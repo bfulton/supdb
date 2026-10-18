@@ -1997,7 +1997,9 @@ mod tests {
         scan_pages: f64,
         /// Seconds a whole build takes at raw rates.
         build_wall: f64,
-        /// `C_build` from nothing, and from sidecars already attached.
+        /// `C_build` from nothing, and from sidecars already attached. From
+        /// nothing it is what [`ski_rental_price`] says of the build's CPU,
+        /// which at the cell is eight seconds.
         price: f64,
         attach: f64,
         /// Refaults a second of other readers in the group.
@@ -2022,7 +2024,7 @@ mod tests {
                 scan_raw: 2.9,
                 scan_pages: 2.74,
                 build_wall: 30.0,
-                price: 8.0,
+                price: ski_rental_price(8.0, None),
                 attach: 0.2,
                 neighbours: 0.0,
             }
@@ -3035,6 +3037,35 @@ mod tests {
     }
 
     // ---- the cell --------------------------------------------------------------
+
+    #[test]
+    fn the_price_is_paid_at_the_rate_the_form_saves_net_of_its_cpu() {
+        // The design registers the price paid in about nine seconds on one
+        // thread and three on three. That is the build's CPU, eight
+        // thread-seconds, at the gross rate the raw form stalls (0.96
+        // thread-seconds a second). The rent is net of the extra CPU the
+        // form costs, 0.76 thread-seconds a second at the cell, and the price
+        // the module asks is the CPU and the displacement it adds until it
+        // is measured, twelve seconds: the build starts three seconds after
+        // SUSPECT (the evidence needs the sampler's reading in the model) and
+        // then at 13.4 s on one thread and 6.4 on three if the price is the
+        // CPU alone, 18.7 and 8.2 if it is the module's.
+        let cpu = 8.0;
+        assert_eq!(Cell::ten_million().price, ski_rental_price(cpu, None));
+        assert_eq!(Cell::ten_million().price, 1.5 * cpu);
+        for (threads, alone, priced) in [(1u32, 13.4, 18.7), (3, 6.4, 8.2)] {
+            for (price, want) in [(cpu, alone), (ski_rental_price(cpu, None), priced)] {
+                let cell = Cell {
+                    threads,
+                    price,
+                    ..Cell::ten_million()
+                };
+                let mut sim = Sim::new(cell.clone(), cell.uniform());
+                sim.run(60.0);
+                near(sim.first(Event::BuildStart), want, 0.25);
+            }
+        }
+    }
 
     #[test]
     fn the_ten_million_cell_pays_the_price_builds_and_installs() {
@@ -4301,8 +4332,10 @@ mod tests {
     }
 
     #[test]
-    fn windows_recorded_from_the_banked_rung_build_and_the_in_core_control_does_not() {
-        // The passes of the banked rung, one interval at a time. At ten
+    fn the_banked_rungs_pass_means_build_and_the_in_core_control_does_not() {
+        // The passes of the banked rung, each replayed at its mean rate: the
+        // log holds one rate and one fault count a pass and no interval at
+        // all, so the windows are the means. At ten
         // million keys under a gibibyte the point read pass of the banked rep
         // ran 53,642 a second and took 0.4625 faults a read, every one a
         // refault, and the scan pass 7,634 scans a second at 3.04 faults a
@@ -4895,7 +4928,7 @@ mod tests {
         assert!(sim
             .log
             .iter()
-            .any(|r| r.excess >= 8.0 && r.t < abandoned + DWELL_FLOOR));
+            .any(|r| r.excess >= Cell::ten_million().price && r.t < abandoned + DWELL_FLOOR));
         near(resumed - abandoned, DWELL_FLOOR.as_secs_f64(), 0.2);
         assert!(resumed - start > DWELL_FLOOR);
         // Builds that install while the window still remembers the
@@ -5082,7 +5115,7 @@ mod tests {
         assert_eq!(sel.phase(), Phase::Suspect);
         assert!(asked > 5000, "it asks on every step it is without one");
         assert_eq!(sel.counts().samples_wanted, 1, "and counts asking once");
-        assert!(sel.excess() > 0.0 || sel.phase() == Phase::Suspect);
+        assert!(sel.excess() > 100.0, "the rent was paid many times over");
     }
 
     #[test]
@@ -5651,6 +5684,21 @@ mod tests {
     }
 
     #[test]
+    fn a_reading_whose_price_is_not_a_price_is_not_kept() {
+        let (mut sel, mut step) = suspect_by_hand();
+        for (k, price) in [f64::NAN, f64::INFINITY, -1.0].into_iter().enumerate() {
+            step += 1;
+            hand(&mut sel, step, 0, Some(reading(price, false, 0)));
+            assert!(sel.sampler.is_none(), "{price}");
+            assert_eq!(sel.counts().ignored, k as u64 + 1);
+        }
+        // A build that costs nothing has a price.
+        step += 1;
+        hand(&mut sel, step, 0, Some(reading(0.0, false, 0)));
+        assert!(sel.sampler.is_some());
+    }
+
+    #[test]
     fn a_decline_is_asked_again_after_a_dwell() {
         // The sampler declined the partitions at the budget they had. The
         // budget and the partitions move, and a decline that stood for the
@@ -5851,6 +5899,336 @@ mod tests {
     }
 
     // ---- holes found by breaking the rules one at a time ----------------------------
+
+    #[test]
+    fn a_scan_only_cold_start_is_not_a_capacity_miss() {
+        // A cold start read by scans alone: the store's faults are the scans',
+        // and the evidence rule has to count them. First touches are not
+        // refaults and buy nothing; the same fill counted as refaults is bought.
+        let cell = Cell {
+            price: 3.0,
+            ..Cell::ten_million()
+        };
+        for (refaults, builds) in [(false, 0), (true, 1)] {
+            let load = Load::Rated {
+                class: Class::Scan,
+                raw: cell.rate(cell.t_hit_scan, cell.scan_raw),
+                z: cell.rate(cell.t_z_scan, 0.0),
+                refaults,
+                bound: cell.bound(cell.z as f64 / PAGE as f64),
+            };
+            let mut sim = Sim::new(cell.clone(), load);
+            sim.phi_raw_override = Some(0.48);
+            sim.run(120.0);
+            assert_eq!(sim.sel.counts().builds, builds, "{refaults}");
+            if builds == 0 {
+                assert!(sim.log.iter().all(|r| r.excess == 0.0));
+            }
+        }
+    }
+
+    #[test]
+    fn each_phase_publishes_its_gate_word() {
+        // The checker compares a decision's gate with `Phase::gate`, that is,
+        // with itself; the words are written out here. (The numbers are the
+        // ones the readers will load.)
+        assert_eq!((GATE_RAW, GATE_CENSUS, GATE_Z), (0, 1, 2));
+        for (phase, gate, census) in [
+            (Phase::Fits, 0, false),
+            (Phase::Suspect, 1, true),
+            (Phase::Building, 1, true),
+            (Phase::Compact, 2, true),
+            (Phase::Trial, 1, true),
+        ] {
+            assert_eq!((phase.gate(), phase.census()), (gate, census), "{phase:?}");
+        }
+    }
+
+    #[test]
+    fn the_trials_wall_is_divided_among_the_threads() {
+        // The pages the trial expects take a fault apiece, and the threads
+        // fault them in together.
+        let wall = |threads: u32| {
+            let mut sel = ZSelect::new();
+            drive(&mut sel, 2, |_| (0.5, 0.0));
+            let now = sel.now + DT;
+            sel.step(&Input {
+                now,
+                census: Census {
+                    threads,
+                    ..Census::default()
+                },
+                ..Input::default()
+            });
+            sel.trial_wall(30_000)
+        };
+        let one = wall(1);
+        assert!(one > Duration::ZERO && one < TRIAL_WALL_CAP, "{one:?}");
+        let three = wall(3);
+        assert!(
+            (three.as_secs_f64() * 3.0 - one.as_secs_f64()).abs() < 1e-6,
+            "{one:?} {three:?}"
+        );
+        // A census that names no thread leaves the last count alone.
+        let mut sel = ZSelect::new();
+        drive(&mut sel, 2, |_| (0.5, 0.0));
+        for (k, threads) in [(1u64, 3u32), (2, 0)] {
+            let now = sel.now + DT * k as u32;
+            sel.step(&Input {
+                now,
+                census: Census {
+                    threads,
+                    ..Census::default()
+                },
+                ..Input::default()
+            });
+        }
+        assert_eq!(sel.threads, 3);
+    }
+
+    #[test]
+    fn mixed_windows_are_counted() {
+        let mut sel = ZSelect::new();
+        drive(&mut sel, 2, |_| (0.5, 0.0));
+        for (k, mixed) in [3u64, 4].into_iter().enumerate() {
+            let now = sel.now + DT;
+            sel.step(&Input {
+                now,
+                census: Census {
+                    mixed,
+                    ..Census::default()
+                },
+                ..Input::default()
+            });
+            assert_eq!(sel.counts().mixed_windows, [3, 7][k]);
+        }
+    }
+
+    #[test]
+    fn a_reading_with_any_field_not_a_number_is_ignored() {
+        let good = Model {
+            phi_raw: 0.5,
+            phi_z: Some(0.0),
+            phi_z_scan: Some(0.0),
+            refault_rate: 0.0,
+            budget: 1 << 30,
+        };
+        let bad = [
+            Model {
+                phi_raw: f64::NAN,
+                ..good
+            },
+            Model {
+                phi_z: Some(f64::NAN),
+                ..good
+            },
+            Model {
+                phi_z_scan: Some(f64::NAN),
+                ..good
+            },
+            Model {
+                phi_z_scan: Some(f64::INFINITY),
+                ..good
+            },
+            Model {
+                refault_rate: f64::NAN,
+                ..good
+            },
+            Model {
+                refault_rate: f64::INFINITY,
+                ..good
+            },
+        ];
+        for (k, m) in bad.into_iter().enumerate() {
+            let mut sel = ZSelect::new();
+            sel.step(&Input {
+                now: Duration::from_secs(1),
+                model: Some(m),
+                ..Input::default()
+            });
+            assert_eq!(
+                (sel.counts().ignored, sel.counts().s1_ticks),
+                (1, 0),
+                "case {k}"
+            );
+        }
+        // A rate that is negative is a rate of nothing, as a model's is.
+        let mut sel = ZSelect::new();
+        let negative = Model {
+            phi_z: Some(-1.0),
+            phi_z_scan: Some(-1.0),
+            refault_rate: -5.0,
+            ..good
+        };
+        sel.step(&Input {
+            now: Duration::from_secs(1),
+            model: Some(negative),
+            ..Input::default()
+        });
+        let m = sel.model.expect("a negative rate is a reading");
+        assert_eq!(
+            (m.phi_z, m.phi_z_scan, m.refault_rate),
+            (Some(0.0), Some(0.0), 0.0)
+        );
+    }
+
+    #[test]
+    fn a_reading_that_is_not_a_number_is_not_a_tick_once_there_has_been_a_good_one() {
+        // With no model yet a reading taken for a tick would find nothing to
+        // read; after a good one it would count the good one twice.
+        let hot = |phi_raw: f64| Model {
+            phi_raw,
+            phi_z: None,
+            phi_z_scan: None,
+            refault_rate: 0.0,
+            budget: 870_000_000,
+        };
+        let mut sel = ZSelect::new();
+        for (k, m) in [hot(0.5), hot(f64::NAN), hot(f64::NAN)]
+            .into_iter()
+            .enumerate()
+        {
+            let d = sel.step(&Input {
+                now: Duration::from_secs(k as u64 + 1),
+                model: Some(m),
+                ..Input::default()
+            });
+            assert_eq!(
+                d.phase,
+                Phase::Fits,
+                "tick {k}: one good reading is not two"
+            );
+        }
+        assert_eq!((sel.counts().s1_ticks, sel.counts().ignored), (1, 2));
+    }
+
+    #[test]
+    fn failed_builds_are_builds_and_not_supersessions() {
+        // Four superseded, four that failed and one superseded: four of the
+        // last eight, the most the budget allows. A failure is not a
+        // supersession, and it is a build that ages one out of the window.
+        let mut sel = ZSelect::new();
+        for (k, build) in [
+            Build {
+                superseded: 4,
+                ..Build::default()
+            },
+            Build {
+                failed: 4,
+                ..Build::default()
+            },
+            Build {
+                superseded: 1,
+                ..Build::default()
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            sel.step(&Input {
+                now: Duration::from_secs(k as u64 + 1),
+                build,
+                ..Input::default()
+            });
+        }
+        assert_eq!(sel.counts().build_suspended, 0);
+    }
+
+    #[test]
+    fn a_model_that_says_it_fits_holds_the_build_off_though_the_rent_is_paid() {
+        // Clause (c) alone. The store is too slow to raise the pressure term
+        // itself, the rent is paid and the census says the form saves, the
+        // sampler has read and no switch has been made; the model, between
+        // the way in and half of it, does not say the store may not fit, and
+        // nothing is built.
+        let cell = Cell::ten_million();
+        let bound = cell.bound(cell.z as f64 / PAGE as f64);
+        let slow = Load::Rated {
+            class: Class::Read,
+            raw: Rate {
+                ops_per_s: 700.0,
+                phi: 0.3,
+            },
+            z: Rate {
+                ops_per_s: 3_000.0,
+                phi: 0.0,
+            },
+            refaults: true,
+            bound,
+        };
+        let mut sim = Sim::new(cell.clone(), slow);
+        sim.run_until(Phase::Suspect, 10.0);
+        let sus = sim.sel.theta_sus(Class::Read);
+        sim.phi_raw_override = Some(0.7 * sus);
+        sim.run(3600.0);
+        assert_eq!(sim.last.phase, Phase::Suspect);
+        assert_eq!(sim.sel.counts().builds, 0);
+        assert!(
+            sim.log.iter().any(|r| r.excess >= cell.price),
+            "the rent was paid"
+        );
+    }
+
+    #[test]
+    fn e2_without_a_footprint_reading_is_not_a_yes() {
+        let mut sel = ZSelect::new();
+        sel.model = Some(Model {
+            phi_raw: 0.5,
+            phi_z: Some(0.0),
+            phi_z_scan: Some(0.0),
+            refault_rate: 0.0,
+            budget: 870_000_000,
+        });
+        sel.phase = Phase::Compact;
+        // A measure in which the compact form faults nothing, over plenty of
+        // reads.
+        let quiet = Window {
+            ops: 100_000,
+            faults: 0,
+        };
+        sel.watch.e2_win[Class::Read.ix()] = quiet;
+        sel.update_e2(Duration::from_secs(11));
+        assert_eq!(sel.watch.e2_run, 0, "no reading of the footprint, no yes");
+        sel.footprint = Some(1 << 20);
+        sel.watch.e2_win[Class::Read.ix()] = quiet;
+        sel.update_e2(Duration::from_secs(22));
+        assert_eq!(sel.watch.e2_run, 1);
+    }
+
+    #[test]
+    fn a_trial_is_wrong_only_when_the_raw_form_saves_the_entry_threshold_over_the_compact_forms_rate(
+    ) {
+        // At 588 MB the model predicts the compact form takes 0.3 a read. A
+        // hot set the compact form serves without a fault is tried on the raw
+        // form: at 0.4 a read the raw form saves a tenth over the predicted
+        // 0.3, under the entry threshold, and the form is left; at 0.6 it
+        // saves three tenths, over it, and the form is wanted.
+        let cell = Cell {
+            cache: 588_000_000,
+            ..Cell::ten_million()
+        };
+        let z = model_z(cell.budget(), cell.resident, cell.z);
+        let enter = ZSelect::new().theta_enter(Class::Read);
+        assert!((z - 0.3).abs() < 0.01, "{z}");
+        assert!(0.4 - z < enter && enter < 0.6 - z);
+        for (plateau, wrong) in [(0.4, false), (0.6, true)] {
+            let mut sim = compact(&cell);
+            sim.load = Load::Hot {
+                raw_pages: 9_000.0,
+                z_pages: 5_000.0,
+                plateau,
+            };
+            sim.run_until(Phase::Trial, 2400.0);
+            assert_eq!(sim.last.phase, Phase::Trial, "{plateau}");
+            sim.run(120.0);
+            let c = sim.sel.counts();
+            assert_eq!(
+                (c.trials_back, c.exits[Exit::E2 as usize]),
+                if wrong { (1, 0) } else { (0, 1) },
+                "{plateau}"
+            );
+        }
+    }
 
     // ---- the controller's own output moves what it reads ---------------------------
     //
