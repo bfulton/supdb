@@ -1292,8 +1292,32 @@ fn an_ordered_index_naming_the_wrong_keys_never_returns_another_keys_values() {
     }
     let (_, declined) = db.ord_point_reads();
     assert_eq!(declined, u64::from(n), "every key the index names wrongly");
-    // The same files without the option read every key.
     db.close().unwrap();
+
+    // The segment's own keys in an order no segment has: a file as valid
+    // and as uniform as the last, whose heads are not sorted, so that the
+    // search lands where it lands. What it answers is right or empty, and
+    // it panics nowhere.
+    let mut b = supdb::ordindex::Builder::new();
+    for k in (0..n).rev() {
+        b.push(&key(k));
+    }
+    std::fs::write(d.join(&ords[0]), b.finish()).unwrap();
+    let db = Db::open(&d, opts()).unwrap();
+    assert_eq!(db.ord_rebuilt(), 0, "the open took this one too");
+    for k in 0..=n + 1 {
+        let want = if k < n { vec![value(k)] } else { Vec::new() };
+        let got = read_vec(&db, &key(k));
+        assert!(
+            got.is_empty() || got == want,
+            "key {k} read {got:?} through unsorted heads, which is not its own"
+        );
+    }
+    let (served, declined) = db.ord_point_reads();
+    assert_eq!(served + declined, u64::from(n) + 2, "every read asked it");
+    db.close().unwrap();
+
+    // The same files without the option read every key.
     let db = Db::open(
         &d,
         Options {
