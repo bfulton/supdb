@@ -68,7 +68,9 @@
 //! are private to `db`, and a child module reaches them without widening any
 //! visibility. The items here are public for the reason `flatindex`'s are:
 //! the tools in `bench/` price the layout they link, and a copy of it in an
-//! example is the second definition.
+//! example is the second definition. The module is hidden from the crate's
+//! documentation until a reader of the sidecar exists, since a layout nothing
+//! reads is not yet an interface anyone is promised.
 
 use crate::block::crc32;
 use crate::flatindex::{parse_record, rd_u32, record_key_next};

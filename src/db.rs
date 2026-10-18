@@ -47,7 +47,14 @@ use crate::Blob;
 // gate would have to say so on this line. A plain comment and not a doc
 // comment, because the module's own documentation is its file's, and rustdoc
 // resolves the links of both against one scope.
+//
+// Public because the tools in `bench/` price the layout they link, and hidden
+// from the documentation because nothing reads a sidecar yet: its items are
+// not an API anyone is promised until the form is wired, and the design had
+// them `pub(super)` in a private module. Lifting the attribute is the step
+// that makes the layout the crate's to keep.
 #[cfg(not(target_family = "wasm"))]
+#[doc(hidden)]
 pub mod zpages;
 
 /// Write a segment's ordered index, and make it durable where `durable`
