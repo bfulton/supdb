@@ -2777,9 +2777,12 @@ struct Seg {
     /// with an empty cell, and its reads go to the raw form until the
     /// sidecar is attached again.
     z: zside::ZCell,
-    /// Why a partition was given no sidecar, for the life of the segment
-    /// (`ZDeclined`), or zero: what keeps a settle from sampling a
-    /// partition again that it has declined.
+    /// Why a partition was given no sidecar, for the life of the segment,
+    /// as `zside::Decline::code` numbers the reasons (`zside::DECLINED_FAILED`
+    /// a build that failed), or zero: what keeps a settle from looking
+    /// again at a partition it has declined, and what `Db::zpage_counts`
+    /// reads to tell a sliver left raw for its size from one that could not
+    /// be covered.
     z_declined: std::sync::atomic::AtomicU8,
 }
 
