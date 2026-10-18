@@ -10855,8 +10855,7 @@ pub struct Reader {
     /// because the record at the rank did not hold the key
     /// (`Options::point_via_ord`). Words of the handle's own, not shared
     /// ones: a count every reader thread bumped on one line is what the
-    /// threaded cells it is meant to be read beside would price. Declared
-    /// last and apart, so that no field the read path already uses moves.
+    /// threaded cells it is meant to be read beside would price.
     ord_served: std::cell::Cell<u64>,
     ord_declined: std::cell::Cell<u64>,
 }
