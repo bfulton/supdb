@@ -22612,8 +22612,8 @@ impl Db {
         if self.opts.zpages != ZPages::Always {
             return Ok(());
         }
-        self.settle()?;
         for _ in 0..ZSETTLE_ROUNDS {
+            self.settle()?;
             // The segments are held past the pin: a build is seconds, and a
             // pin held across one keeps every state a landing replaces
             // alive.
@@ -22630,6 +22630,12 @@ impl Db {
                     .collect()
             };
             if todo.is_empty() {
+                // Every partition has its sidecar or its reason, unless a
+                // merge the settle's joins started is still to land: its
+                // outputs are partitions nobody has looked at.
+                if self.in_flight().1 {
+                    continue;
+                }
                 return Ok(());
             }
             for seg in &todo {

@@ -548,8 +548,11 @@ impl ZSide {
 }
 
 /// That the trailer is the live segment's: every quantity it records of the
-/// segment equals what the segment recomputes of itself. The first mismatch
-/// is named.
+/// segment equals what the segment recomputed of itself. The first mismatch
+/// is named, the name's fields and the content's fingerprint first: two
+/// segments written a second apart differ in their timestamps whatever else
+/// they share, and a refusal that named the clock would say nothing of
+/// whether the records were the same.
 fn same_segment(
     t: &Trailer,
     f: &ZSource,
@@ -561,6 +564,9 @@ fn same_segment(
     }
     if t.nkeys != f.nkeys {
         return Err("the key count differs");
+    }
+    if t.seg_row_crc != f.row_crc {
+        return Err("the key section's checksum row differs");
     }
     if t.seg_recs_len != f.recs_len {
         return Err("the record region's length differs");
@@ -582,9 +588,6 @@ fn same_segment(
     }
     if t.seg_generation != f.generation {
         return Err("the segment's generation differs");
-    }
-    if t.seg_row_crc != f.row_crc {
-        return Err("the key section's checksum row differs");
     }
     if t.rec_version != f.rec_version {
         return Err("the record format's version differs");
@@ -1565,6 +1568,9 @@ mod tests {
         one.side();
         two.side();
         std::fs::copy(&one.out, &two.out).unwrap();
+        // The records differ, so the fingerprint of them does; two segments
+        // written a second apart differ in their clocks as well, which is
+        // not what is named.
         match two.attach() {
             Err(Reject::Identity(why)) => {
                 assert!(why.contains("checksum row"), "{why}");
