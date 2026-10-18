@@ -2139,6 +2139,20 @@ thirty-two mutations picked by the author left holes that two hundred
 mechanical operator flips found, so the flip pass runs beside the list,
 since a list finds only what its author thought of.
 
+**A sibling function without its sibling's guard.** `reserve_contig` made
+the arena's first block when `block_end` was still zero; `reserve`, which
+the memtable's keys and values go through, tested only whether the bytes
+fit, and a reservation of no bytes always fits: it answered offset zero
+without a block, and the write of nothing at that offset asked for a block
+nobody had published ("an offset past what was published"). So the first
+write of a fresh store, and of every table after a seal, panicked if its key
+was empty, in release as in checked, and no test wrote an empty key first;
+the second form's reviewer found it because its fuzz allowed one. The rule:
+two functions that hand out the same resource take the same guard, and a
+fuzz that draws its inputs from the whole of the type (the empty key, the
+empty value, the key of 0xff bytes) finds what a table of examples chose
+not to.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

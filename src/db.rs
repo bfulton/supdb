@@ -6369,7 +6369,11 @@ impl ByteArena {
     fn reserve(&self, n: usize) -> usize {
         // SAFETY: writer-only, see the memtable's doc.
         let t = unsafe { &mut *self.tail.get() };
-        if t.at + n > t.block_end {
+        // An arena with no block yet has `block_end` zero, and a reservation
+        // of nothing fits in no room: it still makes the block, since the
+        // write of nothing at the offset returned asks for the block
+        // that offset is in (`reserve_contig` is guarded the same way).
+        if t.at + n > t.block_end || t.block_end == 0 {
             let b = t.next_block;
             assert!(
                 b < ARENA_BLOCKS,
