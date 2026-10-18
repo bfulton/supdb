@@ -1813,12 +1813,22 @@ fn lag_sweep(
         // memory is the point the pass after it cannot see, since the
         // `lagmem` line is read at the pass's end. Read from the kernel and
         // not from the engine, so it takes nothing back from the upkeep.
+        // It does stand between the burst and the scans, which the suite
+        // otherwise reads nothing between: a read of a `/proc` file, and
+        // under `SUPDB_LAG_ARENAS` also the allocator's report by arena
+        // (`malloc_info`), which walks every free chunk of every arena
+        // under the arena's lock, milliseconds with tens of thousands of
+        // chunks and the upkeep thread's allocations among the waits. That
+        // lengthens the window the thread files the burst in, the same for
+        // every arm; the rates of a run that counts are not read for it.
         if counting_store {
             eprintln!(
                 "lagburst {arm} {pct} anon_mb {}",
                 anon_resident_bytes().map_or(0, |b| b >> 20)
             );
-            lag_arenas("lagburstarenas", arm, &pct.to_string());
+            if std::env::var_os("SUPDB_LAG_ARENAS").is_some() {
+                lag_arenas("lagburstarenas", arm, &pct.to_string());
+            }
         }
         if pct == 0 {
             // Nothing unmerged: the shuffled load's own tail is drained
@@ -1944,8 +1954,9 @@ fn lag_census(arm: &str, point: &str, e: &dyn Engine) {
 /// bytes in use and free over the process, then each arena's bytes taken
 /// from the system, its free bytes and the chunks they are in, and the
 /// chunks mapped on their own. Read from the allocator and not from the
-/// engine, so it takes nothing back from the upkeep, which is why it can
-/// stand where a burst ends.
+/// engine, so it takes nothing back from the upkeep; it still takes each
+/// arena's lock to walk its free chunks, so where a burst ends it is
+/// asked for (`SUPDB_LAG_ARENAS`) and not given.
 fn lag_arenas(tag: &str, arm: &str, point: &str) {
     let mb = |b: u64| b as f64 / (1u64 << 20) as f64;
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
