@@ -460,6 +460,15 @@ pub struct Supdb {
     /// stretch nobody reads filed nothing. `supdb-settlefar`, and
     /// `supdb-ingestsettlefar` buffered.
     settlefar: bool,
+    /// The block cache's forms counted, built and kept by what their
+    /// buffers cost, and its budget kept where they grow
+    /// (`Options::forms_to_fit`). `supdb-tofit`, `supdb-ingesttofit`
+    /// buffered, and `supdb-cache256tofit` beside the 256 MB budget.
+    tofit: bool,
+    /// With `tofit`, the trim that gives the allocator's free pages back
+    /// off (`Options::forms_trim_bytes` zero): against `tofit` alone it
+    /// prices what the trim returns. `supdb-cache256tofitnotrim`.
+    notrim: bool,
     /// A walk's prefetch reaching a kilobyte into the records rather than
     /// four (`Options::scan_prefetch_bytes`). `supdb-prefetch1k`, and
     /// `supdb-ingestprefetch1k` buffered.
@@ -772,6 +781,15 @@ struct Policy {
     /// stretch nobody reads filed nothing. `supdb-settlefar`, and
     /// `supdb-ingestsettlefar` buffered.
     settlefar: bool,
+    /// The block cache's forms counted, built and kept by what their
+    /// buffers cost, and its budget kept where they grow
+    /// (`Options::forms_to_fit`). `supdb-tofit`, `supdb-ingesttofit`
+    /// buffered, and `supdb-cache256tofit` beside the 256 MB budget.
+    tofit: bool,
+    /// With `tofit`, the trim that gives the allocator's free pages back
+    /// off (`Options::forms_trim_bytes` zero): against `tofit` alone it
+    /// prices what the trim returns. `supdb-cache256tofitnotrim`.
+    notrim: bool,
     /// A walk's prefetch reaching a kilobyte into the records rather than
     /// four (`Options::scan_prefetch_bytes`). `supdb-prefetch1k`, and
     /// `supdb-ingestprefetch1k` buffered.
@@ -1042,6 +1060,8 @@ impl Default for Policy {
             noprefetch: false,
             dirplain: false,
             settlefar: false,
+            tofit: false,
+            notrim: false,
             prefetch1k: false,
             manifestrename: false,
             manifestpending: false,
@@ -2613,6 +2633,62 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose block cache costs what its forms' buffers allocate
+    /// (`Options::forms_to_fit`): against `supdb` it prices the forms
+    /// built and grown to fit, and the process's memory they leave.
+    pub fn create_tofit(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                tofit: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-tofit`.
+    pub fn create_ingest_tofit(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                tofit: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cache256` whose cache is counted and kept to fit
+    /// (`Options::forms_to_fit`): against `supdb-cache256` it prices the
+    /// budget as a bound on the process, which the arm beside it is not.
+    pub fn create_cache256_tofit(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 256 << 20,
+                tofit: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cache256tofit` without the trim (`Options::forms_trim_bytes`
+    /// zero): against it, the part of the saving that is the allocator's
+    /// free pages given back; against `supdb-cache256`, the part that is
+    /// the forms' buffers.
+    pub fn create_cache256_tofit_notrim(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 256 << 20,
+                tofit: true,
+                notrim: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-ingest` as `supdb-settlefar`.
     pub fn create_ingest_settlefar(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
@@ -3241,6 +3317,8 @@ impl Supdb {
             noprefetch,
             dirplain,
             settlefar,
+            tofit,
+            notrim,
             prefetch1k,
             manifestrename,
             manifestpending,
@@ -3447,6 +3525,12 @@ impl Supdb {
             scan_prefetch: !noprefetch,
             seek_prefetch_dir: !dirplain,
             forms_settle_far: settlefar,
+            forms_to_fit: tofit,
+            forms_trim_bytes: if notrim {
+                0
+            } else {
+                supdb::Options::default().forms_trim_bytes
+            },
             scan_prefetch_bytes: if prefetch1k { 1024 } else { 4096 },
             manifest_slots: !manifestrename,
             manifest_pending: manifestpending,
@@ -3574,6 +3658,8 @@ impl Supdb {
             noprefetch,
             dirplain,
             settlefar,
+            tofit,
+            notrim,
             prefetch1k,
             manifestrename,
             manifestpending,
@@ -3692,7 +3778,13 @@ impl ThreadReader for supdb::Reader {
 impl Engine for Supdb {
     fn name(&self) -> &'static str {
         if self.budget > 0 {
-            return "supdb-cache256";
+            return if self.tofit && self.notrim {
+                "supdb-cache256tofitnotrim"
+            } else if self.tofit {
+                "supdb-cache256tofit"
+            } else {
+                "supdb-cache256"
+            };
         }
         if self.firstfloor {
             return "supdb-shapefloor";
@@ -4027,6 +4119,13 @@ impl Engine for Supdb {
                 "supdb-ingestsettlefar"
             };
         }
+        if self.tofit {
+            return if self.partition {
+                "supdb-tofit"
+            } else {
+                "supdb-ingesttofit"
+            };
+        }
         if self.prefetch1k {
             return if self.partition {
                 "supdb-prefetch1k"
@@ -4345,6 +4444,9 @@ impl Engine for Supdb {
             ("convert_build_us", db.convert_us().0 as f64),
             ("convert_total_us", db.convert_us().1 as f64),
             ("forms_cloned", db.forms_cloned() as f64),
+            ("forms_trims", db.forms_trims() as f64),
+            ("forms_trim_looks", db.forms_trim_looks() as f64),
+            ("forms_trim_us", db.forms_trim_us() as f64),
             ("forms_rebased", db.forms_rebased() as f64),
             ("pin_barriers", uk[10] as f64),
         ]
@@ -4909,6 +5011,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-noprefetch"
         | "supdb-dirplain"
         | "supdb-settlefar"
+        | "supdb-tofit"
+        | "supdb-cache256tofit"
+        | "supdb-cache256tofitnotrim"
         | "supdb-prefetch1k"
         | "supdb-manifestrename"
         | "supdb-manifestpending"
@@ -4990,6 +5095,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestnoprefetch"
         | "supdb-ingestdirplain"
         | "supdb-ingestsettlefar"
+        | "supdb-ingesttofit"
         | "supdb-ingestprefetch1k"
         | "supdb-ingestmanifestrename"
         | "supdb-ingestmanifestpending"
@@ -5134,6 +5240,10 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestdirplain" => Box::new(Supdb::create_ingest_dirplain(dir)?),
         "supdb-settlefar" => Box::new(Supdb::create_settlefar(dir)?),
         "supdb-ingestsettlefar" => Box::new(Supdb::create_ingest_settlefar(dir)?),
+        "supdb-tofit" => Box::new(Supdb::create_tofit(dir)?),
+        "supdb-ingesttofit" => Box::new(Supdb::create_ingest_tofit(dir)?),
+        "supdb-cache256tofit" => Box::new(Supdb::create_cache256_tofit(dir)?),
+        "supdb-cache256tofitnotrim" => Box::new(Supdb::create_cache256_tofit_notrim(dir)?),
         "supdb-prefetch1k" => Box::new(Supdb::create_prefetch1k(dir)?),
         "supdb-ingestprefetch1k" => Box::new(Supdb::create_ingest_prefetch1k(dir)?),
         "supdb-manifestrename" => Box::new(Supdb::create_manifestrename(dir)?),
@@ -5442,6 +5552,121 @@ mod tests {
             let e = open(name, &opened_d, 1).unwrap();
             assert_eq!(e.name(), name, "the dispatch");
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `supdb-tofit`, `supdb-ingesttofit` and `supdb-cache256tofit` are
+    /// `supdb`, `supdb-ingest` and `supdb-cache256` with `forms_to_fit`
+    /// alone set: each opens under its name, in its default's row and
+    /// under its default's guarantee, with the budget the default has and
+    /// every option the forms and the cache read as the default has them.
+    #[test]
+    fn the_tofit_arms_differ_from_their_defaults_in_the_one_option() {
+        type Make = fn(&Path) -> Res<Supdb>;
+        let root = std::env::temp_dir().join(format!("supdb-bench-tofit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pairs: [(&str, Make, &str, Make); 3] = [
+            ("supdb-tofit", Supdb::create_tofit, "supdb", Supdb::create),
+            (
+                "supdb-ingesttofit",
+                Supdb::create_ingest_tofit,
+                "supdb-ingest",
+                Supdb::create_ingest,
+            ),
+            (
+                "supdb-cache256tofit",
+                Supdb::create_cache256_tofit,
+                "supdb-cache256",
+                Supdb::create_cache256,
+            ),
+        ];
+        for (name, make, base_name, make_base) in pairs {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            let arm = make(&d).unwrap();
+            assert_eq!(arm.name(), name);
+            let base_d = root.join(base_name);
+            std::fs::create_dir_all(&base_d).unwrap();
+            let base = make_base(&base_d).unwrap();
+            assert_eq!(base.name(), base_name);
+            assert_eq!(arm.partition, base.partition, "{name}: the row's shape");
+            assert_eq!(arm.durable, base.durable, "{name}: the row's guarantee");
+            assert_eq!(arm.features(), base.features(), "{name}");
+            assert_eq!(guarantee(name), guarantee(base_name), "{name}");
+            let (a, b) = (
+                arm.db.as_ref().unwrap().options(),
+                base.db.as_ref().unwrap().options(),
+            );
+            assert!(a.forms_to_fit && !b.forms_to_fit, "{name}: the one option");
+            assert_eq!(a.scan_cache_bytes, b.scan_cache_bytes, "{name}: the budget");
+            assert_eq!(
+                a.scan_cache_bytes,
+                if name.contains("cache256") {
+                    256 << 20
+                } else {
+                    0
+                },
+                "{name}"
+            );
+            assert_eq!(a.scan_block_cache, b.scan_block_cache, "{name}");
+            assert_eq!(a.commit_forms, b.commit_forms, "{name}");
+            assert_eq!(a.copy_exact, b.copy_exact, "{name}");
+            assert_eq!(a.forms_publish_lazily, b.forms_publish_lazily, "{name}");
+            assert_eq!(a.scan_cache_ahead, b.scan_cache_ahead, "{name}");
+            assert_eq!(a.upkeep, b.upkeep, "{name}");
+            assert_eq!(a.forms_settle_far, b.forms_settle_far, "{name}");
+            drop(arm);
+            drop(base);
+            // The dispatch opens the arm by its name.
+            let opened_d = root.join(format!("{name}-open"));
+            std::fs::create_dir_all(&opened_d).unwrap();
+            let e = open(name, &opened_d, 1).unwrap();
+            assert_eq!(e.name(), name, "the dispatch");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `supdb-cache256tofitnotrim` is `supdb-cache256tofit` with the trim
+    /// off and nothing else: the one option the arm exists to price.
+    #[test]
+    fn the_notrim_arm_differs_from_its_default_in_the_trim_alone() {
+        let root = std::env::temp_dir().join(format!("supdb-bench-notrim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (d, base_d) = (root.join("notrim"), root.join("tofit"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::create_dir_all(&base_d).unwrap();
+        let arm = Supdb::create_cache256_tofit_notrim(&d).unwrap();
+        let base = Supdb::create_cache256_tofit(&base_d).unwrap();
+        assert_eq!(arm.name(), "supdb-cache256tofitnotrim");
+        assert_eq!(base.name(), "supdb-cache256tofit");
+        assert_eq!(arm.partition, base.partition, "the row's shape");
+        assert_eq!(arm.durable, base.durable, "the row's guarantee");
+        assert_eq!(arm.features(), base.features());
+        assert_eq!(guarantee(arm.name()), guarantee(base.name()));
+        let (a, b) = (
+            arm.db.as_ref().unwrap().options(),
+            base.db.as_ref().unwrap().options(),
+        );
+        assert_eq!(a.forms_trim_bytes, 0);
+        assert_eq!(
+            b.forms_trim_bytes,
+            supdb::Options::default().forms_trim_bytes
+        );
+        assert!(a.forms_to_fit && b.forms_to_fit, "kept to fit in both");
+        assert_eq!(a.scan_cache_bytes, b.scan_cache_bytes, "the budget");
+        assert_eq!(a.scan_block_cache, b.scan_block_cache);
+        assert_eq!(a.commit_forms, b.commit_forms);
+        assert_eq!(a.copy_exact, b.copy_exact);
+        assert_eq!(a.scan_cache_ahead, b.scan_cache_ahead);
+        assert_eq!(a.upkeep, b.upkeep);
+        drop(arm);
+        drop(base);
+        // The dispatch opens the arm by its name.
+        let opened_d = root.join("open");
+        std::fs::create_dir_all(&opened_d).unwrap();
+        let e = open("supdb-cache256tofitnotrim", &opened_d, 1).unwrap();
+        assert_eq!(e.name(), "supdb-cache256tofitnotrim", "the dispatch");
+        drop(e);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
