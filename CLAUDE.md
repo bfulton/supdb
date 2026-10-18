@@ -20,13 +20,14 @@ of the change that produced the text.
 | path | what |
 |---|---|
 | `src/db.rs` | the engine: WAL with atomic batches, memtable, sealed segments, partitioned compaction, tombstones, `Txn`, and the `SegmentWriter` every segment is written by -- `docs/engine.md` |
+| `src/db/zpages.rs` | the compact form's layout: the page, the group, the fill that packs records into pages, the fence, the trailer and the identity a sidecar is bound by; wired to no read path -- the module's own docs, and `bench/examples/zsize.rs` for what it makes of the engine's bytes |
 | `src/db/zselect.rs` | the compact form's selector: `ZSelect::step`, a function of its state and an explicit `Input` (no clock, thread or file), the one definition of the transitions between FITS, SUSPECT, building, COMPACT and the trial, and the replays that hold it -- the module's own docs |
 | `src/format.rs` | the on-disk format's fixed quantities, owned by no writer |
 | `src/block.rs`, `src/index.rs`, `src/flatindex.rs` | the format itself: blocks, extents, the flat key index -- `docs/index-theory.md` |
 | `src/bytes.rs`, `src/blob.rs` | the read path over any byte source; compiles for wasm |
 | `src/wasmapi.rs` | the C ABI the browser calls; hand-written because the module's size is budgeted |
 | `web/` | the browser reader, its byte sources, the Worker it runs in, and the size control -- `web/README.md` |
-| `tests/` | the engine's contract, the read paths held to each other, the format's damage cases |
+| `tests/` | the engine's contract, the read paths held to each other, the format's damage cases; `tests/common` holds what more than one file needs |
 | `bench/` | the benchmark suite: its own cargo workspace, the arms, the runner, the gate and the figures -- `bench/DESIGN.md` |
 
 Two writers produce the format -- `Db` when it seals or compacts, and
@@ -77,6 +78,23 @@ fails with a bare `NotFound` from whatever file operation came next --
 eight tests of one run, one of them in six runs alone, before a syscall
 trace showed the store's directory gone and nothing in the process that
 removed it.
+
+A checked-profile compile of `tests/db.rs` peaks near nine gigabytes (fat
+LTO, one codegen unit, debug information) and the tool cgroup that every
+agent and shell here shares holds fourteen: a second compile at once gets
+its `rustc` killed with `could not compile` and no reason given, so they
+are serialised (`CARGO_BUILD_JOBS=1`, one at a time) and the iteration is
+done in the dev profile, which builds the same tests in a minute.
+`cargo test` stops at the first failing test binary, so a red `db` hid
+`dict`, `leak`, `ranges` and `segwriter` for a run; `--no-fail-fast` shows
+the rest. And worktrees that share a target directory overwrite each
+other's test binaries, because the root package's artifact hash does not
+depend on the checkout path: a run through the shared directory executed
+another branch's seventy-seven-test library binary with none of its own
+tests in it, and was read as green. A worktree gets a target of its own,
+and a result is believed after `--list` has shown the tests it names. The
+tooling cuts a worktree from `origin/main` and not from the parent's head,
+so the first command in one is `git switch -C <branch> <base>`.
 
 Keep it that way. Every gate this repository has broken has broken the same
 way: a check that was not running, or one reporting a verdict it had not
@@ -2052,6 +2070,74 @@ and frozen tables beside the cache, a seal that had not landed, and the census s
 the trim on builds as well as frees, to return the load's retention at a burst's start, read no
 lower and cost a look of 30 ms: refuted. Read a bound's effect as the median of several reps with
 the census of each, never from the rep that happened to be run.
+
+**A library's features, unified across a build.** The bench crate's
+dev-dependency on `lz4_flex` asked for the defaults, cargo unified them
+with the engine's pinned `std` and `frame`, and every example and test of
+`bench/` linked the safe decoder: the compact form's probe timed a decode
+1.3-1.6x slower than the engine's, and nothing printed which codec had
+run. The manifest pins the features the engine ships with now, an
+example builds with the safe codec only when asked (`lz4-safe`), and
+`zsize` runs the codec and the encoder's fingerprint in its own binary and
+exits when either is not what the build asked for. The rule: a measured
+library is built with the features it ships with, and the binary says
+which it linked.
+
+**A budget that counted the cheap thing, and a step that replaced a fit
+with less.** The page filler's loop was bounded at twelve turns and
+counted its staging passes, which cost nothing, as turns, so the
+fallback that was never to be reached could be; and a growth step that
+met a page it overshot kept the smaller page it had and ran on past the
+end of the group. A budget counts the expensive operation it exists to
+bound, and a step that grows a fit never replaces it with a smaller one.
+
+**A guard no input can reach.** The builder decodes every page it has
+written and compares the result with the images, against a defect the
+compressor cannot produce, so no input made the comparison fire and a
+version of it that was constant true left forty tests green. The tail of
+the builder takes a fit and a scratch buffer now, which a test damages
+after the fit was judged, byte by byte against an oracle that decodes the
+damaged block itself. The rule: a check against a defect the code under
+test cannot produce is held to firing by damaging its input after the
+fact, and a conditional assertion that skips itself when its fixture has
+no padding passes for the wrong reason.
+
+**A controller tested on constants its own answer moves.** The selector's
+replay fed its pressure term as a constant, and the term is the group's
+refault counter, which holds the store's own refaults, and which form
+serves decides how many there are. With the constant, making the exits
+inert under pressure looked like the fix for a loop; fed as the group has
+it, one constant workload made eighty-two installs and eighty-one exits in
+three hours, and a compact form that faulted more than the raw form was
+never left, while the checker stayed green because the loop makes one
+switch a dwell. A controller facing constant inputs reaches a fixed point,
+so the replay now feeds it what the world would give back and a grid of
+four hundred and eighty constant workloads asserts that none of them
+switches in its last hours. The same module found a model believed again
+after the form it was wrong about had been seen not to pay, and a census
+read in the state where it means nothing: the raw form's rate over the
+intervals that were capacity misses and not the first touches of a restart,
+and nothing of the census read at all while the model says the store fits.
+
+**A tally that missed the case it was kept for.** A running balance that
+was to be a cumulative sum (an excess that must floor at zero or a long
+hot stretch is owed back), a budget that saw only the builds it expected
+(superseded builds collected after their build was cancelled were lost,
+and installs tripped it again), a window sized by its type and not by its
+constant (a `u8` whatever `BUDGET_BUILDS` said, found by moving the
+constant and seeing nothing change), and a threshold stated two ways in
+the design. The rule: move each constant both ways and see what notices.
+
+**A test that reads what it tests.** Twenty-odd constants of the selector
+survived until their tests wrote the registered number out instead of
+reading the constant, and five holes in the first traces (the band between
+a threshold and half of it, a budget suspension that ends with the dwell,
+a rule that ignored the compact form's faults, an evidence window that
+did not restart, silent intervals) were found only by breaking the rule:
+a trace that never crosses a rule is not a test of it. A hundred and
+thirty-two mutations picked by the author left holes that two hundred
+mechanical operator flips found, so the flip pass runs beside the list,
+since a list finds only what its author thought of.
 
 ## Standing limitations
 
