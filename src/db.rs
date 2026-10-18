@@ -1669,6 +1669,23 @@ pub struct Options {
     /// rebuilding the dense blocks together wrote in 270-311 ms and
     /// read 22-57 µs, which is the trade of carrying nothing.
     pub forms_settle_recent_pct: usize,
+    /// The commit's maintenance files its backlog into the forms far
+    /// from any scan: none in the store's life, or two stores' worth of
+    /// writes since the last (`reads_around`), the regime the upkeep's
+    /// hand-over and the idle seals already ask. Off, the default, such
+    /// a commit files nothing and the forms wait for the first scan,
+    /// which builds its own: a form filed in a stretch nobody reads is
+    /// dropped at the next seal or merge, and the shuffled load at
+    /// three million keys had the upkeep thread copying every block of
+    /// the store into forms as the random writes overlaid them, dropped
+    /// and built again at every landing -- anonymous memory of the
+    /// store's own size beside it, which killed the load under a
+    /// one-gibibyte bound where the arm that filed nothing ran in a
+    /// third of the memory, and the scans after the drain settling
+    /// stale forms. `supdb-settlefar` and `supdb-ingestsettlefar` are
+    /// the shape that filed; `build_ahead_on_publish`, which asks for
+    /// the forms before any read by design, files as it did too.
+    pub forms_settle_far: bool,
     /// EXPERIMENT: the canonical forms carried across a seal. A form is
     /// the merged content of a partition's block and everything unsealed
     /// above it, and a seal changes none of that content: the memtable's
@@ -1895,6 +1912,7 @@ impl Default for Options {
             direct_slim_entries: true,
             direct_map_bytes: 0,
             forms_settle_recent_pct: 0,
+            forms_settle_far: false,
             forms_carry: true,
             freeze_settles: false,
             forms_rebase: true,
@@ -15654,6 +15672,21 @@ impl Reader {
         // burst at ten thousand keys had its forms built on the thread,
         // and the scans after it ran at 0.74x.
         let far = !reads_around(life, writes - self.fs().writes_at_scan.get(), keys);
+        // Far from any scan nothing is filed unless the hand-over forces
+        // it (`Options::forms_settle_far`): what a commit files here is
+        // dropped at the next landing before anything reads it, and the
+        // one-shot reasons below keep until a scan comes around, when the
+        // commit after it files the lot. The arm that builds ahead at
+        // every publish (`Options::build_ahead_on_publish`) asks for the
+        // forms before any read by design, and keeps the shape it was
+        // priced in.
+        if far
+            && !self.opts.forms_settle_far
+            && !self.opts.build_ahead_on_publish
+            && !self.force_due.get()
+        {
+            return Some(false);
+        }
         let quiet = self.opts.seal_idle && self.mode_note.get().quiet && far;
         let recent = !quiet
             && (self.opts.forms_settle_recent_pct == 0

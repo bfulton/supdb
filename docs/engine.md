@@ -2709,6 +2709,41 @@ window takes off the chain. The per-scan median the harness prints was
 rounded to a tenth of a microsecond and could not have seen it; it
 prints to the nanosecond now.
 
+The buffered one-percent burst at a million keys read 0.35x of
+RocksDB's and 0.93x of LMDB's in the row while the ten-percent burst
+read level and the durable arm ran the same burst five times faster,
+so the deciding pairing was the arm that lends every batch
+(`supdb-ingestlendbursts`) against the shipping one, at a million keys
+with the lag counters on, eight pairs in each order. The lent burst
+ran 1.4x and 3.2x the inline one on the one- and ten-percent points,
+and the pass after paid it back: on the one-percent point the first
+scan's settle of the nine thousand keys the thread had not filed was
+3.6 ms and the pass 37 ms against 27, and on the ten-percent point the
+first scan waited 27-32 ms for the thread's pass in flight and settled
+12 ms, the pass 71-75 ms against 30, so the weighted sums read level
+to a tenth in the inline arm's favour (1.04x and 0.89x on the
+one-percent point, 1.04x and 1.11x on the ten-percent) and the regime
+stands. What the inline fills spend is not per write: the ten-percent
+burst's hundred fills cost 1.4 ms each where the one-percent burst's
+ten cost 5.5, and the difference is the tables the drain had emptied,
+over which each fill of a thousand uniform keys builds the block forms
+of the thousand blocks it touched, cold, from the partition's records,
+while the pass after it builds fourteen thousand blocks in both arms.
+The profile of the burst's window by symbol, on the writer's thread
+over six one-percent bursts, puts no one item in charge: the settle's
+resolve of each key to its block over the ordered index's heads, cold
+after the drain and the pass (`owner_of_from`, 13%); the copies (11%);
+the fill's walk of every slot of the table, fifteen thousand a fill
+whatever the batch (`complete_forms`, 7%); the allocator (10%); the
+page faults and the log's writeback landing on the writer (13%); the
+settle itself (5%); and the forms' builds (6%). The ten-percent burst's
+fills, over warm heads and tables, spend the same symbols at a quarter
+of the price a key. So the one-percent cell is the fill machinery run
+cold ten times, and its levers are one per item, each its own move:
+the slot walk bounded to the slots the batch touched, the resolve's
+stride hinted a key ahead, the forms sized by count rather than room,
+each priced on this burst and on the mixes before it is the default.
+
 #### The freeze that leaves its carry to the next look
 
 At level 1 the freeze is the one place the writer still does work for
@@ -5829,6 +5864,70 @@ their reads, 0.9 faults, 1.9 I/Os and 82 µs, the four pages fetched as
 one I/O behind the first. A cold scan of a hundred entries touches an
 index stride, a directory page and three or four record pages in
 series today; asked for together they are two round trips, not six.
+
+#### Out of core: what the process holds beside the page cache
+
+Under a bound the engine's anonymous memory is page cache it does not
+have, so the first bounded rung asked what the process holds, phase by
+phase. The suite's three-million-key rung ran under an eight-gibibyte
+group with the group's `rss` and `cache` sampled twice a second beside
+the phase marks (`SUPDB_LAG_MARK`), one arm a process. The ordered
+load ends at about 55 MB of anonymous memory on every supdb arm and
+LMDB at 20; the read passes and the mixes at 150. The shuffled load is
+where the arms part: the default ended it at 814-865 MB resident, the
+arm with no block cache at 190-287, the arm whose forms wait for a
+reader's scan at 180-315, and LMDB at 25, with a single malloc arena
+(`MALLOC_ARENA_MAX=1`) moving the default's figure to 697-835, so the
+memory was allocation and not the arenas' retention. Every sixteenth
+page fault with its call chain (`perf record -e page-faults -c 16
+--call-graph dwarf`), cut to the two shuffled loads' windows, put 1.4 GB
+of the 3.3 GB faulted on the upkeep thread -- `BuildCtx::copy_block`
+under `materialize`, `complete_forms`, `build_over`, the forms' Vec
+growth -- against the seal threads' 750 MB of transient snapshot
+copies and the writer's 260 MB of memtable chunks. With the forms
+maintained at every commit and nothing gating them on a reader, each
+batch of random writes overlaid every block of the store and the
+thread copied the lot into forms the next landing dropped: anonymous
+memory of the store's own size, built and freed a dozen times a load,
+for scans that came after the drain and read 3.4 M entries/s on the
+first lag pass where the arm that filed nothing read 25 (one rep each,
+ops divided by ten). Under a one-gibibyte bound the default was killed
+inside that load, `anon-rss` at the limit and the group's `cache` at
+32 KB, every file page reclaimed under it.
+
+The commit's maintenance files nothing far from a scan now -- none in
+the store's life or two stores' worth of writes since the last, the
+`reads_around` question the upkeep's hand-over already asks -- and the
+forms wait for the first scan, which builds its own (`Options::forms_settle_far`,
+off; `supdb-settlefar` and `supdb-ingestsettlefar` file as before). A
+test writes a partitioned store in random order through the handle the
+suite holds and asserts no block built, then that the arm builds some
+and both scan every key. Priced against the arm in one process at a
+hundred thousand and three hundred thousand keys, both policies, twelve
+pairs a sitting and two sittings with the order swapped: level on every
+quantity, nothing holding under Holm and the per-quantity marks at the
+coin's rate with their signs swapping between sittings, since at those
+rungs the filing ran on a niced thread beside a four-core box and the
+memory was tens of megabytes. The same probe at three million read the
+new default's shuffled load ending at 217-252 MB resident, the first lag
+pass after it at 28.6 M entries/s, and the lag sweep's own forms still
+taking the process to 960 MB, which is the next question: the forms over
+a store a piece spans are larger than the store.
+
+The same probe answered a question the first bounded numbers raised. A
+bounded row divides its read passes' operation counts for time, and
+at a division of ten the lag passes at three million read supdb at
+0.28-0.4x of LMDB on every lag point where the row before it, at one
+million with whole counts, read 1.2-1.9x. One rep at three million
+with the quick scale's whole counts and no bound read the default at
+1.85x, 1.9x, 1.7x and 1.03x of LMDB over the four lag points: there is
+no cliff between one million and three, and the divided pass had
+weighted the first scan's build ten times. A pass whose first
+operation builds what the pass needs is measured by its count, and a
+count divided for time is a different pass; the bounded rows' division
+is read with that in mind, and the first scan of a divided pass is to
+be reported on its own, as `SUPDB_SCAN_OPS` reports it for the scan
+pass.
 
 ### Arrival order
 

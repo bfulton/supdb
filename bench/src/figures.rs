@@ -52,6 +52,7 @@ fn style(arm: &str) -> (&'static str, &'static str) {
         "supdb-settle" => (ACCENT, "8,2"),
         "supdb-cache256" => (ACCENT, "2,3"),
         "lmdb" | "lmdb-nosync" => (GREY, ""),
+        "lmdb-nordahead" => (GREY, "4,2"),
         "rocksdb-tuned" | "rocksdb-nosync" => (GREY, "7,4"),
         _ => (GREY, "2,3"),
     }
@@ -69,6 +70,7 @@ fn pretty(arm: &str) -> &'static str {
         "supdb-cache256" => "supdb (256 MB block cache)",
         "supdb-ingest" => "supdb (buffered)",
         "lmdb" => "LMDB",
+        "lmdb-nordahead" => "LMDB (no readahead)",
         "lmdb-nosync" => "LMDB (nosync)",
         "rocksdb-tuned" => "RocksDB",
         "rocksdb-nosync" => "RocksDB (nosync)",
@@ -84,6 +86,7 @@ fn workload_noun(w: &str) -> &'static str {
         "scan" => "Ordered scans",
         "scan-mixed" => "Ordered scans on the store the mixes leave",
         "scan-lag" => "Ordered scans against merge lag",
+        "lag-burst" => "The lag sweep's bursts",
         "ycsb-A" => "YCSB-A, update-heavy (50/50 read/update, zipfian)",
         "ycsb-B" => "YCSB-B, read-mostly (95/5 read/update, zipfian)",
         "ycsb-C" => "YCSB-C, read-only (zipfian)",
@@ -211,8 +214,10 @@ fn render_row(row: &Row, out: &Path) -> io::Result<Vec<Rendered>> {
     }
     let mut written = Vec::new();
     for ((workload, quantity, unit, guarantee), arms) in groups {
-        // Arm order: the default first so it is drawn last (on top).
-        let order = crate::engines::ARMS;
+        // Arm order: the default first so it is drawn last (on top), and
+        // every arm either roster names, since a bounded row's arms are
+        // not all in `ARMS`.
+        let order = crate::engines::every_arm();
         let mut curves: Vec<Curve> = order
             .iter()
             .filter_map(|a| arms.get(*a).map(|pts| (a.to_string(), pts)))
@@ -547,7 +552,13 @@ fn message(
     let mut ahead = Vec::new();
     let mut behind = Vec::new();
     let mut level = Vec::new();
-    for comp in ["lmdb", "lmdb-nosync", "rocksdb-tuned", "rocksdb-nosync"] {
+    for comp in [
+        "lmdb",
+        "lmdb-nordahead",
+        "lmdb-nosync",
+        "rocksdb-tuned",
+        "rocksdb-nosync",
+    ] {
         if let (Some(m), Some(c)) = (mine, at(comp)) {
             if c > 0.0 && m > 0.0 {
                 let adv = if up { m / c } else { c / m };

@@ -37,28 +37,44 @@ pub const MIN_HISTORY: usize = 3;
 /// quantities are named by their suffix (`run::threads_of`), one per count
 /// in `run::thread_counts`, and `every_threaded_quantity_is_named` holds
 /// every count a machine of up to sixty-four cores runs -- before a run
-/// has paid for a measurement the gate would refuse.
+/// has paid for a measurement the gate would refuse. A bounded row's
+/// counts per operation (`run::count_of`) are named the same way, by
+/// their base under a thread or lag suffix, and every one is a cost.
 pub fn higher_is_better(quantity: &str) -> Option<bool> {
     Some(match quantity {
         "ops_per_s" | "reads_per_s" | "entries_per_s" | "bytes_per_s" | "pages_per_s" => true,
         q if crate::run::threads_of(q).is_some() => true,
+        q if crate::run::count_of(q).is_some() => false,
         "entries_per_s_lag0pct" | "entries_per_s_lag1pct" => true,
         "entries_per_s_lag10pct" | "entries_per_s_lag100pct" => true,
         "updates_per_s_lag1pct" | "updates_per_s_lag10pct" | "updates_per_s_lag100pct" => true,
-        "p99_us" | "device_bytes_per_byte" | "bytes_on_disk_per_byte" => false,
+        "p50_us" | "p99_us" | "device_bytes_per_byte" | "bytes_on_disk_per_byte" => false,
         _ => return None,
     })
 }
 
 /// The workloads that measure the machine rather than an engine: the
 /// device's sync rate, the mapped sequential read, the random-access
-/// chase, and the price of a fresh page. Named here, never guessed, so a
-/// floor added in `run` is added here or it is not a control.
+/// chase, the price of a fresh page, and under a bound the device's
+/// random read, cold and then again over the same offsets. Named here,
+/// never guessed, so a floor added in `run` is added here or it is not a
+/// control.
 pub fn is_floor(workload: &str) -> bool {
     matches!(
         workload,
-        "wal-floor" | "scan-floor" | "mem-floor" | "page-floor"
+        "wal-floor" | "scan-floor" | "mem-floor" | "page-floor" | "seek-floor" | "seek-floor-again"
     )
+}
+
+/// The floors a bounded row carries for the device's random read, which
+/// are judged on both sides: a seek that is slower than the window is a
+/// device that moved, and one faster than every prior row is the host's
+/// cache of reads answering what the device should, which flatters every
+/// out-of-core cell under it. The other four floors stay one-sided,
+/// since a page that costs less or a chase that runs faster is a host
+/// that got better and takes the engine's cells with it.
+pub fn is_seek_floor(workload: &str) -> bool {
+    matches!(workload, "seek-floor" | "seek-floor-again")
 }
 
 /// The arms an engine change cannot touch: the comparators a user would
@@ -67,11 +83,11 @@ pub fn is_floor(workload: &str) -> bool {
 /// its window is this row's own statement that the machine moved, exact
 /// and needing no statistic. Named, never inferred from the name, and
 /// `every_arm_is_named_as_engine_or_comparator` fails if an arm is added
-/// to `engines::ARMS` without a side.
+/// to `engines::ARMS` or `engines::OOC_ARMS` without a side.
 pub fn is_comparator(arm: &str) -> bool {
     matches!(
         arm,
-        "lmdb" | "lmdb-nosync" | "rocksdb-tuned" | "rocksdb-nosync"
+        "lmdb" | "lmdb-nordahead" | "lmdb-nosync" | "rocksdb-tuned" | "rocksdb-nosync"
     )
 }
 
@@ -79,7 +95,9 @@ pub fn is_comparator(arm: &str) -> bool {
 /// arithmetic on what the engine stored -- they came back identical to
 /// three decimals across hosts that moved every rate by half -- so they
 /// are judged whatever the floors say. Everything else is a rate or a
-/// latency.
+/// latency, and a bounded row's counts per operation are the device's
+/// and the kernel's as much as the engine's: readahead, reclaim and the
+/// host's cache of reads move every one of them.
 pub fn machine_dependent(quantity: &str) -> bool {
     !matches!(quantity, "device_bytes_per_byte" | "bytes_on_disk_per_byte")
 }
@@ -135,11 +153,12 @@ impl Report {
         })
     }
 
-    /// The floors that came in below every row in the window.
+    /// The floors that came in below every row in the window, and the
+    /// seek floors that came in on either side of it (`is_seek_floor`).
     pub fn host_out_of_band(&self) -> Vec<&Finding> {
         self.findings
             .iter()
-            .filter(|f| is_floor(&f.workload) && f.verdict == Verdict::Regressed)
+            .filter(|f| floor_out_of_band(f))
             .collect()
     }
 
@@ -301,6 +320,15 @@ impl Report {
     }
 }
 
+/// A floor finding that says the machine is out of band: below the
+/// window for every floor, and above it as well for the seek floors,
+/// whose faster side is the host's cache rather than the device.
+fn floor_out_of_band(f: &Finding) -> bool {
+    is_floor(&f.workload)
+        && (f.verdict == Verdict::Regressed
+            || (is_seek_floor(&f.workload) && f.verdict == Verdict::Flagged))
+}
+
 fn fmt(v: f64) -> String {
     if v.abs() >= 1000.0 {
         format!("{v:.0}")
@@ -451,9 +479,7 @@ pub fn gate(row: &Row, runs: &Path) -> io::Result<Report> {
         .filter(|f| is_comparator(&f.arm) && f.verdict == Verdict::Regressed)
         .map(|f| (f.workload.clone(), f.quantity.clone()))
         .collect();
-    let host_low = findings
-        .iter()
-        .any(|f| is_floor(&f.workload) && f.verdict == Verdict::Regressed);
+    let host_low = findings.iter().any(floor_out_of_band);
     for f in &mut findings {
         if f.verdict != Verdict::Regressed
             || is_floor(&f.workload)
@@ -500,6 +526,10 @@ mod tests {
             pmu_available: false,
             aslr_disabled: false,
             virtualised: "none".into(),
+            mem_limit_bytes: None,
+            read_ahead_kb: None,
+            rotational: None,
+            write_cache: None,
         }
     }
 
@@ -728,7 +758,7 @@ mod tests {
     /// declared, or an engine nobody judges.
     #[test]
     fn every_arm_is_named_as_engine_or_comparator() {
-        for arm in crate::engines::ARMS {
+        for arm in crate::engines::every_arm() {
             let engine = arm.starts_with("supdb");
             assert_ne!(
                 engine,
@@ -988,6 +1018,94 @@ mod tests {
             }
         }
         assert_eq!(higher_is_better("ops_per_s_2t"), None);
+    }
+
+    /// A seek floor is judged on both sides: faster than every prior
+    /// median withholds the machine's verdicts as slower does, since the
+    /// fast side is the host's cache of reads, while the four other
+    /// floors keep their one side.
+    #[test]
+    fn a_seek_floor_faster_than_its_window_withholds_as_a_slow_one_does() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "supdb-bench-gate-seek-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let build = |utc: &str, reads: f64, seek_p50: f64, page: f64| {
+            let mut r = with_control(
+                row(utc, 4, [reads; 5], [5.0; 5]),
+                1_000_000.0,
+                9.0e9,
+                3_000_000.0,
+                1.44,
+            );
+            r.measurements
+                .push(floor("page-floor", "pages_per_s", "pages/s", page));
+            r.measurements
+                .push(floor("seek-floor", "p50_us", "us", seek_p50));
+            r.measurements
+                .push(floor("seek-floor-again", "p50_us", "us", seek_p50));
+            r
+        };
+        for i in 0..6 {
+            build(&format!("2026010{}T000000Z", i + 1), 100.0, 900.0, 1e6)
+                .write(&dir)
+                .unwrap();
+        }
+        // The reads fall; the seek floor reads a tenth of its window, the
+        // shape of a host serving the device's reads from its own cache.
+        let fast = build("20260201T000000Z", 70.0, 90.0, 1e6);
+        let rep = gate(&fast, &dir).unwrap();
+        let text = rep.render();
+        assert!(!rep.regressed(), "{text}");
+        assert_eq!(rep.host_out_of_band().len(), 2, "{text}");
+        assert!(text.contains("host: OUT OF BAND"), "{text}");
+        let read = rep.findings.iter().find(|f| f.workload == "read").unwrap();
+        assert_eq!(read.verdict, Verdict::NoVerdict, "{text}");
+        // A page floor faster than its window is a host that got better,
+        // and the engine's regression beside it is still the engine's.
+        let cheap_pages = build("20260202T000000Z", 70.0, 900.0, 1e7);
+        let rep = gate(&cheap_pages, &dir).unwrap();
+        let text = rep.render();
+        assert!(rep.regressed(), "{text}");
+        assert!(rep.host_out_of_band().is_empty(), "{text}");
+        // And a seek floor slower than its window withholds as every
+        // floor does.
+        let slow = build("20260203T000000Z", 70.0, 9000.0, 1e6);
+        let rep = gate(&slow, &dir).unwrap();
+        assert!(!rep.regressed(), "{}", rep.render());
+        assert_eq!(rep.host_out_of_band().len(), 2, "{}", rep.render());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The five counts a bounded row records are costs, under every
+    /// suffix a phase gives them, and they move with the machine.
+    #[test]
+    fn every_count_per_op_is_a_cost_whatever_its_suffix() {
+        for base in [
+            "read_bytes_per_op",
+            "majfaults_per_op",
+            "bg_read_bytes_per_op",
+            "refaults_per_op",
+            "read_us_per_io",
+        ] {
+            for q in [
+                base.to_string(),
+                format!("{base}_3t"),
+                format!("{base}_lag100pct"),
+            ] {
+                assert_eq!(higher_is_better(&q), Some(false), "{q}");
+                assert!(machine_dependent(&q), "{q}");
+                assert_eq!(crate::run::count_of(&q), Some(base), "{q}");
+            }
+        }
+        assert_eq!(crate::run::count_of("reads_per_s_3t"), None);
+        assert_eq!(crate::run::count_of("read_bytes_per_opx"), None);
+        assert_eq!(higher_is_better("p50_us"), Some(false));
+        assert!(is_floor("seek-floor") && is_floor("seek-floor-again"));
+        assert!(is_seek_floor("seek-floor-again") && !is_seek_floor("page-floor"));
     }
 
     #[test]

@@ -16,6 +16,7 @@ cd bench
 cargo build --release
 ./target/release/bench run --scale quick        # about three minutes; gates a PR
 ./target/release/bench run --scale full         # hours, on a quiet machine
+sh scripts/ooc.sh 1610612736                     # out of core under a 1.5 GiB bound; Linux, cgroup v1
 ./target/release/bench gate runs-ci/quick/*.json # a row against the series
 ./target/release/bench figures --scale quick    # every figure, from runs/
 ./target/release/bench machine                  # the host as a row records it

@@ -12607,3 +12607,95 @@ fn the_directory_hint_writes_the_segment_and_the_ordered_index_the_default_does(
         );
     }
 }
+
+/// A load nobody reads files no forms. With the forms maintained at
+/// every commit, a stretch of random writes over a partitioned store had
+/// the upkeep thread copying every block the writes overlaid into forms
+/// the next landing dropped: the shuffled load at three million keys
+/// held the store's own size in them. Far from any scan the commit's
+/// maintenance files nothing now, the scan after builds its own and
+/// reads every key; `forms_settle_far` is the shape that filed, kept as
+/// the arm, and it still files.
+#[test]
+fn a_load_nobody_reads_files_no_forms() {
+    for far in [false, true] {
+        let d = dir(&format!("forms-far-{far}"));
+        let opts = Options {
+            // Small seals, so the first flush leaves partitions and the
+            // random writes after it overlay their blocks.
+            seal_bytes: 1 << 20,
+            forms_settle_far: far,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        // The handle the suite holds from the open, so the forms are
+        // maintained as they are there; nothing scans through it yet.
+        let r = db.reader().unwrap();
+        let key = |i: u32| format!("k{i:08}").into_bytes();
+        let val = |i: u32, g: u32| format!("v{i}-{g}").into_bytes();
+        let n = 40_000u32;
+        for i in 0..n {
+            db.append(&key(i), &val(i, 0));
+            if i % 1000 == 999 {
+                db.commit().unwrap();
+            }
+        }
+        db.flush().unwrap();
+        db.settle().unwrap();
+        assert!(db.levels().0 > 0, "the load left partitions");
+        let built0 = db.blocks_built().1;
+        // Random-order updates over the whole key space, committed in
+        // batches of a thousand, with nothing reading between them.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rng = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut model: HashMap<u32, Vec<Vec<u8>>> = (0..n).map(|i| (i, vec![val(i, 0)])).collect();
+        for step in 0..20_000u32 {
+            let i = (rng() % n as u64) as u32;
+            db.append(&key(i), &val(i, step + 1));
+            model.get_mut(&i).unwrap().push(val(i, step + 1));
+            if step % 1000 == 999 {
+                db.commit().unwrap();
+            }
+        }
+        db.commit().unwrap();
+        db.settle().unwrap();
+        let built = db.blocks_built().1 - built0;
+        if far {
+            assert!(built > 0, "the arm that files far from a scan built forms");
+        } else {
+            assert_eq!(built, 0, "a stretch nobody read built {built} blocks");
+        }
+        // A scan through the handle and through the writer reads every
+        // key with every value in order, forms or none.
+        for (who, n_seen) in [("handle", 0usize), ("writer", 0usize)] {
+            let mut seen = n_seen;
+            let mut last: Option<Vec<u8>> = None;
+            let mut check = |k: &[u8], v: &[u8]| {
+                if last.as_deref() != Some(k) {
+                    seen += 1;
+                    last = Some(k.to_vec());
+                }
+                let i: u32 = std::str::from_utf8(&k[1..]).unwrap().parse().unwrap();
+                let want = &model[&i];
+                assert!(
+                    want.iter().any(|w| w == v),
+                    "{who}: key {i} value {:?}",
+                    std::str::from_utf8(v)
+                );
+            };
+            if who == "handle" {
+                r.scan(b"", usize::MAX, &mut check).unwrap();
+            } else {
+                db.scan(b"", usize::MAX, &mut check).unwrap();
+            }
+            assert_eq!(seen, n as usize, "{who}: every key");
+        }
+        drop(r);
+        db.close().unwrap();
+    }
+}
