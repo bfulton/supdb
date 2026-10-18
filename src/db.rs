@@ -22767,10 +22767,8 @@ impl Db {
         if n != b.blob.keys() || a.level != b.level || a.lo != b.lo || a.hi != b.hi {
             return false;
         }
-        (0..n)
-            .step_by(CACHE_BLOCK)
-            .chain(n.checked_sub(1))
-            .all(|r| matches!((a.blob.key_at(r), b.blob.key_at(r)), (Some(x), Some(y)) if x == y))
+        // SCRATCH EXPERIMENT: every rank, not the blocks' first and the last.
+        (0..n).all(|r| matches!((a.blob.key_at(r), b.blob.key_at(r)), (Some(x), Some(y)) if x == y))
     }
 
     fn store_bytes_of(dir: &Path, segs: &[std::sync::Arc<Seg>]) -> u64 {
