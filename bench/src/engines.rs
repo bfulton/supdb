@@ -192,6 +192,23 @@ impl Batch {
     }
 }
 
+/// What `Engine::zpages_state` answers: the second form as the engine holds
+/// it at the moment of asking.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ZState {
+    /// The form is forced on (`supdb::ZPages::Always`), as the engine's own
+    /// options say and not as the arm's name does.
+    pub forced: bool,
+    /// Point reads of a partition answered from a sidecar, over the
+    /// store's life.
+    pub reads: u64,
+    /// The live partitions, those with a sidecar, and those with none for
+    /// being under the floor.
+    pub partitions: u64,
+    pub sidecars: u64,
+    pub small: u64,
+}
+
 pub trait Engine {
     fn name(&self) -> &'static str;
     fn features(&self) -> Features;
@@ -242,6 +259,16 @@ pub trait Engine {
     /// axis, and nothing compares an engine to another through it.
     fn counters(&self) -> Vec<(&'static str, f64)> {
         Vec::new()
+    }
+
+    /// The second form as the engine holds it, or `None` for an engine
+    /// that has none. A pass asks between its timed phases whether a forced
+    /// arm is what it says it is, and `counters` is not for that: it takes
+    /// the writer's upkeep home, which would change the phase after it for
+    /// every arm. This reads the reader table's slots and the live
+    /// segments and takes nothing.
+    fn zpages_state(&self) -> Option<ZState> {
+        None
     }
 }
 
@@ -654,6 +681,11 @@ pub struct Supdb {
     /// its hash (`Options::point_via_ord`). `supdb-nocacheordread`, the
     /// nocache policy alone: the form is for a store that does not fit.
     ordread: bool,
+    /// Every partition's second form forced on (`Options::zpages` at
+    /// `ZPages::Always`), and a point read or a count of a partition read
+    /// from it: `supdb-nocachezpages`, the nocache policy alone, the form
+    /// being for a store that does not fit.
+    zpages: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -1015,6 +1047,9 @@ struct Policy {
     /// A point read of a partition through its ordered index
     /// (`Options::point_via_ord`): `supdb-nocacheordread`.
     ordread: bool,
+    /// The second form forced on (`Options::zpages`):
+    /// `supdb-nocachezpages`.
+    zpages: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -1104,6 +1139,7 @@ impl Default for Policy {
             bg: false,
             bglag: false,
             ordread: false,
+            zpages: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -3232,6 +3268,25 @@ impl Supdb {
         )
     }
 
+    /// `supdb-nocache` with every partition's records also kept in the
+    /// second form and a point read or a count of a partition answered
+    /// from it (`Options::zpages` forced on): the pair against
+    /// `supdb-nocache` differs by that one option and prices what the form
+    /// does for a store that does not fit. The sidecars are built at
+    /// `sync`, inside the load window, so this arm's load carries their
+    /// build. Chosen by hand, as
+    /// `ab --arms supdb-nocache,supdb-nocachezpages`.
+    pub fn create_nocache_zpages(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                block_cache: false,
+                zpages: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with the block cache bounded at 256 MB, the budget
     /// `rocksdb-tuned` runs its block cache on, so that comparison is on
     /// the same memory. Below the bound the two arms are one.
@@ -3341,6 +3396,7 @@ impl Supdb {
             bg,
             bglag,
             ordread,
+            zpages,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -3539,6 +3595,13 @@ impl Supdb {
             asym_pins: asympin,
             exts_by_value: extsval,
             point_via_ord: ordread,
+            // The second form forced on for the arm that prices it, and
+            // whatever the engine ships for every other.
+            zpages: if zpages {
+                supdb::ZPages::Always
+            } else {
+                supdb::Options::default().zpages
+            },
             forms_pieces_only: piecesonly,
             // Unpinned, the writer must be the one publisher, as it was
             // when the pins were priced: the store refuses the pair.
@@ -3676,6 +3739,7 @@ impl Supdb {
             bg,
             bglag,
             ordread,
+            zpages,
             ord_threads: Default::default(),
         })
     }
@@ -4256,6 +4320,9 @@ impl Engine for Supdb {
         if self.ordread {
             return "supdb-nocacheordread";
         }
+        if self.zpages {
+            return "supdb-nocachezpages";
+        }
         match (
             self.partition,
             self.drain,
@@ -4323,6 +4390,7 @@ impl Engine for Supdb {
         let ph = db.scan_phases();
         let uk = db.upkeep_counts();
         let ord = db.ord_point_reads();
+        let z = db.zpage_counts();
         vec![
             ("snapshot_builds", db.snapshot_builds() as f64),
             ("snapshot_extends", db.snapshot_extends() as f64),
@@ -4431,7 +4499,65 @@ impl Engine for Supdb {
                     .declined
                     .load(std::sync::atomic::Ordering::Relaxed) as f64,
             ),
+            // The second form (`Options::zpages`): what answered the reads
+            // and counts of a partition, what was built and what was
+            // declined or refused, and what the store holds at the end.
+            // Read from the reader table's slots and the live segments, so
+            // the handles of a threaded pass are in the sum after they are
+            // dropped. Zero throughout on every arm that does not force it.
+            (
+                "zpage_forced",
+                (db.options().zpages == supdb::ZPages::Always) as u8 as f64,
+            ),
+            ("zpage_reads", z.reads as f64),
+            ("zpage_counts", z.counts as f64),
+            ("zpage_decodes", z.decodes as f64),
+            ("zpage_rawserves", z.rawserves as f64),
+            ("zpage_fallbacks", z.fallbacks as f64),
+            ("zpage_raw_scans", z.raw_scans as f64),
+            ("zpage_builds", z.builds as f64),
+            ("zpage_build_pages", z.build_pages as f64),
+            ("zpage_build_bytes", z.build_bytes as f64),
+            ("zpage_build_stored", z.build_stored as f64),
+            ("zpage_build_failed", z.build_failed as f64),
+            ("zpage_build_orphaned", z.build_orphaned as f64),
+            ("zpage_declined_small", z.declined_small as f64),
+            ("zpage_declined_small_bytes", z.declined_small_bytes as f64),
+            (
+                "zpage_declined_block_backed",
+                z.declined_block_backed as f64,
+            ),
+            ("zpage_declined_oversize", z.declined_oversize as f64),
+            (
+                "zpage_declined_incompressible",
+                z.declined_incompressible as f64,
+            ),
+            ("zpage_declined_unplaceable", z.declined_unplaceable as f64),
+            ("zpage_attached", z.attached as f64),
+            ("zpage_rejected_damage", z.rejected_damage as f64),
+            ("zpage_rejected_identity", z.rejected_identity as f64),
+            ("zpage_partitions_at_end", z.partitions as f64),
+            ("zpage_sidecars_at_end", z.sidecars as f64),
+            ("zpage_small_partitions_at_end", z.small_partitions as f64),
+            ("zpage_damaged_at_end", z.damaged as f64),
+            ("zpage_pages_at_end", z.pages as f64),
+            ("zpage_verified_pages_at_end", z.verified_pages as f64),
+            ("zpage_bad_pages_at_end", z.bad_pages as f64),
+            ("zpage_resident_bytes_at_end", z.resident_bytes as f64),
+            ("zpage_file_bytes_at_end", z.file_bytes as f64),
+            ("zpage_group_bytes_at_end", z.group_bytes as f64),
         ]
+    }
+    fn zpages_state(&self) -> Option<ZState> {
+        let db = self.db.as_ref()?;
+        let c = db.zpage_counts();
+        Some(ZState {
+            forced: db.options().zpages == supdb::ZPages::Always,
+            reads: c.reads,
+            partitions: c.partitions,
+            sidecars: c.sidecars,
+            small: c.small_partitions,
+        })
     }
     fn thread_reader(&self) -> Res<ReaderOpener> {
         let db = self.db.as_ref().ok_or("db closed")?;
@@ -4461,6 +4587,13 @@ impl Engine for Supdb {
                 db.flush().map_err(|e| e.to_string())?;
             } else {
                 db.sync().map_err(|e| e.to_string())?;
+            }
+            // The second form, forced: a flush is answered before the
+            // segment work's later steps, and the arm would read the raw
+            // form of every partition without the sidecars this waits for.
+            // Their build is in the load window, and so is the arm's.
+            if self.zpages {
+                db.zpages_settle().map_err(|e| e.to_string())?;
             }
         }
         Ok(())
@@ -4968,6 +5101,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-noadvice"
         | "supdb-nocache"
         | "supdb-nocacheordread"
+        | "supdb-nocachezpages"
         | "supdb-cache256"
         | "supdb-l0"
         | "supdb-nopin"
@@ -5139,6 +5273,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-noadvice" => Box::new(Supdb::create_noadvice(dir)?),
         "supdb-nocache" => Box::new(Supdb::create_nocache(dir)?),
         "supdb-nocacheordread" => Box::new(Supdb::create_nocache_ordread(dir)?),
+        "supdb-nocachezpages" => Box::new(Supdb::create_nocache_zpages(dir)?),
         "supdb-cache256" => Box::new(Supdb::create_cache256(dir)?),
         "supdb-ingest" => Box::new(Supdb::create_ingest(dir)?),
         "supdb-ingestleave" => Box::new(Supdb::create_ingest_leave(dir)?),
@@ -5599,6 +5734,183 @@ mod tests {
         std::fs::create_dir_all(&opened).unwrap();
         let e = open("supdb-nocacheordread", &opened, 1).unwrap();
         assert_eq!(e.name(), "supdb-nocacheordread", "the dispatch");
+        drop(e);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `supdb-nocachezpages` is the nocache policy with `zpages` alone set
+    /// over `supdb-nocache`: named, durable like it, opened under its name
+    /// by the dispatch, and opened on options that differ from
+    /// `supdb-nocache`'s in `Options::zpages` alone, the floor under which
+    /// a partition is left raw included (`CLAUDE.md`: an arm that keeps an
+    /// old shape keeps that shape's other settings with it). And the form
+    /// is used: the same keys written and read through each, the arm's
+    /// partition is given its sidecar by its `sync` and its reads are
+    /// answered from it, the base's are not, for the writer's own handle
+    /// and for the handles a threaded pass hands its threads, whose counts
+    /// are in the store's after they are dropped.
+    #[test]
+    fn the_zpages_arm_differs_from_nocache_in_the_option_alone() {
+        let root = std::env::temp_dir().join(format!("supdb-bench-zpages-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let new = |name: &str, arm: bool| {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            if arm {
+                Supdb::create_nocache_zpages(&d)
+            } else {
+                Supdb::create_nocache(&d)
+            }
+            .unwrap()
+        };
+        let (mut arm, mut base) = (new("arm", true), new("base", false));
+        assert_eq!(arm.name(), "supdb-nocachezpages");
+        assert_eq!(base.name(), "supdb-nocache");
+        assert_eq!(guarantee("supdb-nocachezpages"), Some(Guarantee::Durable));
+        assert_eq!(guarantee("supdb-nocachezpages"), guarantee("supdb-nocache"));
+        assert!(arm.zpages && !base.zpages);
+        // The policy: every flag the arm could have set beside its own.
+        assert_eq!(arm.partition, base.partition, "the row's shape");
+        assert_eq!(arm.drain, base.drain);
+        assert_eq!(arm.durable, base.durable, "the row's guarantee");
+        assert_eq!(arm.block_cache, base.block_cache);
+        assert!(!arm.block_cache, "the nocache policy");
+        assert_eq!(arm.budget, base.budget);
+        assert_eq!(arm.advice, base.advice);
+        assert_eq!(arm.features(), base.features());
+        assert!(!arm.ordread && !arm.extsval && !arm.dirplain && !arm.forms && !arm.lazyforms);
+        let (a, b) = (
+            arm.db.as_ref().unwrap().options(),
+            base.db.as_ref().unwrap().options(),
+        );
+        assert!(
+            a.zpages == supdb::ZPages::Always && b.zpages == supdb::ZPages::Off,
+            "the one option"
+        );
+        assert_eq!(a.zpages_min_bytes, b.zpages_min_bytes, "the engine's floor");
+        assert_eq!(a.point_via_ord, b.point_via_ord);
+        assert_eq!(a.exts_by_value, b.exts_by_value);
+        assert_eq!(a.scan_block_cache, b.scan_block_cache);
+        assert_eq!(a.scan_cache_bytes, b.scan_cache_bytes);
+        assert_eq!(a.read_advice, b.read_advice);
+        assert_eq!(a.seek_prefetch_dir, b.seek_prefetch_dir);
+        assert_eq!(a.scan_prefetch, b.scan_prefetch);
+        assert_eq!(a.inline_bytes, b.inline_bytes);
+        assert_eq!(a.partition_bytes, b.partition_bytes);
+        assert_eq!(a.seal_bytes, b.seal_bytes);
+        assert_eq!(a.compact, b.compact);
+        assert_eq!(a.promote, b.promote);
+        assert_eq!(a.sync, b.sync);
+        assert_eq!(a.upkeep, b.upkeep);
+        assert_eq!(a.writer_pins, b.writer_pins);
+        assert!(
+            a.writer_pins,
+            "the form is refused beside an unpinned writer"
+        );
+        assert_eq!(a.publish_in_background, b.publish_in_background);
+        // The default is untouched: the shipping arm reads as it always did.
+        assert_eq!(supdb::Options::default().zpages, supdb::ZPages::Off);
+        let shipping = {
+            let d = root.join("shipping");
+            std::fs::create_dir_all(&d).unwrap();
+            Supdb::create(&d).unwrap()
+        };
+        assert!(!shipping.zpages);
+        assert_eq!(
+            shipping.db.as_ref().unwrap().options().zpages,
+            supdb::ZPages::Off
+        );
+        drop(shipping);
+
+        // The form is used by the arm and by nothing else. Keys of the
+        // suite's shape in key order, drained into a partition, and enough
+        // of them to stand over the floor a partition is left raw under.
+        let value = [7u8; 100];
+        let keys: Vec<[u8; 16]> = (0..30_000u64)
+            .map(|i| {
+                let mut k = [0u8; 16];
+                crate::workload::db_key_into(i, &mut k);
+                k
+            })
+            .collect();
+        for e in [&mut arm, &mut base] {
+            for chunk in keys.chunks(1_000) {
+                let items: Vec<(&[u8], &[u8])> =
+                    chunk.iter().map(|k| (&k[..], &value[..])).collect();
+                e.write_batch(&items).unwrap();
+            }
+            e.sync().unwrap();
+            assert!(e.db.as_ref().unwrap().levels().0 >= 1, "a partition");
+        }
+        let (az, bz) = (arm.zpages_state().unwrap(), base.zpages_state().unwrap());
+        assert!(az.forced && !bz.forced, "{az:?} {bz:?}");
+        assert!(
+            az.partitions >= 1 && az.sidecars == az.partitions && az.small == 0,
+            "every partition has its sidecar when the sync returns: {az:?}"
+        );
+        assert_eq!((bz.sidecars, bz.small), (0, 0), "{bz:?}");
+        let (mut reads, absent) = (0f64, [0xffu8; 16]);
+        for k in keys.iter().step_by(7) {
+            assert_eq!(arm.get(k).unwrap(), value.len());
+            assert_eq!(base.get(k).unwrap(), value.len());
+            reads += 1.0;
+        }
+        assert_eq!(arm.get(&absent).unwrap(), 0);
+        assert_eq!(base.get(&absent).unwrap(), 0);
+        let count = |e: &Supdb, name: &str| {
+            e.counters()
+                .iter()
+                .find(|(n, _)| *n == name)
+                .unwrap_or_else(|| panic!("no counter {name}"))
+                .1
+        };
+        // A key the segment's Bloom rules out never reaches the partition's
+        // read, so the absent key is in the count when the filter lets it
+        // through and not when it does not.
+        let served = count(&arm, "zpage_reads");
+        assert!(
+            served == reads || served == reads + 1.0,
+            "{served} of {reads}"
+        );
+        assert_eq!(count(&arm, "zpage_rawserves"), 0.0, "none left raw");
+        assert_eq!(count(&arm, "zpage_fallbacks"), 0.0, "none refused");
+        assert_eq!(count(&arm, "zpage_forced"), 1.0);
+        assert_eq!(count(&arm, "zpage_sidecars_at_end"), az.sidecars as f64);
+        assert_eq!(count(&base, "zpage_forced"), 0.0);
+        for name in [
+            "zpage_reads",
+            "zpage_rawserves",
+            "zpage_builds",
+            "zpage_sidecars_at_end",
+        ] {
+            assert_eq!(count(&base, name), 0.0, "the default's path: {name}");
+        }
+        assert_eq!(count(&arm, "zpage_builds"), az.sidecars as f64);
+
+        // The handles a threaded pass hands its threads count on their
+        // slots, which a handle's drop leaves where they are: the counters
+        // read after a pass carry the whole of it.
+        let handle_reads = keys.iter().step_by(11).count() as f64;
+        for e in [&arm, &base] {
+            let mut r = (e.thread_reader().unwrap())().unwrap();
+            for k in keys.iter().step_by(11) {
+                assert_eq!(r.get(k).unwrap(), value.len());
+            }
+            drop(r);
+        }
+        assert_eq!(count(&arm, "zpage_reads"), served + handle_reads);
+        assert_eq!(count(&base, "zpage_reads"), 0.0);
+        // A scan is walked raw, and counted as one that stood aside.
+        assert_eq!(arm.range(&keys[0], 10).unwrap(), 10 * value.len());
+        assert_eq!(count(&arm, "zpage_raw_scans"), 1.0);
+        assert_eq!(count(&base, "zpage_raw_scans"), 0.0);
+        drop(arm);
+        drop(base);
+        // The dispatch opens the arm by its name.
+        let opened = root.join("open");
+        std::fs::create_dir_all(&opened).unwrap();
+        let e = open("supdb-nocachezpages", &opened, 1).unwrap();
+        assert_eq!(e.name(), "supdb-nocachezpages", "the dispatch");
         drop(e);
         let _ = std::fs::remove_dir_all(&root);
     }

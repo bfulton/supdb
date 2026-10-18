@@ -8,7 +8,7 @@
 //! and first-fault costs that no steady state repeats.
 
 use crate::bound::Bound;
-use crate::engines::{self, Batch, Engine};
+use crate::engines::{self, Batch, Engine, ZState};
 use crate::env::{self, IoCounters};
 use crate::gate;
 use crate::hist::Hist;
@@ -1368,6 +1368,55 @@ fn stat_majflt(stat: &str) -> Option<u64> {
         .and_then(|(_, rest)| rest.split_whitespace().nth(9).and_then(|v| v.parse().ok()))
 }
 
+/// Where a pass asks whether the second form is what the arm says.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ZStage {
+    /// After the load, whose `sync` makes the sidecars.
+    Loaded,
+    /// After the point reads.
+    Read,
+}
+
+/// The refusal of an arm whose second form is not what its name says.
+/// A forced arm with no sidecar, or with the partitions it could cover
+/// raw, posts the raw form's throughput under the form's name; an arm that
+/// does not force the form and has read from a sidecar has been priced as
+/// something else. Either is a measurement of the wrong store, found after
+/// the load that made it. A partition left raw because it is under the
+/// engine's floor is the engine's own decision, counted and printed
+/// (`zpage_declined_small_bytes`), and covers nothing the form is for;
+/// every other partition without a sidecar was declined for what it holds
+/// or failed, and refuses the pass. `None` is an engine with no such form,
+/// which nothing is asked of.
+fn zpages_refusal(arm: &str, size: u64, stage: ZStage, z: Option<ZState>) -> Result<(), String> {
+    let Some(z) = z else { return Ok(()) };
+    let wrong = |what: String| {
+        Err(format!(
+            "{arm} at {size}: {what}, so this is not a measurement of the form"
+        ))
+    };
+    match (stage, z.forced) {
+        (ZStage::Loaded, true) if z.sidecars == 0 => wrong(format!(
+            "the form is forced and none of {} partitions has a sidecar after the load \
+             ({} are under the floor; raise the key count)",
+            z.partitions, z.small
+        )),
+        (ZStage::Loaded, true) if z.sidecars + z.small != z.partitions => wrong(format!(
+            "the form is forced and {} of {} partitions have a sidecar after the load \
+             ({} are under the floor); the rest were declined or failed",
+            z.sidecars, z.partitions, z.small
+        )),
+        (ZStage::Read, true) if z.reads == 0 => wrong(
+            "the form is forced and no point read of the pass was answered from a sidecar".into(),
+        ),
+        (ZStage::Read, false) if z.reads != 0 => wrong(format!(
+            "the form is not forced and {} point reads were answered from a sidecar",
+            z.reads
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn one_pass(
     arm: &str,
     dir: &Path,
@@ -1390,6 +1439,10 @@ fn one_pass(
     let c0 = counting.begin();
     let (load_s, wrote) = load(e.as_mut(), size, plan, payload, |i| i)?;
     counting.end(c0, "load", "", None, size);
+    // The form's sidecars are made by the `sync` the load ends in: a forced
+    // arm that is not covered is refused here and not after the hour its
+    // reads would take.
+    zpages_refusal(arm, size, ZStage::Loaded, e.zpages_state())?;
     let stored = size as f64 * (KEY_SIZE + plan.value_size) as f64;
     // Read here so that this and the device bytes describe one moment: what
     // the engine wrote to get there, and what it occupies having got there.
@@ -1431,6 +1484,7 @@ fn one_pass(
         read_s = t.elapsed().as_secs_f64();
         phase_mark(arm, "read", "end");
         counting.end(c0, "read", "", None, reads);
+        zpages_refusal(arm, size, ZStage::Read, e.zpages_state())?;
     }
 
     // The same reads over each thread count, on the store as loaded and
@@ -3045,14 +3099,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let plan = Plan::new(Scale::Quick, vec![], 10_000, 4);
         let payload = Payload::new(plan.value_size, plan.compress, 0xE1);
-        let size = 2_000u64;
         for arm in [
             "supdb",
             "supdb-ingest",
             "supdb-nocacheordread",
+            "supdb-nocachezpages",
             "lmdb",
             "rocksdb-tuned",
         ] {
+            // The arm that reads from the second form is given a store with
+            // a partition over the floor, which has a sidecar to read from.
+            let size = if arm == "supdb-nocachezpages" {
+                30_000u64
+            } else {
+                2_000
+            };
             let dir = root.join(arm);
             std::fs::create_dir_all(&dir).unwrap();
             let mut e = engines::open(arm, &dir, 1).unwrap();
@@ -3083,8 +3144,29 @@ mod tests {
                     Some(size as f64),
                     "{arm}: the threads' reads reach the counters"
                 ),
-                "supdb" | "supdb-ingest" => assert_eq!(handles_read, Some(0.0), "{arm}"),
+                "supdb" | "supdb-ingest" | "supdb-nocachezpages" => {
+                    assert_eq!(handles_read, Some(0.0), "{arm}")
+                }
                 _ => assert_eq!(handles_read, None, "{arm}"),
+            }
+            // The arm that forces the second form reads the threads' keys
+            // from the sidecars its load's sync made, and the count of
+            // them is in the store's after the threads' handles are gone.
+            let from_sidecars = e
+                .counters()
+                .iter()
+                .find(|(n, _)| *n == "zpage_reads")
+                .map(|(_, v)| *v);
+            match arm {
+                "supdb-nocachezpages" => assert_eq!(
+                    from_sidecars,
+                    Some(size as f64),
+                    "{arm}: the threads' reads are answered from the sidecars"
+                ),
+                "supdb" | "supdb-ingest" | "supdb-nocacheordread" => {
+                    assert_eq!(from_sidecars, Some(0.0), "{arm}")
+                }
+                _ => assert_eq!(from_sidecars, None, "{arm}"),
             }
             let scans = size / plan.scan_len as u64;
             let got = threaded(
@@ -3106,6 +3188,118 @@ mod tests {
             assert_eq!(got.own, (0, 0), "{arm}: counted without being asked");
             drop(e);
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The refusal of a forced arm whose second form is not in use, held to
+    /// inputs that are known red -- nothing covered, a partition left raw
+    /// for what it holds beside the covered ones, no read answered from a
+    /// sidecar after the reads, an arm that does not force the form and
+    /// has read from one -- and to the ones that are green: every
+    /// partition covered, a sliver under the floor beside the covered
+    /// ones, an arm that reads from none, and an engine with no such form.
+    #[test]
+    fn a_forced_form_that_is_not_in_use_is_refused() {
+        let z = |forced, reads, partitions, sidecars, small| {
+            Some(ZState {
+                forced,
+                reads,
+                partitions,
+                sidecars,
+                small,
+            })
+        };
+        let run = |stage, state| zpages_refusal("supdb-nocachezpages", 1_000, stage, state);
+        assert!(run(ZStage::Loaded, z(true, 0, 18, 18, 0)).is_ok());
+        assert!(
+            run(ZStage::Loaded, z(true, 0, 18, 17, 1)).is_ok(),
+            "a sliver under the floor is the engine's own decision"
+        );
+        assert!(run(ZStage::Read, z(true, 10, 18, 18, 0)).is_ok());
+        assert!(run(ZStage::Read, z(false, 0, 18, 0, 0)).is_ok());
+        assert!(run(ZStage::Loaded, z(false, 0, 18, 0, 0)).is_ok());
+        assert!(run(ZStage::Loaded, None).is_ok(), "an engine with no form");
+        assert!(run(ZStage::Read, None).is_ok());
+
+        let red = |stage, state| run(stage, state).unwrap_err();
+        let none = red(ZStage::Loaded, z(true, 0, 18, 0, 0));
+        assert!(none.contains("none of 18 partitions"), "{none}");
+        let under = red(ZStage::Loaded, z(true, 0, 1, 0, 1));
+        assert!(under.contains("raise the key count"), "{under}");
+        let part = red(ZStage::Loaded, z(true, 0, 18, 17, 0));
+        assert!(part.contains("17 of 18"), "{part}");
+        let part = red(ZStage::Loaded, z(true, 0, 18, 16, 1));
+        assert!(part.contains("16 of 18"), "{part}");
+        let silent = red(ZStage::Read, z(true, 0, 18, 18, 0));
+        assert!(silent.contains("no point read"), "{silent}");
+        let leaked = red(ZStage::Read, z(false, 3, 18, 0, 0));
+        assert!(leaked.contains("3 point reads"), "{leaked}");
+        assert!(none.starts_with("supdb-nocachezpages at 1000: "), "{none}");
+    }
+
+    /// The pass itself refuses a forced arm over a store with no sidecar to
+    /// read, and runs one that has: the same arm at a size under the floor
+    /// and over it, and the unforced arm beside it, which reads from none.
+    #[test]
+    fn the_pass_refuses_a_forced_arm_that_covers_nothing_and_runs_one_that_does() {
+        let root = std::env::temp_dir().join(format!("supdb-bench-zpass-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut plan = Plan::new(Scale::Quick, vec![], 30_000, 4);
+        plan.passes = Passes::parse("load,read").unwrap();
+        let payload = Payload::new(plan.value_size, plan.compress, 0xE1);
+        let small = one_pass(
+            "supdb-nocachezpages",
+            &root.join("small"),
+            2_000,
+            1,
+            &plan,
+            &payload,
+        );
+        let why = small
+            .err()
+            .expect("the form forced over a store under the floor");
+        assert!(
+            why.contains("supdb-nocachezpages at 2000") && why.contains("none of"),
+            "{why}"
+        );
+        let count = |p: &OnePass, name: &str| {
+            p.counters
+                .iter()
+                .find(|(n, _)| *n == name)
+                .unwrap_or_else(|| panic!("no counter {name}"))
+                .1
+        };
+        let forced = one_pass(
+            "supdb-nocachezpages",
+            &root.join("forced"),
+            30_000,
+            1,
+            &plan,
+            &payload,
+        )
+        .unwrap();
+        assert_eq!(count(&forced, "zpage_forced"), 2.0, "both stores forced");
+        assert_eq!(count(&forced, "zpage_reads"), 30_000.0, "every read");
+        assert_eq!(count(&forced, "zpage_rawserves"), 0.0);
+        assert!(
+            count(&forced, "zpage_sidecars_at_end") >= 2.0,
+            "one a store"
+        );
+        let base = one_pass(
+            "supdb-nocache",
+            &root.join("base"),
+            30_000,
+            1,
+            &plan,
+            &payload,
+        )
+        .unwrap();
+        assert_eq!(count(&base, "zpage_forced"), 0.0);
+        assert_eq!(count(&base, "zpage_reads"), 0.0);
+        assert_eq!(count(&base, "zpage_sidecars_at_end"), 0.0);
+        // The counters are in the paired quantities `ab` prints.
+        let flat = forced.flat();
+        assert!(flat.iter().any(|(n, _)| n == "count zpage_reads"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
