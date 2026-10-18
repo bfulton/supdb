@@ -10655,6 +10655,11 @@ struct State {
 struct CanonicalForm {
     form: std::sync::Arc<Cached>,
     bytes: usize,
+    /// SCRATCH EXPERIMENT: the log position the form was settled at when it
+    /// was swapped into its slot; zero for a form carried across a publish,
+    /// which is current to whatever `forms_at` of the state says. A reader
+    /// bound to an older position than this does not take it.
+    pos: usize,
 }
 
 impl State {
@@ -10752,6 +10757,7 @@ impl State {
                 let carried = Box::into_raw(Box::new(CanonicalForm {
                     form,
                     bytes: form_bytes,
+                    pos: 0,
                 }));
                 next.forms[p][b].store(carried, AtomicOrdering::Relaxed);
             }
@@ -12186,6 +12192,17 @@ impl SlotSet {
 /// An overlay assembled from a chain alone names no snapshot; this one
 /// stands in, and nothing reads a run from it.
 static NO_SNAPSHOT: std::sync::LazyLock<Snapshot> = std::sync::LazyLock::new(Snapshot::default);
+
+/// SCRATCH EXPERIMENT: what `Reader::canonical` answers for a published form
+/// that is ahead of the reader: the mark a reader builds its own for.
+static REJECTED_FORM: std::sync::LazyLock<Cached> = std::sync::LazyLock::new(|| {
+    Cached::Wide(WideBlock {
+        sorted: Vec::new(),
+        seen: 0,
+        covered: false,
+        walks: 0,
+    })
+});
 
 /// PROTOTYPE: the arena a snapshot's key bytes and copied runs live in,
 /// shared by every version of one snapshot and appended to by whichever
@@ -15552,6 +15569,13 @@ impl Reader {
         // replacement, and this handle is pinned for the operation or is
         // the writer's own, which frees nothing while it reads.
         let e = unsafe { &*e };
+        // SCRATCH EXPERIMENT: a form settled past the position this handle
+        // reads at is not for it, whatever `forms_at` said when the scan
+        // began: the slot was swapped after that, and the position is
+        // stored after the swaps. A marker, so the block is built.
+        if e.pos != 0 && self.forms_bound().is_some_and(|bound| e.pos > bound) {
+            return Some(&REJECTED_FORM);
+        }
         dbgtrace::ev3(
             4,
             self.who(),
@@ -16086,6 +16110,7 @@ impl Reader {
         let new = Box::into_raw(Box::new(CanonicalForm {
             form: form.clone(),
             bytes,
+            pos: self.mem().committed_log().min(self.log_bound.get()),
         }));
         let old = slot.swap(new, AtomicOrdering::AcqRel);
         dbgtrace::ev3(
@@ -30140,6 +30165,7 @@ mod sweep_gate {
             let form = Box::into_raw(Box::new(CanonicalForm {
                 form: std::sync::Arc::new(Cached::Clean),
                 bytes: 0,
+                pos: 0,
             }));
             let epoch = db.shared.readers.epoch.load(AtomicOrdering::SeqCst);
             db.shared.retired_forms.push(epoch + 1, RetiredForm(form));
