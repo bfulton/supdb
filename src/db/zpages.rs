@@ -361,11 +361,11 @@ pub fn decode_group<'a>(
     buf: &'a mut GroupBuf,
 ) -> Result<&'a [u8], ZError> {
     h.check()?;
+    if payload.len() != usize::from(h.clen) {
+        return Err(ZError::Header("the payload is not clen bytes"));
+    }
     let ulen = h.ulen as usize;
     if h.stored {
-        if payload.len() != ulen {
-            return Err(ZError::Header("a stored payload is not ulen bytes"));
-        }
         if (payload.as_ptr() as usize).is_multiple_of(std::mem::align_of::<crate::index::Ext>()) {
             return Ok(payload);
         }
@@ -2125,8 +2125,15 @@ mod tests {
             decode_group(&shorter, payload, &mut buf).err(),
             Some(ZError::Decode)
         );
-        // A payload cut short is not a block.
+        // A payload that is not the page's clen bytes is not the page's.
         let e = decode_group(&h, &payload[..payload.len() / 2], &mut buf).err();
+        assert!(matches!(e, Some(ZError::Header(_))), "{e:?}");
+        // And one cut short with its header corrected is not a block.
+        let half = PageHeader {
+            clen: (payload.len() / 2) as u16,
+            ..h
+        };
+        let e = decode_group(&half, &payload[..payload.len() / 2], &mut buf).err();
         assert!(
             matches!(e, Some(ZError::Decode | ZError::DecodedLen)),
             "{e:?}"
@@ -3667,6 +3674,29 @@ mod tests {
         assert!(
             r.is_err() || r.unwrap() != 12,
             "trailing zeros are further sequences"
+        );
+    }
+
+    #[test]
+    fn the_lz4_version_is_the_one_the_sizes_were_measured_with() {
+        // The version the lock resolves. The pages' sizes are the codec's
+        // output, so a new version is a new sizing: take `zsize` again, and
+        // move this pin with the pins of the test above it.
+        let lock = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock");
+        let Ok(text) = std::fs::read_to_string(&lock) else {
+            eprintln!(
+                "no Cargo.lock at {}: the version pin is not checked from here",
+                lock.display()
+            );
+            return;
+        };
+        let at = text
+            .find("name = \"lz4_flex\"")
+            .expect("lz4_flex is in the lock");
+        assert_eq!(
+            text[at..].lines().nth(1),
+            Some("version = \"0.11.6\""),
+            "lz4_flex moved: re-run bench/examples/zsize.rs, then update the pins"
         );
     }
 
