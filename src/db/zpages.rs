@@ -349,10 +349,12 @@ impl Default for GroupBuf {
 /// where it is not. Either way the bytes returned are aligned, so a record
 /// of any shape parses out of them.
 ///
-/// The buffer is reused without zeroing, so a payload that decodes to fewer
-/// bytes than `ulen` would leave stale bytes inside the group: the length the
-/// decoder reports is required to equal `ulen`. The caller has parsed the
-/// page ([`parse_page`]) first, so the CRC has passed.
+/// The decoder is `lz4_flex`'s `block::decompress_into` called directly, not
+/// the engine's `crate::block::decompress_into`, which discards the length it
+/// decoded: the buffer is reused without zeroing, so a payload that decodes
+/// to fewer bytes than `ulen` would leave stale bytes inside the group, and
+/// the length is required to equal `ulen`. The caller has parsed the page
+/// ([`parse_page`]) first, so the CRC has passed.
 pub fn decode_group<'a>(
     h: &PageHeader,
     payload: &'a [u8],
