@@ -2393,6 +2393,78 @@ mod tests {
     }
 
     #[test]
+    fn a_pages_view_is_its_header_and_payload_and_checks_only_those() {
+        for (group, stored) in small_groups() {
+            let group = group.concat();
+            let page = manual_page(&group, 3, 17, 0xBEEF, stored);
+            let (h, payload) = parse_page(&page, 0xBEEF).unwrap();
+            // The view agrees with the full parse where the page is whole.
+            assert_eq!(page_view(&page), Ok((h, payload)));
+            // It does not look at the CRC, the tag or the padding: those are
+            // the first decode's, and a read of a verified page must not pay
+            // for them again. A damaged page's view is the first decode's to
+            // refuse, which is why a page is viewed only once it has passed.
+            let mut damaged = page;
+            damaged[ZPAGE - 1] ^= 0xFF;
+            assert_eq!(parse_page(&damaged, 0xBEEF).err(), Some(ZError::PageCrc));
+            assert_eq!(page_view(&damaged), Ok((h, payload)));
+            // What it does check is what it hands back is bounded: the
+            // header's values, and the page's length.
+            let mut wild = page;
+            wild[P_CLEN..P_CLEN + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+            assert!(matches!(page_view(&wild), Err(ZError::Header(_))));
+            let mut zero_count = page;
+            zero_count[P_COUNT..P_COUNT + 2].copy_from_slice(&0u16.to_le_bytes());
+            assert!(matches!(page_view(&zero_count), Err(ZError::Header(_))));
+            assert_eq!(page_view(&page[..ZPAGE - 1]).err(), Some(ZError::Length));
+            assert_eq!(page_view(&[]).err(), Some(ZError::Length));
+        }
+    }
+
+    #[test]
+    fn a_fence_finds_the_entry_a_key_falls_among_and_none_below_the_first() {
+        let keys: [&[u8]; 5] = [b"b", b"d", b"dd", b"f", b"ff"];
+        let mut f = ZFence::new();
+        for (i, k) in keys.iter().enumerate() {
+            f.push(i as u32 * 10, i as u32, k).unwrap();
+        }
+        assert_eq!(
+            f.entry_of(b""),
+            None,
+            "the empty key sorts below every other"
+        );
+        assert_eq!(f.entry_of(b"a"), None);
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(f.entry_of(k), Some(i), "an entry's own key");
+        }
+        assert_eq!(f.entry_of(b"c"), Some(0));
+        assert_eq!(f.entry_of(b"d\x00"), Some(1));
+        assert_eq!(
+            f.entry_of(b"dc"),
+            Some(1),
+            "a key among an entry's extensions"
+        );
+        assert_eq!(f.entry_of(b"de"), Some(2));
+        assert_eq!(f.entry_of(b"e"), Some(2));
+        assert_eq!(f.entry_of(b"zzzz"), Some(4));
+        // An empty fence key, the first, is at or below every key, the empty
+        // one included, and a long key is compared as the engine compares it.
+        let mut g = ZFence::new();
+        g.push(0, 0, b"").unwrap();
+        g.push(5, 1, &[7u8; 40]).unwrap();
+        assert_eq!(g.entry_of(b""), Some(0));
+        assert_eq!(g.entry_of(&[3u8]), Some(0));
+        assert_eq!(g.entry_of(b"a"), Some(1));
+        assert_eq!(g.entry_of(&[7u8; 40]), Some(1));
+        assert_eq!(g.entry_of(&[7u8; 39]), Some(0));
+        assert_eq!(g.entry_of(&[7u8; 41]), Some(1));
+        assert_eq!(ZFence::new().entry_of(b"k"), None);
+        // The fence's heap: four words an entry, one more for the offsets,
+        // and the keys.
+        assert_eq!(f.heap_bytes(), 4 * (5 + 5 + 6) + 1 + 1 + 2 + 1 + 2);
+    }
+
+    #[test]
     fn a_zeroed_page_cannot_pass() {
         let zero = [0u8; ZPAGE];
         for bind in [0u32, 1, 0xFFFF_FFFF, 0x1234_5678] {

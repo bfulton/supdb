@@ -1062,3 +1062,712 @@ fn write_pages(
         total_ulen,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::zpages::ZHDR;
+    use crate::db::{SegmentOptions, SegmentWriter};
+    use std::os::unix::fs::FileExt;
+    use std::path::PathBuf;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn word(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.word() % n as u64) as usize
+        }
+        fn bytes(&mut self, n: usize) -> Vec<u8> {
+            (0..n).map(|_| (self.word() >> 24) as u8).collect()
+        }
+    }
+
+    fn dir(name: &str) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("supdb-next-zside-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A key, its values in append order, and whether its run is flagged a
+    /// tombstone.
+    type Rec = (Vec<u8>, Vec<Vec<u8>>, bool);
+
+    /// A segment written as the engine's own writer writes one.
+    fn write_segment(path: &Path, recs: &[Rec], inline_max: usize) {
+        let mut w = SegmentWriter::create(path, &SegmentOptions::default()).unwrap();
+        w.set_inline_max(inline_max);
+        for (k, vals, tomb) in recs {
+            w.begin(k).unwrap();
+            for v in vals {
+                w.value(v);
+            }
+            w.end_with(*tomb).unwrap();
+        }
+        w.finish(1).unwrap();
+    }
+
+    /// The suite's record: sixteen digits and a hundred bytes of which half
+    /// is a repeated phrase at a phase drawn for each and half entropy.
+    fn suite(n: usize, seed: u64) -> Vec<Rec> {
+        let mut rng = Rng(seed | 1);
+        let motif = b"the quick brown fox jumps over the lazy dog 0123456789 ";
+        (0..n)
+            .map(|i| {
+                let phase = rng.below(motif.len());
+                let mut v: Vec<u8> = (0..50).map(|j| motif[(phase + j) % motif.len()]).collect();
+                v.extend(rng.bytes(50));
+                (format!("{i:016}").into_bytes(), vec![v], false)
+            })
+            .collect()
+    }
+
+    /// Runs of every shape the format has, all inline and all small enough
+    /// for a page once compressed: one value, two, seventeen, two hundred and
+    /// fifteen hundred; a fixed width and a prefixed run; zero-length
+    /// values; a tombstone with nothing under it, and one over a run; and
+    /// the empty key first.
+    fn shapes() -> Vec<Rec> {
+        let mut rng = Rng(0x5eed_1234_9876);
+        let mut recs: Vec<Rec> = vec![(Vec::new(), vec![b"the empty key".to_vec()], false)];
+        let mut id = 0u32;
+        let mut key = |tag: &str| {
+            id += 1;
+            format!("{tag}-{id:05}").into_bytes()
+        };
+        for n in [1usize, 2, 17, 200, 1500] {
+            // A fixed width, and a pattern a page's compressor takes whole.
+            recs.push((
+                key("fixed"),
+                (0..n).map(|i| vec![(i % 3) as u8, 0, 0, 7]).collect(),
+                false,
+            ));
+            // Prefixed: widths vary, among them none.
+            recs.push((
+                key("varied"),
+                (0..n).map(|i| vec![b'a' + (i % 3) as u8; i % 7]).collect(),
+                false,
+            ));
+        }
+        recs.push((key("zeros"), vec![Vec::new(); 5], false));
+        recs.push((key("zero"), vec![Vec::new()], false));
+        recs.push((key("tomb"), vec![], true));
+        recs.push((
+            key("tombrun"),
+            (0..40).map(|i| vec![i as u8; 3]).collect(),
+            true,
+        ));
+        for _ in 0..300 {
+            let n = 1 + rng.below(6);
+            let k = key("rand");
+            recs.push((
+                k,
+                (0..n)
+                    .map(|_| {
+                        let l = rng.below(60);
+                        vec![b'x'; l]
+                    })
+                    .collect(),
+                false,
+            ));
+        }
+        recs.sort_by(|a, b| a.0.cmp(&b.0));
+        recs.dedup_by(|a, b| a.0 == b.0);
+        recs
+    }
+
+    const ID: u64 = 7;
+    const END: u64 = 99;
+
+    struct Fixture {
+        dir: PathBuf,
+        seg: PathBuf,
+        out: PathBuf,
+        blob: Blob<MmapBytes>,
+        recs: Vec<Rec>,
+    }
+
+    impl Fixture {
+        fn new(name: &str, recs: Vec<Rec>, inline_max: usize) -> Fixture {
+            let dir = dir(name);
+            let seg = dir.join("par-00000007-0000000000000099--.sup");
+            write_segment(&seg, &recs, inline_max);
+            let blob = Blob::open(MmapBytes::open(&seg).unwrap()).unwrap();
+            Fixture {
+                out: dir.join(zpg_name(ID, END)),
+                dir,
+                seg,
+                blob,
+                recs,
+            }
+        }
+
+        fn build(&self) -> Outcome {
+            build(&self.seg, &self.out, ID, END, 0).unwrap()
+        }
+
+        fn attach(&self) -> std::result::Result<ZSide, Reject> {
+            ZSide::attach(&self.out, &self.blob, ID, END, false)
+        }
+
+        /// A sidecar built and attached.
+        fn side(&self) -> ZSide {
+            assert!(matches!(self.build(), Outcome::Built(_)));
+            self.attach().expect("the sidecar it just built attaches")
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn raw_values(blob: &Blob<MmapBytes>, key: &[u8]) -> Vec<Vec<u8>> {
+        let mut v = Vec::new();
+        blob.read_all(key, |x| v.push(x.to_vec())).unwrap();
+        v
+    }
+
+    /// What the sidecar answers for `key`, or `None` where it declines.
+    fn z_values(side: &ZSide, blob: &Blob<MmapBytes>, key: &[u8]) -> Option<Vec<Vec<u8>>> {
+        let mut v = Vec::new();
+        match side
+            .read_all(blob, key, &mut |x: &[u8]| v.push(x.to_vec()))
+            .unwrap()
+        {
+            ZRead::Served { n, .. } => {
+                assert_eq!(n as usize, v.len(), "the count the read returned");
+                Some(v)
+            }
+            _ => None,
+        }
+    }
+
+    fn served(r: ZRead) -> u64 {
+        match r {
+            ZRead::Served { n, .. } => n,
+            other => panic!("not served: {other:?}"),
+        }
+    }
+
+    /// Keys around the records: below the first, above the last, between
+    /// two, one byte either side of each key, a proper prefix of each, and
+    /// an extension of each.
+    fn probes(recs: &[Rec]) -> Vec<Vec<u8>> {
+        let mut p: Vec<Vec<u8>> = vec![Vec::new(), vec![0], vec![0xff; 8], b"zzzzzzzz".to_vec()];
+        for (k, _, _) in recs {
+            p.push(k.clone());
+            p.push([k.as_slice(), &[0u8]].concat());
+            p.push([k.as_slice(), &[0xffu8]].concat());
+            if let Some((&last, head)) = k.split_last() {
+                p.push(head.to_vec());
+                let mut below = head.to_vec();
+                below.push(last.wrapping_sub(1));
+                p.push(below);
+                let mut above = head.to_vec();
+                above.push(last.wrapping_add(1));
+                p.push(above);
+            }
+        }
+        p
+    }
+
+    /// Every probe answers as the segment's own reader answers it, values
+    /// and count both.
+    fn agree(side: &ZSide, blob: &Blob<MmapBytes>, recs: &[Rec]) {
+        for key in probes(recs) {
+            let want = raw_values(blob, &key);
+            assert_eq!(
+                z_values(side, blob, &key).as_ref(),
+                Some(&want),
+                "read of {key:?}"
+            );
+            assert_eq!(
+                served(side.count(&key)),
+                blob.count(&key).unwrap(),
+                "count of {key:?}"
+            );
+        }
+        assert!(!side.damaged());
+    }
+
+    #[test]
+    fn a_sidecar_answers_every_key_as_the_segment_does() {
+        for (name, recs, inline) in [
+            ("suite", suite(3000, 11), 256),
+            ("shapes", shapes(), 1 << 20),
+        ] {
+            let fx = Fixture::new(name, recs, inline);
+            let side = fx.side();
+            assert!(side.pages() > 1, "{name}: more than one page");
+            agree(&side, &fx.blob, &fx.recs);
+            // Every page a read opened was checked, once, and none failed.
+            assert!(side.verified_pages() > 0 && side.bad_pages() == 0);
+            // The second pass finds every page verified and answers the same.
+            let before = side.verified_pages();
+            agree(&side, &fx.blob, &fx.recs);
+            assert_eq!(side.verified_pages(), before, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_read_hands_over_nothing_before_its_checks_have_passed() {
+        // The callback is called only once every check that can fail has
+        // passed: a read the sidecar declines is read from the raw form by
+        // the caller, and a value already handed over would be handed over
+        // twice. A byte of a page the attach does not sample is flipped, so
+        // the sidecar attaches and the page fails at its first decode.
+        let fx = Fixture::new("before", suite(4000, 12), 256);
+        assert!(matches!(fx.build(), Outcome::Built(_)));
+        let pages = fx.attach().unwrap().pages();
+        assert!(
+            pages > 3 * ZSAMPLE_PAGES,
+            "pages enough to leave some unsampled"
+        );
+        let sampled =
+            |p: usize| (0..ZSAMPLE_PAGES).any(|k| k * (pages - 1) / (ZSAMPLE_PAGES - 1) == p);
+        let unsampled: Vec<usize> = (1..pages - 1).filter(|&p| !sampled(p)).collect();
+        let p = unsampled[unsampled.len() / 2];
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fx.out)
+            .unwrap();
+        let mut b = [0u8; 1];
+        let at = (p * ZPAGE + 100) as u64;
+        f.read_at(&mut b, at).unwrap();
+        f.write_at(&[b[0] ^ 0x5a], at).unwrap();
+        drop(f);
+        let side = fx
+            .attach()
+            .expect("a damaged page the sample misses attaches");
+        let (mut served, mut declined) = (0usize, 0usize);
+        for (k, vals, _) in &fx.recs {
+            let mut got = 0usize;
+            match side
+                .read_all(&fx.blob, k, &mut |_: &[u8]| got += 1)
+                .unwrap()
+            {
+                ZRead::Served { n, .. } => {
+                    assert_eq!((n as usize, got), (vals.len(), vals.len()));
+                    served += 1;
+                }
+                ZRead::Fallback | ZRead::Out => {
+                    assert_eq!(got, 0, "a read that declines has emitted nothing");
+                    declined += 1;
+                }
+            }
+        }
+        assert!(
+            served > 0 && declined > 0,
+            "{served} served, {declined} declined"
+        );
+        assert!(side.damaged() && side.bad_pages() == 1);
+    }
+
+    #[test]
+    fn a_partition_that_cannot_have_a_sidecar_is_declined_for_its_reason() {
+        // Under the floor.
+        let fx = Fixture::new("small", suite(200, 1), 256);
+        let r = build(&fx.seg, &fx.out, ID, END, ZMIN_RECS).unwrap();
+        assert!(matches!(r, Outcome::Declined(Decline::Small(n)) if n > 0 && n < ZMIN_RECS));
+        assert!(!fx.out.exists(), "no file for a declined partition");
+        assert!(!fx.out.with_extension("zpg.tmp").exists());
+
+        // A run in a block.
+        let mut recs = suite(300, 2);
+        recs.push((b"zzz-big".to_vec(), vec![vec![7u8; 9000]], false));
+        let fx = Fixture::new("blocks", recs, 256);
+        assert!(fx.blob.blocks() > 0);
+        assert!(matches!(
+            fx.build(),
+            Outcome::Declined(Decline::BlockBacked)
+        ));
+        assert!(!fx.out.exists());
+
+        // A record no page holds: random bytes that do not fit a page
+        // compressed, and an image over the cap a group decodes into.
+        let mut rng = Rng(77);
+        let mut recs = suite(300, 3);
+        recs.push((b"zzz-big".to_vec(), vec![rng.bytes(6000)], false));
+        let fx = Fixture::new("incompressible", recs, 1 << 20);
+        assert!(matches!(
+            fx.build(),
+            Outcome::Declined(Decline::NoPage(NoPage::Incompressible))
+        ));
+        assert!(!fx.out.exists());
+        let mut recs = suite(300, 4);
+        recs.push((b"zzz-big".to_vec(), vec![vec![0u8; 70_000]], false));
+        let fx = Fixture::new("oversize", recs, 1 << 20);
+        assert!(matches!(
+            fx.build(),
+            Outcome::Declined(Decline::NoPage(NoPage::Oversize))
+        ));
+        assert!(!fx.out.exists());
+    }
+
+    #[test]
+    fn a_page_that_does_not_compress_is_stored_and_read_in_place() {
+        // Keys and values of entropy: a group's LZ4 output is no shorter
+        // than the group, and the page holds the group verbatim.
+        let mut rng = Rng(0xfeed);
+        let mut recs: Vec<Rec> = (0..2000)
+            .map(|_| (rng.bytes(16), vec![rng.bytes(100)], false))
+            .collect();
+        recs.sort_by(|a, b| a.0.cmp(&b.0));
+        recs.dedup_by(|a, b| a.0 == b.0);
+        let fx = Fixture::new("stored", recs, 256);
+        let Outcome::Built(b) = fx.build() else {
+            panic!("built")
+        };
+        assert!(b.fill.stored > 0, "stored pages");
+        let side = fx.attach().unwrap();
+        agree(&side, &fx.blob, &fx.recs);
+        // A stored page is parsed where it lies: nothing is decoded.
+        let key = &fx.recs[fx.recs.len() / 2].0;
+        let mut seen = 0;
+        let r = side
+            .read_all(&fx.blob, key, &mut |_: &[u8]| seen += 1)
+            .unwrap();
+        assert_eq!(seen, 1);
+        let ZRead::Served { decoded, .. } = r else {
+            panic!("served")
+        };
+        let stored_page = {
+            let e = side.fence.entry_of(key).unwrap();
+            let p = side.fence.page(e).unwrap() as usize;
+            page_view(side.page_bytes(p).unwrap()).unwrap().0.stored
+        };
+        assert_eq!(decoded, !stored_page);
+    }
+
+    /// A page whose payload sits at a given misalignment, as a buffer a
+    /// source other than a mapping might hand out.
+    fn page_at(page: &[u8; ZPAGE], skew: usize) -> (Vec<u8>, usize) {
+        let mut backing = vec![0u8; ZPAGE + 16];
+        let base = backing.as_ptr() as usize;
+        let start = (8 - base % 8) % 8 + skew;
+        backing[start..start + ZPAGE].copy_from_slice(page);
+        (backing, start)
+    }
+
+    #[test]
+    fn a_stored_page_at_a_misaligned_address_is_refused_not_missed() {
+        // A stored page whose payload is not aligned for the extents
+        // `parse_record` borrows in place reads as no record, and a probe
+        // that took none for absent would answer a held key as missing. The
+        // reader refuses the page, and a caller counts the refusal.
+        let mut rng = Rng(5);
+        let mut keyed: Vec<(Vec<u8>, Vec<u8>)> =
+            (0..20).map(|_| (rng.bytes(16), rng.bytes(100))).collect();
+        keyed.sort();
+        let recs: Vec<Vec<u8>> = keyed
+            .iter()
+            .map(|(k, v)| {
+                let mut img = Vec::new();
+                let e = Ext {
+                    block: Ext::INLINE,
+                    off: 0,
+                    len: 100,
+                    last: 0,
+                    count: 1 | Ext::FIXED,
+                };
+                crate::flatindex::stream_record_as(&mut img, k, &[e], v, true).unwrap();
+                img
+            })
+            .collect();
+        let bind = 0xABCD_1234;
+        let mut s = FillScratch::new();
+        let mut page = [0u8; ZPAGE];
+        let Fill::Page(g) = fill_group(&recs, 0, 0, bind, &mut s, &mut page) else {
+            panic!("a page")
+        };
+        assert!(g.stored, "random bytes are stored");
+        let (h, _) = parse_page(&page, bind).unwrap();
+        let key0 = keyed[0].0.clone();
+        let entry = FenceEntry {
+            index: 0,
+            first_rank: 0,
+            count: g.count as u32,
+            page: 0,
+            key: &key0,
+        };
+        let mut buf = GroupBuf::new();
+
+        // Aligned: parsed in place, no decode, and the group is found.
+        let (aligned, at) = page_at(&page, 0);
+        let p = &aligned[at..at + ZPAGE];
+        assert_eq!(p.as_ptr() as usize % 8, 0);
+        let (group, count, decoded) = first_decode(p, bind, &entry, &mut buf).unwrap();
+        assert!(!decoded && count == usize::from(h.count));
+        assert!(group_seek(group, count, &key0).unwrap().found);
+        let (group, count, decoded) = verified_group(p, &mut buf).unwrap();
+        assert!(!decoded && count == usize::from(h.count));
+        assert!(group_seek(group, count, &key0).unwrap().found);
+
+        // Misaligned by every skew that is not a multiple of four: refused,
+        // at the first decode and after.
+        for skew in [1usize, 2, 3, 5, 6, 7] {
+            let (backing, at) = page_at(&page, skew);
+            let p = &backing[at..at + ZPAGE];
+            assert_ne!((p.as_ptr() as usize + ZHDR) % 4, 0, "skew {skew}");
+            assert_eq!(
+                first_decode(p, bind, &entry, &mut buf).unwrap_err(),
+                Fail::Misaligned,
+                "skew {skew}"
+            );
+            assert_eq!(
+                verified_group(p, &mut buf).unwrap_err(),
+                Fail::Misaligned,
+                "skew {skew}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_callback_that_reads_again_leaves_the_value_it_was_lent_alone() {
+        // The group a value is lent from is in the thread's buffer. A read
+        // made inside the callback decodes another page: if it shared the
+        // buffer it would overwrite the bytes the outer callback holds.
+        let fx = Fixture::new("reentry", suite(3000, 21), 256);
+        let side = fx.side();
+        let (a, b) = (&fx.recs[10], &fx.recs[2500]);
+        let mut seen = false;
+        let r = side
+            .read_all(&fx.blob, &a.0, &mut |outer: &[u8]| {
+                let before = outer.to_vec();
+                assert_eq!(before, a.1[0]);
+                let inner = z_values(&side, &fx.blob, &b.0).unwrap();
+                assert_eq!(inner, b.1);
+                assert_eq!(outer, &before[..], "the outer value was overwritten");
+                seen = true;
+            })
+            .unwrap();
+        assert!(seen && served(r) == 1);
+    }
+
+    #[test]
+    fn a_sidecar_of_another_segment_is_refused() {
+        // The same ids, the same keys, other values: the hard case. Sidecar
+        // one planted where sidecar two belongs.
+        let one = Fixture::new("other-1", suite(2000, 31), 256);
+        let two = Fixture::new("other-2", suite(2000, 32), 256);
+        one.side();
+        two.side();
+        std::fs::copy(&one.out, &two.out).unwrap();
+        match two.attach() {
+            Err(Reject::Identity(why)) => {
+                assert!(why.contains("checksum row"), "{why}");
+            }
+            other => panic!("{:?}", other.map(|_| ())),
+        }
+        // And the name's own fields.
+        one.side();
+        let b = &one.blob;
+        assert!(matches!(
+            ZSide::attach(&one.out, b, ID + 1, END, false),
+            Err(Reject::Identity(_))
+        ));
+        assert!(matches!(
+            ZSide::attach(&one.out, b, ID, END + 1, false),
+            Err(Reject::Identity(_))
+        ));
+        // No file is no rejection.
+        let _ = std::fs::remove_file(&one.out);
+        assert!(matches!(one.attach(), Err(Reject::Missing)));
+    }
+
+    /// The trailer of the file at `path`, and a rewrite of it with a field
+    /// changed, its CRC and `bind32` made again.
+    fn with_trailer(path: &Path, change: impl FnOnce(&mut Trailer)) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let at = bytes.len() - ZTRAILER;
+        let mut t = Trailer::decode(&bytes[at..]).unwrap();
+        change(&mut t);
+        bytes[at..].copy_from_slice(&t.encode());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn every_field_of_the_trailer_wrong_is_refused() {
+        let fx = Fixture::new("trailer", suite(2500, 41), 256);
+        fx.side();
+        let good = std::fs::read(&fx.out).unwrap();
+        let t0 = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
+        type Edit = Box<dyn Fn(&mut Trailer)>;
+        let edits: Vec<(&str, Edit)> = vec![
+            ("n_pages", Box::new(|t| t.n_pages += 1)),
+            ("n_entries", Box::new(|t| t.n_entries += 1)),
+            ("nkeys", Box::new(|t| t.nkeys += 1)),
+            ("res_off", Box::new(|t| t.res_off += ZPAGE as u64)),
+            ("res_len", Box::new(|t| t.res_len += 1)),
+            ("keys_len", Box::new(|t| t.keys_len += 1)),
+            ("filter_off", Box::new(|t| t.filter_off = 64)),
+            ("filter_blocks", Box::new(|t| t.filter_blocks = 1)),
+            ("res_crc", Box::new(|t| t.res_crc ^= 1)),
+            ("filter", Box::new(|t| t.filter = true)),
+            ("seg_recs_len", Box::new(|t| t.seg_recs_len += 4)),
+            ("seg_crc_off", Box::new(|t| t.seg_crc_off += 4)),
+            ("seg_key_off", Box::new(|t| t.seg_key_off += 4096)),
+            ("seg_hash_cap", Box::new(|t| t.seg_hash_cap *= 2)),
+            ("seg_file_len", Box::new(|t| t.seg_file_len += 4096)),
+            ("seg_timestamp", Box::new(|t| t.seg_timestamp += 1)),
+            ("seg_generation", Box::new(|t| t.seg_generation += 1)),
+            ("seg_row_crc", Box::new(|t| t.seg_row_crc ^= 1)),
+            ("rec_version", Box::new(|t| t.rec_version += 1)),
+            ("rec_magic", Box::new(|t| t.rec_magic ^= 1)),
+            ("seg_id", Box::new(|t| t.seg_id += 1)),
+            ("seg_end_seq", Box::new(|t| t.seg_end_seq += 1)),
+        ];
+        for (field, edit) in &edits {
+            std::fs::write(&fx.out, &good).unwrap();
+            with_trailer(&fx.out, |t| edit(t));
+            let r = fx.attach();
+            assert!(
+                matches!(r, Err(Reject::Damage(_) | Reject::Identity(_))),
+                "a trailer with {field} changed attached: {:?}",
+                r.map(|_| ())
+            );
+        }
+        // The fields no read depends on: the decoded bytes a trailer sums
+        // for the ratio, and the filter's parameters, which a trailer with
+        // no filter does not read. A wrong value is accepted and harmless.
+        for (field, edit) in [
+            (
+                "total_ulen",
+                Box::new(|t: &mut Trailer| t.total_ulen += 1) as Edit,
+            ),
+            ("bloom_sig", Box::new(|t: &mut Trailer| t.bloom_sig = 9)),
+            (
+                "bloom_probes",
+                Box::new(|t: &mut Trailer| t.bloom_probes = 9),
+            ),
+        ] {
+            std::fs::write(&fx.out, &good).unwrap();
+            with_trailer(&fx.out, |t| edit(t));
+            let side = fx.attach().unwrap_or_else(|e| panic!("{field}: {e:?}"));
+            agree(&side, &fx.blob, &fx.recs);
+        }
+        // The file as built still attaches.
+        std::fs::write(&fx.out, &good).unwrap();
+        let side = fx.attach().unwrap();
+        assert_eq!(side.ident(), &t0);
+        // And a torn trailer: every byte of it flipped in turn.
+        for at in (good.len() - ZTRAILER..good.len()).step_by(7) {
+            let mut bad = good.clone();
+            bad[at] ^= 0x10;
+            std::fs::write(&fx.out, &bad).unwrap();
+            assert!(
+                matches!(fx.attach(), Err(Reject::Damage(_))),
+                "a trailer flipped at {at} attached"
+            );
+        }
+        // A file cut short, and one of the wrong length.
+        for len in [0, ZPAGE, good.len() - ZPAGE, good.len() - 1, good.len() + 1] {
+            let mut bad = good.clone();
+            bad.resize(len, 0);
+            std::fs::write(&fx.out, &bad).unwrap();
+            assert!(
+                matches!(fx.attach(), Err(Reject::Damage(_))),
+                "a file of {len} bytes attached"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flipped_byte_in_the_pages_is_never_an_answer() {
+        // Every seventh byte of the page region, one at a time. The first,
+        // the last and fourteen pages between are checked at attach, so a
+        // flip in one of those is a refusal; a flip in any other page is
+        // met at the page's first decode, which declines the read, marks
+        // the page bad and takes the sidecar out of service. No flip is
+        // ever a wrong answer, and none panics.
+        let fx = Fixture::new("flips", suite(1500, 51), 256);
+        fx.side();
+        let good = std::fs::read(&fx.out).unwrap();
+        let t = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
+        let pages = t.n_pages as usize;
+        assert!(pages > ZSAMPLE_PAGES + 4, "{pages} pages");
+        let sampled: Vec<usize> = (0..ZSAMPLE_PAGES)
+            .map(|k| k * (pages - 1) / (ZSAMPLE_PAGES - 1))
+            .collect();
+        let f = OpenOptions::new().write(true).open(&fx.out).unwrap();
+        let (mut refused, mut declined, mut quiet) = (0usize, 0usize, 0usize);
+        for at in (0..pages * ZPAGE).step_by(7) {
+            let p = at / ZPAGE;
+            f.write_at(&[good[at] ^ 0x21], at as u64).unwrap();
+            match fx.attach() {
+                Err(Reject::Damage(_)) => {
+                    assert!(sampled.contains(&p), "page {p} was not sampled");
+                    refused += 1;
+                }
+                Err(other) => panic!("byte {at}: {other:?}"),
+                Ok(side) => {
+                    assert!(!sampled.contains(&p), "byte {at} of sampled page {p}");
+                    // Every key of the damaged page, and a few of the rest.
+                    let mut hit = 0;
+                    for (i, (k, vals, _)) in fx.recs.iter().enumerate() {
+                        let e = side.fence.entry_of(k).unwrap();
+                        let on_it = side.fence.page(e) == Some(p as u32);
+                        if !on_it && i % 97 != 0 {
+                            continue;
+                        }
+                        let mut got = Vec::new();
+                        match side
+                            .read_all(&fx.blob, k, &mut |v: &[u8]| got.push(v.to_vec()))
+                            .unwrap()
+                        {
+                            ZRead::Served { .. } => assert_eq!(&got, vals, "key {i}"),
+                            ZRead::Fallback | ZRead::Out => {
+                                assert!(got.is_empty(), "key {i}: values before a decline");
+                                hit += 1;
+                            }
+                        }
+                    }
+                    if hit > 0 {
+                        assert!(side.damaged() && side.bad_pages() >= 1, "byte {at}");
+                        declined += 1;
+                    } else {
+                        quiet += 1;
+                    }
+                }
+            }
+            f.write_at(&[good[at]], at as u64).unwrap();
+        }
+        assert!(refused > 0 && declined > 0, "{refused} {declined} {quiet}");
+        // The bytes a page does not use are covered too: the CRC is over the
+        // whole page, so a flip in the padding is damage and not a quiet pass.
+        assert_eq!(quiet, 0, "a flip that no read of its page noticed");
+    }
+
+    #[test]
+    fn the_fence_finds_the_entry_a_key_falls_among() {
+        let fx = Fixture::new("fence", shapes(), 1 << 20);
+        let side = fx.side();
+        let f = &side.fence;
+        // The empty key is the first record's, so nothing sorts below it.
+        assert_eq!(f.key(0), Some(&b""[..]));
+        assert_eq!(f.entry_of(b""), Some(0));
+        for i in 0..f.len() {
+            let k = f.key(i).unwrap().to_vec();
+            assert_eq!(f.entry_of(&k), Some(i), "an entry's own key finds it");
+            let past = [k.as_slice(), &[0u8]].concat();
+            assert_eq!(f.entry_of(&past), Some(i), "a key just past it stays");
+            if i + 1 < f.len() {
+                let next = f.key(i + 1).unwrap();
+                assert!(f.entry_of(next) == Some(i + 1));
+            }
+        }
+        assert_eq!(f.entry_of(&[0xff; 64]), Some(f.len() - 1));
+    }
+}
