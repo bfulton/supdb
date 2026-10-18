@@ -6095,8 +6095,11 @@ const ARENA_BLOCKS: usize = 1 << 12;
 /// of sixty-four pages cost a fresh table's first write thirty
 /// microseconds an arena, and the lag sweep's one-percent burst at ten
 /// thousand keys, a hundred writes over four pages, read its updates at
-/// 0.66x and ycsb-B at 0.87x.
+/// 0.66x and ycsb-B at 0.87x. Read only by `populate_ahead`, which is
+/// Linux's.
+#[cfg(target_os = "linux")]
 const PREFAULT_MIN: usize = 16 << 10;
+#[cfg(target_os = "linux")]
 const PREFAULT_MAX: usize = 256 << 10;
 
 /// The pages of `base[..cap]` from `populated` to at least `need`, a
