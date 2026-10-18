@@ -1,13 +1,12 @@
 //! The z form's layout: a derived sidecar that holds a partition's records,
 //! verbatim, in groups that each compress into one 4 KiB page.
 //!
-//! Nothing in the engine reads or writes this layout yet. The module is the
-//! one definition of it -- the page, the trailer, the fence entries, the
-//! group that fills a page and the walk over a decoded group -- so that the
-//! builder, the reader and the tools that price the form all use the same
-//! arithmetic, not a copy of it. A second definition of this layout is a
-//! second reader, and a second reader fails by answering differently, not by
-//! crashing.
+//! The module is the one definition of it -- the page, the trailer, the fence
+//! entries, the group that fills a page and the walk over a decoded group --
+//! so that the builder, the reader and the tools that price the form all use
+//! the same arithmetic, not a copy of it. A second definition of this layout
+//! is a second reader, and a second reader fails by answering differently,
+//! not by crashing.
 //!
 //! # The file
 //!
@@ -350,12 +349,10 @@ impl Default for GroupBuf {
 /// where it is not. Either way the bytes returned are aligned, so a record
 /// of any shape parses out of them.
 ///
-/// The decoder is `lz4_flex::block::decompress_into` itself and not
-/// `block::decompress_into`, which discards the length it decoded; the
-/// buffer is reused without zeroing, so a payload that decodes to fewer
-/// bytes than `ulen` would leave stale bytes inside the group, and the length
-/// is required to equal `ulen`. The caller has parsed the page
-/// ([`parse_page`]) first, so the CRC has passed.
+/// The buffer is reused without zeroing, so a payload that decodes to fewer
+/// bytes than `ulen` would leave stale bytes inside the group: the length the
+/// decoder reports is required to equal `ulen`. The caller has parsed the
+/// page ([`parse_page`]) first, so the CRC has passed.
 pub fn decode_group<'a>(
     h: &PageHeader,
     payload: &'a [u8],
@@ -403,8 +400,9 @@ pub enum Lz4Decoder {
 /// The two check a malformed block in the other order -- a match at an offset
 /// there is no data for, into an output with no room for it -- and say which
 /// they are. Their encoders emit the same bytes, so no output tells them
-/// apart; the encoder is the feature pair `safe-encode`, which a build that
-/// turns one on turns on beside the other.
+/// apart, and only the decoder is found here; a build that asks for the safe
+/// decoder (`safe-decode`) asks for the safe encoder (`safe-encode`) beside
+/// it.
 pub fn lz4_decoder() -> Lz4Decoder {
     use lz4_flex::block::DecompressError;
     let block = [0x10u8, b'a', 0x05, 0x00];
