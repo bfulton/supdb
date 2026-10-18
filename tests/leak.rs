@@ -219,6 +219,8 @@ fn a_zpages_life(name: &str) {
     let opts = Options {
         zpages: supdb::ZPages::Always,
         zpages_min_bytes: 0,
+        // The nocache policy, the form's and the arm's: nothing here scans.
+        scan_block_cache: false,
         seal_bytes: 1 << 20,
         partition_bytes: Some(256 << 10),
         ..Options::default()
