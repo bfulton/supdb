@@ -5612,6 +5612,10 @@ mod tests {
         let scan_floor = SAVING_FLOOR_SHARE * (PRIOR_T_Z_SCAN - PRIOR_T_HIT_SCAN) / PRIOR_T_F;
         assert_eq!(sel.saving_star(Class::Read), floor);
         assert_eq!(sel.saving_star(Class::Scan), scan_floor);
+        // The floor written out: a quarter of the priors' gaps, 3.67 us and
+        // 8 us, over the 41.5 us a fault costs.
+        assert!((floor - 0.022_108).abs() < 1e-6, "{floor}");
+        assert!((scan_floor - 0.048_193).abs() < 1e-6, "{scan_floor}");
         assert!(sel.theta_sus(Class::Read) > 0.0 && sel.theta_enter(Class::Scan) > 0.0);
         // A model of nothing is under the way out, so the rung is left, and
         // one over the floor's threshold is not.
@@ -5626,12 +5630,13 @@ mod tests {
     /// evidence in every step, and a sampler it has not heard from.
     fn suspect_by_hand() -> (ZSelect, u64) {
         let mut sel = ZSelect::new();
-        let mut step = 0;
-        while sel.phase() != Phase::Suspect {
-            step += 1;
+        for step in 1..=100 {
             hand(&mut sel, step, 0, None);
+            if sel.phase() == Phase::Suspect {
+                return (sel, step);
+            }
         }
-        (sel, step)
+        panic!("a hot model for ten seconds is not SUSPECT");
     }
 
     /// One step by hand: reads that fault on 40% of them and refault, the
@@ -5773,6 +5778,526 @@ mod tests {
         assert!((sel.bias - (0.4 - 0.5)).abs() < 1e-9, "{}", sel.bias);
     }
 
+    /// The costs at round numbers, so that the thresholds are numbers a float
+    /// holds: a fault costs a second, a hit a quarter and a compact read three
+    /// quarters, which makes the break-even half a fault a read, the entry
+    /// threshold three quarters and the way in a quarter.
+    fn round_costs() -> Costs {
+        Costs {
+            t_f: Some(1.0),
+            t_hit: Some(0.25),
+            t_hit_scan: Some(0.25),
+            t_z: Some(0.75),
+            t_z_scan: Some(0.75),
+        }
+    }
+
+    /// A selector in COMPACT whose model says half a fault a read, with the
+    /// bitmaps of what the handles touched read.
+    fn compact_selector() -> ZSelect {
+        let mut sel = ZSelect::new();
+        sel.model = Some(model_of(0.5));
+        sel.phase = Phase::Compact;
+        sel.footprint = Some(1 << 20);
+        sel
+    }
+
+    /// A selector fed by hand to the step its build starts at.
+    fn building_by_hand() -> (ZSelect, u64) {
+        let (mut sel, mut step) = suspect_by_hand();
+        for _ in 0..200 {
+            step += 1;
+            let d = hand(&mut sel, step, 0, Some(reading(0.1, false, 0)));
+            if d.event == Some(Event::BuildStart) {
+                return (sel, step);
+            }
+        }
+        panic!("the rent was not paid");
+    }
+
+    #[test]
+    fn a_build_is_installed_at_the_covered_share_itself_and_not_a_hair_under() {
+        let reads = Window {
+            ops: 5000,
+            faults: 2000,
+        };
+        for (coverage, installs) in [
+            (COVERED_ENOUGH * (1.0 - 1e-9), false),
+            (COVERED_ENOUGH, true),
+        ] {
+            let (mut sel, step) = building_by_hand();
+            let d = hand_with(&mut sel, step + 1, 0, None, (reads, 2000), coverage);
+            assert_eq!(d.event == Some(Event::Install), installs, "{coverage}");
+        }
+    }
+
+    #[test]
+    fn a_build_is_cancelled_under_half_the_entry_threshold_and_not_at_it() {
+        // With the costs at round numbers the build is given up under three
+        // eighths of a fault a read, half of the entry threshold.
+        let reads = |faults: u64| Window {
+            ops: 10_000,
+            faults,
+        };
+        for (faults, cancelled) in [(3_750, false), (3_749, true)] {
+            let (mut sel, mut step) = building_by_hand();
+            sel.measured = round_costs();
+            assert_eq!(sel.theta_enter(Class::Read) * VANISH_FACTOR, 0.375);
+            let mut event = None;
+            for _ in 0..2 * VANISH_INTERVALS {
+                step += 1;
+                event = event
+                    .or(hand_with(&mut sel, step, 0, None, (reads(faults), faults), 0.0).event);
+            }
+            assert_eq!(event == Some(Event::BuildCancelled), cancelled, "{faults}");
+        }
+    }
+
+    #[test]
+    fn the_compact_forms_readings_need_sixty_four_reads_and_a_measure_ten_seconds() {
+        // E3 reads a second of the form's reads: sixty-four are a reading
+        // and a form that faults on every one of them is not paying, and
+        // sixty-three break the stretch.
+        for (ops, unpaying) in [(63, false), (64, true)] {
+            let mut sel = compact_selector();
+            sel.watch.tick_reads = Window { ops, faults: ops };
+            sel.update_e3(Duration::from_secs(5));
+            assert_eq!(sel.watch.unpaying_since.is_some(), unpaying, "{ops}");
+        }
+        // E2's measure ends ten seconds on, to the step, and holds data from
+        // sixty-four reads.
+        let quiet = |ops| Window { ops, faults: 0 };
+        let mut sel = compact_selector();
+        sel.watch.e2_win[Class::Read.ix()] = quiet(64);
+        sel.update_e2(E2_MEASURE - Duration::from_nanos(1));
+        assert_eq!(sel.watch.e2_start, Duration::ZERO);
+        sel.update_e2(E2_MEASURE);
+        assert_eq!((sel.watch.e2_start, sel.watch.e2_run), (E2_MEASURE, 1));
+        let mut sel = compact_selector();
+        sel.watch.e2_win[Class::Read.ix()] = quiet(63);
+        sel.update_e2(E2_MEASURE);
+        assert_eq!(sel.watch.e2_run, 0);
+        // The pages touched fit when they are under half the budget: half of
+        // it exactly does not.
+        for (bound, fits) in [(435_000_000, false), (434_999_999, true)] {
+            let mut sel = compact_selector();
+            sel.footprint = Some(bound);
+            sel.watch.e2_win[Class::Read.ix()] = quiet(64);
+            sel.update_e2(E2_MEASURE);
+            assert_eq!(sel.watch.e2_run, u32::from(fits), "{bound}");
+        }
+    }
+
+    /// A selector in a trial of the raw form that expects `pages` raw pages.
+    fn in_a_trial(pages: u64) -> ZSelect {
+        let mut sel = ZSelect::new();
+        sel.model = Some(model_of(0.5));
+        sel.phase = Phase::Trial;
+        sel.trial = Some(Trial {
+            started: Duration::ZERO,
+            pages,
+            faults: 0,
+            low_run: 0,
+            judged: None,
+            pooled: [Window::default(); 2],
+            intervals: 0,
+        });
+        sel
+    }
+
+    fn judged(sel: &ZSelect) -> bool {
+        sel.trial.as_ref().expect("the trial runs").judged.is_some()
+    }
+
+    #[test]
+    fn a_trial_is_judged_at_the_expected_pages_the_wall_and_the_settled_run_themselves() {
+        // The fill is over when the faults reach a fifth over the pages the
+        // raw form needs: six of five, and not five.
+        for (faults, over) in [(5, false), (6, true)] {
+            let mut sel = in_a_trial(5);
+            let census = Census {
+                reads: Window { ops: 0, faults },
+                ..Census::default()
+            };
+            sel.trial_step(
+                &Input {
+                    census,
+                    ..Input::default()
+                },
+                Duration::ZERO,
+            );
+            assert_eq!(judged(&sel), over, "{faults}");
+        }
+        // Or when the wall has passed, to the step, and the wall is capped.
+        for pages in [1000, 100_000_000] {
+            let wall = ZSelect::new().trial_wall(pages);
+            assert!(wall <= TRIAL_WALL_CAP);
+            let mut sel = in_a_trial(pages);
+            sel.trial_step(&Input::default(), wall - Duration::from_nanos(1));
+            assert!(!judged(&sel), "{pages}");
+            sel.trial_step(&Input::default(), wall);
+            assert!(judged(&sel), "{pages}");
+        }
+        // Or when the rate has settled under the entry threshold, which with
+        // the costs at round numbers is three quarters of a fault a read: a
+        // run of intervals at it is not a settled one.
+        for (faults, low_run) in [(7_500, 0), (7_499, 3)] {
+            let mut sel = in_a_trial(1 << 40);
+            sel.measured = round_costs();
+            sel.trial.as_mut().expect("the trial runs").low_run = 2;
+            let census = Census {
+                reads: Window {
+                    ops: 10_000,
+                    faults,
+                },
+                refaults: Some(faults),
+                ..Census::default()
+            };
+            sel.trial_step(
+                &Input {
+                    census,
+                    ..Input::default()
+                },
+                Duration::ZERO,
+            );
+            assert_eq!(
+                sel.trial.as_ref().expect("still").low_run,
+                low_run,
+                "{faults}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trial_is_wrong_when_the_raw_form_saves_the_entry_threshold_itself() {
+        // Three intervals pooled at three quarters of a fault a read, over a
+        // compact form that faults at nothing: the saving is the entry
+        // threshold to the bit and the form is wanted, and a hair under it the
+        // raw form fits.
+        for (faults, wrong) in [(7_500, true), (7_499, false)] {
+            let mut sel = in_a_trial(5);
+            sel.measured = round_costs();
+            let trial = sel.trial.as_mut().expect("the trial runs");
+            trial.judged = Some(Duration::ZERO);
+            trial.intervals = TRIAL_DECIDE_INTERVALS - 1;
+            trial.pooled[Class::Read.ix()] = Window {
+                ops: 20_000,
+                faults: 15_000,
+            };
+            let census = Census {
+                reads: Window {
+                    ops: 10_000,
+                    faults,
+                },
+                refaults: Some(faults),
+                ..Census::default()
+            };
+            let event = sel.trial_step(
+                &Input {
+                    census,
+                    ..Input::default()
+                },
+                DT,
+            );
+            let want = if wrong {
+                Event::TrialBack
+            } else {
+                Event::Exit(Exit::E2)
+            };
+            assert_eq!(event, Some(want), "{faults}");
+        }
+    }
+
+    #[test]
+    fn e3_and_e2_hold_the_break_even_and_the_way_in_themselves() {
+        // E3: a form that saves the break-even, half a fault a read, pays; a
+        // hair short of it does not.
+        for (faults, unpaying) in [(25, false), (26, true)] {
+            let mut sel = compact_selector();
+            sel.measured = round_costs();
+            sel.model = Some(model_of(0.75));
+            sel.watch.tick_reads = Window { ops: 100, faults };
+            sel.update_e3(Duration::from_secs(5));
+            assert_eq!(sel.watch.unpaying_since.is_some(), unpaying, "{faults}");
+        }
+        // E2: the compact form's faults are low under the way in, a quarter
+        // of a fault a read, and not at it.
+        for (faults, low) in [(25, false), (24, true)] {
+            let mut sel = compact_selector();
+            sel.measured = round_costs();
+            sel.watch.e2_win[Class::Read.ix()] = Window { ops: 100, faults };
+            sel.update_e2(E2_MEASURE);
+            assert_eq!(sel.watch.e2_run, u32::from(low), "{faults}");
+        }
+    }
+
+    #[test]
+    fn sidecars_are_retired_when_the_retention_ends_to_the_step() {
+        let mut sel = ZSelect::new();
+        sel.phase = Phase::Suspect;
+        let end = Duration::from_secs(600);
+        sel.retain_until = Some(end);
+        assert!(!sel.retire(end - Duration::from_nanos(1)));
+        assert!(sel.retire(end));
+        assert!(!sel.retained());
+    }
+
+    #[test]
+    fn a_trial_nobody_can_decide_is_undone_a_dwell_after_the_fill_to_the_step() {
+        let mut sel = in_a_trial(5);
+        let since = Duration::from_secs(10);
+        sel.trial.as_mut().expect("the trial runs").judged = Some(since);
+        let late = since + sel.dwell();
+        let quiet = Input::default();
+        assert_eq!(sel.trial_step(&quiet, late - Duration::from_nanos(1)), None);
+        assert_eq!(sel.trial_step(&quiet, late), Some(Event::TrialBack));
+    }
+
+    #[test]
+    fn a_trial_decided_on_scans_alone_files_no_error_of_the_reads() {
+        // The pooled intervals hold scans and no point reads, and the scans
+        // say the raw form still faults: the form is wanted, and the model's
+        // word about the point read is not contradicted by reads that were
+        // never made.
+        let mut sel = in_a_trial(5);
+        let trial = sel.trial.as_mut().expect("the trial runs");
+        trial.judged = Some(Duration::ZERO);
+        trial.intervals = TRIAL_DECIDE_INTERVALS - 1;
+        let scans = Window {
+            ops: 1000,
+            faults: 1000,
+        };
+        trial.pooled[Class::Scan.ix()] = scans;
+        let census = Census {
+            scans,
+            refaults: Some(1000),
+            ..Census::default()
+        };
+        let event = sel.trial_step(
+            &Input {
+                census,
+                ..Input::default()
+            },
+            DT,
+        );
+        assert_eq!(event, Some(Event::TrialBack));
+        assert_eq!(sel.bias, 0.0);
+    }
+
+    #[test]
+    fn e1_and_e3_act_on_a_stretch_a_dwell_old_to_the_step() {
+        let began = Duration::from_secs(10);
+        for exit in [Exit::E1, Exit::E3] {
+            let mut sel = ZSelect::new();
+            sel.model = Some(model_of(0.5));
+            sel.phase = Phase::Compact;
+            match exit {
+                Exit::E1 => sel.low_since = Some(began),
+                _ => sel.watch.unpaying_since = Some(began),
+            }
+            let late = began + sel.dwell();
+            let input = Input::default();
+            assert_eq!(
+                sel.compact(&input, late - Duration::from_nanos(1), false, false),
+                None,
+                "{exit:?}"
+            );
+            assert_eq!(
+                sel.compact(&input, late, false, false),
+                Some(Event::Exit(exit)),
+                "{exit:?}"
+            );
+        }
+    }
+
+    /// The model's reading with only the raw form's rate given.
+    fn model_of(phi_raw: f64) -> Model {
+        Model {
+            phi_raw,
+            phi_z: Some(0.0),
+            phi_z_scan: Some(0.0),
+            refault_rate: 0.0,
+            budget: 870_000_000,
+        }
+    }
+
+    #[test]
+    fn the_models_error_and_the_scans_held_against_it_begin_at_the_threshold_and_not_over_it() {
+        let mut sel = ZSelect::new();
+        let sus = sel.theta_sus(Class::Read);
+        let sus_scan = sel.theta_sus(Class::Scan);
+        // The model said nothing and the raw form took exactly the rate worth
+        // counting, or the model said it and the raw form took nothing: both
+        // are errors, and a hair under is the model right to within what is
+        // worth acting on.
+        sel.model = Some(model_of(0.0));
+        sel.note_raw(Some(sus), None);
+        assert_eq!(sel.bias, sus);
+        sel.note_raw(Some(sus * (1.0 - 1e-9)), None);
+        assert_eq!(sel.bias, 0.0);
+        sel.model = Some(model_of(sus));
+        sel.note_raw(Some(0.0), None);
+        assert_eq!(sel.bias, -sus);
+        // A scan that faults at its class's threshold against a model that
+        // says the store fits is held against it, and one a hair under is not.
+        sel.model = Some(model_of(0.0));
+        sel.note_raw(None, Some(sus_scan * (1.0 - 1e-9)));
+        assert!(!sel.scans_against);
+        sel.note_raw(None, Some(sus_scan));
+        assert!(sel.scans_against);
+        // A model that already says the rate worth counting has not said the
+        // store fits: there is nothing to hold the scans against.
+        sel.scans_against = false;
+        sel.model = Some(model_of(sus));
+        sel.note_raw(None, Some(10.0 * sus_scan));
+        assert!(!sel.scans_against);
+    }
+
+    #[test]
+    fn the_raw_forms_rate_needs_sixty_four_reads_in_the_intervals_that_counted() {
+        let seen = |reads: Window, scans: Window, counted: bool| Seen {
+            reads,
+            scans,
+            counted,
+            ..Seen::default()
+        };
+        let w = |ops: u64, faults: u64| Window { ops, faults };
+        let mut sel = ZSelect::new();
+        sel.share.push(DT, seen(w(63, 21), w(0, 0), true));
+        assert_eq!(sel.raw_seen_in(Class::Read), None);
+        sel.share.push(2 * DT, seen(w(1, 0), w(64, 32), true));
+        assert_eq!(sel.raw_seen_in(Class::Read), Some(21.0 / 64.0));
+        // Each class has its own measure.
+        assert_eq!(sel.raw_seen_in(Class::Scan), Some(0.5));
+        // An interval the evidence rule did not take is not in either.
+        sel.share
+            .push(3 * DT, seen(w(1000, 1000), w(1000, 1000), false));
+        assert_eq!(sel.raw_seen_in(Class::Read), Some(21.0 / 64.0));
+        assert_eq!(sel.raw_seen_in(Class::Scan), Some(0.5));
+    }
+
+    #[test]
+    fn the_faults_stand_in_for_the_refault_counter_from_the_interval_that_fills_the_cache() {
+        // Where the platform counts no refaults the faults taken since SUSPECT
+        // are measured against the cache's size in pages: the interval that
+        // reaches it is evidence and the one before it is not.
+        let mut sel = ZSelect::new();
+        sel.model = Some(Model {
+            budget: 1000 * PAGE,
+            ..model_of(0.5)
+        });
+        let census = Census {
+            reads: Window {
+                ops: 100,
+                faults: 1,
+            },
+            refaults: None,
+            ..Census::default()
+        };
+        sel.faults_since_suspect = 998;
+        assert!(!sel.evidence(&census, DT).any());
+        assert!(sel.evidence(&census, 2 * DT).valid[Class::Read.ix()]);
+    }
+
+    #[test]
+    fn the_rungs_are_entered_and_left_at_the_thresholds_themselves() {
+        let mut sel = ZSelect::new();
+        let sus = sel.theta_sus(Class::Read);
+        let at = |k: u32, phi_raw: f64| Input {
+            now: k * S1_PERIOD,
+            model: Some(model_of(phi_raw)),
+            ..Input::default()
+        };
+        // The way in is the threshold: a model reading it, two ticks running,
+        // is SUSPECT.
+        assert_eq!(sel.step(&at(1, sus)).event, None);
+        assert_eq!(sel.step(&at(2, sus)).event, Some(Event::Suspect));
+        // The way out is under half of it: at half of it the rung holds,
+        // however long, and a hair under it, five ticks running, is FITS.
+        let half = sus * RELAX_FACTOR;
+        for k in 3..=20 {
+            assert_eq!(sel.step(&at(k, half)).event, None, "{k}");
+        }
+        assert_eq!(sel.phase(), Phase::Suspect);
+        for k in 21..=25 {
+            sel.step(&at(k, half * (1.0 - 1e-9)));
+        }
+        assert_eq!(sel.phase(), Phase::Fits);
+    }
+
+    #[test]
+    fn the_build_clause_is_open_at_each_threshold_itself() {
+        // The price paid to the last bit, the predicted saving and the
+        // measured saving each exactly at the entry threshold: all three are
+        // "at least", and a hair short of any one of them refuses.
+        let mut sel = ZSelect::new();
+        let enter = sel.theta_enter(Class::Read);
+        sel.sampler = Some(Sampler {
+            costs: Costs::default(),
+            c_build: 5.0,
+            declined: false,
+            generation: 0,
+        });
+        let short = 1.0 - 1e-9;
+        let mut open = |excess: f64, raw: f64, measured: f64| {
+            sel.excess = excess;
+            sel.model = Some(Model {
+                phi_z: Some(0.0),
+                ..model_of(raw)
+            });
+            let ev = Evidence {
+                valid: [true, false],
+                saving: [measured, 0.0],
+                ..Evidence::default()
+            };
+            sel.build_clause(DT, &ev)
+        };
+        assert!(open(5.0, enter, enter));
+        assert!(!open(5.0 * short, enter, enter));
+        assert!(!open(5.0, enter * short, enter));
+        assert!(!open(5.0, enter, enter * short));
+    }
+
+    #[test]
+    fn a_dwell_and_a_backoff_are_over_at_their_last_step_and_not_the_one_after() {
+        let mut sel = ZSelect::new();
+        let t = Duration::from_secs(100);
+        let ns = Duration::from_nanos(1);
+        sel.last_switch = Some(t);
+        assert!(!sel.switch_allowed(t + sel.dwell() - ns));
+        assert!(sel.switch_allowed(t + sel.dwell()));
+        sel.last_trial_end = Some(t);
+        assert!(!sel.trial_allowed(t + sel.backoff() - ns));
+        assert!(sel.trial_allowed(t + sel.backoff()));
+    }
+
+    #[test]
+    fn the_pressure_term_is_over_its_threshold_and_not_at_it() {
+        let mut sel = ZSelect::new();
+        let at = |refault_rate| Model {
+            refault_rate,
+            ..model_of(0.0)
+        };
+        sel.model = Some(at(PRESSURE_REFAULTS_PER_S));
+        assert!(!sel.pressure());
+        sel.model = Some(at(PRESSURE_REFAULTS_PER_S * (1.0 + 1e-9)));
+        assert!(sel.pressure());
+    }
+
+    #[test]
+    fn the_models_word_is_calm_under_half_the_threshold_and_not_at_it() {
+        for (scale, calm) in [(1.0 - 1e-9, true), (1.0, false)] {
+            let mut sel = ZSelect::new();
+            let edge = sel.theta_sus(Class::Read) * RELAX_FACTOR;
+            sel.step(&Input {
+                now: S1_PERIOD,
+                model: Some(model_of(edge * scale)),
+                ..Input::default()
+            });
+            assert_eq!(sel.low_since.is_some(), calm, "{scale}");
+        }
+    }
+
     #[test]
     fn a_reading_whose_price_is_not_a_price_is_not_kept() {
         let (mut sel, mut step) = suspect_by_hand();
@@ -5803,6 +6328,18 @@ mod tests {
         assert!(sim.log.iter().any(|r| r.excess >= 10.0 * cell.price));
         let asked = sim.sel.counts().samples_wanted;
         assert!((9..=11).contains(&asked), "{asked} asks in ten minutes");
+        // The wait from one ask to the next is the dwell to the step: the
+        // reading arrives the step after the ask and stands for a dwell.
+        let asks: Vec<Duration> = sim
+            .log
+            .windows(2)
+            .filter(|w| w[1].d.sample && !w[0].d.sample)
+            .map(|w| w[1].t)
+            .collect();
+        assert_eq!(asks.len() as u64, asked);
+        for pair in asks.windows(2) {
+            assert_eq!(pair[1] - pair[0], DWELL_FLOOR + DT);
+        }
         // It changes its mind; the next ask is the one that finds out.
         sim.declined = false;
         let changed = sim.now;
