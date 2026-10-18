@@ -312,6 +312,27 @@ pub fn parse_page(page: &[u8], bind32: u32) -> Result<(PageHeader, &[u8]), ZErro
     Ok((h, &page[ZHDR..end]))
 }
 
+/// A page's header and payload for a page this process has already passed
+/// through [`parse_page`] and a first decode: the length and the header's
+/// values are checked and nothing else, because the CRC is a pass over the
+/// page and a reader's every read of a page it has verified would pay it
+/// again. The tag, the flags, the zeros and the padding are the first
+/// decode's; a page that has not had one is read with [`parse_page`].
+pub fn page_view(page: &[u8]) -> Result<(PageHeader, &[u8]), ZError> {
+    let page: &[u8; ZPAGE] = page.try_into().map_err(|_| ZError::Length)?;
+    let word = |at: usize| u32::from_le_bytes([page[at], page[at + 1], page[at + 2], page[at + 3]]);
+    let half = |at: usize| u16::from_le_bytes([page[at], page[at + 1]]);
+    let h = PageHeader {
+        first_rank: word(P_FIRST),
+        count: half(P_COUNT),
+        stored: page[P_FLAGS] & F_STORED != 0,
+        ulen: word(P_ULEN),
+        clen: half(P_CLEN),
+    };
+    h.check()?;
+    Ok((h, &page[ZHDR..ZHDR + h.clen as usize]))
+}
+
 /// A buffer a group decodes into: words, not bytes, so that it is aligned
 /// for the extent arrays `parse_record` borrows in place. A `Vec<u8>` is not
 /// promised to be, and a record read from a misaligned buffer is `None`,
@@ -1279,6 +1300,50 @@ impl ZFence {
             page: self.page(i)?,
             key: self.key(i)?,
         })
+    }
+
+    /// The entry whose records `key` falls among: the greatest whose key is
+    /// at or below `key`, or `None` where `key` sorts below the first
+    /// entry's, which is a key the partition does not hold. A search over
+    /// the fence's keys with the engine's key compare, in the heap and
+    /// touching no page.
+    ///
+    /// An empty fence key is not handed to a byte compare, nor is an empty
+    /// `key`: a slice held in a `Vec` that never allocated points at no
+    /// page, and the library's compare reads through its first operand
+    /// before it honours a zero length -- a failed page walk a call, 81 ns
+    /// measured. An empty key sorts below every other, so neither needs
+    /// one.
+    pub fn entry_of(&self, key: &[u8]) -> Option<usize> {
+        let (mut lo, mut hi) = (0usize, self.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            // Every entry below `len` has a key: `push` writes the offset
+            // with the key and `decode_resident` refuses offsets that do
+            // not run from zero to the blob's length. A miss here is a bug
+            // in the type, and a panic is the better failure than a key
+            // answered as one below the first.
+            let k = self.key(mid).expect("an entry has its key");
+            let at_or_below = if k.is_empty() {
+                true
+            } else if key.is_empty() {
+                false
+            } else {
+                super::key_cmp(k, key) != Ordering::Greater
+            };
+            if at_or_below {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo.checked_sub(1)
+    }
+
+    /// Heap bytes the fence holds: the four tables of region B, as they sit
+    /// in memory.
+    pub fn heap_bytes(&self) -> usize {
+        4 * (self.first_rank.len() + self.page.len() + self.key_off.len()) + self.keys.len()
     }
 
     /// Region B, padded with zeros to a multiple of [`ZPAGE`], and what the
