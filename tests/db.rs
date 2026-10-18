@@ -2647,6 +2647,317 @@ fn the_block_cache_answers_the_same_model_under_a_budget() {
     overlay_model("overlay-budget", true, 2048);
 }
 
+/// The same budget with the forms counted by what their buffers cost and
+/// kept where they grow (`Options::forms_to_fit`): the answers do not
+/// change, and the bytes the cache counts are the bytes its buffers
+/// allocate, which `held` walks by capacity.
+#[test]
+fn the_block_cache_answers_the_same_model_under_a_budget_kept_to_fit() {
+    overlay_model_opts(
+        "overlay-budget-fit",
+        true,
+        2048,
+        supdb::Upkeep::Inline,
+        false,
+        true,
+    );
+}
+
+/// The budget kept to fit with the upkeep on a thread, which files a
+/// burst's patches and sheds for them on a thread of its own.
+#[test]
+fn the_block_cache_answers_the_same_model_under_a_budget_kept_to_fit_on_a_thread() {
+    overlay_model_opts(
+        "overlay-budget-fit-upkeep",
+        true,
+        2048,
+        supdb::Upkeep::Background(3),
+        false,
+        true,
+    );
+}
+
+/// The memory census of a store as a map, by name.
+fn census_of(db: &Db) -> BTreeMap<String, u64> {
+    db.memory_census().into_iter().collect()
+}
+
+/// The bytes the census counts the writer's forms as, by what they hold
+/// (`len`) or by what their buffers allocate (`cap`), the tables' and the
+/// ones a published form shares.
+fn forms_bytes_of(c: &BTreeMap<String, u64>, what: &str) -> u64 {
+    ["tab", "tabshared", "dense"]
+        .iter()
+        .flat_map(|t| ["sparse", "copy", "wide"].map(|k| format!("{t}_{k}_{what}")))
+        .map(|k| c.get(&k).copied().unwrap_or(0))
+        .sum()
+}
+
+/// A store scanned over a burst: three thousand keys flushed into several
+/// partitions, every eighth rewritten and scanned across, which forms the
+/// blocks the budget has room for, then five of every eight rewritten, a
+/// commit, and a scan of one entry from a block that holds a form, which
+/// files the whole burst into the forms and builds none. What the cache
+/// holds then is what the patches left it: the budget was kept only
+/// where a scan built a block.
+fn burst_into_forms(name: &str, budget: usize, fit: bool) -> (Db, ScanModel) {
+    burst_into_forms_with(name, budget, fit, |_| {})
+}
+
+fn burst_into_forms_with(
+    name: &str,
+    budget: usize,
+    fit: bool,
+    tune: impl FnOnce(&mut Options),
+) -> (Db, ScanModel) {
+    let d = dir(name);
+    let mut opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_ahead: false,
+        scan_cache_bytes: budget,
+        forms_settle_backlog_pct: 0,
+        commit_forms: true,
+        // The commit's own maintenance, step by step.
+        upkeep: supdb::Upkeep::Inline,
+        forms_to_fit: fit,
+        ..Options::default()
+    };
+    tune(&mut opts);
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..3000u32 {
+        m.append(&mut db, &key(k), "v0-0123456789");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    assert!(db.levels().0 > 1, "several partitions");
+    let mut sink = 0usize;
+    for k in (0..3000u32).step_by(8) {
+        m.delete(&mut db, &key(k));
+        m.append(&mut db, &key(k), "v1-0123456789");
+    }
+    db.commit().unwrap();
+    db.scan(key(0).as_bytes(), usize::MAX, |_k, v| sink += v.len())
+        .unwrap();
+    for k in (0..3000u32).filter(|k| k % 8 < 5) {
+        m.delete(&mut db, &key(k));
+        m.append(&mut db, &key(k), "v2-0123456789");
+    }
+    db.commit().unwrap();
+    // A block that holds a form, for the scan that files the burst to
+    // read one entry from: it builds nothing, so nothing sheds but a patch.
+    let held = (0..3000u32)
+        .step_by(64)
+        .find(|&k| {
+            db.block_state(key(k).as_bytes())
+                .is_some_and(|s| s.4 != "unbuilt")
+        })
+        .expect("a block holds a form");
+    db.scan(key(held).as_bytes(), 1, |_k, v| sink += v.len())
+        .unwrap();
+    std::hint::black_box(sink);
+    (db, m)
+}
+
+/// A patch is what grows a form in a burst, and the budget was kept
+/// where a scan built a block and nowhere else: a burst filed into the
+/// forms built the cache past it, to the size of the store, and the first
+/// scan after shed the difference, so a process under a bound met the
+/// whole of the burst's forms. Kept to fit, the patch sheds for itself;
+/// the cache never holds more than the budget and the one block in hand.
+/// The answers are the model's either way.
+#[test]
+fn a_burst_filed_into_the_forms_is_kept_to_the_budget_when_they_are_kept_to_fit() {
+    let budget = 8 << 10;
+    let (db, m) = burst_into_forms("burst-fit", budget, true);
+    let counted = db.block_cache_bytes();
+    let largest = db.block_cache_largest();
+    assert!(
+        counted <= budget + largest,
+        "kept to fit: the cache holds {counted} B against {budget} and a largest block of {largest}"
+    );
+    assert!(
+        counted > 0,
+        "the cache holds the blocks the budget has room for"
+    );
+    // Counted by capacity, and the census walks the same buffers.
+    held(&db, 0);
+    let c = census_of(&db);
+    assert_eq!(counted as u64, forms_bytes_of(&c, "cap"), "{c:?}");
+    m.check(&db, "a burst filed into forms kept to fit");
+
+    let (db, m) = burst_into_forms("burst-unfit", budget, false);
+    let counted = db.block_cache_bytes();
+    assert!(
+        counted > 2 * budget,
+        "not kept to fit, the patches built the cache to {counted} B against a budget of {budget}"
+    );
+    held(&db, 0);
+    let c = census_of(&db);
+    assert_eq!(counted as u64, forms_bytes_of(&c, "len"), "{c:?}");
+    m.check(&db, "a burst filed into forms not kept to fit");
+}
+
+/// The room a patched form keeps: grown by doubling, a sparse form that a
+/// burst patched to forty deltas holds them in the capacity of sixty-four,
+/// and a budget counts what the buffers hold; grown by a quarter it holds
+/// them in a fifth more at most. The same burst, the same contents, a
+/// smaller bill: the census counts the bytes by what the forms hold and by
+/// what their buffers cost. (Keys and values of ten bytes make the
+/// doubling cheaper than the suite's.)
+#[test]
+fn a_patched_form_kept_to_fit_costs_little_more_than_it_holds() {
+    // No budget to shed for and none to convert for: a budget out of
+    // reach keeps the dense forms sparse, so the burst's growth is all
+    // that is measured.
+    let budget = 1 << 30;
+    let (fit_db, fit_m) = burst_into_forms("slack-fit", budget, true);
+    let (plain_db, plain_m) = burst_into_forms("slack-plain", budget, false);
+    let (fit, plain) = (census_of(&fit_db), census_of(&plain_db));
+    let (fit_len, fit_cap) = (forms_bytes_of(&fit, "len"), forms_bytes_of(&fit, "cap"));
+    let (plain_len, plain_cap) = (forms_bytes_of(&plain, "len"), forms_bytes_of(&plain, "cap"));
+    assert_eq!(fit_len, plain_len, "the same burst holds the same bytes");
+    assert!(fit_len > 0);
+    assert!(
+        fit_cap * 10 <= plain_cap * 9,
+        "kept to fit {fit_cap} B of buffers for {fit_len}, not {plain_cap}"
+    );
+    assert!(
+        fit_cap * 5 <= fit_len * 6,
+        "kept to fit, the forms cost {fit_cap} B for {fit_len} B they hold"
+    );
+    assert!(
+        plain_cap * 4 >= plain_len * 5,
+        "grown by doubling, the forms cost {plain_cap} B for {plain_len} B they hold"
+    );
+    held(&fit_db, 0);
+    held(&plain_db, 0);
+    fit_m.check(&fit_db, "forms grown to fit");
+    plain_m.check(&plain_db, "forms grown by doubling");
+}
+
+/// What a cache that frees forms asks of the allocator
+/// (`Options::forms_trim_bytes`): the segment work's thread gives back
+/// the free pages once the handles have freed a stride's worth of forms
+/// and the allocator holds that much more free than it did after the
+/// last trim. Kept to fit it trims, with a stride of zero it does not,
+/// and not kept to fit nothing asks. Only where the allocator is glibc's.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[test]
+fn a_cache_kept_to_fit_gives_the_allocator_back_the_pages_its_sheds_freed() {
+    let trims = |fit: bool, stride: usize| -> u64 {
+        let name = format!("trim-{fit}-{stride}");
+        let (db, m) = burst_into_forms_with(&name, 8 << 10, fit, |o| o.forms_trim_bytes = stride);
+        // The trim is the segment work's, on its own thread: asked at a
+        // shed, made at its next turn.
+        for _ in 0..200 {
+            if db.forms_trims() > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        m.check(&db, &name);
+        db.forms_trims()
+    };
+    assert!(trims(true, 1) > 0, "the frees asked for a trim");
+    assert_eq!(trims(true, 0), 0, "a stride of zero never trims");
+    assert_eq!(trims(false, 1), 0, "not kept to fit, nothing asks");
+}
+
+/// A store a handle is live on, whose writer holds a form for as many
+/// blocks as a small budget has room for and has published them, then
+/// scanned from elsewhere until the blocks it holds have been shed and
+/// built again, several times over. A block shed from the partition the
+/// scan is in is retracted -- a marker published in its place -- and one
+/// shed from another partition was not: its form stayed in the state, a
+/// reader's handle free to take it as the block, current to nothing the
+/// writer files from there (the writer files into no block it holds no
+/// form for) and held by the state against a budget that no longer
+/// counted it.
+fn shed_over_published_forms(name: &str, fit: bool) -> (Db, Reader, ScanModel) {
+    let d = dir(name);
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_ahead: false,
+        scan_cache_bytes: 6 << 10,
+        forms_settle_backlog_pct: 0,
+        commit_forms: true,
+        upkeep: supdb::Upkeep::Inline,
+        forms_to_fit: fit,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..3000u32 {
+        m.append(&mut db, &key(k), "v0-0123456789");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    assert!(db.levels().0 > 2, "several partitions");
+    let mut sink = 0usize;
+    for k in (0..3000u32).step_by(4) {
+        m.delete(&mut db, &key(k));
+        m.append(&mut db, &key(k), "v1-0123456789");
+    }
+    db.commit().unwrap();
+    db.scan(key(0).as_bytes(), usize::MAX, |_k, v| sink += v.len())
+        .unwrap();
+    // The claim publishes the forms the writer holds.
+    let r = db.reader().unwrap();
+    assert!(db.canonical_forms().0 > 0, "published at the claim");
+    for round in 0..8u32 {
+        for start in (0..3000u32).step_by(250) {
+            db.scan(key(start + round * 7).as_bytes(), 120, |_k, v| {
+                sink += v.len()
+            })
+            .unwrap();
+        }
+    }
+    std::hint::black_box(sink);
+    (db, r, m)
+}
+
+/// A block shed takes the form it published with it, from whichever
+/// partition's table it is shed: the state holds a form only for a block
+/// the writer holds it for, or a marker that says to build.
+#[test]
+fn a_block_shed_from_any_partition_takes_its_published_form_with_it() {
+    let only = |c: &BTreeMap<String, u64>| {
+        ["sparse", "copy"]
+            .iter()
+            .map(|k| c.get(&format!("pub_{k}_n")).copied().unwrap_or(0))
+            .sum::<u64>()
+    };
+    let (db, r, m) = shed_over_published_forms("shed-published-fit", true);
+    let c = census_of(&db);
+    assert_eq!(
+        only(&c),
+        0,
+        "forms published for blocks the writer shed, kept to fit: {c:?}"
+    );
+    m.check(&r, "a handle over the forms of a cache shed to fit");
+    m.check(&db, "the writer");
+
+    let (db, _r, _m) = shed_over_published_forms("shed-published-plain", false);
+    let c = census_of(&db);
+    assert!(
+        only(&c) > 0,
+        "not kept to fit, a shed from another partition left its published form: {c:?}"
+    );
+}
+
 /// The seal grows with the partitions: past the floor, a memtable seals
 /// only once it holds a sixteenth of what a merge would rewrite. On a
 /// store whose partitions are far larger than the floor, a commit past
@@ -4377,6 +4688,17 @@ fn overlay_model_with(
     upkeep: supdb::Upkeep,
     pieces_only: bool,
 ) {
+    overlay_model_opts(name, block_cache, budget, upkeep, pieces_only, false)
+}
+
+fn overlay_model_opts(
+    name: &str,
+    block_cache: bool,
+    budget: usize,
+    upkeep: supdb::Upkeep,
+    pieces_only: bool,
+    fit: bool,
+) {
     let d = dir(name);
     let opts = Options {
         seal_bytes: 1 << 20,
@@ -4385,6 +4707,7 @@ fn overlay_model_with(
         scan_cache_bytes: budget,
         upkeep,
         forms_pieces_only: pieces_only,
+        forms_to_fit: fit,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
