@@ -1022,6 +1022,27 @@ fn fill_with_turns<I: Images + ?Sized>(
         s.stats.growths += 1;
     }
 
+    seal_page(s, fit, first_rank, calls, bind32, page)
+}
+
+/// The page of a group that fit: written into `page`, then read back as a
+/// reader reads a page and compared with the images the group was built
+/// from, and only then counted and returned.
+///
+/// This is the whole of the builder's guard against a page whose CRC is good
+/// and whose bytes are wrong -- the CRC is computed over whatever was
+/// written, so it cannot see a payload that is not the group -- and it is
+/// split from the search for a fit so that a test can hand it a fit whose
+/// payload has been damaged since it was judged: no input to `fill_group`
+/// reaches the comparison's failure, because the compressor is correct.
+fn seal_page(
+    s: &mut FillScratch,
+    fit: Fit,
+    first_rank: u32,
+    calls: u32,
+    bind32: u32,
+    page: &mut [u8; ZPAGE],
+) -> Fill {
     let payload: &[u8] = match fit.body {
         Body::Stored => &s.imgs[..fit.ulen],
         Body::Lz4 { buf, clen } => &s.out[buf][..clen],
@@ -1036,14 +1057,7 @@ fn fill_with_turns<I: Images + ?Sized>(
     if encode_page(page, &hdr, payload, bind32).is_err() {
         return Fill::Mismatch;
     }
-    // Decode what was written, not what was meant to be: the page as the
-    // reader will see it, against the images it was built from.
-    let Ok((h, body)) = parse_page(page, bind32) else {
-        return Fill::Mismatch;
-    };
-    let same =
-        h == hdr && decode_group(&h, body, &mut s.verify).is_ok_and(|g| g == &s.imgs[..fit.ulen]);
-    if !same {
+    if !page_decodes_to(page, bind32, &hdr, &s.imgs[..fit.ulen], &mut s.verify) {
         return Fill::Mismatch;
     }
     s.stats.pages += 1;
@@ -1058,6 +1072,22 @@ fn fill_with_turns<I: Images + ?Sized>(
         stored: hdr.stored,
         calls,
     })
+}
+
+/// Whether `page`, read the way a reader reads one -- its CRC, its header,
+/// its payload decoded -- carries the header `hdr` and decodes to exactly
+/// `want`. What was written is read back, not what was meant to be written.
+fn page_decodes_to(
+    page: &[u8; ZPAGE],
+    bind32: u32,
+    hdr: &PageHeader,
+    want: &[u8],
+    verify: &mut GroupBuf,
+) -> bool {
+    let Ok((h, body)) = parse_page(page, bind32) else {
+        return false;
+    };
+    h == *hdr && decode_group(&h, body, verify).is_ok_and(|g| g == want)
 }
 
 /// One fence entry as a page's first decode wants it.
@@ -2165,6 +2195,48 @@ mod tests {
     }
 
     #[test]
+    fn a_group_is_not_decoded_under_a_header_no_page_may_carry() {
+        // `decode_group` is public and takes a header, so it holds the header
+        // to what a page may carry itself: an unchecked length past the
+        // buffer is a panic, and a stored header whose lengths disagree is a
+        // slice of the wrong size.
+        let images = small_groups().remove(0).0;
+        let good = manual_page(&images.concat(), images.len() as u16, 3, 7, false);
+        let (h, payload) = parse_page(&good, 7).unwrap();
+        let mut buf = GroupBuf::new();
+        assert!(decode_group(&h, payload, &mut buf).is_ok(), "the control");
+        for bad in [
+            PageHeader {
+                ulen: ZMAX_ULEN as u32 + 4,
+                ..h
+            },
+            PageHeader {
+                ulen: u32::MAX,
+                ..h
+            },
+            PageHeader {
+                ulen: h.ulen + 2,
+                ..h
+            },
+            PageHeader { ulen: 0, ..h },
+            PageHeader { count: 0, ..h },
+            PageHeader {
+                count: ZMAX_COUNT as u16 + 1,
+                ..h
+            },
+            PageHeader { clen: 0, ..h },
+            PageHeader {
+                clen: ZCAP as u16 + 1,
+                ..h
+            },
+            PageHeader { stored: true, ..h },
+        ] {
+            let got = decode_group(&bad, payload, &mut buf).err();
+            assert!(matches!(got, Some(ZError::Header(_))), "{bad:?}: {got:?}");
+        }
+    }
+
+    #[test]
     fn a_page_of_another_sidecar_fails_its_own_check() {
         let images = small_groups().remove(0).0;
         let page = manual_page(&images.concat(), images.len() as u16, 0, 1, false);
@@ -2700,14 +2772,6 @@ mod tests {
         assert!(resident(run(&|_, t| t.filter_blocks += 1)), "filter_blocks");
         assert!(resident(run(&|_, t| t.res_len -= 8)), "res_len");
         assert!(resident(run(&|_, t| t.keys_len += 1)), "keys_len");
-        // The padding before the filter is zeros.
-        let blob_end = 12 * e + 4 + fence.keys_len();
-        if blob_end % 8 != 0 {
-            assert!(
-                resident(run(&|r, _| r[blob_end] = 1)),
-                "padding before the filter"
-            );
-        }
         // No filter, but the trailer says there is a tail.
         let none = |edit: &dyn Fn(&mut Vec<u8>, &mut Trailer)| {
             resident_edited(&fence, &[], nkeys, n_pages, edit)
@@ -2716,6 +2780,42 @@ mod tests {
         assert!(resident(none(&|_, t| t.filter_off = 8)));
         assert!(resident(none(&|_, t| t.filter_blocks = 1)));
         assert!(resident(none(&|_, t| t.res_len -= 1)));
+    }
+
+    #[test]
+    fn the_padding_before_the_filter_is_zeros() {
+        // A fence whose key blob does not end on a multiple of eight, so that
+        // there is padding to be wrong: built to, not drawn, since a test that
+        // asserts only where the draw left padding passes by skipping itself.
+        let mut fence = ZFence::new();
+        for (i, key) in [&b"a"[..], b"bc", b"def"].into_iter().enumerate() {
+            fence.push(10 * i as u32, i as u32, key).unwrap();
+        }
+        let (nkeys, n_pages) = (30, 3);
+        let filter = Rng::new(10).bytes(2 * 64);
+        let blob_end = 12 * fence.len() + 4 + fence.keys_len();
+        let pad = blob_end.next_multiple_of(8) - blob_end;
+        assert!(pad > 1, "{pad} bytes of padding to put a one in");
+        let run = |edit: &dyn Fn(&mut Vec<u8>, &mut Trailer)| {
+            resident_edited(&fence, &filter, nkeys, n_pages, edit)
+        };
+        assert_eq!(run(&|_, _| {}), Ok(()), "the padding as written");
+        // The padding is read: a one in the first byte of it, in the last,
+        // and in all of it. The resident part's CRC is made good again, so
+        // the CRC cannot be what refuses them.
+        for at in [blob_end, blob_end + pad - 1] {
+            let got = run(&|r, _| r[at] = 1);
+            assert!(
+                matches!(got, Err(ZError::Resident(_))),
+                "byte {at}: {got:?}"
+            );
+        }
+        let got = run(&|r, _| r[blob_end..blob_end + pad].fill(0xFF));
+        assert!(matches!(got, Err(ZError::Resident(_))), "{got:?}");
+        // The check is on the padding and not on the region: the byte before
+        // it is a key's, and a key that changed is a different key, not a
+        // refusal.
+        assert_eq!(run(&|r, _| r[blob_end - 1] ^= 1), Ok(()));
     }
 
     #[test]
@@ -3104,17 +3204,71 @@ mod tests {
         out
     }
 
+    /// What a first decode must refuse of a page that is not its entry's:
+    /// the page against its own entry with one quantity off, and its
+    /// neighbours against it. Every page of a sidecar shares `bind32` and
+    /// passes its own CRC, so the comparison of the page's `first_rank` and
+    /// `count` with the entry's, and of its first key with the entry's, is
+    /// all that stands between a page read at the wrong place -- a page
+    /// number off by one, a fence entry from before a rebuild -- and the
+    /// records it holds.
+    fn check_fence_binds(
+        page: &[u8; ZPAGE],
+        neighbours: &[&[u8; ZPAGE]],
+        entry: &FenceEntry<'_>,
+        bind: u32,
+        buf: &mut GroupBuf,
+    ) {
+        let mut refused =
+            |page: &[u8; ZPAGE], e: &FenceEntry<'_>| verify_page(page, bind, e, buf).err();
+        // The entry's rank and its count, each off by one either way: the
+        // comparison that names the disagreement, not the walk behind it.
+        for (first_rank, count) in [
+            (entry.first_rank.wrapping_add(1), entry.count),
+            (entry.first_rank.wrapping_sub(1), entry.count),
+            (entry.first_rank, entry.count + 1),
+            (entry.first_rank, entry.count - 1),
+        ] {
+            let e = FenceEntry {
+                first_rank,
+                count,
+                ..*entry
+            };
+            assert_eq!(refused(page, &e), Some(ZError::Fence), "{e:?}");
+        }
+        // The entry's key: longer, shorter, and one byte off. The page's
+        // rank and count agree with the entry here, so only the first key's
+        // comparison in the walk can see it.
+        let mut keys = vec![[entry.key, &[0u8][..]].concat()];
+        if let Some((last, rest)) = entry.key.split_last() {
+            keys.push(rest.to_vec());
+            keys.push([rest, &[last ^ 1][..]].concat());
+        }
+        for k in &keys {
+            let e = FenceEntry { key: k, ..*entry };
+            let got = refused(page, &e);
+            assert!(matches!(got, Some(ZError::Walk(_))), "{e:?}: {got:?}");
+        }
+        // A page of this sidecar at another entry's place: it passes its own
+        // CRC under this `bind32`, and only the comparison refuses it.
+        for other in neighbours {
+            assert!(parse_page(*other, bind).is_ok(), "a good page of the build");
+            assert_eq!(refused(other, entry), Some(ZError::Fence), "{entry:?}");
+        }
+    }
+
     /// What must hold of a build whatever the records: they are covered
     /// once each by a page or a decline; every page decodes to its records'
     /// images, is stored exactly where LZ4 did not help and the group fits,
     /// and carries the LZ4 block of its group; a record is declined only for
     /// a reason that holds of it alone. With `records`, the images are
-    /// records and every page passes the check a reader's first decode makes.
+    /// records, every page passes the check a reader's first decode makes at
+    /// its own fence entry, and is refused at an entry that is not its own.
     fn check_build<I: Images + ?Sized>(src: &I, b: &Built, bind: u32, records: bool) {
         let n = src.records();
         let mut covered = vec![0u32; n];
         let mut buf = GroupBuf::new();
-        for (rank, g, page) in &b.pages {
+        for (i, (rank, g, page)) in b.pages.iter().enumerate() {
             for c in &mut covered[*rank..*rank + g.count] {
                 *c += 1;
             }
@@ -3168,6 +3322,14 @@ mod tests {
                     verify_page(page, bind, &entry, &mut buf).map(|h| h.count as usize),
                     Ok(g.count)
                 );
+                // And refuses what is not this page's entry, with the pages on
+                // either side of it for the entries a page is read at by mistake.
+                let near: Vec<&[u8; ZPAGE]> = [i.checked_sub(1), Some(i + 1)]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|j| b.pages.get(j).map(|p| &p.2))
+                    .collect();
+                check_fence_binds(page, &near, &entry, bind, &mut buf);
             }
         }
         for &(r, why) in &b.declined {
@@ -3200,6 +3362,40 @@ mod tests {
             s.stats.payload_bytes as f64 / (p * ZCAP as f64),
             s.stats.calls as f64 / p,
         )
+    }
+
+    #[test]
+    fn a_page_is_refused_at_an_entry_that_is_not_its_own() {
+        let images = suite_images(2500, 14);
+        let bind = bind32(1, 2, images.len() as u64, 3);
+        let mut s = FillScratch::new();
+        let b = build_all(&images, &mut s, bind, None);
+        assert!(b.pages.len() >= 20, "{} pages", b.pages.len());
+        let mut buf = GroupBuf::new();
+        for (i, (rank, g, page)) in b.pages.iter().enumerate() {
+            let key = crate::flatindex::record_key(&images[*rank], 0).unwrap();
+            let entry = FenceEntry {
+                index: i,
+                first_rank: *rank as u32,
+                count: g.count as u32,
+                page: i as u32,
+                key,
+            };
+            let ok = verify_page(page, bind, &entry, &mut buf).map(|h| usize::from(h.count));
+            assert_eq!(ok, Ok(g.count), "page {i} at its own entry");
+            let near: Vec<&[u8; ZPAGE]> = [i.checked_sub(1), Some(i + 1)]
+                .into_iter()
+                .flatten()
+                .filter_map(|j| b.pages.get(j).map(|p| &p.2))
+                .collect();
+            check_fence_binds(page, &near, &entry, bind, &mut buf);
+            // A page of another sidecar fails its CRC before the entry is
+            // looked at, whatever the entry says.
+            assert_eq!(
+                verify_page(page, bind ^ 1, &entry, &mut buf).err(),
+                Some(ZError::PageCrc)
+            );
+        }
     }
 
     #[test]
@@ -3658,6 +3854,178 @@ mod tests {
             rows[1].1 > rows[0].1,
             "the first growth round pays: {rows:?}"
         );
+    }
+
+    // ---- the builder's guard against a page that is wrong -----------------
+
+    /// A group of the suite's records staged and compressed as `fill_group`
+    /// leaves it at the moment it makes the page, with the scratch it is in.
+    fn fit_of(images: &[Vec<u8>], m: usize) -> (FillScratch, Fit) {
+        let mut s = FillScratch::new();
+        assert!(matches!(s.stage(images, 0, m), Stage::Ok));
+        let ulen = s.imgs.len();
+        let Some(Class::Lz4(clen)) = s.classify(ulen, 0) else {
+            panic!("{m} of the suite's records compress into a page")
+        };
+        let body = Body::Lz4 { buf: 0, clen };
+        (s, Fit { m, ulen, body })
+    }
+
+    #[test]
+    fn a_page_that_does_not_decode_to_its_images_is_not_returned() {
+        let images = suite_images(60, 15);
+        let (bind, want) = (31, images[..30].concat());
+        // The page `seal_page` makes of a fit, and what a refused one leaves:
+        // no page counted, whatever the compress calls before it cost.
+        let seal = |s: &mut FillScratch, fit: Fit| -> Fill {
+            let before = s.stats;
+            let got = seal_page(s, fit, 0, 1, bind, &mut [0u8; ZPAGE]);
+            if got == Fill::Mismatch {
+                assert_eq!(s.stats, before, "a refused page is not counted");
+            }
+            got
+        };
+        // The control: the group as it was compressed is a page, counted once.
+        let (mut s, fit) = fit_of(&images, 30);
+        let mut page = [0u8; ZPAGE];
+        let Fill::Page(g) = seal_page(&mut s, fit, 0, 1, bind, &mut page) else {
+            panic!("the group as compressed is a page")
+        };
+        assert_eq!((g.count, s.stats.pages, s.stats.records), (30, 1, 30));
+        let (h, payload) = parse_page(&page, bind).unwrap();
+        let mut buf = GroupBuf::new();
+        assert_eq!(decode_group(&h, payload, &mut buf).unwrap(), &want[..]);
+
+        // The compressor's block damaged after the group was judged to fit,
+        // at every byte. The CRC is computed over what was written, so the
+        // page is signed either way and only the comparison can refuse it:
+        // it must agree, byte by byte, with an oracle that decodes the
+        // damaged block itself.
+        let Body::Lz4 { clen, .. } = fit.body else {
+            unreachable!()
+        };
+        let mut harmful = 0;
+        for at in 0..clen {
+            let (mut s, fit) = fit_of(&images, 30);
+            s.out[0][at] ^= 0x20;
+            let mut back = vec![0u8; fit.ulen];
+            let decoded = lz4_flex::block::decompress_into(&s.out[0][..clen], &mut back);
+            let intact = decoded.ok() == Some(fit.ulen) && back == want;
+            let got = seal(&mut s, fit);
+            if intact {
+                assert!(
+                    matches!(got, Fill::Page(_)),
+                    "byte {at}: the group is intact"
+                );
+            } else {
+                harmful += 1;
+                assert_eq!(got, Fill::Mismatch, "byte {at}");
+            }
+        }
+        assert!(harmful * 10 > clen * 9, "{harmful} of {clen} bytes matter");
+
+        // The images changed after the compress: the page decodes to the
+        // group that was compressed, which is no longer them.
+        let (mut s, fit) = fit_of(&images, 30);
+        s.imgs[7] ^= 1;
+        assert_eq!(seal(&mut s, fit), Fill::Mismatch);
+
+        // A header whose length is not the block's, shorter and longer.
+        let (mut s, fit) = fit_of(&images, 30);
+        let shorter = Fit {
+            ulen: fit.ulen - 4,
+            ..fit
+        };
+        assert_eq!(seal(&mut s, shorter), Fill::Mismatch);
+        let (mut s, fit) = fit_of(&images, 30);
+        assert!(matches!(s.stage(&images, 0, 31), Stage::Ok));
+        let longer = Fit {
+            ulen: s.imgs.len(),
+            ..fit
+        };
+        assert_eq!(seal(&mut s, longer), Fill::Mismatch);
+
+        // A fit no header can describe, a payload over a page, is no page.
+        let (mut s, fit) = fit_of(&images, 30);
+        let huge = Fit {
+            body: Body::Lz4 {
+                buf: 0,
+                clen: ZCAP + 1,
+            },
+            ..fit
+        };
+        assert_eq!(seal(&mut s, huge), Fill::Mismatch);
+    }
+
+    #[test]
+    fn a_page_is_compared_as_a_reader_reads_it() {
+        let images = small_groups().remove(0).0;
+        let (group, bind) = (images.concat(), 5);
+        let page = manual_page(&group, images.len() as u16, 9, bind, false);
+        let (hdr, _) = parse_page(&page, bind).unwrap();
+        let mut v = GroupBuf::new();
+        assert!(page_decodes_to(&page, bind, &hdr, &group, &mut v));
+        // Not the group it was asked for.
+        let mut other = group.clone();
+        other[3] ^= 1;
+        assert!(!page_decodes_to(&page, bind, &hdr, &other, &mut v));
+        assert!(!page_decodes_to(
+            &page,
+            bind,
+            &hdr,
+            &group[..group.len() - 4],
+            &mut v
+        ));
+        // Not the header it was asked for.
+        for bad in [
+            PageHeader {
+                first_rank: 10,
+                ..hdr
+            },
+            PageHeader {
+                count: hdr.count - 1,
+                ..hdr
+            },
+        ] {
+            assert!(
+                !page_decodes_to(&page, bind, &bad, &group, &mut v),
+                "{bad:?}"
+            );
+        }
+        // Not a page this sidecar reads: another bind32, or a byte changed.
+        assert!(!page_decodes_to(&page, bind ^ 1, &hdr, &group, &mut v));
+        let mut torn = page;
+        torn[100] ^= 1;
+        assert!(!page_decodes_to(&torn, bind, &hdr, &group, &mut v));
+        // A page whose CRC is good and whose payload is not the group.
+        let mut signed = page;
+        signed[ZHDR + 3] ^= 0x40;
+        resign_page(&mut signed, bind);
+        assert!(parse_page(&signed, bind).is_ok(), "its CRC is good");
+        assert!(!page_decodes_to(&signed, bind, &hdr, &group, &mut v));
+    }
+
+    #[test]
+    fn a_compressor_that_fails_fails_the_build_and_returns_no_page() {
+        let images = suite_images(200, 16);
+        let mut page = [0u8; ZPAGE];
+        let call =
+            |s: &mut FillScratch, page: &mut [u8; ZPAGE]| fill_group(&images, 0, 10, 1, s, page);
+        // The control: with both buffers whole, the call is a page.
+        let mut s = FillScratch::new();
+        assert!(matches!(call(&mut s, &mut page), Fill::Page(_)));
+        // The first compress of a call, into a buffer too small for the
+        // worst case, which `compress_into` refuses whatever the data is.
+        let mut s = FillScratch::new();
+        s.out[0].truncate(8);
+        assert_eq!(call(&mut s, &mut page), Fill::Mismatch);
+        assert_eq!(s.stats.pages, 0);
+        // A growth's compress: the fit is made in one buffer, the growth in
+        // the other.
+        let mut s = FillScratch::new();
+        s.out[1].truncate(8);
+        assert_eq!(call(&mut s, &mut page), Fill::Mismatch);
+        assert_eq!(s.stats.pages, 0);
     }
 
     // ---- a whole sidecar ------------------------------------------------
