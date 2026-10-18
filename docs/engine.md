@@ -6024,7 +6024,7 @@ lag bursts (48-68x) and the one-percent lag scan (3.9x), and trails the
 point reads (0.68x), the scans (0.37x on one thread, 0.76x on three),
 mixes C, D and E, which are Zipfian reads and uniform reads and scans
 (0.45x, 0.48x, 0.35x), and the full-rewrite lag scan, at 0.07x. Mixes C
-and E fault 0.215 and 0.285 a operation against 0.075 and 0.121. The
+and E fault 0.215 and 0.285 an operation against 0.075 and 0.121. The
 full-rewrite lag scan faults 37 times a scan on the scanning thread and
 has 371 KB a scan read by background threads; neither count says why,
 and the candidates, untested, are the seek into the burst's piece, which
