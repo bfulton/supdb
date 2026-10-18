@@ -63,15 +63,15 @@
 //! is refaulting, not that a neighbour is, and it moves with the gate, since
 //! the compact form takes away the refaults the raw form made. A store that
 //! reads fast enough to buy the form is over it by its own refaults alone:
-//! the evidence is half its faults as refaults, and the entry threshold is a
-//! saving of that many faults a read. So the term opens the build clause (the
-//! measured saving still decides) and keeps E1 from acting while it is on,
-//! since the model's word is in doubt then; E3 is not stopped by it, because
-//! the compact form's own faults are among the refaults it counts. The
-//! model's word that the store fits is checked against the raw form's
-//! measured faults when the compact form takes over (see the bullet on the
-//! model's error), and a form bought against that word is left by E3 or by a
-//! trial.
+//! the evidence needs half of its faults to be refaults, and buying needs a
+//! saving of at least the entry threshold in faults a read. So the term opens
+//! the build clause (the measured saving still decides) and keeps E1 from
+//! acting while it is on, since the model's word is in doubt then; E3 is not
+//! stopped by it, because the compact form's own faults are among the
+//! refaults it counts. The model's word that the store fits is checked
+//! against the raw form's measured faults when the compact form takes over
+//! (see the bullet on the model's error), and a form bought against that
+//! word is left by E3 or by a trial.
 //!
 //! The caller steps once per [`CENSUS_INTERVAL`]. The rings that hold a
 //! window of history are sized for that cadence; a caller that steps faster
@@ -2646,9 +2646,12 @@ mod tests {
         // Nothing fits: every read faults on each population it touches.
         assert_eq!(model_raw(0, 1 << 20, 1 << 30), 2.0);
         assert_eq!(model_raw(0, 0, 1 << 30), 1.0);
+        assert_eq!(model_raw(0, 1 << 20, 0), 1.0);
         assert_eq!(model_raw(0, 0, 0), 0.0);
-        // Everything fits.
+        // Everything fits, to the byte: a store that fills the cache exactly
+        // takes no fault and not a rounding of one.
         assert_eq!(model_raw(1 << 31, 1 << 20, 1 << 30), 0.0);
+        assert_eq!(model_raw((1 << 20) + (1 << 30), 1 << 20, 1 << 30), 0.0);
         // One population.
         let one = model_raw(1 << 29, 0, 1 << 30);
         assert!(one > 0.0 && one < 1.0, "{one}");
@@ -2871,6 +2874,8 @@ mod tests {
             8.0 * (1.0 + DISPLACEMENT_FACTOR)
         );
         assert_eq!(ski_rental_price(8.0, Some(1.0)), 9.0);
+        // A displacement measured at nothing is a measure.
+        assert_eq!(ski_rental_price(8.0, Some(0.0)), 8.0);
         assert_eq!(ski_rental_price(8.0, Some(f64::NAN)), 12.0);
         assert_eq!(ski_rental_price(8.0, Some(-1.0)), 12.0);
     }
