@@ -5872,8 +5872,8 @@ have, so the first bounded rung asked what the process holds, phase by
 phase. The suite's three-million-key rung ran under an eight-gibibyte
 group with the group's `rss` and `cache` sampled twice a second beside
 the phase marks (`SUPDB_LAG_MARK`), one arm a process. The ordered
-load ends at about 55 MB of anonymous memory on every supdb arm and
-LMDB at 20; the read passes and the mixes at 150. The shuffled load is
+load and the passes after it hold 50-150 MB of anonymous memory on every
+supdb arm and 20 on LMDB. The shuffled load is
 where the arms part: the default ended it at 814-865 MB resident, the
 arm with no block cache at 190-287, the arm whose forms wait for a
 reader's scan at 180-315, and LMDB at 25, with a single malloc arena
@@ -5881,19 +5881,21 @@ reader's scan at 180-315, and LMDB at 25, with a single malloc arena
 memory was allocation and not the arenas' retention. Every sixteenth
 page fault with its call chain (`perf record -e page-faults -c 16
 --call-graph dwarf`), cut to the two shuffled loads' windows, put 1.4 GB
-of the 3.3 GB faulted on the upkeep thread -- `BuildCtx::copy_block`
-under `materialize`, `complete_forms`, `build_over`, the forms' Vec
-growth -- against the seal threads' 750 MB of transient snapshot
-copies and the writer's 260 MB of memtable chunks. With the forms
+of the 3.3 GB faulted on the upkeep thread, 630 MB of it in
+`BuildCtx::copy_block` under `materialize`, which builds a form, and
+500 in `Reader::splice_run` under `patch_block`, which grows one. The
+writer's thread, and the seal threads that inherit its name, took 1.3
+GB, 750 MB of it in the seal's job and 260 in the memtable's chunks,
+and the segment work 620, the compaction's output. With the forms
 maintained at every commit and nothing gating them on a reader, each
 batch of random writes overlaid every block of the store and the
-thread copied the lot into forms the next landing dropped: anonymous
-memory of the store's own size, built and freed a dozen times a load,
-for scans that came after the drain and read 3.4 M entries/s on the
-first lag pass where the arm that filed nothing read 25 (one rep each,
-ops divided by ten). Under a one-gibibyte bound the default was killed
-inside that load, `anon-rss` at the limit and the group's `cache` at
-32 KB, every file page reclaimed under it.
+thread built and patched forms over all of it, which the next landing
+dropped, and the scans that came after the drain read 3.4 M entries/s
+on the first lag pass where the arm that filed nothing read 25 (one rep
+each, ops divided by ten). Under a one-gibibyte bound the default was
+killed in its first rep at three million keys, `anon-rss` at the limit
+and the group's `cache` at 32 KB, every file page reclaimed under it;
+the phase it was in is not known.
 
 The commit's maintenance files nothing far from a scan now -- none in
 the store's life or two stores' worth of writes since the last, the
@@ -5915,9 +5917,11 @@ taking the process to 960 MB, which is the next question: the forms over
 a store a piece spans are larger than the store. The same probe read the
 arm with its cache budgeted at 256 MB (`supdb-cache256`) peaking at
 840 MB in the lag sweep and the plain-readahead arm at 953, against 417
-for the arm with no cache, and under the gibibyte every supdb arm but
-that one was killed at three million keys, `anon-rss` at the limit
-with the upkeep thread or the writer allocating. The budget counts the
+for the arm with no cache. Under the gibibyte the default, with the
+change above in, and the 256 MB arm were killed at three million keys,
+`anon-rss` at the limit with a different thread allocating each time;
+the plain-readahead arm was not run under it, and a peak of 953 MB
+leaves the page cache no room there. The budget counts the
 forms' contents -- keys, values and entries -- and not the memory they
 cost: the vectors' slack, the arenas' retention of what a shed form
 freed, and the copies a publish carries into the state for every
@@ -5926,19 +5930,23 @@ rows are the arm with no cache against LMDB, and the forms' memory is
 the lead the rows name.
 
 The same probe answered a question the first bounded numbers raised. A
-bounded row divides its read passes' operation counts for time, and
-at a division of ten the lag passes at three million read supdb at
-0.28-0.4x of LMDB on every lag point where the row before it, at one
-million with whole counts, read 1.2-1.9x. One rep at three million
-with the quick scale's whole counts and no bound read the default at
-1.85x, 1.9x, 1.7x and 1.03x of LMDB over the four lag points: there is
-no cliff between one million and three, and the divided pass had
-weighted the first scan's build ten times. A pass whose first
-operation builds what the pass needs is measured by its count, and a
-count divided for time is a different pass; the bounded rows' division
-is read with that in mind, and the first scan of a divided pass is to
-be reported on its own, as `SUPDB_SCAN_OPS` reports it for the scan
-pass.
+bounded row divides its read passes' operation counts for time, and at
+a division of ten three of the four lag points at three million read
+the default at 0.25-0.4x of LMDB and the one-percent point at 0.87x,
+where the row before it, at one million with whole counts, read
+1.2-1.9x. One rep at three million with the quick scale's whole counts
+and no bound read the default at 1.85x, 1.9x, 1.7x and 1.03x of LMDB
+over the four points, so there is no cliff between one million and
+three. The two passes' times fit a one-time cost of tens of
+milliseconds in the first scan, which a tenth of the scans spread over
+a tenth of the entries; and once the forms stopped being filed far from
+a scan the divided pass's first point read 28.6 M entries/s, so the
+division did not make the pass trail, it magnified what the stale forms
+cost. A pass whose first operation builds what the pass needs is
+measured by its count, and a count divided for time is a different
+pass; the bounded rows' division is read with that in mind, and the
+first scan of a divided pass is to be reported on its own, as
+`SUPDB_SCAN_OPS` reports it for the scan pass.
 
 ### Arrival order
 

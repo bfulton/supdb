@@ -1914,12 +1914,13 @@ holds it, since the next change moves the contents and not the name.
 **A structure maintained for a reader who was never coming, found by
 its memory.** The forms were maintained at every commit whoever was
 reading, and a batch of random writes overlays every block of the
-store, so a shuffled load had the upkeep thread copying the whole store
-into forms the next landing dropped -- a dozen times a load, anonymous
-memory of the store's own size beside it. No rate showed it: the thread
-is niced and ran beside the writer on a spare core, the forms were
-freed before any read, and every row was in-core on a box with memory
-to spare. The first bounded rung found it as a kill, `anon-rss` at the
+store, so a shuffled load had the upkeep thread building and patching
+forms over the whole store that the next landing dropped, anonymous
+memory of about the store's own size beside it. No rate named it: the
+thread is niced and ran beside the writer on a spare core, every row was
+in-core on a box with memory to spare, and the one gap it left, the
+first lag pass after a shuffled load, read as a first-scan cost. The
+first bounded rung found it as a kill, `anon-rss` at the
 limit with the page cache reclaimed to nothing under it. The commit's
 maintenance files nothing far from a scan now (`Options::forms_settle_far`
 is the shape that did). The rule: a structure kept for readers is
@@ -1930,8 +1931,9 @@ not; and a process's anonymous memory is read by phase, the group's
 a bound, since what it holds is page cache it will not have. Beside
 it: a pass divided for time weights its first operation by the divisor,
 so a divided pass that trails is read against the whole pass before it
-is read as the engine's -- at a tenth of the scans the lag points at
-three million read 0.3x of LMDB, and whole they read 1.0-1.9x.
+is read as the engine's -- at a tenth of the scans three of the four
+lag points at three million read 0.25-0.4x of LMDB, and whole counts
+read all four at 1.0-1.9x.
 
 ## Standing limitations
 

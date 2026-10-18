@@ -106,15 +106,16 @@ row's read passes run a divided count of operations (`--ops-div`,
 thirty by default, never below a thousand operations); its loads and
 bursts are whole.
 A divided pass is a different pass where its first operation builds
-what the rest reuse: at a tenth of the scans the lag points at three
-million keys read supdb at a third of LMDB, and with the whole count
-in one process they read 1.0-1.9x. A bounded row's divided passes are
+what the rest reuse: at a tenth of the scans three of the four lag
+points at three million keys read supdb at a quarter to two fifths of
+LMDB, and with the whole count in one process all four read 1.0-1.9x. A
+bounded row's divided passes are
 read beside an undivided rung of the same size before a trailing cell
 is called the engine's, and the engine's anonymous memory is read by
 phase first, since under the bound it is page cache the store does not
-have: the default's forms, maintained at every commit, held the store's
-own size during a shuffled load until they were gated on a reader
-being there.
+have: the default's forms, maintained at every commit, held about the
+store's own size during a shuffled load until they were gated on a
+reader being there.
 
 The load's two byte quantities are taken apart, and they are not the same
 question. Device bytes written per byte stored is a flow: the device's
