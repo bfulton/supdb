@@ -115,7 +115,18 @@ fn remove_manifests(d: &std::path::Path) {
 
 fn read_vec(db: &Reader, key: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
-    db.read_all(key, |v| out.push(v.to_vec())).unwrap();
+    let n = db.read_all(key, |v| out.push(v.to_vec())).unwrap();
+    // The number `read_all` returns is how many values it handed over. A
+    // path that works the number out by another route than the one that
+    // delivers the values (the point read through the ordered index asks
+    // the segment for the values of a rank) is held to it by every read
+    // in this file, and not only by the values compared.
+    assert_eq!(
+        n,
+        out.len() as u64,
+        "read_all's count against the values it delivered, key {:?}",
+        String::from_utf8_lossy(key)
+    );
     out
 }
 
@@ -897,16 +908,35 @@ enum OrdShape {
     Mixed,
     /// One length past the common prefix and a head.
     Wide,
+    /// One length that fills the prefix and a head exactly, in bytes of
+    /// zero, 0x7f and 0xff: a key that ends in a zero byte is the key a
+    /// head cannot tell from its own proper prefix, which pads with zeros.
+    Binary,
 }
 
 fn ord_key(shape: OrdShape, k: u32) -> Vec<u8> {
     match shape {
-        OrdShape::Short => format!("key-{k:05}"),
-        OrdShape::Mixed if k.is_multiple_of(7) => format!("key-{k:05}x"),
-        OrdShape::Mixed => format!("key-{k:05}"),
-        OrdShape::Wide => format!("{:08x}-{k:05}-a-wide-key", k.wrapping_mul(2_654_435_761)),
+        OrdShape::Short => format!("key-{k:05}").into_bytes(),
+        OrdShape::Mixed if k.is_multiple_of(7) => format!("key-{k:05}x").into_bytes(),
+        OrdShape::Mixed => format!("key-{k:05}").into_bytes(),
+        OrdShape::Wide => {
+            format!("{:08x}-{k:05}-a-wide-key", k.wrapping_mul(2_654_435_761)).into_bytes()
+        }
+        // Eight base-three digits of `k`, the most significant first and
+        // each one of three bytes in the order of the digits, behind two
+        // bytes of prefix: keys sort as `k` does, and a third of them end
+        // in a zero byte and a third in 0xff. Four thousand keys put the
+        // top digit at zero in some and one in others, so the prefix the
+        // first and last keys share is the two bytes and the keys fill it
+        // and a head to the byte.
+        OrdShape::Binary => {
+            let mut key = b"bn".to_vec();
+            for i in (0..8u32).rev() {
+                key.push([0x00, 0x7f, 0xff][(k / 3u32.pow(i) % 3) as usize]);
+            }
+            key
+        }
     }
-    .into_bytes()
 }
 
 /// A store built by one fixed run of operations, and what it holds: a
@@ -1014,19 +1044,28 @@ fn ord_fixture(name: &str, shape: OrdShape, via_ord: bool) -> OrdFixture {
 /// extremes.
 fn ord_probes(shape: OrdShape) -> Vec<Vec<u8>> {
     let mut v: Vec<Vec<u8>> = (0u32..4_010).map(|k| ord_key(shape, k)).collect();
-    for k in (0u32..4_010).step_by(37) {
+    // Every key of the binary shape: the ones that end in a zero byte are a
+    // third of them, and the key a byte shorter ties the head of each.
+    let step = if matches!(shape, OrdShape::Binary) {
+        1
+    } else {
+        37
+    };
+    for k in (0u32..4_010).step_by(step) {
         let key = ord_key(shape, k);
         v.push(key[..key.len() - 1].to_vec());
-        for tail in [0u8, b'x'] {
+        for tail in [0u8, 0xff, b'x'] {
             let mut longer = key.clone();
             longer.push(tail);
             v.push(longer);
         }
         let mut down = key.clone();
-        *down.last_mut().unwrap() -= 1;
+        let last = down.last_mut().unwrap();
+        *last = last.wrapping_sub(1);
         v.push(down);
         let mut up = key.clone();
-        *up.last_mut().unwrap() += 1;
+        let last = up.last_mut().unwrap();
+        *last = last.wrapping_add(1);
         v.push(up);
     }
     for k in [
@@ -1054,11 +1093,19 @@ fn ord_probes(shape: OrdShape) -> Vec<Vec<u8>> {
 /// the count says the ordered path was taken where the partition's keys
 /// are whole heads, for every read a tombstone does not turn away from the
 /// partition, and was not taken where they are not, or where the option is
-/// off.
+/// off. The count is exact, so a read the heads answered wrongly and the
+/// record check turned back to the hash shows as a decline: the binary
+/// shape's keys end in zero bytes, where a key a byte shorter pads to the
+/// same head and the flag has to say it is not the key.
 #[test]
 fn a_point_read_through_the_ordered_index_answers_as_the_hash_does() {
     assert!(!Options::default().point_via_ord, "an arm, not the default");
-    for shape in [OrdShape::Short, OrdShape::Mixed, OrdShape::Wide] {
+    for shape in [
+        OrdShape::Short,
+        OrdShape::Mixed,
+        OrdShape::Wide,
+        OrdShape::Binary,
+    ] {
         let on = ord_fixture(&format!("ordread-on-{shape:?}"), shape, true);
         let off = ord_fixture(&format!("ordread-off-{shape:?}"), shape, false);
         assert_eq!(on.model, off.model, "{shape:?}: one store written twice");
@@ -1081,7 +1128,7 @@ fn a_point_read_through_the_ordered_index_answers_as_the_hash_does() {
         match shape {
             // Every read a tombstone does not turn away asks the partition,
             // and its heads answer.
-            OrdShape::Short => assert_eq!(
+            OrdShape::Short | OrdShape::Binary => assert_eq!(
                 on.db.ord_point_reads(),
                 (reads - masked_reads, 0),
                 "{shape:?}"

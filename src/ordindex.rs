@@ -1352,6 +1352,109 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    /// The flag `seek_exact` returns is believed: a point read
+    /// (`Options::point_via_ord`) answers a key absent from `Some(false)`
+    /// with no record read. So it is held to the keys and not only to the
+    /// rank: `Some(f)` says whether the key at the rank is the query, for
+    /// every query, over keys that end in zero and 0xff bytes. A head pads
+    /// with zeros, so a query a byte shorter than a key whose last byte is
+    /// zero ties its head, and so does a query a byte longer than a key,
+    /// and neither is the key. A uniform index always says, with no record
+    /// to ask; any other says only for a query outside the prefix, and
+    /// never says yes.
+    #[test]
+    fn the_flag_of_an_exact_seek_says_whether_the_key_is_there() {
+        // Uniform: three bytes of prefix, then six of four values.
+        let uniform: Vec<Vec<u8>> = (0u32..4096)
+            .map(|n| {
+                let mut k = vec![b'p', 0x00, 0xff];
+                for i in (0..6).rev() {
+                    k.push([0x00, 0x01, 0xfe, 0xff][((n >> (2 * i)) & 3) as usize]);
+                }
+                k
+            })
+            .collect();
+        // Not uniform: every string of up to six bytes of three values
+        // behind one byte, so that the lengths differ and heads tie.
+        let mut mixed: Vec<Vec<u8>> = vec![b"k".to_vec()];
+        let mut level = mixed.clone();
+        for _ in 0..6 {
+            level = level
+                .iter()
+                .flat_map(|k| {
+                    [0x00u8, 0x01, 0xff].map(|b| {
+                        let mut longer = k.clone();
+                        longer.push(b);
+                        longer
+                    })
+                })
+                .collect();
+            mixed.extend(level.iter().cloned());
+        }
+        mixed.sort();
+        mixed.dedup();
+        let never = |r: usize| -> Option<&'static [u8]> { panic!("read record {r}") };
+        for (name, owned) in [("uniform", &uniform), ("mixed", &mixed)] {
+            let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+            let p = write(&build(&keys), &format!("flag-{name}"));
+            let mut idx = OrdIndex::open(&p, keys.len()).expect("opens");
+            idx.learn_prefix(keys[0]);
+            assert_eq!(idx.uniform(), name == "uniform", "{name}");
+            let mut probes: Vec<Vec<u8>> = vec![
+                vec![],
+                b"p".to_vec(),
+                b"k".to_vec(),
+                vec![0x00; 16],
+                vec![0xff; 16],
+            ];
+            for k in &keys {
+                probes.push(k.to_vec());
+                probes.push(k[..k.len() - 1].to_vec());
+                for tail in [0x00u8, 0xff] {
+                    let mut longer = k.to_vec();
+                    longer.push(tail);
+                    probes.push(longer);
+                }
+                let last = k[k.len() - 1];
+                for near_last in [last.wrapping_sub(1), last.wrapping_add(1)] {
+                    let mut near = k.to_vec();
+                    *near.last_mut().unwrap() = near_last;
+                    probes.push(near);
+                }
+            }
+            let (mut present, mut shorter_tie) = (0usize, 0usize);
+            for q in &probes {
+                let rank = lower_bound(&keys, q);
+                let is_key = keys.get(rank) == Some(&q.as_slice());
+                let (got, flag) = if idx.uniform() {
+                    idx.seek_exact(q, never)
+                } else {
+                    idx.seek_exact(q, resolver(&keys))
+                };
+                let what = format!("{name}: query {q:02x?}");
+                assert_eq!(got, rank, "{what}: the rank");
+                match flag {
+                    Some(f) => assert_eq!(f, is_key, "{what}: the flag against the key at {rank}"),
+                    None => assert!(!idx.uniform(), "{what}: a uniform index always says"),
+                }
+                if !idx.uniform() {
+                    assert_ne!(flag, Some(true), "{what}: only a uniform index says yes");
+                }
+                present += usize::from(is_key);
+                let mut padded = q.clone();
+                padded.push(0x00);
+                shorter_tie += usize::from(keys.binary_search(&padded.as_slice()).is_ok());
+            }
+            // The cases are in the probes: every key is asked for (a probe
+            // a byte off a key can be another key, so at least that many
+            // are present), and the keys that end in a zero byte are each
+            // asked for a byte short.
+            assert!(present >= keys.len(), "{name}: {present} keys asked");
+            assert!(shorter_tie > keys.len() / 4, "{name}: {shorter_tie} ties");
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
     #[test]
     fn an_empty_segment_builds_and_seeks() {
         let p = write(&build(&[]), "empty");
