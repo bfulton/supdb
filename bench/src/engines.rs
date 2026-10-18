@@ -654,6 +654,39 @@ pub struct Supdb {
     /// its hash (`Options::point_via_ord`). `supdb-nocacheordread`, the
     /// nocache policy alone: the form is for a store that does not fit.
     ordread: bool,
+    /// What the reader handles this store gave its threads answered
+    /// through the ordered index, summed as each is dropped
+    /// (`OrdTally`); only the arm that reads that way hands out handles
+    /// that sum.
+    ord_threads: std::sync::Arc<OrdTally>,
+}
+
+/// The ordered-index point reads of the reader handles a threaded pass
+/// hands its threads. A handle's own count (`supdb::Reader::ord_point_reads`)
+/// dies with it, and a pass drops its handles before the store's counters
+/// are read, so the threaded cells of a pairing would print nothing of
+/// whether they took the path the single-threaded cell did.
+#[derive(Default)]
+struct OrdTally {
+    served: std::sync::atomic::AtomicU64,
+    declined: std::sync::atomic::AtomicU64,
+}
+
+/// A thread's reader on the arm that reads through the ordered index: the
+/// handle, and its counts handed to the store's tally when it is dropped,
+/// which is after the thread's clock has stopped and not once per read.
+struct TallyReader {
+    r: supdb::Reader,
+    tally: std::sync::Arc<OrdTally>,
+}
+
+impl Drop for TallyReader {
+    fn drop(&mut self) {
+        let (served, declined) = self.r.ord_point_reads();
+        let relaxed = std::sync::atomic::Ordering::Relaxed;
+        self.tally.served.fetch_add(served, relaxed);
+        self.tally.declined.fetch_add(declined, relaxed);
+    }
 }
 
 /// What an arm differs from `supdb` by. One struct rather than a row of
@@ -3643,6 +3676,7 @@ impl Supdb {
             bg,
             bglag,
             ordread,
+            ord_threads: Default::default(),
         })
     }
 }
@@ -3701,6 +3735,15 @@ impl ThreadReader for supdb::Reader {
     }
     fn range(&mut self, from: &[u8], n: usize) -> Res<usize> {
         supdb_range(self, from, n)
+    }
+}
+
+impl ThreadReader for TallyReader {
+    fn get(&mut self, key: &[u8]) -> Res<usize> {
+        supdb_get(&self.r, key)
+    }
+    fn range(&mut self, from: &[u8], n: usize) -> Res<usize> {
+        supdb_range(&self.r, from, n)
     }
 }
 
@@ -4372,9 +4415,22 @@ impl Engine for Supdb {
             // index, and the ones that left it for the hash: the writer's
             // own handle's (`Db::ord_point_reads`), so the arm that reads
             // through the index shows the path was taken and the arm that
-            // does not shows none. A threaded pass's handles count apart.
+            // does not shows none. The reader handles of the threaded
+            // passes count apart, summed as each is dropped.
             ("ord_point_reads", ord.0 as f64),
             ("ord_point_declined", ord.1 as f64),
+            (
+                "ord_point_reads_threads",
+                self.ord_threads
+                    .served
+                    .load(std::sync::atomic::Ordering::Relaxed) as f64,
+            ),
+            (
+                "ord_point_declined_threads",
+                self.ord_threads
+                    .declined
+                    .load(std::sync::atomic::Ordering::Relaxed) as f64,
+            ),
         ]
     }
     fn thread_reader(&self) -> Res<ReaderOpener> {
@@ -4383,6 +4439,12 @@ impl Engine for Supdb {
         // table. `Latest`, the handle's default, sees every commit before
         // a read, and the load's last is behind `sync`.
         let r = db.reader().map_err(|e| e.to_string())?;
+        if self.ordread {
+            let tally = self.ord_threads.clone();
+            return Ok(Box::new(move || {
+                Ok(Box::new(TallyReader { r, tally }) as Box<dyn ThreadReader>)
+            }));
+        }
         Ok(Box::new(move || Ok(Box::new(r) as Box<dyn ThreadReader>)))
     }
     fn sync(&mut self) -> Res<()> {
@@ -5477,7 +5539,8 @@ mod tests {
     /// that shape's other settings with it). And the path is taken: the
     /// same keys written and read through each, the arm's reads are
     /// answered through the partition's ordered index and the base's are
-    /// not, and the counters a pairing prints say so.
+    /// not, and the counters a pairing prints say so, for the writer's
+    /// handle and for the handles a threaded pass hands its threads.
     #[test]
     fn the_ordread_arm_differs_from_nocache_in_the_partition_read_path_alone() {
         let root = std::env::temp_dir().join(format!("supdb-bench-ordread-{}", std::process::id()));
@@ -5573,6 +5636,27 @@ mod tests {
         assert_eq!(count(&arm, "ord_point_declined"), 0.0);
         assert_eq!(count(&base, "ord_point_reads"), 0.0, "the default's path");
         assert_eq!(count(&base, "ord_point_declined"), 0.0);
+        assert_eq!(count(&arm, "ord_point_reads_threads"), 0.0, "no handle yet");
+
+        // The handles a threaded pass hands its threads count apart, and
+        // what each answered reaches the store's counters when it is
+        // dropped, so the threaded cells of a pairing print whether they
+        // took the path. A handle on each store reads the same keys, and
+        // the writer's own words stay where they were.
+        let handle_reads = (keys.iter().step_by(11).count() + 1) as f64;
+        for e in [&arm, &base] {
+            let mut r = (e.thread_reader().unwrap())().unwrap();
+            for k in keys.iter().step_by(11) {
+                assert_eq!(r.get(k).unwrap(), value.len());
+            }
+            assert_eq!(r.get(&absent).unwrap(), 0);
+            drop(r);
+        }
+        assert_eq!(count(&arm, "ord_point_reads_threads"), handle_reads);
+        assert_eq!(count(&arm, "ord_point_declined_threads"), 0.0);
+        assert_eq!(count(&base, "ord_point_reads_threads"), 0.0);
+        assert_eq!(count(&base, "ord_point_declined_threads"), 0.0);
+        assert_eq!(count(&arm, "ord_point_reads"), reads, "the writer's own");
         drop(arm);
         drop(base);
         // The dispatch opens the arm by its name.
