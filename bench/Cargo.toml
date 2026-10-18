@@ -38,8 +38,20 @@ rocksdb = { version = "0.23", default-features = false }
 
 [dev-dependencies]
 # The payload test checks that values compress to the compressibility asked
-# for, which is what makes every arm store the same bytes.
-lz4_flex = "0.11"
+# for, which is what makes every arm store the same bytes. The features are
+# the engine's own (its manifest asks for these and no others): cargo unifies
+# a dependency's features across the whole build, so a dev-dependency that
+# asked for the crate's defaults linked the engine to the safe decoder in
+# every example and test binary -- not the codec the engine ships, and the
+# decode is the largest fixed cost of a read from the z form. The cross-check
+# is the feature below.
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "frame"] }
+
+[features]
+# `zsize` built with the crate's safe encoder and decoder, to be run beside
+# the build without it: the pages come out byte for byte the same, and the
+# decode is what moves. Off for everything the suite measures.
+lz4-safe = ["lz4_flex/safe-encode", "lz4_flex/safe-decode"]
 
 # Cargo takes profiles from the root of the workspace being built, which is
 # this manifest, so the engine's own [profile.release] is ignored here and

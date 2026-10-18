@@ -39,6 +39,24 @@ use crate::flatindex;
 use crate::index::{Ext, Extents};
 use crate::Blob;
 
+// The z form's layout: a derived sidecar holding a partition's records in
+// groups that each compress into one page. Native only, stated here and not
+// left to `db` being native only already: the sidecar is read through a
+// mapping of its own, and the browser's reader (`blob`) must never be able
+// to reach it, so a change that moved this module out from under the `db`
+// gate would have to say so on this line. A plain comment and not a doc
+// comment, because the module's own documentation is its file's, and rustdoc
+// resolves the links of both against one scope.
+//
+// Public because the tools in `bench/` price the layout they link, and hidden
+// from the documentation because nothing reads a sidecar yet: its items are
+// not an API anyone is promised until the form is wired, and the design had
+// them `pub(super)` in a private module. Lifting the attribute is the step
+// that makes the layout the crate's to keep.
+#[cfg(not(target_family = "wasm"))]
+#[doc(hidden)]
+pub mod zpages;
+
 /// Write a segment's ordered index, and make it durable where `durable`
 /// says so (`Options::ord_durable`).
 ///
@@ -2378,6 +2396,26 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+/// The signature of `BlockedBloom`'s layout: what a stored filter is
+/// compared against before its bits are trusted.
+///
+/// A sidecar of the z form (`zpages`) stores this filter's words, and a
+/// filter answers "absent" for every key whose bits it does not hold. The
+/// bits are a function of `flatindex::key_hash` (a format quantity: its
+/// change moves the magic), of `finalize` (two multipliers and two shifts),
+/// of the block a hash chooses, of the probe walk in `slots_of`, and of the
+/// blocks `with_capacity` allocates a key. Only the first is format. An edit
+/// to any of the others moves no magic, no record version and no checksum,
+/// so a sidecar built before it would attach with every check passing and
+/// answer "absent" for keys it holds, with nothing raised. Whoever edits any
+/// of them bumps this constant, and `zpages`' pin test -- a CRC of the words
+/// of a filter built from fixed keys -- fails when they forget.
+const BLOOM_SIG: u64 = 1;
+/// Probe bits a key sets in its block, which `BLOOM_SIG` covers.
+const BLOOM_PROBES: u32 = 4;
+/// Filter bits a key, which `BLOOM_SIG` covers.
+const BLOOM_BITS_PER_KEY: u32 = 10;
+
 /// One 64-byte block per query, four probe bits inside it: the structure
 /// measured at 82.1% of a single store when it is the only routing there
 /// is. Here it guards only the bounded L0 tail, because every keys-sized
@@ -2446,18 +2484,28 @@ impl BloomFill {
 }
 
 impl BlockedBloom {
+    /// The blocks a filter for `n` keys has: `BLOOM_BITS_PER_KEY` bits a key
+    /// in whole blocks of 512 bits, and one block at the least. The one
+    /// definition of the filter's size, which what prices a stored filter
+    /// (`zpages::filter_bytes`) asks and does not restate.
+    fn blocks_for(n: usize) -> usize {
+        (n * BLOOM_BITS_PER_KEY as usize).div_ceil(512).max(1)
+    }
+
     fn with_capacity(n: usize) -> BlockedBloom {
         BlockedBloom {
-            blocks: vec![[0u64; 8]; (n * 10).div_ceil(512).max(1)],
+            blocks: vec![[0u64; 8]; BlockedBloom::blocks_for(n)],
         }
     }
 
     /// The hash's first half: the word `flatindex::key_hash` computes
     /// for the index's slots, so a writer that has those words has this
     /// half for every key. It was an FNV-1a of its own here, a multiplier
-    /// apart from the index's -- the filter is built at open and never
-    /// stored, so its hash is free to be the index's; the test beside the
-    /// landing holds the two halves to the whole.
+    /// apart from the index's -- the filter was built at open and never
+    /// stored, so its hash was free to be the index's; the test beside the
+    /// landing holds the two halves to the whole. A sidecar of the z form
+    /// stores the filter's words, so this hash is a stored quantity there:
+    /// `BLOOM_SIG` moves with any edit to it, and `zpages` pins the words.
     fn fnv(key: &[u8]) -> u64 {
         crate::flatindex::key_hash(key)
     }
@@ -2500,13 +2548,13 @@ impl BlockedBloom {
         }
     }
 
-    fn slots(&self, key: &[u8]) -> (usize, [(usize, u64); 4]) {
+    fn slots(&self, key: &[u8]) -> (usize, [(usize, u64); BLOOM_PROBES as usize]) {
         self.slots_of(BlockedBloom::hash(key))
     }
 
-    fn slots_of(&self, h: u64) -> (usize, [(usize, u64); 4]) {
+    fn slots_of(&self, h: u64) -> (usize, [(usize, u64); BLOOM_PROBES as usize]) {
         let bi = (h >> 32) as usize % self.blocks.len();
-        let mut probes = [(0usize, 0u64); 4];
+        let mut probes = [(0usize, 0u64); BLOOM_PROBES as usize];
         let mut x = h;
         for p in &mut probes {
             x = x.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(1);
