@@ -39,12 +39,14 @@ use crate::flatindex;
 use crate::index::{Ext, Extents};
 use crate::Blob;
 
-/// The z form's layout: a derived sidecar holding a partition's records in
-/// groups that each compress into one page. Native only, stated here and not
-/// left to `db` being native only already: the sidecar is read through a
-/// mapping of its own, and the browser's reader (`blob`) must never be able
-/// to reach it, so a change that moved this module out from under the `db`
-/// gate would have to say so on this line.
+// The z form's layout: a derived sidecar holding a partition's records in
+// groups that each compress into one page. Native only, stated here and not
+// left to `db` being native only already: the sidecar is read through a
+// mapping of its own, and the browser's reader (`blob`) must never be able
+// to reach it, so a change that moved this module out from under the `db`
+// gate would have to say so on this line. A plain comment and not a doc
+// comment, because the module's own documentation is its file's, and rustdoc
+// resolves the links of both against one scope.
 #[cfg(not(target_family = "wasm"))]
 pub mod zpages;
 
