@@ -6125,6 +6125,19 @@ impl ByteArena {
         1 << self.shift
     }
 
+    /// The bytes reserved and the bytes of the blocks allocated for them,
+    /// for `Reader::memory_census`.
+    fn census(&self) -> (u64, u64) {
+        let cap: usize = self
+            .blocks
+            .iter()
+            .zip(self.caps.iter())
+            .filter(|(p, _)| !p.load(AtomicOrdering::Relaxed).is_null())
+            .map(|(_, c)| c.load(AtomicOrdering::Relaxed))
+            .sum();
+        (self.used.load(AtomicOrdering::Relaxed) as u64, cap as u64)
+    }
+
     /// Writer: every block whose bytes lie wholly below `off` taken out
     /// of the arena -- its pointer nulled, so a reader finds the block
     /// gone and reads the bytes where the writer has put them meanwhile,
@@ -6514,6 +6527,18 @@ impl<T> Slab<T> {
         self.len.load(AtomicOrdering::Acquire)
     }
 
+    /// The bytes of the entries written and the bytes of the blocks
+    /// allocated for them, for `Reader::memory_census`.
+    fn census(&self) -> (u64, u64) {
+        let sz = std::mem::size_of::<T>() as u64;
+        let blocks = self
+            .blocks
+            .iter()
+            .filter(|b| !b.load(AtomicOrdering::Relaxed).is_null())
+            .count() as u64;
+        (self.len() as u64 * sz, blocks * SLAB_BLOCK as u64 * sz)
+    }
+
     /// Writer: `v` at the next number, published.
     fn push(&self, v: T) -> usize {
         let id = self.len.load(AtomicOrdering::Relaxed);
@@ -6861,6 +6886,31 @@ impl Readers {
 }
 
 impl MemTable {
+    /// What the table holds, for `Reader::memory_census`: the bytes its
+    /// arenas have reserved and the bytes of their blocks, the same of its
+    /// slabs, and its index's slots -- apart from the snapshots it keeps.
+    fn census(&self) -> [u64; 5] {
+        let (mut au, mut ac) = (0, 0);
+        for a in [&self.keys, &self.vals, &self.vals2] {
+            let (u, c) = a.census();
+            au += u;
+            ac += c;
+        }
+        let (eu, ec) = self.entries.census();
+        let (su, sc) = self.slim.census();
+        let (lu, lc) = self.log.census();
+        let ix = self.index.load(AtomicOrdering::Acquire);
+        // SAFETY: the index is retired under the readers' epoch, and the
+        // census runs pinned.
+        let ix = if ix.is_null() {
+            0
+        } else {
+            let index: &Index = unsafe { &*ix };
+            index.slots.len() as u64 * 8
+        };
+        [au, ac, eu + su + lu, ec + sc + lc, ix]
+    }
+
     fn new(prefault: bool) -> MemTable {
         MemTable {
             entries: Slab::new(),
@@ -9733,6 +9783,22 @@ impl SparseBlock {
 }
 
 impl Cached {
+    /// What the block's buffers have allocated, by capacity, where `bytes`
+    /// counts what they hold: the memory the form costs, which is what a
+    /// bound on the process is spent in.
+    fn cap_bytes(&self) -> usize {
+        match self {
+            Cached::Clean => 0,
+            Cached::Sparse(b) => {
+                b.keys.capacity()
+                    + b.ents.capacity() * std::mem::size_of::<DeltaEnt>()
+                    + b.vals.capacity()
+            }
+            Cached::Block(b) => b.keys.capacity() + b.vals.capacity() + b.ents.capacity() * 16,
+            Cached::Wide(w) => w.sorted.capacity() * 8,
+        }
+    }
+
     /// PROTOTYPE: what the block holds beyond its slot, for the budget.
     fn bytes(&self) -> usize {
         match self {
@@ -9740,6 +9806,61 @@ impl Cached {
             Cached::Sparse(b) => b.keys.len() + b.ents.len() * 24 + b.vals.len(),
             Cached::Block(b) => b.keys.len() + b.vals.len() + b.ents.len() * 16,
             Cached::Wide(w) => w.sorted.len() * 8,
+        }
+    }
+}
+
+/// What a census has counted already, by address, so that a structure
+/// shared between owners is counted once, by the first owner reached
+/// (`Reader::memory_census`).
+#[derive(Default)]
+struct CensusSeen {
+    forms: std::collections::HashSet<usize>,
+    mems: std::collections::HashSet<usize>,
+    snaps: std::collections::HashSet<usize>,
+    arenas: std::collections::HashSet<usize>,
+    caches: std::collections::HashSet<usize>,
+}
+
+/// Forms counted by kind -- clean, sparse, copy, wide -- how many, the
+/// bytes the budget counts in them and the bytes their buffers have
+/// allocated.
+#[derive(Default, Clone, Copy)]
+struct FormTally {
+    n: [u64; 4],
+    len: [u64; 4],
+    cap: [u64; 4],
+}
+
+impl FormTally {
+    const KINDS: [&'static str; 4] = ["clean", "sparse", "copy", "wide"];
+
+    fn add(&mut self, c: &Cached) {
+        let k = match c {
+            Cached::Clean => 0,
+            Cached::Sparse(_) => 1,
+            Cached::Block(_) => 2,
+            Cached::Wide(_) => 3,
+        };
+        self.n[k] += 1;
+        self.len[k] += c.bytes() as u64;
+        self.cap[k] += c.cap_bytes() as u64;
+    }
+
+    fn cap_total(&self) -> u64 {
+        self.cap.iter().sum()
+    }
+
+    fn put(&self, out: &mut Vec<(String, u64)>, pre: &str) {
+        for (k, name) in Self::KINDS.iter().enumerate() {
+            if self.n[k] == 0 {
+                continue;
+            }
+            out.push((format!("{pre}_{name}_n"), self.n[k]));
+            if k > 0 {
+                out.push((format!("{pre}_{name}_len"), self.len[k]));
+                out.push((format!("{pre}_{name}_cap"), self.cap[k]));
+            }
         }
     }
 }
@@ -10540,6 +10661,29 @@ impl<T> RetireList<T> {
 
     fn len(&self) -> usize {
         self.len.load(AtomicOrdering::Relaxed)
+    }
+
+    /// `f` on every item, for `Reader::memory_census`: the list is taken
+    /// as a sweep takes it, walked, and put back whole, so a sweep or a
+    /// push meanwhile finds the list empty or adds to its front, and
+    /// nothing is freed that a sweep would not have.
+    fn census(&self, mut f: impl FnMut(&T)) {
+        let first = self
+            .head
+            .swap(std::ptr::null_mut(), AtomicOrdering::Acquire);
+        if first.is_null() {
+            return;
+        }
+        let (mut last, mut q) = (first, first);
+        while !q.is_null() {
+            // SAFETY: taken off the list by the swap, so this walk's alone.
+            unsafe {
+                f(&(*q)._item);
+                last = q;
+                q = (*q).next;
+            }
+        }
+        self.splice(first, last);
     }
 
     /// `item`, which no reader pinned at `epoch` or later can reach.
@@ -11548,6 +11692,16 @@ impl SnapArena {
         }
     }
 
+    /// The bytes reserved and the bytes of the blocks allocated for them,
+    /// for `Reader::memory_census`.
+    fn census(&self) -> (u64, u64) {
+        let cap: usize = (0..SNAP_BLOCKS)
+            .filter(|&b| !self.blocks[b].load(AtomicOrdering::Relaxed).is_null())
+            .map(|b| self.cap(b))
+            .sum();
+        (self.tail.load(AtomicOrdering::Relaxed) as u64, cap as u64)
+    }
+
     /// The block an offset falls in, and the offset within it.
     #[inline]
     fn locate(&self, off: usize) -> (usize, usize) {
@@ -11852,6 +12006,40 @@ struct SnapCursor {
 }
 
 impl Snapshot {
+    /// What this snapshot holds, added into `out` for `Reader::memory_census`:
+    /// snapshots, the arena's bytes reserved and allocated, the entries'
+    /// bytes in use and allocated, and the bounds taken against partitions.
+    /// The arena, the bounds and the bases are shared between versions, so
+    /// each is counted once, by `seen`.
+    fn census(&self, seen: &mut CensusSeen, out: &mut [u64; 6]) {
+        out[0] += 1;
+        if seen
+            .arenas
+            .insert(std::sync::Arc::as_ptr(&self.arena) as usize)
+        {
+            let (written, cap) = self.arena.census();
+            out[1] += written;
+            out[2] += cap;
+        }
+        let sz = std::mem::size_of::<SnapKey>();
+        out[3] += ((self.ents.len() + self.side.len() + self.fresh.len()) * sz) as u64;
+        out[4] +=
+            ((self.ents.capacity() + self.side.capacity() + self.fresh.capacity()) * sz) as u64;
+        if seen
+            .caches
+            .insert(std::sync::Arc::as_ptr(&self.bounds) as usize)
+        {
+            self.bounds.each(|b: &SnapBounds| {
+                out[5] += (b.at.capacity() * 4 + b.cuts.len() * 4 + b.ready.len()) as u64;
+            });
+        }
+        for base in &self.bases {
+            if seen.snaps.insert(std::sync::Arc::as_ptr(base) as usize) {
+                base.census(seen, out);
+            }
+        }
+    }
+
     fn len(&self) -> usize {
         self.ents.len()
     }
@@ -17765,6 +17953,273 @@ impl Reader {
             .sum()
     }
 
+    /// A census of what the process holds for this handle's forms and for
+    /// what stands beside them, by capacity, in the order the question
+    /// "what holds the memory the budget does not count" asks it: the
+    /// handle's tables by the form's kind, with the bytes the budget
+    /// counts in a form beside the bytes its buffers have allocated; the
+    /// forms published in the state, those a table shares and those only
+    /// the state holds; the forms in the retired lists, which wait for a
+    /// reader to leave; the scan snapshots; the memtables, live, frozen,
+    /// settled from, kept for the upkeep's look and retired; and the
+    /// derived caches on the segments. A name ending `_n` is a count and
+    /// every other is bytes. Each structure is counted once, by the first
+    /// owner reached, so `census_cap` is a figure to hold against the
+    /// allocator's bytes in use; what it leaves out is the segment work's
+    /// own, the threads' stacks and every handle but this one.
+    #[doc(hidden)]
+    pub fn memory_census(&self) -> Vec<(String, u64)> {
+        self.memory_census_with(&[])
+    }
+
+    fn memory_census_with(&self, handed: &[std::sync::Arc<MemTable>]) -> Vec<(String, u64)> {
+        let _e = self.enter();
+        let st = self.state();
+        let fs = self.fs();
+        let mut seen = CensusSeen::default();
+        let mut out: Vec<(String, u64)> = Vec::new();
+        let put = |out: &mut Vec<(String, u64)>, k: &str, v: u64| {
+            if v > 0 {
+                out.push((k.to_string(), v));
+            }
+        };
+        // The tables: the forms by kind, and apart from them the vectors
+        // that stand beside every block.
+        let (mut tab, mut shared, mut dense) = (
+            FormTally::default(),
+            FormTally::default(),
+            FormTally::default(),
+        );
+        let (mut tables, mut blocks, mut aux) = (0u64, 0u64, 0u64);
+        for cell in fs.tables.borrow().iter() {
+            let held = cell.borrow();
+            let Some(t) = held.as_ref() else { continue };
+            tables += 1;
+            blocks += t.slots.len() as u64;
+            aux += (t.slots.capacity() * 8
+                + t.dense.capacity() * 8
+                + t.reads.capacity() * 4
+                + t.touched.capacity() * 4
+                + t.listed.capacity() * 4
+                + t.dirty.capacity()
+                + t.last_key.capacity()
+                + t.pieces.capacity() * std::mem::size_of::<(usize, std::sync::Arc<Vec<u32>>)>()
+                + t.piece_ranks.capacity() * 8
+                + t.added.capacity() * 24
+                + t.added.iter().map(|l| l.capacity() * 8).sum::<usize>())
+                as u64;
+            for (list, tally_own) in [(&t.slots, false), (&t.dense, true)] {
+                for a in list.iter().flatten() {
+                    if matches!(**a, Cached::Clean) {
+                        tab.add(a);
+                    } else if seen.forms.insert(std::sync::Arc::as_ptr(a) as usize) {
+                        let into = if tally_own {
+                            &mut dense
+                        } else if std::sync::Arc::strong_count(a) > 1 {
+                            &mut shared
+                        } else {
+                            &mut tab
+                        };
+                        into.add(a);
+                    }
+                }
+            }
+        }
+        let misc = (fs.pending.borrow().capacity() * 16
+            + fs.snap_added.borrow().capacity() * 4
+            + fs.snap_stale.borrow().bits.capacity() * 8
+            + fs.built.borrow().capacity() * 8
+            + fs.settle_run.borrow().capacity()
+            + fs.settle_offs.borrow().capacity() * 8
+            + fs.emit_offs.borrow().capacity() * 8
+            + fs.resume_key.borrow().capacity()
+            + fs.pending_frozen
+                .borrow()
+                .iter()
+                .map(|(_, w)| w.capacity() * 16)
+                .sum::<usize>()) as u64;
+        // The scan snapshots: the handle's own, the state's, the retired
+        // and the ones the tables keep, each counted once.
+        let mut snaps = [[0u64; 6]; 4];
+        if let Some((_, s)) = fs.scan_keys.borrow().as_ref() {
+            if seen.snaps.insert(std::sync::Arc::as_ptr(s) as usize) {
+                s.census(&mut seen, &mut snaps[0]);
+            }
+        }
+        let sp = st.snap.load(AtomicOrdering::Acquire);
+        if !sp.is_null() && seen.snaps.insert(sp as usize) {
+            // SAFETY: published into the state, which this read holds,
+            // and freed only past every pinned reader.
+            unsafe { &*sp }.census(&mut seen, &mut snaps[1]);
+        }
+        // The published forms: those a table shares, and those only the
+        // state holds, which a shed or a patch left standing.
+        let mut pubf = FormTally::default();
+        let (mut pub_n, mut pub_shared) = (0u64, 0u64);
+        for slot in st.forms.iter().flat_map(|f| f.iter()) {
+            let p = slot.load(AtomicOrdering::Acquire);
+            if p.is_null() {
+                continue;
+            }
+            // SAFETY: as in `canonical`.
+            let cf = unsafe { &*p };
+            pub_n += 1;
+            if seen.forms.insert(std::sync::Arc::as_ptr(&cf.form) as usize) {
+                pubf.add(&cf.form);
+            } else {
+                pub_shared += 1;
+            }
+        }
+        // What the retired lists hold: forms a publish replaced, states,
+        // and snapshots, each waiting for the readers pinned before its
+        // retirement to leave.
+        let mut retf = FormTally::default();
+        let (mut retf_n, mut retf_shared) = (0u64, 0u64);
+        self.shared.retired_forms.census(|rf| {
+            retf_n += 1;
+            // SAFETY: held by the list until a sweep past every pinned
+            // reader drops it.
+            let cf = unsafe { &*rf.0 };
+            if seen.forms.insert(std::sync::Arc::as_ptr(&cf.form) as usize) {
+                retf.add(&cf.form);
+            } else {
+                retf_shared += 1;
+            }
+        });
+        // The memtables, labelled by the first owner that reaches each:
+        // live, frozen, settled from (`pending_frozen`), kept for the
+        // upkeep's look (`State::replaced`), retired with a state, handed
+        // to a seal.
+        const LABELS: [&str; 6] = ["live", "frozen", "pending", "replaced", "retired", "handed"];
+        let mut mems: Vec<(usize, std::sync::Arc<MemTable>)> = vec![(0, st.mem.clone())];
+        mems.extend(st.frozen.iter().map(|m| (1, m.clone())));
+        mems.extend(
+            fs.pending_frozen
+                .borrow()
+                .iter()
+                .map(|(m, _)| (2, m.clone())),
+        );
+        mems.extend(st.replaced.iter().map(|m| (3, m.clone())));
+        let mut rets = FormTally::default();
+        let mut rets_n = 0u64;
+        self.shared.retired.census(|b| {
+            rets_n += 1;
+            if !b.forms_moved.load(AtomicOrdering::Relaxed) {
+                for slot in b.forms.iter().flat_map(|f| f.iter()) {
+                    let p = slot.load(AtomicOrdering::Relaxed);
+                    if p.is_null() {
+                        continue;
+                    }
+                    // SAFETY: held by the retired state until it is freed.
+                    let cf = unsafe { &*p };
+                    if seen.forms.insert(std::sync::Arc::as_ptr(&cf.form) as usize) {
+                        rets.add(&cf.form);
+                    }
+                }
+            }
+            let sp = b.snap.load(AtomicOrdering::Relaxed);
+            if !sp.is_null() && seen.snaps.insert(sp as usize) {
+                // SAFETY: as the state's forms above.
+                unsafe { &*sp }.census(&mut seen, &mut snaps[2]);
+            }
+            mems.push((4, b.mem.clone()));
+            mems.extend(
+                b.frozen
+                    .iter()
+                    .chain(b.replaced.iter())
+                    .map(|m| (4, m.clone())),
+            );
+        });
+        self.shared.retired_snaps.census(|rs| {
+            if seen.snaps.insert(rs.0 as usize) {
+                // SAFETY: the list holds the reference it was published with.
+                unsafe { &*rs.0 }.census(&mut seen, &mut snaps[2]);
+            }
+        });
+        mems.extend(handed.iter().map(|m| (5, m.clone())));
+        let mut memt = [[0u64; 6]; 6];
+        for (label, m) in &mems {
+            if !seen.mems.insert(std::sync::Arc::as_ptr(m) as usize) {
+                continue;
+            }
+            let c = m.census();
+            let row = &mut memt[*label];
+            row[0] += 1;
+            for (r, v) in row[1..].iter_mut().zip(c) {
+                *r += v;
+            }
+            for s in [m.snaps.sorted.get(), m.snaps.copied.get()]
+                .into_iter()
+                .flatten()
+            {
+                if seen.snaps.insert(std::sync::Arc::as_ptr(&s) as usize) {
+                    s.census(&mut seen, &mut snaps[3]);
+                }
+            }
+        }
+        // What the segments derive and keep in memory.
+        let (mut seg_ranks, mut seg_bounds, mut seg_bloom) = (0u64, 0u64, 0u64);
+        for s in &st.segs {
+            s.ranks
+                .each(|v: &Vec<u32>| seg_ranks += v.capacity() as u64 * 4);
+            s.bounds
+                .each(|v: &Vec<u32>| seg_bounds += v.capacity() as u64 * 4);
+            if let Some(b) = &s.bloom {
+                seg_bloom += b.blocks.capacity() as u64 * 64;
+            }
+        }
+        // The allocations the forms are behind: an `Arc` a distinct form,
+        // a box a published one.
+        let arcs = seen.forms.len() as u64 * (16 + std::mem::size_of::<Cached>()) as u64;
+        let boxes = (pub_n + retf_n) * std::mem::size_of::<CanonicalForm>() as u64;
+        tab.put(&mut out, "tab");
+        shared.put(&mut out, "tabshared");
+        dense.put(&mut out, "dense");
+        pubf.put(&mut out, "pub");
+        retf.put(&mut out, "retf");
+        rets.put(&mut out, "rets");
+        put(&mut out, "tab_tables", tables);
+        put(&mut out, "tab_blocks", blocks);
+        put(&mut out, "tab_aux", aux);
+        put(&mut out, "fs_misc", misc);
+        put(&mut out, "arc_boxes", arcs + boxes);
+        put(&mut out, "pub_n", pub_n);
+        put(&mut out, "pub_shared_n", pub_shared);
+        put(&mut out, "retf_n", retf_n);
+        put(&mut out, "retf_shared_n", retf_shared);
+        put(&mut out, "rets_n", rets_n);
+        let mut cap_total = tab.cap_total()
+            + shared.cap_total()
+            + dense.cap_total()
+            + pubf.cap_total()
+            + retf.cap_total()
+            + rets.cap_total()
+            + aux
+            + misc
+            + arcs
+            + boxes
+            + seg_ranks
+            + seg_bounds
+            + seg_bloom;
+        for (name, s) in ["fs", "state", "retired", "tables"].iter().zip(&snaps) {
+            put(&mut out, &format!("snap_{name}_n"), s[0]);
+            put(&mut out, &format!("snap_{name}_used"), s[1] + s[3]);
+            put(&mut out, &format!("snap_{name}_cap"), s[2] + s[4] + s[5]);
+            cap_total += s[2] + s[4] + s[5];
+        }
+        for (name, m) in LABELS.iter().zip(&memt) {
+            put(&mut out, &format!("mem_{name}_n"), m[0]);
+            put(&mut out, &format!("mem_{name}_used"), m[1] + m[3]);
+            put(&mut out, &format!("mem_{name}_cap"), m[2] + m[4] + m[5]);
+            cap_total += m[2] + m[4] + m[5];
+        }
+        put(&mut out, "seg_ranks", seg_ranks);
+        put(&mut out, "seg_bounds", seg_bounds);
+        put(&mut out, "seg_bloom", seg_bloom);
+        put(&mut out, "census_cap", cap_total);
+        out
+    }
+
     /// The partitions walked in bulk, with the unsealed keys laid over them.
     ///
     /// The caller has checked there is no level-0 piece, so the sources are
@@ -22116,6 +22571,18 @@ impl<T> Default for IdCache<T> {
 }
 
 impl<T> IdCache<T> {
+    /// `f` on every value, for `Reader::memory_census`.
+    fn each(&self, mut f: impl FnMut(&T)) {
+        let mut p = self.head.load(AtomicOrdering::Acquire);
+        while !p.is_null() {
+            // SAFETY: published whole by `put` and freed only with the
+            // cache.
+            let n = unsafe { &*p };
+            f(&n.val);
+            p = n.next;
+        }
+    }
+
     fn get(&self, id: u64) -> Option<std::sync::Arc<T>> {
         let mut p = self.head.load(AtomicOrdering::Acquire);
         while !p.is_null() {
@@ -23914,6 +24381,14 @@ impl Db {
     /// segment and rebuilt from their segments' keys (`Options::ord_durable`).
     pub fn ord_rebuilt(&self) -> u64 {
         self.shared.ord_rebuilt.load(AtomicOrdering::Relaxed)
+    }
+
+    /// `Reader::memory_census` with the table a `sync` handed to a seal
+    /// without freezing it, which only the writer holds.
+    #[doc(hidden)]
+    pub fn memory_census(&self) -> Vec<(String, u64)> {
+        let handed: Vec<_> = self.mem_handed.iter().cloned().collect();
+        self.r.memory_census_with(&handed)
     }
 
     /// The sequence of the last manifest this store published
