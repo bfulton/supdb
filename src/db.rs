@@ -320,8 +320,8 @@ impl ReadAdvice {
 /// files and setting `Off` is the whole of the undo.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ZPages {
-    /// No sidecar is built, read or attached. A store that has some on disk
-    /// leaves them alone.
+    /// No sidecar is built, read or attached. One already on disk is not
+    /// read, and goes with its segment when the store retires the segment.
     #[default]
     Off,
     /// Every partition has a sidecar, and every point read and count of a

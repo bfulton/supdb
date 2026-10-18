@@ -24,8 +24,8 @@
 //!
 //! A sidecar is installed once and never replaced or cleared before its
 //! segment is dropped, so a reader holding the segment holds the sidecar.
-//! Retirement through the epoch, which a later stage adds, changes that and
-//! changes `ZCell::get` with it.
+//! A cell that could be cleared or replaced would have to free the sidecar it
+//! held through the epoch, and `ZCell::get` would change with it.
 
 use super::zpages::{
     bind32, decode_group, fill_group, group_seek, page_view, parse_page, verify_page, walk_group,
@@ -265,8 +265,8 @@ impl ZSide {
     /// entries that name them. A page body beyond those sixteen is checked
     /// at its first decode.
     ///
-    /// The filter a trailer may carry is not read: this stage builds none
-    /// and answers no read from one.
+    /// The filter a trailer may carry is not read: none is built, and no read
+    /// is answered from one.
     pub(super) fn attach(
         path: &Path,
         blob: &Blob<MmapBytes>,
