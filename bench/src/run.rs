@@ -1808,6 +1808,28 @@ fn lag_sweep(
             counting.end(cb, "lag-burst", &suffix, None, wrote);
             burst_lag.push((pct, wrote as f64 / burst_secs));
         }
+        // The process's anonymous bytes where the burst ends, before a scan
+        // has shed or built anything: what a burst leaves in the forms'
+        // memory is the point the pass after it cannot see, since the
+        // `lagmem` line is read at the pass's end. Read from the kernel and
+        // not from the engine, so it takes nothing back from the upkeep.
+        // It does stand between the burst and the scans, which the suite
+        // otherwise reads nothing between: a read of a `/proc` file, and
+        // under `SUPDB_LAG_ARENAS` also the allocator's report by arena
+        // (`malloc_info`), which walks every free chunk of every arena
+        // under the arena's lock, milliseconds with tens of thousands of
+        // chunks and the upkeep thread's allocations among the waits. That
+        // lengthens the window the thread files the burst in, the same for
+        // every arm; the rates of a run that counts are not read for it.
+        if counting_store {
+            eprintln!(
+                "lagburst {arm} {pct} anon_mb {}",
+                anon_resident_bytes().map_or(0, |b| b >> 20)
+            );
+            if std::env::var_os("SUPDB_LAG_ARENAS").is_some() {
+                lag_arenas("lagburstarenas", arm, &pct.to_string());
+            }
+        }
         if pct == 0 {
             // Nothing unmerged: the shuffled load's own tail is drained
             // here, so the first point is the fully merged store.
@@ -1839,9 +1861,259 @@ fn lag_sweep(
                 &c0,
                 &c1,
             );
+            lag_census(arm, &pct.to_string(), e);
         }
     }
     Ok(())
+}
+
+/// With `SUPDB_LAG_COUNTERS`, the lines after a point's `lagmem`: the
+/// engine's census of what it holds (`Engine::memory_census`), the bytes
+/// in megabytes and the counts as they are, beside the process's
+/// anonymous bytes and the allocator's in use and free bytes taken again
+/// at the same moment; and the allocator's bytes by arena, which says
+/// which thread's frees the free bytes are. Read after `lagmem`, so the
+/// census's own allocations are in neither.
+fn lag_census(arm: &str, point: &str, e: &dyn Engine) {
+    let census = e.memory_census();
+    if census.is_empty() {
+        return;
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    let mi = {
+        // SAFETY: mallinfo2 reads the allocator's own totals.
+        let mi = unsafe { libc::mallinfo2() };
+        (mi.uordblks as u64, mi.fordblks as u64)
+    };
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    let mi = (0u64, 0u64);
+    let mb = |b: u64| b as f64 / (1u64 << 20) as f64;
+    let fields: Vec<String> = census
+        .iter()
+        .map(|(k, v)| {
+            if k.ends_with("_n") {
+                format!("{k} {v}")
+            } else {
+                format!("{k} {:.1}", mb(*v))
+            }
+        })
+        .collect();
+    let counters = e.counters();
+    let counter = |name: &str| {
+        counters
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map_or(0.0, |(_, v)| *v)
+    };
+    eprintln!(
+        "lagcensus {arm} {point} anon_mb {} inuse_mb {:.0} free_mb {:.0} trims {:.0} looks {:.0} look_ms {:.1} | {}",
+        anon_resident_bytes().map_or(0, |b| b >> 20),
+        mb(mi.0),
+        mb(mi.1),
+        counter("forms_trims"),
+        counter("forms_trim_looks"),
+        counter("forms_trim_us") / 1e3,
+        fields.join(" ")
+    );
+    lag_arenas("lagarenas", arm, point);
+    // The anonymous mappings of a megabyte and more, by size: what is
+    // resident in each size class says which allocations they are (a
+    // thread's heap, a memtable's arena block, a snapshot's, a slab's).
+    let maps = anon_maps();
+    if !maps.is_empty() {
+        let total: u64 = maps.iter().map(|m| m.2).sum();
+        let top: Vec<String> = maps
+            .iter()
+            .take(10)
+            .map(|(size, count, rss)| format!("{:.1}mb x{count} rss {:.1}mb", mb(*size), mb(*rss)))
+            .collect();
+        eprintln!(
+            "lagmaps {arm} {point} anon_rss_mb {:.0} | {}",
+            mb(total),
+            top.join(" | ")
+        );
+    }
+    // The probe of what a trim would give back, for the pairing that asks:
+    // the freed memory returned to the system and the process's anonymous
+    // bytes read again. It changes the points after it, so it is its own
+    // variable and off by default.
+    if std::env::var_os("SUPDB_LAG_TRIM").is_some() {
+        let before = anon_resident_bytes().unwrap_or(0);
+        let t = Instant::now();
+        release_freed_memory();
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        eprintln!(
+            "lagtrim {arm} {point} anon_mb {} -> {} trim_ms {ms:.1}",
+            before >> 20,
+            anon_resident_bytes().unwrap_or(0) >> 20
+        );
+    }
+}
+
+/// The allocator's bytes by arena (`malloc_arenas`) as one line: the
+/// bytes in use and free over the process, then each arena's bytes taken
+/// from the system, its free bytes and the chunks they are in, and the
+/// chunks mapped on their own. Read from the allocator and not from the
+/// engine, so it takes nothing back from the upkeep; it still takes each
+/// arena's lock to walk its free chunks, so where a burst ends it is
+/// asked for (`SUPDB_LAG_ARENAS`) and not given.
+fn lag_arenas(tag: &str, arm: &str, point: &str) {
+    let mb = |b: u64| b as f64 / (1u64 << 20) as f64;
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    let mi = {
+        // SAFETY: mallinfo2 reads the allocator's own totals.
+        let mi = unsafe { libc::mallinfo2() };
+        (mi.uordblks as u64, mi.fordblks as u64)
+    };
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    let mi = (0u64, 0u64);
+    let (heaps, mmapped) = malloc_arenas();
+    let arenas: Vec<String> = heaps
+        .iter()
+        .map(|(nr, system, free, chunks)| {
+            format!(
+                "a{nr} system_mb {:.1} free_mb {:.1} chunks {chunks}",
+                mb(*system),
+                mb(*free)
+            )
+        })
+        .collect();
+    if !arenas.is_empty() {
+        eprintln!(
+            "{tag} {arm} {point} inuse_mb {:.0} free_mb {:.0} | {} | mmapped chunks {} mb {:.1}",
+            mb(mi.0),
+            mb(mi.1),
+            arenas.join(" | "),
+            mmapped.0,
+            mb(mmapped.1)
+        );
+    }
+}
+
+/// This process's anonymous mappings of at least a megabyte from
+/// `/proc/self/smaps`, grouped by size to a tenth of a megabyte: the size,
+/// how many, and their resident bytes, the most resident first.
+fn anon_maps() -> Vec<(u64, u64, u64)> {
+    let Ok(text) = std::fs::read_to_string("/proc/self/smaps") else {
+        return Vec::new();
+    };
+    let mut groups: std::collections::BTreeMap<u64, (u64, u64)> = Default::default();
+    let mut current: Option<(bool, u64, u64)> = None;
+    let flush = |cur: &mut Option<(bool, u64, u64)>,
+                 groups: &mut std::collections::BTreeMap<u64, (u64, u64)>| {
+        if let Some((anon, size, rss)) = cur.take() {
+            if anon && size >= 1 << 20 {
+                // To 128 KB.
+                let key = (size + (1 << 16)) >> 17 << 17;
+                let g = groups.entry(key).or_default();
+                g.0 += 1;
+                g.1 += rss;
+            }
+        }
+    };
+    for line in text.lines() {
+        let first = line.split_whitespace().next().unwrap_or("");
+        if first.contains('-') && !first.ends_with(':') {
+            flush(&mut current, &mut groups);
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let anon = fields.len() == 5 || fields.get(5) == Some(&"[heap]");
+            current = Some((anon, 0, 0));
+        } else if let Some(cur) = current.as_mut() {
+            let kb = |l: &str| -> u64 {
+                l.split_whitespace()
+                    .nth(1)
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0)
+                    * 1024
+            };
+            if line.starts_with("Size:") {
+                cur.1 = kb(line);
+            } else if line.starts_with("Rss:") {
+                cur.2 = kb(line);
+            }
+        }
+    }
+    flush(&mut current, &mut groups);
+    let mut out: Vec<(u64, u64, u64)> = groups
+        .into_iter()
+        .map(|(size, (count, rss))| (size, count, rss))
+        .collect();
+    out.sort_by_key(|m| std::cmp::Reverse(m.2));
+    out
+}
+
+/// One arena as `malloc_info` reports it (its number, the bytes it has
+/// taken from the system, the bytes free in it and the chunks those are
+/// in) and, after the arenas, the chunks the allocator mapped on their own
+/// (how many and their bytes).
+type MallocArena = (u64, u64, u64, u64);
+type MallocArenas = (Vec<MallocArena>, (u64, u64));
+
+/// The allocator's arenas as `malloc_info` reports them: for each, its
+/// number, the bytes it has taken from the system, the bytes it holds
+/// free (the fast bins, the other bins and its top) and the free chunks
+/// those are in. The main arena is 0 and a thread's frees go back to the
+/// arena its allocation came from, which is how a thread that builds and
+/// another that drops leave one arena's memory free and resident.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn malloc_arenas() -> MallocArenas {
+    // SAFETY: a temporary file the allocator writes its report to and this
+    // function reads back and closes; nothing else holds it.
+    let text = unsafe {
+        let f = libc::tmpfile();
+        if f.is_null() {
+            return (Vec::new(), (0, 0));
+        }
+        libc::malloc_info(0, f);
+        let n = libc::ftell(f).max(0) as usize;
+        libc::rewind(f);
+        let mut buf = vec![0u8; n];
+        let got = libc::fread(buf.as_mut_ptr().cast(), 1, n, f);
+        libc::fclose(f);
+        buf.truncate(got);
+        String::from_utf8_lossy(&buf).into_owned()
+    };
+    // The attribute `name` of the first `<tag ...>` in `s` whose opening
+    // starts with `open`, as a number.
+    let attr = |s: &str, open: &str, name: &str| -> u64 {
+        let Some(at) = s.find(open) else { return 0 };
+        let rest = &s[at..];
+        let rest = &rest[..rest.find("/>").unwrap_or(rest.len())];
+        let key = format!("{name}=\"");
+        rest.find(&key)
+            .and_then(|i| {
+                let v = &rest[i + key.len()..];
+                v[..v.find('"')?].parse().ok()
+            })
+            .unwrap_or(0)
+    };
+    let mut out = Vec::new();
+    for heap in text.split("<heap nr=\"").skip(1) {
+        let heap = &heap[..heap.find("</heap>").unwrap_or(heap.len())];
+        let nr: u64 = heap
+            .split('"')
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        let fast = attr(heap, "<total type=\"fast\"", "size");
+        let rest = attr(heap, "<total type=\"rest\"", "size");
+        let chunks = attr(heap, "<total type=\"fast\"", "count")
+            + attr(heap, "<total type=\"rest\"", "count");
+        let system = attr(heap, "<system type=\"current\"", "size");
+        out.push((nr, system, fast + rest, chunks));
+    }
+    // After the last heap: the chunks the allocator mapped on their own.
+    let tail = text.rfind("</heap>").map_or("", |i| &text[i..]);
+    let mapped = (
+        attr(tail, "<total type=\"mmap\"", "count"),
+        attr(tail, "<total type=\"mmap\"", "size"),
+    );
+    (out, mapped)
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn malloc_arenas() -> MallocArenas {
+    (Vec::new(), (0, 0))
 }
 
 /// Two arms in one process, alternating, paired rep by rep.
