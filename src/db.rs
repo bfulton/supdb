@@ -114,6 +114,109 @@ fn err(msg: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
 }
 
+/// HUNT INSTRUMENTATION (scratch, not for the engine): a ring of events
+/// stamped with a monotonic clock, so that a wrong answer can be read
+/// against the interleaving that made it. One relaxed fetch_add and four
+/// relaxed stores an event.
+#[doc(hidden)]
+pub mod dbgtrace {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    const N: usize = 1 << 17;
+    static CUR: AtomicUsize = AtomicUsize::new(0);
+    static RING: [[AtomicU64; 6]; N] = [const { [const { AtomicU64::new(0) }; 6] }; N];
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+    pub fn now_ns() -> u64 {
+        T0.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+    }
+
+    /// Kinds: 1 publish_form (a=p<<32|b, b=pos), 2 forms_at stored (a=value,
+    /// b=site), 3 scan start (a=bound, b=forms_at<<1|canonical), 4 take
+    /// (a=p<<32|b, b=kind), 5 scan end (a=seen), 6 publish_dirty begin/end
+    /// (a=0/1), 7 upkeep pass begin/end (a=0/1, b=commit), 8 commit mark
+    /// (a=log, b=len), 9 snapshot handle pinned (a=log bound).
+    pub fn ev(kind: u8, who: u32, a: u64, b: u64) {
+        ev3(kind, who, a, b, 0, 0);
+    }
+
+    /// As `ev`, with the generation and address of the state the event is
+    /// about.
+    pub fn ev3(kind: u8, who: u32, a: u64, b: u64, gen: u64, ptr: usize) {
+        let t = now_ns();
+        let i = CUR.fetch_add(1, Ordering::Relaxed) & (N - 1);
+        let e = &RING[i];
+        e[0].store(0, Ordering::Release);
+        e[1].store(((kind as u64) << 32) | who as u64, Ordering::Relaxed);
+        e[2].store(a, Ordering::Relaxed);
+        e[3].store(b, Ordering::Relaxed);
+        e[4].store(gen, Ordering::Relaxed);
+        e[5].store(ptr as u64, Ordering::Relaxed);
+        e[0].store(t.max(1), Ordering::Release);
+    }
+
+    /// Ends a scan's trace on every return.
+    pub struct End(pub u32);
+
+    impl Drop for End {
+        fn drop(&mut self) {
+            ev(5, self.0, 0, 0);
+        }
+    }
+
+    /// The events at or after `since_ns`, in time order, as lines.
+    pub fn dump(since_ns: u64) -> Vec<String> {
+        let mut v: Vec<(u64, u64, u64, u64, u64, u64)> = Vec::new();
+        for e in RING.iter() {
+            let t = e[0].load(Ordering::Acquire);
+            if t != 0 && t >= since_ns {
+                v.push((
+                    t,
+                    e[1].load(Ordering::Relaxed),
+                    e[2].load(Ordering::Relaxed),
+                    e[3].load(Ordering::Relaxed),
+                    e[4].load(Ordering::Relaxed),
+                    e[5].load(Ordering::Relaxed),
+                ));
+            }
+        }
+        v.sort();
+        v.iter()
+            .map(|&(t, kw, a, b, gen, ptr)| {
+                let (kind, who) = ((kw >> 32) as u8, kw as u32 as i64);
+                let who = match who {
+                    254 => "upkeep".to_string(),
+                    255 => "writer".to_string(),
+                    w => format!("h{w}"),
+                };
+                let what = match kind {
+                    1 => format!("PUBLISH_FORM p{} b{} pos {b}", a >> 32, a as u32),
+                    2 => format!("FORMS_AT_STORED {a} (site {b})"),
+                    3 => format!(
+                        "SCAN_START bound {a} forms_at {} canonical {}",
+                        if b >> 1 == (usize::MAX >> 1) as u64 { "MAX".to_string() } else { (b >> 1).to_string() },
+                        b & 1
+                    ),
+                    4 => format!("TAKE p{} b{} kind {b}", a >> 32, a as u32),
+                    5 => format!("SCAN_END seen {a}"),
+                    6 => format!("PUBLISH_DIRTY {}", if a == 0 { "begin" } else { "end" }),
+                    7 => format!("UPKEEP_PASS {} commit {b}", if a == 0 { "begin" } else { "end" }),
+                    8 => format!("COMMIT_MARK log {a} len {b}"),
+                    9 => format!("SNAPSHOT_PINNED log bound {a} len {b}"),
+                    10 => format!("TEST commit {}", if a == 0 { "begin" } else { "returned" }),
+                    11 => format!("TEST scan {}", if a == 0 { "begin" } else { "returned" }),
+                    k => format!("kind {k} a {a} b {b}"),
+                };
+                let st = if ptr == 0 {
+                    String::new()
+                } else {
+                    format!("  [state gen {gen} @{:x}]", ptr & 0xfffff)
+                };
+                format!("{:>12.3} us  {who:<7} {what}{st}", t as f64 / 1000.0)
+            })
+            .collect()
+    }
+}
+
 fn put_uvarint(out: &mut Vec<u8>, mut v: u64) {
     loop {
         let b = (v & 0x7f) as u8;
@@ -7381,6 +7484,7 @@ impl MemTable {
         };
         m.wm.store(wm, AtomicOrdering::Release);
         self.mark.store(n, AtomicOrdering::Release);
+        dbgtrace::ev(8, 255, self.log_len() as u64, self.len() as u64);
     }
 
     /// The last commit's log length, entry count and watermark, all three
@@ -13370,6 +13474,7 @@ impl Reader {
         self.len_bound.set(len);
         self.wm.set(wm);
         self.isolation.set(Isolation::Snapshot);
+        dbgtrace::ev3(9, self.who(), log as u64, len as u64, unsafe { &*p }.gen, p as usize);
     }
 
     /// PROTOTYPE: hold the state of generation `gen` at the commit `at`
@@ -14340,6 +14445,7 @@ impl Reader {
         mut f: F,
     ) -> Result<usize> {
         let _entered = self.enter();
+        let _traced = dbgtrace::End(self.who());
         self.note_read(true);
         self.advise(!self.scan_wants_readahead(limit));
         // `Prefetch` never changes mode, so `advise` above is a no-op for it.
@@ -15364,7 +15470,30 @@ impl Reader {
         // replacement, and this handle is pinned for the operation or is
         // the writer's own, which frees nothing while it reads.
         let e = unsafe { &*e };
+        dbgtrace::ev3(
+            4,
+            self.who(),
+            ((p as u64) << 32) | b as u64,
+            match &*e.form {
+                Cached::Clean => 0,
+                Cached::Sparse(_) => 1,
+                Cached::Block(_) => 2,
+                Cached::Wide(_) => 3,
+            },
+            st.gen,
+            st as *const State as usize,
+        );
         Some(&e.form)
+    }
+
+    /// HUNT: who an event is of: the upkeep thread's understudy, a handle's
+    /// slot, or the writer's own handle.
+    fn who(&self) -> u32 {
+        if self.understudy {
+            254
+        } else {
+            self.slot.map_or(255, |s| s as u32)
+        }
     }
 
     /// The forms a scan took, counted once at its end: counted at each
@@ -15780,6 +15909,14 @@ impl Reader {
             return true;
         }
         let tables = self.fs().tables.borrow();
+        dbgtrace::ev3(
+            6,
+            self.who(),
+            0,
+            0,
+            self.state().gen,
+            self.state() as *const State as usize,
+        );
         for (p, cell) in tables.iter().enumerate() {
             let mut held = cell.borrow_mut();
             let Some(t) = held.as_mut() else { continue };
@@ -15796,6 +15933,14 @@ impl Reader {
                 }
             }
         }
+        dbgtrace::ev3(
+            6,
+            self.who(),
+            1,
+            0,
+            self.state().gen,
+            self.state() as *const State as usize,
+        );
         self.fs().dirty_any.set(false);
         true
     }
@@ -15839,6 +15984,14 @@ impl Reader {
                 .store(self.fs().tables_complete.get(), AtomicOrdering::Release);
             st.forms_at
                 .store(mem.committed_log(), AtomicOrdering::Release);
+            dbgtrace::ev3(
+                2,
+                self.who(),
+                mem.committed_log() as u64,
+                2,
+                st.gen,
+                st as *const State as usize,
+            );
         }
     }
 
@@ -15853,6 +16006,14 @@ impl Reader {
             bytes,
         }));
         let old = slot.swap(new, AtomicOrdering::AcqRel);
+        dbgtrace::ev3(
+            1,
+            self.who(),
+            ((p as u64) << 32) | b as u64,
+            self.mem().committed_log().min(self.log_bound.get()) as u64,
+            st.gen,
+            st as *const State as usize,
+        );
         st.forms_bytes.fetch_add(bytes, AtomicOrdering::Relaxed);
         if !old.is_null() {
             // SAFETY: as in `canonical`; the pointee is read only to
@@ -16565,6 +16726,14 @@ impl Reader {
             st.forms_at.store(
                 self.mem().committed_log().min(self.log_bound.get()),
                 AtomicOrdering::Release,
+            );
+            dbgtrace::ev3(
+                2,
+                self.who(),
+                st.forms_at.load(AtomicOrdering::Relaxed) as u64,
+                1,
+                st.gen,
+                st as *const State as usize,
             );
         }
         Ok(())
@@ -17817,10 +17986,16 @@ impl Reader {
                 }
             }
         }
-        let canonical = self.opts.commit_forms
-            && self
-                .forms_bound()
-                .is_some_and(|n| st.forms_at.load(AtomicOrdering::Acquire) == n);
+        let at_seen = st.forms_at.load(AtomicOrdering::Acquire);
+        let canonical = self.opts.commit_forms && self.forms_bound().is_some_and(|n| at_seen == n);
+        dbgtrace::ev3(
+            3,
+            self.who(),
+            self.forms_bound().map_or(u64::MAX, |n| n as u64),
+            ((at_seen as u64) << 1) | u64::from(canonical),
+            st.gen,
+            st as *const State as usize,
+        );
         if self.opts.commit_forms && self.forms_bound().is_some() && !resumed {
             match self.slot {
                 Some(slot) => {
@@ -24603,7 +24778,9 @@ impl Reader {
             self.fs().read_cap.set(to.cap as usize);
             self.fs().pass_lent.set(to.lent);
             self.fs().log_short.set(false);
+            dbgtrace::ev(7, 254, 0, to.log as u64);
             let done = self.maintain_forms();
+            dbgtrace::ev(7, 254, 1, to.log as u64);
             whole = !self.fs().log_short.replace(false);
             self.fs().read_cap.set(0);
             self.sweep_retired_forms();

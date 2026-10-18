@@ -343,9 +343,15 @@ fn capture(
     at_snapshot: &Model,
     now: &Model,
     why: &str,
+    t_commit: u64,
 ) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "HUNT-CAPTURE {why}");
+    let t_fail = supdb::db::dbgtrace::now_ns();
+    for line in supdb::db::dbgtrace::dump(t_commit.saturating_sub(2_000_000)) {
+        let _ = writeln!(s, "TRACE {line}");
+    }
+    let _ = writeln!(s, "TRACE (failure noticed at {:.3} us)", t_fail as f64 / 1000.0);
     let _ = writeln!(
         s,
         "key {} scan from {} limit {limit}; isolation {:?}",
@@ -512,6 +518,7 @@ fn scenario(cfg: &Cfg, iter: usize) -> Result<Tally, String> {
         for cycle in 0..cfg.snaps {
             let snap = db.reader().unwrap();
             snap.snapshot();
+            let mut t_commit = supdb::db::dbgtrace::now_ns();
             let at_snapshot = model.clone();
             let tag: Vec<u8> = format!("after the snapshot {cycle}").into_bytes();
             let step = cfg.after_step.max(1);
@@ -543,13 +550,18 @@ fn scenario(cfg: &Cfg, iter: usize) -> Result<Tally, String> {
                     db.put(k, &tag);
                     model.insert(k.clone(), vec![tag.clone()]);
                 }
+                t_commit = supdb::db::dbgtrace::now_ns();
+                supdb::db::dbgtrace::ev(10, 255, 0, 0);
                 db.commit().unwrap();
+                supdb::db::dbgtrace::ev(10, 255, 1, 0);
                 if cfg.pause_ms > 0 {
                     std::thread::sleep(std::time::Duration::from_millis(cfg.pause_ms));
                 }
                 for start in starts.iter().step_by(cfg.snap_step.max(1)) {
                     for &limit in &cfg.snap_limits {
+                        supdb::db::dbgtrace::ev(11, 255, 0, 0);
                         let got = scanned(&snap, start, limit);
+                        supdb::db::dbgtrace::ev(11, 255, 1, 0);
                         tally.snap_scans += 1;
                         let want = window(&at_snapshot, start, limit);
                         let strict_fail = if cfg.strict {
@@ -584,7 +596,8 @@ fn scenario(cfg: &Cfg, iter: usize) -> Result<Tally, String> {
                                     limit,
                                     &at_snapshot,
                                     &model,
-                                    &line
+                                    &line,
+                                    t_commit,
                                 )
                             ));
                         }
