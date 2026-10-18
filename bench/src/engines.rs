@@ -243,6 +243,18 @@ pub trait Engine {
     fn counters(&self) -> Vec<(&'static str, f64)> {
         Vec::new()
     }
+
+    /// What the engine holds in memory, by owner and by capacity: the
+    /// bytes behind each structure that a bound on the process is spent
+    /// in, which `counters` cannot say since it counts what the structures
+    /// hold and not what they cost (`Reader::memory_census`). A name
+    /// ending `_n` is a count and the rest are bytes. Walks every block
+    /// the store has formed, so it is read at the lag sweep's points under
+    /// `SUPDB_LAG_COUNTERS` and nowhere else. Empty for an engine with
+    /// nothing to say.
+    fn memory_census(&self) -> Vec<(String, u64)> {
+        Vec::new()
+    }
 }
 
 /// What a reader thread reads through: the two reads of `Engine`, over a
@@ -4336,6 +4348,12 @@ impl Engine for Supdb {
             ("forms_rebased", db.forms_rebased() as f64),
             ("pin_barriers", uk[10] as f64),
         ]
+    }
+    fn memory_census(&self) -> Vec<(String, u64)> {
+        self.db
+            .as_ref()
+            .map(|db| db.memory_census())
+            .unwrap_or_default()
     }
     fn thread_reader(&self) -> Res<ReaderOpener> {
         let db = self.db.as_ref().ok_or("db closed")?;
