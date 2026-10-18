@@ -1,9 +1,10 @@
 #!/bin/sh
 # Loop tests/hunt_stress0.rs over processes and read a rate.
 #   usage: loop.sh BIN OUTDIR RUNS PARALLEL [LABEL]
-# The scenario's knobs are the HUNT_* variables of the caller. With SEEDS=1
-# each process gets HUNT_SEED=$SEEDBASE+its number (default: the original
-# scenario's seeds, 0). Prints one summary line.
+# The scenario's knobs are the HUNT_* variables of the caller; TESTNAME picks
+# the test (hunt_scenario by default). With SEEDS=1 each process gets
+# HUNT_SEED=$SEEDBASE+its number (default: the original scenario's seeds, 0).
+# Prints one summary line.
 BIN=$1
 OUT=$2
 RUNS=$3
@@ -21,5 +22,7 @@ ok=$(grep -c '^ok ' "$RES")
 f1=$(grep -c '^F1' "$RES")
 f0=$(grep -c '^F0' "$RES")
 f2=$(grep -c '^F2' "$RES")
-ot=$(grep -c '^other' "$RES")
-echo "SUMMARY $LABEL runs=$RUNS ok=$ok F1=$f1 F0=$f0 F2=$f2 other=$ot"
+fp=$(grep -c '^forced-passed' "$RES")
+fn=$(grep -c '^forced-not-parked' "$RES")
+ot=$(grep -c '^other\|^forced-other' "$RES")
+echo "SUMMARY $LABEL runs=$RUNS ok=$ok F1=$f1 F0=$f0 F2=$f2 forced-passed=$fp forced-not-parked=$fn other=$ot"

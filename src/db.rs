@@ -126,6 +126,42 @@ pub mod dbgtrace {
     static RING: [[AtomicU64; 6]; N] = [const { [const { AtomicU64::new(0) }; 6] }; N];
     static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
+    /// HUNT FORCING HOOK: bit 1 holds the forms publisher between its slot
+    /// swaps and its store of `forms_at`; bit 2 is set while a publisher is
+    /// parked there. Process-wide, so a test's helper thread can see it.
+    static FORMS_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+    /// Hold (or release) the forms publisher after its slot swaps and
+    /// before it stores the position they are current to.
+    pub fn hold_forms_position(on: bool) {
+        if on {
+            FORMS_HOLD.fetch_or(1, Ordering::AcqRel);
+        } else {
+            FORMS_HOLD.fetch_and(!1, Ordering::AcqRel);
+        }
+    }
+
+    /// Whether a publisher is parked in the hold.
+    pub fn forms_hold_parked() -> bool {
+        FORMS_HOLD.load(Ordering::Acquire) & 2 != 0
+    }
+
+    /// The publisher's wait, if a test holds it. Marks itself parked so the
+    /// test knows the slots are ahead of the position.
+    pub(super) fn forms_hold_wait() {
+        if FORMS_HOLD.load(Ordering::Acquire) & 1 == 0 {
+            return;
+        }
+        FORMS_HOLD.fetch_or(2, Ordering::AcqRel);
+        let t = std::time::Instant::now();
+        while FORMS_HOLD.load(Ordering::Acquire) & 1 != 0
+            && t.elapsed() < std::time::Duration::from_secs(60)
+        {
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+        FORMS_HOLD.fetch_and(!2, Ordering::AcqRel);
+    }
+
     pub fn now_ns() -> u64 {
         T0.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
     }
@@ -192,9 +228,11 @@ pub mod dbgtrace {
                     1 => format!("PUBLISH_FORM p{} b{} pos {b}", a >> 32, a as u32),
                     2 => format!("FORMS_AT_STORED {a} (site {b})"),
                     3 => format!(
-                        "SCAN_START bound {a} forms_at {} canonical {}",
+                        "SCAN_START bound {} forms_at {} canonical {} (load bracket {} ns)",
+                        a & 0xffff_ffff,
                         if b >> 1 == (usize::MAX >> 1) as u64 { "MAX".to_string() } else { (b >> 1).to_string() },
-                        b & 1
+                        b & 1,
+                        a >> 32
                     ),
                     4 => format!("TAKE p{} b{} kind {b}", a >> 32, a as u32),
                     5 => format!("SCAN_END seen {a}"),
@@ -16721,6 +16759,7 @@ impl Reader {
         // later position would be taken by a reader there without the
         // writes between.
         if self.publish_dirty(false) {
+            dbgtrace::forms_hold_wait();
             st.forms_complete
                 .store(self.fs().tables_complete.get(), AtomicOrdering::Release);
             st.forms_at.store(
@@ -17986,12 +18025,15 @@ impl Reader {
                 }
             }
         }
+        let t_before = dbgtrace::now_ns();
         let at_seen = st.forms_at.load(AtomicOrdering::Acquire);
         let canonical = self.opts.commit_forms && self.forms_bound().is_some_and(|n| at_seen == n);
+        let t_after = dbgtrace::now_ns();
         dbgtrace::ev3(
             3,
             self.who(),
-            self.forms_bound().map_or(u64::MAX, |n| n as u64),
+            self.forms_bound().map_or(u64::MAX, |n| n as u64 & 0xffff_ffff)
+                | ((t_after - t_before) << 32),
             ((at_seen as u64) << 1) | u64::from(canonical),
             st.gen,
             st as *const State as usize,
