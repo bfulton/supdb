@@ -362,13 +362,21 @@ fn shape(got: &[Vec<u8>], want: &[Vec<u8>]) -> String {
     }
 }
 
+/// Record a failed check, and say so at once: a seed that goes on to hang,
+/// abort or fail a call has still named the first wrong answer it was given.
+fn fail(fails: &mut Vec<String>, msg: String) {
+    let shown: String = msg.chars().take(600).collect();
+    eprintln!("CHECK FAILED [step {}]: {shown}", STEP.get());
+    fails.push(msg);
+}
+
 fn check_keys(label: &str, r: &Reader, model: &Model, keys: &[Vec<u8>], fails: &mut Vec<String>) {
     for k in keys {
         let want = model.get(k).cloned().unwrap_or_default();
         match read_vec(r, k) {
             Ok(got) if got == want => {}
             Ok(got) => {
-                fails.push(format!(
+                fail(fails, format!(
                     "{label}: read of key {} (len {}): {}: got {} values {:?}.., want {} values {:?}..",
                     show(k),
                     k.len(),
@@ -379,17 +387,20 @@ fn check_keys(label: &str, r: &Reader, model: &Model, keys: &[Vec<u8>], fails: &
                     want.iter().take(3).map(|v| v.len()).collect::<Vec<_>>(),
                 ));
             }
-            Err(e) => fails.push(format!("{label}: read of key {}: {e}", show(k))),
+            Err(e) => fail(fails, format!("{label}: read of key {}: {e}", show(k))),
         }
         match r.count(k) {
             Ok(n) if n as usize == want.len() => {}
-            Ok(n) => fails.push(format!(
-                "{label}: count of key {} (len {}): got {n}, want {}",
-                show(k),
-                k.len(),
-                want.len()
-            )),
-            Err(e) => fails.push(format!("{label}: count of key {}: {e}", show(k))),
+            Ok(n) => fail(
+                fails,
+                format!(
+                    "{label}: count of key {} (len {}): got {n}, want {}",
+                    show(k),
+                    k.len(),
+                    want.len()
+                ),
+            ),
+            Err(e) => fail(fails, format!("{label}: count of key {}: {e}", show(k))),
         }
         if fails.len() > 20 {
             return;
@@ -822,19 +833,29 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                 let want = live(&model);
                 let ((a, a_faults), (b, b_faults)) = (scan_all(&z), scan_all(&r));
                 let tag = if cfg.cache { " (block cache on)" } else { "" };
-                fails.extend(a_faults.iter().map(|x| format!("z {x}{tag}")));
-                fails.extend(b_faults.iter().map(|x| format!("r {x}{tag}")));
+                for x in &a_faults {
+                    fail(&mut fails, format!("z {x}{tag}"));
+                }
+                for x in &b_faults {
+                    fail(&mut fails, format!("r {x}{tag}"));
+                }
                 if a != want {
-                    fails.push(format!(
-                        "z scan differs from the model{tag}: {}",
-                        model_diff(&a, &want)
-                    ));
+                    fail(
+                        &mut fails,
+                        format!(
+                            "z scan differs from the model{tag}: {}",
+                            model_diff(&a, &want)
+                        ),
+                    );
                 }
                 if b != want {
-                    fails.push(format!(
-                        "r scan differs from the model{tag}: {}",
-                        model_diff(&b, &want)
-                    ));
+                    fail(
+                        &mut fails,
+                        format!(
+                            "r scan differs from the model{tag}: {}",
+                            model_diff(&b, &want)
+                        ),
+                    );
                 }
             }
         }
@@ -842,9 +863,10 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
             break;
         }
     }
-    // Final: settle everything, and check through every path.
-    STEP.set(cfg.ops as i64);
+    // Final: settle everything, and check through every path. A seed that
+    // failed a check keeps the step it failed at.
     if fails.is_empty() {
+        STEP.set(cfg.ops as i64);
         z.commit().map_err(|e| format!("commit z: {e}"))?;
         r.commit().map_err(|e| format!("commit r: {e}"))?;
         for op in staged.drain(..) {
