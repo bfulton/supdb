@@ -293,6 +293,8 @@ fn same_window(got: &Window, want: &Window, what: &str) -> Result<(), String> {
 ///    as it was before it stayed alert.
 ///  * `--cfg hunt_rebase`: `HUNT_NO_REBASE=1` drops the tables at a merge's
 ///    rewrite of a partition, as before they were carried.
+///  * `--cfg hunt_lazy`: `HUNT_EAGER=1` carries the tables inside the publish
+///    (on the commit that added the lazy carry beside it).
 #[allow(unused_variables)]
 fn hunt_opts(o: &mut Options) {
     #[cfg(any(hunt_opts, hunt_share))]
@@ -317,6 +319,13 @@ fn hunt_opts(o: &mut Options) {
     #[cfg(hunt_carry)]
     if env_u64("HUNT_SNAP_CARRY", 0) == 1 {
         o.snapshot_carry = true;
+    }
+    // The carry before the lazy one, on the one commit that has both
+    // (`--cfg hunt_lazy`): the writer's tables and the published forms
+    // moved together inside the publish.
+    #[cfg(hunt_lazy)]
+    if env_u64("HUNT_EAGER", 0) == 1 {
+        o.forms_carry_lazily = false;
     }
     #[cfg(any(hunt_opts, hunt_upkeep))]
     match std::env::var("HUNT_UPKEEP").as_deref() {
@@ -518,6 +527,11 @@ fn snapshot_scenario(iter: u64) -> Result<(), String> {
         drop(snap);
     }
     eprintln!("HUNT-CYCLES {failed_cycles} of {cycles} cycles failed");
+    // How many block forms scans took from the state's published forms, to
+    // show a take-away that stops the failures has not stopped the taking
+    // (`--cfg hunt_takes`, on commits that count them).
+    #[cfg(hunt_takes)]
+    eprintln!("HUNT-TAKES {}", db.canonical_forms().2);
     if let Some(e) = failure {
         if std::env::var("HUNT_KEEP").is_err() {
             drop(latest);
