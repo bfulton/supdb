@@ -14,7 +14,9 @@
 #   n  every switch, the seal can be held                        (758fcd3 and after)
 # PORT is hook (the forcing pause of the snapshot schedule: HUNT_SCAN_AFTER_CHECK_MS between a Snapshot handle's one check
 # of the published forms' position and its load of a form), diag (HUNT_CHECK_CUTS=1: the rebase of a rewritten partition
-# counts the filed keys it carries and the cuts that are not the new partition's), or plain (the default).
+# counts the filed keys it carries and the cuts that are not the new partition's), nolanded (the take-away of that hazard:
+# a landing no longer keeps the writer's snapshot and the keys filed into its tables, as before e1bd6fb), or plain (the
+# default).
 # TEST is hunt_bisect0 (the default) or hunt_cuts (the deterministic stale-cut schedule; KIND o, m or n).
 #
 # The snapshot schedule, on a binary built with hook: HUNT_SCAN_AFTER_CHECK_MS=300 HUNT_CYCLES=3, with HUNT_UPKEEP=bg1
@@ -41,19 +43,26 @@ case "$KIND" in
   *) echo "unknown kind $KIND" >&2; exit 2 ;;
 esac
 SHA="$(git -C "$REPO" rev-parse --short "$COMMIT")"
-X="$OUT/src-$SHA-$PORT-$TEST"
+X="$OUT/src-$SHA-$PORT-$TEST-$$"
 rm -rf "$X"; mkdir -p "$X/tests" "$OUT/bin"
 git -C "$REPO" archive --format=tar "$COMMIT" Cargo.toml Cargo.lock src | tar -x -C "$X"
 case "$PORT" in
   hook) perl "$HERE/hookport.pl" "$X/src/db.rs" >&2 ;;
   diag) perl "$HERE/diagport.pl" "$X/src/db.rs" >&2 ;;
   plain) ;;
+  nolanded)
+    # The take-away of the stale-cut hazard: a landing no longer keeps the writer's snapshot and the keys filed into
+    # its tables (`Reader::rebase_tables`, `keep_snap`), as before e1bd6fb.
+    perl -0pi -e 's/let keep_snap = \(same_frozen \|\| landed\)/let keep_snap = (same_frozen)/; s/let keep_snap = same_frozen \|\| landed;/let keep_snap = same_frozen;/' "$X/src/db.rs"
+    if grep -q 'landed' "$X/src/db.rs" && ! grep -q 'let keep_snap = (same_frozen)\|let keep_snap = same_frozen;' "$X/src/db.rs"; then
+      echo "no keep_snap line to take the landing out of" >&2; exit 2
+    fi ;;
   *) echo "unknown port $PORT" >&2; exit 2 ;;
 esac
 cp "$REPO/tests/$TEST.rs" "$X/tests/$TEST.rs"
-export CARGO_TARGET_DIR="$OUT/target-$SHA-$PORT-$TEST"
+export CARGO_TARGET_DIR="$OUT/target-$SHA-$PORT-$TEST-$$"
 export RUSTFLAGS="$RF"
-LOG="$OUT/build-$SHA-$PORT-$TEST.log"
+LOG="$OUT/build-$SHA-$PORT-$TEST-$$.log"
 if ! ( cd "$X" && cargo test --no-run --test "$TEST" > "$LOG" 2>&1 ); then
   rm -rf "$CARGO_TARGET_DIR"
   echo "build failed, see $LOG" >&2
@@ -61,6 +70,6 @@ if ! ( cd "$X" && cargo test --no-run --test "$TEST" > "$LOG" 2>&1 ); then
 fi
 EXE="$(grep -o "Executable tests/$TEST.rs ([^)]*)" "$LOG" | sed 's/.*(\(.*\))/\1/')"
 BIN="$OUT/bin/$TEST-$SHA-$PORT-$KIND"
-cp "$EXE" "$BIN"
+cp "$EXE" "$BIN.$$" && mv -f "$BIN.$$" "$BIN"
 rm -rf "$CARGO_TARGET_DIR" "$X"
 echo "$BIN"

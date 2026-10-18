@@ -41,6 +41,11 @@
 //!                   (`HUNT_READER_DELAY_MS` after the writes begin), for a
 //!                   forcing schedule on commits whose publishing is the
 //!                   writer's own thread.
+//!  * `HUNT_MIDWALK=1` stops the first snapshot scan inside its walk, in the
+//!                   callback of its first entry, while the writer commits on a
+//!                   thread of its own (`HUNT_MIDWALK_WRITES`, default 300, and
+//!                   `HUNT_MIDWALK_SETTLE_MS`, default 150): a forcing schedule
+//!                   that needs nothing of the engine but its public surface.
 //!  * `HUNT_SNAP_DELAY_MS` sleeps this long after the commit, before the
 //!                   first snapshot scan.
 //!
@@ -470,6 +475,54 @@ fn snapshot_scenario(iter: u64) -> Result<(), String> {
                 &got,
                 &want,
                 &format!("snapshot, cycle {c}, threaded first scan from \"\" for 3"),
+            ) {
+                failed_cycles += 1;
+                eprintln!("HUNT-CYCLE-FAIL {e}");
+                failure.get_or_insert(e);
+            }
+            continue;
+        }
+        // HUNT_MIDWALK=1: a forcing schedule that uses the crate's public
+        // surface alone. The handle's first scan is stopped inside its walk,
+        // in the callback of the first entry it emits, until the writer has
+        // made HUNT_MIDWALK_WRITES puts and a commit on a thread of its own
+        // and HUNT_MIDWALK_SETTLE_MS have passed (the upkeep thread's pass,
+        // where there is one); the walk then goes on to the blocks after the
+        // first, whose published forms the commit has replaced. Whatever the
+        // handle answers is held to the model as it was at the snapshot.
+        if env_u64("HUNT_MIDWALK", 0) == 1 {
+            let want = window(&at_snapshot, b"", 300);
+            let writes = env_u64("HUNT_MIDWALK_WRITES", 300) as usize;
+            let settle = env_u64("HUNT_MIDWALK_SETTLE_MS", 150);
+            let (to_writer, writer_rx) = std::sync::mpsc::channel::<()>();
+            let (to_main, main_rx) = std::sync::mpsc::channel::<()>();
+            let mut got = Vec::new();
+            let visited = std::thread::scope(|s| {
+                s.spawn(|| {
+                    writer_rx.recv().unwrap();
+                    for k in keys.iter().skip((c % 5) as usize).step_by(5).take(writes) {
+                        db.put(k, tag.as_bytes());
+                        model.insert(k.clone(), vec![tag.as_bytes().to_vec()]);
+                    }
+                    db.commit().unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(settle));
+                    to_main.send(()).unwrap();
+                });
+                let mut first = true;
+                snap.scan(b"", 300, |k, v| {
+                    if first {
+                        first = false;
+                        to_writer.send(()).unwrap();
+                        main_rx.recv().unwrap();
+                    }
+                    got.push((k.to_vec(), v.to_vec()));
+                })
+                .unwrap()
+            });
+            if let Err(e) = same_window(
+                &(got, visited),
+                &want,
+                &format!("snapshot, cycle {c}, a scan stopped in its first entry's callback while the writer commits"),
             ) {
                 failed_cycles += 1;
                 eprintln!("HUNT-CYCLE-FAIL {e}");
