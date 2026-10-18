@@ -45,7 +45,8 @@
 //!                   first snapshot scan.
 //!
 //! Compile-time switches, for commits that lack what a call needs:
-//! `--cfg hunt_old` leaves out `hold_seal_landing` and `frozen_tables`, and
+//! `--cfg hunt_old` leaves out `hold_seal_landing` and `frozen_tables`,
+//! `--cfg hunt_nofrozen` only `frozen_tables` (b6b259d .. 549244a .. 9764e28), and
 //! `hunt_share`, `hunt_forms`, `hunt_upkeep` (together `hunt_opts`),
 //! `hunt_alert` and `hunt_rebase` turn on the switches `hunt_opts` lists,
 //! which set options by name (both scenarios).
@@ -399,7 +400,7 @@ fn snapshot_scenario(iter: u64) -> Result<(), String> {
             db.settle().unwrap();
         }
     }
-    #[cfg(not(hunt_old))]
+    #[cfg(not(any(hunt_old, hunt_nofrozen)))]
     assert_eq!(db.frozen_tables(), 1, "the seal is held, its table frozen");
     let mut starts: Vec<Vec<u8>> =
         vec![b"".to_vec(), b"a".to_vec(), b"zzz".to_vec(), vec![0xff; 8]];
