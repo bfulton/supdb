@@ -44,8 +44,7 @@ use crate::Blob;
 /// left to `db` being native only already: the sidecar is read through a
 /// mapping of its own, and the browser's reader (`blob`) must never be able
 /// to reach it, so a change that moved this module out from under the `db`
-/// gate would have to say so on this line. The layout is wired to no read
-/// path and to no option.
+/// gate would have to say so on this line.
 #[cfg(not(target_family = "wasm"))]
 pub mod zpages;
 
@@ -2468,7 +2467,7 @@ impl BlockedBloom {
     /// apart from the index's -- the filter was built at open and never
     /// stored, so its hash was free to be the index's; the test beside the
     /// landing holds the two halves to the whole. A sidecar of the z form
-    /// stores the filter's words, so this hash is a stored quantity now:
+    /// stores the filter's words, so this hash is a stored quantity there:
     /// `BLOOM_SIG` moves with any edit to it, and `zpages` pins the words.
     fn fnv(key: &[u8]) -> u64 {
         crate::flatindex::key_hash(key)
