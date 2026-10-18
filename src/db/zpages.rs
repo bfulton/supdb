@@ -103,7 +103,8 @@ pub const ZVERSION: u32 = 1;
 pub const ZTRAILER: usize = ZPAGE;
 /// The trailer flag that says a filter is stored in the resident part.
 pub const ZT_FILTER: u32 = 1;
-/// How many turns `fill_group` may take to find a group that fits.
+/// How many attempts to compress a group `fill_group` may make to find one
+/// that fits a page, and then to grow it.
 pub const ZFILL_TURNS: u32 = 12;
 /// How many times `fill_group` grows a group that fit with room to spare,
 /// by default: the knob that trades compress calls a page for fill.
@@ -618,7 +619,8 @@ pub struct FillStats {
     pub nopages: u64,
     /// Compress calls.
     pub calls: u64,
-    /// Turns of the loop, whether or not they compressed.
+    /// Turns taken, each an attempt to compress a group within a call's
+    /// budget: the calls' compress calls but for the one a fallback adds.
     pub turns: u64,
     /// Growth rounds that fit.
     pub growths: u64,
@@ -764,12 +766,17 @@ impl Fit {
 /// `hint` is where to start: the previous page's record count, which is
 /// close to this page's, so a page costs about one compress call when the
 /// count fits again and two when it needs a trim or a growth. Zero starts
-/// from one record. The loop predicts, then verifies: the group of `m`
-/// records is compressed, and a group that fits is grown once (by the
-/// records the slack holds, at the group's own bytes a record) while one
+/// from one record, and a growth by the room that one record leaves reaches
+/// the count its own bytes allow, not the count a group of many compresses
+/// to: a call with no predecessor builds a page well short of full, and
+/// whoever sizes a partition from such calls has to chain a few first. The
+/// loop predicts, then verifies: the group of `m` records is compressed, and
+/// a group that fits is grown (by the records the slack holds, at the
+/// group's own bytes a record, [`FillScratch::grow_rounds`] times) while one
 /// that does not is trimmed in proportion to the overshoot for the first
-/// four turns and halved after, so that the count is one by the twelfth turn
-/// at the latest and a record that cannot fit alone is declined, not retried.
+/// four attempts and halved after, so that the count is one by the twelfth
+/// attempt at the latest and a record that cannot fit alone is declined, not
+/// retried.
 ///
 /// The function is total. No input makes it panic, form a group of no
 /// records or loop past its turns: the first record at `rank` is either in
@@ -842,8 +849,10 @@ fn fill_with_turns<I: Images + ?Sized>(
     let mut found: Option<Fit> = None;
 
     while turn < turns {
-        turn += 1;
-        s.stats.turns += 1;
+        // Staging is not a turn: only an attempt to compress is. It can
+        // send the loop round again at most nine times, once for a record
+        // that is not an image (after which no count passes it) and each
+        // time for a group over the cap (which halves the count).
         match s.stage(src, rank, m) {
             Stage::Ok => {}
             Stage::Bad(j) => {
@@ -862,6 +871,8 @@ fn fill_with_turns<I: Images + ?Sized>(
                 continue;
             }
         }
+        turn += 1;
+        s.stats.turns += 1;
         let ulen = s.imgs.len();
         let Some(class) = s.classify(ulen, cur) else {
             return Fill::Mismatch;
@@ -903,10 +914,13 @@ fn fill_with_turns<I: Images + ?Sized>(
     let mut fit = match found {
         Some(f) => f,
         None => {
-            // Every turn spent without a fit. The turns halve the count from
-            // the fifth, so one is reached by the twelfth and a count of one
-            // decides; this is what it would mean if the arithmetic were
-            // wrong: the first record alone, once.
+            // Every turn spent without a fit. A turn is an attempt, the first
+            // four cut the count in proportion (by at least one) and the rest
+            // halve it, so from the most a group holds the count is one at
+            // the twelfth and the twelfth decides: this path is not reached
+            // with the turns the layout gives. It is the path a smaller
+            // budget reaches, and what it does is the first record alone,
+            // once, so that a spent budget is a page of one and not a hole.
             s.stats.fallbacks += 1;
             match s.stage(src, rank, 1) {
                 Stage::Ok => {}
@@ -952,8 +966,6 @@ fn fill_with_turns<I: Images + ?Sized>(
             break;
         }
         let mut m2 = (fit.m + slack / per).min(limit);
-        turn += 1;
-        s.stats.turns += 1;
         match s.stage(src, rank, m2) {
             Stage::Ok => {}
             Stage::Bad(j) => {
@@ -971,6 +983,8 @@ fn fill_with_turns<I: Images + ?Sized>(
                 }
             }
         }
+        turn += 1;
+        s.stats.turns += 1;
         let ulen = s.imgs.len();
         let Some(class) = s.classify(ulen, cur) else {
             return Fill::Mismatch;
@@ -1912,7 +1926,6 @@ mod tests {
         assert_eq!(ZNOPAGE, 0xFFFF_FFFF);
         assert_eq!(ZMAX_COUNT, 256);
         assert_eq!(ZMAX_ULEN, 65_536);
-        assert_eq!(ZMAX_COUNT * 4, 1024, "a record is at least a header");
         assert_eq!(&ZMAGIC, b"SUPDZPG1");
         assert_eq!((ZTRAILER, T_CRC, T_ZERO), (4096, 4092, 212));
         // The header's fields tile the first 24 bytes, in the order written.
@@ -3380,6 +3393,38 @@ mod tests {
                 .map(|&r| (r, NoPage::Unplaceable))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn a_call_with_no_predecessor_builds_a_smaller_page_than_one_that_has_one() {
+        let images = suite_images(4000, 8);
+        let mut s = FillScratch::new();
+        let mut page = [0u8; ZPAGE];
+        let Fill::Page(cold) = fill_group(&images, 2000, 0, 1, &mut s, &mut page) else {
+            panic!()
+        };
+        // Chained from there, the counts climb to the steady state.
+        let (mut rank, mut hint, mut last) = (2000 + cold.count, cold.count, cold);
+        for _ in 0..8 {
+            let Fill::Page(g) = fill_group(&images, rank, hint, 1, &mut s, &mut page) else {
+                panic!()
+            };
+            (rank, hint, last) = (rank + g.count, g.count, g);
+        }
+        eprintln!(
+            "a cold page holds {} records, filled {:.3}; a chained one {}, filled {:.3}",
+            cold.count,
+            cold.clen as f64 / ZCAP as f64,
+            last.count,
+            last.clen as f64 / ZCAP as f64
+        );
+        assert!(
+            cold.count * 10 < last.count * 8,
+            "a cold call is not the steady state: {} against {}",
+            cold.count,
+            last.count
+        );
+        assert!(cold.clen < last.clen);
     }
 
     #[test]
