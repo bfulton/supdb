@@ -1579,6 +1579,31 @@ first turn; the test waits for that turn now. The rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
 thing it bets against gets faster.
 
+**A test whose answer was a function of the clock, or of a thread's
+turn.** The superblock records the second a segment finished in, in each
+of its two slots, and the checksum over each slot covers it: two seals of
+identical input differ in four aligned words whenever a tick falls between
+them. `tests/segwriter.rs` had learned that and kept the fix to itself, a
+private helper; two tests in `tests/db.rs` that compared the files of two
+stores were written without it, one whole-file and one allowing a single
+aligned word, which is not enough for a second slot and a checksum. They
+failed one run in a few dozen under load and every time the binary was
+started within the test's own length of a boundary: a script that starts
+it at chosen offsets before a second boundary (50-110 ms, in a test that
+takes 0.2-0.5 s) failed four starts of thirty-five before and none after.
+The helper lives in `tests/common` now, one definition for every test file,
+and a file the superblock is not in is compared as it is. Beside it a test
+counted the cache's kinds and size right after a commit under the default
+upkeep, which lends the writer's tables to the thread: a counter read takes
+the upkeep home, waiting for a pass in flight and taking back a commit's
+batch the pass has not begun, so the count was of tables nothing had been
+filed into, one run in thirty; the test runs the commit's own fill inline,
+as its siblings that count what a commit filed already did. The rule is the
+one above, applied to two more states a test cannot see it needs: the
+second a store was finished in, and which side of a hand-off a counter is
+read from. A flake whose trigger is a phase is reproduced by choosing the
+phase, not by repeating the run.
+
 **A mark taken whole and then read in part.** A commit publishes the
 log's length, the entry count and the watermark as one mark, and a
 handle under `Latest` or `Snapshot` took the length and the watermark

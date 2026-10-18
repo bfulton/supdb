@@ -9,11 +9,30 @@ use std::path::PathBuf;
 
 use supdb::{Db, Isolation, Options, ReadAdvice, Reader};
 
+mod common;
+use common::without_the_clock;
+
 fn dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-next-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
+}
+
+/// The first byte at which two files a store left differ, `None` when they
+/// are the same file. A segment (`.sup`) is compared without its clock; the
+/// ordered index beside it, and everything else, byte for byte, since none
+/// of it carries one.
+fn first_difference(name: &str, a: &[u8], b: &[u8]) -> Option<usize> {
+    if a.len() != b.len() {
+        return Some(a.len().min(b.len()));
+    }
+    let (x, y) = if name.ends_with(".sup") {
+        (without_the_clock(a), without_the_clock(b))
+    } else {
+        (a.to_vec(), b.to_vec())
+    };
+    x.iter().zip(&y).position(|(p, q)| p != q)
 }
 
 /// The manifest's two slots (`Options::manifest_slots`): the file names a
@@ -1678,7 +1697,11 @@ fn a_seal_through_the_one_value_path_writes_the_segment_the_general_path_does() 
         "the same files"
     );
     for (name, bytes) in a {
-        assert!(bytes == &b[name], "{name} differs between the two paths");
+        let first = first_difference(name, bytes, &b[name]);
+        assert!(
+            first.is_none(),
+            "{name} differs between the two paths, first at {first:?}"
+        );
     }
 }
 
@@ -8525,6 +8548,10 @@ fn a_replacing_write_patches_a_copy_in_place() {
         scan_block_cache: true,
         scan_cache_ahead: false,
         forms_from_reader_scans: 0,
+        // The commit's own fill, which this is about: on the thread, which
+        // commit a pass files is the thread's timing, and a count read
+        // before the pass began counts a table nothing has been filed into.
+        upkeep: supdb::Upkeep::Inline,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -12589,21 +12616,14 @@ fn the_directory_hint_writes_the_segment_and_the_ordered_index_the_default_does(
         b.keys().collect::<Vec<_>>(),
         "the same files"
     );
-    // The superblock carries the second its finish landed in, so two
-    // seals that straddle a second differ in that one aligned word and
-    // nowhere else.
+    // A segment's superblock carries the second its finish landed in, and
+    // a checksum over it, in each slot: two seals that straddle a second
+    // differ in those and nowhere else (`without_the_clock`).
     for (name, bytes) in a {
-        assert_eq!(bytes.len(), b[name].len(), "{name} differs in length");
-        let diff: Vec<usize> = bytes
-            .iter()
-            .zip(&b[name])
-            .enumerate()
-            .filter(|(_, (x, y))| x != y)
-            .map(|(i, _)| i)
-            .collect();
+        let first = first_difference(name, bytes, &b[name]);
         assert!(
-            diff.iter().all(|&i| i / 8 == diff[0] / 8),
-            "{name} differs past the superblock's finish second: {diff:?}"
+            first.is_none(),
+            "{name} differs between the two, first at {first:?}"
         );
     }
 }
