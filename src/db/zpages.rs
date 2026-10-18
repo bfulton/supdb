@@ -462,6 +462,17 @@ pub struct GroupPos {
 /// that is not whole, which the first decode's [`walk_group`] has already
 /// refused; a search over a verified group cannot reach it.
 pub fn group_seek(group: &[u8], count: usize, key: &[u8]) -> Option<GroupPos> {
+    // Nothing sorts below the empty key, so the answer is the first record's
+    // and no compare is made: a compare of a zero-length slice is a call like
+    // any other, and an empty key held in a `Vec` points at no page.
+    if key.is_empty() {
+        let found = count > 0 && record_key_next(group, 0)?.0.is_empty();
+        return Some(GroupPos {
+            index: 0,
+            off: 0,
+            found,
+        });
+    }
     let mut off = 0usize;
     for index in 0..count {
         let (k, next) = record_key_next(group, off)?;
@@ -2944,6 +2955,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_empty_key_is_sought_at_the_front_of_every_group() {
+        // Nothing sorts below it: it is found when the first record has it,
+        // and is the position before the first record when not.
+        let with = [one_value(b"", b"v"), one_value(b"a", b"w")].concat();
+        let without = [one_value(b"a", b"v"), one_value(b"b", b"w")].concat();
+        for (group, found) in [(&with, true), (&without, false)] {
+            let al = Al::new(group);
+            let p = group_seek(al.bytes(), 2, b"").expect("a whole group seeks");
+            assert_eq!((p.index, p.off, p.found), (0, 0, found));
+        }
+        let al = Al::new(&[]);
+        let p = group_seek(al.bytes(), 0, b"").expect("no records is a group too");
+        assert_eq!((p.index, p.off, p.found), (0, 0, false));
+        // A group cut short is still refused for the empty key.
+        let al = Al::new(&with[..6]);
+        assert_eq!(group_seek(al.bytes(), 2, b""), None);
     }
 
     #[test]
