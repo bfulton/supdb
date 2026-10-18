@@ -119,6 +119,14 @@
 //!   intervals as the verdict. A trial that has no evidence to decide on is
 //!   undone after a dwell, since the compact form it came from is attached
 //!   and the raw form must not be left serving a store nothing reads.
+//! * **A form seen not to pay is not bought again on the model's word.** E3
+//!   leaves a form whose measured faults are not enough under the raw form's.
+//!   The model that predicted otherwise predicts it still, and a SUSPECT that
+//!   believed it would buy the form again as soon as a dwell had passed and
+//!   leave it a dwell later, for as long as the store stayed out of FITS. The
+//!   faults the form took through the stretch E3 acted on stand as its rate,
+//!   where they are above the model's, until it is installed again or the
+//!   store is FITS; the build clause and the evidence price the form at that.
 //! * **The budget counts wasted builds.** A store written across its key
 //!   space rewrites every partition each cycle, at a rate that can exceed one
 //!   serial builder, so each rewrite supersedes the build of the partition it
@@ -821,6 +829,9 @@ struct Watch {
     /// Since when the realized saving has stayed under `saving*`, every S1
     /// tick of the stretch having had evidence (E3).
     unpaying_since: Option<Duration>,
+    /// The reads of that stretch, pooled: the faults the compact form really
+    /// took while it was not paying.
+    stretch: Window,
     /// Reads since the last S1 tick (E3's reading).
     tick_reads: Window,
     /// When the current E2 measure began.
@@ -835,6 +846,7 @@ impl Watch {
     fn new(now: Duration) -> Watch {
         Watch {
             unpaying_since: None,
+            stretch: Window::default(),
             tick_reads: Window::default(),
             e2_start: now,
             e2_win: [Window::default(); 2],
@@ -867,6 +879,10 @@ pub struct ZSelect {
     now: Duration,
     model: Option<Model>,
     sampler: Option<Sampler>,
+    /// The compact form's faults a read as the stretch E3 acted on measured
+    /// them: kept after the exit as a floor under the model's prediction,
+    /// until the form is installed again or the store is FITS.
+    z_realized: Option<f64>,
     measured: Costs,
     footprint: Option<u64>,
     threads: u32,
@@ -916,6 +932,7 @@ impl ZSelect {
             now: Duration::ZERO,
             model: None,
             sampler: None,
+            z_realized: None,
             measured: Costs::default(),
             footprint: None,
             threads: 1,
@@ -1117,7 +1134,7 @@ impl ZSelect {
     fn phi_z(&self, class: Class) -> Option<f64> {
         let m = self.model?;
         match class {
-            Class::Read => m.phi_z,
+            Class::Read => m.phi_z.map(|z| z.max(self.z_realized.unwrap_or(0.0))),
             Class::Scan => m.phi_z_scan,
         }
     }
@@ -1258,6 +1275,7 @@ impl ZSelect {
         // before the sampler is asked again, and a wrong guess about a skewed
         // workload is forgiven.
         self.sampler = None;
+        self.z_realized = None;
         self.backoff = TRIAL_BACKOFF_MIN;
         self.last_trial_end = None;
     }
@@ -1325,7 +1343,8 @@ impl ZSelect {
         // where the model cannot see why the cache is short; the measured
         // saving still decides.
         let predicted = pressure
-            || m.phi_z
+            || self
+                .phi_z(Class::Read)
                 .is_some_and(|z| m.phi_raw - z >= self.theta_enter(Class::Read));
         predicted
             && Class::ALL
@@ -1368,6 +1387,7 @@ impl ZSelect {
         self.phase = Phase::Compact;
         self.last_switch = Some(now);
         self.retain_until = None;
+        self.z_realized = None;
         self.excess = 0.0;
         self.watch = Watch::new(now);
         self.counts.installs += 1;
@@ -1466,13 +1486,16 @@ impl ZSelect {
         let Some(m) = self.model else { return };
         if w.ops < MIN_EVIDENCE_OPS || self.pressure() {
             self.watch.unpaying_since = None;
+            self.watch.stretch = Window::default();
             return;
         }
         let realized = m.phi_raw - w.phi();
         if realized < self.saving_star(Class::Read) {
             self.watch.unpaying_since = self.watch.unpaying_since.or(Some(now));
+            self.watch.stretch.add(w);
         } else {
             self.watch.unpaying_since = None;
+            self.watch.stretch = Window::default();
         }
     }
 
@@ -1511,6 +1534,11 @@ impl ZSelect {
         self.counts.switches += 1;
         self.counts.exits[why as usize] += 1;
         self.retain_until = Some(now.saturating_add(self.retain()));
+        if why == Exit::E3 {
+            // The model said the form would pay and the form did not: until
+            // it is installed again its faults are what it was seen to take.
+            self.z_realized = Some(self.watch.stretch.phi());
+        }
         self.watch = Watch::new(now);
         if why == Exit::E2 {
             // A right trial is still a trial: the next one waits out the
@@ -3325,6 +3353,97 @@ mod tests {
                 assert_eq!(sim.sel.counts().switches, 1);
             }
         }
+    }
+
+    #[test]
+    fn a_form_seen_not_to_pay_is_not_bought_again_on_the_models_word() {
+        // The model predicts the compact form free of faults and it takes 0.40
+        // a read where the raw form takes 0.45. Left by E3, it is not bought
+        // again for as long as the model's word is all there is: without the
+        // form's measured rate kept, the store installs and leaves it every
+        // other dwell, an hour long and more.
+        let cell = Cell::ten_million();
+        let bound = cell.bound(cell.z as f64 / PAGE as f64);
+        let mut sim = Sim::new(cell.clone(), cell.fixed(0.45, 0.40, bound));
+        sim.run_until(Phase::Compact, 120.0);
+        sim.run(3.0 * 3600.0);
+        assert_eq!(sim.count(Event::Install), 1);
+        assert_eq!(sim.count(Event::Exit(Exit::E3)), 1);
+        assert_eq!(sim.count(Event::BuildStart), 1);
+        assert_eq!(sim.last.phase, Phase::Suspect);
+        let kept = sim.sel.z_realized.expect("the rate is kept");
+        assert!((kept - 0.40).abs() < 0.005, "{kept}");
+        // The raw form now faults at 0.9, which the model has not heard of:
+        // its 0.48 less the form's 0.40 is under the entry threshold, and the
+        // measured saving alone does not buy.
+        sim.load = cell.fixed(0.9, 0.40, bound);
+        sim.run(600.0);
+        assert_eq!(sim.count(Event::BuildStart), 1);
+        // Once the model says so too the form pays, 0.9 against 0.40, and is
+        // bought again and stays.
+        sim.phi_raw_override = Some(0.9);
+        sim.run(600.0);
+        assert_eq!(sim.count(Event::BuildStart), 2);
+        assert_eq!(sim.last.phase, Phase::Compact);
+        assert_eq!(sim.sel.z_realized, None, "a new install is judged afresh");
+        assert_eq!(sim.count(Event::Exit(Exit::E3)), 1);
+    }
+
+    #[test]
+    fn the_rate_kept_goes_with_the_episode() {
+        // Left by E3 and then the store fits (the limit is lifted): the next
+        // episode starts from the model's word again.
+        let cell = Cell::ten_million();
+        let bound = cell.bound(cell.z as f64 / PAGE as f64);
+        let mut sim = Sim::new(cell.clone(), cell.fixed(0.45, 0.40, bound));
+        sim.run_until(Phase::Compact, 120.0);
+        sim.run(2.0 * sim.sel.dwell().as_secs_f64());
+        assert!(sim.sel.z_realized.is_some());
+        sim.phi_raw_override = Some(0.0);
+        sim.load = Load::Idle;
+        sim.run(60.0);
+        assert_eq!(sim.last.phase, Phase::Fits);
+        assert_eq!(sim.sel.z_realized, None);
+    }
+
+    #[test]
+    fn the_rate_kept_is_the_whole_stretchs_and_not_the_last_second() {
+        // Seconds at 0.40 and seconds at 0.50 a read, neither paying: what is
+        // kept is what the stretch took, weighted by the reads each second
+        // made, and not the second the exit happened to fall in.
+        let cell = Cell::ten_million();
+        let bound = cell.bound(cell.z as f64 / PAGE as f64);
+        let mut sim = Sim::new(cell.clone(), cell.fixed(0.45, 0.40, bound));
+        sim.run_until(Phase::Compact, 120.0);
+        sim.run_with(2.0 * sim.sel.dwell().as_secs_f64(), |s| {
+            let z = if (s.n / TICK).is_multiple_of(2) {
+                0.40
+            } else {
+                0.50
+            };
+            s.load = s.cell.fixed(0.45, z, bound);
+        });
+        sim.first(Event::Exit(Exit::E3));
+        let (a, b) = (cell.rate(cell.t_z, 0.40), cell.rate(cell.t_z, 0.50));
+        let want = (a.ops_per_s * 0.40 + b.ops_per_s * 0.50) / (a.ops_per_s + b.ops_per_s);
+        let kept = sim.sel.z_realized.expect("the rate is kept");
+        assert!((kept - want).abs() < 0.01, "{kept} against {want}");
+    }
+
+    #[test]
+    fn a_form_that_took_few_faults_leaves_no_floor_under_the_model() {
+        // E3 can fire because the raw form stopped faulting (the cache grew)
+        // and not because the compact form does: what it took is then under
+        // the model's prediction, and the model's word stands.
+        let cell = Cell::ten_million();
+        let bound = cell.bound(cell.z as f64 / PAGE as f64);
+        let mut sim = Sim::new(cell.clone(), cell.uniform());
+        sim.run_until(Phase::Compact, 120.0);
+        sim.phi_raw_override = Some(0.05);
+        sim.load = cell.fixed(0.05, 0.0, bound);
+        sim.run(2.0 * sim.sel.dwell().as_secs_f64());
+        sim.first(Event::Exit(Exit::E3));
+        assert_eq!(sim.sel.z_realized, Some(0.0));
     }
 
     #[test]
