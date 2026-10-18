@@ -1421,6 +1421,176 @@ fn a_promotion_that_closes_a_fence_keeps_the_sidecar_of_the_partition_it_renames
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// How many pages of `[off, off + len)` of the file at `path` the page cache
+/// holds: `mincore` over a mapping of the file's own that touches nothing.
+#[cfg(target_os = "linux")]
+fn cached_pages(path: &Path, off: usize, len: usize) -> usize {
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::File::open(path).unwrap();
+    let size = f.metadata().unwrap().len() as usize;
+    // SAFETY: a read-only shared mapping of the whole file, advised over a
+    // range inside it, and unmapped before it returns; nothing reads it.
+    unsafe {
+        let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+        let base = libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            f.as_raw_fd(),
+            0,
+        );
+        assert_ne!(base, libc::MAP_FAILED, "mapping {}", path.display());
+        let (first, last) = (off / page, (off + len).div_ceil(page));
+        let mut vec = vec![0u8; last - first];
+        let r = libc::mincore(
+            (base as usize + first * page) as *mut libc::c_void,
+            (last - first) * page,
+            vec.as_mut_ptr().cast(),
+        );
+        let err = std::io::Error::last_os_error();
+        libc::munmap(base, size);
+        assert_eq!(r, 0, "mincore: {err}");
+        vec.iter().filter(|b| **b & 1 != 0).count()
+    }
+}
+
+/// The file's pages dropped from the page cache, as far as the cache lets a
+/// clean page go.
+#[cfg(target_os = "linux")]
+fn evict(path: &Path) {
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::File::open(path).unwrap();
+    f.sync_all().unwrap();
+    // SAFETY: a hint about a file this function holds open.
+    unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_point_read_from_the_sidecar_touches_no_page_of_the_raw_records() {
+    // What the form is for: a covered partition's read is answered from the
+    // sidecar's page, so the raw records and their directory, which are the
+    // pages a store that does not fit misses on, are not read. Measured
+    // against the page cache: the partition's file is dropped from it, and
+    // the pages of the record region and the directory that it holds are
+    // counted before the reads and after them. The control is the same
+    // store without the form, read the same way, which has to be found
+    // reading them, or the probe is not seeing what it is claimed to see (a
+    // file system that keeps every page, or a cache that was not dropped,
+    // are the usual reasons; point `TMPDIR` at a disk).
+    //
+    // Both stores are loaded and left open in this process and not
+    // reopened: an open walks the records of a segment it did not write
+    // (the Bloom, the tombstone flag, the index's checksum row), and a file
+    // that was just read is not cold.
+    struct Store {
+        db: Db,
+        seg: PathBuf,
+        keys: Vec<Vec<u8>>,
+        model: Model,
+        rec: (usize, usize),
+        dir: (usize, usize),
+    }
+    let build = |name: &str, opts: Options| {
+        let dir = scratch(name);
+        let mut db = Db::create(&dir, opts).unwrap();
+        let model = ordered_load(&mut db, 8000, 0xC01D);
+        db.zpages_settle().unwrap();
+        let seg = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                let n = p.file_name().unwrap().to_string_lossy().into_owned();
+                n.starts_with("par-") && n.ends_with(".sup")
+            })
+            .expect("the partition's file");
+        // Where the records and the directory lie in the file, from the
+        // segment as the layout reads it.
+        let src = MmapBytes::open(&seg).unwrap();
+        let blob = Blob::open(MmapBytes::open(&seg).unwrap()).unwrap();
+        let off = blob.index_offset();
+        let sec = src.slice_at(off, (src.len() - off) as usize).unwrap();
+        let idx = FlatIndex::parse(sec).expect("a flat index");
+        let (recs, d) = idx.regions(sec).unwrap();
+        let at = |s: &[u8]| {
+            (
+                off as usize + (s.as_ptr() as usize - sec.as_ptr() as usize),
+                s.len(),
+            )
+        };
+        let (rec, dir) = (at(recs), at(d));
+        drop((blob, src));
+        let keys = model.keys().cloned().collect();
+        Store {
+            db,
+            seg,
+            keys,
+            model,
+            rec,
+            dir,
+        }
+    };
+    let cached = |s: &Store| {
+        (
+            cached_pages(&s.seg, s.rec.0, s.rec.1),
+            cached_pages(&s.seg, s.dir.0, s.dir.1),
+        )
+    };
+    // The reads: present keys, read and counted, and some that are not there.
+    let reads = |s: &Store| {
+        for k in s.keys.iter().step_by(13) {
+            assert_eq!(read_vec(&s.db, k), s.model[k]);
+            assert_eq!(s.db.count(k).unwrap(), 1);
+        }
+        for i in 0..100 {
+            let absent = format!("key-{:08}", i * 3 + 1).into_bytes();
+            assert!(read_vec(&s.db, &absent).is_empty());
+        }
+    };
+    let sidecar = build("cold-z", forced(|_| {}));
+    let raw = build("cold-raw", Options::default());
+    let region_pages = sidecar.rec.1.div_ceil(4096);
+    assert!(region_pages > 150, "{region_pages} pages of records");
+    for s in [&sidecar, &raw] {
+        evict(&s.seg);
+        let cold = cached(s);
+        assert!(
+            cold.0 * 4 < region_pages,
+            "the records were not dropped from the cache ({} of {region_pages} pages cached): \
+             the probe cannot tell",
+            cold.0
+        );
+    }
+
+    // The sidecar's reads.
+    let cold = cached(&sidecar);
+    reads(&sidecar);
+    let c = sidecar.db.zpage_counts();
+    assert_eq!((c.rawserves, c.fallbacks), (0, 0), "{c:?}");
+    assert!(c.reads + c.counts >= 2 * 8000 / 13, "{c:?}");
+    assert_eq!(
+        cached(&sidecar),
+        cold,
+        "pages of the raw records or directory were read to answer from the sidecar"
+    );
+
+    // The control: the raw form, the same reads.
+    let cold = cached(&raw);
+    reads(&raw);
+    let after = cached(&raw);
+    assert_eq!(raw.db.zpage_counts().reads, 0);
+    assert!(
+        after.0 > cold.0 + region_pages / 2,
+        "the raw reads cached {} of {region_pages} record pages: the probe does not see them",
+        after.0 - cold.0
+    );
+    for d in [&sidecar, &raw] {
+        let _ = std::fs::remove_dir_all(d.seg.parent().unwrap());
+    }
+}
+
 #[test]
 fn handles_on_threads_read_through_the_sidecars_and_their_counts_sum() {
     let dir = scratch("threads");
