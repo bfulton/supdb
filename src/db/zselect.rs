@@ -37,18 +37,41 @@
 //! **S1, the model**, arrives on the first step of each [`S1_PERIOD`] in
 //! every phase: the raw form's predicted faults a read (`phi_raw`), the
 //! compact form's (`phi_z`, once a sampler has said how large it is), and the
-//! pressure of the group's refaults. It is out of band and free, and it
-//! decides whether anything is counted at all.
+//! group's refault rate. It is out of band and free, and it decides whether
+//! anything is counted at all. A reading that comes less than a period (less
+//! one census interval) after the last is kept for the rules and is not a
+//! tick, so the ticks that FITS, SUSPECT and the smoothing count in are
+//! seconds whatever the caller's cadence.
 //!
 //! **S2, the census**, arrives on every step outside FITS (the handles run
-//! none in FITS, and what it carries there is ignored): the operations the
-//! handles ran and the major faults they took, per class (point reads and
-//! counts; scans), summed over the handles' valid windows. A major fault is
-//! the one thing the engine cannot see from inside a lookup, and it is counted
-//! from the thread's own counters and not timed. S1 only decides whether to
-//! count; S2 decides whether to switch. A skewed workload on a store far
-//! larger than its cache is SUSPECT at the price of a countdown and never
-//! builds, because its census shows no capacity misses.
+//! none in FITS, and a census, a sampler's reading or a footprint that comes
+//! then is not read): the operations the handles ran and the major faults
+//! they took, per class (point reads and counts; scans), summed over the
+//! handles' valid windows. A major fault is the one thing the engine cannot
+//! see from inside a lookup, and it is counted from the thread's own counters
+//! and not timed. S1 only decides whether to count; S2 decides whether to
+//! switch. A skewed workload on a store far larger than its cache is SUSPECT
+//! at the price of a countdown and never builds, because its census shows no
+//! capacity misses. The census times the form the gate serves, so the cost of
+//! a hit is taken from it only while the raw form serves, and the cost of a
+//! compact read only while the compact form does.
+//!
+//! **The group's refaults** are the platform's counter for the whole group
+//! and the store's own refaults are in it, whichever form serves them: the
+//! selector is not told how many are the store's and subtracts none. The
+//! pressure term (over [`PRESSURE_REFAULTS_PER_S`]) therefore says the group
+//! is refaulting, not that a neighbour is, and it moves with the gate, since
+//! the compact form takes away the refaults the raw form made. A store that
+//! reads fast enough to buy the form is over it by its own refaults alone:
+//! the evidence is half its faults as refaults, and the entry threshold is a
+//! saving of that many faults a read. So the term opens the build clause (the
+//! measured saving still decides) and keeps E1 from acting while it is on,
+//! since the model's word is in doubt then; E3 is not stopped by it, because
+//! the compact form's own faults are among the refaults it counts. The
+//! model's word that the store fits is checked against the raw form's
+//! measured faults when the compact form takes over (see the bullet on the
+//! model's error), and a form bought against that word is left by E3 or by a
+//! trial.
 //!
 //! The caller steps once per [`CENSUS_INTERVAL`]. The rings that hold a
 //! window of history are sized for that cadence; a caller that steps faster
@@ -60,19 +83,20 @@
 //! |---|---|---|
 //! | FITS | SUSPECT | `phi_raw >= theta_sus` or the pressure term, on [`FITS_TO_SUSPECT_TICKS`] consecutive S1 ticks |
 //! | SUSPECT | FITS | `phi_raw < theta_sus / 2` and no pressure, on [`SUSPECT_TO_FITS_TICKS`] consecutive ticks |
-//! | SUSPECT | building | all of (a) `excess >= C_build`; (b) the predicted saving `phi_raw - phi_z >= theta_enter`, unless the pressure term is on, and the measured saving `phi_meas - phi_z >= theta_enter` in some class; (c) `phi_raw >= theta_sus` or the pressure term; (d) a [`ZSelect::dwell`] since the last switch; (e) the sampler has not declined, and the wasted-build budget has not suspended building |
-//! | building | SUSPECT | the measured saving is under `theta_enter / 2` in every class with evidence, on [`VANISH_INTERVALS`] evidence intervals; or the budget trips. The build is cancelled and **counts as a switch** |
+//! | SUSPECT | building | all of (a) `excess >= C_build`; (b) the predicted saving `phi_raw - phi_z >= theta_enter`, unless the pressure term is on, and the measured saving `phi_meas - phi_z >= theta_enter` in some class; (c) `phi_raw >= theta_sus` or the pressure term; (d) a [`ZSelect::dwell`] since the last switch; (e) the sampler has a reading of the partitions as they are, has not declined them, and the wasted-build budget has not suspended building |
+//! | building | SUSPECT | the measured saving is under `theta_enter / 2` in every class with evidence, on [`VANISH_INTERVALS`] evidence intervals; or the budget trips; or the sampler declines the partitions. The build is cancelled and **counts as a switch** |
 //! | building | COMPACT | sidecars attached for at least [`COVERED_ENOUGH`] of the covered footprint |
-//! | COMPACT | SUSPECT | **E1** the maximum of the smoothed `phi_raw` over a dwell is under `theta_sus / 2`, and the pressure term is off throughout; **E3** the realized saving `phi_raw - phi_meas_z` stays under `saving*` for a dwell, the form watched and the pressure term off throughout; **E2** the trial says the raw form fits |
+//! | COMPACT | SUSPECT | **E1** the maximum of the smoothed `phi_raw`, with the part of the model's error that is positive added, over a dwell is under `theta_sus / 2`, the pressure term is off throughout, and the scans have not been held against the model; **E3** the realized saving, the raw form's believed rate less `phi_meas_z`, stays under `saving*` for a dwell; **E2** the trial says the raw form fits |
 //! | COMPACT | trial | the z faults a read are under `theta_sus` and the raw footprint of the pages touched is under half the budget, on [`E2_MEASURES`] consecutive measures of [`E2_MEASURE`], a dwell since the last switch, and the back-off has run |
-//! | trial | COMPACT | the refilled raw form still faults: its saving over the compact form is at least `theta_enter`. The back-off doubles |
+//! | trial | COMPACT | the refilled raw form still faults: its saving over the compact form's predicted rate, `phi_meas - phi_z`, is at least `theta_enter`. The back-off doubles |
 //! | trial | SUSPECT | it does not: E2. The sidecars are retained |
 //!
 //! `saving* = (t_z - t_hit) / t_f` is the fall in faults an operation at which
 //! the compact form's extra CPU is exactly repaid by the faults it removes,
 //! one per class. Every threshold is a multiple of it, so nothing here is a
 //! rate typed in: the costs are measured by the census and the sampler, and
-//! [`Costs::PRIOR`] stands in only until they are.
+//! [`Costs::PRIOR`] stands in only until they are. The extra CPU is never
+//! taken as less than [`SAVING_FLOOR_SHARE`] of the prior's.
 //!
 //! # What each rule is for
 //!
@@ -84,9 +108,8 @@
 //!   loss is at most twice the price whenever the workload stops. It cannot go
 //!   below zero: a stretch where the form would have lost does not owe the
 //!   next stretch anything, which is the cumulative-sum statistic and not a
-//!   running balance (a balance would take hours to climb out of a long hot
-//!   stretch). It halves for every dwell without evidence, so a stale rent is
-//!   not a credit.
+//!   running balance. It halves for every dwell without evidence, so a stale
+//!   rent is not a credit.
 //! * **Evidence is a capacity miss, not a first touch.** After a restart every
 //!   first touch is a major fault and the rate reads as a footprint loss until
 //!   the hot set is resident. An interval counts only if the trailing
@@ -101,32 +124,48 @@
 //! * **Hysteresis is the gap between the way in and the way out.** SUSPECT is
 //!   entered at `theta_sus` and left at half of it, a build starts at
 //!   `theta_enter` and is cancelled at half of it, and COMPACT is left only
-//!   after a signal has stayed on its side for a dwell, so a signal that
-//!   hovers at a threshold changes nothing.
-//! * **Pressure stands in for a model that cannot see.** The model prices this
-//!   store against the whole budget, and another reader of the group takes
-//!   cache the model does not subtract. The pressure term, the group's
-//!   refaults above [`PRESSURE_REFAULTS_PER_S`], enters SUSPECT and opens the
-//!   build clause where the model says FITS, and the measured saving still
-//!   decides to buy. While it is on, neither E1 nor E3 takes the form back on
-//!   the model's word, since the model's raw rate is what it says is wrong; a
-//!   form opened by it would otherwise be left a dwell later and opened again.
+//!   after a signal has stayed on its side for a dwell.
+//! * **A controller facing constant inputs comes to rest.** Whatever the
+//!   inputs depend on, the gate included, a workload that does not change
+//!   makes no switch after the first dwells: a form that pays stays, one that
+//!   does not is not kept, and the raw form is tried at the trial's back-off
+//!   and no oftener. The tests hold this over a grid of caches, neighbours,
+//!   threads and loads, with the group's refaults as the group has them.
+//! * **The model's error is kept.** The model prices this store against the
+//!   whole budget, and another reader of the group takes cache it does not
+//!   subtract. When the compact form takes over, and again when a trial finds
+//!   the raw form still faulting, the raw form's measured faults a read (the
+//!   point reads, over the trailing window) are set against the model's word;
+//!   where they differ by at least `theta_sus` the difference is the model's
+//!   error, and it is kept for as long as the form stands. The compact form is
+//!   judged against the model's word corrected by it: E3 reads the corrected
+//!   rate, so a form is kept while it beats the raw form as measured and left
+//!   when it does not, whether the model said more or less than the census
+//!   saw, and E1 adds the positive part to the model's word, so a model that
+//!   said the store fits while the raw form faulted is not believed that it
+//!   fits once the form has removed the refaults that showed it. Scans have
+//!   no rate in the model, only its word that the store fits: scans that
+//!   fault at `theta_sus` of their class against that word keep E1 from
+//!   acting, and E3, which reads the point reads, has nothing to say of a
+//!   store that only scans.
+//! * **A form E3 left is not bought again on the model's word.** The faults
+//!   the form took through the stretch E3 acted on stand as its rate, where
+//!   they are above the model's, until it is installed again or the store is
+//!   FITS; the build clause and the evidence price the form at that.
 //! * **The trial judges the refilled state.** The raw form's hot pages are
-//!   cold after the compact form displaced them, and a cold fill faults at one
-//!   a read whatever the hot set, so the trial waits for its faults to reach
-//!   the pages the raw form needs, or for the time they take, or for the rate
-//!   to settle under the threshold, and only then takes three evidence
+//!   cold after the compact form displaced them, and a cold fill faults at
+//!   one a read whatever the hot set, so the trial waits for its faults to
+//!   reach the pages the raw form needs, or for the time they take, or for the
+//!   rate to settle under the threshold, and only then takes three evidence
 //!   intervals as the verdict. A trial that has no evidence to decide on is
 //!   undone after a dwell, since the compact form it came from is attached
 //!   and the raw form must not be left serving a store nothing reads.
-//! * **A form seen not to pay is not bought again on the model's word.** E3
-//!   leaves a form whose measured faults are not enough under the raw form's.
-//!   The model that predicted otherwise predicts it still, and a SUSPECT that
-//!   believed it would buy the form again as soon as a dwell had passed and
-//!   leave it a dwell later, for as long as the store stayed out of FITS. The
-//!   faults the form took through the stretch E3 acted on stand as its rate,
-//!   where they are above the model's, until it is installed again or the
-//!   store is FITS; the build clause and the evidence price the form at that.
+//! * **A reading is of what it was taken of.** The sampler's reading carries
+//!   the generation of the partitions it was taken at and is dropped when they
+//!   change; it is dropped when the sidecars it priced are retired; and a
+//!   decline stands for a dwell, after which the sampler is asked again. The
+//!   footprint is the compact form's bitmaps, and goes when the form does. A
+//!   sampler that declines the partitions while a build is under way ends it.
 //! * **The budget counts wasted builds.** A store written across its key
 //!   space rewrites every partition each cycle, at a rate that can exceed one
 //!   serial builder, so each rewrite supersedes the build of the partition it
@@ -170,6 +209,14 @@ pub const VANISH_FACTOR: f64 = 0.5;
 /// the displacement is measured it is this share of the CPU
 /// ([`ski_rental_price`]).
 pub const DISPLACEMENT_FACTOR: f64 = 0.5;
+/// The compact form reads a page-sized group, so it costs more than a hit by
+/// at least a share of what the priors say it does ([`PRIOR_T_Z`] less
+/// [`PRIOR_T_HIT`]); `saving*` is made of the measured difference but never of
+/// less than this share of the prior's. Two instruments measure the two costs
+/// and a difference they cannot resolve is not a free form: without the floor
+/// a form measured to cost no more than a hit makes every threshold zero,
+/// and a model that reads exactly zero for a store that fits would be hot.
+pub const SAVING_FLOOR_SHARE: f64 = 0.25;
 
 // ---- evidence ----------------------------------------------------------
 
@@ -182,9 +229,10 @@ pub const REFAULT_WINDOW: Duration = Duration::from_secs(5);
 /// The valid operations of one class an interval must hold before its rate
 /// says anything: below it a rate is a handful of faults and not a measure.
 pub const MIN_EVIDENCE_OPS: u64 = 64;
-/// The group's refaults a second above which the pressure term is on: other
-/// readers are taking the cache, and the model, which prices this store
-/// against the whole budget, cannot see them.
+/// The group's refaults a second above which the pressure term is on: the
+/// group is refaulting, the store's own faults and other readers' alike, and
+/// the model, which prices this store against the whole budget, cannot say
+/// that the store fits.
 pub const PRESSURE_REFAULTS_PER_S: f64 = 256.0;
 
 // ---- cadence and hysteresis in ticks ------------------------------------
@@ -444,13 +492,15 @@ pub struct Costs {
     /// over windows with no commit in them, or the sampler's timed cold
     /// touches where none has been seen.
     pub t_f: Option<f64>,
-    /// A point read that hits: the least CPU a read has taken in any window.
+    /// A point read that hits: the least CPU a read has taken in any window
+    /// the raw form served. A census that measured it under the compact form
+    /// has measured something else, and the selector does not take it there.
     pub t_hit: Option<f64>,
-    /// A scan that hits.
+    /// A scan that hits, as `t_hit`.
     pub t_hit_scan: Option<f64>,
-    /// A point read through the compact form.
+    /// A point read through the compact form, measured in windows it served.
     pub t_z: Option<f64>,
-    /// A scan through the compact form.
+    /// A scan through the compact form, as `t_z`.
     pub t_z_scan: Option<f64>,
 }
 
@@ -464,6 +514,11 @@ impl Costs {
         t_z: Some(PRIOR_T_Z),
         t_z_scan: Some(PRIOR_T_Z_SCAN),
     };
+
+    /// The priors of a point read and a scan that hit, by [`Class`].
+    const PRIOR_HIT: [f64; 2] = [PRIOR_T_HIT, PRIOR_T_HIT_SCAN];
+    /// The priors of a point read and a scan through the compact form.
+    const PRIOR_Z: [f64; 2] = [PRIOR_T_Z, PRIOR_T_Z_SCAN];
 
     /// Each field of `self` where it is a usable cost (finite and positive),
     /// else the field of `other`.
@@ -492,7 +547,9 @@ pub struct Model {
     pub phi_z_scan: Option<f64>,
     /// The group's refaults a second over the tick (`workingset_refault_file`
     /// where the platform has it); the pressure term compares it with
-    /// [`PRESSURE_REFAULTS_PER_S`].
+    /// [`PRESSURE_REFAULTS_PER_S`]. It is the group's as the platform counts
+    /// it: the store's own refaults are in it, and none are subtracted, since
+    /// the counter does not say whose they are.
     pub refault_rate: f64,
     /// The cache budget `B`, bytes: the limit less the anonymous memory less
     /// the margin.
@@ -519,8 +576,9 @@ impl Model {
 }
 
 /// What the build sampler said about the partitions as they stand. The caller
-/// sets [`Input::sampler`] after [`Decision::sample`] asks, and again whenever
-/// its reading changes.
+/// sets [`Input::sampler`] after [`Decision::sample`] asks; the reading is of
+/// the partitions at [`Sampler::generation`], and a change of
+/// [`Input::generation`] is the selector's reason to ask again.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sampler {
     /// The sampler's cold estimates of the costs.
@@ -531,6 +589,9 @@ pub struct Sampler {
     /// The sampler declined the partitions: the form would not pay for its
     /// footprint, or the data does not compress.
     pub declined: bool,
+    /// The [`Input::generation`] the reading was taken at: the partitions it
+    /// is a reading of.
+    pub generation: u64,
 }
 
 impl Sampler {
@@ -551,7 +612,10 @@ pub struct Census {
     /// Pages of the group's file cache that were read back after being
     /// reclaimed, over the interval; `None` where the platform has no counter,
     /// and the evidence rule then falls back to the faults taken since
-    /// SUSPECT against the cache's size in pages.
+    /// SUSPECT against the cache's size in pages. The group's, as
+    /// [`Model::refault_rate`] is: a neighbour's refaults are counted, and
+    /// the share the evidence rule takes is the group's refaults against the
+    /// store's faults.
     pub refaults: Option<u64>,
     /// Threads that contributed valid windows: the trial's wall limit divides
     /// by it. 0 keeps the last non-zero count.
@@ -591,15 +655,27 @@ pub struct Input {
     pub now: Duration,
     /// The model, on the first step of each [`S1_PERIOD`] and `None` between.
     pub model: Option<Model>,
-    /// The sampler's reading, when the caller has a new one; the selector
-    /// keeps the last.
+    /// The sampler's reading, when the caller has a new one. The selector
+    /// keeps it while it stands for the partitions as they are, and drops it
+    /// when they change, when the sidecars it priced are retired, and, if it
+    /// declined, after a dwell: each time [`Decision::sample`] asks for
+    /// another. A reading taken at another [`Input::generation`] is of other
+    /// partitions and is not kept.
     pub sampler: Option<Sampler>,
+    /// The identity of what the sampler's reading is a reading of, an opaque
+    /// number: it changes when a partition is made, rewritten or retired (a
+    /// merge, a promotion) and when a sidecar is attached or retired, since
+    /// the price of buying the form is what is built and what is not; it does
+    /// not change for a piece a seal adds. It is compared for equality and
+    /// nothing else, and the caller sets it at every step.
+    pub generation: u64,
     /// This interval's census.
     pub census: Census,
     /// The builder's report.
     pub build: Build,
     /// E2's bound: the raw footprint, bytes, of the compact pages the handles
-    /// have touched, from their bitmaps; the last reading is kept.
+    /// have touched, from their bitmaps. The last reading is kept while the
+    /// compact form stands, and goes with it: the bitmaps are of its pages.
     pub footprint: Option<u64>,
 }
 
@@ -659,8 +735,9 @@ pub enum Event {
     /// Building to SUSPECT: the evidence vanished. A switch; the trial
     /// back-off doubles.
     BuildCancelled,
-    /// Building to SUSPECT: the wasted-build budget tripped. A switch;
-    /// building is suspended for a dwell.
+    /// Building to SUSPECT: the build was given up, because the wasted-build
+    /// budget tripped (and building is suspended for a dwell) or because the
+    /// sampler declined the partitions. A switch.
     BuildAbandoned,
     /// Building to COMPACT. A switch.
     Install,
@@ -697,7 +774,8 @@ pub struct Decision {
     pub gate: u8,
     /// Whether handles run the census.
     pub census: bool,
-    /// Whether the sampler's reading is wanted: SUSPECT without one.
+    /// Whether the sampler's reading is wanted: SUSPECT without one of the
+    /// partitions as they are.
     pub sample: bool,
     /// Whether uncovered partitions may be built: building, or COMPACT unless
     /// the wasted-build budget has suspended it.
@@ -745,6 +823,17 @@ pub struct Counts {
 
 // ---- the state ----------------------------------------------------------
 
+/// Why a build in flight was given up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cancel {
+    /// The measured saving has gone.
+    Vanished,
+    /// The wasted-build budget tripped.
+    Budget,
+    /// The sampler declined the partitions.
+    Declined,
+}
+
 /// A window of history: the values of the last stretch of time, oldest first,
 /// in a fixed array. Holding `N` and no more means a caller that steps faster
 /// than the cadence shortens the window and cannot grow the selector.
@@ -790,6 +879,20 @@ impl<T: Copy + Default, const N: usize> Ring<T, N> {
     fn iter(&self) -> impl Iterator<Item = &(Duration, T)> + '_ {
         (0..self.len).map(move |k| &self.buf[(self.head + k) % N])
     }
+}
+
+/// What one census interval adds to the trailing window the evidence rule
+/// and the raw form's measured rate read.
+#[derive(Clone, Copy, Debug, Default)]
+struct Seen {
+    /// The group's refaults over the interval.
+    refaults: u64,
+    /// The store's major faults over the interval, both classes.
+    faults: u64,
+    /// The point reads of the interval.
+    reads: Window,
+    /// The scans of the interval.
+    scans: Window,
 }
 
 /// The refault window at the census cadence, with room to spare.
@@ -878,11 +981,30 @@ pub struct ZSelect {
     /// The latest `now` seen.
     now: Duration,
     model: Option<Model>,
+    /// When the last model reading that counted as a tick arrived.
+    last_tick: Option<Duration>,
     sampler: Option<Sampler>,
+    /// When the sampler's reading arrived.
+    sampler_at: Duration,
+    /// The generation of the partitions, as the input last said.
+    generation: u64,
     /// The compact form's faults a read as the stretch E3 acted on measured
     /// them: kept after the exit as a floor under the model's prediction,
     /// until the form is installed again or the store is FITS.
     z_realized: Option<f64>,
+    /// The model's error about the raw form's point reads, as the census
+    /// found it when the compact form took over or a trial last tried the raw
+    /// form: what it measured less what the model said, where they differed by
+    /// at least `theta_sus`, else nothing. The compact form is judged against
+    /// the model's word corrected by it ([`ZSelect::raw_belief`]), so a model
+    /// that over-predicted does not keep a form the raw form beat, and one
+    /// that said the store fits while a neighbour took the cache is not
+    /// believed once the neighbour's refaults are gone from the counter: E1
+    /// reads only the part of the error that is positive.
+    bias: f64,
+    /// The census saw the raw form's scans fault while the model said the
+    /// store fits: its word that the store fits is not believed (E1).
+    scans_against: bool,
     measured: Costs,
     footprint: Option<u64>,
     threads: u32,
@@ -891,10 +1013,12 @@ pub struct ZSelect {
     /// Consecutive calm S1 ticks (SUSPECT).
     calm_ticks: u32,
     smooth: Ring<f64, SMOOTH_CAP>,
-    /// Since when the smoothed model has been under `theta_sus / 2` (E1).
+    /// Since when the smoothed model, with the positive part of its error
+    /// added, has been under `theta_sus / 2` and the group has not been
+    /// refaulting (E1).
     low_since: Option<Duration>,
-    /// (refaults, faults) a step, over the trailing [`REFAULT_WINDOW`].
-    share: Ring<(u64, u64), SHARE_CAP>,
+    /// What the census saw a step, over the trailing [`REFAULT_WINDOW`].
+    share: Ring<Seen, SHARE_CAP>,
     faults_since_suspect: u64,
     excess: f64,
     /// When evidence was last added or the excess last halved.
@@ -931,8 +1055,13 @@ impl ZSelect {
             phase: Phase::Fits,
             now: Duration::ZERO,
             model: None,
+            last_tick: None,
             sampler: None,
+            sampler_at: Duration::ZERO,
+            generation: 0,
             z_realized: None,
+            bias: 0.0,
+            scans_against: false,
             measured: Costs::default(),
             footprint: None,
             threads: 1,
@@ -1008,10 +1137,13 @@ impl ZSelect {
 
     /// `saving*` for a class: the fall in faults an operation at which the
     /// compact form's extra CPU is exactly repaid by the faults it removes.
-    /// Zero for a form that costs no more than a hit.
+    /// The extra CPU is the measured difference, and never less than
+    /// [`SAVING_FLOOR_SHARE`] of the prior's.
     pub fn saving_star(&self, class: Class) -> f64 {
         let p = self.priced();
-        ((p.z[class.ix()] - p.hit[class.ix()]) / p.t_f).max(0.0)
+        let i = class.ix();
+        let floor = SAVING_FLOOR_SHARE * (Costs::PRIOR_Z[i] - Costs::PRIOR_HIT[i]);
+        (p.z[i] - p.hit[i]).max(floor) / p.t_f
     }
 
     /// `theta_enter` for a class: [`ENTER_FACTOR`] times `saving*`.
@@ -1029,7 +1161,7 @@ impl ZSelect {
         let now = input.now.max(self.now);
         self.now = now;
         self.counts.steps += 1;
-        let tick = self.absorb(input);
+        let tick = self.absorb(input, now);
         if tick {
             self.read_s1(now);
         }
@@ -1051,40 +1183,91 @@ impl ZSelect {
             self.suspend(now);
         }
         let retire = self.retire(now);
+        // A decline is a statement about the partitions and the budget as they
+        // were, and neither stands still: it holds for a dwell, and then the
+        // sampler is asked again.
+        if self
+            .sampler
+            .is_some_and(|s| s.declined && now.saturating_sub(self.sampler_at) >= self.dwell())
+        {
+            self.sampler = None;
+        }
         self.decide(now, event, retire)
     }
 
     // ---- readings ------------------------------------------------------
 
     /// Keeps what the input carries that outlives the step. True if a model
-    /// reading arrived.
-    fn absorb(&mut self, input: &Input) -> bool {
-        self.measured = input.census.costs.or(self.measured);
-        if input.census.threads > 0 {
-            self.threads = input.census.threads;
+    /// reading arrived that counts as a tick: one a period after the last, to
+    /// within a census interval. A caller that supplies the model faster than
+    /// that has its readings kept and its ticks counted at the period, so the
+    /// ticks that FITS, SUSPECT and the smoothing count in are seconds.
+    fn absorb(&mut self, input: &Input, now: Duration) -> bool {
+        self.generation = input.generation;
+        if self
+            .sampler
+            .is_some_and(|s| s.generation != self.generation)
+        {
+            self.sampler = None;
         }
-        self.counts.mixed_windows = self.counts.mixed_windows.saturating_add(input.census.mixed);
-        if let Some(s) = input.sampler {
-            match s.sanitized() {
-                Some(s) => self.sampler = Some(s),
-                None => self.counts.ignored += 1,
-            }
-        }
-        if let Some(f) = input.footprint {
-            self.footprint = Some(f);
+        // In FITS the handles run no census, nothing is sampled and no
+        // footprint is kept: whatever the input carries of them is not a
+        // reading of anything. Only the model is read.
+        if self.phase != Phase::Fits {
+            self.absorb_census(input);
         }
         match input.model {
             None => false,
             Some(m) => match m.sanitized() {
                 Some(m) => {
                     self.model = Some(m);
-                    true
+                    let due = self.last_tick.is_none_or(|t| {
+                        now.saturating_sub(t).saturating_add(CENSUS_INTERVAL) >= S1_PERIOD
+                    });
+                    if due {
+                        self.last_tick = Some(now);
+                    }
+                    due
                 }
                 None => {
                     self.counts.ignored += 1;
                     false
                 }
             },
+        }
+    }
+
+    /// Keeps what the census, the sampler and the footprint carry that
+    /// outlives the step. The census measured the form the gate served: its
+    /// cost of a hit is a measure of the raw form's and its cost of a compact
+    /// read of the compact form's, and each is taken in no other phase.
+    fn absorb_census(&mut self, input: &Input) {
+        let c = input.census.costs;
+        let raw_served = matches!(self.phase, Phase::Suspect | Phase::Building | Phase::Trial);
+        let z_served = self.phase == Phase::Compact;
+        let served = Costs {
+            t_f: c.t_f,
+            t_hit: c.t_hit.filter(|_| raw_served),
+            t_hit_scan: c.t_hit_scan.filter(|_| raw_served),
+            t_z: c.t_z.filter(|_| z_served),
+            t_z_scan: c.t_z_scan.filter(|_| z_served),
+        };
+        self.measured = served.or(self.measured);
+        if input.census.threads > 0 {
+            self.threads = input.census.threads;
+        }
+        self.counts.mixed_windows = self.counts.mixed_windows.saturating_add(input.census.mixed);
+        if let Some(s) = input.sampler {
+            match s.sanitized() {
+                Some(s) if s.generation == self.generation => {
+                    self.sampler = Some(s);
+                    self.sampler_at = self.now;
+                }
+                _ => self.counts.ignored += 1,
+            }
+        }
+        if let Some(f) = input.footprint {
+            self.footprint = Some(f);
         }
     }
 
@@ -1099,11 +1282,13 @@ impl ZSelect {
             .iter()
             .fold((0.0f64, 0u32), |(s, n), &(_, v)| (s + v, n + 1));
         let mean = sum / f64::from(n.max(1));
-        // The model has to say it fits, and no other reader of the group may
-        // be taking the cache the model prices this store against: where one
-        // is, the model's rate is the thing that is wrong, and the form it
-        // opened is not left on its word.
-        let below = mean < self.theta_sus(Class::Read) * RELAX_FACTOR && !self.pressure();
+        // E1 is the model's word that the store fits. It is believed unless
+        // it was caught saying less than the census saw, and not while the
+        // group is refaulting: where it is, the model's rate is the thing
+        // that is in doubt. A model that over-predicted is not made more
+        // certain by it, so only the positive error counts.
+        let below = mean + self.bias.max(0.0) < self.theta_sus(Class::Read) * RELAX_FACTOR
+            && !self.pressure();
         self.low_since = if below {
             self.low_since.or(Some(now))
         } else {
@@ -1139,6 +1324,50 @@ impl ZSelect {
         }
     }
 
+    /// The faults an operation of a class over the trailing window, as the
+    /// census saw them while the raw form served: what the raw form takes,
+    /// measured. None under [`MIN_EVIDENCE_OPS`] operations.
+    fn raw_seen_in(&self, class: Class) -> Option<f64> {
+        let mut w = Window::default();
+        for (_, s) in self.share.iter() {
+            w.add(match class {
+                Class::Read => s.reads,
+                Class::Scan => s.scans,
+            });
+        }
+        (w.ops >= MIN_EVIDENCE_OPS).then(|| w.phi())
+    }
+
+    /// Files what the census saw the raw form take against the model's word.
+    /// The model's word is about the point read: the reads' measured rate
+    /// less what it said is the model's error, kept where it is at least
+    /// `theta_sus`, the rate below which counting is not worth it, and
+    /// otherwise the model was right to within what is worth acting on. The
+    /// scans have no rate of their own in the model, only its word that the
+    /// store fits: a scan that faults at `theta_sus` of its class while the
+    /// model says the store fits is held against that word. Both hold for as
+    /// long as the form stands.
+    fn note_raw(&mut self, reads: Option<f64>, scans: Option<f64>) {
+        let said = self.model.map_or(0.0, |m| m.phi_raw);
+        let sus = self.theta_sus(Class::Read);
+        if let Some(r) = reads {
+            let off = r - said;
+            self.bias = if off.abs() >= sus { off } else { 0.0 };
+            // The stretch E1 has under way was measured without it.
+            self.low_since = None;
+        }
+        if said < sus && scans.is_some_and(|r| r >= self.theta_sus(Class::Scan)) {
+            self.scans_against = true;
+        }
+    }
+
+    /// What the raw form is believed to take a read, for judging the compact
+    /// form: the model's word for it, corrected by the model's error as the
+    /// census found it.
+    fn raw_belief(&self, said: f64) -> f64 {
+        (said + self.bias).max(0.0)
+    }
+
     /// The pressure term: the group's refaults are above the threshold at the
     /// latest reading.
     fn pressure(&self) -> bool {
@@ -1170,14 +1399,19 @@ impl ZSelect {
     fn evidence(&mut self, census: &Census, now: Duration) -> Evidence {
         let faults = census.reads.faults.saturating_add(census.scans.faults);
         self.faults_since_suspect = self.faults_since_suspect.saturating_add(faults);
-        self.share.push(now, (census.refaults.unwrap_or(0), faults));
+        self.share.push(
+            now,
+            Seen {
+                refaults: census.refaults.unwrap_or(0),
+                faults,
+                reads: census.reads,
+                scans: census.scans,
+            },
+        );
         self.share.expire(now, REFAULT_WINDOW);
-        let (refaults, total) = self
-            .share
-            .iter()
-            .fold((0u64, 0u64), |(r, f), &(_, (dr, df))| {
-                (r.saturating_add(dr), f.saturating_add(df))
-            });
+        let (refaults, total) = self.share.iter().fold((0u64, 0u64), |(r, f), (_, s)| {
+            (r.saturating_add(s.refaults), f.saturating_add(s.faults))
+        });
         let share_ok = if census.refaults.is_some() {
             refaults as f64 >= REFAULT_SHARE * total as f64
         } else {
@@ -1260,6 +1494,9 @@ impl ZSelect {
         self.share.clear();
         self.vanished = 0;
         self.trial = None;
+        self.bias = 0.0;
+        self.scans_against = false;
+        self.footprint = None;
     }
 
     fn enter_fits(&mut self) {
@@ -1354,6 +1591,11 @@ impl ZSelect {
 
     fn building(&mut self, input: &Input, now: Duration, tripped: bool) -> Option<Event> {
         let ev = self.evidence(&input.census, now);
+        // Clause (e) holds throughout: a sampler that declines the partitions
+        // ends the build, finished or not.
+        if self.sampler.is_some_and(|s| s.declined) {
+            return Some(self.cancel(now, Cancel::Declined));
+        }
         if input.build.coverage >= COVERED_ENOUGH {
             let installed = self.install(now);
             if tripped {
@@ -1364,7 +1606,7 @@ impl ZSelect {
             return Some(installed);
         }
         if tripped {
-            return Some(self.cancel(now, false));
+            return Some(self.cancel(now, Cancel::Budget));
         }
         if ev.any() {
             let vanished = Class::ALL.iter().all(|&c| {
@@ -1376,7 +1618,7 @@ impl ZSelect {
                 0
             };
             if self.vanished >= VANISH_INTERVALS {
-                return Some(self.cancel(now, true));
+                return Some(self.cancel(now, Cancel::Vanished));
             }
         }
         None
@@ -1388,6 +1630,11 @@ impl ZSelect {
         self.last_switch = Some(now);
         self.retain_until = None;
         self.z_realized = None;
+        // SUSPECT is entered clear of the model's error and of the scans held
+        // against it, and a form's footprint begins here.
+        debug_assert!(self.bias == 0.0 && !self.scans_against);
+        self.footprint = None;
+        self.note_raw(self.raw_seen_in(Class::Read), self.raw_seen_in(Class::Scan));
         self.excess = 0.0;
         self.watch = Watch::new(now);
         self.counts.installs += 1;
@@ -1395,21 +1642,26 @@ impl ZSelect {
         Event::Install
     }
 
-    /// A build abandoned, because the evidence vanished (and the back-off
-    /// doubles) or because the budget tripped (and building is suspended).
-    fn cancel(&mut self, now: Duration, vanished: bool) -> Event {
+    /// A build given up: the evidence vanished (and the back-off doubles),
+    /// the budget tripped (and building is suspended), or the sampler declined
+    /// the partitions (and the build clause refuses them until it does not).
+    fn cancel(&mut self, now: Duration, why: Cancel) -> Event {
         self.last_build_wall = now.saturating_sub(self.build_started);
         self.last_switch = Some(now);
         self.counts.switches += 1;
         self.counts.build_cancelled += 1;
         self.retain_until = Some(now.saturating_add(self.retain()));
         self.enter_suspect(now);
-        if vanished {
-            self.double_backoff();
-            Event::BuildCancelled
-        } else {
-            self.suspend(now);
-            Event::BuildAbandoned
+        match why {
+            Cancel::Vanished => {
+                self.double_backoff();
+                Event::BuildCancelled
+            }
+            Cancel::Budget => {
+                self.suspend(now);
+                Event::BuildAbandoned
+            }
+            Cancel::Declined => Event::BuildAbandoned,
         }
     }
 
@@ -1455,9 +1707,10 @@ impl ZSelect {
         }
         self.update_e2(now);
         if self.switch_allowed(now) {
-            if self
-                .low_since
-                .is_some_and(|t| now.saturating_sub(t) >= self.dwell())
+            if !self.scans_against
+                && self
+                    .low_since
+                    .is_some_and(|t| now.saturating_sub(t) >= self.dwell())
             {
                 return Some(self.exit(Exit::E1, now));
             }
@@ -1478,18 +1731,19 @@ impl ZSelect {
     /// E3's reading, once an S1 tick: is the form paying, over the second the
     /// census just closed? A tick without evidence breaks the stretch: an exit
     /// is acted on only for a form that has been seen not to pay throughout.
-    /// So does a tick with the pressure term on, for the reason E1's stretch
-    /// is broken by it: the saving is measured against the model's raw rate,
-    /// and under pressure that rate is the part that is wrong.
+    /// The form is judged against [`ZSelect::raw_belief`], the model's word
+    /// for the raw form corrected by its error, and the pressure term does not
+    /// stop the reading: the compact form's own faults are among the refaults
+    /// it counts.
     fn update_e3(&mut self, now: Duration) {
         let w = std::mem::take(&mut self.watch.tick_reads);
         let Some(m) = self.model else { return };
-        if w.ops < MIN_EVIDENCE_OPS || self.pressure() {
+        if w.ops < MIN_EVIDENCE_OPS {
             self.watch.unpaying_since = None;
             self.watch.stretch = Window::default();
             return;
         }
-        let realized = m.phi_raw - w.phi();
+        let realized = self.raw_belief(m.phi_raw) - w.phi();
         if realized < self.saving_star(Class::Read) {
             self.watch.unpaying_since = self.watch.unpaying_since.or(Some(now));
             self.watch.stretch.add(w);
@@ -1618,6 +1872,11 @@ impl ZSelect {
                                     .is_some_and(|z| w.phi() - z >= self.theta_enter(c))
                         });
                         return Some(if high {
+                            let seen = |c: Class| {
+                                let w = t.pooled[c.ix()];
+                                (w.ops > 0).then(|| w.phi())
+                            };
+                            self.note_raw(seen(Class::Read), seen(Class::Scan));
                             self.trial_back(now, true)
                         } else {
                             self.exit(Exit::E2, now)
@@ -1654,6 +1913,9 @@ impl ZSelect {
             Some(t) if now >= t && matches!(self.phase, Phase::Fits | Phase::Suspect) => {
                 self.retain_until = None;
                 self.counts.retired += 1;
+                // The reading priced sidecars that are gone: a build from
+                // nothing costs what the sampler says of it afresh.
+                self.sampler = None;
                 true
             }
             _ => false,
@@ -2001,7 +2263,17 @@ mod tests {
         cold: f64,
         /// The selector asked for a sample, so the caller has one to give.
         sampler_ready: bool,
+        /// The caller gives the reading when it is asked for and not
+        /// otherwise, where it would give it at every step: the selector must
+        /// know by itself when the reading it holds has gone stale.
+        sampler_once: bool,
         declined: bool,
+        /// What the partitions are, as the caller numbers them
+        /// ([`Input::generation`]); a test that merges them bumps it.
+        generation: u64,
+        /// The caller numbers the partitions again when a sidecar is attached
+        /// or retired, as the input's documentation asks.
+        numbers_sidecars: bool,
         /// Every n-th window has no commit in it (0: none): where there is
         /// none, the census cannot measure the cost of a fault.
         commit_free_every: u64,
@@ -2018,6 +2290,10 @@ mod tests {
         refault_scale: f64,
         /// The cost of a fault as the sampler's cold touches read it.
         sampler_t_f: f64,
+        /// The refaults the store itself took since the last S1 tick. The
+        /// group's counter holds them beside the neighbours', whichever form
+        /// serves.
+        own_refaults: u64,
         log: Vec<Rec>,
         checker: Checker,
     }
@@ -2042,7 +2318,10 @@ mod tests {
                 built: 0.0,
                 cold: 0.0,
                 sampler_ready: false,
+                sampler_once: false,
                 declined: false,
+                generation: 0,
+                numbers_sidecars: true,
                 commit_free_every: 1,
                 phi_raw_override: None,
                 collected: Build::default(),
@@ -2050,6 +2329,7 @@ mod tests {
                 counter: true,
                 refault_scale: 1.0,
                 sampler_t_f: PRIOR_T_F,
+                own_refaults: 0,
                 log: Vec::new(),
                 checker: Checker::default(),
             }
@@ -2065,7 +2345,7 @@ mod tests {
                     .unwrap_or_else(|| model_raw(b, c.hash, c.records)),
                 phi_z,
                 phi_z_scan: phi_z.map(|z| z * c.scan_pages),
-                refault_rate: c.neighbours,
+                refault_rate: c.neighbours + self.own_refaults as f64 / S1_PERIOD.as_secs_f64(),
                 budget: b,
             }
         }
@@ -2082,6 +2362,7 @@ mod tests {
                 },
                 c_build: c.price * (1.0 - self.built) + c.attach * self.built,
                 declined: self.declined,
+                generation: self.generation,
             }
         }
 
@@ -2177,9 +2458,17 @@ mod tests {
             let dt = DT.as_secs_f64();
             let z_form = self.last.gate == GATE_Z;
             if self.last.build {
+                let before = self.built;
                 self.built = (self.built + dt / self.cell.build_wall).min(1.0);
+                if before < 1.0 && self.built >= 1.0 && self.numbers_sidecars {
+                    // The last sidecar is attached.
+                    self.generation += 1;
+                }
             }
             let served = self.serve(z_form);
+            if self.counter {
+                self.own_refaults = self.own_refaults.saturating_add(served.refaults);
+            }
             let c = &self.cell;
             let mut input = Input {
                 now: self.now,
@@ -2218,14 +2507,17 @@ mod tests {
             }
             if self.n.is_multiple_of(TICK) {
                 input.model = Some(self.model());
+                self.own_refaults = 0;
             }
-            if self.sampler_ready {
+            input.generation = self.generation;
+            if self.sampler_ready && (!self.sampler_once || self.last.sample) {
                 input.sampler = Some(self.sampler());
             }
             let built = self.built;
             let d = self.sel.step(&input);
             if d.retire {
                 self.built = 0.0;
+                self.generation += u64::from(self.numbers_sidecars);
             }
             let rec = Rec {
                 t: self.now,
@@ -2444,16 +2736,38 @@ mod tests {
             ..Costs::default()
         };
         assert_eq!(s.saving_star(Class::Read), star / 2.0);
-        // A form that costs no more CPU than a hit is bought on any saving.
+        // A form measured to cost no more CPU than a hit is not free: two
+        // instruments measured the two costs, and a difference they cannot
+        // resolve stands for a quarter of the prior's. (The share is the
+        // registered one, written out.)
+        assert_eq!(SAVING_FLOOR_SHARE, 0.25);
+        let mut s = ZSelect::new();
         s.sampler = Some(Sampler {
             costs: Costs {
                 t_z: Some(PRIOR_T_HIT / 2.0),
+                t_z_scan: Some(PRIOR_T_HIT_SCAN / 2.0),
                 ..Costs::default()
             },
             c_build: 1.0,
             declined: false,
+            generation: 0,
         });
-        assert_eq!(s.saving_star(Class::Read), 0.0);
+        assert_eq!(s.saving_star(Class::Read), star / 4.0);
+        assert_eq!(s.saving_star(Class::Scan), scan / 4.0);
+        assert_eq!(s.theta_sus(Class::Read), SUSPECT_FACTOR * star / 4.0);
+        assert_eq!(s.theta_enter(Class::Read), ENTER_FACTOR * star / 4.0);
+        // The floor binds from below only: a difference over it is the
+        // difference, and a fault that costs more makes it smaller.
+        s.measured = Costs {
+            t_f: Some(2.0 * PRIOR_T_F),
+            t_z: Some(2.0 * PRIOR_T_Z),
+            ..Costs::default()
+        };
+        s.sampler = None;
+        assert_eq!(
+            s.saving_star(Class::Read),
+            (2.0 * PRIOR_T_Z - PRIOR_T_HIT) / (2.0 * PRIOR_T_F)
+        );
     }
 
     #[test]
@@ -2512,6 +2826,7 @@ mod tests {
             (Duration::from_secs(30), 3)
         );
         assert_eq!((BUDGET_BUILDS, BUDGET_SUPERSEDED, PAGE), (8, 4, 4096));
+        assert_eq!(SAVING_FLOOR_SHARE, 0.25);
         // The budget remembers its builds in a byte.
         assert_eq!(BUDGET_BUILDS, u8::BITS);
         // The priors: the fault cost the banked rung implies, the in-core
@@ -3373,20 +3688,73 @@ mod tests {
         assert_eq!(sim.last.phase, Phase::Suspect);
         let kept = sim.sel.z_realized.expect("the rate is kept");
         assert!((kept - 0.40).abs() < 0.005, "{kept}");
-        // The raw form now faults at 0.9, which the model has not heard of:
-        // its 0.48 less the form's 0.40 is under the entry threshold, and the
-        // measured saving alone does not buy.
+        // The raw form now faults at 0.9, which the model has not heard of.
+        // Its own refaults put the pressure term on, which stands for a model
+        // that cannot see, so the clause asks no more of the model, and the
+        // measured saving, 0.9 against the form's 0.40, buys it again.
         sim.load = cell.fixed(0.9, 0.40, bound);
-        sim.run(600.0);
-        assert_eq!(sim.count(Event::BuildStart), 1);
-        // Once the model says so too the form pays, 0.9 against 0.40, and is
-        // bought again and stays.
-        sim.phi_raw_override = Some(0.9);
         sim.run(600.0);
         assert_eq!(sim.count(Event::BuildStart), 2);
         assert_eq!(sim.last.phase, Phase::Compact);
         assert_eq!(sim.sel.z_realized, None, "a new install is judged afresh");
+        // And it stays: judged against the 0.9 the census saw and not the
+        // model's 0.48, which less its 0.40 is under the break-even.
+        assert!(
+            (sim.sel.bias - (0.9 - 0.4822)).abs() < 0.01,
+            "{}",
+            sim.sel.bias
+        );
+        sim.run(2.0 * 3600.0);
+        assert_eq!(sim.last.phase, Phase::Compact);
         assert_eq!(sim.count(Event::Exit(Exit::E3)), 1);
+    }
+
+    #[test]
+    fn the_predicted_saving_gates_a_store_too_slow_to_raise_the_pressure_itself() {
+        // Seven hundred reads a second at 0.3 faults a read is 210 refaults a
+        // second, under the pressure term, and an interval of seventy reads is
+        // evidence. The model says the raw form takes a tenth of a fault, so
+        // the saving it predicts, a tenth, is under the entry threshold
+        // however the census reads: the clause asks the model, and refuses.
+        // With a neighbour's refaults added the pressure term is on, it asks
+        // no more, and the measured saving buys.
+        let cell = Cell::ten_million();
+        let bound = cell.bound(cell.z as f64 / PAGE as f64);
+        let slow = Load::Rated {
+            class: Class::Read,
+            raw: Rate {
+                ops_per_s: 700.0,
+                phi: 0.3,
+            },
+            z: Rate {
+                ops_per_s: 3_000.0,
+                phi: 0.0,
+            },
+            refaults: true,
+            bound,
+        };
+        const { assert!(700.0 * 0.3 < PRESSURE_REFAULTS_PER_S) };
+        let enter = ZSelect::new().theta_enter(Class::Read);
+        assert!(0.1 < enter && enter < 0.3);
+        for (neighbours, builds) in [(0.0, 0), (400.0, 1)] {
+            let mut sim = Sim::new(
+                Cell {
+                    neighbours,
+                    ..cell.clone()
+                },
+                slow,
+            );
+            sim.phi_raw_override = Some(0.1);
+            sim.run(3600.0);
+            assert_eq!(sim.sel.counts().builds, builds, "{neighbours}");
+            if builds == 0 {
+                assert!(
+                    sim.log.iter().any(|r| r.excess >= cell.price),
+                    "the rent was paid"
+                );
+                assert_eq!(sim.last.phase, Phase::Suspect);
+            }
+        }
     }
 
     #[test]
@@ -3908,10 +4276,13 @@ mod tests {
         let ops = 1.0 / (cell.t_hit + phi * cell.t_f);
         let rent = (phi - star) * af.sampler_t_f * ops;
         near(af.first(Event::BuildStart), 3.0 + cell.price / rent, 0.3);
-        // A window without a commit, once seen, is kept.
+        // A window without a commit, once seen, is kept. (The census is
+        // read where the handles run it, and that is not FITS.)
         let mut s = ZSelect::new();
-        let with = |t_f: Option<f64>| Input {
-            now: Duration::from_secs(1),
+        assert_eq!(drive(&mut s, 2, |_| (0.5, 0.0)).len(), 1);
+        assert_eq!(s.phase(), Phase::Suspect);
+        let with = |t: u64, t_f: Option<f64>| Input {
+            now: Duration::from_secs(t),
             census: Census {
                 costs: Costs {
                     t_f,
@@ -3921,8 +4292,8 @@ mod tests {
             },
             ..Input::default()
         };
-        s.step(&with(Some(50e-6)));
-        s.step(&with(None));
+        s.step(&with(3, Some(50e-6)));
+        s.step(&with(4, None));
         assert_eq!(
             s.saving_star(Class::Read),
             (PRIOR_T_Z - PRIOR_T_HIT) / 50e-6
@@ -3987,25 +4358,47 @@ mod tests {
         assert_eq!(sim.first(Event::Suspect), 2 * S1_PERIOD);
         let c = sim.sel.counts();
         assert_eq!((c.builds, c.installs), (1, 1));
-        // The model says the store fits, so E1 and E3, which judge by the
-        // model, would take the form back a dwell later and the pressure
-        // would open it again. They do not act while the pressure is on.
+        // The model said the store fits and the census saw the raw form
+        // fault: the model's error is kept for as long as the form stands, so
+        // its word that the store fits is no reason to leave it, and the form
+        // is judged against what the census saw and keeps paying.
+        assert!((sim.sel.bias - 0.3).abs() < 0.01, "{}", sim.sel.bias);
         sim.run(5.0 * sim.sel.dwell().as_secs_f64());
         assert_eq!(
             (sim.last.phase, sim.sel.counts().switches),
             (Phase::Compact, 1)
         );
-        // Once the neighbour is gone, the model's word is taken.
+        // The compact form is quiet and what it touches is small, so the raw
+        // form is tried, and found faulting with the neighbour there.
+        let c = sim.sel.counts();
+        assert_eq!((c.trials, c.trials_back), (1, 1));
+        // The neighbour goes and the raw form would fault at nothing. The
+        // model is no more to be believed than it was, and the form is left
+        // by the next trial, which asks the raw form itself.
         sim.cell.neighbours = 0.0;
-        sim.run(2.0 * sim.sel.dwell().as_secs_f64());
-        assert_eq!(sim.sel.counts().exits.iter().sum::<u64>(), 1);
-        // Without the neighbour the same store never leaves FITS, whatever it
-        // is made to read.
+        sim.load = big.fixed(0.0, 0.0, bound);
+        sim.run(600.0);
+        let c = sim.sel.counts();
+        assert_eq!((c.trials, c.exits), (2, [0, 1, 0]));
+        // The model's error went with the form.
+        assert_eq!(sim.sel.bias, 0.0);
+        sim.run(60.0);
+        assert_eq!(sim.last.phase, Phase::Fits);
+        // A store whose faults are first touches, which no refault is counted
+        // for, raises no pressure of its own; without a neighbour it never
+        // leaves FITS, whatever the census it is handed says.
         let alone = Cell {
             neighbours: 0.0,
             ..big
         };
-        let mut sim = Sim::new(alone.clone(), alone.fixed(0.3, 0.0, bound));
+        let first_touches = Load::Rated {
+            class: Class::Read,
+            raw: alone.rate(alone.t_hit, 0.3),
+            z: alone.rate(alone.t_z, 0.0),
+            refaults: false,
+            bound,
+        };
+        let mut sim = Sim::new(alone.clone(), first_touches);
         sim.garbage = true;
         sim.run(600.0);
         assert!(sim.events().is_empty());
@@ -4114,9 +4507,12 @@ mod tests {
             3.0 + cell.price / rent_rate(&cell),
             0.5,
         );
-        // The one-population model, handed the same store and the same
-        // census, never builds.
+        // Where the platform counts no refaults there is no pressure term,
+        // and the model's word is what the clause has beside the census: the
+        // one-population model, handed the same store and the same census,
+        // never builds.
         let mut one = Sim::new(cell.clone(), cell.uniform());
+        one.counter = false;
         one.phi_raw_override = Some(raw.min(1.0));
         one.run(3600.0);
         assert_eq!(one.sel.counts().builds, 0);
@@ -4125,6 +4521,15 @@ mod tests {
             one.log.iter().any(|r| r.excess >= cell.price),
             "the rent was paid"
         );
+        // Where it counts them, the store's own refaults are in the group's
+        // counter and over the pressure term, which stands for a model that
+        // cannot see: the measured saving decides, and the one-population
+        // model buys as the other does.
+        let mut one = Sim::new(cell.clone(), cell.uniform());
+        one.phi_raw_override = Some(raw.min(1.0));
+        one.run(3600.0);
+        assert_eq!(one.sel.counts().builds, 1);
+        assert_eq!(one.last.phase, Phase::Compact);
     }
 
     // ---- builds that waste -----------------------------------------------------------
@@ -4930,6 +5335,7 @@ mod tests {
                     },
                     c_build: weird(&mut rng, 10.0),
                     declined: rng.below(10) == 0,
+                    generation: rng.below(3),
                 });
                 let window = |rng: &mut Rng| {
                     let ops = if rng.below(5) == 0 {
@@ -4972,6 +5378,7 @@ mod tests {
                         failed: rng.below(2) as u32,
                     },
                     footprint: (rng.below(3) == 0).then(|| rng.next() >> rng.below(40)),
+                    generation: rng.below(3),
                 };
                 let d = sel.step(&input);
                 let r = Rec {
@@ -4992,5 +5399,820 @@ mod tests {
         }
     }
 
-    // @@MORE@@
+    // ---- what a census nobody ran, and a reading of other partitions, may not say ----
+
+    #[test]
+    fn a_census_nobody_ran_prices_nothing_in_memory() {
+        // The model reads exactly nothing for a store that fits. The handles
+        // run no census in FITS, and one that arrives anyway -- costs that put
+        // the compact form under a hit, a sampler that costs nothing, a
+        // footprint -- is not a reading of anything: without that, a
+        // difference of costs of zero is a break-even of zero and a model of
+        // zero is over it.
+        let polluted = Costs {
+            t_f: Some(2e-6),
+            t_hit: Some(5e-6),
+            t_hit_scan: Some(30e-6),
+            t_z: Some(1e-9),
+            t_z_scan: Some(1e-9),
+        };
+        let mut sel = ZSelect::new();
+        for step in 1..=72_000u64 {
+            let d = sel.step(&Input {
+                now: DT * step as u32,
+                model: step.is_multiple_of(10).then_some(Model {
+                    phi_raw: 0.0,
+                    phi_z: None,
+                    phi_z_scan: None,
+                    refault_rate: 0.0,
+                    budget: 4 << 30,
+                }),
+                census: Census {
+                    reads: Window {
+                        ops: 5000,
+                        faults: 0,
+                    },
+                    refaults: Some(0),
+                    threads: 7,
+                    mixed: 3,
+                    costs: polluted,
+                    ..Census::default()
+                },
+                sampler: Some(Sampler {
+                    costs: polluted,
+                    c_build: 0.0,
+                    declined: false,
+                    generation: 0,
+                }),
+                footprint: Some(1),
+                ..Input::default()
+            });
+            assert_eq!(d.phase, Phase::Fits, "step {step}");
+            assert!(!d.sample && !d.census);
+        }
+        let c = sel.counts();
+        assert_eq!((c.samples_wanted, c.builds, c.switches), (0, 0, 0));
+        assert_eq!((c.s1_ticks, c.mixed_windows, c.ignored), (7200, 0, 0));
+        // Nothing of it was kept.
+        assert_eq!(sel.measured, Costs::default());
+        assert_eq!((sel.threads, sel.footprint), (1, None));
+        assert!(sel.sampler.is_none());
+    }
+
+    #[test]
+    fn a_cost_the_census_could_not_have_measured_in_the_form_that_served_is_not_taken() {
+        // The census times the form the gate serves: its cost of a hit is the
+        // raw form's, and its cost of a compact read the compact form's. In
+        // SUSPECT the raw form serves, and a census that claims a compact
+        // read's cost has claimed something it did not measure; in COMPACT
+        // the reverse; in the trial the raw form serves again.
+        let census = |t_hit: f64, t_z: f64| Census {
+            costs: Costs {
+                t_f: Some(30e-6),
+                t_hit: Some(t_hit),
+                t_hit_scan: Some(t_hit),
+                t_z: Some(t_z),
+                t_z_scan: Some(t_z),
+            },
+            ..Census::default()
+        };
+        let feed = |sel: &mut ZSelect, c: Census| {
+            let now = sel.now + DT;
+            sel.step(&Input {
+                now,
+                census: c,
+                ..Input::default()
+            });
+        };
+        let cell = Cell::ten_million();
+        // SUSPECT: the hit is taken, the compact read is not.
+        let mut sel = ZSelect::new();
+        drive(&mut sel, 2, |_| (0.5, 0.0));
+        assert_eq!(sel.phase(), Phase::Suspect);
+        feed(&mut sel, census(0.5e-6, 1e-9));
+        assert_eq!(
+            (
+                sel.measured.t_f,
+                sel.measured.t_hit,
+                sel.measured.t_hit_scan
+            ),
+            (Some(30e-6), Some(0.5e-6), Some(0.5e-6))
+        );
+        assert_eq!((sel.measured.t_z, sel.measured.t_z_scan), (None, None));
+        // The build serves the raw form too.
+        let mut sim = building(&cell);
+        feed(&mut sim.sel, census(0.4e-6, 1e-9));
+        let after = sim.sel.measured;
+        assert_eq!(
+            (after.t_hit, after.t_hit_scan),
+            (Some(0.4e-6), Some(0.4e-6))
+        );
+        assert_eq!((after.t_z, after.t_z_scan), (None, None));
+        // COMPACT: the compact read is taken, the hit is not.
+        let mut sim = compact(&cell);
+        let before = sim.sel.measured;
+        feed(&mut sim.sel, census(1e-9, 7e-6));
+        let after = sim.sel.measured;
+        assert_eq!(
+            (after.t_hit, after.t_hit_scan),
+            (before.t_hit, before.t_hit_scan)
+        );
+        assert_eq!((after.t_z, after.t_z_scan), (Some(7e-6), Some(7e-6)));
+        // The trial: the raw form serves.
+        let mut sim = trial_started(&cell, PAGE);
+        let before = sim.sel.measured;
+        feed(&mut sim.sel, census(0.6e-6, 1e-9));
+        let after = sim.sel.measured;
+        assert_eq!(
+            (after.t_hit, after.t_hit_scan),
+            (Some(0.6e-6), Some(0.6e-6))
+        );
+        assert_eq!((after.t_z, after.t_z_scan), (before.t_z, before.t_z_scan));
+    }
+
+    #[test]
+    fn a_hit_measured_over_the_compact_read_does_not_make_every_threshold_zero() {
+        // The two costs are measured by two instruments, and here the census's
+        // hit is over the prior's compact read. The break-even keeps its floor,
+        // so the thresholds stay over zero and a model reading of nothing is
+        // under the way in however the costs fall.
+        let mut sel = ZSelect::new();
+        drive(&mut sel, 2, |_| (0.5, 0.0));
+        assert_eq!(sel.phase(), Phase::Suspect);
+        let now = sel.now + DT;
+        sel.step(&Input {
+            now,
+            census: Census {
+                costs: Costs {
+                    t_hit: Some(PRIOR_T_Z + 1e-6),
+                    t_hit_scan: Some(PRIOR_T_Z_SCAN + 1e-6),
+                    ..Costs::default()
+                },
+                ..Census::default()
+            },
+            ..Input::default()
+        });
+        let floor = SAVING_FLOOR_SHARE * (PRIOR_T_Z - PRIOR_T_HIT) / PRIOR_T_F;
+        let scan_floor = SAVING_FLOOR_SHARE * (PRIOR_T_Z_SCAN - PRIOR_T_HIT_SCAN) / PRIOR_T_F;
+        assert_eq!(sel.saving_star(Class::Read), floor);
+        assert_eq!(sel.saving_star(Class::Scan), scan_floor);
+        assert!(sel.theta_sus(Class::Read) > 0.0 && sel.theta_enter(Class::Scan) > 0.0);
+        // A model of nothing is under the way out, so the rung is left, and
+        // one over the floor's threshold is not.
+        let floor_sus = SUSPECT_FACTOR * floor;
+        let mut calm = sel.clone();
+        assert_eq!(kinds(&drive(&mut calm, 5, |_| (0.0, 0.0))), [Event::Relax]);
+        let mut hot = sel.clone();
+        assert!(drive(&mut hot, 60, |_| (1.1 * floor_sus, 0.0)).is_empty());
+    }
+
+    /// A selector fed by hand in SUSPECT with a hot model, a census that has
+    /// evidence in every step, and a sampler it has not heard from.
+    fn suspect_by_hand() -> (ZSelect, u64) {
+        let mut sel = ZSelect::new();
+        let mut step = 0;
+        while sel.phase() != Phase::Suspect {
+            step += 1;
+            hand(&mut sel, step, 0, None);
+        }
+        (sel, step)
+    }
+
+    /// One step by hand: reads that fault on 40% of them and refault, the
+    /// model on the tick, and what the caller gives of a sampler.
+    fn hand(sel: &mut ZSelect, step: u64, generation: u64, sampler: Option<Sampler>) -> Decision {
+        sel.step(&Input {
+            now: DT * step as u32,
+            model: step.is_multiple_of(10).then_some(Model {
+                phi_raw: 0.5,
+                phi_z: Some(0.0),
+                phi_z_scan: Some(0.0),
+                refault_rate: 0.0,
+                budget: 870_000_000,
+            }),
+            census: Census {
+                reads: Window {
+                    ops: 5000,
+                    faults: 2000,
+                },
+                refaults: Some(2000),
+                ..Census::default()
+            },
+            sampler,
+            generation,
+            ..Input::default()
+        })
+    }
+
+    fn reading(c_build: f64, declined: bool, generation: u64) -> Sampler {
+        Sampler {
+            costs: Costs::default(),
+            c_build,
+            declined,
+            generation,
+        }
+    }
+
+    #[test]
+    fn a_reading_of_other_partitions_is_dropped_and_asked_for_again() {
+        let (mut sel, mut step) = suspect_by_hand();
+        // The reading arrives and stands.
+        step += 1;
+        let d = hand(&mut sel, step, 0, Some(reading(0.1, false, 0)));
+        assert!(!d.sample && sel.sampler.is_some());
+        // A merge lands: the partitions are other, the reading is of the old
+        // ones, and it is asked for again. Nothing is built meanwhile,
+        // though the rent is paid many times over.
+        let mut asked = 0;
+        for _ in 0..200 {
+            step += 1;
+            let d = hand(&mut sel, step, 1, None);
+            asked += usize::from(d.sample);
+            assert!(
+                d.phase != Phase::Building,
+                "no reading of these partitions, no build"
+            );
+        }
+        assert_eq!(asked, 200);
+        assert!(sel.sampler.is_none());
+        assert_eq!(sel.counts().samples_wanted, 2);
+        assert!(sel.excess() > 10.0);
+        // A reading that arrives for the old partitions is not kept, and
+        // counted.
+        step += 1;
+        let ignored = sel.counts().ignored;
+        hand(&mut sel, step, 1, Some(reading(0.1, false, 0)));
+        assert!(sel.sampler.is_none());
+        assert_eq!(sel.counts().ignored, ignored + 1);
+        // One for these is, and the rent pays for the build at once.
+        step += 1;
+        let d = hand(&mut sel, step, 1, Some(reading(0.1, false, 1)));
+        assert_eq!(d.event, Some(Event::BuildStart));
+    }
+
+    #[test]
+    fn a_decline_is_asked_again_after_a_dwell() {
+        // The sampler declined the partitions at the budget they had. The
+        // budget and the partitions move, and a decline that stood for the
+        // episode would stand for ever; it stands for a dwell, and the
+        // sampler is asked again.
+        let cell = Cell::ten_million();
+        let mut sim = Sim::new(cell.clone(), cell.uniform());
+        sim.sampler_once = true;
+        sim.declined = true;
+        sim.run(600.0);
+        assert_eq!(sim.sel.counts().builds, 0);
+        assert!(sim.log.iter().any(|r| r.excess >= 10.0 * cell.price));
+        let asked = sim.sel.counts().samples_wanted;
+        assert!((9..=11).contains(&asked), "{asked} asks in ten minutes");
+        // It changes its mind; the next ask is the one that finds out.
+        sim.declined = false;
+        let changed = sim.now;
+        sim.run(2.0 * DWELL_FLOOR.as_secs_f64());
+        let start = sim.first(Event::BuildStart);
+        assert!(
+            start - changed <= DWELL_FLOOR + 3 * DT,
+            "{:?}",
+            start - changed
+        );
+        // A reading that does not decline is not asked for again.
+        assert!(sim.sel.counts().samples_wanted <= asked + 1);
+    }
+
+    #[test]
+    fn the_sidecars_retire_with_the_reading_that_priced_them() {
+        // A form left by E3 keeps its sidecars for the retention, and the
+        // reading taken then prices a re-entry at the attach. When they are
+        // retired a build costs what a build from nothing costs, and the
+        // reading that said otherwise is gone with them.
+        let cell = Cell::ten_million();
+        let bound = cell.bound(cell.z as f64 / PAGE as f64);
+        let mut sim = Sim::new(cell.clone(), cell.fixed(0.45, 0.40, bound));
+        sim.sampler_once = true;
+        sim.run_until(Phase::Compact, 120.0);
+        // The first reading priced a build from nothing, and the last
+        // sidecar's attach moves the partitions' identity: the reading is
+        // dropped.
+        assert!(sim.sel.sampler.is_some());
+        sim.run(5.0);
+        assert!(sim.sel.sampler.is_none());
+        sim.run_until(Phase::Suspect, 2.0 * sim.sel.dwell().as_secs_f64());
+        assert_eq!(sim.count(Event::Exit(Exit::E3)), 1);
+        sim.run(1.0);
+        let attach = sim.sel.sampler.expect("asked for after the exit").c_build;
+        assert_eq!(attach, cell.attach);
+        // The retention ends: the sidecars go, and so does the price.
+        let exit = sim.first(Event::Exit(Exit::E3));
+        sim.run_with(sim.sel.retain().as_secs_f64(), |_| {});
+        let retired = sim.log.iter().find(|r| r.d.retire).expect("retired").t;
+        near(retired - exit, sim.sel.retain().as_secs_f64(), 0.2);
+        sim.run(1.0);
+        let scratch = sim
+            .sel
+            .sampler
+            .expect("asked for after the retirement")
+            .c_build;
+        assert_eq!(scratch, cell.price);
+        assert_eq!(sim.sel.counts().samples_wanted, 3);
+    }
+
+    #[test]
+    fn the_retire_pulse_takes_the_reading_with_it_whoever_numbers_the_partitions() {
+        // A caller that does not number the partitions again when the
+        // sidecars go leaves the selector with a price for sidecars that are
+        // not there; the pulse that retires them is its reason to ask again.
+        let cell = Cell::ten_million();
+        let bound = cell.bound(cell.z as f64 / PAGE as f64);
+        let mut sim = Sim::new(cell.clone(), cell.fixed(0.45, 0.40, bound));
+        sim.sampler_once = true;
+        sim.numbers_sidecars = false;
+        sim.run_until(Phase::Compact, 120.0);
+        sim.run_until(Phase::Suspect, 2.0 * sim.sel.dwell().as_secs_f64());
+        assert_eq!(sim.count(Event::Exit(Exit::E3)), 1);
+        assert!(sim.sel.sampler.is_some(), "nothing moved the reading");
+        let asked = sim.sel.counts().samples_wanted;
+        sim.run(sim.sel.retain().as_secs_f64() + 5.0);
+        let pulse = sim.log.iter().find(|r| r.d.retire).expect("retired");
+        assert!(pulse.d.sample, "the pulse asks for another reading");
+        assert_eq!(sim.sel.counts().samples_wanted, asked + 1);
+        assert!(sim.sel.sampler.is_some(), "and gets it");
+    }
+
+    #[test]
+    fn the_footprint_goes_with_the_form_it_was_taken_of() {
+        // The bitmaps are of the compact form's pages; a form installed again
+        // starts with none, and a bound taken of the form before it must not
+        // admit a trial of this one.
+        let cell = Cell::ten_million();
+        let mut sim = compact(&cell);
+        sim.step();
+        assert!(sim.sel.footprint.is_some());
+        sim.load = cell.hot(100);
+        sim.run_until(Phase::Suspect, 2.0 * sim.sel.dwell().as_secs_f64() + 100.0);
+        assert_eq!(sim.count(Event::Exit(Exit::E2)), 1);
+        assert_eq!(sim.sel.footprint, None, "the form was left");
+        sim.load = cell.uniform();
+        sim.run_until(Phase::Compact, 600.0);
+        assert_eq!(sim.last.phase, Phase::Compact);
+        assert_eq!(sim.count(Event::Install), 2);
+        assert_eq!(sim.sel.footprint, None, "the form was installed");
+        // So a trial is admitted by what the new form's bitmaps say and by
+        // nothing taken before them.
+        sim.step();
+        assert!(sim.sel.footprint.is_some());
+    }
+
+    #[test]
+    fn a_decline_that_arrives_while_building_ends_the_build() {
+        // Clause (e) is a condition of the build and not only of its start:
+        // the sampler's reading changes while the builder works, and a build
+        // for partitions it now declines is not finished, however much of it
+        // is.
+        let cell = Cell::ten_million();
+        for finished in [false, true] {
+            let mut sim = building(&cell);
+            if finished {
+                sim.built = 0.95;
+            }
+            sim.declined = true;
+            sim.step();
+            let abandoned = sim.first(Event::BuildAbandoned);
+            assert_eq!(sim.last.phase, Phase::Suspect, "{finished}");
+            let c = sim.sel.counts();
+            assert_eq!((c.installs, c.build_cancelled, c.switches), (0, 1, 1));
+            assert_eq!(c.build_suspended, 0, "the budget did not trip");
+            assert_eq!(
+                sim.sel.backoff(),
+                TRIAL_BACKOFF_MIN,
+                "the saving did not vanish"
+            );
+            assert!(sim.sel.retained());
+            // It stays declined: the rent is paid and nothing is built for
+            // as long as the sampler says so.
+            sim.run(30.0);
+            assert_eq!(sim.sel.counts().builds, 1);
+            // And a sampler that changes its mind is believed after the dwell.
+            sim.declined = false;
+            sim.run(2.0 * DWELL_FLOOR.as_secs_f64());
+            assert!(sim.times(Event::BuildStart).len() == 2, "{abandoned:?}");
+        }
+    }
+
+    #[test]
+    fn a_model_supplied_faster_than_the_period_is_ticks_at_the_period() {
+        // The ticks FITS, SUSPECT and the smoothing count in are seconds.
+        // A caller that supplies the model at every step has it read at every
+        // step and counted a period apart, to within a census interval.
+        let mut sel = ZSelect::new();
+        let hot = Model {
+            phi_raw: 0.5,
+            phi_z: None,
+            phi_z_scan: None,
+            refault_rate: 0.0,
+            budget: 870_000_000,
+        };
+        let mut first = None;
+        for step in 1..=100u64 {
+            let d = sel.step(&Input {
+                now: DT * step as u32,
+                model: Some(hot),
+                ..Input::default()
+            });
+            if d.event == Some(Event::Suspect) {
+                first = Some(step);
+            }
+        }
+        // Ticks at 0.1 s and, a period less an interval later, at 1.0 s.
+        assert_eq!(first, Some(10));
+        assert_eq!(sel.counts().s1_ticks, 12, "twelve ticks in ten seconds");
+        // Readings a period apart with a little jitter each are all ticks.
+        let mut sel = ZSelect::new();
+        let mut at = Duration::ZERO;
+        for k in 0..20u32 {
+            at += S1_PERIOD - Duration::from_millis(50 * u64::from(k % 2));
+            sel.step(&Input {
+                now: at,
+                model: Some(hot),
+                ..Input::default()
+            });
+        }
+        assert_eq!(sel.counts().s1_ticks, 20);
+        // Readings closer than that are kept for the rules but not counted.
+        let mut sel = ZSelect::new();
+        for k in 1..=40u32 {
+            sel.step(&Input {
+                now: Duration::from_millis(500) * k,
+                model: Some(hot),
+                ..Input::default()
+            });
+        }
+        assert_eq!(sel.counts().s1_ticks, 20, "twenty seconds, twenty ticks");
+        assert_eq!(sel.model, Some(hot));
+    }
+
+    // ---- holes found by breaking the rules one at a time ----------------------------
+
+    // ---- the controller's own output moves what it reads ---------------------------
+    //
+    // The group's refault counter holds the refaults of the store itself, and
+    // which form serves decides how many there are. A rule that reads it is
+    // reading its own answer, so the replay feeds it as the group has it, and
+    // a controller facing constant inputs has to come to rest.
+
+    #[test]
+    fn the_replays_pressure_term_is_the_groups_counter_the_stores_own_refaults_included() {
+        let cell = Cell {
+            cache: 4 << 30,
+            neighbours: 100.0,
+            ..Cell::ten_million()
+        };
+        let bound = cell.bound(cell.z as f64 / PAGE as f64);
+        let raw = cell.rate(cell.t_hit, 0.3);
+        let mut sim = Sim::new(cell.clone(), cell.fixed(0.3, 0.0, bound));
+        sim.run(3.0);
+        let read = sim.sel.model.expect("a model reading").refault_rate;
+        assert!(
+            (read - (100.0 + 0.3 * raw.ops_per_s)).abs() < 0.01 * read,
+            "{read}"
+        );
+        // Served by the compact form, which faults nothing, only the
+        // neighbour's are left.
+        sim.run_until(Phase::Compact, 120.0);
+        sim.run(3.0);
+        assert_eq!(sim.sel.model.expect("a model reading").refault_rate, 100.0);
+    }
+
+    /// The loads of the fixed-point checks: the geometry's reads and scans,
+    /// two hot sets, and reads at fixed rates through each form.
+    fn constant_loads(cell: &Cell) -> Vec<(String, Load)> {
+        let bound = cell.bound(cell.z as f64 / PAGE as f64);
+        let mut loads: Vec<(String, Load)> = vec![
+            ("uniform reads".into(), cell.uniform()),
+            ("uniform scans".into(), cell.scans()),
+            ("a hot set of 100 MB".into(), cell.hot(100)),
+            ("a hot set of 300 MB".into(), cell.hot(300)),
+        ];
+        for raw in [0.05, 0.1, 0.3, 0.6] {
+            for z in [0.0, 0.05, 0.2, 0.4, 0.7] {
+                loads.push((
+                    format!("reads at {raw} faults raw and {z} compact"),
+                    cell.fixed(raw, z, bound),
+                ));
+            }
+        }
+        loads
+    }
+
+    /// A controller facing constant inputs reaches a fixed point: no switch in
+    /// the last two of three hours, whatever the cache, the neighbours and the
+    /// threads, and where the numbers pick a place it rests in it -- a form
+    /// that saves the entry threshold is kept, one that loses is not.
+    fn constant_workloads_come_to_rest(cache: u64) {
+        let base = Cell::ten_million();
+        let sel = ZSelect::new();
+        let (mut kept, mut suspect) = (0, 0);
+        for neighbours in [0.0, 400.0] {
+            for threads in [1u32, 3] {
+                let cell = Cell {
+                    cache,
+                    neighbours,
+                    threads,
+                    ..base.clone()
+                };
+                for (name, load) in constant_loads(&cell) {
+                    let mut sim = Sim::new(cell.clone(), load);
+                    sim.run(3600.0);
+                    let before = sim.sel.counts().switches;
+                    sim.run(2.0 * 3600.0);
+                    let at = format!(
+                        "{} MB, {neighbours} refaults a second beside it, {threads} threads, {name}",
+                        cache / 1_000_000
+                    );
+                    let late = sim.sel.counts().switches - before;
+                    assert_eq!(late, 0, "switches after the first hour, {at}");
+                    let held = matches!(sim.last.phase, Phase::Compact | Phase::Trial);
+                    if let Load::Rated { class, raw, z, .. } = load {
+                        let saving = raw.phi - z.phi;
+                        if saving >= sel.theta_enter(class) {
+                            assert!(held, "a saving of {saving} is kept, {at}");
+                        }
+                        if saving < 0.0 {
+                            assert!(!held, "a loss of {} is not, {at}", -saving);
+                        }
+                    }
+                    kept += usize::from(held);
+                    suspect += usize::from(sim.last.phase == Phase::Suspect);
+                }
+            }
+        }
+        assert!(kept > 0 && suspect > 0, "{kept} kept, {suspect} suspect");
+    }
+
+    #[test]
+    fn constant_workloads_come_to_rest_at_700_mb() {
+        constant_workloads_come_to_rest(700_000_000);
+    }
+
+    #[test]
+    fn constant_workloads_come_to_rest_at_937_mb() {
+        constant_workloads_come_to_rest(937_000_000);
+    }
+
+    #[test]
+    fn constant_workloads_come_to_rest_at_1300_mb() {
+        constant_workloads_come_to_rest(1_300_000_000);
+    }
+
+    #[test]
+    fn constant_workloads_come_to_rest_at_2_gb() {
+        constant_workloads_come_to_rest(2_000_000_000);
+    }
+
+    #[test]
+    fn constant_workloads_come_to_rest_at_4_gib() {
+        constant_workloads_come_to_rest(4 << 30);
+    }
+
+    #[test]
+    fn a_form_bought_against_the_models_word_stays_while_it_pays() {
+        // The cache is large, the model says the store fits, and the raw form
+        // faults at 0.3 a read (a reader of the group the model cannot see)
+        // where the compact form faults at none. The store's own refaults
+        // open the clause, the census buys, and the compact form's quiet takes
+        // the refaults away. The model still says the store fits, and its
+        // word is what was contradicted: the form is not left on it, nor on
+        // the pressure it no longer sees. The raw form is tried when a trial
+        // is admitted and found faulting, and each wrong trial doubles the
+        // wait.
+        let big = Cell {
+            cache: 4 << 30,
+            ..Cell::ten_million()
+        };
+        let bound = big.bound(big.z as f64 / PAGE as f64);
+        let mut sim = Sim::new(big.clone(), big.fixed(0.3, 0.0, bound));
+        sim.run(3.0 * 3600.0);
+        let c = sim.sel.counts();
+        assert_eq!((c.builds, c.installs, c.switches), (1, 1, 1));
+        assert_eq!(c.exits, [0, 0, 0]);
+        assert!(c.trials >= 3, "{} trials", c.trials);
+        assert!(c.trials_back + 1 >= c.trials);
+        assert!((sim.sel.bias - 0.3).abs() < 0.01, "{}", sim.sel.bias);
+        let served = sim.log.iter().filter(|r| r.d.gate == GATE_Z).count();
+        assert!(served as f64 > 0.95 * sim.log.len() as f64, "{served}");
+    }
+
+    #[test]
+    fn a_form_that_faults_more_than_the_raw_form_is_left_though_its_faults_raise_the_pressure() {
+        // The compact form takes a fault a read where the raw form took 0.45,
+        // because a raw path beside it enlarged the union of pages the two
+        // forms need. Its own refaults are in the group's counter, so the
+        // pressure term is on through the whole of the stretch; the exit is
+        // for a form that is not paying, and does not wait for the pressure
+        // to fall.
+        let cell = Cell::ten_million();
+        let bound = cell.bound(cell.z as f64 / PAGE as f64);
+        let mut sim = Sim::new(cell.clone(), cell.fixed(0.45, 1.0, bound));
+        sim.run_until(Phase::Compact, 120.0);
+        let install = sim.first(Event::Install);
+        let dwell = sim.sel.dwell();
+        let mut pressed = 0;
+        sim.run_with(dwell.as_secs_f64() + 10.0, |s| {
+            pressed += usize::from(s.sel.pressure());
+        });
+        assert!(pressed > 1000, "{pressed} steps under pressure");
+        let exit = sim.first(Event::Exit(Exit::E3));
+        near(exit - install, dwell.as_secs_f64(), 2.0);
+        let kept = sim.sel.z_realized.expect("the rate is kept");
+        assert!((kept - 1.0).abs() < 0.01, "{kept}");
+        // And it stays left: the form faults more than the raw form does.
+        sim.run(3.0 * 3600.0);
+        assert_eq!(sim.sel.counts().installs, 1);
+        assert_eq!(sim.last.phase, Phase::Suspect);
+    }
+
+    #[test]
+    fn a_trial_that_finds_the_raw_form_faulting_contradicts_a_model_that_said_it_fits() {
+        // The form was bought with the model's agreement. The limit is lifted,
+        // the model says the store fits, and the raw form, which a trial is
+        // admitted to try because what the compact form touches is small,
+        // faults at 0.3 all the same. The model is contradicted by that, and
+        // its word, which would have taken the form back a dwell after the
+        // trial, no longer does.
+        let cell = Cell::ten_million();
+        let mut sim = compact(&cell);
+        assert!(sim.sel.bias <= 0.0, "{}", sim.sel.bias);
+        sim.cell.cache = 4 << 30;
+        sim.load = Load::Hot {
+            raw_pages: 24_000.0,
+            z_pages: 13_000.0,
+            plateau: 0.3,
+        };
+        sim.run_until(Phase::Trial, 1200.0);
+        sim.run_until(Phase::Compact, 120.0);
+        assert_eq!(sim.sel.counts().trials_back, 1);
+        assert!((sim.sel.bias - 0.3).abs() < 0.02, "{}", sim.sel.bias);
+        sim.run(2.0 * sim.sel.dwell().as_secs_f64() + E1_SMOOTHING.as_secs_f64());
+        assert_eq!(sim.sel.counts().exits, [0, 0, 0]);
+        assert_eq!(sim.last.phase, Phase::Compact);
+    }
+
+    #[test]
+    fn a_trial_that_straddles_the_end_of_e1s_stretch_still_disarms_it() {
+        // E1 acts a dwell after the model began to say the store fits. The
+        // trial starts inside that dwell and ends after it, and finds the raw
+        // form faulting at 0.3: too slow a store to raise the pressure term
+        // itself, so nothing else has broken the stretch. The model is
+        // contradicted by the trial, and the stretch it began is no reason to
+        // leave the form.
+        let cell = Cell::ten_million();
+        let mut sim = compact(&cell);
+        let dwell = sim.sel.dwell();
+        sim.run(dwell.as_secs_f64() + 100.0);
+        sim.cell.cache = 4 << 30;
+        sim.load = Load::Idle;
+        while sim.sel.low_since.is_none() {
+            sim.step();
+            assert!(sim.now < Duration::from_secs(10_000));
+        }
+        let began = sim.sel.low_since.expect("the stretch began");
+        let slow = Load::Rated {
+            class: Class::Read,
+            raw: Rate {
+                ops_per_s: 700.0,
+                phi: 0.3,
+            },
+            z: Rate {
+                ops_per_s: 3_000.0,
+                phi: 0.0,
+            },
+            refaults: true,
+            bound: 700_000_000,
+        };
+        // The compact form's quiet takes three measures of ten seconds to
+        // admit the trial: it arrives a little under a dwell into the stretch.
+        let arrives = began + dwell - Duration::from_secs(35);
+        while sim.now < arrives {
+            sim.step();
+        }
+        sim.load = slow;
+        sim.run_until(Phase::Trial, 60.0);
+        assert_eq!(sim.last.phase, Phase::Trial);
+        assert!(sim.now + 3 * S1_PERIOD < began + dwell, "inside the dwell");
+        sim.run_until(Phase::Compact, 60.0);
+        assert!(sim.now > began + dwell, "and ending after it");
+        sim.run(30.0);
+        assert_eq!(sim.sel.counts().exits, [0, 0, 0]);
+        assert!((sim.sel.bias - 0.3).abs() < 0.02, "{}", sim.sel.bias);
+    }
+
+    #[test]
+    fn the_models_word_that_the_store_fits_leaves_a_form_it_backed_and_not_one_it_was_contradicted_about(
+    ) {
+        // The same quiet, the same model and the same hours: a form the model
+        // agreed to buy is left a dwell after the model says the store fits,
+        // and one it was contradicted about is not.
+        let backed = Cell::ten_million();
+        let mut sim = compact(&backed);
+        assert!(sim.sel.bias <= 0.0, "{}", sim.sel.bias);
+        sim.cell.cache = 4 << 30;
+        sim.load = Load::Idle;
+        sim.run(3.0 * 3600.0);
+        assert_eq!(sim.sel.counts().exits, [1, 0, 0]);
+        // The model said fits and a neighbour's refaults and the store's own
+        // said otherwise.
+        let big = Cell {
+            cache: 4 << 30,
+            neighbours: 400.0,
+            ..Cell::ten_million()
+        };
+        let heavy = big.budget();
+        let mut sim = Sim::new(big.clone(), big.fixed(0.3, 0.0, heavy));
+        sim.run_until(Phase::Compact, 120.0);
+        assert!((sim.sel.bias - 0.3).abs() < 0.01, "{}", sim.sel.bias);
+        sim.cell.neighbours = 0.0;
+        sim.load = Load::Idle;
+        sim.run(3.0 * 3600.0);
+        assert_eq!(sim.sel.counts().exits, [0, 0, 0]);
+        assert_eq!(sim.last.phase, Phase::Compact);
+    }
+
+    #[test]
+    fn scans_that_fault_where_the_model_says_the_store_fits_contradict_it() {
+        // The model has no rate for a scan, only its word that the store fits.
+        // A scan that faults at the scan break-even's half against that word
+        // contradicts it, and one against a model that says the store does not
+        // fit contradicts nothing.
+        let fits = Cell {
+            cache: 2_000_000_000,
+            ..Cell::ten_million()
+        };
+        let mut sim = Sim::new(fits.clone(), fits.scans());
+        sim.run_until(Phase::Compact, 120.0);
+        assert!(sim.sel.scans_against);
+        sim.run(3.0 * 3600.0);
+        assert_eq!(sim.sel.counts().exits, [0, 0, 0]);
+        let tight = Cell::ten_million();
+        let mut sim = Sim::new(tight.clone(), tight.scans());
+        sim.run_until(Phase::Compact, 120.0);
+        assert!(!sim.sel.scans_against);
+        // Lift the limit with nothing reading: the model's word is believed.
+        sim.cell.cache = 4 << 30;
+        sim.load = Load::Idle;
+        sim.run(3.0 * 3600.0);
+        assert_eq!(sim.sel.counts().exits, [1, 0, 0]);
+    }
+
+    #[test]
+    fn the_models_error_is_kept_from_the_smallest_rate_worth_counting_in_either_direction() {
+        // The census saw the raw form take 0.3 a read. A model that said a
+        // little more or less than that, by under the least rate worth
+        // counting, was right to within what is worth acting on, and one that
+        // said more or less by over it was not.
+        let cell = Cell::ten_million();
+        let bound = cell.bound(cell.z as f64 / PAGE as f64);
+        let sus = ZSelect::new().theta_sus(Class::Read);
+        for (said, kept) in [
+            (0.3 - 0.9 * sus, false),
+            (0.3 - 1.1 * sus, true),
+            (0.3 + 0.9 * sus, false),
+            (0.3 + 1.1 * sus, true),
+        ] {
+            let mut sim = Sim::new(cell.clone(), cell.fixed(0.3, 0.0, bound));
+            sim.phi_raw_override = Some(said);
+            sim.run_until(Phase::Compact, 120.0);
+            let want = if kept { 0.3 - said } else { 0.0 };
+            assert!(
+                (sim.sel.bias - want).abs() < 0.005,
+                "{said}: {}",
+                sim.sel.bias
+            );
+        }
+    }
+
+    #[test]
+    fn a_model_that_over_predicts_does_not_keep_a_form_the_raw_form_beat() {
+        // The cache is small and the model says the raw form takes 0.75 a
+        // read; the workload is skewed, and the census saw it take 0.3. The
+        // compact form takes 0.4, which is worse, and 0.35 under the model's
+        // word, which would call it paying. The model's error is carried, so
+        // the form is judged against the 0.3 and left; at a cache where the
+        // model's word is close to the census's the same form is left too.
+        let cell = Cell {
+            cache: 700_000_000,
+            ..Cell::ten_million()
+        };
+        let bound = cell.bound(cell.z as f64 / PAGE as f64);
+        let model = model_raw(cell.budget(), cell.hash, cell.records);
+        assert!(model > 0.7 && model < 0.8, "{model}");
+        let mut sim = Sim::new(cell.clone(), cell.fixed(0.3, 0.4, bound));
+        sim.run_until(Phase::Compact, 120.0);
+        assert!(
+            (sim.sel.bias - (0.3 - model)).abs() < 0.01,
+            "{}",
+            sim.sel.bias
+        );
+        sim.run(2.0 * sim.sel.dwell().as_secs_f64());
+        assert_eq!(sim.sel.counts().exits, [0, 0, 1]);
+        assert_eq!(sim.last.phase, Phase::Suspect);
+    }
 }
