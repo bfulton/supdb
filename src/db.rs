@@ -13925,7 +13925,7 @@ impl Reader {
                 if self.opts.zpages == ZPages::Always {
                     // The partition from its sidecar, or from the raw form
                     // and counted where it has none in service.
-                    n += self.part_read_z(seg, key, &mut f, &seg_read)?;
+                    n += self.part_read_z(seg, key, &mut f, seg_read)?;
                 } else {
                     // The partition through its ordered index where the
                     // option asks and the index can answer; everything

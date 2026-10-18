@@ -1321,7 +1321,7 @@ fn handles_on_threads_read_through_the_sidecars_and_their_counts_sum() {
         let r = db.reader().unwrap();
         let (model, keys) = (model.clone(), keys.clone());
         threads.push(std::thread::spawn(move || {
-            let mut rng = Rng(0x1357 ^ (t + 1) * 0x9E37);
+            let mut rng = Rng(0x1357 ^ ((t + 1) * 0x9E37));
             for i in 0..per {
                 let k = &keys[rng.below(keys.len())];
                 if i % 2 == 0 {
@@ -1620,7 +1620,11 @@ fn a_merge_takes_the_sidecar_of_the_segment_it_retires() {
         c.builds > first.builds,
         "the merges' outputs were given sidecars: {c:?}"
     );
-    assert_eq!(c.sidecars + c.declined_block_backed.min(0), c.sidecars);
+    assert_eq!(
+        c.sidecars, c.partitions,
+        "every partition the merges left: {c:?}"
+    );
+    assert_eq!(c.declined_block_backed + c.build_failed, 0, "{c:?}");
     let live: Vec<String> = db
         .zpage_sidecars()
         .into_iter()
