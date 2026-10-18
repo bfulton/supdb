@@ -3630,6 +3630,192 @@ mod tests {
         );
     }
 
+    // ---- a whole sidecar ------------------------------------------------
+
+    /// A filter out of the bytes a sidecar stores it as.
+    fn filter_from(bytes: &[u8]) -> super::super::BlockedBloom {
+        super::super::BlockedBloom {
+            blocks: bytes
+                .chunks_exact(64)
+                .map(|c| {
+                    let mut b = [0u64; 8];
+                    for (w, x) in b.iter_mut().zip(c.chunks_exact(8)) {
+                        *w = u64::from_le_bytes(x.try_into().unwrap());
+                    }
+                    b
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_whole_sidecar_round_trips_through_its_file() {
+        use super::super::{BlockedBloom, BLOOM_BITS_PER_KEY, BLOOM_PROBES, BLOOM_SIG};
+        let mut rng = Rng::new(71);
+        // Records of every shape, and three whose keys are too big for a page
+        // to hold once compressed.
+        let mut keys = std::collections::BTreeSet::new();
+        while keys.len() < 1500 {
+            let l = rng.below(40);
+            keys.insert(rng.bytes(l));
+        }
+        for _ in 0..3 {
+            keys.insert(rng.bytes(5000));
+        }
+        let recs: Vec<(Vec<u8>, Vec<u8>)> = keys
+            .into_iter()
+            .map(|k| {
+                let im = random_image(&mut rng, &k);
+                (k, im)
+            })
+            .collect();
+        let images: Vec<Vec<u8>> = recs.iter().map(|(_, i)| i.clone()).collect();
+        let n = recs.len();
+        let bind = bind32(5, 6, n as u64, 7);
+
+        // The pages, as a builder writes them, and the fence entries they make:
+        // one for each page, and one for each run of records no page holds.
+        let mut s = FillScratch::new();
+        let (mut rank, mut hint) = (0usize, 0usize);
+        let (mut file, mut fence) = (Vec::new(), ZFence::new());
+        let (mut pages, mut total_ulen) = (0u32, 0u64);
+        let mut run: Option<usize> = None;
+        while rank < n {
+            let mut page = [0u8; ZPAGE];
+            match fill_group(&images, rank, hint, bind, &mut s, &mut page) {
+                Fill::Page(g) => {
+                    if let Some(at) = run.take() {
+                        fence.push(at as u32, ZNOPAGE, &recs[at].0).unwrap();
+                    }
+                    fence.push(rank as u32, pages, &recs[rank].0).unwrap();
+                    file.extend_from_slice(&page);
+                    pages += 1;
+                    total_ulen += g.ulen as u64;
+                    rank += g.count;
+                    hint = g.count;
+                }
+                Fill::NoPage(_) => {
+                    run.get_or_insert(rank);
+                    rank += 1;
+                }
+                other => panic!("rank {rank}: {other:?}"),
+            }
+        }
+        if let Some(at) = run.take() {
+            fence.push(at as u32, ZNOPAGE, &recs[at].0).unwrap();
+        }
+        let mut bloom = BlockedBloom::with_capacity(n);
+        for (k, _) in &recs {
+            bloom.insert(k);
+        }
+        let filter: Vec<u8> = bloom
+            .blocks
+            .iter()
+            .flat_map(|b| b.iter().flat_map(|w| w.to_le_bytes()))
+            .collect();
+        let (res, f) = fence.encode_resident(&filter).unwrap();
+        let t = Trailer {
+            n_pages: u64::from(pages),
+            n_entries: fence.len() as u64,
+            nkeys: n as u64,
+            res_off: file.len() as u64,
+            res_len: f.res_len,
+            keys_len: f.keys_len,
+            filter_off: f.filter_off,
+            filter_blocks: f.filter_blocks,
+            res_crc: f.res_crc,
+            filter: true,
+            total_ulen,
+            seg_id: 5,
+            seg_end_seq: 6,
+            seg_row_crc: 7,
+            bloom_probes: BLOOM_PROBES,
+            bloom_sig: BLOOM_SIG,
+            bloom_bits_per_key: BLOOM_BITS_PER_KEY,
+            ..sample_trailer()
+        };
+        assert_eq!(t.bind32(), bind);
+        file.extend_from_slice(&res);
+        file.extend_from_slice(&t.encode());
+
+        // The file, read the way an attach and a read will.
+        assert!(file.len().is_multiple_of(ZPAGE));
+        let t = Trailer::decode(&file[file.len() - ZTRAILER..]).expect("the trailer");
+        assert_eq!(t.expected_file_len(), Some(file.len() as u64));
+        let (fence, filter) =
+            ZFence::decode_resident(&file[t.res_off as usize..], &t).expect("the resident part");
+        assert!(t.filter_matches_engine());
+        let bloom = filter_from(filter);
+        for (k, _) in &recs {
+            assert!(bloom.maybe_contains(k), "the stored filter holds every key");
+        }
+        // Every entry that has a page passes a reader's first decode.
+        let mut buf = GroupBuf::new();
+        let (mut paged, mut raw) = (0usize, 0usize);
+        for i in 0..fence.len() {
+            let e = fence.entry(i, n as u32).unwrap();
+            if e.page == ZNOPAGE {
+                raw += e.count as usize;
+                continue;
+            }
+            let at = e.page as usize * ZPAGE;
+            let h = verify_page(&file[at..at + ZPAGE], t.bind32(), &e, &mut buf).expect("a page");
+            paged += usize::from(h.count);
+        }
+        assert_eq!(paged + raw, n);
+        assert!(
+            (3..30).contains(&raw),
+            "{raw} records are read from the raw segment"
+        );
+        // Every key is found through the fence and the group's walk, at its
+        // rank; and a key between two is not.
+        let entry_of = |key: &[u8]| {
+            let (mut lo, mut hi) = (0usize, fence.len());
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if fence.key(mid).unwrap() <= key {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo.checked_sub(1)
+        };
+        let mut raw_seen = 0;
+        for (rank, (k, _)) in recs.iter().enumerate() {
+            for (probe, want_found) in [(k.clone(), true), ([k.as_slice(), &[0u8]].concat(), false)]
+            {
+                let Some(i) = entry_of(&probe) else {
+                    panic!("every probe is at or above the first key")
+                };
+                let e = fence.entry(i, n as u32).unwrap();
+                if e.page == ZNOPAGE {
+                    raw_seen += 1;
+                    continue;
+                }
+                let at = e.page as usize * ZPAGE;
+                let (h, payload) = parse_page(&file[at..at + ZPAGE], t.bind32()).unwrap();
+                let g = decode_group(&h, payload, &mut buf).unwrap();
+                let p = group_seek(g, usize::from(h.count), &probe).unwrap();
+                let at_rank = e.first_rank as usize + p.index;
+                if want_found {
+                    assert!(p.found && at_rank == rank, "rank {rank}");
+                } else {
+                    // The next key may be the probe itself only by chance of the draw.
+                    assert_eq!(
+                        p.found,
+                        recs.get(rank + 1).is_some_and(|(n, _)| *n == probe)
+                    );
+                    assert_eq!(at_rank, rank + 1);
+                }
+            }
+        }
+        assert!(
+            raw_seen >= raw,
+            "the raw records were reached through NOPAGE entries"
+        );
+    }
+
     // ---- pins -----------------------------------------------------------
 
     /// A filter over 4,096 fixed keys, its words as bytes.
