@@ -2457,9 +2457,17 @@ impl BloomFill {
 }
 
 impl BlockedBloom {
+    /// The blocks a filter for `n` keys has: `BLOOM_BITS_PER_KEY` bits a key
+    /// in whole blocks of 512 bits, and one block at the least. The one
+    /// definition of the filter's size, which what prices a stored filter
+    /// (`zpages::filter_bytes`) asks and does not restate.
+    fn blocks_for(n: usize) -> usize {
+        (n * BLOOM_BITS_PER_KEY as usize).div_ceil(512).max(1)
+    }
+
     fn with_capacity(n: usize) -> BlockedBloom {
         BlockedBloom {
-            blocks: vec![[0u64; 8]; (n * BLOOM_BITS_PER_KEY as usize).div_ceil(512).max(1)],
+            blocks: vec![[0u64; 8]; BlockedBloom::blocks_for(n)],
         }
     }
 

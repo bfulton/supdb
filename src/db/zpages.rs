@@ -416,6 +416,65 @@ pub fn lz4_decoder() -> Lz4Decoder {
     }
 }
 
+/// The fingerprint of the encoder every size this layout's tools print
+/// depends on: the bytes in, the bytes out and the CRC-32C of the bytes out
+/// of [`lz4_encoder_pin`]'s fixed input, as `lz4_flex` 0.11.6 makes them.
+/// A release of the crate that compresses differently moves every
+/// records-a-page figure.
+///
+/// It is a computation and not a version because the build that prints a
+/// size is not the build that tests the engine: the suite is its own
+/// workspace with a lock of its own, so a version read from the engine's
+/// lock says nothing of the encoder a tool linked, and a version bump that
+/// leaves the output alone is not a change to any size. Whoever finds the
+/// fingerprint moved takes the sizing again (`bench/examples/zsize.rs`)
+/// before the new bytes are believed, and then moves the constant.
+pub const LZ4_ENCODER_PIN: (usize, usize, u32) = (3720, 2024, 0xE1D3_F522);
+
+/// What the encoder this build links makes of a fixed input, to be compared
+/// with [`LZ4_ENCODER_PIN`]: (bytes in, bytes out, CRC-32C of the bytes out).
+pub fn lz4_encoder_pin() -> (usize, usize, u32) {
+    let input = encoder_pin_input();
+    let out = lz4_flex::block::compress(&input);
+    (input.len(), out.len(), crc32(&out))
+}
+
+/// Thirty of the suite's records, compact, end to end: a counter for a
+/// sixteen-digit key and a value of a hundred bytes, half a repeated phrase
+/// at a phase drawn for each and half entropy from a fixed stream. The
+/// entropy is the module's tests' own generator (an xorshift with a
+/// multiplier) and a test holds the two to the same bytes, so that the pin
+/// is taken over images a test can look at.
+fn encoder_pin_input() -> Vec<u8> {
+    let mut state = 5u64.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut word = move || {
+        let mut x = state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        state = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+    let motif = b"the quick brown fox jumps over the lazy dog 0123456789 ";
+    let mut out = Vec::new();
+    for i in 0..30 {
+        let key = format!("{i:016}");
+        let phase = (word() % motif.len() as u64) as usize;
+        let mut value: Vec<u8> = (0..50).map(|j| motif[(phase + j) % motif.len()]).collect();
+        value.extend((0..50).map(|_| (word() >> 24) as u8));
+        let ext = crate::index::Ext {
+            block: crate::index::Ext::INLINE,
+            off: 0,
+            len: value.len() as u32,
+            last: 0,
+            count: 1 | crate::index::Ext::FIXED,
+        };
+        crate::flatindex::stream_record_as(&mut out, key.as_bytes(), &[ext], &value, true)
+            .expect("a record of the suite's shape is a record");
+    }
+    out
+}
+
 /// A decoded group walked end to end: `count` records laid end to end with
 /// nothing after them, keys strictly ascending, and the first the fence's
 /// where one is given. `parse_record` judges each record, so a compact header
@@ -1399,6 +1458,15 @@ pub fn bind32(seg_id: u64, seg_end_seq: u64, nkeys: u64, seg_row_crc: u32) -> u3
     b[16..24].copy_from_slice(&nkeys.to_le_bytes());
     b[24..28].copy_from_slice(&seg_row_crc.to_le_bytes());
     crc32(&b)
+}
+
+/// The bytes of the filter a sidecar stores for a partition of `nkeys` keys:
+/// the blocks `BlockedBloom` allocates for that many keys, which is the size
+/// of the filter at build and at attach alike. A tool that prices the
+/// resident part asks here and does not restate the filter's bits a key and
+/// its block, so that its model follows a change to the filter.
+pub fn filter_bytes(nkeys: usize) -> usize {
+    super::BlockedBloom::blocks_for(nkeys) * std::mem::size_of::<[u64; 8]>()
 }
 
 /// Everything a first decode of a page checks, in the order that trusts the
@@ -4271,6 +4339,21 @@ mod tests {
     }
 
     #[test]
+    fn the_filters_size_is_the_one_the_filter_allocates() {
+        use super::super::BlockedBloom;
+        // `filter_bytes` is what a tool asks for the stored filter's size: it
+        // is the filter's own allocation, at the counts a block boundary
+        // falls between, and for none.
+        for n in [0usize, 1, 50, 51, 52, 511, 512, 513, 4096, 100_000] {
+            let f = BlockedBloom::with_capacity(n);
+            assert_eq!(filter_bytes(n), f.blocks.len() * 64, "{n} keys");
+            assert!(filter_bytes(n).is_multiple_of(64) && filter_bytes(n) >= 64);
+        }
+        // The suite's ten million keys: ten bits a key, in whole blocks.
+        assert_eq!(filter_bytes(10_000_000), 195_313 * 64);
+    }
+
+    #[test]
     fn the_lz4_codec_is_the_one_the_sizes_were_measured_with() {
         // The decoder the engine's manifest asks for. A build that links the
         // other -- a dependency that asks for the crate's defaults -- fails
@@ -4285,11 +4368,19 @@ mod tests {
         // pages' sizes, and so every records-a-page figure, depend on. A new
         // version of the crate that encodes differently moves them, and the
         // sizing has to be taken again before the new bytes are believed.
+        // The pin is a computation the sizing tool runs in its own build as
+        // well (`lz4_encoder_pin`), over images a test can look at.
         let input = suite_images(30, 5).concat();
-        let c = lz4_flex::block::compress(&input);
         assert_eq!(
-            (input.len(), c.len(), crc32(&c)),
-            (3720, 2024, 0xE1D3_F522),
+            encoder_pin_input(),
+            input,
+            "the pin's input is the suite's records"
+        );
+        let c = lz4_flex::block::compress(&input);
+        assert_eq!((input.len(), c.len(), crc32(&c)), LZ4_ENCODER_PIN);
+        assert_eq!(
+            lz4_encoder_pin(),
+            LZ4_ENCODER_PIN,
             "lz4_flex encodes this input differently: re-run bench/examples/zsize.rs and \
              take the new pin from this message"
         );
@@ -4315,29 +4406,6 @@ mod tests {
         assert!(
             r.is_err() || r.unwrap() != 12,
             "trailing zeros are further sequences"
-        );
-    }
-
-    #[test]
-    fn the_lz4_version_is_the_one_the_sizes_were_measured_with() {
-        // The version the lock resolves. The pages' sizes are the codec's
-        // output, so a new version is a new sizing: take `zsize` again, and
-        // move this pin with the pins of the test above it.
-        let lock = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock");
-        let Ok(text) = std::fs::read_to_string(&lock) else {
-            eprintln!(
-                "no Cargo.lock at {}: the version pin is not checked from here",
-                lock.display()
-            );
-            return;
-        };
-        let at = text
-            .find("name = \"lz4_flex\"")
-            .expect("lz4_flex is in the lock");
-        assert_eq!(
-            text[at..].lines().nth(1),
-            Some("version = \"0.11.6\""),
-            "lz4_flex moved: re-run bench/examples/zsize.rs, then update the pins"
         );
     }
 
