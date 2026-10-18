@@ -38,6 +38,13 @@ use crate::bytes::MmapBytes;
 use crate::flatindex;
 use crate::index::{Ext, Extents};
 use crate::Blob;
+// The selector of the compact form: a controller that is a function of its
+// inputs, with no clock, thread or file of its own. Native only, stated here
+// and not left to `db` being native only already, as the browser's reader must
+// never be able to reach it. A plain comment and not a doc comment, because
+// the module's documentation is its file's.
+#[cfg(not(target_family = "wasm"))]
+pub mod zselect;
 
 /// Write a segment's ordered index, and make it durable where `durable`
 /// says so (`Options::ord_durable`).
