@@ -135,19 +135,20 @@
 //!   whole budget, and another reader of the group takes cache it does not
 //!   subtract. When the compact form takes over, and again when a trial finds
 //!   the raw form still faulting, the raw form's measured faults a read (the
-//!   point reads, over the trailing window) are set against the model's word;
-//!   where they differ by at least `theta_sus` the difference is the model's
-//!   error, and it is kept for as long as the form stands. The compact form is
-//!   judged against the model's word corrected by it: E3 reads the corrected
-//!   rate, so a form is kept while it beats the raw form as measured and left
-//!   when it does not, whether the model said more or less than the census
-//!   saw, and E1 adds the positive part to the model's word, so a model that
-//!   said the store fits while the raw form faulted is not believed that it
-//!   fits once the form has removed the refaults that showed it. Scans have
-//!   no rate in the model, only its word that the store fits: scans that
-//!   fault at `theta_sus` of their class against that word keep E1 from
-//!   acting, and E3, which reads the point reads, has nothing to say of a
-//!   store that only scans.
+//!   point reads of the intervals that counted as evidence, over the trailing
+//!   window) are set against the model's word; where they differ by at least
+//!   `theta_sus` the difference is the model's error, and it is kept for as
+//!   long as the form stands. The compact form is judged against the model's
+//!   word corrected by it: E3 reads the corrected rate, so a form is kept
+//!   while it beats the raw form as measured and left when it does not,
+//!   whether the model said more or less than the census saw, and E1 adds the
+//!   positive part to the model's word, so a model that said the store fits
+//!   while the raw form faulted is not believed that it fits once the form
+//!   has removed the refaults that showed it. Scans have no rate in the
+//!   model, only its word that the store fits: scans that fault at
+//!   `theta_sus` of their class against that word keep E1 from acting, and
+//!   E3, which reads the point reads, has nothing to say of a store that only
+//!   scans.
 //! * **A form E3 left is not bought again on the model's word.** The faults
 //!   the form took through the stretch E3 acted on stand as its rate, where
 //!   they are above the model's, until it is installed again or the store is
@@ -879,6 +880,11 @@ impl<T: Copy + Default, const N: usize> Ring<T, N> {
     fn iter(&self) -> impl Iterator<Item = &(Duration, T)> + '_ {
         (0..self.len).map(move |k| &self.buf[(self.head + k) % N])
     }
+
+    /// The newest entry.
+    fn last_mut(&mut self) -> Option<&mut (Duration, T)> {
+        (self.len > 0).then(|| &mut self.buf[(self.head + self.len - 1) % N])
+    }
 }
 
 /// What one census interval adds to the trailing window the evidence rule
@@ -893,6 +899,10 @@ struct Seen {
     reads: Window,
     /// The scans of the interval.
     scans: Window,
+    /// The refault share held when the interval arrived: its faults were
+    /// capacity misses, and the rate it measured is the raw form's and not a
+    /// cold start's.
+    counted: bool,
 }
 
 /// The refault window at the census cadence, with room to spare.
@@ -1326,10 +1336,12 @@ impl ZSelect {
 
     /// The faults an operation of a class over the trailing window, as the
     /// census saw them while the raw form served: what the raw form takes,
-    /// measured. None under [`MIN_EVIDENCE_OPS`] operations.
+    /// measured, over the intervals the evidence rule took (a first touch is
+    /// not what the raw form takes once the cache is full). None under
+    /// [`MIN_EVIDENCE_OPS`] operations.
     fn raw_seen_in(&self, class: Class) -> Option<f64> {
         let mut w = Window::default();
-        for (_, s) in self.share.iter() {
+        for (_, s) in self.share.iter().filter(|(_, s)| s.counted) {
             w.add(match class {
                 Class::Read => s.reads,
                 Class::Scan => s.scans,
@@ -1406,6 +1418,7 @@ impl ZSelect {
                 faults,
                 reads: census.reads,
                 scans: census.scans,
+                counted: false,
             },
         );
         self.share.expire(now, REFAULT_WINDOW);
@@ -1418,6 +1431,11 @@ impl ZSelect {
             self.model
                 .is_some_and(|m| self.faults_since_suspect >= m.budget / PAGE)
         };
+        if share_ok {
+            if let Some((_, newest)) = self.share.last_mut() {
+                newest.counted = true;
+            }
+        }
         let mut ev = Evidence::default();
         if !share_ok {
             return ev;
@@ -5619,6 +5637,24 @@ mod tests {
     /// One step by hand: reads that fault on 40% of them and refault, the
     /// model on the tick, and what the caller gives of a sampler.
     fn hand(sel: &mut ZSelect, step: u64, generation: u64, sampler: Option<Sampler>) -> Decision {
+        let reads = Window {
+            ops: 5000,
+            faults: 2000,
+        };
+        hand_with(sel, step, generation, sampler, (reads, 2000), 0.0)
+    }
+
+    /// One step by hand as [`hand`], with the interval's reads and the
+    /// group's refaults given, and the share of the footprint the builder has
+    /// attached.
+    fn hand_with(
+        sel: &mut ZSelect,
+        step: u64,
+        generation: u64,
+        sampler: Option<Sampler>,
+        (reads, refaults): (Window, u64),
+        coverage: f64,
+    ) -> Decision {
         sel.step(&Input {
             now: DT * step as u32,
             model: step.is_multiple_of(10).then_some(Model {
@@ -5629,12 +5665,13 @@ mod tests {
                 budget: 870_000_000,
             }),
             census: Census {
-                reads: Window {
-                    ops: 5000,
-                    faults: 2000,
-                },
-                refaults: Some(2000),
+                reads,
+                refaults: Some(refaults),
                 ..Census::default()
+            },
+            build: Build {
+                coverage,
+                ..Build::default()
             },
             sampler,
             generation,
@@ -5686,6 +5723,54 @@ mod tests {
         step += 1;
         let d = hand(&mut sel, step, 1, Some(reading(0.1, false, 1)));
         assert_eq!(d.event, Some(Event::BuildStart));
+    }
+
+    #[test]
+    fn the_models_error_is_measured_over_capacity_misses_and_not_a_cold_start() {
+        // A restart reads a store nothing has touched: every read faults, and
+        // none of the faults is a page the cache once held. The evidence rule
+        // takes no such interval, and neither does the measure of the raw
+        // form's rate that the model is judged by when the form takes over:
+        // taken over them it would read the cold fill into the raw form's rate
+        // and file an error of the wrong sign.
+        let cold = Window {
+            ops: 5000,
+            faults: 5000,
+        };
+        let warm = Window {
+            ops: 5000,
+            faults: 2000,
+        };
+        let (mut sel, mut step) = suspect_by_hand();
+        for _ in 0..6 {
+            step += 1;
+            hand_with(&mut sel, step, 0, None, (cold, 0), 0.0);
+        }
+        assert_eq!(sel.excess(), 0.0, "a cold start is not evidence");
+        // The reads that follow refault and fault on 40% of them, the model
+        // said 50%. The share holds only once the refaults are half of the
+        // window's faults, which is fifteen intervals on.
+        let mut started = None;
+        for k in 1..=40 {
+            step += 1;
+            let d = hand_with(
+                &mut sel,
+                step,
+                0,
+                Some(reading(0.1, false, 0)),
+                (warm, 2000),
+                0.0,
+            );
+            if d.event == Some(Event::BuildStart) {
+                started = Some(k);
+                break;
+            }
+        }
+        assert_eq!(started, Some(16));
+        step += 1;
+        let d = hand_with(&mut sel, step, 0, None, (warm, 2000), 1.0);
+        assert_eq!(d.event, Some(Event::Install));
+        assert!((sel.bias - (0.4 - 0.5)).abs() < 1e-9, "{}", sel.bias);
     }
 
     #[test]
