@@ -38,6 +38,8 @@ elif grep -q 'HUNT-FAIL thread-later-write' "$LOG"; then
   echo "F1-thread-later-write $ID"
 elif grep -q 'HUNT-FAIL torn' "$LOG"; then
   echo "F1-torn $ID"
+elif grep -q 'HUNT-FAIL oracle' "$LOG"; then
+  echo "F3-oracle rc=$RC $ID"
 elif grep -q 'HUNT-FAIL windows' "$LOG"; then
   echo "F0-windows $ID"
 elif grep -q 'HUNT-FAIL writer-after' "$LOG"; then

@@ -20,6 +20,24 @@
 //! in the engine (`dbgtrace::hold_forms_position`): the forms publisher is
 //! parked between its slot swaps and its store of the position the slots
 //! are current to, and the snapshot handle scans there.
+//!
+//! Knobs, all environment variables: `HUNT_ITERS` scenario runs in the
+//! process; `HUNT_SEED` xored into the seeds (0 is the original's);
+//! `HUNT_NKEYS` (5000), `HUNT_PART_KIB` (160); `HUNT_UPKEEP`
+//! (inline|bg1|bg2|bg3); `HUNT_HOLD` (1: the seal is held), `HUNT_SETTLE`
+//! (1: a settle after the load), `HUNT_ROUNDS` (3), `HUNT_OPS` (120),
+//! `HUNT_SEAL_AFTER` (1), `HUNT_WINDOWS` (1: the window scans before the
+//! snapshot), `HUNT_STRIDE` (238: rank stride of the start keys),
+//! `HUNT_SNAPS` (1: snapshot cycles), `HUNT_AFTER_N` (200) and
+//! `HUNT_AFTER_STEP` (5) the puts after the snapshot, `HUNT_AFTER_COMMITS`
+//! (1), `HUNT_PAUSE_MS` (0: a sleep between the commit and the scans),
+//! `HUNT_READERS`, `HUNT_SNAP_THREADS`, `HUNT_TORN_THREADS`, `HUNT_HOGS`
+//! (threads of the kinds named, started with the puts), `HUNT_STRICT`,
+//! `HUNT_SNAP_STEP` (3), `HUNT_SNAP_LIMITS` (3,57,114), `HUNT_PREWARM`,
+//! `HUNT_DROP_LATEST`, `HUNT_PUBLISH_DELAY_US` (a sleep in the publisher
+//! between the swaps and the position), `HUNT_READER_DELAY_US` (a sleep in
+//! a handle's scan between its decision and its first slot load),
+//! `HUNT_OPT=name=value,...` (an engine option turned, see `apply_opts`).
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -111,6 +129,12 @@ struct Cfg {
     prewarm: bool,
     /// Drop the Latest handle before the snapshot phase.
     drop_latest: bool,
+    /// The forms publisher sleeps this long between its slot swaps and
+    /// its store of the position (a deliberately placed yield).
+    publish_delay_us: u64,
+    /// A handle's scan sleeps this long between deciding the forms are
+    /// current to its bound and loading the first slot.
+    reader_delay_us: u64,
 }
 
 fn hunt_cfg() -> Cfg {
@@ -153,6 +177,8 @@ fn hunt_cfg() -> Cfg {
             .collect(),
         prewarm: env_flag("HUNT_PREWARM", false),
         drop_latest: env_flag("HUNT_DROP_LATEST", false),
+        publish_delay_us: env_usize("HUNT_PUBLISH_DELAY_US", 0) as u64,
+        reader_delay_us: env_usize("HUNT_READER_DELAY_US", 0) as u64,
     }
 }
 
@@ -465,14 +491,56 @@ struct World {
     latest: Option<Reader>,
 }
 
+/// `HUNT_OPT=name=value,name=value`: engine options taken away or turned,
+/// to test a suspect mechanism by its absence. Booleans are 0 or 1.
+fn apply_opts(o: &mut Options) {
+    let Some(list) = env_str("HUNT_OPT") else {
+        return;
+    };
+    for kv in list.split(',') {
+        let (k, v) = kv.split_once('=').unwrap_or_else(|| panic!("HUNT_OPT {kv}"));
+        let flag = v != "0";
+        let n: usize = v.parse().unwrap_or(0);
+        match k {
+            "share_snapshot" => o.share_snapshot = flag,
+            "commit_forms" => o.commit_forms = flag,
+            "commit_forms_build" => o.commit_forms_build = flag,
+            "forms_carry" => o.forms_carry = flag,
+            "forms_rebase" => o.forms_rebase = flag,
+            "forms_publish_lazily" => o.forms_publish_lazily = flag,
+            "upkeep_alert" => o.upkeep_alert = flag,
+            "upkeep_inline_bursts" => o.upkeep_inline_bursts = flag,
+            "upkeep_settle_after_scans" => o.upkeep_settle_after_scans = flag,
+            "forms_convert_unread" => o.forms_convert_unread = flag,
+            "forms_convert_yield" => o.forms_convert_yield = flag,
+            "scan_cache_ahead" => o.scan_cache_ahead = flag,
+            "frozen_snaps" => o.frozen_snaps = flag,
+            "overlay_merge" => o.overlay_merge = flag,
+            "seal_snapshot" => o.seal_snapshot = flag,
+            "snapshot_carry" => o.snapshot_carry = flag,
+            "forms_pieces_only" => o.forms_pieces_only = flag,
+            "forms_to_fit" => o.forms_to_fit = flag,
+            "copy_exact" => o.copy_exact = flag,
+            "publish_in_background" => o.publish_in_background = flag,
+            "snapshot_adopt_behind" => o.snapshot_adopt_behind = n,
+            "upkeep_inline_min" => o.upkeep_inline_min = n,
+            "upkeep_alert_poll_us" => o.upkeep_alert_poll_us = n as u32,
+            "forms_settle_backlog_pct" => o.forms_settle_backlog_pct = n,
+            "upkeep_pass_pct" => o.upkeep_pass_pct = n,
+            other => panic!("HUNT_OPT: unknown option {other}"),
+        }
+    }
+}
+
 fn build_world(cfg: &Cfg, name: &str) -> World {
     let dir = scratch(name);
-    let opts = Options {
+    let mut opts = Options {
         partition_bytes: Some(cfg.part_kib << 10),
         scan_block_cache: true,
         upkeep: cfg.upkeep,
         ..Options::default()
     };
+    apply_opts(&mut opts);
     let mut db = Db::create(&dir, opts).unwrap();
     let mut model = ordered_load(&mut db, cfg.nkeys, 0x71D ^ cfg.seed);
     if cfg.settle {
@@ -701,9 +769,12 @@ fn scenario(cfg: &Cfg, iter: usize) -> Result<Tally, String> {
         }
         for cycle in 0..cfg.snaps {
             let snap = w.db.reader().unwrap();
+            let t_pinned = dbgtrace::now_ns();
             snap.snapshot();
             let at_snapshot = w.model.clone();
             let (ks, tag) = cycle_keys(cfg, &w.keys, cycle);
+            dbgtrace::set_publish_delay_us(cfg.publish_delay_us);
+            dbgtrace::set_reader_delay_us(cfg.reader_delay_us);
             if cycle == 0 {
                 watchers = Some(start_watchers(
                     &w,
@@ -762,7 +833,7 @@ fn scenario(cfg: &Cfg, iter: usize) -> Result<Tally, String> {
                                     &at_snapshot,
                                     Some(&w.model),
                                     &line,
-                                    t_commit
+                                    t_pinned.min(t_commit)
                                 )
                             ));
                         }

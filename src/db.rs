@@ -146,9 +146,35 @@ pub mod dbgtrace {
         FORMS_HOLD.load(Ordering::Acquire) & 2 != 0
     }
 
+    static PUBLISH_DELAY_US: AtomicU64 = AtomicU64::new(0);
+    static READER_DELAY_US: AtomicU64 = AtomicU64::new(0);
+
+    /// HUNT: a handle's scan sleeps this long between its decision that
+    /// the forms are current to its bound and its first load of a slot.
+    pub fn set_reader_delay_us(us: u64) {
+        READER_DELAY_US.store(us, Ordering::Relaxed);
+    }
+
+    pub(super) fn reader_pause() {
+        let delay = READER_DELAY_US.load(Ordering::Relaxed);
+        if delay > 0 {
+            std::thread::sleep(std::time::Duration::from_micros(delay));
+        }
+    }
+
+    /// HUNT: a publisher that sleeps this long between its slot swaps and
+    /// its store of the position, to lengthen the window the race needs.
+    pub fn set_publish_delay_us(us: u64) {
+        PUBLISH_DELAY_US.store(us, Ordering::Relaxed);
+    }
+
     /// The publisher's wait, if a test holds it. Marks itself parked so the
     /// test knows the slots are ahead of the position.
     pub(super) fn forms_hold_wait() {
+        let delay = PUBLISH_DELAY_US.load(Ordering::Relaxed);
+        if delay > 0 {
+            std::thread::sleep(std::time::Duration::from_micros(delay));
+        }
         if FORMS_HOLD.load(Ordering::Acquire) & 1 == 0 {
             return;
         }
@@ -199,6 +225,22 @@ pub mod dbgtrace {
         }
     }
 
+    /// HUNT: the diagnosis printed where `BuildCtx::cut_known` is about to
+    /// assert: the arguments, the thread, a backtrace, and the ring.
+    pub fn cut_behind(cut: u32, rank: usize, end: usize) {
+        let bt = std::backtrace::Backtrace::force_capture();
+        let th = std::thread::current();
+        eprintln!(
+            "HUNT-CUT-BEHIND thread {:?}: cut {cut} = rank {} same {}; the walk stands at rank {rank}, ends at {end}\n{bt}",
+            th.name(),
+            cut >> 1,
+            cut & 1
+        );
+        for line in dump(now_ns().saturating_sub(100_000_000)) {
+            eprintln!("TRACE {line}");
+        }
+    }
+
     /// The events at or after `since_ns`, in time order, as lines.
     pub fn dump(since_ns: u64) -> Vec<String> {
         let mut v: Vec<(u64, u64, u64, u64, u64, u64)> = Vec::new();
@@ -221,6 +263,7 @@ pub mod dbgtrace {
                 let (kind, who) = ((kw >> 32) as u8, kw as u32 as i64);
                 let who = match who {
                     254 => "upkeep".to_string(),
+                    253 => "pub".to_string(),
                     255 => "writer".to_string(),
                     w => format!("h{w}"),
                 };
@@ -240,6 +283,7 @@ pub mod dbgtrace {
                     7 => format!("UPKEEP_PASS {} commit {b}", if a == 0 { "begin" } else { "end" }),
                     8 => format!("COMMIT_MARK log {a} len {b}"),
                     9 => format!("SNAPSHOT_PINNED log bound {a} len {b}"),
+                    12 => format!("STATE_REPLACED now gen {a} lives {b}"),
                     10 => format!("TEST commit {}", if a == 0 { "begin" } else { "returned" }),
                     11 => format!("TEST scan {}", if a == 0 { "begin" } else { "returned" }),
                     k => format!("kind {k} a {a} b {b}"),
@@ -18038,6 +18082,9 @@ impl Reader {
             st.gen,
             st as *const State as usize,
         );
+        if canonical && self.slot.is_some() {
+            dbgtrace::reader_pause();
+        }
         if self.opts.commit_forms && self.forms_bound().is_some() && !resumed {
             match self.slot {
                 Some(slot) => {
@@ -25726,10 +25773,67 @@ impl<'s> BuildCtx<'s> {
         let owner = if same { rank } else { rank.saturating_sub(1) };
         (owner / CACHE_BLOCK, ((rank as u32) << 1) | same as u32)
     }
+    /// HUNT: the overlay a walk is about to trip on, with the partition it
+    /// walks, before the assertion.
+    fn dump_overlay(site: &str, ov: &Overlay, seg: &Seg, rank: usize, hi: usize, at: usize) {
+        use std::fmt::Write as _;
+        let mut s = String::new();
+        let _ = writeln!(
+            s,
+            "HUNT-OVERLAY at {site}: walk rank {rank} end {hi}; overlay entry {at} of {};              partition {} blob {} keys {} lo {:?} hi {:?}",
+            ov.over.len(),
+            seg.name,
+            seg.blob.id(),
+            seg.blob.keys(),
+            String::from_utf8_lossy(&seg.lo),
+            seg.hi.as_ref().map(|h| String::from_utf8_lossy(h).into_owned()),
+        );
+        for (i, o) in ov.over.iter().enumerate().take(80) {
+            let (_, truth) = Self::owner_of(seg, o.key);
+            let _ = writeln!(
+                s,
+                "  [{i}] {} cut {} (rank {} same {}) true cut (rank {} same {}){} sk {}",
+                String::from_utf8_lossy(o.key),
+                if o.cut == u32::MAX {
+                    "none".to_string()
+                } else {
+                    o.cut.to_string()
+                },
+                if o.cut == u32::MAX { 0 } else { o.cut >> 1 },
+                if o.cut == u32::MAX { 0 } else { o.cut & 1 },
+                truth >> 1,
+                truth & 1,
+                if o.cut != u32::MAX && o.cut != truth {
+                    "  <-- STALE"
+                } else {
+                    ""
+                },
+                o.sk.is_some()
+            );
+        }
+        // The partition's own keys, for reading the ranks against.
+        let mut keys = String::new();
+        for r in 0..seg.blob.keys().min(80) {
+            let _ = write!(
+                keys,
+                "{}:{} ",
+                r,
+                seg.blob
+                    .key_at(r)
+                    .map(|k| String::from_utf8_lossy(k).into_owned())
+                    .unwrap_or_default()
+            );
+        }
+        let _ = writeln!(s, "  partition keys: {keys}");
+        eprint!("{s}");
+    }
     /// PROTOTYPE: a cut carried with a key, as `cut_at` would answer it for
     /// a walk standing at `rank` and ending at `end`.
     fn cut_known(cut: u32, rank: usize, end: usize) -> (usize, Ordering) {
         let c = (cut >> 1) as usize;
+        if c < rank {
+            dbgtrace::cut_behind(cut, rank, end);
+        }
         debug_assert!(c >= rank, "an overlay key's cut is behind the walk");
         let c = c.max(rank);
         if c >= end {
@@ -26377,6 +26481,11 @@ impl<'s> BuildCtx<'s> {
         while seen < limit {
             let end = rank.saturating_add(limit - seen).min(hi);
             let next = ov.over.get(oi);
+            if let Some(o) = next {
+                if o.cut != u32::MAX && ((o.cut >> 1) as usize) < rank {
+                    Self::dump_overlay("walk_block", ov, seg, rank, end, oi);
+                }
+            }
             let (bound, at_bound) = match next {
                 Some(o) if o.cut != u32::MAX => BuildCtx::cut_known(o.cut, rank, end),
                 Some(o) if end > rank => BuildCtx::cut_at(seg, rank, end, o.key),
@@ -26565,6 +26674,9 @@ impl<'s> BuildCtx<'s> {
         let mut rank = ranks.start;
         for (oi, o) in ov.over.iter().enumerate() {
             let (cut, at) = if o.cut != u32::MAX {
+                if ((o.cut >> 1) as usize) < rank {
+                    Self::dump_overlay("deltas_for", ov, seg, rank, hi, oi);
+                }
                 BuildCtx::cut_known(o.cut, rank, hi)
             } else if rank < hi {
                 BuildCtx::cut_at(seg, rank, hi, o.key)
@@ -27447,6 +27559,15 @@ impl std::ops::Deref for Maint {
 /// `old`, replaced in the state pointer by its caller, retired at an epoch
 /// the bump makes and freed once no reader is pinned before it.
 fn retire_state(shared: &Shared, old: *mut State) {
+    {
+        // HUNT: a state replaced, by whichever thread published.
+        // SAFETY: the caller swapped `old` out and owns it; the current
+        // state is pinned by the caller or by the epoch below.
+        let (og, ol) = unsafe { ((*old).gen, (*old).lives) };
+        let cur = shared.state.load(AtomicOrdering::Acquire);
+        let (ng, nl) = unsafe { ((*cur).gen, (*cur).lives) };
+        dbgtrace::ev3(12, 253, ng, nl, og, ol as usize);
+    }
     let tag = shared.readers.bump();
     // SAFETY: the caller swapped it out of the state pointer and owns it.
     shared.retired.push(tag, unsafe { Box::from_raw(old) });
