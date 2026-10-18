@@ -1859,12 +1859,14 @@ fn windows_over(name: &str, cache: bool) {
     }
     // A snapshot keeps the answers it was taken at, whatever the writer does
     // after. Not with the block cache on: a handle holding a snapshot read a
-    // post-snapshot write of a key that was unsealed already, in a scan, once
-    // in some hundreds of runs, with the second form off as well and at the
-    // commit this was built from. The scan snapshot a handle adopts from the
-    // state is checked for its keys alone (`refresh_snapshot_to`), and its
-    // copies of the runs may have been taken at a later log position than
-    // the handle's own bound.
+    // post-snapshot write of a key that was unsealed already, in a scan, in
+    // about one run in two hundred (2 of 600 with the second form forced, 8
+    // of 1,300 with it off, on this branch's engine). The cause is not known
+    // here. The scan snapshot a handle adopts from the state is checked for
+    // its keys alone (`refresh_snapshot_to`) and was suspected; adopting one
+    // only when its copies of the runs were taken at or before the handle's
+    // own log position, as a throwaway patch, left the rate where it was (5
+    // of 700 in each form), so that is not the answer.
     if !cache {
         let snap = db.reader().unwrap();
         snap.snapshot();
