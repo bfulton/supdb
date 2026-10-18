@@ -5948,6 +5948,59 @@ pass; the bounded rows' division is read with that in mind, and the
 first scan of a divided pass is to be reported on its own, as
 `SUPDB_SCAN_OPS` reports it for the scan pass.
 
+#### Out of core: against LMDB with its readahead off
+
+The first bounded rung at ten million keys under a gibibyte read the
+arm with no block cache beside LMDB as a user gets it and with its
+readahead off, the lines of the warmup rep, one rep each and the banked
+rep not yet in. LMDB's default readahead is a loss out of core on its
+own: a fault reads 74 KB and a point read 19.8 KB from the device, 12
+times the arm's, and the arm reads at 54 thousand a second to its 33
+thousand, 147 thousand to 52 thousand on three threads. The LMDB a user
+configures for the regime turns it off, and that arm is the comparison:
+0.27 faults and 1.1 KB a point read to the arm's 0.41 and 1.7 KB, 82
+thousand reads a second to 54 thousand on one thread and 195 thousand to
+147 thousand on three, scans at 2.03 million entries a second to 0.80 on
+one thread and 4.82 million to 4.08 on three. Writes go the other way:
+mix A at 244 thousand operations a second to 65 thousand, the ordered
+load at 1.35 million to 0.94, and the shuffled load faulted 1.5 million
+times on LMDB's writer where the arm's writer faulted none. The
+prediction written before the line printed (0.27 +- 0.03 faults, 65-85
+thousand reads a second, scans between 0.8 and 1.83 million) held for
+the reads and missed the scans, which were faster than the range: the
+readahead-off arm takes 1.1 faults a scan where the readahead-on arm
+took 0.44 with 69 KB a fault, and was faster for it.
+
+A point read of this suite's records touches two pages, the hash slot and
+the record whose value is inline (`Options::inline_bytes`). The slots are
+touched by every read, so they stay resident and take their share of the
+cache before any record does, and the faults a read takes are the share
+of the records the rest of the cache cannot hold: a file of 1.5 GB (the
+three-million ratio of 1.31 bytes on disk a byte carried up), 0.94 GB of
+cache and about 0.19 GB of slots (a power-of-two table of 8-byte slots,
+19 bytes a key at this partition size) predict 0.40-0.44 faults a read,
+and 0.41 was measured; LMDB's 1.33 GB file with branch pages in the
+megabytes predicts 0.30, and 0.27 was measured. The cold single-thread
+scan pass reads 2.9 faults a scan where the threaded passes read 1.3,
+which fits the ordered index's heads (80 MB for the store) being faulted
+in by the first scans and found resident by the threaded passes; the
+counts do not separate the two.
+
+What a compact form would buy follows from the same model and is
+arithmetic, not a measurement. The suite's records, sixteen digits and a
+hundred bytes of which half is a repeated phrase, compress to 0.57 of
+their size in blocks of 4-8 KiB under LZ4, the engine's codec, and to
+0.53-0.55 under zlib at level 1, measured offline over 200,000 of them
+with the Python modules, and to nothing one value at a time; a block
+decompresses in 2-3 microseconds there and compresses at about 0.6 GB a
+second. Records held as groups that each fill one 4 KiB page, some 60
+of them, would be 67 bytes a key and about 0.7 GB at ten million keys
+where the raw region is 1.3 GB, under a cache of 0.94. The hash is then
+the smaller lever: dropping it from the point read's path frees at most
+0.19 GB, about a seventh of the faults. `lz4_flex` is the engine's
+already (`src/block.rs`), and the ordered index is the pattern for a
+sidecar the store derives, checks against its segment and regenerates.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and

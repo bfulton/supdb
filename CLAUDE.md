@@ -523,6 +523,24 @@ Two consequences for code in this repository:
 - **No standing figure is written down here.** A number belongs in a row and
   a figure is drawn from the rows by `bench figures`. A figure attached to a
   *change* belongs in the pull request that made it, rounded.
+- **A cell a comparator wins is a workload the engine has no strategy for.**
+  The file may carry more than one form of a structure and the reader choose
+  the one the workload calls for, because the cache is charged for the pages
+  a path touches and not for the file's size: a form the chosen path never
+  reads costs disk and the time to write it. Out of core that is the lever.
+  A point read of inline values touches the hash slot and the record; the
+  slots are touched by every read, so they stay resident and crowd the
+  records out, and the records are the bytes a read misses on. Both have a
+  compact form that the raw one does not preclude. Two rules keep it honest.
+  A second form that accompanies the records may only be one the other paths
+  never touch -- `src/ordindex.rs` records an over-store that scans touched
+  as well, which enlarged the working set it was meant to beat. And the
+  choice is made from what the store measures of the workload, the share of
+  its lookups that blocked and the limit it runs under, the form is built
+  only when that measure calls for it so the in-memory rows cannot move, and
+  the choice is taken back when the measure turns. The first version of this
+  note argued the other way, that past the memory line trading space for
+  speed was no longer free, because it priced the file by its size.
 
 ## Invariants a change must not break
 
@@ -1940,11 +1958,12 @@ read all four at 1.0-1.9x.
 These are the engine's, as opposed to refuted predictions. Each is a curve
 in the suite's figures, at `full` scale where it says so:
 
-- Out-of-core reads fall off a cliff. Once the file exceeds the memory that
-  can cache it, throughput drops by orders of magnitude and the latency
-  distribution goes bimodal -- every miss is a synchronous page fault. This
-  is the mapped read path's shape, not a bug; it is the `read` curves past
-  the memory line.
+- Out-of-core reads run at the speed of their misses. Once the file exceeds
+  the memory that can cache it, every miss is a synchronous page fault and a
+  rate is the faults an operation takes over the device's latency. The faults
+  an operation takes are the engine's to cut, and it takes more than LMDB with
+  readahead off (the `ooc` scale, `bench/DESIGN.md`): a lead, not a limit --
+  see the third consequence under "The suite lives in bench/".
 - The durable ordered load trailed LMDB and RocksDB until ordered ingest
   went straight into segments; the suite's rows since say where it stands,
   and shuffled arrival still inverts both. Quote the pair, never one: the
