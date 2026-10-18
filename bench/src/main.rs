@@ -10,6 +10,7 @@ usage:
   bench run --scale quick|full [--out DIR] [--arms a,b,...] [--top KEYS] [--bottom KEYS] [--reps N]
   bench run --scale ooc --bound BYTES [--ops-div N] [the options above]
   bench ab --arms A,B [--size KEYS] [--reps N] [--len ENTRIES] [--pairs TEXT] [--bound BYTES] [--passes a,b,...]
+           [--ops-div N] [--compress FRACTION]
   bench gate ROW.json [--runs DIR]
   bench figures [--runs DIR] [--out DIR] [--scale quick|full|ooc]
   bench machine
@@ -40,6 +41,10 @@ ab     two arms in one process, alternating and paired rep by rep, for choosing
        --passes a comma-separated subset of load,read,read-threaded,scan,scan-threaded,
                mixes,scan-mixed,lag (default: all), for a question one phase answers
                at a rung where the whole pass is an hour.
+       --ops-div as for run, here at any scale (default 1): the read passes' counts
+               divided, for a pairing at a rung where the whole pass is an hour.
+       --compress the fraction of each value that is a repeated phrase (default 0.5,
+               the suite's); 0.0 is the incompressible control for a compact form.
        An arm against itself (--arms supdb,supdb) is the control: what a
        verdict looks like when nothing differs.
 gate   compares ROW to the last ten rows of its class and scale under runs/ (--runs, default runs);
@@ -257,8 +262,26 @@ fn cmd_ab(a: Args) -> i32 {
     if let Some(l) = a.num("--len") {
         plan.scan_len = (l as usize).max(1);
     }
+    if a.get("--ops-div").is_some() {
+        match a.num("--ops-div") {
+            Some(d) if d >= 1 => plan.ops_div = d,
+            _ => {
+                eprintln!("--ops-div takes a divisor of at least 1\n\n{USAGE}");
+                return 2;
+            }
+        }
+    }
+    if let Some(text) = a.get("--compress") {
+        match text.parse::<f64>() {
+            Ok(c) if (0.0..=1.0).contains(&c) => plan.compress = c,
+            _ => {
+                eprintln!("--compress takes a fraction from 0 to 1\n\n{USAGE}");
+                return 2;
+            }
+        }
+    }
     eprintln!(
-        "bench ab: {a0} against {b0} at {size} keys, scans of {}, {reps} pairs after a warmup{}{}",
+        "bench ab: {a0} against {b0} at {size} keys, scans of {}, {reps} pairs after a warmup{}{}{}{}",
         plan.scan_len,
         match plan.bound_bytes() {
             Some(b) => format!(", under a bound of {b} bytes"),
@@ -268,6 +291,16 @@ fn cmd_ab(a: Args) -> i32 {
             String::new()
         } else {
             format!(", passes {}", a.get("--passes").unwrap_or_default())
+        },
+        if plan.ops_div > 1 {
+            format!(", ops divided by {}", plan.ops_div)
+        } else {
+            String::new()
+        },
+        if (plan.compress - 0.5).abs() > f64::EPSILON {
+            format!(", values {} compressible", plan.compress)
+        } else {
+            String::new()
         }
     );
     let mut log = std::io::stderr();

@@ -239,6 +239,11 @@ pub struct Plan {
     /// lag bursts are never divided, since a store is built whole or not
     /// at all.
     pub ops_div: u64,
+    /// The fraction of each value that is a repeated phrase and so compresses
+    /// (`Payload`'s compressibility): the suite's half by default. A control at
+    /// 0.0 stores the same number of bytes that nothing can shrink, which is
+    /// what a compact form of the records is priced against.
+    pub compress: f64,
     /// The memory bound the run measures under, entered before the plan
     /// was made (`bound::Bound`), or none.
     pub bound: Option<Bound>,
@@ -265,6 +270,7 @@ impl Plan {
                 Scale::Ooc => OOC_OPS_DIV,
                 Scale::Quick | Scale::Full => 1,
             },
+            compress: 0.5,
             bound: None,
             passes: Passes::all(),
         }
@@ -683,7 +689,7 @@ pub fn run(
     engines::check_matched(&plan.arms, root)?;
 
     let rungs = ladder_from(plan.bottom, plan.top);
-    let payload = Payload::new(plan.value_size, 0.5, 0xE1);
+    let payload = Payload::new(plan.value_size, plan.compress, 0xE1);
     let mut s = Samples {
         map: BTreeMap::new(),
     };
@@ -1863,7 +1869,7 @@ pub fn ab(
     plan: &Plan,
     log: &mut dyn std::io::Write,
 ) -> Result<Vec<AbQuantity>, String> {
-    let payload = Payload::new(plan.value_size, 0.5, 0xE1);
+    let payload = Payload::new(plan.value_size, plan.compress, 0xE1);
     let map_gb = lmdb_map_gb(size, plan.value_size);
     let root = std::env::temp_dir().join(format!("supdb-ab-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&root);
@@ -3034,7 +3040,7 @@ mod tests {
             std::env::temp_dir().join(format!("supdb-bench-threaded-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let plan = Plan::new(Scale::Quick, vec![], 10_000, 4);
-        let payload = Payload::new(plan.value_size, 0.5, 0xE1);
+        let payload = Payload::new(plan.value_size, plan.compress, 0xE1);
         let size = 2_000u64;
         for arm in ["supdb", "supdb-ingest", "lmdb", "rocksdb-tuned"] {
             let dir = root.join(arm);
