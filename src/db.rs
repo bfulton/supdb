@@ -15061,7 +15061,49 @@ impl Reader {
             t.pieces = pieces;
             t.piece_ranks = piece_ranks;
             if rebased {
+                if !froze && keep_snap && std::env::var("HUNT_CHECK_CUTS").is_ok() {
+                    let mut stale = 0usize;
+                    let mut total = 0usize;
+                    let mut first = None;
+                    for (b, list) in t.added.iter().enumerate() {
+                        for &(slot, cut) in list {
+                            if slot as usize >= self.mem().len() {
+                                continue;
+                            }
+                            total += 1;
+                            let key = self.mem().key_of(self.mem().entry(slot as usize));
+                            let (nb, ncut) = BuildCtx::owner_of(seg, key);
+                            if nb != b || ncut != cut {
+                                stale += 1;
+                                first.get_or_insert((b, nb, cut, ncut, key.to_vec()));
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "HUNTCUTS rebase p {p}: {} filed keys carried, {} with a cut that is not the new partition's (keep_snap {keep_snap}); first {:?}; keys now {}",
+                        total,
+                        stale,
+                        first.map(|(b, nb, c, nc, k)| (b, nb, c >> 1, c & 1, nc >> 1, nc & 1, String::from_utf8_lossy(&k).to_string())),
+                        seg.blob.keys()
+                    );
+                }
                 t.blob = seg.blob.id();
+                if hunt_fix2() && keep_snap && !froze {
+                    // HUNT_FIX2: the cuts of the keys filed against the
+                    // partition this table was made over are taken again
+                    // against the one it is carried to.
+                    let mut all: Vec<(u32, u32)> = Vec::new();
+                    for list in t.added.iter_mut() {
+                        all.append(list);
+                    }
+                    for (slot, _) in all {
+                        let key = self.mem().key_of(self.mem().entry(slot as usize));
+                        let (nb, ncut) = BuildCtx::owner_of(seg, key);
+                        if let Some(list) = t.added.get_mut(nb) {
+                            list.push((slot, ncut));
+                        }
+                    }
+                }
             }
             if landed && !froze {
                 // The retired bases went with the tables they named, and
@@ -16559,7 +16601,18 @@ impl Reader {
         // have committed past it meanwhile, and forms stamped with a
         // later position would be taken by a reader there without the
         // writes between.
+        if self.understudy {
+            hunt_pause("HUNT_THREAD_BEFORE_PUBLISH_MS");
+        }
+        if hunt_fix() {
+            // HUNT_FIX: the forms are no reader's to trust while they are
+            // being replaced.
+            st.forms_at.store(usize::MAX, AtomicOrdering::Release);
+        }
         if self.publish_dirty(false) {
+            if self.understudy {
+                hunt_pause("HUNT_THREAD_BEFORE_ADVANCE_MS");
+            }
             st.forms_complete
                 .store(self.fs().tables_complete.get(), AtomicOrdering::Release);
             st.forms_at.store(
@@ -17841,6 +17894,7 @@ impl Reader {
             }
         }
         let complete = canonical && st.forms_complete.load(AtomicOrdering::Acquire);
+        let mut stale_canon = false;
         // One context for the scan: its tombstone flag is a walk over every
         // segment, which a context per block paid on every sparse walk.
         let ctx = self.build_ctx();
@@ -17953,8 +18007,30 @@ impl Reader {
                 // A wide form is the handle's own to walk against its own
                 // list of filed keys, so it is never taken from the
                 // table; a reader that meets one builds as before.
-                let canon: Option<&Cached> =
-                    match canonical.then(|| self.canonical(pi, b)).flatten() {
+                if canonical && self.isolation.get() == Isolation::Snapshot {
+                    hunt_pause("HUNT_SCAN_AFTER_CHECK_MS");
+                }
+                let loaded = if canonical && !stale_canon {
+                    self.canonical(pi, b)
+                } else {
+                    None
+                };
+                // HUNT_FIX: the position is read again after the form is,
+                // and a form is taken only if it still names the position
+                // the handle holds.
+                if hunt_fix()
+                    && canonical
+                    && !stale_canon
+                    && !self
+                        .forms_bound()
+                        .is_some_and(|n| st.forms_at.load(AtomicOrdering::Acquire) == n)
+                {
+                    stale_canon = true;
+                }
+                let canon: Option<&Cached> = if stale_canon {
+                    None
+                } else {
+                    match loaded {
                         Some(Cached::Wide(_)) => None,
                         Some(f) => {
                             takes += 1;
@@ -17962,7 +18038,8 @@ impl Reader {
                         }
                         None if complete => Some(&Cached::Clean),
                         None => None,
-                    };
+                    }
+                };
                 // A block to build, or one held wide, reads the
                 // snapshot: without one the walk stops here, before this
                 // block emits anything, and goes on from the block's
@@ -24614,6 +24691,31 @@ impl Reader {
         drop(op);
         let fs = self.lend_fs().expect("the pass holds the upkeep");
         (fs, ran, whole, done)
+    }
+}
+
+/// HUNT (a hunt branch's forcing patch, never for a merge): the switches
+/// of `tests/hunt_bisect0.rs` and `tests/hunt_cuts.rs`, read from the
+/// environment. `HUNT_FIX=1` is the take-away of the published forms'
+/// position race: the position is withdrawn before the forms are
+/// replaced and read again after one is taken. `HUNT_FIX2=1` takes the
+/// cuts of the keys filed against a partition again against the
+/// partition a table is carried to.
+fn hunt_fix() -> bool {
+    static FIX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FIX.get_or_init(|| std::env::var("HUNT_FIX").is_ok_and(|v| v == "1"))
+}
+
+fn hunt_fix2() -> bool {
+    static FIX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FIX.get_or_init(|| std::env::var("HUNT_FIX2").is_ok_and(|v| v == "1"))
+}
+
+/// HUNT: a pause of the number of milliseconds the variable names, to hold
+/// a thread at a point of a forcing schedule.
+fn hunt_pause(var: &str) {
+    if let Some(ms) = std::env::var(var).ok().and_then(|s| s.parse::<u64>().ok()) {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
     }
 }
 

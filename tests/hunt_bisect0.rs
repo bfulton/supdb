@@ -47,7 +47,9 @@
 //! Compile-time switches, for commits that lack what a call needs:
 //! `--cfg hunt_old` leaves out `hold_seal_landing` and `frozen_tables`, and
 //! `--cfg hunt_opts` turns on `HUNT_NO_SHARE`, `HUNT_NO_FORMS` and
-//! `HUNT_UPKEEP`, which set options by name.
+//! `HUNT_UPKEEP`, which set options by name (both scenarios), and with
+//! `--cfg hunt_alert` `HUNT_NO_ALERT`, with `--cfg hunt_rebase`
+//! `HUNT_NO_REBASE`.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -290,11 +292,23 @@ fn hunt_opts(o: &mut Options) {
     if env_u64("HUNT_NO_FORMS", 0) == 1 {
         o.commit_forms = false;
     }
+    // The tables carried across a merge's rewrite of a partition
+    // (`forms_rebase`, from the commit that made it).
+    #[cfg(hunt_rebase)]
+    if env_u64("HUNT_NO_REBASE", 0) == 1 {
+        o.forms_rebase = false;
+    }
     match std::env::var("HUNT_UPKEEP").as_deref() {
         Ok("inline") => o.upkeep = supdb::db::Upkeep::Inline,
         Ok("bg1") => o.upkeep = supdb::db::Upkeep::Background(1),
         Ok("bg2") => o.upkeep = supdb::db::Upkeep::Background(2),
         _ => {}
+    }
+    // The upkeep thread's alert poll exists from the commit that made it
+    // (`--cfg hunt_alert`): `HUNT_NO_ALERT=1` is the back-off as it was.
+    #[cfg(hunt_alert)]
+    if env_u64("HUNT_NO_ALERT", 0) == 1 {
+        o.upkeep_alert = false;
     }
 }
 
@@ -519,7 +533,7 @@ fn snapshot_reads_nothing_after_it() {
 const ORACLE_KEYS: usize = 240;
 
 fn oracle_opts(inline: bool) -> Options {
-    Options {
+    let mut o = Options {
         scan_block_cache: true,
         seal_bytes: 8 << 10,
         partition_bytes: Some(4 << 10),
@@ -530,7 +544,9 @@ fn oracle_opts(inline: bool) -> Options {
         },
         l0_trigger: 2,
         ..Options::default()
-    }
+    };
+    hunt_opts(&mut o);
+    o
 }
 
 fn oracle_keys() -> Vec<Vec<u8>> {
