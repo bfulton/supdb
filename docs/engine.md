@@ -6001,6 +6001,36 @@ the smaller lever: dropping it from the point read's path frees at most
 already (`src/block.rs`), and the ordered index is the pattern for a
 sidecar the store derives, checks against its segment and regenerates.
 
+The banked rep of the same rung (one sample a cell, so no error bars;
+the second pass agreed with the warmup's on the reads) fills in the rest
+of the cells for the arm with no block cache, LMDB as shipped and LMDB
+with readahead off:
+
+| 10M keys, 1 GiB | no block cache | LMDB | LMDB, readahead off |
+|---|---|---|---|
+| point reads a second, 1 / 3 threads | 54k / 132k | 33k / 53k | 79k / 192k |
+| faults a point read | 0.46 | 0.27 | 0.27 |
+| scan entries a second, 1 / 3 threads | 0.76M / 3.56M | 2.11M / 3.39M | 2.06M / 4.68M |
+| faults a scan, 1 / 3 threads | 3.0 / 1.5 | 0.41 | 1.1 |
+| ordered / shuffled load, ops a second | 1.51M / 318k | 0.97M / 19k | 0.92M / 24k |
+| mix A / B / C, ops a second | 224k / 174k / 107k | 54k / 164k / 175k | 64k / 193k / 239k |
+| mix D / E / F, ops a second | 42k / 49k / 146k | 36k / 94k / 53k | 87k / 138k / 67k |
+| lag scans at 0 / 1 / 10 / 100 percent, entries a second | 1.0M / 9.9M / 1.5M / 0.05M | 0.27M each | 0.85M / 2.6M / 0.83M / 0.80M |
+| lag bursts at 1 / 10 / 100 percent, updates a second | 1.10M / 0.82M / 0.78M | 8-9k | 16k |
+
+Against the LMDB a user configures for the regime the arm wins the
+loads (1.6x ordered, 13x shuffled), mixes A and F (3.5x and 2.2x), the
+lag bursts (48-68x) and the one-percent lag scan (3.9x), and trails the
+point reads (0.68x), the scans (0.37x on one thread, 0.76x on three),
+mixes C, D and E, which are Zipfian reads and uniform reads and scans
+(0.45x, 0.48x, 0.35x), and the full-rewrite lag scan, at 0.07x. Mixes C
+and E fault 0.215 and 0.285 a operation against 0.075 and 0.121. The
+full-rewrite lag scan faults 37 times a scan on the scanning thread and
+has 371 KB a scan read by background threads; neither count says why,
+and the candidates, untested, are the seek into the burst's piece, which
+has no ordered index and binary-searches its records, and the merge the
+burst starts streaming the store while the pass runs.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and
