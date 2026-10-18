@@ -1808,37 +1808,64 @@ pub struct Options {
     ///
     /// On: a form is counted by its buffers' capacity, built to the size
     /// it came out (the vectors shrunk to what they hold when a build
-    /// ends) and grown by a quarter at a time and not by doubling, so the
-    /// slack the budget cannot see is a fraction of a form and not a half
-    /// of it; the budget is kept where forms grow and not only where a
-    /// scan builds one -- after a patch, which is the only thing that
-    /// grows a form in a burst -- so a burst no longer builds the cache
-    /// to the size of the store for the first scan to shed; the
-    /// snapshots and forms a publish replaced are swept when the writer's
-    /// operation ends and not at its next commit; and the allocator's
-    /// free pages are given back after a stride of frees
-    /// (`forms_trim_bytes`). Off: the contents are counted, the budget is
-    /// kept at a scan's build and an install, and nothing is swept early
-    /// or trimmed. Beside a budget this bounds the cache, and without one
-    /// it is the slack alone.
+    /// ends) and, where a patch grows it, grown by a quarter at a time
+    /// and not by doubling, so the slack the budget cannot see is a
+    /// fraction of a form and not a half of it. A sparse form reaches the
+    /// dense count in several reallocations where it took one, which is
+    /// what the slack costs. Three more parts come with it, each with an
+    /// option of its own so that it can be priced apart:
+    /// `forms_fit_shed`, `forms_fit_sweep` and `forms_trim_bytes`. Off:
+    /// the contents are counted, a build has room for every overlay key
+    /// and a sparse form grows to the dense count at once, and none of
+    /// the three is done. Beside a budget this bounds the cache, and
+    /// without one it is the slack alone.
     ///
     /// A shed from another partition's table retracts the form it
     /// published, as a shed from the table in hand does, whatever this
     /// option says: left standing, the form was one the writer filed
     /// nothing into, and a reader's handle took it as the block.
     pub forms_to_fit: bool,
-    /// With `forms_to_fit`: the bytes of forms a handle frees, by a shed or
-    /// by dropping its tables, between the times the segment work's thread
-    /// is asked whether the allocator holds free what it has no use for.
-    /// A freed form goes back to the arena its thread took it from, and an
-    /// arena gives memory to the system only from its top: the forms a
-    /// burst's patches built on the upkeep thread and the scans after it
-    /// shed stay as small free chunks in an arena nothing allocates from
-    /// any more, resident beside a cache that has shrunk. The thread trims
-    /// (`malloc_trim`) when the allocator holds this much more free than
-    /// it did after the last trim, so a cache that frees what its next
-    /// build takes again, on one thread, is not trimmed at all. Zero is
-    /// never. Not on a platform without glibc's `mallinfo2`.
+    /// With `forms_to_fit`: the budget is kept where forms grow and not
+    /// only where a scan builds one or an install adds one -- after a
+    /// patch, which is what grows a form in a burst -- so a burst no
+    /// longer builds the cache to the size of the store for the first
+    /// scan after it to shed. Off: the budget is kept at a scan's build
+    /// and an install. Not kept after the fold of a landed piece's keys
+    /// into a block under `forms_pieces_only`, which grows forms where
+    /// the tables are away and sheds in neither setting.
+    pub forms_fit_shed: bool,
+    /// With `forms_to_fit`: the snapshots and forms a publish replaced
+    /// are swept when an engine thread's operation ends -- the writer's,
+    /// the segment work's, the upkeep thread's pass -- and not at the
+    /// writer's next commit, so the last of a pass's retirements does not
+    /// wait for a write. Only by a thread that holds its upkeep, as the
+    /// commit's sweep is. An operation end that finds the same number
+    /// waiting as the last sweep left does not sweep again, a reader's
+    /// pin having kept them then, until `FIT_SWEEP_RETRY` operation ends
+    /// have gone by, so a pin that has gone is found. Off: they wait for
+    /// the commit's sweep or the next publish's.
+    pub forms_fit_sweep: bool,
+    /// With `forms_to_fit`: one stride, counted twice. A handle that has
+    /// freed this many bytes of forms, by a shed or by dropping its
+    /// tables, asks the trim thread to look at the allocator; and the
+    /// thread trims (`malloc_trim`) when the allocator holds this much
+    /// more free than it did after its last trim, so a cache that frees
+    /// what its next build takes again, on one thread, is not trimmed at
+    /// all. A freed form goes back to the arena its thread took it from,
+    /// and an arena gives memory to the system only from its top: the
+    /// forms a burst's patches built on the upkeep thread and the scans
+    /// after it shed stay as small free chunks in an arena nothing
+    /// allocates from any more, resident beside a cache that has shrunk.
+    /// The trim runs on a thread of its own, so the segment work (a
+    /// seal's landing, a flush's answer, a merge's publish) does not wait
+    /// for it; but it returns each arena's pages with that arena's lock
+    /// held, tens of milliseconds for an arena of tens of thousands of
+    /// small free chunks, and a thread that allocates or frees in it
+    /// waits meanwhile -- the thread that freed the forms among them.
+    /// Zero is never. There is no trim where the allocator is not
+    /// glibc's, or is older than 2.33, which has no `mallinfo2` to count
+    /// the free bytes by; the engine does not link against it, so such a
+    /// build still links.
     pub forms_trim_bytes: usize,
 }
 
@@ -1966,6 +1993,8 @@ impl Default for Options {
             form_dense_from: 0,
             scan_snapshot_arena: true,
             forms_to_fit: false,
+            forms_fit_shed: true,
+            forms_fit_sweep: true,
             forms_trim_bytes: 32 << 20,
         }
     }
@@ -9798,10 +9827,13 @@ impl SparseBlock {
     /// time; a build sizes its own from the count it has. Not the dense
     /// count at birth: most forms a mix leaves hold a delta or two, and
     /// at thirty million keys the difference is the page cache's. To fit
-    /// (`Options::forms_to_fit`), room for the delta it is born with and
-    /// one more.
+    /// (`Options::forms_to_fit`), `ROOM_AT_BIRTH_FIT`.
     fn with_room(key_len: usize, run_len: usize, fit: bool) -> SparseBlock {
-        let n = if fit { 2 } else { ROOM_AT_BIRTH };
+        let n = if fit {
+            ROOM_AT_BIRTH_FIT
+        } else {
+            ROOM_AT_BIRTH
+        };
         SparseBlock {
             keys: Vec::with_capacity(n * key_len.max(16)),
             ents: Vec::with_capacity(n),
@@ -9957,6 +9989,19 @@ const CACHE_DENSE: usize = 16;
 /// Deltas a sparse form made by a splice has room for at birth; full, it
 /// grows to `CACHE_DENSE` at once and doubles from there (`SparseBlock::room`).
 const ROOM_AT_BIRTH: usize = 4;
+
+/// The same kept to fit (`Options::forms_to_fit`): the delta the form is
+/// born with and one more. The form then grows by a quarter at a time
+/// (`fit_room`), so what it holds is most of what it costs from the
+/// start.
+const ROOM_AT_BIRTH_FIT: usize = 2;
+
+/// How many operation ends, of any engine thread, skip the sweep of the
+/// retired snapshots and forms while the number waiting is the number the
+/// last sweep left (`Options::forms_fit_sweep`) before one sweeps again:
+/// the same number says a reader's pin held them, and says nothing of
+/// whether the pin has gone.
+const FIT_SWEEP_RETRY: u32 = 64;
 
 /// The most live tables `State::replaced` keeps.
 const REPLACED_CAP: usize = 8;
@@ -10691,9 +10736,12 @@ struct Shared {
     /// read, and `State::replaced` keeps those. Nothing before a look.
     upkeep_lives: AtomicU64,
     /// `Options::forms_trim_bytes`: a handle has freed enough forms that
-    /// the segment work's thread is to look at what the allocator holds
-    /// free; what it held after the last trim; and the trims made.
+    /// the trim thread is to look at what the allocator holds free, and
+    /// the thread to wake; what the allocator held free after the last
+    /// trim; and the trims made. Only the trim thread reads the floor and
+    /// writes the counts.
     trim_wanted: std::sync::atomic::AtomicBool,
+    trim_thread: std::sync::OnceLock<std::thread::Thread>,
     trim_floor: AtomicUsize,
     trims: AtomicU64,
     /// The looks the thread made at the allocator, those that trimmed and
@@ -10701,42 +10749,134 @@ struct Shared {
     /// altogether, in nanoseconds.
     trim_looks: AtomicU64,
     trim_ns: AtomicU64,
-    /// What the writer's sweep of the retired snapshots and forms at the
-    /// end of an operation (`Options::forms_to_fit`) left waiting: an
-    /// operation that finds as many waiting retired nothing, and the
-    /// items are the same ones, which a pinned reader still holds.
+    /// A test's: while set the trim thread waits where a trim would begin,
+    /// as a trim that took long would keep it, and `trim_begun` counts the
+    /// requests it has taken up (`Db::hold_trim`).
+    trim_hold: std::sync::atomic::AtomicBool,
+    trim_begun: AtomicU64,
+    /// What the sweep of the retired snapshots and forms at the end of an
+    /// engine thread's operation (`Options::forms_fit_sweep`: the
+    /// writer's, the segment work's, the upkeep thread's pass) left
+    /// waiting, and the operation ends since that skipped the sweep for
+    /// finding as many waiting: the same number says a reader's pin held
+    /// them, and says nothing of whether it has gone. Read and written
+    /// relaxed by whichever thread's operation ends, and a race costs a
+    /// sweep or skips one.
     fit_swept: AtomicUsize,
+    fit_skips: std::sync::atomic::AtomicU32,
+}
+
+/// What the trim asks of glibc's allocator: the bytes it holds free in its
+/// arenas, and the return of the whole pages inside its free chunks to
+/// the system. The free count is `mallinfo2`'s, looked up by name when
+/// first asked for and not linked against: the symbol is new in glibc
+/// 2.33, and a reference to it kept the engine from linking on any older
+/// one, trim or no trim. Elsewhere there is no count, and so no trim.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+mod heap {
+    type Mallinfo2 = unsafe extern "C" fn() -> libc::mallinfo2;
+
+    fn mallinfo2() -> Option<Mallinfo2> {
+        static FOUND: std::sync::OnceLock<Option<Mallinfo2>> = std::sync::OnceLock::new();
+        *FOUND.get_or_init(|| {
+            // SAFETY: a lookup by a NUL-terminated name in the global
+            // scope, which answers null for a name it does not have.
+            let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"mallinfo2".as_ptr()) };
+            // SAFETY: the symbol of this name is the function of this type.
+            (!p.is_null())
+                .then(|| unsafe { std::mem::transmute::<*mut libc::c_void, Mallinfo2>(p) })
+        })
+    }
+
+    /// The bytes the allocator holds free, or none where it cannot say.
+    pub fn free_bytes() -> Option<usize> {
+        let f = mallinfo2()?;
+        // SAFETY: reads the allocator's own totals under its own locks.
+        Some(unsafe { f() }.fordblks)
+    }
+
+    /// The pages inside every free chunk of every arena given back,
+    /// each arena's lock held while its pages are.
+    pub fn trim() {
+        // SAFETY: releases the allocator's own free memory under its own
+        // locks.
+        unsafe { libc::malloc_trim(0) };
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+mod heap {
+    pub fn free_bytes() -> Option<usize> {
+        None
+    }
+
+    pub fn trim() {}
+}
+
+/// Whether an allocator holding `held` bytes free is to be trimmed, and
+/// the floor the next stride is counted from: the bytes it held after the
+/// last trim (`floor`), lowered to what it holds now when that is less,
+/// so a cache that has grown into the free memory is not waited on for a
+/// trim it no longer needs. Due when it holds `stride` more.
+fn trim_due(held: usize, floor: usize, stride: usize) -> (usize, bool) {
+    let floor = floor.min(held);
+    (floor, held >= floor.saturating_add(stride))
 }
 
 /// Give the system the pages the allocator holds free, if it holds
-/// `stride` more than it did when it was last asked to (`floor`, lowered
-/// to what it holds now when that is less, so a cache that has grown into
-/// the free memory is not waited on for a trim it no longer needs).
+/// `stride` more than it did when it was last asked to (`trim_due`).
 /// Pages, not chunks: glibc releases the whole pages inside every free
 /// chunk of every arena, not only a heap's top.
 fn trim_free_memory(shared: &Shared, stride: usize) {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    {
-        let t = std::time::Instant::now();
-        // SAFETY: both read and release the allocator's own memory under
-        // its own locks.
-        let held = unsafe { libc::mallinfo2() }.fordblks;
-        let floor = shared.trim_floor.load(AtomicOrdering::Relaxed).min(held);
-        shared.trim_floor.store(floor, AtomicOrdering::Relaxed);
-        if held >= floor.saturating_add(stride) {
-            // SAFETY: as above.
-            unsafe { libc::malloc_trim(0) };
-            let left = unsafe { libc::mallinfo2() }.fordblks;
-            shared.trim_floor.store(left, AtomicOrdering::Relaxed);
-            shared.trims.fetch_add(1, AtomicOrdering::Relaxed);
-        }
-        shared.trim_looks.fetch_add(1, AtomicOrdering::Relaxed);
-        shared
-            .trim_ns
-            .fetch_add(t.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+    let t = std::time::Instant::now();
+    let Some(held) = heap::free_bytes() else {
+        return;
+    };
+    let (floor, due) = trim_due(
+        held,
+        shared.trim_floor.load(AtomicOrdering::Relaxed),
+        stride,
+    );
+    shared.trim_floor.store(floor, AtomicOrdering::Relaxed);
+    if due {
+        heap::trim();
+        let left = heap::free_bytes().unwrap_or(held);
+        shared.trim_floor.store(left, AtomicOrdering::Relaxed);
+        shared.trims.fetch_add(1, AtomicOrdering::Relaxed);
     }
-    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-    let _ = (shared, stride);
+    shared.trim_looks.fetch_add(1, AtomicOrdering::Relaxed);
+    shared
+        .trim_ns
+        .fetch_add(t.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+}
+
+/// The trim thread (`Options::forms_trim_bytes`): asleep until a handle
+/// has freed a stride of forms, then a look at the allocator, and a trim if
+/// it holds a stride more free than after the last one. A thread of its
+/// own and not the segment work's, which a trim of tens of milliseconds
+/// held from landing a seal or answering a flush; and not niced, since it
+/// holds an arena's lock for as long as it trims it and a thread that
+/// could be preempted holding one is the one that keeps the rest waiting.
+fn trim_loop(shared: &Shared, stop: &std::sync::atomic::AtomicBool, stride: usize) {
+    while !stop.load(AtomicOrdering::Acquire) {
+        if shared.trim_wanted.swap(false, AtomicOrdering::AcqRel) {
+            shared.trim_begun.fetch_add(1, AtomicOrdering::Release);
+            while shared.trim_hold.load(AtomicOrdering::Acquire)
+                && !stop.load(AtomicOrdering::Acquire)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            trim_free_memory(shared, stride);
+            continue;
+        }
+        std::thread::park();
+    }
+}
+
+/// The trim thread in flight: its handle and the flag that stops it.
+struct Trimmer {
+    handle: Option<std::thread::JoinHandle<()>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// EXPERIMENT: a replaced canonical form on its way to being freed. A
@@ -11448,6 +11588,9 @@ pub struct Db {
     /// EXPERIMENT: the upkeep thread, once a commit has had something
     /// for it; see `Upkeep::Background`.
     upkeeper: Option<Upkeeper>,
+    /// The trim thread, started at the open of a store that keeps its forms
+    /// to fit (`Options::forms_trim_bytes`).
+    trimmer: Option<Trimmer>,
     /// The upkeep thread's regime, kept by the writer since the upkeep
     /// itself may be lent: the generation and committed log length at
     /// the last hand-over, the store's scan count as last seen, and the
@@ -13088,14 +13231,12 @@ impl Reader {
             // snapshots it extends and nothing else sweeps after it, so
             // the last of them waited for the next commit, tens of
             // megabytes at three million keys, beside a budget that
-            // counts none of it (`Options::forms_to_fit`).
-            if self.opts.forms_to_fit {
-                let waiting = self.shared.retired_snaps.len() + self.shared.retired_forms.len();
-                if waiting > 0 && waiting != self.shared.fit_swept.load(AtomicOrdering::Relaxed) {
-                    self.sweep_retired_forms();
-                    let left = self.shared.retired_snaps.len() + self.shared.retired_forms.len();
-                    self.shared.fit_swept.store(left, AtomicOrdering::Relaxed);
-                }
+            // counts none of it (`Options::forms_fit_sweep`). Only by a
+            // handle that holds its upkeep, as the commit's sweep is: a
+            // writer that has lent it leaves the sweeping to the thread
+            // that has it.
+            if self.opts.forms_to_fit && self.opts.forms_fit_sweep && self.fs_home() {
+                self.sweep_at_leave();
             }
         }
         if let Some(slot) = self.slot {
@@ -14814,8 +14955,10 @@ impl Reader {
 
     /// `bytes` of forms freed, counted toward the next look at what the
     /// allocator holds free (`Options::forms_trim_bytes`): asked of the
-    /// segment work's thread, which trims off the path of whoever freed,
-    /// or made here where the segment work has no thread of its own.
+    /// trim thread, which makes the look and the trim on a thread of its
+    /// own whoever freed. A store with no trim thread (the stride zero, or
+    /// the option off) is asked nothing, and one whose thread is gone is
+    /// asked in vain.
     fn note_freed(&self, bytes: usize) {
         let stride = self.opts.forms_trim_bytes;
         if !self.opts.forms_to_fit || stride == 0 || bytes == 0 {
@@ -14827,12 +14970,9 @@ impl Reader {
             return;
         }
         self.fs().freed.set(0);
-        match self.shared.maint_thread.get() {
-            Some(t) => {
-                self.shared.trim_wanted.store(true, AtomicOrdering::Release);
-                t.unpark();
-            }
-            None => trim_free_memory(&self.shared, stride),
+        self.shared.trim_wanted.store(true, AtomicOrdering::Release);
+        if let Some(t) = self.shared.trim_thread.get() {
+            t.unpark();
         }
     }
 
@@ -14843,17 +14983,23 @@ impl Reader {
         self.shared.trims.load(AtomicOrdering::Relaxed)
     }
 
-    /// The looks at the allocator the segment work's thread made, trims
-    /// and not.
+    /// The looks at the allocator the trim thread made, trims and not.
     #[doc(hidden)]
     pub fn forms_trim_looks(&self) -> u64 {
         self.shared.trim_looks.load(AtomicOrdering::Relaxed)
     }
 
-    /// The microseconds those looks took, the segment work's thread's.
+    /// The microseconds those looks took, the trim thread's.
     #[doc(hidden)]
     pub fn forms_trim_us(&self) -> u64 {
         self.shared.trim_ns.load(AtomicOrdering::Relaxed) / 1000
+    }
+
+    /// The requests for a look the trim thread has taken up, a test's
+    /// to wait on (`Db::hold_trim`).
+    #[doc(hidden)]
+    pub fn forms_trims_begun(&self) -> u64 {
+        self.shared.trim_begun.load(AtomicOrdering::Acquire)
     }
 
     fn drop_blocks(&self) {
@@ -15306,6 +15452,53 @@ impl Reader {
             .sweep(|low| self.shared.readers.oldest_for(low));
     }
 
+    /// The sweep at the end of an operation (`Options::forms_fit_sweep`):
+    /// when the number waiting is not the number the last sweep left, and
+    /// otherwise at the first end after `FIT_SWEEP_RETRY` have skipped it.
+    /// A sweep that a reader's pin held leaves the same number waiting,
+    /// and the same number at the next end says that nothing was retired
+    /// since and nothing of whether the pin is still there: a sweep that
+    /// waited for the number to move waited for a publish, which a thread
+    /// that reads and writes no more never makes, and what was retired
+    /// stood for as long as that. The number is a hint and not an
+    /// identity -- some freed and as many retired since read the same --
+    /// and the retry bounds what that costs. A call is a few relaxed
+    /// loads, and a sweep one in the span of a retry.
+    fn sweep_at_leave(&self) {
+        let sh = &self.shared;
+        let waiting = sh.retired_snaps.len() + sh.retired_forms.len();
+        if waiting == 0 {
+            // The count a later sweep compares with is of this list, not
+            // of one that has emptied since.
+            if sh.fit_swept.load(AtomicOrdering::Relaxed) != 0 {
+                sh.fit_swept.store(0, AtomicOrdering::Relaxed);
+            }
+            return;
+        }
+        let skips = sh.fit_skips.load(AtomicOrdering::Relaxed);
+        if waiting == sh.fit_swept.load(AtomicOrdering::Relaxed) && skips < FIT_SWEEP_RETRY {
+            sh.fit_skips.store(skips + 1, AtomicOrdering::Relaxed);
+            return;
+        }
+        self.sweep_retired_forms();
+        sh.fit_swept.store(
+            sh.retired_snaps.len() + sh.retired_forms.len(),
+            AtomicOrdering::Relaxed,
+        );
+        sh.fit_skips.store(0, AtomicOrdering::Relaxed);
+    }
+
+    /// The snapshots and the forms a publish replaced that wait for a
+    /// reader to leave, for a test: read without entering, so that the
+    /// read is not an operation whose end sweeps.
+    #[doc(hidden)]
+    pub fn retired_waiting(&self) -> (usize, usize) {
+        (
+            self.shared.retired_snaps.len(),
+            self.shared.retired_forms.len(),
+        )
+    }
+
     /// A read or a scan over a store with pieces and no partition, for the
     /// segment work to partition it by (`Options::adaptive_shape`): on the
     /// handle's own line, as its other statistics are, and nothing at all
@@ -15586,6 +15779,35 @@ impl Reader {
                 + self.shared.readers.stat(|s| &s.takes)) as usize,
             st.forms_complete.load(AtomicOrdering::Relaxed),
         )
+    }
+
+    /// The bytes the state's published forms are recorded at, and the
+    /// same walked, for a test that holds the record to the forms: the
+    /// counter `canonical_forms` reports, the sum of the bytes each
+    /// published form carries, and the sums of the contents and of the
+    /// buffers of the forms themselves, in that order.
+    #[doc(hidden)]
+    pub fn published_form_bytes(&self) -> [usize; 4] {
+        let _e = self.enter();
+        let st = self.state();
+        let (mut recorded, mut len, mut cap) = (0, 0, 0);
+        for slot in st.forms.iter().flat_map(|f| f.iter()) {
+            let p = slot.load(AtomicOrdering::Acquire);
+            if p.is_null() {
+                continue;
+            }
+            // SAFETY: as in `canonical`.
+            let cf = unsafe { &*p };
+            recorded += cf.bytes;
+            len += cf.form.bytes();
+            cap += cf.form.cap_bytes();
+        }
+        [
+            st.forms_bytes.load(AtomicOrdering::Relaxed),
+            recorded,
+            len,
+            cap,
+        ]
     }
 
     /// A built form behind an `Arc`: the shared clean one for `Clean`,
@@ -16951,9 +17173,10 @@ impl Reader {
         // it: the budget was kept only where a scan built a block, so a
         // burst built the cache to the size of the store and the first
         // scan after it shed the difference. Kept here and not in the
-        // splice, which the rebase's fold also calls while the tables
-        // are away.
-        if self.opts.forms_to_fit {
+        // splice, which the rebase's fold (`fold_piece_block`) also calls
+        // while the tables are away: a block that fold grows is not shed
+        // for (`Options::forms_fit_shed`).
+        if self.opts.forms_to_fit && self.opts.forms_fit_shed {
             self.shed(at, b, table);
         }
         Ok(())
@@ -19395,6 +19618,10 @@ impl Db {
             trim_looks: AtomicU64::new(0),
             trim_ns: AtomicU64::new(0),
             fit_swept: AtomicUsize::new(0),
+            fit_skips: std::sync::atomic::AtomicU32::new(0),
+            trim_thread: std::sync::OnceLock::new(),
+            trim_hold: std::sync::atomic::AtomicBool::new(false),
+            trim_begun: AtomicU64::new(0),
         });
         let pin_slot = Some(
             shared
@@ -19446,6 +19673,7 @@ impl Db {
             wal_dir_unsynced: false,
             keeper: None,
             upkeeper: None,
+            trimmer: None,
             upkeep_log: (0, 0),
             upkeep_life: 0,
             upkeep_since_scan: 0,
@@ -19460,6 +19688,7 @@ impl Db {
             presync_failed: None,
         };
         db.go_away()?;
+        db.start_trimmer();
         Ok(db)
     }
 
@@ -19828,6 +20057,10 @@ impl Db {
             trim_looks: AtomicU64::new(0),
             trim_ns: AtomicU64::new(0),
             fit_swept: AtomicUsize::new(0),
+            fit_skips: std::sync::atomic::AtomicU32::new(0),
+            trim_thread: std::sync::OnceLock::new(),
+            trim_hold: std::sync::atomic::AtomicBool::new(false),
+            trim_begun: AtomicU64::new(0),
         });
         let pin_slot = Some(
             shared
@@ -19879,6 +20112,7 @@ impl Db {
             wal_dir_unsynced: false,
             keeper: None,
             upkeeper: None,
+            trimmer: None,
             upkeep_log: (0, 0),
             upkeep_life: 0,
             upkeep_since_scan: 0,
@@ -19893,6 +20127,7 @@ impl Db {
             presync_failed: None,
         };
         db.go_away()?;
+        db.start_trimmer();
         Ok(db)
     }
 
@@ -24799,6 +25034,80 @@ impl Db {
         }
     }
 
+    /// The trim thread started, if the options ask for one
+    /// (`Options::forms_to_fit` with a stride): at the open, so that a
+    /// handle's first request has a thread to wake, and a store that is
+    /// never asked costs a parked thread.
+    fn start_trimmer(&mut self) {
+        if self.trimmer.is_some() || !self.opts.forms_to_fit || self.opts.forms_trim_bytes == 0 {
+            return;
+        }
+        let shared = self.shared.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let stride = self.opts.forms_trim_bytes;
+        let spawned = std::thread::Builder::new()
+            .name("supdb-trim".into())
+            .spawn(move || trim_loop(&shared, &flag, stride));
+        if let Ok(handle) = spawned {
+            let _ = self.shared.trim_thread.set(handle.thread().clone());
+            self.trimmer = Some(Trimmer {
+                handle: Some(handle),
+                stop,
+            });
+        }
+    }
+
+    /// The trim thread stopped and joined, which waits out a trim in
+    /// progress. A test's hold on it is lifted first.
+    fn stop_trimmer(&mut self) {
+        self.shared.trim_hold.store(false, AtomicOrdering::Release);
+        if let Some(mut t) = self.trimmer.take() {
+            t.stop.store(true, AtomicOrdering::SeqCst);
+            if let Some(th) = self.shared.trim_thread.get() {
+                th.unpark();
+            }
+            if let Some(h) = t.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// Whether this process's allocator can say what it holds free, which
+    /// the trim counts by (`Options::forms_trim_bytes`): not on a
+    /// platform without glibc's, nor on a glibc older than 2.33. For a
+    /// test that asks for a trim.
+    #[doc(hidden)]
+    pub fn trim_supported() -> bool {
+        heap::free_bytes().is_some()
+    }
+
+    /// A test's: while `on`, the trim thread waits where a trim would
+    /// begin, as one that took long would keep it, so a test can ask what
+    /// the rest of the store does meanwhile; `forms_trims_begun` says it
+    /// is there. Lifted at the close.
+    #[doc(hidden)]
+    pub fn hold_trim(&self, on: bool) {
+        self.shared.trim_hold.store(on, AtomicOrdering::Release);
+    }
+
+    /// A test's: `hold_trim(false)` after `after`, from a thread of its
+    /// own, for a test whose thread is the writer waiting on a store
+    /// that the hold keeps. The thread ends as soon as the hold is lifted
+    /// by another hand, so a test that lifts it is not made to wait out
+    /// the time.
+    #[doc(hidden)]
+    pub fn release_trim_after(&self, after: std::time::Duration) -> std::thread::JoinHandle<()> {
+        let shared = self.shared.clone();
+        std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            while t.elapsed() < after && shared.trim_hold.load(AtomicOrdering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            shared.trim_hold.store(false, AtomicOrdering::Release);
+        })
+    }
+
     /// PROTOTYPE: what the keeper has published over this store's life:
     /// versions extended or built, and versions carried across a
     /// publish. For a test.
@@ -26782,12 +27091,6 @@ impl Maint {
             self.collect();
             self.shape_if_read(false);
             self.sweep_spares();
-            // Asked by a handle that has freed forms (`note_freed`): the
-            // allocator's free pages given back off the path of the
-            // handle that freed them.
-            if self.shared.trim_wanted.swap(false, AtomicOrdering::AcqRel) {
-                trim_free_memory(&self.shared, self.opts.forms_trim_bytes);
-            }
             std::thread::park_timeout(MAINT_POLL);
         }
         self.sweep_spares();
@@ -28511,6 +28814,7 @@ impl Drop for Db {
         self.shared.seal_hold.store(0, AtomicOrdering::Release);
         self.stop_upkeep();
         self.stop_keeper();
+        self.stop_trimmer();
         self.stop_ahead();
         match &mut self.maint {
             MaintHome::Here(m) => m.stop(),
@@ -29156,5 +29460,114 @@ mod merge_runs {
                 "round {round}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod trim_stride {
+    use super::trim_due;
+
+    /// A trim is due once the allocator holds a stride more free than it
+    /// did after the last one, and not a byte before.
+    #[test]
+    fn a_trim_is_due_at_a_stride_over_the_floor() {
+        assert_eq!(trim_due(100, 0, 100), (0, true));
+        assert_eq!(trim_due(99, 0, 100), (0, false));
+        assert_eq!(trim_due(250, 150, 100), (150, true));
+        assert_eq!(trim_due(249, 150, 100), (150, false));
+    }
+
+    /// A floor above what the allocator holds now is lowered to it, so a
+    /// cache that has grown into the free memory is waited on for a stride
+    /// more than it holds, and not than it held.
+    #[test]
+    fn the_floor_falls_with_the_free_bytes() {
+        assert_eq!(trim_due(40, 150, 100), (40, false));
+        assert_eq!(trim_due(139, 40, 100), (40, false));
+        assert_eq!(trim_due(140, 40, 100), (40, true));
+    }
+
+    /// A stride nothing reaches never trims, and a floor at the top of the
+    /// range does not wrap into one that does.
+    #[test]
+    fn a_stride_out_of_reach_never_trims() {
+        assert_eq!(trim_due(10, 0, usize::MAX), (0, false));
+        assert_eq!(
+            trim_due(usize::MAX - 1, usize::MAX - 1, 10),
+            (usize::MAX - 1, false)
+        );
+    }
+}
+
+#[cfg(test)]
+mod sweep_gate {
+    use super::*;
+
+    /// The sweep at the end of an operation (`Options::forms_fit_sweep`)
+    /// is the upkeep's holder's, as the commit's is: a writer that has
+    /// lent it leaves what a publish replaced to the thread that has it,
+    /// since that thread frees what it replaced at its own passes and a
+    /// form it had just replaced could go under a read of its own if the
+    /// writer freed it meanwhile. That a handle holds its upkeep is the
+    /// cell not being empty and nothing else (`Reader::fs_home`), so the
+    /// lend is made here by emptying the cell, and no thread's timing
+    /// decides what the test sees.
+    #[test]
+    fn a_writer_that_has_lent_its_upkeep_leaves_the_sweep_to_the_thread_that_has_it() {
+        let dir =
+            std::env::temp_dir().join(format!("supdb-next-sweep-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let opts = Options {
+            forms_to_fit: true,
+            upkeep: Upkeep::Inline,
+            publish_in_background: false,
+            ..Options::default()
+        };
+        let mut db = Db::create(&dir, opts).unwrap();
+        // A form a publish replaced, which no pinned reader can hold.
+        let retire = |db: &Db| {
+            let form = Box::into_raw(Box::new(CanonicalForm {
+                form: std::sync::Arc::new(Cached::Clean),
+                bytes: 0,
+            }));
+            let epoch = db.shared.readers.epoch.load(AtomicOrdering::SeqCst);
+            db.shared.retired_forms.push(epoch + 1, RetiredForm(form));
+        };
+
+        // The holder's operation ends, and sweeps it.
+        retire(&db);
+        assert_eq!(db.retired_waiting(), (0, 1));
+        drop(db.op());
+        assert_eq!(
+            db.retired_waiting(),
+            (0, 0),
+            "an operation end of the handle that holds its upkeep sweeps"
+        );
+
+        // Lent, the same operation end leaves it where it is. The upkeep
+        // is put back before the count is judged, so a failure is the
+        // count's and not a store closed with its upkeep away.
+        retire(&db);
+        let fs = db.r.lend_fs().expect("the writer holds its upkeep");
+        assert!(!db.r.fs_home());
+        drop(db.op());
+        let lent = db.retired_waiting();
+        *db.r.fs.0.get_mut() = Some(fs);
+        assert_eq!(
+            lent,
+            (0, 1),
+            "an operation end of a writer that has lent its upkeep sweeps nothing"
+        );
+
+        // Home again, the next one sweeps it.
+        assert!(db.r.fs_home());
+        drop(db.op());
+        assert_eq!(
+            db.retired_waiting(),
+            (0, 0),
+            "the upkeep home again, the operation end sweeps what waited"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
