@@ -31,8 +31,11 @@
 //!   seeds that run in seconds.
 //! - `ZFUZZ_SEEDS`: a comma separated list of seeds in place of the range.
 //! - `ZFUZZ_CACHE`: `1` turns the block cache on for the one seed in five
-//!   that asks for it, `all` for every seed. A seed's other choices are the
-//!   same under either. Off by default.
+//!   that asks for it, `all` for every seed, and `off` for none while
+//!   drawing as `1` does, so that a seed that failed under `1` or `all`
+//!   reruns as the same configuration and the same operations with the
+//!   cache off. Unset, no seed has the cache and the draw is not made, so a
+//!   seed's other choices are not those it makes under the three.
 //! - `ZFUZZ_OPTVARY`: set, a seed turns compaction or promotion off, each
 //!   with a chance of 15%.
 //! - `ZFUZZ_SHAPES`: the key shapes a seed may draw from, as indexes from 0
@@ -143,10 +146,18 @@ struct Cfg {
 }
 
 /// Whether a seed runs with the block cache on. The chance is drawn whenever
-/// the cache is wanted, so `all` leaves the rest of a seed's stream as `1`
-/// has it.
+/// the cache is wanted, so `all` and `off` leave the rest of a seed's stream
+/// as `1` has it.
 fn cache_asked(rng: &mut Rng, want_cache: bool) -> bool {
-    want_cache && (rng.chance(20) | std::env::var("ZFUZZ_CACHE").is_ok_and(|v| v == "all"))
+    if !want_cache {
+        return false;
+    }
+    let drawn = rng.chance(20);
+    match std::env::var("ZFUZZ_CACHE").as_deref() {
+        Ok("all") => true,
+        Ok("off") => false,
+        _ => drawn,
+    }
 }
 
 fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
@@ -889,7 +900,8 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
 fn fuzz_range() {
     let from = env_u64("ZFUZZ_FROM").unwrap_or(0);
     let to = env_u64("ZFUZZ_TO").unwrap_or(from + DEFAULT_SEEDS);
-    let want_cache = std::env::var("ZFUZZ_CACHE").is_ok_and(|v| v == "1" || v == "all");
+    let want_cache =
+        std::env::var("ZFUZZ_CACHE").is_ok_and(|v| matches!(v.as_str(), "1" | "all" | "off"));
     let verbose = env_flag("ZFUZZ_VERBOSE");
     let list: Option<Vec<u64>> = std::env::var("ZFUZZ_SEEDS")
         .ok()
