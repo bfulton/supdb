@@ -5981,15 +5981,22 @@ thread kept pace with built the cache up to the size of the store (525 MB in use
 burst ended, the others filing their forms in the pass that followed) and the first scan after it
 shed the difference into the allocator's free lists.
 
-The shed of a block in another partition's table left the form it had published in the state. The
-shed from the table in hand retracts it with a marker (`unlist`); the branch for any other
-partition took the slot and the bytes and nothing else, so a reader's handle could take a form the
-writer files nothing into any more, and the debug assertion that says a block the writer holds no
-form for has none published as the block was waiting for the first write to land there. The
-suite's runs never showed it -- the published forms only the state holds read zero in every census
--- and `a_block_shed_from_any_partition_takes_its_published_form_with_it` builds the shape: a
-budget of six kilobytes, a handle claimed, scans from elsewhere until the blocks held have been
-shed and built again.
+The shed of a block in another partition's table left the form it had published in the state, and
+this was the engine's before the flag and whatever the flag says. The shed from the table in hand
+retracts it with a marker (`unlist`); the branch for any other partition took the slot and the bytes
+and nothing else, so a reader's handle could take a form the writer files nothing into any more. The
+first write into the block then trips the check in `settle_each` that a block the writer holds no
+form for has none published as the block, in the checked profile, and in a build without it the
+handle answered the values from before the write: all three rounds of the reproducer disagreed with
+the model. Any store with a budget (`scan_cache_bytes`, as in `supdb-cache256`), a claimed handle
+and writes was exposed. The lag sweep's census, which claims no handle, read zero published forms
+only the state holds, and the suite's harness does not check the values it reads, so which of its
+rows served a stale one is not known. The retraction is unconditional now.
+`a_block_shed_from_any_partition_takes_its_published_form_with_it` builds the shape (a budget of six
+kilobytes, a handle claimed, scans from elsewhere until the blocks held have been shed and built
+again, then rounds of writes read through the handle and the writer against the model), and
+`a_budgeted_cache_answers_the_model_with_a_handle_claimed` is the seeded differential run that found
+it.
 
 And what the sheds freed stayed resident. A freed chunk goes back to the arena that allocated it,
 and glibc gives an arena's memory to the system from its top. The forms a burst's patches built on
@@ -6005,16 +6012,27 @@ waited for a sweep that only a commit made, in three reps of ten.
 
 `Options::forms_to_fit` (arms `supdb-tofit` and `supdb-ingesttofit`, and `supdb-cache256tofit`
 beside the budget) counts a form by the capacity of its buffers, builds it to the size it came out
-(`shrink_to_fit` at the end of a build) and grows it by a quarter and not by doubling, sheds after a
-patch, retracts a shed's publication from any partition, sweeps the retired snapshots and forms when
-the writer's operation ends, and has the segment work's thread trim the allocator
-(`Options::forms_trim_bytes`, 32 MB) once handles have freed that many bytes of forms and the
-allocator holds that much more free than after its last trim. The sweep at an operation's end did
-nothing the census could show: 37-40 MB of retired snapshots still stood at the pass's end in three
-of the twelve reps with the flag, as in three of the ten without it, held by whatever was pinned
-when they were retired (a pass of the upkeep thread, likely; not checked), and freed by no operation
-that ended after it. The full-rewrite point, median (range) over the reps of the sittings, in
-megabytes:
+(`shrink_to_fit` at the end of a build) and grows it by a quarter and not by doubling, so that a
+sparse form reaches the dense count in about six reallocations of each buffer where it took one, the
+price of the slack and a part of the upkeep thread's extra CPU below. Three parts come with it, each
+an option of its own so that it is priced by taking it away: the budget kept after a patch
+(`forms_fit_shed`, the arm `supdb-cache256tofitnoshed`), the retired snapshots and forms swept when
+an engine thread's operation ends (`forms_fit_sweep`, `supdb-cache256tofitnosweep`), and the
+allocator trimmed once handles have freed that many bytes of forms and it holds that much more free
+than after its last trim (`forms_trim_bytes`, 32 MB, `supdb-cache256tofitnotrim`). The retraction of
+a shed's publication is not among them. The measurements below are of the flag as first built, when
+the trim ran on the segment work's thread and the sweep skipped every operation end after one that a
+reader's pin had held, for as long as the number waiting was the same. That guard is the likeliest
+reason 37-40 MB of retired snapshots still stood at the pass's end in three of the twelve reps with
+the flag, as in three of the ten without it: not a pin that stayed, but nothing sweeping them once
+it had gone, since a thread that reads and writes no more retires nothing and the number never
+moved. A probe shows that, and the lag sweep itself was not checked:
+`the_sweep_at_an_operations_end_finds_the_pin_gone` pins a handle, retires under it, lifts it and
+reads, and the guard left them waiting. The sweep retries after sixty-four operation ends that
+skipped it now, and only for a handle that holds its upkeep, as the commit's sweep is (a writer that
+has lent it leaves the sweeping to the thread that has it); what it frees at the pass's end has not
+been measured since. The full-rewrite point, median (range) over the reps of the sittings,
+in megabytes:
 
 | arm | `forms_to_fit` | pass's end | burst's end | in use | held beyond use | forms counted / buffers | reps |
 |---|---|---|---|---|---|---|---|
@@ -6028,12 +6046,19 @@ megabytes:
 The burst's end is read from the kernel before any scan (`lagburst`), and the larger of the two
 samples is what a bound meets: 935 for the budgeted arm, 632 with the flag (523-743). Against the
 arm with no cache and the budget -- 234 and 256, 490 at the pass's end -- the flag takes the
-budgeted arm's excess from 445 MB to 88. The pairs agree in sign, six reps of six in the three
-sittings that ran both, by 282-404 MB at the pass's end. The default's saving is 80 MB, the slack
-and little else, since the default has no budget to keep and its cache is the store's. The flag off
-reads as before in every sitting (buffers 1.65-1.77 times the contents in the budgeted arm, 1.13 in
-the default), and the flag on reads 1.00 at the full-rewrite point and 1.10 at the tenth-rewritten
-(1.12 in the default), so the default's shape is unchanged and the flag's is exact.
+budgeted arm's excess from 445 MB to 88, and not all of that is the forms': the arm with no cache
+has no trim, and the trim also returns part of the load's own retention (144 MB beyond use with the
+flag against 166 for the arm with no cache), so the baseline is higher than the same arm trimmed
+would read, and what is the forms' alone is the part the arm without the trim prices. A pass's end
+within a hundred megabytes of 490 is reached at the median (578) and not in every rep (381-695).
+The pairs agree in sign, six reps of six in the three sittings that ran both, by 282-404 MB at the
+pass's end. The default's saving is 80 MB, the slack and little else, since the default has no
+budget to keep and its cache is the store's: 774 MB at this point with the flag, so whether the
+default policy runs under a bound at three million keys is not answered here, and wants a budget
+derived from the bound or the policy restricted by it. The flag off reads as before in every
+sitting (buffers 1.65-1.77 times the contents in the budgeted arm, 1.13 in the default), and the
+flag on reads 1.00 at the full-rewrite point and 1.10 at the tenth-rewritten in the budgeted arm
+(1.12 for `supdb-tofit` there).
 
 Where the saving comes from is two things, and the arm without the trim
 (`supdb-cache256tofitnotrim`, `Options::forms_trim_bytes` zero) prices them apart: kept to fit alone
@@ -6047,14 +6072,24 @@ burst resident: the probe returned 145 and 250 MB more at the end of a pass with
 581, 1,021 to 771), which a trim when the frees stop would return, and which the pass's end, read
 the moment the last scan returns, would not show.
 
-What the flag costs, on the segment work's thread and not the writer's: a trim is a
-`malloc_trim(0)` over every arena, 30-200 ms at this size, and one to seven were made over a pass
-(`lagcensus`'s `trims`, `looks` and `look_ms`; the looks that decided not to trim cost a few
-milliseconds); the upkeep thread's CPU over the burst read 3.2-4.0 s with the flag against 3.2-3.6
+What the flag costs. A trim is a `malloc_trim(0)` over every arena, 30-200 ms at this size, and one
+to seven were made over a pass (`lagcensus`'s `trims`, `looks` and `look_ms`; the looks that decided
+not to trim cost a few milliseconds). It was made on the segment work's thread, between its jobs, so
+a seal's landing, a flush's answer or a merge's publish that arrived meanwhile waited for it; it
+runs on a thread of its own now (`trim_loop`), and
+`the_segment_work_goes_on_while_a_trim_is_in_progress` holds it at the point a trim would begin and
+flushes. What stays is the arena's lock: `malloc_trim` returns each arena's pages with that arena's
+lock held, and a thread that allocates or frees in it waits, which in the arena of the forms is the
+upkeep thread's next allocation and the writer's free of a form it sheds. A standalone probe of
+that, on a machine that was busy, with 160 MB of 8 KB free chunks in one arena: the trim took 9-17
+ms and single small allocations of a thread in that arena stalled for 5.6-10.9 ms during it, in
+three runs. The upkeep thread's CPU over the burst read 3.2-4.0 s with the flag against 3.2-3.6
 without (medians 3.7 and 3.4), the segment work's 0.3-1.2 s against 0.25-0.56, and the blocks the
-pass built did not move. The writer's rates under the flag were not measured: no pairing was run,
-and the arms exist to run one (`supdb-cache256` against `supdb-cache256tofit`, `supdb` against
-`supdb-tofit`, on the quick row and in `bench ab`).
+pass built did not move; those are of the flag as first built. The writer's rates, the drain and the
+lag points under the flag were not measured, nor the faults of the pages a trim returns and a build
+takes again (the `lagcounters` line of the same run has them by thread): no pairing was run, and the
+arms exist to run one (`supdb-cache256` against `supdb-cache256tofit` and the three arms that take a
+part away, `supdb` against `supdb-tofit`, on the quick row and in `bench ab`).
 
 A request to the trim on builds as well as frees, meant to return the load's own retention at the
 burst's start, was tried and dropped: the budgeted arm read 636 and 580 at the pass's end and 290
