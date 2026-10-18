@@ -441,12 +441,12 @@ fn time_cell(cell: &Cell, rounds: usize) -> Times {
             find.push(
                 ns_of(40, || {
                     for k in &keys {
-                        black_box(group_seek(black_box(group), n, k));
+                        black_box(group_seek(black_box(group), n, k).is_ok());
                     }
                 }) / n as f64,
             );
             walk.push(ns_of(100, || {
-                black_box(group_seek(black_box(group), n, &high));
+                black_box(group_seek(black_box(group), n, &high).is_ok());
             }));
             parse.push(ns_of(100, || {
                 black_box(walk_group(black_box(group), n, None).is_ok());

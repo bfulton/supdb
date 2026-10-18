@@ -460,16 +460,23 @@ pub struct GroupPos {
 
 /// The walk that searches a group: from offset zero, each record's key and
 /// the offset of the next from `record_key_next`, no extent rebuilt, keys
-/// compared as the engine's other searches compare them. `None` for a group
-/// that is not whole, which the first decode's [`walk_group`] has already
-/// refused; a search over a verified group cannot reach it.
-pub fn group_seek(group: &[u8], count: usize, key: &[u8]) -> Option<GroupPos> {
+/// compared as the engine's other searches compare them.
+///
+/// An `Err` is a group that is not whole -- a record that does not parse
+/// before the position is reached -- which the first decode's [`walk_group`]
+/// has already refused, so a search over a verified group cannot return one.
+/// It is damage and never an absent key: an absent key is
+/// `Ok(GroupPos { found: false, .. })`. A caller that reads an `Err` as
+/// "not here" answers wrongly with nothing raised, the silent miss; it
+/// counts the damage and reads the raw form.
+pub fn group_seek(group: &[u8], count: usize, key: &[u8]) -> Result<GroupPos, ZError> {
+    const CUT: ZError = ZError::Walk("a record does not parse");
     // Nothing sorts below the empty key, so the answer is the first record's
     // and no compare is made: a compare of a zero-length slice is a call like
     // any other, and an empty key held in a `Vec` points at no page.
     if key.is_empty() {
-        let found = count > 0 && record_key_next(group, 0)?.0.is_empty();
-        return Some(GroupPos {
+        let found = count > 0 && record_key_next(group, 0).ok_or(CUT)?.0.is_empty();
+        return Ok(GroupPos {
             index: 0,
             off: 0,
             found,
@@ -477,18 +484,18 @@ pub fn group_seek(group: &[u8], count: usize, key: &[u8]) -> Option<GroupPos> {
     }
     let mut off = 0usize;
     for index in 0..count {
-        let (k, next) = record_key_next(group, off)?;
+        let (k, next) = record_key_next(group, off).ok_or(CUT)?;
         match super::key_cmp(k, key) {
             Ordering::Less => off = next,
             Ordering::Equal => {
-                return Some(GroupPos {
+                return Ok(GroupPos {
                     index,
                     off,
                     found: true,
                 })
             }
             Ordering::Greater => {
-                return Some(GroupPos {
+                return Ok(GroupPos {
                     index,
                     off,
                     found: false,
@@ -496,7 +503,7 @@ pub fn group_seek(group: &[u8], count: usize, key: &[u8]) -> Option<GroupPos> {
             }
         }
     }
-    Some(GroupPos {
+    Ok(GroupPos {
         index: count,
         off,
         found: false,
@@ -3073,9 +3080,11 @@ mod tests {
         let al = Al::new(&[]);
         let p = group_seek(al.bytes(), 0, b"").expect("no records is a group too");
         assert_eq!((p.index, p.off, p.found), (0, 0, false));
-        // A group cut short is still refused for the empty key.
+        // A group cut short is still refused for the empty key: an error,
+        // and not the absence of the key.
         let al = Al::new(&with[..6]);
-        assert_eq!(group_seek(al.bytes(), 2, b""), None);
+        let got = group_seek(al.bytes(), 2, b"");
+        assert!(matches!(got, Err(ZError::Walk(_))), "{got:?}");
     }
 
     #[test]
@@ -3132,11 +3141,14 @@ mod tests {
                 walks(&group, n, Some(&recs[1].0)),
                 Err(ZError::Walk(_))
             ));
-            // A search over a group cut short says so rather than guessing.
+            // A search over a group cut short says so rather than guessing: an
+            // error, which a reader must count and not read as "absent", and
+            // which `found: false` is not.
             let cut = &group[..group.len() - 1];
             let alc = Al::new(cut);
             let past = vec![0xFFu8; 64];
-            assert_eq!(group_seek(alc.bytes(), n, &past), None);
+            let got = group_seek(alc.bytes(), n, &past);
+            assert!(matches!(got, Err(ZError::Walk(_))), "{got:?}");
         }
     }
 
