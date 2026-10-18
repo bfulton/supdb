@@ -5466,71 +5466,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// `supdb-settlefar` and `supdb-ingestsettlefar` are the policy with
-    /// `settlefar` alone set over their row's default, open under that
-    /// name, and the options they open the engine with differ from the
-    /// default's in `forms_settle_far` alone among the forms' settings.
-    #[test]
-    fn the_settlefar_arms_differ_from_their_defaults_in_the_far_filing_alone() {
-        let root =
-            std::env::temp_dir().join(format!("supdb-bench-settlefar-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        for (name, buffered) in [("supdb-settlefar", false), ("supdb-ingestsettlefar", true)] {
-            let d = root.join(name);
-            std::fs::create_dir_all(&d).unwrap();
-            let arm = if buffered {
-                Supdb::create_ingest_settlefar(&d)
-            } else {
-                Supdb::create_settlefar(&d)
-            }
-            .unwrap();
-            assert_eq!(arm.name(), name);
-            assert!(arm.settlefar && !arm.dirplain && !arm.lazyforms, "{name}");
-            let base_d = root.join(format!("{name}-base"));
-            std::fs::create_dir_all(&base_d).unwrap();
-            let base = if buffered {
-                Supdb::create_ingest(&base_d)
-            } else {
-                Supdb::create(&base_d)
-            }
-            .unwrap();
-            assert_eq!(arm.partition, base.partition, "{name}: the row's shape");
-            assert_eq!(arm.durable, base.durable, "{name}: the row's guarantee");
-            assert_eq!(arm.features(), base.features(), "{name}");
-            let (a, b) = (
-                arm.db.as_ref().unwrap().options(),
-                base.db.as_ref().unwrap().options(),
-            );
-            assert!(
-                a.forms_settle_far && !b.forms_settle_far,
-                "{name}: the one option"
-            );
-            assert_eq!(a.commit_forms, b.commit_forms, "{name}");
-            assert_eq!(a.scan_block_cache, b.scan_block_cache, "{name}");
-            assert_eq!(
-                a.forms_from_reader_scans, b.forms_from_reader_scans,
-                "{name}"
-            );
-            assert_eq!(
-                a.forms_settle_backlog_pct, b.forms_settle_backlog_pct,
-                "{name}"
-            );
-            assert_eq!(
-                a.forms_settle_recent_pct, b.forms_settle_recent_pct,
-                "{name}"
-            );
-            assert_eq!(a.seal_idle, b.seal_idle, "{name}");
-            drop(arm);
-            drop(base);
-            // The dispatch opens the arm by its name.
-            let opened_d = root.join(format!("{name}-open"));
-            std::fs::create_dir_all(&opened_d).unwrap();
-            let e = open(name, &opened_d, 1).unwrap();
-            assert_eq!(e.name(), name, "the dispatch");
-        }
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     /// `supdb-nocacheordread` is the nocache policy with `ordread` alone
     /// set over `supdb-nocache`: named, durable like it, opened under its
     /// name by the dispatch, and opened on options that differ from
@@ -5665,6 +5600,71 @@ mod tests {
         let e = open("supdb-nocacheordread", &opened, 1).unwrap();
         assert_eq!(e.name(), "supdb-nocacheordread", "the dispatch");
         drop(e);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `supdb-settlefar` and `supdb-ingestsettlefar` are the policy with
+    /// `settlefar` alone set over their row's default, open under that
+    /// name, and the options they open the engine with differ from the
+    /// default's in `forms_settle_far` alone among the forms' settings.
+    #[test]
+    fn the_settlefar_arms_differ_from_their_defaults_in_the_far_filing_alone() {
+        let root =
+            std::env::temp_dir().join(format!("supdb-bench-settlefar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (name, buffered) in [("supdb-settlefar", false), ("supdb-ingestsettlefar", true)] {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            let arm = if buffered {
+                Supdb::create_ingest_settlefar(&d)
+            } else {
+                Supdb::create_settlefar(&d)
+            }
+            .unwrap();
+            assert_eq!(arm.name(), name);
+            assert!(arm.settlefar && !arm.dirplain && !arm.lazyforms, "{name}");
+            let base_d = root.join(format!("{name}-base"));
+            std::fs::create_dir_all(&base_d).unwrap();
+            let base = if buffered {
+                Supdb::create_ingest(&base_d)
+            } else {
+                Supdb::create(&base_d)
+            }
+            .unwrap();
+            assert_eq!(arm.partition, base.partition, "{name}: the row's shape");
+            assert_eq!(arm.durable, base.durable, "{name}: the row's guarantee");
+            assert_eq!(arm.features(), base.features(), "{name}");
+            let (a, b) = (
+                arm.db.as_ref().unwrap().options(),
+                base.db.as_ref().unwrap().options(),
+            );
+            assert!(
+                a.forms_settle_far && !b.forms_settle_far,
+                "{name}: the one option"
+            );
+            assert_eq!(a.commit_forms, b.commit_forms, "{name}");
+            assert_eq!(a.scan_block_cache, b.scan_block_cache, "{name}");
+            assert_eq!(
+                a.forms_from_reader_scans, b.forms_from_reader_scans,
+                "{name}"
+            );
+            assert_eq!(
+                a.forms_settle_backlog_pct, b.forms_settle_backlog_pct,
+                "{name}"
+            );
+            assert_eq!(
+                a.forms_settle_recent_pct, b.forms_settle_recent_pct,
+                "{name}"
+            );
+            assert_eq!(a.seal_idle, b.seal_idle, "{name}");
+            drop(arm);
+            drop(base);
+            // The dispatch opens the arm by its name.
+            let opened_d = root.join(format!("{name}-open"));
+            std::fs::create_dir_all(&opened_d).unwrap();
+            let e = open(name, &opened_d, 1).unwrap();
+            assert_eq!(e.name(), name, "the dispatch");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 }
