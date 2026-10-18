@@ -485,6 +485,25 @@ pub struct Options {
     /// `Blob::lookup_full`, the shape before `Blob::with_lookup` lent them
     /// on the index's frame; kept to price it. `supdb-extsval`.
     pub exts_by_value: bool,
+    /// EXPERIMENT: a point read of a partition whose ordered index holds
+    /// whole keys (`OrdIndex::uniform`: every key one length, no longer
+    /// than the common prefix and eight bytes) finds its rank through the
+    /// index's heads (`OrdIndex::seek_exact`) and reads the values there
+    /// (`Blob::values_at`), and does not probe the segment's hash. The
+    /// hash is a region every read touches once, so it keeps cache the
+    /// records could have had, and the records are what a read past the
+    /// page cache misses on; the heads and the directory, which a seek
+    /// touches instead, are the smaller pair. The rank is checked against
+    /// the record before its values are returned, since the record is read
+    /// for them anyway, and a record that does not hold the key sends the
+    /// read to the hash (`Reader::ord_point_reads` counts both). A key the
+    /// heads place nowhere is answered absent without a record, as the
+    /// scans' seeks are believed. A partition whose keys are not of one
+    /// short length, the level-0 pieces and `count` read as before. In
+    /// memory the seek costs more than the probe it replaces, so this is
+    /// chosen by hand for a store that does not fit and is not the
+    /// default. `supdb-nocacheordread`.
+    pub point_via_ord: bool,
     /// EXPERIMENT: the block forms hold the fold of the partition and the
     /// level-0 pieces alone, and the memtables' keys reach a scan through
     /// the scan snapshot, which every walk overlays on its block whatever
@@ -1832,6 +1851,7 @@ impl Default for Options {
             writer_pins: true,
             asym_pins: false,
             exts_by_value: false,
+            point_via_ord: false,
             forms_pieces_only: false,
             publish_in_background: true,
             adaptive_shape: false,
@@ -10830,6 +10850,15 @@ pub struct Reader {
     /// tables, the scan snapshot, and the log position both are
     /// current to. See `FormsState`.
     fs: FormsCell,
+    /// Point reads of a partition this handle answered through the
+    /// partition's ordered index, and those that left it for the hash
+    /// because the record at the rank did not hold the key
+    /// (`Options::point_via_ord`). Words of the handle's own, not shared
+    /// ones: a count every reader thread bumped on one line is what the
+    /// threaded cells it is meant to be read beside would price. Declared
+    /// last and apart, so that no field the read path already uses moves.
+    ord_served: std::cell::Cell<u64>,
+    ord_declined: std::cell::Cell<u64>,
 }
 
 /// A handle's upkeep for its range reads: its block tables, its scan
@@ -13369,6 +13398,59 @@ impl Reader {
         )
     }
 
+    /// Point reads of a partition this handle answered through the
+    /// partition's ordered index, and the ones that left it for the hash
+    /// because the record at the rank did not hold the key
+    /// (`Options::point_via_ord`); both zero without the option. A
+    /// handle's own count: the `Db` answers for the reads it made, a
+    /// `Reader` for its own.
+    pub fn ord_point_reads(&self) -> (u64, u64) {
+        (self.ord_served.get(), self.ord_declined.get())
+    }
+
+    /// `key`'s values in a partition read through the partition's ordered
+    /// index (`Options::point_via_ord`), or `None` where the hash must
+    /// answer.
+    ///
+    /// Only where the index holds whole keys (`OrdIndex::uniform`): with
+    /// any other a head can tie another key's, and the tie is broken by
+    /// reading records, which is the probe's cost over again. The heads
+    /// place the key at a rank or nowhere, and nowhere is believed as
+    /// every scan's seek believes the index. A rank is checked: its record
+    /// is read for the values, and one that does not hold the key sends
+    /// the read to the hash and is counted, since the index is checked
+    /// against its segment at open by the key count alone and a rank it
+    /// gave wrongly must not return another key's values. The record is
+    /// read twice, for its key and then for its values, the second over
+    /// lines the first left warm.
+    fn part_via_ord<F: FnMut(&[u8])>(
+        &self,
+        seg: &Seg,
+        key: &[u8],
+        f: &mut F,
+    ) -> Result<Option<u64>> {
+        if !seg.ord.uniform() {
+            return Ok(None);
+        }
+        let (rank, exact) = seg.ord.seek_exact(key, |r| seg.blob.key_at(r));
+        let served = match exact {
+            Some(false) => Some(0),
+            Some(true) if seg.blob.key_at(rank) == Some(key) => Some(
+                seg.blob
+                    .values_at(rank, &mut *f)
+                    .map_err(|e| err(&format!("segment read: {e}")))?,
+            ),
+            _ => None,
+        };
+        let count = if served.is_some() {
+            &self.ord_served
+        } else {
+            &self.ord_declined
+        };
+        count.set(count.get() + 1);
+        Ok(served)
+    }
+
     pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {
         let _entered = self.enter();
         self.advise(true);
@@ -13452,7 +13534,18 @@ impl Reader {
         };
         if start == 0 {
             if let Some(seg) = part {
-                n += seg_read(seg, &mut f)?;
+                // The partition through its ordered index where the option
+                // asks and the index can answer; everything else, and the
+                // pieces below, through the hash.
+                let via_ord = if self.opts.point_via_ord {
+                    self.part_via_ord(seg, key, &mut f)?
+                } else {
+                    None
+                };
+                n += match via_ord {
+                    Some(k) => k,
+                    None => seg_read(seg, &mut f)?,
+                };
             }
         }
         for (i, seg) in l0.iter().enumerate() {
@@ -18678,6 +18771,8 @@ impl Db {
             counted: false,
             understudy: false,
             scan_ns: std::cell::Cell::new([0; 6]),
+            ord_served: std::cell::Cell::new(0),
+            ord_declined: std::cell::Cell::new(0),
             slot: None,
             pin_slot,
             depth: std::cell::Cell::new(0),
@@ -19105,6 +19200,8 @@ impl Db {
             counted: false,
             understudy: false,
             scan_ns: std::cell::Cell::new([0; 6]),
+            ord_served: std::cell::Cell::new(0),
+            ord_declined: std::cell::Cell::new(0),
             slot: None,
             pin_slot,
             depth: std::cell::Cell::new(0),
@@ -21232,6 +21329,8 @@ impl Reader {
             counted: false,
             understudy: false,
             scan_ns: std::cell::Cell::new([0; 6]),
+            ord_served: std::cell::Cell::new(0),
+            ord_declined: std::cell::Cell::new(0),
             slot: None,
             pin_slot,
             depth: std::cell::Cell::new(0),
@@ -21261,6 +21360,8 @@ impl Reader {
             counted: false,
             understudy: false,
             scan_ns: std::cell::Cell::new([0; 6]),
+            ord_served: std::cell::Cell::new(0),
+            ord_declined: std::cell::Cell::new(0),
             slot: Some(slot),
             pin_slot: None,
             depth: std::cell::Cell::new(0),
@@ -21297,6 +21398,8 @@ impl Reader {
             counted,
             understudy: false,
             scan_ns: std::cell::Cell::new([0; 6]),
+            ord_served: std::cell::Cell::new(0),
+            ord_declined: std::cell::Cell::new(0),
             slot: Some(slot),
             pin_slot: None,
             depth: std::cell::Cell::new(0),
@@ -23292,6 +23395,8 @@ impl Reader {
             counted: false,
             understudy: true,
             scan_ns: std::cell::Cell::new([0; 6]),
+            ord_served: std::cell::Cell::new(0),
+            ord_declined: std::cell::Cell::new(0),
             slot: None,
             // A slot of its own for the passes, which pin it as the
             // writer's operations pin the writer's.
