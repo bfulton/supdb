@@ -26641,18 +26641,18 @@ impl<'s> BuildCtx<'s> {
         ov: &Overlay,
     ) {
         use std::fmt::Write as _;
-        let mut prev: Option<usize> = None;
+        // Any cut that is not what the partition says it is, behind the walk
+        // or not: a cut ahead of the walk asserts nothing and answers wrong.
         let mut bad = false;
         for o in ov.over.iter() {
             if o.cut == u32::MAX {
                 continue;
             }
-            let c = (o.cut >> 1) as usize;
-            if prev.is_some_and(|p| c < p) {
+            let (_, truth) = Self::owner_of(seg, o.key);
+            if o.cut != truth {
                 bad = true;
                 break;
             }
-            prev = Some(c + (o.cut & 1) as usize);
         }
         if !bad {
             return;

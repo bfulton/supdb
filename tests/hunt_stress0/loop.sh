@@ -19,6 +19,7 @@ seq 0 $((RUNS - 1)) | LABEL="$LABEL" HERE="$HERE" BIN="$BIN" OUT="$OUT" xargs -P
   sh "$HERE/run_one.sh" "$BIN" "$OUT" "$LABEL-{}"
 ' >>"$RES"
 ok=$(grep -c '^ok ' "$RES")
+stale=$(grep -c '^ok-stale-cut' "$RES")
 f1=$(grep -c '^F1' "$RES")
 f0=$(grep -c '^F0' "$RES")
 f2=$(grep -c '^F2' "$RES")
@@ -26,4 +27,4 @@ f3=$(grep -c '^F3' "$RES")
 fp=$(grep -c '^forced-passed' "$RES")
 fn=$(grep -c '^forced-not-parked' "$RES")
 ot=$(grep -c '^other\|^forced-other' "$RES")
-echo "SUMMARY $LABEL runs=$RUNS ok=$ok F1=$f1 F0=$f0 F2=$f2 F3=$f3 forced-passed=$fp forced-not-parked=$fn other=$ot"
+echo "SUMMARY $LABEL runs=$RUNS ok=$ok ok-stale-cut=$stale F1=$f1 F0=$f0 F2=$f2 F3=$f3 forced-passed=$fp forced-not-parked=$fn other=$ot"

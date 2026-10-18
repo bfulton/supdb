@@ -338,14 +338,40 @@ fn hunt_oracle() {
 fn hunt_cut_forced() {
     let variant = env_str("HUNT_CUT_VARIANT").unwrap_or_else(|| "assert".to_string());
     let dir = scratch("cutforced");
-    let opts = Options {
+    // The seal thread's snapshot of its frozen table and the handles' sharing
+    // of snapshots are off: with them on, the writer sometimes adopts a
+    // snapshot built after the key was written and the key is held by the
+    // snapshot, not filed in its block's list (the schedule then misses the
+    // stale cut, in about a quarter of runs). `HUNT_OPT=seal_snapshot=1,
+    // share_snapshot=1` puts them back.
+    let mut opts = Options {
         scan_block_cache: true,
         upkeep: Upkeep::Inline,
         partition_bytes: Some(1 << 20),
         seal_bytes: 1 << 30,
         l0_trigger: 1,
+        seal_snapshot: false,
+        share_snapshot: false,
         ..Options::default()
     };
+    // Options taken away to find what the schedule leaves to a race.
+    if let Some(list) = env_str("HUNT_OPT") {
+        for kv in list.split(',') {
+            let (k, v) = kv.split_once('=').unwrap_or_else(|| panic!("HUNT_OPT {kv}"));
+            let flag = v != "0";
+            match k {
+                "seal_snapshot" => opts.seal_snapshot = flag,
+                "frozen_snaps" => opts.frozen_snaps = flag,
+                "share_snapshot" => opts.share_snapshot = flag,
+                "publish_in_background" => opts.publish_in_background = flag,
+                "snapshot_carry" => opts.snapshot_carry = flag,
+                "forms_carry" => opts.forms_carry = flag,
+                "forms_rebase" => opts.forms_rebase = flag,
+                "scan_cache_ahead" => opts.scan_cache_ahead = flag,
+                other => panic!("HUNT_OPT: unknown option {other}"),
+            }
+        }
+    }
     let key = |n: usize| format!("k{n:04}").into_bytes();
     let mut db = Db::create(&dir, opts).unwrap();
     let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
@@ -404,18 +430,26 @@ fn hunt_cut_forced() {
     if let Some(first) = &first {
         db.put(first, b"v-first");
         model.insert(first.clone(), b"v-first".to_vec());
-        db.commit().unwrap();
     }
     let want: Vec<_> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    // The commit builds the block inline when the forms are kept, and the scan
+    // builds it when they are not: the engine's assertion can fire in either,
+    // so both are under the catch.
+    let phase = std::cell::Cell::new("commit");
+    let scanned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if first.is_some() {
+            db.commit().unwrap();
+        }
+        phase.set("scan");
+        walk(&db)
+    }));
     if env_flag("HUNT_CUT_DEBUG", false) {
-        eprintln!("HUNT-CUT-DEBUG before the last scan: {}", db.debug_key(&second));
-    }
-    let scanned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| walk(&db)));
-    if env_flag("HUNT_CUT_DEBUG", false) {
-        eprintln!("HUNT-CUT-DEBUG after the last scan: {}", db.debug_key(&second));
+        for line in supdb::db::dbgtrace::dump(0) {
+            eprintln!("TRACE {line}");
+        }
     }
     let verdict = match &scanned {
-        Err(_) => "the engine panicked".to_string(),
+        Err(_) => format!("the engine panicked, in the {}", phase.get()),
         Ok(got) if *got == want => "right".to_string(),
         Ok(got) => {
             let at = got

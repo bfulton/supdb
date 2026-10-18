@@ -13,6 +13,12 @@ RC=$?
 rm -rf "$T"
 LOG="$OUT/log/$ID.txt"
 if [ "$RC" = 0 ] && grep -q 'HUNT-OK' "$LOG"; then
+  if grep -q 'HUNT-PROVENANCE' "$LOG"; then
+    # A build met a cut that was not what its partition says, and nothing
+    # asserted and no answer was wrong: kept for reading.
+    echo "ok-stale-cut $ID"
+    exit 0
+  fi
   echo "ok $ID"
   rm -f "$LOG"
   exit 0
