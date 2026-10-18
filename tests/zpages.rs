@@ -258,6 +258,27 @@ fn check(r: &Reader, model: &Model, keys: &[Vec<u8>], what: &str) {
     }
 }
 
+/// As `check`, each key counted before it is read: the first touch of a
+/// page that fails its checks is a count in some of a sidecar's flips and a
+/// read in the others, and the two answer a failure by different arms.
+fn check_counts_first(r: &Reader, model: &Model, keys: &[Vec<u8>], what: &str) {
+    for k in keys {
+        let want = model.get(k).cloned().unwrap_or_default();
+        assert_eq!(
+            r.count(k).unwrap() as usize,
+            want.len(),
+            "{what}: count of {:?}",
+            String::from_utf8_lossy(k)
+        );
+        assert_eq!(
+            read_vec(r, k),
+            want,
+            "{what}: read of {:?}",
+            String::from_utf8_lossy(k)
+        );
+    }
+}
+
 /// Every key the model holds, scanned, is what the model says.
 fn check_scan(r: &Reader, model: &Model, what: &str) {
     let mut scanned: Model = BTreeMap::new();
@@ -804,7 +825,12 @@ fn a_flipped_byte_in_a_sidecar_is_never_an_answer() {
         f.write_at(&[good[at] ^ 0x40], at as u64).unwrap();
         let db = Db::open(&work, forced(|_| {})).unwrap();
         let probe = keys_of_page(&target, p, &keys);
-        check(&db, &model, &probe, &format!("byte {at}"));
+        // Half the flips are met by a count first and half by a read.
+        if (at / 997) % 2 == 1 {
+            check_counts_first(&db, &model, &probe, &format!("byte {at}"));
+        } else {
+            check(&db, &model, &probe, &format!("byte {at}"));
+        }
         let c = db.zpage_counts();
         if sampled.contains(&p) {
             assert_eq!(
@@ -1309,6 +1335,93 @@ fn a_scan_of_a_covered_partition_is_walked_raw_and_counted() {
 }
 
 #[test]
+fn a_promotion_that_closes_a_fence_keeps_the_sidecar_of_the_partition_it_renames() {
+    // The store's last partition has an open fence. Keys above it make more
+    // partitions, and the promotion closes the first by linking it under a
+    // new name that keeps its id and end sequence: the sidecar those two
+    // fields name is the new name's as well, and the retirement of the old
+    // name must not take it.
+    let dir = scratch("promoted");
+    let mut db = Db::create(&dir, forced(|o| o.partition_bytes = Some(160 << 10))).unwrap();
+    let mut model = ordered_load(&mut db, 3000, 0x9A0);
+    db.zpages_settle().unwrap();
+    let first = db.zpage_counts();
+    assert!(
+        first.sidecars >= 2 && first.sidecars == first.partitions,
+        "{first:?}"
+    );
+    let before: Vec<String> = db.zpage_sidecars().into_iter().map(|s| s.0).collect();
+    // Keys above everything stored.
+    let mut rng = Rng(0x9A01);
+    for chunk in (3000..4800usize).collect::<Vec<_>>().chunks(300) {
+        for &i in chunk {
+            let (k, v) = (spaced_key(i), suite_value(&mut rng));
+            db.append(&k, &v);
+            model.insert(k, vec![v]);
+        }
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(c.sidecars, c.partitions, "{c:?}");
+    let after: Vec<String> = db.zpage_sidecars().into_iter().map(|s| s.0).collect();
+    // A partition of the first load is live under a name it did not have,
+    // and its sidecar is the file it had.
+    let renamed: Vec<&String> = before.iter().filter(|n| !after.contains(n)).collect();
+    assert!(
+        !renamed.is_empty(),
+        "no promotion closed a fence: {before:?} then {after:?}"
+    );
+    for old in &renamed {
+        assert!(
+            after.iter().any(|n| zpg_of(n) == zpg_of(old)),
+            "{old} is gone, not renamed: {after:?}"
+        );
+    }
+    // Nothing the promotion renamed was built again: the builds since are of
+    // the partitions whose sidecars the first load did not make.
+    let kept = after
+        .iter()
+        .filter(|n| before.iter().any(|b| zpg_of(b) == zpg_of(n)))
+        .count();
+    assert_eq!(
+        c.builds - first.builds,
+        (after.len() - kept) as u64,
+        "{c:?}"
+    );
+    // And the files on disk are the live partitions' and no others.
+    let mut on_disk: Vec<String> = sidecar_files(&dir)
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    let mut want: Vec<String> = after.iter().map(|n| zpg_of(n)).collect();
+    on_disk.sort();
+    want.sort();
+    assert_eq!(on_disk, want, "no sidecar lost to a rename, none left over");
+    let keys: Vec<Vec<u8>> = model.keys().step_by(7).cloned().collect();
+    check(&db, &model, &keys, "after the promotion");
+    let c = db.zpage_counts();
+    assert_eq!(
+        (
+            c.rawserves,
+            c.fallbacks,
+            c.rejected_damage,
+            c.rejected_identity
+        ),
+        (0, 0, 0, 0),
+        "{c:?}"
+    );
+    // Reopened, every partition attaches the file it has.
+    db.close().unwrap();
+    let db = Db::open(&dir, forced(|_| {})).unwrap();
+    let c = db.zpage_counts();
+    assert_eq!((c.attached, c.rejected_damage), (c.partitions, 0), "{c:?}");
+    check(&db, &model, &keys, "reopened");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn handles_on_threads_read_through_the_sidecars_and_their_counts_sum() {
     let dir = scratch("threads");
     let mut db = Db::create(&dir, forced(|o| o.partition_bytes = Some(160 << 10))).unwrap();
@@ -1355,12 +1468,18 @@ fn a_callback_that_reads_again_leaves_the_value_it_was_lent_alone() {
     let (a, b) = (&keys[100], &keys[4000]);
     let mut calls = 0;
     db.read_all(a, |outer| {
-        let before = outer.to_vec();
-        assert_eq!(&before, &model[a][0]);
+        assert_eq!(outer, &model[a][0][..]);
         // Another page, another read, inside the callback.
         assert_eq!(read_vec(&db, b), model[b]);
         assert_eq!(db.count(b).unwrap(), 1);
-        assert_eq!(outer, &before[..], "the outer value was overwritten");
+        // The value read again byte by byte, volatile: a slice lent for a
+        // call is one the compiler may take to be unchanged under any call
+        // made inside it, and what is asked is whether the call changed it.
+        let again: Vec<u8> = (0..outer.len())
+            // SAFETY: inside the slice the callback was lent.
+            .map(|i| unsafe { std::ptr::read_volatile(outer.as_ptr().add(i)) })
+            .collect();
+        assert_eq!(again, model[a][0], "the outer value was overwritten");
         calls += 1;
     })
     .unwrap();

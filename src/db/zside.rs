@@ -1553,11 +1553,18 @@ mod tests {
         let mut seen = false;
         let r = side
             .read_all(&fx.blob, &a.0, &mut |outer: &[u8]| {
-                let before = outer.to_vec();
-                assert_eq!(before, a.1[0]);
+                assert_eq!(outer, &a.1[0][..]);
                 let inner = z_values(&side, &fx.blob, &b.0).unwrap();
                 assert_eq!(inner, b.1);
-                assert_eq!(outer, &before[..], "the outer value was overwritten");
+                // Read again byte by byte, volatile: a slice lent for a call
+                // is one the compiler may take to be unchanged under any
+                // call made inside it, and what is asked is whether the
+                // call changed it.
+                let again: Vec<u8> = (0..outer.len())
+                    // SAFETY: inside the slice the callback was lent.
+                    .map(|i| unsafe { std::ptr::read_volatile(outer.as_ptr().add(i)) })
+                    .collect();
+                assert_eq!(again, a.1[0], "the outer value was overwritten");
                 seen = true;
             })
             .unwrap();
@@ -1598,6 +1605,15 @@ mod tests {
         assert!(matches!(one.attach(), Err(Reject::Missing)));
     }
 
+    /// A refusal as words: its kind, and the check that made it.
+    fn reject_text(r: &Reject) -> String {
+        match r {
+            Reject::Missing => "missing".into(),
+            Reject::Damage(why) => format!("damage: {why}"),
+            Reject::Identity(why) => format!("identity: {why}"),
+        }
+    }
+
     /// The trailer of the file at `path`, and a rewrite of it with a field
     /// changed, its CRC and `bind32` made again.
     fn with_trailer(path: &Path, change: impl FnOnce(&mut Trailer)) {
@@ -1616,39 +1632,131 @@ mod tests {
         let good = std::fs::read(&fx.out).unwrap();
         let t0 = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
         type Edit = Box<dyn Fn(&mut Trailer)>;
-        let edits: Vec<(&str, Edit)> = vec![
-            ("n_pages", Box::new(|t| t.n_pages += 1)),
-            ("n_entries", Box::new(|t| t.n_entries += 1)),
-            ("nkeys", Box::new(|t| t.nkeys += 1)),
-            ("res_off", Box::new(|t| t.res_off += ZPAGE as u64)),
-            ("res_len", Box::new(|t| t.res_len += 1)),
-            ("keys_len", Box::new(|t| t.keys_len += 1)),
-            ("filter_off", Box::new(|t| t.filter_off = 64)),
-            ("filter_blocks", Box::new(|t| t.filter_blocks = 1)),
-            ("res_crc", Box::new(|t| t.res_crc ^= 1)),
-            ("filter", Box::new(|t| t.filter = true)),
-            ("seg_recs_len", Box::new(|t| t.seg_recs_len += 4)),
-            ("seg_crc_off", Box::new(|t| t.seg_crc_off += 4)),
-            ("seg_key_off", Box::new(|t| t.seg_key_off += 4096)),
-            ("seg_hash_cap", Box::new(|t| t.seg_hash_cap *= 2)),
-            ("seg_file_len", Box::new(|t| t.seg_file_len += 4096)),
-            ("seg_timestamp", Box::new(|t| t.seg_timestamp += 1)),
-            ("seg_generation", Box::new(|t| t.seg_generation += 1)),
-            ("seg_row_crc", Box::new(|t| t.seg_row_crc ^= 1)),
-            ("rec_version", Box::new(|t| t.rec_version += 1)),
-            ("rec_magic", Box::new(|t| t.rec_magic ^= 1)),
-            ("seg_id", Box::new(|t| t.seg_id += 1)),
-            ("seg_end_seq", Box::new(|t| t.seg_end_seq += 1)),
+        // Each field changed, with the refusal it gets: the kind of it and
+        // the words of the check that made it. A field that some other
+        // check would also refuse is not shown to have a check of its own by
+        // a refusal alone, so the check is named: the segment's identity is
+        // compared field by field, and a field whose comparison was removed
+        // would still be refused, by the binding hash, in other words.
+        let edits: Vec<(&str, Edit, &str)> = vec![
+            (
+                "n_pages",
+                Box::new(|t| t.n_pages += 1),
+                "damage: z form: the trailer is inconsistent: res_off is not the pages' length",
+            ),
+            (
+                "n_entries",
+                Box::new(|t| t.n_entries += 1),
+                "damage: z form: the resident part is malformed: the region is not the entries alone",
+            ),
+            (
+                "nkeys",
+                Box::new(|t| t.nkeys += 1),
+                "identity: the key count differs",
+            ),
+            (
+                "res_off",
+                Box::new(|t| t.res_off += ZPAGE as u64),
+                "damage: z form: the trailer is inconsistent: res_off is not the pages' length",
+            ),
+            (
+                "res_len",
+                Box::new(|t| t.res_len += 1),
+                "damage: z form: the resident part's checksum does not match",
+            ),
+            (
+                "keys_len",
+                Box::new(|t| t.keys_len += 1),
+                "damage: z form: the resident part is malformed: the region is not the entries alone",
+            ),
+            (
+                "filter_off",
+                Box::new(|t| t.filter_off = 64),
+                "damage: z form: the resident part is malformed: the region is not the entries alone",
+            ),
+            (
+                "filter_blocks",
+                Box::new(|t| t.filter_blocks = 1),
+                "damage: z form: the trailer is inconsistent: the filter flag and the filter's blocks disagree",
+            ),
+            (
+                "res_crc",
+                Box::new(|t| t.res_crc ^= 1),
+                "damage: z form: the resident part's checksum does not match",
+            ),
+            (
+                "filter",
+                Box::new(|t| t.filter = true),
+                "damage: z form: the trailer is inconsistent: the filter flag and the filter's blocks disagree",
+            ),
+            (
+                "seg_recs_len",
+                Box::new(|t| t.seg_recs_len += 4),
+                "identity: the record region's length differs",
+            ),
+            (
+                "seg_crc_off",
+                Box::new(|t| t.seg_crc_off += 4),
+                "identity: the checksum row's place differs",
+            ),
+            (
+                "seg_key_off",
+                Box::new(|t| t.seg_key_off += 4096),
+                "identity: the key section's offset differs",
+            ),
+            (
+                "seg_hash_cap",
+                Box::new(|t| t.seg_hash_cap *= 2),
+                "identity: the hash capacity differs",
+            ),
+            (
+                "seg_file_len",
+                Box::new(|t| t.seg_file_len += 4096),
+                "identity: the segment's length differs",
+            ),
+            (
+                "seg_timestamp",
+                Box::new(|t| t.seg_timestamp += 1),
+                "identity: the segment's timestamp differs",
+            ),
+            (
+                "seg_generation",
+                Box::new(|t| t.seg_generation += 1),
+                "identity: the segment's generation differs",
+            ),
+            (
+                "seg_row_crc",
+                Box::new(|t| t.seg_row_crc ^= 1),
+                "identity: the key section's checksum row differs",
+            ),
+            (
+                "rec_version",
+                Box::new(|t| t.rec_version += 1),
+                "identity: the record format's version differs",
+            ),
+            (
+                "rec_magic",
+                Box::new(|t| t.rec_magic ^= 1),
+                "identity: the file format's magic differs",
+            ),
+            (
+                "seg_id",
+                Box::new(|t| t.seg_id += 1),
+                "identity: the sidecar names another segment",
+            ),
+            (
+                "seg_end_seq",
+                Box::new(|t| t.seg_end_seq += 1),
+                "identity: the sidecar names another segment",
+            ),
         ];
-        for (field, edit) in &edits {
+        for (field, edit, why) in &edits {
             std::fs::write(&fx.out, &good).unwrap();
             with_trailer(&fx.out, |t| edit(t));
-            let r = fx.attach();
-            assert!(
-                matches!(r, Err(Reject::Damage(_) | Reject::Identity(_))),
-                "a trailer with {field} changed attached: {:?}",
-                r.map(|_| ())
-            );
+            match fx.attach() {
+                Err(r) => assert_eq!(&reject_text(&r), why, "a trailer with {field} changed"),
+                Ok(_) => panic!("a trailer with {field} changed attached"),
+            }
         }
         // The fields no read depends on: the decoded bytes a trailer sums
         // for the ratio, and the filter's parameters, which a trailer with
@@ -1692,6 +1800,23 @@ mod tests {
                 matches!(fx.attach(), Err(Reject::Damage(_))),
                 "a file of {len} bytes attached"
             );
+        }
+        // A page gone from the middle with the trailer whole at the end: a
+        // file of a whole number of pages that is not the length its trailer
+        // says, which is refused for that before anything is read from it.
+        let mut bad = good[..ZPAGE].to_vec();
+        bad.extend_from_slice(&good[2 * ZPAGE..]);
+        std::fs::write(&fx.out, &bad).unwrap();
+        match fx.attach() {
+            Err(r) => {
+                let text = reject_text(&r);
+                assert!(
+                    text.starts_with("damage:")
+                        && text.ends_with("the file is not the length its trailer says"),
+                    "{text}"
+                );
+            }
+            Ok(_) => panic!("a file a page short attached"),
         }
     }
 
