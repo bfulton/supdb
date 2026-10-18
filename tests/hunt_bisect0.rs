@@ -46,10 +46,9 @@
 //!
 //! Compile-time switches, for commits that lack what a call needs:
 //! `--cfg hunt_old` leaves out `hold_seal_landing` and `frozen_tables`, and
-//! `--cfg hunt_opts` turns on `HUNT_NO_SHARE`, `HUNT_NO_FORMS` and
-//! `HUNT_UPKEEP`, which set options by name (both scenarios), and with
-//! `--cfg hunt_alert` `HUNT_NO_ALERT`, with `--cfg hunt_rebase`
-//! `HUNT_NO_REBASE`.
+//! `hunt_share`, `hunt_forms`, `hunt_upkeep` (together `hunt_opts`),
+//! `hunt_alert` and `hunt_rebase` turn on the switches `hunt_opts` lists,
+//! which set options by name (both scenarios).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -280,40 +279,57 @@ fn same_window(got: &Window, want: &Window, what: &str) -> Result<(), String> {
 
 // ---- the snapshot scenario ------------------------------------------------
 
-/// Option switches for isolating a mechanism, on the commits that have the
-/// options (`--cfg hunt_opts`): `HUNT_NO_SHARE=1` leaves the published scan
-/// snapshot out, `HUNT_NO_FORMS=1` the published block forms, and
-/// `HUNT_UPKEEP=inline|bg1|bg2` sets the writer's upkeep.
-#[cfg(hunt_opts)]
+/// Option switches for isolating a mechanism, each on the commits that have
+/// the option it sets; with nothing compiled in this does nothing.
+///
+///  * `--cfg hunt_share`: `HUNT_NO_SHARE=1` leaves the published scan
+///    snapshot out.
+///  * `--cfg hunt_forms`: `HUNT_NO_FORMS=1` leaves the published block forms
+///    out, `HUNT_FORMS_ON=1` turns them on where an arm has them off.
+///  * `--cfg hunt_upkeep`: `HUNT_UPKEEP=inline|bg1|bg2` sets the writer's
+///    upkeep.
+///  * `--cfg hunt_opts` is the three together.
+///  * `--cfg hunt_alert`: `HUNT_NO_ALERT=1` is the upkeep thread's back-off
+///    as it was before it stayed alert.
+///  * `--cfg hunt_rebase`: `HUNT_NO_REBASE=1` drops the tables at a merge's
+///    rewrite of a partition, as before they were carried.
+#[allow(unused_variables)]
 fn hunt_opts(o: &mut Options) {
+    #[cfg(any(hunt_opts, hunt_share))]
     if env_u64("HUNT_NO_SHARE", 0) == 1 {
         o.share_snapshot = false;
     }
-    if env_u64("HUNT_NO_FORMS", 0) == 1 {
-        o.commit_forms = false;
+    #[cfg(any(hunt_opts, hunt_forms))]
+    {
+        if env_u64("HUNT_NO_FORMS", 0) == 1 {
+            o.commit_forms = false;
+        }
+        if env_u64("HUNT_FORMS_ON", 0) == 1 {
+            o.commit_forms = true;
+        }
     }
-    // The tables carried across a merge's rewrite of a partition
-    // (`forms_rebase`, from the commit that made it).
     #[cfg(hunt_rebase)]
     if env_u64("HUNT_NO_REBASE", 0) == 1 {
         o.forms_rebase = false;
     }
+    // The writer's scan snapshot carried across a publish (`--cfg
+    // hunt_carry`, from the commit that made it, off by default).
+    #[cfg(hunt_carry)]
+    if env_u64("HUNT_SNAP_CARRY", 0) == 1 {
+        o.snapshot_carry = true;
+    }
+    #[cfg(any(hunt_opts, hunt_upkeep))]
     match std::env::var("HUNT_UPKEEP").as_deref() {
         Ok("inline") => o.upkeep = supdb::db::Upkeep::Inline,
         Ok("bg1") => o.upkeep = supdb::db::Upkeep::Background(1),
         Ok("bg2") => o.upkeep = supdb::db::Upkeep::Background(2),
         _ => {}
     }
-    // The upkeep thread's alert poll exists from the commit that made it
-    // (`--cfg hunt_alert`): `HUNT_NO_ALERT=1` is the back-off as it was.
     #[cfg(hunt_alert)]
     if env_u64("HUNT_NO_ALERT", 0) == 1 {
         o.upkeep_alert = false;
     }
 }
-
-#[cfg(not(hunt_opts))]
-fn hunt_opts(_: &mut Options) {}
 
 fn snapshot_scenario(iter: u64) -> Result<(), String> {
     let xor = env_u64("HUNT_SEED", 0);
@@ -365,6 +381,13 @@ fn snapshot_scenario(iter: u64) -> Result<(), String> {
             // The first two rounds' writes are in a frozen table when the
             // third begins.
             db.seal().unwrap();
+            // Where the seal cannot be held, it lands now, so that when it
+            // lands is not what the snapshot's cycles depend on: a commit
+            // that joins a finished seal publishes the forms into the state
+            // a handle holds, and whether the seal had finished by the
+            // first cycle's commit was a matter of the machine's load.
+            #[cfg(hunt_old)]
+            db.settle().unwrap();
         }
     }
     #[cfg(not(hunt_old))]

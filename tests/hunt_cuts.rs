@@ -53,7 +53,10 @@ fn same(got: &Scan, want: &Scan, what: &str) {
         Some(vs) => format!(
             "{:?}",
             vs.iter()
-                .map(|v| String::from_utf8_lossy(&v[..v.iter().position(|&b| b == b'.').unwrap_or(v.len())]).to_string())
+                .map(|v| String::from_utf8_lossy(
+                    &v[..v.iter().position(|&b| b == b'.').unwrap_or(v.len())]
+                )
+                .to_string())
                 .collect::<Vec<_>>()
         ),
         None => "absent".to_string(),
@@ -77,22 +80,33 @@ fn same(got: &Scan, want: &Scan, what: &str) {
             )
         })
         .collect();
-    panic!("{what}: {} keys differ ({} scanned, {} in the model); {}", parts.len(), got.len(), want.len(), lines.join("; "));
+    panic!(
+        "{what}: {} keys differ ({} scanned, {} in the model); {}",
+        parts.len(),
+        got.len(),
+        want.len(),
+        lines.join("; ")
+    );
 }
 
 #[test]
 fn a_rewrite_that_changes_interior_keys_leaves_cuts_behind() {
     let dir = scratch("interior");
-    let mut db = Db::create(
-        &dir,
-        Options {
-            partition_bytes: Some(1 << 20),
-            scan_block_cache: true,
-            l0_trigger: 1,
-            ..Options::default()
-        },
-    )
-    .unwrap();
+    #[allow(unused_mut)]
+    let mut opts = Options {
+        partition_bytes: Some(1 << 20),
+        scan_block_cache: true,
+        l0_trigger: 1,
+        ..Options::default()
+    };
+    // `--cfg hunt_rebase`, on commits that have `forms_rebase`:
+    // HUNT_NO_REBASE=1 drops the tables at a merge's rewrite, as before they
+    // were carried.
+    #[cfg(hunt_rebase)]
+    if std::env::var("HUNT_NO_REBASE").is_ok_and(|v| v == "1") {
+        opts.forms_rebase = false;
+    }
+    let mut db = Db::create(&dir, opts).unwrap();
     let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
     for i in (0..200).step_by(2) {
         db.append(&key(i), &val("base"));
