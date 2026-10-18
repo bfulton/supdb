@@ -13422,6 +13422,13 @@ impl Reader {
     /// gave wrongly must not return another key's values. The record is
     /// read twice, for its key and then for its values, the second over
     /// lines the first left warm.
+    ///
+    /// Out of line on purpose. Its one call site invites the compiler to
+    /// inline it, and inlined it grows `read_all`, which every point read
+    /// runs, by more than a third, and the reads the option does not touch
+    /// pay for the growth in instructions; out of line, the default path
+    /// counts what it counted before the option existed.
+    #[inline(never)]
     fn part_via_ord<F: FnMut(&[u8])>(
         &self,
         seg: &Seg,
