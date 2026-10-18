@@ -10,8 +10,11 @@
 //! To build it at a commit that lacks something it names: a tree from before
 //! `Options::upkeep` has no `HUNT_UPKEEP` match to keep (delete the `match`
 //! below), and a tree from before the seal hold has no `hold_seal_landing`
-//! (delete that one line). Nothing else in it is newer than the first commits
-//! of the forms.
+//! (delete that one line). Built so at 78bc23d, 39401bb, 049f4cf, 1087ec8,
+//! 7b0ceb8, e607e70, 579f3d4, f32222a, 39b8f17, eca185b, 6d4b450, 9f5f1ab and
+//! d9712ee, each in a target directory of its own (trees that share one
+//! overwrite each other's binaries). Below e607e70 this scenario fails 42 runs
+//! in 44, at the first key, for an older reason that is not this defect.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

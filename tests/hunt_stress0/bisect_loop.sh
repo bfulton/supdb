@@ -18,9 +18,9 @@ while [ "$c" -lt "$CYCLES" ]; do
       \#* | "") continue ;;
     esac
     if [ "$envv" = "-" ]; then
-      TESTNAME=hunt_scenario sh "$HERE/loop.sh" "$bin" "$OUT" "$PER" "$PAR" "$label-c$c" >>"$OUT/bisect-summary.txt"
+      TESTNAME="${TESTNAME:-hunt_scenario}" sh "$HERE/loop.sh" "$bin" "$OUT" "$PER" "$PAR" "$label-c$c" >>"$OUT/bisect-summary.txt"
     else
-      env "$envv" TESTNAME=hunt_scenario sh "$HERE/loop.sh" "$bin" "$OUT" "$PER" "$PAR" "$label-c$c" >>"$OUT/bisect-summary.txt"
+      env "$envv" TESTNAME="${TESTNAME:-hunt_scenario}" sh "$HERE/loop.sh" "$bin" "$OUT" "$PER" "$PAR" "$label-c$c" >>"$OUT/bisect-summary.txt"
     fi
   done <"$LIST"
   c=$((c + 1))
