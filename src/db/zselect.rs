@@ -992,13 +992,23 @@ impl ZSelect {
         if tick {
             self.read_s1(now);
         }
-        let event = match self.phase {
+        // The budget sees every build whatever the phase: one collected late,
+        // after the build it belonged to was cancelled, was wasted all the
+        // same.
+        let tripped = self.record_outcomes(&input.build);
+        let phase = self.phase;
+        let event = match phase {
             Phase::Fits => self.fits(now, tick),
             Phase::Suspect => self.suspect(input, now, tick),
-            Phase::Building => self.building(input, now),
-            Phase::Compact => self.compact(input, now, tick),
+            Phase::Building => self.building(input, now, tripped),
+            Phase::Compact => self.compact(input, now, tick, tripped),
             Phase::Trial => self.trial_step(input, now),
         };
+        if tripped && !matches!(phase, Phase::Building | Phase::Compact) {
+            // Not building, so there is nothing to cancel: building is held
+            // off for a dwell, which is all the budget asks.
+            self.suspend(now);
+        }
         let retire = self.retire(now);
         self.decide(now, event, retire)
     }
@@ -1270,12 +1280,17 @@ impl ZSelect {
         if !self.switch_allowed(now) {
             return false;
         }
-        // (a) the price is paid, on evidence only.
-        if !ev.any() || self.excess < s.c_build {
+        // (a) the price is paid. (Only evidence adds to the rent, and the
+        // measured saving below is a statement about this interval's: a step
+        // without evidence buys nothing however much rent stands.)
+        if self.excess < s.c_build {
             return false;
         }
         // (c) the model is not contradicting: it does not say FITS, or the
-        // group's pressure overrules it.
+        // group's pressure overrules it. Given (b) this is implied, since the
+        // predicted saving is at most `phi_raw` and `theta_enter` is over
+        // `theta_sus`; it stays as its own row so that a change to (b) cannot
+        // quietly drop it.
         let pressure = self.pressure();
         if !(pressure || m.phi_raw >= self.theta_sus(Class::Read)) {
             return false;
@@ -1294,11 +1309,16 @@ impl ZSelect {
                 .any(|&c| ev.valid[c.ix()] && ev.saving[c.ix()] >= self.theta_enter(c))
     }
 
-    fn building(&mut self, input: &Input, now: Duration) -> Option<Event> {
+    fn building(&mut self, input: &Input, now: Duration, tripped: bool) -> Option<Event> {
         let ev = self.evidence(&input.census, now);
-        let tripped = self.record_outcomes(&input.build);
         if input.build.coverage >= COVERED_ENOUGH {
-            return Some(self.install(now));
+            let installed = self.install(now);
+            if tripped {
+                // The form is attached; what the budget holds off is the
+                // building of whatever a merge makes next.
+                self.suspend(now);
+            }
+            return Some(installed);
         }
         if tripped {
             return Some(self.cancel(now, false));
@@ -1370,9 +1390,15 @@ impl ZSelect {
         superseded > 0 && self.outcomes.count_ones() > BUDGET_SUPERSEDED
     }
 
-    fn compact(&mut self, input: &Input, now: Duration, tick: bool) -> Option<Event> {
+    fn compact(
+        &mut self,
+        input: &Input,
+        now: Duration,
+        tick: bool,
+        tripped: bool,
+    ) -> Option<Event> {
         let mut event = None;
-        if self.record_outcomes(&input.build) {
+        if tripped {
             self.suspend(now);
             event = Some(Event::BuildsSuspended);
         }
@@ -2348,6 +2374,76 @@ mod tests {
     }
 
     #[test]
+    fn the_constants_are_the_quantities_they_stand_for() {
+        // The table of thresholds and the numbers of the transitions, as
+        // registered: a change to one of them is a change to a rule, and
+        // names the quantity it stands for in the line above it.
+        assert_eq!(
+            (ENTER_FACTOR, SUSPECT_FACTOR, RELAX_FACTOR, VANISH_FACTOR),
+            (1.5, 0.5, 0.5, 0.5)
+        );
+        assert_eq!(DISPLACEMENT_FACTOR, 0.5);
+        assert_eq!(
+            (REFAULT_SHARE, REFAULT_WINDOW),
+            (0.5, Duration::from_secs(5))
+        );
+        assert_eq!((MIN_EVIDENCE_OPS, PRESSURE_REFAULTS_PER_S), (64, 256.0));
+        assert_eq!(
+            (S1_PERIOD, CENSUS_INTERVAL),
+            (Duration::from_secs(1), Duration::from_millis(100))
+        );
+        assert_eq!(
+            (
+                FITS_TO_SUSPECT_TICKS,
+                SUSPECT_TO_FITS_TICKS,
+                VANISH_INTERVALS
+            ),
+            (2, 5, 3)
+        );
+        assert_eq!(
+            (COVERED_ENOUGH, E1_SMOOTHING),
+            (0.9, Duration::from_secs(30))
+        );
+        assert_eq!(
+            (DWELL_FLOOR, DWELL_BUILD_FACTOR),
+            (Duration::from_secs(60), 10)
+        );
+        assert_eq!(
+            (RETAIN_FLOOR, RETAIN_BUILD_FACTOR),
+            (Duration::from_secs(600), 20)
+        );
+        assert_eq!(
+            (TRIAL_BACKOFF_MIN, TRIAL_BACKOFF_MAX),
+            (Duration::from_secs(10 * 60), Duration::from_secs(4 * 3600))
+        );
+        assert_eq!(
+            (E2_MEASURE, E2_MEASURES, E2_BOUND_SHARE),
+            (Duration::from_secs(10), 3, 0.5)
+        );
+        assert_eq!(
+            (TRIAL_FAULT_FACTOR, TRIAL_LOW_INTERVALS, TRIAL_WALL_FACTOR),
+            (1.2, 5, 3.0)
+        );
+        assert_eq!(
+            (TRIAL_WALL_CAP, TRIAL_DECIDE_INTERVALS),
+            (Duration::from_secs(30), 3)
+        );
+        assert_eq!((BUDGET_BUILDS, BUDGET_SUPERSEDED, PAGE), (8, 4, 4096));
+        // The budget remembers its builds in a byte.
+        assert_eq!(BUDGET_BUILDS, u8::BITS);
+        // The priors: the fault cost the banked rung implies, the in-core
+        // read, and the compact form's decode and walk.
+        assert_eq!(
+            (PRIOR_T_F, PRIOR_T_HIT, PRIOR_T_Z),
+            (41.5e-6, 0.73e-6, 4.4e-6)
+        );
+        assert_eq!((PRIOR_T_HIT_SCAN, PRIOR_T_Z_SCAN), (3.3e-6, 11.3e-6));
+        // The rings are sized for the cadence they are read at.
+        assert!(SHARE_CAP as u128 >= REFAULT_WINDOW.as_millis() / CENSUS_INTERVAL.as_millis());
+        assert!(SMOOTH_CAP as u128 >= E1_SMOOTHING.as_millis() / S1_PERIOD.as_millis());
+    }
+
+    #[test]
     fn the_dwell_and_the_retention_follow_the_last_build() {
         let mut s = ZSelect::new();
         assert_eq!((s.dwell(), s.retain()), (DWELL_FLOOR, RETAIN_FLOOR));
@@ -2540,9 +2636,11 @@ mod tests {
         let cell = Cell::ten_million();
         let mut sim = Sim::new(cell.clone(), cell.uniform());
         sim.run(120.0);
-        // SUSPECT within two S1 ticks of the first read, the sampler asked once.
+        // SUSPECT within two S1 ticks of the first read, the sampler asked
+        // for once and not again once its reading is in.
         assert_eq!(sim.first(Event::Suspect), 2 * S1_PERIOD);
         assert_eq!(sim.sel.counts().samples_wanted, 1);
+        assert_eq!(sim.log.iter().filter(|r| r.d.sample).count(), 1);
         // The census has evidence once the model carries the compact form's
         // rate, a tick after the sampler's reading; the price is paid at the
         // rate the form is predicted to save net of its CPU.
@@ -2559,6 +2657,7 @@ mod tests {
         );
         let dwell = sim.rec_at(install).dwell;
         near(dwell, 10.0 * (install - start).as_secs_f64(), 0.01);
+        assert_eq!(sim.rec_at(install).excess, 0.0, "the rent is spent");
         assert_eq!((sim.last.phase, sim.last.gate), (Phase::Compact, GATE_Z));
         // And it stays: the form pays, so nothing leaves it.
         let c = sim.sel.counts();
@@ -3090,12 +3189,20 @@ mod tests {
         let dwell = sim.sel.dwell();
         sim.run_until(Phase::Trial, 2.0 * dwell.as_secs_f64());
         assert_eq!(sim.last.phase, Phase::Trial);
-        // Nothing reads: no interval is evidence, so no verdict.
+        // Nothing reads: no interval is evidence, so no verdict. The fill is
+        // judged over by the wall it was given, which is three times what its
+        // expected pages take to fault in; the dwell is counted from there.
         sim.load = Load::Idle;
         let trial = sim.first(Event::TrialStart);
         sim.run(dwell.as_secs_f64() + 60.0);
         let back = sim.first(Event::TrialBack);
-        assert!(back - trial >= dwell);
+        let Load::Hot { z_pages, .. } = cell.hot(100) else {
+            unreachable!()
+        };
+        let pages = cell.bound(z_pages) / PAGE;
+        let wall = TRIAL_WALL_FACTOR * pages as f64 * cell.t_f;
+        assert!(wall < TRIAL_WALL_CAP.as_secs_f64());
+        near(back - trial, wall + dwell.as_secs_f64(), 0.5);
         assert_eq!((sim.last.phase, sim.last.gate), (Phase::Compact, GATE_Z));
         assert_eq!(
             sim.sel.backoff(),
@@ -3352,6 +3459,13 @@ mod tests {
         let c = sim.sel.counts();
         assert_eq!((c.builds, c.installs, c.switches), (1, 1, 1));
         assert_eq!(sim.last.phase, Phase::Compact);
+        // The rent is the saving between the two forms, not the raw form's
+        // faults: the compact form takes nearly a fault a read here.
+        near(
+            sim.first(Event::BuildStart),
+            3.0 + cell.price / rent_rate(&cell),
+            0.5,
+        );
         // The one-population model, handed the same store and the same
         // census, never builds.
         let mut one = Sim::new(cell.clone(), cell.uniform());
@@ -3401,6 +3515,23 @@ mod tests {
         sim.run(250.0);
         let again = sim.times(Event::BuildStart)[1];
         near(again - cancel, r.dwell.as_secs_f64(), 0.2);
+    }
+
+    #[test]
+    fn a_model_that_says_it_fits_ends_the_episode_and_its_back_off() {
+        let cell = Cell::ten_million();
+        let mut sim = Sim::new(cell.clone(), cell.uniform());
+        sim.run_until(Phase::Building, 60.0);
+        sim.run(5.0);
+        sim.load = cell.hot(100);
+        sim.run_until(Phase::Suspect, 5.0);
+        assert_eq!(sim.sel.backoff(), 2 * TRIAL_BACKOFF_MIN);
+        // The store fits: the episode is over, and the next is a fresh one,
+        // with no memory of a wrong guess about a skewed workload.
+        sim.phi_raw_override = Some(0.0);
+        sim.run_until(Phase::Fits, 120.0);
+        assert_eq!(sim.last.phase, Phase::Fits);
+        assert_eq!(sim.sel.backoff(), TRIAL_BACKOFF_MIN);
     }
 
     #[test]
@@ -3462,15 +3593,54 @@ mod tests {
             refaults: true,
             bound: 1_400_000_000,
         };
-        // Fifty reads an interval, every one a fault: nothing to go on.
-        let mut sim = Sim::new(cell.clone(), slow(500.0));
+        // Sixty-three reads an interval, every one a fault: nothing to go on.
+        let mut sim = Sim::new(cell.clone(), slow(630.0));
         sim.run(1800.0);
         assert!(sim.log.iter().all(|r| r.excess == 0.0));
         assert_eq!(sim.sel.counts().builds, 0);
-        // Seventy is.
-        let mut sim = Sim::new(cell.clone(), slow(700.0));
+        // Sixty-four is.
+        let mut sim = Sim::new(cell.clone(), slow(640.0));
         sim.run(1800.0);
         assert_eq!(sim.sel.counts().builds, 1);
+    }
+
+    #[test]
+    fn e3_acts_only_on_a_form_seen_not_to_pay_throughout() {
+        // A second in which nothing reads, part way through the dwell, breaks
+        // the stretch: the exit is for a form that was watched the whole time.
+        let cell = Cell::ten_million();
+        let bound = cell.bound(cell.z as f64 / PAGE as f64);
+        let load = cell.fixed(0.45, 0.40, bound);
+        let mut sim = Sim::new(cell.clone(), load);
+        sim.run_until(Phase::Compact, 120.0);
+        let dwell = sim.sel.dwell();
+        sim.run(100.0);
+        sim.load = Load::Idle;
+        sim.run(2.0);
+        sim.load = load;
+        let resumed = sim.now;
+        sim.run(2.0 * dwell.as_secs_f64());
+        let exit = sim.first(Event::Exit(Exit::E3));
+        assert!(exit - resumed >= dwell, "{:?}", exit - resumed);
+        assert!(exit - resumed <= dwell + 3 * S1_PERIOD);
+    }
+
+    #[test]
+    fn an_idle_store_is_not_a_yes_for_e2() {
+        // The compact form faults nothing because nothing reads it. That
+        // says nothing about whether the raw form would fit what is read.
+        let cell = Cell::ten_million();
+        let mut sim = compact(&cell);
+        sim.run(sim.sel.dwell().as_secs_f64() + 100.0);
+        sim.load = cell.hot(100);
+        while sim.sel.watch.e2_run < E2_MEASURES - 1 {
+            sim.step();
+            assert!(sim.now < Duration::from_secs(10_000));
+        }
+        sim.load = Load::Idle;
+        sim.run(3600.0);
+        assert_eq!(sim.sel.counts().trials, 0);
+        assert_eq!(sim.sel.watch.e2_run, 0);
     }
 
     #[test]
@@ -3595,6 +3765,56 @@ mod tests {
         sim.collected.superseded = 1;
         sim.step();
         assert_eq!(sim.sel.counts().build_suspended, 2);
+        // And a run of builds that installed ages the supersessions out of
+        // the window: one superseded after four installed is two of eight.
+        sim.collected.installed = 4;
+        sim.step();
+        sim.collected.superseded = 1;
+        sim.step();
+        assert_eq!(sim.sel.counts().build_suspended, 2);
+    }
+
+    #[test]
+    fn a_build_collected_late_still_counts_against_the_budget() {
+        // A merge retired the targets of five builds in flight, and their
+        // collection came after the build they belonged to was cancelled:
+        // the selector is SUSPECT by then, and they were wasted all the same.
+        let cell = Cell::ten_million();
+        let mut sim = Sim::new(cell.clone(), cell.uniform());
+        sim.run_until(Phase::Building, 60.0);
+        sim.run(12.0);
+        sim.load = cell.hot(100);
+        sim.run_until(Phase::Suspect, 5.0);
+        assert_eq!(sim.last.phase, Phase::Suspect);
+        let cancelled = sim.now;
+        sim.load = cell.uniform();
+        sim.collected.superseded = 5;
+        sim.step();
+        assert_eq!(sim.last.event, None, "nothing to cancel");
+        assert_eq!(sim.last.phase, Phase::Suspect);
+        assert!(sim.sel.suspended(sim.now));
+        assert_eq!(sim.sel.counts().build_suspended, 1);
+        // The dwell the cancel left is the one the suspension lasts.
+        sim.run(300.0);
+        let again = sim.times(Event::BuildStart)[1];
+        assert!(again - cancelled >= sim.rec_at(cancelled).dwell);
+    }
+
+    #[test]
+    fn an_install_that_comes_with_a_trip_still_holds_off_the_next_building() {
+        let cell = Cell::ten_million();
+        let mut sim = Sim::new(cell.clone(), cell.uniform());
+        sim.run_until(Phase::Building, 60.0);
+        sim.built = 0.95;
+        sim.collected.superseded = 5;
+        sim.step();
+        assert_eq!(sim.last.event, Some(Event::Install));
+        assert_eq!((sim.last.phase, sim.last.gate), (Phase::Compact, GATE_Z));
+        assert!(
+            !sim.last.build,
+            "the form is served and building is held off"
+        );
+        assert_eq!(sim.sel.counts().build_suspended, 1);
     }
 
     #[test]
@@ -3697,6 +3917,9 @@ mod tests {
         assert_eq!(sim.built, 1.0);
         assert_eq!(sim.sel.counts().retired, 0);
         assert!(!sim.sel.retained());
+        // FITS forgot the sampler's reading, so the second episode asked for
+        // another: the partitions may have changed.
+        assert_eq!(sim.sel.counts().samples_wanted, 2);
         let installs = sim.times(Event::Install);
         assert_eq!(installs.len(), 2);
         assert_eq!(installs[1] - starts[1], DT);
