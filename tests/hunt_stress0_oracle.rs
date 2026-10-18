@@ -314,3 +314,131 @@ fn hunt_oracle() {
     }
     eprintln!("HUNT-OK oracle iters {iters}");
 }
+
+/// The second defect's schedule, forced and single-threaded (`Upkeep::Inline`).
+///
+/// A partition of thirty-one keys, one block; a table built over it by the
+/// writer's scans. A frozen table (the seal held) carries a key inserted
+/// before two keys the live table will update and a key deleted after them.
+/// A key updated in the live table is filed in its block's list with its cut
+/// in the partition as it stands: against the old blob. The hold is lifted,
+/// the piece lands and is merged into the partition, whose count and ends are
+/// what they were -- one key in, one out -- so `Db::same_blocks`, which
+/// compares the count and the keys at the blocks' first ranks and the last,
+/// calls the new blob the old one's blocks and the tables are carried with
+/// their filed keys' cuts: a key filed before the rewrite is one rank behind
+/// where the rewritten partition has it.
+///
+/// `HUNT_CUT_VARIANT=assert` (the default) updates two neighbouring keys, one
+/// filed before the rewrite and one after, so the walk passes the second's
+/// stale cut and `BuildCtx::cut_known` asserts. `silent` updates one key
+/// whose stale cut is still ahead of the walk: no assertion, and the scan
+/// answers a wrong partition record under the key.
+#[test]
+fn hunt_cut_forced() {
+    let variant = env_str("HUNT_CUT_VARIANT").unwrap_or_else(|| "assert".to_string());
+    let dir = scratch("cutforced");
+    let opts = Options {
+        scan_block_cache: true,
+        upkeep: Upkeep::Inline,
+        partition_bytes: Some(1 << 20),
+        seal_bytes: 1 << 30,
+        l0_trigger: 1,
+        ..Options::default()
+    };
+    let key = |n: usize| format!("k{n:04}").into_bytes();
+    let mut db = Db::create(&dir, opts).unwrap();
+    let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    for n in (100..=160).step_by(2) {
+        let v = format!("p-{n}").into_bytes();
+        db.put(&key(n), &v);
+        model.insert(key(n), v);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let walk = |db: &Db| -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut got = Vec::new();
+        db.scan(b"", usize::MAX, |k, v| got.push((k.to_vec(), v.to_vec())))
+            .unwrap();
+        got
+    };
+    // Reads around, so the forms are kept and the block has a table.
+    for _ in 0..3 {
+        assert_eq!(walk(&db).len(), model.len());
+    }
+    let (inserted, deleted) = (key(105), key(140));
+    let (first, second) = match variant.as_str() {
+        "assert" => (Some(key(118)), key(120)),
+        "silent" => (None, key(126)),
+        other => panic!("HUNT_CUT_VARIANT {other}"),
+    };
+    db.put(&inserted, b"x-105");
+    model.insert(inserted.clone(), b"x-105".to_vec());
+    db.delete(&deleted);
+    model.remove(&deleted);
+    db.commit().unwrap();
+    db.hold_seal_landing(true);
+    db.seal().unwrap();
+    // A scan after the freeze: the writer's tables are carried across it and
+    // its snapshot built again, over a live table that is empty, so the key
+    // written next is created after the snapshot and is filed in its block's
+    // list, not held by the snapshot.
+    let _ = walk(&db);
+    // The key filed before the rewrite, against the old blob.
+    db.put(&second, b"v-second");
+    model.insert(second.clone(), b"v-second".to_vec());
+    db.commit().unwrap();
+    let before = walk(&db);
+    let want_before: Vec<_> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    assert_eq!(before, want_before, "the scan before the landing");
+    let gen_before = db.state_gen();
+    db.hold_seal_landing(false);
+    db.settle().unwrap();
+    eprintln!(
+        "HUNT-CUT-FORCED levels {:?} state gen {} -> {} (the piece landed and was merged when the pieces are 0)",
+        db.levels(),
+        gen_before,
+        db.state_gen()
+    );
+    if let Some(first) = &first {
+        db.put(first, b"v-first");
+        model.insert(first.clone(), b"v-first".to_vec());
+        db.commit().unwrap();
+    }
+    let want: Vec<_> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    if env_flag("HUNT_CUT_DEBUG", false) {
+        eprintln!("HUNT-CUT-DEBUG before the last scan: {}", db.debug_key(&second));
+    }
+    let scanned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| walk(&db)));
+    if env_flag("HUNT_CUT_DEBUG", false) {
+        eprintln!("HUNT-CUT-DEBUG after the last scan: {}", db.debug_key(&second));
+    }
+    let verdict = match &scanned {
+        Err(_) => "the engine panicked".to_string(),
+        Ok(got) if *got == want => "right".to_string(),
+        Ok(got) => {
+            let at = got
+                .iter()
+                .zip(&want)
+                .position(|(a, b)| a != b)
+                .unwrap_or(got.len().min(want.len()));
+            format!(
+                "wrong: {} entries, wanted {}; first difference at entry {at}: got {:?}, wanted {:?}",
+                got.len(),
+                want.len(),
+                got.get(at).map(|(k, v)| (show(k), show(v))),
+                want.get(at).map(|(k, v)| (show(k), show(v)))
+            )
+        }
+    };
+    eprintln!("HUNT-CUT-FORCED variant {variant}: the scan after the rewrite is {verdict}");
+    let panicked = scanned.is_err();
+    drop(scanned);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(db)));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        verdict == "right",
+        "the scan over a partition rewritten under the same blocks: {verdict} (panicked {panicked})"
+    );
+}

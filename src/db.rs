@@ -26624,10 +26624,114 @@ impl<'s> BuildCtx<'s> {
         if ov.over.is_empty() {
             return Ok(Cached::Clean);
         }
+        self.diag_provenance(src.seg, table, b, unsealed, &ov);
         if ov.over.len() < self.dense_from {
             return Ok(Cached::Sparse(self.deltas_for(src, lo..hi, &ov)?));
         }
         Ok(Cached::Block(self.copy_block(src, lo..hi, &ov)?))
+    }
+    /// HUNT: when the overlay's cuts are not in order, where each came from
+    /// and what it should be against the partition walked.
+    fn diag_provenance(
+        &self,
+        seg: &Seg,
+        table: &BlockTable,
+        b: usize,
+        unsealed: &Snapshot,
+        ov: &Overlay,
+    ) {
+        use std::fmt::Write as _;
+        let mut prev: Option<usize> = None;
+        let mut bad = false;
+        for o in ov.over.iter() {
+            if o.cut == u32::MAX {
+                continue;
+            }
+            let c = (o.cut >> 1) as usize;
+            if prev.is_some_and(|p| c < p) {
+                bad = true;
+                break;
+            }
+            prev = Some(c + (o.cut & 1) as usize);
+        }
+        if !bad {
+            return;
+        }
+        let mut s = String::new();
+        let _ = writeln!(
+            s,
+            "HUNT-PROVENANCE block {b} of partition {}: table.blob {} seg.blob {} table.layout {} \
+             table.snap_gen {} filed {} snapshot len {} live_len {} log_at {} bases {}",
+            seg.name,
+            table.blob,
+            seg.blob.id(),
+            table.layout,
+            table.snap_gen,
+            table.filed,
+            unsealed.len(),
+            unsealed.live_len,
+            unsealed.log_at,
+            unsealed.bases.len(),
+        );
+        let verdict = |cut: u32, key: &[u8]| {
+            let (_, truth) = Self::owner_of(seg, key);
+            if cut == u32::MAX {
+                format!("cut none, true rank {}", truth >> 1)
+            } else if cut == truth {
+                format!("cut rank {} ok", cut >> 1)
+            } else {
+                format!(
+                    "cut rank {} same {} but true rank {} same {}  <-- STALE",
+                    cut >> 1,
+                    cut & 1,
+                    truth >> 1,
+                    truth & 1
+                )
+            }
+        };
+        for (slot, cut) in &table.added[b] {
+            let key = self.mem.key_of(self.mem.entry(*slot as usize));
+            let _ = writeln!(
+                s,
+                "  added slot {slot} {}: {}",
+                String::from_utf8_lossy(key),
+                verdict(*cut, key)
+            );
+        }
+        if let Some(sb) = table.snap_at.get() {
+            for i in sb.at[b] as usize..sb.at[b + 1] as usize {
+                if let Some((k, _)) = unsealed.get(i) {
+                    let cut = sb.cuts.get(i).map_or(u32::MAX, |c| c.load(AtomicOrdering::Relaxed));
+                    let _ = writeln!(
+                        s,
+                        "  snapshot main run [{i}] {}: {} (block ready {})",
+                        String::from_utf8_lossy(k),
+                        verdict(cut, k),
+                        sb.ready[b].load(AtomicOrdering::Relaxed)
+                    );
+                }
+            }
+        }
+        for (bi, base) in unsealed.bases.iter().enumerate() {
+            if let Some(fb) = table.fsnap_at.get(bi).and_then(|c| c.get()) {
+                for i in fb.at[b] as usize..fb.at[b + 1] as usize {
+                    if let Some((k, _)) = base.get(i) {
+                        let cut = fb
+                            .cuts
+                            .get(i)
+                            .map_or(u32::MAX, |c| c.load(AtomicOrdering::Relaxed));
+                        let _ = writeln!(
+                            s,
+                            "  base {bi} [{i}] {}: {} (block ready {})",
+                            String::from_utf8_lossy(k),
+                            verdict(cut, k),
+                            fb.ready[b].load(AtomicOrdering::Relaxed)
+                        );
+                    }
+                }
+            }
+        }
+        eprint!("{s}");
     }
     /// PROTOTYPE: the overlay's keys resolved against the partition once:
     /// where each cuts the walk, and its values from every source that
