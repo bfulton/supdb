@@ -2875,11 +2875,12 @@ fn a_cache_kept_to_fit_gives_the_allocator_back_the_pages_its_sheds_freed() {
 /// scanned from elsewhere until the blocks it holds have been shed and
 /// built again, several times over. A block shed from the partition the
 /// scan is in is retracted -- a marker published in its place -- and one
-/// shed from another partition was not: its form stayed in the state, a
-/// reader's handle free to take it as the block, current to nothing the
-/// writer files from there (the writer files into no block it holds no
-/// form for) and held by the state against a budget that no longer
-/// counted it.
+/// shed from another partition was not, for as long as that branch of the
+/// shed took the slot and the bytes and nothing else: its form stayed in
+/// the state, a reader's handle free to take it as the block, current to
+/// nothing the writer files from there (the writer files into no block it
+/// holds no form for) and held by the state against a budget that no
+/// longer counted it.
 fn shed_over_published_forms(name: &str, fit: bool) -> (Db, Reader, ScanModel) {
     let d = dir(name);
     let opts = Options {
@@ -2931,7 +2932,15 @@ fn shed_over_published_forms(name: &str, fit: bool) -> (Db, Reader, ScanModel) {
 
 /// A block shed takes the form it published with it, from whichever
 /// partition's table it is shed: the state holds a form only for a block
-/// the writer holds it for, or a marker that says to build.
+/// the writer holds it for, or a marker that says to build. A budget
+/// alone does it, kept to fit or not: a form left standing is one the
+/// writer files nothing into from the shed on, so the first write into
+/// the block trips the engine's own assertion in a checked build, and in
+/// one without it a handle's scans take the form as the block and answer
+/// the values from before the write. The census counts the forms only
+/// the state holds; the rounds of writes after the sheds, each read
+/// through the handle and the writer against the model, are what a form
+/// left standing fails.
 #[test]
 fn a_block_shed_from_any_partition_takes_its_published_form_with_it() {
     let only = |c: &BTreeMap<String, u64>| {
@@ -2940,22 +2949,177 @@ fn a_block_shed_from_any_partition_takes_its_published_form_with_it() {
             .map(|k| c.get(&format!("pub_{k}_n")).copied().unwrap_or(0))
             .sum::<u64>()
     };
-    let (db, r, m) = shed_over_published_forms("shed-published-fit", true);
-    let c = census_of(&db);
-    assert_eq!(
-        only(&c),
-        0,
-        "forms published for blocks the writer shed, kept to fit: {c:?}"
-    );
-    m.check(&r, "a handle over the forms of a cache shed to fit");
-    m.check(&db, "the writer");
+    let key = |k: u32| format!("key-{k:05}");
+    for fit in [true, false] {
+        let name = format!("shed-published-fit-{fit}");
+        let (mut db, r, mut m) = shed_over_published_forms(&name, fit);
+        let c = census_of(&db);
+        assert_eq!(
+            only(&c),
+            0,
+            "{name}: forms published for blocks the writer shed: {c:?}"
+        );
+        m.check(&r, &format!("{name}: a handle over a cache shed"));
+        m.check(&db, &format!("{name}: the writer"));
+        for round in 0..3u32 {
+            for k in (0..3000u32).filter(|k| k % 3 == round) {
+                m.delete(&mut db, &key(k));
+                m.append(&mut db, &key(k), &format!("v3-{round}-0123456789"));
+            }
+            db.commit().unwrap();
+            m.check(&r, &format!("{name}: the handle after round {round}"));
+            m.check(&db, &format!("{name}: the writer after round {round}"));
+        }
+    }
+}
 
-    let (db, _r, _m) = shed_over_published_forms("shed-published-plain", false);
-    let c = census_of(&db);
-    assert!(
-        only(&c) > 0,
-        "not kept to fit, a shed from another partition left its published form: {c:?}"
-    );
+/// A seeded differential run of a budgeted cache with a handle claimed,
+/// against the model: rewrites and inserts between existing keys, scans
+/// through the writer and through the handle from random keys at random
+/// limits, a flush or a seal now and then. Under a budget a few blocks
+/// large the writer sheds all the time, from whichever partition's table,
+/// and what it published for a block it no longer holds is what the
+/// handle's scans answer from; kept to fit the cache is also held to its
+/// budget and its counter to a walk of what it holds, at every third
+/// step. The runs are the reproducers of the stale form and are cheap
+/// enough to be many.
+fn differential_under_a_budget(
+    name: &str,
+    fit: bool,
+    seed: u64,
+    upkeep: supdb::Upkeep,
+    budget: usize,
+) {
+    let d = dir(name);
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_ahead: false,
+        scan_cache_bytes: budget,
+        forms_settle_backlog_pct: 0,
+        commit_forms: true,
+        upkeep,
+        forms_to_fit: fit,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..3000u32 {
+        m.append(&mut db, &key(k), "v0-0123456789");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    let r = db.reader().unwrap();
+    let mut x = seed | 1;
+    let mut rng = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    for step in 0..120u32 {
+        if fit && step % 3 == 0 {
+            held(&db, budget);
+        }
+        match rng() % 10 {
+            0..=3 => {
+                let n = 1 + rng() % 80;
+                for i in 0..n {
+                    let k = (rng() % 3000) as u32;
+                    if rng() % 6 == 0 {
+                        // A key between two existing ones, new to the store.
+                        m.append(
+                            &mut db,
+                            &format!("{}x{step}-{i}", key(k)),
+                            &format!("n{step}-{i}"),
+                        );
+                    } else {
+                        m.delete(&mut db, &key(k));
+                        m.append(&mut db, &key(k), &format!("s{step}-{i}"));
+                    }
+                }
+                db.commit().unwrap();
+                if upkeep != supdb::Upkeep::Inline && rng() % 2 == 0 {
+                    db.settle().unwrap();
+                }
+            }
+            4..=7 => {
+                let from = key((rng() % 3300) as u32);
+                let limit = 1 + (rng() % 200) as usize;
+                m.check_one(
+                    &db,
+                    from.as_bytes(),
+                    limit,
+                    &format!("{name} step {step}: the writer"),
+                );
+                m.check_one(
+                    &r,
+                    from.as_bytes(),
+                    limit,
+                    &format!("{name} step {step}: the handle"),
+                );
+            }
+            8 => {
+                for _ in 0..3 {
+                    let from = key((rng() % 3300) as u32);
+                    m.check_one(
+                        &r,
+                        from.as_bytes(),
+                        400,
+                        &format!("{name} step {step}: the handle, wide"),
+                    );
+                }
+            }
+            _ => match rng() % 5 {
+                0 => {
+                    db.commit().unwrap();
+                    db.settle().unwrap();
+                }
+                1 => {
+                    db.commit().unwrap();
+                    db.seal().unwrap();
+                    db.settle().unwrap();
+                }
+                _ => {}
+            },
+        }
+    }
+    db.commit().unwrap();
+    if fit {
+        held(&db, budget);
+    }
+    m.check(&r, &format!("{name}: the handle at the end"));
+    m.check(&db, &format!("{name}: the writer at the end"));
+}
+
+/// The differential runs above, kept to fit or not, on the upkeep inline
+/// and on a thread at the levels that lend. Two seeds a shape: the
+/// stale form this found failed every run without the retraction.
+#[test]
+fn a_budgeted_cache_answers_the_model_with_a_handle_claimed() {
+    for seed in 1..=2u64 {
+        for (fit, upkeep) in [
+            (false, supdb::Upkeep::Inline),
+            (true, supdb::Upkeep::Inline),
+            (false, supdb::Upkeep::Background(1)),
+            (true, supdb::Upkeep::Background(1)),
+            (true, supdb::Upkeep::Background(3)),
+        ] {
+            let name = format!("differential-{fit}-{upkeep:?}-{seed}");
+            differential_under_a_budget(
+                &name,
+                fit,
+                seed.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                upkeep,
+                6 << 10,
+            );
+        }
+    }
 }
 
 /// The seal grows with the partitions: past the floor, a memtable seals
