@@ -4260,6 +4260,11 @@ impl Engine for Supdb {
             ("canon_hit", db.canonical_tries().1 as f64),
             ("forms_held_at_end", forms as f64),
             ("form_bytes_at_end", form_bytes as f64),
+            // What the writer's own block tables count themselves holding
+            // (contents, not capacity), beside the published forms' bytes
+            // above: the pair a memory decomposition holds against the
+            // process's resident bytes (`lagmem`).
+            ("cache_bytes_at_end", db.block_cache_bytes() as f64),
             ("lazy_scans_done", db.lazy_scans().0 as f64),
             ("lazy_scans_resumed", db.lazy_scans().1 as f64),
             ("seals", db.seal_waits().joins as f64),

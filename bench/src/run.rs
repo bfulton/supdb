@@ -488,6 +488,32 @@ fn counters_line(
         get(c1, "unsealed_keys"),
         d("rd_scans")
     );
+    // The process's memory beside the structures that count their own: the
+    // resident bytes, what the allocator has handed out and what it holds
+    // free, and the writer's tables and the published forms by their
+    // counts. The gap between the resident bytes and the sum of the
+    // structures is slack, retention and everything uncounted, which the
+    // lag sweep's peak is made of under a memory bound.
+    if tag == "lagcounters" {
+        // SAFETY: mallinfo2 reads the allocator's own totals.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        let mi = unsafe { libc::mallinfo2() };
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        let (inuse, free, mapped) = (mi.uordblks as u64, mi.fordblks as u64, mi.hblkhd as u64);
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        let (inuse, free, mapped) = (0u64, 0u64, 0u64);
+        let mb = |b: u64| b / (1 << 20);
+        eprintln!(
+            "lagmem {arm} {point} anon_mb {} rss_mb {} inuse_mb {} free_mb {} mmapped_mb {} cache_mb {} forms_mb {}",
+            anon_resident_bytes().map_or(0, mb),
+            resident_bytes().map_or(0, mb),
+            mb(inuse),
+            mb(free),
+            mb(mapped),
+            mb(get(c1, "cache_bytes_at_end") as u64),
+            mb(get(c1, "form_bytes_at_end") as u64),
+        );
+    }
     // The forms' events over the window, by name, for a decomposition of
     // who built what beside whom.
     if std::env::var_os("SUPDB_MIX_EVENTS").is_some() {
@@ -2804,6 +2830,16 @@ fn release_freed_memory() {
     unsafe {
         libc::malloc_trim(0);
     }
+}
+
+/// This process's anonymous resident bytes (Linux `RssAnon`): the memory
+/// a bound charges that the page cache cannot give back. `resident_bytes`
+/// counts the mapped segments' pages too.
+fn anon_resident_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("RssAnon:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
 }
 
 /// This process's resident bytes, where the platform says (Linux).
