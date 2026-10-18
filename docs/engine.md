@@ -5912,7 +5912,18 @@ memory was tens of megabytes. The same probe at three million read the
 new default's shuffled load ending at 217-252 MB resident, the first lag
 pass after it at 28.6 M entries/s, and the lag sweep's own forms still
 taking the process to 960 MB, which is the next question: the forms over
-a store a piece spans are larger than the store.
+a store a piece spans are larger than the store. The same probe read the
+arm with its cache budgeted at 256 MB (`supdb-cache256`) peaking at
+840 MB in the lag sweep and the plain-readahead arm at 953, against 417
+for the arm with no cache, and under the gibibyte every supdb arm but
+that one was killed at three million keys, `anon-rss` at the limit
+with the upkeep thread or the writer allocating. The budget counts the
+forms' contents -- keys, values and entries -- and not the memory they
+cost: the vectors' slack, the arenas' retention of what a shed form
+freed, and the copies a publish carries into the state for every
+handle, which are outside any handle's budget. A bounded rung's first
+rows are the arm with no cache against LMDB, and the forms' memory is
+the lead the rows name.
 
 The same probe answered a question the first bounded numbers raised. A
 bounded row divides its read passes' operation counts for time, and
