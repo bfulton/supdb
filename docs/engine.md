@@ -5948,6 +5948,132 @@ pass; the bounded rows' division is read with that in mind, and the
 first scan of a divided pass is to be reported on its own, as
 `SUPDB_SCAN_OPS` reports it for the scan pass.
 
+#### Out of core: what the budget counted and the process paid
+
+The arm whose block cache is budgeted at 256 MB (`supdb-cache256`) held what the arm with no
+budget held. At three million keys, the quick scale's whole counts and one process an arm, the lag
+sweep's full-rewrite point read 808-1,028 MB of anonymous memory at the end of its pass in it
+(median 935, ten reps in five sittings) against 195-304 in the arm with no cache (median 234, eight
+reps), with the budget's count at 255 MB and the allocator's bytes in use at 483-538. `lagmem`
+could say that and nothing about the 230 MB between the count and the use.
+
+A census of the process by owner (`Reader::memory_census`, the `lagcensus` line under
+`SUPDB_LAG_COUNTERS`) counts the writer's forms by kind, each with the bytes the budget counts in it
+beside the bytes its buffers allocate, the forms the state publishes (those a table shares and
+those only the state holds), the retired lists, the scan snapshots, the memtables by who holds them
+and the segments' derived caches, each structure once, by the first owner reached. Its sum came to
+92-106% of the allocator's bytes in use at the 38 points past 200 MB in use (the mapped chunks,
+16-144 MB, `mallinfo2` counts apart), which is what made the rest a question with an answer. It
+found four things, none of them a leak.
+
+The forms cost 1.6-1.8 times what the budget counted. The cache held 41,000-43,000 sparse forms,
+228-240 MB of contents in 372-391 MB of buffers, and 2,000-3,400 copies, 16-28 MB in 31-54; or,
+where the pass had rebuilt them, 30,840 copies, 256 MB in 452. The default's 46,876 copies cost
+440 MB for the 389 they held. A build asked for room for every overlay key, the ones that replace a
+record as much as the ones that add, so a copy built over a store every key of which had been
+rewritten had room for twice its records; a patch grew a sparse form's three vectors to the dense
+count at once and by doubling past it, so a block a burst had patched forty times sat in the
+capacity of sixty-four; and a copy patched with a longer run appended to its values and doubled.
+
+Nothing shed for a patch. The budget was kept where a scan built a block and where the read-ahead
+installed one, and a burst's patches grow the forms of blocks that hold one, so a burst the upkeep
+thread kept pace with built the cache up to the size of the store (525 MB in use where one such
+burst ended, the others filing their forms in the pass that followed) and the first scan after it
+shed the difference into the allocator's free lists.
+
+The shed of a block in another partition's table left the form it had published in the state. The
+shed from the table in hand retracts it with a marker (`unlist`); the branch for any other
+partition took the slot and the bytes and nothing else, so a reader's handle could take a form the
+writer files nothing into any more, and the debug assertion that says a block the writer holds no
+form for has none published as the block was waiting for the first write to land there. The
+suite's runs never showed it -- the published forms only the state holds read zero in every census
+-- and `a_block_shed_from_any_partition_takes_its_published_form_with_it` builds the shape: a
+budget of six kilobytes, a handle claimed, scans from elsewhere until the blocks held have been
+shed and built again.
+
+And what the sheds freed stayed resident. A freed chunk goes back to the arena that allocated it,
+and glibc gives an arena's memory to the system from its top. The forms a burst's patches built on
+the upkeep thread were freed by the scans that shed them on the writer's, and at the pass's end one
+arena was 152 of its 154 MB free in 19,000 chunks of 8 KB, beside a cache a quarter of that size
+(`malloc_info` by arena, the `lagarenas` line). `malloc_trim` returns the whole pages inside free
+chunks, but `mallinfo2`'s free count includes what it has returned, so the resident bytes the
+allocator keeps beyond its use are read as the anonymous bytes less its in-use and mapped bytes
+(`held` below). The arena is not all of it: the arm with no cache keeps 112-226 MB beyond use at
+the same point, the memtable and snapshot blocks the load's seal threads freed in arenas nothing
+allocates from now, and that is every arm's, the forms' or not. Last, 37-44 MB of retired snapshots
+waited for a sweep that only a commit made, in three reps of ten.
+
+`Options::forms_to_fit` (arms `supdb-tofit` and `supdb-ingesttofit`, and `supdb-cache256tofit`
+beside the budget) counts a form by the capacity of its buffers, builds it to the size it came out
+(`shrink_to_fit` at the end of a build) and grows it by a quarter and not by doubling, sheds after a
+patch, retracts a shed's publication from any partition, sweeps the retired snapshots and forms when
+the writer's operation ends, and has the segment work's thread trim the allocator
+(`Options::forms_trim_bytes`, 32 MB) once handles have freed that many bytes of forms and the
+allocator holds that much more free than after its last trim. The sweep at an operation's end did
+nothing the census could show: 37-40 MB of retired snapshots still stood at the pass's end in three
+of the twelve reps with the flag, as in three of the ten without it, held by whatever was pinned
+when they were retired (a pass of the upkeep thread, likely; not checked), and freed by no operation
+that ended after it. The full-rewrite point, median (range) over the reps of the sittings, in
+megabytes:
+
+| arm | `forms_to_fit` | pass's end | burst's end | in use | held beyond use | forms counted / buffers | reps |
+|---|---|---|---|---|---|---|---|
+| `supdb-nocache` | | 234 (195-304) | 298 (240-364) | 22 (22-45) | 166 (112-226) | | 8 |
+| `supdb-cache256` | off | 935 (808-1,028) | 598 (515-889) | 517 (483-538) | 314 (211-403) | 256 / 452 | 10 |
+| `supdb-cache256tofitnotrim` | on, no trim | 802 (751-881) | 518 (496-659) | 328 (318-341) | 346 (305-445) | 256 / 256 | 4 |
+| `supdb-cache256tofit` | on | 578 (381-695) | 430 (312-743) | 326 (271-411) | 144 (88-236) | 256 / 256 | 12 |
+| `supdb` | off | 856 (782-929) | 892 (774-929) | 514 (503-525) | 228 (209-390) | 389 / 440 | 6 |
+| `supdb-tofit` | on | 774 (680-794) | 771 (709-819) | 464 (450-519) | 204 (187-231) | 389 / 389 | 6 |
+
+The burst's end is read from the kernel before any scan (`lagburst`), and the larger of the two
+samples is what a bound meets: 935 for the budgeted arm, 632 with the flag (523-743). Against the
+arm with no cache and the budget -- 234 and 256, 490 at the pass's end -- the flag takes the
+budgeted arm's excess from 445 MB to 88. The pairs agree in sign, six reps of six in the three
+sittings that ran both, by 282-404 MB at the pass's end. The default's saving is 80 MB, the slack
+and little else, since the default has no budget to keep and its cache is the store's. The flag off
+reads as before in every sitting (buffers 1.65-1.77 times the contents in the budgeted arm, 1.13 in
+the default), and the flag on reads 1.00 at the full-rewrite point and 1.10 at the tenth-rewritten
+(1.12 in the default), so the default's shape is unchanged and the flag's is exact.
+
+Where the saving comes from is two things, and the arm without the trim
+(`supdb-cache256tofitnotrim`, `Options::forms_trim_bytes` zero) prices them apart: kept to fit alone
+the budgeted arm's bytes in use fell by 189 MB and its pass's end by 133, since what the sheds freed
+stayed resident (346 MB beyond use against 314), and the trim returned the other 224 (144 beyond
+use), the four pairs agreeing in sign by 180-228 MB. The trim by itself, probed (`SUPDB_LAG_TRIM=1`,
+a `malloc_trim` after each point's census, the `lagtrim` line), returned 250 and 300 MB of the
+flag-off arm's pass's end (1,025 to 726 in 94 ms, 941 to 691 in 32): most of what that arm holds
+beyond its use is whole free pages that a trim returns. The strided trim leaves the tail of a shed
+burst resident: the probe returned 145 and 250 MB more at the end of a pass with the flag on (726 to
+581, 1,021 to 771), which a trim when the frees stop would return, and which the pass's end, read
+the moment the last scan returns, would not show.
+
+What the flag costs, on the segment work's thread and not the writer's: a trim is a
+`malloc_trim(0)` over every arena, 30-200 ms at this size, and one to seven were made over a pass
+(`lagcensus`'s `trims`, `looks` and `look_ms`; the looks that decided not to trim cost a few
+milliseconds); the upkeep thread's CPU over the burst read 3.2-4.0 s with the flag against 3.2-3.6
+without (medians 3.7 and 3.4), the segment work's 0.3-1.2 s against 0.25-0.56, and the blocks the
+pass built did not move. The writer's rates under the flag were not measured: no pairing was run,
+and the arms exist to run one (`supdb-cache256` against `supdb-cache256tofit`, `supdb` against
+`supdb-tofit`, on the quick row and in `bench ab`).
+
+A request to the trim on builds as well as frees, meant to return the load's own retention at the
+burst's start, was tried and dropped: the budgeted arm read 636 and 580 at the pass's end and 290
+and 732 at the burst's end in a sitting, no lower than the same arm without it, and a look cost
+30 ms of the thread (36 looks and 1.1 s in the first rep).
+
+What is left, and where the next lead is. The arm with no cache holds 195-304 MB at this point,
+112-226 of it resident bytes beyond use that the load's threads left in their arenas, so the load's
+own retention is a lead of its own, in every arm. The write path holds 60-260 MB beyond the cache
+while a burst is in flight or a reader's pin holds what a publish replaced -- a retired memtable and
+a retired snapshot, 36-43 MB each when present, two frozen tables and three snapshots in the rep
+that read 1,019 MB -- which no budget counts and no sweep can free under a pin, and it swings the
+same arm's pass by that much from rep to rep with the census saying where, which is why the
+medians above are over every rep there is. The budget is a handle's, and the copies a publish
+carries into the state for every other handle are outside it (the published forms only the state
+holds read zero in these runs, which have one handle). And the budgeted arm was not run under a
+bound -- a group limit of a gibibyte at three million keys -- where the process's anonymous bytes
+and the page cache compete and the arms' rows would say whether 630 MB is enough.
+
 #### Out of core: against LMDB with its readahead off
 
 The first bounded rung at ten million keys under a gibibyte read the

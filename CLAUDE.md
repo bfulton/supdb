@@ -287,6 +287,23 @@ forty microseconds against the three hundred the read-back cost, so a
 cell that moves when a step is removed is read beside the phase the step
 was in before it is read as the step's.
 
+The same counters have a memory half, for what the process holds and
+not what a pass costs: `lagmem` (anonymous bytes, the allocator's bytes
+in use, free and mapped, the writer's counted cache), `lagburst` (the
+anonymous bytes where the burst ends, read from the kernel so it takes
+nothing back from the upkeep) and, for an engine that answers
+`Engine::memory_census`, `lagcensus` -- the writer's forms by kind with
+their contents beside their buffers' capacity, the published and retired
+forms, the snapshots, the memtables by owner and the segments' derived
+caches, each structure once, the sum held against the allocator's bytes
+in use, which is how an owner nobody counted shows -- then `lagarenas`
+and `lagburstarenas` (the allocator's bytes by arena, which say whose
+frees the free bytes are) and `lagmaps` (the anonymous mappings by
+size). `SUPDB_LAG_TRIM=1` adds `lagtrim`, what a trim at that moment
+returns, and changes the points after it, so it is a probe of its own.
+The census reads the writer's tables and takes its upkeep home, so it
+stands after the pass and never between a burst and its scans.
+
 A copy taken off the writer's path is priced at every reader of the
 copy and in the phase that inherits its pages. The streamed table's
 key copies were twelve hundred first touches a load at three hundred
@@ -1952,6 +1969,47 @@ so a divided pass that trails is read against the whole pass before it
 is read as the engine's -- at a tenth of the scans three of the four
 lag points at three million read 0.25-0.4x of LMDB, and whole counts
 read all four at 1.0-1.9x.
+
+**A budget that counted what a structure held, beside a process that paid for what it cost.** The
+block cache's budget (`scan_cache_bytes`) counted a form's keys, values and entries, and the arm
+budgeted at 256 MB held a median of 935 MB of anonymous memory at the lag sweep's full-rewrite point
+at three million keys, as much as the default with no budget and four times the arm with no cache
+(234). The budget was exact about what it counted. `lagmem` could say that the count was 255 MB and
+the allocator's bytes in use 483-538, and nothing about the 230 MB between; a census of the process
+by owner (`Reader::memory_census`, the `lagcensus` line: the writer's forms by kind with their
+contents beside their buffers' capacity, the published and retired forms, the snapshots, the
+memtables, the segments' caches, each structure once) summed to 92-106% of the in-use bytes where
+they passed 200 MB, which is what made the rest a question with an answer, and the answer was four
+things, none of them a leak. The forms' buffers cost 1.6-1.8x what they held: a build asked for room
+for every overlay key, the ones that replace a record as much as the ones that add, and a patch
+doubled a vector that held forty deltas into room for sixty-four. Nothing shed for a patch: the
+budget was kept where a scan built a block, which a burst does not do, so a burst the upkeep thread
+kept pace with built the cache to the size of the store and the first scan after it shed the
+difference into the allocator's free lists. The shed of a block in another partition's table left
+the form it had published in the state, where a handle's read could take it; the suite never showed
+it, and a test with a small budget and a claimed handle builds the shape. And what the sheds freed
+stayed resident: a freed chunk goes back to the arena that allocated it, glibc gives an arena back
+only from its top, and the forms the upkeep thread built over a burst were freed by the writer's
+scans, 150 MB of 8 KB chunks in an arena that nothing allocated from any more, beside a cache a
+quarter of that size. `Options::forms_to_fit` counts by capacity, builds and grows to fit, sheds
+after a patch, retracts a shed's publication from any table, sweeps the retired lists at the end of
+an operation (which freed nothing the census could show) and has the segment work's thread trim the
+allocator after a stride of frees; the arm read a median of 578 over twelve reps, against 490 for
+its budget and the arm with no cache. The two halves were priced apart (the arm without the trim,
+`supdb-cache256tofitnotrim`): fitting took 133 MB off the pass's end and 189 off the bytes in use,
+and the trim the other 224. The rule: a budget is held against the allocator's bytes in use, by
+owner, before it is called a bound on anything, and against the process's anonymous bytes before it
+is called a bound on the process; a bound is kept at every site that grows what it bounds and not
+only at the one that builds; and the allocator's free bytes are read by arena, and as the resident
+bytes beyond use and not as `mallinfo2`'s free count, which counts pages it has already returned.
+What is left is not the forms': 112-226 MB of resident free bytes in every arm, the arm with no
+cache included, that the load's threads left in their arenas, and a write path that holds 60-260 MB
+beyond the cache while a seal in flight or a reader's pin holds what a publish replaced, which
+swings the same arm's pass by that much between reps: the rep that read 1,019 MB where its arm reads
+580 was 215 MB of snapshots and frozen tables beside the cache, a seal that had not landed, and the
+census said so. A request to the trim on builds as well as frees, to return the load's retention at
+a burst's start, read no lower and cost a look of 30 ms: refuted. Read a bound's effect as the
+median of several reps with the census of each, never from the rep that happened to be run.
 
 ## Standing limitations
 
