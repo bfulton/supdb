@@ -498,6 +498,38 @@ pub fn record_key(buf: &[u8], off: usize) -> Option<&[u8]> {
     buf.get(off + 4..off + 4 + klen)
 }
 
+/// The key of the record at `off` and the offset of the record after it,
+/// for a walk over records laid end to end -- a decoded group of the z
+/// form (`db::zpages`) -- that needs each record's length and nothing of
+/// its extents. `parse_record` is the only other function that says where
+/// a record ends, and it rebuilds a compact record's extent to say so.
+///
+/// The compact case reads the four-byte header's run length and returns
+/// `record_len_compact`'s answer, which is `parse_record`'s fourth element
+/// by the same arithmetic; every other shape asks `parse_record`. As
+/// `record_key` does, it leaves a compact header its run contradicts to
+/// the reader that wants the values. The next record must lie whole in
+/// `buf`, padding included: a record cut short is `None`, never an offset
+/// past the buffer, so a walk that follows the offsets cannot be led out of
+/// it. An offset past the buffer is `None` as well.
+#[inline]
+pub fn record_key_next(buf: &[u8], off: usize) -> Option<(&[u8], usize)> {
+    if off > buf.len() {
+        return None;
+    }
+    let klen = rd_u16(buf, off)? as usize;
+    let n = rd_u16(buf, off + 2)?;
+    if n == COMPACT {
+        let key = buf.get(off + 4..off + 4 + klen)?;
+        let run = rd_u16(buf, off + align_up(4 + klen, REC_ALIGN))? as usize;
+        let next = off.checked_add(record_len_compact(klen, run))?;
+        return (next <= buf.len()).then_some((key, next));
+    }
+    let (key, _, _, len) = parse_record(buf, off)?;
+    let next = off.checked_add(len)?;
+    (next <= buf.len()).then_some((key, next))
+}
+
 #[inline]
 pub fn parse_record(buf: &[u8], off: usize) -> Option<ParsedRecord<'_>> {
     let klen = rd_u16(buf, off)? as usize;
