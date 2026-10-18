@@ -1840,6 +1840,77 @@ pub struct Options {
     /// through two heap pointers per compare -- kept as the comparison arm.
     /// The build runs on the first scan after a commit and cost 300 ns a key.
     pub scan_snapshot_arena: bool,
+    /// The block cache costs what its forms' buffers allocate, and its
+    /// budget (`scan_cache_bytes`) bounds that. A form's bytes were
+    /// counted by what its vectors held, and the vectors cost more: a
+    /// build asked for room for every overlay key, one that replaces a
+    /// record as much as one that adds, a sparse form grew to the dense
+    /// count at once and doubled past it, and a block a burst patched
+    /// kept the capacity of its last doubling. Nothing in the budget
+    /// could see the difference, so a cache budgeted at a quarter of the
+    /// store cost the process well over that.
+    ///
+    /// On: a form is counted by its buffers' capacity, built to the size
+    /// it came out (the vectors shrunk to what they hold when a build
+    /// ends) and, where a patch grows it, grown by a quarter at a time
+    /// and not by doubling, so the slack the budget cannot see is a
+    /// fraction of a form and not a half of it. A sparse form reaches the
+    /// dense count in several reallocations where it took one, which is
+    /// what the slack costs. Three more parts come with it, each with an
+    /// option of its own so that it can be priced apart:
+    /// `forms_fit_shed`, `forms_fit_sweep` and `forms_trim_bytes`. Off:
+    /// the contents are counted, a build has room for every overlay key
+    /// and a sparse form grows to the dense count at once, and none of
+    /// the three is done. Beside a budget this bounds the cache, and
+    /// without one it is the slack alone.
+    ///
+    /// A shed from another partition's table retracts the form it
+    /// published, as a shed from the table in hand does, whatever this
+    /// option says: left standing, the form was one the writer filed
+    /// nothing into, and a reader's handle took it as the block.
+    pub forms_to_fit: bool,
+    /// With `forms_to_fit`: the budget is kept where forms grow and not
+    /// only where a scan builds one or an install adds one -- after a
+    /// patch, which is what grows a form in a burst -- so a burst no
+    /// longer builds the cache to the size of the store for the first
+    /// scan after it to shed. Off: the budget is kept at a scan's build
+    /// and an install. Not kept after the fold of a landed piece's keys
+    /// into a block under `forms_pieces_only`, which grows forms where
+    /// the tables are away and sheds in neither setting.
+    pub forms_fit_shed: bool,
+    /// With `forms_to_fit`: the snapshots and forms a publish replaced
+    /// are swept when an engine thread's operation ends -- the writer's,
+    /// the segment work's, the upkeep thread's pass -- and not at the
+    /// writer's next commit, so the last of a pass's retirements does not
+    /// wait for a write. Only by a thread that holds its upkeep, as the
+    /// commit's sweep is. An operation end that finds the same number
+    /// waiting as the last sweep left does not sweep again, a reader's
+    /// pin having kept them then, until `FIT_SWEEP_RETRY` operation ends
+    /// have gone by, so a pin that has gone is found. Off: they wait for
+    /// the commit's sweep or the next publish's.
+    pub forms_fit_sweep: bool,
+    /// With `forms_to_fit`: one stride, counted twice. A handle that has
+    /// freed this many bytes of forms, by a shed or by dropping its
+    /// tables, asks the trim thread to look at the allocator; and the
+    /// thread trims (`malloc_trim`) when the allocator holds this much
+    /// more free than it did after its last trim, so a cache that frees
+    /// what its next build takes again, on one thread, is not trimmed at
+    /// all. A freed form goes back to the arena its thread took it from,
+    /// and an arena gives memory to the system only from its top: the
+    /// forms a burst's patches built on the upkeep thread and the scans
+    /// after it shed stay as small free chunks in an arena nothing
+    /// allocates from any more, resident beside a cache that has shrunk.
+    /// The trim runs on a thread of its own, so the segment work (a
+    /// seal's landing, a flush's answer, a merge's publish) does not wait
+    /// for it; but it returns each arena's pages with that arena's lock
+    /// held, tens of milliseconds for an arena of tens of thousands of
+    /// small free chunks, and a thread that allocates or frees in it
+    /// waits meanwhile -- the thread that freed the forms among them.
+    /// Zero is never. There is no trim where the allocator is not
+    /// glibc's, or is older than 2.33, which has no `mallinfo2` to count
+    /// the free bytes by; the engine does not link against it, so such a
+    /// build still links.
+    pub forms_trim_bytes: usize,
 }
 
 impl Default for Options {
@@ -1966,6 +2037,10 @@ impl Default for Options {
             forms_to_writer: false,
             form_dense_from: 0,
             scan_snapshot_arena: true,
+            forms_to_fit: false,
+            forms_fit_shed: true,
+            forms_fit_sweep: true,
+            forms_trim_bytes: 32 << 20,
         }
     }
 }
@@ -6095,8 +6170,11 @@ const ARENA_BLOCKS: usize = 1 << 12;
 /// of sixty-four pages cost a fresh table's first write thirty
 /// microseconds an arena, and the lag sweep's one-percent burst at ten
 /// thousand keys, a hundred writes over four pages, read its updates at
-/// 0.66x and ycsb-B at 0.87x.
+/// 0.66x and ycsb-B at 0.87x. Read only by `populate_ahead`, which is
+/// Linux's.
+#[cfg(target_os = "linux")]
 const PREFAULT_MIN: usize = 16 << 10;
+#[cfg(target_os = "linux")]
 const PREFAULT_MAX: usize = 256 << 10;
 
 /// The pages of `base[..cap]` from `populated` to at least `need`, a
@@ -6198,6 +6276,19 @@ impl ByteArena {
     #[inline]
     fn block_len(&self) -> usize {
         1 << self.shift
+    }
+
+    /// The bytes reserved and the bytes of the blocks allocated for them,
+    /// for `Reader::memory_census`.
+    fn census(&self) -> (u64, u64) {
+        let cap: usize = self
+            .blocks
+            .iter()
+            .zip(self.caps.iter())
+            .filter(|(p, _)| !p.load(AtomicOrdering::Relaxed).is_null())
+            .map(|(_, c)| c.load(AtomicOrdering::Relaxed))
+            .sum();
+        (self.used.load(AtomicOrdering::Relaxed) as u64, cap as u64)
     }
 
     /// Writer: every block whose bytes lie wholly below `off` taken out
@@ -6589,6 +6680,18 @@ impl<T> Slab<T> {
         self.len.load(AtomicOrdering::Acquire)
     }
 
+    /// The bytes of the entries written and the bytes of the blocks
+    /// allocated for them, for `Reader::memory_census`.
+    fn census(&self) -> (u64, u64) {
+        let sz = std::mem::size_of::<T>() as u64;
+        let blocks = self
+            .blocks
+            .iter()
+            .filter(|b| !b.load(AtomicOrdering::Relaxed).is_null())
+            .count() as u64;
+        (self.len() as u64 * sz, blocks * SLAB_BLOCK as u64 * sz)
+    }
+
     /// Writer: `v` at the next number, published.
     fn push(&self, v: T) -> usize {
         let id = self.len.load(AtomicOrdering::Relaxed);
@@ -6936,6 +7039,31 @@ impl Readers {
 }
 
 impl MemTable {
+    /// What the table holds, for `Reader::memory_census`: the bytes its
+    /// arenas have reserved and the bytes of their blocks, the same of its
+    /// slabs, and its index's slots -- apart from the snapshots it keeps.
+    fn census(&self) -> [u64; 5] {
+        let (mut au, mut ac) = (0, 0);
+        for a in [&self.keys, &self.vals, &self.vals2] {
+            let (u, c) = a.census();
+            au += u;
+            ac += c;
+        }
+        let (eu, ec) = self.entries.census();
+        let (su, sc) = self.slim.census();
+        let (lu, lc) = self.log.census();
+        let ix = self.index.load(AtomicOrdering::Acquire);
+        // SAFETY: the index is retired under the readers' epoch, and the
+        // census runs pinned.
+        let ix = if ix.is_null() {
+            0
+        } else {
+            let index: &Index = unsafe { &*ix };
+            index.slots.len() as u64 * 8
+        };
+        [au, ac, eu + su + lu, ec + sc + lc, ix]
+    }
+
     fn new(prefault: bool) -> MemTable {
         MemTable {
             entries: Slab::new(),
@@ -9454,6 +9582,13 @@ struct CachedBlock {
 }
 
 impl CachedBlock {
+    /// The three buffers shrunk to what they hold, where a build asked
+    /// for more than it filled (`Options::forms_to_fit`).
+    fn fit(&mut self) {
+        self.keys.shrink_to_fit();
+        self.vals.shrink_to_fit();
+        self.ents.shrink_to_fit();
+    }
     fn begin(&mut self, key: &[u8]) {
         let e = [
             self.keys.len() as u32,
@@ -9715,6 +9850,18 @@ struct SparseBlock {
     vals: Vec<u8>,
 }
 
+/// Room for `need` more in a buffer that is full, for a form kept to fit
+/// (`Options::forms_to_fit`): a quarter of what the buffer holds, and not
+/// less than one more `need`, so the write after this one finds its room
+/// too. Doubling left half of a buffer empty after its last growth, and
+/// a growth at every write would have copied a form that a burst patches
+/// forty times forty times over.
+fn fit_room<T>(v: &mut Vec<T>, need: usize) {
+    if v.len() + need > v.capacity() {
+        v.reserve_exact(need + (v.len() / 4).max(need));
+    }
+}
+
 /// PROTOTYPE: one key of a sparse block: where its key sits in the
 /// block's keys, the first rank of the partition's records not below it,
 /// whether that rank is the key itself -- whose values are then in the
@@ -9757,12 +9904,18 @@ impl SparseBlock {
     /// run like these, for the splices that make a form a delta at a
     /// time; a build sizes its own from the count it has. Not the dense
     /// count at birth: most forms a mix leaves hold a delta or two, and
-    /// at thirty million keys the difference is the page cache's.
-    fn with_room(key_len: usize, run_len: usize) -> SparseBlock {
+    /// at thirty million keys the difference is the page cache's. To fit
+    /// (`Options::forms_to_fit`), `ROOM_AT_BIRTH_FIT`.
+    fn with_room(key_len: usize, run_len: usize, fit: bool) -> SparseBlock {
+        let n = if fit {
+            ROOM_AT_BIRTH_FIT
+        } else {
+            ROOM_AT_BIRTH
+        };
         SparseBlock {
-            keys: Vec::with_capacity(ROOM_AT_BIRTH * key_len.max(16)),
-            ents: Vec::with_capacity(ROOM_AT_BIRTH),
-            vals: Vec::with_capacity(ROOM_AT_BIRTH * (run_len + 8)),
+            keys: Vec::with_capacity(n * key_len.max(16)),
+            ents: Vec::with_capacity(n),
+            vals: Vec::with_capacity(n * (run_len + 8)),
         }
     }
     /// Room for one more delta of a key and a run like these: a buffer
@@ -9780,6 +9933,13 @@ impl SparseBlock {
         grow(&mut self.ents, 1, CACHE_DENSE);
         grow(&mut self.keys, key_len, CACHE_DENSE * key_len.max(16));
         grow(&mut self.vals, run_len, CACHE_DENSE * (run_len + 8));
+    }
+    /// The three buffers shrunk to what they hold, where a build asked
+    /// for more than it filled (`Options::forms_to_fit`).
+    fn fit(&mut self) {
+        self.keys.shrink_to_fit();
+        self.ents.shrink_to_fit();
+        self.vals.shrink_to_fit();
     }
     /// PROTOTYPE: the block's three buffers toward the core ahead of a
     /// walk, as a copy's; the lower bound over the deltas is the same
@@ -9808,6 +9968,22 @@ impl SparseBlock {
 }
 
 impl Cached {
+    /// What the block's buffers have allocated, by capacity, where `bytes`
+    /// counts what they hold: the memory the form costs, which is what a
+    /// bound on the process is spent in.
+    fn cap_bytes(&self) -> usize {
+        match self {
+            Cached::Clean => 0,
+            Cached::Sparse(b) => {
+                b.keys.capacity()
+                    + b.ents.capacity() * std::mem::size_of::<DeltaEnt>()
+                    + b.vals.capacity()
+            }
+            Cached::Block(b) => b.keys.capacity() + b.vals.capacity() + b.ents.capacity() * 16,
+            Cached::Wide(w) => w.sorted.capacity() * 8,
+        }
+    }
+
     /// PROTOTYPE: what the block holds beyond its slot, for the budget.
     fn bytes(&self) -> usize {
         match self {
@@ -9815,6 +9991,61 @@ impl Cached {
             Cached::Sparse(b) => b.keys.len() + b.ents.len() * 24 + b.vals.len(),
             Cached::Block(b) => b.keys.len() + b.vals.len() + b.ents.len() * 16,
             Cached::Wide(w) => w.sorted.len() * 8,
+        }
+    }
+}
+
+/// What a census has counted already, by address, so that a structure
+/// shared between owners is counted once, by the first owner reached
+/// (`Reader::memory_census`).
+#[derive(Default)]
+struct CensusSeen {
+    forms: std::collections::HashSet<usize>,
+    mems: std::collections::HashSet<usize>,
+    snaps: std::collections::HashSet<usize>,
+    arenas: std::collections::HashSet<usize>,
+    caches: std::collections::HashSet<usize>,
+}
+
+/// Forms counted by kind -- clean, sparse, copy, wide -- how many, the
+/// bytes the budget counts in them and the bytes their buffers have
+/// allocated.
+#[derive(Default, Clone, Copy)]
+struct FormTally {
+    n: [u64; 4],
+    len: [u64; 4],
+    cap: [u64; 4],
+}
+
+impl FormTally {
+    const KINDS: [&'static str; 4] = ["clean", "sparse", "copy", "wide"];
+
+    fn add(&mut self, c: &Cached) {
+        let k = match c {
+            Cached::Clean => 0,
+            Cached::Sparse(_) => 1,
+            Cached::Block(_) => 2,
+            Cached::Wide(_) => 3,
+        };
+        self.n[k] += 1;
+        self.len[k] += c.bytes() as u64;
+        self.cap[k] += c.cap_bytes() as u64;
+    }
+
+    fn cap_total(&self) -> u64 {
+        self.cap.iter().sum()
+    }
+
+    fn put(&self, out: &mut Vec<(String, u64)>, pre: &str) {
+        for (k, name) in Self::KINDS.iter().enumerate() {
+            if self.n[k] == 0 {
+                continue;
+            }
+            out.push((format!("{pre}_{name}_n"), self.n[k]));
+            if k > 0 {
+                out.push((format!("{pre}_{name}_len"), self.len[k]));
+                out.push((format!("{pre}_{name}_cap"), self.cap[k]));
+            }
         }
     }
 }
@@ -9836,6 +10067,19 @@ const CACHE_DENSE: usize = 16;
 /// Deltas a sparse form made by a splice has room for at birth; full, it
 /// grows to `CACHE_DENSE` at once and doubles from there (`SparseBlock::room`).
 const ROOM_AT_BIRTH: usize = 4;
+
+/// The same kept to fit (`Options::forms_to_fit`): the delta the form is
+/// born with and one more. The form then grows by a quarter at a time
+/// (`fit_room`), so what it holds is most of what it costs from the
+/// start.
+const ROOM_AT_BIRTH_FIT: usize = 2;
+
+/// How many operation ends, of any engine thread, skip the sweep of the
+/// retired snapshots and forms while the number waiting is the number the
+/// last sweep left (`Options::forms_fit_sweep`) before one sweeps again:
+/// the same number says a reader's pin held them, and says nothing of
+/// whether the pin has gone.
+const FIT_SWEEP_RETRY: u32 = 64;
 
 /// The most live tables `State::replaced` keeps.
 const REPLACED_CAP: usize = 8;
@@ -10242,7 +10486,7 @@ impl State {
     /// its next look at the log (`Reader::rebase_tables`). It needs no
     /// writer's state, so whichever thread publishes may call it, pinned,
     /// since a slot it reads may be replaced and retired under it.
-    fn carry_published(&self, next: &mut State, pieces_only: bool) -> u64 {
+    fn carry_published(&self, next: &mut State, pieces_only: bool, by_capacity: bool) -> u64 {
         let np_cur = self.segs.partition_point(|s| s.level > 0);
         let np = next.segs.partition_point(|s| s.level > 0);
         if self.forms.len() < np_cur
@@ -10313,7 +10557,11 @@ impl State {
                 } else {
                     form.clone()
                 };
-                let form_bytes = form.bytes();
+                let form_bytes = if by_capacity {
+                    form.cap_bytes()
+                } else {
+                    form.bytes()
+                };
                 bytes += form_bytes;
                 let carried = Box::into_raw(Box::new(CanonicalForm {
                     form,
@@ -10565,6 +10813,148 @@ struct Shared {
     /// tables live from there on are the ones a look may still have to
     /// read, and `State::replaced` keeps those. Nothing before a look.
     upkeep_lives: AtomicU64,
+    /// `Options::forms_trim_bytes`: a handle has freed enough forms that
+    /// the trim thread is to look at what the allocator holds free, and
+    /// the thread to wake; what the allocator held free after the last
+    /// trim; and the trims made. Only the trim thread reads the floor and
+    /// writes the counts.
+    trim_wanted: std::sync::atomic::AtomicBool,
+    trim_thread: std::sync::OnceLock<std::thread::Thread>,
+    trim_floor: AtomicUsize,
+    trims: AtomicU64,
+    /// The looks the thread made at the allocator, those that trimmed and
+    /// those that found too little free to, and the time they took
+    /// altogether, in nanoseconds.
+    trim_looks: AtomicU64,
+    trim_ns: AtomicU64,
+    /// A test's: while set the trim thread waits where a trim would begin,
+    /// as a trim that took long would keep it, and `trim_begun` counts the
+    /// requests it has taken up (`Db::hold_trim`).
+    trim_hold: std::sync::atomic::AtomicBool,
+    trim_begun: AtomicU64,
+    /// What the sweep of the retired snapshots and forms at the end of an
+    /// engine thread's operation (`Options::forms_fit_sweep`: the
+    /// writer's, the segment work's, the upkeep thread's pass) left
+    /// waiting, and the operation ends since that skipped the sweep for
+    /// finding as many waiting: the same number says a reader's pin held
+    /// them, and says nothing of whether it has gone. Read and written
+    /// relaxed by whichever thread's operation ends, and a race costs a
+    /// sweep or skips one.
+    fit_swept: AtomicUsize,
+    fit_skips: std::sync::atomic::AtomicU32,
+}
+
+/// What the trim asks of glibc's allocator: the bytes it holds free in its
+/// arenas, and the return of the whole pages inside its free chunks to
+/// the system. The free count is `mallinfo2`'s, looked up by name when
+/// first asked for and not linked against: the symbol is new in glibc
+/// 2.33, and a reference to it kept the engine from linking on any older
+/// one, trim or no trim. Elsewhere there is no count, and so no trim.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+mod heap {
+    type Mallinfo2 = unsafe extern "C" fn() -> libc::mallinfo2;
+
+    fn mallinfo2() -> Option<Mallinfo2> {
+        static FOUND: std::sync::OnceLock<Option<Mallinfo2>> = std::sync::OnceLock::new();
+        *FOUND.get_or_init(|| {
+            // SAFETY: a lookup by a NUL-terminated name in the global
+            // scope, which answers null for a name it does not have.
+            let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"mallinfo2".as_ptr()) };
+            // SAFETY: the symbol of this name is the function of this type.
+            (!p.is_null())
+                .then(|| unsafe { std::mem::transmute::<*mut libc::c_void, Mallinfo2>(p) })
+        })
+    }
+
+    /// The bytes the allocator holds free, or none where it cannot say.
+    pub fn free_bytes() -> Option<usize> {
+        let f = mallinfo2()?;
+        // SAFETY: reads the allocator's own totals under its own locks.
+        Some(unsafe { f() }.fordblks)
+    }
+
+    /// The pages inside every free chunk of every arena given back,
+    /// each arena's lock held while its pages are.
+    pub fn trim() {
+        // SAFETY: releases the allocator's own free memory under its own
+        // locks.
+        unsafe { libc::malloc_trim(0) };
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+mod heap {
+    pub fn free_bytes() -> Option<usize> {
+        None
+    }
+
+    pub fn trim() {}
+}
+
+/// Whether an allocator holding `held` bytes free is to be trimmed, and
+/// the floor the next stride is counted from: the bytes it held after the
+/// last trim (`floor`), lowered to what it holds now when that is less,
+/// so a cache that has grown into the free memory is not waited on for a
+/// trim it no longer needs. Due when it holds `stride` more.
+fn trim_due(held: usize, floor: usize, stride: usize) -> (usize, bool) {
+    let floor = floor.min(held);
+    (floor, held >= floor.saturating_add(stride))
+}
+
+/// Give the system the pages the allocator holds free, if it holds
+/// `stride` more than it did when it was last asked to (`trim_due`).
+/// Pages, not chunks: glibc releases the whole pages inside every free
+/// chunk of every arena, not only a heap's top.
+fn trim_free_memory(shared: &Shared, stride: usize) {
+    let t = std::time::Instant::now();
+    let Some(held) = heap::free_bytes() else {
+        return;
+    };
+    let (floor, due) = trim_due(
+        held,
+        shared.trim_floor.load(AtomicOrdering::Relaxed),
+        stride,
+    );
+    shared.trim_floor.store(floor, AtomicOrdering::Relaxed);
+    if due {
+        heap::trim();
+        let left = heap::free_bytes().unwrap_or(held);
+        shared.trim_floor.store(left, AtomicOrdering::Relaxed);
+        shared.trims.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+    shared.trim_looks.fetch_add(1, AtomicOrdering::Relaxed);
+    shared
+        .trim_ns
+        .fetch_add(t.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+}
+
+/// The trim thread (`Options::forms_trim_bytes`): asleep until a handle
+/// has freed a stride of forms, then a look at the allocator, and a trim if
+/// it holds a stride more free than after the last one. A thread of its
+/// own and not the segment work's, which a trim of tens of milliseconds
+/// held from landing a seal or answering a flush; and not niced, since it
+/// holds an arena's lock for as long as it trims it and a thread that
+/// could be preempted holding one is the one that keeps the rest waiting.
+fn trim_loop(shared: &Shared, stop: &std::sync::atomic::AtomicBool, stride: usize) {
+    while !stop.load(AtomicOrdering::Acquire) {
+        if shared.trim_wanted.swap(false, AtomicOrdering::AcqRel) {
+            shared.trim_begun.fetch_add(1, AtomicOrdering::Release);
+            while shared.trim_hold.load(AtomicOrdering::Acquire)
+                && !stop.load(AtomicOrdering::Acquire)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            trim_free_memory(shared, stride);
+            continue;
+        }
+        std::thread::park();
+    }
+}
+
+/// The trim thread in flight: its handle and the flag that stops it.
+struct Trimmer {
+    handle: Option<std::thread::JoinHandle<()>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// EXPERIMENT: a replaced canonical form on its way to being freed. A
@@ -10615,6 +11005,29 @@ impl<T> RetireList<T> {
 
     fn len(&self) -> usize {
         self.len.load(AtomicOrdering::Relaxed)
+    }
+
+    /// `f` on every item, for `Reader::memory_census`: the list is taken
+    /// as a sweep takes it, walked, and put back whole, so a sweep or a
+    /// push meanwhile finds the list empty or adds to its front, and
+    /// nothing is freed that a sweep would not have.
+    fn census(&self, mut f: impl FnMut(&T)) {
+        let first = self
+            .head
+            .swap(std::ptr::null_mut(), AtomicOrdering::Acquire);
+        if first.is_null() {
+            return;
+        }
+        let (mut last, mut q) = (first, first);
+        while !q.is_null() {
+            // SAFETY: taken off the list by the swap, so this walk's alone.
+            unsafe {
+                f(&(*q)._item);
+                last = q;
+                q = (*q).next;
+            }
+        }
+        self.splice(first, last);
     }
 
     /// `item`, which no reader pinned at `epoch` or later can reach.
@@ -10938,6 +11351,10 @@ struct FormsState {
     /// PROTOTYPE: bytes the built blocks hold, kept exact at every build,
     /// eviction and drop, for the budget.
     cache_bytes: std::cell::Cell<usize>,
+    /// Bytes of forms this handle has freed since the segment work's
+    /// thread was last asked to look at the allocator
+    /// (`Options::forms_trim_bytes`).
+    freed: std::cell::Cell<usize>,
     /// PROTOTYPE: counts scans on the block path; a block records the
     /// count when walked, and the budget sheds the block with the oldest.
     scan_tick: std::cell::Cell<u32>,
@@ -11110,6 +11527,7 @@ impl FormsState {
             scan_keys: std::cell::RefCell::new(None),
             cache_used: std::cell::Cell::new(false),
             cache_bytes: std::cell::Cell::new(0),
+            freed: std::cell::Cell::new(0),
             scan_tick: std::cell::Cell::new(0),
             shed_seed: std::cell::Cell::new(0x9E37_79B9_7F4A_7C15),
             pending: std::cell::RefCell::new(Vec::new()),
@@ -11256,6 +11674,9 @@ pub struct Db {
     /// EXPERIMENT: the upkeep thread, once a commit has had something
     /// for it; see `Upkeep::Background`.
     upkeeper: Option<Upkeeper>,
+    /// The trim thread, started at the open of a store that keeps its forms
+    /// to fit (`Options::forms_trim_bytes`).
+    trimmer: Option<Trimmer>,
     /// The upkeep thread's regime, kept by the writer since the upkeep
     /// itself may be lent: the generation and committed log length at
     /// the last hand-over, the store's scan count as last seen, and the
@@ -11631,6 +12052,16 @@ impl SnapArena {
         }
     }
 
+    /// The bytes reserved and the bytes of the blocks allocated for them,
+    /// for `Reader::memory_census`.
+    fn census(&self) -> (u64, u64) {
+        let cap: usize = (0..SNAP_BLOCKS)
+            .filter(|&b| !self.blocks[b].load(AtomicOrdering::Relaxed).is_null())
+            .map(|b| self.cap(b))
+            .sum();
+        (self.tail.load(AtomicOrdering::Relaxed) as u64, cap as u64)
+    }
+
     /// The block an offset falls in, and the offset within it.
     #[inline]
     fn locate(&self, off: usize) -> (usize, usize) {
@@ -11935,6 +12366,40 @@ struct SnapCursor {
 }
 
 impl Snapshot {
+    /// What this snapshot holds, added into `out` for `Reader::memory_census`:
+    /// snapshots, the arena's bytes reserved and allocated, the entries'
+    /// bytes in use and allocated, and the bounds taken against partitions.
+    /// The arena, the bounds and the bases are shared between versions, so
+    /// each is counted once, by `seen`.
+    fn census(&self, seen: &mut CensusSeen, out: &mut [u64; 6]) {
+        out[0] += 1;
+        if seen
+            .arenas
+            .insert(std::sync::Arc::as_ptr(&self.arena) as usize)
+        {
+            let (written, cap) = self.arena.census();
+            out[1] += written;
+            out[2] += cap;
+        }
+        let sz = std::mem::size_of::<SnapKey>();
+        out[3] += ((self.ents.len() + self.side.len() + self.fresh.len()) * sz) as u64;
+        out[4] +=
+            ((self.ents.capacity() + self.side.capacity() + self.fresh.capacity()) * sz) as u64;
+        if seen
+            .caches
+            .insert(std::sync::Arc::as_ptr(&self.bounds) as usize)
+        {
+            self.bounds.each(|b: &SnapBounds| {
+                out[5] += (b.at.capacity() * 4 + b.cuts.len() * 4 + b.ready.len()) as u64;
+            });
+        }
+        for base in &self.bases {
+            if seen.snaps.insert(std::sync::Arc::as_ptr(base) as usize) {
+                base.census(seen, out);
+            }
+        }
+    }
+
     fn len(&self) -> usize {
         self.ents.len()
     }
@@ -12846,6 +13311,18 @@ impl Reader {
             // memtable a landing replaced held until then.
             if self.shared.retired.len() > 0 {
                 self.sweep_retired_states();
+            }
+            // The snapshots and forms a publish replaced during it, held
+            // for the pin just dropped: a pass of scans publishes the
+            // snapshots it extends and nothing else sweeps after it, so
+            // the last of them waited for the next commit, tens of
+            // megabytes at three million keys, beside a budget that
+            // counts none of it (`Options::forms_fit_sweep`). Only by a
+            // handle that holds its upkeep, as the commit's sweep is: a
+            // writer that has lent it leaves the sweeping to the thread
+            // that has it.
+            if self.opts.forms_to_fit && self.opts.forms_fit_sweep && self.fs_home() {
+                self.sweep_at_leave();
             }
         }
         if let Some(slot) = self.slot {
@@ -14535,8 +15012,8 @@ impl Reader {
             for b in 0..t.slots.len() {
                 if landed_over.get(b).is_some_and(|&o| o) {
                     complete = false;
-                    if t.slots[b].is_some() {
-                        t.slots[b] = None;
+                    if let Some(f) = t.slots[b].take() {
+                        self.note_freed(self.fbytes(&f));
                         t.dirty[b] = false;
                         self.publish_marker(p, b);
                     }
@@ -14548,12 +15025,14 @@ impl Reader {
                     if sparse || copy {
                         complete = false;
                     }
-                    t.slots[b] = None;
+                    if let Some(f) = t.slots[b].take() {
+                        self.note_freed(self.fbytes(&f));
+                    }
                     t.dirty[b] = false;
                     self.publish_marker(p, b);
                 }
                 if let Some(d) = t.dense[b].take() {
-                    dense_bytes += d.bytes() as u64;
+                    dense_bytes += self.fbytes(&d) as u64;
                 }
                 t.listed[b] = u32::MAX;
                 let published = st.forms[p][b].load(AtomicOrdering::Acquire);
@@ -14562,7 +15041,7 @@ impl Reader {
                 let published = (!published.is_null()).then(|| &unsafe { &*published }.form);
                 match (t.slots[b].as_ref(), published) {
                     (Some(form), published) => {
-                        cache_bytes += form.bytes();
+                        cache_bytes += self.fbytes(form);
                         t.listed[b] = built.len() as u32;
                         built.push((p as u32, b as u32));
                         if !published.is_some_and(|f| std::sync::Arc::ptr_eq(f, form)) {
@@ -14631,8 +15110,58 @@ impl Reader {
         true
     }
 
+    /// `bytes` of forms freed, counted toward the next look at what the
+    /// allocator holds free (`Options::forms_trim_bytes`): asked of the
+    /// trim thread, which makes the look and the trim on a thread of its
+    /// own whoever freed. A store with no trim thread (the stride zero, or
+    /// the option off) is asked nothing, and one whose thread is gone is
+    /// asked in vain.
+    fn note_freed(&self, bytes: usize) {
+        let stride = self.opts.forms_trim_bytes;
+        if !self.opts.forms_to_fit || stride == 0 || bytes == 0 {
+            return;
+        }
+        let total = self.fs().freed.get() + bytes;
+        if total < stride {
+            self.fs().freed.set(total);
+            return;
+        }
+        self.fs().freed.set(0);
+        self.shared.trim_wanted.store(true, AtomicOrdering::Release);
+        if let Some(t) = self.shared.trim_thread.get() {
+            t.unpark();
+        }
+    }
+
+    /// The trims `Options::forms_trim_bytes` has made over the store's
+    /// life, for a test and the suite's counters.
+    #[doc(hidden)]
+    pub fn forms_trims(&self) -> u64 {
+        self.shared.trims.load(AtomicOrdering::Relaxed)
+    }
+
+    /// The looks at the allocator the trim thread made, trims and not.
+    #[doc(hidden)]
+    pub fn forms_trim_looks(&self) -> u64 {
+        self.shared.trim_looks.load(AtomicOrdering::Relaxed)
+    }
+
+    /// The microseconds those looks took, the trim thread's.
+    #[doc(hidden)]
+    pub fn forms_trim_us(&self) -> u64 {
+        self.shared.trim_ns.load(AtomicOrdering::Relaxed) / 1000
+    }
+
+    /// The requests for a look the trim thread has taken up, a test's
+    /// to wait on (`Db::hold_trim`).
+    #[doc(hidden)]
+    pub fn forms_trims_begun(&self) -> u64 {
+        self.shared.trim_begun.load(AtomicOrdering::Acquire)
+    }
+
     fn drop_blocks(&self) {
         self.shared.forms_events[0].fetch_add(1, AtomicOrdering::Relaxed);
+        self.note_freed(self.fs().cache_bytes.get());
         for t in self.fs().tables.borrow().iter() {
             *t.borrow_mut() = None;
         }
@@ -15080,6 +15609,53 @@ impl Reader {
             .sweep(|low| self.shared.readers.oldest_for(low));
     }
 
+    /// The sweep at the end of an operation (`Options::forms_fit_sweep`):
+    /// when the number waiting is not the number the last sweep left, and
+    /// otherwise at the first end after `FIT_SWEEP_RETRY` have skipped it.
+    /// A sweep that a reader's pin held leaves the same number waiting,
+    /// and the same number at the next end says that nothing was retired
+    /// since and nothing of whether the pin is still there: a sweep that
+    /// waited for the number to move waited for a publish, which a thread
+    /// that reads and writes no more never makes, and what was retired
+    /// stood for as long as that. The number is a hint and not an
+    /// identity -- some freed and as many retired since read the same --
+    /// and the retry bounds what that costs. A call is a few relaxed
+    /// loads, and a sweep one in the span of a retry.
+    fn sweep_at_leave(&self) {
+        let sh = &self.shared;
+        let waiting = sh.retired_snaps.len() + sh.retired_forms.len();
+        if waiting == 0 {
+            // The count a later sweep compares with is of this list, not
+            // of one that has emptied since.
+            if sh.fit_swept.load(AtomicOrdering::Relaxed) != 0 {
+                sh.fit_swept.store(0, AtomicOrdering::Relaxed);
+            }
+            return;
+        }
+        let skips = sh.fit_skips.load(AtomicOrdering::Relaxed);
+        if waiting == sh.fit_swept.load(AtomicOrdering::Relaxed) && skips < FIT_SWEEP_RETRY {
+            sh.fit_skips.store(skips + 1, AtomicOrdering::Relaxed);
+            return;
+        }
+        self.sweep_retired_forms();
+        sh.fit_swept.store(
+            sh.retired_snaps.len() + sh.retired_forms.len(),
+            AtomicOrdering::Relaxed,
+        );
+        sh.fit_skips.store(0, AtomicOrdering::Relaxed);
+    }
+
+    /// The snapshots and the forms a publish replaced that wait for a
+    /// reader to leave, for a test: read without entering, so that the
+    /// read is not an operation whose end sweeps.
+    #[doc(hidden)]
+    pub fn retired_waiting(&self) -> (usize, usize) {
+        (
+            self.shared.retired_snaps.len(),
+            self.shared.retired_forms.len(),
+        )
+    }
+
     /// A read or a scan over a store with pieces and no partition, for the
     /// segment work to partition it by (`Options::adaptive_shape`): on the
     /// handle's own line, as its other statistics are, and nothing at all
@@ -15271,7 +15847,7 @@ impl Reader {
         let Some(slot) = st.forms.get(p).and_then(|f| f.get(b)) else {
             return;
         };
-        let bytes = form.bytes();
+        let bytes = self.fbytes(form);
         let new = Box::into_raw(Box::new(CanonicalForm {
             form: form.clone(),
             bytes,
@@ -15362,6 +15938,35 @@ impl Reader {
         )
     }
 
+    /// The bytes the state's published forms are recorded at, and the
+    /// same walked, for a test that holds the record to the forms: the
+    /// counter `canonical_forms` reports, the sum of the bytes each
+    /// published form carries, and the sums of the contents and of the
+    /// buffers of the forms themselves, in that order.
+    #[doc(hidden)]
+    pub fn published_form_bytes(&self) -> [usize; 4] {
+        let _e = self.enter();
+        let st = self.state();
+        let (mut recorded, mut len, mut cap) = (0, 0, 0);
+        for slot in st.forms.iter().flat_map(|f| f.iter()) {
+            let p = slot.load(AtomicOrdering::Acquire);
+            if p.is_null() {
+                continue;
+            }
+            // SAFETY: as in `canonical`.
+            let cf = unsafe { &*p };
+            recorded += cf.bytes;
+            len += cf.form.bytes();
+            cap += cf.form.cap_bytes();
+        }
+        [
+            st.forms_bytes.load(AtomicOrdering::Relaxed),
+            recorded,
+            len,
+            cap,
+        ]
+    }
+
     /// A built form behind an `Arc`: the shared clean one for `Clean`,
     /// which holds nothing, and a fresh one for a form with contents.
     fn share_form(&self, form: Cached) -> std::sync::Arc<Cached> {
@@ -15400,6 +16005,7 @@ impl Reader {
             offs: Some(&self.fs().emit_offs),
             copy_dense: false,
             copy_exact: self.opts.copy_exact,
+            fit: self.opts.forms_to_fit,
             merge_pieces: self.opts.overlay_merge,
             pieces_only: self.opts.forms_pieces_only,
             ranks_by_heads: self.opts.piece_ranks_by_heads,
@@ -16077,7 +16683,7 @@ impl Reader {
                         .fetch_add(t_build.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
                     let built = std::sync::Arc::new(built);
                     self.count_built();
-                    let bytes = built.bytes();
+                    let bytes = self.fbytes(&built);
                     table.slots[b] = Some(built);
                     self.list_built_bytes(pi, b, table, bytes);
                     self.shared
@@ -16096,7 +16702,7 @@ impl Reader {
                 self.shared.forms_events[6].fetch_add(1, AtomicOrdering::Relaxed);
                 let built = self.share_form(ctx.materialize(src, table, b, unsealed)?);
                 self.count_built();
-                let bytes = built.bytes();
+                let bytes = self.fbytes(&built);
                 table.slots[b] = Some(built);
                 self.list_built_bytes(pi, b, table, bytes);
             }
@@ -16124,8 +16730,18 @@ impl Reader {
         lent.saturating_sub(self.fs().pass_lent.get()) > allow as u64
     }
 
+    /// What the budget counts a form as: what it holds, or with
+    /// `Options::forms_to_fit` what its buffers cost.
+    fn fbytes(&self, c: &Cached) -> usize {
+        if self.opts.forms_to_fit {
+            c.cap_bytes()
+        } else {
+            c.bytes()
+        }
+    }
+
     fn list_built(&self, p: usize, b: usize, table: &mut BlockTable) {
-        let bytes = table.slots[b].as_ref().map_or(0, |c| c.bytes());
+        let bytes = table.slots[b].as_ref().map_or(0, |c| self.fbytes(c));
         self.list_built_bytes(p, b, table, bytes);
     }
 
@@ -16157,10 +16773,11 @@ impl Reader {
         if self.opts.commit_forms && self.slot.is_none() {
             self.publish_marker(p, b);
         }
-        let bytes = c.bytes();
+        let bytes = self.fbytes(&c);
         self.fs()
             .cache_bytes
             .set(self.fs().cache_bytes.get() - bytes);
+        self.note_freed(bytes);
         let at = std::mem::replace(&mut table.listed[b], u32::MAX);
         if at != u32::MAX {
             let mut built = self.fs().built.borrow_mut();
@@ -16236,10 +16853,23 @@ impl Reader {
                     break;
                 }
                 let c = t.slots[b].take().expect("checked");
-                let bytes = c.bytes();
+                // What was published for the block goes with it, as it
+                // does from the table in hand (`unlist`), whatever else is
+                // set: a form left in the state is one a reader's handle
+                // takes as the block, current to nothing the writer files
+                // from here, and the first write into the block trips the
+                // check in `settle_each` that a block the writer holds no
+                // form for has none published. This branch once took the
+                // slot and the bytes and nothing else, so a budget alone
+                // left the form standing.
+                if self.opts.commit_forms && self.slot.is_none() {
+                    self.publish_marker(p, b);
+                }
+                let bytes = self.fbytes(&c);
                 self.fs()
                     .cache_bytes
                     .set(self.fs().cache_bytes.get() - bytes);
+                self.note_freed(bytes);
                 let at = std::mem::replace(&mut t.listed[b], u32::MAX);
                 drop(held);
                 if at != u32::MAX {
@@ -16508,12 +17138,15 @@ impl Reader {
                 // what brings the copy back for a block the reads still
                 // own.
                 if let Some(old) = table.dense[b].take() {
-                    self.fs()
-                        .cache_bytes
-                        .set(self.fs().cache_bytes.get().saturating_sub(old.bytes()));
+                    self.fs().cache_bytes.set(
+                        self.fs()
+                            .cache_bytes
+                            .get()
+                            .saturating_sub(self.fbytes(&old)),
+                    );
                     let mut c = self.fs().choices.get();
                     c[1] += 1;
-                    c[4] = c[4].saturating_sub(old.bytes() as u64);
+                    c[4] = c[4].saturating_sub(self.fbytes(&old) as u64);
                     self.fs().choices.set(c);
                 }
                 table.reads[b] /= 2;
@@ -16692,7 +17325,18 @@ impl Reader {
             )?;
             *offs = em.scratch;
         }
-        self.splice_run(at, b, table, key, (c, same), run)
+        self.splice_run(at, b, table, key, (c, same), run)?;
+        // A patch is what grows a form in a burst, and nothing shed for
+        // it: the budget was kept only where a scan built a block, so a
+        // burst built the cache to the size of the store and the first
+        // scan after it shed the difference. Kept here and not in the
+        // splice, which the rebase's fold (`fold_piece_block`) also calls
+        // while the tables are away: a block that fold grows is not shed
+        // for (`Options::forms_fit_shed`).
+        if self.opts.forms_to_fit && self.opts.forms_fit_shed {
+            self.shed(at, b, table);
+        }
+        Ok(())
     }
 
     /// `run`, a key's values each behind a u32 length, written into block
@@ -16712,7 +17356,7 @@ impl Reader {
         run: &[u8],
     ) -> Result<()> {
         let (c, same) = cut;
-        let before = table.slots[b].as_ref().map_or(0, |c| c.bytes());
+        let before = table.slots[b].as_ref().map_or(0, |c| self.fbytes(c));
         let was_clean = matches!(table.slots[b].as_deref(), Some(Cached::Clean));
         let mut bloated = false;
         let mut dense = false;
@@ -16767,11 +17411,19 @@ impl Reader {
                     blk.vals[at..at + run.len()].copy_from_slice(run);
                     blk.ents[i][3] = run.len() as u32;
                 } else if found {
+                    if self.opts.forms_to_fit {
+                        fit_room(&mut blk.vals, run.len());
+                    }
                     let at_run = blk.vals.len() as u32;
                     blk.vals.extend_from_slice(run);
                     blk.ents[i][2] = at_run;
                     blk.ents[i][3] = run.len() as u32;
                 } else {
+                    if self.opts.forms_to_fit {
+                        fit_room(&mut blk.vals, run.len());
+                        fit_room(&mut blk.keys, key.len());
+                        fit_room(&mut blk.ents, 1);
+                    }
                     let at_run = blk.vals.len() as u32;
                     blk.vals.extend_from_slice(run);
                     let key_at = blk.keys.len() as u32;
@@ -16822,7 +17474,21 @@ impl Reader {
                 // three times on the way to sixteen, and the allocator
                 // was a fifth of the upkeep thread's time over the
                 // tenth-rewritten burst.
-                sb.room(key.len(), run.len());
+                if self.opts.forms_to_fit {
+                    // Only the buffers this write grows, and by a quarter:
+                    // the doubling left a form that a burst had patched
+                    // to forty deltas in the capacity of sixty-four, and
+                    // a budget cannot see a buffer's room.
+                    if !found || run.len() > sb.ents[i].run.1 as usize {
+                        fit_room(&mut sb.vals, run.len());
+                    }
+                    if !found {
+                        fit_room(&mut sb.keys, key.len());
+                        fit_room(&mut sb.ents, 1);
+                    }
+                } else {
+                    sb.room(key.len(), run.len());
+                }
                 if found && run.len() <= sb.ents[i].run.1 as usize {
                     let at = sb.ents[i].run.0 as usize;
                     sb.vals[at..at + run.len()].copy_from_slice(run);
@@ -16863,7 +17529,7 @@ impl Reader {
                 // Sized for the dense count at birth, and the run copied
                 // rather than its scratch taken: taken, the next splice
                 // allocated the scratch again, one allocation a write.
-                let mut sb = SparseBlock::with_room(key.len(), run.len());
+                let mut sb = SparseBlock::with_room(key.len(), run.len(), self.opts.forms_to_fit);
                 sb.keys.extend_from_slice(key);
                 sb.ents.push(DeltaEnt {
                     key: (0, key.len() as u32),
@@ -16879,7 +17545,7 @@ impl Reader {
         if was_clean {
             self.list_built(at, b, table);
         } else {
-            let after = table.slots[b].as_ref().map_or(0, |c| c.bytes());
+            let after = table.slots[b].as_ref().map_or(0, |c| self.fbytes(c));
             self.fs()
                 .cache_bytes
                 .set(self.fs().cache_bytes.get() + after - before);
@@ -17328,7 +17994,7 @@ impl Reader {
                 if canon.is_none() && table.slots[b].is_none() {
                     let built = self.share_form(ctx.materialize(src, table, b, unsealed)?);
                     self.count_built();
-                    let bytes = built.bytes();
+                    let bytes = self.fbytes(&built);
                     table.slots[b] = Some(built);
                     self.list_built_bytes(pi, b, table, bytes);
                     self.shed(pi, b, table);
@@ -17358,7 +18024,7 @@ impl Reader {
                         .materialize(src, table, b, unsealed)?,
                     );
                     self.count_built();
-                    let bytes = built.bytes();
+                    let bytes = self.fbytes(&built);
                     table.slots[b] = Some(built);
                     self.list_built_bytes(pi, b, table, bytes);
                     self.shed(pi, b, table);
@@ -17606,11 +18272,11 @@ impl Reader {
                         if matches!(copied, Cached::Block(_)) {
                             let mut c = self.fs().choices.get();
                             c[0] += 1;
-                            c[4] += copied.bytes() as u64;
+                            c[4] += self.fbytes(&copied) as u64;
                             self.fs().choices.set(c);
                             self.fs()
                                 .cache_bytes
-                                .set(self.fs().cache_bytes.get() + copied.bytes());
+                                .set(self.fs().cache_bytes.get() + self.fbytes(&copied));
                             table.dense[b] = Some(std::sync::Arc::new(copied));
                         }
                     }
@@ -17844,21 +18510,37 @@ impl Reader {
         let _e = self.enter();
         let (mut clean, mut sparse, mut copies, mut wide, mut bytes) =
             (0usize, 0usize, 0usize, 0usize, 0usize);
+        // The bytes the cache counts itself holding are the contents', or
+        // with `Options::forms_to_fit` the buffers'; the walk adds up the
+        // same by its own arithmetic.
+        let fit = self.opts.forms_to_fit;
         for t in self.fs().tables.borrow().iter() {
             for c in t.borrow().iter().flat_map(|t| t.slots.iter()).flatten() {
                 match &**c {
                     Cached::Clean => clean += 1,
                     Cached::Sparse(b) => {
                         sparse += 1;
-                        bytes += b.keys.len() + b.ents.len() * 24 + b.vals.len();
+                        bytes += if fit {
+                            b.keys.capacity() + b.ents.capacity() * 24 + b.vals.capacity()
+                        } else {
+                            b.keys.len() + b.ents.len() * 24 + b.vals.len()
+                        };
                     }
                     Cached::Block(b) => {
                         copies += 1;
-                        bytes += b.keys.len() + b.vals.len() + b.ents.len() * 16;
+                        bytes += if fit {
+                            b.keys.capacity() + b.vals.capacity() + b.ents.capacity() * 16
+                        } else {
+                            b.keys.len() + b.vals.len() + b.ents.len() * 16
+                        };
                     }
                     Cached::Wide(w) => {
                         wide += 1;
-                        bytes += w.sorted.len() * 8;
+                        bytes += if fit {
+                            w.sorted.capacity() * 8
+                        } else {
+                            w.sorted.len() * 8
+                        };
                     }
                 }
             }
@@ -17890,7 +18572,7 @@ impl Reader {
                     t.slots
                         .iter()
                         .flatten()
-                        .map(|c| c.bytes())
+                        .map(|c| self.fbytes(c))
                         .max()
                         .unwrap_or(0)
                 })
@@ -17917,6 +18599,273 @@ impl Reader {
                 })
             })
             .sum()
+    }
+
+    /// A census of what the process holds for this handle's forms and for
+    /// what stands beside them, by capacity, in the order the question
+    /// "what holds the memory the budget does not count" asks it: the
+    /// handle's tables by the form's kind, with the bytes the budget
+    /// counts in a form beside the bytes its buffers have allocated; the
+    /// forms published in the state, those a table shares and those only
+    /// the state holds; the forms in the retired lists, which wait for a
+    /// reader to leave; the scan snapshots; the memtables, live, frozen,
+    /// settled from, kept for the upkeep's look and retired; and the
+    /// derived caches on the segments. A name ending `_n` is a count and
+    /// every other is bytes. Each structure is counted once, by the first
+    /// owner reached, so `census_cap` is a figure to hold against the
+    /// allocator's bytes in use; what it leaves out is the segment work's
+    /// own, the threads' stacks and every handle but this one.
+    #[doc(hidden)]
+    pub fn memory_census(&self) -> Vec<(String, u64)> {
+        self.memory_census_with(&[])
+    }
+
+    fn memory_census_with(&self, handed: &[std::sync::Arc<MemTable>]) -> Vec<(String, u64)> {
+        let _e = self.enter();
+        let st = self.state();
+        let fs = self.fs();
+        let mut seen = CensusSeen::default();
+        let mut out: Vec<(String, u64)> = Vec::new();
+        let put = |out: &mut Vec<(String, u64)>, k: &str, v: u64| {
+            if v > 0 {
+                out.push((k.to_string(), v));
+            }
+        };
+        // The tables: the forms by kind, and apart from them the vectors
+        // that stand beside every block.
+        let (mut tab, mut shared, mut dense) = (
+            FormTally::default(),
+            FormTally::default(),
+            FormTally::default(),
+        );
+        let (mut tables, mut blocks, mut aux) = (0u64, 0u64, 0u64);
+        for cell in fs.tables.borrow().iter() {
+            let held = cell.borrow();
+            let Some(t) = held.as_ref() else { continue };
+            tables += 1;
+            blocks += t.slots.len() as u64;
+            aux += (t.slots.capacity() * 8
+                + t.dense.capacity() * 8
+                + t.reads.capacity() * 4
+                + t.touched.capacity() * 4
+                + t.listed.capacity() * 4
+                + t.dirty.capacity()
+                + t.last_key.capacity()
+                + t.pieces.capacity() * std::mem::size_of::<(usize, std::sync::Arc<Vec<u32>>)>()
+                + t.piece_ranks.capacity() * 8
+                + t.added.capacity() * 24
+                + t.added.iter().map(|l| l.capacity() * 8).sum::<usize>())
+                as u64;
+            for (list, tally_own) in [(&t.slots, false), (&t.dense, true)] {
+                for a in list.iter().flatten() {
+                    if matches!(**a, Cached::Clean) {
+                        tab.add(a);
+                    } else if seen.forms.insert(std::sync::Arc::as_ptr(a) as usize) {
+                        let into = if tally_own {
+                            &mut dense
+                        } else if std::sync::Arc::strong_count(a) > 1 {
+                            &mut shared
+                        } else {
+                            &mut tab
+                        };
+                        into.add(a);
+                    }
+                }
+            }
+        }
+        let misc = (fs.pending.borrow().capacity() * 16
+            + fs.snap_added.borrow().capacity() * 4
+            + fs.snap_stale.borrow().bits.capacity() * 8
+            + fs.built.borrow().capacity() * 8
+            + fs.settle_run.borrow().capacity()
+            + fs.settle_offs.borrow().capacity() * 8
+            + fs.emit_offs.borrow().capacity() * 8
+            + fs.resume_key.borrow().capacity()
+            + fs.pending_frozen
+                .borrow()
+                .iter()
+                .map(|(_, w)| w.capacity() * 16)
+                .sum::<usize>()) as u64;
+        // The scan snapshots: the handle's own, the state's, the retired
+        // and the ones the tables keep, each counted once.
+        let mut snaps = [[0u64; 6]; 4];
+        if let Some((_, s)) = fs.scan_keys.borrow().as_ref() {
+            if seen.snaps.insert(std::sync::Arc::as_ptr(s) as usize) {
+                s.census(&mut seen, &mut snaps[0]);
+            }
+        }
+        let sp = st.snap.load(AtomicOrdering::Acquire);
+        if !sp.is_null() && seen.snaps.insert(sp as usize) {
+            // SAFETY: published into the state, which this read holds,
+            // and freed only past every pinned reader.
+            unsafe { &*sp }.census(&mut seen, &mut snaps[1]);
+        }
+        // The published forms: those a table shares, and those only the
+        // state holds, which a shed or a patch left standing.
+        let mut pubf = FormTally::default();
+        let (mut pub_n, mut pub_shared) = (0u64, 0u64);
+        for slot in st.forms.iter().flat_map(|f| f.iter()) {
+            let p = slot.load(AtomicOrdering::Acquire);
+            if p.is_null() {
+                continue;
+            }
+            // SAFETY: as in `canonical`.
+            let cf = unsafe { &*p };
+            pub_n += 1;
+            if seen.forms.insert(std::sync::Arc::as_ptr(&cf.form) as usize) {
+                pubf.add(&cf.form);
+            } else {
+                pub_shared += 1;
+            }
+        }
+        // What the retired lists hold: forms a publish replaced, states,
+        // and snapshots, each waiting for the readers pinned before its
+        // retirement to leave.
+        let mut retf = FormTally::default();
+        let (mut retf_n, mut retf_shared) = (0u64, 0u64);
+        self.shared.retired_forms.census(|rf| {
+            retf_n += 1;
+            // SAFETY: held by the list until a sweep past every pinned
+            // reader drops it.
+            let cf = unsafe { &*rf.0 };
+            if seen.forms.insert(std::sync::Arc::as_ptr(&cf.form) as usize) {
+                retf.add(&cf.form);
+            } else {
+                retf_shared += 1;
+            }
+        });
+        // The memtables, labelled by the first owner that reaches each:
+        // live, frozen, settled from (`pending_frozen`), kept for the
+        // upkeep's look (`State::replaced`), retired with a state, handed
+        // to a seal.
+        const LABELS: [&str; 6] = ["live", "frozen", "pending", "replaced", "retired", "handed"];
+        let mut mems: Vec<(usize, std::sync::Arc<MemTable>)> = vec![(0, st.mem.clone())];
+        mems.extend(st.frozen.iter().map(|m| (1, m.clone())));
+        mems.extend(
+            fs.pending_frozen
+                .borrow()
+                .iter()
+                .map(|(m, _)| (2, m.clone())),
+        );
+        mems.extend(st.replaced.iter().map(|m| (3, m.clone())));
+        let mut rets = FormTally::default();
+        let mut rets_n = 0u64;
+        self.shared.retired.census(|b| {
+            rets_n += 1;
+            if !b.forms_moved.load(AtomicOrdering::Relaxed) {
+                for slot in b.forms.iter().flat_map(|f| f.iter()) {
+                    let p = slot.load(AtomicOrdering::Relaxed);
+                    if p.is_null() {
+                        continue;
+                    }
+                    // SAFETY: held by the retired state until it is freed.
+                    let cf = unsafe { &*p };
+                    if seen.forms.insert(std::sync::Arc::as_ptr(&cf.form) as usize) {
+                        rets.add(&cf.form);
+                    }
+                }
+            }
+            let sp = b.snap.load(AtomicOrdering::Relaxed);
+            if !sp.is_null() && seen.snaps.insert(sp as usize) {
+                // SAFETY: as the state's forms above.
+                unsafe { &*sp }.census(&mut seen, &mut snaps[2]);
+            }
+            mems.push((4, b.mem.clone()));
+            mems.extend(
+                b.frozen
+                    .iter()
+                    .chain(b.replaced.iter())
+                    .map(|m| (4, m.clone())),
+            );
+        });
+        self.shared.retired_snaps.census(|rs| {
+            if seen.snaps.insert(rs.0 as usize) {
+                // SAFETY: the list holds the reference it was published with.
+                unsafe { &*rs.0 }.census(&mut seen, &mut snaps[2]);
+            }
+        });
+        mems.extend(handed.iter().map(|m| (5, m.clone())));
+        let mut memt = [[0u64; 6]; 6];
+        for (label, m) in &mems {
+            if !seen.mems.insert(std::sync::Arc::as_ptr(m) as usize) {
+                continue;
+            }
+            let c = m.census();
+            let row = &mut memt[*label];
+            row[0] += 1;
+            for (r, v) in row[1..].iter_mut().zip(c) {
+                *r += v;
+            }
+            for s in [m.snaps.sorted.get(), m.snaps.copied.get()]
+                .into_iter()
+                .flatten()
+            {
+                if seen.snaps.insert(std::sync::Arc::as_ptr(&s) as usize) {
+                    s.census(&mut seen, &mut snaps[3]);
+                }
+            }
+        }
+        // What the segments derive and keep in memory.
+        let (mut seg_ranks, mut seg_bounds, mut seg_bloom) = (0u64, 0u64, 0u64);
+        for s in &st.segs {
+            s.ranks
+                .each(|v: &Vec<u32>| seg_ranks += v.capacity() as u64 * 4);
+            s.bounds
+                .each(|v: &Vec<u32>| seg_bounds += v.capacity() as u64 * 4);
+            if let Some(b) = &s.bloom {
+                seg_bloom += b.blocks.capacity() as u64 * 64;
+            }
+        }
+        // The allocations the forms are behind: an `Arc` a distinct form,
+        // a box a published one.
+        let arcs = seen.forms.len() as u64 * (16 + std::mem::size_of::<Cached>()) as u64;
+        let boxes = (pub_n + retf_n) * std::mem::size_of::<CanonicalForm>() as u64;
+        tab.put(&mut out, "tab");
+        shared.put(&mut out, "tabshared");
+        dense.put(&mut out, "dense");
+        pubf.put(&mut out, "pub");
+        retf.put(&mut out, "retf");
+        rets.put(&mut out, "rets");
+        put(&mut out, "tab_tables", tables);
+        put(&mut out, "tab_blocks", blocks);
+        put(&mut out, "tab_aux", aux);
+        put(&mut out, "fs_misc", misc);
+        put(&mut out, "arc_boxes", arcs + boxes);
+        put(&mut out, "pub_n", pub_n);
+        put(&mut out, "pub_shared_n", pub_shared);
+        put(&mut out, "retf_n", retf_n);
+        put(&mut out, "retf_shared_n", retf_shared);
+        put(&mut out, "rets_n", rets_n);
+        let mut cap_total = tab.cap_total()
+            + shared.cap_total()
+            + dense.cap_total()
+            + pubf.cap_total()
+            + retf.cap_total()
+            + rets.cap_total()
+            + aux
+            + misc
+            + arcs
+            + boxes
+            + seg_ranks
+            + seg_bounds
+            + seg_bloom;
+        for (name, s) in ["fs", "state", "retired", "tables"].iter().zip(&snaps) {
+            put(&mut out, &format!("snap_{name}_n"), s[0]);
+            put(&mut out, &format!("snap_{name}_used"), s[1] + s[3]);
+            put(&mut out, &format!("snap_{name}_cap"), s[2] + s[4] + s[5]);
+            cap_total += s[2] + s[4] + s[5];
+        }
+        for (name, m) in LABELS.iter().zip(&memt) {
+            put(&mut out, &format!("mem_{name}_n"), m[0]);
+            put(&mut out, &format!("mem_{name}_used"), m[1] + m[3]);
+            put(&mut out, &format!("mem_{name}_cap"), m[2] + m[4] + m[5]);
+            cap_total += m[2] + m[4] + m[5];
+        }
+        put(&mut out, "seg_ranks", seg_ranks);
+        put(&mut out, "seg_bounds", seg_bounds);
+        put(&mut out, "seg_bloom", seg_bloom);
+        put(&mut out, "census_cap", cap_total);
+        out
     }
 
     /// The partitions walked in bulk, with the unsealed keys laid over them.
@@ -18820,6 +19769,16 @@ impl Db {
             snap_on_table: AtomicU64::new(0),
             upkeep: Lend::default(),
             upkeep_lives: AtomicU64::new(u64::MAX),
+            trim_wanted: std::sync::atomic::AtomicBool::new(false),
+            trim_floor: AtomicUsize::new(0),
+            trims: AtomicU64::new(0),
+            trim_looks: AtomicU64::new(0),
+            trim_ns: AtomicU64::new(0),
+            fit_swept: AtomicUsize::new(0),
+            fit_skips: std::sync::atomic::AtomicU32::new(0),
+            trim_thread: std::sync::OnceLock::new(),
+            trim_hold: std::sync::atomic::AtomicBool::new(false),
+            trim_begun: AtomicU64::new(0),
         });
         let pin_slot = Some(
             shared
@@ -18873,6 +19832,7 @@ impl Db {
             wal_dir_unsynced: false,
             keeper: None,
             upkeeper: None,
+            trimmer: None,
             upkeep_log: (0, 0),
             upkeep_life: 0,
             upkeep_since_scan: 0,
@@ -18887,6 +19847,7 @@ impl Db {
             presync_failed: None,
         };
         db.go_away()?;
+        db.start_trimmer();
         Ok(db)
     }
 
@@ -19249,6 +20210,16 @@ impl Db {
             snap_on_table: AtomicU64::new(0),
             upkeep: Lend::default(),
             upkeep_lives: AtomicU64::new(u64::MAX),
+            trim_wanted: std::sync::atomic::AtomicBool::new(false),
+            trim_floor: AtomicUsize::new(0),
+            trims: AtomicU64::new(0),
+            trim_looks: AtomicU64::new(0),
+            trim_ns: AtomicU64::new(0),
+            fit_swept: AtomicUsize::new(0),
+            fit_skips: std::sync::atomic::AtomicU32::new(0),
+            trim_thread: std::sync::OnceLock::new(),
+            trim_hold: std::sync::atomic::AtomicBool::new(false),
+            trim_begun: AtomicU64::new(0),
         });
         let pin_slot = Some(
             shared
@@ -19302,6 +20273,7 @@ impl Db {
             wal_dir_unsynced: false,
             keeper: None,
             upkeeper: None,
+            trimmer: None,
             upkeep_log: (0, 0),
             upkeep_life: 0,
             upkeep_since_scan: 0,
@@ -19316,6 +20288,7 @@ impl Db {
             presync_failed: None,
         };
         db.go_away()?;
+        db.start_trimmer();
         Ok(db)
     }
 
@@ -20946,6 +21919,7 @@ impl Db {
         let fresh = std::sync::Arc::new(MemTable::new(self.opts.prefault));
         let carried = std::cell::Cell::new(false);
         let pieces_only = self.opts.forms_pieces_only;
+        let by_capacity = self.opts.forms_to_fit;
         let Some(old) = self.try_publish_writer(|cur| {
             if !std::sync::Arc::ptr_eq(&cur.mem, table) || cur.frozen.len() >= FROZEN_CAP {
                 return None;
@@ -20954,7 +21928,7 @@ impl Db {
             carried.set(carry);
             let mut next = Db::frozen_over(cur, &fresh, from);
             if carry {
-                cur.carry_published(&mut next, pieces_only);
+                cur.carry_published(&mut next, pieces_only, by_capacity);
                 next.forms_at = AtomicUsize::new(0);
                 next.forms_complete = std::sync::atomic::AtomicBool::new(complete);
             }
@@ -21127,11 +22101,14 @@ impl Db {
                     self.unlist(p, b, t);
                 }
                 if let Some(old) = t.dense[b].take() {
-                    self.fs()
-                        .cache_bytes
-                        .set(self.fs().cache_bytes.get().saturating_sub(old.bytes()));
+                    self.fs().cache_bytes.set(
+                        self.fs()
+                            .cache_bytes
+                            .get()
+                            .saturating_sub(self.fbytes(&old)),
+                    );
                     let mut c = self.fs().choices.get();
-                    c[4] = c[4].saturating_sub(old.bytes() as u64);
+                    c[4] = c[4].saturating_sub(self.fbytes(&old) as u64);
                     self.fs().choices.set(c);
                 }
             }
@@ -21182,6 +22159,7 @@ impl Db {
     fn set_mem_with(&mut self, mem: std::sync::Arc<MemTable>, carry: bool) {
         let from = Db::replaced_from(&self.opts, &self.shared);
         let pieces_only = self.opts.forms_pieces_only;
+        let by_capacity = self.opts.forms_to_fit;
         let old = self.publish_writer(|cur| {
             let mut next = State {
                 forms: Reader::forms_for(&cur.segs),
@@ -21206,7 +22184,7 @@ impl Db {
                 layout: cur.layout.clone(),
             };
             if carry {
-                cur.carry_published(&mut next, pieces_only);
+                cur.carry_published(&mut next, pieces_only, by_capacity);
                 next.forms_at = AtomicUsize::new(cur.forms_at.load(AtomicOrdering::Acquire));
                 next.forms_complete = std::sync::atomic::AtomicBool::new(
                     cur.forms_complete.load(AtomicOrdering::Acquire),
@@ -22280,6 +23258,18 @@ impl<T> Default for IdCache<T> {
 }
 
 impl<T> IdCache<T> {
+    /// `f` on every value, for `Reader::memory_census`.
+    fn each(&self, mut f: impl FnMut(&T)) {
+        let mut p = self.head.load(AtomicOrdering::Acquire);
+        while !p.is_null() {
+            // SAFETY: published whole by `put` and freed only with the
+            // cache.
+            let n = unsafe { &*p };
+            f(&n.val);
+            p = n.next;
+        }
+    }
+
     fn get(&self, id: u64) -> Option<std::sync::Arc<T>> {
         let mut p = self.head.load(AtomicOrdering::Acquire);
         while !p.is_null() {
@@ -22669,7 +23659,7 @@ impl Reader {
                     continue;
                 }
                 self.shared.forms_events[9].fetch_add(1, AtomicOrdering::Relaxed);
-                let bytes = form.bytes();
+                let bytes = self.fbytes(&form);
                 sent += bytes;
                 forms.push((b as u32, bytes, form));
             }
@@ -24082,6 +25072,14 @@ impl Db {
         self.shared.ord_rebuilt.load(AtomicOrdering::Relaxed)
     }
 
+    /// `Reader::memory_census` with the table a `sync` handed to a seal
+    /// without freezing it, which only the writer holds.
+    #[doc(hidden)]
+    pub fn memory_census(&self) -> Vec<(String, u64)> {
+        let handed: Vec<_> = self.mem_handed.iter().cloned().collect();
+        self.r.memory_census_with(&handed)
+    }
+
     /// The sequence of the last manifest this store published
     /// (`Options::manifest_slots`): what the open read, plus one for every
     /// publish since. A landing in flight counts once it has published;
@@ -24203,6 +25201,80 @@ impl Db {
                 let _ = h.join();
             }
         }
+    }
+
+    /// The trim thread started, if the options ask for one
+    /// (`Options::forms_to_fit` with a stride): at the open, so that a
+    /// handle's first request has a thread to wake, and a store that is
+    /// never asked costs a parked thread.
+    fn start_trimmer(&mut self) {
+        if self.trimmer.is_some() || !self.opts.forms_to_fit || self.opts.forms_trim_bytes == 0 {
+            return;
+        }
+        let shared = self.shared.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let stride = self.opts.forms_trim_bytes;
+        let spawned = std::thread::Builder::new()
+            .name("supdb-trim".into())
+            .spawn(move || trim_loop(&shared, &flag, stride));
+        if let Ok(handle) = spawned {
+            let _ = self.shared.trim_thread.set(handle.thread().clone());
+            self.trimmer = Some(Trimmer {
+                handle: Some(handle),
+                stop,
+            });
+        }
+    }
+
+    /// The trim thread stopped and joined, which waits out a trim in
+    /// progress. A test's hold on it is lifted first.
+    fn stop_trimmer(&mut self) {
+        self.shared.trim_hold.store(false, AtomicOrdering::Release);
+        if let Some(mut t) = self.trimmer.take() {
+            t.stop.store(true, AtomicOrdering::SeqCst);
+            if let Some(th) = self.shared.trim_thread.get() {
+                th.unpark();
+            }
+            if let Some(h) = t.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// Whether this process's allocator can say what it holds free, which
+    /// the trim counts by (`Options::forms_trim_bytes`): not on a
+    /// platform without glibc's, nor on a glibc older than 2.33. For a
+    /// test that asks for a trim.
+    #[doc(hidden)]
+    pub fn trim_supported() -> bool {
+        heap::free_bytes().is_some()
+    }
+
+    /// A test's: while `on`, the trim thread waits where a trim would
+    /// begin, as one that took long would keep it, so a test can ask what
+    /// the rest of the store does meanwhile; `forms_trims_begun` says it
+    /// is there. Lifted at the close.
+    #[doc(hidden)]
+    pub fn hold_trim(&self, on: bool) {
+        self.shared.trim_hold.store(on, AtomicOrdering::Release);
+    }
+
+    /// A test's: `hold_trim(false)` after `after`, from a thread of its
+    /// own, for a test whose thread is the writer waiting on a store
+    /// that the hold keeps. The thread ends as soon as the hold is lifted
+    /// by another hand, so a test that lifts it is not made to wait out
+    /// the time.
+    #[doc(hidden)]
+    pub fn release_trim_after(&self, after: std::time::Duration) -> std::thread::JoinHandle<()> {
+        let shared = self.shared.clone();
+        std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            while t.elapsed() < after && shared.trim_hold.load(AtomicOrdering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            shared.trim_hold.store(false, AtomicOrdering::Release);
+        })
     }
 
     /// PROTOTYPE: what the keeper has published over this store's life:
@@ -24339,6 +25411,8 @@ struct BuildCtx<'s> {
     copy_dense: bool,
     /// See `Options::copy_exact`.
     copy_exact: bool,
+    /// See `Options::forms_to_fit`.
+    fit: bool,
     /// `Options::forms_pieces_only`: the forms hold the pieces' fold alone
     /// and the walk overlays the snapshot.
     pieces_only: bool,
@@ -25303,6 +26377,9 @@ impl<'s> BuildCtx<'s> {
             rank = cut + same as usize;
         }
         self.give_offs(em.scratch);
+        if self.fit {
+            blk.fit();
+        }
         Ok(blk)
     }
     /// A run's positions over a block from the cursor on, at most
@@ -25751,6 +26828,9 @@ impl<'s> BuildCtx<'s> {
             .iter()
             .all(|o| o.cut != u32::MAX && BuildCtx::cut_known(o.cut, lo, hi).1 == Ordering::Equal);
         blk.identity = updates && blk.ents.len() == hi - lo;
+        if self.fit {
+            blk.fit();
+        }
         Ok(blk)
     }
     /// The merged copy of the ranks with a sparse form's deltas laid over
@@ -25849,6 +26929,9 @@ impl<'s> BuildCtx<'s> {
         // Every delta an update of a record, and a key emitted per record:
         // `copy_block`'s rule, which the form's cuts answer exactly.
         blk.identity = updates && blk.ents.len() == hi - lo;
+        if self.fit {
+            blk.fit();
+        }
         Ok(blk)
     }
     /// The first rank in `rank..end` whose key is not below `uk`, or `end`,
@@ -27137,7 +28220,11 @@ impl Maint {
             let rebases = if swapped_live {
                 0
             } else {
-                cur.carry_published(&mut next, self.opts.forms_pieces_only)
+                cur.carry_published(
+                    &mut next,
+                    self.opts.forms_pieces_only,
+                    self.opts.forms_to_fit,
+                )
             };
             let p = Box::into_raw(Box::new(next));
             if self
@@ -27896,6 +28983,7 @@ impl Drop for Db {
         self.shared.seal_hold.store(0, AtomicOrdering::Release);
         self.stop_upkeep();
         self.stop_keeper();
+        self.stop_trimmer();
         self.stop_ahead();
         match &mut self.maint {
             MaintHome::Here(m) => m.stop(),
@@ -28541,5 +29629,114 @@ mod merge_runs {
                 "round {round}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod trim_stride {
+    use super::trim_due;
+
+    /// A trim is due once the allocator holds a stride more free than it
+    /// did after the last one, and not a byte before.
+    #[test]
+    fn a_trim_is_due_at_a_stride_over_the_floor() {
+        assert_eq!(trim_due(100, 0, 100), (0, true));
+        assert_eq!(trim_due(99, 0, 100), (0, false));
+        assert_eq!(trim_due(250, 150, 100), (150, true));
+        assert_eq!(trim_due(249, 150, 100), (150, false));
+    }
+
+    /// A floor above what the allocator holds now is lowered to it, so a
+    /// cache that has grown into the free memory is waited on for a stride
+    /// more than it holds, and not than it held.
+    #[test]
+    fn the_floor_falls_with_the_free_bytes() {
+        assert_eq!(trim_due(40, 150, 100), (40, false));
+        assert_eq!(trim_due(139, 40, 100), (40, false));
+        assert_eq!(trim_due(140, 40, 100), (40, true));
+    }
+
+    /// A stride nothing reaches never trims, and a floor at the top of the
+    /// range does not wrap into one that does.
+    #[test]
+    fn a_stride_out_of_reach_never_trims() {
+        assert_eq!(trim_due(10, 0, usize::MAX), (0, false));
+        assert_eq!(
+            trim_due(usize::MAX - 1, usize::MAX - 1, 10),
+            (usize::MAX - 1, false)
+        );
+    }
+}
+
+#[cfg(test)]
+mod sweep_gate {
+    use super::*;
+
+    /// The sweep at the end of an operation (`Options::forms_fit_sweep`)
+    /// is the upkeep's holder's, as the commit's is: a writer that has
+    /// lent it leaves what a publish replaced to the thread that has it,
+    /// since that thread frees what it replaced at its own passes and a
+    /// form it had just replaced could go under a read of its own if the
+    /// writer freed it meanwhile. That a handle holds its upkeep is the
+    /// cell not being empty and nothing else (`Reader::fs_home`), so the
+    /// lend is made here by emptying the cell, and no thread's timing
+    /// decides what the test sees.
+    #[test]
+    fn a_writer_that_has_lent_its_upkeep_leaves_the_sweep_to_the_thread_that_has_it() {
+        let dir =
+            std::env::temp_dir().join(format!("supdb-next-sweep-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let opts = Options {
+            forms_to_fit: true,
+            upkeep: Upkeep::Inline,
+            publish_in_background: false,
+            ..Options::default()
+        };
+        let mut db = Db::create(&dir, opts).unwrap();
+        // A form a publish replaced, which no pinned reader can hold.
+        let retire = |db: &Db| {
+            let form = Box::into_raw(Box::new(CanonicalForm {
+                form: std::sync::Arc::new(Cached::Clean),
+                bytes: 0,
+            }));
+            let epoch = db.shared.readers.epoch.load(AtomicOrdering::SeqCst);
+            db.shared.retired_forms.push(epoch + 1, RetiredForm(form));
+        };
+
+        // The holder's operation ends, and sweeps it.
+        retire(&db);
+        assert_eq!(db.retired_waiting(), (0, 1));
+        drop(db.op());
+        assert_eq!(
+            db.retired_waiting(),
+            (0, 0),
+            "an operation end of the handle that holds its upkeep sweeps"
+        );
+
+        // Lent, the same operation end leaves it where it is. The upkeep
+        // is put back before the count is judged, so a failure is the
+        // count's and not a store closed with its upkeep away.
+        retire(&db);
+        let fs = db.r.lend_fs().expect("the writer holds its upkeep");
+        assert!(!db.r.fs_home());
+        drop(db.op());
+        let lent = db.retired_waiting();
+        *db.r.fs.0.get_mut() = Some(fs);
+        assert_eq!(
+            lent,
+            (0, 1),
+            "an operation end of a writer that has lent its upkeep sweeps nothing"
+        );
+
+        // Home again, the next one sweeps it.
+        assert!(db.r.fs_home());
+        drop(db.op());
+        assert_eq!(
+            db.retired_waiting(),
+            (0, 0),
+            "the upkeep home again, the operation end sweeps what waited"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
