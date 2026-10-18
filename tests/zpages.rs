@@ -1166,6 +1166,9 @@ fn the_default_floor_declines_a_small_partition_and_says_how_much() {
     let c = db.zpage_counts();
     assert!(c.partitions >= 1 && c.sidecars == 0, "{c:?}");
     assert_eq!(c.declined_small, c.partitions, "{c:?}");
+    // The gauge a pass asks whether the store is covered by: the live
+    // partitions left raw for their size.
+    assert_eq!(c.small_partitions, c.partitions, "{c:?}");
     assert!(
         c.declined_small_bytes > 400_000 && c.declined_small_bytes < 2 << 20,
         "{c:?}"
@@ -1199,6 +1202,8 @@ fn a_partition_with_a_run_in_a_block_is_declined_and_read_raw() {
     let c = db.zpage_counts();
     assert_eq!(c.declined_block_backed, 1, "{c:?}");
     assert_eq!(c.sidecars + 1, c.partitions, "{c:?}");
+    // Left raw for what it holds, not for its size.
+    assert_eq!(c.small_partitions, 0, "{c:?}");
     assert_eq!(sidecar_files(&dir).len() as u64, c.sidecars);
     let before = db.zpage_counts();
     check(&db, &model, &[b"zzz-big".to_vec()], "the big run");

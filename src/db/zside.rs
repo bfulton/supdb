@@ -759,7 +759,7 @@ impl Decline {
     /// (`Seg::z_declined`); zero is none.
     pub(super) fn code(self) -> u8 {
         match self {
-            Decline::Small(_) => 1,
+            Decline::Small(_) => DECLINED_SMALL,
             Decline::BlockBacked => 2,
             Decline::NoPage(NoPage::Oversize) => 3,
             Decline::NoPage(NoPage::Incompressible) => 4,
@@ -767,6 +767,11 @@ impl Decline {
         }
     }
 }
+
+/// The code `Seg::z_declined` keeps for a partition under the floor, which a
+/// pass that asks whether a store is covered counts apart from the ones that
+/// could not be (`Db::zpage_counts`).
+pub(super) const DECLINED_SMALL: u8 = 1;
 
 /// The code `Seg::z_declined` keeps for a build that failed: not declined
 /// for what the partition holds, but not tried again by this segment.

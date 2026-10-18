@@ -387,9 +387,13 @@ pub struct ZCounts {
     /// Partitions live, the ones with a sidecar installed, the ones of
     /// those out of service, and their pages, the pages a first decode has
     /// passed, the pages a check failed, the fences kept in memory, the
-    /// files' bytes and the decoded bytes of their groups.
+    /// files' bytes and the decoded bytes of their groups. The live
+    /// partitions with none because they are under the floor are counted
+    /// apart (`small_partitions`): a store covered but for a sliver is one
+    /// thing, and one whose partitions could not be is another.
     pub partitions: u64,
     pub sidecars: u64,
+    pub small_partitions: u64,
     pub damaged: u64,
     pub pages: u64,
     pub verified_pages: u64,
@@ -13663,6 +13667,8 @@ impl Reader {
                 c.resident_bytes += z.resident_bytes() as u64;
                 c.file_bytes += z.file_bytes();
                 c.group_bytes += z.group_bytes();
+            } else if seg.z_declined.load(AtomicOrdering::Relaxed) == zside::DECLINED_SMALL {
+                c.small_partitions += 1;
             }
         }
         c
