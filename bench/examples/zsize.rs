@@ -30,36 +30,53 @@
 //! to the same bytes.
 //!
 //! Exit status 2 if the suite's shape (sequential keys, half-compressible
-//! values) comes out under `STOP_RPP` records a page; 3 if the decoder that ran
-//! is not the one the build says it linked.
+//! values) comes out under `STOP_RPP` records a page, counted over the pages a
+//! partition builds once it is under way: not its first, which has no
+//! predecessor to size from, and not its last, which holds what is left. 4 if
+//! the run has no such cell, or no such pages, and so did not evaluate the rule
+//! (it says so, and a run that exits 0 did evaluate it and it held). 3 if the
+//! codec that ran is not the one the build says it linked, or its encoder
+//! makes other bytes than the sizes were taken with.
 use std::collections::HashSet;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use supdb::db::zpages::{
-    bind32, decode_group, fill_group, group_seek, lz4_decoder, page_crc, parse_page, verify_page,
-    walk_group, FenceEntry, Fill, FillScratch, FillStats, Group, GroupBuf, Images, Lz4Decoder,
-    SegImages, ZCAP, ZPAGE, ZTRAILER,
+    bind32, decode_group, fill_group, filter_bytes, group_seek, lz4_decoder, lz4_encoder_pin,
+    page_crc, parse_page, verify_page, walk_group, FenceEntry, Fill, FillScratch, FillStats, Group,
+    GroupBuf, Images, Lz4Decoder, SegImages, LZ4_ENCODER_PIN, ZCAP, ZPAGE, ZTRAILER,
 };
 use supdb::flatindex::{self, record_key, record_key_next, FlatIndex};
 use supdb::{Blob, Bytes, Db, MmapBytes, Options};
 use supdb_bench::workload::{db_key_into, Payload, Rng};
 
-/// The page cache a 1 GiB bound left at the suite's out-of-core cell as
-/// measured there, the limit less the process's anonymous memory, in bytes.
+/// The page cache the cell's 1 GiB bound left, in bytes: the limit less the
+/// process's own anonymous memory, as the suite's out-of-core rung printed it
+/// (`docs/engine.md`, "Out of core": 0.94 GB of cache at ten million keys).
 /// The occupancy printed is a model against this figure and not a
-/// measurement of any cache.
+/// measurement of any cache; a different bound, or a different resident set
+/// in the process, moves it.
 const CACHE_B: f64 = 937e6;
-/// Records a page on the suite's shape under which the form cannot hold the
-/// cell's point reads to fewer faults than LMDB's: the pages and the resident
-/// part (the cache above) would no longer fit with LMDB's fault rate to
-/// spare. The example exits 2 under it.
+/// Records a page on the suite's shape under which the form cannot beat the
+/// comparator the cell is read against, and the example exits 2.
+///
+/// The comparator is LMDB with readahead off, the fastest the cell is read
+/// (`docs/engine.md`, "Out of core": 82 thousand reads a second on one
+/// thread, 12.2 us a read). A read of the form costs its work in memory,
+/// 4.0 us as estimated when the threshold was set (the raw read's fixed
+/// 0.7 us, a page's decode 2.8, the walk to the key 0.5), and a major fault,
+/// 41.5 us (a read's time less its in-memory work, over its faults, for the
+/// two arms there: 40 and 43), for the share `phi` of reads whose page is not
+/// resident: `4.0 + 41.5 phi <= 12.2` gives `phi <= 0.198`. A read is uniform
+/// over the pages, so `phi = 1 - (cache - resident part) / pages` and the
+/// pages may fill `(937 - 17) MB / (1 - 0.198)` = 1.147 GB: 280 thousand
+/// pages of ten million keys, 35.7 records a page, rounded up here to 36. The
+/// estimate of 4.0 us is the one the rule was registered with and is not
+/// replaced by the decode timed below: the threshold that stops the work is
+/// not moved by the work's own measurements.
 const STOP_RPP: f64 = 36.0;
 /// The cell's key count.
 const CELL_KEYS: f64 = 10_000_000.0;
-/// The filter's bits a key and the block it is set in, as `BlockedBloom` has
-/// them: 10 bits a key, 512 bits to a block.
-const FILTER_BITS_PER_KEY: f64 = 10.0;
 /// What every page of the example is bound by: the hash of an identity.
 fn bind() -> u32 {
     bind32(1, 2, 3, 4)
@@ -169,6 +186,11 @@ struct Cell {
     /// Rank within its partition, count, and first key of each page.
     meta: Vec<(u32, u32, Vec<u8>)>,
     groups: Vec<Group>,
+    /// Records and pages over the pages a partition builds once it is under
+    /// way: all but its first, whose call has no predecessor to size from
+    /// and holds about half a page, and its last, which holds what is left.
+    /// The stop rule is evaluated over these; the table prints all pages.
+    steady: (u64, u64),
     declined: u64,
     stats: FillStats,
     /// Nanoseconds spent inside `fill_group`: the compress calls, and the
@@ -185,6 +207,15 @@ fn fnv(mut h: u64, bytes: &[u8]) -> u64 {
         h = h.wrapping_mul(0x1000_0000_01b3);
     }
     h
+}
+
+/// A work directory, removed when it is dropped.
+struct Work(PathBuf);
+
+impl Drop for Work {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Load `keys` through the engine as the suite does and return the segment
@@ -228,6 +259,7 @@ fn analyze(segs: &[PathBuf], want: usize, shape: Shape, comp: f64, sweep: bool) 
         pages: Vec::new(),
         meta: Vec::new(),
         groups: Vec::new(),
+        steady: (0, 0),
         declined: 0,
         stats: FillStats::default(),
         fill_ns: 0,
@@ -272,6 +304,7 @@ fn analyze(segs: &[PathBuf], want: usize, shape: Shape, comp: f64, sweep: bool) 
         cell.keys += n;
         // The pages.
         let (mut rank, mut hint) = (0usize, 0usize);
+        let mut counts: Vec<usize> = Vec::new();
         while rank < n {
             let mut page = [0u8; ZPAGE];
             let t = Instant::now();
@@ -293,6 +326,7 @@ fn analyze(segs: &[PathBuf], want: usize, shape: Shape, comp: f64, sweep: bool) 
                     cell.meta.push((rank as u32, g.count as u32, key));
                     cell.pages.push(page);
                     cell.groups.push(g);
+                    counts.push(g.count);
                     rank += g.count;
                     hint = g.count;
                 }
@@ -302,6 +336,15 @@ fn analyze(segs: &[PathBuf], want: usize, shape: Shape, comp: f64, sweep: bool) 
                 }
                 other => panic!("partition {pi} rank {rank}: {other:?}"),
             }
+        }
+        // The first page of a partition is built with no hint and the last
+        // holds what is left, so a count over every page of a run of a few
+        // pages reads far under the steady state, and a stop rule evaluated
+        // over it stops a run that has not yet got going.
+        if counts.len() > 2 {
+            let mid = &counts[1..counts.len() - 1];
+            cell.steady.0 += mid.iter().sum::<usize>() as u64;
+            cell.steady.1 += mid.len() as u64;
         }
         // The knob, over the first partition.
         if sweep && pi == 0 {
@@ -352,13 +395,25 @@ fn ns_of<F: FnMut()>(reps: u32, mut f: F) -> f64 {
 /// Drop a page's lines from every level of the cache, so the decode that
 /// follows reads them from memory as a read of a page that was just faulted
 /// in does. Only where the instruction exists.
+///
+/// From the line that holds the page's first byte to the line that holds its
+/// last: the pages sit in a `Vec<[u8; ZPAGE]>`, whose alignment is a byte's,
+/// so a page is not promised to begin on a line, and one that does not spans
+/// a line more than its size, which a flush of sixty-four chunks from its
+/// start leaves hot.
 fn evict(page: &[u8; ZPAGE]) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         use std::arch::x86_64::{_mm_clflush, _mm_mfence};
-        for line in page.chunks(64) {
-            // SAFETY: a flush of a line inside a live slice.
-            unsafe { _mm_clflush(line.as_ptr()) };
+        let first = page.as_ptr();
+        let end = first.wrapping_add(page.len());
+        let mut line = first.wrapping_sub(first as usize % 64);
+        while line < end {
+            // SAFETY: a flush of the line that holds a byte of a live slice;
+            // a line lies within one page of the address space, so the bytes
+            // of it that are a neighbour's are mapped and only made cold.
+            unsafe { _mm_clflush(line) };
+            line = line.wrapping_add(64);
         }
         // SAFETY: a fence.
         unsafe { _mm_mfence() };
@@ -504,7 +559,7 @@ fn occupancy(cell: &Cell) -> (f64, f64, f64, f64) {
     let first_key =
         cell.meta.iter().map(|m| m.2.len()).sum::<usize>() as f64 / cell.meta.len() as f64;
     let fence = pages * (12.0 + first_key) + 4.0;
-    let filter = (CELL_KEYS * FILTER_BITS_PER_KEY / 512.0).ceil() * 64.0;
+    let filter = filter_bytes(CELL_KEYS as usize) as f64;
     let resident = fence + filter + ZTRAILER as f64;
     let pages_bytes = pages * ZPAGE as f64;
     (
@@ -565,6 +620,19 @@ fn main() {
         );
         std::process::exit(3);
     }
+    // The encoder this build links, by what it makes of the input the sizes
+    // were pinned on. The suite is its own workspace with its own lock, so
+    // the engine's tests say nothing of the codec this binary carries.
+    let pin = lz4_encoder_pin();
+    println!("encoder pin: {pin:?} (bytes in, bytes out, crc of them); the pin the sizes were taken with: {LZ4_ENCODER_PIN:?}");
+    if pin != LZ4_ENCODER_PIN {
+        eprintln!(
+            "the encoder this build links makes other bytes than the sizes were taken with: \
+             what is printed below is not comparable with them until the sizing is taken again \
+             and the pin (supdb::db::zpages::LZ4_ENCODER_PIN) moved"
+        );
+        std::process::exit(3);
+    }
     println!(
         "{keys} keys a cell, values of 100 bytes, partitions under {}, timing {} ({rounds} rounds of {SAMPLE} sampled pages)\n",
         dir.display(),
@@ -576,15 +644,20 @@ fn main() {
         for &comp in &comps {
             let ks = shape.keys(keys, 7);
             let payload = Payload::new(100, comp, 0xE1);
-            let work = dir.join(format!(
-                "supdb-zsize-{}-{}-{comp}",
+            // Named so that the cleanup the repository documents
+            // (`supdb-next-*` under the temp directory) takes it, and removed
+            // when it goes out of scope, a failed assertion mid-cell included:
+            // a store of tens of megabytes left on a disk with a fixed
+            // allowance is what a check that fails must not cost.
+            let work = Work(dir.join(format!(
+                "supdb-next-zsize-{}-{}-{comp}",
                 std::process::id(),
                 shape.name()
-            ));
-            let segs = load(&work, &ks, &payload);
+            )));
+            let segs = load(&work.0, &ks, &payload);
             let sweep = shape == Shape::Seq && (comp - 0.5).abs() < 1e-9;
             let cell = analyze(&segs, keys, shape, comp, sweep);
-            let _ = std::fs::remove_dir_all(&work);
+            drop(work);
             let times = timing.then(|| time_cell(&cell, rounds));
             eprintln!("done: {} comp {comp}", shape.name());
             cells.push((cell, times));
@@ -670,7 +743,8 @@ fn main() {
                 t.sampled,
             );
         }
-        println!("  decode: the LZ4 block into the buffer (stored pages are lent in place and not in the median); cold: the page's lines flushed first;");
+        println!("  decode: the LZ4 block into the buffer (stored pages are lent in place and not in the median); cold: the page's lines flushed first, the buffer it decodes into warm,");
+        println!("  one call timed by a pair of clock reads that is in the figure; the fault that brings a page in is not, so cold is the decode's share of a first read, a quantity of its own and not a second reading of the hot column;");
         println!("  find: the walk to one key, averaged over the page's keys; walk: the walk past every record; parse: the structural walk (parse_record);");
         println!("  crc: the page's checksum; verify: a reader's whole first decode of a page;");
         println!("  fill_group: the builder's call for the page, its compress calls and the decode and compare of the page it made, once, in the load's pass");
@@ -707,20 +781,39 @@ fn main() {
     }
     println!("  fill_group_s: the builder's fill_group calls at this many pages, one thread: the compress and the decode-compare of the build, not its read of the raw segment, the filter, the CRCs or the writes");
 
-    if let Some((c, _)) = cells
+    let suite = cells
         .iter()
         .find(|(c, _)| c.shape == Shape::Seq && c.comp == 0.5)
-    {
+        .map(|(c, _)| c);
+    if let Some(c) = suite {
         if !c.sweep.is_empty() {
             println!("\nGROWTH ROUNDS (the suite's shape, first partition, first hint 60)");
             for (r, rpp, fill, calls) in &c.sweep {
                 println!("  grow_rounds {r}: {rpp:.2} records a page, fill {fill:.4}, {calls:.3} compress calls a page");
             }
         }
-        let rpp = c.keys as f64 / c.pages.len() as f64;
-        if rpp < STOP_RPP {
-            println!("\nSTOP: {rpp:.2} records a page on the suite's shape is under {STOP_RPP}");
-            std::process::exit(2);
-        }
     }
+    // The stop rule says what it did on every run: a gate that speaks only
+    // when it fires cannot be told from one that did not run.
+    let unevaluated = |why: &str| -> ! {
+        println!("\nSTOP RULE: not evaluated: {why}");
+        eprintln!("the stop rule was not evaluated: {why}");
+        std::process::exit(4);
+    };
+    let Some(c) = suite else {
+        unevaluated("the suite's shape (seq-dec16 at compressibility 0.5) is not in this run")
+    };
+    let (records, pages) = c.steady;
+    if pages == 0 {
+        unevaluated(
+            "the suite's shape built no page between a partition's first and last, so there is \
+             no steady state to count (more keys)",
+        );
+    }
+    let rpp = records as f64 / pages as f64;
+    if rpp < STOP_RPP {
+        println!("\nSTOP: {rpp:.2} records a page on the suite's shape over {pages} page(s) of its steady state is under {STOP_RPP}");
+        std::process::exit(2);
+    }
+    println!("\nstop rule held: {rpp:.2} records a page on the suite's shape over {pages} page(s) of its steady state, not under {STOP_RPP}");
 }
