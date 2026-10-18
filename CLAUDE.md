@@ -297,12 +297,18 @@ their contents beside their buffers' capacity, the published and retired
 forms, the snapshots, the memtables by owner and the segments' derived
 caches, each structure once, the sum held against the allocator's bytes
 in use, which is how an owner nobody counted shows -- then `lagarenas`
-and `lagburstarenas` (the allocator's bytes by arena, which say whose
-frees the free bytes are) and `lagmaps` (the anonymous mappings by
-size). `SUPDB_LAG_TRIM=1` adds `lagtrim`, what a trim at that moment
-returns, and changes the points after it, so it is a probe of its own.
-The census reads the writer's tables and takes its upkeep home, so it
-stands after the pass and never between a burst and its scans.
+(the allocator's bytes by arena, which say whose frees the free bytes
+are) and `lagmaps` (the anonymous mappings by size). `SUPDB_LAG_TRIM=1`
+adds `lagtrim`, what a trim at that moment returns, and changes the
+points after it, so it is a probe of its own. The census reads the
+writer's tables and takes its upkeep home, so it stands after the pass
+and never between a burst and its scans. `lagburst` does stand between
+them, a read of a `/proc` file, and `SUPDB_LAG_ARENAS=1` adds
+`lagburstarenas` there, the arenas as they are at the burst's end:
+`malloc_info` walks every free chunk of every arena under the arena's
+lock, milliseconds with tens of thousands of chunks and the upkeep
+thread's allocations among the waits, so it is asked for and not given,
+and a run that counts is a run whose rates are not read.
 
 A copy taken off the writer's path is priced at every reader of the
 copy and in the phase that inherits its pages. The streamed table's
@@ -1986,30 +1992,40 @@ doubled a vector that held forty deltas into room for sixty-four. Nothing shed f
 budget was kept where a scan built a block, which a burst does not do, so a burst the upkeep thread
 kept pace with built the cache to the size of the store and the first scan after it shed the
 difference into the allocator's free lists. The shed of a block in another partition's table left
-the form it had published in the state, where a handle's read could take it; the suite never showed
-it, and a test with a small budget and a claimed handle builds the shape. And what the sheds freed
-stayed resident: a freed chunk goes back to the arena that allocated it, glibc gives an arena back
-only from its top, and the forms the upkeep thread built over a burst were freed by the writer's
-scans, 150 MB of 8 KB chunks in an arena that nothing allocated from any more, beside a cache a
-quarter of that size. `Options::forms_to_fit` counts by capacity, builds and grows to fit, sheds
-after a patch, retracts a shed's publication from any table, sweeps the retired lists at the end of
-an operation (which freed nothing the census could show) and has the segment work's thread trim the
-allocator after a stride of frees; the arm read a median of 578 over twelve reps, against 490 for
-its budget and the arm with no cache. The two halves were priced apart (the arm without the trim,
-`supdb-cache256tofitnotrim`): fitting took 133 MB off the pass's end and 189 off the bytes in use,
-and the trim the other 224. The rule: a budget is held against the allocator's bytes in use, by
-owner, before it is called a bound on anything, and against the process's anonymous bytes before it
-is called a bound on the process; a bound is kept at every site that grows what it bounds and not
-only at the one that builds; and the allocator's free bytes are read by arena, and as the resident
-bytes beyond use and not as `mallinfo2`'s free count, which counts pages it has already returned.
-What is left is not the forms': 112-226 MB of resident free bytes in every arm, the arm with no
-cache included, that the load's threads left in their arenas, and a write path that holds 60-260 MB
-beyond the cache while a seal in flight or a reader's pin holds what a publish replaced, which
-swings the same arm's pass by that much between reps: the rep that read 1,019 MB where its arm reads
-580 was 215 MB of snapshots and frozen tables beside the cache, a seal that had not landed, and the
-census said so. A request to the trim on builds as well as frees, to return the load's retention at
-a burst's start, read no lower and cost a look of 30 ms: refuted. Read a bound's effect as the
-median of several reps with the census of each, never from the rep that happened to be run.
+the form it had published in the state, where a handle's read could take it, and that was the
+engine's before the flag: under a budget small enough to shed, a claimed handle's scans answered the
+values from before a write (a checked build tripped its assertion at the write instead), and the
+suite never showed it because its harness does not check the values it reads and its lag sweep
+claims no handle; the retraction is unconditional now, and a test with a small budget and a claimed
+handle builds the shape. And what the sheds freed stayed resident: a freed chunk goes back to the
+arena that allocated it, glibc gives an arena back only from its top, and the forms the upkeep
+thread built over a burst were freed by the writer's scans, 150 MB of 8 KB chunks in an arena that
+nothing allocated from any more, beside a cache a quarter of that size. `Options::forms_to_fit`
+counts by capacity and builds and grows to fit, and carries three parts that are options of their
+own, so that each is priced by taking it away: the shed after a patch (`supdb-cache256tofitnoshed`),
+the sweep of the retired lists at the end of an operation (`...nosweep`) and the trim of the
+allocator, by a thread of its own, after a stride of frees (`...notrim`). The arm read a median of
+578 over twelve reps, against 490 for its budget and the arm with no cache, which has no trim, so
+some of the difference is the load's retention that the trim returns and not the forms'. Only the
+trim was priced apart then: fitting took 133 MB off the pass's end and 189 off the bytes in use, and
+the trim the other 224; the sweep, which had freed nothing the census could show, had a guard that
+compared the number waiting with the number its last sweep left and skipped on a match, which a pin
+that stays and a pin that has gone leave alike, so nothing swept again until a publish, and it
+retries on a span of operation ends now, unpriced. The rule: a budget is held against the
+allocator's bytes in use, by owner, before it is called a bound on anything, and against the
+process's anonymous bytes before it is called a bound on the process; a bound is kept at every site
+that grows what it bounds and not only at the one that builds; and the allocator's free bytes are
+read by arena, and as the resident bytes beyond use and not as `mallinfo2`'s free count, which
+counts pages it has already returned; and a fix for a wrong answer is not an arm, since the arm's
+off position is the bug and the default that runs with it off keeps it. What is left is not the
+forms': 112-226 MB of resident free bytes in every arm, the arm with no cache included, that the
+load's threads left in their arenas, and a write path that holds 60-260 MB beyond the cache while a
+seal in flight or a reader's pin holds what a publish replaced, which swings the same arm's pass by
+that much between reps: the rep that read 1,019 MB where its arm reads 580 was 215 MB of snapshots
+and frozen tables beside the cache, a seal that had not landed, and the census said so. A request to
+the trim on builds as well as frees, to return the load's retention at a burst's start, read no
+lower and cost a look of 30 ms: refuted. Read a bound's effect as the median of several reps with
+the census of each, never from the rep that happened to be run.
 
 ## Standing limitations
 
