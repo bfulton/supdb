@@ -1813,18 +1813,19 @@ pub struct Options {
     /// of it; the budget is kept where forms grow and not only where a
     /// scan builds one -- after a patch, which is the only thing that
     /// grows a form in a burst -- so a burst no longer builds the cache
-    /// to the size of the store for the first scan to shed; a block shed
-    /// from another partition's table retracts the form it published, as
-    /// a block shed from the one in hand does, where the published form
-    /// stayed in the state with a reader's handle free to take it; the
+    /// to the size of the store for the first scan to shed; the
     /// snapshots and forms a publish replaced are swept when the writer's
     /// operation ends and not at its next commit; and the allocator's
     /// free pages are given back after a stride of frees
     /// (`forms_trim_bytes`). Off: the contents are counted, the budget is
-    /// kept at a scan's build and an install, a shed in another
-    /// partition leaves its published form where it was, and nothing is
-    /// swept early or trimmed. Beside a budget this bounds the cache, and
-    /// without one it is the slack alone.
+    /// kept at a scan's build and an install, and nothing is swept early
+    /// or trimmed. Beside a budget this bounds the cache, and without one
+    /// it is the slack alone.
+    ///
+    /// A shed from another partition's table retracts the form it
+    /// published, as a shed from the table in hand does, whatever this
+    /// option says: left standing, the form was one the writer filed
+    /// nothing into, and a reader's handle took it as the block.
     pub forms_to_fit: bool,
     /// With `forms_to_fit`: the bytes of forms a handle frees, by a shed or
     /// by dropping its tables, between the times the segment work's thread
@@ -16474,10 +16475,15 @@ impl Reader {
                 }
                 let c = t.slots[b].take().expect("checked");
                 // What was published for the block goes with it, as it
-                // does from the table in hand (`unlist`): a form left in
-                // the state is a form a reader's handle takes as the
-                // block, current to nothing the writer files from here.
-                if self.opts.forms_to_fit && self.opts.commit_forms && self.slot.is_none() {
+                // does from the table in hand (`unlist`), whatever else is
+                // set: a form left in the state is one a reader's handle
+                // takes as the block, current to nothing the writer files
+                // from here, and the first write into the block trips the
+                // check in `settle_each` that a block the writer holds no
+                // form for has none published. This branch once took the
+                // slot and the bytes and nothing else, so a budget alone
+                // left the form standing.
+                if self.opts.commit_forms && self.slot.is_none() {
                     self.publish_marker(p, b);
                 }
                 let bytes = self.fbytes(&c);
