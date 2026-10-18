@@ -3029,9 +3029,13 @@ mod tests {
     /// each key's one value, every entry of every scan, on two threads.
     /// What it pins is the handle each adapter hands a thread -- supdb's
     /// under `Latest` after the load's last commit, on the durable arm
-    /// and on the ingest arm whose keys took the ordered path; LMDB's
-    /// transaction begun on the thread after the writes; RocksDB's shared
-    /// handle -- since a reader over the wrong state would post a
+    /// and on the ingest arm whose keys took the ordered path, and on the
+    /// arm whose handles read the partitions through their ordered
+    /// indexes, where a key the index placed wrongly would read short and
+    /// whose handles' counts must reach the store's counters from the
+    /// threads that drop them; LMDB's transaction begun on the thread
+    /// after the writes; RocksDB's
+    /// shared handle -- since a reader over the wrong state would post a
     /// throughput like any other, and the runner's own check would be
     /// the first to say so, after the load it had paid for.
     #[test]
@@ -3042,7 +3046,13 @@ mod tests {
         let plan = Plan::new(Scale::Quick, vec![], 10_000, 4);
         let payload = Payload::new(plan.value_size, plan.compress, 0xE1);
         let size = 2_000u64;
-        for arm in ["supdb", "supdb-ingest", "lmdb", "rocksdb-tuned"] {
+        for arm in [
+            "supdb",
+            "supdb-ingest",
+            "supdb-nocacheordread",
+            "lmdb",
+            "rocksdb-tuned",
+        ] {
             let dir = root.join(arm);
             std::fs::create_dir_all(&dir).unwrap();
             let mut e = engines::open(arm, &dir, 1).unwrap();
@@ -3057,6 +3067,25 @@ mod tests {
             // In core, the threads' own device reads and major faults
             // over a store just written are nothing or next to it.
             assert!(got.own.0 < 1 << 20, "{arm}: {} device bytes", got.own.0);
+            // The arm that reads through the ordered index counts what its
+            // threads' handles answered, handed to the store as each
+            // thread drops its handle at the end of the pass, so the
+            // counters read after a pass carry the whole of it. The other
+            // supdb arms report none, and the comparators no counters.
+            let handles_read = e
+                .counters()
+                .iter()
+                .find(|(n, _)| *n == "ord_point_reads_threads")
+                .map(|(_, v)| *v);
+            match arm {
+                "supdb-nocacheordread" => assert_eq!(
+                    handles_read,
+                    Some(size as f64),
+                    "{arm}: the threads' reads reach the counters"
+                ),
+                "supdb" | "supdb-ingest" => assert_eq!(handles_read, Some(0.0), "{arm}"),
+                _ => assert_eq!(handles_read, None, "{arm}"),
+            }
             let scans = size / plan.scan_len as u64;
             let got = threaded(
                 e.as_ref(),

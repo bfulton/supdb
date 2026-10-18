@@ -650,6 +650,43 @@ pub struct Supdb {
     /// (`Options::upkeep_lag_pct`, `Options::upkeep_batch_pct`):
     /// `supdb-bglag`, and `supdb-ingestbglag` buffered.
     bglag: bool,
+    /// A point read of a partition through its ordered index rather than
+    /// its hash (`Options::point_via_ord`). `supdb-nocacheordread`, the
+    /// nocache policy alone: the form is for a store that does not fit.
+    ordread: bool,
+    /// What the reader handles this store gave its threads answered
+    /// through the ordered index, summed as each is dropped
+    /// (`OrdTally`); only the arm that reads that way hands out handles
+    /// that sum.
+    ord_threads: std::sync::Arc<OrdTally>,
+}
+
+/// The ordered-index point reads of the reader handles a threaded pass
+/// hands its threads. A handle's own count (`supdb::Reader::ord_point_reads`)
+/// dies with it, and a pass drops its handles before the store's counters
+/// are read, so the threaded cells of a pairing would print nothing of
+/// whether they took the path the single-threaded cell did.
+#[derive(Default)]
+struct OrdTally {
+    served: std::sync::atomic::AtomicU64,
+    declined: std::sync::atomic::AtomicU64,
+}
+
+/// A thread's reader on the arm that reads through the ordered index: the
+/// handle, and its counts handed to the store's tally when it is dropped,
+/// which is after the thread's clock has stopped and not once per read.
+struct TallyReader {
+    r: supdb::Reader,
+    tally: std::sync::Arc<OrdTally>,
+}
+
+impl Drop for TallyReader {
+    fn drop(&mut self) {
+        let (served, declined) = self.r.ord_point_reads();
+        let relaxed = std::sync::atomic::Ordering::Relaxed;
+        self.tally.served.fetch_add(served, relaxed);
+        self.tally.declined.fetch_add(declined, relaxed);
+    }
 }
 
 /// What an arm differs from `supdb` by. One struct rather than a row of
@@ -975,6 +1012,9 @@ struct Policy {
     /// (`Options::upkeep_lag_pct`, `Options::upkeep_batch_pct`):
     /// `supdb-bglag`, and `supdb-ingestbglag` buffered.
     bglag: bool,
+    /// A point read of a partition through its ordered index
+    /// (`Options::point_via_ord`): `supdb-nocacheordread`.
+    ordread: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -1063,6 +1103,7 @@ impl Default for Policy {
             behindyield: false,
             bg: false,
             bglag: false,
+            ordread: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -3175,6 +3216,22 @@ impl Supdb {
         )
     }
 
+    /// `supdb-nocache` with a point read of a partition made through its
+    /// ordered index rather than its hash (`Options::point_via_ord`):
+    /// the pair against `supdb-nocache` differs by that one option and
+    /// prices what the hash costs the records' share of the cache out of
+    /// core. Chosen by hand, as `ab --arms supdb-nocache,supdb-nocacheordread`.
+    pub fn create_nocache_ordread(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                block_cache: false,
+                ordread: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with the block cache bounded at 256 MB, the budget
     /// `rocksdb-tuned` runs its block cache on, so that comparison is on
     /// the same memory. Below the bound the two arms are one.
@@ -3283,6 +3340,7 @@ impl Supdb {
             behindyield,
             bg,
             bglag,
+            ordread,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -3480,6 +3538,7 @@ impl Supdb {
             writer_pins: !nopin,
             asym_pins: asympin,
             exts_by_value: extsval,
+            point_via_ord: ordread,
             forms_pieces_only: piecesonly,
             // Unpinned, the writer must be the one publisher, as it was
             // when the pins were priced: the store refuses the pair.
@@ -3616,6 +3675,8 @@ impl Supdb {
             behindyield,
             bg,
             bglag,
+            ordread,
+            ord_threads: Default::default(),
         })
     }
 }
@@ -3674,6 +3735,15 @@ impl ThreadReader for supdb::Reader {
     }
     fn range(&mut self, from: &[u8], n: usize) -> Res<usize> {
         supdb_range(self, from, n)
+    }
+}
+
+impl ThreadReader for TallyReader {
+    fn get(&mut self, key: &[u8]) -> Res<usize> {
+        supdb_get(&self.r, key)
+    }
+    fn range(&mut self, from: &[u8], n: usize) -> Res<usize> {
+        supdb_range(&self.r, from, n)
     }
 }
 
@@ -4181,6 +4251,11 @@ impl Engine for Supdb {
         if !self.partition && !self.drain {
             return "supdb-ingestsync";
         }
+        // Before the match below, which would name the nocache policy
+        // `supdb-nocache` whatever else it carries.
+        if self.ordread {
+            return "supdb-nocacheordread";
+        }
         match (
             self.partition,
             self.drain,
@@ -4247,6 +4322,7 @@ impl Engine for Supdb {
         let cs = db.copy_starts();
         let ph = db.scan_phases();
         let uk = db.upkeep_counts();
+        let ord = db.ord_point_reads();
         vec![
             ("snapshot_builds", db.snapshot_builds() as f64),
             ("snapshot_extends", db.snapshot_extends() as f64),
@@ -4335,6 +4411,26 @@ impl Engine for Supdb {
             ("forms_cloned", db.forms_cloned() as f64),
             ("forms_rebased", db.forms_rebased() as f64),
             ("pin_barriers", uk[10] as f64),
+            // Point reads of a partition answered through its ordered
+            // index, and the ones that left it for the hash: the writer's
+            // own handle's (`Db::ord_point_reads`), so the arm that reads
+            // through the index shows the path was taken and the arm that
+            // does not shows none. The reader handles of the threaded
+            // passes count apart, summed as each is dropped.
+            ("ord_point_reads", ord.0 as f64),
+            ("ord_point_declined", ord.1 as f64),
+            (
+                "ord_point_reads_threads",
+                self.ord_threads
+                    .served
+                    .load(std::sync::atomic::Ordering::Relaxed) as f64,
+            ),
+            (
+                "ord_point_declined_threads",
+                self.ord_threads
+                    .declined
+                    .load(std::sync::atomic::Ordering::Relaxed) as f64,
+            ),
         ]
     }
     fn thread_reader(&self) -> Res<ReaderOpener> {
@@ -4343,6 +4439,12 @@ impl Engine for Supdb {
         // table. `Latest`, the handle's default, sees every commit before
         // a read, and the load's last is behind `sync`.
         let r = db.reader().map_err(|e| e.to_string())?;
+        if self.ordread {
+            let tally = self.ord_threads.clone();
+            return Ok(Box::new(move || {
+                Ok(Box::new(TallyReader { r, tally }) as Box<dyn ThreadReader>)
+            }));
+        }
         Ok(Box::new(move || Ok(Box::new(r) as Box<dyn ThreadReader>)))
     }
     fn sync(&mut self) -> Res<()> {
@@ -4865,6 +4967,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nosnap"
         | "supdb-noadvice"
         | "supdb-nocache"
+        | "supdb-nocacheordread"
         | "supdb-cache256"
         | "supdb-l0"
         | "supdb-nopin"
@@ -5035,6 +5138,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nosnap" => Box::new(Supdb::create_nosnap(dir)?),
         "supdb-noadvice" => Box::new(Supdb::create_noadvice(dir)?),
         "supdb-nocache" => Box::new(Supdb::create_nocache(dir)?),
+        "supdb-nocacheordread" => Box::new(Supdb::create_nocache_ordread(dir)?),
         "supdb-cache256" => Box::new(Supdb::create_cache256(dir)?),
         "supdb-ingest" => Box::new(Supdb::create_ingest(dir)?),
         "supdb-ingestleave" => Box::new(Supdb::create_ingest_leave(dir)?),
@@ -5359,6 +5463,143 @@ mod tests {
             let e = open(name, &opened_d, 1).unwrap();
             assert_eq!(e.name(), name, "the dispatch");
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `supdb-nocacheordread` is the nocache policy with `ordread` alone
+    /// set over `supdb-nocache`: named, durable like it, opened under its
+    /// name by the dispatch, and opened on options that differ from
+    /// `supdb-nocache`'s in `point_via_ord` alone among the read path's and
+    /// the policy's (`CLAUDE.md`: an arm that keeps an old shape keeps
+    /// that shape's other settings with it). And the path is taken: the
+    /// same keys written and read through each, the arm's reads are
+    /// answered through the partition's ordered index and the base's are
+    /// not, and the counters a pairing prints say so, for the writer's
+    /// handle and for the handles a threaded pass hands its threads.
+    #[test]
+    fn the_ordread_arm_differs_from_nocache_in_the_partition_read_path_alone() {
+        let root = std::env::temp_dir().join(format!("supdb-bench-ordread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let new = |name: &str, arm: bool| {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            if arm {
+                Supdb::create_nocache_ordread(&d)
+            } else {
+                Supdb::create_nocache(&d)
+            }
+            .unwrap()
+        };
+        let (mut arm, mut base) = (new("arm", true), new("base", false));
+        assert_eq!(arm.name(), "supdb-nocacheordread");
+        assert_eq!(base.name(), "supdb-nocache");
+        assert_eq!(guarantee("supdb-nocacheordread"), Some(Guarantee::Durable));
+        assert_eq!(
+            guarantee("supdb-nocacheordread"),
+            guarantee("supdb-nocache")
+        );
+        assert!(arm.ordread && !base.ordread);
+        // The policy: every flag the arm could have set beside its own.
+        assert_eq!(arm.partition, base.partition, "the row's shape");
+        assert_eq!(arm.drain, base.drain);
+        assert_eq!(arm.durable, base.durable, "the row's guarantee");
+        assert_eq!(arm.block_cache, base.block_cache);
+        assert!(!arm.block_cache, "the nocache policy");
+        assert_eq!(arm.budget, base.budget);
+        assert_eq!(arm.advice, base.advice);
+        assert_eq!(arm.features(), base.features());
+        assert!(!arm.extsval && !arm.dirplain && !arm.forms && !arm.lazyforms);
+        let (a, b) = (
+            arm.db.as_ref().unwrap().options(),
+            base.db.as_ref().unwrap().options(),
+        );
+        assert!(a.point_via_ord && !b.point_via_ord, "the one option");
+        assert_eq!(a.exts_by_value, b.exts_by_value);
+        assert_eq!(a.scan_block_cache, b.scan_block_cache);
+        assert_eq!(a.scan_cache_bytes, b.scan_cache_bytes);
+        assert_eq!(a.read_advice, b.read_advice);
+        assert_eq!(a.seek_prefetch_dir, b.seek_prefetch_dir);
+        assert_eq!(a.scan_prefetch, b.scan_prefetch);
+        assert_eq!(a.inline_bytes, b.inline_bytes);
+        assert_eq!(a.partition_bytes, b.partition_bytes);
+        assert_eq!(a.seal_bytes, b.seal_bytes);
+        assert_eq!(a.compact, b.compact);
+        assert_eq!(a.promote, b.promote);
+        assert_eq!(a.sync, b.sync);
+        assert_eq!(a.upkeep, b.upkeep);
+        assert_eq!(a.writer_pins, b.writer_pins);
+        assert_eq!(a.publish_in_background, b.publish_in_background);
+        // The default is untouched: the shipping arm reads as it always did.
+        assert!(!supdb::Options::default().point_via_ord);
+
+        // The path is taken by the arm and by nothing else. Keys of the
+        // suite's shape, in key order, drained into a partition.
+        let value = [7u8; 100];
+        let keys: Vec<[u8; 16]> = (0..20_000u64)
+            .map(|i| {
+                let mut k = [0u8; 16];
+                crate::workload::db_key_into(i, &mut k);
+                k
+            })
+            .collect();
+        for e in [&mut arm, &mut base] {
+            for chunk in keys.chunks(1_000) {
+                let items: Vec<(&[u8], &[u8])> =
+                    chunk.iter().map(|k| (&k[..], &value[..])).collect();
+                e.write_batch(&items).unwrap();
+            }
+            e.sync().unwrap();
+            assert!(e.db.as_ref().unwrap().levels().0 >= 1, "a partition");
+        }
+        let (mut reads, absent) = (0f64, [0xffu8; 16]);
+        for k in keys.iter().step_by(7) {
+            assert_eq!(arm.get(k).unwrap(), value.len());
+            assert_eq!(base.get(k).unwrap(), value.len());
+            reads += 1.0;
+        }
+        assert_eq!(arm.get(&absent).unwrap(), 0);
+        assert_eq!(base.get(&absent).unwrap(), 0);
+        reads += 1.0;
+        let count = |e: &Supdb, name: &str| {
+            e.counters()
+                .iter()
+                .find(|(n, _)| *n == name)
+                .unwrap_or_else(|| panic!("no counter {name}"))
+                .1
+        };
+        assert_eq!(count(&arm, "ord_point_reads"), reads, "every read");
+        assert_eq!(count(&arm, "ord_point_declined"), 0.0);
+        assert_eq!(count(&base, "ord_point_reads"), 0.0, "the default's path");
+        assert_eq!(count(&base, "ord_point_declined"), 0.0);
+        assert_eq!(count(&arm, "ord_point_reads_threads"), 0.0, "no handle yet");
+
+        // The handles a threaded pass hands its threads count apart, and
+        // what each answered reaches the store's counters when it is
+        // dropped, so the threaded cells of a pairing print whether they
+        // took the path. A handle on each store reads the same keys, and
+        // the writer's own words stay where they were.
+        let handle_reads = (keys.iter().step_by(11).count() + 1) as f64;
+        for e in [&arm, &base] {
+            let mut r = (e.thread_reader().unwrap())().unwrap();
+            for k in keys.iter().step_by(11) {
+                assert_eq!(r.get(k).unwrap(), value.len());
+            }
+            assert_eq!(r.get(&absent).unwrap(), 0);
+            drop(r);
+        }
+        assert_eq!(count(&arm, "ord_point_reads_threads"), handle_reads);
+        assert_eq!(count(&arm, "ord_point_declined_threads"), 0.0);
+        assert_eq!(count(&base, "ord_point_reads_threads"), 0.0);
+        assert_eq!(count(&base, "ord_point_declined_threads"), 0.0);
+        assert_eq!(count(&arm, "ord_point_reads"), reads, "the writer's own");
+        drop(arm);
+        drop(base);
+        // The dispatch opens the arm by its name.
+        let opened = root.join("open");
+        std::fs::create_dir_all(&opened).unwrap();
+        let e = open("supdb-nocacheordread", &opened, 1).unwrap();
+        assert_eq!(e.name(), "supdb-nocacheordread", "the dispatch");
+        drop(e);
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -134,7 +134,18 @@ fn remove_manifests(d: &std::path::Path) {
 
 fn read_vec(db: &Reader, key: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
-    db.read_all(key, |v| out.push(v.to_vec())).unwrap();
+    let n = db.read_all(key, |v| out.push(v.to_vec())).unwrap();
+    // The number `read_all` returns is how many values it handed over. A
+    // path that works the number out by another route than the one that
+    // delivers the values (the point read through the ordered index asks
+    // the segment for the values of a rank) is held to it by every read
+    // in this file, and not only by the values compared.
+    assert_eq!(
+        n,
+        out.len() as u64,
+        "read_all's count against the values it delivered, key {:?}",
+        String::from_utf8_lossy(key)
+    );
     out
 }
 
@@ -896,6 +907,655 @@ fn a_segment_whose_ordered_index_is_missing_or_damaged_rebuilds_it_at_open() {
     let db = Db::open(&d, no_merge()).unwrap();
     assert_eq!(db.ord_rebuilt(), 0);
     db.close().unwrap();
+}
+
+// ------------------------------------- point reads through the ordered index --
+//
+// `Options::point_via_ord` changes the path of a point read of a partition
+// and nothing it returns, so what these hold it to is the model, the same
+// files read without the option, and a count that says the path was taken
+// where it can be and was not where it cannot or was not asked for: "a
+// path only one arm exercises is a path nothing tests".
+
+/// How a fixture's keys are cut, which is what `OrdIndex::uniform` asks of
+/// a partition.
+#[derive(Clone, Copy, Debug)]
+enum OrdShape {
+    /// One short length: a head is a whole key.
+    Short,
+    /// Two lengths, which can share a head.
+    Mixed,
+    /// One length past the common prefix and a head.
+    Wide,
+    /// One length that fills the prefix and a head exactly, in bytes of
+    /// zero, 0x7f and 0xff: a key that ends in a zero byte is the key a
+    /// head cannot tell from its own proper prefix, which pads with zeros.
+    Binary,
+}
+
+fn ord_key(shape: OrdShape, k: u32) -> Vec<u8> {
+    match shape {
+        OrdShape::Short => format!("key-{k:05}").into_bytes(),
+        OrdShape::Mixed if k.is_multiple_of(7) => format!("key-{k:05}x").into_bytes(),
+        OrdShape::Mixed => format!("key-{k:05}").into_bytes(),
+        OrdShape::Wide => {
+            format!("{:08x}-{k:05}-a-wide-key", k.wrapping_mul(2_654_435_761)).into_bytes()
+        }
+        // Eight base-three digits of `k`, the most significant first and
+        // each one of three bytes in the order of the digits, behind two
+        // bytes of prefix: keys sort as `k` does, and a third of them end
+        // in a zero byte and a third in 0xff. Four thousand keys put the
+        // top digit at zero in some and one in others, so the prefix the
+        // first and last keys share is the two bytes and the keys fill it
+        // and a head to the byte.
+        OrdShape::Binary => {
+            let mut key = b"bn".to_vec();
+            for i in (0..8u32).rev() {
+                key.push([0x00, 0x7f, 0xff][(k / 3u32.pow(i) % 3) as usize]);
+            }
+            key
+        }
+    }
+}
+
+/// A store built by one fixed run of operations, and what it holds: a
+/// partition of the even keys, a level-0 piece beside it with tombstones,
+/// and a memtable over both, so that a read consults all three.
+struct OrdFixture {
+    db: Db,
+    model: BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
+    /// The keys a tombstone newer than the partition covers: a read of
+    /// one does not ask the partition.
+    masked: BTreeSet<Vec<u8>>,
+}
+
+fn ord_fixture(name: &str, shape: OrdShape, via_ord: bool) -> OrdFixture {
+    // The first flush makes the store's partition, whole, under its own
+    // name. The second step is a seal and not a flush: a flush drains, and
+    // a drain merges every piece into its partition, tombstones with them,
+    // where a lone seal leaves its piece beside the partition until
+    // `l0_trigger` of them pile up.
+    let mut db = Db::create(
+        &dir(name),
+        Options {
+            point_via_ord: via_ord,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    let mut masked = BTreeSet::new();
+    let key = |k: u32| ord_key(shape, k);
+    // The partition: the even keys, three values at every tenth, one
+    // empty value at some, and at others one past the inline limit, which
+    // lives in a block.
+    for k in (0u32..4_000).step_by(2) {
+        let mut vals = vec![format!("v1-{k}").into_bytes()];
+        if k.is_multiple_of(10) {
+            vals.push(format!("v1b-{k}").into_bytes());
+            vals.push(format!("v1c-{k}").into_bytes());
+        }
+        if k % 100 == 50 {
+            vals = vec![Vec::new()];
+        }
+        if k % 500 == 100 {
+            vals.push(vec![b'x'; 3_000]);
+        }
+        for v in vals {
+            db.append(&key(k), &v);
+            model.entry(key(k)).or_default().push(v);
+        }
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.levels(), (1, 0), "{shape:?}: a partition, no piece");
+    // The piece: tombstones, a value after some, a second value on some
+    // partition keys, and keys the partition lacks.
+    for k in 0u32..4_000 {
+        if k.is_multiple_of(12) {
+            db.delete(&key(k));
+            masked.insert(key(k));
+            model.insert(key(k), Vec::new());
+            if k.is_multiple_of(24) {
+                let v = format!("v2-{k}").into_bytes();
+                db.append(&key(k), &v);
+                model.get_mut(&key(k)).unwrap().push(v);
+            }
+        } else if k % 12 == 6 || k % 12 == 3 {
+            let v = format!("v2-{k}").into_bytes();
+            db.append(&key(k), &v);
+            model.entry(key(k)).or_default().push(v);
+        }
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.settle().unwrap();
+    assert_eq!(db.levels(), (1, 1), "{shape:?}: a piece beside it");
+    // The memtable: tombstones over both, a value after some, a value more
+    // on some keys, and keys nothing else holds, among them two outside
+    // every other key's range and ten above the partition's last.
+    for k in 0u32..4_010 {
+        if k % 16 == 4 {
+            db.delete(&key(k));
+            masked.insert(key(k));
+            model.insert(key(k), Vec::new());
+            if k % 32 == 4 {
+                let v = format!("v3-{k}").into_bytes();
+                db.append(&key(k), &v);
+                model.get_mut(&key(k)).unwrap().push(v);
+            }
+        } else if k % 16 == 8 || k % 16 == 5 {
+            let v = format!("v3-{k}").into_bytes();
+            db.append(&key(k), &v);
+            model.entry(key(k)).or_default().push(v);
+        }
+    }
+    for k in [&b"aaa-1"[..], b"zzz-1"] {
+        db.append(k, b"edge");
+        model.entry(k.to_vec()).or_default().push(b"edge".to_vec());
+    }
+    db.commit().unwrap();
+    OrdFixture { db, model, masked }
+}
+
+/// Every key the fixture touched, and what is not a key beside them: a
+/// proper prefix, a key a byte longer, the bytes either side, and the
+/// extremes.
+fn ord_probes(shape: OrdShape) -> Vec<Vec<u8>> {
+    let mut v: Vec<Vec<u8>> = (0u32..4_010).map(|k| ord_key(shape, k)).collect();
+    // Every key of the binary shape: the ones that end in a zero byte are a
+    // third of them, and the key a byte shorter ties the head of each.
+    let step = if matches!(shape, OrdShape::Binary) {
+        1
+    } else {
+        37
+    };
+    for k in (0u32..4_010).step_by(step) {
+        let key = ord_key(shape, k);
+        v.push(key[..key.len() - 1].to_vec());
+        for tail in [0u8, 0xff, b'x'] {
+            let mut longer = key.clone();
+            longer.push(tail);
+            v.push(longer);
+        }
+        let mut down = key.clone();
+        let last = down.last_mut().unwrap();
+        *last = last.wrapping_sub(1);
+        v.push(down);
+        let mut up = key.clone();
+        let last = up.last_mut().unwrap();
+        *last = last.wrapping_add(1);
+        v.push(up);
+    }
+    for k in [
+        &b""[..],
+        b"a",
+        b"aaa-1",
+        b"key",
+        b"key-",
+        b"key-0",
+        b"key-99999",
+        b"zzz-1",
+        b"zzzz",
+        &[0u8],
+        &[0xff; 8],
+    ] {
+        v.push(k.to_vec());
+    }
+    v
+}
+
+/// The same store read with the option and without answers every key as
+/// the model does -- the partition's values, the piece's, the memtable's,
+/// tombstones over each, keys of several values, empty values and values
+/// in blocks, keys no source holds, a prefix of a key, a longer one -- and
+/// the count says the ordered path was taken where the partition's keys
+/// are whole heads, for every read a tombstone does not turn away from the
+/// partition, and was not taken where they are not, or where the option is
+/// off. The count is exact, so a read the heads answered wrongly and the
+/// record check turned back to the hash shows as a decline: the binary
+/// shape's keys end in zero bytes, where a key a byte shorter pads to the
+/// same head and the flag has to say it is not the key.
+#[test]
+fn a_point_read_through_the_ordered_index_answers_as_the_hash_does() {
+    assert!(!Options::default().point_via_ord, "an arm, not the default");
+    for shape in [
+        OrdShape::Short,
+        OrdShape::Mixed,
+        OrdShape::Wide,
+        OrdShape::Binary,
+    ] {
+        let on = ord_fixture(&format!("ordread-on-{shape:?}"), shape, true);
+        let off = ord_fixture(&format!("ordread-off-{shape:?}"), shape, false);
+        assert_eq!(on.model, off.model, "{shape:?}: one store written twice");
+        let probes = ord_probes(shape);
+        let show = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
+        let want = |p: &[u8]| on.model.get(p).cloned().unwrap_or_default();
+        for p in &probes {
+            assert_eq!(read_vec(&on.db, p), want(p), "{shape:?}, on: {}", show(p));
+            assert_eq!(read_vec(&off.db, p), want(p), "{shape:?}, off: {}", show(p));
+            assert_eq!(
+                on.db.count(p).unwrap(),
+                want(p).len() as u64,
+                "{shape:?}: the count of {}",
+                show(p)
+            );
+        }
+        let reads = probes.len() as u64;
+        let masked_reads = probes.iter().filter(|p| on.masked.contains(*p)).count() as u64;
+        assert!(masked_reads > 100, "{shape:?}: tombstones turn reads away");
+        match shape {
+            // Every read a tombstone does not turn away asks the partition,
+            // and its heads answer.
+            OrdShape::Short | OrdShape::Binary => assert_eq!(
+                on.db.ord_point_reads(),
+                (reads - masked_reads, 0),
+                "{shape:?}"
+            ),
+            // Two lengths, or keys longer than a head: the hash answers.
+            _ => assert_eq!(on.db.ord_point_reads(), (0, 0), "{shape:?}"),
+        }
+        assert_eq!(off.db.ord_point_reads(), (0, 0), "{shape:?}: off");
+        // A handle answers the same and counts apart.
+        let before = on.db.ord_point_reads();
+        let r = on.db.reader().unwrap();
+        assert_eq!(r.ord_point_reads(), (0, 0), "{shape:?}: a fresh handle");
+        for p in &probes {
+            assert_eq!(read_vec(&r, p), want(p), "{shape:?}, handle: {}", show(p));
+        }
+        assert_eq!(r.ord_point_reads(), before, "{shape:?}: the handle's own");
+        assert_eq!(on.db.ord_point_reads(), before, "{shape:?}: the writer's");
+    }
+}
+
+/// Several partitions, each with an index of its own and a fence: every
+/// key reads through the index of the partition its fence names.
+#[test]
+fn each_partition_of_a_store_reads_through_its_own_ordered_index() {
+    let keys = 3_000u32;
+    let key = |k: u32| format!("key-{k:05}").into_bytes();
+    // A hundred bytes a value, so that 64 KB of partition is a few hundred
+    // keys.
+    let value = |k: u32| format!("v-{k:090}").into_bytes();
+    let build = |name: &str, via_ord: bool| {
+        let mut db = Db::create(
+            &dir(name),
+            Options {
+                partition_bytes: Some(64 << 10),
+                l0_trigger: 2,
+                point_via_ord: via_ord,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        for k in 0..keys {
+            db.append(&key(k), &value(k));
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        db
+    };
+    let on = build("ordread-parts-on", true);
+    let off = build("ordread-parts-off", false);
+    assert!(on.levels().0 > 2, "several partitions: {:?}", on.levels());
+    // The fences' edges are where a read could ask the wrong partition.
+    for k in (0..keys).chain([keys, keys + 1]) {
+        let want: Vec<Vec<u8>> = if k < keys { vec![value(k)] } else { Vec::new() };
+        assert_eq!(read_vec(&on, &key(k)), want, "key {k}, on");
+        assert_eq!(read_vec(&off, &key(k)), want, "key {k}, off");
+    }
+    let reads = u64::from(keys) + 2;
+    assert_eq!(
+        on.ord_point_reads(),
+        (reads, 0),
+        "every read, one partition"
+    );
+    assert_eq!(off.ord_point_reads(), (0, 0));
+}
+
+/// A segment whose ordered index the open found missing or damaged has
+/// it rebuilt from the segment's keys, and the point read through the
+/// rebuilt one answers as the one it replaced.
+#[test]
+fn a_rebuilt_ordered_index_serves_point_reads_as_the_one_it_replaced() {
+    let opts = || Options {
+        point_via_ord: true,
+        ..Options::default()
+    };
+    let key = |k: u32| format!("key-{k:05}").into_bytes();
+    let d = dir("ordread-rebuild");
+    let mut db = Db::create(&d, opts()).unwrap();
+    for k in 0u32..2_000 {
+        db.append(&key(k), format!("v-{k}").as_bytes());
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    // The tombstones in a piece of their own, beside the partition: a
+    // drain would merge them into it.
+    for k in (0u32..2_000).step_by(7) {
+        db.delete(&key(k));
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.settle().unwrap();
+    assert_eq!(db.levels(), (1, 1), "a partition and a piece");
+    let ords = ord_names(&d);
+    assert_eq!(ords.len(), 2, "one index each: {:?}", seg_names(&d));
+    // Dropped and not closed: a close flushes, and a flush merges the piece
+    // into its partition. Here and at each reopen below.
+    drop(db);
+    let written: Vec<Vec<u8>> = ords
+        .iter()
+        .map(|n| std::fs::read(d.join(n)).unwrap())
+        .collect();
+    // Every key, and the keys past the last, through whatever the options
+    // say; the deleted ones read empty.
+    let reads = |db: &Db| {
+        for k in 0u32..2_100 {
+            let want: Vec<Vec<u8>> = if k < 2_000 && k % 7 != 0 {
+                vec![format!("v-{k}").into_bytes()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(read_vec(db, &key(k)), want, "key {k}");
+        }
+    };
+    let taken = |db: &Db, what: &str| {
+        let c = db.ord_point_reads();
+        assert!(c.0 > 0 && c.1 == 0, "{what}: the ordered path: {c:?}");
+    };
+
+    // As written.
+    let db = Db::open(&d, opts()).unwrap();
+    assert_eq!(db.ord_rebuilt(), 0);
+    reads(&db);
+    taken(&db, "as written");
+    drop(db);
+
+    // Damaged: a flipped byte in every index, rebuilt at the open.
+    for (n, bytes) in ords.iter().zip(&written) {
+        let mut damaged = bytes.clone();
+        let at = damaged.len() / 2;
+        damaged[at] ^= 0x40;
+        std::fs::write(d.join(n), &damaged).unwrap();
+    }
+    let db = Db::open(&d, opts()).unwrap();
+    assert_eq!(db.ord_rebuilt(), ords.len() as u64, "every one rebuilt");
+    reads(&db);
+    taken(&db, "damaged");
+    drop(db);
+
+    // Missing: one removed.
+    std::fs::remove_file(d.join(&ords[0])).unwrap();
+    let db = Db::open(&d, opts()).unwrap();
+    assert_eq!(db.ord_rebuilt(), 1);
+    reads(&db);
+    taken(&db, "missing");
+    drop(db);
+
+    // And the same files without the option: the hash answers the same.
+    let db = Db::open(
+        &d,
+        Options {
+            point_via_ord: false,
+            ..opts()
+        },
+    )
+    .unwrap();
+    reads(&db);
+    assert_eq!(db.ord_point_reads(), (0, 0));
+}
+
+/// The open checks an ordered index against its segment by the key count
+/// alone, so one that describes other keys, the same number of them,
+/// opens, and a head that ties the query names a rank whose record holds
+/// another key. The point read checks the record: it leaves for the hash
+/// and answers as the model does, and never returns another key's values.
+/// A key such an index places nowhere is believed absent, as every scan's
+/// seek believes the index; that edge is the index's contract, the
+/// identity the open could check and does not, and the reads of a key the
+/// segment holds that the index lacks are held here to "right or empty".
+#[test]
+fn an_ordered_index_naming_the_wrong_keys_never_returns_another_keys_values() {
+    let opts = || Options {
+        point_via_ord: true,
+        ..Options::default()
+    };
+    let n = 1_000u32;
+    let key = |k: u32| format!("key-{k:05}").into_bytes();
+    let value = |k: u32| format!("v-{k}").into_bytes();
+    let d = dir("ordread-foreign");
+    let mut db = Db::create(&d, opts()).unwrap();
+    for k in 0..n {
+        db.append(&key(k), &value(k));
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.close().unwrap();
+    let ords = ord_names(&d);
+    assert_eq!(ords.len(), 1, "one segment: {:?}", seg_names(&d));
+    // The keys one place on: the same count, the same lengths, the same
+    // prefix, so the file is valid and uniform and describes nothing here.
+    let mut b = supdb::ordindex::Builder::new();
+    for k in 1..=n {
+        b.push(&key(k));
+    }
+    std::fs::write(d.join(&ords[0]), b.finish()).unwrap();
+    let db = Db::open(&d, opts()).unwrap();
+    assert_eq!(db.ord_rebuilt(), 0, "the open took it: the count agrees");
+    for k in 0..=n + 1 {
+        let want = if k < n { vec![value(k)] } else { Vec::new() };
+        let got = read_vec(&db, &key(k));
+        assert!(
+            got.is_empty() || got == want,
+            "key {k} read {got:?}, which is not its own"
+        );
+        if k >= 1 {
+            // The index names it, at the wrong rank: the record says so.
+            assert_eq!(got, want, "key {k}");
+        }
+    }
+    let (_, declined) = db.ord_point_reads();
+    assert_eq!(declined, u64::from(n), "every key the index names wrongly");
+    db.close().unwrap();
+
+    // The segment's own keys in an order no segment has: a file as valid
+    // and as uniform as the last, whose heads are not sorted, so that the
+    // search lands where it lands. What it answers is right or empty, and
+    // it panics nowhere.
+    let mut b = supdb::ordindex::Builder::new();
+    for k in (0..n).rev() {
+        b.push(&key(k));
+    }
+    std::fs::write(d.join(&ords[0]), b.finish()).unwrap();
+    let db = Db::open(&d, opts()).unwrap();
+    assert_eq!(db.ord_rebuilt(), 0, "the open took this one too");
+    for k in 0..=n + 1 {
+        let want = if k < n { vec![value(k)] } else { Vec::new() };
+        let got = read_vec(&db, &key(k));
+        assert!(
+            got.is_empty() || got == want,
+            "key {k} read {got:?} through unsorted heads, which is not its own"
+        );
+    }
+    let (served, declined) = db.ord_point_reads();
+    assert_eq!(served + declined, u64::from(n) + 2, "every read asked it");
+    db.close().unwrap();
+
+    // The same files without the option read every key.
+    let db = Db::open(
+        &d,
+        Options {
+            point_via_ord: false,
+            ..opts()
+        },
+    )
+    .unwrap();
+    for k in 0..=n + 1 {
+        let want = if k < n { vec![value(k)] } else { Vec::new() };
+        assert_eq!(read_vec(&db, &key(k)), want, "key {k}, off");
+    }
+}
+
+/// The model oracle with the option on and keys of one length, which the
+/// existing oracle's are not: random appends, deletes, commits, seals and
+/// crash-reopens, every key checked against a model after each reopen and
+/// at the end, through the writer and through a handle, with the count
+/// saying the ordered path read the partitions the seals and merges made.
+#[test]
+fn the_oracle_holds_with_point_reads_through_the_ordered_index() {
+    let opts = Options {
+        point_via_ord: true,
+        ..Options::default()
+    };
+    let d = dir("oracle-ordread");
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
+    let mut uncommitted: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+    let mut state = 0x5eedu64;
+    let mut rng = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut served = 0u64;
+    for step in 0..2_000u32 {
+        let key = format!("k{:03}", rng() % 97).into_bytes();
+        if rng() % 20 == 0 {
+            db.delete(&key);
+            uncommitted.push((key, None));
+        } else {
+            let val = format!("v{step}").into_bytes();
+            db.append(&key, &val);
+            uncommitted.push((key, Some(val)));
+        }
+        match rng() % 100 {
+            0..=9 => {
+                db.commit().unwrap();
+                apply(&mut model, &mut uncommitted);
+            }
+            10..=12 => {
+                db.commit().unwrap();
+                apply(&mut model, &mut uncommitted);
+                db.seal().unwrap();
+            }
+            13 => {
+                served += db.ord_point_reads().0;
+                drop(db);
+                uncommitted.clear();
+                db = Db::open(&d, opts.clone()).unwrap();
+                for (k, want) in &model {
+                    assert_eq!(&read_vec(&db, k), want, "after crash at step {step}");
+                }
+            }
+            _ => {}
+        }
+    }
+    db.commit().unwrap();
+    apply(&mut model, &mut uncommitted);
+    db.flush().unwrap();
+    let r = db.reader().unwrap();
+    for (k, want) in &model {
+        assert_eq!(&read_vec(&db, k), want, "the writer");
+        assert_eq!(&read_vec(&r, k), want, "a handle");
+    }
+    // Keys the model never held, in the range and past it.
+    for k in ["k097", "k100", "k", "k00", "j", "l"] {
+        assert!(read_vec(&db, k.as_bytes()).is_empty(), "{k}");
+        assert!(read_vec(&r, k.as_bytes()).is_empty(), "{k}");
+    }
+    let (writer, handle) = (db.ord_point_reads(), r.ord_point_reads());
+    served += writer.0;
+    assert!(served > 0 && writer.1 == 0, "the ordered path: {writer:?}");
+    assert!(handle.0 > 0 && handle.1 == 0, "the handle's: {handle:?}");
+}
+
+/// Reader handles on threads read through the ordered index while the
+/// writer puts, seals, promotes and merges under them: every value is one
+/// the writer wrote, a key's version never goes backwards for one reader,
+/// and each handle's own count says the index answered.
+#[test]
+fn readers_on_threads_keep_answering_through_the_ordered_index() {
+    let d = dir("readers-threads-ordread");
+    let opts = Options {
+        seal_bytes: 32 << 10,
+        partition_bytes: Some(64 << 10),
+        l0_trigger: 2,
+        point_via_ord: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let keys = 3000u32;
+    let key = |k: u32| format!("key-{k:05}").into_bytes();
+    for k in 0..keys {
+        db.append(&key(k), b"0");
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.settle().unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut threads = Vec::new();
+    for t in 0..3u64 {
+        let r = db.reader().unwrap();
+        let stop = stop.clone();
+        threads.push(std::thread::spawn(move || {
+            let mut seen: HashMap<u32, u64> = HashMap::new();
+            let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ t;
+            let mut reads = 0usize;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % keys as u64) as u32;
+                let got = read_vec(&r, &key(k));
+                assert!(got.len() <= 1, "a put key with two values");
+                let v = got.first().expect("a key put at the start is never absent");
+                let ver: u64 = std::str::from_utf8(v).unwrap().parse().unwrap();
+                let prev = seen.entry(k).or_insert(0);
+                assert!(
+                    ver >= *prev,
+                    "a version that went backwards: key {k} read {ver} after {prev}"
+                );
+                *prev = ver;
+                reads += 1;
+            }
+            (reads, r.ord_point_reads())
+        }));
+    }
+    let mut x = 42u64;
+    for round in 1..=300u64 {
+        for _ in 0..50 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = (x % keys as u64) as u32;
+            db.put(&key(k), round.to_string().as_bytes());
+        }
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut reads = 0usize;
+    let (mut served, mut declined) = (0u64, 0u64);
+    for t in threads {
+        let (n, (s, d)) = t.join().unwrap();
+        reads += n;
+        served += s;
+        declined += d;
+    }
+    assert!(reads > 1000, "the readers read: {reads}");
+    assert_eq!(declined, 0, "no rank the record disowned");
+    assert!(
+        served > 0 && served <= reads as u64,
+        "the ordered path answered: {served} of {reads}"
+    );
+    assert!(
+        db.levels().0 > 1,
+        "the writer partitioned under them: {:?}",
+        db.levels()
+    );
 }
 
 /// Under `Options::direct_table_refs`, a direct run's table holds its
