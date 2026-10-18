@@ -239,6 +239,13 @@ pub const BUDGET_BUILDS: u32 = 8;
 /// they installed): a store written across its key space rewrites every
 /// partition each cycle, at a rate that can exceed one serial builder.
 pub const BUDGET_SUPERSEDED: u32 = 4;
+/// The bits of the outcomes word that are the budget's window.
+const BUDGET_WINDOW: u32 = if BUDGET_BUILDS >= u32::BITS {
+    u32::MAX
+} else {
+    (1u32 << BUDGET_BUILDS) - 1
+};
+const _: () = assert!(BUDGET_BUILDS >= 1 && BUDGET_BUILDS <= u32::BITS);
 
 // ---- the unit the model counts in ---------------------------------------
 
@@ -865,8 +872,8 @@ pub struct ZSelect {
     last_build_wall: Duration,
     build_started: Duration,
     vanished: u32,
-    /// The last eight builds, a bit each: set if superseded.
-    outcomes: u8,
+    /// The last [`BUDGET_BUILDS`] builds, a bit each: set if superseded.
+    outcomes: u32,
     suspended_until: Option<Duration>,
     retain_until: Option<Duration>,
     watch: Watch,
@@ -1387,6 +1394,7 @@ impl ZSelect {
         for _ in 0..superseded {
             self.outcomes = (self.outcomes << 1) | 1;
         }
+        self.outcomes &= BUDGET_WINDOW;
         superseded > 0 && self.outcomes.count_ones() > BUDGET_SUPERSEDED
     }
 
