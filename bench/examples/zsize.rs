@@ -23,17 +23,15 @@
 //! machine and hot unless the column says cold (decode, the walk that finds a
 //! key, the walk that checks a group, the CRC, the whole first decode) and what
 //! `fill_group` itself takes a page; and the occupancy of the cache the bound
-//! leaves at ten million keys, with the share of a build that `fill_group`
-//! is at that size. Pages are
-//! built from the records and nothing else, so what is printed is a function
-//! of the images, the layout and the codec: the codec is printed, and the
-//! digest of the pages is, so that a build with the other codec can be held to
-//! the same bytes.
+//! leaves at ten million keys, with the time `fill_group` takes at that size.
+//! Pages are built from the records and nothing else, so what is printed is a
+//! function of the images, the layout and the codec: the codec is printed, and
+//! the digest of the pages is, so that a build with the other codec can be held
+//! to the same bytes.
 //!
 //! Exit status 2 if the suite's shape (sequential keys, half-compressible
-//! values) comes out under 36 records a page, the point under which the form
-//! cannot match LMDB's reads at the cell it was designed for; 3 if the decoder
-//! that ran is not the one the build says it linked.
+//! values) comes out under `STOP_RPP` records a page; 3 if the decoder that ran
+//! is not the one the build says it linked.
 use std::collections::HashSet;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
@@ -47,9 +45,16 @@ use supdb::flatindex::{self, record_key, record_key_next, FlatIndex};
 use supdb::{Blob, Bytes, Db, MmapBytes, Options};
 use supdb_bench::workload::{db_key_into, Payload, Rng};
 
-/// The cache a 1 GiB bound leaves at the suite's out-of-core cell, in bytes:
-/// the figure the design's occupancy arithmetic uses.
+/// The page cache a 1 GiB bound left at the suite's out-of-core cell as
+/// measured there, the limit less the process's anonymous memory, in bytes.
+/// The occupancy printed is a model against this figure and not a
+/// measurement of any cache.
 const CACHE_B: f64 = 937e6;
+/// Records a page on the suite's shape under which the form cannot hold the
+/// cell's point reads to fewer faults than LMDB's: the pages and the resident
+/// part (the cache above) would no longer fit with LMDB's fault rate to
+/// spare. The example exits 2 under it.
+const STOP_RPP: f64 = 36.0;
 /// The cell's key count.
 const CELL_KEYS: f64 = 10_000_000.0;
 /// The filter's bits a key and the block it is set in, as `BlockedBloom` has
@@ -701,7 +706,6 @@ fn main() {
         );
     }
     println!("  fill_group_s: the builder's fill_group calls at this many pages, one thread: the compress and the decode-compare of the build, not its read of the raw segment, the filter, the CRCs or the writes");
-    println!("  records a page at which the claims fall away: 35.7 (parity with LMDB's reads), 40.1 (1.5x), 39.3 (scan 2x; 43.1 with the heads resident), 45 (the cache is full)");
 
     if let Some((c, _)) = cells
         .iter()
@@ -714,8 +718,8 @@ fn main() {
             }
         }
         let rpp = c.keys as f64 / c.pages.len() as f64;
-        if rpp < 36.0 {
-            println!("\nSTOP: {rpp:.2} records a page on the suite's shape is under 36");
+        if rpp < STOP_RPP {
+            println!("\nSTOP: {rpp:.2} records a page on the suite's shape is under {STOP_RPP}");
             std::process::exit(2);
         }
     }
