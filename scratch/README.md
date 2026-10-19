@@ -117,8 +117,8 @@ time, on the tree with the three fixes (`d370547`):
 | `build` | green |
 | `lint` | green |
 | `wasm` | green: the module links, 128,266 bytes |
-| `test` | running when this was committed; the verdict follows in the next commit |
-| `bench` | queued behind `test`; the verdict follows in the next commit |
+| `test` | green in every binary under `checked`: the library's 292, `db` 197, `zpages` 41, `segwriter` 19, `blob` 13, `ranges` 6, `fences` 4, `dict` 4, `fuzz` 2 (its default seeds), `leak`, `checksums_off` and the doc test; run with `--no-fail-fast` and `CARGO_BUILD_JOBS=1` |
+| `bench` | green: the suite's build, its 86 tests under `checked`, clippy, rustfmt and the workflow lint |
 
 ## The branches, and what became of each
 
