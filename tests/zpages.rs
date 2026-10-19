@@ -1411,7 +1411,7 @@ fn the_default_is_off_and_an_off_store_makes_nothing() {
 // ---- what stays raw, and what is shared ---------------------------------------
 
 #[test]
-fn a_scan_of_a_covered_partition_is_walked_raw_and_counted() {
+fn a_scan_of_a_covered_partition_is_served_by_its_sidecar_and_counted() {
     let dir = scratch("scans");
     let mut db = Db::create(&dir, forced(|o| o.partition_bytes = Some(160 << 10))).unwrap();
     let model = ordered_load(&mut db, 6000, 0x5CA);
@@ -1438,11 +1438,21 @@ fn a_scan_of_a_covered_partition_is_walked_raw_and_counted() {
     }
     check_scan(&db, &model, "all");
     scans += 1;
+    // A walk a partition: each scan of a hundred is one, two where it
+    // crosses a fence, and the whole scan one a partition; none goes raw,
+    // and a scan reads no key through the point read's counters. Its
+    // groups are decoded for the walk and verified as they are met, the
+    // whole scan every page of every sidecar.
     let after = db.zpage_counts();
-    assert_eq!(after.raw_scans - before.raw_scans, scans, "{after:?}");
-    assert_eq!(after.reads, before.reads, "a scan reads no sidecar");
+    assert!(after.scans - before.scans >= scans, "{after:?}");
+    assert_eq!((after.raw_scans, after.fallbacks), (0, 0), "{after:?}");
+    assert_eq!(after.reads, before.reads, "a scan is no point read");
     assert_eq!(after.decodes, before.decodes);
-    assert_eq!(after.verified_pages, 0, "and verifies none of its pages");
+    assert!(after.scan_groups >= after.scans, "{after:?}");
+    assert_eq!(
+        after.verified_pages, after.pages,
+        "the whole scan met every page"
+    );
     // Under Off the scan is the same scan and nothing is counted.
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2024,12 +2034,14 @@ fn scans_with_the_block_cache_agree_with_the_model_over_every_window_of_a_covere
 }
 
 fn windows_over(name: &str, cache: bool) {
-    // The scans of a covered partition are walked raw, and have to answer as
-    // if the form were not there, with the unsealed keys laid over it: updates,
-    // inserts between records and deletes, in the live table and in a frozen
-    // one. Windows begin at the fence keys, a byte either side of them, and
-    // at the edges, and end after the counts a page and a block make
-    // interesting.
+    // The scans of a covered partition answer as if the form were not there,
+    // with the unsealed keys laid over it: updates, inserts between records
+    // and deletes, in the live table and in a frozen one. Windows begin at
+    // the fence keys, a byte either side of them, and at the edges, and end
+    // after the counts a page and a block make interesting. Without the
+    // block cache the walks are the sidecars'; with it they are the block
+    // path's own, raw and not counted either way until the third piece of
+    // stage 3 decides its sites.
     let dir = scratch(name);
     let mut db = Db::create(
         &dir,
@@ -2141,7 +2153,16 @@ fn windows_over(name: &str, cache: bool) {
     }
     check(&db, &model, &keys, "after the windows");
     let after = db.zpage_counts();
-    assert!(after.raw_scans - before.raw_scans >= windows, "{after:?}");
+    if cache {
+        assert_eq!(
+            (after.scans, after.raw_scans),
+            (before.scans, before.raw_scans),
+            "the block path's walks: {after:?}"
+        );
+    } else {
+        assert!(after.scans - before.scans >= windows, "{after:?}");
+        assert_eq!(after.raw_scans, before.raw_scans, "{after:?}");
+    }
     assert_eq!(after.fallbacks + after.rejected_damage, 0, "{after:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2694,12 +2715,13 @@ fn the_sizes_the_store_reports_are_the_files_it_holds() {
 }
 
 #[test]
-fn a_scan_is_counted_raw_where_it_began_in_a_partition_with_a_sidecar_and_nowhere_else() {
-    // The first partition has none: its scans are none of the form's to
-    // count, and a scan that begins at the first key of the partition after
-    // it -- which is the first partition's fence -- begins in a partition
-    // with a sidecar. The builds are left to the settle, whose first build
-    // is the first partition's and the one made to fail.
+fn a_scans_walks_are_served_by_the_sidecars_it_crosses_and_raw_where_there_is_none() {
+    // The first partition has none: a walk of it is the raw form's and
+    // counted so; a walk of any partition after it is its sidecar's. A scan
+    // of five keys from the last key of the first partition walks one key
+    // raw and four through the next partition's sidecar. The builds are
+    // left to the settle, whose first build is the first partition's and
+    // the one made to fail.
     let dir = scratch("rawscans");
     let mut db = Db::create(
         &dir,
@@ -2724,32 +2746,48 @@ fn a_scan_is_counted_raw_where_it_began_in_a_partition_with_a_sidecar_and_nowher
         !firsts.contains(&first),
         "the first partition is the one left without"
     );
+    // (raw walks, served walks) of a scan of five keys from `start`.
     let delta = |start: &[u8]| {
-        let before = db.zpage_counts().raw_scans;
+        let before = db.zpage_counts();
         db.scan(start, 5, |_, _| {}).unwrap();
-        db.zpage_counts().raw_scans - before
+        let c = db.zpage_counts();
+        (c.raw_scans - before.raw_scans, c.scans - before.scans)
     };
-    assert_eq!(delta(&first), 0, "from inside the partition without one");
-    assert_eq!(delta(b""), 0, "from before every key");
+    assert_eq!(
+        delta(&first),
+        (1, 0),
+        "from inside the partition without one"
+    );
+    assert_eq!(delta(b""), (1, 0), "from before every key");
     let last_before = model
         .range(..firsts[0].clone())
         .next_back()
         .unwrap()
         .0
         .clone();
-    assert_eq!(delta(&last_before), 0, "from the last key before the next");
+    assert_eq!(
+        delta(&last_before),
+        (1, 1),
+        "from the last key before the next: one key raw, four served"
+    );
     for f in &firsts {
         assert_eq!(
             delta(f),
-            1,
+            (0, 1),
             "from the first key of a partition with a sidecar"
         );
         assert_eq!(
             delta(&[f.as_slice(), &[0u8]].concat()),
-            1,
+            (0, 1),
             "and just past it"
         );
     }
+    let c = db.zpage_counts();
+    assert_eq!((c.fallbacks, c.nopage_scans), (0, 0), "{c:?}");
+    assert!(
+        c.scan_groups >= c.scans,
+        "a group a served walk at least: {c:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3666,6 +3704,9 @@ fn records_larger_than_a_page_are_read_from_the_raw_segment() {
     let c = db.zpage_counts();
     assert_eq!(c.nopage_reads, 4, "a read and a count of each: {c:?}");
     assert_eq!((c.fallbacks, c.rawserves), (0, 0), "{c:?}");
+    // The one scan, served by the sidecar, handed the raw form the two
+    // records no page holds, one run each.
+    assert_eq!((c.scans, c.raw_scans, c.nopage_scans), (1, 0, 2), "{c:?}");
     assert_eq!(
         c.reads + c.counts + c.nopage_reads,
         2 * keys.len() as u64,
@@ -3832,6 +3873,10 @@ fn an_attached_sidecar_is_warmed_once_per_process_unless_the_warm_is_off() {
     // page of it and no other, and the reads after find it resident. With
     // the segment work on a thread of its own, the warm is a job of the
     // builder's thread; inline, the settle warms on the calling thread.
+    // The builds, and so the warms, are left to the settle: under the
+    // eager build the open's first turn starts the warm, and the residency
+    // read between the attach and the warm, which the identity below is
+    // of, raced it (one run of a binary's fifty tests).
     for background in [true, false] {
         evict(&file);
         let (res, all) = resident(&file);
@@ -3841,6 +3886,7 @@ fn an_attached_sidecar_is_warmed_once_per_process_unless_the_warm_is_off() {
             forced(|o| {
                 wide(o);
                 o.publish_in_background = background;
+                o.zpages_eager = false;
             }),
         )
         .unwrap();
@@ -3955,4 +4001,93 @@ fn a_refused_sidecar_is_built_again_at_the_open_without_a_settle() {
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&copy);
+}
+
+// ---- the scan ---------------------------------------------------------------------------
+
+/// Every window of the scan through a store of several covered partitions,
+/// on the writer, a `Latest` handle and a `Snapshot` handle: the stream and
+/// the count against the model, for a start at each partition's first key,
+/// the keys either side of it, a key just past it, the empty key, and keys
+/// below, between and above every key, at every limit of the grid; then
+/// the same with a batch of unsealed writes laid over the partitions, which
+/// cut the walks where they fall. Every walk of a partition is served by
+/// its sidecar and none goes raw.
+#[test]
+fn the_z_reader_agrees_with_the_blob_on_every_scan_window() {
+    let dir = scratch("scan-windows");
+    let mut db = Db::create(&dir, forced(|o| o.partition_bytes = Some(160 << 10))).unwrap();
+    let mut model = ordered_load(&mut db, 6000, 0x5CA7);
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert!(c.partitions >= 3 && c.sidecars == c.partitions, "{c:?}");
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let mut starts: Vec<Vec<u8>> = vec![
+        Vec::new(),
+        b"a".to_vec(),
+        b"zzz".to_vec(),
+        vec![0xff; 8],
+        keys[keys.len() / 2].clone(),
+        [keys[keys.len() / 2].as_slice(), b"+"].concat(),
+    ];
+    for f in sidecar_files(&dir) {
+        let first = fence_keys(&f)[0].clone();
+        let i = keys.binary_search(&first).expect("a fence key is a key");
+        if i > 0 {
+            starts.push(keys[i - 1].clone());
+        }
+        starts.push(first.clone());
+        starts.push([first.as_slice(), b"+"].concat());
+        if i + 1 < keys.len() {
+            starts.push(keys[i + 1].clone());
+        }
+    }
+    let limits = [1usize, 2, 3, 5, 17, 56, 57, 58, 114, usize::MAX];
+    let check_all = |db: &Db, model: &Model, what: &str| {
+        let latest = db.reader().unwrap();
+        let snap = db.reader().unwrap();
+        snap.snapshot();
+        for start in &starts {
+            for &limit in &limits {
+                let want = window(model, start, limit);
+                for (r, who) in [(&**db, "writer"), (&latest, "latest"), (&snap, "snapshot")] {
+                    same_window(
+                        &scanned(r, start, limit),
+                        &want,
+                        &format!(
+                            "{what}, {who}: from {:?} limit {limit}",
+                            String::from_utf8_lossy(start)
+                        ),
+                    );
+                }
+            }
+        }
+        snap.release();
+    };
+    check_all(&db, &model, "drained");
+    let c = db.zpage_counts();
+    assert!(c.scans > 0, "{c:?}");
+    assert_eq!((c.raw_scans, c.fallbacks), (0, 0), "{c:?}");
+    // Unsealed writes over the partitions: new keys between the stored
+    // ones and new values on stored keys, committed and not sealed.
+    let mut rng = Rng(0x5CA8);
+    for i in 0..200 {
+        let k = if i % 2 == 0 {
+            let base = &keys[rng.below(keys.len())];
+            [base.as_slice(), b"-new"].concat()
+        } else {
+            keys[rng.below(keys.len())].clone()
+        };
+        let v = format!("unsealed-{i}").into_bytes();
+        db.append(&k, &v);
+        model.entry(k).or_default().push(v);
+    }
+    db.commit().unwrap();
+    let before = db.zpage_counts();
+    check_all(&db, &model, "with unsealed keys");
+    let c = db.zpage_counts();
+    assert!(c.scans > before.scans, "{c:?}");
+    assert_eq!((c.raw_scans, c.fallbacks), (0, 0), "{c:?}");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -374,7 +374,16 @@ pub struct ZCounts {
     /// a record no page holds, which the build left to the raw form on
     /// purpose.
     pub nopage_reads: u64,
-    /// Scans that began in a partition with a sidecar and were walked raw.
+    /// Partition walks of a scan served by a sidecar (`ZSide::scan_at`),
+    /// the groups decoded for them, and the runs of records no page holds
+    /// that the raw form walked inside them.
+    pub scans: u64,
+    pub scan_groups: u64,
+    pub nopage_scans: u64,
+    /// Partition walks of a scan under the form that went to the raw form:
+    /// the partition had no sidecar in its cell, or one out of service, or
+    /// a check failed inside the walk and the rest was walked raw (counted
+    /// a fallback as well).
     pub raw_scans: u64,
     /// Sidecars built, their pages, bytes, the pages that hold their
     /// group verbatim, the decoded bytes of every group, and compress
@@ -7210,7 +7219,7 @@ fn membarrier_all_threads() {
     }
 }
 
-/// A reader's slot on a cache line of its own. The slots were adjacent
+/// A reader's slot on cache lines of its own. The slots were adjacent
 /// words, eight to a line, and every read pins and unpins its handle's
 /// slot with a store, so four handles claimed in order stored to one
 /// line from four cores on every read. Measured on a partitioned store
@@ -7254,6 +7263,12 @@ struct Slot {
     zraw: AtomicU64,
     zfallbacks: AtomicU64,
     zscans: AtomicU64,
+    /// Partition walks of a scan served by a sidecar, the groups decoded
+    /// for them, and the runs of records no page holds the raw form walked
+    /// inside them.
+    zscanz: AtomicU64,
+    zscangroups: AtomicU64,
+    znopagescans: AtomicU64,
     /// Reads and counts of a record the form holds no page for, read from
     /// the raw form as the fence says.
     znopage: AtomicU64,
@@ -7277,15 +7292,21 @@ impl Slot {
             zraw: AtomicU64::new(0),
             zfallbacks: AtomicU64::new(0),
             zscans: AtomicU64::new(0),
+            zscanz: AtomicU64::new(0),
+            zscangroups: AtomicU64::new(0),
+            znopagescans: AtomicU64::new(0),
             znopage: AtomicU64::new(0),
         }
     }
 }
 
-// One line: the nine words that were here and the six the second form's
-// counters add are 120 bytes of a 128-byte slot, and a seventh would make
-// every slot two lines.
-const _: () = assert!(std::mem::align_of::<Slot>() >= 128 && std::mem::size_of::<Slot>() == 128);
+// Two lines: the nine words that were here and the second form's ten
+// counters, nineteen words, are a 256-byte slot since the scan's three.
+// What the layout is for is that no other thread writes a slot's lines,
+// which two lines a handle owns keep as one did; the first line's sixteen
+// words were full at the seventh second-form counter. The size is pinned
+// so that a counter added moves it here and not in a threaded cell.
+const _: () = assert!(std::mem::align_of::<Slot>() >= 128 && std::mem::size_of::<Slot>() == 256);
 
 const READER_SLOTS: usize = 256;
 
@@ -14546,6 +14567,9 @@ impl Reader {
             rawserves: rd.stat(|s| &s.zraw),
             fallbacks: rd.stat(|s| &s.zfallbacks),
             nopage_reads: rd.stat(|s| &s.znopage),
+            scans: rd.stat(|s| &s.zscanz),
+            scan_groups: rd.stat(|s| &s.zscangroups),
+            nopage_scans: rd.stat(|s| &s.znopagescans),
             raw_scans: rd.stat(|s| &s.zscans),
             builds: get(&ev.builds),
             build_pages: get(&ev.build_pages),
@@ -14663,9 +14687,15 @@ impl Reader {
     /// read beside would price. A handle with no slot counts nothing.
     #[inline]
     fn zbump(&self, pick: impl Fn(&Slot) -> &AtomicU64) {
+        self.zbump_by(pick, 1);
+    }
+
+    /// `zbump`, by `n`.
+    #[inline]
+    fn zbump_by(&self, pick: impl Fn(&Slot) -> &AtomicU64, n: u64) {
         if let Some(i) = self.slot.or(self.pin_slot) {
             let c = pick(&self.shared.readers.slots[i]);
-            c.store(c.load(AtomicOrdering::Relaxed) + 1, AtomicOrdering::Relaxed);
+            c.store(c.load(AtomicOrdering::Relaxed) + n, AtomicOrdering::Relaxed);
         }
     }
 
@@ -14754,17 +14784,51 @@ impl Reader {
         }
     }
 
-    /// A scan begun under `Options::zpages` that starts in a partition with
-    /// a sidecar: counted, since the scan is walked over the raw form and
-    /// the sidecar's pages are not where it reads.
-    #[inline(never)]
-    fn count_raw_scan(&self, from: &[u8]) {
-        let st = self.state();
-        let np = st.segs.partition_point(|s| s.level > 0);
-        let at =
-            st.segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= from));
-        if st.segs[..np].get(at).is_some_and(|s| s.z.get().is_some()) {
-            self.zbump(|s| &s.zscans);
+    /// A scan's walk of `n` keys of a partition from `rank`, through its
+    /// sidecar (`ZSide::scan_at`) where the cell holds one in service, and
+    /// through the raw form for what the sidecar cannot serve: a cell with
+    /// no sidecar, one out of service, or the rest of a walk a check
+    /// stopped, each counted `raw_scans` on this handle's line (a stopped
+    /// walk a fallback as well). A walk the sidecar stops has emitted every
+    /// value of the records before the stop and none after, so the raw
+    /// walk goes on from there and repeats nothing.
+    fn part_scan_z<F: FnMut(&[u8], &[u8])>(
+        &self,
+        seg: &Seg,
+        rank: usize,
+        n: usize,
+        f: &mut F,
+    ) -> Result<usize> {
+        let raw = |rank: usize, n: usize, f: &mut F| {
+            seg.blob
+                .scan_at(rank, n, &mut *f)
+                .map_err(|e| err(&format!("segment scan: {e}")))
+        };
+        let Some(z) = seg.z.get() else {
+            if self.opts.zpages == ZPages::Always {
+                self.zbump(|s| &s.zscans);
+            }
+            return raw(rank, n, f);
+        };
+        let r = z
+            .scan_at(&seg.blob, rank, n, f)
+            .map_err(|e| err(&format!("segment scan: {e}")))?;
+        self.zbump_by(|s| &s.zscangroups, r.decoded);
+        self.zbump_by(|s| &s.znopagescans, r.nopage);
+        match r.end {
+            zside::ScanEnd::Served => {
+                self.zbump(|s| &s.zscanz);
+                Ok(r.seen)
+            }
+            zside::ScanEnd::Fallback => {
+                self.zbump(|s| &s.zfallbacks);
+                self.zbump(|s| &s.zscans);
+                Ok(r.seen + raw(rank + r.seen, n - r.seen, f)?)
+            }
+            zside::ScanEnd::Out => {
+                self.zbump(|s| &s.zscans);
+                Ok(r.seen + raw(rank + r.seen, n - r.seen, f)?)
+            }
         }
     }
 
@@ -15172,11 +15236,6 @@ impl Reader {
             if use_cache {
                 s.blockpath.fetch_add(1, AtomicOrdering::Relaxed);
             }
-        }
-        // A scan walks the raw form whatever the second form holds; one
-        // that begins in a partition with a sidecar is counted as such.
-        if self.opts.zpages == ZPages::Always {
-            self.count_raw_scan(from);
         }
         // Nothing written or published since the last scan: nothing to
         // settle, and the snapshot that stood then stands. Every scan paid
@@ -19770,10 +19829,7 @@ impl Reader {
                     _ => (end, Ordering::Greater),
                 };
                 if bound > rank {
-                    let got = seg
-                        .blob
-                        .scan_at(rank, bound - rank, &mut f)
-                        .map_err(|e| err(&format!("segment scan: {e}")))?;
+                    let got = self.part_scan_z(seg, rank, bound - rank, &mut f)?;
                     if got < bound - rank {
                         // A rank below the key count that the walk could
                         // not resolve. The seek above would have widened

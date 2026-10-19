@@ -1287,6 +1287,16 @@ impl ZFence {
         self.first_rank.get(i).copied()
     }
 
+    /// The entry whose records rank `rank` falls among: the greatest whose
+    /// first rank is at or below it, or `None` for an empty fence or a rank
+    /// below the first entry's, which no fence this engine writes has (the
+    /// tiling check holds the first entry at rank zero).
+    pub fn entry_at_rank(&self, rank: u32) -> Option<usize> {
+        self.first_rank
+            .partition_point(|&r| r <= rank)
+            .checked_sub(1)
+    }
+
     /// Entry `i`'s page, or [`ZNOPAGE`].
     pub fn page(&self, i: usize) -> Option<u32> {
         self.page.get(i).copied()
@@ -2923,6 +2933,18 @@ mod tests {
             engine_filter(t, f.filter_blocks)
         };
         (t, res)
+    }
+
+    #[test]
+    fn the_entry_a_rank_falls_in_is_the_greatest_at_or_below_it() {
+        let mut f = ZFence::new();
+        assert_eq!(f.entry_at_rank(0), None, "an empty fence");
+        for (rank, key) in [(0u32, &b"a"[..]), (10, b"k"), (20, b"u")] {
+            f.push(rank, rank / 10, key).unwrap();
+        }
+        for (rank, want) in [(0u32, 0usize), (9, 0), (10, 1), (19, 1), (20, 2), (1000, 2)] {
+            assert_eq!(f.entry_at_rank(rank), Some(want), "rank {rank}");
+        }
     }
 
     #[test]
