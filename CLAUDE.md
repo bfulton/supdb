@@ -2289,6 +2289,45 @@ gave: a thing of zero length has an address another thing shares, so an
 address is not an identity, and a fuzz that draws the empty key finds
 every place one was taken for one.
 
+**A partition with no record had no block to file a key under.** The
+block cache counts a partition's blocks from its records, and a
+partition emptied by a merge -- every key of its range deleted, or a
+fence no input key lay in -- keeps its range with no record: counted as
+no blocks, the settle dropped every write resolved into it, the scan
+walked past it, and the builder made it a table of nothing, so a key
+written into the range was in no scan through the cache, before and
+after its seal into a piece over the range, while the point read beside
+it, through the memtable or the piece, was right. Five of a hundred and
+twenty cache-on seeds of the differential fuzz. An empty partition has
+one block now, over no record and whatever the memtables and the pieces
+hold in its range, and every table, bound and form over a partition is
+sized by that one count (`Seg::blocks`; `tests/settle.rs`). The rule:
+a structure that files things by the range they fall in has a slot for
+every range the space is cut into, whether or not the range holds
+anything of its own, since what is filed under a range is not what the
+range holds.
+
+**A rank kept across the rewrite that moved it.** A table is carried
+across the merge that rewrites its partition over the same block
+boundaries (`same_blocks`), and keeps its copies, since a block's key
+range is the same on both sides; its sparse forms are dropped, since a
+delta's cut is a rank. The keys filed since the snapshot were carried
+too, each with the cut it had resolved to -- a rank in the partition
+before the rewrite -- and a key the merge folded in or dropped inside a
+block moves every rank after it. The form built from the kept cut put a
+filed key at the wrong record: the scan emitted the record the key's
+tombstone was to mask, then the key itself after its successors, and
+the upkeep's check of a copy from the form against a build from the
+sources, and its check of an entry by cut against the search by key,
+fired on the same cut. Four of a hundred and twenty cache-on seeds, each
+with the partition rewritten once or twice between the filing and the
+scan. A rebased table resolves every filed key again against the
+partition as it stands (`tests/settle.rs`). The rule is the one the
+piece's ranks gave, applied to the keys a table files: a position taken
+against an object is kept only under that object's identity, and a
+carry that keeps the structure across a replacement of the object
+re-takes every position it holds, not only the ones a form holds.
+
 **A probe's total over a whole read is an inlining result.** The same engine
 read +0.9, +1.9, +2.9 and +3.15 instructions a point read across four probes
 and a count +3.00 exactly, because the code after a probe's loop changes what

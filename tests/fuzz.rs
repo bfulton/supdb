@@ -817,21 +817,23 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         }
         if scan_every && staged.is_empty() {
             let want = live(&model);
-            let (a, a_faults) = scan_all(&z);
-            if !a_faults.is_empty() || a != want {
-                let sources = first_diff_key(&a, &want)
-                    .map(|k| format!("; the writer's sources of the first: {}", z.debug_key(&k)))
-                    .unwrap_or_default();
-                // In full, since a failure's line is cut short.
-                eprintln!("SOURCES [step {step}]{sources}");
-                fail(
-                    &mut fails,
-                    format!(
-                        "z scan differs from the model after step {step} (scanned every commit): {} {}{sources}",
-                        model_diff(&a, &want),
-                        a_faults.join("; ")
-                    ),
-                );
+            for (name, d) in [("z", &z), ("r", &r)] {
+                let (a, a_faults) = scan_all(d);
+                if !a_faults.is_empty() || a != want {
+                    let sources = first_diff_key(&a, &want)
+                        .map(|k| format!("; {name}'s sources of the first: {}", d.debug_key(&k)))
+                        .unwrap_or_default();
+                    // In full, since a failure's line is cut short.
+                    eprintln!("SOURCES {name} [step {step}]{sources}");
+                    fail(
+                        &mut fails,
+                        format!(
+                            "{name} scan differs from the model after step {step} (scanned every commit): {} {}{sources}",
+                            model_diff(&a, &want),
+                            a_faults.join("; ")
+                        ),
+                    );
+                }
             }
         }
         if !fails.is_empty() {
@@ -889,10 +891,14 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                     );
                 }
                 if b != want {
+                    let sources = first_diff_key(&b, &want)
+                        .map(|k| format!("; the twin's sources of the first: {}", r.debug_key(&k)))
+                        .unwrap_or_default();
+                    eprintln!("SOURCES r [step {step}]{sources}");
                     fail(
                         &mut fails,
                         format!(
-                            "r scan differs from the model{tag}: {}",
+                            "r scan differs from the model{tag}: {}{sources}",
                             model_diff(&b, &want)
                         ),
                     );

@@ -1,4 +1,9 @@
 //! What the integration tests share.
+//!
+//! Every test binary that names this module compiles the whole of it and
+//! uses a part, so each item is dead in some binary; the allowance is for
+//! that and nothing else.
+#![allow(dead_code)]
 
 /// A segment file without the part of it that is a function of when it was
 /// written.
@@ -25,4 +30,43 @@ pub fn without_the_clock(bytes: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+/// The store's segment files by name, in name order.
+pub fn seg_names(d: &std::path::Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(d)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".sup"))
+        .collect();
+    v.sort();
+    v
+}
+
+fn unhex(s: &str) -> Vec<u8> {
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap())
+        .collect()
+}
+
+/// The live partitions' fences, from their names: `(lo, hi)`, an open
+/// fence empty, in key order.
+pub fn partition_fences(d: &std::path::Path) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+    let mut v: Vec<(Vec<u8>, Option<Vec<u8>>)> = seg_names(d)
+        .iter()
+        .filter(|n| n.starts_with("par-"))
+        .map(|n| {
+            let stem = n.trim_end_matches(".sup");
+            let f: Vec<&str> = stem.split('-').collect();
+            let hi = if f[4].is_empty() {
+                None
+            } else {
+                Some(unhex(f[4]))
+            };
+            (unhex(f[3]), hi)
+        })
+        .collect();
+    v.sort();
+    v
 }
