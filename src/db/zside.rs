@@ -129,6 +129,13 @@ pub(super) enum ZRead {
     /// The sidecar is out of service: the caller reads the raw form and
     /// counts it as served raw.
     Out,
+    /// The key is a record the fence names no page for: one no page holds
+    /// (`ZNOPAGE`), which the form was built without. The caller reads the
+    /// raw form and counts a no-page read; not a failure and not a
+    /// fallback, since the form said so from its fence. A key that falls
+    /// in such an entry's range without being its record is answered absent
+    /// from the fence, as a key below the first key is.
+    NoPage,
 }
 
 /// Where a key lies in a sidecar, found or not, with the bytes it lies in.
@@ -147,6 +154,9 @@ enum Locate<'a> {
     Fallback,
     /// Out of service.
     Out,
+    /// The key is a record the fence names no page for: the raw form's to
+    /// read.
+    NoPage,
 }
 
 /// Why a page was not opened.
@@ -451,9 +461,18 @@ impl ZSide {
         let Some(p) = self.fence.page(e) else {
             return Locate::Fallback;
         };
-        // Records the form does not hold are the raw form's.
+        // A record the form does not hold is the raw form's, and its
+        // entry covers that one record, so a key in the entry's range that
+        // is not the record's key is absent: the fence says so without a
+        // page. An entry over more than one record is one this builder did
+        // not write, and every key in it is the raw form's.
         if p == ZNOPAGE {
-            return Locate::Fallback;
+            return match self.fence.entry(e, self.nkeys as u32) {
+                Some(entry) if entry.count == 1 && entry.key != key => {
+                    Locate::Absent { decoded: false }
+                }
+                _ => Locate::NoPage,
+            };
         }
         let p = p as usize;
         let Some(page) = self.page_bytes(p).filter(|_| p < self.n_pages) else {
@@ -517,6 +536,7 @@ impl ZSide {
             Locate::Absent { decoded } => Ok(ZRead::Served { n: 0, decoded }),
             Locate::Out => Ok(ZRead::Out),
             Locate::Fallback => Ok(ZRead::Fallback),
+            Locate::NoPage => Ok(ZRead::NoPage),
             Locate::Found {
                 exts,
                 tail,
@@ -536,6 +556,7 @@ impl ZSide {
             Locate::Absent { decoded } => ZRead::Served { n: 0, decoded },
             Locate::Out => ZRead::Out,
             Locate::Fallback => ZRead::Fallback,
+            Locate::NoPage => ZRead::NoPage,
             Locate::Found { exts, decoded, .. } => ZRead::Served {
                 n: exts.iter().map(|e| u64::from(e.records())).sum(),
                 decoded,
@@ -746,6 +767,9 @@ pub(super) struct ZEvents {
     /// stopped: a merge took the target as an input, or the store closed.
     pub build_starts: AtomicU64,
     pub build_cancelled: AtomicU64,
+    /// Records the builds held no page for, each an entry of the fence
+    /// read from the raw form.
+    pub build_nopage: AtomicU64,
     /// Partitions declined, by reason, and the record bytes of the ones
     /// declined for their size.
     pub declined_small: AtomicU64,
@@ -815,6 +839,7 @@ impl ZEvents {
         ZEvents::add(&self.build_stored, b.fill.stored);
         ZEvents::add(&self.build_group_bytes, b.total_ulen);
         ZEvents::add(&self.build_calls, b.fill.calls);
+        ZEvents::add(&self.build_nopage, b.fill.nopages);
     }
 }
 
@@ -826,7 +851,8 @@ pub(super) enum Decline {
     /// A record's run lies in a block, so the value is read from the raw
     /// segment whatever the form holds.
     BlockBacked,
-    /// A record that no page holds.
+    /// No record the partition holds fits a page: every one is an entry of
+    /// no page, and a sidecar of those alone serves nothing.
     NoPage(NoPage),
 }
 
@@ -1071,10 +1097,14 @@ impl BuildPlan {
 ///
 /// A partition is declined, with no file written, for a record region
 /// under the plan's floor, for a block table that is not empty (a run lies
-/// outside its record), and for a record that no page holds. No filter is
-/// built. The temp name is removed on every way out the function has, a
-/// decline after pages were written among them; a crash leaves it for the
-/// sweep at open.
+/// outside its record), and when no record of it fits a page. A record no
+/// page holds -- over the largest image a group decodes into, or one that
+/// fits no page compressed or stored -- is an entry of the fence with no
+/// page (`ZNOPAGE`), the raw form's to read, and the build goes on past it;
+/// a key in that entry's range that is not the record's is absent from the
+/// fence alone. No filter is built. The temp name is removed on every way
+/// out the function has, a decline after pages were written among them; a
+/// crash leaves it for the sweep at open.
 pub(super) fn build(
     seg_path: &Path,
     out: &Path,
@@ -1214,6 +1244,9 @@ fn write_pages(
     let (mut rank, mut hint, mut pages) = (0usize, 0usize, 0u32);
     let mut total_ulen = 0u64;
     let mut dropped = 0usize;
+    // The last record no page held, for the decline of a partition that
+    // has nothing else.
+    let mut last_nopage: Option<NoPage> = None;
     // The raw bytes the walk has passed, handed to the cache to forget.
     let mut forget = |from: usize, to: usize| {
         if plan.drop_behind && from < to {
@@ -1232,7 +1265,7 @@ fn write_pages(
                 let key = record_key(first, 0)
                     .ok_or_else(|| super::err("z build: a record has no key"))?;
                 let entry = FenceEntry {
-                    index: pages as usize,
+                    index: fence.len(),
                     first_rank: u32::try_from(rank)
                         .map_err(|_| super::err("z build: a rank past four billion"))?,
                     count: g.count as u32,
@@ -1261,7 +1294,20 @@ fn write_pages(
                     dropped = consumed;
                 }
             }
-            Fill::NoPage(why) => return Ok(Outcome::Declined(Decline::NoPage(why))),
+            Fill::NoPage(why) => {
+                // A record no page holds is an entry of the fence with no
+                // page: the read of it is the raw form's, and the pages
+                // go on from the record after it. A partition of nothing
+                // else is declined below.
+                let first = images.image(rank);
+                let key = record_key(first, 0)
+                    .ok_or_else(|| super::err("z build: a record has no key"))?;
+                let first_rank = u32::try_from(rank)
+                    .map_err(|_| super::err("z build: a rank past four billion"))?;
+                fence.push(first_rank, ZNOPAGE, key)?;
+                last_nopage = Some(why);
+                rank += 1;
+            }
             Fill::End => return Err(super::err("z build: the walk ran past the last record")),
             Fill::Mismatch => {
                 return Err(super::err(
@@ -1272,6 +1318,11 @@ fn write_pages(
     }
     forget(recs_at + dropped, recs_at + recs.len());
     forget(dir_at, dir_at + dir.len());
+    if pages == 0 {
+        return Ok(Outcome::Declined(Decline::NoPage(
+            last_nopage.unwrap_or(NoPage::Unplaceable),
+        )));
+    }
     let (res, rf) = fence.encode_resident(&[])?;
     w.push(&res)?;
     let t = Trailer {
@@ -1616,6 +1667,7 @@ mod tests {
                     assert_eq!(got, 0, "a read that declines has emitted nothing");
                     declined += 1;
                 }
+                ZRead::NoPage => panic!("every record of the fixture has a page"),
             }
         }
         assert!(
@@ -1645,24 +1697,41 @@ mod tests {
         ));
         assert!(!fx.out.exists());
 
-        // A record no page holds: random bytes that do not fit a page
-        // compressed, and an image over the cap a group decodes into.
+        // A record no page holds -- random bytes that do not fit a page
+        // compressed, an image over the cap a group decodes into -- is an
+        // entry of the fence with no page, read from the raw form; the
+        // partition is declined only when it holds nothing else.
         let mut rng = Rng(77);
-        let mut recs = suite(300, 3);
-        recs.push((b"zzz-big".to_vec(), vec![rng.bytes(6000)], false));
-        let fx = Fixture::new("incompressible", recs, 1 << 20);
-        assert!(matches!(
-            fx.build(),
-            Outcome::Declined(Decline::NoPage(NoPage::Incompressible))
-        ));
-        assert!(!fx.out.exists());
-        let mut recs = suite(300, 4);
-        recs.push((b"zzz-big".to_vec(), vec![vec![0u8; 70_000]], false));
-        let fx = Fixture::new("oversize", recs, 1 << 20);
-        assert!(matches!(
-            fx.build(),
-            Outcome::Declined(Decline::NoPage(NoPage::Oversize))
-        ));
+        for (name, big, why) in [
+            ("incompressible", rng.bytes(6000), NoPage::Incompressible),
+            ("oversize", vec![0u8; 70_000], NoPage::Oversize),
+        ] {
+            let mut recs = suite(300, 3);
+            recs.push((b"zzz-big".to_vec(), vec![big.clone()], false));
+            let fx = Fixture::new(name, recs, 1 << 20);
+            let Outcome::Built(b) = fx.build() else {
+                panic!("{name}: built around the record no page holds")
+            };
+            assert_eq!(b.fill.nopages, 1, "{name}");
+            let side = fx.attach().unwrap();
+            assert_eq!(side.count(b"zzz-big"), ZRead::NoPage, "{name}");
+            assert_eq!(
+                z_values(&side, &fx.blob, b"zzz-big"),
+                None,
+                "{name}: the read is the raw form's"
+            );
+            agree(&side, &fx.blob, &fx.recs[..300]);
+            let alone = Fixture::new(
+                &format!("{name}-alone"),
+                vec![(b"zzz-big".to_vec(), vec![big], false)],
+                1 << 20,
+            );
+            assert!(
+                matches!(alone.build(), Outcome::Declined(Decline::NoPage(w)) if w == why),
+                "{name}: a partition of nothing a page holds is declined"
+            );
+            assert!(!alone.out.exists());
+        }
         assert!(!fx.out.exists());
     }
 
@@ -2110,6 +2179,7 @@ mod tests {
                                 assert!(got.is_empty(), "key {i}: values before a decline");
                                 hit += 1;
                             }
+                            ZRead::NoPage => panic!("every record of the fixture has a page"),
                         }
                     }
                     if hit > 0 {
@@ -2508,30 +2578,52 @@ mod tests {
     }
 
     #[test]
-    fn a_decline_after_pages_were_written_leaves_no_temp_file() {
-        // Declined late: the pages before the record no page holds are
-        // already in the temp file when the build gives up.
+    fn a_record_no_page_holds_among_the_pages_is_one_entry_and_the_pages_go_on() {
+        // The pages before the record are in the temp file when the fill
+        // meets it; the entry is pushed and the pages after it follow, so
+        // the sidecar is whole and the temp name is gone.
         let mut rng = Rng(77);
         let mut recs = suite(3000, 3);
-        recs.push((b"zzz-big".to_vec(), vec![rng.bytes(6000)], false));
+        let big = b"0000000000001500-big";
+        recs.insert(1500, (big.to_vec(), vec![rng.bytes(6000)], false));
+        recs.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(recs[1501].0, big, "the record sorts among the suite's keys");
         let fx = Fixture::new("late-incompressible", recs, 1 << 20);
-        assert!(matches!(
-            fx.build(),
-            Outcome::Declined(Decline::NoPage(NoPage::Incompressible))
-        ));
-        assert!(!fx.out.exists());
-        assert!(
-            !tmp_of(&fx.out).exists(),
-            "the temp file of a declined build is left behind"
+        let Outcome::Built(b) = fx.build() else {
+            panic!("built")
+        };
+        assert_eq!(b.fill.nopages, 1);
+        assert!(fx.out.exists() && !tmp_of(&fx.out).exists());
+        let side = fx.attach().unwrap();
+        agree(
+            &side,
+            &fx.blob,
+            &fx.recs
+                .iter()
+                .filter(|r| r.0 != big)
+                .cloned()
+                .collect::<Vec<_>>(),
         );
-        let mut recs = suite(3000, 4);
-        recs.push((b"zzz-big".to_vec(), vec![vec![0u8; 70_000]], false));
-        let fx = Fixture::new("late-oversize", recs, 1 << 20);
-        assert!(matches!(
-            fx.build(),
-            Outcome::Declined(Decline::NoPage(NoPage::Oversize))
-        ));
-        assert!(!fx.out.exists() && !tmp_of(&fx.out).exists());
+        assert_eq!(side.count(big), ZRead::NoPage);
+        // A key in the entry's range that is not the record's is absent
+        // from the fence alone, and the record's own key is the raw form's.
+        let above = [&big[..], &[0xffu8]].concat();
+        assert_eq!(
+            side.count(&above),
+            ZRead::Served {
+                n: 0,
+                decoded: false
+            }
+        );
+        assert_eq!(z_values(&side, &fx.blob, big), None);
+        // The entry's page number is no page, and the pages after it are
+        // numbered on from the one before.
+        let e = side.fence.entry_of(big).unwrap();
+        assert_eq!(side.fence.page(e), Some(ZNOPAGE));
+        assert_eq!(
+            side.fence.page(e + 1),
+            side.fence.page(e - 1).map(|p| p + 1)
+        );
     }
 
     #[test]
@@ -2858,8 +2950,8 @@ mod tests {
                 .read_all(&fx.blob, key, &mut |v: &[u8]| got.push(v.to_vec()))
                 .unwrap();
             if (lo..hi).contains(&i) {
-                assert_eq!((r, got.len()), (ZRead::Fallback, 0), "record {i}");
-                assert_eq!(side.count(key), ZRead::Fallback, "count of record {i}");
+                assert_eq!((r, got.len()), (ZRead::NoPage, 0), "record {i}");
+                assert_eq!(side.count(key), ZRead::NoPage, "count of record {i}");
                 declined += 1;
             } else {
                 assert_eq!(&got, vals, "record {i}");
@@ -2873,6 +2965,6 @@ mod tests {
         // A key that falls in the run and is not there is the raw form's to
         // say so too, not the sidecar's to say absent.
         let inside = [fx.recs[lo].0.as_slice(), &[0u8]].concat();
-        assert_eq!(side.count(&inside), ZRead::Fallback);
+        assert_eq!(side.count(&inside), ZRead::NoPage);
     }
 }
