@@ -372,6 +372,19 @@ impl GroupBuf {
     }
 }
 
+impl GroupBuf {
+    /// The first `n` bytes of the buffer as the last decode left them: what
+    /// a cursor that keeps its group across calls reads the group through,
+    /// since a decode's own borrow ends with the call that made it. `n` is
+    /// at most what the last `bytes_for` was asked for.
+    pub fn bytes(&self, n: usize) -> &[u8] {
+        assert!(n <= self.words.len() * 8, "a group longer than its buffer");
+        // SAFETY: `words` owns at least `n` initialised bytes and `u8` has
+        // no alignment to violate.
+        unsafe { std::slice::from_raw_parts(self.words.as_ptr() as *const u8, n) }
+    }
+}
+
 impl Default for GroupBuf {
     fn default() -> GroupBuf {
         GroupBuf::new()

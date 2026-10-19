@@ -14832,6 +14832,149 @@ impl Reader {
         }
     }
 
+    /// A scan's seek of a partition: the rank of the first key at or after
+    /// `key`, through the sidecar's fence and one group where the cell
+    /// holds one in service (`ZSide::seek`, a group decoded counted on
+    /// this handle's line), and through the ordered index over the raw
+    /// form where it holds none or the sidecar cannot say.
+    fn part_seek_z(&self, seg: &Seg, key: &[u8]) -> usize {
+        let raw = || seg.ord.seek(key, |r| seg.blob.key_at(r));
+        let Some(z) = seg.z.get() else {
+            return raw();
+        };
+        match z.seek(key) {
+            zside::ZSeek::Served { rank, decoded, .. } => {
+                if decoded {
+                    self.zbump(|s| &s.zscangroups);
+                }
+                rank
+            }
+            zside::ZSeek::Fallback => {
+                self.zbump(|s| &s.zfallbacks);
+                raw()
+            }
+            zside::ZSeek::Out | zside::ZSeek::NoPage => raw(),
+        }
+    }
+
+    /// `BuildCtx::cut_at` for a scan: through the sidecar
+    /// (`ZSide::cut_in`) where the cell holds one in service, over the
+    /// ordered index's heads and the raw records otherwise.
+    fn part_cut_z(&self, seg: &Seg, rank: usize, end: usize, uk: &[u8]) -> (usize, Ordering) {
+        let Some(z) = seg.z.get() else {
+            return BuildCtx::cut_at(seg, rank, end, uk);
+        };
+        match z.cut_in(rank, end, uk) {
+            zside::ZSeek::Served { rank, at, decoded } => {
+                if decoded {
+                    self.zbump(|s| &s.zscangroups);
+                }
+                (rank, at)
+            }
+            zside::ZSeek::Fallback => {
+                self.zbump(|s| &s.zfallbacks);
+                BuildCtx::cut_at(seg, rank, end, uk)
+            }
+            zside::ZSeek::Out | zside::ZSeek::NoPage => BuildCtx::cut_at(seg, rank, end, uk),
+        }
+    }
+
+    /// A scan's emit of the partition record at `rank` (`emit_unsealed`):
+    /// `Blob::values_at` through the sidecar where the cell holds one in
+    /// service, counted as a walk's parts are -- a group decoded, a record
+    /// no page holds read raw, a fallback -- and the raw form's otherwise.
+    /// The sidecar answers or it does not before a value is handed to `f`.
+    fn part_values_z<F: FnMut(&[u8])>(&self, seg: &Seg, rank: usize, f: &mut F) -> Result<u64> {
+        let raw = |f: &mut F| {
+            seg.blob
+                .values_at(rank, &mut *f)
+                .map_err(|e| err(&format!("segment scan read: {e}")))
+        };
+        let Some(z) = seg.z.get() else {
+            return raw(f);
+        };
+        let served = z
+            .values_at(&seg.blob, rank, f)
+            .map_err(|e| err(&format!("segment scan read: {e}")))?;
+        match served {
+            zside::ZRead::Served { n, decoded } => {
+                if decoded {
+                    self.zbump(|s| &s.zscangroups);
+                }
+                Ok(n)
+            }
+            zside::ZRead::Fallback => {
+                self.zbump(|s| &s.zfallbacks);
+                raw(f)
+            }
+            zside::ZRead::NoPage => {
+                self.zbump(|s| &s.znopagescans);
+                raw(f)
+            }
+            zside::ZRead::Out => raw(f),
+        }
+    }
+
+    /// `scan_merged`'s walk of `seg` from `rank`: through the sidecar
+    /// where the cell holds one in service, the raw form's otherwise.
+    fn pwalk_at<'a>(&self, seg: &'a Seg, rank: usize) -> PWalk<'a> {
+        match seg.z.get() {
+            Some(z) if !z.damaged() => PWalk::Z(zside::ZCursor::at(z, &seg.blob, rank)),
+            _ => PWalk::Raw {
+                seg,
+                rank,
+                key: seg.blob.key_at(rank),
+            },
+        }
+    }
+
+    /// `pwalk_at` at the first key at or after `key`: the sidecar's seek
+    /// (`ZCursor::seek`), one group opened for the seek and the walk after
+    /// it, or the ordered index's where the sidecar cannot say, with a
+    /// fallback counted where a check failed.
+    fn pwalk_seek<'a>(&self, seg: &'a Seg, key: &[u8]) -> PWalk<'a> {
+        if let Some(z) = seg.z.get() {
+            match zside::ZCursor::seek(z, &seg.blob, key) {
+                Ok(c) => return PWalk::Z(c),
+                Err(zside::ZSeek::Fallback) => self.zbump(|s| &s.zfallbacks),
+                Err(_) => {}
+            }
+        }
+        let rank = seg.ord.seek(key, |r| seg.blob.key_at(r));
+        PWalk::Raw {
+            seg,
+            rank,
+            key: seg.blob.key_at(rank),
+        }
+    }
+
+    /// A partition walk's counts, filed on this handle's line as
+    /// `scan_merged` leaves the partition: a served walk with the groups
+    /// it decoded and the runs no page holds it met, a fallen one as a
+    /// fallback and a raw walk, a raw one as a raw walk -- counted, as
+    /// `part_scan_z` counts one, only where the form is on for every
+    /// partition.
+    fn pwalk_close(&self, w: Option<PWalk>) {
+        match w {
+            None => {}
+            Some(PWalk::Raw { .. }) => {
+                if self.opts.zpages == ZPages::Always {
+                    self.zbump(|s| &s.zscans);
+                }
+            }
+            Some(PWalk::Z(c)) => {
+                self.zbump_by(|s| &s.zscangroups, c.decoded);
+                self.zbump_by(|s| &s.znopagescans, c.nopage);
+                if c.fell_back() {
+                    self.zbump(|s| &s.zfallbacks);
+                    self.zbump(|s| &s.zscans);
+                } else {
+                    self.zbump(|s| &s.zscanz);
+                }
+            }
+        }
+    }
+
     pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {
         let _entered = self.enter();
         self.advise(true);
@@ -19816,7 +19959,7 @@ impl Reader {
             // with; the walk after it is the reader's own. That split is
             // the whole point of the index -- the seek was the entire
             // measured deficit and the walk was already competitive.
-            let mut rank = seg.ord.seek(cursor, |r| seg.blob.key_at(r));
+            let mut rank = self.part_seek_z(seg, cursor);
             while seen < limit {
                 // The walk reaches the limit or the partition's end, cut
                 // where the next unsealed key falls inside it. A rank that
@@ -19825,7 +19968,7 @@ impl Reader {
                 let end = rank.saturating_add(limit - seen).min(keys);
                 let next = unsealed.peek(mc);
                 let (bound, at_bound) = match next {
-                    Some((uk, _)) if end > rank => BuildCtx::cut_at(seg, rank, end, uk),
+                    Some((uk, _)) if end > rank => self.part_cut_z(seg, rank, end, uk),
                     _ => (end, Ordering::Greater),
                 };
                 if bound > rank {
@@ -19947,9 +20090,7 @@ impl Reader {
         }
         if start == 0 {
             if let Some((seg, rank)) = part {
-                seg.blob
-                    .values_at(rank, |v| f(key, v))
-                    .map_err(|e| err(&format!("segment scan read: {e}")))?;
+                self.part_values_z(seg, rank, &mut |v: &[u8]| f(key, v))?;
             }
         }
         for (i, fr) in frozen.iter().enumerate() {
@@ -20033,33 +20174,55 @@ impl Reader {
                 .collect()
         };
         // The partition cursor: the first partition whose fence can reach
-        // `from`, then each following one from its first key.
+        // `from`, then each following one from its first key. Through the
+        // partition's sidecar where it has one in service and the raw
+        // form's rank and key otherwise (`PWalk`), its counts filed as it
+        // leaves each partition. The walk advances at the top of the turn
+        // after the one that emitted its key, since the key it lends is in
+        // use until that turn's end.
         let mut pi = self.first_reaching(np, from);
-        let mut prank = 0usize;
-        let mut pkey: Option<&[u8]> = None;
+        let mut pw: Option<PWalk> = None;
         while pi < np {
             let s = &parts[pi];
-            prank = s.ord.seek(s.cursor_from(from), |r| s.blob.key_at(r));
-            pkey = s.blob.key_at(prank);
-            if pkey.is_some() || routed {
+            let w = self.pwalk_seek(s, s.cursor_from(from));
+            let has = w.key().is_some();
+            pw = Some(w);
+            if has || routed {
                 break;
             }
+            self.pwalk_close(pw.take());
             pi += 1;
         }
         let mut l0: Vec<Cur> = seek_l0(pi.min(np), from);
         let tombs = self.has_tombstones();
         let mut scratch: Vec<usize> = Vec::new();
         let mut seen = 0usize;
+        let mut padv = false;
         while seen < limit {
-            if routed {
-                while pkey.is_none() && l0.iter().all(|c| c.key.is_none()) && pi + 1 < np {
+            if padv {
+                padv = false;
+                if let Some(w) = pw.as_mut() {
+                    w.advance();
+                }
+                while !routed && pw.as_ref().is_some_and(|w| w.key().is_none()) && pi + 1 < np {
                     pi += 1;
-                    prank = 0;
-                    pkey = parts[pi].blob.key_at(0);
+                    self.pwalk_close(pw.take());
+                    pw = Some(self.pwalk_at(&parts[pi], 0));
+                }
+            }
+            if routed {
+                while pw.as_ref().is_none_or(|w| w.key().is_none())
+                    && l0.iter().all(|c| c.key.is_none())
+                    && pi + 1 < np
+                {
+                    pi += 1;
+                    self.pwalk_close(pw.take());
+                    pw = Some(self.pwalk_at(&parts[pi], 0));
                     l0 = seek_l0(pi, parts[pi].lo.as_slice());
                 }
             }
             let nc = l0.len();
+            let pkey: Option<&[u8]> = pw.as_ref().and_then(|w| w.key());
             let mut next: Option<&[u8]> = pkey;
             for c in &l0 {
                 if let Some(k) = c.key {
@@ -20120,18 +20283,11 @@ impl Reader {
 
             if pkey == Some(key) {
                 if start == 0 {
-                    parts[pi]
-                        .blob
-                        .values_at(prank, |v| f(key, v))
-                        .map_err(|e| err(&format!("segment scan read: {e}")))?;
+                    if let Some(w) = pw.as_ref() {
+                        w.values(&mut |v: &[u8]| f(key, v))?;
+                    }
                 }
-                prank += 1;
-                pkey = parts[pi].blob.key_at(prank);
-                while !routed && pkey.is_none() && pi + 1 < np {
-                    pi += 1;
-                    prank = 0;
-                    pkey = parts[pi].blob.key_at(0);
-                }
+                padv = true;
             }
             for (j, c) in l0.iter_mut().enumerate() {
                 if c.key == Some(key) {
@@ -20167,6 +20323,7 @@ impl Reader {
             }
             seen += 1;
         }
+        self.pwalk_close(pw.take());
         Ok(seen)
     }
 
@@ -28263,6 +28420,49 @@ impl<'s> BuildCtx<'s> {
         }
         let at = seg.blob.key_at(r).map_or(Ordering::Greater, |k| k.cmp(uk));
         (r, at)
+    }
+}
+
+/// `Reader::scan_merged`'s walk of one partition: through its sidecar
+/// (`zside::ZCursor`) where the cell holds one in service, by the raw
+/// form's rank and key otherwise.
+enum PWalk<'a> {
+    Raw {
+        seg: &'a Seg,
+        rank: usize,
+        key: Option<&'a [u8]>,
+    },
+    Z(zside::ZCursor<'a>),
+}
+
+impl PWalk<'_> {
+    /// The key at the position, `None` past the partition's end.
+    fn key(&self) -> Option<&[u8]> {
+        match self {
+            PWalk::Raw { key, .. } => *key,
+            PWalk::Z(c) => c.key(),
+        }
+    }
+
+    /// The values at the position, handed to `f`.
+    fn values<F: FnMut(&[u8])>(&self, f: &mut F) -> Result<u64> {
+        match self {
+            PWalk::Raw { seg, rank, .. } => seg.blob.values_at(*rank, &mut *f),
+            PWalk::Z(c) => c.values(f),
+        }
+        .map_err(|e| err(&format!("segment scan read: {e}")))
+    }
+
+    /// One key on.
+    fn advance(&mut self) {
+        match self {
+            PWalk::Raw { seg, rank, key } => {
+                let s = *seg;
+                *rank += 1;
+                *key = s.blob.key_at(*rank);
+            }
+            PWalk::Z(c) => c.advance(),
+        }
     }
 }
 

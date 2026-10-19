@@ -2033,6 +2033,104 @@ fn scans_with_the_block_cache_agree_with_the_model_over_every_window_of_a_covere
     windows_over("windows-cache", true);
 }
 
+#[test]
+fn scans_over_a_piece_agree_with_the_model_over_every_window_of_a_covered_store() {
+    // With a level-0 piece over the partitions a scan takes the merge path
+    // (`scan_merged`): the partition is walked a key at a time beside the
+    // piece's cursor and the unsealed keys, through the partition's
+    // sidecar (`ZCursor`) where it has one, the piece's keys raw since a
+    // piece has no sidecar. Updates, inserts between records and deletes
+    // go into the piece and, after it, into the live table, so the walk
+    // meets a key of every source at every kind of position: a partition
+    // key alone, one the piece rewrites or deletes, one the live table
+    // rewrites over the piece, and keys between records in either.
+    let dir = scratch("windows-piece");
+    let mut db = Db::create(&dir, forced(|o| o.partition_bytes = Some(160 << 10))).unwrap();
+    let mut model = ordered_load(&mut db, 5000, 0x71E);
+    db.zpages_settle().unwrap();
+    assert!(db.zpage_counts().sidecars >= 3);
+    let mut rng = Rng(0x71E1);
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let mut mutate = |db: &mut Db, model: &mut Model, n: usize| {
+        for _ in 0..n {
+            let k = keys[rng.below(keys.len())].clone();
+            match rng.below(7) {
+                0 => {
+                    db.delete(&k);
+                    model.insert(k, Vec::new());
+                }
+                1 => {
+                    let new = [k.as_slice(), b"+"].concat();
+                    let v = suite_value(&mut rng);
+                    db.append(&new, &v);
+                    model.entry(new).or_default().push(v);
+                }
+                2 => {
+                    // Appended to: the partition's value stays, under the
+                    // new one, and the emit reads both.
+                    let v = suite_value(&mut rng);
+                    db.append(&k, &v);
+                    model.entry(k).or_default().push(v);
+                }
+                _ => {
+                    let v = suite_value(&mut rng);
+                    db.put(&k, &v);
+                    model.insert(k, vec![v]);
+                }
+            }
+        }
+        db.commit().unwrap();
+    };
+    mutate(&mut db, &mut model, 200);
+    db.seal().unwrap();
+    db.zpages_settle().unwrap();
+    assert!(
+        db.levels().1 >= 1,
+        "a piece landed and stays one: {:?}",
+        db.levels()
+    );
+    mutate(&mut db, &mut model, 120);
+    let mut starts: Vec<Vec<u8>> =
+        vec![b"".to_vec(), b"a".to_vec(), b"zzz".to_vec(), vec![0xff; 8]];
+    for f in sidecar_files(&dir) {
+        for fk in fence_keys(&f).into_iter().step_by(7) {
+            starts.extend(around(&fk));
+        }
+    }
+    let limits = [1usize, 2, 3, 5, 17, 56, 57, 58, 114, usize::MAX];
+    let latest = db.reader().unwrap();
+    let before = db.zpage_counts();
+    let last = model.keys().next_back().unwrap().clone();
+    let mut walked = 0u64;
+    for start in &starts {
+        for &limit in &limits {
+            let cap = limit.min(1500);
+            let want = window(&model, start, cap);
+            let what = format!("from {:?} for {cap}", String::from_utf8_lossy(start));
+            same_window(&scanned(&db, start, cap), &want, &format!("writer, {what}"));
+            same_window(
+                &scanned(&latest, start, cap),
+                &want,
+                &format!("handle, {what}"),
+            );
+            // A scan from inside the keys walks a partition through its
+            // cursor; one from past every key walks none.
+            if start.as_slice() <= last.as_slice() {
+                walked += 2;
+            }
+        }
+    }
+    check(&db, &model, &keys, "after the windows");
+    let after = db.zpage_counts();
+    assert!(
+        after.scans - before.scans >= walked,
+        "a served walk per scan at least: {after:?}"
+    );
+    assert_eq!(after.raw_scans, before.raw_scans, "{after:?}");
+    assert_eq!(after.fallbacks + after.rejected_damage, 0, "{after:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn windows_over(name: &str, cache: bool) {
     // The scans of a covered partition answer as if the form were not there,
     // with the unsealed keys laid over it: updates, inserts between records
@@ -2065,7 +2163,7 @@ fn windows_over(name: &str, cache: bool) {
     for round in 0..3 {
         for _ in 0..120 {
             let k = keys[rng.below(keys.len())].clone();
-            match rng.below(6) {
+            match rng.below(7) {
                 0 => {
                     db.delete(&k);
                     model.insert(k, Vec::new());
@@ -2075,6 +2173,13 @@ fn windows_over(name: &str, cache: bool) {
                     let v = suite_value(&mut rng);
                     db.append(&new, &v);
                     model.entry(new).or_default().push(v);
+                }
+                2 => {
+                    // Appended to: the partition's value stays, under the
+                    // new one, and the emit reads both.
+                    let v = suite_value(&mut rng);
+                    db.append(&k, &v);
+                    model.entry(k).or_default().push(v);
                 }
                 _ => {
                     let v = suite_value(&mut rng);
@@ -2747,18 +2852,18 @@ fn a_scans_walks_are_served_by_the_sidecars_it_crosses_and_raw_where_there_is_no
         "the first partition is the one left without"
     );
     // (raw walks, served walks) of a scan of five keys from `start`.
-    let delta = |start: &[u8]| {
+    fn delta(db: &Db, start: &[u8]) -> (u64, u64) {
         let before = db.zpage_counts();
         db.scan(start, 5, |_, _| {}).unwrap();
         let c = db.zpage_counts();
         (c.raw_scans - before.raw_scans, c.scans - before.scans)
-    };
+    }
     assert_eq!(
-        delta(&first),
+        delta(&db, &first),
         (1, 0),
         "from inside the partition without one"
     );
-    assert_eq!(delta(b""), (1, 0), "from before every key");
+    assert_eq!(delta(&db, b""), (1, 0), "from before every key");
     let last_before = model
         .range(..firsts[0].clone())
         .next_back()
@@ -2766,18 +2871,18 @@ fn a_scans_walks_are_served_by_the_sidecars_it_crosses_and_raw_where_there_is_no
         .0
         .clone();
     assert_eq!(
-        delta(&last_before),
+        delta(&db, &last_before),
         (1, 1),
         "from the last key before the next: one key raw, four served"
     );
     for f in &firsts {
         assert_eq!(
-            delta(f),
+            delta(&db, f),
             (0, 1),
             "from the first key of a partition with a sidecar"
         );
         assert_eq!(
-            delta(&[f.as_slice(), &[0u8]].concat()),
+            delta(&db, &[f.as_slice(), &[0u8]].concat()),
             (0, 1),
             "and just past it"
         );
@@ -2788,6 +2893,44 @@ fn a_scans_walks_are_served_by_the_sidecars_it_crosses_and_raw_where_there_is_no
         c.scan_groups >= c.scans,
         "a group a served walk at least: {c:?}"
     );
+    // The same walks over a piece, where a scan takes the merge path and
+    // walks each partition by a cursor: a cursor through the partition's
+    // sidecar is a served walk, one through the raw form a raw walk, each
+    // counted as the cursor leaves its partition.
+    db.put(&first, b"in a piece");
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.zpages_settle().unwrap();
+    assert!(db.levels().1 >= 1, "a piece landed: {:?}", db.levels());
+    assert_eq!(
+        delta(&db, &first),
+        (1, 0),
+        "over a piece, from inside the partition without one"
+    );
+    assert_eq!(
+        delta(&db, b""),
+        (1, 0),
+        "over a piece, from before every key"
+    );
+    assert_eq!(
+        delta(&db, &last_before),
+        (1, 1),
+        "over a piece, from the last key before the next: one key raw, four served"
+    );
+    for f in &firsts {
+        assert_eq!(
+            delta(&db, f),
+            (0, 1),
+            "over a piece, from the first key of a partition with a sidecar"
+        );
+        assert_eq!(
+            delta(&db, &[f.as_slice(), &[0u8]].concat()),
+            (0, 1),
+            "over a piece, and just past it"
+        );
+    }
+    let c = db.zpage_counts();
+    assert_eq!((c.fallbacks, c.nopage_scans), (0, 0), "{c:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3732,6 +3875,28 @@ fn records_larger_than_a_page_are_read_from_the_raw_segment() {
     check(&r, &model, &keys, "a handle");
     assert_eq!(db.zpage_counts().nopage_reads, 8, "{c:?}");
     drop(r);
+    // With a piece over the partition the scan takes the merge path, and the
+    // partition's cursor hands the raw form the two records no page holds
+    // as it crosses them, one run each; the walk is one served walk.
+    let c0 = db.zpage_counts();
+    db.put(&spaced_key(10), b"in a piece");
+    model.insert(spaced_key(10), vec![b"in a piece".to_vec()]);
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.zpages_settle().unwrap();
+    assert!(db.levels().1 >= 1, "a piece landed: {:?}", db.levels());
+    check_scan(&db, &model, "the scan over a piece");
+    let c = db.zpage_counts();
+    assert_eq!(
+        (
+            c.scans - c0.scans,
+            c.raw_scans - c0.raw_scans,
+            c.nopage_scans - c0.nopage_scans
+        ),
+        (1, 0, 2),
+        "{c:?}"
+    );
+    assert_eq!((c.fallbacks, c.rawserves), (0, 0), "{c:?}");
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
