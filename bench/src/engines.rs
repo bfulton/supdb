@@ -743,6 +743,11 @@ pub struct Supdb {
     /// against `supdb-nocachezpages` prices the warm, which a restart with
     /// cold sidecars pays before its first read.
     zpages_nowarm: bool,
+    /// The memo of decoded groups off (`Options::zpages_memo` off): the
+    /// pair `supdb-nocachezpagesnomemo` against `supdb-nocachezpages`
+    /// prices the memo, a decode saved on every read of a page the thread
+    /// decoded before.
+    zpages_nomemo: bool,
     /// Every build left to the settle of the form rather than started as
     /// its partition lands (`Options::zpages_eager` off):
     /// `supdb-nocachezpagessettle`, the shape the forced arm's rows were
@@ -1139,6 +1144,9 @@ struct Policy {
     /// Its warm after the attach off (`Options::zpages_warm` off):
     /// `supdb-nocachezpagesnowarm`.
     zpages_nowarm: bool,
+    /// Its memo of decoded groups off (`Options::zpages_memo` off):
+    /// `supdb-nocachezpagesnomemo`.
+    zpages_nomemo: bool,
     /// Its builds left to the settle (`Options::zpages_eager` off):
     /// `supdb-nocachezpagessettle`.
     zpages_settle: bool,
@@ -1238,6 +1246,7 @@ impl Default for Policy {
             zpages: false,
             zpages_nodrop: false,
             zpages_nowarm: false,
+            zpages_nomemo: false,
             zpages_settle: false,
             defer: false,
             firstfloor: false,
@@ -3524,6 +3533,24 @@ impl Supdb {
         )
     }
 
+    /// `supdb-nocachezpages` with the memo of decoded groups off
+    /// (`Options::zpages_memo` off): the pair against `supdb-nocachezpages`
+    /// differs by that one option and prices the memo, the decode a read
+    /// of a compressed page skips when the thread decoded the page before.
+    /// Chosen by hand, as `ab --arms supdb-nocachezpages,supdb-nocachezpagesnomemo`,
+    /// on the point-read passes and the C mix, in core and under a bound.
+    pub fn create_nocache_zpages_nomemo(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                block_cache: false,
+                zpages: true,
+                zpages_nomemo: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-nocachezpages` with every build left to the settle of the
     /// form rather than started as its partition lands
     /// (`Options::zpages_eager` off): the shape the forced arm's first
@@ -3662,6 +3689,7 @@ impl Supdb {
             zpages,
             zpages_nodrop,
             zpages_nowarm,
+            zpages_nomemo,
             zpages_settle,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
@@ -3886,6 +3914,11 @@ impl Supdb {
             } else {
                 supdb::Options::default().zpages_warm
             },
+            zpages_memo: if zpages_nomemo {
+                false
+            } else {
+                supdb::Options::default().zpages_memo
+            },
             zpages_eager: if zpages_settle {
                 false
             } else {
@@ -4035,6 +4068,7 @@ impl Supdb {
             zpages,
             zpages_nodrop,
             zpages_nowarm,
+            zpages_nomemo,
             zpages_settle,
             ord_threads: Default::default(),
         })
@@ -4638,6 +4672,8 @@ impl Engine for Supdb {
                 "supdb-nocachezpagesnodrop"
             } else if self.zpages_nowarm {
                 "supdb-nocachezpagesnowarm"
+            } else if self.zpages_nomemo {
+                "supdb-nocachezpagesnomemo"
             } else if self.zpages_settle {
                 "supdb-nocachezpagessettle"
             } else {
@@ -4859,6 +4895,8 @@ impl Engine for Supdb {
             ("zpage_warm_bytes", z.warm_bytes as f64),
             ("zpage_warm_skipped", z.warm_skipped as f64),
             ("zpage_warm_us", z.warm_us as f64),
+            ("zpage_memo_hits", z.memo_hits as f64),
+            ("zpage_memo_misses", z.memo_misses as f64),
             ("zpage_declined_small", z.declined_small as f64),
             ("zpage_declined_small_bytes", z.declined_small_bytes as f64),
             (
@@ -5468,6 +5506,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocachezpages"
         | "supdb-nocachezpagesnodrop"
         | "supdb-nocachezpagesnowarm"
+        | "supdb-nocachezpagesnomemo"
         | "supdb-nocachezpagessettle"
         | "supdb-cache256"
         | "supdb-l0"
@@ -5649,6 +5688,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nocachezpages" => Box::new(Supdb::create_nocache_zpages(dir)?),
         "supdb-nocachezpagesnodrop" => Box::new(Supdb::create_nocache_zpages_nodrop(dir)?),
         "supdb-nocachezpagesnowarm" => Box::new(Supdb::create_nocache_zpages_nowarm(dir)?),
+        "supdb-nocachezpagesnomemo" => Box::new(Supdb::create_nocache_zpages_nomemo(dir)?),
         "supdb-nocachezpagessettle" => Box::new(Supdb::create_nocache_zpages_settle(dir)?),
         "supdb-cache256" => Box::new(Supdb::create_cache256(dir)?),
         "supdb-ingest" => Box::new(Supdb::create_ingest(dir)?),
@@ -6382,14 +6422,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// `supdb-nocachezpagesnowarm` and `supdb-nocachezpagessettle` are each
-    /// `supdb-nocachezpages` with one option moved -- the warm of a
-    /// sidecar's file after its attach off, every build left to the settle
-    /// -- and nothing else: named, durable like it, opened under their
-    /// names by the dispatch, on options that differ from the arm's in that
+    /// `supdb-nocachezpagesnowarm`, `supdb-nocachezpagessettle` and
+    /// `supdb-nocachezpagesnomemo` are each `supdb-nocachezpages` with one
+    /// option moved -- the warm of a sidecar's file after its attach off,
+    /// every build left to the settle, the memo of decoded groups off --
+    /// and nothing else: named, durable like it, opened under their names
+    /// by the dispatch, on options that differ from the arm's in that
     /// option alone, and forced like it.
     #[test]
-    fn the_nowarm_and_settle_arms_differ_from_the_zpages_arm_in_one_option_each() {
+    fn the_nowarm_settle_and_nomemo_arms_differ_from_the_zpages_arm_in_one_option_each() {
         let root =
             std::env::temp_dir().join(format!("supdb-bench-zpagesarms-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -6405,7 +6446,8 @@ mod tests {
         // so an arm that pins neither has both as the engine ships them.
         assert!(supdb::Options::default().zpages_warm);
         assert!(supdb::Options::default().zpages_eager);
-        assert!(b.zpages_warm && b.zpages_eager);
+        assert!(supdb::Options::default().zpages_memo);
+        assert!(b.zpages_warm && b.zpages_eager && b.zpages_memo);
         for (name, make, arm_dir) in [
             (
                 "supdb-nocachezpagesnowarm",
@@ -6417,6 +6459,11 @@ mod tests {
                 Supdb::create_nocache_zpages_settle,
                 "settle",
             ),
+            (
+                "supdb-nocachezpagesnomemo",
+                Supdb::create_nocache_zpages_nomemo,
+                "nomemo",
+            ),
         ] {
             let arm = new(arm_dir, make);
             assert_eq!(arm.name(), name);
@@ -6426,6 +6473,7 @@ mod tests {
             assert!(!arm.zpages_nodrop);
             assert_eq!(arm.zpages_nowarm, arm_dir == "nowarm");
             assert_eq!(arm.zpages_settle, arm_dir == "settle");
+            assert_eq!(arm.zpages_nomemo, arm_dir == "nomemo");
             assert_eq!(arm.partition, base.partition, "the row's shape");
             assert_eq!(arm.drain, base.drain);
             assert_eq!(arm.durable, base.durable);
@@ -6440,6 +6488,7 @@ mod tests {
                 arm_dir != "settle",
                 "{name}: the one option"
             );
+            assert_eq!(a.zpages_memo, arm_dir != "nomemo", "{name}: the one option");
             assert!(a.zpages == supdb::ZPages::Always && b.zpages == supdb::ZPages::Always);
             assert_eq!(a.zpages_drop_behind, b.zpages_drop_behind);
             assert_eq!(a.zpages_min_bytes, b.zpages_min_bytes);

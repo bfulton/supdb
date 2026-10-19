@@ -38,12 +38,13 @@ use super::zpages::{
 use crate::blob::{Blob, BlobOptions, ZSource};
 use crate::bytes::{Bytes, MmapBytes};
 use crate::flatindex::{parse_record, rd_u32, record_key, record_key_next};
-use crate::index::{Ext, Exts};
-use std::cell::Cell;
+use crate::index::Ext;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering as KeyOrder;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Result, Write};
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 /// The size floor: a partition whose record region is under this many bytes
@@ -157,7 +158,8 @@ fn engine_filter(
 pub(super) enum ZRead {
     /// The sidecar answered: `n` values (or the count), and whether a page
     /// was decoded to get there. A page is decoded for every key that falls
-    /// in its range, the key it holds and the key it does not alike; a
+    /// in its range, the key it holds and the key it does not alike, unless
+    /// the thread's memo holds its group from a decode before (`Memo`); a
     /// stored page is parsed where it lies and decodes nothing, and a key
     /// below the partition's first key is answered from the fence, touching
     /// no page.
@@ -235,6 +237,9 @@ enum Group<'a> {
     None,
     Page(&'a [u8]),
     Buf(usize),
+    /// The memo's, `n` bytes of it, held for the group's life in the
+    /// cursor.
+    Memo(Rc<GroupBuf>, usize),
     Raw,
 }
 
@@ -363,9 +368,10 @@ impl<'a> ZCursor<'a> {
 
     /// The group as the last open left it.
     fn group(&self) -> &[u8] {
-        match self.group {
+        match &self.group {
             Group::Page(p) => p,
-            Group::Buf(n) => self.buf.bytes(n),
+            Group::Buf(n) => self.buf.bytes(*n),
+            Group::Memo(g, n) => g.bytes(*n),
             Group::None | Group::Raw => &[],
         }
     }
@@ -399,17 +405,24 @@ impl<'a> ZCursor<'a> {
             .side
             .page_bytes(self.page)
             .and_then(|page| page_view(page).ok());
-        let Some(decoded) = self.side.open_group(entry, &mut self.buf).map(|g| g.2) else {
+        let Some((opened, _, decoded)) = self.side.open_group(entry, &mut self.buf) else {
             self.fall();
             return false;
         };
         if decoded {
             self.decoded += 1;
         }
-        self.group = match view {
-            Some((h, payload)) if h.stored => Group::Page(payload),
-            Some((h, _)) => Group::Buf(h.ulen as usize),
-            None => {
+        // The memo's group is held by its `Rc`; a borrowed one is the
+        // buffer's or the page's, and its borrow ends here.
+        let memo = match opened {
+            Opened::Memo(g, n) => Some((g, n)),
+            Opened::Borrowed(_) => None,
+        };
+        self.group = match (memo, view) {
+            (Some((g, n)), _) => Group::Memo(g, n),
+            (None, Some((h, payload))) if h.stored => Group::Page(payload),
+            (None, Some((h, _))) => Group::Buf(h.ulen as usize),
+            (None, None) => {
                 self.side.fail(self.page);
                 self.fall();
                 return false;
@@ -468,7 +481,7 @@ impl<'a> ZCursor<'a> {
         match self.group {
             Group::None => None,
             Group::Raw => self.raw.key_at(self.rank),
-            Group::Page(_) | Group::Buf(_) => {
+            Group::Page(_) | Group::Buf(_) | Group::Memo(..) => {
                 let (at, len) = self.key_at;
                 self.group().get(at..at + len)
             }
@@ -480,16 +493,18 @@ impl<'a> ZCursor<'a> {
         match self.group {
             Group::None => Ok(0),
             Group::Raw => self.raw.values_at(self.rank, &mut *f),
-            Group::Page(_) | Group::Buf(_) => match parse_record(self.group(), self.off) {
-                Some((_, exts, tail, _)) => self.raw.read_exts(&exts, tail, &mut *f),
-                None => {
-                    // The first decode walked every record of the group
-                    // whole, so this is a group changed under the mapping:
-                    // the page out of service and the raw form's values.
-                    self.side.fail(self.page);
-                    self.raw.values_at(self.rank, &mut *f)
+            Group::Page(_) | Group::Buf(_) | Group::Memo(..) => {
+                match parse_record(self.group(), self.off) {
+                    Some((_, exts, tail, _)) => self.raw.read_exts(&exts, tail, &mut *f),
+                    None => {
+                        // The first decode walked every record of the group
+                        // whole, so this is a group changed under the mapping:
+                        // the page out of service and the raw form's values.
+                        self.side.fail(self.page);
+                        self.raw.values_at(self.rank, &mut *f)
+                    }
                 }
-            },
+            }
         }
     }
 
@@ -514,16 +529,39 @@ impl Drop for ZCursor<'_> {
     }
 }
 
+/// A group opened (`ZSide::open_group`): where its bytes are.
+enum Opened<'a> {
+    /// A stored page parsed where it lies in the mapping, or a group
+    /// decoded into the thread's buffer with the memo off.
+    Borrowed(&'a [u8]),
+    /// From the memo, or decoded into a buffer the memo now holds: `n`
+    /// bytes of it.
+    Memo(Rc<GroupBuf>, usize),
+}
+
+impl Opened<'_> {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Opened::Borrowed(b) => b,
+            Opened::Memo(g, n) => g.bytes(*n),
+        }
+    }
+}
+
 /// Where a key lies in a sidecar, found or not, with the bytes it lies in.
 enum Locate<'a> {
     /// The key is not in this partition: sorts below its first key, or
     /// among the records of the page it would be in, which was decoded to
     /// find that out unless it is stored or there was no page to open.
     Absent { decoded: bool },
-    /// The record: its extents, its tail, and whether a page was decoded.
+    /// The record: the group it lies in as it was opened, its offset in
+    /// the group, the page, and whether a page was decoded. The caller
+    /// parses the record out of the group, which the `Opened` keeps alive
+    /// -- an `Rc` into the memo where the group came from there.
     Found {
-        exts: Exts<'a>,
-        tail: &'a [u8],
+        opened: Opened<'a>,
+        off: usize,
+        page: usize,
         decoded: bool,
     },
     /// A check failed.
@@ -624,6 +662,125 @@ fn put_buf(b: GroupBuf) {
     ZBUF.with(|c| c.set(Some(b)));
 }
 
+/// The memo's slots, and its cap on the decoded bytes it holds, a thread.
+pub(super) const ZMEMO_SLOTS: usize = 1024;
+pub(super) const ZMEMO_BYTES: usize = 8 << 20;
+
+/// The memo of decoded groups (3.7): a thread's, direct-mapped over its
+/// slots and capped at `cap` bytes of the groups it holds, keyed by the
+/// sidecar's attach identity and the page. A hit hands back the group as
+/// it was decoded and pays the in-group walk alone; an entry is an `Rc`
+/// to its buffer, so a read holds its group across a callback's nested
+/// read, which may displace the entry from the memo without taking the
+/// group away. A sidecar retired takes a new identity at its next attach,
+/// so its entries never hit again and are displaced as the slots turn
+/// over. The slot is the page plus a multiple of the identity, so one
+/// sidecar's pages collide only past the slot count and two sidecars'
+/// are offset from each other.
+struct Memo {
+    slots: Vec<Option<MemoEntry>>,
+    cap: usize,
+    bytes: usize,
+    /// Where the next displacement for the cap begins.
+    sweep: usize,
+    hits: u64,
+    misses: u64,
+}
+
+struct MemoEntry {
+    side: u64,
+    page: u32,
+    group: Rc<GroupBuf>,
+    len: usize,
+}
+
+impl Memo {
+    fn new(slots: usize, cap: usize) -> Memo {
+        Memo {
+            slots: (0..slots.max(1)).map(|_| None).collect(),
+            cap,
+            bytes: 0,
+            sweep: 0,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    fn slot(&self, side: u64, page: u32) -> usize {
+        (page as usize).wrapping_add((side as usize).wrapping_mul(0x9E37_79B9)) % self.slots.len()
+    }
+
+    /// The group memoised for `(side, page)`, counted a hit or a miss.
+    fn get(&mut self, side: u64, page: u32) -> Option<(Rc<GroupBuf>, usize)> {
+        let i = self.slot(side, page);
+        match &self.slots[i] {
+            Some(e) if e.side == side && e.page == page => {
+                self.hits += 1;
+                Some((Rc::clone(&e.group), e.len))
+            }
+            _ => None,
+        }
+    }
+
+    /// `group` memoised for `(side, page)`, which is a miss -- every decode
+    /// of a compressed page with the memo on ends here, a lookup before it
+    /// or not: the slot's occupant displaced, and for the cap further
+    /// entries from a rotating sweep until the bytes held fit, the entry
+    /// just put kept, so the bytes never exceed the cap unless this one
+    /// group does.
+    fn put(&mut self, side: u64, page: u32, group: Rc<GroupBuf>, len: usize) {
+        self.misses += 1;
+        let i = self.slot(side, page);
+        if let Some(old) = self.slots[i].take() {
+            self.bytes -= old.len;
+        }
+        self.slots[i] = Some(MemoEntry {
+            side,
+            page,
+            group,
+            len,
+        });
+        self.bytes += len;
+        let n = self.slots.len();
+        let mut turns = 0;
+        while self.bytes > self.cap && turns < n {
+            let j = self.sweep;
+            self.sweep = (self.sweep + 1) % n;
+            turns += 1;
+            if j == i {
+                continue;
+            }
+            if let Some(old) = self.slots[j].take() {
+                self.bytes -= old.len;
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// The thread's memo: borrowed for a lookup or a put and never across
+    /// a decode or a callback.
+    static ZMEMO: RefCell<Memo> = RefCell::new(Memo::new(ZMEMO_SLOTS, ZMEMO_BYTES));
+}
+
+/// The memo's hits and misses on this thread since the last take, for the
+/// handle's counters (`Reader::zpage_counts`: `memo_hits`, `memo_misses`).
+pub(super) fn memo_take() -> (u64, u64) {
+    ZMEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        let r = (m.hits, m.misses);
+        m.hits = 0;
+        m.misses = 0;
+        r
+    })
+}
+
+/// A test's: the thread's memo made anew with `slots` and `cap`.
+#[cfg(test)]
+fn memo_resize(slots: usize, cap: usize) {
+    ZMEMO.with(|m| *m.borrow_mut() = Memo::new(slots, cap));
+}
+
 fn bit(map: &[AtomicU64], p: usize) -> bool {
     map[p >> 6].load(Ordering::Relaxed) & (1u64 << (p & 63)) != 0
 }
@@ -675,9 +832,13 @@ pub(super) struct ZSide {
     /// Any check failed: the sidecar is out of service, and reads of the
     /// partition go to the raw form until it is dropped.
     damaged: AtomicBool,
+    /// This attach's identity, which the memo keys its groups by.
     id: u64,
     /// The trailer this attach accepted.
     ident: Trailer,
+    /// Whether compressed pages are opened through the thread's memo
+    /// (`Options::zpages_memo`).
+    memo: bool,
     /// A test's: the file's bytes in a buffer of the test's own, read in
     /// place of the mapping from `skew` bytes in, so that a page can sit at
     /// an address a mapping never gives it.
@@ -716,6 +877,7 @@ impl ZSide {
         id: u64,
         end_seq: u64,
         advise: bool,
+        memo: bool,
     ) -> std::result::Result<ZSide, Reject> {
         let damage = |e: ZError| Reject::Damage(e.to_string());
         let map = match MmapBytes::open(path) {
@@ -786,6 +948,7 @@ impl ZSide {
             damaged: AtomicBool::new(false),
             id: NEXT_ZSIDE_ID.fetch_add(1, Ordering::Relaxed),
             ident: t,
+            memo,
             #[cfg(test)]
             skewed: None,
         };
@@ -859,24 +1022,63 @@ impl ZSide {
         &'a self,
         entry: &FenceEntry<'_>,
         buf: &'a mut GroupBuf,
-    ) -> Option<(&'a [u8], usize, bool)> {
+    ) -> Option<(Opened<'a>, usize, bool)> {
         let p = entry.page as usize;
         let Some(page) = self.page_bytes(p).filter(|_| p < self.n_pages) else {
             self.fail(p);
             return None;
         };
         let was_verified = bit(&self.verified, p);
+        // A compressed page goes through the memo: the group as a decode
+        // before left it, for a page this process has verified, since a
+        // hit repeats no check as the verified path repeats none; else a
+        // decode into a buffer of its own that the memo takes. A stored
+        // page is parsed where it lies and has nothing to memoise.
+        let compressed = page_view(page)
+            .ok()
+            .filter(|(h, _)| !h.stored)
+            .map(|(h, _)| usize::from(h.count));
+        if let (true, Some(count)) = (self.memo, compressed) {
+            if was_verified {
+                let hit = ZMEMO.with(|m| m.borrow_mut().get(self.id, entry.page));
+                if let Some((g, n)) = hit {
+                    return Some((Opened::Memo(g, n), count, false));
+                }
+            }
+            let mut fresh = GroupBuf::new();
+            let (count, ulen) = {
+                let opened = if was_verified {
+                    verified_group(page, &mut fresh)
+                } else {
+                    first_decode(page, self.bind, entry, &mut fresh)
+                };
+                match opened {
+                    Ok((g, count, _)) => (count, g.len()),
+                    Err(Fail::Misaligned) => return None,
+                    Err(Fail::Check(_)) => {
+                        self.fail(p);
+                        return None;
+                    }
+                }
+            };
+            if !was_verified {
+                set_bit(&self.verified, p);
+            }
+            let g = Rc::new(fresh);
+            ZMEMO.with(|m| m.borrow_mut().put(self.id, entry.page, Rc::clone(&g), ulen));
+            return Some((Opened::Memo(g, ulen), count, true));
+        }
         let opened = if was_verified {
             verified_group(page, buf)
         } else {
             first_decode(page, self.bind, entry, buf)
         };
         match opened {
-            Ok(g) => {
+            Ok((g, count, decoded)) => {
                 if !was_verified {
                     set_bit(&self.verified, p);
                 }
-                Some(g)
+                Some((Opened::Borrowed(g), count, decoded))
             }
             Err(Fail::Misaligned) => None,
             Err(Fail::Check(_)) => {
@@ -919,27 +1121,22 @@ impl ZSide {
         }
         let p = entry.page as usize;
         let first = entry.first_rank as usize;
-        let Some((group, _, decoded)) = self.open_group(&entry, buf) else {
+        let Some((opened, _, decoded)) = self.open_group(&entry, buf) else {
             return Locate::Fallback;
         };
         let mut off = 0usize;
         for _ in first..rank {
-            let Some((_, next)) = record_key_next(group, off) else {
+            let Some((_, next)) = record_key_next(opened.bytes(), off) else {
                 self.fail(p);
                 return Locate::Fallback;
             };
             off = next;
         }
-        match parse_record(group, off) {
-            Some((_, exts, tail, _)) => Locate::Found {
-                exts,
-                tail,
-                decoded,
-            },
-            None => {
-                self.fail(p);
-                Locate::Fallback
-            }
+        Locate::Found {
+            opened,
+            off,
+            page: p,
+            decoded,
         }
     }
 
@@ -979,10 +1176,10 @@ impl ZSide {
             self.fail(p);
             return Locate::Fallback;
         };
-        let Some((group, count, decoded)) = self.open_group(&entry, buf) else {
+        let Some((opened, count, decoded)) = self.open_group(&entry, buf) else {
             return Locate::Fallback;
         };
-        let pos = match group_seek(group, count, key) {
+        let pos = match group_seek(opened.bytes(), count, key) {
             Ok(pos) => pos,
             Err(_) => {
                 self.fail(p);
@@ -992,16 +1189,11 @@ impl ZSide {
         if !pos.found {
             return Locate::Absent { decoded };
         }
-        match parse_record(group, pos.off) {
-            Some((_, exts, tail, _)) => Locate::Found {
-                exts,
-                tail,
-                decoded,
-            },
-            None => {
-                self.fail(p);
-                Locate::Fallback
-            }
+        Locate::Found {
+            opened,
+            off: pos.off,
+            page: p,
+            decoded,
         }
     }
 
@@ -1021,12 +1213,21 @@ impl ZSide {
             Locate::Fallback => Ok(ZRead::Fallback),
             Locate::NoPage => Ok(ZRead::NoPage),
             Locate::Found {
-                exts,
-                tail,
+                opened,
+                off,
+                page,
                 decoded,
-            } => raw
-                .read_exts(&exts, tail, &mut *f)
-                .map(|n| ZRead::Served { n, decoded }),
+            } => match parse_record(opened.bytes(), off) {
+                Some((_, exts, tail, _)) => raw
+                    .read_exts(&exts, tail, &mut *f)
+                    .map(|n| ZRead::Served { n, decoded }),
+                None => {
+                    // The first decode walked every record whole: a group
+                    // changed under the mapping, the page out of service.
+                    self.fail(page);
+                    Ok(ZRead::Fallback)
+                }
+            },
         };
         put_buf(buf);
         r
@@ -1040,9 +1241,20 @@ impl ZSide {
             Locate::Out => ZRead::Out,
             Locate::Fallback => ZRead::Fallback,
             Locate::NoPage => ZRead::NoPage,
-            Locate::Found { exts, decoded, .. } => ZRead::Served {
-                n: exts.iter().map(|e| u64::from(e.records())).sum(),
+            Locate::Found {
+                opened,
+                off,
+                page,
                 decoded,
+            } => match parse_record(opened.bytes(), off) {
+                Some((_, exts, _, _)) => ZRead::Served {
+                    n: exts.iter().map(|e| u64::from(e.records())).sum(),
+                    decoded,
+                },
+                None => {
+                    self.fail(page);
+                    ZRead::Fallback
+                }
             },
         };
         put_buf(buf);
@@ -1136,10 +1348,11 @@ impl ZSide {
                 continue;
             }
             let p = entry.page as usize;
-            let Some((group, _, decoded)) = self.open_group(&entry, buf) else {
+            let Some((opened, _, decoded)) = self.open_group(&entry, buf) else {
                 out.end = ScanEnd::Fallback;
                 return Ok(());
             };
+            let group = opened.bytes();
             if decoded {
                 out.decoded += 1;
             }
@@ -1186,12 +1399,21 @@ impl ZSide {
             Locate::Fallback => Ok(ZRead::Fallback),
             Locate::NoPage => Ok(ZRead::NoPage),
             Locate::Found {
-                exts,
-                tail,
+                opened,
+                off,
+                page,
                 decoded,
-            } => raw
-                .read_exts(&exts, tail, &mut *f)
-                .map(|n| ZRead::Served { n, decoded }),
+            } => match parse_record(opened.bytes(), off) {
+                Some((_, exts, tail, _)) => raw
+                    .read_exts(&exts, tail, &mut *f)
+                    .map(|n| ZRead::Served { n, decoded }),
+                None => {
+                    // The first decode walked every record whole: a group
+                    // changed under the mapping, the page out of service.
+                    self.fail(page);
+                    Ok(ZRead::Fallback)
+                }
+            },
         };
         put_buf(buf);
         r
@@ -1241,7 +1463,7 @@ impl ZSide {
         let mut buf = take_buf();
         let r = match self.open_group(&entry, &mut buf) {
             None => ZSeek::Fallback,
-            Some((group, count, decoded)) => match group_seek(group, count, key) {
+            Some((opened, count, decoded)) => match group_seek(opened.bytes(), count, key) {
                 Ok(pos) => ZSeek::Served {
                     rank: first + pos.index,
                     at: if pos.found {
@@ -2323,7 +2545,16 @@ mod tests {
         }
 
         fn attach(&self) -> std::result::Result<ZSide, Reject> {
-            ZSide::attach(&self.out, &self.blob, ID, END, false)
+            ZSide::attach(&self.out, &self.blob, ID, END, false, true)
+        }
+
+        /// Attached with the memo off: for a test of the decode path,
+        /// whose second read of a page must decode it as the first did --
+        /// a page changed under the mapping, a page a buffer cannot lend,
+        /// a stored page beside a compressed one. With the memo on, a
+        /// page's group is served as it was decoded while it holds.
+        fn attach_nomemo(&self) -> std::result::Result<ZSide, Reject> {
+            ZSide::attach(&self.out, &self.blob, ID, END, false, false)
         }
 
         /// A sidecar built and attached.
@@ -2556,9 +2787,10 @@ mod tests {
             panic!("built")
         };
         assert!(b.fill.stored > 0, "stored pages");
-        let side = fx.attach().unwrap();
+        let side = fx.attach_nomemo().unwrap();
         agree(&side, &fx.blob, &fx.recs);
-        // A stored page is parsed where it lies: nothing is decoded.
+        // A stored page is parsed where it lies: nothing is decoded. (The
+        // memo off, so that the compressed page beside it decodes again.)
         let key = &fx.recs[fx.recs.len() / 2].0;
         let mut seen = 0;
         let r = side
@@ -2667,6 +2899,9 @@ mod tests {
         let fx = Fixture::new("reentry", suite(3000, 21), 256);
         let side = fx.side();
         let (a, b) = (&fx.recs[10], &fx.recs[2500]);
+        // The memo one slot wide: the inner read's put displaces the outer
+        // group's entry, which the outer read holds through its `Rc`.
+        memo_resize(1, ZMEMO_BYTES);
         let mut seen = false;
         let r = side
             .read_all(&fx.blob, &a.0, &mut |outer: &[u8]| {
@@ -2686,6 +2921,109 @@ mod tests {
             })
             .unwrap();
         assert!(seen && served(r) == 1);
+        memo_resize(ZMEMO_SLOTS, ZMEMO_BYTES);
+    }
+
+    /// The memo: a direct-mapped table under a byte cap. An entry put is
+    /// found until displaced, another sidecar's same page is not it, a put
+    /// that passes the cap displaces others until the bytes held fit with
+    /// the entry just put kept, and the hits and misses count.
+    #[test]
+    fn the_memo_holds_its_cap_and_counts_its_hits() {
+        let g = |n: usize| (Rc::new(GroupBuf::new()), n);
+        let mut m = Memo::new(8, 100);
+        assert!(m.get(1, 0).is_none());
+        let (b, n) = g(40);
+        m.put(1, 0, b, n);
+        assert_eq!(m.get(1, 0).map(|(_, n)| n), Some(40));
+        assert!(m.get(2, 0).is_none(), "another sidecar's page 0");
+        // The same page of another sidecar in the same slot: the slot is
+        // the page plus a multiple of the identity, and the multiplier is
+        // one more than a multiple of eight, so over eight slots sides
+        // eight apart put a page in one slot. Only the side compare tells
+        // them apart, and this is the one way to reach it.
+        assert_eq!(m.slot(1, 0), m.slot(9, 0), "the collision this builds");
+        assert!(m.get(9, 0).is_none(), "another sidecar's page 0, in the same slot");
+        let (b, n) = g(40);
+        m.put(1, 1, b, n);
+        assert_eq!(m.bytes, 80);
+        let (b, n) = g(40);
+        m.put(1, 2, b, n);
+        assert!(m.bytes <= 100, "{}", m.bytes);
+        assert!(m.get(1, 2).is_some(), "the entry just put stays");
+        assert_eq!((m.hits, m.misses), (2, 3), "a miss a put");
+        // A group over the cap on its own is held alone.
+        let (b, n) = g(150);
+        m.put(1, 3, b, n);
+        assert_eq!(m.bytes, 150);
+        assert!(m.get(1, 3).is_some() && m.get(1, 2).is_none());
+        // The same page put again replaces, and the bytes follow.
+        let (b, n) = g(10);
+        m.put(1, 3, b, n);
+        assert_eq!(m.bytes, 10);
+        // A page past the slot count shares a slot with one below it.
+        let (b, n) = g(10);
+        m.put(1, 11, b, n);
+        assert!(m.get(1, 3).is_none() && m.get(1, 11).is_some());
+    }
+
+    /// Reads through the memo: the first read of each compressed page
+    /// decodes it and the memo takes the group, a second pass over the
+    /// same keys hits for every one, a sidecar attached anew (a new
+    /// identity) hits none of the entries the old one left, and with the
+    /// memo off every read decodes and the memo counts nothing.
+    #[test]
+    fn the_memo_serves_the_second_read_of_a_page_and_never_another_attach() {
+        let fx = Fixture::new("memo", suite(3000, 41), 256);
+        let side = fx.side();
+        let pages = side.pages() as u64;
+        let stored = (0..side.pages())
+            .filter(|&p| page_view(side.page_bytes(p).unwrap()).unwrap().0.stored)
+            .count() as u64;
+        assert_eq!(stored, 0, "the suite's values compress");
+        memo_take();
+        let read_all = |side: &ZSide| {
+            let mut decoded = 0u64;
+            for r in &fx.recs {
+                let got = side.read_all(&fx.blob, &r.0, &mut |_: &[u8]| {}).unwrap();
+                match got {
+                    ZRead::Served { n, decoded: d } => {
+                        assert_eq!(n, r.1.len() as u64);
+                        decoded += u64::from(d);
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            decoded
+        };
+        let n = fx.recs.len() as u64;
+        let d1 = read_all(&side);
+        let (h1, m1) = memo_take();
+        assert_eq!(
+            (m1, d1, h1 + m1),
+            (pages, pages, n),
+            "a miss and a decode a page, the rest hits"
+        );
+        let d2 = read_all(&side);
+        assert_eq!(
+            (memo_take(), d2),
+            ((n, 0), 0),
+            "the second pass hits for every read"
+        );
+        let other = fx.attach().unwrap();
+        let d3 = read_all(&other);
+        assert_eq!(
+            (memo_take(), d3),
+            ((n - pages, pages), pages),
+            "a new identity misses every page once"
+        );
+        let off = ZSide::attach(&fx.out, &fx.blob, ID, END, false, false).unwrap();
+        let d4 = read_all(&off);
+        assert_eq!(
+            (memo_take(), d4),
+            ((0, 0), n),
+            "the memo off: every read decodes"
+        );
     }
 
     #[test]
@@ -2710,11 +3048,11 @@ mod tests {
         one.side();
         let b = &one.blob;
         assert!(matches!(
-            ZSide::attach(&one.out, b, ID + 1, END, false),
+            ZSide::attach(&one.out, b, ID + 1, END, false, true),
             Err(Reject::Identity(_))
         ));
         assert!(matches!(
-            ZSide::attach(&one.out, b, ID, END + 1, false),
+            ZSide::attach(&one.out, b, ID, END + 1, false, true),
             Err(Reject::Identity(_))
         ));
         // No file is no rejection.
@@ -3230,7 +3568,9 @@ mod tests {
         let good = std::fs::read(&fx.out).unwrap();
         let t = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
         let p = t.n_pages as usize / 2;
-        let side = fx.attach().unwrap();
+        // The memo off: with it on the group is served as it was decoded
+        // while the memo holds it, whatever the page became.
+        let side = fx.attach_nomemo().unwrap();
         let entry = side.fence.entry(p, side.nkeys as u32).unwrap();
         let (first_rank, count) = (entry.first_rank, entry.count as usize);
         let k = fx.recs[first_rank as usize + 3].clone();
@@ -3278,7 +3618,7 @@ mod tests {
         let good = std::fs::read(&fx.out).unwrap();
         let t = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
         let p = t.n_pages as usize / 2;
-        let side = fx.attach().unwrap();
+        let side = fx.attach_nomemo().unwrap();
         let entry = side.fence.entry(p, side.nkeys as u32).unwrap();
         let (first_rank, count) = (entry.first_rank, entry.count as u16);
         let (key, vals, _) = fx.recs[first_rank as usize + 3].clone();
@@ -3478,9 +3818,11 @@ mod tests {
             // A walk across the record no page holds hands the raw form
             // exactly its run, once; the suite's shape never does.
             let mut sink = |_: &[u8], _: &[u8]| {};
+            memo_take();
             let z = side.scan_at(&fx.blob, 0, usize::MAX, &mut sink).unwrap();
+            let (hits, _) = memo_take();
             assert_eq!(z.nopage, u64::from(name == "scan-nopage"), "{name}");
-            assert!(z.decoded > 1, "{name}: {z:?}");
+            assert!(z.decoded + hits > 1, "{name}: {z:?}, {hits} from the memo");
             assert!(!side.damaged());
         }
     }
@@ -3869,7 +4211,7 @@ mod tests {
         let bytes = std::fs::read(&fx.out).unwrap();
         // A sidecar fresh from its attach: no page is verified yet, so a read
         // that meets a page meets it in its first decode.
-        let mut side = fx.attach().unwrap();
+        let mut side = fx.attach_nomemo().unwrap();
         // Which pages are stored: entropy makes most of them so, and a group
         // that LZ4 does shorten is decoded into a buffer of the reader's own,
         // which is aligned whatever the source is.
