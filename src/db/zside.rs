@@ -40,6 +40,7 @@ use crate::bytes::{Bytes, MmapBytes};
 use crate::flatindex::{parse_record, rd_u32, record_key, record_key_next};
 use crate::index::{Ext, Exts};
 use std::cell::Cell;
+use std::cmp::Ordering as KeyOrder;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Result, Write};
 use std::path::Path;
@@ -201,6 +202,316 @@ pub(super) enum ScanEnd {
     Fallback,
     /// The sidecar was out of service before the first record.
     Out,
+}
+
+/// What a seek or a cut through a sidecar answered (`ZSide::seek`,
+/// `ZSide::cut_in`, `ZCursor::seek`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ZSeek {
+    /// The rank; how the key there compares with the key sought, `Equal`
+    /// for the key itself and `Greater` for the first key past it or the
+    /// end; and whether a page was decoded to find it.
+    Served {
+        rank: usize,
+        at: KeyOrder,
+        decoded: bool,
+    },
+    /// A check failed: the sidecar leaves service, and the caller asks the
+    /// raw form and counts a fallback.
+    Fallback,
+    /// The sidecar is out of service: the raw form's.
+    Out,
+    /// The key falls in an entry no page holds that covers more than one
+    /// record, which this builder does not write: the raw form's to say,
+    /// as a read of such an entry is.
+    NoPage,
+}
+
+/// Where a cursor's group is: parsed in place in a stored page of the
+/// mapping, decoded in the cursor's own buffer, or nowhere -- a run of
+/// records no page holds, or a sidecar that failed a check under the
+/// cursor, both read through the raw form -- or past the end.
+enum Group<'a> {
+    None,
+    Page(&'a [u8]),
+    Buf(usize),
+    Raw,
+}
+
+/// A position in a covered partition (3.10), for the merge that walks a
+/// partition a key at a time beside the pieces over it
+/// (`Reader::scan_merged`): the entry the rank falls in, its group held in
+/// the cursor's own buffer across the calls that walk it, the record's
+/// offset in the group and its key's span. `key` lends the key where it
+/// lies in the group, and `advance` moves on to the next record of the
+/// group or opens the next entry's. A run of records no page holds is
+/// walked through the raw form for exactly those ranks, and a check that
+/// fails under the cursor makes the rest of its walk the raw form's, with
+/// the sidecar out of service, so that every key is still answered.
+///
+/// The cursor holds the thread's group buffer for its life; a read of a
+/// covered partition made inside the walk makes a buffer of its own, as a
+/// callback's nested read does.
+pub(super) struct ZCursor<'a> {
+    side: &'a ZSide,
+    raw: &'a Blob<MmapBytes>,
+    rank: usize,
+    /// The rank the current entry's records end at; the key count past the
+    /// last entry or once the cursor is the raw form's.
+    end: usize,
+    page: usize,
+    /// The record's offset in the group, its key's offset and length, and
+    /// the next record's offset.
+    off: usize,
+    key_at: (usize, usize),
+    next: usize,
+    group: Group<'a>,
+    buf: GroupBuf,
+    /// Groups decoded and runs of records no page holds met, for the
+    /// handle's counters.
+    pub(super) decoded: u64,
+    pub(super) nopage: u64,
+    fell: bool,
+}
+
+impl<'a> ZCursor<'a> {
+    fn new(side: &'a ZSide, raw: &'a Blob<MmapBytes>) -> ZCursor<'a> {
+        ZCursor {
+            side,
+            raw,
+            rank: 0,
+            end: 0,
+            page: 0,
+            off: 0,
+            key_at: (0, 0),
+            next: 0,
+            group: Group::None,
+            buf: take_buf(),
+            decoded: 0,
+            nopage: 0,
+            fell: false,
+        }
+    }
+
+    /// A cursor at `rank`, the key count or past it for the end.
+    pub(super) fn at(side: &'a ZSide, raw: &'a Blob<MmapBytes>, rank: usize) -> ZCursor<'a> {
+        let mut c = ZCursor::new(side, raw);
+        c.rank = rank;
+        c.load();
+        c
+    }
+
+    /// A cursor at the first key at or after `key`, by the fence and the one
+    /// group it falls in (`ZSide::seek`), opened once for the seek and the
+    /// walk after it; or why the sidecar cannot say, which is never
+    /// `Served`, and the caller seeks the raw form.
+    pub(super) fn seek(
+        side: &'a ZSide,
+        raw: &'a Blob<MmapBytes>,
+        key: &[u8],
+    ) -> std::result::Result<ZCursor<'a>, ZSeek> {
+        if side.damaged.load(Ordering::Relaxed) {
+            return Err(ZSeek::Out);
+        }
+        let mut c = ZCursor::new(side, raw);
+        let Some(e) = side.fence.entry_of(key) else {
+            c.load();
+            return Ok(c);
+        };
+        let Some(entry) = side.fence.entry(e, side.nkeys as u32) else {
+            return Err(ZSeek::Fallback);
+        };
+        let first = entry.first_rank as usize;
+        if entry.page == ZNOPAGE {
+            if entry.count != 1 {
+                return Err(ZSeek::NoPage);
+            }
+            c.rank = if entry.key == key { first } else { first + 1 };
+            c.load();
+            return Ok(c);
+        }
+        if !c.open(&entry) {
+            return Err(ZSeek::Fallback);
+        }
+        let pos = match group_seek(c.group(), entry.count as usize, key) {
+            Ok(pos) => pos,
+            Err(_) => {
+                side.fail(entry.page as usize);
+                return Err(ZSeek::Fallback);
+            }
+        };
+        c.rank = first + pos.index;
+        if c.rank >= c.end {
+            c.load();
+        } else {
+            c.off = pos.off;
+            c.place();
+        }
+        Ok(c)
+    }
+
+    /// The rank at the position: the key count at the end.
+    #[cfg(test)]
+    pub(super) fn rank(&self) -> usize {
+        self.rank
+    }
+
+    /// The rest of the walk is the raw form's, after a check failed.
+    pub(super) fn fell_back(&self) -> bool {
+        self.fell
+    }
+
+    /// The group as the last open left it.
+    fn group(&self) -> &[u8] {
+        match self.group {
+            Group::Page(p) => p,
+            Group::Buf(n) => self.buf.bytes(n),
+            Group::None | Group::Raw => &[],
+        }
+    }
+
+    /// The walk from here to the partition's end is the raw form's.
+    fn fall(&mut self) {
+        self.fell = true;
+        self.group = Group::Raw;
+        self.end = self.side.nkeys;
+        self.off = 0;
+    }
+
+    /// Entry `entry` opened as the cursor's group, at its first record:
+    /// `false` where it could not be, the cursor fallen.
+    fn open(&mut self, entry: &FenceEntry<'_>) -> bool {
+        let first = entry.first_rank as usize;
+        self.end = first
+            .saturating_add(entry.count as usize)
+            .min(self.side.nkeys);
+        self.off = 0;
+        if entry.page == ZNOPAGE {
+            self.nopage += 1;
+            self.group = Group::Raw;
+            return true;
+        }
+        self.page = entry.page as usize;
+        // Where the group lies once opened: a stored page that is aligned
+        // is parsed where it lies in the mapping, anything else is decoded
+        // into the buffer, whose borrow by the open ends with the open.
+        let view = self
+            .side
+            .page_bytes(self.page)
+            .and_then(|page| page_view(page).ok());
+        let Some(decoded) = self.side.open_group(entry, &mut self.buf).map(|g| g.2) else {
+            self.fall();
+            return false;
+        };
+        if decoded {
+            self.decoded += 1;
+        }
+        self.group = match view {
+            Some((h, payload)) if h.stored => Group::Page(payload),
+            Some((h, _)) => Group::Buf(h.ulen as usize),
+            None => {
+                self.side.fail(self.page);
+                self.fall();
+                return false;
+            }
+        };
+        true
+    }
+
+    /// The record at `off` parsed for its key and the record after it: a
+    /// record that does not parse in a group the checks let through is
+    /// damage, and the walk falls.
+    fn place(&mut self) {
+        let Some((k, next)) = record_key_next(self.group(), self.off) else {
+            self.side.fail(self.page);
+            self.fall();
+            return;
+        };
+        let base = self.group().as_ptr() as usize;
+        self.key_at = (k.as_ptr() as usize - base, k.len());
+        self.next = next;
+    }
+
+    /// The position loaded for `self.rank`: the entry it falls in opened
+    /// and the walk to its record.
+    fn load(&mut self) {
+        self.off = 0;
+        if self.rank >= self.side.nkeys {
+            self.group = Group::None;
+            self.end = self.side.nkeys;
+            return;
+        }
+        if self.fell || self.side.damaged.load(Ordering::Relaxed) {
+            self.fall();
+            return;
+        }
+        let Some(entry) = self.side.entry_at_rank(self.rank) else {
+            self.fall();
+            return;
+        };
+        if !self.open(&entry) || matches!(self.group, Group::Raw) {
+            return;
+        }
+        for _ in entry.first_rank as usize..self.rank {
+            let Some((_, next)) = record_key_next(self.group(), self.off) else {
+                self.side.fail(self.page);
+                self.fall();
+                return;
+            };
+            self.off = next;
+        }
+        self.place();
+    }
+
+    /// The key at the position, or `None` past the end.
+    pub(super) fn key(&self) -> Option<&[u8]> {
+        match self.group {
+            Group::None => None,
+            Group::Raw => self.raw.key_at(self.rank),
+            Group::Page(_) | Group::Buf(_) => {
+                let (at, len) = self.key_at;
+                self.group().get(at..at + len)
+            }
+        }
+    }
+
+    /// The values at the position, in the raw form's order, and how many.
+    pub(super) fn values<F: FnMut(&[u8])>(&self, f: &mut F) -> Result<u64> {
+        match self.group {
+            Group::None => Ok(0),
+            Group::Raw => self.raw.values_at(self.rank, &mut *f),
+            Group::Page(_) | Group::Buf(_) => match parse_record(self.group(), self.off) {
+                Some((_, exts, tail, _)) => self.raw.read_exts(&exts, tail, &mut *f),
+                None => {
+                    // The first decode walked every record of the group
+                    // whole, so this is a group changed under the mapping:
+                    // the page out of service and the raw form's values.
+                    self.side.fail(self.page);
+                    self.raw.values_at(self.rank, &mut *f)
+                }
+            },
+        }
+    }
+
+    /// One record on: the next of the group, or the next entry's first.
+    pub(super) fn advance(&mut self) {
+        if matches!(self.group, Group::None) {
+            return;
+        }
+        self.rank += 1;
+        if self.rank >= self.end {
+            self.load();
+        } else if !matches!(self.group, Group::Raw) {
+            self.off = self.next;
+            self.place();
+        }
+    }
+}
+
+impl Drop for ZCursor<'_> {
+    fn drop(&mut self) {
+        put_buf(std::mem::take(&mut self.buf));
+    }
 }
 
 /// Where a key lies in a sidecar, found or not, with the bytes it lies in.
@@ -536,6 +847,102 @@ impl ZSide {
         self.damaged.store(true, Ordering::Relaxed);
     }
 
+    /// Entry `entry`'s group, opened the one way every read opens one: the
+    /// page the entry names through the first decode's checks where this
+    /// process has not verified it and through the verified path where it
+    /// has, decoded into `buf` or parsed in place for a stored page that is
+    /// aligned; with its record count and whether a decode was made. `None`
+    /// where the page is out of range or a check failed -- the page and the
+    /// sidecar are out of service then -- or a stored page is misaligned,
+    /// which a mapping never is; the caller answers a fallback.
+    fn open_group<'a>(
+        &'a self,
+        entry: &FenceEntry<'_>,
+        buf: &'a mut GroupBuf,
+    ) -> Option<(&'a [u8], usize, bool)> {
+        let p = entry.page as usize;
+        let Some(page) = self.page_bytes(p).filter(|_| p < self.n_pages) else {
+            self.fail(p);
+            return None;
+        };
+        let was_verified = bit(&self.verified, p);
+        let opened = if was_verified {
+            verified_group(page, buf)
+        } else {
+            first_decode(page, self.bind, entry, buf)
+        };
+        match opened {
+            Ok(g) => {
+                if !was_verified {
+                    set_bit(&self.verified, p);
+                }
+                Some(g)
+            }
+            Err(Fail::Misaligned) => None,
+            Err(Fail::Check(_)) => {
+                self.fail(p);
+                None
+            }
+        }
+    }
+
+    /// The entry rank `rank` falls in, for a rank below the key count: a
+    /// fence that does not cover the rank is damage, since the tiling check
+    /// held every rank below the key count to an entry.
+    fn entry_at_rank(&self, rank: usize) -> Option<FenceEntry<'_>> {
+        u32::try_from(rank)
+            .ok()
+            .and_then(|r| self.fence.entry_at_rank(r))
+            .and_then(|e| self.fence.entry(e, self.nkeys as u32))
+            .filter(|e| {
+                let first = e.first_rank as usize;
+                rank >= first && rank < first.saturating_add(e.count as usize)
+            })
+    }
+
+    /// Where the record at `rank` lies: its entry by the fence's first
+    /// ranks, the entry's group opened, the walk to the record by
+    /// `record_key_next`. A rank past the end is absent; an entry no page
+    /// holds is the raw form's.
+    fn locate_rank<'a>(&'a self, rank: usize, buf: &'a mut GroupBuf) -> Locate<'a> {
+        if self.damaged.load(Ordering::Relaxed) {
+            return Locate::Out;
+        }
+        if rank >= self.nkeys {
+            return Locate::Absent { decoded: false };
+        }
+        let Some(entry) = self.entry_at_rank(rank) else {
+            return Locate::Fallback;
+        };
+        if entry.page == ZNOPAGE {
+            return Locate::NoPage;
+        }
+        let p = entry.page as usize;
+        let first = entry.first_rank as usize;
+        let Some((group, _, decoded)) = self.open_group(&entry, buf) else {
+            return Locate::Fallback;
+        };
+        let mut off = 0usize;
+        for _ in first..rank {
+            let Some((_, next)) = record_key_next(group, off) else {
+                self.fail(p);
+                return Locate::Fallback;
+            };
+            off = next;
+        }
+        match parse_record(group, off) {
+            Some((_, exts, tail, _)) => Locate::Found {
+                exts,
+                tail,
+                decoded,
+            },
+            None => {
+                self.fail(p);
+                Locate::Fallback
+            }
+        }
+    }
+
     /// Where `key` lies among the records of this partition, opening the
     /// one page that could hold it.
     fn locate<'a>(&'a self, key: &[u8], buf: &'a mut GroupBuf) -> Locate<'a> {
@@ -568,30 +975,13 @@ impl ZSide {
             };
         }
         let p = p as usize;
-        let Some(page) = self.page_bytes(p).filter(|_| p < self.n_pages) else {
+        let Some(entry) = self.fence.entry(e, self.nkeys as u32) else {
             self.fail(p);
             return Locate::Fallback;
         };
-        let was_verified = bit(&self.verified, p);
-        let opened = if was_verified {
-            verified_group(page, buf)
-        } else {
-            match self.fence.entry(e, self.nkeys as u32) {
-                Some(entry) => first_decode(page, self.bind, &entry, buf),
-                None => Err(Fail::Check(ZError::Fence)),
-            }
+        let Some((group, count, decoded)) = self.open_group(&entry, buf) else {
+            return Locate::Fallback;
         };
-        let (group, count, decoded) = match opened {
-            Ok(g) => g,
-            Err(Fail::Misaligned) => return Locate::Fallback,
-            Err(Fail::Check(_)) => {
-                self.fail(p);
-                return Locate::Fallback;
-            }
-        };
-        if !was_verified {
-            set_bit(&self.verified, p);
-        }
         let pos = match group_seek(group, count, key) {
             Ok(pos) => pos,
             Err(_) => {
@@ -746,32 +1136,10 @@ impl ZSide {
                 continue;
             }
             let p = entry.page as usize;
-            let Some(page) = self.page_bytes(p).filter(|_| p < self.n_pages) else {
-                self.fail(p);
+            let Some((group, _, decoded)) = self.open_group(&entry, buf) else {
                 out.end = ScanEnd::Fallback;
                 return Ok(());
             };
-            let was_verified = bit(&self.verified, p);
-            let opened = if was_verified {
-                verified_group(page, buf)
-            } else {
-                first_decode(page, self.bind, &entry, buf)
-            };
-            let (group, _, decoded) = match opened {
-                Ok(g) => g,
-                Err(Fail::Misaligned) => {
-                    out.end = ScanEnd::Fallback;
-                    return Ok(());
-                }
-                Err(Fail::Check(_)) => {
-                    self.fail(p);
-                    out.end = ScanEnd::Fallback;
-                    return Ok(());
-                }
-            };
-            if !was_verified {
-                set_bit(&self.verified, p);
-            }
             if decoded {
                 out.decoded += 1;
             }
@@ -800,6 +1168,129 @@ impl ZSide {
             }
         }
         Ok(())
+    }
+
+    /// `Blob::values_at` through the sidecar: the values of the record at
+    /// `rank`, handed to `f` in the raw form's order, or why not -- what a
+    /// scan's emit of one partition record asks (`Reader::emit_unsealed`).
+    pub(super) fn values_at<F: FnMut(&[u8])>(
+        &self,
+        raw: &Blob<MmapBytes>,
+        rank: usize,
+        f: &mut F,
+    ) -> Result<ZRead> {
+        let mut buf = take_buf();
+        let r = match self.locate_rank(rank, &mut buf) {
+            Locate::Absent { decoded } => Ok(ZRead::Served { n: 0, decoded }),
+            Locate::Out => Ok(ZRead::Out),
+            Locate::Fallback => Ok(ZRead::Fallback),
+            Locate::NoPage => Ok(ZRead::NoPage),
+            Locate::Found {
+                exts,
+                tail,
+                decoded,
+            } => raw
+                .read_exts(&exts, tail, &mut *f)
+                .map(|n| ZRead::Served { n, decoded }),
+        };
+        put_buf(buf);
+        r
+    }
+
+    /// `Blob::seek` through the sidecar (3.4): the rank of the first key at
+    /// or after `key`, by the fence and one group's walk. A key below the
+    /// first key is rank zero and one above every key is the key count,
+    /// each `Greater` with nothing decoded; a key in an entry no page holds
+    /// is placed by the entry's one key, since the entry covers that one
+    /// record. The seek takes the fence (heap) and the one page the key
+    /// falls in, where the ordered index takes its heads and a key read of
+    /// the raw records for each probe.
+    pub(super) fn seek(&self, key: &[u8]) -> ZSeek {
+        if self.damaged.load(Ordering::Relaxed) {
+            return ZSeek::Out;
+        }
+        let Some(e) = self.fence.entry_of(key) else {
+            return ZSeek::Served {
+                rank: 0,
+                at: KeyOrder::Greater,
+                decoded: false,
+            };
+        };
+        let Some(entry) = self.fence.entry(e, self.nkeys as u32) else {
+            return ZSeek::Fallback;
+        };
+        let first = entry.first_rank as usize;
+        if entry.page == ZNOPAGE {
+            if entry.count != 1 {
+                return ZSeek::NoPage;
+            }
+            return if entry.key == key {
+                ZSeek::Served {
+                    rank: first,
+                    at: KeyOrder::Equal,
+                    decoded: false,
+                }
+            } else {
+                ZSeek::Served {
+                    rank: first + 1,
+                    at: KeyOrder::Greater,
+                    decoded: false,
+                }
+            };
+        }
+        let mut buf = take_buf();
+        let r = match self.open_group(&entry, &mut buf) {
+            None => ZSeek::Fallback,
+            Some((group, count, decoded)) => match group_seek(group, count, key) {
+                Ok(pos) => ZSeek::Served {
+                    rank: first + pos.index,
+                    at: if pos.found {
+                        KeyOrder::Equal
+                    } else {
+                        KeyOrder::Greater
+                    },
+                    decoded,
+                },
+                Err(_) => {
+                    self.fail(entry.page as usize);
+                    ZSeek::Fallback
+                }
+            },
+        };
+        put_buf(buf);
+        r
+    }
+
+    /// `BuildCtx::cut_at` through the sidecar: the first rank in
+    /// `rank..end` whose key is not below `uk`, or `end`, with how that
+    /// rank's key compares to `uk`. The seek answers for the whole
+    /// partition: a rank below `rank` means the key at `rank` is past `uk`,
+    /// since the keys are distinct and ascend.
+    pub(super) fn cut_in(&self, rank: usize, end: usize, uk: &[u8]) -> ZSeek {
+        if rank >= end {
+            return ZSeek::Served {
+                rank: end,
+                at: KeyOrder::Greater,
+                decoded: false,
+            };
+        }
+        match self.seek(uk) {
+            ZSeek::Served {
+                rank: r,
+                at,
+                decoded,
+            } => {
+                let (rank, at) = if r < rank {
+                    (rank, KeyOrder::Greater)
+                } else if r >= end {
+                    (end, KeyOrder::Greater)
+                } else {
+                    (r, at)
+                };
+                ZSeek::Served { rank, at, decoded }
+            }
+            other => other,
+        }
     }
 
     /// The sidecar is out of service.
@@ -2991,6 +3482,167 @@ mod tests {
             assert_eq!(z.nopage, u64::from(name == "scan-nopage"), "{name}");
             assert!(z.decoded > 1, "{name}: {z:?}");
             assert!(!side.damaged());
+        }
+    }
+
+    /// The seek, the cut and the record by rank against the raw form, on
+    /// the suite's shape and with a record no page holds among the pages:
+    /// every probe key's seek rank and whether it is found; the cut of
+    /// every window at every probe against a walk of the keys; the values
+    /// at every rank, the one no page holds answered as such.
+    #[test]
+    fn the_seek_the_cut_and_the_values_by_rank_agree_with_the_raw_form() {
+        let mut rng = Rng(77);
+        let mut recs = suite(1200, 5);
+        let big = b"0000000000000600-big";
+        recs.insert(600, (big.to_vec(), vec![rng.bytes(6000)], false));
+        recs.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, recs) in [("seek-suite", suite(1000, 6)), ("seek-nopage", recs)] {
+            let fx = Fixture::new(name, recs, 1 << 20);
+            let side = fx.side();
+            let n = fx.recs.len();
+            let keys: Vec<&[u8]> = fx.recs.iter().map(|r| r.0.as_slice()).collect();
+            for key in probes(&fx.recs) {
+                let want = fx.blob.seek(&key);
+                let want_at = if keys.binary_search(&key.as_slice()).is_ok() {
+                    KeyOrder::Equal
+                } else {
+                    KeyOrder::Greater
+                };
+                let got = side.seek(&key);
+                assert!(
+                    matches!(got, ZSeek::Served { rank, at, .. } if rank == want && at == want_at),
+                    "{name}: seek of {key:?}: {got:?}, wanted {want} {want_at:?}"
+                );
+                for (rank, end) in [(0usize, n), (0, 1), (n / 3, 2 * n / 3), (n - 1, n), (n, n)] {
+                    let r = (rank..end)
+                        .find(|&i| keys[i] >= key.as_slice())
+                        .unwrap_or(end);
+                    let at = if r < end && keys[r] == key.as_slice() {
+                        KeyOrder::Equal
+                    } else {
+                        KeyOrder::Greater
+                    };
+                    let got = side.cut_in(rank, end, &key);
+                    assert!(
+                        matches!(got, ZSeek::Served { rank, at: a, .. } if rank == r && a == at),
+                        "{name}: cut of {key:?} in {rank}..{end}: {got:?}, wanted {r} {at:?}"
+                    );
+                }
+            }
+            for rank in (0..n + 2).step_by(7) {
+                let mut want = Vec::new();
+                let raw_n = fx.blob.values_at(rank, |v| want.push(v.to_vec())).unwrap();
+                let mut got = Vec::new();
+                let z = side
+                    .values_at(&fx.blob, rank, &mut |v: &[u8]| got.push(v.to_vec()))
+                    .unwrap();
+                if fx.recs.get(rank).is_some_and(|r| r.0 == big) {
+                    assert_eq!(z, ZRead::NoPage, "{name}: rank {rank}");
+                    assert!(got.is_empty());
+                } else {
+                    assert!(
+                        matches!(z, ZRead::Served { n, .. } if n == raw_n),
+                        "{name}: rank {rank}: {z:?}, wanted {raw_n} values"
+                    );
+                    assert_eq!(got, want, "{name}: the values at {rank}");
+                }
+            }
+            assert!(!side.damaged());
+        }
+    }
+
+    /// The cursor walks every key and its values from every start as the
+    /// raw form's `key_at` and `values_at` sequence has them, across groups
+    /// and across the record no page holds, which it reads through the raw
+    /// form; a seek lands where the raw form's does; and a page flipped
+    /// under it makes the rest of its walk the raw form's from the first
+    /// check that fails, with every key still right.
+    #[test]
+    fn the_cursor_walks_the_records_in_order_and_falls_to_the_raw_form_on_damage() {
+        let mut rng = Rng(78);
+        let mut recs = suite(1500, 9);
+        let big = b"0000000000000750-big";
+        recs.insert(750, (big.to_vec(), vec![rng.bytes(6000)], false));
+        recs.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, recs) in [("cursor-suite", suite(1200, 10)), ("cursor-nopage", recs)] {
+            let fx = Fixture::new(name, recs, 1 << 20);
+            let side = fx.side();
+            let n = fx.recs.len();
+            let nopage = u64::from(name == "cursor-nopage");
+            for start in (0..n + 3).step_by(53) {
+                let mut c = ZCursor::at(&side, &fx.blob, start);
+                let mut rank = start;
+                loop {
+                    assert_eq!(c.rank(), rank, "{name}: from {start}");
+                    let key = c.key().map(|k| k.to_vec());
+                    assert_eq!(
+                        key.as_deref(),
+                        fx.blob.key_at(rank),
+                        "{name}: the key at {rank}, from {start}"
+                    );
+                    if key.is_none() {
+                        break;
+                    }
+                    let mut want = Vec::new();
+                    fx.blob.values_at(rank, |v| want.push(v.to_vec())).unwrap();
+                    let mut got = Vec::new();
+                    c.values(&mut |v: &[u8]| got.push(v.to_vec())).unwrap();
+                    assert_eq!(got, want, "{name}: the values at {rank}, from {start}");
+                    c.advance();
+                    rank += 1;
+                }
+                assert!(!c.fell_back(), "{name}: from {start}");
+                if start == 0 {
+                    assert_eq!(c.nopage, nopage, "{name}: the run no page holds, met once");
+                    assert!(c.decoded > 0, "{name}: groups decoded on the way");
+                }
+                // The seek to a key lands where the raw form's does, and so
+                // does one to a key between records.
+                let k = &fx.recs[start.min(n - 1)].0;
+                let c = ZCursor::seek(&side, &fx.blob, k).unwrap();
+                assert_eq!((c.rank(), c.key()), (start.min(n - 1), Some(k.as_slice())));
+                let between = [k.as_slice(), &[0u8]].concat();
+                let c = ZCursor::seek(&side, &fx.blob, &between).unwrap();
+                assert_eq!(
+                    c.rank(),
+                    fx.blob.seek(&between),
+                    "{name}: seek of {between:?}"
+                );
+                assert_eq!(c.key(), fx.blob.key_at(c.rank()));
+            }
+            let c = ZCursor::seek(&side, &fx.blob, b"").unwrap();
+            assert_eq!(c.rank(), 0);
+            let c = ZCursor::seek(&side, &fx.blob, &[0xffu8; 8]).unwrap();
+            assert_eq!((c.rank(), c.key()), (n, None));
+            assert!(!side.damaged());
+            // A page flipped under the cursor: the first check that fails
+            // makes the rest of the walk the raw form's, and the keys and
+            // values stay right.
+            let good = std::fs::read(&fx.out).unwrap();
+            let t = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
+            let p = unsampled(t.n_pages as usize, 3);
+            let mut flipped = good.clone();
+            flipped[p * ZPAGE + 100] ^= 0x40;
+            std::fs::write(&fx.out, &flipped).unwrap();
+            let side = fx
+                .attach()
+                .expect("the sample does not reach the flipped page");
+            let mut c = ZCursor::at(&side, &fx.blob, 0);
+            for rank in 0..n {
+                assert_eq!(c.key(), fx.blob.key_at(rank), "{name}: flipped, at {rank}");
+                let mut want = Vec::new();
+                fx.blob.values_at(rank, |v| want.push(v.to_vec())).unwrap();
+                let mut got = Vec::new();
+                c.values(&mut |v: &[u8]| got.push(v.to_vec())).unwrap();
+                assert_eq!(got, want, "{name}: flipped, the values at {rank}");
+                c.advance();
+            }
+            assert_eq!((c.key(), c.rank()), (None, n));
+            assert!(c.fell_back() && side.damaged(), "{name}: the flip was met");
+            assert_eq!(side.seek(b"0"), ZSeek::Out);
+            assert!(ZCursor::seek(&side, &fx.blob, b"0").is_err());
+            std::fs::write(&fx.out, &good).unwrap();
         }
     }
 
