@@ -111,17 +111,34 @@ same seeds with the cache on, on the engine before the fixes (`a95fec8`):
 seed the fixed engine fails, the control failed too; so the fixes took
 the fence class and moved nothing in this one.
 
+**The block-cache class, hunted in turn.** Three mechanisms, each traced
+with a temporary trace of the key's sources at the settle, the build and
+the walk (stripped before the commit), and each with a test in
+`tests/settle.rs` that fails on the engine before its fix:
+
+| shape | mechanism | fix | commit |
+|---|---|---|---|
+| a key absent from a scan, or its values short by one, after a write of the empty key (seeds 25, 36, 85 and most of the twenty) | the settle folded a key's consecutive writes and skipped its duplicates by the key's arena offset; the empty key takes no bytes, so the key created after it shares its offset and its creating write vanished into the empty key's entry | the writes fold and skip by the slot | `47dae8b` |
+| a key written into a partition's range absent from a scan, before and after its seal (seeds 33, 49, 87, 96, 110's first failure) | a partition emptied by a merge keeps its range with no record, and the cache counted its blocks from the records: none, so the settle dropped every write resolved into it, the scan walked past it, and the builder gave it a table of nothing | an empty partition has one block, over no record and whatever the memtables and pieces hold in its range; every table, bound and form is sized by `Seg::blocks` | `883db09` |
+| a scan out of order with a stale value, or the panics `a copy from the form disagrees with the build from the sources`, `a sparse form's entry by cut disagrees with its search by key`, `an overlay key's cut is behind the walk` (seeds 28, 67, 110, 115) | a table carried across the merge that rewrites its partition over the same block boundaries kept the keys filed since the snapshot with the cut each had resolved to, a rank in the partition before the rewrite; a key the merge folded in or dropped inside the block moves every rank after it | the rebase resolves every filed key again against the partition as it stands | `883db09` |
+
+The draw after the three, one process a seed with its own `TMPDIR`
+(`hunt2/sweep.sh`): seeds 0 to 240 with the cache on for every
+seed, 240 pass; seeds 0 to 200 with the cache off, 200 pass; no hang.
+The fuzz's full check names the twin's sources beside the writer's now,
+and its scan-every-commit mode checks both stores.
+
 ## The gate on this branch
 
 `sh scripts/deps.sh` first (`all deps ready`), then the groups one at a
-time, on the tree with the three fixes (`d370547`):
+time, on the tree with the six fixes (`883db09`):
 
 | group | result |
 |---|---|
 | `build` | green |
 | `lint` | green |
 | `wasm` | green: the module links, 128,266 bytes |
-| `test` | green in every binary under `checked`: the library's 292, `db` 197, `zpages` 41, `segwriter` 19, `blob` 13, `ranges` 6, `fences` 4, `dict` 4, `fuzz` 2 (its default seeds), `leak`, `checksums_off` and the doc test; run with `--no-fail-fast` and `CARGO_BUILD_JOBS=1` |
+| `test` | green in every binary under `checked`: the library's 292, `db` 197, `zpages` 41, `segwriter` 19, `blob` 13, `ranges` 6, `fences` 4, `dict` 4, `settle` 3, `fuzz` 2 (its default seeds), `leak`, `checksums_off` and the doc test; run with `--no-fail-fast` and `CARGO_BUILD_JOBS=1` |
 | `bench` | green: the suite's build, its 86 tests under `checked`, clippy, rustfmt and the workflow lint |
 
 ## The branches, and what became of each
@@ -191,16 +208,16 @@ branch is the owner's call.
 
 ## Where to start
 
-1. The block-cache scan path: a fifth of the cache-on seeds above, the
-   scans short of the model with the point reads right. A failing seed
+1. The second form: the second sitting of the forced arm's pairing
+   (`wave2/zproof-commands.sh`, the arms swapped), then stage 2b.
+2. The fuzz is clean on both draws to the seeds above; a wider draw
+   (`ZFUZZ_OPTVARY`, the other key shapes, longer ranges) is the next
+   place a defect of the block-cache path would show. A failing seed
    keeps its two stores in `TMPDIR`, `hunt2/probes/` reads them, and the
-   reopened store reproduced the cache-off defects every time; try that
-   first, since a reopened store has no upkeep in flight. Hunt I's
-   patches (`hunt/patches/`) hold the forced schedules and the event ring
-   for the same path, and `cross.sh` the two scratch fixes never
-   adjudicated. The cache-off draw is clean to seed 400.
-2. The second form: the second sitting of the forced arm's pairing
-   (`wave2/zproof-commands.sh`), then stage 2b.
+   fuzz's `SOURCES` lines name the key's every source in both stores.
+   Hunt I's patches (`hunt/patches/`) hold the forced schedules and the
+   event ring for the same path, and `cross.sh` the two scratch fixes
+   never adjudicated.
 
 Every timing run needs the machine to itself (`bench/CLAUDE.md`), and the
 checked compile of `tests/db.rs` needs the memory to itself (`CLAUDE.md`,
