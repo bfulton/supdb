@@ -4839,6 +4839,9 @@ impl Engine for Supdb {
             ("zpage_rawserves", z.rawserves as f64),
             ("zpage_fallbacks", z.fallbacks as f64),
             ("zpage_nopage_reads", z.nopage_reads as f64),
+            ("zpage_scans", z.scans as f64),
+            ("zpage_scan_groups", z.scan_groups as f64),
+            ("zpage_nopage_scans", z.nopage_scans as f64),
             ("zpage_raw_scans", z.raw_scans as f64),
             ("zpage_builds", z.builds as f64),
             ("zpage_build_pages", z.build_pages as f64),
@@ -6304,9 +6307,12 @@ mod tests {
         }
         assert_eq!(count(&arm, "zpage_reads"), served + handle_reads);
         assert_eq!(count(&base, "zpage_reads"), 0.0);
-        // A scan is walked raw, and counted as one that stood aside.
+        // A scan's walk of the partition is served by its sidecar, and
+        // counted as such; the base's is nobody's to count.
         assert_eq!(arm.range(&keys[0], 10).unwrap(), 10 * value.len());
-        assert_eq!(count(&arm, "zpage_raw_scans"), 1.0);
+        assert_eq!(count(&arm, "zpage_scans"), 1.0);
+        assert_eq!(count(&arm, "zpage_raw_scans"), 0.0);
+        assert_eq!(count(&base, "zpage_scans"), 0.0);
         assert_eq!(count(&base, "zpage_raw_scans"), 0.0);
         drop(arm);
         drop(base);

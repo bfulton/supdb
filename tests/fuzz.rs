@@ -216,6 +216,19 @@ fn opts(c: &Cfg) -> Options {
     o
 }
 
+/// The `z` store's options: the pair's, and under `ZFUZZ_ZPAGES` the
+/// compact form forced on with no size floor, so that every partition of
+/// `z` is read and scanned through a sidecar while `r` reads the raw form
+/// over the same writes -- the strongest check a second read path has.
+fn opts_z(c: &Cfg) -> Options {
+    let mut o = opts(c);
+    if env_flag("ZFUZZ_ZPAGES") {
+        o.zpages = supdb::ZPages::Always;
+        o.zpages_min_bytes = 0;
+    }
+    o
+}
+
 fn key_pool(rng: &mut Rng, n: usize) -> Vec<Vec<u8>> {
     let mut set: BTreeSet<Vec<u8>> = BTreeSet::new();
     let shapes = 1 + rng.below(3);
@@ -591,7 +604,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
     if verbose {
         eprintln!("seed {seed}: {cfg:?}");
     }
-    let mut z = Db::create(&dz, opts(&cfg)).map_err(|e| format!("create z: {e}"))?;
+    let mut z = Db::create(&dz, opts_z(&cfg)).map_err(|e| format!("create z: {e}"))?;
     let mut r = Db::create(&dr, opts(&cfg)).map_err(|e| format!("create r: {e}"))?;
     let seedkey_first = env_flag("ZFUZZ_SEEDKEY");
     let mut model: Model = BTreeMap::new();
@@ -801,7 +814,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                         drop(z);
                         drop(r);
                     }
-                    z = Db::open(&dz, opts(&cfg)).map_err(|e| format!("open z: {e}"))?;
+                    z = Db::open(&dz, opts_z(&cfg)).map_err(|e| format!("open z: {e}"))?;
                     r = Db::open(&dr, opts(&cfg)).map_err(|e| format!("open r: {e}"))?;
                     st.reopens += 1;
                     let probe = all_probe(&pool, &absent);

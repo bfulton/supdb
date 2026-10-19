@@ -37,7 +37,7 @@ use super::zpages::{
 };
 use crate::blob::{Blob, BlobOptions, ZSource};
 use crate::bytes::{Bytes, MmapBytes};
-use crate::flatindex::{parse_record, rd_u32, record_key};
+use crate::flatindex::{parse_record, rd_u32, record_key, record_key_next};
 use crate::index::{Ext, Exts};
 use std::cell::Cell;
 use std::fs::{File, OpenOptions};
@@ -174,6 +174,33 @@ pub(super) enum ZRead {
     /// in such an entry's range without being its record is answered absent
     /// from the fence, as a key below the first key is.
     NoPage,
+}
+
+/// What a scan of a covered partition did (`ZSide::scan_at`): the keys
+/// visited, as `Blob::scan_at` counts them; the groups decoded for them;
+/// the runs of records no page holds that the raw form walked; and how it
+/// ended -- served whole, or stopped at a record boundary by a check that
+/// failed or a sidecar out of service, in which case the caller walks the
+/// rest from `seen` on through the raw form, since a walk that stops
+/// between two records has emitted every value of the ones before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ZScan {
+    pub seen: usize,
+    pub decoded: u64,
+    pub nopage: u64,
+    pub end: ScanEnd,
+}
+
+/// How a scan through the sidecar ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ScanEnd {
+    /// Every key asked for, or every key the partition has from the rank.
+    Served,
+    /// A check failed: the sidecar leaves service, and the rest is the raw
+    /// form's.
+    Fallback,
+    /// The sidecar was out of service before the first record.
+    Out,
 }
 
 /// Where a key lies in a sidecar, found or not, with the bytes it lies in.
@@ -630,6 +657,149 @@ impl ZSide {
         };
         put_buf(buf);
         r
+    }
+
+    /// `Blob::scan_at` through the sidecar: the keys from rank `from` on,
+    /// at most `limit` of them, each key's values handed to `f` in the raw
+    /// form's order, and how many keys were visited -- a key whose values
+    /// are all gone counts and emits nothing, a rank past the end walks
+    /// nothing, and the arithmetic saturates, as the raw walk's does. The
+    /// entry the rank falls in is found once, by the fence's first ranks;
+    /// its group is decoded into the thread's buffer (a first decode makes
+    /// the checks the point read makes, and marks the page verified), the
+    /// walk skips to the record by `record_key_next` and parses each
+    /// record from there, handing its extents to `raw.read_exts` as the
+    /// point read does; a spent group is followed by the next entry's. An
+    /// entry no page holds hands the raw form exactly its records. The
+    /// pages touched are the groups the walk crosses and nothing of the
+    /// raw segment's records, directory or hash, except where a run lies
+    /// in a block, which the raw form reads as it would.
+    pub(super) fn scan_at<F: FnMut(&[u8], &[u8])>(
+        &self,
+        raw: &Blob<MmapBytes>,
+        from: usize,
+        limit: usize,
+        f: &mut F,
+    ) -> Result<ZScan> {
+        let mut out = ZScan {
+            seen: 0,
+            decoded: 0,
+            nopage: 0,
+            end: ScanEnd::Served,
+        };
+        if self.damaged.load(Ordering::Relaxed) {
+            out.end = ScanEnd::Out;
+            return Ok(out);
+        }
+        let mut buf = take_buf();
+        let r = self.scan_in(raw, from, limit, f, &mut buf, &mut out);
+        put_buf(buf);
+        r.map(|()| out)
+    }
+
+    /// The walk of `scan_at`, with the thread's buffer lent to it; a check
+    /// that fails ends it at a record boundary with `out.end` saying so.
+    fn scan_in<F: FnMut(&[u8], &[u8])>(
+        &self,
+        raw: &Blob<MmapBytes>,
+        from: usize,
+        limit: usize,
+        f: &mut F,
+        buf: &mut GroupBuf,
+        out: &mut ZScan,
+    ) -> Result<()> {
+        let nkeys = self.nkeys;
+        let mut rank = from;
+        while out.seen < limit && rank < nkeys {
+            // The entry the rank falls in, and how far its records go: a
+            // fence that does not cover the rank is damage, since the
+            // tiling check held every rank below the key count to an
+            // entry.
+            let entry = u32::try_from(rank)
+                .ok()
+                .and_then(|r| self.fence.entry_at_rank(r))
+                .and_then(|e| self.fence.entry(e, self.nkeys as u32));
+            let Some(entry) = entry else {
+                out.end = ScanEnd::Fallback;
+                return Ok(());
+            };
+            let first = entry.first_rank as usize;
+            let end = first.saturating_add(entry.count as usize).min(nkeys);
+            if rank < first || rank >= end {
+                out.end = ScanEnd::Fallback;
+                return Ok(());
+            }
+            let want = (limit - out.seen).min(end - rank);
+            if entry.page == ZNOPAGE {
+                // The records the form does not hold: the raw form's walk,
+                // for exactly them. One that stops short is the raw form's
+                // own damage, which the caller's raw walk meets again and
+                // names.
+                let n = raw.scan_at(rank, want, &mut *f)?;
+                out.nopage += 1;
+                out.seen += n;
+                rank += n;
+                if n < want {
+                    out.end = ScanEnd::Fallback;
+                    return Ok(());
+                }
+                continue;
+            }
+            let p = entry.page as usize;
+            let Some(page) = self.page_bytes(p).filter(|_| p < self.n_pages) else {
+                self.fail(p);
+                out.end = ScanEnd::Fallback;
+                return Ok(());
+            };
+            let was_verified = bit(&self.verified, p);
+            let opened = if was_verified {
+                verified_group(page, buf)
+            } else {
+                first_decode(page, self.bind, &entry, buf)
+            };
+            let (group, _, decoded) = match opened {
+                Ok(g) => g,
+                Err(Fail::Misaligned) => {
+                    out.end = ScanEnd::Fallback;
+                    return Ok(());
+                }
+                Err(Fail::Check(_)) => {
+                    self.fail(p);
+                    out.end = ScanEnd::Fallback;
+                    return Ok(());
+                }
+            };
+            if !was_verified {
+                set_bit(&self.verified, p);
+            }
+            if decoded {
+                out.decoded += 1;
+            }
+            // The skip to the record the rank names, then each record from
+            // there: a record that does not parse is a group the checks let
+            // through, which is damage all the same.
+            let mut off = 0usize;
+            for _ in first..rank {
+                let Some((_, next)) = record_key_next(group, off) else {
+                    self.fail(p);
+                    out.end = ScanEnd::Fallback;
+                    return Ok(());
+                };
+                off = next;
+            }
+            for _ in 0..want {
+                let Some((k, exts, tail, len)) = parse_record(group, off) else {
+                    self.fail(p);
+                    out.end = ScanEnd::Fallback;
+                    return Ok(());
+                };
+                raw.read_exts(&exts, tail, &mut |v: &[u8]| f(k, v))?;
+                off += len;
+                out.seen += 1;
+                rank += 1;
+            }
+        }
+        Ok(())
     }
 
     /// The sidecar is out of service.
@@ -2774,6 +2944,54 @@ mod tests {
             res < all / 4,
             "{res} of {all} resident after a cancelled warm"
         );
+    }
+
+    /// Every window of the scan, through the sidecar and through the raw
+    /// form: every start rank of the grid and every limit, the keys and
+    /// values in order and the count returned, on the suite's shape and on
+    /// the fixture with a record no page holds among the pages.
+    #[test]
+    fn a_scan_through_the_sidecar_agrees_with_the_raw_walk_on_every_window() {
+        let mut rng = Rng(77);
+        let mut recs = suite(3000, 5);
+        let big = b"0000000000001500-big";
+        recs.insert(1500, (big.to_vec(), vec![rng.bytes(6000)], false));
+        recs.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, recs) in [("scan-suite", suite(2500, 6)), ("scan-nopage", recs)] {
+            let fx = Fixture::new(name, recs, 1 << 20);
+            let side = fx.side();
+            let n = fx.recs.len();
+            let starts: Vec<usize> = (0..n).step_by(37).chain([n - 1, n, n + 5]).collect();
+            let limits = [0usize, 1, 2, 3, 5, 17, 56, 57, 58, 114, 1000, usize::MAX];
+            for &from in &starts {
+                for &limit in &limits {
+                    let mut want: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                    let raw_n = fx
+                        .blob
+                        .scan_at(from, limit, |k, v| want.push((k.to_vec(), v.to_vec())))
+                        .unwrap();
+                    let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                    let z = side
+                        .scan_at(&fx.blob, from, limit, &mut |k: &[u8], v: &[u8]| {
+                            got.push((k.to_vec(), v.to_vec()))
+                        })
+                        .unwrap();
+                    assert_eq!(z.end, ScanEnd::Served, "{name}: from {from} limit {limit}");
+                    assert_eq!(
+                        z.seen, raw_n,
+                        "{name}: the count, from {from} limit {limit}"
+                    );
+                    assert_eq!(got, want, "{name}: the stream, from {from} limit {limit}");
+                }
+            }
+            // A walk across the record no page holds hands the raw form
+            // exactly its run, once; the suite's shape never does.
+            let mut sink = |_: &[u8], _: &[u8]| {};
+            let z = side.scan_at(&fx.blob, 0, usize::MAX, &mut sink).unwrap();
+            assert_eq!(z.nopage, u64::from(name == "scan-nopage"), "{name}");
+            assert!(z.decoded > 1, "{name}: {z:?}");
+            assert!(!side.damaged());
+        }
     }
 
     #[test]

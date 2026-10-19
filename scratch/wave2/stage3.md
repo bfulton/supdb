@@ -156,6 +156,22 @@ again, since the scans add a reader of every group. Done when 7.3's scan
 and mix cells have a verdict in two sittings and `raw_touches == 0` holds
 on every shape of 3.9's table.
 
+## Where it stands
+
+Piece 1 is in: `ZSide::scan_at` with `ZScan` (the keys visited, the
+groups decoded, the no-page runs, and how it ended), `ZFence::entry_at_rank`,
+`part_scan_z` at `scan_partitions`' walk with the raw walk for what the
+sidecar cannot serve, the counts `scans`, `scan_groups`, `nopage_scans`
+and `raw_scans` restated as the walks that went raw, the slot two lines
+for them (pinned at 256 bytes). The fuzz takes `ZFUZZ_ZPAGES=1`, the form
+forced in the `z` store of its pair with no size floor; forty seeds with
+the cache off read clean at the commit, and the sweeps of a hundred and
+twenty with the cache off and on are what the piece's gate adds. The tests of the
+scan's windows run on the writer, a `Latest` handle and a `Snapshot`
+handle, drained and with unsealed keys over the partitions; the walks of a
+scan are counted by the partition they cross. The block cache's walks of a
+covered partition stay raw and uncounted until piece 3 lists their sites.
+
 ## What 2b's sittings leave open, read before 3's
 
 - The eager build's pairing (`eager-pairing.sh`, `eager-ab-1.out` and
