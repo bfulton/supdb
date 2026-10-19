@@ -2131,6 +2131,192 @@ fn scans_over_a_piece_agree_with_the_model_over_every_window_of_a_covered_store(
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// What a read of a covered partition touches of the raw form, counted at
+/// the one door (`Seg::raw`, under debug assertions): nothing, for every
+/// kind of read and every shape of store the compact form serves -- point
+/// reads and counts of present and absent keys, scans over a drained
+/// store, scans with unsealed keys inside the window (an insert between
+/// records, an append to a record, a delete), scans over a level-0 piece
+/// (the merge path), reads after a merge's landing, and keys beside a
+/// record no page holds, with keys of every length -- on the writer and a
+/// `Latest` handle. The record no page holds is the positive control: a
+/// read of it is the raw form's by design, and the counter moves.
+#[test]
+fn the_compact_form_touches_no_raw_page() {
+    let counts = cfg!(debug_assertions);
+    let dir = scratch("rawtouches");
+    // Every run inline: a run the appends grow past the inline bound goes
+    // to a block, and a partition with one is declined, which is the raw
+    // form's by design and another test's.
+    let mut db = Db::create(
+        &dir,
+        forced(|o| {
+            o.partition_bytes = Some(160 << 10);
+            o.inline_bytes = 1 << 16;
+        }),
+    )
+    .unwrap();
+    let mut model = ordered_load(&mut db, 5000, 0x7A1);
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert!(c.sidecars >= 3 && c.sidecars == c.partitions, "{c:?}");
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let mut probes: Vec<Vec<u8>> = vec![b"".to_vec(), b"a".to_vec(), vec![0xff; 8]];
+    for f in sidecar_files(&dir) {
+        for fk in fence_keys(&f).into_iter().step_by(5) {
+            probes.extend(around(&fk));
+        }
+    }
+    let limits = [1usize, 3, 57, 114, 1500];
+    // Every kind of read, on the writer and a handle, with the touches
+    // before and after.
+    let held = |db: &Db, model: &Model, what: &str| {
+        let r = db.reader().unwrap();
+        let w: &Reader = db;
+        for who in [w, &r] {
+            let before = who.raw_touches();
+            check(who, model, &keys, what);
+            check(who, model, &probes, what);
+            for start in &probes {
+                for &limit in &limits {
+                    let want = window(model, start, limit);
+                    let where_ = format!(
+                        "{what}, from {:?} for {limit}",
+                        String::from_utf8_lossy(start)
+                    );
+                    same_window(&scanned(who, start, limit), &want, &where_);
+                }
+            }
+            check_scan(who, model, what);
+            let after = who.raw_touches();
+            assert!(
+                !counts || after == before,
+                "{what}: {} touches of the raw form",
+                after - before
+            );
+        }
+    };
+    held(&db, &model, "drained");
+    // Unsealed keys inside the windows: an insert between records, an
+    // append to a record, a delete.
+    let mut rng = Rng(0x7A11);
+    for i in 0..300 {
+        let k = keys[rng.below(keys.len())].clone();
+        match i % 3 {
+            0 => {
+                let new = [k.as_slice(), b"+"].concat();
+                let v = suite_value(&mut rng);
+                db.append(&new, &v);
+                model.entry(new).or_default().push(v);
+            }
+            1 => {
+                let v = suite_value(&mut rng);
+                db.append(&k, &v);
+                model.entry(k).or_default().push(v);
+            }
+            _ => {
+                db.delete(&k);
+                model.insert(k, Vec::new());
+            }
+        }
+    }
+    db.commit().unwrap();
+    held(&db, &model, "with unsealed keys");
+    // The same keys sealed into a piece: the merge path.
+    db.seal().unwrap();
+    db.zpages_settle().unwrap();
+    assert!(db.levels().1 >= 1, "a piece landed: {:?}", db.levels());
+    for i in 0..100 {
+        let k = keys[rng.below(keys.len())].clone();
+        let v = suite_value(&mut rng);
+        if i % 2 == 0 {
+            db.append(&k, &v);
+            model.entry(k).or_default().push(v);
+        } else {
+            db.put(&k, &v);
+            model.insert(k, vec![v]);
+        }
+    }
+    db.commit().unwrap();
+    held(&db, &model, "over a piece");
+    // The piece merged into its partitions: the landing's own passes are
+    // the segment work's, and the reads after it are the new sidecars'.
+    db.flush().unwrap();
+    db.zpages_settle().unwrap();
+    // A deleted key is a key until the merge drops its tombstone with
+    // nothing older left to mask: a scan's limit counted it before and
+    // does not after, and the model follows.
+    model.retain(|_, v| !v.is_empty());
+    let c = db.zpage_counts();
+    assert_eq!(db.levels().1, 0, "merged: {:?}", db.levels());
+    assert_eq!(c.sidecars, c.partitions, "{c:?}");
+    held(&db, &model, "after the merge");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // A record no page holds among keys of every length: the keys beside
+    // it are answered from the fence, and the record itself is the raw
+    // form's, which is what the counter is for.
+    let dir = scratch("rawtouches-nopage");
+    let mut db = Db::create(&dir, forced(|o| o.inline_bytes = 1 << 17)).unwrap();
+    let mut model = Model::new();
+    let mut put = |db: &mut Db, k: Vec<u8>, v: Vec<u8>| {
+        db.append(&k, &v);
+        model.entry(k).or_default().push(v);
+    };
+    for i in 0..3000 {
+        put(&mut db, spaced_key(i), suite_value(&mut rng));
+    }
+    let big = b"n-seventy-thousand".to_vec();
+    put(&mut db, vec![b'k'; 200], b"two hundred".to_vec());
+    put(&mut db, vec![b'l'; 1000], b"a thousand".to_vec());
+    put(&mut db, vec![b'm'; 5000], b"five thousand".to_vec());
+    put(&mut db, big.clone(), vec![b'n'; 70_000]);
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.partitions, c.sidecars, c.build_nopage),
+        (1, 1, 1),
+        "{c:?}"
+    );
+    let keys: Vec<Vec<u8>> = model.keys().filter(|k| **k != big).cloned().collect();
+    let mut beside = around(&big);
+    beside.retain(|k| *k != big);
+    let w: &Reader = &db;
+    let r = db.reader().unwrap();
+    for who in [w, &r] {
+        let before = who.raw_touches();
+        check(who, &model, &keys, "every key but the record no page holds");
+        check(who, &model, &beside, "keys beside the record no page holds");
+        let want = window(&model, b"", 3000);
+        same_window(
+            &scanned(who, b"", 3000),
+            &want,
+            "a scan short of the record",
+        );
+        let after = who.raw_touches();
+        assert!(
+            !counts || after == before,
+            "{} touches of the raw form",
+            after - before
+        );
+        // The positive control.
+        check(
+            who,
+            &model,
+            std::slice::from_ref(&big),
+            "the record no page holds",
+        );
+        let touched = who.raw_touches() - after;
+        assert!(
+            !counts || touched >= 2,
+            "the raw form read and counted the record: {touched}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn windows_over(name: &str, cache: bool) {
     // The scans of a covered partition answer as if the form were not there,
     // with the unsealed keys laid over it: updates, inserts between records

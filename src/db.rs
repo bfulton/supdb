@@ -2973,12 +2973,74 @@ fn z_retire_cell(shared: &Shared, dir: &Path, seg: &Seg) -> Option<PathBuf> {
         .map(|_| dead)
 }
 
+/// A segment's raw form behind one door. `Seg::blob` was the `Blob` itself
+/// and every reader of a partition could read its records through it, with
+/// a sidecar attached or not, which is how the block path and the merge
+/// path walked a covered partition raw for a week each without a row to
+/// show it. The type forwards only what has no raw footprint -- the key
+/// count, the id, the index size, the advice -- so the compiler lists every
+/// read of the records, and each goes through `Seg::raw` on purpose or
+/// through the sidecar's dispatch (`part_read_z`, `part_count_z`,
+/// `part_scan_z`, `part_seek_z`, `part_cut_z`, `part_values_z`, `PWalk`).
+/// `grep -n '\.raw()' src/db.rs` is the list of the deliberate reads, in
+/// these groups: the raw side of each dispatch, which the sidecar's answer
+/// (none, out of service, a check failed, a record no page holds) falls to;
+/// the `cursor_merge` arm, which walks every segment raw; the pieces'
+/// cursors and the tombstone pre-pass over them, since a piece has no
+/// sidecar; the block cache's machinery (`BuildCtx`, `scan_blocks`,
+/// `make_table`, `install_ahead`, `patch_block`, the prefetch), which
+/// builds its forms from the records and which the nocache arms never run;
+/// and the segment work's own passes at a landing, a promotion or the open
+/// (a piece's ranks and bounds against its partition, `same_blocks` one key
+/// a block of the partition a merge retires, a segment's first or last key,
+/// the recovery's walk of a pending segment). Under debug assertions a
+/// touch through `Seg::raw` on a segment with a sidecar installed counts
+/// (`Seg::raw_touches`), which `tests/zpages.rs` holds to zero over a
+/// covered partition's reads and scans.
+struct SegBlob(Blob<MmapBytes>);
+
+impl SegBlob {
+    /// Keys in the segment.
+    fn keys(&self) -> usize {
+        self.0.keys()
+    }
+
+    /// The segment's blob id.
+    fn id(&self) -> u64 {
+        self.0.id()
+    }
+
+    /// The index section's size.
+    fn index_bytes(&self) -> usize {
+        self.0.index_bytes()
+    }
+
+    fn advise_random(&self) {
+        self.0.advise_random();
+    }
+
+    fn advise_normal(&self) {
+        self.0.advise_normal();
+    }
+
+    /// The raw form for the sidecar: `ZSide` reads a run that lies in a
+    /// block through it, as the raw form reads one, and at the attach the
+    /// identity the sidecar is bound by; nothing of the records' region
+    /// for an inline value, which is why it is not a touch.
+    fn for_sidecar(&self) -> &Blob<MmapBytes> {
+        &self.0
+    }
+}
+
 /// A live segment: the mapped store, where it sits in the level structure,
 /// and whatever routing it carries. L0 segments come straight from a seal,
 /// overlap each other freely, and are gated by a Bloom; L1 segments come
 /// from a partitioning merge, are disjoint, and are gated by their fence.
 struct Seg {
-    blob: Blob<MmapBytes>,
+    blob: SegBlob,
+    /// Touches of the raw form through `Seg::raw` while a sidecar is
+    /// installed, under debug assertions; `Reader::raw_touches` sums it.
+    raw_touches: AtomicU64,
     name: String,
     /// PROTOTYPE: for a level-0 piece aligned to a partition, each of its
     /// keys' rank in that partition, shifted left one, with the low bit
@@ -5826,6 +5888,18 @@ impl PieceWriter {
 }
 
 impl Seg {
+    /// The raw form, for a read of the records on purpose (`SegBlob`):
+    /// counted while a sidecar is installed, under debug assertions, so
+    /// that a test can hold a covered partition's reads to the sidecar.
+    #[inline]
+    fn raw(&self) -> &Blob<MmapBytes> {
+        #[cfg(debug_assertions)]
+        if self.z.get().is_some() {
+            self.raw_touches.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        &self.blob.0
+    }
+
     /// Cheap ordered key walk: O(extents), no block touched -- the property
     /// `scan_counts_fixed` exists for. The width argument is irrelevant
     /// here because only the keys are wanted.
@@ -5951,7 +6025,8 @@ impl Seg {
                 None => Seg::bloom_and_tombs(&blob)?,
             };
             return Ok(Seg {
-                blob,
+                blob: SegBlob(blob),
+                raw_touches: AtomicU64::new(0),
                 name: name.to_string(),
                 ranks: IdCache::default(),
                 bounds: IdCache::default(),
@@ -5990,7 +6065,8 @@ impl Seg {
                 Some(unhex(f[3]).ok_or_else(|| err("segment fence is malformed"))?)
             };
             return Ok(Seg {
-                blob,
+                blob: SegBlob(blob),
+                raw_touches: AtomicU64::new(0),
                 name: name.to_string(),
                 ranks: IdCache::default(),
                 bounds: IdCache::default(),
@@ -6021,7 +6097,8 @@ impl Seg {
             None => Seg::bloom_and_tombs(&blob)?,
         };
         Ok(Seg {
-            blob,
+            blob: SegBlob(blob),
+            raw_touches: AtomicU64::new(0),
             name: name.to_string(),
             ranks: IdCache::default(),
             bounds: IdCache::default(),
@@ -10847,7 +10924,7 @@ fn block_bounds_of(
             let bound = match seg.ord.whole_key_at(rank, &mut kbuf) {
                 Some(k) => k,
                 None => seg
-                    .blob
+                    .raw()
                     .key_at(rank)
                     .ok_or_else(|| err("block cache: a rank did not resolve"))?,
             };
@@ -14333,7 +14410,7 @@ impl Reader {
             return None;
         }
         let first_of = |si: usize| -> Option<Vec<u8>> {
-            let b = &self.segs()[si].blob;
+            let b = self.segs()[si].raw();
             if b.keys() == 0 {
                 None
             } else {
@@ -14341,7 +14418,7 @@ impl Reader {
             }
         };
         let last_of = |si: usize| -> Option<Vec<u8>> {
-            let b = &self.segs()[si].blob;
+            let b = self.segs()[si].raw();
             if b.keys() == 0 {
                 None
             } else {
@@ -14555,6 +14632,18 @@ impl Reader {
     /// release leaves where they are, so a threaded pass's handles dropped
     /// before the counters are read are in the sum.
     #[doc(hidden)]
+    /// A test's: the raw form's touches through `Seg::raw` on segments with
+    /// a sidecar installed, summed over the live segments; a build without
+    /// debug assertions counts none (`SegBlob`).
+    #[doc(hidden)]
+    pub fn raw_touches(&self) -> u64 {
+        let _entered = self.enter();
+        self.segs()
+            .iter()
+            .map(|s| s.raw_touches.load(AtomicOrdering::Relaxed))
+            .sum()
+    }
+
     pub fn zpage_counts(&self) -> ZCounts {
         let _entered = self.enter();
         let rd = &self.shared.readers;
@@ -14660,11 +14749,11 @@ impl Reader {
         if !seg.ord.uniform() {
             return Ok(None);
         }
-        let (rank, exact) = seg.ord.seek_exact(key, |r| seg.blob.key_at(r));
+        let (rank, exact) = seg.ord.seek_exact(key, |r| seg.raw().key_at(r));
         let served = match exact {
             Some(false) => Some(0),
-            Some(true) if seg.blob.key_at(rank) == Some(key) => Some(
-                seg.blob
+            Some(true) if seg.raw().key_at(rank) == Some(key) => Some(
+                seg.raw()
                     .values_at(rank, &mut *f)
                     .map_err(|e| err(&format!("segment read: {e}")))?,
             ),
@@ -14724,7 +14813,7 @@ impl Reader {
             return raw(seg, f);
         };
         let served = z
-            .read_all(&seg.blob, key, f)
+            .read_all(seg.blob.for_sidecar(), key, f)
             .map_err(|e| err(&format!("segment read: {e}")))?;
         match served {
             zside::ZRead::Served { n, decoded } => {
@@ -14753,7 +14842,7 @@ impl Reader {
     #[inline(never)]
     fn part_count_z(&self, seg: &Seg, key: &[u8]) -> Result<u64> {
         let raw = || {
-            seg.blob
+            seg.raw()
                 .count(key)
                 .map_err(|e| err(&format!("segment count: {e}")))
         };
@@ -14800,7 +14889,7 @@ impl Reader {
         f: &mut F,
     ) -> Result<usize> {
         let raw = |rank: usize, n: usize, f: &mut F| {
-            seg.blob
+            seg.raw()
                 .scan_at(rank, n, &mut *f)
                 .map_err(|e| err(&format!("segment scan: {e}")))
         };
@@ -14811,7 +14900,7 @@ impl Reader {
             return raw(rank, n, f);
         };
         let r = z
-            .scan_at(&seg.blob, rank, n, f)
+            .scan_at(seg.blob.for_sidecar(), rank, n, f)
             .map_err(|e| err(&format!("segment scan: {e}")))?;
         self.zbump_by(|s| &s.zscangroups, r.decoded);
         self.zbump_by(|s| &s.znopagescans, r.nopage);
@@ -14838,7 +14927,7 @@ impl Reader {
     /// this handle's line), and through the ordered index over the raw
     /// form where it holds none or the sidecar cannot say.
     fn part_seek_z(&self, seg: &Seg, key: &[u8]) -> usize {
-        let raw = || seg.ord.seek(key, |r| seg.blob.key_at(r));
+        let raw = || seg.ord.seek(key, |r| seg.raw().key_at(r));
         let Some(z) = seg.z.get() else {
             return raw();
         };
@@ -14886,7 +14975,7 @@ impl Reader {
     /// The sidecar answers or it does not before a value is handed to `f`.
     fn part_values_z<F: FnMut(&[u8])>(&self, seg: &Seg, rank: usize, f: &mut F) -> Result<u64> {
         let raw = |f: &mut F| {
-            seg.blob
+            seg.raw()
                 .values_at(rank, &mut *f)
                 .map_err(|e| err(&format!("segment scan read: {e}")))
         };
@@ -14894,7 +14983,7 @@ impl Reader {
             return raw(f);
         };
         let served = z
-            .values_at(&seg.blob, rank, f)
+            .values_at(seg.blob.for_sidecar(), rank, f)
             .map_err(|e| err(&format!("segment scan read: {e}")))?;
         match served {
             zside::ZRead::Served { n, decoded } => {
@@ -14919,11 +15008,13 @@ impl Reader {
     /// where the cell holds one in service, the raw form's otherwise.
     fn pwalk_at<'a>(&self, seg: &'a Seg, rank: usize) -> PWalk<'a> {
         match seg.z.get() {
-            Some(z) if !z.damaged() => PWalk::Z(zside::ZCursor::at(z, &seg.blob, rank)),
+            Some(z) if !z.damaged() => {
+                PWalk::Z(zside::ZCursor::at(z, seg.blob.for_sidecar(), rank))
+            }
             _ => PWalk::Raw {
                 seg,
                 rank,
-                key: seg.blob.key_at(rank),
+                key: seg.raw().key_at(rank),
             },
         }
     }
@@ -14934,17 +15025,17 @@ impl Reader {
     /// fallback counted where a check failed.
     fn pwalk_seek<'a>(&self, seg: &'a Seg, key: &[u8]) -> PWalk<'a> {
         if let Some(z) = seg.z.get() {
-            match zside::ZCursor::seek(z, &seg.blob, key) {
+            match zside::ZCursor::seek(z, seg.blob.for_sidecar(), key) {
                 Ok(c) => return PWalk::Z(c),
                 Err(zside::ZSeek::Fallback) => self.zbump(|s| &s.zfallbacks),
                 Err(_) => {}
             }
         }
-        let rank = seg.ord.seek(key, |r| seg.blob.key_at(r));
+        let rank = seg.ord.seek(key, |r| seg.raw().key_at(r));
         PWalk::Raw {
             seg,
             rank,
-            key: seg.blob.key_at(rank),
+            key: seg.raw().key_at(rank),
         }
     }
 
@@ -15035,7 +15126,7 @@ impl Reader {
                     if !seg.tombs || !seg.may_hold(key) {
                         continue;
                     }
-                    if let Some(exts) = seg.blob.lookup(key) {
+                    if let Some(exts) = seg.raw().lookup(key) {
                         if exts.iter().any(|e| e.is_tombstone()) {
                             start = 1 + i;
                             break;
@@ -15050,9 +15141,9 @@ impl Reader {
         let by_value = self.opts.exts_by_value;
         let seg_read = |seg: &Seg, f: &mut F| {
             if by_value {
-                seg.blob.read_all_by_value(key, f)
+                seg.raw().read_all_by_value(key, f)
             } else {
-                seg.blob.read_all(key, f)
+                seg.raw().read_all(key, f)
             }
             .map_err(|e| err(&format!("segment read: {e}")))
         };
@@ -15341,7 +15432,7 @@ impl Reader {
         // scan that fails.
         if self.opts.read_advice == ReadAdvice::Prefetch {
             for seg in self.segs() {
-                let _ = seg.blob.prefetch_scan(from, limit);
+                let _ = seg.raw().prefetch_scan(from, limit);
             }
         }
         let gen = self.state().gen;
@@ -15485,7 +15576,7 @@ impl Reader {
             .segs()
             .iter()
             .filter(|s| s.may_reach(from))
-            .map(|s| (s, s.ord.seek(s.cursor_from(from), |r| s.blob.key_at(r))))
+            .map(|s| (s, s.ord.seek(s.cursor_from(from), |r| s.raw().key_at(r))))
             .collect();
 
         let tombs = self.has_tombstones();
@@ -15494,7 +15585,7 @@ impl Reader {
             // The next key is the smallest any source is holding.
             let mut next: Option<&[u8]> = None;
             for (seg, rank) in &cursors {
-                if let Some(k) = seg.blob.key_at(*rank) {
+                if let Some(k) = seg.raw().key_at(*rank) {
                     if next.is_none_or(|n| k < n) {
                         next = Some(k);
                     }
@@ -15534,8 +15625,8 @@ impl Reader {
                 }
                 if start == 0 {
                     for (j, (seg, rank)) in cursors.iter().enumerate().rev() {
-                        if seg.tombs && seg.blob.key_at(*rank) == Some(key) {
-                            if let Some((_, exts)) = seg.blob.exts_at(*rank) {
+                        if seg.tombs && seg.raw().key_at(*rank) == Some(key) {
+                            if let Some((_, exts)) = seg.raw().exts_at(*rank) {
                                 if exts.iter().any(|e| e.is_tombstone()) {
                                     start = j;
                                     break;
@@ -15546,9 +15637,9 @@ impl Reader {
                 }
             }
             for (j, (seg, rank)) in cursors.iter_mut().enumerate() {
-                if seg.blob.key_at(*rank) == Some(key) {
+                if seg.raw().key_at(*rank) == Some(key) {
                     if j >= start {
-                        seg.blob
+                        seg.raw()
                             .values_at(*rank, |v| f(key, v))
                             .map_err(|e| err(&format!("segment scan read: {e}")))?;
                     }
@@ -16310,9 +16401,12 @@ impl Reader {
                 let lo = if b == 0 {
                     (!seg.lo.is_empty()).then_some(seg.lo.as_slice())
                 } else {
-                    seg.blob.key_at(b * CACHE_BLOCK)
+                    seg.raw().key_at(b * CACHE_BLOCK)
                 };
-                let hi = seg.blob.key_at((b + 1) * CACHE_BLOCK).or(seg.hi.as_deref());
+                let hi = seg
+                    .raw()
+                    .key_at((b + 1) * CACHE_BLOCK)
+                    .or(seg.hi.as_deref());
                 if since.meets(lo, hi) {
                     for i in since.range(lo, hi) {
                         let k = since.at(i);
@@ -18319,8 +18413,8 @@ impl Reader {
             let mut held: Vec<(&[u8], usize, usize, u32)> = Vec::new();
             for &(j, _) in &table.pieces {
                 let p = &l0[j];
-                let r = p.ord.seek(key, |i| p.blob.key_at(i));
-                if r < p.blob.keys() && p.blob.key_at(r) == Some(key) {
+                let r = p.ord.seek(key, |i| p.raw().key_at(i));
+                if r < p.blob.keys() && p.raw().key_at(r) == Some(key) {
                     held.push((key, j, r, u32::MAX));
                 }
             }
@@ -18628,7 +18722,7 @@ impl Reader {
         let run: &mut Vec<u8> = &mut run_scratch;
         for r in ranks {
             let key = p
-                .blob
+                .raw()
                 .key_at(r)
                 .ok_or_else(|| err("block cache: a piece rank did not resolve"))?;
             let cut = cuts.map_or(u32::MAX, |v| v[r]);
@@ -18640,7 +18734,7 @@ impl Reader {
             let same = c < hi && at_eq == Ordering::Equal;
             run.clear();
             let tomb = p.tombs
-                && p.blob
+                && p.raw()
                     .exts_at(r)
                     .is_some_and(|(_, exts)| exts.iter().any(|e| e.is_tombstone()));
             if !tomb {
@@ -18664,7 +18758,7 @@ impl Reader {
                 match had {
                     Some(bytes) => run.extend_from_slice(bytes),
                     None if same => {
-                        seg.blob
+                        seg.raw()
                             .values_at(c, |v| {
                                 run.extend_from_slice(&(v.len() as u32).to_le_bytes());
                                 run.extend_from_slice(v);
@@ -18674,7 +18768,7 @@ impl Reader {
                     None => {}
                 }
             }
-            p.blob
+            p.raw()
                 .values_at(r, |v| {
                     run.extend_from_slice(&(v.len() as u32).to_le_bytes());
                     run.extend_from_slice(v);
@@ -18748,7 +18842,7 @@ impl Reader {
                 .blob
                 .keys()
                 .checked_sub(1)
-                .and_then(|r| seg.blob.key_at(r))
+                .and_then(|r| seg.raw().key_at(r))
                 .map_or_else(Vec::new, <[u8]>::to_vec),
             pieces,
             piece_ranks,
@@ -18904,17 +18998,17 @@ impl Reader {
             let keys = seg.blob.keys();
             let (rank, exact) = seg.ord.seek_exact_hint(
                 cursor,
-                |r| seg.blob.key_at(r),
+                |r| seg.raw().key_at(r),
                 |lo, hi| {
                     if self.opts.scan_prefetch && self.opts.seek_prefetch_dir {
-                        seg.blob.prefetch_dir(lo, hi - lo + 1);
+                        seg.raw().prefetch_dir(lo, hi - lo + 1);
                         let fs = self.fs();
                         fs.dir_prefetches.set(fs.dir_prefetches.get() + 1);
                     }
                 },
             );
             let same =
-                rank < keys && exact.unwrap_or_else(|| seg.blob.key_at(rank) == Some(cursor));
+                rank < keys && exact.unwrap_or_else(|| seg.raw().key_at(rank) == Some(cursor));
             let owner = if same { rank } else { rank.saturating_sub(1) };
             let nblocks = seg.blocks();
             let tables = self.fs().tables.borrow();
@@ -18947,7 +19041,7 @@ impl Reader {
                 if rank < keys {
                     let want = (keys - rank).min(limit - seen);
                     let got = seg
-                        .blob
+                        .raw()
                         .scan_at(rank, want, &mut *f)
                         .map_err(|e| err(&format!("segment scan: {e}")))?;
                     if got < want {
@@ -19008,7 +19102,7 @@ impl Reader {
                         let from: &[u8] = if first {
                             cursor
                         } else {
-                            seg.blob.key_at(lo).ok_or_else(|| {
+                            seg.raw().key_at(lo).ok_or_else(|| {
                                 err("block scan: a block's first rank did not resolve")
                             })?
                         };
@@ -19123,7 +19217,7 @@ impl Reader {
                 };
                 if !fetched && self.opts.scan_prefetch {
                     prefetch_block(
-                        &seg.blob,
+                        seg.raw(),
                         form,
                         start,
                         ahead,
@@ -19143,7 +19237,7 @@ impl Reader {
                     };
                     if let Some(next) = next {
                         prefetch_block(
-                            &seg.blob,
+                            seg.raw(),
                             next,
                             hi,
                             ahead - (hi - start),
@@ -19217,7 +19311,7 @@ impl Reader {
                         if start < run_hi {
                             let want = (run_hi - start).min(limit - seen);
                             let got = seg
-                                .blob
+                                .raw()
                                 .scan_at(start, want, &mut *f)
                                 .map_err(|e| err(&format!("segment scan: {e}")))?;
                             if got < want {
@@ -20164,11 +20258,11 @@ impl Reader {
                 .iter()
                 .filter(|s| s.may_reach(from))
                 .map(|s| {
-                    let rank = s.ord.seek(s.cursor_from(from), |r| s.blob.key_at(r));
+                    let rank = s.ord.seek(s.cursor_from(from), |r| s.raw().key_at(r));
                     Cur {
                         seg: s,
                         rank,
-                        key: s.blob.key_at(rank),
+                        key: s.raw().key_at(rank),
                     }
                 })
                 .collect()
@@ -20270,7 +20364,7 @@ impl Reader {
                 if start == 0 {
                     for (j, c) in l0.iter().enumerate().rev() {
                         if c.seg.tombs && c.key == Some(key) {
-                            if let Some((_, exts)) = c.seg.blob.exts_at(c.rank) {
+                            if let Some((_, exts)) = c.seg.raw().exts_at(c.rank) {
                                 if exts.iter().any(|e| e.is_tombstone()) {
                                     start = j + 1;
                                     break;
@@ -20293,12 +20387,12 @@ impl Reader {
                 if c.key == Some(key) {
                     if j + 1 >= start {
                         c.seg
-                            .blob
+                            .raw()
                             .values_at(c.rank, |v| f(key, v))
                             .map_err(|e| err(&format!("segment scan read: {e}")))?;
                     }
                     c.rank += 1;
-                    c.key = c.seg.blob.key_at(c.rank);
+                    c.key = c.seg.raw().key_at(c.rank);
                 }
             }
             if let Some(sk) = snap.filter(|_| in_unsealed) {
@@ -20373,7 +20467,7 @@ impl Reader {
                     if !seg.tombs || !seg.may_hold(key) {
                         continue;
                     }
-                    if let Some(exts) = seg.blob.lookup(key) {
+                    if let Some(exts) = seg.raw().lookup(key) {
                         if exts.iter().any(|e| e.is_tombstone()) {
                             start = 1 + i;
                             break;
@@ -20389,7 +20483,7 @@ impl Reader {
                     n += self.part_count_z(seg, key)?;
                 } else {
                     n += seg
-                        .blob
+                        .raw()
                         .count(key)
                         .map_err(|e| err(&format!("segment count: {e}")))?;
                 }
@@ -20400,7 +20494,7 @@ impl Reader {
                 continue;
             }
             n += seg
-                .blob
+                .raw()
                 .count(key)
                 .map_err(|e| err(&format!("segment count: {e}")))?;
         }
@@ -21504,7 +21598,7 @@ impl Db {
             // The walk reads every value through its block's checksum; the
             // limit is a bound the walk never reaches, well under the
             // sum a rank is added to.
-            seg.blob.scan(&[], u32::MAX as usize, |_, _| {}).is_ok()
+            seg.raw().scan(&[], u32::MAX as usize, |_, _| {}).is_ok()
         })
     }
 
@@ -21563,7 +21657,7 @@ impl Db {
     fn max_key_of(segs: &[std::sync::Arc<Seg>], mem: &MemTable) -> Vec<u8> {
         let mut best: Vec<u8> = Vec::new();
         for s in segs {
-            let b = &s.blob;
+            let b = s.raw();
             if b.keys() > 0 {
                 if let Some(k) = b.key_at(b.keys() - 1) {
                     if k > best.as_slice() {
@@ -23581,7 +23675,7 @@ impl Db {
         (0..n)
             .step_by(CACHE_BLOCK)
             .chain(n.checked_sub(1))
-            .all(|r| matches!((a.blob.key_at(r), b.blob.key_at(r)), (Some(x), Some(y)) if x == y))
+            .all(|r| matches!((a.raw().key_at(r), b.raw().key_at(r)), (Some(x), Some(y)) if x == y))
     }
 
     fn store_bytes_of(dir: &Path, segs: &[std::sync::Arc<Seg>]) -> u64 {
@@ -24244,7 +24338,7 @@ impl Db {
         };
         match zside::ZSide::attach(
             &dir.join(zside::zpg_name(id, end)),
-            &seg.blob,
+            seg.blob.for_sidecar(),
             id,
             end,
             advise,
@@ -24311,7 +24405,7 @@ impl Db {
         };
         match made {
             Ok(zside::Outcome::Built(b)) => {
-                match zside::ZSide::attach(&out, &seg.blob, id, end, advise) {
+                match zside::ZSide::attach(&out, seg.blob.for_sidecar(), id, end, advise) {
                     Ok(side) => {
                         if seg.z.install(side) {
                             ev.built(&b);
@@ -24833,11 +24927,11 @@ impl SnapBounds {
             let (k, _) = snap
                 .get(i)
                 .ok_or_else(|| err("block cache: a snapshot bound did not resolve"))?;
-            r = seg.ord.advance_below(r, k, |j| seg.blob.key_at(j));
+            r = seg.ord.advance_below(r, k, |j| seg.raw().key_at(j));
             let same = r < keys
                 && match seg.ord.whole_key_at(r, &mut kbuf) {
                     Some(w) => w == k,
-                    None => seg.blob.key_at(r) == Some(k),
+                    None => seg.raw().key_at(r) == Some(k),
                 };
             self.cuts[i].store(((r as u32) << 1) | same as u32, AtomicOrdering::Relaxed);
         }
@@ -26831,8 +26925,8 @@ fn bound_pieces_of(segs: &[std::sync::Arc<Seg>]) -> Result<()> {
                 seg,
                 nblocks,
                 p.blob.keys(),
-                |k| p.ord.seek(p.cursor_from(k), |i| p.blob.key_at(i)),
-                |i, bound| p.ord.advance_below(i, bound, |r| p.blob.key_at(r)),
+                |k| p.ord.seek(p.cursor_from(k), |i| p.raw().key_at(i)),
+                |i, bound| p.ord.advance_below(i, bound, |r| p.raw().key_at(r)),
             )?;
             p.bounds.put(against, std::sync::Arc::new(at));
         }
@@ -26924,8 +27018,8 @@ impl<'s> BuildCtx<'s> {
                         seg,
                         nblocks,
                         p.blob.keys(),
-                        |k| p.ord.seek(p.cursor_from(k), |i| p.blob.key_at(i)),
-                        |i, bound| p.ord.advance_below(i, bound, |r| p.blob.key_at(r)),
+                        |k| p.ord.seek(p.cursor_from(k), |i| p.raw().key_at(i)),
+                        |i, bound| p.ord.advance_below(i, bound, |r| p.raw().key_at(r)),
                     )?);
                     p.bounds.put(against, at.clone());
                     at
@@ -26968,8 +27062,8 @@ impl<'s> BuildCtx<'s> {
     /// (`OrdIndex::seek_exact_from`).
     fn owner_of_from(seg: &Seg, key: &[u8], floor: usize) -> (usize, u32) {
         let keys = seg.blob.keys();
-        let (rank, exact) = seg.ord.seek_exact_from(floor, key, |r| seg.blob.key_at(r));
-        let same = rank < keys && exact.unwrap_or_else(|| seg.blob.key_at(rank) == Some(key));
+        let (rank, exact) = seg.ord.seek_exact_from(floor, key, |r| seg.raw().key_at(r));
+        let same = rank < keys && exact.unwrap_or_else(|| seg.raw().key_at(rank) == Some(key));
         let owner = if same { rank } else { rank.saturating_sub(1) };
         (owner / CACHE_BLOCK, ((rank as u32) << 1) | same as u32)
     }
@@ -27006,11 +27100,11 @@ impl<'s> BuildCtx<'s> {
         let mut r = 0usize;
         for i in 0..n {
             let key = piece
-                .blob
+                .raw()
                 .key_at(i)
                 .ok_or_else(|| err("block cache: a rank did not resolve"))?;
-            let (rank, exact) = part.ord.seek_exact_from(r, key, |j| part.blob.key_at(j));
-            let same = rank < pk && exact.unwrap_or_else(|| part.blob.key_at(rank) == Some(key));
+            let (rank, exact) = part.ord.seek_exact_from(r, key, |j| part.raw().key_at(j));
+            let same = rank < pk && exact.unwrap_or_else(|| part.raw().key_at(rank) == Some(key));
             r = rank;
             out.push(((rank as u32) << 1) | same as u32);
         }
@@ -27031,10 +27125,10 @@ impl<'s> BuildCtx<'s> {
         let mut r = 0usize;
         for i in 0..n {
             let key = piece
-                .blob
+                .raw()
                 .key_at(i)
                 .ok_or_else(|| err("block cache: a rank did not resolve"))?;
-            let below = |j: usize| part.blob.key_at(j).is_some_and(|k| k < key);
+            let below = |j: usize| part.raw().key_at(j).is_some_and(|k| k < key);
             if r < pk && below(r) {
                 let mut lo = r;
                 let mut step = 1usize;
@@ -27061,7 +27155,7 @@ impl<'s> BuildCtx<'s> {
                 }
                 r = a;
             }
-            let same = r < pk && part.blob.key_at(r) == Some(key);
+            let same = r < pk && part.raw().key_at(r) == Some(key);
             out.push(((r as u32) << 1) | same as u32);
         }
         Ok(out)
@@ -27254,7 +27348,7 @@ impl<'s> BuildCtx<'s> {
             let start = held.len();
             for r in run.clone() {
                 let k = p
-                    .blob
+                    .raw()
                     .key_at(r)
                     .ok_or_else(|| err("block cache: a rank did not resolve"))?;
                 let cut = ranks.map_or(u32::MAX, |v| v[r]);
@@ -27463,7 +27557,7 @@ impl<'s> BuildCtx<'s> {
                 let (r0, r1) = (at[b] as usize, at[b + 1] as usize);
                 let r = p
                     .ord
-                    .seek(p.cursor_from(cursor), |i| p.blob.key_at(i))
+                    .seek(p.cursor_from(cursor), |i| p.raw().key_at(i))
                     .clamp(r0, r1);
                 (
                     *j,
@@ -27525,7 +27619,7 @@ impl<'s> BuildCtx<'s> {
                     if !p.tombs {
                         continue;
                     }
-                    if let Some((_, exts)) = p.blob.exts_at(rank) {
+                    if let Some((_, exts)) = p.raw().exts_at(rank) {
                         if exts.iter().any(|e| e.is_tombstone()) {
                             start = j + 1;
                             break;
@@ -27560,13 +27654,13 @@ impl<'s> BuildCtx<'s> {
         let start = self.oldest_live(em, ov, o, held, src);
         if start == 0 {
             if let Some(r) = part_rank {
-                src.seg.blob.values_at(r, |v| f(key, v)).map_err(read)?;
+                src.seg.raw().values_at(r, |v| f(key, v)).map_err(read)?;
             }
         }
         for &(_, j, rank, _) in held {
             if j + 1 >= start {
                 src.l0[j]
-                    .blob
+                    .raw()
                     .values_at(rank, |v| f(key, v))
                     .map_err(read)?;
             }
@@ -27631,7 +27725,7 @@ impl<'s> BuildCtx<'s> {
             };
             if bound > rank {
                 let got = seg
-                    .blob
+                    .raw()
                     .scan_at(rank, bound - rank, |k, v| {
                         on_key(k);
                         f(k, v)
@@ -27989,7 +28083,7 @@ impl<'s> BuildCtx<'s> {
         let scan = |rank: &mut usize, to: usize, seen: &mut usize, f: &mut F| -> Result<()> {
             let want = (to - *rank).min(limit - *seen);
             let got = seg
-                .blob
+                .raw()
                 .scan_at(*rank, want, &mut *f)
                 .map_err(|e| err(&format!("segment scan: {e}")))?;
             if got < want {
@@ -28161,7 +28255,7 @@ impl<'s> BuildCtx<'s> {
             if cut > rank && seen < limit {
                 let want = (cut - rank).min(limit - seen);
                 let got = seg
-                    .blob
+                    .raw()
                     .scan_at(rank, want, &mut f)
                     .map_err(|e| err(&format!("segment scan: {e}")))?;
                 if got < want {
@@ -28185,7 +28279,7 @@ impl<'s> BuildCtx<'s> {
         if seen < limit && rank < hi {
             let want = (hi - rank).min(limit - seen);
             let got = seg
-                .blob
+                .raw()
                 .scan_at(rank, want, &mut f)
                 .map_err(|e| err(&format!("segment scan: {e}")))?;
             if got < want {
@@ -28353,7 +28447,7 @@ impl<'s> BuildCtx<'s> {
                 blk.push(v);
             };
             let got = seg
-                .blob
+                .raw()
                 .scan_at(from, want, &mut rec)
                 .map_err(|e| err(&format!("segment scan: {e}")))?;
             if got < want {
@@ -28414,11 +28508,11 @@ impl<'s> BuildCtx<'s> {
     /// probe; at 300k keys a sparse block's build was 3 us, most of it
     /// here, and a fifth of E's first pass.
     fn cut_at(seg: &Seg, rank: usize, end: usize, uk: &[u8]) -> (usize, Ordering) {
-        let r = seg.ord.seek_in(rank, end, uk, |i| seg.blob.key_at(i));
+        let r = seg.ord.seek_in(rank, end, uk, |i| seg.raw().key_at(i));
         if r >= end {
             return (end, Ordering::Greater);
         }
-        let at = seg.blob.key_at(r).map_or(Ordering::Greater, |k| k.cmp(uk));
+        let at = seg.raw().key_at(r).map_or(Ordering::Greater, |k| k.cmp(uk));
         (r, at)
     }
 }
@@ -28447,7 +28541,7 @@ impl PWalk<'_> {
     /// The values at the position, handed to `f`.
     fn values<F: FnMut(&[u8])>(&self, f: &mut F) -> Result<u64> {
         match self {
-            PWalk::Raw { seg, rank, .. } => seg.blob.values_at(*rank, &mut *f),
+            PWalk::Raw { seg, rank, .. } => seg.raw().values_at(*rank, &mut *f),
             PWalk::Z(c) => c.values(f),
         }
         .map_err(|e| err(&format!("segment scan read: {e}")))
@@ -28459,7 +28553,7 @@ impl PWalk<'_> {
             PWalk::Raw { seg, rank, key } => {
                 let s = *seg;
                 *rank += 1;
-                *key = s.blob.key_at(*rank);
+                *key = s.raw().key_at(*rank);
             }
             PWalk::Z(c) => c.advance(),
         }
@@ -30177,7 +30271,7 @@ impl Maint {
             }
             // The partition's last key, or nothing if it is empty.
             let floor: Option<Vec<u8>> = {
-                let b = &self.segs()[pi].blob;
+                let b = self.segs()[pi].raw();
                 if b.keys() == 0 {
                     None
                 } else {
@@ -30672,7 +30766,7 @@ impl Maint {
                 Some(target) => {
                     match zside::ZSide::attach(
                         &out,
-                        &target.blob,
+                        target.blob.for_sidecar(),
                         id,
                         end,
                         Db::z_advise(&self.opts),
