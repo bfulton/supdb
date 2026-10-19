@@ -1371,19 +1371,46 @@ fn stat_majflt(stat: &str) -> Option<u64> {
 /// Where a pass asks whether the second form is what the arm says.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ZStage {
-    /// After the load, whose `sync` makes the sidecars.
+    /// After the ordered load, whose `sync` makes the sidecars.
     Loaded,
     /// After the point reads.
     Read,
+    /// After the shuffled load into the pass's second store, whose `sync`
+    /// makes that store's sidecars as the first's made the first's: the
+    /// partitions a shuffled load leaves are the ones merges wrote, and a
+    /// settle that ran out of rounds before the merges did leaves some raw.
+    Shuffled,
 }
+
+impl ZStage {
+    /// The moment, as the refusal words it.
+    fn when(self) -> &'static str {
+        match self {
+            ZStage::Loaded => "after the load",
+            ZStage::Read => "after the reads",
+            ZStage::Shuffled => "after the shuffled load",
+        }
+    }
+}
+
+/// The share of a pass's point reads, in percent, that a forced arm may
+/// have served from the raw form before the pass is not a measurement of the
+/// form: the stop the arm's pre-registration names, `zpage_rawserves` over a
+/// hundredth of the reads. The allowance is for what the engine decides on
+/// purpose and counts -- a sliver of a partition under the floor, which is
+/// read raw by design -- and not for a sidecar that went out of service,
+/// which is refused whatever its share.
+const Z_RAW_SHARE_MAX_PCT: u64 = 1;
 
 /// The refusal of an arm whose second form is not what its name says.
 /// A forced arm with no sidecar, or with the partitions it could cover
-/// raw, posts the raw form's throughput under the form's name; an arm that
-/// does not force the form and has read from a sidecar has been priced as
-/// something else. Either is a measurement of the wrong store, found after
-/// the load that made it. A partition left raw because it is under the
-/// engine's floor is the engine's own decision, counted and printed
+/// raw, or with a sidecar out of service, or whose reads went to the raw
+/// form beyond the share that is the engine's own decision, posts the raw
+/// form's throughput under the form's name; an arm that does not force the
+/// form and has read from a sidecar has been priced as something else.
+/// Either is a measurement of the wrong store, found after the load that
+/// made it. A partition left raw because it is under the engine's floor is
+/// the engine's own decision, counted and printed
 /// (`zpage_declined_small_bytes`), and covers nothing the form is for;
 /// every other partition without a sidecar was declined for what it holds
 /// or failed, and refuses the pass. `None` is an engine with no such form,
@@ -1395,26 +1422,102 @@ fn zpages_refusal(arm: &str, size: u64, stage: ZStage, z: Option<ZState>) -> Res
             "{arm} at {size}: {what}, so this is not a measurement of the form"
         ))
     };
+    let when = stage.when();
     match (stage, z.forced) {
-        (ZStage::Loaded, true) if z.sidecars == 0 => wrong(format!(
-            "the form is forced and none of {} partitions has a sidecar after the load \
+        (ZStage::Loaded | ZStage::Shuffled, true) if z.sidecars == 0 => wrong(format!(
+            "the form is forced and none of {} partitions has a sidecar {when} \
              ({} are under the floor; raise the key count)",
             z.partitions, z.small
         )),
-        (ZStage::Loaded, true) if z.sidecars + z.small != z.partitions => wrong(format!(
-            "the form is forced and {} of {} partitions have a sidecar after the load \
-             ({} are under the floor); the rest were declined or failed",
-            z.sidecars, z.partitions, z.small
+        (ZStage::Loaded | ZStage::Shuffled, true) if z.sidecars + z.small != z.partitions => {
+            wrong(format!(
+                "the form is forced and {} of {} partitions have a sidecar {when} \
+                 ({} are under the floor); the rest were declined or failed",
+                z.sidecars, z.partitions, z.small
+            ))
+        }
+        (ZStage::Loaded | ZStage::Shuffled, true) if z.files != z.sidecars || z.stray != 0 => {
+            wrong(format!(
+                "the form is forced and the store's directory holds {} sidecar files and {} \
+                 other files named for the form beside {} live sidecars {when}: a file no \
+                 partition claims is disk the row counts",
+                z.files, z.stray, z.sidecars
+            ))
+        }
+        (_, true) if z.damaged > 0 => wrong(format!(
+            "the form is forced and {} of {} sidecars are out of service {when}: a check \
+             of one of their pages failed, and a partition is read raw from then on",
+            z.damaged, z.sidecars
         )),
         (ZStage::Read, true) if z.reads == 0 => wrong(
             "the form is forced and no point read of the pass was answered from a sidecar".into(),
         ),
+        (ZStage::Read, true) if z.raw * 100 > (z.reads + z.raw) * Z_RAW_SHARE_MAX_PCT => {
+            wrong(format!(
+                "the form is forced and {} of {} reads and counts went to the raw form \
+                 (over {Z_RAW_SHARE_MAX_PCT}%)",
+                z.raw,
+                z.reads + z.raw
+            ))
+        }
         (ZStage::Read, false) if z.reads != 0 => wrong(format!(
             "the form is not forced and {} point reads were answered from a sidecar",
             z.reads
         )),
         _ => Ok(()),
     }
+}
+
+/// The single-threaded point reads of a pass: `reads` of them, each over a
+/// key drawn uniformly from the loaded set and timed into `h`, the phase
+/// counted around, and its seconds returned. Then the question whether a
+/// forced arm read through its form, asked here and not left to the row:
+/// reads that went to the raw form post its throughput under the form's name.
+fn read_phase(
+    e: &mut dyn Engine,
+    arm: &str,
+    size: u64,
+    reads: u64,
+    h: &mut Hist,
+    counting: &mut Counting<'_>,
+) -> Result<f64, String> {
+    let mut kb = [0u8; KEY_SIZE];
+    let mut g = KeyGen::new(KeyDist::Uniform, size, 7);
+    let c0 = counting.begin();
+    phase_mark(arm, "read", "start");
+    let t = Instant::now();
+    for _ in 0..reads {
+        db_key_into(g.next(), &mut kb);
+        let t1 = Instant::now();
+        e.get(&kb)?;
+        h.record(t1.elapsed().as_nanos() as u64);
+    }
+    let read_s = t.elapsed().as_secs_f64();
+    phase_mark(arm, "read", "end");
+    counting.end(c0, "read", "", None, reads);
+    zpages_refusal(arm, size, ZStage::Read, e.zpages_state())?;
+    Ok(read_s)
+}
+
+/// The pass's second store loaded in a shuffled order, its seconds returned.
+/// Then the question whether a forced arm's form covers it: the store is the
+/// one a shuffled load's merges wrote, and the form's `sync` gives up on a
+/// store whose merges outlast its rounds, so the lag sweep that follows
+/// would be over the raw form under the form's name.
+fn shuffled_load(
+    e: &mut dyn Engine,
+    arm: &str,
+    size: u64,
+    plan: &Plan,
+    payload: &Payload,
+    counting: &mut Counting<'_>,
+) -> Result<f64, String> {
+    let perm = Permutation::new(size, 0x5EED);
+    let c0 = counting.begin();
+    let (secs, _) = load(e, size, plan, payload, |i| perm.at(i))?;
+    counting.end(c0, "load-shuffled", "", None, size);
+    zpages_refusal(arm, size, ZStage::Shuffled, e.zpages_state())?;
+    Ok(secs)
 }
 
 fn one_pass(
@@ -1468,23 +1571,10 @@ fn one_pass(
     // (`Plan::divided`), each a key drawn uniformly over the loaded set.
     let reads = plan.divided(size);
     let mut kb = [0u8; KEY_SIZE];
-    let mut g = KeyGen::new(KeyDist::Uniform, size, 7);
     let mut h = Hist::new();
     let mut read_s = f64::NAN;
     if passes.read {
-        let c0 = counting.begin();
-        phase_mark(arm, "read", "start");
-        let t = Instant::now();
-        for _ in 0..reads {
-            db_key_into(g.next(), &mut kb);
-            let t1 = Instant::now();
-            e.get(&kb)?;
-            h.record(t1.elapsed().as_nanos() as u64);
-        }
-        read_s = t.elapsed().as_secs_f64();
-        phase_mark(arm, "read", "end");
-        counting.end(c0, "read", "", None, reads);
-        zpages_refusal(arm, size, ZStage::Read, e.zpages_state())?;
+        read_s = read_phase(e.as_mut(), arm, size, reads, &mut h, &mut counting)?;
     }
 
     // The same reads over each thread count, on the store as loaded and
@@ -1721,11 +1811,7 @@ fn one_pass(
         prime_b = prime_fresh_pool(prime_bytes_for(size, plan.bound_bytes()))?;
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let mut e = engines::open(arm, dir, map_gb)?;
-        let perm = Permutation::new(size, 0x5EED);
-        let c0 = counting.begin();
-        let (secs, _) = load(e.as_mut(), size, plan, payload, |i| perm.at(i))?;
-        counting.end(c0, "load-shuffled", "", None, size);
-        shuf_s = secs;
+        shuf_s = shuffled_load(e.as_mut(), arm, size, plan, payload, &mut counting)?;
         if passes.lag {
             lag_sweep(
                 e.as_mut(),
@@ -2937,6 +3023,18 @@ pub fn full_top(mem_total_kb: u64, value_size: usize) -> u64 {
 mod tests {
     use super::*;
 
+    /// Held between the one test that counts what `release_freed_memory`
+    /// returns and the tests that run a pass, which call it: the release is
+    /// the process's, so a pass's `malloc_trim` in another test's thread
+    /// takes the freed blocks the first is about to count, and the test
+    /// failed -- on blocks that "were not resident to begin with", or on a
+    /// release that returned less than most of them -- in runs of the whole
+    /// binary at the default thread count once a test that runs a pass was
+    /// beside it. A pass takes this shared, and the measurement
+    /// exclusively. The guard is taken through `into_inner`, so a test that
+    /// fails holding it fails nobody else.
+    static TRIM: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
     /// The shape that filled the full run's memory: a thread allocates
     /// small blocks in its own arena, frees them, and exits, with one block
     /// allocated last still live so the arena cannot give its heap back from
@@ -2946,6 +3044,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
     fn a_dropped_stores_freed_memory_is_returned_before_the_next_pass() {
+        let _alone = TRIM.write().unwrap_or_else(|e| e.into_inner());
         const BLOCKS: usize = 3_000_000;
         const SIZE: usize = 100;
         let held = BLOCKS * SIZE;
@@ -3200,6 +3299,7 @@ mod tests {
     /// ones, an arm that reads from none, and an engine with no such form.
     #[test]
     fn a_forced_form_that_is_not_in_use_is_refused() {
+        // A store settled has a file for each of its sidecars.
         let z = |forced, reads, partitions, sidecars, small| {
             Some(ZState {
                 forced,
@@ -3207,6 +3307,8 @@ mod tests {
                 partitions,
                 sidecars,
                 small,
+                files: sidecars,
+                ..ZState::default()
             })
         };
         let run = |stage, state| zpages_refusal("supdb-nocachezpages", 1_000, stage, state);
@@ -3220,10 +3322,16 @@ mod tests {
         assert!(run(ZStage::Loaded, z(false, 0, 18, 0, 0)).is_ok());
         assert!(run(ZStage::Loaded, None).is_ok(), "an engine with no form");
         assert!(run(ZStage::Read, None).is_ok());
+        // The second store, after the shuffled load, is held to the first's
+        // coverage rules.
+        assert!(run(ZStage::Shuffled, z(true, 0, 12, 12, 0)).is_ok());
+        assert!(run(ZStage::Shuffled, z(true, 0, 12, 11, 1)).is_ok());
+        assert!(run(ZStage::Shuffled, z(false, 0, 12, 0, 0)).is_ok());
 
         let red = |stage, state| run(stage, state).unwrap_err();
         let none = red(ZStage::Loaded, z(true, 0, 18, 0, 0));
         assert!(none.contains("none of 18 partitions"), "{none}");
+        assert!(none.contains("after the load"), "{none}");
         let under = red(ZStage::Loaded, z(true, 0, 1, 0, 1));
         assert!(under.contains("raise the key count"), "{under}");
         let part = red(ZStage::Loaded, z(true, 0, 18, 17, 0));
@@ -3235,6 +3343,255 @@ mod tests {
         let leaked = red(ZStage::Read, z(false, 3, 18, 0, 0));
         assert!(leaked.contains("3 point reads"), "{leaked}");
         assert!(none.starts_with("supdb-nocachezpages at 1000: "), "{none}");
+        // The shuffled store, by the same rules and in its own words.
+        let none = red(ZStage::Shuffled, z(true, 0, 12, 0, 0));
+        assert!(
+            none.contains("none of 12 partitions") && none.contains("after the shuffled load"),
+            "{none}"
+        );
+        let part = red(ZStage::Shuffled, z(true, 0, 12, 9, 1));
+        assert!(
+            part.contains("9 of 12") && part.contains("after the shuffled load"),
+            "{part}"
+        );
+        // The directory: one file for each sidecar and no other file named
+        // for the form, at both loads. A leftover is disk the row counts.
+        for stage in [ZStage::Loaded, ZStage::Shuffled] {
+            let mut left = z(true, 0, 18, 18, 0).unwrap();
+            left.files = 19;
+            let why = red(stage, Some(left));
+            assert!(
+                why.contains("19 sidecar files") && why.contains("18 live sidecars"),
+                "{why}"
+            );
+            let mut temp = z(true, 0, 18, 18, 0).unwrap();
+            temp.stray = 1;
+            let why = red(stage, Some(temp));
+            assert!(why.contains("1 other files"), "{why}");
+            let mut lost = z(true, 0, 18, 18, 0).unwrap();
+            lost.files = 17;
+            assert!(red(stage, Some(lost)).contains("17 sidecar files"));
+        }
+        // An unforced arm has none, and its directory is nobody's to ask.
+        let mut unforced = z(false, 0, 18, 0, 0).unwrap();
+        unforced.files = 3;
+        assert!(run(ZStage::Loaded, Some(unforced)).is_ok());
+    }
+
+    /// A sidecar out of service and reads that went to the raw form are what
+    /// the arm's pre-registration stops a pairing for, and a pass that has
+    /// served one read from a sidecar has not earned the form's name with
+    /// them: the share is the registered hundredth of the reads, counted
+    /// with the raw ones, and it is held at its edge.
+    #[test]
+    fn a_forced_form_with_a_sidecar_out_of_service_or_reads_gone_raw_is_refused() {
+        let covered = ZState {
+            forced: true,
+            partitions: 18,
+            sidecars: 18,
+            files: 18,
+            ..ZState::default()
+        };
+        let run = |stage, z: ZState| zpages_refusal("supdb-nocachezpages", 1_000, stage, Some(z));
+        // At the edge: a hundredth of the reads exactly is the allowance.
+        let reads = |reads, raw| ZState {
+            reads,
+            raw,
+            ..covered
+        };
+        assert!(run(ZStage::Read, reads(990, 10)).is_ok());
+        assert!(run(ZStage::Read, reads(1_000, 0)).is_ok());
+        let over = run(ZStage::Read, reads(989, 11)).unwrap_err();
+        assert!(over.contains("11 of 1000"), "{over}");
+        let mostly_raw = run(ZStage::Read, reads(1, 99)).unwrap_err();
+        assert!(mostly_raw.contains("99 of 100"), "{mostly_raw}");
+        // The share is of the forced arm's reads: an unforced arm's raw reads
+        // are all of them.
+        let unforced = ZState {
+            forced: false,
+            raw: 1_000,
+            ..ZState::default()
+        };
+        assert!(run(ZStage::Read, unforced).is_ok());
+        // A sidecar out of service is refused at every stage, however few
+        // reads it cost.
+        for stage in [ZStage::Loaded, ZStage::Read, ZStage::Shuffled] {
+            let out = ZState {
+                damaged: 1,
+                reads: 1_000_000,
+                ..covered
+            };
+            let why = run(stage, out).unwrap_err();
+            assert!(
+                why.contains("1 of 18 sidecars are out of service") && why.contains(stage.when()),
+                "{stage:?}: {why}"
+            );
+            let sound = ZState {
+                reads: 10,
+                ..covered
+            };
+            assert!(run(stage, sound).is_ok(), "{stage:?}");
+        }
+    }
+
+    /// An engine that reads nothing and says what it is told of its second
+    /// form: the pass's phases asked of something that can lie, since a real
+    /// engine's form is never in the state a refusal is for.
+    struct Telling {
+        z: Option<ZState>,
+        gets: u64,
+    }
+
+    impl Engine for Telling {
+        fn name(&self) -> &'static str {
+            "telling"
+        }
+        fn features(&self) -> engines::Features {
+            engines::Features {
+                durable_commit: true,
+                transactions: false,
+                checksums: false,
+                reopen_for_write: false,
+                read_your_writes: true,
+                ordered_scan: true,
+            }
+        }
+        fn write_batch(&mut self, _: &[(&[u8], &[u8])]) -> engines::Res<()> {
+            Ok(())
+        }
+        fn get(&mut self, _: &[u8]) -> engines::Res<usize> {
+            self.gets += 1;
+            Ok(0)
+        }
+        fn range(&mut self, _: &[u8], _: usize) -> engines::Res<usize> {
+            Ok(0)
+        }
+        fn sync(&mut self) -> engines::Res<()> {
+            Ok(())
+        }
+        fn size_bytes(&self) -> u64 {
+            0
+        }
+        fn thread_reader(&self) -> engines::Res<engines::ReaderOpener> {
+            Err("no reader".into())
+        }
+        fn zpages_state(&self) -> Option<ZState> {
+            self.z
+        }
+    }
+
+    /// The point-read phase asks, after the reads, whether a forced arm read
+    /// through its form -- the call site of the refusal that no real arm
+    /// reaches red, because a real forced arm reads through its sidecars.
+    #[test]
+    fn the_read_phase_asks_whether_a_forced_arm_read_through_its_form() {
+        let mut counting = Counting::new(None, Path::new(".")).unwrap();
+        let covered = ZState {
+            forced: true,
+            reads: 50,
+            partitions: 3,
+            sidecars: 3,
+            ..ZState::default()
+        };
+        let mut phase = |z: Option<ZState>| {
+            let mut e = Telling { z, gets: 0 };
+            let mut h = Hist::new();
+            let r = read_phase(
+                &mut e,
+                "supdb-nocachezpages",
+                1_000,
+                50,
+                &mut h,
+                &mut counting,
+            );
+            // The reads were made whatever the answer: it is asked after.
+            assert_eq!(e.gets, 50);
+            r
+        };
+        assert!(phase(Some(covered)).unwrap() >= 0.0);
+        assert!(
+            phase(None).is_ok(),
+            "an engine with no form is asked nothing"
+        );
+        let silent = phase(Some(ZState {
+            reads: 0,
+            ..covered
+        }))
+        .unwrap_err();
+        assert!(silent.contains("no point read"), "{silent}");
+        let raw = phase(Some(ZState {
+            raw: 500,
+            ..covered
+        }))
+        .unwrap_err();
+        assert!(raw.contains("went to the raw form"), "{raw}");
+        let out = phase(Some(ZState {
+            damaged: 1,
+            ..covered
+        }))
+        .unwrap_err();
+        assert!(out.contains("out of service"), "{out}");
+        let leaked = phase(Some(ZState {
+            forced: false,
+            ..covered
+        }))
+        .unwrap_err();
+        assert!(leaked.contains("not forced"), "{leaked}");
+    }
+
+    /// The shuffled load asks, after it, whether a forced arm's form covers
+    /// the pass's second store -- the call site of a refusal that a real arm
+    /// reaches red only when its merges outlast the settle's rounds.
+    #[test]
+    fn the_shuffled_load_asks_whether_a_forced_arm_covers_the_second_store() {
+        let mut counting = Counting::new(None, Path::new(".")).unwrap();
+        let plan = Plan::new(Scale::Quick, vec![], 1_000, 4);
+        let payload = Payload::new(plan.value_size, plan.compress, 0xE1);
+        let mut phase = |z: Option<ZState>| {
+            let mut e = Telling { z, gets: 0 };
+            shuffled_load(
+                &mut e,
+                "supdb-nocachezpages",
+                1_000,
+                &plan,
+                &payload,
+                &mut counting,
+            )
+        };
+        let covered = ZState {
+            forced: true,
+            partitions: 12,
+            sidecars: 12,
+            files: 12,
+            ..ZState::default()
+        };
+        assert!(phase(Some(covered)).unwrap() >= 0.0);
+        assert!(
+            phase(None).is_ok(),
+            "an engine with no form is asked nothing"
+        );
+        let part = phase(Some(ZState {
+            sidecars: 9,
+            files: 9,
+            ..covered
+        }))
+        .unwrap_err();
+        assert!(
+            part.contains("9 of 12") && part.contains("after the shuffled load"),
+            "{part}"
+        );
+        let stray = phase(Some(ZState {
+            stray: 1,
+            ..covered
+        }))
+        .unwrap_err();
+        assert!(stray.contains("1 other files"), "{stray}");
+        let out = phase(Some(ZState {
+            damaged: 1,
+            ..covered
+        }))
+        .unwrap_err();
+        assert!(out.contains("out of service"), "{out}");
     }
 
     /// The pass itself refuses a forced arm over a store with no sidecar to
@@ -3242,6 +3599,9 @@ mod tests {
     /// and over it, and the unforced arm beside it, which reads from none.
     #[test]
     fn the_pass_refuses_a_forced_arm_that_covers_nothing_and_runs_one_that_does() {
+        // A pass releases freed memory to the system: not while the test that
+        // counts what the release returns is counting.
+        let _pass = TRIM.read().unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("supdb-bench-zpass-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let mut plan = Plan::new(Scale::Quick, vec![], 30_000, 4);

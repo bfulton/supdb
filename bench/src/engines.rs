@@ -202,11 +202,25 @@ pub struct ZState {
     /// Point reads of a partition answered from a sidecar, over the
     /// store's life.
     pub reads: u64,
+    /// Reads and counts of a partition that went to the raw form instead,
+    /// over the store's life: the partition had no sidecar in service, or a
+    /// check of the sidecar failed on the read.
+    pub raw: u64,
     /// The live partitions, those with a sidecar, and those with none for
     /// being under the floor.
     pub partitions: u64,
     pub sidecars: u64,
     pub small: u64,
+    /// Sidecars out of service: a check failed on one of their pages, and
+    /// the partition is read raw from then on.
+    pub damaged: u64,
+    /// What the store's directory holds of the form: files named for a
+    /// sidecar, and other files in the form's prefix (a build's temp name,
+    /// or any name the engine's sweep would take). A forced store settled has
+    /// one file for each sidecar and no other: a file nothing claims is disk
+    /// the row's `bytes_on_disk_per_byte` counts.
+    pub files: u64,
+    pub stray: u64,
 }
 
 pub trait Engine {
@@ -686,6 +700,11 @@ pub struct Supdb {
     /// from it: `supdb-nocachezpages`, the nocache policy alone, the form
     /// being for a store that does not fit.
     zpages: bool,
+    /// The build of the second form leaves the raw records it passed in the
+    /// page cache (`Options::zpages_drop_behind` off): the pair
+    /// `supdb-nocachezpagesnodrop` against `supdb-nocachezpages` prices the
+    /// drop, which is a share of the build's elapsed time.
+    zpages_nodrop: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -1050,6 +1069,9 @@ struct Policy {
     /// The second form forced on (`Options::zpages`):
     /// `supdb-nocachezpages`.
     zpages: bool,
+    /// Its build keeps the raw records in the page cache
+    /// (`Options::zpages_drop_behind` off): `supdb-nocachezpagesnodrop`.
+    zpages_nodrop: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -1140,6 +1162,7 @@ impl Default for Policy {
             bglag: false,
             ordread: false,
             zpages: false,
+            zpages_nodrop: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -3276,12 +3299,43 @@ impl Supdb {
     /// `sync`, inside the load window, so this arm's load carries their
     /// build. Chosen by hand, as
     /// `ab --arms supdb-nocache,supdb-nocachezpages`.
+    ///
+    /// The pair differs by one thing the option does not name: the build
+    /// needs the partitions to be final, so this arm's `sync` waits for the
+    /// segment work (`Db::zpages_settle` settles before it builds and after),
+    /// and `supdb-nocache`'s returns when its flush is answered, with the
+    /// manifest slot's fdatasync and the WAL's retirement still to run on the
+    /// segment-work thread beside the first reads of its pass. Milliseconds
+    /// beside a pass of seconds, and not made equal by making the base arm
+    /// wait, which would change an arm the rows are banked on: a pairing is
+    /// read with the load's phases beside it (`SUPDB_LOAD_PHASES`), where the
+    /// sync is a column of its own.
     pub fn create_nocache_zpages(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
                 block_cache: false,
                 zpages: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-nocachezpages` whose build leaves the raw records it read in
+    /// the page cache instead of dropping them behind itself
+    /// (`Options::zpages_drop_behind` off): the pair against
+    /// `supdb-nocachezpages` differs by that one option and prices the drop,
+    /// which a build pays in `madvise` and `fadvise` calls a window and which
+    /// leaves the raw form cold for the scans that follow it. Chosen by
+    /// hand, as `ab --arms supdb-nocachezpages,supdb-nocachezpagesnodrop`,
+    /// read by the load's phases, where the build is the closing sync.
+    pub fn create_nocache_zpages_nodrop(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                block_cache: false,
+                zpages: true,
+                zpages_nodrop: true,
                 ..Policy::default()
             },
         )
@@ -3397,6 +3451,7 @@ impl Supdb {
             bglag,
             ordread,
             zpages,
+            zpages_nodrop,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -3602,6 +3657,11 @@ impl Supdb {
             } else {
                 supdb::Options::default().zpages
             },
+            zpages_drop_behind: if zpages_nodrop {
+                false
+            } else {
+                supdb::Options::default().zpages_drop_behind
+            },
             forms_pieces_only: piecesonly,
             // Unpinned, the writer must be the one publisher, as it was
             // when the pins were priced: the store refuses the pair.
@@ -3740,6 +3800,7 @@ impl Supdb {
             bglag,
             ordread,
             zpages,
+            zpages_nodrop,
             ord_threads: Default::default(),
         })
     }
@@ -4321,7 +4382,11 @@ impl Engine for Supdb {
             return "supdb-nocacheordread";
         }
         if self.zpages {
-            return "supdb-nocachezpages";
+            return if self.zpages_nodrop {
+                "supdb-nocachezpagesnodrop"
+            } else {
+                "supdb-nocachezpages"
+            };
         }
         match (
             self.partition,
@@ -4536,6 +4601,7 @@ impl Engine for Supdb {
             ("zpage_attached", z.attached as f64),
             ("zpage_rejected_damage", z.rejected_damage as f64),
             ("zpage_rejected_identity", z.rejected_identity as f64),
+            ("zpage_swept", z.swept as f64),
             ("zpage_partitions_at_end", z.partitions as f64),
             ("zpage_sidecars_at_end", z.sidecars as f64),
             ("zpage_small_partitions_at_end", z.small_partitions as f64),
@@ -4551,12 +4617,31 @@ impl Engine for Supdb {
     fn zpages_state(&self) -> Option<ZState> {
         let db = self.db.as_ref()?;
         let c = db.zpage_counts();
+        let (mut files, mut stray) = (0, 0);
+        for e in std::fs::read_dir(&self.path)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with("zpg-") {
+                if name.ends_with(".zpg") {
+                    files += 1;
+                } else {
+                    stray += 1;
+                }
+            }
+        }
         Some(ZState {
             forced: db.options().zpages == supdb::ZPages::Always,
             reads: c.reads,
+            raw: c.rawserves + c.fallbacks,
             partitions: c.partitions,
             sidecars: c.sidecars,
             small: c.small_partitions,
+            damaged: c.damaged,
+            files,
+            stray,
         })
     }
     fn thread_reader(&self) -> Res<ReaderOpener> {
@@ -5102,6 +5187,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocache"
         | "supdb-nocacheordread"
         | "supdb-nocachezpages"
+        | "supdb-nocachezpagesnodrop"
         | "supdb-cache256"
         | "supdb-l0"
         | "supdb-nopin"
@@ -5274,6 +5360,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nocache" => Box::new(Supdb::create_nocache(dir)?),
         "supdb-nocacheordread" => Box::new(Supdb::create_nocache_ordread(dir)?),
         "supdb-nocachezpages" => Box::new(Supdb::create_nocache_zpages(dir)?),
+        "supdb-nocachezpagesnodrop" => Box::new(Supdb::create_nocache_zpages_nodrop(dir)?),
         "supdb-cache256" => Box::new(Supdb::create_cache256(dir)?),
         "supdb-ingest" => Box::new(Supdb::create_ingest(dir)?),
         "supdb-ingestleave" => Box::new(Supdb::create_ingest_leave(dir)?),
@@ -5788,6 +5875,11 @@ mod tests {
             "the one option"
         );
         assert_eq!(a.zpages_min_bytes, b.zpages_min_bytes, "the engine's floor");
+        assert_eq!(
+            a.zpages_drop_behind, b.zpages_drop_behind,
+            "the drop behind the build"
+        );
+        assert!(a.zpages_drop_behind, "the engine's own, on");
         assert_eq!(a.point_via_ord, b.point_via_ord);
         assert_eq!(a.exts_by_value, b.exts_by_value);
         assert_eq!(a.scan_block_cache, b.scan_block_cache);
@@ -5849,6 +5941,26 @@ mod tests {
             "every partition has its sidecar when the sync returns: {az:?}"
         );
         assert_eq!((bz.sidecars, bz.small), (0, 0), "{bz:?}");
+        // The directory holds the sidecars' files and no other file of the
+        // form, which is what a pass asks of it.
+        assert_eq!((az.files, az.stray), (az.sidecars, 0), "{az:?}");
+        assert_eq!((bz.files, bz.stray), (0, 0), "{bz:?}");
+        // And the count sees a file that is not a live sidecar's, of either
+        // kind: a whole one nobody claims, and a build's temp name.
+        let (whole, temp) = (
+            arm.path.join("zpg-00000999-0000000000000999.zpg"),
+            arm.path.join("zpg-00000999-0000000000000999.zpg.tmp"),
+        );
+        std::fs::write(&whole, b"nobody's").unwrap();
+        std::fs::write(&temp, b"half a build").unwrap();
+        let planted = arm.zpages_state().unwrap();
+        assert_eq!(
+            (planted.files, planted.stray),
+            (az.files + 1, 1),
+            "{planted:?}"
+        );
+        std::fs::remove_file(&whole).unwrap();
+        std::fs::remove_file(&temp).unwrap();
         let (mut reads, absent) = (0f64, [0xffu8; 16]);
         for k in keys.iter().step_by(7) {
             assert_eq!(arm.get(k).unwrap(), value.len());
@@ -5911,6 +6023,140 @@ mod tests {
         std::fs::create_dir_all(&opened).unwrap();
         let e = open("supdb-nocachezpages", &opened, 1).unwrap();
         assert_eq!(e.name(), "supdb-nocachezpages", "the dispatch");
+        drop(e);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// What the arm's state says of a store whose sidecar a check refused: the
+    /// refusal that reads it is tested on states it is handed, and this is
+    /// the state a real engine hands it. A page of a sidecar is damaged
+    /// before anything reads it; the read that meets it falls back to the raw
+    /// form and answers right, and the state counts that read as raw and the
+    /// sidecar as out of service, then the reads after it as raw too.
+    #[test]
+    fn the_arms_state_says_what_a_damaged_sidecar_did() {
+        let root =
+            std::env::temp_dir().join(format!("supdb-bench-zdamaged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut arm = Supdb::create_nocache_zpages(&root).unwrap();
+        let value = [7u8; 100];
+        let keys: Vec<[u8; 16]> = (0..30_000u64)
+            .map(|i| {
+                let mut k = [0u8; 16];
+                crate::workload::db_key_into(i, &mut k);
+                k
+            })
+            .collect();
+        for chunk in keys.chunks(1_000) {
+            let items: Vec<(&[u8], &[u8])> = chunk.iter().map(|k| (&k[..], &value[..])).collect();
+            arm.write_batch(&items).unwrap();
+        }
+        arm.sync().unwrap();
+        let whole = arm.zpages_state().unwrap();
+        assert!(whole.sidecars >= 1 && whole.sidecars == whole.partitions);
+        assert_eq!((whole.damaged, whole.raw), (0, 0), "{whole:?}");
+        // The first page of every sidecar, one byte changed under the file
+        // the store holds mapped: the page's CRC no longer holds, and no
+        // read has verified it yet.
+        let mut changed = 0;
+        for e in std::fs::read_dir(&root).unwrap().flatten() {
+            let path = e.path();
+            if path.extension().is_some_and(|x| x == "zpg") {
+                use std::os::unix::fs::FileExt;
+                let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                f.write_all_at(&[0xA5], 200).unwrap();
+                changed += 1;
+            }
+        }
+        assert_eq!(changed, whole.sidecars);
+        // The read is answered, from the raw form, and counted as that.
+        assert_eq!(arm.get(&keys[0]).unwrap(), value.len());
+        let hurt = arm.zpages_state().unwrap();
+        assert_eq!((hurt.damaged, hurt.raw), (1, 1), "{hurt:?}");
+        assert_eq!(hurt.reads, whole.reads, "no read was served by the form");
+        // The sidecar is out of service from then on: the next read of the
+        // partition is raw too, without a check failing again.
+        assert_eq!(arm.get(&keys[1]).unwrap(), value.len());
+        let after = arm.zpages_state().unwrap();
+        assert_eq!((after.damaged, after.raw), (1, 2), "{after:?}");
+        drop(arm);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `supdb-nocachezpagesnodrop` is `supdb-nocachezpages` with the build's
+    /// drop of the raw records behind its walk off, and nothing else: named,
+    /// durable like it, opened under its name by the dispatch, on options that
+    /// differ from the arm's in `Options::zpages_drop_behind` alone, and
+    /// forced like it. The drop is what the pair prices, so the arm is held
+    /// to leaving the build's other settings where the arm has them.
+    #[test]
+    fn the_nodrop_arm_differs_from_the_zpages_arm_in_the_drop_alone() {
+        let root =
+            std::env::temp_dir().join(format!("supdb-bench-zpagesnodrop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let new = |name: &str, nodrop: bool| {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            if nodrop {
+                Supdb::create_nocache_zpages_nodrop(&d)
+            } else {
+                Supdb::create_nocache_zpages(&d)
+            }
+            .unwrap()
+        };
+        let (arm, base) = (new("arm", true), new("base", false));
+        assert_eq!(arm.name(), "supdb-nocachezpagesnodrop");
+        assert_eq!(base.name(), "supdb-nocachezpages");
+        assert_eq!(
+            guarantee("supdb-nocachezpagesnodrop"),
+            Some(Guarantee::Durable)
+        );
+        assert_eq!(
+            guarantee("supdb-nocachezpagesnodrop"),
+            guarantee("supdb-nocachezpages")
+        );
+        assert!(arm.zpages && base.zpages, "both force the form");
+        assert!(arm.zpages_nodrop && !base.zpages_nodrop);
+        assert_eq!(arm.partition, base.partition, "the row's shape");
+        assert_eq!(arm.drain, base.drain);
+        assert_eq!(arm.durable, base.durable);
+        assert_eq!(arm.block_cache, base.block_cache);
+        assert_eq!(arm.budget, base.budget);
+        assert_eq!(arm.advice, base.advice);
+        assert_eq!(arm.features(), base.features());
+        let (a, b) = (
+            arm.db.as_ref().unwrap().options(),
+            base.db.as_ref().unwrap().options(),
+        );
+        assert!(
+            !a.zpages_drop_behind && b.zpages_drop_behind,
+            "the one option"
+        );
+        assert!(a.zpages == supdb::ZPages::Always && b.zpages == supdb::ZPages::Always);
+        assert_eq!(a.zpages_min_bytes, b.zpages_min_bytes);
+        assert_eq!(a.point_via_ord, b.point_via_ord);
+        assert_eq!(a.scan_block_cache, b.scan_block_cache);
+        assert_eq!(a.scan_cache_bytes, b.scan_cache_bytes);
+        assert_eq!(a.read_advice, b.read_advice);
+        assert_eq!(a.inline_bytes, b.inline_bytes);
+        assert_eq!(a.partition_bytes, b.partition_bytes);
+        assert_eq!(a.seal_bytes, b.seal_bytes);
+        assert_eq!(a.compact, b.compact);
+        assert_eq!(a.promote, b.promote);
+        assert_eq!(a.sync, b.sync);
+        assert_eq!(a.upkeep, b.upkeep);
+        assert_eq!(a.writer_pins, b.writer_pins);
+        assert_eq!(a.publish_in_background, b.publish_in_background);
+        // The engine's own default is the drop on, so an arm that pins
+        // nothing has it.
+        assert!(supdb::Options::default().zpages_drop_behind);
+        drop((arm, base));
+        let opened = root.join("open");
+        std::fs::create_dir_all(&opened).unwrap();
+        let e = open("supdb-nocachezpagesnodrop", &opened, 1).unwrap();
+        assert_eq!(e.name(), "supdb-nocachezpagesnodrop", "the dispatch");
+        assert_eq!(e.zpages_state().map(|z| z.forced), Some(true));
         drop(e);
         let _ = std::fs::remove_dir_all(&root);
     }
