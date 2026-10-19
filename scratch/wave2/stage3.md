@@ -210,6 +210,44 @@ the next record, an advance that keeps the key. The fuzz with the form
 forced: a hundred and twenty seeds with the cache off and a hundred and
 twenty with it on, clean, every seed reaching `scan_merged`.
 
+Piece 3 is in: `Seg::blob` is `SegBlob`, a newtype with no `Deref` that
+forwards `keys`, `id`, `index_bytes` and the advice; `Seg::raw` is the
+door, counting `raw_touches` under debug assertions where the segment's
+cell holds a sidecar; `SegBlob::for_sidecar` hands the raw form to
+`ZSide` for its reads of runs in blocks and the attach's identity, not a
+touch. The compiler listed seventy-five method sites (sixty-four by the
+first pass's regex, eleven of `count` and `scan_at` it had left out) and
+eight borrows handed to the sidecar; `grep -n '\.raw()' src/db.rs` lists
+eighty deliberate reads, by group: the raw side of each dispatch
+(`part_read_z`, `part_count_z`, `part_scan_z`, `part_seek_z`,
+`part_cut_z`, `part_values_z`, `pwalk_*`, `part_via_ord`, the point read's
+and the count's tombstone pre-pass over the pieces), the `cursor_merge`
+arm in `scan` (seven), the pieces' cursors in `scan_merged`, the block
+cache (`scan_blocks`, `install_ahead`, `patch_block`, `make_table`,
+`fold_piece_block`, `BuildCtx`'s walks, cuts, overlays and the prefetch),
+and the segment work's passes (`same_blocks`, `max_key_of`,
+`promotion_chain`'s first and last keys, `block_bounds_of`,
+`bound_pieces_of`, `table_bounds`, `owner_of_from`, `ranks_over*`,
+`promote_ranges`, `pending_whole`). The test
+(`the_compact_form_touches_no_raw_page`) holds the touches to zero on the
+writer and a `Latest` handle over point reads and counts of present and
+absent keys, scans from every fence key's neighbourhood at five limits
+and the whole store, in five shapes: drained; with an insert between
+records, an append to a record and a delete unsealed; the same sealed
+into a piece with more appends and puts over it; after the flush's merge
+of the piece (the landing's `same_blocks` is the segment work's and falls
+between the reads); and a store of keys of two hundred to five thousand
+bytes with a record no page holds, whose neighbours are answered from the
+fence and whose own read is the positive control, two touches at least.
+Every shape read zero on the first run with the engine as piece 2 left
+it, which is the finding: nothing of a covered partition's records is
+read raw on the nocache arm's paths. Two mutants held to firing: the
+door that counts the wrong segments, and the seek sent raw. The model in
+the test learned one thing of the engine: a deleted key is a key a scan's
+limit counts until the merge drops its tombstone with nothing older to
+mask, so a model that keeps deleted keys as empty entries reads one key
+further than the store after a merge, and drops them there.
+
 ## What 2b's sittings leave open, read before 3's
 
 - The eager build's pairing (`eager-pairing.sh`, `eager-ab-1.out` and
