@@ -20,7 +20,8 @@ of the change that produced the text.
 | path | what |
 |---|---|
 | `src/db.rs` | the engine: WAL with atomic batches, memtable, sealed segments, partitioned compaction, tombstones, `Txn`, and the `SegmentWriter` every segment is written by -- `docs/engine.md` |
-| `src/db/zpages.rs` | the compact form's layout: the page, the group, the fill that packs records into pages, the fence, the trailer and the identity a sidecar is bound by; wired to no read path -- the module's own docs, and `bench/examples/zsize.rs` for what it makes of the engine's bytes |
+| `src/db/zpages.rs` | the compact form's layout: the page, the group, the fill that packs records into pages, the fence, the trailer and the identity a sidecar is bound by, with no file, thread or clock in it -- the module's own docs, and `bench/examples/zsize.rs` for what it makes of the engine's bytes |
+| `src/db/zside.rs` | the compact form on the engine's side of the file: the builder that writes a partition's sidecar from the partition's own bytes, the attach that binds it to its segment by content, the cell a segment holds it in, and the point read and count through it, behind `Options::zpages`; scans stay on the raw form -- the module's own docs |
 | `src/db/zselect.rs` | the compact form's selector: `ZSelect::step`, a function of its state and an explicit `Input` (no clock, thread or file), the one definition of the transitions between FITS, SUSPECT, building, COMPACT and the trial, and the replays that hold it -- the module's own docs |
 | `src/format.rs` | the on-disk format's fixed quantities, owned by no writer |
 | `src/block.rs`, `src/index.rs`, `src/flatindex.rs` | the format itself: blocks, extents, the flat key index -- `docs/index-theory.md` |
@@ -2152,6 +2153,70 @@ two functions that hand out the same resource take the same guard, and a
 fuzz that draws its inputs from the whole of the type (the empty key, the
 empty value, the key of 0xff bytes) finds what a table of examples chose
 not to.
+
+**A check spelled twice, and the copy nothing reached.** The sidecar
+reader's first decode compared a page's rank and count with its fence entry
+and walked its group in code beside `verify_page`'s, and the attach's sample
+compared them in a third place. Every damage test flips a byte and the
+page's CRC refuses it before any later check runs, so deleting the compare,
+skipping the walk or passing no first key survived twenty-six integration
+tests and fifty-seven unit tests. The three share `check_entry` and
+`check_group` now, and the tests forge a page whose CRC is good under the
+sidecar's own binding and whose records are wrong (one short, two swapped, a
+first key that is not the fence's, a rank or a count the entry does not
+name). The rule: a check against what a checksum already catches is reached
+only by an input that passes the checksum, so the test makes one; and a check
+is written once.
+
+**A mapping's advice decided from a mode that moves.** A sidecar was advised
+from the store's mode at the instant of its attach, so one attached after a
+scan kept the kernel's readahead for its life: 806 faults of 4 KiB where the
+other read 34 of 98 KiB, in the review's probe. Only point reads and counts
+read a sidecar, and they are random in every phase, so it is advised random
+once, at attach. The rule: the advice for a mapping one access pattern reads
+is decided by that pattern and not by the phase the store happens to be in,
+and the kernel's answer (the `rr` flag in `smaps`) is read, not the store's
+record of what it asked.
+
+**A second mechanism that masks the first in a test.** Once the settle swept
+the directory, the test that a merge takes the sidecar of the segment it
+retires passed with `retire_seg`'s unlink deleted, because the sweep cleaned
+up before the assertion; two mutants survived. The test asks the directory
+after the merges land and before any settle. The rule: when two mechanisms
+can reach one end state, the test asserts at the moment only the first has
+run.
+
+**A process-wide side effect and a test that counts it.**
+`release_freed_memory` is `malloc_trim` of every arena, and the first library
+test to run a pass trimmed under the test that measures what a trim returns:
+two of twenty-five whole-binary runs failed, with 148.6 of 300 MB released.
+A lock now, taken for write by the measurement and for read by every test
+that reaches a pass, through `into_inner` so that a failure holds nobody. The
+rule: a test that counts a process-wide effect excludes every test that can
+cause it.
+
+**A call site no real input reaches red.** The suite's refusals after the
+read pass and after the shuffled load were green-side only, because a real
+forced arm reads through its sidecars and the refusal is for the arm that did
+not. Each is a function of its own now, driven by a stub engine that lies,
+and the state a real arm reports is read from a store damaged and strewn for
+the purpose. The rule: if a check's red input cannot be made by the real
+thing, the call is a function the test can hand a liar.
+
+**A prediction an assumption supports.** The first registered builds for the
+forced arm rested on two or three rebuilds a partition that a flush and a
+settle's first join make impossible; one band sat 0.4% from its own edge; the
+load's registered cost ignored a build CPU already counted; and a staircase
+was predicted for a file the build leaves resident in the page cache. A
+prediction that rests on an assumption marked unmeasured is registered as an
+identity the counters print, or not at all.
+
+**A probe's total over a whole read is an inlining result.** The same engine
+read +0.9, +1.9, +2.9 and +3.15 instructions a point read across four probes
+and a count +3.00 exactly, because the code after a probe's loop changes what
+LTO inlines. Quote a price from the function that holds the inlined read,
+with the probe's source identical for the base and the head, and never set a
+threshold at the figure.
 
 ## Standing limitations
 
