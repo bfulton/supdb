@@ -668,6 +668,47 @@ thread_local! {
 /// Reader ids, one per open.
 static NEXT_BLOB_ID: AtomicU64 = AtomicU64::new(1);
 
+/// What a derived file that copies a segment's records (a sidecar of the z
+/// form, `db::zpages`) binds itself to, as the segment says it of itself:
+/// every quantity a writer fixes once and nothing changes after. The sidecar
+/// holds values, so it is bound to the segment's content and not to a name --
+/// the engine hands segment ids out again after a crash -- and the strong
+/// part is `row_crc`, the CRC-32C of the key section's checksum row: four
+/// bytes per 16 KiB are a fingerprint of every byte the records live in, and
+/// reading it costs a few hundred kilobytes per gigabyte, not a pass over
+/// the file.
+///
+/// Native only: there is no sidecar in a browser, and nothing that reaches
+/// the wasm module changes with it.
+#[cfg(not(target_family = "wasm"))]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ZSource {
+    /// The segment's key count.
+    pub nkeys: u64,
+    /// Its record region's length.
+    pub recs_len: u64,
+    /// Where its key section's checksum row lies in the section.
+    pub crc_off: u64,
+    /// The key section's offset in the file.
+    pub key_off: u64,
+    /// The hash table's capacity.
+    pub hash_cap: u64,
+    /// The file's length.
+    pub file_len: u64,
+    /// The superblock's timestamp, and the index section's generation
+    /// (`Blob::version`).
+    pub timestamp: u64,
+    pub generation: u64,
+    /// CRC-32C of the checksum row.
+    pub row_crc: u32,
+    /// The record format's version and the file format's magic as this
+    /// engine reads them: a sidecar copied records laid out by these, and an
+    /// engine that lays them out otherwise must not attach it.
+    pub rec_version: u32,
+    pub rec_magic: u64,
+}
+
 impl<B: Bytes> Blob<B> {
     pub fn open(src: B) -> Result<Blob<B>> {
         Blob::open_with(src, BlobOptions::default())
@@ -948,6 +989,50 @@ impl<B: Bytes> Blob<B> {
         if a < b {
             crate::db::prefetch_lines(recs[a..].as_ptr(), b - a);
         }
+    }
+
+    /// The record region and the directory as they lie in the mapping: the
+    /// bytes a derived file copies records from, and the words that say
+    /// where each record starts. The directory is the authority for where a
+    /// record lies and never the difference of two of its words -- a segment
+    /// closed from a direct run keeps its commit markers inside the record
+    /// region, counted in every later word. `None` for a reader that does
+    /// not hold the section whole.
+    #[cfg(not(target_family = "wasm"))]
+    #[doc(hidden)]
+    pub fn record_regions(&self) -> Option<(&[u8], &[u8])> {
+        let (sec, idx) = self.flat()?;
+        idx.regions(sec)
+    }
+
+    /// What a sidecar binds itself to (`ZSource`), or `None` where there is
+    /// nothing to bind to: a reader that does not hold the section whole,
+    /// or a section with no checksum row (a store's in-place-editable
+    /// index, which no sidecar is built for).
+    #[cfg(not(target_family = "wasm"))]
+    #[doc(hidden)]
+    pub fn z_source_facts(&self) -> Option<ZSource> {
+        let (sec, idx) = self.flat()?;
+        let h = flatindex::Header::parse(sec)?;
+        if h.crc_off == 0 {
+            return None;
+        }
+        let base = self.index_offset();
+        let n = flatindex::checksum_row_len(h.crc_off, h.piece_shift, base);
+        let row = sec.get(h.crc_off..h.crc_off.checked_add(n)?)?;
+        Some(ZSource {
+            nkeys: idx.len() as u64,
+            recs_len: h.recs_len as u64,
+            crc_off: h.crc_off as u64,
+            key_off: base,
+            hash_cap: h.hash_cap as u64,
+            file_len: self.src.len(),
+            timestamp: self.timestamp,
+            generation: self.generation,
+            row_crc: block::crc32(row),
+            rec_version: flatindex::REC_VERSION,
+            rec_magic: crate::format::MAGIC,
+        })
     }
 
     /// The key at `rank` in key order.

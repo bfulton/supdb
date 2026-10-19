@@ -63,6 +63,10 @@ pub mod zselect;
 #[cfg(not(target_family = "wasm"))]
 #[doc(hidden)]
 pub mod zpages;
+// The same form's engine side: the sidecar mapped, checked and read, the
+// cell a segment holds it in, and the builder. Private: it is the engine's
+// and nothing outside `db` names it.
+mod zside;
 
 /// Write a segment's ordered index, and make it durable where `durable`
 /// says so (`Options::ord_durable`).
@@ -309,6 +313,114 @@ impl ReadAdvice {
     }
 }
 
+/// Whether a partition's records are also kept in a second form, a sidecar
+/// of the same records packed into groups that each compress into one 4 KiB
+/// page, and read from it (`zpages`).
+///
+/// Out of core a point read of the raw form touches the hash region, which
+/// every read does and which therefore stays resident, and the record, which
+/// is the page a read misses on; the cache holds both, and the records do
+/// not fit beside it. The sidecar is smaller than the records it copies, so
+/// a store whose raw form misses on nearly every read can hold the sidecar
+/// whole, and a read then takes one page of it at most. Both forms answer
+/// every read identically, and the sidecar is derived data: deleting its
+/// files and setting `Off` is the whole of the undo.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ZPages {
+    /// No sidecar is built, read or attached. One already on disk is not
+    /// read, and goes with its segment when the store retires the segment.
+    #[default]
+    Off,
+    /// Every partition has a sidecar, and every point read and count of a
+    /// partition is answered from it. Built on demand by
+    /// `Db::zpages_settle`, attached at open, and refused beside
+    /// `writer_pins` off, since the cell it is read through is freed with
+    /// its segment under the epoch. A partition that has none -- being
+    /// built, declined, damaged -- is read from the raw form and counted.
+    /// Scans of a covered partition are walked over the raw form, and
+    /// counted, so a sidecar's mapping is advised `MADV_RANDOM` in every
+    /// phase of the store whenever `read_advice` advises mappings at all.
+    /// This is the arm that prices the form: it is built and read whether
+    /// or not the store needs it.
+    Always,
+}
+
+/// What the second form has done (`Options::zpages`), read by
+/// `Reader::zpage_counts`.
+///
+/// The first block is the reads' and is summed over every handle's slot; the
+/// second is the building thread's, counted where it happens; the third are
+/// gauges, taken from the segments live when it is read, named for the end
+/// of a pass they are read at.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ZCounts {
+    /// Point reads and counts of a partition answered from its sidecar.
+    pub reads: u64,
+    pub counts: u64,
+    /// Pages decoded to answer them: one for each read or count of a key
+    /// that falls in a page's range, the key the page holds and the key it
+    /// does not alike. A stored page decodes none, and neither does a key
+    /// below the partition's first key, which the fence answers.
+    pub decodes: u64,
+    /// Reads and counts of a partition that went to the raw form because
+    /// it had no sidecar in service: none attached yet, or declined, or
+    /// out of service after a check failed.
+    pub rawserves: u64,
+    /// Reads and counts that went to the raw form because a check failed
+    /// on them, or because the fence names no page for the key: a record the
+    /// form was built without. The builder makes none of those yet, so a
+    /// store that built its own sidecars counts the first kind alone.
+    pub fallbacks: u64,
+    /// Scans that began in a partition with a sidecar and were walked raw.
+    pub raw_scans: u64,
+    /// Sidecars built, their pages, bytes, the pages that hold their
+    /// group verbatim, the decoded bytes of every group, and compress
+    /// calls; builds that failed and builds a merge outran.
+    pub builds: u64,
+    pub build_pages: u64,
+    pub build_bytes: u64,
+    pub build_stored: u64,
+    pub build_group_bytes: u64,
+    pub build_calls: u64,
+    pub build_failed: u64,
+    pub build_orphaned: u64,
+    /// Partitions declined, by reason, and the record bytes of the ones
+    /// declined for their size.
+    pub declined_small: u64,
+    pub declined_small_bytes: u64,
+    pub declined_block_backed: u64,
+    pub declined_oversize: u64,
+    pub declined_incompressible: u64,
+    pub declined_unplaceable: u64,
+    /// Sidecars attached, and files an attach refused: damaged, or bound
+    /// to another segment.
+    pub attached: u64,
+    pub rejected_damage: u64,
+    pub rejected_identity: u64,
+    /// Files removed from the directory because no live segment claims
+    /// them: sidecars left by a crash or by a store that ran without the
+    /// option, and the temp names of builds that did not finish.
+    pub swept: u64,
+    /// Partitions live, the ones with a sidecar installed, the ones of
+    /// those out of service, and their pages, the pages a first decode has
+    /// passed, the pages a check failed, the fences kept in memory, the
+    /// files' bytes and the decoded bytes of their groups. The live
+    /// partitions with none because they are under the floor are counted
+    /// apart (`small_partitions`): a store covered but for a sliver is one
+    /// thing, and one whose partitions could not be is another.
+    pub partitions: u64,
+    pub sidecars: u64,
+    pub small_partitions: u64,
+    pub damaged: u64,
+    pub pages: u64,
+    pub verified_pages: u64,
+    pub bad_pages: u64,
+    pub resident_bytes: u64,
+    pub file_bytes: u64,
+    pub group_bytes: u64,
+}
+
 #[derive(Clone)]
 pub struct Options {
     pub sync: SyncPolicy,
@@ -529,6 +641,28 @@ pub struct Options {
     /// chosen by hand for a store that does not fit and is not the
     /// default. `supdb-nocacheordread`.
     pub point_via_ord: bool,
+    /// The partitions' second form (`ZPages`). `Off`, the default: the
+    /// read path pays one load of this field and one branch not taken, and
+    /// nothing else. `Always` is the arm that prices the form
+    /// (`supdb-nocachezpages`): a point read and a count of a partition is
+    /// answered from its sidecar, a scan of one is not. Refused beside
+    /// `writer_pins` off.
+    pub zpages: ZPages,
+    /// The record bytes below which `ZPages::Always` declines a partition
+    /// and writes no file. A test's: it lowers the floor to build sidecars
+    /// of partitions a test can afford to write.
+    #[doc(hidden)]
+    pub zpages_min_bytes: usize,
+    /// Whether a sidecar's build drops the raw records and directory it
+    /// reads from the page cache as it passes them. On, the build leaves
+    /// the partition's records cold, which is what a store that does not
+    /// fit wants of a pass that read them once. It costs the build an
+    /// `madvise` and an `fadvise` a window, and it leaves the raw form cold
+    /// for a scan of a store that does fit and follows the build. Off is the
+    /// shape the drop is priced against: the sum of a load's phases says
+    /// what it costs.
+    #[doc(hidden)]
+    pub zpages_drop_behind: bool,
     /// EXPERIMENT: the block forms hold the fold of the partition and the
     /// level-0 pieces alone, and the memtables' keys reach a scan through
     /// the scan snapshot, which every walk overlays on its block whatever
@@ -1948,6 +2082,9 @@ impl Default for Options {
             asym_pins: false,
             exts_by_value: false,
             point_via_ord: false,
+            zpages: ZPages::Off,
+            zpages_min_bytes: zside::ZMIN_RECS,
+            zpages_drop_behind: true,
             forms_pieces_only: false,
             publish_in_background: true,
             adaptive_shape: false,
@@ -2738,6 +2875,19 @@ struct Seg {
     /// them; for a segment that recorded none, two thirds of its file,
     /// the ratio `seal_threshold` is calibrated at.
     data: u64,
+    /// The partition's sidecar (`Options::zpages`), once one is attached:
+    /// set once, never cleared, freed with the segment. A segment that
+    /// replaces another -- a merge's output, a promotion's re-open -- starts
+    /// with an empty cell, and its reads go to the raw form until the
+    /// sidecar is attached again.
+    z: zside::ZCell,
+    /// Why a partition was given no sidecar, for the life of the segment,
+    /// as `zside::Decline::code` numbers the reasons (`zside::DECLINED_FAILED`
+    /// a build that failed), or zero: what keeps a settle from looking
+    /// again at a partition it has declined, and what `Db::zpage_counts`
+    /// reads to tell a sliver left raw for its size from one that could not
+    /// be covered.
+    z_declined: std::sync::atomic::AtomicU8,
 }
 
 /// The order the live segments hold: partitions first, disjoint and by
@@ -5633,6 +5783,8 @@ impl Seg {
                 ord_rebuilt,
                 tombs,
                 data,
+                z: zside::ZCell::new(),
+                z_declined: std::sync::atomic::AtomicU8::new(0),
             });
         }
         if let Some(rest) = name
@@ -5666,6 +5818,8 @@ impl Seg {
                 ord_rebuilt,
                 tombs: false,
                 data,
+                z: zside::ZCell::new(),
+                z_declined: std::sync::atomic::AtomicU8::new(0),
             });
         }
         // L0: the Bloom from the writer where it had the keys' hashes, and
@@ -5691,6 +5845,8 @@ impl Seg {
             ord_rebuilt,
             tombs,
             data,
+            z: zside::ZCell::new(),
+            z_declined: std::sync::atomic::AtomicU8::new(0),
         })
     }
 
@@ -6865,6 +7021,19 @@ struct Slot {
     tried: AtomicU64,
     hit: AtomicU64,
     built: AtomicU64,
+    /// What this handle's reads did of the second form (`Options::zpages`),
+    /// written by the slot's handle alone with a plain load and store, the
+    /// way a line only its owner writes is counted: point reads and counts
+    /// the sidecar answered, pages it decoded to answer them, reads of a
+    /// partition that went to the raw form because it had no sidecar in
+    /// service, reads that went to it because a check failed, and scans
+    /// that began in a partition with a sidecar and were walked raw.
+    zreads: AtomicU64,
+    zcounts: AtomicU64,
+    zdecodes: AtomicU64,
+    zraw: AtomicU64,
+    zfallbacks: AtomicU64,
+    zscans: AtomicU64,
 }
 
 impl Slot {
@@ -6879,11 +7048,20 @@ impl Slot {
             tried: AtomicU64::new(0),
             hit: AtomicU64::new(0),
             built: AtomicU64::new(0),
+            zreads: AtomicU64::new(0),
+            zcounts: AtomicU64::new(0),
+            zdecodes: AtomicU64::new(0),
+            zraw: AtomicU64::new(0),
+            zfallbacks: AtomicU64::new(0),
+            zscans: AtomicU64::new(0),
         }
     }
 }
 
-const _: () = assert!(std::mem::align_of::<Slot>() >= 128 && std::mem::size_of::<Slot>() >= 128);
+// One line: the nine words that were here and the six the second form's
+// counters add are 120 bytes of a 128-byte slot, and a seventh would make
+// every slot two lines.
+const _: () = assert!(std::mem::align_of::<Slot>() >= 128 && std::mem::size_of::<Slot>() == 128);
 
 const READER_SLOTS: usize = 256;
 
@@ -8387,6 +8565,15 @@ fn check_options(opts: &Options) -> Result<()> {
         return Err(err(
             "writer_pins off needs every publish on the writer's thread: \
              publish_in_background and snapshot_keeper off",
+        ));
+    }
+    // The sidecar a read follows hangs on its segment and is freed with it,
+    // through the epoch like every state a publish replaces; a writer that
+    // pins nothing reads a segment nobody keeps alive for it.
+    if opts.zpages == ZPages::Always && !opts.writer_pins {
+        return Err(err(
+            "zpages Always needs writer_pins: a sidecar is freed with its segment \
+             under the epoch, and an unpinned writer reads it unpinned",
         ));
     }
     Ok(())
@@ -10659,6 +10846,12 @@ struct Shared {
     /// Ordered indexes the open rebuilt from their segments
     /// (`Seg::open_ord`); see `Db::ord_rebuilt`.
     ord_rebuilt: AtomicU64,
+    /// What building and attaching sidecars did over the store's life
+    /// (`Options::zpages`), counted by the thread that did it; a read's
+    /// own counts are on its slot's line. See `Db::zpage_counts`.
+    z: zside::ZEvents,
+    /// A test's: the next sidecar build fails as a write error would.
+    fail_zbuild: std::sync::atomic::AtomicBool,
     /// Direct runs whose mapping was grown past the file's end
     /// (`Options::direct_table_refs`); see `Db::run_remaps`.
     run_remaps: AtomicU64,
@@ -13890,8 +14083,9 @@ impl Reader {
         self.set_advice_random(random);
         // Segments only. A segment's pages are walked in whichever way the
         // workload is walking them, so the advice follows the phase; the
-        // ordered companion is reached only by a binary search and is left
-        // on `MADV_RANDOM` in both.
+        // ordered companion is reached only by a binary search and a
+        // sidecar only by point reads and counts, and both are left on
+        // `MADV_RANDOM` in both.
         for s in self.segs() {
             if random {
                 s.blob.advise_random();
@@ -13931,6 +14125,92 @@ impl Reader {
             self.segs().iter().filter(|s| s.ord.advised()).count(),
             self.segs().len(),
         )
+    }
+
+    /// How many sidecars' mappings were advised `MADV_RANDOM`, and how many
+    /// sidecars there are.
+    ///
+    /// The sidecar is the other mapping the advice policy can miss, and the
+    /// ordered companion's rule is its own: `advise`'s walk is the segments',
+    /// so a sidecar is advised once, at attach, and not by the mode the store
+    /// is in at that moment -- only point reads and counts reach it, and
+    /// they are random in both phases. Every sidecar of a store that advises
+    /// its mappings is random, then, and none of one that does not
+    /// (`ReadAdvice::Normal`). A check needs to be able to ask, as
+    /// `ords_advised` lets it ask of the companions, and the kernel's own
+    /// answer is the mapping's `VmFlags`.
+    #[doc(hidden)]
+    pub fn zpages_advised(&self) -> (usize, usize) {
+        let _entered = self.enter();
+        let (mut advised, mut total) = (0, 0);
+        for z in self.segs().iter().filter_map(|s| s.z.get()) {
+            total += 1;
+            advised += usize::from(z.advised());
+        }
+        (advised, total)
+    }
+
+    /// What the second form (`Options::zpages`) has done over the store's
+    /// life, whichever handle did it: the reads and counts it answered, the
+    /// reads of a partition that went to the raw form and why, the scans it
+    /// stood aside for, what building and attaching sidecars did, and the
+    /// sidecars as the segments hold them now. Zero throughout without the
+    /// option, but for the partitions it counts and the files the open's
+    /// sweep removed, which runs under either setting.
+    ///
+    /// Read from the slots, the store's shared words and the live segments
+    /// alone: the reads' counts are on the slots' lines, which a handle's
+    /// release leaves where they are, so a threaded pass's handles dropped
+    /// before the counters are read are in the sum.
+    #[doc(hidden)]
+    pub fn zpage_counts(&self) -> ZCounts {
+        let _entered = self.enter();
+        let rd = &self.shared.readers;
+        let ev = &self.shared.z;
+        let get = |c: &AtomicU64| c.load(AtomicOrdering::Relaxed);
+        let mut c = ZCounts {
+            reads: rd.stat(|s| &s.zreads),
+            counts: rd.stat(|s| &s.zcounts),
+            decodes: rd.stat(|s| &s.zdecodes),
+            rawserves: rd.stat(|s| &s.zraw),
+            fallbacks: rd.stat(|s| &s.zfallbacks),
+            raw_scans: rd.stat(|s| &s.zscans),
+            builds: get(&ev.builds),
+            build_pages: get(&ev.build_pages),
+            build_bytes: get(&ev.build_bytes),
+            build_stored: get(&ev.build_stored),
+            build_group_bytes: get(&ev.build_group_bytes),
+            build_calls: get(&ev.build_calls),
+            build_failed: get(&ev.build_failed),
+            build_orphaned: get(&ev.build_orphaned),
+            declined_small: get(&ev.declined_small),
+            declined_small_bytes: get(&ev.declined_small_bytes),
+            declined_block_backed: get(&ev.declined_block_backed),
+            declined_oversize: get(&ev.declined_oversize),
+            declined_incompressible: get(&ev.declined_incompressible),
+            declined_unplaceable: get(&ev.declined_unplaceable),
+            attached: get(&ev.attached),
+            rejected_damage: get(&ev.rejected_damage),
+            rejected_identity: get(&ev.rejected_identity),
+            swept: get(&ev.swept),
+            ..ZCounts::default()
+        };
+        for seg in self.segs().iter().filter(|s| s.level > 0) {
+            c.partitions += 1;
+            if let Some(z) = seg.z.get() {
+                c.sidecars += 1;
+                c.damaged += u64::from(z.damaged());
+                c.pages += z.pages() as u64;
+                c.verified_pages += z.verified_pages();
+                c.bad_pages += z.bad_pages();
+                c.resident_bytes += z.resident_bytes() as u64;
+                c.file_bytes += z.file_bytes();
+                c.group_bytes += z.group_bytes();
+            } else if seg.z_declined.load(AtomicOrdering::Relaxed) == zside::DECLINED_SMALL {
+                c.small_partitions += 1;
+            }
+        }
+        c
     }
 
     /// Point reads of a partition this handle answered through the
@@ -13991,6 +14271,111 @@ impl Reader {
         };
         count.set(count.get() + 1);
         Ok(served)
+    }
+
+    /// One of this handle's second-form counters up by one: a plain load
+    /// and store on the line of the slot the handle owns, the writer's own
+    /// handle through the slot its operations pin. A line only its owner
+    /// writes is not counted with a locked add, and a shared word every
+    /// reader thread bumped is what the threaded cells these counters are
+    /// read beside would price. A handle with no slot counts nothing.
+    #[inline]
+    fn zbump(&self, pick: impl Fn(&Slot) -> &AtomicU64) {
+        if let Some(i) = self.slot.or(self.pin_slot) {
+            let c = pick(&self.shared.readers.slots[i]);
+            c.store(c.load(AtomicOrdering::Relaxed) + 1, AtomicOrdering::Relaxed);
+        }
+    }
+
+    /// `key`'s values in a partition read from its sidecar
+    /// (`Options::zpages`), or from the raw form, which `raw` reads, where
+    /// the partition has no sidecar in service or a check of the sidecar
+    /// failed on this read: counted either way, on this handle's line.
+    ///
+    /// The sidecar answers or it does not before a value is handed to `f`,
+    /// so a read that falls back has emitted nothing and the raw read does
+    /// not repeat a value.
+    ///
+    /// Out of line on purpose, as `part_via_ord` is: its one call site
+    /// invites the compiler to inline it, and inlined it grows `read_all`,
+    /// which every point read runs.
+    #[inline(never)]
+    fn part_read_z<F: FnMut(&[u8])>(
+        &self,
+        seg: &Seg,
+        key: &[u8],
+        f: &mut F,
+        raw: impl Fn(&Seg, &mut F) -> Result<u64>,
+    ) -> Result<u64> {
+        let Some(z) = seg.z.get() else {
+            self.zbump(|s| &s.zraw);
+            return raw(seg, f);
+        };
+        let served = z
+            .read_all(&seg.blob, key, f)
+            .map_err(|e| err(&format!("segment read: {e}")))?;
+        match served {
+            zside::ZRead::Served { n, decoded } => {
+                self.zbump(|s| &s.zreads);
+                if decoded {
+                    self.zbump(|s| &s.zdecodes);
+                }
+                Ok(n)
+            }
+            zside::ZRead::Fallback => {
+                self.zbump(|s| &s.zfallbacks);
+                raw(seg, f)
+            }
+            zside::ZRead::Out => {
+                self.zbump(|s| &s.zraw);
+                raw(seg, f)
+            }
+        }
+    }
+
+    /// `part_read_z` for a count.
+    #[inline(never)]
+    fn part_count_z(&self, seg: &Seg, key: &[u8]) -> Result<u64> {
+        let raw = || {
+            seg.blob
+                .count(key)
+                .map_err(|e| err(&format!("segment count: {e}")))
+        };
+        let Some(z) = seg.z.get() else {
+            self.zbump(|s| &s.zraw);
+            return raw();
+        };
+        match z.count(key) {
+            zside::ZRead::Served { n, decoded } => {
+                self.zbump(|s| &s.zcounts);
+                if decoded {
+                    self.zbump(|s| &s.zdecodes);
+                }
+                Ok(n)
+            }
+            zside::ZRead::Fallback => {
+                self.zbump(|s| &s.zfallbacks);
+                raw()
+            }
+            zside::ZRead::Out => {
+                self.zbump(|s| &s.zraw);
+                raw()
+            }
+        }
+    }
+
+    /// A scan begun under `Options::zpages` that starts in a partition with
+    /// a sidecar: counted, since the scan is walked over the raw form and
+    /// the sidecar's pages are not where it reads.
+    #[inline(never)]
+    fn count_raw_scan(&self, from: &[u8]) {
+        let st = self.state();
+        let np = st.segs.partition_point(|s| s.level > 0);
+        let at =
+            st.segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= from));
+        if st.segs[..np].get(at).is_some_and(|s| s.z.get().is_some()) {
+            self.zbump(|s| &s.zscans);
+        }
     }
 
     pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {
@@ -14076,18 +14461,24 @@ impl Reader {
         };
         if start == 0 {
             if let Some(seg) = part {
-                // The partition through its ordered index where the option
-                // asks and the index can answer; everything else, and the
-                // pieces below, through the hash.
-                let via_ord = if self.opts.point_via_ord {
-                    self.part_via_ord(seg, key, &mut f)?
+                if self.opts.zpages == ZPages::Always {
+                    // The partition from its sidecar, or from the raw form
+                    // and counted where it has none in service.
+                    n += self.part_read_z(seg, key, &mut f, seg_read)?;
                 } else {
-                    None
-                };
-                n += match via_ord {
-                    Some(k) => k,
-                    None => seg_read(seg, &mut f)?,
-                };
+                    // The partition through its ordered index where the
+                    // option asks and the index can answer; everything
+                    // else, and the pieces below, through the hash.
+                    let via_ord = if self.opts.point_via_ord {
+                        self.part_via_ord(seg, key, &mut f)?
+                    } else {
+                        None
+                    };
+                    n += match via_ord {
+                        Some(k) => k,
+                        None => seg_read(seg, &mut f)?,
+                    };
+                }
             }
         }
         for (i, seg) in l0.iter().enumerate() {
@@ -14391,6 +14782,11 @@ impl Reader {
             if use_cache {
                 s.blockpath.fetch_add(1, AtomicOrdering::Relaxed);
             }
+        }
+        // A scan walks the raw form whatever the second form holds; one
+        // that begins in a partition with a sidecar is counted as such.
+        if self.opts.zpages == ZPages::Always {
+            self.count_raw_scan(from);
         }
         // Nothing written or published since the last scan: nothing to
         // settle, and the snapshot that stood then stands. Every scan paid
@@ -19351,10 +19747,14 @@ impl Reader {
         let mut n = 0u64;
         if start == 0 {
             if let Some(seg) = part {
-                n += seg
-                    .blob
-                    .count(key)
-                    .map_err(|e| err(&format!("segment count: {e}")))?;
+                if self.opts.zpages == ZPages::Always {
+                    n += self.part_count_z(seg, key)?;
+                } else {
+                    n += seg
+                        .blob
+                        .count(key)
+                        .map_err(|e| err(&format!("segment count: {e}")))?;
+                }
             }
         }
         for (i, seg) in l0.iter().enumerate() {
@@ -19731,6 +20131,8 @@ impl Db {
             convert_build_ns: AtomicU64::new(0),
             convert_total_ns: AtomicU64::new(0),
             ord_rebuilt: AtomicU64::new(0),
+            z: zside::ZEvents::default(),
+            fail_zbuild: std::sync::atomic::AtomicBool::new(false),
             run_remaps: AtomicU64::new(0),
             stream_recycled: AtomicU64::new(0),
             manifest_seq: AtomicU64::new(0),
@@ -20031,6 +20433,19 @@ impl Db {
                 let _ = std::fs::remove_file(dir.join(name));
             }
         }
+        // And the same for sidecars, under either option: one a live segment
+        // claims stays, since a store that ran without the option may run
+        // with it again and finds the file whole, and every other is a
+        // merge's input whose unlink a crash came before, a build that
+        // never finished, or a file left by a store that was `Always` and
+        // is not. Nothing else removes them: a stale temp name is truncated
+        // by the next build of the same name and never looked at again, and
+        // a sidecar no segment names is not attached.
+        let zev = zside::ZEvents::default();
+        zside::ZEvents::add(
+            &zev.swept,
+            Db::z_sweep(dir, live.iter().map(String::as_str))?,
+        );
         // Where the store starts. `Random` starts advised and never moves;
         let starts_random = opts.read_advice.starts_random();
         let mut segs = Vec::with_capacity(live.len());
@@ -20045,6 +20460,16 @@ impl Db {
             )?);
         }
         segs.sort_by(seg_order);
+        // A store reopened under `Always` attaches the sidecars it finds
+        // for its partitions. One that does not check out is counted and
+        // the partition is read from the raw form until a settle builds it
+        // again; a partition with no file is no rejection.
+        if opts.zpages == ZPages::Always {
+            let advise = Db::z_advise(&opts);
+            for s in segs.iter().filter(|s| s.level > 0) {
+                Db::z_attach(dir, s, advise, &zev);
+            }
+        }
         let ord_rebuilt = segs.iter().filter(|s| s.ord_rebuilt).count() as u64;
         let seg_ids: Vec<(u64, u64)> = live
             .iter()
@@ -20172,6 +20597,8 @@ impl Db {
             convert_build_ns: AtomicU64::new(0),
             convert_total_ns: AtomicU64::new(0),
             ord_rebuilt: AtomicU64::new(ord_rebuilt),
+            z: zev,
+            fail_zbuild: std::sync::atomic::AtomicBool::new(false),
             run_remaps: AtomicU64::new(0),
             stream_recycled: AtomicU64::new(0),
             manifest_seq: AtomicU64::new(0),
@@ -23129,6 +23556,291 @@ impl Db {
             let _ = std::fs::remove_file(spare);
         }
         Ok(())
+    }
+}
+
+/// Rounds `zpages_settle` makes at most over the partitions that lack a
+/// sidecar: a merge that lands while one is built makes partitions the next
+/// round gives theirs, and a store that keeps merging stops being waited
+/// for.
+const ZSETTLE_ROUNDS: usize = 4;
+
+/// Where in a round of `Db::zpages_settle_with` its seam is called.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZRound {
+    /// The partitions the round will give sidecars are listed and none is
+    /// built: what lands now retires a partition before its build opens it.
+    Listed,
+    /// They are built and attached, and the segment work has not been joined
+    /// again: what lands now retires a partition whose sidecar is made.
+    Built,
+}
+
+/// The second form's building and attaching (`Options::zpages`), on the
+/// calling thread: there is no builder thread, no controller and nothing
+/// that retires a sidecar before its segment goes.
+impl Db {
+    /// Whether a sidecar's mapping is advised random: whenever the store
+    /// advises its mappings at all. The mode the store is in at the moment
+    /// of the attach is not asked (see `ZSide`'s `map`).
+    fn z_advise(opts: &Options) -> bool {
+        opts.read_advice != ReadAdvice::Normal
+    }
+
+    /// `seg`'s sidecar attached from the file its name carries, if there is
+    /// one that checks out against the segment: installed, counted, and
+    /// true. A file that does not check out is counted by kind and left
+    /// where it is, for a build to replace, and the segment is marked so
+    /// that the build's round does not ask of the same file again and count
+    /// it twice; no file is not a rejection.
+    fn z_attach(dir: &Path, seg: &Seg, advise: bool, ev: &zside::ZEvents) -> bool {
+        let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) else {
+            return false;
+        };
+        match zside::ZSide::attach(
+            &dir.join(zside::zpg_name(id, end)),
+            &seg.blob,
+            id,
+            end,
+            advise,
+        ) {
+            Ok(side) => {
+                let installed = seg.z.install(side);
+                if installed {
+                    zside::ZEvents::add(&ev.attached, 1);
+                }
+                installed
+            }
+            Err(r) => {
+                ev.rejected(&r);
+                if !matches!(r, zside::Reject::Missing) {
+                    seg.z_declined
+                        .store(zside::DECLINED_REFUSED, AtomicOrdering::Relaxed);
+                }
+                false
+            }
+        }
+    }
+
+    /// Give `seg` a sidecar: the file already there if it checks out, else
+    /// one built from the segment's own bytes and attached, which is the
+    /// reader's own check of what was built. A partition that cannot have
+    /// one -- under the floor, with a record that lies in a block or that
+    /// no page holds -- is counted by reason and not tried again by this
+    /// segment; a build that fails is counted and not tried again either,
+    /// and is not an error for the store: the partition is read raw.
+    ///
+    /// A segment whose file is gone by the time its build opens it was
+    /// retired by a merge or a promotion that landed after the partitions
+    /// were listed. That is a build outrun and not a build that failed: the
+    /// merge's outputs are partitions of their own, given theirs by the next
+    /// round, and the retired segment is not tried again.
+    fn z_give(&self, seg: &Seg) {
+        let ev = &self.shared.z;
+        let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) else {
+            return;
+        };
+        let advise = Db::z_advise(&self.opts);
+        // A file an attach refused was counted when it was, at open or in
+        // an earlier call, and is replaced below.
+        let refused = seg.z_declined.load(AtomicOrdering::Relaxed) == zside::DECLINED_REFUSED;
+        if !refused && Db::z_attach(&self.dir, seg, advise, ev) {
+            return;
+        }
+        let out = self.dir.join(zside::zpg_name(id, end));
+        let made = if self.shared.fail_zbuild.swap(false, AtomicOrdering::AcqRel) {
+            Err(err("the sidecar's build was made to fail"))
+        } else {
+            zside::build(
+                &self.dir.join(&seg.name),
+                &out,
+                id,
+                end,
+                &zside::BuildPlan::new(self.opts.zpages_min_bytes, self.opts.zpages_drop_behind),
+            )
+        };
+        let failed = |why: u8| {
+            zside::ZEvents::add(&ev.build_failed, 1);
+            seg.z_declined.store(why, AtomicOrdering::Relaxed);
+        };
+        match made {
+            Ok(zside::Outcome::Built(b)) => {
+                match zside::ZSide::attach(&out, &seg.blob, id, end, advise) {
+                    Ok(side) => {
+                        if seg.z.install(side) {
+                            ev.built(&b);
+                            zside::ZEvents::add(&ev.attached, 1);
+                        }
+                    }
+                    Err(_) => {
+                        // A file the builder wrote and the reader's own
+                        // attach refuses: the build failed.
+                        let _ = std::fs::remove_file(&out);
+                        failed(zside::DECLINED_FAILED);
+                    }
+                }
+            }
+            Ok(zside::Outcome::Declined(d)) => {
+                ev.declined(d);
+                seg.z_declined.store(d.code(), AtomicOrdering::Relaxed);
+                if refused {
+                    // The file under the name was not this segment's, and
+                    // no build is replacing it.
+                    let _ = std::fs::remove_file(&out);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                zside::ZEvents::add(&ev.build_orphaned, 1);
+                seg.z_declined
+                    .store(zside::DECLINED_FAILED, AtomicOrdering::Relaxed);
+            }
+            Err(_) => failed(zside::DECLINED_FAILED),
+        }
+    }
+
+    /// The sidecar files in `dir` that none of the segments named `live`
+    /// claims, and the temp names of builds that did not finish, removed;
+    /// how many. Called where nothing is building: at open, and at the end
+    /// of `zpages_settle`.
+    fn z_sweep<'a>(dir: &Path, live: impl Iterator<Item = &'a str>) -> Result<u64> {
+        let claimed: std::collections::HashSet<String> =
+            live.filter_map(zside::zpg_name_for).collect();
+        let mut removed = 0;
+        for entry in std::fs::read_dir(dir)? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if zside::is_zpg_file(&name)
+                && !claimed.contains(&name)
+                && std::fs::remove_file(dir.join(&name)).is_ok()
+            {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Under `ZPages::Always`, every live partition given a sidecar
+    /// (`z_give`), and this returns when they are: the segment work first
+    /// waited for, so the partitions are the store's, then each partition
+    /// without a sidecar in turn, on this thread, then the segment work
+    /// again for a merge that landed meanwhile, whose outputs the next round
+    /// gives theirs. A sidecar built for a partition a merge retired before
+    /// this finished is counted and removed; at the end the directory holds
+    /// the live segments' sidecars and no other, whatever a crash or a
+    /// store that ran without the option left. Nothing under `Off`.
+    ///
+    /// What the suite's `sync` calls after a flush under the arm: without
+    /// it a flush returns before the segment work's later steps, and the
+    /// arm would measure the raw form.
+    #[doc(hidden)]
+    pub fn zpages_settle(&mut self) -> Result<()> {
+        self.zpages_settle_with(&mut |_, _| {})
+    }
+
+    /// `zpages_settle`, with `between` called on the store at two points of
+    /// every round that has a partition to give a sidecar (`ZRound`): a
+    /// test's seam for what lands between the steps of a round, which no
+    /// schedule of the segment work makes happen on purpose. It is not
+    /// called by a round that has nothing to give.
+    #[doc(hidden)]
+    pub fn zpages_settle_with(&mut self, between: &mut dyn FnMut(&mut Db, ZRound)) -> Result<()> {
+        if self.opts.zpages != ZPages::Always {
+            return Ok(());
+        }
+        for _ in 0..ZSETTLE_ROUNDS {
+            self.settle()?;
+            // The segments are held past the pin: a build is seconds, and a
+            // pin held across one keeps every state a landing replaces
+            // alive.
+            let todo: Vec<std::sync::Arc<Seg>> = {
+                let _op = self.op();
+                self.segs()
+                    .iter()
+                    .filter(|s| {
+                        let why = s.z_declined.load(AtomicOrdering::Relaxed);
+                        s.level > 0
+                            && s.z.get().is_none()
+                            && (why == 0 || why == zside::DECLINED_REFUSED)
+                    })
+                    .cloned()
+                    .collect()
+            };
+            if todo.is_empty() {
+                // Every partition has its sidecar or its reason, unless a
+                // merge the settle's joins started is still to land: its
+                // outputs are partitions nobody has looked at.
+                if self.in_flight().1 {
+                    continue;
+                }
+                break;
+            }
+            between(self, ZRound::Listed);
+            for seg in &todo {
+                self.z_give(seg);
+            }
+            between(self, ZRound::Built);
+            self.settle()?;
+            let live: Vec<String> = {
+                let _op = self.op();
+                self.segs()
+                    .iter()
+                    .filter_map(|s| zside::zpg_name_for(&s.name))
+                    .collect()
+            };
+            for seg in &todo {
+                let Some(name) = zside::zpg_name_for(&seg.name) else {
+                    continue;
+                };
+                if seg.z.get().is_some() && !live.contains(&name) {
+                    let _ = std::fs::remove_file(self.dir.join(&name));
+                    zside::ZEvents::add(&self.shared.z.build_orphaned, 1);
+                }
+            }
+        }
+        // A build that finished after the landing that retired its segment
+        // wrote a file nothing claims, and so did a build the rounds ran
+        // out before.
+        let names: Vec<String> = {
+            let _op = self.op();
+            self.segs().iter().map(|s| s.name.clone()).collect()
+        };
+        let swept = Db::z_sweep(&self.dir, names.iter().map(String::as_str))?;
+        zside::ZEvents::add(&self.shared.z.swept, swept);
+        Ok(())
+    }
+
+    /// A test's: the next sidecar build fails as a write error would.
+    #[doc(hidden)]
+    pub fn fail_next_zpage_build(&self) {
+        self.shared.fail_zbuild.store(true, AtomicOrdering::Release);
+    }
+
+    /// What the last refusal of a sidecar said, kind first, or empty: the
+    /// counts say a file was refused and a test wants the check that
+    /// refused it.
+    #[doc(hidden)]
+    pub fn zpage_last_reject(&self) -> String {
+        self.shared
+            .z
+            .last_reject
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default()
+    }
+
+    /// The live partitions that hold a sidecar: the segment's file name,
+    /// the sidecar's attach number, its pages, and whether it is out of
+    /// service.
+    #[doc(hidden)]
+    pub fn zpage_sidecars(&self) -> Vec<(String, u64, usize, bool)> {
+        let _op = self.op();
+        self.segs()
+            .iter()
+            .filter_map(|s| {
+                let z = s.z.get()?;
+                Some((s.name.clone(), z.id(), z.pages(), z.damaged()))
+            })
+            .collect()
     }
 }
 
@@ -28396,6 +29108,35 @@ impl Maint {
         if !claimed {
             let _ = std::fs::remove_file(self.dir.join(&ord));
         }
+        // A sidecar is named by the same two fields and claimed by the same
+        // test: a promotion keeps them, so the retired name and the live one
+        // address one file. Unlinked here and not swept at the next open
+        // because a merge is the steady state, and a store that merges for
+        // hours would leave a file per input it retired. A mapping a pinned
+        // reader holds outlives the name, so for a sidecar that is attached
+        // the unlink removes the name and the blocks go with the last
+        // mapping, wherever the segment holding it is dropped; for one
+        // nobody maps, left by a store that ran with the form and is not
+        // running with it, they go here, on the thread every landing goes
+        // through, as the segment's own do above. A freed inode is a device
+        // round trip on this filesystem, so under the forced arm that is a
+        // cost of every merge, and it is read in the cells that merge.
+        //
+        // One stat first: a store that never made a sidecar -- every store
+        // under the default -- pays that and nothing more for a retired
+        // segment, where the claim below compares every live segment's
+        // name.
+        if let Some(fields) = zside::zpg_fields(name) {
+            let zpg = self.dir.join(zside::zpg_name(fields.0, fields.1));
+            if zpg.exists()
+                && !self
+                    .segs()
+                    .iter()
+                    .any(|s| zside::zpg_fields(&s.name) == Some(fields))
+            {
+                let _ = std::fs::remove_file(zpg);
+            }
+        }
     }
 
     /// A merge is due when any one range has accumulated `l0_trigger`
@@ -29386,6 +30127,10 @@ mod threading {
         // is asked here for itself.
         shared::<super::Snapshot>();
         shared::<super::FrozenSnaps>();
+        // The sidecar hangs on a segment in an atomic pointer, which would
+        // let a type that is not `Sync` in unasked.
+        shared::<super::zside::ZSide>();
+        shared::<super::zside::ZCell>();
         sent::<super::Reader>();
     }
 
