@@ -1,0 +1,60 @@
+From ec7d59badd050c1cf5f73362573074d974a233fc Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 22:12:30 +0000
+Subject: [PATCH 4/6] tests: count the forms scans take, and switch the eager
+ carry back on where a commit has both
+
+HUNT-TAKES prints how many block forms scans took from the state's
+published forms, so a take-away that stops the failures can be told from
+one that stopped the taking. HUNT_EAGER=1 (--cfg hunt_lazy) carries the
+tables inside the publish on the one commit that has the lazy carry and
+the carry before it side by side.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011ZkLidS5BYuaBXVcvPAkdd
+---
+ tests/hunt_bisect0.rs | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/tests/hunt_bisect0.rs b/tests/hunt_bisect0.rs
+index 11e8046..9e9e0cd 100644
+--- a/tests/hunt_bisect0.rs
++++ b/tests/hunt_bisect0.rs
+@@ -293,6 +293,8 @@ fn same_window(got: &Window, want: &Window, what: &str) -> Result<(), String> {
+ ///    as it was before it stayed alert.
+ ///  * `--cfg hunt_rebase`: `HUNT_NO_REBASE=1` drops the tables at a merge's
+ ///    rewrite of a partition, as before they were carried.
++///  * `--cfg hunt_lazy`: `HUNT_EAGER=1` carries the tables inside the publish
++///    (on the commit that added the lazy carry beside it).
+ #[allow(unused_variables)]
+ fn hunt_opts(o: &mut Options) {
+     #[cfg(any(hunt_opts, hunt_share))]
+@@ -318,6 +320,13 @@ fn hunt_opts(o: &mut Options) {
+     if env_u64("HUNT_SNAP_CARRY", 0) == 1 {
+         o.snapshot_carry = true;
+     }
++    // The carry before the lazy one, on the one commit that has both
++    // (`--cfg hunt_lazy`): the writer's tables and the published forms
++    // moved together inside the publish.
++    #[cfg(hunt_lazy)]
++    if env_u64("HUNT_EAGER", 0) == 1 {
++        o.forms_carry_lazily = false;
++    }
+     #[cfg(any(hunt_opts, hunt_upkeep))]
+     match std::env::var("HUNT_UPKEEP").as_deref() {
+         Ok("inline") => o.upkeep = supdb::db::Upkeep::Inline,
+@@ -518,6 +527,11 @@ fn snapshot_scenario(iter: u64) -> Result<(), String> {
+         drop(snap);
+     }
+     eprintln!("HUNT-CYCLES {failed_cycles} of {cycles} cycles failed");
++    // How many block forms scans took from the state's published forms, to
++    // show a take-away that stops the failures has not stopped the taking
++    // (`--cfg hunt_takes`, on commits that count them).
++    #[cfg(hunt_takes)]
++    eprintln!("HUNT-TAKES {}", db.canonical_forms().2);
+     if let Some(e) = failure {
+         if std::env::var("HUNT_KEEP").is_err() {
+             drop(latest);
+-- 
+2.43.0
+

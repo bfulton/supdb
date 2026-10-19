@@ -1,0 +1,274 @@
+From c52ea632b9df2b695b8ad68689752056764f1739 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 21:05:12 +0000
+Subject: [PATCH 05/10] hunt stress0: the second defect's schedule forced, and
+ where each cut of an overlay came from
+
+hunt_cut_forced files a key's cut against a partition, rewrites the partition with one key in and one out under the same fences, count and ends, and builds the block: the filed cut is one rank behind, and cut_known asserts. The silent variant has the stale cut still ahead of the walk, and the scan answers a wrong record under the key.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011ZkLidS5BYuaBXVcvPAkdd
+---
+ src/db.rs                    | 104 ++++++++++++++++++++++++++++
+ tests/hunt_stress0_oracle.rs | 128 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 232 insertions(+)
+
+diff --git a/src/db.rs b/src/db.rs
+index e4cfc92..724db10 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -26624,11 +26624,115 @@ impl<'s> BuildCtx<'s> {
+         if ov.over.is_empty() {
+             return Ok(Cached::Clean);
+         }
++        self.diag_provenance(src.seg, table, b, unsealed, &ov);
+         if ov.over.len() < self.dense_from {
+             return Ok(Cached::Sparse(self.deltas_for(src, lo..hi, &ov)?));
+         }
+         Ok(Cached::Block(self.copy_block(src, lo..hi, &ov)?))
+     }
++    /// HUNT: when the overlay's cuts are not in order, where each came from
++    /// and what it should be against the partition walked.
++    fn diag_provenance(
++        &self,
++        seg: &Seg,
++        table: &BlockTable,
++        b: usize,
++        unsealed: &Snapshot,
++        ov: &Overlay,
++    ) {
++        use std::fmt::Write as _;
++        let mut prev: Option<usize> = None;
++        let mut bad = false;
++        for o in ov.over.iter() {
++            if o.cut == u32::MAX {
++                continue;
++            }
++            let c = (o.cut >> 1) as usize;
++            if prev.is_some_and(|p| c < p) {
++                bad = true;
++                break;
++            }
++            prev = Some(c + (o.cut & 1) as usize);
++        }
++        if !bad {
++            return;
++        }
++        let mut s = String::new();
++        let _ = writeln!(
++            s,
++            "HUNT-PROVENANCE block {b} of partition {}: table.blob {} seg.blob {} table.layout {} \
++             table.snap_gen {} filed {} snapshot len {} live_len {} log_at {} bases {}",
++            seg.name,
++            table.blob,
++            seg.blob.id(),
++            table.layout,
++            table.snap_gen,
++            table.filed,
++            unsealed.len(),
++            unsealed.live_len,
++            unsealed.log_at,
++            unsealed.bases.len(),
++        );
++        let verdict = |cut: u32, key: &[u8]| {
++            let (_, truth) = Self::owner_of(seg, key);
++            if cut == u32::MAX {
++                format!("cut none, true rank {}", truth >> 1)
++            } else if cut == truth {
++                format!("cut rank {} ok", cut >> 1)
++            } else {
++                format!(
++                    "cut rank {} same {} but true rank {} same {}  <-- STALE",
++                    cut >> 1,
++                    cut & 1,
++                    truth >> 1,
++                    truth & 1
++                )
++            }
++        };
++        for (slot, cut) in &table.added[b] {
++            let key = self.mem.key_of(self.mem.entry(*slot as usize));
++            let _ = writeln!(
++                s,
++                "  added slot {slot} {}: {}",
++                String::from_utf8_lossy(key),
++                verdict(*cut, key)
++            );
++        }
++        if let Some(sb) = table.snap_at.get() {
++            for i in sb.at[b] as usize..sb.at[b + 1] as usize {
++                if let Some((k, _)) = unsealed.get(i) {
++                    let cut = sb.cuts.get(i).map_or(u32::MAX, |c| c.load(AtomicOrdering::Relaxed));
++                    let _ = writeln!(
++                        s,
++                        "  snapshot main run [{i}] {}: {} (block ready {})",
++                        String::from_utf8_lossy(k),
++                        verdict(cut, k),
++                        sb.ready[b].load(AtomicOrdering::Relaxed)
++                    );
++                }
++            }
++        }
++        for (bi, base) in unsealed.bases.iter().enumerate() {
++            if let Some(fb) = table.fsnap_at.get(bi).and_then(|c| c.get()) {
++                for i in fb.at[b] as usize..fb.at[b + 1] as usize {
++                    if let Some((k, _)) = base.get(i) {
++                        let cut = fb
++                            .cuts
++                            .get(i)
++                            .map_or(u32::MAX, |c| c.load(AtomicOrdering::Relaxed));
++                        let _ = writeln!(
++                            s,
++                            "  base {bi} [{i}] {}: {} (block ready {})",
++                            String::from_utf8_lossy(k),
++                            verdict(cut, k),
++                            fb.ready[b].load(AtomicOrdering::Relaxed)
++                        );
++                    }
++                }
++            }
++        }
++        eprint!("{s}");
++    }
+     /// PROTOTYPE: the overlay's keys resolved against the partition once:
+     /// where each cuts the walk, and its values from every source that
+     /// holds it, the partition's own for an equal key first, packed into
+diff --git a/tests/hunt_stress0_oracle.rs b/tests/hunt_stress0_oracle.rs
+index 3a95daa..3f0d1a4 100644
+--- a/tests/hunt_stress0_oracle.rs
++++ b/tests/hunt_stress0_oracle.rs
+@@ -314,3 +314,131 @@ fn hunt_oracle() {
+     }
+     eprintln!("HUNT-OK oracle iters {iters}");
+ }
++
++/// The second defect's schedule, forced and single-threaded (`Upkeep::Inline`).
++///
++/// A partition of thirty-one keys, one block; a table built over it by the
++/// writer's scans. A frozen table (the seal held) carries a key inserted
++/// before two keys the live table will update and a key deleted after them.
++/// A key updated in the live table is filed in its block's list with its cut
++/// in the partition as it stands: against the old blob. The hold is lifted,
++/// the piece lands and is merged into the partition, whose count and ends are
++/// what they were -- one key in, one out -- so `Db::same_blocks`, which
++/// compares the count and the keys at the blocks' first ranks and the last,
++/// calls the new blob the old one's blocks and the tables are carried with
++/// their filed keys' cuts: a key filed before the rewrite is one rank behind
++/// where the rewritten partition has it.
++///
++/// `HUNT_CUT_VARIANT=assert` (the default) updates two neighbouring keys, one
++/// filed before the rewrite and one after, so the walk passes the second's
++/// stale cut and `BuildCtx::cut_known` asserts. `silent` updates one key
++/// whose stale cut is still ahead of the walk: no assertion, and the scan
++/// answers a wrong partition record under the key.
++#[test]
++fn hunt_cut_forced() {
++    let variant = env_str("HUNT_CUT_VARIANT").unwrap_or_else(|| "assert".to_string());
++    let dir = scratch("cutforced");
++    let opts = Options {
++        scan_block_cache: true,
++        upkeep: Upkeep::Inline,
++        partition_bytes: Some(1 << 20),
++        seal_bytes: 1 << 30,
++        l0_trigger: 1,
++        ..Options::default()
++    };
++    let key = |n: usize| format!("k{n:04}").into_bytes();
++    let mut db = Db::create(&dir, opts).unwrap();
++    let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
++    for n in (100..=160).step_by(2) {
++        let v = format!("p-{n}").into_bytes();
++        db.put(&key(n), &v);
++        model.insert(key(n), v);
++    }
++    db.commit().unwrap();
++    db.flush().unwrap();
++    db.settle().unwrap();
++    let walk = |db: &Db| -> Vec<(Vec<u8>, Vec<u8>)> {
++        let mut got = Vec::new();
++        db.scan(b"", usize::MAX, |k, v| got.push((k.to_vec(), v.to_vec())))
++            .unwrap();
++        got
++    };
++    // Reads around, so the forms are kept and the block has a table.
++    for _ in 0..3 {
++        assert_eq!(walk(&db).len(), model.len());
++    }
++    let (inserted, deleted) = (key(105), key(140));
++    let (first, second) = match variant.as_str() {
++        "assert" => (Some(key(118)), key(120)),
++        "silent" => (None, key(126)),
++        other => panic!("HUNT_CUT_VARIANT {other}"),
++    };
++    db.put(&inserted, b"x-105");
++    model.insert(inserted.clone(), b"x-105".to_vec());
++    db.delete(&deleted);
++    model.remove(&deleted);
++    db.commit().unwrap();
++    db.hold_seal_landing(true);
++    db.seal().unwrap();
++    // A scan after the freeze: the writer's tables are carried across it and
++    // its snapshot built again, over a live table that is empty, so the key
++    // written next is created after the snapshot and is filed in its block's
++    // list, not held by the snapshot.
++    let _ = walk(&db);
++    // The key filed before the rewrite, against the old blob.
++    db.put(&second, b"v-second");
++    model.insert(second.clone(), b"v-second".to_vec());
++    db.commit().unwrap();
++    let before = walk(&db);
++    let want_before: Vec<_> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
++    assert_eq!(before, want_before, "the scan before the landing");
++    let gen_before = db.state_gen();
++    db.hold_seal_landing(false);
++    db.settle().unwrap();
++    eprintln!(
++        "HUNT-CUT-FORCED levels {:?} state gen {} -> {} (the piece landed and was merged when the pieces are 0)",
++        db.levels(),
++        gen_before,
++        db.state_gen()
++    );
++    if let Some(first) = &first {
++        db.put(first, b"v-first");
++        model.insert(first.clone(), b"v-first".to_vec());
++        db.commit().unwrap();
++    }
++    let want: Vec<_> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
++    if env_flag("HUNT_CUT_DEBUG", false) {
++        eprintln!("HUNT-CUT-DEBUG before the last scan: {}", db.debug_key(&second));
++    }
++    let scanned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| walk(&db)));
++    if env_flag("HUNT_CUT_DEBUG", false) {
++        eprintln!("HUNT-CUT-DEBUG after the last scan: {}", db.debug_key(&second));
++    }
++    let verdict = match &scanned {
++        Err(_) => "the engine panicked".to_string(),
++        Ok(got) if *got == want => "right".to_string(),
++        Ok(got) => {
++            let at = got
++                .iter()
++                .zip(&want)
++                .position(|(a, b)| a != b)
++                .unwrap_or(got.len().min(want.len()));
++            format!(
++                "wrong: {} entries, wanted {}; first difference at entry {at}: got {:?}, wanted {:?}",
++                got.len(),
++                want.len(),
++                got.get(at).map(|(k, v)| (show(k), show(v))),
++                want.get(at).map(|(k, v)| (show(k), show(v)))
++            )
++        }
++    };
++    eprintln!("HUNT-CUT-FORCED variant {variant}: the scan after the rewrite is {verdict}");
++    let panicked = scanned.is_err();
++    drop(scanned);
++    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(db)));
++    let _ = std::fs::remove_dir_all(&dir);
++    assert!(
++        verdict == "right",
++        "the scan over a partition rewritten under the same blocks: {verdict} (panicked {panicked})"
++    );
++}
+-- 
+2.43.0
+

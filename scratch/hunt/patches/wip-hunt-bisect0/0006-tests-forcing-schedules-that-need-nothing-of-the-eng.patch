@@ -1,0 +1,390 @@
+From b9cf84461f7476bb359a44922e3164ca947cd799 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 23:06:57 +0000
+Subject: [PATCH 6/6] tests: forcing schedules that need nothing of the engine
+ but its public surface
+
+hunt_bisect0 gets HUNT_MIDWALK: the snapshot handle's first scan is
+stopped in the callback of its first entry while the writer commits on a
+thread of its own, so the walk goes on into blocks whose published forms
+the commit has replaced. hunt_cuts gets the second route of the
+stale-cut hazard, a merge that lands with nothing frozen, forced by
+holding a seal between its two phases, and a third that holds nothing and
+makes the merge slow by the size of the partition. at_commit.sh builds in
+directories of its own per invocation and has a port that takes the
+landing out of keep_snap.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011ZkLidS5BYuaBXVcvPAkdd
+---
+ scripts/hunt_bisect0/at_commit.sh |  19 ++-
+ tests/hunt_bisect0.rs             |  53 ++++++++
+ tests/hunt_cuts.rs                | 203 ++++++++++++++++++++++++++++++
+ 3 files changed, 270 insertions(+), 5 deletions(-)
+
+diff --git a/scripts/hunt_bisect0/at_commit.sh b/scripts/hunt_bisect0/at_commit.sh
+index 2a621fc..0557c74 100644
+--- a/scripts/hunt_bisect0/at_commit.sh
++++ b/scripts/hunt_bisect0/at_commit.sh
+@@ -14,7 +14,9 @@
+ #   n  every switch, the seal can be held                        (758fcd3 and after)
+ # PORT is hook (the forcing pause of the snapshot schedule: HUNT_SCAN_AFTER_CHECK_MS between a Snapshot handle's one check
+ # of the published forms' position and its load of a form), diag (HUNT_CHECK_CUTS=1: the rebase of a rewritten partition
+-# counts the filed keys it carries and the cuts that are not the new partition's), or plain (the default).
++# counts the filed keys it carries and the cuts that are not the new partition's), nolanded (the take-away of that hazard:
++# a landing no longer keeps the writer's snapshot and the keys filed into its tables, as before e1bd6fb), or plain (the
++# default).
+ # TEST is hunt_bisect0 (the default) or hunt_cuts (the deterministic stale-cut schedule; KIND o, m or n).
+ #
+ # The snapshot schedule, on a binary built with hook: HUNT_SCAN_AFTER_CHECK_MS=300 HUNT_CYCLES=3, with HUNT_UPKEEP=bg1
+@@ -41,19 +43,26 @@ case "$KIND" in
+   *) echo "unknown kind $KIND" >&2; exit 2 ;;
+ esac
+ SHA="$(git -C "$REPO" rev-parse --short "$COMMIT")"
+-X="$OUT/src-$SHA-$PORT-$TEST"
++X="$OUT/src-$SHA-$PORT-$TEST-$$"
+ rm -rf "$X"; mkdir -p "$X/tests" "$OUT/bin"
+ git -C "$REPO" archive --format=tar "$COMMIT" Cargo.toml Cargo.lock src | tar -x -C "$X"
+ case "$PORT" in
+   hook) perl "$HERE/hookport.pl" "$X/src/db.rs" >&2 ;;
+   diag) perl "$HERE/diagport.pl" "$X/src/db.rs" >&2 ;;
+   plain) ;;
++  nolanded)
++    # The take-away of the stale-cut hazard: a landing no longer keeps the writer's snapshot and the keys filed into
++    # its tables (`Reader::rebase_tables`, `keep_snap`), as before e1bd6fb.
++    perl -0pi -e 's/let keep_snap = \(same_frozen \|\| landed\)/let keep_snap = (same_frozen)/; s/let keep_snap = same_frozen \|\| landed;/let keep_snap = same_frozen;/' "$X/src/db.rs"
++    if grep -q 'landed' "$X/src/db.rs" && ! grep -q 'let keep_snap = (same_frozen)\|let keep_snap = same_frozen;' "$X/src/db.rs"; then
++      echo "no keep_snap line to take the landing out of" >&2; exit 2
++    fi ;;
+   *) echo "unknown port $PORT" >&2; exit 2 ;;
+ esac
+ cp "$REPO/tests/$TEST.rs" "$X/tests/$TEST.rs"
+-export CARGO_TARGET_DIR="$OUT/target-$SHA-$PORT-$TEST"
++export CARGO_TARGET_DIR="$OUT/target-$SHA-$PORT-$TEST-$$"
+ export RUSTFLAGS="$RF"
+-LOG="$OUT/build-$SHA-$PORT-$TEST.log"
++LOG="$OUT/build-$SHA-$PORT-$TEST-$$.log"
+ if ! ( cd "$X" && cargo test --no-run --test "$TEST" > "$LOG" 2>&1 ); then
+   rm -rf "$CARGO_TARGET_DIR"
+   echo "build failed, see $LOG" >&2
+@@ -61,6 +70,6 @@ if ! ( cd "$X" && cargo test --no-run --test "$TEST" > "$LOG" 2>&1 ); then
+ fi
+ EXE="$(grep -o "Executable tests/$TEST.rs ([^)]*)" "$LOG" | sed 's/.*(\(.*\))/\1/')"
+ BIN="$OUT/bin/$TEST-$SHA-$PORT-$KIND"
+-cp "$EXE" "$BIN"
++cp "$EXE" "$BIN.$$" && mv -f "$BIN.$$" "$BIN"
+ rm -rf "$CARGO_TARGET_DIR" "$X"
+ echo "$BIN"
+diff --git a/tests/hunt_bisect0.rs b/tests/hunt_bisect0.rs
+index 887acee..165a3be 100644
+--- a/tests/hunt_bisect0.rs
++++ b/tests/hunt_bisect0.rs
+@@ -41,6 +41,11 @@
+ //!                   (`HUNT_READER_DELAY_MS` after the writes begin), for a
+ //!                   forcing schedule on commits whose publishing is the
+ //!                   writer's own thread.
++//!  * `HUNT_MIDWALK=1` stops the first snapshot scan inside its walk, in the
++//!                   callback of its first entry, while the writer commits on a
++//!                   thread of its own (`HUNT_MIDWALK_WRITES`, default 300, and
++//!                   `HUNT_MIDWALK_SETTLE_MS`, default 150): a forcing schedule
++//!                   that needs nothing of the engine but its public surface.
+ //!  * `HUNT_SNAP_DELAY_MS` sleeps this long after the commit, before the
+ //!                   first snapshot scan.
+ //!
+@@ -477,6 +482,54 @@ fn snapshot_scenario(iter: u64) -> Result<(), String> {
+             }
+             continue;
+         }
++        // HUNT_MIDWALK=1: a forcing schedule that uses the crate's public
++        // surface alone. The handle's first scan is stopped inside its walk,
++        // in the callback of the first entry it emits, until the writer has
++        // made HUNT_MIDWALK_WRITES puts and a commit on a thread of its own
++        // and HUNT_MIDWALK_SETTLE_MS have passed (the upkeep thread's pass,
++        // where there is one); the walk then goes on to the blocks after the
++        // first, whose published forms the commit has replaced. Whatever the
++        // handle answers is held to the model as it was at the snapshot.
++        if env_u64("HUNT_MIDWALK", 0) == 1 {
++            let want = window(&at_snapshot, b"", 300);
++            let writes = env_u64("HUNT_MIDWALK_WRITES", 300) as usize;
++            let settle = env_u64("HUNT_MIDWALK_SETTLE_MS", 150);
++            let (to_writer, writer_rx) = std::sync::mpsc::channel::<()>();
++            let (to_main, main_rx) = std::sync::mpsc::channel::<()>();
++            let mut got = Vec::new();
++            let visited = std::thread::scope(|s| {
++                s.spawn(|| {
++                    writer_rx.recv().unwrap();
++                    for k in keys.iter().skip((c % 5) as usize).step_by(5).take(writes) {
++                        db.put(k, tag.as_bytes());
++                        model.insert(k.clone(), vec![tag.as_bytes().to_vec()]);
++                    }
++                    db.commit().unwrap();
++                    std::thread::sleep(std::time::Duration::from_millis(settle));
++                    to_main.send(()).unwrap();
++                });
++                let mut first = true;
++                snap.scan(b"", 300, |k, v| {
++                    if first {
++                        first = false;
++                        to_writer.send(()).unwrap();
++                        main_rx.recv().unwrap();
++                    }
++                    got.push((k.to_vec(), v.to_vec()));
++                })
++                .unwrap()
++            });
++            if let Err(e) = same_window(
++                &(got, visited),
++                &want,
++                &format!("snapshot, cycle {c}, a scan stopped in its first entry's callback while the writer commits"),
++            ) {
++                failed_cycles += 1;
++                eprintln!("HUNT-CYCLE-FAIL {e}");
++                failure.get_or_insert(e);
++            }
++            continue;
++        }
+         for k in keys.iter().skip((c % 5) as usize).step_by(5).take(200) {
+             db.put(k, tag.as_bytes());
+             model.insert(k.clone(), vec![tag.as_bytes().to_vec()]);
+diff --git a/tests/hunt_cuts.rs b/tests/hunt_cuts.rs
+index 0a4ca20..1d88ae9 100644
+--- a/tests/hunt_cuts.rs
++++ b/tests/hunt_cuts.rs
+@@ -5,6 +5,9 @@
+ //! same blocks, and the writer's table is carried across it with the cuts
+ //! of the keys it filed against the partition before.
+ //!
++//! `--cfg hunt_old` leaves out the two schedules that hold a seal (`hold_seal_landing`, `hold_seal_durable`), for the
++//! commits before the seals in flight were a queue.
++//!
+ //! One partition of a hundred keys; a delete of k0040 and an insert of
+ //! k0061 sealed into a piece the landing of which is held; a write of k0050
+ //! filed against the partition as it stands; the landing, and the piece's
+@@ -15,6 +18,7 @@ use std::collections::BTreeMap;
+ use std::path::PathBuf;
+ use supdb::{Db, Options, Reader};
+ 
++#[allow(dead_code)]
+ fn key(i: usize) -> Vec<u8> {
+     format!("k{i:04}").into_bytes()
+ }
+@@ -32,6 +36,7 @@ fn scratch(name: &str) -> PathBuf {
+     d
+ }
+ 
++#[allow(dead_code)]
+ fn scan_all(r: &Reader) -> BTreeMap<Vec<u8>, Vec<Vec<u8>>> {
+     let mut m: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+     r.scan(b"", usize::MAX, |k, v| {
+@@ -89,6 +94,7 @@ fn same(got: &Scan, want: &Scan, what: &str) {
+     );
+ }
+ 
++#[cfg(not(hunt_old))]
+ #[test]
+ fn a_rewrite_that_changes_interior_keys_leaves_cuts_behind() {
+     let dir = scratch("interior");
+@@ -161,3 +167,200 @@ fn a_rewrite_that_changes_interior_keys_leaves_cuts_behind() {
+     same(&scan_all(&db), &model, "after the last settle");
+     let _ = std::fs::remove_dir_all(&dir);
+ }
++
++/// The same hazard by the other route: nothing is frozen when the partition is rewritten, so a landing does not come
++/// into it. The seal is held between its two phases (`hold_seal_durable`): its piece is published to readers and the
++/// frozen table is retired, and the merge of the piece into the partition finishes but cannot land until the seal is
++/// durable. A write is filed against the partition as it stands, the hold is lifted, the merge lands, and a scan reads
++/// the block the write is in.
++#[cfg(not(hunt_old))]
++#[test]
++fn a_merge_landing_after_the_look_leaves_cuts_behind() {
++    let dir = scratch("durable");
++    #[allow(unused_mut)]
++    let mut opts = Options {
++        partition_bytes: Some(1 << 20),
++        scan_block_cache: true,
++        l0_trigger: 1,
++        ..Options::default()
++    };
++    #[cfg(hunt_rebase)]
++    if std::env::var("HUNT_NO_REBASE").is_ok_and(|v| v == "1") {
++        opts.forms_rebase = false;
++    }
++    let mut db = Db::create(&dir, opts).unwrap();
++    let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
++    for i in (0..200).step_by(2) {
++        db.append(&key(i), &val("base"));
++        model.insert(key(i), vec![val("base")]);
++        if i % 50 == 48 {
++            db.commit().unwrap();
++        }
++    }
++    db.commit().unwrap();
++    db.flush().unwrap();
++    db.settle().unwrap();
++    let h = db.reader().unwrap();
++    same(&scan_all(&h), &model, "the first scan");
++    same(&scan_all(&db), &model, "the first scan");
++
++    db.hold_seal_durable(true);
++    db.delete(&key(40));
++    model.remove(&key(40));
++    db.append(&key(61), &val("Y"));
++    model.insert(key(61), vec![val("Y")]);
++    db.commit().unwrap();
++    db.seal().unwrap();
++    // The piece is readable and the frozen table retired; the merge of the piece waits to land.
++    std::thread::sleep(std::time::Duration::from_millis(300));
++    same(&scan_all(&db), &model, "after the seal's readable landing");
++    // Z1 is filed against the partition as it stands.
++    db.put(&key(50), &val("Z1"));
++    model.insert(key(50), vec![val("Z1")]);
++    db.commit().unwrap();
++    same(&scan_all(&db), &model, "after Z1");
++    same(&scan_all(&h), &model, "the handle after Z1");
++
++    db.hold_seal_durable(false);
++    db.settle().unwrap();
++    while db.in_flight().1 {
++        std::thread::sleep(std::time::Duration::from_millis(1));
++    }
++    db.settle().unwrap();
++    same(
++        &scan_all(&db),
++        &model,
++        "after the durable landing and the merge",
++    );
++    db.put(&key(52), &val("Z2"));
++    model.insert(key(52), vec![val("Z2")]);
++    db.commit().unwrap();
++    same(&scan_all(&db), &model, "after Z2");
++    same(&scan_all(&h), &model, "the handle after Z2");
++    db.settle().unwrap();
++    same(&scan_all(&db), &model, "after the last settle");
++    let _ = std::fs::remove_dir_all(&dir);
++}
++
++fn key6(i: usize) -> Vec<u8> {
++    format!("k{i:06}").into_bytes()
++}
++
++/// The keys of `r` below `k000400`, from the start: what a scan of three hundred keys answers there.
++fn head_of(r: &Reader) -> Scan {
++    let mut m: Scan = BTreeMap::new();
++    let bound = key6(400);
++    r.scan(b"", 300, |k, v| {
++        if k < bound.as_slice() {
++            m.entry(k.to_vec()).or_default().push(v.to_vec())
++        }
++    })
++    .unwrap();
++    m
++}
++
++fn head_of_model(model: &Scan) -> Scan {
++    let bound = key6(400);
++    model
++        .range(..bound)
++        .map(|(k, v)| (k.clone(), v.clone()))
++        .collect()
++}
++
++/// The same hazard with no hook of the engine's at all, for the commits that have none: the partition is large, so
++/// that the merge of the piece into it outlasts the writes made beside it. The seal's piece lands, the merge starts;
++/// a write is filed against the partition as it stands while the merge runs; the merge lands; a scan reads the block.
++/// The test says so when the merge was not running at the write (`SCHEDULE NOT REACHED`), which is not a pass.
++#[test]
++fn a_slow_merge_landing_after_the_look_leaves_cuts_behind() {
++    let dir = scratch("slow");
++    let n: usize = std::env::var("HUNT_BIG_KEYS")
++        .ok()
++        .and_then(|s| s.parse().ok())
++        .unwrap_or(60_000);
++    #[allow(unused_mut)]
++    let mut opts = Options {
++        partition_bytes: Some(1 << 30),
++        scan_block_cache: true,
++        l0_trigger: 1,
++        ..Options::default()
++    };
++    #[cfg(hunt_rebase)]
++    if std::env::var("HUNT_NO_REBASE").is_ok_and(|v| v == "1") {
++        opts.forms_rebase = false;
++    }
++    // `--cfg hunt_lazy`, on the one commit that has both carries: HUNT_EAGER=1 carries the tables inside the publish.
++    #[cfg(hunt_lazy)]
++    if std::env::var("HUNT_EAGER").is_ok_and(|v| v == "1") {
++        opts.forms_carry_lazily = false;
++    }
++    let mut db = Db::create(&dir, opts).unwrap();
++    let mut model: Scan = BTreeMap::new();
++    for i in (0..2 * n).step_by(2) {
++        db.append(&key6(i), &val("base"));
++        model.insert(key6(i), vec![val("base")]);
++        if i % 10_000 == 9_998 {
++            db.commit().unwrap();
++        }
++    }
++    db.commit().unwrap();
++    db.flush().unwrap();
++    db.settle().unwrap();
++    // The regime and the writer's table: a handle's scan, then the writer's.
++    let h = db.reader().unwrap();
++    same(&head_of(&h), &head_of_model(&model), "the first scan");
++    same(&head_of(&db), &head_of_model(&model), "the first scan");
++
++    db.delete(&key6(40));
++    model.remove(&key6(40));
++    db.append(&key6(61), &val("Y"));
++    model.insert(key6(61), vec![val("Y")]);
++    db.commit().unwrap();
++    db.seal().unwrap();
++    // Read through the writer until the merge of the piece is running: on some commits the landing is the writer's to
++    // apply at its next operation, on others the segment thread's.
++    let t0 = std::time::Instant::now();
++    while !db.in_flight().1 {
++        same(
++            &head_of(&db),
++            &head_of_model(&model),
++            "waiting for the merge",
++        );
++        assert!(
++            t0.elapsed() < std::time::Duration::from_secs(30),
++            "SCHEDULE NOT REACHED: no merge in flight after 30 s"
++        );
++        std::thread::sleep(std::time::Duration::from_millis(1));
++    }
++    // Z1 is filed against the partition as it stands.
++    db.put(&key6(50), &val("Z1"));
++    model.insert(key6(50), vec![val("Z1")]);
++    db.commit().unwrap();
++    same(&head_of(&db), &head_of_model(&model), "after Z1");
++    assert!(
++        db.in_flight().1,
++        "SCHEDULE NOT REACHED: the merge was over before Z1 was filed"
++    );
++    db.settle().unwrap();
++    while db.in_flight().1 {
++        std::thread::sleep(std::time::Duration::from_millis(1));
++    }
++    db.settle().unwrap();
++    same(
++        &head_of(&db),
++        &head_of_model(&model),
++        "after the landing and the merge",
++    );
++    db.put(&key6(52), &val("Z2"));
++    model.insert(key6(52), vec![val("Z2")]);
++    db.commit().unwrap();
++    same(&head_of(&db), &head_of_model(&model), "after Z2");
++    same(&head_of(&h), &head_of_model(&model), "the handle after Z2");
++    db.settle().unwrap();
++    same(
++        &head_of(&db),
++        &head_of_model(&model),
++        "after the last settle",
++    );
++    let _ = std::fs::remove_dir_all(&dir);
++}
+-- 
+2.43.0
+

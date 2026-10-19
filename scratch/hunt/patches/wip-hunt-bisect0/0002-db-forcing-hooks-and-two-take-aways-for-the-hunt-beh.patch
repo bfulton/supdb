@@ -1,0 +1,408 @@
+From 35bd0eba313c03155c550ab2c7180a1186e55d09 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 21:17:12 +0000
+Subject: [PATCH 2/6] db: forcing hooks and two take-aways for the hunt, behind
+ environment variables
+
+For a hunt branch and not for a merge. Every switch is read from the
+environment and does nothing unset.
+
+The published block forms are replaced in a state's slots before the
+state's position moves, and a reader trusts a form once, at the start of
+its scan, by that position. `HUNT_THREAD_BEFORE_PUBLISH_MS`,
+`HUNT_THREAD_BEFORE_ADVANCE_MS` hold the upkeep thread before the forms
+are replaced and between the replacing and the position; and
+`HUNT_SCAN_AFTER_CHECK_MS` holds a Snapshot handle's scan after its
+check. `HUNT_FIX=1` withdraws the position before the forms are replaced
+and reads it again after a form is taken.
+
+A table carried across a merge's rewrite of a partition that
+`same_blocks` takes for the same blocks keeps the cuts of the keys it
+filed against the partition before. `HUNT_CHECK_CUTS=1` says how many of
+them are no longer the new partition's, and `HUNT_FIX2=1` takes them
+again. `tests/hunt_cuts.rs` is the schedule that makes the stale cut a
+wrong scan, with no thread timing in it.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011ZkLidS5BYuaBXVcvPAkdd
+---
+ src/db.rs             | 108 +++++++++++++++++++++++++++++-
+ tests/hunt_bisect0.rs |  22 ++++++-
+ tests/hunt_cuts.rs    | 149 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 273 insertions(+), 6 deletions(-)
+ create mode 100644 tests/hunt_cuts.rs
+
+diff --git a/src/db.rs b/src/db.rs
+index 608e22f..d28db72 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -15061,7 +15061,49 @@ impl Reader {
+             t.pieces = pieces;
+             t.piece_ranks = piece_ranks;
+             if rebased {
++                if !froze && keep_snap && std::env::var("HUNT_CHECK_CUTS").is_ok() {
++                    let mut stale = 0usize;
++                    let mut total = 0usize;
++                    let mut first = None;
++                    for (b, list) in t.added.iter().enumerate() {
++                        for &(slot, cut) in list {
++                            if slot as usize >= self.mem().len() {
++                                continue;
++                            }
++                            total += 1;
++                            let key = self.mem().key_of(self.mem().entry(slot as usize));
++                            let (nb, ncut) = BuildCtx::owner_of(seg, key);
++                            if nb != b || ncut != cut {
++                                stale += 1;
++                                first.get_or_insert((b, nb, cut, ncut, key.to_vec()));
++                            }
++                        }
++                    }
++                    eprintln!(
++                        "HUNTCUTS rebase p {p}: {} filed keys carried, {} with a cut that is not the new partition's (keep_snap {keep_snap}); first {:?}; keys now {}",
++                        total,
++                        stale,
++                        first.map(|(b, nb, c, nc, k)| (b, nb, c >> 1, c & 1, nc >> 1, nc & 1, String::from_utf8_lossy(&k).to_string())),
++                        seg.blob.keys()
++                    );
++                }
+                 t.blob = seg.blob.id();
++                if hunt_fix2() && keep_snap && !froze {
++                    // HUNT_FIX2: the cuts of the keys filed against the
++                    // partition this table was made over are taken again
++                    // against the one it is carried to.
++                    let mut all: Vec<(u32, u32)> = Vec::new();
++                    for list in t.added.iter_mut() {
++                        all.append(list);
++                    }
++                    for (slot, _) in all {
++                        let key = self.mem().key_of(self.mem().entry(slot as usize));
++                        let (nb, ncut) = BuildCtx::owner_of(seg, key);
++                        if let Some(list) = t.added.get_mut(nb) {
++                            list.push((slot, ncut));
++                        }
++                    }
++                }
+             }
+             if landed && !froze {
+                 // The retired bases went with the tables they named, and
+@@ -16559,7 +16601,18 @@ impl Reader {
+         // have committed past it meanwhile, and forms stamped with a
+         // later position would be taken by a reader there without the
+         // writes between.
++        if self.understudy {
++            hunt_pause("HUNT_THREAD_BEFORE_PUBLISH_MS");
++        }
++        if hunt_fix() {
++            // HUNT_FIX: the forms are no reader's to trust while they are
++            // being replaced.
++            st.forms_at.store(usize::MAX, AtomicOrdering::Release);
++        }
+         if self.publish_dirty(false) {
++            if self.understudy {
++                hunt_pause("HUNT_THREAD_BEFORE_ADVANCE_MS");
++            }
+             st.forms_complete
+                 .store(self.fs().tables_complete.get(), AtomicOrdering::Release);
+             st.forms_at.store(
+@@ -17841,6 +17894,7 @@ impl Reader {
+             }
+         }
+         let complete = canonical && st.forms_complete.load(AtomicOrdering::Acquire);
++        let mut stale_canon = false;
+         // One context for the scan: its tombstone flag is a walk over every
+         // segment, which a context per block paid on every sparse walk.
+         let ctx = self.build_ctx();
+@@ -17953,8 +18007,30 @@ impl Reader {
+                 // A wide form is the handle's own to walk against its own
+                 // list of filed keys, so it is never taken from the
+                 // table; a reader that meets one builds as before.
+-                let canon: Option<&Cached> =
+-                    match canonical.then(|| self.canonical(pi, b)).flatten() {
++                if canonical && self.isolation.get() == Isolation::Snapshot {
++                    hunt_pause("HUNT_SCAN_AFTER_CHECK_MS");
++                }
++                let loaded = if canonical && !stale_canon {
++                    self.canonical(pi, b)
++                } else {
++                    None
++                };
++                // HUNT_FIX: the position is read again after the form is,
++                // and a form is taken only if it still names the position
++                // the handle holds.
++                if hunt_fix()
++                    && canonical
++                    && !stale_canon
++                    && !self
++                        .forms_bound()
++                        .is_some_and(|n| st.forms_at.load(AtomicOrdering::Acquire) == n)
++                {
++                    stale_canon = true;
++                }
++                let canon: Option<&Cached> = if stale_canon {
++                    None
++                } else {
++                    match loaded {
+                         Some(Cached::Wide(_)) => None,
+                         Some(f) => {
+                             takes += 1;
+@@ -17962,7 +18038,8 @@ impl Reader {
+                         }
+                         None if complete => Some(&Cached::Clean),
+                         None => None,
+-                    };
++                    }
++                };
+                 // A block to build, or one held wide, reads the
+                 // snapshot: without one the walk stops here, before this
+                 // block emits anything, and goes on from the block's
+@@ -24617,6 +24694,31 @@ impl Reader {
+     }
+ }
+ 
++/// HUNT (a hunt branch's forcing patch, never for a merge): the switches
++/// of `tests/hunt_bisect0.rs` and `tests/hunt_cuts.rs`, read from the
++/// environment. `HUNT_FIX=1` is the take-away of the published forms'
++/// position race: the position is withdrawn before the forms are
++/// replaced and read again after one is taken. `HUNT_FIX2=1` takes the
++/// cuts of the keys filed against a partition again against the
++/// partition a table is carried to.
++fn hunt_fix() -> bool {
++    static FIX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *FIX.get_or_init(|| std::env::var("HUNT_FIX").is_ok_and(|v| v == "1"))
++}
++
++fn hunt_fix2() -> bool {
++    static FIX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *FIX.get_or_init(|| std::env::var("HUNT_FIX2").is_ok_and(|v| v == "1"))
++}
++
++/// HUNT: a pause of the number of milliseconds the variable names, to hold
++/// a thread at a point of a forcing schedule.
++fn hunt_pause(var: &str) {
++    if let Some(ms) = std::env::var(var).ok().and_then(|s| s.parse::<u64>().ok()) {
++        std::thread::sleep(std::time::Duration::from_millis(ms));
++    }
++}
++
+ /// Whether reads are around: a scan over the store in its life, and no
+ /// more than two stores' worth of writes since the last. The upkeep's
+ /// hand-over and the idle seals' filing ask it alike.
+diff --git a/tests/hunt_bisect0.rs b/tests/hunt_bisect0.rs
+index 12ecfd7..a4409d6 100644
+--- a/tests/hunt_bisect0.rs
++++ b/tests/hunt_bisect0.rs
+@@ -47,7 +47,9 @@
+ //! Compile-time switches, for commits that lack what a call needs:
+ //! `--cfg hunt_old` leaves out `hold_seal_landing` and `frozen_tables`, and
+ //! `--cfg hunt_opts` turns on `HUNT_NO_SHARE`, `HUNT_NO_FORMS` and
+-//! `HUNT_UPKEEP`, which set options by name.
++//! `HUNT_UPKEEP`, which set options by name (both scenarios), and with
++//! `--cfg hunt_alert` `HUNT_NO_ALERT`, with `--cfg hunt_rebase`
++//! `HUNT_NO_REBASE`.
+ 
+ use std::collections::BTreeMap;
+ use std::path::PathBuf;
+@@ -290,12 +292,24 @@ fn hunt_opts(o: &mut Options) {
+     if env_u64("HUNT_NO_FORMS", 0) == 1 {
+         o.commit_forms = false;
+     }
++    // The tables carried across a merge's rewrite of a partition
++    // (`forms_rebase`, from the commit that made it).
++    #[cfg(hunt_rebase)]
++    if env_u64("HUNT_NO_REBASE", 0) == 1 {
++        o.forms_rebase = false;
++    }
+     match std::env::var("HUNT_UPKEEP").as_deref() {
+         Ok("inline") => o.upkeep = supdb::db::Upkeep::Inline,
+         Ok("bg1") => o.upkeep = supdb::db::Upkeep::Background(1),
+         Ok("bg2") => o.upkeep = supdb::db::Upkeep::Background(2),
+         _ => {}
+     }
++    // The upkeep thread's alert poll exists from the commit that made it
++    // (`--cfg hunt_alert`): `HUNT_NO_ALERT=1` is the back-off as it was.
++    #[cfg(hunt_alert)]
++    if env_u64("HUNT_NO_ALERT", 0) == 1 {
++        o.upkeep_alert = false;
++    }
+ }
+ 
+ #[cfg(not(hunt_opts))]
+@@ -519,7 +533,7 @@ fn snapshot_reads_nothing_after_it() {
+ const ORACLE_KEYS: usize = 240;
+ 
+ fn oracle_opts(inline: bool) -> Options {
+-    Options {
++    let mut o = Options {
+         scan_block_cache: true,
+         seal_bytes: 8 << 10,
+         partition_bytes: Some(4 << 10),
+@@ -530,7 +544,9 @@ fn oracle_opts(inline: bool) -> Options {
+         },
+         l0_trigger: 2,
+         ..Options::default()
+-    }
++    };
++    hunt_opts(&mut o);
++    o
+ }
+ 
+ fn oracle_keys() -> Vec<Vec<u8>> {
+diff --git a/tests/hunt_cuts.rs b/tests/hunt_cuts.rs
+new file mode 100644
+index 0000000..99cace2
+--- /dev/null
++++ b/tests/hunt_cuts.rs
+@@ -0,0 +1,149 @@
++//! A forcing schedule for the upkeep thread's cut assertion ("an overlay
++//! key's cut is behind the walk"): a partition rewritten by a merge that
++//! drops one key and adds another, so that its count and its key at every
++//! block's first rank and at its last are what they were, is taken for the
++//! same blocks, and the writer's table is carried across it with the cuts
++//! of the keys it filed against the partition before.
++//!
++//! One partition of a hundred keys; a delete of k0040 and an insert of
++//! k0061 sealed into a piece the landing of which is held; a write of k0050
++//! filed against the partition as it stands; the landing, and the piece's
++//! merge into the partition; a write of k0052, filed against the partition
++//! as it now stands; and a scan, which builds the block over both.
++
++use std::collections::BTreeMap;
++use std::path::PathBuf;
++use supdb::{Db, Options, Reader};
++
++fn key(i: usize) -> Vec<u8> {
++    format!("k{i:04}").into_bytes()
++}
++
++fn val(tag: &str) -> Vec<u8> {
++    let mut v = tag.as_bytes().to_vec();
++    v.resize(100, b'.');
++    v
++}
++
++fn scratch(name: &str) -> PathBuf {
++    let d = std::env::temp_dir().join(format!("supdb-next-huntcuts-{name}-{}", std::process::id()));
++    let _ = std::fs::remove_dir_all(&d);
++    std::fs::create_dir_all(&d).unwrap();
++    d
++}
++
++fn scan_all(r: &Reader) -> BTreeMap<Vec<u8>, Vec<Vec<u8>>> {
++    let mut m: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
++    r.scan(b"", usize::MAX, |k, v| {
++        m.entry(k.to_vec()).or_default().push(v.to_vec())
++    })
++    .unwrap();
++    m
++}
++
++type Scan = BTreeMap<Vec<u8>, Vec<Vec<u8>>>;
++
++/// The two scans are the same, or the panic names the first key they part
++/// at and what each holds there.
++fn same(got: &Scan, want: &Scan, what: &str) {
++    if got == want {
++        return;
++    }
++    let show = |m: &Scan, k: &Vec<u8>| match m.get(k) {
++        Some(vs) => format!(
++            "{:?}",
++            vs.iter()
++                .map(|v| String::from_utf8_lossy(&v[..v.iter().position(|&b| b == b'.').unwrap_or(v.len())]).to_string())
++                .collect::<Vec<_>>()
++        ),
++        None => "absent".to_string(),
++    };
++    let parts: Vec<&Vec<u8>> = got
++        .keys()
++        .chain(want.keys())
++        .filter(|k| got.get(*k) != want.get(*k))
++        .collect::<std::collections::BTreeSet<_>>()
++        .into_iter()
++        .collect();
++    let lines: Vec<String> = parts
++        .iter()
++        .take(6)
++        .map(|k| {
++            format!(
++                "{}: scan {}, model {}",
++                String::from_utf8_lossy(k),
++                show(got, k),
++                show(want, k)
++            )
++        })
++        .collect();
++    panic!("{what}: {} keys differ ({} scanned, {} in the model); {}", parts.len(), got.len(), want.len(), lines.join("; "));
++}
++
++#[test]
++fn a_rewrite_that_changes_interior_keys_leaves_cuts_behind() {
++    let dir = scratch("interior");
++    let mut db = Db::create(
++        &dir,
++        Options {
++            partition_bytes: Some(1 << 20),
++            scan_block_cache: true,
++            l0_trigger: 1,
++            ..Options::default()
++        },
++    )
++    .unwrap();
++    let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
++    for i in (0..200).step_by(2) {
++        db.append(&key(i), &val("base"));
++        model.insert(key(i), vec![val("base")]);
++        if i % 50 == 48 {
++            db.commit().unwrap();
++        }
++    }
++    db.commit().unwrap();
++    db.flush().unwrap();
++    db.settle().unwrap();
++    // The regime and the writer's table: a handle's scan, then the writer's.
++    let h = db.reader().unwrap();
++    same(&scan_all(&h), &model, "the first scan");
++    same(&scan_all(&db), &model, "the first scan");
++
++    db.hold_seal_landing(true);
++    // X dropped, Y added, in one piece: count and block-first keys stand.
++    db.delete(&key(40));
++    model.remove(&key(40));
++    db.append(&key(61), &val("Y"));
++    model.insert(key(61), vec![val("Y")]);
++    db.commit().unwrap();
++    db.seal().unwrap();
++    same(&scan_all(&db), &model, "after the seal");
++    // The seal's thread publishes the frozen table's snapshot meanwhile, and
++    // the scan that finds it rebuilds its own, emptying the lists of keys
++    // filed since: let it be published and taken before Z1 is written.
++    std::thread::sleep(std::time::Duration::from_millis(200));
++    same(&scan_all(&db), &model, "after the seal's snapshot");
++    // Z1 is filed against the partition as it stands.
++    db.put(&key(50), &val("Z1"));
++    model.insert(key(50), vec![val("Z1")]);
++    db.commit().unwrap();
++    same(&scan_all(&db), &model, "after Z1");
++    same(&scan_all(&h), &model, "the handle after Z1");
++
++    db.hold_seal_landing(false);
++    db.settle().unwrap();
++    while db.in_flight().1 {
++        std::thread::sleep(std::time::Duration::from_millis(1));
++    }
++    db.settle().unwrap();
++    same(&scan_all(&db), &model, "after the landing and the merge");
++    // Z2 is filed against the partition as it now stands.
++    db.put(&key(52), &val("Z2"));
++    model.insert(key(52), vec![val("Z2")]);
++    db.commit().unwrap();
++    same(&scan_all(&db), &model, "after Z2");
++    same(&scan_all(&h), &model, "the handle after Z2");
++    db.settle().unwrap();
++    same(&scan_all(&db), &model, "after the last settle");
++    let _ = std::fs::remove_dir_all(&dir);
++}
+-- 
+2.43.0
+

@@ -1,0 +1,275 @@
+From b6f7528f11bc77169612332e1f1e7f13736ef313 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 22:55:26 +0000
+Subject: [PATCH 09/10] hunt stress0: the patch scripts of the forcing hook and
+ of the two scratch experiments
+
+apply_hold_hook.py puts the forms publisher's hold into the src/db.rs of an
+older tree (the forced schedule then runs there); apply_fix_b.py makes a
+published form carry the log position it was settled at and a reader at an
+older position build its own block; apply_fix_c.py makes the sameness test of
+a rewritten partition compare every key. They take a path to a scratch copy of
+the file, never the worktree's, and are experiments to price the two
+mechanisms by removing them, not changes for the engine.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011ZkLidS5BYuaBXVcvPAkdd
+---
+ tests/hunt_stress0/apply_fix_b.py     | 106 ++++++++++++++++++++++++++
+ tests/hunt_stress0/apply_fix_c.py     |  28 +++++++
+ tests/hunt_stress0/apply_hold_hook.py |  95 +++++++++++++++++++++++
+ 3 files changed, 229 insertions(+)
+ create mode 100644 tests/hunt_stress0/apply_fix_b.py
+ create mode 100644 tests/hunt_stress0/apply_fix_c.py
+ create mode 100644 tests/hunt_stress0/apply_hold_hook.py
+
+diff --git a/tests/hunt_stress0/apply_fix_b.py b/tests/hunt_stress0/apply_fix_b.py
+new file mode 100644
+index 0000000..4d58ae3
+--- /dev/null
++++ b/tests/hunt_stress0/apply_fix_b.py
+@@ -0,0 +1,106 @@
++#!/usr/bin/env python3
++# Scratch experiment, not a proposal for the engine: the published form carries
++# the log position it was settled at, and a reader at an older position treats
++# a form past its own as one to build for itself. Applied to the src/db.rs of a
++# scratch copy of the tree (never the worktree), by path: apply_fix_b.py PATH.
++# Takes the hunt branch's tree and a clean one.
++import sys
++
++p = sys.argv[1]
++s = open(p).read()
++
++
++def rep(old, new, count=1):
++    global s
++    assert s.count(old) == count, (old[:80], s.count(old))
++    s = s.replace(old, new)
++
++
++rep(
++    """struct CanonicalForm {
++    form: std::sync::Arc<Cached>,
++    bytes: usize,
++}""",
++    """struct CanonicalForm {
++    form: std::sync::Arc<Cached>,
++    bytes: usize,
++    /// SCRATCH EXPERIMENT: the log position the form was settled at when it
++    /// was swapped into its slot; zero for a form carried across a publish,
++    /// which is current to whatever `forms_at` of the state says. A reader
++    /// bound to an older position than this does not take it.
++    pos: usize,
++}""",
++)
++rep(
++    """                let carried = Box::into_raw(Box::new(CanonicalForm {
++                    form,
++                    bytes: form_bytes,
++                }));""",
++    """                let carried = Box::into_raw(Box::new(CanonicalForm {
++                    form,
++                    bytes: form_bytes,
++                    pos: 0,
++                }));""",
++)
++rep(
++    """        let new = Box::into_raw(Box::new(CanonicalForm {
++            form: form.clone(),
++            bytes,
++        }));
++        let old = slot.swap(new, AtomicOrdering::AcqRel);""",
++    """        let new = Box::into_raw(Box::new(CanonicalForm {
++            form: form.clone(),
++            bytes,
++            pos: self.mem().committed_log().min(self.log_bound.get()),
++        }));
++        let old = slot.swap(new, AtomicOrdering::AcqRel);""",
++)
++rep(
++    """            let form = Box::into_raw(Box::new(CanonicalForm {
++                form: std::sync::Arc::new(Cached::Clean),
++                bytes: 0,
++            }));""",
++    """            let form = Box::into_raw(Box::new(CanonicalForm {
++                form: std::sync::Arc::new(Cached::Clean),
++                bytes: 0,
++                pos: 0,
++            }));""",
++)
++# the reader's check, in canonical(): after the slot's load and before the
++# form is handed out (the hunt branch's tree has a trace event there; a clean
++# tree returns the form)
++CHECK = """        // SCRATCH EXPERIMENT: a form settled past the position this handle
++        // reads at is not for it, whatever `forms_at` said when the scan
++        // began: the slot was swapped after that, and the position is
++        // stored after the swaps. A marker, so the block is built.
++        if e.pos != 0 && self.forms_bound().is_some_and(|bound| e.pos > bound) {
++            return Some(&REJECTED_FORM);
++        }
++"""
++if s.count("        let e = unsafe { &*e };\n        dbgtrace::ev3(\n            4,") == 1:
++    rep(
++        "        let e = unsafe { &*e };\n        dbgtrace::ev3(\n            4,",
++        "        let e = unsafe { &*e };\n" + CHECK + "        dbgtrace::ev3(\n            4,",
++    )
++else:
++    rep(
++        "        let e = unsafe { &*e };\n        Some(&e.form)",
++        "        let e = unsafe { &*e };\n" + CHECK + "        Some(&e.form)",
++    )
++rep(
++    """static NO_SNAPSHOT: std::sync::LazyLock<Snapshot> = std::sync::LazyLock::new(Snapshot::default);""",
++    """static NO_SNAPSHOT: std::sync::LazyLock<Snapshot> = std::sync::LazyLock::new(Snapshot::default);
++
++/// SCRATCH EXPERIMENT: what `Reader::canonical` answers for a published form
++/// that is ahead of the reader: the mark a reader builds its own for.
++static REJECTED_FORM: std::sync::LazyLock<Cached> = std::sync::LazyLock::new(|| {
++    Cached::Wide(WideBlock {
++        sorted: Vec::new(),
++        seen: 0,
++        covered: false,
++        walks: 0,
++    })
++});""",
++)
++open(p, "w").write(s)
++print("applied")
+diff --git a/tests/hunt_stress0/apply_fix_c.py b/tests/hunt_stress0/apply_fix_c.py
+new file mode 100644
+index 0000000..5774848
+--- /dev/null
++++ b/tests/hunt_stress0/apply_fix_c.py
+@@ -0,0 +1,28 @@
++#!/usr/bin/env python3
++# Scratch experiment, not a proposal for the engine: `same_blocks` compares
++# every key of the two partitions, not the keys at the blocks' first ranks and
++# the last, so a rewrite that changed keys inside a block (one inserted before a
++# filed key, one removed after it, the count and the ends unchanged) is not
++# taken for the same blocks and the table built over the old blob is dropped.
++import sys
++
++p = sys.argv[1]
++s = open(p).read()
++
++
++def rep(old, new, count=1):
++    global s
++    assert s.count(old) == count, (old[:80], s.count(old))
++    s = s.replace(old, new)
++
++
++rep(
++    """        (0..n)
++            .step_by(CACHE_BLOCK)
++            .chain(n.checked_sub(1))
++            .all(|r| matches!((a.blob.key_at(r), b.blob.key_at(r)), (Some(x), Some(y)) if x == y))""",
++    """        // SCRATCH EXPERIMENT: every rank, not the blocks' first and the last.
++        (0..n).all(|r| matches!((a.blob.key_at(r), b.blob.key_at(r)), (Some(x), Some(y)) if x == y))""",
++)
++open(p, "w").write(s)
++print("applied")
+diff --git a/tests/hunt_stress0/apply_hold_hook.py b/tests/hunt_stress0/apply_hold_hook.py
+new file mode 100644
+index 0000000..d99c689
+--- /dev/null
++++ b/tests/hunt_stress0/apply_hold_hook.py
+@@ -0,0 +1,95 @@
++"""Patch an older tree's src/db.rs with the forms publisher's hold: a dbgtrace
++module (hold_forms_position, forms_hold_parked, forms_hold_wait) and a call to
++the wait as the first statement of the upkeep pass's publish block. With
++`trace` as the second argument the wait also says what the pass holds (the
++bound it was named, the commit the writer is at, the position the state
++vouches for) and the scan says what it decided, both only while the hold is
++armed.
++usage: apply_hold_hook.py PATH-TO-db.rs [trace]"""
++import re
++import sys
++
++path = sys.argv[1]
++trace = len(sys.argv) > 2 and sys.argv[2] == "trace"
++text = open(path).read()
++
++pat = re.compile(r"\n([ \t]*)if self\.publish_dirty\(false\) \{\n")
++found = pat.findall(text)
++assert len(found) == 1, f"expected one publish_dirty(false) block, found {len(found)}"
++if trace:
++    call = "dbgtrace::forms_hold_wait_note(self.log_bound.get(), self.mem().committed_log(), st.forms_at.load(AtomicOrdering::Acquire), st.gen);"
++else:
++    call = "dbgtrace::forms_hold_wait();"
++text = pat.sub(
++    lambda m: f"\n{m.group(1)}if self.publish_dirty(false) {{\n{m.group(1)}    {call}\n",
++    text,
++)
++
++if trace:
++    scan_pat = re.compile(
++        r"(\n[ \t]*let canonical = self\.opts\.commit_forms\n[ \t]*&& self\n[ \t]*\.forms_bound\(\)\n[ \t]*\.is_some_and\(\|n\| st\.forms_at\.load\(AtomicOrdering::Acquire\) == n\);\n)"
++    )
++    assert len(scan_pat.findall(text)) == 1, "scan decision not found once"
++    text = scan_pat.sub(
++        lambda m: m.group(1)
++        + "        dbgtrace::scan_note(self.forms_bound(), st.forms_at.load(AtomicOrdering::Acquire), canonical, self.slot.is_some(), st.gen);\n",
++        text,
++    )
++
++text += '''
++
++/// HUNT (scratch, not for the engine): the forms publisher's hold, to force
++/// the race between its slot swaps and its store of the position.
++#[doc(hidden)]
++pub mod dbgtrace {
++    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
++    static FORMS_HOLD: AtomicU8 = AtomicU8::new(0);
++    static NOTES: AtomicU64 = AtomicU64::new(0);
++
++    pub fn hold_forms_position(on: bool) {
++        if on {
++            FORMS_HOLD.fetch_or(1, Ordering::AcqRel);
++        } else {
++            FORMS_HOLD.fetch_and(!1, Ordering::AcqRel);
++        }
++    }
++
++    pub fn forms_hold_parked() -> bool {
++        FORMS_HOLD.load(Ordering::Acquire) & 2 != 0
++    }
++
++    #[allow(dead_code)]
++    pub(super) fn forms_hold_wait_note(log_bound: usize, committed: usize, forms_at: usize, gen: u64) {
++        if FORMS_HOLD.load(Ordering::Acquire) & 1 != 0 {
++            eprintln!("PARK pass log_bound={log_bound} committed_log={committed} forms_at={forms_at} state_gen={gen}");
++        }
++        forms_hold_wait();
++    }
++
++    #[allow(dead_code)]
++    pub(super) fn scan_note(bound: Option<usize>, at: usize, canonical: bool, handle: bool, gen: u64) {
++        if handle && FORMS_HOLD.load(Ordering::Acquire) & 3 == 3 {
++            let n = NOTES.fetch_add(1, Ordering::Relaxed);
++            if n < 3 {
++                eprintln!("SCAN handle bound={bound:?} forms_at={at} canonical={canonical} state_gen={gen} (parked)");
++            }
++        }
++    }
++
++    pub(super) fn forms_hold_wait() {
++        if FORMS_HOLD.load(Ordering::Acquire) & 1 == 0 {
++            return;
++        }
++        FORMS_HOLD.fetch_or(2, Ordering::AcqRel);
++        let t = std::time::Instant::now();
++        while FORMS_HOLD.load(Ordering::Acquire) & 1 != 0
++            && t.elapsed() < std::time::Duration::from_secs(60)
++        {
++            std::thread::sleep(std::time::Duration::from_micros(50));
++        }
++        FORMS_HOLD.fetch_and(!2, Ordering::AcqRel);
++    }
++}
++'''
++open(path, "w").write(text)
++print("patched", path, "(trace)" if trace else "")
+-- 
+2.43.0
+

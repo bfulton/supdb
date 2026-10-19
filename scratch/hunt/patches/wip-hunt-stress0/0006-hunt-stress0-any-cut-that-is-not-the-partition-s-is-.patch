@@ -1,0 +1,207 @@
+From ae3f9f6e2eaf482ba64fbd7f8b93f1ff09981588 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 21:36:54 +0000
+Subject: [PATCH 06/10] hunt stress0: any cut that is not the partition's is
+ flagged, and the loop counts the ones met without a failure
+
+The provenance check flagged only a cut behind the walk; a cut ahead of it
+asserts nothing and answers wrong, so it now flags any cut that differs from
+the partition's own for the key. The forced cut schedule takes the seal
+thread's snapshot and the handles' sharing off so the stale cut is reached
+every run, and the loop has an ok-stale-cut class and an alternating
+two-binary script for pairing a scratch fix against the head.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011ZkLidS5BYuaBXVcvPAkdd
+---
+ src/db.rs                     |  8 +++---
+ tests/hunt_stress0/ab.sh      | 32 ++++++++++++++++++++++
+ tests/hunt_stress0/loop.sh    |  3 ++-
+ tests/hunt_stress0/run_one.sh |  6 +++++
+ tests/hunt_stress0_oracle.rs  | 50 +++++++++++++++++++++++++++++------
+ 5 files changed, 86 insertions(+), 13 deletions(-)
+ create mode 100644 tests/hunt_stress0/ab.sh
+
+diff --git a/src/db.rs b/src/db.rs
+index 724db10..da3bbb8 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -26641,18 +26641,18 @@ impl<'s> BuildCtx<'s> {
+         ov: &Overlay,
+     ) {
+         use std::fmt::Write as _;
+-        let mut prev: Option<usize> = None;
++        // Any cut that is not what the partition says it is, behind the walk
++        // or not: a cut ahead of the walk asserts nothing and answers wrong.
+         let mut bad = false;
+         for o in ov.over.iter() {
+             if o.cut == u32::MAX {
+                 continue;
+             }
+-            let c = (o.cut >> 1) as usize;
+-            if prev.is_some_and(|p| c < p) {
++            let (_, truth) = Self::owner_of(seg, o.key);
++            if o.cut != truth {
+                 bad = true;
+                 break;
+             }
+-            prev = Some(c + (o.cut & 1) as usize);
+         }
+         if !bad {
+             return;
+diff --git a/tests/hunt_stress0/ab.sh b/tests/hunt_stress0/ab.sh
+new file mode 100644
+index 0000000..6ac4c9e
+--- /dev/null
++++ b/tests/hunt_stress0/ab.sh
+@@ -0,0 +1,32 @@
++#!/bin/sh
++# Alternate two binaries over the same knobs, process by process, so that the
++# host's load falls on both alike.
++#   usage: ab.sh BIN_A BIN_B OUTDIR RUNS PARALLEL LABEL
++# Each worker runs A then B for even numbers and B then A for odd ones. The
++# ids carry the arm: LABEL-A-n and LABEL-B-n. Prints one summary line per arm.
++BIN_A=$1
++BIN_B=$2
++OUT=$3
++RUNS=$4
++PAR=$5
++LABEL=${6:-ab}
++HERE=$(dirname "$0")
++mkdir -p "$OUT/log" "$OUT/tmp"
++RES="$OUT/results-$LABEL.txt"
++: >"$RES"
++seq 0 $((RUNS - 1)) | LABEL="$LABEL" HERE="$HERE" BIN_A="$BIN_A" BIN_B="$BIN_B" OUT="$OUT" xargs -P "$PAR" -I{} sh -c '
++  if [ "${SEEDS:-0}" = 1 ]; then export HUNT_SEED=$(( ${SEEDBASE:-1000} + {} )); fi
++  if [ $(( {} % 2 )) = 0 ]; then
++    sh "$HERE/run_one.sh" "$BIN_A" "$OUT" "$LABEL-A-{}"
++    sh "$HERE/run_one.sh" "$BIN_B" "$OUT" "$LABEL-B-{}"
++  else
++    sh "$HERE/run_one.sh" "$BIN_B" "$OUT" "$LABEL-B-{}"
++    sh "$HERE/run_one.sh" "$BIN_A" "$OUT" "$LABEL-A-{}"
++  fi
++' >>"$RES"
++for arm in A B; do
++  n=$(grep -c " $LABEL-$arm-" "$RES")
++  ok=$(grep "^ok " "$RES" | grep -c " $LABEL-$arm-")
++  fail=$(grep -v "^ok " "$RES" | grep -c " $LABEL-$arm-")
++  echo "AB $LABEL arm=$arm runs=$n ok=$ok failed=$fail"
++done
+diff --git a/tests/hunt_stress0/loop.sh b/tests/hunt_stress0/loop.sh
+index 92d8691..a3eeb4b 100755
+--- a/tests/hunt_stress0/loop.sh
++++ b/tests/hunt_stress0/loop.sh
+@@ -19,6 +19,7 @@ seq 0 $((RUNS - 1)) | LABEL="$LABEL" HERE="$HERE" BIN="$BIN" OUT="$OUT" xargs -P
+   sh "$HERE/run_one.sh" "$BIN" "$OUT" "$LABEL-{}"
+ ' >>"$RES"
+ ok=$(grep -c '^ok ' "$RES")
++stale=$(grep -c '^ok-stale-cut' "$RES")
+ f1=$(grep -c '^F1' "$RES")
+ f0=$(grep -c '^F0' "$RES")
+ f2=$(grep -c '^F2' "$RES")
+@@ -26,4 +27,4 @@ f3=$(grep -c '^F3' "$RES")
+ fp=$(grep -c '^forced-passed' "$RES")
+ fn=$(grep -c '^forced-not-parked' "$RES")
+ ot=$(grep -c '^other\|^forced-other' "$RES")
+-echo "SUMMARY $LABEL runs=$RUNS ok=$ok F1=$f1 F0=$f0 F2=$f2 F3=$f3 forced-passed=$fp forced-not-parked=$fn other=$ot"
++echo "SUMMARY $LABEL runs=$RUNS ok=$ok ok-stale-cut=$stale F1=$f1 F0=$f0 F2=$f2 F3=$f3 forced-passed=$fp forced-not-parked=$fn other=$ot"
+diff --git a/tests/hunt_stress0/run_one.sh b/tests/hunt_stress0/run_one.sh
+index 64a94bc..0b23c24 100755
+--- a/tests/hunt_stress0/run_one.sh
++++ b/tests/hunt_stress0/run_one.sh
+@@ -13,6 +13,12 @@ RC=$?
+ rm -rf "$T"
+ LOG="$OUT/log/$ID.txt"
+ if [ "$RC" = 0 ] && grep -q 'HUNT-OK' "$LOG"; then
++  if grep -q 'HUNT-PROVENANCE' "$LOG"; then
++    # A build met a cut that was not what its partition says, and nothing
++    # asserted and no answer was wrong: kept for reading.
++    echo "ok-stale-cut $ID"
++    exit 0
++  fi
+   echo "ok $ID"
+   rm -f "$LOG"
+   exit 0
+diff --git a/tests/hunt_stress0_oracle.rs b/tests/hunt_stress0_oracle.rs
+index 3f0d1a4..ba58350 100644
+--- a/tests/hunt_stress0_oracle.rs
++++ b/tests/hunt_stress0_oracle.rs
+@@ -338,14 +338,40 @@ fn hunt_oracle() {
+ fn hunt_cut_forced() {
+     let variant = env_str("HUNT_CUT_VARIANT").unwrap_or_else(|| "assert".to_string());
+     let dir = scratch("cutforced");
+-    let opts = Options {
++    // The seal thread's snapshot of its frozen table and the handles' sharing
++    // of snapshots are off: with them on, the writer sometimes adopts a
++    // snapshot built after the key was written and the key is held by the
++    // snapshot, not filed in its block's list (the schedule then misses the
++    // stale cut, in about a quarter of runs). `HUNT_OPT=seal_snapshot=1,
++    // share_snapshot=1` puts them back.
++    let mut opts = Options {
+         scan_block_cache: true,
+         upkeep: Upkeep::Inline,
+         partition_bytes: Some(1 << 20),
+         seal_bytes: 1 << 30,
+         l0_trigger: 1,
++        seal_snapshot: false,
++        share_snapshot: false,
+         ..Options::default()
+     };
++    // Options taken away to find what the schedule leaves to a race.
++    if let Some(list) = env_str("HUNT_OPT") {
++        for kv in list.split(',') {
++            let (k, v) = kv.split_once('=').unwrap_or_else(|| panic!("HUNT_OPT {kv}"));
++            let flag = v != "0";
++            match k {
++                "seal_snapshot" => opts.seal_snapshot = flag,
++                "frozen_snaps" => opts.frozen_snaps = flag,
++                "share_snapshot" => opts.share_snapshot = flag,
++                "publish_in_background" => opts.publish_in_background = flag,
++                "snapshot_carry" => opts.snapshot_carry = flag,
++                "forms_carry" => opts.forms_carry = flag,
++                "forms_rebase" => opts.forms_rebase = flag,
++                "scan_cache_ahead" => opts.scan_cache_ahead = flag,
++                other => panic!("HUNT_OPT: unknown option {other}"),
++            }
++        }
++    }
+     let key = |n: usize| format!("k{n:04}").into_bytes();
+     let mut db = Db::create(&dir, opts).unwrap();
+     let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+@@ -404,18 +430,26 @@ fn hunt_cut_forced() {
+     if let Some(first) = &first {
+         db.put(first, b"v-first");
+         model.insert(first.clone(), b"v-first".to_vec());
+-        db.commit().unwrap();
+     }
+     let want: Vec<_> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
++    // The commit builds the block inline when the forms are kept, and the scan
++    // builds it when they are not: the engine's assertion can fire in either,
++    // so both are under the catch.
++    let phase = std::cell::Cell::new("commit");
++    let scanned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++        if first.is_some() {
++            db.commit().unwrap();
++        }
++        phase.set("scan");
++        walk(&db)
++    }));
+     if env_flag("HUNT_CUT_DEBUG", false) {
+-        eprintln!("HUNT-CUT-DEBUG before the last scan: {}", db.debug_key(&second));
+-    }
+-    let scanned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| walk(&db)));
+-    if env_flag("HUNT_CUT_DEBUG", false) {
+-        eprintln!("HUNT-CUT-DEBUG after the last scan: {}", db.debug_key(&second));
++        for line in supdb::db::dbgtrace::dump(0) {
++            eprintln!("TRACE {line}");
++        }
+     }
+     let verdict = match &scanned {
+-        Err(_) => "the engine panicked".to_string(),
++        Err(_) => format!("the engine panicked, in the {}", phase.get()),
+         Ok(got) if *got == want => "right".to_string(),
+         Ok(got) => {
+             let at = got
+-- 
+2.43.0
+
