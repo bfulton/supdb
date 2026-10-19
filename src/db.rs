@@ -696,12 +696,17 @@ pub struct Options {
     pub zpages_hold_build: bool,
     #[doc(hidden)]
     pub zpages_hold_rename: bool,
-    /// EXPERIMENT: under `ZPages::Always`, a partition's sidecar is built
-    /// as soon as the partition lands, on the builder's thread at idle
-    /// priority, rather than at the next settle of the form. The shape the
-    /// design intends and no pairing has priced: the pairing measured the
-    /// builds inside the load's `sync`, which is where they stay with this
-    /// off. `supdb-nocachezpageseager` is the arm.
+    /// Under `ZPages::Always`, a partition's sidecar is built as soon as
+    /// the partition lands, on the builder's thread at idle priority,
+    /// rather than at the next settle of the form, which then waits for
+    /// the builds in flight and starts the ones no landing did. Priced in
+    /// core at three million keys, the load pass alone, two sittings with
+    /// the arms swapped: the ordered load 1.2-1.3x, its closing sync a
+    /// third of what it was with the builds in it while the commits rose
+    /// by a tenth of the difference; the shuffled load level, with a fifth
+    /// of its builds superseded by the merges that rewrite their
+    /// partitions. `supdb-nocachezpagessettle` is the arm that leaves every
+    /// build to the settle.
     #[doc(hidden)]
     pub zpages_eager: bool,
     /// Whether a sidecar's file is read into the page cache once it is
@@ -2142,7 +2147,7 @@ impl Default for Options {
             zpages_retry_ms: 60_000,
             zpages_hold_build: false,
             zpages_hold_rename: false,
-            zpages_eager: false,
+            zpages_eager: true,
             zpages_warm: true,
             forms_pieces_only: false,
             publish_in_background: true,

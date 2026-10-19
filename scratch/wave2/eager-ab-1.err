@@ -1,0 +1,36 @@
+bench ab: supdb-nocachezpages against supdb-nocachezpageseager at 3000000 keys, scans of 100, 6 pairs after a warmup, passes load, ops divided by 10
+loadphases supdb-nocachezpages size 3000000 commits 3000 ms 1908.02 first 1.46 max 12.05 sync 1640.01 total 3945.11 | commits cpu 1092.4 flt 6285 | sync cpu 1.1 flt 0
+loadphases supdb-nocachezpages size 3000000 commits 3000 ms 4007.98 first 1.55 max 45.46 sync 4949.78 total 9506.22 | commits cpu 1792.7 flt 26190 | sync cpu 34.8 flt 0
+loadphases supdb-nocachezpageseager size 3000000 commits 3000 ms 2221.34 first 1.29 max 57.90 sync 521.83 total 3171.42 | commits cpu 1110.6 flt 4097 | sync cpu 1.2 flt 0
+loadphases supdb-nocachezpageseager size 3000000 commits 3000 ms 4254.52 first 1.34 max 149.22 sync 4999.90 total 9793.53 | commits cpu 1738.9 flt 25053 | sync cpu 45.3 flt 0
+    29s  rep 0/6 (warmup)
+loadphases supdb-nocachezpageseager size 3000000 commits 3000 ms 2662.73 first 0.96 max 263.62 sync 490.61 total 3606.66 | commits cpu 1187.1 flt 4762 | sync cpu 3.0 flt 0
+loadphases supdb-nocachezpageseager size 3000000 commits 3000 ms 4231.66 first 1.26 max 82.11 sync 4801.39 total 9610.06 | commits cpu 1867.8 flt 32120 | sync cpu 40.2 flt 0
+loadphases supdb-nocachezpages size 3000000 commits 3000 ms 2582.33 first 1.40 max 56.84 sync 1669.68 total 4764.74 | commits cpu 1312.0 flt 3643 | sync cpu 1.5 flt 0
+loadphases supdb-nocachezpages size 3000000 commits 3000 ms 3778.52 first 1.28 max 88.68 sync 5109.75 total 9445.71 | commits cpu 1776.1 flt 27162 | sync cpu 33.4 flt 1
+    58s  rep 1/6
+loadphases supdb-nocachezpages size 3000000 commits 3000 ms 2228.15 first 1.20 max 45.27 sync 1596.91 total 4285.42 | commits cpu 1186.3 flt 5279 | sync cpu 1.1 flt 0
+loadphases supdb-nocachezpages size 3000000 commits 3000 ms 4259.08 first 1.39 max 25.55 sync 4696.13 total 9562.57 | commits cpu 1953.4 flt 26692 | sync cpu 31.7 flt 0
+loadphases supdb-nocachezpageseager size 3000000 commits 3000 ms 2231.10 first 1.23 max 61.95 sync 517.56 total 3161.72 | commits cpu 1086.9 flt 2769 | sync cpu 1.5 flt 0
+loadphases supdb-nocachezpageseager size 3000000 commits 3000 ms 5014.47 first 1.23 max 899.97 sync 4944.78 total 10542.45 | commits cpu 1963.3 flt 38562 | sync cpu 34.1 flt 0
+    88s  rep 2/6
+loadphases supdb-nocachezpageseager size 3000000 commits 3000 ms 2263.64 first 1.50 max 49.08 sync 488.26 total 3222.46 | commits cpu 1204.3 flt 4460 | sync cpu 1.5 flt 2
+loadphases supdb-nocachezpageseager size 3000000 commits 3000 ms 4072.54 first 1.40 max 77.78 sync 4522.97 total 9151.99 | commits cpu 1806.8 flt 29937 | sync cpu 24.3 flt 5
+loadphases supdb-nocachezpages size 3000000 commits 3000 ms 1958.65 first 1.09 max 50.61 sync 1502.71 total 3854.31 | commits cpu 1051.0 flt 4549 | sync cpu 1.3 flt 0
+loadphases supdb-nocachezpages size 3000000 commits 3000 ms 3962.44 first 1.24 max 99.59 sync 5125.54 total 9645.23 | commits cpu 1761.2 flt 29613 | sync cpu 35.8 flt 0
+   116s  rep 3/6
+loadphases supdb-nocachezpages size 3000000 commits 3000 ms 2179.87 first 2.59 max 25.32 sync 1678.55 total 4291.94 | commits cpu 1126.5 flt 4387 | sync cpu 1.3 flt 0
+loadphases supdb-nocachezpages size 3000000 commits 3000 ms 3918.68 first 1.82 max 44.45 sync 4964.43 total 9445.66 | commits cpu 1800.5 flt 24500 | sync cpu 31.0 flt 0
+loadphases supdb-nocachezpageseager size 3000000 commits 3000 ms 2290.66 first 1.44 max 96.39 sync 494.89 total 3202.03 | commits cpu 1126.6 flt 3980 | sync cpu 1.2 flt 0
+loadphases supdb-nocachezpageseager size 3000000 commits 3000 ms 4678.75 first 1.22 max 47.58 sync 6076.88 total 11353.40 | commits cpu 1939.0 flt 25290 | sync cpu 46.0 flt 2
+   146s  rep 4/6
+loadphases supdb-nocachezpageseager size 3000000 commits 3000 ms 2553.40 first 26.33 max 51.49 sync 588.55 total 3647.21 | commits cpu 1316.9 flt 4243 | sync cpu 1.4 flt 6
+loadphases supdb-nocachezpageseager size 3000000 commits 3000 ms 4354.80 first 1.40 max 65.26 sync 7051.81 total 11960.48 | commits cpu 1805.7 flt 29638 | sync cpu 48.9 flt 0
+loadphases supdb-nocachezpages size 3000000 commits 3000 ms 2272.88 first 1.40 max 59.69 sync 1664.25 total 4395.17 | commits cpu 1202.7 flt 3974 | sync cpu 1.3 flt 0
+loadphases supdb-nocachezpages size 3000000 commits 3000 ms 3916.51 first 1.98 max 118.29 sync 6200.74 total 10708.46 | commits cpu 1854.9 flt 26243 | sync cpu 40.1 flt 8
+   180s  rep 5/6
+loadphases supdb-nocachezpages size 3000000 commits 3000 ms 2281.68 first 1.50 max 47.78 sync 1636.66 total 4398.81 | commits cpu 1239.1 flt 3953 | sync cpu 1.5 flt 0
+loadphases supdb-nocachezpages size 3000000 commits 3000 ms 3946.53 first 1.30 max 55.79 sync 5242.44 total 9777.41 | commits cpu 1855.4 flt 28159 | sync cpu 34.5 flt 13
+loadphases supdb-nocachezpageseager size 3000000 commits 3000 ms 2367.06 first 1.23 max 47.66 sync 511.74 total 3292.91 | commits cpu 1102.1 flt 3139 | sync cpu 1.2 flt 2
+loadphases supdb-nocachezpageseager size 3000000 commits 3000 ms 4641.45 first 1.15 max 697.55 sync 4068.83 total 9265.49 | commits cpu 1861.1 flt 36579 | sync cpu 30.2 flt 0
+   208s  rep 6/6
