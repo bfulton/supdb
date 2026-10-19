@@ -172,6 +172,44 @@ handle, drained and with unsealed keys over the partitions; the walks of a
 scan are counted by the partition they cross. The block cache's walks of a
 covered partition stay raw and uncounted until piece 3 lists their sites.
 
+Piece 2 is in: `ZSide::seek`, `ZSide::cut_in` and `ZSide::values_at`
+(`ZSeek`: the rank, how the key there compares, whether a page was
+decoded; or fallback, out, no-page), `ZCursor` (`at`, `seek`, `key`,
+`values`, `advance`; the group in the cursor's own buffer through
+`GroupBuf::bytes`, a stored page parsed in place; the thread's buffer
+held for the cursor's life and put back at its drop), and one
+`open_group` that the point read, the walk, the seek and the cursor open
+a page through. Wired at `scan_partitions`' seek and cut (`part_seek_z`,
+`part_cut_z`), `emit_unsealed`'s values (`part_values_z`) and
+`scan_merged`'s partition cursor (`PWalk`: the raw rank and key or the
+cursor, dispatched once a partition). The key the cursor lends is in use
+until the turn's end and nothing needs it across the advance, so the
+advance is deferred to the top of the next turn instead of the key
+copied, and the raw side keeps its borrow as before. The counts: a seek
+or a cut that decodes counts `scan_groups`; the cursor's groups and
+no-page runs are filed as it leaves the partition, a served walk
+(`scans`) or, fallen, a fallback and a raw walk. The plan's `exts_at`
+site is the pieces' (`c.seg.blob.exts_at`), raw since a piece has no
+sidecar; the partition `exts_at` sites outside the scan paths wait for
+piece 3's listing. The cut and the emit's values each open a group the
+walk before them opened too; piece 4's memo is where one decode serves
+the three, and the cost of the three decodes is a thing the in-core
+pairing of piece 8 reads. Tests: the unit tests of the seek, the cut and
+the values by rank against the raw form, on the suite's shape and with a
+no-page record among the pages, and of the cursor from every start,
+across the no-page run and under a page flipped where the attach's
+sample does not look (the rest of the walk raw, every key and value
+right, the sidecar out); the windows over a piece (`scan_merged`, writer
+and handle, counted as served walks); appends to keys the partition
+holds in both window tests, since a put masks the partition's values at
+the emit and only an append reads them; the walks test and the no-page
+test over a piece. Five mutants held to firing: the merge path never
+taking the cursor (three tests, by their counts), the cut always the
+window's end, the emit's values of the next rank, the cursor's values of
+the next record, an advance that keeps the key. The fuzz with the form
+forced: a hundred and twenty seeds with the cache off and a hundred and
+twenty with it on, clean, every seed reaching `scan_merged`.
+
 ## What 2b's sittings leave open, read before 3's
 
 - The eager build's pairing (`eager-pairing.sh`, `eager-ab-1.out` and
