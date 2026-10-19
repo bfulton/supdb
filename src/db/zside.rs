@@ -44,8 +44,8 @@ use std::cmp::Ordering as KeyOrder;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Result, Write};
 use std::path::Path;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// The size floor: a partition whose record region is under this many bytes
 /// is declined and no file is written (`Options::zpages_min_bytes`). The form
@@ -239,7 +239,7 @@ enum Group<'a> {
     Buf(usize),
     /// The memo's, `n` bytes of it, held for the group's life in the
     /// cursor.
-    Memo(Rc<GroupBuf>, usize),
+    Memo(Arc<GroupBuf>, usize),
     Raw,
 }
 
@@ -258,6 +258,7 @@ enum Group<'a> {
 /// covered partition made inside the walk makes a buffer of its own, as a
 /// callback's nested read does.
 pub(super) struct ZCursor<'a> {
+    memo: &'a ZMemo,
     side: &'a ZSide,
     raw: &'a Blob<MmapBytes>,
     rank: usize,
@@ -280,8 +281,9 @@ pub(super) struct ZCursor<'a> {
 }
 
 impl<'a> ZCursor<'a> {
-    fn new(side: &'a ZSide, raw: &'a Blob<MmapBytes>) -> ZCursor<'a> {
+    fn new(memo: &'a ZMemo, side: &'a ZSide, raw: &'a Blob<MmapBytes>) -> ZCursor<'a> {
         ZCursor {
+            memo,
             side,
             raw,
             rank: 0,
@@ -299,8 +301,13 @@ impl<'a> ZCursor<'a> {
     }
 
     /// A cursor at `rank`, the key count or past it for the end.
-    pub(super) fn at(side: &'a ZSide, raw: &'a Blob<MmapBytes>, rank: usize) -> ZCursor<'a> {
-        let mut c = ZCursor::new(side, raw);
+    pub(super) fn at(
+        memo: &'a ZMemo,
+        side: &'a ZSide,
+        raw: &'a Blob<MmapBytes>,
+        rank: usize,
+    ) -> ZCursor<'a> {
+        let mut c = ZCursor::new(memo, side, raw);
         c.rank = rank;
         c.load();
         c
@@ -311,6 +318,7 @@ impl<'a> ZCursor<'a> {
     /// walk after it; or why the sidecar cannot say, which is never
     /// `Served`, and the caller seeks the raw form.
     pub(super) fn seek(
+        memo: &'a ZMemo,
         side: &'a ZSide,
         raw: &'a Blob<MmapBytes>,
         key: &[u8],
@@ -318,7 +326,7 @@ impl<'a> ZCursor<'a> {
         if side.damaged.load(Ordering::Relaxed) {
             return Err(ZSeek::Out);
         }
-        let mut c = ZCursor::new(side, raw);
+        let mut c = ZCursor::new(memo, side, raw);
         let Some(e) = side.fence.entry_of(key) else {
             c.load();
             return Ok(c);
@@ -405,7 +413,8 @@ impl<'a> ZCursor<'a> {
             .side
             .page_bytes(self.page)
             .and_then(|page| page_view(page).ok());
-        let Some((opened, _, decoded)) = self.side.open_group(entry, &mut self.buf) else {
+        let Some((opened, _, decoded)) = self.side.open_group(self.memo, entry, &mut self.buf)
+        else {
             self.fall();
             return false;
         };
@@ -536,7 +545,7 @@ enum Opened<'a> {
     Borrowed(&'a [u8]),
     /// From the memo, or decoded into a buffer the memo now holds: `n`
     /// bytes of it.
-    Memo(Rc<GroupBuf>, usize),
+    Memo(Arc<GroupBuf>, usize),
 }
 
 impl Opened<'_> {
@@ -662,23 +671,30 @@ fn put_buf(b: GroupBuf) {
     ZBUF.with(|c| c.set(Some(b)));
 }
 
-/// The memo's slots, and its cap on the decoded bytes it holds, a thread.
+/// The memo's slots, and its cap on the decoded bytes it holds, a handle.
 pub(super) const ZMEMO_SLOTS: usize = 1024;
 pub(super) const ZMEMO_BYTES: usize = 8 << 20;
 
-/// The memo of decoded groups (3.7): a thread's, direct-mapped over its
-/// slots and capped at `cap` bytes of the groups it holds, keyed by the
+/// The memo of decoded groups (3.7): a reader handle's, direct-mapped over
+/// its slots and capped at `cap` bytes of the groups it holds, keyed by the
 /// sidecar's attach identity and the page. A hit hands back the group as
-/// it was decoded and pays the in-group walk alone; an entry is an `Rc`
+/// it was decoded and pays the in-group walk alone; an entry is an `Arc`
 /// to its buffer, so a read holds its group across a callback's nested
 /// read, which may displace the entry from the memo without taking the
 /// group away. A sidecar retired takes a new identity at its next attach,
 /// so its entries never hit again and are displaced as the slots turn
 /// over. The slot is the page plus a multiple of the identity, so one
 /// sidecar's pages collide only past the slot count and two sidecars'
-/// are offset from each other.
+/// are offset from each other. The slots are made at the first put, so a
+/// handle that reads no covered partition pays nothing for them.
+///
+/// A handle's and not a thread's: a thread's memo kept the groups of every
+/// store the thread had closed, ninety kilobytes a store in the leak test,
+/// where a handle's goes with the handle; and a handle is what the memory
+/// census counts by.
 struct Memo {
     slots: Vec<Option<MemoEntry>>,
+    n: usize,
     cap: usize,
     bytes: usize,
     /// Where the next displacement for the cap begins.
@@ -690,14 +706,15 @@ struct Memo {
 struct MemoEntry {
     side: u64,
     page: u32,
-    group: Rc<GroupBuf>,
+    group: Arc<GroupBuf>,
     len: usize,
 }
 
 impl Memo {
     fn new(slots: usize, cap: usize) -> Memo {
         Memo {
-            slots: (0..slots.max(1)).map(|_| None).collect(),
+            slots: Vec::new(),
+            n: slots.max(1),
             cap,
             bytes: 0,
             sweep: 0,
@@ -707,16 +724,19 @@ impl Memo {
     }
 
     fn slot(&self, side: u64, page: u32) -> usize {
-        (page as usize).wrapping_add((side as usize).wrapping_mul(0x9E37_79B9)) % self.slots.len()
+        (page as usize).wrapping_add((side as usize).wrapping_mul(0x9E37_79B9)) % self.n
     }
 
-    /// The group memoised for `(side, page)`, counted a hit or a miss.
-    fn get(&mut self, side: u64, page: u32) -> Option<(Rc<GroupBuf>, usize)> {
+    /// The group memoised for `(side, page)`, counted a hit.
+    fn get(&mut self, side: u64, page: u32) -> Option<(Arc<GroupBuf>, usize)> {
+        if self.slots.is_empty() {
+            return None;
+        }
         let i = self.slot(side, page);
         match &self.slots[i] {
             Some(e) if e.side == side && e.page == page => {
                 self.hits += 1;
-                Some((Rc::clone(&e.group), e.len))
+                Some((Arc::clone(&e.group), e.len))
             }
             _ => None,
         }
@@ -728,8 +748,11 @@ impl Memo {
     /// entries from a rotating sweep until the bytes held fit, the entry
     /// just put kept, so the bytes never exceed the cap unless this one
     /// group does.
-    fn put(&mut self, side: u64, page: u32, group: Rc<GroupBuf>, len: usize) {
+    fn put(&mut self, side: u64, page: u32, group: Arc<GroupBuf>, len: usize) {
         self.misses += 1;
+        if self.slots.is_empty() {
+            self.slots = (0..self.n).map(|_| None).collect();
+        }
         let i = self.slot(side, page);
         if let Some(old) = self.slots[i].take() {
             self.bytes -= old.len;
@@ -757,28 +780,39 @@ impl Memo {
     }
 }
 
-thread_local! {
-    /// The thread's memo: borrowed for a lookup or a put and never across
-    /// a decode or a callback.
-    static ZMEMO: RefCell<Memo> = RefCell::new(Memo::new(ZMEMO_SLOTS, ZMEMO_BYTES));
-}
+/// A handle's memo (`Memo`) behind a `RefCell`: borrowed for a lookup or a
+/// put and never across a decode or a callback, so a callback's nested
+/// read through the same handle finds it free.
+pub(super) struct ZMemo(RefCell<Memo>);
 
-/// The memo's hits and misses on this thread since the last take, for the
-/// handle's counters (`Reader::zpage_counts`: `memo_hits`, `memo_misses`).
-pub(super) fn memo_take() -> (u64, u64) {
-    ZMEMO.with(|m| {
-        let mut m = m.borrow_mut();
+impl ZMemo {
+    pub(super) fn new() -> ZMemo {
+        ZMemo(RefCell::new(Memo::new(ZMEMO_SLOTS, ZMEMO_BYTES)))
+    }
+
+    /// A test's: a memo of `slots` slots under `cap` bytes.
+    #[cfg(test)]
+    fn with(slots: usize, cap: usize) -> ZMemo {
+        ZMemo(RefCell::new(Memo::new(slots, cap)))
+    }
+
+    /// The hits and misses since the last take, for the handle's counters
+    /// (`Reader::zpage_counts`: `memo_hits`, `memo_misses`).
+    pub(super) fn take_counts(&self) -> (u64, u64) {
+        let mut m = self.0.borrow_mut();
         let r = (m.hits, m.misses);
         m.hits = 0;
         m.misses = 0;
         r
-    })
-}
+    }
 
-/// A test's: the thread's memo made anew with `slots` and `cap`.
-#[cfg(test)]
-fn memo_resize(slots: usize, cap: usize) {
-    ZMEMO.with(|m| *m.borrow_mut() = Memo::new(slots, cap));
+    fn get(&self, side: u64, page: u32) -> Option<(Arc<GroupBuf>, usize)> {
+        self.0.borrow_mut().get(side, page)
+    }
+
+    fn put(&self, side: u64, page: u32, group: Arc<GroupBuf>, len: usize) {
+        self.0.borrow_mut().put(side, page, group, len)
+    }
 }
 
 fn bit(map: &[AtomicU64], p: usize) -> bool {
@@ -1020,6 +1054,7 @@ impl ZSide {
     /// which a mapping never is; the caller answers a fallback.
     fn open_group<'a>(
         &'a self,
+        memo: &ZMemo,
         entry: &FenceEntry<'_>,
         buf: &'a mut GroupBuf,
     ) -> Option<(Opened<'a>, usize, bool)> {
@@ -1040,8 +1075,7 @@ impl ZSide {
             .map(|(h, _)| usize::from(h.count));
         if let (true, Some(count)) = (self.memo, compressed) {
             if was_verified {
-                let hit = ZMEMO.with(|m| m.borrow_mut().get(self.id, entry.page));
-                if let Some((g, n)) = hit {
+                if let Some((g, n)) = memo.get(self.id, entry.page) {
                     return Some((Opened::Memo(g, n), count, false));
                 }
             }
@@ -1064,8 +1098,8 @@ impl ZSide {
             if !was_verified {
                 set_bit(&self.verified, p);
             }
-            let g = Rc::new(fresh);
-            ZMEMO.with(|m| m.borrow_mut().put(self.id, entry.page, Rc::clone(&g), ulen));
+            let g = Arc::new(fresh);
+            memo.put(self.id, entry.page, Arc::clone(&g), ulen);
             return Some((Opened::Memo(g, ulen), count, true));
         }
         let opened = if was_verified {
@@ -1106,7 +1140,7 @@ impl ZSide {
     /// ranks, the entry's group opened, the walk to the record by
     /// `record_key_next`. A rank past the end is absent; an entry no page
     /// holds is the raw form's.
-    fn locate_rank<'a>(&'a self, rank: usize, buf: &'a mut GroupBuf) -> Locate<'a> {
+    fn locate_rank<'a>(&'a self, memo: &ZMemo, rank: usize, buf: &'a mut GroupBuf) -> Locate<'a> {
         if self.damaged.load(Ordering::Relaxed) {
             return Locate::Out;
         }
@@ -1121,7 +1155,7 @@ impl ZSide {
         }
         let p = entry.page as usize;
         let first = entry.first_rank as usize;
-        let Some((opened, _, decoded)) = self.open_group(&entry, buf) else {
+        let Some((opened, _, decoded)) = self.open_group(memo, &entry, buf) else {
             return Locate::Fallback;
         };
         let mut off = 0usize;
@@ -1142,7 +1176,7 @@ impl ZSide {
 
     /// Where `key` lies among the records of this partition, opening the
     /// one page that could hold it.
-    fn locate<'a>(&'a self, key: &[u8], buf: &'a mut GroupBuf) -> Locate<'a> {
+    fn locate<'a>(&'a self, memo: &ZMemo, key: &[u8], buf: &'a mut GroupBuf) -> Locate<'a> {
         if self.damaged.load(Ordering::Relaxed) {
             return Locate::Out;
         }
@@ -1176,7 +1210,7 @@ impl ZSide {
             self.fail(p);
             return Locate::Fallback;
         };
-        let Some((opened, count, decoded)) = self.open_group(&entry, buf) else {
+        let Some((opened, count, decoded)) = self.open_group(memo, &entry, buf) else {
             return Locate::Fallback;
         };
         let pos = match group_seek(opened.bytes(), count, key) {
@@ -1202,12 +1236,13 @@ impl ZSide {
     /// run that lies in one of its blocks, as the raw form does.
     pub(super) fn read_all<F: FnMut(&[u8])>(
         &self,
+        memo: &ZMemo,
         raw: &Blob<MmapBytes>,
         key: &[u8],
         f: &mut F,
     ) -> Result<ZRead> {
         let mut buf = take_buf();
-        let r = match self.locate(key, &mut buf) {
+        let r = match self.locate(memo, key, &mut buf) {
             Locate::Absent { decoded } => Ok(ZRead::Served { n: 0, decoded }),
             Locate::Out => Ok(ZRead::Out),
             Locate::Fallback => Ok(ZRead::Fallback),
@@ -1234,9 +1269,9 @@ impl ZSide {
     }
 
     /// How many values `key` has in this partition.
-    pub(super) fn count(&self, key: &[u8]) -> ZRead {
+    pub(super) fn count(&self, memo: &ZMemo, key: &[u8]) -> ZRead {
         let mut buf = take_buf();
-        let r = match self.locate(key, &mut buf) {
+        let r = match self.locate(memo, key, &mut buf) {
             Locate::Absent { decoded } => ZRead::Served { n: 0, decoded },
             Locate::Out => ZRead::Out,
             Locate::Fallback => ZRead::Fallback,
@@ -1278,6 +1313,7 @@ impl ZSide {
     /// in a block, which the raw form reads as it would.
     pub(super) fn scan_at<F: FnMut(&[u8], &[u8])>(
         &self,
+        memo: &ZMemo,
         raw: &Blob<MmapBytes>,
         from: usize,
         limit: usize,
@@ -1294,15 +1330,17 @@ impl ZSide {
             return Ok(out);
         }
         let mut buf = take_buf();
-        let r = self.scan_in(raw, from, limit, f, &mut buf, &mut out);
+        let r = self.scan_in(memo, raw, from, limit, f, &mut buf, &mut out);
         put_buf(buf);
         r.map(|()| out)
     }
 
     /// The walk of `scan_at`, with the thread's buffer lent to it; a check
     /// that fails ends it at a record boundary with `out.end` saying so.
+    #[allow(clippy::too_many_arguments)]
     fn scan_in<F: FnMut(&[u8], &[u8])>(
         &self,
+        memo: &ZMemo,
         raw: &Blob<MmapBytes>,
         from: usize,
         limit: usize,
@@ -1348,7 +1386,7 @@ impl ZSide {
                 continue;
             }
             let p = entry.page as usize;
-            let Some((opened, _, decoded)) = self.open_group(&entry, buf) else {
+            let Some((opened, _, decoded)) = self.open_group(memo, &entry, buf) else {
                 out.end = ScanEnd::Fallback;
                 return Ok(());
             };
@@ -1388,12 +1426,13 @@ impl ZSide {
     /// scan's emit of one partition record asks (`Reader::emit_unsealed`).
     pub(super) fn values_at<F: FnMut(&[u8])>(
         &self,
+        memo: &ZMemo,
         raw: &Blob<MmapBytes>,
         rank: usize,
         f: &mut F,
     ) -> Result<ZRead> {
         let mut buf = take_buf();
-        let r = match self.locate_rank(rank, &mut buf) {
+        let r = match self.locate_rank(memo, rank, &mut buf) {
             Locate::Absent { decoded } => Ok(ZRead::Served { n: 0, decoded }),
             Locate::Out => Ok(ZRead::Out),
             Locate::Fallback => Ok(ZRead::Fallback),
@@ -1427,7 +1466,7 @@ impl ZSide {
     /// record. The seek takes the fence (heap) and the one page the key
     /// falls in, where the ordered index takes its heads and a key read of
     /// the raw records for each probe.
-    pub(super) fn seek(&self, key: &[u8]) -> ZSeek {
+    pub(super) fn seek(&self, memo: &ZMemo, key: &[u8]) -> ZSeek {
         if self.damaged.load(Ordering::Relaxed) {
             return ZSeek::Out;
         }
@@ -1461,7 +1500,7 @@ impl ZSide {
             };
         }
         let mut buf = take_buf();
-        let r = match self.open_group(&entry, &mut buf) {
+        let r = match self.open_group(memo, &entry, &mut buf) {
             None => ZSeek::Fallback,
             Some((opened, count, decoded)) => match group_seek(opened.bytes(), count, key) {
                 Ok(pos) => ZSeek::Served {
@@ -1488,7 +1527,7 @@ impl ZSide {
     /// rank's key compares to `uk`. The seek answers for the whole
     /// partition: a rank below `rank` means the key at `rank` is past `uk`,
     /// since the keys are distinct and ascend.
-    pub(super) fn cut_in(&self, rank: usize, end: usize, uk: &[u8]) -> ZSeek {
+    pub(super) fn cut_in(&self, memo: &ZMemo, rank: usize, end: usize, uk: &[u8]) -> ZSeek {
         if rank >= end {
             return ZSeek::Served {
                 rank: end,
@@ -1496,7 +1535,7 @@ impl ZSide {
                 decoded: false,
             };
         }
-        match self.seek(uk) {
+        match self.seek(memo, uk) {
             ZSeek::Served {
                 rank: r,
                 at,
@@ -2523,6 +2562,8 @@ mod tests {
         out: PathBuf,
         blob: Blob<MmapBytes>,
         recs: Vec<Rec>,
+        /// The handle's memo the tests read through.
+        memo: ZMemo,
     }
 
     impl Fixture {
@@ -2537,6 +2578,7 @@ mod tests {
                 seg,
                 blob,
                 recs,
+                memo: ZMemo::new(),
             }
         }
 
@@ -2577,10 +2619,15 @@ mod tests {
     }
 
     /// What the sidecar answers for `key`, or `None` where it declines.
-    fn z_values(side: &ZSide, blob: &Blob<MmapBytes>, key: &[u8]) -> Option<Vec<Vec<u8>>> {
+    fn z_values(
+        memo: &ZMemo,
+        side: &ZSide,
+        blob: &Blob<MmapBytes>,
+        key: &[u8],
+    ) -> Option<Vec<Vec<u8>>> {
         let mut v = Vec::new();
         match side
-            .read_all(blob, key, &mut |x: &[u8]| v.push(x.to_vec()))
+            .read_all(memo, blob, key, &mut |x: &[u8]| v.push(x.to_vec()))
             .unwrap()
         {
             ZRead::Served { n, .. } => {
@@ -2622,16 +2669,16 @@ mod tests {
 
     /// Every probe answers as the segment's own reader answers it, values
     /// and count both.
-    fn agree(side: &ZSide, blob: &Blob<MmapBytes>, recs: &[Rec]) {
+    fn agree(memo: &ZMemo, side: &ZSide, blob: &Blob<MmapBytes>, recs: &[Rec]) {
         for key in probes(recs) {
             let want = raw_values(blob, &key);
             assert_eq!(
-                z_values(side, blob, &key).as_ref(),
+                z_values(memo, side, blob, &key).as_ref(),
                 Some(&want),
                 "read of {key:?}"
             );
             assert_eq!(
-                served(side.count(&key)),
+                served(side.count(memo, &key)),
                 blob.count(&key).unwrap(),
                 "count of {key:?}"
             );
@@ -2648,12 +2695,12 @@ mod tests {
             let fx = Fixture::new(name, recs, inline);
             let side = fx.side();
             assert!(side.pages() > 1, "{name}: more than one page");
-            agree(&side, &fx.blob, &fx.recs);
+            agree(&fx.memo, &side, &fx.blob, &fx.recs);
             // Every page a read opened was checked, once, and none failed.
             assert!(side.verified_pages() > 0 && side.bad_pages() == 0);
             // The second pass finds every page verified and answers the same.
             let before = side.verified_pages();
-            agree(&side, &fx.blob, &fx.recs);
+            agree(&fx.memo, &side, &fx.blob, &fx.recs);
             assert_eq!(side.verified_pages(), before, "{name}");
         }
     }
@@ -2693,7 +2740,7 @@ mod tests {
         for (k, vals, _) in &fx.recs {
             let mut got = 0usize;
             match side
-                .read_all(&fx.blob, k, &mut |_: &[u8]| got += 1)
+                .read_all(&fx.memo, &fx.blob, k, &mut |_: &[u8]| got += 1)
                 .unwrap()
             {
                 ZRead::Served { n, .. } => {
@@ -2751,13 +2798,13 @@ mod tests {
             };
             assert_eq!(b.fill.nopages, 1, "{name}");
             let side = fx.attach().unwrap();
-            assert_eq!(side.count(b"zzz-big"), ZRead::NoPage, "{name}");
+            assert_eq!(side.count(&fx.memo, b"zzz-big"), ZRead::NoPage, "{name}");
             assert_eq!(
-                z_values(&side, &fx.blob, b"zzz-big"),
+                z_values(&fx.memo, &side, &fx.blob, b"zzz-big"),
                 None,
                 "{name}: the read is the raw form's"
             );
-            agree(&side, &fx.blob, &fx.recs[..300]);
+            agree(&fx.memo, &side, &fx.blob, &fx.recs[..300]);
             let alone = Fixture::new(
                 &format!("{name}-alone"),
                 vec![(b"zzz-big".to_vec(), vec![big], false)],
@@ -2788,13 +2835,13 @@ mod tests {
         };
         assert!(b.fill.stored > 0, "stored pages");
         let side = fx.attach_nomemo().unwrap();
-        agree(&side, &fx.blob, &fx.recs);
+        agree(&fx.memo, &side, &fx.blob, &fx.recs);
         // A stored page is parsed where it lies: nothing is decoded. (The
         // memo off, so that the compressed page beside it decodes again.)
         let key = &fx.recs[fx.recs.len() / 2].0;
         let mut seen = 0;
         let r = side
-            .read_all(&fx.blob, key, &mut |_: &[u8]| seen += 1)
+            .read_all(&fx.memo, &fx.blob, key, &mut |_: &[u8]| seen += 1)
             .unwrap();
         assert_eq!(seen, 1);
         let ZRead::Served { decoded, .. } = r else {
@@ -2900,13 +2947,13 @@ mod tests {
         let side = fx.side();
         let (a, b) = (&fx.recs[10], &fx.recs[2500]);
         // The memo one slot wide: the inner read's put displaces the outer
-        // group's entry, which the outer read holds through its `Rc`.
-        memo_resize(1, ZMEMO_BYTES);
+        // group's entry, which the outer read holds through its `Arc`.
+        let small = ZMemo::with(1, ZMEMO_BYTES);
         let mut seen = false;
         let r = side
-            .read_all(&fx.blob, &a.0, &mut |outer: &[u8]| {
+            .read_all(&small, &fx.blob, &a.0, &mut |outer: &[u8]| {
                 assert_eq!(outer, &a.1[0][..]);
-                let inner = z_values(&side, &fx.blob, &b.0).unwrap();
+                let inner = z_values(&small, &side, &fx.blob, &b.0).unwrap();
                 assert_eq!(inner, b.1);
                 // Read again byte by byte, volatile: a slice lent for a call
                 // is one the compiler may take to be unchanged under any
@@ -2921,7 +2968,6 @@ mod tests {
             })
             .unwrap();
         assert!(seen && served(r) == 1);
-        memo_resize(ZMEMO_SLOTS, ZMEMO_BYTES);
     }
 
     /// The memo: a direct-mapped table under a byte cap. An entry put is
@@ -2930,7 +2976,7 @@ mod tests {
     /// the entry just put kept, and the hits and misses count.
     #[test]
     fn the_memo_holds_its_cap_and_counts_its_hits() {
-        let g = |n: usize| (Rc::new(GroupBuf::new()), n);
+        let g = |n: usize| (Arc::new(GroupBuf::new()), n);
         let mut m = Memo::new(8, 100);
         assert!(m.get(1, 0).is_none());
         let (b, n) = g(40);
@@ -2943,7 +2989,10 @@ mod tests {
         // eight apart put a page in one slot. Only the side compare tells
         // them apart, and this is the one way to reach it.
         assert_eq!(m.slot(1, 0), m.slot(9, 0), "the collision this builds");
-        assert!(m.get(9, 0).is_none(), "another sidecar's page 0, in the same slot");
+        assert!(
+            m.get(9, 0).is_none(),
+            "another sidecar's page 0, in the same slot"
+        );
         let (b, n) = g(40);
         m.put(1, 1, b, n);
         assert_eq!(m.bytes, 80);
@@ -2981,11 +3030,13 @@ mod tests {
             .filter(|&p| page_view(side.page_bytes(p).unwrap()).unwrap().0.stored)
             .count() as u64;
         assert_eq!(stored, 0, "the suite's values compress");
-        memo_take();
+        fx.memo.take_counts();
         let read_all = |side: &ZSide| {
             let mut decoded = 0u64;
             for r in &fx.recs {
-                let got = side.read_all(&fx.blob, &r.0, &mut |_: &[u8]| {}).unwrap();
+                let got = side
+                    .read_all(&fx.memo, &fx.blob, &r.0, &mut |_: &[u8]| {})
+                    .unwrap();
                 match got {
                     ZRead::Served { n, decoded: d } => {
                         assert_eq!(n, r.1.len() as u64);
@@ -2998,7 +3049,7 @@ mod tests {
         };
         let n = fx.recs.len() as u64;
         let d1 = read_all(&side);
-        let (h1, m1) = memo_take();
+        let (h1, m1) = fx.memo.take_counts();
         assert_eq!(
             (m1, d1, h1 + m1),
             (pages, pages, n),
@@ -3006,21 +3057,21 @@ mod tests {
         );
         let d2 = read_all(&side);
         assert_eq!(
-            (memo_take(), d2),
+            (fx.memo.take_counts(), d2),
             ((n, 0), 0),
             "the second pass hits for every read"
         );
         let other = fx.attach().unwrap();
         let d3 = read_all(&other);
         assert_eq!(
-            (memo_take(), d3),
+            (fx.memo.take_counts(), d3),
             ((n - pages, pages), pages),
             "a new identity misses every page once"
         );
         let off = ZSide::attach(&fx.out, &fx.blob, ID, END, false, false).unwrap();
         let d4 = read_all(&off);
         assert_eq!(
-            (memo_take(), d4),
+            (fx.memo.take_counts(), d4),
             ((0, 0), n),
             "the memo off: every read decodes"
         );
@@ -3233,7 +3284,7 @@ mod tests {
         std::fs::write(&fx.out, &good).unwrap();
         with_trailer(&fx.out, |t| t.total_ulen += 1);
         let side = fx.attach().unwrap_or_else(|e| panic!("total_ulen: {e:?}"));
-        agree(&side, &fx.blob, &fx.recs);
+        agree(&fx.memo, &side, &fx.blob, &fx.recs);
         // The file as built still attaches.
         std::fs::write(&fx.out, &good).unwrap();
         let side = fx.attach().unwrap();
@@ -3317,7 +3368,7 @@ mod tests {
                         }
                         let mut got = Vec::new();
                         match side
-                            .read_all(&fx.blob, k, &mut |v: &[u8]| got.push(v.to_vec()))
+                            .read_all(&fx.memo, &fx.blob, k, &mut |v: &[u8]| got.push(v.to_vec()))
                             .unwrap()
                         {
                             ZRead::Served { .. } => assert_eq!(&got, vals, "key {i}"),
@@ -3490,7 +3541,7 @@ mod tests {
                 .expect("an unsampled page is not looked at by the attach");
             let mut declined = 0;
             for (k, vals, _) in &on_page {
-                match z_values(&side, &fx.blob, k) {
+                match z_values(&fx.memo, &side, &fx.blob, k) {
                     Some(got) => assert_eq!(&got, vals, "{name}: {k:?} answered {got:?}"),
                     None => declined += 1,
                 }
@@ -3547,14 +3598,14 @@ mod tests {
         let key = fx.recs[entry.first_rank as usize + 1].0.clone();
         let mut got = 0;
         let r = side
-            .read_all(&fx.blob, &key, &mut |_: &[u8]| got += 1)
+            .read_all(&fx.memo, &fx.blob, &key, &mut |_: &[u8]| got += 1)
             .unwrap();
         assert_eq!((r, got), (ZRead::Fallback, 0));
         assert_eq!(side.verified_pages(), 0, "a page that failed is verified");
         assert_eq!(side.bad_pages(), 1);
         assert!(side.damaged());
         // The sidecar is out of service, and what it is asked verifies nothing.
-        assert_eq!(side.count(&fx.recs[0].0), ZRead::Out);
+        assert_eq!(side.count(&fx.memo, &fx.recs[0].0), ZRead::Out);
         assert_eq!(side.verified_pages(), 0);
     }
 
@@ -3574,7 +3625,7 @@ mod tests {
         let entry = side.fence.entry(p, side.nkeys as u32).unwrap();
         let (first_rank, count) = (entry.first_rank, entry.count as usize);
         let k = fx.recs[first_rank as usize + 3].clone();
-        assert_eq!(z_values(&side, &fx.blob, &k.0), Some(k.1.clone()));
+        assert_eq!(z_values(&fx.memo, &side, &fx.blob, &k.0), Some(k.1.clone()));
         assert_eq!(side.verified_pages(), 1);
         // The page rewritten whole under the open mapping: its last record is
         // cut in the middle, and the header still says `count` of them.
@@ -3586,7 +3637,7 @@ mod tests {
         let (mut served, mut declined) = (0, 0);
         for i in 0..count {
             let (key, vals, _) = &fx.recs[first_rank as usize + i];
-            match z_values(&side, &fx.blob, key) {
+            match z_values(&fx.memo, &side, &fx.blob, key) {
                 Some(got) => {
                     assert_eq!(
                         &got, vals,
@@ -3622,7 +3673,10 @@ mod tests {
         let entry = side.fence.entry(p, side.nkeys as u32).unwrap();
         let (first_rank, count) = (entry.first_rank, entry.count as u16);
         let (key, vals, _) = fx.recs[first_rank as usize + 3].clone();
-        assert_eq!(z_values(&side, &fx.blob, &key), Some(vals.clone()));
+        assert_eq!(
+            z_values(&fx.memo, &side, &fx.blob, &key),
+            Some(vals.clone())
+        );
         assert_eq!(side.verified_pages(), 1);
         let mut images = page_images(&good, p, t.bind32());
         // The compact header follows the key at the next multiple of four:
@@ -3639,12 +3693,12 @@ mod tests {
         forge(&fx.out, p, first_rank, count, &images);
         let mut got = 0;
         let r = side
-            .read_all(&fx.blob, &key, &mut |_: &[u8]| got += 1)
+            .read_all(&fx.memo, &fx.blob, &key, &mut |_: &[u8]| got += 1)
             .unwrap();
         assert_eq!((r, got), (ZRead::Fallback, 0));
         assert!(side.damaged() && side.bad_pages() == 1);
         // The records before it in the group were answered while it held.
-        assert_eq!(side.count(&key), ZRead::Out);
+        assert_eq!(side.count(&fx.memo, &key), ZRead::Out);
     }
 
     #[test]
@@ -3803,9 +3857,13 @@ mod tests {
                         .unwrap();
                     let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
                     let z = side
-                        .scan_at(&fx.blob, from, limit, &mut |k: &[u8], v: &[u8]| {
-                            got.push((k.to_vec(), v.to_vec()))
-                        })
+                        .scan_at(
+                            &fx.memo,
+                            &fx.blob,
+                            from,
+                            limit,
+                            &mut |k: &[u8], v: &[u8]| got.push((k.to_vec(), v.to_vec())),
+                        )
                         .unwrap();
                     assert_eq!(z.end, ScanEnd::Served, "{name}: from {from} limit {limit}");
                     assert_eq!(
@@ -3818,9 +3876,11 @@ mod tests {
             // A walk across the record no page holds hands the raw form
             // exactly its run, once; the suite's shape never does.
             let mut sink = |_: &[u8], _: &[u8]| {};
-            memo_take();
-            let z = side.scan_at(&fx.blob, 0, usize::MAX, &mut sink).unwrap();
-            let (hits, _) = memo_take();
+            fx.memo.take_counts();
+            let z = side
+                .scan_at(&fx.memo, &fx.blob, 0, usize::MAX, &mut sink)
+                .unwrap();
+            let (hits, _) = fx.memo.take_counts();
             assert_eq!(z.nopage, u64::from(name == "scan-nopage"), "{name}");
             assert!(z.decoded + hits > 1, "{name}: {z:?}, {hits} from the memo");
             assert!(!side.damaged());
@@ -3851,7 +3911,7 @@ mod tests {
                 } else {
                     KeyOrder::Greater
                 };
-                let got = side.seek(&key);
+                let got = side.seek(&fx.memo, &key);
                 assert!(
                     matches!(got, ZSeek::Served { rank, at, .. } if rank == want && at == want_at),
                     "{name}: seek of {key:?}: {got:?}, wanted {want} {want_at:?}"
@@ -3865,7 +3925,7 @@ mod tests {
                     } else {
                         KeyOrder::Greater
                     };
-                    let got = side.cut_in(rank, end, &key);
+                    let got = side.cut_in(&fx.memo, rank, end, &key);
                     assert!(
                         matches!(got, ZSeek::Served { rank, at: a, .. } if rank == r && a == at),
                         "{name}: cut of {key:?} in {rank}..{end}: {got:?}, wanted {r} {at:?}"
@@ -3877,7 +3937,9 @@ mod tests {
                 let raw_n = fx.blob.values_at(rank, |v| want.push(v.to_vec())).unwrap();
                 let mut got = Vec::new();
                 let z = side
-                    .values_at(&fx.blob, rank, &mut |v: &[u8]| got.push(v.to_vec()))
+                    .values_at(&fx.memo, &fx.blob, rank, &mut |v: &[u8]| {
+                        got.push(v.to_vec())
+                    })
                     .unwrap();
                 if fx.recs.get(rank).is_some_and(|r| r.0 == big) {
                     assert_eq!(z, ZRead::NoPage, "{name}: rank {rank}");
@@ -3913,7 +3975,7 @@ mod tests {
             let n = fx.recs.len();
             let nopage = u64::from(name == "cursor-nopage");
             for start in (0..n + 3).step_by(53) {
-                let mut c = ZCursor::at(&side, &fx.blob, start);
+                let mut c = ZCursor::at(&fx.memo, &side, &fx.blob, start);
                 let mut rank = start;
                 loop {
                     assert_eq!(c.rank(), rank, "{name}: from {start}");
@@ -3942,10 +4004,10 @@ mod tests {
                 // The seek to a key lands where the raw form's does, and so
                 // does one to a key between records.
                 let k = &fx.recs[start.min(n - 1)].0;
-                let c = ZCursor::seek(&side, &fx.blob, k).unwrap();
+                let c = ZCursor::seek(&fx.memo, &side, &fx.blob, k).unwrap();
                 assert_eq!((c.rank(), c.key()), (start.min(n - 1), Some(k.as_slice())));
                 let between = [k.as_slice(), &[0u8]].concat();
-                let c = ZCursor::seek(&side, &fx.blob, &between).unwrap();
+                let c = ZCursor::seek(&fx.memo, &side, &fx.blob, &between).unwrap();
                 assert_eq!(
                     c.rank(),
                     fx.blob.seek(&between),
@@ -3953,9 +4015,9 @@ mod tests {
                 );
                 assert_eq!(c.key(), fx.blob.key_at(c.rank()));
             }
-            let c = ZCursor::seek(&side, &fx.blob, b"").unwrap();
+            let c = ZCursor::seek(&fx.memo, &side, &fx.blob, b"").unwrap();
             assert_eq!(c.rank(), 0);
-            let c = ZCursor::seek(&side, &fx.blob, &[0xffu8; 8]).unwrap();
+            let c = ZCursor::seek(&fx.memo, &side, &fx.blob, &[0xffu8; 8]).unwrap();
             assert_eq!((c.rank(), c.key()), (n, None));
             assert!(!side.damaged());
             // A page flipped under the cursor: the first check that fails
@@ -3970,7 +4032,7 @@ mod tests {
             let side = fx
                 .attach()
                 .expect("the sample does not reach the flipped page");
-            let mut c = ZCursor::at(&side, &fx.blob, 0);
+            let mut c = ZCursor::at(&fx.memo, &side, &fx.blob, 0);
             for rank in 0..n {
                 assert_eq!(c.key(), fx.blob.key_at(rank), "{name}: flipped, at {rank}");
                 let mut want = Vec::new();
@@ -3982,8 +4044,8 @@ mod tests {
             }
             assert_eq!((c.key(), c.rank()), (None, n));
             assert!(c.fell_back() && side.damaged(), "{name}: the flip was met");
-            assert_eq!(side.seek(b"0"), ZSeek::Out);
-            assert!(ZCursor::seek(&side, &fx.blob, b"0").is_err());
+            assert_eq!(side.seek(&fx.memo, b"0"), ZSeek::Out);
+            assert!(ZCursor::seek(&fx.memo, &side, &fx.blob, b"0").is_err());
             std::fs::write(&fx.out, &good).unwrap();
         }
     }
@@ -4007,6 +4069,7 @@ mod tests {
         assert!(fx.out.exists() && !tmp_of(&fx.out).exists());
         let side = fx.attach().unwrap();
         agree(
+            &fx.memo,
             &side,
             &fx.blob,
             &fx.recs
@@ -4015,18 +4078,18 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>(),
         );
-        assert_eq!(side.count(big), ZRead::NoPage);
+        assert_eq!(side.count(&fx.memo, big), ZRead::NoPage);
         // A key in the entry's range that is not the record's is absent
         // from the fence alone, and the record's own key is the raw form's.
         let above = [&big[..], &[0xffu8]].concat();
         assert_eq!(
-            side.count(&above),
+            side.count(&fx.memo, &above),
             ZRead::Served {
                 n: 0,
                 decoded: false
             }
         );
-        assert_eq!(z_values(&side, &fx.blob, big), None);
+        assert_eq!(z_values(&fx.memo, &side, &fx.blob, big), None);
         // The entry's page number is no page, and the pages after it are
         // numbered on from the one before.
         let e = side.fence.entry_of(big).unwrap();
@@ -4049,7 +4112,7 @@ mod tests {
         let side = fx
             .attach()
             .expect("a sidecar built over a stale temp file attaches");
-        agree(&side, &fx.blob, &fx.recs);
+        agree(&fx.memo, &side, &fx.blob, &fx.recs);
         assert!(!tmp_of(&fx.out).exists());
     }
 
@@ -4237,7 +4300,7 @@ mod tests {
             for (k, vals, _) in fx.recs.iter().step_by(11) {
                 let mut got = Vec::new();
                 let r = side
-                    .read_all(&fx.blob, k, &mut |v: &[u8]| got.push(v.to_vec()))
+                    .read_all(&fx.memo, &fx.blob, k, &mut |v: &[u8]| got.push(v.to_vec()))
                     .unwrap();
                 if stored(side, k) {
                     assert_eq!(
@@ -4245,11 +4308,15 @@ mod tests {
                         (ZRead::Fallback, 0),
                         "{what}: read of {k:?}"
                     );
-                    assert_eq!(side.count(k), ZRead::Fallback, "{what}: count of {k:?}");
+                    assert_eq!(
+                        side.count(&fx.memo, k),
+                        ZRead::Fallback,
+                        "{what}: count of {k:?}"
+                    );
                     refusals += 1;
                 } else {
                     assert_eq!(&got, vals, "{what}: read of {k:?}");
-                    assert_eq!(served(side.count(k)), vals.len() as u64);
+                    assert_eq!(served(side.count(&fx.memo, k)), vals.len() as u64);
                     answers += 1;
                 }
             }
@@ -4279,7 +4346,7 @@ mod tests {
         for (k, vals, _) in &fx.recs {
             let mut got = Vec::new();
             let r = side
-                .read_all(&fx.blob, k, &mut |v: &[u8]| got.push(v.to_vec()))
+                .read_all(&fx.memo, &fx.blob, k, &mut |v: &[u8]| got.push(v.to_vec()))
                 .unwrap();
             let want = ZRead::Served {
                 n: vals.len() as u64,
@@ -4297,9 +4364,9 @@ mod tests {
         // A source that has no such page at all is the sidecar's damage.
         side.skewed = Some((Vec::new(), 0));
         let k = &fx.recs[fx.recs.len() / 2].0;
-        assert_eq!(side.count(k), ZRead::Fallback);
+        assert_eq!(side.count(&fx.memo, k), ZRead::Fallback);
         assert!(side.damaged() && side.bad_pages() == 1);
-        assert_eq!(side.count(k), ZRead::Out);
+        assert_eq!(side.count(&fx.memo, k), ZRead::Out);
     }
 
     #[test]
@@ -4361,11 +4428,17 @@ mod tests {
         for (i, (key, vals, _)) in fx.recs.iter().enumerate() {
             let mut got = Vec::new();
             let r = side
-                .read_all(&fx.blob, key, &mut |v: &[u8]| got.push(v.to_vec()))
+                .read_all(&fx.memo, &fx.blob, key, &mut |v: &[u8]| {
+                    got.push(v.to_vec())
+                })
                 .unwrap();
             if (lo..hi).contains(&i) {
                 assert_eq!((r, got.len()), (ZRead::NoPage, 0), "record {i}");
-                assert_eq!(side.count(key), ZRead::NoPage, "count of record {i}");
+                assert_eq!(
+                    side.count(&fx.memo, key),
+                    ZRead::NoPage,
+                    "count of record {i}"
+                );
                 declined += 1;
             } else {
                 assert_eq!(&got, vals, "record {i}");
@@ -4383,7 +4456,7 @@ mod tests {
         // entry covers more than one record: asked with the filter set
         // aside.
         let inside = [fx.recs[lo].0.as_slice(), &[0u8]].concat();
-        let answer = side.count(&inside);
+        let answer = side.count(&fx.memo, &inside);
         assert!(
             answer
                 == ZRead::Served {
@@ -4396,7 +4469,7 @@ mod tests {
         let mut side = side;
         side.filter = None;
         assert_eq!(
-            side.count(&inside),
+            side.count(&fx.memo, &inside),
             ZRead::NoPage,
             "the fence's own answer for a key in a run of several records"
         );

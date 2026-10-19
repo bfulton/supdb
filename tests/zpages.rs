@@ -2361,9 +2361,11 @@ fn the_memo_serves_repeated_reads_of_a_partition_and_off_every_read_decodes() {
                 reads,
                 "every read opened a page through the memo: {c:?}"
             );
+            // The writer and the handle each keep a memo of their own, so
+            // each decodes a page once.
             assert!(
-                c.memo_misses >= 1 && c.memo_misses <= c0.pages,
-                "a miss a page at most: {c:?}"
+                c.memo_misses >= 1 && c.memo_misses <= 2 * c0.pages,
+                "a miss a page a handle at most: {c:?}"
             );
             assert_eq!(decodes, c.memo_misses, "a decode a miss: {c:?}");
             assert!(c.memo_hits >= reads * 9 / 10, "the rest hits: {c:?}");
