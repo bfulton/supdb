@@ -1,0 +1,213 @@
+From b26b7fc23ff43b7a76bcb69251c3be15f5cd667b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 22:55:13 +0000
+Subject: [PATCH 5/6] hunt: tools to run the reproducers against any commit of
+ the history
+
+scripts/hunt_bisect0/at_commit.sh builds tests/hunt_bisect0.rs or
+tests/hunt_cuts.rs against the sources of a commit, in a target directory
+of its own: a shared one links the library an earlier export built, since
+the root package's artifact name does not depend on the checkout path and
+git archive gives the files their commit times. hookport.pl puts the
+forcing pause of the snapshot schedule into a commit that has the
+published forms; diagport.pl puts the stale-cut counter into one that has
+rebase_tables. The test file gets a switch for the commits that can hold
+a seal but cannot count the frozen tables.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011ZkLidS5BYuaBXVcvPAkdd
+---
+ scripts/hunt_bisect0/at_commit.sh | 66 +++++++++++++++++++++++++++++++
+ scripts/hunt_bisect0/diagport.pl  | 43 ++++++++++++++++++++
+ scripts/hunt_bisect0/hookport.pl  | 32 +++++++++++++++
+ tests/hunt_bisect0.rs             |  5 ++-
+ 4 files changed, 144 insertions(+), 2 deletions(-)
+ create mode 100644 scripts/hunt_bisect0/at_commit.sh
+ create mode 100644 scripts/hunt_bisect0/diagport.pl
+ create mode 100644 scripts/hunt_bisect0/hookport.pl
+
+diff --git a/scripts/hunt_bisect0/at_commit.sh b/scripts/hunt_bisect0/at_commit.sh
+new file mode 100644
+index 0000000..2a621fc
+--- /dev/null
++++ b/scripts/hunt_bisect0/at_commit.sh
+@@ -0,0 +1,66 @@
++#!/bin/sh
++# A hunt branch's tool, never for a merge: builds tests/hunt_bisect0.rs (or tests/hunt_cuts.rs) against the sources of any
++# commit of the history, without touching the worktree, and prints the path of the test executable.
++#
++#   sh scripts/hunt_bisect0/at_commit.sh COMMIT KIND [PORT [TEST]]
++#
++# KIND names the option switches the commit has (the file's header says what each sets):
++#   z  none                                                      (109d921 and before)
++#   f  commit_forms only                                         (069eecb)
++#   s  share_snapshot and commit_forms                           (eeda338, 23115e7)
++#   o  every switch, the seal cannot be held                     (39401bb .. 39b8f17)
++#   l  as o, and the eager carry (HUNT_EAGER=1)                  (e607e70 only)
++#   m  every switch, the seal can be held, no frozen_tables      (b6b259d .. 7b03182)
++#   n  every switch, the seal can be held                        (758fcd3 and after)
++# PORT is hook (the forcing pause of the snapshot schedule: HUNT_SCAN_AFTER_CHECK_MS between a Snapshot handle's one check
++# of the published forms' position and its load of a form), diag (HUNT_CHECK_CUTS=1: the rebase of a rewritten partition
++# counts the filed keys it carries and the cuts that are not the new partition's), or plain (the default).
++# TEST is hunt_bisect0 (the default) or hunt_cuts (the deterministic stale-cut schedule; KIND o, m or n).
++#
++# The snapshot schedule, on a binary built with hook: HUNT_SCAN_AFTER_CHECK_MS=300 HUNT_CYCLES=3, with HUNT_UPKEEP=bg1
++# where the upkeep thread is to do the publishing, or HUNT_THREADED=1 HUNT_READER_DELAY_MS=0 where the writer's own
++# commit is (the first scan on a thread of its own); the cycles that fail are counted on the HUNT-CYCLES line.
++#
++# Every build has a target directory of its own, removed after the executable is copied out. A shared one is wrong here:
++# the root package's artifact name does not depend on the checkout path, `git archive` gives the files their commit
++# times, and cargo then takes the library an earlier export built (older commit or newer, same flags) as fresh and links
++# the test against it -- two exports that differed in one string constant both linked the first one's.
++set -eu
++COMMIT="$1"; KIND="$2"; PORT="${3:-plain}"; TEST="${4:-hunt_bisect0}"
++HERE="$(cd "$(dirname "$0")" && pwd)"
++REPO="$(cd "$HERE/../.." && pwd)"
++OUT="${HUNT_OUT:-${TMPDIR:-/tmp}/hunt_bisect0}"
++case "$KIND" in
++  z) RF="--cfg hunt_old" ;;
++  f) RF="--cfg hunt_forms --cfg hunt_old" ;;
++  s) RF="--cfg hunt_share --cfg hunt_forms --cfg hunt_old" ;;
++  o) RF="--cfg hunt_opts --cfg hunt_rebase --cfg hunt_carry --cfg hunt_old" ;;
++  l) RF="--cfg hunt_opts --cfg hunt_rebase --cfg hunt_carry --cfg hunt_old --cfg hunt_lazy" ;;
++  m) RF="--cfg hunt_opts --cfg hunt_rebase --cfg hunt_carry --cfg hunt_nofrozen" ;;
++  n) RF="--cfg hunt_opts --cfg hunt_rebase --cfg hunt_carry" ;;
++  *) echo "unknown kind $KIND" >&2; exit 2 ;;
++esac
++SHA="$(git -C "$REPO" rev-parse --short "$COMMIT")"
++X="$OUT/src-$SHA-$PORT-$TEST"
++rm -rf "$X"; mkdir -p "$X/tests" "$OUT/bin"
++git -C "$REPO" archive --format=tar "$COMMIT" Cargo.toml Cargo.lock src | tar -x -C "$X"
++case "$PORT" in
++  hook) perl "$HERE/hookport.pl" "$X/src/db.rs" >&2 ;;
++  diag) perl "$HERE/diagport.pl" "$X/src/db.rs" >&2 ;;
++  plain) ;;
++  *) echo "unknown port $PORT" >&2; exit 2 ;;
++esac
++cp "$REPO/tests/$TEST.rs" "$X/tests/$TEST.rs"
++export CARGO_TARGET_DIR="$OUT/target-$SHA-$PORT-$TEST"
++export RUSTFLAGS="$RF"
++LOG="$OUT/build-$SHA-$PORT-$TEST.log"
++if ! ( cd "$X" && cargo test --no-run --test "$TEST" > "$LOG" 2>&1 ); then
++  rm -rf "$CARGO_TARGET_DIR"
++  echo "build failed, see $LOG" >&2
++  exit 1
++fi
++EXE="$(grep -o "Executable tests/$TEST.rs ([^)]*)" "$LOG" | sed 's/.*(\(.*\))/\1/')"
++BIN="$OUT/bin/$TEST-$SHA-$PORT-$KIND"
++cp "$EXE" "$BIN"
++rm -rf "$CARGO_TARGET_DIR" "$X"
++echo "$BIN"
+diff --git a/scripts/hunt_bisect0/diagport.pl b/scripts/hunt_bisect0/diagport.pl
+new file mode 100644
+index 0000000..b696d40
+--- /dev/null
++++ b/scripts/hunt_bisect0/diagport.pl
+@@ -0,0 +1,43 @@
++#!/usr/bin/perl
++# usage: perl diagport.pl SRC/DB.RS
++# The stale-cut diagnostic, ported to a commit that has Reader::rebase_tables (e607e70 and after): at each rebase
++# of a rewritten partition (HUNT_CHECK_CUTS=1) it counts the filed keys the table carries and how many of them have
++# a cut that is not the new partition's. Nothing else of the engine changes.
++use strict;
++use warnings;
++my $path = shift or die "usage: diagport.pl db.rs\n";
++local $/;
++open(my $in, '<', $path) or die "open $path: $!";
++my $src = <$in>;
++close($in);
++my $n = ($src =~ s{
++    (^[ \t]*t\.pieces\ =\ pieces;\n
++     [ \t]*t\.piece_ranks\ =\ piece_ranks;\n
++     ([ \t]*)if\ rebased\ \{\n)
++}{$1$2    if keep_snap && std::env::var("HUNT_CHECK_CUTS").is_ok() {
++$2        let mut stale = 0usize;
++$2        let mut total = 0usize;
++$2        for (b, list) in t.added.iter().enumerate() {
++$2            for &(slot, cut) in list {
++$2                if slot as usize >= self.mem().len() {
++$2                    continue;
++$2                }
++$2                total += 1;
++$2                let key = self.mem().key_of(self.mem().entry(slot as usize));
++$2                let (nb, ncut) = BuildCtx::owner_of(seg, key);
++$2                if nb != b || ncut != cut {
++$2                    stale += 1;
++$2                }
++$2            }
++$2        }
++$2        eprintln!(
++$2            "HUNTCUTS rebase p {p}: {} filed keys carried, {} with a cut that is not the new partition's (keep_snap {keep_snap})",
++$2            total, stale
++$2        );
++$2    }
++}mx);
++die "the rebase site was not found exactly once in $path ($n)\n" unless $n == 1;
++open(my $out, '>', $path) or die "write $path: $!";
++print $out $src;
++close($out);
++print "diag ported to $path\n";
+diff --git a/scripts/hunt_bisect0/hookport.pl b/scripts/hunt_bisect0/hookport.pl
+new file mode 100644
+index 0000000..2d6fc84
+--- /dev/null
++++ b/scripts/hunt_bisect0/hookport.pl
+@@ -0,0 +1,32 @@
++#!/usr/bin/perl
++# usage: perl hookport.pl SRC/DB.RS
++# The forcing hook of the snapshot schedule, ported to any commit that has the block cache's published forms:
++# a Snapshot handle's scan pauses for HUNT_SCAN_AFTER_CHECK_MS between its one check of the published
++# forms' position and its first load of a form. Nothing else of the engine changes.
++use strict;
++use warnings;
++my $path = shift or die "usage: hookport.pl db.rs\n";
++local $/;
++open(my $in, '<', $path) or die "open $path: $!";
++my $src = <$in>;
++close($in);
++my $n = ($src =~ s{
++    ^([ \t]*)(let\ canon:\ Option<&Cached>\ =\n
++    [ \t]*match\ canonical\.then\(\|\|\ self\.canonical\(pi,\ b\)\)\.flatten\(\)\ \{)
++}{$1if canonical && self.isolation.get() == Isolation::Snapshot {\n$1    hunt_pause("HUNT_SCAN_AFTER_CHECK_MS");\n$1}\n$1$2}mx);
++die "the load site was not found in $path\n" unless $n == 1;
++$src .= <<'RS';
++
++/// HUNT: a pause of the number of milliseconds the variable names, to hold
++/// a thread at a point of a forcing schedule (a hunt branch's patch, never
++/// for a merge).
++fn hunt_pause(var: &str) {
++    if let Some(ms) = std::env::var(var).ok().and_then(|s| s.parse::<u64>().ok()) {
++        std::thread::sleep(std::time::Duration::from_millis(ms));
++    }
++}
++RS
++open(my $out, '>', $path) or die "write $path: $!";
++print $out $src;
++close($out);
++print "hooked $path ($n site)\n";
+diff --git a/tests/hunt_bisect0.rs b/tests/hunt_bisect0.rs
+index 9e9e0cd..887acee 100644
+--- a/tests/hunt_bisect0.rs
++++ b/tests/hunt_bisect0.rs
+@@ -45,7 +45,8 @@
+ //!                   first snapshot scan.
+ //!
+ //! Compile-time switches, for commits that lack what a call needs:
+-//! `--cfg hunt_old` leaves out `hold_seal_landing` and `frozen_tables`, and
++//! `--cfg hunt_old` leaves out `hold_seal_landing` and `frozen_tables`,
++//! `--cfg hunt_nofrozen` only `frozen_tables` (b6b259d .. 549244a .. 9764e28), and
+ //! `hunt_share`, `hunt_forms`, `hunt_upkeep` (together `hunt_opts`),
+ //! `hunt_alert` and `hunt_rebase` turn on the switches `hunt_opts` lists,
+ //! which set options by name (both scenarios).
+@@ -399,7 +400,7 @@ fn snapshot_scenario(iter: u64) -> Result<(), String> {
+             db.settle().unwrap();
+         }
+     }
+-    #[cfg(not(hunt_old))]
++    #[cfg(not(any(hunt_old, hunt_nofrozen)))]
+     assert_eq!(db.frozen_tables(), 1, "the seal is held, its table frozen");
+     let mut starts: Vec<Vec<u8>> =
+         vec![b"".to_vec(), b"a".to_vec(), b"zzz".to_vec(), vec![0xff; 8]];
+-- 
+2.43.0
+

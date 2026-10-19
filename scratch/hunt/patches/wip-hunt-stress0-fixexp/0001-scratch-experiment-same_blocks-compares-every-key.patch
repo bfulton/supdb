@@ -1,0 +1,33 @@
+From c210fe79ac97392894d6310810b2a7419b56f044 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 21:06:33 +0000
+Subject: [PATCH 1/2] scratch experiment: same_blocks compares every key
+
+Not a proposal. A rewrite that moved keys inside a block with the count and the ends unchanged is no longer taken for the same blocks, so the tables built over the old blob are dropped.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011ZkLidS5BYuaBXVcvPAkdd
+---
+ src/db.rs | 6 ++----
+ 1 file changed, 2 insertions(+), 4 deletions(-)
+
+diff --git a/src/db.rs b/src/db.rs
+index 724db10..3d486f5 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -22767,10 +22767,8 @@ impl Db {
+         if n != b.blob.keys() || a.level != b.level || a.lo != b.lo || a.hi != b.hi {
+             return false;
+         }
+-        (0..n)
+-            .step_by(CACHE_BLOCK)
+-            .chain(n.checked_sub(1))
+-            .all(|r| matches!((a.blob.key_at(r), b.blob.key_at(r)), (Some(x), Some(y)) if x == y))
++        // SCRATCH EXPERIMENT: every rank, not the blocks' first and the last.
++        (0..n).all(|r| matches!((a.blob.key_at(r), b.blob.key_at(r)), (Some(x), Some(y)) if x == y))
+     }
+ 
+     fn store_bytes_of(dir: &Path, segs: &[std::sync::Arc<Seg>]) -> u64 {
+-- 
+2.43.0
+

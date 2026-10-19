@@ -1,0 +1,1070 @@
+From 1bfa7e9708426600ba67361c2476147340634934 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 18 Oct 2026 20:29:10 +0000
+Subject: [PATCH 03/10] hunt stress0: a hook that parks the forms publisher
+ between its slot swaps and its position, and a test that scans there
+
+The schedule the natural failures share, forced: every run of hunt_forced fails the snapshot handle's first scan. The loop scripts take the test's name and read the forced test's line.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011ZkLidS5BYuaBXVcvPAkdd
+---
+ src/db.rs                     |  48 ++-
+ tests/hunt_stress0.rs         | 661 +++++++++++++++++++++++++---------
+ tests/hunt_stress0/loop.sh    |  13 +-
+ tests/hunt_stress0/matrix.sh  |  21 ++
+ tests/hunt_stress0/run_one.sh |  22 +-
+ 5 files changed, 579 insertions(+), 186 deletions(-)
+ create mode 100644 tests/hunt_stress0/matrix.sh
+
+diff --git a/src/db.rs b/src/db.rs
+index 02d84c3..83e3255 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -126,6 +126,42 @@ pub mod dbgtrace {
+     static RING: [[AtomicU64; 6]; N] = [const { [const { AtomicU64::new(0) }; 6] }; N];
+     static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+ 
++    /// HUNT FORCING HOOK: bit 1 holds the forms publisher between its slot
++    /// swaps and its store of `forms_at`; bit 2 is set while a publisher is
++    /// parked there. Process-wide, so a test's helper thread can see it.
++    static FORMS_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
++
++    /// Hold (or release) the forms publisher after its slot swaps and
++    /// before it stores the position they are current to.
++    pub fn hold_forms_position(on: bool) {
++        if on {
++            FORMS_HOLD.fetch_or(1, Ordering::AcqRel);
++        } else {
++            FORMS_HOLD.fetch_and(!1, Ordering::AcqRel);
++        }
++    }
++
++    /// Whether a publisher is parked in the hold.
++    pub fn forms_hold_parked() -> bool {
++        FORMS_HOLD.load(Ordering::Acquire) & 2 != 0
++    }
++
++    /// The publisher's wait, if a test holds it. Marks itself parked so the
++    /// test knows the slots are ahead of the position.
++    pub(super) fn forms_hold_wait() {
++        if FORMS_HOLD.load(Ordering::Acquire) & 1 == 0 {
++            return;
++        }
++        FORMS_HOLD.fetch_or(2, Ordering::AcqRel);
++        let t = std::time::Instant::now();
++        while FORMS_HOLD.load(Ordering::Acquire) & 1 != 0
++            && t.elapsed() < std::time::Duration::from_secs(60)
++        {
++            std::thread::sleep(std::time::Duration::from_micros(50));
++        }
++        FORMS_HOLD.fetch_and(!2, Ordering::AcqRel);
++    }
++
+     pub fn now_ns() -> u64 {
+         T0.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+     }
+@@ -192,9 +228,11 @@ pub mod dbgtrace {
+                     1 => format!("PUBLISH_FORM p{} b{} pos {b}", a >> 32, a as u32),
+                     2 => format!("FORMS_AT_STORED {a} (site {b})"),
+                     3 => format!(
+-                        "SCAN_START bound {a} forms_at {} canonical {}",
++                        "SCAN_START bound {} forms_at {} canonical {} (load bracket {} ns)",
++                        a & 0xffff_ffff,
+                         if b >> 1 == (usize::MAX >> 1) as u64 { "MAX".to_string() } else { (b >> 1).to_string() },
+-                        b & 1
++                        b & 1,
++                        a >> 32
+                     ),
+                     4 => format!("TAKE p{} b{} kind {b}", a >> 32, a as u32),
+                     5 => format!("SCAN_END seen {a}"),
+@@ -16721,6 +16759,7 @@ impl Reader {
+         // later position would be taken by a reader there without the
+         // writes between.
+         if self.publish_dirty(false) {
++            dbgtrace::forms_hold_wait();
+             st.forms_complete
+                 .store(self.fs().tables_complete.get(), AtomicOrdering::Release);
+             st.forms_at.store(
+@@ -17986,12 +18025,15 @@ impl Reader {
+                 }
+             }
+         }
++        let t_before = dbgtrace::now_ns();
+         let at_seen = st.forms_at.load(AtomicOrdering::Acquire);
+         let canonical = self.opts.commit_forms && self.forms_bound().is_some_and(|n| at_seen == n);
++        let t_after = dbgtrace::now_ns();
+         dbgtrace::ev3(
+             3,
+             self.who(),
+-            self.forms_bound().map_or(u64::MAX, |n| n as u64),
++            self.forms_bound().map_or(u64::MAX, |n| n as u64 & 0xffff_ffff)
++                | ((t_after - t_before) << 32),
+             ((at_seen as u64) << 1) | u64::from(canonical),
+             st.gen,
+             st as *const State as usize,
+diff --git a/tests/hunt_stress0.rs b/tests/hunt_stress0.rs
+index 7ebb5be..e1df1f7 100644
+--- a/tests/hunt_stress0.rs
++++ b/tests/hunt_stress0.rs
+@@ -9,18 +9,24 @@
+ //! then a `Snapshot` handle whose scans must answer the model as it was
+ //! when it was taken, whatever the writer puts and commits after.
+ //!
+-//! It is a loop target and not a test that is expected to be green: every
+-//! knob is an environment variable (`HUNT_*`), the test runs the scenario
+-//! `HUNT_ITERS` times in one process and panics with the engine's account of
+-//! the key at the first failure, and a shell loop over processes with
+-//! different `TMPDIR`s and seeds reads the rate. See `hunt_cfg` for the
+-//! knobs; the defaults are the original scenario.
++//! `hunt_scenario` is a loop target and not a test that is expected to be
++//! green: every knob is an environment variable (`HUNT_*`, see `hunt_cfg`),
++//! the test runs the scenario `HUNT_ITERS` times in one process and panics
++//! with the engine's account of the key at the first failure, and a shell
++//! loop over processes with different `TMPDIR`s reads the rate
++//! (`tests/hunt_stress0/loop.sh`). The defaults are the original scenario.
++//!
++//! `hunt_forced` runs the same store through a schedule forced by a hook
++//! in the engine (`dbgtrace::hold_forms_position`): the forms publisher is
++//! parked between its slot swaps and its store of the position the slots
++//! are current to, and the snapshot handle scans there.
+ 
+ use std::collections::BTreeMap;
+ use std::fmt::Write as _;
+ use std::path::PathBuf;
+-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+-use std::sync::Arc;
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::{Arc, Mutex};
++use supdb::db::dbgtrace;
+ use supdb::{Db, Options, Reader, Upkeep};
+ 
+ type Model = BTreeMap<Vec<u8>, Vec<Vec<u8>>>;
+@@ -62,7 +68,6 @@ struct Cfg {
+     nkeys: usize,
+     part_kib: usize,
+     upkeep: Upkeep,
+-    upkeep_name: String,
+     /// `Db::hold_seal_landing(true)` before the rounds.
+     hold: bool,
+     /// `Db::settle()` after the load, the "settled start".
+@@ -84,8 +89,14 @@ struct Cfg {
+     /// scan pass through the snapshot handle after each.
+     after_commits: usize,
+     pause_ms: u64,
+-    /// Extra threads scanning through handles of their own.
++    /// Extra `Latest` handles scanning on threads of their own.
+     readers: usize,
++    /// Extra `Snapshot` handles, pinned with the main one, scanning on
++    /// threads of their own through the whole phase.
++    snap_threads: usize,
++    /// Extra `Latest` handles that scan the whole range of the first
++    /// cycle's puts and require all of the commit or none of it.
++    torn_threads: usize,
+     /// Threads spinning at normal priority, to starve the idle-class
+     /// upkeep thread.
+     hogs: usize,
+@@ -103,8 +114,7 @@ struct Cfg {
+ }
+ 
+ fn hunt_cfg() -> Cfg {
+-    let upkeep_name = env_str("HUNT_UPKEEP").unwrap_or_else(|| "bg1".to_string());
+-    let upkeep = match upkeep_name.as_str() {
++    let upkeep = match env_str("HUNT_UPKEEP").as_deref().unwrap_or("bg1") {
+         "inline" => Upkeep::Inline,
+         "bg1" => Upkeep::Background(1),
+         "bg2" => Upkeep::Background(2),
+@@ -118,7 +128,6 @@ fn hunt_cfg() -> Cfg {
+         nkeys: env_usize("HUNT_NKEYS", 5000),
+         part_kib: env_usize("HUNT_PART_KIB", 160),
+         upkeep,
+-        upkeep_name,
+         hold,
+         settle: env_flag("HUNT_SETTLE", true),
+         rounds: env_usize("HUNT_ROUNDS", 3),
+@@ -132,6 +141,8 @@ fn hunt_cfg() -> Cfg {
+         after_commits: env_usize("HUNT_AFTER_COMMITS", 1),
+         pause_ms: env_usize("HUNT_PAUSE_MS", 0) as u64,
+         readers: env_usize("HUNT_READERS", 0),
++        snap_threads: env_usize("HUNT_SNAP_THREADS", 0),
++        torn_threads: env_usize("HUNT_TORN_THREADS", 0),
+         hogs: env_usize("HUNT_HOGS", 0),
+         strict: env_flag("HUNT_STRICT", hold),
+         snap_step: env_usize("HUNT_SNAP_STEP", 3),
+@@ -219,8 +230,10 @@ fn show(k: &[u8]) -> String {
+ 
+ fn vals(r: &Reader, key: &[u8]) -> Vec<String> {
+     let mut v = Vec::new();
+-    r.read_all(key, |x| v.push(String::from_utf8_lossy(&x[..x.len().min(24)]).into_owned()))
+-        .unwrap();
++    r.read_all(key, |x| {
++        v.push(String::from_utf8_lossy(&x[..x.len().min(24)]).into_owned())
++    })
++    .unwrap();
+     v
+ }
+ 
+@@ -263,8 +276,8 @@ fn parting(got: &Window, want: &Window) -> Option<(Vec<u8>, String)> {
+     ))
+ }
+ 
+-/// Whether a later write is in `got`: any value from a put after the
+-/// snapshot, or any value the snapshot's model never held for its key.
++/// Whether a later write is in `got`: any value the snapshot's model never
++/// held for its key.
+ fn foreign(got: &Window, at_snapshot: &Model) -> Option<(Vec<u8>, Vec<u8>)> {
+     for (k, v) in &got.0 {
+         let known = at_snapshot.get(k).is_some_and(|vs| vs.contains(v));
+@@ -275,80 +288,97 @@ fn foreign(got: &Window, at_snapshot: &Model) -> Option<(Vec<u8>, Vec<u8>)> {
+     None
+ }
+ 
++/// The first failure any thread found, for the main thread to print.
++type Failure = Arc<Mutex<Option<String>>>;
++
++fn note(fail: &Failure, text: String) {
++    let mut f = fail.lock().unwrap();
++    if f.is_none() {
++        *f = Some(text);
++    }
++}
++
+ struct Threads {
+     stop: Arc<AtomicBool>,
+     joins: Vec<std::thread::JoinHandle<u64>>,
+ }
+ 
+ impl Threads {
+-    fn start(db: &Db, cfg: &Cfg, starts: &[Vec<u8>]) -> Threads {
+-        let stop = Arc::new(AtomicBool::new(false));
+-        let mut joins = Vec::new();
+-        for t in 0..cfg.readers {
+-            let r = db.reader().unwrap();
+-            let stop = stop.clone();
+-            let starts = starts.to_vec();
+-            joins.push(std::thread::spawn(move || {
+-                let mut rng = Rng(0x5EED_0000 + t as u64 * 7919 + 1);
+-                let limits = [1usize, 3, 17, 57, 114, 400];
+-                let mut n = 0u64;
+-                while !stop.load(Ordering::Relaxed) {
+-                    let s = &starts[rng.below(starts.len())];
+-                    let l = limits[rng.below(limits.len())];
+-                    let mut last: Option<Vec<u8>> = None;
+-                    r.scan(s, l, |k, _| {
+-                        if let Some(p) = &last {
+-                            assert!(p.as_slice() <= k, "a scan out of key order");
+-                        }
+-                        last = Some(k.to_vec());
+-                    })
+-                    .unwrap();
+-                    n += 1;
+-                }
+-                n
+-            }));
+-        }
+-        for _ in 0..cfg.hogs {
+-            let stop = stop.clone();
+-            joins.push(std::thread::spawn(move || {
+-                let mut x = 1u64;
+-                while !stop.load(Ordering::Relaxed) {
+-                    for _ in 0..10_000 {
+-                        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+-                    }
+-                    std::hint::black_box(x);
+-                }
+-                0
+-            }));
+-        }
+-        Threads { stop, joins }
+-    }
+-
+     fn finish(self) -> u64 {
+         self.stop.store(true, Ordering::Relaxed);
+         self.joins.into_iter().map(|j| j.join().unwrap()).sum()
+     }
+ }
+ 
++/// Threads that do not need to know about a snapshot: `Latest` readers
++/// checking key order, and spinners.
++fn start_background(db: &Db, cfg: &Cfg, starts: &[Vec<u8>], stop: &Arc<AtomicBool>) -> Threads {
++    let mut joins = Vec::new();
++    for t in 0..cfg.readers {
++        let r = db.reader().unwrap();
++        let stop = stop.clone();
++        let starts = starts.to_vec();
++        joins.push(std::thread::spawn(move || {
++            let mut rng = Rng(0x5EED_0000 + t as u64 * 7919 + 1);
++            let limits = [1usize, 3, 17, 57, 114, 400];
++            let mut n = 0u64;
++            while !stop.load(Ordering::Relaxed) {
++                let s = &starts[rng.below(starts.len())];
++                let l = limits[rng.below(limits.len())];
++                let mut last: Option<Vec<u8>> = None;
++                r.scan(s, l, |k, _| {
++                    if let Some(p) = &last {
++                        assert!(p.as_slice() <= k, "a scan out of key order");
++                    }
++                    last = Some(k.to_vec());
++                })
++                .unwrap();
++                n += 1;
++            }
++            n
++        }));
++    }
++    for _ in 0..cfg.hogs {
++        let stop = stop.clone();
++        joins.push(std::thread::spawn(move || {
++            let mut x = 1u64;
++            while !stop.load(Ordering::Relaxed) {
++                for _ in 0..10_000 {
++                    x = x
++                        .wrapping_mul(6364136223846793005)
++                        .wrapping_add(1442695040888963407);
++                }
++                std::hint::black_box(x);
++            }
++            0
++        }));
++    }
++    Threads {
++        stop: stop.clone(),
++        joins,
++    }
++}
++
+ /// Everything the engine can say about `key` through a handle that has just
+-/// answered wrongly, in the order that disturbs it least.
++/// answered wrongly, in the order that disturbs it least. The writer's and
++/// the Latest handle's accounts are left out where the caller has none.
+ #[allow(clippy::too_many_arguments)]
+ fn capture(
+-    db: &Db,
++    db: Option<&Db>,
+     snap: &Reader,
+     latest: Option<&Reader>,
+     key: &[u8],
+     start: &[u8],
+     limit: usize,
+     at_snapshot: &Model,
+-    now: &Model,
++    now: Option<&Model>,
+     why: &str,
+-    t_commit: u64,
++    t_from: u64,
+ ) -> String {
+     let mut s = String::new();
+     let _ = writeln!(s, "HUNT-CAPTURE {why}");
+-    let t_fail = supdb::db::dbgtrace::now_ns();
+-    for line in supdb::db::dbgtrace::dump(t_commit.saturating_sub(2_000_000)) {
++    let t_fail = dbgtrace::now_ns();
++    for line in dbgtrace::dump(t_from.saturating_sub(2_000_000)) {
+         let _ = writeln!(s, "TRACE {line}");
+     }
+     let _ = writeln!(s, "TRACE (failure noticed at {:.3} us)", t_fail as f64 / 1000.0);
+@@ -365,7 +395,7 @@ fn capture(
+         at_snapshot
+             .get(key)
+             .map(|v| v.iter().map(|x| short(x)).collect::<Vec<_>>()),
+-        now.get(key)
++        now.and_then(|m| m.get(key))
+             .map(|v| v.iter().map(|x| short(x)).collect::<Vec<_>>())
+     );
+     // The handle's account first, as it stands after the wrong answer.
+@@ -397,33 +427,46 @@ fn capture(
+         let _ = writeln!(s, "latest point read: {:?}", vals(l, key));
+         let _ = writeln!(s, "latest.debug_key: {}", l.debug_key(key));
+     }
+-    let _ = writeln!(s, "writer point read: {:?}", vals(db, key));
+-    let _ = writeln!(s, "writer.debug_key: {}", db.debug_key(key));
+-    let _ = writeln!(
+-        s,
+-        "snapshot_builds {} extends {} refreshes {} switches {} kept {:?} upkeep_counts {:?}",
+-        db.snapshot_builds(),
+-        db.snapshot_extends(),
+-        db.snapshot_refreshes(),
+-        db.snapshot_switches(),
+-        db.snapshot_kept(),
+-        db.upkeep_counts()
+-    );
+-    let _ = writeln!(s, "writer.canonical_forms: {:?}", db.canonical_forms());
++    if let Some(db) = db {
++        let _ = writeln!(s, "writer point read: {:?}", vals(db, key));
++        let _ = writeln!(s, "writer.debug_key: {}", db.debug_key(key));
++        let _ = writeln!(
++            s,
++            "forms_position {} snapshot_builds {} extends {} refreshes {} switches {} kept {:?} \
++             upkeep_counts {:?}",
++            db.forms_position(),
++            db.snapshot_builds(),
++            db.snapshot_extends(),
++            db.snapshot_refreshes(),
++            db.snapshot_switches(),
++            db.snapshot_kept(),
++            db.upkeep_counts()
++        );
++        let _ = writeln!(s, "writer.canonical_forms: {:?}", db.canonical_forms());
++    }
+     s
+ }
+ 
+ struct Tally {
+     windows: u64,
+     snap_scans: u64,
+-    reader_scans: u64,
++    thread_scans: u64,
+ }
+ 
+-/// One run of the scenario. Err carries the capture of the first wrong
+-/// answer through the snapshot handle (or the account of a wrong answer of
+-/// the writer's or the Latest handle's in the window phase).
+-fn scenario(cfg: &Cfg, iter: usize) -> Result<Tally, String> {
+-    let dir = scratch(&format!("i{iter}"));
++/// The store the scenario starts from: loaded, flushed, settled, a seal in
++/// flight (held), the rounds written, the start keys, the `Latest` handle,
++/// and the model of all of it.
++struct World {
++    dir: PathBuf,
++    db: Db,
++    model: Model,
++    keys: Vec<Vec<u8>>,
++    starts: Vec<Vec<u8>>,
++    latest: Option<Reader>,
++}
++
++fn build_world(cfg: &Cfg, name: &str) -> World {
++    let dir = scratch(name);
+     let opts = Options {
+         partition_bytes: Some(cfg.part_kib << 10),
+         scan_block_cache: true,
+@@ -474,94 +517,211 @@ fn scenario(cfg: &Cfg, iter: usize) -> Result<Tally, String> {
+     for i in (0..cfg.nkeys).step_by(cfg.stride.max(1)) {
+         starts.extend(around(&spaced_key(i)));
+     }
+-    let limits = [1usize, 2, 3, 5, 17, 56, 57, 58, 114, usize::MAX];
+-    let mut latest = Some(db.reader().unwrap());
+-    let threads = Threads::start(&db, cfg, &starts);
++    let latest = Some(db.reader().unwrap());
++    World {
++        dir,
++        db,
++        model,
++        keys,
++        starts,
++        latest,
++    }
++}
++
++const LIMITS: [usize; 10] = [1, 2, 3, 5, 17, 56, 57, 58, 114, usize::MAX];
++
++fn windows_phase(cfg: &Cfg, w: &World, tally: &mut Tally) -> Result<(), String> {
++    for start in &w.starts {
++        for &limit in &LIMITS {
++            let cap = limit.min(1500);
++            let want = window(&w.model, start, cap);
++            let got = scanned(&w.db, start, cap);
++            if cfg.strict {
++                if let Some((key, line)) = parting(&got, &want) {
++                    return Err(format!(
++                        "HUNT-FAIL windows-writer from {} for {cap}: {line}\nkey {}",
++                        show(start),
++                        show(&key)
++                    ));
++                }
++            }
++            let got = scanned(w.latest.as_ref().unwrap(), start, cap);
++            if cfg.strict {
++                if let Some((key, line)) = parting(&got, &want) {
++                    return Err(format!(
++                        "HUNT-FAIL windows-latest from {} for {cap}: {line}\nkey {}",
++                        show(start),
++                        show(&key)
++                    ));
++                }
++            }
++            tally.windows += 1;
++        }
++    }
++    Ok(())
++}
++
++/// One cycle's writes: the keys it puts and the value it puts to each.
++fn cycle_keys(cfg: &Cfg, keys: &[Vec<u8>], cycle: usize) -> (Vec<Vec<u8>>, Vec<u8>) {
++    let step = cfg.after_step.max(1);
++    let ks: Vec<Vec<u8>> = keys
++        .iter()
++        .skip(cycle % step)
++        .step_by(step)
++        .take(cfg.after_n)
++        .cloned()
++        .collect();
++    (ks, format!("after the snapshot {cycle}").into_bytes())
++}
++
++/// Extra `Snapshot` handles and `Latest` handles that check the commit's
++/// atomicity, started before the puts.
++fn start_watchers(
++    w: &World,
++    cfg: &Cfg,
++    at_snapshot: &Arc<Model>,
++    targets: &[Vec<u8>],
++    tag: &[u8],
++    stop: &Arc<AtomicBool>,
++    fail: &Failure,
++) -> Threads {
++    let mut joins = Vec::new();
++    for t in 0..cfg.snap_threads {
++        let r = w.db.reader().unwrap();
++        r.snapshot();
++        let (stop, fail, at, starts) = (
++            stop.clone(),
++            fail.clone(),
++            at_snapshot.clone(),
++            w.starts.clone(),
++        );
++        let limits = cfg.snap_limits.clone();
++        joins.push(std::thread::spawn(move || {
++            let mut rng = Rng(0xA11CE + t as u64 * 104729 + 1);
++            let mut n = 0u64;
++            while !stop.load(Ordering::Relaxed) {
++                let s = &starts[rng.below(starts.len())];
++                let l = limits[rng.below(limits.len())];
++                let got = scanned(&r, s, l);
++                n += 1;
++                if let Some((k, v)) = foreign(&got, &at) {
++                    let why = format!(
++                        "snapshot thread {t}: a value the snapshot never held: {} = {}",
++                        show(&k),
++                        short(&v)
++                    );
++                    let cap = capture(
++                        None,
++                        &r,
++                        None,
++                        &k,
++                        s,
++                        l,
++                        &at,
++                        None,
++                        &why,
++                        dbgtrace::now_ns().saturating_sub(30_000_000),
++                    );
++                    note(&fail, format!("HUNT-FAIL thread-later-write {why}\n{cap}"));
++                    stop.store(true, Ordering::Relaxed);
++                }
++            }
++            n
++        }));
++    }
++    // A commit is all or none: a `Latest` handle's scan over every key the
++    // first cycle puts finds the cycle's value under all of them or under
++    // none.
++    if cfg.torn_threads > 0 && !targets.is_empty() {
++        let first = targets.first().unwrap().clone();
++        let limit = w
++            .model
++            .range(first.clone()..=targets.last().unwrap().clone())
++            .count();
++        for t in 0..cfg.torn_threads {
++            let r = w.db.reader().unwrap();
++            let (stop, fail, first, tag) = (stop.clone(), fail.clone(), first.clone(), tag.to_vec());
++            let want = targets.len();
++            joins.push(std::thread::spawn(move || {
++                let mut n = 0u64;
++                while !stop.load(Ordering::Relaxed) {
++                    let got = scanned(&r, &first, limit);
++                    n += 1;
++                    let seen = got.0.iter().filter(|(_, v)| *v == tag).count();
++                    if seen != 0 && seen != want {
++                        let missing = want - seen;
++                        let why = format!(
++                            "torn thread {t}: a Latest scan found {seen} of the commit's {want} \
++                             puts ({missing} missing)"
++                        );
++                        note(
++                            &fail,
++                            format!(
++                                "HUNT-FAIL torn {why}\n{}",
++                                dbgtrace::dump(dbgtrace::now_ns().saturating_sub(30_000_000))
++                                    .iter()
++                                    .map(|l| format!("TRACE {l}"))
++                                    .collect::<Vec<_>>()
++                                    .join("\n")
++                            ),
++                        );
++                        stop.store(true, Ordering::Relaxed);
++                    }
++                }
++                n
++            }));
++        }
++    }
++    Threads {
++        stop: stop.clone(),
++        joins,
++    }
++}
++
++/// One run of the scenario. Err carries the capture of the first wrong
++/// answer through the snapshot handle (or the account of a wrong answer of
++/// the writer's or the Latest handle's in the window phase).
++fn scenario(cfg: &Cfg, iter: usize) -> Result<Tally, String> {
++    let mut w = build_world(cfg, &format!("i{iter}"));
++    let stop = Arc::new(AtomicBool::new(false));
++    let fail: Failure = Arc::new(Mutex::new(None));
++    let background = start_background(&w.db, cfg, &w.starts, &stop);
+     let mut tally = Tally {
+         windows: 0,
+         snap_scans: 0,
+-        reader_scans: 0,
++        thread_scans: 0,
+     };
++    let mut watchers: Option<Threads> = None;
+     let result = (|| -> Result<(), String> {
+         if cfg.windows {
+-            for start in &starts {
+-                for &limit in &limits {
+-                    let cap = limit.min(1500);
+-                    let want = window(&model, start, cap);
+-                    let got = scanned(&db, start, cap);
+-                    if cfg.strict {
+-                        if let Some((key, line)) = parting(&got, &want) {
+-                            return Err(format!(
+-                                "HUNT-FAIL windows-writer from {} for {cap}: {line}\nkey {}",
+-                                show(start),
+-                                show(&key)
+-                            ));
+-                        }
+-                    }
+-                    let got = scanned(latest.as_ref().unwrap(), start, cap);
+-                    if cfg.strict {
+-                        if let Some((key, line)) = parting(&got, &want) {
+-                            return Err(format!(
+-                                "HUNT-FAIL windows-latest from {} for {cap}: {line}\nkey {}",
+-                                show(start),
+-                                show(&key)
+-                            ));
+-                        }
+-                    }
+-                    tally.windows += 1;
+-                }
+-            }
++            windows_phase(cfg, &w, &mut tally)?;
+         }
+         if cfg.drop_latest {
+-            latest = None;
++            w.latest = None;
+         }
+         for cycle in 0..cfg.snaps {
+-            let snap = db.reader().unwrap();
++            let snap = w.db.reader().unwrap();
+             snap.snapshot();
+-            let mut t_commit = supdb::db::dbgtrace::now_ns();
+-            let at_snapshot = model.clone();
+-            let tag: Vec<u8> = format!("after the snapshot {cycle}").into_bytes();
+-            let step = cfg.after_step.max(1);
+-            let ks: Vec<Vec<u8>> = keys
+-                .iter()
+-                .skip(cycle % step)
+-                .step_by(step)
+-                .take(cfg.after_n)
+-                .cloned()
+-                .collect();
+-            let per = ks.len().div_ceil(cfg.after_commits.max(1)).max(1);
+-            if cfg.prewarm {
+-                for start in starts.iter().step_by(cfg.snap_step.max(1)) {
+-                    for &limit in &cfg.snap_limits {
+-                        let got = scanned(&snap, start, limit);
+-                        tally.snap_scans += 1;
+-                        if let Some((k, v)) = foreign(&got, &at_snapshot) {
+-                            return Err(format!(
+-                                "HUNT-FAIL prewarm-foreign {} = {}",
+-                                show(&k),
+-                                short(&v)
+-                            ));
+-                        }
+-                    }
+-                }
++            let at_snapshot = w.model.clone();
++            let (ks, tag) = cycle_keys(cfg, &w.keys, cycle);
++            if cycle == 0 {
++                watchers = Some(start_watchers(
++                    &w,
++                    cfg,
++                    &Arc::new(at_snapshot.clone()),
++                    &ks,
++                    &tag,
++                    &stop,
++                    &fail,
++                ));
+             }
+-            for chunk in ks.chunks(per) {
+-                for k in chunk {
+-                    db.put(k, &tag);
+-                    model.insert(k.clone(), vec![tag.clone()]);
+-                }
+-                t_commit = supdb::db::dbgtrace::now_ns();
+-                supdb::db::dbgtrace::ev(10, 255, 0, 0);
+-                db.commit().unwrap();
+-                supdb::db::dbgtrace::ev(10, 255, 1, 0);
+-                if cfg.pause_ms > 0 {
+-                    std::thread::sleep(std::time::Duration::from_millis(cfg.pause_ms));
+-                }
+-                for start in starts.iter().step_by(cfg.snap_step.max(1)) {
++            let per = ks.len().div_ceil(cfg.after_commits.max(1)).max(1);
++            let scan_pass = |tally: &mut Tally, w: &World, t_commit: u64| -> Result<(), String> {
++                for start in w.starts.iter().step_by(cfg.snap_step.max(1)) {
+                     for &limit in &cfg.snap_limits {
+-                        supdb::db::dbgtrace::ev(11, 255, 0, 0);
++                        dbgtrace::ev(11, 255, 0, 0);
+                         let got = scanned(&snap, start, limit);
+-                        supdb::db::dbgtrace::ev(11, 255, 1, 0);
++                        dbgtrace::ev(11, 255, 1, 0);
+                         tally.snap_scans += 1;
+                         let want = window(&at_snapshot, start, limit);
+                         let strict_fail = if cfg.strict {
+@@ -574,7 +734,11 @@ fn scenario(cfg: &Cfg, iter: usize) -> Result<Tally, String> {
+                             let (key, line) = match (&lenient_fail, &strict_fail) {
+                                 (Some((k, v)), _) => (
+                                     k.clone(),
+-                                    format!("a value the snapshot never held: {} = {}", show(k), short(v)),
++                                    format!(
++                                        "a value the snapshot never held: {} = {}",
++                                        show(k),
++                                        short(v)
++                                    ),
+                                 ),
+                                 (None, Some((k, l))) => (k.clone(), l.clone()),
+                                 _ => unreachable!(),
+@@ -585,25 +749,49 @@ fn scenario(cfg: &Cfg, iter: usize) -> Result<Tally, String> {
+                                 "mismatch"
+                             };
+                             return Err(format!(
+-                                "HUNT-FAIL snapshot-{kind} cycle {cycle} from {} for {limit}: {line}\n{}",
++                                "HUNT-FAIL snapshot-{kind} cycle {cycle} from {} for {limit}: \
++                                 {line}\n{}",
+                                 show(start),
+                                 capture(
+-                                    &db,
++                                    Some(&w.db),
+                                     &snap,
+-                                    latest.as_ref(),
++                                    w.latest.as_ref(),
+                                     &key,
+                                     start,
+                                     limit,
+                                     &at_snapshot,
+-                                    &model,
++                                    Some(&w.model),
+                                     &line,
+-                                    t_commit,
++                                    t_commit
+                                 )
+                             ));
+                         }
+-                        let now = scanned(&db, start, limit);
+-                        if cfg.strict {
+-                            if let Some((key, line)) = parting(&now, &window(&model, start, limit))
++                    }
++                }
++                Ok(())
++            };
++            if cfg.prewarm {
++                scan_pass(&mut tally, &w, dbgtrace::now_ns())?;
++            }
++            for chunk in ks.chunks(per) {
++                for k in chunk {
++                    w.db.put(k, &tag);
++                    w.model.insert(k.clone(), vec![tag.clone()]);
++                }
++                let t_commit = dbgtrace::now_ns();
++                dbgtrace::ev(10, 255, 0, 0);
++                w.db.commit().unwrap();
++                dbgtrace::ev(10, 255, 1, 0);
++                if cfg.pause_ms > 0 {
++                    std::thread::sleep(std::time::Duration::from_millis(cfg.pause_ms));
++                }
++                scan_pass(&mut tally, &w, t_commit)?;
++                if cfg.strict {
++                    for start in w.starts.iter().step_by(cfg.snap_step.max(1)) {
++                        for &limit in &cfg.snap_limits {
++                            let now = scanned(&w.db, start, limit);
++                            if let Some((key, line)) =
++                                parting(&now, &window(&w.model, start, limit))
+                             {
+                                 return Err(format!(
+                                     "HUNT-FAIL writer-after from {} for {limit}: {line}\nkey {}",
+@@ -614,12 +802,23 @@ fn scenario(cfg: &Cfg, iter: usize) -> Result<Tally, String> {
+                         }
+                     }
+                 }
++                if let Some(text) = fail.lock().unwrap().take() {
++                    return Err(text);
++                }
+             }
+             snap.release();
+         }
+         Ok(())
+     })();
+-    tally.reader_scans = threads.finish();
++    tally.thread_scans = background.finish();
++    if let Some(wt) = watchers {
++        tally.thread_scans += wt.finish();
++    }
++    let result = match (result, fail.lock().unwrap().take()) {
++        (Ok(()), Some(text)) => Err(text),
++        (r, _) => r,
++    };
++    let World { dir, db, latest, .. } = w;
+     drop(latest);
+     let closed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+         drop(db);
+@@ -637,14 +836,14 @@ fn hunt_scenario() {
+     let mut total = Tally {
+         windows: 0,
+         snap_scans: 0,
+-        reader_scans: 0,
++        thread_scans: 0,
+     };
+     for iter in 0..cfg.iters {
+         match scenario(&cfg, iter) {
+             Ok(t) => {
+                 total.windows += t.windows;
+                 total.snap_scans += t.snap_scans;
+-                total.reader_scans += t.reader_scans;
++                total.thread_scans += t.thread_scans;
+             }
+             Err(e) => {
+                 eprintln!("{e}");
+@@ -654,10 +853,120 @@ fn hunt_scenario() {
+         }
+     }
+     eprintln!(
+-        "HUNT-OK iters {} windows {} snap_scans {} reader_scans {}",
+-        cfg.iters, total.windows, total.snap_scans, total.reader_scans
++        "HUNT-OK iters {} windows {} snap_scans {} thread_scans {}",
++        cfg.iters, total.windows, total.snap_scans, total.thread_scans
+     );
+ }
+ 
+-#[allow(dead_code)]
+-fn unused(_: &AtomicU64) {}
++/// The schedule forced. The forms publisher (the upkeep thread under
++/// `Background`, the writer under `Inline`) is parked after it has swapped
++/// a commit's forms into the state's slots and before it stores the position
++/// they are current to; a handle pinned at the commit before scans the
++/// first window of the store there. It has to answer the store as it was
++/// pinned, and answers the commit it was not pinned at. Under `Inline` the
++/// writer is the thread parked, so the handle scans on a thread of its own.
++#[test]
++fn hunt_forced() {
++    let mut cfg = hunt_cfg();
++    // The schedule needs the first commit after the snapshot to publish.
++    cfg.windows = true;
++    let w = build_world(&cfg, "forced");
++    let mut tally = Tally {
++        windows: 0,
++        snap_scans: 0,
++        thread_scans: 0,
++    };
++    windows_phase(&cfg, &w, &mut tally).expect("the windows are right before the snapshot");
++    let World {
++        dir,
++        mut db,
++        mut model,
++        keys,
++        latest,
++        ..
++    } = w;
++    let snap = db.reader().unwrap();
++    snap.snapshot();
++    let at_snapshot = model.clone();
++    let position_before = db.forms_position();
++    let (ks, tag) = cycle_keys(&cfg, &keys, 0);
++    for k in &ks {
++        db.put(k, &tag);
++        model.insert(k.clone(), vec![tag.clone()]);
++    }
++    dbgtrace::hold_forms_position(true);
++    let t_commit = dbgtrace::now_ns();
++    let inline = cfg.upkeep == Upkeep::Inline;
++    // What the handle answers while the publisher is parked: the first
++    // window, as the original test's first scan.
++    let scan_parked = move |snap: Reader| -> (Reader, Window, bool) {
++        let t = std::time::Instant::now();
++        while !dbgtrace::forms_hold_parked() && t.elapsed() < std::time::Duration::from_secs(20) {
++            std::thread::sleep(std::time::Duration::from_micros(100));
++        }
++        let parked = dbgtrace::forms_hold_parked();
++        let got = scanned(&snap, b"", 3);
++        // Under `Inline` the parked publisher is the thread that has to
++        // return from the commit before the test can lift the hold.
++        if inline {
++            dbgtrace::hold_forms_position(false);
++        }
++        (snap, got, parked)
++    };
++    let (snap, got, parked) = if inline {
++        let helper = std::thread::spawn(move || scan_parked(snap));
++        db.commit().unwrap();
++        helper.join().unwrap()
++    } else {
++        db.commit().unwrap();
++        scan_parked(snap)
++    };
++    // Released only after the scan: the publisher stores the position and
++    // the hold is over.
++    let position_during = if inline { usize::MAX } else { db.forms_position() };
++    dbgtrace::hold_forms_position(false);
++    let want = window(&at_snapshot, b"", 3);
++    let wrong = parting(&got, &want);
++    // The control: the same scan once the position is stored.
++    std::thread::sleep(std::time::Duration::from_millis(50));
++    let after = scanned(&snap, b"", 3);
++    let after_wrong = parting(&after, &want);
++    let key = got
++        .0
++        .iter()
++        .find(|(k, v)| model.get(k).is_some_and(|vs| vs.contains(v)) && !at_snapshot[k].contains(v))
++        .map(|(k, _)| k.clone())
++        .unwrap_or_else(|| b"key-00000000".to_vec());
++    let report = capture(
++        Some(&db),
++        &snap,
++        latest.as_ref(),
++        &key,
++        b"",
++        3,
++        &at_snapshot,
++        Some(&model),
++        "the forced schedule",
++        t_commit,
++    );
++    eprintln!("{report}");
++    eprintln!(
++        "HUNT-FORCED upkeep {:?} publisher parked {parked} forms_position before {} during {} \
++         wrong-while-parked {:?} wrong-after-release {:?}",
++        cfg.upkeep,
++        position_before,
++        position_during,
++        wrong.as_ref().map(|(_, l)| l.clone()),
++        after_wrong.as_ref().map(|(_, l)| l.clone()),
++    );
++    drop(latest);
++    drop(snap);
++    drop(db);
++    let _ = std::fs::remove_dir_all(&dir);
++    assert!(parked, "the publisher never parked: the schedule was not forced");
++    assert!(
++        wrong.is_none(),
++        "the snapshot handle read a write made after it while the publisher was parked"
++    );
++    assert!(after_wrong.is_none(), "the snapshot is wrong after the release too");
++}
+diff --git a/tests/hunt_stress0/loop.sh b/tests/hunt_stress0/loop.sh
+index 895326e..c3f756b 100755
+--- a/tests/hunt_stress0/loop.sh
++++ b/tests/hunt_stress0/loop.sh
+@@ -1,9 +1,10 @@
+ #!/bin/sh
+ # Loop tests/hunt_stress0.rs over processes and read a rate.
+ #   usage: loop.sh BIN OUTDIR RUNS PARALLEL [LABEL]
+-# The scenario's knobs are the HUNT_* variables of the caller. With SEEDS=1
+-# each process gets HUNT_SEED=$SEEDBASE+its number (default: the original
+-# scenario's seeds, 0). Prints one summary line.
++# The scenario's knobs are the HUNT_* variables of the caller; TESTNAME picks
++# the test (hunt_scenario by default). With SEEDS=1 each process gets
++# HUNT_SEED=$SEEDBASE+its number (default: the original scenario's seeds, 0).
++# Prints one summary line.
+ BIN=$1
+ OUT=$2
+ RUNS=$3
+@@ -21,5 +22,7 @@ ok=$(grep -c '^ok ' "$RES")
+ f1=$(grep -c '^F1' "$RES")
+ f0=$(grep -c '^F0' "$RES")
+ f2=$(grep -c '^F2' "$RES")
+-ot=$(grep -c '^other' "$RES")
+-echo "SUMMARY $LABEL runs=$RUNS ok=$ok F1=$f1 F0=$f0 F2=$f2 other=$ot"
++fp=$(grep -c '^forced-passed' "$RES")
++fn=$(grep -c '^forced-not-parked' "$RES")
++ot=$(grep -c '^other\|^forced-other' "$RES")
++echo "SUMMARY $LABEL runs=$RUNS ok=$ok F1=$f1 F0=$f0 F2=$f2 forced-passed=$fp forced-not-parked=$fn other=$ot"
+diff --git a/tests/hunt_stress0/matrix.sh b/tests/hunt_stress0/matrix.sh
+new file mode 100644
+index 0000000..a6aa1e5
+--- /dev/null
++++ b/tests/hunt_stress0/matrix.sh
+@@ -0,0 +1,21 @@
++#!/bin/sh
++# Run a list of variants one after another and append each summary to a file.
++#   usage: matrix.sh BIN OUTDIR LISTFILE
++# Each line of LISTFILE:  label runs parallel [VAR=value ...]
++# (a '#' line is a comment). The variables are exported for that variant only.
++BIN=$1
++OUT=$2
++LIST=$3
++HERE=$(dirname "$0")
++while read -r label runs par vars; do
++  case "$label" in
++    '' | '#'*) continue ;;
++  esac
++  (
++    for kv in $vars; do
++      export "$kv"
++    done
++    sh "$HERE/loop.sh" "$BIN" "$OUT" "$runs" "$par" "$label"
++  ) | tee -a "$OUT/matrix-summary.txt"
++done <"$LIST"
++echo "MATRIX DONE" | tee -a "$OUT/matrix-summary.txt"
+diff --git a/tests/hunt_stress0/run_one.sh b/tests/hunt_stress0/run_one.sh
+index a50d359..ee6dc9b 100755
+--- a/tests/hunt_stress0/run_one.sh
++++ b/tests/hunt_stress0/run_one.sh
+@@ -1,13 +1,14 @@
+ #!/bin/sh
+ # One process of tests/hunt_stress0.rs under a TMPDIR of its own; prints one
+ # classified line.   usage: run_one.sh BIN OUTDIR ID
+-# The scenario's knobs are the HUNT_* variables of the caller.
++# The scenario's knobs are the HUNT_* variables of the caller; TESTNAME picks
++# the test (hunt_scenario, the default, or hunt_forced).
+ BIN=$1
+ OUT=$2
+ ID=$3
+ T="$OUT/tmp/$ID"
+ mkdir -p "$T" "$OUT/log"
+-TMPDIR="$T" timeout 600 "$BIN" hunt_scenario --exact --nocapture --test-threads=1 >"$OUT/log/$ID.txt" 2>&1
++TMPDIR="$T" timeout 600 "$BIN" "${TESTNAME:-hunt_scenario}" --exact --nocapture --test-threads=1 >"$OUT/log/$ID.txt" 2>&1
+ RC=$?
+ rm -rf "$T"
+ LOG="$OUT/log/$ID.txt"
+@@ -16,10 +17,27 @@ if [ "$RC" = 0 ] && grep -q 'HUNT-OK' "$LOG"; then
+   rm -f "$LOG"
+   exit 0
+ fi
++if grep -q 'HUNT-FORCED' "$LOG"; then
++  if grep -q 'publisher parked false' "$LOG"; then
++    echo "forced-not-parked $ID"
++  elif grep -q 'wrong-while-parked Some' "$LOG"; then
++    echo "F1-forced $ID"
++  elif [ "$RC" = 0 ]; then
++    echo "forced-passed $ID"
++    rm -f "$LOG"
++  else
++    echo "forced-other rc=$RC $ID"
++  fi
++  exit 0
++fi
+ if grep -q 'HUNT-FAIL snapshot-later-write' "$LOG"; then
+   echo "F1-later-write $ID"
+ elif grep -q 'HUNT-FAIL snapshot-mismatch' "$LOG"; then
+   echo "F1-mismatch $ID"
++elif grep -q 'HUNT-FAIL thread-later-write' "$LOG"; then
++  echo "F1-thread-later-write $ID"
++elif grep -q 'HUNT-FAIL torn' "$LOG"; then
++  echo "F1-torn $ID"
+ elif grep -q 'HUNT-FAIL windows' "$LOG"; then
+   echo "F0-windows $ID"
+ elif grep -q 'HUNT-FAIL writer-after' "$LOG"; then
+-- 
+2.43.0
+
