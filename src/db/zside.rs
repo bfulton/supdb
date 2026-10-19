@@ -73,13 +73,25 @@ pub(super) fn zpg_name(id: u64, end_seq: u64) -> String {
     format!("zpg-{id:08}-{end_seq:016}.zpg")
 }
 
+/// The two fields of the segment named `seg` that its sidecar's name is
+/// made of, or `None` for a name that is not a segment's. Two segments with
+/// the same fields address one sidecar -- a promotion keeps them -- and
+/// comparing the fields is the claim test, with no name made to compare.
+pub(super) fn zpg_fields(seg: &str) -> Option<(u64, u64)> {
+    Some((super::Db::name_id(seg)?, super::Db::name_end_seq(seg)?))
+}
+
 /// The sidecar a segment named `seg` would have, or `None` for a name that
 /// is not a segment's.
 pub(super) fn zpg_name_for(seg: &str) -> Option<String> {
-    Some(zpg_name(
-        super::Db::name_id(seg)?,
-        super::Db::name_end_seq(seg)?,
-    ))
+    let (id, end_seq) = zpg_fields(seg)?;
+    Some(zpg_name(id, end_seq))
+}
+
+/// Whether `name` is one of the sidecar's files or a build's temp name:
+/// what a sweep of a store's directory takes for the form's.
+pub(super) fn is_zpg_file(name: &str) -> bool {
+    name.starts_with("zpg-")
 }
 
 /// Why an attach refused a file.
@@ -241,9 +253,18 @@ static NEXT_ZSIDE_ID: AtomicU64 = AtomicU64::new(1);
 /// A sidecar, attached: its file mapped read-only, the fence and the
 /// binding in the heap, and what this process has verified of its pages.
 pub(super) struct ZSide {
-    /// The file, mapped. Its own advice: random, as the store's point reads
-    /// are, where the store's mode is.
+    /// The file, mapped. Advised `MADV_RANDOM` at attach whenever the store
+    /// advises its mappings at all (`ReadAdvice` other than `Normal`), and
+    /// then left alone, as the ordered companion's mapping is, whatever
+    /// mode the store is in at that moment or later: only point reads and
+    /// counts read a sidecar -- the scans of a covered partition are walked
+    /// raw -- and a point read is random in every phase of the store, so
+    /// `Reader::advise`, which follows the workload over the segments, does
+    /// not walk this. The stage that makes scans read sidecars is the one
+    /// to decide what their advice is in a scan phase.
     map: MmapBytes,
+    /// The mapping was advised random (`ZSide::advised`).
+    advised: bool,
     /// Heap copies of the resident part's tables, never evicted.
     fence: ZFence,
     nkeys: usize,
@@ -284,12 +305,14 @@ impl ZSide {
     ///
     /// The filter a trailer may carry is not read: none is built, and no read
     /// is answered from one.
+    ///
+    /// `advise` maps the file `MADV_RANDOM`, once checked.
     pub(super) fn attach(
         path: &Path,
         blob: &Blob<MmapBytes>,
         id: u64,
         end_seq: u64,
-        random: bool,
+        advise: bool,
     ) -> std::result::Result<ZSide, Reject> {
         let damage = |e: ZError| Reject::Damage(e.to_string());
         let map = match MmapBytes::open(path) {
@@ -331,6 +354,7 @@ impl ZSide {
         let bind = bind32(id, end_seq, facts.nkeys, facts.row_crc);
         let side = ZSide {
             map,
+            advised: advise,
             fence,
             nkeys,
             n_pages,
@@ -348,7 +372,7 @@ impl ZSide {
             skewed: None,
         };
         side.check_sample().map_err(damage)?;
-        if random {
+        if advise {
             side.map.advise_random();
         }
         Ok(side)
@@ -523,6 +547,11 @@ impl ZSide {
     /// Pages in the file.
     pub(super) fn pages(&self) -> usize {
         self.n_pages
+    }
+
+    /// Whether the mapping was advised random at attach.
+    pub(super) fn advised(&self) -> bool {
+        self.advised
     }
 
     /// Pages whose first-decode checks have passed in this process, and
@@ -702,6 +731,9 @@ pub(super) struct ZEvents {
     pub attached: AtomicU64,
     pub rejected_damage: AtomicU64,
     pub rejected_identity: AtomicU64,
+    /// Files a sweep of the directory removed: sidecars no live segment
+    /// claims, and the temp names of builds that did not finish.
+    pub swept: AtomicU64,
     /// What the last refusal said: a count says a file was refused and not
     /// which check refused it, and a test that breaks a field wants to see
     /// that it was the check for the field.
@@ -792,6 +824,13 @@ pub(super) const DECLINED_SMALL: u8 = 1;
 /// The code `Seg::z_declined` keeps for a build that failed: not declined
 /// for what the partition holds, but not tried again by this segment.
 pub(super) const DECLINED_FAILED: u8 = 6;
+
+/// The code `Seg::z_declined` keeps for a partition whose sidecar file an
+/// attach refused, which was counted when it was: a build replaces the file
+/// and the attach is not asked again of the same file, or it would be
+/// counted twice. Unlike the others it is not a reason to leave the
+/// partition raw, and a settle still gives it a sidecar.
+pub(super) const DECLINED_REFUSED: u8 = 7;
 
 /// What a build made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

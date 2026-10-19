@@ -330,6 +330,9 @@ pub enum ZPages {
     /// `writer_pins` off, since the cell it is read through is freed with
     /// its segment under the epoch. A partition that has none -- being
     /// built, declined, damaged -- is read from the raw form and counted.
+    /// Scans of a covered partition are walked over the raw form, and
+    /// counted, so a sidecar's mapping is advised `MADV_RANDOM` in every
+    /// phase of the store whenever `read_advice` advises mappings at all.
     /// This is the arm that prices the form: it is built and read whether
     /// or not the store needs it.
     Always,
@@ -388,6 +391,10 @@ pub struct ZCounts {
     pub attached: u64,
     pub rejected_damage: u64,
     pub rejected_identity: u64,
+    /// Files removed from the directory because no live segment claims
+    /// them: sidecars left by a crash or by a store that ran without the
+    /// option, and the temp names of builds that did not finish.
+    pub swept: u64,
     /// Partitions live, the ones with a sidecar installed, the ones of
     /// those out of service, and their pages, the pages a first decode has
     /// passed, the pages a check failed, the fences kept in memory, the
@@ -13577,8 +13584,9 @@ impl Reader {
         self.set_advice_random(random);
         // Segments only. A segment's pages are walked in whichever way the
         // workload is walking them, so the advice follows the phase; the
-        // ordered companion is reached only by a binary search and is left
-        // on `MADV_RANDOM` in both.
+        // ordered companion is reached only by a binary search and a
+        // sidecar only by point reads and counts, and both are left on
+        // `MADV_RANDOM` in both.
         for s in self.segs() {
             if random {
                 s.blob.advise_random();
@@ -13620,12 +13628,36 @@ impl Reader {
         )
     }
 
+    /// How many sidecars' mappings were advised `MADV_RANDOM`, and how many
+    /// sidecars there are.
+    ///
+    /// The sidecar is the other mapping the advice policy can miss, and the
+    /// ordered companion's rule is its own: `advise`'s walk is the segments',
+    /// so a sidecar is advised once, at attach, and not by the mode the store
+    /// is in at that moment -- only point reads and counts reach it, and
+    /// they are random in both phases. Every sidecar of a store that advises
+    /// its mappings is random, then, and none of one that does not
+    /// (`ReadAdvice::Normal`). A check needs to be able to ask, as
+    /// `ords_advised` lets it ask of the companions, and the kernel's own
+    /// answer is the mapping's `VmFlags`.
+    #[doc(hidden)]
+    pub fn zpages_advised(&self) -> (usize, usize) {
+        let _entered = self.enter();
+        let (mut advised, mut total) = (0, 0);
+        for z in self.segs().iter().filter_map(|s| s.z.get()) {
+            total += 1;
+            advised += usize::from(z.advised());
+        }
+        (advised, total)
+    }
+
     /// What the second form (`Options::zpages`) has done over the store's
     /// life, whichever handle did it: the reads and counts it answered, the
     /// reads of a partition that went to the raw form and why, the scans it
     /// stood aside for, what building and attaching sidecars did, and the
     /// sidecars as the segments hold them now. Zero throughout without the
-    /// option.
+    /// option, but for the partitions it counts and the files the open's
+    /// sweep removed, which runs under either setting.
     ///
     /// Read from the slots, the store's shared words and the live segments
     /// alone: the reads' counts are on the slots' lines, which a handle's
@@ -13661,6 +13693,7 @@ impl Reader {
             attached: get(&ev.attached),
             rejected_damage: get(&ev.rejected_damage),
             rejected_identity: get(&ev.rejected_identity),
+            swept: get(&ev.swept),
             ..ZCounts::default()
         };
         for seg in self.segs().iter().filter(|s| s.level > 0) {
@@ -19417,6 +19450,19 @@ impl Db {
                 let _ = std::fs::remove_file(dir.join(name));
             }
         }
+        // And the same for sidecars, under either option: one a live segment
+        // claims stays, since a store that ran without the option may run
+        // with it again and finds the file whole, and every other is a
+        // merge's input whose unlink a crash came before, a build that
+        // never finished, or a file left by a store that was `Always` and
+        // is not. Nothing else removes them: a stale temp name is truncated
+        // by the next build of the same name and never looked at again, and
+        // a sidecar no segment names is not attached.
+        let zev = zside::ZEvents::default();
+        zside::ZEvents::add(
+            &zev.swept,
+            Db::z_sweep(dir, live.iter().map(String::as_str))?,
+        );
         // Where the store starts. `Random` starts advised and never moves;
         let starts_random = opts.read_advice.starts_random();
         let mut segs = Vec::with_capacity(live.len());
@@ -19435,10 +19481,10 @@ impl Db {
         // for its partitions. One that does not check out is counted and
         // the partition is read from the raw form until a settle builds it
         // again; a partition with no file is no rejection.
-        let zev = zside::ZEvents::default();
         if opts.zpages == ZPages::Always {
+            let advise = Db::z_advise(&opts);
             for s in segs.iter().filter(|s| s.level > 0) {
-                Db::z_attach(dir, s, starts_random, &zev);
+                Db::z_attach(dir, s, advise, &zev);
             }
         }
         let ord_rebuilt = segs.iter().filter(|s| s.ord_rebuilt).count() as u64;
@@ -22519,15 +22565,36 @@ impl Db {
 /// for.
 const ZSETTLE_ROUNDS: usize = 4;
 
+/// Where in a round of `Db::zpages_settle_with` its seam is called.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZRound {
+    /// The partitions the round will give sidecars are listed and none is
+    /// built: what lands now retires a partition before its build opens it.
+    Listed,
+    /// They are built and attached, and the segment work has not been joined
+    /// again: what lands now retires a partition whose sidecar is made.
+    Built,
+}
+
 /// The second form's building and attaching (`Options::zpages`), on the
 /// calling thread: there is no builder thread, no controller and nothing
 /// that retires a sidecar before its segment goes.
 impl Db {
+    /// Whether a sidecar's mapping is advised random: whenever the store
+    /// advises its mappings at all. The mode the store is in at the moment
+    /// of the attach is not asked (see `ZSide`'s `map`).
+    fn z_advise(opts: &Options) -> bool {
+        opts.read_advice != ReadAdvice::Normal
+    }
+
     /// `seg`'s sidecar attached from the file its name carries, if there is
     /// one that checks out against the segment: installed, counted, and
     /// true. A file that does not check out is counted by kind and left
-    /// where it is, for a build to replace; no file is not a rejection.
-    fn z_attach(dir: &Path, seg: &Seg, random: bool, ev: &zside::ZEvents) -> bool {
+    /// where it is, for a build to replace, and the segment is marked so
+    /// that the build's round does not ask of the same file again and count
+    /// it twice; no file is not a rejection.
+    fn z_attach(dir: &Path, seg: &Seg, advise: bool, ev: &zside::ZEvents) -> bool {
         let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) else {
             return false;
         };
@@ -22536,7 +22603,7 @@ impl Db {
             &seg.blob,
             id,
             end,
-            random,
+            advise,
         ) {
             Ok(side) => {
                 let installed = seg.z.install(side);
@@ -22547,6 +22614,10 @@ impl Db {
             }
             Err(r) => {
                 ev.rejected(&r);
+                if !matches!(r, zside::Reject::Missing) {
+                    seg.z_declined
+                        .store(zside::DECLINED_REFUSED, AtomicOrdering::Relaxed);
+                }
                 false
             }
         }
@@ -22559,13 +22630,22 @@ impl Db {
     /// no page holds -- is counted by reason and not tried again by this
     /// segment; a build that fails is counted and not tried again either,
     /// and is not an error for the store: the partition is read raw.
+    ///
+    /// A segment whose file is gone by the time its build opens it was
+    /// retired by a merge or a promotion that landed after the partitions
+    /// were listed. That is a build outrun and not a build that failed: the
+    /// merge's outputs are partitions of their own, given theirs by the next
+    /// round, and the retired segment is not tried again.
     fn z_give(&self, seg: &Seg) {
         let ev = &self.shared.z;
         let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) else {
             return;
         };
-        let random = self.advice_random();
-        if Db::z_attach(&self.dir, seg, random, ev) {
+        let advise = Db::z_advise(&self.opts);
+        // A file an attach refused was counted when it was, at open or in
+        // an earlier call, and is replaced below.
+        let refused = seg.z_declined.load(AtomicOrdering::Relaxed) == zside::DECLINED_REFUSED;
+        if !refused && Db::z_attach(&self.dir, seg, advise, ev) {
             return;
         }
         let out = self.dir.join(zside::zpg_name(id, end));
@@ -22586,7 +22666,7 @@ impl Db {
         };
         match made {
             Ok(zside::Outcome::Built(b)) => {
-                match zside::ZSide::attach(&out, &seg.blob, id, end, random) {
+                match zside::ZSide::attach(&out, &seg.blob, id, end, advise) {
                     Ok(side) => {
                         if seg.z.install(side) {
                             ev.built(&b);
@@ -22604,9 +22684,39 @@ impl Db {
             Ok(zside::Outcome::Declined(d)) => {
                 ev.declined(d);
                 seg.z_declined.store(d.code(), AtomicOrdering::Relaxed);
+                if refused {
+                    // The file under the name was not this segment's, and
+                    // no build is replacing it.
+                    let _ = std::fs::remove_file(&out);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                zside::ZEvents::add(&ev.build_orphaned, 1);
+                seg.z_declined
+                    .store(zside::DECLINED_FAILED, AtomicOrdering::Relaxed);
             }
             Err(_) => failed(zside::DECLINED_FAILED),
         }
+    }
+
+    /// The sidecar files in `dir` that none of the segments named `live`
+    /// claims, and the temp names of builds that did not finish, removed;
+    /// how many. Called where nothing is building: at open, and at the end
+    /// of `zpages_settle`.
+    fn z_sweep<'a>(dir: &Path, live: impl Iterator<Item = &'a str>) -> Result<u64> {
+        let claimed: std::collections::HashSet<String> =
+            live.filter_map(zside::zpg_name_for).collect();
+        let mut removed = 0;
+        for entry in std::fs::read_dir(dir)? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if zside::is_zpg_file(&name)
+                && !claimed.contains(&name)
+                && std::fs::remove_file(dir.join(&name)).is_ok()
+            {
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     /// Under `ZPages::Always`, every live partition given a sidecar
@@ -22615,13 +22725,25 @@ impl Db {
     /// without a sidecar in turn, on this thread, then the segment work
     /// again for a merge that landed meanwhile, whose outputs the next round
     /// gives theirs. A sidecar built for a partition a merge retired before
-    /// this finished is removed and counted. Nothing under `Off`.
+    /// this finished is counted and removed; at the end the directory holds
+    /// the live segments' sidecars and no other, whatever a crash or a
+    /// store that ran without the option left. Nothing under `Off`.
     ///
     /// What the suite's `sync` calls after a flush under the arm: without
     /// it a flush returns before the segment work's later steps, and the
     /// arm would measure the raw form.
     #[doc(hidden)]
     pub fn zpages_settle(&mut self) -> Result<()> {
+        self.zpages_settle_with(&mut |_, _| {})
+    }
+
+    /// `zpages_settle`, with `between` called on the store at two points of
+    /// every round that has a partition to give a sidecar (`ZRound`): a
+    /// test's seam for what lands between the steps of a round, which no
+    /// schedule of the segment work makes happen on purpose. It is not
+    /// called by a round that has nothing to give.
+    #[doc(hidden)]
+    pub fn zpages_settle_with(&mut self, between: &mut dyn FnMut(&mut Db, ZRound)) -> Result<()> {
         if self.opts.zpages != ZPages::Always {
             return Ok(());
         }
@@ -22635,9 +22757,10 @@ impl Db {
                 self.segs()
                     .iter()
                     .filter(|s| {
+                        let why = s.z_declined.load(AtomicOrdering::Relaxed);
                         s.level > 0
                             && s.z.get().is_none()
-                            && s.z_declined.load(AtomicOrdering::Relaxed) == 0
+                            && (why == 0 || why == zside::DECLINED_REFUSED)
                     })
                     .cloned()
                     .collect()
@@ -22649,11 +22772,13 @@ impl Db {
                 if self.in_flight().1 {
                     continue;
                 }
-                return Ok(());
+                break;
             }
+            between(self, ZRound::Listed);
             for seg in &todo {
                 self.z_give(seg);
             }
+            between(self, ZRound::Built);
             self.settle()?;
             let live: Vec<String> = {
                 let _op = self.op();
@@ -22672,6 +22797,15 @@ impl Db {
                 }
             }
         }
+        // A build that finished after the landing that retired its segment
+        // wrote a file nothing claims, and so did a build the rounds ran
+        // out before.
+        let names: Vec<String> = {
+            let _op = self.op();
+            self.segs().iter().map(|s| s.name.clone()).collect()
+        };
+        let swept = Db::z_sweep(&self.dir, names.iter().map(String::as_str))?;
+        zside::ZEvents::add(&self.shared.z.swept, swept);
         Ok(())
     }
 
@@ -27869,15 +28003,29 @@ impl Maint {
         // test: a promotion keeps them, so the retired name and the live one
         // address one file. Unlinked here and not swept at the next open
         // because a merge is the steady state, and a store that merges for
-        // hours would leave a file per input it retired. The mapping a
-        // pinned reader holds outlives the name.
-        if let Some(zpg) = zside::zpg_name_for(name) {
-            let claimed = self
-                .segs()
-                .iter()
-                .any(|s| zside::zpg_name_for(&s.name).as_deref() == Some(zpg.as_str()));
-            if !claimed {
-                let _ = std::fs::remove_file(self.dir.join(&zpg));
+        // hours would leave a file per input it retired. A mapping a pinned
+        // reader holds outlives the name, so for a sidecar that is attached
+        // the unlink removes the name and the blocks go with the last
+        // mapping, wherever the segment holding it is dropped; for one
+        // nobody maps, left by a store that ran with the form and is not
+        // running with it, they go here, on the thread every landing goes
+        // through, as the segment's own do above. A freed inode is a device
+        // round trip on this filesystem, so under the forced arm that is a
+        // cost of every merge, and it is read in the cells that merge.
+        //
+        // One stat first: a store that never made a sidecar -- every store
+        // under the default -- pays that and nothing more for a retired
+        // segment, where the claim below compares every live segment's
+        // name.
+        if let Some(fields) = zside::zpg_fields(name) {
+            let zpg = self.dir.join(zside::zpg_name(fields.0, fields.1));
+            if zpg.exists()
+                && !self
+                    .segs()
+                    .iter()
+                    .any(|s| zside::zpg_fields(&s.name) == Some(fields))
+            {
+                let _ = std::fs::remove_file(zpg);
             }
         }
     }
