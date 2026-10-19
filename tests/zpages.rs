@@ -19,7 +19,9 @@ use supdb::db::zpages::{
     bind32, decode_group, fill_group, parse_page, verify_page, FenceEntry, Fill, FillScratch,
     GroupBuf, Images, SegImages, ZPAGE,
 };
-use supdb::flatindex::{record_key, stream_record_as, FlatIndex, Header};
+#[cfg(target_os = "linux")]
+use supdb::flatindex::Header;
+use supdb::flatindex::{record_key, stream_record_as, FlatIndex};
 use supdb::{Blob, Bytes, Db, MmapBytes, Options};
 
 fn scratch(name: &str) -> PathBuf {
