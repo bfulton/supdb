@@ -8928,6 +8928,44 @@ fn compact_job(plan: MergePlan) -> Result<Vec<String>> {
     compact_run(plan)
 }
 
+/// Cut the ranks `[from, to)`, whose keys lie in the fence `(lo, hi)`, at
+/// `bounds` -- ascending, each a value below `hi` cut to the fence's
+/// length -- and name each slice by the bounds that cut it: `lo` up to the
+/// first bound that cuts anything, bound to bound, the last bound up to
+/// `hi`. A bound that cuts nothing off what is left -- one at or below the
+/// first key left, as the cut of a key sharing its first bytes with the
+/// keys before it is -- makes no slice and names none, so the fences tile
+/// `(lo, hi)` whatever was skipped.
+fn cut_by_bounds(
+    keys: &KeyList,
+    from: usize,
+    to: usize,
+    (lo, hi): (&[u8], &Option<Vec<u8>>),
+    bounds: &[Vec<u8>],
+) -> (Vec<(usize, usize)>, Vec<Fence>) {
+    let mut slices = Vec::with_capacity(bounds.len() + 1);
+    let mut given = Vec::with_capacity(bounds.len() + 1);
+    let mut at = from;
+    let mut slo = lo.to_vec();
+    for b in bounds {
+        let end = keys.partition_point(|k| k < b.as_slice()).clamp(from, to);
+        if end > at {
+            slices.push((at, end));
+            given.push((std::mem::replace(&mut slo, b.clone()), Some(b.clone())));
+            at = end;
+        }
+    }
+    if to > at {
+        slices.push((at, to));
+        given.push((slo, hi.clone()));
+    } else if let Some(last) = given.last_mut() {
+        // Nothing left above the last bound that cut: the slice before it
+        // closes at `hi`, so the fences stay a tiling.
+        last.1 = hi.clone();
+    }
+    (slices, given)
+}
+
 /// Distinct keys of a merge, in order, in one allocation -- pass one of the
 /// merge. The slicing addresses keys by rank exactly as the sorted vector
 /// this replaced did, without a million allocations, a sort or a dedup.
@@ -9067,7 +9105,15 @@ impl Emitter<'_> {
         // The slices tile the ranks; a key that belongs to no piece is a
         // key that would have been dropped, silently, on the way to disk.
         if self.r < p.from || self.r >= p.to {
-            return Err(err("merge slices leave a key unassigned"));
+            return Err(err(&format!(
+                "merge slices leave a key unassigned: rank {} against piece {} of {}, ranks [{}, {}), {}",
+                self.r,
+                self.pi,
+                self.pieces.len(),
+                p.from,
+                p.to,
+                p.name
+            )));
         }
         // Insurance against the class of bug that produced this line: a
         // merge told to write a fence must contain what it writes, or the
@@ -9076,7 +9122,18 @@ impl Emitter<'_> {
             if (!p.lo.is_empty() && k < p.lo.as_slice())
                 || p.hi.as_ref().is_some_and(|h| k >= h.as_slice())
             {
-                return Err(err("compaction would write a key outside its fence"));
+                return Err(err(&format!(
+                    "compaction would write a key outside its fence: key {} at rank {} of piece {} of {}, ranks [{}, {}), fence [{}, {}), {}",
+                    hex(k),
+                    self.r,
+                    self.pi,
+                    self.pieces.len(),
+                    p.from,
+                    p.to,
+                    hex(&p.lo),
+                    p.hi.as_deref().map(hex).unwrap_or_default(),
+                    p.name
+                )));
             }
         }
         let (from, to, tmp) = (p.from, p.to, p.tmp.clone());
@@ -9229,7 +9286,14 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         }
     }
     // Slice by whichever boundaries govern: the given fences when the
-    // caller has them, the derived ones when it does not.
+    // caller has them, the derived ones when it does not. Either way a
+    // slice is named by the bounds that cut it and never by its position
+    // among them: a bound is a key cut to the fence's length, so a run of
+    // keys longer than a fence that share their first bytes gives a bound
+    // at or below the run's first key, which cuts nothing and makes no
+    // slice, and a piece named by position carried the fence of the slice
+    // before it and refused its own first key ("compaction would write a
+    // key outside its fence", `tests/fences.rs`).
     let mut slices: Vec<(usize, usize)> = Vec::new();
     let mut given: Vec<Fence> = Vec::new();
     match &fences {
@@ -9247,42 +9311,36 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
                     None => keys.len(),
                 };
                 let to = to.max(from);
+                if from == to {
+                    continue;
+                }
+                // Sub-fences tile the fence they came from: the first
+                // keeps its low bound, the last its high bound, and the
+                // joins are single shared values, each the key at an even
+                // rank cut to the fence's length. A join is made only
+                // where that cut separates the keys on either side of it:
+                // a cut inside a run of keys sharing their first bytes is
+                // at or below the whole run and cuts nothing, so the run
+                // stays in one piece rather than being named by a fence
+                // its own keys are outside of.
                 let n = (to - from).div_ceil(max_keys.max(1)).max(1);
                 let per_sub = (to - from).div_ceil(n);
-                for i in 0..n {
-                    let sf = from + i * per_sub;
-                    let st = (sf + per_sub).min(to);
-                    if sf >= st {
-                        continue;
+                let mut sub: Vec<Vec<u8>> = Vec::new();
+                for i in 1..n {
+                    let b = fence_lo(keys.get((from + i * per_sub).min(to - 1)));
+                    if sub.last().is_none_or(|p| p != &b) {
+                        sub.push(b);
                     }
-                    // Sub-fences tile the fence they came from: the first
-                    // keeps its low bound, the last its high bound, and the
-                    // joins are single shared values.
-                    let sub_lo = if i == 0 {
-                        lo.clone()
-                    } else {
-                        fence_lo(keys.get(sf))
-                    };
-                    let sub_hi = if st == to {
-                        hi.clone()
-                    } else {
-                        Some(fence_lo(keys.get(st)))
-                    };
-                    slices.push((sf, st));
-                    given.push((sub_lo, sub_hi));
                 }
+                let (s, g) = cut_by_bounds(&keys, from, to, (lo, hi), &sub);
+                slices.extend(s);
+                given.extend(g);
             }
         }
         None => {
-            let mut at = 0usize;
-            for b in &bounds {
-                let end = keys.partition_point(|k| k < b.as_slice());
-                if end > at {
-                    slices.push((at, end));
-                    at = end;
-                }
-            }
-            slices.push((at, keys.len()));
+            let (s, g) = cut_by_bounds(&keys, 0, keys.len(), (&[], &None), &bounds);
+            slices.extend(s);
+            given.extend(g);
         }
     }
 
@@ -9292,23 +9350,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
             continue;
         }
         let id = first_id + pi as u64;
-        let (lo, hi) = match &fences {
-            Some(_) => given[pi].clone(),
-            // Unbounded at both ends of the set, and every interior fence
-            // is the boundary shared with the neighbour.
-            None => (
-                if pi == 0 {
-                    Vec::new()
-                } else {
-                    bounds[pi - 1].clone()
-                },
-                if pi + 1 == slices.len() {
-                    None
-                } else {
-                    Some(bounds[pi].clone())
-                },
-            ),
-        };
+        let (lo, hi) = given[pi].clone();
         let name = format!(
             "par-{id:08}-{end_seq:016}-{}-{}.sup",
             hex(&lo),
