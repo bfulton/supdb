@@ -2835,6 +2835,38 @@ impl BlockedBloom {
         let b = &self.blocks[bi];
         probes.iter().all(|&(w, m)| b[w] & m != 0)
     }
+
+    /// The words as a sidecar stores them: every block's eight words
+    /// little-endian, block after block. The one encoding, which
+    /// `from_words` reverses and the layout's pin test hashes.
+    fn words(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(self.blocks.len() * 64);
+        for b in &self.blocks {
+            for w in b {
+                v.extend_from_slice(&w.to_le_bytes());
+            }
+        }
+        v
+    }
+
+    /// A filter from the words `words` wrote, or `None` for a length that
+    /// is not whole blocks or is nothing.
+    fn from_words(bytes: &[u8]) -> Option<BlockedBloom> {
+        if bytes.is_empty() || !bytes.len().is_multiple_of(64) {
+            return None;
+        }
+        let blocks = bytes
+            .chunks_exact(64)
+            .map(|c| {
+                let mut b = [0u64; 8];
+                for (w, x) in b.iter_mut().zip(c.chunks_exact(8)) {
+                    *w = u64::from_le_bytes(x.try_into().expect("eight bytes"));
+                }
+                b
+            })
+            .collect();
+        Some(BlockedBloom { blocks })
+    }
 }
 
 /// A merge in flight: the input names it will retire, and the thread

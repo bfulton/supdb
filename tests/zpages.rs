@@ -1077,7 +1077,10 @@ fn every_field_of_the_trailer_wrong_is_refused_and_counted() {
         ("filter_off", Box::new(|t| t.filter_off = 64)),
         ("filter_blocks", Box::new(|t| t.filter_blocks = 1)),
         ("res_crc", Box::new(|t| t.res_crc ^= 1)),
-        ("filter", Box::new(|t| t.filter = true)),
+        ("filter", Box::new(|t| t.filter = false)),
+        ("bloom_sig", Box::new(|t| t.bloom_sig = 5)),
+        ("bloom_probes", Box::new(|t| t.bloom_probes = 5)),
+        ("bloom_bits_per_key", Box::new(|t| t.bloom_bits_per_key = 5)),
         ("seg_recs_len", Box::new(|t| t.seg_recs_len += 4)),
         ("seg_crc_off", Box::new(|t| t.seg_crc_off += 4)),
         ("seg_key_off", Box::new(|t| t.seg_key_off += 4096)),
@@ -1111,15 +1114,9 @@ fn every_field_of_the_trailer_wrong_is_refused_and_counted() {
         let c = db.zpage_counts();
         assert_eq!((c.sidecars, c.builds), (1, 1), "{field}: {c:?}");
     }
-    // The fields no read depends on are accepted: the decoded bytes a trailer
-    // sums for the ratio, and a filter's parameters, which a trailer with
-    // none is not asked for.
-    let harmless: Vec<(&str, Edit)> = vec![
-        ("total_ulen", Box::new(|t| t.total_ulen += 1)),
-        ("bloom_sig", Box::new(|t| t.bloom_sig = 5)),
-        ("bloom_probes", Box::new(|t| t.bloom_probes = 5)),
-        ("bloom_bits_per_key", Box::new(|t| t.bloom_bits_per_key = 5)),
-    ];
+    // The field no read depends on is accepted: the decoded bytes a trailer
+    // sums for the ratio.
+    let harmless: Vec<(&str, Edit)> = vec![("total_ulen", Box::new(|t| t.total_ulen += 1))];
     for (field, edit) in &harmless {
         let db = open_changed(&dir, &format!("trailer-ok-{field}"), |p| rewrite(p, edit));
         let c = db.zpage_counts();
@@ -2619,10 +2616,12 @@ fn decodes_count_the_pages_decoded_to_answer_and_no_others() {
     let c2 = db.zpage_counts();
     let asked = 2 * inside.len() as u64;
     assert_eq!(c2.reads + c2.counts - c1.reads - c1.counts, asked, "{c2:?}");
-    assert_eq!(
-        c2.decodes - c1.decodes,
-        asked,
-        "an absent key inside the range decodes the page it would be in"
+    // An absent key the filter rejects is answered from the heap; only the
+    // filter's false positives, under two in a hundred, decode the page
+    // the key would be in.
+    assert!(
+        c2.decodes - c1.decodes <= asked / 16,
+        "absent keys inside the range decode only on the filter's false positives: {c2:?}"
     );
     // Below the first key.
     check(&db, &model, &[b"a".to_vec(), Vec::new()], "below");
@@ -2657,15 +2656,15 @@ fn the_sizes_the_store_reports_are_the_files_it_holds() {
             let (h, _) = parse_page(&bytes[p * ZPAGE..(p + 1) * ZPAGE], bind).unwrap();
             groups += u64::from(h.ulen);
         }
-        let (fnc, _) =
+        let (fnc, filter) =
             ZFence::decode_resident(&bytes[t.res_off as usize..bytes.len() - ZTRAILER], &t)
                 .unwrap();
-        fence += fnc.heap_bytes() as u64;
+        fence += fnc.heap_bytes() as u64 + filter.len() as u64;
     }
     assert_eq!(c.file_bytes, file, "{c:?}");
     assert_eq!(c.group_bytes, groups, "{c:?}");
     assert_eq!(c.pages, pages, "{c:?}");
-    assert_eq!(c.resident_bytes, fence, "{c:?}");
+    assert_eq!(c.resident_bytes, fence, "the fence and the filter: {c:?}");
     assert_eq!(
         c.build_bytes, file,
         "what the builds wrote is what is there"
@@ -3642,5 +3641,88 @@ fn records_larger_than_a_page_are_read_from_the_raw_segment() {
     assert_eq!(db.zpage_counts().nopage_reads, 8, "{c:?}");
     drop(r);
     db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- the filter -------------------------------------------------------------------------
+
+/// The filter a sidecar stores is a function of engine code the segment's
+/// checksum row cannot see: an engine whose filter layout changed would
+/// attach an old sidecar with every other check passing and answer present
+/// keys absent. The trailer's signature refuses one (the trailer test above
+/// flips it), and so does every key of the fence tested in the filter,
+/// which a filter of the right size and signature over the wrong bits --
+/// here the blocks in reverse order under a good resident checksum -- fails
+/// with certainty. Through a good one, a key the filter rejects is answered
+/// absent with no page decoded.
+#[test]
+fn a_filter_of_another_layout_cannot_attach_and_never_answers_absent() {
+    let (dir, model, keys) = one_partition("filter-src", 4500, 0xF117);
+    let probe: Vec<Vec<u8>> = keys.iter().step_by(23).cloned().collect();
+    let reverse = |p: &Path| {
+        let mut bytes = std::fs::read(p).unwrap();
+        let at = bytes.len() - ZTRAILER;
+        let mut t = Trailer::decode(&bytes[at..]).unwrap();
+        assert!(
+            t.filter && t.filter_blocks >= 2,
+            "a filter of blocks: {t:?}"
+        );
+        let (fence, filter) = ZFence::decode_resident(&bytes[t.res_off as usize..at], &t).unwrap();
+        let mut words = Vec::with_capacity(filter.len());
+        for block in filter.chunks_exact(64).rev() {
+            words.extend_from_slice(block);
+        }
+        let (res, rf) = fence.encode_resident(&words).unwrap();
+        t.res_len = rf.res_len;
+        t.res_crc = rf.res_crc;
+        t.filter_off = rf.filter_off;
+        t.filter_blocks = rf.filter_blocks;
+        bytes.truncate(t.res_off as usize);
+        bytes.extend_from_slice(&res);
+        bytes.extend_from_slice(&t.encode());
+        std::fs::write(p, bytes).unwrap();
+    };
+    let mut db = open_changed(&dir, "filter-reversed", reverse);
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.rejected_identity, c.rejected_damage, c.sidecars),
+        (1, 0, 0),
+        "{c:?}"
+    );
+    assert!(
+        db.zpage_last_reject().contains("not in the filter"),
+        "{}",
+        db.zpage_last_reject()
+    );
+    check(&db, &model, &probe, "reversed filter");
+    assert_eq!(db.zpage_counts().rawserves, 2 * probe.len() as u64);
+    // A settle replaces it, and the keys are answered from the new one.
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!((c.sidecars, c.builds), (1, 1), "{c:?}");
+    check(&db, &model, &probe, "rebuilt");
+    assert_eq!(db.zpage_counts().reads, probe.len() as u64);
+    drop(db);
+    // Keys the partition does not hold are answered from the filter, with no
+    // page touched: a read and a count each, served, and only the filter's
+    // false positives decode a page. Four probes of ten bits a key is under
+    // two in a hundred, so a few of four hundred; four hundred would mean no
+    // filter was consulted.
+    let db = Db::open(&dir, forced(|_| {})).unwrap();
+    let absent: Vec<Vec<u8>> = (0..200)
+        .map(|i| format!("not-a-key-{i:04}").into_bytes())
+        .collect();
+    let before = db.zpage_counts();
+    check(&db, &model, &absent, "absent keys");
+    let c = db.zpage_counts();
+    assert_eq!(c.reads - before.reads, absent.len() as u64, "{c:?}");
+    assert_eq!(c.counts - before.counts, absent.len() as u64, "{c:?}");
+    assert_eq!(
+        (c.rawserves, c.fallbacks, c.nopage_reads),
+        (0, 0, 0),
+        "{c:?}"
+    );
+    assert!(c.decodes - before.decodes < 40, "{c:?}");
+    drop(db);
     let _ = std::fs::remove_dir_all(&dir);
 }

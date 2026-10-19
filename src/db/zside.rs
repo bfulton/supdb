@@ -113,6 +113,39 @@ pub(super) enum Reject {
     Identity(String),
 }
 
+/// The stored filter `words`, held to the running engine: the trailer's
+/// signature and parameters are the engine's, the words are the size the
+/// engine builds for `nkeys`, and every key of `fence` tests present. Each
+/// failure is an identity refusal, since the file is whole and of something
+/// this engine does not compute.
+fn engine_filter(
+    t: &Trailer,
+    words: &[u8],
+    fence: &ZFence,
+    nkeys: usize,
+) -> std::result::Result<super::BlockedBloom, Reject> {
+    if !t.filter_matches_engine() {
+        return Err(Reject::Identity(
+            "the filter's layout is not this engine's".into(),
+        ));
+    }
+    if words.len() != super::zpages::filter_bytes(nkeys) {
+        return Err(Reject::Identity(
+            "the filter is not the size this engine builds for the key count".into(),
+        ));
+    }
+    let f = super::BlockedBloom::from_words(words)
+        .ok_or_else(|| Reject::Identity("the filter is not whole blocks".into()))?;
+    for i in 0..fence.len() {
+        if fence.key(i).is_some_and(|k| !f.maybe_contains(k)) {
+            return Err(Reject::Identity(
+                "a key of the fence is not in the filter".into(),
+            ));
+        }
+    }
+    Ok(f)
+}
+
 /// What a read of a covered partition answered.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ZRead {
@@ -283,6 +316,10 @@ pub(super) struct ZSide {
     advised: bool,
     /// Heap copies of the resident part's tables, never evicted.
     fence: ZFence,
+    /// The filter the file stores, over every key of the partition: a
+    /// read of a key it does not hold is answered absent from the heap,
+    /// with no page touched. `None` for a sidecar built without one.
+    filter: Option<super::BlockedBloom>,
     nkeys: usize,
     n_pages: usize,
     /// The hash every page's CRC is xored with, recomputed from the live
@@ -319,8 +356,15 @@ impl ZSide {
     /// entries that name them. A page body beyond those sixteen is checked
     /// at its first decode.
     ///
-    /// The filter a trailer may carry is not read: none is built, and no read
-    /// is answered from one.
+    /// The filter the trailer says the file carries is read into the heap
+    /// and held to the running engine before a read consults it: its
+    /// signature, probes and bits a key are the engine's (`BLOOM_SIG`), its
+    /// size is the one the engine builds for the key count, and every key
+    /// of the fence tests present in it, which a filter of another layout
+    /// over the same keys fails with certainty. A filter is a function of
+    /// engine code the segment's checksum row cannot see, and a stored one
+    /// whose layout the engine no longer computes would answer present keys
+    /// absent with nothing raised, so each is an identity refusal.
     ///
     /// `advise` maps the file `MADV_RANDOM`, once checked.
     pub(super) fn attach(
@@ -366,12 +410,18 @@ impl ZSide {
         let res = map
             .slice_at(t.res_off, res_len)
             .ok_or_else(|| damage(ZError::Length))?;
-        let (fence, _filter) = ZFence::decode_resident(res, &t).map_err(damage)?;
+        let (fence, filter) = ZFence::decode_resident(res, &t).map_err(damage)?;
+        let filter = if t.filter {
+            Some(engine_filter(&t, filter, &fence, nkeys)?)
+        } else {
+            None
+        };
         let bind = bind32(id, end_seq, facts.nkeys, facts.row_crc);
         let side = ZSide {
             map,
             advised: advise,
             fence,
+            filter,
             nkeys,
             n_pages,
             bind,
@@ -453,6 +503,11 @@ impl ZSide {
     fn locate<'a>(&'a self, key: &[u8], buf: &'a mut GroupBuf) -> Locate<'a> {
         if self.damaged.load(Ordering::Relaxed) {
             return Locate::Out;
+        }
+        // A key the filter does not hold is not in the partition: answered
+        // from the heap, no page touched.
+        if self.filter.as_ref().is_some_and(|f| !f.maybe_contains(key)) {
+            return Locate::Absent { decoded: false };
         }
         // A key below the first key is not in the partition.
         let Some(e) = self.fence.entry_of(key) else {
@@ -591,9 +646,9 @@ impl ZSide {
         popcount(&self.bad)
     }
 
-    /// Heap bytes the sidecar keeps resident: the fence.
+    /// Heap bytes the sidecar keeps resident: the fence and the filter.
     pub(super) fn resident_bytes(&self) -> usize {
-        self.fence.heap_bytes()
+        self.fence.heap_bytes() + self.filter.as_ref().map_or(0, |f| f.blocks.len() * 64)
     }
 
     /// The file's bytes.
@@ -1102,9 +1157,11 @@ impl BuildPlan {
 /// fits no page compressed or stored -- is an entry of the fence with no
 /// page (`ZNOPAGE`), the raw form's to read, and the build goes on past it;
 /// a key in that entry's range that is not the record's is absent from the
-/// fence alone. No filter is built. The temp name is removed on every way
-/// out the function has, a decline after pages were written among them; a
-/// crash leaves it for the sweep at open.
+/// fence alone. A filter over every key, the ones no page holds included,
+/// goes into region B beside the fence, with its signature and parameters
+/// in the trailer. The temp name is removed on every way out the function
+/// has, a decline after pages were written among them; a crash leaves it
+/// for the sweep at open.
 pub(super) fn build(
     seg_path: &Path,
     out: &Path,
@@ -1247,6 +1304,10 @@ fn write_pages(
     // The last record no page held, for the decline of a partition that
     // has nothing else.
     let mut last_nopage: Option<NoPage> = None;
+    // Every key of the partition, the ones no page holds included, taken
+    // from each record before the walk drops it from the cache: a read of a
+    // key the filter rejects is answered absent from the heap.
+    let mut bloom = super::BlockedBloom::with_capacity(nkeys);
     // The raw bytes the walk has passed, handed to the cache to forget.
     let mut forget = |from: usize, to: usize| {
         if plan.drop_behind && from < to {
@@ -1276,6 +1337,11 @@ fn write_pages(
                     super::err(&format!("z build: a page fails the reader's checks: {e}"))
                 })?;
                 fence.push(entry.first_rank, pages, key)?;
+                for r in rank..rank + g.count {
+                    let k = record_key(images.image(r), 0)
+                        .ok_or_else(|| super::err("z build: a record has no key"))?;
+                    bloom.insert(k);
+                }
                 w.push(&page)?;
                 total_ulen += g.ulen as u64;
                 pages += 1;
@@ -1305,6 +1371,7 @@ fn write_pages(
                 let first_rank = u32::try_from(rank)
                     .map_err(|_| super::err("z build: a rank past four billion"))?;
                 fence.push(first_rank, ZNOPAGE, key)?;
+                bloom.insert(key);
                 last_nopage = Some(why);
                 rank += 1;
             }
@@ -1323,7 +1390,7 @@ fn write_pages(
             last_nopage.unwrap_or(NoPage::Unplaceable),
         )));
     }
-    let (res, rf) = fence.encode_resident(&[])?;
+    let (res, rf) = fence.encode_resident(&bloom.words())?;
     w.push(&res)?;
     let t = Trailer {
         n_pages: u64::from(pages),
@@ -1332,10 +1399,10 @@ fn write_pages(
         res_off: u64::from(pages) * ZPAGE as u64,
         res_len: rf.res_len,
         keys_len: rf.keys_len,
-        filter_off: 0,
-        filter_blocks: 0,
+        filter_off: rf.filter_off,
+        filter_blocks: rf.filter_blocks,
         res_crc: rf.res_crc,
-        filter: false,
+        filter: true,
         total_ulen,
         seg_recs_len: facts.recs_len,
         seg_crc_off: facts.crc_off,
@@ -1349,9 +1416,9 @@ fn write_pages(
         rec_magic: facts.rec_magic,
         seg_id: id,
         seg_end_seq: end_seq,
-        bloom_probes: 0,
-        bloom_sig: 0,
-        bloom_bits_per_key: 0,
+        bloom_probes: super::BLOOM_PROBES,
+        bloom_sig: super::BLOOM_SIG,
+        bloom_bits_per_key: super::BLOOM_BITS_PER_KEY,
     };
     w.push(&t.encode())?;
     w.flush()?;
@@ -1958,7 +2025,7 @@ mod tests {
             (
                 "n_entries",
                 Box::new(|t| t.n_entries += 1),
-                "damage: z form: the resident part is malformed: the region is not the entries alone",
+                "damage: z form: the resident part is malformed: the filter is not where the entries end",
             ),
             (
                 "nkeys",
@@ -1978,17 +2045,17 @@ mod tests {
             (
                 "keys_len",
                 Box::new(|t| t.keys_len += 1),
-                "damage: z form: the resident part is malformed: the region is not the entries alone",
+                "damage: z form: the resident part is malformed: the key offsets do not run from zero to the blob's length",
             ),
             (
                 "filter_off",
                 Box::new(|t| t.filter_off = 64),
-                "damage: z form: the resident part is malformed: the region is not the entries alone",
+                "damage: z form: the resident part is malformed: the filter is not where the entries end",
             ),
             (
                 "filter_blocks",
                 Box::new(|t| t.filter_blocks = 1),
-                "damage: z form: the trailer is inconsistent: the filter flag and the filter's blocks disagree",
+                "damage: z form: the resident part is malformed: the filter is not where the entries end",
             ),
             (
                 "res_crc",
@@ -1997,8 +2064,23 @@ mod tests {
             ),
             (
                 "filter",
-                Box::new(|t| t.filter = true),
+                Box::new(|t| t.filter = false),
                 "damage: z form: the trailer is inconsistent: the filter flag and the filter's blocks disagree",
+            ),
+            (
+                "bloom_sig",
+                Box::new(|t| t.bloom_sig = 9),
+                "identity: the filter's layout is not this engine's",
+            ),
+            (
+                "bloom_probes",
+                Box::new(|t| t.bloom_probes = 9),
+                "identity: the filter's layout is not this engine's",
+            ),
+            (
+                "bloom_bits_per_key",
+                Box::new(|t| t.bloom_bits_per_key = 9),
+                "identity: the filter's layout is not this engine's",
             ),
             (
                 "seg_recs_len",
@@ -2069,25 +2151,12 @@ mod tests {
                 Ok(_) => panic!("a trailer with {field} changed attached"),
             }
         }
-        // The fields no read depends on: the decoded bytes a trailer sums
-        // for the ratio, and the filter's parameters, which a trailer with
-        // no filter does not read. A wrong value is accepted and harmless.
-        for (field, edit) in [
-            (
-                "total_ulen",
-                Box::new(|t: &mut Trailer| t.total_ulen += 1) as Edit,
-            ),
-            ("bloom_sig", Box::new(|t: &mut Trailer| t.bloom_sig = 9)),
-            (
-                "bloom_probes",
-                Box::new(|t: &mut Trailer| t.bloom_probes = 9),
-            ),
-        ] {
-            std::fs::write(&fx.out, &good).unwrap();
-            with_trailer(&fx.out, |t| edit(t));
-            let side = fx.attach().unwrap_or_else(|e| panic!("{field}: {e:?}"));
-            agree(&side, &fx.blob, &fx.recs);
-        }
+        // The field no read depends on: the decoded bytes a trailer sums
+        // for the ratio. A wrong value is accepted and harmless.
+        std::fs::write(&fx.out, &good).unwrap();
+        with_trailer(&fx.out, |t| t.total_ulen += 1);
+        let side = fx.attach().unwrap_or_else(|e| panic!("total_ulen: {e:?}"));
+        agree(&side, &fx.blob, &fx.recs);
         // The file as built still attaches.
         std::fs::write(&fx.out, &good).unwrap();
         let side = fx.attach().unwrap();
@@ -2904,7 +2973,7 @@ mod tests {
         fx.side();
         let good = std::fs::read(&fx.out).unwrap();
         let t = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
-        let (fence, _) =
+        let (fence, filter) =
             ZFence::decode_resident(&good[t.res_off as usize..good.len() - ZTRAILER], &t).unwrap();
         let (pages, k) = (t.n_pages as usize, 5usize);
         assert!(pages > k + 3);
@@ -2924,7 +2993,8 @@ mod tests {
             cut.push(fence.first_rank(i).unwrap(), page, fence.key(i).unwrap())
                 .unwrap();
         }
-        let (res, rf) = cut.encode_resident(&[]).unwrap();
+        // The filter goes with the fence: the keys are the same.
+        let (res, rf) = cut.encode_resident(filter).unwrap();
         bytes.extend_from_slice(&res);
         let dropped = page_view(&good[k * ZPAGE..(k + 1) * ZPAGE]).unwrap().0;
         let mut t2 = t.clone();
@@ -2932,6 +3002,8 @@ mod tests {
         t2.res_off = t2.n_pages * ZPAGE as u64;
         t2.res_len = rf.res_len;
         t2.res_crc = rf.res_crc;
+        t2.filter_off = rf.filter_off;
+        t2.filter_blocks = rf.filter_blocks;
         t2.total_ulen -= u64::from(dropped.ulen);
         bytes.extend_from_slice(&t2.encode());
         std::fs::write(&fx.out, &bytes).unwrap();
@@ -2962,9 +3034,29 @@ mod tests {
         assert_eq!(declined, hi - lo);
         assert!(served > 3 * declined, "{served} served");
         assert!(!side.damaged() && side.bad_pages() == 0);
-        // A key that falls in the run and is not there is the raw form's to
-        // say so too, not the sidecar's to say absent.
+        // A key that falls in the run and is no record is the filter's to
+        // answer, before the fence is asked: absent, no page touched, or
+        // the fence's answer where the filter admits it by chance. The
+        // fence's own answer for such a key is the raw form's, since the
+        // entry covers more than one record: asked with the filter set
+        // aside.
         let inside = [fx.recs[lo].0.as_slice(), &[0u8]].concat();
-        assert_eq!(side.count(&inside), ZRead::NoPage);
+        let answer = side.count(&inside);
+        assert!(
+            answer
+                == ZRead::Served {
+                    n: 0,
+                    decoded: false
+                }
+                || answer == ZRead::NoPage,
+            "{answer:?}"
+        );
+        let mut side = side;
+        side.filter = None;
+        assert_eq!(
+            side.count(&inside),
+            ZRead::NoPage,
+            "the fence's own answer for a key in a run of several records"
+        );
     }
 }
