@@ -2211,6 +2211,30 @@ was predicted for a file the build leaves resident in the page cache. A
 prediction that rests on an assumption marked unmeasured is registered as an
 identity the counters print, or not at all.
 
+**A piece named by its position among the bounds that cut it.** A merge
+cuts its output into pieces at bounds, each a key at an even rank cut to
+the fence's length, and named each piece's fence by the piece's position
+among the bounds. A bound cut from a key that shares its first sixteen
+bytes with every key before it is at or below the first of them, cuts
+nothing and makes no piece, so every piece after it carried the fence of
+the slice before it, and the merge refused its own first key as one
+outside its fence -- after which the store's segment work had stopped
+for good and every commit answered with the refusal. The first
+partitioning had it in one form, and a partition rewrite's split into
+sub-pieces in another, where the joins were cut by count and named by
+the truncated key at the cut, which separates nothing from the keys
+that share it. The suite's keys are sixteen digits, the fence's length
+exactly, so no row reached either; the differential fuzz (`tests/fuzz.rs`)
+reached the first at six seeds of sixty with keys of a long common
+prefix, and the refusal, made to name the key, the rank, the piece and
+its fence, said which. A slice is named by the bounds that cut it now
+(`cut_by_bounds`), a bound that cuts nothing names nothing, and a join
+is made only where its cut separates the two sides; `tests/fences.rs`
+builds both shapes. The rule: a fence derived from a key by cutting it
+short is at or below every key that shares the cut, so it separates
+nothing inside such a run; and two lists kept in step -- the cuts and
+their names -- are built by one loop, never one by index into the other.
+
 **A probe's total over a whole read is an inlining result.** The same engine
 read +0.9, +1.9, +2.9 and +3.15 instructions a point read across four probes
 and a count +3.00 exactly, because the code after a probe's loop changes what
