@@ -105,7 +105,11 @@ default configuration), the same engine reads, over seeds 0 to 120:
 | panic, `an overlay key's cut is behind the walk` (hunt I's second defect) | 1 (seed 115) |
 
 These are the block-cache scan path's, the family hunt I was opened on,
-and none of the three fixes above touches that path; a control of the same seeds on the engine before the fixes follows in the next commit.
+and none of the three fixes above touches that path. The control, the
+same seeds with the cache on, on the engine before the fixes (`a95fec8`):
+88 pass, 8 fence refusals and 24 of the block-cache class, and every
+seed the fixed engine fails, the control failed too; so the fixes took
+the fence class and moved nothing in this one.
 
 ## The gate on this branch
 
