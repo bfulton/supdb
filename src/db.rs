@@ -5925,6 +5925,20 @@ impl Seg {
         }
     }
 
+    /// The block cache's blocks over this segment: one per `CACHE_BLOCK`
+    /// records, and one for a partition with no record at all. A
+    /// partition emptied by a merge keeps its range, and the memtables'
+    /// and pieces' keys over that range are filed under its blocks:
+    /// counted as none, the settle dropped every write resolved into it
+    /// and the block scan walked past it, so a key written into the range
+    /// was in no scan through the cache while the point read beside it,
+    /// through the memtable, was right. Every table, bound and form over
+    /// a partition is sized by this one count.
+    #[inline]
+    fn blocks(&self) -> usize {
+        self.blob.keys().div_ceil(CACHE_BLOCK).max(1)
+    }
+
     /// Could this segment hold `key`? A fence answers exactly; a Bloom
     /// answers with false positives and never a false negative.
     #[inline]
@@ -15582,6 +15596,31 @@ impl Reader {
             t.piece_ranks = piece_ranks;
             if rebased {
                 t.blob = seg.blob.id();
+                // The keys filed since the snapshot carry the cut each
+                // resolved to -- its rank in the partition -- and the
+                // rewrite the carry crosses keeps the block boundaries
+                // (`same_blocks`) and not the ranks between them: a key
+                // the merge folded in or dropped inside a block moves
+                // every rank after it. A build from the kept cut put a
+                // filed key's delta at the wrong record, and a scan
+                // emitted the record the delta was to mask, then the key
+                // itself after its successors. Each filed key is resolved
+                // again against the partition as it stands; its block is
+                // the same, since the boundaries are.
+                if keep_snap {
+                    let filed: Vec<u32> = t
+                        .added
+                        .iter_mut()
+                        .flat_map(|l| l.drain(..).map(|(slot, _)| slot))
+                        .collect();
+                    for slot in filed {
+                        let key = st.mem.key_of(st.mem.entry(slot as usize));
+                        let (b, cut) = BuildCtx::owner_of(seg, key);
+                        if let Some(list) = t.added.get_mut(b) {
+                            list.push((slot, cut));
+                        }
+                    }
+                }
             }
             if landed && !froze {
                 // The retired bases went with the tables they named, and
@@ -15846,7 +15885,7 @@ impl Reader {
         segs.iter()
             .take_while(|s| s.level > 0)
             .map(|s| {
-                (0..s.blob.keys().div_ceil(CACHE_BLOCK))
+                (0..s.blocks())
                     .map(|_| AtomicPtr::new(std::ptr::null_mut()))
                     .collect()
             })
@@ -17106,9 +17145,6 @@ impl Reader {
         ctx.rank_pieces()?;
         for pi in 0..np {
             let seg = &self.segs()[pi];
-            if seg.blob.keys() == 0 {
-                continue;
-            }
             let tables = self.fs().tables.borrow();
             let mut held = tables[pi].borrow_mut();
             if held.is_none() {
@@ -17556,9 +17592,6 @@ impl Reader {
             let Some(seg) = self.segs()[..np].get(at) else {
                 continue;
             };
-            if seg.blob.keys() == 0 {
-                continue;
-            }
             let (b, cut) = BuildCtx::owner_of_from(seg, key, floor);
             floor = (cut >> 1) as usize;
             resolved.push((at as u32, b as u32, cut, off, len, new, slot));
@@ -18214,20 +18247,18 @@ impl Reader {
         // state: its scans answered a key's values short of every write
         // since, and so did the forms it published.
         self.fs().cache_used.set(true);
-        let nblocks = seg.blob.keys().div_ceil(CACHE_BLOCK);
+        let nblocks = seg.blocks();
         let ctx = self.build_ctx();
         ctx.rank_pieces()?;
         let (pieces, piece_ranks) = ctx.table_bounds(seg, l0)?;
         let mut added: Vec<Vec<(u32, u32)>> = (0..nblocks).map(|_| Vec::new()).collect();
-        if nblocks > 0 {
-            for &slot in self.fs().snap_added.borrow().iter() {
-                let key = self.mem().key_of(self.mem().entry(slot as usize));
-                if seg.below_lo(key) || seg.hi.as_ref().is_some_and(|h| key >= h.as_slice()) {
-                    continue;
-                }
-                let (b, cut) = BuildCtx::owner_of(seg, key);
-                added[b].push((slot, cut));
+        for &slot in self.fs().snap_added.borrow().iter() {
+            let key = self.mem().key_of(self.mem().entry(slot as usize));
+            if seg.below_lo(key) || seg.hi.as_ref().is_some_and(|h| key >= h.as_slice()) {
+                continue;
             }
+            let (b, cut) = BuildCtx::owner_of(seg, key);
+            added[b].push((slot, cut));
         }
         let filed = added.iter().map(Vec::len).sum();
         Ok(BlockTable {
@@ -18389,16 +18420,11 @@ impl Reader {
             }
             let src = Sources { seg, l0 };
             cursor = seg.cursor_from(cursor);
+            // An empty partition has one block, over no record and
+            // whatever the memtables and the pieces hold in its range:
+            // the seek answers rank zero, the table's one block is
+            // walked as the overlay alone.
             let keys = seg.blob.keys();
-            if keys == 0 {
-                match &seg.hi {
-                    Some(h) => {
-                        cursor = h.as_slice();
-                        continue;
-                    }
-                    None => break,
-                }
-            }
             let (rank, exact) = seg.ord.seek_exact_hint(
                 cursor,
                 |r| seg.blob.key_at(r),
@@ -18413,7 +18439,7 @@ impl Reader {
             let same =
                 rank < keys && exact.unwrap_or_else(|| seg.blob.key_at(rank) == Some(cursor));
             let owner = if same { rank } else { rank.saturating_sub(1) };
-            let nblocks = keys.div_ceil(CACHE_BLOCK);
+            let nblocks = seg.blocks();
             let tables = self.fs().tables.borrow();
             let mut held = tables[pi].borrow_mut();
             if held.is_none() {
@@ -23129,7 +23155,7 @@ impl Reader {
             .segs()
             .iter()
             .take_while(|s| s.level > 0)
-            .map(|s| s.blob.keys().div_ceil(CACHE_BLOCK))
+            .map(|s| s.blocks())
             .sum();
         if blocks < self.opts.scan_cache_ahead_min_blocks {
             return;
@@ -24425,7 +24451,7 @@ impl Reader {
         let np = self.segs().partition_point(|s| s.level > 0);
         let l0 = &self.segs()[np..];
         for (pi, seg) in self.segs()[..np].iter().enumerate() {
-            let nblocks = seg.blob.keys().div_ceil(CACHE_BLOCK);
+            let nblocks = seg.blocks();
             let (pieces, piece_ranks) = ctx.table_bounds(seg, l0)?;
             let table = BlockTable {
                 slots: (0..nblocks).map(|_| None).collect(),
@@ -26181,7 +26207,7 @@ fn rank_pieces_of(segs: &[std::sync::Arc<Seg>], by_heads: bool) -> Result<()> {
 /// and the same cache.
 fn bound_pieces_of(segs: &[std::sync::Arc<Seg>]) -> Result<()> {
     for seg in segs.iter().filter(|s| s.level > 0) {
-        let nblocks = seg.blob.keys().div_ceil(CACHE_BLOCK);
+        let nblocks = seg.blocks();
         let against = seg.blob.id();
         for p in segs.iter().filter(|s| s.level == 0) {
             if !seg.lo.is_empty()
@@ -26272,7 +26298,7 @@ impl<'s> BuildCtx<'s> {
         seg: &Seg,
         l0: &[std::sync::Arc<Seg>],
     ) -> Result<(PieceBounds, PieceRanks)> {
-        let nblocks = seg.blob.keys().div_ceil(CACHE_BLOCK);
+        let nblocks = seg.blocks();
         let against = seg.blob.id();
         let mut pieces = Vec::new();
         let mut ranks = Vec::new();
