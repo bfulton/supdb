@@ -399,6 +399,12 @@ pub struct ZCounts {
     pub build_cancelled: u64,
     /// Records the builds held no page for.
     pub build_nopage: u64,
+    /// Warms of sidecar files (`Options::zpages_warm`): how many, the bytes
+    /// read, the bytes skipped as resident, and the jobs' microseconds.
+    pub warms: u64,
+    pub warm_bytes: u64,
+    pub warm_skipped: u64,
+    pub warm_us: u64,
     /// Partitions declined, by reason, and the record bytes of the ones
     /// declined for their size.
     pub declined_small: u64,
@@ -698,6 +704,19 @@ pub struct Options {
     /// off. `supdb-nocachezpageseager` is the arm.
     #[doc(hidden)]
     pub zpages_eager: bool,
+    /// Whether a sidecar's file is read into the page cache once it is
+    /// attached, by a job on the builder's thread at idle priority
+    /// (`zside::warm_file`): `MADV_WILLNEED` and a touch of each page in
+    /// chunks of eight megabytes, the chunks `mincore` reports resident
+    /// skipped, cancelled where a merge retires the partition. A sidecar
+    /// just built is resident already and the job skips it whole; one on
+    /// disk at a restart is cold, and a divided read pass over a cold file
+    /// faults as the raw form does. Once per sidecar per process, and the
+    /// settle of the form waits for it as it waits for a build. The
+    /// headroom a bound leaves is not consulted yet: the file is read
+    /// whole. `supdb-nocachezpagesnowarm` is the arm with it off.
+    #[doc(hidden)]
+    pub zpages_warm: bool,
     /// EXPERIMENT: the block forms hold the fold of the partition and the
     /// level-0 pieces alone, and the memtables' keys reach a scan through
     /// the scan snapshot, which every walk overlays on its block whatever
@@ -2124,6 +2143,7 @@ impl Default for Options {
             zpages_hold_build: false,
             zpages_hold_rename: false,
             zpages_eager: false,
+            zpages_warm: true,
             forms_pieces_only: false,
             publish_in_background: true,
             adaptive_shape: false,
@@ -2879,18 +2899,43 @@ type Compaction = (Vec<String>, std::thread::JoinHandle<Result<Vec<String>>>);
 /// replaces or, declined, removes.
 struct ZBuild {
     seg: std::sync::Arc<Seg>,
-    handle: std::thread::JoinHandle<Result<zside::Outcome>>,
+    job: ZJob,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     refused: bool,
 }
 
-/// Why a partition is given a build: it has no sidecar, its last build
-/// failed and the backoff has passed, or its sidecar failed a check.
+/// What the builder's thread is running: a build, or a warm of an attached
+/// sidecar's file (`Options::zpages_warm`).
+enum ZJob {
+    Build(std::thread::JoinHandle<Result<zside::Outcome>>),
+    Warm(std::thread::JoinHandle<Result<zside::Warm>>),
+}
+
+impl ZJob {
+    fn is_finished(&self) -> bool {
+        match self {
+            ZJob::Build(h) => h.is_finished(),
+            ZJob::Warm(h) => h.is_finished(),
+        }
+    }
+
+    fn join(self) {
+        let _ = match self {
+            ZJob::Build(h) => h.join().map(|_| ()),
+            ZJob::Warm(h) => h.join().map(|_| ()),
+        };
+    }
+}
+
+/// Why a partition is given a job: it has no sidecar, its last build
+/// failed and the backoff has passed, or its sidecar failed a check; or its
+/// sidecar is attached and cold to this process, and is to be warmed.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ZKind {
     Build,
     Retry,
     Rebuild,
+    Warm,
 }
 
 /// `seg`'s sidecar taken out of its cell and retired through the epoch --
@@ -3007,6 +3052,9 @@ struct Seg {
     /// failure doubles (`Options::zpages_retry_ms`).
     z_retry: std::sync::Mutex<Option<std::time::Instant>>,
     z_backoff: AtomicU64,
+    /// The sidecar's file warmed into the page cache by this process, or a
+    /// warm of it started (`Options::zpages_warm`).
+    z_warmed: std::sync::atomic::AtomicBool,
 }
 
 /// The order the live segments hold: partitions first, disjoint and by
@@ -5907,6 +5955,7 @@ impl Seg {
                 z_rebuilds: std::sync::atomic::AtomicU8::new(0),
                 z_retry: std::sync::Mutex::new(None),
                 z_backoff: AtomicU64::new(0),
+                z_warmed: std::sync::atomic::AtomicBool::new(false),
             });
         }
         if let Some(rest) = name
@@ -5945,6 +5994,7 @@ impl Seg {
                 z_rebuilds: std::sync::atomic::AtomicU8::new(0),
                 z_retry: std::sync::Mutex::new(None),
                 z_backoff: AtomicU64::new(0),
+                z_warmed: std::sync::atomic::AtomicBool::new(false),
             });
         }
         // L0: the Bloom from the writer where it had the keys' hashes, and
@@ -5975,6 +6025,7 @@ impl Seg {
             z_rebuilds: std::sync::atomic::AtomicU8::new(0),
             z_retry: std::sync::Mutex::new(None),
             z_backoff: AtomicU64::new(0),
+            z_warmed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -14505,6 +14556,10 @@ impl Reader {
             build_starts: get(&ev.build_starts),
             build_cancelled: get(&ev.build_cancelled),
             build_nopage: get(&ev.build_nopage),
+            warms: get(&ev.warms),
+            warm_bytes: get(&ev.warm_bytes),
+            warm_skipped: get(&ev.warm_skipped),
+            warm_us: get(&ev.warm_us),
             declined_small: get(&ev.declined_small),
             declined_small_bytes: get(&ev.declined_small_bytes),
             declined_block_backed: get(&ev.declined_block_backed),
@@ -23997,8 +24052,8 @@ impl Db {
     /// Give `seg` a sidecar: the file already there if it checks out, else
     /// one built from the segment's own bytes and attached, which is the
     /// reader's own check of what was built. A partition that cannot have
-    /// one -- under the floor, with a record that lies in a block or that
-    /// no page holds -- is counted by reason and not tried again by this
+    /// one -- under the floor, with a record that lies in a block or with
+    /// no record a page holds -- is counted by reason and not tried again by this
     /// segment; a build that fails is counted and not tried again either,
     /// and is not an error for the store: the partition is read raw.
     ///
@@ -24168,7 +24223,11 @@ impl Db {
                         let why = s.z_declined.load(AtomicOrdering::Relaxed);
                         s.level > 0
                             && match s.z.get() {
-                                Some(z) => z.damaged(),
+                                Some(z) => {
+                                    z.damaged()
+                                        || (self.opts.zpages_warm
+                                            && !s.z_warmed.load(AtomicOrdering::Relaxed))
+                                }
                                 None => {
                                     why == 0
                                         || why == zside::DECLINED_REFUSED
@@ -24203,6 +24262,18 @@ impl Db {
                         zside::ZEvents::add(&ev.declined_damage, 1);
                         seg.z_declined
                             .store(zside::DECLINED_DAMAGE, AtomicOrdering::Relaxed);
+                    }
+                } else if seg.z.get().is_some() {
+                    // Attached and cold to this process: warmed here, as
+                    // an inline build runs here.
+                    seg.z_warmed.store(true, AtomicOrdering::Relaxed);
+                    if let (Some(id), Some(end)) =
+                        (Db::name_id(&seg.name), Db::name_end_seq(&seg.name))
+                    {
+                        let path = self.dir.join(zside::zpg_name(id, end));
+                        if let Ok(w) = zside::warm_file(&path, None) {
+                            ev.warmed(&w);
+                        }
                     }
                 } else if seg.z_declined.load(AtomicOrdering::Relaxed) == zside::DECLINED_FAILED {
                     zside::ZEvents::add(&ev.build_retries, 1);
@@ -28765,7 +28836,7 @@ impl Maint {
         // before the close, as the seal holds are.
         if let Some(b) = self.zbuild.take() {
             b.cancel.store(true, AtomicOrdering::Release);
-            let _ = b.handle.join();
+            b.job.join();
         }
         for job in self.sealing.drain(..) {
             let _ = job.handle.join();
@@ -30116,7 +30187,7 @@ impl Maint {
         if self.opts.zpages != ZPages::Always || !(self.z_settling || self.opts.zpages_eager) {
             return;
         }
-        if self.zbuild.as_ref().is_some_and(|b| b.handle.is_finished()) {
+        if self.zbuild.as_ref().is_some_and(|b| b.job.is_finished()) {
             let b = self.zbuild.take().expect("checked");
             let op = self.op();
             self.z_collect(b);
@@ -30144,7 +30215,7 @@ impl Maint {
         self.z_next().is_some()
     }
 
-    /// The first live partition due a build, and why: not an input of a
+    /// The first live partition due a job, and which: not an input of a
     /// merge in flight, which retires it. Read under the caller's pin.
     fn z_next(&self) -> Option<(std::sync::Arc<Seg>, ZKind)> {
         for s in self.segs().iter().filter(|s| s.level > 0) {
@@ -30154,6 +30225,13 @@ impl Maint {
             let why = s.z_declined.load(AtomicOrdering::Relaxed);
             let kind = match s.z.get() {
                 Some(z) if z.damaged() && self.z_settling => ZKind::Rebuild,
+                Some(z)
+                    if !z.damaged()
+                        && self.opts.zpages_warm
+                        && !s.z_warmed.load(AtomicOrdering::Relaxed) =>
+                {
+                    ZKind::Warm
+                }
                 Some(_) => continue,
                 None if why == 0 || why == zside::DECLINED_REFUSED => ZKind::Build,
                 None if why == zside::DECLINED_FAILED && self.z_settling && s.z_retry_due() => {
@@ -30179,6 +30257,10 @@ impl Maint {
         let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) else {
             return;
         };
+        if kind == ZKind::Warm {
+            self.z_warm(seg, id, end);
+            return;
+        }
         let retry_ms = self.opts.zpages_retry_ms;
         match kind {
             ZKind::Rebuild => {
@@ -30195,7 +30277,7 @@ impl Maint {
                 zside::ZEvents::add(&ev.rebuilds, 1);
             }
             ZKind::Retry => zside::ZEvents::add(&ev.build_retries, 1),
-            ZKind::Build => {}
+            ZKind::Build | ZKind::Warm => {}
         }
         let advise = Db::z_advise(&self.opts);
         let refused = seg.z_declined.load(AtomicOrdering::Relaxed) == zside::DECLINED_REFUSED;
@@ -30253,7 +30335,7 @@ impl Maint {
                 zside::ZEvents::add(&ev.build_starts, 1);
                 self.zbuild = Some(ZBuild {
                     seg,
-                    handle,
+                    job: ZJob::Build(handle),
                     cancel,
                     refused,
                 });
@@ -30271,11 +30353,19 @@ impl Maint {
         let shared = self.shared.clone();
         let ev = &shared.z;
         let ZBuild {
-            seg,
-            handle,
-            refused,
-            ..
+            seg, job, refused, ..
         } = b;
+        let handle = match job {
+            ZJob::Build(h) => h,
+            ZJob::Warm(h) => {
+                // A warm that could not open its file -- retired meanwhile
+                // -- warmed nothing, and is nobody's failure.
+                if let Ok(Ok(w)) = h.join() {
+                    ev.warmed(&w);
+                }
+                return;
+            }
+        };
         let outcome = handle
             .join()
             .unwrap_or_else(|_| Err(err("the sidecar's build panicked")));
@@ -30350,7 +30440,39 @@ impl Maint {
         }
     }
 
-    /// The build in flight cancelled if its target is among `inputs`, the
+    /// `seg`'s sidecar file read into the page cache on a thread of its
+    /// own at idle priority (`Options::zpages_warm`, `zside::warm_file`),
+    /// once per process: the segment is marked before the thread starts,
+    /// so the next turn does not pick it again, and a merge that retires
+    /// the partition cancels the job as it cancels a build.
+    fn z_warm(&mut self, seg: std::sync::Arc<Seg>, id: u64, end: u64) {
+        seg.z_warmed.store(true, AtomicOrdering::Relaxed);
+        let path = self.dir.join(zside::zpg_name(id, end));
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancel.clone();
+        let wake = self.wake.clone();
+        let spawned = std::thread::Builder::new()
+            .name("supdb-zwarm".into())
+            .spawn(move || {
+                idle_io_priority();
+                idle_cpu_priority();
+                let r = zside::warm_file(&path, Some(&flag));
+                if let Some(t) = wake {
+                    t.unpark();
+                }
+                r
+            });
+        if let Ok(handle) = spawned {
+            self.zbuild = Some(ZBuild {
+                seg,
+                job: ZJob::Warm(handle),
+                cancel,
+                refused: false,
+            });
+        }
+    }
+
+    /// The job in flight cancelled if its target is among `inputs`, the
     /// segments a landing is about to retire; collected at the next turn.
     fn z_cancel_inputs(&self, inputs: &[String]) {
         if let Some(b) = &self.zbuild {

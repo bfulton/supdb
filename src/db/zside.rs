@@ -56,6 +56,11 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 /// store it left out.
 pub(super) const ZMIN_RECS: usize = 2 << 20;
 
+/// A warm reads a sidecar's file into the page cache in chunks of this many
+/// bytes, each asked for with `MADV_WILLNEED` and then touched a page at a
+/// time, with a look at the cancel flag between chunks.
+pub(super) const ZWARM_CHUNK: usize = 8 << 20;
+
 /// The sidecar is written in pieces of this many bytes at their own
 /// alignment, as a segment is (`SegmentOptions::write_piece`): the page
 /// cache sizes a folio by the write that makes it. What the folios of a
@@ -825,6 +830,13 @@ pub(super) struct ZEvents {
     /// Records the builds held no page for, each an entry of the fence
     /// read from the raw form.
     pub build_nopage: AtomicU64,
+    /// Warms of a sidecar's file (`warm_file`): how many, the bytes read,
+    /// the bytes of chunks found resident and skipped, and the jobs' time
+    /// in microseconds.
+    pub warms: AtomicU64,
+    pub warm_bytes: AtomicU64,
+    pub warm_skipped: AtomicU64,
+    pub warm_us: AtomicU64,
     /// Partitions declined, by reason, and the record bytes of the ones
     /// declined for their size.
     pub declined_small: AtomicU64,
@@ -895,6 +907,14 @@ impl ZEvents {
         ZEvents::add(&self.build_group_bytes, b.total_ulen);
         ZEvents::add(&self.build_calls, b.fill.calls);
         ZEvents::add(&self.build_nopage, b.fill.nopages);
+    }
+
+    /// A warm, counted.
+    pub(super) fn warmed(&self, w: &Warm) {
+        ZEvents::add(&self.warms, 1);
+        ZEvents::add(&self.warm_bytes, w.bytes);
+        ZEvents::add(&self.warm_skipped, w.skipped);
+        ZEvents::add(&self.warm_us, w.us);
     }
 }
 
@@ -970,6 +990,58 @@ pub(super) struct Built {
     pub file_bytes: u64,
     /// The decoded bytes of every group.
     pub total_ulen: u64,
+}
+
+/// What a warm of a sidecar's file did (`warm_file`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Warm {
+    /// Bytes read into the page cache: the pages that were not resident.
+    pub bytes: u64,
+    /// Bytes of the chunks found wholly resident and left alone.
+    pub skipped: u64,
+    /// The job's elapsed time, in microseconds.
+    pub us: u64,
+}
+
+/// `path` read into the page cache, chunk by chunk, so that the first reads
+/// of a sidecar that is on disk and cold -- after a restart -- fault on
+/// nothing: a cold file of `P` pages costs `r` reads `P(1 - e^(-r/P))`
+/// major faults, as bad as the raw form. Each chunk the kernel reports
+/// wholly resident is skipped; the rest is asked for with `MADV_WILLNEED`
+/// and then read a page at a time, so the pages are there when this
+/// returns and its time is the read's. `cancel`, looked at between chunks,
+/// stops it where it is; what was read stays read.
+pub(super) fn warm_file(path: &Path, cancel: Option<&AtomicBool>) -> Result<Warm> {
+    let start = std::time::Instant::now();
+    let map = MmapBytes::open(path)?;
+    let len = map.0.len();
+    let page = crate::bytes::os_page_size();
+    let mut w = Warm::default();
+    let mut sum = 0u64;
+    let mut off = 0usize;
+    while off < len {
+        if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+            break;
+        }
+        let span = ZWARM_CHUNK.min(len - off);
+        let pages = span.div_ceil(page);
+        let resident = map.resident_pages(off, span);
+        if resident >= pages {
+            w.skipped += span as u64;
+        } else {
+            map.advise_willneed(off as u64, span);
+            let mut at = off;
+            while at < off + span {
+                sum = sum.wrapping_add(u64::from(map.0[at]));
+                at += page;
+            }
+            w.bytes += ((pages - resident) * page).min(span) as u64;
+        }
+        off += span;
+    }
+    std::hint::black_box(sum);
+    w.us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+    Ok(w)
 }
 
 #[derive(Debug)]
@@ -2644,6 +2716,58 @@ mod tests {
         assert!(r.is_err(), "records out of order built a sidecar: {r:?}");
         assert!(!out.exists());
         assert!(!tmp_of(&out).exists(), "a failed build left its temp name");
+    }
+
+    /// `p`'s pages dropped from the page cache: written back first, then
+    /// `POSIX_FADV_DONTNEED`, which drops every clean page nothing maps.
+    #[cfg(target_os = "linux")]
+    fn evict(p: &Path) {
+        use std::os::unix::io::AsRawFd;
+        let f = File::open(p).unwrap();
+        f.sync_all().unwrap();
+        // SAFETY: a hint on an open descriptor.
+        let rc = unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        assert_eq!(rc, 0, "fadvise");
+    }
+
+    /// A sidecar's file evicted from the page cache and warmed: every page
+    /// resident after, the bytes read the pages that were not; warmed
+    /// again, nothing read and the whole file skipped; and a cancel set
+    /// before it starts reads nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_warm_reads_the_cold_file_once_and_skips_a_resident_one() {
+        let fx = Fixture::new("warm", suite(3000, 9), 1 << 20);
+        let Outcome::Built(b) = fx.build() else {
+            panic!("built")
+        };
+        let page = crate::bytes::os_page_size();
+        let pages = |p: &Path| {
+            let m = MmapBytes::open(p).unwrap();
+            (m.resident_pages(0, m.0.len()), m.0.len().div_ceil(page))
+        };
+        evict(&fx.out);
+        let (res, all) = pages(&fx.out);
+        assert!(res < all / 4, "{res} of {all} resident after the eviction");
+        let w = warm_file(&fx.out, None).unwrap();
+        assert_eq!(
+            (w.bytes, w.skipped),
+            (b.file_bytes - (res * page) as u64, 0),
+            "{w:?}"
+        );
+        let (res, all) = pages(&fx.out);
+        assert_eq!(res, all, "resident after the warm");
+        let again = warm_file(&fx.out, None).unwrap();
+        assert_eq!((again.bytes, again.skipped), (0, b.file_bytes), "{again:?}");
+        evict(&fx.out);
+        let cancel = AtomicBool::new(true);
+        let none = warm_file(&fx.out, Some(&cancel)).unwrap();
+        assert_eq!((none.bytes, none.skipped), (0, 0), "{none:?}");
+        let (res, all) = pages(&fx.out);
+        assert!(
+            res < all / 4,
+            "{res} of {all} resident after a cancelled warm"
+        );
     }
 
     #[test]
