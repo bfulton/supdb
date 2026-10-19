@@ -70,3 +70,23 @@ pub fn partition_fences(d: &std::path::Path) -> Vec<(Vec<u8>, Option<Vec<u8>>)> 
     v.sort();
     v
 }
+
+/// The mappings this process holds of sidecar files under `dir`, as
+/// `/proc/self/maps` names them: a renamed file shows under its new name,
+/// an unlinked one with ` (deleted)`. One line a mapping, deduplicated by
+/// the file the line names, since a mapping may be split into several.
+#[cfg(target_os = "linux")]
+pub fn zpg_mappings(dir: &std::path::Path) -> Vec<String> {
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+    let prefix = dir.join("zpg-");
+    let prefix = prefix.to_string_lossy();
+    let mut v: Vec<String> = maps
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(5))
+        .filter(|p| p.starts_with(&*prefix))
+        .map(str::to_owned)
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
