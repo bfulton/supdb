@@ -55,8 +55,11 @@ pub(super) const ZMIN_RECS: usize = 2 << 20;
 
 /// The sidecar is written in pieces of this many bytes at their own
 /// alignment, as a segment is (`SegmentOptions::write_piece`): the page
-/// cache sizes a folio by the write that makes it, and what the folios of a
-/// file written this way compose to is not measured here.
+/// cache sizes a folio by the write that makes it. What the folios of a
+/// built sidecar compose to is read from `/proc/self/pagemap` and
+/// `/proc/kpageflags` over a mapping of the file; whether a smaller piece
+/// would read better is for a pairing to say, and a plan's `piece` is where
+/// it is changed.
 const ZWRITE_PIECE: usize = 1 << 20;
 
 /// The window of the raw records the build drops behind itself.
@@ -849,20 +852,45 @@ pub(super) enum Outcome {
     Declined(Decline),
 }
 
-/// Writes in whole pieces: bytes are buffered to `ZWRITE_PIECE` and the
-/// piece is written at its own alignment, with a hint to the device for
-/// it, nothing waited for.
-struct Pieces<'a> {
-    file: &'a File,
+/// Where a build's pieces go: in order, whole, one call a piece, at the
+/// piece's own offset. The file for a build, a recorder for a test.
+trait PieceSink {
+    fn put(&mut self, at: u64, piece: &[u8]) -> Result<()>;
+}
+
+/// The build's sink: a piece written to the file whole, and handed to the
+/// device with a hint at once, nothing waited for.
+struct FileSink<'a>(&'a File);
+
+impl PieceSink for FileSink<'_> {
+    fn put(&mut self, at: u64, piece: &[u8]) -> Result<()> {
+        let mut f = self.0;
+        f.write_all(piece)?;
+        super::start_writeback(self.0, at, piece.len() as u64);
+        Ok(())
+    }
+}
+
+/// Writes in whole pieces: bytes are buffered to `size` and the piece is
+/// handed to the sink at its own alignment, nothing waited for. Every piece
+/// is `size` bytes at a multiple of `size` but the last, which is what is
+/// left: the page cache sizes a folio by the write that makes it and the
+/// alignment of its offset, and a write of another shape is a file of other
+/// folios with the same bytes.
+struct Pieces<S: PieceSink> {
+    sink: S,
+    size: usize,
     buf: Vec<u8>,
     at: u64,
 }
 
-impl<'a> Pieces<'a> {
-    fn new(file: &'a File) -> Pieces<'a> {
+impl<S: PieceSink> Pieces<S> {
+    fn new(sink: S, size: usize) -> Pieces<S> {
+        assert!(size > 0, "a piece of no bytes");
         Pieces {
-            file,
-            buf: Vec::with_capacity(ZWRITE_PIECE),
+            sink,
+            size,
+            buf: Vec::with_capacity(size),
             at: 0,
         }
     }
@@ -870,11 +898,11 @@ impl<'a> Pieces<'a> {
     fn push(&mut self, bytes: &[u8]) -> Result<()> {
         let mut rest = bytes;
         while !rest.is_empty() {
-            let room = ZWRITE_PIECE - self.buf.len();
+            let room = self.size - self.buf.len();
             let take = room.min(rest.len());
             self.buf.extend_from_slice(&rest[..take]);
             rest = &rest[take..];
-            if self.buf.len() == ZWRITE_PIECE {
+            if self.buf.len() == self.size {
                 self.flush()?;
             }
         }
@@ -885,9 +913,7 @@ impl<'a> Pieces<'a> {
         if self.buf.is_empty() {
             return Ok(());
         }
-        let mut f = self.file;
-        f.write_all(&self.buf)?;
-        super::start_writeback(self.file, self.at, self.buf.len() as u64);
+        self.sink.put(self.at, &self.buf)?;
         self.at += self.buf.len() as u64;
         self.buf.clear();
         Ok(())
@@ -924,6 +950,36 @@ fn drop_behind(base: usize, file: &File, from: usize, to: usize) {
 #[cfg(not(target_os = "linux"))]
 fn drop_behind(_base: usize, _file: &File, _from: usize, _to: usize) {}
 
+/// What a build is asked, and the two sizes it works in. The floor and
+/// whether the raw bytes are dropped are the store's options; the piece and
+/// the window are the build's own constants, a plan's fields so that a test
+/// can make them small and cross, with a store it can afford, the
+/// boundaries a real one crosses.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct BuildPlan {
+    /// The record bytes below which the partition is declined
+    /// (`Options::zpages_min_bytes`).
+    pub floor: usize,
+    /// Whether the raw records and directory are dropped from the cache
+    /// behind the walk (`Options::zpages_drop_behind`).
+    pub drop_behind: bool,
+    /// The bytes of a write.
+    pub piece: usize,
+    /// The bytes of the raw record region passed between drops.
+    pub window: usize,
+}
+
+impl BuildPlan {
+    pub(super) fn new(floor: usize, drop_behind: bool) -> BuildPlan {
+        BuildPlan {
+            floor,
+            drop_behind,
+            piece: ZWRITE_PIECE,
+            window: ZDROP_WINDOW,
+        }
+    }
+}
+
 /// The sidecar of the segment file at `seg_path`, written to `out`.
 ///
 /// The segment is opened as a merge opens its input: a mapping of its own,
@@ -942,17 +998,35 @@ fn drop_behind(_base: usize, _file: &File, _from: usize, _to: usize) {}
 /// The file is written to `out` with `.tmp` appended, in pieces, the
 /// resident part and the trailer last, and renamed into place, unsynced: a
 /// derived file the store regenerates. The raw records are dropped from the
-/// page cache behind the walk, a window at a time.
+/// page cache behind the walk, a window at a time, where the plan says so.
 ///
 /// A partition is declined, with no file written, for a record region
-/// under `floor`, for a block table that is not empty (a run lies outside
-/// its record), and for a record that no page holds. No filter is built.
+/// under the plan's floor, for a block table that is not empty (a run lies
+/// outside its record), and for a record that no page holds. No filter is
+/// built. The temp name is removed on every way out the function has, a
+/// decline after pages were written among them; a crash leaves it for the
+/// sweep at open.
 pub(super) fn build(
     seg_path: &Path,
     out: &Path,
     id: u64,
     end_seq: u64,
-    floor: usize,
+    plan: &BuildPlan,
+) -> Result<Outcome> {
+    build_seen(seg_path, out, id, end_seq, plan, &mut |_, _| {})
+}
+
+/// `build`, with `seen` called with each range of the segment's file the
+/// build hands to the drop behind the walk, as offsets in the file and
+/// before the range is dropped: a test's view of which bytes the build
+/// meant to drop, which the page cache shows only as a sum.
+fn build_seen(
+    seg_path: &Path,
+    out: &Path,
+    id: u64,
+    end_seq: u64,
+    plan: &BuildPlan,
+    seen: &mut dyn FnMut(usize, usize),
 ) -> Result<Outcome> {
     let file = File::open(seg_path)?;
     // SAFETY: the contract `MmapBytes::open` takes: a sealed segment is
@@ -975,7 +1049,7 @@ pub(super) fn build(
         .record_regions()
         .ok_or_else(|| super::err("z build: the segment's records are not resident"))?;
     let recs_len = usize::try_from(facts.recs_len).unwrap_or(usize::MAX);
-    if recs_len < floor {
+    if recs_len < plan.floor {
         return Ok(Outcome::Declined(Decline::Small(recs_len)));
     }
     if blob.blocks() > 0 {
@@ -989,7 +1063,7 @@ pub(super) fn build(
         std::path::PathBuf::from(s)
     };
     let made = write_pages(
-        &file, base, recs, dir, nkeys, bind, &tmp, &facts, id, end_seq,
+        &file, base, recs, dir, nkeys, bind, &tmp, &facts, id, end_seq, plan, seen,
     );
     match made {
         Ok(Outcome::Built(b)) => {
@@ -1021,13 +1095,15 @@ fn write_pages(
     facts: &ZSource,
     id: u64,
     end_seq: u64,
+    plan: &BuildPlan,
+    seen: &mut dyn FnMut(usize, usize),
 ) -> Result<Outcome> {
     let out = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .open(tmp)?;
-    let mut w = Pieces::new(&out);
+    let mut w = Pieces::new(FileSink(&out), plan.piece);
     let images = SegImages::new(recs, dir, nkeys);
     let mut scratch = FillScratch::new();
     let mut verify_buf = GroupBuf::new();
@@ -1037,6 +1113,13 @@ fn write_pages(
     let (mut rank, mut hint, mut pages) = (0usize, 0usize, 0u32);
     let mut total_ulen = 0u64;
     let mut dropped = 0usize;
+    // The raw bytes the walk has passed, handed to the cache to forget.
+    let mut forget = |from: usize, to: usize| {
+        if plan.drop_behind && from < to {
+            seen(from, to);
+            drop_behind(base, file, from, to);
+        }
+    };
     while rank < nkeys {
         let mut page = [0u8; ZPAGE];
         match fill_group(&images, rank, hint, bind, &mut scratch, &mut page) {
@@ -1069,8 +1152,8 @@ fn write_pages(
                     recs.len()
                 }
                 .min(recs.len());
-                if consumed.saturating_sub(dropped) >= ZDROP_WINDOW {
-                    drop_behind(base, file, recs_at + dropped, recs_at + consumed);
+                if consumed.saturating_sub(dropped) >= plan.window {
+                    forget(recs_at + dropped, recs_at + consumed);
                     dropped = consumed;
                 }
             }
@@ -1083,8 +1166,8 @@ fn write_pages(
             }
         }
     }
-    drop_behind(base, file, recs_at + dropped, recs_at + recs.len());
-    drop_behind(base, file, dir_at, dir_at + dir.len());
+    forget(recs_at + dropped, recs_at + recs.len());
+    forget(dir_at, dir_at + dir.len());
     let (res, rf) = fence.encode_resident(&[])?;
     w.push(&res)?;
     let t = Trailer {
@@ -1275,7 +1358,7 @@ mod tests {
         }
 
         fn build(&self) -> Outcome {
-            build(&self.seg, &self.out, ID, END, 0).unwrap()
+            build(&self.seg, &self.out, ID, END, &BuildPlan::new(0, true)).unwrap()
         }
 
         fn attach(&self) -> std::result::Result<ZSide, Reject> {
@@ -1442,7 +1525,7 @@ mod tests {
     fn a_partition_that_cannot_have_a_sidecar_is_declined_for_its_reason() {
         // Under the floor.
         let fx = Fixture::new("small", suite(200, 1), 256);
-        let r = build(&fx.seg, &fx.out, ID, END, ZMIN_RECS).unwrap();
+        let r = build(&fx.seg, &fx.out, ID, END, &BuildPlan::new(ZMIN_RECS, true)).unwrap();
         assert!(matches!(r, Outcome::Declined(Decline::Small(n)) if n > 0 && n < ZMIN_RECS));
         assert!(!fx.out.exists(), "no file for a declined partition");
         assert!(!fx.out.with_extension("zpg.tmp").exists());

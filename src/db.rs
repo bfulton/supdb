@@ -646,6 +646,16 @@ pub struct Options {
     /// of partitions a test can afford to write.
     #[doc(hidden)]
     pub zpages_min_bytes: usize,
+    /// Whether a sidecar's build drops the raw records and directory it
+    /// reads from the page cache as it passes them. On, the build leaves
+    /// the partition's records cold, which is what a store that does not
+    /// fit wants of a pass that read them once. It costs the build an
+    /// `madvise` and an `fadvise` a window, and it leaves the raw form cold
+    /// for a scan of a store that does fit and follows the build. Off is the
+    /// shape the drop is priced against: the sum of a load's phases says
+    /// what it costs.
+    #[doc(hidden)]
+    pub zpages_drop_behind: bool,
     /// EXPERIMENT: the block forms hold the fold of the partition and the
     /// level-0 pieces alone, and the memtables' keys reach a scan through
     /// the scan snapshot, which every walk overlays on its block whatever
@@ -1996,6 +2006,7 @@ impl Default for Options {
             point_via_ord: false,
             zpages: ZPages::Off,
             zpages_min_bytes: zside::ZMIN_RECS,
+            zpages_drop_behind: true,
             forms_pieces_only: false,
             publish_in_background: true,
             adaptive_shape: false,
@@ -22657,7 +22668,7 @@ impl Db {
                 &out,
                 id,
                 end,
-                self.opts.zpages_min_bytes,
+                &zside::BuildPlan::new(self.opts.zpages_min_bytes, self.opts.zpages_drop_behind),
             )
         };
         let failed = |why: u8| {
