@@ -385,6 +385,12 @@ pub struct ZCounts {
     pub build_calls: u64,
     pub build_failed: u64,
     pub build_orphaned: u64,
+    /// Failed builds tried again after their backoff; sidecars retired for
+    /// a page that failed a check and built again; partitions left raw
+    /// after the third such rebuild.
+    pub build_retries: u64,
+    pub rebuilds: u64,
+    pub declined_damage: u64,
     /// Partitions declined, by reason, and the record bytes of the ones
     /// declined for their size.
     pub declined_small: u64,
@@ -663,6 +669,12 @@ pub struct Options {
     /// what it costs.
     #[doc(hidden)]
     pub zpages_drop_behind: bool,
+    /// How long after a sidecar's build fails the partition is tried
+    /// again, in milliseconds; doubled at each failure up to an hour. A
+    /// disk that was full or a transient error is not the segment's for
+    /// life. A test's knob at zero: the next settle tries again.
+    #[doc(hidden)]
+    pub zpages_retry_ms: u64,
     /// EXPERIMENT: the block forms hold the fold of the partition and the
     /// level-0 pieces alone, and the memtables' keys reach a scan through
     /// the scan snapshot, which every walk overlays on its block whatever
@@ -2085,6 +2097,7 @@ impl Default for Options {
             zpages: ZPages::Off,
             zpages_min_bytes: zside::ZMIN_RECS,
             zpages_drop_behind: true,
+            zpages_retry_ms: 60_000,
             forms_pieces_only: false,
             publish_in_background: true,
             adaptive_shape: false,
@@ -2888,6 +2901,13 @@ struct Seg {
     /// reads to tell a sliver left raw for its size from one that could not
     /// be covered.
     z_declined: std::sync::atomic::AtomicU8,
+    /// Sidecars of this segment built again after a page of one failed a
+    /// check, up to `zside::ZREBUILDS`.
+    z_rebuilds: std::sync::atomic::AtomicU8,
+    /// When a build that failed is tried again, and the backoff the next
+    /// failure doubles (`Options::zpages_retry_ms`).
+    z_retry: std::sync::Mutex<Option<std::time::Instant>>,
+    z_backoff: AtomicU64,
 }
 
 /// The order the live segments hold: partitions first, disjoint and by
@@ -5785,6 +5805,9 @@ impl Seg {
                 data,
                 z: zside::ZCell::new(),
                 z_declined: std::sync::atomic::AtomicU8::new(0),
+                z_rebuilds: std::sync::atomic::AtomicU8::new(0),
+                z_retry: std::sync::Mutex::new(None),
+                z_backoff: AtomicU64::new(0),
             });
         }
         if let Some(rest) = name
@@ -5820,6 +5843,9 @@ impl Seg {
                 data,
                 z: zside::ZCell::new(),
                 z_declined: std::sync::atomic::AtomicU8::new(0),
+                z_rebuilds: std::sync::atomic::AtomicU8::new(0),
+                z_retry: std::sync::Mutex::new(None),
+                z_backoff: AtomicU64::new(0),
             });
         }
         // L0: the Bloom from the writer where it had the keys' hashes, and
@@ -5847,7 +5873,32 @@ impl Seg {
             data,
             z: zside::ZCell::new(),
             z_declined: std::sync::atomic::AtomicU8::new(0),
+            z_rebuilds: std::sync::atomic::AtomicU8::new(0),
+            z_retry: std::sync::Mutex::new(None),
+            z_backoff: AtomicU64::new(0),
         })
+    }
+
+    /// A failed sidecar build scheduled for another try: after the
+    /// segment's backoff, which starts at `base_ms` and doubles at each
+    /// failure up to an hour.
+    fn z_schedule_retry(&self, base_ms: u64) {
+        let cur = self.z_backoff.load(AtomicOrdering::Relaxed);
+        let ms = if cur == 0 { base_ms } else { cur };
+        *self.z_retry.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(ms));
+        self.z_backoff.store(
+            ms.saturating_mul(2).min(3_600_000).max(base_ms),
+            AtomicOrdering::Relaxed,
+        );
+    }
+
+    /// Whether a build that failed may be tried again now.
+    fn z_retry_due(&self) -> bool {
+        self.z_retry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|t| std::time::Instant::now() >= t)
     }
 
     /// The segment's ordered index, mapped, and whether it had to be
@@ -10963,6 +11014,14 @@ struct Shared {
     /// (`Options::zpages`), counted by the thread that did it; a read's
     /// own counts are on its slot's line. See `Db::zpage_counts`.
     z: zside::ZEvents,
+    /// Sidecars taken out of their cells -- out of service after a page
+    /// failed a check, and retired before the partition's is built again
+    /// -- each under the epoch its retirement bumped, freed past every
+    /// pinned reader as the forms and the snapshots are; a reader that
+    /// loaded the pointer before the take may be walking it.
+    retired_z: RetireList<RetiredZ>,
+    /// The dead names given to retired sidecar files (`zside::zpg_dead_name`).
+    next_dead: AtomicU64,
     /// A test's: the next sidecar build fails as a write error would.
     fail_zbuild: std::sync::atomic::AtomicBool,
     /// Direct runs whose mapping was grown past the file's end
@@ -11282,6 +11341,20 @@ struct RetiredForm(*mut CanonicalForm);
 /// one reference, taken by `Arc::into_raw` when it was published.
 struct RetiredSnap(*const Snapshot);
 
+/// A sidecar taken out of its segment's cell (`zside::ZCell::take`), as
+/// `RetiredForm`: dropping it frees the sidecar and its mapping, past every
+/// reader that could have loaded the pointer.
+struct RetiredZ(*mut zside::ZSide);
+
+impl Drop for RetiredZ {
+    fn drop(&mut self) {
+        // SAFETY: from `Box::into_raw` in `ZCell::install`, taken out of
+        // the cell once by `take`, and the sweep drops it past every pinned
+        // reader.
+        drop(unsafe { Box::from_raw(self.0) });
+    }
+}
+
 /// Things replaced in what readers follow, each with the first epoch no
 /// reader pinned at or after can reach it by, freed once every pinned
 /// reader is at or past that epoch. Any thread
@@ -11465,6 +11538,9 @@ unsafe impl Send for RetiredForm {}
 // SAFETY: as `RetiredForm`; the pointee is a `Snapshot`, which is `Send`
 // and `Sync`, and only the sweep touches it after the swap.
 unsafe impl Send for RetiredSnap {}
+// SAFETY: as `RetiredForm`: the pointee is shared with no thread by the time
+// the sweep drops it.
+unsafe impl Send for RetiredZ {}
 
 impl Drop for Shared {
     fn drop(&mut self) {
@@ -13622,6 +13698,12 @@ impl Reader {
             if self.shared.retired.len() > 0 {
                 self.sweep_retired_states();
             }
+            // A sidecar retired by a settle waits for the same pins, and
+            // the writer's next operation is the sweep a store between
+            // publishes has.
+            if self.shared.retired_z.len() > 0 {
+                self.sweep_retired_z();
+            }
             // The snapshots and forms a publish replaced during it, held
             // for the pin just dropped: a pass of scans publishes the
             // snapshots it extends and nothing else sweeps after it, so
@@ -14310,6 +14392,9 @@ impl Reader {
             build_calls: get(&ev.build_calls),
             build_failed: get(&ev.build_failed),
             build_orphaned: get(&ev.build_orphaned),
+            build_retries: get(&ev.build_retries),
+            rebuilds: get(&ev.rebuilds),
+            declined_damage: get(&ev.declined_damage),
             declined_small: get(&ev.declined_small),
             declined_small_bytes: get(&ev.declined_small_bytes),
             declined_block_backed: get(&ev.declined_block_backed),
@@ -16151,12 +16236,24 @@ impl Reader {
             .sweep(|low| self.shared.readers.oldest_for(low));
     }
 
+    /// The sidecars taken out of their cells that no pinned reader can
+    /// still be walking, freed.
+    fn sweep_retired_z(&self) {
+        if self.shared.retired_z.len() == 0 {
+            return;
+        }
+        self.shared
+            .retired_z
+            .sweep(|low| self.shared.readers.oldest_for(low));
+    }
+
     /// EXPERIMENT: free the replaced canonical forms no pinned reader can
     /// still be walking: those retired at an epoch every pinned slot is
     /// past. The epoch is bumped first, so a form retired under the
     /// current epoch can be freed once its readers leave.
     fn sweep_retired_forms(&self) {
         self.sweep_retired_snaps();
+        self.sweep_retired_z();
         if self.shared.retired_forms.len() == 0 {
             return;
         }
@@ -20282,6 +20379,8 @@ impl Db {
             convert_total_ns: AtomicU64::new(0),
             ord_rebuilt: AtomicU64::new(0),
             z: zside::ZEvents::default(),
+            retired_z: RetireList::new(),
+            next_dead: AtomicU64::new(1),
             fail_zbuild: std::sync::atomic::AtomicBool::new(false),
             run_remaps: AtomicU64::new(0),
             stream_recycled: AtomicU64::new(0),
@@ -20748,6 +20847,8 @@ impl Db {
             convert_total_ns: AtomicU64::new(0),
             ord_rebuilt: AtomicU64::new(ord_rebuilt),
             z: zev,
+            retired_z: RetireList::new(),
+            next_dead: AtomicU64::new(1),
             fail_zbuild: std::sync::atomic::AtomicBool::new(false),
             run_remaps: AtomicU64::new(0),
             stream_recycled: AtomicU64::new(0),
@@ -23813,6 +23914,7 @@ impl Db {
         let failed = |why: u8| {
             zside::ZEvents::add(&ev.build_failed, 1);
             seg.z_declined.store(why, AtomicOrdering::Relaxed);
+            seg.z_schedule_retry(self.opts.zpages_retry_ms);
         };
         match made {
             Ok(zside::Outcome::Built(b)) => {
@@ -23849,10 +23951,34 @@ impl Db {
         }
     }
 
+    /// `seg`'s sidecar taken out of its cell and retired through the epoch
+    /// -- a reader pinned before the take may be walking it, and the sweep
+    /// frees it past every such pin -- and its file renamed to a dead name,
+    /// which the sweep at the end of the settle removes; whether there was
+    /// one. For a sidecar out of service after a page failed a check: what
+    /// the rebuild replaces.
+    fn z_retire(&self, seg: &Seg) -> bool {
+        let p = seg.z.take();
+        if p.is_null() {
+            return false;
+        }
+        let tag = self.shared.readers.bump();
+        self.shared.retired_z.push(tag, RetiredZ(p));
+        self.sweep_retired_z();
+        if let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) {
+            let n = self.shared.next_dead.fetch_add(1, AtomicOrdering::Relaxed);
+            let _ = std::fs::rename(
+                self.dir.join(zside::zpg_name(id, end)),
+                self.dir.join(zside::zpg_dead_name(n)),
+            );
+        }
+        true
+    }
+
     /// The sidecar files in `dir` that none of the segments named `live`
-    /// claims, and the temp names of builds that did not finish, removed;
-    /// how many. Called where nothing is building: at open, and at the end
-    /// of `zpages_settle`.
+    /// claims, the dead names of retired ones, and the temp names of builds
+    /// that did not finish, removed; how many. Called where nothing is
+    /// building: at open, and at the end of `zpages_settle`.
     fn z_sweep<'a>(dir: &Path, live: impl Iterator<Item = &'a str>) -> Result<u64> {
         let claimed: std::collections::HashSet<String> =
             live.filter_map(zside::zpg_name_for).collect();
@@ -23902,6 +24028,9 @@ impl Db {
             // The segments are held past the pin: a build is seconds, and a
             // pin held across one keeps every state a landing replaces
             // alive.
+            // The partitions to give one: those with none and no reason
+            // against it, those whose build failed and whose backoff has
+            // passed, and those whose sidecar a check took out of service.
             let todo: Vec<std::sync::Arc<Seg>> = {
                 let _op = self.op();
                 self.segs()
@@ -23909,8 +24038,14 @@ impl Db {
                     .filter(|s| {
                         let why = s.z_declined.load(AtomicOrdering::Relaxed);
                         s.level > 0
-                            && s.z.get().is_none()
-                            && (why == 0 || why == zside::DECLINED_REFUSED)
+                            && match s.z.get() {
+                                Some(z) => z.damaged(),
+                                None => {
+                                    why == 0
+                                        || why == zside::DECLINED_REFUSED
+                                        || (why == zside::DECLINED_FAILED && s.z_retry_due())
+                                }
+                            }
                     })
                     .cloned()
                     .collect()
@@ -23926,7 +24061,26 @@ impl Db {
             }
             between(self, ZRound::Listed);
             for seg in &todo {
-                self.z_give(seg);
+                let ev = &self.shared.z;
+                if seg.z.get().is_some_and(|z| z.damaged()) {
+                    // Retired, and built again up to the bound; past it the
+                    // partition is left raw for the segment's life.
+                    self.z_retire(seg);
+                    if seg.z_rebuilds.load(AtomicOrdering::Relaxed) < zside::ZREBUILDS {
+                        seg.z_rebuilds.fetch_add(1, AtomicOrdering::Relaxed);
+                        zside::ZEvents::add(&ev.rebuilds, 1);
+                        self.z_give(seg);
+                    } else {
+                        zside::ZEvents::add(&ev.declined_damage, 1);
+                        seg.z_declined
+                            .store(zside::DECLINED_DAMAGE, AtomicOrdering::Relaxed);
+                    }
+                } else if seg.z_declined.load(AtomicOrdering::Relaxed) == zside::DECLINED_FAILED {
+                    zside::ZEvents::add(&ev.build_retries, 1);
+                    self.z_give(seg);
+                } else {
+                    self.z_give(seg);
+                }
             }
             between(self, ZRound::Built);
             self.settle()?;
@@ -29258,7 +29412,7 @@ impl Maint {
     /// retired name and the live one address the SAME index file; unlinking
     /// it by name alone took the index of a segment that was still open, and
     /// seven tests said so.
-    fn retire_seg(&self, name: &str) {
+    fn retire_seg(&mut self, name: &str) {
         let _ = std::fs::remove_file(self.dir.join(name));
         let Some(ord) = Db::ord_name_for(name) else {
             return;
@@ -29288,6 +29442,13 @@ impl Maint {
         // under the default -- pays that and nothing more for a retired
         // segment, where the claim below compares every live segment's
         // name.
+        //
+        // Renamed to a dead name here and unlinked at the idle tick, where
+        // the segment work has a thread of its own: a rename frees no inode,
+        // and the unlink's round trip is paid where nobody waits, as the
+        // manifest's spares are. Inline, on the writer's thread, unlinked
+        // now. A dead name no live segment claims, so a crash between the
+        // two leaves a file the next open sweeps.
         if let Some(fields) = zside::zpg_fields(name) {
             let zpg = self.dir.join(zside::zpg_name(fields.0, fields.1));
             if zpg.exists()
@@ -29296,7 +29457,17 @@ impl Maint {
                     .iter()
                     .any(|s| zside::zpg_fields(&s.name) == Some(fields))
             {
-                let _ = std::fs::remove_file(zpg);
+                if self.wake.is_some() {
+                    let n = self.shared.next_dead.fetch_add(1, AtomicOrdering::Relaxed);
+                    let dead = self.dir.join(zside::zpg_dead_name(n));
+                    if std::fs::rename(&zpg, &dead).is_ok() {
+                        self.spares.push(dead);
+                    } else {
+                        let _ = std::fs::remove_file(zpg);
+                    }
+                } else {
+                    let _ = std::fs::remove_file(zpg);
+                }
             }
         }
     }
