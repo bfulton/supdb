@@ -2187,6 +2187,61 @@ mod tests {
     }
 
     #[test]
+    fn a_decode_buffer_is_as_large_as_the_largest_group_it_has_held_in_whole_pages() {
+        // A thread keeps one for its life and a callback that reads again
+        // makes one of its own, so a buffer made at the largest group's size
+        // was 64 KiB zeroed for each, to hold groups of a few kilobytes.
+        let mut buf = GroupBuf::new();
+        assert!(buf.words.is_empty(), "an empty buffer holds nothing");
+        for (n, words) in [
+            (0usize, 0usize),
+            (100, ZPAGE / 8),
+            (ZPAGE, ZPAGE / 8),
+            (ZPAGE + 4, 2 * ZPAGE / 8),
+            (500, 2 * ZPAGE / 8),
+            (ZMAX_ULEN, ZMAX_ULEN / 8),
+            (4, ZMAX_ULEN / 8),
+        ] {
+            let got = buf.bytes_for(n);
+            assert_eq!(got.len(), n);
+            assert!(
+                (got.as_ptr() as usize).is_multiple_of(8),
+                "a group decodes to where extents can be borrowed"
+            );
+            assert_eq!(buf.words.len(), words, "after a group of {n} bytes");
+        }
+        // Groups of every size one after another decode to their bytes,
+        // whichever way the buffer has grown: small, large, small.
+        let mut rng = Rng(0xB0F);
+        let mut buf = GroupBuf::new();
+        for n in [64usize, 3000, 40, 20_000, 4000, ZMAX_ULEN, 8, 3000] {
+            // Entropy for the sizes a page holds, a pattern for the ones it
+            // can only hold compressed.
+            let group: Vec<u8> = if n <= 4000 {
+                rng.bytes(n)
+            } else {
+                (0..n).map(|i| (i / 7 % 251) as u8).collect()
+            };
+            let payload = lz4_flex::block::compress(&group);
+            assert!(payload.len() <= ZCAP, "{n}: the group fits a page");
+            let h = PageHeader {
+                first_rank: 0,
+                count: 1,
+                stored: false,
+                ulen: group.len() as u32,
+                clen: payload.len() as u16,
+            };
+            let back = decode_group(&h, &payload, &mut buf).unwrap();
+            assert_eq!(back, &group[..], "{n}");
+        }
+        assert_eq!(
+            buf.words.len(),
+            ZMAX_ULEN / 8,
+            "grown to the largest, not past it"
+        );
+    }
+
+    #[test]
     fn a_stored_page_is_parsed_in_place_where_aligned_and_copied_where_not() {
         let images = small_groups().remove(1).0;
         let group = images.concat();

@@ -2044,4 +2044,732 @@ mod tests {
         }
         assert_eq!(f.entry_of(&[0xff; 64]), Some(f.len() - 1));
     }
+
+    // ---- the checks a good CRC does not make --------------------------------
+
+    use crate::db::zpages::{encode_page, PageHeader, ZCAP};
+
+    /// The images of page `p`'s records out of `bytes`, the whole sidecar.
+    fn page_images(bytes: &[u8], p: usize, bind: u32) -> Vec<Vec<u8>> {
+        let (h, payload) = parse_page(&bytes[p * ZPAGE..(p + 1) * ZPAGE], bind).unwrap();
+        let mut buf = GroupBuf::new();
+        let group = decode_group(&h, payload, &mut buf).unwrap().to_vec();
+        let (mut out, mut off) = (Vec::new(), 0usize);
+        for _ in 0..h.count {
+            let (_, next) = crate::flatindex::record_key_next(&group, off).unwrap();
+            out.push(group[off..next].to_vec());
+            off = next;
+        }
+        assert_eq!(off, group.len());
+        out
+    }
+
+    /// Page `p` of the sidecar at `path` rewritten in place as `images`, under
+    /// the `first_rank` and `count` the caller names and with a CRC that
+    /// passes: a page that is whole and is wrong. Written in place and never
+    /// truncated, so a mapping a reader holds sees the page change.
+    fn forge(path: &Path, p: usize, first_rank: u32, count: u16, images: &[Vec<u8>]) {
+        let bytes = std::fs::read(path).unwrap();
+        let t = Trailer::decode(&bytes[bytes.len() - ZTRAILER..]).unwrap();
+        let group: Vec<u8> = images.concat();
+        let payload = lz4_flex::block::compress(&group);
+        assert!(payload.len() <= ZCAP, "the forged page fits");
+        let h = PageHeader {
+            first_rank,
+            count,
+            stored: false,
+            ulen: group.len() as u32,
+            clen: payload.len() as u16,
+        };
+        let mut page = [0u8; ZPAGE];
+        encode_page(&mut page, &h, &payload, t.bind32()).unwrap();
+        let f = OpenOptions::new().write(true).open(path).unwrap();
+        f.write_all_at(&page, (p * ZPAGE) as u64).unwrap();
+    }
+
+    /// One record of a single inline value, as the writer lays it out.
+    fn record_image(key: &[u8], value: &[u8]) -> Vec<u8> {
+        let mut img = Vec::new();
+        let e = Ext {
+            block: Ext::INLINE,
+            off: 0,
+            len: value.len() as u32,
+            last: 0,
+            count: 1 | Ext::FIXED,
+        };
+        crate::flatindex::stream_record_as(&mut img, key, &[e], value, true).unwrap();
+        img
+    }
+
+    /// The first page the attach does not sample, `skip` unsampled pages in.
+    fn unsampled(pages: usize, skip: usize) -> usize {
+        let sampled: Vec<usize> = (0..ZSAMPLE_PAGES)
+            .map(|k| k * (pages - 1) / (ZSAMPLE_PAGES - 1))
+            .collect();
+        (1..pages - 1)
+            .filter(|q| !sampled.contains(q))
+            .nth(skip)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_page_with_a_good_crc_and_the_wrong_records_is_never_an_answer() {
+        // The CRC says the page is the bytes somebody wrote; it does not say
+        // they are the page the fence names. Three ways to be wrong under a
+        // good CRC, each of which a search of the group would answer without
+        // noticing: a record short, two records in the wrong order, and a
+        // first key that is not the fence's. The header's rank and count
+        // against the entry, and the walk of the group, are what refuse
+        // them, and the walk is what a read that skipped it would not have.
+        let fx = Fixture::new("forged", suite(4000, 61), 256);
+        fx.side();
+        let good = std::fs::read(&fx.out).unwrap();
+        let t = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
+        let p = unsampled(t.n_pages as usize, 10);
+        let side0 = fx.attach().unwrap();
+        let entry = side0.fence.entry(p, side0.nkeys as u32).unwrap();
+        let (first_rank, count) = (entry.first_rank, entry.count as u16);
+        drop(side0);
+        let images = page_images(&good, p, t.bind32());
+        let n = images.len();
+        assert_eq!(n, usize::from(count));
+        let on_page: Vec<&Rec> = fx.recs[first_rank as usize..first_rank as usize + n]
+            .iter()
+            .collect();
+        // The first record's key with a byte on the end: ascending, and not
+        // the fence's key.
+        let mut grown = on_page[0].0.clone();
+        grown.push(0);
+        let mut first_replaced = images.clone();
+        first_replaced[0] = record_image(&grown, &on_page[0].1[0]);
+        let mut swapped = images.clone();
+        swapped.swap(0, 1);
+        type Variant = (&'static str, u32, u16, Vec<Vec<u8>>);
+        let variants: Vec<Variant> = vec![
+            (
+                "one record short",
+                first_rank,
+                count - 1,
+                images[..n - 1].to_vec(),
+            ),
+            ("the first two swapped", first_rank, count, swapped),
+            (
+                "the first key is not the fence's",
+                first_rank,
+                count,
+                first_replaced,
+            ),
+            // The right records under the wrong rank.
+            ("the wrong rank", first_rank + 1, count, images.clone()),
+        ];
+        for (name, rank, cnt, imgs) in variants {
+            std::fs::write(&fx.out, &good).unwrap();
+            forge(&fx.out, p, rank, cnt, &imgs);
+            let side = fx
+                .attach()
+                .expect("an unsampled page is not looked at by the attach");
+            let mut declined = 0;
+            for (k, vals, _) in &on_page {
+                match z_values(&side, &fx.blob, k) {
+                    Some(got) => assert_eq!(&got, vals, "{name}: {k:?} answered {got:?}"),
+                    None => declined += 1,
+                }
+            }
+            assert!(declined > 0, "{name}: nothing was refused");
+            assert!(side.damaged(), "{name}: the sidecar stayed in service");
+            assert_eq!(
+                side.verified_pages(),
+                0,
+                "{name}: a refused page is verified"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sampled_page_with_a_good_crc_and_the_wrong_count_is_refused_at_attach() {
+        // The attach's sample compares each page it reads with the fence
+        // entry that names it, since a CRC that passes is no proof of that.
+        let fx = Fixture::new("sampled", suite(4000, 62), 256);
+        fx.side();
+        let good = std::fs::read(&fx.out).unwrap();
+        let t = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
+        let images = page_images(&good, 0, t.bind32());
+        let n = images.len();
+        forge(&fx.out, 0, 0, (n - 1) as u16, &images[..n - 1]);
+        assert!(
+            matches!(fx.attach(), Err(Reject::Damage(_))),
+            "a page of the sample that disagrees with its fence entry attached"
+        );
+        // And the rank, the other half of the compare.
+        std::fs::write(&fx.out, &good).unwrap();
+        forge(&fx.out, 0, 1, n as u16, &images);
+        assert!(matches!(fx.attach(), Err(Reject::Damage(_))));
+    }
+
+    #[test]
+    fn a_page_that_failed_its_first_decode_is_never_counted_verified() {
+        // The verified bit is what lets a later read skip the page's CRC, so
+        // it is set after every check has passed and not before: the sidecar
+        // leaves service on the failure, which hides a bit set early from a
+        // single reader, and a second reader that found the bit would serve
+        // the page unchecked.
+        let fx = Fixture::new("unverified", suite(4000, 63), 256);
+        fx.side();
+        let good = std::fs::read(&fx.out).unwrap();
+        let t = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
+        let p = unsampled(t.n_pages as usize, 5);
+        let f = OpenOptions::new().write(true).open(&fx.out).unwrap();
+        f.write_all_at(&[good[p * ZPAGE + 100] ^ 0x5a], (p * ZPAGE + 100) as u64)
+            .unwrap();
+        drop(f);
+        let side = fx.attach().unwrap();
+        let entry = side.fence.entry(p, side.nkeys as u32).unwrap();
+        let key = fx.recs[entry.first_rank as usize + 1].0.clone();
+        let mut got = 0;
+        let r = side
+            .read_all(&fx.blob, &key, &mut |_: &[u8]| got += 1)
+            .unwrap();
+        assert_eq!((r, got), (ZRead::Fallback, 0));
+        assert_eq!(side.verified_pages(), 0, "a page that failed is verified");
+        assert_eq!(side.bad_pages(), 1);
+        assert!(side.damaged());
+        // The sidecar is out of service, and what it is asked verifies nothing.
+        assert_eq!(side.count(&fx.recs[0].0), ZRead::Out);
+        assert_eq!(side.verified_pages(), 0);
+    }
+
+    #[test]
+    fn a_verified_page_that_changes_underneath_is_never_answered_absent() {
+        // Bit rot after the first decode: the page is read as verified, so
+        // its CRC is not looked at again, and a group that no longer searches
+        // is damage and not an absent key.
+        let fx = Fixture::new("rot", suite(3000, 65), 256);
+        fx.side();
+        let good = std::fs::read(&fx.out).unwrap();
+        let t = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
+        let p = t.n_pages as usize / 2;
+        let side = fx.attach().unwrap();
+        let entry = side.fence.entry(p, side.nkeys as u32).unwrap();
+        let (first_rank, count) = (entry.first_rank, entry.count as usize);
+        let k = fx.recs[first_rank as usize + 3].clone();
+        assert_eq!(z_values(&side, &fx.blob, &k.0), Some(k.1.clone()));
+        assert_eq!(side.verified_pages(), 1);
+        // The page rewritten whole under the open mapping: its last record is
+        // cut in the middle, and the header still says `count` of them.
+        let mut cut = page_images(&good, p, t.bind32());
+        let last = cut.len() - 1;
+        let half = cut[last].len() / 2 / 4 * 4;
+        cut[last].truncate(half);
+        forge(&fx.out, p, first_rank, count as u16, &cut);
+        let (mut served, mut declined) = (0, 0);
+        for i in 0..count {
+            let (key, vals, _) = &fx.recs[first_rank as usize + i];
+            match z_values(&side, &fx.blob, key) {
+                Some(got) => {
+                    assert_eq!(
+                        &got, vals,
+                        "{key:?} answered {got:?} after the page changed"
+                    );
+                    served += 1;
+                }
+                None => declined += 1,
+            }
+        }
+        assert!(
+            served > 0 && declined > 0,
+            "{served} served, {declined} declined"
+        );
+        assert!(side.damaged() && side.bad_pages() == 1);
+    }
+
+    #[test]
+    fn a_record_that_stops_parsing_after_its_page_was_verified_is_never_answered_absent() {
+        // The search of a group reads a record's key and its length, which
+        // for a compact record is the two bytes after the key and not the
+        // header's other two; the record is parsed whole only once it is
+        // found. A header the run contradicts is damage the search does not
+        // see, and the page was verified before it came: the record that is
+        // found and does not parse is the sidecar's damage, and a read that
+        // took it for no record would answer a key it holds as missing.
+        let fx = Fixture::new("rot-record", suite(3000, 68), 256);
+        fx.side();
+        let good = std::fs::read(&fx.out).unwrap();
+        let t = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
+        let p = t.n_pages as usize / 2;
+        let side = fx.attach().unwrap();
+        let entry = side.fence.entry(p, side.nkeys as u32).unwrap();
+        let (first_rank, count) = (entry.first_rank, entry.count as u16);
+        let (key, vals, _) = fx.recs[first_rank as usize + 3].clone();
+        assert_eq!(z_values(&side, &fx.blob, &key), Some(vals.clone()));
+        assert_eq!(side.verified_pages(), 1);
+        let mut images = page_images(&good, p, t.bind32());
+        // The compact header follows the key at the next multiple of four:
+        // its run length, then its record count and flags, which here say
+        // more records than the run has bytes.
+        let at = (4 + key.len()).next_multiple_of(4);
+        assert_eq!(
+            u16::from_le_bytes([images[3][2], images[3][3]]),
+            crate::flatindex::COMPACT,
+            "a compact record"
+        );
+        images[3][at + 2] = 0xff;
+        images[3][at + 3] = 0x1f;
+        forge(&fx.out, p, first_rank, count, &images);
+        let mut got = 0;
+        let r = side
+            .read_all(&fx.blob, &key, &mut |_: &[u8]| got += 1)
+            .unwrap();
+        assert_eq!((r, got), (ZRead::Fallback, 0));
+        assert!(side.damaged() && side.bad_pages() == 1);
+        // The records before it in the group were answered while it held.
+        assert_eq!(side.count(&key), ZRead::Out);
+    }
+
+    #[test]
+    fn a_second_install_is_refused() {
+        let fx = Fixture::new("install", suite(2000, 67), 256);
+        fx.side();
+        let cell = ZCell::new();
+        assert!(cell.get().is_none());
+        assert!(cell.install(fx.attach().unwrap()));
+        let first = cell.get().unwrap().id();
+        assert!(
+            !cell.install(fx.attach().unwrap()),
+            "a cell holds one sidecar"
+        );
+        assert_eq!(cell.get().unwrap().id(), first);
+    }
+
+    #[test]
+    fn the_trailer_sums_the_groups_and_the_file_is_the_length_the_build_returns() {
+        let fx = Fixture::new("sums", suite(3000, 64), 256);
+        let Outcome::Built(b) = fx.build() else {
+            panic!("built")
+        };
+        let side = fx.attach().unwrap();
+        let bytes = std::fs::read(&fx.out).unwrap();
+        let mut sum = 0u64;
+        for p in 0..side.pages() {
+            sum += u64::from(
+                page_view(&bytes[p * ZPAGE..(p + 1) * ZPAGE])
+                    .unwrap()
+                    .0
+                    .ulen,
+            );
+        }
+        assert_eq!(side.group_bytes(), sum);
+        assert_eq!(b.total_ulen, sum);
+        assert_eq!(side.file_bytes(), bytes.len() as u64);
+        assert_eq!(b.file_bytes, bytes.len() as u64);
+        assert_eq!(b.fill.pages as usize, side.pages());
+    }
+
+    // ---- what the build leaves behind ---------------------------------------
+
+    /// The sidecar's temp name.
+    fn tmp_of(out: &Path) -> PathBuf {
+        let mut s = out.as_os_str().to_owned();
+        s.push(".tmp");
+        PathBuf::from(s)
+    }
+
+    #[test]
+    fn a_build_over_records_out_of_order_fails_and_leaves_no_file() {
+        // The builder runs the reader's own checks on every page it writes:
+        // a segment whose directory names two records in each other's places
+        // makes a group that is not in key order, which no checksum sees and
+        // a search would answer wrong from. The build fails, and the failure
+        // leaves neither the sidecar nor its temp name.
+        let fx = Fixture::new("order", suite(3000, 63), 256);
+        let map = MmapBytes::open(&fx.seg).unwrap();
+        let base = map.slice_at(0, 1).unwrap().as_ptr() as usize;
+        let blob = Blob::open(map).unwrap();
+        let (_, dir) = blob.record_regions().unwrap();
+        let dir_off = dir.as_ptr() as usize - base;
+        drop(blob);
+        // Two directory words swapped in a copy of the segment: ranks 40 and
+        // 41 name each other's records.
+        let mut copy = std::fs::read(&fx.seg).unwrap();
+        let (a, b) = (dir_off + 4 * 40, dir_off + 4 * 41);
+        for i in 0..4 {
+            copy.swap(a + i, b + i);
+        }
+        let broken = fx.dir.join("par-00000008-0000000000000099--.sup");
+        std::fs::write(&broken, copy).unwrap();
+        let out = fx.dir.join(zpg_name(8, END));
+        let r = build(&broken, &out, 8, END, &BuildPlan::new(0, true));
+        assert!(r.is_err(), "records out of order built a sidecar: {r:?}");
+        assert!(!out.exists());
+        assert!(!tmp_of(&out).exists(), "a failed build left its temp name");
+    }
+
+    #[test]
+    fn a_decline_after_pages_were_written_leaves_no_temp_file() {
+        // Declined late: the pages before the record no page holds are
+        // already in the temp file when the build gives up.
+        let mut rng = Rng(77);
+        let mut recs = suite(3000, 3);
+        recs.push((b"zzz-big".to_vec(), vec![rng.bytes(6000)], false));
+        let fx = Fixture::new("late-incompressible", recs, 1 << 20);
+        assert!(matches!(
+            fx.build(),
+            Outcome::Declined(Decline::NoPage(NoPage::Incompressible))
+        ));
+        assert!(!fx.out.exists());
+        assert!(
+            !tmp_of(&fx.out).exists(),
+            "the temp file of a declined build is left behind"
+        );
+        let mut recs = suite(3000, 4);
+        recs.push((b"zzz-big".to_vec(), vec![vec![0u8; 70_000]], false));
+        let fx = Fixture::new("late-oversize", recs, 1 << 20);
+        assert!(matches!(
+            fx.build(),
+            Outcome::Declined(Decline::NoPage(NoPage::Oversize))
+        ));
+        assert!(!fx.out.exists() && !tmp_of(&fx.out).exists());
+    }
+
+    #[test]
+    fn a_build_over_a_stale_temp_file_is_a_whole_sidecar() {
+        // A build a crash cut off leaves its temp name, and the next build of
+        // the same name writes over it: from the first byte, and to the
+        // length the sidecar is, or the file renamed into place carries what
+        // the crashed build had after its end.
+        let fx = Fixture::new("stale", suite(3000, 66), 256);
+        std::fs::write(tmp_of(&fx.out), vec![0xA5u8; 4 << 20]).unwrap();
+        assert!(matches!(fx.build(), Outcome::Built(_)));
+        let side = fx
+            .attach()
+            .expect("a sidecar built over a stale temp file attaches");
+        agree(&side, &fx.blob, &fx.recs);
+        assert!(!tmp_of(&fx.out).exists());
+    }
+
+    /// A sink that keeps what it is given.
+    struct Recorder(Vec<(u64, Vec<u8>)>);
+
+    impl PieceSink for Recorder {
+        fn put(&mut self, at: u64, piece: &[u8]) -> Result<()> {
+            self.0.push((at, piece.to_vec()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pieces_are_cut_whole_at_their_own_offsets() {
+        let mut rng = Rng(0x91ece);
+        let stream = rng.bytes(10_000);
+        for size in [1usize, 7, 4096, 4097] {
+            for chunk in [1usize, 5, 4096, 9_999, 10_000] {
+                let mut w = Pieces::new(Recorder(Vec::new()), size);
+                for part in stream.chunks(chunk) {
+                    w.push(part).unwrap();
+                }
+                // Nothing is written until a piece is whole, and the last
+                // piece is what is left.
+                let whole = stream.len() / size;
+                assert_eq!(w.sink.0.len(), whole, "size {size}, chunk {chunk}");
+                w.flush().unwrap();
+                w.flush().unwrap();
+                let got = &w.sink.0;
+                assert_eq!(got.len(), stream.len().div_ceil(size));
+                for (i, (at, piece)) in got.iter().enumerate() {
+                    assert_eq!(*at, (i * size) as u64, "size {size}, chunk {chunk}");
+                    let want = size.min(stream.len() - i * size);
+                    assert_eq!(piece.len(), want, "piece {i} of size {size}");
+                }
+                let joined: Vec<u8> = got.iter().flat_map(|(_, p)| p.iter().copied()).collect();
+                assert_eq!(joined, stream, "size {size}, chunk {chunk}");
+                assert_eq!(w.at, stream.len() as u64);
+            }
+        }
+        // Nothing pushed, nothing written.
+        let mut w = Pieces::new(Recorder(Vec::new()), 4096);
+        w.flush().unwrap();
+        assert!(w.sink.0.is_empty() && w.at == 0);
+    }
+
+    #[test]
+    fn a_sidecar_is_the_same_bytes_whatever_the_piece_and_the_window() {
+        // The piece a build writes in and the window it drops the raw records
+        // behind are choices about the page cache; the file is the same. The
+        // plans cross, with a store a test can afford, the boundaries a real
+        // build crosses: a piece smaller than the file, a window smaller than
+        // the records, a piece that is not a whole number of pages.
+        let fx = Fixture::new("plans", suite(6000, 71), 256);
+        let map = MmapBytes::open(&fx.seg).unwrap();
+        let base = map.slice_at(0, 1).unwrap().as_ptr() as usize;
+        let blob = Blob::open(map).unwrap();
+        let (recs, dir) = blob.record_regions().unwrap();
+        let recs_at = recs.as_ptr() as usize - base;
+        let (recs_end, dir_at) = (recs_at + recs.len(), dir.as_ptr() as usize - base);
+        let dir_end = dir_at + dir.len();
+        drop(blob);
+        let mut reference: Option<Vec<u8>> = None;
+        let plans = [
+            (ZWRITE_PIECE, ZDROP_WINDOW, true),
+            (ZPAGE, ZPAGE, true),
+            (3 * ZPAGE, 5 * ZPAGE + 100, true),
+            (7 * ZPAGE + 12, 64 << 10, true),
+            (ZWRITE_PIECE, 64 << 10, false),
+        ];
+        for (piece, window, drop_behind) in plans {
+            let _ = std::fs::remove_file(&fx.out);
+            let plan = BuildPlan {
+                floor: 0,
+                drop_behind,
+                piece,
+                window,
+            };
+            let mut seen: Vec<(usize, usize)> = Vec::new();
+            let r = build_seen(&fx.seg, &fx.out, ID, END, &plan, &mut |a, b| {
+                seen.push((a, b))
+            })
+            .unwrap();
+            assert!(matches!(r, Outcome::Built(_)));
+            let bytes = std::fs::read(&fx.out).unwrap();
+            match &reference {
+                None => reference = Some(bytes),
+                Some(want) => assert_eq!(&bytes, want, "piece {piece}, window {window}"),
+            }
+            if !drop_behind {
+                assert!(
+                    seen.is_empty(),
+                    "a build asked not to drop dropped {seen:?}"
+                );
+                continue;
+            }
+            // The directory last; the records before it, in order, each range
+            // beginning where the one before ended and every range but the
+            // last at least a window; together the whole region and no byte
+            // of anything else.
+            let (dirs, recs_seen) = seen.split_last().expect("something was dropped");
+            assert_eq!(*dirs, (dir_at, dir_end), "the directory is dropped last");
+            let mut at = recs_at;
+            for (i, &(a, b)) in recs_seen.iter().enumerate() {
+                assert_eq!(a, at, "range {i} begins where the one before ended");
+                assert!(b > a, "range {i} is empty");
+                if i + 1 < recs_seen.len() {
+                    assert!(
+                        b - a >= window,
+                        "range {i} is {} bytes of a {window} window",
+                        b - a
+                    );
+                }
+                at = b;
+            }
+            assert_eq!(at, recs_end, "the records are dropped to their end");
+            if window <= 64 << 10 {
+                assert!(
+                    recs_seen.len() > 1,
+                    "a window under the region drops in turns"
+                );
+            } else {
+                assert_eq!(
+                    recs_seen.len(),
+                    1,
+                    "a window over the region drops once, at the end"
+                );
+            }
+        }
+    }
+
+    // ---- the arms of a read ---------------------------------------------------
+
+    /// The file's bytes in a buffer whose start is `extra` bytes past a
+    /// multiple of eight, and where the file begins in it.
+    fn file_at(bytes: &[u8], extra: usize) -> (Vec<u8>, usize) {
+        let mut backing = vec![0u8; bytes.len() + 16];
+        let start = (8 - backing.as_ptr() as usize % 8) % 8 + extra;
+        backing[start..start + bytes.len()].copy_from_slice(bytes);
+        (backing, start)
+    }
+
+    #[test]
+    fn a_page_the_sidecar_cannot_lend_is_refused_by_a_read_and_not_answered_absent() {
+        // Entropy: every page is stored, parsed where it lies, and a stored
+        // page's payload has to sit where the extents `parse_record` borrows
+        // are aligned. A mapping never gives one that does not; a source that
+        // does is refused, and refused by the read and not only by the
+        // function under it: the arm that handles the refusal is the one that
+        // could answer a held key as missing.
+        let mut rng = Rng(0xfeed);
+        let mut recs: Vec<Rec> = (0..1500)
+            .map(|_| (rng.bytes(16), vec![rng.bytes(100)], false))
+            .collect();
+        recs.sort_by(|a, b| a.0.cmp(&b.0));
+        recs.dedup_by(|a, b| a.0 == b.0);
+        let fx = Fixture::new("lend", recs, 256);
+        fx.side();
+        let bytes = std::fs::read(&fx.out).unwrap();
+        // A sidecar fresh from its attach: no page is verified yet, so a read
+        // that meets a page meets it in its first decode.
+        let mut side = fx.attach().unwrap();
+        // Which pages are stored: entropy makes most of them so, and a group
+        // that LZ4 does shorten is decoded into a buffer of the reader's own,
+        // which is aligned whatever the source is.
+        let stored = |side: &ZSide, k: &[u8]| {
+            let p = side.fence.page(side.fence.entry_of(k).unwrap()).unwrap() as usize;
+            page_view(&bytes[p * ZPAGE..(p + 1) * ZPAGE])
+                .unwrap()
+                .0
+                .stored
+        };
+        let on_stored = fx.recs.iter().filter(|r| stored(&side, &r.0)).count();
+        assert!(
+            on_stored > 100 && fx.recs.len() - on_stored > 100,
+            "{on_stored} of {} records on stored pages: the test wants both kinds",
+            fx.recs.len()
+        );
+        // Misaligned by every skew that is not a multiple of four: a read
+        // and a count of a key on a stored page both decline, and the sidecar
+        // stays in service, since a source that cannot lend is no damage to
+        // the file; a key on any other page is served as it is.
+        let refused = |side: &ZSide, what: &str| {
+            let (mut refusals, mut answers) = (0, 0);
+            for (k, vals, _) in fx.recs.iter().step_by(11) {
+                let mut got = Vec::new();
+                let r = side
+                    .read_all(&fx.blob, k, &mut |v: &[u8]| got.push(v.to_vec()))
+                    .unwrap();
+                if stored(side, k) {
+                    assert_eq!(
+                        (r, got.len()),
+                        (ZRead::Fallback, 0),
+                        "{what}: read of {k:?}"
+                    );
+                    assert_eq!(side.count(k), ZRead::Fallback, "{what}: count of {k:?}");
+                    refusals += 1;
+                } else {
+                    assert_eq!(&got, vals, "{what}: read of {k:?}");
+                    assert_eq!(served(side.count(k)), vals.len() as u64);
+                    answers += 1;
+                }
+            }
+            assert!(
+                refusals > 10 && answers > 0,
+                "{refusals} refused, {answers} answered"
+            );
+            assert!(!side.damaged() && side.bad_pages() == 0, "{what}");
+        };
+        for extra in [1usize, 2, 3, 5, 6, 7] {
+            side.skewed = Some(file_at(&bytes, extra));
+            refused(&side, &format!("first decode, skew {extra}"));
+        }
+        for p in 0..side.pages() {
+            let stored_page = page_view(&bytes[p * ZPAGE..(p + 1) * ZPAGE])
+                .unwrap()
+                .0
+                .stored;
+            assert!(
+                !(stored_page && bit(&side.verified, p)),
+                "page {p} was refused and is verified"
+            );
+        }
+        // Aligned, from a buffer of the test's own: every key is served, a
+        // stored page in place with nothing decoded.
+        side.skewed = Some(file_at(&bytes, 0));
+        for (k, vals, _) in &fx.recs {
+            let mut got = Vec::new();
+            let r = side
+                .read_all(&fx.blob, k, &mut |v: &[u8]| got.push(v.to_vec()))
+                .unwrap();
+            let want = ZRead::Served {
+                n: vals.len() as u64,
+                decoded: !stored(&side, k),
+            };
+            assert_eq!(r, want);
+            assert_eq!(&got, vals);
+        }
+        // The pages are verified now, and a read that meets one in the
+        // verified path is refused the same way.
+        for extra in [1usize, 3, 6] {
+            side.skewed = Some(file_at(&bytes, extra));
+            refused(&side, &format!("verified, skew {extra}"));
+        }
+        // A source that has no such page at all is the sidecar's damage.
+        side.skewed = Some((Vec::new(), 0));
+        let k = &fx.recs[fx.recs.len() / 2].0;
+        assert_eq!(side.count(k), ZRead::Fallback);
+        assert!(side.damaged() && side.bad_pages() == 1);
+        assert_eq!(side.count(k), ZRead::Out);
+    }
+
+    #[test]
+    fn records_the_form_holds_no_page_for_are_the_raw_forms_and_pages_are_found_by_number() {
+        // A fence entry that names no page (`ZNOPAGE`) is a run of records the
+        // form was built without, and a read of them is the raw form's: the
+        // sidecar says so and does not answer absent. The entries after it
+        // are not at their own index in the file: the page of entry `i` is
+        // the number the fence gives, and a reader that took the entry's
+        // index for it would open another entry's page and find the damage
+        // check, rightly, unwilling.
+        let fx = Fixture::new("nopage", suite(4000, 81), 256);
+        fx.side();
+        let good = std::fs::read(&fx.out).unwrap();
+        let t = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
+        let (fence, _) =
+            ZFence::decode_resident(&good[t.res_off as usize..good.len() - ZTRAILER], &t).unwrap();
+        let (pages, k) = (t.n_pages as usize, 5usize);
+        assert!(pages > k + 3);
+        let mut bytes: Vec<u8> = Vec::new();
+        for p in (0..pages).filter(|&p| p != k) {
+            bytes.extend_from_slice(&good[p * ZPAGE..(p + 1) * ZPAGE]);
+        }
+        let mut cut = ZFence::new();
+        let mut next = 0u32;
+        for i in 0..fence.len() {
+            let page = if i == k {
+                ZNOPAGE
+            } else {
+                next += 1;
+                next - 1
+            };
+            cut.push(fence.first_rank(i).unwrap(), page, fence.key(i).unwrap())
+                .unwrap();
+        }
+        let (res, rf) = cut.encode_resident(&[]).unwrap();
+        bytes.extend_from_slice(&res);
+        let dropped = page_view(&good[k * ZPAGE..(k + 1) * ZPAGE]).unwrap().0;
+        let mut t2 = t.clone();
+        t2.n_pages -= 1;
+        t2.res_off = t2.n_pages * ZPAGE as u64;
+        t2.res_len = rf.res_len;
+        t2.res_crc = rf.res_crc;
+        t2.total_ulen -= u64::from(dropped.ulen);
+        bytes.extend_from_slice(&t2.encode());
+        std::fs::write(&fx.out, &bytes).unwrap();
+        let side = fx
+            .attach()
+            .expect("a fence with an entry of no page attaches");
+        let (lo, hi) = (
+            fence.first_rank(k).unwrap() as usize,
+            fence.first_rank(k + 1).unwrap() as usize,
+        );
+        assert_eq!(hi - lo, usize::from(dropped.count));
+        let (mut served, mut declined) = (0, 0);
+        for (i, (key, vals, _)) in fx.recs.iter().enumerate() {
+            let mut got = Vec::new();
+            let r = side
+                .read_all(&fx.blob, key, &mut |v: &[u8]| got.push(v.to_vec()))
+                .unwrap();
+            if (lo..hi).contains(&i) {
+                assert_eq!((r, got.len()), (ZRead::Fallback, 0), "record {i}");
+                assert_eq!(side.count(key), ZRead::Fallback, "count of record {i}");
+                declined += 1;
+            } else {
+                assert_eq!(&got, vals, "record {i}");
+                assert!(matches!(r, ZRead::Served { .. }), "record {i}: {r:?}");
+                served += 1;
+            }
+        }
+        assert_eq!(declined, hi - lo);
+        assert!(served > 3 * declined, "{served} served");
+        assert!(!side.damaged() && side.bad_pages() == 0);
+        // A key that falls in the run and is not there is the raw form's to
+        // say so too, not the sidecar's to say absent.
+        let inside = [fx.recs[lo].0.as_slice(), &[0u8]].concat();
+        assert_eq!(side.count(&inside), ZRead::Fallback);
+    }
 }
