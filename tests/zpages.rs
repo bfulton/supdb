@@ -2207,14 +2207,24 @@ fn a_merge_takes_the_sidecar_of_the_segment_it_retires() {
         .filter(|n| n.ends_with(".sup"))
         .map(|n| zpg_of(&n))
         .collect();
+    // A retired sidecar is renamed to a dead name by the landing and
+    // unlinked at the segment work's idle tick, so a dead name may stand
+    // here; a live name must be a live segment's.
     for f in sidecar_files(&dir) {
         let name = f.file_name().unwrap().to_string_lossy().into_owned();
         assert!(
-            segments.contains(&name),
+            name.starts_with("zpg-dead-") || segments.contains(&name),
             "{name} outlived its segment, before any settle of the form"
         );
     }
     db.zpages_settle().unwrap();
+    assert!(
+        sidecar_files(&dir)
+            .iter()
+            .all(|f| !f.to_string_lossy().contains("zpg-dead-")),
+        "no dead name survives a settle of the form: {:?}",
+        sidecar_files(&dir)
+    );
     let c = db.zpage_counts();
     assert!(
         c.builds > first.builds,
@@ -2988,5 +2998,554 @@ fn the_empty_key_as_the_first_write_of_a_store() {
     db.flush().unwrap();
     db.zpages_settle().unwrap();
     assert_eq!(read_vec(&db, b""), vec![b"the empty key".to_vec()]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- the lifecycle: damage, retirement and rebuild ----------------------------------
+
+/// The mappings this process holds of sidecar files under `dir`, as
+/// `/proc/self/maps` names them: a renamed file shows under its new name,
+/// an unlinked one with ` (deleted)`. One line a mapping, deduplicated by
+/// the file the line names, since a mapping may be split into several.
+#[cfg(target_os = "linux")]
+fn zpg_mappings(dir: &Path) -> Vec<String> {
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+    let prefix = dir.join("zpg-");
+    let prefix = prefix.to_string_lossy();
+    let mut v: Vec<String> = maps
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(5))
+        .filter(|p| p.starts_with(&*prefix))
+        .map(str::to_owned)
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// A page of the sidecar at `path`, from its middle on, that no attach
+/// samples and that `taken` does not name: a page whose first decode in
+/// this process is still to come, so that a flip in it is met by a read's
+/// own checks and not by an attach's sample.
+fn an_untouched_page(path: &Path, taken: &[usize]) -> usize {
+    let bytes = std::fs::read(path).unwrap();
+    let t = Trailer::decode(&bytes[bytes.len() - ZTRAILER..]).unwrap();
+    let pages = t.n_pages as usize;
+    assert!(pages > 40, "{pages} pages");
+    let sampled: Vec<usize> = (0..16).map(|k| k * (pages - 1) / 15).collect();
+    (pages / 2..pages)
+        .find(|p| !sampled.contains(p) && !taken.contains(p))
+        .expect("a page nobody sampled or read")
+}
+
+/// The keys of a one-partition store that page `p` of the sidecar holds and
+/// no other: a read of them decodes that page alone.
+fn keys_in_page(sidecar: &Path, p: usize, all: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let fence = fence_keys(sidecar);
+    let (lo, hi) = (&fence[p], fence.get(p + 1));
+    let v: Vec<Vec<u8>> = all
+        .iter()
+        .filter(|k| *k >= lo && hi.is_none_or(|h| *k < h))
+        .cloned()
+        .collect();
+    assert!(!v.is_empty());
+    v
+}
+
+/// One byte of page `p` of the sidecar at `path` flipped in place, and the
+/// keys that page holds and no other.
+fn flip_page(path: &Path, p: usize, all: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let at = (p * ZPAGE + 100) as u64;
+    let mut b = [0u8; 1];
+    f.read_exact_at(&mut b, at).unwrap();
+    f.write_at(&[b[0] ^ 0x40], at).unwrap();
+    keys_in_page(path, p, all)
+}
+
+/// A page that fails its first decode takes the sidecar out of service, and
+/// the next settle retires it, renames the file to a dead name, and builds
+/// the partition's sidecar again; the reads after are served from the new
+/// one. Three times a segment and no more: the fourth damage leaves the
+/// partition raw for the segment's life, counted, since a defect the build
+/// cannot see or a medium that keeps failing is a decline and not a loop of
+/// a build a cycle.
+#[test]
+fn a_damaged_sidecar_is_retired_and_rebuilt_at_most_three_times() {
+    let (dir, model, keys) = one_partition("rebuild-src", 4500, 0x2EB1);
+    let work = scratch("rebuild-work");
+    copy_dir(&dir, &work);
+    let mut db = Db::open(&work, forced(|_| {})).unwrap();
+    let mut taken: Vec<usize> = Vec::new();
+    for round in 1..=4u64 {
+        let file = sidecar_files(&work)
+            .into_iter()
+            .find(|p| !p.to_string_lossy().contains("dead"))
+            .expect("a live sidecar");
+        let p = an_untouched_page(&file, &taken);
+        taken.push(p);
+        let probe = flip_page(&file, p, &keys);
+        let before = db.zpage_counts();
+        check(&db, &model, &probe, &format!("round {round}, damaged"));
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.fallbacks - before.fallbacks, c.damaged, c.sidecars),
+            (1, 1, 1),
+            "round {round}: {c:?}"
+        );
+        // The settle retires the damaged sidecar and rebuilds, or, past
+        // the third rebuild, declines the partition.
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        let live: Vec<PathBuf> = sidecar_files(&work)
+            .into_iter()
+            .filter(|p| !p.to_string_lossy().contains("dead"))
+            .collect();
+        if round <= 3 {
+            assert_eq!(
+                (c.rebuilds, c.damaged, c.sidecars, c.declined_damage),
+                (round, 0, 1, 0),
+                "round {round}: {c:?}"
+            );
+            assert_eq!(live.len(), 1, "one live sidecar: {live:?}");
+            let before = db.zpage_counts();
+            check(&db, &model, &probe, &format!("round {round}, rebuilt"));
+            let c = db.zpage_counts();
+            assert_eq!(
+                (
+                    c.fallbacks - before.fallbacks,
+                    c.rawserves - before.rawserves
+                ),
+                (0, 0),
+                "round {round}: served from the new sidecar: {c:?}"
+            );
+            assert!(c.reads > before.reads, "{c:?}");
+            // The grouping is a function of the segment's bytes, so the
+            // rebuilt sidecar's page `p` holds the same keys, and that
+            // page was decoded just now: the next round takes another.
+        } else {
+            assert_eq!(
+                (c.rebuilds, c.damaged, c.sidecars, c.declined_damage),
+                (3, 0, 0, 1),
+                "round {round}: {c:?}"
+            );
+            assert!(live.is_empty(), "no live sidecar: {live:?}");
+            let before = db.zpage_counts();
+            check(&db, &model, &probe, "declined");
+            let c = db.zpage_counts();
+            assert_eq!(c.reads, before.reads, "{c:?}");
+            assert_eq!(
+                c.rawserves - before.rawserves,
+                2 * probe.len() as u64,
+                "{c:?}"
+            );
+        }
+        // No dead name survives a settle: the sweep at its end takes them.
+        assert!(
+            sidecar_files(&work)
+                .iter()
+                .all(|p| !p.to_string_lossy().contains("dead")),
+            "{:?}",
+            sidecar_files(&work)
+        );
+    }
+    // The decline is the segment's: a reopen gives the partition a sidecar
+    // again, and a merge's output would too.
+    db.close().unwrap();
+    let mut db = Db::open(&work, forced(|_| {})).unwrap();
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.sidecars, c.builds, c.declined_damage),
+        (1, 1, 0),
+        "{c:?}"
+    );
+    check(&db, &model, &keys[..200], "reopened");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// A sidecar retired while a handle is pinned at a snapshot stays mapped
+/// until that handle releases, and goes then: a reader that loaded the
+/// pointer before the retirement may be walking it, and the pin is what
+/// says so. A handle claimed after the retirement reads the new sidecar.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_retired_sidecar_outlives_its_last_reader_and_no_longer() {
+    let (dir, model, keys) = one_partition("retire-pin-src", 4500, 0x9E71);
+    let work = scratch("retire-pin-work");
+    copy_dir(&dir, &work);
+    let mut db = Db::open(&work, forced(|_| {})).unwrap();
+    check(&db, &model, &keys[..50], "before");
+    let old = zpg_mappings(&work);
+    assert_eq!(old.len(), 1, "one sidecar mapped: {old:?}");
+    // A handle pinned at a snapshot, before the damage.
+    let pinned = db.reader().unwrap();
+    pinned.snapshot();
+    check(&pinned, &model, &keys[..50], "pinned, before");
+    let file = sidecar_files(&work).remove(0);
+    let p = an_untouched_page(&file, &[]);
+    let probe = flip_page(&file, p, &keys);
+    check(&db, &model, &probe, "damaged");
+    assert_eq!(db.zpage_counts().damaged, 1);
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!((c.rebuilds, c.sidecars, c.damaged), (1, 1, 0), "{c:?}");
+    // Two mappings: the retired sidecar the pin keeps, under its dead name
+    // or deleted, and the new one.
+    let during = zpg_mappings(&work);
+    assert_eq!(
+        during.len(),
+        2,
+        "the retired mapping waits for the pin: {during:?}"
+    );
+    // The pinned handle still answers, and a fresh one reads the new file.
+    check(&pinned, &model, &keys[..50], "pinned, after");
+    let fresh = db.reader().unwrap();
+    let before = db.zpage_counts();
+    check(&fresh, &model, &probe, "fresh handle");
+    drop(fresh);
+    let c = db.zpage_counts();
+    assert_eq!(
+        (
+            c.fallbacks - before.fallbacks,
+            c.rawserves - before.rawserves
+        ),
+        (0, 0),
+        "{c:?}"
+    );
+    // A retirement that does not involve the pinned handle frees nothing
+    // of what it holds: another read through the writer sweeps, and the
+    // retired mapping stays.
+    check(&db, &model, &keys[..50], "writer, after");
+    assert_eq!(zpg_mappings(&work).len(), 2, "still held by the pin");
+    // Released: the mapping goes with the pin, not with the next
+    // retirement.
+    pinned.release();
+    drop(pinned);
+    check(&db, &model, &keys[..50], "writer, after the release");
+    let after = zpg_mappings(&work);
+    assert_eq!(
+        after.len(),
+        1,
+        "the retired mapping went with the pin: {after:?}"
+    );
+    assert_eq!(
+        after, old,
+        "the mapping left is the rebuilt sidecar's, under the live name"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// A build that fails is tried again after a backoff and not written off
+/// for the segment's life: a disk that was full, a transient error. The
+/// backoff is an option so that a test can make it zero; its default is a
+/// minute, doubling to an hour.
+#[test]
+fn a_failed_build_is_tried_again_after_its_backoff() {
+    let dir = scratch("retry");
+    let mut db = Db::create(&dir, forced(|o| o.zpages_retry_ms = 0)).unwrap();
+    let model = ordered_load(&mut db, 3000, 0x2E72);
+    db.fail_next_zpage_build();
+    // With no backoff the settle's next round tries again and builds it.
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.build_failed, c.builds, c.sidecars, c.build_retries),
+        (1, 1, 1, 1),
+        "{c:?}"
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    check(&db, &model, &keys[..300], "retried");
+    assert_eq!(db.zpage_counts().reads, 300);
+    db.close().unwrap();
+    // With the default backoff a failed build waits: the next settle does
+    // not try it, and a reopen does, since the backoff is the segment's
+    // in this process.
+    let dir2 = scratch("retry-waits");
+    let mut db = Db::create(&dir2, forced(|_| {})).unwrap();
+    let model = ordered_load(&mut db, 3000, 0x2E73);
+    db.fail_next_zpage_build();
+    db.zpages_settle().unwrap();
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.build_failed, c.builds, c.sidecars, c.build_retries),
+        (1, 0, 0, 0),
+        "{c:?}"
+    );
+    assert_eq!(Options::default().zpages_retry_ms, 60_000);
+    db.close().unwrap();
+    let mut db = Db::open(&dir2, forced(|_| {})).unwrap();
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!((c.builds, c.sidecars), (1, 1), "{c:?}");
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    check(&db, &model, &keys[..100], "after the reopen");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
+}
+
+// ---- the crash windows ---------------------------------------------------------------
+
+/// The segment's name fields a sidecar is named by: `(id, end_seq)`.
+fn fields_of(seg: &str) -> (u64, u64) {
+    let rest = seg
+        .strip_prefix("par-")
+        .or_else(|| seg.strip_prefix("seg-"))
+        .or_else(|| seg.strip_prefix("pcs-"))
+        .unwrap();
+    let mut f = rest.split('-');
+    let id: u64 = f.next().unwrap().parse().unwrap();
+    let end: u64 = f.next().unwrap().parse().unwrap();
+    (id, end)
+}
+
+/// The one partition's segment file name in `dir`.
+fn partition_name(dir: &Path) -> String {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("par-") && n.ends_with(".sup"))
+        .collect();
+    assert_eq!(v.len(), 1, "one partition: {v:?}");
+    v.remove(0)
+}
+
+/// Every window of the sidecar's life a crash can fall in, built on disk
+/// from a store that has its sidecar and then opened: what the open
+/// leaves in the directory, what the reads answer, and that the counters
+/// name what it found. A sidecar is derived and unsynced, so every row is
+/// a normal outcome and none is an error for the store.
+#[test]
+fn every_crash_window_of_a_sidecar_is_survived_at_open() {
+    let (dir, model, keys) = one_partition("crash-src", 4500, 0xC2A5);
+    let seg = partition_name(&dir);
+    let (id, end) = fields_of(&seg);
+    let live = format!("zpg-{id:08}-{end:016}.zpg");
+    let good = std::fs::read(dir.join(&live)).unwrap();
+    let pages = Trailer::decode(&good[good.len() - ZTRAILER..])
+        .unwrap()
+        .n_pages as usize;
+    let probe: Vec<Vec<u8>> = keys.iter().step_by(37).cloned().collect();
+    // Each case: a copy of the store, the window's state written into it,
+    // the open under `Always`, the reads, the counters, then a settle that
+    // leaves the store whole again.
+    struct Case {
+        name: &'static str,
+        make: Box<dyn Fn(&Path)>,
+        // (swept, attached, rejected_damage) at the open.
+        at_open: (u64, u64, u64),
+        // Files under `zpg-` left after the open, by name.
+        left: Vec<String>,
+    }
+    let tmp = format!("{live}.tmp");
+    let orphan = format!("zpg-{:08}-{end:016}.zpg", id + 1000);
+    let dead = "zpg-dead-00000007.zpg".to_string();
+    let stray_seg = seg.replacen(&format!("par-{id:08}"), &format!("par-{:08}", id + 1000), 1);
+    assert_ne!(stray_seg, seg);
+    let cases: Vec<Case> = vec![
+        Case {
+            name: "mid-build: a temp name and no final file",
+            make: Box::new({
+                let (live, tmp) = (live.clone(), tmp.clone());
+                move |d| {
+                    std::fs::rename(d.join(&live), d.join(&tmp)).unwrap();
+                }
+            }),
+            at_open: (1, 0, 0),
+            left: vec![],
+        },
+        Case {
+            name: "torn: the file cut short of a whole page",
+            make: Box::new({
+                let live = live.clone();
+                move |d| {
+                    let f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(d.join(&live))
+                        .unwrap();
+                    f.set_len((pages / 2 * ZPAGE + 100) as u64).unwrap();
+                }
+            }),
+            at_open: (0, 0, 1),
+            left: vec![live.clone()],
+        },
+        Case {
+            name: "torn: a zero trailer",
+            make: Box::new({
+                let live = live.clone();
+                move |d| {
+                    use std::os::unix::fs::FileExt;
+                    let f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(d.join(&live))
+                        .unwrap();
+                    let len = f.metadata().unwrap().len();
+                    f.write_all_at(&[0u8; ZTRAILER], len - ZTRAILER as u64)
+                        .unwrap();
+                }
+            }),
+            at_open: (0, 0, 1),
+            left: vec![live.clone()],
+        },
+        Case {
+            name: "torn: every page zero under a good trailer",
+            make: Box::new({
+                let live = live.clone();
+                move |d| {
+                    use std::os::unix::fs::FileExt;
+                    let f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(d.join(&live))
+                        .unwrap();
+                    f.write_all_at(&vec![0u8; pages * ZPAGE], 0).unwrap();
+                }
+            }),
+            at_open: (0, 0, 1),
+            left: vec![live.clone()],
+        },
+        Case {
+            name: "a finished build whose target was retired first",
+            make: Box::new({
+                let (live, orphan) = (live.clone(), orphan.clone());
+                move |d| {
+                    std::fs::copy(d.join(&live), d.join(&orphan)).unwrap();
+                }
+            }),
+            at_open: (1, 1, 0),
+            left: vec![live.clone()],
+        },
+        Case {
+            name: "a dead name queued, the crash before its unlink",
+            make: Box::new({
+                let (live, dead) = (live.clone(), dead.clone());
+                move |d| {
+                    std::fs::copy(d.join(&live), d.join(&dead)).unwrap();
+                }
+            }),
+            at_open: (1, 1, 0),
+            left: vec![live.clone()],
+        },
+        Case {
+            name: "a segment retired by a merge, the crash between the manifest and the unlink",
+            make: Box::new({
+                let (live, orphan, seg, stray_seg) =
+                    (live.clone(), orphan.clone(), seg.clone(), stray_seg.clone());
+                move |d| {
+                    std::fs::copy(d.join(&seg), d.join(&stray_seg)).unwrap();
+                    std::fs::copy(d.join(&live), d.join(&orphan)).unwrap();
+                }
+            }),
+            at_open: (1, 1, 0),
+            left: vec![live.clone()],
+        },
+    ];
+    for (i, case) in cases.iter().enumerate() {
+        let work = scratch(&format!("crash-{i}"));
+        copy_dir(&dir, &work);
+        (case.make)(&work);
+        let mut db = Db::open(&work, forced(|_| {})).unwrap();
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.swept, c.attached, c.rejected_damage),
+            case.at_open,
+            "{}: at the open: {c:?}",
+            case.name
+        );
+        assert_eq!(c.rejected_identity, 0, "{}: {c:?}", case.name);
+        let mut left: Vec<String> = sidecar_files(&work)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, case.left, "{}: what the open left", case.name);
+        assert!(
+            !work.join(&stray_seg).exists(),
+            "{}: an unnamed segment is swept",
+            case.name
+        );
+        // The reads are right whatever the open found, and served raw
+        // where it found nothing it could use.
+        check(&db, &model, &probe, case.name);
+        let c = db.zpage_counts();
+        if case.at_open.1 == 1 {
+            assert_eq!(c.rawserves + c.fallbacks, 0, "{}: {c:?}", case.name);
+            assert_eq!(c.reads, probe.len() as u64, "{}: {c:?}", case.name);
+        } else {
+            assert_eq!(c.rawserves, 2 * probe.len() as u64, "{}: {c:?}", case.name);
+            assert_eq!(c.reads + c.counts, 0, "{}: {c:?}", case.name);
+        }
+        // A settle leaves the store whole: one sidecar, under the live
+        // name, and nothing else of the form's in the directory.
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.sidecars, c.partitions, c.damaged),
+            (1, 1, 0),
+            "{}: after the settle: {c:?}",
+            case.name
+        );
+        let files: Vec<String> = sidecar_files(&work)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files, vec![live.clone()], "{}: after the settle", case.name);
+        let before = db.zpage_counts();
+        check(&db, &model, &probe, &format!("{}, settled", case.name));
+        let c = db.zpage_counts();
+        assert_eq!(
+            (
+                c.rawserves - before.rawserves,
+                c.fallbacks - before.fallbacks
+            ),
+            (0, 0),
+            "{}: served from the sidecar after the settle: {c:?}",
+            case.name
+        );
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&work);
+    }
+    // One torn page in the middle under a good trailer and good samples:
+    // attached, met at the page's first decode, and the settle rebuilds.
+    let work = scratch("crash-page");
+    copy_dir(&dir, &work);
+    let p = an_untouched_page(&work.join(&live), &[]);
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(work.join(&live))
+            .unwrap();
+        f.write_all_at(&[0u8; ZPAGE], (p * ZPAGE) as u64).unwrap();
+    }
+    let mut db = Db::open(&work, forced(|_| {})).unwrap();
+    let c = db.zpage_counts();
+    assert_eq!((c.attached, c.rejected_damage), (1, 0), "{c:?}");
+    let on_page = keys_in_page(&work.join(&live), p, &keys);
+    check(&db, &model, &on_page, "a zeroed page");
+    let c = db.zpage_counts();
+    assert_eq!((c.fallbacks, c.bad_pages, c.damaged), (1, 1, 1), "{c:?}");
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!((c.rebuilds, c.sidecars, c.damaged), (1, 1, 0), "{c:?}");
+    let before = db.zpage_counts();
+    check(&db, &model, &on_page, "rebuilt");
+    let c = db.zpage_counts();
+    assert_eq!(
+        c.fallbacks + c.rawserves,
+        before.fallbacks + before.rawserves,
+        "{c:?}"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&work);
     let _ = std::fs::remove_dir_all(&dir);
 }

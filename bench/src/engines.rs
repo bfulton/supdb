@@ -4767,6 +4767,9 @@ impl Engine for Supdb {
             ("zpage_build_stored", z.build_stored as f64),
             ("zpage_build_failed", z.build_failed as f64),
             ("zpage_build_orphaned", z.build_orphaned as f64),
+            ("zpage_build_retries", z.build_retries as f64),
+            ("zpage_rebuilds", z.rebuilds as f64),
+            ("zpage_declined_damage", z.declined_damage as f64),
             ("zpage_declined_small", z.declined_small as f64),
             ("zpage_declined_small_bytes", z.declined_small_bytes as f64),
             (

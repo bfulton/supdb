@@ -26,6 +26,14 @@ is free.
 | the crash windows (5.7) | the sweep covers the temp name, the unnamed segment's sidecar and the orphan; the attach refuses a torn file | every row of the table built on disk and opened (piece 5) |
 | `a_zpages_life` in `tests/leak.rs` | none | piece 9 |
 
+## Where it stands
+
+Pieces 1, 2, 3 and 5 are in (`tests/zpages.rs`: the damaged sidecar
+retired and rebuilt three times then declined, the retired mapping kept
+by a pinned handle and freed at its release, the failed build retried
+after its backoff, and the crash windows of 5.7 built on disk and
+opened); 4 is written and compiling; 6 to 9 are next.
+
 ## The pieces
 
 1. **The cell retires through the epoch.** `ZCell::take` swaps the

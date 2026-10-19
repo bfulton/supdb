@@ -22,10 +22,13 @@
 //!
 //! # What the cell promises
 //!
-//! A sidecar is installed once and never replaced or cleared before its
-//! segment is dropped, so a reader holding the segment holds the sidecar.
-//! A cell that could be cleared or replaced would have to free the sidecar it
-//! held through the epoch, and `ZCell::get` would change with it.
+//! A sidecar is installed into an empty cell and taken out of it only by
+//! the writer's settle, when a page of it has failed a check and the
+//! partition's is to be built again: what `take` removes is retired under
+//! a fresh epoch and freed past every reader pinned at or before it, as a
+//! replaced state is, so a reader that loaded the pointer inside an
+//! operation keeps it for that operation. A cell with nothing in it is
+//! freed with its segment.
 
 use super::zpages::{
     bind32, check_entry, check_group, decode_group, fill_group, group_seek, page_view, parse_page,
@@ -649,9 +652,11 @@ fn same_segment(
     Ok(())
 }
 
-/// The cell a segment keeps its sidecar in: a pointer set once from null and
-/// freed with the segment, read by an acquire load. Not a `OnceLock`, whose
-/// initialiser takes a lock a reader could wait on.
+/// The cell a segment keeps its sidecar in: a pointer set from null by
+/// `install`, read by an acquire load, cleared by `take` -- whose caller
+/// retires what it took through the epoch, as a replaced state is -- and
+/// freed with the segment if it still holds anything. Not a `OnceLock`,
+/// whose initialiser takes a lock a reader could wait on.
 pub(super) struct ZCell {
     p: AtomicPtr<ZSide>,
 }
@@ -663,15 +668,24 @@ impl ZCell {
         }
     }
 
-    /// The sidecar, if one is installed. Valid as long as the cell is
-    /// borrowed: it is installed once and never cleared or replaced while
-    /// the segment stands.
+    /// The sidecar, if one is installed. Valid for the operation that
+    /// reads it, which pins an epoch: a sidecar `take` removed is retired
+    /// under a later epoch and freed only past every pin at or before it,
+    /// so a reader that loaded the pointer keeps it until it leaves.
     #[inline]
     pub(super) fn get(&self) -> Option<&ZSide> {
         let p = self.p.load(Ordering::Acquire);
-        // SAFETY: set from `Box::into_raw` by `install` and freed only by
-        // `Drop`, which needs `&mut self`; nothing clears or replaces it.
+        // SAFETY: set from `Box::into_raw` by `install`; cleared only by
+        // `take`, whose caller frees it past every pinned reader, and by
+        // `Drop`, which needs `&mut self`.
         unsafe { p.as_ref() }
+    }
+
+    /// The sidecar taken out of the cell, or null: the caller owns the
+    /// pointer and retires it through the epoch (`RetiredZ`), since a
+    /// reader pinned before the take may still be walking it.
+    pub(super) fn take(&self) -> *mut ZSide {
+        self.p.swap(std::ptr::null_mut(), Ordering::AcqRel)
     }
 
     /// `z` installed if the cell is empty; whether it was.
@@ -721,6 +735,13 @@ pub(super) struct ZEvents {
     /// merge outran.
     pub build_failed: AtomicU64,
     pub build_orphaned: AtomicU64,
+    /// Failed builds tried again after their backoff; sidecars taken out
+    /// of service by a page that failed a check, retired and built again;
+    /// partitions declined for the life of their segment after the third
+    /// such rebuild.
+    pub build_retries: AtomicU64,
+    pub rebuilds: AtomicU64,
+    pub declined_damage: AtomicU64,
     /// Partitions declined, by reason, and the record bytes of the ones
     /// declined for their size.
     pub declined_small: AtomicU64,
@@ -825,8 +846,28 @@ impl Decline {
 pub(super) const DECLINED_SMALL: u8 = 1;
 
 /// The code `Seg::z_declined` keeps for a build that failed: not declined
-/// for what the partition holds, but not tried again by this segment.
+/// for what the partition holds, and tried again once the segment's
+/// backoff has passed (`Seg::z_retry_due`).
 pub(super) const DECLINED_FAILED: u8 = 6;
+
+/// The code `Seg::z_declined` keeps for a partition whose sidecar failed a
+/// check after `ZREBUILDS` rebuilds: left raw for the segment's life, so a
+/// defect the build cannot see or a medium that keeps failing is a counted
+/// decline and not a build a cycle.
+pub(super) const DECLINED_DAMAGE: u8 = 8;
+
+/// How many times a segment's sidecar is built again after a page of it
+/// failed a check.
+pub(super) const ZREBUILDS: u8 = 3;
+
+/// The name a retired sidecar is renamed to: a rename frees no inode, where
+/// an unlink is a device round trip here, so the landing that retires a
+/// segment renames and the idle tick unlinks; a dead name no live segment
+/// claims, so a sweep at open or at the end of a settle removes what a
+/// crash left.
+pub(super) fn zpg_dead_name(n: u64) -> String {
+    format!("zpg-dead-{n:08}.zpg")
+}
 
 /// The code `Seg::z_declined` keeps for a partition whose sidecar file an
 /// attach refused, which was counted when it was: a build replaces the file
