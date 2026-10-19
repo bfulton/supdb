@@ -738,6 +738,14 @@ pub struct Supdb {
     /// `supdb-nocachezpagesnodrop` against `supdb-nocachezpages` prices the
     /// drop, which is a share of the build's elapsed time.
     zpages_nodrop: bool,
+    /// The warm of a sidecar's file after its attach off
+    /// (`Options::zpages_warm` off): the pair `supdb-nocachezpagesnowarm`
+    /// against `supdb-nocachezpages` prices the warm, which a restart with
+    /// cold sidecars pays before its first read.
+    zpages_nowarm: bool,
+    /// The builds started as partitions land rather than at the settle
+    /// (`Options::zpages_eager`): `supdb-nocachezpageseager`.
+    zpages_eager: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -1126,6 +1134,12 @@ struct Policy {
     /// Its build keeps the raw records in the page cache
     /// (`Options::zpages_drop_behind` off): `supdb-nocachezpagesnodrop`.
     zpages_nodrop: bool,
+    /// Its warm after the attach off (`Options::zpages_warm` off):
+    /// `supdb-nocachezpagesnowarm`.
+    zpages_nowarm: bool,
+    /// Its builds at the landing (`Options::zpages_eager`):
+    /// `supdb-nocachezpageseager`.
+    zpages_eager: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -1221,6 +1235,8 @@ impl Default for Policy {
             ordread: false,
             zpages: false,
             zpages_nodrop: false,
+            zpages_nowarm: false,
+            zpages_eager: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -3486,6 +3502,46 @@ impl Supdb {
         )
     }
 
+    /// `supdb-nocachezpages` with the warm of a sidecar's file after its
+    /// attach off (`Options::zpages_warm` off): the pair against
+    /// `supdb-nocachezpages` differs by that one option and prices the
+    /// warm, a read of each sidecar's file once per process that a store
+    /// opened on cold sidecars pays at its settle. Chosen by hand, as
+    /// `ab --arms supdb-nocachezpages,supdb-nocachezpagesnowarm`, with a
+    /// read pass after the load and the bound set, where the warm is what
+    /// stands between the first reads and a cold file.
+    pub fn create_nocache_zpages_nowarm(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                block_cache: false,
+                zpages: true,
+                zpages_nowarm: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-nocachezpages` with each build started as its partition
+    /// lands, on the builder's thread, rather than at the settle
+    /// (`Options::zpages_eager`): the pair against `supdb-nocachezpages`
+    /// differs by that one option and prices the design's start-at-landing
+    /// against the settle the rows were taken with, where the builds are
+    /// the load's closing sync. Chosen by hand, as
+    /// `ab --arms supdb-nocachezpages,supdb-nocachezpageseager`, read by
+    /// the load's phases.
+    pub fn create_nocache_zpages_eager(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                block_cache: false,
+                zpages: true,
+                zpages_eager: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with the block cache bounded at 256 MB, the budget
     /// `rocksdb-tuned` runs its block cache on, so that comparison is on
     /// the same memory. Below the bound the two arms are one.
@@ -3601,6 +3657,8 @@ impl Supdb {
             ordread,
             zpages,
             zpages_nodrop,
+            zpages_nowarm,
+            zpages_eager,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -3819,6 +3877,12 @@ impl Supdb {
             } else {
                 supdb::Options::default().zpages_drop_behind
             },
+            zpages_warm: if zpages_nowarm {
+                false
+            } else {
+                supdb::Options::default().zpages_warm
+            },
+            zpages_eager: zpages_eager || supdb::Options::default().zpages_eager,
             forms_pieces_only: piecesonly,
             // Unpinned, the writer must be the one publisher, as it was
             // when the pins were priced: the store refuses the pair.
@@ -3962,6 +4026,8 @@ impl Supdb {
             ordread,
             zpages,
             zpages_nodrop,
+            zpages_nowarm,
+            zpages_eager,
             ord_threads: Default::default(),
         })
     }
@@ -4562,6 +4628,10 @@ impl Engine for Supdb {
         if self.zpages {
             return if self.zpages_nodrop {
                 "supdb-nocachezpagesnodrop"
+            } else if self.zpages_nowarm {
+                "supdb-nocachezpagesnowarm"
+            } else if self.zpages_eager {
+                "supdb-nocachezpageseager"
             } else {
                 "supdb-nocachezpages"
             };
@@ -4774,6 +4844,10 @@ impl Engine for Supdb {
             ("zpage_build_starts", z.build_starts as f64),
             ("zpage_build_cancelled", z.build_cancelled as f64),
             ("zpage_build_nopage", z.build_nopage as f64),
+            ("zpage_warms", z.warms as f64),
+            ("zpage_warm_bytes", z.warm_bytes as f64),
+            ("zpage_warm_skipped", z.warm_skipped as f64),
+            ("zpage_warm_us", z.warm_us as f64),
             ("zpage_declined_small", z.declined_small as f64),
             ("zpage_declined_small_bytes", z.declined_small_bytes as f64),
             (
@@ -5382,6 +5456,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocacheordread"
         | "supdb-nocachezpages"
         | "supdb-nocachezpagesnodrop"
+        | "supdb-nocachezpagesnowarm"
+        | "supdb-nocachezpageseager"
         | "supdb-cache256"
         | "supdb-l0"
         | "supdb-nopin"
@@ -5561,6 +5637,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nocacheordread" => Box::new(Supdb::create_nocache_ordread(dir)?),
         "supdb-nocachezpages" => Box::new(Supdb::create_nocache_zpages(dir)?),
         "supdb-nocachezpagesnodrop" => Box::new(Supdb::create_nocache_zpages_nodrop(dir)?),
+        "supdb-nocachezpagesnowarm" => Box::new(Supdb::create_nocache_zpages_nowarm(dir)?),
+        "supdb-nocachezpageseager" => Box::new(Supdb::create_nocache_zpages_eager(dir)?),
         "supdb-cache256" => Box::new(Supdb::create_cache256(dir)?),
         "supdb-ingest" => Box::new(Supdb::create_ingest(dir)?),
         "supdb-ingestleave" => Box::new(Supdb::create_ingest_leave(dir)?),
@@ -6287,6 +6365,88 @@ mod tests {
         let after = arm.zpages_state().unwrap();
         assert_eq!((after.damaged, after.raw), (1, 2), "{after:?}");
         drop(arm);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `supdb-nocachezpagesnowarm` and `supdb-nocachezpageseager` are each
+    /// `supdb-nocachezpages` with one option moved -- the warm of a
+    /// sidecar's file after its attach off, the builds started as their
+    /// partitions land -- and nothing else: named, durable like it, opened
+    /// under their names by the dispatch, on options that differ from the
+    /// arm's in that option alone, and forced like it.
+    #[test]
+    fn the_nowarm_and_eager_arms_differ_from_the_zpages_arm_in_one_option_each() {
+        let root =
+            std::env::temp_dir().join(format!("supdb-bench-zpagesarms-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let new = |name: &str, make: fn(&Path) -> Res<Supdb>| {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            make(&d).unwrap()
+        };
+        let base = new("base", Supdb::create_nocache_zpages);
+        assert_eq!(base.name(), "supdb-nocachezpages");
+        let b = base.db.as_ref().unwrap().options();
+        // The engine's own defaults: the warm on, the eager build off, so an
+        // arm that pins neither has both as the engine ships them.
+        assert!(supdb::Options::default().zpages_warm);
+        assert!(!supdb::Options::default().zpages_eager);
+        assert!(b.zpages_warm && !b.zpages_eager);
+        for (name, make, arm_dir) in [
+            (
+                "supdb-nocachezpagesnowarm",
+                Supdb::create_nocache_zpages_nowarm as fn(&Path) -> Res<Supdb>,
+                "nowarm",
+            ),
+            (
+                "supdb-nocachezpageseager",
+                Supdb::create_nocache_zpages_eager,
+                "eager",
+            ),
+        ] {
+            let arm = new(arm_dir, make);
+            assert_eq!(arm.name(), name);
+            assert_eq!(guarantee(name), Some(Guarantee::Durable));
+            assert_eq!(guarantee(name), guarantee("supdb-nocachezpages"));
+            assert!(arm.zpages && base.zpages, "both force the form");
+            assert!(!arm.zpages_nodrop);
+            assert_eq!(arm.zpages_nowarm, arm_dir == "nowarm");
+            assert_eq!(arm.zpages_eager, arm_dir == "eager");
+            assert_eq!(arm.partition, base.partition, "the row's shape");
+            assert_eq!(arm.drain, base.drain);
+            assert_eq!(arm.durable, base.durable);
+            assert_eq!(arm.block_cache, base.block_cache);
+            assert_eq!(arm.budget, base.budget);
+            assert_eq!(arm.advice, base.advice);
+            assert_eq!(arm.features(), base.features());
+            let a = arm.db.as_ref().unwrap().options();
+            assert_eq!(a.zpages_warm, arm_dir != "nowarm", "{name}: the one option");
+            assert_eq!(a.zpages_eager, arm_dir == "eager", "{name}: the one option");
+            assert!(a.zpages == supdb::ZPages::Always && b.zpages == supdb::ZPages::Always);
+            assert_eq!(a.zpages_drop_behind, b.zpages_drop_behind);
+            assert_eq!(a.zpages_min_bytes, b.zpages_min_bytes);
+            assert_eq!(a.zpages_retry_ms, b.zpages_retry_ms);
+            assert_eq!(a.point_via_ord, b.point_via_ord);
+            assert_eq!(a.scan_block_cache, b.scan_block_cache);
+            assert_eq!(a.scan_cache_bytes, b.scan_cache_bytes);
+            assert_eq!(a.read_advice, b.read_advice);
+            assert_eq!(a.inline_bytes, b.inline_bytes);
+            assert_eq!(a.partition_bytes, b.partition_bytes);
+            assert_eq!(a.seal_bytes, b.seal_bytes);
+            assert_eq!(a.compact, b.compact);
+            assert_eq!(a.promote, b.promote);
+            assert_eq!(a.sync, b.sync);
+            assert_eq!(a.upkeep, b.upkeep);
+            assert_eq!(a.writer_pins, b.writer_pins);
+            assert_eq!(a.publish_in_background, b.publish_in_background);
+            drop(arm);
+            let opened = root.join(format!("open-{arm_dir}"));
+            std::fs::create_dir_all(&opened).unwrap();
+            let e = open(name, &opened, 1).unwrap();
+            assert_eq!(e.name(), name, "the dispatch");
+            assert_eq!(e.zpages_state().map(|z| z.forced), Some(true));
+        }
+        drop(base);
         let _ = std::fs::remove_dir_all(&root);
     }
 

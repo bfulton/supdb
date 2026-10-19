@@ -3726,3 +3726,123 @@ fn a_filter_of_another_layout_cannot_attach_and_never_answers_absent() {
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- the warm ---------------------------------------------------------------------------
+
+/// A sidecar on disk at a restart is cold, and a divided read pass over a
+/// cold file faults as the raw form does: the settle warms each attached
+/// sidecar's file once per process (`Options::zpages_warm`), reading every
+/// page the attach's own reads left cold and no other, the one just built
+/// skipped as resident, and a store opened with the warm off leaves the
+/// file as the attach left it. Residency is read from the kernel, not from
+/// the store's record of what it asked. The partition is made large
+/// because the attach's sampled pages, read before the mapping is advised
+/// random, pull a readahead window in around each, which is most of a
+/// small file.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_attached_sidecar_is_warmed_once_per_process_unless_the_warm_is_off() {
+    use std::os::unix::io::AsRawFd;
+    let evict = |p: &Path| {
+        let f = std::fs::File::open(p).unwrap();
+        f.sync_all().unwrap();
+        // SAFETY: a hint on an open descriptor.
+        let rc = unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        assert_eq!(rc, 0, "fadvise");
+    };
+    let page = supdb::bytes::os_page_size();
+    let resident = |p: &Path| -> (usize, usize) {
+        let m = MmapBytes::open(p).unwrap();
+        let len = m.len() as usize;
+        (m.resident_pages(0, len), len.div_ceil(page))
+    };
+    let wide = |o: &mut Options| o.partition_bytes = Some(64 << 20);
+    let dir = scratch("warm-src");
+    let mut db = Db::create(&dir, forced(wide)).unwrap();
+    let model = ordered_load(&mut db, 60_000, 0x3A4D);
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.partitions, c.sidecars, c.builds, c.warms),
+        (1, 1, 1, 1),
+        "{c:?}"
+    );
+    // Just built: resident, and the warm after its attach skipped it.
+    assert!(
+        c.warm_skipped >= c.file_bytes * 3 / 4,
+        "found resident: {c:?}"
+    );
+    db.close().unwrap();
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let file = sidecar_files(&dir).remove(0);
+    // Cold at the open: what the attach left cold, the settle reads, every
+    // page of it and no other, and the reads after find it resident. With
+    // the segment work on a thread of its own, the warm is a job of the
+    // builder's thread; inline, the settle warms on the calling thread.
+    for background in [true, false] {
+        evict(&file);
+        let (res, all) = resident(&file);
+        assert!(res < all / 4, "{res} of {all} resident after the eviction");
+        let mut db = Db::open(
+            &dir,
+            forced(|o| {
+                wide(o);
+                o.publish_in_background = background;
+            }),
+        )
+        .unwrap();
+        assert_eq!(db.zpage_counts().attached, 1);
+        let (res, all) = resident(&file);
+        assert!(
+            res < all,
+            "the attach left {} of {all} pages cold",
+            all - res
+        );
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.warms, c.builds),
+            (1, 0),
+            "background {background}: {c:?}"
+        );
+        assert_eq!(
+            c.warm_bytes,
+            ((all - res) * page) as u64,
+            "every page the attach left cold, and no other: {c:?}"
+        );
+        let (res, all) = resident(&file);
+        assert_eq!(res, all, "resident after the warm");
+        check(&db, &model, &keys[..300], "after the warm");
+        assert_eq!(db.zpage_counts().reads, 300);
+        db.zpages_settle().unwrap();
+        assert_eq!(db.zpage_counts().warms, 1, "once per process");
+        db.close().unwrap();
+    }
+    evict(&file);
+    // The warm off: the settle reads nothing ahead, and the file stays as
+    // the attach left it.
+    {
+        let mut db = Db::open(
+            &dir,
+            forced(|o| {
+                wide(o);
+                o.zpages_warm = false;
+            }),
+        )
+        .unwrap();
+        let before = resident(&file);
+        assert!(before.0 < before.1, "the attach left pages cold");
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert_eq!((c.sidecars, c.warms, c.warm_bytes), (1, 0, 0), "{c:?}");
+        assert_eq!(
+            resident(&file),
+            before,
+            "nothing read ahead with the warm off"
+        );
+        check(&db, &model, &keys[..300], "cold");
+        assert_eq!(db.zpage_counts().reads, 300);
+        db.close().unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

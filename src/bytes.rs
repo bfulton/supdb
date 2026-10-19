@@ -193,6 +193,41 @@ impl MmapBytes {
         // sees it.
         Ok(MmapBytes(unsafe { memmap2::Mmap::map(&file)? }))
     }
+
+    /// How many of the system pages under `len` bytes at `off` the kernel
+    /// holds in memory now, by `mincore`: what a warm of the file can skip.
+    /// `off` is rounded down to a page and the range clamped to the
+    /// mapping; zero where the kernel will not say.
+    pub fn resident_pages(&self, off: usize, len: usize) -> usize {
+        let page = os_page_size();
+        let start = off.min(self.0.len()) / page * page;
+        let span = len.min(self.0.len() - start);
+        if span == 0 {
+            return 0;
+        }
+        let mut vec = vec![0u8; span.div_ceil(page)];
+        // SAFETY: the range lies inside this mapping, which lives for the
+        // call, and `vec` has a byte for every page of it.
+        let rc = unsafe {
+            libc::mincore(
+                self.0.as_ptr().add(start).cast_mut().cast(),
+                span,
+                vec.as_mut_ptr().cast(),
+            )
+        };
+        if rc != 0 {
+            return 0;
+        }
+        vec.iter().filter(|&&b| b & 1 != 0).count()
+    }
+}
+
+/// The system's page size.
+#[cfg(not(target_family = "wasm"))]
+pub fn os_page_size() -> usize {
+    // SAFETY: a query with no side effect.
+    let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    usize::try_from(n).unwrap_or(4096).max(1)
 }
 
 #[cfg(not(target_family = "wasm"))]

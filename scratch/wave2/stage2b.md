@@ -52,7 +52,22 @@ and by every fence key testing present, and the locate asks the filter
 before the fence. The words have one encoding (`BlockedBloom::words`,
 `from_words`), which the layout's pin test hashes. The reversed-filter
 test fails the attach on a fence key; the absent-key decode counts fall
-to the filter's false positives. 8 and 9 are next.
+to the filter's false positives. Piece 8 is in: a warm is a job of the
+builder's thread (`ZJob::Warm` beside `ZJob::Build`, one at a time),
+scheduled by `z_next` for an attached, undamaged sidecar the process has
+not warmed, marked before the thread starts; inline, the settle warms on
+its own thread. `warm_file` reads the file in 8 MiB chunks, skipping a
+chunk `mincore` reports wholly resident, `MADV_WILLNEED` then a touch of
+each page, so the job's time is the read's and the pages are there when
+it returns; the headroom check waits for the bound (stage 3), so the
+file is read whole. The test holds the exact identity the mechanism
+gives: the warm reads every page the attach's own reads left cold and
+no other, on a partition large enough that the attach's sampled pages,
+read before the mapping is advised random, do not pull the whole file
+in by readahead (a 280 KB sidecar came in 67 pages of 69 that way). The
+arms `supdb-nocachezpagesnowarm` and `supdb-nocachezpageseager` are in
+the suite, unpriced; the pairing for a free machine is the one written
+above. 9 is next.
 
 ## The pieces
 

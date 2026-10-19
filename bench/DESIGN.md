@@ -248,14 +248,17 @@ off (`lmdb-nordahead`), the LMDB a user configures for the regime. The
 scan floor's file is written and synced outside the group and dropped
 from the cache; the floors and every pass run inside it.
 
-Three more arms exist for a bounded pairing and are in no roster, because
-each prices one engine option against `supdb-nocache` in one process
-(`bench ab --arms supdb-nocache,<arm>`) and is chosen by hand:
+Five more arms exist for a bounded pairing and are in no roster, because
+each prices one engine option against the arm it differs from in one
+process (`bench ab --arms <base>,<arm>`) and is chosen by hand:
 `supdb-nocacheordread` reads a point through the ordered index,
 `supdb-nocachezpages` forces the compact second form for point reads and
 counts (a pass refuses it unless every partition has its sidecar and the
-reads went through the sidecars), and `supdb-nocachezpagesnodrop` is that
-arm with the build's release of the raw records off. The forced arm's
+reads went through the sidecars), and `supdb-nocachezpagesnodrop`,
+`supdb-nocachezpagesnowarm` and `supdb-nocachezpageseager` are that arm
+with one of its builds' options moved: the build's release of the raw
+records off, the warm of a sidecar's file after its attach off, and the
+builds started as their partitions land. The forced arm's
 `sync` builds the sidecars, so its load carries the build, and in memory
 it reads slower than the raw form: it is an arm for the bound, not a
 default.
