@@ -248,6 +248,64 @@ limit counts until the merge drops its tombstone with nothing older to
 mask, so a model that keeps deleted keys as empty entries reads one key
 further than the store after a merge, and drops them there.
 
+Piece 4 is in: the memo of decoded groups (`zside::Memo` behind
+`ZMemo`), a thousand and twenty-four slots direct-mapped by the page plus
+a multiple of the sidecar's attach identity, capped at eight megabytes
+of decoded bytes, an `Arc` to each group; `open_group` consults it for a
+compressed page the process has verified and puts a first decode's
+group in as it passes, the found record is a position in the opened
+group (`Locate::Found { opened, off, page }`) parsed by the read that
+asked, and the cursor holds its group through the `Arc`.
+`Options::zpages_memo` (on), `supdb-nocachezpagesnomemo` the arm,
+`memo_hits` and `memo_misses` on the handle's line (a miss is a put: every
+decode with the memo on, a lookup before it or not). The first version
+was the thread's, as 3.7 said, with `Rc` groups; the gate's leak test
+read ninety kilobytes a closed store, the groups of every store the
+thread had closed, and it is the reader handle's now, dropped with it
+and `Send` through `Arc`, which is also where the census will count it
+(not yet: `Reader::memory_census` does not sum it). The same gate's
+stress read one run in twelve with a build's temp name outliving its
+segment: the build's start was counted after the spawn, and a wait for
+every started build to be collected read the sum between the thread's
+first write and the count; the count comes before the spawn now. Tests:
+the memo's cap, displacement and counts with the slot collision between
+two sidecars' same page built (the side compare is reached only through
+one, and the mutant without it survived the test that named "another
+sidecar's page" until the collision was built); the second read of every
+page a hit, a new attach a miss a page, the memo off a decode a read; the
+re-entrant read with a memo one slot wide; a Zipfian read set over one
+partition on the writer and a handle. The tests of the decode path under
+a page changed in place, a page a buffer cannot lend and a stored page
+beside a compressed one attach with the memo off, since with it on the
+group is served as it was decoded while the memo holds it. Four mutants
+held to firing; the fuzz with the form forced, a hundred and twenty seeds
+each way, clean, twice.
+
+The pairing (`memo-pairing.sh`; `memo-ab-1.out`, `memo-ab-2.out`; two
+sittings with the arms swapped, in core at three million keys with the
+operations divided by ten -- three million and not three hundred
+thousand because the forced arm keeps the engine's floor, the load's tail
+partition at three hundred thousand is under it and holds three percent
+of the keys, and `ab` refuses a forced sitting with over a percent of its
+reads raw): the C mix reads 1.55x and 1.50x with the memo, six pairs of
+six both times; the E mix 3.0x and 3.1x, six of six; B 1.6x and 1.5x
+with the reps split; the uniform point reads level by the mean (1.03x
+and 0.97x, within the coin) and their p99 a fifth higher in both
+sittings (9.2 against 7.6 microseconds, 10.4 against 8.2); A, D, F and
+the two loads within the coin, D three to five percent against the memo
+in both and significant in neither. The counts say why: over the read
+pass and the mixes the memo answered 1.63 million opens of a compressed
+page and decoded 444 thousand, where the arm without it decoded a page
+for every one of its 464 thousand point reads and at every open a scan
+makes, three a step. The first version (`memo-ab-v1-1.out`,
+`memo-ab-v1-2.out`) read the uniform point reads at 0.87x and 0.90x, a
+tenth lost to a buffer allocated for every decode the memo took; the
+displaced entries' buffers are kept for the next decodes now
+(`ZMEMO_FREE`), and the loss went with them. What the memo costs the
+uniform regime is its tail, a thousand buffers hot where there was one,
+which the p99 reads and the mean does not; the out-of-core pairing of
+piece 8 prices it against the faults it saves.
+
 ## What 2b's sittings leave open, read before 3's
 
 - The eager build's pairing (`eager-pairing.sh`, `eager-ab-1.out` and

@@ -1,0 +1,8 @@
+bench ab: supdb-nocachezpages against supdb-nocachezpagesnomemo at 3000000 keys, scans of 100, 6 pairs after a warmup, passes load,read,mixes, ops divided by 10
+    33s  rep 0/6 (warmup)
+    64s  rep 1/6
+    96s  rep 2/6
+   128s  rep 3/6
+   161s  rep 4/6
+   194s  rep 5/6
+   227s  rep 6/6

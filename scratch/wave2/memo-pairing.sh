@@ -1,12 +1,18 @@
 #!/bin/sh
 # The pairing that prices `Options::zpages_memo`: the forced arm with the
 # memo of decoded groups (`supdb-nocachezpages`) against the arm without it
-# (`supdb-nocachezpagesnomemo`), in one process, in core at three hundred
-# thousand keys over the load, the point-read pass and the mixes, two
-# sittings with the arms swapped. The memo saves a decode on every read of
-# a page the thread decoded before, so the point reads and the C mix are
-# the cells it is read on, with `zpage_memo_hits` and `zpage_decodes` beside
-# them to say how often it answered. Needs a free machine (bench/CLAUDE.md).
+# (`supdb-nocachezpagesnomemo`), in one process, in core at three million
+# keys over the load, the point-read pass and the mixes with the operations
+# divided by ten, two sittings with the arms swapped. The memo saves a
+# decode on every read of a page the handle decoded before, so the point
+# reads and the C mix are the cells it is read on, with `zpage_memo_hits`
+# and `zpage_decodes` beside them to say how often it answered. Three
+# million keys and not three hundred thousand: the forced arm keeps the
+# engine's floor under which a partition is declined (`ZMIN_RECS`, two
+# megabytes of records), the load's tail partition at three hundred
+# thousand keys is under it and holds three percent of the keys, and `ab`
+# refuses a forced sitting in which over one percent of the reads went to
+# the raw form. Needs a free machine (bench/CLAUDE.md).
 Z=/home/user/supdb/scratch/wave2
 BIN=/home/user/supdb/bench/target/release/bench
 T=/tmp/claude-0/-home-user-supdb/7a8bc057-f313-5ed1-917a-533bb60079da/scratchpad/tmp-memo
@@ -21,7 +27,7 @@ UNSET="-u SUPDB_LAG_COUNTERS -u SUPDB_LAG_MARK -u SUPDB_MIX_COUNTERS -u SUPDB_MI
 for sitting in 1 2; do
   if [ "$sitting" = 1 ]; then arms=supdb-nocachezpages,supdb-nocachezpagesnomemo; else arms=supdb-nocachezpagesnomemo,supdb-nocachezpages; fi
   echo "##### sitting $sitting: $arms, start $(date -u +%T)"
-  env $UNSET "$BIN" ab --arms "$arms" --size 300000 --reps 6 --passes load,read,mixes --pairs 'ycsb-C' \
+  env $UNSET "$BIN" ab --arms "$arms" --size 3000000 --ops-div 10 --reps 6 --passes load,read,mixes --pairs 'ycsb-C' \
     > "$Z/memo-ab-$sitting.out" 2> "$Z/memo-ab-$sitting.err"
   rc=$?
   if [ $rc -eq 0 ] && grep -q ' quantities: ' "$Z/memo-ab-$sitting.out"; then
