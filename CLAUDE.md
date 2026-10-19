@@ -2176,7 +2176,18 @@ read a sidecar, and they are random in every phase, so it is advised random
 once, at attach. The rule: the advice for a mapping one access pattern reads
 is decided by that pattern and not by the phase the store happens to be in,
 and the kernel's answer (the `rr` flag in `smaps`) is read, not the store's
-record of what it asked.
+record of what it asked. The advice went on after the attach's own sampled
+reads for a while, and under the default advice each of the attach's own
+reads -- the trailer, the resident part, the sampled pages -- pulls a
+readahead window in around it: a 280 KB sidecar came in 67 pages of 69 at
+its attach, a 4 MB one 522 pages of 1,004, two megabytes of a large one
+that the reads may never want, and the warm's test read 8 KB where it was
+written to read the file. The advice goes on as the mapping opens now, 42
+pages of the 1,004 (the sixteen sampled, the resident part and the
+trailer), and the test holds the attach to a quarter of the file. The rule
+again: the advice is set before the first read it is for, and what a step
+leaves resident is read from the kernel between the steps, never taken
+from the file's size.
 
 **A second mechanism that masks the first in a test.** Once the settle swept
 the directory, the test that a merge takes the sidecar of the segment it
@@ -2184,7 +2195,17 @@ retires passed with `retire_seg`'s unlink deleted, because the sweep cleaned
 up before the assertion; two mutants survived. The test asks the directory
 after the merges land and before any settle. The rule: when two mechanisms
 can reach one end state, the test asserts at the moment only the first has
-run.
+run. It came back in the leak test as the other case: a retired sidecar is
+freed by the segment's own drop when its segment retires with it, and by
+the retire list's wrapper (`RetiredZ`) when it was taken out of a live
+segment after a page failed a check, and the test written for the second
+retired only through merges, which never reach the list; a wrapper whose
+drop freed nothing passed it. The test flips a page in place under the
+mapping now, so the settle takes the sidecar out of its cell into the
+list under the pin, and the handle's drop with no sweep after is what
+frees it. The corollary: a test of one of two mechanisms that free the
+same thing is held to a mutant of that mechanism, since the other frees
+it just as well.
 
 **A process-wide side effect and a test that counts it.**
 `release_freed_memory` is `malloc_trim` of every arena, and the first library

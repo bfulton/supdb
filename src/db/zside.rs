@@ -371,7 +371,7 @@ impl ZSide {
     /// whose layout the engine no longer computes would answer present keys
     /// absent with nothing raised, so each is an identity refusal.
     ///
-    /// `advise` maps the file `MADV_RANDOM`, once checked.
+    /// `advise` maps the file `MADV_RANDOM`, before its own sampled reads.
     pub(super) fn attach(
         path: &Path,
         blob: &Blob<MmapBytes>,
@@ -385,6 +385,15 @@ impl ZSide {
             Err(e) if e.kind() == ErrorKind::NotFound => return Err(Reject::Missing),
             Err(e) => return Err(Reject::Damage(format!("the file does not open: {e}"))),
         };
+        // The advice before the attach's own reads -- the trailer, the
+        // resident part, the sampled pages: under the kernel's default each
+        // would pull a readahead window in around it, most of a small
+        // sidecar and megabytes of a large one that the reads may never
+        // want. Half of a four-megabyte file, measured, with the advice
+        // after the sample; a twentieth with it here.
+        if advise {
+            map.advise_random();
+        }
         let len = map.len();
         if len < ZTRAILER as u64 || !len.is_multiple_of(ZPAGE as u64) {
             return Err(damage(ZError::Length));
@@ -443,9 +452,6 @@ impl ZSide {
             skewed: None,
         };
         side.check_sample().map_err(damage)?;
-        if advise {
-            side.map.advise_random();
-        }
         Ok(side)
     }
 
