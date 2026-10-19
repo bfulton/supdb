@@ -91,9 +91,21 @@ probes under `hunt2/probes/` and fixed, each with a test in
 | the tiling assertion | a merge wrote no piece for a fence no input key lay in (an emptied partition a wide piece pulled in), and the partition was an input | an empty partition is written for such a fence | `d370547` |
 
 After the fixes, seeds 0 to 400 with the cache off: 400 pass, no hang.
-The brief's remaining classes are the cache-on ones (`ZFUZZ_CACHE=all`):
-a `copy from the form disagrees with the build from the sources` panic,
-and hunt I's two; see the sweep below.
+
+With the block cache on for every seed (`ZFUZZ_CACHE=all`, the engine's
+default configuration), the same engine reads, over seeds 0 to 120:
+
+| shape | seeds |
+|---|---|
+| pass | 95 |
+| a scan through the block cache answers short of the model: a present key missing, or a key's values short by one or more, while the point reads beside it pass | 20 |
+| a scan emits a key out of order | 1 (seed 28) |
+| panic, `a copy from the form disagrees with the build from the sources` (the upkeep's check of a copied form against a build from the sources) | 2 (seeds 25, 36) |
+| panic, `a sparse form's entry by cut disagrees with its search by key` | 1 (seed 67) |
+| panic, `an overlay key's cut is behind the walk` (hunt I's second defect) | 1 (seed 115) |
+
+These are the block-cache scan path's, the family hunt I was opened on,
+and none of the three fixes above touches that path; a control of the same seeds on the engine before the fixes follows in the next commit.
 
 ## The gate on this branch
 
@@ -175,14 +187,15 @@ branch is the owner's call.
 
 ## Where to start
 
-1. Hunt II, what is left: the cache-on draw. `ZFUZZ_CACHE=all` over a
-   range of seeds, one process a seed under a timeout, and the brief's
-   `copy from the form disagrees with the build from the sources` panic
-   if it shows; a failing seed keeps its stores in `TMPDIR`, and
-   `hunt2/probes/` reads them. The cache-off draw is clean to seed 400.
-2. Hunt I: resume from `hunt/patches/`, `cross.sh` first, since the two
-   scratch fixes were prepared and never adjudicated.
-3. The second form: the second sitting of the forced arm's pairing
+1. The block-cache scan path: a fifth of the cache-on seeds above, the
+   scans short of the model with the point reads right. A failing seed
+   keeps its two stores in `TMPDIR`, `hunt2/probes/` reads them, and the
+   reopened store reproduced the cache-off defects every time; try that
+   first, since a reopened store has no upkeep in flight. Hunt I's
+   patches (`hunt/patches/`) hold the forced schedules and the event ring
+   for the same path, and `cross.sh` the two scratch fixes never
+   adjudicated. The cache-off draw is clean to seed 400.
+2. The second form: the second sitting of the forced arm's pairing
    (`wave2/zproof-commands.sh`), then stage 2b.
 
 Every timing run needs the machine to itself (`bench/CLAUDE.md`), and the
