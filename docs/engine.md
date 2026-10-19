@@ -6192,6 +6192,30 @@ and the candidates, untested, are the seek into the burst's piece, which
 has no ordered index and binary-searches its records, and the merge the
 burst starts streaming the store while the pass runs.
 
+#### Out of core: the second form
+
+A point read of the raw form touches two regions of a partition, the hash slot and the record, and the cache is charged for every page either lives on. The second form is a derived file beside each partition, `zpg-<id>-<end_seq>.zpg` (`Options::zpages`, off by default): the partition's records verbatim in groups, each compressed with LZ4 (the engine's codec) to fill one 4 KiB page, and a fence of the first key of every page held on the heap. A point read of a covered partition binary-searches the fence, reads one page, decodes its group and walks to the key; it touches nothing of the raw segment, so the raw hash region and record region leave the working set and what is resident is one population of pages, a little over half the raw records' size at this suite's values. The sidecar is bound to its segment by content (key count, record length, the key section's checksum row, the build's timestamp, the segment's id and end sequence), so a copy under another segment's name, or one whose segment was rewritten under the same name, is refused and the raw form serves; every page carries a checksum xor'd with the binding; a page that fails a check is read from the raw form and counted, never answered absent. It is derived data: written unsynced from a temp name, renamed into place, swept at open when no live segment claims its name. Point reads and counts read it; scans, the pieces, the frozen tables and the live table are read as before.
+
+`ZPages::Always` forces it (the suite's `supdb-nocachezpages`; its `sync` calls `Db::zpages_settle`, which builds the missing sidecars and waits). The counters it keeps are the `zpage_*` rows `bench ab` prints: reads, decodes, raw serves, fallbacks, damage and identity refusals, builds, declines by reason, and the sidecars' size at the end of a pass.
+
+The first sitting at ten million keys under a 1 GiB bound, the arm with no block cache against the same arm with the form forced, twelve pairs in three chunks of four after their own warmups (the order alternates within each), the read passes at a tenth of the operations:
+
+| | raw | forced | |
+|---|---|---|---|
+| faults a point read, 1 / 2 / 3 threads | 0.45 / 0.41 / 0.41 | 0.000 / 0.000 / 0.000 | 12 of 12 pairs |
+| bytes read from the device a read, 1 thread | 1,852 | 0 | 12 of 12 |
+| point reads a second, 1 / 2 / 3 threads | 31k / 60k / 77k | 196k / 419k / 614k | 6.4x / 7.0x / 8.0x, 12 of 12 |
+| p99 of a point read | 163 µs | 11 µs | |
+| ordered load, ops a second | 936k | 523k | 0.56x: the build is inside `sync` |
+| shuffled load, ops a second | 218k | 193k | 0.89x, 3 of 12 above |
+| bytes on disk a byte stored | 1.30 | 1.91 | |
+
+The raw arm's rate in that sitting is below the 54k a second it read when the rung was first banked, and the forced arm does not wait on the device, so the ratio moves with the host and the faults do not; the comparison with LMDB is not made here, an arm pair holds two arms. Every partition had its sidecar, and no read fell to the raw form or failed a check. One chunk of the sitting died in the shuffled load's last `sync` with `merge slices leave a key unassigned`, the merge's check that its output slices tile the keys of its inputs. The forced arm's `sync` waits for the segment work and so returns that error; the raw arm's flush returns before the merges it leaves finish, and an error from them at the store's close is dropped with the store, so the pairing cannot say whether the raw arm meets it too. The chunk was run again.
+
+In memory the forced form is the wrong choice. At three million keys, which the bound holds, with no division of the reads and eight pairs, it read at 0.21x, 0.18x and 0.17x of the raw form's rate on one, two and three threads, a read of 4.5 µs where the raw one is 0.9, for the page decode in every read where the raw read walks a resident hash; its p99 is 9.5 µs against 1.6. It is an arm for the bound, and something has to decide between the forms per store (`src/db/zselect.rs` is the controller's pure core).
+
+A sidecar written in pieces of a megabyte (`ZWRITE_PIECE`) sits in the page cache as one megabyte folio per megabyte written and a ladder in the tail, in 64 KB pieces as 64 KB folios, in 4 KB pieces as single pages; after eviction a random read through a `MADV_RANDOM` mapping brings back folios of one page whatever the write was. So the composition of what is resident changes during a read pass, and the faults a read are a property of the cache's state as well as of the form. Counted, not timed, on a 400,000-key store with 8 MiB partitions.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and
