@@ -360,8 +360,10 @@ pub struct ZCounts {
     pub counts: u64,
     /// Pages decoded to answer them: one for each read or count of a key
     /// that falls in a page's range, the key the page holds and the key it
-    /// does not alike. A stored page decodes none, and neither does a key
-    /// below the partition's first key, which the fence answers.
+    /// does not alike, unless the thread's memo holds the group from a
+    /// decode before (`memo_hits`). A stored page decodes none, and
+    /// neither does a key below the partition's first key, which the fence
+    /// answers.
     pub decodes: u64,
     /// Reads and counts of a partition that went to the raw form because
     /// it had no sidecar in service: none attached yet, or declined, or
@@ -385,6 +387,12 @@ pub struct ZCounts {
     /// a check failed inside the walk and the rest was walked raw (counted
     /// a fallback as well).
     pub raw_scans: u64,
+    /// The memo of decoded groups (`Options::zpages_memo`): the opens of a
+    /// compressed page it answered, and the ones it did not, each of which
+    /// decoded. A stored page is parsed where it lies and consults it for
+    /// nothing.
+    pub memo_hits: u64,
+    pub memo_misses: u64,
     /// Sidecars built, their pages, bytes, the pages that hold their
     /// group verbatim, the decoded bytes of every group, and compress
     /// calls; builds that failed and builds a merge outran.
@@ -731,6 +739,15 @@ pub struct Options {
     /// whole. `supdb-nocachezpagesnowarm` is the arm with it off.
     #[doc(hidden)]
     pub zpages_warm: bool,
+    /// Whether a compressed page of a sidecar is opened through the
+    /// thread's memo of decoded groups (`zside::Memo`): a thousand and
+    /// twenty-four entries capped at eight megabytes of decoded bytes a
+    /// thread, keyed by the sidecar's attach identity and the page, so a
+    /// read of a page the thread decoded before pays the walk of the group
+    /// and not the decode. Counted on the handle's line (`memo_hits`,
+    /// `memo_misses`). `supdb-nocachezpagesnomemo` is the arm with it off.
+    #[doc(hidden)]
+    pub zpages_memo: bool,
     /// EXPERIMENT: the block forms hold the fold of the partition and the
     /// level-0 pieces alone, and the memtables' keys reach a scan through
     /// the scan snapshot, which every walk overlays on its block whatever
@@ -2158,6 +2175,7 @@ impl Default for Options {
             zpages_hold_rename: false,
             zpages_eager: true,
             zpages_warm: true,
+            zpages_memo: true,
             forms_pieces_only: false,
             publish_in_background: true,
             adaptive_shape: false,
@@ -7349,6 +7367,10 @@ struct Slot {
     /// Reads and counts of a record the form holds no page for, read from
     /// the raw form as the fence says.
     znopage: AtomicU64,
+    /// The memo's hits and misses on this handle's thread, taken at each
+    /// dispatch (`zside::memo_take`).
+    zmemohits: AtomicU64,
+    zmemomisses: AtomicU64,
 }
 
 impl Slot {
@@ -7373,6 +7395,8 @@ impl Slot {
             zscangroups: AtomicU64::new(0),
             znopagescans: AtomicU64::new(0),
             znopage: AtomicU64::new(0),
+            zmemohits: AtomicU64::new(0),
+            zmemomisses: AtomicU64::new(0),
         }
     }
 }
@@ -14660,6 +14684,8 @@ impl Reader {
             scan_groups: rd.stat(|s| &s.zscangroups),
             nopage_scans: rd.stat(|s| &s.znopagescans),
             raw_scans: rd.stat(|s| &s.zscans),
+            memo_hits: rd.stat(|s| &s.zmemohits),
+            memo_misses: rd.stat(|s| &s.zmemomisses),
             builds: get(&ev.builds),
             build_pages: get(&ev.build_pages),
             build_bytes: get(&ev.build_bytes),
@@ -14788,6 +14814,19 @@ impl Reader {
         }
     }
 
+    /// The memo's hits and misses on this thread since the last take, onto
+    /// this handle's line (`zside::memo_take`): taken at each dispatch, so
+    /// a nested read's take attributes what the outer read had made to the
+    /// handle it reads through, and the sums are the thread's.
+    #[inline]
+    fn zmemo_take(&self) {
+        let (h, m) = zside::memo_take();
+        if h | m != 0 {
+            self.zbump_by(|s| &s.zmemohits, h);
+            self.zbump_by(|s| &s.zmemomisses, m);
+        }
+    }
+
     /// `key`'s values in a partition read from its sidecar
     /// (`Options::zpages`), or from the raw form, which `raw` reads, where
     /// the partition has no sidecar in service or a check of the sidecar
@@ -14815,6 +14854,7 @@ impl Reader {
         let served = z
             .read_all(seg.blob.for_sidecar(), key, f)
             .map_err(|e| err(&format!("segment read: {e}")))?;
+        self.zmemo_take();
         match served {
             zside::ZRead::Served { n, decoded } => {
                 self.zbump(|s| &s.zreads);
@@ -14850,7 +14890,9 @@ impl Reader {
             self.zbump(|s| &s.zraw);
             return raw();
         };
-        match z.count(key) {
+        let served = z.count(key);
+        self.zmemo_take();
+        match served {
             zside::ZRead::Served { n, decoded } => {
                 self.zbump(|s| &s.zcounts);
                 if decoded {
@@ -14902,6 +14944,7 @@ impl Reader {
         let r = z
             .scan_at(seg.blob.for_sidecar(), rank, n, f)
             .map_err(|e| err(&format!("segment scan: {e}")))?;
+        self.zmemo_take();
         self.zbump_by(|s| &s.zscangroups, r.decoded);
         self.zbump_by(|s| &s.znopagescans, r.nopage);
         match r.end {
@@ -14931,7 +14974,9 @@ impl Reader {
         let Some(z) = seg.z.get() else {
             return raw();
         };
-        match z.seek(key) {
+        let r = z.seek(key);
+        self.zmemo_take();
+        match r {
             zside::ZSeek::Served { rank, decoded, .. } => {
                 if decoded {
                     self.zbump(|s| &s.zscangroups);
@@ -14953,7 +14998,9 @@ impl Reader {
         let Some(z) = seg.z.get() else {
             return BuildCtx::cut_at(seg, rank, end, uk);
         };
-        match z.cut_in(rank, end, uk) {
+        let r = z.cut_in(rank, end, uk);
+        self.zmemo_take();
+        match r {
             zside::ZSeek::Served { rank, at, decoded } => {
                 if decoded {
                     self.zbump(|s| &s.zscangroups);
@@ -14985,6 +15032,7 @@ impl Reader {
         let served = z
             .values_at(seg.blob.for_sidecar(), rank, f)
             .map_err(|e| err(&format!("segment scan read: {e}")))?;
+        self.zmemo_take();
         match served {
             zside::ZRead::Served { n, decoded } => {
                 if decoded {
@@ -15054,6 +15102,7 @@ impl Reader {
                 }
             }
             Some(PWalk::Z(c)) => {
+                self.zmemo_take();
                 self.zbump_by(|s| &s.zscangroups, c.decoded);
                 self.zbump_by(|s| &s.znopagescans, c.nopage);
                 if c.fell_back() {
@@ -21202,7 +21251,7 @@ impl Db {
         if opts.zpages == ZPages::Always {
             let advise = Db::z_advise(&opts);
             for s in segs.iter().filter(|s| s.level > 0) {
-                Db::z_attach(dir, s, advise, &zev);
+                Db::z_attach(dir, s, advise, opts.zpages_memo, &zev);
             }
         }
         let ord_rebuilt = segs.iter().filter(|s| s.ord_rebuilt).count() as u64;
@@ -24332,7 +24381,7 @@ impl Db {
     /// where it is, for a build to replace, and the segment is marked so
     /// that the build's round does not ask of the same file again and count
     /// it twice; no file is not a rejection.
-    fn z_attach(dir: &Path, seg: &Seg, advise: bool, ev: &zside::ZEvents) -> bool {
+    fn z_attach(dir: &Path, seg: &Seg, advise: bool, memo: bool, ev: &zside::ZEvents) -> bool {
         let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) else {
             return false;
         };
@@ -24342,6 +24391,7 @@ impl Db {
             id,
             end,
             advise,
+            memo,
         ) {
             Ok(side) => {
                 let installed = seg.z.install(side);
@@ -24383,7 +24433,7 @@ impl Db {
         // A file an attach refused was counted when it was, at open or in
         // an earlier call, and is replaced below.
         let refused = seg.z_declined.load(AtomicOrdering::Relaxed) == zside::DECLINED_REFUSED;
-        if !refused && Db::z_attach(&self.dir, seg, advise, ev) {
+        if !refused && Db::z_attach(&self.dir, seg, advise, self.opts.zpages_memo, ev) {
             return;
         }
         let out = self.dir.join(zside::zpg_name(id, end));
@@ -24405,7 +24455,14 @@ impl Db {
         };
         match made {
             Ok(zside::Outcome::Built(b)) => {
-                match zside::ZSide::attach(&out, seg.blob.for_sidecar(), id, end, advise) {
+                match zside::ZSide::attach(
+                    &out,
+                    seg.blob.for_sidecar(),
+                    id,
+                    end,
+                    advise,
+                    self.opts.zpages_memo,
+                ) {
                     Ok(side) => {
                         if seg.z.install(side) {
                             ev.built(&b);
@@ -30658,7 +30715,7 @@ impl Maint {
         }
         let advise = Db::z_advise(&self.opts);
         let refused = seg.z_declined.load(AtomicOrdering::Relaxed) == zside::DECLINED_REFUSED;
-        if !refused && Db::z_attach(&self.dir, &seg, advise, ev) {
+        if !refused && Db::z_attach(&self.dir, &seg, advise, self.opts.zpages_memo, ev) {
             return;
         }
         let failed = |why: u8| {
@@ -30770,6 +30827,7 @@ impl Maint {
                         id,
                         end,
                         Db::z_advise(&self.opts),
+                        self.opts.zpages_memo,
                     ) {
                         Ok(side) => {
                             if target.z.install(side) {

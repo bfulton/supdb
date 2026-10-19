@@ -2317,6 +2317,65 @@ fn the_compact_form_touches_no_raw_page() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The memo of decoded groups (`Options::zpages_memo`): over one
+/// partition read Zipfian-wise, the first read of each page decodes it and
+/// the memo takes the group, the rest hit, so the decodes are a page each
+/// and the hits the rest, on the writer and a handle alike since the memo
+/// is the thread's. With it off every read of a compressed page decodes
+/// and the memo counts nothing.
+#[test]
+fn the_memo_serves_repeated_reads_of_a_partition_and_off_every_read_decodes() {
+    for memo in [true, false] {
+        let dir = scratch(if memo { "memo-on" } else { "memo-off" });
+        let mut db = Db::create(&dir, forced(|o| o.zpages_memo = memo)).unwrap();
+        let model = ordered_load(&mut db, 4000, 0x3E0);
+        db.zpages_settle().unwrap();
+        let c0 = db.zpage_counts();
+        assert_eq!(
+            (c0.partitions, c0.sidecars, c0.build_stored),
+            (1, 1, 0),
+            "{c0:?}"
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let n = keys.len();
+        let mut rng = Rng(0x3E01);
+        let r = db.reader().unwrap();
+        let w: &Reader = &db;
+        for i in 0..6000 {
+            // The low keys hot: the index the square root of a uniform draw.
+            let k = &keys[(rng.below(n * n) as f64).sqrt() as usize % n];
+            let who = if i % 2 == 0 { w } else { &r };
+            assert_eq!(
+                read_vec(who, k),
+                model[k],
+                "the value of {:?}",
+                String::from_utf8_lossy(k)
+            );
+        }
+        let c = db.zpage_counts();
+        let (reads, decodes) = (c.reads - c0.reads, c.decodes - c0.decodes);
+        assert_eq!(reads, 6000, "{c:?}");
+        if memo {
+            assert_eq!(
+                c.memo_hits + c.memo_misses,
+                reads,
+                "every read opened a page through the memo: {c:?}"
+            );
+            assert!(
+                c.memo_misses >= 1 && c.memo_misses <= c0.pages,
+                "a miss a page at most: {c:?}"
+            );
+            assert_eq!(decodes, c.memo_misses, "a decode a miss: {c:?}");
+            assert!(c.memo_hits >= reads * 9 / 10, "the rest hits: {c:?}");
+        } else {
+            assert_eq!((c.memo_hits, c.memo_misses), (0, 0), "{c:?}");
+            assert_eq!(decodes, reads, "every read decodes: {c:?}");
+        }
+        drop(r);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 fn windows_over(name: &str, cache: bool) {
     // The scans of a covered partition answer as if the form were not there,
     // with the unsealed keys laid over it: updates, inserts between records
@@ -2909,12 +2968,13 @@ fn a_refused_file_of_a_partition_the_build_declines_does_not_stay_to_be_met_agai
 #[test]
 fn decodes_count_the_pages_decoded_to_answer_and_no_others() {
     // Values that compress, so that no page is stored and a covered page is
-    // decoded for every read and every count of it (there is no memo). A key
+    // decoded for every read and every count of it, with the memo off (the
+    // memo's own test counts what it saves the decode path). A key
     // that is not there but falls in the range of a page opens the page and
     // decodes it to say so, since this stage has no filter; a key below the
     // partition's first opens none.
     let dir = scratch("decodes");
-    let mut db = Db::create(&dir, forced(|_| {})).unwrap();
+    let mut db = Db::create(&dir, forced(|o| o.zpages_memo = false)).unwrap();
     let mut model = Model::new();
     for chunk in (0..4000usize).collect::<Vec<_>>().chunks(500) {
         for &i in chunk {
@@ -3076,8 +3136,8 @@ fn a_scans_walks_are_served_by_the_sidecars_it_crosses_and_raw_where_there_is_no
     let c = db.zpage_counts();
     assert_eq!((c.fallbacks, c.nopage_scans), (0, 0), "{c:?}");
     assert!(
-        c.scan_groups >= c.scans,
-        "a group a served walk at least: {c:?}"
+        c.scan_groups + c.memo_hits >= c.scans,
+        "a group opened a served walk at least, decoded or the memo's: {c:?}"
     );
     // The same walks over a piece, where a scan takes the merge path and
     // walks each partition by a cursor: a cursor through the partition's
