@@ -208,8 +208,13 @@ branch is the owner's call.
 
 ## Where to start
 
-1. The second form: the second sitting of the forced arm's pairing
-   (`wave2/zproof-commands.sh`, the arms swapped), then stage 2b.
+1. The second form: stage 2b is in (`wave2/stage2b.md`, every piece
+   with its tests; the full gate green and the lifecycle tests run four
+   at a time beside a build), and stage 3 is next: scans through the
+   form (`design/zpages.md`, section 8). Two arms wait for a free
+   machine, unpriced: `bench ab --arms supdb-nocachezpages,supdb-nocachezpagesnowarm`
+   and `...,supdb-nocachezpageseager`, the pairing written in
+   `wave2/stage2b.md` under piece 8.
 2. The fuzz is clean on both draws to the seeds above; a wider draw
    (`ZFUZZ_OPTVARY`, the other key shapes, longer ranges) is the next
    place a defect of the block-cache path would show. A failing seed

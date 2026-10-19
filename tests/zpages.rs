@@ -3731,10 +3731,12 @@ fn a_filter_of_another_layout_cannot_attach_and_never_answers_absent() {
 /// page the attach's own reads left cold and no other, the one just built
 /// skipped as resident, and a store opened with the warm off leaves the
 /// file as the attach left it. Residency is read from the kernel, not from
-/// the store's record of what it asked. The partition is made large
-/// because the attach's sampled pages, read before the mapping is advised
-/// random, pull a readahead window in around each, which is most of a
-/// small file.
+/// the store's record of what it asked. The partition is made large so
+/// that the attach's own reads -- the trailer, the resident part, the
+/// sampled pages -- are a small share of it, and the attach is held to
+/// that share: with the mapping advised random only after the sample,
+/// each of those reads pulled a readahead window in around it, half of
+/// this file and most of a small one.
 #[cfg(target_os = "linux")]
 #[test]
 fn an_attached_sidecar_is_warmed_once_per_process_unless_the_warm_is_off() {
@@ -3789,6 +3791,10 @@ fn an_attached_sidecar_is_warmed_once_per_process_unless_the_warm_is_off() {
         .unwrap();
         assert_eq!(db.zpage_counts().attached, 1);
         let (res, all) = resident(&file);
+        assert!(
+            res * 4 < all,
+            "the attach's own reads pulled {res} of {all} pages in: a readahead window around each"
+        );
         assert!(
             res < all,
             "the attach left {} of {all} pages cold",
