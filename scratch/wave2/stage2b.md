@@ -80,7 +80,20 @@ go through the segment's own drop and never through `RetiredZ`, and a
 handle's drop with the retired sidecar's dead name still mapped. The
 test's values are random bytes now, so a sidecar has more pages than
 the attach samples and a page can be flipped unsampled. All nine
-pieces are in; the stage's full gate is the next step, then stage 3.
+pieces are in. The stage's full gate (`sh scripts/check.sh`, every
+group) is green at `200439b`, and the stop rule's run -- the zpages and
+leak binaries four at a time beside a build, three rounds under
+`checked` -- read one failure in twelve: the fixture of the two
+build-race tests waited for the build's thread to have started and then
+landed its merge, and under load the idle-priority build was still in
+its pages, so the cancel reached it before its last look and the
+orphan test read a cancel. The builder's thread marks the hold it waits
+at now and the fixture waits for the build to be there (`62d5787`);
+twenty runs of twenty beside two clippy compiles after it. Beside that
+the warm's test had found the attach reading half of a four-megabyte
+sidecar through readahead, its own reads made under the default advice:
+the mapping is advised random as it opens now (`e7d9698`, 522 pages of
+1,004 at the attach to 42). Stage 3 is next.
 
 ## The pieces
 
