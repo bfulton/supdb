@@ -9878,6 +9878,40 @@ impl CachedBlock {
             && self.ents == other.ents
             && (self.identity || !other.identity)
     }
+    /// Where this copy and `other` first part: the entry, its keys and
+    /// its values' lengths on each side, for the check above to name.
+    #[cfg(debug_assertions)]
+    fn disagreement(&self, other: &CachedBlock) -> String {
+        let n = self.ents.len().min(other.ents.len());
+        for i in 0..n {
+            let (a, b) = (&self.ents[i], &other.ents[i]);
+            let (ka, kb) = (self.key(a), other.key(b));
+            let mut va = Vec::new();
+            self.each_value(a, |v| va.push(v.len()));
+            let mut vb = Vec::new();
+            other.each_value(b, |v| vb.push(v.len()));
+            if ka != kb || va != vb {
+                return format!(
+                    "entry {i} of {} against {}: key {} against {}, value lens {va:?} against {vb:?}",
+                    self.ents.len(),
+                    other.ents.len(),
+                    hex(ka),
+                    hex(kb)
+                );
+            }
+        }
+        format!(
+            "entries {} against {}, identity {} against {}, keys {} against {} bytes, vals {} against {} bytes",
+            self.ents.len(),
+            other.ents.len(),
+            self.identity,
+            other.identity,
+            self.keys.len(),
+            other.keys.len(),
+            self.vals.len(),
+            other.vals.len()
+        )
+    }
     /// First entry whose key is not below `from`.
     fn lower_bound(&self, from: &[u8]) -> usize {
         select_lower_bound(self.ents.len(), |i| {
@@ -15153,8 +15187,14 @@ impl Reader {
             }
             if file {
                 let e = mem.entry(id);
+                // Consecutive writes of one key fold into one entry, by
+                // the write's slot: the key's arena offset is not its
+                // identity, since the empty key takes no bytes and the
+                // key created after it starts at the same offset, and
+                // folded by offset that key's creating write vanished
+                // into the empty key's entry and was never filed.
                 match pending.last_mut() {
-                    Some(last) if last.0 == e.key_off => last.2 |= new,
+                    Some(last) if last.3 == id as u32 => last.2 |= new,
                     _ => pending.push((e.key_off, e.key_len(), new, id as u32)),
                 }
             }
@@ -15303,8 +15343,9 @@ impl Reader {
                 for i in from..table.log_len() {
                     let (id, _) = table.log_at(i);
                     let e = table.entry(id);
+                    // By the slot, as the live log's read folds them.
                     match writes.last() {
-                        Some(last) if last.0 == e.key_off => {}
+                        Some(last) if last.3 == id as u32 => {}
                         _ => writes.push((e.key_off, e.key_len(), false, id as u32)),
                     }
                 }
@@ -17143,7 +17184,8 @@ impl Reader {
                             match &again {
                                 Cached::Block(cb) => debug_assert!(
                                     copied.agrees(cb),
-                                    "a copy from the form disagrees with the build from the sources"
+                                    "a copy from the form disagrees with the build from the sources: block {b}, {}",
+                                    copied.disagreement(cb)
                                 ),
                                 _ => debug_assert!(
                                     false,
@@ -17485,10 +17527,13 @@ impl Reader {
             Vec::with_capacity(pending.len());
         for &(_, _, i) in &keyed {
             let (off, len, new, slot) = pending[i as usize];
-            if off == last {
+            // A key's writes are adjacent here and skipped past the first,
+            // by the slot: the offset is shared by the empty key and the
+            // key created after it (`sync_log`).
+            if slot == last {
                 continue;
             }
-            last = off;
+            last = slot;
             let key = src.key_at(off, len);
             // The partition holding the key: the one before's or a later
             // one in key order, found by stepping, and from the top for a

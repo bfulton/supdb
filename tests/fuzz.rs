@@ -46,6 +46,11 @@
 //!   the empty key is the first of its memtable.
 //! - `ZFUZZ_VERBOSE=1`: print each seed's configuration. `ZFUZZ_TRACE=1`:
 //!   print each event as it is reached, for the last line of a hang.
+//! - `ZFUZZ_SCANEVERY=1`: scan the whole store through the writer after
+//!   every step that leaves nothing staged, so a scan that goes wrong is
+//!   caught at the step it does and not at the next full check; a
+//!   mismatch names the first key that differs and the writer's every
+//!   source for it (`Reader::debug_key`).
 //! - `ZFUZZ_OPS` (4000), `ZFUZZ_SNAPS=1`: the writer's steps in
 //!   `concurrent_range`, and whether its readers claim snapshots.
 
@@ -475,6 +480,13 @@ fn absent_around(keys: &[Vec<u8>], rng: &mut Rng) -> Vec<Vec<u8>> {
     v
 }
 
+/// The first key the model has that `got` answers differently.
+fn first_diff_key(got: &Model, want: &Model) -> Option<Vec<u8>> {
+    want.iter()
+        .find(|(k, w)| got.get(*k) != Some(w))
+        .map(|(k, _)| k.clone())
+}
+
 fn model_diff(got: &Model, want: &Model) -> String {
     let mut out = Vec::new();
     for (k, w) in want {
@@ -613,6 +625,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         pool.iter().chain(absent.iter()).cloned().collect()
     };
 
+    let scan_every = env_flag("ZFUZZ_SCANEVERY");
     for step in 0..cfg.ops as u64 {
         STEP.set(step as i64);
         let k = pool[rng.below(pool.len())].clone();
@@ -802,6 +815,28 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         if !fails.is_empty() {
             break;
         }
+        if scan_every && staged.is_empty() {
+            let want = live(&model);
+            let (a, a_faults) = scan_all(&z);
+            if !a_faults.is_empty() || a != want {
+                let sources = first_diff_key(&a, &want)
+                    .map(|k| format!("; the writer's sources of the first: {}", z.debug_key(&k)))
+                    .unwrap_or_default();
+                // In full, since a failure's line is cut short.
+                eprintln!("SOURCES [step {step}]{sources}");
+                fail(
+                    &mut fails,
+                    format!(
+                        "z scan differs from the model after step {step} (scanned every commit): {} {}{sources}",
+                        model_diff(&a, &want),
+                        a_faults.join("; ")
+                    ),
+                );
+            }
+        }
+        if !fails.is_empty() {
+            break;
+        }
         // Full checks now and then, on a quiet store.
         if step % 200 == 199 {
             z.commit().map_err(|e| format!("commit z: {e}"))?;
@@ -840,10 +875,15 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                     fail(&mut fails, format!("r {x}{tag}"));
                 }
                 if a != want {
+                    let sources = first_diff_key(&a, &want)
+                        .map(|k| {
+                            format!("; the writer's sources of the first: {}", z.debug_key(&k))
+                        })
+                        .unwrap_or_default();
                     fail(
                         &mut fails,
                         format!(
-                            "z scan differs from the model{tag}: {}",
+                            "z scan differs from the model{tag}: {}{sources}",
                             model_diff(&a, &want)
                         ),
                     );
