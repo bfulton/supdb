@@ -368,10 +368,12 @@ pub struct ZCounts {
     /// out of service after a check failed.
     pub rawserves: u64,
     /// Reads and counts that went to the raw form because a check failed
-    /// on them, or because the fence names no page for the key: a record the
-    /// form was built without. The builder makes none of those yet, so a
-    /// store that built its own sidecars counts the first kind alone.
+    /// on them.
     pub fallbacks: u64,
+    /// Reads and counts of a key whose record the fence names no page for:
+    /// a record no page holds, which the build left to the raw form on
+    /// purpose.
+    pub nopage_reads: u64,
     /// Scans that began in a partition with a sidecar and were walked raw.
     pub raw_scans: u64,
     /// Sidecars built, their pages, bytes, the pages that hold their
@@ -395,6 +397,8 @@ pub struct ZCounts {
     /// flag stopped.
     pub build_starts: u64,
     pub build_cancelled: u64,
+    /// Records the builds held no page for.
+    pub build_nopage: u64,
     /// Partitions declined, by reason, and the record bytes of the ones
     /// declined for their size.
     pub declined_small: u64,
@@ -7162,6 +7166,9 @@ struct Slot {
     zraw: AtomicU64,
     zfallbacks: AtomicU64,
     zscans: AtomicU64,
+    /// Reads and counts of a record the form holds no page for, read from
+    /// the raw form as the fence says.
+    znopage: AtomicU64,
 }
 
 impl Slot {
@@ -7182,6 +7189,7 @@ impl Slot {
             zraw: AtomicU64::new(0),
             zfallbacks: AtomicU64::new(0),
             zscans: AtomicU64::new(0),
+            znopage: AtomicU64::new(0),
         }
     }
 }
@@ -14449,6 +14457,7 @@ impl Reader {
             decodes: rd.stat(|s| &s.zdecodes),
             rawserves: rd.stat(|s| &s.zraw),
             fallbacks: rd.stat(|s| &s.zfallbacks),
+            nopage_reads: rd.stat(|s| &s.znopage),
             raw_scans: rd.stat(|s| &s.zscans),
             builds: get(&ev.builds),
             build_pages: get(&ev.build_pages),
@@ -14463,6 +14472,7 @@ impl Reader {
             declined_damage: get(&ev.declined_damage),
             build_starts: get(&ev.build_starts),
             build_cancelled: get(&ev.build_cancelled),
+            build_nopage: get(&ev.build_nopage),
             declined_small: get(&ev.declined_small),
             declined_small_bytes: get(&ev.declined_small_bytes),
             declined_block_backed: get(&ev.declined_block_backed),
@@ -14606,6 +14616,10 @@ impl Reader {
                 self.zbump(|s| &s.zfallbacks);
                 raw(seg, f)
             }
+            zside::ZRead::NoPage => {
+                self.zbump(|s| &s.znopage);
+                raw(seg, f)
+            }
             zside::ZRead::Out => {
                 self.zbump(|s| &s.zraw);
                 raw(seg, f)
@@ -14635,6 +14649,10 @@ impl Reader {
             }
             zside::ZRead::Fallback => {
                 self.zbump(|s| &s.zfallbacks);
+                raw()
+            }
+            zside::ZRead::NoPage => {
+                self.zbump(|s| &s.znopage);
                 raw()
             }
             zside::ZRead::Out => {

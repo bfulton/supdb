@@ -36,7 +36,15 @@ in flight cancelled by the merge that takes its target, and a build
 past its last cancel check whose target died leaving a dead name). The
 builds run inside the settle of the form, where the pairing measured
 them; `Options::zpages_eager`, the design's start-at-landing, is an
-option to be priced before it is the default. 6 to 9 are next.
+option to be priced before it is the default. Piece 6 is in: a record
+no page holds is a fence entry with no page and the build goes on, a
+partition of nothing else is declined for the last record's reason,
+and a key in such an entry's range that is not the record's is absent
+from the fence (the entry covers one record; one over more is the raw
+form's for every key). The test's keys of 200, 1,000 and 5,000 bytes
+all fit a page compressed, so the records no page holds are a 9,000-byte
+value of random bytes and a 70,000-byte value, over `ZMAX_ULEN`, under
+`inline_bytes` of 128 KiB. 7 to 9 are next.
 
 ## The pieces
 

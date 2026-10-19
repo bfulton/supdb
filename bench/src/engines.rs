@@ -4760,6 +4760,7 @@ impl Engine for Supdb {
             ("zpage_decodes", z.decodes as f64),
             ("zpage_rawserves", z.rawserves as f64),
             ("zpage_fallbacks", z.fallbacks as f64),
+            ("zpage_nopage_reads", z.nopage_reads as f64),
             ("zpage_raw_scans", z.raw_scans as f64),
             ("zpage_builds", z.builds as f64),
             ("zpage_build_pages", z.build_pages as f64),
@@ -4772,6 +4773,7 @@ impl Engine for Supdb {
             ("zpage_declined_damage", z.declined_damage as f64),
             ("zpage_build_starts", z.build_starts as f64),
             ("zpage_build_cancelled", z.build_cancelled as f64),
+            ("zpage_build_nopage", z.build_nopage as f64),
             ("zpage_declined_small", z.declined_small as f64),
             ("zpage_declined_small_bytes", z.declined_small_bytes as f64),
             (

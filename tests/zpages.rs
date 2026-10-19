@@ -3561,3 +3561,86 @@ fn every_crash_window_of_a_sidecar_is_survived_at_open() {
     let _ = std::fs::remove_dir_all(&work);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- records no page holds -------------------------------------------------------------
+
+/// Records no page holds among compressible neighbours -- a value of
+/// random bytes over a page and one over the largest image a group decodes
+/// into -- each get an entry of the fence with no page, the build goes on
+/// past them, the reads of them are the raw form's and counted as such, and
+/// everything beside them is served from the sidecar: the keys of two
+/// hundred, a thousand and five thousand bytes among them, whose records
+/// are over a page uncompressed and fit one compressed.
+#[test]
+fn records_larger_than_a_page_are_read_from_the_raw_segment() {
+    let dir = scratch("nopage");
+    let mut db = Db::create(&dir, forced(|o| o.inline_bytes = 1 << 17)).unwrap();
+    let mut model = Model::new();
+    let mut rng = Rng(0x0A9E);
+    let mut put = |db: &mut Db, k: Vec<u8>, v: Vec<u8>| {
+        db.append(&k, &v);
+        model.entry(k).or_default().push(v);
+    };
+    for i in 0..3000 {
+        put(&mut db, spaced_key(i), suite_value(&mut rng));
+    }
+    // Keys of 200, 1,000 and 5,000 bytes, a 9,000-byte value of random
+    // bytes, and a 70,000-byte value: over `ZMAX_ULEN`, which is 64 KiB.
+    let big: Vec<(Vec<u8>, Vec<u8>)> = vec![
+        (vec![b'k'; 200], b"two hundred".to_vec()),
+        (vec![b'l'; 1000], b"a thousand".to_vec()),
+        (vec![b'm'; 5000], b"five thousand".to_vec()),
+        (
+            b"n-nine-thousand".to_vec(),
+            (0..9000).map(|_| rng.next() as u8).collect::<Vec<u8>>(),
+        ),
+        (b"o-seventy-thousand".to_vec(), vec![b'o'; 70_000]),
+    ];
+    for (k, v) in &big {
+        put(&mut db, k.clone(), v.clone());
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!((c.partitions, c.sidecars), (1, 1), "{c:?}");
+    assert_eq!(c.build_nopage, 2, "{c:?}");
+    assert_eq!(
+        c.declined_oversize + c.declined_incompressible + c.declined_unplaceable + c.build_failed,
+        0,
+        "{c:?}"
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    check(&db, &model, &keys, "with records no page holds");
+    check_scan(&db, &model, "the scan");
+    let c = db.zpage_counts();
+    assert_eq!(c.nopage_reads, 4, "a read and a count of each: {c:?}");
+    assert_eq!((c.fallbacks, c.rawserves), (0, 0), "{c:?}");
+    assert_eq!(
+        c.reads + c.counts + c.nopage_reads,
+        2 * keys.len() as u64,
+        "every read served or read raw for its entry: {c:?}"
+    );
+    // A key in a no-page entry's range that is not its record is absent,
+    // answered from the fence: served, nothing decoded, no raw read.
+    let (d0, r0) = (c.decodes, c.nopage_reads);
+    let mut probes: Vec<Vec<u8>> = Vec::new();
+    for k in [&b"n-nine-thousand"[..], b"o-seventy-thousand"] {
+        probes.push([k, &[0u8]].concat());
+        probes.push([k, &[0xffu8]].concat());
+    }
+    check(
+        &db,
+        &model,
+        &probes,
+        "keys beside the records no page holds",
+    );
+    let c = db.zpage_counts();
+    assert_eq!((c.decodes, c.nopage_reads), (d0, r0), "{c:?}");
+    let r = db.reader().unwrap();
+    check(&r, &model, &keys, "a handle");
+    assert_eq!(db.zpage_counts().nopage_reads, 8, "{c:?}");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
