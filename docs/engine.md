@@ -6210,7 +6210,22 @@ The first sitting at ten million keys under a 1 GiB bound, the arm with no block
 | shuffled load, ops a second | 218k | 193k | 0.89x, 3 of 12 above |
 | bytes on disk a byte stored | 1.30 | 1.91 | |
 
-The raw arm's rate in that sitting is below the 54k a second it read when the rung was first banked, and the forced arm does not wait on the device, so the ratio moves with the host and the faults do not; the comparison with LMDB is not made here, an arm pair holds two arms. Every partition had its sidecar, and no read fell to the raw form or failed a check. One chunk of the sitting died in the shuffled load's last `sync` with `merge slices leave a key unassigned`, the merge's check that its output slices tile the keys of its inputs. The forced arm's `sync` waits for the segment work and so returns that error; the raw arm's flush returns before the merges it leaves finish, and an error from them at the store's close is dropped with the store, so the pairing cannot say whether the raw arm meets it too. The chunk was run again.
+The raw arm's rate in that sitting is below the 54k a second it read when the rung was first banked, and the forced arm does not wait on the device, so the ratio moves with the host and the faults do not; the comparison with LMDB is not made here, an arm pair holds two arms. Every partition had its sidecar, and no read fell to the raw form or failed a check.
+
+The second sitting, the arms' order swapped, twelve pairs after a warmup in one run of forty-one minutes:
+
+| | raw | forced | |
+|---|---|---|---|
+| faults a point read, 1 / 2 / 3 threads | 0.47 / 0.43 / 0.43 | 0.000 / 0.000 / 0.000 | 12 of 12 pairs |
+| bytes read from the device a read, 1 / 2 / 3 threads | 1,933 / 1,762 / 1,760 | 0 / 0 / 0 | 12 of 12 |
+| point reads a second, 1 / 2 / 3 threads | 45k / 85k / 112k | 198k / 422k / 610k | 4.4x / 5.0x / 5.5x, 12 of 12 |
+| p99 of a point read | 109 µs | 10 µs | |
+| ordered load, ops a second | 1,158k | 678k | 0.59x |
+| shuffled load, ops a second | 311k | 260k | 0.84x, 9 of 12 |
+| bytes on disk a byte stored | 1.30 | 1.91 | |
+| bytes written to the device a byte stored | 1.34 | 1.95 | |
+
+Fifty-seven partitions in each pass, fifty-seven sidecars built and attached, 343,000 pages holding 2.48 GB of records in 1.42 GB of file; six million reads through the form, every one decoded, none raw, none fallen back, nothing declined, refused or swept. The forced arm reads at the same rate in both sittings, 196k and 198k a second on one thread, and the raw arm at 31k and 45k: the ratio is the host's that day, the faults a read are the form's and read zero in every pair of both sittings. The load and the disk read where they were registered (`scratch/design/zpages.md`, section 7.3 as corrected in `scratch/wave2/zproof-commands.sh`): the ordered load at 0.59x, the shuffled load at 0.84x, bytes on disk at 1.91 and device bytes at 1.95 a byte stored. What the verdict leaves to the bounded row is the comparison with LMDB and the scan cells, which stay raw until the form serves scans. One chunk of the sitting died in the shuffled load's last `sync` with `merge slices leave a key unassigned`, the merge's check that its output slices tile the keys of its inputs. The forced arm's `sync` waits for the segment work and so returns that error; the raw arm's flush returns before the merges it leaves finish, and an error from them at the store's close is dropped with the store, so the pairing cannot say whether the raw arm meets it too. The chunk was run again.
 
 In memory the forced form is the wrong choice. At three million keys, which the bound holds, with no division of the reads and eight pairs, it read at 0.21x, 0.18x and 0.17x of the raw form's rate on one, two and three threads, a read of 4.5 µs where the raw one is 0.9, for the page decode in every read where the raw read walks a resident hash; its p99 is 9.5 µs against 1.6. It is an arm for the bound, and something has to decide between the forms per store (`src/db/zselect.rs` is the controller's pure core).
 

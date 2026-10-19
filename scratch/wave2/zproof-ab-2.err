@@ -1,0 +1,15 @@
+bench: bound 1073741824 bytes in group /sys/fs/cgroup/memory/process_api/01a15497-92b8-77fe-89c4-b5d5763e5af9/claude-code-bash/supdb-bench-29139
+bench ab: supdb-nocachezpages against supdb-nocache at 10000000 keys, scans of 100, 12 pairs after a warmup, under a bound of 1073741824 bytes, passes load,read,read-threaded, ops divided by 10
+   194s  rep 0/12 (warmup)
+   380s  rep 1/12
+   582s  rep 2/12
+   771s  rep 3/12
+   955s  rep 4/12
+  1132s  rep 5/12
+  1321s  rep 6/12
+  1514s  rep 7/12
+  1701s  rep 8/12
+  1893s  rep 9/12
+  2074s  rep 10/12
+  2254s  rep 11/12
+  2444s  rep 12/12
