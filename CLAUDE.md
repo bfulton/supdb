@@ -2271,6 +2271,24 @@ replaces a set of partitions produces one output per fence it took,
 keys or none, since the tiling is a property of the fences and not of
 the keys.
 
+**A key's identity taken from where its bytes begin.** The settle folds
+a key's consecutive writes into one pending entry and skips its
+duplicates in the resolve, both by the key's arena offset. The empty key
+takes no bytes, so the key created after it begins at the same offset,
+and that key's creating write folded into the empty key's entry: never
+filed into its block's list, never patched into its form, and a scan
+through the block cache answered the key absent, or its values short of
+the one appended after an empty-key write, while the point read beside
+it, through the memtable, was right. Twenty of a hundred and twenty
+cache-on seeds of the differential fuzz, and the conversion's check that
+a copy from the form agrees with a build from the sources, which is the
+same loss seen a second way. The writes fold and skip by the slot now,
+the write's entry in its table, which is what a key is to the table
+(`tests/settle.rs`). The rule is the one the arena's first reservation
+gave: a thing of zero length has an address another thing shares, so an
+address is not an identity, and a fuzz that draws the empty key finds
+every place one was taken for one.
+
 **A probe's total over a whole read is an inlining result.** The same engine
 read +0.9, +1.9, +2.9 and +3.15 instructions a point read across four probes
 and a count +3.00 exactly, because the code after a probe's loop changes what
