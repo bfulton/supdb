@@ -312,31 +312,63 @@ pub fn parse_page(page: &[u8], bind32: u32) -> Result<(PageHeader, &[u8]), ZErro
     Ok((h, &page[ZHDR..end]))
 }
 
+/// A page's header and payload for a page this process has already passed
+/// through [`parse_page`] and a first decode: the length and the header's
+/// values are checked and nothing else, because the CRC is a pass over the
+/// page and a reader's every read of a page it has verified would pay it
+/// again. The tag, the flags, the zeros and the padding are the first
+/// decode's; a page that has not had one is read with [`parse_page`].
+pub fn page_view(page: &[u8]) -> Result<(PageHeader, &[u8]), ZError> {
+    let page: &[u8; ZPAGE] = page.try_into().map_err(|_| ZError::Length)?;
+    let word = |at: usize| u32::from_le_bytes([page[at], page[at + 1], page[at + 2], page[at + 3]]);
+    let half = |at: usize| u16::from_le_bytes([page[at], page[at + 1]]);
+    let h = PageHeader {
+        first_rank: word(P_FIRST),
+        count: half(P_COUNT),
+        stored: page[P_FLAGS] & F_STORED != 0,
+        ulen: word(P_ULEN),
+        clen: half(P_CLEN),
+    };
+    h.check()?;
+    Ok((h, &page[ZHDR..ZHDR + h.clen as usize]))
+}
+
 /// A buffer a group decodes into: words, not bytes, so that it is aligned
 /// for the extent arrays `parse_record` borrows in place. A `Vec<u8>` is not
 /// promised to be, and a record read from a misaligned buffer is `None`,
 /// which a probe loop reads as "absent".
+///
+/// It is as large as the largest group decoded into it so far, in whole
+/// pages, and no larger: a thread that reads a covered partition keeps one
+/// for its life, and a callback that reads again makes one of its own, so a
+/// buffer made at [`ZMAX_ULEN`] was 64 KiB zeroed for every thread and every
+/// nested read to hold groups that are a few kilobytes.
 pub struct GroupBuf {
     words: Vec<u64>,
 }
 
 impl GroupBuf {
-    /// A buffer that holds the largest group.
+    /// An empty buffer, which the first group decoded into it sizes.
     pub fn new() -> GroupBuf {
-        GroupBuf {
-            words: vec![0; ZMAX_ULEN / 8],
-        }
+        GroupBuf { words: Vec::new() }
     }
 
-    /// The buffer's bytes. Not zeroed between uses: a decode writes every
-    /// byte of the group it returns, and nothing beyond it is ever lent.
-    fn bytes_mut(&mut self) -> &mut [u8] {
-        // SAFETY: `words` owns `len * 8` initialised bytes, `u8` has no
+    /// The first `n` bytes of the buffer, grown to hold them. Not zeroed
+    /// between uses: a decode writes every byte of the group it returns, and
+    /// nothing beyond it is ever lent. `n` is at most [`ZMAX_ULEN`], which
+    /// the header's check has seen to.
+    fn bytes_for(&mut self, n: usize) -> &mut [u8] {
+        let words = n.div_ceil(8);
+        if self.words.len() < words {
+            // Whole pages, so that groups a few bytes apart in size grow the
+            // buffer once and not once each. The old contents are not kept:
+            // nothing is lent from a buffer between two decodes.
+            self.words = vec![0; words.next_multiple_of(ZPAGE / 8)];
+        }
+        // SAFETY: `words` owns at least `n` initialised bytes, `u8` has no
         // alignment to violate, and the borrow of `self` is the only access
         // while the slice lives.
-        unsafe {
-            std::slice::from_raw_parts_mut(self.words.as_mut_ptr() as *mut u8, self.words.len() * 8)
-        }
+        unsafe { std::slice::from_raw_parts_mut(self.words.as_mut_ptr() as *mut u8, n) }
     }
 }
 
@@ -371,11 +403,11 @@ pub fn decode_group<'a>(
         if (payload.as_ptr() as usize).is_multiple_of(std::mem::align_of::<crate::index::Ext>()) {
             return Ok(payload);
         }
-        let out = &mut buf.bytes_mut()[..ulen];
+        let out = buf.bytes_for(ulen);
         out.copy_from_slice(payload);
         return Ok(out);
     }
-    let out = &mut buf.bytes_mut()[..ulen];
+    let out = buf.bytes_for(ulen);
     let n = lz4_flex::block::decompress_into(payload, out).map_err(|_| ZError::Decode)?;
     if n != ulen {
         return Err(ZError::DecodedLen);
@@ -1281,6 +1313,50 @@ impl ZFence {
         })
     }
 
+    /// The entry whose records `key` falls among: the greatest whose key is
+    /// at or below `key`, or `None` where `key` sorts below the first
+    /// entry's, which is a key the partition does not hold. A search over
+    /// the fence's keys with the engine's key compare, in the heap and
+    /// touching no page.
+    ///
+    /// An empty fence key is not handed to a byte compare, nor is an empty
+    /// `key`: a slice held in a `Vec` that never allocated points at no
+    /// page, and the library's compare reads through its first operand
+    /// before it honours a zero length -- a failed page walk a call, 81 ns
+    /// measured. An empty key sorts below every other, so neither needs
+    /// one.
+    pub fn entry_of(&self, key: &[u8]) -> Option<usize> {
+        let (mut lo, mut hi) = (0usize, self.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            // Every entry below `len` has a key: `push` writes the offset
+            // with the key and `decode_resident` refuses offsets that do
+            // not run from zero to the blob's length. A miss here is a bug
+            // in the type, and a panic is the better failure than a key
+            // answered as one below the first.
+            let k = self.key(mid).expect("an entry has its key");
+            let at_or_below = if k.is_empty() {
+                true
+            } else if key.is_empty() {
+                false
+            } else {
+                super::key_cmp(k, key) != Ordering::Greater
+            };
+            if at_or_below {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo.checked_sub(1)
+    }
+
+    /// Heap bytes the fence holds: the four tables of region B, as they sit
+    /// in memory.
+    pub fn heap_bytes(&self) -> usize {
+        4 * (self.first_rank.len() + self.page.len() + self.key_off.len()) + self.keys.len()
+    }
+
     /// Region B, padded with zeros to a multiple of [`ZPAGE`], and what the
     /// trailer records of it. `filter` is the filter's blocks as bytes,
     /// little-endian words, whole 64-byte blocks, or empty for none.
@@ -1471,13 +1547,39 @@ pub fn filter_bytes(nkeys: usize) -> usize {
     super::BlockedBloom::blocks_for(nkeys) * std::mem::size_of::<[u64; 8]>()
 }
 
+/// That a page's header is its fence entry's: the rank of its first record
+/// and the records it holds. A page that passes its CRC and is some other
+/// page's, or is the right page rewritten, is told apart here and by
+/// nothing earlier.
+///
+/// One of the two checks a first decode makes beyond the page's own
+/// ([`check_group`] is the other), and the reader's first decode, the
+/// builder's verification of what it wrote ([`verify_page`]) and an attach's
+/// look at the pages it samples all call it, so that the three cannot come to
+/// mean different things by it.
+pub fn check_entry(h: &PageHeader, entry: &FenceEntry<'_>) -> Result<(), ZError> {
+    if h.first_rank != entry.first_rank || u32::from(h.count) != entry.count {
+        return Err(ZError::Fence);
+    }
+    Ok(())
+}
+
+/// That a decoded group is what its page's header and its fence entry say:
+/// `count` records, whole, in key order, the first the entry's key
+/// ([`walk_group`]). See [`check_entry`] for why it is a function of its own.
+pub fn check_group(group: &[u8], h: &PageHeader, entry: &FenceEntry<'_>) -> Result<(), ZError> {
+    walk_group(group, usize::from(h.count), Some(entry.key))
+}
+
 /// Everything a first decode of a page checks, in the order that trusts the
 /// least first: the page's CRC, tag and header; its `first_rank` and `count`
-/// against its fence entry; the payload decoded to exactly `ulen`; and the
-/// structural walk -- `count` records, whole, ascending, the first the
-/// entry's key. The builder runs this on every page it writes, as the page
-/// will be read, so that a defect that would fail every first decode cannot
-/// pass the build and then loop the rebuild.
+/// against its fence entry ([`check_entry`]); the payload decoded to exactly
+/// `ulen`; and the structural walk -- `count` records, whole, ascending, the
+/// first the entry's key ([`check_group`]). The builder runs this on every
+/// page it writes, as the page will be read, so that a defect that would
+/// fail every first decode cannot pass the build and then loop the rebuild;
+/// the reader's first decode is these checks in this order with the one
+/// difference its mapping makes (`db::zside::first_decode`).
 pub fn verify_page(
     page: &[u8],
     bind32: u32,
@@ -1485,11 +1587,9 @@ pub fn verify_page(
     buf: &mut GroupBuf,
 ) -> Result<PageHeader, ZError> {
     let (h, payload) = parse_page(page, bind32)?;
-    if h.first_rank != entry.first_rank || u32::from(h.count) != entry.count {
-        return Err(ZError::Fence);
-    }
+    check_entry(&h, entry)?;
     let group = decode_group(&h, payload, buf)?;
-    walk_group(group, usize::from(h.count), Some(entry.key))?;
+    check_group(group, &h, entry)?;
     Ok(h)
 }
 
@@ -2087,6 +2187,61 @@ mod tests {
     }
 
     #[test]
+    fn a_decode_buffer_is_as_large_as_the_largest_group_it_has_held_in_whole_pages() {
+        // A thread keeps one for its life and a callback that reads again
+        // makes one of its own, so a buffer made at the largest group's size
+        // was 64 KiB zeroed for each, to hold groups of a few kilobytes.
+        let mut buf = GroupBuf::new();
+        assert!(buf.words.is_empty(), "an empty buffer holds nothing");
+        for (n, words) in [
+            (0usize, 0usize),
+            (100, ZPAGE / 8),
+            (ZPAGE, ZPAGE / 8),
+            (ZPAGE + 4, 2 * ZPAGE / 8),
+            (500, 2 * ZPAGE / 8),
+            (ZMAX_ULEN, ZMAX_ULEN / 8),
+            (4, ZMAX_ULEN / 8),
+        ] {
+            let got = buf.bytes_for(n);
+            assert_eq!(got.len(), n);
+            assert!(
+                (got.as_ptr() as usize).is_multiple_of(8),
+                "a group decodes to where extents can be borrowed"
+            );
+            assert_eq!(buf.words.len(), words, "after a group of {n} bytes");
+        }
+        // Groups of every size one after another decode to their bytes,
+        // whichever way the buffer has grown: small, large, small.
+        let mut rng = Rng(0xB0F);
+        let mut buf = GroupBuf::new();
+        for n in [64usize, 3000, 40, 20_000, 4000, ZMAX_ULEN, 8, 3000] {
+            // Entropy for the sizes a page holds, a pattern for the ones it
+            // can only hold compressed.
+            let group: Vec<u8> = if n <= 4000 {
+                rng.bytes(n)
+            } else {
+                (0..n).map(|i| (i / 7 % 251) as u8).collect()
+            };
+            let payload = lz4_flex::block::compress(&group);
+            assert!(payload.len() <= ZCAP, "{n}: the group fits a page");
+            let h = PageHeader {
+                first_rank: 0,
+                count: 1,
+                stored: false,
+                ulen: group.len() as u32,
+                clen: payload.len() as u16,
+            };
+            let back = decode_group(&h, &payload, &mut buf).unwrap();
+            assert_eq!(back, &group[..], "{n}");
+        }
+        assert_eq!(
+            buf.words.len(),
+            ZMAX_ULEN / 8,
+            "grown to the largest, not past it"
+        );
+    }
+
+    #[test]
     fn a_stored_page_is_parsed_in_place_where_aligned_and_copied_where_not() {
         let images = small_groups().remove(1).0;
         let group = images.concat();
@@ -2325,6 +2480,78 @@ mod tests {
                 "bind32 {other}"
             );
         }
+    }
+
+    #[test]
+    fn a_pages_view_is_its_header_and_payload_and_checks_only_those() {
+        for (group, stored) in small_groups() {
+            let group = group.concat();
+            let page = manual_page(&group, 3, 17, 0xBEEF, stored);
+            let (h, payload) = parse_page(&page, 0xBEEF).unwrap();
+            // The view agrees with the full parse where the page is whole.
+            assert_eq!(page_view(&page), Ok((h, payload)));
+            // It does not look at the CRC, the tag or the padding: those are
+            // the first decode's, and a read of a verified page must not pay
+            // for them again. A damaged page's view is the first decode's to
+            // refuse, which is why a page is viewed only once it has passed.
+            let mut damaged = page;
+            damaged[ZPAGE - 1] ^= 0xFF;
+            assert_eq!(parse_page(&damaged, 0xBEEF).err(), Some(ZError::PageCrc));
+            assert_eq!(page_view(&damaged), Ok((h, payload)));
+            // What it does check is what it hands back is bounded: the
+            // header's values, and the page's length.
+            let mut wild = page;
+            wild[P_CLEN..P_CLEN + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+            assert!(matches!(page_view(&wild), Err(ZError::Header(_))));
+            let mut zero_count = page;
+            zero_count[P_COUNT..P_COUNT + 2].copy_from_slice(&0u16.to_le_bytes());
+            assert!(matches!(page_view(&zero_count), Err(ZError::Header(_))));
+            assert_eq!(page_view(&page[..ZPAGE - 1]).err(), Some(ZError::Length));
+            assert_eq!(page_view(&[]).err(), Some(ZError::Length));
+        }
+    }
+
+    #[test]
+    fn a_fence_finds_the_entry_a_key_falls_among_and_none_below_the_first() {
+        let keys: [&[u8]; 5] = [b"b", b"d", b"dd", b"f", b"ff"];
+        let mut f = ZFence::new();
+        for (i, k) in keys.iter().enumerate() {
+            f.push(i as u32 * 10, i as u32, k).unwrap();
+        }
+        assert_eq!(
+            f.entry_of(b""),
+            None,
+            "the empty key sorts below every other"
+        );
+        assert_eq!(f.entry_of(b"a"), None);
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(f.entry_of(k), Some(i), "an entry's own key");
+        }
+        assert_eq!(f.entry_of(b"c"), Some(0));
+        assert_eq!(f.entry_of(b"d\x00"), Some(1));
+        assert_eq!(
+            f.entry_of(b"dc"),
+            Some(1),
+            "a key among an entry's extensions"
+        );
+        assert_eq!(f.entry_of(b"de"), Some(2));
+        assert_eq!(f.entry_of(b"e"), Some(2));
+        assert_eq!(f.entry_of(b"zzzz"), Some(4));
+        // An empty fence key, the first, is at or below every key, the empty
+        // one included, and a long key is compared as the engine compares it.
+        let mut g = ZFence::new();
+        g.push(0, 0, b"").unwrap();
+        g.push(5, 1, &[7u8; 40]).unwrap();
+        assert_eq!(g.entry_of(b""), Some(0));
+        assert_eq!(g.entry_of(&[3u8]), Some(0));
+        assert_eq!(g.entry_of(b"a"), Some(1));
+        assert_eq!(g.entry_of(&[7u8; 40]), Some(1));
+        assert_eq!(g.entry_of(&[7u8; 39]), Some(0));
+        assert_eq!(g.entry_of(&[7u8; 41]), Some(1));
+        assert_eq!(ZFence::new().entry_of(b"k"), None);
+        // The fence's heap: four words an entry, one more for the offsets,
+        // and the keys.
+        assert_eq!(f.heap_bytes(), 4 * (5 + 5 + 6) + 1 + 1 + 2 + 1 + 2);
     }
 
     #[test]

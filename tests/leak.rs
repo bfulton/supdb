@@ -203,26 +203,97 @@ fn a_three_frozen_life(name: &str) {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// One store's life under the second form, forced: a load into partitions,
+/// each given its sidecar, reads and counts from them on the writer and on
+/// a handle's thread (whose buffer for a decoded group goes with the
+/// thread), updates spread over every range and a drain, which merge the
+/// partitions again and take their sidecars with them, and a reopen that
+/// attaches what the merges left. The sidecars are mappings, which the
+/// allocator does not count; what it counts is everything else a sidecar
+/// is: the cell, the fence, the bitmaps, the trailer. The close frees them
+/// with their segments.
+fn a_zpages_life(name: &str) {
+    let d = std::env::temp_dir().join(format!("supdb-next-leak-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let opts = Options {
+        zpages: supdb::ZPages::Always,
+        zpages_min_bytes: 0,
+        // The nocache policy, the form's and the arm's: nothing here scans.
+        scan_block_cache: false,
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(256 << 10),
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let keys = 20_000u32;
+    let key = |k: u32| format!("key-{k:08}").into_bytes();
+    for k in 0..keys {
+        db.append(&key(k), &[7u8; 100]);
+        if k % 2000 == 1999 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.zpages_settle().unwrap();
+    fn read_some(r: &supdb::Reader, keys: u32) {
+        for k in (0..keys).step_by(97) {
+            let key = format!("key-{k:08}").into_bytes();
+            r.read_all(&key, |_| {}).unwrap();
+            r.count(&key).unwrap();
+        }
+    }
+    read_some(&db, keys);
+    let h = db.reader().unwrap();
+    std::thread::spawn(move || read_some(&h, keys))
+        .join()
+        .unwrap();
+    assert!(db.zpage_counts().reads > 0 && db.zpage_counts().sidecars > 1);
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    for round in 1..=3u64 {
+        for _ in 0..1500 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            db.put(&key((x % keys as u64) as u32), &[round as u8; 100]);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.zpages_settle().unwrap();
+        read_some(&db, keys);
+    }
+    drop(db);
+    let db = Db::open(&d, opts).unwrap();
+    assert!(db.zpage_counts().attached > 0);
+    read_some(&db, keys);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 #[test]
 fn a_closed_store_gives_back_what_it_allocated() {
     // The first life allocates what lives for the process -- the test
-    // harness's buffers, lazily built statics -- so the count starts after.
+    // harness's buffers, lazily built statics, the buffer a thread that
+    // reads from a sidecar decodes into -- so the count starts after.
     a_store_life("warm");
     a_handed_life("warm-handed");
     a_three_frozen_life("warm-three");
+    a_zpages_life("warm-zpages");
     let before = LIVE.load(Ordering::SeqCst);
     let lives = 4;
     for i in 0..lives {
         a_store_life(&format!("life-{i}"));
         a_handed_life(&format!("handed-{i}"));
         a_three_frozen_life(&format!("three-{i}"));
+        a_zpages_life(&format!("zpages-{i}"));
     }
     let after = LIVE.load(Ordering::SeqCst);
     let kept = after - before;
     assert!(
         kept < 64 << 10,
         "{} closed stores kept {kept} bytes allocated ({} a store)",
-        3 * lives,
-        kept / (3 * lives)
+        4 * lives,
+        kept / (4 * lives)
     );
 }

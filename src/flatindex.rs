@@ -41,6 +41,11 @@ use crate::index::{Ext, Exts};
 /// "SFIX", little-endian.
 const MAGIC: u32 = 0x5849_4653;
 const VERSION: u32 = 3;
+/// The record format's version, for a derived file that copies records
+/// verbatim (`db::zpages`): its trailer names the version it copied from,
+/// and an engine whose records are laid out otherwise does not attach it.
+/// The one definition; the constant above is its value.
+pub(crate) const REC_VERSION: u32 = VERSION;
 /// Header size, padded so the hash region starts 8-byte aligned.
 ///
 /// Version 1 was 128 and used every slot but the last. Version 2 adds the
