@@ -2975,14 +2975,11 @@ fn a_settle_removes_the_sidecars_and_temp_names_that_nothing_claims() {
 }
 
 #[test]
-#[ignore = "the empty key as the first write of a fresh memtable panics the arena at wave2-base \
-            too; fixed on branch fix-emptykey (e2e1301), which is not merged here"]
 fn the_empty_key_as_the_first_write_of_a_store() {
     // The same case the empty-key test above steers around by writing other
     // keys first: an empty key appended to a fresh memtable asks the arena
-    // for a block of no bytes. Not this form's, and not fixed on this branch;
-    // the test is here for the day the fix is merged, and then it should lose
-    // its `ignore`.
+    // for a block of no bytes, which the arena's first reservation makes
+    // (`tests/db.rs`, an_empty_key_may_be_the_first_write_into_a_memtable).
     let dir = scratch("emptyfirst");
     let mut db = Db::create(&dir, forced(|_| {})).unwrap();
     db.append(b"", b"the empty key");
