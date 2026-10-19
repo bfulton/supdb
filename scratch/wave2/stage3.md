@@ -164,9 +164,9 @@ groups decoded, the no-page runs, and how it ended), `ZFence::entry_at_rank`,
 sidecar cannot serve, the counts `scans`, `scan_groups`, `nopage_scans`
 and `raw_scans` restated as the walks that went raw, the slot two lines
 for them (pinned at 256 bytes). The fuzz takes `ZFUZZ_ZPAGES=1`, the form
-forced in the `z` store of its pair with no size floor; forty seeds with
-the cache off read clean at the commit, and the sweeps of a hundred and
-twenty with the cache off and on are what the piece's gate adds. The tests of the
+forced in the `z` store of its pair with no size floor; a hundred and
+twenty seeds with the cache off and a hundred and twenty with it on read
+clean (`ZFUZZ_CACHE=off` and `all`). The tests of the
 scan's windows run on the writer, a `Latest` handle and a `Snapshot`
 handle, drained and with unsealed keys over the partitions; the walks of a
 scan are counted by the partition they cross. The block cache's walks of a
