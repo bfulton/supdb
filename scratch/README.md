@@ -73,37 +73,40 @@ and what it said, is not recorded anywhere.
 
 **Hunt II: the engine fails a differential fuzz against a model.**
 `tests/fuzz.rs` (merged from `wip-hunt2-base`; brief `hunt2/ctx.txt`). On
-this branch, built in the dev profile and run one process a seed with the
-block cache off (the default draw):
+this branch as consolidated, built in the dev profile and run one process
+a seed with the block cache off (the default draw), seeds 0 to 60 read 53
+passes, six refusals `compaction would write a key outside its fence`
+(seeds 2, 11, 34, 46, 48, 58, after which the segment work has stopped)
+and one raw scan with a value duplicated (seed 36). Seeds 0 to 200 on the
+engine with the first fix read three more: seed 78, the tiling assertion
+killing the segment work's thread, and seeds 99 and 152, the duplicated
+value again. All four classes were traced to their mechanism with the
+probes under `hunt2/probes/` and fixed, each with a test in
+`tests/fences.rs` that fails on the engine before its fix:
 
-| seeds 0..60 | count |
-|---|---|
-| pass | 53 |
-| `compaction would write a key outside its fence` at a commit, settle or close, after which the segment work has stopped (seeds 2, 11, 34, 46, 48, 58) | 6 |
-| a raw scan with a value duplicated (seed 36, big values) | 1 |
-| hang | 0 |
+| shape | mechanism | fix | commit |
+|---|---|---|---|
+| the fence refusal | the first partitioning named its pieces by position among the bounds, and a bound cut to the fence's length from a key sharing sixteen bytes with every key before it cut nothing; a partition rewrite's sub-pieces had the same shape | a slice is named by the bounds that cut it (`cut_by_bounds`), a join only where its cut separates the sides | `b055ca8` |
+| the duplicated value | a promotion closed an emptied partition at its own lower fence, a partition of no width, and the scan's pieces are bracketed by lower fence, so the next range's pieces were walked twice | the first bound stands strictly above the range's lower fence; the tiling check refuses a partition of no width | `d370547` |
+| the tiling assertion | a merge wrote no piece for a fence no input key lay in (an emptied partition a wide piece pulled in), and the partition was an input | an empty partition is written for such a fence | `d370547` |
 
-Seed 2 is in the fuzz's default range of four, fails ten runs of ten, at
-steps 241 to 274 of 725, and fails the same way on the fuzz's own base
-branch (`7024b5d`, before the second form was merged): the defect is the
-engine's and older than this branch. The brief lists two more classes the
-reviewer saw: the tiling assertion in `publish_segs_with` killing the
-maintenance thread with the writer then parked in `land_seal`, and, with
-the cache on, a `copy from the form disagrees with the build from the
-sources` panic. Neither showed in these sixty seeds.
+After the fixes, seeds 0 to 400 with the cache off: 400 pass, no hang.
+The brief's remaining classes are the cache-on ones (`ZFUZZ_CACHE=all`):
+a `copy from the form disagrees with the build from the sources` panic,
+and hunt I's two; see the sweep below.
 
 ## The gate on this branch
 
 `sh scripts/deps.sh` first (`all deps ready`), then the groups one at a
-time:
+time, on the tree with the three fixes (`d370547`):
 
 | group | result |
 |---|---|
 | `build` | green |
 | `lint` | green |
 | `wasm` | green: the module links, 128,266 bytes |
-| `test` | red on `tests/fuzz.rs` alone (`fuzz_range`, seed 2, the fence refusal above; `concurrent_range` passes); every other binary green under `checked`: the library's 292, `db` 197, `zpages` 41, `segwriter` 19, `blob` 13, `ranges` 6, `dict` 4, `leak`, `checksums_off` and the doc test; run with `--no-fail-fast` and `CARGO_BUILD_JOBS=1` |
-| `bench` | green: the suite's build, its 86 tests under `checked`, clippy, rustfmt and the workflow lint |
+| `test` | running when this was committed; the verdict follows in the next commit |
+| `bench` | queued behind `test`; the verdict follows in the next commit |
 
 ## The branches, and what became of each
 
@@ -172,14 +175,11 @@ branch is the owner's call.
 
 ## Where to start
 
-1. Hunt II's fence defect: `ZFUZZ_SEEDS=2 cargo test --profile checked
-   --test fuzz fuzz_range -- --exact --nocapture` fails every run on a
-   store of 4 KiB seals, 1 KiB partitions, `l0_trigger` 4, the upkeep at
-   `Background(2)`, the segment work on a thread, `sync: Always`. A store
-   whose segment work has stopped is the worst thing the engine can ship,
-   and the brief's rules for the fix apply: a regression test that fails
-   deterministically on the unfixed head, the cluster's seeds and a fresh
-   range at a control's rate. Seed 36's duplicated value is the second.
+1. Hunt II, what is left: the cache-on draw. `ZFUZZ_CACHE=all` over a
+   range of seeds, one process a seed under a timeout, and the brief's
+   `copy from the form disagrees with the build from the sources` panic
+   if it shows; a failing seed keeps its stores in `TMPDIR`, and
+   `hunt2/probes/` reads them. The cache-off draw is clean to seed 400.
 2. Hunt I: resume from `hunt/patches/`, `cross.sh` first, since the two
    scratch fixes were prepared and never adjudicated.
 3. The second form: the second sitting of the forced arm's pairing
