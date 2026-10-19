@@ -44,7 +44,15 @@ from the fence (the entry covers one record; one over more is the raw
 form's for every key). The test's keys of 200, 1,000 and 5,000 bytes
 all fit a page compressed, so the records no page holds are a 9,000-byte
 value of random bytes and a 70,000-byte value, over `ZMAX_ULEN`, under
-`inline_bytes` of 128 KiB. 7 to 9 are next.
+`inline_bytes` of 128 KiB. Piece 7 is in: the build inserts every key
+into a `BlockedBloom` as it passes the record, the words go into region
+B with the fence and the parameters into the trailer, the attach holds
+the stored filter to the engine by signature, by size for the key count
+and by every fence key testing present, and the locate asks the filter
+before the fence. The words have one encoding (`BlockedBloom::words`,
+`from_words`), which the layout's pin test hashes. The reversed-filter
+test fails the attach on a fence key; the absent-key decode counts fall
+to the filter's false positives. 8 and 9 are next.
 
 ## The pieces
 

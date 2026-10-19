@@ -4339,22 +4339,6 @@ mod tests {
 
     // ---- a whole sidecar ------------------------------------------------
 
-    /// A filter out of the bytes a sidecar stores it as.
-    fn filter_from(bytes: &[u8]) -> super::super::BlockedBloom {
-        super::super::BlockedBloom {
-            blocks: bytes
-                .chunks_exact(64)
-                .map(|c| {
-                    let mut b = [0u64; 8];
-                    for (w, x) in b.iter_mut().zip(c.chunks_exact(8)) {
-                        *w = u64::from_le_bytes(x.try_into().unwrap());
-                    }
-                    b
-                })
-                .collect(),
-        }
-    }
-
     #[test]
     fn a_whole_sidecar_round_trips_through_its_file() {
         use super::super::{BlockedBloom, BLOOM_BITS_PER_KEY, BLOOM_PROBES, BLOOM_SIG};
@@ -4415,11 +4399,7 @@ mod tests {
         for (k, _) in &recs {
             bloom.insert(k);
         }
-        let filter: Vec<u8> = bloom
-            .blocks
-            .iter()
-            .flat_map(|b| b.iter().flat_map(|w| w.to_le_bytes()))
-            .collect();
+        let filter = bloom.words();
         let (res, f) = fence.encode_resident(&filter).unwrap();
         let t = Trailer {
             n_pages: u64::from(pages),
@@ -4452,7 +4432,7 @@ mod tests {
         let (fence, filter) =
             ZFence::decode_resident(&file[t.res_off as usize..], &t).expect("the resident part");
         assert!(t.filter_matches_engine());
-        let bloom = filter_from(filter);
+        let bloom = BlockedBloom::from_words(filter).expect("whole blocks");
         for (k, _) in &recs {
             assert!(bloom.maybe_contains(k), "the stored filter holds every key");
         }
@@ -4538,12 +4518,7 @@ mod tests {
         for k in &keys {
             assert!(f.maybe_contains(k), "a filter has no false negatives");
         }
-        let words = f
-            .blocks
-            .iter()
-            .flat_map(|b| b.iter().flat_map(|w| w.to_le_bytes()))
-            .collect();
-        (f.blocks.len(), words)
+        (f.blocks.len(), f.words())
     }
 
     #[test]
