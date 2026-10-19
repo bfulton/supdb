@@ -743,9 +743,11 @@ pub struct Supdb {
     /// against `supdb-nocachezpages` prices the warm, which a restart with
     /// cold sidecars pays before its first read.
     zpages_nowarm: bool,
-    /// The builds started as partitions land rather than at the settle
-    /// (`Options::zpages_eager`): `supdb-nocachezpageseager`.
-    zpages_eager: bool,
+    /// Every build left to the settle of the form rather than started as
+    /// its partition lands (`Options::zpages_eager` off):
+    /// `supdb-nocachezpagessettle`, the shape the forced arm's rows were
+    /// first taken with.
+    zpages_settle: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -1137,9 +1139,9 @@ struct Policy {
     /// Its warm after the attach off (`Options::zpages_warm` off):
     /// `supdb-nocachezpagesnowarm`.
     zpages_nowarm: bool,
-    /// Its builds at the landing (`Options::zpages_eager`):
-    /// `supdb-nocachezpageseager`.
-    zpages_eager: bool,
+    /// Its builds left to the settle (`Options::zpages_eager` off):
+    /// `supdb-nocachezpagessettle`.
+    zpages_settle: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -1236,7 +1238,7 @@ impl Default for Policy {
             zpages: false,
             zpages_nodrop: false,
             zpages_nowarm: false,
-            zpages_eager: false,
+            zpages_settle: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -3522,21 +3524,23 @@ impl Supdb {
         )
     }
 
-    /// `supdb-nocachezpages` with each build started as its partition
-    /// lands, on the builder's thread, rather than at the settle
-    /// (`Options::zpages_eager`): the pair against `supdb-nocachezpages`
-    /// differs by that one option and prices the design's start-at-landing
-    /// against the settle the rows were taken with, where the builds are
-    /// the load's closing sync. Chosen by hand, as
-    /// `ab --arms supdb-nocachezpages,supdb-nocachezpageseager`, read by
+    /// `supdb-nocachezpages` with every build left to the settle of the
+    /// form rather than started as its partition lands
+    /// (`Options::zpages_eager` off): the shape the forced arm's first
+    /// sittings were taken with, where the builds are the load's closing
+    /// sync. The pair against `supdb-nocachezpages` differs by that one
+    /// option and priced the start-at-landing in two sittings (the ordered
+    /// load 1.2-1.3x, the shuffled load level), which made it the default.
+    /// Chosen by hand, as
+    /// `ab --arms supdb-nocachezpages,supdb-nocachezpagessettle`, read by
     /// the load's phases.
-    pub fn create_nocache_zpages_eager(path: &Path) -> Res<Supdb> {
+    pub fn create_nocache_zpages_settle(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
                 block_cache: false,
                 zpages: true,
-                zpages_eager: true,
+                zpages_settle: true,
                 ..Policy::default()
             },
         )
@@ -3658,7 +3662,7 @@ impl Supdb {
             zpages,
             zpages_nodrop,
             zpages_nowarm,
-            zpages_eager,
+            zpages_settle,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -3882,7 +3886,11 @@ impl Supdb {
             } else {
                 supdb::Options::default().zpages_warm
             },
-            zpages_eager: zpages_eager || supdb::Options::default().zpages_eager,
+            zpages_eager: if zpages_settle {
+                false
+            } else {
+                supdb::Options::default().zpages_eager
+            },
             forms_pieces_only: piecesonly,
             // Unpinned, the writer must be the one publisher, as it was
             // when the pins were priced: the store refuses the pair.
@@ -4027,7 +4035,7 @@ impl Supdb {
             zpages,
             zpages_nodrop,
             zpages_nowarm,
-            zpages_eager,
+            zpages_settle,
             ord_threads: Default::default(),
         })
     }
@@ -4630,8 +4638,8 @@ impl Engine for Supdb {
                 "supdb-nocachezpagesnodrop"
             } else if self.zpages_nowarm {
                 "supdb-nocachezpagesnowarm"
-            } else if self.zpages_eager {
-                "supdb-nocachezpageseager"
+            } else if self.zpages_settle {
+                "supdb-nocachezpagessettle"
             } else {
                 "supdb-nocachezpages"
             };
@@ -5457,7 +5465,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocachezpages"
         | "supdb-nocachezpagesnodrop"
         | "supdb-nocachezpagesnowarm"
-        | "supdb-nocachezpageseager"
+        | "supdb-nocachezpagessettle"
         | "supdb-cache256"
         | "supdb-l0"
         | "supdb-nopin"
@@ -5638,7 +5646,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nocachezpages" => Box::new(Supdb::create_nocache_zpages(dir)?),
         "supdb-nocachezpagesnodrop" => Box::new(Supdb::create_nocache_zpages_nodrop(dir)?),
         "supdb-nocachezpagesnowarm" => Box::new(Supdb::create_nocache_zpages_nowarm(dir)?),
-        "supdb-nocachezpageseager" => Box::new(Supdb::create_nocache_zpages_eager(dir)?),
+        "supdb-nocachezpagessettle" => Box::new(Supdb::create_nocache_zpages_settle(dir)?),
         "supdb-cache256" => Box::new(Supdb::create_cache256(dir)?),
         "supdb-ingest" => Box::new(Supdb::create_ingest(dir)?),
         "supdb-ingestleave" => Box::new(Supdb::create_ingest_leave(dir)?),
@@ -6368,14 +6376,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// `supdb-nocachezpagesnowarm` and `supdb-nocachezpageseager` are each
+    /// `supdb-nocachezpagesnowarm` and `supdb-nocachezpagessettle` are each
     /// `supdb-nocachezpages` with one option moved -- the warm of a
-    /// sidecar's file after its attach off, the builds started as their
-    /// partitions land -- and nothing else: named, durable like it, opened
-    /// under their names by the dispatch, on options that differ from the
-    /// arm's in that option alone, and forced like it.
+    /// sidecar's file after its attach off, every build left to the settle
+    /// -- and nothing else: named, durable like it, opened under their
+    /// names by the dispatch, on options that differ from the arm's in that
+    /// option alone, and forced like it.
     #[test]
-    fn the_nowarm_and_eager_arms_differ_from_the_zpages_arm_in_one_option_each() {
+    fn the_nowarm_and_settle_arms_differ_from_the_zpages_arm_in_one_option_each() {
         let root =
             std::env::temp_dir().join(format!("supdb-bench-zpagesarms-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -6387,11 +6395,11 @@ mod tests {
         let base = new("base", Supdb::create_nocache_zpages);
         assert_eq!(base.name(), "supdb-nocachezpages");
         let b = base.db.as_ref().unwrap().options();
-        // The engine's own defaults: the warm on, the eager build off, so an
-        // arm that pins neither has both as the engine ships them.
+        // The engine's own defaults: the warm on, the build at the landing,
+        // so an arm that pins neither has both as the engine ships them.
         assert!(supdb::Options::default().zpages_warm);
-        assert!(!supdb::Options::default().zpages_eager);
-        assert!(b.zpages_warm && !b.zpages_eager);
+        assert!(supdb::Options::default().zpages_eager);
+        assert!(b.zpages_warm && b.zpages_eager);
         for (name, make, arm_dir) in [
             (
                 "supdb-nocachezpagesnowarm",
@@ -6399,9 +6407,9 @@ mod tests {
                 "nowarm",
             ),
             (
-                "supdb-nocachezpageseager",
-                Supdb::create_nocache_zpages_eager,
-                "eager",
+                "supdb-nocachezpagessettle",
+                Supdb::create_nocache_zpages_settle,
+                "settle",
             ),
         ] {
             let arm = new(arm_dir, make);
@@ -6411,7 +6419,7 @@ mod tests {
             assert!(arm.zpages && base.zpages, "both force the form");
             assert!(!arm.zpages_nodrop);
             assert_eq!(arm.zpages_nowarm, arm_dir == "nowarm");
-            assert_eq!(arm.zpages_eager, arm_dir == "eager");
+            assert_eq!(arm.zpages_settle, arm_dir == "settle");
             assert_eq!(arm.partition, base.partition, "the row's shape");
             assert_eq!(arm.drain, base.drain);
             assert_eq!(arm.durable, base.durable);
@@ -6421,7 +6429,11 @@ mod tests {
             assert_eq!(arm.features(), base.features());
             let a = arm.db.as_ref().unwrap().options();
             assert_eq!(a.zpages_warm, arm_dir != "nowarm", "{name}: the one option");
-            assert_eq!(a.zpages_eager, arm_dir == "eager", "{name}: the one option");
+            assert_eq!(
+                a.zpages_eager,
+                arm_dir != "settle",
+                "{name}: the one option"
+            );
             assert!(a.zpages == supdb::ZPages::Always && b.zpages == supdb::ZPages::Always);
             assert_eq!(a.zpages_drop_behind, b.zpages_drop_behind);
             assert_eq!(a.zpages_min_bytes, b.zpages_min_bytes);

@@ -1249,7 +1249,7 @@ fn a_reopened_store_attaches_the_sidecars_it_finds_and_off_leaves_them_alone() {
 #[test]
 fn a_build_that_fails_is_counted_and_the_store_reads_raw() {
     let dir = scratch("failed");
-    let mut db = Db::create(&dir, forced(|_| {})).unwrap();
+    let mut db = Db::create(&dir, forced(|o| o.zpages_eager = false)).unwrap();
     let model = ordered_load(&mut db, 3000, 0xFA11);
     db.fail_next_zpage_build();
     // Not an error for the store.
@@ -2193,8 +2193,12 @@ fn a_merge_takes_the_sidecar_of_the_segment_it_retires() {
     db.flush().unwrap();
     // The merges have landed and the form has not been settled, which is
     // what sweeps: the files that are gone were taken by the landing that
-    // retired their segments, and none is left whose segment is not.
+    // retired their segments, and none is left whose segment is not. A
+    // build the landings started for a partition they then retired is
+    // cancelled by the merge and removes its temp name when it notices,
+    // which is waited for, since nothing else collects it before a settle.
     db.settle().unwrap();
+    builds_collected(&db);
     let gone = built.iter().filter(|f| !f.exists()).count();
     assert!(
         gone > 0,
@@ -2424,9 +2428,12 @@ fn a_store_that_does_not_advise_its_mappings_does_not_advise_its_sidecars() {
             "{advice:?}"
         );
         assert_eq!(advised(&dir, ".zpg"), vec![want; n], "{advice:?}");
-        // And the sidecars of a reopened store.
+        // And the sidecars of a reopened store, once the warms the open
+        // started have finished: a warm maps the file it reads on its own,
+        // and that mapping, sequential by nature, is not a sidecar's.
         db.close().unwrap();
-        let db = Db::open(&dir, forced(|o| o.read_advice = advice)).unwrap();
+        let mut db = Db::open(&dir, forced(|o| o.read_advice = advice)).unwrap();
+        db.zpages_settle().unwrap();
         check(&db, &model, &keys, "reopened");
         assert_eq!(advised(&dir, ".zpg"), vec![want; n], "{advice:?}, reopened");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2683,9 +2690,17 @@ fn a_scan_is_counted_raw_where_it_began_in_a_partition_with_a_sidecar_and_nowher
     // The first partition has none: its scans are none of the form's to
     // count, and a scan that begins at the first key of the partition after
     // it -- which is the first partition's fence -- begins in a partition
-    // with a sidecar.
+    // with a sidecar. The builds are left to the settle, whose first build
+    // is the first partition's and the one made to fail.
     let dir = scratch("rawscans");
-    let mut db = Db::create(&dir, forced(|o| o.partition_bytes = Some(160 << 10))).unwrap();
+    let mut db = Db::create(
+        &dir,
+        forced(|o| {
+            o.partition_bytes = Some(160 << 10);
+            o.zpages_eager = false;
+        }),
+    )
+    .unwrap();
     let model = ordered_load(&mut db, 6000, 0xAB3);
     db.fail_next_zpage_build();
     db.zpages_settle().unwrap();
@@ -2841,6 +2856,26 @@ fn the_empty_key_is_read_through_a_sidecar_as_any_other() {
 /// the first of them held where `hold` says -- before its first write or
 /// before its rename -- so that the test can land what it likes with that
 /// build in flight.
+/// Every build the landings started has been collected: finished and
+/// attached, cancelled, failed or orphaned. A build in flight when a merge
+/// lands is cancelled at its next look and collected at the segment work's
+/// next turn, and a test that reads the directory before any settle waits
+/// for that.
+fn builds_collected(db: &Db) {
+    let t = std::time::Instant::now();
+    loop {
+        let c = db.zpage_counts();
+        if c.build_starts == c.builds + c.build_cancelled + c.build_failed + c.build_orphaned {
+            return;
+        }
+        assert!(
+            t.elapsed().as_secs() < 30,
+            "a build in flight was not collected: {c:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
 fn store_without_sidecars(
     name: &str,
     n: usize,
@@ -3254,11 +3289,20 @@ fn a_retired_sidecar_outlives_its_last_reader_and_no_longer() {
 /// A build that fails is tried again after a backoff and not written off
 /// for the segment's life: a disk that was full, a transient error. The
 /// backoff is an option so that a test can make it zero; its default is a
-/// minute, doubling to an hour.
+/// minute, doubling to an hour. The builds are left to the settle here,
+/// so that the failure is the settle's first build and the retry its next
+/// round's.
 #[test]
 fn a_failed_build_is_tried_again_after_its_backoff() {
     let dir = scratch("retry");
-    let mut db = Db::create(&dir, forced(|o| o.zpages_retry_ms = 0)).unwrap();
+    let mut db = Db::create(
+        &dir,
+        forced(|o| {
+            o.zpages_retry_ms = 0;
+            o.zpages_eager = false;
+        }),
+    )
+    .unwrap();
     let model = ordered_load(&mut db, 3000, 0x2E72);
     db.fail_next_zpage_build();
     // With no backoff the settle's next round tries again and builds it.
@@ -3277,7 +3321,7 @@ fn a_failed_build_is_tried_again_after_its_backoff() {
     // not try it, and a reopen does, since the backoff is the segment's
     // in this process.
     let dir2 = scratch("retry-waits");
-    let mut db = Db::create(&dir2, forced(|_| {})).unwrap();
+    let mut db = Db::create(&dir2, forced(|o| o.zpages_eager = false)).unwrap();
     let model = ordered_load(&mut db, 3000, 0x2E73);
     db.fail_next_zpage_build();
     db.zpages_settle().unwrap();
@@ -3290,7 +3334,7 @@ fn a_failed_build_is_tried_again_after_its_backoff() {
     );
     assert_eq!(Options::default().zpages_retry_ms, 60_000);
     db.close().unwrap();
-    let mut db = Db::open(&dir2, forced(|_| {})).unwrap();
+    let mut db = Db::open(&dir2, forced(|o| o.zpages_eager = false)).unwrap();
     db.zpages_settle().unwrap();
     let c = db.zpage_counts();
     assert_eq!((c.builds, c.sidecars), (1, 1), "{c:?}");
@@ -3460,7 +3504,10 @@ fn every_crash_window_of_a_sidecar_is_survived_at_open() {
         let work = scratch(&format!("crash-{i}"));
         copy_dir(&dir, &work);
         (case.make)(&work);
-        let mut db = Db::open(&work, forced(|_| {})).unwrap();
+        // The builds left to the settle, so that what the directory holds
+        // after the open is what the open left and not a build's temp name
+        // started a moment after it.
+        let mut db = Db::open(&work, forced(|o| o.zpages_eager = false)).unwrap();
         let c = db.zpage_counts();
         assert_eq!(
             (c.swept, c.attached, c.rejected_damage),

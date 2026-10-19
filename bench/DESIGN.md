@@ -255,10 +255,11 @@ process (`bench ab --arms <base>,<arm>`) and is chosen by hand:
 `supdb-nocachezpages` forces the compact second form for point reads and
 counts (a pass refuses it unless every partition has its sidecar and the
 reads went through the sidecars), and `supdb-nocachezpagesnodrop`,
-`supdb-nocachezpagesnowarm` and `supdb-nocachezpageseager` are that arm
+`supdb-nocachezpagesnowarm` and `supdb-nocachezpagessettle` are that arm
 with one of its builds' options moved: the build's release of the raw
-records off, the warm of a sidecar's file after its attach off, and the
-builds started as their partitions land. The forced arm's
+records off, the warm of a sidecar's file after its attach off, and every
+build left to the settle of the form rather than started as its
+partition lands. The forced arm's
 `sync` builds the sidecars, so its load carries the build, and in memory
 it reads slower than the raw form: it is an arm for the bound, not a
 default.

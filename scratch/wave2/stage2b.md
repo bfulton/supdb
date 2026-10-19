@@ -35,8 +35,9 @@ its backoff, the crash windows of 5.7 built on disk and opened, a build
 in flight cancelled by the merge that takes its target, and a build
 past its last cancel check whose target died leaving a dead name). The
 builds run inside the settle of the form, where the pairing measured
-them; `Options::zpages_eager`, the design's start-at-landing, is an
-option to be priced before it is the default. Piece 6 is in: a record
+them; `Options::zpages_eager`, the design's start-at-landing, was priced
+after the stage's gate and is the default now (`stage3.md`, the sittings
+in `eager-ab-*.out`). Piece 6 is in: a record
 no page holds is a fence entry with no page and the build goes on, a
 partition of nothing else is declined for the last record's reason,
 and a key in such an entry's range that is not the record's is absent

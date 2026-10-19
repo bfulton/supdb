@@ -158,9 +158,17 @@ on every shape of 3.9's table.
 
 ## What 2b's sittings leave open, read before 3's
 
-- The eager build's pairing (`eager-pairing.sh`, two sittings) prices
-  the design's start-at-landing against the settle; its verdict is the
-  load's phases' sum, read by the arm each `loadphases` line names.
+- The eager build's pairing (`eager-pairing.sh`, `eager-ab-1.out` and
+  `-2`, two sittings with the arms swapped) priced the design's
+  start-at-landing against the settle: the ordered load 1.33x and then
+  1.21x for the eager arm, six pairs of six both times; the shuffled load
+  0.995x and 1.015x, level, with 29-33 builds for 25 partitions (the
+  merges' rewrites supersede 4-8) and a third more build bytes for the
+  same files. The phases say why: at three million keys the ordered
+  load's closing sync fell from about 1.6 s to 0.5 s and the commits rose
+  about 0.2 s, the builds running beside them on the idle-class thread.
+  The eager build is the default now and `supdb-nocachezpagessettle` the
+  arm that leaves every build to the settle.
 - The warm cannot be priced by `ab` as it stands: the forced arm's
   `sync` builds a sidecar and the warm after its attach finds it
   resident, so the warm's work is a restart's, and the runner has no
