@@ -871,14 +871,18 @@ impl std::ops::DerefMut for Opened {
 }
 
 /// A copy of `dir` opened under `Always`, after `change` has been applied
-/// to the copy's sidecar file.
+/// to the copy's sidecar file, with the builds left to the settle: what
+/// the open found stands until a settle, where the eager build would
+/// replace a refused sidecar on the segment work's first turn after the
+/// open, racing the reads a test makes of what the open left (four runs
+/// of twelve beside a build).
 fn open_changed(dir: &Path, name: &str, change: impl FnOnce(&Path)) -> Opened {
     let copy = scratch(name);
     copy_dir(dir, &copy);
     let files = sidecar_files(&copy);
     assert_eq!(files.len(), 1);
     change(&files[0]);
-    let db = Db::open(&copy, forced(|_| {})).unwrap();
+    let db = Db::open(&copy, forced(|o| o.zpages_eager = false)).unwrap();
     Opened {
         db,
         _copy: Scrap(copy),
@@ -928,7 +932,7 @@ fn a_flipped_byte_in_a_sidecar_is_never_an_answer() {
     for at in (0..pages * ZPAGE).step_by(997) {
         let p = at / ZPAGE;
         f.write_at(&[good[at] ^ 0x40], at as u64).unwrap();
-        let db = Db::open(&work, forced(|_| {})).unwrap();
+        let db = Db::open(&work, forced(|o| o.zpages_eager = false)).unwrap();
         let probe = keys_of_page(&target, p, &keys);
         // Half the flips are met by a count first and half by a read.
         if (at / 997) % 2 == 1 {
@@ -976,7 +980,7 @@ fn a_flipped_byte_in_a_sidecar_is_never_an_answer() {
     }
     assert!(refused > 3 && fell_back > 20, "{refused} {fell_back}");
     // And the sound file reads from the sidecar again.
-    let db = Db::open(&work, forced(|_| {})).unwrap();
+    let db = Db::open(&work, forced(|o| o.zpages_eager = false)).unwrap();
     check(&db, &model, &keys[..300], "restored");
     let c = db.zpage_counts();
     assert_eq!(
@@ -1051,7 +1055,7 @@ fn a_file_that_is_not_a_sidecar_is_refused_and_the_partition_is_read_raw() {
     let copy = scratch("notside-none");
     copy_dir(&dir, &copy);
     std::fs::remove_file(&sidecar_files(&copy)[0]).unwrap();
-    let db = Db::open(&copy, forced(|_| {})).unwrap();
+    let db = Db::open(&copy, forced(|o| o.zpages_eager = false)).unwrap();
     let c = db.zpage_counts();
     assert_eq!(
         (
@@ -1191,7 +1195,7 @@ fn a_sidecar_under_another_partitions_name_is_refused() {
     db.close().unwrap();
     let files = sidecar_files(&dir);
     std::fs::copy(&files[0], &files[1]).unwrap();
-    let db = Db::open(&dir, forced(|_| {})).unwrap();
+    let db = Db::open(&dir, forced(|o| o.zpages_eager = false)).unwrap();
     let c = db.zpage_counts();
     assert_eq!((c.rejected_identity, c.rejected_damage), (1, 0), "{c:?}");
     assert_eq!(c.sidecars, c.partitions - 1);
@@ -2384,7 +2388,7 @@ fn a_sidecar_is_advised_random_whatever_mode_the_store_was_in_when_it_was_attach
     assert_eq!(advised(&dir, ".zpg"), vec![true; c.sidecars as usize]);
     // A reopened store attaches them advised too, in whichever mode.
     db.close().unwrap();
-    let db = Db::open(&dir, forced(|_| {})).unwrap();
+    let db = Db::open(&dir, forced(|o| o.zpages_eager = false)).unwrap();
     let c = db.zpage_counts();
     assert_eq!(c.attached, c.partitions, "{c:?}");
     assert_eq!(
@@ -2525,7 +2529,7 @@ fn a_refused_file_is_counted_once_however_often_it_is_met() {
     let at = bytes.len() - 100;
     bytes[at] ^= 0xff;
     std::fs::write(&file, bytes).unwrap();
-    let mut db = Db::open(&copy, forced(|_| {})).unwrap();
+    let mut db = Db::open(&copy, forced(|o| o.zpages_eager = false)).unwrap();
     let c = db.zpage_counts();
     assert_eq!((c.rejected_damage, c.sidecars), (1, 0), "{c:?}");
     db.zpages_settle().unwrap();
@@ -2558,9 +2562,13 @@ fn a_refused_file_of_a_partition_the_build_declines_does_not_stay_to_be_met_agai
     let at = bytes.len() - 100;
     bytes[at] ^= 0xff;
     std::fs::write(&file, bytes).unwrap();
-    // The engine's own floor: a partition of this size is left raw.
+    // The engine's own floor: a partition of this size is left raw. The
+    // builds are left to the settle, whose decline is what removes the
+    // refused file; the eager build would remove it a moment after the
+    // open.
     let floor = Options {
         zpages: ZPages::Always,
+        zpages_eager: false,
         scan_block_cache: false,
         ..Options::default()
     };
@@ -3222,7 +3230,7 @@ fn a_retired_sidecar_outlives_its_last_reader_and_no_longer() {
     let (dir, model, keys) = one_partition("retire-pin-src", 4500, 0x9E71);
     let work = scratch("retire-pin-work");
     copy_dir(&dir, &work);
-    let mut db = Db::open(&work, forced(|_| {})).unwrap();
+    let mut db = Db::open(&work, forced(|o| o.zpages_eager = false)).unwrap();
     check(&db, &model, &keys[..50], "before");
     let old = zpg_mappings(&work);
     assert_eq!(old.len(), 1, "one sidecar mapped: {old:?}");
@@ -3894,4 +3902,57 @@ fn an_attached_sidecar_is_warmed_once_per_process_unless_the_warm_is_off() {
         db.close().unwrap();
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Under the eager build a sidecar the open refuses is built again at
+/// once, by the segment work's first turn after the open and no settle:
+/// the refusal is counted, the new file replaces the refused one, and the
+/// reads are served from it once it is attached. The tests of what an
+/// open leaves open their stores with the builds left to the settle for
+/// that reason.
+#[test]
+fn a_refused_sidecar_is_built_again_at_the_open_without_a_settle() {
+    let (dir, model, keys) = one_partition("refused-eager-src", 3000, 0x3A6E);
+    let copy = scratch("refused-eager");
+    copy_dir(&dir, &copy);
+    let file = sidecar_files(&copy).remove(0);
+    let mut bytes = std::fs::read(&file).unwrap();
+    let at = bytes.len() - 100;
+    bytes[at] ^= 0xff;
+    std::fs::write(&file, bytes).unwrap();
+    let db = Db::open(&copy, forced(|_| {})).unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.rejected_damage, c.sidecars),
+        (1, 0),
+        "at the open: {c:?}"
+    );
+    let t = std::time::Instant::now();
+    loop {
+        let c = db.zpage_counts();
+        if c.sidecars == 1 {
+            break;
+        }
+        assert!(
+            c.build_failed == 0 && t.elapsed().as_secs() < 30,
+            "no build after the open: {c:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.rejected_damage, c.builds, c.sidecars, c.attached),
+        (1, 1, 1, 1),
+        "{c:?}"
+    );
+    check(&db, &model, &keys[..200], "served from the new sidecar");
+    assert_eq!(db.zpage_counts().reads, 200);
+    assert_eq!(
+        sidecar_files(&copy).len(),
+        1,
+        "the refused file is replaced"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&copy);
 }
