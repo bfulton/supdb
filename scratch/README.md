@@ -102,8 +102,8 @@ time:
 | `build` | green |
 | `lint` | green |
 | `wasm` | green: the module links, 128,266 bytes |
-| `test` | running when this was committed; the result is in the commit that follows |
-| `bench` | queued behind `test`; the result is in the commit that follows |
+| `test` | red on `tests/fuzz.rs` alone (`fuzz_range`, seed 2, the fence refusal above; `concurrent_range` passes); every other binary green under `checked`: the library's 292, `db` 197, `zpages` 41, `segwriter` 19, `blob` 13, `ranges` 6, `dict` 4, `leak`, `checksums_off` and the doc test; run with `--no-fail-fast` and `CARGO_BUILD_JOBS=1` |
+| `bench` | green: the suite's build, its 86 tests under `checked`, clippy, rustfmt and the workflow lint |
 
 ## The branches, and what became of each
 
