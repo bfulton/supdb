@@ -4770,6 +4770,8 @@ impl Engine for Supdb {
             ("zpage_build_retries", z.build_retries as f64),
             ("zpage_rebuilds", z.rebuilds as f64),
             ("zpage_declined_damage", z.declined_damage as f64),
+            ("zpage_build_starts", z.build_starts as f64),
+            ("zpage_build_cancelled", z.build_cancelled as f64),
             ("zpage_declined_small", z.declined_small as f64),
             ("zpage_declined_small_bytes", z.declined_small_bytes as f64),
             (

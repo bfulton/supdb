@@ -217,7 +217,6 @@ fn the_images_of_partitions_the_engine_wrote_are_the_streamed_records() {
 
 use std::collections::BTreeMap;
 use supdb::db::zpages::{Trailer, ZFence, ZTRAILER};
-use supdb::db::ZRound;
 use supdb::{Reader, ZPages};
 
 /// A key's values, in the order the store hands them.
@@ -2835,7 +2834,16 @@ fn the_empty_key_is_read_through_a_sidecar_as_any_other() {
 
 /// A store of partitions with no sidecar yet, small enough that a rewrite of
 /// every key merges all of them.
-fn store_without_sidecars(name: &str, n: usize, seed: u64) -> (PathBuf, Db, Model) {
+/// A store whose builds start as its partitions land (`zpages_eager`),
+/// the first of them held where `hold` says -- before its first write or
+/// before its rename -- so that the test can land what it likes with that
+/// build in flight.
+fn store_without_sidecars(
+    name: &str,
+    n: usize,
+    seed: u64,
+    hold: fn(&mut Options),
+) -> (PathBuf, Db, Model) {
     let dir = scratch(name);
     let mut db = Db::create(
         &dir,
@@ -2843,12 +2851,25 @@ fn store_without_sidecars(name: &str, n: usize, seed: u64) -> (PathBuf, Db, Mode
             o.partition_bytes = Some(32 << 10);
             o.seal_bytes = 16 << 10;
             o.l0_trigger = 2;
+            o.zpages_eager = true;
+            hold(o);
         }),
     )
     .unwrap();
     let model = ordered_load(&mut db, n, seed);
+    // The first build started at a landing and waits at the hold.
+    let t = std::time::Instant::now();
+    while db.zpage_counts().build_starts == 0 {
+        assert!(
+            t.elapsed().as_secs() < 30,
+            "no build started: {:?}",
+            db.zpage_counts()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
     let c = db.zpage_counts();
     assert!(c.partitions >= 3 && c.sidecars == 0, "{c:?}");
+    assert_eq!(c.build_starts, 1, "one build in flight, held: {c:?}");
     (dir, db, model)
 }
 
@@ -2894,27 +2915,20 @@ fn assert_only_live_sidecars(dir: &Path, db: &Db) {
 }
 
 #[test]
-fn a_partition_a_merge_retires_before_its_build_opens_it_was_outrun_and_did_not_fail() {
-    // `zpages_settle` lists the partitions that lack a sidecar and builds them
-    // one by one. A merge that lands between the two retires some of them, and
-    // their files are gone when the build goes to open them: a build outrun,
-    // which the merge's outputs make good in the next round, and not a build
-    // that failed -- the store is as sound as it was.
-    let (dir, mut db, mut model) = store_without_sidecars("outrun", 4000, 0x0A7);
-    let listed = db.zpage_counts().partitions;
-    let mut rewritten = false;
-    db.zpages_settle_with(&mut |db, at| {
-        if at == ZRound::Listed && !rewritten {
-            rewritten = true;
-            rewrite_every_key(db, &mut model, "outrun");
-        }
-    })
-    .unwrap();
-    assert!(rewritten, "the seam was never called");
+fn a_build_in_flight_when_a_merge_retires_its_target_is_cancelled_and_counted() {
+    // A build held before its first write while a merge takes its target
+    // as an input: the merge's landing sets the build's cancel flag, the
+    // build sees it at its first page and leaves no file, and the merge's
+    // outputs get theirs. Not a build that failed: the store is as sound
+    // as it was.
+    let (dir, mut db, mut model) =
+        store_without_sidecars("cancel", 4000, 0x0A7, |o| o.zpages_hold_build = true);
+    rewrite_every_key(&mut db, &mut model, "cancel");
+    db.hold_zpage_build(false);
+    db.zpages_settle().unwrap();
     let c = db.zpage_counts();
-    assert!(c.build_orphaned >= 2, "{listed} partitions listed: {c:?}");
-    assert_eq!(c.build_failed, 0, "{c:?}");
-    // The next round gave the partitions that replaced them theirs.
+    assert_eq!(c.build_cancelled, 1, "{c:?}");
+    assert_eq!((c.build_failed, c.build_orphaned), (0, 0), "{c:?}");
     assert!(c.partitions >= 3 && c.sidecars == c.partitions, "{c:?}");
     assert_eq!(
         c.builds, c.partitions,
@@ -2922,36 +2936,34 @@ fn a_partition_a_merge_retires_before_its_build_opens_it_was_outrun_and_did_not_
     );
     assert_only_live_sidecars(&dir, &db);
     let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
-    check(&db, &model, &keys, "after the outrun");
+    check(&db, &model, &keys, "after the cancel");
     let after = db.zpage_counts();
     assert_eq!(after.rawserves + after.fallbacks, 0, "{after:?}");
+    db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn a_sidecar_built_for_a_partition_a_merge_then_retires_is_gone_and_counted() {
-    // The other side of the same race: the build is made, and the merge lands
-    // before the round is over. The sidecar belongs to a partition that is not
-    // there, and neither it nor its file outlives the settle.
-    let (dir, mut db, mut model) = store_without_sidecars("outlived", 4000, 0x0A8);
-    let mut rewritten = false;
-    db.zpages_settle_with(&mut |db, at| {
-        if at == ZRound::Built && !rewritten {
-            rewritten = true;
-            let made = db.zpage_counts();
-            assert_eq!(made.sidecars, made.partitions, "{made:?}");
-            rewrite_every_key(db, &mut model, "outlived");
-        }
-    })
-    .unwrap();
-    assert!(rewritten, "the seam was never called");
+fn a_finished_build_whose_target_died_leaves_no_file() {
+    // The other side of the same race: the build is past its last look at
+    // its cancel flag, held before its rename, and the merge lands and
+    // retires its target. The file gets its name, the collect finds the
+    // target gone, and the file is renamed to a dead name and unlinked at
+    // the idle tick: neither it nor its name outlives the settle.
+    let (dir, mut db, mut model) =
+        store_without_sidecars("outlived", 4000, 0x0A8, |o| o.zpages_hold_rename = true);
+    rewrite_every_key(&mut db, &mut model, "outlived");
+    db.hold_zpage_rename(false);
+    db.zpages_settle().unwrap();
     let c = db.zpage_counts();
-    assert!(c.build_orphaned >= 2, "{c:?}");
-    assert_eq!(c.build_failed, 0, "{c:?}");
+    assert_eq!(c.build_orphaned, 1, "{c:?}");
+    assert_eq!((c.build_failed, c.build_cancelled), (0, 0), "{c:?}");
     assert!(c.sidecars == c.partitions && c.partitions >= 3, "{c:?}");
+    assert_eq!(c.builds, c.partitions, "{c:?}");
     assert_only_live_sidecars(&dir, &db);
     let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
     check(&db, &model, &keys, "after the merge");
+    db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 

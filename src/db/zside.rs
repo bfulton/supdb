@@ -742,6 +742,10 @@ pub(super) struct ZEvents {
     pub build_retries: AtomicU64,
     pub rebuilds: AtomicU64,
     pub declined_damage: AtomicU64,
+    /// Builds started on the builder's thread, and builds its cancel flag
+    /// stopped: a merge took the target as an input, or the store closed.
+    pub build_starts: AtomicU64,
+    pub build_cancelled: AtomicU64,
     /// Partitions declined, by reason, and the record bytes of the ones
     /// declined for their size.
     pub declined_small: AtomicU64,
@@ -891,6 +895,8 @@ pub(super) struct Built {
 pub(super) enum Outcome {
     Built(Built),
     Declined(Decline),
+    /// Stopped by its cancel flag; no file left.
+    Cancelled,
 }
 
 /// Where a build's pieces go: in order, whole, one call a piece, at the
@@ -996,7 +1002,7 @@ fn drop_behind(_base: usize, _file: &File, _from: usize, _to: usize) {}
 /// the window are the build's own constants, a plan's fields so that a test
 /// can make them small and cross, with a store it can afford, the
 /// boundaries a real one crosses.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct BuildPlan {
     /// The record bytes below which the partition is declined
     /// (`Options::zpages_min_bytes`).
@@ -1008,6 +1014,14 @@ pub(super) struct BuildPlan {
     pub piece: usize,
     /// The bytes of the raw record region passed between drops.
     pub window: usize,
+    /// A build on a thread of its own looks here once a page: set, the
+    /// build stops, removes its temp file and answers `Outcome::Cancelled`.
+    /// A merge that takes the build's target as an input sets it.
+    pub cancel: Option<std::sync::Arc<AtomicBool>>,
+    /// A test's holds (`Db::hold_zpage_rename`): the build waits before its
+    /// rename while the bit is set, so a test can land what it likes
+    /// between a build's last look at the cancel and its file's name.
+    pub hold: Option<std::sync::Arc<std::sync::atomic::AtomicU8>>,
 }
 
 impl BuildPlan {
@@ -1017,6 +1031,20 @@ impl BuildPlan {
             drop_behind,
             piece: ZWRITE_PIECE,
             window: ZDROP_WINDOW,
+            cancel: None,
+            hold: None,
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Acquire))
+    }
+
+    fn wait_rename(&self) {
+        if let Some(h) = &self.hold {
+            super::zbuild_hold_wait(h, super::ZHOLD_RENAME);
         }
     }
 }
@@ -1070,6 +1098,30 @@ fn build_seen(
     seen: &mut dyn FnMut(usize, usize),
 ) -> Result<Outcome> {
     let file = File::open(seg_path)?;
+    build_file_seen(file, out, id, end_seq, plan, seen)
+}
+
+/// `build` from a segment file already open: what the segment work hands a
+/// build on a thread of its own, opened before the thread starts, so that a
+/// promotion's unlink of the old name between the two does not fail it.
+pub(super) fn build_file(
+    file: File,
+    out: &Path,
+    id: u64,
+    end_seq: u64,
+    plan: &BuildPlan,
+) -> Result<Outcome> {
+    build_file_seen(file, out, id, end_seq, plan, &mut |_, _| {})
+}
+
+fn build_file_seen(
+    file: File,
+    out: &Path,
+    id: u64,
+    end_seq: u64,
+    plan: &BuildPlan,
+    seen: &mut dyn FnMut(usize, usize),
+) -> Result<Outcome> {
     // SAFETY: the contract `MmapBytes::open` takes: a sealed segment is
     // never truncated under a mapping.
     let map = MmapBytes(unsafe { memmap2::Mmap::map(&file)? });
@@ -1108,6 +1160,14 @@ fn build_seen(
     );
     match made {
         Ok(Outcome::Built(b)) => {
+            // The cancel's last look, before the file gets its name; a
+            // build past it renames whatever landed meanwhile, and the
+            // collect finds the target gone and the file an orphan.
+            if plan.cancelled() {
+                let _ = std::fs::remove_file(&tmp);
+                return Ok(Outcome::Cancelled);
+            }
+            plan.wait_rename();
             std::fs::rename(&tmp, out).inspect_err(|_| {
                 let _ = std::fs::remove_file(&tmp);
             })?;
@@ -1162,6 +1222,9 @@ fn write_pages(
         }
     };
     while rank < nkeys {
+        if plan.cancelled() {
+            return Ok(Outcome::Cancelled);
+        }
         let mut page = [0u8; ZPAGE];
         match fill_group(&images, rank, hint, bind, &mut scratch, &mut page) {
             Fill::Page(g) => {
@@ -2558,10 +2621,9 @@ mod tests {
         for (piece, window, drop_behind) in plans {
             let _ = std::fs::remove_file(&fx.out);
             let plan = BuildPlan {
-                floor: 0,
-                drop_behind,
                 piece,
                 window,
+                ..BuildPlan::new(0, drop_behind)
             };
             let mut seen: Vec<(usize, usize)> = Vec::new();
             let r = build_seen(&fx.seg, &fx.out, ID, END, &plan, &mut |a, b| {
