@@ -671,9 +671,11 @@ fn put_buf(b: GroupBuf) {
     ZBUF.with(|c| c.set(Some(b)));
 }
 
-/// The memo's slots, and its cap on the decoded bytes it holds, a handle.
+/// The memo's slots, its cap on the decoded bytes it holds, and the
+/// displaced buffers it keeps for the next decodes, a handle.
 pub(super) const ZMEMO_SLOTS: usize = 1024;
 pub(super) const ZMEMO_BYTES: usize = 8 << 20;
+const ZMEMO_FREE: usize = 4;
 
 /// The memo of decoded groups (3.7): a reader handle's, direct-mapped over
 /// its slots and capped at `cap` bytes of the groups it holds, keyed by the
@@ -699,6 +701,12 @@ struct Memo {
     bytes: usize,
     /// Where the next displacement for the cap begins.
     sweep: usize,
+    /// The buffers of displaced entries no read still holds, for the next
+    /// decodes: a decode into a buffer made for it was an allocation of
+    /// whole pages a miss, and a uniform read set, which misses every
+    /// time, read a tenth slower with the memo than without it for that
+    /// alone (`scratch/wave2/memo-ab-v1-*.out`).
+    free: Vec<GroupBuf>,
     hits: u64,
     misses: u64,
 }
@@ -718,9 +726,26 @@ impl Memo {
             cap,
             bytes: 0,
             sweep: 0,
+            free: Vec::new(),
             hits: 0,
             misses: 0,
         }
+    }
+
+    /// A displaced entry's buffer kept for a later decode, where no read
+    /// still holds its group.
+    fn recycle(&mut self, old: MemoEntry) {
+        self.bytes -= old.len;
+        if self.free.len() < ZMEMO_FREE {
+            if let Ok(buf) = Arc::try_unwrap(old.group) {
+                self.free.push(buf);
+            }
+        }
+    }
+
+    /// A buffer for a decode: a displaced entry's, or a new one.
+    fn take_free(&mut self) -> GroupBuf {
+        self.free.pop().unwrap_or_default()
     }
 
     fn slot(&self, side: u64, page: u32) -> usize {
@@ -755,7 +780,7 @@ impl Memo {
         }
         let i = self.slot(side, page);
         if let Some(old) = self.slots[i].take() {
-            self.bytes -= old.len;
+            self.recycle(old);
         }
         self.slots[i] = Some(MemoEntry {
             side,
@@ -774,7 +799,7 @@ impl Memo {
                 continue;
             }
             if let Some(old) = self.slots[j].take() {
-                self.bytes -= old.len;
+                self.recycle(old);
             }
         }
     }
@@ -808,6 +833,12 @@ impl ZMemo {
 
     fn get(&self, side: u64, page: u32) -> Option<(Arc<GroupBuf>, usize)> {
         self.0.borrow_mut().get(side, page)
+    }
+
+    /// A buffer for a decode the memo will take: a displaced entry's, or
+    /// a new one.
+    fn fresh_buf(&self) -> GroupBuf {
+        self.0.borrow_mut().take_free()
     }
 
     fn put(&self, side: u64, page: u32, group: Arc<GroupBuf>, len: usize) {
@@ -1079,7 +1110,7 @@ impl ZSide {
                     return Some((Opened::Memo(g, n), count, false));
                 }
             }
-            let mut fresh = GroupBuf::new();
+            let mut fresh = memo.fresh_buf();
             let (count, ulen) = {
                 let opened = if was_verified {
                     verified_group(page, &mut fresh)
@@ -3010,10 +3041,29 @@ mod tests {
         let (b, n) = g(10);
         m.put(1, 3, b, n);
         assert_eq!(m.bytes, 10);
-        // A page past the slot count shares a slot with one below it.
+        // A page past the slot count shares a slot with one below it, and
+        // the displaced entry's buffer, which nothing else holds, is kept
+        // for a later decode and handed out once; the sweep above filled
+        // the free list to its cap, so it is emptied first.
+        m.free.clear();
         let (b, n) = g(10);
         m.put(1, 11, b, n);
         assert!(m.get(1, 3).is_none() && m.get(1, 11).is_some());
+        assert_eq!(m.free.len(), 1, "the displaced buffer kept");
+        let _ = m.take_free();
+        assert!(m.free.is_empty());
+        // A group a read still holds is displaced and not recycled.
+        let held = Arc::new(GroupBuf::new());
+        m.put(1, 20, Arc::clone(&held), 10);
+        let before = m.free.len();
+        let (b, n) = g(10);
+        m.put(1, 28, b, n);
+        assert!(
+            m.get(1, 20).is_none() && m.get(1, 28).is_some(),
+            "the same slot"
+        );
+        assert_eq!(m.free.len(), before, "a held group is not recycled");
+        drop(held);
     }
 
     /// Reads through the memo: the first read of each compressed page
