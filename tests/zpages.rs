@@ -19,7 +19,7 @@ use supdb::db::zpages::{
     bind32, decode_group, fill_group, parse_page, verify_page, FenceEntry, Fill, FillScratch,
     GroupBuf, Images, SegImages, ZPAGE,
 };
-use supdb::flatindex::{record_key, stream_record_as, FlatIndex};
+use supdb::flatindex::{record_key, stream_record_as, FlatIndex, Header};
 use supdb::{Blob, Bytes, Db, MmapBytes, Options};
 
 fn scratch(name: &str) -> PathBuf {
@@ -215,6 +215,7 @@ fn the_images_of_partitions_the_engine_wrote_are_the_streamed_records() {
 
 use std::collections::BTreeMap;
 use supdb::db::zpages::{Trailer, ZFence, ZTRAILER};
+use supdb::db::ZRound;
 use supdb::{Reader, ZPages};
 
 /// A key's values, in the order the store hands them.
@@ -384,11 +385,47 @@ fn the_oracle_holds_when_runs_in_blocks_decline_the_partitions() {
     oracle(false);
 }
 
+/// The second form's counters over the life of a test whose store is dropped
+/// and opened again: what each instance counted, added up, since a counter is
+/// an instance's and a failure counted by the one a crash ended is not one the
+/// next instance's counters can show.
+#[derive(Debug, Default)]
+struct Life {
+    reads: u64,
+    counts: u64,
+    /// Reads that went raw because a partition's sidecar was absent or out of
+    /// service.
+    rawserves: u64,
+    /// Everything that is a failure of the form: a fallback, a refused file,
+    /// a failed build, a sidecar out of service, a page that failed its checks.
+    failures: u64,
+}
+
+impl Life {
+    fn add(&mut self, c: &supdb::db::ZCounts) {
+        self.reads += c.reads;
+        self.counts += c.counts;
+        self.rawserves += c.rawserves;
+        self.failures += c.fallbacks
+            + c.rejected_damage
+            + c.rejected_identity
+            + c.build_failed
+            + c.damaged
+            + c.bad_pages;
+    }
+}
+
 fn oracle(inline: bool) {
     // Puts, multi-value keys, deletes, seals, merges, promotions and
     // reopens, on a store under `Always` and a store under `Off`, each
     // checked against the model after every settle: through the writer, and
     // through a handle made for the purpose.
+    //
+    // At the engine's own inline limit the keys of the lowest tenth of the
+    // range collect runs that go to blocks and the rest are rewritten as they
+    // are written, a value at a time, so that the partitions over the low end
+    // are declined and read raw and the ones above them are given sidecars:
+    // a store with both, and merges between them.
     let tag = if inline { "inline" } else { "blocks" };
     let (dz, dr) = (
         scratch(&format!("oracle-z-{tag}")),
@@ -400,35 +437,46 @@ fn oracle(inline: bool) {
     let mut pending: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
     let mut rng = Rng(0x0AC1E);
     let keys = oracle_keys();
-    let (mut z_reads, mut crashes, mut settles) = (0u64, 0, 0);
+    let (mut life, mut crashes, mut settles) = (Life::default(), 0, 0);
     let both = |z: &mut Db, raw: &mut Db, f: &dyn Fn(&mut Db)| {
         f(z);
         f(raw);
     };
     for step in 0..3000u64 {
-        let key = format!("k{:04}", rng.below(ORACLE_KEYS)).into_bytes();
-        match rng.below(20) {
-            0 => {
-                both(&mut z, &mut raw, &|d| d.delete(&key));
-                pending.push((key, None));
-            }
-            1..=3 => {
-                // A key with several values at once, some of them empty.
-                for j in 0..2 + rng.below(4) {
-                    let v = if j == 1 {
-                        Vec::new()
-                    } else {
-                        format!("m{step}.{j}").into_bytes()
-                    };
-                    both(&mut z, &mut raw, &|d| d.append(&key, &v));
-                    pending.push((key.clone(), Some(v)));
+        let ix = rng.below(ORACLE_KEYS);
+        let key = format!("k{ix:04}").into_bytes();
+        let heavy = inline || ix < ORACLE_KEYS / 10;
+        if !heavy {
+            // The key's value replaced: it never collects a run.
+            let v = format!("v{step}").into_bytes();
+            both(&mut z, &mut raw, &|d| d.delete(&key));
+            pending.push((key.clone(), None));
+            both(&mut z, &mut raw, &|d| d.append(&key, &v));
+            pending.push((key, Some(v)));
+        } else {
+            match rng.below(20) {
+                0 => {
+                    both(&mut z, &mut raw, &|d| d.delete(&key));
+                    pending.push((key, None));
                 }
-            }
-            _ => {
-                let pad = rng.below(80);
-                let v = format!("v{step}-{}", "p".repeat(pad)).into_bytes();
-                both(&mut z, &mut raw, &|d| d.append(&key, &v));
-                pending.push((key, Some(v)));
+                1..=3 => {
+                    // A key with several values at once, some of them empty.
+                    for j in 0..2 + rng.below(4) {
+                        let v = if j == 1 {
+                            Vec::new()
+                        } else {
+                            format!("m{step}.{j}").into_bytes()
+                        };
+                        both(&mut z, &mut raw, &|d| d.append(&key, &v));
+                        pending.push((key.clone(), Some(v)));
+                    }
+                }
+                _ => {
+                    let pad = rng.below(80);
+                    let v = format!("v{step}-{}", "p".repeat(pad)).into_bytes();
+                    both(&mut z, &mut raw, &|d| d.append(&key, &v));
+                    pending.push((key, Some(v)));
+                }
             }
         }
         match rng.below(100) {
@@ -446,7 +494,7 @@ fn oracle(inline: bool) {
             }
             13 if step % 5 == 0 => {
                 // A crash: what was not committed vanishes, on both.
-                z_reads += z.zpage_counts().reads;
+                life.add(&z.zpage_counts());
                 drop(z);
                 drop(raw);
                 pending.clear();
@@ -494,15 +542,13 @@ fn oracle(inline: bool) {
     // from sidecars, every partition has one, and the store under `Off`
     // never touched the form.
     let c = z.zpage_counts();
-    z_reads += c.reads;
+    life.add(&c);
     assert!(c.partitions > 2, "the oracle made partitions: {c:?}");
     assert!(crashes > 0 && settles > 8);
-    assert_eq!(
-        c.rejected_damage + c.rejected_identity + c.fallbacks,
-        0,
-        "{c:?}"
-    );
-    assert_eq!(c.damaged + c.bad_pages, 0, "{c:?}");
+    // No instance of the store, the ones a crash ended included, counted a
+    // failure of the form.
+    assert_eq!(life.failures, 0, "{life:?}");
+    assert!(life.reads > 0 && life.counts > 0, "{life:?}");
     if inline {
         assert_eq!(
             c.sidecars, c.partitions,
@@ -510,12 +556,18 @@ fn oracle(inline: bool) {
         );
         assert_eq!(c.declined_block_backed, 0, "{c:?}");
         assert!(c.reads > before.reads && c.counts > before.counts, "{c:?}");
-        assert!(z_reads > 0);
+        // Reads made after a reopen and before the settle that follows it are
+        // served raw where a partition has no sidecar yet; the reads at the
+        // end, after the last settle, are not.
+        assert_eq!(c.rawserves, before.rawserves, "{c:?}");
     } else {
         // Runs in blocks decline their partitions, and those are read raw
-        // and counted; what a sidecar was built for answers from it.
+        // and counted; the partitions above them have sidecars, and answer
+        // from them.
         assert!(c.declined_block_backed > 0, "{c:?}");
-        assert!(c.rawserves > 0 && c.sidecars <= c.partitions, "{c:?}");
+        assert!(c.rawserves > 0 && life.rawserves > 0, "{c:?}");
+        assert!(c.sidecars > 0 && c.sidecars < c.partitions, "{c:?}");
+        assert!(c.reads > before.reads && c.counts > before.counts, "{c:?}");
     }
     // The partitions are counted whichever form the store is in; nothing
     // else is, under `Off`.
@@ -783,15 +835,49 @@ fn a_direct_runs_segment_with_markers_inside_its_records_has_a_sidecar() {
 
 // ---- a sidecar that is damaged, or is another's ----------------------------------
 
+/// A directory removed when it is dropped.
+struct Scrap(PathBuf);
+
+impl Drop for Scrap {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A store opened over a copy of another's directory, which goes when the
+/// store does and not before.
+struct Opened {
+    db: Db,
+    /// Declared after the store, so that it is closed before its files go.
+    _copy: Scrap,
+}
+
+impl std::ops::Deref for Opened {
+    type Target = Db;
+    fn deref(&self) -> &Db {
+        &self.db
+    }
+}
+
+impl std::ops::DerefMut for Opened {
+    fn deref_mut(&mut self) -> &mut Db {
+        &mut self.db
+    }
+}
+
 /// A copy of `dir` opened under `Always`, after `change` has been applied
 /// to the copy's sidecar file.
-fn open_changed(dir: &Path, name: &str, change: impl FnOnce(&Path)) -> Db {
+fn open_changed(dir: &Path, name: &str, change: impl FnOnce(&Path)) -> Opened {
     let copy = scratch(name);
     copy_dir(dir, &copy);
     let files = sidecar_files(&copy);
     assert_eq!(files.len(), 1);
     change(&files[0]);
-    Db::open(&copy, forced(|_| {})).unwrap()
+    let db = Db::open(&copy, forced(|_| {})).unwrap();
+    Opened {
+        db,
+        _copy: Scrap(copy),
+    }
 }
 
 /// The keys of a one-partition store that a sidecar's page `p` holds, and a
@@ -971,6 +1057,8 @@ fn a_file_that_is_not_a_sidecar_is_refused_and_the_partition_is_read_raw() {
         ),
         (0, 0, 0, 0)
     );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&copy);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1273,8 +1361,10 @@ fn the_form_is_refused_beside_an_unpinned_writer_and_off_is_not() {
         Err(e) => e,
     };
     assert!(e.to_string().contains("writer_pins"), "{e}");
+    let _ = std::fs::remove_dir_all(&dir);
     let dir = scratch("refused-off");
     assert!(Db::create(&dir, unpinned(ZPages::Off)).is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
     // Pinned, with the segment work on a thread or inline, it opens.
     for background in [true, false] {
         let dir = scratch(&format!("refused-pinned-{background}"));
@@ -1284,6 +1374,7 @@ fn the_form_is_refused_beside_an_unpinned_writer_and_off_is_not() {
             ..Options::default()
         };
         assert!(Db::create(&dir, opts).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -1307,6 +1398,8 @@ fn the_default_is_off_and_an_off_store_makes_nothing() {
     );
     assert!(sidecar_files(&dir).is_empty());
     assert!(db.zpage_sidecars().is_empty());
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---- what stays raw, and what is shared ---------------------------------------
@@ -1414,6 +1507,7 @@ fn a_promotion_that_closes_a_fence_keeps_the_sidecar_of_the_partition_it_renames
     want.sort();
     assert_eq!(on_disk, want, "no sidecar lost to a rename, none left over");
     let keys: Vec<Vec<u8>> = model.keys().step_by(7).cloned().collect();
+    let before = db.zpage_counts();
     check(&db, &model, &keys, "after the promotion");
     let c = db.zpage_counts();
     assert_eq!(
@@ -1426,12 +1520,26 @@ fn a_promotion_that_closes_a_fence_keeps_the_sidecar_of_the_partition_it_renames
         (0, 0, 0, 0),
         "{c:?}"
     );
+    // And the reads were answered by the sidecars the promotion kept: a store
+    // that read every key raw would pass every check above.
+    let n = keys.len() as u64;
+    assert_eq!(
+        (c.reads - before.reads, c.counts - before.counts),
+        (n, n),
+        "{c:?}"
+    );
     // Reopened, every partition attaches the file it has.
     db.close().unwrap();
     let db = Db::open(&dir, forced(|_| {})).unwrap();
     let c = db.zpage_counts();
     assert_eq!((c.attached, c.rejected_damage), (c.partitions, 0), "{c:?}");
     check(&db, &model, &keys, "reopened");
+    let after = db.zpage_counts();
+    assert_eq!(
+        (after.reads, after.counts, after.rawserves),
+        (n, n, 0),
+        "{after:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1480,6 +1588,146 @@ fn evict(path: &Path) {
     unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
 }
 
+/// The page-table entries of every read-only shared mapping this process has
+/// of `path` dropped, so that the cache is free to drop the pages behind
+/// them: `posix_fadvise(DONTNEED)` leaves a page that is still mapped, and the
+/// store holds its segment mapped for as long as it is live.
+#[cfg(target_os = "linux")]
+fn unmap_pages(path: &Path) {
+    let real = std::fs::canonicalize(path).unwrap();
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+    let mut zapped = 0;
+    for line in maps.lines() {
+        let mut f = line.split_whitespace();
+        let (range, perms) = (f.next().unwrap_or(""), f.next().unwrap_or(""));
+        if perms != "r--s" || line.split_whitespace().nth(5).map(Path::new) != Some(real.as_path())
+        {
+            continue;
+        }
+        let (a, b) = range.split_once('-').unwrap();
+        let (a, b) = (
+            usize::from_str_radix(a, 16).unwrap(),
+            usize::from_str_radix(b, 16).unwrap(),
+        );
+        // SAFETY: a read-only shared mapping of a file: the call drops this
+        // process's page-table entries for it and nothing else, and the next
+        // touch faults the page back in from the cache.
+        let r = unsafe { libc::madvise(a as *mut libc::c_void, b - a, libc::MADV_DONTNEED) };
+        assert_eq!(r, 0, "madvise: {}", std::io::Error::last_os_error());
+        zapped += 1;
+    }
+    assert!(zapped > 0, "no mapping of {} to zap", real.display());
+}
+
+/// The one partition file of a store's directory.
+#[cfg(target_os = "linux")]
+fn partition_file(dir: &Path) -> PathBuf {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            let n = p.file_name().unwrap().to_string_lossy().into_owned();
+            n.starts_with("par-") && n.ends_with(".sup")
+        })
+        .expect("the partition's file")
+}
+
+/// Where three regions of a partition file lie in it, each as an offset and a
+/// length: the records, their directory, and the hash table every raw read
+/// touches.
+#[cfg(target_os = "linux")]
+struct Regions {
+    rec: (usize, usize),
+    dir: (usize, usize),
+    hash: (usize, usize),
+}
+
+/// The regions of the partition file at `seg`, from the segment as the layout
+/// reads it. Opened without verifying: a verifying open reads every page of
+/// the key section, and a caller that measures what is cached wants the file
+/// as it left it.
+#[cfg(target_os = "linux")]
+fn regions_of(seg: &Path) -> Regions {
+    let src = MmapBytes::open(seg).unwrap();
+    let blob = Blob::open_with(
+        MmapBytes::open(seg).unwrap(),
+        supdb::BlobOptions {
+            verify_checksums: false,
+            verify_index: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let off = blob.index_offset();
+    let sec = src.slice_at(off, (src.len() - off) as usize).unwrap();
+    let idx = FlatIndex::parse(sec).expect("a flat index");
+    let (recs, dir) = idx.regions(sec).unwrap();
+    let at = |s: &[u8]| {
+        (
+            off as usize + (s.as_ptr() as usize - sec.as_ptr() as usize),
+            s.len(),
+        )
+    };
+    let h = Header::parse(sec).expect("a flat index header");
+    Regions {
+        rec: at(recs),
+        dir: at(dir),
+        // Eight bytes a slot.
+        hash: (off as usize + h.hash_off, h.hash_cap * 8),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_build_drops_the_raw_records_it_passed_when_asked_to_and_not_otherwise() {
+    // The build reads a partition's records once, through a mapping of its
+    // own, to copy them into pages; a store that does not fit wants them out
+    // of the cache behind it, since they are the pages the sidecar is there to
+    // keep out. `Options::zpages_drop_behind` is that, and its off position is
+    // the shape the drop is priced against: both are held to what they say,
+    // by what the cache holds of the records after a settle.
+    assert!(
+        Options::default().zpages_drop_behind && forced(|_| {}).zpages_drop_behind,
+        "a build drops unless it is told not to"
+    );
+    for drop_behind in [true, false] {
+        let dir = scratch(&format!("dropbehind-{drop_behind}"));
+        let mut db = Db::create(&dir, forced(|o| o.zpages_drop_behind = drop_behind)).unwrap();
+        let model = ordered_load(&mut db, 8000, 0xD20);
+        let seg = partition_file(&dir);
+        let r = regions_of(&seg);
+        let pages = r.rec.1.div_ceil(4096);
+        assert!(pages > 150, "{pages} pages of records");
+        // Fresh from its load the segment is in the cache, whole and clean:
+        // the probe has something to see dropped.
+        let loaded = cached_pages(&seg, r.rec.0, r.rec.1);
+        assert!(
+            loaded * 4 > pages * 3,
+            "the records are not in the cache to begin with ({loaded} of {pages} pages): \
+             the probe cannot tell"
+        );
+        db.zpages_settle().unwrap();
+        assert_eq!(db.zpage_counts().sidecars, 1);
+        let kept = cached_pages(&seg, r.rec.0, r.rec.1);
+        if drop_behind {
+            assert!(
+                kept * 4 < pages,
+                "the build left {kept} of {pages} pages of the records in the cache"
+            );
+        } else {
+            assert!(
+                kept * 4 > pages * 3,
+                "a build asked not to drop dropped: {kept} of {pages} pages are left"
+            );
+        }
+        // Either way the sidecar answers as the model does.
+        let keys: Vec<Vec<u8>> = model.keys().step_by(13).cloned().collect();
+        check(&db, &model, &keys, "after the build");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn a_point_read_from_the_sidecar_touches_no_page_of_the_raw_records() {
@@ -1505,37 +1753,15 @@ fn a_point_read_from_the_sidecar_touches_no_page_of_the_raw_records() {
         model: Model,
         rec: (usize, usize),
         dir: (usize, usize),
+        hash: (usize, usize),
     }
     let build = |name: &str, opts: Options| {
         let dir = scratch(name);
         let mut db = Db::create(&dir, opts).unwrap();
         let model = ordered_load(&mut db, 8000, 0xC01D);
         db.zpages_settle().unwrap();
-        let seg = std::fs::read_dir(&dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.path())
-            .find(|p| {
-                let n = p.file_name().unwrap().to_string_lossy().into_owned();
-                n.starts_with("par-") && n.ends_with(".sup")
-            })
-            .expect("the partition's file");
-        // Where the records and the directory lie in the file, from the
-        // segment as the layout reads it.
-        let src = MmapBytes::open(&seg).unwrap();
-        let blob = Blob::open(MmapBytes::open(&seg).unwrap()).unwrap();
-        let off = blob.index_offset();
-        let sec = src.slice_at(off, (src.len() - off) as usize).unwrap();
-        let idx = FlatIndex::parse(sec).expect("a flat index");
-        let (recs, d) = idx.regions(sec).unwrap();
-        let at = |s: &[u8]| {
-            (
-                off as usize + (s.as_ptr() as usize - sec.as_ptr() as usize),
-                s.len(),
-            )
-        };
-        let (rec, dir) = (at(recs), at(d));
-        drop((blob, src));
+        let seg = partition_file(&dir);
+        let Regions { rec, dir, hash } = regions_of(&seg);
         let keys = model.keys().cloned().collect();
         Store {
             db,
@@ -1544,12 +1770,14 @@ fn a_point_read_from_the_sidecar_touches_no_page_of_the_raw_records() {
             model,
             rec,
             dir,
+            hash,
         }
     };
     let cached = |s: &Store| {
         (
             cached_pages(&s.seg, s.rec.0, s.rec.1),
             cached_pages(&s.seg, s.dir.0, s.dir.1),
+            cached_pages(&s.seg, s.hash.0, s.hash.1),
         )
     };
     // The reads: present keys, read and counted, and some that are not there.
@@ -1566,31 +1794,39 @@ fn a_point_read_from_the_sidecar_touches_no_page_of_the_raw_records() {
     let sidecar = build("cold-z", forced(|_| {}));
     let raw = build("cold-raw", Options::default());
     let region_pages = sidecar.rec.1.div_ceil(4096);
+    let hash_pages = sidecar.hash.1.div_ceil(4096);
     assert!(region_pages > 150, "{region_pages} pages of records");
+    assert!(hash_pages >= 16, "{hash_pages} pages of hash");
     for s in [&sidecar, &raw] {
+        unmap_pages(&s.seg);
         evict(&s.seg);
         let cold = cached(s);
         assert!(
-            cold.0 * 4 < region_pages,
-            "the records were not dropped from the cache ({} of {region_pages} pages cached): \
-             the probe cannot tell",
-            cold.0
+            cold.0 * 4 < region_pages && cold.2 * 4 < hash_pages,
+            "the records or the hash were not dropped from the cache ({} of {region_pages} \
+             pages of records, {} of {hash_pages} of hash cached): the probe cannot tell",
+            cold.0,
+            cold.2
         );
     }
 
-    // The sidecar's reads.
+    // The sidecar's reads. Not equal to what was there before but no more
+    // than it: a clean mapped page is the cache's to reclaim at any time, and
+    // a reclaim between the two samples is not a read.
     let cold = cached(&sidecar);
     reads(&sidecar);
     let c = sidecar.db.zpage_counts();
     assert_eq!((c.rawserves, c.fallbacks), (0, 0), "{c:?}");
     assert!(c.reads + c.counts >= 2 * 8000 / 13, "{c:?}");
-    assert_eq!(
-        cached(&sidecar),
-        cold,
-        "pages of the raw records or directory were read to answer from the sidecar"
+    let warm = cached(&sidecar);
+    assert!(
+        warm.0 <= cold.0 && warm.1 <= cold.1 && warm.2 <= cold.2,
+        "pages of the raw records, directory or hash were read to answer from the sidecar: \
+         (records, directory, hash) cached {cold:?} before, {warm:?} after"
     );
 
-    // The control: the raw form, the same reads.
+    // The control: the raw form, the same reads, which touch the hash slot
+    // of every key and the record of every key that is there.
     let cold = cached(&raw);
     reads(&raw);
     let after = cached(&raw);
@@ -1599,6 +1835,11 @@ fn a_point_read_from_the_sidecar_touches_no_page_of_the_raw_records() {
         after.0 > cold.0 + region_pages / 2,
         "the raw reads cached {} of {region_pages} record pages: the probe does not see them",
         after.0 - cold.0
+    );
+    assert!(
+        after.2 > cold.2 + hash_pages / 2,
+        "the raw reads cached {} of {hash_pages} hash pages: the probe does not see them",
+        after.2 - cold.2
     );
     for d in [&sidecar, &raw] {
         let _ = std::fs::remove_dir_all(d.seg.parent().unwrap());
@@ -1935,6 +2176,7 @@ fn a_merge_takes_the_sidecar_of_the_segment_it_retires() {
         first.sidecars >= 3 && first.sidecars == first.partitions,
         "{first:?}"
     );
+    let built = sidecar_files(&dir);
     let mut rng = Rng(0xAE71);
     let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
     for round in 0..40 {
@@ -1947,6 +2189,29 @@ fn a_merge_takes_the_sidecar_of_the_segment_it_retires() {
         db.commit().unwrap();
     }
     db.flush().unwrap();
+    // The merges have landed and the form has not been settled, which is
+    // what sweeps: the files that are gone were taken by the landing that
+    // retired their segments, and none is left whose segment is not.
+    db.settle().unwrap();
+    let gone = built.iter().filter(|f| !f.exists()).count();
+    assert!(
+        gone > 0,
+        "a merge retired a partition and its sidecar stayed: {built:?}"
+    );
+    let segments: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".sup"))
+        .map(|n| zpg_of(&n))
+        .collect();
+    for f in sidecar_files(&dir) {
+        let name = f.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            segments.contains(&name),
+            "{name} outlived its segment, before any settle of the form"
+        );
+    }
     db.zpages_settle().unwrap();
     let c = db.zpage_counts();
     assert!(
@@ -1972,6 +2237,757 @@ fn a_merge_takes_the_sidecar_of_the_segment_it_retires() {
     on_disk.sort();
     assert_eq!(on_disk, want, "no sidecar outlives its segment: {c:?}");
     assert_eq!(live.len() as u64, c.sidecars);
+    let before = db.zpage_counts();
     check(&db, &model, &keys, "after the merges");
+    // The reads were answered by the new partitions' sidecars; a store whose
+    // merges left every read raw would keep the files and fail only this.
+    let after = db.zpage_counts();
+    let n = keys.len() as u64;
+    assert_eq!(
+        (after.reads - before.reads, after.counts - before.counts),
+        (n, n),
+        "{after:?}"
+    );
+    assert_eq!(after.rawserves + after.fallbacks, 0, "{after:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- advice, sweeping, and the counters the pairing is read by ---------------------
+
+/// Whether each live mapping of this process whose path contains `needle` is
+/// advised `MADV_RANDOM`, as the kernel says it (`rr` in `VmFlags`): the
+/// mapping is the only thing that can be asked, and a store's own record of
+/// what it last asked of it is a claim the kernel does not have to share. A
+/// mapping of a file that was unlinked (`(deleted)`) is a retired segment's,
+/// held until the last reader that could have it leaves, and is nobody's to
+/// advise any more.
+#[cfg(target_os = "linux")]
+fn mappings_advised_random(needle: &str) -> Vec<(String, bool)> {
+    let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+    let mut out = Vec::new();
+    let mut path: Option<String> = None;
+    for line in smaps.lines() {
+        let first = line.split_whitespace().next().unwrap_or("");
+        if let Some(flags) = line.strip_prefix("VmFlags:") {
+            if let Some(p) = path.take() {
+                out.push((p, flags.split_whitespace().any(|f| f == "rr")));
+            }
+        } else if first.contains('-') && first.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-') {
+            // A mapping's first line: range, permissions, offset, device,
+            // inode and the path, if it has one.
+            let mut f = line.split_whitespace().skip(5);
+            let deleted = line.ends_with("(deleted)");
+            path = f
+                .next()
+                .filter(|p| p.contains(needle) && !deleted)
+                .map(str::to_string);
+        }
+    }
+    out
+}
+
+/// The live mappings under `dir` whose names end in `suffix`, each as the
+/// kernel has it advised.
+#[cfg(target_os = "linux")]
+fn advised(dir: &Path, suffix: &str) -> Vec<bool> {
+    mappings_advised_random(&dir.to_string_lossy())
+        .into_iter()
+        .filter(|(p, _)| p.ends_with(suffix))
+        .map(|(_, rr)| rr)
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_sidecar_is_advised_random_whatever_mode_the_store_was_in_when_it_was_attached() {
+    // Under the default advice the store's mappings are random after a point
+    // read and normal after a scan. A sidecar is read by point reads and
+    // counts alone -- the scans of a covered partition are walked raw -- so
+    // it is advised random at attach and left there, as the ordered
+    // companion is; advised as the store found it, a sidecar made after a
+    // scan sat on the kernel's default readahead for as long as it lived,
+    // and a read of it took a window of pages for the one it asks, which is
+    // what the form is for not doing.
+    let dir = scratch("advice");
+    let mut db = Db::create(&dir, forced(|o| o.partition_bytes = Some(160 << 10))).unwrap();
+    let mut model = ordered_load(&mut db, 6000, 0xAD71);
+    db.zpages_settle().unwrap();
+    let first = db.zpage_counts().sidecars;
+    assert!(first >= 3);
+    // Attached in the mode the store starts in.
+    assert!(db.advice_random());
+    assert_eq!(advised(&dir, ".zpg"), vec![true; first as usize]);
+    assert_eq!(db.zpages_advised(), (first as usize, first as usize));
+    // A scan leaves the store normal, and its segments with it; the sidecars
+    // are not scanned.
+    check_scan(&db, &model, "before");
+    assert!(
+        !db.advice_random(),
+        "a scan leaves the store in normal mode"
+    );
+    assert!(advised(&dir, ".sup").iter().all(|r| !r));
+    assert_eq!(advised(&dir, ".zpg"), vec![true; first as usize]);
+    // Keys above everything stored make partitions of their own, whose
+    // sidecars are attached while the store is normal.
+    let mut rng = Rng(0xAD72);
+    for chunk in (6000..9000usize).collect::<Vec<_>>().chunks(300) {
+        for &i in chunk {
+            let (k, v) = (spaced_key(i), suite_value(&mut rng));
+            db.append(&k, &v);
+            model.insert(k, vec![v]);
+        }
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert!(c.sidecars > first && c.sidecars == c.partitions, "{c:?}");
+    assert!(!db.advice_random(), "nothing read since the scan");
+    assert!(advised(&dir, ".sup").iter().all(|r| !r), "the segments");
+    let z = advised(&dir, ".zpg");
+    assert_eq!(z.len() as u64, c.sidecars, "every sidecar is mapped");
+    assert!(
+        z.iter().all(|&r| r),
+        "the sidecars attached in normal mode: {z:?}"
+    );
+    assert_eq!(
+        db.zpages_advised(),
+        (c.sidecars as usize, c.sidecars as usize)
+    );
+    // The first point read puts the store back to random, every segment with
+    // it, and the sidecars are as they were.
+    let keys: Vec<Vec<u8>> = model.keys().step_by(11).cloned().collect();
+    check(&db, &model, &keys, "after");
+    assert!(db.advice_random());
+    assert!(advised(&dir, ".sup").iter().all(|&r| r), "the segments");
+    assert_eq!(advised(&dir, ".zpg"), vec![true; c.sidecars as usize]);
+    // And a scan again.
+    check_scan(&db, &model, "after");
+    assert!(!db.advice_random());
+    assert!(advised(&dir, ".sup").iter().all(|r| !r), "the segments");
+    assert_eq!(advised(&dir, ".zpg"), vec![true; c.sidecars as usize]);
+    // A reopened store attaches them advised too, in whichever mode.
+    db.close().unwrap();
+    let db = Db::open(&dir, forced(|_| {})).unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(c.attached, c.partitions, "{c:?}");
+    assert_eq!(
+        db.zpages_advised(),
+        (c.sidecars as usize, c.sidecars as usize)
+    );
+    assert_eq!(advised(&dir, ".zpg"), vec![true; c.sidecars as usize]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_store_that_does_not_advise_its_mappings_does_not_advise_its_sidecars() {
+    // `ReadAdvice::Normal` is the kernel's own readahead for every access,
+    // and a store that asked for it gets it for the sidecars as for the
+    // segments; `Random` advises both and never moves.
+    for (advice, want) in [
+        (supdb::ReadAdvice::Normal, false),
+        (supdb::ReadAdvice::Random, true),
+        (supdb::ReadAdvice::Prefetch, true),
+    ] {
+        let dir = scratch(&format!("advice-{advice:?}"));
+        let mut db = Db::create(
+            &dir,
+            forced(|o| {
+                o.partition_bytes = Some(160 << 10);
+                o.read_advice = advice;
+            }),
+        )
+        .unwrap();
+        let model = ordered_load(&mut db, 4000, 0xAD73);
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert!(c.sidecars >= 2 && c.sidecars == c.partitions, "{c:?}");
+        let n = c.sidecars as usize;
+        let keys: Vec<Vec<u8>> = model.keys().step_by(31).cloned().collect();
+        check(&db, &model, &keys, "reads");
+        assert_eq!(
+            db.zpages_advised(),
+            (if want { n } else { 0 }, n),
+            "{advice:?}"
+        );
+        assert_eq!(advised(&dir, ".zpg"), vec![want; n], "{advice:?}");
+        // And the sidecars of a reopened store.
+        db.close().unwrap();
+        let db = Db::open(&dir, forced(|o| o.read_advice = advice)).unwrap();
+        check(&db, &model, &keys, "reopened");
+        assert_eq!(advised(&dir, ".zpg"), vec![want; n], "{advice:?}, reopened");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn a_stale_temp_name_and_a_sidecar_no_segment_claims_are_swept_at_open() {
+    // A build a crash cut off leaves its temp name, and a merge that retired
+    // a segment between its manifest and its unlink leaves the sidecar of a
+    // segment that is not there: derived files nothing else removes, which
+    // `bytes_on_disk` counts for as long as they stay. The sidecar of a live
+    // segment stays, under either setting of the option.
+    let (dir, model, keys) = one_partition("sweep-src", 3000, 0x5EE9);
+    let live = sidecar_files(&dir).remove(0);
+    let name = live.file_name().unwrap().to_string_lossy().into_owned();
+    let good = std::fs::read(&live).unwrap();
+    for (setting, opts) in [("Always", forced(|_| {})), ("Off", Options::default())] {
+        let copy = scratch(&format!("sweep-{setting}"));
+        copy_dir(&dir, &copy);
+        let stamp = std::fs::metadata(copy.join(&name))
+            .unwrap()
+            .modified()
+            .unwrap();
+        // Half a build, under the live name and under another.
+        std::fs::write(copy.join(format!("{name}.tmp")), &good[..good.len() / 2]).unwrap();
+        std::fs::write(copy.join("zpg-00000998-0000000000000998.zpg.tmp"), b"half").unwrap();
+        // A whole sidecar, of no segment that is live.
+        std::fs::write(copy.join("zpg-00000999-0000000000000999.zpg"), &good).unwrap();
+        // Any other name in the form's prefix that no live segment claims.
+        std::fs::write(copy.join("zpg-dead-3"), b"retired").unwrap();
+        // Not ours.
+        std::fs::write(copy.join("notes.txt"), b"a stranger's file").unwrap();
+        assert_eq!(
+            sidecar_files(&copy).len(),
+            5,
+            "the fixture: the live sidecar and four strays"
+        );
+        let db = Db::open(&copy, opts).unwrap();
+        assert_eq!(
+            sidecar_files(&copy),
+            vec![copy.join(&name)],
+            "{setting}: only the live segment's sidecar is left"
+        );
+        assert!(
+            copy.join("notes.txt").exists(),
+            "{setting}: a stranger's file"
+        );
+        assert_eq!(
+            std::fs::metadata(copy.join(&name))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            stamp,
+            "{setting}: the live sidecar is not touched"
+        );
+        let c = db.zpage_counts();
+        assert_eq!(c.swept, 4, "{setting}: the four strays are counted: {c:?}");
+        check(&db, &model, &keys[..300], setting);
+        if setting == "Always" {
+            // The stray whole sidecar was never read: nothing is refused.
+            assert_eq!(
+                (
+                    c.attached,
+                    c.sidecars,
+                    c.rejected_damage,
+                    c.rejected_identity
+                ),
+                (1, 1, 0, 0),
+                "{c:?}"
+            );
+            assert_eq!(db.zpage_counts().reads, 300);
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&copy);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_refused_file_is_counted_once_however_often_it_is_met() {
+    // The open meets a damaged sidecar and counts it; a settle that replaces
+    // it looks at the same file again and must not count it a second time.
+    let (dir, model, keys) = one_partition("once-src", 3000, 0x0CE);
+    let copy = scratch("once");
+    copy_dir(&dir, &copy);
+    let file = sidecar_files(&copy).remove(0);
+    let mut bytes = std::fs::read(&file).unwrap();
+    let at = bytes.len() - 100;
+    bytes[at] ^= 0xff;
+    std::fs::write(&file, bytes).unwrap();
+    let mut db = Db::open(&copy, forced(|_| {})).unwrap();
+    let c = db.zpage_counts();
+    assert_eq!((c.rejected_damage, c.sidecars), (1, 0), "{c:?}");
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.rejected_damage, c.rejected_identity, c.builds, c.sidecars),
+        (1, 0, 1, 1),
+        "the file was refused once and replaced: {c:?}"
+    );
+    check(&db, &model, &keys[..200], "replaced");
+    db.zpages_settle().unwrap();
+    assert_eq!(db.zpage_counts().rejected_damage, 1);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&copy);
+}
+
+#[test]
+fn a_refused_file_of_a_partition_the_build_declines_does_not_stay_to_be_met_again() {
+    // A file that does not check out, under the name of a partition the
+    // build then declines for being under the floor, is nobody's: no build
+    // replaces it, and nothing else removes a file named for a live segment,
+    // so it would be met and refused at every open for as long as the store
+    // lives.
+    let (dir, model, keys) = one_partition("declined-src", 3000, 0x5A1);
+    let copy = scratch("declined");
+    copy_dir(&dir, &copy);
+    let file = sidecar_files(&copy).remove(0);
+    let mut bytes = std::fs::read(&file).unwrap();
+    let at = bytes.len() - 100;
+    bytes[at] ^= 0xff;
+    std::fs::write(&file, bytes).unwrap();
+    // The engine's own floor: a partition of this size is left raw.
+    let floor = Options {
+        zpages: ZPages::Always,
+        scan_block_cache: false,
+        ..Options::default()
+    };
+    let mut db = Db::open(&copy, floor).unwrap();
+    let c = db.zpage_counts();
+    assert_eq!((c.rejected_damage, c.sidecars), (1, 0), "{c:?}");
+    assert_eq!(sidecar_files(&copy).len(), 1, "met, not yet removed");
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.declined_small, c.builds, c.sidecars, c.small_partitions),
+        (1, 0, 0, 1),
+        "{c:?}"
+    );
+    assert!(
+        sidecar_files(&copy).is_empty(),
+        "the file nobody can use is still there"
+    );
+    check(&db, &model, &keys[..200], "raw");
+    assert_eq!(db.zpage_counts().rawserves, 400);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&copy);
+}
+
+#[test]
+fn decodes_count_the_pages_decoded_to_answer_and_no_others() {
+    // Values that compress, so that no page is stored and a covered page is
+    // decoded for every read and every count of it (there is no memo). A key
+    // that is not there but falls in the range of a page opens the page and
+    // decodes it to say so, since this stage has no filter; a key below the
+    // partition's first opens none.
+    let dir = scratch("decodes");
+    let mut db = Db::create(&dir, forced(|_| {})).unwrap();
+    let mut model = Model::new();
+    for chunk in (0..4000usize).collect::<Vec<_>>().chunks(500) {
+        for &i in chunk {
+            let (k, v) = (
+                spaced_key(i),
+                format!("value-{i:08}-").repeat(7).into_bytes(),
+            );
+            db.append(&k, &v);
+            model.insert(k, vec![v]);
+        }
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+    db.zpages_settle().unwrap();
+    let c0 = db.zpage_counts();
+    assert_eq!((c0.sidecars, c0.build_stored), (c0.partitions, 0), "{c0:?}");
+    let present: Vec<Vec<u8>> = model.keys().step_by(17).cloned().collect();
+    check(&db, &model, &present, "present");
+    let c1 = db.zpage_counts();
+    let asked = 2 * present.len() as u64;
+    assert_eq!(c1.reads + c1.counts - c0.reads - c0.counts, asked, "{c1:?}");
+    assert_eq!(c1.decodes - c0.decodes, asked, "a decode for every answer");
+    // Among the records, and above the last.
+    let mut inside: Vec<Vec<u8>> = (0..4000)
+        .step_by(17)
+        .map(|i| format!("key-{:08}", i * 3 + 1).into_bytes())
+        .collect();
+    inside.push(b"zzz".to_vec());
+    check(&db, &model, &inside, "absent inside");
+    let c2 = db.zpage_counts();
+    let asked = 2 * inside.len() as u64;
+    assert_eq!(c2.reads + c2.counts - c1.reads - c1.counts, asked, "{c2:?}");
+    assert_eq!(
+        c2.decodes - c1.decodes,
+        asked,
+        "an absent key inside the range decodes the page it would be in"
+    );
+    // Below the first key.
+    check(&db, &model, &[b"a".to_vec(), Vec::new()], "below");
+    let c3 = db.zpage_counts();
+    assert_eq!(c3.reads + c3.counts - c2.reads - c2.counts, 4, "{c3:?}");
+    assert_eq!(
+        c3.decodes, c2.decodes,
+        "no page is opened below the first key"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_sizes_the_store_reports_are_the_files_it_holds() {
+    // Read by the pairing as the sidecars' footprint (`zpage_file_bytes`,
+    // `_group_bytes`, `_pages`, `_resident_bytes`): each is the sum of what
+    // the files themselves say.
+    let dir = scratch("sizes");
+    let mut db = Db::create(&dir, forced(|o| o.partition_bytes = Some(160 << 10))).unwrap();
+    ordered_load(&mut db, 6000, 0x517E);
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert!(c.sidecars >= 3 && c.sidecars == c.partitions, "{c:?}");
+    let (mut file, mut groups, mut pages, mut fence) = (0u64, 0u64, 0u64, 0u64);
+    for f in sidecar_files(&dir) {
+        let bytes = std::fs::read(&f).unwrap();
+        file += bytes.len() as u64;
+        let t = Trailer::decode(&bytes[bytes.len() - ZTRAILER..]).unwrap();
+        pages += t.n_pages;
+        let bind = t.bind32();
+        for p in 0..t.n_pages as usize {
+            let (h, _) = parse_page(&bytes[p * ZPAGE..(p + 1) * ZPAGE], bind).unwrap();
+            groups += u64::from(h.ulen);
+        }
+        let (fnc, _) =
+            ZFence::decode_resident(&bytes[t.res_off as usize..bytes.len() - ZTRAILER], &t)
+                .unwrap();
+        fence += fnc.heap_bytes() as u64;
+    }
+    assert_eq!(c.file_bytes, file, "{c:?}");
+    assert_eq!(c.group_bytes, groups, "{c:?}");
+    assert_eq!(c.pages, pages, "{c:?}");
+    assert_eq!(c.resident_bytes, fence, "{c:?}");
+    assert_eq!(
+        c.build_bytes, file,
+        "what the builds wrote is what is there"
+    );
+    assert_eq!(c.build_group_bytes, groups);
+    assert_eq!(c.build_pages, pages);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_scan_is_counted_raw_where_it_began_in_a_partition_with_a_sidecar_and_nowhere_else() {
+    // The first partition has none: its scans are none of the form's to
+    // count, and a scan that begins at the first key of the partition after
+    // it -- which is the first partition's fence -- begins in a partition
+    // with a sidecar.
+    let dir = scratch("rawscans");
+    let mut db = Db::create(&dir, forced(|o| o.partition_bytes = Some(160 << 10))).unwrap();
+    let model = ordered_load(&mut db, 6000, 0xAB3);
+    db.fail_next_zpage_build();
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert!(c.partitions >= 3, "{c:?}");
+    assert_eq!((c.build_failed, c.sidecars), (1, c.partitions - 1), "{c:?}");
+    let firsts: Vec<Vec<u8>> = sidecar_files(&dir)
+        .iter()
+        .map(|f| fence_keys(f)[0].clone())
+        .collect();
+    let first = model.keys().next().unwrap().clone();
+    assert!(
+        !firsts.contains(&first),
+        "the first partition is the one left without"
+    );
+    let delta = |start: &[u8]| {
+        let before = db.zpage_counts().raw_scans;
+        db.scan(start, 5, |_, _| {}).unwrap();
+        db.zpage_counts().raw_scans - before
+    };
+    assert_eq!(delta(&first), 0, "from inside the partition without one");
+    assert_eq!(delta(b""), 0, "from before every key");
+    let last_before = model
+        .range(..firsts[0].clone())
+        .next_back()
+        .unwrap()
+        .0
+        .clone();
+    assert_eq!(delta(&last_before), 0, "from the last key before the next");
+    for f in &firsts {
+        assert_eq!(
+            delta(f),
+            1,
+            "from the first key of a partition with a sidecar"
+        );
+        assert_eq!(
+            delta(&[f.as_slice(), &[0u8]].concat()),
+            1,
+            "and just past it"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_level_zero_piece_is_given_no_sidecar_and_is_not_counted_a_partition() {
+    let dir = scratch("piece");
+    let mut db = Db::create(&dir, forced(|o| o.partition_bytes = Some(160 << 10))).unwrap();
+    let mut model = ordered_load(&mut db, 3000, 0x91E);
+    db.zpages_settle().unwrap();
+    let before = db.zpage_counts();
+    // Writes inside the stored range, sealed to a piece over it. One piece
+    // is under the trigger, so it stays a piece.
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    for k in keys.iter().step_by(40) {
+        db.put(k, b"in a piece");
+        model.insert(k.clone(), vec![b"in a piece".to_vec()]);
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.zpages_settle().unwrap();
+    let (partitions, pieces) = db.levels();
+    assert!(
+        pieces >= 1,
+        "a piece landed and is still one: {:?}",
+        db.levels()
+    );
+    let c = db.zpage_counts();
+    assert_eq!(c.partitions, partitions as u64, "{c:?}");
+    assert_eq!(c.partitions, before.partitions, "{c:?}");
+    assert_eq!(
+        (c.sidecars, c.builds),
+        (before.sidecars, before.builds),
+        "{c:?}"
+    );
+    assert_eq!(sidecar_files(&dir).len() as u64, c.sidecars);
+    // The piece's values are read over the partition's, through the sidecar.
+    check(&db, &model, &keys[..400], "over a piece");
+    assert!(db.zpage_counts().reads > c.reads);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_empty_key_is_read_through_a_sidecar_as_any_other() {
+    // The empty key sorts below every other and is its partition's first
+    // fence key; a search for it compares nothing, and the keys around it
+    // are compared against it. It is written after other keys: as the first
+    // write of a fresh memtable it asks the arena for a block of no bytes,
+    // which the engine does not answer (the engine's own, and not this
+    // form's).
+    let dir = scratch("emptykey");
+    let mut db = Db::create(&dir, forced(|_| {})).unwrap();
+    let mut model = Model::new();
+    let mut rng = Rng(0xE7);
+    let mut order: Vec<usize> = (0..3000).collect();
+    for i in (1..order.len()).rev() {
+        order.swap(i, rng.below(i + 1));
+    }
+    for (n, &i) in order.iter().enumerate() {
+        let (k, v) = (spaced_key(i), suite_value(&mut rng));
+        db.append(&k, &v);
+        model.insert(k, vec![v]);
+        if n == 5 {
+            for v in [&b"the empty key"[..], &b"and again"[..], &b""[..]] {
+                db.append(b"", v);
+                model.entry(Vec::new()).or_default().push(v.to_vec());
+            }
+        }
+        if n % 500 == 499 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert!(c.partitions >= 1 && c.sidecars == c.partitions, "{c:?}");
+    let firsts: Vec<Vec<u8>> = sidecar_files(&dir)
+        .iter()
+        .map(|f| fence_keys(f)[0].clone())
+        .collect();
+    assert!(
+        firsts.iter().any(|k| k.is_empty()),
+        "the empty key is a partition's first key: {firsts:?}"
+    );
+    let probes: Vec<Vec<u8>> = vec![
+        Vec::new(),
+        vec![0],
+        vec![0, 0],
+        b"k".to_vec(),
+        spaced_key(0),
+        spaced_key(1),
+    ];
+    let before = db.zpage_counts();
+    check(&db, &model, &probes, "the empty key");
+    let after = db.zpage_counts();
+    assert_eq!(after.reads - before.reads, probes.len() as u64, "{after:?}");
+    assert_eq!(
+        after.counts - before.counts,
+        probes.len() as u64,
+        "{after:?}"
+    );
+    assert_eq!(after.rawserves + after.fallbacks, 0, "{after:?}");
+    assert_eq!(read_vec(&db, b"").len(), 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- what lands while a settle is under way ---------------------------------------
+
+/// A store of partitions with no sidecar yet, small enough that a rewrite of
+/// every key merges all of them.
+fn store_without_sidecars(name: &str, n: usize, seed: u64) -> (PathBuf, Db, Model) {
+    let dir = scratch(name);
+    let mut db = Db::create(
+        &dir,
+        forced(|o| {
+            o.partition_bytes = Some(32 << 10);
+            o.seal_bytes = 16 << 10;
+            o.l0_trigger = 2;
+        }),
+    )
+    .unwrap();
+    let model = ordered_load(&mut db, n, seed);
+    let c = db.zpage_counts();
+    assert!(c.partitions >= 3 && c.sidecars == 0, "{c:?}");
+    (dir, db, model)
+}
+
+/// Every key written again, twice over and each time sealed to a piece, so
+/// that every range holds the pieces its merge waits for; flushed, and the
+/// segment work settled: the partitions the store had are gone, replaced by
+/// the merges' outputs.
+fn rewrite_every_key(db: &mut Db, model: &mut Model, tag: &str) {
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    for pass in 0..2 {
+        for (b, chunk) in keys.chunks(250).enumerate() {
+            for k in chunk {
+                let v = format!("{tag}-{pass}-{b}").into_bytes();
+                db.put(k, &v);
+                model.insert(k.clone(), vec![v]);
+            }
+            db.commit().unwrap();
+        }
+        db.seal().unwrap();
+    }
+    db.flush().unwrap();
+    db.settle().unwrap();
+}
+
+/// The store has exactly the sidecars of its live partitions on disk.
+fn assert_only_live_sidecars(dir: &Path, db: &Db) {
+    let live: Vec<String> = db
+        .zpage_sidecars()
+        .into_iter()
+        .map(|(seg, ..)| zpg_of(&seg))
+        .collect();
+    let mut on_disk: Vec<String> = sidecar_files(dir)
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    let mut want = live;
+    want.sort();
+    on_disk.sort();
+    assert_eq!(
+        on_disk, want,
+        "the sidecars on disk are the live partitions'"
+    );
+}
+
+#[test]
+fn a_partition_a_merge_retires_before_its_build_opens_it_was_outrun_and_did_not_fail() {
+    // `zpages_settle` lists the partitions that lack a sidecar and builds them
+    // one by one. A merge that lands between the two retires some of them, and
+    // their files are gone when the build goes to open them: a build outrun,
+    // which the merge's outputs make good in the next round, and not a build
+    // that failed -- the store is as sound as it was.
+    let (dir, mut db, mut model) = store_without_sidecars("outrun", 4000, 0x0A7);
+    let listed = db.zpage_counts().partitions;
+    let mut rewritten = false;
+    db.zpages_settle_with(&mut |db, at| {
+        if at == ZRound::Listed && !rewritten {
+            rewritten = true;
+            rewrite_every_key(db, &mut model, "outrun");
+        }
+    })
+    .unwrap();
+    assert!(rewritten, "the seam was never called");
+    let c = db.zpage_counts();
+    assert!(c.build_orphaned >= 2, "{listed} partitions listed: {c:?}");
+    assert_eq!(c.build_failed, 0, "{c:?}");
+    // The next round gave the partitions that replaced them theirs.
+    assert!(c.partitions >= 3 && c.sidecars == c.partitions, "{c:?}");
+    assert_eq!(
+        c.builds, c.partitions,
+        "one build for each partition left: {c:?}"
+    );
+    assert_only_live_sidecars(&dir, &db);
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    check(&db, &model, &keys, "after the outrun");
+    let after = db.zpage_counts();
+    assert_eq!(after.rawserves + after.fallbacks, 0, "{after:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_sidecar_built_for_a_partition_a_merge_then_retires_is_gone_and_counted() {
+    // The other side of the same race: the build is made, and the merge lands
+    // before the round is over. The sidecar belongs to a partition that is not
+    // there, and neither it nor its file outlives the settle.
+    let (dir, mut db, mut model) = store_without_sidecars("outlived", 4000, 0x0A8);
+    let mut rewritten = false;
+    db.zpages_settle_with(&mut |db, at| {
+        if at == ZRound::Built && !rewritten {
+            rewritten = true;
+            let made = db.zpage_counts();
+            assert_eq!(made.sidecars, made.partitions, "{made:?}");
+            rewrite_every_key(db, &mut model, "outlived");
+        }
+    })
+    .unwrap();
+    assert!(rewritten, "the seam was never called");
+    let c = db.zpage_counts();
+    assert!(c.build_orphaned >= 2, "{c:?}");
+    assert_eq!(c.build_failed, 0, "{c:?}");
+    assert!(c.sidecars == c.partitions && c.partitions >= 3, "{c:?}");
+    assert_only_live_sidecars(&dir, &db);
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    check(&db, &model, &keys, "after the merge");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_settle_removes_the_sidecars_and_temp_names_that_nothing_claims() {
+    // What a build that finished after the landing that retired its segment
+    // leaves, and what a crash in the middle of one: planted after the open,
+    // where only the settle is left to find them.
+    let (dir, model, keys) = one_partition("settle-sweep", 3000, 0x5EE8);
+    let live = sidecar_files(&dir).remove(0);
+    let name = live.file_name().unwrap().to_string_lossy().into_owned();
+    let good = std::fs::read(&live).unwrap();
+    let mut db = Db::open(&dir, forced(|_| {})).unwrap();
+    assert_eq!(db.zpage_counts().swept, 0);
+    std::fs::write(dir.join(format!("{name}.tmp")), &good[..good.len() / 3]).unwrap();
+    std::fs::write(dir.join("zpg-00000998-0000000000000998.zpg.tmp"), b"half").unwrap();
+    std::fs::write(dir.join("zpg-00000999-0000000000000999.zpg"), &good).unwrap();
+    std::fs::write(dir.join("notes.txt"), b"a stranger's file").unwrap();
+    assert_eq!(sidecar_files(&dir).len(), 4);
+    db.zpages_settle().unwrap();
+    assert_eq!(sidecar_files(&dir), vec![dir.join(&name)]);
+    assert!(dir.join("notes.txt").exists());
+    let c = db.zpage_counts();
+    assert_eq!((c.swept, c.sidecars, c.builds), (3, 1, 0), "{c:?}");
+    // The one the live segment has is the one it had.
+    assert_eq!(std::fs::read(&live).unwrap(), good);
+    check(&db, &model, &keys[..300], "after the sweep");
+    assert_eq!(db.zpage_counts().reads, 300);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[ignore = "the empty key as the first write of a fresh memtable panics the arena at wave2-base \
+            too; fixed on branch fix-emptykey (e2e1301), which is not merged here"]
+fn the_empty_key_as_the_first_write_of_a_store() {
+    // The same case the empty-key test above steers around by writing other
+    // keys first: an empty key appended to a fresh memtable asks the arena
+    // for a block of no bytes. Not this form's, and not fixed on this branch;
+    // the test is here for the day the fix is merged, and then it should lose
+    // its `ignore`.
+    let dir = scratch("emptyfirst");
+    let mut db = Db::create(&dir, forced(|_| {})).unwrap();
+    db.append(b"", b"the empty key");
+    db.commit().unwrap();
+    assert_eq!(read_vec(&db, b""), vec![b"the empty key".to_vec()]);
+    db.flush().unwrap();
+    db.zpages_settle().unwrap();
+    assert_eq!(read_vec(&db, b""), vec![b"the empty key".to_vec()]);
     let _ = std::fs::remove_dir_all(&dir);
 }
