@@ -168,7 +168,13 @@ on every shape of 3.9's table.
   load's closing sync fell from about 1.6 s to 0.5 s and the commits rose
   about 0.2 s, the builds running beside them on the idle-class thread.
   The eager build is the default now and `supdb-nocachezpagessettle` the
-  arm that leaves every build to the settle.
+  arm that leaves every build to the settle. The flip under the gate was
+  green once and read four runs of twelve red beside a build: a sidecar
+  the open refuses is built again by the segment work's first turn after
+  the open under the eager build, and the tests of what an open leaves
+  read that state while the build raced them; they open with the builds
+  left to the settle now, the eager rebuild has a test of its own, and
+  the stress of 2b's stop rule read twenty of twenty after it.
 - The warm cannot be priced by `ab` as it stands: the forced arm's
   `sync` builds a sidecar and the warm after its attach finds it
   resident, so the warm's work is a restart's, and the runner has no
