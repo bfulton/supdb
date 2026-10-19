@@ -2235,6 +2235,42 @@ short is at or below every key that shares the cut, so it separates
 nothing inside such a run; and two lists kept in step -- the cuts and
 their names -- are built by one loop, never one by index into the other.
 
+**A promotion that closed a partition at its own lower fence.** A
+promotion keeps the partition and closes it at the first piece's first
+key, cut to the fence's length, and checks that bound against the
+partition's last key. A partition emptied by a merge -- every key of its
+range deleted -- has no last key, and a piece whose first key was the
+fence itself closed it at its own lower fence: a partition of no width,
+which the tiling check accepted, since it opened where the last closed
+and closed where the next opened. The pieces a scan walks over a
+partition are bracketed by lower fence, and the partition of no width
+shared its lower fence with the one after it, so a scan across the
+boundary walked that one's pieces twice and listed a value twice, while
+the point read, which routes by upper fence, skipped it and was right.
+Three seeds of the differential fuzz read it; the reopened store read it
+every time, and a scan from the key itself did not. The first bound
+stands strictly above the range's lower fence now, the tiling check
+refuses a partition of no width, and `tests/fences.rs` builds the shape.
+The rule: a fence an operation closes is held strictly above the one it
+opens at, by the fences themselves and not only by the keys between
+them, since a partition may hold none; and a check that a set tiles
+checks every member's width.
+
+**A merge that wrote nothing for a fence no input key lay in.** A merge
+cuts its output by the fences it was given and writes a piece for each
+slice that has a rank; a fence with no rank -- the partition that names
+it emptied by an earlier merge, and the merge over it selected by a
+wide piece with no key inside it -- got no output, while the partition
+was an input and went with the landing. The set that landed had a hole,
+the tiling assertion killed the segment work's thread, and the store
+answered every flush after with "the segment work has stopped"; the
+differential fuzz reached it at one seed in two hundred, every run. An
+empty partition is written for such a fence now, as the emitter writes
+one around a slice whose every key is dead. The rule: an operation that
+replaces a set of partitions produces one output per fence it took,
+keys or none, since the tiling is a property of the fences and not of
+the keys.
+
 **A probe's total over a whole read is an inlining result.** The same engine
 read +0.9, +1.9, +2.9 and +3.15 instructions a point read across four probes
 and a count +3.00 exactly, because the code after a probe's loop changes what

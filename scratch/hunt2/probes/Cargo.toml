@@ -1,0 +1,10 @@
+[package]
+name = "segcheck"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+supdb = { path = "../../.." }
+
+[workspace]

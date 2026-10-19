@@ -9312,6 +9312,15 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
                 };
                 let to = to.max(from);
                 if from == to {
+                    // No input holds a key in the fence: the partition
+                    // that names it is an input all the same and goes with
+                    // the landing, so an empty partition is written for it,
+                    // or the set that lands has a hole where it was. The
+                    // differential fuzz reached it with a partition whose
+                    // every key a merge had dropped, pulled into the next
+                    // merge by a wide piece with no key inside it.
+                    slices.push((from, to));
+                    given.push((lo.clone(), hi.clone()));
                     continue;
                 }
                 // Sub-fences tile the fence they came from: the first
@@ -9345,10 +9354,8 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
     }
 
     let mut pieces = Vec::with_capacity(slices.len());
+    let mut empties: Vec<String> = Vec::new();
     for (pi, &(from, to)) in slices.iter().enumerate() {
-        if from >= to {
-            continue;
-        }
         let id = first_id + pi as u64;
         let (lo, hi) = given[pi].clone();
         let name = format!(
@@ -9357,6 +9364,21 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
             hi.as_deref().map(hex).unwrap_or_default()
         );
         let tmp = dir.join(format!("compact-{id:08}.tmp"));
+        if from >= to {
+            // A fence with no rank: pass two visits none of it, so its
+            // empty partition is written here, as the emitter writes one
+            // around a slice whose every key is dead.
+            let _ = std::fs::remove_file(&tmp);
+            let w = PieceWriter::create(&tmp, &opts, sync_every, inline_max)
+                .map_err(|e| err(&format!("compact create: {e}")))?;
+            let ord = w
+                .finish()
+                .map_err(|e| err(&format!("compact finish: {e}")))?;
+            write_ord(&dir, &name, &ord, ord_durable)?;
+            std::fs::rename(&tmp, dir.join(&name))?;
+            empties.push(name);
+            continue;
+        }
         pieces.push(Piece {
             from,
             to,
@@ -9441,7 +9463,8 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
             })?;
         }
     }
-    let out = em.finish(keys.len())?;
+    let mut out = em.finish(keys.len())?;
+    out.extend(empties);
     File::open(&dir)?.sync_all()?;
     Ok(out)
 }
@@ -14028,7 +14051,21 @@ impl Reader {
                     return None;
                 }
             }
-            if b < range.0 || range.1.as_ref().is_some_and(|h| &b >= h) {
+            // Strictly above the range's lower fence too, since the
+            // partition keeps `[range.0, bounds[0])`: an empty partition
+            // has no last key to stand above, and a first piece whose
+            // first key was the fence itself closed it at its own lower
+            // fence -- a partition of no width, sharing its lower fence
+            // with the one after it, that took that one's pieces in every
+            // scan across the boundary and listed their values twice
+            // (`tests/fences.rs`). The open fence is the empty vector and
+            // is not compared (`Seg::below_lo`).
+            let under = if range.0.is_empty() {
+                b.is_empty()
+            } else {
+                b <= range.0
+            };
+            if under || range.1.as_ref().is_some_and(|h| &b >= h) {
                 return None;
             }
             bounds.push(b);
@@ -28382,20 +28419,28 @@ impl Maint {
     }
 
     /// Whether the partitions of `segs`, in the live order, tile the key
-    /// space: the first open below, each opening where the last closed, the
-    /// last open above. A read routes by that and nothing else, so a set
-    /// that breaks it loses keys without raising.
+    /// space: the first open below, each opening where the last closed and
+    /// closing above where it opened, the last open above. A read routes
+    /// by that and nothing else, so a set that breaks it loses keys without
+    /// raising; and a partition of no width shares its lower fence with the
+    /// next, whose pieces a scan then walks twice.
     fn partitions_tile(segs: &[std::sync::Arc<Seg>]) -> bool {
         let mut parts = segs.iter().filter(|s| s.level > 0);
         let Some(first) = parts.next() else {
             return true;
         };
         let mut hi = &first.hi;
-        if !first.lo.is_empty() {
+        if !first.lo.is_empty() || hi.as_ref().is_some_and(|h| h.is_empty()) {
             return false;
         }
         for p in parts {
             if hi.as_ref() != Some(&p.lo) {
+                return false;
+            }
+            if p.hi
+                .as_ref()
+                .is_some_and(|h| h.as_slice() <= p.lo.as_slice())
+            {
                 return false;
             }
             hi = &p.hi;
@@ -28902,7 +28947,11 @@ impl Maint {
         let fresh = landed.map(|_| std::sync::Arc::new(MemTable::new(self.opts.prefault)));
         debug_assert!(
             Self::partitions_tile(&segs),
-            "a segment publish left partitions that do not tile the key space"
+            "a segment publish left partitions that do not tile the key space: {:?}",
+            segs.iter()
+                .filter(|s| s.level > 0)
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
         );
         let mean_key_bytes = Db::mean_key_bytes_of(&segs);
         let store_bytes = Db::store_bytes_of(&self.dir, &segs);
