@@ -28,9 +28,9 @@
 //! held through the epoch, and `ZCell::get` would change with it.
 
 use super::zpages::{
-    bind32, decode_group, fill_group, group_seek, page_view, parse_page, verify_page, walk_group,
-    FenceEntry, Fill, FillScratch, FillStats, GroupBuf, Images, NoPage, SegImages, Trailer, ZError,
-    ZFence, ZNOPAGE, ZPAGE, ZTRAILER,
+    bind32, check_entry, check_group, decode_group, fill_group, group_seek, page_view, parse_page,
+    verify_page, FenceEntry, Fill, FillScratch, FillStats, GroupBuf, Images, NoPage, SegImages,
+    Trailer, ZError, ZFence, ZNOPAGE, ZPAGE, ZTRAILER,
 };
 use crate::blob::{Blob, BlobOptions, ZSource};
 use crate::bytes::{Bytes, MmapBytes};
@@ -159,6 +159,13 @@ fn aligned_for_extents(payload: &[u8]) -> bool {
 /// and the group. Returned with its record count and whether a decode was
 /// made. A stored page is parsed in place and only where its payload is
 /// aligned.
+///
+/// These are `zpages::verify_page`'s checks, which the builder runs on
+/// every page it writes, in the same order and through the same functions
+/// (`check_entry`, `check_group`), with the one thing a mapping adds between
+/// them, the alignment of a stored payload. They are not spelled twice: the
+/// builder's guarantee that no page it writes fails a first decode holds
+/// only while the two are one definition.
 pub(super) fn first_decode<'a>(
     page: &'a [u8],
     bind: u32,
@@ -166,14 +173,12 @@ pub(super) fn first_decode<'a>(
     buf: &'a mut GroupBuf,
 ) -> std::result::Result<(&'a [u8], usize, bool), Fail> {
     let (h, payload) = parse_page(page, bind)?;
-    if h.first_rank != entry.first_rank || u32::from(h.count) != entry.count {
-        return Err(Fail::Check(ZError::Fence));
-    }
+    check_entry(&h, entry)?;
     if h.stored && !aligned_for_extents(payload) {
         return Err(Fail::Misaligned);
     }
     let group = decode_group(&h, payload, buf)?;
-    walk_group(group, usize::from(h.count), Some(entry.key))?;
+    check_group(group, &h, entry)?;
     Ok((group, usize::from(h.count), !h.stored))
 }
 
@@ -196,7 +201,10 @@ thread_local! {
     /// for a read and put back after, so that a callback that reads the
     /// store again finds the cell empty and makes a buffer of its own
     /// instead of sharing the one it is called inside (`Blob`'s scratch is
-    /// the same).
+    /// the same). A thread that reads a covered partition keeps one for its
+    /// life, as large as the largest group it has decoded in whole pages
+    /// (`GroupBuf`) -- a few kilobytes for the records the suite writes, and
+    /// at most a group's cap.
     static ZBUF: Cell<Option<GroupBuf>> = const { Cell::new(None) };
 }
 
@@ -249,6 +257,11 @@ pub(super) struct ZSide {
     id: u64,
     /// The trailer this attach accepted.
     ident: Trailer,
+    /// A test's: the file's bytes in a buffer of the test's own, read in
+    /// place of the mapping from `skew` bytes in, so that a page can sit at
+    /// an address a mapping never gives it.
+    #[cfg(test)]
+    skewed: Option<(Vec<u8>, usize)>,
 }
 
 impl ZSide {
@@ -327,6 +340,8 @@ impl ZSide {
             damaged: AtomicBool::new(false),
             id: NEXT_ZSIDE_ID.fetch_add(1, Ordering::Relaxed),
             ident: t,
+            #[cfg(test)]
+            skewed: None,
         };
         side.check_sample().map_err(damage)?;
         if random {
@@ -366,14 +381,17 @@ impl ZSide {
                 .fence
                 .entry(i, self.nkeys as u32)
                 .ok_or(ZError::Fence)?;
-            if h.first_rank != entry.first_rank || u32::from(h.count) != entry.count {
-                return Err(ZError::Fence);
-            }
+            check_entry(&h, &entry)?;
         }
         Ok(())
     }
 
     fn page_bytes(&self, p: usize) -> Option<&[u8]> {
+        #[cfg(test)]
+        if let Some((bytes, skew)) = &self.skewed {
+            let at = skew + p * ZPAGE;
+            return bytes.get(at..at + ZPAGE);
+        }
         self.map.slice_at((p as u64) * ZPAGE as u64, ZPAGE)
     }
 

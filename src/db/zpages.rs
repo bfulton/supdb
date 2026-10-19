@@ -337,27 +337,38 @@ pub fn page_view(page: &[u8]) -> Result<(PageHeader, &[u8]), ZError> {
 /// for the extent arrays `parse_record` borrows in place. A `Vec<u8>` is not
 /// promised to be, and a record read from a misaligned buffer is `None`,
 /// which a probe loop reads as "absent".
+///
+/// It is as large as the largest group decoded into it so far, in whole
+/// pages, and no larger: a thread that reads a covered partition keeps one
+/// for its life, and a callback that reads again makes one of its own, so a
+/// buffer made at [`ZMAX_ULEN`] was 64 KiB zeroed for every thread and every
+/// nested read to hold groups that are a few kilobytes.
 pub struct GroupBuf {
     words: Vec<u64>,
 }
 
 impl GroupBuf {
-    /// A buffer that holds the largest group.
+    /// An empty buffer, which the first group decoded into it sizes.
     pub fn new() -> GroupBuf {
-        GroupBuf {
-            words: vec![0; ZMAX_ULEN / 8],
-        }
+        GroupBuf { words: Vec::new() }
     }
 
-    /// The buffer's bytes. Not zeroed between uses: a decode writes every
-    /// byte of the group it returns, and nothing beyond it is ever lent.
-    fn bytes_mut(&mut self) -> &mut [u8] {
-        // SAFETY: `words` owns `len * 8` initialised bytes, `u8` has no
+    /// The first `n` bytes of the buffer, grown to hold them. Not zeroed
+    /// between uses: a decode writes every byte of the group it returns, and
+    /// nothing beyond it is ever lent. `n` is at most [`ZMAX_ULEN`], which
+    /// the header's check has seen to.
+    fn bytes_for(&mut self, n: usize) -> &mut [u8] {
+        let words = n.div_ceil(8);
+        if self.words.len() < words {
+            // Whole pages, so that groups a few bytes apart in size grow the
+            // buffer once and not once each. The old contents are not kept:
+            // nothing is lent from a buffer between two decodes.
+            self.words = vec![0; words.next_multiple_of(ZPAGE / 8)];
+        }
+        // SAFETY: `words` owns at least `n` initialised bytes, `u8` has no
         // alignment to violate, and the borrow of `self` is the only access
         // while the slice lives.
-        unsafe {
-            std::slice::from_raw_parts_mut(self.words.as_mut_ptr() as *mut u8, self.words.len() * 8)
-        }
+        unsafe { std::slice::from_raw_parts_mut(self.words.as_mut_ptr() as *mut u8, n) }
     }
 }
 
@@ -392,11 +403,11 @@ pub fn decode_group<'a>(
         if (payload.as_ptr() as usize).is_multiple_of(std::mem::align_of::<crate::index::Ext>()) {
             return Ok(payload);
         }
-        let out = &mut buf.bytes_mut()[..ulen];
+        let out = buf.bytes_for(ulen);
         out.copy_from_slice(payload);
         return Ok(out);
     }
-    let out = &mut buf.bytes_mut()[..ulen];
+    let out = buf.bytes_for(ulen);
     let n = lz4_flex::block::decompress_into(payload, out).map_err(|_| ZError::Decode)?;
     if n != ulen {
         return Err(ZError::DecodedLen);
@@ -1536,13 +1547,39 @@ pub fn filter_bytes(nkeys: usize) -> usize {
     super::BlockedBloom::blocks_for(nkeys) * std::mem::size_of::<[u64; 8]>()
 }
 
+/// That a page's header is its fence entry's: the rank of its first record
+/// and the records it holds. A page that passes its CRC and is some other
+/// page's, or is the right page rewritten, is told apart here and by
+/// nothing earlier.
+///
+/// One of the two checks a first decode makes beyond the page's own
+/// ([`check_group`] is the other), and the reader's first decode, the
+/// builder's verification of what it wrote ([`verify_page`]) and an attach's
+/// look at the pages it samples all call it, so that the three cannot come to
+/// mean different things by it.
+pub fn check_entry(h: &PageHeader, entry: &FenceEntry<'_>) -> Result<(), ZError> {
+    if h.first_rank != entry.first_rank || u32::from(h.count) != entry.count {
+        return Err(ZError::Fence);
+    }
+    Ok(())
+}
+
+/// That a decoded group is what its page's header and its fence entry say:
+/// `count` records, whole, in key order, the first the entry's key
+/// ([`walk_group`]). See [`check_entry`] for why it is a function of its own.
+pub fn check_group(group: &[u8], h: &PageHeader, entry: &FenceEntry<'_>) -> Result<(), ZError> {
+    walk_group(group, usize::from(h.count), Some(entry.key))
+}
+
 /// Everything a first decode of a page checks, in the order that trusts the
 /// least first: the page's CRC, tag and header; its `first_rank` and `count`
-/// against its fence entry; the payload decoded to exactly `ulen`; and the
-/// structural walk -- `count` records, whole, ascending, the first the
-/// entry's key. The builder runs this on every page it writes, as the page
-/// will be read, so that a defect that would fail every first decode cannot
-/// pass the build and then loop the rebuild.
+/// against its fence entry ([`check_entry`]); the payload decoded to exactly
+/// `ulen`; and the structural walk -- `count` records, whole, ascending, the
+/// first the entry's key ([`check_group`]). The builder runs this on every
+/// page it writes, as the page will be read, so that a defect that would
+/// fail every first decode cannot pass the build and then loop the rebuild;
+/// the reader's first decode is these checks in this order with the one
+/// difference its mapping makes (`db::zside::first_decode`).
 pub fn verify_page(
     page: &[u8],
     bind32: u32,
@@ -1550,11 +1587,9 @@ pub fn verify_page(
     buf: &mut GroupBuf,
 ) -> Result<PageHeader, ZError> {
     let (h, payload) = parse_page(page, bind32)?;
-    if h.first_rank != entry.first_rank || u32::from(h.count) != entry.count {
-        return Err(ZError::Fence);
-    }
+    check_entry(&h, entry)?;
     let group = decode_group(&h, payload, buf)?;
-    walk_group(group, usize::from(h.count), Some(entry.key))?;
+    check_group(group, &h, entry)?;
     Ok(h)
 }
 
