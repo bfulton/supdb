@@ -2349,6 +2349,35 @@ against an object is kept only under that object's identity, and a
 carry that keeps the structure across a replacement of the object
 re-takes every position it holds, not only the ones a form holds.
 
+**A cache a thread kept of things a store had closed.** The memo of
+decoded groups was the thread's, keyed by the sidecar's attach identity
+and the page, and a thread that read through one store's sidecars and
+closed the store kept their groups until other stores' displaced them:
+ninety kilobytes a store in `tests/leak.rs`, bounded by the cap, freed by
+nothing the store's close could reach, and invisible to the memory
+census, which counts by handle. The memo is the reader handle's now
+(`zside::ZMemo`), dropped with it and counted with it. Beside it, the
+memo's side compare -- an entry is the sidecar's identity and the page --
+is reached only when two sidecars' pages share a slot, and the test that
+said "another sidecar's page" passed with the compare deleted until it
+built the collision (the slot is the page plus a multiple of the identity,
+so over eight slots sides eight apart collide). The rule: a cache that
+outlives what it caches is a leak with a cap, so a cache is owned by the
+thing whose life it should share and counted where that thing is counted;
+and a compare a hash reaches only on a collision is tested with the
+collision built, as a check behind a checksum is tested with a forged
+checksum.
+
+**A count bumped after the thing it counts began.** A sidecar's build was
+counted started after its thread was spawned, and a test that waited for
+every started build to be collected returned between the thread's first
+write and the count, and read the temp name as a build nobody had
+started: one run in twelve under the lifecycle stress, none alone. The
+start is counted before the thread exists, and a spawn that fails counts
+a failure, so the sum the wait reads is whole at every instant. The rule:
+a count another thread's wait sums with others is bumped before the
+thing it counts can be seen, never after.
+
 **A probe's total over a whole read is an inlining result.** The same engine
 read +0.9, +1.9, +2.9 and +3.15 instructions a point read across four probes
 and a count +3.00 exactly, because the code after a probe's loop changes what

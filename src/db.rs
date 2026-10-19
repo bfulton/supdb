@@ -11996,6 +11996,9 @@ pub struct Reader {
     /// threaded cells it is meant to be read beside would price.
     ord_served: std::cell::Cell<u64>,
     ord_declined: std::cell::Cell<u64>,
+    /// This handle's memo of decoded groups (`zside::ZMemo`,
+    /// `Options::zpages_memo`), which goes with the handle.
+    zmemo: zside::ZMemo,
 }
 
 /// A handle's upkeep for its range reads: its block tables, its scan
@@ -14814,13 +14817,11 @@ impl Reader {
         }
     }
 
-    /// The memo's hits and misses on this thread since the last take, onto
-    /// this handle's line (`zside::memo_take`): taken at each dispatch, so
-    /// a nested read's take attributes what the outer read had made to the
-    /// handle it reads through, and the sums are the thread's.
+    /// The memo's hits and misses since the last take, onto this handle's
+    /// line: taken at each dispatch.
     #[inline]
     fn zmemo_take(&self) {
-        let (h, m) = zside::memo_take();
+        let (h, m) = self.zmemo.take_counts();
         if h | m != 0 {
             self.zbump_by(|s| &s.zmemohits, h);
             self.zbump_by(|s| &s.zmemomisses, m);
@@ -14852,7 +14853,7 @@ impl Reader {
             return raw(seg, f);
         };
         let served = z
-            .read_all(seg.blob.for_sidecar(), key, f)
+            .read_all(&self.zmemo, seg.blob.for_sidecar(), key, f)
             .map_err(|e| err(&format!("segment read: {e}")))?;
         self.zmemo_take();
         match served {
@@ -14890,7 +14891,7 @@ impl Reader {
             self.zbump(|s| &s.zraw);
             return raw();
         };
-        let served = z.count(key);
+        let served = z.count(&self.zmemo, key);
         self.zmemo_take();
         match served {
             zside::ZRead::Served { n, decoded } => {
@@ -14942,7 +14943,7 @@ impl Reader {
             return raw(rank, n, f);
         };
         let r = z
-            .scan_at(seg.blob.for_sidecar(), rank, n, f)
+            .scan_at(&self.zmemo, seg.blob.for_sidecar(), rank, n, f)
             .map_err(|e| err(&format!("segment scan: {e}")))?;
         self.zmemo_take();
         self.zbump_by(|s| &s.zscangroups, r.decoded);
@@ -14974,7 +14975,7 @@ impl Reader {
         let Some(z) = seg.z.get() else {
             return raw();
         };
-        let r = z.seek(key);
+        let r = z.seek(&self.zmemo, key);
         self.zmemo_take();
         match r {
             zside::ZSeek::Served { rank, decoded, .. } => {
@@ -14998,7 +14999,7 @@ impl Reader {
         let Some(z) = seg.z.get() else {
             return BuildCtx::cut_at(seg, rank, end, uk);
         };
-        let r = z.cut_in(rank, end, uk);
+        let r = z.cut_in(&self.zmemo, rank, end, uk);
         self.zmemo_take();
         match r {
             zside::ZSeek::Served { rank, at, decoded } => {
@@ -15030,7 +15031,7 @@ impl Reader {
             return raw(f);
         };
         let served = z
-            .values_at(seg.blob.for_sidecar(), rank, f)
+            .values_at(&self.zmemo, seg.blob.for_sidecar(), rank, f)
             .map_err(|e| err(&format!("segment scan read: {e}")))?;
         self.zmemo_take();
         match served {
@@ -15054,11 +15055,14 @@ impl Reader {
 
     /// `scan_merged`'s walk of `seg` from `rank`: through the sidecar
     /// where the cell holds one in service, the raw form's otherwise.
-    fn pwalk_at<'a>(&self, seg: &'a Seg, rank: usize) -> PWalk<'a> {
+    fn pwalk_at<'a>(&'a self, seg: &'a Seg, rank: usize) -> PWalk<'a> {
         match seg.z.get() {
-            Some(z) if !z.damaged() => {
-                PWalk::Z(zside::ZCursor::at(z, seg.blob.for_sidecar(), rank))
-            }
+            Some(z) if !z.damaged() => PWalk::Z(zside::ZCursor::at(
+                &self.zmemo,
+                z,
+                seg.blob.for_sidecar(),
+                rank,
+            )),
             _ => PWalk::Raw {
                 seg,
                 rank,
@@ -15071,9 +15075,9 @@ impl Reader {
     /// (`ZCursor::seek`), one group opened for the seek and the walk after
     /// it, or the ordered index's where the sidecar cannot say, with a
     /// fallback counted where a check failed.
-    fn pwalk_seek<'a>(&self, seg: &'a Seg, key: &[u8]) -> PWalk<'a> {
+    fn pwalk_seek<'a>(&'a self, seg: &'a Seg, key: &[u8]) -> PWalk<'a> {
         if let Some(z) = seg.z.get() {
-            match zside::ZCursor::seek(z, seg.blob.for_sidecar(), key) {
+            match zside::ZCursor::seek(&self.zmemo, z, seg.blob.for_sidecar(), key) {
                 Ok(c) => return PWalk::Z(c),
                 Err(zside::ZSeek::Fallback) => self.zbump(|s| &s.zfallbacks),
                 Err(_) => {}
@@ -20983,6 +20987,7 @@ impl Db {
             scan_ns: std::cell::Cell::new([0; 6]),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
+            zmemo: zside::ZMemo::new(),
             slot: None,
             pin_slot,
             depth: std::cell::Cell::new(0),
@@ -21452,6 +21457,7 @@ impl Db {
             scan_ns: std::cell::Cell::new([0; 6]),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
+            zmemo: zside::ZMemo::new(),
             slot: None,
             pin_slot,
             depth: std::cell::Cell::new(0),
@@ -23588,6 +23594,7 @@ impl Reader {
             scan_ns: std::cell::Cell::new([0; 6]),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
+            zmemo: zside::ZMemo::new(),
             slot: None,
             pin_slot,
             depth: std::cell::Cell::new(0),
@@ -23619,6 +23626,7 @@ impl Reader {
             scan_ns: std::cell::Cell::new([0; 6]),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
+            zmemo: zside::ZMemo::new(),
             slot: Some(slot),
             pin_slot: None,
             depth: std::cell::Cell::new(0),
@@ -23657,6 +23665,7 @@ impl Reader {
             scan_ns: std::cell::Cell::new([0; 6]),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
+            zmemo: zside::ZMemo::new(),
             slot: Some(slot),
             pin_slot: None,
             depth: std::cell::Cell::new(0),
@@ -26065,6 +26074,7 @@ impl Reader {
             scan_ns: std::cell::Cell::new([0; 6]),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
+            zmemo: zside::ZMemo::new(),
             slot: None,
             // A slot of its own for the passes, which pin it as the
             // writer's operations pin the writer's.
@@ -30746,6 +30756,11 @@ impl Maint {
         let fail = shared.fail_zbuild.swap(false, AtomicOrdering::AcqRel);
         let hold = shared.zbuild_hold.clone();
         let wake = self.wake.clone();
+        // Counted started before the thread exists: counted after the
+        // spawn, a wait for every build to be collected returned between
+        // the thread's first write and the count, and a test read the
+        // temp name as a build nobody had started.
+        zside::ZEvents::add(&ev.build_starts, 1);
         let spawned = std::thread::Builder::new()
             .name("supdb-zbuild".into())
             .spawn(move || {
@@ -30766,7 +30781,6 @@ impl Maint {
             });
         match spawned {
             Ok(handle) => {
-                zside::ZEvents::add(&ev.build_starts, 1);
                 self.zbuild = Some(ZBuild {
                     seg,
                     job: ZJob::Build(handle),
