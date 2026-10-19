@@ -1,0 +1,1458 @@
+{
+  "utc": "20261018T032126Z",
+  "sha": "ca738ec345919b694a3987eb57488235e1b5b332-dirty",
+  "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+  "scale": "ooc",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "cpus": 4,
+    "mem_total_kb": 16479424,
+    "page_size": 4096,
+    "cache_line": 64,
+    "cache_line_detected": true,
+    "l1d": 49152,
+    "l2": 2097152,
+    "l3": 272629760,
+    "kernel": "6.18.44-fc-v139",
+    "governor": "unknown",
+    "thp": "always [madvise] never",
+    "smt_on": false,
+    "pmu_available": false,
+    "aslr_disabled": false,
+    "virtualised": "hypervisor",
+    "mem_limit_bytes": 1073741824,
+    "read_ahead_kb": 128,
+    "rotational": true,
+    "write_cache": "write back"
+  },
+  "measurements": [
+    {
+      "workload": "lag-burst",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "bg_read_bytes_per_op_lag100pct",
+      "unit": "B/op",
+      "samples": [
+        0.8798814814814815
+      ]
+    },
+    {
+      "workload": "lag-burst",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "bg_read_bytes_per_op_lag10pct",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "lag-burst",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "bg_read_bytes_per_op_lag1pct",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "lag-burst",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "majfaults_per_op_lag100pct",
+      "unit": "faults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "lag-burst",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "majfaults_per_op_lag10pct",
+      "unit": "faults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "lag-burst",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "majfaults_per_op_lag1pct",
+      "unit": "faults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "lag-burst",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_bytes_per_op_lag100pct",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "lag-burst",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_bytes_per_op_lag10pct",
+      "unit": "B/op",
+      "samples": [
+        0.01517037037037037
+      ]
+    },
+    {
+      "workload": "lag-burst",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_bytes_per_op_lag1pct",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "lag-burst",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_us_per_io_lag100pct",
+      "unit": "us/io",
+      "samples": [
+        4500.0
+      ]
+    },
+    {
+      "workload": "lag-burst",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_us_per_io_lag10pct",
+      "unit": "us/io",
+      "samples": [
+        1000.0
+      ]
+    },
+    {
+      "workload": "lag-burst",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "refaults_per_op_lag100pct",
+      "unit": "refaults/op",
+      "samples": [
+        0.00021481481481481482
+      ]
+    },
+    {
+      "workload": "lag-burst",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "refaults_per_op_lag10pct",
+      "unit": "refaults/op",
+      "samples": [
+        0.000011111111111111112
+      ]
+    },
+    {
+      "workload": "lag-burst",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "refaults_per_op_lag1pct",
+      "unit": "refaults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "bg_read_bytes_per_op",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "bytes_on_disk_per_byte",
+      "unit": "B/B",
+      "samples": [
+        1.010334896551724
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        1.6777239540229885
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "majfaults_per_op",
+      "unit": "faults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1003479.6848869347
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_bytes_per_op",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "refaults_per_op",
+      "unit": "refaults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "bg_read_bytes_per_op",
+      "unit": "B/op",
+      "samples": [
+        0.0013653333333333334
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "majfaults_per_op",
+      "unit": "faults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        306588.03488331434
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_bytes_per_op",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_us_per_io",
+      "unit": "us/io",
+      "samples": [
+        39181.818181818184
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "refaults_per_op",
+      "unit": "refaults/op",
+      "samples": [
+        1e-6
+      ]
+    },
+    {
+      "workload": "mem-floor",
+      "arm": "floor",
+      "guarantee": "buffered",
+      "quantity": "ops_per_s",
+      "unit": "chases/s",
+      "samples": [
+        13471864.511721998
+      ]
+    },
+    {
+      "workload": "page-floor",
+      "arm": "floor",
+      "guarantee": "buffered",
+      "quantity": "pages_per_s",
+      "unit": "pages/s",
+      "samples": [
+        645009.709789723,
+        567810.0497942797
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "bg_read_bytes_per_op",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "bg_read_bytes_per_op_2t",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "bg_read_bytes_per_op_3t",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "majfaults_per_op",
+      "unit": "faults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "majfaults_per_op_2t",
+      "unit": "faults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "majfaults_per_op_3t",
+      "unit": "faults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        11.007
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_bytes_per_op",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_bytes_per_op_2t",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_bytes_per_op_3t",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        238894.01740371904
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "reads_per_s_2t",
+      "unit": "reads/s",
+      "samples": [
+        450290.9977429726
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "reads_per_s_3t",
+      "unit": "reads/s",
+      "samples": [
+        607919.7515667038
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "refaults_per_op",
+      "unit": "refaults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "refaults_per_op_2t",
+      "unit": "refaults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "refaults_per_op_3t",
+      "unit": "refaults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "bg_read_bytes_per_op",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "bg_read_bytes_per_op_2t",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "bg_read_bytes_per_op_3t",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        3730234.1420721347
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "entries_per_s_2t",
+      "unit": "entries/s",
+      "samples": [
+        8694346.305778818
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "entries_per_s_3t",
+      "unit": "entries/s",
+      "samples": [
+        13544678.170658475
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "majfaults_per_op",
+      "unit": "faults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "majfaults_per_op_2t",
+      "unit": "faults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "majfaults_per_op_3t",
+      "unit": "faults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_bytes_per_op",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_bytes_per_op_2t",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_bytes_per_op_3t",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "refaults_per_op",
+      "unit": "refaults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "refaults_per_op_2t",
+      "unit": "refaults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "refaults_per_op_3t",
+      "unit": "refaults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan-floor",
+      "arm": "floor",
+      "guarantee": "buffered",
+      "quantity": "bytes_per_s",
+      "unit": "B/s",
+      "samples": [
+        2180453996.837966
+      ]
+    },
+    {
+      "workload": "scan-lag",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "bg_read_bytes_per_op_lag0pct",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan-lag",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "bg_read_bytes_per_op_lag100pct",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan-lag",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "bg_read_bytes_per_op_lag10pct",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan-lag",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "bg_read_bytes_per_op_lag1pct",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan-lag",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "entries_per_s_lag0pct",
+      "unit": "entries/s",
+      "samples": [
+        2285077.824076078
+      ]
+    },
+    {
+      "workload": "scan-lag",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "entries_per_s_lag100pct",
+      "unit": "entries/s",
+      "samples": [
+        1060470.060141166
+      ]
+    },
+    {
+      "workload": "scan-lag",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "entries_per_s_lag10pct",
+      "unit": "entries/s",
+      "samples": [
+        2538509.7428088547
+      ]
+    },
+    {
+      "workload": "scan-lag",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "entries_per_s_lag1pct",
+      "unit": "entries/s",
+      "samples": [
+        1782767.1699598646
+      ]
+    },
+    {
+      "workload": "scan-lag",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "majfaults_per_op_lag0pct",
+      "unit": "faults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan-lag",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "majfaults_per_op_lag100pct",
+      "unit": "faults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan-lag",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "majfaults_per_op_lag10pct",
+      "unit": "faults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan-lag",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "majfaults_per_op_lag1pct",
+      "unit": "faults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan-lag",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_bytes_per_op_lag0pct",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan-lag",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_bytes_per_op_lag100pct",
+      "unit": "B/op",
+      "samples": [
+        7292.245333333333
+      ]
+    },
+    {
+      "workload": "scan-lag",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_bytes_per_op_lag10pct",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan-lag",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_bytes_per_op_lag1pct",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan-lag",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_us_per_io_lag100pct",
+      "unit": "us/io",
+      "samples": [
+        37.86764705882353
+      ]
+    },
+    {
+      "workload": "scan-lag",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "refaults_per_op_lag0pct",
+      "unit": "refaults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan-lag",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "refaults_per_op_lag100pct",
+      "unit": "refaults/op",
+      "samples": [
+        1.7803333333333333
+      ]
+    },
+    {
+      "workload": "scan-lag",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "refaults_per_op_lag10pct",
+      "unit": "refaults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan-lag",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "refaults_per_op_lag1pct",
+      "unit": "refaults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan-lag",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "updates_per_s_lag100pct",
+      "unit": "ops/s",
+      "samples": [
+        293682.41388035414
+      ]
+    },
+    {
+      "workload": "scan-lag",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "updates_per_s_lag10pct",
+      "unit": "ops/s",
+      "samples": [
+        321197.85424511036
+      ]
+    },
+    {
+      "workload": "scan-lag",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "updates_per_s_lag1pct",
+      "unit": "ops/s",
+      "samples": [
+        337851.876952995
+      ]
+    },
+    {
+      "workload": "scan-mixed",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "bg_read_bytes_per_op_2t",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan-mixed",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "bg_read_bytes_per_op_3t",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan-mixed",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "entries_per_s_2t",
+      "unit": "entries/s",
+      "samples": [
+        8260285.799566792
+      ]
+    },
+    {
+      "workload": "scan-mixed",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "entries_per_s_3t",
+      "unit": "entries/s",
+      "samples": [
+        11770755.93396477
+      ]
+    },
+    {
+      "workload": "scan-mixed",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "majfaults_per_op_2t",
+      "unit": "faults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan-mixed",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "majfaults_per_op_3t",
+      "unit": "faults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan-mixed",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_bytes_per_op_2t",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan-mixed",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_bytes_per_op_3t",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan-mixed",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "refaults_per_op_2t",
+      "unit": "refaults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "scan-mixed",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "refaults_per_op_3t",
+      "unit": "refaults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "seek-floor",
+      "arm": "floor",
+      "guarantee": "buffered",
+      "quantity": "p50_us",
+      "unit": "us",
+      "samples": [
+        31.702,
+        31.759
+      ]
+    },
+    {
+      "workload": "seek-floor",
+      "arm": "floor",
+      "guarantee": "buffered",
+      "quantity": "p99_us",
+      "unit": "us",
+      "samples": [
+        85.687,
+        74.637
+      ]
+    },
+    {
+      "workload": "seek-floor-again",
+      "arm": "floor",
+      "guarantee": "buffered",
+      "quantity": "p50_us",
+      "unit": "us",
+      "samples": [
+        35.028,
+        32.3
+      ]
+    },
+    {
+      "workload": "seek-floor-again",
+      "arm": "floor",
+      "guarantee": "buffered",
+      "quantity": "p99_us",
+      "unit": "us",
+      "samples": [
+        72.59599999999999,
+        73.61099999999999
+      ]
+    },
+    {
+      "workload": "wal-floor",
+      "arm": "floor",
+      "guarantee": "durable",
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1631502.059828453
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "bg_read_bytes_per_op",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "majfaults_per_op",
+      "unit": "faults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        238352.90439497205
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_bytes_per_op",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "refaults_per_op",
+      "unit": "refaults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "bg_read_bytes_per_op",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "majfaults_per_op",
+      "unit": "faults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        391463.9439315901
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_bytes_per_op",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "refaults_per_op",
+      "unit": "refaults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "bg_read_bytes_per_op",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "majfaults_per_op",
+      "unit": "faults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        354301.4882738714
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_bytes_per_op",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "refaults_per_op",
+      "unit": "refaults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "bg_read_bytes_per_op",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "majfaults_per_op",
+      "unit": "faults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        217482.7397650861
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_bytes_per_op",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "refaults_per_op",
+      "unit": "refaults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "bg_read_bytes_per_op",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "majfaults_per_op",
+      "unit": "faults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        17324.4574797112
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_bytes_per_op",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "refaults_per_op",
+      "unit": "refaults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "bg_read_bytes_per_op",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "majfaults_per_op",
+      "unit": "faults/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        192070.903604058
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "read_bytes_per_op",
+      "unit": "B/op",
+      "samples": [
+        0.0
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 3000000,
+      "quantity": "refaults_per_op",
+      "unit": "refaults/op",
+      "samples": [
+        0.0
+      ]
+    }
+  ]
+}
