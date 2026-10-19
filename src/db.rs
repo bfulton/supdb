@@ -348,15 +348,19 @@ pub struct ZCounts {
     /// Point reads and counts of a partition answered from its sidecar.
     pub reads: u64,
     pub counts: u64,
-    /// Pages decoded to answer them; a stored page and an absent key
-    /// decode none.
+    /// Pages decoded to answer them: one for each read or count of a key
+    /// that falls in a page's range, the key the page holds and the key it
+    /// does not alike. A stored page decodes none, and neither does a key
+    /// below the partition's first key, which the fence answers.
     pub decodes: u64,
     /// Reads and counts of a partition that went to the raw form because
     /// it had no sidecar in service: none attached yet, or declined, or
     /// out of service after a check failed.
     pub rawserves: u64,
     /// Reads and counts that went to the raw form because a check failed
-    /// on them.
+    /// on them, or because the fence names no page for the key: a record the
+    /// form was built without. The builder makes none of those yet, so a
+    /// store that built its own sidecars counts the first kind alone.
     pub fallbacks: u64,
     /// Scans that began in a partition with a sidecar and were walked raw.
     pub raw_scans: u64,

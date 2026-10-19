@@ -99,8 +99,11 @@ pub(super) enum Reject {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ZRead {
     /// The sidecar answered: `n` values (or the count), and whether a page
-    /// was decoded to get there, which a stored page and an absent key are
-    /// not.
+    /// was decoded to get there. A page is decoded for every key that falls
+    /// in its range, the key it holds and the key it does not alike; a
+    /// stored page is parsed where it lies and decodes nothing, and a key
+    /// below the partition's first key is answered from the fence, touching
+    /// no page.
     Served { n: u64, decoded: bool },
     /// A check failed on this read: the caller reads the raw form and
     /// counts a fallback.
@@ -113,8 +116,9 @@ pub(super) enum ZRead {
 /// Where a key lies in a sidecar, found or not, with the bytes it lies in.
 enum Locate<'a> {
     /// The key is not in this partition: sorts below its first key, or
-    /// among the records of the page it would be in.
-    Absent,
+    /// among the records of the page it would be in, which was decoded to
+    /// find that out unless it is stored or there was no page to open.
+    Absent { decoded: bool },
     /// The record: its extents, its tail, and whether a page was decoded.
     Found {
         exts: Exts<'a>,
@@ -412,7 +416,7 @@ impl ZSide {
         }
         // A key below the first key is not in the partition.
         let Some(e) = self.fence.entry_of(key) else {
-            return Locate::Absent;
+            return Locate::Absent { decoded: false };
         };
         let Some(p) = self.fence.page(e) else {
             return Locate::Fallback;
@@ -454,7 +458,7 @@ impl ZSide {
             }
         };
         if !pos.found {
-            return Locate::Absent;
+            return Locate::Absent { decoded };
         }
         match parse_record(group, pos.off) {
             Some((_, exts, tail, _)) => Locate::Found {
@@ -480,10 +484,7 @@ impl ZSide {
     ) -> Result<ZRead> {
         let mut buf = take_buf();
         let r = match self.locate(key, &mut buf) {
-            Locate::Absent => Ok(ZRead::Served {
-                n: 0,
-                decoded: false,
-            }),
+            Locate::Absent { decoded } => Ok(ZRead::Served { n: 0, decoded }),
             Locate::Out => Ok(ZRead::Out),
             Locate::Fallback => Ok(ZRead::Fallback),
             Locate::Found {
@@ -502,10 +503,7 @@ impl ZSide {
     pub(super) fn count(&self, key: &[u8]) -> ZRead {
         let mut buf = take_buf();
         let r = match self.locate(key, &mut buf) {
-            Locate::Absent => ZRead::Served {
-                n: 0,
-                decoded: false,
-            },
+            Locate::Absent { decoded } => ZRead::Served { n: 0, decoded },
             Locate::Out => ZRead::Out,
             Locate::Fallback => ZRead::Fallback,
             Locate::Found { exts, decoded, .. } => ZRead::Served {
