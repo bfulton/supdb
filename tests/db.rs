@@ -2372,6 +2372,47 @@ fn dir_bytes(d: &std::path::Path) -> u64 {
         .sum()
 }
 
+/// The empty key, and the empty value, as the first write into a memtable:
+/// a reservation of no bytes at the tail of an arena that had no block yet
+/// answered offset 0 without making one, and the write of nothing at that
+/// offset asked for a block nobody had published, so the first write of a
+/// fresh store, and the first after every seal, panicked ("an offset past
+/// what was published") if its key was empty.
+#[test]
+fn an_empty_key_may_be_the_first_write_into_a_memtable() {
+    let d = dir("emptykey-first");
+    let mut db = Db::create(&d, Options::default()).unwrap();
+    db.append(b"", b"first");
+    db.append(b"after", b"");
+    db.commit().unwrap();
+    assert_eq!(read_vec(&db, b""), vec![b"first".to_vec()]);
+    assert_eq!(read_vec(&db, b"after"), vec![Vec::<u8>::new()]);
+    // After a seal the live table is fresh again: an empty key first, then
+    // an empty value first of a key that follows.
+    db.seal().unwrap();
+    db.settle().unwrap();
+    db.append(b"", b"second");
+    db.commit().unwrap();
+    assert_eq!(
+        read_vec(&db, b""),
+        vec![b"first".to_vec(), b"second".to_vec()]
+    );
+    db.seal().unwrap();
+    db.settle().unwrap();
+    db.append(b"k", b"");
+    db.commit().unwrap();
+    assert_eq!(read_vec(&db, b"k"), vec![Vec::<u8>::new()]);
+    // And through a reopen, whose replay writes the same way.
+    drop(db);
+    let db = Db::open(&d, Options::default()).unwrap();
+    assert_eq!(
+        read_vec(&db, b""),
+        vec![b"first".to_vec(), b"second".to_vec()]
+    );
+    assert_eq!(read_vec(&db, b"k"), vec![Vec::<u8>::new()]);
+    assert_eq!(read_vec(&db, b"after"), vec![Vec::<u8>::new()]);
+}
+
 #[test]
 fn a_delete_ends_older_values_and_later_appends_start_fresh() {
     let d = dir("delete");
