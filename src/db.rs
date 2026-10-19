@@ -24328,6 +24328,17 @@ impl Db {
         Db::set_zhold(&self.shared.zbuild_hold, ZHOLD_RENAME, on);
     }
 
+    /// Whether the builder's thread is parked at one of the holds. A test
+    /// that lands something under a hold waits for this first: a build
+    /// that has started is in its pages until it reaches the rename, and a
+    /// merge landed before then cancels it, which one run in twelve beside
+    /// a build did.
+    #[doc(hidden)]
+    pub fn zpage_build_waiting(&self) -> bool {
+        let at = (ZHOLD_START | ZHOLD_RENAME) << ZHOLD_WAITING;
+        self.shared.zbuild_hold.load(AtomicOrdering::Acquire) & at != 0
+    }
+
     fn set_zhold(hold: &std::sync::atomic::AtomicU8, bit: u8, on: bool) {
         if on {
             hold.fetch_or(bit, AtomicOrdering::AcqRel);
@@ -28235,9 +28246,15 @@ const SEAL_HOLD_LANDING: u8 = 1;
 const SEAL_HOLD_DURABLE: u8 = 2;
 
 /// The bits of `Shared::zbuild_hold`: a test's holds on the sidecar
-/// builder's thread, before its first write and before its rename.
+/// builder's thread, before its first write and before its rename, and
+/// beside each the bit the thread sets while it waits at that hold, its
+/// hold bit shifted by `ZHOLD_WAITING`. A test that lands something under
+/// a hold reads the waiting bit first (`Db::zpage_build_waiting`): a build
+/// that has started is in its pages until it reaches the rename, and a
+/// merge landed before then cancels it.
 const ZHOLD_START: u8 = 1;
 const ZHOLD_RENAME: u8 = 2;
+const ZHOLD_WAITING: u8 = 2;
 
 /// The holds a store opens with (`Options::zpages_hold_build`,
 /// `Options::zpages_hold_rename`).
@@ -28255,9 +28272,14 @@ fn zhold_of(opts: &Options) -> u8 {
 
 /// The builder thread's wait under a test's hold bit, if it is set.
 fn zbuild_hold_wait(hold: &std::sync::atomic::AtomicU8, bit: u8) {
+    if hold.load(AtomicOrdering::Acquire) & bit == 0 {
+        return;
+    }
+    hold.fetch_or(bit << ZHOLD_WAITING, AtomicOrdering::AcqRel);
     while hold.load(AtomicOrdering::Acquire) & bit != 0 {
         std::thread::park_timeout(MAINT_LAND_POLL);
     }
+    hold.fetch_and(!(bit << ZHOLD_WAITING), AtomicOrdering::AcqRel);
 }
 
 /// A seal thread's wait under a test's hold bit, if it is set.

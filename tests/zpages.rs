@@ -2870,6 +2870,18 @@ fn store_without_sidecars(
         );
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
+    // And at its hold: a build that has started is in its pages until it
+    // reaches the rename, and a merge landed before then cancels it, which
+    // one run in twelve beside a build did while this waited for the start
+    // alone.
+    while !db.zpage_build_waiting() {
+        assert!(
+            t.elapsed().as_secs() < 30,
+            "the build did not reach its hold: {:?}",
+            db.zpage_counts()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
     let c = db.zpage_counts();
     assert!(c.partitions >= 3 && c.sidecars == 0, "{c:?}");
     assert_eq!(c.build_starts, 1, "one build in flight, held: {c:?}");
