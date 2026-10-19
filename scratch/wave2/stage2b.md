@@ -28,11 +28,15 @@ is free.
 
 ## Where it stands
 
-Pieces 1, 2, 3 and 5 are in (`tests/zpages.rs`: the damaged sidecar
-retired and rebuilt three times then declined, the retired mapping kept
-by a pinned handle and freed at its release, the failed build retried
-after its backoff, and the crash windows of 5.7 built on disk and
-opened); 4 is written and compiling; 6 to 9 are next.
+Pieces 1 to 5 are in (`tests/zpages.rs`: the damaged sidecar retired
+and rebuilt three times then declined, the retired mapping kept by a
+pinned handle and freed at its release, the failed build retried after
+its backoff, the crash windows of 5.7 built on disk and opened, a build
+in flight cancelled by the merge that takes its target, and a build
+past its last cancel check whose target died leaving a dead name). The
+builds run inside the settle of the form, where the pairing measured
+them; `Options::zpages_eager`, the design's start-at-landing, is an
+option to be priced before it is the default. 6 to 9 are next.
 
 ## The pieces
 

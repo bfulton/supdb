@@ -391,6 +391,10 @@ pub struct ZCounts {
     pub build_retries: u64,
     pub rebuilds: u64,
     pub declined_damage: u64,
+    /// Builds started on the builder's thread, and the ones its cancel
+    /// flag stopped.
+    pub build_starts: u64,
+    pub build_cancelled: u64,
     /// Partitions declined, by reason, and the record bytes of the ones
     /// declined for their size.
     pub declined_small: u64,
@@ -675,6 +679,21 @@ pub struct Options {
     /// life. A test's knob at zero: the next settle tries again.
     #[doc(hidden)]
     pub zpages_retry_ms: u64,
+    /// A test's: the store opens with the builder's holds set
+    /// (`Db::hold_zpage_build`, `Db::hold_zpage_rename`), so a build the
+    /// open's landings start is held before a test can call them.
+    #[doc(hidden)]
+    pub zpages_hold_build: bool,
+    #[doc(hidden)]
+    pub zpages_hold_rename: bool,
+    /// EXPERIMENT: under `ZPages::Always`, a partition's sidecar is built
+    /// as soon as the partition lands, on the builder's thread at idle
+    /// priority, rather than at the next settle of the form. The shape the
+    /// design intends and no pairing has priced: the pairing measured the
+    /// builds inside the load's `sync`, which is where they stay with this
+    /// off. `supdb-nocachezpageseager` is the arm.
+    #[doc(hidden)]
+    pub zpages_eager: bool,
     /// EXPERIMENT: the block forms hold the fold of the partition and the
     /// level-0 pieces alone, and the memtables' keys reach a scan through
     /// the scan snapshot, which every walk overlays on its block whatever
@@ -2098,6 +2117,9 @@ impl Default for Options {
             zpages_min_bytes: zside::ZMIN_RECS,
             zpages_drop_behind: true,
             zpages_retry_ms: 60_000,
+            zpages_hold_build: false,
+            zpages_hold_rename: false,
+            zpages_eager: false,
             forms_pieces_only: false,
             publish_in_background: true,
             adaptive_shape: false,
@@ -2814,6 +2836,47 @@ impl BlockedBloom {
 /// A merge in flight: the input names it will retire, and the thread
 /// producing the outputs that replace them.
 type Compaction = (Vec<String>, std::thread::JoinHandle<Result<Vec<String>>>);
+
+/// A sidecar build in flight on the builder's thread (`Maint::z_step`):
+/// its target, its thread, the flag that stops it, and whether the file
+/// under the sidecar's name was one an attach refused, which the build
+/// replaces or, declined, removes.
+struct ZBuild {
+    seg: std::sync::Arc<Seg>,
+    handle: std::thread::JoinHandle<Result<zside::Outcome>>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    refused: bool,
+}
+
+/// Why a partition is given a build: it has no sidecar, its last build
+/// failed and the backoff has passed, or its sidecar failed a check.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ZKind {
+    Build,
+    Retry,
+    Rebuild,
+}
+
+/// `seg`'s sidecar taken out of its cell and retired through the epoch --
+/// a reader pinned before the take may be walking it, and the sweep frees
+/// it past every such pin -- and its file renamed to a dead name: the path
+/// of the dead name, for the caller to unlink where nobody waits, or
+/// `None` where there was nothing to retire or the rename failed.
+fn z_retire_cell(shared: &Shared, dir: &Path, seg: &Seg) -> Option<PathBuf> {
+    let p = seg.z.take();
+    if p.is_null() {
+        return None;
+    }
+    let tag = shared.readers.bump();
+    shared.retired_z.push(tag, RetiredZ(p));
+    shared.retired_z.sweep(|low| shared.readers.oldest_for(low));
+    let (id, end) = (Db::name_id(&seg.name)?, Db::name_end_seq(&seg.name)?);
+    let n = shared.next_dead.fetch_add(1, AtomicOrdering::Relaxed);
+    let dead = dir.join(zside::zpg_dead_name(n));
+    std::fs::rename(dir.join(zside::zpg_name(id, end)), &dead)
+        .ok()
+        .map(|_| dead)
+}
 
 /// A live segment: the mapped store, where it sits in the level structure,
 /// and whatever routing it carries. L0 segments come straight from a seal,
@@ -11022,6 +11085,9 @@ struct Shared {
     retired_z: RetireList<RetiredZ>,
     /// The dead names given to retired sidecar files (`zside::zpg_dead_name`).
     next_dead: AtomicU64,
+    /// A test's holds on the builder's thread (`ZHOLD_START`,
+    /// `ZHOLD_RENAME`), shared with the build's plan.
+    zbuild_hold: std::sync::Arc<std::sync::atomic::AtomicU8>,
     /// A test's: the next sidecar build fails as a write error would.
     fail_zbuild: std::sync::atomic::AtomicBool,
     /// Direct runs whose mapping was grown past the file's end
@@ -14395,6 +14461,8 @@ impl Reader {
             build_retries: get(&ev.build_retries),
             rebuilds: get(&ev.rebuilds),
             declined_damage: get(&ev.declined_damage),
+            build_starts: get(&ev.build_starts),
+            build_cancelled: get(&ev.build_cancelled),
             declined_small: get(&ev.declined_small),
             declined_small_bytes: get(&ev.declined_small_bytes),
             declined_block_backed: get(&ev.declined_block_backed),
@@ -20381,6 +20449,7 @@ impl Db {
             z: zside::ZEvents::default(),
             retired_z: RetireList::new(),
             next_dead: AtomicU64::new(1),
+            zbuild_hold: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(zhold_of(&opts))),
             fail_zbuild: std::sync::atomic::AtomicBool::new(false),
             run_remaps: AtomicU64::new(0),
             stream_recycled: AtomicU64::new(0),
@@ -20849,6 +20918,7 @@ impl Db {
             z: zev,
             retired_z: RetireList::new(),
             next_dead: AtomicU64::new(1),
+            zbuild_hold: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(zhold_of(&opts))),
             fail_zbuild: std::sync::atomic::AtomicBool::new(false),
             run_remaps: AtomicU64::new(0),
             stream_recycled: AtomicU64::new(0),
@@ -23942,6 +24012,8 @@ impl Db {
                     let _ = std::fs::remove_file(&out);
                 }
             }
+            // An inline build has no cancel flag; counted all the same.
+            Ok(zside::Outcome::Cancelled) => zside::ZEvents::add(&ev.build_cancelled, 1),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 zside::ZEvents::add(&ev.build_orphaned, 1);
                 seg.z_declined
@@ -23958,21 +24030,19 @@ impl Db {
     /// one. For a sidecar out of service after a page failed a check: what
     /// the rebuild replaces.
     fn z_retire(&self, seg: &Seg) -> bool {
-        let p = seg.z.take();
-        if p.is_null() {
-            return false;
-        }
-        let tag = self.shared.readers.bump();
-        self.shared.retired_z.push(tag, RetiredZ(p));
-        self.sweep_retired_z();
-        if let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) {
-            let n = self.shared.next_dead.fetch_add(1, AtomicOrdering::Relaxed);
-            let _ = std::fs::rename(
-                self.dir.join(zside::zpg_name(id, end)),
-                self.dir.join(zside::zpg_dead_name(n)),
-            );
-        }
-        true
+        z_retire_cell(&self.shared, &self.dir, seg).is_some()
+    }
+
+    /// The sidecar files no live segment claims removed, as `z_sweep`,
+    /// over the live segments as they stand.
+    fn z_sweep_live(&self) -> Result<()> {
+        let names: Vec<String> = {
+            let _op = self.op();
+            self.segs().iter().map(|s| s.name.clone()).collect()
+        };
+        let swept = Db::z_sweep(&self.dir, names.iter().map(String::as_str))?;
+        zside::ZEvents::add(&self.shared.z.swept, swept);
+        Ok(())
     }
 
     /// The sidecar files in `dir` that none of the segments named `live`
@@ -24022,6 +24092,15 @@ impl Db {
     pub fn zpages_settle_with(&mut self, between: &mut dyn FnMut(&mut Db, ZRound)) -> Result<()> {
         if self.opts.zpages != ZPages::Always {
             return Ok(());
+        }
+        // Where the segment work has a thread of its own, the builds are
+        // its (`Maint::z_step`): this waits for every partition to have
+        // its sidecar or its reason, and the seams below are the inline
+        // home's alone.
+        if matches!(self.maint, MaintHome::Away(_)) {
+            self.settle()?;
+            self.maint_request(MaintAsk::ZSettle)?;
+            return self.z_sweep_live();
         }
         for _ in 0..ZSETTLE_ROUNDS {
             self.settle()?;
@@ -24104,19 +24183,36 @@ impl Db {
         // A build that finished after the landing that retired its segment
         // wrote a file nothing claims, and so did a build the rounds ran
         // out before.
-        let names: Vec<String> = {
-            let _op = self.op();
-            self.segs().iter().map(|s| s.name.clone()).collect()
-        };
-        let swept = Db::z_sweep(&self.dir, names.iter().map(String::as_str))?;
-        zside::ZEvents::add(&self.shared.z.swept, swept);
-        Ok(())
+        self.z_sweep_live()
     }
 
     /// A test's: the next sidecar build fails as a write error would.
     #[doc(hidden)]
     pub fn fail_next_zpage_build(&self) {
         self.shared.fail_zbuild.store(true, AtomicOrdering::Release);
+    }
+
+    /// A test's: while `on`, a sidecar build on the builder's thread waits
+    /// before its first write, so a test can land what it likes with a
+    /// build in flight; lifted before any settle of the form or the close,
+    /// which wait for the build. `hold_zpage_rename` holds a build before
+    /// its rename instead, past its last look at its cancel flag.
+    #[doc(hidden)]
+    pub fn hold_zpage_build(&self, on: bool) {
+        Db::set_zhold(&self.shared.zbuild_hold, ZHOLD_START, on);
+    }
+
+    #[doc(hidden)]
+    pub fn hold_zpage_rename(&self, on: bool) {
+        Db::set_zhold(&self.shared.zbuild_hold, ZHOLD_RENAME, on);
+    }
+
+    fn set_zhold(hold: &std::sync::atomic::AtomicU8, bit: u8, on: bool) {
+        if on {
+            hold.fetch_or(bit, AtomicOrdering::AcqRel);
+        } else {
+            hold.fetch_and(!bit, AtomicOrdering::AcqRel);
+        }
     }
 
     /// What the last refusal of a sidecar said, kind first, or empty: the
@@ -28017,6 +28113,32 @@ impl SealReadable {
 const SEAL_HOLD_LANDING: u8 = 1;
 const SEAL_HOLD_DURABLE: u8 = 2;
 
+/// The bits of `Shared::zbuild_hold`: a test's holds on the sidecar
+/// builder's thread, before its first write and before its rename.
+const ZHOLD_START: u8 = 1;
+const ZHOLD_RENAME: u8 = 2;
+
+/// The holds a store opens with (`Options::zpages_hold_build`,
+/// `Options::zpages_hold_rename`).
+fn zhold_of(opts: &Options) -> u8 {
+    (if opts.zpages_hold_build {
+        ZHOLD_START
+    } else {
+        0
+    }) | (if opts.zpages_hold_rename {
+        ZHOLD_RENAME
+    } else {
+        0
+    })
+}
+
+/// The builder thread's wait under a test's hold bit, if it is set.
+fn zbuild_hold_wait(hold: &std::sync::atomic::AtomicU8, bit: u8) {
+    while hold.load(AtomicOrdering::Acquire) & bit != 0 {
+        std::thread::park_timeout(MAINT_LAND_POLL);
+    }
+}
+
 /// A seal thread's wait under a test's hold bit, if it is set.
 fn seal_hold_wait(shared: &Shared, bit: u8) {
     while shared.seal_hold.load(AtomicOrdering::Acquire) & bit != 0 {
@@ -28082,6 +28204,10 @@ enum MaintAsk {
     Drain,
     /// A settle's: the seal and every merge in flight landed.
     Settle,
+    /// A settle of the second form's (`Db::zpages_settle`): every live
+    /// partition given its sidecar or its reason, the landings meanwhile
+    /// collected.
+    ZSettle,
 }
 
 /// How long the segment work's thread sleeps with nothing to do, and how
@@ -28236,6 +28362,12 @@ struct Maint {
     /// The reads over an unshaped store counted when the store was last
     /// shaped (`Options::adaptive_shape`).
     shaped_at: u64,
+    /// The sidecar build in flight, if one is (`Options::zpages`), one at a
+    /// time, collected by polling and never joined on this thread.
+    zbuild: Option<ZBuild>,
+    /// Inside a `ZSettle` answer: every kind of build is due, where the
+    /// loop's own turns start only the builds of partitions with none.
+    z_settling: bool,
 }
 
 impl std::ops::Deref for Maint {
@@ -28279,6 +28411,7 @@ impl Maint {
             }
             self.collect();
             self.shape_if_read(false);
+            self.z_step();
             self.sweep_spares();
             std::thread::park_timeout(MAINT_POLL);
         }
@@ -28344,6 +28477,32 @@ impl Maint {
                 self.join_seal(false)?;
                 self.join_compact()?;
                 self.join_tier()?;
+                self.sync_owed_slot()
+            }
+            MaintAsk::ZSettle => {
+                self.join_seal(false)?;
+                self.join_compact()?;
+                self.join_tier()?;
+                // Every partition given its sidecar or its reason, one
+                // build at a time, with whatever lands meanwhile landed:
+                // a merge's outputs are partitions of their own and get
+                // theirs in turn, and a merge's inputs are left to it.
+                self.z_settling = true;
+                loop {
+                    self.collect();
+                    self.z_step();
+                    let quiet = self.compacting.is_none()
+                        && self.tiering.is_none()
+                        && self.sealing.is_empty();
+                    if quiet && !self.z_pending() {
+                        break;
+                    }
+                    if self.shared.maint_stop.load(AtomicOrdering::Acquire) {
+                        break;
+                    }
+                    std::thread::park_timeout(MAINT_POLL);
+                }
+                self.z_settling = false;
                 self.sync_owed_slot()
             }
         }
@@ -28552,6 +28711,12 @@ impl Maint {
     /// being dropped, and a seal thread left running would go on mutating
     /// the directory under whoever reopens it.
     fn stop(&mut self) {
+        // The build cancelled and joined: a test's hold on it is lifted
+        // before the close, as the seal holds are.
+        if let Some(b) = self.zbuild.take() {
+            b.cancel.store(true, AtomicOrdering::Release);
+            let _ = b.handle.join();
+        }
         for job in self.sealing.drain(..) {
             let _ = job.handle.join();
         }
@@ -28601,6 +28766,8 @@ impl Maint {
             flush_merge: false,
             wake: None,
             shaped_at: 0,
+            zbuild: None,
+            z_settling: false,
         }
     }
 
@@ -29370,6 +29537,7 @@ impl Maint {
         let Some((inputs, handle)) = self.tiering.take() else {
             return Ok(());
         };
+        self.z_cancel_inputs(&inputs);
         let outputs = handle.join().map_err(|_| err("tier thread panicked"))??;
         let mut merged: Vec<std::sync::Arc<Seg>> = self
             .segs()
@@ -29885,6 +30053,263 @@ impl Maint {
         Ok(())
     }
 
+    /// One turn of the second form's building (`Options::zpages`
+    /// `Always`), on this thread's loop: a finished build collected and
+    /// its sidecar installed, then the next build started, one at a time,
+    /// on a thread of its own at idle priority. Inside a settle of the
+    /// form (`MaintAsk::ZSettle`) every kind of build is due -- the first
+    /// of a partition that has none, the retry of one that failed once
+    /// its backoff has passed, the rebuild of a sidecar a check took out
+    /// of service; the loop's own turns build only for partitions with
+    /// none, and only under `Options::zpages_eager`.
+    fn z_step(&mut self) {
+        if self.opts.zpages != ZPages::Always || !(self.z_settling || self.opts.zpages_eager) {
+            return;
+        }
+        if self.zbuild.as_ref().is_some_and(|b| b.handle.is_finished()) {
+            let b = self.zbuild.take().expect("checked");
+            let op = self.op();
+            self.z_collect(b);
+            drop(op);
+        }
+        if self.zbuild.is_some() {
+            return;
+        }
+        let next = {
+            let _op = self.op();
+            self.z_next()
+        };
+        if let Some((seg, kind)) = next {
+            self.z_start(seg, kind);
+        }
+    }
+
+    /// Whether the form has anything left to do: a build in flight, or a
+    /// partition due one.
+    fn z_pending(&self) -> bool {
+        if self.zbuild.is_some() {
+            return true;
+        }
+        let _op = self.op();
+        self.z_next().is_some()
+    }
+
+    /// The first live partition due a build, and why: not an input of a
+    /// merge in flight, which retires it. Read under the caller's pin.
+    fn z_next(&self) -> Option<(std::sync::Arc<Seg>, ZKind)> {
+        for s in self.segs().iter().filter(|s| s.level > 0) {
+            if self.in_flight_input(&s.name) {
+                continue;
+            }
+            let why = s.z_declined.load(AtomicOrdering::Relaxed);
+            let kind = match s.z.get() {
+                Some(z) if z.damaged() && self.z_settling => ZKind::Rebuild,
+                Some(_) => continue,
+                None if why == 0 || why == zside::DECLINED_REFUSED => ZKind::Build,
+                None if why == zside::DECLINED_FAILED && self.z_settling && s.z_retry_due() => {
+                    ZKind::Retry
+                }
+                None => continue,
+            };
+            return Some((s.clone(), kind));
+        }
+        None
+    }
+
+    /// `seg`'s build started on the builder's thread, or the segment given
+    /// its reason without one: a file already under the sidecar's name that
+    /// checks out is attached and nothing is built; a sidecar out of
+    /// service is retired first and, past `ZREBUILDS`, the partition is
+    /// declined. The segment's file is opened here and handed over, so a
+    /// promotion's unlink of its old name between now and the build's open
+    /// does not fail the build.
+    fn z_start(&mut self, seg: std::sync::Arc<Seg>, kind: ZKind) {
+        let shared = self.shared.clone();
+        let ev = &shared.z;
+        let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) else {
+            return;
+        };
+        let retry_ms = self.opts.zpages_retry_ms;
+        match kind {
+            ZKind::Rebuild => {
+                if let Some(dead) = z_retire_cell(&shared, &self.dir, &seg) {
+                    self.spares.push(dead);
+                }
+                if seg.z_rebuilds.load(AtomicOrdering::Relaxed) >= zside::ZREBUILDS {
+                    zside::ZEvents::add(&ev.declined_damage, 1);
+                    seg.z_declined
+                        .store(zside::DECLINED_DAMAGE, AtomicOrdering::Relaxed);
+                    return;
+                }
+                seg.z_rebuilds.fetch_add(1, AtomicOrdering::Relaxed);
+                zside::ZEvents::add(&ev.rebuilds, 1);
+            }
+            ZKind::Retry => zside::ZEvents::add(&ev.build_retries, 1),
+            ZKind::Build => {}
+        }
+        let advise = Db::z_advise(&self.opts);
+        let refused = seg.z_declined.load(AtomicOrdering::Relaxed) == zside::DECLINED_REFUSED;
+        if !refused && Db::z_attach(&self.dir, &seg, advise, ev) {
+            return;
+        }
+        let failed = |why: u8| {
+            zside::ZEvents::add(&ev.build_failed, 1);
+            seg.z_declined.store(why, AtomicOrdering::Relaxed);
+            seg.z_schedule_retry(retry_ms);
+        };
+        let file = match File::open(self.dir.join(&seg.name)) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Retired since it was listed: outrun, not failed.
+                zside::ZEvents::add(&ev.build_orphaned, 1);
+                seg.z_declined
+                    .store(zside::DECLINED_FAILED, AtomicOrdering::Relaxed);
+                return;
+            }
+            Err(_) => {
+                failed(zside::DECLINED_FAILED);
+                return;
+            }
+        };
+        let out = self.dir.join(zside::zpg_name(id, end));
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut plan =
+            zside::BuildPlan::new(self.opts.zpages_min_bytes, self.opts.zpages_drop_behind);
+        plan.cancel = Some(cancel.clone());
+        plan.hold = Some(shared.zbuild_hold.clone());
+        let fail = shared.fail_zbuild.swap(false, AtomicOrdering::AcqRel);
+        let hold = shared.zbuild_hold.clone();
+        let wake = self.wake.clone();
+        let spawned = std::thread::Builder::new()
+            .name("supdb-zbuild".into())
+            .spawn(move || {
+                // Derived data, built when the store is short of memory
+                // and the readers are faulting: the readers' cores first.
+                idle_io_priority();
+                idle_cpu_priority();
+                zbuild_hold_wait(&hold, ZHOLD_START);
+                let r = if fail {
+                    Err(err("the sidecar's build was made to fail"))
+                } else {
+                    zside::build_file(file, &out, id, end, &plan)
+                };
+                if let Some(t) = wake {
+                    t.unpark();
+                }
+                r
+            });
+        match spawned {
+            Ok(handle) => {
+                zside::ZEvents::add(&ev.build_starts, 1);
+                self.zbuild = Some(ZBuild {
+                    seg,
+                    handle,
+                    cancel,
+                    refused,
+                });
+            }
+            Err(_) => failed(zside::DECLINED_FAILED),
+        }
+    }
+
+    /// A finished build taken in: its sidecar attached to the target as it
+    /// stands -- the same segment, or a promotion's re-open over the same
+    /// bytes, which keeps the two fields the sidecar is named by -- or,
+    /// the target gone with a merge's landing, its file given a dead name
+    /// for the idle tick to unlink and counted an orphan.
+    fn z_collect(&mut self, b: ZBuild) {
+        let shared = self.shared.clone();
+        let ev = &shared.z;
+        let ZBuild {
+            seg,
+            handle,
+            refused,
+            ..
+        } = b;
+        let outcome = handle
+            .join()
+            .unwrap_or_else(|_| Err(err("the sidecar's build panicked")));
+        let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) else {
+            return;
+        };
+        let retry_ms = self.opts.zpages_retry_ms;
+        let out = self.dir.join(zside::zpg_name(id, end));
+        let live: Option<std::sync::Arc<Seg>> = self
+            .segs()
+            .iter()
+            .find(|s| zside::zpg_fields(&s.name) == Some((id, end)))
+            .cloned();
+        let failed = |why: u8| {
+            zside::ZEvents::add(&ev.build_failed, 1);
+            seg.z_declined.store(why, AtomicOrdering::Relaxed);
+            seg.z_schedule_retry(retry_ms);
+        };
+        match outcome {
+            Ok(zside::Outcome::Built(built)) => match live {
+                Some(target) => {
+                    match zside::ZSide::attach(
+                        &out,
+                        &target.blob,
+                        id,
+                        end,
+                        Db::z_advise(&self.opts),
+                    ) {
+                        Ok(side) => {
+                            if target.z.install(side) {
+                                ev.built(&built);
+                                zside::ZEvents::add(&ev.attached, 1);
+                            }
+                        }
+                        Err(_) => {
+                            // The reader's own attach refuses what the
+                            // builder wrote: the build failed.
+                            let _ = std::fs::remove_file(&out);
+                            failed(zside::DECLINED_FAILED);
+                        }
+                    }
+                }
+                None => {
+                    // Finished after the landing that retired its segment:
+                    // a dead name, unlinked at the idle tick.
+                    let n = shared.next_dead.fetch_add(1, AtomicOrdering::Relaxed);
+                    let dead = self.dir.join(zside::zpg_dead_name(n));
+                    if std::fs::rename(&out, &dead).is_ok() {
+                        self.spares.push(dead);
+                    } else {
+                        let _ = std::fs::remove_file(&out);
+                    }
+                    zside::ZEvents::add(&ev.build_orphaned, 1);
+                }
+            },
+            Ok(zside::Outcome::Declined(d)) => {
+                ev.declined(d);
+                seg.z_declined.store(d.code(), AtomicOrdering::Relaxed);
+                if refused {
+                    // The file under the name was not this segment's, and
+                    // no build is replacing it.
+                    let _ = std::fs::remove_file(&out);
+                }
+            }
+            Ok(zside::Outcome::Cancelled) => zside::ZEvents::add(&ev.build_cancelled, 1),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                zside::ZEvents::add(&ev.build_orphaned, 1);
+                seg.z_declined
+                    .store(zside::DECLINED_FAILED, AtomicOrdering::Relaxed);
+            }
+            Err(_) => failed(zside::DECLINED_FAILED),
+        }
+    }
+
+    /// The build in flight cancelled if its target is among `inputs`, the
+    /// segments a landing is about to retire; collected at the next turn.
+    fn z_cancel_inputs(&self, inputs: &[String]) {
+        if let Some(b) = &self.zbuild {
+            if inputs.iter().any(|n| *n == b.seg.name) {
+                b.cancel.store(true, AtomicOrdering::Release);
+            }
+        }
+    }
+
     /// The spares the publishes left, unlinked: an inode freed is a
     /// discard round trip here, paid where nobody waits.
     fn sweep_spares(&mut self) {
@@ -30014,6 +30439,7 @@ impl Maint {
         let Some((inputs, handle)) = self.compacting.take() else {
             return Ok(());
         };
+        self.z_cancel_inputs(&inputs);
         self.shared.in_merge.store(false, AtomicOrdering::Release);
         self.flush_merge = false;
         let t = std::time::Instant::now();
