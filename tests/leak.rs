@@ -6,7 +6,10 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicIsize, Ordering};
+use supdb::db::zpages::ZPAGE;
 use supdb::{Db, Options};
+
+mod common;
 
 struct Counting;
 
@@ -207,11 +210,15 @@ fn a_three_frozen_life(name: &str) {
 /// each given its sidecar, reads and counts from them on the writer and on
 /// a handle's thread (whose buffer for a decoded group goes with the
 /// thread), updates spread over every range and a drain, which merge the
-/// partitions again and take their sidecars with them, and a reopen that
+/// partitions again and take their sidecars with them, a handle pinned at
+/// a snapshot across such a round, which keeps the sidecars it reads mapped
+/// after their retirement and past the store's close, and a reopen that
 /// attaches what the merges left. The sidecars are mappings, which the
 /// allocator does not count; what it counts is everything else a sidecar
-/// is: the cell, the fence, the bitmaps, the trailer. The close frees them
-/// with their segments.
+/// is: the cell, the fence, the filter, the bitmaps, the trailer, and the
+/// retire list's entries. The close frees them with their segments, and
+/// what a pin held goes with the pin; on Linux the process's mappings say
+/// so, read from the kernel after each.
 fn a_zpages_life(name: &str) {
     let d = std::env::temp_dir().join(format!("supdb-next-leak-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -228,8 +235,22 @@ fn a_zpages_life(name: &str) {
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let keys = 20_000u32;
     let key = |k: u32| format!("key-{k:08}").into_bytes();
+    // Values of random bytes, so that a partition's sidecar is stored pages
+    // and more than the sixteen an attach samples; a value of one byte
+    // repeated made a sidecar of ten.
+    let value = |k: u32| -> Vec<u8> {
+        let mut x = (u64::from(k) + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (0..100)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    };
     for k in 0..keys {
-        db.append(&key(k), &[7u8; 100]);
+        db.append(&key(k), &value(k));
         if k % 2000 == 1999 {
             db.commit().unwrap();
         }
@@ -263,11 +284,102 @@ fn a_zpages_life(name: &str) {
         db.zpages_settle().unwrap();
         read_some(&db, keys);
     }
+    // A handle pinned at a snapshot across two retirements: a round whose
+    // merges retire the sidecars with their segments, and a sidecar taken
+    // out of a live segment's cell after a page of it failed a check, which
+    // waits in the retire list for the pin. The store is closed with the
+    // pin still held, so neither is swept: the handle's drop is what frees
+    // them, and nothing of the directory stays mapped after it.
+    let pinned = db.reader().unwrap();
+    pinned.snapshot();
+    read_some(&pinned, keys);
+    #[cfg(target_os = "linux")]
+    let mapped_before = common::zpg_mappings(&d).len();
+    for _ in 0..1500 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        db.put(&key((x % keys as u64) as u32), &[4u8; 100]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.zpages_settle().unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        let live = db.zpage_counts().sidecars as usize;
+        let mapped = common::zpg_mappings(&d).len();
+        assert!(
+            mapped > live && mapped >= mapped_before,
+            "{mapped} mapped, {live} live, {mapped_before} before: the pin holds what the merges retired"
+        );
+    }
+    // A page no attach samples -- the second, of a sidecar of more than
+    // sixteen pages, just built and read by nobody -- flipped in place
+    // under the mapping: the reads meet the check, and the settle takes the
+    // sidecar out of its cell into the retire list and builds another.
+    let mut files: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(&d)
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with("zpg-") && n.ends_with(".zpg")
+        })
+        .map(|e| (e.metadata().unwrap().len(), e.path()))
+        .collect();
+    files.sort();
+    let (len, file) = files.pop().expect("a sidecar");
+    assert!(len > 20 * ZPAGE as u64, "a sidecar of {len} bytes");
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file)
+            .unwrap();
+        let mut byte = [0u8; 1];
+        f.read_at(&mut byte, ZPAGE as u64 + 100).unwrap();
+        byte[0] ^= 0x40;
+        f.write_at(&byte, ZPAGE as u64 + 100).unwrap();
+    }
+    let before = db.zpage_counts();
+    for k in 0..keys {
+        db.read_all(&key(k), |_| {}).unwrap();
+    }
+    let c = db.zpage_counts();
+    assert_eq!((c.damaged, c.bad_pages), (1, 1), "the flipped page: {c:?}");
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.rebuilds - before.rebuilds, c.damaged, c.sidecars),
+        (1, 0, before.sidecars),
+        "retired into the list and built again: {c:?}"
+    );
+    read_some(&db, keys);
+    read_some(&pinned, keys);
     drop(db);
+    #[cfg(target_os = "linux")]
+    assert!(
+        !common::zpg_mappings(&d).is_empty(),
+        "the pin holds its sidecars past the store's close"
+    );
+    // Dropped without a release: no operation sweeps after the pin, and
+    // what the handle held goes with it.
+    drop(pinned);
+    #[cfg(target_os = "linux")]
+    assert!(
+        common::zpg_mappings(&d).is_empty(),
+        "no mapping of the store's sidecars survives the last handle: {:?}",
+        common::zpg_mappings(&d)
+    );
     let db = Db::open(&d, opts).unwrap();
     assert!(db.zpage_counts().attached > 0);
     read_some(&db, keys);
     drop(db);
+    #[cfg(target_os = "linux")]
+    assert!(
+        common::zpg_mappings(&d).is_empty(),
+        "no mapping of the store's sidecars survives its close"
+    );
     let _ = std::fs::remove_dir_all(&d);
 }
 

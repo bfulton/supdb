@@ -67,7 +67,20 @@ read before the mapping is advised random, do not pull the whole file
 in by readahead (a 280 KB sidecar came in 67 pages of 69 that way). The
 arms `supdb-nocachezpagesnowarm` and `supdb-nocachezpageseager` are in
 the suite, unpriced; the pairing for a free machine is the one written
-above. 9 is next.
+above. Piece 9 is in: `a_zpages_life` pins a handle at a snapshot across
+two retirements -- a round whose merges retire the sidecars with their
+segments, and a sidecar taken out of a live segment's cell after a page
+flipped in place under the mapping failed its check, which waits in the
+retire list for the pin -- closes the store with the pin held, drops the
+handle without a release, and reads the process's mappings from the
+kernel after each step (`zpg_mappings` in `tests/common`, one definition
+for both files). The first version retired only with the merges, which
+go through the segment's own drop and never through `RetiredZ`, and a
+`RetiredZ` whose drop freed nothing passed it; the second fails at the
+handle's drop with the retired sidecar's dead name still mapped. The
+test's values are random bytes now, so a sidecar has more pages than
+the attach samples and a page can be flipped unsampled. All nine
+pieces are in; the stage's full gate is the next step, then stage 3.
 
 ## The pieces
 

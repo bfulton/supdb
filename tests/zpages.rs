@@ -24,6 +24,10 @@ use supdb::flatindex::Header;
 use supdb::flatindex::{record_key, stream_record_as, FlatIndex};
 use supdb::{Blob, Bytes, Db, MmapBytes, Options};
 
+mod common;
+#[cfg(target_os = "linux")]
+use common::zpg_mappings;
+
 fn scratch(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-next-zpages-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -3013,26 +3017,6 @@ fn the_empty_key_as_the_first_write_of_a_store() {
 }
 
 // ---- the lifecycle: damage, retirement and rebuild ----------------------------------
-
-/// The mappings this process holds of sidecar files under `dir`, as
-/// `/proc/self/maps` names them: a renamed file shows under its new name,
-/// an unlinked one with ` (deleted)`. One line a mapping, deduplicated by
-/// the file the line names, since a mapping may be split into several.
-#[cfg(target_os = "linux")]
-fn zpg_mappings(dir: &Path) -> Vec<String> {
-    let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
-    let prefix = dir.join("zpg-");
-    let prefix = prefix.to_string_lossy();
-    let mut v: Vec<String> = maps
-        .lines()
-        .filter_map(|l| l.split_whitespace().nth(5))
-        .filter(|p| p.starts_with(&*prefix))
-        .map(str::to_owned)
-        .collect();
-    v.sort();
-    v.dedup();
-    v
-}
 
 /// A page of the sidecar at `path`, from its middle on, that no attach
 /// samples and that `taken` does not name: a page whose first decode in
