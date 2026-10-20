@@ -770,6 +770,17 @@ pub struct Options {
     /// `prefetches`. Off.
     #[doc(hidden)]
     pub zpages_scan_prefetch: bool,
+    /// The overlay walk of a covered partition (`scan_partitions`) through
+    /// a cursor that keeps its group and position across the unsealed keys
+    /// it meets (`zside::ZCursor::walk_until`): the cut at an unsealed key
+    /// is a forward walk from where the cursor stands and the emit's
+    /// values are the record under it, one group open a group crossed.
+    /// Off, the walk is cut by rank as it first was: a seek, a fresh walk
+    /// and a values read at every unsealed key, each opening the group
+    /// again, which at the E mix's hot head of unsealed keys was most of a
+    /// scan's time. `supdb-nocachezpagesrankwalk` is that arm.
+    #[doc(hidden)]
+    pub zpages_walk_cursor: bool,
     /// EXPERIMENT: the block forms hold the fold of the partition and the
     /// level-0 pieces alone, and the memtables' keys reach a scan through
     /// the scan snapshot, which every walk overlays on its block whatever
@@ -2200,6 +2211,7 @@ impl Default for Options {
             zpages_memo: true,
             zpages_seek_ord: false,
             zpages_scan_prefetch: false,
+            zpages_walk_cursor: true,
             forms_pieces_only: false,
             publish_in_background: true,
             adaptive_shape: false,
@@ -15266,6 +15278,7 @@ impl Reader {
                 self.zmemo_take();
                 self.zbump_by(|s| &s.zscangroups, c.decoded);
                 self.zbump_by(|s| &s.znopagescans, c.nopage);
+                self.zbump_by(|s| &s.zprefetches, c.prefetches);
                 if c.fell_back() {
                     self.zbump(|s| &s.zfallbacks);
                     self.zbump(|s| &s.zscans);
@@ -20258,6 +20271,32 @@ impl Reader {
                 break;
             }
             cursor = seg.cursor_from(cursor);
+            // A covered partition walks through a cursor that keeps its
+            // group across the unsealed keys it meets
+            // (`Options::zpages_walk_cursor`); the heads arm and the walk
+            // cut by rank take the loop below.
+            if self.opts.zpages_walk_cursor && !self.opts.zpages_seek_ord && seg.z.get().is_some() {
+                if let PWalk::Z(c) = self.pwalk_seek(seg, cursor) {
+                    seen = self.scan_partition_cursor(
+                        seg,
+                        c,
+                        limit,
+                        seen,
+                        &mut mc,
+                        unsealed,
+                        &mut tombs,
+                        &mut scratch,
+                        &mut f,
+                    )?;
+                    match &seg.hi {
+                        Some(h) => cursor = h.as_slice(),
+                        None => break,
+                    }
+                    continue;
+                }
+                // The form could not seek (a fallback, counted): the walk
+                // below, through the raw form.
+            }
             let keys = seg.blob.keys();
             // The ordered index answers the seek this partition starts
             // with; the walk after it is the reader's own. That split is
@@ -20314,7 +20353,7 @@ impl Reader {
                     &mut scratch,
                     tombs,
                     (uk, &sk),
-                    same.then_some((seg, rank)),
+                    same.then_some(PartVals::Rank(seg, rank)),
                     unsealed,
                 )?;
                 if same {
@@ -20341,6 +20380,67 @@ impl Reader {
         Ok(seen)
     }
 
+    /// `scan_partitions`' walk of one covered partition through a cursor
+    /// (`Options::zpages_walk_cursor`): the cursor stands where the seek
+    /// left it, walks to each unsealed key inside the window emitting the
+    /// partition's keys below it (`ZCursor::walk_until`), lends the record
+    /// under it to the emit when the key is the partition's too, and steps
+    /// on; its group is held across all of it, so an unsealed key costs the
+    /// records between, not a seek, a walk start and a read that each open
+    /// the group again. Answers the keys seen so far, the cursor's counts
+    /// filed as it leaves the partition.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_partition_cursor<F: FnMut(&[u8], &[u8])>(
+        &self,
+        seg: &Seg,
+        mut c: zside::ZCursor<'_>,
+        limit: usize,
+        mut seen: usize,
+        mc: &mut SnapCursor,
+        unsealed: &Snapshot,
+        tombs: &mut Option<bool>,
+        scratch: &mut Vec<usize>,
+        f: &mut F,
+    ) -> Result<usize> {
+        while seen < limit {
+            let next = unsealed.peek(*mc);
+            let (n, at) = c.walk_until(next.map(|(uk, _)| uk), limit - seen, f)?;
+            seen += n;
+            if seen >= limit {
+                break;
+            }
+            // The walk stands at the unsealed key's place, or at the end of
+            // this partition's keys: the same rule as the walk by rank for
+            // which partition the key belongs to.
+            let Some((uk, sk)) = next else { break };
+            let same = at == Ordering::Equal;
+            if !same {
+                if seg.hi.as_ref().is_some_and(|h| uk >= h.as_slice()) {
+                    break;
+                }
+                if c.key().is_none() && seg.hi.is_none() {
+                    break;
+                }
+            }
+            let tombs = *tombs.get_or_insert_with(|| self.has_tombstones());
+            self.emit_unsealed(
+                f,
+                scratch,
+                tombs,
+                (uk, &sk),
+                same.then_some(PartVals::Cursor(&c)),
+                unsealed,
+            )?;
+            if same {
+                c.advance();
+            }
+            unsealed.advance(mc);
+            seen += 1;
+        }
+        self.pwalk_close(Some(PWalk::Z(c)));
+        Ok(seen)
+    }
+
     /// One unsealed key, emitted as `scan_merged` emits it with no level-0
     /// piece in the way: the partition's values first when `part` names an
     /// equal key, then the frozen memtables', then the live one's, each
@@ -20353,7 +20453,7 @@ impl Reader {
         scratch: &mut Vec<usize>,
         tombs: bool,
         entry: (&[u8], &UKey),
-        part: Option<(&Seg, usize)>,
+        part: Option<PartVals<'_, '_>>,
         snap: &Snapshot,
     ) -> Result<()> {
         let (key, uk) = entry;
@@ -20393,8 +20493,14 @@ impl Reader {
             }
         }
         if start == 0 {
-            if let Some((seg, rank)) = part {
-                self.part_values_z(seg, rank, &mut |v: &[u8]| f(key, v))?;
+            match part {
+                Some(PartVals::Rank(seg, rank)) => {
+                    self.part_values_z(seg, rank, &mut |v: &[u8]| f(key, v))?;
+                }
+                Some(PartVals::Cursor(c)) => {
+                    c.values(&mut |v: &[u8]| f(key, v))?;
+                }
+                None => {}
             }
         }
         for (i, fr) in frozen.iter().enumerate() {
@@ -28810,6 +28916,15 @@ enum PWalk<'a> {
         key: Option<&'a [u8]>,
     },
     Z(zside::ZCursor<'a>),
+}
+
+/// Where an unsealed key's emit reads the partition's own values from
+/// (`Reader::emit_unsealed`): the record at a rank, through the form or
+/// the raw form as the dispatch decides, or the record a cursor stands on,
+/// whose group the cursor holds already.
+enum PartVals<'a, 'b> {
+    Rank(&'a Seg, usize),
+    Cursor(&'a zside::ZCursor<'b>),
 }
 
 impl PWalk<'_> {
