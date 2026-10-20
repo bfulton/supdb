@@ -359,6 +359,26 @@ are the nocache arms' alone. The cache-on twins assert the point reads
 and the sidecars; the mutant with the option off fails all six tests,
 with no sidecar and no read served.
 
+Piece 8's in-core pairing (`scan-pairing.sh`; `scan-ab-1.out`,
+`scan-ab-2.out`; `supdb-nocache` against `supdb-nocachezpages` at three
+million keys, the operations divided by ten, two sittings with the arms
+swapped, read as form over raw): the scan pass at 0.30x and 0.31x on one
+thread and 0.25x on two and on three; the point reads at 0.17x and 0.19x
+(the design's in-core control registered 0.15-0.24x); the mixes C 0.19x,
+D 0.23x and 0.24x, B 0.33x, E 0.38x and 0.45x, F 0.55x and 0.62x, A
+0.69x and 0.74x; the ordered load 0.74x and 0.79x and the shuffled load
+0.76x and 0.77x, the builds in the sync. Six pairs of six in every cell
+in both sittings. The counts: 1.63 million scan walks served, none raw
+and no fallback, twenty-five sidecars for twenty-five partitions, 4.0
+million groups decoded for the walks, 2.5 a scan of a hundred, and a
+memo that answers few of a scan pass's opens, since the pass's starts
+are uniform over three million keys and the memo holds a thousand
+groups. That is the in-core loss the design registered, the decode
+against a walk that reads its records in place, on every path the form
+serves; it is why the form is the controller's to enter past memory
+(stage 4) and never a default, and what it buys is read out of core
+(`ooc-scan-pairing.sh`), below.
+
 ## What 2b's sittings leave open, read before 3's
 
 - The eager build's pairing (`eager-pairing.sh`, `eager-ab-1.out` and
