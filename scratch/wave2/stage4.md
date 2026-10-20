@@ -384,5 +384,58 @@ the quantity had read the same in the eleven rows since on another
 host, a bisect by the deterministic quantity named the streamed ordered
 load (61b7240, October 6), and the device's counter read a cut of two
 fifths where the suite's count read three and a half percent
-(`devbytes-*.txt`; `bench/CLAUDE.md`). The bounded rung (7.4) is the
-sitting after it.
+(`devbytes-*.txt`; `bench/CLAUDE.md`).
+
+The bounded pairing (7.4, `auto-ooc-pairing.sh forced`: the forced
+form's arm against the controller's at ten million keys under a
+gibibyte, six pairs after the warmup, the reads divided by ten) has its
+first sitting (`auto-ooc-forced-ab-1.out`, the trace in `.err`); the
+container restarted inside the second sitting's warmup, and that
+sitting is run again with the harness's phase marks on and every
+stderr line stamped, since the first sitting's trace had no clock
+against the passes. A diagnostic rep of the controller's arm alone
+(`bench run --scale ooc`, one rep, the same bound and division;
+`auto-ooc-diag.err` stamped, `auto-ooc-diag-threads.log` the process's
+threads and the device every two seconds) laid the controller's phases
+against the passes. What the two say so far, every figure the first
+sitting's or the diagnostic's:
+
+- The controller suspects during the load, once the raw form outgrows
+  the budget (phi_raw past one at about eight seconds of a fourteen
+  second load), samples the store as it grows (twelve samples a rep,
+  the last over twenty-nine partitions: build CPU 8-23 s, c_build
+  12-34 s), and starts the build by the ski rental about fifty-five
+  seconds after the first read, when the read pass (22 s, raw, 0.49
+  faults a read) and the threaded reads are already over.
+- The build then takes 136-196 s of wall a rep (the dwell at the
+  install is ten times the build's wall), beside the threaded scan
+  passes -- `size` scans a thread, five hundred million entries over
+  the raw form -- which hold the device at 99-100% busy, 140-196 MB/s,
+  with 35-50 thousand major faults a second; the build thread, at idle
+  CPU and idle I/O class, gets 4-19% of a core and 30-160 faults a
+  second, the device's leftovers. Its CPU estimate was 8-22 s.
+- So every read pass before the mixes runs raw: the read pass at 0.38x
+  of the forced arm's rate with 7.4x its faults, the threaded reads
+  0.19-0.23x, the scans 0.08-0.16x (consistent in all six pairs). The
+  load reads 1.25x, since the controller builds nothing during it where
+  the forced arm builds at every seal and merge (94 builds a load to
+  29).
+- The install lands 8-10 s before the mixes in every rep, and the mixes
+  run in COMPACT. In the pairing they read 0.25-0.63x of the forced
+  arm's with 0.07-0.45 major faults an operation (C, which only reads,
+  0.23); in the diagnostic rep alone they read 0.75-0.90x of the forced
+  arm's sitting-one rates with no faults at all. Why the pairing's form
+  files are cold at the mixes and the diagnostic's are not is the open
+  question the stamped second sitting is for.
+- The verdict so far: the controller decides right and late. It knows
+  during the load that the store will not fit and has priced the build,
+  and still waits the rental's fifty seconds, then runs the build at
+  the device's idle class behind the very faults the build exists to
+  remove, so the readers pay the build's price in faults ten times over
+  (a c_build of 12-34 s of CPU against 136-196 s of wall). The levers
+  to price as arms, after the second sitting: the build at the load's
+  close once SUSPECT stands and the sampler has priced it (what the
+  forced arm pays for in the load); the build's reads at the readers'
+  I/O class, sharing the device instead of waiting for it; and the
+  rental's price with the device term the sampler can see (t_f times
+  the raw pages a build must read while the readers fault).
