@@ -317,3 +317,17 @@ closing read's has a close of its own. The rule is the small rungs'
 again: a threshold a test's fixture sits near is crossed by the profile
 that moves the costs under it, so a test's inputs are read against every
 threshold on the path under both profiles before its green is believed.
+Piece 4's gate then reported the same two tests red in every run: its
+checked compile of `tests/db.rs` had been killed (`SIGKILL`, the memory
+kill the notes describe, with nothing else compiling) and the script ran
+the binaries on disk, which were the tree before the fix -- a check
+reporting a verdict it had not earned; the gate script stops on a failed
+build now. The same stress found three tests of the earlier tree
+load-sensitive: the fits test read the platform's own budget and
+refaults, and under twelve processes the group's refaults made the
+controller suspect a store that fits (it takes the seam's budget now,
+the platform's reading being the platform test's); the merge-retire
+test read a build's temp name for a live partition, started after it
+had collected the builds, as a file that outlived its segment (a temp
+name of a live segment stands now); and the tick wait of twenty seconds
+was too short for a segment work turn under that load once (a minute).
