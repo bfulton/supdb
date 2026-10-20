@@ -1,0 +1,8 @@
+bench ab: supdb-nocachezpages against supdb-nocachezpagesrankwalk at 3000000 keys, scans of 100, 6 pairs after a warmup, passes load,scan,mixes, ops divided by 10
+    29s  rep 0/6 (warmup)
+    58s  rep 1/6
+    86s  rep 2/6
+   114s  rep 3/6
+   144s  rep 4/6
+   173s  rep 5/6
+   201s  rep 6/6
