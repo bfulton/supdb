@@ -2378,6 +2378,29 @@ a failure, so the sum the wait reads is whole at every instant. The rule:
 a count another thread's wait sums with others is bumped before the
 thing it counts can be seen, never after.
 
+**A plan made against a state the plan's own first step replaces.** The
+merge planner takes the ranges due from the partitions standing, and the
+merge it then starts first joins a merge already finished, whose landing
+replaces the partitions that merge rewrote: a due range whose partition
+the landing had split named a range two of the new partitions tiled, the
+planner took it as it was beside them, and the merge cut its one key list
+at both -- pieces [0, 1500) and [0, 750) -- and refused its own key
+("merge slices leave a key unassigned"), which stops the store's segment
+work for good. One run in a few hundred of the reader-thread tests, once
+in an out-of-core sitting's shuffled load that was run again and read as
+the host's; eighty runs of the test four at a time did not reach the
+window, which is microseconds wide. It was reached by holding the first
+merge before its landing and making the planner join a merge in flight
+before it plans (`Db::hold_merge_landing`, `Db::plan_joins_merge`,
+`tests/fences.rs`), and closed by resolving the fences a caller gives
+against the partitions standing after the join (`resolve_fences`), with
+a debug assertion that a merge's fences are a sorted run of disjoint
+ranges. The rule: a plan made before a step that can change what it was
+planned against is re-resolved against the state after that step, and
+never carried across it as data; and a refusal that fires once in a
+sitting's run and once in a long test is one bug with its window named
+by both, not two accidents.
+
 **A probe's total over a whole read is an inlining result.** The same engine
 read +0.9, +1.9, +2.9 and +3.15 instructions a point read across four probes
 and a count +3.00 exactly, because the code after a probe's loop changes what

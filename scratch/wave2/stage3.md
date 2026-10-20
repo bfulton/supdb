@@ -306,6 +306,17 @@ uniform regime is its tail, a thousand buffers hot where there was one,
 which the p99 reads and the mean does not; the out-of-core pairing of
 piece 8 prices it against the faults it saves.
 
+Found by piece 4's gate, outside the form: the dev suite's
+`reader_threads_over_maintained_forms_keep_answering` died once in a
+flush with "merge slices leave a key unassigned: rank 1500 against piece
+2 of 8, ranks [0, 750)", the refusal 2b's out-of-core sitting had met
+once in its shuffled load and run past. The planner's fences were a
+landing old (`CLAUDE.md`, "A plan made against a state the plan's own
+first step replaces"); `resolve_fences` is the fix, `tests/fences.rs`
+builds the window with two new holds, and the emitter's refusal lists
+every piece's ranks now, which is how the shape was read off the one
+failure.
+
 ## What 2b's sittings leave open, read before 3's
 
 - The eager build's pairing (`eager-pairing.sh`, `eager-ab-1.out` and

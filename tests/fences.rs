@@ -41,6 +41,85 @@ fn hold_to(db: &Db, keys: &[Vec<u8>]) {
     assert_eq!(seen, want, "the scan's keys");
 }
 
+/// A merge planned with fences a landing old. The planner takes the
+/// ranges due from the partitions standing, and the merge it starts
+/// joins a finished merge first, whose landing replaces the partitions
+/// that merge rewrote: a fence of a partition that was gone named a range
+/// two of the new partitions tiled, the merge cut its one key list at
+/// both, and it refused its own key ("merge slices leave a key
+/// unassigned") -- one run in a few hundred of the reader-thread tests,
+/// once in an out-of-core sitting. Built here by holding the first merge
+/// before its landing and making the planner join it before it plans:
+/// the fences resolve to the partitions standing after the landing, the
+/// segment work goes on, the partitions tile, and every key reads back.
+#[test]
+fn a_merge_planned_with_fences_a_landing_old_takes_the_partitions_standing_after_it() {
+    let d = scratch("stale-fences");
+    let mut db = Db::create(
+        &d,
+        Options {
+            seal_bytes: 32 << 10,
+            partition_bytes: Some(32 << 10),
+            l0_trigger: 2,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let key = |k: u32| format!("key-{k:05}").into_bytes();
+    let mut keys: Vec<Vec<u8>> = (0..3000).map(key).collect();
+    for k in &keys {
+        db.append(k, b"0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    let fences = partition_fences(&d);
+    assert!(fences.len() >= 2, "partitions: {fences:?}");
+    let first_hi = fences[0].1.clone().expect("the first partition closes");
+    // Three pieces over the first partition, each of four hundred keys new
+    // to its range (between its first two keys), so that the merge of the
+    // range writes more keys than a piece may hold and splits it. The
+    // second piece's landing starts the merge, which is held before its
+    // landing; the third's landing finds the range due again, its pieces
+    // the merge's inputs, and plans a merge it must wait for.
+    db.hold_merge_landing(true);
+    for round in 0..3u32 {
+        for i in 0..400u32 {
+            let k = format!("key-00000-{round}{i:04}").into_bytes();
+            assert!(k.as_slice() < first_hi.as_slice());
+            db.append(&k, b"n");
+            keys.push(k);
+        }
+        db.commit().unwrap();
+        if round == 1 {
+            db.plan_joins_merge(true);
+        }
+        db.seal().unwrap();
+    }
+    let t = std::time::Instant::now();
+    while !db.merge_plan_joining() {
+        assert!(
+            t.elapsed().as_secs() < 30,
+            "the planner never waited to join the merge in flight"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    db.hold_merge_landing(false);
+    db.settle().unwrap();
+    db.plan_joins_merge(false);
+    db.settle().unwrap();
+    let after = partition_fences(&d);
+    assert!(after.len() > fences.len(), "the range split: {after:?}");
+    for w in after.windows(2) {
+        assert_eq!(
+            w[0].1.as_ref(),
+            Some(&w[1].0),
+            "the partitions tile: {after:?}"
+        );
+    }
+    hold_to(&db, &keys);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// The first partitioning derives its bounds from the keys at even ranks,
 /// cut to the fence's length, so a run of keys longer than a fence that
 /// share their first sixteen bytes gives a bound at or below the run's
