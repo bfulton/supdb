@@ -536,6 +536,27 @@ key it is to stop at (the windows wrong, the unit test's compare
 wrong). The pairings against the arm, in core and under the bound,
 two sittings each, are below once run.
 
+The in-core pairing of the cursor against the walk by rank
+(`cursor-pairing.sh core`; `cursor-core-ab-1.out`, `cursor-core-ab-2.out`;
+three million keys, the load, the scan pass and the mixes, the
+operations divided by ten, six pairs after the warmup, two sittings
+with the arms swapped, read as cursor over rank): E at 1.88x and 1.81x,
+six pairs of six both times, from 58-62 thousand operations a second to
+110-112 thousand, which against the raw form's in-core E of 150-172
+thousand is 0.64-0.73x where it was 0.38-0.45x; the scan pass at 1.07x
+and 0.93x, neither significant, so level; A, C, D, F and the loads
+within the coin both times; B 0.96x and 0.92x, the second significant
+at six pairs and B a mix with no scan in it, so a position effect until
+a third sitting says otherwise. The counts are the same in both
+sittings: 114 thousand memo hits against 1.63 million over the scans and
+the mixes, 50 thousand walks against 129 thousand, 40 thousand groups
+decoded against 50. The gate's stress beside it read one run in twelve
+of `covered_and_uncovered_partitions_agree_across_their_boundaries` with
+every partition covered and nothing failed: the test set its fail hook
+after the load, and under the eager build the load's landings had
+started and finished every build before it on the loaded box; its
+builds are left to the settle now, as its siblings' are.
+
 ## What 2b's sittings leave open, read before 3's
 
 - The eager build's pairing (`eager-pairing.sh`, `eager-ab-1.out` and
