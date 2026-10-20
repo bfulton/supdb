@@ -317,6 +317,48 @@ builds the window with two new holds, and the emitter's refusal lists
 every piece's ranks now, which is how the shape was read off the one
 failure.
 
+Piece 5 is in: `Options::zpages_seek_ord` (off) sends `part_seek_z`,
+`part_cut_z` and `pwalk_seek` to the ordered index's heads and the raw
+records, the walk after the seek the sidecar's;
+`supdb-nocachezpagesheads` is the arm; its test holds the arm's seeks to
+reading the raw form (`raw_touches` grows under it where the forced arm
+reads zero) and its windows to the same keys. Piece 6 is in:
+`Options::zpages_scan_prefetch` (off), one `MADV_WILLNEED` a walk, at the
+first page it opens, for the pages it will cross (the keys still wanted
+over the mean records a page, `ZPREFETCH_PAGES` = 16 at most), counted
+`prefetches` on the handle's line and as the `zpage_prefetches` row;
+`supdb-nocachezpagesprefetch` the arm. The unit test evicts the sidecar's
+file before the attach, attaches under random advice and reads the
+residency outside the attach's sampled pages, because the first version
+read its control pages resident: the kernel's fault-around maps cached
+neighbours on a file fault whatever the advice, readahead under the
+default advice brings sixteen pages in behind a fault, and
+`posix_fadvise(DONTNEED)` drops no page a mapping holds. The integration
+test counts the long walks' asks, one a walk, and none after a reopen
+with the option off. The bench's
+`each_single_option_arm_differs_from_the_zpages_arm_in_that_option_alone`
+covers both arms.
+
+Piece 7 is in: `scan_path_arms()` has `zpages` and `nocachezpages`, so the
+two scan-path tests run their nine arms; the overlay model's twins with
+the form forced, with the block cache and without; the readers on
+threads with the form, with the block cache and without it -- the
+second added here, since that is the lifecycle where merges retire
+sidecars under live cursors; `a_run_of_every_shape_reads_the_same`
+through the scan. Each arm with the form settles the sidecars where the
+store's partitions are made and after the landings, and asserts what the
+form served: every partition a sidecar, the point reads through them,
+and under the nocache shape the scans' partition walks too. The first
+assertion asked for served scans of every arm with the form, and four
+tests answered `scans: 0, raw_scans: 0` with the block cache on: the
+block path's walks reach no dispatch of the form, by piece 1's scope and
+piece 3's listing (`scan_blocks` and `BuildCtx` build the forms from the
+records through the door), so with the cache on, which is the shipping
+default, the form serves scans nothing, and the scan cells piece 8 reads
+are the nocache arms' alone. The cache-on twins assert the point reads
+and the sidecars; the mutant with the option off fails all six tests,
+with no sidecar and no read served.
+
 ## What 2b's sittings leave open, read before 3's
 
 - The eager build's pairing (`eager-pairing.sh`, `eager-ab-1.out` and

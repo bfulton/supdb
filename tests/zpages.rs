@@ -790,6 +790,11 @@ fn a_run_of_every_shape_reads_the_same() {
     check(&z, &model, &keys, "z");
     check(&raw, &model, &keys, "raw");
     check(&z.reader().unwrap(), &model, &keys, "z, a handle");
+    // And through the scan, which walks every shape's record out of its
+    // group and reads its run as the point read does.
+    check_scan(&z, &model, "z, the scan");
+    check_scan(&z.reader().unwrap(), &model, "z, a handle's scan");
+    check_scan(&raw, &model, "raw, the scan");
     let after = z.zpage_counts();
     assert!(after.reads >= keys.len() as u64 * 2 && after.counts >= keys.len() as u64 * 2);
     assert_eq!(after.fallbacks + after.rawserves, 0, "{after:?}");
