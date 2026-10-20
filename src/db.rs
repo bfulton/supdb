@@ -67,6 +67,7 @@ pub mod zpages;
 // cell a segment holds it in, and the builder. Private: it is the engine's
 // and nothing outside `db` names it.
 mod zfile;
+pub use zfile::ZInject;
 
 /// Write a segment's ordered index, and make it durable where `durable`
 /// says so (`Options::ord_durable`).
@@ -343,6 +344,17 @@ pub enum ZPages {
     /// This is the arm that prices the form: it is built and read whether
     /// or not the store needs it.
     Always,
+    /// The controller (`zselect`): the form is entered when the store's
+    /// reads block past the cache and left when they do not, the gate word
+    /// saying which form a read takes. Inert where it cannot run -- the
+    /// segment work without a thread of its own, an unpinned writer, a
+    /// platform that is not Linux -- behaving as `Off` there, counted
+    /// (`ZCounts::auto_inert`) and never refusing the open. It reads the
+    /// model (the cache budget against the partitions' footprint) once a
+    /// second and moves between FITS and SUSPECT on it; the census, the
+    /// sampler and the builds under the controller are the pieces after
+    /// this one, so it builds nothing yet.
+    Auto,
 }
 
 /// What the second form has done (`Options::zpages`), read by
@@ -442,6 +454,17 @@ pub struct ZCounts {
     /// them: form files left by a crash or by a store that ran without the
     /// option, and the temp names of builds that did not finish.
     pub swept: u64,
+    /// The controller's (`ZPages::Auto`): the gate word as it stands, the
+    /// phase (`zselect::Phase::code`), whether the option is inert under
+    /// these options, and the selector's counts.
+    pub gate: u8,
+    pub phase: u8,
+    pub auto_inert: u64,
+    pub sel_steps: u64,
+    pub sel_s1: u64,
+    pub sel_switches: u64,
+    pub sel_trials: u64,
+    pub sel_trials_back: u64,
     /// Partitions live, the ones with a form file installed, the ones of
     /// those out of service, and their pages, the pages a first decode has
     /// passed, the pages a check failed, the fences kept in memory, the
@@ -781,6 +804,11 @@ pub struct Options {
     /// scan's time. `supdb-nocachezpagesrankwalk` is that arm.
     #[doc(hidden)]
     pub zpages_walk_cursor: bool,
+    /// A test's seam for what the controller reads from the platform
+    /// (`zfile::ZInject`): the budget, the refault rate and the clock,
+    /// per store.
+    #[doc(hidden)]
+    pub zpages_inject: Option<std::sync::Arc<zfile::ZInject>>,
     /// EXPERIMENT: the block forms hold the fold of the partition and the
     /// level-0 pieces alone, and the memtables' keys reach a scan through
     /// the scan snapshot, which every walk overlays on its block whatever
@@ -2212,6 +2240,7 @@ impl Default for Options {
             zpages_seek_ord: false,
             zpages_scan_prefetch: false,
             zpages_walk_cursor: true,
+            zpages_inject: None,
             forms_pieces_only: false,
             publish_in_background: true,
             adaptive_shape: false,
@@ -6048,6 +6077,20 @@ impl PieceWriter {
 }
 
 impl Seg {
+    /// The footprint a raw point read of this partition touches, bytes
+    /// (`zselect::model_raw`): the index section, which every read probes,
+    /// and the record region, which every read lands in. Read through the
+    /// form file's door, since it is a fact of the file and not a touch of
+    /// its records; a reader that does not hold the section whole has no
+    /// record region to speak of.
+    fn foot(&self) -> (u64, u64) {
+        let raw = self.blob.for_zfile();
+        let records = raw
+            .record_regions()
+            .map_or(0, |(recs, _)| recs.len() as u64);
+        (self.blob.index_bytes() as u64, records)
+    }
+
     /// The raw form, for a read of the records on purpose (`SegBlob`):
     /// counted while a form file is installed, under debug assertions, so
     /// that a test can hold a covered partition's reads to the form file.
@@ -11389,6 +11432,41 @@ impl Drop for State {
 
 /// What every handle on one store shares: the state, the reader table
 /// the writer frees against, and the mappings' advice mode.
+/// The store-level word that says which form a read takes (`zselect`):
+/// `GATE_RAW`, `GATE_CENSUS` or `GATE_Z`, pinned at the raw form by
+/// `ZPages::Off` and at the compact form by `ZPages::Always`, and moved by
+/// the controller's tick alone under `ZPages::Auto`. On a line of its own,
+/// since every dispatch to the form loads it and nothing a read does may
+/// write a line another thread writes.
+#[repr(align(128))]
+struct ZGate(std::sync::atomic::AtomicU8);
+
+impl ZGate {
+    fn new(zpages: ZPages) -> ZGate {
+        ZGate(std::sync::atomic::AtomicU8::new(match zpages {
+            ZPages::Always => zselect::GATE_Z,
+            ZPages::Off | ZPages::Auto => zselect::GATE_RAW,
+        }))
+    }
+
+    fn load(&self) -> u8 {
+        self.0.load(AtomicOrdering::Relaxed)
+    }
+
+    fn store(&self, gate: u8) {
+        self.0.store(gate, AtomicOrdering::Release);
+    }
+}
+
+/// Whether `ZPages::Auto` cannot run under these options and behaves as
+/// `Off`: the controller's tick is the segment work's thread's, the cell a
+/// read follows is freed through the epoch, and the budget is read from
+/// the platform's files.
+fn z_auto_inert(opts: &Options) -> bool {
+    opts.zpages == ZPages::Auto
+        && (!opts.publish_in_background || !opts.writer_pins || !cfg!(target_os = "linux"))
+}
+
 struct Shared {
     state: AtomicPtr<State>,
     /// The reader table: slots for reader handles, and the epoch the
@@ -11398,6 +11476,8 @@ struct Shared {
     /// the epoch each was retired at. The writer and the segment work
     /// both publish, so both push.
     retired: RetireList<Box<State>>,
+    /// Which form a read takes (`ZGate`).
+    zgate: ZGate,
     /// Which mode the segment mappings are in: `true` is `MADV_RANDOM`.
     /// One flag for the whole store rather than one per segment, because
     /// the phase is a property of what the caller is doing and not of
@@ -14875,6 +14955,14 @@ impl Reader {
             rejected_damage: get(&ev.rejected_damage),
             rejected_identity: get(&ev.rejected_identity),
             swept: get(&ev.swept),
+            gate: self.shared.zgate.load(),
+            phase: get(&ev.phase) as u8,
+            auto_inert: u64::from(z_auto_inert(&self.opts)),
+            sel_steps: get(&ev.sel_steps),
+            sel_s1: get(&ev.sel_s1),
+            sel_switches: get(&ev.sel_switches),
+            sel_trials: get(&ev.sel_trials),
+            sel_trials_back: get(&ev.sel_trials_back),
             ..ZCounts::default()
         };
         for seg in self.segs().iter().filter(|s| s.level > 0) {
@@ -14998,6 +15086,15 @@ impl Reader {
     /// Out of line on purpose, as `part_via_ord` is: its one call site
     /// invites the compiler to inline it, and inlined it grows `read_all`,
     /// which every point read runs.
+    /// Whether the gate says the compact form: every dispatch to the form
+    /// asks first, one relaxed load of a word on its own line, so an
+    /// attached cell under the raw gate (the trial, or a form file attached
+    /// before the controller wanted it) is served raw and counted nothing.
+    #[inline]
+    fn z_on(&self) -> bool {
+        self.shared.zgate.load() == zselect::GATE_Z
+    }
+
     #[inline(never)]
     fn part_read_z<F: FnMut(&[u8])>(
         &self,
@@ -15006,6 +15103,9 @@ impl Reader {
         f: &mut F,
         raw: impl Fn(&Seg, &mut F) -> Result<u64>,
     ) -> Result<u64> {
+        if !self.z_on() {
+            return raw(seg, f);
+        }
         let Some(z) = seg.z.get() else {
             self.zbump(|s| &s.zraw);
             return raw(seg, f);
@@ -15045,6 +15145,9 @@ impl Reader {
                 .count(key)
                 .map_err(|e| err(&format!("segment count: {e}")))
         };
+        if !self.z_on() {
+            return raw();
+        }
         let Some(z) = seg.z.get() else {
             self.zbump(|s| &s.zraw);
             return raw();
@@ -15094,6 +15197,9 @@ impl Reader {
                 .scan_at(rank, n, &mut *f)
                 .map_err(|e| err(&format!("segment scan: {e}")))
         };
+        if !self.z_on() {
+            return raw(rank, n, f);
+        }
         let Some(z) = seg.z.get() else {
             if self.opts.zpages == ZPages::Always {
                 self.zbump(|s| &s.zscans);
@@ -15131,12 +15237,12 @@ impl Reader {
     /// form where it holds none or the form file cannot say.
     fn part_seek_z(&self, seg: &Seg, key: &[u8]) -> usize {
         let raw = || seg.ord.seek(key, |r| seg.raw().key_at(r));
+        if !self.z_on() || self.opts.zpages_seek_ord {
+            return raw();
+        }
         let Some(z) = seg.z.get() else {
             return raw();
         };
-        if self.opts.zpages_seek_ord {
-            return raw();
-        }
         let r = z.seek(&self.zmemo, key);
         self.zmemo_take();
         match r {
@@ -15158,12 +15264,12 @@ impl Reader {
     /// (`ZFile::cut_in`) where the cell holds one in service, over the
     /// ordered index's heads and the raw records otherwise.
     fn part_cut_z(&self, seg: &Seg, rank: usize, end: usize, uk: &[u8]) -> (usize, Ordering) {
+        if !self.z_on() || self.opts.zpages_seek_ord {
+            return BuildCtx::cut_at(seg, rank, end, uk);
+        }
         let Some(z) = seg.z.get() else {
             return BuildCtx::cut_at(seg, rank, end, uk);
         };
-        if self.opts.zpages_seek_ord {
-            return BuildCtx::cut_at(seg, rank, end, uk);
-        }
         let r = z.cut_in(&self.zmemo, rank, end, uk);
         self.zmemo_take();
         match r {
@@ -15192,6 +15298,9 @@ impl Reader {
                 .values_at(rank, &mut *f)
                 .map_err(|e| err(&format!("segment scan read: {e}")))
         };
+        if !self.z_on() {
+            return raw(f);
+        }
         let Some(z) = seg.z.get() else {
             return raw(f);
         };
@@ -15221,7 +15330,7 @@ impl Reader {
     /// `scan_merged`'s walk of `seg` from `rank`: through the form file
     /// where the cell holds one in service, the raw form's otherwise.
     fn pwalk_at<'a>(&'a self, seg: &'a Seg, rank: usize) -> PWalk<'a> {
-        match seg.z.get() {
+        match seg.z.get().filter(|_| self.z_on()) {
             Some(z) if !z.damaged() => PWalk::Z(zfile::ZCursor::at(
                 &self.zmemo,
                 z,
@@ -15241,7 +15350,7 @@ impl Reader {
     /// it, or the ordered index's where the form file cannot say, with a
     /// fallback counted where a check failed.
     fn pwalk_seek<'a>(&'a self, seg: &'a Seg, key: &[u8]) -> PWalk<'a> {
-        if let Some(z) = seg.z.get() {
+        if let Some(z) = seg.z.get().filter(|_| self.z_on()) {
             if self.opts.zpages_seek_ord {
                 let rank = seg.ord.seek(key, |r| seg.raw().key_at(r));
                 return self.pwalk_at(seg, rank);
@@ -20275,7 +20384,11 @@ impl Reader {
             // group across the unsealed keys it meets
             // (`Options::zpages_walk_cursor`); the heads arm and the walk
             // cut by rank take the loop below.
-            if self.opts.zpages_walk_cursor && !self.opts.zpages_seek_ord && seg.z.get().is_some() {
+            if self.opts.zpages_walk_cursor
+                && !self.opts.zpages_seek_ord
+                && self.z_on()
+                && seg.z.get().is_some()
+            {
                 if let PWalk::Z(c) = self.pwalk_seek(seg, cursor) {
                     seen = self.scan_partition_cursor(
                         seg,
@@ -21184,6 +21297,7 @@ impl Db {
             next_dead: AtomicU64::new(1),
             zbuild_hold: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(zhold_of(&opts))),
             fail_zbuild: std::sync::atomic::AtomicBool::new(false),
+            zgate: ZGate::new(opts.zpages),
             run_remaps: AtomicU64::new(0),
             stream_recycled: AtomicU64::new(0),
             manifest_seq: AtomicU64::new(0),
@@ -21662,6 +21776,7 @@ impl Db {
             next_dead: AtomicU64::new(1),
             zbuild_hold: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(zhold_of(&opts))),
             fail_zbuild: std::sync::atomic::AtomicBool::new(false),
+            zgate: ZGate::new(opts.zpages),
             run_remaps: AtomicU64::new(0),
             stream_recycled: AtomicU64::new(0),
             manifest_seq: AtomicU64::new(0),
@@ -25011,6 +25126,14 @@ impl Db {
     #[doc(hidden)]
     pub fn fail_next_zpage_build(&self) {
         self.shared.fail_zbuild.store(true, AtomicOrdering::Release);
+    }
+
+    /// A test's: the gate word set by hand, so a store under `Always` can be
+    /// read with the gate at the raw form, as the controller's trial reads
+    /// it, with its form files attached.
+    #[doc(hidden)]
+    pub fn zgate_set(&self, gate: u8) {
+        self.shared.zgate.store(gate);
     }
 
     /// A test's: while `on`, a form file build on the builder's thread waits
@@ -29272,6 +29395,18 @@ struct Maint {
     /// Inside a `ZSettle` answer: every kind of build is due, where the
     /// loop's own turns start only the builds of partitions with none.
     z_settling: bool,
+    /// The controller (`ZPages::Auto`): the selector, whether it runs under
+    /// these options, whether its decisions are traced
+    /// (`SUPDB_ZPAGES_TRACE`), the epoch its clock counts from, when it
+    /// last stepped and last read the model, and the group's refault count
+    /// at the last model reading, for the rate.
+    zsel: zselect::ZSelect,
+    z_auto: bool,
+    z_trace: bool,
+    z_epoch: std::time::Instant,
+    z_last_step: Option<std::time::Duration>,
+    z_last_s1: Option<std::time::Duration>,
+    z_refaults: Option<(u64, std::time::Duration)>,
 }
 
 impl std::ops::Deref for Maint {
@@ -29653,6 +29788,7 @@ impl Maint {
         r.shared
             .manifest_seq
             .store(manifest_seq, AtomicOrdering::Release);
+        let z_auto = r.opts.zpages == ZPages::Auto && !z_auto_inert(&r.opts);
         Maint {
             r,
             dir: dir.to_path_buf(),
@@ -29672,6 +29808,13 @@ impl Maint {
             shaped_at: 0,
             zbuild: None,
             z_settling: false,
+            zsel: zselect::ZSelect::default(),
+            z_auto,
+            z_trace: std::env::var_os("SUPDB_ZPAGES_TRACE").is_some(),
+            z_epoch: std::time::Instant::now(),
+            z_last_step: None,
+            z_last_s1: None,
+            z_refaults: None,
         }
     }
 
@@ -30954,6 +31097,10 @@ impl Maint {
     /// of service; the loop's own turns build only for partitions with
     /// none, and only under `Options::zpages_eager`.
     fn z_step(&mut self) {
+        if self.z_auto {
+            self.z_tick();
+            return;
+        }
         if self.opts.zpages != ZPages::Always || !(self.z_settling || self.opts.zpages_eager) {
             return;
         }
@@ -30972,6 +31119,124 @@ impl Maint {
         };
         if let Some((seg, kind)) = next {
             self.z_start(seg, kind);
+        }
+    }
+
+    /// The controller's clock: the injected one where a test has moved it,
+    /// else the monotonic clock since this segment work began.
+    fn z_now(&self) -> std::time::Duration {
+        self.opts
+            .zpages_inject
+            .as_ref()
+            .and_then(|i| i.clock())
+            .unwrap_or_else(|| self.z_epoch.elapsed())
+    }
+
+    /// The controller's tick (`ZPages::Auto`): once a census interval the
+    /// selector steps on what the platform and the store say, with the
+    /// model on the first step of each second, and its decision is
+    /// published -- the gate word, the phase and the counts. This piece
+    /// feeds the model alone: the census, the sampler and the builds under
+    /// the controller follow, so the rung moves between FITS and SUSPECT
+    /// and nothing is built.
+    fn z_tick(&mut self) {
+        let now = self.z_now();
+        if self
+            .z_last_step
+            .is_some_and(|t| now.saturating_sub(t) < zselect::CENSUS_INTERVAL)
+        {
+            return;
+        }
+        self.z_last_step = Some(now);
+        let model = if self
+            .z_last_s1
+            .is_none_or(|t| now.saturating_sub(t) >= zselect::S1_PERIOD)
+        {
+            self.z_last_s1 = Some(now);
+            self.z_model(now)
+        } else {
+            None
+        };
+        let input = zselect::Input {
+            now,
+            model,
+            sampler: None,
+            generation: 0,
+            census: zselect::Census::default(),
+            build: zselect::Build::default(),
+            footprint: None,
+        };
+        let d = self.zsel.step(&input);
+        self.z_apply(&d, model.as_ref());
+    }
+
+    /// The model's reading (S1): the cache budget from the injection or the
+    /// platform, the group's refaults a second over the tick, and the raw
+    /// form's predicted faults a read over the partitions' footprint. None
+    /// where the platform gives no budget.
+    fn z_model(&mut self, now: std::time::Duration) -> Option<zselect::Model> {
+        let inject = self.opts.zpages_inject.clone();
+        let platform = zfile::read_budget();
+        let budget = inject
+            .as_ref()
+            .and_then(|i| i.budget())
+            .or(platform.map(|b| b.budget))?;
+        let refault_rate = match inject.as_ref().and_then(|i| i.refault_rate()) {
+            Some(r) => r,
+            None => {
+                let refaults = platform.and_then(|b| b.refaults);
+                let rate = match (refaults, self.z_refaults) {
+                    (Some(r), Some((r0, t0))) if now > t0 => {
+                        r.saturating_sub(r0) as f64 / (now - t0).as_secs_f64()
+                    }
+                    _ => 0.0,
+                };
+                if let Some(r) = refaults {
+                    self.z_refaults = Some((r, now));
+                }
+                rate
+            }
+        };
+        let (hash, records) = {
+            let _op = self.op();
+            self.segs()
+                .iter()
+                .filter(|s| s.level > 0)
+                .fold((0u64, 0u64), |(h, r), s| {
+                    let (sh, sr) = s.foot();
+                    (h.saturating_add(sh), r.saturating_add(sr))
+                })
+        };
+        Some(zselect::Model {
+            phi_raw: zselect::model_raw(budget, hash, records),
+            phi_z: None,
+            phi_z_scan: None,
+            refault_rate,
+            budget,
+        })
+    }
+
+    /// A decision published: the gate word last, the phase and the counts
+    /// beside it, and a trace line where asked.
+    fn z_apply(&self, d: &zselect::Decision, model: Option<&zselect::Model>) {
+        let ev = &self.shared.z;
+        self.shared.zgate.store(d.gate);
+        ev.phase
+            .store(u64::from(d.phase.code()), AtomicOrdering::Relaxed);
+        ev.census
+            .store(u64::from(d.census), AtomicOrdering::Relaxed);
+        let c = self.zsel.counts();
+        ev.sel_steps.store(c.steps, AtomicOrdering::Relaxed);
+        ev.sel_s1.store(c.s1_ticks, AtomicOrdering::Relaxed);
+        ev.sel_switches.store(c.switches, AtomicOrdering::Relaxed);
+        ev.sel_trials.store(c.trials, AtomicOrdering::Relaxed);
+        ev.sel_trials_back
+            .store(c.trials_back, AtomicOrdering::Relaxed);
+        if self.z_trace && (model.is_some() || d.event.is_some()) {
+            eprintln!(
+                "zselect {:?} gate {} census {} build {} sample {} event {:?} model {:?}",
+                d.phase, d.gate, d.census, d.build, d.sample, d.event, model
+            );
         }
     }
 

@@ -711,6 +711,18 @@ impl Phase {
     pub fn census(self) -> bool {
         self != Phase::Fits
     }
+
+    /// The phase as a number, for a gauge: FITS 0, SUSPECT 1, building 2,
+    /// COMPACT 3, the trial 4.
+    pub fn code(self) -> u8 {
+        match self {
+            Phase::Fits => 0,
+            Phase::Suspect => 1,
+            Phase::Building => 2,
+            Phase::Compact => 3,
+            Phase::Trial => 4,
+        }
+    }
 }
 
 /// Why COMPACT was left.
@@ -1964,9 +1976,254 @@ impl ZSelect {
     }
 }
 
+// ---- the platform's side of the model ------------------------------------
+
+/// What the platform says of the memory the store's page cache may use
+/// (design 4.2): the limit in effect, the anonymous memory charged against
+/// it, the group's file refaults so far where the platform counts them, and
+/// the budget `B = limit - anon - margin`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    pub limit: u64,
+    pub anon: u64,
+    pub refaults: Option<u64>,
+    pub budget: u64,
+}
+
+/// A twentieth of the limit, and sixty-four mebibytes at least: what the
+/// model leaves for the kernel's own and the page cache's slack.
+pub fn margin(limit: u64) -> u64 {
+    (limit / 20).max(64 << 20)
+}
+
+impl Budget {
+    pub fn of(limit: u64, anon: u64, refaults: Option<u64>) -> Budget {
+        Budget {
+            limit,
+            anon,
+            refaults,
+            budget: limit.saturating_sub(anon).saturating_sub(margin(limit)),
+        }
+    }
+}
+
+/// cgroup v1's "no limit": `i64::MAX` rounded down to a page.
+pub const V1_NO_LIMIT: u64 = 1 << 62;
+
+/// The v1 memory controller's path for this process from `/proc/self/cgroup`
+/// text: the line `N:memory:/path`, or one naming `memory` among several
+/// controllers. A v2-only host has only the `0::/path` line, which names no
+/// controller, and is `None` here.
+pub fn parse_cgroup_v1_path(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let mut it = line.splitn(3, ':');
+        let (Some(_id), Some(controllers), Some(path)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        if controllers.split(',').any(|c| c == "memory") {
+            return Some(path.to_string());
+        }
+    }
+    None
+}
+
+/// The unified hierarchy's path for this process: the `0::/path` line.
+pub fn parse_cgroup_v2_path(text: &str) -> Option<String> {
+    for line in text.lines() {
+        if let Some(path) = line.strip_prefix("0::") {
+            return Some(path.to_string());
+        }
+    }
+    None
+}
+
+/// Where a cgroup mount of `kind` (`cgroup` with the `memory` option, or
+/// `cgroup2`) is, from `/proc/mounts` text: the mount point is the second
+/// field, as the text has it.
+pub fn parse_mount(text: &str, kind: &str) -> Option<String> {
+    for line in text.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 4 || f[2] != kind {
+            continue;
+        }
+        if kind == "cgroup" && !f[3].split(',').any(|o| o == "memory") {
+            continue;
+        }
+        return Some(f[1].to_string());
+    }
+    None
+}
+
+/// What a v1 group's `memory.stat` says: the limit in effect through the
+/// hierarchy, the anonymous memory (`rss` and `rss_huge`) and the file
+/// refaults, each `None` where the key is absent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StatV1 {
+    pub limit: Option<u64>,
+    pub rss: u64,
+    pub rss_huge: u64,
+    pub refaults: Option<u64>,
+}
+
+pub fn parse_stat_v1(text: &str) -> StatV1 {
+    let mut s = StatV1::default();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(k), Some(v)) = (it.next(), it.next()) else {
+            continue;
+        };
+        let Ok(v) = v.parse::<u64>() else { continue };
+        match k {
+            "hierarchical_memory_limit" => s.limit = Some(v),
+            "rss" => s.rss = v,
+            "rss_huge" => s.rss_huge = v,
+            "workingset_refault_file" | "workingset_refault" => s.refaults = Some(v),
+            _ => {}
+        }
+    }
+    s
+}
+
+/// What a v2 group's `memory.stat` says: the anonymous memory and the file
+/// refaults.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StatV2 {
+    pub anon: u64,
+    pub refaults: Option<u64>,
+}
+
+pub fn parse_stat_v2(text: &str) -> StatV2 {
+    let mut s = StatV2::default();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(k), Some(v)) = (it.next(), it.next()) else {
+            continue;
+        };
+        let Ok(v) = v.parse::<u64>() else { continue };
+        match k {
+            "anon" => s.anon = v,
+            "workingset_refault_file" | "workingset_refault" => s.refaults = Some(v),
+            _ => {}
+        }
+    }
+    s
+}
+
+/// A v2 `memory.max` or `memory.high`: a number, or `max` for none.
+pub fn parse_limit(text: &str) -> Option<u64> {
+    let t = text.trim();
+    if t == "max" {
+        return None;
+    }
+    t.parse::<u64>().ok()
+}
+
+/// `MemTotal` of `/proc/meminfo`, bytes.
+pub fn parse_meminfo_total(text: &str) -> Option<u64> {
+    parse_kb(text, "MemTotal:")
+}
+
+/// `RssAnon` of `/proc/self/status`, bytes.
+pub fn parse_status_rss_anon(text: &str) -> Option<u64> {
+    parse_kb(text, "RssAnon:")
+}
+
+fn parse_kb(text: &str, key: &str) -> Option<u64> {
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix(key) {
+            let n: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return n.checked_mul(1024);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- the platform's side ------------------------------------------
+
+    #[test]
+    fn the_cgroup_parsers_read_this_hosts_shapes_and_a_v2_only_host() {
+        let v1 = "12:pids:/a\n4:memory:/process_api/x/claude-code-bash\n0::/\n";
+        assert_eq!(
+            parse_cgroup_v1_path(v1).as_deref(),
+            Some("/process_api/x/claude-code-bash")
+        );
+        assert_eq!(parse_cgroup_v2_path(v1).as_deref(), Some("/"));
+        let several = "3:cpu,memory:/g\n";
+        assert_eq!(parse_cgroup_v1_path(several).as_deref(), Some("/g"));
+        let v2only = "0::/user.slice/s\n";
+        assert_eq!(parse_cgroup_v1_path(v2only), None);
+        assert_eq!(
+            parse_cgroup_v2_path(v2only).as_deref(),
+            Some("/user.slice/s")
+        );
+        let mounts = "sysfs /sys sysfs rw 0 0\n\
+                      cgroup /sys/fs/cgroup/cpu cgroup rw,cpu 0 0\n\
+                      cgroup /sys/fs/cgroup/memory cgroup rw,memory 0 0\n\
+                      cgroup2 /sys/fs/cgroup/unified cgroup2 rw,nsdelegate 0 0\n";
+        assert_eq!(
+            parse_mount(mounts, "cgroup").as_deref(),
+            Some("/sys/fs/cgroup/memory")
+        );
+        assert_eq!(
+            parse_mount(mounts, "cgroup2").as_deref(),
+            Some("/sys/fs/cgroup/unified")
+        );
+        assert_eq!(parse_mount("none /x tmpfs rw 0 0\n", "cgroup"), None);
+        let stat = "cache 1024\nrss 2048\nrss_huge 4096\nmapped_file 7\n\
+                    workingset_refault_file 99\nhierarchical_memory_limit 1073741824\n";
+        assert_eq!(
+            parse_stat_v1(stat),
+            StatV1 {
+                limit: Some(1 << 30),
+                rss: 2048,
+                rss_huge: 4096,
+                refaults: Some(99),
+            }
+        );
+        assert_eq!(parse_stat_v1("rss 5\n").refaults, None);
+        assert_eq!(
+            parse_stat_v2("anon 123\nfile 9\nworkingset_refault_file 4\n"),
+            StatV2 {
+                anon: 123,
+                refaults: Some(4)
+            }
+        );
+        assert_eq!(parse_limit("max\n"), None);
+        assert_eq!(parse_limit("1073741824\n"), Some(1 << 30));
+        assert_eq!(parse_limit("junk"), None);
+        assert_eq!(
+            parse_meminfo_total("MemTotal:       16479232 kB\nMemFree: 1 kB\n"),
+            Some(16479232 * 1024)
+        );
+        assert_eq!(
+            parse_status_rss_anon("Name:\tx\nRssAnon:\t  4096 kB\nRssFile: 1 kB\n"),
+            Some(4096 * 1024)
+        );
+        assert_eq!(parse_status_rss_anon("Name:\tx\n"), None);
+    }
+
+    #[test]
+    fn the_budget_takes_the_margin_and_the_anon_off_the_limit() {
+        // A small limit keeps the sixty-four mebibyte floor; a large one a
+        // twentieth.
+        assert_eq!(margin(1 << 30), 64 << 20);
+        assert_eq!(margin(16 << 30), (16 << 30) / 20);
+        let b = Budget::of(1 << 30, 100 << 20, Some(7));
+        assert_eq!(b.budget, (1 << 30) - (100 << 20) - (64 << 20));
+        assert_eq!(b.refaults, Some(7));
+        // The anon past the limit leaves nothing, never a wrap.
+        assert_eq!(Budget::of(1 << 30, 2 << 30, None).budget, 0);
+    }
+
+    #[test]
+    fn the_phase_has_a_code_for_the_gauge() {
+        assert_eq!(Phase::Fits.code(), 0);
+        assert_eq!(Phase::Trial.code(), 4);
+    }
 
     const DT: Duration = CENSUS_INTERVAL;
     /// Steps in an S1 period.
