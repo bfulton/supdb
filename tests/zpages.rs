@@ -5774,11 +5774,24 @@ fn form_files_on_disk_are_dormant_under_auto_and_attached_when_the_form_is_wante
 }
 
 /// Closes the handle's window in progress: three ticks, then one read,
-/// which closes it and opens the next, with its fault as every read of
-/// these tests has one, then the tick that sums it. The windows after a
-/// handle's first are a hundred milliseconds of its wall, far more
-/// operations than a test makes, so a test closes them this way.
+/// which closes it and opens the next, then the tick that sums it. The
+/// windows after a handle's first are a hundred milliseconds of its
+/// wall, far more operations than a test makes, so a test closes them
+/// this way. The closing read takes no fault: it is the first read of
+/// the next window, and a fault on it made every window of a hot set
+/// that faults nothing read a fault in sixty-five, over the suspect
+/// threshold of an optimized build and under the dev profile's, so E2
+/// never measured the raw form fitting under `checked` and did under
+/// `dev`.
 fn close_window(db: &Db, r: &Reader, key: &[u8]) {
+    wait_steps(db, 3);
+    r.count(key).unwrap();
+    wait_steps(db, 1);
+}
+
+/// `close_window` with the closing read's fault, for a test whose every
+/// read has one and counts them.
+fn close_window_faulting(db: &Db, r: &Reader, key: &[u8]) {
     wait_steps(db, 3);
     r.count(key).unwrap();
     db.options().zpages_inject.as_ref().unwrap().add_faults(1);
@@ -5807,7 +5820,7 @@ fn windows_with_commits_count_for_the_rate_and_not_for_the_price_of_a_fault() {
             db.commit().unwrap();
         }
     }
-    close_window(&db, &r, &keys[0]);
+    close_window_faulting(&db, &r, &keys[0]);
     let c = db.zpage_counts();
     assert!(c.census_windows >= 2, "{c:?}");
     assert_eq!(
@@ -5843,7 +5856,7 @@ fn windows_with_commits_count_for_the_rate_and_not_for_the_price_of_a_fault() {
         inject.add_faults(1);
         i += 1;
     }
-    close_window(&db, &r, &keys[0]);
+    close_window_faulting(&db, &r, &keys[0]);
     let c2 = db.zpage_counts();
     // One window, or more where the windows before ran long under load
     // and the resize cut this stretch in two: all of them commit-free.

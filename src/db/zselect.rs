@@ -1138,6 +1138,18 @@ impl ZSelect {
         self.sampler.map_or(0.0, |s| s.c_build)
     }
 
+    /// E2's state, for the trace: the measures in a row that said the raw
+    /// form fits, the operations and faults of the measure under way by
+    /// class, the footprint bound held, and the dwell.
+    pub fn e2_state(&self) -> (u32, [Window; 2], Option<u64>, Duration) {
+        (
+            self.watch.e2_run,
+            self.watch.e2_win,
+            self.footprint,
+            self.dwell(),
+        )
+    }
+
     /// The dwell: `max(DWELL_FLOOR, DWELL_BUILD_FACTOR * the last build's
     /// wall)`. A switch must pay back what it cost, and a long build costs
     /// more.

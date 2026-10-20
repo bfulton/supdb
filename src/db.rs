@@ -32236,8 +32236,16 @@ impl Maint {
             .store(ns(Some(self.zsel.c_build())), AtomicOrdering::Relaxed);
         if self.z_trace && (model.is_some() || d.event.is_some()) {
             eprintln!(
-                "zselect {:?} gate {} census {} build {} sample {} event {:?} model {:?}",
-                d.phase, d.gate, d.census, d.build, d.sample, d.event, model
+                "zselect {:?} gate {} census {} build {} sample {} event {:?} model {:?} e2 {:?} costs {:?}",
+                d.phase,
+                d.gate,
+                d.census,
+                d.build,
+                d.sample,
+                d.event,
+                model,
+                self.zsel.e2_state(),
+                m
             );
         }
     }

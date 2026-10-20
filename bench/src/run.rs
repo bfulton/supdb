@@ -1433,6 +1433,19 @@ fn zpages_refusal(arm: &str, size: u64, stage: ZStage, z: Option<ZState>) -> Res
         ))
     };
     let when = stage.when();
+    // The controller's arm promises nothing of the form at any stage: what
+    // it builds and reads through is its decision, which the rows carry.
+    // A form file out of service is a broken store under any option.
+    if z.auto {
+        return if z.damaged != 0 {
+            wrong(format!(
+                "the form is the controller's and {} of {} form files are out of service {when}",
+                z.damaged, z.form_files
+            ))
+        } else {
+            Ok(())
+        };
+    }
     match (stage, z.forced) {
         (ZStage::Loaded | ZStage::Shuffled, true) if z.form_files == 0 => wrong(format!(
             "the form is forced and none of {} partitions has a form file {when} \
@@ -3602,6 +3615,31 @@ mod tests {
         assert!(run(ZStage::Read, z(true, 10, 18, 18, 0)).is_ok());
         assert!(run(ZStage::Read, z(false, 0, 18, 0, 0)).is_ok());
         assert!(run(ZStage::Loaded, z(false, 0, 18, 0, 0)).is_ok());
+        // The controller's arm: nothing promised of the form at any stage,
+        // reads through it or none, form files or none; a form file out of
+        // service is refused as a broken store.
+        let auto = |reads, form_files, damaged| {
+            Some(ZState {
+                auto: true,
+                reads,
+                partitions: 18,
+                form_files,
+                files: form_files,
+                damaged,
+                ..ZState::default()
+            })
+        };
+        for stage in [ZStage::Loaded, ZStage::Read, ZStage::Shuffled] {
+            assert!(run(stage, auto(0, 0, 0)).is_ok());
+            assert!(run(stage, auto(0, 18, 0)).is_ok());
+            assert!(run(stage, auto(10, 18, 0)).is_ok());
+            assert!(run(stage, auto(10, 5, 0)).is_ok());
+            let broken = run(stage, auto(10, 18, 1)).unwrap_err();
+            assert!(
+                broken.contains("the controller's") && broken.contains("1 of 18"),
+                "{broken}"
+            );
+        }
         assert!(run(ZStage::Loaded, None).is_ok(), "an engine with no form");
         assert!(run(ZStage::Read, None).is_ok());
         // The second store, after the shuffled load, is held to the first's
