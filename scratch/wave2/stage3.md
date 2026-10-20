@@ -440,6 +440,26 @@ after the load's last build, or whether a pass is left to warm the next,
 is stage 4's to decide with the census, and the registration's scan
 cells are restated as two, after a read pass and after a load.
 
+The heads pairing (`ooc-scan-pairing.sh heads`; `ooc-heads-ab-1.out`,
+`ooc-heads-ab-2.out`; the forced arm against `supdb-nocachezpagesheads`,
+ten million keys under the gibibyte, the load, the scan passes and the
+mixes, six pairs after the warmup, two sittings with the arms swapped,
+read as the fence's seek over the heads'): the one-thread scan pass at
+1.21x and 1.23x (five pairs of six, then six of six) with 0.60 and 0.63
+faults a scan against 0.89 and 0.87, the two-thread pass at 1.09x and
+1.10x (six of six both) with 0.02 against 0.05, the three-thread pass
+level (1.02x and 0.98x) with no fault either way; the mixes level, E at
+1.02x and 1.03x by rate with 0.02 faults an operation against 0.15; the
+loads level. The counts say what each seek costs: the same 5.4 million
+walks and the same 13.6 million groups decoded in both arms, since the
+walk after a seek by the fence hits the memo for the group the seek
+decoded (10.6 million hits against 0.5), so the fence's seek adds no
+decode, and the heads' seek adds the heads' lines and a raw record read
+a probe, which under the bound are the faults the fence arm does not
+take. The design's reason for the fence (3.4: the heads leave the working
+set) is what the pairing read. The fence stays the default;
+`zpages_seek_ord` is the arm, refuted as an improvement.
+
 ## What 2b's sittings leave open, read before 3's
 
 - The eager build's pairing (`eager-pairing.sh`, `eager-ab-1.out` and
