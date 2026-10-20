@@ -155,6 +155,7 @@ sh web/build.sh                # the browser module
 | `docs/engine.md` | the engine's design and the measurements each decision cites |
 | `docs/index-theory.md` | the index layout, and what theory predicts that measurement does not show |
 | `web/README.md` | the browser reader |
+| `ROADMAP.md` | what the engine and the suite still need, and the losses accepted by design |
 
 ## Status
 
