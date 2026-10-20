@@ -70,7 +70,31 @@ builds at every landing and attaches at open with no gate at all.
    counted and dropped; a handle that moved threads yields nothing; FITS
    runs no countdown.
 3. **The sampler, the build under the controller, install, retire, the
-   trial.** `ZFile::sample` over thirty-two groups of a partition: the
+   trial.** Split in two sittings once piece 2 was in: 3a is the sampler
+   on the build thread (`ZJob::Sample`: thirty-two groups a partition
+   through `fill_group`, each fill and each decode-plus-walk timed on the
+   thread's clock, `W_z` from the pages estimate with the fence and the
+   filter, the build CPU from the fills' cost over the keys, the attach's
+   cost where the form files are on disk, declined where the pages would
+   not be fewer bytes than the records), `Input::generation` as a digest
+   of the live partitions and their cells, `Decision::sample` and
+   `Decision::build` driving `z_next`/`z_start` as `Always` does, the
+   `Build` report (coverage by the partitions' footprint bytes, the
+   collected builds' fates), `Model::phi_z` from `model_z` over the
+   sampler's `W_z`, form files on disk kept dormant under `Auto` and
+   attached when the form is wanted, `Decision::retire` through
+   `z_retire_cell` and the spares; with the tests the model's traces
+   reach without a footprint: builds when the measure says blocked,
+   serves raw until whole, returns to raw when the limit is lifted and
+   gives the disk back, a skewed workload that fits never builds, the
+   price is paid before a build, a cancelled build counts as a switch, a
+   cold start is not a capacity miss, two stores do not share a measure,
+   a store far past the cache still builds, a neighbour's pressure opens
+   the build clause, builds suspend after four of eight are superseded.
+   3b is E2's footprint (the handle's bitmap of the compact pages it
+   touched, posted at the window's close, the raw bound from the store's
+   own quantities) and the trial through the gate, with the trial's,
+   the square wave's and E3's tests, and the take-back's file set. `ZFile::sample` over thirty-two groups of a partition: the
    compressed size (so `W_z` and `phi_z`), the decode-plus-walk cost
    (`t_z`), the build CPU estimate (`c_build` through
    `ski_rental_price`), declined where the form would not pay;
@@ -167,3 +191,40 @@ the toggle on `supdb_bench::engines::supdb_get`, the exact name):
 16,609,943 instructions against 16,609,938, 830 a get both ways; the
 gate's load stands where the cell's load stood, so the design's three
 instructions are none.
+
+Piece 2 is in: the window on the handle (`ZWindow`, `Reader::zcensus_begin`
+at the three operations' start after `note_read`, `zcensus_end` in `leave`
+at depth zero, `zwindow_open`, `zwindow_close`), opened under any gate
+but the raw one for a counted handle of a store under `Auto` where the
+controller runs (`Reader::zcensus`, decided at the claim), closed at `n`
+operations or three ticks, resized toward a hundred milliseconds
+(`ZWINDOW_MIN/MAX/TARGET/TICKS`); the thread's major faults by
+`getrusage(RUSAGE_THREAD)` (`zfile::thread_major_faults`, the constant
+named locally since libc 0.2.189 does not export it for this target, held
+equal to `/proc/thread-self/stat`'s field by a unit test), the CPU clock
+the engine already reads, the operations' busy wall, the thread identity
+by `ThreadId` (no syscall) and the commit position as `note_read` reads
+it; fifteen sums on the slot (three lines, the size assertion moved to
+384), the mins as `f64` bits; the tick's `Maint::z_census` (the sums
+differenced, the threads by slots whose windows moved, the refaults from
+the platform's counter each tick while the census is on or from the
+seam's rate, the price of a fault as the cumulative ratio, the mins over
+the slots), `ZEvents::ticks` a handle's window counts against,
+`census_costs` and `sel_costs`; `ZInject::add_faults`, `set_fault_cost`;
+`ZSelect::measured` and `threads`; twenty `census_*` and `sel_*` fields in
+`ZCounts` and as many `zpage_*` rows. Tests: the price of a fault from
+commit-free windows only, to the nanosecond, and the rate from all; a
+scan-only handle; mixed windows dropped and counted; a handle moved
+between threads; a handle idle between its calls; FITS and `Always` run
+no window. Six mutants held to firing: the thread check, the commit
+check, the countdown under FITS, a mixed window kept, the handle's wall
+for the busy wall, the scan class lost. Learned on the way: the design's
+window wall was the handle's, which reads a caller's idle between calls
+as fault time, so the busy wall is the operations' own, at a clock read
+per operation in the census phases and none in FITS; the selector's
+`threads` defaults to one, so no test asserts zero; a tight loop's second
+window is a hundred thousand operations after the resize, so the tests
+close windows through the ticks, and the read that closes one is an
+operation of the next; `Maint` reaches `shared` through its deref to the
+handle, so a borrow of the reader table holds the whole of `self` and the
+tick clones the `Arc` first. The in-memory price, counted by callgrind in one sitting, three runs of each probe: 828 instructions a get for piece 1's binary (which read 830 in its own sitting: two a get between sittings, under half a get within one) against 836 for this piece's, eight a get, four in `leave` and four in the read's frame -- the two loads and branches of the handle's flag, with what the compiler reloads around them; the design budgeted a load and a branch at the start alone, and the end hook is the busy wall's, which the design did not have. About one percent of the read's instructions, to be read in the rate by the alternation of the two binaries when the arms exist (piece 4), which can only say it is not more.

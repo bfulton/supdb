@@ -4789,11 +4789,19 @@ fn an_auto_store_that_fits_builds_nothing() {
         let keys: Vec<Vec<u8>> = model.keys().step_by(7).cloned().collect();
         check(&db, &model, &keys, name);
         check_scan(&db, &model, name);
+        let r = db.reader().unwrap();
+        check(&r, &model, &keys, name);
+        check_scan(&r, &model, name);
         let c = db.zpage_counts();
         assert_eq!(
             c.builds + c.attached + c.form_files + c.reads + c.scans,
             0,
             "{name}: {c:?}"
+        );
+        assert_eq!(
+            census_sum(&c),
+            0,
+            "{name}: FITS runs no census window: {c:?}"
         );
         assert_eq!(
             (c.gate, c.phase),
@@ -4944,6 +4952,294 @@ fn the_model_moves_the_rung_between_fits_and_suspect_on_the_injected_budget() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Everything the census counted: windows, drops, operations.
+fn census_sum(c: &supdb::db::ZCounts) -> u64 {
+    c.census_windows
+        + c.census_commit_windows
+        + c.census_mixed
+        + c.census_moved
+        + c.census_reads
+        + c.census_scans
+}
+
+/// A store under `Auto` in SUSPECT through the seam: the budget under the
+/// footprint, two hot ticks, the gate at the census, with the price of a
+/// fault set so a window's faults cost something.
+fn suspect_store(name: &str) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>) {
+    let dir = scratch(name);
+    let inject = std::sync::Arc::new(supdb::ZInject::new());
+    inject.set_budget(1 << 20);
+    inject.set_refault_rate(0.0);
+    inject.set_fault_cost(std::time::Duration::from_micros(40));
+    inject.advance(std::time::Duration::from_millis(1));
+    let mut db = Db::create(
+        &dir,
+        Options {
+            zpages: ZPages::Auto,
+            zpages_min_bytes: 0,
+            zpages_inject: Some(inject.clone()),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let model = ordered_load(&mut db, 20_000, 0x4A9);
+    db.settle().unwrap();
+    for _ in 0..2 {
+        inject.advance(std::time::Duration::from_secs(1));
+        wait_steps(&db, 1);
+    }
+    let c = db.zpage_counts();
+    assert_eq!((c.phase, c.gate), (1, 1), "SUSPECT: {c:?}");
+    (dir, db, model, inject)
+}
+
+/// `n` census ticks of the injected clock, each waited for: the tick
+/// runs on the segment work's thread at its own turn.
+fn wait_steps(db: &Db, n: u32) {
+    for _ in 0..n {
+        let inject = db.options().zpages_inject.clone().unwrap();
+        inject.advance(std::time::Duration::from_millis(100));
+        let was = db.zpage_counts().sel_steps;
+        let t = std::time::Instant::now();
+        while db.zpage_counts().sel_steps == was && t.elapsed().as_secs() < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(db.zpage_counts().sel_steps > was, "the tick stepped");
+    }
+}
+
+/// Closes the handle's window in progress: three ticks, then one read,
+/// which closes it and opens the next, with its fault as every read of
+/// these tests has one, then the tick that sums it. The windows after a
+/// handle's first are a hundred milliseconds of its wall, far more
+/// operations than a test makes, so a test closes them this way.
+fn close_window(db: &Db, r: &Reader, key: &[u8]) {
+    wait_steps(db, 3);
+    r.count(key).unwrap();
+    db.options().zpages_inject.as_ref().unwrap().add_faults(1);
+    wait_steps(db, 1);
+}
+
+/// A window with a commit inside counts for the faults an operation and
+/// not for the price of a fault: a stretch of reads with a commit in
+/// every window measures the rate and no price; a stretch with none
+/// measures the price the seam set, to the nanosecond; the least CPU a
+/// read took is measured under the raw gate and nothing is measured of
+/// the form.
+#[test]
+fn windows_with_commits_count_for_the_rate_and_not_for_the_price_of_a_fault() {
+    let (dir, mut db, model, inject) = suspect_store("census-commits");
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut i = 0usize;
+    for _ in 0..640 {
+        let k = &keys[(i * 7) % keys.len()];
+        r.count(k).unwrap();
+        inject.add_faults(1);
+        i += 1;
+        if i.is_multiple_of(32) {
+            db.append(b"zzz-census", b"v");
+            db.commit().unwrap();
+        }
+    }
+    close_window(&db, &r, &keys[0]);
+    let c = db.zpage_counts();
+    assert!(c.census_windows >= 2, "{c:?}");
+    assert_eq!(
+        c.census_commit_windows, c.census_windows,
+        "every window had a commit: {c:?}"
+    );
+    assert_eq!(
+        (c.census_reads, c.census_read_faults),
+        (640, 640),
+        "the reads and their faults, one each: {c:?}"
+    );
+    assert_eq!(
+        (c.census_t_f_ns, c.sel_t_f_ns),
+        (0, 0),
+        "no price from windows with commits: {c:?}"
+    );
+    assert!(c.census_t_hit_ns > 0 && c.sel_t_hit_ns > 0, "{c:?}");
+    assert_eq!(
+        (
+            c.census_t_z_ns,
+            c.sel_t_z_ns,
+            c.census_mixed,
+            c.census_moved
+        ),
+        (0, 0, 0, 0),
+        "{c:?}"
+    );
+    assert_eq!(c.sel_threads, 1, "{c:?}");
+    // No commits: the price of a fault is the seam's.
+    for _ in 0..640 {
+        let k = &keys[(i * 7) % keys.len()];
+        r.count(k).unwrap();
+        inject.add_faults(1);
+        i += 1;
+    }
+    close_window(&db, &r, &keys[0]);
+    let c2 = db.zpage_counts();
+    assert_eq!(
+        c2.census_windows,
+        c.census_windows + 1,
+        "one window, commit-free: {c2:?}"
+    );
+    assert_eq!(c2.census_commit_windows, c.census_commit_windows, "{c2:?}");
+    assert_eq!(
+        (c2.census_reads, c2.census_read_faults),
+        (1281, 1281),
+        "{c2:?}"
+    );
+    for t in [c2.census_t_f_ns, c2.sel_t_f_ns] {
+        assert!(
+            (39_990..=40_010).contains(&t),
+            "the price of a fault: {c2:?}"
+        );
+    }
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The price of a fault is taken from the operations' own wall and not
+/// the handle's: a handle idle between its calls, with no price set on the
+/// seam, prices a fault at what its operations spent and not at its
+/// idleness, which would read as milliseconds a fault.
+#[test]
+fn the_price_of_a_fault_is_the_operations_wall_and_not_the_handles_idle() {
+    let (dir, db, model, inject) = suspect_store("census-idle");
+    inject
+        .fault_cost_ns
+        .store(0, std::sync::atomic::Ordering::Release);
+    assert_eq!(inject.fault_cost(), None);
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    for i in 0..70 {
+        r.count(&keys[(i * 7) % keys.len()]).unwrap();
+        inject.add_faults(1);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    wait_steps(&db, 1);
+    let c = db.zpage_counts();
+    assert_eq!((c.census_windows, c.census_reads), (1, 64), "{c:?}");
+    assert!(
+        c.census_t_f_ns < 100_000,
+        "a fault priced at the operations' wall, not the sleeps: {c:?}"
+    );
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A handle that only scans reaches the census: its windows are scan
+/// windows, counted with their faults, and the least CPU a scan took is
+/// measured; nothing of the reads.
+#[test]
+fn a_scan_only_handle_reaches_the_census() {
+    let (dir, db, model, inject) = suspect_store("census-scans");
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    for i in 0..200 {
+        let from = &keys[(i * 97) % keys.len()];
+        let mut n = 0;
+        r.scan(from, 50, |_, _| n += 1).unwrap();
+        assert!(n > 0);
+        inject.add_faults(3);
+    }
+    wait_steps(&db, 3);
+    r.scan(b"", 1, |_, _| {}).unwrap();
+    wait_steps(&db, 1);
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.census_scans, c.census_scan_faults, c.census_reads),
+        (200, 600, 0),
+        "{c:?}"
+    );
+    assert!(c.census_windows >= 2 && c.census_mixed == 0, "{c:?}");
+    assert!(
+        c.census_t_hit_scan_ns > 0 && c.sel_t_hit_scan_ns > 0,
+        "{c:?}"
+    );
+    assert_eq!((c.census_t_hit_ns, c.census_t_z_scan_ns), (0, 0), "{c:?}");
+    assert_eq!(c.sel_threads, 1, "{c:?}");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A window of reads and scans together is dropped and counted, by the
+/// engine and by the selector, and nothing of it is a rate.
+#[test]
+fn mixed_windows_are_counted_and_dropped() {
+    let (dir, db, model, inject) = suspect_store("census-mixed");
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    for i in 0..200 {
+        let k = &keys[(i * 13) % keys.len()];
+        if i.is_multiple_of(2) {
+            r.count(k).unwrap();
+        } else {
+            r.scan(k, 10, |_, _| {}).unwrap();
+        }
+        inject.add_faults(1);
+    }
+    close_window(&db, &r, &keys[0]);
+    let c = db.zpage_counts();
+    assert!(c.census_mixed >= 2, "{c:?}");
+    assert_eq!(
+        (
+            c.census_windows,
+            c.census_reads,
+            c.census_scans,
+            c.census_moved
+        ),
+        (0, 0, 0, 0),
+        "{c:?}"
+    );
+    assert_eq!(c.sel_mixed, c.census_mixed, "{c:?}");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A window opened on one thread and closed on another is dropped as
+/// moved: the faults it would difference are two threads' counters.
+#[test]
+fn a_handle_that_moved_threads_yields_nothing() {
+    let (dir, db, model, inject) = suspect_store("census-moved");
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    for i in 0..10 {
+        r.count(&keys[i * 5]).unwrap();
+        inject.add_faults(1);
+    }
+    let (r, _inject) = std::thread::spawn(move || {
+        for i in 0..200 {
+            r.count(&keys[(i * 11) % keys.len()]).unwrap();
+            inject.add_faults(1);
+        }
+        (r, inject)
+    })
+    .join()
+    .unwrap();
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    close_window(&db, &r, &keys[0]);
+    let c = db.zpage_counts();
+    assert_eq!(
+        c.census_moved, 2,
+        "the first window closed on the other thread, the second back here: {c:?}"
+    );
+    assert_eq!(
+        (c.census_windows, c.census_reads, c.census_mixed),
+        (0, 0, 0),
+        "{c:?}"
+    );
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The gate decides the form an attached cell serves: a store under
 /// `Always` with its form files attached is read raw once the gate is set
 /// to the raw form by hand, as the controller's trial reads it, with no
@@ -4972,6 +5268,7 @@ fn the_gate_decides_the_form_an_attached_cell_serves() {
             check_scan(who, &model, &format!("gate {gate}"));
         }
         let after = db.zpage_counts();
+        assert_eq!(census_sum(&after), 0, "no census under Always: {after:?}");
         let through = (after.reads
             + after.counts
             + after.scans
