@@ -465,6 +465,34 @@ pub struct ZCounts {
     pub sel_switches: u64,
     pub sel_trials: u64,
     pub sel_trials_back: u64,
+    /// The census (`ZWindow`), summed over the handles' slots: the
+    /// windows that counted, the ones with a commit inside, the ones
+    /// dropped as mixed and as moved, and by class the operations of the
+    /// windows that counted and their major faults; then the costs the
+    /// tick last measured, nanoseconds (0: none): a fault, a point read
+    /// and a scan that hit under the raw form, and a point read and a
+    /// scan through the compact form; and what the selector holds of
+    /// them and of the threads that contributed.
+    pub census_windows: u64,
+    pub census_commit_windows: u64,
+    pub census_mixed: u64,
+    pub census_moved: u64,
+    pub census_reads: u64,
+    pub census_read_faults: u64,
+    pub census_scans: u64,
+    pub census_scan_faults: u64,
+    pub census_t_f_ns: u64,
+    pub census_t_hit_ns: u64,
+    pub census_t_hit_scan_ns: u64,
+    pub census_t_z_ns: u64,
+    pub census_t_z_scan_ns: u64,
+    pub sel_t_f_ns: u64,
+    pub sel_t_hit_ns: u64,
+    pub sel_t_hit_scan_ns: u64,
+    pub sel_t_z_ns: u64,
+    pub sel_t_z_scan_ns: u64,
+    pub sel_threads: u64,
+    pub sel_mixed: u64,
     /// Partitions live, the ones with a form file installed, the ones of
     /// those out of service, and their pages, the pages a first decode has
     /// passed, the pages a check failed, the fences kept in memory, the
@@ -7559,6 +7587,33 @@ struct Slot {
     /// Walks that asked for the pages after their first
     /// (`Options::zpages_scan_prefetch`).
     zprefetches: AtomicU64,
+    /// The census (`ZPages::Auto`, `zselect` S2): what this handle's
+    /// windows summed, written by the handle alone at a window's close
+    /// and read by the controller's tick, which differences them. By
+    /// class, the operations of the windows that counted and the major
+    /// faults they took; over the windows with no commit inside, the
+    /// operations' busy wall and the thread's CPU, nanoseconds, and their
+    /// faults, for the price of a fault; the least CPU an operation took
+    /// in a window the raw form served and in one the compact form
+    /// served, by class, as the bits of an `f64` of seconds (0: none);
+    /// then the windows that counted, the ones with a commit inside, and
+    /// the ones dropped: mixed (both classes), or moved (the thread or the
+    /// gate changed inside it).
+    zcreads: AtomicU64,
+    zcrflt: AtomicU64,
+    zcscans: AtomicU64,
+    zcsflt: AtomicU64,
+    zcfwall: AtomicU64,
+    zcfcpu: AtomicU64,
+    zcfflt: AtomicU64,
+    zchit: AtomicU64,
+    zchitscan: AtomicU64,
+    zcz: AtomicU64,
+    zczscan: AtomicU64,
+    zcwindows: AtomicU64,
+    zccommit: AtomicU64,
+    zcmixed: AtomicU64,
+    zcmoved: AtomicU64,
 }
 
 impl Slot {
@@ -7586,17 +7641,34 @@ impl Slot {
             zmemohits: AtomicU64::new(0),
             zmemomisses: AtomicU64::new(0),
             zprefetches: AtomicU64::new(0),
+            zcreads: AtomicU64::new(0),
+            zcrflt: AtomicU64::new(0),
+            zcscans: AtomicU64::new(0),
+            zcsflt: AtomicU64::new(0),
+            zcfwall: AtomicU64::new(0),
+            zcfcpu: AtomicU64::new(0),
+            zcfflt: AtomicU64::new(0),
+            zchit: AtomicU64::new(0),
+            zchitscan: AtomicU64::new(0),
+            zcz: AtomicU64::new(0),
+            zczscan: AtomicU64::new(0),
+            zcwindows: AtomicU64::new(0),
+            zccommit: AtomicU64::new(0),
+            zcmixed: AtomicU64::new(0),
+            zcmoved: AtomicU64::new(0),
         }
     }
 }
 
-// Two lines: the nine words that were here and the second form's ten
-// counters, nineteen words, are a 256-byte slot since the scan's three.
-// What the layout is for is that no other thread writes a slot's lines,
-// which two lines a handle owns keep as one did; the first line's sixteen
-// words were full at the seventh second-form counter. The size is pinned
-// so that a counter added moves it here and not in a threaded cell.
-const _: () = assert!(std::mem::align_of::<Slot>() >= 128 && std::mem::size_of::<Slot>() == 256);
+// Three lines: the nine words that were here, the second form's thirteen
+// counters and the census's fifteen sums, thirty-seven words, are a
+// 384-byte slot since the census. What the layout is for is that no
+// other thread writes a slot's lines, which three lines a handle owns
+// keep as one did; the first line's sixteen words were full at the
+// seventh second-form counter and the second's at the census's third
+// sum. The size is pinned so that a counter added moves it here and not
+// in a threaded cell.
+const _: () = assert!(std::mem::align_of::<Slot>() >= 128 && std::mem::size_of::<Slot>() == 384);
 
 const READER_SLOTS: usize = 256;
 
@@ -12236,6 +12308,91 @@ pub struct Reader {
     /// This handle's memo of decoded groups (`zfile::ZMemo`,
     /// `Options::zpages_memo`), which goes with the handle.
     zmemo: zfile::ZMemo,
+    /// The census's window in progress (`ZPages::Auto`): see `ZWindow`.
+    zwin: std::cell::Cell<ZWindow>,
+    /// Whether this handle runs the census at all: a counted handle of a
+    /// store under `Auto` where the controller runs. Decided once, so a
+    /// read under `Off` or `Always` pays one load and a branch for it.
+    zcensus: bool,
+}
+
+/// The census's window on a handle (`zselect` S2, design 4.3). What the
+/// engine cannot see is that a read blocked: the first touch of lent
+/// bytes is a page fault inside `seg_read`, and it is inferred from
+/// outside, from the thread's own counters, and not by timing lookups
+/// against a threshold. A window brackets `n` operations, or as many as
+/// three census ticks hold for a sparse handle, between two readings of
+/// the thread's major faults, its CPU clock and the wall it spent inside
+/// the operations; it is opened by the first operation under a gate
+/// other than the raw one, closed by the first operation past its end,
+/// and its sums go onto the slot's census words if it counted: on one
+/// thread, under one gate, and of one class, since a scan of a hundred
+/// touches three pages where a read touches one. A window with a commit
+/// inside counts for the faults an operation and not for the price of a
+/// fault, which is `(busy wall - CPU) / faults` and would carry the
+/// commit's fsync. The busy wall is the operations' own and not the
+/// handle's: a handle idle between its calls would read its idleness as
+/// fault time otherwise. `n` is resized at each close so that a window
+/// lasts about [`ZWINDOW_TARGET`] of wall. In FITS (the raw gate) no
+/// window is opened and an operation pays a load and a branch.
+#[derive(Clone, Copy)]
+struct ZWindow {
+    open: bool,
+    /// Operations to go before the window closes.
+    down: u32,
+    /// The window's length in operations, resized at each close.
+    n: u32,
+    reads: u32,
+    scans: u32,
+    /// The gate at the open.
+    gate: u8,
+    /// The thread the window was opened on.
+    thread: std::thread::ThreadId,
+    /// The thread's major faults and CPU, and the controller's tick count,
+    /// at the open; the store's commit position (the state's generation
+    /// and the live table's committed log length, as `note_read` reads
+    /// it) at the open.
+    flt: u64,
+    cpu: u64,
+    tick: u64,
+    commit: (u64, usize),
+    /// The wall at the open, and the operations' busy wall since, ns.
+    opened: std::time::Instant,
+    busy: u64,
+    /// The operation in progress began at.
+    t0: std::time::Instant,
+}
+
+/// A window's length in operations at first, and its bounds.
+const ZWINDOW_MIN: u32 = 64;
+const ZWINDOW_MAX: u32 = 1 << 20;
+/// What a window's wall is resized toward.
+const ZWINDOW_TARGET: std::time::Duration = std::time::Duration::from_millis(100);
+/// Census ticks (`zselect::CENSUS_INTERVAL` each) after which a window
+/// closes at its next operation whatever its countdown says: two to
+/// three hundred milliseconds, so a sparse handle's window closes too.
+const ZWINDOW_TICKS: u64 = 3;
+
+impl ZWindow {
+    fn closed() -> ZWindow {
+        let now = std::time::Instant::now();
+        ZWindow {
+            open: false,
+            down: 0,
+            n: ZWINDOW_MIN,
+            reads: 0,
+            scans: 0,
+            gate: zselect::GATE_RAW,
+            thread: std::thread::current().id(),
+            flt: 0,
+            cpu: 0,
+            tick: 0,
+            commit: (0, 0),
+            opened: now,
+            busy: 0,
+            t0: now,
+        }
+    }
 }
 
 /// A handle's upkeep for its range reads: its block tables, its scan
@@ -14241,11 +14398,182 @@ impl Reader {
                 self.sweep_at_leave();
             }
         }
+        if self.zcensus {
+            self.zcensus_end();
+        }
         if let Some(slot) = self.slot {
             if self.isolation.get() != Isolation::Snapshot {
                 self.held
                     .store(std::ptr::null_mut(), AtomicOrdering::Relaxed);
                 self.shared.readers.unpin(slot);
+            }
+        }
+    }
+
+    /// The census's hook at an operation's start (`ZWindow`): under the
+    /// raw gate any window in progress is abandoned, since the census is
+    /// FITS's to stop and a window across the gate's change would be of
+    /// two forms; otherwise a window due to close is closed, one is opened
+    /// where none is, and the operation is counted by its class.
+    #[inline]
+    fn zcensus_begin(&self, scan: bool) {
+        if !self.zcensus {
+            return;
+        }
+        let gate = self.shared.zgate.load();
+        let mut w = self.zwin.get();
+        if gate == zselect::GATE_RAW {
+            if w.open {
+                w.open = false;
+                self.zwin.set(w);
+            }
+            return;
+        }
+        if w.open {
+            let ticks = self
+                .shared
+                .z
+                .ticks
+                .load(AtomicOrdering::Relaxed)
+                .wrapping_sub(w.tick);
+            if w.down == 0 || ticks >= ZWINDOW_TICKS {
+                self.zwindow_close(&mut w, gate);
+            }
+        }
+        if !w.open {
+            self.zwindow_open(&mut w, gate);
+        }
+        if scan {
+            w.scans += 1;
+        } else {
+            w.reads += 1;
+        }
+        w.down -= 1;
+        w.t0 = std::time::Instant::now();
+        self.zwin.set(w);
+    }
+
+    /// The census's hook at an operation's end: the operation's wall goes
+    /// onto the window's busy wall.
+    #[inline]
+    fn zcensus_end(&self) {
+        let mut w = self.zwin.get();
+        if !w.open {
+            return;
+        }
+        w.busy = w
+            .busy
+            .saturating_add(w.t0.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        self.zwin.set(w);
+    }
+
+    /// The thread's major faults, from the seam where a test injects them
+    /// and from the platform otherwise; `None` where neither has them, and
+    /// a window without a reading is dropped as moved.
+    fn zcensus_faults(&self) -> Option<u64> {
+        if let Some(f) = self.opts.zpages_inject.as_ref().and_then(|i| i.faults()) {
+            return Some(f);
+        }
+        zfile::thread_major_faults()
+    }
+
+    /// Opens a window at this operation: the readings before it.
+    fn zwindow_open(&self, w: &mut ZWindow, gate: u8) {
+        let now = std::time::Instant::now();
+        w.open = true;
+        w.down = w.n;
+        w.reads = 0;
+        w.scans = 0;
+        w.gate = gate;
+        w.thread = std::thread::current().id();
+        w.flt = self.zcensus_faults().unwrap_or(u64::MAX);
+        w.cpu = thread_cpu_ns();
+        w.tick = self.shared.z.ticks.load(AtomicOrdering::Relaxed);
+        w.commit = (self.state().gen, self.mem().committed_log());
+        w.opened = now;
+        w.busy = 0;
+        w.t0 = now;
+    }
+
+    /// Closes the window before this operation: the readings after its
+    /// last, and the sums onto the slot's census words if it counted. The
+    /// next window's length is this one's resized toward
+    /// `ZWINDOW_TARGET` of wall.
+    fn zwindow_close(&self, w: &mut ZWindow, gate: u8) {
+        w.open = false;
+        let Some(slot) = self.slot else { return };
+        let s = &self.shared.readers.slots[slot];
+        let bump = |c: &AtomicU64, n: u64| {
+            c.store(
+                c.load(AtomicOrdering::Relaxed).saturating_add(n),
+                AtomicOrdering::Relaxed,
+            )
+        };
+        let wall = w.opened.elapsed();
+        let ops = u64::from(w.reads) + u64::from(w.scans);
+        if ops > 0 {
+            let target = ZWINDOW_TARGET.as_nanos() as f64;
+            let scaled = f64::from(w.n) * target / (wall.as_nanos() as f64).max(1.0);
+            w.n = (scaled as u32).clamp(ZWINDOW_MIN, ZWINDOW_MAX);
+        }
+        let flt1 = self.zcensus_faults();
+        let moved = w.thread != std::thread::current().id()
+            || gate != w.gate
+            || w.flt == u64::MAX
+            || flt1.is_none();
+        if moved {
+            bump(&s.zcmoved, 1);
+            return;
+        }
+        if w.reads > 0 && w.scans > 0 {
+            bump(&s.zcmixed, 1);
+            return;
+        }
+        if ops == 0 {
+            return;
+        }
+        let flt = flt1.unwrap_or(0).saturating_sub(w.flt);
+        let cpu = thread_cpu_ns().saturating_sub(w.cpu);
+        // The busy wall, or, under the seam's price of a fault, what the
+        // operations would have spent faulting at that price.
+        let busy = match self
+            .opts
+            .zpages_inject
+            .as_ref()
+            .and_then(|i| i.fault_cost())
+        {
+            Some(cost) => {
+                cpu.saturating_add(flt.saturating_mul(cost.as_nanos().min(u64::MAX as u128) as u64))
+            }
+            None => w.busy,
+        };
+        let scan = w.scans > 0;
+        if scan {
+            bump(&s.zcscans, ops);
+            bump(&s.zcsflt, flt);
+        } else {
+            bump(&s.zcreads, ops);
+            bump(&s.zcrflt, flt);
+        }
+        bump(&s.zcwindows, 1);
+        if (self.state().gen, self.mem().committed_log()) != w.commit {
+            bump(&s.zccommit, 1);
+        } else {
+            bump(&s.zcfwall, busy);
+            bump(&s.zcfcpu, cpu);
+            bump(&s.zcfflt, flt);
+        }
+        if cpu > 0 {
+            let per = cpu as f64 * 1e-9 / ops as f64;
+            let word = match (gate == zselect::GATE_Z, scan) {
+                (false, false) => &s.zchit,
+                (false, true) => &s.zchitscan,
+                (true, false) => &s.zcz,
+                (true, true) => &s.zczscan,
+            };
+            let least = f64::from_bits(word.load(AtomicOrdering::Relaxed));
+            if least == 0.0 || per < least {
+                word.store(per.to_bits(), AtomicOrdering::Relaxed);
             }
         }
     }
@@ -14963,6 +15291,26 @@ impl Reader {
             sel_switches: get(&ev.sel_switches),
             sel_trials: get(&ev.sel_trials),
             sel_trials_back: get(&ev.sel_trials_back),
+            census_windows: rd.stat(|s| &s.zcwindows),
+            census_commit_windows: rd.stat(|s| &s.zccommit),
+            census_mixed: rd.stat(|s| &s.zcmixed),
+            census_moved: rd.stat(|s| &s.zcmoved),
+            census_reads: rd.stat(|s| &s.zcreads),
+            census_read_faults: rd.stat(|s| &s.zcrflt),
+            census_scans: rd.stat(|s| &s.zcscans),
+            census_scan_faults: rd.stat(|s| &s.zcsflt),
+            census_t_f_ns: get(&ev.census_costs[0]),
+            census_t_hit_ns: get(&ev.census_costs[1]),
+            census_t_hit_scan_ns: get(&ev.census_costs[2]),
+            census_t_z_ns: get(&ev.census_costs[3]),
+            census_t_z_scan_ns: get(&ev.census_costs[4]),
+            sel_t_f_ns: get(&ev.sel_costs[0]),
+            sel_t_hit_ns: get(&ev.sel_costs[1]),
+            sel_t_hit_scan_ns: get(&ev.sel_costs[2]),
+            sel_t_z_ns: get(&ev.sel_costs[3]),
+            sel_t_z_scan_ns: get(&ev.sel_costs[4]),
+            sel_threads: get(&ev.sel_threads),
+            sel_mixed: get(&ev.sel_mixed),
             ..ZCounts::default()
         };
         for seg in self.segs().iter().filter(|s| s.level > 0) {
@@ -15402,6 +15750,7 @@ impl Reader {
         let _entered = self.enter();
         self.advise(true);
         self.note_read(false);
+        self.zcensus_begin(false);
         // The state once, and the memtable's hash and slot line only when
         // it has entries: a read over a store just flushed hashed the key
         // and fetched a line of an empty table, and took the state through
@@ -15756,6 +16105,7 @@ impl Reader {
     ) -> Result<usize> {
         let _entered = self.enter();
         self.note_read(true);
+        self.zcensus_begin(true);
         self.advise(!self.scan_wants_readahead(limit));
         // `Prefetch` never changes mode, so `advise` above is a no-op for it.
         // Instead the segments are told exactly which value bytes this scan
@@ -20859,6 +21209,7 @@ impl Reader {
         // purposes even though it returns no bytes (`F28`: 94 ns, a lookup).
         self.advise(true);
         self.note_read(false);
+        self.zcensus_begin(false);
         let st = self.state();
         let (segs, mem) = (&st.segs, &*st.mem);
         let mem_empty = mem.is_empty();
@@ -21366,6 +21717,8 @@ impl Db {
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::new(),
+            zwin: std::cell::Cell::new(ZWindow::closed()),
+            zcensus: false,
             slot: None,
             pin_slot,
             depth: std::cell::Cell::new(0),
@@ -21845,6 +22198,8 @@ impl Db {
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::new(),
+            zwin: std::cell::Cell::new(ZWindow::closed()),
+            zcensus: false,
             slot: None,
             pin_slot,
             depth: std::cell::Cell::new(0),
@@ -23982,6 +24337,8 @@ impl Reader {
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::new(),
+            zwin: std::cell::Cell::new(ZWindow::closed()),
+            zcensus: false,
             slot: None,
             pin_slot,
             depth: std::cell::Cell::new(0),
@@ -24014,6 +24371,8 @@ impl Reader {
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::new(),
+            zwin: std::cell::Cell::new(ZWindow::closed()),
+            zcensus: false,
             slot: Some(slot),
             pin_slot: None,
             depth: std::cell::Cell::new(0),
@@ -24053,6 +24412,8 @@ impl Reader {
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::new(),
+            zwin: std::cell::Cell::new(ZWindow::closed()),
+            zcensus: counted && self.opts.zpages == ZPages::Auto && !z_auto_inert(&self.opts),
             slot: Some(slot),
             pin_slot: None,
             depth: std::cell::Cell::new(0),
@@ -26520,6 +26881,8 @@ impl Reader {
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::new(),
+            zwin: std::cell::Cell::new(ZWindow::closed()),
+            zcensus: false,
             slot: None,
             // A slot of its own for the passes, which pin it as the
             // writer's operations pin the writer's.
@@ -29407,6 +29770,28 @@ struct Maint {
     z_last_step: Option<std::time::Duration>,
     z_last_s1: Option<std::time::Duration>,
     z_refaults: Option<(u64, std::time::Duration)>,
+    /// Whether the last decision had the handles run the census; the sums
+    /// of the slots' census words as the tick last read them, and the
+    /// group's refault count at the last tick that read it, both
+    /// differenced; and each slot's windows count at the last tick, for
+    /// the threads that contributed since.
+    z_census_on: bool,
+    z_census_last: ZCensusSums,
+    z_census_refaults: Option<u64>,
+    z_census_slots: Vec<u64>,
+}
+
+/// The slots' census words, summed: see `Slot`.
+#[derive(Clone, Copy, Default)]
+struct ZCensusSums {
+    reads: u64,
+    rflt: u64,
+    scans: u64,
+    sflt: u64,
+    fwall: u64,
+    fcpu: u64,
+    fflt: u64,
+    mixed: u64,
 }
 
 impl std::ops::Deref for Maint {
@@ -29815,6 +30200,10 @@ impl Maint {
             z_last_step: None,
             z_last_s1: None,
             z_refaults: None,
+            z_census_on: false,
+            z_census_last: ZCensusSums::default(),
+            z_census_refaults: None,
+            z_census_slots: Vec::new(),
         }
     }
 
@@ -31157,17 +31546,117 @@ impl Maint {
         } else {
             None
         };
+        let census = self.z_census(now);
         let input = zselect::Input {
             now,
             model,
             sampler: None,
             generation: 0,
-            census: zselect::Census::default(),
+            census,
             build: zselect::Build::default(),
             footprint: None,
         };
         let d = self.zsel.step(&input);
         self.z_apply(&d, model.as_ref());
+    }
+
+    /// The interval's census (S2): the slots' census words summed and
+    /// differenced against the last tick's, the group's refaults over the
+    /// interval, the threads whose windows closed since, and the costs --
+    /// the price of a fault as the ratio of the commit-free windows' sums
+    /// since the census began, since one preempted window would price it
+    /// alone otherwise, and the least CPU an operation took by class and
+    /// form. Nothing while the handles run none: the words do not move
+    /// and the files are not read.
+    fn z_census(&mut self, now: std::time::Duration) -> zselect::Census {
+        self.shared.z.ticks.fetch_add(1, AtomicOrdering::Relaxed);
+        if !self.z_census_on {
+            return zselect::Census::default();
+        }
+        // The table through the shared handle's own clone: `shared` is
+        // reached through the deref to the handle, which would hold the
+        // whole of `self` for the sums below.
+        let shared = self.shared.clone();
+        let rd = &shared.readers;
+        let sums = ZCensusSums {
+            reads: rd.stat(|s| &s.zcreads),
+            rflt: rd.stat(|s| &s.zcrflt),
+            scans: rd.stat(|s| &s.zcscans),
+            sflt: rd.stat(|s| &s.zcsflt),
+            fwall: rd.stat(|s| &s.zcfwall),
+            fcpu: rd.stat(|s| &s.zcfcpu),
+            fflt: rd.stat(|s| &s.zcfflt),
+            mixed: rd.stat(|s| &s.zcmixed),
+        };
+        let last = std::mem::replace(&mut self.z_census_last, sums);
+        let d = |a: u64, b: u64| a.saturating_sub(b);
+        let mut threads = 0u32;
+        self.z_census_slots.resize(rd.slots.len(), 0);
+        for (i, s) in rd.slots.iter().enumerate() {
+            let n = s.zcwindows.load(AtomicOrdering::Relaxed);
+            if n != self.z_census_slots[i] {
+                threads += 1;
+                self.z_census_slots[i] = n;
+            }
+        }
+        let inject = self.opts.zpages_inject.clone();
+        let refaults = match inject.as_ref().and_then(|i| i.refault_rate()) {
+            Some(rate) => Some((rate * zselect::CENSUS_INTERVAL.as_secs_f64()).round() as u64),
+            None => {
+                let r = zfile::read_budget().and_then(|b| b.refaults);
+                let delta = match (r, self.z_census_refaults) {
+                    (Some(r), Some(r0)) => Some(r.saturating_sub(r0)),
+                    (Some(_), None) => Some(0),
+                    (None, _) => None,
+                };
+                self.z_census_refaults = r;
+                delta
+            }
+        };
+        let least = |pick: fn(&Slot) -> &AtomicU64| -> Option<f64> {
+            rd.slots
+                .iter()
+                .map(|s| f64::from_bits(pick(s).load(AtomicOrdering::Relaxed)))
+                .filter(|v| *v > 0.0)
+                .fold(None, |m: Option<f64>, v| Some(m.map_or(v, |m| m.min(v))))
+        };
+        let t_f = (sums.fflt > 0 && sums.fwall > sums.fcpu)
+            .then(|| (sums.fwall - sums.fcpu) as f64 * 1e-9 / sums.fflt as f64);
+        let costs = zselect::Costs {
+            t_f,
+            t_hit: least(|s| &s.zchit),
+            t_hit_scan: least(|s| &s.zchitscan),
+            t_z: least(|s| &s.zcz),
+            t_z_scan: least(|s| &s.zczscan),
+        };
+        let ns = |c: Option<f64>| c.map_or(0, |v| (v * 1e9) as u64);
+        for (i, c) in [
+            costs.t_f,
+            costs.t_hit,
+            costs.t_hit_scan,
+            costs.t_z,
+            costs.t_z_scan,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            self.shared.z.census_costs[i].store(ns(c), AtomicOrdering::Relaxed);
+        }
+        let _ = now;
+        zselect::Census {
+            reads: zselect::Window {
+                ops: d(sums.reads, last.reads),
+                faults: d(sums.rflt, last.rflt),
+            },
+            scans: zselect::Window {
+                ops: d(sums.scans, last.scans),
+                faults: d(sums.sflt, last.sflt),
+            },
+            mixed: d(sums.mixed, last.mixed),
+            refaults,
+            threads,
+            costs,
+        }
     }
 
     /// The model's reading (S1): the cache budget from the injection or the
@@ -31218,7 +31707,8 @@ impl Maint {
 
     /// A decision published: the gate word last, the phase and the counts
     /// beside it, and a trace line where asked.
-    fn z_apply(&self, d: &zselect::Decision, model: Option<&zselect::Model>) {
+    fn z_apply(&mut self, d: &zselect::Decision, model: Option<&zselect::Model>) {
+        self.z_census_on = d.census;
         let ev = &self.shared.z;
         self.shared.zgate.store(d.gate);
         ev.phase
@@ -31232,6 +31722,17 @@ impl Maint {
         ev.sel_trials.store(c.trials, AtomicOrdering::Relaxed);
         ev.sel_trials_back
             .store(c.trials_back, AtomicOrdering::Relaxed);
+        ev.sel_mixed.store(c.mixed_windows, AtomicOrdering::Relaxed);
+        ev.sel_threads
+            .store(u64::from(self.zsel.threads()), AtomicOrdering::Relaxed);
+        let m = self.zsel.measured();
+        let ns = |c: Option<f64>| c.map_or(0, |v| (v * 1e9) as u64);
+        for (i, c) in [m.t_f, m.t_hit, m.t_hit_scan, m.t_z, m.t_z_scan]
+            .into_iter()
+            .enumerate()
+        {
+            ev.sel_costs[i].store(ns(c), AtomicOrdering::Relaxed);
+        }
         if self.z_trace && (model.is_some() || d.event.is_some()) {
             eprintln!(
                 "zselect {:?} gate {} census {} build {} sample {} event {:?} model {:?}",

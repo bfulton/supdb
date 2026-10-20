@@ -1983,6 +1983,16 @@ pub(super) struct ZEvents {
     pub sel_switches: AtomicU64,
     pub sel_trials: AtomicU64,
     pub sel_trials_back: AtomicU64,
+    /// The census's: the ticks taken, which a handle's window counts its
+    /// length against; the mixed windows and the threads the selector
+    /// holds; the costs the tick last measured and the ones the selector
+    /// holds, nanoseconds (0: none), in the order of `Costs`: a fault, a
+    /// read and a scan that hit, a read and a scan through the form.
+    pub ticks: AtomicU64,
+    pub sel_mixed: AtomicU64,
+    pub sel_threads: AtomicU64,
+    pub census_costs: [AtomicU64; 5],
+    pub sel_costs: [AtomicU64; 5],
 }
 
 impl ZEvents {
@@ -2650,11 +2660,19 @@ pub struct ZInject {
     /// The budget `B`, bytes; 0 for the platform's.
     pub budget: AtomicU64,
     /// The group's refaults a second, as the bits of an `f64`; `u64::MAX`
-    /// for the platform's.
+    /// for the platform's. The census takes the interval's refaults from
+    /// it too.
     pub refault_rate: AtomicU64,
     /// The clock, nanoseconds since the store's epoch; 0 for the monotonic
     /// clock.
     pub clock_ns: AtomicU64,
+    /// The major faults a handle's window reads, a count the test moves,
+    /// in place of the thread's own; `u64::MAX` for the thread's.
+    pub faults: AtomicU64,
+    /// The price of a fault, nanoseconds: a window's busy wall is then its
+    /// CPU plus its faults at that price, so a test needs no bound to
+    /// have faults cost anything; 0 for the wall as spent.
+    pub fault_cost_ns: AtomicU64,
 }
 
 impl Default for ZInject {
@@ -2663,6 +2681,8 @@ impl Default for ZInject {
             budget: AtomicU64::new(0),
             refault_rate: AtomicU64::new(u64::MAX),
             clock_ns: AtomicU64::new(0),
+            faults: AtomicU64::new(u64::MAX),
+            fault_cost_ns: AtomicU64::new(0),
         }
     }
 }
@@ -2712,6 +2732,60 @@ impl ZInject {
             ns => Some(Duration::from_nanos(ns)),
         }
     }
+
+    /// `n` more faults for the windows to read; from the first call the
+    /// windows read this count and not the thread's.
+    pub fn add_faults(&self, n: u64) {
+        let was = self.faults.load(Ordering::Acquire);
+        let now = if was == u64::MAX {
+            n
+        } else {
+            was.saturating_add(n)
+        };
+        self.faults.store(now, Ordering::Release);
+    }
+
+    /// The price of a fault the windows charge, in place of the wall.
+    pub fn set_fault_cost(&self, d: Duration) {
+        let ns = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX).max(1);
+        self.fault_cost_ns.store(ns, Ordering::Release);
+    }
+
+    /// The injected fault count, if a test has moved it.
+    pub fn faults(&self) -> Option<u64> {
+        match self.faults.load(Ordering::Acquire) {
+            u64::MAX => None,
+            n => Some(n),
+        }
+    }
+
+    /// The injected price of a fault, if one is set.
+    pub fn fault_cost(&self) -> Option<Duration> {
+        match self.fault_cost_ns.load(Ordering::Acquire) {
+            0 => None,
+            ns => Some(Duration::from_nanos(ns)),
+        }
+    }
+}
+
+/// The calling thread's major faults, cumulative, as the kernel counts
+/// them for the thread (`getrusage(RUSAGE_THREAD)`): the suite's own
+/// measure (`/proc/thread-self/stat`'s field), read through the call
+/// that costs a syscall and no file. `None` off Linux and where the call
+/// fails. `RUSAGE_THREAD` is Linux's 1, named here because the libc
+/// crate this tree builds with does not name it for this target.
+pub(super) fn thread_major_faults() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        const RUSAGE_THREAD: libc::c_int = 1;
+        // SAFETY: a zeroed rusage is a valid out-buffer for the call's one
+        // write.
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(RUSAGE_THREAD, &mut ru) } == 0 {
+            return Some(ru.ru_majflt as u64);
+        }
+    }
+    None
 }
 
 /// The platform's reading: the v1 memory controller's group where the
@@ -2806,6 +2880,33 @@ mod tests {
         assert_eq!(i.clock(), Some(Duration::from_millis(1500)));
         i.advance(Duration::from_secs(1));
         assert_eq!(i.clock(), Some(Duration::from_millis(2500)));
+        assert_eq!((i.faults(), i.fault_cost()), (None, None));
+        i.add_faults(3);
+        i.add_faults(4);
+        i.set_fault_cost(Duration::from_micros(40));
+        assert_eq!(i.faults(), Some(7));
+        assert_eq!(i.fault_cost(), Some(Duration::from_micros(40)));
+    }
+
+    /// The thread's major faults are read, and are the count the suite
+    /// reads from `/proc/thread-self/stat` (its twelfth field after the
+    /// command), so the engine and the row agree on what a fault is.
+    #[test]
+    fn the_threads_major_faults_are_the_procfs_count() {
+        let Some(a) = thread_major_faults() else {
+            if cfg!(target_os = "linux") {
+                panic!("Linux reads them");
+            }
+            return;
+        };
+        let stat = std::fs::read_to_string("/proc/thread-self/stat").unwrap();
+        let (_, rest) = stat.rsplit_once(')').unwrap();
+        let proc_majflt: u64 = rest.split_whitespace().nth(9).unwrap().parse().unwrap();
+        let b = thread_major_faults().unwrap();
+        assert!(
+            a <= proc_majflt && proc_majflt <= b,
+            "{a} {proc_majflt} {b}"
+        );
     }
     use crate::db::zpages::ZHDR;
     use crate::db::{SegmentOptions, SegmentWriter};

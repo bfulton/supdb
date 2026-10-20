@@ -1121,6 +1121,17 @@ impl ZSelect {
         &self.counts
     }
 
+    /// The costs the census has measured, kept across steps
+    /// ([`Costs::or`] over each interval's).
+    pub fn measured(&self) -> Costs {
+        self.measured
+    }
+
+    /// The threads the last census with any counted.
+    pub fn threads(&self) -> u32 {
+        self.threads
+    }
+
     /// The dwell: `max(DWELL_FLOOR, DWELL_BUILD_FACTOR * the last build's
     /// wall)`. A switch must pay back what it cost, and a long build costs
     /// more.
