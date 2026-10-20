@@ -460,6 +460,23 @@ take. The design's reason for the fence (3.4: the heads leave the working
 set) is what the pairing read. The fence stays the default;
 `zpages_seek_ord` is the arm, refuted as an improvement.
 
+The prefetch pairing (`ooc-scan-pairing.sh prefetch`;
+`ooc-prefetch-ab-1.out`, `ooc-prefetch-ab-2.out`; the forced arm against
+`supdb-nocachezpagesprefetch`, the same shape, read as the prefetch over
+none): the one-thread scan pass after the load at 1.19x and 1.22x, six
+pairs of six both times, with 0.24 and 0.25 faults a scan against 0.58
+and 0.69 and a tenth more bytes read a scan (the pages asked for past
+where the walk stopped); the warm two-thread pass at 0.96x and 0.98x and
+the three-thread pass at 0.94x and 0.94x, six of six each, with no fault
+either way on three threads -- the advice a syscall for pages already
+there, about a microsecond on a scan of twelve; the mixes and the loads
+level, E at 1.00x and 1.03x. 5.06 million asks over 5.40 million walks,
+one an asking walk, none from a walk its first page satisfied. The two
+regimes the design named, read in one pass each: a fifth where the walk
+faults, a twentieth lost where it does not, so the option stays off and
+is the controller's lever, to be turned on by the census's fault rate
+over the scans (stage 4) and never by a flag.
+
 ## What 2b's sittings leave open, read before 3's
 
 - The eager build's pairing (`eager-pairing.sh`, `eager-ab-1.out` and
