@@ -2401,6 +2401,29 @@ never carried across it as data; and a refusal that fires once in a
 sitting's run and once in a long test is one bug with its window named
 by both, not two accidents.
 
+**A walk that reopened what it held at every interruption.** The
+overlay walk under the compact form cut the partition's walk at each
+unsealed key inside the window: a seek to the key, a fresh walk after it
+and a values read at its emit, each opening the key's group again, three
+opens a key where the walk had the group open already. Nothing read
+wrong, and the scan pass never showed it, since a drained store's walk
+meets no unsealed key; the E mix did, 1.12x of the raw form out of core
+with its faults down twenty-fold, because the suite's Zipfian is not
+scrambled and the mixes' updates pile onto the lowest keys, where E's
+scans also start, so a window of fifty there crosses about sixteen
+unsealed keys. The time by kind named the scans, the counts per mix
+named the opens -- thirty-four a scan against four and a half for the
+pass's scan of a hundred -- and the merge path already had the cursor
+that keeps its group across its turns; the overlay walk goes through it
+now, 1.8 opens a scan (`Options::zpages_walk_cursor`;
+`supdb-nocachezpagesrankwalk` is the walk by rank). The rule: a walk
+interrupted by another source keeps what it holds across the
+interruption, and the test of a scan path is a window dense with the
+other source's keys, since a drained store's scan exercises none of its
+seams; and a key distribution's shape is read before a mix's cell is
+decomposed, since an unscrambled Zipfian's hot keys are contiguous and a
+window at its head is a different workload from one anywhere else.
+
 **A probe's total over a whole read is an inlining result.** The same engine
 read +0.9, +1.9, +2.9 and +3.15 instructions a point read across four probes
 and a count +3.00 exactly, because the code after a probe's loop changes what
