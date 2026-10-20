@@ -416,6 +416,30 @@ mixes' time by kind and the store's counters per mix, in core and under
 the bound -- and it runs after the heads and prefetch pairings. Nothing
 is changed for E before that reading.
 
+What the heads pairing's first sitting said about the raw pairing's scan
+cells: its passes are the load, the scan passes and the mixes, with no
+read pass, and the forced arm's one-thread scan pass read 2.5 million
+entries a second with 0.60 faults a scan there (2.4 KB read a scan),
+where the raw pairing read 7.6-8.3 million with none. The runner's order
+puts the read passes before the scan passes, and under the bound it is
+the read pass that brings the sidecars in: the load's builds leave each
+sidecar resident and the warm, finding it so by `mincore`, reads nothing
+(`zpage_warm_skipped` the whole 2.4 GB of both stores' sidecars and
+`zpage_warm_bytes` zero, in every pairing), and the builds and the
+load's writes after it evict it under the gibibyte, so the first pass
+over the form after a load faults the sidecars in -- 0.06 a read over
+the million point reads, 0.6 a scan over the hundred thousand scans --
+and the passes after it find them resident. So the raw pairing's scan
+cells are the warm form's, and the scan after a load is 2.5 million
+entries a second with 0.6 faults a scan against the registered 0.3:
+still 3.1x the raw form's 0.79 million at a fifth of its faults, and the
+raw form never warms under this bound. The warm's test of residency at
+the attach is the wrong moment under a bound (`docs/engine.md`: "the
+headroom a bound leaves is not consulted yet"); whether a warm runs
+after the load's last build, or whether a pass is left to warm the next,
+is stage 4's to decide with the census, and the registration's scan
+cells are restated as two, after a read pass and after a load.
+
 ## What 2b's sittings leave open, read before 3's
 
 - The eager build's pairing (`eager-pairing.sh`, `eager-ab-1.out` and
