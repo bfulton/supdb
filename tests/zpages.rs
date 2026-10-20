@@ -2822,11 +2822,16 @@ fn a_merge_takes_the_form_file_of_the_segment_it_retires() {
         .collect();
     // A retired form file is renamed to a dead name by the landing and
     // unlinked at the segment work's idle tick, so a dead name may stand
-    // here; a live name must be a live segment's.
+    // here; a live name must be a live segment's, and so must a temp
+    // name, a build the segment work started for a live partition since
+    // the builds above were collected -- under the gate's stress one
+    // started in that window and was read as a file that outlived its
+    // segment.
     for f in form_files(&dir) {
         let name = f.file_name().unwrap().to_string_lossy().into_owned();
+        let live = name.strip_suffix(".tmp").unwrap_or(&name);
         assert!(
-            name.starts_with("zpg-dead-") || segments.contains(&name),
+            name.starts_with("zpg-dead-") || segments.contains(&live.to_string()),
             "{name} outlived its segment, before any settle of the form"
         );
     }
@@ -4772,11 +4777,21 @@ fn an_auto_store_that_fits_builds_nothing() {
     let mut listings = Vec::new();
     for (name, mode) in [("auto-fits", ZPages::Auto), ("auto-fits-off", ZPages::Off)] {
         let dir = scratch(name);
+        // The budget and the group's refaults through the seam: the
+        // platform's own reading is the platform test's, and under the
+        // gate's stress of twelve processes it said SUSPECT of this store
+        // -- the group's refaults over the pressure threshold -- so the
+        // test read the controller's answer to the machine's state and
+        // not to the store's.
+        let inject = std::sync::Arc::new(supdb::ZInject::new());
+        inject.set_budget(1 << 40);
+        inject.set_refault_rate(0.0);
         let mut db = Db::create(
             &dir,
             Options {
                 zpages: mode,
                 zpages_min_bytes: 0,
+                zpages_inject: Some(inject.clone()),
                 ..Options::default()
             },
         )
@@ -5031,7 +5046,10 @@ fn blocked_store(name: &str) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInje
 fn wait_tick(db: &Db) {
     let was = db.zpage_counts().sel_steps;
     let t = std::time::Instant::now();
-    while db.zpage_counts().sel_steps == was && t.elapsed().as_secs() < 20 {
+    // A minute: the tick is the segment work's turn, ten milliseconds
+    // apart, and under the gate's stress of twelve processes a turn came
+    // more than twenty seconds late once.
+    while db.zpage_counts().sel_steps == was && t.elapsed().as_secs() < 60 {
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
     assert!(db.zpage_counts().sel_steps > was, "the tick stepped");
