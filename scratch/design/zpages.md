@@ -105,10 +105,10 @@ cache really has, on the build's own thread and never on the segment work's (5.4
 What "reversible" is made to mean (the ledger is section 5.9, and every row has a test):
 
 1. The raw segment, its ordered index, the format, its magic and the browser reader are never touched.
-   Deleting the sidecar files and setting `ZPages::Off` is the whole of the undo.
+   Deleting the form files and setting `ZPages::Off` is the whole of the undo.
 2. Switching form is a store-level word and a per-partition pointer; both forms answer every read
    identically, so a switch at any instant cannot change an answer, only its price.
-3. Disk is returned: the sidecar's mapping is dropped through the epoch (`RetireList`, swept wherever the
+3. Disk is returned: the form file's mapping is dropped through the epoch (`RetireList`, swept wherever the
    other retire lists are, 4.8), the file is renamed to a unique dead name when its cell is retired and
    unlinked on an idle tick (5.6), so `bytes_on_disk_per_byte` after a take-back equals a store that never
    had it.
@@ -118,7 +118,7 @@ What "reversible" is made to mean (the ledger is section 5.9, and every row has 
    supersedes before they install: 5.2) and section 7 prices them.
 
 Where the sentence the request quotes stands, at one probe's framing. "Extra space costs only disk"
-is true of the sidecar: the 0.68 GB it adds is a file no read touches until the form is chosen, and in the form
+is true of the form file: the 0.68 GB it adds is a file no read touches until the form is chosen, and in the form
 it replaces the 1.37 GB the probe's raw reads touched (hash and records; 1.49 GB in the engine, 9.1) with 0.68 GB. "Past the memory line it becomes the
 miss rate" is true of a form that *accompanies* the one the reads use, and false of one that *replaces* it for the
 reads: at 10M keys under 1 GiB the probe read the raw layout at 0.42 faults a read and the compact one at none from
@@ -243,7 +243,7 @@ engine is touched.
 
 ### 1.5 The change, in one paragraph
 
-A derived sidecar `zpg-<id>-<end_seq>.zpg` per partition holds the partition's records, verbatim, in
+A derived form file `zpg-<id>-<end_seq>.zpg` per partition holds the partition's records, verbatim, in
 groups that each compress into one 4 KiB page, with a resident fence of first keys and ranks and a
 resident Bloom filter bound to the code that builds it (sections 2-3). It is built on a niced thread when the
 selector's measure calls for it (4) and read through a mapping of its own; the raw segment is untouched (sections 4-5). Both forms answer
@@ -253,7 +253,7 @@ identically, which is what lets the choice be per workload, reversible and wrong
 
 ### 2.0 Choices, and what each is for
 
-1. **A sidecar file per partition, not a region of the segment.** The segment's format, its magic
+1. **A form file per partition, not a region of the segment.** The segment's format, its magic
    (`src/format.rs:34`, 0007) and the browser reader stay as they are; the rule is the ordered index's
    (`src/ordindex.rs:163-165`, "a companion file rather than a region of the segment because that leaves
    the segment format, and the browser reader over it, untouched"). It is also what makes deletion a
@@ -276,7 +276,7 @@ identically, which is what lets the choice be per workload, reversible and wrong
    (`src/ordindex.rs:417-419`), which is enough for heads and not for a file that carries values.
 6. **One owner for each piece of arithmetic a second reader would restate** (rev 1.2, rev 1.15). The compact
    record's length is `flatindex::record_len_compact` (`src/flatindex.rs:703`), which `record_key_next` calls and does
-   not restate; the Bloom filter's bit layout is `BlockedBloom`'s alone, and the sidecar stores a filter only with a
+   not restate; the Bloom filter's bit layout is `BlockedBloom`'s alone, and the form file stores a filter only with a
    signature that changes whenever that layout does (2.3, 2.5).
 
 ### 2.1 File layout
@@ -305,7 +305,7 @@ Resident bytes at 10M keys [D]: B1+B2 `175k * 8 = 1.4 MB`, B3 0.7 MB, B4 `175k *
 
 | offset | size | field |
 |---|---|---|
-| 0 | 4 | `crc`: CRC32C (`block::crc32`, `src/block.rs:116`; hardware where the CPU has it) over bytes `[4, 4096)` of the page, padding included, **XOR the trailer's `bind32`** (2.3): a page copied in from another sidecar, or from the same partition's sidecar of another generation, fails its own check at no cost (rev 1.15) |
+| 0 | 4 | `crc`: CRC32C (`block::crc32`, `src/block.rs:116`; hardware where the CPU has it) over bytes `[4, 4096)` of the page, padding included, **XOR the trailer's `bind32`** (2.3): a page copied in from another form file, or from the same partition's form file of another generation, fails its own check at no cost (rev 1.15) |
 | 4 | 4 | `tag` = `"ZPG1"` (`0x3147_505A`), never zero: a zeroed page cannot pass |
 | 8 | 4 | `first_rank` (u32) |
 | 12 | 2 | `count` (u16, 1..=256 = `ZMAX_COUNT`) |
@@ -381,35 +381,35 @@ bytes (`src/block.rs:10-13`), and the unchecked decoder is never handed a page w
 // idle_io_priority, idle_cpu_priority and Seg without widening any visibility; db is already
 // cfg(not(wasm)), src/lib.rs:68-69, so the module is excluded from the wasm build by construction;
 // every item that touches the OS is cfg(target_os = "linux") with a no-op elsewhere: 2.9)
-pub(super) struct ZSide {
-    map: MmapBytes,                 // the sidecar, mapped read-only; its own advice
+pub(super) struct ZFile {
+    map: MmapBytes,                 // the form file, mapped read-only; its own advice
     advice_random: AtomicBool,      // set at attach from the store's current advice and flipped with it (rev 1.15)
     fence: ZFence,                  // heap copies of B1..B4: anonymous, never evicted (swap is off here)
     filter: BlockedBloom,           // heap copy of B5, valid only under the trailer's bloom_sig (2.5)
     nkeys: usize, n_pages: usize,
     verified: Box<[AtomicU64]>,     // one bit per page: CRC and structural walk passed in this process
     bad: Box<[AtomicU64]>,          // one bit per page: failed
-    damaged: AtomicBool,            // any failure: the whole sidecar leaves service
+    damaged: AtomicBool,            // any failure: the whole form file leaves service
     id: u64,                        // minted at attach from a global counter, as Blob::id (src/blob.rs:758-760)
     ident: ZIdent,                  // the trailer's binding fields, bind32 among them
 }
 struct ZFence { first_rank: Vec<u32>, page: Vec<u32>, key_off: Vec<u32>, keys: Vec<u8> }
-pub(super) struct ZCell { p: AtomicPtr<ZSide> }   // Seg::z; an Arc<ZSide> through into_raw/from_raw
+pub(super) struct ZCell { p: AtomicPtr<ZFile> }   // Seg::z; an Arc<ZFile> through into_raw/from_raw
 // The per-read counters are not here: they live in ZStat, one 128-byte line per reader slot (6.1, 6.4).
 ```
 
-`ZSide` holds no raw pointer and no cell a reader follows; the compile-time test that asks the compiler
-`Send + Sync` of `State`, `Shared` and `Snapshot` (`src/db.rs:28116-28131`) gets `ZSide` added, because
-an `AtomicPtr<ZSide>` in `Seg` would otherwise let a non-`Sync` type in unasked (`CLAUDE.md` "Invariants":
+`ZFile` holds no raw pointer and no cell a reader follows; the compile-time test that asks the compiler
+`Send + Sync` of `State`, `Shared` and `Snapshot` (`src/db.rs:28116-28131`) gets `ZFile` added, because
+an `AtomicPtr<ZFile>` in `Seg` would otherwise let a non-`Sync` type in unasked (`CLAUDE.md` "Invariants":
 "a raw pointer behind an atomic would let one in unasked").
 
-### 2.5 Binding a sidecar to its segment
+### 2.5 Binding a form file to its segment
 
 No engine segment has a strong identity [D from code]: every one is finished with generation 1
 (`src/db.rs:5312-5342`) and a timestamp in whole seconds (`src/db.rs:4958-4961`), the ordered
 index checks a key count (`src/ordindex.rs:417-419`), and `next_seg` restarts at the largest live id plus
 one at every open (`src/db.rs:18997`), so a swept orphan's id can name a different segment next time. A
-sidecar holds *values*, so the binding is to the content: at attach the reader recomputes from the live
+form file holds *values*, so the binding is to the content: at attach the reader recomputes from the live
 segment, and the trailer must equal, all of
 
 `nkeys`, `recs_len`, `crc_off`, `key_off`, `hash_cap`, `file_len` (the superblock's `high_water`),
@@ -428,7 +428,7 @@ live in, and reading it costs a few hundred kilobytes per gigabyte, not a pass o
 multiplier constants and two shifts, `src/db.rs:2441-2444`), of the block choice `(h >> 32) % blocks.len()` and the
 four-probe walk of `slots_of` (`src/db.rs:2481-2492`), and of `with_capacity`'s `n * 10 / 512` blocks
 (`src/db.rs:2429-2433`). Only the first is format; an edit to any other moves no magic, no record version, no row CRC
-and no trailer field, so an engine that changed `slots_of` (five probes, a new finalizer) would attach an old sidecar
+and no trailer field, so an engine that changed `slots_of` (five probes, a new finalizer) would attach an old form file
 whose trailer CRC, `res_crc`, binding and sampled page CRCs all pass, and every present key whose bits no longer line up
 would test negative and be answered "absent" with no fence search and no counted fallback (3.2, step 1). That is a derived
 thing whose function changed under it, and nothing raises. The comment at `src/db.rs:2438-2440` ("the filter is built at
@@ -436,7 +436,7 @@ open and never stored, so its hash is free to be the index's") is false once a f
 same commit. Three defences, each cheap: (1) `BLOOM_SIG`, a constant beside `BlockedBloom` bumped with any of the
 above, stored in the trailer and compared at attach; (2) a unit test that builds a filter over 4,096 fixed keys and
 compares a CRC32C of its words with a literal, so an edit to `BlockedBloom` fails a test whose message says to bump
-`BLOOM_SIG` and the sidecar `version`; (3) at attach every fence key (a real key of the partition: 7.6k a partition at
+`BLOOM_SIG` and the form file `version`; (3) at attach every fence key (a real key of the partition: 7.6k a partition at
 10M, under a millisecond) must test positive in the filter, which a mismatched layout fails with certainty (a present
 key tests positive under a wrong layout at the false-positive rate, 1.26%, so 7.6k keys all passing is `0.0126^7600`).
 
@@ -604,9 +604,9 @@ makes `W_z` and `W_raw` nearly equal and fails the same gate.
 | file absent, empty, length not a multiple of 4096 | attach | open of the form (5.5) | none; raw serves; counted `rejected_damage` if a file was there |
 | trailer torn | `trailer_crc`, magic, `version`, `page_size` | attach | file deleted, counted, raw serves, rebuilt when the form is wanted |
 | resident part damaged | `res_crc`; the fence's tiling (below) | attach | as above |
-| another segment's sidecar (id reused after a crash, a merge's orphan, a record-format change, an engine whose Bloom layout changed) | the binding fields of 2.5, `bloom_sig` and the fence-key membership check among them | attach | as above, counted `rejected_identity` |
+| another segment's form file (id reused after a crash, a merge's orphan, a record-format change, an engine whose Bloom layout changed) | the binding fields of 2.5, `bloom_sig` and the fence-key membership check among them | attach | as above, counted `rejected_identity` |
 | truncated tail, zeroed pages, a page lost to a torn unsynced write | length; the trailer; CRC of the first, last and 14 evenly spaced pages (16 faults, about 0.7 ms a file, once) | attach; and page CRC at first decode | as above |
-| bit flip or zeroing of one page | per-page `crc`, `tag`, `first_rank` and `count` against the fence, `ulen` against the decoder's returned length, then a full structural walk (below) | the page's first decode in this process; the bit in `verified` is set only after all of it passes | that read is answered from the raw segment (fallback, counted), the page's `bad` bit set, `damaged` set; Maint retires the sidecar (renamed to a dead name, 5.6) and rebuilds it if the form is still wanted, at most three times a `Seg` (below) |
+| bit flip or zeroing of one page | per-page `crc`, `tag`, `first_rank` and `count` against the fence, `ulen` against the decoder's returned length, then a full structural walk (below) | the page's first decode in this process; the bit in `verified` is set only after all of it passes | that read is answered from the raw segment (fallback, counted), the page's `bad` bit set, `damaged` set; Maint retires the form file (renamed to a dead name, 5.6) and rebuilds it if the form is still wanted, at most three times a `Seg` (below) |
 | a wrong group with a valid CRC (a builder bug) | the builder's decode-and-compare (2.6 step 6); the structural walk; the tests | build | the build fails, temp removed, `build_failed` counted, nothing attached |
 
 The fence's tiling is checked at attach from the resident part alone, with no page read: `first_rank[0] =
@@ -623,7 +623,7 @@ taken silently is the shape of every gate this repository broke (`src/db.rs:2566
 of the segment bytes, the constants and the `lz4_flex` version, and the test for rebuild compares decoded
 groups and the fence, not bytes, so a dependency update does not turn it red).
 
-**Rebuild after damage is bounded** (rev 1.7). `Maint` retires a damaged sidecar (renamed to a dead name, 5.6) and may
+**Rebuild after damage is bounded** (rev 1.7). `Maint` retires a damaged form file (renamed to a dead name, 5.6) and may
 rebuild it while the form is still wanted, at most three times a `Seg`, each after the 60 s doubling backoff of a failed
 build (5.7); after the third the partition is declined for the life of the `Seg` and counted `declined_damage`. A
 deterministic builder defect that slips past step 6, or a media fault that persists, is thereby a counted decline and
@@ -649,7 +649,7 @@ reads that need it.
   `190-193`, `216-219` and `tests/segwriter.rs:150-153`): the z reader is a different reader on a different
   file and `Blob`'s own lending is not touched.
 * `tests/blob.rs`, `tests/dict.rs`, `tests/ranges.rs` and `tests/segwriter.rs` open `Blob` and `SparseBlob`
-  over a `SegmentWriter` file and never see a sidecar. They are **not parameterized and not edited**: that
+  over a `SegmentWriter` file and never see a form file. They are **not parameterized and not edited**: that
   they pass unchanged is the evidence that the three readers (a `Blob` over a mapping, over a copying
   source, and `SparseBlob` over ranges) did not move. The z reader is a *fourth* reader, native only, and it
   is held to the first three in a new `tests/zpages.rs` (6.3) over the very partition file the `Db`
@@ -685,7 +685,7 @@ side, and a green local run would not have been a green CI run (`CLAUDE.md`, "Ru
   `/proc/self/maps` assertion) are `#[cfg(target_os = "linux")]`; the rest of `tests/zpages.rs` runs on the three
   native legs (`cargo test --profile checked` through `scripts/check.sh test`), so the layout, the cursor and the oracle are held
   on three kernels' mmap; the qemu job runs `--lib` only (`.github/workflows/ci.yml:106`), so what it holds is the unit tests
-  inside `src/db/zpages.rs` (the layout, `fill_group`, the encoders). The sidecar copies record images verbatim and so inherits
+  inside `src/db/zpages.rs` (the layout, `fill_group`, the encoders). The form file copies record images verbatim and so inherits
   the segment's native-endian rule (`src/flatindex.rs:25-31`).
 * The page is 4 KiB by the format's choice (`page_size`, 2.3), not the host's. Where the host's page is larger (16 KiB on
   Apple silicon) one z page is not one fault and the model's "one fault a read" is false; `Always` still answers
@@ -694,7 +694,7 @@ side, and a green local run would not have been a green CI run (`CLAUDE.md`, "Ru
 
 ## 3. READ PATHS IN THE COMPACT FORM
 
-The rule every path below keeps: **a covered partition's read, count and scan touch the sidecar and nothing of the raw
+The rule every path below keeps: **a covered partition's read, count and scan touch the form file and nothing of the raw
 segment's record, directory or hash regions, except at the sites 3.9 marks raw on purpose.** Every exception is in the
 table, bounded, counted, and visible to the selector's "z is not paying" exit (4.5, E3), because a path that touches the
 raw form beside the z form enlarges the working set it was meant to shrink (the union leak: `src/ordindex.rs:91-107`).
@@ -708,7 +708,7 @@ store would have failed it; 6.3 tests the shapes. Everything else in `Reader::re
 untouched: the epoch pin, the partition routing by fence (`src/db.rs:13385-13388`; partitions carry no Bloom and
 `Seg::may_hold` is the fence alone, `src/db.rs:5625-5632`, `5514`), the level-0 pieces over the range, the frozen tables
 and the live table, the tombstone pre-pass, and the order sources are read in (partition, pieces, frozen oldest first,
-live: `src/db.rs:13453-13484`). The sidecar replaces the one source that is a partition, nothing more.
+live: `src/db.rs:13453-13484`). The form file replaces the one source that is a partition, nothing more.
 
 ### 3.1 Where the branch sits, and why both forms may be read at any instant
 
@@ -718,12 +718,12 @@ start"). With the gate at COMPACT the partition source is read by `Seg::read_all
 `seg_read` as it is today (`src/db.rs:13445-13457`); `Reader::count` the same at `src/db.rs:18246-18251`.
 `Seg::read_all_z` loads the segment's `ZCell` (an acquire load; the read is pinned, so the pointer it
 returns stays valid to the end of the operation, `src/db.rs:12703-12748`, `10587-10628`) and, if it is null
-or the sidecar is damaged, answers from the raw form and counts a `rawserve`. Because the two forms answer
+or the form file is damaged, answers from the raw form and counts a `rawserve`. Because the two forms answer
 identically (the tests of section 6 hold them to it), a gate store, a cell install or a retirement at any
 instant between two loads changes the price of a read and never its answer; that is the property that makes
 publication a store instead of a protocol.
 
-### 3.2 Point read, `ZSide::read_all(raw, key, f)`
+### 3.2 Point read, `ZFile::read_all(raw, key, f)`
 
 1. `h = flatindex::key_hash(key)` (FNV, `src/flatindex.rs:1528`). If `!filter.maybe_contains_fnv(h)`: return
    0 values, **no fence search, no page**. The raw form answers an absent key from its resident hash
@@ -737,7 +737,7 @@ publication a store instead of a protocol.
    answers without the call) at about 7.6k entries a partition, about 100 ns, the fences being 3 MB of heap). `None` (the key sorts below the first key) returns 0 values: a free negative for the first
    partition, whose fence is open (`Seg::below_lo`, `src/db.rs:5606`).
 3. If `page[e] == ZNOPAGE`: return `Fallback`, counted `nopage_reads`; the caller reads the raw form.
-4. `g = group(e)`: the memo (3.7), else the page: lend 4,096 bytes from the sidecar's mapping
+4. `g = group(e)`: the memo (3.7), else the page: lend 4,096 bytes from the form file's mapping
    (`MmapBytes::slice_at`, `src/bytes.rs:206-212`) -- **this is the one page fault of a read**, at most --
    check the `verified` bit, and on its absence do the first-decode checks of 2.7 (CRC, tag, `first_rank`
    and `count` against the entry, decode length against `ulen`, the structural walk); then decode into the
@@ -768,22 +768,22 @@ are heap. With a block-backed run: one z page and the raw block's 4 KiB chunk (`
 
 ### 3.3 Count
 
-`Blob::count` is `lookup` then the sum of `Ext::records()` (`src/blob.rs:1491-1497`). `ZSide::count` is steps
+`Blob::count` is `lookup` then the sum of `Ext::records()` (`src/blob.rs:1491-1497`). `ZFile::count` is steps
 1-5 and then the sum over `exts` of the same function; the same pages. The Db's count adds the
 other sources as before (`src/db.rs:18253-18275`).
 
 ### 3.4 Seek and `key_at`
 
-`ZSide::seek(key) -> usize` returns the rank of the first key at or after `key` as `Blob::seek` does
+`ZFile::seek(key) -> usize` returns the rank of the first key at or after `key` as `Blob::seek` does
 (`src/blob.rs:870-876`): steps 2-5 with "first record whose key is `>= key`"; the rank is
 `first_rank[e] + index`; if every record of the group is smaller, `first_rank[e] + count`, which is the next
 entry's first rank or `nkeys`, with no second page; a key below the first key is rank 0. One page.
-`ZSide::key_at(rank, f)` finds the entry by `partition_point` over `first_rank` (a `u32` array: thirteen
+`ZFile::key_at(rank, f)` finds the entry by `partition_point` over `first_rank` (a `u32` array: thirteen
 compares of integers), decodes it, skips `rank - first_rank[e]` records and hands the key to `f`. Callback
 shaped, for the lifetime reason above, and a loop that keeps a position uses the cursor of 3.10 instead.
 
 **Seeks of a covered partition go by the z fence and not by the ordered index** (rev 2.5; the first version made this
-stage 3b, conditional). `ZSide::seek` is steps 2-5 above and costs the page the scan reads next anyway, since the walk
+stage 3b, conditional). `ZFile::seek` is steps 2-5 above and costs the page the scan reads next anyway, since the walk
 begins there, so it adds the in-group walk (0.2-0.85 us) and takes the seek's own page fault out of the ordered index's
 heads. The ordered index (`OrdIndex::seek_exact_hint`, `src/db.rs:17058`) answers a seek from the heads, 8 B a key (80 MB
 at 10M), when every key has one length up to its prefix plus eight bytes -- the suite's (`src/ordindex.rs:28-35`,
@@ -791,10 +791,10 @@ at 10M), when every key has one length up to its prefix plus eight bytes -- the 
 compact form that search is a raw record read per probe, the union leak, and the suite's keys would never have shown it.
 Seeking by the fence drops the heads from the compact form's working set (0.82 to 0.74 GB at 57 records a page, which is the
 difference between D10's 43.1 and 39.3 records a page for the scan claim), makes the seek independent of key shape, and
-leaves the ordered index serving the partitions that have no sidecar and the pieces. The heads path stays as the arm that
+leaves the ordered index serving the partitions that have no form file and the pieces. The heads path stays as the arm that
 prices the choice (`Options::zpages_seek_ord`, `supdb-nocachezpagesheads`, 6.2).
 
-### 3.5 Scan, `ZSide::scan_at(raw, rank, limit, f)`
+### 3.5 Scan, `ZFile::scan_at(raw, rank, limit, f)`
 
 The contract is `Blob::scan_at`'s (`src/blob.rs:1695-1901`): `limit` counts **keys**, the return value is the
 keys visited, a key whose values are all gone (a tombstone-only key) counts and emits nothing, and the Db
@@ -843,9 +843,9 @@ the second lever, after the decode, and is not taken in this move.
 
 ### 3.6 Values, extents, multi-value keys, tombstones
 
-* `ZSide::values_at(raw, rank, f)` is `Blob::values_at` (`src/blob.rs:973-989`): the record at `rank` by the
+* `ZFile::values_at(raw, rank, f)` is `Blob::values_at` (`src/blob.rs:973-989`): the record at `rank` by the
   entry and the skip, then `read_exts` for each extent.
-* `ZSide::with_exts_at(rank, f)` hands `(key, &[Ext], tail)` to `f`; the four Db sites that call
+* `ZFile::with_exts_at(rank, f)` hands `(key, &[Ext], tail)` to `f`; the four Db sites that call
   `Blob::exts_at` to look at flags or counts (`src/db.rs:13915`, `16790`, `18126`, `24822`) take this form.
 * **Multi-value keys.** A key's values are one run in one extent of one record (`SegmentWriter` makes
   exactly one extent a key, `src/db.rs:4348-4378`): FIXED (equal widths, no prefixes) or prefixed, a
@@ -877,7 +877,7 @@ KiB, so 256 entries of highly compressible data would be 16 MB; the byte cap bou
 aligned buffer, indexed by `(side id, page)` hashed to a slot, filled on a miss, allocated lazily per entry and reusing the
 buffer of the entry it replaces when its count is one. A hit costs the index, a compare and an `Rc` clone (3 ns) instead of
 the decode, and **still pays the in-group walk** (28 `key_cmp` compares, 3.2 step 5): a hit read is 1.2-1.9 us, not 0.9
-[P2]. The `Rc` keeps the buffer alive across a re-entrant callback without a `Cell` take-and-put; a retired sidecar's
+[P2]. The `Rc` keeps the buffer alive across a re-entrant callback without a `Cell` take-and-put; a retired form file's
 entries are never hit (the id is never reused) and are overwritten in time. Memory: at most 8 MiB a thread, allocated only
 in the compact form; at three reader threads that is 24 MB of the cache budget, which the model reads as `anon` (4.2).
 
@@ -904,7 +904,7 @@ values is the raw form's. In the scans, the machinery that merges the partition'
 keys' snapshot (`scan_blocks`, `scan_partitions`, `scan_merged`, `walk_deltas`, `copy_from_deltas`:
 `src/db.rs:16924`, `17791`, `18007`, `25456`, `25645`) calls the partition through the `scan_at`, `values_at`, `exts_at`,
 seek and cut sites of 3.9, and goes through the z wrappers, or the cursor of 3.10 where it keeps a position, at each; the
-snapshot's overlay is never read from a sidecar. `Cached::Block` copies own their values and read no partition after they are
+snapshot's overlay is never read from a form file. `Cached::Block` copies own their values and read no partition after they are
 built (`src/db.rs:17382-17419`); building them reads through the same wrappers. A direct run in progress above the store's
 greatest key is an ordered memtable, not a partition, and is read as today.
 
@@ -921,7 +921,7 @@ site that was not decided does not compile", and with a `key_at` forwarder none 
 `prefetch_ranks(_est)` -- and forwards only the names that read no record: `keys`, `id`, `index_bytes`,
 `advise_random`, `advise_normal`. A site that calls one of the first group does not build until its author writes a
 z-aware call (which takes the covered or uncovered branch) or `.raw()`, the raw form on purpose. `raw()` is the one door
-to the raw `Blob`: under `debug_assertions` it increments `raw_touches` when the segment has an installed sidecar and the gate
+to the raw `Blob`: under `debug_assertions` it increments `raw_touches` when the segment has an installed form file and the gate
 is at COMPACT (6.4), so `grep -n '\.raw()' src/db.rs` is the list of every deliberate raw read and the counter is the list
 of the ones that run. `prefetch_block` (`src/db.rs:9553-9565`) takes a `&Blob` and is given `seg.blob.raw()`. The test of the
 mechanism is `the_compact_form_touches_no_raw_page` over the shapes of the table below, each of whose rows is a fixture; the
@@ -937,15 +937,15 @@ on exactly those.
 | `src/db.rs:13929`, `16814`, `17967`, `18141`, `24857` | `values_at` over a partition | **z** `values_at` |
 | `src/db.rs:16824`, `18157`, `24864` | `values_at` over a piece | raw |
 | `src/db.rs:13915`, `16790`, `18126`, `24822` | `exts_at` for flags / counts | **z** `with_exts_at` |
-| `src/db.rs:17832`, `18058-18059` | `scan_partitions`' and `scan_merged`'s seek of a partition, and its first key | **z** `ZSide::seek` / `cursor_seek`, by the fence (3.4, 3.10) |
-| `src/db.rs:17841` calling `25702`, `25706` (`BuildCtx::cut_at`) | where the next unsealed key cuts the walk window | **z** `ZSide::cut_in` (3.10); two raw records otherwise (rev 1.1, rev 2.5) |
+| `src/db.rs:17832`, `18058-18059` | `scan_partitions`' and `scan_merged`'s seek of a partition, and its first key | **z** `ZFile::seek` / `cursor_seek`, by the fence (3.4, 3.10) |
+| `src/db.rs:17841` calling `25702`, `25706` (`BuildCtx::cut_at`) | where the next unsealed key cuts the walk window | **z** `ZFile::cut_in` (3.10); two raw records otherwise (rev 1.1, rev 2.5) |
 | `src/db.rs:18074`, `18141`, `18145`, `18149` | `scan_merged`'s partition cursor: first key of the next partition, its values, the key after each emitted key | **z** `ZCursor::{key, values, advance}` (3.10) |
-| `src/db.rs:18042`, `18046`, `18161` | `scan_merged`'s level-0 cursors | raw: a piece has no sidecar (3.10) |
+| `src/db.rs:18042`, `18046`, `18161` | `scan_merged`'s level-0 cursors | raw: a piece has no form file (3.10) |
 | `src/ordindex.rs:864-905` (`exact_at`) | binary search of `key_at` over a tied run when keys are not one length within a head | not reached for a covered partition: its seeks go by the fence |
 | `src/db.rs:17058`, `17067`, `16501`, `22216-22220`, `24130-24131`, `24221-24222`, `24265-24266`, `24306-24358`, `24760` | seek, cut and rank closures of the block-cache machinery (`scan_blocks`, `BoundsById`, `owner_of`) and of the pieces | the default policy's: raw `key_at` behind the ordered index on pieces; on a covered partition through the z wrappers in stage 3, counted by `raw_touches` until then (R17) |
 | `src/db.rs:13865`, `13874`, `13914`, `13926` | the k-way arm (`scan_merge: false`) | raw and counted; a comparison arm never paired with `zpages` |
 | `src/db.rs:9553-9565`, `17063`, `13719-13723` | prefetch hints | not issued on a covered partition; z span hint instead |
-| `src/db.rs:13322-13338` | `advise` loop | adds `ZSide::advise` |
+| `src/db.rs:13322-13338` | `advise` loop | adds `ZFile::advise` |
 | `src/db.rs:8774-8786`, `9056-9068` | merges' own mapping of their inputs | raw by design: one sequential pass, nothing kept |
 | `src/db.rs:18917-18924`, `19289-19302` | open's checksum-row verify, `pending_whole` | raw by design: a pass over the whole key section at every open, dropped by the cache as z pages are touched |
 | `src/db.rs:5438-5440` | `learn_prefix` first key at open | raw: one page a segment |
@@ -957,16 +957,16 @@ on exactly those.
 Three paths keep a *position* in a partition and ask for the key there again and again: `scan_merged` (`src/db.rs:18007`)
 holds `pkey = blob.key_at(prank)` across iterations and compares it with the pieces' keys; `scan_partitions` asks
 `BuildCtx::cut_at` where the next unsealed key falls in its window; and the default policy's `walk_deltas` and
-`copy_from_deltas` (`25456`, `25645`) do the same over a block's ranks. The callback-shaped `ZSide::key_at(rank, f)` of 3.4
+`copy_from_deltas` (`25456`, `25645`) do the same over a block's ranks. The callback-shaped `ZFile::key_at(rank, f)` of 3.4
 serves none of them: it re-skips from the group's start on every call (O(57), ten times the raw per-entry cost) and cannot lend
 a key across an iteration. One type serves all three:
 
-* `ZSide::cursor_seek(key) -> ZCursor` and `ZSide::cursor_at(rank) -> ZCursor`: the entry by `partition_point` over the fence
+* `ZFile::cursor_seek(key) -> ZCursor` and `ZFile::cursor_at(rank) -> ZCursor`: the entry by `partition_point` over the fence
   or over `first_rank` (once), the group through the memo (an `Rc`), the record by `record_key_next`;
 * `ZCursor::key() -> Option<&[u8]>`, `ZCursor::values(f)`, `ZCursor::rank()` and `ZCursor::advance()`, which is one
   `record_key_next` and, at the end of a group, the next entry's group through the memo; an entry that is `ZNOPAGE` hands the
   cursor to a raw sub-cursor for exactly those records (counted `nopage_scans`);
-* `ZSide::cut_in(rank, end, uk) -> (usize, Ordering)`, `cut_at`'s answer from a cursor: the fence picks the one group of the
+* `ZFile::cut_in(rank, end, uk) -> (usize, Ordering)`, `cut_at`'s answer from a cursor: the fence picks the one group of the
   window that can hold `uk` and a walk of at most 57 `key_cmp` compares finds the rank, 0.25 us on average, where the heads
   and one record cost a cache line and a page.
 
@@ -981,7 +981,7 @@ the arm if the copy shows in the scan cells. Neither touches the raw path of an 
 covered partition raw, counted `raw_scans`, and the verdict reads the footprint of those cells as raw plus z; stage 3 is the
 stage that makes them z, and `raw_touches == 0` is its gate, not stage 2's. What the controller does while raw scans run beside
 z reads is E3 (4.5): the realized saving falls, and the exit fires when it stays under `saving*` for a dwell. The level-0 pieces
-over a range are raw by construction (a piece has no sidecar and its life is the merge), and a read or scan over a range that has
+over a range are raw by construction (a piece has no form file and its life is the merge), and a read or scan over a range that has
 one touches the piece's pages beside the partition's z pages; that union is bounded by the pieces' bytes (at most `l0_trigger` a
 range) and is the write-heavy mixes' price (R8).
 
@@ -1003,7 +1003,7 @@ this selector if they are ever built, instead of growing a second one (rev 3.12)
 | SUSPECT | 1 | the model says it may not; handles run the census; reads are served raw | the census countdown, about five instructions |
 | COMPACT | 2 | covered partitions are read from the z form | a z read, and the footprint sketch's one store |
 
-`ZPages::Off` pins the gate to 0, samples nothing, builds nothing and sweeps sidecars at open.
+`ZPages::Off` pins the gate to 0, samples nothing, builds nothing and sweeps form files at open.
 `ZPages::Always` pins it to 2 and builds at every landing (the forced arm: it prices the form without the
 controller). `ZPages::Auto` is the controller below, and **it degrades where it cannot run instead of refusing the
 open** (rev 1.3, rev 2.18): `Auto` needs the segment work's thread, which exists unless `publish_in_background` is off
@@ -1139,7 +1139,7 @@ inferred from outside, from the thread's own counters, and **not by timing looku
 | `refault_share` | 0.5 over 5 s | a refault is a capacity miss and a first touch is not: cold start against a store larger than its cache (4.3) |
 | S1 period, census interval | 1 s, 100 ms | the model moves with the limit and the anon, which move in seconds; the census adds in-band samples (rev 2.15) |
 | `dwell` | `max(60 s, 10 * last build wall)` | a switch must pay back what it cost. A thread that reads continuously at any fault rate above `theta_enter` spends 0.87 or more of its time stalled (`phi * t_f / (t_hit + phi * t_f)` = 0.87 at 0.12 faults a read, 0.96 at 0.41 [D]) and the form removes nearly all of it, so a build of 20 s of idle-priority CPU is repaid inside the dwell; the dwell also keeps a transient from costing two builds; a cancelled build counts as a switch for the dwell and doubles the back-off of the trial (rev 2.1) |
-| `retain` | `max(600 s, 20 * build wall)` | how long a sidecar is kept after the form is left: while a re-entry is likelier to be cheaper than a rebuild |
+| `retain` | `max(600 s, 20 * build wall)` | how long a form file is kept after the form is left: while a re-entry is likelier to be cheaper than a rebuild |
 | trial backoff | 10 min, doubling to 4 h | the cost of being wrong about a skewed workload, bounded to under 1% of the time |
 
 ### 4.5 The transitions, with hysteresis
@@ -1148,9 +1148,9 @@ inferred from outside, from the thread's own counters, and **not by timing looku
 |---|---|---|
 | FITS | SUSPECT | `phi_hat_raw >= theta_sus` or the pressure term, on 2 consecutive S1 ticks (2 s) |
 | SUSPECT | FITS | `phi_hat_raw < theta_sus/2` and no pressure, on 5 consecutive S1 ticks |
-| SUSPECT | building (gate stays 1) | all of: (a) `excess >= C_build` (below), accumulated over evidence intervals only (4.3); (b) the predicted saving `phi_hat_raw - phi_hat_z >= theta_enter` from the sampler's `W_z` (2.6.1) and the measured `phi_meas - phi_hat_z >= theta_enter`; (c) the model not contradicting: `phi_hat_raw >= theta_sus` **or** the pressure term (rev 2.16); (d) `dwell` since the last switch, cancelled builds included; (e) the sampler not declining the partitions. Sidecars already on disk with a matching identity are attached instead of rebuilt, and `C_build` is then the attach's cost |
+| SUSPECT | building (gate stays 1) | all of: (a) `excess >= C_build` (below), accumulated over evidence intervals only (4.3); (b) the predicted saving `phi_hat_raw - phi_hat_z >= theta_enter` from the sampler's `W_z` (2.6.1) and the measured `phi_meas - phi_hat_z >= theta_enter`; (c) the model not contradicting: `phi_hat_raw >= theta_sus` **or** the pressure term (rev 2.16); (d) `dwell` since the last switch, cancelled builds included; (e) the sampler not declining the partitions. Form files already on disk with a matching identity are attached instead of rebuilt, and `C_build` is then the attach's cost |
 | building | SUSPECT | `phi_meas - phi_hat_z < theta_enter/2` on 3 evidence intervals (the evidence vanished): the build is cancelled, **counts as a switch** and doubles the back-off |
-| building | COMPACT | sidecars attached for at least 90% of the covered footprint bytes (declined partitions excluded); the gate is stored **last**, after every cell |
+| building | COMPACT | form files attached for at least 90% of the covered footprint bytes (declined partitions excluded); the gate is stored **last**, after every cell |
 | COMPACT | SUSPECT | **E1** the limit was raised or the store shrank: the maximum of `phi_hat_raw` over the last `dwell`, on S1 values smoothed over 30 s, is under `theta_sus/2` (rev 2.15: the first version exited on `phi_hat < theta_sus` for 5 ticks, 50 ms at the 10 ms tick, with no dwell, and `phi_hat` moves 0.3 for 400 MB of `anon`; E1 is unreachable at the 1 GiB cell, where it needs `B >= 1.4 GB`); or **E2** the trial of 4.7 says raw fits; or **E3** the form is not paying: the realized saving `phi_hat_raw - phi_meas_z` stays under `saving*` for a dwell, `phi_meas_z` being the census in COMPACT (rev 2.2) |
 
 `excess` accumulates over every evidence interval since the rung entered SUSPECT, over all handles: `excess += (phi_meas -
@@ -1210,7 +1210,7 @@ the workload stops the moment the build starts, the loss is the build, which is 
   page and left the 190 MB hash out). When `z faults per read < theta_sus` and that bound is under `B/2` for 3 consecutive
   10 s measures, the raw form would fit with room to spare.
 * **The trial** then confirms rather than assumes, **on the refilled state and not on the fill** (rev 2.3). The gate goes back
-  to 1 (sidecars stay attached) and the census runs on the raw form, whose hot pages are cold: they were not touched while the
+  to 1 (form files stay attached) and the census runs on the raw form, whose hot pages are cold: they were not touched while the
   rung was COMPACT and the z pages displaced them. The trial is judged only once the raw form has been refilled: when the trial's
   faults reach `1.2 * predicted_raw_pages` (E2's bound over 4096), or the per-interval fault rate has fallen for five
   intervals running, or `3 * predicted_raw_pages * t_f / threads` of wall time (capped at 30 s) has passed, whichever is
@@ -1230,11 +1230,11 @@ the workload stops the moment the build starts, the loss is the build, which is 
 ### 4.8 The initial state, publication and reversal
 
 * **Initial:** gate 0 at every open and create, whatever is on disk. `Auto`'s first tick is within 10 ms of
-  the segment work's start; it reads S1 at once. Sidecars found at open are attached lazily, by the tick that
+  the segment work's start; it reads S1 at once. Form files found at open are attached lazily, by the tick that
   first wants the compact form (an attach reads a partition's resident part, 0.76 MB at the suite's shape, in one
   sequential read, about 10 ms cold and 0.2 s for the store [D: 4,250 pages at a fault each is the bound];
   the tick does it, not the open and not a reader), so a restart in a
-  bound environment pays only the attach, which is what `C_build` is for a sidecar already on disk (0.2 s), and reaches COMPACT in
+  bound environment pays only the attach, which is what `C_build` is for a form file already on disk (0.2 s), and reaches COMPACT in
   about a second of evidence plus the attach, where a rebuild takes 15-40 s.
 * **Publish:** cells first (`ZCell::install`, a compare-and-swap from null; each partition's `warm` ran on the build thread before its
   install, 5.4), then `zgate.store(2, Release)`. A reader that sees the gate sees a complete cell or none (acquire load), and a
@@ -1308,7 +1308,7 @@ build: the segment-work thread opens the input and hands the `File` over at spaw
 damage unlinks are by name on an idle tick while the segment is still live, so `retire_seg`'s claim test cannot guard them,
 and a rebuild of the same `(id, end_seq)` renamed into place before the queued unlink runs would be deleted by it. The
 manifest spares avoid exactly this by linking the old manifest to a unique name before the rename (`manifest_write`,
-`src/db.rs:8355-8385`; `Maint::sweep_spares`, `27543-27563`); a sidecar is retired the same way (5.6).
+`src/db.rs:8355-8385`; `Maint::sweep_spares`, `27543-27563`); a form file is retired the same way (5.6).
 
 **A wasted-build budget** (rev 2.17). Each partition merge mints a new identity, so a rebuild follows every rewrite, and
 5.6 derives that a store written across its key space rewrites every partition each cycle, at a rate that can exceed one serial
@@ -1321,11 +1321,11 @@ does not suspend; it reports coverage as a covariate of every cell that writes (
 
 Install happens on the segment work's thread, in `z_step`, never on a reader's: (1) the target is still
 live (`Arc::ptr_eq` against `self.segs()`, or the same `(id, end_seq)` and binding under a promotion);
-(2) `ZSide::attach(path, &seg, random)` opens the final name, runs the checks of 2.7 (no page body but
+(2) `ZFile::attach(path, &seg, random)` opens the final name, runs the checks of 2.7 (no page body but
 sixteen sampled), maps it **with the store's current advice** (`Reader::advice_random`, `src/db.rs:13345`, as `Seg::open_full`
-passes it to the segment and to the ordered index, `src/db.rs:5435-5437`, `5448-5455`: a sidecar attached in a scan phase
+passes it to the segment and to the ordered index, `src/db.rs:5435-5437`, `5448-5455`: a form file attached in a scan phase
 would otherwise sit on default readahead for its life; `zpages_advised` holds it, 6.1; rev 1.15), copies the resident part to
-the heap, and requires the binding of 2.5, `bloom_sig` and the fence keys in the filter; (3) `seg.z.install(Arc<ZSide>)`, a
+the heap, and requires the binding of 2.5, `bloom_sig` and the fence keys in the filter; (3) `seg.z.install(Arc<ZFile>)`, a
 compare-and-swap from null on a pointer only this thread writes. It is **not** a `publish_segs`: a publish
 starts the next state with a fresh forms table and a null scan snapshot, bumps the epoch and wakes the keeper
 (`src/db.rs:26949-26975`, `25981-25986`, `27001-27003`), all of which an attach would reset for nothing.
@@ -1336,7 +1336,7 @@ object to null once, each through the epoch.
 
 The cold-file arithmetic (D7) is the reason: a divided read cell of 333k reads against a cold 175k-page file takes 0.45
 faults a read, as bad as the raw form. After the cells are installed, when `Options::zpages_warm` (default on; the arm
-`supdb-nocachezpagesnowarm` is the same engine with it off) and `headroom = B - resident parts - other sidecars' resident >
+`supdb-nocachezpagesnowarm` is the same engine with it off) and `headroom = B - resident parts - other form files' resident >
 file bytes` (`B` is already net of `anon` and the margin: the first version subtracted `anon` twice, and so would have skipped
 warm at about 50 records a page or fewer with room to spare, rev 2.13), the job issues `MADV_WILLNEED` over the mapping in
 8 MiB chunks, skipping chunks `mincore` reports resident, stopping at the headroom. It reads at most the file once,
@@ -1352,13 +1352,13 @@ writer would block on the oldest seal's readable landing, and a `flush` would wa
 segment work's thread, at idle priority"; priority does not help a thread that is not turning its loop, and `ioprio_set`
 applies to the calling thread (`src/db.rs:152-165`), so lowered there and not restored it would have demoted the manifest's
 `fdatasync`s too. Warm is a job of the idle-class build thread (5.2): after its rename it maps the finished file itself and
-warms it in chunks, cancellable at every chunk, counted in `warm_us`; a restart with sidecars on disk runs a warm job per
+warms it in chunks, cancellable at every chunk, counted in `warm_us`; a restart with form files on disk runs a warm job per
 partition with nothing to build; and the segment-work thread then only attaches, installs and stores the gate. The warm
 holds no epoch pin across its work (a pin held across a long job keeps every state retired meanwhile alive: the comment at
 `src/db.rs:26052`, and `op()` at `26036`, `26097`, `26237`). It is a cost of the form the controller has already chosen, paid off
 every read and every commit.
 
-### 5.5 Attach at open, at promotion, and a dormant sidecar
+### 5.5 Attach at open, at promotion, and a dormant form file
 
 `Db::open` lists the directory already (`src/db.rs:18905-18912`, `read_dir` for the `ord-` sweep); the same
 listing yields the `zpg-` names. A name equal to a live segment's `(id, end_seq)` is **kept dormant**: no
@@ -1366,7 +1366,7 @@ mapping, no read. Every other `zpg-` name, `.tmp` and `zpg-dead-*` included, is 
 ignore them: `src/db.rs:18815`, `18910`; the binding is the second defence against an id handed out again,
 `src/db.rs:18997`). `ZPages::Off` removes the live ones too: the user-visible undo. At promotion, `apply_promotion`
 (`src/db.rs:27409-27455`) opens the new `Seg` over the same bytes and, **before** `publish_segs` (`:27449`),
-attaches the sidecar again by `(id, end_seq)` if the old `Seg`'s cell was set: the resident part and a
+attaches the form file again by `(id, end_seq)` if the old `Seg`'s cell was set: the resident part and a
 sixteen-page sample, about a millisecond, rather than carrying a shared `Arc` across two `Seg`s. The file
 carries no fence, level or name of the segment, so a closed fence invalidates nothing (the engine
 re-opens an ordered tail's last partition at every promotion, `src/db.rs:27296-27304`).
@@ -1374,14 +1374,14 @@ re-opens an ordered tail's last partition at every promotion, `src/db.rs:27296-2
 ### 5.6 Retirement on merge
 
 `Maint::retire_seg` (`src/db.rs:27130-27142`) unlinks the `.sup`, then the ordered index unless a live
-segment claims its name. It gains the sidecar by the same claim test: a promotion keeps `(id, end_seq)`, so
+segment claims its name. It gains the form file by the same claim test: a promotion keeps `(id, end_seq)`, so
 the retired and the live names address one file, and unlinking by name once took the ordered index of an
-open segment and failed seven tests (`src/db.rs:27125-27129`). **The sidecar is renamed, not unlinked** (rev 1.8): the cell's
+open segment and failed seven tests (`src/db.rs:27125-27129`). **The form file is renamed, not unlinked** (rev 1.8): the cell's
 retirement (4.8) renames the file to a unique `zpg-dead-N` (a directory operation that frees no inode), the dead name goes on
 the list the idle tick unlinks like the manifest spares (`src/db.rs:27543-27563`), not inline as the `.sup` is -- the second
 large file per partition would double the merge landing's device round trips -- and `zpg-dead-*` is swept at open (5.5). A
 rebuild of the same `(id, end_seq)` can then rename into the free final name without a queued by-name unlink able to delete it.
-A merge's *outputs* get no sidecar from the merge: they are new ids, and `z_step` builds them when the rung wants. The
+A merge's *outputs* get no form file from the merge: they are new ids, and `z_step` builds them when the rung wants. The
 exposure window, a partition served raw between its landing and its install, is the build's **wall**, 0.65-1.7 s a 64 MiB
 partition (rev 2.17: the first version wrote 0.3-0.6 s, which is the CPU, 8 s over 23 partitions; the 15-40 s of 7.1 over 23 is
 the wall, one build at a time on four shared vCPUs), counted as `rawserves`; building inside the merge's `Emitter` from the
@@ -1394,7 +1394,7 @@ writes reach every range too (a far range draws 0.3% of the writes). A seal fire
 l0_trigger))` capped at a tenth of the store (`threshold_for`, `src/db.rs:13086-13096`): 32 MiB at small stores and about
 101 MB at 10M keys, i.e. about 700k writes of mix A [D: ~140 B a write in the memtable; U]. Four seals are then 2.9M writes, 26 s
 of mix A at its 112k writes/s, and each cycle rewrites about 1.5 GB (reads 1.3 GB, writes 1.3 GB, displacing z pages) and retires
-all 22-23 sidecars. A serial builder at 0.65-1.7 s a partition needs 15-40 s to cover them again, the same order as the
+all 22-23 form files. A serial builder at 0.65-1.7 s a partition needs 15-40 s to cover them again, the same order as the
 cadence: at that write rate coverage hovers near half, and a covered partition is rebuilt almost as soon as it installs,
 the 0.35 s of CPU a partition spent for a few seconds of life. What that costs `Always` is `rawserves` (the share of reads served
 raw, a covariate of every A, F and lag cell) and 0.72 GB of device writes a cycle beside the merge's 1.3 GB; what it costs
@@ -1403,7 +1403,7 @@ raw, a covariate of every A, F and lag cell) and 0.72 GB of device writes a cycl
 
 ### 5.7 Crash windows
 
-Derived, unsynced and unnamed by the manifest (`src/db.rs:8249-8270`; sidecars are not in `live_names`,
+Derived, unsynced and unnamed by the manifest (`src/db.rs:8249-8270`; form files are not in `live_names`,
 `:27516`, nor in `store_bytes_of`, `:21370-21376`, so the seal cadence does not move).
 
 | window | what a crash leaves | what the open does |
@@ -1414,10 +1414,10 @@ Derived, unsynced and unnamed by the manifest (`src/db.rs:8249-8270`; sidecars a
 | valid trailer, one torn page in the middle | everything checks at attach | the page's CRC at its first decode: fallback for that read, `damaged`, the segment work retires and rebuilds, at most three times a `Seg` (2.7) |
 | a finished build whose target a merge retired first | a final-named file no live segment claims | renamed to a dead name by the collect step (5.2), swept at the next open if the crash came first |
 | a dead name queued, crash before the idle unlink | `zpg-dead-N` | swept at open |
-| segment retired by a merge, crash between the manifest (`src/db.rs:27714`) and the unlink (`:27715`) | an unnamed `.sup` and its sidecar | both swept (`src/db.rs:18813-18817`; the `zpg-` prefix rule) |
-| merge outputs written, manifest not | unnamed outputs | swept; no sidecar can exist: builds target *landed live* partitions |
+| segment retired by a merge, crash between the manifest (`src/db.rs:27714`) and the unlink (`:27715`) | an unnamed `.sup` and its form file | both swept (`src/db.rs:18813-18817`; the `zpg-` prefix rule) |
+| merge outputs written, manifest not | unnamed outputs | swept; no form file can exist: builds target *landed live* partitions |
 | promotion: link (`:27429`), manifest (`:27450`), unlink (`:27451`) | two names, one inode | the claim by `(id, end_seq)` keeps the file while either name is live |
-| id reused after a crash | a swept orphan's sidecar under a re-handed id | the sweep removes it at open before ids are handed out; if the unlink failed, the binding refuses it |
+| id reused after a crash | a swept orphan's form file under a re-handed id | the sweep removes it at open before ids are handed out; if the unlink failed, the binding refuses it |
 | disk full, write error | a temp file | removed, `build_failed` counted, serving stays raw, retried with a backoff of 60 s doubling to an hour; not an error for the store (contrast the ordered index, whose write failure fails the seal) |
 | power loss, data not written back, file the right length | zero or stale pages | per-page CRC and tag |
 
@@ -1432,7 +1432,7 @@ Failure injection is a hook, not a bet: `fail_next_zpage_build`, beside `fail_ne
   +0.634 for the pages written (`/proc/self/io` `write_bytes`, counted at dirtying time per folio:
   `CLAUDE.md` profiling; the page cache's folio composition for a file written in 1 MiB pieces is [U]):
   1.339 -> 1.97. `dir_size` counts allocated blocks of every file at any depth, each inode once
-  (`bench/src/engines.rs:270-295`), so the suite sees the sidecar with no edit. In `Auto` the load writes
+  (`bench/src/engines.rs:270-295`), so the suite sees the form file with no edit. In `Auto` the load writes
   none of it; the build's writes are in the pass that carried the regime change.
 * **The build's I/O** (rev 2.6, rev 1.13). It reads the record region (1.24 GB) and the directory (40 MB) once,
   sequentially, through a mapping of its own on the descriptor it was handed, and drops each 8 MiB window behind itself:
@@ -1451,15 +1451,15 @@ Failure injection is a hook, not a bet: `fail_next_zpage_build`, beside `fail_ne
   build, which the verdict reads (7.6, item 6) and the ski-rental price carries (`displacement_est`, 4.4). The merge's and the
   open's reads of raw input are not dropped either (the engine has no drop-behind anywhere); a COMPACT-only drop-behind in
   `compact_run`, so that merges stop evicting z pages, is a separate gated change, priced as an arm if the verdict shows merges
-  displacing the sidecar (R19).
-* **The forms cache.** The anonymous consumers sit in the same cgroup as the sidecar: `FormsState`
+  displacing the form file (R19).
+* **The forms cache.** The anonymous consumers sit in the same cgroup as the form file: `FormsState`
   (block tables, scan keys; per handle), the published copies in `State.forms`, the scan snapshot, and
   under writes the memtable chain (the live table plus `FROZEN_CAP` = 3 frozen, `src/db.rs:10015`). This
   move's scope is the nocache policy, whose rows are the bounded rows (the default and `supdb-cache256`
   are killed at 3M under the bound by the forms alone, `docs/engine.md:5920-5928`, and
   `scratchpad/ooc/forms-lead.md` is that lead), and for it there is no interaction: no forms are built.
   For the default policy: form builds read the partition through the wrappers of 3.9 and so are served
-  from the sidecar; the budget is not coupled in this move. The arithmetic for the follow-up is on the
+  from the form file; the budget is not coupled in this move. The arithmetic for the follow-up is on the
   page: a dense `Cached::Block` costs `keys + vals + 16 * entries` = 132-136 B a key
   (`src/db.rs:9737-9744`) against 71 B a key in a z page, so in the compact form a dense copy costs twice
   the page it was built from and re-deriving a block from its page (2-3 us) is cheaper than holding it; a
@@ -1478,7 +1478,7 @@ Failure injection is a hook, not a bet: `fail_next_zpage_build`, beside `fail_ne
 | in-memory read cost | +3 instructions | none needed | -- | callgrind; quick row |
 | wrong-form CPU (4 us where 0.73 would do) | up to 5x a read | E1, E2, E3 and the trial; the memo | a trial: at most 5 s of one thread's stall, once per backoff, judged on the refilled state (4.7) | `a_square_wave_switches_at_most_once_per_dwell` (6.3) |
 | absent-key reads | 0 (filter) | -- | -- | `the_z_reader_agrees_with_the_blob_on_every_key`, absent keys (6.3) |
-| resident memory | 17 MB at 10M | cell retire | -- | `zpage_sidecars_at_end` gauge |
+| resident memory | 17 MB at 10M | cell retire | -- | `zpage_form files_at_end` gauge |
 | rebuild on every merge | 0.35-0.5 CPU-s per 64 MiB partition rewritten, up to the whole store a cycle (5.6) | gate off stops builds; the budget of 5.2 suspends them; retired inputs take theirs | the exposure window of 5.6, 0.65-1.7 s a partition | `rawserves`, `build_suspended`, the lag cells in the verdict |
 | the format, the magic, the browser reader, the raw segment | none | -- | -- | `tests/blob.rs`, `dict.rs`, `ranges.rs`, `segwriter.rs` unedited and green; `web/build.sh` bytes equal |
 
@@ -1497,14 +1497,14 @@ in section 7 rather than claimed free.
 | `src/db.rs:1801-1926` `Default` | the seven defaults |
 | `src/db.rs:8173` `check_options` | refuse `Always` with `writer_pins` off (the clearable cell is freed through the epoch, and an unpinned writer reads it unpinned, `src/db.rs:8178-8183` is the precedent). **`Auto` is never refused**: with `publish_in_background` off, with `writer_pins` off, or off Linux it behaves as `Off` and is counted (`auto_inert`) (rev 1.3, rev 2.18; 4.1). Tests: a refusal test for `Always` shaped like `tests/db.rs:587-620`, and `options_default_plus_each_inline_and_unpinned_set_opens`, which opens `Options::default()` over each of `{publish_in_background: false}`, `{writer_pins: false, publish_in_background: false}` and `{snapshot_keeper: true}`, so that the flip of stage 6 cannot turn the cases at `tests/db.rs:607`, `616`, `8355`, `9327`, `11712` or the suite's `supdb-inlinemaint` and `supdb-nopin` arms red by construction |
 | `src/db.rs:2522` `Seg`; literals at `:5472`, `:5505`, `:5530` | `blob: SegBlob`; `z: ZCell`; `z_declined: AtomicU8` (the reason a partition is declined for the life of the `Seg`, 0 for none: 2.6.1, 2.7; rev 1.15) and `z_rebuilds: AtomicU8` (damage rebuilds so far, at most three); `foot: (u64, u64)` (H and R of 4.2) |
-| `src/db.rs:10281` `Shared` | `zgate`, a one-word `#[repr(align(128))]` wrapper of an `AtomicU8` as `Slot` is aligned (`src/db.rs:6664`), `retired_z: RetireList<Arc<ZSide>>`, `zevents: ZEvents` (the segment work's and the build thread's events only: builds, attaches, retires, switches, declines; the per-read counters are on `ZStat`, 6.4) |
+| `src/db.rs:10281` `Shared` | `zgate`, a one-word `#[repr(align(128))]` wrapper of an `AtomicU8` as `Slot` is aligned (`src/db.rs:6664`), `retired_z: RetireList<Arc<ZFile>>`, `zevents: ZEvents` (the segment work's and the build thread's events only: builds, attaches, retires, switches, declines; the per-read counters are on `ZStat`, 6.4) |
 | `src/db.rs:6616` `Readers` | `zstats: Box<[ZStat]>`, one `#[repr(align(128))]` line a reader slot with the slot's index, written by the slot's handle alone with relaxed stores and summed by the accessors as `Readers::stat` sums the slots; it holds the per-read and per-scan counters of 6.4 and the census's `zdistinct` (rev 1.4, rev 2.11, rev 3.10) |
 | `src/db.rs:6665` `Slot` | `zdown`, `zreads`, `zscans`, `zflt`, `zsflt`, `zwall`, `zcpu` (single-writer atomics, 56 bytes: the Slot's nine words are 72 and the line is 128, so seven fit exactly; the assertion at `src/db.rs:6704` becomes `size_of::<Slot>() == 128`) |
-| `src/db.rs:13322`, `13372`, `18192` | `advise` also flips the sidecars' advice; `read_all` and `count` take the gate and call `read_all_z` / `count_z` for the partition |
+| `src/db.rs:13322`, `13372`, `18192` | `advise` also flips the form files' advice; `read_all` and `count` take the gate and call `read_all_z` / `count_z` for the partition |
 | the sites of 3.9 and 3.10 | the `scan_at`, `values_at`, `exts_at`, seek, cut and cursor sites; `SegBlob` has no forwarder for any name that reads a record, so each site is written down (3.9) |
 | `src/db.rs:25892` `Maint` | `zbuild: Option<ZBuild>`, `zrung: ZRung` (the selector's state, `src/db/zselect.rs`); `z_step()` at `:26012-26014`; cancel and join in `stop` (`:26285`) |
 | `src/db.rs:27130`, `27409`, `18744`, `18905-18912` | `retire_seg`, `apply_promotion`, `Db::open`'s directory listing and sweep, as 5.5-5.6 |
-| `src/db.rs:28116` `mod threading` | `shared::<ZSide>()` |
+| `src/db.rs:28116` `mod threading` | `shared::<ZFile>()` |
 | `src/db.rs`, new hooks (`pub`, `#[doc(hidden)]`, beside `ord_rebuilt` `:23915`, `ords_advised` `:13364`, `hold_seal_landing` `:21933`, `fail_next_presync` `:21912`) | `zpage_counts()`, `zpages_advised() -> (usize, usize)`, `zpages_settle()` (waits for builds and warm, never for the controller), `hold_zpage_build(bool)` and `release_zpage_build_after(n)`, `fail_next_zpage_build()`, `zpage_fence_keys(partition)` |
 | `src/db/zpages.rs` (new, about 1,300 lines without its tests), `src/db/zselect.rs` (new, about 600) | children of `db`, declared `mod zpages; mod zselect;` below the `use` lines at `src/db.rs:30-40`. The selector's core is a pure function, `ZSelect::step(state, inputs) -> (state, action)`, so the replay of stage 1d is a unit test of the shipping code and the transitions have one definition |
 | `src/flatindex.rs:492` | `record_key_next`; and `pub(crate) const REC_VERSION: u32 = VERSION` |
@@ -1569,11 +1569,11 @@ waited behind the most expensive stage for them): `bench ab` takes `--ops-div` (
 reads the flag, `bench/src/main.rs:249-256`, whose `Plan::new` gives a divisor of 1, `bench/src/run.rs:264-267`, so `ab
 --bound` runs the whole counts, 2.7 h against about 15 min for the same 10M pairing [D from the pass times of M-table row
 `rung1.log`]); `load_bpb` and `disk_bpb` stop being NaN unless `passes.load` (`bench/src/run.rs:1674-1683`; a pairing of the
-sidecar's disk and device bytes needs them without building the shuffled store); and a `--compress` flag on `ab` **only**,
+form file's disk and device bytes needs them without building the shuffled store); and a `--compress` flag on `ab` **only**,
 never on `run` (it would redefine every banked quantity: "a bisect across a change in the measurement", `bench/CLAUDE.md`), so
-the incompressible control is a pairing and not a row. `one_pass` refuses to measure a forced arm whose sidecars are not whole,
+the incompressible control is a pairing and not a row. `one_pass` refuses to measure a forced arm whose form files are not whole,
 in the shape of its byte checks (`bench/src/run.rs:1430-1436`, `1517-1522`, `1607-1612`): after the load
-`zpage_sidecars_at_end == partitions`, after the read phase `zpage_reads > 0` for `Always` and `== 0` for `Off`.
+`zpage_form files_at_end == partitions`, after the read phase `zpage_reads > 0` for `Always` and `== 0` for `Off`.
 
 ### 6.3 The tests
 
@@ -1592,41 +1592,41 @@ shape):
 |---|---|
 | `the_z_reader_agrees_with_the_blob_on_every_key` | through a `Db` forced to partitions, every key's `read_all`, `count`, `stored_bytes` equal to `Blob<MmapBytes>`, to a `Blob` over a copying source and to `SparseBlob`, on the three fixtures; absent keys below the first, above the last, between two records of a page, one byte either side of every fence key, a proper prefix of a fence key, a key longer than a fence key it extends |
 | `the_z_reader_agrees_with_the_blob_on_every_scan_window` | start in {each fence key, its predecessor and successor, key + `+`, empty, `a`, `zzz`, `0xff` x 8} x limit in {1, 2, 3, 5, 17, 56, 57, 58, 114, `usize::MAX`}: the stream, the returned count and `scan_counts`, through the writer, a `Latest` handle and a `Snapshot` handle, against the model and against the raw `Blob` |
-| `windows_that_cross_partitions_and_covered_with_uncovered_agree` | at least three partitions; a store where partition `i` has a sidecar and `i+1` does not (`hold_zpage_build` after `k`) |
+| `windows_that_cross_partitions_and_covered_with_uncovered_agree` | at least three partitions; a store where partition `i` has a form file and `i+1` does not (`hold_zpage_build` after `k`) |
 | `a_stored_page_parses_in_place_and_a_misaligned_buffer_is_refused_not_missed` | incompressible fixture; full-form records (`compact_records` off) and block-backed runs; `STORED` pages at a pointer that is 8-aligned; a deliberately misaligned buffer makes the reader refuse and count, never answer absent (risk R6) |
 | `records_larger_than_a_page_are_read_from_the_raw_segment` | keys of 200, 1,000, 5,000 bytes, a 9,000-byte value; `ZNOPAGE` entries; scans across them; `nopage_reads` and `nopage_scans` |
 | `commit_markers_in_a_direct_segment_are_not_records` | a partition promoted from a direct run (markers inside the record region) and the same keys rewritten by a merge: equal decoded groups; `record_key_next` against `parse_record` on both |
 | `a_run_of_every_shape_reads_the_same` | runs of 1, 2, 17, 200, 1,500 values; FIXED and prefixed together; zero-length values; an empty run; a run over `inline_bytes` straddling the block; tombstone-only keys; a key whose tombstone masks a 1,500-value run (`tests/blob.rs:70-78`, `tests/segwriter.rs:496-519`) |
 | `the_gate_declines_what_it_should_and_stores_what_does_not_compress` | random values at the cell's shape: built as `STORED` pages (32 records a page), read in place, faults and rate as 7.3 registers; a budget large enough to hold the raw form (the injected `B`): declined, counter, no file, bytes on disk equal to `Off`'s; the suite shape builds; fill and calls a page are asserted to be in the range the doc predicts (rev 2.10) |
 | `fill_group_is_total` | records of 200, 1,000, 4,056-4,072 (incompressible), 4,500 and 5,000 bytes, alone and among compressible neighbours: `m = 0` is never formed, the loop ends in at most twelve turns, `NOPAGE` only where the record cannot fit, a lone incompressible record that fits `ZCAP` is `STORED`; the pair `m = 2, len(c) = 9,000` is a fixture (rev 1.6) |
-| `a_bloom_layout_change_cannot_attach_an_old_sidecar` | `BLOOM_SIG` is pinned by a literal CRC32C over the words of a filter built from 4,096 fixed keys (the failure message says to bump `BLOOM_SIG` and the sidecar `version`); a sidecar whose `bloom_sig`, `bloom_probes` or `bloom_bits_per_key` is altered, or whose filter words are permuted under a good CRC, is refused at attach (`rejected_identity`) and never answers "absent" (rev 1.2) |
+| `a_bloom_layout_change_cannot_attach_an_old_form_file` | `BLOOM_SIG` is pinned by a literal CRC32C over the words of a filter built from 4,096 fixed keys (the failure message says to bump `BLOOM_SIG` and the form file `version`); a form file whose `bloom_sig`, `bloom_probes` or `bloom_bits_per_key` is altered, or whose filter words are permuted under a good CRC, is refused at attach (`rejected_identity`) and never answers "absent" (rev 1.2) |
 | `a_finished_build_whose_target_died_leaves_no_file` | a build held with `hold_zpage_build` is released after its target merged away: the finished file is renamed to a dead name and gone after the idle sweep, `build_orphaned == 1`; a promotion between spawn and open does not fail the build (the `File` was handed over); a rebuild renamed into the final name is not deleted by a queued dead-name unlink (rev 1.8) |
-| `rebuild_after_damage_is_bounded` | an injected builder that always writes one bad page: `verify_page` fails the build at step 6; a sidecar damaged after attach is rebuilt three times with the doubling backoff, then `declined_damage` and `Seg::z_declined`, with no loop (rev 1.7) |
-| `a_flipped_byte_anywhere_in_a_sidecar_is_never_an_answer` | every seventh byte (the template `tests/segwriter.rs:618-686`), each flip followed by a read of every key: never a wrong value; every flip in a covered byte counted as a rejection or a fallback; truncation at every 997th length never panics (`src/flatindex.rs:2716-2750`); a zeroed page; a file of zeros of the right length; with block checksums on, and in `tests/zpages_checksums_off.rs` with them off (the page CRC must not depend on `block::CHECKSUMS`, which is process-wide and which every bench arm sets off) |
-| `a_sidecar_of_another_segment_is_refused` | the hard case: build `S1`, set its sidecar aside, apply updates to the same keys (different values) and merge, so the new partition has the same key count; plant `S1`'s sidecar under the new partition's name and under a re-handed id with the same end-sequence: reads return `S2`'s values, `rejected_identity == 1`, `rebuilt == 1` (`OrdIndex::open` would accept it: it checks key count alone, `src/ordindex.rs:417-419`) |
-| `a_retired_sidecar_outlives_its_last_reader_and_no_longer` | a pinned handle reads the old sidecar's values after a merge lands, a new handle reads the new, and the mapping disappears from `/proc/self/maps` at the pinned handle's release, not at the next retirement (`retired_z` is swept at `leave`: 4.8); a `Snapshot` handle held across the landing defers it, which the test asserts (rev 1.9) |
-| `a_take_back_returns_the_disk_and_the_file_set` | after a take-back and `retain`, the directory's file set (no `zpg-dead-*` left) and `bytes_on_disk_per_byte` equal a store that never built (to 0.001), with no `Snapshot` handle held; `Off` at open removes the live sidecars |
+| `rebuild_after_damage_is_bounded` | an injected builder that always writes one bad page: `verify_page` fails the build at step 6; a form file damaged after attach is rebuilt three times with the doubling backoff, then `declined_damage` and `Seg::z_declined`, with no loop (rev 1.7) |
+| `a_flipped_byte_anywhere_in_a_form file_is_never_an_answer` | every seventh byte (the template `tests/segwriter.rs:618-686`), each flip followed by a read of every key: never a wrong value; every flip in a covered byte counted as a rejection or a fallback; truncation at every 997th length never panics (`src/flatindex.rs:2716-2750`); a zeroed page; a file of zeros of the right length; with block checksums on, and in `tests/zpages_checksums_off.rs` with them off (the page CRC must not depend on `block::CHECKSUMS`, which is process-wide and which every bench arm sets off) |
+| `a_form file_of_another_segment_is_refused` | the hard case: build `S1`, set its form file aside, apply updates to the same keys (different values) and merge, so the new partition has the same key count; plant `S1`'s form file under the new partition's name and under a re-handed id with the same end-sequence: reads return `S2`'s values, `rejected_identity == 1`, `rebuilt == 1` (`OrdIndex::open` would accept it: it checks key count alone, `src/ordindex.rs:417-419`) |
+| `a_retired_form file_outlives_its_last_reader_and_no_longer` | a pinned handle reads the old form file's values after a merge lands, a new handle reads the new, and the mapping disappears from `/proc/self/maps` at the pinned handle's release, not at the next retirement (`retired_z` is swept at `leave`: 4.8); a `Snapshot` handle held across the landing defers it, which the test asserts (rev 1.9) |
+| `a_take_back_returns_the_disk_and_the_file_set` | after a take-back and `retain`, the directory's file set (no `zpg-dead-*` left) and `bytes_on_disk_per_byte` equal a store that never built (to 0.001), with no `Snapshot` handle held; `Off` at open removes the live form files |
 
 `tests/db.rs`:
 
 | name (new) | template | asserts |
 |---|---|---|
-| `the_oracle_holds_with_zpages_forced_on` and `..._with_a_sidecar_damaged_before_each_reopen` | `oracle_in` `:389-477` | the model oracle (97 short keys, deletes, crashes at 13%) with `Options { zpages: Always, seal_bytes: 2 << 10, .. }` |
+| `the_oracle_holds_with_zpages_forced_on` and `..._with_a_form file_damaged_before_each_reopen` | `oracle_in` `:389-477` | the model oracle (97 short keys, deletes, crashes at 13%) with `Options { zpages: Always, seal_bytes: 2 << 10, .. }` |
 | twins of the plain, cache, upkeep-on-a-thread, pieces-only and budget scan-model tests, and of `fold_model_with` `:2733`, `extend_order_model_with` `:6546`, `carry_model_with` `:6745` | `overlay_model_with` `:4373-4511` gets a trailing `zpages: bool`; callers `:2593-2647` | each `m.check` on the writer and on a handle; the nocache twin sets `scan_block_cache: false` so the merge and bulk-walk paths carry the form |
 | `scan_path_arms()` gains `("zpages", ..)` and `("nocachezpages", ..)`; its type goes from 7 to 9 | `:9605-9652`, consumers `:9523`, `:10135` | a live write over the frozen table is one key on every scan path |
-| `readers_on_threads_keep_answering_through_seals_and_merges_with_zpages` | `:4681-4780` | 300 rounds over 3,000 keys with partitions of 64 KB: a stale sidecar after a merge is "a version that went backwards" (`:4734`) |
+| `readers_on_threads_keep_answering_through_seals_and_merges_with_zpages` | `:4681-4780` | 300 rounds over 3,000 keys with partitions of 64 KB: a stale form file after a merge is "a version that went backwards" (`:4734`) |
 | `reader_threads_over_blocks_on` wrapper with a trailing `Options` argument (nine wrappers `:5511-5642` already) | `:5654-5857` | |
-| `a_reader_handle_keeps_the_retired_sidecar_until_released` | `:4564` | |
-| lifecycle twins | `:784-880` damaged / missing and counted; `:1145-1179` survives promotion and reopen; `:2251-2287` a merge takes the sidecar with the segment (count `zpg` against `.sup`, no orphan, without reopening); `:2290-2348` advice reaches the mapping (`zpages_advised`); `:8751-8816` an unnamed segment is swept with its sidecar; `:1279` a crash before the manifest keeps the pre-merge store; `:12538-12609` `.sup` and `.oidx` byte-identical with the option on and off; `:12620-12700` a load nobody reads builds nothing; `:12311-12339` a failed sidecar build **does not** fail the flush (the opposite of a failed presync, whose error propagates) and is counted | |
+| `a_reader_handle_keeps_the_retired_form file_until_released` | `:4564` | |
+| lifecycle twins | `:784-880` damaged / missing and counted; `:1145-1179` survives promotion and reopen; `:2251-2287` a merge takes the form file with the segment (count `zpg` against `.sup`, no orphan, without reopening); `:2290-2348` advice reaches the mapping (`zpages_advised`); `:8751-8816` an unnamed segment is swept with its form file; `:1279` a crash before the manifest keeps the pre-merge store; `:12538-12609` `.sup` and `.oidx` byte-identical with the option on and off; `:12620-12700` a load nobody reads builds nothing; `:12311-12339` a failed form file build **does not** fail the flush (the opposite of a failed presync, whose error propagates) and is counted | |
 | `an_auto_store_that_fits_builds_nothing` | | in memory: no build, no read through the form, no `zpg` file, directory identical to `Off`'s, `zgate == 0`, no thread beyond the segment work (`/proc/self/task`) |
-| the selector set | `ZInject`, replay | `auto_builds_when_the_measure_says_blocked_and_the_limit_is_below_the_footprint`; `auto_serves_raw_until_the_sidecar_is_whole`; `auto_returns_to_raw_when_the_limit_is_lifted_and_gives_the_disk_back`; `a_skewed_workload_that_fits_never_builds`; `a_square_wave_switches_at_most_once_per_dwell`; `the_trial_judges_the_refilled_state` (a 100 MB hot set after COMPACT returns to raw, a 600 MB one stays); `two_stores_in_one_process_do_not_share_a_measure`; `a_cold_start_is_not_a_capacity_miss` (first-touch faults with no refaults never build; refault share at or over 0.5 does); `a_mix_with_commits_reaches_evidence` and `a_scan_only_handle_reaches_evidence` (windows with commits count for `phi_meas` and not for `t_f`; scan windows count; `mixed_windows` is counted); `the_ski_rental_price_is_paid_before_a_build` (excess against `C_build`); `a_cancelled_build_counts_as_a_switch`; `a_form_that_stops_paying_is_left` (E3); `a_store_far_past_the_cache_still_builds` (a model-only synthetic 50x store: the two-population raw model keeps the predicted saving over `theta_enter`, D9); `a_neighbours_pressure_opens_the_build_clause` (rev 2.16); `builds_suspend_after_four_of_eight_are_superseded` (rev 2.17). Each is a trace fed to `ZSelect::step` first (stage 1d) and to the engine second (stage 4) |
+| the selector set | `ZInject`, replay | `auto_builds_when_the_measure_says_blocked_and_the_limit_is_below_the_footprint`; `auto_serves_raw_until_the_form file_is_whole`; `auto_returns_to_raw_when_the_limit_is_lifted_and_gives_the_disk_back`; `a_skewed_workload_that_fits_never_builds`; `a_square_wave_switches_at_most_once_per_dwell`; `the_trial_judges_the_refilled_state` (a 100 MB hot set after COMPACT returns to raw, a 600 MB one stays); `two_stores_in_one_process_do_not_share_a_measure`; `a_cold_start_is_not_a_capacity_miss` (first-touch faults with no refaults never build; refault share at or over 0.5 does); `a_mix_with_commits_reaches_evidence` and `a_scan_only_handle_reaches_evidence` (windows with commits count for `phi_meas` and not for `t_f`; scan windows count; `mixed_windows` is counted); `the_ski_rental_price_is_paid_before_a_build` (excess against `C_build`); `a_cancelled_build_counts_as_a_switch`; `a_form_that_stops_paying_is_left` (E3); `a_store_far_past_the_cache_still_builds` (a model-only synthetic 50x store: the two-population raw model keeps the predicted saving over `theta_enter`, D9); `a_neighbours_pressure_opens_the_build_clause` (rev 2.16); `builds_suspend_after_four_of_eight_are_superseded` (rev 2.17). Each is a trace fed to `ZSelect::step` first (stage 1d) and to the engine second (stage 4) |
 | `auto_degrades_where_it_cannot_run_and_always_is_refused_beside_an_unpinned_writer` | `:587-620` | `Options::default()` with `Auto` over each of `publish_in_background: false` and `writer_pins: false` with `publish_in_background: false` opens, `zgate == 0`, `auto_inert` set; `Always` beside `writer_pins: false` is refused (rev 1.3) |
 | `options_default_plus_each_inline_and_unpinned_set_opens` | `:607`, `616`, `8355`, `9327`, `11712` | the option sets those tests use, opened over `Options::default()` once the default is `Auto`; the test that makes the flip safe by construction (6.1) |
 | `the_compact_form_touches_no_raw_page` | debug-assertions build | `raw_touches == 0` per operation kind **and per shape of 3.9's table** on a covered partition -- a scan over a range with a level-0 piece (`scan_merged`), a scan with an unsealed key inside the walk window (`cut_at`), variable-length keys and random sixteen-byte keys whose heads do not name a key (`exact_at`), a key straddling a `ZNOPAGE` entry, a merge landing's `same_blocks` -- on the writer and on a `Latest` handle, against a raw model; then the residency check below. The first version's test would have passed on the suite's drained cells and failed on a mixed store (rev 1.1, rev 2.5) |
 | `a_stray_raw_read_in_two_hundred_does_not_collapse_the_compact_form` | `src/ordindex.rs:100-107` | one raw-path operation (a `Dirty` read through a level-0 piece's key, or a count on an uncovered partition) per 200 form reads under a bound: faults per read do not rise by more than the stray reads' own pages. This is the footprint-sum rule asserted, not assumed |
 
 `tests/leak.rs:206-228` gains `a_zpages_life` in the loop of lives (a store with the form, readers with their
-scratch and memo, a merge replacing a sidecar, closed with a retired sidecar unswept), and a check of
+scratch and memo, a merge replacing a form file, closed with a retired form file unswept), and a check of
 `/proc/self/maps` that no mapping of the store's directory survives the drop, because the counting allocator
 does not see a mapping. `src/db/zpages.rs` carries unit tests: `record_key_next` against `parse_record` on
 every fixture record and 100,000 random ones; `fill_group` fits `ZCAP` for every group of every fixture;
@@ -1638,7 +1638,7 @@ Residency, the instrument the fault counts cannot be: `bench/examples/zresident.
 `Db::create` and `flush` (a landed segment skips the index verify, `src/db.rs:5389-5398`; a reopen verifies
 the whole key section, `:18917-18924`, and would make it resident), drops both files with
 `posix_fadvise(DONTNEED)`, runs N compact-form reads, then `mincore`s a fresh mapping of each: the raw
-segment's resident pages stay at the open's few and the sidecar's grow. The count of faults tells that
+segment's resident pages stay at the open's few and the form file's grow. The count of faults tells that
 something was read; this tells which file. It also samples the raw segment's resident pages and a reader's faults per read
 through a build and its drop-behind (5.8; rev 2.6), and the hash file's residency after a pass (rev 3.2). It is
 `#[cfg(target_os = "linux")]` with the other residency readers (2.9).
@@ -1665,7 +1665,7 @@ would have sat inside the arm being measured and hidden itself behind the counte
 `retired`, `unlinked`, `switches`, `trials`, `trials_back`, `mixed_windows`, `auto_inert` -- are `AtomicU64` on `Shared`,
 written by the segment work and the build thread only, **where the action happens** (the lesson of `ord_rebuilt`, summed only
 in `Db::open`, `src/db.rs:18927`, `19053`, so a rebuild inside a running store is invisible to it). Gauges are named
-`*_at_end` because the runner sums a counter over a pass's two stores (`bench/src/run.rs:1657-1662`): `sidecars_at_end`,
+`*_at_end` because the runner sums a counter over a pass's two stores (`bench/src/run.rs:1657-1662`): `form_files_at_end`,
 `pages_at_end`, `resident_bytes_at_end`, `rung_at_end`. Read from `Shared` and the slots alone: a counter accessor that calls
 `take_back_upkeep` changes the next phase (`src/db.rs:21153`, `21161`; `bench/src/run.rs:1743-1745`). `raw_touches` is
 compiled under `debug_assertions` only (3.9): an instrument in the measured path is priced by taking it away, and this one is
@@ -1701,7 +1701,7 @@ that (rev 3.14). Ranges are the claim; a value outside one is a refutation, not 
 |---|---|---|
 | records per 4,072-byte payload, 124-byte images of the suite's shape | 57 (52-62) | M14: 60.0 on 116-byte records and a 4,088-byte payload; plus eight framing bytes a record that repeat verbatim (a byte or two compressed each) |
 | page bytes per key | 71.9 (66-79) | `4096/57` |
-| the sidecar at 10M keys | 0.72 GB of pages (0.66-0.79) plus 17.4 MB resident part and trailer | 175k pages |
+| the form file at 10M keys | 0.72 GB of pages (0.66-0.79) plus 17.4 MB resident part and trailer | 175k pages |
 | fill (payload bytes / 4,072) | 0.97 or better | one growth round |
 | compress calls a page | 1.6-2.6 | start at the last page's count; trim or grow once |
 | decode of one page, cache-hot | 2.5-3.5 us with the engine's unsafe codec. The standalone probe ran that same codec (7.2a, point 3), so its 3.6-3.8 us is no upper bound on decode; the planned `bench/examples` binary would link the *safe* codec through the dev-dependency (`lz4_flex = "0.11"` with default features, `bench/Cargo.toml:41-42`, unified by cargo for targets that build dev-dependencies), so stage 0b pins the features, prints which codec ran, and builds the cross-check both ways [rev 2.14, rev 3.14] | M13, M14 |
@@ -1820,8 +1820,8 @@ that way.
 | `device_bytes_per_byte` | 1.339 | 2.54-2.61 | 1.986 | 1.97 (1.90-2.05) |
 | the 3M control (in core), point reads/s | 1.37M | 0.79M | 239-252k | `Always`: 0.15-0.24x of raw, 200-330k; `Auto` (stage 4): raw's, within the arm-against-itself spread |
 | `load-shuffled`, ops/s | 318k | 24k | 290k | `Always`: 0.4-0.8x of `supdb-nocache` [P2]: about 50-70 builds [U: 23 partitions rewritten two to three times] at 0.35 s of idle-class CPU each beside seals and merges on four vCPUs, and `sync` waits for the last ones |
-| `lag-burst`, updates/s at 1 / 10 / 100% | 1.10M / 0.82M / 0.78M | 16k | [U: not read here] | `Always`: 0.85-1.05x at each [P2]: the builder is idle-class and a burst writes no sidecar bytes; the 100% point's merge cycles compete for the same vCPUs |
-| `scan-lag`, entries/s at 0 / 1 / 10 / 100% | 1.0M / 9.9M / 1.5M / 0.05M | 0.85M / 2.6M / 0.83M / 0.80M | 1.646M at 10%, 0.399M at 100% | `Always`: 3.5-8M / 3-6M / 1.5-4M / 0.04-0.06M [P2]. The 1% point is a loss by design: its raw pass takes 0.07 faults a scan (666 faults over the pass), so the raw scan is CPU-light and the z scan, 11 us, is 0.3-0.6x of it -- the cell that says why the controller exists (`Auto` would not enter: 0.07 is under `saving*_scan` of 0.19). At 100% the burst rewrites every partition (about fourteen seals, three merge cycles), the sidecars are superseded, the pass reads raw and `rawserves` is near 1: level, 0.9-1.1x |
+| `lag-burst`, updates/s at 1 / 10 / 100% | 1.10M / 0.82M / 0.78M | 16k | [U: not read here] | `Always`: 0.85-1.05x at each [P2]: the builder is idle-class and a burst writes no form file bytes; the 100% point's merge cycles compete for the same vCPUs |
+| `scan-lag`, entries/s at 0 / 1 / 10 / 100% | 1.0M / 9.9M / 1.5M / 0.05M | 0.85M / 2.6M / 0.83M / 0.80M | 1.646M at 10%, 0.399M at 100% | `Always`: 3.5-8M / 3-6M / 1.5-4M / 0.04-0.06M [P2]. The 1% point is a loss by design: its raw pass takes 0.07 faults a scan (666 faults over the pass), so the raw scan is CPU-light and the z scan, 11 us, is 0.3-0.6x of it -- the cell that says why the controller exists (`Auto` would not enter: 0.07 is under `saving*_scan` of 0.19). At 100% the burst rewrites every partition (about fourteen seals, three merge cycles), the form files are superseded, the pass reads raw and `rawserves` is near 1: level, 0.9-1.1x |
 | incompressible control (`ab --compress 0.0`, 10M) | 54k reads/s, 0.43 faults (the records are the same size) | -- | -- | built as `STORED` pages, 32 a page: faults 0.24-0.32, 65-90k reads/s (1.2-1.6x of `supdb-nocache`), `bytes_on_disk_per_byte` +1.0-1.2, `declined_gate` 0 [P2: 2.6.1]. The same control at 3M in core: declined (no saving), bytes on disk equal to `Off`'s to three decimals, rates level 0.97-1.03 |
 
 Per-cell derivations: a point read is `t_z + phi * t_f` with `t_z = 4.0 us` (D5) and `t_f = 41.5 us`:
@@ -1856,7 +1856,7 @@ bytes on disk (1.304 against 1.0022) -- and, outside the table, the shuffled loa
 10% point to RocksDB: `scan-lag` entries/s with 10% and 100% of the keys rewritten read 1.454M and 52.5k against
 RocksDB's 1.646M and 399.4k (0.88x and 0.13x) and `lmdb-nordahead`'s 0.826M and 0.797M (1.76x, then 0.066x). This move is
 not claimed to touch those two points: a burst's merges rewrite the partitions and a rewritten partition is raw until its
-sidecar installs (the exposure window, 5.6), so the pass reads the form it reads today, and what costs the 100% point is not
+form file installs (the exposure window, 5.6), so the pass reads the form it reads today, and what costs the 100% point is not
 a footprint on its face [U: not examined here; `forms-lead.md` is the nearest lead]. So the goal "every row but disk" is not
 reached by this move (rev 3.9: the first version said it closed "the point-read, scan and mix cells against LMDB", which its
 own ranges do not support): the rows it closes are the point-read and scan cells against LMDB, mixes A, B, D and F, and the
@@ -1869,7 +1869,7 @@ D9's window no single-fault form reaches LMDB's reads (open question 1).
 At 3M under the bound: the rung stays FITS, zero samples, zero builds, zero files, `zgate` 0 for the pass.
 At 10M: SUSPECT within two S1 ticks of the first read (4.5: two consecutive 1 s ticks; the first version said "within one tick",
 which 4.5 contradicted: rev 2.15), the ski-rental price paid in about 9 s on one thread and 3 s on three, the build and the warm
-(15-45 s) at raw rates, then COMPACT; a restart with valid sidecars reaches COMPACT in about a second. A limit lifted to 4
+(15-45 s) at raw rates, then COMPACT; a restart with valid form files reaches COMPACT in about a second. A limit lifted to 4
 GiB: FITS within 5 S1 ticks, and after `retain` the directory equals a store that never built. A square wave of uniform and a
 1% hot set at 10, 60 and 300 s: at most one switch per `dwell`, and a build per partition per entry, never more. A skewed
 workload that fits: no build, ever. The default policy (forms on) under the bound is expected to be killed at 3M by its
@@ -1967,7 +1967,7 @@ a covered partition is read from one form or from a listed, counted exception, t
 identity of what it derives from, the segment's key-section row and name fields, and a derivation that stores a function of
 engine code, the filter, binds to a signature of that code: 2.5; the first version's "tombstone-free identity rule" was
 defined nowhere and is dropped, rev 3.14) and the failure shapes found on the way; the `README.md` says, factually and without
-a standing figure, that a store out of memory may carry a derived sidecar and what removing it does.
+a standing figure, that a store out of memory may carry a derived form file and what removing it does.
 
 **(b) The default moves to `Auto`** only when the forms-memory lead (`scratchpad/ooc/forms-lead.md`; `docs/engine.md:5895-5930`:
 the default policy was killed in its first rep at 3M under the bound, `anon-rss` at the limit; commit `5dbfa23`: its anonymous
@@ -1998,7 +1998,7 @@ it leaves is mergeable.
 | **1d** | the selector core `ZSelect::step` and its replay tests (7.4): the traces, no machine | 500 | none | the transitions (4.5) before any census or I/O exists | a trace that violates 4.5's table or the one-switch-per-dwell rule | tests green under `checked`; the constants are the replay's, read off the traces |
 | **2a** | the proof slice: the forced arm for point reads and counts only. The builder (no `NOPAGE`, no `STORED`: a partition with a block-backed, oversize or incompressible record is declined), attach with the trailer CRC, the tiling check and sampled pages, the cell, `read_all` and `count` behind one gate load, the counters of reads, rawserves, builds and declines, the build called from `Supdb::sync` under `Always`; the oracle test and one scan-model twin; no `SegBlob`, filter, memo, warm or controller | 900 | tests 15 min a run under `checked`, about four runs; `ab` at 3M 15 min; at 10M with `--ops-div 10`, 12 pairs a sitting 40 min, two sittings | C2 and C4 for point reads on the engine's own path, the in-situ `t_z` and the three-thread number; R3 and R4 for points | a refutation of 7.3's counts in two sittings; any `raw_touches` on a point read or count | the forced arm measured in two sittings, `check.sh` green on all three CI legs, `Off` the default, rows unchanged |
 | **2b** | lifecycle: retire through the epoch with the sweeps, promotion attach, sweep at open and the dead names, the orphan collect, the crash windows, the 20-field identity trailer, damage injection and the bounded rebuild, the Bloom filter and `bloom_sig`, `ZNOPAGE` and `STORED`, the `ZStat` counters, the warm job; arms s1-s15 as the stage needs them; the tests of 6.3 for lifecycle, damage and identity (about thirty, and twins of eight existing tests) | 1,500 | tests 15 min a run, about six runs | R6, R7, R15 | any lifecycle test red under load (run beside a build, four at a time) | the store survives every crash window of 5.7; `a_zpages_life` leaks nothing |
-| **3** | scans: `SegBlob` without forwarders, `ZCursor`, the seek by the fence, `cut_in`, `ZSide::scan_at`, `values_at` and `with_exts_at` at the sites of 3.9, the prefetch gate, the memo and its arm; the scan-model tests; the Zipfian mixes. (The seek by the fence is no longer a conditional 3b: rev 2.5) | 1,400 (engine 900; tests 500) | `ab` with the scan passes 90 min; mixes 60 min; the three-arm row (`supdb-nocache`, `supdb-nocachezpages`, `lmdb-nordahead`) at `--reps 3 --ops-div 10`, 3-3.5 h, twice | C2 for scans, C4 for scans and mixes B, C, D, E, the memo's worth, R4 and R5 | 7.3's scan cells; a mix C the memo does not move; any `raw_touches` on a shape of 3.9 | verdict items 1, 2 and 4 in two sittings for the scan cells and the mixes |
+| **3** | scans: `SegBlob` without forwarders, `ZCursor`, the seek by the fence, `cut_in`, `ZFile::scan_at`, `values_at` and `with_exts_at` at the sites of 3.9, the prefetch gate, the memo and its arm; the scan-model tests; the Zipfian mixes. (The seek by the fence is no longer a conditional 3b: rev 2.5) | 1,400 (engine 900; tests 500) | `ab` with the scan passes 90 min; mixes 60 min; the three-arm row (`supdb-nocache`, `supdb-nocachezpages`, `lmdb-nordahead`) at `--reps 3 --ops-div 10`, 3-3.5 h, twice | C2 for scans, C4 for scans and mixes B, C, D, E, the memo's worth, R4 and R5 | 7.3's scan cells; a mix C the memo does not move; any `raw_touches` on a shape of 3.9 | verdict items 1, 2 and 4 in two sittings for the scan cells and the mixes |
 | **4a** | `Auto`, the thin part: `zselect.rs` wired to the engine (cgroup v1 and v2 readers, the model, the tick at 1 Hz, build-when-wanted), `ZInject`; no hot-path code | 500 | injected tests 20 min; the 10M `Auto` pass 60 min | S1 and the build decision, on the real thing | an in-memory mark that keeps its sign; a build in memory | in memory: no thread, no file, no sample, callgrind +3 instructions; `Auto` enters under `ZInject` |
 | **4b** | the census: the `Slot` fields and `ZStat`, the windows and their validity (commits, scans), the refault evidence, the scan census; the probe takes each workload (scan-only, B-shaped, A-shaped) to a fresh store, so that no earlier pass has taught the rung (rev 2.4) | 450 | 15 min of tests, a 30 min probe | the census's `t_f`, `t_hit` and `saving*` on the real thing | a window class that never produces evidence in a mix | the replay's traces pass with the engine's census |
 | **4c** | E2 (the bitmaps), E3, the trial on the refilled state, the back-off, the ski-rental price, the wasted-build budget; the constants measured against the square wave and a sweep | 400 | tests 20 min; sweeps 60 min; the in-memory pairs `supdb` against `supdb-autozpages` at 100k and 300k, all passes, 12 pairs, two sittings, 2 h; callgrind 5 min | C6, 7.4, 7.5 | an in-memory mark that keeps its sign; a skewed workload that builds; more than one switch per `dwell` | 7.4's behaviours and 7.5 hold |
@@ -2006,7 +2006,7 @@ it leaves is mergeable.
 | **6** | the flip, only under 7.8(b): `ZPages::Auto` the default, the `*nozpages` arms, the rosters, the quick row, docs (`docs/engine.md`, `CLAUDE.md`, `README.md`) | 150 plus docs | the quick row twice, 20 min each; the ooc row 3 h, two sittings | 7.5 across the whole suite | any gate group red | 7.8 (b) |
 
 Total: about 7,150 lines, a bit under half of them tests, and 30 hours of machine time with the second sittings 7.8
-requires (23 with one sitting of the three-arm and ooc rows), 3 hours of it before the sidecar's read path exists (0a to 1c); none of it
+requires (23 with one sitting of the three-arm and ooc rows), 3 hours of it before the form file's read path exists (0a to 1c); none of it
 while another timing run holds the machine. The first version said 14-16 hours; its own cells summed to 17.1 and, with the
 conditional stage 3b, 22.9, before the second sittings (rev 3.13).
 
@@ -2017,7 +2017,7 @@ re-measured a passed gate and had no registered range for what it added. The che
 margin (how far from the cache's edge 79% occupancy is, and whether the hash is evicted: 1a, no code), the selector's transitions against traces nobody has run (1d, no machine), and the first
 in-situ numbers (2a: 900 lines and not 2,400, because the proof slice leaves out what the cell does not contain -- `ZNOPAGE`,
 `STORED`, the filter, the lifecycle, `SegBlob`, `warm` -- all of which the first version bundled with the proof, so that a
-lifecycle bug could not have been told from a failed thesis). L1 (1b) comes before the sidecar because it needs no file, no
+lifecycle bug could not have been told from a failed thesis). L1 (1b) comes before the form file because it needs no file, no
 format change, no identity check and, as an off-by-default flag, no controller. Stage 0b is not on that list as a gate: its stop
 on the suite's shape (36 records a page, against a prediction of 57 and the probe's 60.0) is not expected to fire and is kept because
 it is free. What 0b can still refute are the ranges of 7.1 (fill, compress calls a page, decode, records a page for each key shape,
@@ -2113,7 +2113,7 @@ page, and none of the hash. The working set is the heads and the directory, 120 
 reads/s to about 61k [D] -- a third of the gap to `lmdb-nordahead`. It needs no file, no build and no identity
 (the ordered index exists and is checked at open), is reversed by the gate, and is the cheapest *engine* change that moves
 the cell (about 70 lines). It cannot be the move: 0.33-0.38 against LMDB's 0.274 leaves the cell a loss. Nor does it wait
-behind the sidecar (rev 3.3): it is stage 1b, before the first sidecar line of the engine, because it is the one lever that
+behind the form file (rev 3.3): it is stage 1b, before the first form file line of the engine, because it is the one lever that
 needs no file, no format change, no identity check and, as an off-by-default `Options` flag chosen by hand, no controller.
 "Needs the same controller" holds only for a default-on L1: in memory a lookup of 94 ns (`src/db.rs:18194-18195`) becomes a
 seek of 390 ns, 170 of them the tie search at 300k keys (`src/ordindex.rs:34-36`), which is why it is never the default.
@@ -2155,8 +2155,8 @@ adding the kind later is not a format change.
 | build at the landing, as the ordered index is | a z build is 0.25-0.55 us a record on every seal and merge of every store including the in-memory ones: it breaks "the in-memory rows must not move". Allowed in stage 5 for merges, when the form is already wanted |
 | build lazily on the first reader | a build of seconds on a reader's thread holds every replaced state (`RetireList::sweep`, `src/db.rs:10587-10628`) and runs un-niced; "the first reader to find the cache empty pays" is a named defect (`CLAUDE.md` "A publish that left its derived work to whoever looked first") |
 | a `OnceLock` cell (the in-memory cells' precedent, `IdCache`, `src/db.rs:22093-22165`, is append-only too) | it cannot be cleared, so a take-back could not drop the mapping, and an unlinked file stays allocated while mapped: "disk is returned" would be false until the segment died |
-| identity by name and key count, as the ordered index | it holds heads, not values; a stale sidecar would return another segment's values silently |
-| one sidecar for the store | merges rewrite partitions; the grain of identity, retirement and promotion is the partition |
+| identity by name and key count, as the ordered index | it holds heads, not values; a stale form file would return another segment's values silently |
+| one form file for the store | merges rewrite partitions; the grain of identity, retirement and promotion is the partition |
 | a time-based signal (`Instant`, `rdtsc`) or `mincore` on the read path | 50 ns a pair against a 212 ns read, a latency threshold to type, and a residency answer that is not a blocking answer (4.3); `mincore` is the tests' instrument |
 | the PSI file `/proc/pressure/memory` as the trigger | present on this host; a group-wide figure with no attribution to the store's reads. Used by nothing; the refault rate in `memory.stat` is the pressure term |
 | a per-handle form | the build is store-level work and the footprint is shared; two handles in different forms is the sum-of-footprints failure |
@@ -2192,8 +2192,8 @@ adding the kind later is not a format change.
 | R4 | **the union leak**: any path still reading the raw hash, record or directory pages of a covered partition | a second form that accompanies the records only adds to the working set (`src/ordindex.rs:67-77`); "one point read in two hundred costs 7x"; the cache is charged for what a path touches | `SegBlob` with no `Deref` and no forwarder for any name that reads a record (3.9), `raw()` and `raw_touches`, the cursor and the seek by the fence (3.10, 3.4), the table's rows as fixtures, the residency probe on a landed store, the stray-read test, E3 as the net (4.5), `bg_read_bytes_per_op` in the row | the maintenance touches of 3.9 are bounded, not zero; a range with a level-0 piece touches the piece's pages beside the z pages (3.10) |
 | R5 | the scan's working set at less redundant keys: 0.72 + 0.017 GB of 0.92 at 57 records a page (80%), 0.84 + 0.017 at 50 (91%); the first version's 80 MB of heads on top made 89% and 100% | 91% of the budget leaves no room for the memtable chain under writes (up to about 400 MB by arithmetic, `src/db.rs:13085-13127`) | the seek by the fence takes the heads out of the working set (3.4); the model reads `anon` each tick; the key-shape grid | scans under heavy writes in the bound [U] |
 | R6 | the silent miss: a misaligned decode buffer makes `parse_record` return `None` for a full-form record, which a probe loop reads as "absent" | `src/flatindex.rs:520-523`, `1776-1783`; a compact-only fixture cannot catch it | `u64`-backed scratch, a refuse-and-count path, a test with full-form records and a deliberately misaligned buffer | |
-| R7 | a stale sidecar serves another segment's values | ids are re-handed after a crash (`src/db.rs:18997`); the ordered index's binding is a key count | content binding by the checksum row's CRC, the name fields and the segment's sizes, and `bloom_sig` for the stored filter (2.5); the planted-sidecar test | |
-| R8 | the exposure window after a merge or a promotion: a new partition is raw until its sidecar installs, 0.65-1.7 s a partition | the form's footprint win is only as good as its coverage; a store written across its key space rewrites every partition each cycle, at a rate near one serial builder's (5.6) | `rawserves`; promotion attaches before the publish; the wasted-build budget (5.2); merge-time build in stage 5; the registered mix cells never seal (7.3), so the lag sweep prices it | the cost on mix A beyond the registered cells needs a runner knob [U] |
+| R7 | a stale form file serves another segment's values | ids are re-handed after a crash (`src/db.rs:18997`); the ordered index's binding is a key count | content binding by the checksum row's CRC, the name fields and the segment's sizes, and `bloom_sig` for the stored filter (2.5); the planted-form file test | |
+| R8 | the exposure window after a merge or a promotion: a new partition is raw until its form file installs, 0.65-1.7 s a partition | the form's footprint win is only as good as its coverage; a store written across its key space rewrites every partition each cycle, at a rate near one serial builder's (5.6) | `rawserves`; promotion attaches before the publish; the wasted-build budget (5.2); merge-time build in stage 5; the registered mix cells never seal (7.3), so the lag sweep prices it | the cost on mix A beyond the registered cells needs a runner knob [U] |
 | R9 | the census lies: a handle migrates threads, a window holds a scan, a callback faults, a write-heavy mix yields little evidence, a first touch looks like a capacity miss | `RUSAGE_THREAD` is the calling thread's; the suite's mixes commit in every window; a cold cache faults at about one a read | thread token, window classes (commits tolerated, scans their own census: 4.3), the refault evidence and the ski-rental price (4.4, 4.5), and **holding the rung when there is no evidence**; the model gates counting only | the cost of `getrusage` and the clocks on this guest [U]; handles on a thread pool are dropped; the kernel's accounting of faults that wait on I/O in flight [U] |
 | R10 | flapping, and the trial's cost | a wrong switch costs a build (15-40 s) or a hot set's refault (5 s) | the ski-rental price, `dwell`, `retain`, the trial judged on the refilled state, a cancelled build counted as a switch, the square-wave test and the replay (7.4) | the constants are provisional until stage 4 [U] |
 | R11 | the comparison is not like for like | `rocksdb-tuned` is uncompressed (`bench/src/engines.rs:4415`; the suite builds its comparators "without compression libraries", `bench/Cargo.toml:31-33`). Its 10M row is banked (M15) and `supdb-nocache` already beats it on every rate cell of 7.3 but the one-thread scan, so against this RocksDB the z form is needed for one cell. An LZ4-compressing RocksDB would hold the same data in about 0.66 GB [D: 1.16 GB at the offline 0.57, M13], inside the cache, and read at no more than the in-core rate this machine measured for it, 239-252k/s at 3M keys [M15], an upper bound for a read that decompresses and one that 7.3's predicted 120-230k/s does not clear. `lmdb-nordahead` is LMDB configured for the regime. A win over an uncompressed RocksDB is not a win over RocksDB as a user runs it out of core | a compressing RocksDB arm (LZ4 on) before any claim against RocksDB; the claim in 7.6 is against LMDB | the compressing arm's 10M row [U] |
@@ -2201,18 +2201,18 @@ adding the kind later is not a format change.
 | R13 | the host: balloon page prices move load and build phases 2.5-3x between sittings (`CLAUDE.md` profiling, "A fresh page's price here is the host's"); a three-thread cell is the scheduler's on four vCPUs (`bench/CLAUDE.md`) | the build writes 0.72 GB of fresh page-cache pages | counts first, two sittings with the order swapped, the floors read first | |
 | R14 | the in-memory branch moves a read by code layout rather than instructions | a two-instruction change in a monomorphised generic can; the pin's fence once read as 25% and was nothing | callgrind for the instruction count; two binaries alternated in one sitting and again in a second; the arm-against-itself coin rate | |
 | R15 | a lifecycle bug of a class this repository has met | attach is not a publish (`src/db.rs:26949-26975`); a join blocking the thread everything lands through; a flag set before the call that resets it; a sweep that reads pins before the list; a derived thing keyed by position; a test that bets a seal is still running; a counter read that takes the upkeep home; an absence whose meaning a publish changed | the cell and the gate are written in the order that makes a partial state served raw, never wrong; the build is polled, never joined; the pins and the retire list are the forms' own; cells are keyed by identity; tests hold states (`hold_zpage_build`); counters read from `Shared` alone | |
-| R16 | disk: about 10 GB free on this host when read (`df`); a forced 10M pass needs 4-5 GB; `bench run`'s guard knows 3x the records (`bench/src/run.rs:803-814`) and not the sidecar; `ab` has none | the load's measured 3.1x was without the form | re-measure the guard's factor with the form; give every pairing a `TMPDIR` of its own | |
+| R16 | disk: about 10 GB free on this host when read (`df`); a forced 10M pass needs 4-5 GB; `bench run`'s guard knows 3x the records (`bench/src/run.rs:803-814`) and not the form file; `ab` has none | the load's measured 3.1x was without the form | re-measure the guard's factor with the form; give every pairing a `TMPDIR` of its own | |
 | R17 | the default policy is killed under the bound at 3M by the forms' memory | `docs/engine.md:5920-5928`; commit `5dbfa23`: 760-820 MB of anonymous memory at the full-rewrite lag point against 225-255 for no cache | not this move: the nocache policy carries the rows; `forms-lead.md` is the lead; 5.8 states the coupling for the follow-up; **7.8(b) gates the flip of the default on it** | the row for the default arm stays absent, and its absence is not a pass |
 | R18 | the browser half of "the three readers agree" is not in this tree | `tests/blob.rs:485` names `web/test/node.mjs`, which does not exist [U] | nothing compiled for wasm; `web/build.sh` bytes before and after | |
-| R19 | the reopen's verify pass makes the raw key section resident at every open, and merges read 1.3-1.5 GB of raw input a cycle | `src/db.rs:18917-18924` reads every byte of every segment's key section; the engine drops nothing behind a merge (5.8) | attach is lazy; raw pages age out as z pages are touched; a restart in a bound environment pays one raw pass first; a COMPACT-only drop-behind in `compact_run` is a separate gated change, priced as an arm if the verdict shows merges displacing the sidecar | |
-| R20 | the sidecar's folio composition under a 1 MiB write piece is unmeasured | a folio is sized by the write that makes it, and a file written one way reads another (`CLAUDE.md` "A write pattern priced on the bytes it wrote") | the piece is a named constant; a `pagemap` + `kpageflags` walk at three piece sizes in stage 2a | [U] |
+| R19 | the reopen's verify pass makes the raw key section resident at every open, and merges read 1.3-1.5 GB of raw input a cycle | `src/db.rs:18917-18924` reads every byte of every segment's key section; the engine drops nothing behind a merge (5.8) | attach is lazy; raw pages age out as z pages are touched; a restart in a bound environment pays one raw pass first; a COMPACT-only drop-behind in `compact_run` is a separate gated change, priced as an arm if the verdict shows merges displacing the form file | |
+| R20 | the form file's folio composition under a 1 MiB write piece is unmeasured | a folio is sized by the write that makes it, and a file written one way reads another (`CLAUDE.md` "A write pattern priced on the bytes it wrote") | the piece is a named constant; a `pagemap` + `kpageflags` walk at three piece sizes in stage 2a | [U] |
 | R21 | two controllers in one cgroup (two stores, or a store beside another process) | each store's model says "fits" | the pressure term (4.2); `two_stores_in_one_process_do_not_share_a_measure` | cross-process interplay [U] |
 | R22 | the form is wrong for a data shape: values over `inline_bytes`, multi-value keys of three or more 100-byte values (a run over 256 bytes goes to a block), tombstone-heavy partitions | z holds the records; the blocks stay raw and fault in both forms | the skip rule counts block-backed bytes in `W`; mixed partitions are copied verbatim and stay exact | the gain on such stores is small and declined |
 | R23 | the counters bump shared lines | per-read counters on `Shared` are a line every handle writes: `CLAUDE.md` "A slot table whose slots share a line" (four handles at 0.46x of LMDB with thirteen shared statistics) | `ZStat`, one line a slot, summed on read (6.4); the shared shape kept as the arm `supdb-nocachezpagessharedcounts` and paired at three threads (7.5) | the line costs 264 slots x 128 B = 34 KB [D] |
 | R24 | portability: the engine builds and tests on Linux x86, Linux ARM and macOS arm64, and `RUSAGE_THREAD`, cgroups, `mincore` and `fadvise` are Linux's | `libc` 0.2.191 defines `RUSAGE_THREAD` for no Apple target (2.9) | every Linux-only item gated with a no-op elsewhere, `Auto` inert off Linux, hosts whose page is not 4 KiB decline | `Always` on a 16 KiB-page host is correct and not one fault a read [U] |
 | R25 | the evidence lives in a session scratchpad | the probe, M17's block and the 10M rows are not in the repository, and `CLAUDE.md`'s rule is that a number lives in a banked row | stage 0a | M17's per-pass output is gone [U] |
 | R26 | the window: no single-fault form that decodes reaches LMDB's reads past about 7 times the cache | D9: both take one fault a read and the decode adds three microseconds | stated in 1.4, 7.3 and 9.1; "everywhere but disk" is not claimed past the window | open question 1 |
-| R27 | the stored filter's bits are a function of engine code | an edit to `BlockedBloom` that changes no format quantity would make an old sidecar answer "absent" for present keys, with nothing raised (2.5) | `BLOOM_SIG`, its pin test and the fence-key membership check at attach | the first sidecars of a new engine version are rebuilt and not attached whenever the signature moves |
+| R27 | the stored filter's bits are a function of engine code | an edit to `BlockedBloom` that changes no format quantity would make an old form file answer "absent" for present keys, with nothing raised (2.5) | `BLOOM_SIG`, its pin test and the fence-key membership check at attach | the first form files of a new engine version are rebuilt and not attached whenever the signature moves |
 | R28 | the controller's evidence in the suite's own mixes | A, B, D, E and F commit in every 100 ms window (`bench/src/run.rs:309`); E and a scan-only workload have scans in every window | commits tolerated, a scan census (4.3) | handles on a thread pool are dropped; the kernel's accounting of faults under I/O in flight [U] |
 
 ## Appendix A. Not found, not measured, not verified
@@ -2228,7 +2228,7 @@ Not found in the repository or on this host, said plainly:
   `scratchpad/ooc/rung1-10m` and are not committed.
 * `web/test/node.mjs`, named at `tests/blob.rs:485`.
 * Cancellation of a seal or a merge; a sweep at open of `seal-N.tmp`, `compact-N.tmp`, `tier-N.tmp`
-  (`src/db.rs:20288`, `8923`, `9082`), which is why the sidecar's temp name must sit under a swept prefix;
+  (`src/db.rs:20288`, `8923`, `9082`), which is why the form file's temp name must sit under a swept prefix;
   a directory lock between processes.
 * A public way to read a segment's record bytes or its checksum row from `Blob` (`Blob::flat` and the index are
   private, `src/blob.rs:588-591`, `723`); a function that returns a record's length without rebuilding a
@@ -2244,7 +2244,7 @@ Not found in the repository or on this host, said plainly:
 Not measured (everything in [P] and [P2] is also unmeasured; these are the inputs it stands on): the ratio of the engine's
 124-byte record images, per key shape (stage 0b); `lz4_flex`'s unsafe decode of 7 KB groups on this guest, and its compress
 rate; a cache-cold page's decode; the cost of `getrusage(RUSAGE_THREAD)`, `mincore` and the two clocks on this guest; the three
-instructions of the branch; the folio composition of a sidecar; whether the suite's 10M partitions carry commit markers (the
+instructions of the branch; the folio composition of a form file; whether the suite's 10M partitions carry commit markers (the
 builder handles both); the 2.9% and 3% record-straddle fractions (arithmetic, 30 of 1,024 phases); the residency a forced
 build leaves; `warm`'s cost; every machine time of 8 beyond the derived; why removing the hash is worth 0.07 faults a read more
 than its footprint (M17, 7.2a); the hash file's residency (stage 1a); the partition sizes and key counts of the banked 10M
@@ -2291,11 +2291,11 @@ each has its reason. The tables after it say, finding by finding, what changed a
 |---|---|---|
 | 1.1 | the reviewer's remedy for the partition cursor of `scan_merged` and for `cut_at`: read the keys from the ordered index's heads (`whole_key_at`, `src/ordindex.rs:488`) | a head names a whole key only when every key has one length within a head (`src/ordindex.rs:28-35`, `864-887`), which is the suite's shape and no other; the heads are 80 MB that the seek by the fence takes out of the compact form's working set (D10: the scan claim's 2x needs 43.1 records a page with them resident and 39.3 without); and a key borrowed across loop iterations needs a cursor that owns its group for the shapes where the heads do not apply. The z cursor of 3.10 serves every key shape. The heads stay for `same_blocks` and as the arm `supdb-nocachezpagesheads` |
 | 1.11 | the premise that a write-heavy mix seals every few seconds at 32 MiB | `seal_grows` is on by default (`src/db.rs:1817`) and `threshold_for` (`src/db.rs:13086-13100`) takes `max(seal_bytes, store/16)`, about 101 MB at 10M keys: a seal about every 6 s of mix A and a merge cycle (four pieces) about every 26 s, and the registered mix cells (83k updates, 12 MB; `Plan::divided`, `bench/src/run.rs:277`) never seal. The rate race the finding describes is real at that cadence and is derived in 5.6 |
-| 1.13 | a COMPACT-only drop-behind in `compact_run`, as part of this move | it edits the merge every store runs, for a displacement nobody has measured; it is a separate gated change, priced as an arm if the verdict shows merges displacing the sidecar (R19) |
+| 1.13 | a COMPACT-only drop-behind in `compact_run`, as part of this move | it edits the merge every store runs, for a displacement nobody has measured; it is a separate gated change, priced as an arm if the verdict shows merges displacing the form file (R19) |
 | 2.2 | the x_max of 14-21 times the cache and the net loss of the z form at 60 times (44 us against 42 us) | both come from a raw model capped at one fault a read, `1.15 - 1/x`. Once the 190 MB hash stops fitting, a raw read faults on the hash page as well: Che's approximation over the two populations (4.2) reproduces the cell, 0.428 against 0.425, and gives 1.94 faults a read at 60 times the cache, so a raw read is `0.73 + 41.5 * 1.94 = 81 us` against the z form's `4.0 + 41.5 * 0.99 = 45 us`, and the saving never falls under 0.43 at any size in D9's table (0.54 or more from 15M keys on, out to 200M). The gate and the exit the finding asked for are in; what they are for is no compression, a hot set that fits, and a cache that grows |
 | 2.4 | one fresh store per workload for stage 4's ooc rows | a 10M load and a build are minutes before the first cell. Taken for 4b's probe, which takes each workload (scan-only, B-shaped, A-shaped) to a fresh store, and for the replay's cold traces (7.4) |
 | 2.6 | `pread` in 1 MiB chunks, each followed by `fadvise`, as the stream | the builder parses records out of a mapped `Blob` (`Blob::record_regions`, 2.6 step 1), so it keeps the mapping and zaps the consumed window with `MADV_DONTNEED` before `posix_fadvise(DONTNEED)`; `pread` is the fallback if `zresident` shows the zap does not drop the pages |
-| 2.8 | a 300-line engine spike (`Blob::record_regions`, a stage-0 sidecar, a hidden-option `read_all`, no lifecycle) as its own step before stage 2 | it is stage 2a, at 900 lines and not 300: an in-situ `t_z` and a three-thread number are admissible only from a file that passed attach (trailer CRC, tiling check, identity), else they are read off a file nothing checked |
+| 2.8 | a 300-line engine spike (`Blob::record_regions`, a stage-0 form file, a hidden-option `read_all`, no lifecycle) as its own step before stage 2 | it is stage 2a, at 900 lines and not 300: an in-situ `t_z` and a three-thread number are admissible only from a file that passed attach (trailer CRC, tiling check, identity), else they are read off a file nothing checked |
 | 2.18 | stage 6 pins `ZPages::Off` in the inline and unpinned arms and tests | with `Auto` degrading to `Off` where it cannot run (1.3) those arms need no pin; the test that `Options::default()` opens over each of those option sets runs before any flip |
 | 3.1 | "neither stage is a gate", for stage 0b | conceded for 0b's stop on the suite's shape (36 records a page against a prediction of 57 and the probe's 60.0): it is not expected to fire and is kept because it is free. Not conceded for the stage: 7.1's ranges for fill, compress calls, decode and records a page by key shape can refute, and its product is the one layout the engine and the probes share |
 | 3.2 | `mlock` or a populate of the hash as a step before the residency answer; the fault attribution as an unconditional stage | the lever is ten lines and moot if the hash reads 97-100% resident, so it waits for 1a (9.5); the attribution is an optional run of 1a (by file, on the probe) and one untimed run in 1b (by region, on the engine), both [U] on this guest |
@@ -2310,13 +2310,13 @@ each has its reason. The tables after it say, finding by finding, what changed a
 | finding | what it said | where | disposition and what was checked |
 |---|---|---|---|
 | 1.1 | major: the nocache scan paths read the raw hash, directory and records of a covered partition (`cut_at`, `scan_merged`'s cursor), and "the compiler lists every site" is not a mechanism | 0, 3.8-3.10, 6.3 | **Accepted in part** (remedy above). Both shapes are real: `cut_at` is reached from `scan_partitions` (`src/db.rs:17841` into `25702`, `25706`), and `scan_merged` reads the partition's key after every emitted key and keeps it across iterations (`18058-18059`, `18074`, `18145`, `18149`). 3.9's table has them, and the level-0 cursors (`18042`, `18046`, `18161`) as raw by construction; 3.10 designs the cursor (`ZCursor`, `cut_in`) and says what is raw until stage 3 (`raw_scans`). `SegBlob` has no forwarder for any name that reads a record, which is what makes the compiler list each site, and `raw_touches` with a test per shape of the table is the check |
-| 1.2 | major: the persisted Bloom filter is a function of engine code that nothing in the trailer fingerprints | 2.0, 2.5, 3.2, 6.3 | **Accepted.** The trailer carries `bloom_probes`, `bloom_bits_per_key` and `bloom_sig`; `BLOOM_SIG` is pinned by a literal CRC32C over a filter of 4,096 fixed keys (the failing test says to bump it and the sidecar version); attach requires every fence key to test positive; the stale comment at `src/db.rs:2438-2440` is on the edit list. An edit to `slots_of` (`src/db.rs:2476-2495`) would have turned present keys into "absent" with nothing raised |
+| 1.2 | major: the persisted Bloom filter is a function of engine code that nothing in the trailer fingerprints | 2.0, 2.5, 3.2, 6.3 | **Accepted.** The trailer carries `bloom_probes`, `bloom_bits_per_key` and `bloom_sig`; `BLOOM_SIG` is pinned by a literal CRC32C over a filter of 4,096 fixed keys (the failing test says to bump it and the form file version); attach requires every fence key to test positive; the stale comment at `src/db.rs:2438-2440` is on the edit list. An edit to `slots_of` (`src/db.rs:2476-2495`) would have turned present keys into "absent" with nothing raised |
 | 1.3 | major: `check_options` refuses `Auto` beside `publish_in_background: false` or `writer_pins: false`, and stage 6 makes `Auto` the default | 4.1, 6.1, 6.3 | **Accepted.** `Auto` is never refused: it behaves as `Off` and is counted (`auto_inert`); only `Always` beside an unpinned writer is refused. `options_default_plus_each_inline_and_unpinned_set_opens` opens `Options::default()` over the option sets of `tests/db.rs:607`, `616`, `8355`, `9327`, `11712` and the arms `supdb-inlinemaint` and `supdb-nopin` (`bench/src/engines.rs:3480-3486`), and runs before any flip |
 | 1.4 | major: per-read counters on `Shared` | 4.6, 6.1, 6.2, 6.4, 7.5 | **Accepted** (the same defect as 2.11 and 3.10). `ZStat`, a 128-byte line per reader slot written by its handle alone and summed on read as `Readers::stat` sums the slots; `Shared` keeps events (builds, attaches, retires, switches). The `Slot` has nine words, 72 B (`src/db.rs:6665-6686`), so the census's seven words fit exactly (72 + 56 = 128 B) and five counters more would not. The shared shape stays as the arm `supdb-nocachezpagessharedcounts`, priced at three threads |
 | 1.5 | major: `warm` runs on the segment-work thread | 5.4 | **Accepted.** Warm is a job of the idle-class build thread, chunked, cancellable, holding no pin; the segment-work thread attaches, installs and stores the gate and nothing else. The loop of `Maint::run` (`src/db.rs:25995-26015`) and `FROZEN_CAP` = 3 (`10015`) make the stall the finding describes real |
 | 1.6 | minor: `fill_group`'s shrink reaches `m = 0` and divides by zero | 2.6, 6.3 | **Accepted.** Checked: `m = 2, len(c) = 9000` gives 0, 8144 gives 1, 8145 gives 0, and `m = 7, 35700` gives 0. The function is total: `m` never reaches 0, the loop ends in at most twelve turns, an image that fits `ZCAP` is `STORED` before any shrink, and `NOPAGE` is returned only where a lone record cannot fit. 0b's example has the 5,000-byte-key and 4,056-4,072-byte incompressible fixtures (`fill_group_is_total`) |
 | 1.7 | minor: rebuild after damage is unbounded, and step 6 does not check header against fence | 2.6, 2.7, 6.3 | **Accepted.** Step 6 runs `verify_page(page, fence_entry)` for each page it writes; rebuild after damage runs at most three times with the doubling backoff, then `declined_damage` (`Seg::z_declined`, `z_rebuilds`) |
-| 1.8 | minor: three windows between a build and a merge or promotion | 2.6, 5.2, 5.6, 6.3 | **Accepted.** (1) The collect step renames a finished build's file whose target is gone to a dead name and counts `build_orphaned`; (2) the segment-work thread opens the input and hands the `File` to the build thread at spawn, so a promotion's unlink of the old name (`src/db.rs:27130-27142`, `27449-27455`) cannot fail the open; (3) a retired sidecar is renamed to a unique `zpg-dead-N`, queued for an idle unlink as the manifest spares are (`src/db.rs:8355-8385`, `27543-27563`) and swept at open |
+| 1.8 | minor: three windows between a build and a merge or promotion | 2.6, 5.2, 5.6, 6.3 | **Accepted.** (1) The collect step renames a finished build's file whose target is gone to a dead name and counts `build_orphaned`; (2) the segment-work thread opens the input and hands the `File` to the build thread at spawn, so a promotion's unlink of the old name (`src/db.rs:27130-27142`, `27449-27455`) cannot fail the open; (3) a retired form file is renamed to a unique `zpg-dead-N`, queued for an idle unlink as the manifest spares are (`src/db.rs:8355-8385`, `27543-27563`) and swept at open |
 | 1.9 | minor: `retired_z` is swept once, at the push | 4.8, 6.3 | **Accepted.** `retired_z` is swept wherever the other retire lists are (the writer's `leave`, the `Maint` tick; `src/db.rs:14906-14909`, `12740-12755`). A `Snapshot` handle held across a landing defers the munmap and the disk, which 5.9 states and the test asserts |
 | 1.10 | minor: scan-only workloads yield no evidence; "exactly, no false positive" is too strong | 4.3 | **Accepted.** Scan windows have their own census and windows with commits count. "Exactly" now says "faults that missed the page cache"; the kernel's accounting of a fault that waits on another reader's I/O is [U], and stage 1a tests it with a `WILLNEED` in flight. Handles on a thread pool stay dropped, said and not fixed |
 | 1.11 | minor: the exposure window is a rate race priced only as build wall | 5.6, 7.3, 7.6 | **Accepted in part** (premise above). 5.6 derives the rewrite rate against the rebuild rate; 7.3 re-derives mixes A and F with a refutation line at 0.9x; `Always` cells report coverage as a covariate; `rawserves`, merge cycles and builds superseded are in verdict item 3; `Auto` is bounded by the budget of 5.2; building inside the merge stays stage 5 |
@@ -2354,7 +2354,7 @@ each has its reason. The tables after it say, finding by finding, what changed a
 |---|---|---|---|
 | 3.1 | major: the thesis gate was passed by M17; v2 has no registered range; the stage-0 stop cannot fire | 7.2b, 8 | **Accepted in part** (above). v2 is retired as a separate program: its page header, CRC and walk would have been a second definition of the layout, so the layout is 0b in the real module and the example runs the real `fill_group`. The new axes have ranges registered before they run (7.2b: the knee with and without heads, hash residency, faults by region, stray raw reads, three threads, the raw-to-z switch, the bound axis, hash sizing, key shapes); Zipf is priced on the engine in stage 3, where the memo is |
 | 3.2 | major: the 0.07 residual, the hash's power-of-two step and the fault attribution are in no stage | 1.3, 6.2, 6.3, 7.2b, 9.5 | **Accepted in part** (above). (a) `mincore` over the hash file is stage 1a, with the range 97-100% resident and the refutation under 90%; (b) the hash's step (`src/flatindex.rs:55-56`, `90-96`; `partition_bytes`, `src/db.rs:608`; hard-coded at `bench/src/engines.rs:3330`) is 9.5 and the optional arm `supdb-nocachepart<N>` in 1c, [U] because the banked store's partition sizes were not kept; (c) faults by file on the probe (1a, optional) and by region on the engine's baseline cell (1b), registered at hash 0.00-0.02 a read, the two-population model's 0.003 |
-| 3.3 | major: L1 and the incompressible control are sequenced and registered so that they cannot do their job | 6.2, 8, 9.2 | **Accepted.** `ab --ops-div`, finite `load_bpb` and `disk_bpb` without the load pass, and `--compress` on `ab` are stage 0a (`ab` builds a Quick plan, whose divisor is 1: `bench/src/main.rs:249-256`, `bench/src/run.rs:264-267`). 1b runs before any sidecar line, with 9.2's range (0.33-0.38 faults, about 61k reads/s) and a number in its stop (level on faults, under 0.02 apart, in both sittings). L1 is the declined case's hand-chosen fallback until L2 exists. The incompressible control is a row of 7.3 |
+| 3.3 | major: L1 and the incompressible control are sequenced and registered so that they cannot do their job | 6.2, 8, 9.2 | **Accepted.** `ab --ops-div`, finite `load_bpb` and `disk_bpb` without the load pass, and `--compress` on `ab` are stage 0a (`ab` builds a Quick plan, whose divisor is 1: `bench/src/main.rs:249-256`, `bench/src/run.rs:264-267`). 1b runs before any form file line, with 9.2's range (0.33-0.38 faults, about 61k reads/s) and a number in its stop (level on faults, under 0.02 apart, in both sittings). L1 is the declined case's hand-chosen fallback until L2 exists. The incompressible control is a row of 7.3 |
 | 3.4 | major: nothing brackets the regime where the form does not fit | 0, 1.3, 7.2b, 7.6 | **Accepted.** D9 models the window (z over `lmdb-nordahead` 3.3x at the cell, 1.5x at 18.7M keys, 1.0x at 50M, 0.94x at 90M; over the raw form 1.75x or more past 3 times the cache); 7.2b registers the bound axis (768, 640 and 512 MiB) with predicted ratios; entry is on the predicted saving, E3 leaves, 7.4 has the fifty-times store, and verdict item 7 reads the window's edge |
 | 3.5 | major: stage 2 is one 2,400-line stage bundling the proof with shapes the cell lacks | 8 | **Accepted in part** (above). 2a (900 lines): the format with `E = P`, no `NOPAGE` and no `STORED`, a partition with an irregular record declined, attach with the trailer CRC, the tiling check and sampled pages, `read_all` and `count` behind one gate load, no `SegBlob`, filter, memo, warm or controller. 2b: lifecycle, damage, identity, the Bloom filter, `ZNOPAGE`, `STORED`, `ZStat`, warm. 3: scans. Each stage has a DONE WHEN and an `Off`-default state that merges |
 | 3.6 | major: DONE WHEN requires the default flip that the scope excludes | 6.1, 7.8, R17 | **Accepted.** Two tiers: (a) the default `Off`, the forced arm and `Auto` behind the option, merged on nocache evidence with the 3M control and the quick row clean; (b) the flip only when the forms-memory lead (`docs/engine.md:5920-5928`) is closed. Until then `Auto` serves no policy that builds forms, and the default policy under the bound is an expected "killed or never leaves FITS" (7.4) whose absence is not a pass |
@@ -2364,7 +2364,7 @@ each has its reason. The tables after it say, finding by finding, what changed a
 | 3.10 | minor: per-read counters on `Shared` | 4.6, 6.1, 6.4 | **Accepted** (see 1.4) |
 | 3.11 | minor: stage 4 is 1,200 lines on provisional constants; no write-cost input | 8 | **Accepted in part** (above). Stage 4 is split: 4a (S1, the tick and build-when-wanted, no hot-path code), 4b (the census), 4c (E2, E3, the trial, the back-off, the price, the budget), each with a DONE WHEN. A mixed read-write workload has its verdict lines in 7.3 (A and F) and 7.6 item 3 |
 | 3.12 | minor: ten arms for fifteen suite sites each, two with no verdict item; `ZRegime` collides with the upkeep's regime | 6.1, 6.2, naming | **Accepted in part** (above). `supdb-ingestzpages` and `supdb-zpages` are dropped (their jobs are tests); the `*nozpages` arms arrive at the flip; the module and type are `src/db/zselect.rs` and `ZSelect` |
-| 3.13 | minor: the machine-time budget does not follow from the cells; no DONE WHEN per stage | 8 | **Accepted.** Restated from the cells: about 30 hours with the second sittings 7.8 asks for (23 with one sitting of the three-arm and ooc rows), 3 hours of it before the sidecar's read path exists; every stage has a DONE WHEN |
+| 3.13 | minor: the machine-time budget does not follow from the cells; no DONE WHEN per stage | 8 | **Accepted.** Restated from the cells: about 30 hours with the second sittings 7.8 asks for (23 with one sitting of the three-arm and ooc rows), 3 hours of it before the form file's read path exists; every stage has a DONE WHEN |
 | 3.14 | minor: six factual slips | 1.3, 1.4, 7, 7.1, 7.2a, 7.6, 7.8 | **Accepted in full.** (1) the probe's codec is the engine's, `t_z` 4.0-4.7; (2) 7.1's "before any code or probe run" is corrected, since M13 and M14 preceded it; (3) 35.7, stop under 36; (4) one threshold a quantity: 0.03 after the file is resident, 0.10 for the first cell, 0.05 the refutation line at three threads, bytes a read 120 and 410; (5) the tombstone rule is dropped; (6) the passage is `CLAUDE.md:526-543` |
 
 ### What the reviews said was missing

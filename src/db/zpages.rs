@@ -1,4 +1,4 @@
-//! The z form's layout: a derived sidecar that holds a partition's records,
+//! The z form's layout: a derived form file that holds a partition's records,
 //! verbatim, in groups that each compress into one 4 KiB page.
 //!
 //! The module is the one definition of it -- the page, the trailer, the fence
@@ -52,7 +52,7 @@
 //! The page carries `clen` because the decoder stops only when its input is
 //! exhausted after a literal run: handed the page's trailing zeros it parses
 //! them as further sequences. The CRC is xored with `bind32`, a hash of the
-//! segment's identity, so a page copied in from another sidecar fails its
+//! segment's identity, so a page copied in from another form file fails its
 //! own check without a second field to read. It is checked before anything
 //! is decoded, because LZ4 decodes many corrupt inputs into plausible bytes.
 //!
@@ -69,7 +69,7 @@
 //! visibility. The items here are public for the reason `flatindex`'s are:
 //! the tools in `bench/` price the layout they link, and a copy of it in an
 //! example is the second definition. The module is hidden from the crate's
-//! documentation until a reader of the sidecar exists, since a layout nothing
+//! documentation until a reader of the form file exists, since a layout nothing
 //! reads is not yet an interface anyone is promised.
 
 use crate::block::crc32;
@@ -147,7 +147,7 @@ pub enum ZError {
     Resident(&'static str),
     /// The fence entries do not tile the partition.
     Tiling(&'static str),
-    /// A page's CRC does not match its bytes under this sidecar's `bind32`.
+    /// A page's CRC does not match its bytes under this form file's `bind32`.
     PageCrc,
     /// A page's tag is not [`ZTAG`].
     Tag,
@@ -242,7 +242,7 @@ impl PageHeader {
 }
 
 /// The page's checksum: CRC-32C over everything after the CRC field, xor the
-/// sidecar's `bind32`.
+/// form file's `bind32`.
 pub fn page_crc(page: &[u8; ZPAGE], bind32: u32) -> u32 {
     crc32(&page[P_TAG..]) ^ bind32
 }
@@ -1547,10 +1547,10 @@ impl ZFence {
     }
 }
 
-/// The hash a sidecar's pages are bound by: CRC-32C over the segment's id,
+/// The hash a form file's pages are bound by: CRC-32C over the segment's id,
 /// the sequence its name covers, its key count and the CRC of its key
 /// section's checksum row, twenty-eight bytes little-endian. Every page's
-/// CRC is xored with it, so a page that is another sidecar's fails its own
+/// CRC is xored with it, so a page that is another form file's fails its own
 /// check at no cost.
 pub fn bind32(seg_id: u64, seg_end_seq: u64, nkeys: u64, seg_row_crc: u32) -> u32 {
     let mut b = [0u8; 28];
@@ -1561,7 +1561,7 @@ pub fn bind32(seg_id: u64, seg_end_seq: u64, nkeys: u64, seg_row_crc: u32) -> u3
     crc32(&b)
 }
 
-/// The bytes of the filter a sidecar stores for a partition of `nkeys` keys:
+/// The bytes of the filter a form file stores for a partition of `nkeys` keys:
 /// the blocks `BlockedBloom` allocates for that many keys, which is the size
 /// of the filter at build and at attach alike. A tool that prices the
 /// resident part asks here and does not restate the filter's bits a key and
@@ -1602,7 +1602,7 @@ pub fn check_group(group: &[u8], h: &PageHeader, entry: &FenceEntry<'_>) -> Resu
 /// page it writes, as the page will be read, so that a defect that would
 /// fail every first decode cannot pass the build and then loop the rebuild;
 /// the reader's first decode is these checks in this order with the one
-/// difference its mapping makes (`db::zside::first_decode`).
+/// difference its mapping makes (`db::zfile::first_decode`).
 pub fn verify_page(
     page: &[u8],
     bind32: u32,
@@ -1671,13 +1671,13 @@ fn get64(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(w)
 }
 
-/// The trailer, the file's last page: what the sidecar holds, the segment it
+/// The trailer, the file's last page: what the form file holds, the segment it
 /// derives from as that segment says of itself, and the filter's
 /// parameters. The magic, the version, the page size, the page's capacity
 /// and the most records in a group are constants of the layout and are not
 /// fields here; `bind32` and the CRC are derived.
 ///
-/// A sidecar holds values, so it is bound to its segment by content and not
+/// A form file holds values, so it is bound to its segment by content and not
 /// by a name: the engine hands segment ids out again after a crash, and the
 /// ordered index binds to its segment by key count alone, which is enough for
 /// heads and not for a file that carries values. The segment's key-section
@@ -1739,7 +1739,7 @@ pub struct Trailer {
 }
 
 impl Trailer {
-    /// The hash this sidecar's pages are bound by ([`bind32`]).
+    /// The hash this form file's pages are bound by ([`bind32`]).
     pub fn bind32(&self) -> u32 {
         bind32(self.seg_id, self.seg_end_seq, self.nkeys, self.seg_row_crc)
     }
@@ -1809,7 +1809,7 @@ impl Trailer {
     /// file: the length, the magic, the version, the page size, the CRC, the
     /// constants, the flags, the zeros, `bind32` against the fields it hashes,
     /// and that the fields do not contradict each other. The cheap identifying
-    /// checks come first, so a file that is not a sidecar at all is said to
+    /// checks come first, so a file that is not a form file at all is said to
     /// be that, and the CRC says the rest was torn.
     pub fn decode(bytes: &[u8]) -> Result<Trailer, ZError> {
         if bytes.len() != ZTRAILER {
@@ -2492,7 +2492,7 @@ mod tests {
     }
 
     #[test]
-    fn a_page_of_another_sidecar_fails_its_own_check() {
+    fn a_page_of_another_form_file_fails_its_own_check() {
         let images = small_groups().remove(0).0;
         let page = manual_page(&images.concat(), images.len() as u16, 0, 1, false);
         assert!(parse_page(&page, 1).is_ok());
@@ -3550,7 +3550,7 @@ mod tests {
 
     /// What a first decode must refuse of a page that is not its entry's:
     /// the page against its own entry with one quantity off, and its
-    /// neighbours against it. Every page of a sidecar shares `bind32` and
+    /// neighbours against it. Every page of a form file shares `bind32` and
     /// passes its own CRC, so the comparison of the page's `first_rank` and
     /// `count` with the entry's, and of its first key with the entry's, is
     /// all that stands between a page read at the wrong place -- a page
@@ -3593,7 +3593,7 @@ mod tests {
             let got = refused(page, &e);
             assert!(matches!(got, Some(ZError::Walk(_))), "{e:?}: {got:?}");
         }
-        // A page of this sidecar at another entry's place: it passes its own
+        // A page of this form file at another entry's place: it passes its own
         // CRC under this `bind32`, and only the comparison refuses it.
         for other in neighbours {
             assert!(parse_page(*other, bind).is_ok(), "a good page of the build");
@@ -3733,7 +3733,7 @@ mod tests {
                 .filter_map(|j| b.pages.get(j).map(|p| &p.2))
                 .collect();
             check_fence_binds(page, &near, &entry, bind, &mut buf);
-            // A page of another sidecar fails its CRC before the entry is
+            // A page of another form file fails its CRC before the entry is
             // looked at, whatever the entry says.
             assert_eq!(
                 verify_page(page, bind ^ 1, &entry, &mut buf).err(),
@@ -4336,7 +4336,7 @@ mod tests {
                 "{bad:?}"
             );
         }
-        // Not a page this sidecar reads: another bind32, or a byte changed.
+        // Not a page this form file reads: another bind32, or a byte changed.
         assert!(!page_decodes_to(&page, bind ^ 1, &hdr, &group, &mut v));
         let mut torn = page;
         torn[100] ^= 1;
@@ -4372,10 +4372,10 @@ mod tests {
         assert_eq!(s.stats.pages, 0);
     }
 
-    // ---- a whole sidecar ------------------------------------------------
+    // ---- a whole form file ------------------------------------------------
 
     #[test]
-    fn a_whole_sidecar_round_trips_through_its_file() {
+    fn a_whole_form_file_round_trips_through_its_file() {
         use super::super::{BlockedBloom, BLOOM_BITS_PER_KEY, BLOOM_PROBES, BLOOM_SIG};
         let mut rng = Rng::new(71);
         // Records of every shape, and three whose keys are too big for a page
@@ -4562,7 +4562,7 @@ mod tests {
         assert_eq!(
             (super::super::BLOOM_SIG, blocks, words.len(), crc32(&words)),
             (1, 80, 5120, 0x2EA5_76A7),
-            "BlockedBloom's bits are not the ones this pin was taken from: a sidecar \
+            "BlockedBloom's bits are not the ones this pin was taken from: a form file \
              built before the change would attach with every other check passing and \
              answer \"absent\" for keys it holds. Bump BLOOM_SIG (db.rs) and ZVERSION, \
              then take the new CRC of the words from this message"

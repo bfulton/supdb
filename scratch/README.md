@@ -25,7 +25,7 @@ predictions and the verdict rule. On the mainline:
 - Stage 1d: the selector's pure core, `src/db/zselect.rs`, wired to
   nothing (merged `71916db`).
 - Stage 2a: the forced arm for point reads and counts: `Options::zpages`,
-  `ZPages::Always`, the sidecar `zpg-<id>-<end_seq>.zpg` beside each
+  `ZPages::Always`, the form file `zpg-<id>-<end_seq>.zpg` beside each
   partition, arm `supdb-nocachezpages`, `Db::zpages_settle` (merged
   `cd4e774`). Measured in one sitting at ten million keys under a 1 GiB
   bound and written up in `docs/engine.md`, "Out of core: the second form"

@@ -5929,7 +5929,7 @@ fn overlay_model_opts(
 }
 
 /// The overlay model with the compact form forced: every partition the
-/// flush makes gets a sidecar as it lands, and the scans walk them -- the
+/// flush makes gets a form file as it lands, and the scans walk them -- the
 /// bulk walk, the merge path over a piece and the block path alike -- with
 /// the unsealed keys laid over them as before.
 #[test]
@@ -6108,18 +6108,18 @@ fn overlay_model_z(
         );
     }
     if zpages {
-        // The point reads above went through the sidecars and every
+        // The point reads above went through the form files and every
         // partition has one; without the block cache the scans' partition
         // walks went through them too, where the block path's walks stay
         // raw.
         let c = db.zpage_counts();
         assert!(
-            c.partitions > 0 && c.sidecars == c.partitions && c.reads > 0,
+            c.partitions > 0 && c.form_files == c.partitions && c.reads > 0,
             "the compact form served the checks: {c:?}"
         );
         assert!(
             block_cache || c.scans > 0,
-            "the scans went through the sidecars: {c:?}"
+            "the scans went through the form files: {c:?}"
         );
     }
     db.close().unwrap();
@@ -6298,9 +6298,9 @@ fn readers_on_threads_keep_answering_through_seals_and_merges() {
 }
 
 /// The same with the compact form forced: every partition the merges make
-/// gets a sidecar as it lands and the readers' point reads go through
+/// gets a form file as it lands and the readers' point reads go through
 /// them, while the writer seals and merges under them and the landings
-/// retire the sidecars of the partitions they replace. The scans take the
+/// retire the form files of the partitions they replace. The scans take the
 /// block path here, whose walks stay raw.
 #[test]
 fn readers_on_threads_keep_answering_through_seals_and_merges_with_zpages() {
@@ -6308,7 +6308,7 @@ fn readers_on_threads_keep_answering_through_seals_and_merges_with_zpages() {
 }
 
 /// And without the block cache, so the readers' scans walk the partitions
-/// through the sidecars' cursors while the landings retire them.
+/// through the form files' cursors while the landings retire them.
 #[test]
 fn readers_on_threads_keep_answering_through_seals_and_merges_with_zpages_and_no_cache() {
     readers_through_seals_and_merges("readers-threads-zpages-nocache", true, false);
@@ -6412,7 +6412,7 @@ fn readers_through_seals_and_merges(name: &str, zpages: bool, cache: bool) {
         "the writer partitioned under them: {:?}",
         db.levels()
     );
-    // Under the compact form, every partition standing has its sidecar
+    // Under the compact form, every partition standing has its form file
     // before the closing reads, so they go through it.
     db.zpages_settle().unwrap();
     // Every key's last version, from the writer's own handle and from a
@@ -6424,19 +6424,19 @@ fn readers_through_seals_and_merges(name: &str, zpages: bool, cache: bool) {
     if zpages {
         // And a scan over the settled store; then the counts say the reads,
         // the threads' during the run and these after it, were served by
-        // the sidecars and every partition has one, and without the block
+        // the form files and every partition has one, and without the block
         // cache that the scans' partition walks were too.
         let mut n = 0;
         db.scan(&key(0), 200, |_, _| n += 1).unwrap();
         assert!(n > 0);
         let c = db.zpage_counts();
         assert!(
-            c.partitions > 0 && c.sidecars == c.partitions && c.reads > 0,
+            c.partitions > 0 && c.form_files == c.partitions && c.reads > 0,
             "the compact form served the readers: {c:?}"
         );
         assert!(
             cache || c.scans > 0,
-            "the scans went through the sidecars: {c:?}"
+            "the scans went through the form files: {c:?}"
         );
     }
 }
@@ -11320,17 +11320,17 @@ fn a_live_write_over_the_frozen_table_is_one_key_on_every_scan_path() {
         m.check(&r, &format!("{name}: a handle after the landing"));
         m.check(&db, &format!("{name}: the writer after the landing"));
         if name.contains("zpages") {
-            // The point reads went through the sidecars and every partition
+            // The point reads went through the form files and every partition
             // has one; without the block cache the scans' partition walks
             // went through them too, where the block path's walks stay raw.
             let c = db.zpage_counts();
             assert!(
-                c.partitions > 0 && c.sidecars == c.partitions && c.reads > 0,
+                c.partitions > 0 && c.form_files == c.partitions && c.reads > 0,
                 "{name}: the compact form served the checks: {c:?}"
             );
             assert!(
                 !name.starts_with("nocache") || c.scans > 0,
-                "{name}: the scans went through the sidecars: {c:?}"
+                "{name}: the scans went through the form files: {c:?}"
             );
         }
         drop(r);
@@ -11347,7 +11347,7 @@ fn scan_path_arms() -> [(&'static str, Options); 10] {
     [
         ("default", Options::default()),
         // The compact form forced, with the block cache and without it: the
-        // block path over the sidecars, and the merge and bulk-walk paths
+        // block path over the form files, and the merge and bulk-walk paths
         // through them.
         (
             "zpages",
@@ -11963,17 +11963,17 @@ fn a_writer_freezes_into_room_while_three_seals_are_held() {
         m.check(&r, &format!("{name}: a handle after the landings"));
         m.check(&db, &format!("{name}: the writer after the landings"));
         if name.contains("zpages") {
-            // The point reads went through the sidecars and every partition
+            // The point reads went through the form files and every partition
             // has one; without the block cache the scans' partition walks
             // went through them too, where the block path's walks stay raw.
             let c = db.zpage_counts();
             assert!(
-                c.partitions > 0 && c.sidecars == c.partitions && c.reads > 0,
+                c.partitions > 0 && c.form_files == c.partitions && c.reads > 0,
                 "{name}: the compact form served the checks: {c:?}"
             );
             assert!(
                 !name.starts_with("nocache") || c.scans > 0,
-                "{name}: the scans went through the sidecars: {c:?}"
+                "{name}: the scans went through the form files: {c:?}"
             );
         }
         drop(r);

@@ -207,14 +207,14 @@ fn a_three_frozen_life(name: &str) {
 }
 
 /// One store's life under the second form, forced: a load into partitions,
-/// each given its sidecar, reads and counts from them on the writer and on
+/// each given its form file, reads and counts from them on the writer and on
 /// a handle's thread (whose buffer for a decoded group goes with the
 /// thread), updates spread over every range and a drain, which merge the
-/// partitions again and take their sidecars with them, a handle pinned at
-/// a snapshot across such a round, which keeps the sidecars it reads mapped
+/// partitions again and take their form files with them, a handle pinned at
+/// a snapshot across such a round, which keeps the form files it reads mapped
 /// after their retirement and past the store's close, and a reopen that
-/// attaches what the merges left. The sidecars are mappings, which the
-/// allocator does not count; what it counts is everything else a sidecar
+/// attaches what the merges left. The form files are mappings, which the
+/// allocator does not count; what it counts is everything else a form file
 /// is: the cell, the fence, the filter, the bitmaps, the trailer, and the
 /// retire list's entries. The close frees them with their segments, and
 /// what a pin held goes with the pin; on Linux the process's mappings say
@@ -235,9 +235,9 @@ fn a_zpages_life(name: &str) {
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let keys = 20_000u32;
     let key = |k: u32| format!("key-{k:08}").into_bytes();
-    // Values of random bytes, so that a partition's sidecar is stored pages
+    // Values of random bytes, so that a partition's form file is stored pages
     // and more than the sixteen an attach samples; a value of one byte
-    // repeated made a sidecar of ten.
+    // repeated made a form file of ten.
     let value = |k: u32| -> Vec<u8> {
         let mut x = (u64::from(k) + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         (0..100)
@@ -270,7 +270,7 @@ fn a_zpages_life(name: &str) {
     std::thread::spawn(move || read_some(&h, keys))
         .join()
         .unwrap();
-    assert!(db.zpage_counts().reads > 0 && db.zpage_counts().sidecars > 1);
+    assert!(db.zpage_counts().reads > 0 && db.zpage_counts().form_files > 1);
     let mut x = 0x9E37_79B9_7F4A_7C15u64;
     for round in 1..=3u64 {
         for _ in 0..1500 {
@@ -285,7 +285,7 @@ fn a_zpages_life(name: &str) {
         read_some(&db, keys);
     }
     // A handle pinned at a snapshot across two retirements: a round whose
-    // merges retire the sidecars with their segments, and a sidecar taken
+    // merges retire the form files with their segments, and a form file taken
     // out of a live segment's cell after a page of it failed a check, which
     // waits in the retire list for the pin. The store is closed with the
     // pin still held, so neither is swept: the handle's drop is what frees
@@ -306,17 +306,17 @@ fn a_zpages_life(name: &str) {
     db.zpages_settle().unwrap();
     #[cfg(target_os = "linux")]
     {
-        let live = db.zpage_counts().sidecars as usize;
+        let live = db.zpage_counts().form_files as usize;
         let mapped = common::zpg_mappings(&d).len();
         assert!(
             mapped > live && mapped >= mapped_before,
             "{mapped} mapped, {live} live, {mapped_before} before: the pin holds what the merges retired"
         );
     }
-    // A page no attach samples -- the second, of a sidecar of more than
+    // A page no attach samples -- the second, of a form file of more than
     // sixteen pages, just built and read by nobody -- flipped in place
     // under the mapping: the reads meet the check, and the settle takes the
-    // sidecar out of its cell into the retire list and builds another.
+    // form file out of its cell into the retire list and builds another.
     let mut files: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(&d)
         .unwrap()
         .flatten()
@@ -327,8 +327,8 @@ fn a_zpages_life(name: &str) {
         .map(|e| (e.metadata().unwrap().len(), e.path()))
         .collect();
     files.sort();
-    let (len, file) = files.pop().expect("a sidecar");
-    assert!(len > 20 * ZPAGE as u64, "a sidecar of {len} bytes");
+    let (len, file) = files.pop().expect("a form file");
+    assert!(len > 20 * ZPAGE as u64, "a form file of {len} bytes");
     {
         use std::os::unix::fs::FileExt;
         let f = std::fs::OpenOptions::new()
@@ -350,8 +350,8 @@ fn a_zpages_life(name: &str) {
     db.zpages_settle().unwrap();
     let c = db.zpage_counts();
     assert_eq!(
-        (c.rebuilds - before.rebuilds, c.damaged, c.sidecars),
-        (1, 0, before.sidecars),
+        (c.rebuilds - before.rebuilds, c.damaged, c.form_files),
+        (1, 0, before.form_files),
         "retired into the list and built again: {c:?}"
     );
     read_some(&db, keys);
@@ -360,7 +360,7 @@ fn a_zpages_life(name: &str) {
     #[cfg(target_os = "linux")]
     assert!(
         !common::zpg_mappings(&d).is_empty(),
-        "the pin holds its sidecars past the store's close"
+        "the pin holds its form files past the store's close"
     );
     // Dropped without a release: no operation sweeps after the pin, and
     // what the handle held goes with it.
@@ -368,7 +368,7 @@ fn a_zpages_life(name: &str) {
     #[cfg(target_os = "linux")]
     assert!(
         common::zpg_mappings(&d).is_empty(),
-        "no mapping of the store's sidecars survives the last handle: {:?}",
+        "no mapping of the store's form files survives the last handle: {:?}",
         common::zpg_mappings(&d)
     );
     let db = Db::open(&d, opts).unwrap();
@@ -378,7 +378,7 @@ fn a_zpages_life(name: &str) {
     #[cfg(target_os = "linux")]
     assert!(
         common::zpg_mappings(&d).is_empty(),
-        "no mapping of the store's sidecars survives its close"
+        "no mapping of the store's form files survives its close"
     );
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -387,7 +387,7 @@ fn a_zpages_life(name: &str) {
 fn a_closed_store_gives_back_what_it_allocated() {
     // The first life allocates what lives for the process -- the test
     // harness's buffers, lazily built statics, the buffer a thread that
-    // reads from a sidecar decodes into -- so the count starts after.
+    // reads from a form file decodes into -- so the count starts after.
     a_store_life("warm");
     a_handed_life("warm-handed");
     a_three_frozen_life("warm-three");

@@ -24,9 +24,9 @@
 //! |---|---|---|
 //! | [`Phase::Fits`] | 0 | the model says the raw form fits the cache; nothing runs, nothing is sampled |
 //! | [`Phase::Suspect`] | 1 | the model says it may not; handles run the census; reads are served raw |
-//! | [`Phase::Building`] | 1 | the price is paid and the sidecars are being built or attached; reads are served raw |
+//! | [`Phase::Building`] | 1 | the price is paid and the form files are being built or attached; reads are served raw |
 //! | [`Phase::Compact`] | 2 | covered partitions are read from the compact form |
-//! | [`Phase::Trial`] | 1 | COMPACT's probe: the raw form is served again, sidecars attached, to see whether it fits |
+//! | [`Phase::Trial`] | 1 | COMPACT's probe: the raw form is served again, form files attached, to see whether it fits |
 //!
 //! The table's three rungs are FITS, SUSPECT (with the build inside it) and
 //! COMPACT (with the trial inside it); the five phases are what the gate and
@@ -85,11 +85,11 @@
 //! | SUSPECT | FITS | `phi_raw < theta_sus / 2` and no pressure, on [`SUSPECT_TO_FITS_TICKS`] consecutive ticks |
 //! | SUSPECT | building | all of (a) `excess >= C_build`; (b) the predicted saving `phi_raw - phi_z >= theta_enter`, unless the pressure term is on, and the measured saving `phi_meas - phi_z >= theta_enter` in some class; (c) `phi_raw >= theta_sus` or the pressure term; (d) a [`ZSelect::dwell`] since the last switch; (e) the sampler has a reading of the partitions as they are, has not declined them, and the wasted-build budget has not suspended building |
 //! | building | SUSPECT | the measured saving is under `theta_enter / 2` in every class with evidence, on [`VANISH_INTERVALS`] evidence intervals; or the budget trips; or the sampler declines the partitions. The build is cancelled and **counts as a switch** |
-//! | building | COMPACT | sidecars attached for at least [`COVERED_ENOUGH`] of the covered footprint |
+//! | building | COMPACT | form files attached for at least [`COVERED_ENOUGH`] of the covered footprint |
 //! | COMPACT | SUSPECT | **E1** the maximum of the smoothed `phi_raw`, with the part of the model's error that is positive added, over a dwell is under `theta_sus / 2`, the pressure term is off throughout, and the scans have not been held against the model; **E3** the realized saving, the raw form's believed rate less `phi_meas_z`, stays under `saving*` for a dwell; **E2** the trial says the raw form fits |
 //! | COMPACT | trial | the z faults a read are under `theta_sus` and the raw footprint of the pages touched is under half the budget, on [`E2_MEASURES`] consecutive measures of [`E2_MEASURE`], a dwell since the last switch, and the back-off has run |
 //! | trial | COMPACT | the refilled raw form still faults: its saving over the compact form's predicted rate, `phi_meas - phi_z`, is at least `theta_enter`. The back-off doubles |
-//! | trial | SUSPECT | it does not: E2. The sidecars are retained |
+//! | trial | SUSPECT | it does not: E2. The form files are retained |
 //!
 //! `saving* = (t_z - t_hit) / t_f` is the fall in faults an operation at which
 //! the compact form's extra CPU is exactly repaid by the faults it removes,
@@ -163,7 +163,7 @@
 //!   and the raw form must not be left serving a store nothing reads.
 //! * **A reading is of what it was taken of.** The sampler's reading carries
 //!   the generation of the partitions it was taken at and is dropped when they
-//!   change; it is dropped when the sidecars it priced are retired; and a
+//!   change; it is dropped when the form files it priced are retired; and a
 //!   decline stands for a dwell, after which the sampler is asked again. The
 //!   footprint is the compact form's bitmaps, and goes when the form does. A
 //!   sampler that declines the partitions while a build is under way ends it.
@@ -252,7 +252,7 @@ pub const SUSPECT_TO_FITS_TICKS: u32 = 5;
 /// Consecutive evidence intervals in which the saving has vanished before a
 /// build in flight is cancelled.
 pub const VANISH_INTERVALS: u32 = 3;
-/// The share of the covered footprint bytes whose sidecars must be attached
+/// The share of the covered footprint bytes whose form files must be attached
 /// for building to become COMPACT (declined partitions are excluded from the
 /// footprint by the caller).
 pub const COVERED_ENOUGH: f64 = 0.9;
@@ -268,7 +268,7 @@ pub const DWELL_FLOOR: Duration = Duration::from_secs(60);
 /// The dwell is this many times the last build's wall time when that is more
 /// than [`DWELL_FLOOR`].
 pub const DWELL_BUILD_FACTOR: u32 = 10;
-/// The shortest time a sidecar is kept after the form is left, while a
+/// The shortest time a form file is kept after the form is left, while a
 /// re-entry is likelier to be cheaper than a rebuild.
 pub const RETAIN_FLOOR: Duration = Duration::from_secs(600);
 /// The retention is this many times the last build's wall time when that is
@@ -403,7 +403,7 @@ pub fn model_raw(budget: u64, hash: u64, records: u64) -> f64 {
 }
 
 /// The compact form's faults a point read: one population read uniformly,
-/// `1 - (B - f) / W_z` clamped to a rate, where `f` is the part of the sidecar
+/// `1 - (B - f) / W_z` clamped to a rate, where `f` is the part of the form file
 /// that is resident whatever the reads do (the fence and the filter) and `W_z`
 /// the pages.
 pub fn model_z(budget: u64, resident: u64, z_bytes: u64) -> f64 {
@@ -417,7 +417,7 @@ pub fn model_z(budget: u64, resident: u64, z_bytes: u64) -> f64 {
 /// `C_build`, seconds: what buying the form costs, the CPU the build is
 /// estimated to take plus the displacement of the cache it causes. Until the
 /// displacement is measured it is [`DISPLACEMENT_FACTOR`] of the CPU. For a
-/// sidecar already on disk with a matching identity the price is the attach's
+/// form file already on disk with a matching identity the price is the attach's
 /// cost, and the caller passes that instead.
 pub fn ski_rental_price(build_cpu: f64, displacement: Option<f64>) -> f64 {
     let displacement = displacement
@@ -585,7 +585,7 @@ pub struct Sampler {
     /// The sampler's cold estimates of the costs.
     pub costs: Costs,
     /// `C_build`, seconds ([`ski_rental_price`]); the attach's cost where the
-    /// sidecars are already on disk.
+    /// form files are already on disk.
     pub c_build: f64,
     /// The sampler declined the partitions: the form would not pay for its
     /// footprint, or the data does not compress.
@@ -637,7 +637,7 @@ impl Census {
 /// The builder's report to the selector.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Build {
-    /// The share of the covered footprint bytes whose sidecars are attached.
+    /// The share of the covered footprint bytes whose form files are attached.
     pub coverage: f64,
     /// Builds collected since the last step that installed.
     pub installed: u32,
@@ -658,14 +658,14 @@ pub struct Input {
     pub model: Option<Model>,
     /// The sampler's reading, when the caller has a new one. The selector
     /// keeps it while it stands for the partitions as they are, and drops it
-    /// when they change, when the sidecars it priced are retired, and, if it
+    /// when they change, when the form files it priced are retired, and, if it
     /// declined, after a dwell: each time [`Decision::sample`] asks for
     /// another. A reading taken at another [`Input::generation`] is of other
     /// partitions and is not kept.
     pub sampler: Option<Sampler>,
     /// The identity of what the sampler's reading is a reading of, an opaque
     /// number: it changes when a partition is made, rewritten or retired (a
-    /// merge, a promotion) and when a sidecar is attached or retired, since
+    /// merge, a promotion) and when a form file is attached or retired, since
     /// the price of buying the form is what is built and what is not; it does
     /// not change for a piece a seal adds. It is compared for equality and
     /// nothing else, and the caller sets it at every step.
@@ -689,7 +689,7 @@ pub enum Phase {
     Fits,
     /// The model says it may not; the census runs.
     Suspect,
-    /// The price is paid; sidecars are being built or attached.
+    /// The price is paid; form files are being built or attached.
     Building,
     /// Covered partitions are read from the compact form.
     Compact,
@@ -745,7 +745,7 @@ pub enum Event {
     /// COMPACT: the wasted-build budget tripped and building is suspended for
     /// a dwell. The form is still served.
     BuildsSuspended,
-    /// COMPACT to SUSPECT. A switch; the sidecars are retained.
+    /// COMPACT to SUSPECT. A switch; the form files are retained.
     Exit(Exit),
     /// COMPACT to the trial: the gate goes back to the raw form.
     TrialStart,
@@ -781,7 +781,7 @@ pub struct Decision {
     /// Whether uncovered partitions may be built: building, or COMPACT unless
     /// the wasted-build budget has suspended it.
     pub build: bool,
-    /// Pulse: the retention ended with the form unused; drop the sidecars.
+    /// Pulse: the retention ended with the form unused; drop the form files.
     pub retire: bool,
     /// Pulse: the transition this step made; a cancel is the event
     /// [`Event::BuildCancelled`] or [`Event::BuildAbandoned`].
@@ -814,7 +814,7 @@ pub struct Counts {
     pub trials: u64,
     /// Trials that went back to COMPACT.
     pub trials_back: u64,
-    /// Retention windows that ended with the sidecars unused.
+    /// Retention windows that ended with the form files unused.
     pub retired: u64,
     /// Mixed windows the census dropped.
     pub mixed_windows: u64,
@@ -1116,7 +1116,7 @@ impl ZSelect {
         DWELL_FLOOR.max(self.last_build_wall.saturating_mul(DWELL_BUILD_FACTOR))
     }
 
-    /// How long sidecars are kept after the form is left:
+    /// How long form files are kept after the form is left:
     /// `max(RETAIN_FLOOR, RETAIN_BUILD_FACTOR * the last build's wall)`.
     pub fn retain(&self) -> Duration {
         RETAIN_FLOOR.max(self.last_build_wall.saturating_mul(RETAIN_BUILD_FACTOR))
@@ -1134,7 +1134,7 @@ impl ZSelect {
         self.excess
     }
 
-    /// Whether sidecars are being kept for a re-entry: the form was left (or a
+    /// Whether form files are being kept for a re-entry: the form was left (or a
     /// build cancelled) and the retention has not ended.
     pub fn retained(&self) -> bool {
         self.retain_until.is_some()
@@ -1931,7 +1931,7 @@ impl ZSelect {
             Some(t) if now >= t && matches!(self.phase, Phase::Fits | Phase::Suspect) => {
                 self.retain_until = None;
                 self.counts.retired += 1;
-                // The reading priced sidecars that are gone: a build from
+                // The reading priced form files that are gone: a build from
                 // nothing costs what the sampler says of it afresh.
                 self.sampler = None;
                 true
@@ -2015,7 +2015,7 @@ mod tests {
         scan_pages: f64,
         /// Seconds a whole build takes at raw rates.
         build_wall: f64,
-        /// `C_build` from nothing, and from sidecars already attached. From
+        /// `C_build` from nothing, and from form files already attached. From
         /// nothing it is what [`ski_rental_price`] says of the build's CPU,
         /// which at the cell is eight seconds.
         price: f64,
@@ -2186,7 +2186,7 @@ mod tests {
         dwell: Duration,
         backoff: Duration,
         excess: f64,
-        /// The sidecars attached, as the builder had them when the step began.
+        /// The form files attached, as the builder had them when the step began.
         built: f64,
         /// The major faults the interval took, through whichever form served it.
         faults: u64,
@@ -2277,7 +2277,7 @@ mod tests {
         n: u64,
         load: Load,
         last: Decision,
-        /// The share of the covered footprint with a sidecar attached.
+        /// The share of the covered footprint with a form file attached.
         built: f64,
         /// Pages not yet resident (a hot set's raw pages, a cold fill).
         cold: f64,
@@ -2291,9 +2291,9 @@ mod tests {
         /// What the partitions are, as the caller numbers them
         /// ([`Input::generation`]); a test that merges them bumps it.
         generation: u64,
-        /// The caller numbers the partitions again when a sidecar is attached
+        /// The caller numbers the partitions again when a form file is attached
         /// or retired, as the input's documentation asks.
-        numbers_sidecars: bool,
+        numbers_form_files: bool,
         /// Every n-th window has no commit in it (0: none): where there is
         /// none, the census cannot measure the cost of a fault.
         commit_free_every: u64,
@@ -2341,7 +2341,7 @@ mod tests {
                 sampler_once: false,
                 declined: false,
                 generation: 0,
-                numbers_sidecars: true,
+                numbers_form_files: true,
                 commit_free_every: 1,
                 phi_raw_override: None,
                 collected: Build::default(),
@@ -2480,8 +2480,8 @@ mod tests {
             if self.last.build {
                 let before = self.built;
                 self.built = (self.built + dt / self.cell.build_wall).min(1.0);
-                if before < 1.0 && self.built >= 1.0 && self.numbers_sidecars {
-                    // The last sidecar is attached.
+                if before < 1.0 && self.built >= 1.0 && self.numbers_form_files {
+                    // The last form file is attached.
                     self.generation += 1;
                 }
             }
@@ -2537,7 +2537,7 @@ mod tests {
             let d = self.sel.step(&input);
             if d.retire {
                 self.built = 0.0;
-                self.generation += u64::from(self.numbers_sidecars);
+                self.generation += u64::from(self.numbers_form_files);
             }
             let rec = Rec {
                 t: self.now,
@@ -3142,8 +3142,8 @@ mod tests {
     }
 
     #[test]
-    fn a_restart_with_valid_sidecars_reaches_compact_in_about_a_second() {
-        // The sidecars are on disk: the price is the attach's, the builder
+    fn a_restart_with_valid_form_files_reaches_compact_in_about_a_second() {
+        // The form files are on disk: the price is the attach's, the builder
         // has nothing to build, and the form is bought on the first rent.
         let cell = Cell::ten_million();
         let mut sim = Sim::new(cell.clone(), cell.uniform());
@@ -3614,7 +3614,7 @@ mod tests {
                 c.switches <= 3600 / DWELL_FLOOR.as_secs() + 1,
                 "{period}: {c:?}"
             );
-            // A build from nothing once for each entry: after the sidecars are
+            // A build from nothing once for each entry: after the form files are
             // retired and not before.
             let scratch = sim
                 .log
@@ -3644,7 +3644,7 @@ mod tests {
     }
 
     #[test]
-    fn e1_leaves_when_the_limit_is_lifted_and_the_sidecars_go_after_the_retention() {
+    fn e1_leaves_when_the_limit_is_lifted_and_the_form_files_go_after_the_retention() {
         let cell = Cell::ten_million();
         let mut sim = compact(&cell);
         let dwell = sim.sel.dwell();
@@ -3666,7 +3666,7 @@ mod tests {
             "{exit:?} {relax:?}"
         );
         assert_eq!(sim.last.phase, Phase::Fits);
-        // The sidecars are kept for the retention and retired once, after it.
+        // The form files are kept for the retention and retired once, after it.
         let retired: Vec<Duration> = sim.log.iter().filter(|r| r.d.retire).map(|r| r.t).collect();
         assert_eq!(retired.len(), 1);
         near(retired[0] - exit, sim.sel.retain().as_secs_f64(), 0.2);
@@ -3905,7 +3905,7 @@ mod tests {
         );
         assert!(exit - trial >= (TRIAL_LOW_INTERVALS + TRIAL_DECIDE_INTERVALS) * DT);
         assert!(exit - trial < 5 * S1_PERIOD, "{:?}", exit - trial);
-        // The form is left: the raw form serves, the sidecars are kept.
+        // The form is left: the raw form serves, the form files are kept.
         assert_eq!(
             (sim.last.phase, sim.last.gate),
             (Phase::Suspect, GATE_CENSUS)
@@ -4610,7 +4610,7 @@ mod tests {
         assert_eq!(sim.last.phase, Phase::Suspect);
         // It is a switch for the dwell, which is ten of the wall the build
         // had when it was cancelled; the back-off before a trial has doubled;
-        // the sidecars it made are kept.
+        // the form files it made are kept.
         let r = *sim.rec_at(cancel);
         near(r.dwell, 10.0 * (cancel - start).as_secs_f64(), 0.01);
         assert!(r.dwell > DWELL_FLOOR);
@@ -4865,7 +4865,7 @@ mod tests {
         sim.run_until(Phase::Suspect, 1200.0);
         let exit = sim.first(Event::Exit(Exit::E2));
         // The workload widens again and the form is bought again, from the
-        // sidecars that were kept; then it narrows once more.
+        // form files that were kept; then it narrows once more.
         sim.load = cell.uniform();
         sim.run_until(Phase::Compact, 900.0);
         assert_eq!(sim.last.phase, Phase::Compact);
@@ -5156,7 +5156,7 @@ mod tests {
         sim.cell.cache = cell.cache;
         sim.load = sim.cell.uniform();
         sim.run(dwell.as_secs_f64() + 60.0);
-        // The sidecars stood: the price was the attach's, the builder had
+        // The form files stood: the price was the attach's, the builder had
         // nothing to build, and no retirement came for them.
         let starts = sim.times(Event::BuildStart);
         assert_eq!(starts.len(), 2);
@@ -6032,7 +6032,7 @@ mod tests {
     }
 
     #[test]
-    fn sidecars_are_retired_when_the_retention_ends_to_the_step() {
+    fn form_files_are_retired_when_the_retention_ends_to_the_step() {
         let mut sel = ZSelect::new();
         sel.phase = Phase::Suspect;
         let end = Duration::from_secs(600);
@@ -6355,8 +6355,8 @@ mod tests {
     }
 
     #[test]
-    fn the_sidecars_retire_with_the_reading_that_priced_them() {
-        // A form left by E3 keeps its sidecars for the retention, and the
+    fn the_form_files_retire_with_the_reading_that_priced_them() {
+        // A form left by E3 keeps its form files for the retention, and the
         // reading taken then prices a re-entry at the attach. When they are
         // retired a build costs what a build from nothing costs, and the
         // reading that said otherwise is gone with them.
@@ -6366,7 +6366,7 @@ mod tests {
         sim.sampler_once = true;
         sim.run_until(Phase::Compact, 120.0);
         // The first reading priced a build from nothing, and the last
-        // sidecar's attach moves the partitions' identity: the reading is
+        // form file's attach moves the partitions' identity: the reading is
         // dropped.
         assert!(sim.sel.sampler.is_some());
         sim.run(5.0);
@@ -6376,7 +6376,7 @@ mod tests {
         sim.run(1.0);
         let attach = sim.sel.sampler.expect("asked for after the exit").c_build;
         assert_eq!(attach, cell.attach);
-        // The retention ends: the sidecars go, and so does the price.
+        // The retention ends: the form files go, and so does the price.
         let exit = sim.first(Event::Exit(Exit::E3));
         sim.run_with(sim.sel.retain().as_secs_f64(), |_| {});
         let retired = sim.log.iter().find(|r| r.d.retire).expect("retired").t;
@@ -6394,13 +6394,13 @@ mod tests {
     #[test]
     fn the_retire_pulse_takes_the_reading_with_it_whoever_numbers_the_partitions() {
         // A caller that does not number the partitions again when the
-        // sidecars go leaves the selector with a price for sidecars that are
+        // form files go leaves the selector with a price for form files that are
         // not there; the pulse that retires them is its reason to ask again.
         let cell = Cell::ten_million();
         let bound = cell.bound(cell.z as f64 / PAGE as f64);
         let mut sim = Sim::new(cell.clone(), cell.fixed(0.45, 0.40, bound));
         sim.sampler_once = true;
-        sim.numbers_sidecars = false;
+        sim.numbers_form_files = false;
         sim.run_until(Phase::Compact, 120.0);
         sim.run_until(Phase::Suspect, 2.0 * sim.sel.dwell().as_secs_f64());
         assert_eq!(sim.count(Event::Exit(Exit::E3)), 1);

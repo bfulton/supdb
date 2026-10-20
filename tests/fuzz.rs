@@ -218,7 +218,7 @@ fn opts(c: &Cfg) -> Options {
 
 /// The `z` store's options: the pair's, and under `ZFUZZ_ZPAGES` the
 /// compact form forced on with no size floor, so that every partition of
-/// `z` is read and scanned through a sidecar while `r` reads the raw form
+/// `z` is read and scanned through a form file while `r` reads the raw form
 /// over the same writes -- the strongest check a second read path has.
 fn opts_z(c: &Cfg) -> Options {
     let mut o = opts(c);

@@ -20,8 +20,8 @@ of the change that produced the text.
 | path | what |
 |---|---|
 | `src/db.rs` | the engine: WAL with atomic batches, memtable, sealed segments, partitioned compaction, tombstones, `Txn`, and the `SegmentWriter` every segment is written by -- `docs/engine.md` |
-| `src/db/zpages.rs` | the compact form's layout: the page, the group, the fill that packs records into pages, the fence, the trailer and the identity a sidecar is bound by, with no file, thread or clock in it -- the module's own docs, and `bench/examples/zsize.rs` for what it makes of the engine's bytes |
-| `src/db/zside.rs` | the compact form on the engine's side of the file: the builder that writes a partition's sidecar from the partition's own bytes, the attach that binds it to its segment by content, the cell a segment holds it in, and the point read and count through it, behind `Options::zpages`; scans stay on the raw form -- the module's own docs |
+| `src/db/zpages.rs` | the compact form's layout: the page, the group, the fill that packs records into pages, the fence, the trailer and the identity a form file is bound by, with no file, thread or clock in it -- the module's own docs, and `bench/examples/zsize.rs` for what it makes of the engine's bytes |
+| `src/db/zfile.rs` | the compact form's file on the engine's side: the builder that writes a partition's form file from the partition's own bytes, the attach that binds it to its segment by content, the cell a segment holds it in, and the point read, the count, the scan walk and the cursor through it, behind `Options::zpages`; the block cache's walks stay on the raw form -- the module's own docs |
 | `src/db/zselect.rs` | the compact form's selector: `ZSelect::step`, a function of its state and an explicit `Input` (no clock, thread or file), the one definition of the transitions between FITS, SUSPECT, building, COMPACT and the trial, and the replays that hold it -- the module's own docs |
 | `src/format.rs` | the on-disk format's fixed quantities, owned by no writer |
 | `src/block.rs`, `src/index.rs`, `src/flatindex.rs` | the format itself: blocks, extents, the flat key index -- `docs/index-theory.md` |
@@ -2154,7 +2154,7 @@ fuzz that draws its inputs from the whole of the type (the empty key, the
 empty value, the key of 0xff bytes) finds what a table of examples chose
 not to.
 
-**A check spelled twice, and the copy nothing reached.** The sidecar
+**A check spelled twice, and the copy nothing reached.** The form file
 reader's first decode compared a page's rank and count with its fence entry
 and walked its group in code beside `verify_page`'s, and the attach's sample
 compared them in a third place. Every damage test flips a byte and the
@@ -2162,24 +2162,24 @@ page's CRC refuses it before any later check runs, so deleting the compare,
 skipping the walk or passing no first key survived twenty-six integration
 tests and fifty-seven unit tests. The three share `check_entry` and
 `check_group` now, and the tests forge a page whose CRC is good under the
-sidecar's own binding and whose records are wrong (one short, two swapped, a
+form file's own binding and whose records are wrong (one short, two swapped, a
 first key that is not the fence's, a rank or a count the entry does not
 name). The rule: a check against what a checksum already catches is reached
 only by an input that passes the checksum, so the test makes one; and a check
 is written once.
 
-**A mapping's advice decided from a mode that moves.** A sidecar was advised
+**A mapping's advice decided from a mode that moves.** A form file was advised
 from the store's mode at the instant of its attach, so one attached after a
 scan kept the kernel's readahead for its life: 806 faults of 4 KiB where the
 other read 34 of 98 KiB, in the review's probe. Only point reads and counts
-read a sidecar, and they are random in every phase, so it is advised random
+read a form file, and they are random in every phase, so it is advised random
 once, at attach. The rule: the advice for a mapping one access pattern reads
 is decided by that pattern and not by the phase the store happens to be in,
 and the kernel's answer (the `rr` flag in `smaps`) is read, not the store's
 record of what it asked. The advice went on after the attach's own sampled
 reads for a while, and under the default advice each of the attach's own
 reads -- the trailer, the resident part, the sampled pages -- pulls a
-readahead window in around it: a 280 KB sidecar came in 67 pages of 69 at
+readahead window in around it: a 280 KB form file came in 67 pages of 69 at
 its attach, a 4 MB one 522 pages of 1,004, two megabytes of a large one
 that the reads may never want, and the warm's test read 8 KB where it was
 written to read the file. The advice goes on as the mapping opens now, 42
@@ -2190,18 +2190,18 @@ leaves resident is read from the kernel between the steps, never taken
 from the file's size.
 
 **A second mechanism that masks the first in a test.** Once the settle swept
-the directory, the test that a merge takes the sidecar of the segment it
+the directory, the test that a merge takes the form file of the segment it
 retires passed with `retire_seg`'s unlink deleted, because the sweep cleaned
 up before the assertion; two mutants survived. The test asks the directory
 after the merges land and before any settle. The rule: when two mechanisms
 can reach one end state, the test asserts at the moment only the first has
-run. It came back in the leak test as the other case: a retired sidecar is
+run. It came back in the leak test as the other case: a retired form file is
 freed by the segment's own drop when its segment retires with it, and by
 the retire list's wrapper (`RetiredZ`) when it was taken out of a live
 segment after a page failed a check, and the test written for the second
 retired only through merges, which never reach the list; a wrapper whose
 drop freed nothing passed it. The test flips a page in place under the
-mapping now, so the settle takes the sidecar out of its cell into the
+mapping now, so the settle takes the form file out of its cell into the
 list under the pin, and the handle's drop with no sweep after is what
 frees it. The corollary: a test of one of two mechanisms that free the
 same thing is held to a mutant of that mechanism, since the other frees
@@ -2218,7 +2218,7 @@ cause it.
 
 **A call site no real input reaches red.** The suite's refusals after the
 read pass and after the shuffled load were green-side only, because a real
-forced arm reads through its sidecars and the refusal is for the arm that did
+forced arm reads through its form files and the refusal is for the arm that did
 not. Each is a function of its own now, driven by a stub engine that lies,
 and the state a real arm reports is read from a store damaged and strewn for
 the purpose. The rule: if a check's red input cannot be made by the real
@@ -2350,16 +2350,16 @@ carry that keeps the structure across a replacement of the object
 re-takes every position it holds, not only the ones a form holds.
 
 **A cache a thread kept of things a store had closed.** The memo of
-decoded groups was the thread's, keyed by the sidecar's attach identity
-and the page, and a thread that read through one store's sidecars and
+decoded groups was the thread's, keyed by the form file's attach identity
+and the page, and a thread that read through one store's form files and
 closed the store kept their groups until other stores' displaced them:
 ninety kilobytes a store in `tests/leak.rs`, bounded by the cap, freed by
 nothing the store's close could reach, and invisible to the memory
 census, which counts by handle. The memo is the reader handle's now
-(`zside::ZMemo`), dropped with it and counted with it. Beside it, the
-memo's side compare -- an entry is the sidecar's identity and the page --
-is reached only when two sidecars' pages share a slot, and the test that
-said "another sidecar's page" passed with the compare deleted until it
+(`zfile::ZMemo`), dropped with it and counted with it. Beside it, the
+memo's file compare -- an entry is the form file's identity and the page --
+is reached only when two form files' pages share a slot, and the test that
+said "another form file's page" passed with the compare deleted until it
 built the collision (the slot is the page plus a multiple of the identity,
 so over eight slots sides eight apart collide). The rule: a cache that
 outlives what it caches is a leak with a cap, so a cache is owned by the
@@ -2368,7 +2368,7 @@ and a compare a hash reaches only on a collision is tested with the
 collision built, as a check behind a checksum is tested with a forged
 checksum.
 
-**A count bumped after the thing it counts began.** A sidecar's build was
+**A count bumped after the thing it counts began.** A form file's build was
 counted started after its thread was spawned, and a test that waited for
 every started build to be collected returned between the thread's first
 write and the count, and read the temp name as a build nobody had

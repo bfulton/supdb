@@ -199,25 +199,25 @@ pub struct ZState {
     /// The form is forced on (`supdb::ZPages::Always`), as the engine's own
     /// options say and not as the arm's name does.
     pub forced: bool,
-    /// Point reads of a partition answered from a sidecar, over the
+    /// Point reads of a partition answered from a form file, over the
     /// store's life.
     pub reads: u64,
     /// Reads and counts of a partition that went to the raw form instead,
-    /// over the store's life: the partition had no sidecar in service, or a
-    /// check of the sidecar failed on the read.
+    /// over the store's life: the partition had no form file in service, or a
+    /// check of the form file failed on the read.
     pub raw: u64,
-    /// The live partitions, those with a sidecar, and those with none for
+    /// The live partitions, those with a form file, and those with none for
     /// being under the floor.
     pub partitions: u64,
-    pub sidecars: u64,
+    pub form_files: u64,
     pub small: u64,
-    /// Sidecars out of service: a check failed on one of their pages, and
+    /// Form files out of service: a check failed on one of their pages, and
     /// the partition is read raw from then on.
     pub damaged: u64,
     /// What the store's directory holds of the form: files named for a
-    /// sidecar, and other files in the form's prefix (a build's temp name,
+    /// form file, and other files in the form's prefix (a build's temp name,
     /// or any name the engine's sweep would take). A forced store settled has
-    /// one file for each sidecar and no other: a file nothing claims is disk
+    /// one file for each form file and no other: a file nothing claims is disk
     /// the row's `bytes_on_disk_per_byte` counts.
     pub files: u64,
     pub stray: u64,
@@ -738,10 +738,10 @@ pub struct Supdb {
     /// `supdb-nocachezpagesnodrop` against `supdb-nocachezpages` prices the
     /// drop, which is a share of the build's elapsed time.
     zpages_nodrop: bool,
-    /// The warm of a sidecar's file after its attach off
+    /// The warm of a form file after its attach off
     /// (`Options::zpages_warm` off): the pair `supdb-nocachezpagesnowarm`
     /// against `supdb-nocachezpages` prices the warm, which a restart with
-    /// cold sidecars pays before its first read.
+    /// cold form files pays before its first read.
     zpages_nowarm: bool,
     /// The memo of decoded groups off (`Options::zpages_memo` off): the
     /// pair `supdb-nocachezpagesnomemo` against `supdb-nocachezpages`
@@ -750,7 +750,7 @@ pub struct Supdb {
     zpages_nomemo: bool,
     /// A scan's seek of a covered partition by the ordered index's heads
     /// (`Options::zpages_seek_ord` on): the pair `supdb-nocachezpagesheads`
-    /// against `supdb-nocachezpages` prices the seek by the sidecar's
+    /// against `supdb-nocachezpages` prices the seek by the form file's
     /// fence and one group against the one by the heads and the raw
     /// records.
     zpages_heads: bool,
@@ -3497,7 +3497,7 @@ impl Supdb {
     /// second form and a point read or a count of a partition answered
     /// from it (`Options::zpages` forced on): the pair against
     /// `supdb-nocache` differs by that one option and prices what the form
-    /// does for a store that does not fit. The sidecars are built at
+    /// does for a store that does not fit. The form files are built at
     /// `sync`, inside the load window, so this arm's load carries their
     /// build. Chosen by hand, as
     /// `ab --arms supdb-nocache,supdb-nocachezpages`.
@@ -3543,11 +3543,11 @@ impl Supdb {
         )
     }
 
-    /// `supdb-nocachezpages` with the warm of a sidecar's file after its
+    /// `supdb-nocachezpages` with the warm of a form file after its
     /// attach off (`Options::zpages_warm` off): the pair against
     /// `supdb-nocachezpages` differs by that one option and prices the
-    /// warm, a read of each sidecar's file once per process that a store
-    /// opened on cold sidecars pays at its settle. Chosen by hand, as
+    /// warm, a read of each form file once per process that a store
+    /// opened on cold form files pays at its settle. Chosen by hand, as
     /// `ab --arms supdb-nocachezpages,supdb-nocachezpagesnowarm`, with a
     /// read pass after the load and the bound set, where the warm is what
     /// stands between the first reads and a cold file.
@@ -3584,7 +3584,7 @@ impl Supdb {
     /// `supdb-nocachezpages` with a scan's seek of a covered partition by
     /// the ordered index's heads (`Options::zpages_seek_ord` on): the pair
     /// against `supdb-nocachezpages` differs by that one option and prices
-    /// the seek by the sidecar's fence and one group, which touches no raw
+    /// the seek by the form file's fence and one group, which touches no raw
     /// page, against the seek by the heads and a key read of the raw
     /// records at each probe. Chosen by hand, as
     /// `ab --arms supdb-nocachezpages,supdb-nocachezpagesheads`, on the
@@ -5031,7 +5031,7 @@ impl Engine for Supdb {
             ("zpage_rejected_identity", z.rejected_identity as f64),
             ("zpage_swept", z.swept as f64),
             ("zpage_partitions_at_end", z.partitions as f64),
-            ("zpage_sidecars_at_end", z.sidecars as f64),
+            ("zpage_form files_at_end", z.form_files as f64),
             ("zpage_small_partitions_at_end", z.small_partitions as f64),
             ("zpage_damaged_at_end", z.damaged as f64),
             ("zpage_pages_at_end", z.pages as f64),
@@ -5071,7 +5071,7 @@ impl Engine for Supdb {
             reads: c.reads,
             raw: c.rawserves + c.fallbacks,
             partitions: c.partitions,
-            sidecars: c.sidecars,
+            form_files: c.form_files,
             small: c.small_partitions,
             damaged: c.damaged,
             files,
@@ -5109,7 +5109,7 @@ impl Engine for Supdb {
             }
             // The second form, forced: a flush is answered before the
             // segment work's later steps, and the arm would read the raw
-            // form of every partition without the sidecars this waits for.
+            // form of every partition without the form files this waits for.
             // Their build is in the load window, and so is the arm's.
             if self.zpages {
                 db.zpages_settle().map_err(|e| e.to_string())?;
@@ -6290,7 +6290,7 @@ mod tests {
     /// a partition is left raw included (`CLAUDE.md`: an arm that keeps an
     /// old shape keeps that shape's other settings with it). And the form
     /// is used: the same keys written and read through each, the arm's
-    /// partition is given its sidecar by its `sync` and its reads are
+    /// partition is given its form file by its `sync` and its reads are
     /// answered from it, the base's are not, for the writer's own handle
     /// and for the handles a threaded pass hands its threads, whose counts
     /// are in the store's after they are dropped.
@@ -6395,15 +6395,15 @@ mod tests {
         let (az, bz) = (arm.zpages_state().unwrap(), base.zpages_state().unwrap());
         assert!(az.forced && !bz.forced, "{az:?} {bz:?}");
         assert!(
-            az.partitions >= 1 && az.sidecars == az.partitions && az.small == 0,
-            "every partition has its sidecar when the sync returns: {az:?}"
+            az.partitions >= 1 && az.form_files == az.partitions && az.small == 0,
+            "every partition has its form file when the sync returns: {az:?}"
         );
-        assert_eq!((bz.sidecars, bz.small), (0, 0), "{bz:?}");
-        // The directory holds the sidecars' files and no other file of the
+        assert_eq!((bz.form_files, bz.small), (0, 0), "{bz:?}");
+        // The directory holds the form files and no other file of the
         // form, which is what a pass asks of it.
-        assert_eq!((az.files, az.stray), (az.sidecars, 0), "{az:?}");
+        assert_eq!((az.files, az.stray), (az.form_files, 0), "{az:?}");
         assert_eq!((bz.files, bz.stray), (0, 0), "{bz:?}");
-        // And the count sees a file that is not a live sidecar's, of either
+        // And the count sees a file that is not a live form file's, of either
         // kind: a whole one nobody claims, and a build's temp name.
         let (whole, temp) = (
             arm.path.join("zpg-00000999-0000000000000999.zpg"),
@@ -6445,17 +6445,17 @@ mod tests {
         assert_eq!(count(&arm, "zpage_rawserves"), 0.0, "none left raw");
         assert_eq!(count(&arm, "zpage_fallbacks"), 0.0, "none refused");
         assert_eq!(count(&arm, "zpage_forced"), 1.0);
-        assert_eq!(count(&arm, "zpage_sidecars_at_end"), az.sidecars as f64);
+        assert_eq!(count(&arm, "zpage_form files_at_end"), az.form_files as f64);
         assert_eq!(count(&base, "zpage_forced"), 0.0);
         for name in [
             "zpage_reads",
             "zpage_rawserves",
             "zpage_builds",
-            "zpage_sidecars_at_end",
+            "zpage_form files_at_end",
         ] {
             assert_eq!(count(&base, name), 0.0, "the default's path: {name}");
         }
-        assert_eq!(count(&arm, "zpage_builds"), az.sidecars as f64);
+        assert_eq!(count(&arm, "zpage_builds"), az.form_files as f64);
 
         // The handles a threaded pass hands its threads count on their
         // slots, which a handle's drop leaves where they are: the counters
@@ -6470,7 +6470,7 @@ mod tests {
         }
         assert_eq!(count(&arm, "zpage_reads"), served + handle_reads);
         assert_eq!(count(&base, "zpage_reads"), 0.0);
-        // A scan's walk of the partition is served by its sidecar, and
+        // A scan's walk of the partition is served by its form file, and
         // counted as such; the base's is nobody's to count.
         assert_eq!(arm.range(&keys[0], 10).unwrap(), 10 * value.len());
         assert_eq!(count(&arm, "zpage_scans"), 1.0);
@@ -6488,14 +6488,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// What the arm's state says of a store whose sidecar a check refused: the
+    /// What the arm's state says of a store whose form file a check refused: the
     /// refusal that reads it is tested on states it is handed, and this is
-    /// the state a real engine hands it. A page of a sidecar is damaged
+    /// the state a real engine hands it. A page of a form file is damaged
     /// before anything reads it; the read that meets it falls back to the raw
     /// form and answers right, and the state counts that read as raw and the
-    /// sidecar as out of service, then the reads after it as raw too.
+    /// form file as out of service, then the reads after it as raw too.
     #[test]
-    fn the_arms_state_says_what_a_damaged_sidecar_did() {
+    fn the_arms_state_says_what_a_damaged_form_file_did() {
         let root =
             std::env::temp_dir().join(format!("supdb-bench-zdamaged-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -6515,9 +6515,9 @@ mod tests {
         }
         arm.sync().unwrap();
         let whole = arm.zpages_state().unwrap();
-        assert!(whole.sidecars >= 1 && whole.sidecars == whole.partitions);
+        assert!(whole.form_files >= 1 && whole.form_files == whole.partitions);
         assert_eq!((whole.damaged, whole.raw), (0, 0), "{whole:?}");
-        // The first page of every sidecar, one byte changed under the file
+        // The first page of every form file, one byte changed under the file
         // the store holds mapped: the page's CRC no longer holds, and no
         // read has verified it yet.
         let mut changed = 0;
@@ -6530,13 +6530,13 @@ mod tests {
                 changed += 1;
             }
         }
-        assert_eq!(changed, whole.sidecars);
+        assert_eq!(changed, whole.form_files);
         // The read is answered, from the raw form, and counted as that.
         assert_eq!(arm.get(&keys[0]).unwrap(), value.len());
         let hurt = arm.zpages_state().unwrap();
         assert_eq!((hurt.damaged, hurt.raw), (1, 1), "{hurt:?}");
         assert_eq!(hurt.reads, whole.reads, "no read was served by the form");
-        // The sidecar is out of service from then on: the next read of the
+        // The form file is out of service from then on: the next read of the
         // partition is raw too, without a check failing again.
         assert_eq!(arm.get(&keys[1]).unwrap(), value.len());
         let after = arm.zpages_state().unwrap();
@@ -6549,7 +6549,7 @@ mod tests {
     /// `supdb-nocachezpagesnomemo`, `supdb-nocachezpagesheads`,
     /// `supdb-nocachezpagesprefetch` and `supdb-nocachezpagesrankwalk` are
     /// each `supdb-nocachezpages` with one option moved -- the warm of a
-    /// sidecar's file after its attach off, every build left to the settle,
+    /// form file after its attach off, every build left to the settle,
     /// the memo of decoded groups off, the seeks by the ordered index's
     /// heads, a scan's prefetch of its pages on, the overlay walk cut by
     /// rank -- and nothing else: named, durable like it, opened
