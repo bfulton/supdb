@@ -4748,3 +4748,249 @@ fn the_z_reader_agrees_with_the_blob_on_every_scan_window() {
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- the controller (stage 4) ---------------------------------------------
+
+/// A store that fits in memory under `ZPages::Auto`: the model says the raw
+/// form fits, so the rung stays FITS, the gate stays at the raw form, no
+/// form file is built or attached, no thread beyond the segment work's is
+/// spawned for it, and the directory is a store under `Off`'s, file for
+/// file; and every read and scan answers the model.
+#[test]
+fn an_auto_store_that_fits_builds_nothing() {
+    let files_of = |dir: &Path| -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.starts_with("wal-"))
+            .collect();
+        v.sort();
+        v
+    };
+    let mut dirs = Vec::new();
+    let mut listings = Vec::new();
+    for (name, mode) in [("auto-fits", ZPages::Auto), ("auto-fits-off", ZPages::Off)] {
+        let dir = scratch(name);
+        let mut db = Db::create(
+            &dir,
+            Options {
+                zpages: mode,
+                zpages_min_bytes: 0,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let model = ordered_load(&mut db, 20_000, 0x4A7);
+        db.settle().unwrap();
+        // The controller's tick runs every hundred milliseconds and reads
+        // the model once a second: wait out a few of each.
+        std::thread::sleep(std::time::Duration::from_millis(2300));
+        let keys: Vec<Vec<u8>> = model.keys().step_by(7).cloned().collect();
+        check(&db, &model, &keys, name);
+        check_scan(&db, &model, name);
+        let c = db.zpage_counts();
+        assert_eq!(
+            c.builds + c.attached + c.form_files + c.reads + c.scans,
+            0,
+            "{name}: {c:?}"
+        );
+        assert_eq!(
+            (c.gate, c.phase),
+            (0, 0),
+            "{name}: FITS and the raw gate: {c:?}"
+        );
+        assert_eq!(c.auto_inert, 0, "{name}: the controller runs: {c:?}");
+        if mode == ZPages::Auto {
+            assert!(
+                c.sel_steps >= 10 && c.sel_s1 >= 2,
+                "{name}: the tick ran: {c:?}"
+            );
+        } else {
+            assert_eq!(c.sel_steps, 0, "{name}: no tick under Off: {c:?}");
+        }
+        assert_eq!(c.build_starts, 0, "{name}: no build thread started: {c:?}");
+        assert!(form_files(&dir).is_empty(), "{name}: no form file");
+        db.close().unwrap();
+        listings.push(files_of(&dir));
+        dirs.push(dir);
+    }
+    assert_eq!(
+        listings[0], listings[1],
+        "the directories are the same, file for file"
+    );
+    for d in dirs {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// `Auto` where the controller cannot run opens and is inert, counted;
+/// `Always` beside an unpinned writer is refused, as before.
+#[test]
+fn auto_degrades_where_it_cannot_run_and_always_is_refused_beside_an_unpinned_writer() {
+    for (name, extra) in [
+        (
+            "auto-inline",
+            &(|o: &mut Options| o.publish_in_background = false) as &dyn Fn(&mut Options),
+        ),
+        ("auto-nopin", &|o: &mut Options| {
+            o.writer_pins = false;
+            o.publish_in_background = false;
+        }),
+    ] {
+        let dir = scratch(name);
+        let mut o = Options {
+            zpages: ZPages::Auto,
+            zpages_min_bytes: 0,
+            ..Options::default()
+        };
+        extra(&mut o);
+        let mut db = Db::create(&dir, o).unwrap();
+        let model = ordered_load(&mut db, 3000, 0x1B);
+        db.settle().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let keys: Vec<Vec<u8>> = model.keys().step_by(5).cloned().collect();
+        check(&db, &model, &keys, name);
+        let c = db.zpage_counts();
+        assert_eq!(c.auto_inert, 1, "{name}: {c:?}");
+        assert_eq!(
+            (c.gate, c.sel_steps, c.builds, c.reads),
+            (0, 0, 0, 0),
+            "{name}: {c:?}"
+        );
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    let dir = scratch("always-nopin");
+    let r = Db::create(
+        &dir,
+        Options {
+            zpages: ZPages::Always,
+            writer_pins: false,
+            publish_in_background: false,
+            ..Options::default()
+        },
+    );
+    assert!(r.is_err(), "Always beside an unpinned writer is refused");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The model moves the rung: a budget injected under the partitions'
+/// footprint takes FITS to SUSPECT on the second model tick, with the gate
+/// at the census, and a budget over it takes SUSPECT back to FITS on the
+/// fifth; the ticks are the injected clock's, and the reads stay the raw
+/// form's throughout, since nothing is built.
+#[test]
+fn the_model_moves_the_rung_between_fits_and_suspect_on_the_injected_budget() {
+    let dir = scratch("auto-model");
+    let inject = std::sync::Arc::new(supdb::ZInject::new());
+    inject.set_budget(1 << 20);
+    inject.set_refault_rate(0.0);
+    inject.advance(std::time::Duration::from_millis(1));
+    let mut db = Db::create(
+        &dir,
+        Options {
+            zpages: ZPages::Auto,
+            zpages_min_bytes: 0,
+            zpages_inject: Some(inject.clone()),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let model = ordered_load(&mut db, 20_000, 0x4A8);
+    db.settle().unwrap();
+    let c = db.zpage_counts();
+    assert!(c.partitions >= 1, "{c:?}");
+    // One second of the injected clock a step, and the tick's own turn to
+    // see it: the first model reading is the first hot tick, the second
+    // moves the rung.
+    let tick = |db: &Db, secs: u64| {
+        for _ in 0..secs {
+            inject.advance(std::time::Duration::from_secs(1));
+            let was = db.zpage_counts().sel_s1;
+            let t = std::time::Instant::now();
+            while db.zpage_counts().sel_s1 == was && t.elapsed().as_secs() < 5 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(db.zpage_counts().sel_s1 > was, "the tick read the model");
+        }
+    };
+    tick(&db, 2);
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.phase, c.gate),
+        (1, 1),
+        "SUSPECT on the second hot tick: {c:?}"
+    );
+    let keys: Vec<Vec<u8>> = model.keys().step_by(9).cloned().collect();
+    check(&db, &model, &keys, "suspect");
+    check_scan(&db, &model, "suspect");
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.reads, c.scans, c.builds, c.form_files),
+        (0, 0, 0, 0),
+        "raw throughout: {c:?}"
+    );
+    // The budget lifted: five calm ticks relax the rung.
+    inject.set_budget(1 << 40);
+    tick(&db, 5);
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.phase, c.gate),
+        (0, 0),
+        "FITS after five calm ticks: {c:?}"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The gate decides the form an attached cell serves: a store under
+/// `Always` with its form files attached is read raw once the gate is set
+/// to the raw form by hand, as the controller's trial reads it, with no
+/// read, scan or raw serve counted through the form, and through the form
+/// again once the gate is set back; every answer the model's.
+#[test]
+fn the_gate_decides_the_form_an_attached_cell_serves() {
+    let dir = scratch("gate");
+    let mut db = Db::create(&dir, forced(|o| o.inline_bytes = 1 << 16)).unwrap();
+    let model = ordered_load(&mut db, 9000, 0x6A7);
+    db.zpages_settle().unwrap();
+    let c0 = db.zpage_counts();
+    assert!(
+        c0.form_files >= 1 && c0.form_files == c0.partitions,
+        "{c0:?}"
+    );
+    assert_eq!(c0.gate, 2, "{c0:?}");
+    let keys: Vec<Vec<u8>> = model.keys().step_by(11).cloned().collect();
+    let r = db.reader().unwrap();
+    let w: &Reader = &db;
+    for (gate, served) in [(1u8, false), (0, false), (2, true)] {
+        db.zgate_set(gate);
+        let before = db.zpage_counts();
+        for who in [w, &r] {
+            check(who, &model, &keys, &format!("gate {gate}"));
+            check_scan(who, &model, &format!("gate {gate}"));
+        }
+        let after = db.zpage_counts();
+        let through = (after.reads
+            + after.counts
+            + after.scans
+            + after.rawserves
+            + after.raw_scans)
+            - (before.reads + before.counts + before.scans + before.rawserves + before.raw_scans);
+        if served {
+            assert!(
+                after.reads > before.reads && after.scans > before.scans,
+                "{after:?}"
+            );
+        } else {
+            assert_eq!(
+                through, 0,
+                "gate {gate}: nothing counted through the form: {after:?}"
+            );
+        }
+    }
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

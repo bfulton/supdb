@@ -123,6 +123,47 @@ controller reads right.
 
 ## Where it stands
 
-Not started. The rename of the form's file from "sidecar" to "form file"
-(`ZFile`, `zfile.rs`, `form_files`, the counters, the docs and the notes)
-went in first so the controller is written in the right vocabulary.
+The rename of the form's file from "sidecar" to "form file" (`ZFile`,
+`zfile.rs`, `form_files`, the counters, the docs and the notes) went in
+first so the controller is written in the right vocabulary.
+
+Piece 1 is in: `ZPages::Auto` (the default stays `Off`); `Shared.zgate`
+(`ZGate`, one aligned word, pinned by `Off` and `Always`, moved by the
+tick) and `Reader::z_on`, asked first by every dispatch to the form --
+`part_read_z`, `part_count_z`, `part_scan_z`, `part_seek_z`,
+`part_cut_z`, `part_values_z`, `pwalk_at`, `pwalk_seek` and the overlay
+walk's cursor branch -- so a cell under the raw gate is served raw and
+counted nothing; `z_auto_inert` (the segment work without a thread, an
+unpinned writer, not Linux) and `ZCounts::auto_inert`; the platform's
+reading (`zfile::read_budget`: v1's group through `/proc/self/cgroup`
+and `/proc/mounts` and its `memory.stat`, else v2's least limit over the
+path, else `MemTotal` and `RssAnon`; `Budget::of` with the margin) with
+the parsers pure in `zselect` and their texts tested, this host's hybrid
+shape among them; `Seg::foot`; `Maint::z_tick` every census interval
+with the model every S1 period, `z_model`, `z_apply` (the gate stored
+last after the phase and the counts; `SUPDB_ZPAGES_TRACE=1` a line a
+model reading or event); `ZInject` (`Options::zpages_inject`: the
+budget, the refault rate, the clock); the gate, the phase, `auto_inert`
+and the selector's counts in `ZCounts` and the `zpage_*` rows; `Db::zgate_set`
+for a test. Tests: `an_auto_store_that_fits_builds_nothing` (gate 0,
+FITS, no build started, no form file, the directory `Off`'s file for
+file, the tick counted), the degrade test (inline, unpinned: inert and
+counted; `Always` unpinned refused), the model moving the rung through
+the injected budget and clock (SUSPECT on the second hot tick with the
+gate at the census and every read raw; FITS after five calm ticks), and
+the gate deciding the form an attached cell serves (a store under
+`Always`, the gate set to 1 and 0 by hand: nothing counted through the
+form; back at 2: served). Two mutants held to firing: the point read
+ignoring the gate, and the tick never running. Two things learned on the
+way: the selector's purity test (no clock, thread, file or engine type
+in `zselect.rs`) refused the platform's reading and the seam, which is
+right -- the pure parsers stay and the reads live beside the file they
+are for; and a test that counted the process's threads for a build
+thread read other tests' stores in the same binary, so it counts the
+store's own `build_starts`. The in-memory price, counted by callgrind
+over twenty thousand gets of a ten-thousand-key store under `Off`
+(`bench/examples/read_only.rs` built from the commit before and after,
+the toggle on `supdb_bench::engines::supdb_get`, the exact name):
+16,609,943 instructions against 16,609,938, 830 a get both ways; the
+gate's load stands where the cell's load stood, so the design's three
+instructions are none.

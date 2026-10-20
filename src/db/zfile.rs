@@ -1972,6 +1972,17 @@ pub(super) struct ZEvents {
     /// which check refused it, and a test that breaks a field wants to see
     /// that it was the check for the field.
     pub last_reject: std::sync::Mutex<String>,
+    /// The controller's (`ZPages::Auto`, `zselect`), published by the
+    /// segment work's tick for whoever asks: the phase (`Phase::code`),
+    /// whether the handles run the census, and the selector's counts --
+    /// steps, model ticks, switches, trials and trials that came back.
+    pub phase: AtomicU64,
+    pub census: AtomicU64,
+    pub sel_steps: AtomicU64,
+    pub sel_s1: AtomicU64,
+    pub sel_switches: AtomicU64,
+    pub sel_trials: AtomicU64,
+    pub sel_trials_back: AtomicU64,
 }
 
 impl ZEvents {
@@ -2618,9 +2629,184 @@ fn write_pages(
     }))
 }
 
+// ---- the controller's platform side ---------------------------------------
+
+use super::zselect::{
+    parse_cgroup_v1_path, parse_cgroup_v2_path, parse_limit, parse_meminfo_total, parse_mount,
+    parse_stat_v1, parse_stat_v2, parse_status_rss_anon, Budget, V1_NO_LIMIT,
+};
+use std::time::Duration;
+
+/// A test's seam for the quantities the controller reads from the platform
+/// (`Options::zpages_inject`), one per store and never a process-wide
+/// static, since a test binary runs many stores as threads of one process:
+/// the cache budget in place of the group's, the group's refault rate, and
+/// the clock the tick reads, which a test advances so that a dwell of
+/// minutes replays in milliseconds. A field left at its sentinel is read
+/// from the platform.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct ZInject {
+    /// The budget `B`, bytes; 0 for the platform's.
+    pub budget: AtomicU64,
+    /// The group's refaults a second, as the bits of an `f64`; `u64::MAX`
+    /// for the platform's.
+    pub refault_rate: AtomicU64,
+    /// The clock, nanoseconds since the store's epoch; 0 for the monotonic
+    /// clock.
+    pub clock_ns: AtomicU64,
+}
+
+impl Default for ZInject {
+    fn default() -> ZInject {
+        ZInject {
+            budget: AtomicU64::new(0),
+            refault_rate: AtomicU64::new(u64::MAX),
+            clock_ns: AtomicU64::new(0),
+        }
+    }
+}
+
+impl ZInject {
+    pub fn new() -> ZInject {
+        ZInject::default()
+    }
+
+    /// The budget the tick reads, in place of the platform's.
+    pub fn set_budget(&self, bytes: u64) {
+        self.budget.store(bytes, Ordering::Release);
+    }
+
+    /// The refault rate the tick reads, in place of the platform's.
+    pub fn set_refault_rate(&self, per_s: f64) {
+        self.refault_rate.store(per_s.to_bits(), Ordering::Release);
+    }
+
+    /// The injected clock moved on by `d`; from the first call the tick
+    /// reads this clock and not the monotonic one.
+    pub fn advance(&self, d: Duration) {
+        let ns = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX).max(1);
+        self.clock_ns.fetch_add(ns, Ordering::AcqRel);
+    }
+
+    /// The injected budget, if one is set.
+    pub fn budget(&self) -> Option<u64> {
+        match self.budget.load(Ordering::Acquire) {
+            0 => None,
+            b => Some(b),
+        }
+    }
+
+    /// The injected refault rate, if one is set.
+    pub fn refault_rate(&self) -> Option<f64> {
+        match self.refault_rate.load(Ordering::Acquire) {
+            u64::MAX => None,
+            bits => Some(f64::from_bits(bits)),
+        }
+    }
+
+    /// The injected clock, if a test has moved it.
+    pub fn clock(&self) -> Option<Duration> {
+        match self.clock_ns.load(Ordering::Acquire) {
+            0 => None,
+            ns => Some(Duration::from_nanos(ns)),
+        }
+    }
+}
+
+/// The platform's reading: the v1 memory controller's group where the
+/// process has one (this host is a hybrid whose v1 line wins), else the
+/// unified hierarchy's group with the least of `memory.max` and
+/// `memory.high` over the path to its mount, else the machine's total and
+/// the process's own anonymous memory; and `None` where even `/proc/meminfo`
+/// cannot be read. Off Linux there is no reading.
+#[cfg(target_os = "linux")]
+pub fn read_budget() -> Option<Budget> {
+    let read = |p: &Path| std::fs::read_to_string(p).ok();
+    let total = parse_meminfo_total(&read(Path::new("/proc/meminfo"))?)?;
+    let cg = read(Path::new("/proc/self/cgroup")).unwrap_or_default();
+    let mounts = read(Path::new("/proc/mounts")).unwrap_or_default();
+    if let Some(path) = parse_cgroup_v1_path(&cg) {
+        if let Some(mount) = parse_mount(&mounts, "cgroup") {
+            let dir = Path::new(&mount).join(path.trim_start_matches('/'));
+            if let Some(st) = read(&dir.join("memory.stat")).map(|t| parse_stat_v1(&t)) {
+                let limit = st
+                    .limit
+                    .filter(|l| *l < V1_NO_LIMIT)
+                    .unwrap_or(total)
+                    .min(total);
+                return Some(Budget::of(
+                    limit,
+                    st.rss.saturating_add(st.rss_huge),
+                    st.refaults,
+                ));
+            }
+        }
+    }
+    if let Some(path) = parse_cgroup_v2_path(&cg) {
+        if let Some(mount) = parse_mount(&mounts, "cgroup2") {
+            let mount = Path::new(&mount);
+            let leaf = mount.join(path.trim_start_matches('/'));
+            if let Some(st) = read(&leaf.join("memory.stat")).map(|t| parse_stat_v2(&t)) {
+                let mut limit = total;
+                let mut dir = leaf.as_path();
+                loop {
+                    for f in ["memory.max", "memory.high"] {
+                        if let Some(l) = read(&dir.join(f)).and_then(|t| parse_limit(&t)) {
+                            limit = limit.min(l);
+                        }
+                    }
+                    if dir == mount {
+                        break;
+                    }
+                    match dir.parent() {
+                        Some(p) if p.starts_with(mount) => dir = p,
+                        _ => break,
+                    }
+                }
+                return Some(Budget::of(limit, st.anon, st.refaults));
+            }
+        }
+    }
+    let anon = read(Path::new("/proc/self/status"))
+        .and_then(|t| parse_status_rss_anon(&t))
+        .unwrap_or(0);
+    Some(Budget::of(total, anon, None))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn read_budget() -> Option<Budget> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_platform_gives_a_reading_on_this_host() {
+        let b = read_budget().expect("linux reads /proc/meminfo at least");
+        assert!(b.limit > 0 && b.budget < b.limit, "{b:?}");
+        assert!(b.anon < b.limit, "{b:?}");
+    }
+
+    #[test]
+    fn the_injection_seam_reads_as_the_platform_until_set() {
+        let i = ZInject::new();
+        assert_eq!(
+            (i.budget(), i.refault_rate(), i.clock()),
+            (None, None, None)
+        );
+        i.set_budget(5);
+        i.set_refault_rate(0.0);
+        i.advance(Duration::from_millis(1500));
+        assert_eq!(i.budget(), Some(5));
+        assert_eq!(i.refault_rate(), Some(0.0));
+        assert_eq!(i.clock(), Some(Duration::from_millis(1500)));
+        i.advance(Duration::from_secs(1));
+        assert_eq!(i.clock(), Some(Duration::from_millis(2500)));
+    }
     use crate::db::zpages::ZHDR;
     use crate::db::{SegmentOptions, SegmentWriter};
     use std::os::unix::fs::FileExt;
