@@ -365,5 +365,24 @@ opened under `Auto` (2 a rep), the selector's steps (15 at a hundred
 thousand keys, 45-47 at three hundred thousand, one a census interval),
 its S1 evaluations (3 and 6, one a second) and the thread count it saw
 (2). In memory the controller costs nothing the pairs resolve and builds
-nothing, which is what 7.5 asked; the quick row's deterministic
-quantities and the bounded rung (7.4) are the sittings after it.
+nothing, which is what 7.5 asked. The quick ladder for the controller's
+arm beside its base (`bench run --scale quick --arms
+supdb,supdb-autozpages`, the row kept as `quick-auto-5df834c.json` and
+not banked: the quick roster is the twelve shipping arms and the
+comparators, and the controller's arms are the bounded roster's) reads
+the eight quantities a load fixes -- bytes on disk and device bytes per
+byte at the four rungs -- identical to four decimals; a `run` row
+carries no `zpage_*` counters, those are the pairing's, and the thread
+spans the suite prints are the harness's own threads, so the
+controller's threads are read off its counters, no sampler and no build
+started. 7.5 holds. The quick row of 5df834c itself, banked, ran on a
+host out of band (its memory floor at half the window's), so its rates
+have no verdict, and it flagged the load's device bytes per byte for
+every supdb arm at every rung as better than every prior row of its
+class: the window was this host's seven rows from before October 11,
+the quantity had read the same in the eleven rows since on another
+host, a bisect by the deterministic quantity named the streamed ordered
+load (61b7240, October 6), and the device's counter read a cut of two
+fifths where the suite's count read three and a half percent
+(`devbytes-*.txt`; `bench/CLAUDE.md`). The bounded rung (7.4) is the
+sitting after it.

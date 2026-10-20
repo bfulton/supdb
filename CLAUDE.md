@@ -256,7 +256,12 @@ time per folio: a one-megabyte write makes a one-megabyte folio, and a
 patch of a hundred bytes made in place after the folio was written
 back counts a megabyte again while the device writes a page. Read the
 device's own counter in `/sys/block/vda/stat` beside it before calling
-such a move a cost. And an inode freed is a device round trip here: the
+such a move a cost, or a win: the streamed ordered load moved the
+load's `write_bytes` by three and a half percent at ten thousand keys,
+which the quick gate flagged a fortnight later as better than every row
+of its class, and the device's counter around the same loads read 4.4 MB
+a load against 7.6 before it, two fifths fewer, since the count sees
+neither the journal nor a page written back twice. And an inode freed is a device round trip here: the
 filesystem discards freed blocks, so a rename over an existing file, an
 unlink or a truncate costs 1.2-1.4 ms for a file of one block and 20 ms
 for one of forty megabytes, where writing and fsyncing a new file costs

@@ -131,6 +131,25 @@ one that cries regression. The evidence for the second case is the
 comparators on independent hosts across several rows, never one row's
 floors.
 
+**A window keyed on the host hides a move that lands with a host
+change.** The class carries the CPU model's string as the hypervisor
+reports it, and the same fleet reports a Xeon as `Intel(R) Xeon(R)
+Processor @ 2.10GHz` on one host and `Intel(R) Xeon(R) Processor` on
+another with twice the L3. A quick row on the first, after eleven rows
+on the second, was gated against the seven rows of its own class from a
+fortnight before, and flagged the load's device bytes per byte as better
+than every one of them at every rung -- a quantity that had read the
+same in all eleven rows of the other class, since the engine change that
+moved it (the streamed ordered load, 61b7240) landed the day before the
+fleet moved, and the first row of the new class had no priors to gate it
+against. A bisect by the deterministic quantity, one rep a commit, named
+it in five builds, and the device's own counter said what the count had
+not: two fifths fewer bytes a load where the count read three and a half
+percent (`CLAUDE.md`, profiling). The rule: a deterministic quantity
+flagged against a short window is read across every class the series
+has before it is read as new, and a move that lands on the day the
+class changes is gated by nobody, so it is looked for there.
+
 The gate does that reading itself now, from two controls the row carries.
 The comparators are the exact one: their code is untouchable by an engine
 change, so one below its own window withholds the arms' verdict in that

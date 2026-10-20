@@ -1,0 +1,9 @@
+27 commits between a466e59 and db6fe5c
+  28522fe Convert a dense form from its own deltas, and give the row its counter: 1.3489 (61s)
+  8b2a42f Cut the settle's instructions a write: one chain walk, word compares, : 1.3983 (61s)
+  a97ef2c Convert dense forms through a burst while the upkeep thread has slack: 1.3489 (60s)
+  4feec4d Record the buffered lag points' decomposition and the settle's instruc: 1.3983 (58s)
+  61b7240 Stream the ordered load: facts from the writer, a helper that syncs an: 1.3489 (58s)
+first commit with the new reading: 61b7240 Stream the ordered load: facts from the writer, a helper that syncs and hashes behind it
+last commit with the old reading:  4feec4d Record the buffered lag points' decomposition and the settle's instruction budget
+back on claude/recover-consolidate-branches-5rwvr5 5df834c suite rebuilt
