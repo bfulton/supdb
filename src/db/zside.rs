@@ -191,6 +191,9 @@ pub(super) struct ZScan {
     pub seen: usize,
     pub decoded: u64,
     pub nopage: u64,
+    /// Whether the walk asked for the pages after its first at once
+    /// (`Options::zpages_scan_prefetch`).
+    pub prefetches: u64,
     pub end: ScanEnd,
 }
 
@@ -671,6 +674,10 @@ fn put_buf(b: GroupBuf) {
     ZBUF.with(|c| c.set(Some(b)));
 }
 
+/// The pages a scan asks for ahead of its walk at most
+/// (`Options::zpages_scan_prefetch`).
+const ZPREFETCH_PAGES: usize = 16;
+
 /// The memo's slots, its cap on the decoded bytes it holds, and the
 /// displaced buffers it keeps for the next decodes, a handle.
 pub(super) const ZMEMO_SLOTS: usize = 1024;
@@ -901,9 +908,12 @@ pub(super) struct ZSide {
     id: u64,
     /// The trailer this attach accepted.
     ident: Trailer,
-    /// Whether compressed pages are opened through the thread's memo
+    /// Whether compressed pages are opened through the handle's memo
     /// (`Options::zpages_memo`).
     memo: bool,
+    /// Whether a scan asks for the pages it will cross after its first
+    /// (`Options::zpages_scan_prefetch`).
+    prefetch: bool,
     /// A test's: the file's bytes in a buffer of the test's own, read in
     /// place of the mapping from `skew` bytes in, so that a page can sit at
     /// an address a mapping never gives it.
@@ -943,6 +953,7 @@ impl ZSide {
         end_seq: u64,
         advise: bool,
         memo: bool,
+        prefetch: bool,
     ) -> std::result::Result<ZSide, Reject> {
         let damage = |e: ZError| Reject::Damage(e.to_string());
         let map = match MmapBytes::open(path) {
@@ -1014,6 +1025,7 @@ impl ZSide {
             id: NEXT_ZSIDE_ID.fetch_add(1, Ordering::Relaxed),
             ident: t,
             memo,
+            prefetch,
             #[cfg(test)]
             skewed: None,
         };
@@ -1354,6 +1366,7 @@ impl ZSide {
             seen: 0,
             decoded: 0,
             nopage: 0,
+            prefetches: 0,
             end: ScanEnd::Served,
         };
         if self.damaged.load(Ordering::Relaxed) {
@@ -1381,6 +1394,7 @@ impl ZSide {
     ) -> Result<()> {
         let nkeys = self.nkeys;
         let mut rank = from;
+        let mut asked = false;
         while out.seen < limit && rank < nkeys {
             // The entry the rank falls in, and how far its records go: a
             // fence that does not cover the rank is damage, since the
@@ -1424,6 +1438,27 @@ impl ZSide {
             let group = opened.bytes();
             if decoded {
                 out.decoded += 1;
+            }
+            // The pages the walk will cross after this one, asked for at
+            // once (3.5, `Options::zpages_scan_prefetch`): the keys still
+            // wanted past this entry over the mean records a page, at most
+            // `ZPREFETCH_PAGES`, at the first page the walk opens and never
+            // again. `MADV_WILLNEED` reads them in the background; a page
+            // the walk never reaches was a read the device made for
+            // nothing, which is the bound's reason.
+            if self.prefetch && !asked {
+                asked = true;
+                let past = (limit - out.seen).saturating_sub(end - rank);
+                let mean = (nkeys / self.n_pages.max(1)).max(1);
+                let k = past
+                    .div_ceil(mean)
+                    .min(ZPREFETCH_PAGES)
+                    .min(self.n_pages.saturating_sub(p + 1));
+                if past > 0 && k > 0 {
+                    self.map
+                        .advise_willneed(((p + 1) * ZPAGE) as u64, k * ZPAGE);
+                    out.prefetches += 1;
+                }
             }
             // The skip to the record the rank names, then each record from
             // there: a record that does not parse is a group the checks let
@@ -2618,7 +2653,17 @@ mod tests {
         }
 
         fn attach(&self) -> std::result::Result<ZSide, Reject> {
-            ZSide::attach(&self.out, &self.blob, ID, END, false, true)
+            ZSide::attach(&self.out, &self.blob, ID, END, false, true, false)
+        }
+
+        /// Attached with the advice, the memo and the scan's prefetch as given.
+        fn attach_opts(
+            &self,
+            advise: bool,
+            memo: bool,
+            prefetch: bool,
+        ) -> std::result::Result<ZSide, Reject> {
+            ZSide::attach(&self.out, &self.blob, ID, END, advise, memo, prefetch)
         }
 
         /// Attached with the memo off: for a test of the decode path,
@@ -2627,7 +2672,7 @@ mod tests {
         /// a stored page beside a compressed one. With the memo on, a
         /// page's group is served as it was decoded while it holds.
         fn attach_nomemo(&self) -> std::result::Result<ZSide, Reject> {
-            ZSide::attach(&self.out, &self.blob, ID, END, false, false)
+            ZSide::attach(&self.out, &self.blob, ID, END, false, false, false)
         }
 
         /// A sidecar built and attached.
@@ -3118,7 +3163,7 @@ mod tests {
             ((n - pages, pages), pages),
             "a new identity misses every page once"
         );
-        let off = ZSide::attach(&fx.out, &fx.blob, ID, END, false, false).unwrap();
+        let off = ZSide::attach(&fx.out, &fx.blob, ID, END, false, false, false).unwrap();
         let d4 = read_all(&off);
         assert_eq!(
             (fx.memo.take_counts(), d4),
@@ -3149,11 +3194,11 @@ mod tests {
         one.side();
         let b = &one.blob;
         assert!(matches!(
-            ZSide::attach(&one.out, b, ID + 1, END, false, true),
+            ZSide::attach(&one.out, b, ID + 1, END, false, true, false),
             Err(Reject::Identity(_))
         ));
         assert!(matches!(
-            ZSide::attach(&one.out, b, ID, END + 1, false, true),
+            ZSide::attach(&one.out, b, ID, END + 1, false, true, false),
             Err(Reject::Identity(_))
         ));
         // No file is no rejection.
@@ -4098,6 +4143,98 @@ mod tests {
             assert!(ZCursor::seek(&fx.memo, &side, &fx.blob, b"0").is_err());
             std::fs::write(&fx.out, &good).unwrap();
         }
+    }
+
+    /// The scan's prefetch: a walk that wants more keys than its first
+    /// page holds asks for the pages after it, once, as many as the keys
+    /// still wanted over the mean a page and sixteen at most, and they are
+    /// resident soon after while the same walk without the prefetch
+    /// leaves them cold; a walk of one key and a walk from the last page
+    /// ask for nothing.
+    #[test]
+    fn a_scan_asks_for_the_pages_it_will_cross_once_and_they_come_in_behind_it() {
+        let fx = Fixture::new("prefetch", suite(6000, 12), 1 << 20);
+        assert!(matches!(fx.build(), Outcome::Built(_)));
+        // Evicted before the attach: a fault on a mapped file maps the
+        // cached pages around it as well (the kernel's fault-around, sixteen
+        // pages), which no eviction takes from a mapping, so a sidecar
+        // attached while its file was resident stayed resident whatever
+        // was advised. Attached advised random, as the store advises a
+        // sidecar, so that the kernel's readahead does not bring in behind
+        // a walk what the prefetch is measured by.
+        evict(&fx.out);
+        let on = fx.attach_opts(true, true, true).unwrap();
+        let off = fx.attach_opts(true, true, false).unwrap();
+        let pages = on.pages();
+        assert!(pages > 3 * ZPREFETCH_PAGES, "{pages} pages");
+        assert_eq!(
+            crate::bytes::os_page_size(),
+            ZPAGE,
+            "a page of the form is a page of the machine"
+        );
+        // The attach's sample faulted sixteen pages in through the
+        // mapping, which no eviction takes back; the pages read are the
+        // others: (resident, counted) over a run.
+        let sampled: Vec<usize> = (0..ZSAMPLE_PAGES)
+            .map(|k| k * (pages - 1) / (ZSAMPLE_PAGES - 1))
+            .collect();
+        let resident = |from: usize, n: usize| -> (usize, usize) {
+            let m = MmapBytes::open(&fx.out).unwrap();
+            let (mut res, mut all) = (0, 0);
+            for p in from..from + n {
+                if sampled.contains(&p) {
+                    continue;
+                }
+                all += 1;
+                res += m.resident_pages(p * ZPAGE, ZPAGE);
+            }
+            (res, all)
+        };
+        let mut sink = |_: &[u8], _: &[u8]| {};
+        let (res, all) = resident(1, ZPREFETCH_PAGES);
+        assert!(
+            all >= ZPREFETCH_PAGES - 5 && res == 0,
+            "{res} of {all} resident after the eviction"
+        );
+        // Without the prefetch a walk of one key from the first page leaves
+        // the pages after it as the eviction left them.
+        let z = off.scan_at(&fx.memo, &fx.blob, 0, 1, &mut sink).unwrap();
+        assert_eq!((z.seen, z.prefetches), (1, 0));
+        assert_eq!(resident(1, ZPREFETCH_PAGES).0, 0, "cold behind the walk");
+        // With it, a walk of one key asks for nothing, a walk from the last
+        // page asks for nothing, and a long walk asks once for the pages it
+        // will cross, which come in behind it.
+        let z = on.scan_at(&fx.memo, &fx.blob, 0, 1, &mut sink).unwrap();
+        assert_eq!(
+            (z.seen, z.prefetches),
+            (1, 0),
+            "one key: nothing past its page"
+        );
+        let last_first = on
+            .fence
+            .entry(on.fence.len() - 1, on.nkeys as u32)
+            .unwrap()
+            .first_rank as usize;
+        let z = on
+            .scan_at(&fx.memo, &fx.blob, last_first, usize::MAX, &mut sink)
+            .unwrap();
+        assert_eq!(z.prefetches, 0, "from the last page: nothing after it");
+        assert_eq!(resident(1, ZPREFETCH_PAGES).0, 0, "still cold");
+        let mean = on.nkeys / pages;
+        let first = on.fence.entry(0, on.nkeys as u32).unwrap().count as usize;
+        let want = 5 * mean;
+        let z = on.scan_at(&fx.memo, &fx.blob, 0, want, &mut sink).unwrap();
+        assert_eq!((z.seen, z.prefetches), (want, 1), "{z:?}");
+        let k = (want - first).div_ceil(mean).min(ZPREFETCH_PAGES);
+        let t = std::time::Instant::now();
+        while resident(1, k).0 < resident(1, k).1 && t.elapsed().as_secs() < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let (res, all) = resident(1, k);
+        assert_eq!(res, all, "the {k} pages asked for came in");
+        // The walk touched the pages it crossed, the ones asked for or the
+        // one after; past those, nothing came in.
+        assert_eq!(resident(1 + k + 2, 3).0, 0, "and no more than them");
     }
 
     #[test]

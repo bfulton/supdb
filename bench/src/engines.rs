@@ -748,6 +748,18 @@ pub struct Supdb {
     /// prices the memo, a decode saved on every read of a page the thread
     /// decoded before.
     zpages_nomemo: bool,
+    /// A scan's seek of a covered partition by the ordered index's heads
+    /// (`Options::zpages_seek_ord` on): the pair `supdb-nocachezpagesheads`
+    /// against `supdb-nocachezpages` prices the seek by the sidecar's
+    /// fence and one group against the one by the heads and the raw
+    /// records.
+    zpages_heads: bool,
+    /// A scan's prefetch of the pages it will cross after its first
+    /// (`Options::zpages_scan_prefetch` on): the pair
+    /// `supdb-nocachezpagesprefetch` against `supdb-nocachezpages` prices
+    /// it, out of core on the scan cells and in core where it is a syscall
+    /// for nothing.
+    zpages_prefetch: bool,
     /// Every build left to the settle of the form rather than started as
     /// its partition lands (`Options::zpages_eager` off):
     /// `supdb-nocachezpagessettle`, the shape the forced arm's rows were
@@ -1147,6 +1159,12 @@ struct Policy {
     /// Its memo of decoded groups off (`Options::zpages_memo` off):
     /// `supdb-nocachezpagesnomemo`.
     zpages_nomemo: bool,
+    /// Its seeks by the ordered index's heads (`Options::zpages_seek_ord`
+    /// on): `supdb-nocachezpagesheads`.
+    zpages_heads: bool,
+    /// Its scans asking ahead for their pages
+    /// (`Options::zpages_scan_prefetch` on): `supdb-nocachezpagesprefetch`.
+    zpages_prefetch: bool,
     /// Its builds left to the settle (`Options::zpages_eager` off):
     /// `supdb-nocachezpagessettle`.
     zpages_settle: bool,
@@ -1247,6 +1265,8 @@ impl Default for Policy {
             zpages_nodrop: false,
             zpages_nowarm: false,
             zpages_nomemo: false,
+            zpages_heads: false,
+            zpages_prefetch: false,
             zpages_settle: false,
             defer: false,
             firstfloor: false,
@@ -3551,6 +3571,45 @@ impl Supdb {
         )
     }
 
+    /// `supdb-nocachezpages` with a scan's seek of a covered partition by
+    /// the ordered index's heads (`Options::zpages_seek_ord` on): the pair
+    /// against `supdb-nocachezpages` differs by that one option and prices
+    /// the seek by the sidecar's fence and one group, which touches no raw
+    /// page, against the seek by the heads and a key read of the raw
+    /// records at each probe. Chosen by hand, as
+    /// `ab --arms supdb-nocachezpages,supdb-nocachezpagesheads`, on the
+    /// scan passes and the E mix, in core and under a bound.
+    pub fn create_nocache_zpages_heads(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                block_cache: false,
+                zpages: true,
+                zpages_heads: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-nocachezpages` with a scan's prefetch of the pages it will
+    /// cross (`Options::zpages_scan_prefetch` on): the pair against
+    /// `supdb-nocachezpages` differs by that one option and prices the
+    /// advice, which out of core brings the walk's pages in behind its
+    /// first and in core is a syscall for pages that are there. Chosen by
+    /// hand, as `ab --arms supdb-nocachezpages,supdb-nocachezpagesprefetch`,
+    /// on the scan passes and the E mix under a bound.
+    pub fn create_nocache_zpages_prefetch(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                block_cache: false,
+                zpages: true,
+                zpages_prefetch: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-nocachezpages` with every build left to the settle of the
     /// form rather than started as its partition lands
     /// (`Options::zpages_eager` off): the shape the forced arm's first
@@ -3690,6 +3749,8 @@ impl Supdb {
             zpages_nodrop,
             zpages_nowarm,
             zpages_nomemo,
+            zpages_heads,
+            zpages_prefetch,
             zpages_settle,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
@@ -3919,6 +3980,16 @@ impl Supdb {
             } else {
                 supdb::Options::default().zpages_memo
             },
+            zpages_seek_ord: if zpages_heads {
+                true
+            } else {
+                supdb::Options::default().zpages_seek_ord
+            },
+            zpages_scan_prefetch: if zpages_prefetch {
+                true
+            } else {
+                supdb::Options::default().zpages_scan_prefetch
+            },
             zpages_eager: if zpages_settle {
                 false
             } else {
@@ -4069,6 +4140,8 @@ impl Supdb {
             zpages_nodrop,
             zpages_nowarm,
             zpages_nomemo,
+            zpages_heads,
+            zpages_prefetch,
             zpages_settle,
             ord_threads: Default::default(),
         })
@@ -4674,6 +4747,10 @@ impl Engine for Supdb {
                 "supdb-nocachezpagesnowarm"
             } else if self.zpages_nomemo {
                 "supdb-nocachezpagesnomemo"
+            } else if self.zpages_heads {
+                "supdb-nocachezpagesheads"
+            } else if self.zpages_prefetch {
+                "supdb-nocachezpagesprefetch"
             } else if self.zpages_settle {
                 "supdb-nocachezpagessettle"
             } else {
@@ -4897,6 +4974,7 @@ impl Engine for Supdb {
             ("zpage_warm_us", z.warm_us as f64),
             ("zpage_memo_hits", z.memo_hits as f64),
             ("zpage_memo_misses", z.memo_misses as f64),
+            ("zpage_prefetches", z.prefetches as f64),
             ("zpage_declined_small", z.declined_small as f64),
             ("zpage_declined_small_bytes", z.declined_small_bytes as f64),
             (
@@ -5507,6 +5585,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocachezpagesnodrop"
         | "supdb-nocachezpagesnowarm"
         | "supdb-nocachezpagesnomemo"
+        | "supdb-nocachezpagesheads"
+        | "supdb-nocachezpagesprefetch"
         | "supdb-nocachezpagessettle"
         | "supdb-cache256"
         | "supdb-l0"
@@ -5689,6 +5769,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nocachezpagesnodrop" => Box::new(Supdb::create_nocache_zpages_nodrop(dir)?),
         "supdb-nocachezpagesnowarm" => Box::new(Supdb::create_nocache_zpages_nowarm(dir)?),
         "supdb-nocachezpagesnomemo" => Box::new(Supdb::create_nocache_zpages_nomemo(dir)?),
+        "supdb-nocachezpagesheads" => Box::new(Supdb::create_nocache_zpages_heads(dir)?),
+        "supdb-nocachezpagesprefetch" => Box::new(Supdb::create_nocache_zpages_prefetch(dir)?),
         "supdb-nocachezpagessettle" => Box::new(Supdb::create_nocache_zpages_settle(dir)?),
         "supdb-cache256" => Box::new(Supdb::create_cache256(dir)?),
         "supdb-ingest" => Box::new(Supdb::create_ingest(dir)?),
@@ -6422,15 +6504,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// `supdb-nocachezpagesnowarm`, `supdb-nocachezpagessettle` and
-    /// `supdb-nocachezpagesnomemo` are each `supdb-nocachezpages` with one
-    /// option moved -- the warm of a sidecar's file after its attach off,
-    /// every build left to the settle, the memo of decoded groups off --
-    /// and nothing else: named, durable like it, opened under their names
-    /// by the dispatch, on options that differ from the arm's in that
-    /// option alone, and forced like it.
+    /// `supdb-nocachezpagesnowarm`, `supdb-nocachezpagessettle`,
+    /// `supdb-nocachezpagesnomemo`, `supdb-nocachezpagesheads` and
+    /// `supdb-nocachezpagesprefetch` are each `supdb-nocachezpages` with
+    /// one option moved -- the warm of a sidecar's file after its attach
+    /// off, every build left to the settle, the memo of decoded groups
+    /// off, the seeks by the ordered index's heads, a scan's prefetch of
+    /// its pages on -- and nothing else: named, durable like it, opened
+    /// under their names by the dispatch, on options that differ from the
+    /// arm's in that option alone, and forced like it.
     #[test]
-    fn the_nowarm_settle_and_nomemo_arms_differ_from_the_zpages_arm_in_one_option_each() {
+    fn each_single_option_arm_differs_from_the_zpages_arm_in_that_option_alone() {
         let root =
             std::env::temp_dir().join(format!("supdb-bench-zpagesarms-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -6447,7 +6531,10 @@ mod tests {
         assert!(supdb::Options::default().zpages_warm);
         assert!(supdb::Options::default().zpages_eager);
         assert!(supdb::Options::default().zpages_memo);
+        assert!(!supdb::Options::default().zpages_seek_ord);
+        assert!(!supdb::Options::default().zpages_scan_prefetch);
         assert!(b.zpages_warm && b.zpages_eager && b.zpages_memo);
+        assert!(!b.zpages_seek_ord && !b.zpages_scan_prefetch);
         for (name, make, arm_dir) in [
             (
                 "supdb-nocachezpagesnowarm",
@@ -6464,6 +6551,16 @@ mod tests {
                 Supdb::create_nocache_zpages_nomemo,
                 "nomemo",
             ),
+            (
+                "supdb-nocachezpagesheads",
+                Supdb::create_nocache_zpages_heads,
+                "heads",
+            ),
+            (
+                "supdb-nocachezpagesprefetch",
+                Supdb::create_nocache_zpages_prefetch,
+                "prefetch",
+            ),
         ] {
             let arm = new(arm_dir, make);
             assert_eq!(arm.name(), name);
@@ -6474,6 +6571,8 @@ mod tests {
             assert_eq!(arm.zpages_nowarm, arm_dir == "nowarm");
             assert_eq!(arm.zpages_settle, arm_dir == "settle");
             assert_eq!(arm.zpages_nomemo, arm_dir == "nomemo");
+            assert_eq!(arm.zpages_heads, arm_dir == "heads");
+            assert_eq!(arm.zpages_prefetch, arm_dir == "prefetch");
             assert_eq!(arm.partition, base.partition, "the row's shape");
             assert_eq!(arm.drain, base.drain);
             assert_eq!(arm.durable, base.durable);
@@ -6489,6 +6588,16 @@ mod tests {
                 "{name}: the one option"
             );
             assert_eq!(a.zpages_memo, arm_dir != "nomemo", "{name}: the one option");
+            assert_eq!(
+                a.zpages_seek_ord,
+                arm_dir == "heads",
+                "{name}: the one option"
+            );
+            assert_eq!(
+                a.zpages_scan_prefetch,
+                arm_dir == "prefetch",
+                "{name}: the one option"
+            );
             assert!(a.zpages == supdb::ZPages::Always && b.zpages == supdb::ZPages::Always);
             assert_eq!(a.zpages_drop_behind, b.zpages_drop_behind);
             assert_eq!(a.zpages_min_bytes, b.zpages_min_bytes);
