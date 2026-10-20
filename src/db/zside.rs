@@ -276,10 +276,14 @@ pub(super) struct ZCursor<'a> {
     next: usize,
     group: Group<'a>,
     buf: GroupBuf,
-    /// Groups decoded and runs of records no page holds met, for the
-    /// handle's counters.
+    /// Groups decoded, runs of records no page holds met and prefetch
+    /// asks made, for the handle's counters.
     pub(super) decoded: u64,
     pub(super) nopage: u64,
+    pub(super) prefetches: u64,
+    /// Whether the bulk walk has asked for the pages ahead of it
+    /// (`walk_until`): once a cursor, as `scan_at` asks once a walk.
+    asked: bool,
     fell: bool,
 }
 
@@ -299,6 +303,8 @@ impl<'a> ZCursor<'a> {
             buf: take_buf(),
             decoded: 0,
             nopage: 0,
+            prefetches: 0,
+            asked: false,
             fell: false,
         }
     }
@@ -532,6 +538,103 @@ impl<'a> ZCursor<'a> {
             self.off = self.next;
             self.place();
         }
+    }
+
+    /// The bulk walk from the position, for the overlay walk
+    /// (`Reader::scan_partitions` under `Options::zpages_walk_cursor`):
+    /// every record from here handed to `f` as `ZSide::scan_at` hands
+    /// them, until `limit` records have been, or the key under the cursor
+    /// is not below `until`, or the partition ends; the cursor stands at
+    /// the record it stopped at. Answers how many it handed over and how
+    /// the key it stands at compares with `until`: `Equal` for `until`
+    /// itself, `Greater` for a key past it, and `Greater` at the end or at
+    /// the limit, where no key was compared. The group is held across the
+    /// records and across the caller's turns, so a walk cut at every
+    /// unsealed key opens one group a group crossed, where the walk cut by
+    /// rank opened one for its seek, one for its fresh walk and one for its
+    /// emit at each. A run of records no page holds, and the rest of a walk
+    /// after a check failed, go a key at a time through the raw form, as
+    /// the merge path reads them.
+    pub(super) fn walk_until<F: FnMut(&[u8], &[u8])>(
+        &mut self,
+        until: Option<&[u8]>,
+        limit: usize,
+        f: &mut F,
+    ) -> Result<(usize, KeyOrder)> {
+        let mut n = 0usize;
+        while n < limit {
+            if matches!(self.group, Group::None) {
+                return Ok((n, KeyOrder::Greater));
+            }
+            if matches!(self.group, Group::Raw) {
+                let Some(k) = self.raw.key_at(self.rank) else {
+                    return Ok((n, KeyOrder::Greater));
+                };
+                if let Some(u) = until {
+                    match k.cmp(u) {
+                        KeyOrder::Less => {}
+                        order => return Ok((n, order)),
+                    }
+                }
+                self.raw.values_at(self.rank, &mut |v: &[u8]| f(k, v))?;
+                n += 1;
+                self.advance();
+                continue;
+            }
+            if !self.asked {
+                self.asked = true;
+                let past = (limit - n).saturating_sub(self.end - self.rank);
+                if self.side.ask_ahead(self.page, past) {
+                    self.prefetches += 1;
+                }
+            }
+            // The held group: its records parsed where they lie, until it
+            // is spent, the limit is reached or `until` is met.
+            let (mut off, mut rank, end) = (self.off, self.rank, self.end);
+            let mut stop: Option<KeyOrder> = None;
+            let mut damaged = false;
+            {
+                let group = self.group();
+                while n < limit && rank < end {
+                    let Some((k, exts, tail, len)) = parse_record(group, off) else {
+                        damaged = true;
+                        break;
+                    };
+                    if let Some(u) = until {
+                        match k.cmp(u) {
+                            KeyOrder::Less => {}
+                            order => {
+                                stop = Some(order);
+                                break;
+                            }
+                        }
+                    }
+                    self.raw.read_exts(&exts, tail, &mut |v: &[u8]| f(k, v))?;
+                    off += len;
+                    rank += 1;
+                    n += 1;
+                }
+            }
+            self.rank = rank;
+            if damaged {
+                // A record that does not parse in a group the checks let
+                // through is damage: the page out of service, and the rest
+                // of the walk the raw form's, every key still answered.
+                self.side.fail(self.page);
+                self.fall();
+                continue;
+            }
+            if rank >= end {
+                self.load();
+                continue;
+            }
+            self.off = off;
+            self.place();
+            if let Some(order) = stop {
+                return Ok((n, order));
+            }
+        }
+        Ok((n, KeyOrder::Greater))
     }
 }
 
@@ -1446,17 +1549,10 @@ impl ZSide {
             // again. `MADV_WILLNEED` reads them in the background; a page
             // the walk never reaches was a read the device made for
             // nothing, which is the bound's reason.
-            if self.prefetch && !asked {
+            if !asked {
                 asked = true;
                 let past = (limit - out.seen).saturating_sub(end - rank);
-                let mean = (nkeys / self.n_pages.max(1)).max(1);
-                let k = past
-                    .div_ceil(mean)
-                    .min(ZPREFETCH_PAGES)
-                    .min(self.n_pages.saturating_sub(p + 1));
-                if past > 0 && k > 0 {
-                    self.map
-                        .advise_willneed(((p + 1) * ZPAGE) as u64, k * ZPAGE);
+                if self.ask_ahead(p, past) {
                     out.prefetches += 1;
                 }
             }
@@ -1485,6 +1581,31 @@ impl ZSide {
             }
         }
         Ok(())
+    }
+
+    /// The pages a walk will cross after page `p`, asked for at once
+    /// (`Options::zpages_scan_prefetch`): `past` the keys still wanted past
+    /// the page's entry, over the mean records a page, at most
+    /// `ZPREFETCH_PAGES` and never past the last page. `MADV_WILLNEED`
+    /// reads them in the background; a page the walk never reaches was a
+    /// read the device made for nothing, which is the bound's reason.
+    /// Whether it asked: nothing with the option off, nothing wanted past
+    /// the page, or no page after it.
+    fn ask_ahead(&self, p: usize, past: usize) -> bool {
+        if !self.prefetch || past == 0 {
+            return false;
+        }
+        let mean = (self.nkeys / self.n_pages.max(1)).max(1);
+        let k = past
+            .div_ceil(mean)
+            .min(ZPREFETCH_PAGES)
+            .min(self.n_pages.saturating_sub(p + 1));
+        if k == 0 {
+            return false;
+        }
+        self.map
+            .advise_willneed(((p + 1) * ZPAGE) as u64, k * ZPAGE);
+        true
     }
 
     /// `Blob::values_at` through the sidecar: the values of the record at
@@ -4141,6 +4262,161 @@ mod tests {
             assert!(c.fell_back() && side.damaged(), "{name}: the flip was met");
             assert_eq!(side.seek(&fx.memo, b"0"), ZSeek::Out);
             assert!(ZCursor::seek(&fx.memo, &side, &fx.blob, b"0").is_err());
+            std::fs::write(&fx.out, &good).unwrap();
+        }
+    }
+
+    /// The bulk walk through the cursor (`walk_until`) hands over the keys
+    /// and values from the position exactly as the raw form has them, up
+    /// to the limit or the first key not below `until`, says how that key
+    /// compares, and leaves the cursor on it, so that the overlay walk's
+    /// turns -- walk to an unsealed key, read the record under the cursor,
+    /// step past it, walk on -- are one walk with one open a group crossed;
+    /// across the record no page holds, and under a flipped page, every
+    /// key still right; and a long walk asks ahead once where the prefetch
+    /// is on, a walk of one key never.
+    #[test]
+    fn the_cursors_bulk_walk_stops_at_the_key_asked_and_hands_over_what_the_raw_form_has() {
+        let mut rng = Rng(79);
+        let mut recs = suite(1500, 11);
+        let big = b"0000000000000750-big";
+        recs.insert(750, (big.to_vec(), vec![rng.bytes(6000)], false));
+        recs.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, recs) in [("bulk-suite", suite(1200, 12)), ("bulk-nopage", recs)] {
+            let fx = Fixture::new(name, recs, 1 << 20);
+            let side = fx.side();
+            let n = fx.recs.len();
+            let raw_seq = |from: usize, to: usize| -> Vec<(Vec<u8>, Vec<u8>)> {
+                let mut v = Vec::new();
+                for r in from..to.min(n) {
+                    let k = fx.blob.key_at(r).unwrap().to_vec();
+                    fx.blob
+                        .values_at(r, |val| v.push((k.clone(), val.to_vec())))
+                        .unwrap();
+                }
+                v
+            };
+            let key_at = |r: usize| fx.recs.get(r).map(|rec| rec.0.clone());
+            for start in (0..n).step_by(47).chain([n]) {
+                for ahead in [0usize, 1, 5, 40, 300] {
+                    let target = start + ahead;
+                    // `until`: the key `ahead` records on (stopped at it,
+                    // `Equal`), the key just past it (stopped one further,
+                    // `Greater`), and none (the partition's end).
+                    let mut untils: Vec<(Option<Vec<u8>>, usize, KeyOrder)> =
+                        vec![(None, n, KeyOrder::Greater)];
+                    if let Some(k) = key_at(target) {
+                        untils.push((Some(k.clone()), target, KeyOrder::Equal));
+                        let between = [k.as_slice(), &[0u8]].concat();
+                        untils.push((Some(between), target + 1, KeyOrder::Greater));
+                    }
+                    for (until, stop, at_want) in untils {
+                        for limit in [1usize, 7, usize::MAX] {
+                            let what = format!(
+                                "{name}: from {start}, until {:?} (stop {stop}), limit {limit}",
+                                until.as_deref().map(String::from_utf8_lossy)
+                            );
+                            let stop = stop.min(n);
+                            let mut c = ZCursor::at(&fx.memo, &side, &fx.blob, start);
+                            let mut got = Vec::new();
+                            let (got_n, at) = c
+                                .walk_until(until.as_deref(), limit, &mut |k: &[u8], v: &[u8]| {
+                                    got.push((k.to_vec(), v.to_vec()))
+                                })
+                                .unwrap();
+                            let want_n = (stop - start).min(limit);
+                            assert_eq!(got_n, want_n, "{what}: handed over");
+                            assert_eq!(
+                                got,
+                                raw_seq(start, start + want_n),
+                                "{what}: the keys and values"
+                            );
+                            let at_rank = start + want_n;
+                            assert_eq!(c.rank(), at_rank, "{what}: the cursor's rank after");
+                            assert_eq!(
+                                c.key(),
+                                fx.blob.key_at(at_rank),
+                                "{what}: the key under it"
+                            );
+                            // At the limit nothing is compared, the end
+                            // of the window being the caller's to see.
+                            let want_at = if want_n >= limit {
+                                KeyOrder::Greater
+                            } else {
+                                at_want
+                            };
+                            assert_eq!(at, want_at, "{what}: how the key compares");
+                            if at == KeyOrder::Equal {
+                                // The overlay walk's turn at an unsealed key
+                                // the partition holds too: the record under
+                                // the cursor, the step past it, the walk on.
+                                let mut want = Vec::new();
+                                fx.blob
+                                    .values_at(at_rank, |v| want.push(v.to_vec()))
+                                    .unwrap();
+                                let mut vals = Vec::new();
+                                c.values(&mut |v: &[u8]| vals.push(v.to_vec())).unwrap();
+                                assert_eq!(vals, want, "{what}: the values under the cursor");
+                                c.advance();
+                                let mut rest = Vec::new();
+                                let (m, at2) = c
+                                    .walk_until(None, usize::MAX, &mut |k: &[u8], v: &[u8]| {
+                                        rest.push((k.to_vec(), v.to_vec()))
+                                    })
+                                    .unwrap();
+                                assert_eq!(
+                                    (m, at2),
+                                    (n - at_rank - 1, KeyOrder::Greater),
+                                    "{what}: the rest"
+                                );
+                                assert_eq!(
+                                    rest,
+                                    raw_seq(at_rank + 1, n),
+                                    "{what}: the rest's keys"
+                                );
+                                assert_eq!((c.key(), c.rank()), (None, n));
+                            }
+                            assert!(!c.fell_back(), "{what}");
+                        }
+                    }
+                }
+            }
+            assert!(!side.damaged());
+            // Asked ahead once a cursor where the prefetch is on, and never
+            // for a walk its first page satisfies.
+            let on = fx.attach_opts(false, true, true).unwrap();
+            let mut sink = |_: &[u8], _: &[u8]| {};
+            let mut c = ZCursor::at(&fx.memo, &on, &fx.blob, 0);
+            c.walk_until(None, 300, &mut sink).unwrap();
+            c.walk_until(None, 300, &mut sink).unwrap();
+            assert_eq!(c.prefetches, 1, "{name}: one ask a cursor");
+            let mut c = ZCursor::at(&fx.memo, &on, &fx.blob, 0);
+            c.walk_until(None, 1, &mut sink).unwrap();
+            assert_eq!(c.prefetches, 0, "{name}: nothing past the page wanted");
+            let mut c = ZCursor::at(&fx.memo, &side, &fx.blob, 0);
+            c.walk_until(None, 300, &mut sink).unwrap();
+            assert_eq!(c.prefetches, 0, "{name}: the option off");
+            // A page flipped under the walk: the rest is the raw form's, and
+            // every key and value is still right.
+            let good = std::fs::read(&fx.out).unwrap();
+            let t = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
+            let p = unsampled(t.n_pages as usize, 3);
+            let mut flipped = good.clone();
+            flipped[p * ZPAGE + 100] ^= 0x40;
+            std::fs::write(&fx.out, &flipped).unwrap();
+            let side = fx
+                .attach()
+                .expect("the sample does not reach the flipped page");
+            let mut c = ZCursor::at(&fx.memo, &side, &fx.blob, 0);
+            let mut got = Vec::new();
+            let (m, at) = c
+                .walk_until(None, usize::MAX, &mut |k: &[u8], v: &[u8]| {
+                    got.push((k.to_vec(), v.to_vec()))
+                })
+                .unwrap();
+            assert_eq!((m, at), (n, KeyOrder::Greater), "{name}: flipped");
+            assert_eq!(got, raw_seq(0, n), "{name}: flipped, every key and value");
+            assert!(c.fell_back() && side.damaged(), "{name}: the flip was met");
             std::fs::write(&fx.out, &good).unwrap();
         }
     }

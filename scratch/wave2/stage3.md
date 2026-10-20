@@ -510,6 +510,32 @@ rank-based loop kept as the arm (`Options::zpages_walk_cursor`,
 `supdb-nocachezpagesrankwalk`) and priced on E and the scan passes in
 core and under the bound, two sittings each.
 
+Piece 9 is in: `ZCursor::walk_until`, the bulk walk through the cursor
+(the records of the held group parsed where they lie until the limit,
+the partition's end or the first key not below the key asked, the
+cursor left on it, how it compares answered, one open a group crossed,
+the no-page run and a fallen walk a key at a time through the raw form,
+the prefetch asked once a cursor through `ZSide::ask_ahead`, which
+`scan_at` asks through too); `Reader::scan_partition_cursor`, the
+overlay walk of a covered partition through it under
+`Options::zpages_walk_cursor` (on), the emit's values from the record
+under the cursor (`PartVals`), the walk cut by rank kept as the arm
+(`supdb-nocachezpagesrankwalk`) and taken by the heads arm; the
+cursor's prefetch asks filed at its close. Tests: the bulk walk from
+every start against the raw form's sequence, stopped at a key present,
+a key between records and the end, at limits short of and past the
+stop, the record under the cursor and the walk on after it, across the
+no-page run and under a flipped page, the prefetch's one ask; the
+overlay walk at an E-like head (every other key of the first two
+thousand appended to, scans of fifty from it on the writer and a
+handle, both arms against the model): 1.8 opens a scan through the
+cursor against over twenty by rank, which is the assertion; the scan
+path arms gain `nocachezpagesrankwalk`. Two mutants held to firing:
+the flag ignored (both arms at 1.8 opens) and the walk ignoring the
+key it is to stop at (the windows wrong, the unit test's compare
+wrong). The pairings against the arm, in core and under the bound,
+two sittings each, are below once run.
+
 ## What 2b's sittings leave open, read before 3's
 
 - The eager build's pairing (`eager-pairing.sh`, `eager-ab-1.out` and

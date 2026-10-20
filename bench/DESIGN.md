@@ -248,7 +248,7 @@ off (`lmdb-nordahead`), the LMDB a user configures for the regime. The
 scan floor's file is written and synced outside the group and dropped
 from the cache; the floors and every pass run inside it.
 
-Eight more arms exist for a bounded pairing and are in no roster, because
+Nine more arms exist for a bounded pairing and are in no roster, because
 each prices one engine option against the arm it differs from in one
 process (`bench ab --arms <base>,<arm>`) and is chosen by hand:
 `supdb-nocacheordread` reads a point through the ordered index,
@@ -256,13 +256,15 @@ process (`bench ab --arms <base>,<arm>`) and is chosen by hand:
 counts (a pass refuses it unless every partition has its sidecar and the
 reads went through the sidecars), and `supdb-nocachezpagesnodrop`,
 `supdb-nocachezpagesnowarm`, `supdb-nocachezpagessettle`,
-`supdb-nocachezpagesnomemo`, `supdb-nocachezpagesheads` and
-`supdb-nocachezpagesprefetch` are that arm with one of its options
-moved: the build's release of the raw records off, the warm of a
-sidecar's file after its attach off, every build left to the settle of
-the form rather than started as its partition lands, the memo of decoded
-groups off, a scan's seeks by the ordered index's heads instead of the
-sidecar's fence, and a scan's prefetch of the pages it will cross on. The forced arm's
+`supdb-nocachezpagesnomemo`, `supdb-nocachezpagesheads`,
+`supdb-nocachezpagesprefetch` and `supdb-nocachezpagesrankwalk` are that
+arm with one of its options moved: the build's release of the raw
+records off, the warm of a sidecar's file after its attach off, every
+build left to the settle of the form rather than started as its
+partition lands, the memo of decoded groups off, a scan's seeks by the
+ordered index's heads instead of the sidecar's fence, a scan's prefetch
+of the pages it will cross on, and the overlay walk of a covered
+partition cut by rank rather than carried through a cursor. The forced arm's
 `sync` builds the sidecars, so its load carries the build, and in memory
 it reads slower than the raw form: it is an arm for the bound, not a
 default.

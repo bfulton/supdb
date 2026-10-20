@@ -2387,6 +2387,84 @@ fn the_memo_serves_repeated_reads_of_a_partition_and_off_every_read_decodes() {
 /// the ordered index and the raw records, the walk after them the
 /// sidecar's. The windows agree with the model as the fence's do, the walks
 /// are served, and the seeks touch the raw form, which the door counts.
+/// A scan over a run of unsealed keys dense in the partition's keys, the
+/// E mix's hot head: through the cursor (`Options::zpages_walk_cursor`)
+/// a scan of fifty opens a group once a group it crosses, and cut by rank
+/// (the `supdb-nocachezpagesrankwalk` arm) it opens one for the seek, one
+/// for the fresh walk and one for the read at every unsealed key, which
+/// was most of such a scan's time; both answer the model, on the writer
+/// and a handle.
+#[test]
+fn the_overlay_walk_through_the_cursor_opens_a_group_a_group_where_the_walk_by_rank_opened_three_a_key(
+) {
+    let mut opens = Vec::new();
+    for (name, by_cursor) in [("overlay-cursor", true), ("overlay-rankwalk", false)] {
+        let dir = scratch(name);
+        let mut db = Db::create(
+            &dir,
+            forced(|o| {
+                o.zpages_walk_cursor = by_cursor;
+                o.inline_bytes = 1 << 16;
+            }),
+        )
+        .unwrap();
+        let mut model = Model::new();
+        let mut rng = Rng(0xE0E);
+        let key = |i: usize| format!("key-{i:08}").into_bytes();
+        for i in 0..20_000 {
+            let v = suite_value(&mut rng);
+            db.append(&key(i), &v);
+            model.entry(key(i)).or_default().push(v);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert!(c.partitions >= 1 && c.sidecars == c.partitions, "{c:?}");
+        // The head: every other key of the first two thousand appended to,
+        // committed and not sealed, so a window there is half unsealed keys.
+        for i in (0..2000).step_by(2) {
+            db.append(&key(i), b"u");
+            model.entry(key(i)).or_default().push(b"u".to_vec());
+        }
+        db.commit().unwrap();
+        assert_eq!(db.levels().1, 0, "{name}: nothing sealed");
+        let r = db.reader().unwrap();
+        let w: &Reader = &db;
+        let before = db.zpage_counts();
+        let mut scans = 0u64;
+        for who in [w, &r] {
+            for i in (0..2000).step_by(20) {
+                let start = key(i);
+                same_window(
+                    &scanned(who, &start, 50),
+                    &window(&model, &start, 50),
+                    &format!("{name}: from {i}"),
+                );
+                scans += 1;
+            }
+        }
+        let after = db.zpage_counts();
+        let opened =
+            (after.memo_hits + after.memo_misses) - (before.memo_hits + before.memo_misses);
+        assert_eq!(after.rawserves + after.fallbacks, 0, "{name}: {after:?}");
+        assert!(after.scans > before.scans, "{name}: walks served");
+        opens.push((name, opened as f64 / scans as f64));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // A window of fifty at the head is about twenty-five partition keys
+    // and twenty-five unsealed, over one or two groups: the cursor opens
+    // those, and the walk by rank three a key.
+    let (cursor, rank) = (opens[0].1, opens[1].1);
+    assert!(
+        cursor <= 4.0,
+        "{cursor:.1} opens a scan through the cursor: {opens:?}"
+    );
+    assert!(rank >= 20.0, "{rank:.1} opens a scan by rank: {opens:?}");
+}
+
 #[test]
 fn the_heads_arm_seeks_through_the_raw_form_and_scans_the_same() {
     let dir = scratch("heads");

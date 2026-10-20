@@ -760,6 +760,12 @@ pub struct Supdb {
     /// it, out of core on the scan cells and in core where it is a syscall
     /// for nothing.
     zpages_prefetch: bool,
+    /// The overlay walk of a covered partition cut by rank, as it was
+    /// before the cursor (`Options::zpages_walk_cursor` off): the pair
+    /// `supdb-nocachezpagesrankwalk` against `supdb-nocachezpages` prices
+    /// the cursor's one open a group against the seek, the fresh walk and
+    /// the read at every unsealed key, on the E mix and the scan passes.
+    zpages_rankwalk: bool,
     /// Every build left to the settle of the form rather than started as
     /// its partition lands (`Options::zpages_eager` off):
     /// `supdb-nocachezpagessettle`, the shape the forced arm's rows were
@@ -1165,6 +1171,9 @@ struct Policy {
     /// Its scans asking ahead for their pages
     /// (`Options::zpages_scan_prefetch` on): `supdb-nocachezpagesprefetch`.
     zpages_prefetch: bool,
+    /// Its overlay walk cut by rank (`Options::zpages_walk_cursor` off):
+    /// `supdb-nocachezpagesrankwalk`.
+    zpages_rankwalk: bool,
     /// Its builds left to the settle (`Options::zpages_eager` off):
     /// `supdb-nocachezpagessettle`.
     zpages_settle: bool,
@@ -1267,6 +1276,7 @@ impl Default for Policy {
             zpages_nomemo: false,
             zpages_heads: false,
             zpages_prefetch: false,
+            zpages_rankwalk: false,
             zpages_settle: false,
             defer: false,
             firstfloor: false,
@@ -3610,6 +3620,26 @@ impl Supdb {
         )
     }
 
+    /// `supdb-nocachezpages` with the overlay walk of a covered partition
+    /// cut by rank, as it was before the cursor (`Options::zpages_walk_cursor`
+    /// off): the pair against `supdb-nocachezpages` differs by that one
+    /// option and prices the cursor, which opens a group once a group
+    /// crossed, against the seek, the fresh walk and the read that each
+    /// opened the group again at every unsealed key inside a window. Chosen
+    /// by hand, as `ab --arms supdb-nocachezpages,supdb-nocachezpagesrankwalk`,
+    /// on the E mix and the scan passes, in core and under a bound.
+    pub fn create_nocache_zpages_rankwalk(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                block_cache: false,
+                zpages: true,
+                zpages_rankwalk: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-nocachezpages` with every build left to the settle of the
     /// form rather than started as its partition lands
     /// (`Options::zpages_eager` off): the shape the forced arm's first
@@ -3751,6 +3781,7 @@ impl Supdb {
             zpages_nomemo,
             zpages_heads,
             zpages_prefetch,
+            zpages_rankwalk,
             zpages_settle,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
@@ -3990,6 +4021,11 @@ impl Supdb {
             } else {
                 supdb::Options::default().zpages_scan_prefetch
             },
+            zpages_walk_cursor: if zpages_rankwalk {
+                false
+            } else {
+                supdb::Options::default().zpages_walk_cursor
+            },
             zpages_eager: if zpages_settle {
                 false
             } else {
@@ -4142,6 +4178,7 @@ impl Supdb {
             zpages_nomemo,
             zpages_heads,
             zpages_prefetch,
+            zpages_rankwalk,
             zpages_settle,
             ord_threads: Default::default(),
         })
@@ -4751,6 +4788,8 @@ impl Engine for Supdb {
                 "supdb-nocachezpagesheads"
             } else if self.zpages_prefetch {
                 "supdb-nocachezpagesprefetch"
+            } else if self.zpages_rankwalk {
+                "supdb-nocachezpagesrankwalk"
             } else if self.zpages_settle {
                 "supdb-nocachezpagessettle"
             } else {
@@ -5587,6 +5626,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocachezpagesnomemo"
         | "supdb-nocachezpagesheads"
         | "supdb-nocachezpagesprefetch"
+        | "supdb-nocachezpagesrankwalk"
         | "supdb-nocachezpagessettle"
         | "supdb-cache256"
         | "supdb-l0"
@@ -5771,6 +5811,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nocachezpagesnomemo" => Box::new(Supdb::create_nocache_zpages_nomemo(dir)?),
         "supdb-nocachezpagesheads" => Box::new(Supdb::create_nocache_zpages_heads(dir)?),
         "supdb-nocachezpagesprefetch" => Box::new(Supdb::create_nocache_zpages_prefetch(dir)?),
+        "supdb-nocachezpagesrankwalk" => Box::new(Supdb::create_nocache_zpages_rankwalk(dir)?),
         "supdb-nocachezpagessettle" => Box::new(Supdb::create_nocache_zpages_settle(dir)?),
         "supdb-cache256" => Box::new(Supdb::create_cache256(dir)?),
         "supdb-ingest" => Box::new(Supdb::create_ingest(dir)?),
@@ -6505,12 +6546,13 @@ mod tests {
     }
 
     /// `supdb-nocachezpagesnowarm`, `supdb-nocachezpagessettle`,
-    /// `supdb-nocachezpagesnomemo`, `supdb-nocachezpagesheads` and
-    /// `supdb-nocachezpagesprefetch` are each `supdb-nocachezpages` with
-    /// one option moved -- the warm of a sidecar's file after its attach
-    /// off, every build left to the settle, the memo of decoded groups
-    /// off, the seeks by the ordered index's heads, a scan's prefetch of
-    /// its pages on -- and nothing else: named, durable like it, opened
+    /// `supdb-nocachezpagesnomemo`, `supdb-nocachezpagesheads`,
+    /// `supdb-nocachezpagesprefetch` and `supdb-nocachezpagesrankwalk` are
+    /// each `supdb-nocachezpages` with one option moved -- the warm of a
+    /// sidecar's file after its attach off, every build left to the settle,
+    /// the memo of decoded groups off, the seeks by the ordered index's
+    /// heads, a scan's prefetch of its pages on, the overlay walk cut by
+    /// rank -- and nothing else: named, durable like it, opened
     /// under their names by the dispatch, on options that differ from the
     /// arm's in that option alone, and forced like it.
     #[test]
@@ -6533,7 +6575,8 @@ mod tests {
         assert!(supdb::Options::default().zpages_memo);
         assert!(!supdb::Options::default().zpages_seek_ord);
         assert!(!supdb::Options::default().zpages_scan_prefetch);
-        assert!(b.zpages_warm && b.zpages_eager && b.zpages_memo);
+        assert!(supdb::Options::default().zpages_walk_cursor);
+        assert!(b.zpages_warm && b.zpages_eager && b.zpages_memo && b.zpages_walk_cursor);
         assert!(!b.zpages_seek_ord && !b.zpages_scan_prefetch);
         for (name, make, arm_dir) in [
             (
@@ -6561,6 +6604,11 @@ mod tests {
                 Supdb::create_nocache_zpages_prefetch,
                 "prefetch",
             ),
+            (
+                "supdb-nocachezpagesrankwalk",
+                Supdb::create_nocache_zpages_rankwalk,
+                "rankwalk",
+            ),
         ] {
             let arm = new(arm_dir, make);
             assert_eq!(arm.name(), name);
@@ -6573,6 +6621,7 @@ mod tests {
             assert_eq!(arm.zpages_nomemo, arm_dir == "nomemo");
             assert_eq!(arm.zpages_heads, arm_dir == "heads");
             assert_eq!(arm.zpages_prefetch, arm_dir == "prefetch");
+            assert_eq!(arm.zpages_rankwalk, arm_dir == "rankwalk");
             assert_eq!(arm.partition, base.partition, "the row's shape");
             assert_eq!(arm.drain, base.drain);
             assert_eq!(arm.durable, base.durable);
@@ -6596,6 +6645,11 @@ mod tests {
             assert_eq!(
                 a.zpages_scan_prefetch,
                 arm_dir == "prefetch",
+                "{name}: the one option"
+            );
+            assert_eq!(
+                a.zpages_walk_cursor,
+                arm_dir != "rankwalk",
                 "{name}: the one option"
             );
             assert!(a.zpages == supdb::ZPages::Always && b.zpages == supdb::ZPages::Always);
