@@ -2424,6 +2424,18 @@ seams; and a key distribution's shape is read before a mix's cell is
 decomposed, since an unscrambled Zipfian's hot keys are contiguous and a
 window at its head is a different workload from one anywhere else.
 
+**A dispatch gated on the one option its tests ran under.** The point
+read and the count went to the form only when the option was `Always`,
+with the controller's gate asked inside the dispatch; the gate's first
+piece tested the gate under `Always` alone, so a store under `Auto` in
+COMPACT read every key raw with the gate at the form and the cells
+installed, and nothing raised, since the raw answer is right. The first
+`Auto` store driven to COMPACT found it in its first run, by the count of
+reads through the form. The rule is the one "a path only one arm
+exercises" gave, for a mechanism with two modes: a test of the mechanism
+runs under every mode that reaches it, and the condition at the call
+site is the mechanism's own (the gate) and not the mode's name.
+
 **A probe's total over a whole read is an inlining result.** The same engine
 read +0.9, +1.9, +2.9 and +3.15 instructions a point read across four probes
 and a count +3.00 exactly, because the code after a probe's loop changes what

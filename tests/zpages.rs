@@ -4962,15 +4962,20 @@ fn census_sum(c: &supdb::db::ZCounts) -> u64 {
         + c.census_scans
 }
 
-/// A store under `Auto` in SUSPECT through the seam: the budget under the
-/// footprint, two hot ticks, the gate at the census, with the price of a
-/// fault set so a window's faults cost something.
-fn suspect_store(name: &str) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>) {
+/// A store under `Auto` through the seam, loaded with twenty thousand keys
+/// and ticked twice with the budget and the group's refault rate given,
+/// with the price of a fault set so a window's faults cost something.
+fn auto_store(
+    name: &str,
+    budget: u64,
+    refaults_per_s: f64,
+    fault_cost: std::time::Duration,
+) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>) {
     let dir = scratch(name);
     let inject = std::sync::Arc::new(supdb::ZInject::new());
-    inject.set_budget(1 << 20);
-    inject.set_refault_rate(0.0);
-    inject.set_fault_cost(std::time::Duration::from_micros(40));
+    inject.set_budget(budget);
+    inject.set_refault_rate(refaults_per_s);
+    inject.set_fault_cost(fault_cost);
     inject.advance(std::time::Duration::from_millis(1));
     let mut db = Db::create(
         &dir,
@@ -4986,26 +4991,558 @@ fn suspect_store(name: &str) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInje
     db.settle().unwrap();
     for _ in 0..2 {
         inject.advance(std::time::Duration::from_secs(1));
-        wait_steps(&db, 1);
+        wait_tick(&db);
     }
-    let c = db.zpage_counts();
-    assert_eq!((c.phase, c.gate), (1, 1), "SUSPECT: {c:?}");
     (dir, db, model, inject)
 }
 
-/// `n` census ticks of the injected clock, each waited for: the tick
-/// runs on the segment work's thread at its own turn.
-fn wait_steps(db: &Db, n: u32) {
-    for _ in 0..n {
-        let inject = db.options().zpages_inject.clone().unwrap();
-        inject.advance(std::time::Duration::from_millis(100));
-        let was = db.zpage_counts().sel_steps;
-        let t = std::time::Instant::now();
-        while db.zpage_counts().sel_steps == was && t.elapsed().as_secs() < 5 {
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        assert!(db.zpage_counts().sel_steps > was, "the tick stepped");
+/// A store under `Auto` in SUSPECT: the budget under the footprint, no
+/// refaults, two hot ticks, the gate at the census.
+fn suspect_store(name: &str) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>) {
+    let out = auto_store(name, 1 << 20, 0.0, FAULT_40US);
+    let c = out.1.zpage_counts();
+    assert_eq!((c.phase, c.gate), (1, 1), "SUSPECT: {c:?}");
+    out
+}
+
+/// The seam's prices of a fault: forty microseconds, this host's, and a
+/// millisecond, a spinning disk's. The build tests price a fault at the
+/// millisecond: the form's saving is the faults it spares against the
+/// decode it costs, and an unoptimized build decodes a page in sixty
+/// microseconds where an optimized one takes five, so at this host's price
+/// the form would not pay in the dev profile and the selector would be
+/// right to build nothing.
+const FAULT_40US: std::time::Duration = std::time::Duration::from_micros(40);
+const FAULT_1MS: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// A store under `Auto` whose measure says blocked: the budget under the
+/// footprint and the group refaulting at a rate that makes every interval
+/// evidence -- and the pressure term true, as a store's own refaults make
+/// it out of core -- in SUSPECT after two hot ticks.
+fn blocked_store(name: &str) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>) {
+    let out = auto_store(name, 1 << 20, 1_000_000.0, FAULT_1MS);
+    let c = out.1.zpage_counts();
+    assert_eq!((c.phase, c.gate), (1, 1), "SUSPECT: {c:?}");
+    out
+}
+
+/// One tick of the controller waited for, after the injected clock has
+/// been moved: the tick runs on the segment work's thread at its own turn.
+fn wait_tick(db: &Db) {
+    let was = db.zpage_counts().sel_steps;
+    let t = std::time::Instant::now();
+    while db.zpage_counts().sel_steps == was && t.elapsed().as_secs() < 20 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
+    assert!(db.zpage_counts().sel_steps > was, "the tick stepped");
+}
+
+/// Ticks of the injected clock until `cond` holds of the counts, at most
+/// `max` of them: whether it held.
+fn tick_until(db: &Db, max: u32, cond: impl Fn(&supdb::db::ZCounts) -> bool) -> bool {
+    for _ in 0..max {
+        if cond(&db.zpage_counts()) {
+            return true;
+        }
+        wait_steps(db, 1);
+    }
+    cond(&db.zpage_counts())
+}
+
+/// `n` census ticks of the injected clock, each waited for.
+fn wait_steps(db: &Db, n: u32) {
+    let inject = db.options().zpages_inject.clone().unwrap();
+    for _ in 0..n {
+        inject.advance(std::time::Duration::from_millis(100));
+        wait_tick(db);
+    }
+}
+
+/// The injected clock moved `step` seconds a tick for `secs` seconds, each
+/// tick waited for: an S1 tick each, since the model is read once a second.
+fn wait_secs(db: &Db, secs: u64, step: u64) {
+    let inject = db.options().zpages_inject.clone().unwrap();
+    let mut t = 0;
+    while t < secs {
+        inject.advance(std::time::Duration::from_secs(step));
+        wait_tick(db);
+        t += step;
+    }
+}
+
+/// `n` point reads through `r` from `at` on, each with `faults` faults on
+/// the seam, over the keys.
+fn reads(
+    r: &Reader,
+    keys: &[Vec<u8>],
+    inject: &supdb::ZInject,
+    n: usize,
+    at: &mut usize,
+    faults: u64,
+) {
+    for _ in 0..n {
+        r.count(&keys[(*at * 7) % keys.len()]).unwrap();
+        if faults > 0 {
+            inject.add_faults(faults);
+        }
+        *at += 1;
+    }
+}
+
+/// Stretches of `per` reads, each stretch's window closed through the
+/// ticks, until the controller's phase reads `phase` or `max` stretches
+/// have gone: whether it was reached.
+#[allow(clippy::too_many_arguments)]
+fn drive_to(
+    db: &Db,
+    r: &Reader,
+    keys: &[Vec<u8>],
+    inject: &supdb::ZInject,
+    at: &mut usize,
+    per: usize,
+    faults: u64,
+    phase: u8,
+    max: usize,
+) -> bool {
+    for _ in 0..max {
+        reads(r, keys, inject, per, at, faults);
+        close_window(db, r, &keys[0]);
+        if db.zpage_counts().phase == phase {
+            return true;
+        }
+    }
+    db.zpage_counts().phase == phase
+}
+
+/// `cond` waited for, up to ten seconds.
+fn wait_for(what: &str, cond: impl Fn() -> bool) {
+    let t = std::time::Instant::now();
+    while !cond() {
+        assert!(t.elapsed().as_secs() < 10, "{what}");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// A blocked store driven to COMPACT by faulting reads through a handle:
+/// the price paid, the form built and installed, the gate at the form.
+#[allow(clippy::type_complexity)]
+fn compact_store(
+    name: &str,
+) -> (
+    PathBuf,
+    Db,
+    Model,
+    std::sync::Arc<supdb::ZInject>,
+    Reader,
+    Vec<Vec<u8>>,
+    usize,
+) {
+    let (dir, db, model, inject) = blocked_store(name);
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    assert!(
+        drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+        "COMPACT: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!((c.gate, c.phase), (2, 3), "{c:?}");
+    assert!(c.samples >= 1 && c.sampled >= c.partitions, "{c:?}");
+    assert!(c.sel_builds >= 1 && c.builds >= 1, "{c:?}");
+    assert_eq!((c.sel_installs, c.sel_switches), (1, 1), "{c:?}");
+    assert_eq!(c.form_files, c.partitions, "{c:?}");
+    (dir, db, model, inject, r, keys, at)
+}
+
+/// The model says blocked and the census agrees, on faulting reads: the
+/// sampler reads the partitions, the rent reaches the price, one build at
+/// a time covers the store, the cells are installed and then the gate, and
+/// the reads after it go through the form, every answer the model's.
+#[test]
+fn auto_builds_when_the_measure_says_blocked_and_the_limit_is_below_the_footprint() {
+    let (dir, db, model, _inject, r, keys, _) = compact_store("auto-build");
+    let before = db.zpage_counts();
+    let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
+    check(&r, &model, &some, "compact");
+    check_scan(&r, &model, "compact");
+    let after = db.zpage_counts();
+    // The reads through the form; the scans walk the block path raw with
+    // the cache on, as every cache-on arm's do.
+    assert!(after.reads > before.reads, "through the form: {after:?}");
+    assert_eq!(
+        (
+            after.sel_exit_e1,
+            after.sel_exit_e2,
+            after.sel_exit_e3,
+            after.sel_cancelled
+        ),
+        (0, 0, 0, 0),
+        "{after:?}"
+    );
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// While the form is building, every read is served raw and nothing is
+/// counted through the form; the gate moves only once the cells are in.
+#[test]
+fn auto_serves_raw_until_the_form_file_is_whole() {
+    let (dir, db, model, inject) = blocked_store("auto-raw-until");
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    db.hold_zpage_build(true);
+    assert!(
+        drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 2, 400),
+        "building: {:?}",
+        db.zpage_counts()
+    );
+    wait_for("the build at its hold", || db.zpage_build_waiting());
+    reads(&r, &keys, &inject, 640, &mut at, 1);
+    let c = db.zpage_counts();
+    assert_eq!((c.gate, c.phase), (1, 2), "{c:?}");
+    assert_eq!(
+        c.reads + c.counts + c.scans + c.rawserves + c.form_files,
+        0,
+        "nothing through the form while building: {c:?}"
+    );
+    db.hold_zpage_build(false);
+    assert!(
+        drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 200),
+        "COMPACT: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!((c.gate, c.form_files), (2, c.partitions), "{c:?}");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The limit lifted: the model's smoothed word says the raw form fits for
+/// a dwell, E1 leaves the form, the rung relaxes to FITS with the form
+/// files kept for the retention, and the retention's end retires them and
+/// gives the disk back.
+#[test]
+fn auto_returns_to_raw_when_the_limit_is_lifted_and_gives_the_disk_back() {
+    let (dir, db, _model, inject, r, _keys, _) = compact_store("auto-lifted");
+    inject.set_budget(1 << 40);
+    inject.set_refault_rate(0.0);
+    wait_secs(&db, 100, 1);
+    let c = db.zpage_counts();
+    assert_eq!((c.sel_exit_e1, c.phase, c.gate), (1, 0, 0), "{c:?}");
+    assert_eq!(c.form_files, c.partitions, "kept for the retention: {c:?}");
+    assert!(!form_files(&dir).is_empty());
+    wait_secs(&db, 700, 10);
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.sel_retired, c.retired, c.form_files),
+        (1, c.partitions, 0),
+        "{c:?}"
+    );
+    wait_for("the dead names unlinked", || form_files(&dir).is_empty());
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A workload that fits the cache in the raw form faults nothing however
+/// large the store is: the model says blocked, the census says no, and the
+/// rung stays SUSPECT with nothing built.
+#[test]
+fn a_skewed_workload_that_fits_never_builds() {
+    let (dir, db, model, inject) = blocked_store("auto-skewed");
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    assert!(!drive_to(&db, &r, &keys, &inject, &mut at, 640, 0, 3, 20));
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.phase, c.sel_builds, c.builds, c.form_files),
+        (1, 0, 0, 0),
+        "{c:?}"
+    );
+    assert!(c.samples >= 1, "the sampler was asked all the same: {c:?}");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// First touches with no refaults are a cold start, not capacity misses:
+/// the faults count for nothing and nothing is built.
+#[test]
+fn a_cold_start_is_not_a_capacity_miss() {
+    let (dir, db, model, inject) = suspect_store("auto-cold");
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    assert!(!drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 2, 20));
+    let c = db.zpage_counts();
+    assert_eq!((c.phase, c.sel_builds, c.builds), (1, 0, 0), "{c:?}");
+    assert!(
+        c.census_read_faults >= 640 * 20,
+        "the faults were counted: {c:?}"
+    );
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The build waits for the rent to reach the price: at every stretch of
+/// evidence, no build has started while the rent is under the price, and
+/// the build that starts finds the rent at or over it.
+#[test]
+fn the_ski_rental_price_is_paid_before_a_build() {
+    let (dir, db, model, inject) = blocked_store("auto-price");
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    assert!(tick_until(&db, 100, |c| c.sampled >= 1), "the sample taken");
+    wait_steps(&db, 2);
+    let c = db.zpage_counts();
+    assert!(c.sel_c_build_ns > 0 && c.sel_samples >= 1, "priced: {c:?}");
+    assert_eq!(
+        (c.sel_builds, c.sel_excess_ns),
+        (0, 0),
+        "no rent yet: {c:?}"
+    );
+    let mut started = false;
+    for _ in 0..400 {
+        reads(&r, &keys, &inject, 64, &mut at, 1);
+        close_window(&db, &r, &keys[0]);
+        let c = db.zpage_counts();
+        if c.sel_builds == 0 {
+            assert!(
+                c.sel_excess_ns < c.sel_c_build_ns,
+                "no build while the rent is under the price: {c:?}"
+            );
+        } else {
+            assert!(
+                c.sel_excess_ns >= c.sel_c_build_ns,
+                "the build started with the rent at the price: {c:?}"
+            );
+            started = true;
+            break;
+        }
+    }
+    assert!(started, "the price is reached: {:?}", db.zpage_counts());
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A build whose evidence vanishes is cancelled, and a cancel is a switch:
+/// the rung is back at SUSPECT, the builder's thread stops at its next
+/// look, and no form file is left.
+#[test]
+fn a_cancelled_build_counts_as_a_switch() {
+    let (dir, db, model, inject) = blocked_store("auto-cancel");
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    db.hold_zpage_build(true);
+    assert!(drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 2, 400));
+    wait_for("the build at its hold", || db.zpage_build_waiting());
+    // The reads stop faulting: three evidence intervals under half the
+    // entry threshold, and the build is given up.
+    assert!(
+        drive_to(&db, &r, &keys, &inject, &mut at, 640, 0, 1, 12),
+        "cancelled: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.sel_cancelled, c.sel_switches, c.sel_installs),
+        (1, 1, 0),
+        "{c:?}"
+    );
+    db.hold_zpage_build(false);
+    assert!(
+        tick_until(&db, 100, |c| c.build_cancelled >= 1),
+        "the builder's thread stopped: {:?}",
+        db.zpage_counts()
+    );
+    wait_steps(&db, 2);
+    let c = db.zpage_counts();
+    assert_eq!((c.form_files, c.phase), (0, 1), "{c:?}");
+    assert!(form_files(&dir).is_empty(), "no form file left");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The gate decides the form under `Auto` as under `Always`: a store
+/// driven to COMPACT, its gate set to the census and to the raw form by
+/// hand, serves every read raw and counts nothing through the form, and
+/// set back serves the form again; every answer the model's. The gate's
+/// first test ran under `Always` alone, and the dispatch asked for that
+/// option before the gate.
+#[test]
+fn the_gate_decides_the_form_under_auto_as_under_always() {
+    let (dir, db, model, _inject, r, keys, _) = compact_store("auto-gate");
+    let some: Vec<Vec<u8>> = keys.iter().step_by(101).cloned().collect();
+    for (gate, served) in [(1u8, false), (0, false), (2, true)] {
+        db.zgate_set(gate);
+        let before = db.zpage_counts();
+        check(&r, &model, &some, &format!("auto gate {gate}"));
+        let after = db.zpage_counts();
+        let through = (after.reads + after.counts + after.rawserves)
+            - (before.reads + before.counts + before.rawserves);
+        if served {
+            assert!(after.reads > before.reads, "{after:?}");
+        } else {
+            assert_eq!(
+                through, 0,
+                "gate {gate}: nothing through the form: {after:?}"
+            );
+        }
+    }
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two stores in one process keep measures of their own: one driven to
+/// COMPACT, the other, which fits, stays FITS with nothing sampled.
+#[test]
+fn two_stores_in_one_process_do_not_share_a_measure() {
+    let (dir_b, db_b, model_b, _inject_b) = auto_store("auto-two-b", 1 << 40, 0.0, FAULT_40US);
+    let (dir_a, db_a, _model_a, _inject_a, r_a, _keys_a, _) = compact_store("auto-two-a");
+    let keys_b: Vec<Vec<u8>> = model_b.keys().step_by(5).cloned().collect();
+    let r_b = db_b.reader().unwrap();
+    check(&r_b, &model_b, &keys_b, "b");
+    wait_steps(&db_b, 5);
+    let b = db_b.zpage_counts();
+    assert_eq!(
+        (
+            b.phase,
+            b.gate,
+            b.samples,
+            b.sel_builds,
+            b.builds,
+            b.form_files
+        ),
+        (0, 0, 0, 0, 0, 0),
+        "{b:?}"
+    );
+    let a = db_a.zpage_counts();
+    assert_eq!((a.phase, a.gate), (3, 2), "{a:?}");
+    drop(r_a);
+    drop(r_b);
+    db_a.close().unwrap();
+    db_b.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// A neighbour's pressure opens the build clause: the model says the
+/// store fits, the group refaults, the rung suspects on the pressure, and
+/// faulting reads buy the form.
+#[test]
+fn a_neighbours_pressure_opens_the_build_clause() {
+    let (dir, db, model, inject) = auto_store("auto-pressure", 1 << 40, 1_000_000.0, FAULT_1MS);
+    let c = db.zpage_counts();
+    assert_eq!((c.phase, c.gate), (1, 1), "SUSPECT on the pressure: {c:?}");
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    assert!(
+        drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+        "COMPACT: {:?}",
+        db.zpage_counts()
+    );
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A store fifty times the cache still builds: the compact form's
+/// predicted faults are a page a read and the raw form's the two the
+/// model's two populations predict, so the saving stands at a fault a
+/// read, measured and predicted alike.
+#[test]
+fn a_store_far_past_the_cache_still_builds() {
+    let (dir, db, model, inject) = auto_store("auto-far", 4096, 1_000_000.0, FAULT_1MS);
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    // A raw read far past the cache faults on the hash page and on the
+    // record page; the form's page is one.
+    assert!(
+        drive_to(&db, &r, &keys, &inject, &mut at, 640, 2, 3, 400),
+        "COMPACT: {:?}",
+        db.zpage_counts()
+    );
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Form files on disk are dormant under `Auto` until the form is wanted,
+/// and then attached in place of a build, at the attach's price.
+#[test]
+fn form_files_on_disk_are_dormant_under_auto_and_attached_when_the_form_is_wanted() {
+    let dir = scratch("auto-dormant");
+    let model = {
+        let mut db = Db::create(&dir, forced(|_| {})).unwrap();
+        let model = ordered_load(&mut db, 20_000, 0x4A9);
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert!(c.form_files >= 1 && c.form_files == c.partitions, "{c:?}");
+        db.close().unwrap();
+        model
+    };
+    let on_disk = form_files(&dir);
+    assert!(!on_disk.is_empty());
+    let inject = std::sync::Arc::new(supdb::ZInject::new());
+    inject.set_budget(1 << 20);
+    inject.set_refault_rate(1_000_000.0);
+    inject.set_fault_cost(FAULT_1MS);
+    inject.advance(std::time::Duration::from_millis(1));
+    let db = Db::open(
+        &dir,
+        Options {
+            zpages: ZPages::Auto,
+            zpages_min_bytes: 0,
+            zpages_inject: Some(inject.clone()),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let c = db.zpage_counts();
+    assert_eq!((c.form_files, c.attached), (0, 0), "dormant: {c:?}");
+    assert_eq!(form_files(&dir), on_disk, "and kept");
+    for _ in 0..2 {
+        inject.advance(std::time::Duration::from_secs(1));
+        wait_tick(&db);
+    }
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    assert!(
+        drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+        "COMPACT: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.builds, c.build_starts),
+        (0, 0),
+        "attached, not built: {c:?}"
+    );
+    assert_eq!(
+        (c.attached, c.form_files),
+        (c.partitions, c.partitions),
+        "{c:?}"
+    );
+    let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
+    check(&r, &model, &some, "dormant attached");
+    assert!(db.zpage_counts().reads > 0);
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Closes the handle's window in progress: three ticks, then one read,

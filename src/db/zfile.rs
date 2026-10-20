@@ -31,9 +31,9 @@
 //! freed with its segment.
 
 use super::zpages::{
-    bind32, check_entry, check_group, decode_group, fill_group, group_seek, page_view, parse_page,
-    verify_page, FenceEntry, Fill, FillScratch, FillStats, GroupBuf, Images, NoPage, SegImages,
-    Trailer, ZError, ZFence, ZNOPAGE, ZPAGE, ZTRAILER,
+    bind32, check_entry, check_group, decode_group, fill_group, filter_bytes, group_seek,
+    page_view, parse_page, verify_page, walk_group, FenceEntry, Fill, FillScratch, FillStats,
+    GroupBuf, Images, NoPage, SegImages, Trailer, ZError, ZFence, ZNOPAGE, ZPAGE, ZTRAILER,
 };
 use crate::blob::{Blob, BlobOptions, ZSource};
 use crate::bytes::{Bytes, MmapBytes};
@@ -1993,6 +1993,29 @@ pub(super) struct ZEvents {
     pub sel_threads: AtomicU64,
     pub census_costs: [AtomicU64; 5],
     pub sel_costs: [AtomicU64; 5],
+    /// The sampler's: jobs run, partitions sampled in them, partitions the
+    /// sample declined, and the jobs' wall in microseconds; and the
+    /// selector's counts of what it asked and did: samples wanted, builds
+    /// started, installed, cancelled and suspended, the exits by kind, and
+    /// retentions that ended with the form files retired.
+    pub samples: AtomicU64,
+    pub sampled: AtomicU64,
+    pub sample_declined: AtomicU64,
+    pub sample_us: AtomicU64,
+    pub sel_samples: AtomicU64,
+    pub sel_builds: AtomicU64,
+    pub sel_installs: AtomicU64,
+    pub sel_cancelled: AtomicU64,
+    pub sel_suspended: AtomicU64,
+    pub sel_exits: [AtomicU64; 3],
+    pub sel_retired: AtomicU64,
+    /// The rent toward the build's price and the price, nanoseconds, as
+    /// the selector holds them.
+    pub sel_excess_ns: AtomicU64,
+    pub sel_c_build_ns: AtomicU64,
+    /// Form files the controller retired: taken out of their cells through
+    /// the epoch and given dead names for the idle sweep.
+    pub retired: AtomicU64,
 }
 
 impl ZEvents {
@@ -2788,6 +2811,141 @@ pub(super) fn thread_major_faults() -> Option<u64> {
     None
 }
 
+/// What a sample of a partition says its form would be (design 2.6.1):
+/// [`SAMPLE_GROUPS`] groups formed at evenly spaced ranks with the real
+/// `fill_group`, each fill and each decode-plus-walk timed on the thread's
+/// own clock, and the major faults the fills' touches took, with the wall
+/// they waited, as the first measured price of a fault the selector has.
+/// Taken over the live mapping: the fills read the records the groups are
+/// made of, which is what a build reads of them.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Sample {
+    /// The partition's keys and its record bytes.
+    pub nkeys: u64,
+    pub recs_len: u64,
+    /// Groups formed, and the records in them.
+    pub groups: u64,
+    pub records: u64,
+    /// The pages the form is estimated to take, and the bytes of the form:
+    /// the pages, a fence entry a page and the filter.
+    pub pages_est: u64,
+    pub w_z: u64,
+    /// The form's resident part, estimated: the fence entries and the
+    /// filter.
+    pub resident_est: u64,
+    /// The fills' thread CPU, nanoseconds, over `records`: the build's CPU
+    /// a record.
+    pub fill_ns: u64,
+    /// The decodes' and walks' thread CPU over `groups` pages: what a read
+    /// through the form pays a page.
+    pub decode_ns: u64,
+    /// The sample's wall less its CPU, nanoseconds, and the major faults it
+    /// took: the price of a fault, where any were taken.
+    pub wait_ns: u64,
+    pub faults: u64,
+    /// Declined: the floor, a block-backed record, or no group formed.
+    pub declined: Option<Decline>,
+}
+
+/// Groups a sample forms.
+pub(super) const SAMPLE_GROUPS: usize = 32;
+
+/// `blob`'s sample, see [`Sample`]; `floor` is the record bytes under which
+/// the partition is declined (`Options::zpages_min_bytes`).
+pub(super) fn sample(
+    blob: &Blob<MmapBytes>,
+    id: u64,
+    end_seq: u64,
+    floor: usize,
+) -> Result<Sample> {
+    let facts = blob.z_source_facts().ok_or_else(|| {
+        super::err("z sample: the segment has no checksum row to bind a form file to")
+    })?;
+    let (recs, dir) = blob
+        .record_regions()
+        .ok_or_else(|| super::err("z sample: the segment's records are not resident"))?;
+    let recs_len = usize::try_from(facts.recs_len).unwrap_or(usize::MAX);
+    let mut s = Sample {
+        nkeys: facts.nkeys,
+        recs_len: facts.recs_len,
+        ..Sample::default()
+    };
+    if recs_len < floor {
+        s.declined = Some(Decline::Small(recs_len));
+        return Ok(s);
+    }
+    if blob.blocks() > 0 {
+        s.declined = Some(Decline::BlockBacked);
+        return Ok(s);
+    }
+    let nkeys = blob.keys();
+    let bind = bind32(id, end_seq, facts.nkeys, facts.row_crc);
+    let images = SegImages::new(recs, dir, nkeys);
+    let mut scratch = FillScratch::new();
+    let mut buf = GroupBuf::new();
+    let mut page = [0u8; ZPAGE];
+    let flt0 = thread_major_faults().unwrap_or(0);
+    let cpu0 = super::thread_cpu_ns();
+    let wall0 = std::time::Instant::now();
+    let mut last_nopage: Option<NoPage> = None;
+    let mut key_bytes = 0u64;
+    for i in 0..SAMPLE_GROUPS {
+        let rank = i * nkeys / SAMPLE_GROUPS;
+        if rank >= nkeys {
+            break;
+        }
+        let c0 = super::thread_cpu_ns();
+        match fill_group(&images, rank, 0, bind, &mut scratch, &mut page) {
+            Fill::Page(g) => {
+                let c1 = super::thread_cpu_ns();
+                s.fill_ns = s.fill_ns.saturating_add(c1.saturating_sub(c0));
+                let (h, payload) = parse_page(&page, bind).map_err(|e| {
+                    super::err(&format!("z sample: a page fails its own parse: {e}"))
+                })?;
+                let group = decode_group(&h, payload, &mut buf).map_err(|e| {
+                    super::err(&format!("z sample: a page fails its own decode: {e}"))
+                })?;
+                walk_group(group, g.count, None).map_err(|e| {
+                    super::err(&format!("z sample: a group fails its own walk: {e}"))
+                })?;
+                s.decode_ns = s
+                    .decode_ns
+                    .saturating_add(super::thread_cpu_ns().saturating_sub(c1));
+                s.groups += 1;
+                s.records += g.count as u64;
+                key_bytes += record_key(images.image(rank), 0).map_or(0, |k| k.len() as u64);
+            }
+            Fill::NoPage(np) => {
+                s.fill_ns = s
+                    .fill_ns
+                    .saturating_add(super::thread_cpu_ns().saturating_sub(c0));
+                last_nopage = Some(np);
+            }
+            Fill::End => break,
+            Fill::Mismatch => return Err(super::err("z sample: a page fails its own decode")),
+        }
+    }
+    s.faults = thread_major_faults().unwrap_or(0).saturating_sub(flt0);
+    let cpu = super::thread_cpu_ns().saturating_sub(cpu0);
+    s.wait_ns = (wall0.elapsed().as_nanos().min(u64::MAX as u128) as u64).saturating_sub(cpu);
+    if s.groups == 0 {
+        s.declined = Some(last_nopage.map_or(Decline::Small(recs_len), Decline::NoPage));
+        return Ok(s);
+    }
+    let mean_count = s.records as f64 / s.groups as f64;
+    s.pages_est = (nkeys as f64 / mean_count).ceil().max(1.0) as u64;
+    let mean_key = key_bytes / s.groups;
+    s.resident_est = s
+        .pages_est
+        .saturating_mul(8 + mean_key)
+        .saturating_add(filter_bytes(nkeys) as u64);
+    s.w_z = s
+        .pages_est
+        .saturating_mul(ZPAGE as u64)
+        .saturating_add(s.resident_est);
+    Ok(s)
+}
+
 /// The platform's reading: the v1 memory controller's group where the
 /// process has one (this host is a hybrid whose v1 line wins), else the
 /// unified hierarchy's group with the least of `memory.max` and
@@ -2886,6 +3044,28 @@ mod tests {
         i.set_fault_cost(Duration::from_micros(40));
         assert_eq!(i.faults(), Some(7));
         assert_eq!(i.fault_cost(), Some(Duration::from_micros(40)));
+    }
+
+    /// A sample of a partition: thirty-two groups, every one timed, the
+    /// pages estimated from their records, the form's bytes under the
+    /// records', and the declines the builder makes made here first.
+    #[test]
+    fn a_sample_estimates_the_form_from_thirty_two_groups() {
+        let fx = Fixture::new("sample", suite(6000, 0x5A4), 1 << 16);
+        let s = sample(&fx.blob, ID, END, 0).unwrap();
+        assert_eq!(s.declined, None, "{s:?}");
+        assert_eq!(s.nkeys, 6000);
+        assert_eq!(s.groups, SAMPLE_GROUPS as u64, "{s:?}");
+        assert!(s.records >= s.groups, "{s:?}");
+        let mean = s.records as f64 / s.groups as f64;
+        assert_eq!(s.pages_est, (6000.0 / mean).ceil() as u64, "{s:?}");
+        assert!(s.w_z < s.recs_len, "the form under the records: {s:?}");
+        assert_eq!(s.w_z, s.pages_est * ZPAGE as u64 + s.resident_est, "{s:?}");
+        assert!(s.fill_ns > 0 && s.decode_ns > 0, "timed: {s:?}");
+        // The builder's own declines, made first: the floor.
+        let d = sample(&fx.blob, ID, END, usize::MAX).unwrap();
+        assert!(matches!(d.declined, Some(Decline::Small(_))), "{d:?}");
+        assert_eq!((d.groups, d.w_z), (0, 0), "{d:?}");
     }
 
     /// The thread's major faults are read, and are the count the suite
