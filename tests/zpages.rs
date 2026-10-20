@@ -2378,6 +2378,140 @@ fn the_memo_serves_repeated_reads_of_a_partition_and_off_every_read_decodes() {
     }
 }
 
+/// The heads arm (`Options::zpages_seek_ord`): a scan's seek and cut by
+/// the ordered index and the raw records, the walk after them the
+/// sidecar's. The windows agree with the model as the fence's do, the walks
+/// are served, and the seeks touch the raw form, which the door counts.
+#[test]
+fn the_heads_arm_seeks_through_the_raw_form_and_scans_the_same() {
+    let dir = scratch("heads");
+    let mut db = Db::create(
+        &dir,
+        forced(|o| {
+            o.partition_bytes = Some(160 << 10);
+            o.zpages_seek_ord = true;
+        }),
+    )
+    .unwrap();
+    let mut model = ordered_load(&mut db, 4000, 0x4EAD);
+    db.zpages_settle().unwrap();
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let mut rng = Rng(0x4EAD1);
+    for _ in 0..200 {
+        let k = keys[rng.below(keys.len())].clone();
+        match rng.below(3) {
+            0 => {
+                db.delete(&k);
+                model.insert(k, Vec::new());
+            }
+            1 => {
+                let new = [k.as_slice(), b"+"].concat();
+                let v = suite_value(&mut rng);
+                db.append(&new, &v);
+                model.entry(new).or_default().push(v);
+            }
+            _ => {
+                let v = suite_value(&mut rng);
+                db.append(&k, &v);
+                model.entry(k).or_default().push(v);
+            }
+        }
+    }
+    db.commit().unwrap();
+    let mut starts: Vec<Vec<u8>> = vec![b"".to_vec(), vec![0xff; 8]];
+    for f in sidecar_files(&dir) {
+        for fk in fence_keys(&f).into_iter().step_by(9) {
+            starts.extend(around(&fk));
+        }
+    }
+    let before = db.zpage_counts();
+    let touches = db.raw_touches();
+    let r = db.reader().unwrap();
+    for start in &starts {
+        for limit in [1usize, 5, 57, 300] {
+            let want = window(&model, start, limit);
+            let what = format!("from {:?} for {limit}", String::from_utf8_lossy(start));
+            same_window(
+                &scanned(&db, start, limit),
+                &want,
+                &format!("writer, {what}"),
+            );
+            same_window(
+                &scanned(&r, start, limit),
+                &want,
+                &format!("handle, {what}"),
+            );
+        }
+    }
+    let after = db.zpage_counts();
+    assert!(
+        after.scans > before.scans,
+        "the walks are the sidecars': {after:?}"
+    );
+    assert_eq!(
+        (after.raw_scans, after.fallbacks),
+        (before.raw_scans, 0),
+        "{after:?}"
+    );
+    if cfg!(debug_assertions) {
+        assert!(db.raw_touches() > touches, "the seeks read the raw form");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The prefetch arm (`Options::zpages_scan_prefetch`): the scans agree
+/// with the model as without it, every walk that wants more than its
+/// first page asks once, and a walk of one key asks for nothing.
+#[test]
+fn the_prefetch_arm_scans_the_same_and_asks_once_a_walk() {
+    let dir = scratch("prefetch");
+    let mut db = Db::create(
+        &dir,
+        forced(|o| {
+            o.partition_bytes = Some(160 << 10);
+            o.zpages_scan_prefetch = true;
+        }),
+    )
+    .unwrap();
+    let model = ordered_load(&mut db, 4000, 0x9FE7);
+    db.zpages_settle().unwrap();
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let before = db.zpage_counts();
+    let mut long = 0u64;
+    for (i, start) in keys.iter().step_by(97).enumerate() {
+        let limit = [1usize, 3, 57, 300][i % 4];
+        long += u64::from(limit >= 57);
+        same_window(
+            &scanned(&db, start, limit),
+            &window(&model, start, limit),
+            &format!("from {:?} for {limit}", String::from_utf8_lossy(start)),
+        );
+    }
+    let after = db.zpage_counts();
+    let walks = after.scans - before.scans;
+    // A walk that wants more keys than its first page holds asks once: the
+    // long scans do, but for one that starts in a partition's last page
+    // and asks from the next partition's walk instead; a scan of one or
+    // three keys seldom passes its page.
+    assert!(long >= 10 && walks > long, "{after:?}");
+    assert!(
+        after.prefetches >= long - 3 && after.prefetches <= walks,
+        "a prefetch a walk that wants more than a page ({long} long scans): {after:?}"
+    );
+    assert_eq!(
+        (after.raw_scans, after.fallbacks),
+        (before.raw_scans, 0),
+        "{after:?}"
+    );
+    db.close().unwrap();
+    let off = Db::open(&dir, forced(|o| o.partition_bytes = Some(160 << 10))).unwrap();
+    assert_eq!(off.zpage_counts().prefetches, 0);
+    off.scan(b"", 500, |_, _| {}).unwrap();
+    assert_eq!(off.zpage_counts().prefetches, 0, "off: no walk asks");
+    drop(off);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn windows_over(name: &str, cache: bool) {
     // The scans of a covered partition answer as if the form were not there,
     // with the unsealed keys laid over it: updates, inserts between records

@@ -393,6 +393,9 @@ pub struct ZCounts {
     /// nothing.
     pub memo_hits: u64,
     pub memo_misses: u64,
+    /// Walks that asked for the pages after their first at once
+    /// (`Options::zpages_scan_prefetch`).
+    pub prefetches: u64,
     /// Sidecars built, their pages, bytes, the pages that hold their
     /// group verbatim, the decoded bytes of every group, and compress
     /// calls; builds that failed and builds a merge outran.
@@ -748,6 +751,25 @@ pub struct Options {
     /// `memo_misses`). `supdb-nocachezpagesnomemo` is the arm with it off.
     #[doc(hidden)]
     pub zpages_memo: bool,
+    /// EXPERIMENT: a scan's seek of a covered partition, and the cut where
+    /// an unsealed key falls inside its walk, by the ordered index's heads
+    /// and the raw records, as before the form served scans, instead of by
+    /// the sidecar's fence and one group (`ZSide::seek`, `ZSide::cut_in`);
+    /// the walk after the seek stays the sidecar's. `supdb-nocachezpagesheads`
+    /// prices the seek by the fence against it. Off.
+    #[doc(hidden)]
+    pub zpages_seek_ord: bool,
+    /// EXPERIMENT: a scan of a covered partition that wants more keys than
+    /// its first page holds asks the kernel for the pages it will cross
+    /// after it, at once (`MADV_WILLNEED`, `zside::ZPREFETCH_PAGES` of them
+    /// at most, the keys still wanted over the mean a page), so that out
+    /// of core the walk finds them coming in instead of faulting on each;
+    /// in core the advice is a syscall for pages that are there. The design
+    /// gates it on the census's fault rate, which is a later stage's, so it
+    /// is an option and an arm, `supdb-nocachezpagesprefetch`, counted
+    /// `prefetches`. Off.
+    #[doc(hidden)]
+    pub zpages_scan_prefetch: bool,
     /// EXPERIMENT: the block forms hold the fold of the partition and the
     /// level-0 pieces alone, and the memtables' keys reach a scan through
     /// the scan snapshot, which every walk overlays on its block whatever
@@ -2176,6 +2198,8 @@ impl Default for Options {
             zpages_eager: true,
             zpages_warm: true,
             zpages_memo: true,
+            zpages_seek_ord: false,
+            zpages_scan_prefetch: false,
             forms_pieces_only: false,
             publish_in_background: true,
             adaptive_shape: false,
@@ -7477,6 +7501,9 @@ struct Slot {
     /// dispatch (`zside::memo_take`).
     zmemohits: AtomicU64,
     zmemomisses: AtomicU64,
+    /// Walks that asked for the pages after their first
+    /// (`Options::zpages_scan_prefetch`).
+    zprefetches: AtomicU64,
 }
 
 impl Slot {
@@ -7503,6 +7530,7 @@ impl Slot {
             znopage: AtomicU64::new(0),
             zmemohits: AtomicU64::new(0),
             zmemomisses: AtomicU64::new(0),
+            zprefetches: AtomicU64::new(0),
         }
     }
 }
@@ -14806,6 +14834,7 @@ impl Reader {
             raw_scans: rd.stat(|s| &s.zscans),
             memo_hits: rd.stat(|s| &s.zmemohits),
             memo_misses: rd.stat(|s| &s.zmemomisses),
+            prefetches: rd.stat(|s| &s.zprefetches),
             builds: get(&ev.builds),
             build_pages: get(&ev.build_pages),
             build_bytes: get(&ev.build_bytes),
@@ -15065,6 +15094,7 @@ impl Reader {
         self.zmemo_take();
         self.zbump_by(|s| &s.zscangroups, r.decoded);
         self.zbump_by(|s| &s.znopagescans, r.nopage);
+        self.zbump_by(|s| &s.zprefetches, r.prefetches);
         match r.end {
             zside::ScanEnd::Served => {
                 self.zbump(|s| &s.zscanz);
@@ -15092,6 +15122,9 @@ impl Reader {
         let Some(z) = seg.z.get() else {
             return raw();
         };
+        if self.opts.zpages_seek_ord {
+            return raw();
+        }
         let r = z.seek(&self.zmemo, key);
         self.zmemo_take();
         match r {
@@ -15116,6 +15149,9 @@ impl Reader {
         let Some(z) = seg.z.get() else {
             return BuildCtx::cut_at(seg, rank, end, uk);
         };
+        if self.opts.zpages_seek_ord {
+            return BuildCtx::cut_at(seg, rank, end, uk);
+        }
         let r = z.cut_in(&self.zmemo, rank, end, uk);
         self.zmemo_take();
         match r {
@@ -15194,6 +15230,10 @@ impl Reader {
     /// fallback counted where a check failed.
     fn pwalk_seek<'a>(&'a self, seg: &'a Seg, key: &[u8]) -> PWalk<'a> {
         if let Some(z) = seg.z.get() {
+            if self.opts.zpages_seek_ord {
+                let rank = seg.ord.seek(key, |r| seg.raw().key_at(r));
+                return self.pwalk_at(seg, rank);
+            }
             match zside::ZCursor::seek(&self.zmemo, z, seg.blob.for_sidecar(), key) {
                 Ok(c) => return PWalk::Z(c),
                 Err(zside::ZSeek::Fallback) => self.zbump(|s| &s.zfallbacks),
@@ -21374,7 +21414,14 @@ impl Db {
         if opts.zpages == ZPages::Always {
             let advise = Db::z_advise(&opts);
             for s in segs.iter().filter(|s| s.level > 0) {
-                Db::z_attach(dir, s, advise, opts.zpages_memo, &zev);
+                Db::z_attach(
+                    dir,
+                    s,
+                    advise,
+                    opts.zpages_memo,
+                    opts.zpages_scan_prefetch,
+                    &zev,
+                );
             }
         }
         let ord_rebuilt = segs.iter().filter(|s| s.ord_rebuilt).count() as u64;
@@ -24541,7 +24588,14 @@ impl Db {
     /// where it is, for a build to replace, and the segment is marked so
     /// that the build's round does not ask of the same file again and count
     /// it twice; no file is not a rejection.
-    fn z_attach(dir: &Path, seg: &Seg, advise: bool, memo: bool, ev: &zside::ZEvents) -> bool {
+    fn z_attach(
+        dir: &Path,
+        seg: &Seg,
+        advise: bool,
+        memo: bool,
+        prefetch: bool,
+        ev: &zside::ZEvents,
+    ) -> bool {
         let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) else {
             return false;
         };
@@ -24552,6 +24606,7 @@ impl Db {
             end,
             advise,
             memo,
+            prefetch,
         ) {
             Ok(side) => {
                 let installed = seg.z.install(side);
@@ -24593,7 +24648,16 @@ impl Db {
         // A file an attach refused was counted when it was, at open or in
         // an earlier call, and is replaced below.
         let refused = seg.z_declined.load(AtomicOrdering::Relaxed) == zside::DECLINED_REFUSED;
-        if !refused && Db::z_attach(&self.dir, seg, advise, self.opts.zpages_memo, ev) {
+        if !refused
+            && Db::z_attach(
+                &self.dir,
+                seg,
+                advise,
+                self.opts.zpages_memo,
+                self.opts.zpages_scan_prefetch,
+                ev,
+            )
+        {
             return;
         }
         let out = self.dir.join(zside::zpg_name(id, end));
@@ -24622,6 +24686,7 @@ impl Db {
                     end,
                     advise,
                     self.opts.zpages_memo,
+                    self.opts.zpages_scan_prefetch,
                 ) {
                     Ok(side) => {
                         if seg.z.install(side) {
@@ -30871,7 +30936,16 @@ impl Maint {
         }
         let advise = Db::z_advise(&self.opts);
         let refused = seg.z_declined.load(AtomicOrdering::Relaxed) == zside::DECLINED_REFUSED;
-        if !refused && Db::z_attach(&self.dir, &seg, advise, self.opts.zpages_memo, ev) {
+        if !refused
+            && Db::z_attach(
+                &self.dir,
+                &seg,
+                advise,
+                self.opts.zpages_memo,
+                self.opts.zpages_scan_prefetch,
+                ev,
+            )
+        {
             return;
         }
         let failed = |why: u8| {
@@ -30988,6 +31062,7 @@ impl Maint {
                         end,
                         Db::z_advise(&self.opts),
                         self.opts.zpages_memo,
+                        self.opts.zpages_scan_prefetch,
                     ) {
                         Ok(side) => {
                             if target.z.install(side) {
