@@ -228,3 +228,42 @@ close windows through the ticks, and the read that closes one is an
 operation of the next; `Maint` reaches `shared` through its deref to the
 handle, so a borrow of the reader table holds the whole of `self` and the
 tick clones the `Arc` first. The in-memory price, counted by callgrind in one sitting, three runs of each probe: 828 instructions a get for piece 1's binary (which read 830 in its own sitting: two a get between sittings, under half a get within one) against 836 for this piece's, eight a get, four in `leave` and four in the read's frame -- the two loads and branches of the handle's flag, with what the compiler reloads around them; the design budgeted a load and a branch at the start alone, and the end hook is the busy wall's, which the design did not have. About one percent of the read's instructions, to be read in the rate by the alternation of the two binaries when the arms exist (piece 4), which can only say it is not more.
+
+Piece 3a is in: `zfile::sample` (`Sample`, `SAMPLE_GROUPS`; a unit test
+over six thousand of the suite's records, the floor's decline among it),
+the sample job (`ZSampling`, `Maint::z_sample_start`/`z_sample_collect`:
+the reading summed into `zselect::Sampler` with `Costs`, `c_build` as the
+ski-rental price of the fills' CPU over the keys or the attach's reads at
+the price of a fault, `declined` where every partition is, the generation
+it was taken at; `z_sample_size` kept for `Model::phi_z` and
+`phi_z_scan`), `z_generation` (an FNV digest of the live partitions by
+name with their cells and declines), `z_report_take` (the collect's fates
+by `z_report`, the coverage by `Seg::foot` bytes), `z_drive` (retire
+through `z_retire_cell` and the spares; collect; attach every dormant
+file and start one build where builds are wanted, cancel a build in
+flight where they are not; a sample job where a reading is wanted),
+`z_next` building under `z_want_build` as under a settle, the scan keys
+in the census windows (`zcskeys`, `z_scan_len`), the counts and rows,
+`ZSelect::c_build`. Tests (`tests/zpages.rs`, through the seam with the
+price of a fault at a millisecond, since an unoptimized decode costs
+sixty microseconds a page where an optimized one costs five and at this
+host's forty-microsecond fault the form would not pay in the dev
+profile): builds when the measure says blocked; serves raw until the
+form file is whole; returns to raw when the limit is lifted and gives the
+disk back; a skewed workload that fits never builds; a cold start is not
+a capacity miss; the ski-rental price is paid before a build (the rent
+against the price at every stretch); a cancelled build counts as a
+switch; two stores do not share a measure; a neighbour's pressure opens
+the build clause; a store far past the cache still builds (two faults a
+raw read, the hash page and the record page, against the form's one);
+form files on disk are dormant under `Auto` and attached when the form is
+wanted. Six mutants held to firing: the dispatch asking for `Always`, a
+coverage always whole, a retire skipped, no cancel below building, the
+sampler's reading never fed, a dormant file not attached. Found on the
+way: the read and count dispatch asked for `Always` before the gate, so
+an `Auto` store in COMPACT read every key raw -- the first test that drove
+`Auto` to COMPACT caught it, and the piece-1 gate test had run under
+`Always` only. Not in this piece: the wasted-build budget's engine test
+(the report counts a superseded build; a test that supersedes four of
+eight needs merges under held builds) and the generation's test against
+a merge mid-reading. Next, 3b: E2's footprint and the trial.

@@ -493,6 +493,28 @@ pub struct ZCounts {
     pub sel_t_z_scan_ns: u64,
     pub sel_threads: u64,
     pub sel_mixed: u64,
+    /// The sampler's jobs, the partitions sampled, the ones declined and
+    /// the jobs' microseconds; and the selector's samples wanted, builds,
+    /// installs, cancelled and suspended builds, exits by kind and
+    /// retentions ended.
+    pub samples: u64,
+    pub sampled: u64,
+    pub sample_declined: u64,
+    pub sample_us: u64,
+    pub sel_samples: u64,
+    pub sel_builds: u64,
+    pub sel_installs: u64,
+    pub sel_cancelled: u64,
+    pub sel_suspended: u64,
+    pub sel_exit_e1: u64,
+    pub sel_exit_e2: u64,
+    pub sel_exit_e3: u64,
+    pub sel_retired: u64,
+    /// The rent toward the build's price and the price, nanoseconds.
+    pub sel_excess_ns: u64,
+    pub sel_c_build_ns: u64,
+    /// Form files the controller retired.
+    pub retired: u64,
     /// Partitions live, the ones with a form file installed, the ones of
     /// those out of service, and their pages, the pages a first decode has
     /// passed, the pages a check failed, the fences kept in memory, the
@@ -7614,6 +7636,9 @@ struct Slot {
     zccommit: AtomicU64,
     zcmixed: AtomicU64,
     zcmoved: AtomicU64,
+    /// The keys the scan windows' scans emitted, for the mean scan length
+    /// the sampler prices a scan through the form by.
+    zcskeys: AtomicU64,
 }
 
 impl Slot {
@@ -7656,12 +7681,13 @@ impl Slot {
             zccommit: AtomicU64::new(0),
             zcmixed: AtomicU64::new(0),
             zcmoved: AtomicU64::new(0),
+            zcskeys: AtomicU64::new(0),
         }
     }
 }
 
 // Three lines: the nine words that were here, the second form's thirteen
-// counters and the census's fifteen sums, thirty-seven words, are a
+// counters and the census's sixteen sums, thirty-eight words, are a
 // 384-byte slot since the census. What the layout is for is that no
 // other thread writes a slot's lines, which three lines a handle owns
 // keep as one did; the first line's sixteen words were full at the
@@ -12356,6 +12382,8 @@ struct ZWindow {
     cpu: u64,
     tick: u64,
     commit: (u64, usize),
+    /// The keys the window's scans emitted, for the mean scan length.
+    skeys: u64,
     /// The wall at the open, and the operations' busy wall since, ns.
     opened: std::time::Instant,
     busy: u64,
@@ -12388,6 +12416,7 @@ impl ZWindow {
             cpu: 0,
             tick: 0,
             commit: (0, 0),
+            skeys: 0,
             opened: now,
             busy: 0,
             t0: now,
@@ -14490,9 +14519,23 @@ impl Reader {
         w.cpu = thread_cpu_ns();
         w.tick = self.shared.z.ticks.load(AtomicOrdering::Relaxed);
         w.commit = (self.state().gen, self.mem().committed_log());
+        w.skeys = 0;
         w.opened = now;
         w.busy = 0;
         w.t0 = now;
+    }
+
+    /// The census's note of a scan's emitted keys, onto the window.
+    #[inline]
+    fn zcensus_scanned(&self, n: usize) {
+        if !self.zcensus {
+            return;
+        }
+        let mut w = self.zwin.get();
+        if w.open {
+            w.skeys = w.skeys.saturating_add(n as u64);
+            self.zwin.set(w);
+        }
     }
 
     /// Closes the window before this operation: the readings after its
@@ -14551,6 +14594,7 @@ impl Reader {
         if scan {
             bump(&s.zcscans, ops);
             bump(&s.zcsflt, flt);
+            bump(&s.zcskeys, w.skeys);
         } else {
             bump(&s.zcreads, ops);
             bump(&s.zcrflt, flt);
@@ -15311,6 +15355,22 @@ impl Reader {
             sel_t_z_scan_ns: get(&ev.sel_costs[4]),
             sel_threads: get(&ev.sel_threads),
             sel_mixed: get(&ev.sel_mixed),
+            samples: get(&ev.samples),
+            sampled: get(&ev.sampled),
+            sample_declined: get(&ev.sample_declined),
+            sample_us: get(&ev.sample_us),
+            sel_samples: get(&ev.sel_samples),
+            sel_builds: get(&ev.sel_builds),
+            sel_installs: get(&ev.sel_installs),
+            sel_cancelled: get(&ev.sel_cancelled),
+            sel_suspended: get(&ev.sel_suspended),
+            sel_exit_e1: get(&ev.sel_exits[0]),
+            sel_exit_e2: get(&ev.sel_exits[1]),
+            sel_exit_e3: get(&ev.sel_exits[2]),
+            sel_retired: get(&ev.sel_retired),
+            sel_excess_ns: get(&ev.sel_excess_ns),
+            sel_c_build_ns: get(&ev.sel_c_build_ns),
+            retired: get(&ev.retired),
             ..ZCounts::default()
         };
         for seg in self.segs().iter().filter(|s| s.level > 0) {
@@ -15549,7 +15609,7 @@ impl Reader {
             return raw(rank, n, f);
         }
         let Some(z) = seg.z.get() else {
-            if self.opts.zpages == ZPages::Always {
+            if self.z_on() {
                 self.zbump(|s| &s.zscans);
             }
             return raw(rank, n, f);
@@ -15727,7 +15787,7 @@ impl Reader {
         match w {
             None => {}
             Some(PWalk::Raw { .. }) => {
-                if self.opts.zpages == ZPages::Always {
+                if self.z_on() {
                     self.zbump(|s| &s.zscans);
                 }
             }
@@ -15830,7 +15890,12 @@ impl Reader {
         };
         if start == 0 {
             if let Some(seg) = part {
-                if self.opts.zpages == ZPages::Always {
+                // The form's dispatch under either option that may serve
+                // it; the gate inside decides, and `Off` keeps the raw path
+                // without the gate's load. The dispatch asked for `Always`
+                // here for as long as only `Always` was tested through it:
+                // a store under `Auto` in COMPACT read every key raw.
+                if self.opts.zpages != ZPages::Off {
                     // The partition from its form file, or from the raw form
                     // and counted where it has none in service.
                     n += self.part_read_z(seg, key, &mut f, seg_read)?;
@@ -16189,6 +16254,7 @@ impl Reader {
                 Walk::Done(n) => {
                     counts[0] += 1;
                     self.fs().lazy_scans.set(counts);
+                    self.zcensus_scanned(n);
                     return Ok(n);
                 }
                 Walk::Resume { seen } => (
@@ -16350,6 +16416,7 @@ impl Reader {
             }
             seen += 1;
         }
+        self.zcensus_scanned(seen);
         Ok(seen)
     }
 
@@ -21259,7 +21326,7 @@ impl Reader {
         let mut n = 0u64;
         if start == 0 {
             if let Some(seg) = part {
-                if self.opts.zpages == ZPages::Always {
+                if self.opts.zpages != ZPages::Off {
                     n += self.part_count_z(seg, key)?;
                 } else {
                     n += seg
@@ -29779,6 +29846,27 @@ struct Maint {
     z_census_last: ZCensusSums,
     z_census_refaults: Option<u64>,
     z_census_slots: Vec<u64>,
+    /// Whether the last decision wanted builds (`Decision::build`); the
+    /// sample job in flight, with the generation it was started at and
+    /// when; the reading it left, fed to the selector once; what the
+    /// sampler said of the store, kept for the model's compact-form
+    /// prediction at each S1 tick (the form's bytes, its resident part,
+    /// the pages a key); the builds collected since the last tick, by
+    /// fate; and the mean scan length the census last saw, keys.
+    z_want_build: bool,
+    z_sampling: Option<ZSampling>,
+    z_sample_ready: Option<zselect::Sampler>,
+    z_sample_size: Option<(u64, u64, f64)>,
+    z_report: zselect::Build,
+    z_scan_len: f64,
+}
+
+/// A sample job in flight (`zfile::sample` over the live partitions, on a
+/// thread of its own).
+struct ZSampling {
+    handle: std::thread::JoinHandle<Vec<(std::sync::Arc<Seg>, Result<zfile::Sample>)>>,
+    generation: u64,
+    started: std::time::Instant,
 }
 
 /// The slots' census words, summed: see `Slot`.
@@ -29792,6 +29880,7 @@ struct ZCensusSums {
     fcpu: u64,
     fflt: u64,
     mixed: u64,
+    skeys: u64,
 }
 
 impl std::ops::Deref for Maint {
@@ -30141,6 +30230,9 @@ impl Maint {
             b.cancel.store(true, AtomicOrdering::Release);
             b.job.join();
         }
+        if let Some(s) = self.z_sampling.take() {
+            let _ = s.handle.join();
+        }
         for job in self.sealing.drain(..) {
             let _ = job.handle.join();
         }
@@ -30204,6 +30296,12 @@ impl Maint {
             z_census_last: ZCensusSums::default(),
             z_census_refaults: None,
             z_census_slots: Vec::new(),
+            z_want_build: false,
+            z_sampling: None,
+            z_sample_ready: None,
+            z_sample_size: None,
+            z_report: zselect::Build::default(),
+            z_scan_len: 0.0,
         }
     }
 
@@ -31547,17 +31645,290 @@ impl Maint {
             None
         };
         let census = self.z_census(now);
+        self.z_sample_collect();
+        let (generation, build) = {
+            let _op = self.op();
+            (self.z_generation(), self.z_report_take())
+        };
         let input = zselect::Input {
             now,
             model,
-            sampler: None,
-            generation: 0,
+            sampler: self.z_sample_ready.take(),
+            generation,
             census,
-            build: zselect::Build::default(),
+            build,
             footprint: None,
         };
         let d = self.zsel.step(&input);
         self.z_apply(&d, model.as_ref());
+        self.z_drive(&d);
+    }
+
+    /// The identity of what a sampler's reading is a reading of: a digest
+    /// of the live partitions by name, each with whether it has a cell and
+    /// its decline. A partition made, rewritten or retired changes it, and
+    /// so does a form file attached or retired; a piece a seal adds does
+    /// not. Read under the caller's pin.
+    fn z_generation(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |b: &[u8]| {
+            for &x in b {
+                h ^= u64::from(x);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        for s in self.segs().iter().filter(|s| s.level > 0) {
+            mix(s.name.as_bytes());
+            mix(&[
+                u8::from(s.z.get().is_some()),
+                s.z_declined.load(AtomicOrdering::Relaxed),
+            ]);
+        }
+        h
+    }
+
+    /// The builder's report for this tick: the builds collected since the
+    /// last, by fate, and the coverage -- the footprint bytes of the
+    /// partitions with a cell over those of the partitions not declined.
+    /// Read under the caller's pin.
+    fn z_report_take(&mut self) -> zselect::Build {
+        let mut b = std::mem::take(&mut self.z_report);
+        let (mut covered, mut coverable) = (0u64, 0u64);
+        for s in self.segs().iter().filter(|s| s.level > 0) {
+            if s.z_declined.load(AtomicOrdering::Relaxed) != 0 {
+                continue;
+            }
+            let (h, r) = s.foot();
+            let bytes = h.saturating_add(r);
+            coverable = coverable.saturating_add(bytes);
+            if s.z.get().is_some() {
+                covered = covered.saturating_add(bytes);
+            }
+        }
+        b.coverage = if coverable == 0 {
+            0.0
+        } else {
+            covered as f64 / coverable as f64
+        };
+        b
+    }
+
+    /// A sample job started: the live partitions sampled on a thread of
+    /// its own at idle priority, each through its live mapping, the
+    /// segments held by their `Arc`s for the job's length.
+    fn z_sample_start(&mut self) {
+        let segs: Vec<std::sync::Arc<Seg>> = {
+            let _op = self.op();
+            self.segs()
+                .iter()
+                .filter(|s| s.level > 0)
+                .cloned()
+                .collect()
+        };
+        let generation = {
+            let _op = self.op();
+            self.z_generation()
+        };
+        let floor = self.opts.zpages_min_bytes;
+        let wake = self.wake.clone();
+        zfile::ZEvents::add(&self.shared.z.samples, 1);
+        let spawned = std::thread::Builder::new()
+            .name("supdb-zsample".into())
+            .spawn(move || {
+                idle_io_priority();
+                idle_cpu_priority();
+                let out: Vec<_> = segs
+                    .into_iter()
+                    .map(|s| {
+                        let r = match (Db::name_id(&s.name), Db::name_end_seq(&s.name)) {
+                            (Some(id), Some(end)) => {
+                                zfile::sample(s.blob.for_zfile(), id, end, floor)
+                            }
+                            _ => Err(err("z sample: a partition without an id")),
+                        };
+                        (s, r)
+                    })
+                    .collect();
+                if let Some(t) = wake {
+                    t.unpark();
+                }
+                out
+            });
+        if let Ok(handle) = spawned {
+            self.z_sampling = Some(ZSampling {
+                handle,
+                generation,
+                started: std::time::Instant::now(),
+            });
+        }
+    }
+
+    /// A finished sample job taken in: each partition's decline recorded
+    /// on its segment as the builder would record it, and the rest summed
+    /// into the selector's reading -- the form's bytes and resident part
+    /// for the model, the fills' CPU over the keys as the build's CPU and
+    /// its price, the decodes' CPU a page as the cost of a read and of a
+    /// scan through the form, the touches' wait a fault as the price of a
+    /// fault where any faulted, and the attach's price in place of the
+    /// build's where every partition's form file is on disk already.
+    fn z_sample_collect(&mut self) {
+        if !self
+            .z_sampling
+            .as_ref()
+            .is_some_and(|s| s.handle.is_finished())
+        {
+            return;
+        }
+        let job = self.z_sampling.take().expect("checked");
+        let shared = self.shared.clone();
+        let ev = &shared.z;
+        zfile::ZEvents::add(
+            &ev.sample_us,
+            job.started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+        );
+        let Ok(results) = job.handle.join() else {
+            return;
+        };
+        let (mut w_z, mut resident, mut nkeys, mut pages) = (0u64, 0u64, 0u64, 0u64);
+        let (mut fill_ns, mut records, mut decode_ns, mut groups) = (0u64, 0u64, 0u64, 0u64);
+        let mut recs_len = 0u64;
+        let (mut wait_ns, mut faults) = (0u64, 0u64);
+        let (mut on_disk, mut counted) = (0usize, 0usize);
+        for (seg, r) in results {
+            zfile::ZEvents::add(&ev.sampled, 1);
+            let s = match r {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if let Some(d) = s.declined {
+                if seg.z_declined.load(AtomicOrdering::Relaxed) == 0 {
+                    ev.declined(d);
+                    seg.z_declined.store(d.code(), AtomicOrdering::Relaxed);
+                }
+                zfile::ZEvents::add(&ev.sample_declined, 1);
+                continue;
+            }
+            counted += 1;
+            w_z = w_z.saturating_add(s.w_z);
+            resident = resident.saturating_add(s.resident_est);
+            nkeys = nkeys.saturating_add(s.nkeys);
+            recs_len = recs_len.saturating_add(s.recs_len);
+            pages = pages.saturating_add(s.pages_est);
+            fill_ns = fill_ns.saturating_add(s.fill_ns);
+            records = records.saturating_add(s.records);
+            decode_ns = decode_ns.saturating_add(s.decode_ns);
+            groups = groups.saturating_add(s.groups);
+            wait_ns = wait_ns.saturating_add(s.wait_ns);
+            faults = faults.saturating_add(s.faults);
+            let on = Db::name_id(&seg.name)
+                .zip(Db::name_end_seq(&seg.name))
+                .is_some_and(|(id, end)| self.dir.join(zfile::zpg_name(id, end)).is_file());
+            on_disk += usize::from(on);
+        }
+        let declined = counted == 0;
+        let fill_per_record = if records > 0 {
+            fill_ns as f64 * 1e-9 / records as f64
+        } else {
+            0.0
+        };
+        let build_cpu = fill_per_record * nkeys as f64;
+        let decode_per_page = if groups > 0 {
+            decode_ns as f64 * 1e-9 / groups as f64
+        } else {
+            0.0
+        };
+        let t_f = (faults > 0).then(|| wait_ns as f64 * 1e-9 / faults as f64);
+        let priced_t_f = t_f.unwrap_or(zselect::PRIOR_T_F);
+        // The attach reads the trailer, the resident part and sixteen
+        // sampled pages of each file, each a page the device may fault.
+        let attach = (resident as f64 / zselect::PAGE as f64 + 17.0 * counted as f64) * priced_t_f;
+        let c_build = if !declined && on_disk == counted {
+            attach
+        } else {
+            zselect::ski_rental_price(build_cpu, None)
+        };
+        let pages_per_key = if nkeys > 0 {
+            pages as f64 / nkeys as f64
+        } else {
+            0.0
+        };
+        let pages_per_scan = self.z_scan_len * pages_per_key + 1.0;
+        let costs = zselect::Costs {
+            t_f,
+            t_hit: None,
+            t_hit_scan: None,
+            t_z: Some(zselect::PRIOR_T_HIT + 1.25 * decode_per_page),
+            t_z_scan: Some(zselect::PRIOR_T_HIT_SCAN + pages_per_scan * 1.25 * decode_per_page),
+        };
+        self.z_sample_size = (!declined).then_some((w_z, resident, pages_per_key));
+        self.z_sample_ready = Some(zselect::Sampler {
+            costs,
+            c_build,
+            declined,
+            generation: job.generation,
+        });
+        if self.z_trace {
+            eprintln!(
+                "zsample partitions {counted} declined {declined} on_disk {on_disk} keys {nkeys} records {recs_len} w_z {w_z} resident {resident} build_cpu {build_cpu:.4} c_build {c_build:.4} t_f {t_f:?} decode_per_page {decode_per_page:.3e}"
+            );
+        }
+    }
+
+    /// What the decision asks of the segment work, after it is published:
+    /// the form files retired where the retention ended; a finished job
+    /// collected; the next build or attach started where builds are
+    /// wanted, every dormant form file attached in one turn and one build
+    /// at a time as `Always` does, or a build in flight cancelled where
+    /// they are not; a sample job started where a reading is wanted.
+    fn z_drive(&mut self, d: &zselect::Decision) {
+        self.z_want_build = d.build;
+        if d.retire {
+            let segs: Vec<std::sync::Arc<Seg>> = {
+                let _op = self.op();
+                self.segs()
+                    .iter()
+                    .filter(|s| s.level > 0 && s.z.get().is_some())
+                    .cloned()
+                    .collect()
+            };
+            for seg in segs {
+                if let Some(dead) = z_retire_cell(&self.shared, &self.dir, &seg) {
+                    self.spares.push(dead);
+                }
+                zfile::ZEvents::add(&self.shared.z.retired, 1);
+            }
+        }
+        if self.zbuild.as_ref().is_some_and(|b| b.job.is_finished()) {
+            let b = self.zbuild.take().expect("checked");
+            let op = self.op();
+            self.z_collect(b);
+            drop(op);
+        }
+        if d.build {
+            // A turn attaches what is on disk and starts one job; a
+            // partition without a form file on disk ends the turn with a
+            // build thread, and the next turn goes on after it.
+            let mut turns = {
+                let _op = self.op();
+                self.segs().len()
+            };
+            while self.zbuild.is_none() && turns > 0 {
+                turns -= 1;
+                let next = {
+                    let _op = self.op();
+                    self.z_next()
+                };
+                let Some((seg, kind)) = next else { break };
+                self.z_start(seg, kind);
+            }
+        } else if let Some(b) = &self.zbuild {
+            if matches!(b.job, ZJob::Build(_)) {
+                b.cancel.store(true, AtomicOrdering::Release);
+            }
+        }
+        if d.sample && self.z_sampling.is_none() && self.z_sample_ready.is_none() {
+            self.z_sample_start();
+        }
     }
 
     /// The interval's census (S2): the slots' census words summed and
@@ -31587,9 +31958,13 @@ impl Maint {
             fcpu: rd.stat(|s| &s.zcfcpu),
             fflt: rd.stat(|s| &s.zcfflt),
             mixed: rd.stat(|s| &s.zcmixed),
+            skeys: rd.stat(|s| &s.zcskeys),
         };
         let last = std::mem::replace(&mut self.z_census_last, sums);
         let d = |a: u64, b: u64| a.saturating_sub(b);
+        if d(sums.scans, last.scans) > 0 {
+            self.z_scan_len = d(sums.skeys, last.skeys) as f64 / d(sums.scans, last.scans) as f64;
+        }
         let mut threads = 0u32;
         self.z_census_slots.resize(rd.slots.len(), 0);
         for (i, s) in rd.slots.iter().enumerate() {
@@ -31696,10 +32071,17 @@ impl Maint {
                     (h.saturating_add(sh), r.saturating_add(sr))
                 })
         };
+        let (phi_z, phi_z_scan) = match self.z_sample_size {
+            Some((w_z, resident, pages_per_key)) => {
+                let z = zselect::model_z(budget, resident, w_z);
+                (Some(z), Some(z * (self.z_scan_len * pages_per_key + 1.0)))
+            }
+            None => (None, None),
+        };
         Some(zselect::Model {
             phi_raw: zselect::model_raw(budget, hash, records),
-            phi_z: None,
-            phi_z_scan: None,
+            phi_z,
+            phi_z_scan,
             refault_rate,
             budget,
         })
@@ -31733,6 +32115,22 @@ impl Maint {
         {
             ev.sel_costs[i].store(ns(c), AtomicOrdering::Relaxed);
         }
+        ev.sel_samples
+            .store(c.samples_wanted, AtomicOrdering::Relaxed);
+        ev.sel_builds.store(c.builds, AtomicOrdering::Relaxed);
+        ev.sel_installs.store(c.installs, AtomicOrdering::Relaxed);
+        ev.sel_cancelled
+            .store(c.build_cancelled, AtomicOrdering::Relaxed);
+        ev.sel_suspended
+            .store(c.build_suspended, AtomicOrdering::Relaxed);
+        for (i, n) in c.exits.into_iter().enumerate() {
+            ev.sel_exits[i].store(n, AtomicOrdering::Relaxed);
+        }
+        ev.sel_retired.store(c.retired, AtomicOrdering::Relaxed);
+        ev.sel_excess_ns
+            .store(ns(Some(self.zsel.excess())), AtomicOrdering::Relaxed);
+        ev.sel_c_build_ns
+            .store(ns(Some(self.zsel.c_build())), AtomicOrdering::Relaxed);
         if self.z_trace && (model.is_some() || d.event.is_some()) {
             eprintln!(
                 "zselect {:?} gate {} census {} build {} sample {} event {:?} model {:?}",
@@ -31760,7 +32158,7 @@ impl Maint {
             }
             let why = s.z_declined.load(AtomicOrdering::Relaxed);
             let kind = match s.z.get() {
-                Some(z) if z.damaged() && self.z_settling => ZKind::Rebuild,
+                Some(z) if z.damaged() && (self.z_settling || self.z_want_build) => ZKind::Rebuild,
                 Some(z)
                     if !z.damaged()
                         && self.opts.zpages_warm
@@ -31770,7 +32168,10 @@ impl Maint {
                 }
                 Some(_) => continue,
                 None if why == 0 || why == zfile::DECLINED_REFUSED => ZKind::Build,
-                None if why == zfile::DECLINED_FAILED && self.z_settling && s.z_retry_due() => {
+                None if why == zfile::DECLINED_FAILED
+                    && (self.z_settling || self.z_want_build)
+                    && s.z_retry_due() =>
+                {
                     ZKind::Retry
                 }
                 None => continue,
@@ -31949,6 +32350,7 @@ impl Maint {
                             if target.z.install(side) {
                                 ev.built(&built);
                                 zfile::ZEvents::add(&ev.attached, 1);
+                                self.z_report.installed += 1;
                             }
                         }
                         Err(_) => {
@@ -31962,6 +32364,7 @@ impl Maint {
                 None => {
                     // Finished after the landing that retired its segment:
                     // a dead name, unlinked at the idle tick.
+                    self.z_report.superseded += 1;
                     let n = shared.next_dead.fetch_add(1, AtomicOrdering::Relaxed);
                     let dead = self.dir.join(zfile::zpg_dead_name(n));
                     if std::fs::rename(&out, &dead).is_ok() {
@@ -31986,8 +32389,12 @@ impl Maint {
                 zfile::ZEvents::add(&ev.build_orphaned, 1);
                 seg.z_declined
                     .store(zfile::DECLINED_FAILED, AtomicOrdering::Relaxed);
+                self.z_report.superseded += 1;
             }
-            Err(_) => failed(zfile::DECLINED_FAILED),
+            Err(_) => {
+                failed(zfile::DECLINED_FAILED);
+                self.z_report.failed += 1;
+            }
         }
     }
 

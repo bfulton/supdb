@@ -1132,6 +1132,12 @@ impl ZSelect {
         self.threads
     }
 
+    /// The build's price (`C_build`), seconds, as the sampler's reading
+    /// has it; 0 without one.
+    pub fn c_build(&self) -> f64 {
+        self.sampler.map_or(0.0, |s| s.c_build)
+    }
+
     /// The dwell: `max(DWELL_FLOOR, DWELL_BUILD_FACTOR * the last build's
     /// wall)`. A switch must pay back what it cost, and a long build costs
     /// more.
