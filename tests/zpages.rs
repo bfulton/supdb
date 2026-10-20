@@ -1938,9 +1938,20 @@ fn a_callback_that_reads_again_leaves_the_value_it_was_lent_alone() {
 fn covered_and_uncovered_partitions_agree_across_their_boundaries() {
     // The first partition built fails, the rest are given sidecars: reads
     // and scans cross from a partition read raw into one read from its
-    // sidecar and answer as the model does.
+    // sidecar and answer as the model does. The builds are left to the
+    // settle: under the eager build the load's landings start them on the
+    // segment work's thread, and on a loaded box every one of them had
+    // finished before the hook was set, so the hook failed nothing and
+    // every partition was covered, one run in twelve.
     let dir = scratch("mixed");
-    let mut db = Db::create(&dir, forced(|o| o.partition_bytes = Some(160 << 10))).unwrap();
+    let mut db = Db::create(
+        &dir,
+        forced(|o| {
+            o.partition_bytes = Some(160 << 10);
+            o.zpages_eager = false;
+        }),
+    )
+    .unwrap();
     let model = ordered_load(&mut db, 6000, 0x30C);
     db.fail_next_zpage_build();
     db.zpages_settle().unwrap();
