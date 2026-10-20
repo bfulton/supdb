@@ -331,3 +331,19 @@ test read a build's temp name for a live partition, started after it
 had collected the builds, as a file that outlived its segment (a temp
 name of a live segment stands now); and the tick wait of twenty seconds
 was too short for a segment work turn under that load once (a minute).
+The gate rerun with the machine free was killed the same way, and
+`dmesg` named it: the memory cgroup's kill of `rustc` at 13.3 GiB of
+anonymous memory, compiling the checked `db` test binary, against the
+group's limit of 13.4. The tree before (a0f18e6) compiled it at a
+sampled peak of 13.17 GiB, so the gate had sat two percent under the
+limit and the twenty-two lines of source since (the dispatch fix and
+two accessors) crossed it -- a creep over the two days the compact
+form and the controller added eighteen thousand lines to the engine,
+not a step. The peak comes in the codegen's last two minutes, where
+the debug info is emitted; the same compile with line tables alone
+(`debug = 1`) peaked at 6.96 GiB in 17 minutes against 13.17 in 24,
+with the line tables the same size in the binary (12.9 MB against
+13.6) and the location lists (100 MB) and half the type info gone. The
+checked profile asks for line tables now, as the suite's manifest
+already did, and the gate's sampler reads the peak of every binary it
+compiles, which is the proof the manifest's setting is in effect.
