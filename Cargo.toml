@@ -37,8 +37,13 @@ debug = true
 # prefetch span that summed a rank and a scan's limit of `usize::MAX`
 # wrapped through the checks green and panicked in every debug build.
 # The wasm module and the suite's binaries keep the release profile:
-# the checks cost code size there and time in a measurement.
+# the checks cost code size there and time in a measurement. Debug info
+# is line tables here, as in the suite's manifest: a backtrace names its
+# lines with those, and the full information doubled the memory of the
+# fat-LTO compile of `tests/db.rs`, which outgrew what a build has here
+# (CLAUDE.md, running the checks). It changes no code.
 [profile.checked]
 inherits = "release"
 overflow-checks = true
 debug-assertions = true
+debug = 1
