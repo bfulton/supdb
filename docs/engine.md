@@ -3661,7 +3661,7 @@ straddle an arena block is laid in two parts and its value copied once
 for the reads; a key over 65,535 bytes does not enter a run. The bytes
 are the buffer path's byte for byte, which `tests/db.rs` requires of the
 finished segments and of the file a crash leaves under both shapes,
-with the same batches recovered from each.
+with the same batches recovered from each. The device's own count of the load's writes, read around eighteen loads of ten thousand keys for the engine before the stream and after it, is 7.6 MB a load against 4.4, two fifths fewer, where the suite's dirtied-bytes quantity moved three and a half percent; the quick gate found it a fortnight later, flagged against a window of the host's own class (`bench/CLAUDE.md`, the window keyed on the host).
 
 It took four shapes to price, and the first three lost for reasons that
 had nothing to do with the copies. The first wrote and hinted at the

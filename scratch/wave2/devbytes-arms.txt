@@ -1,0 +1,19 @@
+##### supdb,supdb-manifestrename load at 10000: 21:54:33
+exit 0
+load bytes_on_disk_per_byte               1.3135        1.3100   0.997x     0/3      0.250
+load device_bytes_per_byte                1.3489        1.3489   1.000x     0/0      1.000
+load ops_per_s                       649695.4942   676149.4829   1.041x     3/3      0.250
+180 quantities: 0 marked *, where a coin marks about 9.0; 0 marked **, which holds for the table as a whole (Holm)
+##### supdb,supdb-manifestfree load at 10000: 21:54:33
+exit 0
+load bytes_on_disk_per_byte               1.3135        1.3135   1.000x     0/0      1.000
+load device_bytes_per_byte                1.3489        1.3489   1.000x     0/0      1.000
+load ops_per_s                       585384.7459   641689.8723   1.096x     2/3      1.000
+180 quantities: 0 marked *, where a coin marks about 9.0; 0 marked **, which holds for the table as a whole (Holm)
+##### supdb,supdb-copyvals load at 10000: 21:54:34
+exit 0
+load bytes_on_disk_per_byte               1.3135        1.3135   1.000x     0/0      1.000
+load device_bytes_per_byte                1.3489        1.3489   1.000x     0/0      1.000
+load ops_per_s                       907142.7787   779704.7835   0.860x     1/3      1.000
+180 quantities: 0 marked *, where a coin marks about 9.0; 0 marked **, which holds for the table as a whole (Holm)
+##### manifest-bytes done 21:54:34

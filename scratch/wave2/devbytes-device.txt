@@ -1,0 +1,10 @@
+##### old engine 4feec4d built 22:06:00
+old run 1: device 136504 KB over 18 loads = 7583 KB a load; suite device_bytes_per_byte 1.3983
+old run 2: device 136264 KB over 18 loads = 7570 KB a load; suite device_bytes_per_byte 1.3983
+old run 3: device 136208 KB over 18 loads = 7567 KB a load; suite device_bytes_per_byte 1.3983
+##### head 5df834c built 22:07:31
+head run 1: device 78932 KB over 18 loads = 4385 KB a load; suite device_bytes_per_byte 1.3489
+head run 2: device 78824 KB over 18 loads = 4379 KB a load; suite device_bytes_per_byte 1.3489
+head run 3: device 78808 KB over 18 loads = 4378 KB a load; suite device_bytes_per_byte 1.3489
+back on claude/recover-consolidate-branches-5rwvr5
+##### devcounter done 22:07:40
