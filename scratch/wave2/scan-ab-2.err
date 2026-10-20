@@ -1,0 +1,8 @@
+bench ab: supdb-nocachezpages against supdb-nocache at 3000000 keys, scans of 100, 6 pairs after a warmup, passes load,read,scan,scan-threaded,mixes, ops divided by 10
+    34s  rep 0/6 (warmup)
+    66s  rep 1/6
+   100s  rep 2/6
+   132s  rep 3/6
+   166s  rep 4/6
+   198s  rep 5/6
+   231s  rep 6/6
