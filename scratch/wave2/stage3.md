@@ -379,6 +379,43 @@ serves; it is why the form is the controller's to enter past memory
 (stage 4) and never a default, and what it buys is read out of core
 (`ooc-scan-pairing.sh`), below.
 
+The out-of-core pairing (`ooc-scan-pairing.sh raw`; `ooc-raw-ab-1.out`,
+`ooc-raw-ab-2.out`; ten million keys under a gibibyte, the operations
+divided by ten, six pairs after the warmup, two sittings with the arms
+swapped, read as form over raw): the scan pass at 9.6x and 10.4x on one
+thread, 6.1x on two and 6.6x and 6.7x on three, with no fault a scan in
+any rep and no bytes read against the raw form's 3.1 faults a scan on one
+thread and 1.6 on two and three; the point reads at 2.8x and 2.7x, 4.4x
+and 4.0x, 5.1x and 5.0x, with 0.06 and 0.05 faults a read on one thread,
+0.006 on two and none on three against the raw form's 0.43-0.48 (the
+proof sitting's cells again); the mixes A 1.40x and 1.45x, B 2.50x and
+2.33x, C 4.33x and 4.27x, D 3.61x and 4.0x, F 1.46x and 1.60x; the
+ordered load 0.75x and 0.77x and the shuffled load 0.77x and 0.74x. Six
+pairs of six in every cell in both sittings, and the counts whole both
+times: fifty-three sidecars for fifty-three partitions, 93 and 96 builds
+(the shuffled load's rewrites), 5.4 million scan walks served and none
+raw, no fallback, 13.6 million groups decoded for the walks. Against the
+design's registration (7.3 of `scratch/design/zpages.md`): the scan
+entries a second at 7.6 and 8.3 million on one thread against 3.5-8
+registered and 24 million on three against 9-22; the faults a scan 0.000
+against at most 0.3; the point reads inside their bands; A and F inside
+theirs, B, C and D above theirs; the loads inside theirs. The one cell
+short is E: 50.9 and 51.3 thousand operations a second against 90-180
+thousand registered and LMDB's banked 138 thousand, 1.12x of the raw form
+in both sittings, while its faults an operation fell from 0.29-0.30 to
+0.017 and 0.011. So E's cost under the form is CPU and not faults, and
+it is in core as well (0.38x and 0.45x of raw where the scan pass reads
+0.30x, so E loses less than the pass there and gains far less here). What
+an operation of E's is: a scan of fifty from a Zipfian start over a store
+the four mixes before it have written into, with its own inserts past the
+end, so every scan takes the overlay path, where the form's cut at an
+unsealed key inside the walk and its values at an emit each open a group
+the walk opened too; whether that, the memo's miss rate over fifty-key
+walks, or the commits is E's time is what `e-probe.sh` separates -- the
+mixes' time by kind and the store's counters per mix, in core and under
+the bound -- and it runs after the heads and prefetch pairings. Nothing
+is changed for E before that reading.
+
 ## What 2b's sittings leave open, read before 3's
 
 - The eager build's pairing (`eager-pairing.sh`, `eager-ab-1.out` and
