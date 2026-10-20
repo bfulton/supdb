@@ -347,3 +347,23 @@ with the line tables the same size in the binary (12.9 MB against
 checked profile asks for line tables now, as the suite's manifest
 already did, and the gate's sampler reads the peak of every binary it
 compiles, which is the proof the manifest's setting is in effect.
+The in-memory pairing (7.5) was taken on b4cc915
+(`scratch/wave2/auto-pairing.sh`, the tables
+`auto-ab-{100000,300000}-{1,2}.out`): `supdb` against
+`supdb-autozpages`, twelve pairs a sitting, two sittings with the arms
+swapped, 206 quantities a table. Nothing is marked under Holm in any
+sitting, and no mark keeps its sign in the second: at a hundred thousand
+keys the shuffled load read 0.89x for the controller's arm (1/12, p
+.006) and D 1.10x (10/12, p .039) in the first sitting and 1.01x and
+0.94x in the second; at three hundred thousand the lag sweep's 1% point
+read 1.43x (11/12, p .006) and its 0% point 1.24x for the controller's
+arm in the first sitting and 1.02x and 1.08x in the second, and
+`publish_ms` 0.59x and then 1.12x -- position effects, every one. The
+controller's arm reports no build start, no sample, no census window
+and no install in any sitting: its nonzero `zpage_*` rows are the stores
+opened under `Auto` (2 a rep), the selector's steps (15 at a hundred
+thousand keys, 45-47 at three hundred thousand, one a census interval),
+its S1 evaluations (3 and 6, one a second) and the thread count it saw
+(2). In memory the controller costs nothing the pairs resolve and builds
+nothing, which is what 7.5 asked; the quick row's deterministic
+quantities and the bounded rung (7.4) are the sittings after it.

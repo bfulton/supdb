@@ -1,0 +1,14 @@
+bench ab: supdb-autozpages against supdb at 100000 keys, scans of 100, 12 pairs after a warmup
+     3s  rep 0/12 (warmup)
+     6s  rep 1/12
+    10s  rep 2/12
+    13s  rep 3/12
+    16s  rep 4/12
+    20s  rep 5/12
+    23s  rep 6/12
+    26s  rep 7/12
+    30s  rep 8/12
+    33s  rep 9/12
+    36s  rep 10/12
+    39s  rep 11/12
+    42s  rep 12/12
