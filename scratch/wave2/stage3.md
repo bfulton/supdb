@@ -477,6 +477,39 @@ faults, a twentieth lost where it does not, so the option stays off and
 is the controller's lever, to be turned on by the census's fault rate
 over the scans (stage 4) and never by a flag.
 
+The E probe (`e-probe.sh`; `e-probe-v1-*` the first run with the time by
+kind alone, `e-probe-3m.*` and `e-probe-10m.*` the run with the form's
+counts per mix, which `mixcounters` carries now): E's time is its scans
+in both arms, 93-98% of it, and the commits the rest. In core at three
+million keys a scan of E's, fifty keys from a Zipfian start, costs the
+raw form 5.9-8.4 µs and the form 15.2-16.8, where the scan pass's scan
+of a hundred costs them 3.3 and 10.8; under the bound at ten million,
+with the sidecars cold after the load, 21.6-24.5 against 22.5-22.8, with
+0.33 faults an operation against 0.04. The form's counts say what an E
+scan does: 2.5-2.65 partition walks a scan, 0.9-1.0 group decoded, and
+33-34 group opens served by the memo -- thirty-four opens for fifty keys
+where the pass's scan of a hundred makes four and a half. The suite's
+Zipfian is not scrambled (`workload.rs`: rank zero is key zero), so the
+mixes' updates and E's own starts pile onto the lowest keys, and an E
+window there crosses about sixteen unsealed keys; for each one the
+overlay walk (`scan_partitions`) cuts the walk at it (`part_cut_z`: a
+fence search, a group open, a `group_seek` from the group's start),
+starts the walk again after it (`part_scan_z`: a group open, a walk to
+the rank) and reads the partition's values at the emit (`part_values_z`:
+a group open, a walk to the rank), each open a memo hit at about half a
+microsecond with the walk inside the group, which is the nine µs a scan
+the form pays over the raw form in core and the whole of E's loss. The
+raw form pays the same shape at its own prices, a binary search over the
+ordered index and a record read, which is why its E scan costs twice its
+pass scan too. The merge path (`scan_merged`) already walks a covered
+partition through a cursor that keeps its group and position across the
+turns (`ZCursor`), and that is the fix (piece 9, below): the overlay walk
+through the cursor, the cut a forward walk from where it stands, the
+emit's values the record under it, one open a group crossed, with the
+rank-based loop kept as the arm (`Options::zpages_walk_cursor`,
+`supdb-nocachezpagesrankwalk`) and priced on E and the scan passes in
+core and under the bound, two sittings each.
+
 ## What 2b's sittings leave open, read before 3's
 
 - The eager build's pairing (`eager-pairing.sh`, `eager-ab-1.out` and
