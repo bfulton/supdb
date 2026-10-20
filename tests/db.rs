@@ -5925,6 +5925,49 @@ fn overlay_model_opts(
     pieces_only: bool,
     fit: bool,
 ) {
+    overlay_model_z(name, block_cache, budget, upkeep, pieces_only, fit, false)
+}
+
+/// The overlay model with the compact form forced: every partition the
+/// flush makes gets a sidecar as it lands, and the scans walk them -- the
+/// bulk walk, the merge path over a piece and the block path alike -- with
+/// the unsealed keys laid over them as before.
+#[test]
+fn the_bulk_walk_lays_unsealed_keys_over_the_partitions_as_the_merge_does_with_zpages() {
+    overlay_model_z(
+        "overlay-zpages",
+        false,
+        0,
+        supdb::Upkeep::Inline,
+        false,
+        false,
+        true,
+    );
+}
+
+#[test]
+fn the_block_cache_answers_the_same_model_with_zpages() {
+    overlay_model_z(
+        "overlay-cache-zpages",
+        true,
+        0,
+        supdb::Upkeep::Inline,
+        false,
+        false,
+        true,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn overlay_model_z(
+    name: &str,
+    block_cache: bool,
+    budget: usize,
+    upkeep: supdb::Upkeep,
+    pieces_only: bool,
+    fit: bool,
+    zpages: bool,
+) {
     let d = dir(name);
     let opts = Options {
         seal_bytes: 1 << 20,
@@ -5934,6 +5977,12 @@ fn overlay_model_opts(
         upkeep,
         forms_pieces_only: pieces_only,
         forms_to_fit: fit,
+        zpages: if zpages {
+            supdb::ZPages::Always
+        } else {
+            supdb::ZPages::Off
+        },
+        zpages_min_bytes: 0,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -5954,6 +6003,7 @@ fn overlay_model_opts(
     db.commit().unwrap();
     db.flush().unwrap();
     m.flushed();
+    db.zpages_settle().unwrap();
     let (parts, l0) = db.levels();
     assert!(
         parts > 1 && l0 == 0,
@@ -6038,6 +6088,7 @@ fn overlay_model_opts(
     db.flush().unwrap();
     m.flushed();
     assert_eq!(db.levels().1, 0);
+    db.zpages_settle().unwrap();
     m.check(&db, "partitions only, after the merge");
     held(&db, budget);
 
@@ -6054,6 +6105,21 @@ fn overlay_model_opts(
         assert!(
             db.upkeep_counts()[0] > 0,
             "the thread made no pass, so nothing above tested it"
+        );
+    }
+    if zpages {
+        // The point reads above went through the sidecars and every
+        // partition has one; without the block cache the scans' partition
+        // walks went through them too, where the block path's walks stay
+        // raw.
+        let c = db.zpage_counts();
+        assert!(
+            c.partitions > 0 && c.sidecars == c.partitions && c.reads > 0,
+            "the compact form served the checks: {c:?}"
+        );
+        assert!(
+            block_cache || c.scans > 0,
+            "the scans went through the sidecars: {c:?}"
         );
     }
     db.close().unwrap();
@@ -6228,13 +6294,39 @@ fn a_reader_handle_sees_what_its_isolation_says() {
 /// under its key.
 #[test]
 fn readers_on_threads_keep_answering_through_seals_and_merges() {
-    let d = dir("readers-threads");
-    let opts = Options {
+    readers_through_seals_and_merges("readers-threads", false, true);
+}
+
+/// The same with the compact form forced: every partition the merges make
+/// gets a sidecar as it lands and the readers' point reads go through
+/// them, while the writer seals and merges under them and the landings
+/// retire the sidecars of the partitions they replace. The scans take the
+/// block path here, whose walks stay raw.
+#[test]
+fn readers_on_threads_keep_answering_through_seals_and_merges_with_zpages() {
+    readers_through_seals_and_merges("readers-threads-zpages", true, true);
+}
+
+/// And without the block cache, so the readers' scans walk the partitions
+/// through the sidecars' cursors while the landings retire them.
+#[test]
+fn readers_on_threads_keep_answering_through_seals_and_merges_with_zpages_and_no_cache() {
+    readers_through_seals_and_merges("readers-threads-zpages-nocache", true, false);
+}
+
+fn readers_through_seals_and_merges(name: &str, zpages: bool, cache: bool) {
+    let d = dir(name);
+    let mut opts = Options {
         seal_bytes: 32 << 10,
         partition_bytes: Some(64 << 10),
         l0_trigger: 2,
+        scan_block_cache: cache,
         ..Options::default()
     };
+    if zpages {
+        opts.zpages = supdb::ZPages::Always;
+        opts.zpages_min_bytes = 0;
+    }
     let mut db = Db::create(&d, opts).unwrap();
     let keys = 3000u32;
     let key = |k: u32| format!("key-{k:05}").into_bytes();
@@ -6320,11 +6412,32 @@ fn readers_on_threads_keep_answering_through_seals_and_merges() {
         "the writer partitioned under them: {:?}",
         db.levels()
     );
+    // Under the compact form, every partition standing has its sidecar
+    // before the closing reads, so they go through it.
+    db.zpages_settle().unwrap();
     // Every key's last version, from the writer's own handle and from a
     // fresh reader, agree.
     let r = db.reader().unwrap();
     for k in (0..keys).step_by(97) {
         assert_eq!(read_vec(&db, &key(k)), read_vec(&r, &key(k)), "key {k}");
+    }
+    if zpages {
+        // And a scan over the settled store; then the counts say the reads,
+        // the threads' during the run and these after it, were served by
+        // the sidecars and every partition has one, and without the block
+        // cache that the scans' partition walks were too.
+        let mut n = 0;
+        db.scan(&key(0), 200, |_, _| n += 1).unwrap();
+        assert!(n > 0);
+        let c = db.zpage_counts();
+        assert!(
+            c.partitions > 0 && c.sidecars == c.partitions && c.reads > 0,
+            "the compact form served the readers: {c:?}"
+        );
+        assert!(
+            cache || c.scans > 0,
+            "the scans went through the sidecars: {c:?}"
+        );
     }
 }
 
@@ -11154,6 +11267,7 @@ fn a_live_write_over_the_frozen_table_is_one_key_on_every_scan_path() {
         db.commit().unwrap();
         db.flush().unwrap();
         m.flushed();
+        db.zpages_settle().unwrap();
         assert!(db.levels().0 > 1, "{name}: partitions under the rest");
         // A piece: updates and new keys sealed and landed over them.
         for k in (0..3000u32).step_by(5) {
@@ -11202,8 +11316,23 @@ fn a_live_write_over_the_frozen_table_is_one_key_on_every_scan_path() {
         m.check(&db, &format!("{name}: the writer during the seal"));
         db.hold_seal_landing(false);
         db.settle().unwrap();
+        db.zpages_settle().unwrap();
         m.check(&r, &format!("{name}: a handle after the landing"));
         m.check(&db, &format!("{name}: the writer after the landing"));
+        if name.contains("zpages") {
+            // The point reads went through the sidecars and every partition
+            // has one; without the block cache the scans' partition walks
+            // went through them too, where the block path's walks stay raw.
+            let c = db.zpage_counts();
+            assert!(
+                c.partitions > 0 && c.sidecars == c.partitions && c.reads > 0,
+                "{name}: the compact form served the checks: {c:?}"
+            );
+            assert!(
+                !name.starts_with("nocache") || c.scans > 0,
+                "{name}: the scans went through the sidecars: {c:?}"
+            );
+        }
         drop(r);
         db.close().unwrap();
     }
@@ -11214,9 +11343,29 @@ fn a_live_write_over_the_frozen_table_is_one_key_on_every_scan_path() {
 /// over unrouted sources, the lazy snapshot, the snapshot's runs, a
 /// snapshot each handle builds alone, and frozen tables with no snapshot
 /// of their own.
-fn scan_path_arms() -> [(&'static str, Options); 7] {
+fn scan_path_arms() -> [(&'static str, Options); 9] {
     [
         ("default", Options::default()),
+        // The compact form forced, with the block cache and without it: the
+        // block path over the sidecars, and the merge and bulk-walk paths
+        // through them.
+        (
+            "zpages",
+            Options {
+                zpages: supdb::ZPages::Always,
+                zpages_min_bytes: 0,
+                ..Options::default()
+            },
+        ),
+        (
+            "nocachezpages",
+            Options {
+                zpages: supdb::ZPages::Always,
+                zpages_min_bytes: 0,
+                scan_block_cache: false,
+                ..Options::default()
+            },
+        ),
         (
             "cursormerge",
             Options {
@@ -11686,6 +11835,7 @@ fn partitions_under_a_piece(name: &str, base: Options) -> (Db, ScanModel, PathBu
     db.commit().unwrap();
     db.flush().unwrap();
     m.flushed();
+    db.zpages_settle().unwrap();
     assert!(db.levels().0 > 1, "{name}: partitions under the rest");
     for k in (0..3000u32).step_by(5) {
         m.append(&mut db, &key(k), "q");
@@ -11798,8 +11948,23 @@ fn a_writer_freezes_into_room_while_three_seals_are_held() {
         db.hold_seal_landing(false);
         db.settle().unwrap();
         assert_eq!(db.frozen_tables(), 0, "{name}: all three landed");
+        db.zpages_settle().unwrap();
         m.check(&r, &format!("{name}: a handle after the landings"));
         m.check(&db, &format!("{name}: the writer after the landings"));
+        if name.contains("zpages") {
+            // The point reads went through the sidecars and every partition
+            // has one; without the block cache the scans' partition walks
+            // went through them too, where the block path's walks stay raw.
+            let c = db.zpage_counts();
+            assert!(
+                c.partitions > 0 && c.sidecars == c.partitions && c.reads > 0,
+                "{name}: the compact form served the checks: {c:?}"
+            );
+            assert!(
+                !name.starts_with("nocache") || c.scans > 0,
+                "{name}: the scans went through the sidecars: {c:?}"
+            );
+        }
         drop(r);
         db.close().unwrap();
     }
