@@ -293,3 +293,27 @@ commit-free count and not the window count now. The price by callgrind, the piec
 The chain's bench step linked red once on the way, `ld terminated with
 signal 7` with the disk's allowance spent on a second bench target and
 the probes, as the notes say it does; cleared, the group ran green.
+
+Piece 4, the arms: `Policy::zpages_auto`, `Supdb::create_auto_zpages`
+and `create_nocache_auto_zpages`, the names, the guarantee, the
+dispatch, the `zpage_auto` row, `ZState::auto`, the refusal that asks
+nothing of the form under the controller but a form file in service
+(`zpages_refusal`, its test's `auto` cases), the design's roster, and
+`each_auto_arm_differs_from_its_base_in_the_controller_alone`. The
+measurements -- 7.5's quick-row quantities and the in-memory pairing
+of `supdb,supdb-autozpages` at a hundred and three hundred thousand keys
+in two sittings, 7.4's bounded rung against the forced arm -- are the
+sittings after it. Piece 3b's gate found the two trial tests red under
+`checked` in every run, the plain one and the stress's twelve, green
+under `dev`: the test helper that closes a window gave its closing read
+a fault, for the census test that counts every read's, so a hot set
+that faults nothing read a fault in sixty-five, over the suspect
+threshold of an optimized build (a decode at ten microseconds against
+a fault at a millisecond) and under the dev profile's (a decode at
+sixty), and E2 never saw the raw form fit. Found through a trace of
+E2's state (`ZSelect::e2_state`, printed on the controller's trace line
+now); the closing read takes no fault, and the one test that counts the
+closing read's has a close of its own. The rule is the small rungs'
+again: a threshold a test's fixture sits near is crossed by the profile
+that moves the costs under it, so a test's inputs are read against every
+threshold on the path under both profiles before its green is believed.

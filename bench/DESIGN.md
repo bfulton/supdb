@@ -248,9 +248,14 @@ off (`lmdb-nordahead`), the LMDB a user configures for the regime. The
 scan floor's file is written and synced outside the group and dropped
 from the cache; the floors and every pass run inside it.
 
-Nine more arms exist for a bounded pairing and are in no roster, because
+Eleven more arms exist for a bounded pairing and are in no roster, because
 each prices one engine option against the arm it differs from in one
 process (`bench ab --arms <base>,<arm>`) and is chosen by hand:
+`supdb-autozpages` and `supdb-nocacheautozpages` are `supdb` and
+`supdb-nocache` with the compact form the controller's to choose (a pass
+asks nothing of the form under them: what the controller builds and reads
+through is its decision, carried by the `zpage_*` rows, and only a form
+file out of service refuses the pass),
 `supdb-nocacheordread` reads a point through the ordered index,
 `supdb-nocachezpages` forces the compact second form for point reads and
 counts (a pass refuses it unless every partition has its form file and the

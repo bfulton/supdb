@@ -199,6 +199,9 @@ pub struct ZState {
     /// The form is forced on (`supdb::ZPages::Always`), as the engine's own
     /// options say and not as the arm's name does.
     pub forced: bool,
+    /// The form is the controller's to choose (`supdb::ZPages::Auto`): what
+    /// it reads through is its decision, and the rows carry it.
+    pub auto: bool,
     /// Point reads of a partition answered from a form file, over the
     /// store's life.
     pub reads: u64,
@@ -771,6 +774,13 @@ pub struct Supdb {
     /// `supdb-nocachezpagessettle`, the shape the forced arm's rows were
     /// first taken with.
     zpages_settle: bool,
+    /// The second form the controller's to choose (`Options::zpages` at
+    /// `ZPages::Auto`): `supdb-autozpages` beside `supdb`, and
+    /// `supdb-nocacheautozpages` beside `supdb-nocache`, each the base
+    /// with the controller and nothing else, so the pair prices what the
+    /// controller costs in memory, where it must build nothing, and what
+    /// it buys out of core, where it must reach the form.
+    zpages_auto: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -1177,6 +1187,9 @@ struct Policy {
     /// Its builds left to the settle (`Options::zpages_eager` off):
     /// `supdb-nocachezpagessettle`.
     zpages_settle: bool,
+    /// The form the controller's (`Options::zpages` at `ZPages::Auto`):
+    /// `supdb-autozpages`, `supdb-nocacheautozpages`.
+    zpages_auto: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -1278,6 +1291,7 @@ impl Default for Policy {
             zpages_prefetch: false,
             zpages_rankwalk: false,
             zpages_settle: false,
+            zpages_auto: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -3662,6 +3676,37 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with the second form the controller's to choose
+    /// (`Options::zpages` at `ZPages::Auto`), and nothing else moved:
+    /// `supdb-autozpages`. The pair against `supdb` prices the controller
+    /// in memory, where it must build nothing and the pair must read
+    /// level, and out of core, where it must reach the form and the cells
+    /// after the entry read against the forced arm's. Chosen by hand, as
+    /// `ab --arms supdb,supdb-autozpages`.
+    pub fn create_auto_zpages(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zpages_auto: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-nocache` with the second form the controller's to choose:
+    /// `supdb-nocacheautozpages`, the pair against `supdb-nocache` and
+    /// against `supdb-nocachezpages`, which forces what this arm decides.
+    pub fn create_nocache_auto_zpages(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                block_cache: false,
+                zpages_auto: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with the block cache bounded at 256 MB, the budget
     /// `rocksdb-tuned` runs its block cache on, so that comparison is on
     /// the same memory. Below the bound the two arms are one.
@@ -3783,6 +3828,7 @@ impl Supdb {
             zpages_prefetch,
             zpages_rankwalk,
             zpages_settle,
+            zpages_auto,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -3993,6 +4039,8 @@ impl Supdb {
             // whatever the engine ships for every other.
             zpages: if zpages {
                 supdb::ZPages::Always
+            } else if zpages_auto {
+                supdb::ZPages::Auto
             } else {
                 supdb::Options::default().zpages
             },
@@ -4180,6 +4228,7 @@ impl Supdb {
             zpages_prefetch,
             zpages_rankwalk,
             zpages_settle,
+            zpages_auto,
             ord_threads: Default::default(),
         })
     }
@@ -4777,6 +4826,13 @@ impl Engine for Supdb {
         if self.ordread {
             return "supdb-nocacheordread";
         }
+        if self.zpages_auto {
+            return if self.block_cache {
+                "supdb-autozpages"
+            } else {
+                "supdb-nocacheautozpages"
+            };
+        }
         if self.zpages {
             return if self.zpages_nodrop {
                 "supdb-nocachezpagesnodrop"
@@ -4985,6 +5041,10 @@ impl Engine for Supdb {
                 "zpage_forced",
                 (db.options().zpages == supdb::ZPages::Always) as u8 as f64,
             ),
+            (
+                "zpage_auto",
+                (db.options().zpages == supdb::ZPages::Auto) as u8 as f64,
+            ),
             ("zpage_reads", z.reads as f64),
             ("zpage_counts", z.counts as f64),
             ("zpage_decodes", z.decodes as f64),
@@ -5117,6 +5177,7 @@ impl Engine for Supdb {
         }
         Some(ZState {
             forced: db.options().zpages == supdb::ZPages::Always,
+            auto: db.options().zpages == supdb::ZPages::Auto,
             reads: c.reads,
             raw: c.rawserves + c.fallbacks,
             partitions: c.partitions,
@@ -5677,6 +5738,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocachezpagesprefetch"
         | "supdb-nocachezpagesrankwalk"
         | "supdb-nocachezpagessettle"
+        | "supdb-autozpages"
+        | "supdb-nocacheautozpages"
         | "supdb-cache256"
         | "supdb-l0"
         | "supdb-nopin"
@@ -5862,6 +5925,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nocachezpagesprefetch" => Box::new(Supdb::create_nocache_zpages_prefetch(dir)?),
         "supdb-nocachezpagesrankwalk" => Box::new(Supdb::create_nocache_zpages_rankwalk(dir)?),
         "supdb-nocachezpagessettle" => Box::new(Supdb::create_nocache_zpages_settle(dir)?),
+        "supdb-autozpages" => Box::new(Supdb::create_auto_zpages(dir)?),
+        "supdb-nocacheautozpages" => Box::new(Supdb::create_nocache_auto_zpages(dir)?),
         "supdb-cache256" => Box::new(Supdb::create_cache256(dir)?),
         "supdb-ingest" => Box::new(Supdb::create_ingest(dir)?),
         "supdb-ingestleave" => Box::new(Supdb::create_ingest_leave(dir)?),
@@ -6591,6 +6656,68 @@ mod tests {
         let after = arm.zpages_state().unwrap();
         assert_eq!((after.damaged, after.raw), (1, 2), "{after:?}");
         drop(arm);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `supdb-autozpages` is `supdb` with the controller and nothing else,
+    /// and `supdb-nocacheautozpages` is `supdb-nocache` the same way:
+    /// named, durable like their bases, opened under their names by the
+    /// dispatch, the form the controller's by the engine's own options and
+    /// neither forced nor off, and every other option the base's.
+    #[test]
+    fn each_auto_arm_differs_from_its_base_in_the_controller_alone() {
+        let root =
+            std::env::temp_dir().join(format!("supdb-bench-autoarms-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let new = |name: &str, make: fn(&Path) -> Res<Supdb>| {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            make(&d).unwrap()
+        };
+        for (name, make, base_name, base_make) in [
+            (
+                "supdb-autozpages",
+                Supdb::create_auto_zpages as fn(&Path) -> Res<Supdb>,
+                "supdb",
+                Supdb::create as fn(&Path) -> Res<Supdb>,
+            ),
+            (
+                "supdb-nocacheautozpages",
+                Supdb::create_nocache_auto_zpages,
+                "supdb-nocache",
+                Supdb::create_nocache,
+            ),
+        ] {
+            let arm = new(name, make);
+            let base = new(base_name, base_make);
+            assert_eq!(arm.name(), name);
+            assert_eq!(base.name(), base_name);
+            assert_eq!(guarantee(name), Some(Guarantee::Durable));
+            assert_eq!(guarantee(name), guarantee(base_name));
+            let (a, b) = (
+                arm.db.as_ref().unwrap().options(),
+                base.db.as_ref().unwrap().options(),
+            );
+            assert_eq!(a.zpages, supdb::ZPages::Auto);
+            assert_eq!(b.zpages, supdb::ZPages::Off);
+            assert!(arm.zpages_auto && !base.zpages_auto && !arm.zpages);
+            assert_eq!(arm.block_cache, base.block_cache);
+            assert_eq!(a.scan_block_cache, b.scan_block_cache);
+            assert_eq!(arm.partition, base.partition);
+            assert_eq!(arm.drain, base.drain);
+            assert_eq!(arm.durable, base.durable);
+            assert_eq!(arm.budget, base.budget);
+            assert_eq!(arm.advice, base.advice);
+            assert_eq!(arm.features(), base.features());
+            let state = arm.zpages_state().unwrap();
+            assert!(state.auto && !state.forced, "{state:?}");
+            let state = base.zpages_state().unwrap();
+            assert!(!state.auto && !state.forced, "{state:?}");
+            let d = root.join(format!("{name}-dispatch"));
+            std::fs::create_dir_all(&d).unwrap();
+            let opened = open(name, &d, 1).unwrap();
+            assert_eq!(opened.name(), name);
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
