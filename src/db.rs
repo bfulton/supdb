@@ -3158,6 +3158,112 @@ struct Seg {
 /// sealed before the first partitioning has the empty fence, as the
 /// pieces aligned to the first partition do, and it is the sequence that
 /// puts it before them.
+/// A merge's fences from the ranges `given` to it: the partitions standing
+/// (`parts`, which tile the key space) that any given range overlaps, and
+/// then every partition a level-0 segment over them also overlaps, until
+/// none reaches outside, in key order. A given range that is a partition's
+/// resolves to that partition; one a landing old, over a range the
+/// partitions since cut, resolves to the ones that tile it, where it had
+/// been taken as it was and stood beside them, two fences open at the same
+/// key. A piece is cut at the fences of the partitions standing when its
+/// table froze, and a merge landing before it lands leaves it over ranges
+/// it was not cut at: the growth takes those ranges in, since a key of an
+/// input past every fence belonged to no output. The result is a sorted
+/// run of disjoint partition ranges, which is what the merge cuts its one
+/// key list by.
+fn resolve_fences(parts: &[Fence], pieces: &[Fence], given: &[Fence]) -> Vec<Fence> {
+    let mut fences: Vec<Fence> = parts
+        .iter()
+        .filter(|p| {
+            given
+                .iter()
+                .any(|(lo, hi)| fences_overlap(lo, hi, &p.0, &p.1))
+        })
+        .cloned()
+        .collect();
+    loop {
+        let mut grew = false;
+        for (plo, phi) in pieces {
+            if !fences
+                .iter()
+                .any(|(lo, hi)| fences_overlap(plo, phi, lo, hi))
+            {
+                continue;
+            }
+            for p in parts {
+                if fences_overlap(plo, phi, &p.0, &p.1) && !fences.contains(p) {
+                    fences.push(p.clone());
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    fences.sort_by(|a, b| a.0.cmp(&b.0));
+    debug_assert!(
+        fences
+            .windows(2)
+            .all(|w| w[0].1.as_ref().is_some_and(|h| h <= &w[1].0)),
+        "a merge's fences overlap or are out of order: {:?}",
+        fences
+            .iter()
+            .map(|(lo, hi)| {
+                (
+                    String::from_utf8_lossy(lo).into_owned(),
+                    hi.as_ref().map(|h| String::from_utf8_lossy(h).into_owned()),
+                )
+            })
+            .collect::<Vec<_>>()
+    );
+    fences
+}
+
+#[cfg(test)]
+mod merge_fences {
+    use super::*;
+
+    fn f(lo: &str, hi: Option<&str>) -> Fence {
+        (lo.as_bytes().to_vec(), hi.map(|h| h.as_bytes().to_vec()))
+    }
+
+    /// A given range that stands resolves to itself; one a landing old,
+    /// over a range two partitions tile since, resolves to the two; a
+    /// piece over more ranges than the given grows the set to them; and
+    /// the result is sorted and disjoint whatever order the ranges came in.
+    #[test]
+    fn a_fence_a_landing_old_resolves_to_the_partitions_that_tile_it() {
+        let parts = vec![
+            f("", Some("key-00750")),
+            f("key-00750", Some("key-01500")),
+            f("key-01500", None),
+        ];
+        let aligned = vec![f("", Some("key-00750")), f("key-00750", Some("key-01500"))];
+        assert_eq!(
+            resolve_fences(&parts, &aligned, &[parts[1].clone()]),
+            vec![parts[1].clone()]
+        );
+        assert_eq!(
+            resolve_fences(&parts, &aligned, &[f("", Some("key-01500"))]),
+            parts[..2].to_vec(),
+            "the partition the landing split, as the two that tile it"
+        );
+        let wide = vec![f("key-00750", None)];
+        assert_eq!(
+            resolve_fences(&parts, &wide, &[parts[2].clone()]),
+            parts[1..].to_vec(),
+            "grown to the range the piece reaches into"
+        );
+        assert_eq!(
+            resolve_fences(&parts, &wide, &[parts[2].clone(), parts[0].clone()]),
+            parts,
+            "in key order whatever order they were given in"
+        );
+        assert!(resolve_fences(&parts, &aligned, &[]).is_empty());
+    }
+}
+
 /// Whether the range `[a_lo, a_hi)` meets `[b_lo, b_hi)`; `None` is open.
 fn fences_overlap(
     a_lo: &[u8],
@@ -9451,14 +9557,20 @@ impl Emitter<'_> {
         // The slices tile the ranks; a key that belongs to no piece is a
         // key that would have been dropped, silently, on the way to disk.
         if self.r < p.from || self.r >= p.to {
+            let all: Vec<String> = self
+                .pieces
+                .iter()
+                .map(|q| format!("[{}, {}) {}", q.from, q.to, q.name))
+                .collect();
             return Err(err(&format!(
-                "merge slices leave a key unassigned: rank {} against piece {} of {}, ranks [{}, {}), {}",
+                "merge slices leave a key unassigned: rank {} against piece {} of {}, ranks [{}, {}), {}; the pieces: {}",
                 self.r,
                 self.pi,
                 self.pieces.len(),
                 p.from,
                 p.to,
-                p.name
+                p.name,
+                all.join(" | ")
             )));
         }
         // Insurance against the class of bug that produced this line: a
@@ -11420,6 +11532,11 @@ struct Shared {
     /// between its two phases, the segments published and their fsyncs
     /// not yet paid (`Db::hold_seal_landing`, `Db::hold_seal_durable`).
     seal_hold: std::sync::atomic::AtomicU8,
+    /// A test's holds on the merge (`MERGE_HOLD_*`): the merge thread held
+    /// before its landing (`Db::hold_merge_landing`), and the planner made
+    /// to join a merge in flight before it plans (`Db::plan_joins_merge`),
+    /// which is the window a landing otherwise falls in by chance.
+    merge_hold: std::sync::atomic::AtomicU8,
     /// A seal's landing failed before its segments were published: no seal
     /// behind it in the queue lands from here, since a manifest a later
     /// landing wrote would cover the failed seal's sequence with its
@@ -20948,6 +21065,7 @@ impl Db {
             in_seal: AtomicUsize::new(0),
             in_merge: std::sync::atomic::AtomicBool::new(false),
             seal_hold: std::sync::atomic::AtomicU8::new(0),
+            merge_hold: std::sync::atomic::AtomicU8::new(0),
             seal_wedged: std::sync::atomic::AtomicBool::new(false),
             fail_landing: std::sync::atomic::AtomicBool::new(false),
             fail_presync: std::sync::atomic::AtomicBool::new(false),
@@ -21418,6 +21536,7 @@ impl Db {
             in_seal: AtomicUsize::new(0),
             in_merge: std::sync::atomic::AtomicBool::new(false),
             seal_hold: std::sync::atomic::AtomicU8::new(0),
+            merge_hold: std::sync::atomic::AtomicU8::new(0),
             seal_wedged: std::sync::atomic::AtomicBool::new(false),
             fail_landing: std::sync::atomic::AtomicBool::new(false),
             fail_presync: std::sync::atomic::AtomicBool::new(false),
@@ -24301,6 +24420,38 @@ impl Db {
     #[doc(hidden)]
     pub fn hold_seal_landing(&self, on: bool) {
         self.set_seal_hold(SEAL_HOLD_LANDING, on);
+    }
+
+    /// A test's: while `on`, a merge's thread waits before it returns its
+    /// outputs, so the merge is in flight for as long as the test says.
+    #[doc(hidden)]
+    pub fn hold_merge_landing(&self, on: bool) {
+        Db::set_hold(&self.shared.merge_hold, MERGE_HOLD_LANDING, on);
+    }
+
+    /// A test's: while `on`, a merge the planner would start beside one
+    /// still running waits for it and joins it first, instead of waiting
+    /// for the next turn -- the window a landing falls in by chance between
+    /// the planner's look at the partitions and the merge's start.
+    /// `merge_plan_joining` says when the planner is in that wait.
+    #[doc(hidden)]
+    pub fn plan_joins_merge(&self, on: bool) {
+        Db::set_hold(&self.shared.merge_hold, MERGE_HOLD_JOINS, on);
+    }
+
+    /// A test's: whether the planner is waiting to join a merge in flight
+    /// under `plan_joins_merge`.
+    #[doc(hidden)]
+    pub fn merge_plan_joining(&self) -> bool {
+        self.shared.merge_hold.load(AtomicOrdering::Acquire) & MERGE_HOLD_JOINING != 0
+    }
+
+    fn set_hold(hold: &std::sync::atomic::AtomicU8, bit: u8, on: bool) {
+        if on {
+            hold.fetch_or(bit, AtomicOrdering::AcqRel);
+        } else {
+            hold.fetch_and(!bit, AtomicOrdering::AcqRel);
+        }
     }
 
     fn set_seal_hold(&self, bit: u8, on: bool) {
@@ -28667,6 +28818,14 @@ impl SealReadable {
 const SEAL_HOLD_LANDING: u8 = 1;
 const SEAL_HOLD_DURABLE: u8 = 2;
 
+/// A test's holds on the merge (`Shared::merge_hold`): the merge thread
+/// held before it returns its outputs; a planned merge made to wait for the
+/// one running and join it before it plans; and the bit the planner sets
+/// while it waits in that join, for the test to release the first against.
+const MERGE_HOLD_LANDING: u8 = 1;
+const MERGE_HOLD_JOINS: u8 = 2;
+const MERGE_HOLD_JOINING: u8 = 4;
+
 /// The bits of `Shared::zbuild_hold`: a test's holds on the sidecar
 /// builder's thread, before its first write and before its rename, and
 /// beside each the bit the thread sets while it waits at that hold, its
@@ -29336,43 +29495,30 @@ impl Maint {
         }
     }
 
-    /// `fences` grown to every partition range that a level-0 segment over
-    /// them also overlaps, until none reaches outside, in key order. A
-    /// piece is cut at the fences of the partitions standing when its
-    /// table froze, and a merge landing before it lands leaves it over
-    /// ranges it was not cut at: taken as an input of a merge over some of
-    /// them, its keys past them belonged to no output, and the merge
-    /// refused ("merge slices leave a key unassigned"). Partitions tile
-    /// the key space, so the grown fences hold every key of every input.
-    fn cover_inputs(&self, mut fences: Vec<Fence>) -> Vec<Fence> {
+    /// The merge's fences: `given` resolved to the partitions standing now
+    /// and grown over the pieces, in key order (`resolve_fences`). Resolved
+    /// first, since the fences a caller planned may be a landing old:
+    /// `start_compact` joins a finished merge before it plans, the landing
+    /// replaces the partitions that merge rewrote, and a fence of a
+    /// partition that was gone named a range two of the new partitions
+    /// tiled -- the merge cut its keys at both, pieces [0, 1500) and
+    /// [0, 750) of one key list, and refused its own key ("merge slices
+    /// leave a key unassigned"), one run in a few hundred of the
+    /// reader-thread tests and once in an out-of-core sitting's load.
+    fn cover_inputs(&self, given: Vec<Fence>) -> Vec<Fence> {
         let parts: Vec<Fence> = self
             .segs()
             .iter()
             .filter(|s| s.level > 0)
             .map(|s| (s.lo.clone(), s.hi.clone()))
             .collect();
-        loop {
-            let mut grew = false;
-            for s in self.segs().iter().filter(|s| s.level == 0) {
-                if !fences
-                    .iter()
-                    .any(|(lo, hi)| fences_overlap(&s.lo, &s.hi, lo, hi))
-                {
-                    continue;
-                }
-                for p in &parts {
-                    if fences_overlap(&s.lo, &s.hi, &p.0, &p.1) && !fences.contains(p) {
-                        fences.push(p.clone());
-                        grew = true;
-                    }
-                }
-            }
-            if !grew {
-                break;
-            }
-        }
-        fences.sort_by(|a, b| a.0.cmp(&b.0));
-        fences
+        let pieces: Vec<Fence> = self
+            .segs()
+            .iter()
+            .filter(|s| s.level == 0)
+            .map(|s| (s.lo.clone(), s.hi.clone()))
+            .collect();
+        resolve_fences(&parts, &pieces, &given)
     }
 
     /// Whether the partitions of `segs`, in the live order, tile the key
@@ -30950,13 +31096,27 @@ impl Maint {
     /// first is O(store), which is what the merge measurements convicted.
     fn start_compact(&mut self, fences: Option<Vec<Fence>>) -> Result<()> {
         if let Some((_, h)) = &self.compacting {
-            if !h.is_finished() {
+            let joins =
+                self.shared.merge_hold.load(AtomicOrdering::Acquire) & MERGE_HOLD_JOINS != 0;
+            if !h.is_finished() && !joins {
                 // A merge is still running. Deferring rather than blocking
                 // keeps it off the commit path; the range it would have
                 // merged waits for the next seal.
                 return Ok(());
             }
-            self.join_compact()?;
+            // The landing that joins it replaces the partitions the merge
+            // rewrote, so the fences planned before it are resolved against
+            // the partitions standing after it (`cover_inputs`).
+            if joins {
+                self.shared
+                    .merge_hold
+                    .fetch_or(MERGE_HOLD_JOINING, AtomicOrdering::AcqRel);
+            }
+            let joined = self.join_compact();
+            self.shared
+                .merge_hold
+                .fetch_and(!MERGE_HOLD_JOINING, AtomicOrdering::AcqRel);
+            joined?;
         }
         // No piece merge runs when a partition merge starts, so the pieces
         // taken here are every piece of the ranges, the oldest included.
@@ -31028,6 +31188,7 @@ impl Maint {
         let ord_durable = self.opts.ord_durable;
         let job_inputs = inputs.clone();
         let wake = self.wake.clone();
+        let held = self.shared.clone();
         let handle = std::thread::spawn(move || {
             let out = compact_job(MergePlan {
                 dir,
@@ -31044,6 +31205,10 @@ impl Maint {
                 inline_max,
                 ord_durable,
             });
+            // A test's hold before the landing (`Db::hold_merge_landing`).
+            while held.merge_hold.load(AtomicOrdering::Acquire) & MERGE_HOLD_LANDING != 0 {
+                std::thread::park_timeout(MAINT_LAND_POLL);
+            }
             if let Some(t) = wake {
                 t.unpark();
             }
