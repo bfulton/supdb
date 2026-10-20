@@ -5076,6 +5076,8 @@ impl Engine for Supdb {
             ("zpage_sel_retired", z.sel_retired as f64),
             ("zpage_sel_excess_ns", z.sel_excess_ns as f64),
             ("zpage_sel_c_build_ns", z.sel_c_build_ns as f64),
+            ("zpage_footprint_pages", z.footprint_pages as f64),
+            ("zpage_footprint_bytes", z.footprint_bytes as f64),
             ("zpage_retired", z.retired as f64),
             ("zpage_partitions_at_end", z.partitions as f64),
             ("zpage_form files_at_end", z.form_files as f64),

@@ -266,4 +266,30 @@ an `Auto` store in COMPACT read every key raw -- the first test that drove
 `Always` only. Not in this piece: the wasted-build budget's engine test
 (the report counts a superseded build; a test that supersedes four of
 eight needs merges under held builds) and the generation's test against
-a merge mid-reading. Next, 3b: E2's footprint and the trial.
+a merge mid-reading.
+
+Piece 3b is in: the footprint on the handle's memo (`Memo::track`,
+`touched`, `distinct`; `ZMemo::tracking`, `track`, `footprint_pages`,
+`touch` from `open_group`), `Reader::zfootprint_track` at a window's
+abandon and under the census gates, the slot's `zcpages` (seventeen
+census words now) posted at a window's close under the form's gate,
+`Maint::z_footprint` (the bound from the store's quantities; `ZEvents`
+and `ZCounts` `footprint_pages`/`footprint_bytes` and their rows) fed as
+`Input::footprint`. Tests: the footprint counts the compact pages a
+handle touched (ten keys, the spread, the drop and the restart); the
+trial judges the refilled state (a one-page hot set, since the bound
+charges a page's keys with as many hash pages and the budget is a
+mebibyte, and the wide set never trials); a trial that finds the raw
+form faulting goes back; a form that stops paying is left (E3); a
+square wave switches at most once a dwell. Four mutants held to firing:
+no touch, the footprint never fed, the footprint not dropped, the bound
+without the hash. Learned: the trial's wall at this scale is a fifth of
+a second (three times sixty-five pages at a millisecond), so the engine
+test judges on the cached hot page and the fill path is the selector's
+replays'; the stress of piece 3a's gate found the census test's window
+count load-sensitive (a stretch's windows ran long under twelve
+processes, the resize cut the next stretch in two), and it asserts the
+commit-free count and not the window count now. The price by callgrind, the piece-3a probe against this one: through the form 881 instructions a get against 878, on the raw path 837 against 834 -- three fewer on both, since the census hooks had grown out of line (seventeen instructions of call and prologue a read through the form for a flag that said no: each is a flag inlined and the rest out of line now), and the page touch asks the memo's flag outside its cell, a load and a branch where the cell's borrow had read eighteen a get.
+The chain's bench step linked red once on the way, `ld terminated with
+signal 7` with the disk's allowance spent on a second bench target and
+the probes, as the notes say it does; cleared, the group ran green.

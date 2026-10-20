@@ -5404,6 +5404,234 @@ fn the_gate_decides_the_form_under_auto_as_under_always() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Reads through the form over `hot` keys, in stretches whose windows
+/// close through the ticks, for `secs` seconds of the injected clock, each
+/// read with `faults` faults on the seam: what a COMPACT store's handle
+/// does for the footprint and the exits.
+fn hot_reads(
+    db: &Db,
+    r: &Reader,
+    hot: &[Vec<u8>],
+    inject: &supdb::ZInject,
+    secs: u64,
+    faults: u64,
+) {
+    let mut t = 0.0f64;
+    let mut i = 0usize;
+    while t < secs as f64 {
+        for _ in 0..64 {
+            r.count(&hot[i % hot.len()]).unwrap();
+            if faults > 0 {
+                inject.add_faults(faults);
+            }
+            i += 1;
+        }
+        close_window(db, r, &hot[0]);
+        t += 0.4;
+    }
+}
+
+/// Stretches of sixty-four reads over `hot` with `faults` a read, each
+/// window closed through the ticks, until `cond` holds of the counts or
+/// `max` stretches have gone: whether it held.
+fn stretch_until(
+    db: &Db,
+    r: &Reader,
+    hot: &[Vec<u8>],
+    inject: &supdb::ZInject,
+    faults: u64,
+    max: usize,
+    cond: impl Fn(&supdb::db::ZCounts) -> bool,
+) -> bool {
+    let mut at = 0usize;
+    for _ in 0..max {
+        reads(r, hot, inject, 64, &mut at, faults);
+        close_window(db, r, &hot[0]);
+        if cond(&db.zpage_counts()) {
+            return true;
+        }
+    }
+    cond(&db.zpage_counts())
+}
+
+/// E2's footprint: a handle's distinct compact pages are counted while the
+/// form serves and the raw bound is drawn from them, a hot set of a few
+/// keys reading as a few pages and the whole store as all of them; the
+/// count goes when the form stops serving.
+#[test]
+fn the_footprint_counts_the_compact_pages_a_handle_touched() {
+    let (dir, db, _model, inject, r, keys, _) = compact_store("auto-footprint");
+    let hot: Vec<Vec<u8>> = keys.iter().step_by(2000).cloned().collect();
+    assert_eq!(hot.len(), 10);
+    hot_reads(&db, &r, &hot, &inject, 2, 0);
+    let c = db.zpage_counts();
+    assert!(
+        (1..=10).contains(&c.footprint_pages),
+        "ten keys touch at most ten pages: {c:?}"
+    );
+    // The bound is loose by design: a page's keys hash to as many hash
+    // pages, capped at the index, which this store's inline values make the
+    // larger part of.
+    let small = c.footprint_bytes;
+    assert!(
+        small > 10 * 3 * 4096 && small <= 10 * 62 * 4096 + 10 * 3 * 4096,
+        "the record pages and the hash's share: {c:?}"
+    );
+    let spread: Vec<Vec<u8>> = keys.iter().step_by(61).cloned().collect();
+    hot_reads(&db, &r, &spread, &inject, 4, 0);
+    let c = db.zpage_counts();
+    assert!(c.footprint_pages >= c.pages / 2, "the whole store: {c:?}");
+    assert!(c.footprint_bytes > small, "{c:?}");
+    // The gate off the form: the next operation drops the handle's count.
+    db.zgate_set(1);
+    r.count(&keys[0]).unwrap();
+    wait_steps(&db, 1);
+    db.zgate_set(2);
+    hot_reads(&db, &r, &hot, &inject, 1, 0);
+    let c = db.zpage_counts();
+    assert!((1..=10).contains(&c.footprint_pages), "begun again: {c:?}");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The trial judges the refilled state: a hot set whose raw form fits
+/// with room passes E2's measures, the trial runs raw through the gate
+/// with the cells kept, and once the refill's wall has passed the reads
+/// fault nothing and the trial leaves the form, kept for the retention;
+/// a hot set the raw form cannot hold never reaches a trial.
+#[test]
+fn the_trial_judges_the_refilled_state() {
+    let (dir, db, _model, inject, r, keys, _) = compact_store("auto-trial");
+    // One key, one compact page: the bound charges a page's keys with as
+    // many hash pages, and a budget of a mebibyte holds one page's worth.
+    let hot: Vec<Vec<u8>> = keys[..1].to_vec();
+    // A dwell since the install before a trial may start; then three E2
+    // measures of ten seconds, the hot set faulting nothing through the
+    // form.
+    wait_secs(&db, 61, 1);
+    assert!(
+        stretch_until(&db, &r, &hot, &inject, 0, 120, |c| c.sel_trials >= 1),
+        "the trial: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.phase, c.gate, c.sel_trials),
+        (4, 1, 1),
+        "the trial: {c:?}"
+    );
+    assert_eq!(
+        c.form_files, c.partitions,
+        "the cells stay through it: {c:?}"
+    );
+    // The raw form's hot page is in the cache already: the trial waits
+    // out the refill's wall -- three times the bound's pages at the price
+    // of a fault, a fifth of a second here, which the selector's own tests
+    // cover by the fill as well -- and the reads after it fault nothing.
+    assert!(
+        stretch_until(&db, &r, &hot, &inject, 0, 40, |c| c.phase != 4),
+        "judged: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!((c.sel_exit_e2, c.phase, c.gate), (1, 1, 1), "left: {c:?}");
+    assert_eq!(c.sel_trials_back, 0, "{c:?}");
+    assert_eq!(c.form_files, c.partitions, "kept for the retention: {c:?}");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    // The other store: the whole key set, which the raw form cannot hold
+    // in the budget, never fits E2's bound and never trials.
+    let (dir, db, _model, inject, r, keys, _) = compact_store("auto-trial-wide");
+    wait_secs(&db, 61, 1);
+    hot_reads(&db, &r, &keys, &inject, 32, 0);
+    let c = db.zpage_counts();
+    assert_eq!((c.phase, c.sel_trials), (3, 0), "no trial: {c:?}");
+    assert!(c.footprint_bytes > 1 << 19, "{c:?}");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A trial whose raw reads still fault goes back to the form, and a
+/// wrong trial doubles the back-off.
+#[test]
+fn a_trial_that_finds_the_raw_form_faulting_goes_back() {
+    let (dir, db, _model, inject, r, keys, _) = compact_store("auto-trial-back");
+    let hot: Vec<Vec<u8>> = keys[..1].to_vec();
+    wait_secs(&db, 61, 1);
+    assert!(
+        stretch_until(&db, &r, &hot, &inject, 0, 120, |c| c.sel_trials >= 1),
+        "the trial: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!((c.phase, c.sel_trials), (4, 1), "the trial: {c:?}");
+    // The raw form keeps faulting past the refill: a fault a read.
+    assert!(
+        stretch_until(&db, &r, &hot, &inject, 1, 60, |c| c.phase != 4),
+        "judged: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.sel_trials_back, c.phase, c.gate),
+        (1, 3, 2),
+        "back: {c:?}"
+    );
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A form that stops paying is left: reads through it faulting as much as
+/// the raw form would, for a dwell, and E3 leaves it.
+#[test]
+fn a_form_that_stops_paying_is_left() {
+    let (dir, db, _model, inject, r, keys, _) = compact_store("auto-e3");
+    wait_secs(&db, 61, 1);
+    hot_reads(&db, &r, &keys, &inject, 70, 2);
+    let c = db.zpage_counts();
+    assert_eq!((c.sel_exit_e3, c.phase, c.gate), (1, 1, 1), "left: {c:?}");
+    assert_eq!(c.form_files, c.partitions, "kept for the retention: {c:?}");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A square wave between a uniform workload that faults and one that
+/// does not switches at most once a dwell: the price, the dwell and the
+/// retention bound the switches whatever the period.
+#[test]
+fn a_square_wave_switches_at_most_once_per_dwell() {
+    let (dir, db, model, inject) = blocked_store("auto-wave");
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    let period = 30u64;
+    let periods = 10u64;
+    for p in 0..periods {
+        let faults = u64::from(p.is_multiple_of(2));
+        let mut t = 0.0;
+        while t < period as f64 {
+            reads(&r, &keys, &inject, 64, &mut at, faults);
+            close_window(&db, &r, &keys[0]);
+            t += 0.4;
+        }
+    }
+    let c = db.zpage_counts();
+    let dwells = period * periods / 60;
+    assert!(c.sel_switches <= dwells + 1, "{c:?}");
+    assert!(
+        c.sel_builds <= c.sel_installs + c.sel_cancelled + 1,
+        "{c:?}"
+    );
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Two stores in one process keep measures of their own: one driven to
 /// COMPACT, the other, which fits, stays FITS with nothing sampled.
 #[test]
@@ -5617,12 +5845,13 @@ fn windows_with_commits_count_for_the_rate_and_not_for_the_price_of_a_fault() {
     }
     close_window(&db, &r, &keys[0]);
     let c2 = db.zpage_counts();
+    // One window, or more where the windows before ran long under load
+    // and the resize cut this stretch in two: all of them commit-free.
+    assert!(c2.census_windows > c.census_windows, "{c2:?}");
     assert_eq!(
-        c2.census_windows,
-        c.census_windows + 1,
-        "one window, commit-free: {c2:?}"
+        c2.census_commit_windows, c.census_commit_windows,
+        "commit-free: {c2:?}"
     );
-    assert_eq!(c2.census_commit_windows, c.census_commit_windows, "{c2:?}");
     assert_eq!(
         (c2.census_reads, c2.census_read_faults),
         (1281, 1281),

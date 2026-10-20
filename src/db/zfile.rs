@@ -819,6 +819,12 @@ struct Memo {
     free: Vec<GroupBuf>,
     hits: u64,
     misses: u64,
+    /// E2's footprint (design 4.7): while the handle reads the compact form
+    /// under the controller, one bit a page it touched, by form file, and
+    /// the distinct pages so far; off and empty otherwise.
+    track: bool,
+    touched: std::collections::HashMap<u64, Vec<u64>>,
+    distinct: u64,
 }
 
 struct MemoEntry {
@@ -839,6 +845,31 @@ impl Memo {
             free: Vec::new(),
             hits: 0,
             misses: 0,
+            track: false,
+            touched: std::collections::HashMap::new(),
+            distinct: 0,
+        }
+    }
+
+    /// A page touched, for the footprint; nothing while it is not kept.
+    fn touch(&mut self, zfile: u64, page: u32, n_pages: usize) {
+        if !self.track {
+            return;
+        }
+        let words = n_pages.div_ceil(64).max(1);
+        let map = self
+            .touched
+            .entry(zfile)
+            .or_insert_with(|| vec![0u64; words]);
+        if map.len() < words {
+            map.resize(words, 0);
+        }
+        let (w, b) = ((page >> 6) as usize, page & 63);
+        if let Some(word) = map.get_mut(w) {
+            if *word & (1u64 << b) == 0 {
+                *word |= 1u64 << b;
+                self.distinct += 1;
+            }
         }
     }
 
@@ -918,23 +949,39 @@ impl Memo {
 /// A handle's memo (`Memo`) behind a `RefCell`: borrowed for a lookup or a
 /// put and never across a decode or a callback, so a callback's nested
 /// read through the same handle finds it free.
-pub(super) struct ZMemo(RefCell<Memo>);
+pub(super) struct ZMemo {
+    memo: RefCell<Memo>,
+    /// Whether the footprint is kept, outside the memo's cell: every page
+    /// open asks, and under `Always` and in the census phases that do not
+    /// serve the form the answer is no, at a load and a branch rather
+    /// than the cell's borrow -- eighteen instructions a point read
+    /// through the form with the borrow, counted, against the three the
+    /// flag costs.
+    track: Cell<bool>,
+}
 
 impl ZMemo {
     pub(super) fn new() -> ZMemo {
-        ZMemo(RefCell::new(Memo::new(ZMEMO_SLOTS, ZMEMO_BYTES)))
+        ZMemo::of(Memo::new(ZMEMO_SLOTS, ZMEMO_BYTES))
+    }
+
+    fn of(memo: Memo) -> ZMemo {
+        ZMemo {
+            memo: RefCell::new(memo),
+            track: Cell::new(false),
+        }
     }
 
     /// A test's: a memo of `slots` slots under `cap` bytes.
     #[cfg(test)]
     fn with(slots: usize, cap: usize) -> ZMemo {
-        ZMemo(RefCell::new(Memo::new(slots, cap)))
+        ZMemo::of(Memo::new(slots, cap))
     }
 
     /// The hits and misses since the last take, for the handle's counters
     /// (`Reader::zpage_counts`: `memo_hits`, `memo_misses`).
     pub(super) fn take_counts(&self) -> (u64, u64) {
-        let mut m = self.0.borrow_mut();
+        let mut m = self.memo.borrow_mut();
         let r = (m.hits, m.misses);
         m.hits = 0;
         m.misses = 0;
@@ -942,17 +989,46 @@ impl ZMemo {
     }
 
     fn get(&self, zfile: u64, page: u32) -> Option<(Arc<GroupBuf>, usize)> {
-        self.0.borrow_mut().get(zfile, page)
+        self.memo.borrow_mut().get(zfile, page)
+    }
+
+    /// Whether the footprint is kept, and the switch: turned off, the bitmap
+    /// and its count are dropped, since a footprint is of one stretch of
+    /// the compact form serving.
+    pub(super) fn tracking(&self) -> bool {
+        self.track.get()
+    }
+
+    pub(super) fn track(&self, on: bool) {
+        self.track.set(on);
+        let mut m = self.memo.borrow_mut();
+        m.track = on;
+        if !on {
+            m.touched = std::collections::HashMap::new();
+            m.distinct = 0;
+        }
+    }
+
+    /// The distinct compact pages touched since the footprint began.
+    pub(super) fn footprint_pages(&self) -> u64 {
+        self.memo.borrow().distinct
+    }
+
+    #[inline]
+    fn touch(&self, zfile: u64, page: u32, n_pages: usize) {
+        if self.track.get() {
+            self.memo.borrow_mut().touch(zfile, page, n_pages);
+        }
     }
 
     /// A buffer for a decode the memo will take: a displaced entry's, or
     /// a new one.
     fn fresh_buf(&self) -> GroupBuf {
-        self.0.borrow_mut().take_free()
+        self.memo.borrow_mut().take_free()
     }
 
     fn put(&self, zfile: u64, page: u32, group: Arc<GroupBuf>, len: usize) {
-        self.0.borrow_mut().put(zfile, page, group, len)
+        self.memo.borrow_mut().put(zfile, page, group, len)
     }
 }
 
@@ -1209,6 +1285,7 @@ impl ZFile {
             self.fail(p);
             return None;
         };
+        memo.touch(self.id, entry.page, self.n_pages);
         let was_verified = bit(&self.verified, p);
         // A compressed page goes through the memo: the group as a decode
         // before left it, for a page this process has verified, since a
@@ -2013,6 +2090,10 @@ pub(super) struct ZEvents {
     /// the selector holds them.
     pub sel_excess_ns: AtomicU64,
     pub sel_c_build_ns: AtomicU64,
+    /// E2's footprint as the tick last computed it: the compact pages the
+    /// handles touched, summed, and the raw bound in bytes.
+    pub footprint_pages: AtomicU64,
+    pub footprint_bytes: AtomicU64,
     /// Form files the controller retired: taken out of their cells through
     /// the epoch and given dead names for the idle sweep.
     pub retired: AtomicU64,

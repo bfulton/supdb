@@ -513,6 +513,10 @@ pub struct ZCounts {
     /// The rent toward the build's price and the price, nanoseconds.
     pub sel_excess_ns: u64,
     pub sel_c_build_ns: u64,
+    /// E2's footprint as the tick last computed it: the compact pages the
+    /// handles touched, summed, and the raw bound in bytes.
+    pub footprint_pages: u64,
+    pub footprint_bytes: u64,
     /// Form files the controller retired.
     pub retired: u64,
     /// Partitions live, the ones with a form file installed, the ones of
@@ -7639,6 +7643,12 @@ struct Slot {
     /// The keys the scan windows' scans emitted, for the mean scan length
     /// the sampler prices a scan through the form by.
     zcskeys: AtomicU64,
+    /// The distinct compact pages this handle has touched while the form
+    /// served under the controller (E2's footprint), posted at each
+    /// window's close and cleared when the form stops serving: a count and
+    /// not a sum, so the tick sums the slots for an upper bound on the
+    /// union.
+    zcpages: AtomicU64,
 }
 
 impl Slot {
@@ -7682,12 +7692,13 @@ impl Slot {
             zcmixed: AtomicU64::new(0),
             zcmoved: AtomicU64::new(0),
             zcskeys: AtomicU64::new(0),
+            zcpages: AtomicU64::new(0),
         }
     }
 }
 
 // Three lines: the nine words that were here, the second form's thirteen
-// counters and the census's sixteen sums, thirty-eight words, are a
+// counters and the census's seventeen sums, thirty-nine words, are a
 // 384-byte slot since the census. What the layout is for is that no
 // other thread writes a slot's lines, which three lines a handle owns
 // keep as one did; the first line's sixteen words were full at the
@@ -14444,20 +14455,37 @@ impl Reader {
     /// FITS's to stop and a window across the gate's change would be of
     /// two forms; otherwise a window due to close is closed, one is opened
     /// where none is, and the operation is counted by its class.
-    #[inline]
+    #[inline(always)]
     fn zcensus_begin(&self, scan: bool) {
-        if !self.zcensus {
-            return;
+        // The flag's load and branch inlined into the operation and the
+        // rest out of line: grown past what the compiler inlines, the
+        // whole hook cost a read through the form seventeen instructions
+        // of call and prologue under `Always`, counted, for a flag that
+        // said no.
+        if self.zcensus {
+            self.zcensus_begin_slow(scan);
         }
+    }
+
+    #[inline(never)]
+    fn zcensus_begin_slow(&self, scan: bool) {
         let gate = self.shared.zgate.load();
         let mut w = self.zwin.get();
         if gate == zselect::GATE_RAW {
+            // Under the raw gate the window in progress is abandoned, and
+            // the footprint with it: nothing else is asked here, since
+            // FITS is the in-memory regime and an operation under it pays
+            // the two loads and branches above and no more.
             if w.open {
                 w.open = false;
                 self.zwin.set(w);
+                self.zfootprint_track(false);
             }
             return;
         }
+        // E2's footprint: kept while the form serves and dropped, with the
+        // word the tick reads, when it stops.
+        self.zfootprint_track(gate == zselect::GATE_Z);
         if w.open {
             let ticks = self
                 .shared
@@ -14483,8 +14511,8 @@ impl Reader {
     }
 
     /// The census's hook at an operation's end: the operation's wall goes
-    /// onto the window's busy wall.
-    #[inline]
+    /// onto the window's busy wall. Called behind the flag.
+    #[inline(never)]
     fn zcensus_end(&self) {
         let mut w = self.zwin.get();
         if !w.open {
@@ -14525,12 +14553,34 @@ impl Reader {
         w.t0 = now;
     }
 
-    /// The census's note of a scan's emitted keys, onto the window.
+    /// The footprint kept or dropped as the form starts or stops serving
+    /// this handle: a switch of the memo's bitmap, and the slot's word
+    /// cleared with it, since the tick sums the words.
     #[inline]
-    fn zcensus_scanned(&self, n: usize) {
-        if !self.zcensus {
+    fn zfootprint_track(&self, on: bool) {
+        if self.zmemo.tracking() == on {
             return;
         }
+        self.zmemo.track(on);
+        if !on {
+            if let Some(slot) = self.slot {
+                self.shared.readers.slots[slot]
+                    .zcpages
+                    .store(0, AtomicOrdering::Relaxed);
+            }
+        }
+    }
+
+    /// The census's note of a scan's emitted keys, onto the window.
+    #[inline(always)]
+    fn zcensus_scanned(&self, n: usize) {
+        if self.zcensus {
+            self.zcensus_scanned_slow(n);
+        }
+    }
+
+    #[inline(never)]
+    fn zcensus_scanned_slow(&self, n: usize) {
         let mut w = self.zwin.get();
         if w.open {
             w.skeys = w.skeys.saturating_add(n as u64);
@@ -14600,6 +14650,10 @@ impl Reader {
             bump(&s.zcrflt, flt);
         }
         bump(&s.zcwindows, 1);
+        if gate == zselect::GATE_Z {
+            s.zcpages
+                .store(self.zmemo.footprint_pages(), AtomicOrdering::Relaxed);
+        }
         if (self.state().gen, self.mem().committed_log()) != w.commit {
             bump(&s.zccommit, 1);
         } else {
@@ -15370,6 +15424,8 @@ impl Reader {
             sel_retired: get(&ev.sel_retired),
             sel_excess_ns: get(&ev.sel_excess_ns),
             sel_c_build_ns: get(&ev.sel_c_build_ns),
+            footprint_pages: get(&ev.footprint_pages),
+            footprint_bytes: get(&ev.footprint_bytes),
             retired: get(&ev.retired),
             ..ZCounts::default()
         };
@@ -31646,9 +31702,13 @@ impl Maint {
         };
         let census = self.z_census(now);
         self.z_sample_collect();
-        let (generation, build) = {
+        let (generation, build, footprint) = {
             let _op = self.op();
-            (self.z_generation(), self.z_report_take())
+            (
+                self.z_generation(),
+                self.z_report_take(),
+                self.z_footprint(),
+            )
         };
         let input = zselect::Input {
             now,
@@ -31657,11 +31717,54 @@ impl Maint {
             generation,
             census,
             build,
-            footprint: None,
+            footprint,
         };
         let d = self.zsel.step(&input);
         self.z_apply(&d, model.as_ref());
         self.z_drive(&d);
+    }
+
+    /// E2's bound (design 4.7): the raw footprint, bytes, of the compact
+    /// pages the handles have touched, from their counts -- an upper bound
+    /// on the union, up to the threads' count loose over one hot set. A
+    /// page's keys hash to as many hash pages, bounded by the hash file,
+    /// and its records lie over the record pages a page's share of the
+    /// region spans, and one more; the quantities are the store's, never
+    /// a cell's. None while no handle has touched a page. Read under the
+    /// caller's pin.
+    fn z_footprint(&self) -> Option<u64> {
+        let shared = self.shared.clone();
+        let pages = shared.readers.stat(|s| &s.zcpages);
+        if pages == 0 {
+            return None;
+        }
+        let (mut hash, mut records, mut nkeys, mut n_pages) = (0u64, 0u64, 0u64, 0u64);
+        for s in self.segs().iter().filter(|s| s.level > 0) {
+            let Some(z) = s.z.get() else { continue };
+            let (h, r) = s.foot();
+            hash = hash.saturating_add(h);
+            records = records.saturating_add(r);
+            nkeys = nkeys.saturating_add(s.blob.keys() as u64);
+            n_pages = n_pages.saturating_add(z.pages() as u64);
+        }
+        if n_pages == 0 {
+            return None;
+        }
+        let page = zselect::PAGE;
+        let keys_per_page = nkeys.div_ceil(n_pages).max(1);
+        let record_pages = records.div_ceil(n_pages).div_ceil(page) + 1;
+        let hash_part = hash.min(pages.saturating_mul(keys_per_page).saturating_mul(page));
+        let bound =
+            hash_part.saturating_add(pages.saturating_mul(record_pages).saturating_mul(page));
+        self.shared
+            .z
+            .footprint_pages
+            .store(pages, AtomicOrdering::Relaxed);
+        self.shared
+            .z
+            .footprint_bytes
+            .store(bound, AtomicOrdering::Relaxed);
+        Some(bound)
     }
 
     /// The identity of what a sampler's reading is a reading of: a digest
