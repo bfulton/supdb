@@ -557,6 +557,45 @@ after the load, and under the eager build the load's landings had
 started and finished every build before it on the loaded box; its
 builds are left to the settle now, as its siblings' are.
 
+The out-of-core pairing of the cursor against the walk by rank
+(`cursor-pairing.sh ooc`; `cursor-ooc-ab-1.out`, `cursor-ooc-ab-2.out`;
+ten million keys under the gibibyte, the load, the scan passes on one,
+two and three threads and the mixes, the operations divided by ten, six
+pairs after the warmup, two sittings with the arms swapped, read as
+cursor over rank): E at 1.63x and 1.60x, six pairs of six both times,
+from 46-51 thousand operations a second to 74-84 thousand, which
+against the raw form's 45-46 thousand under the bound is 1.6-1.8x where
+it was 1.12x -- still short of the design's 90-180 thousand and LMDB's
+banked 138, with E's scan of fifty now costing about what the pass's
+scan of a hundred does, so what is left of E is the overlay's own work
+and the decodes the memo misses, common to both walks; the scan passes
+level in both directions (one thread 1.06x then 0.85x, five pairs of
+six each way; two and three threads within the coin) with the same
+faults a scan; the other mixes and the loads within the coin. The counts
+are the same in both sittings: 0.40 million memo hits against 10.56 over
+the passes, 5.17 million walks against 5.40, the groups decoded the
+same. The cursor is the default and the walk by rank the arm.
+
+## Where stage 3 stands
+
+Done, against the design's "done when" (7.8): the scan and mix cells of
+7.3 have a verdict in two sittings each, out of core and in core, and
+`raw_touches == 0` holds on every shape of 3.9's table through the
+no-raw test. The cells against the raw form out of core: scans 9.6-10.4x
+on one thread and 6.1-6.7x on two and three with no fault a scan after a
+read pass, 3.1x with 0.6 faults a scan straight after a load; point
+reads 2.7-5.1x; mixes A 1.4x, B 2.3-2.5x, C 4.3x, D 3.6-4.0x, F 1.5-1.6x,
+E 1.6-1.8x with the cursor; the loads 0.74-0.79x. In core the form loses
+every read cell to the decode, as registered, which is the controller's
+reason. Open, for stage 4 and after: the controller (`ZPages::Auto`),
+which enters the form by the census's fault rate and leaves it in core;
+the prefetch on under the same signal; a warm that runs after the load's
+last build under a bound, or the restated scan cell after a load; E's
+remaining gap, which is the overlay's and not the form's; and the block
+cache's walks, which stay raw by design, so the shipping default with
+the cache on gets nothing from the form on scans until the cache's
+builds read through it.
+
 ## What 2b's sittings leave open, read before 3's
 
 - The eager build's pairing (`eager-pairing.sh`, `eager-ab-1.out` and
