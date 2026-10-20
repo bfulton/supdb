@@ -453,9 +453,12 @@ pub fn phase_mark(arm: &str, phase: &str, edge: &str) {
 /// One line of the store's counters around a timed stretch, as deltas
 /// of `e.counters()` read before and after it: the scans' phases before
 /// their walk, the threads' time, the blocks built and the forms copied,
-/// the snapshots and the walks by form, and the store's shape after. The
-/// lag sweep prints one a point (`SUPDB_LAG_COUNTERS`) and the mixes one
-/// a mix (`SUPDB_MIX_COUNTERS`).
+/// the snapshots and the walks by form, the store's shape after, and the
+/// compact form's reads, decodes, scan walks and groups, memo hits and
+/// misses and prefetch asks over the window, so that a mix's cost under
+/// the form is read beside its time by kind. The lag sweep prints one a
+/// point (`SUPDB_LAG_COUNTERS`) and the mixes one a mix
+/// (`SUPDB_MIX_COUNTERS`).
 fn counters_line(
     tag: &str,
     arm: &str,
@@ -468,7 +471,7 @@ fn counters_line(
     let get = |c: &[(&str, f64)], n: &str| c.iter().find(|(k, _)| *k == n).map_or(0.0, |(_, v)| *v);
     let d = |n: &str| get(c1, n) - get(c0, n);
     eprintln!(
-        "{tag} {arm} {point} flt up {flt_up} main {flt_main} memfree_mb {} burst_ms {burst_ms:.1} pass_ms {pass_ms:.1} | ph take {:.2} sync {:.2} settle {:.2} snap {:.2} ahead {:.2} install {:.2} | thread {:.1}ms/{:.0}p maint {:.1}ms | built up {:.0} eng {:.0} rd {:.0} cloned {:.0} | snaps {:.0} refr {:.0} | walks {:.0}/{:.0}/{:.0} starts {:.0}/{:.0} | pieces {:.0} unsealed {:.0} handles-scans {:.0}",
+        "{tag} {arm} {point} flt up {flt_up} main {flt_main} memfree_mb {} burst_ms {burst_ms:.1} pass_ms {pass_ms:.1} | ph take {:.2} sync {:.2} settle {:.2} snap {:.2} ahead {:.2} install {:.2} | thread {:.1}ms/{:.0}p maint {:.1}ms | built up {:.0} eng {:.0} rd {:.0} cloned {:.0} | snaps {:.0} refr {:.0} | walks {:.0}/{:.0}/{:.0} starts {:.0}/{:.0} | pieces {:.0} unsealed {:.0} handles-scans {:.0} | z reads {:.0} dec {:.0} scans {:.0} groups {:.0} memo {:.0}/{:.0} pf {:.0}",
         mem_free_mb(),
         d("scan_take_us") / 1e3,
         d("scan_sync_us") / 1e3,
@@ -492,7 +495,14 @@ fn counters_line(
         d("start_search"),
         get(c1, "pieces"),
         get(c1, "unsealed_keys"),
-        d("rd_scans")
+        d("rd_scans"),
+        d("zpage_reads"),
+        d("zpage_decodes"),
+        d("zpage_scans"),
+        d("zpage_scan_groups"),
+        d("zpage_memo_hits"),
+        d("zpage_memo_misses"),
+        d("zpage_prefetches")
     );
     // The process's memory beside the structures that count their own: the
     // resident bytes, what the allocator has handed out and what it holds
