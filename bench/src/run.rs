@@ -1381,12 +1381,12 @@ fn stat_majflt(stat: &str) -> Option<u64> {
 /// Where a pass asks whether the second form is what the arm says.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ZStage {
-    /// After the ordered load, whose `sync` makes the sidecars.
+    /// After the ordered load, whose `sync` makes the form files.
     Loaded,
     /// After the point reads.
     Read,
     /// After the shuffled load into the pass's second store, whose `sync`
-    /// makes that store's sidecars as the first's made the first's: the
+    /// makes that store's form files as the first's made the first's: the
     /// partitions a shuffled load leaves are the ones merges wrote, and a
     /// settle that ran out of rounds before the merges did leaves some raw.
     Shuffled,
@@ -1408,21 +1408,21 @@ impl ZStage {
 /// form: the stop the arm's pre-registration names, `zpage_rawserves` over a
 /// hundredth of the reads. The allowance is for what the engine decides on
 /// purpose and counts -- a sliver of a partition under the floor, which is
-/// read raw by design -- and not for a sidecar that went out of service,
+/// read raw by design -- and not for a form file that went out of service,
 /// which is refused whatever its share.
 const Z_RAW_SHARE_MAX_PCT: u64 = 1;
 
 /// The refusal of an arm whose second form is not what its name says.
-/// A forced arm with no sidecar, or with the partitions it could cover
-/// raw, or with a sidecar out of service, or whose reads went to the raw
+/// A forced arm with no form file, or with the partitions it could cover
+/// raw, or with a form file out of service, or whose reads went to the raw
 /// form beyond the share that is the engine's own decision, posts the raw
 /// form's throughput under the form's name; an arm that does not force the
-/// form and has read from a sidecar has been priced as something else.
+/// form and has read from a form file has been priced as something else.
 /// Either is a measurement of the wrong store, found after the load that
 /// made it. A partition left raw because it is under the engine's floor is
 /// the engine's own decision, counted and printed
 /// (`zpage_declined_small_bytes`), and covers nothing the form is for;
-/// every other partition without a sidecar was declined for what it holds
+/// every other partition without a form file was declined for what it holds
 /// or failed, and refuses the pass. `None` is an engine with no such form,
 /// which nothing is asked of.
 fn zpages_refusal(arm: &str, size: u64, stage: ZStage, z: Option<ZState>) -> Result<(), String> {
@@ -1434,33 +1434,33 @@ fn zpages_refusal(arm: &str, size: u64, stage: ZStage, z: Option<ZState>) -> Res
     };
     let when = stage.when();
     match (stage, z.forced) {
-        (ZStage::Loaded | ZStage::Shuffled, true) if z.sidecars == 0 => wrong(format!(
-            "the form is forced and none of {} partitions has a sidecar {when} \
+        (ZStage::Loaded | ZStage::Shuffled, true) if z.form_files == 0 => wrong(format!(
+            "the form is forced and none of {} partitions has a form file {when} \
              ({} are under the floor; raise the key count)",
             z.partitions, z.small
         )),
-        (ZStage::Loaded | ZStage::Shuffled, true) if z.sidecars + z.small != z.partitions => {
+        (ZStage::Loaded | ZStage::Shuffled, true) if z.form_files + z.small != z.partitions => {
             wrong(format!(
-                "the form is forced and {} of {} partitions have a sidecar {when} \
+                "the form is forced and {} of {} partitions have a form file {when} \
                  ({} are under the floor); the rest were declined or failed",
-                z.sidecars, z.partitions, z.small
+                z.form_files, z.partitions, z.small
             ))
         }
-        (ZStage::Loaded | ZStage::Shuffled, true) if z.files != z.sidecars || z.stray != 0 => {
+        (ZStage::Loaded | ZStage::Shuffled, true) if z.files != z.form_files || z.stray != 0 => {
             wrong(format!(
-                "the form is forced and the store's directory holds {} sidecar files and {} \
-                 other files named for the form beside {} live sidecars {when}: a file no \
+                "the form is forced and the store's directory holds {} form files and {} \
+                 other files named for the form beside {} live form files {when}: a file no \
                  partition claims is disk the row counts",
-                z.files, z.stray, z.sidecars
+                z.files, z.stray, z.form_files
             ))
         }
         (_, true) if z.damaged > 0 => wrong(format!(
-            "the form is forced and {} of {} sidecars are out of service {when}: a check \
+            "the form is forced and {} of {} form files are out of service {when}: a check \
              of one of their pages failed, and a partition is read raw from then on",
-            z.damaged, z.sidecars
+            z.damaged, z.form_files
         )),
         (ZStage::Read, true) if z.reads == 0 => wrong(
-            "the form is forced and no point read of the pass was answered from a sidecar".into(),
+            "the form is forced and no point read of the pass was answered from a form file".into(),
         ),
         (ZStage::Read, true) if z.raw * 100 > (z.reads + z.raw) * Z_RAW_SHARE_MAX_PCT => {
             wrong(format!(
@@ -1471,7 +1471,7 @@ fn zpages_refusal(arm: &str, size: u64, stage: ZStage, z: Option<ZState>) -> Res
             ))
         }
         (ZStage::Read, false) if z.reads != 0 => wrong(format!(
-            "the form is not forced and {} point reads were answered from a sidecar",
+            "the form is not forced and {} point reads were answered from a form file",
             z.reads
         )),
         _ => Ok(()),
@@ -1552,7 +1552,7 @@ fn one_pass(
     let c0 = counting.begin();
     let (load_s, wrote) = load(e.as_mut(), size, plan, payload, |i| i)?;
     counting.end(c0, "load", "", None, size);
-    // The form's sidecars are made by the `sync` the load ends in: a forced
+    // The form's form files are made by the `sync` the load ends in: a forced
     // arm that is not covered is refused here and not after the hour its
     // reads would take.
     zpages_refusal(arm, size, ZStage::Loaded, e.zpages_state())?;
@@ -3489,7 +3489,7 @@ mod tests {
             "rocksdb-tuned",
         ] {
             // The arm that reads from the second form is given a store with
-            // a partition over the floor, which has a sidecar to read from.
+            // a partition over the floor, which has a form file to read from.
             let size = if arm == "supdb-nocachezpages" {
                 30_000u64
             } else {
@@ -3531,23 +3531,23 @@ mod tests {
                 _ => assert_eq!(handles_read, None, "{arm}"),
             }
             // The arm that forces the second form reads the threads' keys
-            // from the sidecars its load's sync made, and the count of
+            // from the form files its load's sync made, and the count of
             // them is in the store's after the threads' handles are gone.
-            let from_sidecars = e
+            let from_form_files = e
                 .counters()
                 .iter()
                 .find(|(n, _)| *n == "zpage_reads")
                 .map(|(_, v)| *v);
             match arm {
                 "supdb-nocachezpages" => assert_eq!(
-                    from_sidecars,
+                    from_form_files,
                     Some(size as f64),
-                    "{arm}: the threads' reads are answered from the sidecars"
+                    "{arm}: the threads' reads are answered from the form files"
                 ),
                 "supdb" | "supdb-ingest" | "supdb-nocacheordread" => {
-                    assert_eq!(from_sidecars, Some(0.0), "{arm}")
+                    assert_eq!(from_form_files, Some(0.0), "{arm}")
                 }
-                _ => assert_eq!(from_sidecars, None, "{arm}"),
+                _ => assert_eq!(from_form_files, None, "{arm}"),
             }
             let scans = size / plan.scan_len as u64;
             let got = threaded(
@@ -3575,21 +3575,21 @@ mod tests {
     /// The refusal of a forced arm whose second form is not in use, held to
     /// inputs that are known red -- nothing covered, a partition left raw
     /// for what it holds beside the covered ones, no read answered from a
-    /// sidecar after the reads, an arm that does not force the form and
+    /// form file after the reads, an arm that does not force the form and
     /// has read from one -- and to the ones that are green: every
     /// partition covered, a sliver under the floor beside the covered
     /// ones, an arm that reads from none, and an engine with no such form.
     #[test]
     fn a_forced_form_that_is_not_in_use_is_refused() {
-        // A store settled has a file for each of its sidecars.
-        let z = |forced, reads, partitions, sidecars, small| {
+        // A store settled has a file for each of its form files.
+        let z = |forced, reads, partitions, form_files, small| {
             Some(ZState {
                 forced,
                 reads,
                 partitions,
-                sidecars,
+                form_files,
                 small,
-                files: sidecars,
+                files: form_files,
                 ..ZState::default()
             })
         };
@@ -3636,14 +3636,14 @@ mod tests {
             part.contains("9 of 12") && part.contains("after the shuffled load"),
             "{part}"
         );
-        // The directory: one file for each sidecar and no other file named
+        // The directory: one file for each form file and no other file named
         // for the form, at both loads. A leftover is disk the row counts.
         for stage in [ZStage::Loaded, ZStage::Shuffled] {
             let mut left = z(true, 0, 18, 18, 0).unwrap();
             left.files = 19;
             let why = red(stage, Some(left));
             assert!(
-                why.contains("19 sidecar files") && why.contains("18 live sidecars"),
+                why.contains("19 form files") && why.contains("18 live form files"),
                 "{why}"
             );
             let mut temp = z(true, 0, 18, 18, 0).unwrap();
@@ -3652,7 +3652,7 @@ mod tests {
             assert!(why.contains("1 other files"), "{why}");
             let mut lost = z(true, 0, 18, 18, 0).unwrap();
             lost.files = 17;
-            assert!(red(stage, Some(lost)).contains("17 sidecar files"));
+            assert!(red(stage, Some(lost)).contains("17 form files"));
         }
         // An unforced arm has none, and its directory is nobody's to ask.
         let mut unforced = z(false, 0, 18, 0, 0).unwrap();
@@ -3660,17 +3660,17 @@ mod tests {
         assert!(run(ZStage::Loaded, Some(unforced)).is_ok());
     }
 
-    /// A sidecar out of service and reads that went to the raw form are what
+    /// A form file out of service and reads that went to the raw form are what
     /// the arm's pre-registration stops a pairing for, and a pass that has
-    /// served one read from a sidecar has not earned the form's name with
+    /// served one read from a form file has not earned the form's name with
     /// them: the share is the registered hundredth of the reads, counted
     /// with the raw ones, and it is held at its edge.
     #[test]
-    fn a_forced_form_with_a_sidecar_out_of_service_or_reads_gone_raw_is_refused() {
+    fn a_forced_form_with_a_form_file_out_of_service_or_reads_gone_raw_is_refused() {
         let covered = ZState {
             forced: true,
             partitions: 18,
-            sidecars: 18,
+            form_files: 18,
             files: 18,
             ..ZState::default()
         };
@@ -3695,7 +3695,7 @@ mod tests {
             ..ZState::default()
         };
         assert!(run(ZStage::Read, unforced).is_ok());
-        // A sidecar out of service is refused at every stage, however few
+        // A form file out of service is refused at every stage, however few
         // reads it cost.
         for stage in [ZStage::Loaded, ZStage::Read, ZStage::Shuffled] {
             let out = ZState {
@@ -3705,7 +3705,7 @@ mod tests {
             };
             let why = run(stage, out).unwrap_err();
             assert!(
-                why.contains("1 of 18 sidecars are out of service") && why.contains(stage.when()),
+                why.contains("1 of 18 form files are out of service") && why.contains(stage.when()),
                 "{stage:?}: {why}"
             );
             let sound = ZState {
@@ -3764,7 +3764,7 @@ mod tests {
 
     /// The point-read phase asks, after the reads, whether a forced arm read
     /// through its form -- the call site of the refusal that no real arm
-    /// reaches red, because a real forced arm reads through its sidecars.
+    /// reaches red, because a real forced arm reads through its form files.
     #[test]
     fn the_read_phase_asks_whether_a_forced_arm_read_through_its_form() {
         let mut counting = Counting::new(None, Path::new(".")).unwrap();
@@ -3772,7 +3772,7 @@ mod tests {
             forced: true,
             reads: 50,
             partitions: 3,
-            sidecars: 3,
+            form_files: 3,
             ..ZState::default()
         };
         let mut phase = |z: Option<ZState>| {
@@ -3843,7 +3843,7 @@ mod tests {
         let covered = ZState {
             forced: true,
             partitions: 12,
-            sidecars: 12,
+            form_files: 12,
             files: 12,
             ..ZState::default()
         };
@@ -3853,7 +3853,7 @@ mod tests {
             "an engine with no form is asked nothing"
         );
         let part = phase(Some(ZState {
-            sidecars: 9,
+            form_files: 9,
             files: 9,
             ..covered
         }))
@@ -3876,7 +3876,7 @@ mod tests {
         assert!(out.contains("out of service"), "{out}");
     }
 
-    /// The pass itself refuses a forced arm over a store with no sidecar to
+    /// The pass itself refuses a forced arm over a store with no form file to
     /// read, and runs one that has: the same arm at a size under the floor
     /// and over it, and the unforced arm beside it, which reads from none.
     #[test]
@@ -3924,7 +3924,7 @@ mod tests {
         assert_eq!(count(&forced, "zpage_reads"), 30_000.0, "every read");
         assert_eq!(count(&forced, "zpage_rawserves"), 0.0);
         assert!(
-            count(&forced, "zpage_sidecars_at_end") >= 2.0,
+            count(&forced, "zpage_form files_at_end") >= 2.0,
             "one a store"
         );
         let base = one_pass(
@@ -3938,7 +3938,7 @@ mod tests {
         .unwrap();
         assert_eq!(count(&base, "zpage_forced"), 0.0);
         assert_eq!(count(&base, "zpage_reads"), 0.0);
-        assert_eq!(count(&base, "zpage_sidecars_at_end"), 0.0);
+        assert_eq!(count(&base, "zpage_form files_at_end"), 0.0);
         // The counters are in the paired quantities `ab` prints.
         let flat = forced.flat();
         assert!(flat.iter().any(|(n, _)| n == "count zpage_reads"));

@@ -71,7 +71,7 @@ pub fn partition_fences(d: &std::path::Path) -> Vec<(Vec<u8>, Option<Vec<u8>>)> 
     v
 }
 
-/// The mappings this process holds of sidecar files under `dir`, as
+/// The mappings this process holds of form files under `dir`, as
 /// `/proc/self/maps` names them: a renamed file shows under its new name,
 /// an unlinked one with ` (deleted)`. One line a mapping, deduplicated by
 /// the file the line names, since a mapping may be split into several.

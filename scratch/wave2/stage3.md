@@ -3,8 +3,8 @@
 The design is `scratch/design/zpages.md`, section 3 (the read paths: 3.4
 the seek by the fence, 3.5 the scan, 3.6 values and extents, 3.7 the memo,
 3.8 the overlay, 3.9 the sites, 3.10 the cursor), 6.2 (the arms) and 6.3
-(the tests); stages 2a and 2b are what `src/db/zside.rs` holds today: the
-point read and the count through a sidecar, its lifecycle, its filter and
+(the tests); stages 2a and 2b are what `src/db/zfile.rs` holds today: the
+point read and the count through a form file, its lifecycle, its filter and
 its warm. This file is the cut of 3 into pieces, each a commit with its
 tests, in the order they are built, and what each leaves for the next.
 Stage 3 is the stage whose gate is `raw_touches == 0` on a covered
@@ -34,7 +34,7 @@ already.
 
 ## The pieces
 
-1. **`ZSide::scan_at`**, the walk of 3.5: from a rank, the entry by
+1. **`ZFile::scan_at`**, the walk of 3.5: from a rank, the entry by
    `partition_point` over `first_rank`, the group through the thread's
    buffer (a first decode checks as the point read's does, and marks the
    page verified), the skip to the record by `record_key_next`, then each
@@ -47,7 +47,7 @@ already.
    rank past the end walks nothing, and the arithmetic saturates. Wired
    at the one site a drained store's scans take, `scan_partitions`'
    `seg.blob.scan_at`, through `Seg::scan_at_z(raw, rank, n, f)`: the
-   cell's sidecar if installed and in service, else the raw walk counted
+   cell's form file if installed and in service, else the raw walk counted
    `raw_scans` as today. Counters `scans` (walks served), `scan_pages`
    (groups decoded for them), `nopage_scans`. Tests: the unit test of
    `scan_at` against `Blob::scan_at` on the fixtures, every start rank
@@ -63,14 +63,14 @@ already.
    same writes is the strongest check a scan can have. Gate: every scan
    of a drained covered store counted `scans`, none `raw_scans`.
 
-2. **The seek, the key and the cursor** (3.4, 3.10): `ZSide::seek(key)`
-   by the fence and one group's walk, `ZSide::key_at(rank, f)` callback
+2. **The seek, the key and the cursor** (3.4, 3.10): `ZFile::seek(key)`
+   by the fence and one group's walk, `ZFile::key_at(rank, f)` callback
    shaped, and `ZCursor` -- `cursor_seek`, `cursor_at`, `key()`,
    `rank()`, `values(raw, f)`, `with_exts(f)`, `advance()` -- a position
    in a partition that holds its group's buffer (taken from the thread's
    cell, put back at the drop) and steps by `record_key_next`, taking the
    next entry's group at a group's end and handing a `ZNOPAGE` entry to a
-   raw sub-cursor for its records. `ZSide::cut_in(rank, end, uk)`, the
+   raw sub-cursor for its records. `ZFile::cut_in(rank, end, uk)`, the
    answer `cut_at` gives, from the one group the fence says can hold `uk`
    and a walk of at most a group's records. Wired at every site of 3.9 the
    two scan paths have: `scan_partitions`' seek and `cut_at`,
@@ -80,7 +80,7 @@ already.
    once a partition), and the `exts_at` for flags. Each site is a
    `Seg::*_z` dispatch as in 1, raw when the cell is empty. Tests:
    `windows_that_cross_partitions_and_covered_with_uncovered_agree` (one
-   partition without a sidecar, `hold_zpage_build` after `k`); a scan
+   partition without a form file, `hold_zpage_build` after `k`); a scan
    with an unsealed key inside the walk window (the `cut_at` shape) and
    one over a range with a level-0 piece (the `scan_merged` shape), each
    on the writer and a handle against a raw model; the fuzz as in 1 with
@@ -92,7 +92,7 @@ already.
    `scan_at`, `values_at`, `exts_at`, `prefetch_*` -- forwarding only
    `keys`, `id`, `index_bytes`, `advise_random`, `advise_normal`; `raw()`
    the one door, which under `debug_assertions` counts `raw_touches` when
-   the segment has a sidecar installed. The compiler then lists every
+   the segment has a form file installed. The compiler then lists every
    site (about forty `key_at`, the rest the read methods), and each is
    decided: the z dispatch of 1 and 2, or `.raw()` on purpose with the
    reason beside it (the tombstone pre-pass over pieces, the pieces'
@@ -114,7 +114,7 @@ already.
    `supdb-nocachezpagesnomemo`. The cursor of 2 takes its groups through
    the memo. Tests: a hit rate asserted on a Zipfian read set over one
    partition (the memo's own counters `memo_hits`, `memo_misses`), the
-   re-entrant callback, the cap held, a retired sidecar's entries never
+   re-entrant callback, the cap held, a retired form file's entries never
    hit. Priced by mix C in the ooc pairing (7.3: 260-350k with it,
    185-230k without) and in core by the C mix at 300k, where it must not
    lose.
@@ -158,10 +158,10 @@ on every shape of 3.9's table.
 
 ## Where it stands
 
-Piece 1 is in: `ZSide::scan_at` with `ZScan` (the keys visited, the
+Piece 1 is in: `ZFile::scan_at` with `ZScan` (the keys visited, the
 groups decoded, the no-page runs, and how it ended), `ZFence::entry_at_rank`,
 `part_scan_z` at `scan_partitions`' walk with the raw walk for what the
-sidecar cannot serve, the counts `scans`, `scan_groups`, `nopage_scans`
+form file cannot serve, the counts `scans`, `scan_groups`, `nopage_scans`
 and `raw_scans` restated as the walks that went raw, the slot two lines
 for them (pinned at 256 bytes). The fuzz takes `ZFUZZ_ZPAGES=1`, the form
 forced in the `z` store of its pair with no size floor; a hundred and
@@ -172,7 +172,7 @@ handle, drained and with unsealed keys over the partitions; the walks of a
 scan are counted by the partition they cross. The block cache's walks of a
 covered partition stay raw and uncounted until piece 3 lists their sites.
 
-Piece 2 is in: `ZSide::seek`, `ZSide::cut_in` and `ZSide::values_at`
+Piece 2 is in: `ZFile::seek`, `ZFile::cut_in` and `ZFile::values_at`
 (`ZSeek`: the rank, how the key there compares, whether a page was
 decoded; or fallback, out, no-page), `ZCursor` (`at`, `seek`, `key`,
 `values`, `advance`; the group in the cursor's own buffer through
@@ -190,7 +190,7 @@ or a cut that decodes counts `scan_groups`; the cursor's groups and
 no-page runs are filed as it leaves the partition, a served walk
 (`scans`) or, fallen, a fallback and a raw walk. The plan's `exts_at`
 site is the pieces' (`c.seg.blob.exts_at`), raw since a piece has no
-sidecar; the partition `exts_at` sites outside the scan paths wait for
+form file; the partition `exts_at` sites outside the scan paths wait for
 piece 3's listing. The cut and the emit's values each open a group the
 walk before them opened too; piece 4's memo is where one decode serves
 the three, and the cost of the three decodes is a thing the in-core
@@ -199,7 +199,7 @@ the values by rank against the raw form, on the suite's shape and with a
 no-page record among the pages, and of the cursor from every start,
 across the no-page run and under a page flipped where the attach's
 sample does not look (the rest of the walk raw, every key and value
-right, the sidecar out); the windows over a piece (`scan_merged`, writer
+right, the form file out); the windows over a piece (`scan_merged`, writer
 and handle, counted as served walks); appends to keys the partition
 holds in both window tests, since a put masks the partition's values at
 the emit and only an append reads them; the walks test and the no-page
@@ -213,11 +213,11 @@ twenty with it on, clean, every seed reaching `scan_merged`.
 Piece 3 is in: `Seg::blob` is `SegBlob`, a newtype with no `Deref` that
 forwards `keys`, `id`, `index_bytes` and the advice; `Seg::raw` is the
 door, counting `raw_touches` under debug assertions where the segment's
-cell holds a sidecar; `SegBlob::for_sidecar` hands the raw form to
-`ZSide` for its reads of runs in blocks and the attach's identity, not a
+cell holds a form file; `SegBlob::for_form_file` hands the raw form to
+`ZFile` for its reads of runs in blocks and the attach's identity, not a
 touch. The compiler listed seventy-five method sites (sixty-four by the
 first pass's regex, eleven of `count` and `scan_at` it had left out) and
-eight borrows handed to the sidecar; `grep -n '\.raw()' src/db.rs` lists
+eight borrows handed to the form file; `grep -n '\.raw()' src/db.rs` lists
 eighty deliberate reads, by group: the raw side of each dispatch
 (`part_read_z`, `part_count_z`, `part_scan_z`, `part_seek_z`,
 `part_cut_z`, `part_values_z`, `pwalk_*`, `part_via_ord`, the point read's
@@ -248,9 +248,9 @@ limit counts until the merge drops its tombstone with nothing older to
 mask, so a model that keeps deleted keys as empty entries reads one key
 further than the store after a merge, and drops them there.
 
-Piece 4 is in: the memo of decoded groups (`zside::Memo` behind
+Piece 4 is in: the memo of decoded groups (`zfile::Memo` behind
 `ZMemo`), a thousand and twenty-four slots direct-mapped by the page plus
-a multiple of the sidecar's attach identity, capped at eight megabytes
+a multiple of the form file's attach identity, capped at eight megabytes
 of decoded bytes, an `Arc` to each group; `open_group` consults it for a
 compressed page the process has verified and puts a first decode's
 group in as it passes, the found record is a position in the opened
@@ -269,9 +269,9 @@ segment: the build's start was counted after the spawn, and a wait for
 every started build to be collected read the sum between the thread's
 first write and the count; the count comes before the spawn now. Tests:
 the memo's cap, displacement and counts with the slot collision between
-two sidecars' same page built (the side compare is reached only through
+two form files' same page built (the file compare is reached only through
 one, and the mutant without it survived the test that named "another
-sidecar's page" until the collision was built); the second read of every
+form file's page" until the collision was built); the second read of every
 page a hit, a new attach a miss a page, the memo off a decode a read; the
 re-entrant read with a memo one slot wide; a Zipfian read set over one
 partition on the writer and a handle. The tests of the decode path under
@@ -319,7 +319,7 @@ failure.
 
 Piece 5 is in: `Options::zpages_seek_ord` (off) sends `part_seek_z`,
 `part_cut_z` and `pwalk_seek` to the ordered index's heads and the raw
-records, the walk after the seek the sidecar's;
+records, the walk after the seek the form file's;
 `supdb-nocachezpagesheads` is the arm; its test holds the arm's seeks to
 reading the raw form (`raw_touches` grows under it where the forced arm
 reads zero) and its windows to the same keys. Piece 6 is in:
@@ -327,7 +327,7 @@ reads zero) and its windows to the same keys. Piece 6 is in:
 first page it opens, for the pages it will cross (the keys still wanted
 over the mean records a page, `ZPREFETCH_PAGES` = 16 at most), counted
 `prefetches` on the handle's line and as the `zpage_prefetches` row;
-`supdb-nocachezpagesprefetch` the arm. The unit test evicts the sidecar's
+`supdb-nocachezpagesprefetch` the arm. The unit test evicts the form file's
 file before the attach, attaches under random advice and reads the
 residency outside the attach's sampled pages, because the first version
 read its control pages resident: the kernel's fault-around maps cached
@@ -344,10 +344,10 @@ two scan-path tests run their nine arms; the overlay model's twins with
 the form forced, with the block cache and without; the readers on
 threads with the form, with the block cache and without it -- the
 second added here, since that is the lifecycle where merges retire
-sidecars under live cursors; `a_run_of_every_shape_reads_the_same`
-through the scan. Each arm with the form settles the sidecars where the
+form files under live cursors; `a_run_of_every_shape_reads_the_same`
+through the scan. Each arm with the form settles the form files where the
 store's partitions are made and after the landings, and asserts what the
-form served: every partition a sidecar, the point reads through them,
+form served: every partition a form file, the point reads through them,
 and under the nocache shape the scans' partition walks too. The first
 assertion asked for served scans of every arm with the form, and four
 tests answered `scans: 0, raw_scans: 0` with the block cache on: the
@@ -356,8 +356,8 @@ piece 3's listing (`scan_blocks` and `BuildCtx` build the forms from the
 records through the door), so with the cache on, which is the shipping
 default, the form serves scans nothing, and the scan cells piece 8 reads
 are the nocache arms' alone. The cache-on twins assert the point reads
-and the sidecars; the mutant with the option off fails all six tests,
-with no sidecar and no read served.
+and the form files; the mutant with the option off fails all six tests,
+with no form file and no read served.
 
 Piece 8's in-core pairing (`scan-pairing.sh`; `scan-ab-1.out`,
 `scan-ab-2.out`; `supdb-nocache` against `supdb-nocachezpages` at three
@@ -369,7 +369,7 @@ D 0.23x and 0.24x, B 0.33x, E 0.38x and 0.45x, F 0.55x and 0.62x, A
 0.69x and 0.74x; the ordered load 0.74x and 0.79x and the shuffled load
 0.76x and 0.77x, the builds in the sync. Six pairs of six in every cell
 in both sittings. The counts: 1.63 million scan walks served, none raw
-and no fallback, twenty-five sidecars for twenty-five partitions, 4.0
+and no fallback, twenty-five form files for twenty-five partitions, 4.0
 million groups decoded for the walks, 2.5 a scan of a hundred, and a
 memo that answers few of a scan pass's opens, since the pass's starts
 are uniform over three million keys and the memo holds a thousand
@@ -392,7 +392,7 @@ proof sitting's cells again); the mixes A 1.40x and 1.45x, B 2.50x and
 2.33x, C 4.33x and 4.27x, D 3.61x and 4.0x, F 1.46x and 1.60x; the
 ordered load 0.75x and 0.77x and the shuffled load 0.77x and 0.74x. Six
 pairs of six in every cell in both sittings, and the counts whole both
-times: fifty-three sidecars for fifty-three partitions, 93 and 96 builds
+times: fifty-three form files for fifty-three partitions, 93 and 96 builds
 (the shuffled load's rewrites), 5.4 million scan walks served and none
 raw, no fallback, 13.6 million groups decoded for the walks. Against the
 design's registration (7.3 of `scratch/design/zpages.md`): the scan
@@ -422,12 +422,12 @@ read pass, and the forced arm's one-thread scan pass read 2.5 million
 entries a second with 0.60 faults a scan there (2.4 KB read a scan),
 where the raw pairing read 7.6-8.3 million with none. The runner's order
 puts the read passes before the scan passes, and under the bound it is
-the read pass that brings the sidecars in: the load's builds leave each
-sidecar resident and the warm, finding it so by `mincore`, reads nothing
-(`zpage_warm_skipped` the whole 2.4 GB of both stores' sidecars and
+the read pass that brings the form files in: the load's builds leave each
+form file resident and the warm, finding it so by `mincore`, reads nothing
+(`zpage_warm_skipped` the whole 2.4 GB of both stores' form files and
 `zpage_warm_bytes` zero, in every pairing), and the builds and the
 load's writes after it evict it under the gibibyte, so the first pass
-over the form after a load faults the sidecars in -- 0.06 a read over
+over the form after a load faults the form files in -- 0.06 a read over
 the million point reads, 0.6 a scan over the hundred thousand scans --
 and the passes after it find them resident. So the raw pairing's scan
 cells are the warm form's, and the scan after a load is 2.5 million
@@ -484,7 +484,7 @@ in both arms, 93-98% of it, and the commits the rest. In core at three
 million keys a scan of E's, fifty keys from a Zipfian start, costs the
 raw form 5.9-8.4 µs and the form 15.2-16.8, where the scan pass's scan
 of a hundred costs them 3.3 and 10.8; under the bound at ten million,
-with the sidecars cold after the load, 21.6-24.5 against 22.5-22.8, with
+with the form files cold after the load, 21.6-24.5 against 22.5-22.8, with
 0.33 faults an operation against 0.04. The form's counts say what an E
 scan does: 2.5-2.65 partition walks a scan, 0.9-1.0 group decoded, and
 33-34 group opens served by the memo -- thirty-four opens for fifty keys
@@ -515,7 +515,7 @@ Piece 9 is in: `ZCursor::walk_until`, the bulk walk through the cursor
 the partition's end or the first key not below the key asked, the
 cursor left on it, how it compares answered, one open a group crossed,
 the no-page run and a fallen walk a key at a time through the raw form,
-the prefetch asked once a cursor through `ZSide::ask_ahead`, which
+the prefetch asked once a cursor through `ZFile::ask_ahead`, which
 `scan_at` asks through too); `Reader::scan_partition_cursor`, the
 overlay walk of a covered partition through it under
 `Options::zpages_walk_cursor` (on), the emit's values from the record
@@ -609,14 +609,14 @@ builds read through it.
   about 0.2 s, the builds running beside them on the idle-class thread.
   The eager build is the default now and `supdb-nocachezpagessettle` the
   arm that leaves every build to the settle. The flip under the gate was
-  green once and read four runs of twelve red beside a build: a sidecar
+  green once and read four runs of twelve red beside a build: a form file
   the open refuses is built again by the segment work's first turn after
   the open under the eager build, and the tests of what an open leaves
   read that state while the build raced them; they open with the builds
   left to the settle now, the eager rebuild has a test of its own, and
   the stress of 2b's stop rule read twenty of twenty after it.
 - The warm cannot be priced by `ab` as it stands: the forced arm's
-  `sync` builds a sidecar and the warm after its attach finds it
+  `sync` builds a form file and the warm after its attach finds it
   resident, so the warm's work is a restart's, and the runner has no
   pass that reopens a loaded store cold. A `reopen` pass -- the store
   closed, its files dropped with `posix_fadvise(DONTNEED)`, opened again

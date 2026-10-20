@@ -46,9 +46,9 @@ use crate::Blob;
 #[cfg(not(target_family = "wasm"))]
 pub mod zselect;
 
-// The z form's layout: a derived sidecar holding a partition's records in
+// The z form's layout: a derived form file holding a partition's records in
 // groups that each compress into one page. Native only, stated here and not
-// left to `db` being native only already: the sidecar is read through a
+// left to `db` being native only already: the form file is read through a
 // mapping of its own, and the browser's reader (`blob`) must never be able
 // to reach it, so a change that moved this module out from under the `db`
 // gate would have to say so on this line. A plain comment and not a doc
@@ -56,17 +56,17 @@ pub mod zselect;
 // resolves the links of both against one scope.
 //
 // Public because the tools in `bench/` price the layout they link, and hidden
-// from the documentation because nothing reads a sidecar yet: its items are
+// from the documentation because nothing reads a form file yet: its items are
 // not an API anyone is promised until the form is wired, and the design had
 // them `pub(super)` in a private module. Lifting the attribute is the step
 // that makes the layout the crate's to keep.
 #[cfg(not(target_family = "wasm"))]
 #[doc(hidden)]
 pub mod zpages;
-// The same form's engine side: the sidecar mapped, checked and read, the
+// The same form's engine side: the form file mapped, checked and read, the
 // cell a segment holds it in, and the builder. Private: it is the engine's
 // and nothing outside `db` names it.
-mod zside;
+mod zfile;
 
 /// Write a segment's ordered index, and make it durable where `durable`
 /// says so (`Options::ord_durable`).
@@ -313,32 +313,32 @@ impl ReadAdvice {
     }
 }
 
-/// Whether a partition's records are also kept in a second form, a sidecar
+/// Whether a partition's records are also kept in a second form, a form file
 /// of the same records packed into groups that each compress into one 4 KiB
 /// page, and read from it (`zpages`).
 ///
 /// Out of core a point read of the raw form touches the hash region, which
 /// every read does and which therefore stays resident, and the record, which
 /// is the page a read misses on; the cache holds both, and the records do
-/// not fit beside it. The sidecar is smaller than the records it copies, so
-/// a store whose raw form misses on nearly every read can hold the sidecar
+/// not fit beside it. The form file is smaller than the records it copies, so
+/// a store whose raw form misses on nearly every read can hold the form file
 /// whole, and a read then takes one page of it at most. Both forms answer
-/// every read identically, and the sidecar is derived data: deleting its
+/// every read identically, and the form file is derived data: deleting its
 /// files and setting `Off` is the whole of the undo.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ZPages {
-    /// No sidecar is built, read or attached. One already on disk is not
+    /// No form file is built, read or attached. One already on disk is not
     /// read, and goes with its segment when the store retires the segment.
     #[default]
     Off,
-    /// Every partition has a sidecar, and every point read and count of a
+    /// Every partition has a form file, and every point read and count of a
     /// partition is answered from it. Built on demand by
     /// `Db::zpages_settle`, attached at open, and refused beside
     /// `writer_pins` off, since the cell it is read through is freed with
     /// its segment under the epoch. A partition that has none -- being
     /// built, declined, damaged -- is read from the raw form and counted.
     /// Scans of a covered partition are walked over the raw form, and
-    /// counted, so a sidecar's mapping is advised `MADV_RANDOM` in every
+    /// counted, so a form file's mapping is advised `MADV_RANDOM` in every
     /// phase of the store whenever `read_advice` advises mappings at all.
     /// This is the arm that prices the form: it is built and read whether
     /// or not the store needs it.
@@ -355,7 +355,7 @@ pub enum ZPages {
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ZCounts {
-    /// Point reads and counts of a partition answered from its sidecar.
+    /// Point reads and counts of a partition answered from its form file.
     pub reads: u64,
     pub counts: u64,
     /// Pages decoded to answer them: one for each read or count of a key
@@ -366,7 +366,7 @@ pub struct ZCounts {
     /// answers.
     pub decodes: u64,
     /// Reads and counts of a partition that went to the raw form because
-    /// it had no sidecar in service: none attached yet, or declined, or
+    /// it had no form file in service: none attached yet, or declined, or
     /// out of service after a check failed.
     pub rawserves: u64,
     /// Reads and counts that went to the raw form because a check failed
@@ -376,14 +376,14 @@ pub struct ZCounts {
     /// a record no page holds, which the build left to the raw form on
     /// purpose.
     pub nopage_reads: u64,
-    /// Partition walks of a scan served by a sidecar (`ZSide::scan_at`),
+    /// Partition walks of a scan served by a form file (`ZFile::scan_at`),
     /// the groups decoded for them, and the runs of records no page holds
     /// that the raw form walked inside them.
     pub scans: u64,
     pub scan_groups: u64,
     pub nopage_scans: u64,
     /// Partition walks of a scan under the form that went to the raw form:
-    /// the partition had no sidecar in its cell, or one out of service, or
+    /// the partition had no form file in its cell, or one out of service, or
     /// a check failed inside the walk and the rest was walked raw (counted
     /// a fallback as well).
     pub raw_scans: u64,
@@ -396,7 +396,7 @@ pub struct ZCounts {
     /// Walks that asked for the pages after their first at once
     /// (`Options::zpages_scan_prefetch`).
     pub prefetches: u64,
-    /// Sidecars built, their pages, bytes, the pages that hold their
+    /// Form files built, their pages, bytes, the pages that hold their
     /// group verbatim, the decoded bytes of every group, and compress
     /// calls; builds that failed and builds a merge outran.
     pub builds: u64,
@@ -407,7 +407,7 @@ pub struct ZCounts {
     pub build_calls: u64,
     pub build_failed: u64,
     pub build_orphaned: u64,
-    /// Failed builds tried again after their backoff; sidecars retired for
+    /// Failed builds tried again after their backoff; form files retired for
     /// a page that failed a check and built again; partitions left raw
     /// after the third such rebuild.
     pub build_retries: u64,
@@ -419,7 +419,7 @@ pub struct ZCounts {
     pub build_cancelled: u64,
     /// Records the builds held no page for.
     pub build_nopage: u64,
-    /// Warms of sidecar files (`Options::zpages_warm`): how many, the bytes
+    /// Warms of form files (`Options::zpages_warm`): how many, the bytes
     /// read, the bytes skipped as resident, and the jobs' microseconds.
     pub warms: u64,
     pub warm_bytes: u64,
@@ -433,16 +433,16 @@ pub struct ZCounts {
     pub declined_oversize: u64,
     pub declined_incompressible: u64,
     pub declined_unplaceable: u64,
-    /// Sidecars attached, and files an attach refused: damaged, or bound
+    /// Form files attached, and files an attach refused: damaged, or bound
     /// to another segment.
     pub attached: u64,
     pub rejected_damage: u64,
     pub rejected_identity: u64,
     /// Files removed from the directory because no live segment claims
-    /// them: sidecars left by a crash or by a store that ran without the
+    /// them: form files left by a crash or by a store that ran without the
     /// option, and the temp names of builds that did not finish.
     pub swept: u64,
-    /// Partitions live, the ones with a sidecar installed, the ones of
+    /// Partitions live, the ones with a form file installed, the ones of
     /// those out of service, and their pages, the pages a first decode has
     /// passed, the pages a check failed, the fences kept in memory, the
     /// files' bytes and the decoded bytes of their groups. The live
@@ -450,7 +450,7 @@ pub struct ZCounts {
     /// apart (`small_partitions`): a store covered but for a sliver is one
     /// thing, and one whose partitions could not be is another.
     pub partitions: u64,
-    pub sidecars: u64,
+    pub form_files: u64,
     pub small_partitions: u64,
     pub damaged: u64,
     pub pages: u64,
@@ -685,15 +685,15 @@ pub struct Options {
     /// read path pays one load of this field and one branch not taken, and
     /// nothing else. `Always` is the arm that prices the form
     /// (`supdb-nocachezpages`): a point read and a count of a partition is
-    /// answered from its sidecar, a scan of one is not. Refused beside
+    /// answered from its form file, a scan of one is not. Refused beside
     /// `writer_pins` off.
     pub zpages: ZPages,
     /// The record bytes below which `ZPages::Always` declines a partition
-    /// and writes no file. A test's: it lowers the floor to build sidecars
+    /// and writes no file. A test's: it lowers the floor to build form files
     /// of partitions a test can afford to write.
     #[doc(hidden)]
     pub zpages_min_bytes: usize,
-    /// Whether a sidecar's build drops the raw records and directory it
+    /// Whether a form file's build drops the raw records and directory it
     /// reads from the page cache as it passes them. On, the build leaves
     /// the partition's records cold, which is what a store that does not
     /// fit wants of a pass that read them once. It costs the build an
@@ -703,7 +703,7 @@ pub struct Options {
     /// what it costs.
     #[doc(hidden)]
     pub zpages_drop_behind: bool,
-    /// How long after a sidecar's build fails the partition is tried
+    /// How long after a form file's build fails the partition is tried
     /// again, in milliseconds; doubled at each failure up to an hour. A
     /// disk that was full or a transient error is not the segment's for
     /// life. A test's knob at zero: the next settle tries again.
@@ -716,7 +716,7 @@ pub struct Options {
     pub zpages_hold_build: bool,
     #[doc(hidden)]
     pub zpages_hold_rename: bool,
-    /// Under `ZPages::Always`, a partition's sidecar is built as soon as
+    /// Under `ZPages::Always`, a partition's form file is built as soon as
     /// the partition lands, on the builder's thread at idle priority,
     /// rather than at the next settle of the form, which then waits for
     /// the builds in flight and starts the ones no landing did. Priced in
@@ -729,23 +729,23 @@ pub struct Options {
     /// build to the settle.
     #[doc(hidden)]
     pub zpages_eager: bool,
-    /// Whether a sidecar's file is read into the page cache once it is
+    /// Whether a form file is read into the page cache once it is
     /// attached, by a job on the builder's thread at idle priority
-    /// (`zside::warm_file`): `MADV_WILLNEED` and a touch of each page in
+    /// (`zfile::warm_file`): `MADV_WILLNEED` and a touch of each page in
     /// chunks of eight megabytes, the chunks `mincore` reports resident
-    /// skipped, cancelled where a merge retires the partition. A sidecar
+    /// skipped, cancelled where a merge retires the partition. A form file
     /// just built is resident already and the job skips it whole; one on
     /// disk at a restart is cold, and a divided read pass over a cold file
-    /// faults as the raw form does. Once per sidecar per process, and the
+    /// faults as the raw form does. Once per form file per process, and the
     /// settle of the form waits for it as it waits for a build. The
     /// headroom a bound leaves is not consulted yet: the file is read
     /// whole. `supdb-nocachezpagesnowarm` is the arm with it off.
     #[doc(hidden)]
     pub zpages_warm: bool,
-    /// Whether a compressed page of a sidecar is opened through the
-    /// thread's memo of decoded groups (`zside::Memo`): a thousand and
+    /// Whether a compressed page of a form file is opened through the
+    /// thread's memo of decoded groups (`zfile::Memo`): a thousand and
     /// twenty-four entries capped at eight megabytes of decoded bytes a
-    /// thread, keyed by the sidecar's attach identity and the page, so a
+    /// thread, keyed by the form file's attach identity and the page, so a
     /// read of a page the thread decoded before pays the walk of the group
     /// and not the decode. Counted on the handle's line (`memo_hits`,
     /// `memo_misses`). `supdb-nocachezpagesnomemo` is the arm with it off.
@@ -754,14 +754,14 @@ pub struct Options {
     /// EXPERIMENT: a scan's seek of a covered partition, and the cut where
     /// an unsealed key falls inside its walk, by the ordered index's heads
     /// and the raw records, as before the form served scans, instead of by
-    /// the sidecar's fence and one group (`ZSide::seek`, `ZSide::cut_in`);
-    /// the walk after the seek stays the sidecar's. `supdb-nocachezpagesheads`
+    /// the form file's fence and one group (`ZFile::seek`, `ZFile::cut_in`);
+    /// the walk after the seek stays the form file's. `supdb-nocachezpagesheads`
     /// prices the seek by the fence against it. Off.
     #[doc(hidden)]
     pub zpages_seek_ord: bool,
     /// EXPERIMENT: a scan of a covered partition that wants more keys than
     /// its first page holds asks the kernel for the pages it will cross
-    /// after it, at once (`MADV_WILLNEED`, `zside::ZPREFETCH_PAGES` of them
+    /// after it, at once (`MADV_WILLNEED`, `zfile::ZPREFETCH_PAGES` of them
     /// at most, the keys still wanted over the mean a page), so that out
     /// of core the walk finds them coming in instead of faulting on each;
     /// in core the advice is a syscall for pages that are there. The design
@@ -772,7 +772,7 @@ pub struct Options {
     pub zpages_scan_prefetch: bool,
     /// The overlay walk of a covered partition (`scan_partitions`) through
     /// a cursor that keeps its group and position across the unsealed keys
-    /// it meets (`zside::ZCursor::walk_until`): the cut at an unsealed key
+    /// it meets (`zfile::ZCursor::walk_until`): the cut at an unsealed key
     /// is a forward walk from where the cursor stands and the emit's
     /// values are the record under it, one group open a group crossed.
     /// Off, the walk is cut by rank as it first was: a seek, a fresh walk
@@ -2201,7 +2201,7 @@ impl Default for Options {
             exts_by_value: false,
             point_via_ord: false,
             zpages: ZPages::Off,
-            zpages_min_bytes: zside::ZMIN_RECS,
+            zpages_min_bytes: zfile::ZMIN_RECS,
             zpages_drop_behind: true,
             zpages_retry_ms: 60_000,
             zpages_hold_build: false,
@@ -2745,14 +2745,14 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
 /// The signature of `BlockedBloom`'s layout: what a stored filter is
 /// compared against before its bits are trusted.
 ///
-/// A sidecar of the z form (`zpages`) stores this filter's words, and a
+/// A form file of the z form (`zpages`) stores this filter's words, and a
 /// filter answers "absent" for every key whose bits it does not hold. The
 /// bits are a function of `flatindex::key_hash` (a format quantity: its
 /// change moves the magic), of `finalize` (two multipliers and two shifts),
 /// of the block a hash chooses, of the probe walk in `slots_of`, and of the
 /// blocks `with_capacity` allocates a key. Only the first is format. An edit
 /// to any of the others moves no magic, no record version and no checksum,
-/// so a sidecar built before it would attach with every check passing and
+/// so a form file built before it would attach with every check passing and
 /// answer "absent" for keys it holds, with nothing raised. Whoever edits any
 /// of them bumps this constant, and `zpages`' pin test -- a CRC of the words
 /// of a filter built from fixed keys -- fails when they forget.
@@ -2849,7 +2849,7 @@ impl BlockedBloom {
     /// half for every key. It was an FNV-1a of its own here, a multiplier
     /// apart from the index's -- the filter was built at open and never
     /// stored, so its hash was free to be the index's; the test beside the
-    /// landing holds the two halves to the whole. A sidecar of the z form
+    /// landing holds the two halves to the whole. A form file of the z form
     /// stores the filter's words, so this hash is a stored quantity there:
     /// `BLOOM_SIG` moves with any edit to it, and `zpages` pins the words.
     fn fnv(key: &[u8]) -> u64 {
@@ -2924,7 +2924,7 @@ impl BlockedBloom {
         probes.iter().all(|&(w, m)| b[w] & m != 0)
     }
 
-    /// The words as a sidecar stores them: every block's eight words
+    /// The words as a form file stores them: every block's eight words
     /// little-endian, block after block. The one encoding, which
     /// `from_words` reverses and the layout's pin test hashes.
     fn words(&self) -> Vec<u8> {
@@ -2961,9 +2961,9 @@ impl BlockedBloom {
 /// producing the outputs that replace them.
 type Compaction = (Vec<String>, std::thread::JoinHandle<Result<Vec<String>>>);
 
-/// A sidecar build in flight on the builder's thread (`Maint::z_step`):
+/// A form file build in flight on the builder's thread (`Maint::z_step`):
 /// its target, its thread, the flag that stops it, and whether the file
-/// under the sidecar's name was one an attach refused, which the build
+/// under the form file's name was one an attach refused, which the build
 /// replaces or, declined, removes.
 struct ZBuild {
     seg: std::sync::Arc<Seg>,
@@ -2973,10 +2973,10 @@ struct ZBuild {
 }
 
 /// What the builder's thread is running: a build, or a warm of an attached
-/// sidecar's file (`Options::zpages_warm`).
+/// form file (`Options::zpages_warm`).
 enum ZJob {
-    Build(std::thread::JoinHandle<Result<zside::Outcome>>),
-    Warm(std::thread::JoinHandle<Result<zside::Warm>>),
+    Build(std::thread::JoinHandle<Result<zfile::Outcome>>),
+    Warm(std::thread::JoinHandle<Result<zfile::Warm>>),
 }
 
 impl ZJob {
@@ -2995,9 +2995,9 @@ impl ZJob {
     }
 }
 
-/// Why a partition is given a job: it has no sidecar, its last build
-/// failed and the backoff has passed, or its sidecar failed a check; or its
-/// sidecar is attached and cold to this process, and is to be warmed.
+/// Why a partition is given a job: it has no form file, its last build
+/// failed and the backoff has passed, or its form file failed a check; or its
+/// form file is attached and cold to this process, and is to be warmed.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ZKind {
     Build,
@@ -3006,7 +3006,7 @@ enum ZKind {
     Warm,
 }
 
-/// `seg`'s sidecar taken out of its cell and retired through the epoch --
+/// `seg`'s form file taken out of its cell and retired through the epoch --
 /// a reader pinned before the take may be walking it, and the sweep frees
 /// it past every such pin -- and its file renamed to a dead name: the path
 /// of the dead name, for the caller to unlink where nobody waits, or
@@ -3021,34 +3021,34 @@ fn z_retire_cell(shared: &Shared, dir: &Path, seg: &Seg) -> Option<PathBuf> {
     shared.retired_z.sweep(|low| shared.readers.oldest_for(low));
     let (id, end) = (Db::name_id(&seg.name)?, Db::name_end_seq(&seg.name)?);
     let n = shared.next_dead.fetch_add(1, AtomicOrdering::Relaxed);
-    let dead = dir.join(zside::zpg_dead_name(n));
-    std::fs::rename(dir.join(zside::zpg_name(id, end)), &dead)
+    let dead = dir.join(zfile::zpg_dead_name(n));
+    std::fs::rename(dir.join(zfile::zpg_name(id, end)), &dead)
         .ok()
         .map(|_| dead)
 }
 
 /// A segment's raw form behind one door. `Seg::blob` was the `Blob` itself
 /// and every reader of a partition could read its records through it, with
-/// a sidecar attached or not, which is how the block path and the merge
+/// a form file attached or not, which is how the block path and the merge
 /// path walked a covered partition raw for a week each without a row to
 /// show it. The type forwards only what has no raw footprint -- the key
 /// count, the id, the index size, the advice -- so the compiler lists every
 /// read of the records, and each goes through `Seg::raw` on purpose or
-/// through the sidecar's dispatch (`part_read_z`, `part_count_z`,
+/// through the form file's dispatch (`part_read_z`, `part_count_z`,
 /// `part_scan_z`, `part_seek_z`, `part_cut_z`, `part_values_z`, `PWalk`).
 /// `grep -n '\.raw()' src/db.rs` is the list of the deliberate reads, in
-/// these groups: the raw side of each dispatch, which the sidecar's answer
+/// these groups: the raw side of each dispatch, which the form file's answer
 /// (none, out of service, a check failed, a record no page holds) falls to;
 /// the `cursor_merge` arm, which walks every segment raw; the pieces'
 /// cursors and the tombstone pre-pass over them, since a piece has no
-/// sidecar; the block cache's machinery (`BuildCtx`, `scan_blocks`,
+/// form file; the block cache's machinery (`BuildCtx`, `scan_blocks`,
 /// `make_table`, `install_ahead`, `patch_block`, the prefetch), which
 /// builds its forms from the records and which the nocache arms never run;
 /// and the segment work's own passes at a landing, a promotion or the open
 /// (a piece's ranks and bounds against its partition, `same_blocks` one key
 /// a block of the partition a merge retires, a segment's first or last key,
 /// the recovery's walk of a pending segment). Under debug assertions a
-/// touch through `Seg::raw` on a segment with a sidecar installed counts
+/// touch through `Seg::raw` on a segment with a form file installed counts
 /// (`Seg::raw_touches`), which `tests/zpages.rs` holds to zero over a
 /// covered partition's reads and scans.
 struct SegBlob(Blob<MmapBytes>);
@@ -3077,11 +3077,11 @@ impl SegBlob {
         self.0.advise_normal();
     }
 
-    /// The raw form for the sidecar: `ZSide` reads a run that lies in a
+    /// The raw form for the form file: `ZFile` reads a run that lies in a
     /// block through it, as the raw form reads one, and at the attach the
-    /// identity the sidecar is bound by; nothing of the records' region
+    /// identity the form file is bound by; nothing of the records' region
     /// for an inline value, which is why it is not a touch.
-    fn for_sidecar(&self) -> &Blob<MmapBytes> {
+    fn for_zfile(&self) -> &Blob<MmapBytes> {
         &self.0
     }
 }
@@ -3092,7 +3092,7 @@ impl SegBlob {
 /// from a partitioning merge, are disjoint, and are gated by their fence.
 struct Seg {
     blob: SegBlob,
-    /// Touches of the raw form through `Seg::raw` while a sidecar is
+    /// Touches of the raw form through `Seg::raw` while a form file is
     /// installed, under debug assertions; `Reader::raw_touches` sums it.
     raw_touches: AtomicU64,
     name: String,
@@ -3162,27 +3162,27 @@ struct Seg {
     /// them; for a segment that recorded none, two thirds of its file,
     /// the ratio `seal_threshold` is calibrated at.
     data: u64,
-    /// The partition's sidecar (`Options::zpages`), once one is attached:
+    /// The partition's form file (`Options::zpages`), once one is attached:
     /// set once, never cleared, freed with the segment. A segment that
     /// replaces another -- a merge's output, a promotion's re-open -- starts
     /// with an empty cell, and its reads go to the raw form until the
-    /// sidecar is attached again.
-    z: zside::ZCell,
-    /// Why a partition was given no sidecar, for the life of the segment,
-    /// as `zside::Decline::code` numbers the reasons (`zside::DECLINED_FAILED`
+    /// form file is attached again.
+    z: zfile::ZCell,
+    /// Why a partition was given no form file, for the life of the segment,
+    /// as `zfile::Decline::code` numbers the reasons (`zfile::DECLINED_FAILED`
     /// a build that failed), or zero: what keeps a settle from looking
     /// again at a partition it has declined, and what `Db::zpage_counts`
     /// reads to tell a sliver left raw for its size from one that could not
     /// be covered.
     z_declined: std::sync::atomic::AtomicU8,
-    /// Sidecars of this segment built again after a page of one failed a
-    /// check, up to `zside::ZREBUILDS`.
+    /// Form files of this segment built again after a page of one failed a
+    /// check, up to `zfile::ZREBUILDS`.
     z_rebuilds: std::sync::atomic::AtomicU8,
     /// When a build that failed is tried again, and the backoff the next
     /// failure doubles (`Options::zpages_retry_ms`).
     z_retry: std::sync::Mutex<Option<std::time::Instant>>,
     z_backoff: AtomicU64,
-    /// The sidecar's file warmed into the page cache by this process, or a
+    /// The form file warmed into the page cache by this process, or a
     /// warm of it started (`Options::zpages_warm`).
     z_warmed: std::sync::atomic::AtomicBool,
 }
@@ -6049,8 +6049,8 @@ impl PieceWriter {
 
 impl Seg {
     /// The raw form, for a read of the records on purpose (`SegBlob`):
-    /// counted while a sidecar is installed, under debug assertions, so
-    /// that a test can hold a covered partition's reads to the sidecar.
+    /// counted while a form file is installed, under debug assertions, so
+    /// that a test can hold a covered partition's reads to the form file.
     #[inline]
     fn raw(&self) -> &Blob<MmapBytes> {
         #[cfg(debug_assertions)]
@@ -6199,7 +6199,7 @@ impl Seg {
                 ord_rebuilt,
                 tombs,
                 data,
-                z: zside::ZCell::new(),
+                z: zfile::ZCell::new(),
                 z_declined: std::sync::atomic::AtomicU8::new(0),
                 z_rebuilds: std::sync::atomic::AtomicU8::new(0),
                 z_retry: std::sync::Mutex::new(None),
@@ -6239,7 +6239,7 @@ impl Seg {
                 ord_rebuilt,
                 tombs: false,
                 data,
-                z: zside::ZCell::new(),
+                z: zfile::ZCell::new(),
                 z_declined: std::sync::atomic::AtomicU8::new(0),
                 z_rebuilds: std::sync::atomic::AtomicU8::new(0),
                 z_retry: std::sync::Mutex::new(None),
@@ -6271,7 +6271,7 @@ impl Seg {
             ord_rebuilt,
             tombs,
             data,
-            z: zside::ZCell::new(),
+            z: zfile::ZCell::new(),
             z_declined: std::sync::atomic::AtomicU8::new(0),
             z_rebuilds: std::sync::atomic::AtomicU8::new(0),
             z_retry: std::sync::Mutex::new(None),
@@ -6280,7 +6280,7 @@ impl Seg {
         })
     }
 
-    /// A failed sidecar build scheduled for another try: after the
+    /// A failed form file build scheduled for another try: after the
     /// segment's backoff, which starts at `base_ms` and doubles at each
     /// failure up to an hour.
     fn z_schedule_retry(&self, base_ms: u64) {
@@ -7490,17 +7490,17 @@ struct Slot {
     /// What this handle's reads did of the second form (`Options::zpages`),
     /// written by the slot's handle alone with a plain load and store, the
     /// way a line only its owner writes is counted: point reads and counts
-    /// the sidecar answered, pages it decoded to answer them, reads of a
-    /// partition that went to the raw form because it had no sidecar in
+    /// the form file answered, pages it decoded to answer them, reads of a
+    /// partition that went to the raw form because it had no form file in
     /// service, reads that went to it because a check failed, and scans
-    /// that began in a partition with a sidecar and were walked raw.
+    /// that began in a partition with a form file and were walked raw.
     zreads: AtomicU64,
     zcounts: AtomicU64,
     zdecodes: AtomicU64,
     zraw: AtomicU64,
     zfallbacks: AtomicU64,
     zscans: AtomicU64,
-    /// Partition walks of a scan served by a sidecar, the groups decoded
+    /// Partition walks of a scan served by a form file, the groups decoded
     /// for them, and the runs of records no page holds the raw form walked
     /// inside them.
     zscanz: AtomicU64,
@@ -7510,7 +7510,7 @@ struct Slot {
     /// the raw form as the fence says.
     znopage: AtomicU64,
     /// The memo's hits and misses on this handle's thread, taken at each
-    /// dispatch (`zside::memo_take`).
+    /// dispatch (`zfile::memo_take`).
     zmemohits: AtomicU64,
     zmemomisses: AtomicU64,
     /// Walks that asked for the pages after their first
@@ -9059,12 +9059,12 @@ fn check_options(opts: &Options) -> Result<()> {
              publish_in_background and snapshot_keeper off",
         ));
     }
-    // The sidecar a read follows hangs on its segment and is freed with it,
+    // The form file a read follows hangs on its segment and is freed with it,
     // through the epoch like every state a publish replaces; a writer that
     // pins nothing reads a segment nobody keeps alive for it.
     if opts.zpages == ZPages::Always && !opts.writer_pins {
         return Err(err(
-            "zpages Always needs writer_pins: a sidecar is freed with its segment \
+            "zpages Always needs writer_pins: a form file is freed with its segment \
              under the epoch, and an unpinned writer reads it unpinned",
         ));
     }
@@ -11443,22 +11443,22 @@ struct Shared {
     /// Ordered indexes the open rebuilt from their segments
     /// (`Seg::open_ord`); see `Db::ord_rebuilt`.
     ord_rebuilt: AtomicU64,
-    /// What building and attaching sidecars did over the store's life
+    /// What building and attaching form files did over the store's life
     /// (`Options::zpages`), counted by the thread that did it; a read's
     /// own counts are on its slot's line. See `Db::zpage_counts`.
-    z: zside::ZEvents,
-    /// Sidecars taken out of their cells -- out of service after a page
+    z: zfile::ZEvents,
+    /// Form files taken out of their cells -- out of service after a page
     /// failed a check, and retired before the partition's is built again
     /// -- each under the epoch its retirement bumped, freed past every
     /// pinned reader as the forms and the snapshots are; a reader that
     /// loaded the pointer before the take may be walking it.
     retired_z: RetireList<RetiredZ>,
-    /// The dead names given to retired sidecar files (`zside::zpg_dead_name`).
+    /// The dead names given to retired form files (`zfile::zpg_dead_name`).
     next_dead: AtomicU64,
     /// A test's holds on the builder's thread (`ZHOLD_START`,
     /// `ZHOLD_RENAME`), shared with the build's plan.
     zbuild_hold: std::sync::Arc<std::sync::atomic::AtomicU8>,
-    /// A test's: the next sidecar build fails as a write error would.
+    /// A test's: the next form file build fails as a write error would.
     fail_zbuild: std::sync::atomic::AtomicBool,
     /// Direct runs whose mapping was grown past the file's end
     /// (`Options::direct_table_refs`); see `Db::run_remaps`.
@@ -11782,10 +11782,10 @@ struct RetiredForm(*mut CanonicalForm);
 /// one reference, taken by `Arc::into_raw` when it was published.
 struct RetiredSnap(*const Snapshot);
 
-/// A sidecar taken out of its segment's cell (`zside::ZCell::take`), as
-/// `RetiredForm`: dropping it frees the sidecar and its mapping, past every
+/// A form file taken out of its segment's cell (`zfile::ZCell::take`), as
+/// `RetiredForm`: dropping it frees the form file and its mapping, past every
 /// reader that could have loaded the pointer.
-struct RetiredZ(*mut zside::ZSide);
+struct RetiredZ(*mut zfile::ZFile);
 
 impl Drop for RetiredZ {
     fn drop(&mut self) {
@@ -12153,9 +12153,9 @@ pub struct Reader {
     /// threaded cells it is meant to be read beside would price.
     ord_served: std::cell::Cell<u64>,
     ord_declined: std::cell::Cell<u64>,
-    /// This handle's memo of decoded groups (`zside::ZMemo`,
+    /// This handle's memo of decoded groups (`zfile::ZMemo`,
     /// `Options::zpages_memo`), which goes with the handle.
-    zmemo: zside::ZMemo,
+    zmemo: zfile::ZMemo,
 }
 
 /// A handle's upkeep for its range reads: its block tables, its scan
@@ -14142,7 +14142,7 @@ impl Reader {
             if self.shared.retired.len() > 0 {
                 self.sweep_retired_states();
             }
-            // A sidecar retired by a settle waits for the same pins, and
+            // A form file retired by a settle waits for the same pins, and
             // the writer's next operation is the sweep a store between
             // publishes has.
             if self.shared.retired_z.len() > 0 {
@@ -14737,7 +14737,7 @@ impl Reader {
         // Segments only. A segment's pages are walked in whichever way the
         // workload is walking them, so the advice follows the phase; the
         // ordered companion is reached only by a binary search and a
-        // sidecar only by point reads and counts, and both are left on
+        // form file only by point reads and counts, and both are left on
         // `MADV_RANDOM` in both.
         for s in self.segs() {
             if random {
@@ -14780,14 +14780,14 @@ impl Reader {
         )
     }
 
-    /// How many sidecars' mappings were advised `MADV_RANDOM`, and how many
-    /// sidecars there are.
+    /// How many form files' mappings were advised `MADV_RANDOM`, and how many
+    /// form files there are.
     ///
-    /// The sidecar is the other mapping the advice policy can miss, and the
+    /// The form file is the other mapping the advice policy can miss, and the
     /// ordered companion's rule is its own: `advise`'s walk is the segments',
-    /// so a sidecar is advised once, at attach, and not by the mode the store
+    /// so a form file is advised once, at attach, and not by the mode the store
     /// is in at that moment -- only point reads and counts reach it, and
-    /// they are random in both phases. Every sidecar of a store that advises
+    /// they are random in both phases. Every form file of a store that advises
     /// its mappings is random, then, and none of one that does not
     /// (`ReadAdvice::Normal`). A check needs to be able to ask, as
     /// `ords_advised` lets it ask of the companions, and the kernel's own
@@ -14806,8 +14806,8 @@ impl Reader {
     /// What the second form (`Options::zpages`) has done over the store's
     /// life, whichever handle did it: the reads and counts it answered, the
     /// reads of a partition that went to the raw form and why, the scans it
-    /// stood aside for, what building and attaching sidecars did, and the
-    /// sidecars as the segments hold them now. Zero throughout without the
+    /// stood aside for, what building and attaching form files did, and the
+    /// form files as the segments hold them now. Zero throughout without the
     /// option, but for the partitions it counts and the files the open's
     /// sweep removed, which runs under either setting.
     ///
@@ -14817,7 +14817,7 @@ impl Reader {
     /// before the counters are read are in the sum.
     #[doc(hidden)]
     /// A test's: the raw form's touches through `Seg::raw` on segments with
-    /// a sidecar installed, summed over the live segments; a build without
+    /// a form file installed, summed over the live segments; a build without
     /// debug assertions counts none (`SegBlob`).
     #[doc(hidden)]
     pub fn raw_touches(&self) -> u64 {
@@ -14880,7 +14880,7 @@ impl Reader {
         for seg in self.segs().iter().filter(|s| s.level > 0) {
             c.partitions += 1;
             if let Some(z) = seg.z.get() {
-                c.sidecars += 1;
+                c.form_files += 1;
                 c.damaged += u64::from(z.damaged());
                 c.pages += z.pages() as u64;
                 c.verified_pages += z.verified_pages();
@@ -14888,7 +14888,7 @@ impl Reader {
                 c.resident_bytes += z.resident_bytes() as u64;
                 c.file_bytes += z.file_bytes();
                 c.group_bytes += z.group_bytes();
-            } else if seg.z_declined.load(AtomicOrdering::Relaxed) == zside::DECLINED_SMALL {
+            } else if seg.z_declined.load(AtomicOrdering::Relaxed) == zfile::DECLINED_SMALL {
                 c.small_partitions += 1;
             }
         }
@@ -14986,12 +14986,12 @@ impl Reader {
         }
     }
 
-    /// `key`'s values in a partition read from its sidecar
+    /// `key`'s values in a partition read from its form file
     /// (`Options::zpages`), or from the raw form, which `raw` reads, where
-    /// the partition has no sidecar in service or a check of the sidecar
+    /// the partition has no form file in service or a check of the form file
     /// failed on this read: counted either way, on this handle's line.
     ///
-    /// The sidecar answers or it does not before a value is handed to `f`,
+    /// The form file answers or it does not before a value is handed to `f`,
     /// so a read that falls back has emitted nothing and the raw read does
     /// not repeat a value.
     ///
@@ -15011,26 +15011,26 @@ impl Reader {
             return raw(seg, f);
         };
         let served = z
-            .read_all(&self.zmemo, seg.blob.for_sidecar(), key, f)
+            .read_all(&self.zmemo, seg.blob.for_zfile(), key, f)
             .map_err(|e| err(&format!("segment read: {e}")))?;
         self.zmemo_take();
         match served {
-            zside::ZRead::Served { n, decoded } => {
+            zfile::ZRead::Served { n, decoded } => {
                 self.zbump(|s| &s.zreads);
                 if decoded {
                     self.zbump(|s| &s.zdecodes);
                 }
                 Ok(n)
             }
-            zside::ZRead::Fallback => {
+            zfile::ZRead::Fallback => {
                 self.zbump(|s| &s.zfallbacks);
                 raw(seg, f)
             }
-            zside::ZRead::NoPage => {
+            zfile::ZRead::NoPage => {
                 self.zbump(|s| &s.znopage);
                 raw(seg, f)
             }
-            zside::ZRead::Out => {
+            zfile::ZRead::Out => {
                 self.zbump(|s| &s.zraw);
                 raw(seg, f)
             }
@@ -15052,22 +15052,22 @@ impl Reader {
         let served = z.count(&self.zmemo, key);
         self.zmemo_take();
         match served {
-            zside::ZRead::Served { n, decoded } => {
+            zfile::ZRead::Served { n, decoded } => {
                 self.zbump(|s| &s.zcounts);
                 if decoded {
                     self.zbump(|s| &s.zdecodes);
                 }
                 Ok(n)
             }
-            zside::ZRead::Fallback => {
+            zfile::ZRead::Fallback => {
                 self.zbump(|s| &s.zfallbacks);
                 raw()
             }
-            zside::ZRead::NoPage => {
+            zfile::ZRead::NoPage => {
                 self.zbump(|s| &s.znopage);
                 raw()
             }
-            zside::ZRead::Out => {
+            zfile::ZRead::Out => {
                 self.zbump(|s| &s.zraw);
                 raw()
             }
@@ -15075,11 +15075,11 @@ impl Reader {
     }
 
     /// A scan's walk of `n` keys of a partition from `rank`, through its
-    /// sidecar (`ZSide::scan_at`) where the cell holds one in service, and
-    /// through the raw form for what the sidecar cannot serve: a cell with
-    /// no sidecar, one out of service, or the rest of a walk a check
+    /// form file (`ZFile::scan_at`) where the cell holds one in service, and
+    /// through the raw form for what the form file cannot serve: a cell with
+    /// no form file, one out of service, or the rest of a walk a check
     /// stopped, each counted `raw_scans` on this handle's line (a stopped
-    /// walk a fallback as well). A walk the sidecar stops has emitted every
+    /// walk a fallback as well). A walk the form file stops has emitted every
     /// value of the records before the stop and none after, so the raw
     /// walk goes on from there and repeats nothing.
     fn part_scan_z<F: FnMut(&[u8], &[u8])>(
@@ -15101,23 +15101,23 @@ impl Reader {
             return raw(rank, n, f);
         };
         let r = z
-            .scan_at(&self.zmemo, seg.blob.for_sidecar(), rank, n, f)
+            .scan_at(&self.zmemo, seg.blob.for_zfile(), rank, n, f)
             .map_err(|e| err(&format!("segment scan: {e}")))?;
         self.zmemo_take();
         self.zbump_by(|s| &s.zscangroups, r.decoded);
         self.zbump_by(|s| &s.znopagescans, r.nopage);
         self.zbump_by(|s| &s.zprefetches, r.prefetches);
         match r.end {
-            zside::ScanEnd::Served => {
+            zfile::ScanEnd::Served => {
                 self.zbump(|s| &s.zscanz);
                 Ok(r.seen)
             }
-            zside::ScanEnd::Fallback => {
+            zfile::ScanEnd::Fallback => {
                 self.zbump(|s| &s.zfallbacks);
                 self.zbump(|s| &s.zscans);
                 Ok(r.seen + raw(rank + r.seen, n - r.seen, f)?)
             }
-            zside::ScanEnd::Out => {
+            zfile::ScanEnd::Out => {
                 self.zbump(|s| &s.zscans);
                 Ok(r.seen + raw(rank + r.seen, n - r.seen, f)?)
             }
@@ -15125,10 +15125,10 @@ impl Reader {
     }
 
     /// A scan's seek of a partition: the rank of the first key at or after
-    /// `key`, through the sidecar's fence and one group where the cell
-    /// holds one in service (`ZSide::seek`, a group decoded counted on
+    /// `key`, through the form file's fence and one group where the cell
+    /// holds one in service (`ZFile::seek`, a group decoded counted on
     /// this handle's line), and through the ordered index over the raw
-    /// form where it holds none or the sidecar cannot say.
+    /// form where it holds none or the form file cannot say.
     fn part_seek_z(&self, seg: &Seg, key: &[u8]) -> usize {
         let raw = || seg.ord.seek(key, |r| seg.raw().key_at(r));
         let Some(z) = seg.z.get() else {
@@ -15140,22 +15140,22 @@ impl Reader {
         let r = z.seek(&self.zmemo, key);
         self.zmemo_take();
         match r {
-            zside::ZSeek::Served { rank, decoded, .. } => {
+            zfile::ZSeek::Served { rank, decoded, .. } => {
                 if decoded {
                     self.zbump(|s| &s.zscangroups);
                 }
                 rank
             }
-            zside::ZSeek::Fallback => {
+            zfile::ZSeek::Fallback => {
                 self.zbump(|s| &s.zfallbacks);
                 raw()
             }
-            zside::ZSeek::Out | zside::ZSeek::NoPage => raw(),
+            zfile::ZSeek::Out | zfile::ZSeek::NoPage => raw(),
         }
     }
 
-    /// `BuildCtx::cut_at` for a scan: through the sidecar
-    /// (`ZSide::cut_in`) where the cell holds one in service, over the
+    /// `BuildCtx::cut_at` for a scan: through the form file
+    /// (`ZFile::cut_in`) where the cell holds one in service, over the
     /// ordered index's heads and the raw records otherwise.
     fn part_cut_z(&self, seg: &Seg, rank: usize, end: usize, uk: &[u8]) -> (usize, Ordering) {
         let Some(z) = seg.z.get() else {
@@ -15167,25 +15167,25 @@ impl Reader {
         let r = z.cut_in(&self.zmemo, rank, end, uk);
         self.zmemo_take();
         match r {
-            zside::ZSeek::Served { rank, at, decoded } => {
+            zfile::ZSeek::Served { rank, at, decoded } => {
                 if decoded {
                     self.zbump(|s| &s.zscangroups);
                 }
                 (rank, at)
             }
-            zside::ZSeek::Fallback => {
+            zfile::ZSeek::Fallback => {
                 self.zbump(|s| &s.zfallbacks);
                 BuildCtx::cut_at(seg, rank, end, uk)
             }
-            zside::ZSeek::Out | zside::ZSeek::NoPage => BuildCtx::cut_at(seg, rank, end, uk),
+            zfile::ZSeek::Out | zfile::ZSeek::NoPage => BuildCtx::cut_at(seg, rank, end, uk),
         }
     }
 
     /// A scan's emit of the partition record at `rank` (`emit_unsealed`):
-    /// `Blob::values_at` through the sidecar where the cell holds one in
+    /// `Blob::values_at` through the form file where the cell holds one in
     /// service, counted as a walk's parts are -- a group decoded, a record
     /// no page holds read raw, a fallback -- and the raw form's otherwise.
-    /// The sidecar answers or it does not before a value is handed to `f`.
+    /// The form file answers or it does not before a value is handed to `f`.
     fn part_values_z<F: FnMut(&[u8])>(&self, seg: &Seg, rank: usize, f: &mut F) -> Result<u64> {
         let raw = |f: &mut F| {
             seg.raw()
@@ -15196,36 +15196,36 @@ impl Reader {
             return raw(f);
         };
         let served = z
-            .values_at(&self.zmemo, seg.blob.for_sidecar(), rank, f)
+            .values_at(&self.zmemo, seg.blob.for_zfile(), rank, f)
             .map_err(|e| err(&format!("segment scan read: {e}")))?;
         self.zmemo_take();
         match served {
-            zside::ZRead::Served { n, decoded } => {
+            zfile::ZRead::Served { n, decoded } => {
                 if decoded {
                     self.zbump(|s| &s.zscangroups);
                 }
                 Ok(n)
             }
-            zside::ZRead::Fallback => {
+            zfile::ZRead::Fallback => {
                 self.zbump(|s| &s.zfallbacks);
                 raw(f)
             }
-            zside::ZRead::NoPage => {
+            zfile::ZRead::NoPage => {
                 self.zbump(|s| &s.znopagescans);
                 raw(f)
             }
-            zside::ZRead::Out => raw(f),
+            zfile::ZRead::Out => raw(f),
         }
     }
 
-    /// `scan_merged`'s walk of `seg` from `rank`: through the sidecar
+    /// `scan_merged`'s walk of `seg` from `rank`: through the form file
     /// where the cell holds one in service, the raw form's otherwise.
     fn pwalk_at<'a>(&'a self, seg: &'a Seg, rank: usize) -> PWalk<'a> {
         match seg.z.get() {
-            Some(z) if !z.damaged() => PWalk::Z(zside::ZCursor::at(
+            Some(z) if !z.damaged() => PWalk::Z(zfile::ZCursor::at(
                 &self.zmemo,
                 z,
-                seg.blob.for_sidecar(),
+                seg.blob.for_zfile(),
                 rank,
             )),
             _ => PWalk::Raw {
@@ -15236,9 +15236,9 @@ impl Reader {
         }
     }
 
-    /// `pwalk_at` at the first key at or after `key`: the sidecar's seek
+    /// `pwalk_at` at the first key at or after `key`: the form file's seek
     /// (`ZCursor::seek`), one group opened for the seek and the walk after
-    /// it, or the ordered index's where the sidecar cannot say, with a
+    /// it, or the ordered index's where the form file cannot say, with a
     /// fallback counted where a check failed.
     fn pwalk_seek<'a>(&'a self, seg: &'a Seg, key: &[u8]) -> PWalk<'a> {
         if let Some(z) = seg.z.get() {
@@ -15246,9 +15246,9 @@ impl Reader {
                 let rank = seg.ord.seek(key, |r| seg.raw().key_at(r));
                 return self.pwalk_at(seg, rank);
             }
-            match zside::ZCursor::seek(&self.zmemo, z, seg.blob.for_sidecar(), key) {
+            match zfile::ZCursor::seek(&self.zmemo, z, seg.blob.for_zfile(), key) {
                 Ok(c) => return PWalk::Z(c),
-                Err(zside::ZSeek::Fallback) => self.zbump(|s| &s.zfallbacks),
+                Err(zfile::ZSeek::Fallback) => self.zbump(|s| &s.zfallbacks),
                 Err(_) => {}
             }
         }
@@ -15373,7 +15373,7 @@ impl Reader {
         if start == 0 {
             if let Some(seg) = part {
                 if self.opts.zpages == ZPages::Always {
-                    // The partition from its sidecar, or from the raw form
+                    // The partition from its form file, or from the raw form
                     // and counted where it has none in service.
                     n += self.part_read_z(seg, key, &mut f, seg_read)?;
                 } else {
@@ -16933,7 +16933,7 @@ impl Reader {
             .sweep(|low| self.shared.readers.oldest_for(low));
     }
 
-    /// The sidecars taken out of their cells that no pinned reader can
+    /// The form files taken out of their cells that no pinned reader can
     /// still be walking, freed.
     fn sweep_retired_z(&self) {
         if self.shared.retired_z.len() == 0 {
@@ -20393,7 +20393,7 @@ impl Reader {
     fn scan_partition_cursor<F: FnMut(&[u8], &[u8])>(
         &self,
         seg: &Seg,
-        mut c: zside::ZCursor<'_>,
+        mut c: zfile::ZCursor<'_>,
         limit: usize,
         mut seen: usize,
         mc: &mut SnapCursor,
@@ -20585,7 +20585,7 @@ impl Reader {
         };
         // The partition cursor: the first partition whose fence can reach
         // `from`, then each following one from its first key. Through the
-        // partition's sidecar where it has one in service and the raw
+        // partition's form file where it has one in service and the raw
         // form's rank and key otherwise (`PWalk`), its counts filed as it
         // leaves each partition. The walk advances at the top of the turn
         // after the one that emitted its key, since the key it lends is in
@@ -21179,7 +21179,7 @@ impl Db {
             convert_build_ns: AtomicU64::new(0),
             convert_total_ns: AtomicU64::new(0),
             ord_rebuilt: AtomicU64::new(0),
-            z: zside::ZEvents::default(),
+            z: zfile::ZEvents::default(),
             retired_z: RetireList::new(),
             next_dead: AtomicU64::new(1),
             zbuild_hold: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(zhold_of(&opts))),
@@ -21251,7 +21251,7 @@ impl Db {
             scan_ns: std::cell::Cell::new([0; 6]),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zside::ZMemo::new(),
+            zmemo: zfile::ZMemo::new(),
             slot: None,
             pin_slot,
             depth: std::cell::Cell::new(0),
@@ -21486,16 +21486,16 @@ impl Db {
                 let _ = std::fs::remove_file(dir.join(name));
             }
         }
-        // And the same for sidecars, under either option: one a live segment
+        // And the same for form files, under either option: one a live segment
         // claims stays, since a store that ran without the option may run
         // with it again and finds the file whole, and every other is a
         // merge's input whose unlink a crash came before, a build that
         // never finished, or a file left by a store that was `Always` and
         // is not. Nothing else removes them: a stale temp name is truncated
         // by the next build of the same name and never looked at again, and
-        // a sidecar no segment names is not attached.
-        let zev = zside::ZEvents::default();
-        zside::ZEvents::add(
+        // a form file no segment names is not attached.
+        let zev = zfile::ZEvents::default();
+        zfile::ZEvents::add(
             &zev.swept,
             Db::z_sweep(dir, live.iter().map(String::as_str))?,
         );
@@ -21513,7 +21513,7 @@ impl Db {
             )?);
         }
         segs.sort_by(seg_order);
-        // A store reopened under `Always` attaches the sidecars it finds
+        // A store reopened under `Always` attaches the form files it finds
         // for its partitions. One that does not check out is counted and
         // the partition is read from the raw form until a settle builds it
         // again; a partition with no file is no rejection.
@@ -21729,7 +21729,7 @@ impl Db {
             scan_ns: std::cell::Cell::new([0; 6]),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zside::ZMemo::new(),
+            zmemo: zfile::ZMemo::new(),
             slot: None,
             pin_slot,
             depth: std::cell::Cell::new(0),
@@ -23866,7 +23866,7 @@ impl Reader {
             scan_ns: std::cell::Cell::new([0; 6]),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zside::ZMemo::new(),
+            zmemo: zfile::ZMemo::new(),
             slot: None,
             pin_slot,
             depth: std::cell::Cell::new(0),
@@ -23898,7 +23898,7 @@ impl Reader {
             scan_ns: std::cell::Cell::new([0; 6]),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zside::ZMemo::new(),
+            zmemo: zfile::ZMemo::new(),
             slot: Some(slot),
             pin_slot: None,
             depth: std::cell::Cell::new(0),
@@ -23937,7 +23937,7 @@ impl Reader {
             scan_ns: std::cell::Cell::new([0; 6]),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zside::ZMemo::new(),
+            zmemo: zfile::ZMemo::new(),
             slot: Some(slot),
             pin_slot: None,
             depth: std::cell::Cell::new(0),
@@ -24660,7 +24660,7 @@ impl Db {
 }
 
 /// Rounds `zpages_settle` makes at most over the partitions that lack a
-/// sidecar: a merge that lands while one is built makes partitions the next
+/// form file: a merge that lands while one is built makes partitions the next
 /// round gives theirs, and a store that keeps merging stops being waited
 /// for.
 const ZSETTLE_ROUNDS: usize = 4;
@@ -24669,26 +24669,26 @@ const ZSETTLE_ROUNDS: usize = 4;
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ZRound {
-    /// The partitions the round will give sidecars are listed and none is
+    /// The partitions the round will give form files are listed and none is
     /// built: what lands now retires a partition before its build opens it.
     Listed,
     /// They are built and attached, and the segment work has not been joined
-    /// again: what lands now retires a partition whose sidecar is made.
+    /// again: what lands now retires a partition whose form file is made.
     Built,
 }
 
 /// The second form's building and attaching (`Options::zpages`), on the
 /// calling thread: there is no builder thread, no controller and nothing
-/// that retires a sidecar before its segment goes.
+/// that retires a form file before its segment goes.
 impl Db {
-    /// Whether a sidecar's mapping is advised random: whenever the store
+    /// Whether a form file's mapping is advised random: whenever the store
     /// advises its mappings at all. The mode the store is in at the moment
-    /// of the attach is not asked (see `ZSide`'s `map`).
+    /// of the attach is not asked (see `ZFile`'s `map`).
     fn z_advise(opts: &Options) -> bool {
         opts.read_advice != ReadAdvice::Normal
     }
 
-    /// `seg`'s sidecar attached from the file its name carries, if there is
+    /// `seg`'s form file attached from the file its name carries, if there is
     /// one that checks out against the segment: installed, counted, and
     /// true. A file that does not check out is counted by kind and left
     /// where it is, for a build to replace, and the segment is marked so
@@ -24700,14 +24700,14 @@ impl Db {
         advise: bool,
         memo: bool,
         prefetch: bool,
-        ev: &zside::ZEvents,
+        ev: &zfile::ZEvents,
     ) -> bool {
         let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) else {
             return false;
         };
-        match zside::ZSide::attach(
-            &dir.join(zside::zpg_name(id, end)),
-            seg.blob.for_sidecar(),
+        match zfile::ZFile::attach(
+            &dir.join(zfile::zpg_name(id, end)),
+            seg.blob.for_zfile(),
             id,
             end,
             advise,
@@ -24717,22 +24717,22 @@ impl Db {
             Ok(side) => {
                 let installed = seg.z.install(side);
                 if installed {
-                    zside::ZEvents::add(&ev.attached, 1);
+                    zfile::ZEvents::add(&ev.attached, 1);
                 }
                 installed
             }
             Err(r) => {
                 ev.rejected(&r);
-                if !matches!(r, zside::Reject::Missing) {
+                if !matches!(r, zfile::Reject::Missing) {
                     seg.z_declined
-                        .store(zside::DECLINED_REFUSED, AtomicOrdering::Relaxed);
+                        .store(zfile::DECLINED_REFUSED, AtomicOrdering::Relaxed);
                 }
                 false
             }
         }
     }
 
-    /// Give `seg` a sidecar: the file already there if it checks out, else
+    /// Give `seg` a form file: the file already there if it checks out, else
     /// one built from the segment's own bytes and attached, which is the
     /// reader's own check of what was built. A partition that cannot have
     /// one -- under the floor, with a record that lies in a block or with
@@ -24753,7 +24753,7 @@ impl Db {
         let advise = Db::z_advise(&self.opts);
         // A file an attach refused was counted when it was, at open or in
         // an earlier call, and is replaced below.
-        let refused = seg.z_declined.load(AtomicOrdering::Relaxed) == zside::DECLINED_REFUSED;
+        let refused = seg.z_declined.load(AtomicOrdering::Relaxed) == zfile::DECLINED_REFUSED;
         if !refused
             && Db::z_attach(
                 &self.dir,
@@ -24766,28 +24766,28 @@ impl Db {
         {
             return;
         }
-        let out = self.dir.join(zside::zpg_name(id, end));
+        let out = self.dir.join(zfile::zpg_name(id, end));
         let made = if self.shared.fail_zbuild.swap(false, AtomicOrdering::AcqRel) {
-            Err(err("the sidecar's build was made to fail"))
+            Err(err("the form file's build was made to fail"))
         } else {
-            zside::build(
+            zfile::build(
                 &self.dir.join(&seg.name),
                 &out,
                 id,
                 end,
-                &zside::BuildPlan::new(self.opts.zpages_min_bytes, self.opts.zpages_drop_behind),
+                &zfile::BuildPlan::new(self.opts.zpages_min_bytes, self.opts.zpages_drop_behind),
             )
         };
         let failed = |why: u8| {
-            zside::ZEvents::add(&ev.build_failed, 1);
+            zfile::ZEvents::add(&ev.build_failed, 1);
             seg.z_declined.store(why, AtomicOrdering::Relaxed);
             seg.z_schedule_retry(self.opts.zpages_retry_ms);
         };
         match made {
-            Ok(zside::Outcome::Built(b)) => {
-                match zside::ZSide::attach(
+            Ok(zfile::Outcome::Built(b)) => {
+                match zfile::ZFile::attach(
                     &out,
-                    seg.blob.for_sidecar(),
+                    seg.blob.for_zfile(),
                     id,
                     end,
                     advise,
@@ -24797,18 +24797,18 @@ impl Db {
                     Ok(side) => {
                         if seg.z.install(side) {
                             ev.built(&b);
-                            zside::ZEvents::add(&ev.attached, 1);
+                            zfile::ZEvents::add(&ev.attached, 1);
                         }
                     }
                     Err(_) => {
                         // A file the builder wrote and the reader's own
                         // attach refuses: the build failed.
                         let _ = std::fs::remove_file(&out);
-                        failed(zside::DECLINED_FAILED);
+                        failed(zfile::DECLINED_FAILED);
                     }
                 }
             }
-            Ok(zside::Outcome::Declined(d)) => {
+            Ok(zfile::Outcome::Declined(d)) => {
                 ev.declined(d);
                 seg.z_declined.store(d.code(), AtomicOrdering::Relaxed);
                 if refused {
@@ -24818,27 +24818,27 @@ impl Db {
                 }
             }
             // An inline build has no cancel flag; counted all the same.
-            Ok(zside::Outcome::Cancelled) => zside::ZEvents::add(&ev.build_cancelled, 1),
+            Ok(zfile::Outcome::Cancelled) => zfile::ZEvents::add(&ev.build_cancelled, 1),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                zside::ZEvents::add(&ev.build_orphaned, 1);
+                zfile::ZEvents::add(&ev.build_orphaned, 1);
                 seg.z_declined
-                    .store(zside::DECLINED_FAILED, AtomicOrdering::Relaxed);
+                    .store(zfile::DECLINED_FAILED, AtomicOrdering::Relaxed);
             }
-            Err(_) => failed(zside::DECLINED_FAILED),
+            Err(_) => failed(zfile::DECLINED_FAILED),
         }
     }
 
-    /// `seg`'s sidecar taken out of its cell and retired through the epoch
+    /// `seg`'s form file taken out of its cell and retired through the epoch
     /// -- a reader pinned before the take may be walking it, and the sweep
     /// frees it past every such pin -- and its file renamed to a dead name,
     /// which the sweep at the end of the settle removes; whether there was
-    /// one. For a sidecar out of service after a page failed a check: what
+    /// one. For a form file out of service after a page failed a check: what
     /// the rebuild replaces.
     fn z_retire(&self, seg: &Seg) -> bool {
         z_retire_cell(&self.shared, &self.dir, seg).is_some()
     }
 
-    /// The sidecar files no live segment claims removed, as `z_sweep`,
+    /// The form files no live segment claims removed, as `z_sweep`,
     /// over the live segments as they stand.
     fn z_sweep_live(&self) -> Result<()> {
         let names: Vec<String> = {
@@ -24846,21 +24846,21 @@ impl Db {
             self.segs().iter().map(|s| s.name.clone()).collect()
         };
         let swept = Db::z_sweep(&self.dir, names.iter().map(String::as_str))?;
-        zside::ZEvents::add(&self.shared.z.swept, swept);
+        zfile::ZEvents::add(&self.shared.z.swept, swept);
         Ok(())
     }
 
-    /// The sidecar files in `dir` that none of the segments named `live`
+    /// The form files in `dir` that none of the segments named `live`
     /// claims, the dead names of retired ones, and the temp names of builds
     /// that did not finish, removed; how many. Called where nothing is
     /// building: at open, and at the end of `zpages_settle`.
     fn z_sweep<'a>(dir: &Path, live: impl Iterator<Item = &'a str>) -> Result<u64> {
         let claimed: std::collections::HashSet<String> =
-            live.filter_map(zside::zpg_name_for).collect();
+            live.filter_map(zfile::zpg_name_for).collect();
         let mut removed = 0;
         for entry in std::fs::read_dir(dir)? {
             let name = entry?.file_name().to_string_lossy().into_owned();
-            if zside::is_zpg_file(&name)
+            if zfile::is_zpg_file(&name)
                 && !claimed.contains(&name)
                 && std::fs::remove_file(dir.join(&name)).is_ok()
             {
@@ -24870,14 +24870,14 @@ impl Db {
         Ok(removed)
     }
 
-    /// Under `ZPages::Always`, every live partition given a sidecar
+    /// Under `ZPages::Always`, every live partition given a form file
     /// (`z_give`), and this returns when they are: the segment work first
     /// waited for, so the partitions are the store's, then each partition
-    /// without a sidecar in turn, on this thread, then the segment work
+    /// without a form file in turn, on this thread, then the segment work
     /// again for a merge that landed meanwhile, whose outputs the next round
-    /// gives theirs. A sidecar built for a partition a merge retired before
+    /// gives theirs. A form file built for a partition a merge retired before
     /// this finished is counted and removed; at the end the directory holds
-    /// the live segments' sidecars and no other, whatever a crash or a
+    /// the live segments' form files and no other, whatever a crash or a
     /// store that ran without the option left. Nothing under `Off`.
     ///
     /// What the suite's `sync` calls after a flush under the arm: without
@@ -24889,7 +24889,7 @@ impl Db {
     }
 
     /// `zpages_settle`, with `between` called on the store at two points of
-    /// every round that has a partition to give a sidecar (`ZRound`): a
+    /// every round that has a partition to give a form file (`ZRound`): a
     /// test's seam for what lands between the steps of a round, which no
     /// schedule of the segment work makes happen on purpose. It is not
     /// called by a round that has nothing to give.
@@ -24900,7 +24900,7 @@ impl Db {
         }
         // Where the segment work has a thread of its own, the builds are
         // its (`Maint::z_step`): this waits for every partition to have
-        // its sidecar or its reason, and the seams below are the inline
+        // its form file or its reason, and the seams below are the inline
         // home's alone.
         if matches!(self.maint, MaintHome::Away(_)) {
             self.settle()?;
@@ -24914,7 +24914,7 @@ impl Db {
             // alive.
             // The partitions to give one: those with none and no reason
             // against it, those whose build failed and whose backoff has
-            // passed, and those whose sidecar a check took out of service.
+            // passed, and those whose form file a check took out of service.
             let todo: Vec<std::sync::Arc<Seg>> = {
                 let _op = self.op();
                 self.segs()
@@ -24930,8 +24930,8 @@ impl Db {
                                 }
                                 None => {
                                     why == 0
-                                        || why == zside::DECLINED_REFUSED
-                                        || (why == zside::DECLINED_FAILED && s.z_retry_due())
+                                        || why == zfile::DECLINED_REFUSED
+                                        || (why == zfile::DECLINED_FAILED && s.z_retry_due())
                                 }
                             }
                     })
@@ -24939,7 +24939,7 @@ impl Db {
                     .collect()
             };
             if todo.is_empty() {
-                // Every partition has its sidecar or its reason, unless a
+                // Every partition has its form file or its reason, unless a
                 // merge the settle's joins started is still to land: its
                 // outputs are partitions nobody has looked at.
                 if self.in_flight().1 {
@@ -24954,14 +24954,14 @@ impl Db {
                     // Retired, and built again up to the bound; past it the
                     // partition is left raw for the segment's life.
                     self.z_retire(seg);
-                    if seg.z_rebuilds.load(AtomicOrdering::Relaxed) < zside::ZREBUILDS {
+                    if seg.z_rebuilds.load(AtomicOrdering::Relaxed) < zfile::ZREBUILDS {
                         seg.z_rebuilds.fetch_add(1, AtomicOrdering::Relaxed);
-                        zside::ZEvents::add(&ev.rebuilds, 1);
+                        zfile::ZEvents::add(&ev.rebuilds, 1);
                         self.z_give(seg);
                     } else {
-                        zside::ZEvents::add(&ev.declined_damage, 1);
+                        zfile::ZEvents::add(&ev.declined_damage, 1);
                         seg.z_declined
-                            .store(zside::DECLINED_DAMAGE, AtomicOrdering::Relaxed);
+                            .store(zfile::DECLINED_DAMAGE, AtomicOrdering::Relaxed);
                     }
                 } else if seg.z.get().is_some() {
                     // Attached and cold to this process: warmed here, as
@@ -24970,13 +24970,13 @@ impl Db {
                     if let (Some(id), Some(end)) =
                         (Db::name_id(&seg.name), Db::name_end_seq(&seg.name))
                     {
-                        let path = self.dir.join(zside::zpg_name(id, end));
-                        if let Ok(w) = zside::warm_file(&path, None) {
+                        let path = self.dir.join(zfile::zpg_name(id, end));
+                        if let Ok(w) = zfile::warm_file(&path, None) {
                             ev.warmed(&w);
                         }
                     }
-                } else if seg.z_declined.load(AtomicOrdering::Relaxed) == zside::DECLINED_FAILED {
-                    zside::ZEvents::add(&ev.build_retries, 1);
+                } else if seg.z_declined.load(AtomicOrdering::Relaxed) == zfile::DECLINED_FAILED {
+                    zfile::ZEvents::add(&ev.build_retries, 1);
                     self.z_give(seg);
                 } else {
                     self.z_give(seg);
@@ -24988,16 +24988,16 @@ impl Db {
                 let _op = self.op();
                 self.segs()
                     .iter()
-                    .filter_map(|s| zside::zpg_name_for(&s.name))
+                    .filter_map(|s| zfile::zpg_name_for(&s.name))
                     .collect()
             };
             for seg in &todo {
-                let Some(name) = zside::zpg_name_for(&seg.name) else {
+                let Some(name) = zfile::zpg_name_for(&seg.name) else {
                     continue;
                 };
                 if seg.z.get().is_some() && !live.contains(&name) {
                     let _ = std::fs::remove_file(self.dir.join(&name));
-                    zside::ZEvents::add(&self.shared.z.build_orphaned, 1);
+                    zfile::ZEvents::add(&self.shared.z.build_orphaned, 1);
                 }
             }
         }
@@ -25007,13 +25007,13 @@ impl Db {
         self.z_sweep_live()
     }
 
-    /// A test's: the next sidecar build fails as a write error would.
+    /// A test's: the next form file build fails as a write error would.
     #[doc(hidden)]
     pub fn fail_next_zpage_build(&self) {
         self.shared.fail_zbuild.store(true, AtomicOrdering::Release);
     }
 
-    /// A test's: while `on`, a sidecar build on the builder's thread waits
+    /// A test's: while `on`, a form file build on the builder's thread waits
     /// before its first write, so a test can land what it likes with a
     /// build in flight; lifted before any settle of the form or the close,
     /// which wait for the build. `hold_zpage_rename` holds a build before
@@ -25047,7 +25047,7 @@ impl Db {
         }
     }
 
-    /// What the last refusal of a sidecar said, kind first, or empty: the
+    /// What the last refusal of a form file said, kind first, or empty: the
     /// counts say a file was refused and a test wants the check that
     /// refused it.
     #[doc(hidden)]
@@ -25060,11 +25060,11 @@ impl Db {
             .unwrap_or_default()
     }
 
-    /// The live partitions that hold a sidecar: the segment's file name,
-    /// the sidecar's attach number, its pages, and whether it is out of
+    /// The live partitions that hold a form file: the segment's file name,
+    /// the form file's attach number, its pages, and whether it is out of
     /// service.
     #[doc(hidden)]
-    pub fn zpage_sidecars(&self) -> Vec<(String, u64, usize, bool)> {
+    pub fn zpage_form_files(&self) -> Vec<(String, u64, usize, bool)> {
         let _op = self.op();
         self.segs()
             .iter()
@@ -26396,7 +26396,7 @@ impl Reader {
             scan_ns: std::cell::Cell::new([0; 6]),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zside::ZMemo::new(),
+            zmemo: zfile::ZMemo::new(),
             slot: None,
             // A slot of its own for the passes, which pin it as the
             // writer's operations pin the writer's.
@@ -28906,8 +28906,8 @@ impl<'s> BuildCtx<'s> {
     }
 }
 
-/// `Reader::scan_merged`'s walk of one partition: through its sidecar
-/// (`zside::ZCursor`) where the cell holds one in service, by the raw
+/// `Reader::scan_merged`'s walk of one partition: through its form file
+/// (`zfile::ZCursor`) where the cell holds one in service, by the raw
 /// form's rank and key otherwise.
 enum PWalk<'a> {
     Raw {
@@ -28915,7 +28915,7 @@ enum PWalk<'a> {
         rank: usize,
         key: Option<&'a [u8]>,
     },
-    Z(zside::ZCursor<'a>),
+    Z(zfile::ZCursor<'a>),
 }
 
 /// Where an unsealed key's emit reads the partition's own values from
@@ -28924,7 +28924,7 @@ enum PWalk<'a> {
 /// whose group the cursor holds already.
 enum PartVals<'a, 'b> {
     Rank(&'a Seg, usize),
-    Cursor(&'a zside::ZCursor<'b>),
+    Cursor(&'a zfile::ZCursor<'b>),
 }
 
 impl PWalk<'_> {
@@ -29006,7 +29006,7 @@ const MERGE_HOLD_LANDING: u8 = 1;
 const MERGE_HOLD_JOINS: u8 = 2;
 const MERGE_HOLD_JOINING: u8 = 4;
 
-/// The bits of `Shared::zbuild_hold`: a test's holds on the sidecar
+/// The bits of `Shared::zbuild_hold`: a test's holds on the form file
 /// builder's thread, before its first write and before its rename, and
 /// beside each the bit the thread sets while it waits at that hold, its
 /// hold bit shifted by `ZHOLD_WAITING`. A test that lands something under
@@ -29109,7 +29109,7 @@ enum MaintAsk {
     /// A settle's: the seal and every merge in flight landed.
     Settle,
     /// A settle of the second form's (`Db::zpages_settle`): every live
-    /// partition given its sidecar or its reason, the landings meanwhile
+    /// partition given its form file or its reason, the landings meanwhile
     /// collected.
     ZSettle,
 }
@@ -29266,7 +29266,7 @@ struct Maint {
     /// The reads over an unshaped store counted when the store was last
     /// shaped (`Options::adaptive_shape`).
     shaped_at: u64,
-    /// The sidecar build in flight, if one is (`Options::zpages`), one at a
+    /// The form file build in flight, if one is (`Options::zpages`), one at a
     /// time, collected by polling and never joined on this thread.
     zbuild: Option<ZBuild>,
     /// Inside a `ZSettle` answer: every kind of build is due, where the
@@ -29387,7 +29387,7 @@ impl Maint {
                 self.join_seal(false)?;
                 self.join_compact()?;
                 self.join_tier()?;
-                // Every partition given its sidecar or its reason, one
+                // Every partition given its form file or its reason, one
                 // build at a time, with whatever lands meanwhile landed:
                 // a merge's outputs are partitions of their own and get
                 // theirs in turn, and a merge's inputs are left to it.
@@ -30483,12 +30483,12 @@ impl Maint {
         if !claimed {
             let _ = std::fs::remove_file(self.dir.join(&ord));
         }
-        // A sidecar is named by the same two fields and claimed by the same
+        // A form file is named by the same two fields and claimed by the same
         // test: a promotion keeps them, so the retired name and the live one
         // address one file. Unlinked here and not swept at the next open
         // because a merge is the steady state, and a store that merges for
         // hours would leave a file per input it retired. A mapping a pinned
-        // reader holds outlives the name, so for a sidecar that is attached
+        // reader holds outlives the name, so for a form file that is attached
         // the unlink removes the name and the blocks go with the last
         // mapping, wherever the segment holding it is dropped; for one
         // nobody maps, left by a store that ran with the form and is not
@@ -30497,7 +30497,7 @@ impl Maint {
         // round trip on this filesystem, so under the forced arm that is a
         // cost of every merge, and it is read in the cells that merge.
         //
-        // One stat first: a store that never made a sidecar -- every store
+        // One stat first: a store that never made a form file -- every store
         // under the default -- pays that and nothing more for a retired
         // segment, where the claim below compares every live segment's
         // name.
@@ -30508,17 +30508,17 @@ impl Maint {
         // manifest's spares are. Inline, on the writer's thread, unlinked
         // now. A dead name no live segment claims, so a crash between the
         // two leaves a file the next open sweeps.
-        if let Some(fields) = zside::zpg_fields(name) {
-            let zpg = self.dir.join(zside::zpg_name(fields.0, fields.1));
+        if let Some(fields) = zfile::zpg_fields(name) {
+            let zpg = self.dir.join(zfile::zpg_name(fields.0, fields.1));
             if zpg.exists()
                 && !self
                     .segs()
                     .iter()
-                    .any(|s| zside::zpg_fields(&s.name) == Some(fields))
+                    .any(|s| zfile::zpg_fields(&s.name) == Some(fields))
             {
                 if self.wake.is_some() {
                     let n = self.shared.next_dead.fetch_add(1, AtomicOrdering::Relaxed);
-                    let dead = self.dir.join(zside::zpg_dead_name(n));
+                    let dead = self.dir.join(zfile::zpg_dead_name(n));
                     if std::fs::rename(&zpg, &dead).is_ok() {
                         self.spares.push(dead);
                     } else {
@@ -30946,11 +30946,11 @@ impl Maint {
 
     /// One turn of the second form's building (`Options::zpages`
     /// `Always`), on this thread's loop: a finished build collected and
-    /// its sidecar installed, then the next build started, one at a time,
+    /// its form file installed, then the next build started, one at a time,
     /// on a thread of its own at idle priority. Inside a settle of the
     /// form (`MaintAsk::ZSettle`) every kind of build is due -- the first
     /// of a partition that has none, the retry of one that failed once
-    /// its backoff has passed, the rebuild of a sidecar a check took out
+    /// its backoff has passed, the rebuild of a form file a check took out
     /// of service; the loop's own turns build only for partitions with
     /// none, and only under `Options::zpages_eager`.
     fn z_step(&mut self) {
@@ -31003,8 +31003,8 @@ impl Maint {
                     ZKind::Warm
                 }
                 Some(_) => continue,
-                None if why == 0 || why == zside::DECLINED_REFUSED => ZKind::Build,
-                None if why == zside::DECLINED_FAILED && self.z_settling && s.z_retry_due() => {
+                None if why == 0 || why == zfile::DECLINED_REFUSED => ZKind::Build,
+                None if why == zfile::DECLINED_FAILED && self.z_settling && s.z_retry_due() => {
                     ZKind::Retry
                 }
                 None => continue,
@@ -31015,8 +31015,8 @@ impl Maint {
     }
 
     /// `seg`'s build started on the builder's thread, or the segment given
-    /// its reason without one: a file already under the sidecar's name that
-    /// checks out is attached and nothing is built; a sidecar out of
+    /// its reason without one: a file already under the form file's name that
+    /// checks out is attached and nothing is built; a form file out of
     /// service is retired first and, past `ZREBUILDS`, the partition is
     /// declined. The segment's file is opened here and handed over, so a
     /// promotion's unlink of its old name between now and the build's open
@@ -31037,20 +31037,20 @@ impl Maint {
                 if let Some(dead) = z_retire_cell(&shared, &self.dir, &seg) {
                     self.spares.push(dead);
                 }
-                if seg.z_rebuilds.load(AtomicOrdering::Relaxed) >= zside::ZREBUILDS {
-                    zside::ZEvents::add(&ev.declined_damage, 1);
+                if seg.z_rebuilds.load(AtomicOrdering::Relaxed) >= zfile::ZREBUILDS {
+                    zfile::ZEvents::add(&ev.declined_damage, 1);
                     seg.z_declined
-                        .store(zside::DECLINED_DAMAGE, AtomicOrdering::Relaxed);
+                        .store(zfile::DECLINED_DAMAGE, AtomicOrdering::Relaxed);
                     return;
                 }
                 seg.z_rebuilds.fetch_add(1, AtomicOrdering::Relaxed);
-                zside::ZEvents::add(&ev.rebuilds, 1);
+                zfile::ZEvents::add(&ev.rebuilds, 1);
             }
-            ZKind::Retry => zside::ZEvents::add(&ev.build_retries, 1),
+            ZKind::Retry => zfile::ZEvents::add(&ev.build_retries, 1),
             ZKind::Build | ZKind::Warm => {}
         }
         let advise = Db::z_advise(&self.opts);
-        let refused = seg.z_declined.load(AtomicOrdering::Relaxed) == zside::DECLINED_REFUSED;
+        let refused = seg.z_declined.load(AtomicOrdering::Relaxed) == zfile::DECLINED_REFUSED;
         if !refused
             && Db::z_attach(
                 &self.dir,
@@ -31064,7 +31064,7 @@ impl Maint {
             return;
         }
         let failed = |why: u8| {
-            zside::ZEvents::add(&ev.build_failed, 1);
+            zfile::ZEvents::add(&ev.build_failed, 1);
             seg.z_declined.store(why, AtomicOrdering::Relaxed);
             seg.z_schedule_retry(retry_ms);
         };
@@ -31072,20 +31072,20 @@ impl Maint {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Retired since it was listed: outrun, not failed.
-                zside::ZEvents::add(&ev.build_orphaned, 1);
+                zfile::ZEvents::add(&ev.build_orphaned, 1);
                 seg.z_declined
-                    .store(zside::DECLINED_FAILED, AtomicOrdering::Relaxed);
+                    .store(zfile::DECLINED_FAILED, AtomicOrdering::Relaxed);
                 return;
             }
             Err(_) => {
-                failed(zside::DECLINED_FAILED);
+                failed(zfile::DECLINED_FAILED);
                 return;
             }
         };
-        let out = self.dir.join(zside::zpg_name(id, end));
+        let out = self.dir.join(zfile::zpg_name(id, end));
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut plan =
-            zside::BuildPlan::new(self.opts.zpages_min_bytes, self.opts.zpages_drop_behind);
+            zfile::BuildPlan::new(self.opts.zpages_min_bytes, self.opts.zpages_drop_behind);
         plan.cancel = Some(cancel.clone());
         plan.hold = Some(shared.zbuild_hold.clone());
         let fail = shared.fail_zbuild.swap(false, AtomicOrdering::AcqRel);
@@ -31095,7 +31095,7 @@ impl Maint {
         // spawn, a wait for every build to be collected returned between
         // the thread's first write and the count, and a test read the
         // temp name as a build nobody had started.
-        zside::ZEvents::add(&ev.build_starts, 1);
+        zfile::ZEvents::add(&ev.build_starts, 1);
         let spawned = std::thread::Builder::new()
             .name("supdb-zbuild".into())
             .spawn(move || {
@@ -31105,9 +31105,9 @@ impl Maint {
                 idle_cpu_priority();
                 zbuild_hold_wait(&hold, ZHOLD_START);
                 let r = if fail {
-                    Err(err("the sidecar's build was made to fail"))
+                    Err(err("the form file's build was made to fail"))
                 } else {
-                    zside::build_file(file, &out, id, end, &plan)
+                    zfile::build_file(file, &out, id, end, &plan)
                 };
                 if let Some(t) = wake {
                     t.unpark();
@@ -31123,13 +31123,13 @@ impl Maint {
                     refused,
                 });
             }
-            Err(_) => failed(zside::DECLINED_FAILED),
+            Err(_) => failed(zfile::DECLINED_FAILED),
         }
     }
 
-    /// A finished build taken in: its sidecar attached to the target as it
+    /// A finished build taken in: its form file attached to the target as it
     /// stands -- the same segment, or a promotion's re-open over the same
-    /// bytes, which keeps the two fields the sidecar is named by -- or,
+    /// bytes, which keeps the two fields the form file is named by -- or,
     /// the target gone with a merge's landing, its file given a dead name
     /// for the idle tick to unlink and counted an orphan.
     fn z_collect(&mut self, b: ZBuild) {
@@ -31151,28 +31151,28 @@ impl Maint {
         };
         let outcome = handle
             .join()
-            .unwrap_or_else(|_| Err(err("the sidecar's build panicked")));
+            .unwrap_or_else(|_| Err(err("the form file's build panicked")));
         let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) else {
             return;
         };
         let retry_ms = self.opts.zpages_retry_ms;
-        let out = self.dir.join(zside::zpg_name(id, end));
+        let out = self.dir.join(zfile::zpg_name(id, end));
         let live: Option<std::sync::Arc<Seg>> = self
             .segs()
             .iter()
-            .find(|s| zside::zpg_fields(&s.name) == Some((id, end)))
+            .find(|s| zfile::zpg_fields(&s.name) == Some((id, end)))
             .cloned();
         let failed = |why: u8| {
-            zside::ZEvents::add(&ev.build_failed, 1);
+            zfile::ZEvents::add(&ev.build_failed, 1);
             seg.z_declined.store(why, AtomicOrdering::Relaxed);
             seg.z_schedule_retry(retry_ms);
         };
         match outcome {
-            Ok(zside::Outcome::Built(built)) => match live {
+            Ok(zfile::Outcome::Built(built)) => match live {
                 Some(target) => {
-                    match zside::ZSide::attach(
+                    match zfile::ZFile::attach(
                         &out,
-                        target.blob.for_sidecar(),
+                        target.blob.for_zfile(),
                         id,
                         end,
                         Db::z_advise(&self.opts),
@@ -31182,14 +31182,14 @@ impl Maint {
                         Ok(side) => {
                             if target.z.install(side) {
                                 ev.built(&built);
-                                zside::ZEvents::add(&ev.attached, 1);
+                                zfile::ZEvents::add(&ev.attached, 1);
                             }
                         }
                         Err(_) => {
                             // The reader's own attach refuses what the
                             // builder wrote: the build failed.
                             let _ = std::fs::remove_file(&out);
-                            failed(zside::DECLINED_FAILED);
+                            failed(zfile::DECLINED_FAILED);
                         }
                     }
                 }
@@ -31197,16 +31197,16 @@ impl Maint {
                     // Finished after the landing that retired its segment:
                     // a dead name, unlinked at the idle tick.
                     let n = shared.next_dead.fetch_add(1, AtomicOrdering::Relaxed);
-                    let dead = self.dir.join(zside::zpg_dead_name(n));
+                    let dead = self.dir.join(zfile::zpg_dead_name(n));
                     if std::fs::rename(&out, &dead).is_ok() {
                         self.spares.push(dead);
                     } else {
                         let _ = std::fs::remove_file(&out);
                     }
-                    zside::ZEvents::add(&ev.build_orphaned, 1);
+                    zfile::ZEvents::add(&ev.build_orphaned, 1);
                 }
             },
-            Ok(zside::Outcome::Declined(d)) => {
+            Ok(zfile::Outcome::Declined(d)) => {
                 ev.declined(d);
                 seg.z_declined.store(d.code(), AtomicOrdering::Relaxed);
                 if refused {
@@ -31215,24 +31215,24 @@ impl Maint {
                     let _ = std::fs::remove_file(&out);
                 }
             }
-            Ok(zside::Outcome::Cancelled) => zside::ZEvents::add(&ev.build_cancelled, 1),
+            Ok(zfile::Outcome::Cancelled) => zfile::ZEvents::add(&ev.build_cancelled, 1),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                zside::ZEvents::add(&ev.build_orphaned, 1);
+                zfile::ZEvents::add(&ev.build_orphaned, 1);
                 seg.z_declined
-                    .store(zside::DECLINED_FAILED, AtomicOrdering::Relaxed);
+                    .store(zfile::DECLINED_FAILED, AtomicOrdering::Relaxed);
             }
-            Err(_) => failed(zside::DECLINED_FAILED),
+            Err(_) => failed(zfile::DECLINED_FAILED),
         }
     }
 
-    /// `seg`'s sidecar file read into the page cache on a thread of its
-    /// own at idle priority (`Options::zpages_warm`, `zside::warm_file`),
+    /// `seg`'s form file read into the page cache on a thread of its
+    /// own at idle priority (`Options::zpages_warm`, `zfile::warm_file`),
     /// once per process: the segment is marked before the thread starts,
     /// so the next turn does not pick it again, and a merge that retires
     /// the partition cancels the job as it cancels a build.
     fn z_warm(&mut self, seg: std::sync::Arc<Seg>, id: u64, end: u64) {
         seg.z_warmed.store(true, AtomicOrdering::Relaxed);
-        let path = self.dir.join(zside::zpg_name(id, end));
+        let path = self.dir.join(zfile::zpg_name(id, end));
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = cancel.clone();
         let wake = self.wake.clone();
@@ -31241,7 +31241,7 @@ impl Maint {
             .spawn(move || {
                 idle_io_priority();
                 idle_cpu_priority();
-                let r = zside::warm_file(&path, Some(&flag));
+                let r = zfile::warm_file(&path, Some(&flag));
                 if let Some(t) = wake {
                     t.unpark();
                 }
@@ -31862,10 +31862,10 @@ mod threading {
         // is asked here for itself.
         shared::<super::Snapshot>();
         shared::<super::FrozenSnaps>();
-        // The sidecar hangs on a segment in an atomic pointer, which would
+        // The form file hangs on a segment in an atomic pointer, which would
         // let a type that is not `Sync` in unasked.
-        shared::<super::zside::ZSide>();
-        shared::<super::zside::ZCell>();
+        shared::<super::zfile::ZFile>();
+        shared::<super::zfile::ZCell>();
         sent::<super::Reader>();
     }
 

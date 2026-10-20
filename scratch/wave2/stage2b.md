@@ -2,7 +2,7 @@
 
 The design is `scratch/design/zpages.md`, sections 5 (lifecycle), 2.5 and
 2.7 (binding and integrity), 6.2 (arms) and 6.3 (tests); stage 2a is what
-`src/db/zside.rs` and `Db::zpages_settle` hold today. This file is the
+`src/db/zfile.rs` and `Db::zpages_settle` hold today. This file is the
 cut of 2b into pieces, each a commit with its test, in the order they are
 built, and what each leaves for the next. Nothing here is timed: the one
 pairing 2b adds is the warm arm's, written here and run when the machine
@@ -12,23 +12,23 @@ is free.
 
 | design | 2a | 2b |
 |---|---|---|
-| sidecar named `(id, end_seq)`, claimed by the same test as the ordered index (5.5, 5.6) | yes | -- |
+| form file named `(id, end_seq)`, claimed by the same test as the ordered index (5.5, 5.6) | yes | -- |
 | attach at open under `Always`, dormant under `Off` | yes; `Off` keeps a live segment's file (the reopen test holds it: a store that ran without the option may run with it again), where 5.5 says `Off` removes. Kept as 2a has it: removal is the reversal of `Auto` (4.8), stage 4's | -- |
 | sweep at open of every `zpg-` file no live segment claims, temp names included (5.5, 5.7) | yes | dead names join the sweep |
 | the build on the writer's thread inside `zpages_settle` | yes | a thread of its own (piece 4) |
-| retire on merge (5.6) | the sidecar is unlinked inline in `retire_seg`, a freed inode on the landing's path | renamed to a dead name, unlinked at the idle tick (piece 2) |
-| a page that fails its first decode (2.7) | fallback counted, the page marked, the sidecar out of service for the segment's life | retired through the epoch, renamed dead, rebuilt at most three times a segment (pieces 1, 3) |
+| retire on merge (5.6) | the form file is unlinked inline in `retire_seg`, a freed inode on the landing's path | renamed to a dead name, unlinked at the idle tick (piece 2) |
+| a page that fails its first decode (2.7) | fallback counted, the page marked, the form file out of service for the segment's life | retired through the epoch, renamed dead, rebuilt at most three times a segment (pieces 1, 3) |
 | a failed build (5.7) | counted, the segment declined for its life | retried after a backoff of 60 s doubling to an hour (piece 3) |
 | the cell (4.8) | set once, freed with the segment | clearable: swapped to null and pushed on a retire list swept past every pinned reader (piece 1) |
 | `ZNOPAGE` entries (2.1, 2.7) | the layout has them and the reader reads them raw; the builder declines the partition instead | the builder writes them (piece 6) |
 | the Bloom filter and `bloom_sig` (2.5) | the trailer has the fields; none is built or read | built, checked at attach, read for absent keys (piece 7) |
 | warm (5.4) | none | a job after the build, `Options::zpages_warm`, the arm `supdb-nocachezpagesnowarm` (piece 8) |
-| the crash windows (5.7) | the sweep covers the temp name, the unnamed segment's sidecar and the orphan; the attach refuses a torn file | every row of the table built on disk and opened (piece 5) |
+| the crash windows (5.7) | the sweep covers the temp name, the unnamed segment's form file and the orphan; the attach refuses a torn file | every row of the table built on disk and opened (piece 5) |
 | `a_zpages_life` in `tests/leak.rs` | none | piece 9 |
 
 ## Where it stands
 
-Pieces 1 to 5 are in (`tests/zpages.rs`: the damaged sidecar retired
+Pieces 1 to 5 are in (`tests/zpages.rs`: the damaged form file retired
 and rebuilt three times then declined, the retired mapping kept by a
 pinned handle and freed at its release, the failed build retried after
 its backoff, the crash windows of 5.7 built on disk and opened, a build
@@ -55,7 +55,7 @@ before the fence. The words have one encoding (`BlockedBloom::words`,
 test fails the attach on a fence key; the absent-key decode counts fall
 to the filter's false positives. Piece 8 is in: a warm is a job of the
 builder's thread (`ZJob::Warm` beside `ZJob::Build`, one at a time),
-scheduled by `z_next` for an attached, undamaged sidecar the process has
+scheduled by `z_next` for an attached, undamaged form file the process has
 not warmed, marked before the thread starts; inline, the settle warms on
 its own thread. `warm_file` reads the file in 8 MiB chunks, skipping a
 chunk `mincore` reports wholly resident, `MADV_WILLNEED` then a touch of
@@ -65,12 +65,12 @@ file is read whole. The test holds the exact identity the mechanism
 gives: the warm reads every page the attach's own reads left cold and
 no other, on a partition large enough that the attach's sampled pages,
 read before the mapping is advised random, do not pull the whole file
-in by readahead (a 280 KB sidecar came in 67 pages of 69 that way). The
+in by readahead (a 280 KB form file came in 67 pages of 69 that way). The
 arms `supdb-nocachezpagesnowarm` and `supdb-nocachezpageseager` are in
 the suite, unpriced; the pairing for a free machine is the one written
 above. Piece 9 is in: `a_zpages_life` pins a handle at a snapshot across
-two retirements -- a round whose merges retire the sidecars with their
-segments, and a sidecar taken out of a live segment's cell after a page
+two retirements -- a round whose merges retire the form files with their
+segments, and a form file taken out of a live segment's cell after a page
 flipped in place under the mapping failed its check, which waits in the
 retire list for the pin -- closes the store with the pin held, drops the
 handle without a release, and reads the process's mappings from the
@@ -78,8 +78,8 @@ kernel after each step (`zpg_mappings` in `tests/common`, one definition
 for both files). The first version retired only with the merges, which
 go through the segment's own drop and never through `RetiredZ`, and a
 `RetiredZ` whose drop freed nothing passed it; the second fails at the
-handle's drop with the retired sidecar's dead name still mapped. The
-test's values are random bytes now, so a sidecar has more pages than
+handle's drop with the retired form file's dead name still mapped. The
+test's values are random bytes now, so a form file has more pages than
 the attach samples and a page can be flipped unsampled. All nine
 pieces are in. The stage's full gate (`sh scripts/check.sh`, every
 group) is green at `200439b`, and the stop rule's run -- the zpages and
@@ -92,7 +92,7 @@ orphan test read a cancel. The builder's thread marks the hold it waits
 at now and the fixture waits for the build to be there (`62d5787`);
 twenty runs of twenty beside two clippy compiles after it. Beside that
 the warm's test had found the attach reading half of a four-megabyte
-sidecar through readahead, its own reads made under the default advice:
+form file through readahead, its own reads made under the default advice:
 the mapping is advised random as it opens now (`e7d9698`, 522 pages of
 1,004 at the attach to 42). Stage 3 is next.
 
@@ -101,23 +101,23 @@ the mapping is advised random as it opens now (`e7d9698`, 522 pages of
 1. **The cell retires through the epoch.** `ZCell::take` swaps the
    pointer to null and the caller pushes it on `Shared::retired_z`, a
    `RetireList<RetiredZ>` under a fresh epoch; `RetiredZ`'s `Drop` frees
-   the sidecar (the mapping with it). Swept where the forms and the
+   the form file (the mapping with it). Swept where the forms and the
    snapshots are (`sweep_retired_forms`, the writer's `leave`, the
    segment work's tick), and counted in `sweep_at_leave`'s number
    waiting. `ZCell::get` is then valid for the operation that read it,
    which pins; `Seg::z` keeps its acquire load. Test: a `Snapshot` handle
-   pinned before a retirement keeps reading the old sidecar's values and
+   pinned before a retirement keeps reading the old form file's values and
    the mapping stays in `/proc/self/maps` until the handle releases, and
    goes then and not at the next retirement.
-2. **Dead names.** `retire_seg` renames an unclaimed sidecar to
+2. **Dead names.** `retire_seg` renames an unclaimed form file to
    `zpg-dead-<N>.zpg` and queues it on `Maint::spares`, unlinked at the
    idle tick as the manifest spares are; inline (no thread) it unlinks
    as before. `is_zpg_file` covers the dead names, so the sweep at open
    and at the end of a settle removes what a crash left. The merge test
    asserts, after the merges land and before any settle: no live-named
-   sidecar of a retired segment, dead names at most, and none after the
+   form file of a retired segment, dead names at most, and none after the
    idle tick.
-3. **Damage and failure are bounded, not final.** A sidecar out of
+3. **Damage and failure are bounded, not final.** A form file out of
    service is retired by the next settle round (piece 1), its file
    renamed dead, and the partition rebuilt: at most three times a
    segment (`Seg::z_rebuilds`), after which `declined_damage` and the
@@ -140,9 +140,9 @@ the mapping is advised random as it opens now (`e7d9698`, 522 pages of
    builds as 2a did. `hold_zpage_build` holds the thread before its
    first write, for the tests that need a build in flight.
 5. **The crash windows of 5.7**, each built on disk from a store that
-   has a sidecar, then opened: a `.tmp`, a complete unattached file, a
+   has a form file, then opened: a `.tmp`, a complete unattached file, a
    short file, a zero trailer, zero pages, a torn page in the middle, a
-   finished orphan under a dead name, an unnamed `.sup` with its sidecar,
+   finished orphan under a dead name, an unnamed `.sup` with its form file,
    a promotion's two names, a re-handed id. Each asserts what the open
    leaves and what the reads answer, and that the counters name it.
 6. **`ZNOPAGE`.** The builder writes a fence entry with no page for a
@@ -167,7 +167,7 @@ the mapping is advised random as it opens now (`e7d9698`, 522 pages of
    --arms supdb-nocachezpages,supdb-nocachezpagesnowarm --size 10000000
    --bound 1073741824 --ops-div 10 --reps 6 --passes load,read`.
 9. **`a_zpages_life`** in `tests/leak.rs`: a store with the form, a
-   merge replacing a sidecar, a handle holding a retired one, closed with
+   merge replacing a form file, a handle holding a retired one, closed with
    one unswept; nothing allocated outlives the drop and no mapping of
    the directory survives it.
 

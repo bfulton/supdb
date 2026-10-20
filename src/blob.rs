@@ -668,9 +668,9 @@ thread_local! {
 /// Reader ids, one per open.
 static NEXT_BLOB_ID: AtomicU64 = AtomicU64::new(1);
 
-/// What a derived file that copies a segment's records (a sidecar of the z
+/// What a derived file that copies a segment's records (a form file of the z
 /// form, `db::zpages`) binds itself to, as the segment says it of itself:
-/// every quantity a writer fixes once and nothing changes after. The sidecar
+/// every quantity a writer fixes once and nothing changes after. The form file
 /// holds values, so it is bound to the segment's content and not to a name --
 /// the engine hands segment ids out again after a crash -- and the strong
 /// part is `row_crc`, the CRC-32C of the key section's checksum row: four
@@ -678,7 +678,7 @@ static NEXT_BLOB_ID: AtomicU64 = AtomicU64::new(1);
 /// reading it costs a few hundred kilobytes per gigabyte, not a pass over
 /// the file.
 ///
-/// Native only: there is no sidecar in a browser, and nothing that reaches
+/// Native only: there is no form file in a browser, and nothing that reaches
 /// the wasm module changes with it.
 #[cfg(not(target_family = "wasm"))]
 #[doc(hidden)]
@@ -703,7 +703,7 @@ pub struct ZSource {
     /// CRC-32C of the checksum row.
     pub row_crc: u32,
     /// The record format's version and the file format's magic as this
-    /// engine reads them: a sidecar copied records laid out by these, and an
+    /// engine reads them: a form file copied records laid out by these, and an
     /// engine that lays them out otherwise must not attach it.
     pub rec_version: u32,
     pub rec_magic: u64,
@@ -1005,10 +1005,10 @@ impl<B: Bytes> Blob<B> {
         idx.regions(sec)
     }
 
-    /// What a sidecar binds itself to (`ZSource`), or `None` where there is
+    /// What a form file binds itself to (`ZSource`), or `None` where there is
     /// nothing to bind to: a reader that does not hold the section whole,
     /// or a section with no checksum row (a store's in-place-editable
-    /// index, which no sidecar is built for).
+    /// index, which no form file is built for).
     #[cfg(not(target_family = "wasm"))]
     #[doc(hidden)]
     pub fn z_source_facts(&self) -> Option<ZSource> {

@@ -1,4 +1,4 @@
-//! The z form's engine side: the sidecar mapped and checked (`ZSide`), the
+//! The z form's engine side: the form file mapped and checked (`ZFile`), the
 //! cell a partition holds it in (`ZCell`), the read of a key through it, and
 //! the builder that writes one from a partition's own bytes (`build`).
 //!
@@ -10,7 +10,7 @@
 //! # What a read promises
 //!
 //! A partition's point read or count, answered here, is the raw form's
-//! answer or no answer: a read the sidecar cannot serve says so
+//! answer or no answer: a read the form file cannot serve says so
 //! ([`ZRead::Fallback`], [`ZRead::Out`]) and the caller reads the raw form
 //! and counts it. Nothing that fails a check is ever answered as an absent
 //! key, because a group that cannot be read is damage and an absent key is a
@@ -22,7 +22,7 @@
 //!
 //! # What the cell promises
 //!
-//! A sidecar is installed into an empty cell and taken out of it only by
+//! A form file is installed into an empty cell and taken out of it only by
 //! the writer's settle, when a page of it has failed a check and the
 //! partition's is to be built again: what `take` removes is retired under
 //! a fresh epoch and freed past every reader pinned at or before it, as a
@@ -58,15 +58,15 @@ use std::sync::Arc;
 /// store it left out.
 pub(super) const ZMIN_RECS: usize = 2 << 20;
 
-/// A warm reads a sidecar's file into the page cache in chunks of this many
+/// A warm reads a form file into the page cache in chunks of this many
 /// bytes, each asked for with `MADV_WILLNEED` and then touched a page at a
 /// time, with a look at the cancel flag between chunks.
 pub(super) const ZWARM_CHUNK: usize = 8 << 20;
 
-/// The sidecar is written in pieces of this many bytes at their own
+/// The form file is written in pieces of this many bytes at their own
 /// alignment, as a segment is (`SegmentOptions::write_piece`): the page
 /// cache sizes a folio by the write that makes it. What the folios of a
-/// built sidecar compose to is read from `/proc/self/pagemap` and
+/// built form file compose to is read from `/proc/self/pagemap` and
 /// `/proc/kpageflags` over a mapping of the file; whether a smaller piece
 /// would read better is for a pairing to say, and a plan's `piece` is where
 /// it is changed.
@@ -79,29 +79,29 @@ const ZDROP_WINDOW: usize = 8 << 20;
 /// evenly spaced between, sixteen faults a file, once.
 const ZSAMPLE_PAGES: usize = 16;
 
-/// The sidecar's name: the two fields of the segment's name that a
+/// The form file's name: the two fields of the segment's name that a
 /// promotion keeps, as the ordered index's (`Db::ord_name`), so a
 /// promotion's link names no new file.
 pub(super) fn zpg_name(id: u64, end_seq: u64) -> String {
     format!("zpg-{id:08}-{end_seq:016}.zpg")
 }
 
-/// The two fields of the segment named `seg` that its sidecar's name is
+/// The two fields of the segment named `seg` that its form file's name is
 /// made of, or `None` for a name that is not a segment's. Two segments with
-/// the same fields address one sidecar -- a promotion keeps them -- and
+/// the same fields address one form file -- a promotion keeps them -- and
 /// comparing the fields is the claim test, with no name made to compare.
 pub(super) fn zpg_fields(seg: &str) -> Option<(u64, u64)> {
     Some((super::Db::name_id(seg)?, super::Db::name_end_seq(seg)?))
 }
 
-/// The sidecar a segment named `seg` would have, or `None` for a name that
+/// The form file a segment named `seg` would have, or `None` for a name that
 /// is not a segment's.
 pub(super) fn zpg_name_for(seg: &str) -> Option<String> {
     let (id, end_seq) = zpg_fields(seg)?;
     Some(zpg_name(id, end_seq))
 }
 
-/// Whether `name` is one of the sidecar's files or a build's temp name:
+/// Whether `name` is one of the form files or a build's temp name:
 /// what a sweep of a store's directory takes for the form's.
 pub(super) fn is_zpg_file(name: &str) -> bool {
     name.starts_with("zpg-")
@@ -112,10 +112,10 @@ pub(super) fn is_zpg_file(name: &str) -> bool {
 pub(super) enum Reject {
     /// There is no file. Not a rejection: nothing was there to refuse.
     Missing,
-    /// A file that is not a sidecar anyone can use: short, torn, a trailer
+    /// A file that is not a form file anyone can use: short, torn, a trailer
     /// or a resident part or a sampled page that does not check.
     Damage(String),
-    /// A sidecar, whole, of something else: another segment, a record
+    /// A form file, whole, of something else: another segment, a record
     /// format this engine does not lay out, an engine whose layout differs.
     Identity(String),
 }
@@ -156,7 +156,7 @@ fn engine_filter(
 /// What a read of a covered partition answered.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ZRead {
-    /// The sidecar answered: `n` values (or the count), and whether a page
+    /// The form file answered: `n` values (or the count), and whether a page
     /// was decoded to get there. A page is decoded for every key that falls
     /// in its range, the key it holds and the key it does not alike, unless
     /// the thread's memo holds its group from a decode before (`Memo`); a
@@ -167,7 +167,7 @@ pub(super) enum ZRead {
     /// A check failed on this read: the caller reads the raw form and
     /// counts a fallback.
     Fallback,
-    /// The sidecar is out of service: the caller reads the raw form and
+    /// The form file is out of service: the caller reads the raw form and
     /// counts it as served raw.
     Out,
     /// The key is a record the fence names no page for: one no page holds
@@ -179,11 +179,11 @@ pub(super) enum ZRead {
     NoPage,
 }
 
-/// What a scan of a covered partition did (`ZSide::scan_at`): the keys
+/// What a scan of a covered partition did (`ZFile::scan_at`): the keys
 /// visited, as `Blob::scan_at` counts them; the groups decoded for them;
 /// the runs of records no page holds that the raw form walked; and how it
 /// ended -- served whole, or stopped at a record boundary by a check that
-/// failed or a sidecar out of service, in which case the caller walks the
+/// failed or a form file out of service, in which case the caller walks the
 /// rest from `seen` on through the raw form, since a walk that stops
 /// between two records has emitted every value of the ones before.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -197,20 +197,20 @@ pub(super) struct ZScan {
     pub end: ScanEnd,
 }
 
-/// How a scan through the sidecar ended.
+/// How a scan through the form file ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ScanEnd {
     /// Every key asked for, or every key the partition has from the rank.
     Served,
-    /// A check failed: the sidecar leaves service, and the rest is the raw
+    /// A check failed: the form file leaves service, and the rest is the raw
     /// form's.
     Fallback,
-    /// The sidecar was out of service before the first record.
+    /// The form file was out of service before the first record.
     Out,
 }
 
-/// What a seek or a cut through a sidecar answered (`ZSide::seek`,
-/// `ZSide::cut_in`, `ZCursor::seek`).
+/// What a seek or a cut through a form file answered (`ZFile::seek`,
+/// `ZFile::cut_in`, `ZCursor::seek`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ZSeek {
     /// The rank; how the key there compares with the key sought, `Equal`
@@ -221,10 +221,10 @@ pub(super) enum ZSeek {
         at: KeyOrder,
         decoded: bool,
     },
-    /// A check failed: the sidecar leaves service, and the caller asks the
+    /// A check failed: the form file leaves service, and the caller asks the
     /// raw form and counts a fallback.
     Fallback,
-    /// The sidecar is out of service: the raw form's.
+    /// The form file is out of service: the raw form's.
     Out,
     /// The key falls in an entry no page holds that covers more than one
     /// record, which this builder does not write: the raw form's to say,
@@ -234,7 +234,7 @@ pub(super) enum ZSeek {
 
 /// Where a cursor's group is: parsed in place in a stored page of the
 /// mapping, decoded in the cursor's own buffer, or nowhere -- a run of
-/// records no page holds, or a sidecar that failed a check under the
+/// records no page holds, or a form file that failed a check under the
 /// cursor, both read through the raw form -- or past the end.
 enum Group<'a> {
     None,
@@ -255,14 +255,14 @@ enum Group<'a> {
 /// group or opens the next entry's. A run of records no page holds is
 /// walked through the raw form for exactly those ranks, and a check that
 /// fails under the cursor makes the rest of its walk the raw form's, with
-/// the sidecar out of service, so that every key is still answered.
+/// the form file out of service, so that every key is still answered.
 ///
 /// The cursor holds the thread's group buffer for its life; a read of a
 /// covered partition made inside the walk makes a buffer of its own, as a
 /// callback's nested read does.
 pub(super) struct ZCursor<'a> {
     memo: &'a ZMemo,
-    side: &'a ZSide,
+    zfile: &'a ZFile,
     raw: &'a Blob<MmapBytes>,
     rank: usize,
     /// The rank the current entry's records end at; the key count past the
@@ -288,10 +288,10 @@ pub(super) struct ZCursor<'a> {
 }
 
 impl<'a> ZCursor<'a> {
-    fn new(memo: &'a ZMemo, side: &'a ZSide, raw: &'a Blob<MmapBytes>) -> ZCursor<'a> {
+    fn new(memo: &'a ZMemo, zfile: &'a ZFile, raw: &'a Blob<MmapBytes>) -> ZCursor<'a> {
         ZCursor {
             memo,
-            side,
+            zfile,
             raw,
             rank: 0,
             end: 0,
@@ -312,35 +312,35 @@ impl<'a> ZCursor<'a> {
     /// A cursor at `rank`, the key count or past it for the end.
     pub(super) fn at(
         memo: &'a ZMemo,
-        side: &'a ZSide,
+        zfile: &'a ZFile,
         raw: &'a Blob<MmapBytes>,
         rank: usize,
     ) -> ZCursor<'a> {
-        let mut c = ZCursor::new(memo, side, raw);
+        let mut c = ZCursor::new(memo, zfile, raw);
         c.rank = rank;
         c.load();
         c
     }
 
     /// A cursor at the first key at or after `key`, by the fence and the one
-    /// group it falls in (`ZSide::seek`), opened once for the seek and the
-    /// walk after it; or why the sidecar cannot say, which is never
+    /// group it falls in (`ZFile::seek`), opened once for the seek and the
+    /// walk after it; or why the form file cannot say, which is never
     /// `Served`, and the caller seeks the raw form.
     pub(super) fn seek(
         memo: &'a ZMemo,
-        side: &'a ZSide,
+        zfile: &'a ZFile,
         raw: &'a Blob<MmapBytes>,
         key: &[u8],
     ) -> std::result::Result<ZCursor<'a>, ZSeek> {
-        if side.damaged.load(Ordering::Relaxed) {
+        if zfile.damaged.load(Ordering::Relaxed) {
             return Err(ZSeek::Out);
         }
-        let mut c = ZCursor::new(memo, side, raw);
-        let Some(e) = side.fence.entry_of(key) else {
+        let mut c = ZCursor::new(memo, zfile, raw);
+        let Some(e) = zfile.fence.entry_of(key) else {
             c.load();
             return Ok(c);
         };
-        let Some(entry) = side.fence.entry(e, side.nkeys as u32) else {
+        let Some(entry) = zfile.fence.entry(e, zfile.nkeys as u32) else {
             return Err(ZSeek::Fallback);
         };
         let first = entry.first_rank as usize;
@@ -358,7 +358,7 @@ impl<'a> ZCursor<'a> {
         let pos = match group_seek(c.group(), entry.count as usize, key) {
             Ok(pos) => pos,
             Err(_) => {
-                side.fail(entry.page as usize);
+                zfile.fail(entry.page as usize);
                 return Err(ZSeek::Fallback);
             }
         };
@@ -397,7 +397,7 @@ impl<'a> ZCursor<'a> {
     fn fall(&mut self) {
         self.fell = true;
         self.group = Group::Raw;
-        self.end = self.side.nkeys;
+        self.end = self.zfile.nkeys;
         self.off = 0;
     }
 
@@ -407,7 +407,7 @@ impl<'a> ZCursor<'a> {
         let first = entry.first_rank as usize;
         self.end = first
             .saturating_add(entry.count as usize)
-            .min(self.side.nkeys);
+            .min(self.zfile.nkeys);
         self.off = 0;
         if entry.page == ZNOPAGE {
             self.nopage += 1;
@@ -419,10 +419,10 @@ impl<'a> ZCursor<'a> {
         // is parsed where it lies in the mapping, anything else is decoded
         // into the buffer, whose borrow by the open ends with the open.
         let view = self
-            .side
+            .zfile
             .page_bytes(self.page)
             .and_then(|page| page_view(page).ok());
-        let Some((opened, _, decoded)) = self.side.open_group(self.memo, entry, &mut self.buf)
+        let Some((opened, _, decoded)) = self.zfile.open_group(self.memo, entry, &mut self.buf)
         else {
             self.fall();
             return false;
@@ -441,7 +441,7 @@ impl<'a> ZCursor<'a> {
             (None, Some((h, payload))) if h.stored => Group::Page(payload),
             (None, Some((h, _))) => Group::Buf(h.ulen as usize),
             (None, None) => {
-                self.side.fail(self.page);
+                self.zfile.fail(self.page);
                 self.fall();
                 return false;
             }
@@ -454,7 +454,7 @@ impl<'a> ZCursor<'a> {
     /// damage, and the walk falls.
     fn place(&mut self) {
         let Some((k, next)) = record_key_next(self.group(), self.off) else {
-            self.side.fail(self.page);
+            self.zfile.fail(self.page);
             self.fall();
             return;
         };
@@ -467,16 +467,16 @@ impl<'a> ZCursor<'a> {
     /// and the walk to its record.
     fn load(&mut self) {
         self.off = 0;
-        if self.rank >= self.side.nkeys {
+        if self.rank >= self.zfile.nkeys {
             self.group = Group::None;
-            self.end = self.side.nkeys;
+            self.end = self.zfile.nkeys;
             return;
         }
-        if self.fell || self.side.damaged.load(Ordering::Relaxed) {
+        if self.fell || self.zfile.damaged.load(Ordering::Relaxed) {
             self.fall();
             return;
         }
-        let Some(entry) = self.side.entry_at_rank(self.rank) else {
+        let Some(entry) = self.zfile.entry_at_rank(self.rank) else {
             self.fall();
             return;
         };
@@ -485,7 +485,7 @@ impl<'a> ZCursor<'a> {
         }
         for _ in entry.first_rank as usize..self.rank {
             let Some((_, next)) = record_key_next(self.group(), self.off) else {
-                self.side.fail(self.page);
+                self.zfile.fail(self.page);
                 self.fall();
                 return;
             };
@@ -518,7 +518,7 @@ impl<'a> ZCursor<'a> {
                         // The first decode walked every record of the group
                         // whole, so this is a group changed under the mapping:
                         // the page out of service and the raw form's values.
-                        self.side.fail(self.page);
+                        self.zfile.fail(self.page);
                         self.raw.values_at(self.rank, &mut *f)
                     }
                 }
@@ -542,7 +542,7 @@ impl<'a> ZCursor<'a> {
 
     /// The bulk walk from the position, for the overlay walk
     /// (`Reader::scan_partitions` under `Options::zpages_walk_cursor`):
-    /// every record from here handed to `f` as `ZSide::scan_at` hands
+    /// every record from here handed to `f` as `ZFile::scan_at` hands
     /// them, until `limit` records have been, or the key under the cursor
     /// is not below `until`, or the partition ends; the cursor stands at
     /// the record it stopped at. Answers how many it handed over and how
@@ -584,7 +584,7 @@ impl<'a> ZCursor<'a> {
             if !self.asked {
                 self.asked = true;
                 let past = (limit - n).saturating_sub(self.end - self.rank);
-                if self.side.ask_ahead(self.page, past) {
+                if self.zfile.ask_ahead(self.page, past) {
                     self.prefetches += 1;
                 }
             }
@@ -620,7 +620,7 @@ impl<'a> ZCursor<'a> {
                 // A record that does not parse in a group the checks let
                 // through is damage: the page out of service, and the rest
                 // of the walk the raw form's, every key still answered.
-                self.side.fail(self.page);
+                self.zfile.fail(self.page);
                 self.fall();
                 continue;
             }
@@ -644,7 +644,7 @@ impl Drop for ZCursor<'_> {
     }
 }
 
-/// A group opened (`ZSide::open_group`): where its bytes are.
+/// A group opened (`ZFile::open_group`): where its bytes are.
 enum Opened<'a> {
     /// A stored page parsed where it lies in the mapping, or a group
     /// decoded into the thread's buffer with the memo off.
@@ -663,7 +663,7 @@ impl Opened<'_> {
     }
 }
 
-/// Where a key lies in a sidecar, found or not, with the bytes it lies in.
+/// Where a key lies in a form file, found or not, with the bytes it lies in.
 enum Locate<'a> {
     /// The key is not in this partition: sorts below its first key, or
     /// among the records of the page it would be in, which was decoded to
@@ -789,14 +789,14 @@ const ZMEMO_FREE: usize = 4;
 
 /// The memo of decoded groups (3.7): a reader handle's, direct-mapped over
 /// its slots and capped at `cap` bytes of the groups it holds, keyed by the
-/// sidecar's attach identity and the page. A hit hands back the group as
+/// form file's attach identity and the page. A hit hands back the group as
 /// it was decoded and pays the in-group walk alone; an entry is an `Arc`
 /// to its buffer, so a read holds its group across a callback's nested
 /// read, which may displace the entry from the memo without taking the
-/// group away. A sidecar retired takes a new identity at its next attach,
+/// group away. A form file retired takes a new identity at its next attach,
 /// so its entries never hit again and are displaced as the slots turn
 /// over. The slot is the page plus a multiple of the identity, so one
-/// sidecar's pages collide only past the slot count and two sidecars'
+/// form file's pages collide only past the slot count and two form files'
 /// are offset from each other. The slots are made at the first put, so a
 /// handle that reads no covered partition pays nothing for them.
 ///
@@ -822,7 +822,7 @@ struct Memo {
 }
 
 struct MemoEntry {
-    side: u64,
+    zfile: u64,
     page: u32,
     group: Arc<GroupBuf>,
     len: usize,
@@ -858,18 +858,18 @@ impl Memo {
         self.free.pop().unwrap_or_default()
     }
 
-    fn slot(&self, side: u64, page: u32) -> usize {
-        (page as usize).wrapping_add((side as usize).wrapping_mul(0x9E37_79B9)) % self.n
+    fn slot(&self, zfile: u64, page: u32) -> usize {
+        (page as usize).wrapping_add((zfile as usize).wrapping_mul(0x9E37_79B9)) % self.n
     }
 
     /// The group memoised for `(side, page)`, counted a hit.
-    fn get(&mut self, side: u64, page: u32) -> Option<(Arc<GroupBuf>, usize)> {
+    fn get(&mut self, zfile: u64, page: u32) -> Option<(Arc<GroupBuf>, usize)> {
         if self.slots.is_empty() {
             return None;
         }
-        let i = self.slot(side, page);
+        let i = self.slot(zfile, page);
         match &self.slots[i] {
-            Some(e) if e.side == side && e.page == page => {
+            Some(e) if e.zfile == zfile && e.page == page => {
                 self.hits += 1;
                 Some((Arc::clone(&e.group), e.len))
             }
@@ -883,17 +883,17 @@ impl Memo {
     /// entries from a rotating sweep until the bytes held fit, the entry
     /// just put kept, so the bytes never exceed the cap unless this one
     /// group does.
-    fn put(&mut self, side: u64, page: u32, group: Arc<GroupBuf>, len: usize) {
+    fn put(&mut self, zfile: u64, page: u32, group: Arc<GroupBuf>, len: usize) {
         self.misses += 1;
         if self.slots.is_empty() {
             self.slots = (0..self.n).map(|_| None).collect();
         }
-        let i = self.slot(side, page);
+        let i = self.slot(zfile, page);
         if let Some(old) = self.slots[i].take() {
             self.recycle(old);
         }
         self.slots[i] = Some(MemoEntry {
-            side,
+            zfile,
             page,
             group,
             len,
@@ -941,8 +941,8 @@ impl ZMemo {
         r
     }
 
-    fn get(&self, side: u64, page: u32) -> Option<(Arc<GroupBuf>, usize)> {
-        self.0.borrow_mut().get(side, page)
+    fn get(&self, zfile: u64, page: u32) -> Option<(Arc<GroupBuf>, usize)> {
+        self.0.borrow_mut().get(zfile, page)
     }
 
     /// A buffer for a decode the memo will take: a displaced entry's, or
@@ -951,8 +951,8 @@ impl ZMemo {
         self.0.borrow_mut().take_free()
     }
 
-    fn put(&self, side: u64, page: u32, group: Arc<GroupBuf>, len: usize) {
-        self.0.borrow_mut().put(side, page, group, len)
+    fn put(&self, zfile: u64, page: u32, group: Arc<GroupBuf>, len: usize) {
+        self.0.borrow_mut().put(zfile, page, group, len)
     }
 }
 
@@ -970,30 +970,30 @@ fn popcount(map: &[AtomicU64]) -> u64 {
         .sum()
 }
 
-/// Sidecar ids, one per attach: what a cache derived from one sidecar is
+/// Form file ids, one per attach: what a cache derived from one form file is
 /// keyed by, so it cannot be read against another over the same range.
 static NEXT_ZSIDE_ID: AtomicU64 = AtomicU64::new(1);
 
-/// A sidecar, attached: its file mapped read-only, the fence and the
+/// A form file, attached: its file mapped read-only, the fence and the
 /// binding in the heap, and what this process has verified of its pages.
-pub(super) struct ZSide {
+pub(super) struct ZFile {
     /// The file, mapped. Advised `MADV_RANDOM` at attach whenever the store
     /// advises its mappings at all (`ReadAdvice` other than `Normal`), and
     /// then left alone, as the ordered companion's mapping is, whatever
     /// mode the store is in at that moment or later: only point reads and
-    /// counts read a sidecar -- the scans of a covered partition are walked
+    /// counts read a form file -- the scans of a covered partition are walked
     /// raw -- and a point read is random in every phase of the store, so
     /// `Reader::advise`, which follows the workload over the segments, does
-    /// not walk this. The stage that makes scans read sidecars is the one
+    /// not walk this. The stage that makes scans read form files is the one
     /// to decide what their advice is in a scan phase.
     map: MmapBytes,
-    /// The mapping was advised random (`ZSide::advised`).
+    /// The mapping was advised random (`ZFile::advised`).
     advised: bool,
     /// Heap copies of the resident part's tables, never evicted.
     fence: ZFence,
     /// The filter the file stores, over every key of the partition: a
     /// read of a key it does not hold is answered absent from the heap,
-    /// with no page touched. `None` for a sidecar built without one.
+    /// with no page touched. `None` for a form file built without one.
     filter: Option<super::BlockedBloom>,
     nkeys: usize,
     n_pages: usize,
@@ -1004,7 +1004,7 @@ pub(super) struct ZSide {
     verified: Box<[AtomicU64]>,
     /// One bit per page: a check failed.
     bad: Box<[AtomicU64]>,
-    /// Any check failed: the sidecar is out of service, and reads of the
+    /// Any check failed: the form file is out of service, and reads of the
     /// partition go to the raw form until it is dropped.
     damaged: AtomicBool,
     /// This attach's identity, which the memo keys its groups by.
@@ -1024,8 +1024,8 @@ pub(super) struct ZSide {
     skewed: Option<(Vec<u8>, usize)>,
 }
 
-impl ZSide {
-    /// The sidecar at `path`, if it is the sidecar of the live segment
+impl ZFile {
+    /// The form file at `path`, if it is the form file of the live segment
     /// `blob`, whose name carries `id` and `end_seq`. The checks, in order:
     /// the file's length and its trailer (every field the trailer's own
     /// decode checks); the trailer against what the live segment recomputes
@@ -1057,7 +1057,7 @@ impl ZSide {
         advise: bool,
         memo: bool,
         prefetch: bool,
-    ) -> std::result::Result<ZSide, Reject> {
+    ) -> std::result::Result<ZFile, Reject> {
         let damage = |e: ZError| Reject::Damage(e.to_string());
         let map = match MmapBytes::open(path) {
             Ok(m) => m,
@@ -1067,7 +1067,7 @@ impl ZSide {
         // The advice before the attach's own reads -- the trailer, the
         // resident part, the sampled pages: under the kernel's default each
         // would pull a readahead window in around it, most of a small
-        // sidecar and megabytes of a large one that the reads may never
+        // form file and megabytes of a large one that the reads may never
         // want. Half of a four-megabyte file, measured, with the advice
         // after the sample; a twentieth with it here.
         if advise {
@@ -1110,7 +1110,7 @@ impl ZSide {
             None
         };
         let bind = bind32(id, end_seq, facts.nkeys, facts.row_crc);
-        let side = ZSide {
+        let zfile = ZFile {
             map,
             advised: advise,
             fence,
@@ -1132,12 +1132,12 @@ impl ZSide {
             #[cfg(test)]
             skewed: None,
         };
-        side.check_sample().map_err(damage)?;
-        Ok(side)
+        zfile.check_sample().map_err(damage)?;
+        Ok(zfile)
     }
 
     /// The first, the last and fourteen evenly spaced pages through
-    /// `parse_page` -- the CRC under this sidecar's `bind32`, the tag, the
+    /// `parse_page` -- the CRC under this form file's `bind32`, the tag, the
     /// header, the padding -- and their rank and count against the fence
     /// entry that names each. Every page where there are no more than
     /// sixteen. These are not first decodes: nothing is decoded and no page
@@ -1181,7 +1181,7 @@ impl ZSide {
         self.map.slice_at((p as u64) * ZPAGE as u64, ZPAGE)
     }
 
-    /// A check failed on page `p`: it and the sidecar leave service.
+    /// A check failed on page `p`: it and the form file leave service.
     #[cold]
     fn fail(&self, p: usize) {
         if p < self.n_pages {
@@ -1196,7 +1196,7 @@ impl ZSide {
     /// has, decoded into `buf` or parsed in place for a stored page that is
     /// aligned; with its record count and whether a decode was made. `None`
     /// where the page is out of range or a check failed -- the page and the
-    /// sidecar are out of service then -- or a stored page is misaligned,
+    /// form file are out of service then -- or a stored page is misaligned,
     /// which a mapping never is; the caller answers a fallback.
     fn open_group<'a>(
         &'a self,
@@ -1442,7 +1442,7 @@ impl ZSide {
         r
     }
 
-    /// `Blob::scan_at` through the sidecar: the keys from rank `from` on,
+    /// `Blob::scan_at` through the form file: the keys from rank `from` on,
     /// at most `limit` of them, each key's values handed to `f` in the raw
     /// form's order, and how many keys were visited -- a key whose values
     /// are all gone counts and emits nothing, a rank past the end walks
@@ -1608,7 +1608,7 @@ impl ZSide {
         true
     }
 
-    /// `Blob::values_at` through the sidecar: the values of the record at
+    /// `Blob::values_at` through the form file: the values of the record at
     /// `rank`, handed to `f` in the raw form's order, or why not -- what a
     /// scan's emit of one partition record asks (`Reader::emit_unsealed`).
     pub(super) fn values_at<F: FnMut(&[u8])>(
@@ -1645,7 +1645,7 @@ impl ZSide {
         r
     }
 
-    /// `Blob::seek` through the sidecar (3.4): the rank of the first key at
+    /// `Blob::seek` through the form file (3.4): the rank of the first key at
     /// or after `key`, by the fence and one group's walk. A key below the
     /// first key is rank zero and one above every key is the key count,
     /// each `Greater` with nothing decoded; a key in an entry no page holds
@@ -1709,7 +1709,7 @@ impl ZSide {
         r
     }
 
-    /// `BuildCtx::cut_at` through the sidecar: the first rank in
+    /// `BuildCtx::cut_at` through the form file: the first rank in
     /// `rank..end` whose key is not below `uk`, or `end`, with how that
     /// rank's key compares to `uk`. The seek answers for the whole
     /// partition: a rank below `rank` means the key at `rank` is past `uk`,
@@ -1741,7 +1741,7 @@ impl ZSide {
         }
     }
 
-    /// The sidecar is out of service.
+    /// The form file is out of service.
     pub(super) fn damaged(&self) -> bool {
         self.damaged.load(Ordering::Relaxed)
     }
@@ -1766,7 +1766,7 @@ impl ZSide {
         popcount(&self.bad)
     }
 
-    /// Heap bytes the sidecar keeps resident: the fence and the filter.
+    /// Heap bytes the form file keeps resident: the fence and the filter.
     pub(super) fn resident_bytes(&self) -> usize {
         self.fence.heap_bytes() + self.filter.as_ref().map_or(0, |f| f.blocks.len() * 64)
     }
@@ -1781,7 +1781,7 @@ impl ZSide {
         self.ident.total_ulen
     }
 
-    /// This attach's number: no other sidecar attached in this process has
+    /// This attach's number: no other form file attached in this process has
     /// it.
     pub(super) fn id(&self) -> u64 {
         self.id
@@ -1807,7 +1807,7 @@ fn same_segment(
     end_seq: u64,
 ) -> std::result::Result<(), &'static str> {
     if t.seg_id != id || t.seg_end_seq != end_seq {
-        return Err("the sidecar names another segment");
+        return Err("the form file names another segment");
     }
     if t.nkeys != f.nkeys {
         return Err("the key count differs");
@@ -1848,13 +1848,13 @@ fn same_segment(
     Ok(())
 }
 
-/// The cell a segment keeps its sidecar in: a pointer set from null by
+/// The cell a segment keeps its form file in: a pointer set from null by
 /// `install`, read by an acquire load, cleared by `take` -- whose caller
 /// retires what it took through the epoch, as a replaced state is -- and
 /// freed with the segment if it still holds anything. Not a `OnceLock`,
 /// whose initialiser takes a lock a reader could wait on.
 pub(super) struct ZCell {
-    p: AtomicPtr<ZSide>,
+    p: AtomicPtr<ZFile>,
 }
 
 impl ZCell {
@@ -1864,12 +1864,12 @@ impl ZCell {
         }
     }
 
-    /// The sidecar, if one is installed. Valid for the operation that
-    /// reads it, which pins an epoch: a sidecar `take` removed is retired
+    /// The form file, if one is installed. Valid for the operation that
+    /// reads it, which pins an epoch: a form file `take` removed is retired
     /// under a later epoch and freed only past every pin at or before it,
     /// so a reader that loaded the pointer keeps it until it leaves.
     #[inline]
-    pub(super) fn get(&self) -> Option<&ZSide> {
+    pub(super) fn get(&self) -> Option<&ZFile> {
         let p = self.p.load(Ordering::Acquire);
         // SAFETY: set from `Box::into_raw` by `install`; cleared only by
         // `take`, whose caller frees it past every pinned reader, and by
@@ -1877,15 +1877,15 @@ impl ZCell {
         unsafe { p.as_ref() }
     }
 
-    /// The sidecar taken out of the cell, or null: the caller owns the
+    /// The form file taken out of the cell, or null: the caller owns the
     /// pointer and retires it through the epoch (`RetiredZ`), since a
     /// reader pinned before the take may still be walking it.
-    pub(super) fn take(&self) -> *mut ZSide {
+    pub(super) fn take(&self) -> *mut ZFile {
         self.p.swap(std::ptr::null_mut(), Ordering::AcqRel)
     }
 
     /// `z` installed if the cell is empty; whether it was.
-    pub(super) fn install(&self, z: ZSide) -> bool {
+    pub(super) fn install(&self, z: ZFile) -> bool {
         let p = Box::into_raw(Box::new(z));
         match self
             .p
@@ -1917,7 +1917,7 @@ impl Drop for ZCell {
 /// writer's, in `Db::zpages_settle` and at open), never by a read.
 #[derive(Default)]
 pub(super) struct ZEvents {
-    /// Sidecars built, the pages and bytes of them, pages that hold their
+    /// Form files built, the pages and bytes of them, pages that hold their
     /// group verbatim, and the decoded bytes of every group.
     pub builds: AtomicU64,
     pub build_pages: AtomicU64,
@@ -1931,7 +1931,7 @@ pub(super) struct ZEvents {
     /// merge outran.
     pub build_failed: AtomicU64,
     pub build_orphaned: AtomicU64,
-    /// Failed builds tried again after their backoff; sidecars taken out
+    /// Failed builds tried again after their backoff; form files taken out
     /// of service by a page that failed a check, retired and built again;
     /// partitions declined for the life of their segment after the third
     /// such rebuild.
@@ -1945,7 +1945,7 @@ pub(super) struct ZEvents {
     /// Records the builds held no page for, each an entry of the fence
     /// read from the raw form.
     pub build_nopage: AtomicU64,
-    /// Warms of a sidecar's file (`warm_file`): how many, the bytes read,
+    /// Warms of a form file (`warm_file`): how many, the bytes read,
     /// the bytes of chunks found resident and skipped, and the jobs' time
     /// in microseconds.
     pub warms: AtomicU64,
@@ -1960,12 +1960,12 @@ pub(super) struct ZEvents {
     pub declined_oversize: AtomicU64,
     pub declined_incompressible: AtomicU64,
     pub declined_unplaceable: AtomicU64,
-    /// Sidecars attached, and files an attach refused: damaged, or bound to
+    /// Form files attached, and files an attach refused: damaged, or bound to
     /// another segment.
     pub attached: AtomicU64,
     pub rejected_damage: AtomicU64,
     pub rejected_identity: AtomicU64,
-    /// Files a sweep of the directory removed: sidecars no live segment
+    /// Files a sweep of the directory removed: form files no live segment
     /// claims, and the temp names of builds that did not finish.
     pub swept: AtomicU64,
     /// What the last refusal said: a count says a file was refused and not
@@ -2033,7 +2033,7 @@ impl ZEvents {
     }
 }
 
-/// Why a partition was not given a sidecar.
+/// Why a partition was not given a form file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Decline {
     /// The record region is under the floor.
@@ -2042,7 +2042,7 @@ pub(super) enum Decline {
     /// segment whatever the form holds.
     BlockBacked,
     /// No record the partition holds fits a page: every one is an entry of
-    /// no page, and a sidecar of those alone serves nothing.
+    /// no page, and a form file of those alone serves nothing.
     NoPage(NoPage),
 }
 
@@ -2070,17 +2070,17 @@ pub(super) const DECLINED_SMALL: u8 = 1;
 /// backoff has passed (`Seg::z_retry_due`).
 pub(super) const DECLINED_FAILED: u8 = 6;
 
-/// The code `Seg::z_declined` keeps for a partition whose sidecar failed a
+/// The code `Seg::z_declined` keeps for a partition whose form file failed a
 /// check after `ZREBUILDS` rebuilds: left raw for the segment's life, so a
 /// defect the build cannot see or a medium that keeps failing is a counted
 /// decline and not a build a cycle.
 pub(super) const DECLINED_DAMAGE: u8 = 8;
 
-/// How many times a segment's sidecar is built again after a page of it
+/// How many times a segment's form file is built again after a page of it
 /// failed a check.
 pub(super) const ZREBUILDS: u8 = 3;
 
-/// The name a retired sidecar is renamed to: a rename frees no inode, where
+/// The name a retired form file is renamed to: a rename frees no inode, where
 /// an unlink is a device round trip here, so the landing that retires a
 /// segment renames and the idle tick unlinks; a dead name no live segment
 /// claims, so a sweep at open or at the end of a settle removes what a
@@ -2089,11 +2089,11 @@ pub(super) fn zpg_dead_name(n: u64) -> String {
     format!("zpg-dead-{n:08}.zpg")
 }
 
-/// The code `Seg::z_declined` keeps for a partition whose sidecar file an
+/// The code `Seg::z_declined` keeps for a partition whose form file an
 /// attach refused, which was counted when it was: a build replaces the file
 /// and the attach is not asked again of the same file, or it would be
 /// counted twice. Unlike the others it is not a reason to leave the
-/// partition raw, and a settle still gives it a sidecar.
+/// partition raw, and a settle still gives it a form file.
 pub(super) const DECLINED_REFUSED: u8 = 7;
 
 /// What a build made.
@@ -2107,7 +2107,7 @@ pub(super) struct Built {
     pub total_ulen: u64,
 }
 
-/// What a warm of a sidecar's file did (`warm_file`).
+/// What a warm of a form file did (`warm_file`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Warm {
     /// Bytes read into the page cache: the pages that were not resident.
@@ -2119,7 +2119,7 @@ pub(super) struct Warm {
 }
 
 /// `path` read into the page cache, chunk by chunk, so that the first reads
-/// of a sidecar that is on disk and cold -- after a restart -- fault on
+/// of a form file that is on disk and cold -- after a restart -- fault on
 /// nothing: a cold file of `P` pages costs `r` reads `P(1 - e^(-r/P))`
 /// major faults, as bad as the raw form. Each chunk the kernel reports
 /// wholly resident is skipped; the rest is asked for with `MADV_WILLNEED`
@@ -2317,7 +2317,7 @@ impl BuildPlan {
     }
 }
 
-/// The sidecar of the segment file at `seg_path`, written to `out`.
+/// The form file of the segment file at `seg_path`, written to `out`.
 ///
 /// The segment is opened as a merge opens its input: a mapping of its own,
 /// advised for the sequential walk the build makes (the live mapping is
@@ -2410,7 +2410,7 @@ fn build_file_seen(
     )?;
     blob.advise_normal();
     let facts = blob.z_source_facts().ok_or_else(|| {
-        super::err("z build: the segment has no checksum row to bind a sidecar to")
+        super::err("z build: the segment has no checksum row to bind a form file to")
     })?;
     let (recs, dir) = blob
         .record_regions()
@@ -2454,7 +2454,7 @@ fn build_file_seen(
     }
 }
 
-/// The pages, the resident part and the trailer of the sidecar of the
+/// The pages, the resident part and the trailer of the form file of the
 /// segment whose records and directory these are, written to `tmp`. `base`
 /// is the address of the segment's mapping and `file` its descriptor, for
 /// the drop-behind.
@@ -2647,7 +2647,7 @@ mod tests {
 
     fn dir(name: &str) -> PathBuf {
         let d =
-            std::env::temp_dir().join(format!("supdb-next-zside-{name}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("supdb-next-zfile-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -2773,8 +2773,8 @@ mod tests {
             build(&self.seg, &self.out, ID, END, &BuildPlan::new(0, true)).unwrap()
         }
 
-        fn attach(&self) -> std::result::Result<ZSide, Reject> {
-            ZSide::attach(&self.out, &self.blob, ID, END, false, true, false)
+        fn attach(&self) -> std::result::Result<ZFile, Reject> {
+            ZFile::attach(&self.out, &self.blob, ID, END, false, true, false)
         }
 
         /// Attached with the advice, the memo and the scan's prefetch as given.
@@ -2783,8 +2783,8 @@ mod tests {
             advise: bool,
             memo: bool,
             prefetch: bool,
-        ) -> std::result::Result<ZSide, Reject> {
-            ZSide::attach(&self.out, &self.blob, ID, END, advise, memo, prefetch)
+        ) -> std::result::Result<ZFile, Reject> {
+            ZFile::attach(&self.out, &self.blob, ID, END, advise, memo, prefetch)
         }
 
         /// Attached with the memo off: for a test of the decode path,
@@ -2792,14 +2792,14 @@ mod tests {
         /// a page changed under the mapping, a page a buffer cannot lend,
         /// a stored page beside a compressed one. With the memo on, a
         /// page's group is served as it was decoded while it holds.
-        fn attach_nomemo(&self) -> std::result::Result<ZSide, Reject> {
-            ZSide::attach(&self.out, &self.blob, ID, END, false, false, false)
+        fn attach_nomemo(&self) -> std::result::Result<ZFile, Reject> {
+            ZFile::attach(&self.out, &self.blob, ID, END, false, false, false)
         }
 
-        /// A sidecar built and attached.
-        fn side(&self) -> ZSide {
+        /// A form file built and attached.
+        fn zfile(&self) -> ZFile {
             assert!(matches!(self.build(), Outcome::Built(_)));
-            self.attach().expect("the sidecar it just built attaches")
+            self.attach().expect("the form file it just built attaches")
         }
     }
 
@@ -2815,15 +2815,15 @@ mod tests {
         v
     }
 
-    /// What the sidecar answers for `key`, or `None` where it declines.
+    /// What the form file answers for `key`, or `None` where it declines.
     fn z_values(
         memo: &ZMemo,
-        side: &ZSide,
+        zfile: &ZFile,
         blob: &Blob<MmapBytes>,
         key: &[u8],
     ) -> Option<Vec<Vec<u8>>> {
         let mut v = Vec::new();
-        match side
+        match zfile
             .read_all(memo, blob, key, &mut |x: &[u8]| v.push(x.to_vec()))
             .unwrap()
         {
@@ -2866,49 +2866,49 @@ mod tests {
 
     /// Every probe answers as the segment's own reader answers it, values
     /// and count both.
-    fn agree(memo: &ZMemo, side: &ZSide, blob: &Blob<MmapBytes>, recs: &[Rec]) {
+    fn agree(memo: &ZMemo, zfile: &ZFile, blob: &Blob<MmapBytes>, recs: &[Rec]) {
         for key in probes(recs) {
             let want = raw_values(blob, &key);
             assert_eq!(
-                z_values(memo, side, blob, &key).as_ref(),
+                z_values(memo, zfile, blob, &key).as_ref(),
                 Some(&want),
                 "read of {key:?}"
             );
             assert_eq!(
-                served(side.count(memo, &key)),
+                served(zfile.count(memo, &key)),
                 blob.count(&key).unwrap(),
                 "count of {key:?}"
             );
         }
-        assert!(!side.damaged());
+        assert!(!zfile.damaged());
     }
 
     #[test]
-    fn a_sidecar_answers_every_key_as_the_segment_does() {
+    fn a_form_file_answers_every_key_as_the_segment_does() {
         for (name, recs, inline) in [
             ("suite", suite(3000, 11), 256),
             ("shapes", shapes(), 1 << 20),
         ] {
             let fx = Fixture::new(name, recs, inline);
-            let side = fx.side();
-            assert!(side.pages() > 1, "{name}: more than one page");
-            agree(&fx.memo, &side, &fx.blob, &fx.recs);
+            let zfile = fx.zfile();
+            assert!(zfile.pages() > 1, "{name}: more than one page");
+            agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
             // Every page a read opened was checked, once, and none failed.
-            assert!(side.verified_pages() > 0 && side.bad_pages() == 0);
+            assert!(zfile.verified_pages() > 0 && zfile.bad_pages() == 0);
             // The second pass finds every page verified and answers the same.
-            let before = side.verified_pages();
-            agree(&fx.memo, &side, &fx.blob, &fx.recs);
-            assert_eq!(side.verified_pages(), before, "{name}");
+            let before = zfile.verified_pages();
+            agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
+            assert_eq!(zfile.verified_pages(), before, "{name}");
         }
     }
 
     #[test]
     fn a_read_hands_over_nothing_before_its_checks_have_passed() {
         // The callback is called only once every check that can fail has
-        // passed: a read the sidecar declines is read from the raw form by
+        // passed: a read the form file declines is read from the raw form by
         // the caller, and a value already handed over would be handed over
         // twice. A byte of a page the attach does not sample is flipped, so
-        // the sidecar attaches and the page fails at its first decode.
+        // the form file attaches and the page fails at its first decode.
         let fx = Fixture::new("before", suite(4000, 12), 256);
         assert!(matches!(fx.build(), Outcome::Built(_)));
         let pages = fx.attach().unwrap().pages();
@@ -2930,13 +2930,13 @@ mod tests {
         f.read_at(&mut b, at).unwrap();
         f.write_at(&[b[0] ^ 0x5a], at).unwrap();
         drop(f);
-        let side = fx
+        let zfile = fx
             .attach()
             .expect("a damaged page the sample misses attaches");
         let (mut served, mut declined) = (0usize, 0usize);
         for (k, vals, _) in &fx.recs {
             let mut got = 0usize;
-            match side
+            match zfile
                 .read_all(&fx.memo, &fx.blob, k, &mut |_: &[u8]| got += 1)
                 .unwrap()
             {
@@ -2955,11 +2955,11 @@ mod tests {
             served > 0 && declined > 0,
             "{served} served, {declined} declined"
         );
-        assert!(side.damaged() && side.bad_pages() == 1);
+        assert!(zfile.damaged() && zfile.bad_pages() == 1);
     }
 
     #[test]
-    fn a_partition_that_cannot_have_a_sidecar_is_declined_for_its_reason() {
+    fn a_partition_that_cannot_have_a_form_file_is_declined_for_its_reason() {
         // Under the floor.
         let fx = Fixture::new("small", suite(200, 1), 256);
         let r = build(&fx.seg, &fx.out, ID, END, &BuildPlan::new(ZMIN_RECS, true)).unwrap();
@@ -2994,14 +2994,14 @@ mod tests {
                 panic!("{name}: built around the record no page holds")
             };
             assert_eq!(b.fill.nopages, 1, "{name}");
-            let side = fx.attach().unwrap();
-            assert_eq!(side.count(&fx.memo, b"zzz-big"), ZRead::NoPage, "{name}");
+            let zfile = fx.attach().unwrap();
+            assert_eq!(zfile.count(&fx.memo, b"zzz-big"), ZRead::NoPage, "{name}");
             assert_eq!(
-                z_values(&fx.memo, &side, &fx.blob, b"zzz-big"),
+                z_values(&fx.memo, &zfile, &fx.blob, b"zzz-big"),
                 None,
                 "{name}: the read is the raw form's"
             );
-            agree(&fx.memo, &side, &fx.blob, &fx.recs[..300]);
+            agree(&fx.memo, &zfile, &fx.blob, &fx.recs[..300]);
             let alone = Fixture::new(
                 &format!("{name}-alone"),
                 vec![(b"zzz-big".to_vec(), vec![big], false)],
@@ -3031,13 +3031,13 @@ mod tests {
             panic!("built")
         };
         assert!(b.fill.stored > 0, "stored pages");
-        let side = fx.attach_nomemo().unwrap();
-        agree(&fx.memo, &side, &fx.blob, &fx.recs);
+        let zfile = fx.attach_nomemo().unwrap();
+        agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
         // A stored page is parsed where it lies: nothing is decoded. (The
         // memo off, so that the compressed page beside it decodes again.)
         let key = &fx.recs[fx.recs.len() / 2].0;
         let mut seen = 0;
-        let r = side
+        let r = zfile
             .read_all(&fx.memo, &fx.blob, key, &mut |_: &[u8]| seen += 1)
             .unwrap();
         assert_eq!(seen, 1);
@@ -3045,9 +3045,9 @@ mod tests {
             panic!("served")
         };
         let stored_page = {
-            let e = side.fence.entry_of(key).unwrap();
-            let p = side.fence.page(e).unwrap() as usize;
-            page_view(side.page_bytes(p).unwrap()).unwrap().0.stored
+            let e = zfile.fence.entry_of(key).unwrap();
+            let p = zfile.fence.page(e).unwrap() as usize;
+            page_view(zfile.page_bytes(p).unwrap()).unwrap().0.stored
         };
         assert_eq!(decoded, !stored_page);
     }
@@ -3141,16 +3141,16 @@ mod tests {
         // made inside the callback decodes another page: if it shared the
         // buffer it would overwrite the bytes the outer callback holds.
         let fx = Fixture::new("reentry", suite(3000, 21), 256);
-        let side = fx.side();
+        let zfile = fx.zfile();
         let (a, b) = (&fx.recs[10], &fx.recs[2500]);
         // The memo one slot wide: the inner read's put displaces the outer
         // group's entry, which the outer read holds through its `Arc`.
         let small = ZMemo::with(1, ZMEMO_BYTES);
         let mut seen = false;
-        let r = side
+        let r = zfile
             .read_all(&small, &fx.blob, &a.0, &mut |outer: &[u8]| {
                 assert_eq!(outer, &a.1[0][..]);
-                let inner = z_values(&small, &side, &fx.blob, &b.0).unwrap();
+                let inner = z_values(&small, &zfile, &fx.blob, &b.0).unwrap();
                 assert_eq!(inner, b.1);
                 // Read again byte by byte, volatile: a slice lent for a call
                 // is one the compiler may take to be unchanged under any
@@ -3168,7 +3168,7 @@ mod tests {
     }
 
     /// The memo: a direct-mapped table under a byte cap. An entry put is
-    /// found until displaced, another sidecar's same page is not it, a put
+    /// found until displaced, another form file's same page is not it, a put
     /// that passes the cap displaces others until the bytes held fit with
     /// the entry just put kept, and the hits and misses count.
     #[test]
@@ -3179,16 +3179,16 @@ mod tests {
         let (b, n) = g(40);
         m.put(1, 0, b, n);
         assert_eq!(m.get(1, 0).map(|(_, n)| n), Some(40));
-        assert!(m.get(2, 0).is_none(), "another sidecar's page 0");
-        // The same page of another sidecar in the same slot: the slot is
+        assert!(m.get(2, 0).is_none(), "another form file's page 0");
+        // The same page of another form file in the same slot: the slot is
         // the page plus a multiple of the identity, and the multiplier is
         // one more than a multiple of eight, so over eight slots sides
-        // eight apart put a page in one slot. Only the side compare tells
+        // eight apart put a page in one slot. Only the file compare tells
         // them apart, and this is the one way to reach it.
         assert_eq!(m.slot(1, 0), m.slot(9, 0), "the collision this builds");
         assert!(
             m.get(9, 0).is_none(),
-            "another sidecar's page 0, in the same slot"
+            "another form file's page 0, in the same slot"
         );
         let (b, n) = g(40);
         m.put(1, 1, b, n);
@@ -3234,23 +3234,23 @@ mod tests {
 
     /// Reads through the memo: the first read of each compressed page
     /// decodes it and the memo takes the group, a second pass over the
-    /// same keys hits for every one, a sidecar attached anew (a new
+    /// same keys hits for every one, a form file attached anew (a new
     /// identity) hits none of the entries the old one left, and with the
     /// memo off every read decodes and the memo counts nothing.
     #[test]
     fn the_memo_serves_the_second_read_of_a_page_and_never_another_attach() {
         let fx = Fixture::new("memo", suite(3000, 41), 256);
-        let side = fx.side();
-        let pages = side.pages() as u64;
-        let stored = (0..side.pages())
-            .filter(|&p| page_view(side.page_bytes(p).unwrap()).unwrap().0.stored)
+        let zfile = fx.zfile();
+        let pages = zfile.pages() as u64;
+        let stored = (0..zfile.pages())
+            .filter(|&p| page_view(zfile.page_bytes(p).unwrap()).unwrap().0.stored)
             .count() as u64;
         assert_eq!(stored, 0, "the suite's values compress");
         fx.memo.take_counts();
-        let read_all = |side: &ZSide| {
+        let read_all = |zfile: &ZFile| {
             let mut decoded = 0u64;
             for r in &fx.recs {
-                let got = side
+                let got = zfile
                     .read_all(&fx.memo, &fx.blob, &r.0, &mut |_: &[u8]| {})
                     .unwrap();
                 match got {
@@ -3264,14 +3264,14 @@ mod tests {
             decoded
         };
         let n = fx.recs.len() as u64;
-        let d1 = read_all(&side);
+        let d1 = read_all(&zfile);
         let (h1, m1) = fx.memo.take_counts();
         assert_eq!(
             (m1, d1, h1 + m1),
             (pages, pages, n),
             "a miss and a decode a page, the rest hits"
         );
-        let d2 = read_all(&side);
+        let d2 = read_all(&zfile);
         assert_eq!(
             (fx.memo.take_counts(), d2),
             ((n, 0), 0),
@@ -3284,7 +3284,7 @@ mod tests {
             ((n - pages, pages), pages),
             "a new identity misses every page once"
         );
-        let off = ZSide::attach(&fx.out, &fx.blob, ID, END, false, false, false).unwrap();
+        let off = ZFile::attach(&fx.out, &fx.blob, ID, END, false, false, false).unwrap();
         let d4 = read_all(&off);
         assert_eq!(
             (fx.memo.take_counts(), d4),
@@ -3294,13 +3294,13 @@ mod tests {
     }
 
     #[test]
-    fn a_sidecar_of_another_segment_is_refused() {
-        // The same ids, the same keys, other values: the hard case. Sidecar
-        // one planted where sidecar two belongs.
+    fn a_form_file_of_another_segment_is_refused() {
+        // The same ids, the same keys, other values: the hard case. Form file
+        // one planted where form file two belongs.
         let one = Fixture::new("other-1", suite(2000, 31), 256);
         let two = Fixture::new("other-2", suite(2000, 32), 256);
-        one.side();
-        two.side();
+        one.zfile();
+        two.zfile();
         std::fs::copy(&one.out, &two.out).unwrap();
         // The records differ, so the fingerprint of them does; two segments
         // written a second apart differ in their clocks as well, which is
@@ -3312,14 +3312,14 @@ mod tests {
             other => panic!("{:?}", other.map(|_| ())),
         }
         // And the name's own fields.
-        one.side();
+        one.zfile();
         let b = &one.blob;
         assert!(matches!(
-            ZSide::attach(&one.out, b, ID + 1, END, false, true, false),
+            ZFile::attach(&one.out, b, ID + 1, END, false, true, false),
             Err(Reject::Identity(_))
         ));
         assert!(matches!(
-            ZSide::attach(&one.out, b, ID, END + 1, false, true, false),
+            ZFile::attach(&one.out, b, ID, END + 1, false, true, false),
             Err(Reject::Identity(_))
         ));
         // No file is no rejection.
@@ -3350,7 +3350,7 @@ mod tests {
     #[test]
     fn every_field_of_the_trailer_wrong_is_refused() {
         let fx = Fixture::new("trailer", suite(2500, 41), 256);
-        fx.side();
+        fx.zfile();
         let good = std::fs::read(&fx.out).unwrap();
         let t0 = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
         type Edit = Box<dyn Fn(&mut Trailer)>;
@@ -3479,12 +3479,12 @@ mod tests {
             (
                 "seg_id",
                 Box::new(|t| t.seg_id += 1),
-                "identity: the sidecar names another segment",
+                "identity: the form file names another segment",
             ),
             (
                 "seg_end_seq",
                 Box::new(|t| t.seg_end_seq += 1),
-                "identity: the sidecar names another segment",
+                "identity: the form file names another segment",
             ),
         ];
         for (field, edit, why) in &edits {
@@ -3499,12 +3499,12 @@ mod tests {
         // for the ratio. A wrong value is accepted and harmless.
         std::fs::write(&fx.out, &good).unwrap();
         with_trailer(&fx.out, |t| t.total_ulen += 1);
-        let side = fx.attach().unwrap_or_else(|e| panic!("total_ulen: {e:?}"));
-        agree(&fx.memo, &side, &fx.blob, &fx.recs);
+        let zfile = fx.attach().unwrap_or_else(|e| panic!("total_ulen: {e:?}"));
+        agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
         // The file as built still attaches.
         std::fs::write(&fx.out, &good).unwrap();
-        let side = fx.attach().unwrap();
-        assert_eq!(side.ident(), &t0);
+        let zfile = fx.attach().unwrap();
+        assert_eq!(zfile.ident(), &t0);
         // And a torn trailer: every byte of it flipped in turn.
         for at in (good.len() - ZTRAILER..good.len()).step_by(7) {
             let mut bad = good.clone();
@@ -3550,10 +3550,10 @@ mod tests {
         // the last and fourteen pages between are checked at attach, so a
         // flip in one of those is a refusal; a flip in any other page is
         // met at the page's first decode, which declines the read, marks
-        // the page bad and takes the sidecar out of service. No flip is
+        // the page bad and takes the form file out of service. No flip is
         // ever a wrong answer, and none panics.
         let fx = Fixture::new("flips", suite(1500, 51), 256);
-        fx.side();
+        fx.zfile();
         let good = std::fs::read(&fx.out).unwrap();
         let t = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
         let pages = t.n_pages as usize;
@@ -3572,18 +3572,18 @@ mod tests {
                     refused += 1;
                 }
                 Err(other) => panic!("byte {at}: {other:?}"),
-                Ok(side) => {
+                Ok(zfile) => {
                     assert!(!sampled.contains(&p), "byte {at} of sampled page {p}");
                     // Every key of the damaged page, and a few of the rest.
                     let mut hit = 0;
                     for (i, (k, vals, _)) in fx.recs.iter().enumerate() {
-                        let e = side.fence.entry_of(k).unwrap();
-                        let on_it = side.fence.page(e) == Some(p as u32);
+                        let e = zfile.fence.entry_of(k).unwrap();
+                        let on_it = zfile.fence.page(e) == Some(p as u32);
                         if !on_it && i % 97 != 0 {
                             continue;
                         }
                         let mut got = Vec::new();
-                        match side
+                        match zfile
                             .read_all(&fx.memo, &fx.blob, k, &mut |v: &[u8]| got.push(v.to_vec()))
                             .unwrap()
                         {
@@ -3596,7 +3596,7 @@ mod tests {
                         }
                     }
                     if hit > 0 {
-                        assert!(side.damaged() && side.bad_pages() >= 1, "byte {at}");
+                        assert!(zfile.damaged() && zfile.bad_pages() >= 1, "byte {at}");
                         declined += 1;
                     } else {
                         quiet += 1;
@@ -3614,8 +3614,8 @@ mod tests {
     #[test]
     fn the_fence_finds_the_entry_a_key_falls_among() {
         let fx = Fixture::new("fence", shapes(), 1 << 20);
-        let side = fx.side();
-        let f = &side.fence;
+        let zfile = fx.zfile();
+        let f = &zfile.fence;
         // The empty key is the first record's, so nothing sorts below it.
         assert_eq!(f.key(0), Some(&b""[..]));
         assert_eq!(f.entry_of(b""), Some(0));
@@ -3636,7 +3636,7 @@ mod tests {
 
     use crate::db::zpages::{encode_page, PageHeader, ZCAP};
 
-    /// The images of page `p`'s records out of `bytes`, the whole sidecar.
+    /// The images of page `p`'s records out of `bytes`, the whole form file.
     fn page_images(bytes: &[u8], p: usize, bind: u32) -> Vec<Vec<u8>> {
         let (h, payload) = parse_page(&bytes[p * ZPAGE..(p + 1) * ZPAGE], bind).unwrap();
         let mut buf = GroupBuf::new();
@@ -3651,7 +3651,7 @@ mod tests {
         out
     }
 
-    /// Page `p` of the sidecar at `path` rewritten in place as `images`, under
+    /// Page `p` of the form file at `path` rewritten in place as `images`, under
     /// the `first_rank` and `count` the caller names and with a CRC that
     /// passes: a page that is whole and is wrong. Written in place and never
     /// truncated, so a mapping a reader holds sees the page change.
@@ -3709,7 +3709,7 @@ mod tests {
         // against the entry, and the walk of the group, are what refuse
         // them, and the walk is what a read that skipped it would not have.
         let fx = Fixture::new("forged", suite(4000, 61), 256);
-        fx.side();
+        fx.zfile();
         let good = std::fs::read(&fx.out).unwrap();
         let t = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
         let p = unsampled(t.n_pages as usize, 10);
@@ -3752,20 +3752,20 @@ mod tests {
         for (name, rank, cnt, imgs) in variants {
             std::fs::write(&fx.out, &good).unwrap();
             forge(&fx.out, p, rank, cnt, &imgs);
-            let side = fx
+            let zfile = fx
                 .attach()
                 .expect("an unsampled page is not looked at by the attach");
             let mut declined = 0;
             for (k, vals, _) in &on_page {
-                match z_values(&fx.memo, &side, &fx.blob, k) {
+                match z_values(&fx.memo, &zfile, &fx.blob, k) {
                     Some(got) => assert_eq!(&got, vals, "{name}: {k:?} answered {got:?}"),
                     None => declined += 1,
                 }
             }
             assert!(declined > 0, "{name}: nothing was refused");
-            assert!(side.damaged(), "{name}: the sidecar stayed in service");
+            assert!(zfile.damaged(), "{name}: the form file stayed in service");
             assert_eq!(
-                side.verified_pages(),
+                zfile.verified_pages(),
                 0,
                 "{name}: a refused page is verified"
             );
@@ -3777,7 +3777,7 @@ mod tests {
         // The attach's sample compares each page it reads with the fence
         // entry that names it, since a CRC that passes is no proof of that.
         let fx = Fixture::new("sampled", suite(4000, 62), 256);
-        fx.side();
+        fx.zfile();
         let good = std::fs::read(&fx.out).unwrap();
         let t = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
         let images = page_images(&good, 0, t.bind32());
@@ -3796,12 +3796,12 @@ mod tests {
     #[test]
     fn a_page_that_failed_its_first_decode_is_never_counted_verified() {
         // The verified bit is what lets a later read skip the page's CRC, so
-        // it is set after every check has passed and not before: the sidecar
+        // it is set after every check has passed and not before: the form file
         // leaves service on the failure, which hides a bit set early from a
         // single reader, and a second reader that found the bit would serve
         // the page unchecked.
         let fx = Fixture::new("unverified", suite(4000, 63), 256);
-        fx.side();
+        fx.zfile();
         let good = std::fs::read(&fx.out).unwrap();
         let t = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
         let p = unsampled(t.n_pages as usize, 5);
@@ -3809,20 +3809,20 @@ mod tests {
         f.write_all_at(&[good[p * ZPAGE + 100] ^ 0x5a], (p * ZPAGE + 100) as u64)
             .unwrap();
         drop(f);
-        let side = fx.attach().unwrap();
-        let entry = side.fence.entry(p, side.nkeys as u32).unwrap();
+        let zfile = fx.attach().unwrap();
+        let entry = zfile.fence.entry(p, zfile.nkeys as u32).unwrap();
         let key = fx.recs[entry.first_rank as usize + 1].0.clone();
         let mut got = 0;
-        let r = side
+        let r = zfile
             .read_all(&fx.memo, &fx.blob, &key, &mut |_: &[u8]| got += 1)
             .unwrap();
         assert_eq!((r, got), (ZRead::Fallback, 0));
-        assert_eq!(side.verified_pages(), 0, "a page that failed is verified");
-        assert_eq!(side.bad_pages(), 1);
-        assert!(side.damaged());
-        // The sidecar is out of service, and what it is asked verifies nothing.
-        assert_eq!(side.count(&fx.memo, &fx.recs[0].0), ZRead::Out);
-        assert_eq!(side.verified_pages(), 0);
+        assert_eq!(zfile.verified_pages(), 0, "a page that failed is verified");
+        assert_eq!(zfile.bad_pages(), 1);
+        assert!(zfile.damaged());
+        // The form file is out of service, and what it is asked verifies nothing.
+        assert_eq!(zfile.count(&fx.memo, &fx.recs[0].0), ZRead::Out);
+        assert_eq!(zfile.verified_pages(), 0);
     }
 
     #[test]
@@ -3831,18 +3831,21 @@ mod tests {
         // its CRC is not looked at again, and a group that no longer searches
         // is damage and not an absent key.
         let fx = Fixture::new("rot", suite(3000, 65), 256);
-        fx.side();
+        fx.zfile();
         let good = std::fs::read(&fx.out).unwrap();
         let t = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
         let p = t.n_pages as usize / 2;
         // The memo off: with it on the group is served as it was decoded
         // while the memo holds it, whatever the page became.
-        let side = fx.attach_nomemo().unwrap();
-        let entry = side.fence.entry(p, side.nkeys as u32).unwrap();
+        let zfile = fx.attach_nomemo().unwrap();
+        let entry = zfile.fence.entry(p, zfile.nkeys as u32).unwrap();
         let (first_rank, count) = (entry.first_rank, entry.count as usize);
         let k = fx.recs[first_rank as usize + 3].clone();
-        assert_eq!(z_values(&fx.memo, &side, &fx.blob, &k.0), Some(k.1.clone()));
-        assert_eq!(side.verified_pages(), 1);
+        assert_eq!(
+            z_values(&fx.memo, &zfile, &fx.blob, &k.0),
+            Some(k.1.clone())
+        );
+        assert_eq!(zfile.verified_pages(), 1);
         // The page rewritten whole under the open mapping: its last record is
         // cut in the middle, and the header still says `count` of them.
         let mut cut = page_images(&good, p, t.bind32());
@@ -3853,7 +3856,7 @@ mod tests {
         let (mut served, mut declined) = (0, 0);
         for i in 0..count {
             let (key, vals, _) = &fx.recs[first_rank as usize + i];
-            match z_values(&fx.memo, &side, &fx.blob, key) {
+            match z_values(&fx.memo, &zfile, &fx.blob, key) {
                 Some(got) => {
                     assert_eq!(
                         &got, vals,
@@ -3868,7 +3871,7 @@ mod tests {
             served > 0 && declined > 0,
             "{served} served, {declined} declined"
         );
-        assert!(side.damaged() && side.bad_pages() == 1);
+        assert!(zfile.damaged() && zfile.bad_pages() == 1);
     }
 
     #[test]
@@ -3878,22 +3881,22 @@ mod tests {
         // header's other two; the record is parsed whole only once it is
         // found. A header the run contradicts is damage the search does not
         // see, and the page was verified before it came: the record that is
-        // found and does not parse is the sidecar's damage, and a read that
+        // found and does not parse is the form file's damage, and a read that
         // took it for no record would answer a key it holds as missing.
         let fx = Fixture::new("rot-record", suite(3000, 68), 256);
-        fx.side();
+        fx.zfile();
         let good = std::fs::read(&fx.out).unwrap();
         let t = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
         let p = t.n_pages as usize / 2;
-        let side = fx.attach_nomemo().unwrap();
-        let entry = side.fence.entry(p, side.nkeys as u32).unwrap();
+        let zfile = fx.attach_nomemo().unwrap();
+        let entry = zfile.fence.entry(p, zfile.nkeys as u32).unwrap();
         let (first_rank, count) = (entry.first_rank, entry.count as u16);
         let (key, vals, _) = fx.recs[first_rank as usize + 3].clone();
         assert_eq!(
-            z_values(&fx.memo, &side, &fx.blob, &key),
+            z_values(&fx.memo, &zfile, &fx.blob, &key),
             Some(vals.clone())
         );
-        assert_eq!(side.verified_pages(), 1);
+        assert_eq!(zfile.verified_pages(), 1);
         let mut images = page_images(&good, p, t.bind32());
         // The compact header follows the key at the next multiple of four:
         // its run length, then its record count and flags, which here say
@@ -3908,26 +3911,26 @@ mod tests {
         images[3][at + 3] = 0x1f;
         forge(&fx.out, p, first_rank, count, &images);
         let mut got = 0;
-        let r = side
+        let r = zfile
             .read_all(&fx.memo, &fx.blob, &key, &mut |_: &[u8]| got += 1)
             .unwrap();
         assert_eq!((r, got), (ZRead::Fallback, 0));
-        assert!(side.damaged() && side.bad_pages() == 1);
+        assert!(zfile.damaged() && zfile.bad_pages() == 1);
         // The records before it in the group were answered while it held.
-        assert_eq!(side.count(&fx.memo, &key), ZRead::Out);
+        assert_eq!(zfile.count(&fx.memo, &key), ZRead::Out);
     }
 
     #[test]
     fn a_second_install_is_refused() {
         let fx = Fixture::new("install", suite(2000, 67), 256);
-        fx.side();
+        fx.zfile();
         let cell = ZCell::new();
         assert!(cell.get().is_none());
         assert!(cell.install(fx.attach().unwrap()));
         let first = cell.get().unwrap().id();
         assert!(
             !cell.install(fx.attach().unwrap()),
-            "a cell holds one sidecar"
+            "a cell holds one form file"
         );
         assert_eq!(cell.get().unwrap().id(), first);
     }
@@ -3938,10 +3941,10 @@ mod tests {
         let Outcome::Built(b) = fx.build() else {
             panic!("built")
         };
-        let side = fx.attach().unwrap();
+        let zfile = fx.attach().unwrap();
         let bytes = std::fs::read(&fx.out).unwrap();
         let mut sum = 0u64;
-        for p in 0..side.pages() {
+        for p in 0..zfile.pages() {
             sum += u64::from(
                 page_view(&bytes[p * ZPAGE..(p + 1) * ZPAGE])
                     .unwrap()
@@ -3949,16 +3952,16 @@ mod tests {
                     .ulen,
             );
         }
-        assert_eq!(side.group_bytes(), sum);
+        assert_eq!(zfile.group_bytes(), sum);
         assert_eq!(b.total_ulen, sum);
-        assert_eq!(side.file_bytes(), bytes.len() as u64);
+        assert_eq!(zfile.file_bytes(), bytes.len() as u64);
         assert_eq!(b.file_bytes, bytes.len() as u64);
-        assert_eq!(b.fill.pages as usize, side.pages());
+        assert_eq!(b.fill.pages as usize, zfile.pages());
     }
 
     // ---- what the build leaves behind ---------------------------------------
 
-    /// The sidecar's temp name.
+    /// The form file's temp name.
     fn tmp_of(out: &Path) -> PathBuf {
         let mut s = out.as_os_str().to_owned();
         s.push(".tmp");
@@ -3971,7 +3974,7 @@ mod tests {
         // a segment whose directory names two records in each other's places
         // makes a group that is not in key order, which no checksum sees and
         // a search would answer wrong from. The build fails, and the failure
-        // leaves neither the sidecar nor its temp name.
+        // leaves neither the form file nor its temp name.
         let fx = Fixture::new("order", suite(3000, 63), 256);
         let map = MmapBytes::open(&fx.seg).unwrap();
         let base = map.slice_at(0, 1).unwrap().as_ptr() as usize;
@@ -3990,7 +3993,7 @@ mod tests {
         std::fs::write(&broken, copy).unwrap();
         let out = fx.dir.join(zpg_name(8, END));
         let r = build(&broken, &out, 8, END, &BuildPlan::new(0, true));
-        assert!(r.is_err(), "records out of order built a sidecar: {r:?}");
+        assert!(r.is_err(), "records out of order built a form file: {r:?}");
         assert!(!out.exists());
         assert!(!tmp_of(&out).exists(), "a failed build left its temp name");
     }
@@ -4007,7 +4010,7 @@ mod tests {
         assert_eq!(rc, 0, "fadvise");
     }
 
-    /// A sidecar's file evicted from the page cache and warmed: every page
+    /// A form file evicted from the page cache and warmed: every page
     /// resident after, the bytes read the pages that were not; warmed
     /// again, nothing read and the whole file skipped; and a cancel set
     /// before it starts reads nothing.
@@ -4047,12 +4050,12 @@ mod tests {
         );
     }
 
-    /// Every window of the scan, through the sidecar and through the raw
+    /// Every window of the scan, through the form file and through the raw
     /// form: every start rank of the grid and every limit, the keys and
     /// values in order and the count returned, on the suite's shape and on
     /// the fixture with a record no page holds among the pages.
     #[test]
-    fn a_scan_through_the_sidecar_agrees_with_the_raw_walk_on_every_window() {
+    fn a_scan_through_the_form_file_agrees_with_the_raw_walk_on_every_window() {
         let mut rng = Rng(77);
         let mut recs = suite(3000, 5);
         let big = b"0000000000001500-big";
@@ -4060,7 +4063,7 @@ mod tests {
         recs.sort_by(|a, b| a.0.cmp(&b.0));
         for (name, recs) in [("scan-suite", suite(2500, 6)), ("scan-nopage", recs)] {
             let fx = Fixture::new(name, recs, 1 << 20);
-            let side = fx.side();
+            let zfile = fx.zfile();
             let n = fx.recs.len();
             let starts: Vec<usize> = (0..n).step_by(37).chain([n - 1, n, n + 5]).collect();
             let limits = [0usize, 1, 2, 3, 5, 17, 56, 57, 58, 114, 1000, usize::MAX];
@@ -4072,7 +4075,7 @@ mod tests {
                         .scan_at(from, limit, |k, v| want.push((k.to_vec(), v.to_vec())))
                         .unwrap();
                     let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-                    let z = side
+                    let z = zfile
                         .scan_at(
                             &fx.memo,
                             &fx.blob,
@@ -4093,13 +4096,13 @@ mod tests {
             // exactly its run, once; the suite's shape never does.
             let mut sink = |_: &[u8], _: &[u8]| {};
             fx.memo.take_counts();
-            let z = side
+            let z = zfile
                 .scan_at(&fx.memo, &fx.blob, 0, usize::MAX, &mut sink)
                 .unwrap();
             let (hits, _) = fx.memo.take_counts();
             assert_eq!(z.nopage, u64::from(name == "scan-nopage"), "{name}");
             assert!(z.decoded + hits > 1, "{name}: {z:?}, {hits} from the memo");
-            assert!(!side.damaged());
+            assert!(!zfile.damaged());
         }
     }
 
@@ -4117,7 +4120,7 @@ mod tests {
         recs.sort_by(|a, b| a.0.cmp(&b.0));
         for (name, recs) in [("seek-suite", suite(1000, 6)), ("seek-nopage", recs)] {
             let fx = Fixture::new(name, recs, 1 << 20);
-            let side = fx.side();
+            let zfile = fx.zfile();
             let n = fx.recs.len();
             let keys: Vec<&[u8]> = fx.recs.iter().map(|r| r.0.as_slice()).collect();
             for key in probes(&fx.recs) {
@@ -4127,7 +4130,7 @@ mod tests {
                 } else {
                     KeyOrder::Greater
                 };
-                let got = side.seek(&fx.memo, &key);
+                let got = zfile.seek(&fx.memo, &key);
                 assert!(
                     matches!(got, ZSeek::Served { rank, at, .. } if rank == want && at == want_at),
                     "{name}: seek of {key:?}: {got:?}, wanted {want} {want_at:?}"
@@ -4141,7 +4144,7 @@ mod tests {
                     } else {
                         KeyOrder::Greater
                     };
-                    let got = side.cut_in(&fx.memo, rank, end, &key);
+                    let got = zfile.cut_in(&fx.memo, rank, end, &key);
                     assert!(
                         matches!(got, ZSeek::Served { rank, at: a, .. } if rank == r && a == at),
                         "{name}: cut of {key:?} in {rank}..{end}: {got:?}, wanted {r} {at:?}"
@@ -4152,7 +4155,7 @@ mod tests {
                 let mut want = Vec::new();
                 let raw_n = fx.blob.values_at(rank, |v| want.push(v.to_vec())).unwrap();
                 let mut got = Vec::new();
-                let z = side
+                let z = zfile
                     .values_at(&fx.memo, &fx.blob, rank, &mut |v: &[u8]| {
                         got.push(v.to_vec())
                     })
@@ -4168,7 +4171,7 @@ mod tests {
                     assert_eq!(got, want, "{name}: the values at {rank}");
                 }
             }
-            assert!(!side.damaged());
+            assert!(!zfile.damaged());
         }
     }
 
@@ -4187,11 +4190,11 @@ mod tests {
         recs.sort_by(|a, b| a.0.cmp(&b.0));
         for (name, recs) in [("cursor-suite", suite(1200, 10)), ("cursor-nopage", recs)] {
             let fx = Fixture::new(name, recs, 1 << 20);
-            let side = fx.side();
+            let zfile = fx.zfile();
             let n = fx.recs.len();
             let nopage = u64::from(name == "cursor-nopage");
             for start in (0..n + 3).step_by(53) {
-                let mut c = ZCursor::at(&fx.memo, &side, &fx.blob, start);
+                let mut c = ZCursor::at(&fx.memo, &zfile, &fx.blob, start);
                 let mut rank = start;
                 loop {
                     assert_eq!(c.rank(), rank, "{name}: from {start}");
@@ -4220,10 +4223,10 @@ mod tests {
                 // The seek to a key lands where the raw form's does, and so
                 // does one to a key between records.
                 let k = &fx.recs[start.min(n - 1)].0;
-                let c = ZCursor::seek(&fx.memo, &side, &fx.blob, k).unwrap();
+                let c = ZCursor::seek(&fx.memo, &zfile, &fx.blob, k).unwrap();
                 assert_eq!((c.rank(), c.key()), (start.min(n - 1), Some(k.as_slice())));
                 let between = [k.as_slice(), &[0u8]].concat();
-                let c = ZCursor::seek(&fx.memo, &side, &fx.blob, &between).unwrap();
+                let c = ZCursor::seek(&fx.memo, &zfile, &fx.blob, &between).unwrap();
                 assert_eq!(
                     c.rank(),
                     fx.blob.seek(&between),
@@ -4231,11 +4234,11 @@ mod tests {
                 );
                 assert_eq!(c.key(), fx.blob.key_at(c.rank()));
             }
-            let c = ZCursor::seek(&fx.memo, &side, &fx.blob, b"").unwrap();
+            let c = ZCursor::seek(&fx.memo, &zfile, &fx.blob, b"").unwrap();
             assert_eq!(c.rank(), 0);
-            let c = ZCursor::seek(&fx.memo, &side, &fx.blob, &[0xffu8; 8]).unwrap();
+            let c = ZCursor::seek(&fx.memo, &zfile, &fx.blob, &[0xffu8; 8]).unwrap();
             assert_eq!((c.rank(), c.key()), (n, None));
-            assert!(!side.damaged());
+            assert!(!zfile.damaged());
             // A page flipped under the cursor: the first check that fails
             // makes the rest of the walk the raw form's, and the keys and
             // values stay right.
@@ -4245,10 +4248,10 @@ mod tests {
             let mut flipped = good.clone();
             flipped[p * ZPAGE + 100] ^= 0x40;
             std::fs::write(&fx.out, &flipped).unwrap();
-            let side = fx
+            let zfile = fx
                 .attach()
                 .expect("the sample does not reach the flipped page");
-            let mut c = ZCursor::at(&fx.memo, &side, &fx.blob, 0);
+            let mut c = ZCursor::at(&fx.memo, &zfile, &fx.blob, 0);
             for rank in 0..n {
                 assert_eq!(c.key(), fx.blob.key_at(rank), "{name}: flipped, at {rank}");
                 let mut want = Vec::new();
@@ -4259,9 +4262,9 @@ mod tests {
                 c.advance();
             }
             assert_eq!((c.key(), c.rank()), (None, n));
-            assert!(c.fell_back() && side.damaged(), "{name}: the flip was met");
-            assert_eq!(side.seek(&fx.memo, b"0"), ZSeek::Out);
-            assert!(ZCursor::seek(&fx.memo, &side, &fx.blob, b"0").is_err());
+            assert!(c.fell_back() && zfile.damaged(), "{name}: the flip was met");
+            assert_eq!(zfile.seek(&fx.memo, b"0"), ZSeek::Out);
+            assert!(ZCursor::seek(&fx.memo, &zfile, &fx.blob, b"0").is_err());
             std::fs::write(&fx.out, &good).unwrap();
         }
     }
@@ -4284,7 +4287,7 @@ mod tests {
         recs.sort_by(|a, b| a.0.cmp(&b.0));
         for (name, recs) in [("bulk-suite", suite(1200, 12)), ("bulk-nopage", recs)] {
             let fx = Fixture::new(name, recs, 1 << 20);
-            let side = fx.side();
+            let zfile = fx.zfile();
             let n = fx.recs.len();
             let raw_seq = |from: usize, to: usize| -> Vec<(Vec<u8>, Vec<u8>)> {
                 let mut v = Vec::new();
@@ -4317,7 +4320,7 @@ mod tests {
                                 until.as_deref().map(String::from_utf8_lossy)
                             );
                             let stop = stop.min(n);
-                            let mut c = ZCursor::at(&fx.memo, &side, &fx.blob, start);
+                            let mut c = ZCursor::at(&fx.memo, &zfile, &fx.blob, start);
                             let mut got = Vec::new();
                             let (got_n, at) = c
                                 .walk_until(until.as_deref(), limit, &mut |k: &[u8], v: &[u8]| {
@@ -4381,7 +4384,7 @@ mod tests {
                     }
                 }
             }
-            assert!(!side.damaged());
+            assert!(!zfile.damaged());
             // Asked ahead once a cursor where the prefetch is on, and never
             // for a walk its first page satisfies.
             let on = fx.attach_opts(false, true, true).unwrap();
@@ -4393,7 +4396,7 @@ mod tests {
             let mut c = ZCursor::at(&fx.memo, &on, &fx.blob, 0);
             c.walk_until(None, 1, &mut sink).unwrap();
             assert_eq!(c.prefetches, 0, "{name}: nothing past the page wanted");
-            let mut c = ZCursor::at(&fx.memo, &side, &fx.blob, 0);
+            let mut c = ZCursor::at(&fx.memo, &zfile, &fx.blob, 0);
             c.walk_until(None, 300, &mut sink).unwrap();
             assert_eq!(c.prefetches, 0, "{name}: the option off");
             // A page flipped under the walk: the rest is the raw form's, and
@@ -4404,10 +4407,10 @@ mod tests {
             let mut flipped = good.clone();
             flipped[p * ZPAGE + 100] ^= 0x40;
             std::fs::write(&fx.out, &flipped).unwrap();
-            let side = fx
+            let zfile = fx
                 .attach()
                 .expect("the sample does not reach the flipped page");
-            let mut c = ZCursor::at(&fx.memo, &side, &fx.blob, 0);
+            let mut c = ZCursor::at(&fx.memo, &zfile, &fx.blob, 0);
             let mut got = Vec::new();
             let (m, at) = c
                 .walk_until(None, usize::MAX, &mut |k: &[u8], v: &[u8]| {
@@ -4416,7 +4419,7 @@ mod tests {
                 .unwrap();
             assert_eq!((m, at), (n, KeyOrder::Greater), "{name}: flipped");
             assert_eq!(got, raw_seq(0, n), "{name}: flipped, every key and value");
-            assert!(c.fell_back() && side.damaged(), "{name}: the flip was met");
+            assert!(c.fell_back() && zfile.damaged(), "{name}: the flip was met");
             std::fs::write(&fx.out, &good).unwrap();
         }
     }
@@ -4433,10 +4436,10 @@ mod tests {
         assert!(matches!(fx.build(), Outcome::Built(_)));
         // Evicted before the attach: a fault on a mapped file maps the
         // cached pages around it as well (the kernel's fault-around, sixteen
-        // pages), which no eviction takes from a mapping, so a sidecar
+        // pages), which no eviction takes from a mapping, so a form file
         // attached while its file was resident stayed resident whatever
         // was advised. Attached advised random, as the store advises a
-        // sidecar, so that the kernel's readahead does not bring in behind
+        // form file, so that the kernel's readahead does not bring in behind
         // a walk what the prefetch is measured by.
         evict(&fx.out);
         let on = fx.attach_opts(true, true, true).unwrap();
@@ -4517,7 +4520,7 @@ mod tests {
     fn a_record_no_page_holds_among_the_pages_is_one_entry_and_the_pages_go_on() {
         // The pages before the record are in the temp file when the fill
         // meets it; the entry is pushed and the pages after it follow, so
-        // the sidecar is whole and the temp name is gone.
+        // the form file is whole and the temp name is gone.
         let mut rng = Rng(77);
         let mut recs = suite(3000, 3);
         let big = b"0000000000001500-big";
@@ -4530,10 +4533,10 @@ mod tests {
         };
         assert_eq!(b.fill.nopages, 1);
         assert!(fx.out.exists() && !tmp_of(&fx.out).exists());
-        let side = fx.attach().unwrap();
+        let zfile = fx.attach().unwrap();
         agree(
             &fx.memo,
-            &side,
+            &zfile,
             &fx.blob,
             &fx.recs
                 .iter()
@@ -4541,41 +4544,41 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>(),
         );
-        assert_eq!(side.count(&fx.memo, big), ZRead::NoPage);
+        assert_eq!(zfile.count(&fx.memo, big), ZRead::NoPage);
         // A key in the entry's range that is not the record's is absent
         // from the fence alone, and the record's own key is the raw form's.
         let above = [&big[..], &[0xffu8]].concat();
         assert_eq!(
-            side.count(&fx.memo, &above),
+            zfile.count(&fx.memo, &above),
             ZRead::Served {
                 n: 0,
                 decoded: false
             }
         );
-        assert_eq!(z_values(&fx.memo, &side, &fx.blob, big), None);
+        assert_eq!(z_values(&fx.memo, &zfile, &fx.blob, big), None);
         // The entry's page number is no page, and the pages after it are
         // numbered on from the one before.
-        let e = side.fence.entry_of(big).unwrap();
-        assert_eq!(side.fence.page(e), Some(ZNOPAGE));
+        let e = zfile.fence.entry_of(big).unwrap();
+        assert_eq!(zfile.fence.page(e), Some(ZNOPAGE));
         assert_eq!(
-            side.fence.page(e + 1),
-            side.fence.page(e - 1).map(|p| p + 1)
+            zfile.fence.page(e + 1),
+            zfile.fence.page(e - 1).map(|p| p + 1)
         );
     }
 
     #[test]
-    fn a_build_over_a_stale_temp_file_is_a_whole_sidecar() {
+    fn a_build_over_a_stale_temp_file_is_a_whole_form_file() {
         // A build a crash cut off leaves its temp name, and the next build of
         // the same name writes over it: from the first byte, and to the
-        // length the sidecar is, or the file renamed into place carries what
+        // length the form file is, or the file renamed into place carries what
         // the crashed build had after its end.
         let fx = Fixture::new("stale", suite(3000, 66), 256);
         std::fs::write(tmp_of(&fx.out), vec![0xA5u8; 4 << 20]).unwrap();
         assert!(matches!(fx.build(), Outcome::Built(_)));
-        let side = fx
+        let zfile = fx
             .attach()
-            .expect("a sidecar built over a stale temp file attaches");
-        agree(&fx.memo, &side, &fx.blob, &fx.recs);
+            .expect("a form file built over a stale temp file attaches");
+        agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
         assert!(!tmp_of(&fx.out).exists());
     }
 
@@ -4624,7 +4627,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sidecar_is_the_same_bytes_whatever_the_piece_and_the_window() {
+    fn a_form_file_is_the_same_bytes_whatever_the_piece_and_the_window() {
         // The piece a build writes in and the window it drops the raw records
         // behind are choices about the page cache; the file is the same. The
         // plans cross, with a store a test can afford, the boundaries a real
@@ -4719,7 +4722,7 @@ mod tests {
     }
 
     #[test]
-    fn a_page_the_sidecar_cannot_lend_is_refused_by_a_read_and_not_answered_absent() {
+    fn a_page_the_form_file_cannot_lend_is_refused_by_a_read_and_not_answered_absent() {
         // Entropy: every page is stored, parsed where it lies, and a stored
         // page's payload has to sit where the extents `parse_record` borrows
         // are aligned. A mapping never gives one that does not; a source that
@@ -4733,53 +4736,53 @@ mod tests {
         recs.sort_by(|a, b| a.0.cmp(&b.0));
         recs.dedup_by(|a, b| a.0 == b.0);
         let fx = Fixture::new("lend", recs, 256);
-        fx.side();
+        fx.zfile();
         let bytes = std::fs::read(&fx.out).unwrap();
-        // A sidecar fresh from its attach: no page is verified yet, so a read
+        // A form file fresh from its attach: no page is verified yet, so a read
         // that meets a page meets it in its first decode.
-        let mut side = fx.attach_nomemo().unwrap();
+        let mut zfile = fx.attach_nomemo().unwrap();
         // Which pages are stored: entropy makes most of them so, and a group
         // that LZ4 does shorten is decoded into a buffer of the reader's own,
         // which is aligned whatever the source is.
-        let stored = |side: &ZSide, k: &[u8]| {
-            let p = side.fence.page(side.fence.entry_of(k).unwrap()).unwrap() as usize;
+        let stored = |zfile: &ZFile, k: &[u8]| {
+            let p = zfile.fence.page(zfile.fence.entry_of(k).unwrap()).unwrap() as usize;
             page_view(&bytes[p * ZPAGE..(p + 1) * ZPAGE])
                 .unwrap()
                 .0
                 .stored
         };
-        let on_stored = fx.recs.iter().filter(|r| stored(&side, &r.0)).count();
+        let on_stored = fx.recs.iter().filter(|r| stored(&zfile, &r.0)).count();
         assert!(
             on_stored > 100 && fx.recs.len() - on_stored > 100,
             "{on_stored} of {} records on stored pages: the test wants both kinds",
             fx.recs.len()
         );
         // Misaligned by every skew that is not a multiple of four: a read
-        // and a count of a key on a stored page both decline, and the sidecar
+        // and a count of a key on a stored page both decline, and the form file
         // stays in service, since a source that cannot lend is no damage to
         // the file; a key on any other page is served as it is.
-        let refused = |side: &ZSide, what: &str| {
+        let refused = |zfile: &ZFile, what: &str| {
             let (mut refusals, mut answers) = (0, 0);
             for (k, vals, _) in fx.recs.iter().step_by(11) {
                 let mut got = Vec::new();
-                let r = side
+                let r = zfile
                     .read_all(&fx.memo, &fx.blob, k, &mut |v: &[u8]| got.push(v.to_vec()))
                     .unwrap();
-                if stored(side, k) {
+                if stored(zfile, k) {
                     assert_eq!(
                         (r, got.len()),
                         (ZRead::Fallback, 0),
                         "{what}: read of {k:?}"
                     );
                     assert_eq!(
-                        side.count(&fx.memo, k),
+                        zfile.count(&fx.memo, k),
                         ZRead::Fallback,
                         "{what}: count of {k:?}"
                     );
                     refusals += 1;
                 } else {
                     assert_eq!(&got, vals, "{what}: read of {k:?}");
-                    assert_eq!(served(side.count(&fx.memo, k)), vals.len() as u64);
+                    assert_eq!(served(zfile.count(&fx.memo, k)), vals.len() as u64);
                     answers += 1;
                 }
             }
@@ -4787,33 +4790,33 @@ mod tests {
                 refusals > 10 && answers > 0,
                 "{refusals} refused, {answers} answered"
             );
-            assert!(!side.damaged() && side.bad_pages() == 0, "{what}");
+            assert!(!zfile.damaged() && zfile.bad_pages() == 0, "{what}");
         };
         for extra in [1usize, 2, 3, 5, 6, 7] {
-            side.skewed = Some(file_at(&bytes, extra));
-            refused(&side, &format!("first decode, skew {extra}"));
+            zfile.skewed = Some(file_at(&bytes, extra));
+            refused(&zfile, &format!("first decode, skew {extra}"));
         }
-        for p in 0..side.pages() {
+        for p in 0..zfile.pages() {
             let stored_page = page_view(&bytes[p * ZPAGE..(p + 1) * ZPAGE])
                 .unwrap()
                 .0
                 .stored;
             assert!(
-                !(stored_page && bit(&side.verified, p)),
+                !(stored_page && bit(&zfile.verified, p)),
                 "page {p} was refused and is verified"
             );
         }
         // Aligned, from a buffer of the test's own: every key is served, a
         // stored page in place with nothing decoded.
-        side.skewed = Some(file_at(&bytes, 0));
+        zfile.skewed = Some(file_at(&bytes, 0));
         for (k, vals, _) in &fx.recs {
             let mut got = Vec::new();
-            let r = side
+            let r = zfile
                 .read_all(&fx.memo, &fx.blob, k, &mut |v: &[u8]| got.push(v.to_vec()))
                 .unwrap();
             let want = ZRead::Served {
                 n: vals.len() as u64,
-                decoded: !stored(&side, k),
+                decoded: !stored(&zfile, k),
             };
             assert_eq!(r, want);
             assert_eq!(&got, vals);
@@ -4821,28 +4824,28 @@ mod tests {
         // The pages are verified now, and a read that meets one in the
         // verified path is refused the same way.
         for extra in [1usize, 3, 6] {
-            side.skewed = Some(file_at(&bytes, extra));
-            refused(&side, &format!("verified, skew {extra}"));
+            zfile.skewed = Some(file_at(&bytes, extra));
+            refused(&zfile, &format!("verified, skew {extra}"));
         }
-        // A source that has no such page at all is the sidecar's damage.
-        side.skewed = Some((Vec::new(), 0));
+        // A source that has no such page at all is the form file's damage.
+        zfile.skewed = Some((Vec::new(), 0));
         let k = &fx.recs[fx.recs.len() / 2].0;
-        assert_eq!(side.count(&fx.memo, k), ZRead::Fallback);
-        assert!(side.damaged() && side.bad_pages() == 1);
-        assert_eq!(side.count(&fx.memo, k), ZRead::Out);
+        assert_eq!(zfile.count(&fx.memo, k), ZRead::Fallback);
+        assert!(zfile.damaged() && zfile.bad_pages() == 1);
+        assert_eq!(zfile.count(&fx.memo, k), ZRead::Out);
     }
 
     #[test]
     fn records_the_form_holds_no_page_for_are_the_raw_forms_and_pages_are_found_by_number() {
         // A fence entry that names no page (`ZNOPAGE`) is a run of records the
         // form was built without, and a read of them is the raw form's: the
-        // sidecar says so and does not answer absent. The entries after it
+        // form file says so and does not answer absent. The entries after it
         // are not at their own index in the file: the page of entry `i` is
         // the number the fence gives, and a reader that took the entry's
         // index for it would open another entry's page and find the damage
         // check, rightly, unwilling.
         let fx = Fixture::new("nopage", suite(4000, 81), 256);
-        fx.side();
+        fx.zfile();
         let good = std::fs::read(&fx.out).unwrap();
         let t = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
         let (fence, filter) =
@@ -4879,7 +4882,7 @@ mod tests {
         t2.total_ulen -= u64::from(dropped.ulen);
         bytes.extend_from_slice(&t2.encode());
         std::fs::write(&fx.out, &bytes).unwrap();
-        let side = fx
+        let zfile = fx
             .attach()
             .expect("a fence with an entry of no page attaches");
         let (lo, hi) = (
@@ -4890,7 +4893,7 @@ mod tests {
         let (mut served, mut declined) = (0, 0);
         for (i, (key, vals, _)) in fx.recs.iter().enumerate() {
             let mut got = Vec::new();
-            let r = side
+            let r = zfile
                 .read_all(&fx.memo, &fx.blob, key, &mut |v: &[u8]| {
                     got.push(v.to_vec())
                 })
@@ -4898,7 +4901,7 @@ mod tests {
             if (lo..hi).contains(&i) {
                 assert_eq!((r, got.len()), (ZRead::NoPage, 0), "record {i}");
                 assert_eq!(
-                    side.count(&fx.memo, key),
+                    zfile.count(&fx.memo, key),
                     ZRead::NoPage,
                     "count of record {i}"
                 );
@@ -4911,7 +4914,7 @@ mod tests {
         }
         assert_eq!(declined, hi - lo);
         assert!(served > 3 * declined, "{served} served");
-        assert!(!side.damaged() && side.bad_pages() == 0);
+        assert!(!zfile.damaged() && zfile.bad_pages() == 0);
         // A key that falls in the run and is no record is the filter's to
         // answer, before the fence is asked: absent, no page touched, or
         // the fence's answer where the filter admits it by chance. The
@@ -4919,7 +4922,7 @@ mod tests {
         // entry covers more than one record: asked with the filter set
         // aside.
         let inside = [fx.recs[lo].0.as_slice(), &[0u8]].concat();
-        let answer = side.count(&fx.memo, &inside);
+        let answer = zfile.count(&fx.memo, &inside);
         assert!(
             answer
                 == ZRead::Served {
@@ -4929,10 +4932,10 @@ mod tests {
                 || answer == ZRead::NoPage,
             "{answer:?}"
         );
-        let mut side = side;
-        side.filter = None;
+        let mut zfile = zfile;
+        zfile.filter = None;
         assert_eq!(
-            side.count(&fx.memo, &inside),
+            zfile.count(&fx.memo, &inside),
             ZRead::NoPage,
             "the fence's own answer for a key in a run of several records"
         );

@@ -253,19 +253,19 @@ each prices one engine option against the arm it differs from in one
 process (`bench ab --arms <base>,<arm>`) and is chosen by hand:
 `supdb-nocacheordread` reads a point through the ordered index,
 `supdb-nocachezpages` forces the compact second form for point reads and
-counts (a pass refuses it unless every partition has its sidecar and the
-reads went through the sidecars), and `supdb-nocachezpagesnodrop`,
+counts (a pass refuses it unless every partition has its form file and the
+reads went through the form files), and `supdb-nocachezpagesnodrop`,
 `supdb-nocachezpagesnowarm`, `supdb-nocachezpagessettle`,
 `supdb-nocachezpagesnomemo`, `supdb-nocachezpagesheads`,
 `supdb-nocachezpagesprefetch` and `supdb-nocachezpagesrankwalk` are that
 arm with one of its options moved: the build's release of the raw
-records off, the warm of a sidecar's file after its attach off, every
+records off, the warm of a form file after its attach off, every
 build left to the settle of the form rather than started as its
 partition lands, the memo of decoded groups off, a scan's seeks by the
-ordered index's heads instead of the sidecar's fence, a scan's prefetch
+ordered index's heads instead of the form file's fence, a scan's prefetch
 of the pages it will cross on, and the overlay walk of a covered
 partition cut by rank rather than carried through a cursor. The forced arm's
-`sync` builds the sidecars, so its load carries the build, and in memory
+`sync` builds the form files, so its load carries the build, and in memory
 it reads slower than the raw form: it is an arm for the bound, not a
 default.
 

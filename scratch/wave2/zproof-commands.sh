@@ -17,27 +17,27 @@
 #    the pre-registration moves. Each is the counted number the review recomputed, and none is a measurement of the
 #    arm: the arm has not been timed.
 #
-#  P1  The staircase clause is withdrawn. The build leaves the sidecar in the page cache (at one fifth scale the
+#  P1  The staircase clause is withdrawn. The build leaves the form file in the page cache (at one fifth scale the
 #      cgroup held 149 MB of its 200 right after the load), so Z's cells are expected to read about 0.00 in all
 #      three, not to fall across them while a cold file warms. The refutation line is unchanged: Z's 3t cell above
 #      0.05. A resident file after a build is the expected shape and is recorded as such.
 #  P4  The build counts are identities the counters print, not an absolute range. Per pass (the runner sums a
 #      counter over the pass's two stores; a gauge is named `*_at_end`):
-#        zpage_sidecars_at_end + zpage_small_partitions_at_end == zpage_partitions_at_end
+#        zpage_form files_at_end + zpage_small_partitions_at_end == zpage_partitions_at_end
 #        zpage_attached == zpage_builds                 (nothing is attached at open in a fresh store)
-#        zpage_builds >= zpage_sidecars_at_end          (equal when every merge landed before the builds, which
+#        zpage_builds >= zpage_form files_at_end          (equal when every merge landed before the builds, which
 #                                                        flush and the settle's first join make the case: 6 of 6
 #                                                        and 12 of 12 partitions in the 2M and 3M shuffled loads;
 #                                                        a surplus is a merge that landed during a settle, and is
 #                                                        a count to explain, not a failure)
 #        zpage_build_failed == zpage_build_orphaned == zpage_swept == zpage_fallbacks == 0
 #      The pass itself refuses a store that breaks the first identity, whose directory holds anything but one
-#      `.zpg` per sidecar and no other `zpg-` name, or whose sidecar is out of service (it checks the ordered load's
+#      `.zpg` per form file and no other `zpg-` name, or whose form file is out of service (it checks the ordered load's
 #      store and the shuffled load's). The report's 68-93 builds (18-23 for the ordered store, 50-70 for the shuffled
 #      store) is withdrawn: its 2-3 rebuilds of a partition do not happen, and its 64 MiB partitions are
 #      unmeasured at 10M (the engine wrote 31-36 MB partitions at 1M-2M keys); one build per final partition is the
 #      shape counted.
-#  P5  `load bytes_on_disk_per_byte` 1.89 (1.86-1.92) against R's 1.304 (678 MB of sidecar at 67.8 B a key: 1.304 +
+#  P5  `load bytes_on_disk_per_byte` 1.89 (1.86-1.92) against R's 1.304 (678 MB of form file at 67.8 B a key: 1.304 +
 #      0.584); `load device_bytes_per_byte` 1.92 (1.89-1.96) against 1.339. The sizes (file, group, pages,
 #      resident) are unchanged.
 #  P6  `load ops_per_s` of the ordered load 0.40-0.60x of R (centre 0.50): the builds' CPU alone is 4.8-5.9 s per 10M
@@ -55,7 +55,7 @@
 #      that spread and with no margin for the count. The default path's verdict is the quick row's smallest rung read
 #      pass, not an instruction count. `#[cold]` on `part_read_z` and `part_count_z` was priced (-0.3 a read, -1.0 a
 #      count) and not adopted: it would put the forced arm's own read function in the cold section.
-#  The retire of a merge's input unlinks its sidecar on the segment-work thread (`Maint::retire_seg`), a device round
+#  The retire of a merge's input unlinks its form file on the segment-work thread (`Maint::retire_seg`), a device round
 #  trip a file on this filesystem (33-98 ms for a 34 MB synced file). The 2a cells (load, read, read-threaded) retire
 #  none; the all-passes run (section 3b) carries it in every cell that merges (the lag sweep, the bursts, the mixes
 #  that write), and a lag or burst cell that trails is read with this cost named before it is called the form's.
@@ -87,7 +87,7 @@ mkdir -p /tmp/wave2-zproof-tmp
 TMPDIR=/tmp/wave2-zproof-tmp
 export TMPDIR
 
-# The disk. A pass writes about 1.7 GB for the raw arm and 0.7 GB more for the forced one (the sidecars), and removes
+# The disk. A pass writes about 1.7 GB for the raw arm and 0.7 GB more for the forced one (the form files), and removes
 # it when it ends; the fault record adds a recording of some hundred megabytes beside it; a link of the suite's
 # binary is a third of a gigabyte. Eight free gigabytes is the least to start with, because the failure at the
 # allowance is the linker's, not a write's, and `df` still shows free space when it comes.
@@ -124,7 +124,7 @@ cargo test --profile checked --lib -- \
     engines::tests::the_zpages_arm_differs_from_nocache_in_the_option_alone \
     engines::tests::the_nodrop_arm_differs_from_the_zpages_arm_in_the_drop_alone \
     run::tests::a_forced_form_that_is_not_in_use_is_refused \
-    run::tests::a_forced_form_with_a_sidecar_out_of_service_or_reads_gone_raw_is_refused \
+    run::tests::a_forced_form_with_a_form file_out_of_service_or_reads_gone_raw_is_refused \
     run::tests::the_read_phase_asks_whether_a_forced_arm_read_through_its_form \
     run::tests::the_shuffled_load_asks_whether_a_forced_arm_covers_the_second_store \
     run::tests::the_pass_refuses_a_forced_arm_that_covers_nothing_and_runs_one_that_does \
@@ -137,7 +137,7 @@ cargo test --profile checked --lib -- \
 #    warmup pair, on one thread and on the class's two and three. Two sittings, THE ARMS SWAPPED in the second (the
 #    columns of the second are A = supdb-nocachezpages, B = supdb-nocache: read B/A there as A/B). `ab` swaps
 #    which arm goes first every other rep itself. The load is a pass of the pairing (`--passes load,...`): the
-#    forced arm's `sync` waits for every partition's sidecar, so its load carries the build and the pairing
+#    forced arm's `sync` waits for every partition's form file, so its load carries the build and the pairing
 #    prints what that costs. The arms also differ in what their `sync` joins: the forced arm's calls
 #    `Db::zpages_settle`, which joins the segment work (the slot's fdatasync, the WAL's retirement, any
 #    promotion), where `supdb-nocache`'s flush returns before them. Z's read pass therefore starts on a quiet
@@ -147,7 +147,7 @@ cargo test --profile checked --lib -- \
 #    Time: 26 passes (13 pairs), each the ordered load of ten million keys (about 7 s raw and a build more for the
 #    forced arm, with the drain), the million reads of the single-thread pass (19 s at the banked 54k/s for the raw
 #    arm, 6 s at the predicted 180k/s for the forced one) and the two- and three-thread passes (2M and 3M reads),
-#    plus the second store the runner opens for the shuffled load (the sidecars are built for it too, one for each
+#    plus the second store the runner opens for the shuffled load (the form files are built for it too, one for each
 #    final partition), the store's open, its prime and its removal. Plan an hour a sitting, and read the `rep 0/12
 #    (warmup)` line `ab` prints on stderr when the first pair is done: its elapsed seconds are one pair, and
 #    thirteen times that is the sitting.
@@ -176,8 +176,8 @@ env $UNSET "$BIN" ab \
 
 # The pairing is read only if the form was used, and only the nocache column is zero (the gate in the
 # pre-registration's VERDICT). A pass refuses by itself a forced arm whose store is not whole after either load
-# (sidecars + small != partitions, a directory with a name or a count of `zpg-` files the sidecars do not account
-# for, a sidecar out of service) and one that read through the form for under 99% of its reads; those are errors in
+# (form files + small != partitions, a directory with a name or a count of `zpg-` files the form files do not account
+# for, a form file out of service) and one that read through the form for under 99% of its reads; those are errors in
 # the .err file, not lines to find here. In sitting 1 the forced arm is column B, in sitting 2 column A:
 #   count zpage_forced                 nocache 0   zpages 2          (both stores of a pass)
 #   count zpage_reads                  nocache 0   zpages 6000000    (1M by the writer's handle, 2M + 3M by the handles of
@@ -193,9 +193,9 @@ env $UNSET "$BIN" ab \
 #   count zpage_declined_block_backed / _oversize / _incompressible / _unplaceable   0 / 0
 #   count zpage_declined_small         0 / 0 to 4                     (the tail of a store, per store, 0-2)
 #   count zpage_partitions_at_end      the two stores' live partitions, summed
-#   count zpage_sidecars_at_end        == partitions - zpage_small_partitions_at_end  (P4's identity, corrected above)
-#   count zpage_builds, zpage_attached builds == attached >= sidecars_at_end (P4 above)
-#   count zpage_pages_at_end, zpage_file_bytes_at_end, zpage_group_bytes_at_end: the sidecars' size and what it
+#   count zpage_form files_at_end        == partitions - zpage_small_partitions_at_end  (P4's identity, corrected above)
+#   count zpage_builds, zpage_attached builds == attached >= form_files_at_end (P4 above)
+#   count zpage_pages_at_end, zpage_file_bytes_at_end, zpage_group_bytes_at_end: the form files' size and what it
 #                                      decodes to (the ratio is the pages' compression)
 grep -E '^count zpage_' "$Z/zproof-ab-1.out" "$Z/zproof-ab-2.out"
 
@@ -222,9 +222,9 @@ grep -E '^(read (reads_per_s|majfaults_per_op)|count zpage_(forced|reads|rawserv
 # 3b. The rows that must not move (7.6 item 4): the same pairing with every pass, one sitting, six pairs. Scans and the
 #    mixes' scans are raw by construction in this stage, so scan entries/s and ycsb-E are expected LEVEL with
 #    `supdb-nocache`'s; mixes A, B, C, D, F read points through the form. About three hours. The lag and burst cells
-#    merge, and a merge unlinks the sidecar of every input it retires on the segment-work thread (section 0): a
+#    merge, and a merge unlinks the form file of every input it retires on the segment-work thread (section 0): a
 #    cell that trails there is read with that named before it is the form's. `zpage_raw_scans` is the scans that
-#    began in a partition with a sidecar and no other.
+#    began in a partition with a form file and no other.
 # ---------------------------------------------------------------------------------------------------------------
 env $UNSET "$BIN" ab \
     --arms supdb-nocache,supdb-nocachezpages \
@@ -251,9 +251,9 @@ grep -E '^phasemark supdb-nocache(zpages)? read ' "$Z/zproof-faults.err"
 
 # The buckets, per window: the reading thread's faults by the file they landed in and by the code that took them.
 # For the nocache arm: the hash slot (`FlatIndex::with_lookup`) and the record (`parse_record`, `record_key`), both on
-# `.sup` files. For the forced arm the page of the sidecar is the only fault the read takes (the `.zpg` file); a fault on
+# `.sup` files. For the forced arm the page of the form file is the only fault the read takes (the `.zpg` file); a fault on
 # a `.sup` file in its read window is a raw touch (the stop rule). --files keeps the segments', the ordered indexes'
-# and the sidecars' faults and drops the heap's and the binary's.
+# and the form files' faults and drops the heap's and the binary's.
 python3 -I "$TOOLS/faultsites.py" --data "$Z/zproof-faults.data" --bin "$BIN" \
     --marks "$Z/zproof-faults.err" --arm supdb-nocache --reads 1000000 --perf "$PERF" \
     --files '\.(sup|oidx|zpg)$' > "$Z/zproof-faults-nocache.txt" && echo "bucketed: nocache"
@@ -265,16 +265,16 @@ cat "$Z/zproof-faults-nocache.txt" "$Z/zproof-faults-zpages.txt"
 
 # ---------------------------------------------------------------------------------------------------------------
 # 5. The page cache's folios (counting, not timing; design 2.6 step 7). The kernel sizes a folio by the write that
-#    makes it and the alignment of its offset, so the sidecar's write piece (`ZWRITE_PIECE`, 1 MiB, the segment's
+#    makes it and the alignment of its offset, so the form file's write piece (`ZWRITE_PIECE`, 1 MiB, the segment's
 #    own) is a number a pairing could price. Counted on a 400,000-key store with 8 MiB partitions by walking
 #    /proc/self/pagemap and /proc/kpageflags over a mapping of each file (a scratch probe, the engine's piece size read
 #    from the environment in the scratch copy only):
-#      piece 1 MiB   a 19,188 KiB sidecar is 18 folios of 1 MiB and a ladder in the tail (128, 32, 16, 8, 4 and 1 pages);
+#      piece 1 MiB   a 19,188 KiB form file is 18 folios of 1 MiB and a ladder in the tail (128, 32, 16, 8, 4 and 1 pages);
 #                    a 7,288 KiB one is 7 of 1 MiB and a ladder (16, 4, 2); the raw segments beside them are mostly
 #                    128 KiB folios
 #      piece 64 KiB  299 and 113 folios of 64 KiB, and a ladder of three or four
 #      piece 4 KiB   every page a folio of its own (4,797 and 1,822)
-#    and in all three, after the sidecar is evicted and 3,000 random pages are read through a MADV_RANDOM mapping, the
+#    and in all three, after the form file is evicted and 3,000 random pages are read through a MADV_RANDOM mapping, the
 #    pages that come back are folios of one page (2,205 of 2,213 and 1,128 of 1,140 at 1 MiB; the rest of two to six
 #    pages). So the composition changes during the read pass: reclaim works on 1 MiB units for as long as the built
 #    file stays cached and on pages after, and the verdict reads faults a read as a property of the form, with this
@@ -308,7 +308,7 @@ cat "$Z/zproof-faults-nocache.txt" "$Z/zproof-faults-zpages.txt"
 
 # ---------------------------------------------------------------------------------------------------------------
 # 8. The load's phases, for the mechanism and not for the verdict (7.6 item 3: "the sum of the phases last"). The forced
-#    arm's `sync` makes the sidecars, so its load is the commits plus a closing sync that carries every build. Both arms
+#    arm's `sync` makes the form files, so its load is the commits plus a closing sync that carries every build. Both arms
 #    get the instrument, which is what an option set from the environment is for; three pairs of the load pass alone.
 # ---------------------------------------------------------------------------------------------------------------
 env $UNSET SUPDB_LOAD_PHASES=1 "$BIN" ab \
@@ -320,7 +320,7 @@ grep -E '^loadphases' "$Z/zproof-loadphases.err"          # the commits' time, t
 
 # The build's drop of the raw records priced by taking it away: the forced arm against the same arm with
 # `Options::zpages_drop_behind` off (`supdb-nocachezpagesnodrop`, a test asserts the two differ in that option alone).
-# Both build the same sidecars, so the load's closing sync is the quantity, and the bytes the page cache holds after
+# Both build the same form files, so the load's closing sync is the quantity, and the bytes the page cache holds after
 # it. Both arms carry the phases instrument; three pairs, one sitting, and a second sitting with the arms swapped
 # before it is read as more than a position effect.
 env $UNSET SUPDB_LOAD_PHASES=1 "$BIN" ab \
