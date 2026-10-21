@@ -490,3 +490,17 @@ raw records asked for ahead of the walk in megabytes (`MADV_WILLNEED`,
 as the warm already does by chunk), so that one wait fetches a megabyte
 and not 128 KB, and the build's wall is the device's bandwidth share
 and not its round trips.
+
+That window is an option and an arm now: `Options::zpages_build_ahead`,
+the bytes of raw records a build asks for ahead of its walk
+(`MADV_WILLNEED`, a window at a time, the next asked once the walk is
+within half a window of the last), zero as shipped until priced, the
+bytes asked counted (`ZCounts::build_ahead_bytes`, the row
+`zpage_build_ahead_bytes`); `supdb-nocacheautozpagesahead` is the
+controller's bounded arm with four mebibytes, and `auto-ooc-ahead-5m.sh`
+is its pairing against the controller's arm, five million keys under
+512 MiB, three pairs a process, both orders, stamped. A unit test holds
+the ask to the kernel (a cold copy of a segment resident within a moment
+once asked, a second copy left cold), the integration test holds the
+count to the record section asked once, whole, and each has the mutant
+that fails it alone.
