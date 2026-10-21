@@ -1738,6 +1738,42 @@ fn the_forms_threads_take_the_io_class_the_option_names_and_the_build_records_it
 }
 
 #[test]
+fn the_build_asks_the_records_ahead_when_told_to_and_counts_what_it_asked() {
+    // `Options::zpages_build_ahead` is the window of raw records a build
+    // asks the kernel for ahead of its walk; the bytes asked are counted,
+    // and a window of zero asks for nothing. The whole record section is
+    // asked for exactly once, in windows clamped to its end.
+    assert_eq!(
+        Options::default().zpages_build_ahead,
+        0,
+        "nothing is asked ahead unless told"
+    );
+    for ahead in [0usize, 256 << 10] {
+        let dir = scratch(&format!("ahead-{ahead}"));
+        let mut db = Db::create(&dir, forced(|o| o.zpages_build_ahead = ahead)).unwrap();
+        let _model = ordered_load(&mut db, 8000, 0xD22);
+        let seg = partition_file(&dir);
+        let r = regions_of(&seg);
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert_eq!(c.form_files, 1);
+        assert!(c.build_starts >= 1, "a build ran");
+        if ahead == 0 {
+            assert_eq!(
+                c.build_ahead_bytes, 0,
+                "nothing asked with the window at zero"
+            );
+        } else {
+            assert_eq!(
+                c.build_ahead_bytes, r.rec.1 as u64,
+                "the whole record section asked for once ({} bytes of records)",
+                r.rec.1
+            );
+        }
+    }
+}
+
+#[test]
 fn the_build_drops_the_raw_records_it_passed_when_asked_to_and_not_otherwise() {
     // The build reads a partition's records once, through a mapping of its
     // own, to copy them into pages; a store that does not fit wants them out

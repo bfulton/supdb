@@ -786,6 +786,11 @@ pub struct Supdb {
     /// `supdb-nocacheautozpagesfairio`, the pair against
     /// `supdb-nocacheautozpages` under a bound.
     zpages_fairio: bool,
+    /// The controller's bounded arm with its builds asking four mebibytes
+    /// of the raw records ahead of their walks
+    /// (`Options::zpages_build_ahead`): `supdb-nocacheautozpagesahead`,
+    /// the pair against `supdb-nocacheautozpages` under a bound.
+    zpages_ahead: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -1200,6 +1205,11 @@ struct Policy {
     /// `supdb-nocacheautozpagesfairio`, the pair against
     /// `supdb-nocacheautozpages` under a bound.
     zpages_fairio: bool,
+    /// The controller's bounded arm with its builds asking four mebibytes
+    /// of the raw records ahead of their walks
+    /// (`Options::zpages_build_ahead`): `supdb-nocacheautozpagesahead`,
+    /// the pair against `supdb-nocacheautozpages` under a bound.
+    zpages_ahead: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -1303,6 +1313,7 @@ impl Default for Policy {
             zpages_settle: false,
             zpages_auto: false,
             zpages_fairio: false,
+            zpages_ahead: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -3737,6 +3748,25 @@ impl Supdb {
         )
     }
 
+    /// `supdb-nocacheautozpages` with its builds asking four mebibytes of
+    /// the raw records ahead of their walks (`Options::zpages_build_ahead`):
+    /// the pair against `supdb-nocacheautozpages` differs by that one
+    /// option and prices, under a bound, a build whose waits fetch a
+    /// window each against one whose waits fetch the device's readahead.
+    /// Chosen by hand, as `ab --arms
+    /// supdb-nocacheautozpages,supdb-nocacheautozpagesahead --bound ...`.
+    pub fn create_nocache_auto_zpages_ahead(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                block_cache: false,
+                zpages_auto: true,
+                zpages_ahead: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with the block cache bounded at 256 MB, the budget
     /// `rocksdb-tuned` runs its block cache on, so that comparison is on
     /// the same memory. Below the bound the two arms are one.
@@ -3860,6 +3890,7 @@ impl Supdb {
             zpages_settle,
             zpages_auto,
             zpages_fairio,
+            zpages_ahead,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -4095,6 +4126,11 @@ impl Supdb {
             } else {
                 supdb::Options::default().zpages_io_idle
             },
+            zpages_build_ahead: if zpages_ahead {
+                4 << 20
+            } else {
+                supdb::Options::default().zpages_build_ahead
+            },
             zpages_seek_ord: if zpages_heads {
                 true
             } else {
@@ -4266,6 +4302,7 @@ impl Supdb {
             zpages_settle,
             zpages_auto,
             zpages_fairio,
+            zpages_ahead,
             ord_threads: Default::default(),
         })
     }
@@ -4868,6 +4905,8 @@ impl Engine for Supdb {
                 "supdb-autozpages"
             } else if self.zpages_fairio {
                 "supdb-nocacheautozpagesfairio"
+            } else if self.zpages_ahead {
+                "supdb-nocacheautozpagesahead"
             } else {
                 "supdb-nocacheautozpages"
             };
@@ -5106,6 +5145,7 @@ impl Engine for Supdb {
             ("zpage_build_starts", z.build_starts as f64),
             ("zpage_build_cancelled", z.build_cancelled as f64),
             ("zpage_build_io_class", z.build_io_class as f64),
+            ("zpage_build_ahead_bytes", z.build_ahead_bytes as f64),
             ("zpage_build_nopage", z.build_nopage as f64),
             ("zpage_warms", z.warms as f64),
             ("zpage_warm_bytes", z.warm_bytes as f64),
@@ -5781,6 +5821,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-autozpages"
         | "supdb-nocacheautozpages"
         | "supdb-nocacheautozpagesfairio"
+        | "supdb-nocacheautozpagesahead"
         | "supdb-cache256"
         | "supdb-l0"
         | "supdb-nopin"
@@ -5969,6 +6010,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-autozpages" => Box::new(Supdb::create_auto_zpages(dir)?),
         "supdb-nocacheautozpages" => Box::new(Supdb::create_nocache_auto_zpages(dir)?),
         "supdb-nocacheautozpagesfairio" => Box::new(Supdb::create_nocache_auto_zpages_fairio(dir)?),
+        "supdb-nocacheautozpagesahead" => Box::new(Supdb::create_nocache_auto_zpages_ahead(dir)?),
         "supdb-cache256" => Box::new(Supdb::create_cache256(dir)?),
         "supdb-ingest" => Box::new(Supdb::create_ingest(dir)?),
         "supdb-ingestleave" => Box::new(Supdb::create_ingest_leave(dir)?),
@@ -6730,7 +6772,26 @@ mod tests {
         let b = base.db.as_ref().unwrap().options();
         let a = arm.db.as_ref().unwrap().options();
         assert!(b.zpages_io_idle && !a.zpages_io_idle, "the one option");
+        assert_eq!(a.zpages_build_ahead, b.zpages_build_ahead);
         assert_eq!(a.zpages, b.zpages);
+        // And the arm that asks ahead: the same base, its one option the
+        // window, the engine's own default none.
+        assert_eq!(supdb::Options::default().zpages_build_ahead, 0);
+        let ahead = new("ahead", Supdb::create_nocache_auto_zpages_ahead);
+        assert_eq!(ahead.name(), "supdb-nocacheautozpagesahead");
+        assert_eq!(guarantee(ahead.name()), guarantee(base.name()));
+        assert!(ahead.zpages_auto && ahead.zpages_ahead && !ahead.zpages_fairio);
+        assert_eq!(ahead.block_cache, base.block_cache);
+        assert_eq!(ahead.features(), base.features());
+        let h = ahead.db.as_ref().unwrap().options();
+        assert_eq!(
+            (h.zpages_build_ahead, b.zpages_build_ahead),
+            (4 << 20, 0),
+            "the one option"
+        );
+        assert_eq!(h.zpages_io_idle, b.zpages_io_idle);
+        assert_eq!(h.zpages, b.zpages);
+        drop(ahead);
         assert_eq!(
             (
                 a.zpages_warm,

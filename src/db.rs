@@ -452,6 +452,9 @@ pub struct ZCounts {
     /// on the thread after it chose: 3 idle (`Options::zpages_io_idle`), 2
     /// best effort, 0 none, which is best effort at the thread's nice.
     pub build_io_class: u64,
+    /// The raw record bytes the builds asked for ahead of their walks
+    /// (`Options::zpages_build_ahead`).
+    pub build_ahead_bytes: u64,
     /// Records the builds held no page for.
     pub build_nopage: u64,
     /// Warms of form files (`Options::zpages_warm`): how many, the bytes
@@ -892,6 +895,16 @@ pub struct Options {
     /// arm with it off.
     #[doc(hidden)]
     pub zpages_io_idle: bool,
+    /// The bytes of a partition's raw records a build asks the kernel for
+    /// ahead of its walk, a window at a time (`MADV_WILLNEED`); zero asks
+    /// for nothing, and the walk's page faults fetch the device's
+    /// readahead, 128 KB here, one window a wait. Under a bound the walk's
+    /// waits queue behind the readers' faults, and a build of a gigabyte
+    /// ran at 5-15 MB/s whatever its I/O class. The bytes asked are
+    /// counted (`ZCounts::build_ahead_bytes`). `supdb-nocacheautozpagesahead`
+    /// is the arm with four mebibytes.
+    #[doc(hidden)]
+    pub zpages_build_ahead: usize,
     /// A test's seam for what the controller reads from the platform
     /// (`zfile::ZInject`): the budget, the refault rate and the clock,
     /// per store.
@@ -2329,6 +2342,7 @@ impl Default for Options {
             zpages_scan_prefetch: false,
             zpages_walk_cursor: true,
             zpages_io_idle: true,
+            zpages_build_ahead: 0,
             zpages_inject: None,
             forms_pieces_only: false,
             publish_in_background: true,
@@ -15401,6 +15415,7 @@ impl Reader {
             declined_damage: get(&ev.declined_damage),
             build_starts: get(&ev.build_starts),
             build_io_class: get(&ev.build_io_class),
+            build_ahead_bytes: get(&ev.build_ahead_bytes),
             build_cancelled: get(&ev.build_cancelled),
             build_nopage: get(&ev.build_nopage),
             warms: get(&ev.warms),
@@ -25405,13 +25420,12 @@ impl Db {
         let made = if self.shared.fail_zbuild.swap(false, AtomicOrdering::AcqRel) {
             Err(err("the form file's build was made to fail"))
         } else {
-            zfile::build(
-                &self.dir.join(&seg.name),
-                &out,
-                id,
-                end,
-                &zfile::BuildPlan::new(self.opts.zpages_min_bytes, self.opts.zpages_drop_behind),
-            )
+            zfile::build(&self.dir.join(&seg.name), &out, id, end, &{
+                let mut plan =
+                    zfile::BuildPlan::new(self.opts.zpages_min_bytes, self.opts.zpages_drop_behind);
+                plan.ahead = self.opts.zpages_build_ahead;
+                plan
+            })
         };
         let failed = |why: u8| {
             zfile::ZEvents::add(&ev.build_failed, 1);
@@ -32403,6 +32417,7 @@ impl Maint {
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut plan =
             zfile::BuildPlan::new(self.opts.zpages_min_bytes, self.opts.zpages_drop_behind);
+        plan.ahead = self.opts.zpages_build_ahead;
         plan.cancel = Some(cancel.clone());
         plan.hold = Some(shared.zbuild_hold.clone());
         let fail = shared.fail_zbuild.swap(false, AtomicOrdering::AcqRel);

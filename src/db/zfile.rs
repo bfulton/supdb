@@ -2022,6 +2022,8 @@ pub(super) struct ZEvents {
     /// The I/O class the kernel reported for the last build thread
     /// (`ZCounts::build_io_class`).
     pub build_io_class: AtomicU64,
+    /// The raw record bytes the builds asked for ahead of their walks.
+    pub build_ahead_bytes: AtomicU64,
     /// Records the builds held no page for, each an entry of the fence
     /// read from the raw form.
     pub build_nopage: AtomicU64,
@@ -2150,6 +2152,7 @@ impl ZEvents {
         ZEvents::add(&self.build_group_bytes, b.total_ulen);
         ZEvents::add(&self.build_calls, b.fill.calls);
         ZEvents::add(&self.build_nopage, b.fill.nopages);
+        ZEvents::add(&self.build_ahead_bytes, b.asked);
     }
 
     /// A warm, counted.
@@ -2233,6 +2236,8 @@ pub(super) struct Built {
     pub file_bytes: u64,
     /// The decoded bytes of every group.
     pub total_ulen: u64,
+    /// The raw record bytes asked for ahead of the walk (`BuildPlan::ahead`).
+    pub asked: u64,
 }
 
 /// What a warm of a form file did (`warm_file`).
@@ -2393,6 +2398,27 @@ fn drop_behind(base: usize, file: &File, from: usize, to: usize) {
 #[cfg(not(target_os = "linux"))]
 fn drop_behind(_base: usize, _file: &File, _from: usize, _to: usize) {}
 
+/// Ask the kernel for `[from, to)` of the mapping at `base` ahead of a walk
+/// (`MADV_WILLNEED`): the reads are issued at once and the walk's faults
+/// then find the pages in flight or resident, so one wait of the walk's
+/// fetches the window and not the device's readahead. The start is taken
+/// down to its page; the call is advice and its failure is nobody's.
+#[cfg(target_os = "linux")]
+fn ask_ahead(base: usize, from: usize, to: usize) {
+    let a = from & !(ZPAGE - 1);
+    if a >= to {
+        return;
+    }
+    // SAFETY: a read-only shared mapping of a file, advised over a range
+    // inside it; the kernel reads pages in and changes nothing else.
+    unsafe {
+        libc::madvise((base + a) as *mut libc::c_void, to - a, libc::MADV_WILLNEED);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ask_ahead(_base: usize, _from: usize, _to: usize) {}
+
 /// What a build is asked, and the two sizes it works in. The floor and
 /// whether the raw bytes are dropped are the store's options; the piece and
 /// the window are the build's own constants, a plan's fields so that a test
@@ -2410,6 +2436,10 @@ pub(super) struct BuildPlan {
     pub piece: usize,
     /// The bytes of the raw record region passed between drops.
     pub window: usize,
+    /// The bytes of the raw records asked for ahead of the walk, a window
+    /// at a time (`Options::zpages_build_ahead`); zero asks for nothing,
+    /// and the walk's page faults fetch the device's readahead and no more.
+    pub ahead: usize,
     /// A build on a thread of its own looks here once a page: set, the
     /// build stops, removes its temp file and answers `Outcome::Cancelled`.
     /// A merge that takes the build's target as an input sets it.
@@ -2427,6 +2457,7 @@ impl BuildPlan {
             drop_behind,
             piece: ZWRITE_PIECE,
             window: ZDROP_WINDOW,
+            ahead: 0,
             cancel: None,
             hold: None,
         }
@@ -2630,9 +2661,25 @@ fn write_pages(
             drop_behind(base, file, from, to);
         }
     };
+    // The raw bytes ahead of the walk, asked for a window at a time: the
+    // next window is asked for once the walk is within half a window of
+    // the end of what was asked, so between half a window and a whole one
+    // is in flight ahead of it.
+    let (mut asked, mut asked_bytes) = (0usize, 0u64);
     while rank < nkeys {
         if plan.cancelled() {
             return Ok(Outcome::Cancelled);
+        }
+        if plan.ahead > 0 && asked < recs.len() {
+            let at = rd_u32(dir, rank * 4)
+                .map_or(recs.len(), |o| o as usize)
+                .min(recs.len());
+            if at + plan.ahead / 2 >= asked {
+                let to = asked.saturating_add(plan.ahead).min(recs.len());
+                ask_ahead(base, recs_at + asked, recs_at + to);
+                asked_bytes += (to - asked) as u64;
+                asked = to;
+            }
         }
         let mut page = [0u8; ZPAGE];
         match fill_group(&images, rank, hint, bind, &mut scratch, &mut page) {
@@ -2743,6 +2790,7 @@ fn write_pages(
         fill: scratch.stats,
         file_bytes,
         total_ulen,
+        asked: asked_bytes,
     }))
 }
 
@@ -4559,6 +4607,48 @@ mod tests {
         // SAFETY: a hint on an open descriptor.
         let rc = unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
         assert_eq!(rc, 0, "fadvise");
+    }
+
+    /// The ask ahead of a build's walk asks the kernel, not a note: a
+    /// copy of a segment evicted from the page cache, asked for whole
+    /// through a mapping of its own, is resident within a moment, and one
+    /// not asked for stays cold.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_ask_ahead_brings_the_cold_pages_in() {
+        let fx = Fixture::new("ahead", suite(3000, 9), 1 << 20);
+        let page = crate::bytes::os_page_size();
+        let cold = |name: &str| {
+            let p = fx.dir.join(name);
+            std::fs::copy(&fx.seg, &p).unwrap();
+            evict(&p);
+            let m = MmapBytes::open(&p).unwrap();
+            let all = m.0.len().div_ceil(page);
+            let res = m.resident_pages(0, m.0.len());
+            assert!(
+                res < all / 4,
+                "{name}: {res} of {all} resident after the eviction"
+            );
+            (m, all)
+        };
+        let (asked, all) = cold("seg-asked");
+        ask_ahead(asked.0.as_ptr() as usize, 0, asked.0.len());
+        let (left, _) = cold("seg-left");
+        let t = std::time::Instant::now();
+        let mut res = asked.resident_pages(0, asked.0.len());
+        while res * 4 < all * 3 && t.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            res = asked.resident_pages(0, asked.0.len());
+        }
+        assert!(
+            res * 4 >= all * 3,
+            "{res} of {all} pages resident after the ask"
+        );
+        let untouched = left.resident_pages(0, left.0.len());
+        assert!(
+            untouched < all / 4,
+            "{untouched} of {all} resident with nothing asked"
+        );
     }
 
     /// A form file evicted from the page cache and warmed: every page
