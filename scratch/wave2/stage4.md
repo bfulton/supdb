@@ -817,7 +817,21 @@ anon-rss:653140kB`). The tuned shape configures a 256 MB block cache and
 four write buffers of 128 MB, 768 MB before the harness's own, which no
 bound under a gibibyte holds; it is paired at the suite's own bounded
 rung instead, ten million keys under a gibibyte, two pairs a sitting and
-one sitting a run (`ooc-cmp-rocks-10m.sh`).
+one sitting a run (`ooc-cmp-rocks-10m.sh`). Both sittings
+(`ooc-cmp-rocks10m-ab-{1,2}.*`, two pairs after the warmup, the arms
+swapped) agree: the form reads 3.0-3.5x RocksDB's point reads on one
+thread, 6.8-7.0x on two and 8.9-9.2x on three, scans 10-13x, loads
+1.17-1.28x ordered, and takes every mix -- A 2.2-2.6x, B 4.3-4.5x, C
+6.0-6.5x, D 4.6-6.1x, E 9.9-10.5x, F 2.6-2.8x; the shuffled load read
+1.16x for the form in one order and 1.17x for RocksDB in the other, a
+position effect, level. The device rows say the margin: RocksDB's tuned
+shape spends 768 MB of the gibibyte on its own buffers and block cache,
+and what the page cache has left does not hold its files, so it reads
+3-4.5 KB from the device a point read (0.7-1.1 refaults) and 16 KB a scan
+(about four), while the form's 720 MB of files fit beside the harness
+and fault 0.07 a read on one thread and nothing on three. The form in
+cache against RocksDB out of it, which is the configuration a user
+deploys at this bound.
 
 What E is made of, and what would win it. E is 95% scans of fifty from
 a Zipfian key and 5% inserts above the store's greatest key, and its
