@@ -4897,6 +4897,120 @@ fn an_eager_auto_store_buys_the_form_before_any_read() {
     }
 }
 
+/// The model's populations of a store: the hash regions and the record
+/// regions of its partition files, each summed from the file's own header,
+/// and the key sections whole.
+#[cfg(target_os = "linux")]
+fn populations_of(dir: &Path) -> (u64, u64, u64) {
+    let (mut hash, mut records, mut sections) = (0u64, 0u64, 0u64);
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        let n = p.file_name().unwrap().to_string_lossy().into_owned();
+        if !(n.starts_with("par-") && n.ends_with(".sup")) {
+            continue;
+        }
+        let r = regions_of(&p);
+        hash += r.hash.1 as u64;
+        records += r.rec.1 as u64;
+        let blob = Blob::open(MmapBytes::open(&p).unwrap()).unwrap();
+        sections += blob.index_bytes() as u64;
+    }
+    (hash, records, sections)
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn the_models_populations_are_the_hash_region_and_the_record_region() {
+    // A raw point read probes one page of the hash region and lands on one
+    // page of the record region, and the model takes each as a population
+    // read uniformly (`zselect::model_raw`). The record region lies inside
+    // the key section for a record whose value is inline -- every record of
+    // the suite's shape -- so a hash population the size of the section
+    // counts the records twice: a store of five million keys under 640 MiB
+    // was predicted 1.25 faults a read where the census measured 0.27, and
+    // the controller, buying on the prediction, cancelled the build on the
+    // measurement within a second.
+    let dir = scratch("model-populations");
+    let inject = std::sync::Arc::new(supdb::ZInject::new());
+    inject.set_budget(1 << 40);
+    inject.set_refault_rate(0.0);
+    inject.advance(std::time::Duration::from_millis(1));
+    let mut db = Db::create(
+        &dir,
+        Options {
+            zpages: ZPages::Auto,
+            zpages_min_bytes: 0,
+            zpages_inject: Some(inject.clone()),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let _model = ordered_load(&mut db, 20_000, 0x5AA);
+    db.settle().unwrap();
+    inject.advance(std::time::Duration::from_secs(1));
+    wait_tick(&db);
+    let c = db.zpage_counts();
+    let (hash, records, sections) = populations_of(&dir);
+    assert!(c.partitions >= 1 && hash > 0 && records > 0, "{c:?}");
+    assert_eq!(
+        (c.model_hash_bytes, c.model_record_bytes),
+        (hash, records),
+        "the hash regions and the record regions: {c:?}"
+    );
+    // The section holds the records and more, and the hash region is a
+    // fraction of it: eight bytes a slot against a hundred and more a record.
+    assert!(
+        sections > hash + records && hash < records / 4,
+        "hash {hash} records {records} sections {sections}"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_store_whose_hash_and_records_fit_the_budget_is_fits() {
+    // The two populations fit a budget an eighth over their sum, so the
+    // model's rate is zero and the store stays FITS through the ticks; a
+    // budget of half their sum is SUSPECT within the ticks the rule asks.
+    // With the section as the hash population the store would be over the
+    // first budget by the records' size again and read SUSPECT where it
+    // fits.
+    let dir = scratch("model-fits");
+    let inject = std::sync::Arc::new(supdb::ZInject::new());
+    inject.set_budget(1 << 40);
+    inject.set_refault_rate(0.0);
+    inject.advance(std::time::Duration::from_millis(1));
+    let mut db = Db::create(
+        &dir,
+        Options {
+            zpages: ZPages::Auto,
+            zpages_min_bytes: 0,
+            zpages_inject: Some(inject.clone()),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let _model = ordered_load(&mut db, 20_000, 0x5AB);
+    db.settle().unwrap();
+    let (hash, records, _) = populations_of(&dir);
+    inject.set_budget((hash + records) * 9 / 8);
+    for _ in 0..6 {
+        inject.advance(std::time::Duration::from_secs(1));
+        wait_tick(&db);
+        let c = db.zpage_counts();
+        assert_eq!(c.phase, 0, "a store whose populations fit is FITS: {c:?}");
+    }
+    inject.set_budget((hash + records) / 2);
+    assert!(
+        tick_until(&db, 40, |c| c.phase >= 1),
+        "a store whose populations do not fit is SUSPECT: {:?}",
+        db.zpage_counts()
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn an_auto_store_that_fits_builds_nothing() {
     let files_of = |dir: &Path| -> Vec<String> {
@@ -5171,7 +5285,15 @@ const FAULT_1MS: std::time::Duration = std::time::Duration::from_millis(1);
 /// evidence -- and the pressure term true, as a store's own refaults make
 /// it out of core -- in SUSPECT after two hot ticks.
 fn blocked_store(name: &str) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>) {
-    let out = auto_store(name, 1 << 20, 1_000_000.0, FAULT_1MS);
+    blocked_store_at(name, 1 << 20)
+}
+
+/// `blocked_store` under a budget of the caller's choosing, bytes.
+fn blocked_store_at(
+    name: &str,
+    budget: u64,
+) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>) {
+    let out = auto_store(name, budget, 1_000_000.0, FAULT_1MS);
     let c = out.1.zpage_counts();
     assert_eq!((c.phase, c.gate), (1, 1), "SUSPECT: {c:?}");
     out
@@ -5291,7 +5413,24 @@ fn compact_store(
     Vec<Vec<u8>>,
     usize,
 ) {
-    let (dir, db, model, inject) = blocked_store(name);
+    compact_store_at(name, 1 << 20)
+}
+
+/// `compact_store` under a budget of the caller's choosing, bytes.
+#[allow(clippy::type_complexity)]
+fn compact_store_at(
+    name: &str,
+    budget: u64,
+) -> (
+    PathBuf,
+    Db,
+    Model,
+    std::sync::Arc<supdb::ZInject>,
+    Reader,
+    Vec<Vec<u8>>,
+    usize,
+) {
+    let (dir, db, model, inject) = blocked_store_at(name, budget);
     let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
     let r = db.reader().unwrap();
     let mut at = 0usize;
@@ -5381,7 +5520,18 @@ fn auto_serves_raw_until_the_form_file_is_whole() {
 /// gives the disk back.
 #[test]
 fn auto_returns_to_raw_when_the_limit_is_lifted_and_gives_the_disk_back() {
-    let (dir, db, _model, inject, r, _keys, _) = compact_store("auto-lifted");
+    // E1 trusts the model's word that the store fits only where the model
+    // did not under-predict the raw form at the install: the positive part
+    // of its error is added to the smoothed rate (`note_raw`), and the
+    // seam's thresholds are a thousandth of a fault. The seam injects one
+    // fault a read whatever the budget, so the budget is set where the
+    // model predicts more than one for the two populations: 512 KiB, with
+    // the hash region (256 KiB) and the records (2.4 MB) both mostly cold.
+    // At a mebibyte the model predicts 0.69 and would be held to its error
+    // for the form's life; it predicted 1.2 while the hash population was
+    // the whole key section, records included, which is what this test
+    // passed under.
+    let (dir, db, _model, inject, r, _keys, _) = compact_store_at("auto-lifted", 1 << 19);
     inject.set_budget(1 << 40);
     inject.set_refault_rate(0.0);
     wait_secs(&db, 100, 1);

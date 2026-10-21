@@ -1949,6 +1949,13 @@ impl FlatIndex {
         ))
     }
 
+    /// The hash region's bytes: the slots a point read probes one page of,
+    /// the first of the two populations the raw form's fault model takes
+    /// (`db::Seg::foot`).
+    pub fn hash_bytes(&self) -> usize {
+        self.hash.1.saturating_sub(self.hash.0)
+    }
+
     /// Where the records at `rank` and `n` ranks on lie by the directory:
     /// the first's offset and the last's, for a hint of what a walk
     /// between them streams. Records ascend with rank in a segment; where

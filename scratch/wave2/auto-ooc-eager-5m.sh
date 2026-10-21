@@ -1,10 +1,12 @@
 #!/bin/sh
-# The eager entry priced under a bound (the controller's arm against the same arm buying the form at SUSPECT on the model's prediction, without the rent), at five million keys under 512 MiB, half the ten-million run's I/O a rep, since the container restarted inside three bounded runs at ten million and the floors and the harness do not fit the 256 MiB floor at three million (the cgroup killed that run in its first two minutes): the controller's arm against
-# the same arm with the form's threads at the readers' I/O class
-# (`supdb-nocacheautozpagesfairio`), at ten million keys under a gibibyte,
-# three pairs after the warmup, the reads divided by ten, two sittings with
-# the arms swapped; the harness's phase marks on for both and every stderr
-# line stamped, so each sitting's trace reads against its passes. Three pairs
+# The eager entry priced under a bound: the controller's arm against the
+# same arm buying the form at SUSPECT on the model's prediction, without
+# the rent (`supdb-nocacheautozpageseager`), at five million keys under
+# 640 MiB -- not 512, under which the cgroup killed the harness itself at
+# 516 MB of anonymous memory in a shuffled load's drain -- three pairs
+# after the warmup, the reads divided by ten, two sittings with the arms
+# swapped; the harness's phase marks on for both and every stderr line
+# stamped, so each sitting's trace reads against its passes. Three pairs
 # and not six: the container restarted twice inside bounded pairings past
 # fifty minutes of saturated I/O and never inside a shorter run, and a run
 # that dies writes no table, so a sitting is kept under half an hour and a
@@ -24,7 +26,7 @@ A=supdb-nocacheautozpages; B=supdb-nocacheautozpageseager
 for sitting in 1 2; do
   if [ "$sitting" = 1 ]; then arms=$A,$B; else arms=$B,$A; fi
   echo "##### sitting $sitting: $arms, start $(date -u +%T)"
-  env $UNSET SUPDB_ZPAGES_TRACE=1 SUPDB_LAG_MARK=1 "$BIN" ab --arms "$arms" --size 5000000 --bound 536870912 --ops-div 10 --reps 3 \
+  env $UNSET SUPDB_ZPAGES_TRACE=1 SUPDB_LAG_MARK=1 "$BIN" ab --arms "$arms" --size 5000000 --bound 671088640 --ops-div 10 --reps 3 \
     --passes load,read,read-threaded,scan,scan-threaded,mixes --pairs 'scan' \
     2>&1 >"$Z/auto-ooc-eager5m-ab-$sitting.out" | while IFS= read -r line; do printf '%s %s\n' "$(cut -d' ' -f1 /proc/uptime)" "$line"; done > "$Z/auto-ooc-eager5m-ab-$sitting.err"
   if grep -q ' quantities: ' "$Z/auto-ooc-eager5m-ab-$sitting.out"; then echo "sitting $sitting: the table is whole"; else echo "sitting $sitting: NOT whole"; fi

@@ -2099,6 +2099,10 @@ pub(super) struct ZEvents {
     /// handles touched, summed, and the raw bound in bytes.
     pub footprint_pages: AtomicU64,
     pub footprint_bytes: AtomicU64,
+    /// The model's two populations as the tick last summed them over the
+    /// partitions, bytes: the hash regions and the record regions.
+    pub model_hash: AtomicU64,
+    pub model_records: AtomicU64,
     /// Form files the controller retired: taken out of their cells through
     /// the epoch and given dead names for the idle sweep.
     pub retired: AtomicU64,

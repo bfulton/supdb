@@ -600,7 +600,54 @@ build was cancelled at 18-20 s by a merge landing after the load -- the
 settle of two seconds since the last change of partitions passed while
 the load's trailing merges were still in flight -- and the dwell a
 cancelled build costs put the next purchase at 105-135 s, later than
-the rent's. The settle is not enough: the segment work knows when a
-merge, a promotion or a seal is in flight, and the eager entry has to
-be told (`Input::rewriting`), the settle counting from the rewrite's
-end. That is the next change, then the pairing again at 640 MiB.
+the rent's. That reading was wrong, and the next paragraph has what the trace
+says.
+
+The cancels were the vanish rule's, not a merge's. Both of the first
+sitting's cancelled builds ended in `BuildCancelled`, the event of
+`Cancel::Vanished` (the measured saving under `theta_enter / 2` in every
+class with evidence for `VANISH_INTERVALS` evidence intervals, three
+census intervals of a hundred milliseconds), two and five seconds into
+the threaded read pass, and a merge's supersession is not that event.
+The trace carried no census, so it was extended: every interval of a
+build prints the census windows, the group's refaults, the evidence's
+saving by class, the vanish run, the thresholds, the model's two
+populations, the generation and the segment work in flight
+(`auto-ooc-eager-diag.sh`, the same two arms at five million keys under
+640 MiB, the passes cut to the load and the two read passes, four
+pairs). Every eager rep bought the form at the sampler's reading and
+cancelled it within 0.3-1.2 s, with nothing in flight and the generation
+unchanged, on evidence like this: the reads' window 14,316 operations
+and 3,810 faults, 0.27 a read, against the model's `phi_z` of 0.215, a
+saving of 0.05; and the model's `phi_raw` for the same reads was 1.246.
+Solving `model_raw` back from 1.246 at the tick's budget of 501.6 MB and
+records of 620.1 MB gives a hash population of 716 MB, bigger than the
+records, and `Seg::foot` was handing the model the index section as the
+hash population: the record region lies inside the key section for a
+record whose value is inline, every record of the suite's shape, so the
+records were counted twice and the raw form predicted to miss twice
+where it misses once; with the hash region alone (67 MB, eight bytes a
+slot) the model answers 0.30 for the reads that measured 0.27. The fix is
+`foot` returning the hash region and the record region, the counts
+carrying both (`ZCounts::model_hash_bytes`, `model_record_bytes`), a
+test holding them to the files' headers and a store whose populations
+fit its budget to FITS (both fail with the section as the population),
+and the trace printing them. Consequences: every bounded row of the
+controller so far ran under a `phi_raw` about four times the truth --
+SUSPECT entered at once, the predicted-saving clause always passed, the
+model's error (`note_raw`) a fault a read, and E2's raw footprint bound
+overstated by the same factor -- so the 7.4 verdict against the forced
+arm stands as a measurement of that controller and is to be taken again
+with the model right. The segment-work signal (`Input::rewriting`) is
+still a sound guard for an eager buy, a build a landing would supersede,
+and is the change after this one; it is not what the sittings needed.
+What they say now: at 640 MiB the eager entry buys on a prediction
+(0.30 raw against 0.215 compact, the pressure term on) and the vanish
+rule cancels on the measurement (0.27 against 0.215, 0.05 a read, under
+half of `theta_enter`) within a second, and that is the controller
+reading a form that saves the point read little at this bound -- the
+form's pages are the raw records' size at the suite's incompressible
+values, 626 MB against 620, and its saving is the hash region's 67 MB
+and the second touch -- where the first sitting's threaded scans read
+2.3x under it. Whether the eager entry is worth shipping is a question
+for the scan class and for the pairing with the model right.

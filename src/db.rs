@@ -543,6 +543,11 @@ pub struct ZCounts {
     /// handles touched, summed, and the raw bound in bytes.
     pub footprint_pages: u64,
     pub footprint_bytes: u64,
+    /// The model's two populations as the tick last summed them over the
+    /// partitions, bytes: the hash regions and the record regions
+    /// (`zselect::model_raw`).
+    pub model_hash_bytes: u64,
+    pub model_record_bytes: u64,
     /// Form files the controller retired.
     pub retired: u64,
     /// Partitions live, the ones with a form file installed, the ones of
@@ -6194,18 +6199,22 @@ impl PieceWriter {
 }
 
 impl Seg {
-    /// The footprint a raw point read of this partition touches, bytes
-    /// (`zselect::model_raw`): the index section, which every read probes,
-    /// and the record region, which every read lands in. Read through the
-    /// form file's door, since it is a fact of the file and not a touch of
-    /// its records; a reader that does not hold the section whole has no
-    /// record region to speak of.
+    /// The two populations a raw point read of this partition touches one
+    /// page of each, bytes (`zselect::model_raw`): the hash region, which
+    /// every read probes, and the record region, which every read lands in.
+    /// Not the index section: the record region lies inside it for a record
+    /// whose value is inline, so a section-sized hash population counts the
+    /// records twice, and did, for as long as the controller shipped
+    /// (`tests/zpages.rs`, the model's populations). Read through the form
+    /// file's door, since it is a fact of the file and not a touch of its
+    /// records; a reader that does not hold the section whole has neither
+    /// region to speak of.
     fn foot(&self) -> (u64, u64) {
         let raw = self.blob.for_zfile();
         let records = raw
             .record_regions()
             .map_or(0, |(recs, _)| recs.len() as u64);
-        (self.blob.index_bytes() as u64, records)
+        (raw.hash_region_bytes() as u64, records)
     }
 
     /// The raw form, for a read of the records on purpose (`SegBlob`):
@@ -15491,6 +15500,8 @@ impl Reader {
             sel_c_build_ns: get(&ev.sel_c_build_ns),
             footprint_pages: get(&ev.footprint_pages),
             footprint_bytes: get(&ev.footprint_bytes),
+            model_hash_bytes: get(&ev.model_hash),
+            model_record_bytes: get(&ev.model_records),
             retired: get(&ev.retired),
             ..ZCounts::default()
         };
@@ -31789,7 +31800,7 @@ impl Maint {
             footprint,
         };
         let d = self.zsel.step(&input);
-        self.z_apply(&d, model.as_ref());
+        self.z_apply(&d, model.as_ref(), &input);
         self.z_drive(&d);
     }
 
@@ -32246,6 +32257,14 @@ impl Maint {
                     (h.saturating_add(sh), r.saturating_add(sr))
                 })
         };
+        self.shared
+            .z
+            .model_hash
+            .store(hash, AtomicOrdering::Relaxed);
+        self.shared
+            .z
+            .model_records
+            .store(records, AtomicOrdering::Relaxed);
         let (phi_z, phi_z_scan) = match self.z_sample_size {
             Some((w_z, resident, pages_per_key)) => {
                 let z = zselect::model_z(budget, resident, w_z);
@@ -32264,7 +32283,12 @@ impl Maint {
 
     /// A decision published: the gate word last, the phase and the counts
     /// beside it, and a trace line where asked.
-    fn z_apply(&mut self, d: &zselect::Decision, model: Option<&zselect::Model>) {
+    fn z_apply(
+        &mut self,
+        d: &zselect::Decision,
+        model: Option<&zselect::Model>,
+        input: &zselect::Input,
+    ) {
         self.z_census_on = d.census;
         let ev = &self.shared.z;
         self.shared.zgate.store(d.gate);
@@ -32306,9 +32330,21 @@ impl Maint {
             .store(ns(Some(self.zsel.excess())), AtomicOrdering::Relaxed);
         ev.sel_c_build_ns
             .store(ns(Some(self.zsel.c_build())), AtomicOrdering::Relaxed);
-        if self.z_trace && (model.is_some() || d.event.is_some()) {
+        // Once a second, at an event, and at every interval with operations
+        // while a build runs, since the vanish rule reads those.
+        let ops = input
+            .census
+            .reads
+            .ops
+            .saturating_add(input.census.scans.ops);
+        if self.z_trace
+            && (model.is_some()
+                || d.event.is_some()
+                || (d.phase == zselect::Phase::Building && ops > 0))
+        {
+            let (saving, vanished) = self.zsel.evidence_state();
             eprintln!(
-                "zselect {:?} gate {} census {} build {} sample {} event {:?} model {:?} e2 {:?} costs {:?}",
+                "zselect {:?} gate {} census {} build {} sample {} event {:?} model {:?} e2 {:?} costs {:?} win r {}/{} s {}/{} refaults {:?} saving {:?} vanished {} theta {:.4}/{:.4} foot {}/{} gen {:x} inflight {}{}{}",
                 d.phase,
                 d.gate,
                 d.census,
@@ -32317,7 +32353,22 @@ impl Maint {
                 d.event,
                 model,
                 self.zsel.e2_state(),
-                m
+                m,
+                input.census.reads.ops,
+                input.census.reads.faults,
+                input.census.scans.ops,
+                input.census.scans.faults,
+                input.census.refaults,
+                saving,
+                vanished,
+                self.zsel.theta_enter(zselect::Class::Read),
+                self.zsel.theta_sus(zselect::Class::Read),
+                ev.model_hash.load(AtomicOrdering::Relaxed),
+                ev.model_records.load(AtomicOrdering::Relaxed),
+                input.generation,
+                u8::from(self.compacting.is_some()),
+                u8::from(self.tiering.is_some()),
+                self.sealing.len(),
             );
         }
     }
