@@ -777,3 +777,65 @@ store loaded past its budget and never read, stands -- where the rent
 now pays within ten seconds of it; the arm stays and the default stays
 the rent. The gear shift is the build's wall now: twenty seconds of rent
 and thirty to fifty of build, and the second is the lever left.
+
+## Against the comparators out of core
+
+Every bounded pairing above paired supdb's arms with each other; the one
+comparator table out of core (`docs/engine.md`, ten million keys under a
+gibibyte) priced the raw form against LMDB with its readahead off:
+point reads 0.68x, scans 0.37x and 0.76x on one and three threads, the
+mixes C, D and E 0.45x, 0.48x and 0.35x, the loads and the write-heavy
+mixes won. `ooc-cmp-5m.sh` pairs the form against the comparators at
+five million keys under 640 MiB, three pairs after the warmup in both
+orders.
+
+The forced form against that LMDB (`ooc-cmp-lmdbforced-ab-{1,2}.*`):
+point reads 1.7-2.4x on one to three threads, scans 2.2-3.1x, the
+ordered load 1.2-1.4x and the shuffled 11x, the mixes A, B, C, D and F
+1.1-4.4x, and E 0.55x and 0.56x. LMDB takes 0.10-0.15 faults a point
+read and 0.33-0.56 a scan at this bound; the form takes none, since its
+360 MB of files fit the budget and LMDB's 670 MB file does not, so this
+rung measures the form in cache against a B-tree partly out of it, the
+regime the form is for and not the one where neither fits. E's loss is
+CPU, not faults: the form faults nothing there and reads at 12.5 µs an
+operation against LMDB's 7.
+
+The controller against the same LMDB (`ooc-cmp-lmdbauto-ab-{1,2}.*`):
+it buys at 23-32 s and installs at 56-71 s in every rep, so the read
+pass and the one- and two-thread scan passes run raw and read
+0.52-0.67x and 0.26-0.64x, the raw form's standing; the three-thread
+scans, under the form, 2.4-2.8x; the loads 1.4-1.7x and 13-15x; the
+mixes A, B, C, D and F 1.1-5.7x; E 0.54x and 0.56x. What ships pays the
+raw form's deficit for about a minute of reads after a load that
+outgrows the budget, and then wins every cell but E.
+
+RocksDB as tuned under 640 MiB: the cgroup killed the harness in both
+orders, at 653 MB of anonymous memory in RocksDB's load
+(`ooc-cmp-rocksforced-ab-{1,2}.err` end at the load's first seconds; the
+kernel's record: `Memory cgroup out of memory: Killed process (bench)
+anon-rss:653140kB`). The tuned shape configures a 256 MB block cache and
+four write buffers of 128 MB, 768 MB before the harness's own, which no
+bound under a gibibyte holds; it is paired at the suite's own bounded
+rung instead, ten million keys under a gibibyte, two pairs a sitting and
+one sitting a run (`ooc-cmp-rocks-10m.sh`).
+
+What E is made of, and what would win it. E is 95% scans of fifty from
+a Zipfian key and 5% inserts above the store's greatest key, and its
+scans start in the Zipfian head where the earlier mixes' updates sit
+unsealed, about sixteen memtable keys a window. In memory the quick row
+at three hundred thousand keys reads E at 560k operations a second with
+the block cache (1.45x LMDB's 387k) and 133k without it (0.34x): the
+block cache's per-block merged forms, the records with the unsealed
+keys folded in, are what win E, and the bounded arms run without them
+because the cache is anonymous memory under a bound. The compact form
+took the nocache arm's E from 0.35x of LMDB (raw, ten million under a
+gibibyte) to 0.55x by removing its faults; the rest is the nocache
+walk's CPU. The decomposition (`e-decomp-5m.sh`: the mixes' timer by
+kind and the form's events per mix, under the forced arm against LMDB)
+says where the twelve microseconds go -- the decode where the memo
+misses the head, the merge of the unsealed keys, or the walk -- and the
+arm to price after it is `supdb-cache256tofitautozpages`, the bounded
+block cache beside the controller's compact form (the edits are staged),
+paired against `supdb-nocacheautozpages` on the mixes: what the Zipfian
+head's short scans gain from the merged forms against what the point
+reads lose to the page cache the cache displaces.

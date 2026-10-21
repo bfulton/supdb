@@ -1,0 +1,7 @@
+7002.67 bench: bound 671088640 bytes in group /sys/fs/cgroup/memory/process_api/01a15f1b-c27d-77e0-a213-eef931631a8d/claude-code-bash/supdb-bench-10178
+7002.67 bench ab: rocksdb-tuned against supdb-nocachezpages at 5000000 keys, scans of 100, 3 pairs after a warmup, under a bound of 671088640 bytes, passes load,read,read-threaded,scan,scan-threaded,mixes, ops divided by 10
+7002.73 phasemark rocksdb-tuned load start 7002.736913630
+7010.90 phasemark rocksdb-tuned load sync 7010.899164185
+7010.90 phasemark rocksdb-tuned load end 7010.899710993
+7010.90 phasemark rocksdb-tuned read start 7010.899970050
+7021.01 phasemark rocksdb-tuned read end 7021.011213376

@@ -1,0 +1,29 @@
+7025.68 bench: bound 671088640 bytes in group /sys/fs/cgroup/memory/process_api/01a15f1b-c27d-77e0-a213-eef931631a8d/claude-code-bash/supdb-bench-10227
+7025.68 bench ab: supdb-nocachezpages against rocksdb-tuned at 5000000 keys, scans of 100, 3 pairs after a warmup, under a bound of 671088640 bytes, passes load,read,read-threaded,scan,scan-threaded,mixes, ops divided by 10
+7025.73 phasemark supdb-nocachezpages load start 7025.733873939
+7031.65 phasemark supdb-nocachezpages load sync 7031.654003469
+7032.72 phasemark supdb-nocachezpages load end 7032.726445362
+7032.73 phasemark supdb-nocachezpages read start 7032.727873112
+7035.79 phasemark supdb-nocachezpages read end 7035.795989954
+7041.52 phasemark supdb-nocachezpages scan start 7041.521017304
+7041.60 phasemark supdb-nocachezpages scan end 7041.604716566
+7056.45 phasemark supdb-nocachezpages ycsb-C start 7056.449434675
+7056.80 phasemark supdb-nocachezpages ycsb-C end 7056.802052136
+7056.80 phasemark supdb-nocachezpages ycsb-B start 7056.802267429
+7057.12 phasemark supdb-nocachezpages ycsb-B end 7057.126619851
+7057.13 phasemark supdb-nocachezpages ycsb-A start 7057.126861255
+7057.79 phasemark supdb-nocachezpages ycsb-A end 7057.790488130
+7057.79 phasemark supdb-nocachezpages ycsb-F start 7057.790844623
+7058.65 phasemark supdb-nocachezpages ycsb-F end 7058.657089314
+7058.66 phasemark supdb-nocachezpages ycsb-D start 7058.657304934
+7059.20 phasemark supdb-nocachezpages ycsb-D end 7059.207009866
+7059.21 phasemark supdb-nocachezpages ycsb-E start 7059.207285364
+7060.38 phasemark supdb-nocachezpages ycsb-E end 7060.387250231
+7061.05 phasemark supdb-nocachezpages load start 7061.055823198
+7072.47 phasemark supdb-nocachezpages load sync 7072.472433760
+7083.07 phasemark supdb-nocachezpages load end 7083.076294030
+7083.66 phasemark rocksdb-tuned load start 7083.663998118
+7092.25 phasemark rocksdb-tuned load sync 7092.257546026
+7092.26 phasemark rocksdb-tuned load end 7092.257949871
+7092.26 phasemark rocksdb-tuned read start 7092.258319667
+7105.43 phasemark rocksdb-tuned read end 7105.432990792
