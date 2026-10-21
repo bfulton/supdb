@@ -900,9 +900,11 @@ pub struct Options {
     /// for nothing, and the walk's page faults fetch the device's
     /// readahead, 128 KB here, one window a wait. Under a bound the walk's
     /// waits queue behind the readers' faults, and a build of a gigabyte
-    /// ran at 5-15 MB/s whatever its I/O class. The bytes asked are
-    /// counted (`ZCounts::build_ahead_bytes`). `supdb-nocacheautozpagesahead`
-    /// is the arm with four mebibytes.
+    /// ran at 5-15 MB/s whatever its I/O class; four mebibytes asked ahead
+    /// took its wall to a little over half. Four mebibytes as shipped; the
+    /// bytes asked are counted (`ZCounts::build_ahead_bytes`), and
+    /// `supdb-nocacheautozpagesnoahead` is the arm that asks nothing, the
+    /// shape the window was priced against.
     #[doc(hidden)]
     pub zpages_build_ahead: usize,
     /// A test's seam for what the controller reads from the platform
@@ -2342,7 +2344,7 @@ impl Default for Options {
             zpages_scan_prefetch: false,
             zpages_walk_cursor: true,
             zpages_io_idle: true,
-            zpages_build_ahead: 0,
+            zpages_build_ahead: 4 << 20,
             zpages_inject: None,
             forms_pieces_only: false,
             publish_in_background: true,
