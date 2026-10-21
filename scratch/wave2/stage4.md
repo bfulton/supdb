@@ -911,3 +911,28 @@ E question the shuffled load is not needed: `cache-e-noshuf-5m.sh` pairs
 the arms on the reads, the scans and the mixes alone under 640 MiB, and
 the block-cache arm's memory under a bound in a shuffled load is a
 standing item of its own.
+
+The pairing without the shuffled load (`cache-e5m-noshuf-ab-{1,2}.*`,
+three pairs, both orders) refutes the combined arm, and by mechanism:
+E reads 0.65x and 0.58x of the controller's under it, the other mixes
+0.19-0.58x, the point reads 0.73-0.93x and the scans 0.25-0.88x. The
+form serves the combined arm's point reads as it serves the
+controller's (`zpage_reads` 83,334 in C under both, the same decodes
+and memo hits) and none of its scans (`zpage_scans` 0 against
+1,801,236): the block cache's walks stay on the raw form, so its scans
+-- the scan passes and E's -- drag the raw records through the page
+cache and evict the compact form the point reads need, and the working
+set is the raw form and the compact one together. The faults say it:
+C takes 0.208 faults a read under the combined arm against 0.001, E
+0.363 against 0.003, the three-thread scans 0.76 a scan against 0.013.
+This is the rule the compact form was built under, that a second form
+may accompany the records only if the other paths never touch them,
+read from the other side: a cache whose walks touch the raw records
+cannot sit beside a form that keeps them out of the cache. What would
+win E is the block cache's merged forms built from the compact form's
+records instead of the raw ones, so that no path touches the raw form
+under the bound -- a design item for the walk, not an arm; the arm
+stays as the record of why. The levers left for E as the engine stands
+are the memo's size over the head (a quarter to a third of E's scan
+time is the decode of the groups the memo misses) and the merge of the
+unsealed head in the walk itself.
