@@ -527,6 +527,9 @@ pub struct ZCounts {
     pub sampled: u64,
     pub sample_declined: u64,
     pub sample_us: u64,
+    /// The sampler's estimate of the form's bytes over the partitions it
+    /// counted, at its last reading; `file_bytes` is what the build wrote.
+    pub sample_w_z_bytes: u64,
     pub sel_samples: u64,
     pub sel_builds: u64,
     pub sel_installs: u64,
@@ -15489,6 +15492,7 @@ impl Reader {
             sampled: get(&ev.sampled),
             sample_declined: get(&ev.sample_declined),
             sample_us: get(&ev.sample_us),
+            sample_w_z_bytes: get(&ev.sample_w_z),
             sel_samples: get(&ev.sel_samples),
             sel_builds: get(&ev.sel_builds),
             sel_installs: get(&ev.sel_installs),
@@ -32052,6 +32056,7 @@ impl Maint {
             t_z_scan: Some(zselect::PRIOR_T_HIT_SCAN + pages_per_scan * 1.25 * decode_per_page),
         };
         self.z_sample_size = (!declined).then_some((w_z, resident, pages_per_key));
+        ev.sample_w_z.store(w_z, AtomicOrdering::Relaxed);
         self.z_sample_ready = Some(zselect::Sampler {
             costs,
             c_build,

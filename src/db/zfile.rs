@@ -2084,6 +2084,9 @@ pub(super) struct ZEvents {
     pub sampled: AtomicU64,
     pub sample_declined: AtomicU64,
     pub sample_us: AtomicU64,
+    /// The sampler's estimate of the form's bytes over the partitions it
+    /// counted, at its last reading (`Sample::w_z` summed).
+    pub sample_w_z: AtomicU64,
     pub sel_samples: AtomicU64,
     pub sel_builds: AtomicU64,
     pub sel_installs: AtomicU64,
@@ -2959,11 +2962,13 @@ pub(super) struct Sample {
     /// The partition's keys and its record bytes.
     pub nkeys: u64,
     pub recs_len: u64,
-    /// Groups formed, and the records in them.
+    /// Groups counted -- the last of each rank's chain of [`SAMPLE_CHAIN`]
+    /// fills -- and the records in them.
     pub groups: u64,
     pub records: u64,
-    /// The pages the form is estimated to take, and the bytes of the form:
-    /// the pages, a fence entry a page and the filter.
+    /// The pages the form is estimated to take, the keys over the counted
+    /// groups' mean count, and the bytes of the form: the pages, a fence
+    /// entry a page and the filter.
     pub pages_est: u64,
     pub w_z: u64,
     /// The form's resident part, estimated: the fence entries and the
@@ -2983,8 +2988,18 @@ pub(super) struct Sample {
     pub declined: Option<Decline>,
 }
 
-/// Groups a sample forms.
+/// Ranks a sample fills from, evenly spaced.
 pub(super) const SAMPLE_GROUPS: usize = 32;
+/// Fills a sample chains from each rank, each hinted by the one before, the
+/// last counted: a fill with no predecessor builds a page well short of
+/// full (`fill_group`), the records' uncompressed count where a chained
+/// page holds what its group compresses to, and the build's pages are one
+/// chain from the partition's first record. Counting the unchained group
+/// estimated the form at 1.7x its file -- 626 MB for a file of 360 at five
+/// million keys of the suite's values -- and every rate the model drew
+/// from it. Three: the second fill grows by the slack the first's bytes
+/// leave and the third fits what the second compressed to.
+pub(super) const SAMPLE_CHAIN: usize = 3;
 
 /// `blob`'s sample, see [`Sample`]; `floor` is the record bytes under which
 /// the partition is declined (`Options::zpages_min_bytes`).
@@ -3026,39 +3041,54 @@ pub(super) fn sample(
     let mut last_nopage: Option<NoPage> = None;
     let mut key_bytes = 0u64;
     for i in 0..SAMPLE_GROUPS {
-        let rank = i * nkeys / SAMPLE_GROUPS;
+        let mut rank = i * nkeys / SAMPLE_GROUPS;
         if rank >= nkeys {
             break;
         }
-        let c0 = super::thread_cpu_ns();
-        match fill_group(&images, rank, 0, bind, &mut scratch, &mut page) {
-            Fill::Page(g) => {
-                let c1 = super::thread_cpu_ns();
-                s.fill_ns = s.fill_ns.saturating_add(c1.saturating_sub(c0));
-                let (h, payload) = parse_page(&page, bind).map_err(|e| {
-                    super::err(&format!("z sample: a page fails its own parse: {e}"))
-                })?;
-                let group = decode_group(&h, payload, &mut buf).map_err(|e| {
-                    super::err(&format!("z sample: a page fails its own decode: {e}"))
-                })?;
-                walk_group(group, g.count, None).map_err(|e| {
-                    super::err(&format!("z sample: a group fails its own walk: {e}"))
-                })?;
-                s.decode_ns = s
-                    .decode_ns
-                    .saturating_add(super::thread_cpu_ns().saturating_sub(c1));
-                s.groups += 1;
-                s.records += g.count as u64;
-                key_bytes += record_key(images.image(rank), 0).map_or(0, |k| k.len() as u64);
+        // The chain from this rank, each fill hinted by the one before and
+        // only the last counted and timed (`SAMPLE_CHAIN`); a chain cut
+        // short by the partition's end or a record no page holds counts
+        // nothing for this rank.
+        let mut hint = 0usize;
+        for step in 1..=SAMPLE_CHAIN {
+            let c0 = super::thread_cpu_ns();
+            match fill_group(&images, rank, hint, bind, &mut scratch, &mut page) {
+                Fill::Page(g) => {
+                    if step < SAMPLE_CHAIN {
+                        hint = g.count;
+                        rank += g.count;
+                        continue;
+                    }
+                    let c1 = super::thread_cpu_ns();
+                    s.fill_ns = s.fill_ns.saturating_add(c1.saturating_sub(c0));
+                    let (h, payload) = parse_page(&page, bind).map_err(|e| {
+                        super::err(&format!("z sample: a page fails its own parse: {e}"))
+                    })?;
+                    let group = decode_group(&h, payload, &mut buf).map_err(|e| {
+                        super::err(&format!("z sample: a page fails its own decode: {e}"))
+                    })?;
+                    walk_group(group, g.count, None).map_err(|e| {
+                        super::err(&format!("z sample: a group fails its own walk: {e}"))
+                    })?;
+                    s.decode_ns = s
+                        .decode_ns
+                        .saturating_add(super::thread_cpu_ns().saturating_sub(c1));
+                    s.groups += 1;
+                    s.records += g.count as u64;
+                    key_bytes += record_key(images.image(rank), 0).map_or(0, |k| k.len() as u64);
+                }
+                Fill::NoPage(np) => {
+                    s.fill_ns = s
+                        .fill_ns
+                        .saturating_add(super::thread_cpu_ns().saturating_sub(c0));
+                    last_nopage = Some(np);
+                    break;
+                }
+                Fill::End => break,
+                Fill::Mismatch => {
+                    return Err(super::err("z sample: a page fails its own decode"));
+                }
             }
-            Fill::NoPage(np) => {
-                s.fill_ns = s
-                    .fill_ns
-                    .saturating_add(super::thread_cpu_ns().saturating_sub(c0));
-                last_nopage = Some(np);
-            }
-            Fill::End => break,
-            Fill::Mismatch => return Err(super::err("z sample: a page fails its own decode")),
         }
     }
     s.faults = thread_major_faults().unwrap_or(0).saturating_sub(flt0);
@@ -3182,22 +3212,45 @@ mod tests {
         assert_eq!(i.fault_cost(), Some(Duration::from_micros(40)));
     }
 
-    /// A sample of a partition: thirty-two groups, every one timed, the
-    /// pages estimated from their records, the form's bytes under the
-    /// records', and the declines the builder makes made here first.
+    /// A sample of a partition: thirty-two ranks, at each a chain of fills
+    /// hinted by the one before with the last counted and timed, the pages
+    /// estimated from the counted groups' records within a tenth of the
+    /// pages the build writes and the form's bytes within a tenth of the
+    /// file's, and the declines the builder makes made here first. A fill
+    /// with no predecessor builds a page well short of full, and a sample
+    /// that counted one such group a rank estimated the records'
+    /// uncompressed count a page: 1.7x the file at five million keys, and
+    /// every rate the model drew from it.
     #[test]
-    fn a_sample_estimates_the_form_from_thirty_two_groups() {
-        let fx = Fixture::new("sample", suite(6000, 0x5A4), 1 << 16);
+    fn a_sample_estimates_the_form_within_a_tenth_of_the_build() {
+        let fx = Fixture::new("sample", suite(20_000, 0x5A4), 1 << 16);
         let s = sample(&fx.blob, ID, END, 0).unwrap();
         assert_eq!(s.declined, None, "{s:?}");
-        assert_eq!(s.nkeys, 6000);
+        assert_eq!(s.nkeys, 20_000);
         assert_eq!(s.groups, SAMPLE_GROUPS as u64, "{s:?}");
         assert!(s.records >= s.groups, "{s:?}");
         let mean = s.records as f64 / s.groups as f64;
-        assert_eq!(s.pages_est, (6000.0 / mean).ceil() as u64, "{s:?}");
+        assert_eq!(s.pages_est, (20_000.0 / mean).ceil() as u64, "{s:?}");
         assert!(s.w_z < s.recs_len, "the form under the records: {s:?}");
         assert_eq!(s.w_z, s.pages_est * ZPAGE as u64 + s.resident_est, "{s:?}");
         assert!(s.fill_ns > 0 && s.decode_ns > 0, "timed: {s:?}");
+        let Outcome::Built(b) = fx.build() else {
+            panic!("the fixture builds")
+        };
+        let pages = s.pages_est as f64 / b.fill.pages as f64;
+        assert!(
+            (pages - 1.0).abs() < 0.1,
+            "{} pages estimated, {} built: {s:?}",
+            s.pages_est,
+            b.fill.pages
+        );
+        let bytes = s.w_z as f64 / b.file_bytes as f64;
+        assert!(
+            (bytes - 1.0).abs() < 0.1,
+            "{} bytes estimated, the file {}: {s:?}",
+            s.w_z,
+            b.file_bytes
+        );
         // The builder's own declines, made first: the floor.
         let d = sample(&fx.blob, ID, END, usize::MAX).unwrap();
         assert!(matches!(d.declined, Some(Decline::Small(_))), "{d:?}");

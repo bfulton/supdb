@@ -5241,6 +5241,7 @@ impl Engine for Supdb {
             ("zpage_sampled", z.sampled as f64),
             ("zpage_sample_declined", z.sample_declined as f64),
             ("zpage_sample_us", z.sample_us as f64),
+            ("zpage_sample_w_z_bytes", z.sample_w_z_bytes as f64),
             ("zpage_sel_samples", z.sel_samples as f64),
             ("zpage_sel_builds", z.sel_builds as f64),
             ("zpage_sel_installs", z.sel_installs as f64),
