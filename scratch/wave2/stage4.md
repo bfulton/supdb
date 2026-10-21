@@ -504,3 +504,26 @@ the ask to the kernel (a cold copy of a segment resident within a moment
 once asked, a second copy left cold), the integration test holds the
 count to the record section asked once, whole, and each has the mutant
 that fails it alone.
+
+The window, priced (`auto-ooc-ahead5m-ab-{1,2}.out`, five million keys
+under 512 MiB, three pairs a process, both orders): it holds. The
+build's wall falls from 66-93 s to 29-60 s in every rep of both
+sittings (medians near 83 and 47), so the install lands 30-45 s
+earlier, at 88-112 s into a rep against 119-150; the bytes asked are
+the record section, whole, in every rep. What the earlier install buys
+depends on where it falls against the passes, which in the suite's
+shape is the boundary between the threaded scans and the mixes: in the
+first sitting the window's installs came before the mixes and the
+shipped shape's inside them, and the mixes read 1.6-5.0x (C 5.0x, D
+3.7x, B 2.7x, F 2.6x, A 2.0x, E 1.6x) with the three-thread scan 2.9x;
+in the second the shipped shape's installs met mixes that started a
+few seconds later, two reps of three, and the mixes read nearer level
+(D 1.45x and E 1.16x for the window, A 0.91x) with the three-thread
+scan 3.0x. The passes before any build, the load, the read pass and
+the single scan, read within five percent with the sign changing
+between the sittings, position; the threaded reads and the two-thread
+scan the same. Nothing is marked at three pairs, since the sign test
+cannot mark at three; the two orders agree on the wall, the install
+and every cell after it. Four mebibytes is the default now, the shape
+without a window the arm (`supdb-nocacheautozpagesnoahead`), under the
+gate before the controller is paired against the forced arm again.
