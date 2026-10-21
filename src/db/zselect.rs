@@ -83,7 +83,7 @@
 //! |---|---|---|
 //! | FITS | SUSPECT | `phi_raw >= theta_sus` or the pressure term, on [`FITS_TO_SUSPECT_TICKS`] consecutive S1 ticks |
 //! | SUSPECT | FITS | `phi_raw < theta_sus / 2` and no pressure, on [`SUSPECT_TO_FITS_TICKS`] consecutive ticks |
-//! | SUSPECT | building | all of (a) `excess >= C_build`, or, eager ([`ZSelect::set_eager`]) and no build cancelled nor COMPACT left yet, the partitions unchanged for [`EAGER_SETTLE`], in which case the measured half of (b) is waived too, the first build being bought on the prediction before any read has wasted its price; (b) the predicted saving `phi_raw - phi_z >= theta_enter`, unless the pressure term is on, and the measured saving `phi_meas - phi_z >= theta_enter` in some class; (c) `phi_raw >= theta_sus` or the pressure term; (d) a [`ZSelect::dwell`] since the last switch; (e) the sampler has a reading of the partitions as they are, has not declined them, and the wasted-build budget has not suspended building |
+//! | SUSPECT | building | all of (a) `excess >= C_build`, or, eager ([`ZSelect::set_eager`]) and no build cancelled nor COMPACT left yet, the partitions unchanged and the segment work idle ([`Input::rewriting`]) for [`EAGER_SETTLE`], in which case the measured half of (b) is waived too, the first build being bought on the prediction before any read has wasted its price; (b) the predicted saving `phi_raw - phi_z >= theta_enter`, unless the pressure term is on, and the measured saving `phi_meas - phi_z >= theta_enter` in some class; (c) `phi_raw >= theta_sus` or the pressure term; (d) a [`ZSelect::dwell`] since the last switch; (e) the sampler has a reading of the partitions as they are, has not declined them, and the wasted-build budget has not suspended building |
 //! | building | SUSPECT | the measured saving is under `theta_enter / 2` in every class with evidence, on [`VANISH_INTERVALS`] evidence intervals; or the budget trips; or the sampler declines the partitions. The build is cancelled and **counts as a switch** |
 //! | building | COMPACT | form files attached for at least [`COVERED_ENOUGH`] of the covered footprint |
 //! | COMPACT | SUSPECT | **E1** the maximum of the smoothed `phi_raw`, with the part of the model's error that is positive added, over a dwell is under `theta_sus / 2`, the pressure term is off throughout, and the scans have not been held against the model; **E3** the realized saving, the raw form's believed rate less `phi_meas_z`, stays under `saving*` for a dwell; **E2** the trial says the raw form fits |
@@ -230,11 +230,12 @@ pub const REFAULT_WINDOW: Duration = Duration::from_secs(5);
 /// The valid operations of one class an interval must hold before its rate
 /// says anything: below it a rate is a handful of faults and not a measure.
 pub const MIN_EVIDENCE_OPS: u64 = 64;
-/// How long the partitions must have stood still before an eager selector
+/// How long the partitions must have stood still, with nothing of the
+/// segment work in flight ([`Input::rewriting`]), before an eager selector
 /// ([`ZSelect::set_eager`]) buys the form on the model's prediction alone,
 /// without the rent: a store under rewrite -- a load's seals and merges --
-/// would have its build cancelled by the next merge, and a cancelled build
-/// is a switch that costs a dwell.
+/// would have its build superseded by the next landing, and a build given
+/// up is a switch that costs a dwell.
 pub const EAGER_SETTLE: Duration = Duration::from_secs(2);
 /// The group's refaults a second above which the pressure term is on: the
 /// group is refaulting, the store's own faults and other readers' alike, and
@@ -684,6 +685,14 @@ pub struct Input {
     /// have touched, from their bitmaps. The last reading is kept while the
     /// compact form stands, and goes with it: the bitmaps are of its pages.
     pub footprint: Option<u64>,
+    /// The segment work has a merge, a promotion or a seal in flight. The
+    /// generation moves at a landing and not at a start, so a store whose
+    /// load left merges running reads as settled two seconds after the last
+    /// landing while the next is still to come; an eager selector
+    /// ([`ZSelect::set_eager`]) counts the settle from the last step this
+    /// was set, since a build bought under a merge is one the landing
+    /// supersedes. The selector as shipped reads nothing of it.
+    pub rewriting: bool,
 }
 
 // ---- what comes back ----------------------------------------------------
@@ -1304,7 +1313,7 @@ impl ZSelect {
     /// that has its readings kept and its ticks counted at the period, so the
     /// ticks that FITS, SUSPECT and the smoothing count in are seconds.
     fn absorb(&mut self, input: &Input, now: Duration) -> bool {
-        if self.generation != input.generation {
+        if self.generation != input.generation || input.rewriting {
             self.gen_changed_at = now;
         }
         self.generation = input.generation;
@@ -2665,6 +2674,8 @@ mod tests {
         /// group's counter holds them beside the neighbours', whichever form
         /// serves.
         own_refaults: u64,
+        /// The segment work has something in flight ([`Input::rewriting`]).
+        rewriting: bool,
         log: Vec<Rec>,
         checker: Checker,
     }
@@ -2701,6 +2712,7 @@ mod tests {
                 refault_scale: 1.0,
                 sampler_t_f: PRIOR_T_F,
                 own_refaults: 0,
+                rewriting: false,
                 log: Vec::new(),
                 checker: Checker::default(),
             }
@@ -2881,6 +2893,7 @@ mod tests {
                 self.own_refaults = 0;
             }
             input.generation = self.generation;
+            input.rewriting = self.rewriting;
             if self.sampler_ready && (!self.sampler_once || self.last.sample) {
                 input.sampler = Some(self.sampler());
             }
@@ -3819,6 +3832,37 @@ mod tests {
             sim.sel.counts().builds,
             1,
             "bought once the partitions have stood"
+        );
+    }
+
+    /// The generation moves when a merge lands and not when it starts, so
+    /// the partitions read as settled with the next landing still to come;
+    /// the segment work says what it has in flight, and the settle counts
+    /// from the end of that.
+    #[test]
+    fn an_eager_selector_waits_out_the_segment_work_in_flight() {
+        let cell = Cell::ten_million();
+        let mut sim = Sim::new(cell.clone(), cell.uniform());
+        sim.sel.set_eager(true);
+        sim.rewriting = true;
+        sim.run(5.0);
+        assert_eq!(
+            sim.sel.counts().builds,
+            0,
+            "nothing is bought while the segment work runs"
+        );
+        sim.rewriting = false;
+        sim.run(EAGER_SETTLE.as_secs_f64() - 0.3);
+        assert_eq!(
+            sim.sel.counts().builds,
+            0,
+            "not before the settle from its end"
+        );
+        sim.run(1.0);
+        assert_eq!(
+            sim.sel.counts().builds,
+            1,
+            "bought once it has ended and the settle has passed"
         );
     }
 
@@ -5839,6 +5883,7 @@ mod tests {
                     },
                     footprint: (rng.below(3) == 0).then(|| rng.next() >> rng.below(40)),
                     generation: rng.below(3),
+                    rewriting: rng.below(4) == 0,
                 };
                 let d = sel.step(&input);
                 let r = Rec {

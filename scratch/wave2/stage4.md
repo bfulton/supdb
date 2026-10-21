@@ -651,3 +651,19 @@ values, 626 MB against 620, and its saving is the hash region's 67 MB
 and the second touch -- where the first sitting's threaded scans read
 2.3x under it. Whether the eager entry is worth shipping is a question
 for the scan class and for the pairing with the model right.
+
+The signal is in. `Input::rewriting` is set by the segment work at every
+tick a merge, a promotion or a seal is in flight (`compacting`,
+`tiering`, `sealing`), and the selector's `absorb` resets the eager
+settle's clock at every step it is set, so the settle counts from the
+rewrite's end and not from the last landing. The replay holds an eager
+selector to buying nothing for five seconds with the signal up and to
+buying once the settle has passed from its clearing; the store test
+holds a seal in flight (`hold_seal_landing`) and the eager store to
+buying nothing through eighty ticks, then buying once the seal has
+landed and the settle has passed; the mutants, the selector ignoring
+the signal and the segment work never raising it, each fail the test
+written for them. The selector as shipped reads nothing of it. Next:
+the eager pairing at 640 MiB with the model right
+(`auto-ooc-eager-5m.sh`), read for the scan class as much as the
+reads.
