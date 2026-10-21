@@ -2505,6 +2505,27 @@ quantity before its verdicts are read, since a controller that decides
 on a prediction four times the truth decides the right things late and
 the wrong things fast.
 
+**An estimate from the first call of a chain whose steady state is the
+third.** The sampler sized the form from thirty-two groups, each filled
+from a rank with no hint, and the filler's own doc says what such a fill
+makes: a page well short of full, the records' uncompressed count, where
+a page hinted by its predecessor holds what its group compresses to --
+"whoever sizes a partition from such calls has to chain a few first".
+Nobody did, and the estimate came out at 1.7x the file (626 MB for files
+of 360 at five million keys), exactly the uncompressed count a page; the
+model's compact rate read 0.22-0.28 a read for a form that fit its budget
+whole, where the forced arm measured 0.000-0.008, and every rate drawn
+from it -- the predicted saving, the measured saving the rent and the
+vanish rule take, the eager entry's verdict -- was off by that. Its test
+asserted the estimate's own arithmetic and that the form was under the
+records, which a 1.7x estimate still was. The sample chains three fills a
+rank now and counts the last, and the tests hold the estimate to the
+build's page count and the store's files within a tenth. The rule: a
+quantity whose doc says it needs a predecessor is sampled with one; and an
+estimate is held to the thing it estimates -- the build's pages, the
+file's bytes -- never to its own arithmetic, since the arithmetic was never
+the question.
+
 **A probe's total over a whole read is an inlining result.** The same engine
 read +0.9, +1.9, +2.9 and +3.15 instructions a point read across four probes
 and a count +3.00 exactly, because the code after a probe's loop changes what

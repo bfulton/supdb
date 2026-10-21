@@ -4945,6 +4945,29 @@ fn an_eager_auto_store_waits_for_the_segment_work_in_flight() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn the_samplers_estimate_of_the_form_is_within_a_tenth_of_its_files() {
+    // The compact-form rate the model predicts is drawn from the sampler's
+    // estimate of the form's bytes; held to the files the build then
+    // wrote. A sample whose fills were not chained estimated the records'
+    // uncompressed count a page, 1.7x the files at five million keys, and
+    // the model's compact rate read 0.22-0.28 a read for a form that fit
+    // its budget whole.
+    let (dir, db, _model, _inject, r, _keys, _) = compact_store("auto-estimate");
+    let c = db.zpage_counts();
+    assert!(c.sample_w_z_bytes > 0 && c.file_bytes > 0, "{c:?}");
+    let ratio = c.sample_w_z_bytes as f64 / c.file_bytes as f64;
+    assert!(
+        (ratio - 1.0).abs() < 0.1,
+        "{} bytes estimated for files of {}: {c:?}",
+        c.sample_w_z_bytes,
+        c.file_bytes
+    );
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The model's populations of a store: the hash regions and the record
 /// regions of its partition files, each summed from the file's own header,
 /// and the key sections whole.

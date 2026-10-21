@@ -701,5 +701,39 @@ window where it installed at 96-120 before. Beside it, the base
 controller with the model right: SUSPECT at the load's end as before
 (the pressure term), the buy by the rent at 44-58 s, the model's
 `phi_raw` 0.37 at the install against a measured 0.31-0.40 a read.
-Next: the design's 7.4 again at 640 MiB with the model right
-(`auto-ooc-forced-5m.sh`, writing `auto-ooc-forced5m640-ab-{1,2}.*`).
+The design's 7.4 at 640 MiB with the populations right
+(`auto-ooc-forced5m640-ab-{1,2}.*`, three pairs after the warmup, both
+orders) read the controller against the forced arm as before in shape --
+the controller's load 1.23x and 1.26x the forced arm's in the two
+sittings (the forced arm builds at every seal), SUSPECT at the load's end,
+the rent's buy at 43-56 s on the scan class's saving and the install at
+55-113 s in every rep, the mixes after it level -- and one cell said what
+the model was still getting wrong: the forced arm's point reads under its
+form took 0.0077 and 0.0000 faults a read in the two sittings, and its
+scans 0.000, against the raw form's 0.35-0.39 and 2.5-2.7, while the
+model's compact rate (`phi_z`) at the install read 0.24-0.28. The form
+fits the budget whole: the counts put the controller's nineteen form
+files at 360 MB (`zpage_file_bytes_at_end`, 85,766 pages over 620 MB of
+records) and the sampler's estimate at 626 MB (`zsample ... w_z`), 1.74x
+the files and the records' own size -- 150,000 pages of 33 records, the
+uncompressed count a page, where the build's pages hold 58. The sampler
+filled each of its thirty-two groups with no hint, and the filler's doc
+says what that makes ("a page well short of full ... whoever sizes a
+partition from such calls has to chain a few first"); its test asserted
+the estimate's arithmetic and that the form was under the records, which
+a 1.7x estimate still was. So every rate the model drew from `W_z` was
+off by that: `model_z` 0.22-0.28 where the form faulted nothing, the
+predicted saving 0.09 where the forced arm measured 0.3-0.4, the measured
+saving the rent and the vanish rule take (`phi_meas_raw - phi_z`) a
+quarter of the truth, and the eager entry's eight cancels above were the
+vanish rule reading a saving of 0.01-0.04 that was 0.3. The sample
+chains three fills a rank now and counts the last
+(`zfile::SAMPLE_CHAIN`); `ZCounts::sample_w_z_bytes` carries the
+estimate, the suite's row `zpage_sample_w_z_bytes` beside the files'
+bytes; the unit test holds the estimate to the build's pages and file
+within a tenth and the engine test to the store's files, and both fail
+with a chain of one. Both pairings are to be taken again with it, since
+every controller verdict so far -- the 7.4 verdicts at 512 and 640 MiB
+and the eager entry's -- was drawn on a compact rate three times the
+truth: the rent's accrual, the predicted-saving clause, the vanish rule
+and E3 all read `phi_z`.
