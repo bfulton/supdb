@@ -890,3 +890,24 @@ once -- and it is read against the passes with the process's anonymous
 memory sampled, unbounded, for both arms (`anon-probe-5m.sh`,
 `anon-probe-rss.txt` beside `anon-probe.err`), before the bound for
 the pairing is chosen.
+
+The probe, unbounded (`anon-probe-rss.txt`): both arms peak in the
+shuffled load, 321-379 MB for the combined arm and 332-339 for the
+controller's, and sit at 50-143 MB through the mixes, the combined arm
+40-80 MB above the controller's at every point. Under the bound
+(`anon-probe640-rss.txt`): the controller's shuffled load peaks at 333
+MB and the combined arm's first at 399, both surviving, and the kill
+comes in the combined arm's second rep's shuffled load, which climbs
+from 143 MB to 635 in eleven seconds -- the last three at a hundred
+megabytes a second -- while the page cache is squeezed from 486 MB to
+11. FROZEN_CAP is three tables of 32 MB, so the pile is not the
+memtables; what the block-cache arm holds that the controller's does
+not, under seals and merges slowed by a page cache reclaimed to nothing,
+is the write path's retention the census named once before (the forms'
+copies a publish carries and the snapshots over the frozen tables, held
+while the segment work's pins stand), and the owner is a census sampled
+through the load to name, which no instrument prints there yet. For the
+E question the shuffled load is not needed: `cache-e-noshuf-5m.sh` pairs
+the arms on the reads, the scans and the mixes alone under 640 MiB, and
+the block-cache arm's memory under a bound in a shuffled load is a
+standing item of its own.
