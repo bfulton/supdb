@@ -1745,8 +1745,8 @@ fn the_build_asks_the_records_ahead_when_told_to_and_counts_what_it_asked() {
     // asked for exactly once, in windows clamped to its end.
     assert_eq!(
         Options::default().zpages_build_ahead,
-        0,
-        "nothing is asked ahead unless told"
+        4 << 20,
+        "four mebibytes are asked ahead unless told otherwise"
     );
     for ahead in [0usize, 256 << 10] {
         let dir = scratch(&format!("ahead-{ahead}"));

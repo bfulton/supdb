@@ -273,10 +273,10 @@ partition cut by rank rather than carried through a cursor; and
 `supdb-nocacheautozpagesfairio` is `supdb-nocacheautozpages` with the
 form's threads at the readers' I/O class rather than the device's idle
 class, for a build under a bound that shares the device with the faults it
-is there to remove, and `supdb-nocacheautozpagesahead` the same with its
-builds asking four mebibytes of the raw records ahead of their walks, so
-that a wait of the walk's fetches a window and not the device's readahead.
-The forced arm's
+is there to remove, and `supdb-nocacheautozpagesnoahead` the same with its
+builds asking nothing of the raw records ahead of their walks, the shape
+before the window, whose every wait fetched the device's readahead and no
+more. The forced arm's
 `sync` builds the form files, so its load carries the build, and in memory
 it reads slower than the raw form: it is an arm for the bound, not a
 default.

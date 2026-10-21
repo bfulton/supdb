@@ -2459,6 +2459,25 @@ exercises" gave, for a mechanism with two modes: a test of the mechanism
 runs under every mode that reaches it, and the condition at the call
 site is the mechanism's own (the gate) and not the mode's name.
 
+**A build priced by its class and limited by its window.** Under a
+bound the controller's build of a store's form files took 136-196 s of
+wall for 8-22 s of CPU, and the note that first timed it blamed the idle
+I/O class the build ran at, behind the readers' faults that held the
+device at 99-100% busy. The class made an arm, and the arm read level
+in two sittings, the build's wall 80-93 s under either class. The
+diagnostic's sampler had the build thread at forty-odd major faults a
+second and the device's readahead is 128 KB: the build walked a mapping
+by rank, one readahead window a wait, each wait a device round trip
+behind the readers' queue, 5-15 MB/s whatever the request's class.
+Asking the raw records ahead of the walk in four-mebibyte windows
+(`Options::zpages_build_ahead`) took the wall to 29-60 s in every rep of
+both sittings and the install 30-45 s earlier, and the passes before any
+build did not move. The rule: a reader's rate under contention is the
+bytes a wait fetches times the waits a second, so a change to a wait's
+class or priority is priced after a count of the bytes it fetches; and a
+sequential walk through a mapping asks for what it is about to read,
+since the kernel's readahead is a window sized for nobody.
+
 **A probe's total over a whole read is an inlining result.** The same engine
 read +0.9, +1.9, +2.9 and +3.15 instructions a point read across four probes
 and a count +3.00 exactly, because the code after a probe's loop changes what
