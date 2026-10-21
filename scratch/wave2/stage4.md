@@ -737,3 +737,31 @@ every controller verdict so far -- the 7.4 verdicts at 512 and 640 MiB
 and the eager entry's -- was drawn on a compact rate three times the
 truth: the rent's accrual, the predicted-saving clause, the vanish rule
 and E3 all read `phi_z`.
+
+The design's 7.4 with both inputs right (`auto-ooc-forced5m640s-ab-{1,2}.*`,
+five million keys under 640 MiB, three pairs after the warmup, both
+orders). The sampler's estimate reads 360.00 MB for files of 360.06
+(`zsample ... w_z 360002128` against `zpage_file_bytes_at_end`
+360062976), and the build's CPU it prices 4.7 s where the unchained fills
+had said 12-14, so `c_build` is 7.1 s where it was 18-21. The controller
+enters SUSPECT at the load's end as before, and buys at 23-27 s in every
+rep -- inside the threaded read pass, on the point reads' own measured
+saving of 0.27-0.33 a read in six reps of eight, the model's compact rate
+now near zero for a form that fits, and on the scans' 0.38-1.16 in the
+two whose threaded reads were shorter -- where the sittings before read
+43-58 s on the scan class alone; the install lands at 57-72 s in eight
+reps of eight, the build's wall 30-45 s under the readers' I/O, where it
+landed at 55-116 before and 96-120 before the window. After the install
+the mixes read level with the forced arm's, 0.83-1.0x in the forced-first
+sitting and 0.89-1.17x in the other, every mix's faults a read under a
+hundredth in both arms; the read and scan passes read raw (0.35-0.38 and
+2.6-2.7 faults an operation against the forced arm's 0.006-0.008 and
+0.000), since they run before the buy; and the controller's loads read
+1.09x and 1.15x the forced arm's in one order and 1.03x and 1.21x in the
+other, the forced arm building at every seal. So the gear shift at this
+rung and bound is the rent's twenty-odd seconds and the build's
+thirty-odd, and the price of the controller against the forced form is
+the read and scan passes it serves raw before the install; what the
+forced arm pays for serving them compact is its loads. The eager entry's
+pairing is next, since with the compact rate right the vanish rule has
+nothing to cancel on.
