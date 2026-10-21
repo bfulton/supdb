@@ -561,3 +561,26 @@ case is a store that is loaded, outgrows the budget and is never read
 rental's case, measured here: a hundred seconds of raw reads. The
 load's cost is the cell to watch, since the forced arm pays 16-24% of
 its load for building at every seal.
+
+The eager entry is an option and an arm: `Options::zpages_build_eager`
+has the selector buy at SUSPECT once the sampler has priced the
+partitions and they have stood for `zselect::EAGER_SETTLE` (two
+seconds) since they last changed, the rent and the measured half of the
+saving clause waived; the settle is there because a store under rewrite
+-- a load's seals and merges -- would have its build cancelled by the
+next merge, and a cancelled build is a switch that costs a dwell. The
+eager entry is a one-shot, spent by any cancel or exit: the first
+purchase is the prediction's and every later one the rent's, since the
+grid of constant workloads looped under an eager entry that could buy
+again after every exit -- a form that does not pay was bought, left and
+bought again once a dwell, forever, where the rent asks the evidence
+each time. Off as shipped; `supdb-nocacheautozpageseager` is the controller's bounded arm
+with it on, `auto-ooc-eager-5m.sh` its pairing against the controller's
+arm. The replays hold the eager selector to buying where the rent still
+waits (eight seconds of the ten-million cell's uniform reads, the rent
+short of the price) and to waiting out a store whose partitions change
+at every step; the grid of constant workloads comes to rest under the
+eager entry as without it (it changes when the form is first bought and
+nothing after); the store test buys without a read under the seam where
+the shipped store does not; and the mutants, eager ignored and the
+settle ignored, each fail the test written for them.
