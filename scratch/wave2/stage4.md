@@ -667,3 +667,39 @@ written for them. The selector as shipped reads nothing of it. Next:
 the eager pairing at 640 MiB with the model right
 (`auto-ooc-eager-5m.sh`), read for the scan class as much as the
 reads.
+
+The pairing with the model right (`auto-ooc-eager5m640-ab-{1,2}.*`,
+five million keys under 640 MiB, three pairs after the warmup, both
+orders; `ab-events.py` in the scratchpad lists each rep's events from
+its load start): the eager arm bought at 11-12 s into every rep, six
+seconds after the load's end and at the sampler's reading, and the
+vanish rule cancelled every one of the eight builds 0.3-17 s later, in
+the threaded read pass or the scan pass after it, on the read class's
+evidence alone -- its measured saving 0.010-0.040 a read against
+`theta_enter / 2` of 0.02-0.11 -- since the read class is the one with
+evidence then and the rule asks every class that has any. The scan
+class, which the form is for, had no evidence yet: the base arm's rent
+bought in every rep at 44-58 s, inside the threaded scan pass, on the
+scan class's saving of 0.3-1.0 a scan, and installed at 56-116 s (eight
+of eight). The eager arm's one-shot was spent at the cancel, the
+cancel's dwell (`max(60 s, 10 x the build's wall)`) held the rent's buy
+to 72-81 s, and it installed at 86-94 s in four reps of eight and not at
+all in the other four. The cells read the position and the install's
+timing and nothing of the entry: the scans 0.9-1.2x either way, the
+mixes 0.77-1.74x in both directions across the two sittings, the loads
+level. So the eager entry as designed loses at this rung and bound,
+and the trace names the design's gap rather than the arm's: a build
+bought on a prediction for both classes is judged by the vanish rule on
+whichever class the pass order measures first, and at this suite's
+values the point read's saving is a fraction of the threshold while the
+scan's is ten times it. A vanish rule that judges a build on the class
+whose predicted saving bought it, or an entry that waits for evidence
+in that class, is the next design question; neither is built here,
+since the rent's entry, which waits for the scan class's own evidence,
+is the shape the rows know and it now installs at 56-116 s with the
+window where it installed at 96-120 before. Beside it, the base
+controller with the model right: SUSPECT at the load's end as before
+(the pressure term), the buy by the rent at 44-58 s, the model's
+`phi_raw` 0.37 at the install against a measured 0.31-0.40 a read.
+Next: the design's 7.4 again at 640 MiB with the model right
+(`auto-ooc-forced-5m.sh`, writing `auto-ooc-forced5m640-ab-{1,2}.*`).
