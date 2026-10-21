@@ -1,7 +1,8 @@
 #!/bin/sh
 # The block cache beside the compact form under a bound: the combined arm
-# (`supdb-cache256tofitautozpages`, the cache's merged forms over the hot
-# blocks kept to fit 256 MB, the compact form the controller's) against
+# (`supdb-cache64tofitautozpages`, the cache's merged forms over the hot
+# blocks kept to fit 64 MB, the compact form the controller's; at 256 MB
+# the cgroup killed the harness in the shuffled load, `cache-e5m256-ab-*`) against
 # the controller's arm without it, at five million keys under 640 MiB,
 # three pairs after the warmup, the reads divided by ten, both orders.
 # What E, A, B and F gain from the merged forms of the Zipfian head
@@ -17,7 +18,7 @@ cd /home/user/supdb/bench || exit 2
 git -C /home/user/supdb rev-parse --short HEAD > "$Z/cache-e5m-head.txt"
 date -u +%FT%TZ >> "$Z/cache-e5m-head.txt"
 UNSET="-u SUPDB_LAG_COUNTERS -u SUPDB_SCAN_OPS -u SUPDB_THREAD_SPANS -u SUPDB_LOAD_PHASES -u SUPDB_DRAIN_STEPS -u GLIBC_TUNABLES -u MALLOC_ARENA_MAX"
-A=supdb-nocacheautozpages; B=supdb-cache256tofitautozpages
+A=supdb-nocacheautozpages; B=supdb-cache64tofitautozpages
 for sitting in 1 2; do
   if [ "$sitting" = 1 ]; then arms=$A,$B; else arms=$B,$A; fi
   echo "##### cache-e sitting $sitting: $arms, start $(date -u +%T)"

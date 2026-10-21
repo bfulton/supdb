@@ -248,7 +248,7 @@ off (`lmdb-nordahead`), the LMDB a user configures for the regime. The
 scan floor's file is written and synced outside the group and dropped
 from the cache; the floors and every pass run inside it.
 
-Fifteen more arms exist for a bounded pairing and are in no roster, because
+Sixteen more arms exist for a bounded pairing and are in no roster, because
 each prices one engine option against the arm it differs from in one
 process (`bench ab --arms <base>,<arm>`) and is chosen by hand:
 `supdb-autozpages` and `supdb-nocacheautozpages` are `supdb` and
@@ -279,13 +279,16 @@ before the window, whose every wait fetched the device's readahead and no
 more, and `supdb-nocacheautozpageseager` the controller buying the form at
 SUSPECT on the model's prediction, once the sampler has priced it and the
 partitions have stood for the settle, instead of after the ski rental's
-wait; and `supdb-cache256tofitautozpages` is `supdb-cache256tofit` with the
-compact form the controller's to choose, the block cache's merged forms
-over the hot blocks kept to fit beside the compact form for the rest of
-the store, so that the pair against `supdb-nocacheautozpages` prices the
+wait; `supdb-cache64tofit` is `supdb-cache256tofit` with its bound at
+64 MB, and `supdb-cache64tofitautozpages` is that arm with the compact
+form the controller's to choose, the block cache's merged forms over the
+hot blocks kept to fit beside the compact form for the rest of the
+store, so that the pair against `supdb-nocacheautozpages` prices the
 cache under a bound: what the short scans of the Zipfian head gain from
 the merged forms against what the point reads lose to the page cache the
-cache displaces. The forced arm's
+cache displaces (a cache of 256 MB beside the form did not fit a 640 MiB
+bound at five million keys: the cgroup killed the harness in the shuffled
+load). The forced arm's
 `sync` builds the form files, so its load carries the build, and in memory
 it reads slower than the raw form: it is an arm for the bound, not a
 default.

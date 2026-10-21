@@ -872,3 +872,12 @@ the merge, which the block cache's merged forms fold in advance (the
 combined arm, `supdb-cache256tofitautozpages`, gated and built), and the
 memo's size over the head, a constant today (`ZMEMO_SLOTS`,
 `ZMEMO_BYTES`), which a larger memo would price on the decodes alone.
+
+The combined arm with a 256 MB cache did not fit the bound: both
+sittings at five million keys under 640 MiB were killed by the cgroup at
+650 MB of anonymous memory, in the shuffled load of the warmup rep
+(`cache-e5m256-ab-{1,2}.err`, the kernel's record `anon-rss:650784kB`
+and `650764kB`), the cache at its bound beside the shuffled load's
+memtable and the harness. The Zipfian head's hot blocks are a small set,
+so the arm is `supdb-cache64tofitautozpages` now, with `supdb-cache64tofit`
+as its base, and the pairing is taken again.

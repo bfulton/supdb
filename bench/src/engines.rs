@@ -2901,19 +2901,35 @@ impl Supdb {
         )
     }
 
-    /// `supdb-cache256tofit` with the second form the controller's to
-    /// choose: the block cache's merged forms over the hot blocks, kept to
-    /// fit 256 MB, beside the compact form for the rest of the store. The
-    /// pair against `supdb-nocacheautozpages` prices the cache under a
-    /// bound: what E, A, B and F gain from the merged forms of the Zipfian
-    /// head against what the point reads lose to the page cache the cache
-    /// displaces; against `supdb-cache256tofit`, what the compact form
-    /// adds to the cache arm out of core.
-    pub fn create_cache256_tofit_auto_zpages(path: &Path) -> Res<Supdb> {
+    /// `supdb-cache256tofit` with the cache's bound at 64 MB, the base of
+    /// the combined arm below: the Zipfian head's hot blocks are a small
+    /// set, and 256 MB of cache beside the compact form did not fit a
+    /// 640 MiB bound at five million keys (the cgroup killed the harness
+    /// at 650 MB of anonymous memory in the shuffled load).
+    pub fn create_cache64_tofit(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
-                budget: 256 << 20,
+                budget: 64 << 20,
+                tofit: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cache64tofit` with the second form the controller's to
+    /// choose: the block cache's merged forms over the hot blocks, kept to
+    /// fit 64 MB, beside the compact form for the rest of the store. The
+    /// pair against `supdb-nocacheautozpages` prices the cache under a
+    /// bound: what E, A, B and F gain from the merged forms of the Zipfian
+    /// head against what the point reads lose to the page cache the cache
+    /// displaces; against `supdb-cache64tofit`, what the compact form adds
+    /// to the cache arm out of core.
+    pub fn create_cache64_tofit_auto_zpages(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
                 tofit: true,
                 zpages_auto: true,
                 ..Policy::default()
@@ -4433,7 +4449,10 @@ impl Engine for Supdb {
         // Before the budget branch, which would name the policy the cache
         // arm whatever else it carries.
         if self.budget > 0 && self.tofit && self.zpages_auto {
-            return "supdb-cache256tofitautozpages";
+            return "supdb-cache64tofitautozpages";
+        }
+        if self.budget == 64 << 20 && self.tofit {
+            return "supdb-cache64tofit";
         }
         if self.budget > 0 {
             return if self.tofit && self.notrim {
@@ -5882,7 +5901,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocachezpagessettle"
         | "supdb-autozpages"
         | "supdb-nocacheautozpages"
-        | "supdb-cache256tofitautozpages"
+        | "supdb-cache64tofit"
+        | "supdb-cache64tofitautozpages"
         | "supdb-nocacheautozpagesfairio"
         | "supdb-nocacheautozpagesnoahead"
         | "supdb-nocacheautozpageseager"
@@ -6072,7 +6092,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nocachezpagesrankwalk" => Box::new(Supdb::create_nocache_zpages_rankwalk(dir)?),
         "supdb-nocachezpagessettle" => Box::new(Supdb::create_nocache_zpages_settle(dir)?),
         "supdb-autozpages" => Box::new(Supdb::create_auto_zpages(dir)?),
-        "supdb-cache256tofitautozpages" => Box::new(Supdb::create_cache256_tofit_auto_zpages(dir)?),
+        "supdb-cache64tofit" => Box::new(Supdb::create_cache64_tofit(dir)?),
+        "supdb-cache64tofitautozpages" => Box::new(Supdb::create_cache64_tofit_auto_zpages(dir)?),
         "supdb-nocacheautozpages" => Box::new(Supdb::create_nocache_auto_zpages(dir)?),
         "supdb-nocacheautozpagesfairio" => Box::new(Supdb::create_nocache_auto_zpages_fairio(dir)?),
         "supdb-nocacheautozpagesnoahead" => {
@@ -6922,10 +6943,10 @@ mod tests {
                 Supdb::create_nocache,
             ),
             (
-                "supdb-cache256tofitautozpages",
-                Supdb::create_cache256_tofit_auto_zpages,
-                "supdb-cache256tofit",
-                Supdb::create_cache256_tofit,
+                "supdb-cache64tofitautozpages",
+                Supdb::create_cache64_tofit_auto_zpages,
+                "supdb-cache64tofit",
+                Supdb::create_cache64_tofit,
             ),
         ] {
             let arm = new(name, make);
