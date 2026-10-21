@@ -880,4 +880,13 @@ sittings at five million keys under 640 MiB were killed by the cgroup at
 and `650764kB`), the cache at its bound beside the shuffled load's
 memtable and the harness. The Zipfian head's hot blocks are a small set,
 so the arm is `supdb-cache64tofitautozpages` now, with `supdb-cache64tofit`
-as its base, and the pairing is taken again.
+as its base. Taken again under 640 MiB it died in the same place at the
+same size, 651 MB in the shuffled load's first seconds in both orders
+(`cache-e5m64-640-ab-{1,2}.err`), so the growth is not the cache's bound
+but what the block-cache arm holds beside it in a shuffled load -- the
+suite's own figures had the `tofit` arm's process at 578 MB median at
+three million keys, and the nocache arm's drain at 516 MB under 512 MiB
+once -- and it is read against the passes with the process's anonymous
+memory sampled, unbounded, for both arms (`anon-probe-5m.sh`,
+`anon-probe-rss.txt` beside `anon-probe.err`), before the bound for
+the pairing is chosen.
