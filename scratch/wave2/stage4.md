@@ -584,3 +584,23 @@ eager entry as without it (it changes when the form is first bought and
 nothing after); the store test buys without a read under the seam where
 the shipped store does not; and the mutants, eager ignored and the
 settle ignored, each fail the test written for them.
+
+The eager entry's first sitting (`auto-ooc-eager5m-ab-1.out`, five
+million keys under 512 MiB, three pairs) and the two reps its second
+sitting wrote before the cgroup killed the process at 516 MB of
+anonymous memory, in the shuffled load's drain, with no build running
+(`auto-ooc-eager5m-ab-2.err`; the harness itself nears the bound there
+at this rung, and the next bounded pairings run under 640 MiB). The
+eager arm buys at 6-11 s into the rep, two seconds after the load's
+last change of partitions, and installs at 29-63 s in five reps of
+seven, against the shipped entry's 96-120: so the threaded scans read
+2.3x and 2.4x, the mixes level, the read pass 0.84x since the build now
+runs inside it, sharing the device. In the other two reps the eager
+build was cancelled at 18-20 s by a merge landing after the load -- the
+settle of two seconds since the last change of partitions passed while
+the load's trailing merges were still in flight -- and the dwell a
+cancelled build costs put the next purchase at 105-135 s, later than
+the rent's. The settle is not enough: the segment work knows when a
+merge, a promotion or a seal is in flight, and the eager entry has to
+be told (`Input::rewriting`), the settle counting from the rewrite's
+end. That is the next change, then the pairing again at 640 MiB.
