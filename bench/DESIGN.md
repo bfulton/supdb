@@ -248,7 +248,7 @@ off (`lmdb-nordahead`), the LMDB a user configures for the regime. The
 scan floor's file is written and synced outside the group and dropped
 from the cache; the floors and every pass run inside it.
 
-Eleven more arms exist for a bounded pairing and are in no roster, because
+Twelve more arms exist for a bounded pairing and are in no roster, because
 each prices one engine option against the arm it differs from in one
 process (`bench ab --arms <base>,<arm>`) and is chosen by hand:
 `supdb-autozpages` and `supdb-nocacheautozpages` are `supdb` and
@@ -269,7 +269,11 @@ build left to the settle of the form rather than started as its
 partition lands, the memo of decoded groups off, a scan's seeks by the
 ordered index's heads instead of the form file's fence, a scan's prefetch
 of the pages it will cross on, and the overlay walk of a covered
-partition cut by rank rather than carried through a cursor. The forced arm's
+partition cut by rank rather than carried through a cursor; and
+`supdb-nocacheautozpagesfairio` is `supdb-nocacheautozpages` with the
+form's threads at the readers' I/O class rather than the device's idle
+class, for a build under a bound that shares the device with the faults it
+is there to remove. The forced arm's
 `sync` builds the form files, so its load carries the build, and in memory
 it reads slower than the raw form: it is an arm for the bound, not a
 default.
