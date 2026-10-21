@@ -439,3 +439,31 @@ sitting's or the diagnostic's:
   I/O class, sharing the device instead of waiting for it; and the
   rental's price with the device term the sampler can see (t_f times
   the raw pages a build must read while the readers fault).
+
+The stamped second sitting was cut by a second container restart at
+fifty-seven minutes, five of its six pairs done and no table written
+(`auto-ooc-forced-ab-2.err` holds the five, stamped); the first restart
+had come fifty minutes into the previous bounded run, and no shorter run
+has died, so a bounded pairing is three pairs a process now
+(`auto-ooc-fairio.sh`), under half an hour, and a verdict that needs
+more pairs takes a second process. The five stamped reps answer the
+open question: in every one the controller's mixes ran in COMPACT at
+the forced arm's rates (C in 0.58-0.67 s against the forced arm's
+0.56-0.70, E in 2.4-3.6 against 2.7-3.6), so the cold mixes of the
+first sitting were that hour's host, which the quick row's floors had
+read out of band and which restarted twice since; and they repeat the
+shape rep for rep: the build starts at 72-117 s, after a read pass of
+24-36 s (the forced arm's 9-15) and the threaded reads, and installs at
+237-279 s, 150-180 s of wall a build.
+
+The first lever is an option and an arm: `Options::zpages_io_idle`,
+whether the form's threads (the build, the warm, the sampler) take the
+device at the idle I/O class, on as shipped; off, they read at the
+readers' class and share the device with their faults.
+`supdb-nocacheautozpagesfairio` is the controller's bounded arm with it
+off, and the pair against `supdb-nocacheautozpages` under the bound
+prices it. The build thread reads its class back from the kernel
+(`ioprio_get`) and counts it (`ZCounts::build_io_class`, the row
+`zpage_build_io_class`), so the test holds the option to what the
+kernel says and not to what the thread asked; the mutant that idles
+whatever the option says fails the test's off case.

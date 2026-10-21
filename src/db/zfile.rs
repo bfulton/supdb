@@ -2019,6 +2019,9 @@ pub(super) struct ZEvents {
     /// stopped: a merge took the target as an input, or the store closed.
     pub build_starts: AtomicU64,
     pub build_cancelled: AtomicU64,
+    /// The I/O class the kernel reported for the last build thread
+    /// (`ZCounts::build_io_class`).
+    pub build_io_class: AtomicU64,
     /// Records the builds held no page for, each an entry of the fence
     /// read from the raw form.
     pub build_nopage: AtomicU64,

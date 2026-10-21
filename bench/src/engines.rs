@@ -781,6 +781,11 @@ pub struct Supdb {
     /// controller costs in memory, where it must build nothing, and what
     /// it buys out of core, where it must reach the form.
     zpages_auto: bool,
+    /// The controller's bounded arm with the form's threads at the
+    /// readers' I/O class (`Options::zpages_io_idle` off):
+    /// `supdb-nocacheautozpagesfairio`, the pair against
+    /// `supdb-nocacheautozpages` under a bound.
+    zpages_fairio: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -1190,6 +1195,11 @@ struct Policy {
     /// The form the controller's (`Options::zpages` at `ZPages::Auto`):
     /// `supdb-autozpages`, `supdb-nocacheautozpages`.
     zpages_auto: bool,
+    /// The controller's bounded arm with the form's threads at the
+    /// readers' I/O class (`Options::zpages_io_idle` off):
+    /// `supdb-nocacheautozpagesfairio`, the pair against
+    /// `supdb-nocacheautozpages` under a bound.
+    zpages_fairio: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -1292,6 +1302,7 @@ impl Default for Policy {
             zpages_rankwalk: false,
             zpages_settle: false,
             zpages_auto: false,
+            zpages_fairio: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -3707,6 +3718,25 @@ impl Supdb {
         )
     }
 
+    /// `supdb-nocacheautozpages` with the form's threads at the readers'
+    /// I/O class (`Options::zpages_io_idle` off): the pair against
+    /// `supdb-nocacheautozpages` differs by that one option and prices,
+    /// under a bound, a build that shares the device with the readers'
+    /// faults against one the device serves after them. Chosen by hand,
+    /// as `ab --arms supdb-nocacheautozpages,supdb-nocacheautozpagesfairio
+    /// --bound ...`.
+    pub fn create_nocache_auto_zpages_fairio(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                block_cache: false,
+                zpages_auto: true,
+                zpages_fairio: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with the block cache bounded at 256 MB, the budget
     /// `rocksdb-tuned` runs its block cache on, so that comparison is on
     /// the same memory. Below the bound the two arms are one.
@@ -3829,6 +3859,7 @@ impl Supdb {
             zpages_rankwalk,
             zpages_settle,
             zpages_auto,
+            zpages_fairio,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -4059,6 +4090,11 @@ impl Supdb {
             } else {
                 supdb::Options::default().zpages_memo
             },
+            zpages_io_idle: if zpages_fairio {
+                false
+            } else {
+                supdb::Options::default().zpages_io_idle
+            },
             zpages_seek_ord: if zpages_heads {
                 true
             } else {
@@ -4229,6 +4265,7 @@ impl Supdb {
             zpages_rankwalk,
             zpages_settle,
             zpages_auto,
+            zpages_fairio,
             ord_threads: Default::default(),
         })
     }
@@ -4829,6 +4866,8 @@ impl Engine for Supdb {
         if self.zpages_auto {
             return if self.block_cache {
                 "supdb-autozpages"
+            } else if self.zpages_fairio {
+                "supdb-nocacheautozpagesfairio"
             } else {
                 "supdb-nocacheautozpages"
             };
@@ -5066,6 +5105,7 @@ impl Engine for Supdb {
             ("zpage_declined_damage", z.declined_damage as f64),
             ("zpage_build_starts", z.build_starts as f64),
             ("zpage_build_cancelled", z.build_cancelled as f64),
+            ("zpage_build_io_class", z.build_io_class as f64),
             ("zpage_build_nopage", z.build_nopage as f64),
             ("zpage_warms", z.warms as f64),
             ("zpage_warm_bytes", z.warm_bytes as f64),
@@ -5740,6 +5780,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocachezpagessettle"
         | "supdb-autozpages"
         | "supdb-nocacheautozpages"
+        | "supdb-nocacheautozpagesfairio"
         | "supdb-cache256"
         | "supdb-l0"
         | "supdb-nopin"
@@ -5927,6 +5968,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nocachezpagessettle" => Box::new(Supdb::create_nocache_zpages_settle(dir)?),
         "supdb-autozpages" => Box::new(Supdb::create_auto_zpages(dir)?),
         "supdb-nocacheautozpages" => Box::new(Supdb::create_nocache_auto_zpages(dir)?),
+        "supdb-nocacheautozpagesfairio" => Box::new(Supdb::create_nocache_auto_zpages_fairio(dir)?),
         "supdb-cache256" => Box::new(Supdb::create_cache256(dir)?),
         "supdb-ingest" => Box::new(Supdb::create_ingest(dir)?),
         "supdb-ingestleave" => Box::new(Supdb::create_ingest_leave(dir)?),
@@ -6664,6 +6706,50 @@ mod tests {
     /// named, durable like their bases, opened under their names by the
     /// dispatch, the form the controller's by the engine's own options and
     /// neither forced nor off, and every other option the base's.
+    #[test]
+    fn the_fair_io_arm_differs_from_the_controllers_in_the_io_class_alone() {
+        let root = std::env::temp_dir().join(format!("supdb-bench-fairio-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let new = |name: &str, make: fn(&Path) -> Res<Supdb>| {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            make(&d).unwrap()
+        };
+        // The engine's own default: the form's threads at the idle class,
+        // so an arm that does not pin it has the class the engine ships.
+        assert!(supdb::Options::default().zpages_io_idle);
+        let base = new("base", Supdb::create_nocache_auto_zpages);
+        let arm = new("fairio", Supdb::create_nocache_auto_zpages_fairio);
+        assert_eq!(base.name(), "supdb-nocacheautozpages");
+        assert_eq!(arm.name(), "supdb-nocacheautozpagesfairio");
+        assert_eq!(guarantee(arm.name()), guarantee(base.name()));
+        assert!(base.zpages_auto && arm.zpages_auto, "both the controller's");
+        assert!(!base.zpages_fairio && arm.zpages_fairio);
+        assert_eq!(arm.block_cache, base.block_cache);
+        assert_eq!(arm.features(), base.features());
+        let b = base.db.as_ref().unwrap().options();
+        let a = arm.db.as_ref().unwrap().options();
+        assert!(b.zpages_io_idle && !a.zpages_io_idle, "the one option");
+        assert_eq!(a.zpages, b.zpages);
+        assert_eq!(
+            (
+                a.zpages_warm,
+                a.zpages_eager,
+                a.zpages_memo,
+                a.zpages_walk_cursor
+            ),
+            (
+                b.zpages_warm,
+                b.zpages_eager,
+                b.zpages_memo,
+                b.zpages_walk_cursor
+            )
+        );
+        drop(arm);
+        drop(base);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn each_auto_arm_differs_from_its_base_in_the_controller_alone() {
         let root =

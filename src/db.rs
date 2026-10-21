@@ -193,6 +193,25 @@ fn idle_io_priority() {
     }
 }
 
+/// The calling thread's I/O class as the kernel reports it: 3 idle, 2 best
+/// effort, 1 real time, 0 none, which the kernel serves as best effort at
+/// the thread's nice level. Zero where the call is not had or fails.
+fn io_priority_class() -> u64 {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let v = libc::syscall(libc::SYS_ioprio_get, 1 as libc::c_int, 0 as libc::c_int);
+        if v < 0 {
+            0
+        } else {
+            (v as u64) >> 13
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
 /// Who keeps the writer's upkeep current: the block forms its range
 /// reads walk and the scan snapshot of the unsealed keys, both filed with
 /// every commit's writes. `Background(1)` by default.
@@ -429,6 +448,10 @@ pub struct ZCounts {
     /// flag stopped.
     pub build_starts: u64,
     pub build_cancelled: u64,
+    /// The I/O class the kernel reported for the last build thread, read
+    /// on the thread after it chose: 3 idle (`Options::zpages_io_idle`), 2
+    /// best effort, 0 none, which is best effort at the thread's nice.
+    pub build_io_class: u64,
     /// Records the builds held no page for.
     pub build_nopage: u64,
     /// Warms of form files (`Options::zpages_warm`): how many, the bytes
@@ -858,6 +881,17 @@ pub struct Options {
     /// scan's time. `supdb-nocachezpagesrankwalk` is that arm.
     #[doc(hidden)]
     pub zpages_walk_cursor: bool,
+    /// Whether the form's own threads -- the build, the warm and the
+    /// sampler -- take the device at the idle I/O class, served only when
+    /// nothing else is waiting on it; off, they read at the class the
+    /// readers have and share the device with their faults. Under a bound
+    /// the readers fault without pause, and a build served after them took
+    /// ten times its CPU in wall while they read raw. The class the build
+    /// thread ends in is read back from the kernel and counted
+    /// (`ZCounts::build_io_class`). `supdb-nocacheautozpagesfairio` is the
+    /// arm with it off.
+    #[doc(hidden)]
+    pub zpages_io_idle: bool,
     /// A test's seam for what the controller reads from the platform
     /// (`zfile::ZInject`): the budget, the refault rate and the clock,
     /// per store.
@@ -2294,6 +2328,7 @@ impl Default for Options {
             zpages_seek_ord: false,
             zpages_scan_prefetch: false,
             zpages_walk_cursor: true,
+            zpages_io_idle: true,
             zpages_inject: None,
             forms_pieces_only: false,
             publish_in_background: true,
@@ -15365,6 +15400,7 @@ impl Reader {
             rebuilds: get(&ev.rebuilds),
             declined_damage: get(&ev.declined_damage),
             build_starts: get(&ev.build_starts),
+            build_io_class: get(&ev.build_io_class),
             build_cancelled: get(&ev.build_cancelled),
             build_nopage: get(&ev.build_nopage),
             warms: get(&ev.warms),
@@ -31835,10 +31871,13 @@ impl Maint {
         let floor = self.opts.zpages_min_bytes;
         let wake = self.wake.clone();
         zfile::ZEvents::add(&self.shared.z.samples, 1);
+        let io_idle = self.opts.zpages_io_idle;
         let spawned = std::thread::Builder::new()
             .name("supdb-zsample".into())
             .spawn(move || {
-                idle_io_priority();
+                if io_idle {
+                    idle_io_priority();
+                }
                 idle_cpu_priority();
                 let out: Vec<_> = segs
                     .into_iter()
@@ -32374,12 +32413,22 @@ impl Maint {
         // the thread's first write and the count, and a test read the
         // temp name as a build nobody had started.
         zfile::ZEvents::add(&ev.build_starts, 1);
+        let io_idle = self.opts.zpages_io_idle;
+        let io_ev = shared.clone();
         let spawned = std::thread::Builder::new()
             .name("supdb-zbuild".into())
             .spawn(move || {
                 // Derived data, built when the store is short of memory
-                // and the readers are faulting: the readers' cores first.
-                idle_io_priority();
+                // and the readers are faulting: the readers' cores first,
+                // and the device's queue too unless the option has the
+                // build share it; the class the kernel reports is counted.
+                if io_idle {
+                    idle_io_priority();
+                }
+                io_ev
+                    .z
+                    .build_io_class
+                    .store(io_priority_class(), AtomicOrdering::Relaxed);
                 idle_cpu_priority();
                 zbuild_hold_wait(&hold, ZHOLD_START);
                 let r = if fail {
@@ -32520,10 +32569,13 @@ impl Maint {
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = cancel.clone();
         let wake = self.wake.clone();
+        let io_idle = self.opts.zpages_io_idle;
         let spawned = std::thread::Builder::new()
             .name("supdb-zwarm".into())
             .spawn(move || {
-                idle_io_priority();
+                if io_idle {
+                    idle_io_priority();
+                }
                 idle_cpu_priority();
                 let r = zfile::warm_file(&path, Some(&flag));
                 if let Some(t) = wake {

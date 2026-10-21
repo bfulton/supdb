@@ -1701,6 +1701,43 @@ fn regions_of(seg: &Path) -> Regions {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn the_forms_threads_take_the_io_class_the_option_names_and_the_build_records_it() {
+    // The build, the warm and the sampler take the device at the idle I/O
+    // class unless `Options::zpages_io_idle` is off, and the build thread
+    // reads its class back from the kernel and counts it: so the option is
+    // held to what the kernel says, not to what the thread asked.
+    assert!(
+        Options::default().zpages_io_idle && forced(|_| {}).zpages_io_idle,
+        "the form's threads are idle unless they are told otherwise"
+    );
+    for idle in [true, false] {
+        let dir = scratch(&format!("ioclass-{idle}"));
+        let mut db = Db::create(&dir, forced(|o| o.zpages_io_idle = idle)).unwrap();
+        let _model = ordered_load(&mut db, 8000, 0xD21);
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert_eq!(c.form_files, 1);
+        assert!(c.build_starts >= 1, "a build ran");
+        if idle {
+            assert_eq!(
+                c.build_io_class, 3,
+                "the build thread's class, as the kernel reports it"
+            );
+        } else {
+            assert_ne!(
+                c.build_io_class, 3,
+                "the build thread stays out of the idle class"
+            );
+            assert!(
+                c.build_io_class <= 2,
+                "{}: a class the kernel knows",
+                c.build_io_class
+            );
+        }
+    }
+}
+
+#[test]
 fn the_build_drops_the_raw_records_it_passed_when_asked_to_and_not_otherwise() {
     // The build reads a partition's records once, through a mapping of its
     // own, to copy them into pages; a store that does not fit wants them out
