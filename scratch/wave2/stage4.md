@@ -763,5 +763,17 @@ rung and bound is the rent's twenty-odd seconds and the build's
 thirty-odd, and the price of the controller against the forced form is
 the read and scan passes it serves raw before the install; what the
 forced arm pays for serving them compact is its loads. The eager entry's
-pairing is next, since with the compact rate right the vanish rule has
-nothing to cancel on.
+pairing with both inputs right (`auto-ooc-eager5m640s-ab-{1,2}.*`):
+the eager arm buys at 14-16 s in every rep, no build cancelled (the
+read class's measured saving is 0.26-0.33 a read now against a
+`theta_enter / 2` of 0.03-0.12), and installs at 44-73 s; the rent buys
+at 22-25 s and installs at 57-78 s. Eight seconds of head start, spent
+inside a build whose wall under the readers' I/O ranges 30-57 s in both
+arms, and the cells read level within noise in both orders (the mixes
+0.88-1.10x either way, the loads 1.00-1.04x, the reads and scans
+position-bound). So the eager entry buys nothing the rows can see at
+this rung and bound, and it buys on no evidence -- its loss case, a
+store loaded past its budget and never read, stands -- where the rent
+now pays within ten seconds of it; the arm stays and the default stays
+the rent. The gear shift is the build's wall now: twenty seconds of rent
+and thirty to fifty of build, and the second is the lever left.
