@@ -1,0 +1,195 @@
+
+quantity                           lmdb-nordahead supdb-nocachezpages      B/A B above A   sign p
+load bg_read_bytes_per_op                 0.0000        0.0041     NaNx     2/2      0.500
+load bytes_on_disk_per_byte               1.1465        1.9241   1.678x     2/2      0.500
+load device_bytes_per_byte                2.5580        1.9602   0.766x     0/2      0.500
+load majfaults_per_op                     0.0000        0.0000   0.000x     0/2      0.500
+load ops_per_s                       591059.9066   685893.0431   1.160x     1/2      1.000
+load read_bytes_per_op                    0.0041        0.0008   0.200x     0/2      0.500
+load read_us_per_io                     250.0000    77600.0000 310.400x     2/2      0.500
+load refaults_per_op                      0.0000        0.0000   0.545x     0/2      0.500
+load-shuffled bg_read_bytes_per_op        0.0000      820.2346     NaNx     2/2      0.500
+load-shuffled majfaults_per_op            0.0991        0.0000   0.000x     0/2      0.500
+load-shuffled ops_per_s               19420.7348   225190.3284  11.595x     2/2      0.500
+load-shuffled read_bytes_per_op         405.8579        0.0082   0.000x     0/2      0.500
+load-shuffled read_us_per_io             63.4221      358.9998   5.660x     2/2      0.500
+load-shuffled refaults_per_op             0.0991        0.1876   1.894x     2/2      0.500
+prime us_per_page                         2.1451        1.9033   0.887x     1/2      1.000
+ycsb-A bg_read_bytes_per_op               0.0000        0.0000     NaNx     0/0      1.000
+ycsb-A majfaults_per_op                   0.0648        0.0004   0.007x     0/2      0.500
+ycsb-A ops_per_s                      44614.7513   140319.1947   3.145x     2/2      0.500
+ycsb-A read_bytes_per_op                265.5170        1.7695   0.007x     0/2      0.500
+ycsb-A read_us_per_io                    65.9015      111.1111   1.686x     1/1      1.000
+ycsb-A refaults_per_op                    0.0648        0.0004   0.007x     0/2      0.500
+ycsb-B bg_read_bytes_per_op               0.0000        0.0000     NaNx     0/0      1.000
+ycsb-B majfaults_per_op                   0.0808        0.0026   0.033x     0/2      0.500
+ycsb-B ops_per_s                     149780.8610   231047.8909   1.543x     2/2      0.500
+ycsb-B read_bytes_per_op                330.9869       10.8625   0.033x     0/2      0.500
+ycsb-B read_us_per_io                    53.7571      135.7466   2.525x     2/2      0.500
+ycsb-B refaults_per_op                    0.0808        0.0026   0.033x     0/2      0.500
+ycsb-C bg_read_bytes_per_op               0.0000        0.0000     NaNx     0/0      1.000
+ycsb-C majfaults_per_op                   0.1472        0.0396   0.269x     0/2      0.500
+ycsb-C ops_per_s                     123311.0703   255777.8880   2.074x     2/2      0.500
+ycsb-C read_bytes_per_op                602.8936      162.3969   0.269x     0/2      0.500
+ycsb-C read_us_per_io                    48.0189       53.5714   1.116x     2/2      0.500
+ycsb-C refaults_per_op                    0.1472        0.0396   0.269x     0/2      0.500
+ycsb-D bg_read_bytes_per_op               0.0000        0.0000     NaNx     0/0      1.000
+ycsb-D majfaults_per_op                   0.1323        0.0000   0.000x     0/2      0.500
+ycsb-D ops_per_s                     122136.6869   147675.2655   1.209x     2/2      0.500
+ycsb-D read_bytes_per_op                542.0439        0.1475   0.000x     0/2      0.500
+ycsb-D read_us_per_io                    45.1578        0.0000   0.000x     0/1      1.000
+ycsb-D refaults_per_op                    0.1323        0.0000   0.000x     0/2      0.500
+ycsb-E bg_read_bytes_per_op               0.0000        0.0000     NaNx     0/0      1.000
+ycsb-E majfaults_per_op                   0.0945        0.0000   0.000x     0/2      0.500
+ycsb-E ops_per_s                     139328.2843    75616.0833   0.543x     0/2      0.500
+ycsb-E read_bytes_per_op                386.9214        0.1475   0.000x     0/2      0.500
+ycsb-E read_us_per_io                    46.0150      333.3333   7.244x     1/1      1.000
+ycsb-E refaults_per_op                    0.0945        0.0000   0.000x     0/2      0.500
+ycsb-F bg_read_bytes_per_op               0.0000        0.0000     NaNx     0/0      1.000
+ycsb-F majfaults_per_op                   0.0532        0.0002   0.004x     0/2      0.500
+ycsb-F ops_per_s                      41662.9481   147612.0721   3.543x     2/2      0.500
+ycsb-F read_bytes_per_op                217.9382        0.8847   0.004x     0/2      0.500
+ycsb-F read_us_per_io                    69.2377      111.1111   1.605x     1/1      1.000
+ycsb-F refaults_per_op                    0.0532        0.0002   0.004x     0/2      0.500
+
+51 quantities: 0 marked *, where a coin marks about 2.6; 0 marked **, which holds for the table as a whole (Holm)
+
+ycsb-A bg_read_bytes_per_op by rep (A first on even reps):
+  rep   1             0.00            0.00      NaNx
+  rep   2             0.00            0.00      NaNx
+
+ycsb-A majfaults_per_op by rep (A first on even reps):
+  rep   1             0.06            0.00    0.007x
+  rep   2             0.06            0.00    0.000x
+
+ycsb-A ops_per_s by rep (A first on even reps):
+  rep   1         36478.80       140319.19    3.847x
+  rep   2         44614.75       127749.29    2.863x
+
+ycsb-A read_bytes_per_op by rep (A first on even reps):
+  rep   1           265.52            1.77    0.007x
+  rep   2           265.32            0.00    0.000x
+
+ycsb-A read_us_per_io by rep (A first on even reps):
+  rep   1            65.90          111.11    1.686x
+
+ycsb-A refaults_per_op by rep (A first on even reps):
+  rep   1             0.06            0.00    0.007x
+  rep   2             0.06            0.00    0.000x
+
+ycsb-B bg_read_bytes_per_op by rep (A first on even reps):
+  rep   1             0.00            0.00      NaNx
+  rep   2             0.00            0.00      NaNx
+
+ycsb-B majfaults_per_op by rep (A first on even reps):
+  rep   1             0.08            0.00    0.033x
+  rep   2             0.08            0.00    0.001x
+
+ycsb-B ops_per_s by rep (A first on even reps):
+  rep   1        106714.66       231047.89    2.165x
+  rep   2        149780.86       229424.36    1.532x
+
+ycsb-B read_bytes_per_op by rep (A first on even reps):
+  rep   1           330.99           10.86    0.033x
+  rep   2           330.79            0.49    0.001x
+
+ycsb-B read_us_per_io by rep (A first on even reps):
+  rep   1            53.76          135.75    2.525x
+  rep   2            37.44          100.00    2.671x
+
+ycsb-B refaults_per_op by rep (A first on even reps):
+  rep   1             0.08            0.00    0.033x
+  rep   2             0.08            0.00    0.001x
+
+ycsb-C bg_read_bytes_per_op by rep (A first on even reps):
+  rep   1             0.00            0.00      NaNx
+  rep   2             0.00            0.00      NaNx
+
+ycsb-C majfaults_per_op by rep (A first on even reps):
+  rep   1             0.15            0.04    0.269x
+  rep   2             0.15            0.02    0.125x
+
+ycsb-C ops_per_s by rep (A first on even reps):
+  rep   1         92437.38       168094.94    1.818x
+  rep   2        123311.07       255777.89    2.074x
+
+ycsb-C read_bytes_per_op by rep (A first on even reps):
+  rep   1           602.89          162.40    0.269x
+  rep   2           602.21           75.05    0.125x
+
+ycsb-C read_us_per_io by rep (A first on even reps):
+  rep   1            48.02           53.57    1.116x
+  rep   2            36.08           39.95    1.107x
+
+ycsb-C refaults_per_op by rep (A first on even reps):
+  rep   1             0.15            0.04    0.269x
+  rep   2             0.15            0.02    0.125x
+
+ycsb-D bg_read_bytes_per_op by rep (A first on even reps):
+  rep   1             0.00            0.00      NaNx
+  rep   2             0.00            0.00      NaNx
+
+ycsb-D majfaults_per_op by rep (A first on even reps):
+  rep   1             0.13            0.00    0.000x
+  rep   2             0.13            0.00    0.000x
+
+ycsb-D ops_per_s by rep (A first on even reps):
+  rep   1         94597.06       146043.39    1.544x
+  rep   2        122136.69       147675.27    1.209x
+
+ycsb-D read_bytes_per_op by rep (A first on even reps):
+  rep   1           542.04            0.15    0.000x
+  rep   2           541.26            0.00    0.000x
+
+ycsb-D read_us_per_io by rep (A first on even reps):
+  rep   1            45.16            0.00    0.000x
+
+ycsb-D refaults_per_op by rep (A first on even reps):
+  rep   1             0.13            0.00    0.000x
+  rep   2             0.13            0.00    0.000x
+
+ycsb-E bg_read_bytes_per_op by rep (A first on even reps):
+  rep   1             0.00            0.00      NaNx
+  rep   2             0.00            0.00      NaNx
+
+ycsb-E majfaults_per_op by rep (A first on even reps):
+  rep   1             0.09            0.00    0.000x
+  rep   2             0.09            0.00    0.000x
+
+ycsb-E ops_per_s by rep (A first on even reps):
+  rep   1        109462.56        49381.32    0.451x
+  rep   2        139328.28        75616.08    0.543x
+
+ycsb-E read_bytes_per_op by rep (A first on even reps):
+  rep   1           386.68            0.15    0.000x
+  rep   2           386.92            0.00    0.000x
+
+ycsb-E read_us_per_io by rep (A first on even reps):
+  rep   1            46.01          333.33    7.244x
+
+ycsb-E refaults_per_op by rep (A first on even reps):
+  rep   1             0.09            0.00    0.000x
+  rep   2             0.09            0.00    0.000x
+
+ycsb-F bg_read_bytes_per_op by rep (A first on even reps):
+  rep   1             0.00            0.00      NaNx
+  rep   2             0.00            0.00      NaNx
+
+ycsb-F majfaults_per_op by rep (A first on even reps):
+  rep   1             0.05            0.00    0.004x
+  rep   2             0.05            0.00    0.000x
+
+ycsb-F ops_per_s by rep (A first on even reps):
+  rep   1         37880.32       118893.65    3.139x
+  rep   2         41662.95       147612.07    3.543x
+
+ycsb-F read_bytes_per_op by rep (A first on even reps):
+  rep   1           217.94            0.88    0.004x
+  rep   2           217.69            0.00    0.000x
+
+ycsb-F read_us_per_io by rep (A first on even reps):
+  rep   1            69.24          111.11    1.605x
+
+ycsb-F refaults_per_op by rep (A first on even reps):
+  rep   1             0.05            0.00    0.004x
+  rep   2             0.05            0.00    0.000x

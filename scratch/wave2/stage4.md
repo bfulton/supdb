@@ -839,3 +839,22 @@ block cache beside the controller's compact form (the edits are staged),
 paired against `supdb-nocacheautozpages` on the mixes: what the Zipfian
 head's short scans gain from the merged forms against what the point
 reads lose to the page cache the cache displaces.
+
+The decomposition (`e-decomp-ab.*`, the forced form against LMDB at five
+million keys under 640 MiB, the load and the mixes alone, two pairs; the
+mixes' timer by kind and the form's counters per mix, which the events
+line carries now under `SUPDB_MIX_COUNTERS` with `SUPDB_MIX_EVENTS`):
+E's time is the scans' alone, 975-1,297 ms over 79,198 scans of fifty
+against LMDB's 489-805, the commits 38-51 ms on both arms, so 11-16 µs a
+scan against 6-10. Under the form a scan touches 1.9 groups, 1.16 of
+them memo hits and 0.73 opened from the file (57,543 of 79,199 scans,
+the memo's hit rate 61% over the Zipfian head with its 1,024 slots and
+8 MiB), and at 5-6 µs a decode the opens are 320-350 ms of the scans'
+time, a quarter to a third; the rest, 8-12 µs a scan, is the walk with
+the merge of the unsealed head, about sixteen memtable keys a window.
+The point-read mixes read the memo the same way: C hits 61%, B 40%, A
+23%, F 14%, D 1% (uniform). So two levers, in the order of their share:
+the merge, which the block cache's merged forms fold in advance (the
+combined arm, `supdb-cache256tofitautozpages`, gated and built), and the
+memo's size over the head, a constant today (`ZMEMO_SLOTS`,
+`ZMEMO_BYTES`), which a larger memo would price on the decodes alone.
