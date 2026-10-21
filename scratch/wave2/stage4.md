@@ -467,3 +467,26 @@ prices it. The build thread reads its class back from the kernel
 `zpage_build_io_class`), so the test holds the option to what the
 kernel says and not to what the thread asked; the mutant that idles
 whatever the option says fails the test's off case.
+
+The class, priced (`auto-ooc-fairio5m-ab-{1,2}.out`, five million keys
+under 512 MiB, three pairs a process, both orders; the ten-million runs
+died with the container, and the floors and the harness do not fit the
+256 MiB floor at three million, the cgroup killed that run in its first
+two minutes): refuted. Nothing is marked in either table, the mixes'
+marks flip sign with the order, the read and scan passes read level.
+The stamped reps say why: the build's wall is 80-93 s under both
+classes in every rep but the first of each process, whose passes end
+before any build can (the install lands at 133-147 s into a rep whose
+last mix ends near 150, under either class). The class is not what
+limits the build. The diagnostic's sampler had the build thread at 44
+major faults a second (the median, 117 at most) at ten million keys,
+and the device's readahead is 128 KB, so the build's rate is one
+readahead window a wait, 5-15 MB/s, each wait a device round trip
+behind the readers' queue (`mq-deadline`, `nr_requests` 256, a device
+rotational by its own account), whatever the request's class: the
+build's reads are the page faults of a mapping walked by rank, with
+nothing asked ahead. The next lever is the window, not the class: the
+raw records asked for ahead of the walk in megabytes (`MADV_WILLNEED`,
+as the warm already does by chunk), so that one wait fetches a megabyte
+and not 128 KB, and the build's wall is the device's bandwidth share
+and not its round trips.
