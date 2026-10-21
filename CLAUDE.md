@@ -2478,6 +2478,33 @@ class or priority is priced after a count of the bytes it fetches; and a
 sequential walk through a mapping asks for what it is about to read,
 since the kernel's readahead is a window sized for nobody.
 
+**A population taken from the section that holds the other
+population.** The model of the raw form's faults takes two populations
+a point read touches one page of each, the hash slots and the records
+(`zselect::model_raw`), and the engine handed it the index section for
+the first. The record region lies inside the key section for a record
+whose value is inline, every record of the suite's shape, so the records
+were counted twice, and the model predicted 1.25 faults a read where the
+census measured 0.27 -- five million keys under 640 MiB, 4.6x -- for as
+long as the controller shipped. Nothing raised: a prediction nothing
+holds to a measurement is wrong for free, and the controller's verdicts
+under it had read as cautious rather than wrong, since the rent is
+measured and the inflated prediction only let it in. The eager entry
+found it: bought on the prediction, every build was cancelled within a
+second by the vanish rule, which holds the measured raw rate against the
+modelled compact rate, and the trace, extended to print the census and
+the evidence beside the model, put 0.27 beside 1.25 on one line; the
+first sitting's two cancels had been read as a merge's, from the
+stamps, until the event's kind was read. The populations are the hash
+region and the record region now, the counts carry both, and the test
+holds them to the files' headers and a store whose populations fit its
+budget to FITS. The rule: a population handed to a model is the region
+a read touches a page of, never a section that contains it; and a
+model's prediction is printed beside the measurement of the same
+quantity before its verdicts are read, since a controller that decides
+on a prediction four times the truth decides the right things late and
+the wrong things fast.
+
 **A probe's total over a whole read is an inlining result.** The same engine
 read +0.9, +1.9, +2.9 and +3.15 instructions a point read across four probes
 and a count +3.00 exactly, because the code after a probe's loop changes what

@@ -1068,6 +1068,8 @@ pub struct ZSelect {
     last_build_wall: Duration,
     build_started: Duration,
     vanished: u32,
+    /// What the last interval's census said, for the trace.
+    last_evidence: Evidence,
     /// The last [`BUDGET_BUILDS`] builds, a bit each: set if superseded.
     outcomes: u32,
     suspended_until: Option<Duration>,
@@ -1119,6 +1121,7 @@ impl ZSelect {
             last_build_wall: Duration::ZERO,
             build_started: Duration::ZERO,
             vanished: 0,
+            last_evidence: Evidence::default(),
             outcomes: 0,
             suspended_until: None,
             retain_until: None,
@@ -1167,6 +1170,20 @@ impl ZSelect {
             self.watch.e2_win,
             self.footprint,
             self.dwell(),
+        )
+    }
+
+    /// For the trace: the last interval's evidence, the measured saving by
+    /// class where the interval had any, and the run of intervals the saving
+    /// has vanished for.
+    pub fn evidence_state(&self) -> ([Option<f64>; 2], u32) {
+        let ev = &self.last_evidence;
+        (
+            [
+                ev.valid[0].then_some(ev.saving[0]),
+                ev.valid[1].then_some(ev.saving[1]),
+            ],
+            self.vanished,
         )
     }
 
@@ -1515,6 +1532,7 @@ impl ZSelect {
         }
         let mut ev = Evidence::default();
         if !share_ok {
+            self.last_evidence = ev;
             return ev;
         }
         for class in Class::ALL {
@@ -1528,6 +1546,7 @@ impl ZSelect {
             ev.win[i] = w;
             ev.saving[i] = w.phi() - z;
         }
+        self.last_evidence = ev;
         ev
     }
 

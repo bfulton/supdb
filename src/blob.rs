@@ -1005,6 +1005,14 @@ impl<B: Bytes> Blob<B> {
         idx.regions(sec)
     }
 
+    /// The hash region's bytes, the slots a point read probes one page of;
+    /// 0 for a reader that does not hold the section whole.
+    #[cfg(not(target_family = "wasm"))]
+    #[doc(hidden)]
+    pub fn hash_region_bytes(&self) -> usize {
+        self.flat().map_or(0, |(_, idx)| idx.hash_bytes())
+    }
+
     /// What a form file binds itself to (`ZSource`), or `None` where there is
     /// nothing to bind to: a reader that does not hold the section whole,
     /// or a section with no checksum row (a store's in-place-editable
