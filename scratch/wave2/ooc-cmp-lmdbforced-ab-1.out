@@ -1,0 +1,158 @@
+
+quantity                           lmdb-nordahead supdb-nocachezpages      B/A B above A   sign p
+load bg_read_bytes_per_op                 0.0000        0.0057     NaNx     3/3      0.250
+load bytes_on_disk_per_byte               1.1465        1.9241   1.678x     3/3      0.250
+load device_bytes_per_byte                2.5622        1.9600   0.765x     0/3      0.250
+load majfaults_per_op                     0.0000        0.0000   0.000x     0/3      0.250
+load ops_per_s                       494593.1973   687344.0268   1.390x     3/3      0.250
+load read_bytes_per_op                    0.0049        0.0025   0.500x     1/3      1.000
+load read_us_per_io                     333.3333      428.5714   1.286x     3/3      0.250
+load refaults_per_op                      0.0000        0.0000   1.571x     2/3      1.000
+load-shuffled bg_read_bytes_per_op        0.0000      876.1639     NaNx     3/3      0.250
+load-shuffled majfaults_per_op            0.0864        0.0000   0.000x     0/3      0.250
+load-shuffled ops_per_s               19264.9780   204610.5927  10.621x     3/3      0.250
+load-shuffled read_bytes_per_op         353.7650        0.0205   0.000x     0/3      0.250
+load-shuffled read_us_per_io             51.6740      286.4832   5.544x     3/3      0.250
+load-shuffled refaults_per_op             0.0864        0.2028   2.348x     3/3      0.250
+prime us_per_page                         1.8233        1.5218   0.835x     0/3      0.250
+read bg_read_bytes_per_op                 0.0000        0.0000     NaNx     0/0      1.000
+read bg_read_bytes_per_op_2t              0.0000        0.0000     NaNx     0/0      1.000
+read bg_read_bytes_per_op_3t              0.0000        0.0000     NaNx     0/1      1.000
+read majfaults_per_op                     0.1016        0.0000   0.000x     0/3      0.250
+read majfaults_per_op_2t                  0.0906        0.0000   0.000x     0/3      0.250
+read majfaults_per_op_3t                  0.0824        0.0000   0.000x     0/3      0.250
+read p99_us                             163.8390       14.3990   0.088x     0/3      0.250
+read read_bytes_per_op                  416.3256        0.0000   0.000x     0/3      0.250
+read read_bytes_per_op_2t               370.9624        0.0000   0.000x     0/3      0.250
+read read_bytes_per_op_3t               337.5295        0.0000   0.000x     0/3      0.250
+read read_us_per_io                      53.7106       95.0136   1.769x     1/1      1.000
+read read_us_per_io_2t                   45.2886      142.8571   3.154x     1/1      1.000
+read reads_per_s                      84310.0910   171872.5511   2.039x     3/3      0.250
+read reads_per_s_2t                  240194.9227   341132.7120   1.420x     3/3      0.250
+read reads_per_s_3t                  219040.5171   522017.1938   2.383x     3/3      0.250
+read refaults_per_op                      0.1016        0.0000   0.000x     0/3      0.250
+read refaults_per_op_2t                   0.0906        0.0000   0.000x     0/3      0.250
+read refaults_per_op_3t                   0.0824        0.0000   0.000x     0/3      0.250
+scan bg_read_bytes_per_op                 0.0000        0.0000     NaNx     0/0      1.000
+scan bg_read_bytes_per_op_2t              0.0041        0.0000   0.000x     0/3      0.250
+scan bg_read_bytes_per_op_3t              0.0027        0.0000   0.000x     0/3      0.250
+scan entries_per_s                  2322219.8040  7095885.7246   3.056x     3/3      0.250
+scan entries_per_s_2t               5633450.8608 12624580.9635   2.241x     3/3      0.250
+scan entries_per_s_3t               7343958.1070 19866149.1869   2.705x     3/3      0.250
+scan majfaults_per_op                     0.3332        0.0000   0.000x     0/3      0.250
+scan majfaults_per_op_2t                  0.3422        0.0000   0.000x     0/3      0.250
+scan majfaults_per_op_3t                  0.3408        0.0000   0.000x     0/3      0.250
+scan read_bytes_per_op                 1364.7872        0.0000   0.000x     0/3      0.250
+scan read_bytes_per_op_2t              1401.7249        0.0000   0.000x     0/3      0.250
+scan read_bytes_per_op_3t              1395.9168        0.0000   0.000x     0/3      0.250
+scan refaults_per_op                      0.3332        0.0000   0.000x     0/3      0.250
+scan refaults_per_op_2t                   0.3422        0.0000   0.000x     0/3      0.250
+scan refaults_per_op_3t                   0.3408        0.0000   0.000x     0/3      0.250
+ycsb-A bg_read_bytes_per_op               0.0000        0.0000     NaNx     0/0      1.000
+ycsb-A majfaults_per_op                   0.0149        0.0000   0.000x     0/3      0.250
+ycsb-A ops_per_s                      39550.0465   154272.4394   3.901x     3/3      0.250
+ycsb-A read_bytes_per_op                 61.0463        0.0000   0.000x     0/3      0.250
+ycsb-A refaults_per_op                    0.0149        0.0000   0.000x     0/3      0.250
+ycsb-B bg_read_bytes_per_op               0.0000        0.0000     NaNx     0/0      1.000
+ycsb-B majfaults_per_op                   0.0158        0.0000   0.000x     0/3      0.250
+ycsb-B ops_per_s                     198483.6222   315909.8479   1.592x     3/3      0.250
+ycsb-B read_bytes_per_op                 64.8801        0.0492   0.001x     0/3      0.250
+ycsb-B read_us_per_io                   136.3636     1000.0000   7.333x     1/2      1.000
+ycsb-B refaults_per_op                    0.0158        0.0000   0.000x     0/3      0.250
+ycsb-C bg_read_bytes_per_op               0.0000        0.0000     NaNx     0/0      1.000
+ycsb-C majfaults_per_op                   0.0204        0.0000   0.000x     0/3      0.250
+ycsb-C ops_per_s                     372330.6374   442813.1833   1.189x     2/3      1.000
+ycsb-C read_bytes_per_op                 83.7543        0.0000   0.000x     0/3      0.250
+ycsb-C refaults_per_op                    0.0204        0.0000   0.000x     0/3      0.250
+ycsb-D bg_read_bytes_per_op               0.0000        0.0000     NaNx     0/0      1.000
+ycsb-D majfaults_per_op                   0.0832        0.0000   0.000x     0/3      0.250
+ycsb-D ops_per_s                      97034.0728   164386.4875   1.694x     3/3      0.250
+ycsb-D read_bytes_per_op                340.8664        0.0000   0.000x     0/3      0.250
+ycsb-D refaults_per_op                    0.0832        0.0000   0.000x     0/3      0.250
+ycsb-E bg_read_bytes_per_op               0.0000        0.0000     NaNx     0/0      1.000
+ycsb-E majfaults_per_op                   0.0428        0.0000   0.000x     0/3      0.250
+ycsb-E ops_per_s                     134780.4922    75740.6804   0.562x     0/3      0.250
+ycsb-E read_bytes_per_op                175.2255        0.0000   0.000x     0/3      0.250
+ycsb-E refaults_per_op                    0.0428        0.0000   0.000x     0/3      0.250
+ycsb-F bg_read_bytes_per_op               0.0000        0.0000     NaNx     0/0      1.000
+ycsb-F majfaults_per_op                   0.0140        0.0000   0.000x     0/3      0.250
+ycsb-F ops_per_s                      42615.5228   143369.9509   3.364x     3/3      0.250
+ycsb-F read_bytes_per_op                 57.4582        0.0000   0.000x     0/3      0.250
+ycsb-F refaults_per_op                    0.0140        0.0000   0.000x     0/3      0.250
+
+79 quantities: 0 marked *, where a coin marks about 4.0; 0 marked **, which holds for the table as a whole (Holm)
+
+scan bg_read_bytes_per_op by rep (A first on even reps):
+  rep   1             0.00            0.00      NaNx
+  rep   2             0.00            0.00      NaNx
+  rep   3             0.00            0.00      NaNx
+
+scan bg_read_bytes_per_op_2t by rep (A first on even reps):
+  rep   1             0.00            0.00    0.000x
+  rep   2             0.00            0.00    0.000x
+  rep   3             0.01            0.00    0.000x
+
+scan bg_read_bytes_per_op_3t by rep (A first on even reps):
+  rep   1             0.00            0.00    0.000x
+  rep   2             0.00            0.00    0.000x
+  rep   3             0.00            0.00    0.000x
+
+scan entries_per_s by rep (A first on even reps):
+  rep   1       3749541.32      7095885.72    1.892x
+  rep   2       2221634.91      7457967.68    3.357x
+  rep   3       2322219.80      5516181.06    2.375x
+
+scan entries_per_s_2t by rep (A first on even reps):
+  rep   1       6403104.62     12956780.33    2.024x
+  rep   2       5633450.86     12624580.96    2.241x
+  rep   3       3888374.94     12083260.30    3.108x
+
+scan entries_per_s_3t by rep (A first on even reps):
+  rep   1       9097426.37     19866149.19    2.184x
+  rep   2       7343958.11     20552558.17    2.799x
+  rep   3       4994162.72     17808346.17    3.566x
+
+scan majfaults_per_op by rep (A first on even reps):
+  rep   1             0.33            0.00    0.000x
+  rep   2             0.33            0.00    0.000x
+  rep   3             0.68            0.00    0.000x
+
+scan majfaults_per_op_2t by rep (A first on even reps):
+  rep   1             0.34            0.00    0.000x
+  rep   2             0.34            0.00    0.000x
+  rep   3             0.68            0.00    0.000x
+
+scan majfaults_per_op_3t by rep (A first on even reps):
+  rep   1             0.34            0.00    0.000x
+  rep   2             0.34            0.00    0.000x
+  rep   3             0.68            0.00    0.000x
+
+scan read_bytes_per_op by rep (A first on even reps):
+  rep   1          1364.79            0.00    0.000x
+  rep   2          1358.23            0.00    0.000x
+  rep   3          2775.45            0.00    0.000x
+
+scan read_bytes_per_op_2t by rep (A first on even reps):
+  rep   1          1401.72            0.00    0.000x
+  rep   2          1393.93            0.00    0.000x
+  rep   3          2787.25            0.00    0.000x
+
+scan read_bytes_per_op_3t by rep (A first on even reps):
+  rep   1          1395.92            0.00    0.000x
+  rep   2          1393.72            0.00    0.000x
+  rep   3          2798.30            0.00    0.000x
+
+scan refaults_per_op by rep (A first on even reps):
+  rep   1             0.33            0.00    0.000x
+  rep   2             0.33            0.00    0.000x
+  rep   3             0.68            0.00    0.000x
+
+scan refaults_per_op_2t by rep (A first on even reps):
+  rep   1             0.34            0.00    0.000x
+  rep   2             0.34            0.00    0.000x
+  rep   3             0.68            0.00    0.000x
+
+scan refaults_per_op_3t by rep (A first on even reps):
+  rep   1             0.34            0.00    0.000x
+  rep   2             0.34            0.00    0.000x
+  rep   3             0.68            0.00    0.000x
