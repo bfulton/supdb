@@ -248,7 +248,7 @@ off (`lmdb-nordahead`), the LMDB a user configures for the regime. The
 scan floor's file is written and synced outside the group and dropped
 from the cache; the floors and every pass run inside it.
 
-Thirteen more arms exist for a bounded pairing and are in no roster, because
+Fourteen more arms exist for a bounded pairing and are in no roster, because
 each prices one engine option against the arm it differs from in one
 process (`bench ab --arms <base>,<arm>`) and is chosen by hand:
 `supdb-autozpages` and `supdb-nocacheautozpages` are `supdb` and
@@ -276,7 +276,10 @@ class, for a build under a bound that shares the device with the faults it
 is there to remove, and `supdb-nocacheautozpagesnoahead` the same with its
 builds asking nothing of the raw records ahead of their walks, the shape
 before the window, whose every wait fetched the device's readahead and no
-more. The forced arm's
+more, and `supdb-nocacheautozpageseager` the controller buying the form at
+SUSPECT on the model's prediction, once the sampler has priced it and the
+partitions have stood for the settle, instead of after the ski rental's
+wait. The forced arm's
 `sync` builds the form files, so its load carries the build, and in memory
 it reads slower than the raw form: it is an arm for the bound, not a
 default.

@@ -907,6 +907,17 @@ pub struct Options {
     /// shape the window was priced against.
     #[doc(hidden)]
     pub zpages_build_ahead: usize,
+    /// Whether the controller buys its first form at SUSPECT on the model's
+    /// prediction, once the sampler has priced it and the partitions have
+    /// stood for `zselect::EAGER_SETTLE`, instead of after the ski rental's
+    /// wait for the readers to waste the build's price; every purchase after
+    /// a cancel or an exit is the rent's. Off as shipped: the
+    /// rent bounds the loss of a workload that stops at twice the price,
+    /// and the eager entry's loss case is a store that is loaded, outgrows
+    /// the budget and is never read. `supdb-nocacheautozpageseager` is the
+    /// arm.
+    #[doc(hidden)]
+    pub zpages_build_eager: bool,
     /// A test's seam for what the controller reads from the platform
     /// (`zfile::ZInject`): the budget, the refault rate and the clock,
     /// per store.
@@ -2345,6 +2356,7 @@ impl Default for Options {
             zpages_walk_cursor: true,
             zpages_io_idle: true,
             zpages_build_ahead: 4 << 20,
+            zpages_build_eager: false,
             zpages_inject: None,
             forms_pieces_only: false,
             publish_in_background: true,
@@ -30374,6 +30386,7 @@ impl Maint {
             .manifest_seq
             .store(manifest_seq, AtomicOrdering::Release);
         let z_auto = r.opts.zpages == ZPages::Auto && !z_auto_inert(&r.opts);
+        let z_eager = r.opts.zpages_build_eager;
         Maint {
             r,
             dir: dir.to_path_buf(),
@@ -30393,7 +30406,11 @@ impl Maint {
             shaped_at: 0,
             zbuild: None,
             z_settling: false,
-            zsel: zselect::ZSelect::default(),
+            zsel: {
+                let mut sel = zselect::ZSelect::default();
+                sel.set_eager(z_eager);
+                sel
+            },
             z_auto,
             z_trace: std::env::var_os("SUPDB_ZPAGES_TRACE").is_some(),
             z_epoch: std::time::Instant::now(),

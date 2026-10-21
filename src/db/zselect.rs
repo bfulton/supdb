@@ -83,7 +83,7 @@
 //! |---|---|---|
 //! | FITS | SUSPECT | `phi_raw >= theta_sus` or the pressure term, on [`FITS_TO_SUSPECT_TICKS`] consecutive S1 ticks |
 //! | SUSPECT | FITS | `phi_raw < theta_sus / 2` and no pressure, on [`SUSPECT_TO_FITS_TICKS`] consecutive ticks |
-//! | SUSPECT | building | all of (a) `excess >= C_build`; (b) the predicted saving `phi_raw - phi_z >= theta_enter`, unless the pressure term is on, and the measured saving `phi_meas - phi_z >= theta_enter` in some class; (c) `phi_raw >= theta_sus` or the pressure term; (d) a [`ZSelect::dwell`] since the last switch; (e) the sampler has a reading of the partitions as they are, has not declined them, and the wasted-build budget has not suspended building |
+//! | SUSPECT | building | all of (a) `excess >= C_build`, or, eager ([`ZSelect::set_eager`]) and no build cancelled nor COMPACT left yet, the partitions unchanged for [`EAGER_SETTLE`], in which case the measured half of (b) is waived too, the first build being bought on the prediction before any read has wasted its price; (b) the predicted saving `phi_raw - phi_z >= theta_enter`, unless the pressure term is on, and the measured saving `phi_meas - phi_z >= theta_enter` in some class; (c) `phi_raw >= theta_sus` or the pressure term; (d) a [`ZSelect::dwell`] since the last switch; (e) the sampler has a reading of the partitions as they are, has not declined them, and the wasted-build budget has not suspended building |
 //! | building | SUSPECT | the measured saving is under `theta_enter / 2` in every class with evidence, on [`VANISH_INTERVALS`] evidence intervals; or the budget trips; or the sampler declines the partitions. The build is cancelled and **counts as a switch** |
 //! | building | COMPACT | form files attached for at least [`COVERED_ENOUGH`] of the covered footprint |
 //! | COMPACT | SUSPECT | **E1** the maximum of the smoothed `phi_raw`, with the part of the model's error that is positive added, over a dwell is under `theta_sus / 2`, the pressure term is off throughout, and the scans have not been held against the model; **E3** the realized saving, the raw form's believed rate less `phi_meas_z`, stays under `saving*` for a dwell; **E2** the trial says the raw form fits |
@@ -230,6 +230,12 @@ pub const REFAULT_WINDOW: Duration = Duration::from_secs(5);
 /// The valid operations of one class an interval must hold before its rate
 /// says anything: below it a rate is a handful of faults and not a measure.
 pub const MIN_EVIDENCE_OPS: u64 = 64;
+/// How long the partitions must have stood still before an eager selector
+/// ([`ZSelect::set_eager`]) buys the form on the model's prediction alone,
+/// without the rent: a store under rewrite -- a load's seals and merges --
+/// would have its build cancelled by the next merge, and a cancelled build
+/// is a switch that costs a dwell.
+pub const EAGER_SETTLE: Duration = Duration::from_secs(2);
 /// The group's refaults a second above which the pressure term is on: the
 /// group is refaulting, the store's own faults and other readers' alike, and
 /// the model, which prices this store against the whole budget, cannot say
@@ -1046,6 +1052,17 @@ pub struct ZSelect {
     /// When evidence was last added or the excess last halved.
     excess_anchor: Duration,
     last_switch: Option<Duration>,
+    /// Whether the first build is bought at SUSPECT on the model's
+    /// prediction once the sampler has priced it and the partitions have
+    /// stood for [`EAGER_SETTLE`], without the rent (`set_eager`).
+    eager: bool,
+    /// The eager purchase made, or a purchase undone: a build cancelled or
+    /// COMPACT left. From then on the rent governs, since an eager entry
+    /// that could buy again after every exit would buy a form that does not
+    /// pay once a dwell, forever, where the rent asks the evidence each time.
+    eager_spent: bool,
+    /// When the generation last changed, for the settle.
+    gen_changed_at: Duration,
     /// The wall time of the last build or cancelled build; the dwell and the
     /// retention are multiples of it.
     last_build_wall: Duration,
@@ -1096,6 +1113,9 @@ impl ZSelect {
             excess: 0.0,
             excess_anchor: Duration::ZERO,
             last_switch: None,
+            eager: false,
+            eager_spent: false,
+            gen_changed_at: Duration::ZERO,
             last_build_wall: Duration::ZERO,
             build_started: Duration::ZERO,
             vanished: 0,
@@ -1173,6 +1193,19 @@ impl ZSelect {
     /// extra CPU since SUSPECT was entered.
     pub fn excess(&self) -> f64 {
         self.excess
+    }
+
+    /// Whether the first build is bought at SUSPECT on the model's
+    /// prediction, once the sampler has priced it and the partitions have
+    /// stood for [`EAGER_SETTLE`], instead of after the rent
+    /// (`Options::zpages_build_eager`); every purchase after a cancel or an
+    /// exit is the rent's.
+    pub fn set_eager(&mut self, on: bool) {
+        self.eager = on;
+    }
+
+    pub fn eager(&self) -> bool {
+        self.eager
     }
 
     /// Whether form files are being kept for a re-entry: the form was left (or a
@@ -1254,6 +1287,9 @@ impl ZSelect {
     /// that has its readings kept and its ticks counted at the period, so the
     /// ticks that FITS, SUSPECT and the smoothing count in are seconds.
     fn absorb(&mut self, input: &Input, now: Duration) -> bool {
+        if self.generation != input.generation {
+            self.gen_changed_at = now;
+        }
         self.generation = input.generation;
         if self
             .sampler
@@ -1620,8 +1656,15 @@ impl ZSelect {
         }
         // (a) the price is paid. (Only evidence adds to the rent, and the
         // measured saving below is a statement about this interval's: a step
-        // without evidence buys nothing however much rent stands.)
-        if self.excess < s.c_build {
+        // without evidence buys nothing however much rent stands.) Or, eager,
+        // the partitions have stood for the settle since they last changed
+        // and the model's prediction stands in for the rent: the form is
+        // bought before any read has wasted its price, on the prediction
+        // that every read would.
+        let settled = self.eager
+            && !self.eager_spent
+            && now.saturating_sub(self.gen_changed_at) >= EAGER_SETTLE;
+        if !settled && self.excess < s.c_build {
             return false;
         }
         // (c) the model is not contradicting: it does not say FITS, or the
@@ -1643,9 +1686,10 @@ impl ZSelect {
                 .phi_z(Class::Read)
                 .is_some_and(|z| m.phi_raw - z >= self.theta_enter(Class::Read));
         predicted
-            && Class::ALL
-                .iter()
-                .any(|&c| ev.valid[c.ix()] && ev.saving[c.ix()] >= self.theta_enter(c))
+            && (settled
+                || Class::ALL
+                    .iter()
+                    .any(|&c| ev.valid[c.ix()] && ev.saving[c.ix()] >= self.theta_enter(c)))
     }
 
     fn building(&mut self, input: &Input, now: Duration, tripped: bool) -> Option<Event> {
@@ -1705,6 +1749,7 @@ impl ZSelect {
     /// the budget tripped (and building is suspended), or the sampler declined
     /// the partitions (and the build clause refuses them until it does not).
     fn cancel(&mut self, now: Duration, why: Cancel) -> Event {
+        self.eager_spent = true;
         self.last_build_wall = now.saturating_sub(self.build_started);
         self.last_switch = Some(now);
         self.counts.switches += 1;
@@ -1843,6 +1888,7 @@ impl ZSelect {
     }
 
     fn exit(&mut self, why: Exit, now: Duration) -> Event {
+        self.eager_spent = true;
         self.last_switch = Some(now);
         self.counts.switches += 1;
         self.counts.exits[why as usize] += 1;
@@ -3094,6 +3140,7 @@ mod tests {
             (0.5, Duration::from_secs(5))
         );
         assert_eq!((MIN_EVIDENCE_OPS, PRESSURE_REFAULTS_PER_S), (64, 256.0));
+        assert_eq!(EAGER_SETTLE, Duration::from_secs(2));
         assert_eq!(
             (S1_PERIOD, CENSUS_INTERVAL),
             (Duration::from_secs(1), Duration::from_millis(100))
@@ -3702,6 +3749,58 @@ mod tests {
         sim.run(dwell.as_secs_f64());
         assert_eq!(sim.sel.excess(), rent / 4.0);
         assert_eq!(sim.sel.counts().builds, 0);
+    }
+
+    /// An eager selector buys the form once the sampler has priced it and the
+    /// partitions have stood for the settle, on the model's prediction alone;
+    /// the rent, at the same point, is short of the price and the selector
+    /// as shipped has bought nothing.
+    #[test]
+    fn an_eager_selector_buys_once_priced_and_settled_where_the_rent_waits() {
+        let cell = Cell::ten_million();
+        let mut lazy = Sim::new(cell.clone(), cell.uniform());
+        let mut eager = Sim::new(cell.clone(), cell.uniform());
+        assert!(!lazy.sel.eager());
+        eager.sel.set_eager(true);
+        lazy.run(8.0);
+        eager.run(8.0);
+        assert_eq!(lazy.sel.counts().builds, 0, "the rent waits");
+        assert!(
+            lazy.sel.excess() < cell.price,
+            "{} of {}",
+            lazy.sel.excess(),
+            cell.price
+        );
+        assert_eq!(eager.sel.counts().builds, 1, "bought on the prediction");
+        assert!(
+            matches!(eager.last.phase, Phase::Building | Phase::Compact),
+            "{:?}",
+            eager.last.phase
+        );
+    }
+
+    /// Eager is not reckless: while the partitions change at every step, a
+    /// load's seals and merges, nothing is bought, since the next merge would
+    /// cancel the build; once they have stood for the settle, it is.
+    #[test]
+    fn an_eager_selector_waits_out_a_store_under_rewrite() {
+        let cell = Cell::ten_million();
+        let mut sim = Sim::new(cell.clone(), cell.uniform());
+        sim.sel.set_eager(true);
+        sim.run_with(5.0, |s| s.generation += 1);
+        assert_eq!(
+            sim.sel.counts().builds,
+            0,
+            "a store under rewrite is not bought"
+        );
+        sim.run(EAGER_SETTLE.as_secs_f64() - 0.3);
+        assert_eq!(sim.sel.counts().builds, 0, "not before the settle");
+        sim.run(1.0);
+        assert_eq!(
+            sim.sel.counts().builds,
+            1,
+            "bought once the partitions have stood"
+        );
     }
 
     // ---- hysteresis ----------------------------------------------------------------
@@ -7198,7 +7297,7 @@ mod tests {
     /// the last two of three hours, whatever the cache, the neighbours and the
     /// threads, and where the numbers pick a place it rests in it -- a form
     /// that saves the entry threshold is kept, one that loses is not.
-    fn constant_workloads_come_to_rest(cache: u64) {
+    fn constant_workloads_come_to_rest(cache: u64, eager: bool) {
         let base = Cell::ten_million();
         let sel = ZSelect::new();
         let (mut kept, mut suspect) = (0, 0);
@@ -7212,6 +7311,7 @@ mod tests {
                 };
                 for (name, load) in constant_loads(&cell) {
                     let mut sim = Sim::new(cell.clone(), load);
+                    sim.sel.set_eager(eager);
                     sim.run(3600.0);
                     let before = sim.sel.counts().switches;
                     sim.run(2.0 * 3600.0);
@@ -7241,27 +7341,39 @@ mod tests {
 
     #[test]
     fn constant_workloads_come_to_rest_at_700_mb() {
-        constant_workloads_come_to_rest(700_000_000);
+        constant_workloads_come_to_rest(700_000_000, false);
     }
 
     #[test]
     fn constant_workloads_come_to_rest_at_937_mb() {
-        constant_workloads_come_to_rest(937_000_000);
+        constant_workloads_come_to_rest(937_000_000, false);
+    }
+
+    /// The eager entry changes when the form is first bought and nothing
+    /// after: the same grid comes to rest under it.
+    #[test]
+    fn constant_workloads_come_to_rest_eager_at_700_mb() {
+        constant_workloads_come_to_rest(700_000_000, true);
+    }
+
+    #[test]
+    fn constant_workloads_come_to_rest_eager_at_937_mb() {
+        constant_workloads_come_to_rest(937_000_000, true);
     }
 
     #[test]
     fn constant_workloads_come_to_rest_at_1300_mb() {
-        constant_workloads_come_to_rest(1_300_000_000);
+        constant_workloads_come_to_rest(1_300_000_000, false);
     }
 
     #[test]
     fn constant_workloads_come_to_rest_at_2_gb() {
-        constant_workloads_come_to_rest(2_000_000_000);
+        constant_workloads_come_to_rest(2_000_000_000, false);
     }
 
     #[test]
     fn constant_workloads_come_to_rest_at_4_gib() {
-        constant_workloads_come_to_rest(4 << 30);
+        constant_workloads_come_to_rest(4 << 30, false);
     }
 
     #[test]

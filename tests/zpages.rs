@@ -4835,6 +4835,69 @@ fn the_z_reader_agrees_with_the_blob_on_every_scan_window() {
 /// spawned for it, and the directory is a store under `Off`'s, file for
 /// file; and every read and scan answers the model.
 #[test]
+fn an_eager_auto_store_buys_the_form_before_any_read() {
+    // The controller as shipped buys the form once the readers have wasted
+    // its price in faults (the ski rental); with `Options::zpages_build_eager`
+    // it buys at SUSPECT on the model's prediction, once the sampler has
+    // priced the partitions and they have stood for the settle, and no read
+    // need happen first. Both stores sit in SUSPECT under the seam's budget
+    // with the group's pressure term on, as the build tests have it, so the
+    // predicted saving holds whatever the sampler makes of a store this
+    // small; ticks of the injected clock and nothing else: the eager one
+    // builds, the other does not, since the rent and the measured saving
+    // both want reads.
+    assert!(
+        !Options::default().zpages_build_eager,
+        "the rent is the entry as shipped"
+    );
+    for eager in [false, true] {
+        let dir = scratch(&format!("eager-{eager}"));
+        let inject = std::sync::Arc::new(supdb::ZInject::new());
+        inject.set_budget(1 << 20);
+        inject.set_refault_rate(1_000_000.0);
+        inject.set_fault_cost(FAULT_1MS);
+        inject.advance(std::time::Duration::from_millis(1));
+        let mut db = Db::create(
+            &dir,
+            Options {
+                zpages: ZPages::Auto,
+                zpages_min_bytes: 0,
+                zpages_build_eager: eager,
+                zpages_inject: Some(inject.clone()),
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let _model = ordered_load(&mut db, 20_000, 0x4AA);
+        db.settle().unwrap();
+        for _ in 0..2 {
+            inject.advance(std::time::Duration::from_secs(1));
+            wait_tick(&db);
+        }
+        let c = db.zpage_counts();
+        // SUSPECT, or, eager, already past it: the settle may have run out
+        // inside the two ticks.
+        assert!(
+            c.gate >= 1 && (c.phase == 1 || (eager && c.phase >= 2)),
+            "SUSPECT or past it: {c:?}"
+        );
+        let bought = tick_until(&db, 80, |c| c.sel_builds >= 1);
+        let c = db.zpage_counts();
+        if eager {
+            assert!(bought, "the eager store buys without a read: {c:?}");
+            assert!(
+                tick_until(&db, 80, |c| c.sel_installs >= 1),
+                "and installs: {:?}",
+                db.zpage_counts()
+            );
+        } else {
+            assert!(!bought, "the rent buys nothing without a read: {c:?}");
+            assert_eq!(c.sel_builds, 0);
+        }
+    }
+}
+
+#[test]
 fn an_auto_store_that_fits_builds_nothing() {
     let files_of = |dir: &Path| -> Vec<String> {
         let mut v: Vec<String> = std::fs::read_dir(dir)
