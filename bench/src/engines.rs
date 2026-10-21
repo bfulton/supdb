@@ -2901,6 +2901,26 @@ impl Supdb {
         )
     }
 
+    /// `supdb-cache256tofit` with the second form the controller's to
+    /// choose: the block cache's merged forms over the hot blocks, kept to
+    /// fit 256 MB, beside the compact form for the rest of the store. The
+    /// pair against `supdb-nocacheautozpages` prices the cache under a
+    /// bound: what E, A, B and F gain from the merged forms of the Zipfian
+    /// head against what the point reads lose to the page cache the cache
+    /// displaces; against `supdb-cache256tofit`, what the compact form
+    /// adds to the cache arm out of core.
+    pub fn create_cache256_tofit_auto_zpages(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 256 << 20,
+                tofit: true,
+                zpages_auto: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-cache256tofit` without the trim (`Options::forms_trim_bytes`
     /// zero): against it, the part of the saving that is the allocator's
     /// free pages given back; against `supdb-cache256`, the part that is
@@ -4410,6 +4430,11 @@ impl ThreadReader for TallyReader {
 
 impl Engine for Supdb {
     fn name(&self) -> &'static str {
+        // Before the budget branch, which would name the policy the cache
+        // arm whatever else it carries.
+        if self.budget > 0 && self.tofit && self.zpages_auto {
+            return "supdb-cache256tofitautozpages";
+        }
         if self.budget > 0 {
             return if self.tofit && self.notrim {
                 "supdb-cache256tofitnotrim"
@@ -5857,6 +5882,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocachezpagessettle"
         | "supdb-autozpages"
         | "supdb-nocacheautozpages"
+        | "supdb-cache256tofitautozpages"
         | "supdb-nocacheautozpagesfairio"
         | "supdb-nocacheautozpagesnoahead"
         | "supdb-nocacheautozpageseager"
@@ -6046,6 +6072,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nocachezpagesrankwalk" => Box::new(Supdb::create_nocache_zpages_rankwalk(dir)?),
         "supdb-nocachezpagessettle" => Box::new(Supdb::create_nocache_zpages_settle(dir)?),
         "supdb-autozpages" => Box::new(Supdb::create_auto_zpages(dir)?),
+        "supdb-cache256tofitautozpages" => Box::new(Supdb::create_cache256_tofit_auto_zpages(dir)?),
         "supdb-nocacheautozpages" => Box::new(Supdb::create_nocache_auto_zpages(dir)?),
         "supdb-nocacheautozpagesfairio" => Box::new(Supdb::create_nocache_auto_zpages_fairio(dir)?),
         "supdb-nocacheautozpagesnoahead" => {
@@ -6893,6 +6920,12 @@ mod tests {
                 Supdb::create_nocache_auto_zpages,
                 "supdb-nocache",
                 Supdb::create_nocache,
+            ),
+            (
+                "supdb-cache256tofitautozpages",
+                Supdb::create_cache256_tofit_auto_zpages,
+                "supdb-cache256tofit",
+                Supdb::create_cache256_tofit,
             ),
         ] {
             let arm = new(name, make);

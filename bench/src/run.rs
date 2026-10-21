@@ -558,6 +558,18 @@ fn counters_line(
             "snapshot_extends",
             "canon_tried",
             "canon_hit",
+            // The compact form's, for a mix read through it: what a scan
+            // of the Zipfian head opens and decodes, and what the memo
+            // answers.
+            "zpage_reads",
+            "zpage_scans",
+            "zpage_scan_groups",
+            "zpage_decodes",
+            "zpage_memo_hits",
+            "zpage_memo_misses",
+            "zpage_prefetches",
+            "zpage_nopage_scans",
+            "zpage_raw_scans",
         ];
         let ev: Vec<String> = names.iter().map(|n| format!("{n} {:.0}", d(n))).collect();
         eprintln!("{tag}-events {arm} {point} {}", ev.join(" | "));
