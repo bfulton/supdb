@@ -1,0 +1,73 @@
+16022.70 bench: bound 671088640 bytes in group /sys/fs/cgroup/memory/process_api/01a15f1b-c27d-77e0-a213-eef931631a8d/claude-code-bash/supdb-bench-27719
+16022.70 bench ab: supdb-nocacheautozpages against supdb-cache64tofitautozpages at 5000000 keys, scans of 100, 1 pairs after a warmup, under a bound of 671088640 bytes, passes load,mixes, ops divided by 10
+16022.76 phasemark supdb-nocacheautozpages load start 16022.763371437
+16028.65 phasemark supdb-nocacheautozpages load sync 16028.650809063
+16028.69 phasemark supdb-nocacheautozpages load end 16028.695604033
+16028.69 phasemark supdb-nocacheautozpages ycsb-C start 16028.696171692
+16029.97 phasemark supdb-nocacheautozpages ycsb-C end 16029.969552114
+16029.97 mixcounters supdb-nocacheautozpages C flt up 0 main 4425 memfree_mb 14784 burst_ms 0.0 pass_ms 1187.0 | ph take 0.00 sync 0.00 settle 0.00 snap 0.00 ahead 0.00 install 0.00 | thread 0.0ms/0p maint 7.0ms | built up 0 eng 0 rd 0 cloned 0 | snaps 0 refr 0 | walks 0/0/0 starts 0/0 | pieces 0 unsealed 0 handles-scans 0 | z reads 0 dec 0 scans 0 groups 0 memo 0/0 pf 0
+16029.97 phasemark supdb-nocacheautozpages ycsb-B start 16029.970321488
+16030.67 phasemark supdb-nocacheautozpages ycsb-B end 16030.673924780
+16030.67 mixcounters supdb-nocacheautozpages B flt up 0 main 1324 memfree_mb 14778 burst_ms 0.0 pass_ms 604.4 | ph take 0.00 sync 0.00 settle 0.00 snap 0.00 ahead 0.00 install 0.00 | thread 0.1ms/41p maint 4.2ms | built up 0 eng 0 rd 0 cloned 0 | snaps 0 refr 0 | walks 0/0/0 starts 0/0 | pieces 0 unsealed 2679 handles-scans 0 | z reads 0 dec 0 scans 0 groups 0 memo 0/0 pf 0
+16030.67 phasemark supdb-nocacheautozpages ycsb-A start 16030.674488327
+16031.37 phasemark supdb-nocacheautozpages ycsb-A end 16031.372939270
+16031.37 mixcounters supdb-nocacheautozpages A flt up 0 main 620 memfree_mb 14786 burst_ms 0.0 pass_ms 609.0 | ph take 0.00 sync 0.00 settle 0.00 snap 0.00 ahead 0.00 install 0.00 | thread 0.7ms/398p maint 4.2ms | built up 0 eng 0 rd 0 cloned 0 | snaps 0 refr 0 | walks 0/0/0 starts 0/0 | pieces 0 unsealed 23232 handles-scans 0 | z reads 0 dec 0 scans 0 groups 0 memo 0/0 pf 0
+16031.37 phasemark supdb-nocacheautozpages ycsb-F start 16031.373545175
+16032.43 phasemark supdb-nocacheautozpages ycsb-F end 16032.437830215
+16032.44 mixcounters supdb-nocacheautozpages F flt up 0 main 931 memfree_mb 14787 burst_ms 0.0 pass_ms 972.2 | ph take 0.00 sync 0.00 settle 0.00 snap 0.00 ahead 0.00 install 0.00 | thread 1.0ms/393p maint 6.0ms | built up 0 eng 0 rd 0 cloned 0 | snaps 0 refr 0 | walks 0/0/0 starts 0/0 | pieces 0 unsealed 40715 handles-scans 0 | z reads 0 dec 0 scans 0 groups 0 memo 0/0 pf 0
+16032.44 phasemark supdb-nocacheautozpages ycsb-D start 16032.438566795
+16033.66 phasemark supdb-nocacheautozpages ycsb-D end 16033.663961326
+16033.66 mixcounters supdb-nocacheautozpages D flt up 0 main 426 memfree_mb 14753 burst_ms 0.0 pass_ms 1225.4 | ph take 0.00 sync 0.00 settle 0.00 snap 0.00 ahead 0.00 install 0.00 | thread 0.1ms/41p maint 8.0ms | built up 0 eng 0 rd 0 cloned 0 | snaps 0 refr 0 | walks 0/0/0 starts 0/0 | pieces 0 unsealed 44899 handles-scans 0 | z reads 0 dec 0 scans 0 groups 0 memo 0/0 pf 0
+16033.66 phasemark supdb-nocacheautozpages ycsb-E start 16033.664526778
+16035.70 phasemark supdb-nocacheautozpages ycsb-E end 16035.698430023
+16035.70 mixcounters supdb-nocacheautozpages E flt up 0 main 833 memfree_mb 14710 burst_ms 0.0 pass_ms 1943.0 | ph take 3.84 sync 4.16 settle 0.00 snap 11.03 ahead 0.00 install 0.00 | thread 0.0ms/2p maint 12.9ms | built up 0 eng 0 rd 0 cloned 0 | snaps 1 refr 0 | walks 0/0/0 starts 0/0 | pieces 0 unsealed 49035 handles-scans 0 | z reads 0 dec 0 scans 0 groups 0 memo 0/0 pf 0
+16036.31 phasemark supdb-nocacheautozpages load start 16036.311492632
+16047.10 phasemark supdb-nocacheautozpages load sync 16047.106529868
+16053.90 phasemark supdb-nocacheautozpages load end 16053.902102875
+16054.51 phasemark supdb-cache64tofitautozpages load start 16054.517042859
+16060.70 phasemark supdb-cache64tofitautozpages load sync 16060.706330447
+16060.75 phasemark supdb-cache64tofitautozpages load end 16060.754935472
+16060.75 phasemark supdb-cache64tofitautozpages ycsb-C start 16060.755568130
+16061.77 phasemark supdb-cache64tofitautozpages ycsb-C end 16061.769686883
+16061.77 mixcounters supdb-cache64tofitautozpages C flt up 0 main 3714 memfree_mb 14789 burst_ms 0.0 pass_ms 926.1 | ph take 0.00 sync 0.00 settle 0.00 snap 0.00 ahead 0.00 install 0.00 | thread 0.0ms/0p maint 6.7ms | built up 0 eng 0 rd 0 cloned 0 | snaps 0 refr 0 | walks 0/0/0 starts 0/0 | pieces 0 unsealed 0 handles-scans 0 | z reads 0 dec 0 scans 0 groups 0 memo 0/0 pf 0
+16061.77 phasemark supdb-cache64tofitautozpages ycsb-B start 16061.770324712
+16062.43 phasemark supdb-cache64tofitautozpages ycsb-B end 16062.430390627
+16062.43 mixcounters supdb-cache64tofitautozpages B flt up 0 main 1217 memfree_mb 14787 burst_ms 0.0 pass_ms 573.5 | ph take 0.00 sync 0.00 settle 0.00 snap 0.00 ahead 0.00 install 0.00 | thread 0.1ms/40p maint 4.7ms | built up 0 eng 0 rd 0 cloned 0 | snaps 0 refr 0 | walks 0/0/0 starts 0/0 | pieces 0 unsealed 2679 handles-scans 0 | z reads 0 dec 0 scans 0 groups 0 memo 0/0 pf 0
+16062.43 phasemark supdb-cache64tofitautozpages ycsb-A start 16062.430966636
+16062.96 phasemark supdb-cache64tofitautozpages ycsb-A end 16062.963752975
+16062.96 mixcounters supdb-cache64tofitautozpages A flt up 0 main 576 memfree_mb 14779 burst_ms 0.0 pass_ms 439.6 | ph take 0.00 sync 0.00 settle 0.00 snap 0.00 ahead 0.00 install 0.00 | thread 0.9ms/405p maint 3.2ms | built up 0 eng 0 rd 0 cloned 0 | snaps 0 refr 0 | walks 0/0/0 starts 0/0 | pieces 0 unsealed 23232 handles-scans 0 | z reads 0 dec 0 scans 0 groups 0 memo 0/0 pf 0
+16062.96 phasemark supdb-cache64tofitautozpages ycsb-F start 16062.964346445
+16063.70 phasemark supdb-cache64tofitautozpages ycsb-F end 16063.699611182
+16063.70 mixcounters supdb-cache64tofitautozpages F flt up 0 main 1002 memfree_mb 14768 burst_ms 0.0 pass_ms 649.1 | ph take 0.00 sync 0.00 settle 0.00 snap 0.00 ahead 0.00 install 0.00 | thread 0.9ms/406p maint 4.0ms | built up 0 eng 0 rd 0 cloned 0 | snaps 0 refr 0 | walks 0/0/0 starts 0/0 | pieces 0 unsealed 40715 handles-scans 0 | z reads 0 dec 0 scans 0 groups 0 memo 0/0 pf 0
+16063.70 phasemark supdb-cache64tofitautozpages ycsb-D start 16063.700341722
+16065.00 phasemark supdb-cache64tofitautozpages ycsb-D end 16065.002433367
+16065.00 mixcounters supdb-cache64tofitautozpages D flt up 0 main 381 memfree_mb 14728 burst_ms 0.0 pass_ms 1302.1 | ph take 0.00 sync 0.00 settle 0.00 snap 0.00 ahead 0.00 install 0.00 | thread 0.2ms/41p maint 9.7ms | built up 0 eng 0 rd 0 cloned 0 | snaps 0 refr 0 | walks 0/0/0 starts 0/0 | pieces 0 unsealed 44899 handles-scans 0 | z reads 0 dec 0 scans 0 groups 0 memo 0/0 pf 0
+16065.00 phasemark supdb-cache64tofitautozpages ycsb-E start 16065.003105674
+16066.19 phasemark supdb-cache64tofitautozpages ycsb-E end 16066.193064370
+16066.19 mixcounters supdb-cache64tofitautozpages E flt up 44 main 599 memfree_mb 14717 burst_ms 0.0 pass_ms 1094.2 | ph take 3.45 sync 3.87 settle 0.01 snap 8.11 ahead 0.07 install 8.03 | thread 1.8ms/41p maint 7.6ms | built up 0 eng 15299 rd 0 cloned 0 | snaps 1 refr 0 | walks 78631/30410/18321 starts 50978/0 | pieces 0 unsealed 49035 handles-scans 0 | z reads 0 dec 0 scans 0 groups 0 memo 0/0 pf 0
+16066.69 phasemark supdb-cache64tofitautozpages load start 16066.697624354
+16077.22 phasemark supdb-cache64tofitautozpages load sync 16077.219760935
+16085.49 phasemark supdb-cache64tofitautozpages load end 16085.488776644
+16085.96     63s  rep 0/1 (warmup)
+16085.99 phasemark supdb-cache64tofitautozpages load start 16085.993792942
+16091.94 phasemark supdb-cache64tofitautozpages load sync 16091.943793870
+16092.00 phasemark supdb-cache64tofitautozpages load end 16092.003338651
+16092.00 phasemark supdb-cache64tofitautozpages ycsb-C start 16092.003981664
+16093.45 phasemark supdb-cache64tofitautozpages ycsb-C end 16093.457419750
+16093.46 mixcounters supdb-cache64tofitautozpages C flt up 0 main 3467 memfree_mb 14828 burst_ms 0.0 pass_ms 1347.0 | ph take 0.00 sync 0.00 settle 0.00 snap 0.00 ahead 0.00 install 0.00 | thread 0.0ms/0p maint 11.0ms | built up 0 eng 0 rd 0 cloned 0 | snaps 0 refr 0 | walks 0/0/0 starts 0/0 | pieces 0 unsealed 0 handles-scans 0 | z reads 0 dec 0 scans 0 groups 0 memo 0/0 pf 0
+16093.46 phasemark supdb-cache64tofitautozpages ycsb-B start 16093.458067920
+16094.24 phasemark supdb-cache64tofitautozpages ycsb-B end 16094.243429165
+16094.24 mixcounters supdb-cache64tofitautozpages B flt up 0 main 1100 memfree_mb 14825 burst_ms 0.0 pass_ms 675.1 | ph take 0.00 sync 0.00 settle 0.00 snap 0.00 ahead 0.00 install 0.00 | thread 0.1ms/42p maint 6.2ms | built up 0 eng 0 rd 0 cloned 0 | snaps 0 refr 0 | walks 0/0/0 starts 0/0 | pieces 0 unsealed 2679 handles-scans 0 | z reads 0 dec 0 scans 0 groups 0 memo 0/0 pf 0
+16094.24 phasemark supdb-cache64tofitautozpages ycsb-A start 16094.244044823
+16095.04 phasemark supdb-cache64tofitautozpages ycsb-A end 16095.043377518
+16095.04 mixcounters supdb-cache64tofitautozpages A flt up 0 main 1148 memfree_mb 14827 burst_ms 0.0 pass_ms 703.0 | ph take 0.00 sync 0.00 settle 0.00 snap 0.00 ahead 0.00 install 0.00 | thread 1.1ms/395p maint 6.4ms | built up 0 eng 0 rd 0 cloned 0 | snaps 0 refr 0 | walks 0/0/0 starts 0/0 | pieces 0 unsealed 23232 handles-scans 0 | z reads 0 dec 0 scans 0 groups 0 memo 0/0 pf 0
+16095.04 phasemark supdb-cache64tofitautozpages ycsb-F start 16095.043944521
+16096.21 phasemark supdb-cache64tofitautozpages ycsb-F end 16096.217697110
+16096.22 mixcounters supdb-cache64tofitautozpages F flt up 0 main 631 memfree_mb 14825 burst_ms 0.0 pass_ms 1056.8 | ph take 0.00 sync 0.00 settle 0.00 snap 0.00 ahead 0.00 install 0.00 | thread 1.2ms/406p maint 7.8ms | built up 0 eng 0 rd 0 cloned 0 | snaps 0 refr 0 | walks 0/0/0 starts 0/0 | pieces 0 unsealed 40715 handles-scans 0 | z reads 0 dec 0 scans 0 groups 0 memo 0/0 pf 0
+16096.22 phasemark supdb-cache64tofitautozpages ycsb-D start 16096.218623953
+16098.25 phasemark supdb-cache64tofitautozpages ycsb-D end 16098.251785819
+16098.25 mixcounters supdb-cache64tofitautozpages D flt up 0 main 298 memfree_mb 14770 burst_ms 0.0 pass_ms 2033.1 | ph take 0.00 sync 0.00 settle 0.00 snap 0.00 ahead 0.00 install 0.00 | thread 0.2ms/42p maint 12.4ms | built up 0 eng 0 rd 0 cloned 0 | snaps 0 refr 0 | walks 0/0/0 starts 0/0 | pieces 0 unsealed 44899 handles-scans 0 | z reads 0 dec 0 scans 0 groups 0 memo 0/0 pf 0
+16098.25 phasemark supdb-cache64tofitautozpages ycsb-E start 16098.252566846
+16099.46 phasemark supdb-cache64tofitautozpages ycsb-E end 16099.458925163
+16099.46 mixcounters supdb-cache64tofitautozpages E flt up 39 main 369 memfree_mb 14731 burst_ms 0.0 pass_ms 1114.3 | ph take 3.52 sync 3.80 settle 0.00 snap 6.92 ahead 0.05 install 7.75 | thread 1.6ms/42p maint 7.2ms | built up 0 eng 15277 rd 0 cloned 0 | snaps 1 refr 0 | walks 78631/30410/18321 starts 50978/0 | pieces 0 unsealed 49035 handles-scans 0 | z reads 0 dec 0 scans 0 groups 0 memo 0/0 pf 0
+16100.01 phasemark supdb-cache64tofitautozpages load start 16100.010001894
