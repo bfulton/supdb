@@ -527,3 +527,37 @@ cannot mark at three; the two orders agree on the wall, the install
 and every cell after it. Four mebibytes is the default now, the shape
 without a window the arm (`supdb-nocacheautozpagesnoahead`), under the
 gate before the controller is paired against the forced arm again.
+
+7.4 again with the window (`auto-ooc-forced5m-ab-{1,2}.out`, the forced
+arm against the controller's, five million keys under 512 MiB, three
+pairs a process, both orders): the load reads 1.16x and 1.24x for the
+controller, which builds nineteen form files a rep where the forced arm
+builds forty-seven at its seals and merges; the controller installs in
+every rep (the forced arm has nothing to install, its files come with
+the load); and the mixes, which now run after the install in every
+rep, read level in both orders (0.96-1.09x and 0.91-1.03x, no sign
+kept). What the controller still pays is the shift's latency: the read
+pass at 0.40x in both orders with six times the faults, the threaded
+reads at 0.16-0.23x, the single and two-thread scans at 0.09-0.13x,
+all before the build has landed, and the three-thread scan 0.27x and
+0.87x with the install inside it. Nothing marked at three pairs; the
+two orders agree on every cell. So the window closed the second half
+of the gap (the passes after the install) and left the first (the
+passes before it): the build starts 50-60 s after the first read by the
+rental, and lands 30-60 s after that.
+
+The next lever is the rental's wait. The controller enters SUSPECT
+during the load, when the raw form outgrows the budget, and has the
+sampler's price within seconds; it then waits for the readers to waste
+the build's price in faults before it buys, by design (the entry is a
+price, not a streak, so a workload that stops loses at most twice the
+price). At the load's close the build is at its cheapest -- the records
+the load wrote are resident and the device idle -- and every read that
+comes before it lands is a fault the model already predicted. The arm
+to price: the build bought at SUSPECT once the sampler has priced it,
+without the rental's wait (`supdb-nocacheautozpageseager`), whose loss
+case is a store that is loaded, outgrows the budget and is never read
+(one build's CPU on a spare core at idle priority), against the
+rental's case, measured here: a hundred seconds of raw reads. The
+load's cost is the cell to watch, since the forced arm pays 16-24% of
+its load for building at every seal.
