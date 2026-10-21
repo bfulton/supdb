@@ -4897,6 +4897,54 @@ fn an_eager_auto_store_buys_the_form_before_any_read() {
     }
 }
 
+#[test]
+fn an_eager_auto_store_waits_for_the_segment_work_in_flight() {
+    // The eager store of the test above buys within a few ticks of the
+    // settle; with a seal held in flight it buys nothing, however many
+    // ticks pass, since the landing would supersede the build, and it buys
+    // once the seal has landed and the settle has passed from there.
+    let dir = scratch("eager-inflight");
+    let inject = std::sync::Arc::new(supdb::ZInject::new());
+    inject.set_budget(1 << 20);
+    inject.set_refault_rate(1_000_000.0);
+    inject.set_fault_cost(FAULT_1MS);
+    inject.advance(std::time::Duration::from_millis(1));
+    let mut db = Db::create(
+        &dir,
+        Options {
+            zpages: ZPages::Auto,
+            zpages_min_bytes: 0,
+            zpages_build_eager: true,
+            zpages_inject: Some(inject.clone()),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let _model = ordered_load(&mut db, 20_000, 0x4AB);
+    db.settle().unwrap();
+    db.hold_seal_landing(true);
+    db.append(&spaced_key(7), b"in-flight");
+    db.commit().unwrap();
+    db.seal().unwrap();
+    for _ in 0..2 {
+        inject.advance(std::time::Duration::from_secs(1));
+        wait_tick(&db);
+    }
+    let bought = tick_until(&db, 80, |c| c.sel_builds >= 1);
+    let c = db.zpage_counts();
+    assert!(!bought, "nothing is bought with a seal in flight: {c:?}");
+    assert!(c.gate >= 1, "SUSPECT all the same: {c:?}");
+    db.hold_seal_landing(false);
+    db.settle().unwrap();
+    assert!(
+        tick_until(&db, 80, |c| c.sel_builds >= 1),
+        "bought once the seal has landed: {:?}",
+        db.zpage_counts()
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The model's populations of a store: the hash regions and the record
 /// regions of its partition files, each summed from the file's own header,
 /// and the key sections whole.

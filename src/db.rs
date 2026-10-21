@@ -914,9 +914,11 @@ pub struct Options {
     pub zpages_build_ahead: usize,
     /// Whether the controller buys its first form at SUSPECT on the model's
     /// prediction, once the sampler has priced it and the partitions have
-    /// stood for `zselect::EAGER_SETTLE`, instead of after the ski rental's
-    /// wait for the readers to waste the build's price; every purchase after
-    /// a cancel or an exit is the rent's. Off as shipped: the
+    /// stood for `zselect::EAGER_SETTLE` with nothing of the segment work in
+    /// flight (`zselect::Input::rewriting`: a merge, a promotion or a seal,
+    /// whose landing would supersede the build), instead of after the ski
+    /// rental's wait for the readers to waste the build's price; every
+    /// purchase after a cancel or an exit is the rent's. Off as shipped: the
     /// rent bounds the loss of a workload that stops at twice the price,
     /// and the eager entry's loss case is a store that is loaded, outgrows
     /// the budget and is never read. `supdb-nocacheautozpageseager` is the
@@ -31798,6 +31800,9 @@ impl Maint {
             census,
             build,
             footprint,
+            rewriting: self.compacting.is_some()
+                || self.tiering.is_some()
+                || !self.sealing.is_empty(),
         };
         let d = self.zsel.step(&input);
         self.z_apply(&d, model.as_ref(), &input);
