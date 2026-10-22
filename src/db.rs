@@ -32266,10 +32266,19 @@ impl Maint {
             0.0
         };
         let build_cpu = fill_per_record * nkeys as f64;
-        let decode_per_page = if groups > 0 {
-            decode_ns as f64 * 1e-9 / groups as f64
-        } else {
-            0.0
+        // The decode as timed, or as the seam prices it: the thresholds
+        // below are a function of it, and a timed decode is the build
+        // profile's.
+        let injected = self
+            .opts
+            .zpages_inject
+            .as_ref()
+            .and_then(|i| i.decode_cost())
+            .map(|d| d.as_secs_f64());
+        let decode_per_page = match injected {
+            Some(d) => d,
+            None if groups > 0 => decode_ns as f64 * 1e-9 / groups as f64,
+            None => 0.0,
         };
         let t_f = (faults > 0).then(|| wait_ns as f64 * 1e-9 / faults as f64);
         let priced_t_f = t_f.unwrap_or(zselect::PRIOR_T_F);

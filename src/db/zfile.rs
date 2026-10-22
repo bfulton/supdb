@@ -2884,12 +2884,25 @@ pub struct ZInject {
     /// clock.
     pub clock_ns: AtomicU64,
     /// The major faults a handle's window reads, a count the test moves,
-    /// in place of the thread's own; `u64::MAX` for the thread's.
+    /// in place of the thread's own, from the seam's creation: zero until
+    /// the test adds some. It began as a sentinel for "the thread's" until
+    /// the first add, so a window opened before a test's first fault and
+    /// closed after it took the thread's count as its baseline and the
+    /// seam's as its end, and read one fault short whenever the thread had
+    /// taken one real major fault before the test's first read -- the test
+    /// binary's own text paged in after a large build, once in a gate run.
     pub faults: AtomicU64,
     /// The price of a fault, nanoseconds: a window's busy wall is then its
     /// CPU plus its faults at that price, so a test needs no bound to
     /// have faults cost anything; 0 for the wall as spent.
     pub fault_cost_ns: AtomicU64,
+    /// The decode of a page the sampler prices the compact form by,
+    /// nanoseconds, in place of the one it times; 0 for the timed one. The
+    /// selector's thresholds are a function of it, and a timed decode is
+    /// the build profile's: a hundred microseconds with a third of noise
+    /// in the dev profile against five optimized, so a test's premise
+    /// that sat on a threshold held in one profile and not the other.
+    pub decode_cost_ns: AtomicU64,
 }
 
 impl Default for ZInject {
@@ -2898,8 +2911,9 @@ impl Default for ZInject {
             budget: AtomicU64::new(0),
             refault_rate: AtomicU64::new(u64::MAX),
             clock_ns: AtomicU64::new(0),
-            faults: AtomicU64::new(u64::MAX),
+            faults: AtomicU64::new(0),
             fault_cost_ns: AtomicU64::new(0),
+            decode_cost_ns: AtomicU64::new(0),
         }
     }
 }
@@ -2950,16 +2964,10 @@ impl ZInject {
         }
     }
 
-    /// `n` more faults for the windows to read; from the first call the
-    /// windows read this count and not the thread's.
+    /// `n` more faults for the windows to read.
     pub fn add_faults(&self, n: u64) {
         let was = self.faults.load(Ordering::Acquire);
-        let now = if was == u64::MAX {
-            n
-        } else {
-            was.saturating_add(n)
-        };
-        self.faults.store(now, Ordering::Release);
+        self.faults.store(was.saturating_add(n), Ordering::Release);
     }
 
     /// The price of a fault the windows charge, in place of the wall.
@@ -2968,17 +2976,30 @@ impl ZInject {
         self.fault_cost_ns.store(ns, Ordering::Release);
     }
 
-    /// The injected fault count, if a test has moved it.
+    /// The injected fault count: the seam's from its creation, so that a
+    /// window's two readings are of one counter.
     pub fn faults(&self) -> Option<u64> {
-        match self.faults.load(Ordering::Acquire) {
-            u64::MAX => None,
-            n => Some(n),
-        }
+        Some(self.faults.load(Ordering::Acquire))
     }
 
     /// The injected price of a fault, if one is set.
     pub fn fault_cost(&self) -> Option<Duration> {
         match self.fault_cost_ns.load(Ordering::Acquire) {
+            0 => None,
+            ns => Some(Duration::from_nanos(ns)),
+        }
+    }
+
+    /// The decode of a page the sampler prices the compact form by, in
+    /// place of the one it times.
+    pub fn set_decode_cost(&self, d: Duration) {
+        let ns = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX).max(1);
+        self.decode_cost_ns.store(ns, Ordering::Release);
+    }
+
+    /// The injected decode of a page, if one is set.
+    pub fn decode_cost(&self) -> Option<Duration> {
+        match self.decode_cost_ns.load(Ordering::Acquire) {
             0 => None,
             ns => Some(Duration::from_nanos(ns)),
         }
@@ -3259,12 +3280,20 @@ mod tests {
         assert_eq!(i.clock(), Some(Duration::from_millis(1500)));
         i.advance(Duration::from_secs(1));
         assert_eq!(i.clock(), Some(Duration::from_millis(2500)));
-        assert_eq!((i.faults(), i.fault_cost()), (None, None));
+        // The fault count is the seam's from its creation, zero, so that
+        // a window opened before the first add and closed after it reads
+        // two values of one counter.
+        assert_eq!(
+            (i.faults(), i.fault_cost(), i.decode_cost()),
+            (Some(0), None, None)
+        );
         i.add_faults(3);
         i.add_faults(4);
         i.set_fault_cost(Duration::from_micros(40));
+        i.set_decode_cost(Duration::from_micros(5));
         assert_eq!(i.faults(), Some(7));
         assert_eq!(i.fault_cost(), Some(Duration::from_micros(40)));
+        assert_eq!(i.decode_cost(), Some(Duration::from_micros(5)));
     }
 
     /// A sample of a partition: thirty-two ranks, at each a chain of fills
