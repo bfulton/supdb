@@ -1134,3 +1134,30 @@ misses on the warm tail, which no copy of the hot head reaches; what
 would cut them is a cheaper decode or a memo that holds more in the
 same bytes, and the decode is priced next, by instruction, before
 either is built. The arm stays as the record, off as shipped.
+
+## The decode priced
+
+Counted before anything else is built for E, since the "5 of 7 µs" the
+promotion was built on took the sampler's decode-plus-walk figure for
+the decode alone (`zsample ... decode_per_page`, which walks every
+record of the group it decodes). Callgrind over `e_passes` at three
+hundred thousand keys in core, the forced nocache form, toggled on the
+harness's `get` and `range` (valgrind names the generic functions in
+their angle-bracket form, `<supdb::db::Reader>::scan_partitions::<...>`,
+and a toggle on the plain path collects nothing; the harness's
+`<Supdb as Engine>::get` and `::range` are outlined and hold the whole
+read): the point read's instructions are 60% LZ4 decompression and 13%
+the seek inside the group (`group_seek`), the fence's entry 4%, so a
+point read through the form is the decode; E's scan on the merge path
+is 6% decompression, 29% the walk itself, 11% key compares (`memcmp`),
+and about 20% the memtable's chain reads for the unsealed keys
+(`ByteArena::block` 8%, `has_tomb` 3%, `live_offs_into` 3%,
+`Snapshot::key_of` 3%, `entry`, `value_at`), 83,000 instructions a scan
+of fifty. The time profile in core agrees (perf over the same probe,
+the E window): decompression 13% of E's samples, `memcmp` 15%, the walk
+19%, the memtable's reads 15%. So E is the overlay's merge, not the
+decode, and the point reads are the decode; the bounded profile of the
+combined arm at five million keys (`perf-bound.sh`, `perfab/`) is what
+says where the block path's 7 µs a scan goes under the regime that
+matters, and a cheaper decode is the point reads' lever before it is
+E's.
