@@ -36,6 +36,9 @@
 //!   reruns as the same configuration and the same operations with the
 //!   cache off. Unset, no seed has the cache and the draw is not made, so a
 //!   seed's other choices are not those it makes under the three.
+//! - `ZFUZZ_PROMOTE`: set, with the form forced and the cache on, the `z`
+//!   store holds a block read a few entries' worth as a copy in its slot
+//!   under a small budget (`Options::zpages_promote_copies`).
 //! - `ZFUZZ_OPTVARY`: set, a seed turns compaction or promotion off, each
 //!   with a chance of 15%.
 //! - `ZFUZZ_SHAPES`: the key shapes a seed may draw from, as indexes from 0
@@ -225,6 +228,17 @@ fn opts_z(c: &Cfg) -> Options {
     if env_flag("ZFUZZ_ZPAGES") {
         o.zpages = supdb::ZPages::Always;
         o.zpages_min_bytes = 0;
+    }
+    // Under `ZFUZZ_PROMOTE` with the form forced and the cache on, a block
+    // read a few entries' worth is held as a copy in its slot and the
+    // cache sheds under a small budget (`Options::zpages_promote_copies`),
+    // so the copies, the sheds and the writes spliced into copies are read
+    // against the raw store over the same writes.
+    if env_flag("ZFUZZ_PROMOTE") && c.cache {
+        o.promote_entries = 8;
+        o.zpages_promote_copies = true;
+        o.scan_cache_bytes = 32 << 10;
+        o.forms_to_fit = true;
     }
     o
 }
