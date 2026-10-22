@@ -1008,3 +1008,68 @@ the snapshot and hides the case): red with the fix off, green with it
 on, and the four seeds, sixty-four seeds in two configurations and the
 concurrent range clean under it. The fix goes in after the chain that
 gates the block cache change, as a commit of its own.
+
+The pairings (`zcache-e5m-ab-{1,2}.*`, `zcache-lmdb5m-ab-{1,2}.*`; the
+raw-reads pairing below; the container restarted inside the third
+pairing's first sitting and it was run again on the same binary,
+`zcache-raw-5m.sh`). Against the controller's nocache arm, the combined
+arm with its reads through the form wins every mix in both orders --
+E 1.38x and 1.80x (3 of 3 pairs each way), D 1.24x and 1.27x, C 1.16x
+and 1.04x, F 1.08x and 1.12x, A 1.07x and 1.05x, B 1.00x and 1.04x --
+and faults on none of them, where the nocache arm takes 0.001-0.01 a
+read; three pairs mark nothing under Holm, and the sign holds in every
+cell of both orders. E's time by kind is the scans' alone, 6.1-7.6 µs
+a scan against the nocache arm's 10.6-12.9, the commits level at 31-49
+ms a mix in both. The passes before the install -- the point reads at
+twelve seconds, the scans at twenty-four, the install at 51-64 s in
+both arms -- read level: point reads 0.90-0.98x in one order and
+1.04-1.07x in the other, the scan passes 1.06-1.08x on one thread,
+0.96-1.02x on two, 1.10-1.43x on three, with the faults the same, so
+the cache costs the raw stretch nothing. The counters say what the
+cache does with E: 104,943 walks through the form file for 79,198
+scans (1.33 a scan, the runs between a sparse form's cuts, each a walk
+of its own), 75,768 groups opened from the file (0.96 a scan, the memo
+hitting 73% of 285,495 looks) against the nocache arm's 57,550 opens
+(0.73 a scan, 61% of 149,533), and 42 upkeep passes a mix, one a
+commit, against 1-4: at five million keys the Zipfian head's blocks
+hold fewer than `CACHE_DENSE` unsealed keys apiece, so E walks sparse
+forms through the form file rather than copies, and the win is the
+merge of the unsealed keys folded into the deltas, not the decodes,
+which the cache's walk opens more of.
+
+Against LMDB with its readahead off, E stands at 0.55x and 0.62x in the
+two orders (0.52-0.75x by rep), still a loss; A 4.9x and 4.2x, F 3.4x
+and 3.3x, B 1.2x and 1.5x; C 0.53x and 1.33x, which is LMDB's two
+shapes and not ours -- its C reads 543-913k a second across the reps
+where ours reads 372-624k with its gets at 1.7-2.1 µs in every rep; D
+0.82x and 0.74x, ours 4.1-5.8 µs a get with a group decoded for 77,551
+of 78,487 reads through the form (the mix reads the tail uniformly and
+the memo holds nothing of it). The passes before the install read the
+raw form, as every controller pairing has: point reads 0.36x, scans
+0.12x on one thread, at four and fourteen times LMDB's faults. The
+sitting's LMDB E is 209-265k a second where the earlier comparator
+sitting read it at 149-151k, so the move since the nocache arm's
+0.54-0.56x is not read across the two sittings; within this one the
+cache took E from the nocache arm's shape to 0.55-0.62x of LMDB's. What
+is left of E at 6-7 µs a scan against LMDB's four: the hot blocks
+walked as sparse forms, each run between cuts a `scan_at` of its own
+with a fence look, a memo look and the skip to the rank, and a decode
+for 0.96 of them -- levers to price are a cursor held across a sparse
+walk's cuts as the merge path holds its own (`ZCursor::walk_until`),
+the dense threshold against the memory it buys, and the memo's size
+over the head; none is built here.
+
+The raw-reads pairing (`zcache-raw5m-ab-{1,2}.*`, the combined arm with
+the cache's reads raw against the same arm with them through the form,
+both orders) prices the change itself in one process: the form-reads
+arm over the raw-reads arm reads E 2.8x and 2.6x, C 5.1x and 5.6x, D
+4.6x and 3.8x, B 2.9x and 2.8x, F 1.9x and 1.7x, A 1.8x and 1.8x, 3 of
+3 pairs in every cell of both orders, with the raw-reads arm faulting
+0.05-0.36 a read across the mixes and the form-reads arm 0.000; E's
+scans read 18-23 µs under the raw reads against 6.4-9.7 under the
+form's. The passes before the install are identical (point reads
+1.02x, scans 0.98x, the faults the same), since neither arm has a form
+to read yet. The refutation's mechanism, read from the other side: the
+cache's raw walks evicted the form the point reads needed, and with
+the walks through the form the cache keeps the compact working set and
+adds its merged forms to it.
