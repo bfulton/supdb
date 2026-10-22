@@ -500,6 +500,19 @@ suite's own arms answer most of these questions without a probe at all,
 and `bench ab` prices two of them in one process; reach for a probe only
 when no pair of arms isolates what you are asking.
 
+A decoder timed on one input is timed on an input it has learned. The
+form's LZ4 decode read 1.1 µs a page decoding one page over and over
+and 3.4 cycling the file's pages, and the cache level was not it:
+cycling 1, 4, 16, 64 and 256 pages of a file that fits L2 read 0.7,
+1.0, 2.0, 4.5 and 3.5 µs a page, the plateau the whole 20 MB file reads
+at. A decoder is a branch or two a token and the predictor learns a
+page's tokens inside a few repetitions, so the hot figure is nobody's
+and the cycling figure is a read's; liblz4 against `lz4_flex` read
+0.76-0.83 hot and 0.83-0.91 cycling. Time a decoder, a parser or any
+branchy walk over more distinct inputs than the predictor holds, a few
+hundred pages here (`bench/examples/zdecode.rs`, `--pages`), and read
+the figure where it has stopped climbing.
+
 A pass that reads bimodal across rounds is two shapes, not noise. The
 run keeper's lag pass at ten thousand keys read 2 µs a scan in four
 rounds and 15-36 in three, and the rounds split on the probe's own

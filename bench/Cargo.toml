@@ -36,6 +36,11 @@ heed = "0.20"
 # holding it (libclang.so, or libclang.dylib on macOS).
 rocksdb = { version = "0.23", default-features = false }
 
+# liblz4's decoder, for the probe that prices it against `lz4_flex` on the
+# form's own pages (`examples/zdecode.rs`, `--features lz4-c`). Optional, so
+# nothing the suite measures links the C library.
+lz4 = { version = "1", optional = true }
+
 [dev-dependencies]
 # The payload test checks that values compress to the compressibility asked
 # for, which is what makes every arm store the same bytes. The features are
@@ -52,6 +57,13 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std", "fra
 # the build without it: the pages come out byte for byte the same, and the
 # decode is what moves. Off for everything the suite measures.
 lz4-safe = ["lz4_flex/safe-encode", "lz4_flex/safe-decode"]
+# `zdecode` built with liblz4 beside the engine's decoder. Off for
+# everything the suite measures.
+lz4-c = ["dep:lz4"]
+
+[[example]]
+name = "zdecode"
+required-features = ["lz4-c"]
 
 # Cargo takes profiles from the root of the workspace being built, which is
 # this manifest, so the engine's own [profile.release] is ignored here and
