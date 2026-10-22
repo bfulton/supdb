@@ -14480,3 +14480,109 @@ fn a_load_nobody_reads_files_no_forms() {
         db.close().unwrap();
     }
 }
+
+/// The merge path's filing of the keys created since the scan snapshot
+/// depends on the snapshot and the log, never on which of the writer's
+/// operations read the log. A store with no partition yet -- a memtable
+/// alone, then a piece beside it -- scans on the merge path with the block
+/// cache on, and the keys created since its snapshot reach the walk through
+/// the side runs the scan files from the log read's list. A handle claimed
+/// between two scans reads the log for the forms (`publish_for_handle`)
+/// and, with no partition to hang them on, files nothing and refreshes
+/// nothing: the writer's next scan found the log read already, took the
+/// refresh for unneeded, and walked a snapshot short of every key created
+/// since the handle was claimed. The differential fuzz reached it in four
+/// seeds of forty-eight with the cache on in every seed.
+#[test]
+fn a_handle_claimed_between_two_scans_leaves_the_writers_scan_whole_before_the_first_partition() {
+    let d = dir("handle-between-scans");
+    // Compaction and promotion off, and partitions smaller than the seal's
+    // piece, so the piece is not named the first partition at its landing
+    // and the store has no partition through the whole test; the direct
+    // runs off, since the keys ascend from an empty store and a run's
+    // close at the first lower key is a freeze, which moves the
+    // generation and rebuilds the snapshot -- the shape here is a live
+    // table that stands across the claim.
+    let mut db = Db::create(
+        &d,
+        Options {
+            compact: false,
+            promote: false,
+            partition_bytes: Some(1 << 10),
+            direct_ingest: false,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert!(db.options().scan_block_cache, "the shape is the cache's");
+    let key = |k: u32| format!("k{k:05}").into_bytes();
+    type Model = BTreeMap<Vec<u8>, Vec<Vec<u8>>>;
+    let scanned = |r: &Reader| -> Model {
+        let mut m: Model = BTreeMap::new();
+        r.scan(b"", usize::MAX, |k, v| {
+            m.entry(k.to_vec()).or_default().push(v.to_vec())
+        })
+        .unwrap();
+        m
+    };
+    let mut model: Model = BTreeMap::new();
+    let write = |db: &mut Db, model: &mut Model, lo: u32, hi: u32, v: &[u8]| {
+        for k in lo..hi {
+            db.append(&key(k), v);
+            model.entry(key(k)).or_default().push(v.to_vec());
+        }
+    };
+    write(&mut db, &mut model, 0, 100, b"one");
+    db.commit().unwrap();
+    // The first scan builds the writer's snapshot over the hundred.
+    assert_eq!(scanned(&db), model, "the memtable alone");
+    // Keys created since, an append to a key the snapshot holds and a
+    // delete of one, committed; then a handle claimed, which reads the log.
+    write(&mut db, &mut model, 100, 160, b"two");
+    db.append(&key(5), b"more");
+    model.get_mut(&key(5)).unwrap().push(b"more".to_vec());
+    db.delete(&key(7));
+    model.remove(&key(7));
+    db.commit().unwrap();
+    let h = db.reader().unwrap();
+    assert_eq!(db.levels(), (0, 0), "no segment yet");
+    assert_eq!(
+        db.frozen_tables(),
+        0,
+        "the live table stands across the claim"
+    );
+    assert_eq!(
+        scanned(&db),
+        model,
+        "the writer, after a handle was claimed"
+    );
+    assert_eq!(scanned(&h), model, "the handle");
+    // The same over a piece: the memtable sealed into one and kept one.
+    db.seal().unwrap();
+    db.settle().unwrap();
+    let (parts, pieces) = db.levels();
+    assert!(
+        parts == 0 && pieces >= 1,
+        "pieces and no partition: {parts} {pieces}"
+    );
+    assert_eq!(scanned(&db), model, "over the piece");
+    write(&mut db, &mut model, 160, 230, b"three");
+    db.append(&key(150), b"again");
+    model.get_mut(&key(150)).unwrap().push(b"again".to_vec());
+    db.delete(&key(3));
+    model.remove(&key(3));
+    db.delete(&key(120));
+    model.remove(&key(120));
+    db.commit().unwrap();
+    let h2 = db.reader().unwrap();
+    assert_eq!(
+        scanned(&db),
+        model,
+        "the writer over the piece, after a handle was claimed"
+    );
+    assert_eq!(scanned(&h2), model, "the second handle");
+    assert_eq!(scanned(&h), model, "the first handle, at the latest commit");
+    drop(h);
+    drop(h2);
+    let _ = std::fs::remove_dir_all(&d);
+}

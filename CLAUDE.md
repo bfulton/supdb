@@ -2526,6 +2526,26 @@ estimate is held to the thing it estimates -- the build's pages, the
 file's bytes -- never to its own arithmetic, since the arithmetic was never
 the question.
 
+**A refresh gated on who read the log.** The scan on the merge paths
+files the keys created since its snapshot into the snapshot's side runs,
+from the list the log read keeps, and asked for the filing only when its
+own log read had moved. A handle claimed between two scans reads the log
+for the forms (`publish_for_handle`) and, with no partition to hang them
+on, refreshes nothing, so the writer's next scan found the log read
+already, took the refresh for unneeded, and walked a snapshot short of
+every key created since the claim, with nothing raised. With a partition
+in the store the claim rebuilds the snapshot, and with the cache off the
+claim reads no log, so it needed the block cache on in a store with no
+partition yet -- every store's first stretch -- which no test built and
+the differential fuzz drew in four seeds of forty-eight with the cache on
+in every seed (`ZFUZZ_CACHE=all`, with `ZFUZZ_OPTVARY`); the probe that
+named it stamped each log read with its caller. The scan asks whether the
+list has grown past what the snapshot has filed now (`tests/db.rs`). The
+rule: a step another operation may take on a handle's behalf leaves that
+operation's own work undone, so the operation that owns the work asks the
+state it is about -- the list against the filed count -- and never the
+event, whether this call was the one that read the log.
+
 **A probe's total over a whole read is an inlining result.** The same engine
 read +0.9, +1.9, +2.9 and +3.15 instructions a point read across four probes
 and a count +3.00 exactly, because the code after a probe's loop changes what
