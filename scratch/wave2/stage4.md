@@ -1161,3 +1161,98 @@ combined arm at five million keys (`perf-bound.sh`, `perfab/`) is what
 says where the block path's 7 µs a scan goes under the regime that
 matters, and a cheaper decode is the point reads' lever before it is
 E's.
+
+The bounded profile (`perf-bound.sh`, one rep of the combined and the
+nocache arms at five million keys under 640 MiB, the E and C windows
+cut by their marks on CLOCK_MONOTONIC, `perfab/`): the combined arm's E
+is LZ4 decompression 35%, the group's open, seek and fence 13%
+(`open_group` 4.3, `group_seek` 3.9, `entry_of` 3.1, `part_scan_z` 1.9),
+the block walk 10% (`scan_blocks` 5.1, `cache_scan` 3.5, `each_value`
+1.3), the harness's Zipfian generator 11% (`pow` 7.9, `run::ycsb` 3.4,
+paid by every arm alike), context switches 3.6% and value moves 2.9%;
+the nocache arm's E is decompression 19%, the memtable's merge of the
+unsealed keys 26% (`has_tomb` 11, `entry` 6, `Snapshot::seek` 3.7,
+`ByteArena::block` 3.1, `key_of` 2.3), key compares 10%, the walk 7%,
+the cursor's opens 3%. So the cache took the merge and the compares out
+and left the decode, which is now a third of E and, with the group
+machinery, half; C under either arm is decompression 37-38%, the group
+seek 6-7%, the open and the fence 8%, and the harness's generator 22%.
+In core at three hundred thousand keys E's decode was 6% by
+instruction and 13% by time because the memo hit far more often there;
+at five million the memo misses 27% of 3.6 looks a scan, 0.96 decodes.
+A decode is 5,400-10,700 instructions a page (callgrind's inclusive
+cost over the calls it collected, E's pages at the low end). The
+levers, in order of what they cost to price: the decoder itself
+(liblz4's C decoder against `lz4_flex`'s on these exact pages, a
+micro-probe over a built form file), the memo's misses for the same
+bytes (associativity), and the page's size against the file's
+(a smaller group is less decode a lookup and finer memo entries for
+the same bytes, and a format change).
+
+## The decoder and the cut priced
+
+`bench/examples/zdecode.rs` (`--features lz4-c`, the `lz4` crate as an
+optional dependency so nothing the suite measures links the C library):
+the forced form built at three hundred thousand keys in the suite's
+shape, every compressed page read back, each decoded with the engine's
+`lz4_flex::block::decompress_into` and with liblz4's
+`LZ4_decompress_safe`, the two held equal byte for byte, and timed. One
+form file of 4,972 pages, 20.1 MB compressed from 36.0 MB, 7,233 bytes
+a page decoded, 0.558.
+
+| decoder | Ir a page (callgrind) | cycling 4,972 pages, ns a page | one page hot, ns |
+|---|---|---|---|
+| lz4_flex 0.11.6, unsafe | 17,562 | 3,393 / 3,534 / 3,763 (three runs) | 1,112-1,188 |
+| liblz4 1.10.0 (`LZ4_decompress_safe`, -O3) | 14,405 | 2,831 / 3,044 / 3,408 | 888-1,000 |
+| liblz4 / lz4_flex | 0.82 | 0.83 / 0.86 / 0.91 | 0.76-0.83 |
+
+The cycling figure is three times the hot one, and the cache level is
+not it: cycling the first 1, 4, 16, 64 and 256 pages of a 515-page file
+(all of it in L2) reads 712, 1,014, 2,049, 4,522 and 3,450 ns a page,
+the same 3.3-3.5 µs plateau from a few hundred distinct pages up as
+over the 20 MB file -- a page decoded over and over is one whose tokens
+the branch predictor has learned, so the hot figure is nobody's and the
+cycling figure is a read's. The decode is misprediction-bound on these
+records: 7,230 bytes in 360-odd tokens at nine nanoseconds a token
+cycling, three hot. (`zdecode-300k-{1,2}.out`,
+`zdecode-split-300k-1.out`, `cg/zdecode-{flex,c}.out` in the
+scratchpad.)
+
+A fifth of the decode is a fourteenth of C and a twentieth of E under
+the bounded profile's shares, inside what a pairing resolves on those
+cells, for a C library in the engine (built with `cc`, native only, the
+wasm reader's decoder left as it is). Declined: the decoder stays
+`lz4_flex`.
+
+What the count points at is what a read decodes. A point read decodes
+the whole group, seven kilobytes, for one record of a hundred and
+twenty; the memo saves the hot pages' decodes and nothing of a miss's
+size. The same probe cuts each group at record boundaries into `k` runs
+of about equal bytes compressed apart with the engine's encoder (the
+whole group recompressed is the page's payload byte for byte, the
+check), and times one run a page -- the point read's decode under the
+cut, the run rotating with the page so every position is read -- and
+every run of every page, the scan's:
+
+| k | compressed / decoded | over the page's own | bytes a run | one run, lz4_flex / liblz4 ns | all runs, lz4_flex / liblz4 ns |
+|---|---|---|---|---|---|
+| 1 | 0.558 | 1.000 | 7,233 | 3,584 / 3,063 | 3,623 / 3,037 |
+| 2 | 0.569 | 1.020 | 3,616 | 1,954 / 1,585 | 3,623 / 3,216 |
+| 4 | 0.590 | 1.058 | 1,808 | 1,020 / 856 | 3,608 / 3,057 |
+| 8 | 0.628 | 1.125 | 904 | 547 / 474 | 3,566 / 3,050 |
+| 16 | 0.692 | 1.240 | 452 | 321 / 291 | 3,521 / 3,033 |
+| 32 | 0.807 | 1.447 | 226 | 236 / 219 | 3,467 / 3,140 |
+
+Four runs cost 6% of the form's bytes and take the point read's decode
+to 0.28 of the group's; eight cost 12% and take it to 0.15; the scan's
+decode is level at every `k`, since a scan decodes the runs it walks and
+they sum to the group. At five million keys under 640 MiB the C mix
+reads 2.16 µs an op against LMDB's 1.14 (0.53x, `zcache-lmdb5m-ab-*`),
+37% of it the decode: 0.8 µs, so most of C's reads hit the memo and
+the misses cost the 3.4; four runs would take about 0.55 µs off the op
+and eight 0.68, 0.7-0.77x of LMDB from 0.53, before anything the memo's
+finer entries save. That is the structure to build: the page a
+container of several groups of a target decoded size, one fence entry
+and one CRC a page and a directory of the groups inside it, so a point
+read decodes one group and a scan decodes the groups it walks, and the
+memo's entry is a group and not a page.
