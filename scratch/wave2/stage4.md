@@ -1107,3 +1107,30 @@ stays right through a write spliced into it, with the option off as the
 control; `ZFUZZ_PROMOTE` runs the differential fuzz over it. The arm is
 `supdb-cache64tofitautozpagespromote`, priced by `zcache-promote-5m.sh`
 against the combined arm and against LMDB.
+
+Refuted (`zcache-promote5m-ab-{1,2}.*`, `zcache-promotelmdb5m-ab-{1,2}.*`),
+in both orders and by mechanism. The promotion arm over the combined
+arm reads E 0.81x and 0.71x, C 0.44x and 0.33x, D 0.52x and 0.44x, B
+0.50x and 0.53x, A 0.69x and 0.76x, F 0.85x and 0.83x, 0 of 3 pairs in
+every cell, and faults on every mix where the combined arm faults on
+none: C 0.064 a read, D 0.107, B 0.038, F 0.026, A 0.016, E 0.018
+against 0.003. E's walks through the form fell by three tenths (74,081
+against 104,943 a mix) and its decodes by three percent (73,445 against
+75,768): the copies covered the hottest blocks, whose pages the memo
+held already, so the walks they replaced were memo hits, and the
+decodes come from the colder blocks a copy never reaches. The copies'
+64 MB came out of a page cache that just fit the form files -- the
+combined arm's 0.000 faults a read on every mix is the form files
+resident whole -- so every mix pays the form's pages faulting back in,
+C's gets at 5.5-7 µs against 2.0 with the same 32,772 decodes, D's at
+11-15 against 4-6. Against LMDB the arm reads E 0.46x and 0.48x, C 0.29x
+and 0.31x, where the combined arm read 0.55-0.62x and about level. The
+passes before the install are the combined arm's, since the promotion
+waits for the form. The rule the refutation gives: under a bound that
+the compact form just fits, a structure that trades page cache for
+decoded bytes loses by the fault it buys for the decode it saves --
+sixty microseconds against five -- and the decodes left are the memo's
+misses on the warm tail, which no copy of the hot head reaches; what
+would cut them is a cheaper decode or a memo that holds more in the
+same bytes, and the decode is priced next, by instruction, before
+either is built. The arm stays as the record, off as shipped.
