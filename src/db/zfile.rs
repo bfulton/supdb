@@ -1722,6 +1722,61 @@ impl ZFile {
         r
     }
 
+    /// `Blob::key_at` through the form file: the key of the record at `rank`
+    /// copied into `out`, for what the block cache asks of a partition by
+    /// rank and keeps -- a block's boundary key, the last key a table holds,
+    /// the key a lazy scan resumes from (`Reader::cache_key_at`). Answers as
+    /// `values_at` does: served with one key, or none past the end; a record
+    /// no page holds the raw form's; a check that failed a fallback; out of
+    /// service. `out` is left as it was unless a key was served. The key of
+    /// a record no page holds is the fence's: its entry covers that one
+    /// record and names its key, so the key is answered from the heap as
+    /// the seek answers it, and only the record's values are the raw
+    /// form's -- the last key of a partition whose last record no page
+    /// holds is what a block table keeps, and it was a touch of the raw
+    /// form until the fence answered it.
+    pub(super) fn key_at_into(&self, memo: &ZMemo, rank: usize, out: &mut Vec<u8>) -> ZRead {
+        if !self.damaged.load(Ordering::Relaxed) && rank < self.nkeys {
+            if let Some(e) = self.entry_at_rank(rank) {
+                if e.page == ZNOPAGE && e.count == 1 {
+                    out.clear();
+                    out.extend_from_slice(e.key);
+                    return ZRead::Served {
+                        n: 1,
+                        decoded: false,
+                    };
+                }
+            }
+        }
+        let mut buf = take_buf();
+        let r = match self.locate_rank(memo, rank, &mut buf) {
+            Locate::Absent { decoded } => ZRead::Served { n: 0, decoded },
+            Locate::Out => ZRead::Out,
+            Locate::Fallback => ZRead::Fallback,
+            Locate::NoPage => ZRead::NoPage,
+            Locate::Found {
+                opened,
+                off,
+                page,
+                decoded,
+            } => match record_key_next(opened.bytes(), off) {
+                Some((k, _)) => {
+                    out.clear();
+                    out.extend_from_slice(k);
+                    ZRead::Served { n: 1, decoded }
+                }
+                None => {
+                    // The first decode walked every record whole: a group
+                    // changed under the mapping, the page out of service.
+                    self.fail(page);
+                    ZRead::Fallback
+                }
+            },
+        };
+        put_buf(buf);
+        r
+    }
+
     /// `Blob::seek` through the form file (3.4): the rank of the first key at
     /// or after `key`, by the fence and one group's walk. A key below the
     /// first key is rank zero and one above every key is the key count,

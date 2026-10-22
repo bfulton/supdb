@@ -288,7 +288,10 @@ cache under a bound: what the short scans of the Zipfian head gain from
 the merged forms against what the point reads lose to the page cache the
 cache displaces (a cache of 256 MB beside the form did not fit a 640 MiB
 bound at five million keys: the cgroup killed the harness in the shuffled
-load). The forced arm's
+load), and `supdb-cache64tofitautozpagesraw` is that arm with the cache's
+reads of a partition through the raw records rather than the form file
+(`Options::zpages_block_cache` off), the shape the combined arm was first
+priced in. The forced arm's
 `sync` builds the form files, so its load carries the build, and in memory
 it reads slower than the raw form: it is an arm for the bound, not a
 default.
