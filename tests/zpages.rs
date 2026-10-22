@@ -2115,7 +2115,7 @@ fn same_window(got: &Window, want: &Window, what: &str) {
 #[test]
 fn scans_agree_with_the_model_over_every_window_of_a_covered_store() {
     // On the nocache policy, the arm's: the scans merge their sources.
-    windows_over("windows", false);
+    windows_over("windows", false, false);
 }
 
 #[test]
@@ -2123,7 +2123,16 @@ fn scans_with_the_block_cache_agree_with_the_model_over_every_window_of_a_covere
     // On the default policy, the block cache on: a scan of a covered
     // partition with the cache's forms around it is the case this is for.
     // It holds the seal, so nothing lands under the forms' upkeep.
-    windows_over("windows-cache", true);
+    windows_over("windows-cache", true, false);
+}
+
+#[test]
+fn scans_with_the_blocks_promoted_to_copies_agree_with_the_model_over_every_window() {
+    // The cache with its blocks held as copies once read
+    // (`Options::zpages_promote_copies`), under a budget small enough to
+    // shed them between the windows, so the walks meet a block as a form,
+    // as a copy in its slot, and as a form again after the shed.
+    windows_over("windows-promote", true, true);
 }
 
 #[test]
@@ -2767,7 +2776,7 @@ fn the_prefetch_arm_scans_the_same_and_asks_once_a_walk() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-fn windows_over(name: &str, cache: bool) {
+fn windows_over(name: &str, cache: bool, promote: bool) {
     // The scans of a covered partition answer as if the form were not there,
     // with the unsealed keys laid over it: updates, inserts between records
     // and deletes, in the live table and in a frozen one. Windows begin at
@@ -2785,6 +2794,12 @@ fn windows_over(name: &str, cache: bool) {
         forced(|o| {
             o.partition_bytes = Some(160 << 10);
             o.scan_block_cache = cache;
+            if promote {
+                o.promote_entries = 50;
+                o.zpages_promote_copies = true;
+                o.scan_cache_bytes = 96 << 10;
+                o.forms_to_fit = true;
+            }
         }),
     )
     .unwrap();
@@ -2906,8 +2921,17 @@ fn windows_over(name: &str, cache: bool) {
     let after = db.zpage_counts();
     // Through the block path a window is as many walks as it has runs
     // between cuts, so the count is at least the windows'; through the
-    // merge path exactly one walk a partition a window starts in.
-    assert!(after.scans - before.scans >= windows, "{after:?}");
+    // merge path exactly one walk a partition a window starts in. With
+    // the blocks promoted to copies a window over copies walks no form,
+    // and the copies were built: the writer's and the handle's count of
+    // promotions, which the shed under the budget does not take back.
+    if promote {
+        assert!(after.scans > before.scans, "{after:?}");
+        let promoted = db.form_choices()[0] + latest.form_choices()[0];
+        assert!(promoted >= 8, "blocks promoted to copies: {promoted}");
+    } else {
+        assert!(after.scans - before.scans >= windows, "{after:?}");
+    }
     assert_eq!(after.raw_scans, before.raw_scans, "{after:?}");
     assert_eq!(after.fallbacks + after.rejected_damage, 0, "{after:?}");
     let _ = std::fs::remove_dir_all(&dir);
@@ -6533,4 +6557,91 @@ fn the_gate_decides_the_form_an_attached_cell_serves() {
     drop(r);
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Under the form file a block that reads have walked `promote_entries`
+/// entries' worth is held as a merged copy in its slot, a clean block
+/// included (`Options::zpages_promote_copies`): the window's first scans
+/// walk the form file, run by run, and once its blocks are copies a scan
+/// over it walks no form at all, answers the same, touches no page of the
+/// raw form, and stays right through a write into a copied block, which
+/// the settle splices into the copy. The same reads with the option off
+/// walk the form every time: the positive control.
+#[test]
+fn a_block_read_often_enough_under_the_form_is_held_as_a_copy_and_walked_without_the_form() {
+    for promote in [true, false] {
+        let dir = scratch(if promote {
+            "promote-copies"
+        } else {
+            "promote-copies-off"
+        });
+        let mut db = Db::create(
+            &dir,
+            forced(|o| {
+                o.partition_bytes = Some(160 << 10);
+                o.scan_block_cache = true;
+                o.promote_entries = 64;
+                o.zpages_promote_copies = promote;
+            }),
+        )
+        .unwrap();
+        let mut model = ordered_load(&mut db, 5000, 0x9A1);
+        db.zpages_settle().unwrap();
+        db.settle().unwrap();
+        assert!(db.zpage_counts().form_files >= 3);
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let start = keys[1000].clone();
+        let want = window(&model, &start, 100);
+        let touches = r.raw_touches();
+        // A window of a hundred spans two blocks: the first scan takes a
+        // block's worth from the first and promotes it, the second scan
+        // promotes the second.
+        for i in 0..3 {
+            same_window(&scanned(&r, &start, 100), &want, &format!("scan {i}"));
+        }
+        let promoted = r.form_choices()[0];
+        let walks = db.zpage_counts().scans;
+        same_window(&scanned(&r, &start, 100), &want, "over the copies");
+        let walked = db.zpage_counts().scans - walks;
+        if promote {
+            assert!(promoted >= 2, "both blocks promoted: {promoted}");
+            assert_eq!(walked, 0, "a scan over the copies walks no form");
+        } else {
+            assert_eq!(
+                promoted, 0,
+                "nothing promoted into a slot with the option off"
+            );
+            assert!(walked >= 1, "the form walked every time: {walked}");
+        }
+        assert!(
+            !cfg!(debug_assertions) || r.raw_touches() == touches,
+            "{} touches of the raw form",
+            r.raw_touches() - touches
+        );
+        // A write into a copied block, and one that creates a key inside
+        // it: spliced into the copy by the settle, answered by the next
+        // scan.
+        db.append(&keys[1010], b"appended");
+        model
+            .get_mut(&keys[1010])
+            .unwrap()
+            .push(b"appended".to_vec());
+        let new = [keys[1020].as_slice(), b"+"].concat();
+        db.append(&new, b"created");
+        model.insert(new, vec![b"created".to_vec()]);
+        db.commit().unwrap();
+        same_window(
+            &scanned(&r, &start, 100),
+            &window(&model, &start, 100),
+            "after writes into a copied block",
+        );
+        same_window(
+            &scanned(&db, &start, 100),
+            &window(&model, &start, 100),
+            "the writer, after writes into a copied block",
+        );
+        drop(r);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

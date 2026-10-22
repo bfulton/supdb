@@ -291,7 +291,11 @@ bound at five million keys: the cgroup killed the harness in the shuffled
 load), and `supdb-cache64tofitautozpagesraw` is that arm with the cache's
 reads of a partition through the raw records rather than the form file
 (`Options::zpages_block_cache` off), the shape the combined arm was first
-priced in. The forced arm's
+priced in, and `supdb-cache64tofitautozpagespromote` is the combined arm
+with a block that reads have walked a block's worth of entries held as a
+merged copy in its slot under the form, a clean block included
+(`Options::zpages_promote_copies`), so the hot blocks are walked without
+a group decoded. The forced arm's
 `sync` builds the form files, so its load carries the build, and in memory
 it reads slower than the raw form: it is an arm for the bound, not a
 default.

@@ -910,6 +910,21 @@ pub struct Options {
     /// never touch them. `supdb-cache64tofitautozpagesraw` is that arm.
     #[doc(hidden)]
     pub zpages_block_cache: bool,
+    /// EXPERIMENT: under the form file, a block that reads have walked
+    /// `promote_entries` entries' worth is held as a merged copy in place
+    /// of its form, a clean block included, with the copy the block's one
+    /// form -- listed and shed under the budget like any other, patched by
+    /// the writes into it -- rather than a second way beside the cheap
+    /// form (`promote_entries` alone, which copies a block walked as
+    /// deltas and leaves a clean one, since a clean block's raw walk
+    /// streams the records and has nothing to gain). Under the form a
+    /// clean block's walk is a group decoded a walk, five microseconds a
+    /// page here, and the E mix's hot head at five million keys is walked
+    /// as sparse and clean forms through the form file, 0.96 groups opened
+    /// a scan; a copy is walked without one. Off as shipped; the arm is
+    /// `supdb-cache64tofitautozpagespromote`.
+    #[doc(hidden)]
+    pub zpages_promote_copies: bool,
     /// Whether the form's own threads -- the build, the warm and the
     /// sampler -- take the device at the idle I/O class, served only when
     /// nothing else is waiting on it; off, they read at the class the
@@ -2383,6 +2398,7 @@ impl Default for Options {
             zpages_scan_prefetch: false,
             zpages_walk_cursor: true,
             zpages_block_cache: true,
+            zpages_promote_copies: false,
             zpages_io_idle: true,
             zpages_build_ahead: 4 << 20,
             zpages_build_eager: false,
@@ -20124,7 +20140,14 @@ impl Reader {
             // one the shortcut would walk the partition past every
             // unsealed key over it. The blocks below answer rightly
             // either way.
-            if unsealed.is_some() && table.clean_throughout() && !canonical {
+            // Not under the form file with the promotion on: the bulk
+            // walk decodes a group a page every time, and only the walk
+            // through the blocks promotes the blocks read again to
+            // copies, which decode nothing (`Options::zpages_promote_copies`).
+            let promote_copies = self.opts.zpages_promote_copies
+                && self.opts.promote_entries > 0
+                && self.zc(seg).is_some();
+            if unsealed.is_some() && table.clean_throughout() && !canonical && !promote_copies {
                 // The suite's scan workload, and any store between a flush
                 // and its next write: one walk from the seek, as the bulk
                 // walk makes it. Measured through the blocks it was a
@@ -20269,9 +20292,18 @@ impl Reader {
                 // not. Both are current -- a write drops the copy and
                 // patches the cheap form -- so the pick costs one load
                 // and a branch.
+                // Under the form file a copy this handle promoted stands in
+                // its own slot and is read before the canonical form, which
+                // a handle at the writer's commit otherwise takes as the
+                // block (`Options::zpages_promote_copies`): the copy is
+                // current to this handle's own position, which its settle
+                // keeps, and the canonical form would cost a group decoded.
+                let in_slot = self.opts.zpages_promote_copies && self.zc(seg).is_some();
+                let own_copy =
+                    in_slot && matches!(table.slots[b].as_deref(), Some(Cached::Block(_)));
                 let cheap: &Cached = match canon {
-                    Some(f) => f,
-                    None => table.slots[b].as_deref().expect("just built"),
+                    Some(f) if !own_copy => f,
+                    _ => table.slots[b].as_deref().expect("just built"),
                 };
                 let dense: Option<&Cached> = if promoting {
                     table.dense[b].as_deref()
@@ -20279,6 +20311,15 @@ impl Reader {
                     None
                 };
                 let form: &Cached = dense.unwrap_or(cheap);
+                // The kind the walk reads, for the promotion after it,
+                // which judges what was walked -- the canonical form as
+                // much as this handle's own.
+                let walked_kind: u8 = match form {
+                    Cached::Block(_) => 0,
+                    Cached::Sparse(_) => 1,
+                    Cached::Clean => 2,
+                    Cached::Wide(_) => 3,
+                };
                 let mut c = self.fs().choices.get();
                 c[if dense.is_some() { 2 } else { 3 }] += 1;
                 self.fs().choices.set(c);
@@ -20447,34 +20488,72 @@ impl Reader {
                 // anything to gain: a clean one is already the bulk
                 // walk's, and a dense cheap form is a copy already.
                 let promote = self.opts.promote_entries;
+                // Under the form file the copy stands in this handle's slot
+                // as the block's one form (`Options::zpages_promote_copies`);
+                // a block walked as a copy has nothing to promote.
                 // A copy is built from the snapshot; a walk without one
                 // leaves the promotion to the next.
-                if promote > 0 && !lazy && table.dense[b].is_none() {
+                if promote > 0
+                    && !lazy
+                    && table.dense[b].is_none()
+                    && !(in_slot && walked_kind == 0)
+                {
                     let took = (seen - took_from) as u32;
                     table.reads[b] = table.reads[b].saturating_add(took);
                     // A walked block is copied only below the wide bound:
-                    // past it the block holds more than a copy should.
-                    let repays = match table.slots[b].as_deref() {
-                        Some(Cached::Sparse(_)) => true,
-                        Some(Cached::Wide(_)) => BuildCtx::overlay_count(table, b) <= WIDE,
-                        _ => false,
+                    // past it the block holds more than a copy should. Under
+                    // the form file the walked form is judged, the canonical
+                    // one included, and a clean block repays a copy, since
+                    // its walk is a group decoded a walk; the raw walk
+                    // streams its records, and the copy beside the cheap
+                    // form is for a block walked as deltas.
+                    let repays = if in_slot {
+                        match walked_kind {
+                            1 | 2 => true,
+                            3 => BuildCtx::overlay_count(table, b) <= WIDE,
+                            _ => false,
+                        }
+                    } else {
+                        match table.slots[b].as_deref() {
+                            Some(Cached::Sparse(_)) => true,
+                            Some(Cached::Wide(_)) => BuildCtx::overlay_count(table, b) <= WIDE,
+                            _ => false,
+                        }
                     };
                     if table.reads[b] as usize >= promote && repays {
-                        let copied = BuildCtx {
+                        let ctx = BuildCtx {
                             dense_from: 1,
                             copy_dense: true,
                             ..self.build_ctx()
-                        }
-                        .materialize(src, table, b, unsealed)?;
+                        };
+                        // `materialize` leaves a block with nothing over
+                        // it clean, so a clean block's copy is the records
+                        // between the overlay's keys, all of them.
+                        let copied = if in_slot && walked_kind == 2 {
+                            let ov = ctx.overlay_all(src, table, b, unsealed)?;
+                            Cached::Block(ctx.copy_block(src, lo..hi, &ov)?)
+                        } else {
+                            ctx.materialize(src, table, b, unsealed)?
+                        };
                         if matches!(copied, Cached::Block(_)) {
+                            let bytes = self.fbytes(&copied);
                             let mut c = self.fs().choices.get();
                             c[0] += 1;
-                            c[4] += self.fbytes(&copied) as u64;
+                            c[4] += bytes as u64;
                             self.fs().choices.set(c);
-                            self.fs()
-                                .cache_bytes
-                                .set(self.fs().cache_bytes.get() + self.fbytes(&copied));
-                            table.dense[b] = Some(std::sync::Arc::new(copied));
+                            if in_slot {
+                                self.unlist(pi, b, table);
+                                let built = self.share_form(copied);
+                                self.count_built();
+                                table.slots[b] = Some(built);
+                                self.list_built_bytes(pi, b, table, bytes);
+                                self.shed(pi, b, table);
+                            } else {
+                                self.fs()
+                                    .cache_bytes
+                                    .set(self.fs().cache_bytes.get() + bytes);
+                                table.dense[b] = Some(std::sync::Arc::new(copied));
+                            }
                         }
                     }
                 }

@@ -1073,3 +1073,37 @@ to read yet. The refutation's mechanism, read from the other side: the
 cache's raw walks evicted the form the point reads needed, and with
 the walks through the form the cache keeps the compact working set and
 adds its merged forms to it.
+
+## The hot blocks as copies under the form
+
+What is left of E under the combined arm is the decodes: the sampler on
+the pairing's run prices a decode at 5.2 µs a page (`zsample ...
+decode_per_page`), and the counters put the mixes' cost on it -- C's
+2.0 µs a get is its 0.39 misses a read times a decode, D's 4-6 µs a get
+a decode a read, and E's 0.96 groups opened a scan about 5 of its 7 µs.
+The cache has a mechanism for exactly that, the promotion of a block the
+reads have walked `promote_entries` entries' worth to a merged copy,
+and it counted only blocks walked as deltas, since a clean block's raw
+walk streamed the records and had nothing to gain; under the form a
+clean block's walk is a decode a walk. The second shape
+(`Options::zpages_promote_copies`): the copy stands in the handle's slot
+as the block's one form, clean blocks included, judged by the form the
+walk read -- a handle at the writer's commit takes the canonical form
+and builds no slot of its own, which is where the first version never
+fired, in a test over a drained store -- and read before the canonical
+form once it stands; listed and shed under the budget like any form
+(the copy beside the cheap form was never shed, so under a bound it
+would have pushed the budget over and shed everything else); and the
+clean-throughout shortcut, the bulk walk of a partition with nothing
+unsealed over it, is skipped under it, since the bulk walk decodes a
+group a page every time and only the walk through the blocks promotes.
+The threshold under the form is a block's worth of entries, sixty-four:
+a copy's build costs the decode the walk pays anyway, so a block
+repays a copy at its second touch, where the raw crossover was a few
+hundred entries. `tests/zpages.rs` holds a window to the model with the
+blocks promoted under a budget that sheds them, and holds a block read
+three times to a copy that walks no form, touches no raw page, and
+stays right through a write spliced into it, with the option off as the
+control; `ZFUZZ_PROMOTE` runs the differential fuzz over it. The arm is
+`supdb-cache64tofitautozpagespromote`, priced by `zcache-promote-5m.sh`
+against the combined arm and against LMDB.

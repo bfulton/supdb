@@ -803,6 +803,12 @@ pub struct Supdb {
     /// `supdb-cache64tofitautozpagesraw`, the pair against
     /// `supdb-cache64tofitautozpages`.
     zcacheraw: bool,
+    /// The combined arm with a block read this many entries' worth held
+    /// as a copy in its slot under the form (`Options::promote_entries`
+    /// with `zpages_promote_copies`), zero for neither:
+    /// `supdb-cache64tofitautozpagespromote`, the pair against
+    /// `supdb-cache64tofitautozpages`.
+    zpromote: usize,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -1228,6 +1234,11 @@ struct Policy {
     /// controller's form (`Options::zpages_block_cache` off):
     /// `supdb-cache64tofitautozpagesraw`.
     zcacheraw: bool,
+    /// Blocks read this many entries' worth held as copies in their slots
+    /// under the form (`Options::promote_entries` with
+    /// `zpages_promote_copies`), zero for neither:
+    /// `supdb-cache64tofitautozpagespromote`.
+    zpromote: usize,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -1334,6 +1345,7 @@ impl Default for Policy {
             zpages_noahead: false,
             zpages_buildeager: false,
             zcacheraw: false,
+            zpromote: 0,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -2968,6 +2980,28 @@ impl Supdb {
         )
     }
 
+    /// `supdb-cache64tofitautozpages` with a block that reads have walked
+    /// a block's worth of entries (sixty-four) held as a merged copy in
+    /// its slot under the form, a clean block included
+    /// (`Options::promote_entries`, `zpages_promote_copies`): the E mix's
+    /// hot head walked as copies, which open no group, where the combined
+    /// arm walks it as sparse and clean forms through the form file at a
+    /// group decoded a scan. The pair against `supdb-cache64tofitautozpages`
+    /// prices the copies against the decodes they replace and the budget
+    /// they take.
+    pub fn create_cache64_tofit_auto_zpages_promote(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages_auto: true,
+                zpromote: 64,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-cache256tofit` without the trim (`Options::forms_trim_bytes`
     /// zero): against it, the part of the saving that is the allocator's
     /// free pages given back; against `supdb-cache256`, the part that is
@@ -3991,6 +4025,7 @@ impl Supdb {
             zpages_noahead,
             zpages_buildeager,
             zcacheraw,
+            zpromote,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -4233,6 +4268,8 @@ impl Supdb {
             },
             zpages_build_eager: zpages_buildeager,
             zpages_block_cache: !zcacheraw,
+            promote_entries: zpromote,
+            zpages_promote_copies: zpromote > 0,
             zpages_seek_ord: if zpages_heads {
                 true
             } else {
@@ -4407,6 +4444,7 @@ impl Supdb {
             zpages_noahead,
             zpages_buildeager,
             zcacheraw,
+            zpromote,
             ord_threads: Default::default(),
         })
     }
@@ -4485,6 +4523,8 @@ impl Engine for Supdb {
         if self.budget > 0 && self.tofit && self.zpages_auto {
             return if self.zcacheraw {
                 "supdb-cache64tofitautozpagesraw"
+            } else if self.zpromote > 0 {
+                "supdb-cache64tofitautozpagespromote"
             } else {
                 "supdb-cache64tofitautozpages"
             };
@@ -5942,6 +5982,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache64tofit"
         | "supdb-cache64tofitautozpages"
         | "supdb-cache64tofitautozpagesraw"
+        | "supdb-cache64tofitautozpagespromote"
         | "supdb-nocacheautozpagesfairio"
         | "supdb-nocacheautozpagesnoahead"
         | "supdb-nocacheautozpageseager"
@@ -6135,6 +6176,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cache64tofitautozpages" => Box::new(Supdb::create_cache64_tofit_auto_zpages(dir)?),
         "supdb-cache64tofitautozpagesraw" => {
             Box::new(Supdb::create_cache64_tofit_auto_zpages_raw(dir)?)
+        }
+        "supdb-cache64tofitautozpagespromote" => {
+            Box::new(Supdb::create_cache64_tofit_auto_zpages_promote(dir)?)
         }
         "supdb-nocacheautozpages" => Box::new(Supdb::create_nocache_auto_zpages(dir)?),
         "supdb-nocacheautozpagesfairio" => Box::new(Supdb::create_nocache_auto_zpages_fairio(dir)?),
@@ -7075,11 +7119,43 @@ mod tests {
                 b.forms_to_fit
             )
         );
+        assert_eq!((a.promote_entries, a.zpages_promote_copies), (0, false));
         let d = root.join("dispatch");
         std::fs::create_dir_all(&d).unwrap();
         let opened = open("supdb-cache64tofitautozpagesraw", &d, 1).unwrap();
         assert_eq!(opened.name(), "supdb-cache64tofitautozpagesraw");
         drop(opened);
+        // The promotion arm: the combined arm with the copies in the slots
+        // and nothing else moved.
+        let promote = new("promote", Supdb::create_cache64_tofit_auto_zpages_promote);
+        assert_eq!(promote.name(), "supdb-cache64tofitautozpagespromote");
+        assert_eq!(guarantee(promote.name()), guarantee(base.name()));
+        assert!(promote.zpromote == 64 && base.zpromote == 0 && !promote.zcacheraw);
+        assert_eq!(promote.features(), base.features());
+        let p = promote.db.as_ref().unwrap().options();
+        assert_eq!((p.promote_entries, p.zpages_promote_copies), (64, true));
+        assert_eq!(
+            (
+                p.zpages,
+                p.scan_block_cache,
+                p.scan_cache_bytes,
+                p.forms_to_fit,
+                p.zpages_block_cache
+            ),
+            (
+                b.zpages,
+                b.scan_block_cache,
+                b.scan_cache_bytes,
+                b.forms_to_fit,
+                b.zpages_block_cache
+            )
+        );
+        let d = root.join("dispatch-promote");
+        std::fs::create_dir_all(&d).unwrap();
+        let opened = open("supdb-cache64tofitautozpagespromote", &d, 1).unwrap();
+        assert_eq!(opened.name(), "supdb-cache64tofitautozpagespromote");
+        drop(opened);
+        drop(promote);
         drop(arm);
         drop(base);
         let _ = std::fs::remove_dir_all(&root);
