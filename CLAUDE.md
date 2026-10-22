@@ -2559,6 +2559,33 @@ operation's own work undone, so the operation that owns the work asks the
 state it is about -- the list against the filed count -- and never the
 event, whether this call was the one that read the log.
 
+**A window whose two readings were of two counters.** The census
+window reads the thread's major faults at its open and at its close and
+counts the difference, from the test's seam where one is set and from
+the platform otherwise; the seam's count began as a sentinel meaning
+"the platform's" until the test's first `add_faults`, and a test adds a
+read's fault after the read. So the first window of every faulting test
+opened on the platform's count and closed on the seam's, and read right
+only while the thread had taken no real major fault before its first
+read: the gate's test group runs straight after the checked build has
+pushed the page cache out, the test binary's own text pages in by major
+fault, and `a_cold_start_is_not_a_capacity_miss` counted 12,799 faults
+of 12,800, once, with every count beside it exact. The seam's count is
+zero from its creation now. The rule: a difference of two readings is
+taken from one counter, chosen once at the first reading and never
+re-chosen between them, and a sentinel that selects a source is a
+second counter. Beside it, the same test's premise stood on a
+threshold the dev profile's timings drew: the relax line is a function
+of the sampler's timed decode of a page, a hundred microseconds with a
+third of noise between dev runs against five optimized, and the test's
+model rate of 0.69 faults a read sat between the line's 0.57 and 0.78,
+so one dev run in eight relaxed the rung to FITS for two seconds and
+the census it was counting stopped with it; under `checked` the line is
+at 0.05. The seam prices the decode now (`ZInject::set_decode_cost`),
+as it prices a fault. A threshold a test's premise depends on is pinned
+through the seam, never left to a measurement whose profile the test
+does not choose.
+
 **A probe's total over a whole read is an inlining result.** The same engine
 read +0.9, +1.9, +2.9 and +3.15 instructions a point read across four probes
 and a count +3.00 exactly, because the code after a probe's loop changes what

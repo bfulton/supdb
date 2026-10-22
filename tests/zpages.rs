@@ -5425,6 +5425,16 @@ fn auto_store(
     inject.set_budget(budget);
     inject.set_refault_rate(refaults_per_s);
     inject.set_fault_cost(fault_cost);
+    // The decode a page the sampler prices the form by: the optimized
+    // build's, whatever profile the test runs under. The selector's
+    // thresholds are a function of it, and the dev profile's timed decode
+    // is a hundred microseconds with a third of noise between runs: the
+    // cold-start test's model rate, 0.69 faults a read at a mebibyte, sat
+    // on the relax line that decode drew, 0.57 in one run and 0.78 in the
+    // next, so the rung relaxed to FITS for two seconds in one run of
+    // eight, the census stopped with it, and the faults it was to count
+    // went uncounted. Under `checked` the line is at 0.05.
+    inject.set_decode_cost(DECODE_5US);
     inject.advance(std::time::Duration::from_millis(1));
     let mut db = Db::create(
         &dir,
@@ -5463,6 +5473,10 @@ fn suspect_store(name: &str) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInje
 /// right to build nothing.
 const FAULT_40US: std::time::Duration = std::time::Duration::from_micros(40);
 const FAULT_1MS: std::time::Duration = std::time::Duration::from_millis(1);
+/// The decode of a page the sampler is told, the optimized build's
+/// (`zdecode`, cycling the pages of the suite's shape: 3.4 µs, and the
+/// sampler's chain of fills reads about five on this host).
+const DECODE_5US: std::time::Duration = std::time::Duration::from_micros(5);
 
 /// A store under `Auto` whose measure says blocked: the budget under the
 /// footprint and the group refaulting at a rate that makes every interval
