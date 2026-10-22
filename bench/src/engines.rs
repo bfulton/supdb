@@ -809,6 +809,12 @@ pub struct Supdb {
     /// `supdb-cache64tofitautozpagespromote`, the pair against
     /// `supdb-cache64tofitautozpages`.
     zpromote: usize,
+    /// The combined arm with the form's page cut into groups at this many
+    /// bytes of records (`Options::zpages_group_bytes`), `None` for the
+    /// engine's default: `supdb-cache64tofitautozpagesonegroup` at zero,
+    /// the page as one group, and `supdb-cache64tofitautozpagesgroup1k` at
+    /// a kibibyte, each the pair against `supdb-cache64tofitautozpages`.
+    zgroup: Option<usize>,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -1239,6 +1245,10 @@ struct Policy {
     /// `zpages_promote_copies`), zero for neither:
     /// `supdb-cache64tofitautozpagespromote`.
     zpromote: usize,
+    /// The form's page cut into groups at this many bytes of records
+    /// (`Options::zpages_group_bytes`), `None` for the engine's default:
+    /// `supdb-cache64tofitautozpagesonegroup`, `...group1k`.
+    zgroup: Option<usize>,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -1346,6 +1356,7 @@ impl Default for Policy {
             zpages_buildeager: false,
             zcacheraw: false,
             zpromote: 0,
+            zgroup: None,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -3002,6 +3013,45 @@ impl Supdb {
         )
     }
 
+    /// `supdb-cache64tofitautozpages` with the form's page as one group
+    /// (`Options::zpages_group_bytes` zero), the shape before the page
+    /// became a container of groups: a point read decodes the whole page
+    /// for its record. The pair against `supdb-cache64tofitautozpages`
+    /// prices the cut, which costs the form six percent of its bytes at
+    /// the suite's shape for a point read's decode a quarter of the
+    /// page's.
+    pub fn create_cache64_tofit_auto_zpages_onegroup(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages_auto: true,
+                zgroup: Some(0),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cache64tofitautozpages` with the page cut at a kibibyte of
+    /// records (`Options::zpages_group_bytes` 1024) where the default cuts
+    /// at two: twice the groups, twelve percent of the form's bytes against
+    /// six for a point read's decode a seventh of the page's against a
+    /// quarter. The pair against `supdb-cache64tofitautozpages` prices the
+    /// target.
+    pub fn create_cache64_tofit_auto_zpages_group1k(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages_auto: true,
+                zgroup: Some(1024),
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-cache256tofit` without the trim (`Options::forms_trim_bytes`
     /// zero): against it, the part of the saving that is the allocator's
     /// free pages given back; against `supdb-cache256`, the part that is
@@ -4026,6 +4076,7 @@ impl Supdb {
             zpages_buildeager,
             zcacheraw,
             zpromote,
+            zgroup,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -4270,6 +4321,7 @@ impl Supdb {
             zpages_block_cache: !zcacheraw,
             promote_entries: zpromote,
             zpages_promote_copies: zpromote > 0,
+            zpages_group_bytes: zgroup.unwrap_or(supdb::Options::default().zpages_group_bytes),
             zpages_seek_ord: if zpages_heads {
                 true
             } else {
@@ -4445,6 +4497,7 @@ impl Supdb {
             zpages_buildeager,
             zcacheraw,
             zpromote,
+            zgroup,
             ord_threads: Default::default(),
         })
     }
@@ -4526,7 +4579,11 @@ impl Engine for Supdb {
             } else if self.zpromote > 0 {
                 "supdb-cache64tofitautozpagespromote"
             } else {
-                "supdb-cache64tofitautozpages"
+                match self.zgroup {
+                    Some(0) => "supdb-cache64tofitautozpagesonegroup",
+                    Some(1024) => "supdb-cache64tofitautozpagesgroup1k",
+                    _ => "supdb-cache64tofitautozpages",
+                }
             };
         }
         if self.budget == 64 << 20 && self.tofit {
@@ -5983,6 +6040,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache64tofitautozpages"
         | "supdb-cache64tofitautozpagesraw"
         | "supdb-cache64tofitautozpagespromote"
+        | "supdb-cache64tofitautozpagesonegroup"
+        | "supdb-cache64tofitautozpagesgroup1k"
         | "supdb-nocacheautozpagesfairio"
         | "supdb-nocacheautozpagesnoahead"
         | "supdb-nocacheautozpageseager"
@@ -6179,6 +6238,12 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         }
         "supdb-cache64tofitautozpagespromote" => {
             Box::new(Supdb::create_cache64_tofit_auto_zpages_promote(dir)?)
+        }
+        "supdb-cache64tofitautozpagesonegroup" => {
+            Box::new(Supdb::create_cache64_tofit_auto_zpages_onegroup(dir)?)
+        }
+        "supdb-cache64tofitautozpagesgroup1k" => {
+            Box::new(Supdb::create_cache64_tofit_auto_zpages_group1k(dir)?)
         }
         "supdb-nocacheautozpages" => Box::new(Supdb::create_nocache_auto_zpages(dir)?),
         "supdb-nocacheautozpagesfairio" => Box::new(Supdb::create_nocache_auto_zpages_fairio(dir)?),
@@ -7155,6 +7220,59 @@ mod tests {
         let opened = open("supdb-cache64tofitautozpagespromote", &d, 1).unwrap();
         assert_eq!(opened.name(), "supdb-cache64tofitautozpagespromote");
         drop(opened);
+        // The group arms: the combined arm with the form's page cut at
+        // another target, and nothing else moved; the default target is
+        // the engine's, not restated.
+        assert_eq!(
+            b.zpages_group_bytes,
+            supdb::Options::default().zpages_group_bytes
+        );
+        assert_eq!(b.zpages_group_bytes, supdb::db::zpages::ZGROUP_BYTES);
+        for (name, make, target) in [
+            (
+                "supdb-cache64tofitautozpagesonegroup",
+                Supdb::create_cache64_tofit_auto_zpages_onegroup as fn(&Path) -> Res<Supdb>,
+                0usize,
+            ),
+            (
+                "supdb-cache64tofitautozpagesgroup1k",
+                Supdb::create_cache64_tofit_auto_zpages_group1k,
+                1024,
+            ),
+        ] {
+            let arm = new(name, make);
+            assert_eq!(arm.name(), name);
+            assert_eq!(guarantee(arm.name()), guarantee(base.name()));
+            assert_eq!(arm.zgroup, Some(target));
+            assert!(base.zgroup.is_none() && !arm.zcacheraw && arm.zpromote == 0);
+            assert_eq!(arm.features(), base.features());
+            let g = arm.db.as_ref().unwrap().options();
+            assert_eq!(g.zpages_group_bytes, target, "{name}: the one option");
+            assert_eq!(
+                (
+                    g.zpages,
+                    g.scan_block_cache,
+                    g.scan_cache_bytes,
+                    g.forms_to_fit,
+                    g.zpages_block_cache,
+                    g.promote_entries
+                ),
+                (
+                    b.zpages,
+                    b.scan_block_cache,
+                    b.scan_cache_bytes,
+                    b.forms_to_fit,
+                    b.zpages_block_cache,
+                    b.promote_entries
+                )
+            );
+            let d = root.join(format!("dispatch-{name}"));
+            std::fs::create_dir_all(&d).unwrap();
+            let opened = open(name, &d, 1).unwrap();
+            assert_eq!(opened.name(), name);
+            drop(opened);
+            drop(arm);
+        }
         drop(promote);
         drop(arm);
         drop(base);

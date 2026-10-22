@@ -1256,3 +1256,44 @@ container of several groups of a target decoded size, one fence entry
 and one CRC a page and a directory of the groups inside it, so a point
 read decodes one group and a scan decodes the groups it walks, and the
 memo's entry is a group and not a page.
+
+## The page as a container of groups
+
+The cut, built: a form file's page holds one to sixteen groups, each
+compressed on its own, with a directory after the header naming each
+group's first record index, its payload's place and length, its decoded
+length and, for every group but the first, the key of its first record
+(`src/db/zpages.rs`, tag `ZPG2`, magic `SUPDZPG2`; a `ZPG1` reader would
+take the directory for the payload, so an old file is refused at its
+trailer and rebuilt). The fill stages a group to
+`Options::zpages_group_bytes` of records (two kibibytes as shipped),
+compresses it once, and trims only a page's last group to the room,
+sizing that group from the page's own ratio first so the room costs a
+trim and not a compress call and a trim; at a target of zero the page
+is one group grown to fill it, the shape before, with its hint, its
+growth rounds and its turns, which is the arm
+`supdb-cache64tofitautozpagesonegroup`; `...group1k` cuts at a kibibyte.
+A point read finds the page by the fence and the group by the
+directory's keys and decodes that group alone; a scan decodes the
+groups it walks, the cursor stepping to the page's next group before
+the next page; the memo's entry is a group, 4,096 slots under the same
+8 MB; the sampler prices a read by the decode of one group and a scan
+by the groups it crosses.
+
+Two things the first build of it taught. A page is verified whole at
+its first decode, every group walked, and not the group read alone:
+the directory's key for a group is held to the group's first record
+only by that group's walk, and a key the directory names above the
+true first record sends a read of that record to the group before,
+where it is absent, with nothing raised -- the forged-page test caught
+it on the first run, answering a key on the page `[]`. And the
+directory can name a group only by a record: an image with no key to
+parse, or one not above the group before (never a record of a
+partition), closes the page before it, so the fill stays total on the
+adversarial images its tests draw and a page of entropy images holds
+one group of them under the cut.
+
+At the suite's shape the fill reads 55.9 records a page in 3.99 groups
+at a fill of 0.991, against 58.3 in one group; the cut's price in pages
+is held by a test to 2-12%. Pairings at five million keys under 640 MiB
+(`zgroup-5m.sh`): to come.

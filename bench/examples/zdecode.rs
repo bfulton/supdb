@@ -6,54 +6,56 @@
 //! This builds a store under the forced form (`supdb-nocachezpages`) in the
 //! suite's shape -- `size` keys in key order, values of a hundred bytes at
 //! the suite's compressibility, `Batch` flushes of a thousand and the `sync`
-//! the suite's load ends in -- reads every compressed page of its form files
-//! back, decodes each with the engine's decoder and with liblz4's
-//! `LZ4_decompress_safe` (the `lz4` crate), requires the two to agree byte
-//! for byte with the page's `ulen`, and times each over the pages:
+//! the suite's load ends in -- reads every compressed group of every page of
+//! its form files back, decodes each with the engine's decoder and with
+//! liblz4's `LZ4_decompress_safe` (the `lz4` crate), requires the two to
+//! agree byte for byte with the group's `ulen`, and times each over the
+//! groups:
 //!
-//! - `cycle`: every page in turn, the decoder's input streaming through the
+//! - `cycle`: every group in turn, the decoder's input streaming through the
 //!   cache as a memo miss's does, one time a round, the decoders alternating
 //!   their order round by round so a drift in the host falls on both;
-//! - `hot`: one page decoded over and over, the input in L1, the decoder's
+//! - `hot`: one group decoded over and over, the input in L1, the decoder's
 //!   own instruction cost with nothing of the bytes' placement in it.
 //!
-//! Prints each decoder's median ns a page and ns a decoded byte over the
+//! Prints each decoder's median ns a group and ns a decoded byte over the
 //! rounds, and the C decoder's share of the engine's. For an instruction
-//! count, `--count flex` or `--count c` decodes every page once with that
+//! count, `--count flex` or `--count c` decodes every group once with that
 //! decoder and exits, for `valgrind --tool=callgrind` with
 //! `--toggle-collect=zdecode::decode_all_flex` (or `_c`).
 //!
-//! Then the other lever the count points at, priced before it is built: a
-//! point read decodes the whole group, some seven kilobytes, for one record
-//! of a hundred and twenty. `--split k,...` cuts each group at record
-//! boundaries into `k` runs of about equal bytes, compresses each run on
-//! its own with the engine's encoder (the whole group recompressed the same
-//! way is the check: its bytes are the page's payload's), and reports what
-//! the cut costs in bytes (the compressed bytes over the decoded, against
-//! the page's own) and what it saves in decode: one run a page, the point
-//! read's decode, and all `k` runs, the scan's, each cycling the pages as
-//! above.
+//! Then the lever the count pointed at, priced here before it was built and
+//! kept to price the cut again: a point read decodes one group of a page
+//! for one record. `--split k,...` cuts each group as read at record
+//! boundaries into `k` runs of about equal bytes, compresses each run on its
+//! own with the engine's encoder (the group recompressed whole is the
+//! check: its bytes are the page's payload's for it), and reports what the
+//! cut costs in bytes (the compressed bytes over the decoded, against the
+//! file's own) and what it saves in decode: one run a group, the point
+//! read's decode, and all `k` runs, the scan's, each cycling the groups as
+//! above. The form as shipped cuts a page at two kibibytes of records
+//! (`Options::zpages_group_bytes`); a store built with the target at zero
+//! (one group a page) is what the split was first priced on.
 //!
 //!     cargo run --release --features lz4-c --example zdecode -- [--size N] [--rounds N] [--split k,...] [--pages N] [--count flex|c]
 use std::hint::black_box;
 use std::path::Path;
 use std::time::Instant;
-use supdb::db::zpages::{
-    lz4_decoder, parse_page, Lz4Decoder, PageHeader, Trailer, ZPAGE, ZTRAILER,
-};
+use supdb::db::zpages::{lz4_decoder, parse_page, Lz4Decoder, Trailer, ZPAGE, ZTRAILER};
 use supdb::flatindex::record_key_next;
 use supdb_bench::engines::{self, Batch};
 use supdb_bench::workload::{db_key_into, Payload, Rng};
 
-/// A compressed page's payload, the length its group decodes to and the
-/// records in it.
+/// A compressed group's payload, the length it decodes to and the records
+/// in it.
 struct Page {
     payload: Vec<u8>,
     ulen: usize,
     count: usize,
 }
 
-/// Every compressed page of every form file under `dir`, in file order.
+/// Every compressed group of every page of every form file under `dir`, in
+/// file order.
 fn form_pages(dir: &Path) -> Vec<Page> {
     let mut files: Vec<_> = walk(dir)
         .into_iter()
@@ -66,28 +68,31 @@ fn form_pages(dir: &Path) -> Vec<Page> {
     files.sort();
     assert!(!files.is_empty(), "no form file under {}", dir.display());
     let mut pages = Vec::new();
-    let mut stored = 0usize;
+    let (mut stored, mut npages) = (0usize, 0usize);
     for f in &files {
         let bytes = std::fs::read(f).expect("a form file reads");
         let t = Trailer::decode(&bytes[bytes.len() - ZTRAILER..]).expect("a trailer");
         let bind = t.bind32();
         for i in 0..t.n_pages as usize {
             let page = &bytes[i * ZPAGE..(i + 1) * ZPAGE];
-            let (h, payload): (PageHeader, &[u8]) =
-                parse_page(page, bind).expect("a page we built");
-            if h.stored {
-                stored += 1;
-                continue;
+            let view = parse_page(page, bind).expect("a page we built");
+            npages += 1;
+            for j in 0..view.groups() {
+                let g = view.group(j).expect("a group of the page");
+                if g.stored {
+                    stored += 1;
+                    continue;
+                }
+                pages.push(Page {
+                    payload: view.payload(j).expect("its payload").to_vec(),
+                    ulen: g.ulen as usize,
+                    count: usize::from(g.count),
+                });
             }
-            pages.push(Page {
-                payload: payload.to_vec(),
-                ulen: h.ulen as usize,
-                count: h.count as usize,
-            });
         }
     }
     println!(
-        "{} form files, {} compressed pages, {} stored pages skipped",
+        "{} form files, {npages} pages, {} compressed groups, {} stored groups skipped",
         files.len(),
         pages.len(),
         stored
@@ -258,7 +263,7 @@ fn split_probe(pages: &[Page], ks: &[usize], rounds: usize) {
     let ulen_max = pages.iter().map(|p| p.ulen).max().unwrap();
     let mut out = vec![0u8; ulen_max];
     println!(
-        "\nsplit: the group cut into k runs compressed apart; bytes as the compressed over the decoded (the page's own {:.3}); ns a decode cycling {} pages, median of {rounds} rounds",
+        "\nsplit: each group cut into k runs compressed apart; bytes as the compressed over the decoded (the file's own {:.3}); ns a decode cycling {} groups, median of {rounds} rounds",
         total_c as f64 / total_u as f64,
         pages.len()
     );
@@ -269,10 +274,7 @@ fn split_probe(pages: &[Page], ks: &[usize], rounds: usize) {
     for &k in ks {
         let (runs, stored) = cut_runs(pages, k);
         if k == 1 {
-            assert_eq!(
-                stored, total_c,
-                "the whole group recompressed is the page's payload"
-            );
+            assert_eq!(stored, total_c, "a group recompressed whole is its payload");
         }
         // The runs decode to the group: every run, against the page's own
         // decode.
@@ -421,7 +423,7 @@ fn main() {
     let total_u: usize = pages.iter().map(|p| p.ulen).sum();
     let total_c: usize = pages.iter().map(|p| p.payload.len()).sum();
     println!(
-        "{} compressed bytes to {} decoded, {:.2} a page decoded, ratio {:.3}",
+        "{} compressed bytes to {} decoded, {:.2} a group decoded, ratio {:.3}",
         total_c,
         total_u,
         total_u as f64 / pages.len() as f64,
@@ -431,7 +433,7 @@ fn main() {
     let mut a = vec![0u8; ulen_max];
     let mut b = vec![0u8; ulen_max];
 
-    // Agreement first: both decoders, every page, byte for byte and in
+    // Agreement first: both decoders, every group, byte for byte and in
     // length.
     for (i, p) in pages.iter().enumerate() {
         let na = flex(p, &mut a);
@@ -442,7 +444,7 @@ fn main() {
             "page {i}: the decoders disagree"
         );
     }
-    println!("the decoders agree on every page");
+    println!("the decoders agree on every group");
 
     if let Some(which) = count {
         let n = match which.as_str() {
@@ -451,7 +453,7 @@ fn main() {
             other => panic!("--count takes flex or c, not {other}"),
         };
         println!(
-            "counted {which}: {n} bytes decoded over {} pages",
+            "counted {which}: {n} bytes decoded over {} groups",
             pages.len()
         );
         return;
@@ -502,7 +504,7 @@ fn main() {
     let bytes = total_u as f64 / pages.len() as f64;
     let (mf, mc) = (median(&mut cyc_f), median(&mut cyc_c));
     println!(
-        "cycle ({rounds} rounds over {} pages): lz4_flex {:.0} ns a page ({:.3} ns a byte), liblz4 {:.0} ns a page ({:.3} ns a byte); liblz4 at {:.2} of lz4_flex",
+        "cycle ({rounds} rounds over {} groups): lz4_flex {:.0} ns a group ({:.3} ns a byte), liblz4 {:.0} ns a group ({:.3} ns a byte); liblz4 at {:.2} of lz4_flex",
         pages.len(),
         mf,
         mf / bytes,
@@ -511,7 +513,7 @@ fn main() {
         mc / mf
     );
     println!(
-        "hot (16 pages, 200 decodes a sample, {rounds} samples): lz4_flex {:.0} / {:.0} ns a page, liblz4 {:.0} / {:.0} ns a page; liblz4 at {:.2} of lz4_flex",
+        "hot (16 groups, 200 decodes a sample, {rounds} samples): lz4_flex {:.0} / {:.0} ns a group, liblz4 {:.0} / {:.0} ns a group; liblz4 at {:.2} of lz4_flex",
         hot_f,
         hot_f2,
         hot_c,

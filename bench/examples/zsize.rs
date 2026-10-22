@@ -1,4 +1,4 @@
-//! What the z form's layout makes of the suite's records: the real `fill_group`
+//! What the z form's layout makes of the suite's records: the real `fill_page`
 //! over the record images of partitions the engine wrote, for the four key
 //! shapes a store may have and three payload compressibilities.
 //!
@@ -14,16 +14,17 @@
 //! and flushed into partitions. For every record of every partition the image
 //! the directory points at is compared with the record `stream_record` makes of
 //! what `exts_at_full` reads back, byte for byte; the images then go through
-//! `fill_group` a page at a time with the previous page's count as the hint,
-//! and every page it builds goes through `verify_page`, the check a reader's
-//! first decode makes.
+//! `fill_page` a page at a time, each page cut into groups at the engine's
+//! target (`ZGROUP_BYTES`), and every page it builds goes through
+//! `verify_page`, the check a reader's first decode makes.
 //!
-//! Printed: the size of what was built (records and bytes a page, fill,
-//! compress calls a page); the time of what a read does with a page, on this
-//! machine and hot unless the column says cold (decode, the walk that finds a
-//! key, the walk that checks a group, the CRC, the whole first decode) and what
-//! `fill_group` itself takes a page; and the occupancy of the cache the bound
-//! leaves at ten million keys, with the time `fill_group` takes at that size.
+//! Printed: the size of what was built (records, groups and bytes a page,
+//! fill, compress calls a page); the time of what a read does with a page,
+//! on this machine and hot unless the column says cold (the decode of one
+//! group, the walk that finds a key in it, the walk that checks it, the
+//! page's CRC, the whole first decode of a page) and what `fill_page` itself
+//! takes a page; and the occupancy of the cache the bound leaves at ten
+//! million keys, with the time `fill_page` takes at that size.
 //! Pages are built from the records and nothing else, so what is printed is a
 //! function of the images, the layout and the codec: the codec is printed, and
 //! the digest of the pages is, so that a build with the other codec can be held
@@ -42,9 +43,9 @@ use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use supdb::db::zpages::{
-    bind32, decode_group, fill_group, filter_bytes, group_seek, lz4_decoder, lz4_encoder_pin,
-    page_crc, parse_page, verify_page, walk_group, FenceEntry, Fill, FillScratch, FillStats, Group,
-    GroupBuf, Images, Lz4Decoder, SegImages, LZ4_ENCODER_PIN, ZCAP, ZPAGE, ZTRAILER,
+    bind32, decode_group, fill_page, filter_bytes, group_seek, lz4_decoder, lz4_encoder_pin,
+    page_crc, parse_page, verify_page, walk_group, FenceEntry, Fill, FillScratch, FillStats,
+    Filled, GroupBuf, Images, Lz4Decoder, SegImages, LZ4_ENCODER_PIN, ZCAP, ZPAGE, ZTRAILER,
 };
 use supdb::flatindex::{self, record_key, record_key_next, FlatIndex};
 use supdb::{Blob, Bytes, Db, MmapBytes, Options};
@@ -185,7 +186,7 @@ struct Cell {
     pages: Vec<[u8; ZPAGE]>,
     /// Rank within its partition, count, and first key of each page.
     meta: Vec<(u32, u32, Vec<u8>)>,
-    groups: Vec<Group>,
+    groups: Vec<Filled>,
     /// Records and pages over the pages a partition builds once it is under
     /// way: all but its first, whose call has no predecessor to size from
     /// and holds about half a page, and its last, which holds what is left.
@@ -193,7 +194,7 @@ struct Cell {
     steady: (u64, u64),
     declined: u64,
     stats: FillStats,
-    /// Nanoseconds spent inside `fill_group`: the compress calls, and the
+    /// Nanoseconds spent inside `fill_page`: the compress calls, and the
     /// decode and compare of each page it built.
     fill_ns: u64,
     digest: u64,
@@ -246,7 +247,7 @@ fn load(dir: &Path, keys: &[Vec<u8>], payload: &Payload) -> Vec<PathBuf> {
 }
 
 /// The stored records of every partition checked against the writer's
-/// encoder, then run through `fill_group`; the cell's numbers.
+/// encoder, then run through `fill_page`; the cell's numbers.
 fn analyze(segs: &[PathBuf], want: usize, shape: Shape, comp: f64, sweep: bool) -> Cell {
     let mut cell = Cell {
         shape,
@@ -303,12 +304,12 @@ fn analyze(segs: &[PathBuf], want: usize, shape: Shape, comp: f64, sweep: bool) 
         }
         cell.keys += n;
         // The pages.
-        let (mut rank, mut hint) = (0usize, 0usize);
+        let mut rank = 0usize;
         let mut counts: Vec<usize> = Vec::new();
         while rank < n {
             let mut page = [0u8; ZPAGE];
             let t = Instant::now();
-            let made = fill_group(&images, rank, hint, bind(), &mut scratch, &mut page);
+            let made = fill_page(&images, rank, bind(), &mut scratch, &mut page);
             cell.fill_ns += t.elapsed().as_nanos() as u64;
             match made {
                 Fill::Page(g) => {
@@ -328,7 +329,6 @@ fn analyze(segs: &[PathBuf], want: usize, shape: Shape, comp: f64, sweep: bool) 
                     cell.groups.push(g);
                     counts.push(g.count);
                     rank += g.count;
-                    hint = g.count;
                 }
                 Fill::NoPage(_) => {
                     cell.declined += 1;
@@ -346,19 +346,18 @@ fn analyze(segs: &[PathBuf], want: usize, shape: Shape, comp: f64, sweep: bool) 
             cell.steady.0 += mid.iter().sum::<usize>() as u64;
             cell.steady.1 += mid.len() as u64;
         }
-        // The knob, over the first partition.
+        // The one-group shape's knob, over the first partition.
         if sweep && pi == 0 {
             for rounds in 0..=3u32 {
                 let mut s = FillScratch::new();
+                s.group_bytes = 0;
                 s.grow_rounds = rounds;
-                let (mut rank, mut hint) = (0usize, 60usize);
+                s.hint = 60;
+                let mut rank = 0usize;
                 while rank < n {
                     let mut page = [0u8; ZPAGE];
-                    match fill_group(&images, rank, hint, bind(), &mut s, &mut page) {
-                        Fill::Page(g) => {
-                            rank += g.count;
-                            hint = g.count;
-                        }
+                    match fill_page(&images, rank, bind(), &mut s, &mut page) {
+                        Fill::Page(g) => rank += g.count,
                         Fill::NoPage(_) => rank += 1,
                         other => panic!("sweep rank {rank}: {other:?}"),
                     }
@@ -367,7 +366,7 @@ fn analyze(segs: &[PathBuf], want: usize, shape: Shape, comp: f64, sweep: bool) 
                 cell.sweep.push((
                     rounds,
                     s.stats.records as f64 / p,
-                    s.stats.payload_bytes as f64 / (p * ZCAP as f64),
+                    s.stats.used_bytes as f64 / (p * ZCAP as f64),
                     s.stats.calls as f64 / p,
                 ));
             }
@@ -437,8 +436,8 @@ struct Times {
     parse: f64,
     crc: f64,
     verify: f64,
-    stored_pages: usize,
-    sampled: usize,
+    stored_groups: usize,
+    groups_sampled: usize,
 }
 
 fn time_cell(cell: &Cell, rounds: usize) -> Times {
@@ -447,17 +446,18 @@ fn time_cell(cell: &Cell, rounds: usize) -> Times {
     let picks: Vec<usize> = (0..take).map(|i| i * total / take).collect();
     let high = [0xFFu8; 64];
     let mut rows: Vec<[f64; 7]> = Vec::new();
-    let mut stored_pages = 0;
+    let (mut stored_groups, mut groups_sampled) = (0, 0);
     for _ in 0..rounds {
         let (mut decode, mut cold, mut find, mut walk, mut parse, mut crc, mut verify) =
             (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
         let mut buf = GroupBuf::new();
         let mut vbuf = GroupBuf::new();
         let mut cold_ok = true;
-        stored_pages = 0;
+        stored_groups = 0;
+        groups_sampled = 0;
         for &pi in &picks {
             let page = &cell.pages[pi];
-            let (h, payload) = parse_page(page, bind()).expect("a page we built");
+            let view = parse_page(page, bind()).expect("a page we built");
             let (rank, count, key) = &cell.meta[pi];
             let entry = FenceEntry {
                 index: pi,
@@ -472,40 +472,45 @@ fn time_cell(cell: &Cell, rounds: usize) -> Times {
             verify.push(ns_of(40, || {
                 black_box(verify_page(black_box(page), bind(), &entry, &mut vbuf).is_ok());
             }));
-            if h.stored {
-                stored_pages += 1;
-            } else {
-                decode.push(ns_of(100, || {
-                    let _ =
-                        black_box(decode_group(&h, black_box(payload), &mut buf).map(|g| g.len()));
+            // Each group of the page on its own: the decode a point read
+            // pays, the walks over it.
+            for j in 0..view.groups() {
+                let g = view.group(j).expect("a group of the page");
+                groups_sampled += 1;
+                if g.stored {
+                    stored_groups += 1;
+                } else {
+                    decode.push(ns_of(100, || {
+                        let _ = black_box(decode_group(&view, j, &mut buf).map(|g| g.len()));
+                    }));
+                    cold_ok &= evict(page);
+                    let t = Instant::now();
+                    black_box(decode_group(&view, j, &mut buf).map(|g| g.len()).ok());
+                    cold.push(t.elapsed().as_nanos() as f64);
+                }
+                let group = decode_group(&view, j, &mut buf).expect("decodes");
+                let n = usize::from(g.count);
+                let mut keys: Vec<&[u8]> = Vec::with_capacity(n);
+                let mut off = 0;
+                for _ in 0..n {
+                    let (k, next) = record_key_next(group, off).expect("a whole group");
+                    keys.push(k);
+                    off = next;
+                }
+                find.push(
+                    ns_of(40, || {
+                        for k in &keys {
+                            black_box(group_seek(black_box(group), n, k).is_ok());
+                        }
+                    }) / n as f64,
+                );
+                walk.push(ns_of(100, || {
+                    black_box(group_seek(black_box(group), n, &high).is_ok());
                 }));
-                cold_ok &= evict(page);
-                let t = Instant::now();
-                black_box(decode_group(&h, payload, &mut buf).map(|g| g.len()).ok());
-                cold.push(t.elapsed().as_nanos() as f64);
+                parse.push(ns_of(100, || {
+                    black_box(walk_group(black_box(group), n, None, None).is_ok());
+                }));
             }
-            let group = decode_group(&h, payload, &mut buf).expect("decodes");
-            let n = h.count as usize;
-            let mut keys: Vec<&[u8]> = Vec::with_capacity(n);
-            let mut off = 0;
-            for _ in 0..n {
-                let (k, next) = record_key_next(group, off).expect("a whole group");
-                keys.push(k);
-                off = next;
-            }
-            find.push(
-                ns_of(40, || {
-                    for k in &keys {
-                        black_box(group_seek(black_box(group), n, k).is_ok());
-                    }
-                }) / n as f64,
-            );
-            walk.push(ns_of(100, || {
-                black_box(group_seek(black_box(group), n, &high).is_ok());
-            }));
-            parse.push(ns_of(100, || {
-                black_box(walk_group(black_box(group), n, None).is_ok());
-            }));
         }
         let med = |v: &mut [f64]| {
             if v.is_empty() {
@@ -546,8 +551,8 @@ fn time_cell(cell: &Cell, rounds: usize) -> Times {
         parse: across(4),
         crc: across(5),
         verify: across(6),
-        stored_pages,
-        sampled: take,
+        stored_groups,
+        groups_sampled,
     }
 }
 
@@ -664,26 +669,29 @@ fn main() {
         }
     }
 
-    println!("SIZE (what fill_group built; every page decoded, compared and verified)");
     println!(
-        "{:<13} {:>4} {:>6} {:>5} {:>7} {:>8} {:>8} {:>7} {:>6} {:>7} {:>6} {:>7} {:>6} {:>7} {:>18}",
-        "shape", "comp", "parts", "rec_B", "pages", "rec/page", "grpB/pg", "payB/pg", "B/key", "fill", "stored", "nopage", "calls", "turns", "digest"
+        "SIZE (what fill_page built; every page decoded group by group, compared and verified)"
+    );
+    println!(
+        "{:<13} {:>4} {:>6} {:>5} {:>7} {:>8} {:>6} {:>8} {:>7} {:>6} {:>7} {:>6} {:>7} {:>6} {:>7} {:>18}",
+        "shape", "comp", "parts", "rec_B", "pages", "rec/page", "grp/pg", "grpB/pg", "payB/pg", "B/key", "fill", "stored", "nopage", "calls", "turns", "digest"
     );
     for (c, _) in &cells {
         let p = c.pages.len() as f64;
         println!(
-            "{:<13} {:>4} {:>6} {:>5.1} {:>7} {:>8.2} {:>8.1} {:>7.1} {:>6.2} {:>7.4} {:>5.1}% {:>7} {:>6.3} {:>7.3} {:>18x}",
+            "{:<13} {:>4} {:>6} {:>5.1} {:>7} {:>8.2} {:>6.2} {:>8.1} {:>7.1} {:>6.2} {:>7.4} {:>5.1}% {:>7} {:>6.3} {:>7.3} {:>18x}",
             c.shape.name(),
             c.comp,
             c.partitions,
             c.image_bytes as f64 / c.keys as f64,
             c.pages.len(),
             c.keys as f64 / p,
+            c.stats.groups as f64 / p,
             c.stats.group_bytes as f64 / p,
             c.stats.payload_bytes as f64 / p,
             ZPAGE as f64 * p / c.keys as f64,
-            c.stats.payload_bytes as f64 / (p * ZCAP as f64),
-            100.0 * c.stats.stored as f64 / p,
+            c.stats.used_bytes as f64 / (p * ZCAP as f64),
+            100.0 * c.stats.stored as f64 / c.stats.groups.max(1) as f64,
             c.declined,
             c.stats.calls as f64 / p,
             c.stats.turns as f64 / p,
@@ -706,7 +714,7 @@ fn main() {
 
     if timing {
         println!(
-            "\nTIME, microseconds a page, medians over sampled pages and rounds (hot unless cold)"
+            "\nTIME, microseconds a group (crc and verify a page), medians over sampled pages' groups and rounds (hot unless cold)"
         );
         println!(
             "{:<13} {:>4} {:>8} {:>16} {:>8} {:>8} {:>8} {:>8} {:>8} {:>7} {:>9} {:>9}",
@@ -720,7 +728,7 @@ fn main() {
             "parse",
             "crc",
             "verify",
-            "fill_group",
+            "fill_page",
             "stored/n"
         );
         for (c, t) in &cells {
@@ -739,15 +747,15 @@ fn main() {
                 t.crc,
                 t.verify,
                 c.fill_ns as f64 / c.pages.len() as f64 / 1000.0,
-                t.stored_pages,
-                t.sampled,
+                t.stored_groups,
+                t.groups_sampled,
             );
         }
-        println!("  decode: the LZ4 block into the buffer (stored pages are lent in place and not in the median); cold: the page's lines flushed first, the buffer it decodes into warm,");
+        println!("  decode: one group's LZ4 block into the buffer, what a point read pays (stored groups are lent in place and not in the median); cold: the page's lines flushed first, the buffer it decodes into warm,");
         println!("  one call timed by a pair of clock reads that is in the figure; the fault that brings a page in is not, so cold is the decode's share of a first read, a quantity of its own and not a second reading of the hot column;");
-        println!("  find: the walk to one key, averaged over the page's keys; walk: the walk past every record; parse: the structural walk (parse_record);");
-        println!("  crc: the page's checksum; verify: a reader's whole first decode of a page;");
-        println!("  fill_group: the builder's call for the page, its compress calls and the decode and compare of the page it made, once, in the load's pass");
+        println!("  find: the walk to one key, averaged over the group's keys; walk: the walk past every record of the group; parse: the structural walk (parse_record);");
+        println!("  crc: the page's checksum; verify: a reader's whole first decode of a page, every group; stored/n: stored groups over the groups sampled;");
+        println!("  fill_page: the builder's call for the page, its compress calls and the decode and compare of the page it made, once, in the load's pass");
     }
 
     println!(
@@ -756,7 +764,7 @@ fn main() {
     );
     println!(
         "{:<13} {:>4} {:>11} {:>10} {:>12} {:>10} {:>14}",
-        "shape", "comp", "pages", "pages_GB", "resident_MB", "occupancy", "fill_group_s"
+        "shape", "comp", "pages", "pages_GB", "resident_MB", "occupancy", "fill_page_s"
     );
     for (c, _) in &cells {
         let (pages, bytes, resident, occ) = occupancy(c);
@@ -779,7 +787,7 @@ fn main() {
             fill
         );
     }
-    println!("  fill_group_s: the builder's fill_group calls at this many pages, one thread: the compress and the decode-compare of the build, not its read of the raw segment, the filter, the CRCs or the writes");
+    println!("  fill_page_s: the builder's fill_page calls at this many pages, one thread: the compress and the decode-compare of the build, not its read of the raw segment, the filter, the CRCs or the writes");
 
     let suite = cells
         .iter()
@@ -787,7 +795,7 @@ fn main() {
         .map(|(c, _)| c);
     if let Some(c) = suite {
         if !c.sweep.is_empty() {
-            println!("\nGROWTH ROUNDS (the suite's shape, first partition, first hint 60)");
+            println!("\nGROWTH ROUNDS (the suite's shape, first partition, the page as one group, first hint 60)");
             for (r, rpp, fill, calls) in &c.sweep {
                 println!("  grow_rounds {r}: {rpp:.2} records a page, fill {fill:.4}, {calls:.3} compress calls a page");
             }
