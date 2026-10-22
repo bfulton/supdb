@@ -299,9 +299,11 @@ a group decoded. The form's page is a container of groups, each
 compressed on its own and cut at `Options::zpages_group_bytes` of
 records, so that a point read decodes the group its record is in and not
 the page: `supdb-cache64tofitautozpagesonegroup` is the combined arm with
-the target at zero, the page as one group, the shape before the cut, and
-`supdb-cache64tofitautozpagesgroup1k` cuts at a kibibyte where the
-default cuts at two. The forced arm's
+the target at zero, the page as one group, the shape before the cut,
+`supdb-nocachezpagesonegroup` is the forced arm with the same, which
+prices the cut on a point read through the form from the pass's first
+read, and `supdb-cache64tofitautozpagesgroup1k` cuts at a kibibyte where
+the default cuts at two. The forced arm's
 `sync` builds the form files, so its load carries the build, and in memory
 it reads slower than the raw form: it is an arm for the bound, not a
 default.

@@ -3836,6 +3836,26 @@ impl Supdb {
         )
     }
 
+    /// `supdb-nocachezpages` with the page as one group
+    /// (`Options::zpages_group_bytes` zero), the shape before the cut: the
+    /// pair against `supdb-nocachezpages` differs by that one option and
+    /// prices the cut on the point read through the form from the first
+    /// read of the pass, which the controller's pair
+    /// (`supdb-cache64tofitautozpagesonegroup`) cannot, since under the
+    /// controller the form lands after the read passes. Chosen by hand, as
+    /// `ab --arms supdb-nocachezpages,supdb-nocachezpagesonegroup`.
+    pub fn create_nocache_zpages_onegroup(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                block_cache: false,
+                zpages: true,
+                zgroup: Some(0),
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-nocachezpages` with every build left to the settle of the
     /// form rather than started as its partition lands
     /// (`Options::zpages_eager` off): the shape the forced arm's first
@@ -5141,6 +5161,8 @@ impl Engine for Supdb {
                 "supdb-nocachezpagesrankwalk"
             } else if self.zpages_settle {
                 "supdb-nocachezpagessettle"
+            } else if self.zgroup == Some(0) {
+                "supdb-nocachezpagesonegroup"
             } else {
                 "supdb-nocachezpages"
             };
@@ -6033,6 +6055,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocachezpagesheads"
         | "supdb-nocachezpagesprefetch"
         | "supdb-nocachezpagesrankwalk"
+        | "supdb-nocachezpagesonegroup"
         | "supdb-nocachezpagessettle"
         | "supdb-autozpages"
         | "supdb-nocacheautozpages"
@@ -6229,6 +6252,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nocachezpagesheads" => Box::new(Supdb::create_nocache_zpages_heads(dir)?),
         "supdb-nocachezpagesprefetch" => Box::new(Supdb::create_nocache_zpages_prefetch(dir)?),
         "supdb-nocachezpagesrankwalk" => Box::new(Supdb::create_nocache_zpages_rankwalk(dir)?),
+        "supdb-nocachezpagesonegroup" => Box::new(Supdb::create_nocache_zpages_onegroup(dir)?),
         "supdb-nocachezpagessettle" => Box::new(Supdb::create_nocache_zpages_settle(dir)?),
         "supdb-autozpages" => Box::new(Supdb::create_auto_zpages(dir)?),
         "supdb-cache64tofit" => Box::new(Supdb::create_cache64_tofit(dir)?),
@@ -7343,6 +7367,11 @@ mod tests {
                 Supdb::create_nocache_zpages_rankwalk,
                 "rankwalk",
             ),
+            (
+                "supdb-nocachezpagesonegroup",
+                Supdb::create_nocache_zpages_onegroup,
+                "onegroup",
+            ),
         ] {
             let arm = new(arm_dir, make);
             assert_eq!(arm.name(), name);
@@ -7350,6 +7379,8 @@ mod tests {
             assert_eq!(guarantee(name), guarantee("supdb-nocachezpages"));
             assert!(arm.zpages && base.zpages, "both force the form");
             assert!(!arm.zpages_nodrop);
+            assert_eq!(arm.zgroup, (arm_dir == "onegroup").then_some(0));
+            assert!(base.zgroup.is_none());
             assert_eq!(arm.zpages_nowarm, arm_dir == "nowarm");
             assert_eq!(arm.zpages_settle, arm_dir == "settle");
             assert_eq!(arm.zpages_nomemo, arm_dir == "nomemo");
@@ -7386,6 +7417,16 @@ mod tests {
                 arm_dir != "rankwalk",
                 "{name}: the one option"
             );
+            assert_eq!(
+                a.zpages_group_bytes,
+                if arm_dir == "onegroup" {
+                    0
+                } else {
+                    b.zpages_group_bytes
+                },
+                "{name}: the one option"
+            );
+            assert_eq!(b.zpages_group_bytes, supdb::db::zpages::ZGROUP_BYTES);
             assert!(a.zpages == supdb::ZPages::Always && b.zpages == supdb::ZPages::Always);
             assert_eq!(a.zpages_drop_behind, b.zpages_drop_behind);
             assert_eq!(a.zpages_min_bytes, b.zpages_min_bytes);

@@ -1295,5 +1295,76 @@ one group of them under the cut.
 
 At the suite's shape the fill reads 55.9 records a page in 3.99 groups
 at a fill of 0.991, against 58.3 in one group; the cut's price in pages
-is held by a test to 2-12%. Pairings at five million keys under 640 MiB
-(`zgroup-5m.sh`): to come.
+is held by a test to 2-12%.
+
+Pairings at five million keys under 640 MiB (`zgroup-5m.sh`, head
+dda952d, three pairs after the warmup in both orders, each sitting nine
+minutes). The cut against the page as one group
+(`zgroup5m-ab-{1,2}.*`, the combined arm against
+`supdb-cache64tofitautozpagesonegroup`): the form's files 391 MB against
+361, 8.5% for the cut, 93,333 pages against 85,932; the mixes, the one
+pass that reads the form in these sittings, for the cut in both orders,
+3 of 3 pairs in every cell but F's first sitting (2 of 3) -- C 1.61x
+and 1.63x, D 1.76x and 1.99x, B 1.54x and 1.46x, F 1.12x and 1.56x, A
+1.41x and 1.16x, E 1.31x and 1.21x -- with no faults in any mix of
+either arm, since the mixes' Zipfian head is in core, and the same
+decodes a mix (C: 83,334 reads, 38,302 decodes against 39,275, the memo
+hitting 54% in both), so the move is the decode's bytes alone, a group
+of 1.8 KB where a page's 7 KB was. The point reads, the threaded reads
+and the scans read level with the faults level (point reads 0.95-0.98x
+in one order and 1.01-1.03x in the other, the one-thread scan 0.94x and
+then 1.07x, the three-thread scan 1.38x and then 0.85x, which is the
+threaded cell's spread), because none of them read the form: in every
+rep of both arms the controller went SUSPECT 1.5 s into the read pass,
+sampled for nine seconds, started the build sixteen seconds after the
+read pass had ended and installed twenty-seven seconds later, inside
+the threaded scans, so the read passes paired the raw form against
+itself (0.26 faults a read, the raw rate the census has read at this
+rung since the model was fixed). The scans' counters say what the cut
+costs where the form is read in bulk: the memo misses 4.1x and 4.0x,
+the groups a scan crosses 4.3x, each a decode of a quarter the bytes.
+`supdb-nocachezpagesonegroup`, the forced arm with the page as one
+group, is the pair that prices the cut on a point read through the
+form from the pass's first read (`zgroup-forced-5m.sh`, below).
+
+The cut against LMDB with its readahead off (`zgrouplmdb5m-ab-{1,2}.*`):
+A 5.1x and 4.7x, F 3.8x and 3.4x, B 1.8x and 1.8x, D 1.6x and 1.5x, C
+1.16x and 1.09x (2 of 3 and 1 of 3), E 0.64x and 0.71x; the point reads
+0.41x and 0.40x at 3.1-3.5x LMDB's faults and the one-thread scans
+0.13x and 0.16x at nine to ten times, the raw form's passes as above.
+Beside the sitting before the cut (C 0.53x and 1.33x, D 0.82x and
+0.74x, E 0.55x and 0.62x), the mixes a point read dominates moved by
+about the in-process factor the cut pairing read; the comparator moves
+between sittings, so the cut's verdict is the in-process pair's and
+this table says where the arm stands.
+
+The cut at a kibibyte against two (`zgroup1k5m-ab-{1,2}.*`,
+`supdb-cache64tofitautozpagesgroup1k` against the combined arm): the
+files 424 MB against 391, 8.2% again, the memo misses and the groups a
+scan crosses 2.0x; the mixes 0.88-1.09x for the kibibyte in one order
+and 0.98-1.22x in the other, B 0.88x and then 1.20x, so nothing the two
+sittings resolve, and the point reads and scans level as above. Two
+kibibytes stays: a second 8% of the file for a decode half the size that
+no cell could see.
+
+The cut on a point read through the form from the pass's first read
+(`zgroup-forced-5m.sh`, `zgroupforced5m-ab-{1,2}.*`: the forced arm
+against `supdb-nocachezpagesonegroup`, built at the load's sync, both
+orders, same rung and bound): no fault in any pass of either arm, since
+the forced arm's 361 and 391 MB of files fit the budget, so every cell
+is the decode's. The point reads 1.47x and 1.45x for the cut on one
+thread, 1.81x and 1.86x on two, 1.81x and 1.83x on three, 3 of 3 pairs
+in every cell of both orders, the read's p99 9.3 µs against 13.6 and
+10.7 against 13.1; the one-thread read at 263k and 258k a second
+against 179k and 178k is 1.8 µs a read saved of 5.6, where the probe's
+split at four had priced the decode 3.6 µs to 1.0 (the memo serves a
+sixth of a group's reads either way: 525k hits of 3.27M reads against
+281k). The mixes C 1.82x and 1.81x, D 1.74x and 1.55x, B 1.52x and
+1.45x, A 1.43x and 1.09x, and E 0.98x and 1.06x and F 1.04x and 1.10x
+level, E being the scans' and F the writes'. The scans 1.25x and then
+0.89x on one thread and level threaded, with the groups a scan crosses
+3.1x and the memo misses 2.4x: the scan decodes the same bytes in four
+pieces and pays the fence and memo look per group, and the two sittings
+disagree on its sign. So the cut's price is 8% of the file and nothing
+a scan cell resolves, and its saving is the point read's 1.5x in core
+and the mixes a point read dominates.
