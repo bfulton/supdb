@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 use supdb::db::zpages::{
-    bind32, decode_group, fill_group, parse_page, verify_page, FenceEntry, Fill, FillScratch,
+    bind32, decode_group, fill_page, parse_page, verify_page, FenceEntry, Fill, FillScratch,
     GroupBuf, Images, SegImages, ZPAGE,
 };
 #[cfg(target_os = "linux")]
@@ -99,19 +99,22 @@ fn check_segment(path: &Path) -> Segment {
     }
     let bind = bind32(77, 1, n as u64, 0);
     let (mut s, mut buf) = (FillScratch::new(), GroupBuf::new());
-    let (mut rank, mut hint, mut pages, mut declined) = (0usize, 0usize, 0usize, 0usize);
+    let (mut rank, mut pages, mut declined) = (0usize, 0usize, 0usize);
     while rank < n {
         let mut page = [0u8; ZPAGE];
-        match fill_group(&images, rank, hint, bind, &mut s, &mut page) {
+        match fill_page(&images, rank, bind, &mut s, &mut page) {
             Fill::Page(g) => {
                 let group: Vec<u8> = (rank..rank + g.count)
                     .flat_map(|r| images.image(r).iter().copied())
                     .collect();
-                let (h, payload) = parse_page(&page, bind).expect("a page fill_group built");
+                let view = parse_page(&page, bind).expect("a page fill_page built");
+                let mut decoded = Vec::new();
+                for j in 0..view.groups() {
+                    decoded.extend_from_slice(decode_group(&view, j, &mut buf).unwrap());
+                }
                 assert_eq!(
-                    decode_group(&h, payload, &mut buf).unwrap(),
-                    &group[..],
-                    "rank {rank}: the page holds the images"
+                    decoded, group,
+                    "rank {rank}: the page holds the images, group after group"
                 );
                 let entry = FenceEntry {
                     index: pages,
@@ -127,7 +130,6 @@ fn check_segment(path: &Path) -> Segment {
                 );
                 pages += 1;
                 rank += g.count;
-                hint = g.count;
             }
             Fill::NoPage(_) => {
                 declined += 1;
@@ -2548,10 +2550,10 @@ fn the_memo_serves_repeated_reads_of_a_partition_and_off_every_read_decodes() {
                 "every read opened a page through the memo: {c:?}"
             );
             // The writer and the handle each keep a memo of their own, so
-            // each decodes a page once.
+            // each decodes a group once; a page holds up to sixteen.
             assert!(
-                c.memo_misses >= 1 && c.memo_misses <= 2 * c0.pages,
-                "a miss a page a handle at most: {c:?}"
+                c.memo_misses >= 1 && c.memo_misses <= 2 * 16 * c0.pages,
+                "a miss a group a handle at most: {c:?}"
             );
             assert_eq!(decodes, c.memo_misses, "a decode a miss: {c:?}");
             assert!(c.memo_hits >= reads * 9 / 10, "the rest hits: {c:?}");
@@ -2636,11 +2638,12 @@ fn the_overlay_walk_through_the_cursor_opens_a_group_a_group_where_the_walk_by_r
         let _ = std::fs::remove_dir_all(&dir);
     }
     // A window of fifty at the head is about twenty-five partition keys
-    // and twenty-five unsealed, over one or two groups: the cursor opens
-    // those, and the walk by rank three a key.
+    // and twenty-five unsealed, over two to four groups of the page's
+    // sixteen records: the cursor opens those, and the walk by rank three
+    // a key.
     let (cursor, rank) = (opens[0].1, opens[1].1);
     assert!(
-        cursor <= 4.0,
+        cursor <= 6.0,
         "{cursor:.1} opens a scan through the cursor: {opens:?}"
     );
     assert!(rank >= 20.0, "{rank:.1} opens a scan by rank: {opens:?}");
@@ -3481,7 +3484,9 @@ fn the_sizes_the_store_reports_are_the_files_it_holds() {
         pages += t.n_pages;
         let bind = t.bind32();
         for p in 0..t.n_pages as usize {
-            let (h, _) = parse_page(&bytes[p * ZPAGE..(p + 1) * ZPAGE], bind).unwrap();
+            let h = parse_page(&bytes[p * ZPAGE..(p + 1) * ZPAGE], bind)
+                .unwrap()
+                .header;
             groups += u64::from(h.ulen);
         }
         let (fnc, filter) =

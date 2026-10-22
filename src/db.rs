@@ -948,6 +948,17 @@ pub struct Options {
     /// shape the window was priced against.
     #[doc(hidden)]
     pub zpages_build_ahead: usize,
+    /// The decoded bytes a form file's page is cut into groups at, each
+    /// compressed on its own, so that a point read decodes the group its
+    /// record is in and not the page (`zpages::ZGROUP_BYTES`, two
+    /// kibibytes: four groups a page at the suite's shape, 6% of the
+    /// form's bytes for a point read's decode a quarter of the page's;
+    /// `bench/examples/zdecode.rs` priced the cut). Zero is the page as one
+    /// group, the shape before the cut; `supdb-cache64tofitautozpagesonegroup`
+    /// is that arm, and `...group1k` cuts at a kibibyte, 12% of the bytes
+    /// for a decode a seventh.
+    #[doc(hidden)]
+    pub zpages_group_bytes: usize,
     /// Whether the controller buys its first form at SUSPECT on the model's
     /// prediction, once the sampler has priced it and the partitions have
     /// stood for `zselect::EAGER_SETTLE` with nothing of the segment work in
@@ -2401,6 +2412,7 @@ impl Default for Options {
             zpages_promote_copies: false,
             zpages_io_idle: true,
             zpages_build_ahead: 4 << 20,
+            zpages_group_bytes: zpages::ZGROUP_BYTES,
             zpages_build_eager: false,
             zpages_inject: None,
             forms_pieces_only: false,
@@ -25723,6 +25735,7 @@ impl Db {
                 let mut plan =
                     zfile::BuildPlan::new(self.opts.zpages_min_bytes, self.opts.zpages_drop_behind);
                 plan.ahead = self.opts.zpages_build_ahead;
+                plan.group_bytes = self.opts.zpages_group_bytes;
                 plan
             })
         };
@@ -32161,6 +32174,7 @@ impl Maint {
             self.z_generation()
         };
         let floor = self.opts.zpages_min_bytes;
+        let group_bytes = self.opts.zpages_group_bytes;
         let wake = self.wake.clone();
         zfile::ZEvents::add(&self.shared.z.samples, 1);
         let io_idle = self.opts.zpages_io_idle;
@@ -32176,7 +32190,7 @@ impl Maint {
                     .map(|s| {
                         let r = match (Db::name_id(&s.name), Db::name_end_seq(&s.name)) {
                             (Some(id), Some(end)) => {
-                                zfile::sample(s.blob.for_zfile(), id, end, floor)
+                                zfile::sample(s.blob.for_zfile(), id, end, floor, group_bytes)
                             }
                             _ => Err(err("z sample: a partition without an id")),
                         };
@@ -32225,6 +32239,7 @@ impl Maint {
         };
         let (mut w_z, mut resident, mut nkeys, mut pages) = (0u64, 0u64, 0u64, 0u64);
         let (mut fill_ns, mut records, mut decode_ns, mut groups) = (0u64, 0u64, 0u64, 0u64);
+        let mut zgroups = 0u64;
         let mut recs_len = 0u64;
         let (mut wait_ns, mut faults) = (0u64, 0u64);
         let (mut on_disk, mut counted) = (0usize, 0usize);
@@ -32252,6 +32267,7 @@ impl Maint {
             records = records.saturating_add(s.records);
             decode_ns = decode_ns.saturating_add(s.decode_ns);
             groups = groups.saturating_add(s.groups);
+            zgroups = zgroups.saturating_add(s.zgroups);
             wait_ns = wait_ns.saturating_add(s.wait_ns);
             faults = faults.saturating_add(s.faults);
             let on = Db::name_id(&seg.name)
@@ -32266,9 +32282,10 @@ impl Maint {
             0.0
         };
         let build_cpu = fill_per_record * nkeys as f64;
-        // The decode as timed, or as the seam prices it: the thresholds
-        // below are a function of it, and a timed decode is the build
-        // profile's.
+        // The decode of one group, which is what a point read pays, as
+        // timed over every group of the sampled pages, or as the seam
+        // prices it: the thresholds below are a function of it, and a
+        // timed decode is the build profile's.
         let injected = self
             .opts
             .zpages_inject
@@ -32277,7 +32294,7 @@ impl Maint {
             .map(|d| d.as_secs_f64());
         let decode_per_page = match injected {
             Some(d) => d,
-            None if groups > 0 => decode_ns as f64 * 1e-9 / groups as f64,
+            None if zgroups > 0 => decode_ns as f64 * 1e-9 / zgroups as f64,
             None => 0.0,
         };
         let t_f = (faults > 0).then(|| wait_ns as f64 * 1e-9 / faults as f64);
@@ -32295,13 +32312,20 @@ impl Maint {
         } else {
             0.0
         };
-        let pages_per_scan = self.z_scan_len * pages_per_key + 1.0;
+        // A scan decodes the groups it crosses: its length over the
+        // records a group holds, and the group it starts in.
+        let groups_per_key = if records > 0 {
+            zgroups as f64 / records as f64
+        } else {
+            0.0
+        };
+        let groups_per_scan = self.z_scan_len * groups_per_key + 1.0;
         let costs = zselect::Costs {
             t_f,
             t_hit: None,
             t_hit_scan: None,
             t_z: Some(zselect::PRIOR_T_HIT + 1.25 * decode_per_page),
-            t_z_scan: Some(zselect::PRIOR_T_HIT_SCAN + pages_per_scan * 1.25 * decode_per_page),
+            t_z_scan: Some(zselect::PRIOR_T_HIT_SCAN + groups_per_scan * 1.25 * decode_per_page),
         };
         self.z_sample_size = (!declined).then_some((w_z, resident, pages_per_key));
         ev.sample_w_z.store(w_z, AtomicOrdering::Relaxed);
@@ -32746,6 +32770,7 @@ impl Maint {
         let mut plan =
             zfile::BuildPlan::new(self.opts.zpages_min_bytes, self.opts.zpages_drop_behind);
         plan.ahead = self.opts.zpages_build_ahead;
+        plan.group_bytes = self.opts.zpages_group_bytes;
         plan.cancel = Some(cancel.clone());
         plan.hold = Some(shared.zbuild_hold.clone());
         let fail = shared.fail_zbuild.swap(false, AtomicOrdering::AcqRel);

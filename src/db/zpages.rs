@@ -35,31 +35,48 @@
 //!
 //! # The page
 //!
+//! A page is a container of one to [`ZMAX_GROUPS`] groups, each compressed
+//! on its own, so that a point read decodes the group its record is in and
+//! not the page: a directory after the header says where each group's
+//! payload lies, how many records it holds and, for every group but the
+//! first, the key of its first record, by which a read picks the group
+//! without decoding one.
+//!
 //! | offset | size | field |
 //! |---|---|---|
 //! | 0 | 4 | `crc`: CRC-32C over bytes `[4, 4096)`, padding included, xor the trailer's `bind32` |
-//! | 4 | 4 | `tag`, `"ZPG1"`, never zero: a zeroed page cannot pass |
+//! | 4 | 4 | `tag`, `"ZPG2"`, never zero: a zeroed page cannot pass |
 //! | 8 | 4 | `first_rank` |
-//! | 12 | 2 | `count`, 1 to [`ZMAX_COUNT`] |
-//! | 14 | 1 | `flags`: bit 0 stored (the payload is the group verbatim) |
-//! | 15 | 1 | zero |
-//! | 16 | 4 | `ulen`: bytes of the group, a multiple of 4, at most [`ZMAX_ULEN`] |
-//! | 20 | 2 | `clen`: payload bytes, at most [`ZCAP`] |
-//! | 22 | 2 | zero |
-//! | 24 | `clen` | the payload: one LZ4 block, no size prefix and no frame, or the group |
-//! | 24 + `clen` | the rest | zeros |
+//! | 12 | 2 | `count`: records in the page, 1 to [`ZMAX_COUNT`] |
+//! | 14 | 2 | `stored`: bit `j` set where group `j`'s payload is its images verbatim |
+//! | 16 | 4 | `ulen`: bytes of the decoded groups, summed |
+//! | 20 | 2 | `used`: bytes after the header the page uses, at most [`ZCAP`] |
+//! | 22 | 1 | `groups`, 1 to [`ZMAX_GROUPS`] |
+//! | 23 | 1 | zero |
+//! | 24 | 8 × `groups` | the directory: per group `first` (u16, the index in the page of its first record), `coff` (u16, its payload's offset from the page's start, a multiple of 4), `clen` (u16, payload bytes), `ulen4` (u16, decoded bytes over four) |
+//! | after | varies | the keys of groups 1..: per group `klen` (u16) and the key |
+//! | `coff` | `clen` | each payload at its `coff`, the first at the keys' end rounded up to a multiple of 4 and each after at the end of the one before rounded the same, zeros between: one LZ4 block, no size prefix and no frame, or the group |
+//! | 24 + `used` | the rest | zeros |
 //!
-//! The page carries `clen` because the decoder stops only when its input is
-//! exhausted after a literal run: handed the page's trailing zeros it parses
-//! them as further sequences. The CRC is xored with `bind32`, a hash of the
-//! segment's identity, so a page copied in from another form file fails its
-//! own check without a second field to read. It is checked before anything
-//! is decoded, because LZ4 decodes many corrupt inputs into plausible bytes.
+//! The groups' firsts ascend from zero and their keys ascend; the directory
+//! holds no key for group 0, whose first key the fence carries. A group's
+//! records are 4 to [`ZMAX_ULEN`] decoded bytes; the sum over the page is
+//! `ulen`. The directory carries each `clen` because the decoder stops only
+//! when its input is exhausted after a literal run: handed the padding
+//! after a payload it parses it as further sequences. The CRC is xored with
+//! `bind32`, a hash of the segment's identity, so a page copied in from
+//! another form file fails its own check without a second field to read.
+//! It is checked before anything is decoded, because LZ4 decodes many
+//! corrupt inputs into plausible bytes.
 //!
 //! A group is the concatenation of the bytes `parse_record` consumes for each
 //! of its records, in rank order, each image a multiple of four bytes. One
 //! decoder then serves every read, count and scan, and no second definition
-//! of the record exists to drift.
+//! of the record exists to drift. The groups are cut at
+//! [`FillScratch::group_bytes`] decoded bytes, four to a page at the suite's
+//! shape, which costs the form six percent of its bytes for a point read's
+//! decode a quarter of the page's (`bench/examples/zdecode.rs`); a target of
+//! zero is the page as one group.
 //!
 //! # Why it is a child of `db`
 //!
@@ -72,8 +89,9 @@
 //! documentation until a reader of the form file exists, since a layout nothing
 //! reads is not yet an interface anyone is promised.
 
+use super::key_cmp;
 use crate::block::crc32;
-use crate::flatindex::{parse_record, rd_u32, record_key_next};
+use crate::flatindex::{parse_record, rd_u32, record_key, record_key_next};
 use std::cmp::Ordering;
 use std::fmt;
 
@@ -83,21 +101,33 @@ pub const ZPAGE: usize = 4096;
 pub const ZHDR: usize = 24;
 /// Payload bytes a page holds.
 pub const ZCAP: usize = ZPAGE - ZHDR;
-/// The most records in a group: `count` is a u16, and the buffer a group
-/// decodes into has to be bounded.
+/// The most records in a page: `count` is a u16, and a group's record
+/// index in the page is one too.
 pub const ZMAX_COUNT: usize = 256;
 /// The most bytes in a decoded group, and the size of the buffer one decodes
 /// into. LZ4's window is 64 KiB, so a longer group would not compress better
 /// for its length.
 pub const ZMAX_ULEN: usize = 64 * 1024;
+/// The most groups in a page: the header's `stored` mask is a u16.
+pub const ZMAX_GROUPS: usize = 16;
+/// A directory entry's length.
+pub const ZDIR_ENTRY: usize = 8;
+/// The decoded bytes a group is cut at by default (`FillScratch::group_bytes`):
+/// what a point read decodes for one record. Four groups a page at the
+/// suite's shape, 6% of the form's bytes for a decode a quarter the whole
+/// page's; zero cuts nothing and a page is one group.
+pub const ZGROUP_BYTES: usize = 2048;
 /// A fence entry's page number for records the form does not hold.
 pub const ZNOPAGE: u32 = u32::MAX;
-/// A page's tag, `"ZPG1"` as the bytes on disk: the digit moves whenever an
-/// older reader would misread a page rather than refuse it.
-pub const ZTAG: u32 = u32::from_le_bytes(*b"ZPG1");
+/// A page's tag, `"ZPG2"` as the bytes on disk: the digit moves whenever an
+/// older reader would misread a page rather than refuse it. It moved when
+/// the page became a container of groups: a `ZPG1` reader takes the
+/// directory for the payload.
+pub const ZTAG: u32 = u32::from_le_bytes(*b"ZPG2");
 /// The trailer's magic: the digit moves whenever an older reader would
-/// misread the file rather than refuse it.
-pub const ZMAGIC: [u8; 8] = *b"SUPDZPG1";
+/// misread the file rather than refuse it; it moves with the page's tag,
+/// so a file of the other layout is refused at its trailer and rebuilt.
+pub const ZMAGIC: [u8; 8] = *b"SUPDZPG2";
 /// The trailer's version: what an older reader refuses without misreading.
 pub const ZVERSION: u32 = 1;
 /// The trailer's length, a page.
@@ -111,17 +141,21 @@ pub const ZFILL_TURNS: u32 = 12;
 /// by default: the knob that trades compress calls a page for fill.
 pub const ZGROW_ROUNDS: u32 = 1;
 
-/// Page flag: the payload is the group verbatim.
-const F_STORED: u8 = 1;
-
 // The page header's fields.
 const P_CRC: usize = 0;
 const P_TAG: usize = 4;
 const P_FIRST: usize = 8;
 const P_COUNT: usize = 12;
-const P_FLAGS: usize = 14;
+const P_STORED: usize = 14;
 const P_ULEN: usize = 16;
-const P_CLEN: usize = 20;
+const P_USED: usize = 20;
+const P_GROUPS: usize = 22;
+const P_ZERO: usize = 23;
+// A directory entry's fields, from the entry's start.
+const D_FIRST: usize = 0;
+const D_COFF: usize = 2;
+const D_CLEN: usize = 4;
+const D_ULEN4: usize = 6;
 
 /// What a check of the layout found. One variant for each check the layout
 /// makes, so a test can say which one a damaged byte reaches and a caller
@@ -205,39 +239,162 @@ impl From<ZError> for std::io::Error {
 }
 
 /// A page's header, less the fields that are constants: the tag, the CRC and
-/// the zeros.
+/// the zero byte. What is page-wide; the groups are the directory's
+/// ([`PageView`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageHeader {
-    /// The rank of the group's first record.
+    /// The rank of the page's first record.
     pub first_rank: u32,
-    /// Records in the group, 1 to [`ZMAX_COUNT`].
+    /// Records in the page, every group's, 1 to [`ZMAX_COUNT`].
     pub count: u16,
-    /// The payload is the group verbatim, and `clen == ulen`.
-    pub stored: bool,
-    /// Bytes of the decoded group: a multiple of four, at most [`ZMAX_ULEN`].
+    /// Bit `j`: group `j`'s payload is its images verbatim.
+    pub stored: u16,
+    /// Bytes of the decoded groups, summed.
     pub ulen: u32,
-    /// Payload bytes, at most [`ZCAP`].
-    pub clen: u16,
+    /// Bytes after the header the page uses: the directory, the keys and
+    /// the payloads, at most [`ZCAP`]; zeros after.
+    pub used: u16,
+    /// Groups in the page, 1 to [`ZMAX_GROUPS`].
+    pub groups: u8,
 }
 
 impl PageHeader {
-    /// The values a page may carry, which writing and reading both hold it to.
+    /// The values a page may carry, which writing and reading both hold it
+    /// to; the directory's are [`PageView`]'s to hold.
     fn check(&self) -> Result<(), ZError> {
         if self.count == 0 || self.count as usize > ZMAX_COUNT {
-            return Err(ZError::Header("count is not 1 to the most a group holds"));
+            return Err(ZError::Header("count is not 1 to the most a page holds"));
         }
-        if self.ulen == 0 || !self.ulen.is_multiple_of(4) || self.ulen as usize > ZMAX_ULEN {
-            return Err(ZError::Header(
-                "ulen is not a multiple of four in 4 to the most a group holds",
-            ));
+        if self.groups == 0 || self.groups as usize > ZMAX_GROUPS {
+            return Err(ZError::Header("groups is not 1 to the most a page holds"));
         }
-        if self.clen == 0 || self.clen as usize > ZCAP {
-            return Err(ZError::Header("clen is not 1 to the most a page holds"));
+        if u32::from(self.groups) < u16::BITS && self.stored >> self.groups != 0 {
+            return Err(ZError::Header("a stored bit names no group"));
         }
-        if self.stored && u32::from(self.clen) != self.ulen {
-            return Err(ZError::Header("a stored page's clen is not its ulen"));
+        if self.ulen == 0 || !self.ulen.is_multiple_of(4) {
+            return Err(ZError::Header("ulen is not a multiple of four"));
+        }
+        if self.used as usize > ZCAP || (self.used as usize) < ZDIR_ENTRY * self.groups as usize {
+            return Err(ZError::Header("used is not the directory to the cap"));
         }
         Ok(())
+    }
+
+    /// Whether group `j` is stored verbatim.
+    pub fn is_stored(&self, j: usize) -> bool {
+        j < 16 && self.stored & (1 << j) != 0
+    }
+}
+
+/// One group of a page as the directory names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupEntry {
+    /// The index in the page of the group's first record.
+    pub first: u16,
+    /// Records in the group: to the next group's first, or the page's
+    /// count.
+    pub count: u16,
+    /// The payload's offset from the page's start, a multiple of four.
+    pub coff: u16,
+    /// Payload bytes.
+    pub clen: u16,
+    /// Bytes of the decoded group, a multiple of four, 4 to [`ZMAX_ULEN`].
+    pub ulen: u32,
+    /// The payload is the group verbatim.
+    pub stored: bool,
+}
+
+/// A page parsed: its header, and the directory the groups' payloads and
+/// keys are found by, over the page's own bytes. Made by [`parse_page`]
+/// (every check) or [`page_view`] (the header's and the directory's values,
+/// for a page a first decode has passed).
+#[derive(Clone, Copy)]
+pub struct PageView<'a> {
+    /// The page-wide fields.
+    pub header: PageHeader,
+    page: &'a [u8; ZPAGE],
+    /// Where the keys of groups 1.. begin, after the directory.
+    keys_at: usize,
+    /// Where each group's key lies in the page, `key_at[j]..key_end[j]`,
+    /// for `j` in 1..groups; group 0's is the fence's.
+    key_at: [u16; ZMAX_GROUPS],
+    key_end: [u16; ZMAX_GROUPS],
+}
+
+impl<'a> PageView<'a> {
+    /// Groups in the page.
+    pub fn groups(&self) -> usize {
+        usize::from(self.header.groups)
+    }
+
+    fn entry_raw(&self, j: usize) -> (u16, u16, u16, u16) {
+        let at = ZHDR + j * ZDIR_ENTRY;
+        let half = |o: usize| u16::from_le_bytes([self.page[at + o], self.page[at + o + 1]]);
+        (half(D_FIRST), half(D_COFF), half(D_CLEN), half(D_ULEN4))
+    }
+
+    /// Group `j` as the directory names it, `None` past the last.
+    pub fn group(&self, j: usize) -> Option<GroupEntry> {
+        if j >= self.groups() {
+            return None;
+        }
+        let (first, coff, clen, ulen4) = self.entry_raw(j);
+        let next = if j + 1 < self.groups() {
+            self.entry_raw(j + 1).0
+        } else {
+            self.header.count
+        };
+        Some(GroupEntry {
+            first,
+            count: next - first,
+            coff,
+            clen,
+            ulen: u32::from(ulen4) * 4,
+            stored: self.header.is_stored(j),
+        })
+    }
+
+    /// Group `j`'s payload, where it lies in the page.
+    pub fn payload(&self, j: usize) -> Option<&'a [u8]> {
+        let g = self.group(j)?;
+        self.page
+            .get(usize::from(g.coff)..usize::from(g.coff) + usize::from(g.clen))
+    }
+
+    /// The key of group `j`'s first record for `j` in 1..groups, where it
+    /// lies in the page; `None` for group 0, whose key is the fence's, and
+    /// past the last group.
+    pub fn key(&self, j: usize) -> Option<&'a [u8]> {
+        if j == 0 || j >= self.groups() {
+            return None;
+        }
+        self.page
+            .get(usize::from(self.key_at[j])..usize::from(self.key_end[j]))
+    }
+
+    /// The group that holds the record at index `i` of the page: the last
+    /// whose first is at or below it. `i` below the count.
+    pub fn group_of_index(&self, i: usize) -> usize {
+        let mut j = 0;
+        while j + 1 < self.groups() && usize::from(self.entry_raw(j + 1).0) <= i {
+            j += 1;
+        }
+        j
+    }
+
+    /// The group `key` would be in: the last whose first key is at or
+    /// below it, group 0 for a key below group 1's. A key below the page's
+    /// own first key is the fence's to refuse; here it is group 0's.
+    pub fn group_of_key(&self, key: &[u8]) -> usize {
+        let mut j = 0;
+        while j + 1 < self.groups()
+            && self
+                .key(j + 1)
+                .is_some_and(|k| key_cmp(k, key) != Ordering::Greater)
+        {
+            j += 1;
+        }
+        j
     }
 }
 
@@ -247,90 +404,280 @@ pub fn page_crc(page: &[u8; ZPAGE], bind32: u32) -> u32 {
     crc32(&page[P_TAG..]) ^ bind32
 }
 
-/// Write one page: the header, the payload, zeros, and the CRC last. The
-/// header and the payload must agree, and the page is untouched when they do
+/// One group to write into a page.
+#[derive(Clone, Copy, Debug)]
+pub struct PageGroup<'a> {
+    /// Records in the group, at least one.
+    pub count: u16,
+    /// The payload: one LZ4 block, or the group verbatim where `stored`.
+    pub payload: &'a [u8],
+    /// Bytes of the decoded group.
+    pub ulen: u32,
+    pub stored: bool,
+    /// The key of the group's first record. Group 0's is the fence's and
+    /// is not written; the rest go into the directory.
+    pub key: &'a [u8],
+}
+
+/// Where the payloads of groups with these compressed and key lengths
+/// would lie: each group's `coff`, and the bytes the page would use after
+/// the header. `None` where the keys alone pass the cap or a group is past
+/// the most a page holds; whether the payloads fit is the caller's `used`
+/// against [`ZCAP`].
+pub fn page_layout(groups: &[(usize, usize)]) -> Option<(Vec<usize>, usize)> {
+    if groups.is_empty() || groups.len() > ZMAX_GROUPS {
+        return None;
+    }
+    let keys: usize = groups.iter().skip(1).map(|&(_, klen)| 2 + klen).sum();
+    let mut at = (ZHDR + ZDIR_ENTRY * groups.len() + keys).next_multiple_of(4);
+    if at > ZPAGE {
+        return None;
+    }
+    let mut coffs = Vec::with_capacity(groups.len());
+    for &(clen, _) in groups {
+        coffs.push(at);
+        at = (at + clen).next_multiple_of(4);
+    }
+    // The last group's padding is not used bytes: zeros after the payload.
+    let last = coffs[coffs.len() - 1] + groups[groups.len() - 1].0;
+    Some((coffs, last - ZHDR))
+}
+
+/// Write one page: the header, the directory, the keys of groups 1.., the
+/// payloads each at a multiple of four, zeros, and the CRC last. The groups
+/// must agree with themselves and fit; the page is untouched when they do
 /// not.
 pub fn encode_page(
     page: &mut [u8; ZPAGE],
-    h: &PageHeader,
-    payload: &[u8],
+    first_rank: u32,
+    groups: &[PageGroup<'_>],
     bind32: u32,
-) -> Result<(), ZError> {
-    h.check()?;
-    if payload.len() != h.clen as usize {
-        return Err(ZError::Header("the payload is not clen bytes"));
+) -> Result<PageHeader, ZError> {
+    let bad = |why: &'static str| Err(ZError::Header(why));
+    if groups.is_empty() || groups.len() > ZMAX_GROUPS {
+        return bad("groups is not 1 to the most a page holds");
     }
+    let mut count = 0usize;
+    let mut ulen = 0u64;
+    let mut stored = 0u16;
+    for (j, g) in groups.iter().enumerate() {
+        if g.count == 0 {
+            return bad("a group of no records");
+        }
+        if g.ulen == 0 || !g.ulen.is_multiple_of(4) || g.ulen as usize > ZMAX_ULEN {
+            return bad("a group's ulen is not a multiple of four in 4 to the most a group holds");
+        }
+        if g.payload.is_empty() || g.payload.len() > ZCAP {
+            return bad("a group's payload is not 1 to the most a page holds");
+        }
+        if g.stored && g.payload.len() != g.ulen as usize {
+            return bad("a stored group's payload is not its ulen");
+        }
+        if j > 0 {
+            if g.key.is_empty() || g.key.len() > u16::MAX as usize {
+                return bad("a group's key is empty or over a u16");
+            }
+            if key_cmp(groups[j - 1].key, g.key) != Ordering::Less {
+                return bad("the groups' keys do not ascend");
+            }
+        }
+        count += usize::from(g.count);
+        ulen += u64::from(g.ulen);
+        stored |= u16::from(g.stored) << j;
+    }
+    if count > ZMAX_COUNT {
+        return bad("count is not 1 to the most a page holds");
+    }
+    let shape: Vec<(usize, usize)> = groups
+        .iter()
+        .enumerate()
+        .map(|(j, g)| (g.payload.len(), if j == 0 { 0 } else { g.key.len() }))
+        .collect();
+    let Some((coffs, used)) = page_layout(&shape) else {
+        return bad("the groups do not fit the page");
+    };
+    if used > ZCAP {
+        return bad("the groups do not fit the page");
+    }
+    let h = PageHeader {
+        first_rank,
+        count: count as u16,
+        stored,
+        ulen: ulen as u32,
+        used: used as u16,
+        groups: groups.len() as u8,
+    };
+    h.check()?;
+    page.fill(0);
     page[P_TAG..P_TAG + 4].copy_from_slice(&ZTAG.to_le_bytes());
     page[P_FIRST..P_FIRST + 4].copy_from_slice(&h.first_rank.to_le_bytes());
     page[P_COUNT..P_COUNT + 2].copy_from_slice(&h.count.to_le_bytes());
-    page[P_FLAGS] = if h.stored { F_STORED } else { 0 };
-    page[P_FLAGS + 1] = 0;
+    page[P_STORED..P_STORED + 2].copy_from_slice(&h.stored.to_le_bytes());
     page[P_ULEN..P_ULEN + 4].copy_from_slice(&h.ulen.to_le_bytes());
-    page[P_CLEN..P_CLEN + 2].copy_from_slice(&h.clen.to_le_bytes());
-    page[P_CLEN + 2..ZHDR].fill(0);
-    page[ZHDR..ZHDR + payload.len()].copy_from_slice(payload);
-    page[ZHDR + payload.len()..].fill(0);
+    page[P_USED..P_USED + 2].copy_from_slice(&h.used.to_le_bytes());
+    page[P_GROUPS] = h.groups;
+    page[P_ZERO] = 0;
+    let mut first = 0u16;
+    let mut keys_at = ZHDR + ZDIR_ENTRY * groups.len();
+    for (j, g) in groups.iter().enumerate() {
+        let at = ZHDR + j * ZDIR_ENTRY;
+        page[at + D_FIRST..at + D_FIRST + 2].copy_from_slice(&first.to_le_bytes());
+        page[at + D_COFF..at + D_COFF + 2].copy_from_slice(&(coffs[j] as u16).to_le_bytes());
+        page[at + D_CLEN..at + D_CLEN + 2].copy_from_slice(&(g.payload.len() as u16).to_le_bytes());
+        page[at + D_ULEN4..at + D_ULEN4 + 2].copy_from_slice(&((g.ulen / 4) as u16).to_le_bytes());
+        first += g.count;
+        if j > 0 {
+            page[keys_at..keys_at + 2].copy_from_slice(&(g.key.len() as u16).to_le_bytes());
+            page[keys_at + 2..keys_at + 2 + g.key.len()].copy_from_slice(g.key);
+            keys_at += 2 + g.key.len();
+        }
+        page[coffs[j]..coffs[j] + g.payload.len()].copy_from_slice(g.payload);
+    }
     let crc = page_crc(page, bind32);
     page[P_CRC..P_CRC + 4].copy_from_slice(&crc.to_le_bytes());
-    Ok(())
+    Ok(h)
 }
 
-/// A page's header and payload, after every check that needs no fence and no
-/// decoder: the length, the CRC (first, so nothing below trusts an
-/// unchecked byte), the tag, the flags, the zeros, the header's values and
-/// the zeros after the payload.
-pub fn parse_page(page: &[u8], bind32: u32) -> Result<(PageHeader, &[u8]), ZError> {
+/// The header's and the directory's values, checked against each other and
+/// the page's bounds: what a view needs to hand out a payload or a key
+/// safely. Nothing of the CRC, the tag or the zeros, which are
+/// [`parse_page`]'s.
+fn view_checked(page: &[u8]) -> Result<PageView<'_>, ZError> {
     let page: &[u8; ZPAGE] = page.try_into().map_err(|_| ZError::Length)?;
     let word = |at: usize| u32::from_le_bytes([page[at], page[at + 1], page[at + 2], page[at + 3]]);
     let half = |at: usize| u16::from_le_bytes([page[at], page[at + 1]]);
-    if word(P_CRC) != page_crc(page, bind32) {
+    let h = PageHeader {
+        first_rank: word(P_FIRST),
+        count: half(P_COUNT),
+        stored: half(P_STORED),
+        ulen: word(P_ULEN),
+        used: half(P_USED),
+        groups: page[P_GROUPS],
+    };
+    h.check()?;
+    let bad = |why: &'static str| Err(ZError::Header(why));
+    let groups = usize::from(h.groups);
+    let end = ZHDR + usize::from(h.used);
+    let mut v = PageView {
+        header: h,
+        page,
+        keys_at: ZHDR + ZDIR_ENTRY * groups,
+        key_at: [0; ZMAX_GROUPS],
+        key_end: [0; ZMAX_GROUPS],
+    };
+    // The keys of groups 1.., end to end after the directory.
+    let mut at = v.keys_at;
+    for j in 1..groups {
+        if at + 2 > end {
+            return bad("a group's key lies past the used bytes");
+        }
+        let klen = usize::from(half(at));
+        if klen == 0 || at + 2 + klen > end {
+            return bad("a group's key is empty or lies past the used bytes");
+        }
+        v.key_at[j] = (at + 2) as u16;
+        v.key_end[j] = (at + 2 + klen) as u16;
+        if j > 1
+            && key_cmp(v.key(j - 1).unwrap_or(&[]), &page[at + 2..at + 2 + klen]) != Ordering::Less
+        {
+            return bad("the groups' keys do not ascend");
+        }
+        at += 2 + klen;
+    }
+    // The entries: firsts from zero ascending below the count, payloads
+    // each at a multiple of four straight after the one before, the
+    // last ending at the used bytes, each decoded length in range and a
+    // stored group's payload its decoded length, the lengths summing to
+    // the header's.
+    let mut expect_coff = at.next_multiple_of(4);
+    let mut ulen = 0u64;
+    for j in 0..groups {
+        let (first, coff, clen, ulen4) = v.entry_raw(j);
+        let want_first = if j == 0 {
+            0
+        } else {
+            let prev = v.entry_raw(j - 1).0;
+            if first <= prev {
+                return bad("the groups' firsts do not ascend");
+            }
+            first
+        };
+        if first != want_first || first >= h.count {
+            return bad("a group's first is not in order below the count");
+        }
+        if usize::from(coff) != expect_coff || clen == 0 {
+            return bad("a group's payload is not where the one before ends");
+        }
+        let gulen = u32::from(ulen4) * 4;
+        if gulen == 0 || gulen as usize > ZMAX_ULEN {
+            return bad("a group's ulen is not 4 to the most a group holds");
+        }
+        if h.is_stored(j) && u32::from(clen) != gulen {
+            return bad("a stored group's clen is not its ulen");
+        }
+        let pend = usize::from(coff) + usize::from(clen);
+        if pend > end {
+            return bad("a group's payload lies past the used bytes");
+        }
+        if j + 1 == groups && pend != end {
+            return bad("the last payload does not end at the used bytes");
+        }
+        expect_coff = pend.next_multiple_of(4);
+        ulen += u64::from(gulen);
+    }
+    if ulen != u64::from(h.ulen) {
+        return bad("ulen is not the groups' sum");
+    }
+    Ok(v)
+}
+
+/// A page's view, after every check that needs no fence and no decoder:
+/// the length, the CRC (first, so nothing below trusts an unchecked byte),
+/// the tag, the zero byte, the header's and the directory's values, and
+/// the zeros: the padding between the keys and the first payload, between
+/// the payloads, and after the last.
+pub fn parse_page(page: &[u8], bind32: u32) -> Result<PageView<'_>, ZError> {
+    let p: &[u8; ZPAGE] = page.try_into().map_err(|_| ZError::Length)?;
+    let word = |at: usize| u32::from_le_bytes([p[at], p[at + 1], p[at + 2], p[at + 3]]);
+    if word(P_CRC) != page_crc(p, bind32) {
         return Err(ZError::PageCrc);
     }
     if word(P_TAG) != ZTAG {
         return Err(ZError::Tag);
     }
-    if page[P_FLAGS] & !F_STORED != 0 {
-        return Err(ZError::Header(
-            "a flag bit this reader does not know is set",
-        ));
-    }
-    if page[P_FLAGS + 1] != 0 || half(P_CLEN + 2) != 0 {
+    if p[P_ZERO] != 0 {
         return Err(ZError::Header("a reserved byte is not zero"));
     }
-    let h = PageHeader {
-        first_rank: word(P_FIRST),
-        count: half(P_COUNT),
-        stored: page[P_FLAGS] & F_STORED != 0,
-        ulen: word(P_ULEN),
-        clen: half(P_CLEN),
-    };
-    h.check()?;
-    let end = ZHDR + h.clen as usize;
-    if page[end..].iter().any(|&b| b != 0) {
+    let v = view_checked(page)?;
+    let end = ZHDR + usize::from(v.header.used);
+    if p[end..].iter().any(|&b| b != 0) {
         return Err(ZError::Padding);
     }
-    Ok((h, &page[ZHDR..end]))
+    // The bytes no field names: after the keys to the first payload, and
+    // between payloads.
+    let mut gap_from = if v.groups() > 1 {
+        usize::from(v.key_end[v.groups() - 1])
+    } else {
+        v.keys_at
+    };
+    for j in 0..v.groups() {
+        let g = v.group(j).ok_or(ZError::Length)?;
+        if p[gap_from..usize::from(g.coff)].iter().any(|&b| b != 0) {
+            return Err(ZError::Padding);
+        }
+        gap_from = usize::from(g.coff) + usize::from(g.clen);
+    }
+    Ok(v)
 }
 
-/// A page's header and payload for a page this process has already passed
-/// through [`parse_page`] and a first decode: the length and the header's
-/// values are checked and nothing else, because the CRC is a pass over the
-/// page and a reader's every read of a page it has verified would pay it
-/// again. The tag, the flags, the zeros and the padding are the first
+/// A page's view for a page this process has already passed through
+/// [`parse_page`] and a first decode: the length and the header's and
+/// directory's values are checked and nothing else, because the CRC is a
+/// pass over the page and a reader's every read of a page it has verified
+/// would pay it again. The tag, the zeros and the padding are the first
 /// decode's; a page that has not had one is read with [`parse_page`].
-pub fn page_view(page: &[u8]) -> Result<(PageHeader, &[u8]), ZError> {
-    let page: &[u8; ZPAGE] = page.try_into().map_err(|_| ZError::Length)?;
-    let word = |at: usize| u32::from_le_bytes([page[at], page[at + 1], page[at + 2], page[at + 3]]);
-    let half = |at: usize| u16::from_le_bytes([page[at], page[at + 1]]);
-    let h = PageHeader {
-        first_rank: word(P_FIRST),
-        count: half(P_COUNT),
-        stored: page[P_FLAGS] & F_STORED != 0,
-        ulen: word(P_ULEN),
-        clen: half(P_CLEN),
-    };
-    h.check()?;
-    Ok((h, &page[ZHDR..ZHDR + h.clen as usize]))
+pub fn page_view(page: &[u8]) -> Result<PageView<'_>, ZError> {
+    view_checked(page)
 }
 
 /// A buffer a group decodes into: words, not bytes, so that it is aligned
@@ -391,7 +738,7 @@ impl Default for GroupBuf {
     }
 }
 
-/// The group a page holds, decoded: LZ4 into `buf`, or for a stored page the
+/// Group `j` of a page, decoded: LZ4 into `buf`, or for a stored group the
 /// payload itself where it is aligned for `parse_record` and a copy in `buf`
 /// where it is not. Either way the bytes returned are aligned, so a record
 /// of any shape parses out of them.
@@ -403,16 +750,16 @@ impl Default for GroupBuf {
 /// the length is required to equal `ulen`. The caller has parsed the page
 /// ([`parse_page`]) first, so the CRC has passed.
 pub fn decode_group<'a>(
-    h: &PageHeader,
-    payload: &'a [u8],
+    view: &PageView<'a>,
+    j: usize,
     buf: &'a mut GroupBuf,
 ) -> Result<&'a [u8], ZError> {
-    h.check()?;
-    if payload.len() != usize::from(h.clen) {
-        return Err(ZError::Header("the payload is not clen bytes"));
-    }
-    let ulen = h.ulen as usize;
-    if h.stored {
+    let g = view
+        .group(j)
+        .ok_or(ZError::Header("no such group in the page"))?;
+    let payload = view.payload(j).ok_or(ZError::Length)?;
+    let ulen = g.ulen as usize;
+    if g.stored {
         if (payload.as_ptr() as usize).is_multiple_of(std::mem::align_of::<crate::index::Ext>()) {
             return Ok(payload);
         }
@@ -523,22 +870,33 @@ fn encoder_pin_input() -> Vec<u8> {
 }
 
 /// A decoded group walked end to end: `count` records laid end to end with
-/// nothing after them, keys strictly ascending, and the first the fence's
-/// where one is given. `parse_record` judges each record, so a compact header
-/// its run contradicts, an extent array that is not aligned and a record cut
-/// short are all refused. This is the walk a page's first decode makes, once
-/// per page and process; [`group_seek`] is the walk a read makes after it.
-pub fn walk_group(group: &[u8], count: usize, first_key: Option<&[u8]>) -> Result<(), ZError> {
+/// nothing after them, keys strictly ascending, the first the key given
+/// where one is (the fence's for a page's first group, the directory's for
+/// the rest), and every key below `below` where one is given (the next
+/// group's first key). `parse_record` judges each record, so a compact
+/// header its run contradicts, an extent array that is not aligned and a
+/// record cut short are all refused. This is the walk a group's first decode
+/// makes, once per group and process; [`group_seek`] is the walk a read
+/// makes after it.
+pub fn walk_group(
+    group: &[u8],
+    count: usize,
+    first_key: Option<&[u8]>,
+    below: Option<&[u8]>,
+) -> Result<(), ZError> {
     let mut off = 0usize;
     let mut prev: Option<&[u8]> = None;
     for i in 0..count {
         let (key, _, _, len) =
             parse_record(group, off).ok_or(ZError::Walk("a record does not parse"))?;
         if i == 0 && first_key.is_some_and(|f| f != key) {
-            return Err(ZError::Walk("the first key is not the fence's"));
+            return Err(ZError::Walk("the first key is not the one named for it"));
         }
         if prev.is_some_and(|p| p >= key) {
             return Err(ZError::Walk("keys do not ascend"));
+        }
+        if below.is_some_and(|b| key_cmp(key, b) != Ordering::Less) {
+            return Err(ZError::Walk("a key is not below the next group's first"));
         }
         prev = Some(key);
         off = off
@@ -696,27 +1054,32 @@ pub enum NoPage {
     Unplaceable,
 }
 
-/// A page `fill_group` built.
+/// A page `fill_page` built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Group {
-    /// Records in the group, from the rank asked for.
+pub struct Filled {
+    /// Records in the page, from the rank asked for.
     pub count: usize,
-    /// Bytes of the decoded group.
+    /// Bytes of the decoded groups, summed.
     pub ulen: usize,
-    /// Payload bytes in the page.
+    /// Payload bytes in the page, summed over the groups.
     pub clen: usize,
-    /// The payload is the group verbatim.
-    pub stored: bool,
+    /// Bytes after the header the page uses: the directory, the keys and
+    /// the payloads.
+    pub used: usize,
+    /// Groups in the page.
+    pub groups: usize,
+    /// Groups whose payload is the images verbatim.
+    pub stored: usize,
     /// Compress calls this page cost.
     pub calls: u32,
 }
 
-/// What `fill_group` made of the records from a rank.
+/// What `fill_page` made of the records from a rank.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fill {
     /// A page is in the caller's buffer, decoded and compared with the
     /// images it was built from.
-    Page(Group),
+    Page(Filled),
     /// The record at the rank is not held by a page, and is read from the
     /// raw segment. One record: the next call starts at the next rank.
     NoPage(NoPage),
@@ -729,7 +1092,7 @@ pub enum Fill {
     Mismatch,
 }
 
-/// What `fill_group` has done since its scratch was made. Counters only:
+/// What `fill_page` has done since its scratch was made. Counters only:
 /// nothing here changes what a call returns.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FillStats {
@@ -737,40 +1100,77 @@ pub struct FillStats {
     pub pages: u64,
     /// Records in them.
     pub records: u64,
-    /// Pages whose payload is the group verbatim.
+    /// Groups in them.
+    pub groups: u64,
+    /// Groups whose payload is the images verbatim.
     pub stored: u64,
     /// Records declined.
     pub nopages: u64,
     /// Compress calls.
     pub calls: u64,
-    /// Turns taken, each an attempt to compress a group within a call's
-    /// budget: the calls' compress calls but for the one a fallback adds.
+    /// Turns taken, each an attempt to compress a group within a group's
+    /// budget: the calls' compress calls but for the ones a fallback adds.
     pub turns: u64,
     /// Growth rounds that fit.
     pub growths: u64,
-    /// Calls that spent every turn without a fit and fell back to the first
-    /// record alone. The arithmetic of the turns says none does.
+    /// Groups that spent every turn without a fit and fell back to the
+    /// first record alone. The arithmetic of the turns says none does.
     pub fallbacks: u64,
     /// Payload bytes in the pages built.
     pub payload_bytes: u64,
+    /// Bytes after the header the pages use: the payloads and what the
+    /// directories and keys cost.
+    pub used_bytes: u64,
     /// Decoded bytes in the pages built.
     pub group_bytes: u64,
 }
 
-/// The buffers `fill_group` works in, kept between calls so that a page
-/// costs no allocation, and the one knob.
+/// A group accepted into the page being built: its records, its images'
+/// span in `page_imgs`, its payload's span in `payloads`, and whether the
+/// payload is the images.
+#[derive(Clone, Copy)]
+struct Accepted {
+    count: usize,
+    img_at: usize,
+    ulen: usize,
+    pay_at: usize,
+    clen: usize,
+    stored: bool,
+}
+
+/// The buffers `fill_page` works in, kept between calls so that a page
+/// costs no allocation, and the knobs.
 pub struct FillScratch {
     /// The images of the group being tried, end to end, and where each ends.
     imgs: Vec<u8>,
     ends: Vec<usize>,
-    /// Compressor output, two buffers because a group that grew and did not
-    /// fit must not have overwritten the one that did.
-    out: [Vec<u8>; 2],
+    /// Compressor output for the group being tried.
+    out: Vec<u8>,
+    /// The groups accepted into the page so far: their images end to end,
+    /// their payloads end to end, and each one's spans.
+    page_imgs: Vec<u8>,
+    payloads: Vec<u8>,
+    accepted: Vec<Accepted>,
+    /// A fit's compressed bytes kept aside at the end of `payloads` while
+    /// a growth is tried over the output buffer: where they are and how
+    /// many.
+    held: Option<(usize, usize)>,
     /// Where the page just built is decoded to be compared.
     verify: GroupBuf,
-    /// Growth rounds after a first fit. [`ZGROW_ROUNDS`] until a measurement
-    /// of fill against compress calls says otherwise.
+    /// Growth rounds after a first fit, in the one-group shape.
+    /// [`ZGROW_ROUNDS`] until a measurement of fill against compress calls
+    /// says otherwise.
     pub grow_rounds: u32,
+    /// The decoded bytes a group is cut at: a group takes records from its
+    /// first until the next would pass it, and the page holds as many
+    /// groups as fit, the last trimmed to the room. Zero is one group a
+    /// page, grown to fill it. [`ZGROUP_BYTES`] to begin with.
+    pub group_bytes: usize,
+    /// The previous page's record count, where the one-group shape starts
+    /// its first attempt; zero before the first page. A caller may set it,
+    /// as the sizing tool's sweep does to start a run near its steady
+    /// state.
+    pub hint: usize,
     /// What has been done with this scratch.
     pub stats: FillStats,
 }
@@ -779,16 +1179,22 @@ impl FillScratch {
     /// A scratch with every buffer at its largest.
     pub fn new() -> FillScratch {
         // `compress_into` refuses an output shorter than the worst case for
-        // its input, whatever the data would compress to, so the buffers
-        // are sized for the largest group and a group is judged by the
-        // length it compressed to.
+        // its input, whatever the data would compress to, so the buffer is
+        // sized for the largest group and a group is judged by the length
+        // it compressed to.
         let out = lz4_flex::block::get_maximum_output_size(ZMAX_ULEN);
         FillScratch {
             imgs: Vec::with_capacity(ZMAX_ULEN),
             ends: Vec::with_capacity(ZMAX_COUNT),
-            out: [vec![0; out], vec![0; out]],
+            out: vec![0; out],
+            page_imgs: Vec::with_capacity(ZMAX_ULEN),
+            payloads: Vec::with_capacity(ZPAGE),
+            accepted: Vec::with_capacity(ZMAX_GROUPS),
+            held: None,
             verify: GroupBuf::new(),
             grow_rounds: ZGROW_ROUNDS,
+            group_bytes: ZGROUP_BYTES,
+            hint: 0,
             stats: FillStats::default(),
         }
     }
@@ -818,17 +1224,48 @@ impl FillScratch {
         Stage::Ok
     }
 
-    /// The staged group compressed into buffer `buf`, and what the length
-    /// says to do with it. `None` if the compressor failed, which a buffer
-    /// sized for the largest group makes unreachable.
-    fn classify(&mut self, ulen: usize, buf: usize) -> Option<Class> {
-        let n = lz4_flex::block::compress_into(&self.imgs[..ulen], &mut self.out[buf]).ok()?;
+    /// Stage the records from `rank`, at most `limit` of them, while the
+    /// staged bytes stay within `target` -- the first whatever its size,
+    /// up to [`ZMAX_ULEN`]. Stops at a record that is not an image.
+    fn stage_to<I: Images + ?Sized>(
+        &mut self,
+        src: &I,
+        rank: usize,
+        limit: usize,
+        target: usize,
+    ) -> Stage {
+        self.imgs.clear();
+        self.ends.clear();
+        while self.ends.len() < limit {
+            let j = self.ends.len();
+            let img = src.image(rank + j);
+            if img.is_empty() || !img.len().is_multiple_of(4) {
+                return Stage::Bad(j);
+            }
+            if j > 0 && self.imgs.len() + img.len() > target {
+                break;
+            }
+            self.imgs.extend_from_slice(img);
+            self.ends.push(self.imgs.len());
+            if self.imgs.len() > ZMAX_ULEN {
+                return Stage::Over;
+            }
+        }
+        Stage::Ok
+    }
+
+    /// The staged group compressed, and what the length says to do with it
+    /// against `room`, the payload bytes the page has left. `None` if the
+    /// compressor failed, which a buffer sized for the largest group makes
+    /// unreachable.
+    fn classify(&mut self, ulen: usize, room: usize) -> Option<Class> {
+        let n = lz4_flex::block::compress_into(&self.imgs[..ulen], &mut self.out).ok()?;
         self.stats.calls += 1;
-        Some(if n >= ulen && ulen <= ZCAP {
+        Some(if n >= ulen && ulen <= room {
             // LZ4 did not help and the group fits as it is: its own expansion
             // is never a reason to shrink a group or to give a record up.
             Class::Stored
-        } else if n > ZCAP {
+        } else if n > room {
             Class::TooBig(n)
         } else {
             Class::Lz4(n)
@@ -838,6 +1275,70 @@ impl FillScratch {
     fn decline(&mut self, why: NoPage) -> Fill {
         self.stats.nopages += 1;
         Fill::NoPage(why)
+    }
+
+    /// Nothing accepted yet: the start of a page.
+    fn reset_page(&mut self) {
+        self.page_imgs.clear();
+        self.payloads.clear();
+        self.accepted.clear();
+    }
+
+    /// The compressed and key lengths of the groups accepted, with one more
+    /// group of `clen` payload bytes and a `klen`-byte key: what
+    /// [`page_layout`] shapes a page from.
+    fn shape_with(&self, clen: usize, klen: usize) -> Vec<(usize, usize)> {
+        let mut v: Vec<(usize, usize)> = self
+            .accepted
+            .iter()
+            .enumerate()
+            .map(|(j, a)| (a.clen, if j == 0 { 0 } else { self.key_len(j) }))
+            .collect();
+        v.push((clen, if v.is_empty() { 0 } else { klen }));
+        v
+    }
+
+    /// The payload bytes the page has left for one more group whose key is
+    /// `klen` bytes: the cap less what the layout takes with it at no
+    /// payload; `None` where there is none.
+    fn room_for(&self, klen: usize) -> Option<usize> {
+        let (_, used) = page_layout(&self.shape_with(0, klen))?;
+        ZCAP.checked_sub(used)
+    }
+
+    /// Accepted group `j`'s key: its first record's.
+    fn key_of(&self, j: usize) -> &[u8] {
+        let a = self.accepted[j];
+        record_key(&self.page_imgs[a.img_at..a.img_at + a.ulen], 0).unwrap_or(&[])
+    }
+
+    fn key_len(&self, j: usize) -> usize {
+        self.key_of(j).len()
+    }
+
+    /// The group that fit, moved from the staging buffers into the page's.
+    fn accept(&mut self, fit: Fit) {
+        let img_at = self.page_imgs.len();
+        self.page_imgs.extend_from_slice(&self.imgs[..fit.ulen]);
+        let pay_at = self.payloads.len();
+        let (clen, stored) = match fit.body {
+            Body::Stored => {
+                self.payloads.extend_from_slice(&self.imgs[..fit.ulen]);
+                (fit.ulen, true)
+            }
+            Body::Lz4 { clen } => {
+                self.payloads.extend_from_slice(&self.out[..clen]);
+                (clen, false)
+            }
+        };
+        self.accepted.push(Accepted {
+            count: fit.m,
+            img_at,
+            ulen: fit.ulen,
+            pay_at,
+            clen,
+            stored,
+        });
     }
 }
 
@@ -864,10 +1365,11 @@ enum Class {
 #[derive(Clone, Copy)]
 enum Body {
     Stored,
-    Lz4 { buf: usize, clen: usize },
+    Lz4 { clen: usize },
 }
 
-/// A group that fits a page: its records, its decoded bytes and its body.
+/// A group that fits the page's room: its records, its decoded bytes and
+/// its body, the compressed bytes in the scratch's output buffer.
 #[derive(Clone, Copy)]
 struct Fit {
     m: usize,
@@ -879,36 +1381,48 @@ impl Fit {
     fn body_len(&self) -> usize {
         match self.body {
             Body::Stored => self.ulen,
-            Body::Lz4 { clen, .. } => clen,
+            Body::Lz4 { clen } => clen,
         }
     }
 }
 
-/// Size a group from `rank` so that its compressed bytes fill one page, and
-/// build the page into `page`.
+/// Why a group was not fitted into the page's room.
+enum NoFit {
+    /// The record alone does not fit the room, or is no image, or is over
+    /// the largest group: the first group of a page declines it, a later
+    /// group closes the page before it and leaves it to the next page's
+    /// first group to decline.
+    Decline(NoPage),
+    /// The compressor failed.
+    Mismatch,
+}
+
+/// Build the page at `rank`: groups of records from there, each cut at
+/// [`FillScratch::group_bytes`] decoded bytes and compressed on its own, as
+/// many as fit the page with the last trimmed to the room; or, at a target
+/// of zero, one group sized so that its compressed bytes fill the page.
 ///
-/// `hint` is where to start: the previous page's record count, which is
-/// close to this page's, so a page costs about one compress call when the
-/// count fits again and two when it needs a trim or a growth. Zero starts
-/// from one record, and a growth by the room that one record leaves reaches
-/// the count its own bytes allow, not the count a group of many compresses
-/// to: a call with no predecessor builds a page well short of full, and
-/// whoever sizes a partition from such calls has to chain a few first. The
-/// loop predicts, then verifies: the group of `m` records is compressed, and
-/// a group that fits is grown (by the records the slack holds, at the
-/// group's own bytes a record, [`FillScratch::grow_rounds`] times) while one
-/// that does not is trimmed in proportion to the overshoot for the first
-/// four attempts and halved after, so that the count is one by the twelfth
-/// attempt at the latest and a record that cannot fit alone is declined, not
-/// retried.
+/// The one-group shape predicts, then verifies: the previous page's count
+/// is where it starts (zero starts from one record, and a growth by the
+/// room that one record leaves reaches the count its own bytes allow, not
+/// the count a group of many compresses to, so whoever sizes a partition
+/// from such calls has to chain a few first); the group of `m` records is
+/// compressed, and a group that fits is grown (by the records the slack
+/// holds, at the group's own bytes a record, [`FillScratch::grow_rounds`]
+/// times) while one that does not is trimmed in proportion to the
+/// overshoot for the first four attempts and halved after. The cut shape
+/// stages the records up to the target, compresses them once, and trims
+/// the same way only where the room is short. Either way the count is one
+/// by the twelfth attempt at the latest ([`ZFILL_TURNS`], a group's
+/// budget), and a record that cannot fit alone is declined, not retried.
 ///
-/// The function is total. No input makes it panic, form a group of no
+/// The function is total. No input makes it panic, form a page of no
 /// records or loop past its turns: the first record at `rank` is either in
 /// a page, or declined as [`NoPage`] for a reason, or `rank` is past the end
 /// ([`Fill::End`]). Each of these once was a way to fail:
 ///
-/// * The shrink of a group that overshot, `m * ZCAP / len`, is zero whenever
-///   `m * ZCAP < len` -- two records of 4,500 compressed bytes, or seven of
+/// * The shrink of a group that overshot, `m * room / len`, is zero whenever
+///   `m * room < len` -- two records of 4,500 compressed bytes, or seven of
 ///   5,100 -- and a group of no records divided by its own count. `m` is
 ///   never below one here.
 /// * A lone record of 4,056 to 4,072 bytes that does not compress has an LZ4
@@ -916,10 +1430,10 @@ impl Fit {
 ///   output is no smaller than its images is stored verbatim if the images
 ///   fit, and LZ4's expansion is never a reason to shrink a group or to
 ///   give a record up.
-/// * `compress_into` cannot say whether a group fits a page: it refuses any
+/// * `compress_into` cannot say whether a group fits: it refuses any
 ///   output buffer shorter than the worst case for its input, whatever the
 ///   data would compress to. The group is compressed into a buffer for the
-///   largest group and its length is compared with [`ZCAP`].
+///   largest group and its length is compared with the room.
 ///
 /// A record with a block-backed extent is copied verbatim, extent and all,
 /// and stays exact; its value still lives in the raw segment's block region.
@@ -930,23 +1444,21 @@ impl Fit {
 /// before it is returned, because a bug here would otherwise ship a page
 /// whose CRC is good and whose bytes are wrong, which no checksum downstream
 /// can see.
-pub fn fill_group<I: Images + ?Sized>(
+pub fn fill_page<I: Images + ?Sized>(
     src: &I,
     rank: usize,
-    hint: usize,
     bind32: u32,
     scratch: &mut FillScratch,
     page: &mut [u8; ZPAGE],
 ) -> Fill {
-    fill_with_turns(src, rank, hint, bind32, scratch, page, ZFILL_TURNS)
+    fill_with_turns(src, rank, bind32, scratch, page, ZFILL_TURNS)
 }
 
-/// `fill_group` with the turn budget a parameter, so that a test can spend
+/// `fill_page` with the turn budget a parameter, so that a test can spend
 /// it and reach the path after it.
 fn fill_with_turns<I: Images + ?Sized>(
     src: &I,
     rank: usize,
-    hint: usize,
     bind32: u32,
     s: &mut FillScratch,
     page: &mut [u8; ZPAGE],
@@ -959,19 +1471,226 @@ fn fill_with_turns<I: Images + ?Sized>(
     let Ok(first_rank) = u32::try_from(rank) else {
         return s.decline(NoPage::Unplaceable);
     };
+    s.reset_page();
+    let mut calls = 0u32;
+    let mut at = rank;
+    let mut idx = 0usize;
+    loop {
+        let g = s.accepted.len();
+        if g == ZMAX_GROUPS || at >= n || idx >= ZMAX_COUNT {
+            break;
+        }
+        // The next group's key, for the room its directory entry leaves:
+        // the first record's. A record that is no image is the first
+        // group's to decline and a later group's to close the page before;
+        // so is an image the directory cannot name, one with no key to
+        // parse or a key not above the group before it (never a record of
+        // a partition, whose keys ascend), since the first group of a page
+        // is named by the fence and needs none.
+        let img = src.image(at);
+        if img.is_empty() || !img.len().is_multiple_of(4) {
+            if g == 0 {
+                return s.decline(NoPage::Unplaceable);
+            }
+            break;
+        }
+        let klen = if g == 0 {
+            0
+        } else {
+            match record_key(img, 0) {
+                Some(k) if key_cmp(s.key_of(g - 1), k) == Ordering::Less => k.len(),
+                _ => break,
+            }
+        };
+        let Some(room) = s.room_for(klen) else { break };
+        let limit = (n - at).min(ZMAX_COUNT - idx);
+        let fit = if s.group_bytes == 0 {
+            fit_one_group(src, at, limit, room, s, turns, &mut calls)
+        } else {
+            fit_cut_group(src, at, limit, room, s, turns, &mut calls)
+        };
+        match fit {
+            Ok(fit) => {
+                at += fit.m;
+                idx += fit.m;
+                s.accept(fit);
+            }
+            Err(NoFit::Mismatch) => return Fill::Mismatch,
+            Err(NoFit::Decline(why)) => {
+                if g == 0 {
+                    return s.decline(why);
+                }
+                break;
+            }
+        }
+        if s.group_bytes == 0 {
+            break;
+        }
+    }
+    seal_page(s, first_rank, calls, bind32, page)
+}
+
+/// The cut shape's group at `rank`: the records up to the target, trimmed
+/// to the room where its compressed bytes pass it.
+fn fit_cut_group<I: Images + ?Sized>(
+    src: &I,
+    rank: usize,
+    limit: usize,
+    room: usize,
+    s: &mut FillScratch,
+    turns: u32,
+    calls: &mut u32,
+) -> Result<Fit, NoFit> {
+    let target = s.group_bytes.min(ZMAX_ULEN);
+    let mut m = match s.stage_to(src, rank, limit, target) {
+        Stage::Ok => s.ends.len(),
+        Stage::Bad(0) => return Err(NoFit::Decline(NoPage::Unplaceable)),
+        // Up to the record that is no image.
+        Stage::Bad(j) => j,
+        Stage::Over => {
+            if s.ends.len() == 1 {
+                return Err(NoFit::Decline(NoPage::Oversize));
+            }
+            (s.ends.len() / 2).max(1)
+        }
+    };
+    // The page's last group is the one the room cuts, and the groups
+    // before it say what a record compresses to here: a group the ratio
+    // says will not fit is staged shorter before it is compressed, so the
+    // room costs a trim and not a compress call and a trim.
+    let (records, bytes) = s
+        .accepted
+        .iter()
+        .fold((0usize, 0usize), |(r, b), a| (r + a.count, b + a.clen));
+    if records > 0 && m > 1 {
+        let per = (bytes / records).max(1);
+        if m * per > room {
+            m = (room / per).clamp(1, m);
+        }
+    }
+    let mut turn = 0u32;
+    while turn < turns {
+        match s.stage(src, rank, m) {
+            Stage::Ok => {}
+            Stage::Bad(j) => {
+                if j == 0 {
+                    return Err(NoFit::Decline(NoPage::Unplaceable));
+                }
+                m = m.min(j);
+                continue;
+            }
+            Stage::Over => {
+                if s.ends.len() == 1 {
+                    return Err(NoFit::Decline(NoPage::Oversize));
+                }
+                m = (m / 2).max(1);
+                continue;
+            }
+        }
+        turn += 1;
+        s.stats.turns += 1;
+        let ulen = s.imgs.len();
+        let Some(class) = s.classify(ulen, room) else {
+            return Err(NoFit::Mismatch);
+        };
+        *calls += 1;
+        match class {
+            Class::Stored => {
+                return Ok(Fit {
+                    m,
+                    ulen,
+                    body: Body::Stored,
+                })
+            }
+            Class::Lz4(clen) => {
+                return Ok(Fit {
+                    m,
+                    ulen,
+                    body: Body::Lz4 { clen },
+                })
+            }
+            Class::TooBig(c) => {
+                if m == 1 {
+                    return Err(NoFit::Decline(NoPage::Incompressible));
+                }
+                m = trimmed(m, c, room, turn);
+            }
+        }
+    }
+    fallback(src, rank, room, s, calls)
+}
+
+/// The count a group that compressed to `c` bytes over `room` is cut to:
+/// in proportion to the overshoot, and by at least one, for the first four
+/// turns; halved after, so that it is one by the twelfth.
+fn trimmed(m: usize, c: usize, room: usize, turn: u32) -> usize {
+    if turn <= 4 {
+        let cut = ((c - room) * m).div_ceil(c).max(1);
+        m.saturating_sub(cut).max(1)
+    } else {
+        (m / 2).max(1)
+    }
+}
+
+/// Every turn spent without a fit. A turn is an attempt, the first four
+/// cut the count in proportion (by at least one) and the rest halve it,
+/// so from the most a group holds the count is one at the twelfth and the
+/// twelfth decides: this path is not reached with the turns the layout
+/// gives. It is the path a smaller budget reaches, and what it does is the
+/// first record alone, once, so that a spent budget is a group of one and
+/// not a hole.
+fn fallback<I: Images + ?Sized>(
+    src: &I,
+    rank: usize,
+    room: usize,
+    s: &mut FillScratch,
+    calls: &mut u32,
+) -> Result<Fit, NoFit> {
+    s.stats.fallbacks += 1;
+    match s.stage(src, rank, 1) {
+        Stage::Ok => {}
+        Stage::Over => return Err(NoFit::Decline(NoPage::Oversize)),
+        Stage::Bad(_) => return Err(NoFit::Decline(NoPage::Unplaceable)),
+    }
+    let ulen = s.imgs.len();
+    let Some(class) = s.classify(ulen, room) else {
+        return Err(NoFit::Mismatch);
+    };
+    *calls += 1;
+    match class {
+        Class::Stored => Ok(Fit {
+            m: 1,
+            ulen,
+            body: Body::Stored,
+        }),
+        Class::Lz4(clen) => Ok(Fit {
+            m: 1,
+            ulen,
+            body: Body::Lz4 { clen },
+        }),
+        Class::TooBig(_) => Err(NoFit::Decline(NoPage::Incompressible)),
+    }
+}
+
+/// The one-group shape's group at `rank`: sized from the scratch's hint so
+/// that its compressed bytes fill the room, grown by the slack.
+fn fit_one_group<I: Images + ?Sized>(
+    src: &I,
+    rank: usize,
+    limit: usize,
+    room: usize,
+    s: &mut FillScratch,
+    turns: u32,
+    calls: &mut u32,
+) -> Result<Fit, NoFit> {
     s.imgs.clear();
     s.ends.clear();
     // The most records the group can hold: the cap, the records left, and
     // the first record that is not an image.
-    let mut limit = (n - rank).min(ZMAX_COUNT);
-    let mut m = hint.clamp(1, limit);
+    let mut limit = limit;
+    let mut m = s.hint.clamp(1, limit);
     let mut turn = 0u32;
-    // The output buffer the next compress writes, and the other one holds
-    // the group that fit.
-    let mut cur = 0usize;
-    let mut calls = 0u32;
     let mut found: Option<Fit> = None;
-
     while turn < turns {
         // Staging is not a turn: only an attempt to compress is. It can
         // send the loop round again at most nine times, once for a record
@@ -981,7 +1700,7 @@ fn fill_with_turns<I: Images + ?Sized>(
             Stage::Ok => {}
             Stage::Bad(j) => {
                 if j == 0 {
-                    return s.decline(NoPage::Unplaceable);
+                    return Err(NoFit::Decline(NoPage::Unplaceable));
                 }
                 limit = j;
                 m = m.min(j);
@@ -989,7 +1708,7 @@ fn fill_with_turns<I: Images + ?Sized>(
             }
             Stage::Over => {
                 if s.ends.len() == 1 {
-                    return s.decline(NoPage::Oversize);
+                    return Err(NoFit::Decline(NoPage::Oversize));
                 }
                 m = (m / 2).max(1);
                 continue;
@@ -998,10 +1717,10 @@ fn fill_with_turns<I: Images + ?Sized>(
         turn += 1;
         s.stats.turns += 1;
         let ulen = s.imgs.len();
-        let Some(class) = s.classify(ulen, cur) else {
-            return Fill::Mismatch;
+        let Some(class) = s.classify(ulen, room) else {
+            return Err(NoFit::Mismatch);
         };
-        calls += 1;
+        *calls += 1;
         match class {
             Class::Stored => {
                 found = Some(Fit {
@@ -1015,85 +1734,43 @@ fn fill_with_turns<I: Images + ?Sized>(
                 found = Some(Fit {
                     m,
                     ulen,
-                    body: Body::Lz4 { buf: cur, clen },
+                    body: Body::Lz4 { clen },
                 });
-                cur ^= 1;
                 break;
             }
             Class::TooBig(c) => {
                 if m == 1 {
-                    return s.decline(NoPage::Incompressible);
+                    return Err(NoFit::Decline(NoPage::Incompressible));
                 }
-                m = if turn <= 4 {
-                    // In proportion to the overshoot, and at least one.
-                    let cut = ((c - ZCAP) * m).div_ceil(c).max(1);
-                    m.saturating_sub(cut).max(1)
-                } else {
-                    (m / 2).max(1)
-                };
+                m = trimmed(m, c, room, turn);
             }
         }
     }
-
     let mut fit = match found {
         Some(f) => f,
-        None => {
-            // Every turn spent without a fit. A turn is an attempt, the first
-            // four cut the count in proportion (by at least one) and the rest
-            // halve it, so from the most a group holds the count is one at
-            // the twelfth and the twelfth decides: this path is not reached
-            // with the turns the layout gives. It is the path a smaller
-            // budget reaches, and what it does is the first record alone,
-            // once, so that a spent budget is a page of one and not a hole.
-            s.stats.fallbacks += 1;
-            match s.stage(src, rank, 1) {
-                Stage::Ok => {}
-                Stage::Over => return s.decline(NoPage::Oversize),
-                Stage::Bad(_) => return s.decline(NoPage::Unplaceable),
-            }
-            let ulen = s.imgs.len();
-            let Some(class) = s.classify(ulen, cur) else {
-                return Fill::Mismatch;
-            };
-            calls += 1;
-            match class {
-                Class::Stored => Fit {
-                    m: 1,
-                    ulen,
-                    body: Body::Stored,
-                },
-                Class::Lz4(clen) => {
-                    let f = Fit {
-                        m: 1,
-                        ulen,
-                        body: Body::Lz4 { buf: cur, clen },
-                    };
-                    cur ^= 1;
-                    f
-                }
-                Class::TooBig(_) => return s.decline(NoPage::Incompressible),
-            }
-        }
+        None => fallback(src, rank, room, s, calls)?,
     };
-
     // Growth: a group that fit with a record's room to spare is grown by the
     // records the slack holds, at the bytes a record has taken so far; past
     // the cap, to the most records that fit under it. A growth that does not
     // fit returns the group that did: it never replaces a group with a
-    // smaller one.
+    // smaller one. The group that fit is kept in the page's buffers while a
+    // larger one is tried, since the compressor's output is one buffer.
     let mut rounds = s.grow_rounds;
     while rounds > 0 && turn < turns {
         let body = fit.body_len();
-        let slack = ZCAP - body;
+        let slack = room - body;
         let per = (body / fit.m).max(1);
         if fit.m >= limit || slack < per {
             break;
         }
         let mut m2 = (fit.m + slack / per).min(limit);
+        s.hold(fit);
         match s.stage(src, rank, m2) {
             Stage::Ok => {}
             Stage::Bad(j) => {
                 limit = j;
+                s.unhold(fit);
                 continue;
             }
             Stage::Over => {
@@ -1103,6 +1780,7 @@ fn fill_with_turns<I: Images + ?Sized>(
                 // search of where they end and not another try.
                 m2 = s.ends.partition_point(|&e| e <= ZMAX_ULEN);
                 if m2 <= fit.m || !matches!(s.stage(src, rank, m2), Stage::Ok) {
+                    s.unhold(fit);
                     break;
                 }
             }
@@ -1110,86 +1788,128 @@ fn fill_with_turns<I: Images + ?Sized>(
         turn += 1;
         s.stats.turns += 1;
         let ulen = s.imgs.len();
-        let Some(class) = s.classify(ulen, cur) else {
-            return Fill::Mismatch;
+        let Some(class) = s.classify(ulen, room) else {
+            return Err(NoFit::Mismatch);
         };
-        calls += 1;
-        fit = match class {
-            Class::Stored => Fit {
-                m: m2,
-                ulen,
-                body: Body::Stored,
-            },
-            Class::Lz4(clen) => {
-                let f = Fit {
+        *calls += 1;
+        match class {
+            Class::Stored => {
+                fit = Fit {
                     m: m2,
                     ulen,
-                    body: Body::Lz4 { buf: cur, clen },
+                    body: Body::Stored,
                 };
-                cur ^= 1;
-                f
+                s.drop_held();
             }
-            Class::TooBig(_) => break,
-        };
+            Class::Lz4(clen) => {
+                fit = Fit {
+                    m: m2,
+                    ulen,
+                    body: Body::Lz4 { clen },
+                };
+                s.drop_held();
+            }
+            Class::TooBig(_) => {
+                s.unhold(fit);
+                break;
+            }
+        }
         rounds -= 1;
         s.stats.growths += 1;
     }
-
-    seal_page(s, fit, first_rank, calls, bind32, page)
+    s.hint = fit.m;
+    Ok(fit)
 }
 
-/// The page of a group that fit: written into `page`, then read back as a
-/// reader reads a page and compared with the images the group was built
+impl FillScratch {
+    /// A fit's compressed bytes kept aside while a larger group is tried
+    /// over the same output buffer: at the end of the page's payloads,
+    /// where `unhold` restores them to the output buffer and `drop_held`
+    /// forgets them.
+    fn hold(&mut self, fit: Fit) {
+        if let Body::Lz4 { clen } = fit.body {
+            let at = self.payloads.len();
+            self.payloads.extend_from_slice(&self.out[..clen]);
+            self.held = Some((at, clen));
+        }
+    }
+
+    fn unhold(&mut self, fit: Fit) {
+        if let (Body::Lz4 { clen }, Some((at, n))) = (fit.body, self.held.take()) {
+            debug_assert_eq!(clen, n);
+            self.out[..n].copy_from_slice(&self.payloads[at..at + n]);
+            self.payloads.truncate(at);
+        }
+        // The images of the fit are staged again by the caller's next
+        // `stage`, which truncates to the count.
+        let keep = self.ends.get(fit.m - 1).copied().unwrap_or(0);
+        self.ends.truncate(fit.m);
+        self.imgs.truncate(keep);
+    }
+
+    fn drop_held(&mut self) {
+        if let Some((at, _)) = self.held.take() {
+            self.payloads.truncate(at);
+        }
+    }
+}
+
+/// The page of the groups that fit: written into `page`, then read back as
+/// a reader reads a page and compared with the images the groups were built
 /// from, and only then counted and returned.
 ///
 /// This is the whole of the builder's guard against a page whose CRC is good
 /// and whose bytes are wrong -- the CRC is computed over whatever was
-/// written, so it cannot see a payload that is not the group -- and it is
-/// split from the search for a fit so that a test can hand it a fit whose
-/// payload has been damaged since it was judged: no input to `fill_group`
-/// reaches the comparison's failure, because the compressor is correct.
+/// written -- so the comparison is of the page as a reader decodes it, not
+/// of the buffers it was composed from.
 fn seal_page(
     s: &mut FillScratch,
-    fit: Fit,
     first_rank: u32,
     calls: u32,
     bind32: u32,
     page: &mut [u8; ZPAGE],
 ) -> Fill {
-    let payload: &[u8] = match fit.body {
-        Body::Stored => &s.imgs[..fit.ulen],
-        Body::Lz4 { buf, clen } => &s.out[buf][..clen],
+    let groups: Vec<PageGroup<'_>> = s
+        .accepted
+        .iter()
+        .enumerate()
+        .map(|(j, a)| PageGroup {
+            count: a.count as u16,
+            payload: &s.payloads[a.pay_at..a.pay_at + a.clen],
+            ulen: a.ulen as u32,
+            stored: a.stored,
+            key: s.key_of(j),
+        })
+        .collect();
+    let Ok(h) = encode_page(page, first_rank, &groups, bind32) else {
+        return Fill::Mismatch;
     };
-    let hdr = PageHeader {
-        first_rank,
-        count: fit.m as u16,
-        stored: matches!(fit.body, Body::Stored),
-        ulen: fit.ulen as u32,
-        clen: payload.len() as u16,
-    };
-    if encode_page(page, &hdr, payload, bind32).is_err() {
+    if !page_decodes_to(page, bind32, &h, &s.page_imgs, &mut s.verify) {
         return Fill::Mismatch;
     }
-    if !page_decodes_to(page, bind32, &hdr, &s.imgs[..fit.ulen], &mut s.verify) {
-        return Fill::Mismatch;
-    }
-    s.stats.pages += 1;
-    s.stats.records += fit.m as u64;
-    s.stats.stored += u64::from(hdr.stored);
-    s.stats.payload_bytes += u64::from(hdr.clen);
-    s.stats.group_bytes += u64::from(hdr.ulen);
-    Fill::Page(Group {
-        count: fit.m,
-        ulen: fit.ulen,
-        clen: usize::from(hdr.clen),
-        stored: hdr.stored,
+    let built = Filled {
+        count: usize::from(h.count),
+        ulen: h.ulen as usize,
+        clen: s.accepted.iter().map(|a| a.clen).sum(),
+        used: usize::from(h.used),
+        groups: s.accepted.len(),
+        stored: s.accepted.iter().filter(|a| a.stored).count(),
         calls,
-    })
+    };
+    s.stats.pages += 1;
+    s.stats.records += built.count as u64;
+    s.stats.groups += built.groups as u64;
+    s.stats.stored += built.stored as u64;
+    s.stats.payload_bytes += built.clen as u64;
+    s.stats.used_bytes += built.used as u64;
+    s.stats.group_bytes += built.ulen as u64;
+    Fill::Page(built)
 }
 
-/// Whether `page`, read the way a reader reads one -- its CRC, its header,
-/// its payload decoded -- carries the header `hdr` and decodes to exactly
-/// `want`. What was written is read back, not what was meant to be written.
+/// Whether `page`, read the way a reader reads one -- its CRC, its header
+/// and directory, each group's payload decoded -- carries the header `hdr`
+/// and decodes, group after group, to exactly `want`. What was written is
+/// read back, not what was meant to be written.
 fn page_decodes_to(
     page: &[u8; ZPAGE],
     bind32: u32,
@@ -1197,10 +1917,23 @@ fn page_decodes_to(
     want: &[u8],
     verify: &mut GroupBuf,
 ) -> bool {
-    let Ok((h, body)) = parse_page(page, bind32) else {
+    let Ok(view) = parse_page(page, bind32) else {
         return false;
     };
-    h == *hdr && decode_group(&h, body, verify).is_ok_and(|g| g == want)
+    if view.header != *hdr {
+        return false;
+    }
+    let mut at = 0usize;
+    for j in 0..view.groups() {
+        let Ok(g) = decode_group(&view, j, verify) else {
+            return false;
+        };
+        if want.get(at..at + g.len()) != Some(g) {
+            return false;
+        }
+        at += g.len();
+    }
+    at == want.len()
 }
 
 /// One fence entry as a page's first decode wants it.
@@ -1580,40 +2313,64 @@ pub fn filter_bytes(nkeys: usize) -> usize {
 /// builder's verification of what it wrote ([`verify_page`]) and an attach's
 /// look at the pages it samples all call it, so that the three cannot come to
 /// mean different things by it.
-pub fn check_entry(h: &PageHeader, entry: &FenceEntry<'_>) -> Result<(), ZError> {
+pub fn check_entry(view: &PageView<'_>, entry: &FenceEntry<'_>) -> Result<(), ZError> {
+    let h = &view.header;
     if h.first_rank != entry.first_rank || u32::from(h.count) != entry.count {
+        return Err(ZError::Fence);
+    }
+    // The directory's keys ascend among themselves (the view's check);
+    // the fence's key, the first group's, is below them.
+    if view
+        .key(1)
+        .is_some_and(|k| key_cmp(entry.key, k) != Ordering::Less)
+    {
         return Err(ZError::Fence);
     }
     Ok(())
 }
 
-/// That a decoded group is what its page's header and its fence entry say:
-/// `count` records, whole, in key order, the first the entry's key
-/// ([`walk_group`]). See [`check_entry`] for why it is a function of its own.
-pub fn check_group(group: &[u8], h: &PageHeader, entry: &FenceEntry<'_>) -> Result<(), ZError> {
-    walk_group(group, usize::from(h.count), Some(entry.key))
+/// That a decoded group `j` is what its page's directory and its fence
+/// entry say: the group's records, whole, in key order, the first the
+/// entry's key for group 0 and the directory's for the rest, every key
+/// below the next group's first ([`walk_group`]). See [`check_entry`] for
+/// why it is a function of its own.
+pub fn check_group(
+    group: &[u8],
+    view: &PageView<'_>,
+    j: usize,
+    entry: &FenceEntry<'_>,
+) -> Result<(), ZError> {
+    let g = view
+        .group(j)
+        .ok_or(ZError::Header("no such group in the page"))?;
+    let first = if j == 0 { Some(entry.key) } else { view.key(j) };
+    walk_group(group, usize::from(g.count), first, view.key(j + 1))
 }
 
 /// Everything a first decode of a page checks, in the order that trusts the
-/// least first: the page's CRC, tag and header; its `first_rank` and `count`
-/// against its fence entry ([`check_entry`]); the payload decoded to exactly
-/// `ulen`; and the structural walk -- `count` records, whole, ascending, the
-/// first the entry's key ([`check_group`]). The builder runs this on every
-/// page it writes, as the page will be read, so that a defect that would
-/// fail every first decode cannot pass the build and then loop the rebuild;
-/// the reader's first decode is these checks in this order with the one
-/// difference its mapping makes (`db::zfile::first_decode`).
+/// least first: the page's CRC, tag, header and directory; its `first_rank`
+/// and `count` against its fence entry ([`check_entry`]); and for each
+/// group the payload decoded to exactly its `ulen` and the structural walk
+/// -- its records, whole, ascending, the first the key named for it and
+/// every one below the next group's ([`check_group`]). The builder runs this
+/// on every page it writes, as the page will be read, so that a defect that
+/// would fail every first decode cannot pass the build and then loop the
+/// rebuild; the reader's first decode of a group is these checks in this
+/// order over the page and that group, with the one difference its mapping
+/// makes (`db::zfile::first_decode`).
 pub fn verify_page(
     page: &[u8],
     bind32: u32,
     entry: &FenceEntry<'_>,
     buf: &mut GroupBuf,
 ) -> Result<PageHeader, ZError> {
-    let (h, payload) = parse_page(page, bind32)?;
-    check_entry(&h, entry)?;
-    let group = decode_group(&h, payload, buf)?;
-    check_group(group, &h, entry)?;
-    Ok(h)
+    let view = parse_page(page, bind32)?;
+    check_entry(&view, entry)?;
+    for j in 0..view.groups() {
+        let group = decode_group(&view, j, buf)?;
+        check_group(group, &view, j, entry)?;
+    }
+    Ok(view.header)
 }
 
 // The trailer's fields.
@@ -2109,8 +2866,8 @@ mod tests {
             .collect()
     }
 
-    /// A page built by hand from a group, so the layout's tests do not stand
-    /// on `fill_group`.
+    /// A page built by hand from one group, so the layout's tests do not
+    /// stand on `fill_page`.
     fn manual_page(
         group: &[u8],
         count: u16,
@@ -2118,20 +2875,40 @@ mod tests {
         bind: u32,
         stored: bool,
     ) -> [u8; ZPAGE] {
+        manual_pages(&[(group, count, stored, &[])], first_rank, bind)
+    }
+
+    /// A page built by hand from several groups: each its bytes, its record
+    /// count, whether it is stored verbatim, and the key the directory
+    /// names it by (unused for the first).
+    fn manual_pages(
+        groups: &[(&[u8], u16, bool, &[u8])],
+        first_rank: u32,
+        bind: u32,
+    ) -> [u8; ZPAGE] {
         let mut page = [0u8; ZPAGE];
-        let payload = if stored {
-            group.to_vec()
-        } else {
-            lz4_flex::block::compress(group)
-        };
-        let h = PageHeader {
-            first_rank,
-            count,
-            stored,
-            ulen: group.len() as u32,
-            clen: payload.len() as u16,
-        };
-        encode_page(&mut page, &h, &payload, bind).expect("the fixture page encodes");
+        let payloads: Vec<Vec<u8>> = groups
+            .iter()
+            .map(|&(group, _, stored, _)| {
+                if stored {
+                    group.to_vec()
+                } else {
+                    lz4_flex::block::compress(group)
+                }
+            })
+            .collect();
+        let pg: Vec<PageGroup<'_>> = groups
+            .iter()
+            .zip(&payloads)
+            .map(|(&(group, count, stored, key), payload)| PageGroup {
+                count,
+                payload,
+                ulen: group.len() as u32,
+                stored,
+                key,
+            })
+            .collect();
+        encode_page(&mut page, first_rank, &pg, bind).expect("the fixture page encodes");
         page
     }
 
@@ -2162,18 +2939,21 @@ mod tests {
     fn the_constants_are_the_layouts() {
         assert_eq!(ZCAP, 4072);
         assert_eq!(ZHDR + ZCAP, ZPAGE);
-        assert_eq!(&ZTAG.to_le_bytes(), b"ZPG1");
+        assert_eq!(&ZTAG.to_le_bytes(), b"ZPG2");
         assert_ne!(ZTAG, 0, "a zeroed page must not carry a valid tag");
         assert_eq!(ZNOPAGE, 0xFFFF_FFFF);
         assert_eq!(ZMAX_COUNT, 256);
         assert_eq!(ZMAX_ULEN, 65_536);
-        assert_eq!(&ZMAGIC, b"SUPDZPG1");
+        assert_eq!((ZMAX_GROUPS, ZDIR_ENTRY, ZGROUP_BYTES), (16, 8, 2048));
+        assert_eq!(&ZMAGIC, b"SUPDZPG2");
         assert_eq!((ZTRAILER, T_CRC, T_ZERO), (4096, 4092, 212));
-        // The header's fields tile the first 24 bytes, in the order written.
+        // The header's fields tile the first 24 bytes, in the order written,
+        // and a directory entry's its eight.
         assert_eq!(
-            [P_CRC, P_TAG, P_FIRST, P_COUNT, P_FLAGS, P_ULEN, P_CLEN],
-            [0, 4, 8, 12, 14, 16, 20]
+            [P_CRC, P_TAG, P_FIRST, P_COUNT, P_STORED, P_ULEN, P_USED, P_GROUPS, P_ZERO],
+            [0, 4, 8, 12, 14, 16, 20, 22, 23]
         );
+        assert_eq!([D_FIRST, D_COFF, D_CLEN, D_ULEN4], [0, 2, 4, 6]);
         // The CRC check value of the Castagnoli polynomial, and the engine's
         // CRC held to the definition above.
         assert_eq!(crc32c(b"123456789"), 0xE306_9283);
@@ -2192,21 +2972,137 @@ mod tests {
         for (images, stored) in small_groups() {
             let group = images.concat();
             let page = manual_page(&group, images.len() as u16, 77, 0xDEAD_BEEF, stored);
-            let (h, payload) = parse_page(&page, 0xDEAD_BEEF).expect("a good page parses");
+            let v = parse_page(&page, 0xDEAD_BEEF).expect("a good page parses");
+            let h = v.header;
             assert_eq!(h.first_rank, 77);
             assert_eq!(h.count as usize, images.len());
-            assert_eq!(h.stored, stored);
+            assert_eq!((h.groups, h.stored), (1, u16::from(stored)));
             assert_eq!(h.ulen as usize, group.len());
-            assert_eq!(payload.len(), h.clen as usize);
+            let g = v.group(0).unwrap();
+            assert_eq!(
+                (g.first, g.count as usize, g.stored),
+                (0, images.len(), stored)
+            );
+            assert_eq!(g.ulen as usize, group.len());
+            assert_eq!(v.payload(0).unwrap().len(), g.clen as usize);
+            assert_eq!(usize::from(h.used), ZDIR_ENTRY + usize::from(g.clen));
+            assert!(v.group(1).is_none() && v.key(0).is_none() && v.key(1).is_none());
             let mut buf = GroupBuf::new();
-            let back = decode_group(&h, payload, &mut buf).expect("a good page decodes");
+            let back = decode_group(&v, 0, &mut buf).expect("a good page decodes");
             assert_eq!(back, &group[..]);
             assert!(
                 (back.as_ptr() as usize).is_multiple_of(4),
                 "a decoded group is aligned for extents"
             );
-            walk_group(back, images.len(), None).expect("the group walks");
+            walk_group(back, images.len(), None, None).expect("the group walks");
+            assert!(matches!(
+                decode_group(&v, 1, &mut buf),
+                Err(ZError::Header(_))
+            ));
         }
+    }
+
+    #[test]
+    fn a_page_of_several_groups_round_trips_and_is_found_by_key_and_index() {
+        // The suite's records cut into four groups, one of them stored, with
+        // the keys the directory names each by: every group decodes to its
+        // records on its own, the directory finds a key's group and an
+        // index's group, and the layout is what the table says.
+        let images = suite_images(40, 5);
+        let cuts = [0usize, 7, 20, 28, 40];
+        let groups: Vec<Vec<u8>> = cuts
+            .windows(2)
+            .map(|w| images[w[0]..w[1]].concat())
+            .collect();
+        let keys: Vec<Vec<u8>> = cuts[..4]
+            .iter()
+            .map(|&i| record_key(&images[i], 0).unwrap().to_vec())
+            .collect();
+        let spec: Vec<(&[u8], u16, bool, &[u8])> = (0..4)
+            .map(|j| {
+                (
+                    groups[j].as_slice(),
+                    (cuts[j + 1] - cuts[j]) as u16,
+                    j == 2,
+                    keys[j].as_slice(),
+                )
+            })
+            .collect();
+        let page = manual_pages(&spec, 100, 9);
+        let v = parse_page(&page, 9).expect("parses");
+        assert_eq!(
+            (v.groups(), v.header.count, v.header.first_rank),
+            (4, 40, 100)
+        );
+        assert_eq!(v.header.stored, 1 << 2);
+        assert_eq!(v.header.ulen as usize, images.concat().len());
+        let mut buf = GroupBuf::new();
+        let mut at = ZHDR + 4 * ZDIR_ENTRY;
+        for j in 0..4 {
+            let g = v.group(j).unwrap();
+            assert_eq!(
+                (g.first as usize, g.count as usize),
+                (cuts[j], cuts[j + 1] - cuts[j])
+            );
+            assert_eq!((g.stored, g.ulen as usize), (j == 2, groups[j].len()));
+            assert_eq!(
+                decode_group(&v, j, &mut buf).unwrap(),
+                &groups[j][..],
+                "group {j}"
+            );
+            if j > 0 {
+                assert_eq!(v.key(j), Some(keys[j].as_slice()));
+                // The key where the table says: a length and the bytes.
+                assert_eq!(
+                    u16::from_le_bytes([page[at], page[at + 1]]) as usize,
+                    keys[j].len()
+                );
+                assert_eq!(&page[at + 2..at + 2 + keys[j].len()], &keys[j][..]);
+                at += 2 + keys[j].len();
+            }
+        }
+        // The payloads from the keys' end rounded up to four, each after
+        // the last rounded the same, the last ending at the used bytes.
+        let mut coff = at.next_multiple_of(4);
+        for j in 0..4 {
+            let g = v.group(j).unwrap();
+            assert_eq!(usize::from(g.coff), coff, "group {j}'s payload");
+            coff = (coff + usize::from(g.clen)).next_multiple_of(4);
+        }
+        let g3 = v.group(3).unwrap();
+        assert_eq!(
+            ZHDR + usize::from(v.header.used),
+            usize::from(g3.coff) + usize::from(g3.clen)
+        );
+        // Found by index and by key: every record of every group, and the
+        // keys between.
+        for (i, image) in images.iter().enumerate().take(40) {
+            let j = cuts.iter().rposition(|&c| c <= i).unwrap();
+            assert_eq!(v.group_of_index(i), j, "index {i}");
+            let k = record_key(image, 0).unwrap();
+            assert_eq!(v.group_of_key(k), j, "key of {i}");
+            let mut above = k.to_vec();
+            above.push(0);
+            assert_eq!(v.group_of_key(&above), j, "a key just above {i}'s");
+        }
+        assert_eq!(
+            v.group_of_key(b""),
+            0,
+            "a key below the page's first is group 0's to refuse"
+        );
+        assert_eq!(v.group_of_key(&[0xff; 20]), 3);
+        // And the whole page verifies at its entry, group by group.
+        let entry = FenceEntry {
+            index: 0,
+            first_rank: 100,
+            count: 40,
+            page: 0,
+            key: &keys[0],
+        };
+        assert_eq!(
+            verify_page(&page, 9, &entry, &mut buf).map(|h| h.groups),
+            Ok(4)
+        );
     }
 
     #[test]
@@ -2246,15 +3142,13 @@ mod tests {
                 (0..n).map(|i| (i / 7 % 251) as u8).collect()
             };
             let payload = lz4_flex::block::compress(&group);
-            assert!(payload.len() <= ZCAP, "{n}: the group fits a page");
-            let h = PageHeader {
-                first_rank: 0,
-                count: 1,
-                stored: false,
-                ulen: group.len() as u32,
-                clen: payload.len() as u16,
-            };
-            let back = decode_group(&h, &payload, &mut buf).unwrap();
+            assert!(
+                payload.len() <= ZCAP - ZDIR_ENTRY,
+                "{n}: the group fits a page"
+            );
+            let page = manual_page(&group, 1, 0, 0, false);
+            let v = parse_page(&page, 0).unwrap();
+            let back = decode_group(&v, 0, &mut buf).unwrap();
             assert_eq!(back, &group[..], "{n}");
         }
         assert_eq!(
@@ -2277,20 +3171,22 @@ mod tests {
             std::slice::from_raw_parts_mut(region.as_mut_ptr() as *mut u8, region.len() * 8)
         };
         bytes[..ZPAGE].copy_from_slice(&page);
-        let (h, payload) = parse_page(&bytes[..ZPAGE], 5).unwrap();
-        let g = decode_group(&h, payload, &mut buf).unwrap();
+        let v = parse_page(&bytes[..ZPAGE], 5).unwrap();
+        let payload = v.payload(0).unwrap();
+        let g = decode_group(&v, 0, &mut buf).unwrap();
         assert_eq!(g.as_ptr(), payload.as_ptr(), "aligned: lent from the page");
         assert_eq!(g, &group[..]);
         bytes.copy_within(0..ZPAGE, 1);
-        let (h, payload) = parse_page(&bytes[1..1 + ZPAGE], 5).unwrap();
+        let v = parse_page(&bytes[1..1 + ZPAGE], 5).unwrap();
+        let payload = v.payload(0).unwrap();
         assert!(!(payload.as_ptr() as usize).is_multiple_of(4));
-        let g = decode_group(&h, payload, &mut buf).unwrap();
+        let g = decode_group(&v, 0, &mut buf).unwrap();
         assert_ne!(g.as_ptr(), payload.as_ptr(), "misaligned: copied");
         assert!((g.as_ptr() as usize).is_multiple_of(4));
         assert_eq!(g, &group[..]);
         // And the records parse out of it, which is what a misaligned
         // buffer would have turned into "absent".
-        walk_group(g, images.len(), None).expect("a copied group walks");
+        walk_group(g, images.len(), None, None).expect("a copied group walks");
     }
 
     #[test]
@@ -2305,27 +3201,31 @@ mod tests {
                 crc32c(&page[4..]) ^ bind,
                 "crc covers [4, 4096) xor bind32"
             );
-            assert_eq!(&page[4..8], b"ZPG1");
+            assert_eq!(&page[4..8], b"ZPG2");
             assert_eq!(le32(&page, 8), 1234);
-            assert_eq!(
-                u16::from_le_bytes([page[12], page[13]]) as usize,
-                images.len()
-            );
-            assert_eq!(page[14], u8::from(stored));
-            assert_eq!(page[15], 0);
+            let le16 = |at: usize| u16::from_le_bytes([page[at], page[at + 1]]) as usize;
+            assert_eq!(le16(12), images.len());
+            assert_eq!(le16(14), usize::from(stored), "the stored mask");
             assert_eq!(le32(&page, 16) as usize, group.len());
-            let clen = u16::from_le_bytes([page[20], page[21]]) as usize;
-            assert_eq!(&page[22..24], &[0, 0]);
+            let used = le16(20);
+            assert_eq!((page[22], page[23]), (1, 0), "one group, then zero");
+            // The one directory entry: first 0, the payload at 32 (the
+            // directory's end, a multiple of four), its length, ulen / 4.
+            assert_eq!(le16(24), 0);
+            assert_eq!(le16(26), 32);
+            let clen = le16(28);
+            assert_eq!(le16(30) * 4, group.len());
+            assert_eq!(used, 8 + clen);
             if stored {
                 assert_eq!(clen, group.len());
-                assert_eq!(&page[24..24 + clen], &group[..]);
+                assert_eq!(&page[32..32 + clen], &group[..]);
             } else {
                 let mut out = vec![0u8; group.len()];
-                let n = lz4_flex::block::decompress_into(&page[24..24 + clen], &mut out).unwrap();
+                let n = lz4_flex::block::decompress_into(&page[32..32 + clen], &mut out).unwrap();
                 assert_eq!(&out[..n], &group[..]);
             }
             assert!(
-                page[24 + clen..].iter().all(|&b| b == 0),
+                page[32 + clen..].iter().all(|&b| b == 0),
                 "zeros after the payload"
             );
         }
@@ -2361,7 +3261,7 @@ mod tests {
         let images = small_groups().remove(0).0;
         let group = images.concat();
         let good = manual_page(&group, images.len() as u16, 3, 7, false);
-        let clen = u16::from_le_bytes([good[20], good[21]]) as usize;
+        let clen = usize::from(parse_page(&good, 7).unwrap().group(0).unwrap().clen);
         // A copy of the good page edited and signed again, so that only the
         // checks behind the CRC can see the edit.
         let edit = |f: &dyn Fn(&mut [u8; ZPAGE])| {
@@ -2375,11 +3275,9 @@ mod tests {
         // The tag: zero, and one bit off.
         assert_eq!(refused(edit(&|p| p[4..8].fill(0)), 7), Some(ZError::Tag));
         assert_eq!(refused(edit(&|p| p[4] ^= 1), 7), Some(ZError::Tag));
-        // The flags, and the bytes that are zero.
-        for at in [14usize, 15, 22, 23] {
-            let e = refused(edit(&|p| p[at] |= 2), 7);
-            assert!(header(e), "byte {at}: {e:?}");
-        }
+        // The byte that is zero.
+        let e = refused(edit(&|p| p[23] |= 2), 7);
+        assert!(header(e), "byte 23: {e:?}");
         // The counts and lengths.
         let set16 =
             |at: usize, v: u16| edit(&move |p| p[at..at + 2].copy_from_slice(&v.to_le_bytes()));
@@ -2389,20 +3287,50 @@ mod tests {
             let e = refused(set16(12, count), 7);
             assert!(header(e), "count {count}: {e:?}");
         }
-        for ulen in [0u32, 6, group.len() as u32 + 1, 65_540, u32::MAX] {
+        for ulen in [
+            0u32,
+            6,
+            group.len() as u32 + 1,
+            group.len() as u32 + 4,
+            65_540,
+            u32::MAX,
+        ] {
             let e = refused(set32(16, ulen), 7);
             assert!(header(e), "ulen {ulen}: {e:?}");
         }
-        for len in [0u16, 4073, u16::MAX] {
-            let e = refused(set16(20, len), 7);
-            assert!(header(e), "clen {len}: {e:?}");
+        for used in [0u16, 7, 4073, u16::MAX] {
+            let e = refused(set16(20, used), 7);
+            assert!(header(e), "used {used}: {e:?}");
         }
-        // A compressed page marked stored: its clen is not its ulen.
-        let e = refused(edit(&|p| p[14] = 1), 7);
+        for groups in [0u8, 2, 17, u8::MAX] {
+            let e = refused(edit(&move |p| p[22] = groups), 7);
+            assert!(header(e), "groups {groups}: {e:?}");
+        }
+        // A compressed group marked stored: its clen is not its ulen; and a
+        // stored bit for a group the page does not have.
+        let e = refused(set16(14, 1), 7);
         assert!(header(e), "{e:?}");
+        let e = refused(set16(14, 2), 7);
+        assert!(header(e), "{e:?}");
+        // The directory: a first that is not zero, a payload not where the
+        // keys end, no payload, a ulen of nothing, a ulen past the cap.
+        let e = refused(set16(24, 1), 7);
+        assert!(header(e), "first: {e:?}");
+        for coff in [0u16, 28, 36, 4000] {
+            let e = refused(set16(26, coff), 7);
+            assert!(header(e), "coff {coff}: {e:?}");
+        }
+        let e = refused(set16(28, 0), 7);
+        assert!(header(e), "clen 0: {e:?}");
+        let e = refused(set16(28, clen as u16 + 4), 7);
+        assert!(header(e), "clen past the used bytes: {e:?}");
+        let e = refused(set16(30, 0), 7);
+        assert!(header(e), "ulen4 0: {e:?}");
+        let e = refused(set16(30, (ZMAX_ULEN / 4 + 1) as u16), 7);
+        assert!(header(e), "ulen4 past the cap: {e:?}");
         // Bytes after the payload.
         assert_eq!(
-            refused(edit(&|p| p[24 + clen] = 1), 7),
+            refused(edit(&|p| p[32 + clen] = 1), 7),
             Some(ZError::Padding)
         );
         assert_eq!(
@@ -2415,82 +3343,145 @@ mod tests {
             Some(ZError::Length)
         );
         assert_eq!(parse_page(&[], 7).err(), Some(ZError::Length));
-        // The payload: a ulen the payload does not decode to, either way.
-        let (h, payload) = parse_page(&good, 7).unwrap();
+        // The payload: a ulen the payload does not decode to, either way,
+        // the header's sum kept in step so the directory passes.
         let mut buf = GroupBuf::new();
-        let longer = PageHeader {
-            ulen: h.ulen + 4,
-            ..h
-        };
+        let ulen4 = (group.len() / 4) as u16;
+        let longer = edit(&|p| {
+            p[30..32].copy_from_slice(&(ulen4 + 1).to_le_bytes());
+            p[16..20].copy_from_slice(&(group.len() as u32 + 4).to_le_bytes());
+        });
+        let v = parse_page(&longer, 7).expect("the directory agrees with the header");
         assert_eq!(
-            decode_group(&longer, payload, &mut buf).err(),
+            decode_group(&v, 0, &mut buf).err(),
             Some(ZError::DecodedLen)
         );
-        let shorter = PageHeader {
-            ulen: h.ulen - 4,
-            ..h
-        };
-        assert_eq!(
-            decode_group(&shorter, payload, &mut buf).err(),
-            Some(ZError::Decode)
-        );
-        // A payload that is not the page's clen bytes is not the page's.
-        let e = decode_group(&h, &payload[..payload.len() / 2], &mut buf).err();
-        assert!(matches!(e, Some(ZError::Header(_))), "{e:?}");
-        // And one cut short with its header corrected is not a block.
-        let half = PageHeader {
-            clen: (payload.len() / 2) as u16,
-            ..h
-        };
-        let e = decode_group(&half, &payload[..payload.len() / 2], &mut buf).err();
+        let shorter = edit(&|p| {
+            p[30..32].copy_from_slice(&(ulen4 - 1).to_le_bytes());
+            p[16..20].copy_from_slice(&(group.len() as u32 - 4).to_le_bytes());
+        });
+        let v = parse_page(&shorter, 7).unwrap();
+        assert_eq!(decode_group(&v, 0, &mut buf).err(), Some(ZError::Decode));
+        // A payload cut short, with the lengths corrected, is not a block.
+        let half = edit(&|p| {
+            p[28..30].copy_from_slice(&((clen / 2) as u16).to_le_bytes());
+            p[20..22].copy_from_slice(&((8 + clen / 2) as u16).to_le_bytes());
+            p[32 + clen / 2..].fill(0);
+        });
+        let v = parse_page(&half, 7).unwrap();
+        let e = decode_group(&v, 0, &mut buf).err();
         assert!(
             matches!(e, Some(ZError::Decode | ZError::DecodedLen)),
             "{e:?}"
         );
+        // A page of two groups: the keys between the directory and the
+        // payloads, and the padding around them, are checked too. The
+        // second key empty, past the used bytes, not above the first
+        // group's; the second payload not at the first's end rounded up;
+        // the padding after the keys and between the payloads not zero.
+        let two = suite_images(20, 6);
+        let (g0, g1) = (two[..12].concat(), two[12..].concat());
+        let k1 = record_key(&two[12], 0).unwrap();
+        let page2 = manual_pages(&[(&g0, 12, false, &[]), (&g1, 8, false, k1)], 0, 7);
+        let v2 = parse_page(&page2, 7).unwrap();
+        let (e0, e1) = (v2.group(0).unwrap(), v2.group(1).unwrap());
+        let keys_at = ZHDR + 2 * ZDIR_ENTRY;
+        assert_eq!(&page2[keys_at + 2..keys_at + 2 + k1.len()], k1);
+        let edit2 = |f: &dyn Fn(&mut [u8; ZPAGE])| {
+            let mut p = page2;
+            f(&mut p);
+            resign_page(&mut p, 7);
+            p
+        };
+        type Lie = Box<dyn Fn(&mut [u8; ZPAGE])>;
+        let lies: Vec<(&str, Lie)> = vec![
+            (
+                "an empty second key",
+                Box::new(move |p| p[keys_at..keys_at + 2].fill(0)),
+            ),
+            (
+                "a second key past the used bytes",
+                Box::new(move |p| p[keys_at..keys_at + 2].copy_from_slice(&4000u16.to_le_bytes())),
+            ),
+            (
+                "the second first not above the first",
+                Box::new(|p| p[ZHDR + ZDIR_ENTRY..ZHDR + ZDIR_ENTRY + 2].fill(0)),
+            ),
+            (
+                "the second payload not at the first's end",
+                Box::new(move |p| {
+                    let at = ZHDR + ZDIR_ENTRY + D_COFF;
+                    p[at..at + 2].copy_from_slice(&(e1.coff + 4).to_le_bytes());
+                }),
+            ),
+        ];
+        for (what, f) in &lies {
+            let e = refused(edit2(f.as_ref()), 7);
+            assert!(header(e), "{what}: {e:?}");
+        }
+        let pad_after_keys = keys_at + 2 + k1.len();
+        if pad_after_keys < usize::from(e0.coff) {
+            assert_eq!(
+                refused(edit2(&|p| p[pad_after_keys] = 1), 7),
+                Some(ZError::Padding),
+                "the padding after the keys"
+            );
+        }
+        let between = usize::from(e0.coff) + usize::from(e0.clen);
+        if between < usize::from(e1.coff) {
+            assert_eq!(
+                refused(edit2(&|p| p[between] = 1), 7),
+                Some(ZError::Padding),
+                "the padding between the payloads"
+            );
+        }
+        // The view, which trusts the CRC, hands the keys out as they lie.
+        assert_eq!(page_view(&page2).unwrap().key(1), Some(k1));
     }
 
     #[test]
-    fn a_group_is_not_decoded_under_a_header_no_page_may_carry() {
-        // `decode_group` is public and takes a header, so it holds the header
-        // to what a page may carry itself: an unchecked length past the
-        // buffer is a panic, and a stored header whose lengths disagree is a
-        // slice of the wrong size.
+    fn a_view_refuses_a_header_or_a_directory_no_page_may_carry() {
+        // `page_view` is public and reads a page a first decode has passed,
+        // so it holds the header and the directory to what a page may carry
+        // itself: an unchecked length past the buffer is a panic, and a
+        // stored group whose lengths disagree is a slice of the wrong size.
         let images = small_groups().remove(0).0;
         let good = manual_page(&images.concat(), images.len() as u16, 3, 7, false);
-        let (h, payload) = parse_page(&good, 7).unwrap();
         let mut buf = GroupBuf::new();
-        assert!(decode_group(&h, payload, &mut buf).is_ok(), "the control");
-        for bad in [
-            PageHeader {
-                ulen: ZMAX_ULEN as u32 + 4,
-                ..h
-            },
-            PageHeader {
-                ulen: u32::MAX,
-                ..h
-            },
-            PageHeader {
-                ulen: h.ulen + 2,
-                ..h
-            },
-            PageHeader { ulen: 0, ..h },
-            PageHeader { count: 0, ..h },
-            PageHeader {
-                count: ZMAX_COUNT as u16 + 1,
-                ..h
-            },
-            PageHeader { clen: 0, ..h },
-            PageHeader {
-                clen: ZCAP as u16 + 1,
-                ..h
-            },
-            PageHeader { stored: true, ..h },
+        let v = page_view(&good).unwrap();
+        assert!(decode_group(&v, 0, &mut buf).is_ok(), "the control");
+        let set16 = |at: usize, val: u16| {
+            let mut p = good;
+            p[at..at + 2].copy_from_slice(&val.to_le_bytes());
+            p
+        };
+        let set32 = |at: usize, val: u32| {
+            let mut p = good;
+            p[at..at + 4].copy_from_slice(&val.to_le_bytes());
+            p
+        };
+        for (what, bad) in [
+            ("ulen past the cap", set32(16, ZMAX_ULEN as u32 + 4)),
+            ("ulen huge", set32(16, u32::MAX)),
+            ("ulen not a multiple of four", set32(16, v.header.ulen + 2)),
+            ("ulen zero", set32(16, 0)),
+            ("count zero", set16(12, 0)),
+            ("count past the most", set16(12, ZMAX_COUNT as u16 + 1)),
+            ("used zero", set16(20, 0)),
+            ("used past the cap", set16(20, ZCAP as u16 + 1)),
+            ("stored, but the lengths disagree", set16(14, 1)),
+            ("a directory entry's first off", set16(24, 5)),
+            ("a payload nowhere", set16(26, 4090)),
+            ("no payload", set16(28, 0)),
+            ("a group of no bytes", set16(30, 0)),
         ] {
-            let got = decode_group(&bad, payload, &mut buf).err();
-            assert!(matches!(got, Some(ZError::Header(_))), "{bad:?}: {got:?}");
+            let got = page_view(&bad).err();
+            assert!(matches!(got, Some(ZError::Header(_))), "{what}: {got:?}");
         }
+        let mut groups = good;
+        groups[22] = 0;
+        assert!(matches!(page_view(&groups).err(), Some(ZError::Header(_))));
     }
-
     #[test]
     fn a_page_of_another_form_file_fails_its_own_check() {
         let images = small_groups().remove(0).0;
@@ -2506,13 +3497,17 @@ mod tests {
     }
 
     #[test]
-    fn a_pages_view_is_its_header_and_payload_and_checks_only_those() {
+    fn a_pages_view_is_its_header_and_directory_and_checks_only_those() {
         for (group, stored) in small_groups() {
             let group = group.concat();
             let page = manual_page(&group, 3, 17, 0xBEEF, stored);
-            let (h, payload) = parse_page(&page, 0xBEEF).unwrap();
+            let full = parse_page(&page, 0xBEEF).unwrap();
             // The view agrees with the full parse where the page is whole.
-            assert_eq!(page_view(&page), Ok((h, payload)));
+            let v = page_view(&page).unwrap();
+            assert_eq!(
+                (v.header, v.group(0), v.payload(0)),
+                (full.header, full.group(0), full.payload(0))
+            );
             // It does not look at the CRC, the tag or the padding: those are
             // the first decode's, and a read of a verified page must not pay
             // for them again. A damaged page's view is the first decode's to
@@ -2520,11 +3515,12 @@ mod tests {
             let mut damaged = page;
             damaged[ZPAGE - 1] ^= 0xFF;
             assert_eq!(parse_page(&damaged, 0xBEEF).err(), Some(ZError::PageCrc));
-            assert_eq!(page_view(&damaged), Ok((h, payload)));
+            let dv = page_view(&damaged).unwrap();
+            assert_eq!((dv.header, dv.payload(0)), (full.header, full.payload(0)));
             // What it does check is what it hands back is bounded: the
-            // header's values, and the page's length.
+            // header's and the directory's values, and the page's length.
             let mut wild = page;
-            wild[P_CLEN..P_CLEN + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+            wild[P_USED..P_USED + 2].copy_from_slice(&u16::MAX.to_le_bytes());
             assert!(matches!(page_view(&wild), Err(ZError::Header(_))));
             let mut zero_count = page;
             zero_count[P_COUNT..P_COUNT + 2].copy_from_slice(&0u16.to_le_bytes());
@@ -2589,36 +3585,87 @@ mod tests {
     }
 
     #[test]
-    fn a_page_is_refused_a_header_it_would_not_write() {
+    fn a_page_is_refused_groups_it_would_not_write() {
         let mut page = [0xAAu8; ZPAGE];
-        let h = PageHeader {
-            first_rank: 0,
+        let payload = [1u8, 2, 3, 4];
+        let big = [0u8; ZCAP + 1];
+        let g = PageGroup {
             count: 1,
-            stored: false,
+            payload: &payload,
             ulen: 8,
-            clen: 4,
+            stored: false,
+            key: b"a",
         };
-        for bad in [
-            PageHeader { count: 0, ..h },
-            PageHeader { count: 257, ..h },
-            PageHeader { ulen: 0, ..h },
-            PageHeader { ulen: 6, ..h },
-            PageHeader { ulen: 65_540, ..h },
-            PageHeader { clen: 0, ..h },
-            PageHeader { clen: 4073, ..h },
-            PageHeader { stored: true, ..h },
-        ] {
-            assert!(
-                encode_page(&mut page, &bad, &[1, 2, 3, 4], 0).is_err(),
-                "{bad:?}"
-            );
+        fn one<'a>(bad: PageGroup<'a>) -> Vec<PageGroup<'a>> {
+            vec![bad]
         }
-        // A payload that is not clen bytes.
-        assert!(encode_page(&mut page, &h, &[1, 2, 3], 0).is_err());
+        let refusals: Vec<(&str, Vec<PageGroup<'_>>)> = vec![
+            ("no groups", Vec::new()),
+            ("a group of no records", one(PageGroup { count: 0, ..g })),
+            ("a ulen of nothing", one(PageGroup { ulen: 0, ..g })),
+            (
+                "a ulen not a multiple of four",
+                one(PageGroup { ulen: 6, ..g }),
+            ),
+            ("a ulen past the cap", one(PageGroup { ulen: 65_540, ..g })),
+            ("no payload", one(PageGroup { payload: &[], ..g })),
+            (
+                "a payload past the page",
+                one(PageGroup { payload: &big, ..g }),
+            ),
+            (
+                "stored, lengths disagreeing",
+                one(PageGroup { stored: true, ..g }),
+            ),
+            (
+                "the records past the most a page holds",
+                vec![
+                    PageGroup { count: 200, ..g },
+                    PageGroup {
+                        count: 57,
+                        key: b"b",
+                        ..g
+                    },
+                ],
+            ),
+            ("keys not ascending", vec![g, PageGroup { key: b"a", ..g }]),
+            (
+                "an empty key after the first",
+                vec![g, PageGroup { key: b"", ..g }],
+            ),
+            (
+                "more groups than a page holds",
+                (0..17).map(|_| g).collect(),
+            ),
+        ];
+        for (what, groups) in &refusals {
+            assert!(encode_page(&mut page, 0, groups, 0).is_err(), "{what}");
+        }
+        // Groups whose payloads do not fit the page together.
+        let half = vec![0u8; ZCAP / 2];
+        let twice = vec![
+            PageGroup {
+                payload: &half,
+                ..g
+            },
+            PageGroup {
+                payload: &half,
+                key: b"b",
+                ..g
+            },
+        ];
+        assert!(encode_page(&mut page, 0, &twice, 0).is_err());
         assert!(
             page.iter().all(|&b| b == 0xAA),
             "a refused page is left alone"
         );
+        // A stored group with the lengths agreeing is written.
+        let stored = PageGroup {
+            stored: true,
+            ulen: 4,
+            ..g
+        };
+        assert!(encode_page(&mut page, 0, &[stored], 0).is_ok());
     }
 
     // ---- the trailer ----------------------------------------------------
@@ -2739,7 +3786,7 @@ mod tests {
             2,
         );
         let b = t.encode();
-        assert_eq!(&b[0..8], b"SUPDZPG1");
+        assert_eq!(&b[0..8], b"SUPDZPG2");
         assert_eq!(le32(&b, 8), 1, "version");
         assert_eq!(le32(&b, 12), 4096, "page size");
         for (at, want) in [
@@ -3358,8 +4405,21 @@ mod tests {
             let group: Vec<u8> = recs.iter().flat_map(|(_, i)| i.iter().copied()).collect();
             let al = Al::new(&group);
             let g = al.bytes();
-            walk_group(g, n, Some(&recs[0].0)).expect("a whole group walks");
-            walk_group(g, n, None).expect("and without a fence key");
+            walk_group(g, n, Some(&recs[0].0), None).expect("a whole group walks");
+            walk_group(g, n, None, None).expect("and without a fence key");
+            // Every key below a bound above the last, and not below the
+            // last itself or anything under it.
+            let mut above = recs[n - 1].0.clone();
+            above.push(0);
+            walk_group(g, n, None, Some(&above)).expect("every key below the bound");
+            assert!(matches!(
+                walk_group(g, n, None, Some(&recs[n - 1].0)),
+                Err(ZError::Walk(_))
+            ));
+            assert!(matches!(
+                walk_group(g, n, None, Some(b"")),
+                Err(ZError::Walk(_))
+            ));
             let lens: Vec<usize> = recs.iter().map(|(_, im)| im.len()).collect();
             let model = |key: &[u8]| {
                 let idx = recs.partition_point(|(k, _)| k.as_slice() < key);
@@ -3436,7 +4496,7 @@ mod tests {
             let group = join(&natural);
             let walks = |g: &[u8], count: usize, first: Option<&[u8]>| {
                 let al = Al::new(g);
-                walk_group(al.bytes(), count, first)
+                walk_group(al.bytes(), count, first, None)
             };
             assert_eq!(walks(&group, n, Some(&recs[0].0)), Ok(()));
             // One more record than there are, and one fewer.
@@ -3484,17 +4544,17 @@ mod tests {
         }
     }
 
-    // ---- fill_group -----------------------------------------------------
+    // ---- fill_page ------------------------------------------------------
 
     struct Built {
-        /// (first rank, the group, the page)
-        pages: Vec<(usize, Group, [u8; ZPAGE])>,
+        /// (first rank, the page's summary, the page)
+        pages: Vec<(usize, Filled, [u8; ZPAGE])>,
         declined: Vec<(usize, NoPage)>,
     }
 
-    /// `fill_group` over every record in rank order, the previous page's
-    /// count the next call's hint, as a builder drives it; or one hint for
-    /// every call.
+    /// `fill_page` over every record in rank order, as a builder drives it,
+    /// the previous page's count the one-group shape's hint; or one hint
+    /// for every call.
     fn build_all<I: Images + ?Sized>(
         src: &I,
         s: &mut FillScratch,
@@ -3514,7 +4574,8 @@ mod tests {
         start: usize,
     ) -> Built {
         let n = src.records();
-        let (mut rank, mut hint) = (0usize, start);
+        let mut rank = 0usize;
+        s.hint = start;
         let mut out = Built {
             pages: Vec::new(),
             declined: Vec::new(),
@@ -3522,16 +4583,19 @@ mod tests {
         while rank < n {
             let mut page = [0u8; ZPAGE];
             let turns = s.stats.turns;
-            match fill_group(src, rank, fixed_hint.unwrap_or(hint), bind, s, &mut page) {
+            if let Some(h) = fixed_hint {
+                s.hint = h;
+            }
+            match fill_page(src, rank, bind, s, &mut page) {
                 Fill::Page(g) => {
                     assert!(g.count >= 1 && rank + g.count <= n, "rank {rank}: {g:?}");
                     assert!(
-                        g.count <= ZMAX_COUNT && g.ulen <= ZMAX_ULEN && g.clen <= ZCAP,
+                        g.count <= ZMAX_COUNT && g.used <= ZCAP && g.clen <= g.used,
                         "{g:?}"
                     );
+                    assert!(g.groups >= 1 && g.groups <= ZMAX_GROUPS && g.stored <= g.groups);
                     out.pages.push((rank, g, page));
                     rank += g.count;
-                    hint = g.count;
                 }
                 Fill::NoPage(why) => {
                     out.declined.push((rank, why));
@@ -3540,7 +4604,7 @@ mod tests {
                 other => panic!("rank {rank} of {n}: {other:?}"),
             }
             assert!(
-                s.stats.turns - turns <= u64::from(ZFILL_TURNS),
+                s.stats.turns - turns <= u64::from(ZFILL_TURNS) * ZMAX_GROUPS as u64,
                 "rank {rank}: {} turns",
                 s.stats.turns - turns
             );
@@ -3582,7 +4646,9 @@ mod tests {
         }
         // The entry's key: longer, shorter, and one byte off. The page's
         // rank and count agree with the entry here, so only the first key's
-        // comparison in the walk can see it.
+        // comparison in the walk can see it -- or, on a page of several
+        // groups, the comparison of the entry's key with the second group's,
+        // where the longer key sorts at or past it.
         let mut keys = vec![[entry.key, &[0u8][..]].concat()];
         if let Some((last, rest)) = entry.key.split_last() {
             keys.push(rest.to_vec());
@@ -3591,7 +4657,10 @@ mod tests {
         for k in &keys {
             let e = FenceEntry { key: k, ..*entry };
             let got = refused(page, &e);
-            assert!(matches!(got, Some(ZError::Walk(_))), "{e:?}: {got:?}");
+            assert!(
+                matches!(got, Some(ZError::Walk(_) | ZError::Fence)),
+                "{e:?}: {got:?}"
+            );
         }
         // A page of this form file at another entry's place: it passes its own
         // CRC under this `bind32`, and only the comparison refuses it.
@@ -3602,13 +4671,27 @@ mod tests {
     }
 
     /// What must hold of a build whatever the records: they are covered
-    /// once each by a page or a decline; every page decodes to its records'
-    /// images, is stored exactly where LZ4 did not help and the group fits,
-    /// and carries the LZ4 block of its group; a record is declined only for
-    /// a reason that holds of it alone. With `records`, the images are
-    /// records, every page passes the check a reader's first decode makes at
-    /// its own fence entry, and is refused at an entry that is not its own.
+    /// once each by a page or a decline; every page decodes, group after
+    /// group, to its records' images; every group is stored exactly where
+    /// LZ4 did not help, and carries the LZ4 block of its records
+    /// otherwise; every group but the last of a page holds what the target
+    /// allows and no more; the directory names each group after the first
+    /// by its first record's key; and a record is declined only for a
+    /// reason that holds of it alone. With `records`, the images are
+    /// records, every page passes the check a reader's first decode makes
+    /// at its own fence entry, and is refused at an entry that is not its
+    /// own.
     fn check_build<I: Images + ?Sized>(src: &I, b: &Built, bind: u32, records: bool) {
+        check_build_at(src, b, bind, records, ZGROUP_BYTES)
+    }
+
+    fn check_build_at<I: Images + ?Sized>(
+        src: &I,
+        b: &Built,
+        bind: u32,
+        records: bool,
+        target: usize,
+    ) {
         let n = src.records();
         let mut covered = vec![0u32; n];
         let mut buf = GroupBuf::new();
@@ -3616,43 +4699,72 @@ mod tests {
             for c in &mut covered[*rank..*rank + g.count] {
                 *c += 1;
             }
-            let group: Vec<u8> = (*rank..*rank + g.count)
-                .flat_map(|r| src.image(r).iter().copied())
-                .collect();
-            assert_eq!(group.len(), g.ulen, "rank {rank}");
-            let (h, payload) = parse_page(page, bind).expect("a page fill_group built parses");
+            let v = parse_page(page, bind).expect("a page fill_page built parses");
+            let h = v.header;
             assert_eq!(
                 (
                     h.first_rank as usize,
                     h.count as usize,
                     h.ulen as usize,
-                    h.clen as usize,
-                    h.stored
+                    usize::from(h.used),
+                    usize::from(h.groups),
+                    h.stored.count_ones() as usize
                 ),
-                (*rank, g.count, g.ulen, g.clen, g.stored)
-            );
-            assert_eq!(
-                decode_group(&h, payload, &mut buf).unwrap(),
-                &group[..],
+                (*rank, g.count, g.ulen, g.used, g.groups, g.stored),
                 "rank {rank}"
             );
-            let c = lz4_flex::block::compress(&group);
-            assert_eq!(
-                g.stored,
-                c.len() >= g.ulen && g.ulen <= ZCAP,
-                "rank {rank}: lz4 {} of {}",
-                c.len(),
-                g.ulen
-            );
-            if g.stored {
-                assert_eq!(payload, &group[..]);
-            } else {
+            let (mut at, mut clen) = (*rank, 0usize);
+            for j in 0..v.groups() {
+                let ge = v.group(j).unwrap();
+                let count = usize::from(ge.count);
+                let group: Vec<u8> = (at..at + count)
+                    .flat_map(|r| src.image(r).iter().copied())
+                    .collect();
+                assert_eq!(group.len(), ge.ulen as usize, "rank {rank} group {j}");
                 assert_eq!(
-                    payload,
-                    &c[..],
-                    "the block is the compressor's output for the group"
+                    decode_group(&v, j, &mut buf).unwrap(),
+                    &group[..],
+                    "rank {rank} group {j}"
                 );
+                let c = lz4_flex::block::compress(&group);
+                let payload = v.payload(j).unwrap();
+                if ge.stored {
+                    assert!(
+                        c.len() >= group.len(),
+                        "rank {rank} group {j}: stored though LZ4 helped"
+                    );
+                    assert_eq!(payload, &group[..]);
+                } else {
+                    assert_eq!(
+                        payload,
+                        &c[..],
+                        "rank {rank} group {j}: the block is the compressor's output"
+                    );
+                }
+                // Under a target every group but the page's last holds the
+                // records the target allows and no more: the next record
+                // would have passed it, or the count or the page's groups
+                // bound it.
+                if target > 0 && j + 1 < v.groups() {
+                    let next = src.image(at + count).len();
+                    assert!(
+                        group.len() <= target.min(ZMAX_ULEN) || count == 1,
+                        "rank {rank} group {j}: {} bytes over the target",
+                        group.len()
+                    );
+                    assert!(
+                        group.len() + next > target || count == ZMAX_COUNT,
+                        "rank {rank} group {j}: the next record would have fit"
+                    );
+                }
+                if records && j > 0 {
+                    let key = crate::flatindex::record_key(src.image(at), 0).unwrap();
+                    assert_eq!(v.key(j), Some(key), "rank {rank} group {j}'s key");
+                }
+                at += count;
+                clen += usize::from(ge.clen);
             }
+            assert_eq!((at, clen), (*rank + g.count, g.clen));
             if records {
                 let key = crate::flatindex::record_key(src.image(*rank), 0).unwrap();
                 let entry = FenceEntry {
@@ -3682,7 +4794,8 @@ mod tests {
             match why {
                 NoPage::Oversize => assert!(im.len() > ZMAX_ULEN, "rank {r}"),
                 NoPage::Incompressible => assert!(
-                    im.len() > ZCAP && lz4_flex::block::compress(im).len() > ZCAP,
+                    im.len() > ZCAP - ZDIR_ENTRY
+                        && lz4_flex::block::compress(im).len() > ZCAP - ZDIR_ENTRY,
                     "rank {r}: {} bytes, lz4 {}",
                     im.len(),
                     lz4_flex::block::compress(im).len()
@@ -3698,14 +4811,25 @@ mod tests {
         );
     }
 
-    /// The summary a build's scratch gives.
-    fn per_page(s: &FillScratch) -> (f64, f64, f64) {
+    /// The summary a build's scratch gives: records a page, the page's
+    /// used bytes over the cap, compress calls a page, groups a page.
+    fn per_page(s: &FillScratch) -> (f64, f64, f64, f64) {
         let p = s.stats.pages as f64;
         (
             s.stats.records as f64 / p,
-            s.stats.payload_bytes as f64 / (p * ZCAP as f64),
+            s.stats.used_bytes as f64 / (p * ZCAP as f64),
             s.stats.calls as f64 / p,
+            s.stats.groups as f64 / p,
         )
+    }
+
+    /// A scratch of the one-group shape: the page as one group, grown to
+    /// fill it, which the tests of the hint, the growth and the turns are
+    /// about.
+    fn one_group() -> FillScratch {
+        let mut s = FillScratch::new();
+        s.group_bytes = 0;
+        s
     }
 
     #[test]
@@ -3743,12 +4867,14 @@ mod tests {
     }
 
     #[test]
-    fn fill_group_fills_pages_with_records_shaped_like_the_suites() {
+    fn fill_page_fills_pages_with_records_shaped_like_the_suites() {
         let images = suite_images(20_000, 1);
         assert!(
             images.iter().all(|i| i.len() == 124),
             "the suite's record is 124 bytes"
         );
+        // The cut shape, as shipped: four groups a page or so, each the
+        // records two kibibytes hold, the directory and the keys the cost.
         let mut s = FillScratch::new();
         let b = build_all(&images, &mut s, 99, None);
         check_build(&images, &b, 99, true);
@@ -3758,30 +4884,68 @@ mod tests {
         assert_eq!(s.stats.stored, 0);
         assert_eq!(s.stats.nopages + s.stats.fallbacks, 0);
         assert_eq!(s.stats.group_bytes, 20_000 * 124);
-        let (rpp, fill, calls) = per_page(&s);
-        eprintln!("suite shape: {rpp:.2} records a page, fill {fill:.4}, {calls:.2} calls a page");
+        let (rpp, fill, calls, gpp) = per_page(&s);
+        eprintln!("suite shape, cut: {rpp:.2} records a page, fill {fill:.4}, {calls:.2} calls a page, {gpp:.2} groups a page");
         // Guard rails, not figures: the form is not worth building under 36
-        // records a page, a page left a quarter empty wastes the lever, and a
-        // page that takes four compress calls has lost the previous count.
+        // records a page, a page left a quarter empty wastes the lever, a
+        // group is a compress call and a page that takes two more has lost
+        // its way, and the groups are what the target makes of 124-byte
+        // records: sixteen a group, three or four and a tail to a page.
         assert!(rpp >= 36.0, "{rpp} records a page is under the stop rule");
         assert!(fill > 0.9, "fill {fill}");
-        assert!(calls < 4.0, "{calls} compress calls a page");
+        assert!(
+            calls < gpp + 2.0,
+            "{calls} compress calls a page for {gpp} groups"
+        );
+        assert!((3.0..=5.0).contains(&gpp), "{gpp} groups a page");
+        // The one-group shape, the page as it was before the cut: the hint
+        // keeps the compress calls near one a page.
+        let mut one = one_group();
+        let b1 = build_all(&images, &mut one, 99, None);
+        check_build_at(&images, &b1, 99, true, 0);
+        assert!(b1.pages.iter().all(|(_, g, _)| g.groups == 1));
+        let (rpp1, fill1, calls1, _) = per_page(&one);
+        eprintln!("suite shape, one group: {rpp1:.2} records a page, fill {fill1:.4}, {calls1:.2} calls a page");
+        assert!(
+            rpp1 >= 36.0 && fill1 > 0.9 && calls1 < 4.0,
+            "{rpp1} {fill1} {calls1}"
+        );
+        // The cut's price in pages: the probe priced four groups at six
+        // percent of the form's bytes, and the fill here says the same
+        // within a few percent of it.
+        let cost = b.pages.len() as f64 / b1.pages.len() as f64;
+        eprintln!("the cut costs {cost:.3} of the one-group pages");
+        assert!(
+            (1.02..=1.12).contains(&cost),
+            "the cut's cost in pages: {cost}"
+        );
     }
 
     #[test]
     fn a_stored_page_of_images_that_do_not_compress_holds_thirty_two_of_124_bytes() {
         // 124-byte images that are entropy throughout: LZ4 saves nothing, so
-        // the group is stored, 32 of them, 3,968 bytes, parsed in place.
+        // the groups are stored, 32 records to a page, 3,968 bytes, parsed
+        // in place. Such images are no records, and the directory cannot
+        // name a group by one, so under the cut a page holds one group of
+        // them, sixteen.
         let mut rng = Rng::new(31);
         let images: Vec<Vec<u8>> = (0..200).map(|_| rng.bytes(124)).collect();
-        let mut s = FillScratch::new();
-        let b = build_all(&images, &mut s, 1, None);
-        check_build(&images, &b, 1, false);
-        for (_, g, _) in &b.pages[..b.pages.len() - 1] {
-            assert!(g.stored, "{g:?}");
-            assert_eq!((g.count, g.ulen, g.clen), (32, 3968, 3968));
+        for (shape, mut s, count, groups) in [
+            ("cut", FillScratch::new(), 16, 1),
+            ("one group", one_group(), 32, 1),
+        ] {
+            let b = build_all(&images, &mut s, 1, None);
+            check_build_at(&images, &b, 1, false, s.group_bytes);
+            for (_, g, _) in &b.pages[..b.pages.len() - 1] {
+                assert_eq!((g.stored, g.groups), (groups, groups), "{shape}: {g:?}");
+                assert_eq!(
+                    (g.count, g.ulen, g.clen),
+                    (count, count * 124, count * 124),
+                    "{shape}: {g:?}"
+                );
+            }
+            assert_eq!(s.stats.stored, s.stats.groups, "{shape}");
         }
-        assert_eq!(s.stats.stored, s.stats.pages);
         // The suite's record with a random value is not such an image: its
         // framing and its sequential key still compress, and the page is
         // LZ4's, with a few more records than a stored page holds.
@@ -3796,106 +4960,195 @@ mod tests {
     }
 
     #[test]
-    fn fill_group_is_total_on_adversarial_input() {
+    fn fill_page_is_total_on_adversarial_input() {
         let mut rng = Rng::new(41);
         let bind = 5;
-        let run = |images: &[Vec<u8>], hint: Option<usize>| {
+        // Under the cut shape unless the case is the one-group shape's.
+        let run = |images: &[Vec<u8>], hint: Option<usize>, target: usize| {
             let mut s = FillScratch::new();
+            s.group_bytes = target;
             let b = build_all(images, &mut s, bind, hint);
-            check_build(images, &b, bind, false);
+            check_build_at(images, &b, bind, false, target);
             assert_eq!(s.stats.fallbacks, 0, "the turns suffice");
             (b, s)
         };
-        let small = |n: usize| -> Vec<Vec<u8>> { vec![vec![0x55u8; 124]; n] };
+        // Records of 124 bytes with ascending keys and one value: what
+        // the directory can name a group by.
+        let small = |n: usize| -> Vec<Vec<u8>> {
+            (0..n)
+                .map(|i| one_value(format!("{i:016}").as_bytes(), &[0x55u8; 100]))
+                .collect()
+        };
+        assert_eq!(small(1)[0].len(), 124);
         let declined = |b: &Built| -> Vec<(usize, NoPage)> { b.declined.clone() };
+        let room1 = ZCAP - ZDIR_ENTRY;
 
-        // No records, and a rank past the ones there are.
-        let mut s = FillScratch::new();
-        let mut page = [0u8; ZPAGE];
-        let none: Vec<Vec<u8>> = Vec::new();
-        assert_eq!(fill_group(&none, 0, 0, bind, &mut s, &mut page), Fill::End);
-        let three = small(3);
-        for rank in [3usize, 4, 1000, usize::MAX] {
+        for target in [ZGROUP_BYTES, 0] {
+            // No records, and a rank past the ones there are.
+            let mut s = FillScratch::new();
+            s.group_bytes = target;
+            let mut page = [0u8; ZPAGE];
+            let none: Vec<Vec<u8>> = Vec::new();
+            assert_eq!(fill_page(&none, 0, bind, &mut s, &mut page), Fill::End);
+            let three = small(3);
+            for rank in [3usize, 4, 1000, usize::MAX] {
+                assert_eq!(
+                    fill_page(&three, rank, bind, &mut s, &mut page),
+                    Fill::End,
+                    "{rank}"
+                );
+            }
+            assert_eq!(s.stats, FillStats::default(), "an end costs nothing");
+
+            // The smallest images: a header's worth, and stored.
+            let (b, _) = run(&[vec![1, 2, 3, 4]], None, target);
+            assert!(b.pages[0].1.stored == 1 && b.pages[0].1.count == 1);
+            let (b, _) = run(&[vec![9; 8]], Some(usize::MAX), target);
+            assert_eq!(b.pages.len(), 1);
+
+            // A record larger than a page that compresses is a group of
+            // one; among neighbours it is still one record, and they are
+            // pages, on the same page as it where they fit.
+            let mut mixed = small(10);
+            mixed.push(one_value(b"0000000000000010", &[b'a'; 4900]));
+            mixed.extend(small(10));
+            let (b, _) = run(&mixed, None, target);
+            assert!(b.declined.is_empty());
+            assert!(b
+                .pages
+                .iter()
+                .any(|(r, g, _)| *r <= 10 && *r + g.count > 10));
+
+            // One that does not compress is read from the raw segment, and
+            // only it is.
+            let mut mixed = small(10);
+            mixed.push(one_value(b"0000000000000010", &rng.bytes(4900)));
+            mixed.extend(small(10));
+            let (b, _) = run(&mixed, None, target);
+            assert_eq!(declined(&b), vec![(10, NoPage::Incompressible)]);
+
+            // A lone incompressible record that fits a page's room -- the
+            // cap less its one directory entry -- is stored, to the last
+            // word, where its LZ4 output would not.
+            for len in (4052..=room1).step_by(4) {
+                let (b, _) = run(&[rng.bytes(len)], None, target);
+                assert!(b.declined.is_empty(), "{len} bytes fit a page as they are");
+                let (_, g, _) = &b.pages[0];
+                assert!(
+                    g.stored == 1 && g.clen == len && g.count == 1,
+                    "{len}: {g:?}"
+                );
+            }
+            for len in [room1 + 4, room1 + 8, 4080, 4084] {
+                let (b, _) = run(&[rng.bytes(len)], None, target);
+                assert_eq!(declined(&b), vec![(0, NoPage::Incompressible)], "{len}");
+            }
+
+            // The shrink that once reached zero: two records of 4,500
+            // incompressible bytes, and seven of 5,100. Every record alone is
+            // declined, and nothing divides by a count of none.
+            let (b, s) = run(&[rng.bytes(4500), rng.bytes(4500)], Some(2), target);
             assert_eq!(
-                fill_group(&three, rank, 0, bind, &mut s, &mut page),
-                Fill::End,
-                "{rank}"
+                declined(&b),
+                vec![(0, NoPage::Incompressible), (1, NoPage::Incompressible)]
+            );
+            assert!(b.pages.is_empty());
+            assert!(s.stats.turns <= 4 * u64::from(ZFILL_TURNS));
+            let seven: Vec<Vec<u8>> = (0..7).map(|_| rng.bytes(5100)).collect();
+            let (b, _) = run(&seven, Some(7), target);
+            assert_eq!(b.declined.len(), 7);
+            let (b, _) = run(&seven, Some(usize::MAX), target);
+            assert_eq!(b.declined.len(), 7);
+
+            // Over the most a group may decode to: declined without a
+            // compress call, though it would compress; at the most, a page.
+            let (b, s) = run(
+                &[small(1).remove(0), vec![b'z'; 65_540], small(1).remove(0)],
+                None,
+                target,
+            );
+            assert_eq!(declined(&b), vec![(1, NoPage::Oversize)]);
+            assert_eq!(b.pages.len(), 2);
+            assert!(s.stats.calls <= 6, "{} calls", s.stats.calls);
+            let (b, _) = run(&[vec![b'z'; ZMAX_ULEN]], None, target);
+            assert!(b.declined.is_empty() && b.pages[0].1.ulen == ZMAX_ULEN);
+            let (b, _) = run(&[rng.bytes(70_000)], None, target);
+            assert_eq!(declined(&b), vec![(0, NoPage::Oversize)]);
+
+            // A group the count binds: identical images are 256 to a page
+            // in the one-group shape, whose first group needs no key;
+            // under the cut, records of one value, whose keys compress on
+            // their own in each group, and the room binds first.
+            if target == 0 {
+                let (b, _) = run(&vec![vec![0x55u8; 124]; 2000], None, 0);
+                assert!(b.pages[..b.pages.len() - 1]
+                    .iter()
+                    .all(|(_, g, _)| g.count == ZMAX_COUNT));
+                assert_eq!(b.pages.iter().map(|p| p.1.count).sum::<usize>(), 2000);
+            } else {
+                let (b, _) = run(&small(2000), None, target);
+                assert!(b.pages[..b.pages.len() - 1]
+                    .iter()
+                    .all(|(_, g, _)| g.count <= ZMAX_COUNT && g.count >= 100));
+                assert_eq!(b.pages.iter().map(|p| p.1.count).sum::<usize>(), 2000);
+            }
+
+            // Records of every length and every degree of compressibility.
+            let varied: Vec<Vec<u8>> = (0..3000)
+                .map(|_| {
+                    let len = 4 * (1 + rng.below(500));
+                    match rng.below(4) {
+                        0 => rng.bytes(len),
+                        1 => vec![0x55; len],
+                        2 => (0..len).map(|i| (i % 7) as u8).collect(),
+                        _ => {
+                            let mut v = rng.bytes(len / 4 * 2);
+                            v.resize(len, b'x');
+                            v
+                        }
+                    }
+                })
+                .collect();
+            for hint in [
+                None,
+                Some(0),
+                Some(1),
+                Some(255),
+                Some(256),
+                Some(257),
+                Some(usize::MAX),
+            ] {
+                run(&varied, hint, target);
+            }
+
+            // Things that are not images: empty, or not a multiple of four.
+            let g = small(1).remove(0);
+            let bad = vec![
+                vec![],
+                g.clone(),
+                vec![1u8; 6],
+                g.clone(),
+                g.clone(),
+                vec![],
+                vec![],
+                vec![2u8; 3],
+                g.clone(),
+                vec![],
+            ];
+            let (b, _) = run(&bad, None, target);
+            let want = [0usize, 2, 5, 6, 7, 9];
+            assert_eq!(
+                b.declined,
+                want.iter()
+                    .map(|&r| (r, NoPage::Unplaceable))
+                    .collect::<Vec<_>>()
             );
         }
-        assert_eq!(s.stats, FillStats::default(), "an end costs nothing");
-
-        // The smallest images: a header's worth, and stored.
-        let (b, _) = run(&[vec![1, 2, 3, 4]], None);
-        assert!(b.pages[0].1.stored && b.pages[0].1.count == 1);
-        let (b, _) = run(&[vec![9; 8]], Some(usize::MAX));
-        assert_eq!(b.pages.len(), 1);
-
-        // A record larger than a page that compresses is a page of one; among
-        // neighbours it is still one record, and they are pages.
-        let mut mixed = small(10);
-        mixed.push(vec![b'a'; 5000]);
-        mixed.extend(small(10));
-        let (b, _) = run(&mixed, None);
-        assert!(b.declined.is_empty());
-        assert!(b
-            .pages
-            .iter()
-            .any(|(r, g, _)| *r <= 10 && *r + g.count > 10));
-
-        // One that does not compress is read from the raw segment, and only
-        // it is.
-        let mut mixed = small(10);
-        mixed.push(rng.bytes(5000));
-        mixed.extend(small(10));
-        let (b, _) = run(&mixed, None);
-        assert_eq!(declined(&b), vec![(10, NoPage::Incompressible)]);
-
-        // A lone incompressible record that fits a page is stored, to the
-        // last word, where its LZ4 output would not.
-        for len in (4056..=4072).step_by(4) {
-            let (b, _) = run(&[rng.bytes(len)], None);
-            assert!(b.declined.is_empty(), "{len} bytes fit a page as they are");
-            let (_, g, _) = &b.pages[0];
-            assert!(g.stored && g.clen == len && g.count == 1, "{len}: {g:?}");
-        }
-        for len in [4076usize, 4080, 4084] {
-            let (b, _) = run(&[rng.bytes(len)], None);
-            assert_eq!(declined(&b), vec![(0, NoPage::Incompressible)], "{len}");
-        }
-
-        // The shrink that once reached zero: two records of 4,500
-        // incompressible bytes, and seven of 5,100. Every record alone is
-        // declined, and nothing divides by a count of none.
-        let (b, s) = run(&[rng.bytes(4500), rng.bytes(4500)], Some(2));
-        assert_eq!(
-            declined(&b),
-            vec![(0, NoPage::Incompressible), (1, NoPage::Incompressible)]
-        );
-        assert!(b.pages.is_empty());
-        assert!(s.stats.turns <= 4 * u64::from(ZFILL_TURNS));
-        let seven: Vec<Vec<u8>> = (0..7).map(|_| rng.bytes(5100)).collect();
-        let (b, _) = run(&seven, Some(7));
-        assert_eq!(b.declined.len(), 7);
-        let (b, _) = run(&seven, Some(usize::MAX));
-        assert_eq!(b.declined.len(), 7);
-
-        // Over the most a group may decode to: declined without a compress
-        // call, though it would compress; at the most, a page.
-        let (b, s) = run(
-            &[small(1).remove(0), vec![b'z'; 65_540], small(1).remove(0)],
-            None,
-        );
-        assert_eq!(declined(&b), vec![(1, NoPage::Oversize)]);
-        assert_eq!(b.pages.len(), 2);
-        assert!(s.stats.calls <= 6, "{} calls", s.stats.calls);
-        let (b, _) = run(&[vec![b'z'; ZMAX_ULEN]], None);
-        assert!(b.declined.is_empty() && b.pages[0].1.ulen == ZMAX_ULEN);
-        let (b, _) = run(&[rng.bytes(70_000)], None);
-        assert_eq!(declined(&b), vec![(0, NoPage::Oversize)]);
 
         // A group the cap binds: records of 300 identical bytes would hold
-        // many more than fit 64 KiB.
-        let (b, _) = run(&vec![vec![7u8; 300]; 600], None);
+        // many more than fit 64 KiB, in the one-group shape; under the cut
+        // the groups a page holds bind first, sixteen of six records.
+        let (b, _) = run(&vec![vec![7u8; 300]; 600], None, 0);
         assert!(b.declined.is_empty());
         let held = ZMAX_ULEN / 300;
         assert!(
@@ -3905,81 +5158,100 @@ mod tests {
             "{:?}",
             b.pages.iter().map(|p| p.1).collect::<Vec<_>>()
         );
+        let framed: Vec<Vec<u8>> = (0..600)
+            .map(|i| one_value(format!("{i:016}").as_bytes(), &[7u8; 276]))
+            .collect();
+        assert_eq!(framed[0].len(), 300);
+        let (b, _) = run(&framed, None, ZGROUP_BYTES);
+        assert!(b.declined.is_empty());
+        assert!(
+            b.pages[..b.pages.len() - 1]
+                .iter()
+                .all(|(_, g, _)| g.groups == ZMAX_GROUPS && g.count == 16 * 6),
+            "{:?}",
+            b.pages.iter().map(|p| p.1).collect::<Vec<_>>()
+        );
 
-        // A group the count binds: identical records are 256 to a page.
-        let (b, _) = run(&small(2000), None);
-        assert!(b.pages[..b.pages.len() - 1]
-            .iter()
-            .all(|(_, g, _)| g.count == ZMAX_COUNT));
-        assert_eq!(b.pages.iter().map(|p| p.1.count).sum::<usize>(), 2000);
+        // Targets of every size: under a record, between, past the cap.
+        let images = suite_images(3000, 44);
+        for target in [1usize, 100, 124, 125, 500, 4000, ZMAX_ULEN, usize::MAX] {
+            let (b, s) = run(&images, None, target);
+            assert!(b.declined.is_empty(), "target {target}");
+            let (rpp, _, _, gpp) = per_page(&s);
+            assert!(rpp >= 1.0 && gpp >= 1.0, "target {target}: {rpp} {gpp}");
+        }
+    }
 
-        // Records of every length and every degree of compressibility.
-        let varied: Vec<Vec<u8>> = (0..3000)
-            .map(|_| {
-                let len = 4 * (1 + rng.below(500));
-                match rng.below(4) {
-                    0 => rng.bytes(len),
-                    1 => vec![0x55; len],
-                    2 => (0..len).map(|i| (i % 7) as u8).collect(),
-                    _ => {
-                        let mut v = rng.bytes(len / 4 * 2);
-                        v.resize(len, b'x');
-                        v
+    #[test]
+    fn the_cut_shape_names_its_groups_and_trims_the_last_to_the_room() {
+        // Every group but a page's last holds what the target allows and no
+        // more; the last holds what the room allows; the directory names
+        // every group after the first by its first record's key; and the
+        // page's used bytes are the directory, the keys and the payloads.
+        let images = suite_images(6000, 17);
+        for target in [512usize, 1024, ZGROUP_BYTES, 4096] {
+            let mut s = FillScratch::new();
+            s.group_bytes = target;
+            let b = build_all(&images, &mut s, 3, None);
+            check_build_at(&images, &b, 3, true, target);
+            let per = target / 124;
+            let (mut full, mut trimmed) = (0usize, 0usize);
+            for (rank, g, page) in &b.pages {
+                let v = parse_page(page, 3).unwrap();
+                let mut keys_len = 0usize;
+                for j in 0..v.groups() {
+                    let ge = v.group(j).unwrap();
+                    if j + 1 < v.groups() {
+                        assert_eq!(
+                            usize::from(ge.count),
+                            per,
+                            "rank {rank} group {j}: the target's count"
+                        );
+                        full += 1;
+                    } else {
+                        assert!(usize::from(ge.count) <= per);
+                        trimmed += usize::from(usize::from(ge.count) < per);
+                    }
+                    if j > 0 {
+                        keys_len += 2 + v.key(j).unwrap().len();
                     }
                 }
-            })
-            .collect();
-        for hint in [
-            None,
-            Some(0),
-            Some(1),
-            Some(255),
-            Some(256),
-            Some(257),
-            Some(usize::MAX),
-        ] {
-            run(&varied, hint);
+                let layout = (ZHDR + ZDIR_ENTRY * v.groups() + keys_len).next_multiple_of(4) - ZHDR;
+                assert!(g.used >= layout + g.clen && g.used <= layout + g.clen + 3 * g.groups);
+                // The page is full to within a group's trim: the next record
+                // would not have fit the room, or the groups bound it.
+                assert!(
+                    g.used + 130 > ZCAP
+                        || g.groups == ZMAX_GROUPS
+                        || *rank + g.count == images.len(),
+                    "rank {rank}: {g:?} left room"
+                );
+            }
+            assert!(full > 0, "target {target}");
+            eprintln!(
+                "target {target}: {} pages, {full} full groups, {trimmed} trimmed",
+                b.pages.len()
+            );
         }
-
-        // Things that are not images: empty, or not a multiple of four.
-        let g = small(1).remove(0);
-        let bad = vec![
-            vec![],
-            g.clone(),
-            vec![1u8; 6],
-            g.clone(),
-            g.clone(),
-            vec![],
-            vec![],
-            vec![2u8; 3],
-            g.clone(),
-            vec![],
-        ];
-        let (b, _) = run(&bad, None);
-        let want = [0usize, 2, 5, 6, 7, 9];
-        assert_eq!(
-            b.declined,
-            want.iter()
-                .map(|&r| (r, NoPage::Unplaceable))
-                .collect::<Vec<_>>()
-        );
     }
 
     #[test]
     fn a_call_with_no_predecessor_builds_a_smaller_page_than_one_that_has_one() {
+        // The one-group shape: its first attempt is the hint, and a hint of
+        // nothing starts from one record.
         let images = suite_images(4000, 8);
-        let mut s = FillScratch::new();
+        let mut s = one_group();
         let mut page = [0u8; ZPAGE];
-        let Fill::Page(cold) = fill_group(&images, 2000, 0, 1, &mut s, &mut page) else {
+        let Fill::Page(cold) = fill_page(&images, 2000, 1, &mut s, &mut page) else {
             panic!()
         };
         // Chained from there, the counts climb to the steady state.
-        let (mut rank, mut hint, mut last) = (2000 + cold.count, cold.count, cold);
+        let (mut rank, mut last) = (2000 + cold.count, cold);
         for _ in 0..8 {
-            let Fill::Page(g) = fill_group(&images, rank, hint, 1, &mut s, &mut page) else {
+            let Fill::Page(g) = fill_page(&images, rank, 1, &mut s, &mut page) else {
                 panic!()
             };
-            (rank, hint, last) = (rank + g.count, g.count, g);
+            (rank, last) = (rank + g.count, g);
         }
         eprintln!(
             "a cold page holds {} records, filled {:.3}; a chained one {}, filled {:.3}",
@@ -3995,36 +5267,52 @@ mod tests {
             last.count
         );
         assert!(cold.clen < last.clen);
+        // The cut shape has no hint: its first page is its steady state.
+        let mut c = FillScratch::new();
+        let Fill::Page(first) = fill_page(&images, 2000, 1, &mut c, &mut page) else {
+            panic!()
+        };
+        let Fill::Page(next) = fill_page(&images, 2000 + first.count, 1, &mut c, &mut page) else {
+            panic!()
+        };
+        assert!(
+            first.count * 10 >= next.count * 9,
+            "{first:?} against {next:?}"
+        );
     }
 
     #[test]
     fn a_group_that_ends_exactly_at_capacity_is_a_page() {
         let mut rng = Rng::new(43);
-        let mut s = FillScratch::new();
+        let mut s = one_group();
         let bind = 3;
-        // Stored: thirty-one of 124 bytes and one of 228 make 4,072.
+        // The one-group page's room: the cap less its directory entry.
+        let room1 = ZCAP - ZDIR_ENTRY;
+        // Stored: thirty-one of 124 bytes and one of 220 make 4,064.
         let mut images: Vec<Vec<u8>> = (0..31).map(|_| rng.bytes(124)).collect();
-        images.push(rng.bytes(228));
+        images.push(rng.bytes(room1 - 31 * 124));
         for hint in [0usize, 1, 32, 100] {
             let mut page = [0u8; ZPAGE];
-            let f = fill_group(&images, 0, hint, bind, &mut s, &mut page);
+            s.hint = hint;
+            let f = fill_page(&images, 0, bind, &mut s, &mut page);
             let Fill::Page(g) = f else { panic!("{f:?}") };
             assert!(
-                g.stored && g.count == 32 && g.clen == ZCAP,
+                g.stored == 1 && g.count == 32 && g.clen == room1 && g.used == ZCAP,
                 "hint {hint}: {g:?}"
             );
         }
         // One word more is over: the last record leaves the group.
         let mut over = images.clone();
-        over[31] = rng.bytes(232);
+        over[31] = rng.bytes(room1 - 31 * 124 + 4);
         let mut page = [0u8; ZPAGE];
-        let Fill::Page(g) = fill_group(&over, 0, 32, bind, &mut s, &mut page) else {
+        s.hint = 32;
+        let Fill::Page(g) = fill_page(&over, 0, bind, &mut s, &mut page) else {
             panic!()
         };
-        assert!(g.count < 32 && g.clen <= ZCAP, "{g:?}");
+        assert!(g.count < 32 && g.used <= ZCAP, "{g:?}");
 
         // Compressed: some group of the suite's records and a tail of
-        // entropy compresses to exactly a page. Found, not assumed: the
+        // entropy compresses to exactly the room. Found, not assumed: the
         // length of the block moves with the tail by four, and by five where
         // a length byte joins, so a base may skip it.
         let mut found = None;
@@ -4037,70 +5325,83 @@ mod tests {
                     let mut group = head.clone();
                     group.extend_from_slice(&tail);
                     let c = lz4_flex::block::compress(&group).len();
-                    if c == ZCAP {
+                    if c == room1 {
                         found = Some((suite[..base].to_vec(), tail));
                         break 'search;
                     }
-                    if c > ZCAP {
+                    if c > room1 {
                         break;
                     }
                 }
             }
         }
-        let (mut images, tail) = found.expect("some group compresses to exactly a page");
+        let (mut images, tail) = found.expect("some group compresses to exactly the room");
         images.push(tail);
         let mut page = [0u8; ZPAGE];
-        let f = fill_group(&images, 0, images.len(), bind, &mut s, &mut page);
+        s.hint = images.len();
+        let f = fill_page(&images, 0, bind, &mut s, &mut page);
         let Fill::Page(g) = f else { panic!("{f:?}") };
         assert!(
-            !g.stored && g.clen == ZCAP && g.count == images.len(),
+            g.stored == 0 && g.clen == room1 && g.count == images.len(),
             "{g:?}"
         );
-        assert_eq!(parse_page(&page, bind).unwrap().0.clen as usize, ZCAP);
+        assert_eq!(
+            usize::from(parse_page(&page, bind).unwrap().header.used),
+            ZCAP
+        );
         // And one more word is over, so the group gives a record up.
         let mut longer = images.clone();
         longer.push(vec![0xA5, 0x5A, 0xA5, 0x5A]);
         let mut page2 = [0u8; ZPAGE];
-        let f = fill_group(&longer, 0, longer.len(), bind, &mut s, &mut page2);
+        s.hint = longer.len();
+        let f = fill_page(&longer, 0, bind, &mut s, &mut page2);
         let Fill::Page(g2) = f else { panic!("{f:?}") };
-        assert!(g2.clen <= ZCAP && g2.count <= images.len() + 1, "{g2:?}");
+        assert!(g2.used <= ZCAP && g2.count <= images.len() + 1, "{g2:?}");
         // Whatever was built decodes to its records.
         let b = build_all(&longer, &mut s, bind, None);
-        check_build(&longer, &b, bind, false);
+        check_build_at(&longer, &b, bind, false, 0);
     }
 
     #[test]
-    fn fill_group_is_deterministic() {
+    fn fill_page_is_deterministic() {
         let images = suite_images(5000, 2);
-        let fingerprint = |b: &Built| -> Vec<(usize, Group, u32)> {
+        let fingerprint = |b: &Built| -> Vec<(usize, Filled, u32)> {
             b.pages.iter().map(|(r, g, p)| (*r, *g, crc32(p))).collect()
         };
-        let mut fresh = FillScratch::new();
-        let a = build_all(&images, &mut fresh, 7, None);
-        let want = fingerprint(&a);
-        // Again, with a scratch the first build dirtied.
-        let b = build_all(&images, &mut fresh, 7, None);
-        assert_eq!(fingerprint(&b), want, "a reused scratch");
-        // A scratch dirtied by something else entirely: entropy, big records,
-        // records that are declined.
-        let mut rng = Rng::new(3);
-        let mut dirty = FillScratch::new();
-        let junk: Vec<Vec<u8>> = (0..400)
-            .map(|i| rng.bytes(4 * (1 + (i * 37) % 1500)))
-            .chain(std::iter::once(vec![b'q'; 70_000]))
-            .collect();
-        build_all(&junk, &mut dirty, 1, None);
-        let c = build_all(&images, &mut dirty, 7, None);
-        assert_eq!(fingerprint(&c), want, "a scratch dirtied by other records");
-        // Another thread.
-        let moved = std::thread::spawn(move || {
-            let mut s = FillScratch::new();
-            let d = build_all(&images, &mut s, 7, None);
-            fingerprint(&d)
-        })
-        .join()
-        .unwrap();
-        assert_eq!(moved, want, "another thread");
+        for target in [ZGROUP_BYTES, 0] {
+            let mut fresh = FillScratch::new();
+            fresh.group_bytes = target;
+            let a = build_all(&images, &mut fresh, 7, None);
+            let want = fingerprint(&a);
+            // Again, with a scratch the first build dirtied.
+            let b = build_all(&images, &mut fresh, 7, None);
+            assert_eq!(fingerprint(&b), want, "a reused scratch");
+            // A scratch dirtied by something else entirely: entropy, big
+            // records, records that are declined.
+            let mut rng = Rng::new(3);
+            let mut dirty = FillScratch::new();
+            dirty.group_bytes = target;
+            let junk: Vec<Vec<u8>> = (0..400)
+                .map(|i| rng.bytes(4 * (1 + (i * 37) % 1500)))
+                .chain(std::iter::once(vec![b'q'; 70_000]))
+                .collect();
+            build_all(&junk, &mut dirty, 1, None);
+            let c = build_all(&images, &mut dirty, 7, None);
+            assert_eq!(fingerprint(&c), want, "a scratch dirtied by other records");
+            // Another thread.
+            let moved = {
+                let images = images.clone();
+                std::thread::spawn(move || {
+                    let mut s = FillScratch::new();
+                    s.group_bytes = target;
+                    let d = build_all(&images, &mut s, 7, None);
+                    fingerprint(&d)
+                })
+                .join()
+                .unwrap()
+            };
+            assert_eq!(moved, want, "another thread");
+        }
         // The bind32 is in the CRC and nowhere else in the page.
         let images = suite_images(200, 2);
         let x = build_all(&images, &mut FillScratch::new(), 1, None);
@@ -4115,24 +5416,25 @@ mod tests {
     #[test]
     fn the_turns_are_spent_at_most_and_a_spent_budget_still_yields_a_page() {
         let images = suite_images(3000, 4);
-        // A hint far past what fits, and a budget of one turn: the first
-        // group is too big, the turn is spent, and the call falls back to the
-        // first record alone.
+        // The one-group shape with a hint far past what fits on every call,
+        // and a budget of one turn: the first group is too big, the turn is
+        // spent, and the call falls back to the first record alone.
         for turns in [1u32, 2, 3, 5, 8] {
-            let mut s = FillScratch::new();
+            let mut s = one_group();
             let mut rank = 0;
             let mut pages = 0;
             while rank < images.len() {
                 let mut page = [0u8; ZPAGE];
-                let f = fill_with_turns(&images, rank, 200, 8, &mut s, &mut page, turns);
+                s.hint = 200;
+                let f = fill_with_turns(&images, rank, 8, &mut s, &mut page, turns);
                 let Fill::Page(g) = f else {
                     panic!("turns {turns} rank {rank}: {f:?}")
                 };
                 // The records are the images', and the page parses.
                 let group: Vec<u8> = images[rank..rank + g.count].concat();
-                let (h, payload) = parse_page(&page, 8).unwrap();
+                let v = parse_page(&page, 8).unwrap();
                 let mut buf = GroupBuf::new();
-                assert_eq!(decode_group(&h, payload, &mut buf).unwrap(), &group[..]);
+                assert_eq!(decode_group(&v, 0, &mut buf).unwrap(), &group[..]);
                 rank += g.count;
                 pages += 1;
             }
@@ -4149,9 +5451,8 @@ mod tests {
             );
         }
         // With the production budget the fallback is not reached on any
-        // records the other tests build: the arithmetic of the turns says it
-        // cannot be.
-        let mut s = FillScratch::new();
+        // records the other tests build, under either shape: the arithmetic
+        // of the turns says it cannot be.
         let mut rng = Rng::new(55);
         let hard: Vec<Vec<u8>> = (0..800)
             .map(|_| {
@@ -4163,12 +5464,16 @@ mod tests {
                 }
             })
             .collect();
-        for hint in [0usize, 1, 7, 255, 256, usize::MAX] {
-            build_all(&hard, &mut s, 1, Some(hint));
+        for target in [0usize, ZGROUP_BYTES] {
+            let mut s = FillScratch::new();
+            s.group_bytes = target;
+            for hint in [0usize, 1, 7, 255, 256, usize::MAX] {
+                build_all(&hard, &mut s, 1, Some(hint));
+            }
+            build_all(&images, &mut s, 1, None);
+            assert_eq!(s.stats.fallbacks, 0, "target {target}");
+            assert!(s.stats.turns > 0);
         }
-        build_all(&images, &mut s, 1, None);
-        assert_eq!(s.stats.fallbacks, 0);
-        assert!(s.stats.turns > 0);
     }
 
     #[test]
@@ -4176,11 +5481,11 @@ mod tests {
         let images = suite_images(30_000, 6);
         let mut rows = Vec::new();
         for rounds in 0..=3u32 {
-            let mut s = FillScratch::new();
+            let mut s = one_group();
             s.grow_rounds = rounds;
             let b = build_from(&images, &mut s, 1, None, 60);
-            check_build(&images, &b, 1, true);
-            let (rpp, fill, calls) = per_page(&s);
+            check_build_at(&images, &b, 1, true, 0);
+            let (rpp, fill, calls, _) = per_page(&s);
             eprintln!("grow_rounds {rounds}: {rpp:.2} records a page, fill {fill:.4}, {calls:.3} calls a page");
             rows.push((rpp, fill, calls));
         }
@@ -4202,16 +5507,18 @@ mod tests {
 
     // ---- the builder's guard against a page that is wrong -----------------
 
-    /// A group of the suite's records staged and compressed as `fill_group`
-    /// leaves it at the moment it makes the page, with the scratch it is in.
+    /// A group of the suite's records staged and compressed as `fill_page`
+    /// leaves it at the moment it accepts the group, with the scratch it is
+    /// in: the compressed bytes in the output buffer, not yet accepted.
     fn fit_of(images: &[Vec<u8>], m: usize) -> (FillScratch, Fit) {
         let mut s = FillScratch::new();
+        s.reset_page();
         assert!(matches!(s.stage(images, 0, m), Stage::Ok));
         let ulen = s.imgs.len();
-        let Some(Class::Lz4(clen)) = s.classify(ulen, 0) else {
+        let Some(Class::Lz4(clen)) = s.classify(ulen, ZCAP) else {
             panic!("{m} of the suite's records compress into a page")
         };
-        let body = Body::Lz4 { buf: 0, clen };
+        let body = Body::Lz4 { clen };
         (s, Fit { m, ulen, body })
     }
 
@@ -4219,11 +5526,13 @@ mod tests {
     fn a_page_that_does_not_decode_to_its_images_is_not_returned() {
         let images = suite_images(60, 15);
         let (bind, want) = (31, images[..30].concat());
-        // The page `seal_page` makes of a fit, and what a refused one leaves:
-        // no page counted, whatever the compress calls before it cost.
+        // The page `seal_page` makes of a fit accepted, and what a refused
+        // one leaves: no page counted, whatever the compress calls before it
+        // cost.
         let seal = |s: &mut FillScratch, fit: Fit| -> Fill {
             let before = s.stats;
-            let got = seal_page(s, fit, 0, 1, bind, &mut [0u8; ZPAGE]);
+            s.accept(fit);
+            let got = seal_page(s, 0, 1, bind, &mut [0u8; ZPAGE]);
             if got == Fill::Mismatch {
                 assert_eq!(s.stats, before, "a refused page is not counted");
             }
@@ -4232,28 +5541,29 @@ mod tests {
         // The control: the group as it was compressed is a page, counted once.
         let (mut s, fit) = fit_of(&images, 30);
         let mut page = [0u8; ZPAGE];
-        let Fill::Page(g) = seal_page(&mut s, fit, 0, 1, bind, &mut page) else {
+        s.accept(fit);
+        let Fill::Page(g) = seal_page(&mut s, 0, 1, bind, &mut page) else {
             panic!("the group as compressed is a page")
         };
         assert_eq!((g.count, s.stats.pages, s.stats.records), (30, 1, 30));
-        let (h, payload) = parse_page(&page, bind).unwrap();
+        let v = parse_page(&page, bind).unwrap();
         let mut buf = GroupBuf::new();
-        assert_eq!(decode_group(&h, payload, &mut buf).unwrap(), &want[..]);
+        assert_eq!(decode_group(&v, 0, &mut buf).unwrap(), &want[..]);
 
         // The compressor's block damaged after the group was judged to fit,
         // at every byte. The CRC is computed over what was written, so the
         // page is signed either way and only the comparison can refuse it:
         // it must agree, byte by byte, with an oracle that decodes the
         // damaged block itself.
-        let Body::Lz4 { clen, .. } = fit.body else {
+        let Body::Lz4 { clen } = fit.body else {
             unreachable!()
         };
         let mut harmful = 0;
         for at in 0..clen {
             let (mut s, fit) = fit_of(&images, 30);
-            s.out[0][at] ^= 0x20;
+            s.out[at] ^= 0x20;
             let mut back = vec![0u8; fit.ulen];
-            let decoded = lz4_flex::block::decompress_into(&s.out[0][..clen], &mut back);
+            let decoded = lz4_flex::block::decompress_into(&s.out[..clen], &mut back);
             let intact = decoded.ok() == Some(fit.ulen) && back == want;
             let got = seal(&mut s, fit);
             if intact {
@@ -4274,7 +5584,7 @@ mod tests {
         s.imgs[7] ^= 1;
         assert_eq!(seal(&mut s, fit), Fill::Mismatch);
 
-        // A header whose length is not the block's, shorter and longer.
+        // A directory whose length is not the block's, shorter and longer.
         let (mut s, fit) = fit_of(&images, 30);
         let shorter = Fit {
             ulen: fit.ulen - 4,
@@ -4289,16 +5599,30 @@ mod tests {
         };
         assert_eq!(seal(&mut s, longer), Fill::Mismatch);
 
-        // A fit no header can describe, a payload over a page, is no page.
+        // A fit no page can describe, a payload over a page, is no page.
         let (mut s, fit) = fit_of(&images, 30);
         let huge = Fit {
-            body: Body::Lz4 {
-                buf: 0,
-                clen: ZCAP + 1,
-            },
+            body: Body::Lz4 { clen: ZCAP + 1 },
             ..fit
         };
         assert_eq!(seal(&mut s, huge), Fill::Mismatch);
+
+        // Two groups, the second's images changed after its compress: the
+        // page decodes group by group, and the second refuses it.
+        let (mut s, fit) = fit_of(&images, 30);
+        s.accept(fit);
+        assert!(matches!(s.stage(&images, 30, 20), Stage::Ok));
+        let ulen = s.imgs.len();
+        let Some(Class::Lz4(clen)) = s.classify(ulen, ZCAP) else {
+            panic!()
+        };
+        s.imgs[ulen - 3] ^= 1;
+        s.accept(Fit {
+            m: 20,
+            ulen,
+            body: Body::Lz4 { clen },
+        });
+        assert_eq!(seal_page(&mut s, 0, 2, bind, &mut page), Fill::Mismatch);
     }
 
     #[test]
@@ -4306,7 +5630,7 @@ mod tests {
         let images = small_groups().remove(0).0;
         let (group, bind) = (images.concat(), 5);
         let page = manual_page(&group, images.len() as u16, 9, bind, false);
-        let (hdr, _) = parse_page(&page, bind).unwrap();
+        let hdr = parse_page(&page, bind).unwrap().header;
         let mut v = GroupBuf::new();
         assert!(page_decodes_to(&page, bind, &hdr, &group, &mut v));
         // Not the group it was asked for.
@@ -4341,35 +5665,50 @@ mod tests {
         let mut torn = page;
         torn[100] ^= 1;
         assert!(!page_decodes_to(&torn, bind, &hdr, &group, &mut v));
-        // A page whose CRC is good and whose payload is not the group.
+        // A page whose CRC is good and whose payload is not the group: the
+        // payload begins after the one directory entry, at 32.
         let mut signed = page;
-        signed[ZHDR + 3] ^= 0x40;
+        signed[32 + 3] ^= 0x40;
         resign_page(&mut signed, bind);
         assert!(parse_page(&signed, bind).is_ok(), "its CRC is good");
         assert!(!page_decodes_to(&signed, bind, &hdr, &group, &mut v));
+        // A page of two groups compares group by group: the second's payload
+        // changed under a good CRC is refused.
+        let two = suite_images(20, 6);
+        let (g0, g1) = (two[..12].concat(), two[12..].concat());
+        let k1 = record_key(&two[12], 0).unwrap();
+        let page2 = manual_pages(&[(&g0, 12, false, &[]), (&g1, 8, false, k1)], 0, bind);
+        let v2 = parse_page(&page2, bind).unwrap();
+        let (hdr2, coff1) = (v2.header, usize::from(v2.group(1).unwrap().coff));
+        let both = [g0.clone(), g1.clone()].concat();
+        assert!(page_decodes_to(&page2, bind, &hdr2, &both, &mut v));
+        let mut signed2 = page2;
+        signed2[coff1 + 2] ^= 0x40;
+        resign_page(&mut signed2, bind);
+        assert!(parse_page(&signed2, bind).is_ok());
+        assert!(!page_decodes_to(&signed2, bind, &hdr2, &both, &mut v));
     }
 
     #[test]
     fn a_compressor_that_fails_fails_the_build_and_returns_no_page() {
         let images = suite_images(200, 16);
         let mut page = [0u8; ZPAGE];
-        let call =
-            |s: &mut FillScratch, page: &mut [u8; ZPAGE]| fill_group(&images, 0, 10, 1, s, page);
-        // The control: with both buffers whole, the call is a page.
-        let mut s = FillScratch::new();
-        assert!(matches!(call(&mut s, &mut page), Fill::Page(_)));
-        // The first compress of a call, into a buffer too small for the
-        // worst case, which `compress_into` refuses whatever the data is.
-        let mut s = FillScratch::new();
-        s.out[0].truncate(8);
-        assert_eq!(call(&mut s, &mut page), Fill::Mismatch);
-        assert_eq!(s.stats.pages, 0);
-        // A growth's compress: the fit is made in one buffer, the growth in
-        // the other.
-        let mut s = FillScratch::new();
-        s.out[1].truncate(8);
-        assert_eq!(call(&mut s, &mut page), Fill::Mismatch);
-        assert_eq!(s.stats.pages, 0);
+        for target in [ZGROUP_BYTES, 0] {
+            let call = |s: &mut FillScratch, page: &mut [u8; ZPAGE]| {
+                s.group_bytes = target;
+                s.hint = 10;
+                fill_page(&images, 0, 1, s, page)
+            };
+            // The control: with the buffer whole, the call is a page.
+            let mut s = FillScratch::new();
+            assert!(matches!(call(&mut s, &mut page), Fill::Page(_)));
+            // The first compress of a call, into a buffer too small for the
+            // worst case, which `compress_into` refuses whatever the data is.
+            let mut s = FillScratch::new();
+            s.out.truncate(8);
+            assert_eq!(call(&mut s, &mut page), Fill::Mismatch);
+            assert_eq!(s.stats.pages, 0);
+        }
     }
 
     // ---- a whole form file ------------------------------------------------
@@ -4402,13 +5741,13 @@ mod tests {
         // The pages, as a builder writes them, and the fence entries they make:
         // one for each page, and one for each run of records no page holds.
         let mut s = FillScratch::new();
-        let (mut rank, mut hint) = (0usize, 0usize);
+        let mut rank = 0usize;
         let (mut file, mut fence) = (Vec::new(), ZFence::new());
         let (mut pages, mut total_ulen) = (0u32, 0u64);
         let mut run: Option<usize> = None;
         while rank < n {
             let mut page = [0u8; ZPAGE];
-            match fill_group(&images, rank, hint, bind, &mut s, &mut page) {
+            match fill_page(&images, rank, bind, &mut s, &mut page) {
                 Fill::Page(g) => {
                     if let Some(at) = run.take() {
                         fence.push(at as u32, ZNOPAGE, &recs[at].0).unwrap();
@@ -4418,7 +5757,6 @@ mod tests {
                     pages += 1;
                     total_ulen += g.ulen as u64;
                     rank += g.count;
-                    hint = g.count;
                 }
                 Fill::NoPage(_) => {
                     run.get_or_insert(rank);
@@ -4516,10 +5854,12 @@ mod tests {
                     continue;
                 }
                 let at = e.page as usize * ZPAGE;
-                let (h, payload) = parse_page(&file[at..at + ZPAGE], t.bind32()).unwrap();
-                let g = decode_group(&h, payload, &mut buf).unwrap();
-                let p = group_seek(g, usize::from(h.count), &probe).unwrap();
-                let at_rank = e.first_rank as usize + p.index;
+                let v = parse_page(&file[at..at + ZPAGE], t.bind32()).unwrap();
+                let j = v.group_of_key(&probe);
+                let ge = v.group(j).unwrap();
+                let g = decode_group(&v, j, &mut buf).unwrap();
+                let p = group_seek(g, usize::from(ge.count), &probe).unwrap();
+                let at_rank = e.first_rank as usize + usize::from(ge.first) + p.index;
                 if want_found {
                     assert!(p.found && at_rank == rank, "rank {rank}");
                 } else {

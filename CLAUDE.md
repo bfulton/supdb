@@ -20,7 +20,7 @@ of the change that produced the text.
 | path | what |
 |---|---|
 | `src/db.rs` | the engine: WAL with atomic batches, memtable, sealed segments, partitioned compaction, tombstones, `Txn`, and the `SegmentWriter` every segment is written by -- `docs/engine.md` |
-| `src/db/zpages.rs` | the compact form's layout: the page, the group, the fill that packs records into pages, the fence, the trailer and the identity a form file is bound by, with no file, thread or clock in it -- the module's own docs, and `bench/examples/zsize.rs` for what it makes of the engine's bytes |
+| `src/db/zpages.rs` | the compact form's layout: the page, the directory of the groups it holds, the group, the fill that cuts records into groups and packs them into pages, the fence, the trailer and the identity a form file is bound by, with no file, thread or clock in it -- the module's own docs, and `bench/examples/zsize.rs` for what it makes of the engine's bytes |
 | `src/db/zfile.rs` | the compact form's file on the engine's side: the builder that writes a partition's form file from the partition's own bytes, the attach that binds it to its segment by content, the cell a segment holds it in, the point read, the count, the scan walk and the cursor through it, behind `Options::zpages`, and the controller's platform side, the cache budget read from the cgroup and the test's seam for it; the block cache's reads of a covered partition go through it too (`Options::zpages_block_cache`) -- the module's own docs |
 | `src/db/zselect.rs` | the compact form's selector: `ZSelect::step`, a function of its state and an explicit `Input` (no clock, thread or file), the one definition of the transitions between FITS, SUSPECT, building, COMPACT and the trial, and the replays that hold it -- the module's own docs |
 | `src/format.rs` | the on-disk format's fixed quantities, owned by no writer |
@@ -2585,6 +2585,24 @@ at 0.05. The seam prices the decode now (`ZInject::set_decode_cost`),
 as it prices a fault. A threshold a test's premise depends on is pinned
 through the seam, never left to a measurement whose profile the test
 does not choose.
+
+**A lie only the group nobody read could refute.** The form's page became
+a container of groups, each decoded on its own, the directory naming each
+group after the first by its first record's key, and the first version
+verified a group at its own first decode: the walk of a group holds every
+key of it below the next group's named key and its first key to the key
+named for it. A directory that names a group by its *second* record's key
+passes the group before (every key of it below the name) and is refused
+only when the named group is decoded, and a read of the group's true
+first record never decodes it -- the name sends the read to the group
+before, where the record is absent, and the read answers nothing with
+nothing raised. The forged-page test found it on its first run, under a
+good CRC. A page is verified whole at its first decode now, every group
+walked, and a read after decodes the one group it wants. The rule: a
+check that a claim about `B` is true, made by walking `A`, protects a
+read of `A` only; when a lie about `B` sends reads of `B` to `A`, the
+check has to run before any read of the page, not when `B` happens to be
+read.
 
 **A probe's total over a whole read is an inlining result.** The same engine
 read +0.9, +1.9, +2.9 and +3.15 instructions a point read across four probes

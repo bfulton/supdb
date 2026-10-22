@@ -295,7 +295,13 @@ priced in, and `supdb-cache64tofitautozpagespromote` is the combined arm
 with a block that reads have walked a block's worth of entries held as a
 merged copy in its slot under the form, a clean block included
 (`Options::zpages_promote_copies`), so the hot blocks are walked without
-a group decoded. The forced arm's
+a group decoded. The form's page is a container of groups, each
+compressed on its own and cut at `Options::zpages_group_bytes` of
+records, so that a point read decodes the group its record is in and not
+the page: `supdb-cache64tofitautozpagesonegroup` is the combined arm with
+the target at zero, the page as one group, the shape before the cut, and
+`supdb-cache64tofitautozpagesgroup1k` cuts at a kibibyte where the
+default cuts at two. The forced arm's
 `sync` builds the form files, so its load carries the build, and in memory
 it reads slower than the raw form: it is an arm for the bound, not a
 default.
