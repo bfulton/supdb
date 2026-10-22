@@ -16541,6 +16541,23 @@ impl Reader {
         self.scan_tick(0, t);
         let t = self.tick_start();
         let moved = self.sync_log() || self.fs().scan_keys.borrow().is_none();
+        // On the merge paths the keys created since the snapshot are filed
+        // into its side runs by the scan, from the list the log read
+        // keeps, and the log may have been read by another of this
+        // handle's operations since the last scan: a handle claimed
+        // (`publish_for_handle`) reads it to settle the forms and, with no
+        // partition to hang them on, refreshes nothing. So the scan asks
+        // whether the list has grown past what its snapshot has filed,
+        // never whether this call read the log: asked the second way, a
+        // writer whose store had no partition yet walked a snapshot short
+        // of every key created since a handle was claimed, in four seeds
+        // of the differential fuzz with the cache on in every seed.
+        let unfiled =
+            !use_cache
+                && self.fs().scan_keys.borrow().as_ref().is_some_and(|(g, s)| {
+                    *g == gen && self.fs().snap_added.borrow().len() > s.filed
+                });
+        let moved = moved || unfiled;
         self.scan_tick(1, t);
         if use_cache && moved {
             let t = self.tick_start();
