@@ -936,3 +936,75 @@ stays as the record of why. The levers left for E as the engine stands
 are the memo's size over the head (a quarter to a third of E's scan
 time is the decode of the groups the memo misses) and the merge of the
 unsealed head in the walk itself.
+
+## The block cache's forms built from the compact form
+
+The design item the refutation named is built: the block cache's reads
+of a covered partition go through its form file while the gate serves
+it (`Options::zpages_block_cache`, on; `docs/engine.md`). `BuildCtx`
+carries the handle it builds for, and every read of a partition's
+records the cache's machinery made through the door -- the clean walk
+and the walks between a form's keys (`scan_at` by rank), the cut of an
+unsealed key inside a walk (`cut_at`), the partition's own record at an
+overlay key's emit (`values_at`), the block boundaries a table's bounds
+read (`block_bounds_of`), the last key a table keeps, the key a lazy
+scan resumes from, the seek a scan starts a partition with and the
+block a written key belongs to (`owner_of`) -- asks the handle first
+(`Reader::cache_scan`, `cache_values`, `cache_cut`, `cache_seek_exact`,
+`cache_key_at`), which dispatches to the form file as the nocache paths
+do (`ZFile::scan_at`, `values_at`, `cut_in`, `seek`, and a `key_at_into`
+written for the boundary keys, which answers a record no page holds
+from its fence entry) and to the door otherwise. The raw prefetch of a
+block's records is not issued under the form. What stays raw is a
+piece's side of every join -- a piece has no form file -- and the
+segment work's joins at a landing, which have no handle. The
+understudy and the builder ahead are handles with memos of their own,
+so the upkeep thread's builds and conversions go through the form too.
+
+Held by `tests/zpages.rs`: the no-raw-touch test's phases (drained,
+unsealed keys inside the windows, over a piece, after the merge, beside
+a record no page holds) run with the cache on and count zero, with two
+positive controls -- the option off counts touches, and the gate set to
+the raw form with the cells kept (the trial's shape) counts touches
+while the gate back at the form counts none; the windows test counts
+the block path's walks through the form (one a run between cuts). The
+first cache-on run found one touch: the last key a table keeps was the
+record no page holds, read raw by `key_at`, where the seek had always
+answered such a record from its fence entry; `key_at_into` answers it
+from the fence now. The differential fuzz with the form forced and the
+cache on in every seed (`ZFUZZ_ZPAGES=1 ZFUZZ_CACHE=all`) read sixteen
+seeds clean, and a second range with the options varied was killed by
+my own cleanup -- `rm -rf /tmp/supdb-next-*` issued before the chain
+with the fuzz still running in `/tmp`, the exact failure `CLAUDE.md`
+names, `seal create: No such file or directory` -- and is run again in
+a `TMPDIR` of its own.
+
+The arm for the shape before it is `supdb-cache64tofitautozpagesraw`
+(the cache's reads through the door under the controller's form), so
+the change is priced in one process: `zcache-all.sh` runs the three
+pairings at five million keys under 640 MiB without the shuffled load,
+both orders -- the combined arm against the controller's nocache arm
+(`zcache-e5m-ab-*`: E), against LMDB with its readahead off
+(`zcache-lmdb5m-ab-*`: whether E is won), and against the raw-reads
+arm (`zcache-raw5m-ab-*`: what the change moved).
+
+The fuzz run in its own `TMPDIR` found four seeds of forty-eight
+(26, 31, 48, 53) whose scans disagreed with the model, each with the
+cache on and no partition in the store, and the same four fail on the
+base commit (133a237) with the cache alone and no form file, in a
+worktree built from it: pre-existing, and not the block cache's reads
+through the form. A probe stamping each log read with its caller named
+it: the check's `z.reader()` claims a handle, which reads the writer's
+log for the forms (`publish_for_handle`) and, with no partition to hang
+them on, refreshes nothing; the writer's next scan on the merge path
+found the log read already (`moved` false), returned from the refresh
+before filing the keys created since into the snapshot's side runs, and
+walked a snapshot short of them -- 106 keys in seed 26. The scan asks
+whether the list has grown past what the snapshot has filed now, and a
+test in `tests/db.rs` builds the shape with a memtable alone and with
+pieces (the direct runs off, since ascending keys from an empty store
+open a run whose close at a lower key is a freeze, and a freeze rebuilds
+the snapshot and hides the case): red with the fix off, green with it
+on, and the four seeds, sixty-four seeds in two configurations and the
+concurrent range clean under it. The fix goes in after the chain that
+gates the block cache change, as a commit of its own.

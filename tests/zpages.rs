@@ -2236,8 +2236,40 @@ fn scans_over_a_piece_agree_with_the_model_over_every_window_of_a_covered_store(
 /// read of it is the raw form's by design, and the counter moves.
 #[test]
 fn the_compact_form_touches_no_raw_page() {
-    let counts = cfg!(debug_assertions);
-    let dir = scratch("rawtouches");
+    no_raw_touches("rawtouches", false, true);
+}
+
+/// The same reads with the block cache on: the forms the walks build over
+/// the unsealed keys, the walks between a form's keys and over the clean
+/// blocks, the cuts, the block boundaries and the owners of the written
+/// keys go through the form file (`Options::zpages_block_cache`), on the
+/// writer, a handle and the upkeep thread's understudy, and the raw form
+/// is touched by none of them.
+#[test]
+fn the_block_cache_under_the_compact_form_touches_no_raw_page() {
+    no_raw_touches("rawtouches-cache", true, true);
+}
+
+/// The positive control for the option: with the cache's reads of a
+/// partition sent through the door (`Options::zpages_block_cache` off),
+/// the same reads touch the raw form -- the shape that dragged the raw
+/// records through the page cache beside the form under a bound.
+#[test]
+fn the_block_cache_with_its_reads_raw_touches_the_raw_form() {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let touched = no_raw_touches("rawtouches-cacheraw", true, false);
+    assert!(touched > 0, "the cache's reads through the door: {touched}");
+}
+
+/// The body of the three tests above: the store, its phases and the reads
+/// under each, counted on the writer and a handle. With `via_form` the
+/// count is held to zero; without it the touches are summed and returned.
+fn no_raw_touches(name: &str, cache: bool, via_form: bool) -> u64 {
+    let counts = cfg!(debug_assertions) && via_form;
+    let touched = std::cell::Cell::new(0u64);
+    let dir = scratch(name);
     // Every run inline: a run the appends grow past the inline bound goes
     // to a block, and a partition with one is declined, which is the raw
     // form's by design and another test's.
@@ -2246,6 +2278,8 @@ fn the_compact_form_touches_no_raw_page() {
         forced(|o| {
             o.partition_bytes = Some(160 << 10);
             o.inline_bytes = 1 << 16;
+            o.scan_block_cache = cache;
+            o.zpages_block_cache = via_form;
         }),
     )
     .unwrap();
@@ -2287,8 +2321,13 @@ fn the_compact_form_touches_no_raw_page() {
                 "{what}: {} touches of the raw form",
                 after - before
             );
+            touched.set(touched.get() + (after - before));
         }
     };
+    // Every landing in flight joined before a count begins: the landing's
+    // own passes -- a piece's ranks and bounds against its partition -- are
+    // the segment work's and read the raw form on purpose.
+    db.settle().unwrap();
     held(&db, &model, "drained");
     // Unsealed keys inside the windows: an insert between records, an
     // append to a record, a delete.
@@ -2315,9 +2354,42 @@ fn the_compact_form_touches_no_raw_page() {
     }
     db.commit().unwrap();
     held(&db, &model, "with unsealed keys");
+    // The gate's say over the cache's reads: at the raw form, as the
+    // controller's trial reads with the cells kept, the cache reads the
+    // partition through the door; back at the form it does not. A handle
+    // of its own, so the forms it builds under the raw gate are its own
+    // to walk again under the form's.
+    if cache && counts {
+        let r = db.reader().unwrap();
+        db.zgate_set(0);
+        let before = r.raw_touches();
+        same_window(
+            &scanned(&r, b"", 300),
+            &window(&model, b"", 300),
+            "under the raw gate",
+        );
+        assert!(
+            r.raw_touches() > before,
+            "under the raw gate the cache read the form"
+        );
+        db.zgate_set(2);
+        let before = r.raw_touches();
+        same_window(
+            &scanned(&r, b"", 300),
+            &window(&model, b"", 300),
+            "under the form's gate",
+        );
+        check(&r, &model, &keys[..200], "under the form's gate");
+        assert_eq!(
+            r.raw_touches(),
+            before,
+            "under the form's gate the cache read the raw form"
+        );
+    }
     // The same keys sealed into a piece: the merge path.
     db.seal().unwrap();
     db.zpages_settle().unwrap();
+    db.settle().unwrap();
     assert!(db.levels().1 >= 1, "a piece landed: {:?}", db.levels());
     for i in 0..100 {
         let k = keys[rng.below(keys.len())].clone();
@@ -2336,6 +2408,7 @@ fn the_compact_form_touches_no_raw_page() {
     // the segment work's, and the reads after it are the new form files'.
     db.flush().unwrap();
     db.zpages_settle().unwrap();
+    db.settle().unwrap();
     // A deleted key is a key until the merge drops its tombstone with
     // nothing older left to mask: a scan's limit counted it before and
     // does not after, and the model follows.
@@ -2345,12 +2418,22 @@ fn the_compact_form_touches_no_raw_page() {
     assert_eq!(c.form_files, c.partitions, "{c:?}");
     held(&db, &model, "after the merge");
     let _ = std::fs::remove_dir_all(&dir);
+    if !via_form {
+        return touched.get();
+    }
 
     // A record no page holds among keys of every length: the keys beside
     // it are answered from the fence, and the record itself is the raw
     // form's, which is what the counter is for.
-    let dir = scratch("rawtouches-nopage");
-    let mut db = Db::create(&dir, forced(|o| o.inline_bytes = 1 << 17)).unwrap();
+    let dir = scratch(&format!("{name}-nopage"));
+    let mut db = Db::create(
+        &dir,
+        forced(|o| {
+            o.inline_bytes = 1 << 17;
+            o.scan_block_cache = cache;
+        }),
+    )
+    .unwrap();
     let mut model = Model::new();
     let mut put = |db: &mut Db, k: Vec<u8>, v: Vec<u8>| {
         db.append(&k, &v);
@@ -2408,6 +2491,7 @@ fn the_compact_form_touches_no_raw_page() {
         );
     }
     let _ = std::fs::remove_dir_all(&dir);
+    0
 }
 
 /// The memo of decoded groups (`Options::zpages_memo`): over one
@@ -2690,8 +2774,11 @@ fn windows_over(name: &str, cache: bool) {
     // the fence keys, a byte either side of them, and at the edges, and end
     // after the counts a page and a block make interesting. Without the
     // block cache the walks are the form files'; with it they are the block
-    // path's own, raw and not counted either way until the third piece of
-    // stage 3 decides its sites.
+    // path's, whose forms are built from the form file and whose walks
+    // between a form's keys go through it (`Options::zpages_block_cache`),
+    // each run between two cuts a walk of its own, and the raw form is
+    // touched by neither.
+    let counts = cfg!(debug_assertions);
     let dir = scratch(name);
     let mut db = Db::create(
         &dir,
@@ -2758,6 +2845,7 @@ fn windows_over(name: &str, cache: bool) {
     let limits = [1usize, 2, 3, 5, 17, 56, 57, 58, 114, usize::MAX];
     let latest = db.reader().unwrap();
     let before = db.zpage_counts();
+    let touches = (db.raw_touches(), latest.raw_touches());
     let mut windows = 0u64;
     for start in &starts {
         for &limit in &limits {
@@ -2773,6 +2861,12 @@ fn windows_over(name: &str, cache: bool) {
             windows += 1;
         }
     }
+    assert!(
+        !counts || (db.raw_touches(), latest.raw_touches()) == touches,
+        "the windows touched the raw form: {} on the writer, {} on the handle",
+        db.raw_touches() - touches.0,
+        latest.raw_touches() - touches.1
+    );
     // A snapshot keeps the answers it was taken at, whatever the writer does
     // after. Not with the block cache on: a handle holding a snapshot read a
     // post-snapshot write of a key that was unsealed already, in a scan, in
@@ -2810,16 +2904,11 @@ fn windows_over(name: &str, cache: bool) {
     }
     check(&db, &model, &keys, "after the windows");
     let after = db.zpage_counts();
-    if cache {
-        assert_eq!(
-            (after.scans, after.raw_scans),
-            (before.scans, before.raw_scans),
-            "the block path's walks: {after:?}"
-        );
-    } else {
-        assert!(after.scans - before.scans >= windows, "{after:?}");
-        assert_eq!(after.raw_scans, before.raw_scans, "{after:?}");
-    }
+    // Through the block path a window is as many walks as it has runs
+    // between cuts, so the count is at least the windows'; through the
+    // merge path exactly one walk a partition a window starts in.
+    assert!(after.scans - before.scans >= windows, "{after:?}");
+    assert_eq!(after.raw_scans, before.raw_scans, "{after:?}");
     assert_eq!(after.fallbacks + after.rejected_damage, 0, "{after:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }

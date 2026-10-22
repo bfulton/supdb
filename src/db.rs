@@ -892,6 +892,24 @@ pub struct Options {
     /// scan's time. `supdb-nocachezpagesrankwalk` is that arm.
     #[doc(hidden)]
     pub zpages_walk_cursor: bool,
+    /// The block cache's reads of a covered partition through its form file
+    /// while the gate serves the form: a block's merged form is built from
+    /// the form file's records, the walks between a form's keys and over a
+    /// clean block go through it, and a block's boundary keys, the cuts of
+    /// the unsealed keys and the block a written key belongs to are
+    /// answered by its fence and one group (`Reader::cache_scan`,
+    /// `cache_values`, `cache_cut`, `cache_seek_exact`, `cache_key_at`),
+    /// so that with the cache on no path of the store touches the raw
+    /// records under the bound but a piece's side of a join and a record
+    /// no page holds. Off, the cache's machinery reads the raw records
+    /// through the door whatever the gate says: its scans dragged the raw
+    /// records through the page cache and evicted the form the point reads
+    /// needed, 0.21 faults a read in the C mix against 0.001 under the
+    /// controller's arm without the cache (`docs/engine.md`), which is why
+    /// a second form may sit beside the records only when the other paths
+    /// never touch them. `supdb-cache64tofitautozpagesraw` is that arm.
+    #[doc(hidden)]
+    pub zpages_block_cache: bool,
     /// Whether the form's own threads -- the build, the warm and the
     /// sampler -- take the device at the idle I/O class, served only when
     /// nothing else is waiting on it; off, they read at the class the
@@ -2364,6 +2382,7 @@ impl Default for Options {
             zpages_seek_ord: false,
             zpages_scan_prefetch: false,
             zpages_walk_cursor: true,
+            zpages_block_cache: true,
             zpages_io_idle: true,
             zpages_build_ahead: 4 << 20,
             zpages_build_eager: false,
@@ -3197,10 +3216,13 @@ fn z_retire_cell(shared: &Shared, dir: &Path, seg: &Seg) -> Option<PathBuf> {
 /// (none, out of service, a check failed, a record no page holds) falls to;
 /// the `cursor_merge` arm, which walks every segment raw; the pieces'
 /// cursors and the tombstone pre-pass over them, since a piece has no
-/// form file; the block cache's machinery (`BuildCtx`, `scan_blocks`,
-/// `make_table`, `install_ahead`, `patch_block`, the prefetch), which
-/// builds its forms from the records and which the nocache arms never run;
-/// and the segment work's own passes at a landing, a promotion or the open
+/// form file; the raw side of the block cache's reads of a partition
+/// (`Reader::cache_scan`, `cache_values`, `cache_cut`, `cache_seek_exact`,
+/// `cache_key_at`), which the form file's dispatch serves under
+/// `Options::zpages_block_cache` and the door serves with it off, and the
+/// piece's side of every join the cache makes (`table_bounds`, `ranks_over`,
+/// `patch_block`'s piece reads); and the segment work's own passes at a
+/// landing, a promotion or the open
 /// (a piece's ranks and bounds against its partition, `same_blocks` one key
 /// a block of the partition a merge retires, a segment's first or last key,
 /// the recovery's walk of a pending segment). Under debug assertions a
@@ -10778,14 +10800,19 @@ fn prefetch_form(form: &Cached) {
 /// the ranks (`Options::seek_prefetch_dir`), since the read is a load
 /// the hint waits for before it can issue.
 fn prefetch_block(
-    blob: &Blob<MmapBytes>,
+    blob: Option<&Blob<MmapBytes>>,
     form: &Cached,
     from: usize,
     n: usize,
     cap: usize,
     estimate: bool,
 ) {
-    let ranks = |blob: &Blob<MmapBytes>| {
+    // The partition's records are asked for only where the walk will read
+    // them raw: under the form file the walk's pages are the form's, which
+    // asks for them itself (`ZFile::ask_ahead`), and the directory read the
+    // span needs is a touch of the raw index.
+    let ranks = || {
+        let Some(blob) = blob else { return };
         if estimate {
             blob.prefetch_ranks_est(from, n, cap);
         } else {
@@ -10796,9 +10823,9 @@ fn prefetch_block(
         Cached::Block(blk) => blk.prefetch(),
         Cached::Sparse(sb) => {
             sb.prefetch();
-            ranks(blob);
+            ranks();
         }
-        Cached::Clean => ranks(blob),
+        Cached::Clean => ranks(),
         Cached::Wide(_) => {}
     }
 }
@@ -11238,28 +11265,34 @@ impl BlockTable {
     /// the bases' beside them: `overlay_count` reads them all, and a
     /// block over a base's keys alone counted none and was taken for
     /// clean.
-    fn snap_at(&self, seg: &Seg, unsealed: &Snapshot) -> Result<&SnapBounds> {
+    fn snap_at(&self, rd: &Reader, seg: &Seg, unsealed: &Snapshot) -> Result<&SnapBounds> {
         if let Some(at) = self.snap_at.get() {
             return Ok(at);
         }
         for i in 0..unsealed.bases.len() {
-            self.fsnap_at(i, seg, unsealed)?;
+            self.fsnap_at(rd, i, seg, unsealed)?;
         }
-        let at = BuildCtx::snap_bounds(seg, self.slots.len(), unsealed)?;
+        let at = BuildCtx::snap_bounds(rd, seg, self.slots.len(), unsealed)?;
         let _ = self.snap_at.set(at);
         Ok(self.snap_at.get().expect("just set"))
     }
 
     /// Base `i`'s bounds, from the base's own cache or walked now, or
     /// none past the snapshot's bases.
-    fn fsnap_at(&self, i: usize, seg: &Seg, unsealed: &Snapshot) -> Result<Option<&SnapBounds>> {
+    fn fsnap_at(
+        &self,
+        rd: &Reader,
+        i: usize,
+        seg: &Seg,
+        unsealed: &Snapshot,
+    ) -> Result<Option<&SnapBounds>> {
         let Some(base) = unsealed.bases.get(i) else {
             return Ok(None);
         };
         if let Some(at) = self.fsnap_at[i].get() {
             return Ok(Some(at));
         }
-        let at = BuildCtx::snap_bounds(seg, self.slots.len(), base)?;
+        let at = BuildCtx::snap_bounds(rd, seg, self.slots.len(), base)?;
         let _ = self.fsnap_at[i].set(at);
         Ok(self.fsnap_at[i].get().map(|a| &**a))
     }
@@ -11307,6 +11340,7 @@ fn block_bounds_of(
     len: usize,
     seek: impl Fn(&[u8]) -> usize,
     advance: impl Fn(usize, &[u8]) -> usize,
+    key_at: impl Fn(usize, &mut Vec<u8>) -> bool,
 ) -> Result<Vec<u32>> {
     let mut at = Vec::with_capacity(nblocks + 1);
     let mut i = if seg.lo.is_empty() { 0 } else { seek(&seg.lo) };
@@ -11323,17 +11357,14 @@ fn block_bounds_of(
         if i < len {
             let rank = b * CACHE_BLOCK;
             // The boundary key from the ordered index's top level where a
-            // head is a whole key, and from the record where it is not:
+            // head is a whole key, and from the record where it is not --
+            // the caller's `key_at`, the form file's or the raw form's:
             // the record is a cold line per block for every source the
             // table maps, the top level is in memory.
-            let bound = match seg.ord.whole_key_at(rank, &mut kbuf) {
-                Some(k) => k,
-                None => seg
-                    .raw()
-                    .key_at(rank)
-                    .ok_or_else(|| err("block cache: a rank did not resolve"))?,
-            };
-            i = advance(i, bound).min(len);
+            if seg.ord.whole_key_at(rank, &mut kbuf).is_none() && !key_at(rank, &mut kbuf) {
+                return Err(err("block cache: a rank did not resolve"));
+            }
+            i = advance(i, &kbuf).min(len);
         }
         at.push(i as u32);
     }
@@ -15873,6 +15904,150 @@ impl Reader {
         }
     }
 
+    /// The form file a block-cache read of `seg` goes through: the cell's,
+    /// in service, while the gate serves the form and the cache reads it
+    /// (`Options::zpages_block_cache`); none, and the read is the raw form's
+    /// through the door. One relaxed load of the gate's word and a look at
+    /// the cell, asked at each read as every dispatch asks.
+    #[inline]
+    fn zc<'a>(&self, seg: &'a Seg) -> Option<&'a zfile::ZFile> {
+        if !self.opts.zpages_block_cache || !self.z_on() {
+            return None;
+        }
+        seg.z.get().filter(|z| !z.damaged())
+    }
+
+    /// `Blob::scan_at` for the block cache: the `n` records from `rank`
+    /// handed to `f`, through the form file where `zc` says so
+    /// (`part_scan_z`, each run between two cuts a walk of its own and
+    /// counted as one) and through the door otherwise. A run that stops
+    /// short of `n` is the raw form's own damage, named as the raw walk
+    /// names it, so a caller asks for what the partition has.
+    fn cache_scan<F: FnMut(&[u8], &[u8])>(
+        &self,
+        seg: &Seg,
+        rank: usize,
+        n: usize,
+        f: &mut F,
+    ) -> Result<usize> {
+        let got = if self.zc(seg).is_some() {
+            self.part_scan_z(seg, rank, n, f)?
+        } else {
+            seg.raw()
+                .scan_at(rank, n, &mut *f)
+                .map_err(|e| err(&format!("segment scan: {e}")))?
+        };
+        if got < n {
+            return Err(err(
+                "segment scan: a partition's walk stopped short of its key count",
+            ));
+        }
+        Ok(got)
+    }
+
+    /// `Blob::values_at` for the block cache: the values of the record at
+    /// `rank`, through the form file where `zc` says so (`part_values_z`)
+    /// and through the door otherwise.
+    fn cache_values<F: FnMut(&[u8])>(&self, seg: &Seg, rank: usize, f: &mut F) -> Result<u64> {
+        if self.zc(seg).is_some() {
+            self.part_values_z(seg, rank, f)
+        } else {
+            seg.raw()
+                .values_at(rank, &mut *f)
+                .map_err(|e| err(&format!("block cache read: {e}")))
+        }
+    }
+
+    /// `BuildCtx::cut_at` for the block cache: the first rank in
+    /// `rank..end` whose key is not below `key`, or `end`, with how that
+    /// rank's key compares to `key`; through the form file's fence and one
+    /// group where `zc` says so (`part_cut_z`), over the ordered index's
+    /// heads and the raw records otherwise.
+    fn cache_cut(&self, seg: &Seg, rank: usize, end: usize, key: &[u8]) -> (usize, Ordering) {
+        if self.zc(seg).is_some() {
+            self.part_cut_z(seg, rank, end, key)
+        } else {
+            BuildCtx::cut_at(seg, rank, end, key)
+        }
+    }
+
+    /// `OrdIndex::seek_exact` for the block cache: the rank of the first
+    /// key at or after `key`, the key count past every key, and whether
+    /// the key there is `key`. Through the form file's fence and one group
+    /// where `zc` says so (`ZFile::seek`, a group decoded counted on this
+    /// handle's line, a check that failed a fallback to the heads), the
+    /// heads and the raw records otherwise. The fence seek answers for the
+    /// whole partition and takes no floor; `floor` is the heads' gallop
+    /// hint, the rank the key before this one resolved to
+    /// (`OrdIndex::seek_exact_from`).
+    fn cache_seek_exact(&self, seg: &Seg, key: &[u8], floor: usize) -> (usize, bool) {
+        let keys = seg.blob.keys();
+        if let Some(z) = self.zc(seg) {
+            let r = z.seek(&self.zmemo, key);
+            self.zmemo_take();
+            match r {
+                zfile::ZSeek::Served { rank, at, decoded } => {
+                    if decoded {
+                        self.zbump(|s| &s.zscangroups);
+                    }
+                    let rank = rank.min(keys);
+                    return (rank, rank < keys && at == Ordering::Equal);
+                }
+                zfile::ZSeek::Fallback => self.zbump(|s| &s.zfallbacks),
+                zfile::ZSeek::Out | zfile::ZSeek::NoPage => {}
+            }
+        }
+        let (rank, exact) = seg.ord.seek_exact_from(floor, key, |r| seg.raw().key_at(r));
+        let same = rank < keys && exact.unwrap_or_else(|| seg.raw().key_at(rank) == Some(key));
+        (rank, same)
+    }
+
+    /// The block whose key range holds `key`, and the key's cut as the
+    /// forms carry it (`BuildCtx::cut_known`), by `cache_seek_exact`. Over
+    /// the raw form whether the key at the rank is `key` comes from the
+    /// heads where they can say, as it does at a scan's start: asked of
+    /// the record, it was a cold line in the record region for every write
+    /// a settle filed, and the record parse was the largest leaf of the
+    /// settle's samples after the lag burst at three hundred thousand keys;
+    /// and a batch resolved in key order hands each key the rank the key
+    /// before it reached as `floor`, so the heads' seek gallops from one
+    /// answer to the next over warm heads.
+    fn cache_owner_of(&self, seg: &Seg, key: &[u8], floor: usize) -> (usize, u32) {
+        let (rank, same) = self.cache_seek_exact(seg, key, floor);
+        let owner = if same { rank } else { rank.saturating_sub(1) };
+        (owner / CACHE_BLOCK, ((rank as u32) << 1) | same as u32)
+    }
+
+    /// `Blob::key_at` for the block cache, the key copied into `out`:
+    /// whether the rank holds one. Through the form file where `zc` says
+    /// so (`ZFile::key_at_into`, counted as a walk's parts are) and through
+    /// the door otherwise.
+    fn cache_key_at(&self, seg: &Seg, rank: usize, out: &mut Vec<u8>) -> bool {
+        if let Some(z) = self.zc(seg) {
+            let r = z.key_at_into(&self.zmemo, rank, out);
+            self.zmemo_take();
+            match r {
+                zfile::ZRead::Served { n, decoded } => {
+                    if decoded {
+                        self.zbump(|s| &s.zscangroups);
+                    }
+                    return n > 0;
+                }
+                zfile::ZRead::Fallback => self.zbump(|s| &s.zfallbacks),
+                zfile::ZRead::NoPage => self.zbump(|s| &s.znopagescans),
+                zfile::ZRead::Out => {}
+            }
+        }
+        match seg.raw().key_at(rank) {
+            Some(k) => {
+                out.clear();
+                out.extend_from_slice(k);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// `scan_merged`'s walk of `seg` from `rank`: through the form file
     /// where the cell holds one in service, the raw form's otherwise.
     fn pwalk_at<'a>(&'a self, seg: &'a Seg, rank: usize) -> PWalk<'a> {
@@ -17058,7 +17233,7 @@ impl Reader {
                         .collect();
                     for slot in filed {
                         let key = st.mem.key_of(st.mem.entry(slot as usize));
-                        let (b, cut) = BuildCtx::owner_of(seg, key);
+                        let (b, cut) = self.cache_owner_of(seg, key, 0);
                         if let Some(list) = t.added.get_mut(b) {
                             list.push((slot, cut));
                         }
@@ -17237,7 +17412,7 @@ impl Reader {
             if table.snap_gen != self.fs().snap_gen.get() {
                 table.resnap(seg, unsealed, self.fs().snap_gen.get());
             }
-            table.snap_at(seg, unsealed)?;
+            table.snap_at(self, seg, unsealed)?;
             for (b, bytes, form) in built.forms {
                 let b = b as usize;
                 if b >= table.slots.len() || BuildCtx::overlay_count(table, b) > WIDE {
@@ -17285,19 +17460,23 @@ impl Reader {
                 if past_all {
                     continue;
                 }
-                let lo = if b == 0 {
+                let (mut lob, mut hib) = (Vec::new(), Vec::new());
+                let lo: Option<&[u8]> = if b == 0 {
                     (!seg.lo.is_empty()).then_some(seg.lo.as_slice())
+                } else if self.cache_key_at(seg, b * CACHE_BLOCK, &mut lob) {
+                    Some(&lob)
                 } else {
-                    seg.raw().key_at(b * CACHE_BLOCK)
+                    None
                 };
-                let hi = seg
-                    .raw()
-                    .key_at((b + 1) * CACHE_BLOCK)
-                    .or(seg.hi.as_deref());
+                let hi: Option<&[u8]> = if self.cache_key_at(seg, (b + 1) * CACHE_BLOCK, &mut hib) {
+                    Some(&hib)
+                } else {
+                    seg.hi.as_deref()
+                };
                 if since.meets(lo, hi) {
                     for i in since.range(lo, hi) {
                         let k = since.at(i);
-                        let cut = BuildCtx::owner_of(seg, k).1;
+                        let cut = self.cache_owner_of(seg, k, 0).1;
                         // The list carries keys and not slots, so this
                         // path probes for the one the settle carries.
                         let slot = self
@@ -17892,7 +18071,7 @@ impl Reader {
         let at = self.segs()[..np]
             .partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
         let seg = self.segs()[..np].get(at)?;
-        let (b, _) = BuildCtx::owner_of(seg, key);
+        let (b, _) = self.cache_owner_of(seg, key, 0);
         let tables = self.fs().tables.borrow();
         let held = tables.get(at)?.borrow();
         let t = held.as_ref()?;
@@ -18005,6 +18184,7 @@ impl Reader {
     /// PROTOTYPE: the build context over this store's own state.
     fn build_ctx(&self) -> BuildCtx<'_> {
         BuildCtx {
+            rd: self,
             wm: self.wm(),
             segs: self.segs(),
             mem: self.mem(),
@@ -18615,7 +18795,7 @@ impl Reader {
             if table.clean_throughout() {
                 continue;
             }
-            table.snap_at(seg, unsealed)?;
+            table.snap_at(self, seg, unsealed)?;
             let src = Sources { seg, l0 };
             let ctx = BuildCtx {
                 copy_dense: true,
@@ -19050,7 +19230,7 @@ impl Reader {
             let Some(seg) = self.segs()[..np].get(at) else {
                 continue;
             };
-            let (b, cut) = BuildCtx::owner_of_from(seg, key, floor);
+            let (b, cut) = self.cache_owner_of(seg, key, floor);
             floor = (cut >> 1) as usize;
             resolved.push((at as u32, b as u32, cut, off, len, new, slot));
         }
@@ -19616,7 +19796,7 @@ impl Reader {
             let (c, at_eq) = if cut != u32::MAX {
                 BuildCtx::cut_known(cut, lo, hi)
             } else {
-                BuildCtx::cut_at(seg, lo, hi, key)
+                self.cache_cut(seg, lo, hi, key)
             };
             let same = c < hi && at_eq == Ordering::Equal;
             run.clear();
@@ -19645,12 +19825,10 @@ impl Reader {
                 match had {
                     Some(bytes) => run.extend_from_slice(bytes),
                     None if same => {
-                        seg.raw()
-                            .values_at(c, |v| {
-                                run.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                                run.extend_from_slice(v);
-                            })
-                            .map_err(read)?;
+                        self.cache_values(seg, c, &mut |v| {
+                            run.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                            run.extend_from_slice(v);
+                        })?;
                     }
                     None => {}
                 }
@@ -19715,7 +19893,7 @@ impl Reader {
             if seg.below_lo(key) || seg.hi.as_ref().is_some_and(|h| key >= h.as_slice()) {
                 continue;
             }
-            let (b, cut) = BuildCtx::owner_of(seg, key);
+            let (b, cut) = self.cache_owner_of(seg, key, 0);
             added[b].push((slot, cut));
         }
         let filed = added.iter().map(Vec::len).sum();
@@ -19725,12 +19903,13 @@ impl Reader {
             reads: vec![0; nblocks],
             touched: vec![0; nblocks],
             listed: vec![u32::MAX; nblocks],
-            last_key: seg
-                .blob
-                .keys()
-                .checked_sub(1)
-                .and_then(|r| seg.raw().key_at(r))
-                .map_or_else(Vec::new, <[u8]>::to_vec),
+            last_key: {
+                let mut k = Vec::new();
+                match seg.blob.keys().checked_sub(1) {
+                    Some(r) if self.cache_key_at(seg, r, &mut k) => k,
+                    _ => Vec::new(),
+                }
+            },
             pieces,
             piece_ranks,
             snap_at: std::cell::OnceCell::new(),
@@ -19883,19 +20062,27 @@ impl Reader {
             // the seek answers rank zero, the table's one block is
             // walked as the overlay alone.
             let keys = seg.blob.keys();
-            let (rank, exact) = seg.ord.seek_exact_hint(
-                cursor,
-                |r| seg.raw().key_at(r),
-                |lo, hi| {
-                    if self.opts.scan_prefetch && self.opts.seek_prefetch_dir {
-                        seg.raw().prefetch_dir(lo, hi - lo + 1);
-                        let fs = self.fs();
-                        fs.dir_prefetches.set(fs.dir_prefetches.get() + 1);
-                    }
-                },
-            );
-            let same =
-                rank < keys && exact.unwrap_or_else(|| seg.raw().key_at(rank) == Some(cursor));
+            // The seek through the form file's fence and one group where
+            // the handle reads it (`cache_seek_exact`); the heads' with
+            // the directory's lines asked for ahead otherwise.
+            let (rank, same) = if self.zc(seg).is_some() {
+                self.cache_seek_exact(seg, cursor, 0)
+            } else {
+                let (rank, exact) = seg.ord.seek_exact_hint(
+                    cursor,
+                    |r| seg.raw().key_at(r),
+                    |lo, hi| {
+                        if self.opts.scan_prefetch && self.opts.seek_prefetch_dir {
+                            seg.raw().prefetch_dir(lo, hi - lo + 1);
+                            let fs = self.fs();
+                            fs.dir_prefetches.set(fs.dir_prefetches.get() + 1);
+                        }
+                    },
+                );
+                let same =
+                    rank < keys && exact.unwrap_or_else(|| seg.raw().key_at(rank) == Some(cursor));
+                (rank, same)
+            };
             let owner = if same { rank } else { rank.saturating_sub(1) };
             let nblocks = seg.blocks();
             let tables = self.fs().tables.borrow();
@@ -19927,16 +20114,7 @@ impl Reader {
                 // tenth slower, in first touches and bookkeeping.
                 if rank < keys {
                     let want = (keys - rank).min(limit - seen);
-                    let got = seg
-                        .raw()
-                        .scan_at(rank, want, &mut *f)
-                        .map_err(|e| err(&format!("segment scan: {e}")))?;
-                    if got < want {
-                        return Err(err(
-                            "segment scan: a partition's walk stopped short of its key count",
-                        ));
-                    }
-                    seen += got;
+                    seen += self.cache_scan(seg, rank, want, &mut *f)?;
                 }
                 match &seg.hi {
                     Some(h) => {
@@ -19986,12 +20164,13 @@ impl Reader {
                     Some(u) => u,
                     None if wants_snapshot => {
                         self.count_takes(takes);
+                        let mut kbuf = Vec::new();
                         let from: &[u8] = if first {
                             cursor
+                        } else if self.cache_key_at(seg, lo, &mut kbuf) {
+                            &kbuf
                         } else {
-                            seg.raw().key_at(lo).ok_or_else(|| {
-                                err("block scan: a block's first rank did not resolve")
-                            })?
+                            return Err(err("block scan: a block's first rank did not resolve"));
                         };
                         return Ok(self.resume_at(seen, from));
                     }
@@ -20104,7 +20283,7 @@ impl Reader {
                 };
                 if !fetched && self.opts.scan_prefetch {
                     prefetch_block(
-                        seg.raw(),
+                        self.zc(seg).is_none().then(|| seg.raw()),
                         form,
                         start,
                         ahead,
@@ -20124,7 +20303,7 @@ impl Reader {
                     };
                     if let Some(next) = next {
                         prefetch_block(
-                            seg.raw(),
+                            self.zc(seg).is_none().then(|| seg.raw()),
                             next,
                             hi,
                             ahead - (hi - start),
@@ -20197,14 +20376,7 @@ impl Reader {
                         }
                         if start < run_hi {
                             let want = (run_hi - start).min(limit - seen);
-                            let got = seg
-                                .raw()
-                                .scan_at(start, want, &mut *f)
-                                .map_err(|e| err(&format!("segment scan: {e}")))?;
-                            if got < want {
-                                return Err(err("segment scan: a partition's walk stopped short of its key count"));
-                            }
-                            seen += got;
+                            seen += self.cache_scan(seg, start, want, &mut *f)?;
                         }
                     }
                     Cached::Block(blk) if mem_ov.is_some() => {
@@ -20392,7 +20564,7 @@ impl Reader {
             if seg.below_lo(key) || seg.hi.as_ref().is_some_and(|h| key >= h.as_slice()) {
                 continue;
             }
-            let (b, cut) = BuildCtx::owner_of(seg, key);
+            let (b, cut) = self.cache_owner_of(seg, key, 0);
             let _ = write!(
                 out,
                 "partition {p} blob {} block {b} cut {cut}: ",
@@ -25990,7 +26162,7 @@ impl SnapBounds {
     /// partition's walk, from one forward walk along the index heads
     /// from the block's first rank, since every key over the block is at
     /// or past it. Indexed by the entry's position in `snap`.
-    fn cuts_of(&self, b: usize, seg: &Seg, snap: &Snapshot) -> Result<&[AtomicU32]> {
+    fn cuts_of(&self, rd: &Reader, b: usize, seg: &Seg, snap: &Snapshot) -> Result<&[AtomicU32]> {
         if self.ready[b].load(AtomicOrdering::Acquire) {
             return Ok(&self.cuts);
         }
@@ -25999,16 +26171,27 @@ impl SnapBounds {
         let keys = seg.blob.keys();
         let mut r = (b * CACHE_BLOCK).min(keys);
         let mut kbuf = Vec::new();
+        // Through the form file where the handle reads it: each key's cut
+        // by the fence and one group, the group the memo holds after the
+        // first; over the heads and the raw records otherwise, each from
+        // the rank the key before it reached.
+        let via_z = rd.zc(seg).is_some();
         for i in lo..hi {
             let (k, _) = snap
                 .get(i)
                 .ok_or_else(|| err("block cache: a snapshot bound did not resolve"))?;
-            r = seg.ord.advance_below(r, k, |j| seg.raw().key_at(j));
-            let same = r < keys
-                && match seg.ord.whole_key_at(r, &mut kbuf) {
-                    Some(w) => w == k,
-                    None => seg.raw().key_at(r) == Some(k),
-                };
+            let same = if via_z {
+                let (c, at) = rd.cache_cut(seg, r, keys, k);
+                r = c;
+                r < keys && at == Ordering::Equal
+            } else {
+                r = seg.ord.advance_below(r, k, |j| seg.raw().key_at(j));
+                r < keys
+                    && match seg.ord.whole_key_at(r, &mut kbuf) {
+                        Some(w) => w == k,
+                        None => seg.raw().key_at(r) == Some(k),
+                    }
+            };
             self.cuts[i].store(((r as u32) << 1) | same as u32, AtomicOrdering::Relaxed);
         }
         self.ready[b].store(true, AtomicOrdering::Release);
@@ -26246,7 +26429,7 @@ impl Reader {
             if table.clean_throughout() {
                 continue;
             }
-            table.snap_at(seg, &unsealed)?;
+            table.snap_at(self, seg, &unsealed)?;
             let src = Sources { seg, l0 };
             let mut forms: Vec<(u32, usize, Cached)> = Vec::with_capacity(AHEAD_BATCH);
             for b in 0..=nblocks {
@@ -27974,6 +28157,20 @@ fn rank_pieces_of(segs: &[std::sync::Arc<Seg>], by_heads: bool) -> Result<()> {
     Ok(())
 }
 
+/// `Blob::key_at` through the door, copied into `out`: the boundary key of
+/// a join the segment work makes with no handle in hand
+/// (`bound_pieces_of`), where a handle's join asks `Reader::cache_key_at`.
+fn raw_key_into(seg: &Seg, rank: usize, out: &mut Vec<u8>) -> bool {
+    match seg.raw().key_at(rank) {
+        Some(k) => {
+            out.clear();
+            out.extend_from_slice(k);
+            true
+        }
+        None => false,
+    }
+}
+
 /// The bounds of every level-0 piece in `segs` against every partition
 /// whose range it meets, where the piece has none against that partition
 /// yet: the same walk `BuildCtx::table_bounds` makes when a table is made,
@@ -28006,6 +28203,7 @@ fn bound_pieces_of(segs: &[std::sync::Arc<Seg>]) -> Result<()> {
                 p.blob.keys(),
                 |k| p.ord.seek(p.cursor_from(k), |i| p.raw().key_at(i)),
                 |i, bound| p.ord.advance_below(i, bound, |r| p.raw().key_at(r)),
+                |r, out| raw_key_into(seg, r, out),
             )?;
             p.bounds.put(against, std::sync::Arc::new(at));
         }
@@ -28024,6 +28222,10 @@ type FrozenRuns<'c> = [Option<(std::ops::Range<usize>, &'c [AtomicU32])>; MAX_FR
 /// handle holding the state as of a commit, and the store splices in the
 /// keys written after that commit when it installs a block.
 struct BuildCtx<'s> {
+    /// The handle the build reads a covered partition through: its memo of
+    /// decoded groups and the gate, for the form file's dispatch
+    /// (`Reader::cache_scan` and its kin, `Options::zpages_block_cache`).
+    rd: &'s Reader,
     /// The watermark the live memtable's chains are walked under.
     wm: u64,
     segs: &'s [std::sync::Arc<Seg>],
@@ -28099,6 +28301,7 @@ impl<'s> BuildCtx<'s> {
                         p.blob.keys(),
                         |k| p.ord.seek(p.cursor_from(k), |i| p.raw().key_at(i)),
                         |i, bound| p.ord.advance_below(i, bound, |r| p.raw().key_at(r)),
+                        |r, out| self.rd.cache_key_at(seg, r, out),
                     )?);
                     p.bounds.put(against, at.clone());
                     at
@@ -28125,27 +28328,6 @@ impl<'s> BuildCtx<'s> {
         (lo as u32, hi as u32)
     }
 
-    /// PROTOTYPE: the block whose key range holds `key`.
-    ///
-    /// Whether the key at the rank is `key` comes from the heads where
-    /// they can say, as it does at a scan's start: asked of the record,
-    /// it was a cold line in the record region for every write a settle
-    /// filed, and the record parse was the largest leaf of the settle's
-    /// samples after the lag burst at three hundred thousand keys.
-    fn owner_of(seg: &Seg, key: &[u8]) -> (usize, u32) {
-        Self::owner_of_from(seg, key, 0)
-    }
-    /// `owner_of` for a key expected at or past rank `floor` -- the rank
-    /// the key before it in key order resolved to -- so a batch resolved
-    /// in key order gallops from one answer to the next over warm heads
-    /// (`OrdIndex::seek_exact_from`).
-    fn owner_of_from(seg: &Seg, key: &[u8], floor: usize) -> (usize, u32) {
-        let keys = seg.blob.keys();
-        let (rank, exact) = seg.ord.seek_exact_from(floor, key, |r| seg.raw().key_at(r));
-        let same = rank < keys && exact.unwrap_or_else(|| seg.raw().key_at(rank) == Some(key));
-        let owner = if same { rank } else { rank.saturating_sub(1) };
-        (owner / CACHE_BLOCK, ((rank as u32) << 1) | same as u32)
-    }
     /// PROTOTYPE: a cut carried with a key, as `cut_at` would answer it for
     /// a walk standing at `rank` and ending at `end`.
     fn cut_known(cut: u32, rank: usize, end: usize) -> (usize, Ordering) {
@@ -28249,6 +28431,7 @@ impl<'s> BuildCtx<'s> {
     /// PROTOTYPE: where the snapshot's keys fall against the partition's
     /// block boundaries.
     fn snap_bounds(
+        rd: &Reader,
         seg: &Seg,
         nblocks: usize,
         unsealed: &Snapshot,
@@ -28263,6 +28446,7 @@ impl<'s> BuildCtx<'s> {
             unsealed.len(),
             |k| unsealed.seek(k),
             |i, bound| unsealed.advance_below(i, bound),
+            |r, out| rd.cache_key_at(seg, r, out),
         )?;
         let cuts = (0..unsealed.len())
             .map(|_| AtomicU32::new(u32::MAX))
@@ -28503,15 +28687,15 @@ impl<'s> BuildCtx<'s> {
         b: usize,
         unsealed: &'a Snapshot,
     ) -> Result<Overlay<'a>> {
-        let sb = table.snap_at(src.seg, unsealed)?;
+        let sb = table.snap_at(self.rd, src.seg, unsealed)?;
         let snap = sb.at[b] as usize..sb.at[b + 1] as usize;
-        let cuts = sb.cuts_of(b, src.seg, unsealed)?;
+        let cuts = sb.cuts_of(self.rd, b, src.seg, unsealed)?;
         let mut frozen: FrozenRuns<'_> = Default::default();
         for (i, (f, base)) in frozen.iter_mut().zip(&unsealed.bases).enumerate() {
-            *f = match table.fsnap_at(i, src.seg, unsealed)? {
+            *f = match table.fsnap_at(self.rd, i, src.seg, unsealed)? {
                 Some(fb) => Some((
                     fb.at[b] as usize..fb.at[b + 1] as usize,
-                    fb.cuts_of(b, src.seg, base)?,
+                    fb.cuts_of(self.rd, b, src.seg, base)?,
                 )),
                 None => None,
             };
@@ -28610,15 +28794,15 @@ impl<'s> BuildCtx<'s> {
         let (cursor, limit) = window;
         let window_of =
             |s: &Snapshot, s0: usize, s1: usize| BuildCtx::window_of(s, s0, s1, cursor, limit);
-        let sb = table.snap_at(src.seg, unsealed)?;
+        let sb = table.snap_at(self.rd, src.seg, unsealed)?;
         let snap = window_of(unsealed, sb.at[b] as usize, sb.at[b + 1] as usize);
-        let cuts = sb.cuts_of(b, src.seg, unsealed)?;
+        let cuts = sb.cuts_of(self.rd, b, src.seg, unsealed)?;
         let mut frozen: FrozenRuns<'_> = Default::default();
         for (i, (f, base)) in frozen.iter_mut().zip(&unsealed.bases).enumerate() {
-            *f = match table.fsnap_at(i, src.seg, unsealed)? {
+            *f = match table.fsnap_at(self.rd, i, src.seg, unsealed)? {
                 Some(fb) => Some((
                     window_of(base, fb.at[b] as usize, fb.at[b + 1] as usize),
-                    fb.cuts_of(b, src.seg, base)?,
+                    fb.cuts_of(self.rd, b, src.seg, base)?,
                 )),
                 None => None,
             };
@@ -28733,7 +28917,7 @@ impl<'s> BuildCtx<'s> {
         let start = self.oldest_live(em, ov, o, held, src);
         if start == 0 {
             if let Some(r) = part_rank {
-                src.seg.raw().values_at(r, |v| f(key, v)).map_err(read)?;
+                self.rd.cache_values(src.seg, r, &mut |v| f(key, v))?;
             }
         }
         for &(_, j, rank, _) in held {
@@ -28799,22 +28983,14 @@ impl<'s> BuildCtx<'s> {
             let next = ov.over.get(oi);
             let (bound, at_bound) = match next {
                 Some(o) if o.cut != u32::MAX => BuildCtx::cut_known(o.cut, rank, end),
-                Some(o) if end > rank => BuildCtx::cut_at(seg, rank, end, o.key),
+                Some(o) if end > rank => self.rd.cache_cut(seg, rank, end, o.key),
                 _ => (end, Ordering::Greater),
             };
             if bound > rank {
-                let got = seg
-                    .raw()
-                    .scan_at(rank, bound - rank, |k, v| {
-                        on_key(k);
-                        f(k, v)
-                    })
-                    .map_err(|e| err(&format!("segment scan: {e}")))?;
-                if got < bound - rank {
-                    return Err(err(
-                        "segment scan: a partition's walk stopped short of its key count",
-                    ));
-                }
+                let got = self.rd.cache_scan(seg, rank, bound - rank, &mut |k, v| {
+                    on_key(k);
+                    f(k, v)
+                })?;
                 seen += got;
                 rank += got;
                 if seen >= limit {
@@ -28871,7 +29047,7 @@ impl<'s> BuildCtx<'s> {
         let keys = src.seg.blob.keys();
         let lo = b * CACHE_BLOCK;
         let hi = ((b + 1) * CACHE_BLOCK).min(keys);
-        let sb = table.snap_at(src.seg, unsealed)?;
+        let sb = table.snap_at(self.rd, src.seg, unsealed)?;
         let live = (sb.at[b + 1] - sb.at[b]) as usize;
         // Each base's entries over the block, and whether every base
         // with any carries its chains.
@@ -28879,7 +29055,7 @@ impl<'s> BuildCtx<'s> {
         let mut frozen_runs = true;
         for (i, base) in unsealed.bases.iter().enumerate() {
             let n = table
-                .fsnap_at(i, src.seg, unsealed)?
+                .fsnap_at(self.rd, i, src.seg, unsealed)?
                 .map_or(0, |f| (f.at[b + 1] - f.at[b]) as usize);
             frozen += n;
             frozen_runs &= n == 0 || base.runs;
@@ -28987,7 +29163,7 @@ impl<'s> BuildCtx<'s> {
             let (cut, at) = if o.cut != u32::MAX {
                 BuildCtx::cut_known(o.cut, rank, hi)
             } else if rank < hi {
-                BuildCtx::cut_at(seg, rank, hi, o.key)
+                self.rd.cache_cut(seg, rank, hi, o.key)
             } else {
                 (hi, Ordering::Greater)
             };
@@ -29057,11 +29233,11 @@ impl<'s> BuildCtx<'s> {
         window: (&[u8], usize),
     ) -> Result<Option<Overlay<'a>>> {
         let (cursor, limit) = window;
-        let sb = table.snap_at(src.seg, unsealed)?;
+        let sb = table.snap_at(self.rd, src.seg, unsealed)?;
         let mut any = sb.at[b + 1] > sb.at[b] || !table.added[b].is_empty();
         let mut frozen: FrozenRuns<'_> = Default::default();
         for (i, (f, base)) in frozen.iter_mut().zip(&unsealed.bases).enumerate() {
-            *f = match table.fsnap_at(i, src.seg, unsealed)? {
+            *f = match table.fsnap_at(self.rd, i, src.seg, unsealed)? {
                 Some(fb) => {
                     any |= fb.at[b + 1] > fb.at[b];
                     Some((
@@ -29072,7 +29248,7 @@ impl<'s> BuildCtx<'s> {
                             cursor,
                             limit,
                         ),
-                        fb.cuts_of(b, src.seg, base)?,
+                        fb.cuts_of(self.rd, b, src.seg, base)?,
                     ))
                 }
                 None => None,
@@ -29081,7 +29257,7 @@ impl<'s> BuildCtx<'s> {
         if !any {
             return Ok(None);
         }
-        let cuts = sb.cuts_of(b, src.seg, unsealed)?;
+        let cuts = sb.cuts_of(self.rd, b, src.seg, unsealed)?;
         let snap = BuildCtx::window_of(
             unsealed,
             sb.at[b] as usize,
@@ -29161,15 +29337,7 @@ impl<'s> BuildCtx<'s> {
         };
         let scan = |rank: &mut usize, to: usize, seen: &mut usize, f: &mut F| -> Result<()> {
             let want = (to - *rank).min(limit - *seen);
-            let got = seg
-                .raw()
-                .scan_at(*rank, want, &mut *f)
-                .map_err(|e| err(&format!("segment scan: {e}")))?;
-            if got < want {
-                return Err(err(
-                    "segment scan: a partition's walk stopped short of its key count",
-                ));
-            }
+            let got = self.rd.cache_scan(seg, *rank, want, f)?;
             *seen += got;
             *rank += got;
             Ok(())
@@ -29183,7 +29351,7 @@ impl<'s> BuildCtx<'s> {
             let end = rank.saturating_add(limit - seen).min(hi);
             let (ocut, oat) = match o {
                 Some(o) if o.cut != u32::MAX => BuildCtx::cut_known(o.cut, rank, end),
-                Some(o) if end > rank => BuildCtx::cut_at(seg, rank, end, o.key),
+                Some(o) if end > rank => self.rd.cache_cut(seg, rank, end, o.key),
                 Some(_) => (end, Ordering::Greater),
                 None => (usize::MAX, Ordering::Greater),
             };
@@ -29333,15 +29501,7 @@ impl<'s> BuildCtx<'s> {
             let cut = (e.cut as usize).max(rank);
             if cut > rank && seen < limit {
                 let want = (cut - rank).min(limit - seen);
-                let got = seg
-                    .raw()
-                    .scan_at(rank, want, &mut f)
-                    .map_err(|e| err(&format!("segment scan: {e}")))?;
-                if got < want {
-                    return Err(err(
-                        "segment scan: a partition's walk stopped short of its key count",
-                    ));
-                }
+                let got = self.rd.cache_scan(seg, rank, want, &mut f)?;
                 seen += got;
                 rank += got;
             }
@@ -29357,16 +29517,7 @@ impl<'s> BuildCtx<'s> {
         }
         if seen < limit && rank < hi {
             let want = (hi - rank).min(limit - seen);
-            let got = seg
-                .raw()
-                .scan_at(rank, want, &mut f)
-                .map_err(|e| err(&format!("segment scan: {e}")))?;
-            if got < want {
-                return Err(err(
-                    "segment scan: a partition's walk stopped short of its key count",
-                ));
-            }
-            seen += got;
+            seen += self.rd.cache_scan(seg, rank, want, &mut f)?;
         }
         Ok(seen)
     }
@@ -29525,15 +29676,7 @@ impl<'s> BuildCtx<'s> {
                 }
                 blk.push(v);
             };
-            let got = seg
-                .raw()
-                .scan_at(from, want, &mut rec)
-                .map_err(|e| err(&format!("segment scan: {e}")))?;
-            if got < want {
-                return Err(err(
-                    "segment scan: a partition's walk stopped short of its key count",
-                ));
-            }
+            self.rd.cache_scan(seg, from, want, &mut rec)?;
             Ok(())
         };
         for e in &sb.ents {
