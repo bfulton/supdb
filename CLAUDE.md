@@ -1476,7 +1476,18 @@ point read beside it, through the piece, was right. That landing carries
 no form now, as a freeze that carries nothing does. The corollary: a copy
 is current to the log position its source was filed to, and a publish that
 carries copies across a change of the live table has to know that position
-was the table's end.
+was the table's end. And a fourth time, as a deferral: the look that finds
+a carried form its table holds none for marked the block dirty for the next
+publish, and the settle in the same look wrote into the block with the form
+still standing, which the check that a block with no form has none
+published caught in the differential fuzz under the promotion arm, four
+runs in a hundred with four processes and none alone; a publish that builds
+nothing at a commit (`commit_forms_build` off) would have moved the forms'
+position past the dirty block without publishing it. The look publishes the
+marker itself now, as its sibling branches do, and the test leaves the
+state the race leaves through a seam (`Reader::forget_form_unretracted`).
+A retraction is made where the staleness is found, not queued behind a
+publish some other step may run first.
 
 **A rename under a merge.** A promotion hard-links a partition under a
 new name to close its fence, and a merge's landing removes its inputs by

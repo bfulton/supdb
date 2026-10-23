@@ -17380,10 +17380,23 @@ impl Reader {
                     }
                     // A form this table dropped after the publish copied
                     // it -- a pass shedding or widening the block over
-                    // the old state -- stands in the new one as the
-                    // block, where the table vouches for none: marked, so
-                    // the next publish replaces it with a marker.
-                    (None, Some(f)) if !matches!(**f, Cached::Wide(_)) => t.dirty[b] = true,
+                    // the old state, or the writer dropping it in an
+                    // operation that holds the old state while a landing
+                    // carries the forms out of it -- stands in the new
+                    // one as the block, where the table vouches for none:
+                    // replaced
+                    // by a marker here, as the branches above replace
+                    // what they drop. Left for the next publish, it stood
+                    // through the settle that follows this look, which
+                    // holds that a block with no form has none published,
+                    // and through every publish of an arm that builds no
+                    // forms at a commit (`commit_forms_build` off), whose
+                    // publish moves `forms_at` past the dirty blocks
+                    // without publishing them.
+                    (None, Some(f)) if !matches!(**f, Cached::Wide(_)) => {
+                        t.dirty[b] = false;
+                        self.publish_marker(p, b);
+                    }
                     (None, _) => {}
                 }
                 dirty_any |= t.dirty[b];
@@ -18266,6 +18279,55 @@ impl Reader {
         Some((at, b, t.dense[b].is_some(), t.reads[b], kind))
     }
 
+    /// For a test: the block `key` falls in dropped from this handle's
+    /// table with nothing published in its place, the state a drop leaves
+    /// when a publish from the segment work copied the form into the state
+    /// that replaces the one the drop's marker went to. Whether the table
+    /// held a form for the block.
+    #[doc(hidden)]
+    pub fn forget_form_unretracted(&self, key: &[u8]) -> bool {
+        let _e = self.enter();
+        let np = self.segs().partition_point(|s| s.level > 0);
+        let at = self.segs()[..np]
+            .partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
+        let Some(seg) = self.segs()[..np].get(at) else {
+            return false;
+        };
+        let (b, _) = self.cache_owner_of(seg, key, 0);
+        let tables = self.fs().tables.borrow();
+        let Some(cell) = tables.get(at) else {
+            return false;
+        };
+        let mut held = cell.borrow_mut();
+        let Some(t) = held.as_mut() else {
+            return false;
+        };
+        if b >= t.slots.len() || t.slots[b].is_none() {
+            return false;
+        }
+        self.unlist_as(at, b, t, false);
+        true
+    }
+
+    /// For a test: the kind of form published in the state for the block
+    /// `key` falls in -- "clean", "sparse", "copy" or "wide", a marker
+    /// being a wide form -- or `None` for none.
+    #[doc(hidden)]
+    pub fn published_kind(&self, key: &[u8]) -> Option<&'static str> {
+        let _e = self.enter();
+        let np = self.segs().partition_point(|s| s.level > 0);
+        let at = self.segs()[..np]
+            .partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
+        let seg = self.segs()[..np].get(at)?;
+        let (b, _) = self.cache_owner_of(seg, key, 0);
+        Some(match self.canonical(at, b)? {
+            Cached::Clean => "clean",
+            Cached::Sparse(_) => "sparse",
+            Cached::Block(_) => "copy",
+            Cached::Wide(_) => "wide",
+        })
+    }
+
     /// EXPERIMENT: what the reads chose: blocks promoted to a copy
     /// beside their cheap form, copies dropped by a write, block walks
     /// over a copy, block walks over the cheap form, and the bytes the
@@ -19138,12 +19200,19 @@ impl Reader {
     /// its place in the list goes to the last listed block, whose table
     /// is `table` when it is the one in hand and borrowed otherwise.
     fn unlist(&self, p: usize, b: usize, table: &mut BlockTable) -> usize {
+        self.unlist_as(p, b, table, true)
+    }
+
+    /// `unlist`, with the marker published for the block or, for a test
+    /// that builds the state a drop into a replaced state leaves
+    /// (`forget_form_unretracted`), not.
+    fn unlist_as(&self, p: usize, b: usize, table: &mut BlockTable, retract: bool) -> usize {
         let Some(c) = table.slots[b].take() else {
             return 0;
         };
         // Whatever was published for the block is not this handle's to
         // keep current any more: a reader builds it for itself.
-        if self.opts.commit_forms && self.slot.is_none() {
+        if retract && self.opts.commit_forms && self.slot.is_none() {
             self.publish_marker(p, b);
         }
         let bytes = self.fbytes(&c);
