@@ -922,6 +922,25 @@ pub struct Options {
     /// arm.
     #[doc(hidden)]
     pub zpages_memo_first: bool,
+    /// A block's reads of its covered partition through one cursor
+    /// (`PartReader`, `zfile::ZCursor`): a build or a walk reads the
+    /// records between the overlay's keys, each key's cut where the walk
+    /// stops at it or where the cursor moved to it from the group it holds
+    /// stands (`ZCursor::skip_to`), and the record an overlay key replaces
+    /// from the cursor standing on it, so a block opens each group it
+    /// crosses once; the cuts of its memtable keys are left to it
+    /// (`SnapBounds::cuts_of` and `BuildCtx::filed_cuts` resolve nothing
+    /// under it). Off is the shape before: a cursor opened for every run
+    /// between two keys (`Reader::cache_scan`), a seek from the fence for
+    /// every cut (`cache_cut`, the cuts of a block's snapshot keys taken by
+    /// the first build and the filed keys' by each) and a read by rank for
+    /// every replaced record (`cache_values`), each opening the key's group
+    /// again -- on the E mix's main thread at five million keys under
+    /// 640 MiB the cuts alone were 5.9%, and the builds' walks and the
+    /// replaced records' reads opened a group a run and a key besides.
+    /// `supdb-cache64tofitautozpagesperrun` is the arm.
+    #[doc(hidden)]
+    pub zpages_block_cursor: bool,
     /// EXPERIMENT: a scan's seek of a covered partition, and the cut where
     /// an unsealed key falls inside its walk, by the ordered index's heads
     /// and the raw records, as before the form served scans, instead of by
@@ -2505,6 +2524,7 @@ impl Default for Options {
             zpages_settle_span: true,
             zpages_trusted_views: true,
             zpages_memo_first: false,
+            zpages_block_cursor: true,
             zpages_scan_prefetch: false,
             zpages_walk_cursor: true,
             zpages_block_cache: true,
@@ -12791,7 +12811,9 @@ struct FormsState {
     /// the rank never sought (`Options::zpages_seek_span`).
     span_starts: std::cell::Cell<u64>,
     /// Writes a settle filed with their cut unresolved, and filed cuts a
-    /// build resolved (`Options::zpages_settle_span`).
+    /// build resolved by a seek (`Options::zpages_settle_span`); a build
+    /// under `Options::zpages_block_cursor` resolves them where its walk
+    /// stops and counts none.
     lazy_cuts: std::cell::Cell<[u64; 2]>,
     /// For a pass on the upkeep thread: the most writes it reads from the
     /// live log, and the most it settles from the frozen tables' carried
@@ -19825,6 +19847,7 @@ impl Reader {
                 tombs,
                 scratch: std::mem::take(&mut *offs),
             };
+            let mut pr = PartReader::new(self, src.seg);
             ctx.emit_over(
                 &mut |_, v: &[u8]| {
                     run.extend_from_slice(&(v.len() as u32).to_le_bytes());
@@ -19833,7 +19856,7 @@ impl Reader {
                 &mut em,
                 &ov,
                 0,
-                same.then_some(c),
+                same.then_some((c, &mut pr)),
                 src,
             )?;
             *offs = em.scratch;
@@ -20694,8 +20717,9 @@ impl Reader {
                     }
                     Cached::Clean if mem_ov.is_some() => {
                         let ov = mem_ov.as_ref().expect("checked");
-                        seen +=
-                            ctx.walk_block(src, start..hi, ov, limit - seen, |_k| {}, &mut *f)?;
+                        seen += ctx
+                            .walk_block(src, start..hi, ov, limit - seen, |_k| {}, &mut *f)?
+                            .0;
                     }
                     Cached::Clean => {
                         // Every clean block built after this one joins the
@@ -20783,8 +20807,9 @@ impl Reader {
                     Cached::Wide(w) => {
                         let window = (from_key, limit - seen);
                         let ov = ctx.overlay_window(src, table, b, unsealed, w, window)?;
-                        seen +=
-                            ctx.walk_block(src, start..hi, &ov, limit - seen, |_k| {}, &mut *f)?;
+                        seen += ctx
+                            .walk_block(src, start..hi, &ov, limit - seen, |_k| {}, &mut *f)?
+                            .0;
                     }
                 }
                 // What this read took from the block is what pays for a
@@ -25044,8 +25069,10 @@ impl Db {
     }
 
     /// The writer's own writes a settle filed with their cut unresolved,
-    /// and the filed cuts its builds resolved
-    /// (`Options::zpages_settle_span`).
+    /// and the filed cuts its builds resolved by a seek
+    /// (`Options::zpages_settle_span`); under `Options::zpages_block_cursor`
+    /// a build over a covered partition resolves them where its walk stops
+    /// and counts none here.
     pub fn lazy_cuts(&self) -> [u64; 2] {
         self.take_back_upkeep();
         self.r.fs().lazy_cuts.get()
@@ -26602,6 +26629,15 @@ impl SnapBounds {
     /// or past it. Indexed by the entry's position in `snap`.
     fn cuts_of(&self, rd: &Reader, b: usize, seg: &Seg, snap: &Snapshot) -> Result<&[AtomicU32]> {
         if self.ready[b].load(AtomicOrdering::Acquire) {
+            return Ok(&self.cuts);
+        }
+        // Under `Options::zpages_block_cursor` a covered partition's cuts
+        // are the build's, found where its one cursor stops at each key
+        // (`PartReader::scan_until`, `PartReader::cut`): left unresolved
+        // here, which `Over::cut` reads as "the build searches", and the
+        // block not marked ready, so a build that reads the raw form later
+        // takes them this way as before.
+        if rd.opts.zpages_block_cursor && rd.zc(seg).is_some() {
             return Ok(&self.cuts);
         }
         let lo = self.at[b] as usize;
@@ -29129,7 +29165,13 @@ impl<'s> BuildCtx<'s> {
         b: usize,
         filed: &'f [(u32, u32)],
     ) -> std::borrow::Cow<'f, [(u32, u32)]> {
-        if !filed.iter().any(|&(_, c)| c == LAZY_CUT) {
+        // Under `Options::zpages_block_cursor` a covered partition's filed
+        // cuts are found where the build's cursor stops at each key, as the
+        // snapshot keys' are (`SnapBounds::cuts_of`); `LAZY_CUT` is the
+        // search the overlay asks for.
+        if !filed.iter().any(|&(_, c)| c == LAZY_CUT)
+            || (self.rd.opts.zpages_block_cursor && self.rd.zc(src.seg).is_some())
+        {
             return std::borrow::Cow::Borrowed(filed);
         }
         let mut n = 0u64;
@@ -29372,15 +29414,15 @@ impl<'s> BuildCtx<'s> {
     /// pieces 1 through their count, the frozen memtables oldest first,
     /// the live one --
     /// and the newest that holds a tombstone for the key cuts every older
-    /// one. `part_rank` names the partition's own record for the key, if
-    /// it has one.
+    /// one. `part` names the partition's own record for the key, if it has
+    /// one, and the block's reader to read it through.
     fn emit_over<F: FnMut(&[u8], &[u8])>(
         &self,
         f: &mut F,
         em: &mut Emit,
         ov: &Overlay,
         oi: usize,
-        part_rank: Option<usize>,
+        part: Option<(usize, &mut PartReader<'_>)>,
         src: Sources,
     ) -> Result<()> {
         let o = &ov.over[oi];
@@ -29390,8 +29432,8 @@ impl<'s> BuildCtx<'s> {
         let read = |e: std::io::Error| err(&format!("block cache read: {e}"));
         let start = self.oldest_live(em, ov, o, held, src);
         if start == 0 {
-            if let Some(r) = part_rank {
-                self.rd.cache_values(src.seg, r, &mut |v| f(key, v))?;
+            if let Some((r, pr)) = part {
+                pr.values_at(r, &mut |v| f(key, v))?;
             }
         }
         for &(_, j, rank, _) in held {
@@ -29436,7 +29478,9 @@ impl<'s> BuildCtx<'s> {
     /// keys laid over: the walk `scan_partitions` makes, on a block, with
     /// every source. `on_key` sees every key once before its values,
     /// tombstone-only keys included, which is what a copy needs and a
-    /// caller's closure does not.
+    /// caller's closure does not. Answers the keys seen and whether every
+    /// overlay key it emitted replaced a partition record of its own,
+    /// which is `copy_block`'s identity.
     fn walk_block<F: FnMut(&[u8], &[u8]), K: FnMut(&[u8])>(
         &self,
         src: Sources,
@@ -29445,40 +29489,57 @@ impl<'s> BuildCtx<'s> {
         limit: usize,
         mut on_key: K,
         mut f: F,
-    ) -> Result<usize> {
+    ) -> Result<(usize, bool)> {
         let mut oi = 0usize;
         let seg = src.seg;
         let hi = ranks.end;
         let mut seen = 0usize;
         let mut rank = ranks.start;
         let mut em: Option<Emit> = None;
+        let mut pr = PartReader::new(self.rd, seg);
+        let mut all_same = true;
         while seen < limit {
             let end = rank.saturating_add(limit - seen).min(hi);
             let next = ov.over.get(oi);
+            // The records below the next overlay key, and the key's cut:
+            // the run to a cut a source carried, or the run until the key,
+            // whose end is the cut, where the build searches.
+            let mut g = |k: &[u8], v: &[u8]| {
+                on_key(k);
+                f(k, v)
+            };
             let (bound, at_bound) = match next {
-                Some(o) if o.cut != u32::MAX => BuildCtx::cut_known(o.cut, rank, end),
-                Some(o) if end > rank => self.rd.cache_cut(seg, rank, end, o.key),
-                _ => (end, Ordering::Greater),
+                Some(o) if o.cut != u32::MAX => {
+                    let (bound, at) = BuildCtx::cut_known(o.cut, rank, end);
+                    if bound > rank {
+                        pr.scan(rank, bound - rank, &mut g)?;
+                    }
+                    (bound, at)
+                }
+                Some(o) if end > rank => pr.scan_until(rank, end, o.key, &mut g)?,
+                _ => {
+                    if end > rank {
+                        pr.scan(rank, end - rank, &mut g)?;
+                    }
+                    (end, Ordering::Greater)
+                }
             };
             if bound > rank {
-                let got = self.rd.cache_scan(seg, rank, bound - rank, &mut |k, v| {
-                    on_key(k);
-                    f(k, v)
-                })?;
-                seen += got;
-                rank += got;
+                seen += bound - rank;
+                rank = bound;
                 if seen >= limit {
                     break;
                 }
             }
             let Some(o) = next else { break };
             let same = rank < hi && at_bound == Ordering::Equal;
+            all_same &= same;
             let em = em.get_or_insert_with(|| Emit {
                 tombs: self.tombs,
                 scratch: self.take_offs(),
             });
             on_key(o.key);
-            self.emit_over(&mut f, em, ov, oi, same.then_some(rank), src)?;
+            self.emit_over(&mut f, em, ov, oi, same.then_some((rank, &mut pr)), src)?;
             if same {
                 rank += 1;
             }
@@ -29488,7 +29549,7 @@ impl<'s> BuildCtx<'s> {
         if let Some(em) = em {
             self.give_offs(em.scratch);
         }
-        Ok(seen)
+        Ok((seen, all_same))
     }
     /// PROTOTYPE: the cached form of block `b`, built on its first touch:
     /// `Clean` with no key above the partition in its range, resolved
@@ -29633,13 +29694,12 @@ impl<'s> BuildCtx<'s> {
             vals: Vec::with_capacity(ov.over.len() * 128),
         };
         let mut rank = ranks.start;
+        let mut pr = PartReader::new(self.rd, seg);
         for (oi, o) in ov.over.iter().enumerate() {
             let (cut, at) = if o.cut != u32::MAX {
                 BuildCtx::cut_known(o.cut, rank, hi)
-            } else if rank < hi {
-                self.rd.cache_cut(seg, rank, hi, o.key)
             } else {
-                (hi, Ordering::Greater)
+                pr.cut(rank, hi, o.key)
             };
             let same = cut < hi && at == Ordering::Equal;
             let key_at = blk.keys.len() as u32;
@@ -29654,7 +29714,7 @@ impl<'s> BuildCtx<'s> {
                 &mut em,
                 ov,
                 oi,
-                same.then_some(cut),
+                same.then_some((cut, &mut pr)),
                 src,
             )?;
             blk.ents.push(DeltaEnt {
@@ -29810,13 +29870,7 @@ impl<'s> BuildCtx<'s> {
             tombs: self.tombs,
             scratch: self.take_offs(),
         };
-        let scan = |rank: &mut usize, to: usize, seen: &mut usize, f: &mut F| -> Result<()> {
-            let want = (to - *rank).min(limit - *seen);
-            let got = self.rd.cache_scan(seg, *rank, want, f)?;
-            *seen += got;
-            *rank += got;
-            Ok(())
-        };
+        let mut pr = PartReader::new(self.rd, seg);
         while seen < limit {
             let d = blk.ents.get(di);
             let o = ov.over.get(oi);
@@ -29824,31 +29878,41 @@ impl<'s> BuildCtx<'s> {
                 break;
             }
             let end = rank.saturating_add(limit - seen).min(hi);
-            let (ocut, oat) = match o {
-                Some(o) if o.cut != u32::MAX => BuildCtx::cut_known(o.cut, rank, end),
-                Some(o) if end > rank => self.rd.cache_cut(seg, rank, end, o.key),
-                Some(_) => (end, Ordering::Greater),
-                None => (usize::MAX, Ordering::Greater),
-            };
-            let dcut = d.map_or(usize::MAX, |e| (e.cut as usize).max(rank));
-            // The memtable key first where its cut is lower, or at one cut
-            // where its key is not above the form's: equal keys emit once.
+            // The memtable key first where it is not above the form's: two
+            // keys' cuts order as the keys do, and equal keys emit once. The
+            // shape before ordered the two by cut, which sought the overlay
+            // key's cut at every turn before it was taken.
             let take_over = match (d, o) {
-                (Some(e), Some(o)) => match ocut.cmp(&dcut) {
-                    Ordering::Less => true,
-                    Ordering::Greater => false,
-                    Ordering::Equal => o.key <= blk.key(e),
-                },
+                (Some(e), Some(o)) => o.key <= blk.key(e),
                 (None, Some(_)) => true,
                 _ => false,
             };
-            let to = if take_over { ocut.max(rank) } else { dcut };
-            if to > rank {
-                scan(&mut rank, to.min(end), &mut seen, &mut f)?;
-                if seen >= limit {
-                    break;
+            // The run below the key taken, and the key's cut: the form's
+            // deltas carry theirs; an overlay key's is known, or found where
+            // the walk stops at it.
+            let (to, oat) = if take_over {
+                let o = o.expect("taken");
+                if o.cut != u32::MAX {
+                    let (c, at) = BuildCtx::cut_known(o.cut, rank, end);
+                    if c > rank {
+                        pr.scan(rank, c - rank, &mut f)?;
+                    }
+                    (c, at)
+                } else {
+                    pr.scan_until(rank, end, o.key, &mut f)?
                 }
-                if to > rank {
+            } else {
+                let e = d.expect("taken");
+                let c = (e.cut as usize).clamp(rank, end);
+                if c > rank {
+                    pr.scan(rank, c - rank, &mut f)?;
+                }
+                (c, Ordering::Greater)
+            };
+            if to > rank {
+                seen += to - rank;
+                rank = to;
+                if seen >= limit {
                     // The limit fell before the cut.
                     break;
                 }
@@ -29867,7 +29931,14 @@ impl<'s> BuildCtx<'s> {
                     }
                     None => {
                         let same = rank < hi && oat == Ordering::Equal;
-                        self.emit_over(&mut f, &mut em, ov, oi, same.then_some(rank), src)?;
+                        self.emit_over(
+                            &mut f,
+                            &mut em,
+                            ov,
+                            oi,
+                            same.then_some((rank, &mut pr)),
+                            src,
+                        )?;
                         if same {
                             rank += 1;
                         }
@@ -29886,7 +29957,8 @@ impl<'s> BuildCtx<'s> {
             seen += 1;
         }
         if seen < limit && rank < hi {
-            scan(&mut rank, hi, &mut seen, &mut f)?;
+            let want = (hi - rank).min(limit - seen);
+            seen += pr.scan(rank, want, &mut f)?;
         }
         self.give_offs(em.scratch);
         Ok(seen)
@@ -29972,11 +30044,12 @@ impl<'s> BuildCtx<'s> {
         } else {
             select_lower_bound(blk.ents.len(), |i| blk.key(&blk.ents[i]) < cursor)
         };
+        let mut pr = PartReader::new(self.rd, seg);
         for e in &blk.ents[di..] {
             let cut = (e.cut as usize).max(rank);
             if cut > rank && seen < limit {
                 let want = (cut - rank).min(limit - seen);
-                let got = self.rd.cache_scan(seg, rank, want, &mut f)?;
+                let got = pr.scan(rank, want, &mut f)?;
                 seen += got;
                 rank += got;
             }
@@ -29992,7 +30065,7 @@ impl<'s> BuildCtx<'s> {
         }
         if seen < limit && rank < hi {
             let want = (hi - rank).min(limit - seen);
-            seen += self.rd.cache_scan(seg, rank, want, &mut f)?;
+            seen += pr.scan(rank, want, &mut f)?;
         }
         Ok(seen)
     }
@@ -30062,7 +30135,7 @@ impl<'s> BuildCtx<'s> {
         });
         let mut current: Vec<u8> = Vec::with_capacity(32);
         let mut open = false;
-        self.walk_block(
+        let (_, all_same) = self.walk_block(
             src,
             ranks,
             ov,
@@ -30085,13 +30158,13 @@ impl<'s> BuildCtx<'s> {
         if open {
             blk.end();
         }
-        // Every overlay key an update of a record at a known cut, and a
-        // key emitted per record: a tombstone that took a record out, or
-        // a cut the build had to search for, leaves the copy searched.
-        let updates = ov
-            .over
-            .iter()
-            .all(|o| o.cut != u32::MAX && BuildCtx::cut_known(o.cut, lo, hi).1 == Ordering::Equal);
+        // Every overlay key an update of a record at its cut, and a key
+        // emitted per record: a tombstone that took a record out leaves the
+        // copy searched. The walk answers each key's cut exactly, carried or
+        // searched for; the shape before (`Options::zpages_block_cursor`
+        // off) also left a copy searched where a cut had to be searched for.
+        let updates = all_same
+            && (self.rd.opts.zpages_block_cursor || ov.over.iter().all(|o| o.cut != u32::MAX));
         blk.identity = updates && blk.ents.len() == hi - lo;
         if self.fit {
             blk.fit();
@@ -30133,11 +30206,12 @@ impl<'s> BuildCtx<'s> {
         let mut open = false;
         let mut rank = lo;
         let mut updates = true;
-        let stream = |blk: &mut CachedBlock,
-                      current: &mut Vec<u8>,
-                      open: &mut bool,
-                      from: usize,
-                      want: usize|
+        let mut pr = PartReader::new(self.rd, seg);
+        let mut stream = |blk: &mut CachedBlock,
+                          current: &mut Vec<u8>,
+                          open: &mut bool,
+                          from: usize,
+                          want: usize|
          -> Result<()> {
             let mut rec = |k: &[u8], v: &[u8]| {
                 if !*open || current.as_slice() != k {
@@ -30151,7 +30225,7 @@ impl<'s> BuildCtx<'s> {
                 }
                 blk.push(v);
             };
-            self.rd.cache_scan(seg, from, want, &mut rec)?;
+            pr.scan(from, want, &mut rec)?;
             Ok(())
         };
         for e in &sb.ents {
@@ -30211,6 +30285,225 @@ impl<'s> BuildCtx<'s> {
         }
         let at = seg.raw().key_at(r).map_or(Ordering::Greater, |k| k.cmp(uk));
         (r, at)
+    }
+}
+
+/// A block's reads of its partition through one cursor
+/// (`Options::zpages_block_cursor`): the records between the overlay's
+/// keys (`scan`), each key's cut where the records below it end
+/// (`scan_until`) or where the cursor moved to it stands (`cut`), and the
+/// record an overlay key replaces (`values_at`), all by the form file's
+/// cursor held across the block (`zfile::ZCursor`), which opens each group
+/// it crosses once. The shape before opened a cursor for every run between
+/// two keys (`Reader::cache_scan`), sought every cut from the fence
+/// (`cache_cut`) and read every replaced record by rank (`cache_values`),
+/// each opening the key's group again: three opens a key over the one the
+/// walk needs. The runs are consecutive, so the cursor stands where the
+/// next begins, less the record an overlay key was emitted in place of,
+/// which it steps over. Where the cell holds no form file in service,
+/// under the arm, or once the cursor fell back, the reads are the
+/// dispatch's as before; the cursor's counts are filed on the handle's
+/// line as a partition walk's are (`pwalk_close`), when the reader drops.
+struct PartReader<'a> {
+    rd: &'a Reader,
+    seg: &'a Seg,
+    cur: Option<zfile::ZCursor<'a>>,
+    /// The rank the cursor stands at; `usize::MAX` until a run placed it.
+    at: usize,
+    /// Whether the held cursor serves: the option, the cell, no fall.
+    on: bool,
+}
+
+impl<'a> PartReader<'a> {
+    fn new(rd: &'a Reader, seg: &'a Seg) -> PartReader<'a> {
+        let on = rd.opts.zpages_block_cursor && rd.zc(seg).is_some();
+        PartReader {
+            rd,
+            seg,
+            cur: None,
+            at: usize::MAX,
+            on,
+        }
+    }
+
+    /// The cursor at `rank`: the held one where it stands there or within
+    /// a block before it -- the records overlay keys were emitted in place
+    /// of, stepped over -- else one placed afresh, the held one's counts
+    /// filed. None where the form file does not serve.
+    fn cursor_at(&mut self, rank: usize) -> Option<&mut zfile::ZCursor<'a>> {
+        if !self.on {
+            return None;
+        }
+        let (fell, near) = match &self.cur {
+            Some(c) => (
+                c.fell_back(),
+                self.at <= rank && rank - self.at <= CACHE_BLOCK,
+            ),
+            None => (false, false),
+        };
+        if fell {
+            self.close();
+            self.on = false;
+            return None;
+        }
+        if near {
+            let from = self.at;
+            let c = self.cur.as_mut().expect("held");
+            for _ in from..rank {
+                c.advance();
+            }
+            self.at = rank;
+            return self.cur.as_mut();
+        }
+        let Some(z) = self.rd.zc(self.seg) else {
+            self.close();
+            self.on = false;
+            return None;
+        };
+        self.close();
+        self.cur = Some(zfile::ZCursor::at(
+            &self.rd.zmemo,
+            z,
+            self.seg.blob.for_zfile(),
+            rank,
+        ));
+        self.at = rank;
+        self.cur.as_mut()
+    }
+
+    /// `Reader::cache_scan`: the `n` records from `rank` to `f`, through the
+    /// cursor where it serves. A run that stops short of `n` is the raw
+    /// form's own damage, named as the dispatch names it.
+    fn scan<F: FnMut(&[u8], &[u8])>(&mut self, rank: usize, n: usize, f: &mut F) -> Result<usize> {
+        if n == 0 {
+            return Ok(0);
+        }
+        let Some(c) = self.cursor_at(rank) else {
+            return self.rd.cache_scan(self.seg, rank, n, f);
+        };
+        let (got, _) = c
+            .walk_run(None, n, f)
+            .map_err(|e| err(&format!("segment scan: {e}")))?;
+        self.at = rank + got;
+        if got < n {
+            return Err(err(
+                "segment scan: a partition's walk stopped short of its key count",
+            ));
+        }
+        Ok(got)
+    }
+
+    /// `Reader::cache_scan` to the cut of `key` and `Reader::cache_cut` in
+    /// one: the records from `rank` whose keys are below `key`, at most
+    /// `end - rank` of them, to `f`, and the cut as `cache_cut(seg, rank,
+    /// end, key)` answers it -- the first rank in `rank..end` whose key is
+    /// not below `key`, or `end`, with how that key compares.
+    fn scan_until<F: FnMut(&[u8], &[u8])>(
+        &mut self,
+        rank: usize,
+        end: usize,
+        key: &[u8],
+        f: &mut F,
+    ) -> Result<(usize, Ordering)> {
+        if end <= rank {
+            return Ok((end, Ordering::Greater));
+        }
+        let Some(c) = self.cursor_at(rank) else {
+            let (cut, at) = self.rd.cache_cut(self.seg, rank, end, key);
+            if cut > rank {
+                self.rd.cache_scan(self.seg, rank, cut - rank, f)?;
+            }
+            return Ok((cut, at));
+        };
+        let (got, at) = c
+            .walk_run(Some(key), end - rank, f)
+            .map_err(|e| err(&format!("segment scan: {e}")))?;
+        self.at = rank + got;
+        Ok(if got >= end - rank {
+            (end, Ordering::Greater)
+        } else {
+            (rank + got, at)
+        })
+    }
+
+    /// `Reader::cache_cut`, by the cursor moved to the key from the group it
+    /// holds, emitting nothing (`ZCursor::skip_to`): the first rank in
+    /// `rank..end` whose key is not below `key`, or `end`, with how that
+    /// key compares; the cursor then stands on the record, for `values_at`.
+    fn cut(&mut self, rank: usize, end: usize, key: &[u8]) -> (usize, Ordering) {
+        if end <= rank {
+            return (end, Ordering::Greater);
+        }
+        if self.on && self.cur.is_none() {
+            match self.rd.zc(self.seg) {
+                Some(z) => {
+                    self.cur = Some(zfile::ZCursor::unplaced(
+                        &self.rd.zmemo,
+                        z,
+                        self.seg.blob.for_zfile(),
+                    ));
+                    self.at = usize::MAX;
+                }
+                None => self.on = false,
+            }
+        }
+        if self.on {
+            let answered = self
+                .cur
+                .as_mut()
+                .and_then(|c| c.skip_to(key).map(|at| (c.rank(), at)));
+            match answered {
+                Some((r, at)) => {
+                    self.at = r;
+                    // The cursor answers for the partition: a rank below
+                    // `rank` means the key at `rank` is past `key`, as
+                    // `ZFile::cut_in` has it.
+                    return if r < rank {
+                        (rank, Ordering::Greater)
+                    } else if r >= end {
+                        (end, Ordering::Greater)
+                    } else {
+                        (r, at)
+                    };
+                }
+                None => {
+                    self.close();
+                    self.on = false;
+                }
+            }
+        }
+        self.rd.cache_cut(self.seg, rank, end, key)
+    }
+
+    /// `Reader::cache_values` of the record at `rank`: from the cursor where
+    /// it stands on the record, its group open already.
+    fn values_at<F: FnMut(&[u8])>(&mut self, rank: usize, f: &mut F) -> Result<u64> {
+        if self.on && self.at == rank {
+            if let Some(c) = self.cur.as_mut().filter(|c| !c.fell_back()) {
+                // A run that ended at a group's last record left the next
+                // group to the next read; a record read there is its first.
+                c.resume();
+                return c
+                    .values(f)
+                    .map_err(|e| err(&format!("block cache read: {e}")));
+            }
+        }
+        self.rd.cache_values(self.seg, rank, f)
+    }
+
+    /// The cursor's counts filed on the handle's line, as a partition
+    /// walk's are.
+    fn close(&mut self) {
+        if let Some(c) = self.cur.take() {
+            self.rd.pwalk_close(Some(PWalk::Z(c)));
+        }
+        self.at = usize::MAX;
+    }
+}
+
+impl Drop for PartReader<'_> {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 

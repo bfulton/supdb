@@ -5958,6 +5958,24 @@ fn the_block_cache_answers_the_same_model_with_zpages() {
     );
 }
 
+/// The model with the compact form forced and the forms holding the
+/// pieces' fold alone (`Options::forms_pieces_only`): a sparse block's
+/// walk lays the memtables' keys over the form's deltas, the two lists
+/// ordered by key, with the partition's records between them read through
+/// the one cursor the block holds (`Options::zpages_block_cursor`).
+#[test]
+fn the_block_cache_answers_the_same_model_with_pieces_only_forms_and_zpages() {
+    overlay_model_z(
+        "overlay-cache-piecesonly-zpages",
+        true,
+        0,
+        supdb::Upkeep::Inline,
+        true,
+        false,
+        true,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn overlay_model_z(
     name: &str,

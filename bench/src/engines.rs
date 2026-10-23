@@ -848,6 +848,11 @@ pub struct Supdb {
     /// `supdb-cache64tofitautozpagesmemofirst`, the pair against
     /// `supdb-cache64tofitautozpages`.
     zmemofirst: bool,
+    /// The combined arm with a block read through a cursor a run, a seek a
+    /// cut and a read by rank a replaced record
+    /// (`Options::zpages_block_cursor` off): `supdb-cache64tofitautozpagesperrun`,
+    /// the pair against `supdb-cache64tofitautozpages`.
+    zperrun: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -1301,6 +1306,10 @@ struct Policy {
     /// A verified page's group asked of the memo before any view
     /// (`Options::zpages_memo_first`): `supdb-cache64tofitautozpagesmemofirst`.
     zmemofirst: bool,
+    /// A block read through a cursor a run, a seek a cut and a read by rank
+    /// a replaced record (`Options::zpages_block_cursor` off):
+    /// `supdb-cache64tofitautozpagesperrun`.
+    zperrun: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -1415,6 +1424,7 @@ impl Default for Policy {
             zexactcut: false,
             zcheckedviews: false,
             zmemofirst: false,
+            zperrun: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -3221,6 +3231,25 @@ impl Supdb {
         )
     }
 
+    /// `supdb-cache64tofitautozpages` with a block read through a cursor a
+    /// run, a seek a cut and a read by rank a replaced record
+    /// (`Options::zpages_block_cursor` off), the shape before a block was
+    /// read through one cursor: the pair against
+    /// `supdb-cache64tofitautozpages` prices the cursor held across the
+    /// block, by the groups a mix decodes and asks the memo for first.
+    pub fn create_cache64_tofit_auto_zpages_perrun(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages_auto: true,
+                zperrun: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-cache256tofit` without the trim (`Options::forms_trim_bytes`
     /// zero): against it, the part of the saving that is the allocator's
     /// free pages given back; against `supdb-cache256`, the part that is
@@ -4289,6 +4318,7 @@ impl Supdb {
             zexactcut,
             zcheckedviews,
             zmemofirst,
+            zperrun,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -4540,6 +4570,7 @@ impl Supdb {
             zpages_settle_span: !zexactcut,
             zpages_trusted_views: !zcheckedviews,
             zpages_memo_first: zmemofirst,
+            zpages_block_cursor: !zperrun,
             zpages_seek_ord: if zpages_heads {
                 true
             } else {
@@ -4722,6 +4753,7 @@ impl Supdb {
             zexactcut,
             zcheckedviews,
             zmemofirst,
+            zperrun,
             ord_threads: Default::default(),
         })
     }
@@ -4814,6 +4846,8 @@ impl Engine for Supdb {
                 "supdb-cache64tofitautozpagescheckedviews"
             } else if self.zmemofirst {
                 "supdb-cache64tofitautozpagesmemofirst"
+            } else if self.zperrun {
+                "supdb-cache64tofitautozpagesperrun"
             } else {
                 match self.zgroup {
                     Some(0) => "supdb-cache64tofitautozpagesonegroup",
@@ -6294,6 +6328,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache64tofitautozpagesexactcut"
         | "supdb-cache64tofitautozpagescheckedviews"
         | "supdb-cache64tofitautozpagesmemofirst"
+        | "supdb-cache64tofitautozpagesperrun"
         | "supdb-nocacheautozpagesfairio"
         | "supdb-nocacheautozpagesnoahead"
         | "supdb-nocacheautozpageseager"
@@ -6518,6 +6553,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         }
         "supdb-cache64tofitautozpagesmemofirst" => {
             Box::new(Supdb::create_cache64_tofit_auto_zpages_memofirst(dir)?)
+        }
+        "supdb-cache64tofitautozpagesperrun" => {
+            Box::new(Supdb::create_cache64_tofit_auto_zpages_perrun(dir)?)
         }
         "supdb-nocacheautozpages" => Box::new(Supdb::create_nocache_auto_zpages(dir)?),
         "supdb-nocacheautozpagesfairio" => Box::new(Supdb::create_nocache_auto_zpages_fairio(dir)?),
@@ -7679,6 +7717,35 @@ mod tests {
             )
         );
         drop(memofirst);
+        assert!(supdb::Options::default().zpages_block_cursor && b.zpages_block_cursor);
+        let perrun = new(
+            "supdb-cache64tofitautozpagesperrun",
+            Supdb::create_cache64_tofit_auto_zpages_perrun,
+        );
+        assert_eq!(perrun.name(), "supdb-cache64tofitautozpagesperrun");
+        assert_eq!(guarantee(perrun.name()), guarantee(base.name()));
+        assert_eq!(perrun.features(), base.features());
+        let g = perrun.db.as_ref().unwrap().options();
+        assert!(!g.zpages_block_cursor, "the one option");
+        assert_eq!(
+            (
+                g.zpages,
+                g.zpages_trusted_views,
+                g.zpages_memo_first,
+                g.zpages_settle_span,
+                g.zpages_seek_span,
+                g.scan_cache_bytes
+            ),
+            (
+                b.zpages,
+                b.zpages_trusted_views,
+                b.zpages_memo_first,
+                b.zpages_settle_span,
+                b.zpages_seek_span,
+                b.scan_cache_bytes
+            )
+        );
+        drop(perrun);
         let pre = new(
             "supdb-cache64tofitautozpagesprebuild",
             Supdb::create_cache64_tofit_auto_zpages_prebuild,
