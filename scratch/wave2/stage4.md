@@ -1481,3 +1481,58 @@ however the slots are spread: what is left there is the cap against the
 page cache, which the promotion's refutation says this bound has none to
 spare for.
 
+## The settle's cuts left to the builds
+
+`Options::zpages_settle_span` (on) files a written key under the block the
+form file's fence and the page's directory name (`ZFile::owner_span`) where
+that block holds no form or a wide one, with its cut left unresolved
+(`LAZY_CUT`); a build that reads the block's filed keys resolves them for
+that block (`BuildCtx::filed_cuts`), and a wide walk takes the cut as the
+overlay's unknown one and places the key by key, as it already did for a
+snapshot key whose cut was never taken. `supdb-cache64tofitautozpagesexactcut`
+resolves every cut at the settle through a seek, the shape before.
+`scratch/wave2/zcut-5m.sh`: five million keys under 640 MiB, three pairs
+after the warmup, both orders, the per-mix counters on.
+
+E's settle (the scans' `settle` phase, ms, per rep, 8 reps an arm over the
+two sittings):
+
+| arm | settle | groups decoded |
+|---|---|---|
+| exact | 64.0-85.3 (median 68) | 167,839-167,934 |
+| lazy | 39.1-43.6 (median 40) | 147,035-147,133 |
+
+Every rep of both orders, 27 ms off a settle of 68 and 20,800 fewer group
+decodes (12%). The lazy cuts filed: 40,878 of the 44,857 distinct keys; the
+builds resolved none of them, since E walks the blocks it meets wide and a
+wide walk needs no cut. No other mix runs the settle (A, C, D and F read 0.00
+in both arms; B's upkeep passes decode 13 groups against 72). E's pass did
+not move by a margin the reps resolve: 503-588 ms lazy against 509-598
+exact, the scans' time 458-535 against 466-553, a spread of 40 ms a rep
+around a saving of 27. The table's other cells move with the column, not
+the arm (the scan pass's single thread lower in the second column of both
+sittings, its three threads higher in both, D higher in both), which is the
+pairing's position effect; the mechanism reaches none of them. Kept on: a
+phase that only E runs, shorter in all sixteen reps, and nothing it reaches
+worse.
+
+## A race in the promotion arm, found by the fuzz under load
+
+The differential fuzz with the form forced, the cache on and the blocks
+promoted to copies in their slots (`ZFUZZ_ZPAGES=1 ZFUZZ_CACHE=all
+ZFUZZ_PROMOTE=1`, the arm `supdb-cache64tofitautozpagespromote`'s option,
+`Options::zpages_promote_copies`) fails a debug assertion in the settle's
+apply -- "a block the writer holds no form for has none published as the
+block" -- in seed 48 of one run over 0..120, and in seed 43 (seal 2 KB,
+partitions of 4 KB, `Upkeep::Background(2)`, the segment work on its own
+thread) in 3-5 runs of a hundred with four processes running the seed at
+once. It is older than this session's changes: the same stress fails 5 of
+100 on b5ea3ae, and 3 of 100 with the settle's lazy cuts on and off alike;
+and it is the promotion's: the seed passes 100 of 100 under the same
+stress with the promotion off. In a release build the assertion is gone
+and the state it guards is a block the writer holds no form for whose
+published form a handle may take, the shape "a form dropped by its writer
+stayed published" names, so it is a wrong-answer risk in that arm. The
+arm is off as shipped and was refuted on its rates; the race is recorded
+here and not yet taken apart.
+

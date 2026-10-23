@@ -874,6 +874,21 @@ pub struct Options {
     /// `supdb-cache64tofitautozpagesmemolinear` is the arm.
     #[doc(hidden)]
     pub zpages_memo_hash: bool,
+    /// A settle files a written key under the block the form file's fence
+    /// and the page's directory name (`ZFile::owner_span`) with its cut
+    /// left unresolved, where that block holds no form a patch would need
+    /// the cut for, and the build that reads the block's filed keys
+    /// resolves them for that block alone (`BuildCtx::filed_cuts`). The
+    /// exact resolve was a seek through the form a distinct key: the E
+    /// mix's first scan settles the 91,143 writes the A, F and D mixes
+    /// left, 44,857 distinct keys, in 55 of the settle's 60 ms at five
+    /// million keys under 640 MiB, 25,740 of the seeks decoding a group,
+    /// for blocks most of which E never builds; a block held wide walks a
+    /// key with its cut unknown, placed by key, as it walks a snapshot key
+    /// whose cut was never taken. Off resolves every key at the settle,
+    /// the shape before; `supdb-cache64tofitautozpagesexactcut` is the arm.
+    #[doc(hidden)]
+    pub zpages_settle_span: bool,
     /// EXPERIMENT: a scan's seek of a covered partition, and the cut where
     /// an unsealed key falls inside its walk, by the ordered index's heads
     /// and the raw records, as before the form served scans, instead of by
@@ -2454,6 +2469,7 @@ impl Default for Options {
             zpages_seek_ord: false,
             zpages_seek_span: false,
             zpages_memo_hash: true,
+            zpages_settle_span: true,
             zpages_scan_prefetch: false,
             zpages_walk_cursor: true,
             zpages_block_cache: true,
@@ -11190,6 +11206,13 @@ impl FormTally {
 /// the copy it saves. Rounds interleaved, one machine.
 const CACHE_DENSE: usize = 16;
 
+/// A filed key's cut not yet resolved (`Options::zpages_settle_span`): the
+/// build that reads the block resolves it (`BuildCtx::filed_cuts`), and a
+/// block held wide passes it to its walk as the overlay's unknown cut,
+/// which the walk places by key. No resolved cut is this, since a cut packs
+/// a rank under the key count, shifted, with one bit beside it.
+const LAZY_CUT: u32 = u32::MAX;
+
 /// Deltas a sparse form made by a splice has room for at birth; full, it
 /// grows to `CACHE_DENSE` at once and doubles from there (`SparseBlock::room`).
 const ROOM_AT_BIRTH: usize = 4;
@@ -12732,6 +12755,9 @@ struct FormsState {
     /// Scans whose first block was a copy walked from the start key with
     /// the rank never sought (`Options::zpages_seek_span`).
     span_starts: std::cell::Cell<u64>,
+    /// Writes a settle filed with their cut unresolved, and filed cuts a
+    /// build resolved (`Options::zpages_settle_span`).
+    lazy_cuts: std::cell::Cell<[u64; 2]>,
     /// For a pass on the upkeep thread: the most writes it reads from the
     /// live log, and the most it settles from the frozen tables' carried
     /// lists, and whether it stopped short of either, for the thread to
@@ -12850,6 +12876,7 @@ impl FormsState {
             dir_prefetches: std::cell::Cell::new(0),
             copy_starts: std::cell::Cell::new([0; 2]),
             span_starts: std::cell::Cell::new(0),
+            lazy_cuts: std::cell::Cell::new([0; 2]),
             read_cap: std::cell::Cell::new(0),
             pass_lent: std::cell::Cell::new(0),
             log_short: std::cell::Cell::new(false),
@@ -16124,6 +16151,28 @@ impl Reader {
     /// and a batch resolved in key order hands each key the rank the key
     /// before it reached as `floor`, so the heads' seek gallops from one
     /// answer to the next over warm heads.
+    /// The block a settle may file `key` under with its cut unresolved
+    /// (`Options::zpages_settle_span`): the one the form file's fence and
+    /// the page's directory name (`ZFile::owner_span`), where they name
+    /// one, and where the partition's table holds no form for it that a
+    /// patch reads the cut of -- none, or a wide one, which files keys by
+    /// slot. `None` asks for the exact resolve.
+    fn lazy_block(&self, at: usize, seg: &Seg, key: &[u8]) -> Option<usize> {
+        let (lo, hi) = self.zc(seg)?.owner_span(key)?;
+        if hi <= lo || lo / CACHE_BLOCK != (hi - 1) / CACHE_BLOCK {
+            return None;
+        }
+        let b = lo / CACHE_BLOCK;
+        let tables = self.fs().tables.borrow();
+        let held = tables.get(at)?.borrow();
+        match held.as_ref() {
+            Some(t) => {
+                matches!(t.slots.get(b)?.as_deref(), None | Some(Cached::Wide(_))).then_some(b)
+            }
+            None => Some(b),
+        }
+    }
+
     fn cache_owner_of(&self, seg: &Seg, key: &[u8], floor: usize) -> (usize, u32) {
         let (rank, same) = self.cache_seek_exact(seg, key, floor);
         let owner = if same { rank } else { rank.saturating_sub(1) };
@@ -19328,6 +19377,8 @@ impl Reader {
         let mut floor = 0usize;
         let mut resolved: Vec<(u32, u32, u32, u32, u32, bool, u32)> =
             Vec::with_capacity(pending.len());
+        let lazy = self.opts.zpages_settle_span && !self.opts.forms_pieces_only;
+        let mut lazy_n = 0u64;
         for &(_, _, i) in &keyed {
             let (off, len, new, slot) = pending[i as usize];
             // A key's writes are adjacent here and skipped past the first,
@@ -19359,11 +19410,36 @@ impl Reader {
             let Some(seg) = self.segs()[..np].get(at) else {
                 continue;
             };
-            let (b, cut) = self.cache_owner_of(seg, key, floor);
-            floor = (cut >> 1) as usize;
+            let (b, cut) = match lazy.then(|| self.lazy_block(at, seg, key)).flatten() {
+                Some(b) => {
+                    lazy_n += 1;
+                    (b, LAZY_CUT)
+                }
+                None => {
+                    let (b, cut) = self.cache_owner_of(seg, key, floor);
+                    floor = (cut >> 1) as usize;
+                    (b, cut)
+                }
+            };
             resolved.push((at as u32, b as u32, cut, off, len, new, slot));
         }
-        resolved.sort_unstable_by_key(|r| (u64::from(r.0) << 32) | u64::from(r.2));
+        if lazy_n > 0 {
+            let fs = self.fs();
+            let mut c = fs.lazy_cuts.get();
+            c[0] += lazy_n;
+            fs.lazy_cuts.set(c);
+        }
+        // By partition and then by position: a cut packs the rank it is
+        // taken at, and a cut left unresolved sorts after its block's
+        // resolved ones, so one block's keys stay contiguous.
+        resolved.sort_unstable_by_key(|r| {
+            let c = if r.2 == LAZY_CUT {
+                ((u64::from(r.1) * CACHE_BLOCK as u64 + CACHE_BLOCK as u64 - 1) << 1) | 1
+            } else {
+                u64::from(r.2)
+            };
+            (u64::from(r.0) << 34) | c
+        });
         if self.opts.forms_pieces_only {
             for &(at, b, cut, _, _, _, slot) in &resolved {
                 let tables = self.fs().tables.borrow();
@@ -24852,6 +24928,14 @@ impl Db {
         self.r.fs().span_starts.get()
     }
 
+    /// The writer's own writes a settle filed with their cut unresolved,
+    /// and the filed cuts its builds resolved
+    /// (`Options::zpages_settle_span`).
+    pub fn lazy_cuts(&self) -> [u64; 2] {
+        self.take_back_upkeep();
+        self.r.fs().lazy_cuts.get()
+    }
+
     /// The writer's own seeks that hinted their stride window's
     /// directory, over the store's life (`Options::seek_prefetch_dir`);
     /// a handle's are `Reader::dir_prefetches`.
@@ -28910,6 +28994,41 @@ impl<'s> BuildCtx<'s> {
     }
     /// PROTOTYPE: every key above the partition in block `b`, from the
     /// table's bounds; nothing is seeked.
+    /// Block `b`'s filed keys with every cut a settle left unresolved
+    /// resolved (`Options::zpages_settle_span`): through the same exact
+    /// resolve the settle would have made, for this block alone, where
+    /// the build reads its groups anyway. The list as it is where it holds
+    /// none.
+    fn filed_cuts<'f>(
+        &self,
+        src: Sources<'_>,
+        b: usize,
+        filed: &'f [(u32, u32)],
+    ) -> std::borrow::Cow<'f, [(u32, u32)]> {
+        if !filed.iter().any(|&(_, c)| c == LAZY_CUT) {
+            return std::borrow::Cow::Borrowed(filed);
+        }
+        let mut n = 0u64;
+        let out: Vec<(u32, u32)> = filed
+            .iter()
+            .map(|&(slot, cut)| {
+                if cut != LAZY_CUT {
+                    return (slot, cut);
+                }
+                n += 1;
+                let key = self.mem.key_of(self.mem.entry(slot as usize));
+                let (bb, cut) = self.rd.cache_owner_of(src.seg, key, 0);
+                debug_assert_eq!(bb, b, "a key filed by its span resolved to another block");
+                (slot, cut)
+            })
+            .collect();
+        let fs = self.rd.fs();
+        let mut c = fs.lazy_cuts.get();
+        c[1] += n;
+        fs.lazy_cuts.set(c);
+        std::borrow::Cow::Owned(out)
+    }
+
     fn overlay_all<'a>(
         &'a self,
         src: Sources<'a>,
@@ -28933,7 +29052,8 @@ impl<'s> BuildCtx<'s> {
         let mem = if self.pieces_only {
             Vec::new()
         } else {
-            self.overlay_mem(unsealed, snap, cuts, &frozen, &table.added[b], false)?
+            let filed = self.filed_cuts(src, b, &table.added[b]);
+            self.overlay_mem(unsealed, snap, cuts, &frozen, &filed, false)?
         };
         let pieces: Vec<PieceRun<'_>> = table
             .pieces
@@ -29496,7 +29616,8 @@ impl<'s> BuildCtx<'s> {
             limit,
         );
         let key_of = |slot: u32| self.mem.key_of(self.mem.entry(slot as usize));
-        let filed: Vec<(u32, u32)> = table.added[b]
+        let filed: Vec<(u32, u32)> = self
+            .filed_cuts(src, b, &table.added[b])
             .iter()
             .copied()
             .filter(|&(i, _)| cursor.is_empty() || key_of(i) >= cursor)
