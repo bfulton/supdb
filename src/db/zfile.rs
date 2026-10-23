@@ -293,6 +293,12 @@ pub(super) struct ZCursor<'a> {
     /// (`walk_until`): once a cursor, as `scan_at` asks once a walk.
     asked: bool,
     fell: bool,
+    /// The key the last `skip_to` moved to, and whether the position is
+    /// still its cut -- every record before it below it -- which a later
+    /// key at or above it reads its answer from without a search
+    /// (`skip_to`); a walk or a step from the position ends the claim.
+    last: Vec<u8>,
+    last_ok: bool,
 }
 
 impl<'a> ZCursor<'a> {
@@ -318,6 +324,8 @@ impl<'a> ZCursor<'a> {
             prefetches: 0,
             asked: false,
             fell: false,
+            last: Vec::new(),
+            last_ok: false,
         }
     }
 
@@ -332,6 +340,18 @@ impl<'a> ZCursor<'a> {
         c.rank = rank;
         c.load();
         c
+    }
+
+    /// A cursor nowhere yet, placed by its first `skip_to`, which opens
+    /// the group its key falls in: a batch of cuts over a block opens no
+    /// group the batch does not need, where a cursor placed at the block's
+    /// first rank opened that rank's group whether or not a key fell in it.
+    pub(super) fn unplaced(
+        memo: &'a ZMemo,
+        zfile: &'a ZFile,
+        raw: &'a Blob<MmapBytes>,
+    ) -> ZCursor<'a> {
+        ZCursor::new(memo, zfile, raw)
     }
 
     /// A cursor at the first key at or after `key`, by the fence and the one
@@ -388,7 +408,6 @@ impl<'a> ZCursor<'a> {
     }
 
     /// The rank at the position: the key count at the end.
-    #[cfg(test)]
     pub(super) fn rank(&self) -> usize {
         self.rank
     }
@@ -554,6 +573,10 @@ impl<'a> ZCursor<'a> {
 
     /// The key at the position, or `None` past the end.
     pub(super) fn key(&self) -> Option<&[u8]> {
+        debug_assert!(
+            self.rank < self.end || matches!(self.group, Group::None | Group::Raw),
+            "a spent group is resumed before it is read"
+        );
         match self.group {
             Group::None => None,
             Group::Raw => self.raw.key_at(self.rank),
@@ -566,6 +589,10 @@ impl<'a> ZCursor<'a> {
 
     /// The values at the position, in the raw form's order, and how many.
     pub(super) fn values<F: FnMut(&[u8])>(&self, f: &mut F) -> Result<u64> {
+        debug_assert!(
+            self.rank < self.end || matches!(self.group, Group::None | Group::Raw),
+            "a spent group is resumed before it is read"
+        );
         match self.group {
             Group::None => Ok(0),
             Group::Raw => self.raw.values_at(self.rank, &mut *f),
@@ -587,6 +614,8 @@ impl<'a> ZCursor<'a> {
     /// One record on: the next of the group, or the next group's first,
     /// or the next entry's.
     pub(super) fn advance(&mut self) {
+        self.last_ok = false;
+        self.resume();
         if matches!(self.group, Group::None) {
             return;
         }
@@ -620,6 +649,40 @@ impl<'a> ZCursor<'a> {
         limit: usize,
         f: &mut F,
     ) -> Result<(usize, KeyOrder)> {
+        self.walk_impl(until, limit, f, false)
+    }
+
+    /// `walk_until` for a block's reader (`PartReader::scan`, `scan_until`),
+    /// which reads its block in consecutive runs and asks nothing of the
+    /// position between them but another run, a step or the record under
+    /// a cut: where the limit falls at a group's last record the next group
+    /// is left to the next read from the position, which resumes it
+    /// (`resume`), since the run may be the block's last and the group would
+    /// be opened for nobody -- the walk a run at a time that the reader
+    /// replaced opened nothing past its last record, and the first pairing
+    /// of the reader decoded 0.7% more groups in E for these opens. `key`
+    /// and `values` are not asked of the position before the next read
+    /// resumes it (they assert so under the checked profile); `rank` is
+    /// right either way. The overlay walk keeps `walk_until`, whose caller
+    /// reads the key under the cursor after a walk.
+    pub(super) fn walk_run<F: FnMut(&[u8], &[u8])>(
+        &mut self,
+        until: Option<&[u8]>,
+        limit: usize,
+        f: &mut F,
+    ) -> Result<(usize, KeyOrder)> {
+        self.walk_impl(until, limit, f, true)
+    }
+
+    fn walk_impl<F: FnMut(&[u8], &[u8])>(
+        &mut self,
+        until: Option<&[u8]>,
+        limit: usize,
+        f: &mut F,
+        lazy_end: bool,
+    ) -> Result<(usize, KeyOrder)> {
+        self.last_ok = false;
+        self.resume();
         let mut n = 0usize;
         while n < limit {
             if matches!(self.group, Group::None) {
@@ -684,6 +747,13 @@ impl<'a> ZCursor<'a> {
                 continue;
             }
             if rank >= end {
+                if lazy_end && n >= limit {
+                    // `walk_run`'s end: the run ended at the group's last
+                    // record, and the next group is the next read's to
+                    // open (`resume`).
+                    self.off = off;
+                    return Ok((n, KeyOrder::Greater));
+                }
                 self.next_group();
                 continue;
             }
@@ -694,6 +764,174 @@ impl<'a> ZCursor<'a> {
             }
         }
         Ok((n, KeyOrder::Greater))
+    }
+
+    /// A group a walk spent to its last record (`walk_until` at its limit):
+    /// the next group opened now, at its first record, where the walk left
+    /// it to whoever reads on. Every read from the position goes through
+    /// it first; `key` and `values` expect it done.
+    pub(super) fn resume(&mut self) {
+        if self.rank >= self.end
+            && matches!(self.group, Group::Page(_) | Group::Buf(_) | Group::Memo(..))
+        {
+            self.next_group();
+        }
+    }
+
+    /// The position moved to the first record whose key is not below
+    /// `until`, or to the end, and how that key compares with `until`:
+    /// `Equal` for `until` itself, `Greater` for a key past it and at the
+    /// end. For a batch of keys in key order it is the seek a key
+    /// (`ZFile::cut_in`) with the group kept: where the position is the cut
+    /// of the key before and its record is not below `until`, the cut is
+    /// the position and nothing is searched; else the entry and the group
+    /// `until` falls in are found as a seek finds them, the fence searched
+    /// from the entry held (`ZFence::entry_of_from`) and the page's
+    /// directory, and the group held is kept where it is that group and
+    /// the position is not past `until`, so the records are parsed from
+    /// the position on and each once -- the cuts of a block's overlay keys
+    /// (`PartReader::cut`), where a seek a key opened the group and parsed
+    /// it from its first record for every key. A key in another group, or
+    /// below the position, opens its group as the seek would, at its first
+    /// record. The keys are read and nothing else. `None` where the form
+    /// file cannot say -- out of service, an entry or a page that fails a
+    /// check, a record that does not parse -- after which the cursor has
+    /// fallen (`fell_back`) and the caller takes the cut from the raw form.
+    pub(super) fn skip_to(&mut self, until: &[u8]) -> Option<KeyOrder> {
+        if self.fell || self.zfile.damaged.load(Ordering::Relaxed) {
+            self.fall();
+            return None;
+        }
+        self.resume();
+        // The position is the cut already: every record before it is below
+        // the key before, which is at or below this one; at the end, every
+        // record is.
+        if self.last_ok && self.last.as_slice() <= until {
+            match self.key().map(|k| k.cmp(until)) {
+                None => return Some(KeyOrder::Greater),
+                Some(KeyOrder::Less) => {}
+                Some(order) => {
+                    self.remember(until);
+                    return Some(order);
+                }
+            }
+        }
+        // Where `until` lies: the entry from the one held, and the group in
+        // its page; a key below every entry's is the first record's.
+        let e = self
+            .zfile
+            .fence
+            .entry_of_from(until, self.eidx)
+            .unwrap_or(0);
+        let Some(entry) = self.zfile.fence.entry(e, self.zfile.nkeys as u32) else {
+            self.fall();
+            return None;
+        };
+        let j = if entry.page == ZNOPAGE {
+            0
+        } else {
+            match self.zfile.group_of_key(entry.page as usize, until) {
+                Some(j) => j,
+                None => {
+                    self.fall();
+                    return None;
+                }
+            }
+        };
+        let held = e == self.eidx
+            && j == self.gidx
+            && !matches!(self.group, Group::None)
+            && self
+                .key()
+                .is_some_and(|k| k.cmp(until) != KeyOrder::Greater);
+        if !held {
+            if !self.open_at(&entry, j) {
+                return None;
+            }
+            self.rank = self.gstart;
+            if !matches!(self.group, Group::Raw) {
+                self.place();
+            }
+        }
+        let order = self.advance_until(until);
+        if self.fell {
+            return None;
+        }
+        self.remember(until);
+        Some(order)
+    }
+
+    /// The key `skip_to` moved to, kept for the next.
+    fn remember(&mut self, until: &[u8]) {
+        self.last.clear();
+        self.last.extend_from_slice(until);
+        self.last_ok = true;
+    }
+
+    /// The records from the position parsed for their keys until one is not
+    /// below `until`, or the end: the held group first, then the page's
+    /// next and the next entry's, each opened once. How the key it stands
+    /// at compares with `until`, `Greater` at the end; a record that does
+    /// not parse is damage, the page out of service and the cursor fallen,
+    /// which the caller reads before the answer.
+    fn advance_until(&mut self, until: &[u8]) -> KeyOrder {
+        loop {
+            match self.group {
+                Group::None => return KeyOrder::Greater,
+                Group::Raw => {
+                    if self.fell {
+                        return KeyOrder::Greater;
+                    }
+                    let Some(k) = self.raw.key_at(self.rank) else {
+                        return KeyOrder::Greater;
+                    };
+                    match k.cmp(until) {
+                        KeyOrder::Less => self.advance(),
+                        order => return order,
+                    }
+                }
+                _ => {
+                    let (mut off, mut rank, end) = (self.off, self.rank, self.end);
+                    let mut stop: Option<KeyOrder> = None;
+                    let mut damaged = false;
+                    {
+                        let group = self.group();
+                        while rank < end {
+                            let Some((k, next)) = record_key_next(group, off) else {
+                                damaged = true;
+                                break;
+                            };
+                            match k.cmp(until) {
+                                KeyOrder::Less => {
+                                    off = next;
+                                    rank += 1;
+                                }
+                                order => {
+                                    stop = Some(order);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    self.rank = rank;
+                    if damaged {
+                        self.zfile.fail(self.page);
+                        self.fall();
+                        return KeyOrder::Greater;
+                    }
+                    if rank >= end {
+                        self.next_group();
+                        continue;
+                    }
+                    self.off = off;
+                    self.place();
+                    if self.fell {
+                        return KeyOrder::Greater;
+                    }
+                    return stop.unwrap_or(KeyOrder::Greater);
+                }
+            }
+        }
     }
 }
 
@@ -4079,6 +4317,227 @@ mod tests {
             agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
             assert_eq!(zfile.verified_pages(), before, "{name}");
         }
+    }
+
+    /// A cursor moved to a key (`ZCursor::skip_to`) cuts a batch of keys
+    /// in key order where a seek a key (`ZFile::cut_in`) cuts each: every
+    /// record's key, keys between records, below the first and past the
+    /// last, over the suite's shape and over every record shape; it opens
+    /// each compressed group once over the batch, where the seeks open one
+    /// a key; and keys out of order are answered as the seek from the top
+    /// answers them, the group opened again.
+    #[test]
+    fn a_cursor_moved_to_a_key_agrees_with_the_seek_a_key() {
+        for (name, recs, inline_max) in [
+            ("skipto-suite", suite(3000, 41), 256),
+            ("skipto-shapes", shapes(), 1 << 20),
+        ] {
+            let fx = Fixture::new(name, recs, inline_max);
+            let zfile = fx.zfile();
+            let nkeys = fx.recs.len();
+            let mut probes: Vec<Vec<u8>> = vec![Vec::new(), b"\x00".to_vec()];
+            for (k, _, _) in &fx.recs {
+                probes.push(k.clone());
+                let mut above = k.clone();
+                above.push(0);
+                probes.push(above);
+                if let Some(&last) = k.last() {
+                    let mut below = k.clone();
+                    *below.last_mut().unwrap() = last.wrapping_sub(1);
+                    probes.push(below);
+                }
+            }
+            probes.push(vec![0xff; 20]);
+            probes.sort();
+            probes.dedup();
+            // The seeks, each from the rank the one before reached, as a
+            // block's cuts were taken.
+            let mut want = Vec::with_capacity(probes.len());
+            let mut r = 0usize;
+            for k in &probes {
+                match zfile.cut_in(&fx.memo, r, nkeys, k) {
+                    ZSeek::Served { rank, at, .. } => {
+                        want.push((rank, at));
+                        r = rank;
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            assert_eq!(
+                want.last().map(|w| w.0),
+                Some(nkeys),
+                "the last probe is past every key"
+            );
+            fx.memo.take_counts();
+            let mut cur = ZCursor::unplaced(&fx.memo, &zfile, &fx.blob);
+            let got: Vec<(usize, KeyOrder)> = probes
+                .iter()
+                .map(|k| {
+                    let at = cur.skip_to(k).expect("the form file answers");
+                    (cur.rank().min(nkeys), at)
+                })
+                .collect();
+            assert!(!cur.fell_back());
+            let decoded = cur.decoded;
+            drop(cur);
+            assert_eq!(got, want, "{name}");
+            let (hits, misses) = fx.memo.take_counts();
+            assert_eq!(misses, decoded, "{name}: a miss a decode");
+            // A stored group is parsed where it lies and asks the memo
+            // nothing; every other group is asked for once.
+            let compressed: usize = (0..zfile.pages())
+                .map(|p| {
+                    let v = page_view(zfile.page_bytes(p).unwrap()).unwrap();
+                    (0..v.groups())
+                        .filter(|&j| v.group(j).is_some_and(|g| !g.stored))
+                        .count()
+                })
+                .sum();
+            assert_eq!(
+                (hits + misses) as usize,
+                compressed,
+                "{name}: one open a compressed group"
+            );
+            // Out of key order: every key answered as the seek from the top
+            // answers it, the group opened again where the cursor was past.
+            let mut cur = ZCursor::unplaced(&fx.memo, &zfile, &fx.blob);
+            for k in probes.iter().rev() {
+                let want = match zfile.cut_in(&fx.memo, 0, nkeys, k) {
+                    ZSeek::Served { rank, at, .. } => (rank, at),
+                    other => panic!("{other:?}"),
+                };
+                let at = cur.skip_to(k).expect("the form file answers");
+                assert_eq!(
+                    (cur.rank().min(nkeys), at),
+                    want,
+                    "{name}: key {k:?} out of order"
+                );
+            }
+            assert!(!cur.fell_back());
+        }
+    }
+
+    /// A block reader's walk whose limit falls at a group's last record
+    /// (`walk_run`) opens the next group for nobody: the memo is asked for
+    /// the group the walk opened and no other until the next read from the
+    /// position -- a run, a step or a key sought -- which opens it then and
+    /// stands where the walk left off; the overlay walk's `walk_until`
+    /// stands on the next group's first record at once, its key readable.
+    #[test]
+    fn a_walk_that_ends_at_a_groups_last_record_leaves_the_next_group_to_the_next_read() {
+        let fx = Fixture::new("walk-group-end", suite(3000, 41), 256);
+        let zfile = fx.zfile();
+        let v = page_view(zfile.page_bytes(0).unwrap()).unwrap();
+        assert!(v.groups() > 1, "a page of several groups");
+        let count = v.group(0).unwrap().count as usize;
+        fx.memo.take_counts();
+        let mut cur = ZCursor::at(&fx.memo, &zfile, &fx.blob, 0);
+        let mut seen = Vec::new();
+        let (n, at) = cur
+            .walk_run(None, count, &mut |k: &[u8], _: &[u8]| seen.push(k.to_vec()))
+            .unwrap();
+        assert_eq!((n, at), (count, KeyOrder::Greater));
+        assert_eq!(seen.len(), count);
+        assert_eq!(
+            cur.rank(),
+            count,
+            "the position is the next group's first record"
+        );
+        let (hits, misses) = fx.memo.take_counts();
+        assert_eq!(hits + misses, 1, "the one group the walk opened");
+        // The next read opens it and goes on from there.
+        let (n, _) = cur
+            .walk_run(None, 1, &mut |k: &[u8], _: &[u8]| seen.push(k.to_vec()))
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            seen.last().map(|k| k.as_slice()),
+            Some(fx.recs[count].0.as_slice())
+        );
+        let (hits, misses) = fx.memo.take_counts();
+        assert_eq!(hits + misses, 1, "the next group, opened once");
+        // A step from a spent group is a step into the next.
+        let mut cur = ZCursor::at(&fx.memo, &zfile, &fx.blob, 0);
+        cur.walk_run(None, count, &mut |_: &[u8], _: &[u8]| {})
+            .unwrap();
+        cur.advance();
+        assert_eq!(cur.rank(), count + 1);
+        assert_eq!(cur.key(), Some(fx.recs[count + 1].0.as_slice()));
+        // And a key sought from one is sought from the next group's first.
+        let mut cur = ZCursor::at(&fx.memo, &zfile, &fx.blob, 0);
+        cur.walk_run(None, count, &mut |_: &[u8], _: &[u8]| {})
+            .unwrap();
+        assert_eq!(cur.skip_to(&fx.recs[count].0), Some(KeyOrder::Equal));
+        assert_eq!(cur.rank(), count);
+        // The overlay walk's bulk walk opens the next group at once and
+        // stands on its first record.
+        fx.memo.take_counts();
+        let mut cur = ZCursor::at(&fx.memo, &zfile, &fx.blob, 0);
+        cur.walk_until(None, count, &mut |_: &[u8], _: &[u8]| {})
+            .unwrap();
+        assert_eq!(cur.rank(), count);
+        assert_eq!(cur.key(), Some(fx.recs[count].0.as_slice()));
+        let (hits, misses) = fx.memo.take_counts();
+        assert_eq!(
+            hits + misses,
+            2,
+            "the group walked and the next, opened at once"
+        );
+    }
+
+    /// A cursor moved onto a page that fails its first decode answers
+    /// `None` and has fallen, with the form file out of service, and the
+    /// keys before the page were answered: the caller takes the rest from
+    /// the raw form. A byte of a page the attach does not sample is
+    /// flipped, so the form file attaches and the page fails at its first
+    /// decode.
+    #[test]
+    fn a_cursor_moved_onto_a_damaged_page_falls_back() {
+        let fx = Fixture::new("skipto-damaged", suite(4000, 12), 256);
+        assert!(matches!(fx.build(), Outcome::Built(_)));
+        let pages = fx.attach().unwrap().pages();
+        assert!(
+            pages > 3 * ZSAMPLE_PAGES,
+            "pages enough to leave some unsampled"
+        );
+        let sampled =
+            |p: usize| (0..ZSAMPLE_PAGES).any(|k| k * (pages - 1) / (ZSAMPLE_PAGES - 1) == p);
+        let unsampled: Vec<usize> = (1..pages - 1).filter(|&p| !sampled(p)).collect();
+        let p = unsampled[unsampled.len() / 2];
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fx.out)
+            .unwrap();
+        let mut b = [0u8; 1];
+        let at = (p * ZPAGE + 100) as u64;
+        f.read_at(&mut b, at).unwrap();
+        f.write_at(&[b[0] ^ 0x5a], at).unwrap();
+        drop(f);
+        let zfile = fx
+            .attach()
+            .expect("a damaged page the sample misses attaches");
+        let nkeys = fx.recs.len();
+        let first_on_p = (0..zfile.fence.len())
+            .find_map(|e| {
+                zfile
+                    .fence
+                    .entry(e, nkeys as u32)
+                    .filter(|en| en.page as usize == p)
+                    .map(|en| en.first_rank as usize)
+            })
+            .expect("a page the fence names");
+        assert!(first_on_p > 0 && first_on_p < nkeys);
+        let mut cur = ZCursor::unplaced(&fx.memo, &zfile, &fx.blob);
+        for (i, (k, _, _)) in fx.recs[..first_on_p].iter().enumerate() {
+            assert_eq!(cur.skip_to(k), Some(KeyOrder::Equal), "key {i}");
+            assert_eq!(cur.rank(), i);
+        }
+        assert!(!cur.fell_back() && !zfile.damaged());
+        let k = &fx.recs[first_on_p].0;
+        assert_eq!(cur.skip_to(k), None, "a key on the damaged page");
+        assert!(cur.fell_back() && zfile.damaged());
+        assert_eq!(cur.skip_to(k), None, "fallen for good");
     }
 
     #[test]

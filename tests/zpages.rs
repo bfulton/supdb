@@ -2148,6 +2148,24 @@ fn scans_with_the_block_cache_resolving_every_filed_cut_agree_with_the_model_ove
 }
 
 #[test]
+fn scans_with_a_cursor_a_run_and_a_seek_a_cut_agree_with_the_model_over_every_window() {
+    // The block cache with a block read through a cursor a run, a seek a
+    // cut and a read by rank a replaced record (`Options::zpages_block_cursor`
+    // off), the shape before a block was read through one cursor held
+    // across it: both shapes answer every window alike.
+    windows_over_with(
+        "windows-cache-perrun",
+        true,
+        false,
+        false,
+        true,
+        true,
+        false,
+        false,
+    );
+}
+
+#[test]
 fn scans_with_every_page_view_checked_agree_with_the_model_over_every_window() {
     // The block cache with every view of a form file's page checked and the
     // memo asked after it (`Options::zpages_trusted_views` off), the shape
@@ -2161,6 +2179,7 @@ fn scans_with_every_page_view_checked_agree_with_the_model_over_every_window() {
         true,
         false,
         false,
+        true,
     );
 }
 
@@ -2175,6 +2194,7 @@ fn scans_with_the_memo_asked_before_the_view_agree_with_the_model_over_every_win
         true,
         false,
         false,
+        true,
         true,
         true,
         true,
@@ -2833,9 +2853,10 @@ fn the_prefetch_arm_scans_the_same_and_asks_once_a_walk() {
 }
 
 fn windows_over(name: &str, cache: bool, promote: bool, span: bool, lazy: bool) {
-    windows_over_with(name, cache, promote, span, lazy, true, false);
+    windows_over_with(name, cache, promote, span, lazy, true, false, true);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn windows_over_with(
     name: &str,
     cache: bool,
@@ -2844,6 +2865,7 @@ fn windows_over_with(
     lazy: bool,
     trusted: bool,
     memo_first: bool,
+    block_cursor: bool,
 ) {
     // The scans of a covered partition answer as if the form were not there,
     // with the unsealed keys laid over it: updates, inserts between records
@@ -2866,6 +2888,7 @@ fn windows_over_with(
             o.zpages_settle_span = lazy;
             o.zpages_trusted_views = trusted;
             o.zpages_memo_first = memo_first;
+            o.zpages_block_cursor = block_cursor;
             if span {
                 o.upkeep = supdb::Upkeep::Inline;
             }
@@ -2994,9 +3017,13 @@ fn windows_over_with(
     // Under the promotion's small budget the sheds rebase the tables,
     // which resolve every filed cut again (`rebase_tables`), so its builds
     // may find none left to resolve.
+    // Under the block cursor a build over a covered partition resolves a
+    // filed cut where its walk stops and counts none
+    // (`Options::zpages_block_cursor`), so the resolved count says nothing
+    // of it there.
     if cache && lazy {
         assert!(
-            filed_lazy > 0 && (promote || resolved_lazy > 0),
+            filed_lazy > 0 && (promote || block_cursor || resolved_lazy > 0),
             "lazy cuts {filed_lazy} filed, {resolved_lazy} resolved"
         );
     } else {

@@ -1699,3 +1699,152 @@ is partly the miss that function happens to be the first to touch, so a
 share cut out by instruction is not a share of time saved until a pairing
 says so -- here `view_checked`'s 8.5% of E's samples bought 2.4% of E's
 instructions and nothing the rows can see.
+
+## A block read through one cursor
+
+The profile of E on the combined arm (the section before) put the builds'
+cuts at 5.9% of the main thread and the block walks' opens through
+`cache_scan` at 20.5%, and the code behind both was a read of the same
+group several times over. A block's build or walk over a covered partition
+read the partition in runs between the overlay's keys, and each run went
+through `Reader::cache_scan`, which made a `ZCursor` at the run's rank --
+the fence's entry by rank, the page's view, the directory's group by
+index, the group opened through the memo or decoded, the records parsed
+from the group's start to the rank -- and dropped it at the run's end; the
+cut of each overlay key, where the run ends, was a seek from the fence
+(`cuts_of` for the snapshot's keys at a block's first build,
+`filed_cuts` for the filed keys at every build, `cache_cut` for a key
+neither had resolved), which opened the key's group again; and the record
+an overlay key replaces was read by rank through `cache_values`, which
+located and opened the group a third time. Over a block of sixty-four
+records in four or five groups with `k` overlay keys that is about `2k + 5`
+group opens and `k` fence searches for the four or five opens the walk
+needs, and the counters put E's builds at 13.2 memo asks a block (24,007
+blocks built a pass, 316,780 asks). The sparse walk under
+`forms_pieces_only` (`walk_deltas_over`, an arm's path) had one more: it
+ordered the form's deltas against the memtables' keys by cut, and sought
+the overlay key's cut at every turn of the loop before the key was taken.
+
+**The block read through one cursor** (`Options::zpages_block_cursor`, on;
+`supdb-cache64tofitautozpagesperrun` is the shape before). A build or a
+walk holds one reader over its partition for the block (`db::PartReader`
+over `zfile::ZCursor`): the runs between the overlay's keys are the
+cursor's walk (`walk_until`), consecutive, so the cursor stands where the
+next run begins less the record an overlay key was emitted in place of,
+which it steps over; an overlay key's cut is where the walk stops at the
+key (`walk_until(Some(key))`, the records below it emitted on the way),
+which is `cache_cut`'s answer with the records read once; and the record
+the key replaces is read from the cursor standing on it (`ZCursor::values`),
+as the overlay walk of `scan_partitions` reads it. A sparse build
+(`deltas_for`) reads no records, so its cuts are the cursor moved to each
+key from the group it holds (`ZCursor::skip_to`): the fence searched from
+the entry held (`entry_of_from`), the page's directory for the group, the
+group kept where it is the one held and the position is not past the key,
+and the records parsed forward from the position -- and where the position
+is the cut of the key before and its record is not below this key, the cut
+is the position and nothing is searched, since every record before it is
+below the key before. The cuts of a covered partition's memtable keys are
+left to the build under the option (`cuts_of` and `filed_cuts` resolve
+nothing, `Over::cut` reads "the build searches"), and the pieces-only
+sparse walk orders its two lists by key, which is the order of their cuts
+(the two keys' cuts order as the keys do, and at one cut the memtable key
+first where it is not above the form's, as before), so it seeks nothing
+before a key is taken; the arm keeps that order too, so the pairing prices
+the cursor alone. A fall -- a page that fails a check under the cursor --
+files the cursor's counts and hands the rest of the block to the dispatch
+as before, which reads the raw form. The counts are filed as a partition
+walk's are (`pwalk_close`): a block's walk is one served walk now where
+each run was one, so `zpage_scans` falls by design, and the groups decoded
+and the memo's asks are the mechanism's measure.
+
+The unit tests hold the cursor moved to a key to the seek a key
+(`ZFile::cut_in`) over the suite's shape and over every record shape --
+every record's key, a key between every two records, below the first and
+past the last, in key order from an unplaced cursor and then in reverse
+order from another -- and count the memo's asks: one per compressed group
+of the file in key order (a stored group is parsed where it lies and asks
+nothing), where the seeks ask once a key; a cursor moved onto a page that
+fails its first decode answers every key before the page, `None` for one on
+it, and has fallen with the form file out of service. `tests/zpages.rs`
+runs the windows over a covered store with a cursor a run and a seek a cut
+as well, and `tests/db.rs` holds the pieces-only sparse walk with the
+compact form to the overlay model; the fuzz turns the cursor off in some
+seeds under `ZFUZZ_OPTVARY`. Five mutants each kill their test: the cursor's
+fast path without the key order (the reverse-order probes), the held
+group's check without the position's (the same), the step over a replaced
+record removed (six windows tests), the pieces-only merge taking equal
+keys apart (five pieces-only model tests in `tests/db.rs`; the windows
+tests and forty fuzz seeds let that one through, since the path is the
+arm's -- `walk_deltas_over` runs under `forms_pieces_only` alone -- which
+is why the pieces-only model now runs with the compact form too), and the
+step from a spent group without the resume (the lazy end's test, below).
+
+Paired against the shape before (`scratch/wave2/zblockcur-5m.sh`,
+`zblockcur5m-ab-{1,2}.*`: five pairs a sitting after the warmup, both
+orders, the per-mix counters on, read by `pairing_read.py` as the k-th rep
+of each arm against the k-th of the other). The counts first, deterministic
+across the reps of an arm to a few hundredths of a percent and identical in
+every mix but E, which alone builds blocks: E's walks the counters see fall
+from 104,943 a pass to 57,904, since a block's walk is one where each run
+was one; its memo asks from 316,780 to 256,593 (the hits from 169,682 to
+108,430, the groups re-opened after the walk had opened them, which the
+memo held); and its groups decoded rise from 147,098 to 148,162, 0.7%, with
+24,007 blocks built in both. The rise named a cost of its own: the cursor's
+bulk walk opened the next group whenever a run ended at a group's last
+record -- the limit reached and the group spent in one step -- where the
+per-run walk this replaced opened nothing past its last record, and a
+block's last record ends a group once in fourteen; the opens of groups
+past a block's end are misses as often as not. The reader's walk leaves a
+spent group to the next read now (`ZCursor::walk_run`, with `resume`
+called by every read from the position, and the unit test counting the
+memo's asks across a walk that ends at a group's last record); the overlay
+walk's `walk_until` keeps the cursor on the next group's first record, as
+its test holds and its caller reads, and pays that open at a scan's end
+still -- the no-cache arm's lever, unpaired, on a path a scan with the
+block cache never takes (it returns from `scan_blocks`), so the pairing
+below prices the committed code exactly. The pairing was run again. The
+rates of the first pairing, over the twelve pairs a mix by the mixes' own
+times: E's scans 0.923 of the shape before, slower in 2 of 12 pairs, in
+both orders (0.900 and 0.945 by sitting); C, which builds nothing and
+reads the form by point reads alone, 1.000 (7 of 12), the control the
+pairing carries; B 0.958, A 0.953, F 0.942 and D 0.965 by total, the
+update mixes' commits 0.93-0.94, since a commit's own fill of its batch's
+blocks is a build; the floors from the passes before the install, identical
+code, read 1.008 and 1.084 in one order and 0.976 and 0.960 in the other.
+
+Paired again with the walk leaving a spent group to the next read
+(`zblockcur2-5m.sh`, `zblockcur5mb-ab-{1,2}.*`, the same shape of
+sitting): E's groups decoded read 147,097 a pass against the shape
+before's 147,098, equal to within a group, so the rise was the eager open
+and nothing else; the memo asks 254,358 against 316,780, a fifth fewer;
+the walks 57,904 against 104,943; 24,007 blocks built in both; and every
+other mix's counts identical, as before. The counts move by about seventy
+across the reps of either arm, the same range in both, which is the memo's
+state from the mixes before. The rates over the twelve pairs: E's scans
+0.977 of the shape before (5 of 12 slower; 0.968 and 0.985 by sitting), C
+1.003 (5 of 12), the update mixes' commits mixed this time (A 1.03, F 1.12
+with 10 of 12 slower, B 0.85, D 0.98), the floors from identical code
+0.96-1.06. Over the four sittings of the two pairings E's scans read for
+the change in every sitting, by 1.5% to 10%, with the control level in all
+four, and the commits' column swung both ways between the pairings: so the
+rates say E moves the way the counts say, by an amount the host decides
+sitting to sitting, and the figure that stands is the counts' -- a fifth of
+E's memo asks and nearly half of its walks' opens gone, the decodes
+unchanged, the same answers (the windows, the model and the fuzz). What a
+memo ask costs is a hash, a compare, an `Arc` clone and its return to the
+recycler, and the fence and directory searches a seek made before it, a
+few hundred instructions each, so sixty thousand of them are about a
+hundredth of E's pass; the lever's larger half, the walks' opens, saved
+nothing by decode because the walk had just put the group in the memo.
+
+The rule the lever adds: count a path's opens as a block pays them -- the
+walk's, the cuts' and the replaced records' together -- before pricing any
+one of them, since the profile named the cuts (5.9%) and the opens the
+walk itself repeated were the larger part by count; and a change that
+holds a group across a walk is read in the decodes as well as the asks,
+since a group opened for a read that never comes is a miss as often as
+not. What E pays now, by the counts, is the decodes themselves -- 147,000
+groups a pass of 105,000 scans, 1.4 a scan, 46% of the memo's asks missing
+-- and the memo's size and admission (`next/README.md`) are the levers on
+that; the decode's own cost is the codec's.
+

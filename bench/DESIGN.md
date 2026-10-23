@@ -326,7 +326,11 @@ reads a verified page's directory trusted, and `supdb-nocachezpagescheckedviews`
 is the forced arm with the same, the pair against `supdb-nocachezpages`;
 `supdb-cache64tofitautozpagesmemofirst` is the combined arm with a
 verified page's group asked of the memo before any view of the page
-(`Options::zpages_memo_first`), where the default asks after it. The forced arm's
+(`Options::zpages_memo_first`), where the default asks after it;
+`supdb-cache64tofitautozpagesperrun` is the combined arm with a block read
+through a cursor a run, a seek a cut and a read by rank a replaced record
+(`Options::zpages_block_cursor` off), where the default reads a block through
+one cursor held across it. The forced arm's
 `sync` builds the form files, so its load carries the build, and in memory
 it reads slower than the raw form: it is an arm for the bound, not a
 default.

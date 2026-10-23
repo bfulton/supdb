@@ -1,12 +1,13 @@
 # Handoff: out-of-core work on the compact form (zpages)
 
 Branch `claude/recover-consolidate-branches-5rwvr5` of `bfulton/supdb`. The
-last engine commit is the one that added the section "This session: E
-profiled, the page view read once" below (`git log -1 -- src/db/zfile.rs`
-names it), pushed, with the full gate (`sh scripts/check.sh`, every group)
-green on its tree and the two fuzz ranges below green on its binary. The
-session before it ended at `d5114b6`, whose record the sections after
-"Where the out-of-core comparison stands" keep.
+last engine commit is the one that added the section "This session: a block
+read through one cursor" below (`git log -1 -- src/db/zfile.rs` names it),
+pushed, with the full gate (`sh scripts/check.sh`, every group) green on
+its tree and the two fuzz ranges below green on its binary. The session
+before it ended at `92a5f35` (the page view read once), and the one before
+that at `d5114b6`; their records are the sections after "Where the
+out-of-core comparison stands".
 
 ## Standing instructions
 
@@ -22,9 +23,9 @@ session before it ended at `d5114b6`, whose record the sections after
   are dominated by position effects. The deterministic per-mix counters are
   the evidence; two sittings of a phase column are the verdict when only that
   phase can move (`CLAUDE.md`, Profiling).
-- Commit trailer (no model identifier anywhere in commits, code or docs):
-  `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` and a
-  `Claude-Session:` line for the session.
+- Commit trailer: the two attribution lines the harness gives the session
+  (`Co-Authored-By:` and `Claude-Session:`), and no model identifier
+  anywhere else -- not in commits, code or docs.
 
 ## Environment (a fresh container)
 
@@ -91,7 +92,71 @@ out of core" (5M keys under 640 MiB):
 The open cell is E. A secondary one is the minute of raw reads before the
 install (the "gear shift").
 
-## This session: E profiled, the page view read once
+## This session: a block read through one cursor
+
+- **Committed: `Options::zpages_block_cursor`** (on; the arm
+  `supdb-cache64tofitautozpagesperrun` is the shape before). A block's
+  build or walk over a covered partition reads the partition through one
+  cursor held across the block (`db::PartReader` over `zfile::ZCursor`):
+  the runs between the overlay's keys by the cursor's walk, each key's cut
+  where the walk stops at the key, a sparse build's cuts by the cursor moved
+  to each key from the group it holds (`ZCursor::skip_to`, with the
+  last-key memory that answers an ascending batch from the position), and
+  the record an overlay key replaces from the cursor standing on it. The
+  shape before opened a cursor per run (`cache_scan`), sought every cut from
+  the fence (`cuts_of`, `filed_cuts`, `cache_cut`) and located every
+  replaced record (`cache_values`), each opening the key's group again --
+  `2k + 5` opens a block of `k` overlay keys for the four or five the walk
+  needs. Under the option `cuts_of` and `filed_cuts` resolve nothing for a
+  covered partition (`Over::cut == u32::MAX` means "the build searches"),
+  and the pieces-only sparse walk (`walk_deltas_over`, the
+  `forms_pieces_only` arm's path) orders its two lists by key instead of
+  by cut, which is the same order without a seek per turn; the arm keeps
+  that order too. The reader's walk (`ZCursor::walk_run`) leaves a group
+  it spent at its limit to the next read (`ZCursor::resume`): the first
+  pairing read E's groups decoded up 0.7% for the next group opened at
+  every run that ended on a group's last record. The overlay walk's
+  `walk_until` keeps the cursor on the next group's first record, as its
+  test holds and `scan_partition_cursor` reads it.
+- **The counts** (`stage4.md`, "A block read through one cursor";
+  `zblockcur-5m.sh`, `zblockcur2-5m.sh`): E's walks the counters see
+  104,943 a pass before, 57,904 after; memo asks 316,780 before, 256,593
+  after the first version and 254,358 after the lazy end; groups
+  decoded 147,098 before, 148,162 and then 147,097; 24,007 blocks
+  built in all. Every other mix's counts are identical, since only E
+  builds blocks. The rates, by the mixes' own times over twelve pairs in
+  both orders: E's scans 0.923 of the shape before in the first pairing
+  (2 of 12 slower; 0.900 and 0.945 by sitting) and 0.977 in the second
+  (5 of 12; 0.968 and 0.985), for the change in all four sittings; C,
+  which builds nothing, 1.000 in the first and 1.003 in the second, the
+  pairing's control; the update mixes' commits 0.93-0.94 in the first (a
+  commit's fill of its batch's blocks is a build) and both ways in the
+  second; the floors from identical code 0.96-1.08. The pairing reader is
+  `scratch/wave2/pairing_read.py`.
+- **Tests**: the cursor moved to a key against the seek a key (every
+  record's key, the keys between, below the first, past the last; in key
+  order with one memo ask per compressed group, and in reverse order); a
+  cursor onto a damaged page falls back after the keys before it; a walk
+  that ends at a group's last record opens no next group; the windows over
+  a covered store under the arm; the pieces-only overlay model with the
+  compact form (`tests/db.rs`), which is the one test that reaches the
+  by-key merge's equal case (the windows tests and forty fuzz seeds let a
+  mutant of it through); the fuzz turns the cursor off in some seeds under
+  `ZFUZZ_OPTVARY`. Five mutants were run, four of the new code and one of
+  the lazy end, each killed by a test in the gate.
+- **The rule this session adds**: count a path's opens as a block pays
+  them -- the walk's, the cuts' and the replaced records' together -- before
+  pricing any one of them, since the profile named the cuts (5.9%) and the
+  opens the walk itself repeated were the larger part; and a change that
+  holds a group across a walk is read in the decodes as well as the asks,
+  since an open made for the next read is a miss as often as not.
+- **The memo-size drafts** stay under `next/` (`next/README.md`: how to
+  run them, and the dry-run trap). The lever C drafts there were superseded
+  by this change and removed.
+- **Untouched**: the shuffled-load kill of the combined arm under 640 MiB
+  and the gear shift, as the session before left them.
+
+## The session before: E profiled, the page view read once (at `92a5f35`)
 
 - **E profiled as it stands** (`stage4.md`, "E as it stands, profiled, and
   the page view read once"): on the combined arm at five million keys under
@@ -210,9 +275,8 @@ Candidates for the next lever, none priced yet:
 
 ## How the pairings were run
 
-The script for the last pairings is `scratch/wave2/zviews-5m.sh`
-(`zviews3-5m.sh` with five pairs a sitting); copy it for a new pair of
-arms. It:
+The script for the last pairings is `scratch/wave2/zblockcur-5m.sh`
+(five pairs a sitting, both orders); copy it for a new pair of arms. It:
 
 - builds `bench` in release;
 - unsets every instrument variable except those it wants, so both arms carry
@@ -223,10 +287,14 @@ arms. It:
 
 It writes `NAME-ab-{1,2}.out` (the table) and `.err` (per-rep lines).
 
-- Read the `.err` per arm by the arm name each line carries, never by parity.
+- Read the `.err` per arm by the arm name each line carries, never by parity:
+  `scratch/wave2/pairing_read.py A B NAME-ab-1.err NAME-ab-2.err` prints, per
+  mix, the two arms' own times paired rep by rep (the geometric mean of B/A
+  and the pairs B was slower in) and each arm's median counters, and names
+  any count that varies across an arm's reps.
 - `mixcounters <arm> <mix> ... ph take/sync/settle/snap ... z reads/dec/groups/memo`
   and `mixkinds <arm> <mix> ... gets N ms scans N ms commits N ms total`.
-- Each sitting takes about 9 minutes.
+- Each sitting takes about 14 minutes at five reps.
 - In the table, column B is the second arm named, so the arms' columns swap
   between the two sittings.
 
@@ -245,4 +313,15 @@ A new arm needs four things: a field on `Policy`/`Supdb` and its name in
 - The perf recordings and callgrind outputs of this session were in its
   scratchpad and are gone; the aggregated profile and the annotate summaries
   are under `prof/` and `zviews-callgrind.txt`.
+- The drafts under `next/` for the memo's size: the engine script's `db.rs`
+  half writes the file directly, so it cannot be dry-run by disarming its
+  `edit` function (`next/README.md`).
+- The overlay walk (`scan_partition_cursor`, the scans of a store with the
+  block cache off) still opens the next group when a scan's limit falls on
+  a group's last record (`walk_until`); `walk_run`'s lazy end is the lever
+  there, unpaired, and its caller would read the key under the cursor only
+  after a resume.
+- The container restarted once during a gate's test group, at the checked
+  compile of the engine, with nothing else running; the gate was run again
+  from the start. `free` read 15.5 GB free of 16 after it.
 - Nothing is uncommitted.
