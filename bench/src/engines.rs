@@ -831,6 +831,11 @@ pub struct Supdb {
     /// `supdb-cache64tofitautozpagesmemolinear`, the pair against
     /// `supdb-cache64tofitautozpages`.
     zmemolinear: bool,
+    /// The combined arm with a settle resolving every written key's cut
+    /// (`Options::zpages_settle_span` off):
+    /// `supdb-cache64tofitautozpagesexactcut`, the pair against
+    /// `supdb-cache64tofitautozpages`.
+    zexactcut: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -1274,6 +1279,9 @@ struct Policy {
     /// The memo's slot unhashed (`Options::zpages_memo_hash` off):
     /// `supdb-cache64tofitautozpagesmemolinear`.
     zmemolinear: bool,
+    /// Every filed cut resolved at the settle (`Options::zpages_settle_span`
+    /// off): `supdb-cache64tofitautozpagesexactcut`.
+    zexactcut: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -1385,6 +1393,7 @@ impl Default for Policy {
             zprebuild: false,
             zspan: false,
             zmemolinear: false,
+            zexactcut: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -3125,6 +3134,23 @@ impl Supdb {
     /// off), the shape before the hash: the pair against
     /// `supdb-cache64tofitautozpages` prices the slots a form file of the
     /// shipped cut could not reach.
+    /// `supdb-cache64tofitautozpages` with a settle resolving every
+    /// written key's cut through a seek (`Options::zpages_settle_span`
+    /// off), the shape before: the pair against
+    /// `supdb-cache64tofitautozpages` prices the cuts left to the builds.
+    pub fn create_cache64_tofit_auto_zpages_exactcut(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages_auto: true,
+                zexactcut: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     pub fn create_cache64_tofit_auto_zpages_memolinear(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
@@ -4186,6 +4212,7 @@ impl Supdb {
             zprebuild,
             zspan,
             zmemolinear,
+            zexactcut,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -4434,6 +4461,7 @@ impl Supdb {
             zpages_prebuild: zprebuild,
             zpages_seek_span: zspan,
             zpages_memo_hash: !zmemolinear,
+            zpages_settle_span: !zexactcut,
             zpages_seek_ord: if zpages_heads {
                 true
             } else {
@@ -4613,6 +4641,7 @@ impl Supdb {
             zprebuild,
             zspan,
             zmemolinear,
+            zexactcut,
             ord_threads: Default::default(),
         })
     }
@@ -4699,6 +4728,8 @@ impl Engine for Supdb {
                 "supdb-cache64tofitautozpagesspan"
             } else if self.zmemolinear {
                 "supdb-cache64tofitautozpagesmemolinear"
+            } else if self.zexactcut {
+                "supdb-cache64tofitautozpagesexactcut"
             } else {
                 match self.zgroup {
                     Some(0) => "supdb-cache64tofitautozpagesonegroup",
@@ -5403,6 +5434,8 @@ impl Engine for Supdb {
             ("start_at_rank", cs[0] as f64),
             ("start_search", cs[1] as f64),
             ("span_starts", db.span_starts() as f64),
+            ("lazy_cuts_filed", db.lazy_cuts()[0] as f64),
+            ("lazy_cuts_resolved", db.lazy_cuts()[1] as f64),
             ("walk_sparse", wk[1] as f64),
             ("walk_other", wk[2] as f64),
             // Seeks that hinted their stride window's directory: see
@@ -6171,6 +6204,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache64tofitautozpagesprebuild"
         | "supdb-cache64tofitautozpagesspan"
         | "supdb-cache64tofitautozpagesmemolinear"
+        | "supdb-cache64tofitautozpagesexactcut"
         | "supdb-nocacheautozpagesfairio"
         | "supdb-nocacheautozpagesnoahead"
         | "supdb-nocacheautozpageseager"
@@ -6383,6 +6417,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         }
         "supdb-cache64tofitautozpagesmemolinear" => {
             Box::new(Supdb::create_cache64_tofit_auto_zpages_memolinear(dir)?)
+        }
+        "supdb-cache64tofitautozpagesexactcut" => {
+            Box::new(Supdb::create_cache64_tofit_auto_zpages_exactcut(dir)?)
         }
         "supdb-nocacheautozpages" => Box::new(Supdb::create_nocache_auto_zpages(dir)?),
         "supdb-nocacheautozpagesfairio" => Box::new(Supdb::create_nocache_auto_zpages_fairio(dir)?),
@@ -7465,6 +7502,31 @@ mod tests {
             )
         );
         drop(linear);
+        assert!(supdb::Options::default().zpages_settle_span && b.zpages_settle_span);
+        let exact = new(
+            "supdb-cache64tofitautozpagesexactcut",
+            Supdb::create_cache64_tofit_auto_zpages_exactcut,
+        );
+        assert_eq!(exact.name(), "supdb-cache64tofitautozpagesexactcut");
+        assert_eq!(guarantee(exact.name()), guarantee(base.name()));
+        assert_eq!(exact.features(), base.features());
+        let g = exact.db.as_ref().unwrap().options();
+        assert!(!g.zpages_settle_span, "the one option");
+        assert_eq!(
+            (
+                g.zpages,
+                g.zpages_memo_hash,
+                g.zpages_seek_span,
+                g.scan_cache_bytes
+            ),
+            (
+                b.zpages,
+                b.zpages_memo_hash,
+                b.zpages_seek_span,
+                b.scan_cache_bytes
+            )
+        );
+        drop(exact);
         let pre = new(
             "supdb-cache64tofitautozpagesprebuild",
             Supdb::create_cache64_tofit_auto_zpages_prebuild,

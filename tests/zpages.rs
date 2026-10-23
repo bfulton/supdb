@@ -2117,7 +2117,7 @@ fn same_window(got: &Window, want: &Window, what: &str) {
 #[test]
 fn scans_agree_with_the_model_over_every_window_of_a_covered_store() {
     // On the nocache policy, the arm's: the scans merge their sources.
-    windows_over("windows", false, false, true);
+    windows_over("windows", false, false, true, true);
 }
 
 #[test]
@@ -2125,15 +2125,26 @@ fn scans_with_the_block_cache_agree_with_the_model_over_every_window_of_a_covere
     // On the default policy, the block cache on: a scan of a covered
     // partition with the cache's forms around it is the case this is for.
     // It holds the seal, so nothing lands under the forms' upkeep.
-    windows_over("windows-cache", true, false, true);
+    windows_over("windows-cache", true, false, false, true);
 }
 
 #[test]
-fn scans_with_the_block_cache_seeking_every_rank_agree_with_the_model_over_every_window() {
-    // The block cache with every scan's start sought for its rank through
-    // a group (`Options::zpages_seek_span` off), the shape before the
-    // span: both shapes answer every window alike.
-    windows_over("windows-cache-nospan", true, false, false);
+fn scans_with_the_block_cache_skipping_a_copys_rank_agree_with_the_model_over_every_window() {
+    // The block cache with a scan's block taken from the fence and the
+    // directory and its rank sought only for a form walked by rank
+    // (`Options::zpages_seek_span`, off as shipped): both shapes answer
+    // every window alike. The upkeep inline, so the dense blocks are the
+    // writer's copies when its windows reach them: lent, a pass of the
+    // thread's built them another way in one full run of four.
+    windows_over("windows-cache-span", true, false, true, true);
+}
+
+#[test]
+fn scans_with_the_block_cache_resolving_every_filed_cut_agree_with_the_model_over_every_window() {
+    // The block cache with a settle resolving every written key's cut
+    // through a seek (`Options::zpages_settle_span` off), the shape before
+    // the cuts were left to the builds: both shapes answer alike.
+    windows_over("windows-cache-exactcut", true, false, true, false);
 }
 
 #[test]
@@ -2142,7 +2153,7 @@ fn scans_with_the_blocks_promoted_to_copies_agree_with_the_model_over_every_wind
     // (`Options::zpages_promote_copies`), under a budget small enough to
     // shed them between the windows, so the walks meet a block as a form,
     // as a copy in its slot, and as a form again after the shed.
-    windows_over("windows-promote", true, true, true);
+    windows_over("windows-promote", true, true, false, true);
 }
 
 #[test]
@@ -2787,7 +2798,7 @@ fn the_prefetch_arm_scans_the_same_and_asks_once_a_walk() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-fn windows_over(name: &str, cache: bool, promote: bool, span: bool) {
+fn windows_over(name: &str, cache: bool, promote: bool, span: bool, lazy: bool) {
     // The scans of a covered partition answer as if the form were not there,
     // with the unsealed keys laid over it: updates, inserts between records
     // and deletes, in the live table and in a frozen one. Windows begin at
@@ -2806,6 +2817,10 @@ fn windows_over(name: &str, cache: bool, promote: bool, span: bool) {
             o.partition_bytes = Some(160 << 10);
             o.scan_block_cache = cache;
             o.zpages_seek_span = span;
+            o.zpages_settle_span = lazy;
+            if span {
+                o.upkeep = supdb::Upkeep::Inline;
+            }
             if promote {
                 o.promote_entries = 50;
                 o.zpages_promote_copies = true;
@@ -2825,6 +2840,19 @@ fn windows_over(name: &str, cache: bool, promote: bool, span: bool) {
     db.hold_seal_landing(true);
     let mut rng = Rng(0x71D1);
     let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    // A short scan first, so the tables stand before the writes, most of
+    // their blocks unbuilt, and the writes reach them through a settle, as
+    // the E mix's do after the mixes before it: written before any scan
+    // they go into the first scan's snapshot and no settle runs, and after
+    // a scan of the whole store every block holds a form a patch needs the
+    // cut for.
+    same_window(
+        &scanned(&db, b"", 10),
+        &window(&model, b"", 10),
+        "before the writes",
+    );
+    // Before the writes: their settle runs at the commits after a scan.
+    let lazies = db.lazy_cuts();
     // Updates and deletes of records, and keys between records.
     for round in 0..3 {
         for _ in 0..120 {
@@ -2910,6 +2938,22 @@ fn windows_over(name: &str, cache: bool, promote: bool, span: bool) {
     // The span is taken where a window starts in a block held as a copy,
     // with the cache on and the option on, and never otherwise.
     let spanned = db.span_starts() - spans;
+    // The writes' cuts left to the builds where their blocks held no form,
+    // and resolved by the builds that read them, with the cache on and
+    // the option on, and never otherwise.
+    let [filed_lazy, resolved_lazy] = db.lazy_cuts();
+    let (filed_lazy, resolved_lazy) = (filed_lazy - lazies[0], resolved_lazy - lazies[1]);
+    // Under the promotion's small budget the sheds rebase the tables,
+    // which resolve every filed cut again (`rebase_tables`), so its builds
+    // may find none left to resolve.
+    if cache && lazy {
+        assert!(
+            filed_lazy > 0 && (promote || resolved_lazy > 0),
+            "lazy cuts {filed_lazy} filed, {resolved_lazy} resolved"
+        );
+    } else {
+        assert_eq!((filed_lazy, resolved_lazy), (0, 0), "lazy cuts with it off");
+    }
     if cache && span && !promote {
         assert!(spanned > 0, "no window took the span");
     } else if !span || !cache {
