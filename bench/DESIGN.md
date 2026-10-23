@@ -319,7 +319,14 @@ two over every slot. `supdb-cache64tofitautozpagesexactcut` is the combined arm 
 settle resolving every written key's cut through a seek
 (`Options::zpages_settle_span` off), where the default files a key under
 the block the fence and the directory name and leaves its cut to the build
-that reads the block. The forced arm's
+that reads the block. `supdb-cache64tofitautozpagescheckedviews` is the
+combined arm with every view of a form file's page checked and the memo
+asked after it (`Options::zpages_trusted_views` off), where the default
+reads a verified page's directory trusted, and `supdb-nocachezpagescheckedviews`
+is the forced arm with the same, the pair against `supdb-nocachezpages`;
+`supdb-cache64tofitautozpagesmemofirst` is the combined arm with a
+verified page's group asked of the memo before any view of the page
+(`Options::zpages_memo_first`), where the default asks after it. The forced arm's
 `sync` builds the form files, so its load carries the build, and in memory
 it reads slower than the raw form: it is an arm for the bound, not a
 default.

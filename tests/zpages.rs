@@ -2148,6 +2148,40 @@ fn scans_with_the_block_cache_resolving_every_filed_cut_agree_with_the_model_ove
 }
 
 #[test]
+fn scans_with_every_page_view_checked_agree_with_the_model_over_every_window() {
+    // The block cache with every view of a form file's page checked and the
+    // memo asked after it (`Options::zpages_trusted_views` off), the shape
+    // before a verified page's directory was read trusted: both shapes
+    // answer every window alike.
+    windows_over_with(
+        "windows-cache-checkedviews",
+        true,
+        false,
+        false,
+        true,
+        false,
+        false,
+    );
+}
+
+#[test]
+fn scans_with_the_memo_asked_before_the_view_agree_with_the_model_over_every_window() {
+    // The block cache with a verified page's group asked of the memo before
+    // any view of the page (`Options::zpages_memo_first`, off as shipped):
+    // a hit answers the group's first record and count from its entry, and
+    // every window answers alike.
+    windows_over_with(
+        "windows-cache-memofirst",
+        true,
+        false,
+        false,
+        true,
+        true,
+        true,
+    );
+}
+
+#[test]
 fn scans_with_the_blocks_promoted_to_copies_agree_with_the_model_over_every_window() {
     // The cache with its blocks held as copies once read
     // (`Options::zpages_promote_copies`), under a budget small enough to
@@ -2799,6 +2833,18 @@ fn the_prefetch_arm_scans_the_same_and_asks_once_a_walk() {
 }
 
 fn windows_over(name: &str, cache: bool, promote: bool, span: bool, lazy: bool) {
+    windows_over_with(name, cache, promote, span, lazy, true, false);
+}
+
+fn windows_over_with(
+    name: &str,
+    cache: bool,
+    promote: bool,
+    span: bool,
+    lazy: bool,
+    trusted: bool,
+    memo_first: bool,
+) {
     // The scans of a covered partition answer as if the form were not there,
     // with the unsealed keys laid over it: updates, inserts between records
     // and deletes, in the live table and in a frozen one. Windows begin at
@@ -2818,6 +2864,8 @@ fn windows_over(name: &str, cache: bool, promote: bool, span: bool, lazy: bool) 
             o.scan_block_cache = cache;
             o.zpages_seek_span = span;
             o.zpages_settle_span = lazy;
+            o.zpages_trusted_views = trusted;
+            o.zpages_memo_first = memo_first;
             if span {
                 o.upkeep = supdb::Upkeep::Inline;
             }

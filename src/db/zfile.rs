@@ -32,9 +32,9 @@
 
 use super::zpages::{
     bind32, check_entry, check_group, decode_group, fill_page, filter_bytes, group_seek, page_view,
-    parse_page, verify_page, walk_group, FenceEntry, Fill, FillScratch, FillStats, GroupBuf,
-    Images, NoPage, SegImages, Trailer, ZError, ZFence, ZGROUP_BYTES, ZMAX_GROUPS, ZNOPAGE, ZPAGE,
-    ZTRAILER,
+    parse_page, verify_page, view_trusted, walk_group, FenceEntry, Fill, FillScratch, FillStats,
+    GroupBuf, Images, NoPage, PageView, SegImages, Trailer, ZError, ZFence, ZGROUP_BYTES,
+    ZMAX_GROUPS, ZNOPAGE, ZPAGE, ZTRAILER,
 };
 use crate::blob::{Blob, BlobOptions, ZSource};
 use crate::bytes::{Bytes, MmapBytes};
@@ -443,9 +443,10 @@ impl<'a> ZCursor<'a> {
         let view = self
             .zfile
             .page_bytes(self.page)
-            .and_then(|page| page_view(page).ok());
+            .and_then(|page| self.zfile.view(self.page, page).ok());
         let Some((opened, gfirst, count, decoded)) =
-            self.zfile.open_group(self.memo, entry, j, &mut self.buf)
+            self.zfile
+                .open_group(self.memo, entry, j, &mut self.buf, view.as_ref())
         else {
             self.fall();
             return false;
@@ -826,12 +827,23 @@ pub(super) fn first_decode<'a>(
 
 /// A verified group of a page: the header's and the directory's values and
 /// the decode, and nothing the first decode already settled.
+#[cfg(test)]
 pub(super) fn verified_group<'a>(
     page: &'a [u8],
     j: usize,
     buf: &'a mut GroupBuf,
 ) -> std::result::Result<Open<'a>, Fail> {
     let view = page_view(page)?;
+    verified_group_in(&view, j, buf)
+}
+
+/// `verified_group` over a view the caller took of the page: the group the
+/// directory names decoded into `buf`, or parsed where it lies.
+pub(super) fn verified_group_in<'a>(
+    view: &PageView<'a>,
+    j: usize,
+    buf: &'a mut GroupBuf,
+) -> std::result::Result<Open<'a>, Fail> {
     let g = view
         .group(j)
         .ok_or(Fail::Check(ZError::Header("no such group in the page")))?;
@@ -839,7 +851,7 @@ pub(super) fn verified_group<'a>(
     if g.stored && !aligned_for_extents(payload) {
         return Err(Fail::Misaligned);
     }
-    let group = decode_group(&view, j, buf)?;
+    let group = decode_group(view, j, buf)?;
     Ok((group, usize::from(g.first), usize::from(g.count), !g.stored))
 }
 
@@ -962,6 +974,11 @@ struct MemoEntry {
     index: u8,
     group: Arc<GroupBuf>,
     len: usize,
+    /// The index in the page of the group's first record, and its record
+    /// count, as the directory names them: what a hit answers with so that
+    /// it reads nothing of the page (`ZFile::open_group`).
+    first: u16,
+    count: u16,
 }
 
 impl Memo {
@@ -1038,14 +1055,16 @@ impl Memo {
         ((h >> 32) as usize) % self.n
     }
 
-    /// The group memoised for `(side, page, index)`, counted a hit.
+    /// The group memoised for `(side, page, index)`, counted a hit: its
+    /// buffer, the bytes of it, and the group's first record index and
+    /// count.
     fn get(
         &mut self,
         zfile: u64,
         page: u32,
         index: u8,
         hashed: bool,
-    ) -> Option<(Arc<GroupBuf>, usize)> {
+    ) -> Option<(Arc<GroupBuf>, usize, u16, u16)> {
         if self.slots.is_empty() {
             return None;
         }
@@ -1053,7 +1072,7 @@ impl Memo {
         match &self.slots[i] {
             Some(e) if e.zfile == zfile && e.page == page && e.index == index => {
                 self.hits += 1;
-                Some((Arc::clone(&e.group), e.len))
+                Some((Arc::clone(&e.group), e.len, e.first, e.count))
             }
             _ => None,
         }
@@ -1065,6 +1084,7 @@ impl Memo {
     /// further entries from a rotating sweep until the bytes held fit, the
     /// entry just put kept, so the bytes never exceed the cap unless this
     /// one group does.
+    #[allow(clippy::too_many_arguments)]
     fn put(
         &mut self,
         zfile: u64,
@@ -1073,6 +1093,8 @@ impl Memo {
         hashed: bool,
         group: Arc<GroupBuf>,
         len: usize,
+        first: u16,
+        count: u16,
     ) {
         self.misses += 1;
         if self.slots.is_empty() {
@@ -1088,6 +1110,8 @@ impl Memo {
             index,
             group,
             len,
+            first,
+            count,
         });
         self.bytes += len;
         let n = self.slots.len();
@@ -1154,7 +1178,7 @@ impl ZMemo {
         page: u32,
         index: u8,
         hashed: bool,
-    ) -> Option<(Arc<GroupBuf>, usize)> {
+    ) -> Option<(Arc<GroupBuf>, usize, u16, u16)> {
         self.memo.borrow_mut().get(zfile, page, index, hashed)
     }
 
@@ -1193,6 +1217,7 @@ impl ZMemo {
         self.memo.borrow_mut().take_free()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn put(
         &self,
         zfile: u64,
@@ -1201,10 +1226,12 @@ impl ZMemo {
         hashed: bool,
         group: Arc<GroupBuf>,
         len: usize,
+        first: u16,
+        count: u16,
     ) {
         self.memo
             .borrow_mut()
-            .put(zfile, page, index, hashed, group, len)
+            .put(zfile, page, index, hashed, group, len, first, count)
     }
 }
 
@@ -1269,6 +1296,12 @@ pub(super) struct ZFile {
     /// (`Options::zpages_memo_hash`).
     memo: bool,
     memo_hashed: bool,
+    /// Whether a verified page's directory is read trusted
+    /// (`Options::zpages_trusted_views`, `ZFile::view`), and whether its
+    /// group is asked of the memo before any view
+    /// (`Options::zpages_memo_first`, `ZFile::open_group`).
+    trusted: bool,
+    memo_first: bool,
     /// Whether a scan asks for the pages it will cross after its first
     /// (`Options::zpages_scan_prefetch`).
     prefetch: bool,
@@ -1304,6 +1337,7 @@ impl ZFile {
     /// absent with nothing raised, so each is an identity refusal.
     ///
     /// `advise` maps the file `MADV_RANDOM`, before its own sampled reads.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn attach(
         path: &Path,
         blob: &Blob<MmapBytes>,
@@ -1312,6 +1346,8 @@ impl ZFile {
         advise: bool,
         memo: impl Into<MemoShape>,
         prefetch: bool,
+        trusted: bool,
+        memo_first: bool,
     ) -> std::result::Result<ZFile, Reject> {
         let memo = memo.into();
         let damage = |e: ZError| Reject::Damage(e.to_string());
@@ -1385,6 +1421,8 @@ impl ZFile {
             ident: t,
             memo: memo != MemoShape::Off,
             memo_hashed: memo == MemoShape::Hashed,
+            trusted,
+            memo_first,
             prefetch,
             #[cfg(test)]
             skewed: None,
@@ -1447,24 +1485,29 @@ impl ZFile {
         self.damaged.store(true, Ordering::Relaxed);
     }
 
-    /// Entry `entry`'s group, opened the one way every read opens one: the
-    /// page the entry names through the first decode's checks where this
-    /// process has not verified it and through the verified path where it
-    /// has, decoded into `buf` or parsed in place for a stored page that is
-    /// aligned; with its record count and whether a decode was made. `None`
-    /// where the page is out of range or a check failed -- the page and the
-    /// form file are out of service then -- or a stored page is misaligned,
-    /// which a mapping never is; the caller answers a fallback.
-    /// Group `j` of the page entry `entry` names, opened: where its bytes
-    /// are, the index in the page of its first record, its record count
-    /// and whether a decode was made; `None` where it could not be, the
-    /// page out of service.
+    /// Entry `entry`'s group `j`, opened the one way every read opens one:
+    /// through the first decode's checks where this process has not
+    /// verified the page and through the verified path where it has,
+    /// decoded into `buf`, taken from the memo, or parsed in place for a
+    /// stored group that is aligned; with the index in the page of its
+    /// first record, its record count and whether a decode was made.
+    /// `None` where the page is out of range or a check failed -- the page
+    /// and the form file are out of service then -- or a stored group is
+    /// misaligned, which a mapping never is; the caller answers a fallback.
+    /// `view` is the page's view where the caller took one to find the
+    /// group, else one is taken here (`ZFile::view`). Under
+    /// `Options::zpages_memo_first` a verified page's group is asked of the
+    /// memo before any view, the entry carrying the group's first record
+    /// and count, so a hit reads nothing of the page; as shipped the memo
+    /// is asked after the view, which says whether the group is compressed,
+    /// the order the shape before had.
     fn open_group<'a>(
         &'a self,
         memo: &ZMemo,
         entry: &FenceEntry<'_>,
         j: usize,
         buf: &'a mut GroupBuf,
+        view: Option<&PageView<'a>>,
     ) -> Option<(Opened<'a>, usize, usize, bool)> {
         let p = entry.page as usize;
         let Some(page) = self.page_bytes(p).filter(|_| p < self.n_pages) else {
@@ -1477,27 +1520,59 @@ impl ZFile {
             return None;
         };
         let was_verified = bit(&self.verified, p);
+        if self.memo_first && self.memo && was_verified {
+            if let Some((g, n, first, count)) =
+                memo.get(self.id, entry.page, index, self.memo_hashed)
+            {
+                return Some((
+                    Opened::Memo(g, n),
+                    usize::from(first),
+                    usize::from(count),
+                    false,
+                ));
+            }
+        }
+        let own;
+        let view: &PageView<'a> = match view {
+            Some(v) => v,
+            None => match self.view(p, page) {
+                Ok(v) => {
+                    own = v;
+                    &own
+                }
+                Err(_) => {
+                    self.fail(p);
+                    return None;
+                }
+            },
+        };
+        let Some(g) = view.group(j) else {
+            self.fail(p);
+            return None;
+        };
         // A compressed group goes through the memo: the group as a decode
         // before left it, for a page this process has verified, since a
         // hit repeats no check as the verified path repeats none; else a
         // decode into a buffer of its own that the memo takes, the page's
         // first decode verifying every group of it. A stored group is
         // parsed where it lies and has nothing to memoise.
-        let compressed = page_view(page)
-            .ok()
-            .and_then(|v| v.group(j))
-            .filter(|g| !g.stored)
-            .map(|g| (usize::from(g.first), usize::from(g.count)));
-        if let (true, Some((first, count))) = (self.memo, compressed) {
-            if was_verified {
-                if let Some((g, n)) = memo.get(self.id, entry.page, index, self.memo_hashed) {
-                    return Some((Opened::Memo(g, n), first, count, false));
+        if self.memo && !g.stored {
+            if was_verified && !self.memo_first {
+                if let Some((g, n, first, count)) =
+                    memo.get(self.id, entry.page, index, self.memo_hashed)
+                {
+                    return Some((
+                        Opened::Memo(g, n),
+                        usize::from(first),
+                        usize::from(count),
+                        false,
+                    ));
                 }
             }
             let mut fresh = memo.fresh_buf();
             let (first, count, ulen) = {
                 let opened = if was_verified {
-                    verified_group(page, j, &mut fresh)
+                    verified_group_in(view, j, &mut fresh)
                 } else {
                     first_decode(page, self.bind, entry, j, &mut fresh)
                 };
@@ -1521,11 +1596,13 @@ impl ZFile {
                 self.memo_hashed,
                 Arc::clone(&g),
                 ulen,
+                first as u16,
+                count as u16,
             );
             return Some((Opened::Memo(g, ulen), first, count, true));
         }
         let opened = if was_verified {
-            verified_group(page, j, buf)
+            verified_group_in(view, j, buf)
         } else {
             first_decode(page, self.bind, entry, j, buf)
         };
@@ -1544,13 +1621,39 @@ impl ZFile {
         }
     }
 
+    /// Page `p`'s view over its bytes `page`: with its directory trusted
+    /// (`view_trusted`) for a page this process has verified, under
+    /// `Options::zpages_trusted_views`, and through every check of
+    /// `page_view` otherwise. What every lookup of a group in a page goes
+    /// through, so the two shapes differ here and nowhere else.
+    fn view<'a>(&self, p: usize, page: &'a [u8]) -> std::result::Result<PageView<'a>, ZError> {
+        if self.trusted && bit(&self.verified, p) {
+            view_trusted(page)
+        } else {
+            page_view(page)
+        }
+    }
+
+    /// Page `p`'s view, where it has bytes and they parse; `None` takes the
+    /// page out of service.
+    fn view_of(&self, p: usize) -> Option<PageView<'_>> {
+        let v = self
+            .page_bytes(p)
+            .filter(|_| p < self.n_pages)
+            .and_then(|page| self.view(p, page).ok());
+        if v.is_none() {
+            self.fail(p);
+        }
+        v
+    }
+
     /// The group of page `p` that holds the record at index `i` of the
     /// page, by the directory; `None` where the page's values do not
     /// parse, the page out of service.
     fn group_of_index(&self, p: usize, i: usize) -> Option<usize> {
         let j = self
             .page_bytes(p)
-            .and_then(|page| page_view(page).ok())
+            .and_then(|page| self.view(p, page).ok())
             .map(|v| v.group_of_index(i));
         if j.is_none() {
             self.fail(p);
@@ -1566,7 +1669,7 @@ impl ZFile {
     fn group_of_key(&self, p: usize, key: &[u8]) -> Option<usize> {
         let j = self
             .page_bytes(p)
-            .and_then(|page| page_view(page).ok())
+            .and_then(|page| self.view(p, page).ok())
             .map(|v| v.group_of_key(key));
         if j.is_none() {
             self.fail(p);
@@ -1607,10 +1710,12 @@ impl ZFile {
         }
         let p = entry.page as usize;
         let first = entry.first_rank as usize;
-        let Some(j) = self.group_of_index(p, rank - first) else {
+        let Some(view) = self.view_of(p) else {
             return Locate::Fallback;
         };
-        let Some((opened, gfirst, _, decoded)) = self.open_group(memo, &entry, j, buf) else {
+        let j = view.group_of_index(rank - first);
+        let Some((opened, gfirst, _, decoded)) = self.open_group(memo, &entry, j, buf, Some(&view))
+        else {
             return Locate::Fallback;
         };
         let mut off = 0usize;
@@ -1665,10 +1770,12 @@ impl ZFile {
             self.fail(p);
             return Locate::Fallback;
         };
-        let Some(j) = self.group_of_key(p, key) else {
+        let Some(view) = self.view_of(p) else {
             return Locate::Fallback;
         };
-        let Some((opened, _, count, decoded)) = self.open_group(memo, &entry, j, buf) else {
+        let j = view.group_of_key(key);
+        let Some((opened, _, count, decoded)) = self.open_group(memo, &entry, j, buf, Some(&view))
+        else {
             return Locate::Fallback;
         };
         let pos = match group_seek(opened.bytes(), count, key) {
@@ -1847,15 +1954,19 @@ impl ZFile {
                 continue;
             }
             let p = entry.page as usize;
-            let Some(mut j) = self.group_of_index(p, rank - first) else {
+            // The page's view once, for the group the rank falls in and for
+            // each group of it opened below.
+            let Some(view) = self.view_of(p) else {
                 out.end = ScanEnd::Fallback;
                 return Ok(());
             };
+            let mut j = view.group_of_index(rank - first);
             // The page's groups from the one the rank falls in, each
             // opened once and walked to its end, the limit or the entry's
             // end.
             while out.seen < limit && rank < end {
-                let Some((opened, gfirst, count, decoded)) = self.open_group(memo, &entry, j, buf)
+                let Some((opened, gfirst, count, decoded)) =
+                    self.open_group(memo, &entry, j, buf, Some(&view))
                 else {
                     out.end = ScanEnd::Fallback;
                     return Ok(());
@@ -2069,11 +2180,12 @@ impl ZFile {
                 }
             };
         }
-        let Some(j) = self.group_of_key(entry.page as usize, key) else {
+        let Some(view) = self.view_of(entry.page as usize) else {
             return ZSeek::Fallback;
         };
+        let j = view.group_of_key(key);
         let mut buf = take_buf();
-        let r = match self.open_group(memo, &entry, j, &mut buf) {
+        let r = match self.open_group(memo, &entry, j, &mut buf, Some(&view)) {
             None => ZSeek::Fallback,
             Some((opened, gfirst, count, decoded)) => {
                 match group_seek(opened.bytes(), count, key) {
@@ -2108,19 +2220,31 @@ impl ZFile {
     /// holds, a page whose view does not check (taken out of service, as
     /// `group_of_key` takes it).
     pub(super) fn owner_span(&self, key: &[u8]) -> Option<(usize, usize)> {
+        let mut none = usize::MAX;
+        self.owner_span_from(key, &mut none)
+    }
+
+    /// `owner_span` for a batch of keys in key order, each from the entry
+    /// the one before was found in: `hint` is that entry, taken as the
+    /// fence's `entry_of_from` takes it and left at the entry found, so a
+    /// run of keys over one page costs a compare or two each where the
+    /// search from the top costs the fence's depth (the settle's filing of
+    /// a sorted batch, `Reader::lazy_block`). `usize::MAX` is no hint.
+    pub(super) fn owner_span_from(&self, key: &[u8], hint: &mut usize) -> Option<(usize, usize)> {
         if self.damaged.load(Ordering::Relaxed) {
             return None;
         }
-        let Some(e) = self.fence.entry_of(key) else {
+        let Some(e) = self.fence.entry_of_from(key, *hint) else {
             return Some((0, 1));
         };
+        *hint = e;
         let entry = self.fence.entry(e, self.nkeys as u32)?;
         let first = entry.first_rank as usize;
         if entry.page == ZNOPAGE {
             return (entry.count == 1).then_some((first, first + 1));
         }
         let p = entry.page as usize;
-        let Some(v) = self.page_bytes(p).and_then(|page| page_view(page).ok()) else {
+        let Some(v) = self.page_bytes(p).and_then(|page| self.view(p, page).ok()) else {
             self.fail(p);
             return None;
         };
@@ -3823,7 +3947,9 @@ mod tests {
         }
 
         fn attach(&self) -> std::result::Result<ZFile, Reject> {
-            ZFile::attach(&self.out, &self.blob, ID, END, false, true, false)
+            ZFile::attach(
+                &self.out, &self.blob, ID, END, false, true, false, true, false,
+            )
         }
 
         /// Attached with the advice, the memo and the scan's prefetch as given.
@@ -3833,7 +3959,9 @@ mod tests {
             memo: bool,
             prefetch: bool,
         ) -> std::result::Result<ZFile, Reject> {
-            ZFile::attach(&self.out, &self.blob, ID, END, advise, memo, prefetch)
+            ZFile::attach(
+                &self.out, &self.blob, ID, END, advise, memo, prefetch, true, false,
+            )
         }
 
         /// Attached with the memo off: for a test of the decode path,
@@ -3842,7 +3970,9 @@ mod tests {
         /// a stored page beside a compressed one. With the memo on, a
         /// page's group is served as it was decoded while it holds.
         fn attach_nomemo(&self) -> std::result::Result<ZFile, Reject> {
-            ZFile::attach(&self.out, &self.blob, ID, END, false, false, false)
+            ZFile::attach(
+                &self.out, &self.blob, ID, END, false, false, false, true, false,
+            )
         }
 
         /// A form file built and attached.
@@ -4229,8 +4359,8 @@ mod tests {
         let mut m = Memo::new(8, 100);
         assert!(m.get(1, 0, 0, true).is_none());
         let (b, n) = g(40);
-        m.put(1, 0, 0, true, b, n);
-        assert_eq!(m.get(1, 0, 0, true).map(|(_, n)| n), Some(40));
+        m.put(1, 0, 0, true, b, n, 0, 1);
+        assert_eq!(m.get(1, 0, 0, true).map(|(_, n, _, _)| n), Some(40));
         assert!(m.get(2, 0, 0, true).is_none(), "another form file's page 0");
         // The same group of another form file in the same slot, found over
         // the identities: only the file compare tells them apart, and this
@@ -4250,10 +4380,10 @@ mod tests {
             "the slots this builds"
         );
         let (b, n) = g(40);
-        m.put(1, 0, 1, true, b, n);
+        m.put(1, 0, 1, true, b, n, 0, 1);
         assert_eq!(m.bytes, 80);
         let (b, n) = g(40);
-        m.put(1, 0, 2, true, b, n);
+        m.put(1, 0, 2, true, b, n, 0, 1);
         assert!(m.bytes <= 100, "{}", m.bytes);
         assert!(m.get(1, 0, 2, true).is_some(), "the entry just put stays");
         assert!(
@@ -4263,12 +4393,12 @@ mod tests {
         assert_eq!((m.hits, m.misses), (2, 3), "a miss a put");
         // A group over the cap on its own is held alone.
         let (b, n) = g(150);
-        m.put(1, 3, 0, true, b, n);
+        m.put(1, 3, 0, true, b, n, 0, 1);
         assert_eq!(m.bytes, 150);
         assert!(m.get(1, 3, 0, true).is_some() && m.get(1, 0, 2, true).is_none());
         // The same page put again replaces, and the bytes follow.
         let (b, n) = g(10);
-        m.put(1, 3, 0, true, b, n);
+        m.put(1, 3, 0, true, b, n, 0, 1);
         assert_eq!(m.bytes, 10);
         // Another page in the same slot, found over the pages: the
         // displaced entry's buffer, which nothing else holds, is kept for a
@@ -4279,20 +4409,20 @@ mod tests {
             .find(|&p| m.slot(1, p, 0, true) == m.slot(1, 3, 0, true))
             .unwrap();
         let (b, n) = g(10);
-        m.put(1, alias, 0, true, b, n);
+        m.put(1, alias, 0, true, b, n, 0, 1);
         assert!(m.get(1, 3, 0, true).is_none() && m.get(1, alias, 0, true).is_some());
         assert_eq!(m.free.len(), 1, "the displaced buffer kept");
         let _ = m.take_free();
         assert!(m.free.is_empty());
         // A group a read still holds is displaced and not recycled.
         let held = Arc::new(GroupBuf::new());
-        m.put(1, 20, 0, true, Arc::clone(&held), 10);
+        m.put(1, 20, 0, true, Arc::clone(&held), 10, 0, 1);
         let before = m.free.len();
         let again = (21u32..)
             .find(|&p| m.slot(1, p, 0, true) == m.slot(1, 20, 0, true))
             .unwrap();
         let (b, n) = g(10);
-        m.put(1, again, 0, true, b, n);
+        m.put(1, again, 0, true, b, n, 0, 1);
         assert!(
             m.get(1, 20, 0, true).is_none() && m.get(1, again, 0, true).is_some(),
             "the same slot"
@@ -4380,13 +4510,152 @@ mod tests {
             ((n - groups, groups), groups),
             "a new identity misses every group once"
         );
-        let off = ZFile::attach(&fx.out, &fx.blob, ID, END, false, false, false).unwrap();
+        let off =
+            ZFile::attach(&fx.out, &fx.blob, ID, END, false, false, false, true, false).unwrap();
         let d4 = read_all(&off);
         assert_eq!(
             (fx.memo.take_counts(), d4),
             ((0, 0), n),
             "the memo off: every read decodes"
         );
+    }
+
+    /// The trusted view of a verified page (`Options::zpages_trusted_views`)
+    /// agrees with the checked view on every page of a built form file --
+    /// the header, every group's entry, key and payload -- so nothing a read
+    /// takes from a directory differs between the two shapes; and over a
+    /// directory damaged after the verification, which the trusted view
+    /// does not check, every value it hands out is bounds-checked where it
+    /// is taken: no byte flipped in a page's header, directory or keys makes
+    /// a view panic, whatever is asked of it.
+    #[test]
+    fn a_trusted_view_agrees_with_the_checked_view_and_never_panics_on_damage() {
+        for (name, recs, inline_max) in [
+            ("trusted-suite", suite(3000, 41), 256),
+            ("trusted-shapes", shapes(), 1 << 20),
+        ] {
+            let fx = Fixture::new(name, recs, inline_max);
+            let zfile = fx.zfile();
+            assert!(zfile.pages() > 0);
+            for p in 0..zfile.pages() {
+                let page = zfile.page_bytes(p).unwrap();
+                let c = page_view(page).unwrap();
+                let t = view_trusted(page).unwrap();
+                assert_eq!(c.header, t.header, "page {p}");
+                assert_eq!(c.groups(), t.groups(), "page {p}");
+                for j in 0..=c.groups() {
+                    assert_eq!(c.group(j), t.group(j), "page {p} group {j}");
+                    assert_eq!(c.key(j), t.key(j), "page {p} group {j}");
+                    assert_eq!(c.payload(j), t.payload(j), "page {p} group {j}");
+                }
+                for i in [0usize, 1, 7, usize::from(c.header.count) - 1] {
+                    assert_eq!(
+                        c.group_of_index(i),
+                        t.group_of_index(i),
+                        "page {p} index {i}"
+                    );
+                }
+                for k in [&b""[..], b"0", b"rand-00100", b"\xff\xff"] {
+                    assert_eq!(c.group_of_key(k), t.group_of_key(k), "page {p} key {k:?}");
+                }
+            }
+            // Damage after the verification: the header, the directory and
+            // the keys, one byte at a time, every value over the page.
+            let probes: [&[u8]; 4] = [b"", b"0", b"rand-00100", b"\xff\xff"];
+            for p in [0, zfile.pages() / 2, zfile.pages() - 1] {
+                let page = zfile.page_bytes(p).unwrap();
+                let mut copy = page.to_vec();
+                for at in 0..256.min(copy.len()) {
+                    for flip in [0x01u8, 0x80, 0xff] {
+                        copy[at] ^= flip;
+                        if let Ok(v) = view_trusted(&copy) {
+                            let n = v.groups();
+                            for j in 0..=n {
+                                let _ = (v.group(j), v.key(j), v.payload(j));
+                            }
+                            for i in [0usize, 1, 255, usize::from(v.header.count)] {
+                                let _ = v.group_of_index(i);
+                            }
+                            for k in probes {
+                                let _ = v.group_of_key(k);
+                            }
+                        }
+                        copy[at] ^= flip;
+                    }
+                }
+                assert_eq!(copy, page, "the page restored");
+            }
+        }
+    }
+
+    /// A memo hit asked before any view (`Options::zpages_memo_first`)
+    /// answers the group's first record index and count from its entry,
+    /// reading nothing of the page: a scan of the whole form file and a seek
+    /// of every key answer, through the hits, as they did through the
+    /// decodes that filled the memo. Asked after the view, trusted or
+    /// checked, the same from the view.
+    #[test]
+    fn a_memo_hit_carries_the_groups_first_and_count() {
+        for (trusted, memo_first) in [(true, true), (true, false), (false, false)] {
+            let fx = Fixture::new(
+                match (trusted, memo_first) {
+                    (true, true) => "memo-first",
+                    (true, false) => "memo-first-after",
+                    _ => "memo-first-checked",
+                },
+                suite(3000, 41),
+                256,
+            );
+            assert!(matches!(fx.build(), Outcome::Built(_)));
+            let zfile = ZFile::attach(
+                &fx.out, &fx.blob, ID, END, false, true, false, trusted, memo_first,
+            )
+            .unwrap();
+            type Emitted = Vec<(Vec<u8>, Vec<u8>)>;
+            let scan = |zfile: &ZFile| -> (Emitted, u64) {
+                let mut out: Emitted = Vec::new();
+                let r = zfile
+                    .scan_at(
+                        &fx.memo,
+                        &fx.blob,
+                        0,
+                        usize::MAX,
+                        &mut |k: &[u8], v: &[u8]| out.push((k.to_vec(), v.to_vec())),
+                    )
+                    .unwrap();
+                assert!(matches!(r.end, ScanEnd::Served), "{:?}", r.end);
+                (out, r.decoded)
+            };
+            let seeks = |zfile: &ZFile| -> Vec<(usize, KeyOrder)> {
+                fx.recs
+                    .iter()
+                    .map(|r| match zfile.seek(&fx.memo, &r.0) {
+                        ZSeek::Served { rank, at, .. } => (rank, at),
+                        other => panic!("{other:?}"),
+                    })
+                    .collect()
+            };
+            fx.memo.take_counts();
+            let (first_pass, d1) = scan(&zfile);
+            assert!(d1 > 0, "the first pass decodes");
+            assert_eq!(
+                first_pass.len(),
+                fx.recs.iter().map(|r| r.1.len()).sum::<usize>()
+            );
+            let seeks1 = seeks(&zfile);
+            assert!(seeks1.iter().all(|&(_, at)| at == KeyOrder::Equal));
+            fx.memo.take_counts();
+            let (second_pass, d2) = scan(&zfile);
+            let seeks2 = seeks(&zfile);
+            let (hits, misses) = fx.memo.take_counts();
+            assert_eq!((d2, misses), (0, 0), "the second pass hits for every group");
+            assert!(hits > 0);
+            assert_eq!(
+                first_pass, second_pass,
+                "trusted {trusted} memo first {memo_first}"
+            );
+            assert_eq!(seeks1, seeks2, "trusted {trusted} memo first {memo_first}");
+        }
     }
 
     #[test]
@@ -4411,11 +4680,11 @@ mod tests {
         one.zfile();
         let b = &one.blob;
         assert!(matches!(
-            ZFile::attach(&one.out, b, ID + 1, END, false, true, false),
+            ZFile::attach(&one.out, b, ID + 1, END, false, true, false, true, false),
             Err(Reject::Identity(_))
         ));
         assert!(matches!(
-            ZFile::attach(&one.out, b, ID, END + 1, false, true, false),
+            ZFile::attach(&one.out, b, ID, END + 1, false, true, false, true, false),
             Err(Reject::Identity(_))
         ));
         // No file is no rejection.

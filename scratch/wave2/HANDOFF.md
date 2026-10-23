@@ -1,9 +1,12 @@
 # Handoff: out-of-core work on the compact form (zpages)
 
 Branch `claude/recover-consolidate-branches-5rwvr5` of `bfulton/supdb`. The
-last engine commit is `d5114b6`, pushed, and the full gate (`sh
-scripts/check.sh`, every group) was green on it. This note is the only
-thing committed after it.
+last engine commit is the one that added the section "This session: E
+profiled, the page view read once" below (`git log -1 -- src/db/zfile.rs`
+names it), pushed, with the full gate (`sh scripts/check.sh`, every group)
+green on its tree and the two fuzz ranges below green on its binary. The
+session before it ended at `d5114b6`, whose record the sections after
+"Where the out-of-core comparison stands" keep.
 
 ## Standing instructions
 
@@ -88,7 +91,60 @@ out of core" (5M keys under 640 MiB):
 The open cell is E. A secondary one is the minute of raw reads before the
 install (the "gear shift").
 
-## This session's commits and verdicts
+## This session: E profiled, the page view read once
+
+- **E profiled as it stands** (`stage4.md`, "E as it stands, profiled, and
+  the page view read once"): on the combined arm at five million keys under
+  640 MiB, E's main thread is the LZ4 decode 26.5%; the lookup machinery
+  around it about a third (`view_checked` 8.5%, the fence's `entry_of` 5.2%,
+  `open_group`'s own 4.7%, `group_seek` 2.2%, the memo's `recycle` 2%); the
+  walk and emit a fifth; the harness's Zipfian generator and clock an eighth
+  (LMDB pays the same); the one-off settle and builds a seventh. By caller
+  `ZFile::seek` is 27% inclusive (the scans' start seeks 22%, the builds'
+  cuts 5.4%), `materialize` 10.3% with `cuts_of` 5.9% -- a seek from the
+  fence's top per snapshot key over a block. The tooling is committed:
+  `prof/profile-e.sh` (perf attached to the harness at each mixes pass's
+  start, detached at E's end; set `SCRATCH`) and `prof/aggregate.py` (the
+  window cut by the phase marks, self and inclusive by symbol, callers by
+  substring; `c++filt` demangles the v0 names). perf slows E about 1.3x, so
+  read shares, not times. The aggregated profile is `prof/E-cache64-*.txt`.
+- **Committed: `Options::zpages_trusted_views`** (on): a verified page's
+  directory read trusted (`zpages::view_trusted`), one view per page open,
+  the settle's lazy filing from the entry before (`ZFence::entry_of_from`);
+  arms `supdb-cache64tofitautozpagescheckedviews` and the forced
+  `supdb-nocachezpagescheckedviews`. **`Options::zpages_memo_first`** (off):
+  the memo asked before any view, the entry carrying the group's first and
+  count; arm `supdb-cache64tofitautozpagesmemofirst`. Exact count
+  (`zviews-callgrind.txt`): a point read 5,018 against 5,315 instructions
+  (-5.6%), the views 144 against 437; an E scan on the merge path 78,167
+  against 80,119 (-2.4%). Pairings: both on against the shape before
+  (`zviews-5m.sh`, `zviews2-5m.sh`, four sittings) read the counts identical
+  and the rates 1-4% against on every mix, 44 of 72 pairs, inside a floor of
+  a tenth; the trusted views alone (`zviews3-5m.sh`, five pairs a sitting,
+  two sittings) read C and E for (0.98) and A, B, D, F against (1.05-1.07),
+  37 of 60, the pairs swinging a quarter. The lean is left with the memo
+  asked first, which reorders two misses; the trusted view reads the same
+  bytes in the same order. If the host quiets, pair `supdb-cache64tofitautozpages`
+  against `...checkedviews` again before building on it.
+- **The rule this session adds** (`stage4.md`'s section ends with it): a perf
+  share attributed to a function is partly the miss that function is the
+  first to touch, so a share cut out by instruction is not a share of time
+  saved until a pairing says so; and a change that reorders two loads is
+  priced in time as well as by instruction.
+- **Drafted, not applied** (`next/README.md`): lever C, a block's snapshot
+  keys cut by one cursor moved forward key by key (`cuts_of` is 5.9% of E;
+  the raw path already cuts this way); the memo's cap as an option with arms
+  at 16 and 32 MiB, to count the decodes a larger memo saves before pricing
+  the page cache it takes (E's memo hits 54% over four looks a scan; the
+  static optimum for 8 MiB over this Zipfian is about 66%, for 32 MiB about
+  76%); then an admission policy for the memo, which the design's 3.7 names
+  as the arm if the hit rate lands under 0.45.
+- **Untouched**: the shuffled-load kill of the combined arm under 640 MiB
+  (`stage4.md`, "Against the comparators out of core") -- a census sampled
+  through the load is the instrument it needs; and the gear shift, which the
+  eager entry's sittings (`stage4.md`) left as it stands.
+
+## The session before: its commits and verdicts (at `d5114b6`)
 
 - **`dda952d` / `b5ea3ae`: the page as a container of groups.** A point read
   decodes one group. Kept, with the pairings in stage4.md.
@@ -123,7 +179,7 @@ install (the "gear shift").
   stress went from 9/220 to 0/400. The cause is written into the existing
   `CLAUDE.md` shape entry "A form dropped after the copy stood as the block".
 
-## E: what is known after this session
+## E: what was known after the session before (at `d5114b6`)
 
 The pairing: 5M keys, `--bound 671088640 --ops-div 10`, three reps after the
 warmup.
@@ -154,8 +210,9 @@ Candidates for the next lever, none priced yet:
 
 ## How the pairings were run
 
-The script for the last pairing is `scratch/wave2/zcut-5m.sh`; copy it for a
-new pair of arms. It:
+The script for the last pairings is `scratch/wave2/zviews-5m.sh`
+(`zviews3-5m.sh` with five pairs a sitting); copy it for a new pair of
+arms. It:
 
 - builds `bench` in release;
 - unsets every instrument variable except those it wants, so both arms carry
@@ -185,4 +242,7 @@ A new arm needs four things: a field on `Policy`/`Supdb` and its name in
   other deferral was audited.
 - The promotion arm stays off as shipped (refuted on rates); its race is
   fixed.
+- The perf recordings and callgrind outputs of this session were in its
+  scratchpad and are gone; the aggregated profile and the annotate summaries
+  are under `prof/` and `zviews-callgrind.txt`.
 - Nothing is uncommitted.

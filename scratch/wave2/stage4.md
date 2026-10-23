@@ -1560,3 +1560,142 @@ look as it was it fails with the fuzz's own assertion, with the fix it
 passes. The seed's stress: 9 failures in 220 runs before, none in 200 on
 the fix with the event ring and the 400 below without it.
 
+## E as it stands, profiled, and the page view read once
+
+E on the combined arm (`supdb-cache64tofitautozpages`), profiled with perf
+on cpu-clock and DWARF stacks over the mixes of two reps at five million
+keys under 640 MiB (`scratch/wave2/../prof/profile-e.sh`: perf attached to
+the harness at each mixes pass's start and detached at E's end, the
+samples cut to E's window by the phase marks and to the main thread,
+4,492 samples; perf slows E's scans about 1.3x, so the shares are read and
+the times are not). The counts are the pairings': 79,198 scans, 1.33 walks
+through the form a scan, 1.86 groups decoded a scan, 4.0 memo looks a scan
+at a 54% hit rate, 24,007 blocks built, 78,631 block walks as copies,
+30,410 as sparse forms and 18,321 clean or wide, the settle of the
+earlier mixes' 49,035 writes at the first scan.
+
+By self time: LZ4 decompression 26.5%; `view_checked` 8.5%; the fence's
+binary search `entry_of` 5.2%; `scan_blocks` 5.1%; `open_group` 4.7%;
+memcpy 4.4% (the copy walks' values into the harness's sink);
+`cache_scan` 3.6%; the harness's Zipfian generator and clock about 12.5%
+(`pow`, `exp`, `log`, `run::ycsb`, the vdso); `prefetch_block` 2.3%;
+`group_seek` 2.2%; `Memo::recycle` 2.0%; the settle (`settle_each`, the
+radix sort, `sync_log`) about 3%. By caller: `ZFile::seek` is 27% of the
+thread inclusive -- 22% the scans' start seeks through `cache_seek_exact`
+and 5.4% the builds' cuts through `part_cut_z` -- and inside it the group
+open 15% (the start group's decode where the memo misses), `entry_of`
+4.7%, the view 4.1%, `group_seek` 2.4%; `materialize` is 10.3%, of which
+`cuts_of` 5.9%, a seek from the fence's top per snapshot key over a block;
+the block walks' opens through `cache_scan` and `part_scan_z` 20.5%. The
+view's 8.5% comes from `seek` (4.1), `group_of_index` (1.6), `owner_span`
+(1.2, the settle's lazy filing), `open_group` (1.1) and `verified_group`
+(0.5): two or three full validations of a page's directory per group
+opened, since the group's index took one, the open took another, and a
+miss's decode a third. In D, where every read decodes, the view is 15% and
+`entry_of` 11.5%.
+
+So E's remaining time on this arm is the decode (a quarter), the lookup
+machinery around it (a third: the views, the fence search, the memo's
+bookkeeping, the group seeks), the walk and emit (a fifth), the harness
+(an eighth), and the one-off settle and builds (a seventh) -- and the
+harness's share is LMDB's too.
+
+**The page view read once, trusted** (`Options::zpages_trusted_views`, on;
+`supdb-cache64tofitautozpagescheckedviews` and the forced
+`supdb-nocachezpagescheckedviews` are the shape before). A verified page's
+directory is read by `view_trusted`: the header's bounds and where each
+group's key lies, none of the cross-checks between the directory's values
+that the first decode made once and `view_checked` re-made at every open
+(the keys ascending, the firsts ascending below the count, each payload
+where the one before ends, the lengths summing); every slice a view hands
+out stays bounds-checked where it is taken, a group whose first is past
+the next's is no group (`PageView::group`), and the decode bounds the
+group's length itself (`decode_group`). A read takes a page's view once,
+for the group it wants and the open of it (`scan_in`, `seek`, `locate`,
+`locate_rank`, the cursor's `open_at`), and the settle's lazy filing finds
+each key's fence entry from the one before (`ZFence::entry_of_from`, a
+gallop from the hint, the same answer as the search from the top for every
+key and every hint, held by its test). Beside it, as an option of its own,
+**the memo asked before any view** (`Options::zpages_memo_first`, off;
+`supdb-cache64tofitautozpagesmemofirst` is the arm): a verified page's
+group asked of the memo first, the memo's entry carrying the group's first
+record index and count, so a hit reads nothing of the page, where the
+shape before asks after the view, which says whether the group is
+compressed. The unit tests hold the trusted view to the checked view on
+every page of a built form file -- the header, every group's entry, key
+and payload, the lookups by index and by key -- and to never panicking on
+a page whose header, directory or keys were damaged after verification,
+one byte at a time, whatever is asked of the view; a memo hit's first and
+count to a whole-file scan and a seek of every key through the hits
+answering as through the decodes, under the memo asked first and after;
+and the three mutants (the key offsets left unset, the entry's first
+stored as zero, the gallop stopped at the first entry at or below) each
+kill their test. `tests/zpages.rs` runs the windows over a covered store
+with the views checked and with the memo asked first as well, and the fuzz
+turns the one off and the other on in some seeds under `ZFUZZ_OPTVARY`.
+
+Counted exactly (callgrind over the suite's probes in core, a hundred
+thousand keys, the forced form so that every read is the form's from the
+first: `read_only` for the point read, `e_passes` for E's scans,
+`supdb-nocachezpagescheckedviews` against `supdb-nocachezpages`, two
+hundred thousand reads and thirty-two thousand scans a run, the memo asked
+first in both). A point read through the form is 5,018 instructions with
+the views trusted against 5,315 with them checked, 297 fewer (5.6%): the
+view's 437 instructions a read became 144, and the decode (2,338), the
+group seek (603) and the fence's search (573) are the same to the
+instruction, as they should be, since the change touches nothing of them.
+An E scan on the nocache arm's merge path is 78,167 against 80,119, 1,952
+fewer (2.4%), of which the cursor's page open 1,414. The memo asked first
+moves no count: it reorders a lookup and a touch.
+
+Paired, first as one change -- the trusted views with the memo asked
+first, both on, against the shape before (`scratch/wave2/zviews-5m.sh`
+and `zviews2-5m.sh`, `zviews5m-ab-{1,2}.*` and `zviews5mb-ab-{1,2}.*`:
+three pairs after the warmup a sitting, both orders, twice). The counts
+are identical in every rep of both arms -- E's 147k groups decoded and
+170k memo hits, C's 83,334 reads and 34.5k decodes, D's 77.5k decodes --
+so the arms do the same work and nothing fell back to the raw form. The
+rates read against the change: over the four sittings' twelve pairs a
+mix, the arm with it on is slower in 9 of 12 on E (the scans' time, the
+geometric mean 1.015), 8 of 12 on C (1.043), 7 of 12 on A, B and F
+(1.02-1.04), 6 of 12 on D (1.013) -- 44 of 72 pairs, every mix's mean
+against, 1-4%, where the floor of a sitting read off the passes before
+the install, which both arms serve with the raw form and identical code,
+is about a tenth (the scan pass 0.93x in one order and 1.12x in the
+other). A lean of a few percent inside that floor, but the same way in
+every mix across four sittings, for a change that executes 2-6% fewer
+instructions: a cost the count does not show. Of the two parts, the view
+is nearly the whole of the instruction saving and touches the same bytes
+in the same order; the memo asked first saves nothing by instruction and
+moves the memo slot's load ahead of the page's first touch, two misses
+that the shape before had overlapped under the view's work and the
+reorder serializes -- a reading, not a measurement, since this guest has
+no cycle counters (`CLAUDE.md`, profiling). So the change was split: the
+views trusted ship, the memo asked first is an arm, off, and the trusted
+views alone were paired against the shape before with five pairs a sitting
+(`zviews3-5m.sh`, `zviews5mc-ab-{1,2}.*`).
+
+The trusted views alone against the shape before (`zviews5mc-ab-{1,2}.*`,
+five pairs after the warmup a sitting, both orders): the counts identical
+again, and the rates mixed inside a floor that read the scan pass of
+identical code at 0.905x in one order and 0.994x in the other, the pairs
+swinging a quarter either way. Over the ten pairs a mix, by the gets' and
+the scans' own time, the trusted arm is faster on the two mixes that read
+the form most -- C 4 of 10 pairs slower, the geometric mean 0.980; E 4 of
+10, 0.984 -- and slower on the rest: B 8 of 10 (1.067), A 8 of 10 (1.063),
+D 7 of 10 (1.046), F 6 of 10 (1.052); 37 of 60 in all. No mechanism puts
+the trusted view behind the checked one on A, B, D or F and ahead on C and
+E -- it reads the same bytes in the same order and executes strictly fewer
+instructions on every path, and D, all misses, is where it saves the most
+by count -- so the split is read as the host's, and the lean the two
+pairings before carried is left with the memo asked first, which the
+split's pairing did not run. What ships: the views trusted, on, by the
+exact count, with the rates unresolved and the two heaviest readers of the
+form for; the memo asked first, off, with its lean recorded. The rule the
+session adds: a change that reorders two loads is priced in time as well
+as by instruction, since the count cannot see a miss moved from under a
+stretch of work to ahead of it; and a perf share attributed to a function
+is partly the miss that function happens to be the first to touch, so a
+share cut out by instruction is not a share of time saved until a pairing
+says so -- here `view_checked`'s 8.5% of E's samples bought 2.4% of E's
+instructions and nothing the rows can see.
