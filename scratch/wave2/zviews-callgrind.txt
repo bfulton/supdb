@@ -1,0 +1,35 @@
+# callgrind over the suite's probes in core, 100k keys, the forced form: the trusted views (supdb-nocachezpages) against the checked (supdb-nocachezpagescheckedviews); inclusive instructions, 200k point reads (read_only) and 2x~15.8k E scans (e_passes)
+## read_only supdb-nocachezpages
+1,003,579,028 (56.27%)  /home/user/supdb/bench/src/engines.rs:<supdb_bench::engines::Supdb as supdb_bench::engines::Engine>::get
+1,003,179,028 (56.25%)  bench/src/engines.rs:<supdb_bench::engines::Supdb as supdb_bench::engines::Engine>::get [/home/user/supdb/bench/target/release/examples/read_only]
+  506,195,586 (28.38%)  src/db/zfile.rs:<supdb::db::zfile::ZFile>::open_group [/home/user/supdb/bench/target/release/examples/read_only]
+  467,678,659 (26.22%)  /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/lz4_flex-0.11.6/src/block/decompress.rs:supdb::db::zpages::decode_group
+  429,795,491 (24.10%)  /home/user/supdb/src/db/zpages.rs:supdb::db::zpages::decode_group
+  120,672,844 ( 6.77%)  /home/user/supdb/src/db/zpages.rs:supdb::db::zpages::group_seek
+  114,613,402 ( 6.43%)  /home/user/supdb/src/db/zpages.rs:<supdb::db::zpages::ZFence>::entry_of
+   62,447,964 ( 3.50%)  src/db/zpages.rs:supdb::db::zpages::decode_group [/home/user/supdb/bench/target/release/examples/read_only]
+   41,771,058 ( 2.34%)  src/db/zpages.rs:<supdb::db::zpages::ZFence>::entry_of [/home/user/supdb/bench/target/release/examples/read_only]
+## e_passes supdb-nocachezpages
+2,475,276,247 (66.90%)  /home/user/supdb/bench/src/engines.rs:<supdb_bench::engines::Supdb as supdb_bench::engines::Engine>::range
+2,475,212,877 (66.90%)  bench/src/engines.rs:<supdb_bench::engines::Supdb as supdb_bench::engines::Engine>::range [/home/user/supdb/bench/target/release/examples/e_passes]
+  234,139,177 ( 6.33%)  src/db/zfile.rs:<supdb::db::zfile::ZFile>::open_group [/home/user/supdb/bench/target/release/examples/e_passes]
+  218,999,785 ( 5.92%)  /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/lz4_flex-0.11.6/src/block/decompress.rs:supdb::db::zpages::decode_group
+  177,529,115 ( 4.80%)  /home/user/supdb/src/db/zpages.rs:supdb::db::zpages::decode_group
+  134,887,559 ( 3.65%)  src/db/zfile.rs:<supdb::db::zfile::ZCursor>::open_at [/home/user/supdb/bench/target/release/examples/e_passes]
+## read_only supdb-nocachezpagescheckedviews
+1,062,978,921 (57.68%)  /home/user/supdb/bench/src/engines.rs:<supdb_bench::engines::Supdb as supdb_bench::engines::Engine>::get
+1,062,578,921 (57.66%)  bench/src/engines.rs:<supdb_bench::engines::Supdb as supdb_bench::engines::Engine>::get [/home/user/supdb/bench/target/release/examples/read_only]
+  508,952,569 (27.62%)  src/db/zfile.rs:<supdb::db::zfile::ZFile>::open_group [/home/user/supdb/bench/target/release/examples/read_only]
+  467,678,659 (25.38%)  /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/lz4_flex-0.11.6/src/block/decompress.rs:supdb::db::zpages::decode_group
+  429,788,819 (23.32%)  /home/user/supdb/src/db/zpages.rs:supdb::db::zpages::decode_group
+  120,672,844 ( 6.55%)  /home/user/supdb/src/db/zpages.rs:supdb::db::zpages::group_seek
+  114,613,402 ( 6.22%)  /home/user/supdb/src/db/zpages.rs:<supdb::db::zpages::ZFence>::entry_of
+   87,393,448 ( 4.74%)  /home/user/supdb/src/db/zpages.rs:supdb::db::zpages::view_with
+   62,447,964 ( 3.39%)  src/db/zpages.rs:supdb::db::zpages::decode_group [/home/user/supdb/bench/target/release/examples/read_only]
+## e_passes supdb-nocachezpagescheckedviews
+2,537,083,488 (67.15%)  /home/user/supdb/bench/src/engines.rs:<supdb_bench::engines::Supdb as supdb_bench::engines::Engine>::range
+2,537,020,118 (67.15%)  bench/src/engines.rs:<supdb_bench::engines::Supdb as supdb_bench::engines::Engine>::range [/home/user/supdb/bench/target/release/examples/e_passes]
+  238,724,705 ( 6.32%)  src/db/zfile.rs:<supdb::db::zfile::ZFile>::open_group [/home/user/supdb/bench/target/release/examples/e_passes]
+  218,999,785 ( 5.80%)  /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/lz4_flex-0.11.6/src/block/decompress.rs:supdb::db::zpages::decode_group
+  179,662,672 ( 4.76%)  src/db/zfile.rs:<supdb::db::zfile::ZCursor>::open_at [/home/user/supdb/bench/target/release/examples/e_passes]
+  177,517,322 ( 4.70%)  /home/user/supdb/src/db/zpages.rs:supdb::db::zpages::decode_group

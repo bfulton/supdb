@@ -344,9 +344,13 @@ impl<'a> PageView<'a> {
         } else {
             self.header.count
         };
+        // Firsts ascend in a directory the checked view passed; a trusted
+        // view ([`view_trusted`]) has not asked, and a group whose first is
+        // past the next's is no group.
+        let count = next.checked_sub(first)?;
         Some(GroupEntry {
             first,
-            count: next - first,
+            count,
             coff,
             clen,
             ulen: u32::from(ulen4) * 4,
@@ -543,6 +547,28 @@ pub fn encode_page(
 /// safely. Nothing of the CRC, the tag or the zeros, which are
 /// [`parse_page`]'s.
 fn view_checked(page: &[u8]) -> Result<PageView<'_>, ZError> {
+    view_with(page, true)
+}
+
+/// A verified page's view: the header's bounds and where each group's key
+/// lies, and none of the cross-checks [`view_checked`] makes between the
+/// directory's values -- the keys ascending, the firsts ascending below the
+/// count, each payload where the one before ends, the lengths summing to
+/// the header's. A page this process has passed through [`parse_page`] and
+/// a first decode holds a directory those checks accepted, and every slice
+/// a view hands out is bounds-checked where it is taken, so what the checks
+/// buy a verified page is a repeat of what was checked once, at every group
+/// open: a fifth of a scan's lookup work beside the decode, measured. A
+/// directory a flipped byte changed after the verification is caught where
+/// the checked view would catch it only by chance too -- at the decode, whose
+/// length the payload no longer fits, or at the record parse -- and the page
+/// leaves service there as it would. `Options::zpages_trusted_views`.
+pub fn view_trusted(page: &[u8]) -> Result<PageView<'_>, ZError> {
+    view_with(page, false)
+}
+
+/// The view, with or without the directory's cross-checks.
+fn view_with(page: &[u8], checked: bool) -> Result<PageView<'_>, ZError> {
     let page: &[u8; ZPAGE] = page.try_into().map_err(|_| ZError::Length)?;
     let word = |at: usize| u32::from_le_bytes([page[at], page[at + 1], page[at + 2], page[at + 3]]);
     let half = |at: usize| u16::from_le_bytes([page[at], page[at + 1]]);
@@ -577,12 +603,16 @@ fn view_checked(page: &[u8]) -> Result<PageView<'_>, ZError> {
         }
         v.key_at[j] = (at + 2) as u16;
         v.key_end[j] = (at + 2 + klen) as u16;
-        if j > 1
+        if checked
+            && j > 1
             && key_cmp(v.key(j - 1).unwrap_or(&[]), &page[at + 2..at + 2 + klen]) != Ordering::Less
         {
             return bad("the groups' keys do not ascend");
         }
         at += 2 + klen;
+    }
+    if !checked {
+        return Ok(v);
     }
     // The entries: firsts from zero ascending below the count, payloads
     // each at a multiple of four straight after the one before, the
@@ -759,6 +789,11 @@ pub fn decode_group<'a>(
         .ok_or(ZError::Header("no such group in the page"))?;
     let payload = view.payload(j).ok_or(ZError::Length)?;
     let ulen = g.ulen as usize;
+    if ulen == 0 || ulen > ZMAX_ULEN {
+        return Err(ZError::Header(
+            "a group's ulen is not 4 to the most a group holds",
+        ));
+    }
     if g.stored {
         if (payload.as_ptr() as usize).is_multiple_of(std::mem::align_of::<crate::index::Ext>()) {
             return Ok(payload);
@@ -2105,6 +2140,52 @@ impl ZFence {
             }
         }
         lo.checked_sub(1)
+    }
+
+    /// [`entry_of`](ZFence::entry_of) for a key at or above the one entry
+    /// `from` was found for -- a batch of keys in key order, each resolved
+    /// from the entry before -- so a run of keys that share an entry costs a
+    /// compare or two each where the search from the top costs the fence's
+    /// depth in cold lines (`CLAUDE.md`, a batch resolved in arrival
+    /// order): `from` itself where the key is still at or above its key and
+    /// below the next entry's, else a gallop forward from `from` and a
+    /// search over the span the gallop bracketed. A key below entry `from`'s,
+    /// or a `from` past the last entry, is searched from the top. The same
+    /// answer as `entry_of` for every key and every `from`.
+    pub fn entry_of_from(&self, key: &[u8], from: usize) -> Option<usize> {
+        let n = self.len();
+        if from >= n || key.is_empty() {
+            return self.entry_of(key);
+        }
+        // Whether entry `i`'s key is at or below `key`, `key` non-empty.
+        let at_or_below = |i: usize| -> bool {
+            let k = self.key(i).expect("an entry has its key");
+            k.is_empty() || super::key_cmp(k, key) != Ordering::Greater
+        };
+        if !at_or_below(from) {
+            return self.entry_of(key);
+        }
+        // `lo` is at or below the key; `hi` is the next candidate, probed
+        // at doubling strides until one is above the key or the fence ends.
+        let mut lo = from;
+        let mut hi = from + 1;
+        let mut step = 1usize;
+        while hi < n && at_or_below(hi) {
+            lo = hi;
+            hi = hi.saturating_add(step).min(n);
+            step = step.saturating_mul(2);
+        }
+        // The first entry above the key lies in `lo + 1..=hi`.
+        let (mut a, mut b) = (lo + 1, hi);
+        while a < b {
+            let mid = a + (b - a) / 2;
+            if at_or_below(mid) {
+                a = mid + 1;
+            } else {
+                b = mid;
+            }
+        }
+        Some(a - 1)
     }
 
     /// Heap bytes the fence holds: the four tables of region B, as they sit
@@ -3571,6 +3652,61 @@ mod tests {
         // The fence's heap: four words an entry, one more for the offsets,
         // and the keys.
         assert_eq!(f.heap_bytes(), 4 * (5 + 5 + 6) + 1 + 1 + 2 + 1 + 2);
+    }
+
+    /// The search from a hint (`entry_of_from`) answers as the search from
+    /// the top for every key and every hint: the hint itself, the entries
+    /// either side of the answer, the ends, and hints past the fence; over
+    /// a fence whose first key is empty too.
+    #[test]
+    fn the_hinted_entry_search_answers_as_the_search_from_the_top() {
+        let mut fences = Vec::new();
+        let mut f = ZFence::new();
+        let keys: Vec<Vec<u8>> = (0..300u32)
+            .map(|i| format!("{:08}", i * 7 + 3).into_bytes())
+            .collect();
+        for (i, k) in keys.iter().enumerate() {
+            f.push(i as u32 * 10, i as u32, k).unwrap();
+        }
+        fences.push((f, keys.clone()));
+        let mut g = ZFence::new();
+        g.push(0, 0, b"").unwrap();
+        for (i, k) in keys.iter().enumerate().skip(1) {
+            g.push(i as u32 * 10, i as u32, k).unwrap();
+        }
+        fences.push((g, keys));
+        for (f, keys) in &fences {
+            let n = f.len();
+            let mut probes: Vec<Vec<u8>> = vec![Vec::new(), b"0".to_vec(), b"9".repeat(12)];
+            for k in keys {
+                probes.push(k.clone());
+                if let Some(last) = k.last() {
+                    let mut below = k.clone();
+                    *below.last_mut().unwrap() = last.wrapping_sub(1);
+                    probes.push(below);
+                }
+                let mut above = k.clone();
+                above.push(0);
+                probes.push(above);
+            }
+            for key in &probes {
+                let want = f.entry_of(key);
+                let mut froms = vec![0usize, 1, n / 2, n - 1, n, n + 7, usize::MAX];
+                if let Some(e) = want {
+                    froms.extend([
+                        e,
+                        e.saturating_sub(1),
+                        e.saturating_sub(5),
+                        (e + 1).min(n),
+                        (e + 3).min(n),
+                    ]);
+                }
+                for from in froms {
+                    assert_eq!(f.entry_of_from(key, from), want, "key {key:?} from {from}");
+                }
+            }
+        }
+        assert_eq!(ZFence::new().entry_of_from(b"k", 0), None);
     }
 
     #[test]

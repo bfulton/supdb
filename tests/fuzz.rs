@@ -39,8 +39,9 @@
 //! - `ZFUZZ_PROMOTE`: set, with the form forced and the cache on, the `z`
 //!   store holds a block read a few entries' worth as a copy in its slot
 //!   under a small budget (`Options::zpages_promote_copies`).
-//! - `ZFUZZ_OPTVARY`: set, a seed turns compaction or promotion off, each
-//!   with a chance of 15%.
+//! - `ZFUZZ_OPTVARY`: set, a seed turns compaction, promotion or the trusted
+//!   page views of the compact form off, or its memo-first ask on, each with
+//!   a chance of 15%.
 //! - `ZFUZZ_SHAPES`: the key shapes a seed may draw from, as indexes from 0
 //!   to 7 separated by commas.
 //! - `ZFUZZ_NOPUT`, `ZFUZZ_NOBURST`: set, no puts, or no ordered bursts.
@@ -151,6 +152,14 @@ struct Cfg {
     big: bool,
     compact: bool,
     promote: bool,
+    /// A verified form page's directory read trusted
+    /// (`Options::zpages_trusted_views`); off in some seeds under
+    /// `ZFUZZ_OPTVARY`, so the shape before is read against the model too.
+    trusted: bool,
+    /// A verified page's group asked of the memo before any view
+    /// (`Options::zpages_memo_first`, off as shipped); on in some seeds
+    /// under `ZFUZZ_OPTVARY`.
+    memo_first: bool,
 }
 
 /// Whether a seed runs with the block cache on. The chance is drawn whenever
@@ -197,6 +206,8 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         big: rng.chance(25),
         compact: !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15)),
         promote: !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15)),
+        trusted: !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15)),
+        memo_first: std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15),
     }
 }
 
@@ -211,6 +222,8 @@ fn opts(c: &Cfg) -> Options {
         sync: c.sync,
         compact: c.compact,
         promote: c.promote,
+        zpages_trusted_views: c.trusted,
+        zpages_memo_first: c.memo_first,
         ..Options::default()
     };
     if let Some(i) = c.inline_bytes {

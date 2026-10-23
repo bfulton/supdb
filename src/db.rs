@@ -889,6 +889,39 @@ pub struct Options {
     /// the shape before; `supdb-cache64tofitautozpagesexactcut` is the arm.
     #[doc(hidden)]
     pub zpages_settle_span: bool,
+    /// A verified page of a form file is read with its directory trusted
+    /// (`zpages::view_trusted`, `ZFile::view`), and a read takes a page's
+    /// view once, for the group it wants and the open of it. The checked
+    /// view (`view_checked`) re-made the directory's cross-checks at every
+    /// group open, two or three times a group between the view that found
+    /// the group, the view the open took and a miss's decode: 8.5% of the E
+    /// mix's time and 15% of D's on the main thread at five million keys
+    /// under 640 MiB, beside the decode's 27%; by callgrind the views are
+    /// 437 instructions of a point read's 5,315 checked and 144 trusted.
+    /// What those checks catch on a page a first decode has passed is a
+    /// directory changed under the mapping since, which the decode's length
+    /// check or the record parse catches where they would catch it by
+    /// chance too, and the page leaves service there as before. Off is
+    /// every view checked, the shape before;
+    /// `supdb-cache64tofitautozpagescheckedviews` and the forced
+    /// `supdb-nocachezpagescheckedviews` are the arms.
+    #[doc(hidden)]
+    pub zpages_trusted_views: bool,
+    /// EXPERIMENT: a verified page's group asked of the handle's memo before
+    /// any view of the page, the memo's entry carrying the group's first
+    /// record and count, so a hit reads nothing of the page
+    /// (`ZFile::open_group`). Off, the memo is asked after the view, which
+    /// says whether the group is compressed, the order the shape before
+    /// had. Paired on with the trusted views in four sittings of two
+    /// pairings at five million keys under 640 MiB, the pair read 1-4%
+    /// slower in time on every mix, in 44 of 72 pairs, for 2-6% fewer
+    /// instructions by callgrind: a cost the count does not show, read as
+    /// the memo slot's miss serialized ahead of the page's where the view's
+    /// work had overlapped them, and not resolved, since this guest has no
+    /// cycle counters. Off; `supdb-cache64tofitautozpagesmemofirst` is the
+    /// arm.
+    #[doc(hidden)]
+    pub zpages_memo_first: bool,
     /// EXPERIMENT: a scan's seek of a covered partition, and the cut where
     /// an unsealed key falls inside its walk, by the ordered index's heads
     /// and the raw records, as before the form served scans, instead of by
@@ -2470,6 +2503,8 @@ impl Default for Options {
             zpages_seek_span: false,
             zpages_memo_hash: true,
             zpages_settle_span: true,
+            zpages_trusted_views: true,
+            zpages_memo_first: false,
             zpages_scan_prefetch: false,
             zpages_walk_cursor: true,
             zpages_block_cache: true,
@@ -16157,8 +16192,8 @@ impl Reader {
     /// one, and where the partition's table holds no form for it that a
     /// patch reads the cut of -- none, or a wide one, which files keys by
     /// slot. `None` asks for the exact resolve.
-    fn lazy_block(&self, at: usize, seg: &Seg, key: &[u8]) -> Option<usize> {
-        let (lo, hi) = self.zc(seg)?.owner_span(key)?;
+    fn lazy_block(&self, at: usize, seg: &Seg, key: &[u8], hint: &mut usize) -> Option<usize> {
+        let (lo, hi) = self.zc(seg)?.owner_span_from(key, hint)?;
         if hi <= lo || lo / CACHE_BLOCK != (hi - 1) / CACHE_BLOCK {
             return None;
         }
@@ -19444,6 +19479,10 @@ impl Reader {
         let mut last = u32::MAX;
         let mut at = 0usize;
         let mut floor = 0usize;
+        // The fence entry the key before resolved to, for the lazy filing's
+        // search from it (`ZFile::owner_span_from`); none across a change
+        // of partition.
+        let mut zhint = usize::MAX;
         let mut resolved: Vec<(u32, u32, u32, u32, u32, bool, u32)> =
             Vec::with_capacity(pending.len());
         let lazy = self.opts.zpages_settle_span && !self.opts.forms_pieces_only;
@@ -19470,16 +19509,21 @@ impl Reader {
             {
                 at += 1;
                 floor = 0;
+                zhint = usize::MAX;
             }
             if at < np && at > 0 && self.segs()[at].below_lo(key) {
                 at = self.segs()[..np]
                     .partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
                 floor = 0;
+                zhint = usize::MAX;
             }
             let Some(seg) = self.segs()[..np].get(at) else {
                 continue;
             };
-            let (b, cut) = match lazy.then(|| self.lazy_block(at, seg, key)).flatten() {
+            let (b, cut) = match lazy
+                .then(|| self.lazy_block(at, seg, key, &mut zhint))
+                .flatten()
+            {
                 Some(b) => {
                     lazy_n += 1;
                     (b, LAZY_CUT)
@@ -22727,6 +22771,8 @@ impl Db {
                     advise,
                     Db::z_memo(&opts),
                     opts.zpages_scan_prefetch,
+                    opts.zpages_trusted_views,
+                    opts.zpages_memo_first,
                     &zev,
                 );
             }
@@ -25929,12 +25975,15 @@ impl Db {
     /// where it is, for a build to replace, and the segment is marked so
     /// that the build's round does not ask of the same file again and count
     /// it twice; no file is not a rejection.
+    #[allow(clippy::too_many_arguments)]
     fn z_attach(
         dir: &Path,
         seg: &Seg,
         advise: bool,
         memo: zfile::MemoShape,
         prefetch: bool,
+        trusted: bool,
+        memo_first: bool,
         ev: &zfile::ZEvents,
     ) -> bool {
         let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) else {
@@ -25948,6 +25997,8 @@ impl Db {
             advise,
             memo,
             prefetch,
+            trusted,
+            memo_first,
         ) {
             Ok(side) => {
                 let installed = seg.z.install(side);
@@ -25996,6 +26047,8 @@ impl Db {
                 advise,
                 Db::z_memo(&self.opts),
                 self.opts.zpages_scan_prefetch,
+                self.opts.zpages_trusted_views,
+                self.opts.zpages_memo_first,
                 ev,
             )
         {
@@ -26028,6 +26081,8 @@ impl Db {
                     advise,
                     Db::z_memo(&self.opts),
                     self.opts.zpages_scan_prefetch,
+                    self.opts.zpages_trusted_views,
+                    self.opts.zpages_memo_first,
                 ) {
                     Ok(side) => {
                         if seg.z.install(side) {
@@ -33129,6 +33184,8 @@ impl Maint {
                 advise,
                 Db::z_memo(&self.opts),
                 self.opts.zpages_scan_prefetch,
+                self.opts.zpages_trusted_views,
+                self.opts.zpages_memo_first,
                 ev,
             )
         {
@@ -33273,6 +33330,8 @@ impl Maint {
                         Db::z_advise(&self.opts),
                         Db::z_memo(&self.opts),
                         self.opts.zpages_scan_prefetch,
+                        self.opts.zpages_trusted_views,
+                        self.opts.zpages_memo_first,
                     ) {
                         Ok(side) => {
                             if target.z.install(side) {
