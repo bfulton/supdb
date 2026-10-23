@@ -12825,6 +12825,132 @@ fn a_landing_that_replaces_the_live_table_carries_no_form() {
     std::hint::black_box(sink);
 }
 
+/// A form the writer drops after a publish from the segment work copied it
+/// stands in the copy's state as the block: the drop's marker goes to the
+/// state the writer's operation holds, and the landing, swapping in the
+/// state it carried the forms into meanwhile, carries the form. The
+/// writer's next look finds a form published where its table holds none;
+/// it marked the block dirty for the next publish, and the settle in the
+/// same look, writing into the block, tripped the check that a block the
+/// writer holds no form for has none published -- the differential fuzz
+/// under the promotion arm, a few runs in a hundred under load -- and a
+/// publish that builds nothing (`commit_forms_build` off) moved the forms'
+/// position past the dirty block without publishing it. The race is
+/// microseconds wide; the test leaves the state it leaves
+/// (`forget_form_unretracted`: the table's form dropped, nothing
+/// published), lands a seal over it, and holds the look to retracting
+/// the form at once, then a handle's scans to the model.
+#[test]
+fn a_form_dropped_under_a_landings_carry_is_retracted_at_the_writers_look() {
+    let d = dir("dropped-under-carry");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_bytes: 64 << 20,
+        scan_cache_ahead: false,
+        commit_forms: true,
+        forms_carry: true,
+        upkeep: supdb::Upkeep::Inline,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..1500u32 {
+        m.append(&mut db, &key(k), "v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    assert!(db.levels().0 > 1, "several partitions");
+    assert_eq!(db.levels().1, 0, "no piece yet");
+    let mut sink = 0usize;
+    for k in (0..1500u32).step_by(5) {
+        m.append(&mut db, &key(k), "v1");
+    }
+    db.commit().unwrap();
+    db.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        .unwrap();
+    let r = db.reader().unwrap();
+    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        .unwrap();
+    m.append(&mut db, &key(1), "v1b");
+    db.commit().unwrap();
+    let hot = key(700);
+    let kind = db.published_kind(hot.as_bytes());
+    assert!(
+        kind.is_some_and(|k| k != "wide"),
+        "a form published for the block: {kind:?}"
+    );
+    // A seal frozen and held before its landing, of a batch away from the
+    // block.
+    db.hold_seal_landing(true);
+    for k in (2..400u32).step_by(7) {
+        m.append(&mut db, &key(k), "v2");
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    assert!(db.in_flight().0, "a seal in flight, held");
+    // The freeze carries no form; a maintained commit publishes them again
+    // into the state the landing will carry from.
+    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        .unwrap();
+    m.append(&mut db, &key(3), "v3");
+    db.commit().unwrap();
+    assert_eq!(
+        db.published_kind(hot.as_bytes()),
+        kind,
+        "the block's form still published"
+    );
+    assert!(
+        db.block_state(hot.as_bytes())
+            .is_some_and(|s| s.4 != "unbuilt"),
+        "the writer holds the block's form"
+    );
+    // A publish from the segment work over the state that still holds the
+    // form: a threshold seal, frozen before the form was dropped and
+    // landed after, as the race orders them. Nothing writes into the block
+    // until the landing: in the state the test leaves, such a write would
+    // settle against the very state the form was left standing in.
+    db.forget_form_unretracted(hot.as_bytes());
+    db.hold_seal_landing(false);
+    wait_for("the seal's landing", || db.levels().1 > 0);
+    assert_eq!(
+        db.published_kind(hot.as_bytes()),
+        kind,
+        "the landing carried the form the writer's table dropped"
+    );
+    // The writer's look and, in the same commit, a write into the block
+    // settled: the check that a block with no form has none published.
+    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        .unwrap();
+    m.append(&mut db, &key(700), "into");
+    db.commit().unwrap();
+    assert_eq!(
+        db.published_kind(hot.as_bytes()),
+        Some("wide"),
+        "the look retracted a form its table holds none for"
+    );
+    // A write into the block, settled with nothing published for it, and
+    // a handle's scans after the commit that publishes.
+    m.append(&mut db, &key(701), "after");
+    db.commit().unwrap();
+    db.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        .unwrap();
+    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        .unwrap();
+    m.append(&mut db, &key(702), "after2");
+    db.commit().unwrap();
+    m.check(&r, "a handle after the retraction");
+    m.check(&db, "the writer after it");
+    db.settle().unwrap();
+    m.check(&r, "a handle after the settle");
+    std::hint::black_box(sink);
+}
+
 /// An ordered load's tail handed while a threshold seal is still in
 /// flight, the case a promotion at every landing makes common: the seal
 /// in flight is a piece cut open above against the last partition, and

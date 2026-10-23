@@ -1533,6 +1533,30 @@ stress with the promotion off. In a release build the assertion is gone
 and the state it guards is a block the writer holds no form for whose
 published form a handle may take, the shape "a form dropped by its writer
 stayed published" names, so it is a wrong-answer risk in that arm. The
-arm is off as shipped and was refuted on its rates; the race is recorded
-here and not yet taken apart.
+arm is off as shipped and was refuted on its rates.
+
+Taken apart with an event ring of every publish, marker, retraction,
+carry and stale look (removed after), the failing runs read the same
+sequence, ending at partition 3, block 1: the writer publishes a copy into
+gen 57; the segment work's landing carries gen 57's forms into gen 58, the
+copy among them; the writer, its operation still holding gen 57, drops the
+copy and publishes the marker into gen 57's slot, which the landing has
+already copied; the writer's next look rebases its tables over gen 58,
+finds the copy published where its table holds no form, and marks the
+block dirty for the next publish (`rebase_tables`, the `(None, Some(f))`
+arm); and the settle in the same look writes into the block before any
+publish, with the copy standing, which the assertion catches. In a release
+build with `commit_forms_build` on, the next publish replaces the copy
+before it moves `forms_at`, and a handle trusts no form until then, so no
+read takes it; with `commit_forms_build` off, `publish_dirty` returns
+before publishing the dirty blocks and the position moves past them. The
+look now publishes the marker at once, as its sibling branches do for what
+they drop. `a_form_dropped_under_a_landings_carry_is_retracted_at_the_writers_look`
+(`tests/db.rs`) leaves the state through a seam
+(`Reader::forget_form_unretracted`: the table's form dropped, nothing
+published), holds a seal's landing across it so the landing carries the
+form, and commits a write into the block after a handle's scan: with the
+look as it was it fails with the fuzz's own assertion, with the fix it
+passes. The seed's stress: 9 failures in 220 runs before, none in 200 on
+the fix with the event ring and the 400 below without it.
 
