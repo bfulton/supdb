@@ -881,6 +881,27 @@ fn put_verify_buf(b: GroupBuf) {
 /// (`Options::zpages_scan_prefetch`).
 const ZPREFETCH_PAGES: usize = 16;
 
+/// How a form file's compressed pages meet the handle's memo: not at all
+/// (`Options::zpages_memo` off), at the slot the group's number gives
+/// (`Options::zpages_memo_hash` off, the shape before the hash), or at the
+/// hashed slot. A bool is the memo on hashed or off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MemoShape {
+    Off,
+    Linear,
+    Hashed,
+}
+
+impl From<bool> for MemoShape {
+    fn from(on: bool) -> MemoShape {
+        if on {
+            MemoShape::Hashed
+        } else {
+            MemoShape::Off
+        }
+    }
+}
+
 /// The memo's slots, its cap on the decoded bytes it holds, and the
 /// displaced buffers it keeps for the next decodes, a handle. The slots
 /// went from a thousand and twenty-four to four thousand and ninety-six
@@ -899,11 +920,14 @@ const ZMEMO_FREE: usize = 4;
 /// without taking the group away. A form file retired takes a new identity
 /// at its next attach, so its entries never hit again and are displaced as
 /// the slots turn over. The slot is the group's number in the file (the
-/// page times the most groups a page holds, plus the group) plus a multiple
-/// of the identity, so one form file's groups collide only past the slot
-/// count and two form files' are offset from each other. The slots are made
-/// at the first put, so a handle that reads no covered partition pays
-/// nothing for them.
+/// page times the most groups a page holds, plus the group) and the form
+/// file's identity, mixed by a Fibonacci hash and taken mod the slots
+/// (`Memo::slot`): the number alone left twelve of every sixteen slots to
+/// group indices a page of the shipped cut never reaches, so a form file's
+/// groups took a quarter of the slots and pages 256 apart collided, and
+/// the hash spreads consecutive groups over every slot with few collisions
+/// until the slots are nearly full. The slots are made at the first put,
+/// so a handle that reads no covered partition pays nothing for them.
 ///
 /// A handle's and not a thread's: a thread's memo kept the groups of every
 /// store the thread had closed, ninety kilobytes a store in the leak test,
@@ -995,20 +1019,37 @@ impl Memo {
         self.free.pop().unwrap_or_default()
     }
 
-    fn slot(&self, zfile: u64, page: u32, index: u8) -> usize {
-        (page as usize)
-            .wrapping_mul(ZMAX_GROUPS)
-            .wrapping_add(usize::from(index))
-            .wrapping_add((zfile as usize).wrapping_mul(0x9E37_79B9))
-            % self.n
+    fn slot(&self, zfile: u64, page: u32, index: u8, hashed: bool) -> usize {
+        if !hashed {
+            // The shape before the hash (`Options::zpages_memo_hash` off):
+            // the group's number plus a multiple of the identity.
+            return (page as usize)
+                .wrapping_mul(ZMAX_GROUPS)
+                .wrapping_add(usize::from(index))
+                .wrapping_add((zfile as usize).wrapping_mul(0x9E37_79B9))
+                % self.n;
+        }
+        let group = u64::from(page)
+            .wrapping_mul(ZMAX_GROUPS as u64)
+            .wrapping_add(u64::from(index));
+        let h = group
+            .wrapping_add(zfile.wrapping_mul(0xD6E8_FEB8_6659_FD93))
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        ((h >> 32) as usize) % self.n
     }
 
     /// The group memoised for `(side, page, index)`, counted a hit.
-    fn get(&mut self, zfile: u64, page: u32, index: u8) -> Option<(Arc<GroupBuf>, usize)> {
+    fn get(
+        &mut self,
+        zfile: u64,
+        page: u32,
+        index: u8,
+        hashed: bool,
+    ) -> Option<(Arc<GroupBuf>, usize)> {
         if self.slots.is_empty() {
             return None;
         }
-        let i = self.slot(zfile, page, index);
+        let i = self.slot(zfile, page, index, hashed);
         match &self.slots[i] {
             Some(e) if e.zfile == zfile && e.page == page && e.index == index => {
                 self.hits += 1;
@@ -1024,12 +1065,20 @@ impl Memo {
     /// further entries from a rotating sweep until the bytes held fit, the
     /// entry just put kept, so the bytes never exceed the cap unless this
     /// one group does.
-    fn put(&mut self, zfile: u64, page: u32, index: u8, group: Arc<GroupBuf>, len: usize) {
+    fn put(
+        &mut self,
+        zfile: u64,
+        page: u32,
+        index: u8,
+        hashed: bool,
+        group: Arc<GroupBuf>,
+        len: usize,
+    ) {
         self.misses += 1;
         if self.slots.is_empty() {
             self.slots = (0..self.n).map(|_| None).collect();
         }
-        let i = self.slot(zfile, page, index);
+        let i = self.slot(zfile, page, index, hashed);
         if let Some(old) = self.slots[i].take() {
             self.recycle(old);
         }
@@ -1099,8 +1148,14 @@ impl ZMemo {
         r
     }
 
-    fn get(&self, zfile: u64, page: u32, index: u8) -> Option<(Arc<GroupBuf>, usize)> {
-        self.memo.borrow_mut().get(zfile, page, index)
+    fn get(
+        &self,
+        zfile: u64,
+        page: u32,
+        index: u8,
+        hashed: bool,
+    ) -> Option<(Arc<GroupBuf>, usize)> {
+        self.memo.borrow_mut().get(zfile, page, index, hashed)
     }
 
     /// Whether the footprint is kept, and the switch: turned off, the bitmap
@@ -1138,8 +1193,18 @@ impl ZMemo {
         self.memo.borrow_mut().take_free()
     }
 
-    fn put(&self, zfile: u64, page: u32, index: u8, group: Arc<GroupBuf>, len: usize) {
-        self.memo.borrow_mut().put(zfile, page, index, group, len)
+    fn put(
+        &self,
+        zfile: u64,
+        page: u32,
+        index: u8,
+        hashed: bool,
+        group: Arc<GroupBuf>,
+        len: usize,
+    ) {
+        self.memo
+            .borrow_mut()
+            .put(zfile, page, index, hashed, group, len)
     }
 }
 
@@ -1200,8 +1265,10 @@ pub(super) struct ZFile {
     /// The trailer this attach accepted.
     ident: Trailer,
     /// Whether compressed pages are opened through the handle's memo
-    /// (`Options::zpages_memo`).
+    /// (`Options::zpages_memo`), and whether its slot is the hashed one
+    /// (`Options::zpages_memo_hash`).
     memo: bool,
+    memo_hashed: bool,
     /// Whether a scan asks for the pages it will cross after its first
     /// (`Options::zpages_scan_prefetch`).
     prefetch: bool,
@@ -1243,9 +1310,10 @@ impl ZFile {
         id: u64,
         end_seq: u64,
         advise: bool,
-        memo: bool,
+        memo: impl Into<MemoShape>,
         prefetch: bool,
     ) -> std::result::Result<ZFile, Reject> {
+        let memo = memo.into();
         let damage = |e: ZError| Reject::Damage(e.to_string());
         let map = match MmapBytes::open(path) {
             Ok(m) => m,
@@ -1315,7 +1383,8 @@ impl ZFile {
             damaged: AtomicBool::new(false),
             id: NEXT_ZSIDE_ID.fetch_add(1, Ordering::Relaxed),
             ident: t,
-            memo,
+            memo: memo != MemoShape::Off,
+            memo_hashed: memo == MemoShape::Hashed,
             prefetch,
             #[cfg(test)]
             skewed: None,
@@ -1421,7 +1490,7 @@ impl ZFile {
             .map(|g| (usize::from(g.first), usize::from(g.count)));
         if let (true, Some((first, count))) = (self.memo, compressed) {
             if was_verified {
-                if let Some((g, n)) = memo.get(self.id, entry.page, index) {
+                if let Some((g, n)) = memo.get(self.id, entry.page, index, self.memo_hashed) {
                     return Some((Opened::Memo(g, n), first, count, false));
                 }
             }
@@ -1445,7 +1514,14 @@ impl ZFile {
                 set_bit(&self.verified, p);
             }
             let g = Arc::new(fresh);
-            memo.put(self.id, entry.page, index, Arc::clone(&g), ulen);
+            memo.put(
+                self.id,
+                entry.page,
+                index,
+                self.memo_hashed,
+                Arc::clone(&g),
+                ulen,
+            );
             return Some((Opened::Memo(g, ulen), first, count, true));
         }
         let opened = if was_verified {
@@ -2021,6 +2097,43 @@ impl ZFile {
         r
     }
 
+    /// The ranks the owner of `key` lies in -- the rank of the first key at
+    /// or after `key` where that key is `key`, the rank before it otherwise,
+    /// which is the rank whose block a block cache files the key under --
+    /// by the fence and the page's directory alone, no group opened:
+    /// `lo..hi` over the group the key falls in, or the one rank the fence
+    /// or the group's first key names. A key below the first key is owned
+    /// by rank zero. `None` where the form file cannot say without a decode,
+    /// or at all: out of service, an entry of several records no page
+    /// holds, a page whose view does not check (taken out of service, as
+    /// `group_of_key` takes it).
+    pub(super) fn owner_span(&self, key: &[u8]) -> Option<(usize, usize)> {
+        if self.damaged.load(Ordering::Relaxed) {
+            return None;
+        }
+        let Some(e) = self.fence.entry_of(key) else {
+            return Some((0, 1));
+        };
+        let entry = self.fence.entry(e, self.nkeys as u32)?;
+        let first = entry.first_rank as usize;
+        if entry.page == ZNOPAGE {
+            return (entry.count == 1).then_some((first, first + 1));
+        }
+        let p = entry.page as usize;
+        let Some(v) = self.page_bytes(p).and_then(|page| page_view(page).ok()) else {
+            self.fail(p);
+            return None;
+        };
+        let j = v.group_of_key(key);
+        let g = v.group(j)?;
+        let lo = first + usize::from(g.first);
+        let named = if j == 0 { Some(entry.key) } else { v.key(j) };
+        if named == Some(key) {
+            return Some((lo, lo + 1));
+        }
+        Some((lo, lo + usize::from(g.count)))
+    }
+
     /// `BuildCtx::cut_at` through the form file: the first rank in
     /// `rank..end` whose key is not below `uk`, or `end`, with how that
     /// rank's key compares to `uk`. The seek answers for the whole
@@ -2254,6 +2367,9 @@ pub(super) struct ZEvents {
     /// stopped: a merge took the target as an input, or the store closed.
     pub build_starts: AtomicU64,
     pub build_cancelled: AtomicU64,
+    /// Builds collected dormant, ahead of the controller's decision
+    /// (`ZCounts::prebuilt`).
+    pub prebuilt: AtomicU64,
     /// The I/O class the kernel reported for the last build thread
     /// (`ZCounts::build_io_class`).
     pub build_io_class: AtomicU64,
@@ -4111,72 +4227,102 @@ mod tests {
     fn the_memo_holds_its_cap_and_counts_its_hits() {
         let g = |n: usize| (Arc::new(GroupBuf::new()), n);
         let mut m = Memo::new(8, 100);
-        assert!(m.get(1, 0, 0).is_none());
+        assert!(m.get(1, 0, 0, true).is_none());
         let (b, n) = g(40);
-        m.put(1, 0, 0, b, n);
-        assert_eq!(m.get(1, 0, 0).map(|(_, n)| n), Some(40));
-        assert!(m.get(2, 0, 0).is_none(), "another form file's page 0");
-        // The same group of another form file in the same slot: the slot is
-        // the group's number in the file (the page times the most groups
-        // a page holds, plus the group) plus a multiple of the identity,
-        // and the multiplier is one more than a multiple of eight, so over
-        // eight slots sides eight apart put a group in one slot. Only the
-        // file compare tells them apart, and this is the one way to reach
-        // it.
-        assert_eq!(
-            m.slot(1, 0, 0),
-            m.slot(9, 0, 0),
-            "the collision this builds"
-        );
+        m.put(1, 0, 0, true, b, n);
+        assert_eq!(m.get(1, 0, 0, true).map(|(_, n)| n), Some(40));
+        assert!(m.get(2, 0, 0, true).is_none(), "another form file's page 0");
+        // The same group of another form file in the same slot, found over
+        // the identities: only the file compare tells them apart, and this
+        // is the one way to reach it.
+        let other = (2..)
+            .find(|&z| m.slot(z, 0, 0, true) == m.slot(1, 0, 0, true))
+            .unwrap();
         assert!(
-            m.get(9, 0, 0).is_none(),
+            m.get(other, 0, 0, true).is_none(),
             "another form file's page 0, in the same slot"
         );
-        // The page's other groups are entries of their own; the pages
-        // themselves alias over eight slots, since a page's groups take
-        // sixteen numbers.
+        // The page's other groups are entries of their own, in a slot of
+        // their own here.
+        assert_ne!(
+            m.slot(1, 0, 1, true),
+            m.slot(1, 0, 0, true),
+            "the slots this builds"
+        );
         let (b, n) = g(40);
-        m.put(1, 0, 1, b, n);
+        m.put(1, 0, 1, true, b, n);
         assert_eq!(m.bytes, 80);
         let (b, n) = g(40);
-        m.put(1, 0, 2, b, n);
+        m.put(1, 0, 2, true, b, n);
         assert!(m.bytes <= 100, "{}", m.bytes);
-        assert!(m.get(1, 0, 2).is_some(), "the entry just put stays");
-        assert!(m.get(1, 0, 3).is_none(), "a group not put is not there");
+        assert!(m.get(1, 0, 2, true).is_some(), "the entry just put stays");
+        assert!(
+            m.get(1, 0, 3, true).is_none(),
+            "a group not put is not there"
+        );
         assert_eq!((m.hits, m.misses), (2, 3), "a miss a put");
         // A group over the cap on its own is held alone.
         let (b, n) = g(150);
-        m.put(1, 3, 0, b, n);
+        m.put(1, 3, 0, true, b, n);
         assert_eq!(m.bytes, 150);
-        assert!(m.get(1, 3, 0).is_some() && m.get(1, 0, 2).is_none());
+        assert!(m.get(1, 3, 0, true).is_some() && m.get(1, 0, 2, true).is_none());
         // The same page put again replaces, and the bytes follow.
         let (b, n) = g(10);
-        m.put(1, 3, 0, b, n);
+        m.put(1, 3, 0, true, b, n);
         assert_eq!(m.bytes, 10);
-        // A page whose group number passes the slot count shares a slot
-        // with one below it (the number is a multiple of sixteen), and
-        // the displaced entry's buffer, which nothing else holds, is kept
-        // for a later decode and handed out once; the sweep above filled
-        // the free list to its cap, so it is emptied first.
+        // Another page in the same slot, found over the pages: the
+        // displaced entry's buffer, which nothing else holds, is kept for a
+        // later decode and handed out once; the sweep above filled the free
+        // list to its cap, so it is emptied first.
         m.free.clear();
+        let alias = (4u32..)
+            .find(|&p| m.slot(1, p, 0, true) == m.slot(1, 3, 0, true))
+            .unwrap();
         let (b, n) = g(10);
-        m.put(1, 11, 0, b, n);
-        assert!(m.get(1, 3, 0).is_none() && m.get(1, 11, 0).is_some());
+        m.put(1, alias, 0, true, b, n);
+        assert!(m.get(1, 3, 0, true).is_none() && m.get(1, alias, 0, true).is_some());
         assert_eq!(m.free.len(), 1, "the displaced buffer kept");
         let _ = m.take_free();
         assert!(m.free.is_empty());
         // A group a read still holds is displaced and not recycled.
         let held = Arc::new(GroupBuf::new());
-        m.put(1, 20, 0, Arc::clone(&held), 10);
+        m.put(1, 20, 0, true, Arc::clone(&held), 10);
         let before = m.free.len();
+        let again = (21u32..)
+            .find(|&p| m.slot(1, p, 0, true) == m.slot(1, 20, 0, true))
+            .unwrap();
         let (b, n) = g(10);
-        m.put(1, 28, 0, b, n);
+        m.put(1, again, 0, true, b, n);
         assert!(
-            m.get(1, 20, 0).is_none() && m.get(1, 28, 0).is_some(),
+            m.get(1, 20, 0, true).is_none() && m.get(1, again, 0, true).is_some(),
             "the same slot"
         );
         assert_eq!(m.free.len(), before, "a held group is not recycled");
         drop(held);
+        // The slots a form file of the shipped cut reaches: four groups a
+        // page over as many groups as there are slots take more than half
+        // of them, where the group's number alone reached a quarter --
+        // twelve of every sixteen numbers belong to indices such a page
+        // never has.
+        let big = Memo::new(ZMEMO_SLOTS, ZMEMO_BYTES);
+        let mut reached = std::collections::HashSet::new();
+        for p in 0..(ZMEMO_SLOTS / 4) as u32 {
+            for j in 0..4u8 {
+                reached.insert(big.slot(7, p, j, true));
+            }
+        }
+        assert!(
+            reached.len() > ZMEMO_SLOTS / 2,
+            "{} slots of {} reached",
+            reached.len(),
+            ZMEMO_SLOTS
+        );
+        // The shape before the hash reached a quarter.
+        let linear: std::collections::HashSet<usize> = (0..(ZMEMO_SLOTS / 4) as u32)
+            .flat_map(|p| (0..4u8).map(move |j| (p, j)))
+            .map(|(p, j)| big.slot(7, p, j, false))
+            .collect();
+        assert_eq!(linear.len(), ZMEMO_SLOTS / 4);
     }
 
     /// Reads through the memo: the first read of each compressed page
@@ -5197,6 +5343,19 @@ mod tests {
                 assert!(
                     matches!(got, ZSeek::Served { rank, at, .. } if rank == want && at == want_at),
                     "{name}: seek of {key:?}: {got:?}, wanted {want} {want_at:?}"
+                );
+                // The owner's span by the fence and the directory alone holds
+                // the owner the seek names: the rank where the key is there,
+                // the rank before it otherwise.
+                let owner = if want_at == KeyOrder::Equal {
+                    want
+                } else {
+                    want.saturating_sub(1)
+                };
+                let span = zfile.owner_span(&key);
+                assert!(
+                    span.is_some_and(|(lo, hi)| lo <= owner && owner < hi),
+                    "{name}: span of {key:?}: {span:?}, the owner {owner}"
                 );
                 for (rank, end) in [(0usize, n), (0, 1), (n / 3, 2 * n / 3), (n - 1, n), (n, n)] {
                     let r = (rank..end)
