@@ -303,7 +303,19 @@ the target at zero, the page as one group, the shape before the cut,
 `supdb-nocachezpagesonegroup` is the forced arm with the same, which
 prices the cut on a point read through the form from the pass's first
 read, and `supdb-cache64tofitautozpagesgroup1k` cuts at a kibibyte where
-the default cuts at two. The forced arm's
+the default cuts at two. `supdb-cache64tofitautozpagesprebuild` is the
+combined arm with the form files built ahead of the controller's
+decision once the store outgrows its budget and left dormant on disk
+(`Options::zpages_prebuild`), so that the shift to the form is an attach
+and not a build under the readers' faults; a store that fits builds
+nothing. `supdb-cache64tofitautozpagesspan` is the combined arm with a
+block-cache scan's block taken from the fence and the page's directory
+and its rank sought only for a block not held as a copy
+(`Options::zpages_seek_span`), where the default seeks every scan's rank
+through a group. `supdb-cache64tofitautozpagesmemolinear` is the combined arm with the
+memo's slot the group's number plus a multiple of the form file's
+identity (`Options::zpages_memo_hash` off), where the default hashes the
+two over every slot. The forced arm's
 `sync` builds the form files, so its load carries the build, and in memory
 it reads slower than the raw form: it is an arm for the bound, not a
 default.

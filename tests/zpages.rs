@@ -2117,7 +2117,7 @@ fn same_window(got: &Window, want: &Window, what: &str) {
 #[test]
 fn scans_agree_with_the_model_over_every_window_of_a_covered_store() {
     // On the nocache policy, the arm's: the scans merge their sources.
-    windows_over("windows", false, false);
+    windows_over("windows", false, false, true);
 }
 
 #[test]
@@ -2125,7 +2125,15 @@ fn scans_with_the_block_cache_agree_with_the_model_over_every_window_of_a_covere
     // On the default policy, the block cache on: a scan of a covered
     // partition with the cache's forms around it is the case this is for.
     // It holds the seal, so nothing lands under the forms' upkeep.
-    windows_over("windows-cache", true, false);
+    windows_over("windows-cache", true, false, true);
+}
+
+#[test]
+fn scans_with_the_block_cache_seeking_every_rank_agree_with_the_model_over_every_window() {
+    // The block cache with every scan's start sought for its rank through
+    // a group (`Options::zpages_seek_span` off), the shape before the
+    // span: both shapes answer every window alike.
+    windows_over("windows-cache-nospan", true, false, false);
 }
 
 #[test]
@@ -2134,7 +2142,7 @@ fn scans_with_the_blocks_promoted_to_copies_agree_with_the_model_over_every_wind
     // (`Options::zpages_promote_copies`), under a budget small enough to
     // shed them between the windows, so the walks meet a block as a form,
     // as a copy in its slot, and as a form again after the shed.
-    windows_over("windows-promote", true, true);
+    windows_over("windows-promote", true, true, true);
 }
 
 #[test]
@@ -2779,7 +2787,7 @@ fn the_prefetch_arm_scans_the_same_and_asks_once_a_walk() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-fn windows_over(name: &str, cache: bool, promote: bool) {
+fn windows_over(name: &str, cache: bool, promote: bool, span: bool) {
     // The scans of a covered partition answer as if the form were not there,
     // with the unsealed keys laid over it: updates, inserts between records
     // and deletes, in the live table and in a frozen one. Windows begin at
@@ -2797,6 +2805,7 @@ fn windows_over(name: &str, cache: bool, promote: bool) {
         forced(|o| {
             o.partition_bytes = Some(160 << 10);
             o.scan_block_cache = cache;
+            o.zpages_seek_span = span;
             if promote {
                 o.promote_entries = 50;
                 o.zpages_promote_copies = true;
@@ -2845,6 +2854,21 @@ fn windows_over(name: &str, cache: bool, promote: bool) {
                 }
             }
         }
+        if round == 2 {
+            // A run of consecutive records updated across the block
+            // boundary at rank 2048: both blocks hold more overlay keys
+            // than a sparse form takes (`CACHE_DENSE`) and are built as
+            // merged copies, which a scan starting in one walks from its
+            // start key -- with the span on, without its rank sought
+            // (`Options::zpages_seek_span`) -- and the group across the
+            // boundary is the span that names two blocks, where the rank is
+            // sought.
+            for k in &keys[2020..2076] {
+                let v = suite_value(&mut rng);
+                db.put(k, &v);
+                model.insert(k.clone(), vec![v]);
+            }
+        }
         db.commit().unwrap();
         if round == 1 {
             // The first two rounds' writes are in a frozen table when the
@@ -2855,6 +2879,9 @@ fn windows_over(name: &str, cache: bool, promote: bool) {
     assert_eq!(db.frozen_tables(), 1, "the seal is held, its table frozen");
     let mut starts: Vec<Vec<u8>> =
         vec![b"".to_vec(), b"a".to_vec(), b"zzz".to_vec(), vec![0xff; 8]];
+    for k in &keys[2016..2080] {
+        starts.extend(around(k));
+    }
     for f in form_files(&dir) {
         for fk in fence_keys(&f).into_iter().step_by(7) {
             starts.extend(around(&fk));
@@ -2863,6 +2890,7 @@ fn windows_over(name: &str, cache: bool, promote: bool) {
     let limits = [1usize, 2, 3, 5, 17, 56, 57, 58, 114, usize::MAX];
     let latest = db.reader().unwrap();
     let before = db.zpage_counts();
+    let spans = db.span_starts();
     let touches = (db.raw_touches(), latest.raw_touches());
     let mut windows = 0u64;
     for start in &starts {
@@ -2878,6 +2906,14 @@ fn windows_over(name: &str, cache: bool, promote: bool) {
             );
             windows += 1;
         }
+    }
+    // The span is taken where a window starts in a block held as a copy,
+    // with the cache on and the option on, and never otherwise.
+    let spanned = db.span_starts() - spans;
+    if cache && span && !promote {
+        assert!(spanned > 0, "no window took the span");
+    } else if !span || !cache {
+        assert_eq!(spanned, 0, "a window took the span with it off");
     }
     assert!(
         !counts || (db.raw_touches(), latest.raw_touches()) == touches,
@@ -5214,7 +5250,11 @@ fn an_auto_store_that_fits_builds_nothing() {
     };
     let mut dirs = Vec::new();
     let mut listings = Vec::new();
-    for (name, mode) in [("auto-fits", ZPages::Auto), ("auto-fits-off", ZPages::Off)] {
+    for (name, mode, prebuild) in [
+        ("auto-fits", ZPages::Auto, false),
+        ("auto-fits-prebuild", ZPages::Auto, true),
+        ("auto-fits-off", ZPages::Off, false),
+    ] {
         let dir = scratch(name);
         // The budget and the group's refaults through the seam: the
         // platform's own reading is the platform test's, and under the
@@ -5231,6 +5271,7 @@ fn an_auto_store_that_fits_builds_nothing() {
                 zpages: mode,
                 zpages_min_bytes: 0,
                 zpages_inject: Some(inject.clone()),
+                zpages_prebuild: prebuild,
                 ..Options::default()
             },
         )
@@ -5272,15 +5313,17 @@ fn an_auto_store_that_fits_builds_nothing() {
             assert_eq!(c.sel_steps, 0, "{name}: no tick under Off: {c:?}");
         }
         assert_eq!(c.build_starts, 0, "{name}: no build thread started: {c:?}");
+        assert_eq!(c.prebuilt, 0, "{name}: nothing built ahead: {c:?}");
         assert!(form_files(&dir).is_empty(), "{name}: no form file");
         db.close().unwrap();
         listings.push(files_of(&dir));
         dirs.push(dir);
     }
     assert_eq!(
-        listings[0], listings[1],
+        listings[0], listings[2],
         "the directories are the same, file for file"
     );
+    assert_eq!(listings[1], listings[2], "the prebuild store's too");
     for d in dirs {
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -5425,6 +5468,19 @@ fn auto_store(
     refaults_per_s: f64,
     fault_cost: std::time::Duration,
 ) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>) {
+    auto_store_with(name, budget, refaults_per_s, fault_cost, |_| {}, |_| {})
+}
+
+/// `auto_store` with the options moved by `extra` before the store opens
+/// and `prep` run on the store before its load.
+fn auto_store_with(
+    name: &str,
+    budget: u64,
+    refaults_per_s: f64,
+    fault_cost: std::time::Duration,
+    extra: impl FnOnce(&mut Options),
+    prep: impl FnOnce(&Db),
+) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>) {
     let dir = scratch(name);
     let inject = std::sync::Arc::new(supdb::ZInject::new());
     inject.set_budget(budget);
@@ -5441,16 +5497,15 @@ fn auto_store(
     // went uncounted. Under `checked` the line is at 0.05.
     inject.set_decode_cost(DECODE_5US);
     inject.advance(std::time::Duration::from_millis(1));
-    let mut db = Db::create(
-        &dir,
-        Options {
-            zpages: ZPages::Auto,
-            zpages_min_bytes: 0,
-            zpages_inject: Some(inject.clone()),
-            ..Options::default()
-        },
-    )
-    .unwrap();
+    let mut opts = Options {
+        zpages: ZPages::Auto,
+        zpages_min_bytes: 0,
+        zpages_inject: Some(inject.clone()),
+        ..Options::default()
+    };
+    extra(&mut opts);
+    let mut db = Db::create(&dir, opts).unwrap();
+    prep(&db);
     let model = ordered_load(&mut db, 20_000, 0x4A9);
     db.settle().unwrap();
     for _ in 0..2 {
@@ -5633,7 +5688,28 @@ fn compact_store_at(
     Vec<Vec<u8>>,
     usize,
 ) {
-    let (dir, db, model, inject) = blocked_store_at(name, budget);
+    compact_store_with(name, budget, |_| {})
+}
+
+/// `compact_store_at` with the options moved by `extra`.
+#[allow(clippy::type_complexity)]
+fn compact_store_with(
+    name: &str,
+    budget: u64,
+    extra: impl FnOnce(&mut Options),
+) -> (
+    PathBuf,
+    Db,
+    Model,
+    std::sync::Arc<supdb::ZInject>,
+    Reader,
+    Vec<Vec<u8>>,
+    usize,
+) {
+    let (dir, db, model, inject) =
+        auto_store_with(name, budget, 1_000_000.0, FAULT_1MS, extra, |_| {});
+    let c = db.zpage_counts();
+    assert_eq!((c.phase, c.gate), (1, 1), "SUSPECT: {c:?}");
     let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
     let r = db.reader().unwrap();
     let mut at = 0usize;
@@ -6275,6 +6351,147 @@ fn form_files_on_disk_are_dormant_under_auto_and_attached_when_the_form_is_wante
     let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
     check(&r, &model, &some, "dormant attached");
     assert!(db.zpage_counts().reads > 0);
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A store past its budget with the builds ahead on
+/// (`Options::zpages_prebuild`): every partition's form file is built and
+/// left on disk unattached while the controller is in SUSPECT, the raw
+/// form serving every read and nothing counted through the form; the
+/// controller's build is then the attach of those files, with no build
+/// started past the ones made ahead, and the reads after the install go
+/// through the form, every answer the model's. The same store without
+/// the option has no form file on disk at the same point.
+#[test]
+fn a_store_past_its_budget_builds_its_form_files_ahead_and_buys_them_by_attach() {
+    // Every build held at its start from before the load.
+    let (dir, db, model, inject) = auto_store_with(
+        "auto-prebuild",
+        1 << 20,
+        1_000_000.0,
+        FAULT_1MS,
+        |o| o.zpages_prebuild = true,
+        |db| db.hold_zpage_build(true),
+    );
+    let c = db.zpage_counts();
+    assert_eq!((c.phase, c.gate), (1, 1), "SUSPECT: {c:?}");
+    // The sampler waits for the builds ahead: one held at its start, the
+    // ticks run on and no sample is taken.
+    for _ in 0..400 {
+        if db.zpage_build_waiting() {
+            break;
+        }
+        wait_steps(&db, 1);
+    }
+    assert!(
+        db.zpage_build_waiting(),
+        "a build ahead at its hold: {:?}",
+        db.zpage_counts()
+    );
+    assert!(
+        !tick_until(&db, 30, |c| c.samples > 0),
+        "{:?}",
+        db.zpage_counts()
+    );
+    db.hold_zpage_build(false);
+    assert!(
+        tick_until(&db, 400, |c| c.prebuilt >= c.partitions && c.partitions > 0),
+        "built ahead: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!((c.phase, c.gate), (1, 1), "still SUSPECT: {c:?}");
+    assert_eq!(c.prebuilt, c.partitions, "{c:?}");
+    assert_eq!(c.build_starts, c.prebuilt, "one build each: {c:?}");
+    assert_eq!(
+        (c.form_files, c.attached, c.reads),
+        (0, 0, 0),
+        "dormant: {c:?}"
+    );
+    assert_eq!(form_files(&dir).len() as u64, c.partitions, "on disk");
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
+    let r = db.reader().unwrap();
+    check(&r, &model, &some, "raw beside the dormant files");
+    assert_eq!(db.zpage_counts().reads, 0, "nothing through the form yet");
+    let mut at = 0usize;
+    assert!(
+        drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+        "COMPACT: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!((c.gate, c.phase), (2, 3), "{c:?}");
+    assert_eq!(
+        c.build_starts, c.prebuilt,
+        "attached, not built again: {c:?}"
+    );
+    assert_eq!(
+        (c.attached, c.form_files),
+        (c.partitions, c.partitions),
+        "{c:?}"
+    );
+    check(&r, &model, &some, "through the form built ahead");
+    check_scan(&r, &model, "through the form built ahead");
+    assert!(db.zpage_counts().reads > 0, "{:?}", db.zpage_counts());
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    // The control: the same store, the option off, in SUSPECT with
+    // nothing on disk however long the ticks run without a read.
+    let (dir, db, _model, _inject) = blocked_store("auto-prebuild-off");
+    assert!(
+        !tick_until(&db, 60, |c| c.build_starts > 0),
+        "{:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!((c.prebuilt, c.build_starts), (0, 0), "{c:?}");
+    assert!(
+        form_files(&dir).is_empty(),
+        "nothing ahead without the option"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The builds ahead are for the first shift up: a store that reached
+/// COMPACT, left it on the trial (E2: the touched pages fit, the
+/// populations still past the budget) and retired its form files at the
+/// retention's end builds none of them again ahead, however long it
+/// stays past its budget.
+#[test]
+fn a_store_that_left_compact_builds_nothing_ahead_again() {
+    let (dir, db, _model, inject, r, keys, _) =
+        compact_store_with("auto-prebuild-exit", 1 << 20, |o| o.zpages_prebuild = true);
+    let built = db.zpage_counts().prebuilt;
+    let hot: Vec<Vec<u8>> = keys[..1].to_vec();
+    wait_secs(&db, 61, 1);
+    assert!(
+        stretch_until(&db, &r, &hot, &inject, 0, 120, |c| c.sel_trials >= 1),
+        "the trial: {:?}",
+        db.zpage_counts()
+    );
+    assert!(
+        stretch_until(&db, &r, &hot, &inject, 0, 40, |c| c.phase != 4),
+        "judged: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!((c.sel_exit_e2, c.phase), (1, 1), "left: {c:?}");
+    // Past the retention: the cells retired, the files given back.
+    wait_secs(&db, 700, 10);
+    let c = db.zpage_counts();
+    assert_eq!(c.form_files, 0, "retired: {c:?}");
+    assert!(c.retired > 0, "{c:?}");
+    let starts = c.build_starts;
+    wait_secs(&db, 30, 1);
+    let c = db.zpage_counts();
+    assert_eq!(c.prebuilt, built, "nothing built ahead again: {c:?}");
+    assert_eq!(c.build_starts, starts, "no build at all: {c:?}");
+    assert_eq!(c.phase, 1, "still past the budget, SUSPECT: {c:?}");
     drop(r);
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);

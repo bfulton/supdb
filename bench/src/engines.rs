@@ -815,6 +815,22 @@ pub struct Supdb {
     /// the page as one group, and `supdb-cache64tofitautozpagesgroup1k` at
     /// a kibibyte, each the pair against `supdb-cache64tofitautozpages`.
     zgroup: Option<usize>,
+    /// The combined arm with the form files built ahead of the
+    /// controller's decision once the store outgrows its budget
+    /// (`Options::zpages_prebuild`): `supdb-cache64tofitautozpagesprebuild`,
+    /// the pair against `supdb-cache64tofitautozpages`.
+    zprebuild: bool,
+    /// The combined arm with a block-cache scan's block taken from the
+    /// fence and the directory and its rank sought only for a form walked
+    /// by rank (`Options::zpages_seek_span`):
+    /// `supdb-cache64tofitautozpagesspan`, the pair against
+    /// `supdb-cache64tofitautozpages`.
+    zspan: bool,
+    /// The combined arm with the memo's slot the group's number plus a
+    /// multiple of the identity (`Options::zpages_memo_hash` off):
+    /// `supdb-cache64tofitautozpagesmemolinear`, the pair against
+    /// `supdb-cache64tofitautozpages`.
+    zmemolinear: bool,
     /// What the reader handles this store gave its threads answered
     /// through the ordered index, summed as each is dropped
     /// (`OrdTally`); only the arm that reads that way hands out handles
@@ -1249,6 +1265,15 @@ struct Policy {
     /// (`Options::zpages_group_bytes`), `None` for the engine's default:
     /// `supdb-cache64tofitautozpagesonegroup`, `...group1k`.
     zgroup: Option<usize>,
+    /// The form files built ahead past the budget
+    /// (`Options::zpages_prebuild`): `supdb-cache64tofitautozpagesprebuild`.
+    zprebuild: bool,
+    /// The scan's rank skipped for a copy (`Options::zpages_seek_span`):
+    /// `supdb-cache64tofitautozpagesspan`.
+    zspan: bool,
+    /// The memo's slot unhashed (`Options::zpages_memo_hash` off):
+    /// `supdb-cache64tofitautozpagesmemolinear`.
+    zmemolinear: bool,
 }
 
 /// The conversions a fill makes at most in `supdb-convertcap`: the first
@@ -1357,6 +1382,9 @@ impl Default for Policy {
             zcacheraw: false,
             zpromote: 0,
             zgroup: None,
+            zprebuild: false,
+            zspan: false,
+            zmemolinear: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -3052,6 +3080,64 @@ impl Supdb {
         )
     }
 
+    /// `supdb-cache64tofitautozpages` with the form files built ahead of
+    /// the controller's decision once the store outgrows its budget
+    /// (`Options::zpages_prebuild`): written to disk and left dormant
+    /// while the raw form serves, so that the controller's build is the
+    /// attach of files already there. The pair against
+    /// `supdb-cache64tofitautozpages` prices the head start -- the build's
+    /// wall under the readers' faults taken off the shift -- against what
+    /// the build costs the passes it runs beside; a store that fits builds
+    /// nothing, so the in-memory rungs read the same arm twice.
+    pub fn create_cache64_tofit_auto_zpages_prebuild(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages_auto: true,
+                zprebuild: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cache64tofitautozpages` with a block-cache scan's block taken
+    /// from the form file's fence and the page's directory, and its rank
+    /// sought only for a form walked by rank (`Options::zpages_seek_span`):
+    /// the pair against `supdb-cache64tofitautozpages` prices the seek a
+    /// copy walked from its start key does not need, and read level.
+    pub fn create_cache64_tofit_auto_zpages_span(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages_auto: true,
+                zspan: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cache64tofitautozpages` with the memo's slot the group's
+    /// number plus a multiple of the identity (`Options::zpages_memo_hash`
+    /// off), the shape before the hash: the pair against
+    /// `supdb-cache64tofitautozpages` prices the slots a form file of the
+    /// shipped cut could not reach.
+    pub fn create_cache64_tofit_auto_zpages_memolinear(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages_auto: true,
+                zmemolinear: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-cache256tofit` without the trim (`Options::forms_trim_bytes`
     /// zero): against it, the part of the saving that is the allocator's
     /// free pages given back; against `supdb-cache256`, the part that is
@@ -4097,6 +4183,9 @@ impl Supdb {
             zcacheraw,
             zpromote,
             zgroup,
+            zprebuild,
+            zspan,
+            zmemolinear,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -4342,6 +4431,9 @@ impl Supdb {
             promote_entries: zpromote,
             zpages_promote_copies: zpromote > 0,
             zpages_group_bytes: zgroup.unwrap_or(supdb::Options::default().zpages_group_bytes),
+            zpages_prebuild: zprebuild,
+            zpages_seek_span: zspan,
+            zpages_memo_hash: !zmemolinear,
             zpages_seek_ord: if zpages_heads {
                 true
             } else {
@@ -4518,6 +4610,9 @@ impl Supdb {
             zcacheraw,
             zpromote,
             zgroup,
+            zprebuild,
+            zspan,
+            zmemolinear,
             ord_threads: Default::default(),
         })
     }
@@ -4598,6 +4693,12 @@ impl Engine for Supdb {
                 "supdb-cache64tofitautozpagesraw"
             } else if self.zpromote > 0 {
                 "supdb-cache64tofitautozpagespromote"
+            } else if self.zprebuild {
+                "supdb-cache64tofitautozpagesprebuild"
+            } else if self.zspan {
+                "supdb-cache64tofitautozpagesspan"
+            } else if self.zmemolinear {
+                "supdb-cache64tofitautozpagesmemolinear"
             } else {
                 match self.zgroup {
                     Some(0) => "supdb-cache64tofitautozpagesonegroup",
@@ -5301,6 +5402,7 @@ impl Engine for Supdb {
             ("walk_copy", wk[0] as f64),
             ("start_at_rank", cs[0] as f64),
             ("start_search", cs[1] as f64),
+            ("span_starts", db.span_starts() as f64),
             ("walk_sparse", wk[1] as f64),
             ("walk_other", wk[2] as f64),
             // Seeks that hinted their stride window's directory: see
@@ -5381,6 +5483,7 @@ impl Engine for Supdb {
             ("zpage_declined_damage", z.declined_damage as f64),
             ("zpage_build_starts", z.build_starts as f64),
             ("zpage_build_cancelled", z.build_cancelled as f64),
+            ("zpage_prebuilt", z.prebuilt as f64),
             ("zpage_build_io_class", z.build_io_class as f64),
             ("zpage_build_ahead_bytes", z.build_ahead_bytes as f64),
             ("zpage_build_nopage", z.build_nopage as f64),
@@ -6065,6 +6168,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache64tofitautozpagespromote"
         | "supdb-cache64tofitautozpagesonegroup"
         | "supdb-cache64tofitautozpagesgroup1k"
+        | "supdb-cache64tofitautozpagesprebuild"
+        | "supdb-cache64tofitautozpagesspan"
+        | "supdb-cache64tofitautozpagesmemolinear"
         | "supdb-nocacheautozpagesfairio"
         | "supdb-nocacheautozpagesnoahead"
         | "supdb-nocacheautozpageseager"
@@ -6268,6 +6374,15 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         }
         "supdb-cache64tofitautozpagesgroup1k" => {
             Box::new(Supdb::create_cache64_tofit_auto_zpages_group1k(dir)?)
+        }
+        "supdb-cache64tofitautozpagesprebuild" => {
+            Box::new(Supdb::create_cache64_tofit_auto_zpages_prebuild(dir)?)
+        }
+        "supdb-cache64tofitautozpagesspan" => {
+            Box::new(Supdb::create_cache64_tofit_auto_zpages_span(dir)?)
+        }
+        "supdb-cache64tofitautozpagesmemolinear" => {
+            Box::new(Supdb::create_cache64_tofit_auto_zpages_memolinear(dir)?)
         }
         "supdb-nocacheautozpages" => Box::new(Supdb::create_nocache_auto_zpages(dir)?),
         "supdb-nocacheautozpagesfairio" => Box::new(Supdb::create_nocache_auto_zpages_fairio(dir)?),
@@ -7297,6 +7412,96 @@ mod tests {
             drop(opened);
             drop(arm);
         }
+        // The prebuild arm: the combined arm with the builds ahead on and
+        // nothing else moved; off is the engine's default.
+        assert!(!supdb::Options::default().zpages_prebuild && !b.zpages_prebuild);
+        assert!(!supdb::Options::default().zpages_seek_span && !b.zpages_seek_span);
+        let span = new(
+            "supdb-cache64tofitautozpagesspan",
+            Supdb::create_cache64_tofit_auto_zpages_span,
+        );
+        assert_eq!(span.name(), "supdb-cache64tofitautozpagesspan");
+        assert_eq!(guarantee(span.name()), guarantee(base.name()));
+        assert_eq!(span.features(), base.features());
+        let g = span.db.as_ref().unwrap().options();
+        assert!(g.zpages_seek_span, "the one option");
+        assert_eq!(
+            (
+                g.zpages,
+                g.scan_cache_bytes,
+                g.forms_to_fit,
+                g.zpages_prebuild
+            ),
+            (
+                b.zpages,
+                b.scan_cache_bytes,
+                b.forms_to_fit,
+                b.zpages_prebuild
+            )
+        );
+        drop(span);
+        assert!(supdb::Options::default().zpages_memo_hash && b.zpages_memo_hash);
+        let linear = new(
+            "supdb-cache64tofitautozpagesmemolinear",
+            Supdb::create_cache64_tofit_auto_zpages_memolinear,
+        );
+        assert_eq!(linear.name(), "supdb-cache64tofitautozpagesmemolinear");
+        assert_eq!(guarantee(linear.name()), guarantee(base.name()));
+        assert_eq!(linear.features(), base.features());
+        let g = linear.db.as_ref().unwrap().options();
+        assert!(!g.zpages_memo_hash, "the one option");
+        assert_eq!(
+            (
+                g.zpages,
+                g.zpages_memo,
+                g.zpages_seek_span,
+                g.scan_cache_bytes
+            ),
+            (
+                b.zpages,
+                b.zpages_memo,
+                b.zpages_seek_span,
+                b.scan_cache_bytes
+            )
+        );
+        drop(linear);
+        let pre = new(
+            "supdb-cache64tofitautozpagesprebuild",
+            Supdb::create_cache64_tofit_auto_zpages_prebuild,
+        );
+        assert_eq!(pre.name(), "supdb-cache64tofitautozpagesprebuild");
+        assert_eq!(guarantee(pre.name()), guarantee(base.name()));
+        assert!(pre.zprebuild && !base.zprebuild);
+        assert!(pre.zgroup.is_none() && !pre.zcacheraw && pre.zpromote == 0);
+        assert_eq!(pre.features(), base.features());
+        let g = pre.db.as_ref().unwrap().options();
+        assert!(g.zpages_prebuild, "the one option");
+        assert_eq!(
+            (
+                g.zpages,
+                g.scan_block_cache,
+                g.scan_cache_bytes,
+                g.forms_to_fit,
+                g.zpages_block_cache,
+                g.promote_entries,
+                g.zpages_group_bytes
+            ),
+            (
+                b.zpages,
+                b.scan_block_cache,
+                b.scan_cache_bytes,
+                b.forms_to_fit,
+                b.zpages_block_cache,
+                b.promote_entries,
+                b.zpages_group_bytes
+            )
+        );
+        let d = root.join("dispatch-prebuild");
+        std::fs::create_dir_all(&d).unwrap();
+        let opened = open("supdb-cache64tofitautozpagesprebuild", &d, 1).unwrap();
+        assert_eq!(opened.name(), "supdb-cache64tofitautozpagesprebuild");
+        drop(opened);
+        drop(pre);
         drop(promote);
         drop(arm);
         drop(base);

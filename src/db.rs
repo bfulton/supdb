@@ -448,6 +448,9 @@ pub struct ZCounts {
     /// flag stopped.
     pub build_starts: u64,
     pub build_cancelled: u64,
+    /// Form files built ahead of the controller's decision and left on
+    /// disk unattached (`Options::zpages_prebuild`).
+    pub prebuilt: u64,
     /// The I/O class the kernel reported for the last build thread, read
     /// on the thread after it chose: 3 idle (`Options::zpages_io_idle`), 2
     /// best effort, 0 none, which is best effort at the thread's nice.
@@ -862,6 +865,15 @@ pub struct Options {
     /// `memo_misses`). `supdb-nocachezpagesnomemo` is the arm with it off.
     #[doc(hidden)]
     pub zpages_memo: bool,
+    /// The memo's slot for a group by a Fibonacci hash of the group's
+    /// number and the form file's identity (`zfile::Memo::slot`), over
+    /// every slot. Off is the group's number plus a multiple of the
+    /// identity, the shape before: a page's groups take sixteen numbers and
+    /// the shipped cut puts about four groups on a page, so a form file's
+    /// groups reached a quarter of the slots and pages 256 apart collided.
+    /// `supdb-cache64tofitautozpagesmemolinear` is the arm.
+    #[doc(hidden)]
+    pub zpages_memo_hash: bool,
     /// EXPERIMENT: a scan's seek of a covered partition, and the cut where
     /// an unsealed key falls inside its walk, by the ordered index's heads
     /// and the raw records, as before the form served scans, instead of by
@@ -870,6 +882,22 @@ pub struct Options {
     /// prices the seek by the fence against it. Off.
     #[doc(hidden)]
     pub zpages_seek_ord: bool,
+    /// A block-cache scan of a covered partition takes the block its start
+    /// falls in from the form file's fence and the page's directory where
+    /// they name one block (`ZFile::owner_span`), and seeks the rank only
+    /// where the block's form is not a merged copy: a copy is walked from
+    /// the start key by its own search and needs the block and not the
+    /// rank, and the seek for the rank decoded a group for nothing -- a
+    /// fifth of the E mix's thread at five million keys under 640 MiB in
+    /// a profile, where the Zipfian head's blocks are copies. Priced there
+    /// against the seek for every scan it cut E's group decodes by 7% and
+    /// its memo looks by 12% and read E 2-3% slower in both orders, the
+    /// other cells position-bound: the seeks it skipped were mostly memo
+    /// hits, and its own fence and directory lookup, with a second seek for
+    /// the blocks that are not copies, cost what they saved. Off, the
+    /// default; `supdb-cache64tofitautozpagesspan` is the arm.
+    #[doc(hidden)]
+    pub zpages_seek_span: bool,
     /// EXPERIMENT: a scan of a covered partition that wants more keys than
     /// its first page holds asks the kernel for the pages it will cross
     /// after it, at once (`MADV_WILLNEED`, `zfile::ZPREFETCH_PAGES` of them
@@ -948,6 +976,24 @@ pub struct Options {
     /// shape the window was priced against.
     #[doc(hidden)]
     pub zpages_build_ahead: usize,
+    /// Under `ZPages::Auto`, the form files built ahead of the controller's
+    /// decision once the store has outgrown its budget -- the raw form's
+    /// populations, the hash slots and the records, past the cache the
+    /// store has, which is the model's own test -- and no seal, merge or
+    /// promotion is in flight: one partition at a time, the newest first,
+    /// on the builder's idle-class thread, each written to disk and left
+    /// dormant, unattached, with the raw form still serving every read.
+    /// The sampler waits for them, so its reading finds every form file
+    /// on disk and prices the buy at the attach's cost
+    /// (`zselect::Sampler::c_build`), and the controller's build is the
+    /// attach of files already written, as after a restart. What the
+    /// controller pays between SUSPECT and COMPACT is then the census's
+    /// evidence and the sampler, not the build's wall under the readers'
+    /// faults. A store that fits never builds: the test is the model's,
+    /// and nothing is built below it. Off is the shape the controller
+    /// shipped with; `supdb-cache64tofitautozpagesprebuild` is the arm.
+    #[doc(hidden)]
+    pub zpages_prebuild: bool,
     /// The decoded bytes a form file's page is cut into groups at, each
     /// compressed on its own, so that a point read decodes the group its
     /// record is in and not the page (`zpages::ZGROUP_BYTES`, two
@@ -2406,12 +2452,15 @@ impl Default for Options {
             zpages_warm: true,
             zpages_memo: true,
             zpages_seek_ord: false,
+            zpages_seek_span: false,
+            zpages_memo_hash: true,
             zpages_scan_prefetch: false,
             zpages_walk_cursor: true,
             zpages_block_cache: true,
             zpages_promote_copies: false,
             zpages_io_idle: true,
             zpages_build_ahead: 4 << 20,
+            zpages_prebuild: false,
             zpages_group_bytes: zpages::ZGROUP_BYTES,
             zpages_build_eager: false,
             zpages_inject: None,
@@ -3173,6 +3222,11 @@ struct ZBuild {
     job: ZJob,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     refused: bool,
+    /// A build ahead of the controller's decision
+    /// (`Options::zpages_prebuild`): its file is left on disk unattached
+    /// unless the controller wants builds by the time it is collected, and
+    /// a decision that wants none does not cancel it.
+    dormant: bool,
 }
 
 /// What the builder's thread is running: a build, or a warm of an attached
@@ -12675,6 +12729,9 @@ struct FormsState {
     /// Scans that started a copy walk at the seek's rank, and that
     /// searched the copy (`Options::copy_start_at_rank`).
     copy_starts: std::cell::Cell<[u64; 2]>,
+    /// Scans whose first block was a copy walked from the start key with
+    /// the rank never sought (`Options::zpages_seek_span`).
+    span_starts: std::cell::Cell<u64>,
     /// For a pass on the upkeep thread: the most writes it reads from the
     /// live log, and the most it settles from the frozen tables' carried
     /// lists, and whether it stopped short of either, for the thread to
@@ -12792,6 +12849,7 @@ impl FormsState {
             walk_kinds: std::cell::Cell::new([0; 3]),
             dir_prefetches: std::cell::Cell::new(0),
             copy_starts: std::cell::Cell::new([0; 2]),
+            span_starts: std::cell::Cell::new(0),
             read_cap: std::cell::Cell::new(0),
             pass_lent: std::cell::Cell::new(0),
             log_short: std::cell::Cell::new(false),
@@ -15504,6 +15562,7 @@ impl Reader {
             build_io_class: get(&ev.build_io_class),
             build_ahead_bytes: get(&ev.build_ahead_bytes),
             build_cancelled: get(&ev.build_cancelled),
+            prebuilt: get(&ev.prebuilt),
             build_nopage: get(&ev.build_nopage),
             warms: get(&ev.warms),
             warm_bytes: get(&ev.warm_bytes),
@@ -16027,6 +16086,31 @@ impl Reader {
         }
         let (rank, exact) = seg.ord.seek_exact_from(floor, key, |r| seg.raw().key_at(r));
         let same = rank < keys && exact.unwrap_or_else(|| seg.raw().key_at(rank) == Some(key));
+        (rank, same)
+    }
+
+    /// A block-cache scan's seek of `seg` for `cursor`: the rank of the
+    /// first key at or after it and whether that key is it. Through the
+    /// form file's fence and one group where the handle reads it
+    /// (`cache_seek_exact`); the heads' with the directory's lines asked for
+    /// ahead otherwise.
+    fn scan_seek(&self, seg: &Seg, cursor: &[u8]) -> (usize, bool) {
+        if self.zc(seg).is_some() {
+            return self.cache_seek_exact(seg, cursor, 0);
+        }
+        let keys = seg.blob.keys();
+        let (rank, exact) = seg.ord.seek_exact_hint(
+            cursor,
+            |r| seg.raw().key_at(r),
+            |lo, hi| {
+                if self.opts.scan_prefetch && self.opts.seek_prefetch_dir {
+                    seg.raw().prefetch_dir(lo, hi - lo + 1);
+                    let fs = self.fs();
+                    fs.dir_prefetches.set(fs.dir_prefetches.get() + 1);
+                }
+            },
+        );
+        let same = rank < keys && exact.unwrap_or_else(|| seg.raw().key_at(rank) == Some(cursor));
         (rank, same)
     }
 
@@ -20107,26 +20191,24 @@ impl Reader {
             // the seek answers rank zero, the table's one block is
             // walked as the overlay alone.
             let keys = seg.blob.keys();
-            // The seek through the form file's fence and one group where
-            // the handle reads it (`cache_seek_exact`); the heads' with
-            // the directory's lines asked for ahead otherwise.
-            let (rank, same) = if self.zc(seg).is_some() {
-                self.cache_seek_exact(seg, cursor, 0)
+            // The block the start falls in, by the fence and the page's
+            // directory where they name one (`Options::zpages_seek_span`):
+            // the rank is sought below only where the block's form is not
+            // a copy, which is walked from the start key by its own search.
+            // `usize::MAX` stands for the rank not sought yet.
+            let span_b = if self.opts.zpages_seek_span {
+                self.zc(seg)
+                    .and_then(|z| z.owner_span(cursor))
+                    .and_then(|(lo, hi)| {
+                        (hi > lo && lo / CACHE_BLOCK == (hi - 1) / CACHE_BLOCK)
+                            .then_some(lo / CACHE_BLOCK)
+                    })
             } else {
-                let (rank, exact) = seg.ord.seek_exact_hint(
-                    cursor,
-                    |r| seg.raw().key_at(r),
-                    |lo, hi| {
-                        if self.opts.scan_prefetch && self.opts.seek_prefetch_dir {
-                            seg.raw().prefetch_dir(lo, hi - lo + 1);
-                            let fs = self.fs();
-                            fs.dir_prefetches.set(fs.dir_prefetches.get() + 1);
-                        }
-                    },
-                );
-                let same =
-                    rank < keys && exact.unwrap_or_else(|| seg.raw().key_at(rank) == Some(cursor));
-                (rank, same)
+                None
+            };
+            let (mut rank, mut same) = match span_b {
+                Some(_) => (usize::MAX, false),
+                None => self.scan_seek(seg, cursor),
             };
             let owner = if same { rank } else { rank.saturating_sub(1) };
             let nblocks = seg.blocks();
@@ -20164,6 +20246,9 @@ impl Reader {
                 // and its next write: one walk from the seek, as the bulk
                 // walk makes it. Measured through the blocks it was a
                 // tenth slower, in first touches and bookkeeping.
+                if rank == usize::MAX {
+                    (rank, _) = self.scan_seek(seg, cursor);
+                }
                 if rank < keys {
                     let want = (keys - rank).min(limit - seen);
                     seen += self.cache_scan(seg, rank, want, &mut *f)?;
@@ -20176,7 +20261,7 @@ impl Reader {
                     None => break,
                 }
             }
-            let mut b = owner / CACHE_BLOCK;
+            let mut b = span_b.unwrap_or(owner / CACHE_BLOCK);
             let mut first = true;
             // Whether the block this iteration walks was fetched by the
             // one before, as the next block it would cross into: the
@@ -20186,7 +20271,6 @@ impl Reader {
             while seen < limit && b < nblocks {
                 let lo = b * CACHE_BLOCK;
                 let hi = ((b + 1) * CACHE_BLOCK).min(keys);
-                let start = if first { rank.max(lo) } else { lo };
                 let from_key: &[u8] = if first { cursor } else { b"" };
                 // A wide form is the handle's own to walk against its own
                 // list of filed keys, so it is never taken from the
@@ -20323,6 +20407,21 @@ impl Reader {
                     None
                 };
                 let form: &Cached = dense.unwrap_or(cheap);
+                // The rank the span left unsought, sought now for a form
+                // walked by rank; a copy needs none.
+                if first && rank == usize::MAX && !matches!(form, Cached::Block(_)) {
+                    (rank, same) = self.scan_seek(seg, cursor);
+                    debug_assert_eq!(
+                        (if same { rank } else { rank.saturating_sub(1) }) / CACHE_BLOCK,
+                        b,
+                        "the span named another block than the seek"
+                    );
+                }
+                let start = if !first || rank == usize::MAX {
+                    lo
+                } else {
+                    rank.max(lo)
+                };
                 // The kind the walk reads, for the promotion after it,
                 // which judges what was walked -- the canonical form as
                 // much as this handle's own.
@@ -20459,7 +20558,8 @@ impl Reader {
                         // entries are the block's records; the cursor is
                         // above record `start - 1` and not above `start`,
                         // so no entry between them is skipped.
-                        let at_rank = self.opts.copy_start_at_rank && blk.identity;
+                        let at_rank =
+                            self.opts.copy_start_at_rank && blk.identity && rank != usize::MAX;
                         let i = if !first {
                             0
                         } else if at_rank {
@@ -20477,6 +20577,10 @@ impl Reader {
                             let mut c = self.fs().copy_starts.get();
                             c[usize::from(!at_rank)] += 1;
                             self.fs().copy_starts.set(c);
+                            if rank == usize::MAX {
+                                let fs = self.fs();
+                                fs.span_starts.set(fs.span_starts.get() + 1);
+                            }
                         }
                         for e in &blk.ents[i..] {
                             if seen >= limit {
@@ -22476,7 +22580,7 @@ impl Db {
                     dir,
                     s,
                     advise,
-                    opts.zpages_memo,
+                    Db::z_memo(&opts),
                     opts.zpages_scan_prefetch,
                     &zev,
                 );
@@ -24741,6 +24845,13 @@ impl Db {
         self.r.fs().copy_starts.get()
     }
 
+    /// The writer's own scans whose first block was a copy walked with the
+    /// rank never sought (`Options::zpages_seek_span`).
+    pub fn span_starts(&self) -> u64 {
+        self.take_back_upkeep();
+        self.r.fs().span_starts.get()
+    }
+
     /// The writer's own seeks that hinted their stride window's
     /// directory, over the store's life (`Options::seek_prefetch_dir`);
     /// a handle's are `Reader::dir_prefetches`.
@@ -25649,6 +25760,16 @@ impl Db {
         opts.read_advice != ReadAdvice::Normal
     }
 
+    /// How a form file meets the handles' memos, by the options
+    /// (`Options::zpages_memo`, `Options::zpages_memo_hash`).
+    fn z_memo(opts: &Options) -> zfile::MemoShape {
+        match (opts.zpages_memo, opts.zpages_memo_hash) {
+            (false, _) => zfile::MemoShape::Off,
+            (true, false) => zfile::MemoShape::Linear,
+            (true, true) => zfile::MemoShape::Hashed,
+        }
+    }
+
     /// `seg`'s form file attached from the file its name carries, if there is
     /// one that checks out against the segment: installed, counted, and
     /// true. A file that does not check out is counted by kind and left
@@ -25659,7 +25780,7 @@ impl Db {
         dir: &Path,
         seg: &Seg,
         advise: bool,
-        memo: bool,
+        memo: zfile::MemoShape,
         prefetch: bool,
         ev: &zfile::ZEvents,
     ) -> bool {
@@ -25720,7 +25841,7 @@ impl Db {
                 &self.dir,
                 seg,
                 advise,
-                self.opts.zpages_memo,
+                Db::z_memo(&self.opts),
                 self.opts.zpages_scan_prefetch,
                 ev,
             )
@@ -25752,7 +25873,7 @@ impl Db {
                     id,
                     end,
                     advise,
-                    self.opts.zpages_memo,
+                    Db::z_memo(&self.opts),
                     self.opts.zpages_scan_prefetch,
                 ) {
                     Ok(side) => {
@@ -30248,6 +30369,9 @@ struct Maint {
     z_sample_size: Option<(u64, u64, f64)>,
     z_report: zselect::Build,
     z_scan_len: f64,
+    /// Whether the store's raw populations were past its budget at the
+    /// model's last reading (`Options::zpages_prebuild`).
+    z_past_budget: bool,
 }
 
 /// A sample job in flight (`zfile::sample` over the live partitions, on a
@@ -30696,6 +30820,7 @@ impl Maint {
             z_sample_size: None,
             z_report: zselect::Build::default(),
             z_scan_len: 0.0,
+            z_past_budget: false,
         }
     }
 
@@ -31999,7 +32124,7 @@ impl Maint {
             self.z_next()
         };
         if let Some((seg, kind)) = next {
-            self.z_start(seg, kind);
+            self.z_start(seg, kind, false);
         }
     }
 
@@ -32387,15 +32512,87 @@ impl Maint {
                     self.z_next()
                 };
                 let Some((seg, kind)) = next else { break };
-                self.z_start(seg, kind);
+                self.z_start(seg, kind, false);
             }
         } else if let Some(b) = &self.zbuild {
-            if matches!(b.job, ZJob::Build(_)) {
+            if matches!(b.job, ZJob::Build(_)) && !b.dormant {
                 b.cancel.store(true, AtomicOrdering::Release);
             }
         }
-        if d.sample && self.z_sampling.is_none() && self.z_sample_ready.is_none() {
+        if !d.build {
+            self.z_prebuild_step();
+        }
+        if d.sample
+            && self.z_sampling.is_none()
+            && self.z_sample_ready.is_none()
+            && !self.z_prebuild_pending()
+        {
             self.z_sample_start();
+        }
+    }
+
+    /// The partition a build ahead takes next (`Options::zpages_prebuild`),
+    /// where one is due: the store past its budget at the model's last
+    /// reading, the controller never yet in COMPACT, nothing landing,
+    /// sealing or merging, and a live partition with no cell, no decline
+    /// and no form file on disk, the newest first -- an ordered load's last
+    /// partitions are the ones still in the page cache. Only before the
+    /// first install: the exit from COMPACT retires the form files because
+    /// the raw form's touched pages fit, while the populations stay past
+    /// the budget, and building them all again ahead at every exit would
+    /// pay a build for each switch the dwell already prices. Read under
+    /// the caller's pin.
+    fn z_prebuild_next(&self) -> Option<std::sync::Arc<Seg>> {
+        if !self.opts.zpages_prebuild
+            || !self.z_auto
+            || !self.z_past_budget
+            || self.zsel.counts().installs > 0
+            || self.compacting.is_some()
+            || self.tiering.is_some()
+            || !self.sealing.is_empty()
+        {
+            return None;
+        }
+        self.segs()
+            .iter()
+            .filter(|s| s.level > 0)
+            .filter(|s| !self.in_flight_input(&s.name))
+            .filter(|s| s.z.get().is_none())
+            .filter(|s| s.z_declined.load(AtomicOrdering::Relaxed) == 0)
+            .filter(|s| {
+                Db::name_id(&s.name)
+                    .zip(Db::name_end_seq(&s.name))
+                    .is_some_and(|(id, end)| !self.dir.join(zfile::zpg_name(id, end)).is_file())
+            })
+            .max_by_key(|s| Db::name_end_seq(&s.name).unwrap_or(0))
+            .cloned()
+    }
+
+    /// Whether builds ahead are still to run or running: the sampler
+    /// waits for them, so that its reading prices the attach of files
+    /// already written and not a build the builder is in the middle of.
+    fn z_prebuild_pending(&self) -> bool {
+        if !self.opts.zpages_prebuild {
+            return false;
+        }
+        if self.zbuild.as_ref().is_some_and(|b| b.dormant) {
+            return true;
+        }
+        let _op = self.op();
+        self.z_prebuild_next().is_some()
+    }
+
+    /// One build ahead started where one is due and the builder is free.
+    fn z_prebuild_step(&mut self) {
+        if !self.opts.zpages_prebuild || self.zbuild.is_some() {
+            return;
+        }
+        let next = {
+            let _op = self.op();
+            self.z_prebuild_next()
+        };
+        if let Some(seg) = next {
+            self.z_start(seg, ZKind::Build, true);
         }
     }
 
@@ -32547,6 +32744,7 @@ impl Maint {
             .z
             .model_records
             .store(records, AtomicOrdering::Relaxed);
+        self.z_past_budget = hash.saturating_add(records) > budget;
         let (phi_z, phi_z_scan) = match self.z_sample_size {
             Some((w_z, resident, pages_per_key)) => {
                 let z = zselect::model_z(budget, resident, w_z);
@@ -32704,7 +32902,7 @@ impl Maint {
     /// declined. The segment's file is opened here and handed over, so a
     /// promotion's unlink of its old name between now and the build's open
     /// does not fail the build.
-    fn z_start(&mut self, seg: std::sync::Arc<Seg>, kind: ZKind) {
+    fn z_start(&mut self, seg: std::sync::Arc<Seg>, kind: ZKind, dormant: bool) {
         let shared = self.shared.clone();
         let ev = &shared.z;
         let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) else {
@@ -32739,7 +32937,7 @@ impl Maint {
                 &self.dir,
                 &seg,
                 advise,
-                self.opts.zpages_memo,
+                Db::z_memo(&self.opts),
                 self.opts.zpages_scan_prefetch,
                 ev,
             )
@@ -32816,6 +33014,7 @@ impl Maint {
                     job: ZJob::Build(handle),
                     cancel,
                     refused,
+                    dormant,
                 });
             }
             Err(_) => failed(zfile::DECLINED_FAILED),
@@ -32831,7 +33030,11 @@ impl Maint {
         let shared = self.shared.clone();
         let ev = &shared.z;
         let ZBuild {
-            seg, job, refused, ..
+            seg,
+            job,
+            refused,
+            dormant,
+            ..
         } = b;
         let handle = match job {
             ZJob::Build(h) => h,
@@ -32863,6 +33066,13 @@ impl Maint {
             seg.z_schedule_retry(retry_ms);
         };
         match outcome {
+            // Built ahead and not wanted yet: on disk, dormant, for the
+            // attach the controller's build makes when it comes; counted
+            // as built here, where its bytes were written.
+            Ok(zfile::Outcome::Built(built)) if dormant && !self.z_want_build && live.is_some() => {
+                ev.built(&built);
+                zfile::ZEvents::add(&ev.prebuilt, 1);
+            }
             Ok(zfile::Outcome::Built(built)) => match live {
                 Some(target) => {
                     match zfile::ZFile::attach(
@@ -32871,7 +33081,7 @@ impl Maint {
                         id,
                         end,
                         Db::z_advise(&self.opts),
-                        self.opts.zpages_memo,
+                        Db::z_memo(&self.opts),
                         self.opts.zpages_scan_prefetch,
                     ) {
                         Ok(side) => {
@@ -32957,6 +33167,7 @@ impl Maint {
                 job: ZJob::Warm(handle),
                 cancel,
                 refused: false,
+                dormant: false,
             });
         }
     }
@@ -33163,8 +33374,11 @@ impl Maint {
 impl Drop for Db {
     fn drop(&mut self) {
         let _op = self.op();
-        // A test's holds on the seal thread are lifted: the close joins it.
+        // A test's holds on the seal thread and on the form's builder are
+        // lifted: the close joins them, and a test that failed under a hold
+        // hung here in the builder's join before the second was.
         self.shared.seal_hold.store(0, AtomicOrdering::Release);
+        self.shared.zbuild_hold.store(0, AtomicOrdering::Release);
         self.stop_upkeep();
         self.stop_keeper();
         self.stop_trimmer();

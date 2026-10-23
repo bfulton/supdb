@@ -2604,6 +2604,22 @@ read of `A` only; when a lie about `B` sends reads of `B` to `A`, the
 check has to run before any read of the page, not when `B` happens to be
 read.
 
+**A slot keyed by a number a format change made sparse.** The memo of
+decoded groups is direct-mapped, and its slot was the group's number in
+the form file, the page times the most groups a page holds plus the
+group, mod the slots. When the page became a container of up to sixteen
+groups the number took sixteen values a page while the shipped cut puts
+about four groups on one, so a form file's groups reached a quarter of
+the slots and pages 256 apart collided; nothing raised, the memo's hit
+rate was what it was, and its test asserted the collision arithmetic the
+mapping implied. A Fibonacci hash of the number spreads the groups over
+every slot (`Options::zpages_memo_hash`), and the test finds its
+collisions by search and holds the slots reached to more than half. The
+rule: a direct-mapped table is keyed by a function of the key's
+information, not of its encoding, and a change to how densely the
+encoding is used -- here the most groups a page may hold against the
+groups it does -- is a change to the table's capacity.
+
 **A probe's total over a whole read is an inlining result.** The same engine
 read +0.9, +1.9, +2.9 and +3.15 instructions a point read across four probes
 and a count +3.00 exactly, because the code after a probe's loop changes what

@@ -1368,3 +1368,116 @@ pieces and pays the fence and memo look per group, and the two sittings
 disagree on its sign. So the cut's price is 8% of the file and nothing
 a scan cell resolves, and its saving is the point read's 1.5x in core
 and the mixes a point read dominates.
+
+## The form files built ahead of the shift
+
+The gear shift at five million keys under 640 MiB took 36-49 s from the
+load's end to the install, twenty-odd of them the rent and the sampler
+and thirty to fifty the build re-reading 620 MB of raw records from the
+device beside the readers' faults. A form file on disk is bought at the
+attach's price (the restart path, `zselect::Sampler::c_build`), so the
+change builds the form files ahead and leaves them dormant
+(`Options::zpages_prebuild`, off): once the store's raw populations pass
+its budget, the model's own test, and nothing is landing or merging, one
+partition at a time, the newest first, on the builder's idle-class
+thread, written to disk unattached while the raw form serves; the sampler
+waits for them, so its reading finds every file on disk; only before the
+first install, since the exit from COMPACT retires the files while the
+populations stay past the budget. `tests/zpages.rs` holds a store past
+its budget to building every file ahead, unattached, with no read through
+the form, the sampler held while a build ahead is held, and the install
+an attach with no build started past the ones made ahead; a store that
+fits to building nothing; and a store that left COMPACT on the trial and
+retired its files to building none again. Five mutants of the mechanism
+(the install guard, the dormant collect, the sampler's wait, the budget
+test, the cancel of a dormant build) are each killed by those tests. The
+store's drop lifts the test's build holds now, as it lifted the seal's:
+a test that failed under a build hold hung in the builder's join.
+
+Refuted (`zprebuild5m-ab-{1,2}.*`, `supdb-cache64tofitautozpagesprebuild`
+against the combined arm, three pairs after the warmup, both orders; the
+second order rerun on the same binary after a container restart cut it).
+The raw read pass read 0.66x and 0.65x, 3 of 3 pairs in both orders, its
+faults a read 1.53x and 1.50x: the builds ahead ran beside the read pass
+and read the raw records back from the device beside its faults, the
+contention the change was to take off the shift, moved into the pass
+before it. The install came 36-37 s after the load's end against the
+base's 41, since the sampler's nine seconds still followed the builds and
+the warm of the attached files took eight; the two-thread scans read
+1.20x and 1.22x for it, landing after the earlier install, the
+three-thread scans 1.36x and 0.99x, and the mixes level in both orders
+(B 0.85x and then 1.18x, the rest 0.95-1.16x). So a build after the load
+is a build under the readers whenever it runs; what would take it off
+everyone's path is a build while the raw records are still in the page
+cache, at the landing, which the forced arm does and pays for at the
+load, and the budget test does not pass until the load's last partitions
+at this rung. The arm stays as the record, off as shipped.
+
+## E's start seek skipped for a block held as a copy
+
+E under the cut, profiled with DWARF unwinding over one rep of the
+combined arm at five million keys under 640 MiB (the E window cut by its
+phase marks on CLOCK_MONOTONIC, the main thread's samples): the seek
+through the form file 25% inclusive -- the scan's own start seek 19%
+(`scan_blocks` into `cache_seek_exact`), the settle's resolves of the
+earlier mixes' 49,035 unsealed keys 7% -- LZ4 decompression 27%, half of
+it under the seeks, the block forms' builds 11%, the page view's checks
+6% (`view_checked`, at every group open, the memo's hits included), the
+fence's search 5%, and the harness's Zipfian generator about ten, which
+LMDB's E pays alike. The settle's phase timer reads 60-68 ms of E's
+roughly 500.
+
+A copy is walked from the start key by its own search
+(`CachedBlock::lower_bound`), so the scan's seek decoded a group to learn
+a rank only the block of which it used. `Options::zpages_seek_span` takes
+the block from the fence and the page's directory where the start's
+group lies in one block (`ZFile::owner_span`, no group opened) and seeks
+the rank only for a form walked by rank; `span_starts` counts the scans
+that skipped it, the windows test is held to a positive count with the
+option on and none with it off over a dense run of updates that straddles
+a block boundary, and the seek's unit test holds the span to the exact
+owner for every probe. Three mutants (the span as the group's first
+block, the span short by one, the copy's start taken at an unsought rank)
+are each killed.
+
+Level (`zspan5m-ab-{1,2}.*`, the arm against the seek for every scan, both
+orders): E's group decodes fell 7% (163,719 against 176,834 a mix) and its
+memo looks 12%, and E read 2-3% slower with the span in both orders, 1 of
+3 pairs each; every other cell moved with its position, the second arm of
+a pair faster in both sittings (the scan pass 1.15x for the span and then
+1.09x against it, B 1.13x and then 1.30x against). The seeks it skipped
+were mostly memo hits on the Zipfian head, worth about thirteen thousand
+decodes a pass, some 13 ms of E; the span's own fence and directory
+lookup, with a second seek for the 44% of starts whose block is not a
+copy, cost what that saved. The option stays off, the arm
+(`supdb-cache64tofitautozpagesspan`) as the record.
+
+## The memo's slots hashed
+
+The memo's slot was the group's number in the form file (the page times
+sixteen, the most groups a page holds, plus the group) plus a multiple of
+the identity, mod 4,096. Under the shipped cut a page holds about four
+groups, so twelve of every sixteen numbers belonged to indices no page
+had: a form file's groups reached a quarter of the slots, and pages 256
+apart collided -- about 1,024 entries, 1.8 MB, where the cap is 8 MB.
+`Options::zpages_memo_hash` (on) hashes the group's number and the
+identity by a Fibonacci multiply over every slot; the memo's unit test
+finds its collisions over the identities and the pages rather than
+assuming them, and holds a form file of the shipped cut to reaching more
+than half the slots, where the shape before reaches exactly a quarter.
+`supdb-cache64tofitautozpagesmemolinear` is the shape before.
+
+Priced (`zmemo5m-ab-{1,2}.*`, both orders): the counts per mix are the
+same to the unit in both sittings, the hash decoding 12% fewer groups in
+C (34.5k against 39.3k a mix), 13% fewer in B, 5% fewer in E's scans
+(167.9k against 176.8k), D the same (its reads are uniform over the tail),
+and the point reads' decodes 7% fewer over the run, 3 of 3 pairs both
+ways. The rates moved with their position in both sittings, the second
+arm of a pair slower whichever it was (A 0.89x for the hash and then
+1.11x, E 0.90x and then 1.05x, F 0.86x and then 1.02x), so none resolves;
+the change does strictly fewer decodes by a count that does not move, and
+stays on. E's 5% says its hot set outgrows the memo's eight megabytes
+however the slots are spread: what is left there is the cap against the
+page cache, which the promotion's refutation says this bound has none to
+spare for.
+
