@@ -330,7 +330,12 @@ verified page's group asked of the memo before any view of the page
 `supdb-cache64tofitautozpagesperrun` is the combined arm with a block read
 through a cursor a run, a seek a cut and a read by rank a replaced record
 (`Options::zpages_block_cursor` off), where the default reads a block through
-one cursor held across it. The forced arm's
+one cursor held across it; `supdb-cache64tofitautozpagesmemo4`,
+`supdb-cache64tofitautozpagesmemo16` and `supdb-cache64tofitautozpagesmemo32`
+are the combined arm with the memo of decoded groups capped at four, sixteen
+and thirty-two mebibytes (`Options::zpages_memo_bytes`), where the default
+caps it at eight. The
+forced arm's
 `sync` builds the form files, so its load carries the build, and in memory
 it reads slower than the raw form: it is an arm for the bound, not a
 default.

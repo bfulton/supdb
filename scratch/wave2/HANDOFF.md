@@ -1,13 +1,14 @@
 # Handoff: out-of-core work on the compact form (zpages)
 
 Branch `claude/recover-consolidate-branches-5rwvr5` of `bfulton/supdb`. The
-last engine commit is the one that added the section "This session: a block
-read through one cursor" below (`git log -1 -- src/db/zfile.rs` names it),
-pushed, with the full gate (`sh scripts/check.sh`, every group) green on
-its tree and the two fuzz ranges below green on its binary. The session
-before it ended at `92a5f35` (the page view read once), and the one before
-that at `d5114b6`; their records are the sections after "Where the
-out-of-core comparison stands".
+last two engine commits are this session's, the block read through one
+cursor and the memo's size counted and paired (the section "This session"
+below; `git log -2 -- src/db/zfile.rs` names them), each pushed with the
+full gate (`sh scripts/check.sh`, every group) green on its tree and the
+two fuzz ranges below green on its binary. The session before ended at
+`92a5f35` (the page view read once), and the one before that at `d5114b6`;
+their records are the sections after "Where the out-of-core comparison
+stands".
 
 ## Standing instructions
 
@@ -150,9 +151,31 @@ install (the "gear shift").
   opens the walk itself repeated were the larger part; and a change that
   holds a group across a walk is read in the decodes as well as the asks,
   since an open made for the next read is a miss as often as not.
-- **The memo-size drafts** stay under `next/` (`next/README.md`: how to
-  run them, and the dry-run trap). The lever C drafts there were superseded
-  by this change and removed.
+- **Committed: `Options::zpages_memo_bytes`** (eight mebibytes, as the
+  memo was) with the arms `supdb-cache64tofitautozpagesmemo4`, `...memo16`
+  and `...memo32` (`stage4.md`, "The memo's size, counted"; `zmemo-count-5m.sh`
+  for the counts, `pair-5m.sh NAME A B` for any pairing). By count a
+  sixteen-mebibyte memo decodes 8.3% fewer groups in E and 11.5% fewer in
+  C, thirty-two 14.4% and 15.8% fewer (E's hit rate 42%, 47%, 50%), the
+  point reads' major faults level. Paired, five pairs a sitting in both
+  orders: sixteen moves neither E (0.997, the sign with the order) nor C
+  (1.007) and reads D 1.065 slower in both orders (the uniform reads hit
+  the memo once in eighty asks and pay its footprint); thirty-two reads C
+  1.115 slower in both orders (the mix that saved the most decodes), D
+  1.066, E level (1.026, the sign with the order); four
+  (`...memo4`, added to read the other side) decodes 5.5% more in E and
+  reads E 1.078 slower in both orders, C level. Eight is at the knee and
+  stays. The reading: the memo pays for groups that come back while still
+  warm in the last-level cache, the Zipfian head's, and a hit on a cold
+  group costs the walk its thirty-two lines from memory, about what the
+  decode would have, while the larger memo's footprint costs the point
+  reads besides; a cycle counter could settle it and this guest has none
+  (`stage4.md` names the micro-probe that would). The memo's size is not
+  a lever on E.
+- **The drafts under `next/`** are gone: the memo-size ones landed, the
+  lever C ones were superseded. `next/README.md` says what the counts point
+  at next and how a draft is applied (never dry-run by disarming its edit
+  function).
 - **Untouched**: the shuffled-load kill of the combined arm under 640 MiB
   and the gear shift, as the session before left them.
 
