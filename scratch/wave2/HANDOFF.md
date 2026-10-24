@@ -1,13 +1,13 @@
 # Handoff: out-of-core work on the compact form (zpages)
 
 Branch `claude/recover-consolidate-branches-5rwvr5` of `bfulton/supdb`. The
-last two engine commits are this session's, the block read through one
-cursor and the memo's size counted and paired (the section "This session"
-below; `git log -2 -- src/db/zfile.rs` names them), each pushed with the
-full gate (`sh scripts/check.sh`, every group) green on its tree and the
-two fuzz ranges below green on its binary; after them the probe of the
-per-record form (`bench/examples/zrec.rs`, the last bullet of "This
-session"), which is the next lever and touches no engine code yet. The session before ended at
+engine commits of this session are the block read through one cursor, the
+memo's size counted and paired, the record coding (a form file's groups
+holding their records one by one, now an arm) and the commit that made it
+the arm (the section "This session" below; `git log -- src/db/zfile.rs`
+names them), each pushed with the full gate (`sh scripts/check.sh`, every
+group) green on its tree and the two fuzz ranges below green on its binary;
+between them the probes of the per-record form (`bench/examples/zrec.rs`). The session before ended at
 `92a5f35` (the page view read once), and the one before that at `d5114b6`;
 their records are the sections after "Where the out-of-core comparison
 stands".
@@ -236,7 +236,27 @@ group decode.
   block's hot and 1.6x cold, a point read's one record about a sixth of a
   group. The plan's per-page coding was wrong (a 5,000-byte key the block
   compresses and a head never is) and so was the memo test's invariant for
-  this coding; both are in the record. Not yet paired in the suite: step 3.
+  this coding; both are in the record.
+- **Paired, twice, and made the arm** (`stage4.md`, "The record coding
+  paired, and what E's loss was made of" and "... paired again, and made the
+  arm"; `zcoding-ab-{1,2}.*`, `zcoding2-ab-{1,2}.*`, `pairing_read.py`). Over
+  twelve pairs in both orders the record coding reads the point-read mixes'
+  gets at 0.68-0.79 of the block coding's time, never slower in a pair, and
+  E's scans at 1.24, slower in every pair; the write mixes' commits read
+  7-33% slower in the first pairing and level in the second, once a page's
+  first touch verified a coded group by its heads (`zpages::check_coded_group`,
+  `zfile::first_checks`) instead of decoding it. E's loss is the memo
+  misses' decode of a group through its records, 2.2x the block decode's
+  instructions by callgrind and structural (a field parse, three copies and
+  a decoder call a record against LZ4's bulk copies); a decoder and an
+  encoder shaped for a record, held to the library byte for byte, were
+  slower than the library and were removed. So `Options::zpages_record_coding`
+  is off and the arms are `supdb-cache64tofitautozpagesrecord` and
+  `supdb-nocachezpagesrecord`; the shipping default is the block coding as
+  it was, under the per-group bit and the trailer's version 2. The shape
+  that would serve both paths -- one block a group whose records reference
+  only the first, an entry a record into it, the heads beside it -- is
+  named in the record and not built: it would hold E level, not win it.
 - **Untouched**: the shuffled-load kill of the combined arm under 640 MiB
   and the gear shift, as the session before left them.
 

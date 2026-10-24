@@ -1324,6 +1324,63 @@ pub fn decode_record_group<'a>(
     Ok(out)
 }
 
+/// A coded group's key `i` assembled into `into`: the first record's head
+/// to the prefix length, the suffix, and the key is what follows the four
+/// header bytes.
+fn coded_key_into(head0: &[u8], r: &CodedRec<'_>, into: &mut Vec<u8>) {
+    into.clear();
+    into.extend_from_slice(&head0[..r.plen]);
+    into.extend_from_slice(r.suffix);
+    into.drain(..4);
+}
+
+/// That a record-coded group `j` is what its page's directory and its
+/// fence entry say, read from its heads and nothing decoded: every record's
+/// fields in range (`coded_rec`), the image lengths summing to the group's,
+/// the keys strictly ascending, the first the entry's key for group 0 and
+/// the directory's for the rest, every one below the next group's first.
+/// What [`check_group`] checks of a decoded group, less the tails, whose
+/// decode is checked at the read that wants them -- a tail that decodes to
+/// the wrong length or not at all is damage there as a record that does not
+/// parse is in a decoded group -- so a page's first touch under this coding
+/// walks heads where the block coding decodes every group of the page.
+pub fn check_coded_group(
+    payload: &[u8],
+    view: &PageView<'_>,
+    j: usize,
+    entry: &FenceEntry<'_>,
+) -> Result<(), ZError> {
+    let g = view
+        .group(j)
+        .ok_or(ZError::Header("no such group in the page"))?;
+    let count = usize::from(g.count);
+    let first = if j == 0 { Some(entry.key) } else { view.key(j) };
+    let below = view.key(j + 1);
+    let (head0, _) = coded_first(payload, count)?;
+    let mut prev: Vec<u8> = Vec::new();
+    let mut cur: Vec<u8> = Vec::new();
+    let mut ulen = 0usize;
+    for i in 0..count {
+        let r = coded_rec(payload, count, i)?;
+        ulen = ulen.checked_add(r.ulen).ok_or(REC_CUT)?;
+        coded_key_into(head0, &r, &mut cur);
+        if i == 0 && first.is_some_and(|f| f != cur.as_slice()) {
+            return Err(ZError::Walk("the first key is not the one named for it"));
+        }
+        if i > 0 && key_cmp(&prev, &cur) != Ordering::Less {
+            return Err(ZError::Walk("keys do not ascend"));
+        }
+        if below.is_some_and(|b| key_cmp(&cur, b) != Ordering::Less) {
+            return Err(ZError::Walk("a key is not below the next group's first"));
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    if ulen != g.ulen as usize {
+        return Err(ZError::DecodedLen);
+    }
+    Ok(())
+}
+
 /// The key of a coded record, `head_i[4..]`, compared with `key` without
 /// assembling it: the part the shared prefix holds, then the suffix's.
 fn cmp_coded_key(head0: &[u8], r: &CodedRec<'_>, key: &[u8]) -> Ordering {
@@ -3593,6 +3650,92 @@ mod tests {
         assert_eq!(
             decode_record_group(&payload, count, all.len(), &mut b).unwrap(),
             &all[..]
+        );
+    }
+
+    /// The head walk refuses what the decoded walk refuses, from the heads:
+    /// a first key that is not the one named, keys out of order, a key at or
+    /// past the next group's first, and lengths that do not sum to the
+    /// group's; and passes the group as written.
+    #[test]
+    fn a_coded_groups_heads_are_checked_as_its_decoded_records_would_be() {
+        let imgs = suite_images(30, 51);
+        let (a, b) = imgs.split_at(15);
+        let (all_a, _, pay_a) = coded(a);
+        let (_, _, pay_b) = coded(b);
+        let key_a = record_key(&a[0], 0).unwrap().to_vec();
+        let key_b = record_key(&b[0], 0).unwrap().to_vec();
+        let bind = 0x3131_0003;
+        let groups = [
+            PageGroup {
+                count: 15,
+                payload: &pay_a,
+                ulen: all_a.len() as u32,
+                stored: false,
+                coded: true,
+                key: b"",
+            },
+            PageGroup {
+                count: 15,
+                payload: &pay_b,
+                ulen: all_a.len() as u32,
+                stored: false,
+                coded: true,
+                key: &key_b,
+            },
+        ];
+        let mut page = [0u8; ZPAGE];
+        encode_page(&mut page, 0, &groups, bind).unwrap();
+        let view = parse_page(&page, bind).unwrap();
+        let entry = FenceEntry {
+            index: 0,
+            first_rank: 0,
+            count: 30,
+            page: 0,
+            key: &key_a,
+        };
+        for j in 0..2 {
+            assert_eq!(
+                check_coded_group(view.payload(j).unwrap(), &view, j, &entry),
+                Ok(())
+            );
+            let mut buf = GroupBuf::new();
+            let dec = decode_group(&view, j, &mut buf).unwrap();
+            assert_eq!(check_group(dec, &view, j, &entry), Ok(()));
+        }
+        // The entry names another first key: group 0 refused, group 1 not.
+        let wrong = FenceEntry {
+            key: &key_b,
+            ..entry
+        };
+        assert!(check_coded_group(view.payload(0).unwrap(), &view, 0, &wrong).is_err());
+        assert_eq!(
+            check_coded_group(view.payload(1).unwrap(), &view, 1, &wrong),
+            Ok(())
+        );
+        // Record 3's suffix made to sort below record 2's: not ascending.
+        let (_, _, _, _) = fields_of(&pay_a, 3);
+        let mut p = pay_a.clone();
+        let off = usize::from(u16::from_le_bytes([p[6], p[7]]));
+        let slen = usize::from(p[off + 1]);
+        p[off + 2 + slen - 1] = b'0';
+        let r = check_coded_group(&p, &view, 0, &entry);
+        assert!(matches!(r, Err(ZError::Walk(_))), "{r:?}");
+        // Group 0's last key raised past group 1's first: not below the next.
+        let mut p = pay_a.clone();
+        let off = usize::from(u16::from_le_bytes([p[28], p[29]]));
+        let slen = usize::from(p[off + 1]);
+        p[off + 2 + slen - 1] = b'9';
+        p[off + 2 + slen - 2] = b'9';
+        let r = check_coded_group(&p, &view, 0, &entry);
+        assert!(matches!(r, Err(ZError::Walk(_))), "{r:?}");
+        // An image length changed: the sum is not the group's.
+        let mut p = pay_a.clone();
+        let (_, _, ulen_at, _) = fields_of(&pay_a, 5);
+        p[ulen_at] += 4;
+        assert_eq!(
+            check_coded_group(&p, &view, 0, &entry),
+            Err(ZError::DecodedLen)
         );
     }
 

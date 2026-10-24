@@ -1,0 +1,14 @@
+a78ea7e
+ M scratch/wave2/stage4.md
+ M src/db/zfile.rs
+ M src/db/zpages.rs
+?? scratch/wave2/zcoding-ab-1.err
+?? scratch/wave2/zcoding-ab-1.out
+?? scratch/wave2/zcoding-ab-2.err
+?? scratch/wave2/zcoding-ab-2.out
+?? scratch/wave2/zcoding-build.log
+?? scratch/wave2/zcoding-head.txt
+?? scratch/wave2/zcoding2-build.log
+?? scratch/wave2/zcoding2-head.txt
+?? scratch/wave2/zsize-record-300k-heads.txt
+2026-10-24T16:04:17Z

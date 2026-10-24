@@ -1,0 +1,33 @@
+codec: lz4_flex 0.11.6 (bench/Cargo.lock); decoder run: Unsafe; bench feature lz4-safe: off; the encoders emit the same bytes (compare the digests); coding: record
+encoder pin: (3720, 2024, 3788764450) (bytes in, bytes out, crc of them); the pin the sizes were taken with: (3720, 2024, 3788764450)
+300000 keys a cell, values of 100 bytes, partitions under /tmp/claude-0/-home-user-supdb/95907082-4009-52f5-8d06-b36856ae75e3/scratchpad/zrec-engine/zsize5-record, timing on (1 rounds of 400 sampled pages)
+
+done: seq-dec16 comp 0.5
+SIZE (what fill_page built; every page decoded group by group, compared and verified)
+shape         comp  parts rec_B   pages rec/page grp/pg  grpB/pg payB/pg  B/key    fill stored  nopage  calls   turns             digest
+seq-dec16      0.5      2 124.0    6370    47.10   3.04   5839.9  3944.2  86.97  0.9844   1.0%       0  4.048   4.048   d60db9ffef0c8091
+
+stored images are byte-equal to stream_record's: checked for every record of every cell
+  seq-dec16 comp 0.5: 7152 bytes of the record region lie between records (commit markers of a direct run); the directory skips them
+
+TIME, microseconds a group (crc and verify a page), medians over sampled pages' groups and rounds (hot unless cold)
+shape         comp   decode (range of rounds)     cold     find     walk    parse      crc  verify fill_page  stored/n
+seq-dec16      0.5    0.547   0.547-0.547       1.807    0.040    0.070    0.100    0.394   2.661     19.554   10/1214
+  decode: one group's LZ4 block into the buffer, what a point read pays (stored groups are lent in place and not in the median); cold: the page's lines flushed first, the buffer it decodes into warm,
+  one call timed by a pair of clock reads that is in the figure; the fault that brings a page in is not, so cold is the decode's share of a first read, a quantity of its own and not a second reading of the hot column;
+  find: the walk to one key, averaged over the group's keys; walk: the walk past every record of the group; parse: the structural walk (parse_record);
+  crc: the page's checksum; verify: a reader's whole first decode of a page, every group; stored/n: stored groups over the groups sampled;
+  fill_page: the builder's call for the page, its compress calls and the decode and compare of the page it made, once, in the load's pass
+
+OCCUPANCY at 10000000 keys, against 937 MB of cache
+shape         comp       pages   pages_GB  resident_MB  occupancy    fill_page_s
+seq-dec16      0.5      212334      0.870         18.4      94.8%            4.2
+  fill_page_s: the builder's fill_page calls at this many pages, one thread: the compress and the decode-compare of the build, not its read of the raw segment, the filter, the CRCs or the writes
+
+GROWTH ROUNDS (the suite's shape, first partition, the page as one group, first hint 60)
+  grow_rounds 0: 44.11 records a page, fill 0.8920, 1.001 compress calls a page
+  grow_rounds 1: 48.99 records a page, fill 0.9886, 1.854 compress calls a page
+  grow_rounds 2: 49.01 records a page, fill 0.9889, 1.870 compress calls a page
+  grow_rounds 3: 49.01 records a page, fill 0.9889, 1.870 compress calls a page
+
+stop rule held: 47.10 records a page on the suite's shape over 6366 page(s) of its steady state, not under 36

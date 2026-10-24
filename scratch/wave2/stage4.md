@@ -2233,3 +2233,114 @@ seeds under `ZFUZZ_OPTVARY`), and the test of a piece kept across a merge
 holding the merge's landing (`Db::hold_merge_landing`), which bet a merge of
 four hundred thousand keys would outlast a seal of twenty and lost once under
 the gate's load.
+
+## The record coding paired, and what E's loss was made of
+
+The pairing (`pair-5m.sh zcoding supdb-cache64tofitautozpagesblock
+supdb-cache64tofitautozpages`, `zcoding-ab-{1,2}.*`, the tree `a78ea7e`:
+five pairs a sitting after the warmup, both orders, five million keys under
+640 MiB, read by `pairing_read.py` as the arm each line names). Over the
+twelve pairs the record coding reads the point-read mixes faster in every
+pair: C's gets 0.689 of the block coding's time (0 of 12 slower; 0.715 and
+0.664 by sitting), B's 0.704, D's 0.742, F's 0.831, A's 0.799 (1 of 12), the
+mixes' totals 0.707, 0.756, 0.785, 0.981 and 1.003 -- the suite's ops a
+second 1.46x, 1.32x and 1.33x on C, B and D in the first sitting, 1.51x,
+1.37x and 1.34x in the second -- and reads E's scans at 1.262 (11 of 12
+slower; 1.253 and 1.271 by sitting), E's total 1.270, with the write
+mixes' commits 1.07 to 1.33 slower besides (A's 1.074 in 9 of 12, F's 1.065
+in 8, E's 1.332 in 9). The counters: under the block coding 42% of C's
+reads hit the memo and the rest decoded a group (48,822 hits, 34,512
+misses of 83,334 reads); under the record coding no read asks the memo and
+every read decodes its record (5 hits, 83,306 decodes), and the reads are
+still a third faster, so a record's decode is cheap against the memo's hit
+as well as against a group's decode. E decodes fewer groups under the record
+coding, 130,861 a pass against 147,116, with the memo's hits 109,224 against
+107,242, and pays about a microsecond more for each: 648 ms a pass against
+503. A commit's fill of its batch's blocks decodes groups as well, which is
+the write mixes' loss.
+
+Where E's microsecond a group came from, by count. The sizing tool at
+300,000 keys (`zsize-record-300k.txt`) read a group decoded whole through
+its records at 0.649 µs hot against the block's 0.271 and 1.631 cold against
+1.014, and callgrind over the tool's build with the collection toggled on
+`decode_group` counted the record coding's decode at 2.2x the block's
+instructions, 81.3M against 36.9M over the same records: `decode_record_group`
+itself 26%, libc's memcpy 19% (three calls a record, of twenty to a hundred
+bytes), the record's field parsing (`coded_rec`, `get_var`) 16%, the rest
+bounds checks and arithmetic -- about 2,000 instructions a record against
+the block decode's 920, which is LZ4's bulk copies at seven instructions a
+byte against a structure that pays a fixed cost a record. That is 0.4-0.6 µs
+of the microsecond; the pairing's end counters gave the rest: every page of
+the form is verified over a run (`zpage_verified_pages_at_end` 106,241
+against 93,333, the forms' page counts), and a page's first decode decodes
+every group of it to check the keys, 3.0 µs a page under the record coding
+against 1.8 by the tool's `verify` column, so the first touch of a page cost
+E 1.2 µs more under the record coding, and E, whose Zipfian starts range
+over the store, first-touches tens of thousands of pages a rep.
+
+Two things tried against it, one kept. A decoder and an encoder of
+standard LZ4 blocks shaped for a record against a dictionary, allocation-free
+(the library's compress builds a table per call), on the reading that the
+library's per-call setup was the record's cost: held to the library byte for
+byte both ways on every shape, and slower -- a group decoded through them
+read 0.93 µs hot against 0.66 through the library, the fill 51 µs a page
+against 26, and a loop of eight-byte copies tried for the records' pieces
+read a third more instructions than the memcpy calls it replaced, since the
+compiler made no single moves of them -- so both were taken out again; the
+per-record cost is the structure's and not the library's call. And the first
+touch of a coded group verifies it by its heads (`zpages::check_coded_group`;
+`zfile::first_checks`, which `first_decode` and the point read's fast path
+share): the fields of every record in range, the image lengths summing to the
+group's, the keys strictly ascending from the one the fence or the directory
+names and below the next group's first -- what `walk_group` checks of a
+decoded group, less the tails, whose decode is checked at the read that wants
+them, a tail that decodes short or not at all being damage there as a record
+that does not parse is in a decoded group. The point read's fast path runs on
+a page not yet verified too now, the first checks first. Held by the head
+walk's own test (a first key not the one named, keys out of order, a key at
+the next group's first, lengths that do not sum) beside the forged-payload
+tests. The pairing after it is the next section.
+
+## The record coding paired again, and made the arm
+
+With a coded group verified by its heads at a page's first touch, the same
+pairing (`pair-5m.sh zcoding2 ...`, `zcoding2-ab-{1,2}.*`): over twelve pairs
+in both orders the point-read mixes' gets read 0.682 (C, 0 of 12 slower),
+0.748 (B), 0.751 (A), 0.780 (D) and 0.794 (F, 1 of 12) of the block coding's
+time, the totals 0.697, 0.790, 0.943, 0.819 and 0.936; the write mixes'
+commits, which the first pairing read 7-33% slower, are level now (A 1.000,
+F 1.009, D 1.037, B 0.864, E 1.048) -- a commit's fill of its blocks touches
+pages first, and the heads made that touch what the block coding's was; and
+E's scans read 1.236, slower in all twelve pairs (1.222 and 1.249 by sitting),
+E's total 1.218. So the first touch was the commits' loss and about three
+points of E's, and the rest of E's loss, a fifth, is the memo misses' decode
+of a group through its records, 131,000 of them a pass at 2.2x the block
+decode's instructions, which no decoder of the records made cheaper and
+which the structure sets: a field parse, three copies and a decoder call a
+record against LZ4's bulk copies at seven instructions a byte, so a group
+decoded through its records costs at least what the block decode costs and
+in practice two to three times it. A scan's path needs groups decoded whole,
+through the memo, and a point read's needs one record: the coding that
+serves the second costs the first, and the shape that would serve both --
+one LZ4 block a group whose records reference only the group's first, with
+an entry a record into the block and the heads kept beside it for the seek,
+so that the whole decode is the block's and a record's decode is its own --
+is another layout, a tenth larger again, and would hold E level rather than
+win it.
+
+E being the cell the form has left to win, the record coding is the arm and
+the block coding ships (`Options::zpages_record_coding` off;
+`supdb-cache64tofitautozpagesrecord` and `supdb-nocachezpagesrecord` are the
+arms, renamed from the block arms built the other way round). What this leaves
+in the engine as shipped: the per-group coding bit (zero in every group the
+block coding writes), the trailer at version 2 (a form file from before is
+rebuilt once), the page's first checks factored (`zfile::first_checks`, the
+same checks for a block group as before), the coded group's own paths inert
+under the default, and the record coding whole behind the arm, with its tests
+and the fuzz turning it on in a quarter of its seeds under `ZFUZZ_OPTVARY`.
+The point-read gain is real and banked as the arm: a quarter to a third of the
+point-read mixes' time at five million keys under 640 MiB, for a form 14%
+larger and E a fifth slower. The rule the two pairings give: a form is priced
+on every path that reads it before its coding is chosen, and a group decoded
+through its records is a decode of every record, so a structure that makes
+one record cheap to read is priced on the readers that want the group.
