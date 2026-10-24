@@ -1665,7 +1665,12 @@ land). It came back as a count: the segment writer's helper thread syncs
 once an `ahead` of the file is unsynced and begins no sync once the
 finish asks it to stop, and its test asserted a sync after writing a
 quarter megabyte, which a host twice as fast wrote before the thread's
-first turn; the test waits for that turn now. The rule: a test that
+first turn; the test waits for that turn now. And as a merge: the test
+of a piece kept across a merge bet that a merge of four hundred thousand
+keys would outlast a seal of twenty, and the bet lost once under the
+gate's load, with a guard naming the case not reached; it holds the
+merge's landing now (`hold_merge_landing`) until the piece has published.
+The rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
 thing it bets against gets faster.
 
