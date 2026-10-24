@@ -1949,3 +1949,116 @@ would decide it here -- the lines a hit's parse misses against a decode's
 more distinct groups than the last-level cache holds, timed as the decoder
 was (`bench/examples/zdecode.rs`), is the instrument to build if the memo
 is taken up again.
+
+## The per-record form, probed against the comparators
+
+The question put was whether a form whose records decode on their own
+beats LMDB and RocksDB on a cell the engine loses, before it is built into
+the engine. `bench/examples/zrec.rs` writes the suite's records (sixteen-byte
+keys in order, the suite's hundred-byte values) as such a form -- groups of
+sixteen records, the group's first key raw, every record's key front-coded
+against it as the shared prefix's length and the suffix, every value
+compressed on its own with LZ4 against a dictionary of the segment's first
+sixty kilobytes of values, and a table of sixteen record offsets at the
+group's head -- maps it, advises it random, and runs three read-only mixes
+against it, the forced group form (`supdb-nocachezpages`), LMDB with its
+readahead off and RocksDB, in one process with the arms interleaved within
+a round: 200,000 uniform point reads (the suite's read pass), 200,000
+Zipfian point reads (C's) and 20,000 Zipfian scans of fifty (E's scans
+without its inserts), each timed with the process's major faults around it
+and the bytes it answered. The byte totals are the check that the arms
+answered the same question: every arm reads 20.0 MB a point-read mix and
+100.0 MB a scan mix with zero misses, in every round of both runs. A point
+read decodes one record, found by binary search over the group's offsets
+with the key compared through its prefix length and suffix; a scan decodes
+exactly the fifty records it emits, assembling each key. What the probe
+does not do: inserts (D's and E's five percent, and the updates the mixes
+before E leave at the Zipfian head), the controller, the block cache, any
+write path; so it prices the form's own cost per read and per scanned
+record and nothing of the overlay walk. The runs are `zrec-incore-5m.log`
+and `zrec-bound-5m.log`, read by `zrec_summarize.py` (medians over the
+rounds, and the median of the per-round ratios to LMDB).
+
+The form is the group form's size: 361.9 MB at five million keys, 72.4
+bytes a record keys included, against the form file's 360 -- the
+dictionary finds the value's fifty-byte motif where the group's
+compression found it in the neighbouring records. The probe's build takes
+73-85 s, fifteen microseconds a record, because `compress_into_with_dict`
+rebuilds the dictionary's hash table on every call; a builder in the
+engine keeps that table across records, and the figure is the probe's and
+not the form's.
+
+In core (three rounds; medians, with the per-round range of the ratio to
+LMDB): the per-record form reads a uniform point read in 1.87 µs, a
+Zipfian one in 0.84 and a scan of fifty in 4.16; the forced group form
+5.08, 1.68 and 6.06 with 1,147 MB of files (the raw records, the form and
+the index); LMDB 1.65, 0.79 and 2.02 with 665 MB; RocksDB as tuned 6.90,
+4.10 and 16.16 with 584. Against LMDB the per-record form reads 1.12x
+(1.03-1.13) on the uniform reads, 1.01x (0.95-1.16) on the Zipfian and
+1.92x (1.42-2.18) on the scans: level on point reads, since both are
+bound by the lines a read misses and neither decodes much, and half
+LMDB's speed on scans, which is fifty decodes of about sixty nanoseconds
+each where LMDB's cursor steps and copies. Against the group form it is
+0.37x, 0.50x and 0.69x, all of it the decode: the group form decodes seven
+kilobytes for a record of 116 bytes.
+
+Under the bound (640 MiB, five million keys, three rounds): the per-record
+form reads 1.80, 0.75 and 3.68 µs with no major faults in any mix, since
+362 MB fits the cgroup whole; the forced group form 5.83, 1.78 and 6.39
+with 0.006, 0.001 and 0 faults an operation; LMDB 15.41, 5.61 and 8.37
+with 0.186, 0.056 and 0.070 faults an operation, its 665 MB tree past what
+the group holds; RocksDB at its default options (`rocksdb-nosync`, whose
+reads are a durable RocksDB's and whose policy touches the load alone,
+since the tuned arm's 256 MB block cache does not survive this bound)
+22.01, 11.32 and 36.52 with 630 MB of files and no major faults, because
+it reads with `pread` and its misses are read calls, so only its time
+counts. The ratios to LMDB, median of the per-round ratios with the range:
+the per-record form 0.12 (0.10-0.16) on the uniform reads, 0.15
+(0.12-0.16) on the Zipfian, 0.44 (0.37-0.58) on the scans; the group form
+0.38 (0.38-0.43), 0.33 (0.31-0.37) and 0.77 (0.64-1.02); RocksDB 1.57,
+2.12 and 4.36. The per-record form against the group form, same process,
+same rounds: 0.31 (0.27-0.38), 0.42 (0.36-0.48) and 0.58 (0.43-0.74). So
+under the bound the per-record form reads six to eight times faster than
+LMDB on point reads and 2.3 times on scans, ten to fifteen times faster
+than RocksDB, and three times faster than the engine's own form on
+uniform reads, 2.4 on Zipfian reads and 1.7 on scans, in every round --
+and since both supdb forms fit the bound and fault nothing, the whole of
+that last gap is the group decode.
+
+What it shows and what it does not. The record above ("Against the
+comparators out of core") already has the forced group form winning these
+read-only cells against LMDB under the bound, and the probe agrees (0.33-0.77x
+of LMDB's time); the cells the engine loses there are E, at 0.55x, and the
+controller arm's passes before its install, and E's loss is in the mixes'
+shape -- its scans cross the unsealed updates the mixes before it leave at
+the Zipfian head, and the settle and the builds are a seventh of it -- which
+the probe cannot run. What the probe measures is the cost the form itself
+adds to a read and to each record a scan emits, and that is what a
+per-record form changes: the profile of E on the combined arm put the LZ4
+decode at 26.5% of the main thread and `ZFile::seek` at 27% inclusive with
+the scans' start seeks 22% of it, each start seek a group decoded to place
+the cursor, and the overlay walk's re-entries after each unsealed key a
+group each (1.8 opens a scan after the cursor kept its group). A record
+decoded instead of a group at every one of those is the lever the shares
+name; what it buys E is a measurement the suite has to make, not a figure
+to be drawn from the shares.
+
+The scan is where the per-record form pays, and in core it pays to LMDB:
+fifty decodes a scan against a cursor's fifty steps. Three levers there,
+none of them probed: the decoder (the C library at 0.83-0.91 of
+`lz4_flex` cycling, "the decoder and the cut"), values stored raw with
+only the keys coded (about 107 bytes a record, 535 MB at this rung, which
+sits at the edge of this bound beside the process), and a value coding
+cheaper than LZ4's token walk for records this short. Under the bound the
+scan reads 0.44x of LMDB anyway, since LMDB faults on its tree.
+
+Building it into the engine: the form file's page becomes a container of
+per-record-decodable groups -- the page's CRC and fence entry as they are,
+a directory of record offsets in the group, the first key raw and the rest
+front-coded, the dictionary once per form file in the trailer -- the
+cursor's walk decodes per record, a point read decodes one, the memo caches
+nothing a point read needs (a decoded group is the thing it exists to
+cache), and the builder keeps the compressor's dictionary state across
+records. The fence, the directory of groups and the controller do not
+change. The arm is the group form, which is what every bounded row so far
+has measured.

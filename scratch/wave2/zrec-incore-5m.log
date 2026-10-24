@@ -1,0 +1,14 @@
+5000000 keys, 3 rounds, 200000 reads a mix and 20000 scans of 50, bound none
+round 1 zrec                   load   84.1s   361.9 MB | D-reads    1.71 us/op  0.000 majflt/op  20.0 MB 0 miss | C-reads    0.74 us/op  0.000 majflt/op  20.0 MB 0 miss | E-scans    4.16 us/op  0.000 majflt/op 100.0 MB 0 miss |
+round 1 supdb-nocachezpages    load    6.5s  1147.2 MB | D-reads    4.75 us/op  0.000 majflt/op  20.0 MB 0 miss | C-reads    1.68 us/op  0.000 majflt/op  20.0 MB 0 miss | E-scans    6.06 us/op  0.000 majflt/op 100.0 MB 0 miss |
+round 1 lmdb-nordahead         load    7.8s   665.0 MB | D-reads    1.52 us/op  0.000 majflt/op  20.0 MB 0 miss | C-reads    0.78 us/op  0.000 majflt/op  20.0 MB 0 miss | E-scans    1.91 us/op  0.000 majflt/op 100.0 MB 0 miss |
+round 1 rocksdb-tuned          load    7.3s   584.1 MB | D-reads    6.95 us/op  0.000 majflt/op  20.0 MB 0 miss | C-reads    3.71 us/op  0.000 majflt/op  20.0 MB 0 miss | E-scans   15.42 us/op  0.000 majflt/op 100.0 MB 0 miss |
+round 2 zrec                   load   74.1s   361.9 MB | D-reads    1.94 us/op  0.000 majflt/op  20.0 MB 0 miss | C-reads    0.84 us/op  0.000 majflt/op  20.0 MB 0 miss | E-scans    4.36 us/op  0.000 majflt/op 100.0 MB 0 miss |
+round 2 supdb-nocachezpages    load    7.1s  1147.2 MB | D-reads    5.08 us/op  0.000 majflt/op  20.0 MB 0 miss | C-reads    1.64 us/op  0.000 majflt/op  20.0 MB 0 miss | E-scans    5.59 us/op  0.000 majflt/op 100.0 MB 0 miss |
+round 2 lmdb-nordahead         load    9.6s   665.0 MB | D-reads    1.88 us/op  0.000 majflt/op  20.0 MB 0 miss | C-reads    0.83 us/op  0.000 majflt/op  20.0 MB 0 miss | E-scans    3.07 us/op  0.000 majflt/op 100.0 MB 0 miss |
+round 2 rocksdb-tuned          load    7.8s   584.1 MB | D-reads    6.79 us/op  0.000 majflt/op  20.0 MB 0 miss | C-reads    4.10 us/op  0.000 majflt/op  20.0 MB 0 miss | E-scans   16.16 us/op  0.000 majflt/op 100.0 MB 0 miss |
+round 3 zrec                   load   84.7s   361.9 MB | D-reads    1.87 us/op  0.000 majflt/op  20.0 MB 0 miss | C-reads    0.92 us/op  0.000 majflt/op  20.0 MB 0 miss | E-scans    3.88 us/op  0.000 majflt/op 100.0 MB 0 miss |
+round 3 supdb-nocachezpages    load    7.7s  1147.2 MB | D-reads    5.57 us/op  0.000 majflt/op  20.0 MB 0 miss | C-reads    2.07 us/op  0.000 majflt/op  20.0 MB 0 miss | E-scans    6.15 us/op  0.000 majflt/op 100.0 MB 0 miss |
+round 3 lmdb-nordahead         load    9.2s   665.0 MB | D-reads    1.65 us/op  0.000 majflt/op  20.0 MB 0 miss | C-reads    0.79 us/op  0.000 majflt/op  20.0 MB 0 miss | E-scans    2.02 us/op  0.000 majflt/op 100.0 MB 0 miss |
+round 3 rocksdb-tuned          load    8.8s   584.1 MB | D-reads    6.90 us/op  0.000 majflt/op  20.0 MB 0 miss | C-reads    4.36 us/op  0.000 majflt/op  20.0 MB 0 miss | E-scans   17.03 us/op  0.000 majflt/op 100.0 MB 0 miss |
+exit 0

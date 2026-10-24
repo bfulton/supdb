@@ -7,7 +7,19 @@ and `...memo32`) landed with the commit that added them to the record
 superseded by `Options::zpages_block_cursor` (`stage4.md`, "A block read
 through one cursor").
 
-What the counts point at next, for E: the decodes themselves, 147,000
+The next lever is the per-record form, probed and not yet built:
+`bench/examples/zrec.rs` and `stage4.md`, "The per-record form, probed
+against the comparators". Under 640 MiB at five million keys it reads
+point reads at 0.31-0.42x of the group form's time and scans at 0.58x, in
+the same process, both forms fitting the bound and faulting nothing, so
+the gap is the group decode. Building it means the form file's page as a
+container of per-record-decodable groups (offset table, first key raw,
+keys front-coded, one dictionary a file in the trailer), the cursor's walk
+and the point read decoding a record, and the group form kept as the arm;
+the section's last paragraph lists the parts. The suite then prices it on
+E and on the controller's passes, which the probe cannot run.
+
+What the counts pointed at before the probe, for E: the decodes themselves, 147,000
 groups a pass of 105,000 scans at the shipped memo, with 42% of the memo's
 asks missing -- and the three sizes paired say a larger memo does not
 buy them back (`stage4.md`, "The memo's size, counted"): the memo pays
