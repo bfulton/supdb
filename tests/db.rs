@@ -7966,9 +7966,12 @@ fn a_block_the_reads_pay_for_is_held_as_a_copy_too() {
 /// piece's key where the old partition had it. The oracle test reached
 /// this in about one run in twenty as an assertion under the checked
 /// profile, once the seal's timing put a piece inside a merge; here the
-/// merge is long and the seal short, so the piece is published while the
-/// merge runs every time, and the pieces the merge folds in carry new
-/// keys below the kept piece's, so the old ranks are wrong by ten.
+/// merge is held before its landing (`Db::hold_merge_landing`) until the
+/// piece has published, so the piece is published while the merge runs
+/// every time -- a long merge and a short seal were the bet before, and
+/// the bet lost once under the gate's load -- and the pieces the merge
+/// folds in carry new keys below the kept piece's, so the old ranks are
+/// wrong by ten.
 #[test]
 fn a_piece_kept_across_a_merge_is_ranked_against_the_partition_it_meets() {
     let d = dir("kept-piece-ranks");
@@ -8008,6 +8011,9 @@ fn a_piece_kept_across_a_merge_is_ranked_against_the_partition_it_meets() {
         put(&mut db, &mut model, &between(2000, i), "b");
     }
     db.commit().unwrap();
+    // The second piece's landing starts the merge; held before its
+    // landing, the merge stays in flight until the test lets it go.
+    db.hold_merge_landing(true);
     db.seal().unwrap();
     // The third piece: keys the partition holds and keys between them.
     // Its seal waits for the second piece's publish, whose landing then
@@ -8040,6 +8046,7 @@ fn a_piece_kept_across_a_merge_is_ranked_against_the_partition_it_meets() {
         "the merge finished before the third piece was published; the case was not reached"
     );
     assert_eq!(db.levels(), (1, 3));
+    db.hold_merge_landing(false);
     db.settle().unwrap();
     assert_eq!(
         db.levels(),

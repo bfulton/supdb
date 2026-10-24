@@ -2062,3 +2062,83 @@ cache), and the builder keeps the compressor's dictionary state across
 records. The fence, the directory of groups and the controller do not
 change. The arm is the group form, which is what every bounded row so far
 has measured.
+
+## The dictionary and the value coding, probed
+
+The two choices a build of the per-record form has to make were probed in
+the same example before any engine code (`bench/examples/zrec.rs`, the
+shapes; `zrec-shapes-suite-1m.log`, `zrec-shapes-drift-1m.log`, read by
+`zrec_summarize.py`): a million keys in core, two rounds, 100,000 uniform
+and 100,000 Zipfian point reads and 10,000 Zipfian scans of fifty a mix,
+every arm answering the same bytes with zero misses, on the suite's payload
+and on a drifting one. The suite's values are half a motif shared by every
+value in the store and half entropy, the payload a segment dictionary
+learns from any sixty kilobytes of it; the drifting payload keeps the halves
+and gives every two hundred records a motif of their own (`--payload drift`,
+`DRIFT_EVERY`), so a value shares its motif with twelve groups of
+neighbours and with nothing far away -- the payload a segment dictionary
+cannot learn and a group's own redundancy can, and the case the per-record
+form's size parity with the group form had not been tested on. The shapes:
+`zrec` (the segment's first sixty kilobytes of values as the dictionary),
+`zrec-sampled` (six hundred values sampled across the segment), `zrec-local`
+(no segment dictionary; a group's first record stored raw and the
+dictionary for the fifteen after it), `zrec-hybrid` (the segment dictionary
+with the group's raw first record appended, assembled per group),
+`zrec-nodict` (every value compressed alone), `zrec-raw` (values stored raw,
+only the keys coded) and `zrec-group` (the sixteen records compressed as one
+block, the group form's shape at this grouping, the control). A value LZ4
+does not shrink is stored raw under every shape.
+
+Bytes a record, keys and headers included, suite payload then drifting:
+`zrec` 72.3 and 108.6; `zrec-sampled` 75.8 and 106.2; `zrec-local` 80.5 and
+75.6; `zrec-hybrid` 75.0 and 75.6; `zrec-nodict` and `zrec-raw` 108.5 and
+108.6 (a hundred-byte value alone has nothing LZ4 can match: the motif's
+window is shorter than the motif); `zrec-group` 72.3 and 70.1; the engine's
+forced form 229.7 and 226.4 (its raw records, its form file and its index
+together); LMDB 133.1 on both. So the segment dictionary is the suite
+payload's: on the drifting payload it compresses nothing and the form is
+the raw form's size, which out of core is half again the faults. The local
+dictionary holds on both payloads, within 11% of the group control on the
+suite's and 8% on the drifting one, because a group's first record carries
+the motif its fifteen neighbours need, and the hybrid takes the suite
+payload's 7% back (75.0 against 80.5) and matches the local dictionary on
+the drifting one. The sampled dictionary learns nothing a first-values one
+does not at six hundred samples over five thousand motifs.
+
+Time, in core (medians of the two rounds; the ratio to LMDB, median of the
+per-round ratios, in the logs). Point reads: every per-record shape reads
+level with LMDB on both payloads -- 0.88-1.07x on the uniform reads and
+0.73-1.14x on the Zipfian, the ranges overlapping -- against the group
+control's 1.32-1.95x and the engine's form's 1.83-2.44x; the dictionary
+decides nothing a point read's time can see, since one record is decoded
+whatever the dictionary. Scans, suite payload: `zrec-local` 2.45 µs,
+`zrec-hybrid` 2.74, `zrec` 2.90, `zrec-sampled` 3.66, `zrec-group` 3.29, the
+engine's form 3.72, `zrec-raw` and `zrec-nodict` 1.73, LMDB 1.53; drifting
+payload, where most values of the segment-dictionary shapes are stored raw
+and decode as copies: 1.76, 1.83, 1.77, 1.38, 1.71, 3.99, 1.44 and 1.39,
+LMDB 1.33. So a scan's time over LMDB's is the decodes it makes and nothing
+else: fifty raw copies read 1.13x of LMDB, fifty decodes against a hot
+hundred-byte dictionary 1.6x, against a sixty-kilobyte one 1.8-1.9x, and
+the group control's three whole-group decodes 2.1x. The local dictionary's
+decode is the cheapest of the compressed shapes by 10-15% on scans, the
+dictionary being in the lines the walk already holds, where the segment
+dictionary is sixty kilobytes the decode's matches reach into; two rounds
+do not resolve that difference and the sizes do.
+
+The choices, then. The value coding is LZ4 per record: raw values cost half
+again the bytes for a scan a quarter faster in core, and out of core the
+bytes are faults, so the compressed form is the one for the regime the form
+exists for; the scan's remaining cost over LMDB is the decoder's per-record
+price, 15-25 ns a record here, a lever for later (a decoder shaped for a
+hundred-byte record, or the C library) and not a layout choice. The
+dictionary is the group's own first record, stored raw: it needs no segment
+dictionary in the trailer, no state kept across records at the build, no
+per-group assembly at the read, and it holds the form's size within a tenth
+of the group form's on both payloads where the segment dictionary holds it
+on one. The segment dictionary appended to it is the arm, worth 7% of the
+bytes on the suite's payload and nothing on the drifting one, with a trailer
+slot for it that an empty dictionary leaves as the local shape. The rule the
+study gives: a compression ratio measured on one payload is that payload's,
+and a form whose ratio depends on where in the file a value's redundancy
+lies is tested on a payload whose redundancy is somewhere else before the
+ratio is read as the form's.

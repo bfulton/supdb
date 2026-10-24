@@ -207,6 +207,23 @@ group decode.
   and what it buys E is for the suite to measure once the form is an
   engine option. The build in the probe is slow (fifteen microseconds a
   record, the dictionary's table rebuilt per call) and that is the probe's.
+- **Probed: the dictionary and the value coding** (`stage4.md`, "The
+  dictionary and the value coding, probed"; `zrec-shapes-{suite,drift}-1m.log`).
+  Seven shapes of the form at a million keys in core on the suite's payload
+  and on a drifting one (`--payload drift`: a motif of its own every two
+  hundred records). The segment dictionary (`zrec`, 72.3 B a record on the
+  suite's payload) compresses nothing on the drifting payload (108.6, the
+  raw size); the group's own first record as the dictionary (`zrec-local`)
+  holds both at 80.5 and 75.6 against the group control's 72.3 and 70.1;
+  the two together (`zrec-hybrid`) read 75.0 and 75.6. Point reads of every
+  per-record shape are level with LMDB in core (0.9-1.1x) against the group
+  control's 1.3-2x; a scan's time over LMDB's is its decodes alone (raw
+  copies 1.13x, a hot hundred-byte dictionary 1.6x, a sixty-kilobyte one
+  1.8-1.9x, whole groups 2.1x). Chosen for the build: LZ4 per record (raw
+  values cost half again the bytes, which out of core are faults) with the
+  group's first record as the dictionary, no segment dictionary needed; the
+  segment dictionary appended to it is the arm, a trailer slot that an
+  empty dictionary leaves as the local shape.
 - **Untouched**: the shuffled-load kill of the combined arm under 640 MiB
   and the gear shift, as the session before left them.
 
