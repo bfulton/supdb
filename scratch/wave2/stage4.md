@@ -1848,3 +1848,104 @@ groups a pass of 105,000 scans, 1.4 a scan, 46% of the memo's asks missing
 -- and the memo's size and admission (`next/README.md`) are the levers on
 that; the decode's own cost is the codec's.
 
+
+## The memo's size, counted
+
+The handle's memo of decoded groups (`zfile::ZMemo`) is direct-mapped, four
+thousand and ninety-six slots under eight mebibytes, and with the block
+read through one cursor E asks it 254,000 times a pass at five million
+keys under 640 MiB and misses 147,000 of them: a decode a miss, 1.4 a
+scan, the largest single cost E has left by the profile (the LZ4 decode a
+quarter of the main thread before the cursor, more after it). The memo's
+size is now an option (`Options::zpages_memo_bytes`, eight mebibytes as
+shipped, `ZMemo::sized` scaling the slots with the cap at the shipped ratio
+of a slot per two kibibytes), with two arms, `supdb-cache64tofitautozpagesmemo16`
+and `...memo32`. A larger memo is memory the bound takes from the page
+cache that holds the form files, so the count comes first and the rent is
+the pairing's to price.
+
+Counted (`zmemo-count-5m.sh`, `zmemo{16,32}count5m-ab.*`: one rep of the
+combined arm against each size, the per-mix counters on; the counts are
+deterministic to a few hundredths of a percent). Groups decoded a pass:
+E 147,083 at eight mebibytes, 134,933 at sixteen (8.3% fewer), 125,950 at
+thirty-two (14.4% fewer), the hit rate 42%, 47% and 50%; C 34,466, 30,488
+(11.5% fewer) and 29,023 (15.8% fewer), the point-read mix's groups being
+the Zipfian head's, which a larger memo holds more of. The other mixes
+follow C in proportion (B's decodes 32,470 at eight). Over the whole run
+the point reads' decodes fall 7.7% and 12.4%, and the scan passes' groups
+move 0.4% and 2.7%, since a scan of a cold store streams through groups the
+memo cannot help with. The main thread's minor faults in C rise from 1,600
+to 4,200 and 8,000 a mix, the memo's larger buffers first-touched as it
+fills, a few milliseconds a mix at this guest's price for a fresh page; the
+point reads' major faults read level in the one rep (0.98x and 0.96x of
+the shipped size), which is the question the pairing has to answer with
+more reps, since the page cache the memo takes is the form files'.
+
+Paired, sixteen against eight (`pair-5m.sh zmemo16 ...`, `zmemo16-ab-{1,2}.*`,
+five pairs a sitting, both orders, read as the pairings before). The counts
+as counted: E 135,050 groups decoded against 147,093, C 30,506 against
+34,546, the memo's asks the same within a hundred. The rates over the
+twelve pairs: E's scans 0.997 (7 of 12 slower; 1.037 in the sitting where
+the larger memo ran second and 0.958 where it ran first, the sign with the
+order, so a position effect and no more); C's gets 1.007 (7 of 12; 1.024
+and 0.990 by sitting); D 1.065 by total, slower in 9 of 12 and in both
+orders (1.030 and 1.093), the uniform reads that hit the memo once in
+eighty asks and pay its larger footprint for nothing; F's gets 1.062 (8 of
+12), B 0.961 and A 0.977 the other way; the floors of identical code read
+1.025 and 1.066 in one order, 0.976 and 1.014 in the other, and the point
+reads' major faults 0.974x and 1.017x, level. So eight percent of E's
+decodes and twelve of C's, taken away, moved neither mix's time: a decode
+saved by the memo is a group read cold from the memo's buffer instead,
+thirty-two lines of it for the parse that follows, where the decode writes
+the group into the thread's buffer and the parse reads it hot -- a reading
+the cycle counters this guest lacks could settle and the pairing cannot,
+and the one that fits a memo whose hits cost what its misses cost. The
+main thread's minor faults rise by two thousand a mix in C and nine
+hundred in E, the larger buffers first-touched, a millisecond or two
+against mixes of 140 and 550.
+
+Thirty-two against eight (`zmemo32-ab-{1,2}.*`): the counts as counted
+again, E 125,940 groups decoded against 147,100, C 29,036 against 34,512,
+D 74,730 against 77,525 with its hits 3,760 against 960. The rates over
+the twelve pairs: C's gets 1.115, slower in 10 of 12 and in both orders
+(1.023 and 1.216 by sitting), the mix that saved the most decodes by
+share; D's gets 1.066, slower in 10 of 12 and in both orders (1.114 and
+1.020); E's scans 1.026 (7 of 12; 1.083 and 0.972, the sign with the
+order); B 1.019, A 1.010, F 1.028 by the gets; the floors of identical
+code 0.976 and 0.995 in one order, 0.999 and 1.007 in the other, and the
+point reads' major faults 0.997x and 0.987x, level again. So the memo
+that decodes a sixth fewer groups in C reads C a tenth slower in both
+orders, and the one that decodes a seventh fewer in E reads E level. The
+page cache is not what it costs -- the faults say so -- and the decodes
+saved are real; what the larger memo adds is the footprint its hits read
+through: a hit hands the walk a group whose lines were last touched when
+the memo took it, and a memo of thirty-two mebibytes beside the fence,
+the directories and the raw records the point reads touch is more than
+this guest's last-level cache holds, so the hit's thirty-two lines come
+from memory where the decode's came from the buffer the decode had just
+written. Eight stays, and the two sizes are arms.
+
+And four against eight (`zmemo4-ab-{1,2}.*`), to read the other side of
+the knee: E decodes 155,180 groups a pass against 147,100 (5.5% more, the
+hit rate 39% against 42%), C 38,750 against 34,530 (12% more), D 77,990
+against 77,525. The rates: E's scans 1.078, slower in 8 of 12 and in both
+orders (1.030 where the smaller memo ran second, which the floors favoured
+by six percent, and 1.128 where it ran first), A's total 1.080 (10 of 12,
+both orders), D 1.061 (8 of 12, both orders), C 0.977 (2 of 12; 0.934 and
+1.023, the sign with the order), B 0.989; the floors read the second arm
+faster by 4-8% in both sittings, so the position effect is of that size
+here, and E's loss stands beyond it. So the memo pays for the groups that
+come back while they are still warm -- the Zipfian head's, which four
+mebibytes hold short of and eight hold -- and not for the ones that come
+back cold, which sixteen and thirty-two add: a hit on a cold group costs
+the walk its thirty-two lines from memory, about what the decode would
+have, and the larger memo's footprint costs the point reads besides. Eight
+is at the knee for this shape and stays; the three sizes are arms. The
+rule the sizes give: a cache of decoded things is priced by the warmth of
+its hits and not by its hit rate, so a size is paired at both sides of the
+shipped one before the hit rate is read as the lever, and the count that
+would decide it here -- the lines a hit's parse misses against a decode's
+-- is one this guest's missing counters cannot give; a micro-probe over
+more distinct groups than the last-level cache holds, timed as the decoder
+was (`bench/examples/zdecode.rs`), is the instrument to build if the memo
+is taken up again.

@@ -1,28 +1,28 @@
-# Patches drafted and not applied, for the next lever
+# Drafts for the next lever
 
-Each is a Python script of exact-once replacements against the tree as it
-stands after the commit that added it; run it from anywhere, then build,
-test and pair as `HANDOFF.md` says. A script that fails its assertion names
-the anchor that moved.
+Nothing is drafted here at the moment. The memo-size drafts that were here
+(`Options::zpages_memo_bytes` with the arms `supdb-cache64tofitautozpagesmemo16`
+and `...memo32`) landed with the commit that added them to the record
+(`stage4.md`, "The memo's size, counted"); the lever C drafts were
+superseded by `Options::zpages_block_cursor` (`stage4.md`, "A block read
+through one cursor").
 
-- `memo-size-engine.py`, `memo-size-suite.py`: the memo's cap as an option
-  (`Options::zpages_memo_bytes`, 8 MiB as shipped) with arms at 16 and 32
-  MiB (`supdb-cache64tofitautozpagesmemo16`, `...memo32`), for counting the
-  decodes E and the point-read mixes make under each before any rate is
-  read; the counts are deterministic, so one `bench ab --reps 1` of the two
-  arms gives both. At the commit that read a block through one cursor
-  (`Options::zpages_block_cursor`) the engine script's anchors still match
-  and the suite script's first anchor does not (the arm fields moved under
-  the two arms added since); re-anchor it on `zperrun`, the last arm's
-  field, before running it. The engine script's `db.rs` half writes the
-  file directly, not through its `edit` function, so a dry run made by
-  disarming `edit` applies that half: run it only to apply it, on a tree
-  whose `db.rs` is committed, and check `git diff` after.
+What the counts point at next, for E: the decodes themselves, 147,000
+groups a pass of 105,000 scans at the shipped memo, with 42% of the memo's
+asks missing -- and the three sizes paired say a larger memo does not
+buy them back (`stage4.md`, "The memo's size, counted"): the memo pays
+for groups that come back while still warm in the last-level cache, and a
+hit on a cold group costs about what a decode would. The design's 3.7
+names an admission policy for the memo as the arm if the hit rate lands
+under 0.45; after the sizes, the question it would have to answer is
+which groups stay warm, not which are asked for again, and the instrument
+it needs first is a micro-probe of a hit's parse against a decode over
+more distinct groups than the last-level cache holds, timed as the decoder
+was (`bench/examples/zdecode.rs`). The scans' start groups
+(`ZCursor::seek`) are where the misses are, by the profile of the session
+before (`ZFile::seek` 27% of E's thread, 22% of it the scans' start seeks).
 
-The lever C drafts that were here -- a block's snapshot keys cut by one
-cursor moved forward key by key, `Options::zpages_cut_cursor` -- were
-superseded by the change that landed as `Options::zpages_block_cursor`: a
-block read through one cursor for its runs, its cuts and the records its
-overlay keys replace (`stage4.md`, "A block read through one cursor"),
-which is what the counts asked for once the walk's opens were counted
-beside the cuts'.
+A script of exact-once replacements is the shape a draft takes here: run it
+to apply it, on a committed tree, and check `git diff` after -- never
+dry-run one by disarming its `edit` function, since a draft may write a
+file directly (the memo-size one did, and a dry run applied half of it).

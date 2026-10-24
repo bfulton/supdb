@@ -907,6 +907,25 @@ pub struct Options {
     /// `supdb-nocachezpagescheckedviews` are the arms.
     #[doc(hidden)]
     pub zpages_trusted_views: bool,
+    /// The decoded bytes a handle's memo of groups holds at most
+    /// (`zfile::ZMemo`), its slots scaled with it: eight mebibytes as
+    /// shipped, which E's Zipfian head outgrows at five million keys under
+    /// 640 MiB (a 42% hit rate over 2.4 asks a scan, the block read through
+    /// one cursor). A larger memo trades the page cache a bound leaves the
+    /// form files for decodes saved: by count, sixteen mebibytes decode 8%
+    /// fewer groups in E and 12% fewer in C, thirty-two 14% and 16% fewer,
+    /// four 5.5% and 12% more, with the point reads' major faults level.
+    /// Paired, none of the three moves E or C for the better: sixteen reads
+    /// D slower in both orders, thirty-two reads C a tenth slower in both,
+    /// and four reads E slower in both -- the memo pays for the groups that
+    /// come back while still warm in the last-level cache, the Zipfian
+    /// head's, and a hit on a cold group costs the walk its lines from
+    /// memory, about what the decode would have. Eight is at the knee for
+    /// the suite's shape; `supdb-cache64tofitautozpagesmemo4`, `...memo16`
+    /// and `...memo32` are the arms, and the pairings are in
+    /// `scratch/wave2/stage4.md`.
+    #[doc(hidden)]
+    pub zpages_memo_bytes: usize,
     /// EXPERIMENT: a verified page's group asked of the handle's memo before
     /// any view of the page, the memo's entry carrying the group's first
     /// record and count, so a hit reads nothing of the page
@@ -2523,6 +2542,7 @@ impl Default for Options {
             zpages_memo_hash: true,
             zpages_settle_span: true,
             zpages_trusted_views: true,
+            zpages_memo_bytes: 8 << 20,
             zpages_memo_first: false,
             zpages_block_cursor: true,
             zpages_scan_prefetch: false,
@@ -22519,7 +22539,7 @@ impl Db {
             scan_ns: std::cell::Cell::new([0; 6]),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zfile::ZMemo::new(),
+            zmemo: zfile::ZMemo::sized(opts.zpages_memo_bytes),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zcensus: false,
             slot: None,
@@ -23002,7 +23022,7 @@ impl Db {
             scan_ns: std::cell::Cell::new([0; 6]),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zfile::ZMemo::new(),
+            zmemo: zfile::ZMemo::sized(opts.zpages_memo_bytes),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zcensus: false,
             slot: None,
@@ -25158,7 +25178,7 @@ impl Reader {
             scan_ns: std::cell::Cell::new([0; 6]),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zfile::ZMemo::new(),
+            zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zcensus: false,
             slot: None,
@@ -25192,7 +25212,7 @@ impl Reader {
             scan_ns: std::cell::Cell::new([0; 6]),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zfile::ZMemo::new(),
+            zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zcensus: false,
             slot: Some(slot),
@@ -25233,7 +25253,7 @@ impl Reader {
             scan_ns: std::cell::Cell::new([0; 6]),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zfile::ZMemo::new(),
+            zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zcensus: counted && self.opts.zpages == ZPages::Auto && !z_auto_inert(&self.opts),
             slot: Some(slot),
@@ -27741,7 +27761,7 @@ impl Reader {
             scan_ns: std::cell::Cell::new([0; 6]),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zfile::ZMemo::new(),
+            zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zcensus: false,
             slot: None,

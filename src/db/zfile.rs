@@ -1383,8 +1383,20 @@ pub(super) struct ZMemo {
 }
 
 impl ZMemo {
+    /// A memo at the shipped cap (`Options::zpages_memo_bytes` as it
+    /// defaults): the tests' handle; a store's handles take `sized`.
+    #[cfg(test)]
     pub(super) fn new() -> ZMemo {
-        ZMemo::of(Memo::new(ZMEMO_SLOTS, ZMEMO_BYTES))
+        ZMemo::sized(ZMEMO_BYTES)
+    }
+
+    /// A memo capped at `bytes` of decoded groups (`Options::zpages_memo_bytes`),
+    /// its slots scaled with the cap at the shipped ratio -- a slot per two
+    /// kibibytes, a group's decoded size at the suite's shape -- so the cap
+    /// and not the slot count bounds what it holds, as `ZMemo::new` has it.
+    pub(super) fn sized(bytes: usize) -> ZMemo {
+        let slots = (bytes / (ZMEMO_BYTES / ZMEMO_SLOTS)).max(1);
+        ZMemo::of(Memo::new(slots, bytes))
     }
 
     fn of(memo: Memo) -> ZMemo {
