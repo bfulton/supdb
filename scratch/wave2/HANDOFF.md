@@ -5,7 +5,9 @@ last two engine commits are this session's, the block read through one
 cursor and the memo's size counted and paired (the section "This session"
 below; `git log -2 -- src/db/zfile.rs` names them), each pushed with the
 full gate (`sh scripts/check.sh`, every group) green on its tree and the
-two fuzz ranges below green on its binary. The session before ended at
+two fuzz ranges below green on its binary; after them the probe of the
+per-record form (`bench/examples/zrec.rs`, the last bullet of "This
+session"), which is the next lever and touches no engine code yet. The session before ended at
 `92a5f35` (the page view read once), and the one before that at `d5114b6`;
 their records are the sections after "Where the out-of-core comparison
 stands".
@@ -91,7 +93,9 @@ out of core" (5M keys under 640 MiB):
   under 1 GiB the form takes every cell.
 
 The open cell is E. A secondary one is the minute of raw reads before the
-install (the "gear shift").
+install (the "gear shift"). The per-record form, probed below, is the shape
+that attacks what E and the point reads still pay on the form's side, the
+group decode.
 
 ## This session: a block read through one cursor
 
@@ -176,6 +180,33 @@ install (the "gear shift").
   lever C ones were superseded. `next/README.md` says what the counts point
   at next and how a draft is applied (never dry-run by disarming its edit
   function).
+- **Probed: the per-record form** (`bench/examples/zrec.rs`; `stage4.md`,
+  "The per-record form, probed against the comparators"; the runs
+  `zrec-incore-5m.log`, `zrec-bound-5m.log`, read by `zrec_summarize.py`).
+  The user asked for a quick test that the faster format beats LMDB and
+  RocksDB on a cell the engine loses. The probe writes the suite's records
+  as groups of sixteen with the first key raw, the keys front-coded, each
+  value LZ4-compressed on its own against a dictionary of the first values,
+  and an offset table a group, and runs read-only mixes (uniform reads,
+  Zipfian reads, Zipfian scans of fifty) against it, the forced group form,
+  LMDB (readahead off) and RocksDB in one process, three rounds, every arm
+  answering the same bytes. The form is the group form's size (362 MB at
+  five million keys). Under 640 MiB it reads 1.80, 0.75 and 3.68 µs an op
+  with no faults, against the group form's 5.83, 1.78 and 6.39, LMDB's
+  15.41, 5.61 and 8.37 (0.19, 0.06 and 0.07 faults an op) and RocksDB's
+  22.0, 11.3 and 36.5 at default options: 0.12x, 0.15x and 0.44x of LMDB's
+  time, 0.31x, 0.42x and 0.58x of the group form's, in every round. In
+  core it is level with LMDB on point reads (1.12x, 1.01x) and half its
+  speed on scans (1.92x), fifty decodes a scan. Caveats, stated in the
+  record: the group form already wins these read-only cells against LMDB
+  under the bound (the probe reads it at 0.33-0.77x); the cells lost, E and
+  the controller's pre-install passes, are mixes with inserts and unsealed
+  keys the probe does not run; what the probe measures is the form's own
+  cost per read and per scanned record, which the profile's shares (decode
+  26.5%, the scans' start seeks 22%) name as E's lever on the form's side,
+  and what it buys E is for the suite to measure once the form is an
+  engine option. The build in the probe is slow (fifteen microseconds a
+  record, the dictionary's table rebuilt per call) and that is the probe's.
 - **Untouched**: the shuffled-load kill of the combined arm under 640 MiB
   and the gear shift, as the session before left them.
 
