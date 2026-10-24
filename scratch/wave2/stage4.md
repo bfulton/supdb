@@ -2344,3 +2344,177 @@ larger and E a fifth slower. The rule the two pairings give: a form is priced
 on every path that reads it before its coding is chosen, and a group decoded
 through its records is a decode of every record, so a structure that makes
 one record cheap to read is priced on the readers that want the group.
+
+## E profiled again, the decode's lines probed, and two levers on the lines a read touches
+
+At `3a885a9` (the record coding as the arm), E on the combined arm at five
+million keys under 640 MiB, profiled as before (`scratch/wave2/prof/profile-e.sh`,
+`perf record -e cpu-clock` at 3 kHz with DWARF chains over each mixes pass,
+cut to E's windows by the harness's marks; the samples' text made with
+`perf script --no-inline`, since perf's inline resolution through
+`addr2line` ran at two kilobytes a second over this binary): three windows,
+1,972 ms, 5,575 samples on the harness's thread at 2,827 a second, so the
+thread was on its core for the whole of E -- the form fits the bound and E
+faults nothing -- at 7.8 µs of CPU a scan (the harness's own 1.6 of it: the
+Zipfian's `pow` 11.8%, the op loop 4.5%, the clock 4%). The engine's share,
+by inclusive sample: the start seek (`cache_seek_exact` → `ZFile::seek`)
+20.0%, of which the fence's search 4.7, the page's view 3.1, the group's
+open 10.3 and the seek inside the group 1.9; the block reader's walks
+(`PartReader::scan`) 15.3%; the clean runs through `ZFile::scan_at` 11.6%;
+the builds (`materialize`) 10.0%, 6.5 of it `deltas_for`; the settle 7.5%;
+the loop's own bookkeeping 5.6%; and across all of those the LZ4 decode
+23.8%, 1,327 samples over 147,000 decodes a pass, which is 1.0 µs a decode
+-- the figure `zsize` gives a decode whose page's lines were flushed, against
+0.27 µs with them warm. The counters beside it: 79,198 scans a pass, 57,904
+of them through the form file, 147,100 groups decoded and 107,300 memo
+hits, 24,007 blocks built, walks 78,631 over copies, 30,410 over sparse
+forms and 18,321 over clean blocks, 50,978 scans starting in a copy; the
+arm without the block cache decodes 155,400 and runs E at 12.6 µs a scan
+against 6.3, its time in the merge with the memtable (`has_tomb` 11.7%,
+`memcmp` 11.3%, the snapshot's seeks) and not in decodes. So the decode is
+E's largest single cost and runs at the cold figure, and the seek's share of
+the decodes, a third by the open's callers, is spent for nothing on the
+scans that start in a copy, which the copy answers without it -- the lever
+`zpages_seek_span` was built for and did not take, since its own fence and
+directory lookups and the copy's six-miss search cost what the seek had.
+
+The lines a decode reads, probed (`bench/examples/zlines.rs`): a store of
+a million keys built under the forced form, its pages read whole, and one
+group of every page decoded in a random page order, cold, under five shapes
+-- the view then the decode, as the engine has it; the group's payload lines
+asked for after the view; the page's first line before the view and the
+payload after; the page's first half before the view; the whole page before
+the view -- with the output buffer warm, rotated over two thousand buffers as
+the memo's recycled ones are, and with a spin between the hint and the
+decode (`zlines-probe-1m.log`, `zlines-probe-out-1m.log`). The payload hint takes a cold
+decode of 900 ns to 820, 9% at most in any shape and within the rounds'
+spread; the whole page asked for is slower (1,019), the half page level, the
+output buffer's lines asked for level (1,243 against 1,222 cold), and the
+scan shape, every group of the page after one view, moves under none of
+them. So the lines are not what a cold decode costs: the engine's 1.0 µs a
+decode is the cycling figure `zdecode` found for a decoder on input its
+predictor has not learned (the same groups cycled over a file that fits L2
+read the same plateau), and a prefetch issued where the engine first knows
+the page or the group buys a tenth of the decode, a fiftieth of E. Refuted
+as a lever and not built; the probe stays as the record.
+
+The decode's other lever, probed (`zdecode --hc LEVEL`, every group
+recompressed by liblz4's high-compression mode and the cycling decode
+timed over the new payloads, `zlines-hc-1m.log`): fewer tokens decode faster.
+Level 1 shrinks the form 1.8% and the cold decode 2%; level 4, 4.1% and
+10%; level 9, 4.1% and 16.5% (598 ns against 716); level 12, 4.2% and 18%.
+liblz4's own decoder is 0.84-0.86 of `lz4_flex`'s cycling, as the earlier
+probe read it, and over the HC payloads 508 ns a group, 0.71 of the
+engine's decode as it stands. Both are liblz4, a C library the engine does
+not link (the bench's `lz4` crate under its `lz4-c` feature is how the
+probe has it); the compressor would be the builder's alone and the native
+build's, since the browser reader decodes nothing of the form, and level 9
+compresses at 13 µs a group, 2.3x the build's CPU at five million keys.
+Whether the engine takes a C dependency is the user's decision, so the
+figures are recorded and nothing is built.
+
+What the profile left as pure-Rust levers on the lines a read touches, both
+small and both on every read through the form:
+
+- **The fence's search** (`entry_of`, 4.7% of E's thread, 8.6% of C's by
+  the same recording's C windows): a binary search over 93,000 entries at
+  five million keys whose every probe below the hot top levels read a line
+  of the key offsets and a line of the key blob, dependent. `ZFence::index`
+  builds a tree over the entries' words -- the eight bytes after the bytes
+  every non-empty key shares, taken from the first non-empty key and the
+  last, since the keys ascend; zero for the empty key, the open lower fence
+  -- as a balanced tree laid out breadth first in lines of eight nodes, so
+  a search reads one word a level and asks for the line three levels down
+  before it reads one of its nodes, and compares whole keys only where
+  entries tie on the word, from the top of the tie. The search over the keys
+  stays as the shape before and as the oracle the tree is held to over
+  every shape of fence and key (`the_trees_search_answers_as_the_search_over_the_keys`).
+  Twelve bytes an entry beside the fence's sixteen and the keys.
+  `Options::zpages_fence_tree` (on), `supdb-cache64tofitautozpagesfencesearch`
+  the shape before.
+- **The memo's victim** (`Memo::recycle`, 2.9% of E's thread and 6% of
+  C's): a put displaces the slot's entry and tries its `Arc` for the last
+  reference, a load of the counts' line last touched when that entry was
+  made, thousands of decodes ago -- a cold miss a decode, on no instruction
+  worth the name. The decode now asks for that line before it begins
+  (`Memo::prefetch_victim`, the slot the put will take being a function of
+  the group's number), and a decode is long enough to bring it.
+  `Options::zpages_memo_ahead` (on), `supdb-cache64tofitautozpagesmemonoahead`
+  the shape before.
+
+Both paired at five million keys under 640 MiB, two sittings each, five
+pairs a sitting, both orders (`pair-5m.sh zlines-fence ...`,
+`pair-5m.sh zlines-memo ...`); the verdicts follow.
+
+The fence's tree paired (`zlines-fence-ab-{1,2}.*`, A the tree, B the search
+over the keys): over twelve pairs in both orders every cell is inside the
+position band and the directions are mixed -- B/A on the gets C 1.002 (6 of
+12 pairs B slower), B 1.033 (7), A 0.924 (3), F 0.937 (4), D 0.987 (5); E's
+scans 1.023 (6); the totals 1.003, 1.040, 0.984, 0.968, 0.995 and 1.017 --
+with the counters identical arm to arm (the same groups decoded, memo hits
+and misses, blocks built and walks, to within the reps' own spread). The
+point-read mixes under this bound are the form's faults more than its CPU:
+C takes about 2,900 major faults a pass, 125 ms of gets for 83,000 reads,
+and the thread is on its core for a tenth of that (the profile's C windows
+sampled it at 262 a second against 2,827 in E), so a lever on the CPU of a
+point read shows there only in core; and E's 2% is the position's. The
+pairing rules a loss out and cannot see the gain, which is misses, so the
+verdict for both levers is read in the profile of the arm pair, below,
+where the symbol each lever is aimed at either loses its samples or does
+not.
+
+The memo's victim hint paired (`zlines-memo-ab-{1,2}.*`, A the hint, B
+without it): over twelve pairs in both orders B/A on the gets C 1.065 (8 of
+12 pairs B slower), B 1.050 (9), A 0.976 (6), F 1.008 (6), D 0.981 (6); E's
+scans 1.035 (8; 1.109 in all six pairs of the second sitting, 0.965 in the
+first); the totals 1.064, 1.076, 0.934, 0.946, 0.973 and 1.020; the counters
+identical arm to arm. The direction favours the hint in the memo-heavy
+mixes (C, B, E) and is nowhere outside the band, so this pairing too rules
+a loss out and leaves the gain to the profile. One cell of the fence
+pairing is noted for the profile to check: A's and F's gets read 0.924 and
+0.937 for the shape before (B slower in 3 and 4 pairs of 12, the same sign
+in both sittings), the two mixes whose gets run between 418 fsyncing
+commits a pass, where C's, B's and D's gets -- the same reads without the
+commits -- read level; the tree changes nothing a commit does, and the
+settle's resolve of a sorted batch searches from the entry before, not from
+the top.
+
+The arm pairs profiled (`profile-e.sh` with each pair, two pairs after a
+warmup, three E windows an arm; `scratch/wave2/prof/` has the aggregates as
+`ycsb-E-<arm>.txt`): the fence's tree arm against the search over the keys,
+the E windows 1,986 and 2,040 ms, 5,688 and 5,731 samples -- `entry_of`'s
+own samples 240 (4.22%) with the tree against 192 (3.35%) without, the
+hinted gallop's compare 67 against 57, everything else within the arms'
+noise. The tree costs more, not less. The reading: the store at five
+million keys is nineteen partitions of some 263,000 keys, so a fence is
+some 4,900 entries, a hundred kilobytes of offsets and keys, and the
+partitions a Zipfian reads keep theirs in the second-level cache; the
+search over the keys was instructions and L2 hits, not the misses the
+first profile's self time was read as, and the tree's prefetches, bounds
+checks and word compares are instructions added to a search that had no
+misses to lose. The lever was priced on a fence of 93,000 entries that the
+store does not have. `Options::zpages_fence_tree` is off and
+`supdb-cache64tofitautozpagesfencetree` is the arm, for a store whose one
+fence would not fit a cache. The memo's hint arm against the shape before,
+the E windows 1,988 and 1,779 ms, 5,623 and 5,062 samples: `Memo::recycle`
+14 samples (0.25%) with the hint against 101 (2.00%) without, the miss it
+was aimed at gone; the rest of the profile moved together, the hint arm's
+whole pass 12% longer in this sitting with the decode, the view and the
+fence all slower alike, which is the host between the two arms' windows
+(the pairing's two sittings had the same cell at 0.965 and 1.109, and the
+first profile's three windows of one arm spread 11%). The hint ships on:
+the miss it removes is a fifth of a microsecond a scan by the first
+profile, the pairing reads the memo-heavy mixes 3-6% for it in two thirds
+of the pairs and no cell against it, and it costs two prefetches a decode.
+The C windows cannot be read from these recordings: `perf record -p`
+attaches some two hundred milliseconds after the mark that starts it, and
+the C mix is 130-200 ms long, so C's windows hold the tail of C or nothing
+(162, 166, 230 and 0 samples); a point-read profile needs perf attached
+before the pass, cut by the marks afterwards.
+
+The rule, for the profiling notes: a self time is read as misses only after
+the structure's size is read against the cache per instance -- a fence
+here is a partition's, not the store's -- and a lever on misses is held to
+the profile of the arm pair, where the symbol it is aimed at loses its
+samples or does not, since a pairing resolves nothing under a tenth and an
+instruction count sees no miss.

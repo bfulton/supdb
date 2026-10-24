@@ -853,6 +853,16 @@ pub struct Supdb {
     /// `supdb-cache64tofitautozpagesmemofirst`, the pair against
     /// `supdb-cache64tofitautozpages`.
     zmemofirst: bool,
+    /// The combined arm with the form file's fence searched through a tree
+    /// over the entries' words (`Options::zpages_fence_tree` on):
+    /// `supdb-cache64tofitautozpagesfencetree`, the pair against
+    /// `supdb-cache64tofitautozpages`.
+    zfencetree: bool,
+    /// The combined arm with a decode asking nothing ahead for the memo
+    /// entry its put displaces (`Options::zpages_memo_ahead` off):
+    /// `supdb-cache64tofitautozpagesmemonoahead`, the pair against
+    /// `supdb-cache64tofitautozpages`.
+    zmemonoahead: bool,
     /// The combined arm with a block read through a cursor a run, a seek a
     /// cut and a read by rank a replaced record
     /// (`Options::zpages_block_cursor` off): `supdb-cache64tofitautozpagesperrun`,
@@ -1321,6 +1331,12 @@ struct Policy {
     /// A verified page's group asked of the memo before any view
     /// (`Options::zpages_memo_first`): `supdb-cache64tofitautozpagesmemofirst`.
     zmemofirst: bool,
+    /// The fence searched through its tree (`Options::zpages_fence_tree`):
+    /// `supdb-cache64tofitautozpagesfencetree`.
+    zfencetree: bool,
+    /// Nothing asked ahead for the memo entry a decode's put displaces
+    /// (`Options::zpages_memo_ahead` off): `supdb-cache64tofitautozpagesmemonoahead`.
+    zmemonoahead: bool,
     /// A block read through a cursor a run, a seek a cut and a read by rank
     /// a replaced record (`Options::zpages_block_cursor` off):
     /// `supdb-cache64tofitautozpagesperrun`.
@@ -1444,6 +1460,8 @@ impl Default for Policy {
             zcheckedviews: false,
             zrecord: false,
             zmemofirst: false,
+            zfencetree: false,
+            zmemonoahead: false,
             zperrun: false,
             zmemo_mib: 0,
             defer: false,
@@ -3271,6 +3289,40 @@ impl Supdb {
         )
     }
 
+    /// `supdb-cache64tofitautozpages` with the form file's fence searched
+    /// through a tree over the entries' words (`Options::zpages_fence_tree`
+    /// on): the pair against `supdb-cache64tofitautozpages` prices the tree
+    /// on every read, seek and settle through the form.
+    pub fn create_cache64_tofit_auto_zpages_fencetree(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages_auto: true,
+                zfencetree: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cache64tofitautozpages` with a decode asking nothing ahead for
+    /// the memo entry its put displaces (`Options::zpages_memo_ahead` off),
+    /// the shape before: the pair against `supdb-cache64tofitautozpages`
+    /// prices the hint on every decode through the memo.
+    pub fn create_cache64_tofit_auto_zpages_memonoahead(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages_auto: true,
+                zmemonoahead: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-cache64tofitautozpages` with a block read through a cursor a
     /// run, a seek a cut and a read by rank a replaced record
     /// (`Options::zpages_block_cursor` off), the shape before a block was
@@ -4405,6 +4457,8 @@ impl Supdb {
             zcheckedviews,
             zrecord,
             zmemofirst,
+            zfencetree,
+            zmemonoahead,
             zperrun,
             zmemo_mib,
         } = policy;
@@ -4659,6 +4713,8 @@ impl Supdb {
             zpages_trusted_views: !zcheckedviews,
             zpages_record_coding: zrecord,
             zpages_memo_first: zmemofirst,
+            zpages_fence_tree: zfencetree,
+            zpages_memo_ahead: !zmemonoahead,
             zpages_block_cursor: !zperrun,
             zpages_memo_bytes: if zmemo_mib > 0 {
                 zmemo_mib << 20
@@ -4848,6 +4904,8 @@ impl Supdb {
             zcheckedviews,
             zrecord,
             zmemofirst,
+            zfencetree,
+            zmemonoahead,
             zperrun,
             zmemo_mib,
             ord_threads: Default::default(),
@@ -4944,6 +5002,10 @@ impl Engine for Supdb {
                 "supdb-cache64tofitautozpagesrecord"
             } else if self.zmemofirst {
                 "supdb-cache64tofitautozpagesmemofirst"
+            } else if self.zfencetree {
+                "supdb-cache64tofitautozpagesfencetree"
+            } else if self.zmemonoahead {
+                "supdb-cache64tofitautozpagesmemonoahead"
             } else if self.zperrun {
                 "supdb-cache64tofitautozpagesperrun"
             } else if self.zmemo_mib == 4 {
@@ -6436,6 +6498,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache64tofitautozpagescheckedviews"
         | "supdb-cache64tofitautozpagesrecord"
         | "supdb-cache64tofitautozpagesmemofirst"
+        | "supdb-cache64tofitautozpagesfencetree"
+        | "supdb-cache64tofitautozpagesmemonoahead"
         | "supdb-cache64tofitautozpagesperrun"
         | "supdb-cache64tofitautozpagesmemo4"
         | "supdb-cache64tofitautozpagesmemo16"
@@ -6668,6 +6732,12 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         }
         "supdb-cache64tofitautozpagesmemofirst" => {
             Box::new(Supdb::create_cache64_tofit_auto_zpages_memofirst(dir)?)
+        }
+        "supdb-cache64tofitautozpagesfencetree" => {
+            Box::new(Supdb::create_cache64_tofit_auto_zpages_fencetree(dir)?)
+        }
+        "supdb-cache64tofitautozpagesmemonoahead" => {
+            Box::new(Supdb::create_cache64_tofit_auto_zpages_memonoahead(dir)?)
         }
         "supdb-cache64tofitautozpagesperrun" => {
             Box::new(Supdb::create_cache64_tofit_auto_zpages_perrun(dir)?)
@@ -7841,6 +7911,60 @@ mod tests {
             )
         );
         drop(memofirst);
+        assert!(!supdb::Options::default().zpages_fence_tree && !b.zpages_fence_tree);
+        let fencetree = new(
+            "supdb-cache64tofitautozpagesfencetree",
+            Supdb::create_cache64_tofit_auto_zpages_fencetree,
+        );
+        assert_eq!(fencetree.name(), "supdb-cache64tofitautozpagesfencetree");
+        assert_eq!(guarantee(fencetree.name()), guarantee(base.name()));
+        assert_eq!(fencetree.features(), base.features());
+        let g = fencetree.db.as_ref().unwrap().options();
+        assert!(g.zpages_fence_tree, "the one option");
+        assert_eq!(
+            (
+                g.zpages,
+                g.zpages_memo_ahead,
+                g.zpages_trusted_views,
+                g.zpages_seek_span,
+                g.scan_cache_bytes
+            ),
+            (
+                b.zpages,
+                b.zpages_memo_ahead,
+                b.zpages_trusted_views,
+                b.zpages_seek_span,
+                b.scan_cache_bytes
+            )
+        );
+        drop(fencetree);
+        assert!(supdb::Options::default().zpages_memo_ahead && b.zpages_memo_ahead);
+        let noahead = new(
+            "supdb-cache64tofitautozpagesmemonoahead",
+            Supdb::create_cache64_tofit_auto_zpages_memonoahead,
+        );
+        assert_eq!(noahead.name(), "supdb-cache64tofitautozpagesmemonoahead");
+        assert_eq!(guarantee(noahead.name()), guarantee(base.name()));
+        assert_eq!(noahead.features(), base.features());
+        let g = noahead.db.as_ref().unwrap().options();
+        assert!(!g.zpages_memo_ahead, "the one option");
+        assert_eq!(
+            (
+                g.zpages,
+                g.zpages_fence_tree,
+                g.zpages_trusted_views,
+                g.zpages_seek_span,
+                g.scan_cache_bytes
+            ),
+            (
+                b.zpages,
+                b.zpages_fence_tree,
+                b.zpages_trusted_views,
+                b.zpages_seek_span,
+                b.scan_cache_bytes
+            )
+        );
+        drop(noahead);
         assert!(supdb::Options::default().zpages_block_cursor && b.zpages_block_cursor);
         let perrun = new(
             "supdb-cache64tofitautozpagesperrun",

@@ -1,0 +1,97 @@
+3 windows of supdb-cache64tofitautozpages ycsb-E, 1988 ms in all
+samples by tid in the windows: {28139: 5623, 28144: 118, 28449: 81, 28552: 76, 28142: 12, 28550: 11, 28447: 10}
+tid 28139: 5623 samples (2828/s)
+
+== self, top 45 ==
+ 26.27%    1477  _RINvNtNtCskM85p0F8VIm_8lz4_flex5block10decompress19decompress_internalKb0_NtNtB6_4sink9SliceSinkECskKIM0acSqRs_5supdb
+  6.26%     352  _RINvMs1h_NtCskKIM0acSqRs_5supdb2dbNtB7_6Reader11scan_blocksNCNvNtCshMaFH5QrrhC_11supdb_bench7engines11supdb_range0EB11_
+  5.98%     336  __ieee754_pow_fma
+  5.51%     310  _RNvNtNtCskKIM0acSqRs_5supdb2db6zpages9view_with
+  5.03%     283  __memmove_avx512_unaligned_erms
+  4.27%     240  _RNvNtCshMaFH5QrrhC_11supdb_bench3run4ycsb
+  3.72%     209  [unknown [vdso]]
+  3.50%     197  _RNvMsg_NtNtCskKIM0acSqRs_5supdb2db6zpagesNtB5_6ZFence8entry_of
+  2.97%     167  _RNvMs5_NtNtCskKIM0acSqRs_5supdb2db5zfileNtB5_5ZFile10open_group
+  2.31%     130  _RNvMs4_NtNtCskKIM0acSqRs_5supdb2db5zfileNtB5_5ZMemo3get
+  2.21%     124  _RINvMs1h_NtCskKIM0acSqRs_5supdb2dbNtB7_6Reader11part_scan_zNCNvNtCshMaFH5QrrhC_11supdb_bench7engines11supdb_range0EB11_
+  2.19%     123  __memcmp_evex_movbe
+  2.19%     123  _RNvNtCskKIM0acSqRs_5supdb2db14prefetch_block
+  1.94%     109  _RINvMNtNtCskKIM0acSqRs_5supdb2db5zfileNtB3_7ZCursor8walk_runQNCNvNtCshMaFH5QrrhC_11supdb_bench7engines11supdb_range0EB13_
+  1.74%      98  _RNvNtNtCskKIM0acSqRs_5supdb2db6zpages10group_seek
+  1.37%      77  pow@@GLIBC_2.29
+  1.33%      75  _RNCNvMsg_NtNtCskKIM0acSqRs_5supdb2db6zpagesNtB7_6ZFence13entry_of_from0Bb_
+  1.03%      58  _RNvMNtNtCskKIM0acSqRs_5supdb2db5zfileNtB2_7ZCursor4load
+  0.87%      49  malloc
+  0.82%      46  _RNvNtCskKIM0acSqRs_5supdb2db15radix_by_prefix
+  0.80%      45  _RNvMs1h_NtCskKIM0acSqRs_5supdb2dbNtB6_6Reader11settle_each
+  0.75%      42  _RNvNtCskKIM0acSqRs_5supdb5index10each_value
+  0.66%      37  _RNvMsv_NtCskKIM0acSqRs_5supdb2dbNtB5_8MemTable14prefetch_chunk
+  0.64%      36  _RINvMs1h_NtCskKIM0acSqRs_5supdb2dbNtB7_6Reader4scanNCNvNtCshMaFH5QrrhC_11supdb_bench7engines11supdb_range0EBT_
+  0.60%      34  cfree@GLIBC_2.2.5
+  0.57%      32  _RNvMs1G_NtCskKIM0acSqRs_5supdb2dbNtB6_8BuildCtx11materialize
+  0.52%      29  iowrite16
+  0.50%      28  __pow_finite@GLIBC_2.15@plt
+  0.50%      28  _RNvMNtNtCskKIM0acSqRs_5supdb2db5zfileNtB2_7ZCursor5place
+  0.48%      27  _RINvMs2_NtNtCsgczF5crJ4sT_3std6thread5localINtB6_8LocalKeyINtNtCscI6d9CVNmLh_4core4cell7RefCellINtNtCs40k4W9msRzi_5alloc3vec3VechEEE4withNCNvNtCshMaFH5QrrhC_11supdb_bench7engines7consume0uEB2h_
+  0.46%      26  _RNvMs5_NtNtCskKIM0acSqRs_5supdb2db5zfileNtB5_5ZFile4seek
+  0.43%      24  _RNvMsv_NtCskKIM0acSqRs_5supdb2dbNtB5_8MemTable5entry
+  0.41%      23  _RNvMs1G_NtCskKIM0acSqRs_5supdb2dbNtB6_8BuildCtx10deltas_for
+  0.37%      21  _RNvMs2_NtNtCskKIM0acSqRs_5supdb2db6zpagesNtB5_8PageView12group_of_key
+  0.37%      21  _RNvMNtNtCskKIM0acSqRs_5supdb2db5zfileNtB2_7ZCursor7open_at
+  0.34%      19  _RINvNtNtNtNtCscI6d9CVNmLh_4core5slice4sort8unstable9quicksort9quicksortTmmmmmbmENCINvMB8_SB17_20sort_unstable_by_keyyNCNvMs1h_NtCskKIM0acSqRs_5supdb2dbNtB20_6Reader11settle_eachs3_0E0EB22_
+  0.30%      17  _raw_spin_unlock_irqrestore
+  0.28%      16  _RNvMs1G_NtCskKIM0acSqRs_5supdb2dbNtB6_8BuildCtx13overlay_count
+  0.27%      15  _raw_spin_unlock_irq
+  0.25%      14  _RNvMs1h_NtCskKIM0acSqRs_5supdb2dbNtB6_6Reader8sync_log
+  0.25%      14  _RINvNtNtNtNtCscI6d9CVNmLh_4core5slice4sort8unstable9quicksort9quicksortTmmbmENCINvMB8_SB17_20sort_unstable_by_keyyNCNvMs1h_NtCskKIM0acSqRs_5supdb2dbNtB1X_6Reader14settle_pendings_0E0EB1Z_
+  0.25%      14  _RNvMs3_NtNtCskKIM0acSqRs_5supdb2db5zfileNtB5_4Memo7recycle
+  0.23%      13  _RNvMs1G_NtCskKIM0acSqRs_5supdb2dbNtB6_8BuildCtx16prefetch_overlay
+  0.23%      13  finish_task_switch.isra.0
+  0.23%      13  _RNvMs1G_NtCskKIM0acSqRs_5supdb2dbNtB6_8BuildCtx11overlay_mem
+
+== inclusive, top 45 ==
+100.00%    5623  _RNvNtCshMaFH5QrrhC_11supdb_bench3run8one_pass
+ 99.98%    5622  _RNvNtCshMaFH5QrrhC_11supdb_bench3run2ab
+ 99.98%    5622  _RNvNtCshMaFH5QrrhC_11supdb_bench3run4ycsb
+ 99.93%    5619  _RNvCs3FbAtKiN0Fj_5bench6cmd_ab
+ 99.93%    5619  _RNvCs3FbAtKiN0Fj_5bench4main
+ 99.89%    5617  _RINvNtNtCsgczF5crJ4sT_3std3sys9backtrace28___rust_begin_short_backtraceFEuuECs3FbAtKiN0Fj_5bench
+ 99.89%    5617  main
+ 99.73%    5608  __libc_start_call_main
+ 99.54%    5597  __libc_start_main@@GLIBC_2.34
+ 99.47%    5593  _start
+ 84.26%    4738  _RNvXs5_NtCshMaFH5QrrhC_11supdb_bench7enginesNtB5_5SupdbNtB5_6Engine5range
+ 84.21%    4735  _RINvMs1h_NtCskKIM0acSqRs_5supdb2dbNtB7_6Reader4scanNCNvNtCshMaFH5QrrhC_11supdb_bench7engines11supdb_range0EBT_
+ 84.21%    4735  _RNvNtCshMaFH5QrrhC_11supdb_bench7engines11supdb_range
+ 72.40%    4071  _RINvMs1h_NtCskKIM0acSqRs_5supdb2dbNtB7_6Reader11scan_blocksNCNvNtCshMaFH5QrrhC_11supdb_bench7engines11supdb_range0EB11_
+ 32.95%    1853  _RNvMs5_NtNtCskKIM0acSqRs_5supdb2db5zfileNtB5_5ZFile10open_group
+ 26.36%    1482  _RNvNtNtCskKIM0acSqRs_5supdb2db6zpages12decode_group
+ 26.27%    1477  _RINvNtNtCskM85p0F8VIm_8lz4_flex5block10decompress19decompress_internalKb0_NtNtB6_4sink9SliceSinkECskKIM0acSqRs_5supdb
+ 20.77%    1168  _RNvMs1h_NtCskKIM0acSqRs_5supdb2dbNtB6_6Reader16cache_seek_exact
+ 20.67%    1162  _RNvMs5_NtNtCskKIM0acSqRs_5supdb2db5zfileNtB5_5ZFile4seek
+ 16.38%     921  _RINvMs1H_NtCskKIM0acSqRs_5supdb2dbNtB7_10PartReader4scanQNCNvNtCshMaFH5QrrhC_11supdb_bench7engines11supdb_range0EBZ_
+ 14.53%     817  _RNvMNtNtCskKIM0acSqRs_5supdb2db5zfileNtB2_7ZCursor7open_at
+ 12.68%     713  _RINvMNtNtCskKIM0acSqRs_5supdb2db5zfileNtB3_7ZCursor8walk_runQNCNvNtCshMaFH5QrrhC_11supdb_bench7engines11supdb_range0EB13_
+ 12.18%     685  _RINvMs1h_NtCskKIM0acSqRs_5supdb2dbNtB7_6Reader11part_scan_zNCNvNtCshMaFH5QrrhC_11supdb_bench7engines11supdb_range0EB11_
+ 12.18%     685  _RINvMs1h_NtCskKIM0acSqRs_5supdb2dbNtB7_6Reader10cache_scanNCNvNtCshMaFH5QrrhC_11supdb_bench7engines11supdb_range0EB10_
+ 11.10%     624  _RNvMs1G_NtCskKIM0acSqRs_5supdb2dbNtB6_8BuildCtx11materialize
+  7.84%     441  pow@@GLIBC_2.29
+  7.83%     440  _RNvMs1G_NtCskKIM0acSqRs_5supdb2dbNtB6_8BuildCtx10deltas_for
+  7.68%     432  _RNvMNtNtCskKIM0acSqRs_5supdb2db5zfileNtB2_7ZCursor10next_group
+  6.97%     392  _RNvMs1h_NtCskKIM0acSqRs_5supdb2dbNtB6_6Reader14settle_pending
+  6.69%     376  _RNvMs1h_NtCskKIM0acSqRs_5supdb2dbNtB6_6Reader11settle_each
+  5.98%     336  __ieee754_pow_fma
+  5.90%     332  _RNvNtNtCskKIM0acSqRs_5supdb2db6zpages9view_with
+  5.85%     329  _RNvMNtNtCskKIM0acSqRs_5supdb2db5zfileNtB2_7ZCursor4load
+  5.42%     305  __memmove_avx512_unaligned_erms
+  4.43%     249  _RNvMsg_NtNtCskKIM0acSqRs_5supdb2db6zpagesNtB5_6ZFence8entry_of
+  4.20%     236  _RNvMNtNtNtNtCsgczF5crJ4sT_3std3sys3pal4unix4timeNtB2_8Timespec3now
+  4.02%     226  clock_gettime@@GLIBC_2.17
+  3.98%     224  _RNvMs1H_NtCskKIM0acSqRs_5supdb2dbNtB6_10PartReader9cursor_at
+  3.72%     209  [unknown [vdso]]
+  2.51%     141  exc_page_fault
+  2.51%     141  asm_exc_page_fault
+  2.49%     140  do_user_addr_fault
+  2.31%     130  _RNvMs4_NtNtCskKIM0acSqRs_5supdb2db5zfileNtB5_5ZMemo3get
+  2.19%     123  handle_mm_fault
+  2.19%     123  __memcmp_evex_movbe

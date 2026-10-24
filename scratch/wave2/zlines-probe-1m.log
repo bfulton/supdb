@@ -1,0 +1,45 @@
+=== zlines 
+1000000 keys loaded under supdb-nocachezpages in 1.61 s
+18649 pages (76.4 MB), 74588 groups; one group a page in a random page order, one output buffer, spin 0, 11 rounds
+       shape  ns/decode   rounds (min-max)
+       plain        902      819-1692    
+     payload        817      765-1301    
+ hdr+payload        845      770-1208    
+   half-page        892      842-1315    
+        page       1019      923-1290    
+=== zlines --spin 40
+1000000 keys loaded under supdb-nocachezpages in 1.50 s
+18649 pages (76.4 MB), 74588 groups; one group a page in a random page order, one output buffer, spin 40, 11 rounds
+       shape  ns/decode   rounds (min-max)
+       plain        830      817-1604    
+     payload        785      771-1173    
+ hdr+payload        786      775-984     
+   half-page        821      814-1058    
+        page        902      879-1387    
+=== zlines --cold-out
+1000000 keys loaded under supdb-nocachezpages in 1.33 s
+18649 pages (76.4 MB), 74588 groups; one group a page in a random page order, 2048 rotating output buffers, spin 0, 11 rounds
+       shape  ns/decode   rounds (min-max)
+       plain       1117     1103-1998    
+     payload       1054     1030-1511    
+ hdr+payload       1067     1037-1393    
+   half-page       1107     1080-1418    
+        page       1190     1166-1415    
+=== zlines --scan
+1000000 keys loaded under supdb-nocachezpages in 1.38 s
+18649 pages (76.4 MB), 74588 groups; one group a page in a random page order then every group of the page, one output buffer, spin 0, 11 rounds
+       shape  ns/decode   rounds (min-max)
+       plain        781      627-958     
+     payload        750      614-948     
+ hdr+payload        749      591-927     
+   half-page        767      625-977     
+        page        786      612-925     
+=== zlines --scan --cold-out
+1000000 keys loaded under supdb-nocachezpages in 1.38 s
+18649 pages (76.4 MB), 74588 groups; one group a page in a random page order then every group of the page, 2048 rotating output buffers, spin 0, 11 rounds
+       shape  ns/decode   rounds (min-max)
+       plain        703      635-1025    
+     payload        782      596-1066    
+ hdr+payload        727      610-955     
+   half-page        679      620-870     
+        page        720      634-843     

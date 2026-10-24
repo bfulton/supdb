@@ -37,7 +37,15 @@
 //! (`Options::zpages_group_bytes`); a store built with the target at zero
 //! (one group a page) is what the split was first priced on.
 //!
-//!     cargo run --release --features lz4-c --example zdecode -- [--size N] [--rounds N] [--split k,...] [--pages N] [--count flex|c]
+//! And the compressor's side of the decode: `--hc LEVEL` recompresses every
+//! group with liblz4's high-compression mode at that level (a longer match
+//! search, fewer tokens for the decoder to parse, the same block format)
+//! and prices the cycling decode of those payloads beside their bytes, since
+//! a cold decode's cost is the decoder's branches on tokens it has not
+//! learned, and fewer tokens is the one lever on that the form's writer
+//! holds. The split probe is skipped under it unless asked for.
+//!
+//!     cargo run --release --features lz4-c --example zdecode -- [--size N] [--rounds N] [--split k,...] [--pages N] [--count flex|c] [--hc LEVEL]
 use std::hint::black_box;
 use std::path::Path;
 use std::time::Instant;
@@ -365,6 +373,8 @@ fn main() {
     let mut rounds: usize = 21;
     let mut count: Option<String> = None;
     let mut ks: Vec<usize> = vec![1, 2, 4, 8, 16];
+    let mut split_given = false;
+    let mut hc: Option<i32> = None;
     let mut first: Option<usize> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -376,7 +386,9 @@ fn main() {
             // The cycle over the first N pages only: what the cycling figure
             // is made of, the predictor or the cache level the pages sit in.
             "--pages" => first = Some(val("a count").parse().expect("a count")),
+            "--hc" => hc = Some(val("a level").parse().expect("a level")),
             "--split" => {
+                split_given = true;
                 ks = val("a list")
                     .split(',')
                     .map(|s| s.parse().expect("a count"))
@@ -419,6 +431,39 @@ fn main() {
     let _ = std::fs::remove_dir_all(&root);
     if let Some(n) = first {
         pages.truncate(n);
+    }
+    if let Some(level) = hc {
+        // Every group recompressed by liblz4's high-compression mode from
+        // the bytes the engine's decoder gives for it; a group it would
+        // not shrink keeps the engine's payload, as the fill keeps a group
+        // the encoder does not shrink.
+        let before: usize = pages.iter().map(|p| p.payload.len()).sum();
+        let mut g = vec![0u8; pages.iter().map(|p| p.ulen).max().unwrap()];
+        let t = Instant::now();
+        for p in pages.iter_mut() {
+            let n = flex(p, &mut g);
+            assert_eq!(n, p.ulen);
+            let out = lz4::block::compress(
+                &g[..p.ulen],
+                Some(lz4::block::CompressionMode::HIGHCOMPRESSION(level)),
+                false,
+            )
+            .expect("liblz4's HC compressor");
+            if out.len() < p.payload.len() {
+                p.payload = out;
+            }
+        }
+        let after: usize = pages.iter().map(|p| p.payload.len()).sum();
+        println!(
+            "hc {level}: {} compressed bytes recompressed to {} ({:.3} of the engine's) in {:.2} s",
+            before,
+            after,
+            after as f64 / before as f64,
+            t.elapsed().as_secs_f64()
+        );
+        if !split_given {
+            ks.clear();
+        }
     }
     let total_u: usize = pages.iter().map(|p| p.ulen).sum();
     let total_c: usize = pages.iter().map(|p| p.payload.len()).sum();

@@ -1,0 +1,11 @@
+3a885a9
+ M bench/examples/zdecode.rs
+ M bench/src/engines.rs
+ M src/db.rs
+ M src/db/zfile.rs
+ M src/db/zpages.rs
+ M tests/fuzz.rs
+?? bench/examples/zlines.rs
+?? scratch/wave2/zlines-fence-build.log
+?? scratch/wave2/zlines-fence-head.txt
+2026-10-24T20:49:01Z

@@ -941,6 +941,39 @@ pub struct Options {
     /// arm.
     #[doc(hidden)]
     pub zpages_memo_first: bool,
+    /// EXPERIMENT: a form file's fence searched through a tree over the
+    /// entries' words (`zpages::ZFence::index`, built at the attach): a
+    /// balanced tree over the entries in key order laid out breadth first,
+    /// one word a level, the line three levels down asked for before it is
+    /// read, and the whole key compared only where entries tie on the word.
+    /// Built for the fence's search, a twentieth of the E mix's thread at
+    /// five million keys under 640 MiB, read as a binary search whose every
+    /// probe below the top missed on a line of the offsets and a line of
+    /// the keys. Profiled arm against arm, the tree's search took more of
+    /// the thread, not less (4.2% against 3.4%), and the pairing read level
+    /// everywhere: that store's fences are nineteen of some 4,900 entries,
+    /// a hundred kilobytes each and in the second-level cache for the
+    /// partitions a Zipfian reads, so the search was never miss-bound and
+    /// the tree's prefetches, bounds and word compares are instructions
+    /// added to a search that had none to lose. Off;
+    /// `supdb-cache64tofitautozpagesfencetree` is the arm, for a store
+    /// whose fence does not fit a cache -- one partition of millions of
+    /// pages -- where the tree's reading of one line a level would count.
+    /// Twelve bytes an entry beside the fence's sixteen and the keys.
+    #[doc(hidden)]
+    pub zpages_fence_tree: bool,
+    /// A group's decode asks for the line of the memo entry its put will
+    /// displace before it begins (`zfile::Memo::prefetch_victim`): the put
+    /// tries the displaced group's `Arc` for its last reference, a load of
+    /// a line last touched when that entry was made, thousands of decodes
+    /// ago, and a cold miss a decode -- `Memo::recycle` was 2.9% of the E
+    /// mix's thread at five million keys under 640 MiB, on no instruction
+    /// worth the name. Profiled arm against arm the recycle's samples go
+    /// from 2.0% of the thread to 0.25%, the miss gone; paired, the
+    /// memo-heavy mixes read 3-6% for the hint in two thirds of the pairs
+    /// and no cell against it, inside the band. On;
+    /// `supdb-cache64tofitautozpagesmemonoahead` is the shape before.
+    pub zpages_memo_ahead: bool,
     /// A block's reads of its covered partition through one cursor
     /// (`PartReader`, `zfile::ZCursor`): a build or a walk reads the
     /// records between the overlay's keys, each key's cut where the walk
@@ -2572,6 +2605,8 @@ impl Default for Options {
             zpages_trusted_views: true,
             zpages_memo_bytes: 8 << 20,
             zpages_memo_first: false,
+            zpages_fence_tree: false,
+            zpages_memo_ahead: true,
             zpages_block_cursor: true,
             zpages_scan_prefetch: false,
             zpages_walk_cursor: true,
@@ -22847,6 +22882,7 @@ impl Db {
                     opts.zpages_scan_prefetch,
                     opts.zpages_trusted_views,
                     opts.zpages_memo_first,
+                    (opts.zpages_fence_tree, opts.zpages_memo_ahead),
                     &zev,
                 );
             }
@@ -26052,6 +26088,7 @@ impl Db {
     /// that the build's round does not ask of the same file again and count
     /// it twice; no file is not a rejection.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn z_attach(
         dir: &Path,
         seg: &Seg,
@@ -26060,6 +26097,7 @@ impl Db {
         prefetch: bool,
         trusted: bool,
         memo_first: bool,
+        lines: (bool, bool),
         ev: &zfile::ZEvents,
     ) -> bool {
         let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) else {
@@ -26075,6 +26113,8 @@ impl Db {
             prefetch,
             trusted,
             memo_first,
+            lines.0,
+            lines.1,
         ) {
             Ok(side) => {
                 let installed = seg.z.install(side);
@@ -26125,6 +26165,7 @@ impl Db {
                 self.opts.zpages_scan_prefetch,
                 self.opts.zpages_trusted_views,
                 self.opts.zpages_memo_first,
+                (self.opts.zpages_fence_tree, self.opts.zpages_memo_ahead),
                 ev,
             )
         {
@@ -26160,6 +26201,8 @@ impl Db {
                     self.opts.zpages_scan_prefetch,
                     self.opts.zpages_trusted_views,
                     self.opts.zpages_memo_first,
+                    self.opts.zpages_fence_tree,
+                    self.opts.zpages_memo_ahead,
                 ) {
                     Ok(side) => {
                         if seg.z.install(side) {
@@ -33535,6 +33578,7 @@ impl Maint {
                 self.opts.zpages_scan_prefetch,
                 self.opts.zpages_trusted_views,
                 self.opts.zpages_memo_first,
+                (self.opts.zpages_fence_tree, self.opts.zpages_memo_ahead),
                 ev,
             )
         {
@@ -33682,6 +33726,8 @@ impl Maint {
                         self.opts.zpages_scan_prefetch,
                         self.opts.zpages_trusted_views,
                         self.opts.zpages_memo_first,
+                        self.opts.zpages_fence_tree,
+                        self.opts.zpages_memo_ahead,
                     ) {
                         Ok(side) => {
                             if target.z.install(side) {
