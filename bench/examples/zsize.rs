@@ -5,6 +5,7 @@
 //! ```text
 //! cargo run --release --example zsize -- [--keys N] [--shapes seq,rdec,rbytes,uuid]
 //!                                        [--comp 0.5,0,1] [--rounds R] [--dir PATH] [--no-time]
+//!                                        [--coding block|record]
 //! cargo run --release --example zsize --features lz4-safe -- ...      # the cross-check codec
 //! ```
 //!
@@ -45,8 +46,19 @@ use std::time::Instant;
 use supdb::db::zpages::{
     bind32, decode_group, fill_page, filter_bytes, group_seek, lz4_decoder, lz4_encoder_pin,
     page_crc, parse_page, verify_page, walk_group, FenceEntry, Fill, FillScratch, FillStats,
-    Filled, GroupBuf, Images, Lz4Decoder, SegImages, LZ4_ENCODER_PIN, ZCAP, ZPAGE, ZTRAILER,
+    Filled, GroupBuf, Images, Lz4Decoder, SegImages, LZ4_ENCODER_PIN, ZCAP, ZCODING_BLOCK,
+    ZCODING_RECORD, ZPAGE, ZTRAILER,
 };
+
+/// The group coding the fills run under (`--coding`): the block coding, the
+/// shape every figure in this file's notes was taken on, unless asked for
+/// the record coding the engine ships. One knob for every scratch the tool
+/// makes.
+static CODING: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(ZCODING_BLOCK);
+
+fn coding() -> u8 {
+    CODING.load(std::sync::atomic::Ordering::Relaxed)
+}
 use supdb::flatindex::{self, record_key, record_key_next, FlatIndex};
 use supdb::{Blob, Bytes, Db, MmapBytes, Options};
 use supdb_bench::workload::{db_key_into, Payload, Rng};
@@ -268,6 +280,7 @@ fn analyze(segs: &[PathBuf], want: usize, shape: Shape, comp: f64, sweep: bool) 
         sweep: Vec::new(),
     };
     let mut scratch = FillScratch::new();
+    scratch.coding = coding();
     let mut vbuf = GroupBuf::new();
     for (pi, path) in segs.iter().enumerate() {
         let src = MmapBytes::open(path).expect("map");
@@ -350,6 +363,7 @@ fn analyze(segs: &[PathBuf], want: usize, shape: Shape, comp: f64, sweep: bool) 
         if sweep && pi == 0 {
             for rounds in 0..=3u32 {
                 let mut s = FillScratch::new();
+                s.coding = coding();
                 s.group_bytes = 0;
                 s.grow_rounds = rounds;
                 s.hint = 60;
@@ -602,6 +616,14 @@ fn main() {
                     .collect()
             }
             "--no-time" => timing = false,
+            "--coding" => {
+                let c = match val("block|record").as_str() {
+                    "block" => ZCODING_BLOCK,
+                    "record" => ZCODING_RECORD,
+                    other => panic!("--coding block|record, not {other}"),
+                };
+                CODING.store(c, std::sync::atomic::Ordering::Relaxed);
+            }
             other => panic!("unknown argument {other}"),
         }
     }
@@ -610,9 +632,10 @@ fn main() {
     let decoder = lz4_decoder();
     let safe_feature = cfg!(feature = "lz4-safe");
     println!(
-        "codec: lz4_flex {} (bench/Cargo.lock); decoder run: {decoder:?}; bench feature lz4-safe: {}; the encoders emit the same bytes (compare the digests)",
+        "codec: lz4_flex {} (bench/Cargo.lock); decoder run: {decoder:?}; bench feature lz4-safe: {}; the encoders emit the same bytes (compare the digests); coding: {}",
         lz4_version(),
         if safe_feature { "on" } else { "off" },
+        if coding() == ZCODING_RECORD { "record" } else { "block" },
     );
     let want = if safe_feature {
         Lz4Decoder::Safe

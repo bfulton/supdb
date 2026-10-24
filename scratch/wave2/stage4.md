@@ -2142,3 +2142,94 @@ study gives: a compression ratio measured on one payload is that payload's,
 and a form whose ratio depends on where in the file a value's redundancy
 lies is tested on a payload whose redundancy is somewhere else before the
 ratio is read as the form's.
+
+## The record coding in the engine
+
+Built from the plan in `next/README.md` after the two probes, and changed
+where the engine said otherwise. The form file's groups hold their records
+one by one now (`Options::zpages_record_coding`, on; `zpages::ZCODING_RECORD`),
+the choice per group in the high bit of the directory entry's decoded-length
+word (`D_CODED`; a group's length never reaches the bit), the trailer at
+version 2 so that a reader from before refuses the file and rebuilds it and
+this reader refuses the files before, and the header's spare byte zero as it
+was. A coded group's payload is an offset table of `u16`s, then each record
+as its head (`[klen u16][n u16][key]`) front-coded against the first record's
+head -- the prefix length and the suffix, as varints and bytes -- its image
+length, its tail's stored length, and the tail (the image from its aligned
+tail start) LZ4-compressed against the first record's tail, which is stored
+raw as the dictionary; a tail LZ4 does not shrink is stored raw, and so is
+every tail under eight bytes (`zpages::encode_record_group`). A group decoded
+whole is its records decoded one after another into the bytes the block
+coding decodes to (`decode_record_group`), which is how the verify at the
+build, the first decode's checks, the memo and every reader of a decoded
+group -- the cursor's walk among them -- read a coded group unchanged; a
+point read of a verified page seeks the group's heads where they lie
+(`record_group_seek`, the keys compared through the prefix and the suffix
+without assembling them) and decodes its one record into the read's buffer
+(`decode_record`), asking the memo nothing (`ZFile::locate`); the page is
+still touched for the footprint, which the first version forgot and the
+footprint test found. The block coding stays as the arms
+`supdb-cache64tofitautozpagesblock` and `supdb-nocachezpagesblock`.
+
+Two things the plan had wrong, both found by the existing tests. The coding
+was to be the page's, in the header's spare byte; the integration test of
+records larger than a page counted a third record no page held under it,
+and it was the 5,000-byte key: the block coding compresses a key's run and a
+head is never compressed, so a record alone whose head passes the page is
+the block's if the block holds it. The fill tries the record coding first
+and falls back to one LZ4 block for a single record only (`FillScratch::compress`);
+a group of more records that passes the room is trimmed and tried coded
+again, as the block coding's groups are trimmed, since the block compresses
+a tenth tighter and would otherwise take every page's last group. And the
+memo test's invariant, every read opened a page through the memo, is the
+block coding's; under the record coding no read of a verified page asks
+the memo and every read decodes its record, which the test asserts now for
+that coding, with the memo's misses the pages' first decodes.
+
+What the sizing tool says of it (`bench/examples/zsize.rs --coding record`,
+`zsize-{block,record}-300k.txt`: 300,000 keys of the suite's shape, one
+round, 400 sampled pages). The record coding's form is 14% larger: 86.97
+bytes a key against 76.34, 47.1 records a page against 53.7, three groups a
+page against four, one group in a hundred stored verbatim (the coding did
+not shrink it) against none; at ten million keys 0.87 GB of pages against
+0.76, 95% of the 937 MB the 1 GiB bound leaves against 83%, so the top rung
+of the out-of-core ladder is a closer fit under this coding. The fill is
+1.5x slower, 25.7 µs a page against 17.2 and 5.5 s against 3.2 at ten
+million keys, one thread: LZ4's compress against a dictionary sets up a
+table per call, once a record here where the block coding set up once a
+group, and this is the lever on the build if the install's time is read as
+the coding's. A group decoded whole through its records costs 0.649 µs hot
+against the block's 0.271 and 1.631 cold against 1.014 -- per record about
+43 ns hot, the decoder's per-call setup over a hundred-byte input -- which is
+what the cursor's walk and a page's first decode pay for a group, while a
+point read pays one record of it, about a sixth of the block's group hot and
+less cold. The checks over a page (`verify`) read 3.1 µs against 2.3 for the
+same reason. Nothing else moved: the walk, the parse and the CRC read the
+same.
+
+So the engine's point reads should gain by about the decode a read saves,
+and its scans pay the decode constant on every group the memo misses, 1.6x
+cold; the probe's scans read the other way (`zrec-local` 2.45 µs a scan of
+fifty against the group control's 3.29, in core), where the probe's group
+control decoded a group without a memo in front of it. What the suite's E
+makes of the two is the pairing's to say, not this tool's, and the levers
+if E loses are named: a decoder shaped for a hundred-byte record against a
+dictionary (lz4_flex's per-call setup is most of 43 ns), the cursor decoding
+the records it emits rather than the group, worth little for a scan of
+fifty that crosses three groups, and the segment dictionary appended to the
+first record's tail for the bytes.
+
+Held by: the layout module's five new tests (round trip and seek against
+the decoded group's over every record shape the module's tests know, the
+forged payloads -- an offset into the table or past the payload, a prefix
+past the first head, an image length not whole words or shorter than its
+tail, a tail cut short, a first record coded against anything -- a page of
+either coding read as the other's, a stored group never coded, the fill
+under the coding building pages the reader decodes with a point read of
+every record), the reader's every-key and cursor-against-seek tests under
+both codings, the memo test's two invariants, the integration suite (100),
+the fuzz under the option varied (`record_coding` off in a quarter of the
+seeds under `ZFUZZ_OPTVARY`), and the test of a piece kept across a merge
+holding the merge's landing (`Db::hold_merge_landing`), which bet a merge of
+four hundred thousand keys would outlast a seal of twenty and lost once under
+the gate's load.
