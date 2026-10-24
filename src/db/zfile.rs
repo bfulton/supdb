@@ -31,10 +31,10 @@
 //! freed with its segment.
 
 use super::zpages::{
-    bind32, check_entry, check_group, decode_group, fill_page, filter_bytes, group_seek, page_view,
-    parse_page, verify_page, view_trusted, walk_group, FenceEntry, Fill, FillScratch, FillStats,
-    GroupBuf, Images, NoPage, PageView, SegImages, Trailer, ZError, ZFence, ZGROUP_BYTES,
-    ZMAX_GROUPS, ZNOPAGE, ZPAGE, ZTRAILER,
+    bind32, check_entry, check_group, decode_group, decode_record, fill_page, filter_bytes,
+    group_seek, page_view, parse_page, record_group_seek, verify_page, view_trusted, walk_group,
+    FenceEntry, Fill, FillScratch, FillStats, GroupBuf, Images, NoPage, PageView, SegImages,
+    Trailer, ZError, ZFence, ZCODING_BLOCK, ZGROUP_BYTES, ZMAX_GROUPS, ZNOPAGE, ZPAGE, ZTRAILER,
 };
 use crate::blob::{Blob, BlobOptions, ZSource};
 use crate::bytes::{Bytes, MmapBytes};
@@ -2024,6 +2024,47 @@ impl ZFile {
             return Locate::Fallback;
         };
         let j = view.group_of_key(key);
+        // The record coding's point read, on a page this process has
+        // verified: the group's heads are sought where they lie and the one
+        // record is decoded into the read's buffer, nothing else of the
+        // group and nothing of the memo. A page not yet verified takes the
+        // first decode below, every group whole, as any page does; a group
+        // that is stored verbatim, or one LZ4 block because only that held
+        // it, is opened as under the block coding.
+        if bit(&self.verified, p) {
+            if let Some(g) = view.group(j).filter(|g| g.coded) {
+                // The page is touched, for the footprint, as `open_group`
+                // touches it.
+                memo.touch(self.id, entry.page, self.n_pages);
+                let Some(payload) = view.payload(j) else {
+                    self.fail(p);
+                    return Locate::Fallback;
+                };
+                let count = usize::from(g.count);
+                let pos = match record_group_seek(payload, count, key) {
+                    Ok(pos) => pos,
+                    Err(_) => {
+                        self.fail(p);
+                        return Locate::Fallback;
+                    }
+                };
+                if !pos.found {
+                    return Locate::Absent { decoded: false };
+                }
+                return match decode_record(payload, count, pos.index, buf) {
+                    Ok(rec) => Locate::Found {
+                        opened: Opened::Borrowed(rec),
+                        off: 0,
+                        page: p,
+                        decoded: true,
+                    },
+                    Err(_) => {
+                        self.fail(p);
+                        Locate::Fallback
+                    }
+                };
+            }
+        }
         let Some((opened, _, count, decoded)) = self.open_group(memo, &entry, j, buf, Some(&view))
         else {
             return Locate::Fallback;
@@ -3176,6 +3217,10 @@ pub(super) struct BuildPlan {
     /// (`Options::zpages_group_bytes`, `FillScratch::group_bytes`); zero is
     /// one group a page.
     pub group_bytes: usize,
+    /// The coding of the groups that compress (`Options::zpages_record_coding`,
+    /// `FillScratch::coding`): `ZCODING_RECORD` as the engine ships,
+    /// `ZCODING_BLOCK` the shape before.
+    pub coding: u8,
     /// A build on a thread of its own looks here once a page: set, the
     /// build stops, removes its temp file and answers `Outcome::Cancelled`.
     /// A merge that takes the build's target as an input sets it.
@@ -3195,6 +3240,7 @@ impl BuildPlan {
             window: ZDROP_WINDOW,
             ahead: 0,
             group_bytes: ZGROUP_BYTES,
+            coding: ZCODING_BLOCK,
             cancel: None,
             hold: None,
         }
@@ -3378,6 +3424,7 @@ fn write_pages(
     let images = SegImages::new(recs, dir, nkeys);
     let mut scratch = FillScratch::new();
     scratch.group_bytes = plan.group_bytes;
+    scratch.coding = plan.coding;
     let mut verify_buf = GroupBuf::new();
     let mut fence = ZFence::new();
     let recs_at = recs.as_ptr() as usize - base;
@@ -3763,6 +3810,7 @@ pub(super) fn sample(
     end_seq: u64,
     floor: usize,
     group_bytes: usize,
+    coding: u8,
 ) -> Result<Sample> {
     let facts = blob.z_source_facts().ok_or_else(|| {
         super::err("z sample: the segment has no checksum row to bind a form file to")
@@ -3789,6 +3837,7 @@ pub(super) fn sample(
     let images = SegImages::new(recs, dir, nkeys);
     let mut scratch = FillScratch::new();
     scratch.group_bytes = group_bytes;
+    scratch.coding = coding;
     let mut buf = GroupBuf::new();
     let mut page = [0u8; ZPAGE];
     let flt0 = thread_major_faults().unwrap_or(0);
@@ -3939,6 +3988,7 @@ pub fn read_budget() -> Option<Budget> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::zpages::ZCODING_RECORD;
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -3991,7 +4041,7 @@ mod tests {
     #[test]
     fn a_sample_estimates_the_form_within_a_tenth_of_the_build() {
         let fx = Fixture::new("sample", suite(20_000, 0x5A4), 1 << 16);
-        let s = sample(&fx.blob, ID, END, 0, ZGROUP_BYTES).unwrap();
+        let s = sample(&fx.blob, ID, END, 0, ZGROUP_BYTES, ZCODING_BLOCK).unwrap();
         assert_eq!(s.declined, None, "{s:?}");
         assert_eq!(s.nkeys, 20_000);
         assert_eq!(s.groups, SAMPLE_GROUPS as u64, "{s:?}");
@@ -4019,7 +4069,7 @@ mod tests {
             b.file_bytes
         );
         // The builder's own declines, made first: the floor.
-        let d = sample(&fx.blob, ID, END, usize::MAX, ZGROUP_BYTES).unwrap();
+        let d = sample(&fx.blob, ID, END, usize::MAX, ZGROUP_BYTES, ZCODING_BLOCK).unwrap();
         assert!(matches!(d.declined, Some(Decline::Small(_))), "{d:?}");
         assert_eq!((d.groups, d.w_z), (0, 0), "{d:?}");
     }
@@ -4174,10 +4224,17 @@ mod tests {
         recs: Vec<Rec>,
         /// The handle's memo the tests read through.
         memo: ZMemo,
+        /// The group coding the fixture builds its form file with: the
+        /// block coding unless a test asks for the other.
+        coding: u8,
     }
 
     impl Fixture {
         fn new(name: &str, recs: Vec<Rec>, inline_max: usize) -> Fixture {
+            Fixture::with_coding(name, recs, inline_max, ZCODING_BLOCK)
+        }
+
+        fn with_coding(name: &str, recs: Vec<Rec>, inline_max: usize, coding: u8) -> Fixture {
             let dir = dir(name);
             let seg = dir.join("par-00000007-0000000000000099--.sup");
             write_segment(&seg, &recs, inline_max);
@@ -4189,11 +4246,16 @@ mod tests {
                 blob,
                 recs,
                 memo: ZMemo::new(),
+                coding,
             }
         }
 
         fn build(&self) -> Outcome {
-            build(&self.seg, &self.out, ID, END, &BuildPlan::new(0, true)).unwrap()
+            let plan = BuildPlan {
+                coding: self.coding,
+                ..BuildPlan::new(0, true)
+            };
+            build(&self.seg, &self.out, ID, END, &plan).unwrap()
         }
 
         fn attach(&self) -> std::result::Result<ZFile, Reject> {
@@ -4314,20 +4376,24 @@ mod tests {
 
     #[test]
     fn a_form_file_answers_every_key_as_the_segment_does() {
-        for (name, recs, inline) in [
-            ("suite", suite(3000, 11), 256),
-            ("shapes", shapes(), 1 << 20),
+        for (name, recs, inline, coding) in [
+            ("suite", suite(3000, 11), 256, ZCODING_BLOCK),
+            ("shapes", shapes(), 1 << 20, ZCODING_BLOCK),
+            ("suite-rec", suite(3000, 11), 256, ZCODING_RECORD),
+            ("shapes-rec", shapes(), 1 << 20, ZCODING_RECORD),
         ] {
-            let fx = Fixture::new(name, recs, inline);
+            let fx = Fixture::with_coding(name, recs, inline, coding);
             let zfile = fx.zfile();
             assert!(zfile.pages() > 1, "{name}: more than one page");
             agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
             // Every page a read opened was checked, once, and none failed.
             assert!(zfile.verified_pages() > 0 && zfile.bad_pages() == 0);
-            // The second pass finds every page verified and answers the same.
+            // The second pass finds every page verified and answers the same:
+            // under the record coding, through the one-record point read.
             let before = zfile.verified_pages();
             agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
             assert_eq!(zfile.verified_pages(), before, "{name}");
+            assert_eq!(zfile.bad_pages(), 0, "{name}");
         }
     }
 
@@ -4340,11 +4406,13 @@ mod tests {
     /// answers them, the group opened again.
     #[test]
     fn a_cursor_moved_to_a_key_agrees_with_the_seek_a_key() {
-        for (name, recs, inline_max) in [
-            ("skipto-suite", suite(3000, 41), 256),
-            ("skipto-shapes", shapes(), 1 << 20),
+        for (name, recs, inline_max, coding) in [
+            ("skipto-suite", suite(3000, 41), 256, ZCODING_BLOCK),
+            ("skipto-shapes", shapes(), 1 << 20, ZCODING_BLOCK),
+            ("skipto-suite-rec", suite(3000, 41), 256, ZCODING_RECORD),
+            ("skipto-shapes-rec", shapes(), 1 << 20, ZCODING_RECORD),
         ] {
-            let fx = Fixture::new(name, recs, inline_max);
+            let fx = Fixture::with_coding(name, recs, inline_max, coding);
             let zfile = fx.zfile();
             let nkeys = fx.recs.len();
             let mut probes: Vec<Vec<u8>> = vec![Vec::new(), b"\x00".to_vec()];
@@ -5528,6 +5596,7 @@ mod tests {
                 payload,
                 ulen: group.len() as u32,
                 stored: false,
+                coded: false,
                 key,
             })
             .collect();

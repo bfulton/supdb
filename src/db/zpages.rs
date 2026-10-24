@@ -129,7 +129,12 @@ pub const ZTAG: u32 = u32::from_le_bytes(*b"ZPG2");
 /// so a file of the other layout is refused at its trailer and rebuilt.
 pub const ZMAGIC: [u8; 8] = *b"SUPDZPG2";
 /// The trailer's version: what an older reader refuses without misreading.
-pub const ZVERSION: u32 = 1;
+/// It moved to 2 with the record coding ([`ZCODING_RECORD`]): the page's
+/// layout is the same and a `ZPG2` reader refuses a coded group at its
+/// decoded length, whose high bit says the coding, but a refusal at a page
+/// is read as damage and a refusal at the trailer as a file to rebuild,
+/// which a derived file is.
+pub const ZVERSION: u32 = 2;
 /// The trailer's length, a page.
 pub const ZTRAILER: usize = ZPAGE;
 /// The trailer flag that says a filter is stored in the resident part.
@@ -302,7 +307,15 @@ pub struct GroupEntry {
     pub ulen: u32,
     /// The payload is the group verbatim.
     pub stored: bool,
+    /// The payload is the record coding ([`ZCODING_RECORD`]): its records
+    /// one by one, each decodable alone. Else, not stored, one LZ4 block.
+    /// The high bit of the entry's decoded-length word, which the length
+    /// never reaches.
+    pub coded: bool,
 }
+
+/// The directory word's bit that says a group is record-coded.
+const D_CODED: u16 = 0x8000;
 
 /// A page parsed: its header, and the directory the groups' payloads and
 /// keys are found by, over the page's own bytes. Made by [`parse_page`]
@@ -353,8 +366,9 @@ impl<'a> PageView<'a> {
             count,
             coff,
             clen,
-            ulen: u32::from(ulen4) * 4,
+            ulen: u32::from(ulen4 & !D_CODED) * 4,
             stored: self.header.is_stored(j),
+            coded: ulen4 & D_CODED != 0,
         })
     }
 
@@ -413,11 +427,13 @@ pub fn page_crc(page: &[u8; ZPAGE], bind32: u32) -> u32 {
 pub struct PageGroup<'a> {
     /// Records in the group, at least one.
     pub count: u16,
-    /// The payload: one LZ4 block, or the group verbatim where `stored`.
+    /// The payload: one LZ4 block, the record coding where `coded`, or the
+    /// group verbatim where `stored`.
     pub payload: &'a [u8],
     /// Bytes of the decoded group.
     pub ulen: u32,
     pub stored: bool,
+    pub coded: bool,
     /// The key of the group's first record. Group 0's is the fence's and
     /// is not written; the rest go into the directory.
     pub key: &'a [u8],
@@ -477,6 +493,9 @@ pub fn encode_page(
         if g.stored && g.payload.len() != g.ulen as usize {
             return bad("a stored group's payload is not its ulen");
         }
+        if g.stored && g.coded {
+            return bad("a stored group is not coded");
+        }
         if j > 0 {
             if g.key.is_empty() || g.key.len() > u16::MAX as usize {
                 return bad("a group's key is empty or over a u16");
@@ -528,7 +547,8 @@ pub fn encode_page(
         page[at + D_FIRST..at + D_FIRST + 2].copy_from_slice(&first.to_le_bytes());
         page[at + D_COFF..at + D_COFF + 2].copy_from_slice(&(coffs[j] as u16).to_le_bytes());
         page[at + D_CLEN..at + D_CLEN + 2].copy_from_slice(&(g.payload.len() as u16).to_le_bytes());
-        page[at + D_ULEN4..at + D_ULEN4 + 2].copy_from_slice(&((g.ulen / 4) as u16).to_le_bytes());
+        let ulen4 = (g.ulen / 4) as u16 | if g.coded { D_CODED } else { 0 };
+        page[at + D_ULEN4..at + D_ULEN4 + 2].copy_from_slice(&ulen4.to_le_bytes());
         first += g.count;
         if j > 0 {
             page[keys_at..keys_at + 2].copy_from_slice(&(g.key.len() as u16).to_le_bytes());
@@ -638,12 +658,15 @@ fn view_with(page: &[u8], checked: bool) -> Result<PageView<'_>, ZError> {
         if usize::from(coff) != expect_coff || clen == 0 {
             return bad("a group's payload is not where the one before ends");
         }
-        let gulen = u32::from(ulen4) * 4;
+        let gulen = u32::from(ulen4 & !D_CODED) * 4;
         if gulen == 0 || gulen as usize > ZMAX_ULEN {
             return bad("a group's ulen is not 4 to the most a group holds");
         }
         if h.is_stored(j) && u32::from(clen) != gulen {
             return bad("a stored group's clen is not its ulen");
+        }
+        if h.is_stored(j) && ulen4 & D_CODED != 0 {
+            return bad("a stored group is not coded");
         }
         let pend = usize::from(coff) + usize::from(clen);
         if pend > end {
@@ -768,9 +791,10 @@ impl Default for GroupBuf {
     }
 }
 
-/// Group `j` of a page, decoded: LZ4 into `buf`, or for a stored group the
-/// payload itself where it is aligned for `parse_record` and a copy in `buf`
-/// where it is not. Either way the bytes returned are aligned, so a record
+/// Group `j` of a page, decoded: LZ4 into `buf` (record by record for a
+/// group of the record coding, [`decode_record_group`]), or for a stored
+/// group the payload itself where it is aligned for `parse_record` and a
+/// copy in `buf` where it is not. Either way the bytes returned are aligned, so a record
 /// of any shape parses out of them.
 ///
 /// The decoder is `lz4_flex`'s `block::decompress_into` called directly, not
@@ -801,6 +825,9 @@ pub fn decode_group<'a>(
         let out = buf.bytes_for(ulen);
         out.copy_from_slice(payload);
         return Ok(out);
+    }
+    if g.coded {
+        return decode_record_group(payload, usize::from(g.count), ulen, buf);
     }
     let out = buf.bytes_for(ulen);
     let n = lz4_flex::block::decompress_into(payload, out).map_err(|_| ZError::Decode)?;
@@ -1009,6 +1036,347 @@ pub fn group_seek(group: &[u8], count: usize, key: &[u8]) -> Result<GroupPos, ZE
     })
 }
 
+/// A group's coding, in the high bit of its directory entry's decoded
+/// length ([`GroupEntry::coded`]), and the fill's preference
+/// (`FillScratch::coding`): how a group the `stored` mask does not name
+/// holds its records.
+///
+/// `ZCODING_BLOCK`: a group's payload is one LZ4 block of its images laid
+/// end to end, and a read decodes the whole group for one record.
+/// `ZCODING_RECORD`: the payload holds the records one by one, each
+/// decodable alone -- an offset table, each record's head front-coded
+/// against the first record's and its tail LZ4-compressed against the first
+/// record's tail, which is stored raw -- so a point read decodes one record
+/// and a scan decodes the records it emits ([`encode_record_group`]).
+pub const ZCODING_BLOCK: u8 = 0;
+pub const ZCODING_RECORD: u8 = 1;
+
+/// The record coding's fields are LEB128 varints: one byte to 127, two to
+/// 16,383, and so on; nothing in a group needs more than four.
+fn put_var(out: &mut [u8], at: &mut usize, mut v: usize) -> Option<()> {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        let slot = out.get_mut(*at)?;
+        *at += 1;
+        if v == 0 {
+            *slot = b;
+            return Some(());
+        }
+        *slot = b | 0x80;
+    }
+}
+
+fn get_var(b: &[u8], at: &mut usize) -> Option<usize> {
+    let mut v = 0usize;
+    let mut shift = 0u32;
+    loop {
+        let x = *b.get(*at)?;
+        *at += 1;
+        v |= usize::from(x & 0x7f) << shift;
+        if x & 0x80 == 0 {
+            return Some(v);
+        }
+        shift += 7;
+        if shift > 28 {
+            return None;
+        }
+    }
+}
+
+/// A record image's head: the two header halves and the key, `4 + klen`
+/// bytes; the tail begins at the next multiple of four.
+fn image_head_len(img: &[u8]) -> Option<usize> {
+    let klen = usize::from(u16::from_le_bytes([*img.first()?, *img.get(1)?]));
+    let head = 4 + klen;
+    (head <= img.len()).then_some(head)
+}
+
+/// The record coding of a group: `ends.len()` images laid end to end in
+/// `imgs`, image `i` ending at `ends[i]`, written into `out` as
+///
+/// ```text
+/// [u16 off_i; n]                      where record i begins in the payload
+/// record i:
+///   varint plen, varint slen, suffix   head_i = head_0[..plen] ++ suffix
+///   varint ulen_i                      the image's length
+///   varint clen_i                      the tail's stored length
+///   tail_i                             image_i from its aligned tail start:
+///                                      LZ4 against tail_0, or raw when
+///                                      clen_i is the tail's length
+/// ```
+///
+/// Record 0 is stored whole: its head as the suffix of a zero prefix and its
+/// tail raw, since it is the dictionary. A tail LZ4 does not shrink is stored
+/// raw. The payload's length, or `None` where the coding cannot hold the
+/// group: an image that is not one, a record that would begin past a u16,
+/// or an output too small, which `FillScratch::classify` reads as a group
+/// too big for the page.
+pub fn encode_record_group(imgs: &[u8], ends: &[usize], out: &mut [u8]) -> Option<usize> {
+    let n = ends.len();
+    if n == 0 || n > ZMAX_COUNT || out.len() < 2 * n {
+        return None;
+    }
+    let img0 = imgs.get(..ends[0])?;
+    let head0 = image_head_len(img0)?;
+    let tail0 = img0.get(head0.next_multiple_of(4)..)?;
+    let mut at = 2 * n;
+    let mut start = 0usize;
+    for (i, &end) in ends.iter().enumerate() {
+        let img = imgs.get(start..end)?;
+        if img.is_empty() || !img.len().is_multiple_of(4) {
+            return None;
+        }
+        if at > usize::from(u16::MAX) {
+            return None;
+        }
+        out[2 * i..2 * i + 2].copy_from_slice(&(at as u16).to_le_bytes());
+        let head = image_head_len(img)?;
+        let plen = if i == 0 {
+            0
+        } else {
+            img[..head]
+                .iter()
+                .zip(&img0[..head0])
+                .take_while(|(a, b)| a == b)
+                .count()
+        };
+        put_var(out, &mut at, plen)?;
+        put_var(out, &mut at, head - plen)?;
+        out.get_mut(at..at + head - plen)?
+            .copy_from_slice(&img[plen..head]);
+        at += head - plen;
+        put_var(out, &mut at, img.len())?;
+        let tail = &img[head.next_multiple_of(4)..];
+        // The compressed tail, where it is shorter; raw otherwise. The
+        // length field goes before the tail, so the compression is made
+        // into the room after where the field at its longest would end.
+        let field_max = 3;
+        let room = out.get_mut(at + field_max..)?;
+        let clen = if i == 0 || tail.len() < 8 {
+            tail.len()
+        } else {
+            match lz4_flex::block::compress_into_with_dict(tail, room, tail0) {
+                Ok(c) if c < tail.len() => c,
+                _ => tail.len(),
+            }
+        };
+        if clen < tail.len() {
+            // Written into the room past the field at its longest: move it
+            // down to right after the field as written.
+            let mut field_at = at;
+            put_var(out, &mut field_at, clen)?;
+            out.copy_within(at + field_max..at + field_max + clen, field_at);
+            at = field_at + clen;
+        } else {
+            put_var(out, &mut at, clen)?;
+            out.get_mut(at..at + clen)?.copy_from_slice(tail);
+            at += clen;
+        }
+        start = end;
+    }
+    Some(at)
+}
+
+/// Record `i`'s fields in a record-coded payload, located and checked:
+/// where its head's suffix, its tail and its lengths are.
+struct CodedRec<'a> {
+    plen: usize,
+    suffix: &'a [u8],
+    ulen: usize,
+    tail: &'a [u8],
+}
+
+impl<'a> CodedRec<'a> {
+    fn head_len(&self) -> usize {
+        self.plen + self.suffix.len()
+    }
+
+    /// Where the tail begins in the image.
+    fn tail_at(&self) -> usize {
+        self.head_len().next_multiple_of(4)
+    }
+}
+
+const REC_CUT: ZError = ZError::Walk("a coded record does not parse");
+
+fn coded_rec(payload: &[u8], count: usize, i: usize) -> Result<CodedRec<'_>, ZError> {
+    if i >= count || count > ZMAX_COUNT || payload.len() < 2 * count {
+        return Err(REC_CUT);
+    }
+    let mut at = usize::from(u16::from_le_bytes([payload[2 * i], payload[2 * i + 1]]));
+    if at < 2 * count {
+        return Err(REC_CUT);
+    }
+    let plen = get_var(payload, &mut at).ok_or(REC_CUT)?;
+    let slen = get_var(payload, &mut at).ok_or(REC_CUT)?;
+    let suffix = payload.get(at..at + slen).ok_or(REC_CUT)?;
+    at += slen;
+    let ulen = get_var(payload, &mut at).ok_or(REC_CUT)?;
+    let clen = get_var(payload, &mut at).ok_or(REC_CUT)?;
+    let tail = payload.get(at..at + clen).ok_or(REC_CUT)?;
+    let r = CodedRec {
+        plen,
+        suffix,
+        ulen,
+        tail,
+    };
+    // A head holds its two halves at least; the image is whole words, at
+    // most a group; the tail fits where the head ends.
+    if r.head_len() < 4
+        || ulen == 0
+        || !ulen.is_multiple_of(4)
+        || ulen > ZMAX_ULEN
+        || r.tail_at() > ulen
+        || clen > ulen - r.tail_at()
+    {
+        return Err(REC_CUT);
+    }
+    if i == 0 && (plen != 0 || clen != ulen - r.tail_at()) {
+        return Err(ZError::Walk(
+            "a coded group's first record is not stored whole",
+        ));
+    }
+    Ok(r)
+}
+
+/// Record 0 of a record-coded payload: the head every other record's is
+/// coded against and the tail they are compressed against.
+fn coded_first(payload: &[u8], count: usize) -> Result<(&[u8], &[u8]), ZError> {
+    let r0 = coded_rec(payload, count, 0)?;
+    Ok((r0.suffix, r0.tail))
+}
+
+/// Record `i` of a record-coded group written into `out`, which is the
+/// image's length: the head from the first record's and the suffix, zeros to
+/// the tail, the tail decoded against the first record's.
+fn decode_record_into(
+    payload: &[u8],
+    count: usize,
+    i: usize,
+    head0: &[u8],
+    tail0: &[u8],
+    r: &CodedRec<'_>,
+    out: &mut [u8],
+) -> Result<(), ZError> {
+    debug_assert_eq!(out.len(), r.ulen);
+    let _ = (payload, count, i);
+    if r.plen > head0.len() {
+        return Err(ZError::Walk(
+            "a coded record's prefix is longer than the first head",
+        ));
+    }
+    let head = r.head_len();
+    out[..r.plen].copy_from_slice(&head0[..r.plen]);
+    out[r.plen..head].copy_from_slice(r.suffix);
+    let tail_at = r.tail_at();
+    out[head..tail_at].fill(0);
+    let want = r.ulen - tail_at;
+    if r.tail.len() == want {
+        out[tail_at..].copy_from_slice(r.tail);
+        return Ok(());
+    }
+    let n = lz4_flex::block::decompress_into_with_dict(r.tail, &mut out[tail_at..], tail0)
+        .map_err(|_| ZError::Decode)?;
+    if n != want {
+        return Err(ZError::DecodedLen);
+    }
+    Ok(())
+}
+
+/// Record `i` of a record-coded group of `count` records, decoded into
+/// `buf`: the image, aligned, as `parse_record` reads one.
+pub fn decode_record<'a>(
+    payload: &[u8],
+    count: usize,
+    i: usize,
+    buf: &'a mut GroupBuf,
+) -> Result<&'a [u8], ZError> {
+    let (head0, tail0) = coded_first(payload, count)?;
+    let r = coded_rec(payload, count, i)?;
+    let out = buf.bytes_for(r.ulen);
+    decode_record_into(payload, count, i, head0, tail0, &r, out)?;
+    Ok(out)
+}
+
+/// A record-coded group decoded whole into `buf`: the images end to end,
+/// `ulen` bytes, as the block coding's decode lays them, so everything that
+/// reads a decoded group reads this one.
+pub fn decode_record_group<'a>(
+    payload: &[u8],
+    count: usize,
+    ulen: usize,
+    buf: &'a mut GroupBuf,
+) -> Result<&'a [u8], ZError> {
+    let (head0, tail0) = coded_first(payload, count)?;
+    let out = buf.bytes_for(ulen);
+    let mut at = 0usize;
+    for i in 0..count {
+        let r = coded_rec(payload, count, i)?;
+        let end = at.checked_add(r.ulen).ok_or(REC_CUT)?;
+        let slot = out.get_mut(at..end).ok_or(ZError::DecodedLen)?;
+        decode_record_into(payload, count, i, head0, tail0, &r, slot)?;
+        at = end;
+    }
+    if at != ulen {
+        return Err(ZError::DecodedLen);
+    }
+    Ok(out)
+}
+
+/// The key of a coded record, `head_i[4..]`, compared with `key` without
+/// assembling it: the part the shared prefix holds, then the suffix's.
+fn cmp_coded_key(head0: &[u8], r: &CodedRec<'_>, key: &[u8]) -> Ordering {
+    let a = &head0[r.plen.min(4)..r.plen];
+    let b = &r.suffix[4usize.saturating_sub(r.plen)..];
+    // key_i = a ++ b against key, lexicographically.
+    let n = a.len().min(key.len());
+    match a[..n].cmp(&key[..n]) {
+        Ordering::Equal => {}
+        o => return o,
+    }
+    if key.len() < a.len() {
+        return Ordering::Greater;
+    }
+    b.cmp(&key[n..])
+}
+
+/// Where a key falls in a record-coded group, as [`group_seek`] answers for
+/// a decoded one, with `off` the record's offset in the payload. The heads
+/// are read in order and no record is decoded.
+pub fn record_group_seek(payload: &[u8], count: usize, key: &[u8]) -> Result<GroupPos, ZError> {
+    let (head0, _) = coded_first(payload, count)?;
+    for index in 0..count {
+        let r = coded_rec(payload, count, index)?;
+        let off = usize::from(u16::from_le_bytes([
+            payload[2 * index],
+            payload[2 * index + 1],
+        ]));
+        match cmp_coded_key(head0, &r, key) {
+            Ordering::Less => {}
+            Ordering::Equal => {
+                return Ok(GroupPos {
+                    index,
+                    off,
+                    found: true,
+                })
+            }
+            Ordering::Greater => {
+                return Ok(GroupPos {
+                    index,
+                    off,
+                    found: false,
+                })
+            }
+        }
+    }
+    Ok(GroupPos {
+        index: count,
+        off: payload.len(),
+        found: false,
+    })
+}
+
 /// Where `fill_group` reads record images from: the records of one
 /// partition, in rank order.
 pub trait Images {
@@ -1171,6 +1539,7 @@ struct Accepted {
     pay_at: usize,
     clen: usize,
     stored: bool,
+    coded: bool,
 }
 
 /// The buffers `fill_page` works in, kept between calls so that a page
@@ -1206,6 +1575,12 @@ pub struct FillScratch {
     /// as the sizing tool's sweep does to start a run near its steady
     /// state.
     pub hint: usize,
+    /// The coding tried first for a group that compresses:
+    /// [`ZCODING_BLOCK`], the shape this module's figures were taken on,
+    /// until a caller says [`ZCODING_RECORD`] (`Options::zpages_record_coding`,
+    /// the engine's default), under which a record alone that only the
+    /// block holds is the block's (`compress`).
+    pub coding: u8,
     /// What has been done with this scratch.
     pub stats: FillStats,
 }
@@ -1217,7 +1592,9 @@ impl FillScratch {
         // its input, whatever the data would compress to, so the buffer is
         // sized for the largest group and a group is judged by the length
         // it compressed to.
-        let out = lz4_flex::block::get_maximum_output_size(ZMAX_ULEN);
+        // The record coding's worst case is over the block's: an offset a
+        // record, its fields, and LZ4's fixed overhead once a tail.
+        let out = lz4_flex::block::get_maximum_output_size(ZMAX_ULEN) + 32 * ZMAX_COUNT;
         FillScratch {
             imgs: Vec::with_capacity(ZMAX_ULEN),
             ends: Vec::with_capacity(ZMAX_COUNT),
@@ -1230,6 +1607,7 @@ impl FillScratch {
             grow_rounds: ZGROW_ROUNDS,
             group_bytes: ZGROUP_BYTES,
             hint: 0,
+            coding: ZCODING_BLOCK,
             stats: FillStats::default(),
         }
     }
@@ -1294,7 +1672,7 @@ impl FillScratch {
     /// compressor failed, which a buffer sized for the largest group makes
     /// unreachable.
     fn classify(&mut self, ulen: usize, room: usize) -> Option<Class> {
-        let n = lz4_flex::block::compress_into(&self.imgs[..ulen], &mut self.out).ok()?;
+        let (n, coded) = self.compress(ulen, room)?;
         self.stats.calls += 1;
         Some(if n >= ulen && ulen <= room {
             // LZ4 did not help and the group fits as it is: its own expansion
@@ -1303,8 +1681,28 @@ impl FillScratch {
         } else if n > room {
             Class::TooBig(n)
         } else {
-            Class::Lz4(n)
+            Class::Lz4(n, coded)
         })
+    }
+
+    /// The staged group's payload into `out`: the record coding where it
+    /// is the preference, and one LZ4 block otherwise -- or for a record
+    /// alone whose heads pass the room coded, since a long key LZ4 shrinks
+    /// and a head is never compressed; a group of more records that passes
+    /// the room is trimmed by the caller and tried coded again. The bytes
+    /// and which coding they are. A group the record coding cannot hold in
+    /// the buffer (its offsets past a u16) is reported over the room, with
+    /// nothing of it in `out`, which a `TooBig` never reads.
+    fn compress(&mut self, ulen: usize, room: usize) -> Option<(usize, bool)> {
+        if self.coding == ZCODING_RECORD {
+            let n = encode_record_group(&self.imgs[..ulen], &self.ends, &mut self.out)
+                .unwrap_or(ulen + ulen / 8 + 64 * self.ends.len().max(1));
+            if n <= room || ulen <= room || self.ends.len() > 1 {
+                return Some((n, true));
+            }
+        }
+        let n = lz4_flex::block::compress_into(&self.imgs[..ulen], &mut self.out).ok()?;
+        Some((n, false))
     }
 
     fn decline(&mut self, why: NoPage) -> Fill {
@@ -1356,14 +1754,14 @@ impl FillScratch {
         let img_at = self.page_imgs.len();
         self.page_imgs.extend_from_slice(&self.imgs[..fit.ulen]);
         let pay_at = self.payloads.len();
-        let (clen, stored) = match fit.body {
+        let (clen, stored, coded) = match fit.body {
             Body::Stored => {
                 self.payloads.extend_from_slice(&self.imgs[..fit.ulen]);
-                (fit.ulen, true)
+                (fit.ulen, true, false)
             }
-            Body::Lz4 { clen } => {
+            Body::Lz4 { clen, coded } => {
                 self.payloads.extend_from_slice(&self.out[..clen]);
-                (clen, false)
+                (clen, false, coded)
             }
         };
         self.accepted.push(Accepted {
@@ -1373,6 +1771,7 @@ impl FillScratch {
             pay_at,
             clen,
             stored,
+            coded,
         });
     }
 }
@@ -1393,14 +1792,15 @@ enum Stage {
 
 enum Class {
     Stored,
-    Lz4(usize),
+    /// Compressed to this many bytes, under the record coding where `bool`.
+    Lz4(usize, bool),
     TooBig(usize),
 }
 
 #[derive(Clone, Copy)]
 enum Body {
     Stored,
-    Lz4 { clen: usize },
+    Lz4 { clen: usize, coded: bool },
 }
 
 /// A group that fits the page's room: its records, its decoded bytes and
@@ -1416,7 +1816,7 @@ impl Fit {
     fn body_len(&self) -> usize {
         match self.body {
             Body::Stored => self.ulen,
-            Body::Lz4 { clen } => clen,
+            Body::Lz4 { clen, .. } => clen,
         }
     }
 }
@@ -1637,11 +2037,11 @@ fn fit_cut_group<I: Images + ?Sized>(
                     body: Body::Stored,
                 })
             }
-            Class::Lz4(clen) => {
+            Class::Lz4(clen, coded) => {
                 return Ok(Fit {
                     m,
                     ulen,
-                    body: Body::Lz4 { clen },
+                    body: Body::Lz4 { clen, coded },
                 })
             }
             Class::TooBig(c) => {
@@ -1698,10 +2098,10 @@ fn fallback<I: Images + ?Sized>(
             ulen,
             body: Body::Stored,
         }),
-        Class::Lz4(clen) => Ok(Fit {
+        Class::Lz4(clen, coded) => Ok(Fit {
             m: 1,
             ulen,
-            body: Body::Lz4 { clen },
+            body: Body::Lz4 { clen, coded },
         }),
         Class::TooBig(_) => Err(NoFit::Decline(NoPage::Incompressible)),
     }
@@ -1765,11 +2165,11 @@ fn fit_one_group<I: Images + ?Sized>(
                 });
                 break;
             }
-            Class::Lz4(clen) => {
+            Class::Lz4(clen, coded) => {
                 found = Some(Fit {
                     m,
                     ulen,
-                    body: Body::Lz4 { clen },
+                    body: Body::Lz4 { clen, coded },
                 });
                 break;
             }
@@ -1836,11 +2236,11 @@ fn fit_one_group<I: Images + ?Sized>(
                 };
                 s.drop_held();
             }
-            Class::Lz4(clen) => {
+            Class::Lz4(clen, coded) => {
                 fit = Fit {
                     m: m2,
                     ulen,
-                    body: Body::Lz4 { clen },
+                    body: Body::Lz4 { clen, coded },
                 };
                 s.drop_held();
             }
@@ -1862,7 +2262,7 @@ impl FillScratch {
     /// where `unhold` restores them to the output buffer and `drop_held`
     /// forgets them.
     fn hold(&mut self, fit: Fit) {
-        if let Body::Lz4 { clen } = fit.body {
+        if let Body::Lz4 { clen, .. } = fit.body {
             let at = self.payloads.len();
             self.payloads.extend_from_slice(&self.out[..clen]);
             self.held = Some((at, clen));
@@ -1870,7 +2270,7 @@ impl FillScratch {
     }
 
     fn unhold(&mut self, fit: Fit) {
-        if let (Body::Lz4 { clen }, Some((at, n))) = (fit.body, self.held.take()) {
+        if let (Body::Lz4 { clen, .. }, Some((at, n))) = (fit.body, self.held.take()) {
             debug_assert_eq!(clen, n);
             self.out[..n].copy_from_slice(&self.payloads[at..at + n]);
             self.payloads.truncate(at);
@@ -1913,6 +2313,7 @@ fn seal_page(
             payload: &s.payloads[a.pay_at..a.pay_at + a.clen],
             ulen: a.ulen as u32,
             stored: a.stored,
+            coded: a.coded,
             key: s.key_of(j),
         })
         .collect();
@@ -2986,6 +3387,7 @@ mod tests {
                 payload,
                 ulen: group.len() as u32,
                 stored,
+                coded: false,
                 key,
             })
             .collect();
@@ -3012,6 +3414,313 @@ mod tests {
             .map(|i| one_value(format!("{i:016}").as_bytes(), &rng.bytes(100)))
             .collect();
         vec![(compressible, false), (entropy, true)]
+    }
+
+    // ---- the record coding ---------------------------------------------
+
+    /// Groups of every shape the module's tests know, each as its images in
+    /// key order: the suite's, entropy that does not compress, the empty
+    /// key first, long keys, and records of every extent shape.
+    fn coding_groups() -> Vec<Vec<Vec<u8>>> {
+        let mut rng = Rng::new(29);
+        let mut v: Vec<Vec<Vec<u8>>> = small_groups().into_iter().map(|(g, _)| g).collect();
+        v.push(suite_images(16, 5));
+        v.push(suite_images(1, 6));
+        let mut empty_first = vec![one_value(b"", b"v")];
+        empty_first.extend(suite_images(5, 7));
+        v.push(empty_first);
+        let long: Vec<Vec<u8>> = (0..6u8)
+            .map(|i| one_value(&[0x61 + i].repeat(300 + 7 * usize::from(i)), &rng.bytes(40)))
+            .collect();
+        v.push(long);
+        let recs = sorted_records(&mut rng, 20);
+        let shapes: Vec<Vec<u8>> = recs
+            .iter()
+            .map(|(k, _)| random_image(&mut rng, k))
+            .collect();
+        v.push(shapes);
+        v
+    }
+
+    fn coded(imgs: &[Vec<u8>]) -> (Vec<u8>, Vec<usize>, Vec<u8>) {
+        let mut all = Vec::new();
+        let mut ends = Vec::new();
+        for im in imgs {
+            all.extend_from_slice(im);
+            ends.push(all.len());
+        }
+        let mut out = vec![0u8; 2 * ZMAX_ULEN];
+        let n = encode_record_group(&all, &ends, &mut out).expect("the group codes");
+        out.truncate(n);
+        (all, ends, out)
+    }
+
+    #[test]
+    fn the_record_coding_round_trips_and_seeks_as_the_decoded_group() {
+        for imgs in coding_groups() {
+            let (all, ends, payload) = coded(&imgs);
+            let count = imgs.len();
+            let mut buf = GroupBuf::new();
+            let whole = decode_record_group(&payload, count, all.len(), &mut buf).unwrap();
+            assert_eq!(whole, &all[..], "the group decoded whole");
+            for (i, im) in imgs.iter().enumerate() {
+                let mut b = GroupBuf::new();
+                assert_eq!(
+                    decode_record(&payload, count, i, &mut b).unwrap(),
+                    &im[..],
+                    "record {i}"
+                );
+            }
+            // Every key, the key after each (a zero appended), the empty
+            // key, one below every digit and one past every key.
+            let keys: Vec<&[u8]> = imgs.iter().map(|im| record_key(im, 0).unwrap()).collect();
+            let mut probes: Vec<Vec<u8>> = Vec::new();
+            for k in &keys {
+                probes.push(k.to_vec());
+                let mut up = k.to_vec();
+                up.push(0);
+                probes.push(up);
+            }
+            probes.push(Vec::new());
+            probes.push(vec![0x00]);
+            probes.push(vec![0xff; 400]);
+            for p in &probes {
+                let want = group_seek(&all, count, p).unwrap();
+                let got = record_group_seek(&payload, count, p).unwrap();
+                assert_eq!(
+                    (got.index, got.found),
+                    (want.index, want.found),
+                    "probe {p:?}"
+                );
+                if got.index < count {
+                    let off =
+                        u16::from_le_bytes([payload[2 * got.index], payload[2 * got.index + 1]]);
+                    assert_eq!(
+                        got.off,
+                        usize::from(off),
+                        "off names the record in the payload"
+                    );
+                } else {
+                    assert_eq!(got.off, payload.len());
+                }
+            }
+            // No room is a refusal, never a short payload.
+            let mut small = vec![0u8; 12];
+            assert!(encode_record_group(&all, &ends, &mut small).is_none());
+        }
+    }
+
+    #[test]
+    fn the_record_coding_is_near_the_block_codings_size_on_the_suites_records() {
+        let imgs = suite_images(16, 21);
+        let (all, _, payload) = coded(&imgs);
+        let block = lz4_flex::block::compress(&all);
+        assert!(
+            payload.len() <= block.len() * 6 / 5,
+            "coded {} against the block's {}",
+            payload.len(),
+            block.len()
+        );
+        assert!(
+            payload.len() < all.len(),
+            "the coding compresses the suite's records"
+        );
+    }
+
+    /// Where record `i`'s single-byte fields lie in a payload of the suite's
+    /// records: plen, slen, the ulen and the clen after the suffix.
+    fn fields_of(payload: &[u8], i: usize) -> (usize, usize, usize, usize) {
+        let off = usize::from(u16::from_le_bytes([payload[2 * i], payload[2 * i + 1]]));
+        let slen = usize::from(payload[off + 1]);
+        let ulen_at = off + 2 + slen;
+        (off, off + 1, ulen_at, ulen_at + 1)
+    }
+
+    #[test]
+    fn a_coded_group_that_lies_is_refused() {
+        let imgs = suite_images(8, 9);
+        let (all, _, payload) = coded(&imgs);
+        let count = imgs.len();
+        let refused = |p: &[u8], what: &str| {
+            let mut b = GroupBuf::new();
+            assert!(
+                decode_record_group(p, count, all.len(), &mut b).is_err(),
+                "{what}: whole"
+            );
+        };
+        // An offset past the payload, and one into the table.
+        let mut p = payload.clone();
+        p[6..8].copy_from_slice(&0xfff0u16.to_le_bytes());
+        refused(&p, "an offset past the payload");
+        let mut b = GroupBuf::new();
+        assert!(decode_record(&p, count, 3, &mut b).is_err());
+        assert!(record_group_seek(&p, count, b"0000000000000003").is_err());
+        let mut p = payload.clone();
+        p[6..8].copy_from_slice(&2u16.to_le_bytes());
+        refused(&p, "an offset into the table");
+        // A prefix longer than the first head.
+        let mut p = payload.clone();
+        let (plen_at, _, _, _) = fields_of(&payload, 2);
+        p[plen_at] = 60;
+        refused(&p, "a prefix past the first head");
+        let mut b = GroupBuf::new();
+        assert!(decode_record(&p, count, 2, &mut b).is_err());
+        // An image length that is not whole words, and one the tail passes.
+        let mut p = payload.clone();
+        let (_, _, ulen_at, _) = fields_of(&payload, 1);
+        p[ulen_at] += 1;
+        refused(&p, "ulen not a multiple of four");
+        let mut p = payload.clone();
+        p[ulen_at] = 4;
+        refused(&p, "a tail past its image");
+        // A compressed tail cut short decodes to the wrong length or not at
+        // all; the first record coded against anything is not the
+        // dictionary.
+        let mut p = payload.clone();
+        let (_, _, _, clen_at) = fields_of(&payload, 1);
+        assert!(
+            usize::from(p[clen_at]) < imgs[1].len(),
+            "record 1 is compressed"
+        );
+        p[clen_at] -= 1;
+        refused(&p, "a tail cut short");
+        let mut p = payload.clone();
+        let (plen_at, _, _, _) = fields_of(&payload, 0);
+        p[plen_at] = 1;
+        refused(&p, "the first record not stored whole");
+        // What was not touched still decodes.
+        let mut b = GroupBuf::new();
+        assert_eq!(
+            decode_record_group(&payload, count, all.len(), &mut b).unwrap(),
+            &all[..]
+        );
+    }
+
+    #[test]
+    fn a_page_of_the_record_coding_is_read_as_one_of_the_block_coding() {
+        let imgs = suite_images(40, 31);
+        let (all, _, payload) = coded(&imgs);
+        let count = imgs.len() as u16;
+        let bind = 0x5151_0001;
+        let block = lz4_flex::block::compress(&all);
+        for coding in [ZCODING_RECORD, ZCODING_BLOCK] {
+            let pay: &[u8] = if coding == ZCODING_RECORD {
+                &payload
+            } else {
+                &block
+            };
+            let coded = coding == ZCODING_RECORD;
+            let groups = [PageGroup {
+                count,
+                payload: pay,
+                ulen: all.len() as u32,
+                stored: false,
+                coded,
+                key: b"",
+            }];
+            let mut page = [0u8; ZPAGE];
+            encode_page(&mut page, 0, &groups, bind).unwrap();
+            let view = parse_page(&page, bind).unwrap();
+            let g = view.group(0).unwrap();
+            assert_eq!((g.coded, g.ulen as usize), (coded, all.len()));
+            let mut buf = GroupBuf::new();
+            assert_eq!(decode_group(&view, 0, &mut buf).unwrap(), &all[..]);
+            assert!(walk_group(&all, imgs.len(), record_key(&imgs[0], 0), None).is_ok());
+        }
+        // A stored group is never coded: refused by the encoder, and by the
+        // view when the bit is set on one after the fact. A smaller group,
+        // since stored it must fit the page as it is.
+        let small = suite_images(16, 32);
+        let (all, _, _) = coded(&small);
+        let count = small.len() as u16;
+        let stored = [PageGroup {
+            count,
+            payload: &all,
+            ulen: all.len() as u32,
+            stored: true,
+            coded: true,
+            key: b"",
+        }];
+        let mut page = [0u8; ZPAGE];
+        assert!(encode_page(&mut page, 0, &stored, bind).is_err());
+        let stored = [PageGroup {
+            coded: false,
+            ..stored[0]
+        }];
+        encode_page(&mut page, 0, &stored, bind).unwrap();
+        let at = ZHDR + D_ULEN4;
+        let word = u16::from_le_bytes([page[at], page[at + 1]]) | D_CODED;
+        page[at..at + 2].copy_from_slice(&word.to_le_bytes());
+        resign_page(&mut page, bind);
+        assert!(matches!(parse_page(&page, bind), Err(ZError::Header(_))));
+    }
+
+    #[test]
+    fn the_fill_under_the_record_coding_builds_pages_the_reader_decodes() {
+        let imgs = suite_images(500, 41);
+        let mut s = FillScratch::new();
+        s.coding = ZCODING_RECORD;
+        let bind = 0x7777_0002;
+        let mut rank = 0usize;
+        let mut page = [0u8; ZPAGE];
+        let mut buf = GroupBuf::new();
+        let mut seen = 0usize;
+        let mut stored_groups = 0usize;
+        let mut groups = 0usize;
+        while rank < imgs.len() {
+            let Fill::Page(built) = fill_page(&imgs, rank, bind, &mut s, &mut page) else {
+                panic!("a page at rank {rank}");
+            };
+            groups += built.groups;
+            let view = parse_page(&page, bind).unwrap();
+            let mut at = rank;
+            for j in 0..view.groups() {
+                let g = view.group(j).unwrap();
+                assert_eq!(
+                    g.coded, !g.stored,
+                    "a compressed group of the suite's is coded"
+                );
+                let n = usize::from(g.count);
+                let dec = decode_group(&view, j, &mut buf).unwrap();
+                let mut want = Vec::new();
+                for im in &imgs[at..at + n] {
+                    want.extend_from_slice(im);
+                }
+                assert_eq!(dec, &want[..], "page at {rank}, group {j}");
+                // A point read of every record of a coded group decodes it
+                // alone; a group the coding did not shrink is stored verbatim
+                // under either coding, and is sought as a decoded group.
+                let payload = view.payload(j).unwrap();
+                for (k, im) in imgs[at..at + n].iter().enumerate() {
+                    let key = record_key(im, 0).unwrap();
+                    if g.stored {
+                        stored_groups += 1;
+                        let pos = group_seek(dec, n, key).unwrap();
+                        assert!(pos.found && pos.index == k);
+                        continue;
+                    }
+                    let pos = record_group_seek(payload, n, key)
+                        .unwrap_or_else(|e| panic!("seek in a coded group: {e:?}"));
+                    assert!(
+                        pos.found && pos.index == k,
+                        "record {k} of {n} at rank {at}: {pos:?}, key {:?}",
+                        String::from_utf8_lossy(key)
+                    );
+                    let mut b = GroupBuf::new();
+                    assert_eq!(decode_record(payload, n, k, &mut b).unwrap(), &im[..]);
+                }
+                at += n;
+            }
+            seen += built.count;
+            rank += built.count;
+        }
+        assert_eq!(seen, imgs.len());
+        // The suite's records compress under the coding: the groups stored
+        // verbatim are the odd one the fill could not grow, not the rule.
+        assert!(
+            stored_groups * 4 < groups,
+            "{stored_groups} of {groups} groups stored verbatim"
+        );
     }
 
     // ---- constants ------------------------------------------------------
@@ -3730,6 +4439,7 @@ mod tests {
             payload: &payload,
             ulen: 8,
             stored: false,
+            coded: false,
             key: b"a",
         };
         fn one<'a>(bad: PageGroup<'a>) -> Vec<PageGroup<'a>> {
@@ -3798,6 +4508,7 @@ mod tests {
         // A stored group with the lengths agreeing is written.
         let stored = PageGroup {
             stored: true,
+            coded: false,
             ulen: 4,
             ..g
         };
@@ -3923,7 +4634,7 @@ mod tests {
         );
         let b = t.encode();
         assert_eq!(&b[0..8], b"SUPDZPG2");
-        assert_eq!(le32(&b, 8), 1, "version");
+        assert_eq!(le32(&b, 8), 2, "version");
         assert_eq!(le32(&b, 12), 4096, "page size");
         for (at, want) in [
             (16, t.n_pages),
@@ -4075,9 +4786,14 @@ mod tests {
             "a filter with no probes"
         );
         assert!(inconsistent(bad(&|b| b[208] = 0)), "a filter with no bits");
-        // A version or a page size the CRC covers is refused before it.
+        // A version or a page size the CRC covers is refused before it: a
+        // version this reader does not know, and the one before, whose
+        // files it rebuilds.
         let mut b = base;
-        b[8] = 2;
+        b[8] = 3;
+        assert_eq!(Trailer::decode(&b), Err(ZError::Version));
+        let mut b = base;
+        b[8] = 1;
         assert_eq!(Trailer::decode(&b), Err(ZError::Version));
         let mut b = base;
         b[12..16].copy_from_slice(&16_384u32.to_le_bytes());
@@ -5651,10 +6367,10 @@ mod tests {
         s.reset_page();
         assert!(matches!(s.stage(images, 0, m), Stage::Ok));
         let ulen = s.imgs.len();
-        let Some(Class::Lz4(clen)) = s.classify(ulen, ZCAP) else {
+        let Some(Class::Lz4(clen, coded)) = s.classify(ulen, ZCAP) else {
             panic!("{m} of the suite's records compress into a page")
         };
-        let body = Body::Lz4 { clen };
+        let body = Body::Lz4 { clen, coded };
         (s, Fit { m, ulen, body })
     }
 
@@ -5691,7 +6407,7 @@ mod tests {
         // page is signed either way and only the comparison can refuse it:
         // it must agree, byte by byte, with an oracle that decodes the
         // damaged block itself.
-        let Body::Lz4 { clen } = fit.body else {
+        let Body::Lz4 { clen, .. } = fit.body else {
             unreachable!()
         };
         let mut harmful = 0;
@@ -5738,7 +6454,10 @@ mod tests {
         // A fit no page can describe, a payload over a page, is no page.
         let (mut s, fit) = fit_of(&images, 30);
         let huge = Fit {
-            body: Body::Lz4 { clen: ZCAP + 1 },
+            body: Body::Lz4 {
+                clen: ZCAP + 1,
+                coded: false,
+            },
             ..fit
         };
         assert_eq!(seal(&mut s, huge), Fill::Mismatch);
@@ -5749,14 +6468,14 @@ mod tests {
         s.accept(fit);
         assert!(matches!(s.stage(&images, 30, 20), Stage::Ok));
         let ulen = s.imgs.len();
-        let Some(Class::Lz4(clen)) = s.classify(ulen, ZCAP) else {
+        let Some(Class::Lz4(clen, coded)) = s.classify(ulen, ZCAP) else {
             panic!()
         };
         s.imgs[ulen - 3] ^= 1;
         s.accept(Fit {
             m: 20,
             ulen,
-            body: Body::Lz4 { clen },
+            body: Body::Lz4 { clen, coded },
         });
         assert_eq!(seal_page(&mut s, 0, 2, bind, &mut page), Fill::Mismatch);
     }

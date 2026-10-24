@@ -164,6 +164,10 @@ struct Cfg {
     /// (`Options::zpages_block_cursor`); off in some seeds under
     /// `ZFUZZ_OPTVARY`, so the shape before is read against the model too.
     block_cursor: bool,
+    /// The form file's groups coded record by record
+    /// (`Options::zpages_record_coding`); off in some seeds under
+    /// `ZFUZZ_OPTVARY`, so the block coding is read against the model too.
+    record_coding: bool,
 }
 
 /// Whether a seed runs with the block cache on. The chance is drawn whenever
@@ -213,6 +217,7 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         trusted: !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15)),
         memo_first: std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15),
         block_cursor: !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15)),
+        record_coding: !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25)),
     }
 }
 
@@ -230,6 +235,7 @@ fn opts(c: &Cfg) -> Options {
         zpages_trusted_views: c.trusted,
         zpages_memo_first: c.memo_first,
         zpages_block_cursor: c.block_cursor,
+        zpages_record_coding: c.record_coding,
         ..Options::default()
     };
     if let Some(i) = c.inline_bytes {

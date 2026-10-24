@@ -2583,12 +2583,26 @@ fn no_raw_touches(name: &str, cache: bool, via_form: bool) -> u64 {
 /// the memo takes the group, the rest hit, so the decodes are a page each
 /// and the hits the rest, on the writer and a handle alike since the memo
 /// is the thread's. With it off every read of a compressed page decodes
-/// and the memo counts nothing.
+/// and the memo counts nothing. The memo serves groups decoded whole, the
+/// block coding's point read; under the record coding a point read of a
+/// verified page decodes its one record and asks the memo nothing, so the
+/// memo is never hit and every read decodes, with the memo on or off.
 #[test]
 fn the_memo_serves_repeated_reads_of_a_partition_and_off_every_read_decodes() {
-    for memo in [true, false] {
-        let dir = scratch(if memo { "memo-on" } else { "memo-off" });
-        let mut db = Db::create(&dir, forced(|o| o.zpages_memo = memo)).unwrap();
+    for (memo, record) in [(true, false), (false, false), (true, true), (false, true)] {
+        let dir = scratch(&format!(
+            "memo-{}-{}",
+            if memo { "on" } else { "off" },
+            if record { "record" } else { "block" }
+        ));
+        let mut db = Db::create(
+            &dir,
+            forced(|o| {
+                o.zpages_memo = memo;
+                o.zpages_record_coding = record;
+            }),
+        )
+        .unwrap();
         let model = ordered_load(&mut db, 4000, 0x3E0);
         db.zpages_settle().unwrap();
         let c0 = db.zpage_counts();
@@ -2616,7 +2630,17 @@ fn the_memo_serves_repeated_reads_of_a_partition_and_off_every_read_decodes() {
         let c = db.zpage_counts();
         let (reads, decodes) = (c.reads - c0.reads, c.decodes - c0.decodes);
         assert_eq!(reads, 6000, "{c:?}");
-        if memo {
+        if record {
+            // The one-record point read: no memo asked once a page is
+            // verified, a decode a read; the memo's misses are the pages'
+            // first decodes, through the group opened whole.
+            assert_eq!(
+                c.memo_hits, 0,
+                "no read of a verified page asks the memo: {c:?}"
+            );
+            assert!(c.memo_misses <= 2 * 16 * c0.pages, "{c:?}");
+            assert_eq!(decodes, reads, "every read decodes its record: {c:?}");
+        } else if memo {
             assert_eq!(
                 c.memo_hits + c.memo_misses,
                 reads,

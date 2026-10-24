@@ -224,6 +224,19 @@ group decode.
   group's first record as the dictionary, no segment dictionary needed; the
   segment dictionary appended to it is the arm, a trailer slot that an
   empty dictionary leaves as the local shape.
+- **Built: the record coding** (`Options::zpages_record_coding`, on;
+  `stage4.md`, "The record coding in the engine"): a group's records one by
+  one, each decodable alone, the choice per group in the directory entry's
+  spare bit, the trailer at version 2; a point read of a verified page seeks
+  the heads and decodes one record (`ZFile::locate`), scans decode groups
+  whole through the memo as before; the block coding is the arm
+  (`supdb-cache64tofitautozpagesblock`, `supdb-nocachezpagesblock`). The
+  sizing tool at 300k keys: the form 14% larger (87 against 76 B a key),
+  the fill 1.5x slower, a group decoded whole through its records 2.4x the
+  block's hot and 1.6x cold, a point read's one record about a sixth of a
+  group. The plan's per-page coding was wrong (a 5,000-byte key the block
+  compresses and a head never is) and so was the memo test's invariant for
+  this coding; both are in the record. Not yet paired in the suite: step 3.
 - **Untouched**: the shuffled-load kill of the combined arm under 640 MiB
   and the gear shift, as the session before left them.
 

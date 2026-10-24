@@ -52,11 +52,14 @@ fence, the trailer, the filter, the fill's loop (`fill_page`,
 `fit_one_group`, `seal_page`, `page_decodes_to`), the attach, the controller.
 A group's payload is opaque to all of it: `stored` or one LZ4 block today.
 
-What changes: a third payload coding, per page, in the header's spare byte
-(`P_ZERO` becomes the coding: 0 the block, 1 per record), checked to those
-two values; the trailer's `ZVERSION` moves to 2 so a reader from before
-refuses the file at its trailer and rebuilds it (a derived file), and this
-reader refuses version 1 the same way. The record-coded payload of a group
+What changes: a third payload coding, per group, in the high bit of the
+directory entry's decoded-length word (`D_CODED`; the length never reaches
+it), since the first build found a record alone whose head passes a page --
+a 5,000-byte key the block coding compressed and a head never is -- and the
+fill falls back to one block for exactly that group; the header's spare
+byte stays zero. The trailer's `ZVERSION` moves to 2 so a reader from
+before refuses the file at its trailer and rebuilds it (a derived file),
+and this reader refuses version 1 the same way. The record-coded payload of a group
 of `n` images:
 
     [u16 off_i; n]                        payload offsets of the records

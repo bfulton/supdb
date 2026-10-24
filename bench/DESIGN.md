@@ -324,6 +324,11 @@ combined arm with every view of a form file's page checked and the memo
 asked after it (`Options::zpages_trusted_views` off), where the default
 reads a verified page's directory trusted, and `supdb-nocachezpagescheckedviews`
 is the forced arm with the same, the pair against `supdb-nocachezpages`;
+`supdb-cache64tofitautozpagesblock` is the combined arm with the form
+file's groups as one LZ4 block each (`Options::zpages_record_coding` off),
+where the default holds a group's records one by one, each decodable alone,
+and `supdb-nocachezpagesblock` is the forced arm with the same, the pair
+against `supdb-nocachezpages`;
 `supdb-cache64tofitautozpagesmemofirst` is the combined arm with a
 verified page's group asked of the memo before any view of the page
 (`Options::zpages_memo_first`), where the default asks after it;

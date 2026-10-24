@@ -1091,6 +1091,18 @@ pub struct Options {
     /// for a decode a seventh.
     #[doc(hidden)]
     pub zpages_group_bytes: usize,
+    /// Whether a form file's groups hold their records one by one, each
+    /// decodable alone (`zpages::ZCODING_RECORD`: an offset table, each
+    /// record's head front-coded against the group's first and its tail
+    /// LZ4-compressed against the first record's, which is stored raw), so
+    /// that a point read decodes one record and a scan decodes the records
+    /// it emits, where the block coding (`zpages::ZCODING_BLOCK`, the shape
+    /// before) decodes a group of about fourteen records for either. The
+    /// probe that chose it is `bench/examples/zrec.rs`;
+    /// `supdb-cache64tofitautozpagesblock` and `supdb-nocachezpagesblock`
+    /// are the block coding's arms.
+    #[doc(hidden)]
+    pub zpages_record_coding: bool,
     /// Whether the controller buys its first form at SUSPECT on the model's
     /// prediction, once the sampler has priced it and the partitions have
     /// stood for `zselect::EAGER_SETTLE` with nothing of the segment work in
@@ -2493,6 +2505,18 @@ pub struct Options {
     pub forms_trim_bytes: usize,
 }
 
+impl Options {
+    /// The form file's group coding the options ask for
+    /// (`zpages_record_coding`), as the builder's plan and the sampler take it.
+    pub(crate) fn z_coding(&self) -> u8 {
+        if self.zpages_record_coding {
+            zpages::ZCODING_RECORD
+        } else {
+            zpages::ZCODING_BLOCK
+        }
+    }
+}
+
 impl Default for Options {
     fn default() -> Options {
         Options {
@@ -2553,6 +2577,7 @@ impl Default for Options {
             zpages_build_ahead: 4 << 20,
             zpages_prebuild: false,
             zpages_group_bytes: zpages::ZGROUP_BYTES,
+            zpages_record_coding: true,
             zpages_build_eager: false,
             zpages_inject: None,
             forms_pieces_only: false,
@@ -26110,6 +26135,7 @@ impl Db {
                     zfile::BuildPlan::new(self.opts.zpages_min_bytes, self.opts.zpages_drop_behind);
                 plan.ahead = self.opts.zpages_build_ahead;
                 plan.group_bytes = self.opts.zpages_group_bytes;
+                plan.coding = self.opts.z_coding();
                 plan
             })
         };
@@ -32858,6 +32884,7 @@ impl Maint {
         };
         let floor = self.opts.zpages_min_bytes;
         let group_bytes = self.opts.zpages_group_bytes;
+        let coding = self.opts.z_coding();
         let wake = self.wake.clone();
         zfile::ZEvents::add(&self.shared.z.samples, 1);
         let io_idle = self.opts.zpages_io_idle;
@@ -32872,9 +32899,14 @@ impl Maint {
                     .into_iter()
                     .map(|s| {
                         let r = match (Db::name_id(&s.name), Db::name_end_seq(&s.name)) {
-                            (Some(id), Some(end)) => {
-                                zfile::sample(s.blob.for_zfile(), id, end, floor, group_bytes)
-                            }
+                            (Some(id), Some(end)) => zfile::sample(
+                                s.blob.for_zfile(),
+                                id,
+                                end,
+                                floor,
+                                group_bytes,
+                                coding,
+                            ),
                             _ => Err(err("z sample: a partition without an id")),
                         };
                         (s, r)
@@ -33529,6 +33561,7 @@ impl Maint {
             zfile::BuildPlan::new(self.opts.zpages_min_bytes, self.opts.zpages_drop_behind);
         plan.ahead = self.opts.zpages_build_ahead;
         plan.group_bytes = self.opts.zpages_group_bytes;
+        plan.coding = self.opts.z_coding();
         plan.cancel = Some(cancel.clone());
         plan.hold = Some(shared.zbuild_hold.clone());
         let fail = shared.fail_zbuild.swap(false, AtomicOrdering::AcqRel);
