@@ -511,7 +511,28 @@ and the cycling figure is a read's; liblz4 against `lz4_flex` read
 0.76-0.83 hot and 0.83-0.91 cycling. Time a decoder, a parser or any
 branchy walk over more distinct inputs than the predictor holds, a few
 hundred pages here (`bench/examples/zdecode.rs`, `--pages`), and read
-the figure where it has stopped climbing.
+the figure where it has stopped climbing. And read a cold figure as the
+predictor's before reading it as the memory's: the E mix's decodes ran at
+exactly that cycling figure, a microsecond a group against 0.27 hot, and
+the obvious lever -- the group's lines asked for ahead, at the view, at
+the fence, the whole page -- bought a tenth of a decode at most and made
+the whole page slower (`bench/examples/zlines.rs`), where fewer tokens
+to parse did (`zdecode --hc`: liblz4's high-compression mode, 16% off
+the cold decode and 4% off the form at level 9). A software prefetch is
+a lever on a stall the profile shows as a load; a cold decode's stall is
+its branches. And a self time is read as misses only after the
+structure's size is read against the cache per instance, not per store:
+the fence's search was a twentieth of E's thread and was taken for a
+binary search over 93,000 entries missing on two lines a probe, so a tree
+over the entries' words was built, one line a level and prefetched three
+ahead (`Options::zpages_fence_tree`); profiled arm against arm the search
+took more of the thread with the tree than without, because the store's
+fences are nineteen of 4,900 entries, a hundred kilobytes each and in L2
+for the partitions a Zipfian reads, and a search that was instructions
+and L2 hits had no misses for a tree to save. A lever on misses is held to
+the profile of the arm pair, where the symbol it is aimed at loses its
+samples or does not; a pairing resolves nothing under a tenth and an
+instruction count sees no miss.
 
 A pass that reads bimodal across rounds is two shapes, not noise. The
 run keeper's lag pass at ten thousand keys read 2 µs a scan in four

@@ -1302,6 +1302,25 @@ impl Memo {
         self.free.pop().unwrap_or_default()
     }
 
+    /// The entry a put for `(zfile, page, index)` would displace, the line
+    /// its `Arc`'s counts and buffer header sit in asked for ahead of the
+    /// decode whose put recycles it (`recycle`); nothing where the slot is
+    /// empty or the slots are not made. The counts sit just before the
+    /// group in the `Arc`'s allocation.
+    fn prefetch_victim(&self, zfile: u64, page: u32, index: u8, hashed: bool) {
+        if self.slots.is_empty() {
+            return;
+        }
+        let i = self.slot(zfile, page, index, hashed);
+        if let Some(e) = &self.slots[i] {
+            let p = Arc::as_ptr(&e.group) as *const u8;
+            // SAFETY-free: a prefetch is a hint that faults on no address,
+            // and the address is the allocation's start, sixteen bytes
+            // before the data an `Arc` points at.
+            super::prefetch_lines(p.wrapping_sub(16), 80);
+        }
+    }
+
     fn slot(&self, zfile: u64, page: u32, index: u8, hashed: bool) -> usize {
         if !hashed {
             // The shape before the hash (`Options::zpages_memo_hash` off):
@@ -1483,6 +1502,13 @@ impl ZMemo {
     }
 
     #[inline]
+    /// `Memo::prefetch_victim`, through the cell.
+    fn prefetch_victim(&self, zfile: u64, page: u32, index: u8, hashed: bool) {
+        self.memo
+            .borrow()
+            .prefetch_victim(zfile, page, index, hashed);
+    }
+
     fn touch(&self, zfile: u64, page: u32, n_pages: usize) {
         if self.track.get() {
             self.memo.borrow_mut().touch(zfile, page, n_pages);
@@ -1580,6 +1606,10 @@ pub(super) struct ZFile {
     /// (`Options::zpages_memo_first`, `ZFile::open_group`).
     trusted: bool,
     memo_first: bool,
+    /// Whether a decode asks for the line of the memo entry its put will
+    /// displace before it begins (`Options::zpages_memo_ahead`,
+    /// `ZFile::open_group`).
+    memo_ahead: bool,
     /// Whether a scan asks for the pages it will cross after its first
     /// (`Options::zpages_scan_prefetch`).
     prefetch: bool,
@@ -1615,6 +1645,9 @@ impl ZFile {
     /// absent with nothing raised, so each is an identity refusal.
     ///
     /// `advise` maps the file `MADV_RANDOM`, before its own sampled reads.
+    /// `fence_tree` builds the fence's search tree (`ZFence::index`,
+    /// `Options::zpages_fence_tree`); `memo_ahead` is
+    /// `Options::zpages_memo_ahead`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn attach(
         path: &Path,
@@ -1626,6 +1659,8 @@ impl ZFile {
         prefetch: bool,
         trusted: bool,
         memo_first: bool,
+        fence_tree: bool,
+        memo_ahead: bool,
     ) -> std::result::Result<ZFile, Reject> {
         let memo = memo.into();
         let damage = |e: ZError| Reject::Damage(e.to_string());
@@ -1673,7 +1708,10 @@ impl ZFile {
         let res = map
             .slice_at(t.res_off, res_len)
             .ok_or_else(|| damage(ZError::Length))?;
-        let (fence, filter) = ZFence::decode_resident(res, &t).map_err(damage)?;
+        let (mut fence, filter) = ZFence::decode_resident(res, &t).map_err(damage)?;
+        if fence_tree {
+            fence.index();
+        }
         let filter = if t.filter {
             Some(engine_filter(&t, filter, &fence, nkeys)?)
         } else {
@@ -1701,6 +1739,7 @@ impl ZFile {
             memo_hashed: memo == MemoShape::Hashed,
             trusted,
             memo_first,
+            memo_ahead,
             prefetch,
             #[cfg(test)]
             skewed: None,
@@ -1846,6 +1885,14 @@ impl ZFile {
                         false,
                     ));
                 }
+            }
+            // The entry this decode's put will displace, its line asked for
+            // now: the put tries the displaced group's `Arc` for its last
+            // reference, a load of a line last touched when that entry was
+            // made, thousands of decodes ago, and the decode is long enough
+            // to bring it (`Options::zpages_memo_ahead`).
+            if self.memo_ahead {
+                memo.prefetch_victim(self.id, entry.page, index, self.memo_hashed);
             }
             let mut fresh = memo.fresh_buf();
             let (first, count, ulen) = {
@@ -4302,7 +4349,7 @@ mod tests {
 
         fn attach(&self) -> std::result::Result<ZFile, Reject> {
             ZFile::attach(
-                &self.out, &self.blob, ID, END, false, true, false, true, false,
+                &self.out, &self.blob, ID, END, false, true, false, true, false, false, true,
             )
         }
 
@@ -4314,7 +4361,20 @@ mod tests {
             prefetch: bool,
         ) -> std::result::Result<ZFile, Reject> {
             ZFile::attach(
-                &self.out, &self.blob, ID, END, advise, memo, prefetch, true, false,
+                &self.out, &self.blob, ID, END, advise, memo, prefetch, true, false, false, true,
+            )
+        }
+
+        /// Attached with the fence's tree and the memo's victim hint as
+        /// given (`Options::zpages_fence_tree`, `Options::zpages_memo_ahead`).
+        fn attach_lines(
+            &self,
+            fence_tree: bool,
+            memo_ahead: bool,
+        ) -> std::result::Result<ZFile, Reject> {
+            ZFile::attach(
+                &self.out, &self.blob, ID, END, false, true, false, true, false, fence_tree,
+                memo_ahead,
             )
         }
 
@@ -4325,7 +4385,7 @@ mod tests {
         /// page's group is served as it was decoded while it holds.
         fn attach_nomemo(&self) -> std::result::Result<ZFile, Reject> {
             ZFile::attach(
-                &self.out, &self.blob, ID, END, false, false, false, true, false,
+                &self.out, &self.blob, ID, END, false, false, false, true, false, false, true,
             )
         }
 
@@ -4436,6 +4496,23 @@ mod tests {
             agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
             assert_eq!(zfile.verified_pages(), before, "{name}");
             assert_eq!(zfile.bad_pages(), 0, "{name}");
+        }
+    }
+
+    /// The fence's tree and the memo's victim hint
+    /// (`Options::zpages_fence_tree`, `Options::zpages_memo_ahead`), in
+    /// every combination, answer every key as the segment does, twice over,
+    /// with the fence indexed only where the tree is asked for.
+    #[test]
+    fn the_fences_tree_and_the_memos_hint_answer_as_the_segment_does_in_every_combination() {
+        let fx = Fixture::new("lines", suite(3000, 17), 256);
+        assert!(matches!(fx.build(), Outcome::Built(_)));
+        for (tree, ahead) in [(false, false), (true, false), (false, true), (true, true)] {
+            let zfile = fx.attach_lines(tree, ahead).unwrap();
+            assert_eq!(zfile.fence.indexed(), tree, "tree {tree}");
+            agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
+            agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
+            assert_eq!(zfile.bad_pages(), 0, "tree {tree} ahead {ahead}");
         }
     }
 
@@ -5091,8 +5168,10 @@ mod tests {
             ((n - groups, groups), groups),
             "a new identity misses every group once"
         );
-        let off =
-            ZFile::attach(&fx.out, &fx.blob, ID, END, false, false, false, true, false).unwrap();
+        let off = ZFile::attach(
+            &fx.out, &fx.blob, ID, END, false, false, false, true, false, false, true,
+        )
+        .unwrap();
         let d4 = read_all(&off);
         assert_eq!(
             (fx.memo.take_counts(), d4),
@@ -5189,7 +5268,7 @@ mod tests {
             );
             assert!(matches!(fx.build(), Outcome::Built(_)));
             let zfile = ZFile::attach(
-                &fx.out, &fx.blob, ID, END, false, true, false, trusted, memo_first,
+                &fx.out, &fx.blob, ID, END, false, true, false, trusted, memo_first, false, true,
             )
             .unwrap();
             type Emitted = Vec<(Vec<u8>, Vec<u8>)>;
@@ -5261,11 +5340,35 @@ mod tests {
         one.zfile();
         let b = &one.blob;
         assert!(matches!(
-            ZFile::attach(&one.out, b, ID + 1, END, false, true, false, true, false),
+            ZFile::attach(
+                &one.out,
+                b,
+                ID + 1,
+                END,
+                false,
+                true,
+                false,
+                true,
+                false,
+                false,
+                true
+            ),
             Err(Reject::Identity(_))
         ));
         assert!(matches!(
-            ZFile::attach(&one.out, b, ID, END + 1, false, true, false, true, false),
+            ZFile::attach(
+                &one.out,
+                b,
+                ID,
+                END + 1,
+                false,
+                true,
+                false,
+                true,
+                false,
+                false,
+                true
+            ),
             Err(Reject::Identity(_))
         ));
         // No file is no rejection.

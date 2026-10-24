@@ -96,9 +96,13 @@ The open cell is E. A secondary one is the minute of raw reads before the
 install (the "gear shift"). The per-record form, probed and built below as
 the record coding, took the point reads' group decode away and not E's: a
 scan's memo miss still decodes a group whole, and through its records that
-costs more, so the coding is an arm and E's levers are elsewhere -- the
-start seek, the walk and emit, the settle, by the profile in "E as it stands,
-profiled".
+costs more, so the coding is an arm. The profile at `3a885a9` (below) has
+E's remaining cost spread over the decode (24%, at the cold decoder's
+figure, which is its branches and not its lines), the start seek (20%, a
+third of it decodes wasted on copy starts), the walks, the builds and the
+settle, none above a quarter; the one lever of size left on the decode is
+liblz4 (its high-compression mode and its decoder), a C dependency and the
+user's call.
 
 ## This session: a block read through one cursor
 
@@ -273,6 +277,60 @@ profiled".
   and not a broken measurement; the record coding is inert on the quick row,
   whose stores fit and build no form. The row is in `bench/runs-ci/`, not
   banked (the controls were out of band).
+- **E profiled again at `3a885a9`** (`stage4.md`, "E profiled again, the
+  decode's lines probed, and two levers on the lines a read touches";
+  `scratch/wave2/prof/profile-e.sh`, the samples' text now made with
+  `perf script --no-inline`, since the inline resolution ran at two
+  kilobytes a second): the thread is on its core for all of E at 7.8 µs
+  of CPU a scan, 1.6 of it the harness's; the decode 23.8% at exactly the
+  cold figure (1.0 µs a group against 0.27 hot), the start seek 20% (a third
+  of the decodes, wasted on the two thirds of scans that start in a copy),
+  the block reader's walks 15%, the clean runs 12%, the builds 10%, the
+  settle 7.5%. Nothing decisive is left in one place; the remaining levers
+  are each three to ten percent.
+- **Probed and refuted: the decode's lines asked for ahead**
+  (`bench/examples/zlines.rs`, `zlines-probe-1m.log`,
+  `zlines-probe-out-1m.log`): a prefetch of the group's payload at the view,
+  of the page at the fence, of the output buffer -- 9% off a cold decode at
+  most, the whole page slower. A cold decode's cost is the decoder's
+  branches on tokens it has not learned, not its memory; `CLAUDE.md`
+  (Profiling) carries the rule.
+- **Probed, open for the user's decision: liblz4 in the engine**
+  (`zdecode --hc LEVEL`, `zlines-hc-1m.log`): liblz4's high-compression
+  mode at level 9 shrinks the form 4% and the cold decode 16.5% (fewer
+  tokens), at 2.3x the build's CPU; liblz4's decoder is 0.84-0.86 of
+  `lz4_flex`'s on cold input, and over HC payloads 0.71 of the engine's
+  decode as it stands. Both are a C library the engine does not link (the
+  bench's `lz4` crate, feature `lz4-c`, is how the probes have it); the
+  compressor would be the builder's and the native build's alone. Decode is
+  24% of E and 27% of C's CPU, so the pair is worth about 7% of E and more
+  of the point reads in core. Not built: a dependency decision.
+- **Built and priced: the fence's search tree (refuted, the arm) and the
+  memo's victim hint (on)** (`stage4.md`, the same section; `zlines-fence-ab-{1,2}.*`,
+  `zlines-memo-ab-{1,2}.*`, the arm pairs' profiles under
+  `scratch/wave2/prof/` as `ycsb-E-<arm>.txt`). `Options::zpages_fence_tree`
+  (`ZFence::index`): a breadth-first tree over the entries' words, one line
+  a level prefetched three ahead, whole keys compared only where words tie
+  -- built for the fence's search at 4.7% of E's thread, read as misses. The
+  pairing read level everywhere with mixed signs and the arm-pair profile
+  read the search's own samples up (4.2% against 3.4%): the store's fences
+  are nineteen of 4,900 entries, L2-resident for the partitions a Zipfian
+  reads, so the search was never miss-bound and the tree is instructions
+  added. Off; `supdb-cache64tofitautozpagesfencetree` is the arm, on in a
+  quarter of the fuzz's `ZFUZZ_OPTVARY` seeds, held to the search over the
+  keys over every shape of fence and key. `Options::zpages_memo_ahead`
+  (`Memo::prefetch_victim`): a decode asks for the line of the memo entry
+  its put will displace; the arm-pair profile has `Memo::recycle` at 0.25%
+  of the thread against 2.0% without it, the miss gone, and the pairing
+  reads the memo-heavy mixes 3-6% for it in two thirds of the pairs and no
+  cell against it (E's two sittings disagree in sign, the host's). On;
+  `supdb-cache64tofitautozpagesmemonoahead` is the shape before. Two rules
+  went to `CLAUDE.md`'s profiling notes: a cold decode's stall is its
+  branches, and a self time is misses only once the structure's size is
+  read against the cache per instance. Also: `perf record -p` attaches some
+  200 ms after its mark, so the C mix's windows (130-200 ms) hold the tail
+  of C or nothing; a point-read profile needs perf attached before the
+  pass.
 - **Untouched**: the shuffled-load kill of the combined arm under 640 MiB
   and the gear shift, as the session before left them.
 
@@ -445,3 +503,10 @@ A new arm needs four things: a field on `Policy`/`Supdb` and its name in
   compile of the engine, with nothing else running; the gate was run again
   from the start. `free` read 15.5 GB free of 16 after it.
 - Nothing is uncommitted.
+- The suite's `the_removal_arms_differ_from_their_default_in_the_one_option`
+  overflows the test thread's stack in the dev profile at `3a885a9` already
+  (`cargo test --lib` in `bench/`, before any change of this session); it
+  passes under `checked`, which the gate runs, and with `RUST_MIN_STACK` at
+  16 MiB in dev. The engine values are small (`Db` 2.5 KB, `Supdb` 2.8 KB),
+  so the frame is the debug build's open chain, not the test's values;
+  boxing the engines moved nothing. Not fixed here.

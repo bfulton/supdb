@@ -24,6 +24,7 @@ ap.add_argument('--tid', type=int)
 ap.add_argument('--top', type=int, default=40)
 ap.add_argument('--self-only', action='store_true')
 ap.add_argument('--callers', help='print the callers (next frame up) of this symbol')
+ap.add_argument('--under', help='print the leaves, and the frames below it, of the samples whose chain holds this symbol')
 a = ap.parse_args()
 
 windows = []
@@ -94,16 +95,28 @@ def short(s):
     return s
 
 selfc = Counter(); incl = Counter(); callers = Counter()
+under_leaf = Counter(); under_incl = Counter(); under_n = 0
 for fr in chosen:
     if fr:
         selfc[short(fr[0])] += 1
     seen = set()
+    at = None
     for i, s in enumerate(fr):
         ss = short(s)
         if ss not in seen:
             seen.add(ss); incl[ss] += 1
         if a.callers and a.callers in ss and i + 1 < len(fr):
             callers[short(fr[i+1])] += 1
+        if a.under and at is None and a.under in ss:
+            at = i
+    if a.under and at is not None:
+        under_n += 1
+        under_leaf[short(fr[0])] += 1
+        seen = set()
+        for s in fr[:at]:
+            ss = short(s)
+            if ss not in seen:
+                seen.add(ss); under_incl[ss] += 1
 print(f'\n== self, top {a.top} ==')
 for s, c in selfc.most_common(a.top):
     print(f'{100*c/n:6.2f}%  {c:6d}  {s}')
@@ -114,4 +127,11 @@ if not a.self_only:
 if a.callers:
     print(f'\n== callers of {a.callers} ==')
     for s, c in callers.most_common(a.top):
+        print(f'{100*c/n:6.2f}%  {c:6d}  {s}')
+if a.under:
+    print(f'\n== under {a.under}: {under_n} samples, {100*under_n/n:.2f}% of the thread; leaves ==')
+    for s, c in under_leaf.most_common(a.top):
+        print(f'{100*c/n:6.2f}%  {c:6d}  {s}')
+    print(f'\n== under {a.under}: frames below it, inclusive ==')
+    for s, c in under_incl.most_common(a.top):
         print(f'{100*c/n:6.2f}%  {c:6d}  {s}')

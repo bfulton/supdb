@@ -1,0 +1,27 @@
+=== zlines --cold-out
+       shape  ns/decode   rounds (min-max)
+       plain       1222     1154-1767    
+     payload       1139     1067-1363    
+ hdr+payload       1156     1059-1364    
+   half-page       1251     1174-1448    
+        page       1241     1148-1927    
+         out       1243     1179-1914    
+ payload+out       1128     1037-1357    
+=== zlines --scan --cold-out
+       shape  ns/decode   rounds (min-max)
+       plain        850      802-906     
+     payload        867      790-1007    
+ hdr+payload        846      767-1050    
+   half-page        831      767-996     
+        page        862      823-992     
+         out        872      832-1105    
+ payload+out        851      774-964     
+=== zlines 
+       shape  ns/decode   rounds (min-max)
+       plain       1282     1165-1834    
+     payload       1117      970-1645    
+ hdr+payload       1210     1134-1647    
+   half-page       1407     1112-1700    
+        page       1374     1239-1714    
+         out       1352     1141-2006    
+ payload+out       1150      982-1701    

@@ -169,6 +169,14 @@ struct Cfg {
     /// the seeds under `ZFUZZ_OPTVARY`, so the record coding is read against
     /// the model too.
     record_coding: bool,
+    /// The fence searched through its tree (`Options::zpages_fence_tree`,
+    /// off as shipped); on in a quarter of the seeds under `ZFUZZ_OPTVARY`,
+    /// so the tree is read against the model too.
+    fence_tree: bool,
+    /// A decode asking ahead for the memo entry its put displaces
+    /// (`Options::zpages_memo_ahead`); off in some seeds under
+    /// `ZFUZZ_OPTVARY`.
+    memo_ahead: bool,
 }
 
 /// Whether a seed runs with the block cache on. The chance is drawn whenever
@@ -219,6 +227,8 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         memo_first: std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15),
         block_cursor: !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15)),
         record_coding: std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25),
+        fence_tree: std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25),
+        memo_ahead: !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15)),
     }
 }
 
@@ -237,6 +247,8 @@ fn opts(c: &Cfg) -> Options {
         zpages_memo_first: c.memo_first,
         zpages_block_cursor: c.block_cursor,
         zpages_record_coding: c.record_coding,
+        zpages_fence_tree: c.fence_tree,
+        zpages_memo_ahead: c.memo_ahead,
         ..Options::default()
     };
     if let Some(i) = c.inline_bytes {

@@ -1,0 +1,25 @@
+3a885a9
+ M CLAUDE.md
+ M bench/DESIGN.md
+ M bench/examples/zdecode.rs
+ M bench/src/engines.rs
+ M scratch/wave2/HANDOFF.md
+ M scratch/wave2/prof/aggregate.py
+ M scratch/wave2/stage4.md
+ M src/db.rs
+ M src/db/zfile.rs
+ M src/db/zpages.rs
+ M tests/fuzz.rs
+?? bench/examples/zlines.rs
+?? scratch/wave2/zlines-fence-ab-1.err
+?? scratch/wave2/zlines-fence-ab-1.out
+?? scratch/wave2/zlines-fence-ab-2.err
+?? scratch/wave2/zlines-fence-ab-2.out
+?? scratch/wave2/zlines-fence-build.log
+?? scratch/wave2/zlines-fence-head.txt
+?? scratch/wave2/zlines-hc-1m.log
+?? scratch/wave2/zlines-memo-build.log
+?? scratch/wave2/zlines-memo-head.txt
+?? scratch/wave2/zlines-probe-1m.log
+?? scratch/wave2/zlines-probe-out-1m.log
+2026-10-24T21:16:14Z

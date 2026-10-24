@@ -332,6 +332,13 @@ the pair against `supdb-nocachezpages`;
 `supdb-cache64tofitautozpagesmemofirst` is the combined arm with a
 verified page's group asked of the memo before any view of the page
 (`Options::zpages_memo_first`), where the default asks after it;
+`supdb-cache64tofitautozpagesfencetree` is the combined arm with the
+form file's fence searched through a tree over the entries' words built at
+the attach (`Options::zpages_fence_tree`), where the default searches the
+keys; `supdb-cache64tofitautozpagesmemonoahead` is the combined arm
+with a decode asking nothing ahead for the memo entry its put displaces
+(`Options::zpages_memo_ahead` off), where the default asks for its line
+before the decode;
 `supdb-cache64tofitautozpagesperrun` is the combined arm with a block read
 through a cursor a run, a seek a cut and a read by rank a replaced record
 (`Options::zpages_block_cursor` off), where the default reads a block through

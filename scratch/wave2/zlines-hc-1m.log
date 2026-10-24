@@ -1,0 +1,30 @@
+=== zdecode --size 1000000 --rounds 11 --split 1
+4 form files, 18649 pages, 74588 compressed groups, 0 stored groups skipped
+73564962 compressed bytes to 124000000 decoded, 1662.47 a group decoded, ratio 0.593
+cycle (11 rounds over 74588 groups): lz4_flex 716 ns a group (0.431 ns a byte), liblz4 601 ns a group (0.361 ns a byte); liblz4 at 0.84 of lz4_flex
+hot (16 groups, 200 decodes a sample, 11 samples): lz4_flex 315 / 259 ns a group, liblz4 216 / 209 ns a group; liblz4 at 0.74 of lz4_flex
+  1   0.593  1.000      1662       689       503       600       577
+=== zdecode --size 1000000 --rounds 11 --hc 1
+4 form files, 18649 pages, 74588 compressed groups, 0 stored groups skipped
+hc 1: 73564962 compressed bytes recompressed to 72266990 (0.982 of the engine's) in 0.84 s
+72266990 compressed bytes to 124000000 decoded, 1662.47 a group decoded, ratio 0.583
+cycle (11 rounds over 74588 groups): lz4_flex 700 ns a group (0.421 ns a byte), liblz4 554 ns a group (0.333 ns a byte); liblz4 at 0.79 of lz4_flex
+hot (16 groups, 200 decodes a sample, 11 samples): lz4_flex 394 / 388 ns a group, liblz4 298 / 272 ns a group; liblz4 at 0.73 of lz4_flex
+=== zdecode --size 1000000 --rounds 11 --hc 4
+4 form files, 18649 pages, 74588 compressed groups, 0 stored groups skipped
+hc 4: 73564962 compressed bytes recompressed to 70562246 (0.959 of the engine's) in 1.01 s
+70562246 compressed bytes to 124000000 decoded, 1662.47 a group decoded, ratio 0.569
+cycle (11 rounds over 74588 groups): lz4_flex 642 ns a group (0.386 ns a byte), liblz4 540 ns a group (0.325 ns a byte); liblz4 at 0.84 of lz4_flex
+hot (16 groups, 200 decodes a sample, 11 samples): lz4_flex 226 / 227 ns a group, liblz4 177 / 177 ns a group; liblz4 at 0.78 of lz4_flex
+=== zdecode --size 1000000 --rounds 11 --hc 9
+4 form files, 18649 pages, 74588 compressed groups, 0 stored groups skipped
+hc 9: 73564962 compressed bytes recompressed to 70521948 (0.959 of the engine's) in 0.94 s
+70521948 compressed bytes to 124000000 decoded, 1662.47 a group decoded, ratio 0.569
+cycle (11 rounds over 74588 groups): lz4_flex 598 ns a group (0.359 ns a byte), liblz4 515 ns a group (0.310 ns a byte); liblz4 at 0.86 of lz4_flex
+hot (16 groups, 200 decodes a sample, 11 samples): lz4_flex 229 / 227 ns a group, liblz4 178 / 178 ns a group; liblz4 at 0.78 of lz4_flex
+=== zdecode --size 1000000 --rounds 11 --hc 12
+4 form files, 18649 pages, 74588 compressed groups, 0 stored groups skipped
+hc 12: 73564962 compressed bytes recompressed to 70492671 (0.958 of the engine's) in 2.46 s
+70492671 compressed bytes to 124000000 decoded, 1662.47 a group decoded, ratio 0.568
+cycle (11 rounds over 74588 groups): lz4_flex 589 ns a group (0.354 ns a byte), liblz4 508 ns a group (0.306 ns a byte); liblz4 at 0.86 of lz4_flex
+hot (16 groups, 200 decodes a sample, 11 samples): lz4_flex 238 / 233 ns a group, liblz4 171 / 172 ns a group; liblz4 at 0.73 of lz4_flex
