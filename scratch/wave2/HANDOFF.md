@@ -93,9 +93,12 @@ out of core" (5M keys under 640 MiB):
   under 1 GiB the form takes every cell.
 
 The open cell is E. A secondary one is the minute of raw reads before the
-install (the "gear shift"). The per-record form, probed below, is the shape
-that attacks what E and the point reads still pay on the form's side, the
-group decode.
+install (the "gear shift"). The per-record form, probed and built below as
+the record coding, took the point reads' group decode away and not E's: a
+scan's memo miss still decodes a group whole, and through its records that
+costs more, so the coding is an arm and E's levers are elsewhere -- the
+start seek, the walk and emit, the settle, by the profile in "E as it stands,
+profiled".
 
 ## This session: a block read through one cursor
 
@@ -257,6 +260,19 @@ group decode.
   that would serve both paths -- one block a group whose records reference
   only the first, an entry a record into it, the heads beside it -- is
   named in the record and not built: it would hold E level, not win it.
+- **The quick row in core at `5059187`** (the suite's own gate, eight prior
+  rows of the class, the newest at `5df834c` of October 20): passed, the host
+  out of band (the memory floor at 0.73 of the window's lowest median) so the
+  machine-bound quantities got no verdict; nothing regressed that is the
+  engine's; three quantities better than every prior row, flagged for a look
+  -- `supdb-ingest`'s E at ten thousand and a hundred thousand keys (1.03-1.48M
+  ops/s against the window's at most 0.97M) and `supdb-nocache`'s threaded
+  scan mix at thirty thousand -- which are the E levers that landed after the
+  window's last row (the settle's cut left to the build, the block read
+  through one cursor) showing in core, on a host slower than the window's,
+  and not a broken measurement; the record coding is inert on the quick row,
+  whose stores fit and build no form. The row is in `bench/runs-ci/`, not
+  banked (the controls were out of band).
 - **Untouched**: the shuffled-load kill of the combined arm under 640 MiB
   and the gear shift, as the session before left them.
 
