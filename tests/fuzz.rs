@@ -165,8 +165,9 @@ struct Cfg {
     /// `ZFUZZ_OPTVARY`, so the shape before is read against the model too.
     block_cursor: bool,
     /// The form file's groups coded record by record
-    /// (`Options::zpages_record_coding`); off in some seeds under
-    /// `ZFUZZ_OPTVARY`, so the block coding is read against the model too.
+    /// (`Options::zpages_record_coding`, off as shipped); on in a quarter of
+    /// the seeds under `ZFUZZ_OPTVARY`, so the record coding is read against
+    /// the model too.
     record_coding: bool,
 }
 
@@ -217,7 +218,7 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         trusted: !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15)),
         memo_first: std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15),
         block_cursor: !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15)),
-        record_coding: !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25)),
+        record_coding: std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25),
     }
 }
 

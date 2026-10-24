@@ -843,11 +843,11 @@ pub struct Supdb {
     /// `supdb-nocachezpagescheckedviews`, the pair against
     /// `supdb-nocachezpages`, which prices the views by instruction in core.
     zcheckedviews: bool,
-    /// The form file's groups as one LZ4 block each
-    /// (`Options::zpages_record_coding` off), the shape before the record
-    /// coding: `supdb-cache64tofitautozpagesblock` and the forced
-    /// `supdb-nocachezpagesblock`, each the pair against the arm without it.
-    zblock: bool,
+    /// The form file's groups holding their records one by one
+    /// (`Options::zpages_record_coding` on): `supdb-cache64tofitautozpagesrecord`
+    /// and the forced `supdb-nocachezpagesrecord`, each the pair against the
+    /// arm without it.
+    zrecord: bool,
     /// The combined arm with a verified page's group asked of the memo
     /// before any view (`Options::zpages_memo_first`):
     /// `supdb-cache64tofitautozpagesmemofirst`, the pair against
@@ -1314,10 +1314,10 @@ struct Policy {
     /// (`Options::zpages_trusted_views` off):
     /// `supdb-cache64tofitautozpagescheckedviews`.
     zcheckedviews: bool,
-    /// The form file's groups as one LZ4 block each
-    /// (`Options::zpages_record_coding` off), the shape before the record
-    /// coding: `supdb-cache64tofitautozpagesblock`, `supdb-nocachezpagesblock`.
-    zblock: bool,
+    /// The form file's groups holding their records one by one
+    /// (`Options::zpages_record_coding` on): `supdb-cache64tofitautozpagesrecord`,
+    /// `supdb-nocachezpagesrecord`.
+    zrecord: bool,
     /// A verified page's group asked of the memo before any view
     /// (`Options::zpages_memo_first`): `supdb-cache64tofitautozpagesmemofirst`.
     zmemofirst: bool,
@@ -1442,7 +1442,7 @@ impl Default for Policy {
             zmemolinear: false,
             zexactcut: false,
             zcheckedviews: false,
-            zblock: false,
+            zrecord: false,
             zmemofirst: false,
             zperrun: false,
             zmemo_mib: 0,
@@ -3234,19 +3234,20 @@ impl Supdb {
         )
     }
 
-    /// `supdb-cache64tofitautozpages` with the form file's groups as one LZ4
-    /// block each (`Options::zpages_record_coding` off), the shape before
-    /// the record coding: the pair against `supdb-cache64tofitautozpages`
-    /// prices a record decoded against a group decoded, on every read
-    /// through the form.
-    pub fn create_cache64_tofit_auto_zpages_block(path: &Path) -> Res<Supdb> {
+    /// `supdb-cache64tofitautozpages` with the form file's groups holding
+    /// their records one by one (`Options::zpages_record_coding` on): the
+    /// pair against `supdb-cache64tofitautozpages` prices a record decoded
+    /// against a group decoded, on every read through the form -- the
+    /// point-read mixes a quarter to a third faster and E's scans a fifth
+    /// slower at five million keys under 640 MiB.
+    pub fn create_cache64_tofit_auto_zpages_record(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
                 budget: 64 << 20,
                 tofit: true,
                 zpages_auto: true,
-                zblock: true,
+                zrecord: true,
                 ..Policy::default()
             },
         )
@@ -4061,17 +4062,17 @@ impl Supdb {
         )
     }
 
-    /// `supdb-nocachezpages` with the form file's groups as one LZ4 block
-    /// each (`Options::zpages_record_coding` off), the shape before the
-    /// record coding: the pair against `supdb-nocachezpages` prices the
-    /// coding on the forced form, in core as well as under a bound.
-    pub fn create_nocache_zpages_block(path: &Path) -> Res<Supdb> {
+    /// `supdb-nocachezpages` with the form file's groups holding their
+    /// records one by one (`Options::zpages_record_coding` on): the pair
+    /// against `supdb-nocachezpages` prices the coding on the forced form,
+    /// in core as well as under a bound.
+    pub fn create_nocache_zpages_record(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
                 block_cache: false,
                 zpages: true,
-                zblock: true,
+                zrecord: true,
                 ..Policy::default()
             },
         )
@@ -4402,7 +4403,7 @@ impl Supdb {
             zmemolinear,
             zexactcut,
             zcheckedviews,
-            zblock,
+            zrecord,
             zmemofirst,
             zperrun,
             zmemo_mib,
@@ -4656,7 +4657,7 @@ impl Supdb {
             zpages_memo_hash: !zmemolinear,
             zpages_settle_span: !zexactcut,
             zpages_trusted_views: !zcheckedviews,
-            zpages_record_coding: !zblock,
+            zpages_record_coding: zrecord,
             zpages_memo_first: zmemofirst,
             zpages_block_cursor: !zperrun,
             zpages_memo_bytes: if zmemo_mib > 0 {
@@ -4845,7 +4846,7 @@ impl Supdb {
             zmemolinear,
             zexactcut,
             zcheckedviews,
-            zblock,
+            zrecord,
             zmemofirst,
             zperrun,
             zmemo_mib,
@@ -4939,8 +4940,8 @@ impl Engine for Supdb {
                 "supdb-cache64tofitautozpagesexactcut"
             } else if self.zcheckedviews {
                 "supdb-cache64tofitautozpagescheckedviews"
-            } else if self.zblock {
-                "supdb-cache64tofitautozpagesblock"
+            } else if self.zrecord {
+                "supdb-cache64tofitautozpagesrecord"
             } else if self.zmemofirst {
                 "supdb-cache64tofitautozpagesmemofirst"
             } else if self.zperrun {
@@ -5516,8 +5517,8 @@ impl Engine for Supdb {
                 "supdb-nocachezpagessettle"
             } else if self.zcheckedviews {
                 "supdb-nocachezpagescheckedviews"
-            } else if self.zblock {
-                "supdb-nocachezpagesblock"
+            } else if self.zrecord {
+                "supdb-nocachezpagesrecord"
             } else if self.zgroup == Some(0) {
                 "supdb-nocachezpagesonegroup"
             } else {
@@ -6414,7 +6415,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocachezpagesnowarm"
         | "supdb-nocachezpagesnomemo"
         | "supdb-nocachezpagescheckedviews"
-        | "supdb-nocachezpagesblock"
+        | "supdb-nocachezpagesrecord"
         | "supdb-nocachezpagesheads"
         | "supdb-nocachezpagesprefetch"
         | "supdb-nocachezpagesrankwalk"
@@ -6433,7 +6434,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache64tofitautozpagesmemolinear"
         | "supdb-cache64tofitautozpagesexactcut"
         | "supdb-cache64tofitautozpagescheckedviews"
-        | "supdb-cache64tofitautozpagesblock"
+        | "supdb-cache64tofitautozpagesrecord"
         | "supdb-cache64tofitautozpagesmemofirst"
         | "supdb-cache64tofitautozpagesperrun"
         | "supdb-cache64tofitautozpagesmemo4"
@@ -6626,7 +6627,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nocachezpagescheckedviews" => {
             Box::new(Supdb::create_nocache_zpages_checkedviews(dir)?)
         }
-        "supdb-nocachezpagesblock" => Box::new(Supdb::create_nocache_zpages_block(dir)?),
+        "supdb-nocachezpagesrecord" => Box::new(Supdb::create_nocache_zpages_record(dir)?),
         "supdb-nocachezpagesheads" => Box::new(Supdb::create_nocache_zpages_heads(dir)?),
         "supdb-nocachezpagesprefetch" => Box::new(Supdb::create_nocache_zpages_prefetch(dir)?),
         "supdb-nocachezpagesrankwalk" => Box::new(Supdb::create_nocache_zpages_rankwalk(dir)?),
@@ -6662,8 +6663,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cache64tofitautozpagescheckedviews" => {
             Box::new(Supdb::create_cache64_tofit_auto_zpages_checkedviews(dir)?)
         }
-        "supdb-cache64tofitautozpagesblock" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_block(dir)?)
+        "supdb-cache64tofitautozpagesrecord" => {
+            Box::new(Supdb::create_cache64_tofit_auto_zpages_record(dir)?)
         }
         "supdb-cache64tofitautozpagesmemofirst" => {
             Box::new(Supdb::create_cache64_tofit_auto_zpages_memofirst(dir)?)
@@ -8048,7 +8049,7 @@ mod tests {
             assert_eq!(arm.zpages_prefetch, arm_dir == "prefetch");
             assert_eq!(arm.zpages_rankwalk, arm_dir == "rankwalk");
             assert_eq!(arm.zcheckedviews, arm_dir == "checkedviews");
-            assert_eq!(arm.zblock, arm_dir == "block");
+            assert_eq!(arm.zrecord, arm_dir == "record");
             assert_eq!(arm.partition, base.partition, "the row's shape");
             assert_eq!(arm.drain, base.drain);
             assert_eq!(arm.durable, base.durable);

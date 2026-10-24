@@ -31,10 +31,11 @@
 //! freed with its segment.
 
 use super::zpages::{
-    bind32, check_entry, check_group, decode_group, decode_record, fill_page, filter_bytes,
-    group_seek, page_view, parse_page, record_group_seek, verify_page, view_trusted, walk_group,
-    FenceEntry, Fill, FillScratch, FillStats, GroupBuf, Images, NoPage, PageView, SegImages,
-    Trailer, ZError, ZFence, ZCODING_BLOCK, ZGROUP_BYTES, ZMAX_GROUPS, ZNOPAGE, ZPAGE, ZTRAILER,
+    bind32, check_coded_group, check_entry, check_group, decode_group, decode_record, fill_page,
+    filter_bytes, group_seek, page_view, parse_page, record_group_seek, verify_page, view_trusted,
+    walk_group, FenceEntry, Fill, FillScratch, FillStats, GroupBuf, Images, NoPage, PageView,
+    SegImages, Trailer, ZError, ZFence, ZCODING_BLOCK, ZGROUP_BYTES, ZMAX_GROUPS, ZNOPAGE, ZPAGE,
+    ZTRAILER,
 };
 use crate::blob::{Blob, BlobOptions, ZSource};
 use crate::bytes::{Bytes, MmapBytes};
@@ -1042,8 +1043,7 @@ pub(super) fn first_decode<'a>(
     j: usize,
     buf: &'a mut GroupBuf,
 ) -> std::result::Result<Open<'a>, Fail> {
-    let view = parse_page(page, bind)?;
-    check_entry(&view, entry)?;
+    let view = first_checks(page, bind, entry, Some(j))?;
     let g = view
         .group(j)
         .ok_or(Fail::Check(ZError::Header("no such group in the page")))?;
@@ -1051,16 +1051,44 @@ pub(super) fn first_decode<'a>(
     if g.stored && !aligned_for_extents(payload) {
         return Err(Fail::Misaligned);
     }
-    let mut scratch = take_verify_buf();
-    let others = (0..view.groups()).filter(|&k| k != j).try_for_each(|k| {
-        let other = decode_group(&view, k, &mut scratch)?;
-        check_group(other, &view, k, entry)
-    });
-    put_verify_buf(scratch);
-    others?;
     let group = decode_group(&view, j, buf)?;
     check_group(group, &view, j, entry)?;
     Ok((group, usize::from(g.first), usize::from(g.count), !g.stored))
+}
+
+/// A page's first checks, every one that needs no group of it decoded for
+/// the caller: the CRC, the tag, the header and the directory, the fence
+/// entry, and every group's own check -- a record-coded group by its heads
+/// (`check_coded_group`), a block or a stored group decoded into the
+/// thread's verify buffer and walked (`check_group`) -- but for `except`,
+/// which the caller decodes and checks itself. The view, for the caller to
+/// go on with.
+pub(super) fn first_checks<'a>(
+    page: &'a [u8],
+    bind: u32,
+    entry: &FenceEntry<'_>,
+    except: Option<usize>,
+) -> std::result::Result<PageView<'a>, Fail> {
+    let view = parse_page(page, bind)?;
+    check_entry(&view, entry)?;
+    let mut scratch = take_verify_buf();
+    let groups = (0..view.groups())
+        .filter(|&k| Some(k) != except)
+        .try_for_each(|k| {
+            let g = view
+                .group(k)
+                .ok_or(ZError::Header("no such group in the page"))?;
+            if g.coded {
+                let payload = view.payload(k).ok_or(ZError::Length)?;
+                check_coded_group(payload, &view, k, entry)
+            } else {
+                let other = decode_group(&view, k, &mut scratch)?;
+                check_group(other, &view, k, entry)
+            }
+        });
+    put_verify_buf(scratch);
+    groups?;
+    Ok(view)
 }
 
 /// A verified group of a page: the header's and the directory's values and
@@ -2024,15 +2052,29 @@ impl ZFile {
             return Locate::Fallback;
         };
         let j = view.group_of_key(key);
-        // The record coding's point read, on a page this process has
-        // verified: the group's heads are sought where they lie and the one
-        // record is decoded into the read's buffer, nothing else of the
-        // group and nothing of the memo. A page not yet verified takes the
-        // first decode below, every group whole, as any page does; a group
-        // that is stored verbatim, or one LZ4 block because only that held
-        // it, is opened as under the block coding.
-        if bit(&self.verified, p) {
-            if let Some(g) = view.group(j).filter(|g| g.coded) {
+        // The record coding's point read: the group's heads are sought
+        // where they lie and the one record is decoded into the read's
+        // buffer, nothing else of the group and nothing of the memo. A page
+        // not yet verified takes its first checks first -- its coded groups
+        // by their heads, nothing of them decoded -- and is verified by
+        // them; a group that is stored verbatim, or one LZ4 block because
+        // only that held it, is opened as under the block coding.
+        if let Some(g) = view.group(j).filter(|g| g.coded) {
+            if !bit(&self.verified, p) {
+                let Some(page) = self.page_bytes(p) else {
+                    self.fail(p);
+                    return Locate::Fallback;
+                };
+                match first_checks(page, self.bind, &entry, None) {
+                    Ok(_) => set_bit(&self.verified, p),
+                    Err(Fail::Misaligned) => return Locate::Fallback,
+                    Err(Fail::Check(_)) => {
+                        self.fail(p);
+                        return Locate::Fallback;
+                    }
+                }
+            }
+            {
                 // The page is touched, for the footprint, as `open_group`
                 // touches it.
                 memo.touch(self.id, entry.page, self.n_pages);

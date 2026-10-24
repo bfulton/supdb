@@ -103,7 +103,9 @@ Where it plugs in:
 - `db.rs`: `Options::zpages_record_coding` (on), threaded to the builder;
   nothing on the read side, which reads the page's byte.
 - `bench/src/engines.rs`: the block coding as the arm beside the shipping
-  combined and forced arms (`...zpagesblock`, `supdb-nocachezpagesblock`).
+  combined and forced arms (built so; the pairing then made the record
+  coding the arm, `...zpagesrecord` and `supdb-nocachezpagesrecord`, and the
+  block coding the default -- `stage4.md`, "The record coding paired").
 - `zselect.rs`: the sampler's estimate runs the same fill, so it follows.
 - Tests beyond the unit ones: `tests/zpages.rs` windows under both codings,
   `tests/fuzz.rs` toggling the coding under `ZFUZZ_OPTVARY`, the two fuzz

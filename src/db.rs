@@ -1095,12 +1095,16 @@ pub struct Options {
     /// decodable alone (`zpages::ZCODING_RECORD`: an offset table, each
     /// record's head front-coded against the group's first and its tail
     /// LZ4-compressed against the first record's, which is stored raw), so
-    /// that a point read decodes one record and a scan decodes the records
-    /// it emits, where the block coding (`zpages::ZCODING_BLOCK`, the shape
-    /// before) decodes a group of about fourteen records for either. The
-    /// probe that chose it is `bench/examples/zrec.rs`;
-    /// `supdb-cache64tofitautozpagesblock` and `supdb-nocachezpagesblock`
-    /// are the block coding's arms.
+    /// that a point read decodes one record where the block coding
+    /// (`zpages::ZCODING_BLOCK`, one LZ4 block a group) decodes a group of
+    /// about fourteen. Off: the record coding is an arm
+    /// (`supdb-cache64tofitautozpagesrecord`, `supdb-nocachezpagesrecord`),
+    /// since paired at five million keys under 640 MiB it reads the point-read
+    /// mixes a quarter to a third faster and E's scans a fifth slower -- a
+    /// group decoded whole through its records, which a scan's memo miss
+    /// does, costs 2.2x the block decode's instructions -- and E is the cell
+    /// the compact form has left to win (`scratch/wave2/stage4.md`, "The
+    /// record coding paired").
     #[doc(hidden)]
     pub zpages_record_coding: bool,
     /// Whether the controller buys its first form at SUSPECT on the model's
@@ -2577,7 +2581,7 @@ impl Default for Options {
             zpages_build_ahead: 4 << 20,
             zpages_prebuild: false,
             zpages_group_bytes: zpages::ZGROUP_BYTES,
-            zpages_record_coding: true,
+            zpages_record_coding: false,
             zpages_build_eager: false,
             zpages_inject: None,
             forms_pieces_only: false,
