@@ -13013,6 +13013,12 @@ struct FormsState {
     /// The forms the writer's block walks met: copies, sparse forms,
     /// anything else -- what a pass after a burst is walking.
     walk_kinds: std::cell::Cell<[u64; 3]>,
+    /// The blocks this handle built, by the form's kind -- copy, sparse,
+    /// wide, clean -- the covered blocks it copied on their second touch,
+    /// and the blocks the budget shed (`Db::build_kinds`).
+    built_kinds: std::cell::Cell<[u64; 4]>,
+    recopies: std::cell::Cell<u64>,
+    sheds: std::cell::Cell<u64>,
     /// Seeks whose stride window's directory lines were asked for ahead
     /// of the heads' read (`Options::seek_prefetch_dir`), the window
     /// empty or not: one a scan's start on the block path.
@@ -13145,6 +13151,9 @@ impl FormsState {
             log_counted: std::cell::Cell::new((0, 0)),
             choices: std::cell::Cell::new([0; 5]),
             walk_kinds: std::cell::Cell::new([0; 3]),
+            built_kinds: std::cell::Cell::new([0; 4]),
+            recopies: std::cell::Cell::new(0),
+            sheds: std::cell::Cell::new(0),
             dir_prefetches: std::cell::Cell::new(0),
             copy_starts: std::cell::Cell::new([0; 2]),
             span_starts: std::cell::Cell::new(0),
@@ -18444,6 +18453,21 @@ impl Reader {
         }
     }
 
+    /// `count_built`, with the kind of the form built kept for the counts
+    /// (`Db::build_kinds`): copy, sparse, wide, clean.
+    fn count_built_kind(&self, built: &Cached) {
+        self.count_built();
+        let i = match built {
+            Cached::Block(_) => 0,
+            Cached::Sparse(_) => 1,
+            Cached::Wide(_) => 2,
+            Cached::Clean => 3,
+        };
+        let mut k = self.fs().built_kinds.get();
+        k[i] += 1;
+        self.fs().built_kinds.set(k);
+    }
+
     /// One block materialised, charged to whoever built it.
     fn count_built(&self) {
         match (self.counted, self.slot) {
@@ -19472,7 +19496,7 @@ impl Reader {
                         .convert_build_ns
                         .fetch_add(t_build.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
                     let built = std::sync::Arc::new(built);
-                    self.count_built();
+                    self.count_built_kind(&built);
                     let bytes = self.fbytes(&built);
                     table.slots[b] = Some(built);
                     self.list_built_bytes(pi, b, table, bytes);
@@ -19491,7 +19515,7 @@ impl Reader {
                 }
                 self.shared.forms_events[6].fetch_add(1, AtomicOrdering::Relaxed);
                 let built = self.share_form(ctx.materialize(src, table, b, unsealed)?);
-                self.count_built();
+                self.count_built_kind(&built);
                 let bytes = self.fbytes(&built);
                 table.slots[b] = Some(built);
                 self.list_built_bytes(pi, b, table, bytes);
@@ -19637,6 +19661,7 @@ impl Reader {
                 }
             }
             let Some((p, b, _)) = best else { break };
+            self.fs().sheds.set(self.fs().sheds.get() + 1);
             if p == cur {
                 self.unlist(p, b, table);
             } else {
@@ -20854,7 +20879,7 @@ impl Reader {
                 };
                 if canon.is_none() && table.slots[b].is_none() {
                     let built = self.share_form(ctx.materialize(src, table, b, unsealed)?);
-                    self.count_built();
+                    self.count_built_kind(&built);
                     let bytes = self.fbytes(&built);
                     table.slots[b] = Some(built);
                     self.list_built_bytes(pi, b, table, bytes);
@@ -20884,7 +20909,8 @@ impl Reader {
                         }
                         .materialize(src, table, b, unsealed)?,
                     );
-                    self.count_built();
+                    self.fs().recopies.set(self.fs().recopies.get() + 1);
+                    self.count_built_kind(&built);
                     let bytes = self.fbytes(&built);
                     table.slots[b] = Some(built);
                     self.list_built_bytes(pi, b, table, bytes);
@@ -21200,7 +21226,7 @@ impl Reader {
                             if in_slot {
                                 self.unlist(pi, b, table);
                                 let built = self.share_form(copied);
-                                self.count_built();
+                                self.count_built_kind(&built);
                                 table.slots[b] = Some(built);
                                 self.list_built_bytes(pi, b, table, bytes);
                                 self.shed(pi, b, table);
@@ -25380,6 +25406,15 @@ impl Db {
     pub fn forms_walks(&self) -> [u64; 3] {
         self.take_back_upkeep();
         self.r.fs().walk_kinds.get()
+    }
+
+    /// The writer's block builds by the form's kind -- copy, sparse, wide,
+    /// clean -- then the covered blocks copied on their second touch, and
+    /// the blocks the budget shed.
+    pub fn build_kinds(&self) -> ([u64; 4], u64, u64) {
+        self.take_back_upkeep();
+        let fs = self.r.fs();
+        (fs.built_kinds.get(), fs.recopies.get(), fs.sheds.get())
     }
 
     /// The writer's own copy walks by how they started: at the seek's

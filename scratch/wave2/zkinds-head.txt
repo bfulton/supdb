@@ -1,0 +1,14 @@
+5fa6c29
+ M bench/DESIGN.md
+ M bench/src/engines.rs
+ M bench/src/run.rs
+ M scratch/wave2/stage4.md
+ M src/db.rs
+?? scratch/wave2/zbudget256-ab-1.err
+?? scratch/wave2/zbudget256-ab-1.out
+?? scratch/wave2/zbudget256-ab-2.err
+?? scratch/wave2/zbudget256-ab-2.out
+?? scratch/wave2/zbudget256-build.log
+?? scratch/wave2/zbudget256-head.txt
+?? scratch/wave2/zkinds-head.txt
+2026-10-25T14:29:48Z

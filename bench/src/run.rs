@@ -584,6 +584,12 @@ fn counters_line(
             // starts it kept (`Db::start_cache_counts`).
             "start_cache_hits",
             "start_cache_puts",
+            "builds_copy",
+            "builds_sparse",
+            "builds_wide",
+            "builds_clean",
+            "recopies",
+            "sheds",
         ];
         let ev: Vec<String> = names.iter().map(|n| format!("{n} {:.0}", d(n))).collect();
         eprintln!("{tag}-events {arm} {point} {}", ev.join(" | "));

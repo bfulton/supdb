@@ -1,0 +1,6 @@
+5fa6c29
+ M bench/DESIGN.md
+ M bench/src/engines.rs
+?? scratch/wave2/zbudget256-build.log
+?? scratch/wave2/zbudget256-head.txt
+2026-10-25T13:59:29Z

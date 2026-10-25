@@ -369,6 +369,26 @@ user's call.
   its fuzz patched to consume the draw, its own target), not by the
   option's name -- the start cache was off in the seed and the commit before
   failed four runs in six.
+- **E against LMDB, the budget and the kinds** (`stage4.md`, "E against
+  LMDB: the block cache's budget, refuted as the lever" and the kinds
+  after it): `supdb-cache128tofitautozpages` and `supdb-cache256tofitautozpages`
+  are the combined arm with the budget at 128 and 256 MB; paired at five
+  million keys under 640 MiB the 256 MB arm reads E 0.975 over twelve pairs
+  with every count identical to the default's. The events line carries the
+  builds by kind, the covered blocks' second-touch copies and the sheds now
+  (`builds_copy/sparse/wide/clean`, `recopies`, `sheds`; `Db::build_kinds`):
+  E's 24,007 builds a pass are 14,789 clean, 8,890 sparse, 327 copies, one
+  wide, 0 recopies, 0 sheds. The hot head is 327 copies walked 78,600 times
+  a pass with no decode; the warm middle 8,890 sparse blocks built at first
+  touch (7.7% of E) and walked 3.4 times a pass through the form; the cold
+  tail 14,789 clean blocks walked 1.2 times. In core the same block cache
+  reads E at 1.36-1.48x of LMDB (the full row of 29 September, 300k-3M
+  keys), so the deficit under the bound is the form's decode under every
+  walk that is not the head's, plus the sparse builds. The process holds
+  77 MB anonymous beside 520-560 MB of file pages under the 671 MB limit;
+  LMDB there is in core by minor faults. Next: a stored-values group coding
+  (keys front-coded, about 530 MB at five million) as the lightest coding
+  that fits the bound, the forced and the combined arms paired under it.
 - **Where E's time is, by the arm pair's profile at the head**: the LZ4
   decode 25% of the thread (147,000 groups a pass, 2.5 a form walk, nearly
   every one a memo miss, since the form walks are the Zipfian's cold tail),

@@ -2675,3 +2675,99 @@ fails on the guards removed with the same message, and `db::snap_arena`
 holds the arena to it. The attribution's worktree and binaries are
 `$S/wt-head` and `$S/wt-head-target`; the sweep that named the seed ran
 every seed alone (`$S/tmp-fuzz-single`).
+
+## E against LMDB: the block cache's budget, refuted as the lever
+
+The user's question -- why LMDB is untouchable in E, and why the engine
+cannot do what it does with the right gear shift -- and the answer the
+notes already held: at five million keys under 640 MiB LMDB's 670 MB file
+does not fit and its E still runs at about 4 µs a scan with 0.33-0.56
+faults a scan, so a fault there is a few microseconds (the page cache's
+minor faults on its mapping), while the form fits whole and wins the point
+reads 1.7-2.4x, the pure scan pass 2.2-3.1x and every other mix, and loses
+E alone at about 6 µs a scan. E mixes inserts with scans on the same hot
+keys; a B-tree applies each insert to its leaf page at write time and its
+scan reads one structure, where the engine merges the memtable into every
+scan at read time -- the forms built (11% of E's thread, 24,007 a pass), the
+settle (7%), the sparse walks' cuts, the seek (0.6 µs a scan) and the
+decode of every group a walk crosses (1.45 µs a scan). The plan agreed:
+the budget first, then whatever keeps the hot head's copies from staying,
+then the tail's decode.
+
+The budget (`supdb-cache128tofitautozpages`, `supdb-cache256tofitautozpages`,
+two creators on the combined arm's policy; `zbudget256-ab-{1,2}.err`, five
+pairs a sitting, both orders): E's scans 0.975 over twelve pairs with the
+256 MB arm slower in four, 0.950 and 1.000 by sitting, every other cell
+within a few percent either way -- level -- and the counts identical in
+every rep of both arms: 24,007 forms built a pass, the walks 78,631 copies,
+30,410 sparse and 18,321 other, 147,100 groups decoded, the memo asked the
+same. A budget four times the default sheds nothing E rebuilds, so the
+24,007 builds are not churn: they are E's first touch of each block it meets
+in a pass, a slot made for every block a scan crosses, most of them clean,
+and the covered blocks' copies on their second touch. The hot head's copies
+stay as they are; the pairing against 128 MB was stopped as redundant once
+the counts read the same. What the 24,000 builds are by kind, and how many
+the budget sheds, is counted next (`Db::build_kinds`: copy, sparse, wide,
+clean, the second-touch copies and the sheds, on the events line), since
+the lever is in the kinds and not in the budget.
+
+The same profile (the start cache pair's default arm, `prof/ycsb-E-...-startcachepair-{decompress_internal,materialize,cache_seek_exact}.txt`),
+taken apart for the plan. The decode's one caller is `decode_group`, 25% of
+E's thread, and by the subtrees it sits in: the scans' start seeks 8.5%,
+the builds 2.7%, the walks the remaining 14%. The seek (`cache_seek_exact`,
+21.0%) is that decode 8.5%, the fence's search 3.3%, the page view 3.0%,
+the group's search 1.8%, the group open's own 1.2%, the memo 1.1% and the
+seek's own 0.9%: about 0.7 µs of a scan without the decode, 1.15 with it.
+The builds (`materialize`, 10.9%) are the sparse forms: `deltas_for` is 7.7%
+of the thread, the cursor opened at each delta's cut 3.4% of that, the
+builds' decodes 2.7%, a memcmp 1.0% and the fence's walk from the entry
+held 0.9% -- the dirty tail's blocks, a few unsealed keys each, built at
+their first touch in the pass. So E's thread against LMDB's: the decode
+1.35 µs a scan, the builds 0.6, the settle 0.36, the seek's search 0.7
+against a B-tree descent of perhaps 0.3, and the record walks about a
+fifth of the thread, which a B-tree's leaf walk pays alike. The decode is
+three quarters of the gap, and it is the cold tail's: the walks' 14% is
+groups no memo holds, the seeks' 8.5% the cold starts, and the hot head,
+held as copies, decodes nothing after its first pass.
+
+The kinds (`zkinds-ab-1.err`, two reps of the default and the 128 MB arm in
+one order, the counts the same in every rep of both): of E's 24,007 builds
+a pass, 14,789 are clean blocks -- the overlay check coming back empty, a
+slot and nothing built -- 8,890 sparse forms, 327 copies and one wide
+block; the covered rule's second-touch copy fired 0 times and the budget
+shed 0 blocks, at 64 MB as at 128. So the hot head is 327 blocks held as
+copies from their first touch and walked 78,600 times a pass with no decode,
+exactly the structure a B-tree's resident leaves are; the warm middle is
+8,890 blocks with a few unsealed keys each, a sparse form built at the
+first touch (3.7 µs each, `deltas_for` and the cursor opened at each
+delta's cut: 7.7% of E) and walked 3.4 times a pass through the form, a
+decode a group; the cold tail is 14,789 clean blocks walked 1.2 times a
+pass, a decode a group. Nothing here is churn and nothing here is the
+budget: it is the form's decode on every walk that is not the head's, plus
+the sparse builds. The in-core rows say the same from the other side
+(`bench/runs/full/20260929T025048Z-5eabd8d.json`, ycsb-E, durable arms):
+`supdb` with the block cache reads 1.36x, 1.48x and 1.41x of LMDB at three
+hundred thousand, one million and three million keys, `supdb-nocache` 0.21x,
+and `supdb-cache256` 1.01-1.34x -- the per-block forms over raw records win
+E in core by half as much again, and under the bound the same forms walk
+the form's groups instead of raw records and read 0.55-0.62x. The whole of
+E's deficit under the bound is the decode the form puts under every walk
+that the head's copies do not cover.
+
+Under the bound the process holds 75-77 MB of anonymous memory through the
+mixes beside 520-560 MB of file pages (the bound's cgroup sampled every
+three seconds, `zkinds-memsample.log`): the form files' 360 MB and
+what else of the store's files the earlier passes left resident, under a
+limit of 671 MB. LMDB there allocates next to nothing and its 670 MB file
+is all but resident, so its 0.33-0.56 faults a scan are the mapping's
+minor faults, not the device's: at this rung LMDB is in core, and so are
+we, through a form whose decode is three quarters of the gap. A form with
+the keys front-coded and the values stored -- about 530 MB by the records'
+arithmetic, 105 bytes a record -- would hold 607 MB of the 671 with the
+process's 77 beside it, which fits, and its walk reads records as the raw
+walk does; the next rung it does not fit, and the LZ4 form is the one that
+fits there. That is the gear: the lightest coding that fits the bound,
+chosen as the controller chooses the form, by what fits and what faults.
+Built next as a group coding beside the block and the record codings, the
+forced and combined arms paired under the bound at five million keys, E
+and the point reads read together.

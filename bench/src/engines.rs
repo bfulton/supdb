@@ -3087,6 +3087,36 @@ impl Supdb {
         )
     }
 
+    /// `supdb-cache64tofitautozpages` with the block cache's budget at 128 MB
+    /// (`Options::scan_cache_bytes`), `supdb-cache128tofitautozpages`: the
+    /// pair against the default prices the budget on the E mix under the
+    /// bound, whose scans build 24,000 forms a pass at 64 MB while the
+    /// Zipfian head they start in is about 9 MB of copies.
+    pub fn create_cache128_tofit_auto_zpages(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 128 << 20,
+                tofit: true,
+                zpages_auto: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// The same with the budget at 256 MB: `supdb-cache256tofitautozpages`.
+    pub fn create_cache256_tofit_auto_zpages(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 256 << 20,
+                tofit: true,
+                zpages_auto: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-cache64tofitautozpages` with the block cache's reads of a
     /// partition through the door instead of the form file
     /// (`Options::zpages_block_cache` off): the shape the combined arm had
@@ -5013,6 +5043,12 @@ impl Engine for Supdb {
         // Before the budget branch, which would name the policy the cache
         // arm whatever else it carries.
         if self.budget > 0 && self.tofit && self.zpages_auto {
+            if self.budget == 128 << 20 {
+                return "supdb-cache128tofitautozpages";
+            }
+            if self.budget == 256 << 20 {
+                return "supdb-cache256tofitautozpages";
+            }
             return if self.zcacheraw {
                 "supdb-cache64tofitautozpagesraw"
             } else if self.zpromote > 0 {
@@ -5681,6 +5717,7 @@ impl Engine for Supdb {
         let (forms, form_bytes, _, _) = db.canonical_forms();
         let ev = db.forms_events();
         let sd = db.settle_density();
+        let bk = db.build_kinds();
         let wk = db.forms_walks();
         let cs = db.copy_starts();
         let ph = db.scan_phases();
@@ -5753,6 +5790,15 @@ impl Engine for Supdb {
             ("walk_copy", wk[0] as f64),
             ("start_at_rank", cs[0] as f64),
             ("start_search", cs[1] as f64),
+            // The writer's builds by kind, the covered blocks copied on
+            // their second touch and the budget's sheds: see
+            // `Db::build_kinds`.
+            ("builds_copy", bk.0[0] as f64),
+            ("builds_sparse", bk.0[1] as f64),
+            ("builds_wide", bk.0[2] as f64),
+            ("builds_clean", bk.0[3] as f64),
+            ("recopies", bk.1 as f64),
+            ("sheds", bk.2 as f64),
             ("span_starts", db.span_starts() as f64),
             // The scans' start blocks the start cache named, and the
             // starts it kept: see `Db::start_cache_counts`.
@@ -6528,6 +6574,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocacheautozpages"
         | "supdb-cache64tofit"
         | "supdb-cache64tofitautozpages"
+        | "supdb-cache128tofitautozpages"
+        | "supdb-cache256tofitautozpages"
         | "supdb-cache64tofitautozpagesraw"
         | "supdb-cache64tofitautozpagespromote"
         | "supdb-cache64tofitautozpagesonegroup"
@@ -6742,6 +6790,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-autozpages" => Box::new(Supdb::create_auto_zpages(dir)?),
         "supdb-cache64tofit" => Box::new(Supdb::create_cache64_tofit(dir)?),
         "supdb-cache64tofitautozpages" => Box::new(Supdb::create_cache64_tofit_auto_zpages(dir)?),
+        "supdb-cache128tofitautozpages" => Box::new(Supdb::create_cache128_tofit_auto_zpages(dir)?),
+        "supdb-cache256tofitautozpages" => Box::new(Supdb::create_cache256_tofit_auto_zpages(dir)?),
         "supdb-cache64tofitautozpagesraw" => {
             Box::new(Supdb::create_cache64_tofit_auto_zpages_raw(dir)?)
         }
@@ -8037,6 +8087,47 @@ mod tests {
             )
         );
         drop(startc);
+        assert_eq!(b.scan_cache_bytes, 64 << 20);
+        for (name, make, budget) in [
+            (
+                "supdb-cache128tofitautozpages",
+                Supdb::create_cache128_tofit_auto_zpages as fn(&Path) -> Res<Supdb>,
+                128usize << 20,
+            ),
+            (
+                "supdb-cache256tofitautozpages",
+                Supdb::create_cache256_tofit_auto_zpages as fn(&Path) -> Res<Supdb>,
+                256usize << 20,
+            ),
+        ] {
+            let arm = new(name, make);
+            assert_eq!(arm.name(), name);
+            assert_eq!(guarantee(arm.name()), guarantee(base.name()));
+            assert_eq!(arm.features(), base.features());
+            let g = arm.db.as_ref().unwrap().options();
+            assert_eq!(
+                g.scan_cache_bytes, budget,
+                "{name}: the one option, the budget"
+            );
+            assert_eq!(
+                (
+                    g.zpages,
+                    g.forms_to_fit,
+                    g.zpages_memo_ahead,
+                    g.zpages_block_cursor,
+                    g.scan_start_cache
+                ),
+                (
+                    b.zpages,
+                    b.forms_to_fit,
+                    b.zpages_memo_ahead,
+                    b.zpages_block_cursor,
+                    b.scan_start_cache
+                ),
+                "{name}: the rest as the default's"
+            );
+            drop(arm);
+        }
         assert!(supdb::Options::default().zpages_block_cursor && b.zpages_block_cursor);
         let perrun = new(
             "supdb-cache64tofitautozpagesperrun",
