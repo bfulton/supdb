@@ -412,6 +412,23 @@ user's call.
   (liblz4, the user's call), the sparse builds' resolves and the settle's
   backlog, each a few percent, and the in-place walk of a record-coded
   group only where that coding fits.
+- **The fit check, refuted** (`stage4.md`, "The fit check: the raw-tail
+  form with the memo off and a trim after the install"): the raw-tail form
+  with the memo off and the allocator trimmed once after the install
+  (`Options::zpages_trim_install`; the arm
+  `supdb-cache64tofitzpagesrecordrawlean`, against `supdb-cache64tofitzpages`,
+  two sittings, `zfit-ab-{1,2}`) still takes 0.022-0.031 major faults an
+  operation in D and E (0.13 a read in the read pass, 0.07-0.08 a scan in
+  the scan pass) and reads D 1.45-1.5x and E 1.5-1.57x slower in every
+  pair, the faults two thirds of E's loss and the memo's lost hits the
+  rest; C, B and A read 1.3-1.45x faster, by the LZ4 decodes they no
+  longer do. The per-mix census (`SUPDB_MIX_CENSUS=1`, a `mixcensus` line a
+  mix; `census_read.py`) says why: the process's anonymous bytes in the
+  mixes are 64-99 MB under the lean arm against 68-88, the trim's return
+  taken back by the mixes' own allocations (in use 15 MB lower, resident
+  free 26 MB higher), so the anonymous memory is not the lever on the fit
+  and the in-place walk of a record-coded group is not built for this rung.
+  The lighter codings and the trim stay as arms, off.
 - **Where E's time is, by the arm pair's profile at the head**: the LZ4
   decode 25% of the thread (147,000 groups a pass, 2.5 a form walk, nearly
   every one a memo miss, since the form walks are the Zipfian's cold tail),
@@ -437,8 +454,11 @@ user's call.
   loads under the same bound, with the counters unset, hold 75-77 MB. The
   counters mode or the lag pass's presence holds the load's memory; not
   chased, since the fit question it was to answer is answered by the fault
-  columns, but a census of what the process holds under the bound by owner
-  still has no run that prints it.
+  columns; the census of what the process holds under the bound by owner
+  is printed after each mix now (`SUPDB_MIX_CENSUS=1`, the `mixcensus`
+  line, read by `census_read.py`), and the pairings run with it hold 64-99
+  MB in the mixes with no kill, so what the counters mode or the lag pass
+  adds to the load's memory is the part still unchased.
 - **Untouched**: the shuffled-load kill of the combined arm under 640 MiB
   and the gear shift, as the session before left them.
 

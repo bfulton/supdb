@@ -7139,11 +7139,18 @@ fn a_block_read_often_enough_under_the_form_is_held_as_a_copy_and_walked_without
 #[test]
 fn a_form_stored_whole_answers_as_the_compressed_one_and_decodes_nothing() {
     let mut bytes = Vec::new();
-    // Compressed, stored whole, and the record coding with raw tails: the
-    // last answers as the others and sits between them in size.
-    for (stored, raw) in [(false, false), (true, false), (false, true)] {
-        let what = format!("stored {stored} raw tails {raw}");
-        let dir = scratch(&format!("stored-whole-{stored}-{raw}"));
+    // Compressed, stored whole, the record coding with raw tails, and the
+    // raw tails with the memo off and the allocator trimmed after the
+    // install (`zpages_trim_install`): the third answers as the others and
+    // sits between them in size, and the fourth is the third's file.
+    for (stored, raw, lean) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, true, true),
+    ] {
+        let what = format!("stored {stored} raw tails {raw} lean {lean}");
+        let dir = scratch(&format!("stored-whole-{stored}-{raw}-{lean}"));
         let mut db = Db::create(
             &dir,
             forced(|o| {
@@ -7151,6 +7158,8 @@ fn a_form_stored_whole_answers_as_the_compressed_one_and_decodes_nothing() {
                 o.zpages_store_all = stored;
                 o.zpages_record_coding = raw;
                 o.zpages_raw_tails = raw;
+                o.zpages_memo = !lean;
+                o.zpages_trim_install = lean;
             }),
         )
         .unwrap();
@@ -7190,5 +7199,9 @@ fn a_form_stored_whole_answers_as_the_compressed_one_and_decodes_nothing() {
     assert!(
         bytes[0] < bytes[2] && bytes[2] < bytes[1],
         "the raw-tail form sits between the compressed and the stored: {bytes:?}"
+    );
+    assert_eq!(
+        bytes[3], bytes[2],
+        "the memo and the trim change nothing of the file: {bytes:?}"
     );
 }

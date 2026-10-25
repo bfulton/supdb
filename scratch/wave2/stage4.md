@@ -2860,3 +2860,70 @@ and the merge bookkeeping (the sparse builds and the settle, a sixth), and
 neither coding reaches it. The census of what the process holds under the
 bound, by owner, is read next (`zcensus-ab-1.err`), since the fit's margin
 is the one quantity that could still change the answer.
+
+## The fit check: the raw-tail form with the memo off and a trim after the install
+
+The question left by the raw-tail pairings was whether the 556 MB form
+missed the fit by the process's own anonymous memory, which could be
+lowered, or by its size against the bound, which cannot. Two levers on the
+anonymous bytes were put into one arm: the memo of decoded groups off
+(`zpages_memo`, eight mebibytes a handle, and nothing a one-record copy
+needs), and the allocator trimmed once after the form files' install
+(`Options::zpages_trim_install`, `malloc_trim` at the end of
+`zpages_settle`, whichever home the segment work has), so that what the
+builds' threads and the load left free in their arenas is the file's before
+the mixes start. `supdb-cache64tofitzpagesrecordrawlean` is the arm; the
+harness prints the engine's census after each mix under `SUPDB_MIX_CENSUS`
+(a `mixcensus` line a mix, the lag pass's `lagcensus` without the arenas
+and the maps), and `census_read.py` reads them by arm and mix. Paired
+against `supdb-cache64tofitzpages` at five million keys under 640 MiB, five
+pairs a sitting, both orders (`zfit-ab-{1,2}.{out,err}`, read with
+`pairing_read.py` and `census_read.py`).
+
+The fit is lost all the same. The lean arm takes 0.022-0.024 major faults a
+read in D and 0.029-0.031 a scan in E in both sittings, 0.128-0.129 a read
+in the read pass right after the build and 0.069-0.081 a scan in the scan
+pass, where the LZ4 arm takes none anywhere; A, B and C take none under
+either. D reads 1.45-1.5x slower in eleven pairs of twelve and E 1.5-1.57x
+slower in twelve of twelve, by the faults: E's 2,400 a mix (83,334
+operations, 79,198 of them scans) at the 65-75 µs a fault D and the read
+pass price it at are 160-180 ms of the 260 ms E loses a mix, and the rest
+is the memo's: with it off every group a scan opens is a copy-decode,
+269,763 a mix against the LZ4 arm's 147,182 decodes and 107,176 hits, and
+the settle reads 92 ms against 53. The point-read mixes read the other
+way, and by exactly the decodes they no longer do: C's gets 0.716 (124.9
+to 91.2 ms a mix, 34,366 LZ4 decodes gone at about a microsecond each),
+B's 0.693 (135.3 to 100.8, 32,376 decodes), A's 0.766 (85.3 to 61.2,
+16,052), F level -- the forced pairing had them at 0.81-0.93 with the memo
+on, so for a point read under the raw tails the memo was a cost and not a
+saving, since a one-record copy is as cheap as a hit.
+
+The census says why the levers did not buy the margin. The process's
+anonymous bytes during the mixes are 64-99 MB under the lean arm against
+68-88 under the LZ4 arm -- lower by four in C, higher by eleven in E -- while
+the allocator's bytes in use are 15 MB lower in every mix (the memo's
+eight, and the groups it held): the trim's return is taken back by the
+mixes' own allocations, the memtable's arena (19 MB of capacity by D), the
+snapshot (5.7), the block cache's tables (12 in E), the harness, and what
+those free again stays resident in the arenas, so the lean arm's resident
+free bytes beyond use are 47 MB in E where the LZ4 arm's are 21, and the
+minor faults a mix are higher under it (E 5,200 against 2,318), the pages
+the trim returned faulted in again. A trim before the mixes lowers what
+the process holds at the trim and nothing of what it holds in the mixes,
+which is where the form's pages compete. The engine's own census is 4-38 MB
+of the 16-67 in use; the rest is the harness's.
+
+So at five million keys under 640 MiB the raw-tail form's 556 MB of file
+do not fit beside the 90 MB the process needs during the mixes and the
+raw pages the block cache's builds and the settle read, by a few percent
+of the form's pages, and the process's anonymous memory is not the lever
+that closes it. The in-place walk of a record-coded group, which would
+take E's decode out, is not built: it would save E's 1.45 µs a scan of
+decode and E would still pay 0.03 faults a scan at 65-75 µs each, about 2
+µs, before the memo's loss. Both lighter codings stay as arms for the
+bounds they fit (this store under 768 MiB, or three million keys under
+this one), where the raw tails with the memo off read the point-read
+mixes 1.3-1.5x faster than the LZ4 form; the trim is an arm, off, refuted
+as a lever on the fit; and the controller's choice of a coding, when it is
+made, is made on the form's size against what the mixes leave, which the
+`mixcensus` line now reads.

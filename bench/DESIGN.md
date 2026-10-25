@@ -353,7 +353,10 @@ whatever the controller would decide, and `supdb-cache64tofitzpagesstored`
 the same with every group stored; `supdb-nocachezpagesrecordraw` and
 `supdb-cache64tofitzpagesrecordraw` are the two under the record coding with
 every tail stored raw (`Options::zpages_raw_tails`), the heads front-coded
-and the values the records' own bytes;
+and the values the records' own bytes, and
+`supdb-cache64tofitzpagesrecordrawlean` is the cached one with the memo of
+decoded groups off and the allocator trimmed once after the form files'
+install (`Options::zpages_trim_install`), the fit check of that form;
 `supdb-cache64tofitautozpagesperrun` is the combined arm with a block read
 through a cursor a run, a seek a cut and a read by rank a replaced record
 (`Options::zpages_block_cursor` off), where the default reads a block through

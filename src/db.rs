@@ -1189,6 +1189,17 @@ pub struct Options {
     /// cache, against `supdb-cache64tofitzpages`.
     #[doc(hidden)]
     pub zpages_raw_tails: bool,
+    /// EXPERIMENT: the allocator trimmed once (`malloc_trim`) at the end of
+    /// `zpages_settle`, after every partition has its form file: what the
+    /// builds' threads and the load left free in their arenas is given back
+    /// to the kernel, so a form that fits the bound by a margin of tens of
+    /// megabytes has them for its pages. With `zpages_memo` off it is the
+    /// fit check of the raw-tail coding at five million keys under 640 MiB
+    /// (`supdb-cache64tofitzpagesrecordrawlean` against
+    /// `supdb-cache64tofitzpages`), where the form's 556 MB beside the
+    /// block cache left the process's anonymous bytes the margin. Off.
+    #[doc(hidden)]
+    pub zpages_trim_install: bool,
     /// Whether the controller buys its first form at SUSPECT on the model's
     /// prediction, once the sampler has priced it and the partitions have
     /// stood for `zselect::EAGER_SETTLE` with nothing of the segment work in
@@ -2669,6 +2680,7 @@ impl Default for Options {
             zpages_record_coding: false,
             zpages_store_all: false,
             zpages_raw_tails: false,
+            zpages_trim_install: false,
             zpages_build_eager: false,
             zpages_inject: None,
             forms_pieces_only: false,
@@ -26640,7 +26652,7 @@ impl Db {
         if matches!(self.maint, MaintHome::Away(_)) {
             self.settle()?;
             self.maint_request(MaintAsk::ZSettle)?;
-            return self.z_sweep_live();
+            return self.z_settle_end();
         }
         for _ in 0..ZSETTLE_ROUNDS {
             self.settle()?;
@@ -26739,7 +26751,20 @@ impl Db {
         // A build that finished after the landing that retired its segment
         // wrote a file nothing claims, and so did a build the rounds ran
         // out before.
-        self.z_sweep_live()
+        self.z_settle_end()
+    }
+
+    /// The end of `zpages_settle`, whichever home the segment work has: the
+    /// form files no live segment claims swept, and under
+    /// `Options::zpages_trim_install` the allocator trimmed once, now that
+    /// every partition has its form file and the builds' threads have left
+    /// what they freed in their arenas.
+    fn z_settle_end(&self) -> Result<()> {
+        self.z_sweep_live()?;
+        if self.opts.zpages_trim_install {
+            heap::trim();
+        }
+        Ok(())
     }
 
     /// A test's: the next form file build fails as a write error would.
