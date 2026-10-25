@@ -182,6 +182,14 @@ struct Cfg {
     /// `ZFUZZ_OPTVARY`, so a scan that takes its block from the cache is
     /// read against the model too.
     start_cache: bool,
+    /// Every group of the form stored verbatim (`Options::zpages_store_all`,
+    /// off); on in some seeds under `ZFUZZ_OPTVARY`, so the stored form is
+    /// read against the model too.
+    store_all: bool,
+    /// The record coding's tails stored raw (`Options::zpages_raw_tails`,
+    /// off), with the record coding on; on in some seeds under
+    /// `ZFUZZ_OPTVARY`.
+    raw_tails: bool,
 }
 
 /// Whether a seed runs with the block cache on. The chance is drawn whenever
@@ -235,6 +243,8 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         fence_tree: std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25),
         memo_ahead: !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15)),
         start_cache: std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25),
+        store_all: std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25),
+        raw_tails: std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25),
     }
 }
 
@@ -252,9 +262,11 @@ fn opts(c: &Cfg) -> Options {
         zpages_trusted_views: c.trusted,
         zpages_memo_first: c.memo_first,
         zpages_block_cursor: c.block_cursor,
-        zpages_record_coding: c.record_coding,
+        zpages_record_coding: c.record_coding || c.raw_tails,
+        zpages_raw_tails: c.raw_tails,
         zpages_fence_tree: c.fence_tree,
         zpages_memo_ahead: c.memo_ahead,
+        zpages_store_all: c.store_all,
         scan_start_cache: if c.start_cache { 4096 } else { 0 },
         ..Options::default()
     };

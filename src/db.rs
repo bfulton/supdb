@@ -1162,6 +1162,33 @@ pub struct Options {
     /// record coding paired").
     #[doc(hidden)]
     pub zpages_record_coding: bool,
+    /// EXPERIMENT: the form file's groups stored verbatim, every one, LZ4
+    /// never tried -- the lightest coding, whose decode is the payload
+    /// itself (`zpages::GroupEntry::stored`, which the fill gave a group that
+    /// LZ4 did not shrink) and whose form is the records' own bytes, about
+    /// 120 a record at the suite's shape against 68 under LZ4. Built for the
+    /// E mix at five million keys under 640 MiB, where the LZ4 form's decode
+    /// is three quarters of E's loss to LMDB and the stored form would hold
+    /// about 600 MB beside the process's 77: the gear is the lightest coding
+    /// that fits the bound. Off; `supdb-nocachezpagesstored` is the forced
+    /// arm and `supdb-cache64tofitzpagesstored` the forced form with the
+    /// block cache, against `supdb-cache64tofitzpages`.
+    #[doc(hidden)]
+    pub zpages_store_all: bool,
+    /// EXPERIMENT: under the record coding (`zpages_record_coding`), every
+    /// record's tail stored raw and LZ4 never tried on one: the heads
+    /// front-coded against the group's first record as that coding has
+    /// them, the values the records' own bytes, so a decode is a copy a
+    /// record and a point read copies one. About 108 bytes a record at the
+    /// suite's shape against 120 stored whole and 68 under LZ4: at five
+    /// million keys under 640 MiB the stored-whole form did not fit beside
+    /// the process (0.31 major faults a scan in the scan pass) and this one
+    /// should, at about 556 MB of 594 available. Off;
+    /// `supdb-nocachezpagesrecordraw` is the forced arm and
+    /// `supdb-cache64tofitzpagesrecordraw` the forced form with the block
+    /// cache, against `supdb-cache64tofitzpages`.
+    #[doc(hidden)]
+    pub zpages_raw_tails: bool,
     /// Whether the controller buys its first form at SUSPECT on the model's
     /// prediction, once the sampler has priced it and the partitions have
     /// stood for `zselect::EAGER_SETTLE` with nothing of the segment work in
@@ -2640,6 +2667,8 @@ impl Default for Options {
             zpages_prebuild: false,
             zpages_group_bytes: zpages::ZGROUP_BYTES,
             zpages_record_coding: false,
+            zpages_store_all: false,
+            zpages_raw_tails: false,
             zpages_build_eager: false,
             zpages_inject: None,
             forms_pieces_only: false,
@@ -26475,6 +26504,8 @@ impl Db {
                 plan.ahead = self.opts.zpages_build_ahead;
                 plan.group_bytes = self.opts.zpages_group_bytes;
                 plan.coding = self.opts.z_coding();
+                plan.store_all = self.opts.zpages_store_all;
+                plan.raw_tails = self.opts.zpages_raw_tails;
                 plan
             })
         };
@@ -33226,6 +33257,8 @@ impl Maint {
         let floor = self.opts.zpages_min_bytes;
         let group_bytes = self.opts.zpages_group_bytes;
         let coding = self.opts.z_coding();
+        let store_all = self.opts.zpages_store_all;
+        let raw_tails = self.opts.zpages_raw_tails;
         let wake = self.wake.clone();
         zfile::ZEvents::add(&self.shared.z.samples, 1);
         let io_idle = self.opts.zpages_io_idle;
@@ -33245,8 +33278,12 @@ impl Maint {
                                 id,
                                 end,
                                 floor,
-                                group_bytes,
-                                coding,
+                                zfile::FillShape {
+                                    group_bytes,
+                                    coding,
+                                    store_all,
+                                    raw_tails,
+                                },
                             ),
                             _ => Err(err("z sample: a partition without an id")),
                         };
@@ -33904,6 +33941,8 @@ impl Maint {
         plan.ahead = self.opts.zpages_build_ahead;
         plan.group_bytes = self.opts.zpages_group_bytes;
         plan.coding = self.opts.z_coding();
+        plan.store_all = self.opts.zpages_store_all;
+        plan.raw_tails = self.opts.zpages_raw_tails;
         plan.cancel = Some(cancel.clone());
         plan.hold = Some(shared.zbuild_hold.clone());
         let fail = shared.fail_zbuild.swap(false, AtomicOrdering::AcqRel);

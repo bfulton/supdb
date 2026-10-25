@@ -345,6 +345,15 @@ scan started skipping the partition's seek, where the default seeks every
 start; `supdb-cache128tofitautozpages` and `supdb-cache256tofitautozpages`
 are the combined arm with the block cache's budget at 128 and 256 MB
 (`Options::scan_cache_bytes`), where the default's is 64;
+`supdb-nocachezpagesstored` is the forced form with every group stored
+verbatim (`Options::zpages_store_all`), no LZ4, where the default compresses
+every group that shrinks; `supdb-cache64tofitzpages` is the forced form with
+the combined arm's block cache and budget, the form installed from the start
+whatever the controller would decide, and `supdb-cache64tofitzpagesstored`
+the same with every group stored; `supdb-nocachezpagesrecordraw` and
+`supdb-cache64tofitzpagesrecordraw` are the two under the record coding with
+every tail stored raw (`Options::zpages_raw_tails`), the heads front-coded
+and the values the records' own bytes;
 `supdb-cache64tofitautozpagesperrun` is the combined arm with a block read
 through a cursor a run, a seek a cut and a read by rank a replaced record
 (`Options::zpages_block_cursor` off), where the default reads a block through
