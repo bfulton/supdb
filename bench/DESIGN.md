@@ -338,7 +338,11 @@ the attach (`Options::zpages_fence_tree`), where the default searches the
 keys; `supdb-cache64tofitautozpagesmemonoahead` is the combined arm
 with a decode asking nothing ahead for the memo entry its put displaces
 (`Options::zpages_memo_ahead` off), where the default asks for its line
-before the decode;
+before the decode; `supdb-cache64tofitautozpagesstartcache` is the
+combined arm with a scan's start key kept with its block
+(`Options::scan_start_cache` at 4,096 entries), a scan starting where a
+scan started skipping the partition's seek, where the default seeks every
+start;
 `supdb-cache64tofitautozpagesperrun` is the combined arm with a block read
 through a cursor a run, a seek a cut and a read by rank a replaced record
 (`Options::zpages_block_cursor` off), where the default reads a block through

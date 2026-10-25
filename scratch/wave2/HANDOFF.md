@@ -331,6 +331,61 @@ user's call.
   200 ms after its mark, so the C mix's windows (130-200 ms) hold the tail
   of C or nothing; a point-read profile needs perf attached before the
   pass.
+- **The settle counted, the span arm re-paired, the start cache refuted**
+  (`stage4.md`, its last three sections). The per-mix events line carries
+  the settle's counts (`settle_runs/keys/blocks/rebuilds`,
+  `lazy_cuts_filed/resolved`; `Db::settle_density`): E's settle is 43 runs
+  a pass filing the 49,000-key backlog the mixes before it leave, 1.1 µs a
+  key, no piece over 2% of E, not a lever. `supdb-cache64tofitautozpagesspan`
+  paired again in two sittings read E 0.990 (0.940/1.043): level, off. The
+  start cache (`Options::scan_start_cache`, `db::StartCache`), a scan's
+  start key kept with its block against the partition's blob identity,
+  built for E's Zipfian starts (half among four thousand keys), paired
+  level (E 0.981 in both sittings), and the counts and the arm-pair profile
+  said why: 15,800 hits of 79,200 starts (63,000 puts churn 4,096
+  direct-mapped slots), the decodes unchanged because every skipped seek
+  was a memo hit, the seek's subtree down 4% of its samples and the scan's
+  own up as much in the cache's lookups. Off;
+  `supdb-cache64tofitautozpagesstartcache` is the arm, on in a quarter of
+  the fuzz's `ZFUZZ_OPTVARY` seeds; `tests/zpages.rs` holds a store with it
+  to one without, and `tests/fuzz.rs` draws it. The bound for the family: a
+  cache by key reaches at most the 53% of E's starts that repeat, one by
+  block range about 78%, and either saves the seek only where the block is
+  a copy -- the hot blocks, whose seeks are the cheap ones.
+- **The fuzz's red at seed 242, a bug older than the change, fixed**
+  (`stage4.md`, "The fuzz's red on this tree"): the scan snapshot's arena
+  answered a batched reservation of no bytes -- the empty key alone in the
+  live table -- with its tail and no block, and the read of those bytes at
+  the next partition's fence asked for the block: the upkeep thread
+  panicked and the store's drop aborted the process, four runs in five at
+  the seed alone. `SnapArena::reserve`, `write` and `slice` take no block
+  for no bytes now; `db::snap_arena::no_bytes_take_no_block_and_read_as_none`
+  and `tests/settle.rs`'s
+  `a_snapshot_over_the_empty_key_alone_is_sought_at_a_partitions_fence`
+  hold it, the second red on the guards removed. The attribution's method
+  is the rule, now in `CLAUDE.md`: a draw added to the fuzz moves every
+  seed's operations, so a failure that appears with a new option is
+  attributed by running the commit before with the same draws (`$S/wt-head`,
+  its fuzz patched to consume the draw, its own target), not by the
+  option's name -- the start cache was off in the seed and the commit before
+  failed four runs in six.
+- **Where E's time is, by the arm pair's profile at the head**: the LZ4
+  decode 25% of the thread (147,000 groups a pass, 2.5 a form walk, nearly
+  every one a memo miss, since the form walks are the Zipfian's cold tail),
+  the start seek 21% with its decodes inside it, the record walks about a
+  quarter (`walk_run` 12%, the clean runs 12%), the builds 11%, the settle
+  7%, the harness's generator and clock about a sixth. The levers left are
+  on the decode. liblz4 is one (above, the user's call). The other is a form
+  that compresses less: the suite's values are half motif and half entropy
+  (`workload::Payload`), LZ4 takes them to about 68 bytes of 100 and the
+  form files to 360 MB where the raw files are about 650, and a form with
+  the keys front-coded and the values stored would be about 520 MB -- it
+  fits the five-million rung under 640 MiB with little room and not the
+  next, and its group decode is a copy, or a read in place with no memo.
+  The controller chooses forms by their measured faults already, so a
+  lighter form is a second form for it to choose when it fits, not a
+  replacement. Not built: the user asked why compress at all, and this is
+  the answer's shape.
 - **Untouched**: the shuffled-load kill of the combined arm under 640 MiB
   and the gear shift, as the session before left them.
 

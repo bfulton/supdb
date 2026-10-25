@@ -1,0 +1,19 @@
+d0636fa
+ M bench/DESIGN.md
+ M bench/src/engines.rs
+ M bench/src/run.rs
+ M scratch/wave2/stage4.md
+ M src/db.rs
+ M tests/fuzz.rs
+ M tests/zpages.rs
+?? scratch/wave2/zspan-quick-ab.err
+?? scratch/wave2/zspan-quick-ab.out
+?? scratch/wave2/zspan2-ab-1.err
+?? scratch/wave2/zspan2-ab-1.out
+?? scratch/wave2/zspan2-ab-2.err
+?? scratch/wave2/zspan2-ab-2.out
+?? scratch/wave2/zspan2-build.log
+?? scratch/wave2/zspan2-head.txt
+?? scratch/wave2/zstartcache-build.log
+?? scratch/wave2/zstartcache-head.txt
+2026-10-25T01:26:19Z

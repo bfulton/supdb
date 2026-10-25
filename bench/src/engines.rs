@@ -863,6 +863,11 @@ pub struct Supdb {
     /// `supdb-cache64tofitautozpagesmemonoahead`, the pair against
     /// `supdb-cache64tofitautozpages`.
     zmemonoahead: bool,
+    /// The combined arm with a scan's start key kept with its block
+    /// (`Options::scan_start_cache` at 4,096 entries, a repeated start
+    /// skipping the seek): `supdb-cache64tofitautozpagesstartcache`, the
+    /// pair against `supdb-cache64tofitautozpages`, which seeks every start.
+    zstartcache: bool,
     /// The combined arm with a block read through a cursor a run, a seek a
     /// cut and a read by rank a replaced record
     /// (`Options::zpages_block_cursor` off): `supdb-cache64tofitautozpagesperrun`,
@@ -1337,6 +1342,9 @@ struct Policy {
     /// Nothing asked ahead for the memo entry a decode's put displaces
     /// (`Options::zpages_memo_ahead` off): `supdb-cache64tofitautozpagesmemonoahead`.
     zmemonoahead: bool,
+    /// A scan's start key kept with its block (`Options::scan_start_cache`
+    /// at 4,096 entries): `supdb-cache64tofitautozpagesstartcache`.
+    zstartcache: bool,
     /// A block read through a cursor a run, a seek a cut and a read by rank
     /// a replaced record (`Options::zpages_block_cursor` off):
     /// `supdb-cache64tofitautozpagesperrun`.
@@ -1462,6 +1470,7 @@ impl Default for Policy {
             zmemofirst: false,
             zfencetree: false,
             zmemonoahead: false,
+            zstartcache: false,
             zperrun: false,
             zmemo_mib: 0,
             defer: false,
@@ -3323,6 +3332,23 @@ impl Supdb {
         )
     }
 
+    /// `supdb-cache64tofitautozpages` with a scan's start key kept with its
+    /// block (`Options::scan_start_cache` at 4,096 entries), a scan starting
+    /// where a scan started skipping the partition's seek: the pair against
+    /// `supdb-cache64tofitautozpages` prices the cache on those starts.
+    pub fn create_cache64_tofit_auto_zpages_startcache(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages_auto: true,
+                zstartcache: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-cache64tofitautozpages` with a block read through a cursor a
     /// run, a seek a cut and a read by rank a replaced record
     /// (`Options::zpages_block_cursor` off), the shape before a block was
@@ -4459,6 +4485,7 @@ impl Supdb {
             zmemofirst,
             zfencetree,
             zmemonoahead,
+            zstartcache,
             zperrun,
             zmemo_mib,
         } = policy;
@@ -4715,6 +4742,7 @@ impl Supdb {
             zpages_memo_first: zmemofirst,
             zpages_fence_tree: zfencetree,
             zpages_memo_ahead: !zmemonoahead,
+            scan_start_cache: if zstartcache { 4096 } else { 0 },
             zpages_block_cursor: !zperrun,
             zpages_memo_bytes: if zmemo_mib > 0 {
                 zmemo_mib << 20
@@ -4906,6 +4934,7 @@ impl Supdb {
             zmemofirst,
             zfencetree,
             zmemonoahead,
+            zstartcache,
             zperrun,
             zmemo_mib,
             ord_threads: Default::default(),
@@ -5006,6 +5035,8 @@ impl Engine for Supdb {
                 "supdb-cache64tofitautozpagesfencetree"
             } else if self.zmemonoahead {
                 "supdb-cache64tofitautozpagesmemonoahead"
+            } else if self.zstartcache {
+                "supdb-cache64tofitautozpagesstartcache"
             } else if self.zperrun {
                 "supdb-cache64tofitautozpagesperrun"
             } else if self.zmemo_mib == 4 {
@@ -5649,6 +5680,7 @@ impl Engine for Supdb {
         // store's own life instead.
         let (forms, form_bytes, _, _) = db.canonical_forms();
         let ev = db.forms_events();
+        let sd = db.settle_density();
         let wk = db.forms_walks();
         let cs = db.copy_starts();
         let ph = db.scan_phases();
@@ -5722,8 +5754,17 @@ impl Engine for Supdb {
             ("start_at_rank", cs[0] as f64),
             ("start_search", cs[1] as f64),
             ("span_starts", db.span_starts() as f64),
+            // The scans' start blocks the start cache named, and the
+            // starts it kept: see `Db::start_cache_counts`.
+            ("start_cache_hits", db.start_cache_counts().0 as f64),
+            ("start_cache_puts", db.start_cache_counts().1 as f64),
             ("lazy_cuts_filed", db.lazy_cuts()[0] as f64),
             ("lazy_cuts_resolved", db.lazy_cuts()[1] as f64),
+            // The writer's settles: see `Db::settle_density`.
+            ("settle_runs", sd[0] as f64),
+            ("settle_keys", sd[1] as f64),
+            ("settle_blocks", sd[2] as f64),
+            ("settle_rebuilds", sd[3] as f64),
             ("walk_sparse", wk[1] as f64),
             ("walk_other", wk[2] as f64),
             // Seeks that hinted their stride window's directory: see
@@ -6500,6 +6541,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache64tofitautozpagesmemofirst"
         | "supdb-cache64tofitautozpagesfencetree"
         | "supdb-cache64tofitautozpagesmemonoahead"
+        | "supdb-cache64tofitautozpagesstartcache"
         | "supdb-cache64tofitautozpagesperrun"
         | "supdb-cache64tofitautozpagesmemo4"
         | "supdb-cache64tofitautozpagesmemo16"
@@ -6738,6 +6780,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         }
         "supdb-cache64tofitautozpagesmemonoahead" => {
             Box::new(Supdb::create_cache64_tofit_auto_zpages_memonoahead(dir)?)
+        }
+        "supdb-cache64tofitautozpagesstartcache" => {
+            Box::new(Supdb::create_cache64_tofit_auto_zpages_startcache(dir)?)
         }
         "supdb-cache64tofitautozpagesperrun" => {
             Box::new(Supdb::create_cache64_tofit_auto_zpages_perrun(dir)?)
@@ -7965,6 +8010,33 @@ mod tests {
             )
         );
         drop(noahead);
+        assert!(supdb::Options::default().scan_start_cache == 0 && b.scan_start_cache == 0);
+        let startc = new(
+            "supdb-cache64tofitautozpagesstartcache",
+            Supdb::create_cache64_tofit_auto_zpages_startcache,
+        );
+        assert_eq!(startc.name(), "supdb-cache64tofitautozpagesstartcache");
+        assert_eq!(guarantee(startc.name()), guarantee(base.name()));
+        assert_eq!(startc.features(), base.features());
+        let g = startc.db.as_ref().unwrap().options();
+        assert_eq!(g.scan_start_cache, 4096, "the one option");
+        assert_eq!(
+            (
+                g.zpages,
+                g.zpages_memo_ahead,
+                g.zpages_trusted_views,
+                g.zpages_seek_span,
+                g.scan_cache_bytes
+            ),
+            (
+                b.zpages,
+                b.zpages_memo_ahead,
+                b.zpages_trusted_views,
+                b.zpages_seek_span,
+                b.scan_cache_bytes
+            )
+        );
+        drop(startc);
         assert!(supdb::Options::default().zpages_block_cursor && b.zpages_block_cursor);
         let perrun = new(
             "supdb-cache64tofitautozpagesperrun",

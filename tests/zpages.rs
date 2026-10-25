@@ -2347,6 +2347,112 @@ fn the_block_cache_with_its_reads_raw_touches_the_raw_form() {
     assert!(touched > 0, "the cache's reads through the door: {touched}");
 }
 
+/// A scan that starts where a scan started before takes its block from the
+/// start cache (`Options::scan_start_cache`) and answers as the model does
+/// and as the same store with the cache off does: over the drained store,
+/// with unsealed keys inside the windows -- inserts between records,
+/// appends, deletes -- and with the same keys sealed into a piece, from
+/// starts drawn from a small head so that most repeat, and from keys the
+/// cache never sees: between records, below the first, past the last. The
+/// writer and a handle each hit on their repeated starts, the store with the
+/// cache off keeps nothing, and a key over sixteen bytes is sought as before.
+#[test]
+fn a_scan_from_a_key_a_scan_started_at_takes_its_block_from_the_start_cache() {
+    let mut stores: Vec<(Db, Model)> = Vec::new();
+    for (name, entries) in [("startcache-on", 4096usize), ("startcache-off", 0)] {
+        let dir = scratch(name);
+        let mut db = Db::create(
+            &dir,
+            forced(|o| {
+                o.partition_bytes = Some(160 << 10);
+                o.inline_bytes = 1 << 16;
+                o.scan_block_cache = true;
+                o.scan_start_cache = entries;
+            }),
+        )
+        .unwrap();
+        let model = ordered_load(&mut db, 5000, 0x5CA7);
+        db.zpages_settle().unwrap();
+        db.settle().unwrap();
+        stores.push((db, model));
+    }
+    let keys: Vec<Vec<u8>> = stores[0].1.keys().cloned().collect();
+    let mut rng = Rng(0x5CA71);
+    let starts: Vec<Vec<u8>> = (0..400).map(|_| keys[rng.below(40)].clone()).collect();
+    let mut probes: Vec<Vec<u8>> = vec![b"".to_vec(), b"a".to_vec(), vec![0xff; 8], vec![b'5'; 24]];
+    probes.extend(keys.iter().step_by(97).flat_map(|k| around(k)));
+    let limits = [1usize, 7, 64, 130];
+    let round = |stores: &[(Db, Model)], what: &str| {
+        for (db, model) in stores {
+            let r = db.reader().unwrap();
+            let w: &Reader = db;
+            for who in [w, &r] {
+                for start in starts.iter().chain(&probes) {
+                    for &limit in &limits {
+                        same_window(
+                            &scanned(who, start, limit),
+                            &window(model, start, limit),
+                            &format!(
+                                "{what}, from {:?} for {limit}",
+                                String::from_utf8_lossy(start)
+                            ),
+                        );
+                    }
+                }
+            }
+            let (hits, puts) = db.start_cache_counts();
+            let (rh, rp) = r.start_cache_counts();
+            if db.options().scan_start_cache > 0 {
+                assert!(
+                    puts > 0 && hits > puts && rp > 0 && rh > rp,
+                    "{what}: the repeated starts hit: writer {hits}/{puts}, handle {rh}/{rp}"
+                );
+            } else {
+                assert_eq!((hits, puts, rh, rp), (0, 0, 0, 0), "{what}: nothing kept");
+            }
+        }
+    };
+    round(&stores, "drained");
+    // Unsealed keys over the windows, the same in both stores.
+    let mut ops: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+    for i in 0..300 {
+        let k = keys[rng.below(keys.len())].clone();
+        match i % 3 {
+            0 => ops.push((k, Some(suite_value(&mut rng)))),
+            1 => {
+                let mut between = k.clone();
+                between.push(b'~');
+                ops.push((between, Some(suite_value(&mut rng))));
+            }
+            _ => ops.push((k, None)),
+        }
+    }
+    for (db, model) in stores.iter_mut() {
+        for (k, v) in &ops {
+            match v {
+                Some(v) => {
+                    db.append(k, v);
+                    model.entry(k.clone()).or_default().push(v.clone());
+                }
+                None => {
+                    db.delete(k);
+                    model.insert(k.clone(), Vec::new());
+                }
+            }
+        }
+        db.commit().unwrap();
+    }
+    round(&stores, "with unsealed keys");
+    // The same keys sealed into a piece: the merge path beside the cache.
+    for (db, _) in stores.iter_mut() {
+        db.seal().unwrap();
+        db.zpages_settle().unwrap();
+        db.settle().unwrap();
+        assert!(db.levels().1 >= 1, "a piece landed: {:?}", db.levels());
+    }
+    round(&stores, "sealed into a piece");
+}
+
 /// The body of the three tests above: the store, its phases and the reads
 /// under each, counted on the writer and a handle. With `via_form` the
 /// count is held to zero; without it the touches are summed and returned.

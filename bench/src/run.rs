@@ -570,6 +570,20 @@ fn counters_line(
             "zpage_prefetches",
             "zpage_nopage_scans",
             "zpage_raw_scans",
+            // The writer's settles over the mix: runs, keys, the blocks
+            // the keys grouped into, the blocks dropped for a rebuild, and
+            // the keys filed with their cut unresolved against those
+            // resolved by a seek (`Db::settle_density`, `Db::lazy_cuts`).
+            "settle_runs",
+            "settle_keys",
+            "settle_blocks",
+            "settle_rebuilds",
+            "lazy_cuts_filed",
+            "lazy_cuts_resolved",
+            // The scans' start blocks the start cache named, and the
+            // starts it kept (`Db::start_cache_counts`).
+            "start_cache_hits",
+            "start_cache_puts",
         ];
         let ev: Vec<String> = names.iter().map(|n| format!("{n} {:.0}", d(n))).collect();
         eprintln!("{tag}-events {arm} {point} {}", ev.join(" | "));
