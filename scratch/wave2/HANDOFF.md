@@ -389,6 +389,29 @@ user's call.
   LMDB there is in core by minor faults. Next: a stored-values group coding
   (keys front-coded, about 530 MB at five million) as the lightest coding
   that fits the bound, the forced and the combined arms paired under it.
+- **The stored-whole form, refuted by the fit** (`stage4.md`, "The
+  stored-whole form, refuted at this bound by its size"): every group stored
+  verbatim (`Options::zpages_store_all`; arms `supdb-nocachezpagesstored`,
+  `supdb-cache64tofitzpagesstored`, and `supdb-cache64tofitzpages` as the
+  forced-with-cache control) decodes nothing and reads in place, and at five
+  million keys under 640 MiB its 620 MB do not fit the 594 the process
+  leaves: E 1.275 (slower), D 2.83x, the scan pass 0.60x, 0.31 major faults a
+  scan there against none. `tests/zpages.rs` holds it to the compressed form
+  and to zero decodes. The fitting variant is the record coding with raw
+  tails (`Options::zpages_raw_tails`, about 556 MB; arms
+  `supdb-nocachezpagesrecordraw`, `supdb-cache64tofitzpagesrecordraw`),
+  paired: forced against forced it wins every point-read mix 7-19% and
+  loses E a tenth (its decode is a copy a record, as costly as LZ4's block
+  decode for a scan); with the block cache beside it (`zrawtailscache`) it
+  loses everything, E 1.46x, on 0.016-0.03 major faults an operation, since
+  the cache's anonymous memory was the fit's last margin. So at this rung
+  the LZ4 form is the lightest coding that fits beside the block cache, and
+  the gear picks it; both lighter codings are arms for the bounds they fit.
+  E here is bounded by the LZ4 decode (a quarter of its thread) and the
+  merge bookkeeping (a sixth); the next levers are the codec's speed
+  (liblz4, the user's call), the sparse builds' resolves and the settle's
+  backlog, each a few percent, and the in-place walk of a record-coded
+  group only where that coding fits.
 - **Where E's time is, by the arm pair's profile at the head**: the LZ4
   decode 25% of the thread (147,000 groups a pass, 2.5 a form walk, nearly
   every one a memo miss, since the form walks are the Zipfian's cold tail),
@@ -406,6 +429,16 @@ user's call.
   lighter form is a second form for it to choose when it fits, not a
   replacement. Not built: the user asked why compress at all, and this is
   the answer's shape.
+- **Loose end: a census under the bound kills the load.** `bench ab` at
+  five million keys under 640 MiB with `SUPDB_LAG_COUNTERS=1` and
+  `--passes load,mixes,lag` (`$S/census-run.sh`) was OOM-killed by the
+  bound's cgroup nine seconds into the second arm's load, at 636 MiB of
+  anonymous memory (`dmesg`: `anon-rss:651596kB`), where the pairings'
+  loads under the same bound, with the counters unset, hold 75-77 MB. The
+  counters mode or the lag pass's presence holds the load's memory; not
+  chased, since the fit question it was to answer is answered by the fault
+  columns, but a census of what the process holds under the bound by owner
+  still has no run that prints it.
 - **Untouched**: the shuffled-load kill of the combined arm under 640 MiB
   and the gear shift, as the session before left them.
 

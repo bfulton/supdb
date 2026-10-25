@@ -1,0 +1,20 @@
+880ffcb
+ M bench/DESIGN.md
+ M bench/src/engines.rs
+ M docs/engine.md
+ M scratch/wave2/HANDOFF.md
+ M scratch/wave2/stage4.md
+ M src/db.rs
+ M src/db/zfile.rs
+ M src/db/zpages.rs
+ M tests/fuzz.rs
+ M tests/zpages.rs
+?? scratch/wave2/zrawtails-build.log
+?? scratch/wave2/zrawtails-head.txt
+?? scratch/wave2/zstored-ab-1.err
+?? scratch/wave2/zstored-ab-1.out
+?? scratch/wave2/zstored-ab-2.err
+?? scratch/wave2/zstored-ab-2.out
+?? scratch/wave2/zstored-build.log
+?? scratch/wave2/zstored-head.txt
+2026-10-25T15:54:05Z

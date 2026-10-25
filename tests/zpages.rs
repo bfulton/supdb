@@ -7130,3 +7130,65 @@ fn a_block_read_often_enough_under_the_form_is_held_as_a_copy_and_walked_without
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// Every group stored verbatim (`Options::zpages_store_all`, off): the form
+/// answers reads, counts and scans as the compressed one does, its files are
+/// the records' own bytes and larger than the compressed ones by more than a
+/// quarter at the suite's shape, and a read through it decodes nothing,
+/// since a stored group's payload is the group.
+#[test]
+fn a_form_stored_whole_answers_as_the_compressed_one_and_decodes_nothing() {
+    let mut bytes = Vec::new();
+    // Compressed, stored whole, and the record coding with raw tails: the
+    // last answers as the others and sits between them in size.
+    for (stored, raw) in [(false, false), (true, false), (false, true)] {
+        let what = format!("stored {stored} raw tails {raw}");
+        let dir = scratch(&format!("stored-whole-{stored}-{raw}"));
+        let mut db = Db::create(
+            &dir,
+            forced(|o| {
+                o.partition_bytes = Some(160 << 10);
+                o.zpages_store_all = stored;
+                o.zpages_record_coding = raw;
+                o.zpages_raw_tails = raw;
+            }),
+        )
+        .unwrap();
+        let model = ordered_load(&mut db, 5000, 0x57ED);
+        db.zpages_settle().unwrap();
+        assert!(db.zpage_counts().form_files >= 3, "{what}: the form files");
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        check(&db, &model, &keys, &what);
+        check_scan(&db, &model, &what);
+        for (i, limit) in [(1234usize, 70usize), (0, 3), (4990, 40)] {
+            same_window(
+                &scanned(&db, &keys[i], limit),
+                &window(&model, &keys[i], limit),
+                &what,
+            );
+        }
+        let c = db.zpage_counts();
+        assert!(c.reads > 0, "{what}: the reads went through the form");
+        if stored {
+            assert_eq!(c.decodes, 0, "{what}: a stored group decodes nothing");
+        } else {
+            assert!(c.decodes > 0, "{what}: the compressed groups decode");
+        }
+        bytes.push(
+            form_files(&dir)
+                .iter()
+                .map(|p| std::fs::metadata(p).unwrap().len())
+                .sum::<u64>(),
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert!(
+        bytes[1] > bytes[0] + bytes[0] / 4,
+        "the stored form is the records' bytes: {bytes:?}"
+    );
+    assert!(
+        bytes[0] < bytes[2] && bytes[2] < bytes[1],
+        "the raw-tail form sits between the compressed and the stored: {bytes:?}"
+    );
+}

@@ -3310,6 +3310,12 @@ pub(super) struct BuildPlan {
     /// `FillScratch::coding`): `ZCODING_RECORD` as the engine ships,
     /// `ZCODING_BLOCK` the shape before.
     pub coding: u8,
+    /// Every group stored verbatim, LZ4 never tried
+    /// (`Options::zpages_store_all`, `FillScratch::store_all`).
+    pub store_all: bool,
+    /// Under the record coding, every tail stored raw
+    /// (`Options::zpages_raw_tails`, `FillScratch::raw_tails`).
+    pub raw_tails: bool,
     /// A build on a thread of its own looks here once a page: set, the
     /// build stops, removes its temp file and answers `Outcome::Cancelled`.
     /// A merge that takes the build's target as an input sets it.
@@ -3330,6 +3336,8 @@ impl BuildPlan {
             ahead: 0,
             group_bytes: ZGROUP_BYTES,
             coding: ZCODING_BLOCK,
+            store_all: false,
+            raw_tails: false,
             cancel: None,
             hold: None,
         }
@@ -3514,6 +3522,8 @@ fn write_pages(
     let mut scratch = FillScratch::new();
     scratch.group_bytes = plan.group_bytes;
     scratch.coding = plan.coding;
+    scratch.store_all = plan.store_all;
+    scratch.raw_tails = plan.raw_tails;
     let mut verify_buf = GroupBuf::new();
     let mut fence = ZFence::new();
     let recs_at = recs.as_ptr() as usize - base;
@@ -3893,13 +3903,46 @@ pub(super) const SAMPLE_CHAIN: usize = 3;
 
 /// `blob`'s sample, see [`Sample`]; `floor` is the record bytes under which
 /// the partition is declined (`Options::zpages_min_bytes`).
+/// The fill's shape a sample and a build take from the options: the
+/// decoded bytes a group is cut at, the coding of the groups that compress,
+/// and whether every group is stored verbatim or every tail raw
+/// (`Options::zpages_group_bytes`, `z_coding`, `zpages_store_all`,
+/// `zpages_raw_tails`).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct FillShape {
+    pub group_bytes: usize,
+    pub coding: u8,
+    pub store_all: bool,
+    pub raw_tails: bool,
+}
+
+impl Default for FillShape {
+    fn default() -> FillShape {
+        FillShape {
+            group_bytes: ZGROUP_BYTES,
+            coding: ZCODING_BLOCK,
+            store_all: false,
+            raw_tails: false,
+        }
+    }
+}
+
+impl FillShape {
+    /// The scratch's shape set from this one.
+    fn apply(&self, scratch: &mut FillScratch) {
+        scratch.group_bytes = self.group_bytes;
+        scratch.coding = self.coding;
+        scratch.store_all = self.store_all;
+        scratch.raw_tails = self.raw_tails;
+    }
+}
+
 pub(super) fn sample(
     blob: &Blob<MmapBytes>,
     id: u64,
     end_seq: u64,
     floor: usize,
-    group_bytes: usize,
-    coding: u8,
+    shape: FillShape,
 ) -> Result<Sample> {
     let facts = blob.z_source_facts().ok_or_else(|| {
         super::err("z sample: the segment has no checksum row to bind a form file to")
@@ -3925,8 +3968,7 @@ pub(super) fn sample(
     let bind = bind32(id, end_seq, facts.nkeys, facts.row_crc);
     let images = SegImages::new(recs, dir, nkeys);
     let mut scratch = FillScratch::new();
-    scratch.group_bytes = group_bytes;
-    scratch.coding = coding;
+    shape.apply(&mut scratch);
     let mut buf = GroupBuf::new();
     let mut page = [0u8; ZPAGE];
     let flt0 = thread_major_faults().unwrap_or(0);
@@ -4130,7 +4172,7 @@ mod tests {
     #[test]
     fn a_sample_estimates_the_form_within_a_tenth_of_the_build() {
         let fx = Fixture::new("sample", suite(20_000, 0x5A4), 1 << 16);
-        let s = sample(&fx.blob, ID, END, 0, ZGROUP_BYTES, ZCODING_BLOCK).unwrap();
+        let s = sample(&fx.blob, ID, END, 0, FillShape::default()).unwrap();
         assert_eq!(s.declined, None, "{s:?}");
         assert_eq!(s.nkeys, 20_000);
         assert_eq!(s.groups, SAMPLE_GROUPS as u64, "{s:?}");
@@ -4158,7 +4200,7 @@ mod tests {
             b.file_bytes
         );
         // The builder's own declines, made first: the floor.
-        let d = sample(&fx.blob, ID, END, usize::MAX, ZGROUP_BYTES, ZCODING_BLOCK).unwrap();
+        let d = sample(&fx.blob, ID, END, usize::MAX, FillShape::default()).unwrap();
         assert!(matches!(d.declined, Some(Decline::Small(_))), "{d:?}");
         assert_eq!((d.groups, d.w_z), (0, 0), "{d:?}");
     }

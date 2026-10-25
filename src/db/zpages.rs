@@ -1118,7 +1118,12 @@ fn image_head_len(img: &[u8]) -> Option<usize> {
 /// group: an image that is not one, a record that would begin past a u16,
 /// or an output too small, which `FillScratch::classify` reads as a group
 /// too big for the page.
-pub fn encode_record_group(imgs: &[u8], ends: &[usize], out: &mut [u8]) -> Option<usize> {
+pub fn encode_record_group(
+    imgs: &[u8],
+    ends: &[usize],
+    out: &mut [u8],
+    raw_tails: bool,
+) -> Option<usize> {
     let n = ends.len();
     if n == 0 || n > ZMAX_COUNT || out.len() < 2 * n {
         return None;
@@ -1159,7 +1164,7 @@ pub fn encode_record_group(imgs: &[u8], ends: &[usize], out: &mut [u8]) -> Optio
         // into the room after where the field at its longest would end.
         let field_max = 3;
         let room = out.get_mut(at + field_max..)?;
-        let clen = if i == 0 || tail.len() < 8 {
+        let clen = if i == 0 || tail.len() < 8 || raw_tails {
             tail.len()
         } else {
             match lz4_flex::block::compress_into_with_dict(tail, room, tail0) {
@@ -1644,6 +1649,13 @@ pub struct FillScratch {
     /// the engine's default), under which a record alone that only the
     /// block holds is the block's (`compress`).
     pub coding: u8,
+    /// Every group stored verbatim, LZ4 never tried (`Options::zpages_store_all`):
+    /// a decode is the payload itself, and the form is the records' bytes.
+    pub store_all: bool,
+    /// Under the record coding, every tail stored raw and LZ4 never tried on
+    /// one (`Options::zpages_raw_tails`): the heads front-coded, the values
+    /// the records' own bytes, a decode a copy a record.
+    pub raw_tails: bool,
     /// What has been done with this scratch.
     pub stats: FillStats,
 }
@@ -1671,6 +1683,8 @@ impl FillScratch {
             group_bytes: ZGROUP_BYTES,
             hint: 0,
             coding: ZCODING_BLOCK,
+            store_all: false,
+            raw_tails: false,
             stats: FillStats::default(),
         }
     }
@@ -1735,6 +1749,17 @@ impl FillScratch {
     /// compressor failed, which a buffer sized for the largest group makes
     /// unreachable.
     fn classify(&mut self, ulen: usize, room: usize) -> Option<Class> {
+        if self.store_all {
+            // The lightest coding: the images are the payload, and a group
+            // that passes the room is trimmed to one that does not, never
+            // compressed to fit.
+            self.stats.calls += 1;
+            return Some(if ulen <= room {
+                Class::Stored
+            } else {
+                Class::TooBig(ulen)
+            });
+        }
         let (n, coded) = self.compress(ulen, room)?;
         self.stats.calls += 1;
         Some(if n >= ulen && ulen <= room {
@@ -1758,8 +1783,13 @@ impl FillScratch {
     /// nothing of it in `out`, which a `TooBig` never reads.
     fn compress(&mut self, ulen: usize, room: usize) -> Option<(usize, bool)> {
         if self.coding == ZCODING_RECORD {
-            let n = encode_record_group(&self.imgs[..ulen], &self.ends, &mut self.out)
-                .unwrap_or(ulen + ulen / 8 + 64 * self.ends.len().max(1));
+            let n = encode_record_group(
+                &self.imgs[..ulen],
+                &self.ends,
+                &mut self.out,
+                self.raw_tails,
+            )
+            .unwrap_or(ulen + ulen / 8 + 64 * self.ends.len().max(1));
             if n <= room || ulen <= room || self.ends.len() > 1 {
                 return Some((n, true));
             }
@@ -3688,7 +3718,7 @@ mod tests {
             ends.push(all.len());
         }
         let mut out = vec![0u8; 2 * ZMAX_ULEN];
-        let n = encode_record_group(&all, &ends, &mut out).expect("the group codes");
+        let n = encode_record_group(&all, &ends, &mut out, false).expect("the group codes");
         out.truncate(n);
         (all, ends, out)
     }
@@ -3744,7 +3774,7 @@ mod tests {
             }
             // No room is a refusal, never a short payload.
             let mut small = vec![0u8; 12];
-            assert!(encode_record_group(&all, &ends, &mut small).is_none());
+            assert!(encode_record_group(&all, &ends, &mut small, false).is_none());
         }
     }
 

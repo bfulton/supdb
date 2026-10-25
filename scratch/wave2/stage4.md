@@ -2771,3 +2771,92 @@ chosen as the controller chooses the form, by what fits and what faults.
 Built next as a group coding beside the block and the record codings, the
 forced and combined arms paired under the bound at five million keys, E
 and the point reads read together.
+
+## The stored-whole form, refuted at this bound by its size
+
+The format already has a stored group (`GroupEntry::stored`, the payload the
+images verbatim, read in place from the mapping with no copy and no memo),
+which the fill gives a group LZ4 does not shrink. `Options::zpages_store_all`
+gives it to every group; `supdb-nocachezpagesstored` is the forced arm and
+`supdb-cache64tofitzpagesstored` the forced form with the block cache, beside
+`supdb-cache64tofitzpages`, the forced form with the combined arm's cache
+and budget, added as the control a coding the controller's size model would
+refuse is priced against. `tests/zpages.rs` holds the stored form to the
+compressed one in every read, count and window, to zero decodes, and to a
+file at least a quarter larger. Paired forced against forced at five million
+keys under 640 MiB (`zstored-ab-{1,2}.err`, five pairs a sitting, both
+orders): the stored form reads E's scans 1.275 (slower) over twelve pairs,
+eleven of twelve, C's gets 1.354 in twelve of twelve, D's 2.831 in twelve of
+twelve, F's 1.578, A's and B's 1.30, the scan pass at 0.60x -- and the reason
+is one column: major faults, 0.31 a scan in the scan pass, 0.19 a point read
+in the read pass, 0.06 a scan in E, 0.11 a read in D, 0.018 in C, where the
+LZ4 form takes none. The images are 120 bytes a record at the suite's shape
+and the stored form about 620 MB of file against the LZ4 form's 360, and the
+cgroup holds 671 MB less the process's 50-77 MB: the form is some 96%
+resident, the tail's misses go to the device at tens of microseconds each,
+and E's decode-free walks are invisible under them (D, which reads the tail
+uniformly, says it loudest). The same shape as the promotion arm's
+refutation: under a bound the LZ4 form just fits, anything that trades page
+cache for decoded bytes loses by the faults it buys, and the stored form
+trades 260 MB of it. The arm stays as the record of the fit, off; at a bound
+the stored form fits, it is the lightest coding there is.
+
+The fitting variant is the record coding with its tails stored raw
+(`Options::zpages_raw_tails`, built next): the heads front-coded against the
+group's first record as that coding has them, the values the records' own
+bytes, a decode a copy a record, about 108 bytes a record and some 556 MB at
+five million -- under the 594 MB the process leaves, where 620 was not. The
+record coding's reader already copies a raw tail where it finds one, so the
+change is the encoder's alone; `supdb-nocachezpagesrecordraw` and
+`supdb-cache64tofitzpagesrecordraw` are the arms, paired as the stored ones
+were.
+
+The raw-tail record coding, forced against the LZ4 form (`zrawtails-ab-{1,2}.err`,
+five pairs a sitting, both orders): the point-read mixes read for it in both
+sittings -- B's gets 0.828 (slower in two of twelve), D's 0.810 (none of
+twelve), F's 0.813 (one), A's 0.880 (three), C's 0.930 (three) -- since a
+point read copies one record of about 108 bytes where the LZ4 form decodes a
+group of two kilobytes or hits the memo; and E's scans read 1.098 against it,
+slower in nine of twelve, 1.100 in six of six in the second sitting, since a
+scan decodes its groups whole and the coding's decode is a copy a record,
+seventeen varint parses and thirty-four small copies a group, about what the
+LZ4 block decode costs, over 12% more groups (175,000 against 155,000 a pass:
+a page holds fewer of the larger payloads and a group that passes the room
+is trimmed). The form fits at steady state -- the mixes take 0.001-0.005
+major faults an operation against the LZ4 form's none -- but the passes
+right after the build do not: 0.14 a read in the read pass and 0.09-0.10 a
+scan in the scan pass (0.58x), the build's own traffic (600 MB of raw records
+read, 556 of form written, through 594 of cache) having pushed the form's
+pages out, which the LZ4 form's 360 survive. What E needs from this coding is
+the value read in place: the payload holds every tail raw and contiguous,
+`record_group_seek` already walks the heads without a decode, and a cursor
+that walked a coded group by record -- the head rebuilt from the group's
+first into a small buffer, the tail lent from the payload -- would decode
+nothing for a scan, a few hundred lines of `ZCursor` (its position a record
+index for a coded group where it is a byte offset for a decoded one). The
+cached pairing (`zrawtailscache`, the forced form with the block cache and
+budget, raw tails against LZ4) says what E reads with the hot head's copies
+beside it.
+
+With the block cache beside it (`zrawtailscache-ab-{1,2}.err`,
+`supdb-cache64tofitzpagesrecordraw` against `supdb-cache64tofitzpages`, the
+forced form with the combined arm's cache and budget, whose E runs at the
+Auto default's 450-500 ms a pass): the raw-tail form loses every cell it won
+forced -- E's scans 1.462 (slower) in twelve of twelve, D's gets 1.272 in
+twelve of twelve, C's 1.299 in nine, B's 1.118 in ten, A and F level -- and
+the faults say why: 0.016 major faults a scan in E, 0.028 a read in D, 0.013
+in C, 0.15-0.20 an operation in the passes, where the LZ4 form takes none.
+The cache's anonymous memory -- the copies, the sparse forms, the tables --
+is the margin the forced arm had left, and without it the 556 MB form is a
+form the tail's reads fetch from the device. So at five million keys under
+640 MiB, beside the block cache that wins E in core, the LZ4 form is the
+lightest coding that fits, and the gear the plan named picks it here. The
+two lighter codings stay as arms, off: at a bound they fit -- this store
+under 768 MiB, or three million keys under this one -- the raw-tail coding
+reads the point-read mixes 7-19% faster for its one-record copies, and the
+stored form decodes nothing at all. E at this rung is bounded by the LZ4
+decode (a quarter of its thread, irreducible but by the codec's own speed)
+and the merge bookkeeping (the sparse builds and the settle, a sixth), and
+neither coding reaches it. The census of what the process holds under the
+bound, by owner, is read next (`zcensus-ab-1.err`), since the fit's margin
+is the one quantity that could still change the answer.
