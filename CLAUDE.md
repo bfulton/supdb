@@ -2225,7 +2225,20 @@ the second form's reviewer found it because its fuzz allowed one. The rule:
 two functions that hand out the same resource take the same guard, and a
 fuzz that draws its inputs from the whole of the type (the empty key, the
 empty value, the key of 0xff bytes) finds what a table of examples chose
-not to.
+not to. It came back in the scan
+snapshot's arena: the batched reservation answered no bytes with the tail
+and no block, the per-key one made the block, and a snapshot built over
+the empty key alone reserved its one key's no bytes the first way; the read
+of them, the fence sought in the snapshot at the next partition's start,
+asked for the block nobody had made and the upkeep thread panicked, one
+seed in three hundred of the differential fuzz once a new option draw had
+moved every seed's operations, with a trace that named the arena's tail at
+zero and no block. A read or a write of no bytes touches no block now,
+and the two reservations agree (`tests/settle.rs`). The corollary: a fuzz
+whose seeds share one random stream changes every seed's operations when
+a draw is added, so a failure that appears with a new option is attributed
+by running the commit before with the same draws, not by reading the
+option's name.
 
 **A check spelled twice, and the copy nothing reached.** The form file
 reader's first decode compared a page's rank and count with its fence entry

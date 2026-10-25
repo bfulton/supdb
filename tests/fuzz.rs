@@ -177,6 +177,11 @@ struct Cfg {
     /// (`Options::zpages_memo_ahead`); off in some seeds under
     /// `ZFUZZ_OPTVARY`.
     memo_ahead: bool,
+    /// The scans' start keys kept with their blocks
+    /// (`Options::scan_start_cache`, off); on in some seeds under
+    /// `ZFUZZ_OPTVARY`, so a scan that takes its block from the cache is
+    /// read against the model too.
+    start_cache: bool,
 }
 
 /// Whether a seed runs with the block cache on. The chance is drawn whenever
@@ -229,6 +234,7 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         record_coding: std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25),
         fence_tree: std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25),
         memo_ahead: !(std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(15)),
+        start_cache: std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25),
     }
 }
 
@@ -249,6 +255,7 @@ fn opts(c: &Cfg) -> Options {
         zpages_record_coding: c.record_coding,
         zpages_fence_tree: c.fence_tree,
         zpages_memo_ahead: c.memo_ahead,
+        scan_start_cache: if c.start_cache { 4096 } else { 0 },
         ..Options::default()
     };
     if let Some(i) = c.inline_bytes {

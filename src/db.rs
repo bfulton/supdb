@@ -1017,6 +1017,28 @@ pub struct Options {
     /// default; `supdb-cache64tofitautozpagesspan` is the arm.
     #[doc(hidden)]
     pub zpages_seek_span: bool,
+    /// EXPERIMENT: a scan's start key kept with the block its partition
+    /// holds it in, so that a scan starting at a key a scan started at
+    /// before skips the partition's seek -- the form file's fence, the
+    /// page's view, a group opened and sought. A hit names the block alone;
+    /// a block held as a copy walks from the key by its own search, as it
+    /// does under `zpages_seek_span`, and a block held any other way seeks
+    /// the rank where that option seeks it. The block of a key in a
+    /// partition is a function of the two, kept against the partition's
+    /// blob identity, so a partition replaced or re-opened is a miss
+    /// (`db::StartCache`); a key over sixteen bytes is never kept. The
+    /// entries, in a direct-mapped table of thirty-two bytes each made at
+    /// the handle's first scan, rounded up to a power of two; zero is off.
+    /// Off: built for the E mix's Zipfian starts at five million keys under
+    /// 640 MiB, half of them among four thousand keys, it hit a fifth of
+    /// the starts -- 63,000 puts a pass churn 4,096 slots -- and every seek
+    /// it skipped was a memo hit, the cheapest fifth: in the arm pair's
+    /// profile the seek's subtree lost 4% of its samples and the scan's
+    /// own gained as much in the cache's lookups, the decodes unchanged
+    /// and the pairing level. `supdb-cache64tofitautozpagesstartcache` is
+    /// the arm, at 4,096 entries.
+    #[doc(hidden)]
+    pub scan_start_cache: usize,
     /// EXPERIMENT: a scan of a covered partition that wants more keys than
     /// its first page holds asks the kernel for the pages it will cross
     /// after it, at once (`MADV_WILLNEED`, `zfile::ZPREFETCH_PAGES` of them
@@ -2600,6 +2622,7 @@ impl Default for Options {
             zpages_memo: true,
             zpages_seek_ord: false,
             zpages_seek_span: false,
+            scan_start_cache: 0,
             zpages_memo_hash: true,
             zpages_settle_span: true,
             zpages_trusted_views: true,
@@ -12792,6 +12815,112 @@ impl ZWindow {
 /// and the positions all of them are current to. Apart from the
 /// `Reader` that holds it because the writer's can be lent: see
 /// `FormsCell`.
+/// EXPERIMENT: a scan's start key mapped to the block its partition holds
+/// it in, for the keys a workload starts at again (`Options::scan_start_cache`,
+/// off, with the verdict: the starts that repeat are the seeks that were
+/// cheap).
+/// A scan's first step is the partition's seek of its start key -- the
+/// form file's fence, the page's view, a group opened and sought, a
+/// microsecond and a half and a fifth of the E mix's thread at five million
+/// keys under 640 MiB -- and two thirds of E's scans start in a block the
+/// cache holds as a copy, which answers the start by its own search and
+/// needs the block alone. The block of a key in a partition is a function
+/// of the two, so it is kept here against the partition's blob identity, a
+/// number no other open blob has: a partition a merge replaced or a
+/// promotion re-opened is a miss and never a stale block. Direct-mapped;
+/// an entry holds the whole key, up to sixteen bytes, and a longer key is
+/// never kept, since a hit has to be exact -- a wrong block walks the wrong
+/// records with nothing raised. The slots are made at the first put, so a
+/// handle that never scans pays nothing for them.
+struct StartCache {
+    slots: Vec<StartSlot>,
+    hits: u64,
+    puts: u64,
+}
+
+#[derive(Clone, Copy)]
+struct StartSlot {
+    blob: u64,
+    /// `u32::MAX` for an empty slot.
+    block: u32,
+    len: u8,
+    key: [u8; 16],
+}
+
+impl StartCache {
+    fn new() -> StartCache {
+        StartCache {
+            slots: Vec::new(),
+            hits: 0,
+            puts: 0,
+        }
+    }
+
+    /// The slot for `key` in `blob`: the key's two prefix words, its length
+    /// and the identity mixed, over a power of two of slots.
+    fn slot(&self, blob: u64, key: &[u8]) -> usize {
+        let (a, b) = key_prefix(key);
+        let h = a.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ b.rotate_left(29).wrapping_mul(0xD6E8_FEB8_6659_FD93)
+            ^ blob.wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+            ^ (key.len() as u64).wrapping_mul(0x1656_67B1_9E37_79F9);
+        ((h ^ (h >> 32)) as usize) & (self.slots.len() - 1)
+    }
+
+    /// The block kept for `key` in `blob`, counted a hit.
+    fn get(&mut self, blob: u64, key: &[u8]) -> Option<u32> {
+        if self.slots.is_empty() || key.len() > 16 {
+            return None;
+        }
+        let s = &self.slots[self.slot(blob, key)];
+        if s.block != u32::MAX
+            && s.blob == blob
+            && usize::from(s.len) == key.len()
+            && s.key[..key.len()] == *key
+        {
+            self.hits += 1;
+            return Some(s.block);
+        }
+        None
+    }
+
+    /// `block` kept for `key` in `blob`, over whatever the slot held; the
+    /// slots made at `entries` rounded up to a power of two on the first.
+    /// A key over sixteen bytes is not kept.
+    fn put(&mut self, entries: usize, blob: u64, key: &[u8], block: u32) {
+        if key.len() > 16 || entries == 0 {
+            return;
+        }
+        if self.slots.is_empty() {
+            let n = entries.next_power_of_two();
+            self.slots = vec![
+                StartSlot {
+                    blob: 0,
+                    block: u32::MAX,
+                    len: 0,
+                    key: [0; 16],
+                };
+                n
+            ];
+        }
+        let i = self.slot(blob, key);
+        let mut k = [0u8; 16];
+        k[..key.len()].copy_from_slice(key);
+        self.slots[i] = StartSlot {
+            blob,
+            block,
+            len: key.len() as u8,
+            key: k,
+        };
+        self.puts += 1;
+    }
+
+    /// The slots' bytes, for the census.
+    fn bytes(&self) -> usize {
+        self.slots.capacity() * std::mem::size_of::<StartSlot>()
+    }
+}
+
 struct FormsState {
     /// PROTOTYPE: the block cache's table for each segment, by position
     /// in `segs`, made on first use and dropped whenever the segments
@@ -12894,6 +13023,8 @@ struct FormsState {
     /// Scans whose first block was a copy walked from the start key with
     /// the rank never sought (`Options::zpages_seek_span`).
     span_starts: std::cell::Cell<u64>,
+    /// The scans' start keys and their blocks (`Options::scan_start_cache`).
+    start_cache: std::cell::RefCell<StartCache>,
     /// Writes a settle filed with their cut unresolved, and filed cuts a
     /// build resolved by a seek (`Options::zpages_settle_span`); a build
     /// under `Options::zpages_block_cursor` resolves them where its walk
@@ -13017,6 +13148,7 @@ impl FormsState {
             dir_prefetches: std::cell::Cell::new(0),
             copy_starts: std::cell::Cell::new([0; 2]),
             span_starts: std::cell::Cell::new(0),
+            start_cache: std::cell::RefCell::new(StartCache::new()),
             lazy_cuts: std::cell::Cell::new([0; 2]),
             read_cap: std::cell::Cell::new(0),
             pass_lent: std::cell::Cell::new(0),
@@ -13545,8 +13677,14 @@ impl SnapArena {
         1usize << (self.base_shift + b as u32)
     }
 
-    /// `n` contiguous bytes, at the offset returned. Any thread.
+    /// `n` contiguous bytes, at the offset returned. Any thread. No bytes
+    /// take no block, as `reserve_bytes` answers them: the offset is the
+    /// tail, which the next reservation shares, and a read or a write of
+    /// no bytes there touches no block.
     fn reserve(&self, n: usize) -> u32 {
+        if n == 0 {
+            return self.tail.load(AtomicOrdering::Relaxed) as u32;
+        }
         loop {
             let off = self.tail.fetch_add(n, AtomicOrdering::Relaxed);
             assert!(
@@ -13587,12 +13725,27 @@ impl SnapArena {
         }
     }
 
+    /// The block `len` bytes at `off` lie in, and the offset within it.
+    /// For bytes: a reservation of none has no block, so a read or a write
+    /// of none never asks (`slice`, `write`). The snapshot built over the
+    /// empty key alone reserved its one key's no bytes and the read of them
+    /// asked for the block nobody had made.
     fn block(&self, off: usize, len: usize) -> (*mut u8, usize) {
+        debug_assert!(
+            len > 0,
+            "snapshot arena: a read of no bytes asks for no block"
+        );
         let (b, w) = self.locate(off);
         let p = self.blocks[b].load(AtomicOrdering::Acquire);
         assert!(
             !p.is_null(),
-            "snapshot arena: an offset past what was written"
+            "snapshot arena: an offset past what was written: off {off} len {len} in block {b} at {w}, base_shift {}, tail {}, blocks allocated {}",
+            self.base_shift,
+            self.tail.load(AtomicOrdering::Relaxed),
+            self.blocks
+                .iter()
+                .take_while(|p| !p.load(AtomicOrdering::Acquire).is_null())
+                .count()
         );
         assert!(
             w + len <= self.cap(b),
@@ -13601,8 +13754,11 @@ impl SnapArena {
         (p, w)
     }
 
-    /// `bytes` into a reserved range at `off`.
+    /// `bytes` into a reserved range at `off`; none touch no block.
     fn write(&self, off: u32, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
         let (p, w) = self.block(off as usize, bytes.len());
         // SAFETY: inside the block, a range this thread reserved and no
         // reader can reach until an entry naming it is published.
@@ -13630,9 +13786,12 @@ impl SnapArena {
         (off, unsafe { std::slice::from_raw_parts_mut(p.add(w), n) })
     }
 
-    /// Published bytes at `off`.
+    /// Published bytes at `off`; none touch no block.
     #[inline]
     fn slice(&self, off: u32, len: u32) -> &[u8] {
+        if len == 0 {
+            return &[];
+        }
         let (p, w) = self.block(off as usize, len as usize);
         // SAFETY: inside a block that lives as long as the arena, bytes
         // written before the entry that names them was published.
@@ -14586,6 +14745,53 @@ mod radix {
                     "run of {n}, answer {at}"
                 );
             }
+        }
+    }
+
+    /// The start cache answers a key kept under its blob and nothing else:
+    /// not the same key under another blob, a longer or shorter key, or a
+    /// key over sixteen bytes, which it never keeps; a put over a slot's
+    /// occupant replaces it; the slots are made at the first put, at the
+    /// power of two above the entries asked for; and the empty key is a
+    /// key like any other.
+    #[test]
+    fn the_start_cache_answers_the_key_it_kept_and_no_other() {
+        let mut c = super::StartCache::new();
+        assert_eq!(c.bytes(), 0);
+        assert_eq!(c.get(7, b"key"), None);
+        c.put(100, 7, b"key", 5);
+        assert_eq!(c.slots.len(), 128);
+        assert_eq!(c.bytes(), 128 * std::mem::size_of::<super::StartSlot>());
+        assert_eq!(c.get(7, b"key"), Some(5));
+        assert_eq!(c.get(8, b"key"), None, "another blob");
+        assert_eq!(c.get(7, b"ke"), None, "a prefix");
+        assert_eq!(c.get(7, b"key\0"), None, "an extension");
+        c.put(100, 7, b"", 0);
+        assert_eq!(c.get(7, b""), Some(0), "the empty key");
+        assert_eq!(c.get(7, b"key"), Some(5));
+        let long = [b'x'; 17];
+        c.put(100, 7, &long, 9);
+        assert_eq!(
+            c.get(7, &long),
+            None,
+            "a key over sixteen bytes is never kept"
+        );
+        let sixteen = [b'y'; 16];
+        c.put(100, 7, &sixteen, 11);
+        assert_eq!(c.get(7, &sixteen), Some(11));
+        c.put(100, 7, b"key", 6);
+        assert_eq!(c.get(7, b"key"), Some(6), "the newer put stands");
+        assert_eq!((c.hits, c.puts), (5, 4));
+        // Many keys over few slots: every key asked answers its own block
+        // or nothing, never another's.
+        let mut small = super::StartCache::new();
+        for i in 0..64u32 {
+            small.put(8, 1, format!("{i:016}").as_bytes(), i);
+        }
+        assert_eq!(small.slots.len(), 8);
+        for i in 0..64u32 {
+            let got = small.get(1, format!("{i:016}").as_bytes());
+            assert!(got.is_none() || got == Some(i), "key {i}: {got:?}");
         }
     }
 }
@@ -18495,6 +18701,14 @@ impl Reader {
         self.fs().settle_density.get()
     }
 
+    /// This handle's scans whose start block the start cache named, and
+    /// the starts it kept (`Options::scan_start_cache`).
+    #[doc(hidden)]
+    pub fn start_cache_counts(&self) -> (u64, u64) {
+        let c = self.fs().start_cache.borrow();
+        (c.hits, c.puts)
+    }
+
     /// EXPERIMENT: the canonical forms table's size: forms held, their
     /// bytes, how many walks took one, and whether the table is complete.
     pub fn canonical_forms(&self) -> (usize, usize, usize, bool) {
@@ -20481,18 +20695,36 @@ impl Reader {
                 break;
             }
             let src = Sources { seg, l0 };
+            // The scan's first partition: the one whose start is the
+            // scan's own key, which the start cache answers for.
+            let scan_start = pi == first;
             cursor = seg.cursor_from(cursor);
             // An empty partition has one block, over no record and
             // whatever the memtables and the pieces hold in its range:
             // the seek answers rank zero, the table's one block is
             // walked as the overlay alone.
             let keys = seg.blob.keys();
-            // The block the start falls in, by the fence and the page's
-            // directory where they name one (`Options::zpages_seek_span`):
-            // the rank is sought below only where the block's form is not
-            // a copy, which is walked from the start key by its own search.
-            // `usize::MAX` stands for the rank not sought yet.
-            let span_b = if self.opts.zpages_seek_span {
+            // The block the start falls in: from the start cache, where a
+            // scan started at this key before (`Options::scan_start_cache`);
+            // else by the fence and the page's directory where they name one
+            // (`Options::zpages_seek_span`). Either way the rank is sought
+            // below only where the block's form is not a copy, which is
+            // walked from the start key by its own search. `usize::MAX`
+            // stands for the rank not sought yet.
+            let start_cached = self.opts.scan_start_cache > 0 && scan_start;
+            let blob_id = seg.blob.id();
+            let cached_b = if start_cached {
+                self.fs()
+                    .start_cache
+                    .borrow_mut()
+                    .get(blob_id, cursor)
+                    .map(|b| b as usize)
+            } else {
+                None
+            };
+            let span_b = if cached_b.is_some() {
+                cached_b
+            } else if self.opts.zpages_seek_span {
                 self.zc(seg)
                     .and_then(|z| z.owner_span(cursor))
                     .and_then(|(lo, hi)| {
@@ -20507,6 +20739,16 @@ impl Reader {
                 None => self.scan_seek(seg, cursor),
             };
             let owner = if same { rank } else { rank.saturating_sub(1) };
+            // The block the seek found, kept for the next scan from this
+            // key; a seek deferred below finds a block the cache named.
+            if start_cached && cached_b.is_none() && rank != usize::MAX {
+                self.fs().start_cache.borrow_mut().put(
+                    self.opts.scan_start_cache,
+                    blob_id,
+                    cursor,
+                    (owner / CACHE_BLOCK) as u32,
+                );
+            }
             let nblocks = seg.blocks();
             let tables = self.fs().tables.borrow();
             let mut held = tables[pi].borrow_mut();
@@ -21371,6 +21613,7 @@ impl Reader {
             + fs.settle_offs.borrow().capacity() * 8
             + fs.emit_offs.borrow().capacity() * 8
             + fs.resume_key.borrow().capacity()
+            + fs.start_cache.borrow().bytes()
             + fs.pending_frozen
                 .borrow()
                 .iter()
@@ -25146,11 +25389,27 @@ impl Db {
         self.r.fs().copy_starts.get()
     }
 
+    /// The writer's settles over the store's life: settles run, keys
+    /// settled, blocks those keys grouped into, and blocks dropped for a
+    /// rebuild by the backlog's density (`Reader::settle_density`).
+    pub fn settle_density(&self) -> [u64; 4] {
+        self.take_back_upkeep();
+        self.r.fs().settle_density.get()
+    }
+
     /// The writer's own scans whose first block was a copy walked with the
     /// rank never sought (`Options::zpages_seek_span`).
     pub fn span_starts(&self) -> u64 {
         self.take_back_upkeep();
         self.r.fs().span_starts.get()
+    }
+
+    /// The writer's own scans whose start block the start cache named,
+    /// and the starts it kept (`Options::scan_start_cache`).
+    pub fn start_cache_counts(&self) -> (u64, u64) {
+        self.take_back_upkeep();
+        let c = self.r.fs().start_cache.borrow();
+        (c.hits, c.puts)
     }
 
     /// The writer's own writes a settle filed with their cut unresolved,
@@ -34363,6 +34622,30 @@ mod landing_facts {
 #[cfg(test)]
 mod snap_arena {
     use super::*;
+
+    /// A reservation of no bytes -- the empty key, a value of none -- takes
+    /// no block whichever way it is reserved, and the read and the write of
+    /// none at its offset ask for none: the first version answered the
+    /// batched reservation of none with the tail and no block, and the
+    /// read of the empty key at that offset asked for the block.
+    #[test]
+    fn no_bytes_take_no_block_and_read_as_none() {
+        let a = SnapArena::default();
+        let (off, room) = a.reserve_bytes(0);
+        assert!(room.is_empty());
+        assert_eq!(a.slice(off, 0), b"");
+        let off2 = a.append(b"");
+        assert_eq!(off2, off, "no bytes move the tail nowhere");
+        a.write(off2, b"");
+        assert_eq!(a.slice(off2, 0), b"");
+        assert_eq!(a.census(), (0, 0), "nothing written, no block allocated");
+        // Real bytes after them share the offset and read back whole.
+        let off3 = a.append(b"abc");
+        assert_eq!(off3, off);
+        assert_eq!(a.slice(off3, 3), b"abc");
+        assert_eq!(a.slice(off, 0), b"");
+        assert!(a.census().1 > 0);
+    }
 
     #[test]
     fn offsets_cross_blocks_and_two_threads_append_without_overlap() {

@@ -1,0 +1,7 @@
+d0636fa
+ M bench/src/engines.rs
+ M bench/src/run.rs
+ M src/db.rs
+?? scratch/wave2/zspan2-build.log
+?? scratch/wave2/zspan2-head.txt
+2026-10-25T00:46:34Z

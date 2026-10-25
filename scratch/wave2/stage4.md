@@ -2518,3 +2518,160 @@ here is a partition's, not the store's -- and a lever on misses is held to
 the profile of the arm pair, where the symbol it is aimed at loses its
 samples or does not, since a pairing resolves nothing under a tenth and an
 instruction count sees no miss.
+
+## The settle's share of E, counted; the span arm looked at again
+
+The settle is 7.5% of E's thread by the profile at `3a885a9`, and E
+commits 4,167 inserts a pass in 42 batches, which read as ten microseconds
+an inserted key -- too much for a key filed under the last block, which is
+wide and takes a push. The per-mix events line carries the settle's counts
+now (`settle_runs`, `settle_keys`, `settle_blocks`, `settle_rebuilds`,
+`lazy_cuts_filed`, `lazy_cuts_resolved`; `Db::settle_density`), and they
+say what the settle is: 43 runs a pass settling 48,993 keys over 17,651
+blocks (`zspan-quick-ab.err`), the writes of the mixes before E -- A's and
+F's updates, B's and D's inserts, the 49,035 unsealed keys the counters
+show -- which their own commits do not file, since nothing scans there
+(`Options::forms_settle_far` off, for the shuffled load's memory), so E's
+first scans file the backlog: 1.1 µs a key, once a pass. Of the keys, 40,805
+are filed lazily under the block the fence and the directory name
+(`Options::zpages_settle_span`) and 8,188 fall in a group that straddles a
+block boundary and take the exact seek, with a decode for most, since the
+memo rarely holds the head's groups between two settles; by the profile's
+subtree (`aggregate.py --under settle_each`) the resolve is two fifths of
+the settle (the lazy keys' page views a sixth, the straddlers' seeks and
+decodes a quarter), the sort a sixth, the patches a third, and the fresh
+pages of the batch's own vectors a twelfth. No piece is over two percent
+of E, and the sum cannot move to the mixes before without charging them
+the same work, so the settle is not a lever on E; the counts stay on the
+line.
+
+The same run (two pairs after a warmup, one order) looked at
+`supdb-cache64tofitautozpagesspan` again, the arm that takes a scan's block
+from the fence and the directory and seeks the rank only for a block not
+held as a copy, which read 2-3% slower in both orders when it was priced:
+E's scans 0.878 (the span arm faster in two pairs of three), D's gets 0.865
+in three of three, C's, A's and F's gets 1.07-1.10 in two of three -- a
+quick look, not a verdict -- with the deterministic counters saying the
+mechanism works: 44,652 of E's 79,198 scans start in a copy without a seek
+(`starts 6326/44652`), E decodes 137,400 groups against 147,100 and asks
+the memo 210,000 times against 254,000. The levers since the arm was priced
+-- the trusted views, the block cursor, the copy start at the rank -- moved
+what the seek and the copy's search cost, so the arm is paired again in
+full (`pair-5m.sh zspan2 ...`); the verdict follows.
+
+The verdict (`zspan2-ab-{1,2}.err`, five pairs a sitting after a warmup,
+both orders): E's scans 0.990 over twelve pairs with the span arm slower in
+seven, 0.940 in the first sitting and 1.043 in the second, the gets of C
+1.040 (slower in eight of twelve; 0.973 and then 1.111), D 0.994, A 1.004,
+F 1.016, and every count the same as the quick look's: 137,400 groups
+decoded against 147,100, 72,300 memo hits against 107,300, the walks and
+the blocks built equal. Level, a position effect wide in both directions
+and nothing a tenth from one; the arm stays off. What it says about the
+start: the seek the arm skips is a memo hit two times in three (the
+decodes fall by the third that misses), so the seek's own cost is the
+fence's search, the view, the group's search and the memo's lookup, and
+the arm pays most of that again finding the block from the fence and the
+directory and then walking the copy from the key by its own search. A
+lever on the start has to skip the fence and the view too, which only a
+memory of the key's block can.
+
+## The start cache: a scan's start key mapped to its block
+
+E's scans start where E's scans started: the mix's Zipfian, unscrambled,
+puts half of a pass's 79,000 starts among the top four thousand keys, and
+the scan's first step is the partition's seek of the start -- the fence's
+search, the page's view, a group opened and sought -- a fifth of E's
+thread by the profile at `3a885a9` (`cache_seek_exact` and `ZFile::seek`
+under `scan_blocks`), with a third of the groups it decodes decoded for a
+start the copy that holds the block would have found by its own search.
+A start is a function of the key and the partition's blob, so the handle
+keeps the block each start key resolved to, against the blob's identity --
+a number no other open blob in the process has, so a partition a merge
+replaced or a promotion re-opened is a miss and never a stale block -- in a
+direct-mapped table of thirty-two-byte slots made at the first put
+(`Options::scan_start_cache`, 4,096 entries as shipped, 128 KB a handle,
+counted in the census's `misc`; `db::StartCache`). A hit names the block
+alone and the walk begins there as it does under the span arm: a copy
+walks from the key by its own search and a block held any other way
+seeks the rank where that arm seeks it. A key over sixteen bytes is never
+kept, since a hit has to be exact and a wrong block walks the wrong
+records with nothing raised; a slot holds the whole key and the compare
+is of the bytes. The put is made only where the seek ran, after it, with
+the block the seek's owner rank falls in. The counts are on the per-mix
+events line (`start_cache_hits`, `start_cache_puts`;
+`Db::start_cache_counts`), the fuzz runs a quarter of its option-varying
+seeds with the cache off, and `tests/zpages.rs` holds a store with the
+cache to the one without over scans from repeated starts -- drained, with
+unsealed keys, and with those keys sealed into a piece -- through the
+writer and a handle, with a key over sixteen bytes among the starts.
+`supdb-cache64tofitautozpagesnostartcache` is the shape before, every scan
+seeking its start; the pairing (`zstartcache-ab-{1,2}.err`) and the arm
+pair's profile follow.
+
+The verdict (`zstartcache-ab-{1,2}.err`, five pairs a sitting after a
+warmup, both orders; `prof/ycsb-E-supdb-cache64tofitautozpages-startcachepair.txt`
+and its `nostartcache` partner): level, and a lever aimed at the wrong
+seeks. E's scans read 0.981 over twelve pairs with the arm without the cache
+the faster in both sittings (0.983, 0.979), the other mixes within the ±5%
+the mixes that never consult it show (B's gets 1.049 and A's 1.026 with
+hits and puts at zero there). The counts, the same in every rep: 15,800
+hits and 63,400 puts over E's 79,200 starts a pass -- a fifth, where the
+Zipfian's mass puts half of the starts among four thousand keys -- because
+a direct-mapped table of 4,096 slots is churned by 63,000 puts a pass,
+fifteen a slot, so a key survives between two of its starts only where
+fewer puts than that reach its slot in between; and the groups decoded the
+same, 147,100 a pass in both arms, with the memo asked 91,500 times against
+107,300: every seek the hits skipped was a memo hit. The hits are the
+hottest keys' seeks, whose fence entry, page and group sit in the core's
+caches and the memo, the cheapest fifth of the seeks; the expensive seeks
+are the cold ones, with a decode, at keys that never repeat. The arm
+pair's profile says the same in samples: the seek's subtree
+(`cache_seek_exact`) at 21.0% of E's thread with the cache against 21.5%
+without, 1,140 samples against 1,189, a loss of 4% for a fifth of the
+seeks skipped, and `scan_blocks`' own samples up from 320 to 377 with the
+cache's lookups and puts -- 128 KB of slots touched at random -- as much as
+the seek lost; the decode 25.1% against 25.8%, the windows 1,901 ms against
+1,936. Off; `supdb-cache64tofitautozpagesstartcache` is the arm, at 4,096
+entries, on in a quarter of the fuzz's option-varying seeds. Two bounds
+for whoever returns to the start: an exact-key cache of any size reaches
+at most the starts that repeat by key, 53% of E's by the Zipfian's
+arithmetic (37,000 distinct keys among 79,200 draws), and its hits are the
+cheap seeks by construction; a cache of blocks by key range would reach
+the starts that repeat by block, about 78% (17,000 distinct blocks), but a
+hit saves the seek only where the block is a copy -- the hot blocks again,
+since a block held any other way needs the rank, and the rank's seek
+decodes the group the walk decodes first anyway. What the start costs E
+is the cold start's decode where the block is a copy, the third of the
+start decodes the span arm skipped for a level result. The start is not
+where E's time is to be had; the decode is (25% of the thread, 147,000
+groups a pass, 2.5 a form walk, nearly every one a miss since the form
+walks are the cold tail), then the record walks (`walk_run` 12%, the
+clean runs 12%), the builds 11%, the settle 7%, and the harness's
+generator and clock about a sixth.
+
+## The fuzz's red on this tree: the snapshot arena's reservation of no bytes
+
+The option-varying fuzz range (`ZFUZZ_OPTVARY`, seeds 0-300) went red on
+this tree at one seed, 242, and at no other alone: a panic in the upkeep
+thread, `snapshot arena: an offset past what was written`, from
+`Snapshot::seek` under `BuildCtx::snap_span` in `Reader::make_table`, four
+runs in five with the seed alone, the store's drop then aborting the
+process. The start cache was off in the seed's options, and the commit
+before this tree (`d0636fa`), with its fuzz patched to consume the one draw
+this tree adds so that every seed's operations are the same, fails the seed
+four runs in six the same way: a bug older than the change, reached because
+a draw added to the fuzz's one random stream moves every seed's operations
+after it. The assertion, made to name its quantities, said what: offset 0,
+length 0, the arena's tail at zero and no block allocated -- the empty key,
+the live table's only key after the flush. The snapshot's build reserves
+the keys' bytes in one batch (`SnapArena::reserve_bytes`), which answered no
+bytes with the tail and no block where the per-key reservation (`reserve`)
+made the block; the read of the key, the next partition's fence sought in
+the snapshot, asked for the block nobody had made. A read or a write of no
+bytes touches no block now and the two reservations agree; `tests/settle.rs`
+builds the shape (two partitions, the empty key alone unsealed, a scan
+through the writer and a handle, with and without the snapshot's runs) and
+fails on the guards removed with the same message, and `db::snap_arena`
+holds the arena to it. The attribution's worktree and binaries are
+`$S/wt-head` and `$S/wt-head-target`; the sweep that named the seed ran
+every seed alone (`$S/tmp-fuzz-single`).
