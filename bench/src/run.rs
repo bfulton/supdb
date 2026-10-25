@@ -1764,6 +1764,10 @@ fn one_pass(
     // and never between. A mix's commits are inside its timed region, so
     // the line's burst is zero and its pass is the whole mix.
     let mix_counting = std::env::var_os("SUPDB_MIX_COUNTERS").is_some();
+    // With `SUPDB_MIX_CENSUS` set, the engine's census of what the process
+    // holds after each mix, one `mixcensus` line a mix, as the lag sweep's
+    // `lagcensus`: the form files' fit beside the process is read there.
+    let mix_census = std::env::var_os("SUPDB_MIX_CENSUS").is_some();
     for letter in YCSB_ORDER {
         if !passes.mixes {
             break;
@@ -1800,6 +1804,9 @@ fn one_pass(
                 &c0,
                 &c1,
             );
+        }
+        if mix_census {
+            census_line("mixcensus", arm, &letter.to_string(), e.as_ref(), false);
         }
     }
 
@@ -2056,7 +2063,7 @@ fn lag_sweep(
                 &c0,
                 &c1,
             );
-            lag_census(arm, &pct.to_string(), e);
+            census_line("lagcensus", arm, &pct.to_string(), e, true);
         }
     }
     Ok(())
@@ -2066,10 +2073,13 @@ fn lag_sweep(
 /// engine's census of what it holds (`Engine::memory_census`), the bytes
 /// in megabytes and the counts as they are, beside the process's
 /// anonymous bytes and the allocator's in use and free bytes taken again
-/// at the same moment; and the allocator's bytes by arena, which says
-/// which thread's frees the free bytes are. Read after `lagmem`, so the
-/// census's own allocations are in neither.
-fn lag_census(arm: &str, point: &str, e: &dyn Engine) {
+/// at the same moment; and, with `detail`, the allocator's bytes by arena,
+/// which says which thread's frees the free bytes are, and the anonymous
+/// mappings by size. Read after `lagmem`, so the census's own allocations
+/// are in neither. The mixes print the census line alone, one a mix
+/// (`SUPDB_MIX_CENSUS`, the tag `mixcensus`), for what the process holds
+/// by owner where a form file's fit beside it is the question.
+fn census_line(tag: &str, arm: &str, point: &str, e: &dyn Engine, detail: bool) {
     let census = e.memory_census();
     if census.is_empty() {
         return;
@@ -2101,7 +2111,7 @@ fn lag_census(arm: &str, point: &str, e: &dyn Engine) {
             .map_or(0.0, |(_, v)| *v)
     };
     eprintln!(
-        "lagcensus {arm} {point} anon_mb {} inuse_mb {:.0} free_mb {:.0} trims {:.0} looks {:.0} look_ms {:.1} | {}",
+        "{tag} {arm} {point} anon_mb {} inuse_mb {:.0} free_mb {:.0} trims {:.0} looks {:.0} look_ms {:.1} | {}",
         anon_resident_bytes().map_or(0, |b| b >> 20),
         mb(mi.0),
         mb(mi.1),
@@ -2110,6 +2120,9 @@ fn lag_census(arm: &str, point: &str, e: &dyn Engine) {
         counter("forms_trim_us") / 1e3,
         fields.join(" ")
     );
+    if !detail {
+        return;
+    }
     lag_arenas("lagarenas", arm, point);
     // The anonymous mappings of a megabyte and more, by size: what is
     // resident in each size class says which allocations they are (a

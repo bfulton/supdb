@@ -569,7 +569,13 @@ timer by kind (`SUPDB_MIX_KINDS=1`, a `mixkinds` line per mix on
 stderr for every arm, its reads, scans and commits apart), which read
 the E gap as the scans' alone and the tax as the commits' and the
 gets'; `SUPDB_MIX_EVENTS=1` prints each mix's form events, upkeep
-passes and snapshot builds beside its counters. `SUPDB_SCAN_OPS=1` times
+passes and snapshot builds beside its counters; `SUPDB_MIX_CENSUS=1`
+prints the lag pass's census of what the process holds, by owner, after
+each mix (`mixcensus`), which is where a form file's fit beside the
+process is decided -- a trim before the mixes read the process 15 MB
+lower in use and level in anonymous bytes once the mixes had taken the
+return back, so a lever on the process's memory is read in the phase
+that competes for it, never at the lever. `SUPDB_SCAN_OPS=1` times
 every scan of the single-threaded scan pass on its own, for every arm,
 and prints a `scanops` line a pass with the first scans beside the
 median: a pass of a hundred scans at the smallest rung is a few hundred
