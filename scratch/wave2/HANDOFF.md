@@ -447,6 +447,28 @@ user's call.
   limit, and E at this rung would need the raw-tail form, a process of
   LMDB's order and the in-place walk together. Both trims stay as arms,
   off.
+- **The coding gear, built as an arm** (`stage4.md`, "The coding gear"):
+  `Options::zpages_coding_auto` has the sampler size the raw-tail record
+  coding beside the block coding and `zselect::choose_coding` pick the raw
+  tails where `model_z` predicts that form faults nothing against the
+  budget, the block coding otherwise; the pick drives the controller's
+  builds, each form file naming its coding; `supdb-cache64tofitautozpagescodingauto`
+  is the arm, `tests/zpages.rs` drives both picks to a build, and the
+  counts carry the picks and both forms' estimates. Paired: forced at three
+  million keys under 640 MiB (both fit) the raw-tail form reads the
+  point-read mixes 1.25-1.95x faster in both orders (D 1.8-1.95x) and the
+  scan pass 0.70x, E 0.89-1.02; Auto at three million under 640 MiB builds
+  nothing (FITS) and reads level; at five million under 640 MiB the gear
+  picks the block coding and reads level within the order's noise; at 720
+  MiB the pick flips with the order (the process's anonymous memory at the
+  sample's moment is the knife edge); at 736 MiB it picks the raw tails in
+  every rep and reads the point-read mixes 1.2-2.4x faster than the default
+  in both orders, with the default's slow buy at that rung confounding the
+  size of it. The window is the budgets between the raw-tail form's bytes
+  (86% of the raw files at the suite's shape) and the raw store's. Off,
+  pending the in-place walk that would take the scans' loss out. Read any
+  Auto-against-Auto pairing per sitting with `zpage_builds` and the picks
+  beside the rates: the ski rental's buy moves with the order.
 - **Where E's time is, by the arm pair's profile at the head**: the LZ4
   decode 25% of the thread (147,000 groups a pass, 2.5 a form walk, nearly
   every one a memo miss, since the form walks are the Zipfian's cold tail),

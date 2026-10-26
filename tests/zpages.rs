@@ -5300,6 +5300,104 @@ fn an_eager_auto_store_buys_the_form_before_any_read() {
     }
 }
 
+/// Under `Options::zpages_coding_auto` the selector chooses the coding the
+/// form files are built in: the sampler sizes the raw-tail record coding
+/// beside the block coding, and the raw tails are built where the model
+/// predicts that form faults nothing against the budget -- a store of twenty
+/// thousand keys, whose raw-tail form is about 2.2 MB, under 64 MiB -- and
+/// the block coding where it does not: the same store under a budget of
+/// 1.5 MiB, which the block form's 1.4 MB sits under and the raw-tail form's
+/// does not. Both stores are eager and under the group's pressure, as the
+/// eager test has them, so each buys and installs; the counts say which
+/// coding was chosen and built, the raw-tail form reads larger than the
+/// block form at both readings, and the reads answer the model either way.
+#[test]
+fn the_selector_builds_the_raw_tails_where_that_form_fits_and_the_block_coding_otherwise() {
+    assert!(
+        !Options::default().zpages_coding_auto,
+        "the options' coding as shipped"
+    );
+    for (budget, raw) in [(64u64 << 20, true), (1536u64 << 10, false)] {
+        let what = format!("budget {budget}, raw tails expected {raw}");
+        let dir = scratch(&format!("coding-auto-{raw}"));
+        let inject = std::sync::Arc::new(supdb::ZInject::new());
+        inject.set_budget(budget);
+        inject.set_refault_rate(1_000_000.0);
+        inject.set_fault_cost(FAULT_1MS);
+        inject.advance(std::time::Duration::from_millis(1));
+        let mut db = Db::create(
+            &dir,
+            Options {
+                zpages: ZPages::Auto,
+                zpages_min_bytes: 0,
+                zpages_build_eager: true,
+                zpages_coding_auto: true,
+                zpages_inject: Some(inject.clone()),
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let model = ordered_load(&mut db, 20_000, 0x4AA);
+        db.settle().unwrap();
+        for _ in 0..2 {
+            inject.advance(std::time::Duration::from_secs(1));
+            wait_tick(&db);
+        }
+        assert!(
+            tick_until(&db, 160, |c| c.sel_installs >= 1),
+            "{what}: bought and installed: {:?}",
+            db.zpage_counts()
+        );
+        let c = db.zpage_counts();
+        assert!(c.builds >= 1, "{what}: {c:?}");
+        assert!(
+            c.sample_w_z_raw_bytes > 0 && c.sample_w_z_bytes > 0,
+            "{what}: both codings sized: {c:?}"
+        );
+        if raw {
+            assert!(
+                c.coding_picks_raw >= 1 && c.coding_picks_block == 0,
+                "{what}: the raw tails chosen: {c:?}"
+            );
+            assert_eq!(
+                c.builds_raw_tails, c.builds,
+                "{what}: every build raw-tailed"
+            );
+            assert_eq!(
+                c.sample_w_z_bytes, c.sample_w_z_raw_bytes,
+                "{what}: the reading fed to the selector is the chosen form's"
+            );
+            assert!(
+                c.sample_w_z_raw_bytes < budget,
+                "{what}: the raw-tail form under the budget"
+            );
+        } else {
+            assert!(
+                c.coding_picks_block >= 1 && c.coding_picks_raw == 0,
+                "{what}: the block coding chosen: {c:?}"
+            );
+            assert_eq!(c.builds_raw_tails, 0, "{what}: no build raw-tailed");
+            assert!(
+                c.sample_w_z_bytes < c.sample_w_z_raw_bytes,
+                "{what}: the block form the smaller: {c:?}"
+            );
+            assert!(
+                c.sample_w_z_raw_bytes > budget,
+                "{what}: the raw-tail form over the budget: {c:?}"
+            );
+        }
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        check(&db, &model, &keys, &what);
+        check_scan(&db, &model, &what);
+        assert!(
+            db.zpage_counts().reads > c.reads,
+            "{what}: the reads went through the form"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[test]
 fn an_eager_auto_store_waits_for_the_segment_work_in_flight() {
     // The eager store of the test above buys within a few ticks of the

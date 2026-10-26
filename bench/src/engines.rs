@@ -803,6 +803,10 @@ pub struct Supdb {
     /// `supdb-cache64tofitautozpagesraw`, the pair against
     /// `supdb-cache64tofitautozpages`.
     zcacheraw: bool,
+    /// The coding the selector's to choose (`Options::zpages_coding_auto`):
+    /// `supdb-cache64tofitautozpagescodingauto` against
+    /// `supdb-cache64tofitautozpages`.
+    zcodingauto: bool,
     /// The combined arm with a block read this many entries' worth held
     /// as a copy in its slot under the form (`Options::promote_entries`
     /// with `zpages_promote_copies`), zero for neither:
@@ -1324,6 +1328,10 @@ struct Policy {
     /// controller's form (`Options::zpages_block_cache` off):
     /// `supdb-cache64tofitautozpagesraw`.
     zcacheraw: bool,
+    /// The coding the selector's to choose (`Options::zpages_coding_auto`):
+    /// `supdb-cache64tofitautozpagescodingauto` against
+    /// `supdb-cache64tofitautozpages`.
+    zcodingauto: bool,
     /// Blocks read this many entries' worth held as copies in their slots
     /// under the form (`Options::promote_entries` with
     /// `zpages_promote_copies`), zero for neither:
@@ -1490,6 +1498,7 @@ impl Default for Policy {
             zpages_noahead: false,
             zpages_buildeager: false,
             zcacheraw: false,
+            zcodingauto: false,
             zpromote: 0,
             zgroup: None,
             zprebuild: false,
@@ -3172,6 +3181,26 @@ impl Supdb {
         )
     }
 
+    /// `supdb-cache64tofitautozpages` with the coding of the form files the
+    /// selector's to choose (`Options::zpages_coding_auto`): the raw-tail
+    /// record coding where the model predicts that form fits the budget, the
+    /// block coding otherwise, `supdb-cache64tofitautozpagescodingauto`. The
+    /// pair against the combined arm prices the gear: at three million keys
+    /// under 640 MiB it picks the raw tails, at five million the block
+    /// coding the default builds.
+    pub fn create_cache64_tofit_auto_zpages_codingauto(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages_auto: true,
+                zcodingauto: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-cache64tofitautozpages` with a block that reads have walked
     /// a block's worth of entries (sixty-four) held as a merged copy in
     /// its slot under the form, a clean block included
@@ -4661,6 +4690,7 @@ impl Supdb {
             zpages_noahead,
             zpages_buildeager,
             zcacheraw,
+            zcodingauto,
             zpromote,
             zgroup,
             zprebuild,
@@ -4921,6 +4951,7 @@ impl Supdb {
             },
             zpages_build_eager: zpages_buildeager,
             zpages_block_cache: !zcacheraw,
+            zpages_coding_auto: zcodingauto,
             promote_entries: zpromote,
             zpages_promote_copies: zpromote > 0,
             zpages_group_bytes: zgroup.unwrap_or(supdb::Options::default().zpages_group_bytes),
@@ -5118,6 +5149,7 @@ impl Supdb {
             zpages_noahead,
             zpages_buildeager,
             zcacheraw,
+            zcodingauto,
             zpromote,
             zgroup,
             zprebuild,
@@ -5234,6 +5266,8 @@ impl Engine for Supdb {
                 "supdb-cache64tofitautozpagescheckedviews"
             } else if self.zrecord {
                 "supdb-cache64tofitautozpagesrecord"
+            } else if self.zcodingauto {
+                "supdb-cache64tofitautozpagescodingauto"
             } else if self.zmemofirst {
                 "supdb-cache64tofitautozpagesmemofirst"
             } else if self.zfencetree {
@@ -6140,6 +6174,10 @@ impl Engine for Supdb {
             ("zpage_sample_declined", z.sample_declined as f64),
             ("zpage_sample_us", z.sample_us as f64),
             ("zpage_sample_w_z_bytes", z.sample_w_z_bytes as f64),
+            ("zpage_sample_w_z_raw_bytes", z.sample_w_z_raw_bytes as f64),
+            ("zpage_coding_picks_block", z.coding_picks_block as f64),
+            ("zpage_coding_picks_raw", z.coding_picks_raw as f64),
+            ("zpage_builds_raw_tails", z.builds_raw_tails as f64),
             ("zpage_sel_samples", z.sel_samples as f64),
             ("zpage_sel_builds", z.sel_builds as f64),
             ("zpage_sel_installs", z.sel_installs as f64),
@@ -6770,6 +6808,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache128tofitautozpages"
         | "supdb-cache256tofitautozpages"
         | "supdb-cache64tofitautozpagesraw"
+        | "supdb-cache64tofitautozpagescodingauto"
         | "supdb-cache64tofitautozpagespromote"
         | "supdb-cache64tofitautozpagesonegroup"
         | "supdb-cache64tofitautozpagesgroup1k"
@@ -7002,6 +7041,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cache256tofitautozpages" => Box::new(Supdb::create_cache256_tofit_auto_zpages(dir)?),
         "supdb-cache64tofitautozpagesraw" => {
             Box::new(Supdb::create_cache64_tofit_auto_zpages_raw(dir)?)
+        }
+        "supdb-cache64tofitautozpagescodingauto" => {
+            Box::new(Supdb::create_cache64_tofit_auto_zpages_codingauto(dir)?)
         }
         "supdb-cache64tofitautozpagespromote" => {
             Box::new(Supdb::create_cache64_tofit_auto_zpages_promote(dir)?)
@@ -7939,6 +7981,70 @@ mod tests {
             let opened = open(name, &d, 1).unwrap();
             assert_eq!(opened.name(), name);
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `supdb-cache64tofitautozpagescodingauto` is `supdb-cache64tofitautozpages`
+    /// with the coding the selector's to choose (`Options::zpages_coding_auto`)
+    /// and nothing else: named, durable like it, opened under its name by
+    /// the dispatch, the codings the options name off in both, and the
+    /// engine's default off.
+    #[test]
+    fn the_coding_gear_arm_differs_from_the_combined_arm_in_the_choice_alone() {
+        let root =
+            std::env::temp_dir().join(format!("supdb-bench-codingauto-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let new = |name: &str, make: fn(&Path) -> Res<Supdb>| {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            make(&d).unwrap()
+        };
+        assert!(!supdb::Options::default().zpages_coding_auto);
+        let base = new("base", Supdb::create_cache64_tofit_auto_zpages);
+        let arm = new("gear", Supdb::create_cache64_tofit_auto_zpages_codingauto);
+        assert_eq!(base.name(), "supdb-cache64tofitautozpages");
+        assert_eq!(arm.name(), "supdb-cache64tofitautozpagescodingauto");
+        assert_eq!(guarantee(arm.name()), Some(Guarantee::Durable));
+        assert_eq!(guarantee(arm.name()), guarantee(base.name()));
+        assert!(arm.zcodingauto && !base.zcodingauto);
+        assert!(arm.zpages_auto && base.zpages_auto && arm.tofit && base.tofit);
+        assert_eq!(arm.features(), base.features());
+        let (a, b) = (
+            arm.db.as_ref().unwrap().options(),
+            base.db.as_ref().unwrap().options(),
+        );
+        assert!(
+            a.zpages_coding_auto && !b.zpages_coding_auto,
+            "the one option"
+        );
+        assert_eq!(
+            (
+                a.zpages,
+                a.zpages_record_coding,
+                a.zpages_raw_tails,
+                a.zpages_store_all,
+                a.scan_cache_bytes,
+                a.forms_to_fit,
+                a.zpages_block_cache
+            ),
+            (
+                b.zpages,
+                false,
+                false,
+                false,
+                b.scan_cache_bytes,
+                b.forms_to_fit,
+                b.zpages_block_cache
+            ),
+            "the rest as the combined arm's, the options' codings off"
+        );
+        let d = root.join("dispatch");
+        std::fs::create_dir_all(&d).unwrap();
+        let opened = open("supdb-cache64tofitautozpagescodingauto", &d, 1).unwrap();
+        assert_eq!(opened.name(), "supdb-cache64tofitautozpagescodingauto");
+        drop(opened);
+        drop(arm);
+        drop(base);
         let _ = std::fs::remove_dir_all(&root);
     }
 

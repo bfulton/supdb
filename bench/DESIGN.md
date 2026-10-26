@@ -359,6 +359,10 @@ decoded groups off and the allocator trimmed once after the form files'
 install (`Options::zpages_trim_install`), the fit check of that form, and
 `supdb-cache64tofitzpagesrecordrawleantrim` the same with the trim thread
 asked to look at every upkeep pass end (`Options::upkeep_trim_look`);
+`supdb-cache64tofitautozpagescodingauto` is the combined arm with the coding
+of its form files the selector's to choose (`Options::zpages_coding_auto`),
+the raw tails where the model predicts that form fits the budget and the
+block coding otherwise, where the default builds the block coding;
 `supdb-cache64tofitautozpagesperrun` is the combined arm with a block read
 through a cursor a run, a seek a cut and a read by rank a replaced record
 (`Options::zpages_block_cursor` off), where the default reads a block through

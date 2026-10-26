@@ -421,6 +421,44 @@ pub fn model_z(budget: u64, resident: u64, z_bytes: u64) -> f64 {
     (1.0 - room / z_bytes as f64).clamp(0.0, 1.0)
 }
 
+/// Which coding the compact form is built in where the selector chooses one
+/// (`Options::zpages_coding_auto`): the LZ4 block coding, one block a group,
+/// whose form is about two thirds of the raw-tail form's bytes at the suite's
+/// shape and whose point read decodes a group; or the record coding with raw
+/// tails, whose form is the records' own bytes with the heads front-coded and
+/// whose point read copies one record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Coding {
+    Block,
+    RawTails,
+}
+
+/// A form's size as the sampler estimates it (`zfile::Sample`, summed over the
+/// partitions): its bytes, and the part of it resident whatever the reads do.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FormSize {
+    pub w_z: u64,
+    pub resident: u64,
+}
+
+/// The coding to build in, with the raw-tail form sized: the raw tails where
+/// [`model_z`] predicts that form faults nothing against the budget, the
+/// block coding otherwise. The line is at no predicted fault at all, since a
+/// form that faults a little loses more than it wins: at five million keys
+/// under 640 MiB the raw-tail form's 556 MB against a budget of about 490 MiB
+/// (the limit less the process's 90 and the margin's 64) predicts about a
+/// tenth of a fault a read and took 0.02-0.03, with D and E 1.4-1.5x slower
+/// for them where the point-read mixes read 1.3x faster, and the block
+/// form's 360 MB predicts none and took none. A size of zero is a form the
+/// sampler declined, and the block coding stands for it.
+pub fn choose_coding(budget: u64, raw_tails: FormSize) -> Coding {
+    if raw_tails.w_z > 0 && model_z(budget, raw_tails.resident, raw_tails.w_z) <= 0.0 {
+        Coding::RawTails
+    } else {
+        Coding::Block
+    }
+}
+
 /// `C_build`, seconds: what buying the form costs, the CPU the build is
 /// estimated to take plus the displacement of the cache it causes. Until the
 /// displacement is measured it is [`DISPLACEMENT_FACTOR`] of the CPU. For a
@@ -2244,6 +2282,74 @@ fn parse_kb(text: &str, key: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The coding the selector chooses is the raw tails exactly where the
+    /// model predicts that form faults nothing, and the block coding
+    /// otherwise: the two measured points (five million keys under 640 MiB,
+    /// where the raw-tail form missed and the block form fit, and three
+    /// million under the same bound, where both fit), the line itself, a
+    /// budget of nothing, and a form the sampler declined.
+    #[test]
+    fn the_coding_is_the_raw_tails_only_where_that_form_is_predicted_to_fault_nothing() {
+        let mb = |n: u64| n << 20;
+        let budget = Budget::of(mb(640), mb(90), None).budget;
+        let raw = FormSize {
+            w_z: mb(530),
+            resident: mb(10),
+        };
+        let block = FormSize {
+            w_z: mb(343),
+            resident: mb(10),
+        };
+        assert!(
+            model_z(budget, raw.resident, raw.w_z) > 0.0,
+            "the raw-tail form misses at {budget}"
+        );
+        assert_eq!(
+            model_z(budget, block.resident, block.w_z),
+            0.0,
+            "the block form fits"
+        );
+        assert_eq!(choose_coding(budget, raw), Coding::Block);
+        let smaller = FormSize {
+            w_z: mb(318),
+            resident: mb(6),
+        };
+        assert_eq!(choose_coding(budget, smaller), Coding::RawTails);
+        let room = budget - raw.resident;
+        assert_eq!(
+            choose_coding(
+                budget,
+                FormSize {
+                    w_z: room,
+                    resident: raw.resident
+                }
+            ),
+            Coding::RawTails,
+            "the line: the form exactly the room"
+        );
+        assert_eq!(
+            choose_coding(
+                budget,
+                FormSize {
+                    w_z: room + 1,
+                    resident: raw.resident
+                }
+            ),
+            Coding::Block,
+            "one byte over the room"
+        );
+        assert_eq!(
+            choose_coding(0, raw),
+            Coding::Block,
+            "no budget fits nothing"
+        );
+        assert_eq!(
+            choose_coding(budget, FormSize::default()),
+            Coding::Block,
+            "a declined form is not chosen"
+        );
+    }
 
     // ---- the platform's side ------------------------------------------
 
