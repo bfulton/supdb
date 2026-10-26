@@ -1191,27 +1191,35 @@ pub fn encode_record_group(
 
 /// Record `i`'s fields in a record-coded payload, located and checked:
 /// where its head's suffix, its tail and its lengths are.
-struct CodedRec<'a> {
-    plen: usize,
-    suffix: &'a [u8],
-    ulen: usize,
-    tail: &'a [u8],
+pub struct CodedRec<'a> {
+    pub plen: usize,
+    pub suffix: &'a [u8],
+    pub ulen: usize,
+    pub tail: &'a [u8],
 }
 
 impl<'a> CodedRec<'a> {
-    fn head_len(&self) -> usize {
+    pub fn head_len(&self) -> usize {
         self.plen + self.suffix.len()
     }
 
     /// Where the tail begins in the image.
-    fn tail_at(&self) -> usize {
+    pub fn tail_at(&self) -> usize {
         self.head_len().next_multiple_of(4)
+    }
+
+    /// Whether the tail is stored raw: the image's bytes from its tail
+    /// start, verbatim, which a reader may parse where they lie
+    /// (`encode_record_group` under `raw_tails`, and every record's whose
+    /// tail LZ4 did not shrink).
+    pub fn tail_is_raw(&self) -> bool {
+        self.tail.len() == self.ulen - self.tail_at()
     }
 }
 
-const REC_CUT: ZError = ZError::Walk("a coded record does not parse");
+pub const REC_CUT: ZError = ZError::Walk("a coded record does not parse");
 
-fn coded_rec(payload: &[u8], count: usize, i: usize) -> Result<CodedRec<'_>, ZError> {
+pub fn coded_rec(payload: &[u8], count: usize, i: usize) -> Result<CodedRec<'_>, ZError> {
     if i >= count || count > ZMAX_COUNT || payload.len() < 2 * count {
         return Err(REC_CUT);
     }
@@ -1253,7 +1261,7 @@ fn coded_rec(payload: &[u8], count: usize, i: usize) -> Result<CodedRec<'_>, ZEr
 
 /// Record 0 of a record-coded payload: the head every other record's is
 /// coded against and the tail they are compressed against.
-fn coded_first(payload: &[u8], count: usize) -> Result<(&[u8], &[u8]), ZError> {
+pub fn coded_first(payload: &[u8], count: usize) -> Result<(&[u8], &[u8]), ZError> {
     let r0 = coded_rec(payload, count, 0)?;
     Ok((r0.suffix, r0.tail))
 }
@@ -1337,12 +1345,38 @@ pub fn decode_record_group<'a>(
 
 /// A coded group's key `i` assembled into `into`: the first record's head
 /// to the prefix length, the suffix, and the key is what follows the four
-/// header bytes.
-fn coded_key_into(head0: &[u8], r: &CodedRec<'_>, into: &mut Vec<u8>) {
+/// header bytes. `false`, with `into` cleared, for a prefix longer than the
+/// first record's head, which is damage: a forged payload once panicked the
+/// check here instead of failing it.
+pub fn coded_key_into(head0: &[u8], r: &CodedRec<'_>, into: &mut Vec<u8>) -> bool {
     into.clear();
+    if r.plen > head0.len() {
+        return false;
+    }
     into.extend_from_slice(&head0[..r.plen]);
     into.extend_from_slice(r.suffix);
     into.drain(..4);
+    true
+}
+
+/// A coded record's four header bytes -- the key's length and the extent
+/// count or the compact mark, as `flatindex::parse_record` reads them from
+/// an image -- taken from the first record's head to the prefix length and
+/// the suffix after it, which is where the record's head lies without
+/// assembling it. `None` for a prefix longer than the first head.
+pub fn coded_header(head0: &[u8], r: &CodedRec<'_>) -> Option<[u8; 4]> {
+    if r.plen > head0.len() || r.head_len() < 4 {
+        return None;
+    }
+    let mut h = [0u8; 4];
+    for (k, b) in h.iter_mut().enumerate() {
+        *b = if k < r.plen {
+            head0[k]
+        } else {
+            r.suffix[k - r.plen]
+        };
+    }
+    Some(h)
 }
 
 /// That a record-coded group `j` is what its page's directory and its
@@ -1374,7 +1408,11 @@ pub fn check_coded_group(
     for i in 0..count {
         let r = coded_rec(payload, count, i)?;
         ulen = ulen.checked_add(r.ulen).ok_or(REC_CUT)?;
-        coded_key_into(head0, &r, &mut cur);
+        if !coded_key_into(head0, &r, &mut cur) {
+            return Err(ZError::Walk(
+                "a coded record's prefix is longer than the first head",
+            ));
+        }
         if i == 0 && first.is_some_and(|f| f != cur.as_slice()) {
             return Err(ZError::Walk("the first key is not the one named for it"));
         }
@@ -1393,8 +1431,10 @@ pub fn check_coded_group(
 }
 
 /// The key of a coded record, `head_i[4..]`, compared with `key` without
-/// assembling it: the part the shared prefix holds, then the suffix's.
-fn cmp_coded_key(head0: &[u8], r: &CodedRec<'_>, key: &[u8]) -> Ordering {
+/// assembling it: the part the shared prefix holds, then the suffix's. The
+/// prefix is within the first head: the caller has checked it, as
+/// `check_coded_group` has for every record of a verified group.
+pub fn cmp_coded_key(head0: &[u8], r: &CodedRec<'_>, key: &[u8]) -> Ordering {
     let a = &head0[r.plen.min(4)..r.plen];
     let b = &r.suffix[4usize.saturating_sub(r.plen)..];
     // key_i = a ++ b against key, lexicographically.

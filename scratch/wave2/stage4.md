@@ -3090,3 +3090,72 @@ It stays an arm, off, until the in-place walk of a raw-tail group takes the
 scan's cost out, which is the lean-process direction's first piece, since a
 gear that trades the scans for the point reads is not the default for a
 store that does both.
+
+## The in-place walk of a raw-tail group
+
+The raw-tail form's scans paid for the coding the point reads won by: a
+scan decoded each group whole, a parse and a copy a record over 12% more
+groups, and the scan pass read 0.70x of the block form's where both fit.
+The walk reads a raw-tail coded group where it lies now
+(`Options::zpages_inplace_walk`, on; `zfile::Group::Coded`,
+`Opened::Coded`): the group is held as its payload in the mapping, the
+position is a record index, each record's key is assembled from the
+group's first head and the record's suffix into the cursor's key buffer
+(sixteen bytes at the suite's shape, a copy LMDB's leaf does not make),
+and its extents and inline value are parsed from the raw tail where it
+lies by `flatindex::parse_record_tail`, the half of `parse_record` past
+the key, one definition for both. A record whose tail is compressed after
+all, or whose extents cannot be read where they lie (the non-compact
+shape's extent array has an alignment the payload does not keep), is
+decoded on its own; a group is judged raw-tailed from its last record,
+since the first is stored raw whatever the coding. Nothing goes into the
+memo for such a group, and the page is verified at its first touch as a
+first decode verifies it, every group by its own check. The open hands
+the payload back as a kind of its own (`Opened::Coded`) only to a caller
+that asked (`open_group`'s `inplace`): the seek a key and the point read
+read an opened group as decoded bytes and get the decode as before. Two
+walks share the shape -- the cursor's (`ZCursor::walk_until`, `walk_run`,
+`skip_to`, `advance_until`, `key`, `values`) and the bulk scan's
+(`ZFile::scan_in`, which the block cache's clean walks and the scans with
+the cache off take) -- and both read in place. `coded_key_into` refuses a
+prefix longer than the first head where it would have panicked on a
+forged payload, and `check_coded_group` fails such a record.
+`supdb-cache64tofitzpagesrecordrawdecode` is the shape before. The tests:
+the cursor's walk from every start, its position's reads rank by rank and
+its seeks over the suite's shape and over every record shape, in place
+and with the walk off, with the groups counted by kind (the shapes' long
+keys leave groups the builder codes as blocks, decoded either way), the
+memo asked nothing for a group read in place; a forged raw-tail page
+whose compact header names a run longer than its tail, under a good CRC,
+which falls the walk to the raw form with every key and value right; and
+the codings test's scans counted in place (`zpage_inplace_groups`).
+
+The first pairing said the walk was in and bypassed: the cursor read
+74,000 groups in place over the mixes while the scans decoded 14 million,
+since the block cache's clean walks go through the bulk scan path and not
+the cursor, and only the counter beside the rates said so (the rates read
+E 1.12-1.22x for the walk, which was the cursor's share). With both paths
+in place (`zinplace2-ab-{1,2}`, `supdb-cache64tofitzpages` against
+`supdb-cache64tofitzpagesrecordraw`, three million keys under 640 MiB,
+both forms fitting, no major fault in either arm): 14.4 million groups a
+rep read in place and 1.5 million decoded by scans where the block form
+decodes 12.5 million; the raw-tail form reads the point-read mixes
+1.2-1.5x faster than the block form in both orders (C 1.43-1.53x, B
+1.23-1.50x, D 1.20-1.51x, A 1.0-1.05x, the read pass 1.41-1.53x), the
+scan pass 1.13-1.21x faster in both orders where it read 0.70-0.72x
+before the walk, and E and F level (E 1.05x and 0.91x, F 1.14x and
+0.85x by order). The walk priced alone (`zinplacewalk2-ab-{1,2}`,
+`supdb-cache64tofitzpagesrecordrawdecode` against the default): the scan
+pass 1.85x and 2.1x faster in the two orders, E 1.21x and 1.13x, the
+point-read mixes level to the order's noise (0.77-1.29 both ways), which
+the walk does not touch.
+
+So the raw-tail form is the better form on every cell where it fits, by
+1.2-1.5x on the point-read mixes and the scan pass and level on E and F,
+and the coding gear's trade is gone: what it picks where the form fits
+loses nothing. The gear stays off one cycle longer, since its pick at the
+window's lower edge flips with the process's memory at the sample's
+moment and the Auto default's buy at a near-fit rung is slow; making it
+the default is the next decision, and the in-place point read -- one
+record lent from the payload instead of copied -- is the next piece of
+the form.

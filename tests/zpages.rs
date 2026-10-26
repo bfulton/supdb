@@ -7282,6 +7282,16 @@ fn a_form_stored_whole_answers_as_the_compressed_one_and_decodes_nothing() {
         } else {
             assert!(c.decodes > 0, "{what}: the compressed groups decode");
         }
+        // A scan of the raw-tail form reads its groups in place
+        // (`Options::zpages_inplace_walk`); the block coding's are LZ4
+        // blocks and the stored form's are parsed where they lie as they
+        // were, neither through the in-place walk.
+        assert_eq!(
+            c.inplace_groups > 0,
+            raw,
+            "{what}: the groups a scan read in place: {}",
+            c.inplace_groups
+        );
         bytes.push(
             form_files(&dir)
                 .iter()

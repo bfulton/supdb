@@ -396,6 +396,9 @@ pub struct ZCounts {
     /// neither does a key below the partition's first key, which the fence
     /// answers.
     pub decodes: u64,
+    /// Groups a scan read in place, record by record, without a decode
+    /// (`Options::zpages_inplace_walk`).
+    pub inplace_groups: u64,
     /// Reads and counts of a partition that went to the raw form because
     /// it had no form file in service: none attached yet, or declined, or
     /// out of service after a check failed.
@@ -1234,6 +1237,18 @@ pub struct Options {
     /// `zpages_record_coding` and `zpages_raw_tails`.
     #[doc(hidden)]
     pub zpages_coding_auto: bool,
+    /// A raw-tail coded group (`zpages_record_coding` with
+    /// `zpages_raw_tails`, or the selector's pick under
+    /// `zpages_coding_auto`) read where it lies by the block cache's cursor:
+    /// each record's key assembled from the group's first head and its
+    /// suffix, its values parsed from the raw tail in the page
+    /// (`flatindex::parse_record_tail`), nothing decoded and nothing put in
+    /// the memo. Off, the group is decoded whole into the cursor's buffer,
+    /// a parse and a copy a record, which read the scan pass at 0.70x of
+    /// the block coding's where both forms fit. On; `supdb-cache64tofitzpagesrecordrawdecode`
+    /// is the shape before. Nothing changes for the block coding, whose
+    /// groups are LZ4 blocks.
+    pub zpages_inplace_walk: bool,
     /// Whether the controller buys its first form at SUSPECT on the model's
     /// prediction, once the sampler has priced it and the partitions have
     /// stood for `zselect::EAGER_SETTLE` with nothing of the segment work in
@@ -2717,6 +2732,7 @@ impl Default for Options {
             zpages_trim_install: false,
             upkeep_trim_look: false,
             zpages_coding_auto: false,
+            zpages_inplace_walk: true,
             zpages_build_eager: false,
             zpages_inject: None,
             forms_pieces_only: false,
@@ -8030,6 +8046,8 @@ struct Slot {
     zreads: AtomicU64,
     zcounts: AtomicU64,
     zdecodes: AtomicU64,
+    /// Groups a scan read in place without a decode (`Group::Coded`).
+    zinplace: AtomicU64,
     zraw: AtomicU64,
     zfallbacks: AtomicU64,
     zscans: AtomicU64,
@@ -8102,6 +8120,7 @@ impl Slot {
             zreads: AtomicU64::new(0),
             zcounts: AtomicU64::new(0),
             zdecodes: AtomicU64::new(0),
+            zinplace: AtomicU64::new(0),
             zraw: AtomicU64::new(0),
             zfallbacks: AtomicU64::new(0),
             zscans: AtomicU64::new(0),
@@ -15997,6 +16016,7 @@ impl Reader {
             reads: rd.stat(|s| &s.zreads),
             counts: rd.stat(|s| &s.zcounts),
             decodes: rd.stat(|s| &s.zdecodes),
+            inplace_groups: rd.stat(|s| &s.zinplace),
             rawserves: rd.stat(|s| &s.zraw),
             fallbacks: rd.stat(|s| &s.zfallbacks),
             nopage_reads: rd.stat(|s| &s.znopage),
@@ -16339,6 +16359,7 @@ impl Reader {
             .map_err(|e| err(&format!("segment scan: {e}")))?;
         self.zmemo_take();
         self.zbump_by(|s| &s.zscangroups, r.decoded);
+        self.zbump_by(|s| &s.zinplace, r.inplace);
         self.zbump_by(|s| &s.znopagescans, r.nopage);
         self.zbump_by(|s| &s.zprefetches, r.prefetches);
         match r.end {
@@ -16705,6 +16726,7 @@ impl Reader {
             Some(PWalk::Z(c)) => {
                 self.zmemo_take();
                 self.zbump_by(|s| &s.zscangroups, c.decoded);
+                self.zbump_by(|s| &s.zinplace, c.inplace);
                 self.zbump_by(|s| &s.znopagescans, c.nopage);
                 self.zbump_by(|s| &s.zprefetches, c.prefetches);
                 if c.fell_back() {
@@ -23232,7 +23254,11 @@ impl Db {
                     opts.zpages_scan_prefetch,
                     opts.zpages_trusted_views,
                     opts.zpages_memo_first,
-                    (opts.zpages_fence_tree, opts.zpages_memo_ahead),
+                    (
+                        opts.zpages_fence_tree,
+                        opts.zpages_memo_ahead,
+                        opts.zpages_inplace_walk,
+                    ),
                     &zev,
                 );
             }
@@ -26472,7 +26498,7 @@ impl Db {
         prefetch: bool,
         trusted: bool,
         memo_first: bool,
-        lines: (bool, bool),
+        lines: (bool, bool, bool),
         ev: &zfile::ZEvents,
     ) -> bool {
         let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) else {
@@ -26491,7 +26517,8 @@ impl Db {
             lines.0,
             lines.1,
         ) {
-            Ok(side) => {
+            Ok(mut side) => {
+                side.inplace = lines.2;
                 let installed = seg.z.install(side);
                 if installed {
                     zfile::ZEvents::add(&ev.attached, 1);
@@ -26540,7 +26567,11 @@ impl Db {
                 self.opts.zpages_scan_prefetch,
                 self.opts.zpages_trusted_views,
                 self.opts.zpages_memo_first,
-                (self.opts.zpages_fence_tree, self.opts.zpages_memo_ahead),
+                (
+                    self.opts.zpages_fence_tree,
+                    self.opts.zpages_memo_ahead,
+                    self.opts.zpages_inplace_walk,
+                ),
                 ev,
             )
         {
@@ -26581,7 +26612,8 @@ impl Db {
                     self.opts.zpages_fence_tree,
                     self.opts.zpages_memo_ahead,
                 ) {
-                    Ok(side) => {
+                    Ok(mut side) => {
+                        side.inplace = self.opts.zpages_inplace_walk;
                         if seg.z.install(side) {
                             ev.built(&b);
                             zfile::ZEvents::add(&ev.attached, 1);
@@ -31009,7 +31041,11 @@ impl Drop for PartReader<'_> {
 
 /// `Reader::scan_merged`'s walk of one partition: through its form file
 /// (`zfile::ZCursor`) where the cell holds one in service, by the raw
-/// form's rank and key otherwise.
+/// form's rank and key otherwise. A local of one scan's walk, held on the
+/// stack in an `Option` and in no collection, so the cursor's size is the
+/// stack's; a box for it would be an allocation per partition a merge walk
+/// enters.
+#[allow(clippy::large_enum_variant)]
 enum PWalk<'a> {
     Raw {
         seg: &'a Seg,
@@ -34093,7 +34129,11 @@ impl Maint {
                 self.opts.zpages_scan_prefetch,
                 self.opts.zpages_trusted_views,
                 self.opts.zpages_memo_first,
-                (self.opts.zpages_fence_tree, self.opts.zpages_memo_ahead),
+                (
+                    self.opts.zpages_fence_tree,
+                    self.opts.zpages_memo_ahead,
+                    self.opts.zpages_inplace_walk,
+                ),
                 ev,
             )
         {
@@ -34260,7 +34300,8 @@ impl Maint {
                         self.opts.zpages_fence_tree,
                         self.opts.zpages_memo_ahead,
                     ) {
-                        Ok(side) => {
+                        Ok(mut side) => {
+                            side.inplace = self.opts.zpages_inplace_walk;
                             if target.z.install(side) {
                                 ev.built(&built);
                                 zfile::ZEvents::add(&ev.attached, 1);

@@ -538,29 +538,46 @@ pub fn record_key_next(buf: &[u8], off: usize) -> Option<(&[u8], usize)> {
 #[inline]
 pub fn parse_record(buf: &[u8], off: usize) -> Option<ParsedRecord<'_>> {
     let klen = rd_u16(buf, off)? as usize;
-    let n = rd_u16(buf, off + 2)?;
+    let header: [u8; 4] = buf.get(off..off.checked_add(4)?)?.try_into().ok()?;
     let key = buf.get(off + 4..off + 4 + klen)?;
     let e_at = off.checked_add(align_up(4 + klen, REC_ALIGN))?;
+    let (exts, tail, used) = parse_record_tail(header, buf.get(e_at..)?)?;
+    Some((key, exts, tail, align_up(e_at + used - off, REC_ALIGN)))
+}
+
+/// The part of `parse_record` past the key: for a record whose four header
+/// bytes are `header` and whose image from its aligned tail start is
+/// `rest`, the extents, the inline tail the extents' runs lie in, and how
+/// many bytes of `rest` the record spans (the extents' region and the inline
+/// tail, before the record's padding). `parse_record` is this over the
+/// record's own bytes; a reader of the compact form's record coding with raw
+/// tails (`db::zpages`, `zfile::ZCursor`) has the header and the tail apart,
+/// the head front-coded against the group's first record and the tail where
+/// it lies in the page, and parses the record without assembling it. One
+/// definition for both: a second one is a second reader.
+///
+/// The compact shape's four-byte header and run lie at the start of `rest`;
+/// the other shape's extents must be aligned for `Ext` where they lie, as
+/// the decoded group's buffer and the mapping place them, and a tail at an
+/// offset that is not is `None`, which the caller reads as a record it must
+/// decode first.
+#[inline]
+pub fn parse_record_tail(header: [u8; 4], rest: &[u8]) -> Option<(Exts<'_>, &[u8], usize)> {
+    let n = u16::from_le_bytes([header[2], header[3]]);
     if n & COMPACT != 0 {
         // One shape carries the bit, and any other count beside it is
         // damage rather than a record.
         if n != COMPACT {
             return None;
         }
-        let h: [u8; 4] = buf.get(e_at..e_at.checked_add(4)?)?.try_into().ok()?;
+        let h: [u8; 4] = rest.get(..4)?.try_into().ok()?;
         let len = u16::from_le_bytes([h[0], h[1]]) as usize;
-        let t_at = e_at + 4;
-        let tail = buf.get(t_at..t_at.checked_add(len)?)?;
+        let tail = rest.get(4..4usize.checked_add(len)?)?;
         let e = compact_ext(h, tail)?;
-        return Some((
-            key,
-            Exts::One(e),
-            tail,
-            align_up(t_at + len - off, REC_ALIGN),
-        ));
+        return Some((Exts::One(e), tail, 4 + len));
     }
     let n = n as usize;
-    let bytes = buf.get(e_at..e_at.checked_add(n.checked_mul(EXT_BYTES)?)?)?;
+    let bytes = rest.get(..n.checked_mul(EXT_BYTES)?)?;
     if !(bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<Ext>()) {
         return None;
     }
@@ -571,10 +588,9 @@ pub fn parse_record(buf: &[u8], off: usize) -> Option<ParsedRecord<'_>> {
             tail_len = tail_len.max((e.off as usize).checked_add(e.len as usize)?);
         }
     }
-    let t_at = e_at + n * EXT_BYTES;
-    let tail = buf.get(t_at..t_at.checked_add(tail_len)?)?;
-    let len = align_up(t_at + tail_len - off, REC_ALIGN);
-    Some((key, Exts::Borrowed(exts), tail, len))
+    let t_at = n * EXT_BYTES;
+    let tail = rest.get(t_at..t_at.checked_add(tail_len)?)?;
+    Some((Exts::Borrowed(exts), tail, t_at + tail_len))
 }
 
 /// The fence, held on its own: `fence_n + 1` offsets and the key blob they
