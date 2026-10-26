@@ -429,6 +429,24 @@ user's call.
   free 26 MB higher), so the anonymous memory is not the lever on the fit
   and the in-place walk of a record-coded group is not built for this rung.
   The lighter codings and the trim stay as arms, off.
+- **The fit check's second half, refuted too** (`stage4.md`, "The fit
+  check, second half"): the census's arenas line (`SUPDB_MIX_CENSUS=2`) put
+  40-50 MB of the lean arm's 72-89 MB in E in free chunks resident in the
+  arenas the build and seal threads left and the upkeep thread's, so the
+  trim was moved to where the mixes are: `Options::upkeep_trim_look` asks
+  the trim thread to look at every upkeep pass end, the stride deciding
+  (arm `supdb-cache64tofitzpagesrecordrawleantrim`, `zfit2-ab-{1,2}`;
+  `tests/db.rs` holds the look to the pass end). The looks happened (970 by
+  E's end, 30-50 µs each) and the trims did not (two over the store's
+  life): `trim_due` counts the allocator's free bytes, which stand still
+  while the seal threads re-use the dead arenas' chunks and the pages come
+  back resident. Anonymous bytes in E 81-102 MB against 72-99, the faults
+  unchanged (E 0.027-0.031 a scan, D 0.013-0.026 a read), E 1.39x and D
+  1.45x slower in every pair, the point-read mixes 0.65-0.76. The verdict
+  of both halves: the form's 556 MB plus the process's 90 MB is the
+  limit, and E at this rung would need the raw-tail form, a process of
+  LMDB's order and the in-place walk together. Both trims stay as arms,
+  off.
 - **Where E's time is, by the arm pair's profile at the head**: the LZ4
   decode 25% of the thread (147,000 groups a pass, 2.5 a form walk, nearly
   every one a memo miss, since the form walks are the Zipfian's cold tail),
@@ -446,19 +464,24 @@ user's call.
   lighter form is a second form for it to choose when it fits, not a
   replacement. Not built: the user asked why compress at all, and this is
   the answer's shape.
-- **Loose end: a census under the bound kills the load.** `bench ab` at
-  five million keys under 640 MiB with `SUPDB_LAG_COUNTERS=1` and
+- **The "census kills the load" loose end was the shuffled load.** `bench
+  ab` at five million keys under 640 MiB with `SUPDB_LAG_COUNTERS=1` and
   `--passes load,mixes,lag` (`$S/census-run.sh`) was OOM-killed by the
-  bound's cgroup nine seconds into the second arm's load, at 636 MiB of
-  anonymous memory (`dmesg`: `anon-rss:651596kB`), where the pairings'
-  loads under the same bound, with the counters unset, hold 75-77 MB. The
-  counters mode or the lag pass's presence holds the load's memory; not
-  chased, since the fit question it was to answer is answered by the fault
-  columns; the census of what the process holds under the bound by owner
-  is printed after each mix now (`SUPDB_MIX_CENSUS=1`, the `mixcensus`
-  line, read by `census_read.py`), and the pairings run with it hold 64-99
-  MB in the mixes with no kill, so what the counters mode or the lag pass
-  adds to the load's memory is the part still unchased.
+  bound's cgroup in what read as the second arm's load, at 636 MiB of
+  anonymous memory, and was put down to the counters mode. It was not: the
+  `load` pass (and the `lag` pass) builds a second store with the same keys
+  in a shuffled order (`one_pass`, "The second store"), and the shuffled
+  load of the forced-form arms under 640 MiB is the known kill the session
+  before left untouched; a rerun with `--passes load,mixes` and no counters
+  at all, the process's anonymous bytes sampled each second
+  (`$S/zfit-killcheck.sh`, `$S/logs/killcheck.mem`), climbed from 30 MB at
+  the first store's drop to 574 MB in twelve seconds of the shuffled load
+  and died there. The pairings never run the shuffled load (`--passes
+  read,read-threaded,scan,scan-threaded,mixes`), which is why they survive.
+  The census of what the process holds under the bound by owner is printed
+  after each mix now (`SUPDB_MIX_CENSUS=1`, the `mixcensus` line, `2` with
+  the arenas and the mappings, read by `census_read.py`). The shuffled-load
+  kill itself stays untouched.
 - **Untouched**: the shuffled-load kill of the combined arm under 640 MiB
   and the gear shift, as the session before left them.
 
@@ -607,6 +630,12 @@ It writes `NAME-ab-{1,2}.out` (the table) and `.err` (per-rep lines).
 A new arm needs four things: a field on `Policy`/`Supdb` and its name in
 `bench/src/engines.rs`, a roster line in `bench/DESIGN.md`, a test in
 `engines.rs` holding the arm to its option, and any counter row it needs.
+
+A build whose output is piped (`cargo build ... | tail`) reports the
+pipe's exit, not cargo's, and cargo once reported a bench binary fresh with
+its source newer; the check that a binary is the tree's is its mtime
+against the sources' (`ls -la --time-style=+%T`), read before a run that
+depends on the change.
 
 ## Loose ends
 

@@ -575,7 +575,12 @@ each mix (`mixcensus`), which is where a form file's fit beside the
 process is decided -- a trim before the mixes read the process 15 MB
 lower in use and level in anonymous bytes once the mixes had taken the
 return back, so a lever on the process's memory is read in the phase
-that competes for it, never at the lever. `SUPDB_SCAN_OPS=1` times
+that competes for it, never at the lever; and a trim counted by the
+allocator's free bytes (`trim_due`) never fires on pages that come back
+resident under chunks already free, which is what a thread re-using a
+dead arena does, so a look that found nothing to trim nine hundred times
+is read against the arenas line (`SUPDB_MIX_CENSUS=2`) before the
+mechanism is read as having nothing to return. `SUPDB_SCAN_OPS=1` times
 every scan of the single-threaded scan pass on its own, for every arm,
 and prints a `scanops` line a pass with the first scans beside the
 median: a pass of a hundred scans at the smallest rung is a few hundred

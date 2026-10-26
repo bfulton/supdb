@@ -1767,7 +1767,11 @@ fn one_pass(
     // With `SUPDB_MIX_CENSUS` set, the engine's census of what the process
     // holds after each mix, one `mixcensus` line a mix, as the lag sweep's
     // `lagcensus`: the form files' fit beside the process is read there.
+    // Set to `2`, the allocator's bytes by arena and the anonymous mappings
+    // by size follow it, as they follow `lagcensus`: a walk of every free
+    // chunk under each arena's lock, asked for and not given.
     let mix_census = std::env::var_os("SUPDB_MIX_CENSUS").is_some();
+    let mix_census_detail = std::env::var("SUPDB_MIX_CENSUS").is_ok_and(|v| v == "2");
     for letter in YCSB_ORDER {
         if !passes.mixes {
             break;
@@ -1806,7 +1810,13 @@ fn one_pass(
             );
         }
         if mix_census {
-            census_line("mixcensus", arm, &letter.to_string(), e.as_ref(), false);
+            census_line(
+                "mixcensus",
+                arm,
+                &letter.to_string(),
+                e.as_ref(),
+                mix_census_detail,
+            );
         }
     }
 

@@ -1,0 +1,12 @@
+4df915f
+ M bench/src/engines.rs
+ M bench/src/run.rs
+ M scratch/wave2/HANDOFF.md
+ M src/db.rs
+ M tests/db.rs
+ M tests/zpages.rs
+?? scratch/wave2/zfit-arenas.err
+?? scratch/wave2/zfit-arenas.out
+?? scratch/wave2/zfit2-build.log
+?? scratch/wave2/zfit2-head.txt
+2026-10-25T23:17:06Z
