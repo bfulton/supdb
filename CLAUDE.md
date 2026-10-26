@@ -1376,7 +1376,12 @@ oracle, whose store has pieces, runs under them and counts a fallback or
 a damaged form file as a failure. The corollary of the corollary: a
 shape given to a kind of group is checked at every site that reads the
 group's bytes, and a reader that answers the empty slice for a kind it
-does not hold is a reader every such site has to be read against.
+does not hold is a reader every such site has to be read against. And a
+fourth site by the profile: the form file's own seek, the scan's start
+and the cut's, still opened a coded group with the decode and sought the
+decoded bytes, 87,000 whole-group copy-decodes a mix in the lean arm's E
+for walks that decoded nothing, a fifth of its thread; the profile of the
+arm named the caller where the counters had only the count.
 
 **A list of raw pointers drops the pointers.** A replaced canonical
 form and a replaced scan snapshot wait in lists until every reader

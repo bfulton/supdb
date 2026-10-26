@@ -3242,3 +3242,70 @@ same cell are read beside the engine's, since a comparator that faults as
 much and reads faster names the engine's own cost as the gap; and a count
 that was to replace one that never fired is read first for whether it
 fired, at the stride it was given.
+
+## The form file's seek over a coded group's heads, and where E's time is on both forms
+
+Two profiles at five million keys under 640 MiB (`scratch/wave2/prof/profile-e.sh`,
+perf over each mixes pass, the samples cut to E's window and the main thread;
+`$S/profE`, `$S/profL`), the first of the forced LZ4 form beside LMDB and the
+second beside the lean raw-tail arm, before any change. The LZ4 form's E thread
+(8,470 samples a sitting): the LZ4 decode 24.9%, every one a cold group -- the
+counters put 147,000 decodes a mix beside 107,000 memo hits, 2.5 and 1.85 a
+scan, since the window of fifty crosses 2.6 groups of 2 KB and half the starts
+fall in the Zipfian's cold tail -- `scan_blocks` 6.9%, the page view 4.2%, the
+memo's get and the open 6.3%, the fence's search 4.4%, the walks and the runs
+5.5%, the prefetch 2.5%, the settle about 2%; the harness's generator and
+clock a sixth, and of that the `pow` of the Zipfian's zeta sum over the
+store's keys, built at every mix's start before the mix's clock starts, a
+tenth of the window and none of the measured time. The group opens by caller:
+the cursor's `open_at` 14%, `ZFile::seek` 10.6%, the bulk scan 8.3%. LMDB's E
+thread beside it (4,828 samples): `mdb_cursor_next` 20.8%, the page and node
+searches 15%, the cursor get 3.8%, about two fifths of its thread the engine's
+against four fifths of ours, which puts our engine's CPU a scan at about three
+times LMDB's, and the LZ4 decode alone at what LMDB's whole walk costs.
+
+The lean raw-tail arm's E thread (9,942 samples, on its core 81% of the window
+where the LZ4 form's is 95%, the rest the device): the record coding's
+whole-group decode -- `coded_rec` 6.3%, the copies 9.2%, `get_var` 1.7%,
+`decode_record_group` and `decode_record_into` 2.2% -- about a fifth of the
+thread, 87,000 groups a mix, 1.5 a scan, in a form whose walks decode nothing;
+the faults' kernel share a sixth (`iowrite16` 8.3%, the task switches 4.6%,
+the folio and fault handlers 2.7%); `coded_record_to` 4.7%, the in-place
+walk's own records; `scan_blocks` 5.8%, the page view 4.5%, the fence 4.2%.
+The decodes' caller was `ZFile::seek`: the scan's start seek and the cut's
+opened the group as a walk opens one, with the decode, and sought the decoded
+bytes, where the point read had sought the same group over its heads since the
+record coding (`record_group_seek`); under the in-place walk the decode served
+nobody, and under the block coding it was the group the walk would decode
+anyway, hit in the memo at the walk's open.
+
+`ZFile::seek` seeks a coded group over its heads now, nothing decoded and
+nothing put in the memo, the page verified at its first touch as a first
+decode verifies it; the block coding's seek is as it was. The skip-to test
+holds the suite's shapes under the record coding to no decode and no memo ask
+for a seek, and was held to firing on the tree before: the record-coded
+fixture's seeks asked the memo 6,296 times. Paired at five million keys under
+640 MiB (`zheads-ab-{1,2}`, the lean arm against the LZ4 form, both orders, the
+census on): the lean arm's scans decode nothing (`zpage_scan_groups` 0 a mix
+against 87,000), and against the LZ4 form it reads C 0.74 and B 0.70 (faster)
+in every pair, A 0.80 and F 0.94 by gets, D 1.42 (slower) in eleven pairs of
+twelve and E 1.41 in twelve, where the pairing before the change read C 0.82-
+0.91, B 0.85-0.90, A 1.04-1.07, F 1.28-1.33, D 1.90-1.93 and E 1.55-1.65; its
+faults as before, 0.027-0.030 a scan in E and 0.020-0.023 a read in D, which
+is where D's and E's loss now lies, with the settle beside it.
+
+Where both forms fit (three million keys under 640 MiB, `zheads3m-ab-{1,2}`,
+`supdb-cache64tofitzpagesrecordraw` against the LZ4 form, no fault in either
+arm) the raw-tail form reads every mix faster now: C 0.78, B 0.73, A 0.74 and
+F 0.80 of the LZ4 form's time by gets, D 0.69, and E 0.80 by scans in ten
+pairs of twelve, with the scan pass 1.25-1.74x by order, where before the
+heads' seek E read level (1.05 and 0.91 by order) and the point-read mixes
+1.2-1.5x. So the raw-tail form reads every cell faster than the block form
+wherever it fits, and where it does not (five million under 640 MiB) it wins
+the point-read mixes and loses D and E on the faults the block form does not
+take; the gear's trade is a fit's, which is the controller's measure. What E
+still pays beside LMDB at five million under 640 MiB is on the LZ4 form the
+cold decode of 2.5 groups a scan and the walk around it, and on the raw-tail
+form the faults and the settle; the raw-tail form's scan at three million,
+decoding nothing, reads 0.80 of the LZ4 form's, which is about LMDB's
+fault-free rate by the profile's shares.

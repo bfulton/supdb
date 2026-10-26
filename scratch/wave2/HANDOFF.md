@@ -522,6 +522,31 @@ user's call.
   and the oracle runs under the raw tails too
   (`the_oracle_holds_with_the_raw_tails_read_in_place`), held to firing
   on the tree before the fix.
+- **The form file's seek over a coded group's heads** (`stage4.md`, "The
+  form file's seek over a coded group's heads, and where E's time is on both
+  forms"): `ZFile::seek`, the scan's start seek and the cut's, opened a
+  record-coded group with the decode and sought the decoded bytes, where the
+  point read seeks over the heads; under the in-place walk that decode
+  served nobody -- 87,000 whole-group copy-decodes a mix in the lean arm's E,
+  a fifth of its thread by the profile. It seeks over the heads now, nothing
+  decoded. At five million under 640 MiB the lean raw-tail arm against the
+  LZ4 form reads C 0.74, B 0.70, A 0.80, F 0.94, D 1.42 and E 1.41 (from
+  0.82-0.91, 0.85-0.90, 1.04-1.07, 1.28-1.33, 1.9 and 1.55-1.65), its faults
+  unchanged; at three million under 640 MiB, both fitting, the raw-tail form
+  reads every mix faster than the LZ4 form (C 0.78, B 0.73, A 0.74, F 0.80,
+  D 0.69, E 0.80) and the scan pass 1.25-1.74x. Two E profiles at five
+  million (`scratch/wave2/prof/profile-e.sh`; `$S/profE`, `$S/profL`, gone
+  with the container; the aggregates' heads are in stage4): the LZ4 form's
+  thread is a quarter LZ4 decode (147,000 cold groups a mix, 2.5 a scan),
+  LMDB's engine is two fifths of its thread where ours is four fifths, so
+  our E CPU a scan is about three times LMDB's; the lean arm's thread was a
+  fifth whole-group decodes (now gone), a sixth the faults' kernel share.
+  **Next**: the gear's default under `Auto` is now the clear call where the
+  form fits; E on the LZ4 form at five million is the cold decode of 2.5
+  groups a scan (a partial decode of the last group, liblz4, or the raw-tail
+  form where it fits are the levers); on the raw-tail form the faults and
+  the settle (121 ms of E against the LZ4 form's 51, unexplained -- profile
+  the settle's frames in the lean arm's E).
 - **Where E's time is, by the arm pair's profile at the head**: the LZ4
   decode 25% of the thread (147,000 groups a pass, 2.5 a form walk, nearly
   every one a memo miss, since the form walks are the Zipfian's cold tail),
