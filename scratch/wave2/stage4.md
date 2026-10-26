@@ -3159,3 +3159,86 @@ moment and the Auto default's buy at a near-fit rung is slow; making it
 the default is the next decision, and the in-place point read -- one
 record lent from the payload instead of copied -- is the next piece of
 the form.
+
+## The lean process, third fit check: a trim counted by the resident bytes beyond use
+
+The second fit check left one lever untried: a trim counted by what is
+resident and free rather than by the allocator's free count, which stands
+still while a thread re-uses a dead arena's chunks and frees them again. The
+trim thread counts its stride that way now under
+`Options::trim_by_resident` (off): `RssAnon` of `/proc/self/status` less
+`mallinfo2`'s in-use and mmapped bytes, read at every look, the floor after a
+trim re-read the same way (`heap::resident_beyond_use`, `heap::held`); an
+allocation nobody has touched counts as in use and not as resident, so the
+count runs under the truth and a trim comes late, never for nothing.
+`supdb-cache64tofitzpagesrecordrawleanresident` is the lean arm with the look
+at every pass end and the count, paired against `supdb-cache64tofitzpages`
+at five million keys under 640 MiB with the census on (`zleanres-ab-{1,2}`),
+and against LMDB (`zleanlmdb-ab-{1,2}`), the cell.
+
+The tests (`tests/db.rs`): a dead arena built to glibc's own arithmetic -- a
+thread raises the dynamic mmap threshold with one allocation under its cap,
+takes thirty-two megabytes in pieces of one from its heap, touches them,
+frees them and exits with a keeper of two megabytes allocated after them
+alive, since glibc carves from its bins before its top and a free run under
+a live chunk is a bin chunk a trim reaches where a free top under the trim
+threshold is not -- reads as that much more resident beyond use and a trim
+returns at least half of it; and a store with the look, an eight-megabyte
+stride and the count trims again when a second thread re-touches the arena,
+which the free count never sees. The first shape of the dead arena had no
+keeper and its pieces coalesced into the heap's top, and `malloc_trim`
+returned nothing of them: a heap's top is shrunk only past the trim
+threshold, twice the dynamic mmap threshold, up to sixty-four megabytes.
+The four tests that make or count a trim share a lock, since a trim is of
+the whole process and a test's dead arena was returned by another test's
+trim between its two readings.
+
+At the default stride of thirty-two megabytes the count never fired: one
+trim over the store's life, the install's, in 930-980 looks, with the
+process 31-42 MB resident beyond use through E (anonymous 83-98 MB, in use
+52) -- 15-25 MB over the floor the install trim left. The lean-resident arm
+read the fit as the lean arms before it: 0.055 and 0.026 major faults a
+scan in E by sitting, 0.051-0.053 a read in D, 0.041-0.044 a scan in the
+scan pass, where the LZ4 form takes none; E's scans 992 and 797 ms against
+584 and 583, the 195 ms between the sittings for 2,400 more faults, about
+80 us a fault; D's gets 1.93x slower in twelve pairs of twelve and E 1.65x
+in twelve, the point-read mixes C 0.82 and B 0.85 (faster), A 1.07 and F
+1.28 (slower) by gets. The stride is eight megabytes for the arm now, and
+the pairing at it follows.
+
+Against LMDB the lean-resident arm wins every cell but E: ycsb-A 5.1x,
+B 2.2x, C 2.3x, D 2.0x, F 4.4x the operations a second, the scan pass 2.1x
+on one thread and 2.5x on three, and E 0.66x, in every pair of both
+orders. And E's faults are LMDB's: 0.0243 a scan for the arm against
+0.0253 for LMDB, whose 650 MB file does not fit the bound either (its D
+0.068 a read against our 0.0125, its scan pass 0.227 against 0.059), while
+LMDB's E scans read 528-535 ms median (279 in the fastest rep) against
+our 892-997. So E against LMDB at this rung is not the fit, and the lean
+process is not its lever: the LZ4 form, the default's coding, reads E at
+583 ms with no fault at all, 1.1x LMDB's faulting median, which puts a
+fault-free LMDB a good half faster than our best E. What E pays is the
+walk's own time -- the overlay merge at the Zipfian head, the first
+group's decode at every seek (the lean arm still decodes 1.5 groups a scan
+in E, the seek's group and the skip's reopen, where the walk between them
+is in place), the settle (121 ms of the lean arm's E against 51 of the
+LZ4 arm's) -- and the pages are LMDB's problem as much as ours.
+
+At eight megabytes the count fired -- four to nine trims in the mixes
+over the install's one, by the census at E's end (`zleanres8-ab-{1,2}`) --
+and nothing moved: the lean-resident arm's anonymous bytes in E read 82-88
+MB against the LZ4 arm's 76-84 in the same sittings, and in C, B and A
+52-68 against 45-70; its faults 0.047 and 0.021 a scan in E by sitting and
+0.046-0.053 a read in D, as before; E 1.55x slower in twelve pairs of
+twelve and D 1.90x in twelve, the point-read mixes 0.90-0.91 (faster), F
+1.33 (slower). The pages a trim returns are the pages the mixes touch
+next -- the seal threads' buffers, the memtable's growth, the forms --
+so a trim inside the mixes lowers what the process holds at the trim and
+nothing of what it holds through the mix, which is where the form's pages
+compete; the count was the right count, and the lever is refuted in its
+third form as in its first two. `trim_by_resident` stays an arm, off.
+
+The rule: before a cell's fit is chased, the comparator's faults on the
+same cell are read beside the engine's, since a comparator that faults as
+much and reads faster names the engine's own cost as the gap; and a count
+that was to replace one that never fired is read first for whether it
+fired, at the stride it was given.

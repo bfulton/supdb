@@ -358,7 +358,10 @@ and the values the records' own bytes, and
 decoded groups off and the allocator trimmed once after the form files'
 install (`Options::zpages_trim_install`), the fit check of that form, and
 `supdb-cache64tofitzpagesrecordrawleantrim` the same with the trim thread
-asked to look at every upkeep pass end (`Options::upkeep_trim_look`);
+asked to look at every upkeep pass end (`Options::upkeep_trim_look`), and
+`supdb-cache64tofitzpagesrecordrawleanresident` the same with the trim's
+stride counted by the anonymous bytes resident beyond the allocator's use
+instead of its free count (`Options::trim_by_resident`);
 `supdb-cache64tofitautozpagescodingauto` is the combined arm with the coding
 of its form files the selector's to choose (`Options::zpages_coding_auto`),
 the raw tails where the model predicts that form fits the budget and the

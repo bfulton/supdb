@@ -1223,6 +1223,28 @@ pub struct Options {
     /// raw-tail coding (`supdb-cache64tofitzpagesrecordrawleantrim`). Off.
     #[doc(hidden)]
     pub upkeep_trim_look: bool,
+    /// EXPERIMENT: the trim thread counts its stride by the anonymous bytes
+    /// this process holds resident beyond what the allocator has in use
+    /// (`RssAnon` less `mallinfo2`'s in-use and mmapped bytes) and not by
+    /// the allocator's free count. The free count stands still while a
+    /// thread re-uses a dead arena's free chunks and frees them again --
+    /// the chunks were free before and are free after, and only their
+    /// pages came back -- so at five million keys under 640 MiB the look
+    /// at every pass end (`upkeep_trim_look`) found nothing to trim nine
+    /// hundred and seventy times while 40-50 MB sat resident and free in
+    /// the arenas the seal and build threads left. The resident count
+    /// moves with the pages. An allocation nobody has touched yet counts
+    /// as in use and not as resident, so the count runs under the truth
+    /// by that much and a trim comes late, never for nothing. With the
+    /// lean arm's levers and the look it is the third fit check of the
+    /// raw-tail form (`supdb-cache64tofitzpagesrecordrawleanresident`),
+    /// refuted as its first two were: at a stride of eight megabytes the
+    /// count fired, four to nine trims in the mixes, and the process's
+    /// anonymous bytes through the mixes and the faults read as without
+    /// it, since the pages a trim returns are the pages the mixes touch
+    /// next. Off.
+    #[doc(hidden)]
+    pub trim_by_resident: bool,
     /// EXPERIMENT: under `ZPages::Auto`, the coding the form files are built
     /// in is the selector's to choose (`zselect::choose_coding`): the sampler
     /// sizes the record coding with raw tails beside the block coding, and
@@ -2731,6 +2753,7 @@ impl Default for Options {
             zpages_raw_tails: false,
             zpages_trim_install: false,
             upkeep_trim_look: false,
+            trim_by_resident: false,
             zpages_coding_auto: false,
             zpages_inplace_walk: true,
             zpages_build_eager: false,
@@ -12343,6 +12366,33 @@ mod heap {
         Some(unsafe { f() }.fordblks)
     }
 
+    /// The anonymous bytes this process holds resident beyond what the
+    /// allocator has in use: `RssAnon` of `/proc/self/status` less
+    /// `mallinfo2`'s in-use bytes in the arenas and its mmapped chunks.
+    /// Free chunks' resident pages, mostly, since the engine maps no
+    /// anonymous memory of its own; the stacks and the binary's data are a
+    /// constant the trim's floor absorbs, and an allocation not yet touched
+    /// counts as in use and not as resident, so the reading runs under the
+    /// truth and never over it. None where either reading cannot be had.
+    pub fn resident_beyond_use() -> Option<usize> {
+        let f = mallinfo2()?;
+        let text = std::fs::read_to_string("/proc/self/status").ok()?;
+        let anon = super::zselect::parse_status_rss_anon(&text)? as usize;
+        // SAFETY: reads the allocator's own totals under its own locks.
+        let mi = unsafe { f() };
+        Some(anon.saturating_sub(mi.uordblks.saturating_add(mi.hblkhd)))
+    }
+
+    /// What the trim counts its stride by: the resident bytes beyond use
+    /// (`Options::trim_by_resident`), or the allocator's free count.
+    pub fn held(by_resident: bool) -> Option<usize> {
+        if by_resident {
+            resident_beyond_use()
+        } else {
+            free_bytes()
+        }
+    }
+
     /// The pages inside every free chunk of every arena given back,
     /// each arena's lock held while its pages are.
     pub fn trim() {
@@ -12355,6 +12405,14 @@ mod heap {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 mod heap {
     pub fn free_bytes() -> Option<usize> {
+        None
+    }
+
+    pub fn resident_beyond_use() -> Option<usize> {
+        None
+    }
+
+    pub fn held(_by_resident: bool) -> Option<usize> {
         None
     }
 
@@ -12372,12 +12430,13 @@ fn trim_due(held: usize, floor: usize, stride: usize) -> (usize, bool) {
 }
 
 /// Give the system the pages the allocator holds free, if it holds
-/// `stride` more than it did when it was last asked to (`trim_due`).
+/// `stride` more than it did when it was last asked to (`trim_due`), by
+/// the count the store asks for (`heap::held`, `Options::trim_by_resident`).
 /// Pages, not chunks: glibc releases the whole pages inside every free
 /// chunk of every arena, not only a heap's top.
-fn trim_free_memory(shared: &Shared, stride: usize) {
+fn trim_free_memory(shared: &Shared, stride: usize, by_resident: bool) {
     let t = std::time::Instant::now();
-    let Some(held) = heap::free_bytes() else {
+    let Some(held) = heap::held(by_resident) else {
         return;
     };
     let (floor, due) = trim_due(
@@ -12388,7 +12447,7 @@ fn trim_free_memory(shared: &Shared, stride: usize) {
     shared.trim_floor.store(floor, AtomicOrdering::Relaxed);
     if due {
         heap::trim();
-        let left = heap::free_bytes().unwrap_or(held);
+        let left = heap::held(by_resident).unwrap_or(held);
         shared.trim_floor.store(left, AtomicOrdering::Relaxed);
         shared.trims.fetch_add(1, AtomicOrdering::Relaxed);
     }
@@ -12405,7 +12464,12 @@ fn trim_free_memory(shared: &Shared, stride: usize) {
 /// held from landing a seal or answering a flush; and not niced, since it
 /// holds an arena's lock for as long as it trims it and a thread that
 /// could be preempted holding one is the one that keeps the rest waiting.
-fn trim_loop(shared: &Shared, stop: &std::sync::atomic::AtomicBool, stride: usize) {
+fn trim_loop(
+    shared: &Shared,
+    stop: &std::sync::atomic::AtomicBool,
+    stride: usize,
+    by_resident: bool,
+) {
     while !stop.load(AtomicOrdering::Acquire) {
         if shared.trim_wanted.swap(false, AtomicOrdering::AcqRel) {
             shared.trim_begun.fetch_add(1, AtomicOrdering::Release);
@@ -12414,7 +12478,7 @@ fn trim_loop(shared: &Shared, stop: &std::sync::atomic::AtomicBool, stride: usiz
             {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            trim_free_memory(shared, stride);
+            trim_free_memory(shared, stride, by_resident);
             continue;
         }
         std::thread::park();
@@ -26838,9 +26902,10 @@ impl Db {
             // Counted with the trim thread's trims, and the floor its
             // next stride is counted from set to what is left, so the
             // census reads this trim and the looks after it start from it.
-            self.shared
-                .trim_floor
-                .store(heap::free_bytes().unwrap_or(0), AtomicOrdering::Relaxed);
+            self.shared.trim_floor.store(
+                heap::held(self.opts.trim_by_resident).unwrap_or(0),
+                AtomicOrdering::Relaxed,
+            );
             self.shared.trims.fetch_add(1, AtomicOrdering::Relaxed);
         }
         Ok(())
@@ -29043,9 +29108,10 @@ impl Db {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = stop.clone();
         let stride = self.opts.forms_trim_bytes;
+        let by_resident = self.opts.trim_by_resident;
         let spawned = std::thread::Builder::new()
             .name("supdb-trim".into())
-            .spawn(move || trim_loop(&shared, &flag, stride));
+            .spawn(move || trim_loop(&shared, &flag, stride, by_resident));
         if let Ok(handle) = spawned {
             let _ = self.shared.trim_thread.set(handle.thread().clone());
             self.trimmer = Some(Trimmer {
@@ -29077,6 +29143,27 @@ impl Db {
     #[doc(hidden)]
     pub fn trim_supported() -> bool {
         heap::free_bytes().is_some()
+    }
+
+    /// This process's anonymous bytes resident beyond the allocator's use,
+    /// the count `Options::trim_by_resident` trims by. For a test.
+    #[doc(hidden)]
+    pub fn resident_beyond_use() -> Option<usize> {
+        heap::resident_beyond_use()
+    }
+
+    /// The bytes the trim counts its stride by at this moment, by the
+    /// store's option. For a test.
+    #[doc(hidden)]
+    pub fn trim_held_bytes(&self) -> Option<usize> {
+        heap::held(self.opts.trim_by_resident)
+    }
+
+    /// A trim of every arena now, on the calling thread. For a test of what
+    /// the resident count reads before and after one.
+    #[doc(hidden)]
+    pub fn trim_now() {
+        heap::trim();
     }
 
     /// A test's: while `on`, the trim thread waits where a trim would
