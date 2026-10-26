@@ -3638,6 +3638,45 @@ fn a_cache_kept_to_fit_gives_the_allocator_back_the_pages_its_sheds_freed() {
     assert_eq!(run(false, 1), (0, 0), "not kept to fit, nothing asks");
 }
 
+/// An upkeep pass's end may ask the trim thread to look at the allocator
+/// (`Options::upkeep_trim_look`), the stride deciding whether it trims:
+/// the pass is the engine's moment inside a run of reads, where the
+/// process's resident free pages compete with its own file's. With a
+/// stride no shed reaches, the looks are the passes' alone: some with the
+/// option and none without, and no trim either way.
+#[test]
+fn an_upkeep_pass_end_asks_the_trim_thread_to_look() {
+    if !Db::trim_supported() {
+        return;
+    }
+    let run = |look: bool| -> u64 {
+        let name = format!("trim-look-{look}");
+        // The burst helper files on the writer's thread; the passes are
+        // the thread's, so the upkeep is lent, bursts and all.
+        let (db, m) = burst_into_forms_with(&name, 8 << 10, true, |o| {
+            o.upkeep = supdb::Upkeep::Background(1);
+            o.upkeep_inline_bursts = false;
+            o.forms_trim_bytes = 1 << 40;
+            o.upkeep_trim_look = look;
+        });
+        for _ in 0..400 {
+            if db.forms_trim_looks() > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        m.check(&db, &name);
+        assert_eq!(
+            db.forms_trims(),
+            0,
+            "{name}: a stride past what is held never trims"
+        );
+        db.forms_trim_looks()
+    };
+    assert_eq!(run(false), 0, "without the option no pass asks for a look");
+    assert!(run(true) > 0, "with the option a pass end asked for a look");
+}
+
 /// A trim in progress holds nothing of the segment work: the trim is a
 /// thread's of its own, and a seal's landing and a flush's answer, which
 /// wait on the segment work's thread, do not wait for it. The trim thread

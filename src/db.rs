@@ -1200,6 +1200,19 @@ pub struct Options {
     /// block cache left the process's anonymous bytes the margin. Off.
     #[doc(hidden)]
     pub zpages_trim_install: bool,
+    /// EXPERIMENT: the trim thread (`forms_to_fit` with `forms_trim_bytes`)
+    /// asked to look at the allocator at the end of every upkeep pass, the
+    /// stride deciding whether it trims (`trim_due`), and not only when a
+    /// handle has freed a stride of forms. The pass is the engine's moment
+    /// inside a run of reads, where the process's resident free pages
+    /// compete with its own file's: the census after each mix under the
+    /// bound read 40-50 MB of free chunks resident in the arenas the seal
+    /// and build threads left and the main arena's churn, with the trim
+    /// after the install (`zpages_trim_install`) taken back by then. With
+    /// that trim and the memo off it is the second fit check of the
+    /// raw-tail coding (`supdb-cache64tofitzpagesrecordrawleantrim`). Off.
+    #[doc(hidden)]
+    pub upkeep_trim_look: bool,
     /// Whether the controller buys its first form at SUSPECT on the model's
     /// prediction, once the sampler has priced it and the partitions have
     /// stood for `zselect::EAGER_SETTLE` with nothing of the segment work in
@@ -2681,6 +2694,7 @@ impl Default for Options {
             zpages_store_all: false,
             zpages_raw_tails: false,
             zpages_trim_install: false,
+            upkeep_trim_look: false,
             zpages_build_eager: false,
             zpages_inject: None,
             forms_pieces_only: false,
@@ -26763,6 +26777,13 @@ impl Db {
         self.z_sweep_live()?;
         if self.opts.zpages_trim_install {
             heap::trim();
+            // Counted with the trim thread's trims, and the floor its
+            // next stride is counted from set to what is left, so the
+            // census reads this trim and the looks after it start from it.
+            self.shared
+                .trim_floor
+                .store(heap::free_bytes().unwrap_or(0), AtomicOrdering::Relaxed);
+            self.shared.trims.fetch_add(1, AtomicOrdering::Relaxed);
         }
         Ok(())
     }
@@ -28267,6 +28288,16 @@ impl Reader {
                 AtomicOrdering::Relaxed,
             );
             lend.passes.fetch_add(1, AtomicOrdering::Relaxed);
+            // Under `Options::upkeep_trim_look`, the trim thread is asked
+            // to look at the allocator at every pass end, the stride
+            // deciding (`trim_due`); a store with no trim thread is asked
+            // nothing, as a shed asks nothing.
+            if self.opts.upkeep_trim_look {
+                shared.trim_wanted.store(true, AtomicOrdering::Release);
+                if let Some(t) = shared.trim_thread.get() {
+                    t.unpark();
+                }
+            }
             match pass {
                 Ok((fs, ran, whole, done)) => {
                     // Filed only by a pass that ran, and ran to the commit:

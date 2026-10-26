@@ -7160,6 +7160,7 @@ fn a_form_stored_whole_answers_as_the_compressed_one_and_decodes_nothing() {
                 o.zpages_raw_tails = raw;
                 o.zpages_memo = !lean;
                 o.zpages_trim_install = lean;
+                o.upkeep_trim_look = lean;
             }),
         )
         .unwrap();

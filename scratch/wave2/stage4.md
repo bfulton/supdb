@@ -2927,3 +2927,68 @@ mixes 1.3-1.5x faster than the LZ4 form; the trim is an arm, off, refuted
 as a lever on the fit; and the controller's choice of a coding, when it is
 made, is made on the form's size against what the mixes leave, which the
 `mixcensus` line now reads.
+
+## The fit check, second half: whose bytes the resident free memory is, and a trim where the mixes are
+
+The census's arenas line (`SUPDB_MIX_CENSUS=2`, the lag pass's `lagarenas`
+and `lagmaps` after each `mixcensus`; `zfit-arenas.err`, three reps of the
+lean arm against the LZ4 arm, the mixes alone) says whose frees the lean
+arm's resident free bytes are after E: the main arena, the harness's and
+the writer's, 33-52 MB taken from the system with 0.7-19 MB free and 28-31
+resident; three or four arenas of 9-29 MB each entirely free in one or two
+chunks and 5.6-8.7 MB resident apiece, the arenas the build threads and the
+mixes' seal threads left; and an arena of 3,589 free chunks holding 8 MB,
+the upkeep thread's. About 40-50 MB of the 72-89 MB the process holds in E
+is free memory resident in those arenas, which is what a trim returns,
+and the trim after the install had returned it once: the mixes' seal
+threads take the dead arenas over, allocate into them and free again, and
+the pages come back resident under the same chunks.
+
+So the trim was moved to where the mixes are: `Options::upkeep_trim_look`
+asks the trim thread (`forms_to_fit` with `forms_trim_bytes`) to look at
+the allocator at the end of every upkeep pass, the stride deciding
+(`trim_due`), and not only when a handle has freed a stride of forms; the
+install trim counts with the thread's trims and sets the floor its stride
+is counted from. `supdb-cache64tofitzpagesrecordrawleantrim` is the lean
+arm with it, paired against `supdb-cache64tofitzpages` as before
+(`zfit2-ab-{1,2}`, two sittings, five pairs each). `tests/db.rs` holds the
+look to the pass end: with a stride no shed reaches, the looks are the
+passes' alone, some with the option and none without.
+
+Refuted again, and the counters say how. The looks happened -- 970-980 by
+the end of E, 30-50 µs each by the cumulative `look_ms` -- and the trims
+did not: two over the store's life, the install's and one in the first
+mix, since `trim_due` trims when the allocator's free bytes have grown a
+stride past the floor the last trim left, and the free bytes do not grow:
+the seal threads re-use the dead arenas' chunks, so the pages come back
+resident while `mallinfo2`'s free count stands still. The process's
+anonymous bytes in E are 81-102 MB (median 92) against the lean arm's
+72-99 and the LZ4 arm's 76-106; in C, B and A 57-65 against 64-71, seven
+MB lower. The faults stand: 0.027-0.031 major faults a scan in E and
+0.013-0.026 a read in D in both sittings, 0.12-0.13 a read in the read
+pass and 0.05-0.065 a scan in the scan pass, none in A, B or C, none
+anywhere under the LZ4 arm. E's scans read 1.393 (slower) in twelve pairs
+of twelve and D's gets 1.449 in twelve of twelve; the faults are E's whole
+loss now, 2,200-2,560 a mix at 65 µs each against the 162 ms E loses, so
+the memo's lost hits cost less than the first check priced them. The
+point-read mixes read 0.65-0.76 (C's gets 0.672, B's 0.653, A's 0.759, F's
+0.892), as before.
+
+What the two checks say together: at five million keys under 640 MiB the
+raw-tail form's 556 MB and the process's 90 MB in the mixes are the
+limit's 671 MB with nothing left for the pieces the mixes seal, the log,
+the raw pages the block cache's builds and the settle read, or the
+kernel's own, so the tail's reads and D's reads of the newest keys fault at
+a few percent; the process's anonymous memory is not the lever that
+closes it, since a trim before the mixes is taken back and a trim counted
+by the allocator's free bytes never fires on pages that come back under
+the same chunks, and a trim counted by resident bytes beyond use would
+return at most the 40 MB that are free, for a working set that is over
+the limit by about that much before the pieces are counted. The same
+total is where LMDB sits in core at this rung with its 650 MB file and a
+process of almost nothing, which is the gear E would need: the raw-tail
+form, a process footprint of LMDB's order, and the in-place walk that
+decodes nothing, each necessary and none sufficient alone. The lighter
+codings and both trims stay as arms, off; the per-pass look is a sound
+mechanism that found nothing to do here, and the record of what a trim
+can return is the census's.
