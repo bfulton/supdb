@@ -469,6 +469,21 @@ user's call.
   pending the in-place walk that would take the scans' loss out. Read any
   Auto-against-Auto pairing per sitting with `zpage_builds` and the picks
   beside the rates: the ski rental's buy moves with the order.
+- **The in-place walk of a raw-tail group** (`stage4.md`, "The in-place
+  walk of a raw-tail group"): `Options::zpages_inplace_walk` (on) has the
+  cursor and the bulk scan read a raw-tail coded group where it lies,
+  record by record (`Group::Coded`, `Opened::Coded`, `parse_record_tail`
+  as the half of `parse_record` past the key), nothing decoded and nothing
+  memoised; `supdb-cache64tofitzpagesrecordrawdecode` is the shape before.
+  At three million keys under 640 MiB, both forms fitting, the raw-tail
+  form reads the point-read mixes 1.2-1.5x faster than the block form in
+  both orders and the scan pass 1.13-1.21x faster, where it read 0.70x
+  before the walk, with E and F level; the walk alone reads the scan pass
+  1.85-2.1x and E 1.13-1.21x. The first pairing had the walk in the cursor
+  only, and the counter beside the rates (`zpage_inplace_groups` 74,000
+  against 14 million groups the scans decoded) named the bulk scan path
+  the clean walks take. The gear's trade is gone; its default is the next
+  decision, and the in-place point read the next piece.
 - **Where E's time is, by the arm pair's profile at the head**: the LZ4
   decode 25% of the thread (147,000 groups a pass, 2.5 a form walk, nearly
   every one a memo miss, since the form walks are the Zipfian's cold tail),

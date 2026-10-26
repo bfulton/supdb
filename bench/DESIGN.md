@@ -363,6 +363,10 @@ asked to look at every upkeep pass end (`Options::upkeep_trim_look`);
 of its form files the selector's to choose (`Options::zpages_coding_auto`),
 the raw tails where the model predicts that form fits the budget and the
 block coding otherwise, where the default builds the block coding;
+`supdb-cache64tofitzpagesrecordrawdecode` is the forced raw-tail form with
+the block cache whose scans decode a group whole before walking it
+(`Options::zpages_inplace_walk` off), where the default reads a raw-tail
+group record by record where it lies;
 `supdb-cache64tofitautozpagesperrun` is the combined arm with a block read
 through a cursor a run, a seek a cut and a read by rank a replaced record
 (`Options::zpages_block_cursor` off), where the default reads a block through

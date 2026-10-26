@@ -31,15 +31,15 @@
 //! freed with its segment.
 
 use super::zpages::{
-    bind32, check_coded_group, check_entry, check_group, decode_group, decode_record, fill_page,
-    filter_bytes, group_seek, page_view, parse_page, record_group_seek, verify_page, view_trusted,
-    walk_group, FenceEntry, Fill, FillScratch, FillStats, GroupBuf, Images, NoPage, PageView,
-    SegImages, Trailer, ZError, ZFence, ZCODING_BLOCK, ZGROUP_BYTES, ZMAX_GROUPS, ZNOPAGE, ZPAGE,
-    ZTRAILER,
+    bind32, check_coded_group, check_entry, check_group, cmp_coded_key, coded_first, coded_header,
+    coded_key_into, coded_rec, decode_group, decode_record, fill_page, filter_bytes, group_seek,
+    page_view, parse_page, record_group_seek, verify_page, view_trusted, walk_group, FenceEntry,
+    Fill, FillScratch, FillStats, GroupBuf, Images, NoPage, PageView, SegImages, Trailer, ZError,
+    ZFence, ZCODING_BLOCK, ZGROUP_BYTES, ZMAX_GROUPS, ZNOPAGE, ZPAGE, ZTRAILER,
 };
 use crate::blob::{Blob, BlobOptions, ZSource};
 use crate::bytes::{Bytes, MmapBytes};
-use crate::flatindex::{parse_record, rd_u32, record_key, record_key_next};
+use crate::flatindex::{parse_record, parse_record_tail, rd_u32, record_key, record_key_next};
 use crate::index::Ext;
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering as KeyOrder;
@@ -192,6 +192,9 @@ pub(super) enum ZRead {
 pub(super) struct ZScan {
     pub seen: usize,
     pub decoded: u64,
+    /// Groups read in place, record by record, without a decode
+    /// (`Opened::Coded`).
+    pub inplace: u64,
     pub nopage: u64,
     /// Whether the walk asked for the pages after its first at once
     /// (`Options::zpages_scan_prefetch`).
@@ -245,7 +248,91 @@ enum Group<'a> {
     /// The memo's, `n` bytes of it, held for the group's life in the
     /// cursor.
     Memo(Arc<GroupBuf>, usize),
+    /// A record-coded group whose tails are stored raw, held as its payload
+    /// where it lies in the mapping and read record by record in place
+    /// (`ZFile::inplace`): the position is a record index, the key is
+    /// assembled from the first record's head and the record's suffix into
+    /// the cursor's `keybuf`, and the values are parsed from the raw tail
+    /// (`parse_record_tail`), so a walk decodes nothing. A record whose tail
+    /// is compressed after all, or whose extents cannot be read where they
+    /// lie, is decoded on its own into the cursor's buffer.
+    Coded(&'a [u8], usize),
     Raw,
+}
+
+/// Whether a record-coded group's tails are raw, judged from its last
+/// record: the first is stored raw whatever the coding, and a group built
+/// under `raw_tails` has every tail raw. A group judged raw with a
+/// compressed tail inside it, which the record coding without `raw_tails`
+/// leaves where LZ4 did not shrink one, is still read right: that record is
+/// decoded on its own.
+fn raw_tail_group(payload: &[u8], count: usize) -> bool {
+    count >= 1
+        && coded_rec(payload, count, count - 1)
+            .map(|r| r.tail_is_raw())
+            .unwrap_or(false)
+}
+
+/// A raw-tail coded group where it lies: its payload, its record count and
+/// the first record's head, which every other record's key is assembled
+/// against (`coded_record_to`).
+#[derive(Clone, Copy)]
+struct CodedGroup<'a> {
+    payload: &'a [u8],
+    count: usize,
+    head0: &'a [u8],
+}
+
+impl<'a> CodedGroup<'a> {
+    /// The group over `payload`, or the error of a first record that does
+    /// not parse.
+    fn open(payload: &'a [u8], count: usize) -> std::result::Result<Self, ZError> {
+        let (head0, _) = coded_first(payload, count)?;
+        Ok(CodedGroup {
+            payload,
+            count,
+            head0,
+        })
+    }
+}
+
+/// Record `i` of a coded group handed to `f` as the walk hands a decoded
+/// record: its key assembled into `key`, and its values read where the raw
+/// tail lies when the record parses there, else from the record decoded on
+/// its own into `scratch`. `Ok(false)` is damage -- a record that does not
+/// parse either way -- for the caller to fail the page on.
+fn coded_record_to<F: FnMut(&[u8], &[u8])>(
+    raw: &Blob<MmapBytes>,
+    g: &CodedGroup<'_>,
+    i: usize,
+    key: &mut Vec<u8>,
+    scratch: &mut GroupBuf,
+    f: &mut F,
+) -> Result<bool> {
+    let (payload, count, head0) = (g.payload, g.count, g.head0);
+    let Ok(r) = coded_rec(payload, count, i) else {
+        return Ok(false);
+    };
+    if !coded_key_into(head0, &r, key) {
+        return Ok(false);
+    }
+    if r.tail_is_raw() {
+        if let Some(h) = coded_header(head0, &r) {
+            if let Some((exts, tail, _)) = parse_record_tail(h, r.tail) {
+                let k: &[u8] = key.as_slice();
+                raw.read_exts(&exts, tail, |v: &[u8]| f(k, v))?;
+                return Ok(true);
+            }
+        }
+    }
+    let Ok(img) = decode_record(payload, count, i, scratch) else {
+        return Ok(false);
+    };
+    let Some((k, exts, tail, _)) = parse_record(img, 0) else {
+        return Ok(false);
+    };
+    raw.read_exts(&exts, tail, |v: &[u8]| f(k, v))?;
+    Ok(true)
 }
 
 /// A position in a covered partition (3.10), for the merge that walks a
@@ -285,9 +372,14 @@ pub(super) struct ZCursor<'a> {
     next: usize,
     group: Group<'a>,
     buf: GroupBuf,
-    /// Groups decoded, runs of records no page holds met and prefetch
-    /// asks made, for the handle's counters.
+    /// The key at the position of a raw-tail coded group, assembled
+    /// (`Group::Coded`).
+    keybuf: Vec<u8>,
+    /// Groups decoded, groups read in place without a decode, runs of
+    /// records no page holds met and prefetch asks made, for the handle's
+    /// counters.
     pub(super) decoded: u64,
+    pub(super) inplace: u64,
     pub(super) nopage: u64,
     pub(super) prefetches: u64,
     /// Whether the bulk walk has asked for the pages ahead of it
@@ -320,7 +412,9 @@ impl<'a> ZCursor<'a> {
             next: 0,
             group: Group::None,
             buf: take_buf(),
+            keybuf: Vec::new(),
             decoded: 0,
+            inplace: 0,
             nopage: 0,
             prefetches: 0,
             asked: false,
@@ -424,7 +518,7 @@ impl<'a> ZCursor<'a> {
             Group::Page(p) => p,
             Group::Buf(n) => self.buf.bytes(*n),
             Group::Memo(g, n) => g.bytes(*n),
-            Group::None | Group::Raw => &[],
+            Group::None | Group::Raw | Group::Coded(..) => &[],
         }
     }
 
@@ -464,10 +558,14 @@ impl<'a> ZCursor<'a> {
             .zfile
             .page_bytes(self.page)
             .and_then(|page| self.zfile.view(self.page, page).ok());
-        let Some((opened, gfirst, count, decoded)) =
-            self.zfile
-                .open_group(self.memo, entry, j, &mut self.buf, view.as_ref())
-        else {
+        let Some((opened, gfirst, count, decoded)) = self.zfile.open_group(
+            self.memo,
+            entry,
+            j,
+            &mut self.buf,
+            view.as_ref(),
+            self.zfile.inplace,
+        ) else {
             self.fall();
             return false;
         };
@@ -478,18 +576,22 @@ impl<'a> ZCursor<'a> {
         }
         // The memo's group is held by its `Rc`; a borrowed one is the
         // buffer's or the page's, and its borrow ends here.
-        let memo = match opened {
-            Opened::Memo(g, n) => Some((g, n)),
-            Opened::Borrowed(_) => None,
-        };
-        let placed = match (memo, view) {
-            (Some((g, n)), _) => Some(Group::Memo(g, n)),
-            (None, Some(v)) => match (v.group(j), v.payload(j)) {
-                (Some(g), Some(payload)) if g.stored => Some(Group::Page(payload)),
-                (Some(g), _) => Some(Group::Buf(g.ulen as usize)),
-                _ => None,
+        // A coded group read in place is the page's payload, taken from
+        // the view, whose borrow is the mapping's and not the buffer's.
+        let placed = match opened {
+            Opened::Memo(g, n) => Some(Group::Memo(g, n)),
+            Opened::Coded(_) => view.as_ref().and_then(|v| v.payload(j)).map(|payload| {
+                self.inplace += 1;
+                Group::Coded(payload, count)
+            }),
+            Opened::Borrowed(_) => match view {
+                Some(v) => match (v.group(j), v.payload(j)) {
+                    (Some(g), Some(payload)) if g.stored => Some(Group::Page(payload)),
+                    (Some(g), _) => Some(Group::Buf(g.ulen as usize)),
+                    _ => None,
+                },
+                None => None,
             },
-            (None, None) => None,
         };
         let Some(group) = placed else {
             self.zfile.fail(self.page);
@@ -519,6 +621,23 @@ impl<'a> ZCursor<'a> {
     /// record that does not parse in a group the checks let through is
     /// damage, and the walk falls.
     fn place(&mut self) {
+        if let Group::Coded(payload, count) = &self.group {
+            let (payload, count) = (*payload, *count);
+            let ok = match (
+                coded_first(payload, count),
+                coded_rec(payload, count, self.off),
+            ) {
+                (Ok((head0, _)), Ok(r)) => coded_key_into(head0, &r, &mut self.keybuf),
+                _ => false,
+            };
+            if !ok {
+                self.zfile.fail(self.page);
+                self.fall();
+                return;
+            }
+            self.next = self.off + 1;
+            return;
+        }
         let Some((k, next)) = record_key_next(self.group(), self.off) else {
             self.zfile.fail(self.page);
             self.fall();
@@ -561,6 +680,12 @@ impl<'a> ZCursor<'a> {
         if !self.open_at(&entry, j) || matches!(self.group, Group::Raw) {
             return;
         }
+        if matches!(self.group, Group::Coded(..)) {
+            // The position in a group read in place is the record's index.
+            self.off = self.rank - self.gstart;
+            self.place();
+            return;
+        }
         for _ in self.gstart..self.rank {
             let Some((_, next)) = record_key_next(self.group(), self.off) else {
                 self.zfile.fail(self.page);
@@ -581,6 +706,7 @@ impl<'a> ZCursor<'a> {
         match self.group {
             Group::None => None,
             Group::Raw => self.raw.key_at(self.rank),
+            Group::Coded(..) => Some(self.keybuf.as_slice()),
             Group::Page(_) | Group::Buf(_) | Group::Memo(..) => {
                 let (at, len) = self.key_at;
                 self.group().get(at..at + len)
@@ -597,6 +723,35 @@ impl<'a> ZCursor<'a> {
         match self.group {
             Group::None => Ok(0),
             Group::Raw => self.raw.values_at(self.rank, &mut *f),
+            Group::Coded(payload, count) => {
+                // The record where it lies, or decoded on its own into a
+                // buffer of this call's, since the position's own buffer
+                // is not for a shared borrow to write; a record that parses
+                // neither way is the group changed under the mapping.
+                let mut n = 0u64;
+                let mut key = Vec::new();
+                let mut scratch = GroupBuf::new();
+                let read = match CodedGroup::open(payload, count) {
+                    Ok(g) => coded_record_to(
+                        self.raw,
+                        &g,
+                        self.off,
+                        &mut key,
+                        &mut scratch,
+                        &mut |_k: &[u8], v: &[u8]| {
+                            n += 1;
+                            f(v);
+                        },
+                    )?,
+                    Err(_) => false,
+                };
+                if read {
+                    Ok(n)
+                } else {
+                    self.zfile.fail(self.page);
+                    self.raw.values_at(self.rank, &mut *f)
+                }
+            }
             Group::Page(_) | Group::Buf(_) | Group::Memo(..) => {
                 match parse_record(self.group(), self.off) {
                     Some((_, exts, tail, _)) => self.raw.read_exts(&exts, tail, &mut *f),
@@ -711,6 +866,67 @@ impl<'a> ZCursor<'a> {
                     self.prefetches += 1;
                 }
             }
+            if let Group::Coded(payload, count) = &self.group {
+                // A raw-tail coded group: each record's key assembled and
+                // its values read where its tail lies, nothing decoded.
+                let (payload, count) = (*payload, *count);
+                let raw = self.raw;
+                let (mut i, mut rank, end) = (self.off, self.rank, self.end);
+                let mut stop: Option<KeyOrder> = None;
+                let mut damaged = false;
+                match CodedGroup::open(payload, count) {
+                    Ok(g) => {
+                        let head0 = g.head0;
+                        while n < limit && rank < end {
+                            let Ok(r) = coded_rec(payload, count, i) else {
+                                damaged = true;
+                                break;
+                            };
+                            if r.plen > head0.len() {
+                                damaged = true;
+                                break;
+                            }
+                            if let Some(u) = until {
+                                match cmp_coded_key(head0, &r, u) {
+                                    KeyOrder::Less => {}
+                                    order => {
+                                        stop = Some(order);
+                                        break;
+                                    }
+                                }
+                            }
+                            if !coded_record_to(raw, &g, i, &mut self.keybuf, &mut self.buf, f)? {
+                                damaged = true;
+                                break;
+                            }
+                            i += 1;
+                            rank += 1;
+                            n += 1;
+                        }
+                    }
+                    Err(_) => damaged = true,
+                }
+                self.rank = rank;
+                if damaged {
+                    self.zfile.fail(self.page);
+                    self.fall();
+                    continue;
+                }
+                if rank >= end {
+                    if lazy_end && n >= limit {
+                        self.off = i;
+                        return Ok((n, KeyOrder::Greater));
+                    }
+                    self.next_group();
+                    continue;
+                }
+                self.off = i;
+                self.place();
+                if let Some(order) = stop {
+                    return Ok((n, order));
+                }
+                continue;
+            }
             // The held group: its records parsed where they lie, until it
             // is spent, the limit is reached or `until` is met.
             let (mut off, mut rank, end) = (self.off, self.rank, self.end);
@@ -773,7 +989,10 @@ impl<'a> ZCursor<'a> {
     /// it first; `key` and `values` expect it done.
     pub(super) fn resume(&mut self) {
         if self.rank >= self.end
-            && matches!(self.group, Group::Page(_) | Group::Buf(_) | Group::Memo(..))
+            && matches!(
+                self.group,
+                Group::Page(_) | Group::Buf(_) | Group::Memo(..) | Group::Coded(..)
+            )
         {
             self.next_group();
         }
@@ -891,6 +1110,55 @@ impl<'a> ZCursor<'a> {
                         order => return order,
                     }
                 }
+                Group::Coded(payload, count) => {
+                    // The heads compared where they lie, no key assembled
+                    // until the one the position stops at.
+                    let (payload, count) = (payload, count);
+                    let (mut i, mut rank, end) = (self.off, self.rank, self.end);
+                    let mut stop: Option<KeyOrder> = None;
+                    let mut damaged = false;
+                    match coded_first(payload, count) {
+                        Ok((head0, _)) => {
+                            while rank < end {
+                                let Ok(r) = coded_rec(payload, count, i) else {
+                                    damaged = true;
+                                    break;
+                                };
+                                if r.plen > head0.len() {
+                                    damaged = true;
+                                    break;
+                                }
+                                match cmp_coded_key(head0, &r, until) {
+                                    KeyOrder::Less => {
+                                        i += 1;
+                                        rank += 1;
+                                    }
+                                    order => {
+                                        stop = Some(order);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => damaged = true,
+                    }
+                    self.rank = rank;
+                    if damaged {
+                        self.zfile.fail(self.page);
+                        self.fall();
+                        return KeyOrder::Greater;
+                    }
+                    if rank >= end {
+                        self.next_group();
+                        continue;
+                    }
+                    self.off = i;
+                    self.place();
+                    if self.fell {
+                        return KeyOrder::Greater;
+                    }
+                    return stop.unwrap_or(KeyOrder::Greater);
+                }
                 _ => {
                     let (mut off, mut rank, end) = (self.off, self.rank, self.end);
                     let mut stop: Option<KeyOrder> = None;
@@ -950,12 +1218,17 @@ enum Opened<'a> {
     /// From the memo, or decoded into a buffer the memo now holds: `n`
     /// bytes of it.
     Memo(Arc<GroupBuf>, usize),
+    /// A raw-tail coded group's payload, undecoded, for a caller that
+    /// asked to read it record by record where it lies (`open_group` with
+    /// `inplace`): never handed to a caller that reads the bytes as a
+    /// decoded group.
+    Coded(&'a [u8]),
 }
 
 impl Opened<'_> {
     fn bytes(&self) -> &[u8] {
         match self {
-            Opened::Borrowed(b) => b,
+            Opened::Borrowed(b) | Opened::Coded(b) => b,
             Opened::Memo(g, n) => g.bytes(*n),
         }
     }
@@ -1606,6 +1879,10 @@ pub(super) struct ZFile {
     /// (`Options::zpages_memo_first`, `ZFile::open_group`).
     trusted: bool,
     memo_first: bool,
+    /// A raw-tail coded group read where it lies, record by record, by the
+    /// cursor (`Options::zpages_inplace_walk`; `Group::Coded`), instead of
+    /// decoded whole into the buffer.
+    pub(super) inplace: bool,
     /// Whether a decode asks for the line of the memo entry its put will
     /// displace before it begins (`Options::zpages_memo_ahead`,
     /// `ZFile::open_group`).
@@ -1739,6 +2016,7 @@ impl ZFile {
             memo_hashed: memo == MemoShape::Hashed,
             trusted,
             memo_first,
+            inplace: true,
             memo_ahead,
             prefetch,
             #[cfg(test)]
@@ -1817,7 +2095,10 @@ impl ZFile {
     /// memo before any view, the entry carrying the group's first record
     /// and count, so a hit reads nothing of the page; as shipped the memo
     /// is asked after the view, which says whether the group is compressed,
-    /// the order the shape before had.
+    /// the order the shape before had. With `inplace`, a raw-tail coded
+    /// group is handed back as its payload, undecoded, for a caller that
+    /// reads it record by record (`ZCursor`, `Group::Coded`); every other
+    /// caller reads the bytes as a decoded group and passes `false`.
     fn open_group<'a>(
         &'a self,
         memo: &ZMemo,
@@ -1825,6 +2106,7 @@ impl ZFile {
         j: usize,
         buf: &'a mut GroupBuf,
         view: Option<&PageView<'a>>,
+        inplace: bool,
     ) -> Option<(Opened<'a>, usize, usize, bool)> {
         let p = entry.page as usize;
         let Some(page) = self.page_bytes(p).filter(|_| p < self.n_pages) else {
@@ -1867,6 +2149,32 @@ impl ZFile {
             self.fail(p);
             return None;
         };
+        // A raw-tail coded group is read where it lies (`Group::Coded`):
+        // the page verified as a first decode verifies it, every group by
+        // its own check, and the payload handed back with nothing decoded
+        // and nothing for the memo to hold.
+        if inplace && g.coded && self.inplace {
+            if let Some(payload) = view.payload(j) {
+                if raw_tail_group(payload, usize::from(g.count)) {
+                    if !was_verified {
+                        match first_checks(page, self.bind, entry, None) {
+                            Ok(_) => set_bit(&self.verified, p),
+                            Err(Fail::Misaligned) => return None,
+                            Err(Fail::Check(_)) => {
+                                self.fail(p);
+                                return None;
+                            }
+                        }
+                    }
+                    return Some((
+                        Opened::Coded(payload),
+                        usize::from(g.first),
+                        usize::from(g.count),
+                        false,
+                    ));
+                }
+            }
+        }
         // A compressed group goes through the memo: the group as a decode
         // before left it, for a page this process has verified, since a
         // hit repeats no check as the verified path repeats none; else a
@@ -2039,7 +2347,8 @@ impl ZFile {
             return Locate::Fallback;
         };
         let j = view.group_of_index(rank - first);
-        let Some((opened, gfirst, _, decoded)) = self.open_group(memo, &entry, j, buf, Some(&view))
+        let Some((opened, gfirst, _, decoded)) =
+            self.open_group(memo, &entry, j, buf, Some(&view), false)
         else {
             return Locate::Fallback;
         };
@@ -2154,7 +2463,8 @@ impl ZFile {
                 };
             }
         }
-        let Some((opened, _, count, decoded)) = self.open_group(memo, &entry, j, buf, Some(&view))
+        let Some((opened, _, count, decoded)) =
+            self.open_group(memo, &entry, j, buf, Some(&view), false)
         else {
             return Locate::Fallback;
         };
@@ -2268,6 +2578,7 @@ impl ZFile {
         let mut out = ZScan {
             seen: 0,
             decoded: 0,
+            inplace: 0,
             nopage: 0,
             prefetches: 0,
             end: ScanEnd::Served,
@@ -2298,6 +2609,8 @@ impl ZFile {
         let nkeys = self.nkeys;
         let mut rank = from;
         let mut asked = false;
+        // The key of a record read in place, assembled (`Opened::Coded`).
+        let mut key: Vec<u8> = Vec::new();
         while out.seen < limit && rank < nkeys {
             // The entry the rank falls in, and how far its records go: a
             // fence that does not cover the rank is damage, since the
@@ -2346,11 +2659,51 @@ impl ZFile {
             // end.
             while out.seen < limit && rank < end {
                 let Some((opened, gfirst, count, decoded)) =
-                    self.open_group(memo, &entry, j, buf, Some(&view))
+                    self.open_group(memo, &entry, j, buf, Some(&view), self.inplace)
                 else {
                     out.end = ScanEnd::Fallback;
                     return Ok(());
                 };
+                if matches!(opened, Opened::Coded(_)) {
+                    // A raw-tail coded group read where it lies: the
+                    // records from the one the rank names, each handed
+                    // over by `coded_record_to`, nothing decoded. The
+                    // payload is taken from the view, whose borrow is the
+                    // mapping's, so the buffer is free for a record that
+                    // has to be decoded on its own.
+                    out.inplace += 1;
+                    if !asked {
+                        asked = true;
+                        let past = (limit - out.seen).saturating_sub(end - rank);
+                        if self.ask_ahead(p, past) {
+                            out.prefetches += 1;
+                        }
+                    }
+                    let Ok(g) = view
+                        .payload(j)
+                        .ok_or(ZError::Length)
+                        .and_then(|pl| CodedGroup::open(pl, count))
+                    else {
+                        self.fail(p);
+                        out.end = ScanEnd::Fallback;
+                        return Ok(());
+                    };
+                    let gstart = first + gfirst;
+                    let gend = gstart.saturating_add(count).min(end);
+                    let want = (limit - out.seen).min(gend.saturating_sub(rank));
+                    let from = rank.saturating_sub(gstart);
+                    for i in from..from + want {
+                        if !coded_record_to(raw, &g, i, &mut key, buf, f)? {
+                            self.fail(p);
+                            out.end = ScanEnd::Fallback;
+                            return Ok(());
+                        }
+                        out.seen += 1;
+                        rank += 1;
+                    }
+                    j += 1;
+                    continue;
+                }
                 let group = opened.bytes();
                 if decoded {
                     out.decoded += 1;
@@ -2565,7 +2918,7 @@ impl ZFile {
         };
         let j = view.group_of_key(key);
         let mut buf = take_buf();
-        let r = match self.open_group(memo, &entry, j, &mut buf, Some(&view)) {
+        let r = match self.open_group(memo, &entry, j, &mut buf, Some(&view), false) {
             None => ZSeek::Fallback,
             Some((opened, gfirst, count, decoded)) => {
                 match group_seek(opened.bytes(), count, key) {
@@ -4362,8 +4715,10 @@ mod tests {
         /// The handle's memo the tests read through.
         memo: ZMemo,
         /// The group coding the fixture builds its form file with: the
-        /// block coding unless a test asks for the other.
+        /// block coding unless a test asks for the other, and the record
+        /// coding's tails stored raw where a test asks for that.
         coding: u8,
+        raw_tails: bool,
     }
 
     impl Fixture {
@@ -4372,6 +4727,16 @@ mod tests {
         }
 
         fn with_coding(name: &str, recs: Vec<Rec>, inline_max: usize, coding: u8) -> Fixture {
+            Fixture::with_shape(name, recs, inline_max, coding, false)
+        }
+
+        fn with_shape(
+            name: &str,
+            recs: Vec<Rec>,
+            inline_max: usize,
+            coding: u8,
+            raw_tails: bool,
+        ) -> Fixture {
             let dir = dir(name);
             let seg = dir.join("par-00000007-0000000000000099--.sup");
             write_segment(&seg, &recs, inline_max);
@@ -4384,12 +4749,14 @@ mod tests {
                 recs,
                 memo: ZMemo::new(),
                 coding,
+                raw_tails,
             }
         }
 
         fn build(&self) -> Outcome {
             let plan = BuildPlan {
                 coding: self.coding,
+                raw_tails: self.raw_tails,
                 ..BuildPlan::new(0, true)
             };
             build(&self.seg, &self.out, ID, END, &plan).unwrap()
@@ -4573,13 +4940,33 @@ mod tests {
     /// answers them, the group opened again.
     #[test]
     fn a_cursor_moved_to_a_key_agrees_with_the_seek_a_key() {
-        for (name, recs, inline_max, coding) in [
-            ("skipto-suite", suite(3000, 41), 256, ZCODING_BLOCK),
-            ("skipto-shapes", shapes(), 1 << 20, ZCODING_BLOCK),
-            ("skipto-suite-rec", suite(3000, 41), 256, ZCODING_RECORD),
-            ("skipto-shapes-rec", shapes(), 1 << 20, ZCODING_RECORD),
+        for (name, recs, inline_max, coding, raw_tails) in [
+            ("skipto-suite", suite(3000, 41), 256, ZCODING_BLOCK, false),
+            ("skipto-shapes", shapes(), 1 << 20, ZCODING_BLOCK, false),
+            (
+                "skipto-suite-rec",
+                suite(3000, 41),
+                256,
+                ZCODING_RECORD,
+                false,
+            ),
+            (
+                "skipto-shapes-rec",
+                shapes(),
+                1 << 20,
+                ZCODING_RECORD,
+                false,
+            ),
+            (
+                "skipto-suite-raw",
+                suite(3000, 41),
+                256,
+                ZCODING_RECORD,
+                true,
+            ),
+            ("skipto-shapes-raw", shapes(), 1 << 20, ZCODING_RECORD, true),
         ] {
-            let fx = Fixture::with_coding(name, recs, inline_max, coding);
+            let fx = Fixture::with_shape(name, recs, inline_max, coding, raw_tails);
             let zfile = fx.zfile();
             let nkeys = fx.recs.len();
             let mut probes: Vec<Vec<u8>> = vec![Vec::new(), b"\x00".to_vec()];
@@ -4625,13 +5012,15 @@ mod tests {
                 })
                 .collect();
             assert!(!cur.fell_back());
-            let decoded = cur.decoded;
+            let (decoded, inplace) = (cur.decoded, cur.inplace);
             drop(cur);
             assert_eq!(got, want, "{name}");
             let (hits, misses) = fx.memo.take_counts();
             assert_eq!(misses, decoded, "{name}: a miss a decode");
             // A stored group is parsed where it lies and asks the memo
-            // nothing; every other group is asked for once.
+            // nothing, and so is a raw-tail coded group (`Group::Coded`),
+            // which the random shapes leave where LZ4 shrank no tail; every
+            // other group is asked for once.
             let compressed: usize = (0..zfile.pages())
                 .map(|p| {
                     let v = page_view(zfile.page_bytes(p).unwrap()).unwrap();
@@ -4641,9 +5030,14 @@ mod tests {
                 })
                 .sum();
             assert_eq!(
-                (hits + misses) as usize,
+                (hits + misses) as usize + inplace as usize,
                 compressed,
-                "{name}: one open a compressed group"
+                "{name}: one open a compressed group, or a read in place"
+            );
+            assert_eq!(
+                inplace > 0,
+                raw_tails || name == "skipto-shapes-rec",
+                "{name}: the raw tails, and the shapes' uncompressible ones, are read in place"
             );
             // Out of key order: every key answered as the seek from the top
             // answers it, the group opened again where the cursor was past.
@@ -6502,6 +6896,201 @@ mod tests {
     /// across the record no page holds, and under a flipped page, every
     /// key still right; and a long walk asks ahead once where the prefetch
     /// is on, a walk of one key never.
+    /// A raw-tail coded group is read where it lies (`Group::Coded`): the
+    /// cursor's walk from every start hands over every key and value the raw
+    /// form has, in order, over the suite's shape and over every record
+    /// shape, reading its groups in place and decoding nothing, with the
+    /// memo asked nothing; and with the walk off (`ZFile::inplace`) the same
+    /// cursor decodes every group it crosses, as the shape before did. The
+    /// position's own reads (`key`, `values`, `advance`) agree with the raw
+    /// form at every rank either way.
+    #[test]
+    fn the_cursor_reads_a_raw_tail_group_in_place_and_decodes_nothing() {
+        for (name, recs, inline_max) in [
+            ("inplace-suite", suite(1500, 23), 256),
+            ("inplace-shapes", shapes(), 1 << 20),
+        ] {
+            let fx = Fixture::with_shape(name, recs, inline_max, ZCODING_RECORD, true);
+            let n = fx.recs.len();
+            for inplace in [true, false] {
+                let mut zfile = fx.zfile();
+                zfile.inplace = inplace;
+                let what = format!("{name} in place {inplace}");
+                // The file's groups by kind: the record coding's, which the
+                // in-place walk reads where they lie, and the blocks the
+                // builder falls back to where a record's head passes the
+                // page -- the shapes' long keys -- which are decoded as
+                // they were; a stored group is parsed in place either way.
+                let (coded, blocks) = (0..zfile.pages())
+                    .map(|p| {
+                        let v = page_view(zfile.page_bytes(p).unwrap()).unwrap();
+                        (0..v.groups()).fold((0usize, 0usize), |(c, b), j| {
+                            let g = v.group(j).unwrap();
+                            (
+                                c + usize::from(g.coded),
+                                b + usize::from(!g.coded && !g.stored),
+                            )
+                        })
+                    })
+                    .fold((0, 0), |(c, b), (dc, db)| (c + dc, b + db));
+                assert!(coded > 0, "{what}: the form has coded groups");
+                fx.memo.take_counts();
+                // The bulk walk from several starts.
+                for start in (0..n + 2).step_by(97) {
+                    let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                    let mut c = ZCursor::at(&fx.memo, &zfile, &fx.blob, start);
+                    let (walked, order) = c
+                        .walk_until(None, n + 5, &mut |k: &[u8], v: &[u8]| {
+                            got.push((k.to_vec(), v.to_vec()))
+                        })
+                        .unwrap();
+                    assert_eq!(order, KeyOrder::Greater, "{what}: from {start}");
+                    assert_eq!(walked, n.saturating_sub(start), "{what}: from {start}");
+                    let mut want: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                    for rank in start..n {
+                        let k = fx.blob.key_at(rank).unwrap().to_vec();
+                        fx.blob
+                            .values_at(rank, |v| want.push((k.clone(), v.to_vec())))
+                            .unwrap();
+                    }
+                    assert_eq!(got, want, "{what}: the walk from {start}");
+                    assert!(
+                        !c.fell_back(),
+                        "{what}: fell from {start}: decoded {} in place {} bad pages {} nopage {}",
+                        c.decoded,
+                        c.inplace,
+                        zfile.bad_pages(),
+                        c.nopage
+                    );
+                    if start == 0 {
+                        // From the first record every group is opened once:
+                        // the coded ones in place, or decoded with the walk
+                        // off, and the blocks decoded either way.
+                        let want = if inplace {
+                            (coded, blocks)
+                        } else {
+                            (0, coded + blocks)
+                        };
+                        assert_eq!(
+                            (c.inplace as usize, c.decoded as usize),
+                            want,
+                            "{what}: (in place, decoded) over {coded} coded and {blocks} block groups"
+                        );
+                    }
+                }
+                // The position's reads, rank by rank.
+                let mut c = ZCursor::at(&fx.memo, &zfile, &fx.blob, 0);
+                for rank in 0..n {
+                    assert_eq!(c.rank(), rank, "{what}");
+                    assert_eq!(c.key(), fx.blob.key_at(rank), "{what}: the key at {rank}");
+                    let mut want = Vec::new();
+                    fx.blob.values_at(rank, |v| want.push(v.to_vec())).unwrap();
+                    let mut got = Vec::new();
+                    let count = c.values(&mut |v: &[u8]| got.push(v.to_vec())).unwrap();
+                    assert_eq!(got, want, "{what}: the values at {rank}");
+                    assert_eq!(count as usize, want.len(), "{what}: the count at {rank}");
+                    c.advance();
+                }
+                assert_eq!(c.key(), None, "{what}: past the end");
+                assert!(!c.fell_back(), "{what}");
+                // The memo is asked for the groups decoded and for no group
+                // read in place: nothing at all over the suite's shape with
+                // the walk on, whose groups all code.
+                let (hits, misses) = fx.memo.take_counts();
+                assert_eq!(
+                    hits + misses == 0,
+                    inplace && blocks == 0,
+                    "{what}: the memo asked {hits} hits {misses} misses over {blocks} block groups"
+                );
+                assert!(!zfile.damaged(), "{what}");
+            }
+        }
+    }
+
+    /// A raw-tail coded page whose CRC is good and whose record lies: a
+    /// compact header naming a run longer than the tail that holds it. The
+    /// heads pass the first touch's check, which reads no tail, and the
+    /// in-place walk meets the lie where it parses the record: the page goes
+    /// out of service and the rest of the walk is the raw form's, every key
+    /// and value still right, as the decoded walk does on a record that
+    /// does not parse.
+    #[test]
+    fn a_raw_tail_record_that_lies_about_its_run_falls_the_walk_to_the_raw_form() {
+        use crate::db::zpages::{encode_page, encode_record_group, PageGroup, ZCAP};
+        use std::os::unix::fs::FileExt;
+        let fx = Fixture::with_shape("inplace-forged", suite(3000, 29), 256, ZCODING_RECORD, true);
+        fx.zfile();
+        let good = std::fs::read(&fx.out).unwrap();
+        let t = Trailer::decode(&good[good.len() - ZTRAILER..]).unwrap();
+        let p = unsampled(t.n_pages as usize, 7);
+        let side0 = fx.attach().unwrap();
+        let entry = side0.fence.entry(p, side0.nkeys as u32).unwrap();
+        let (first_rank, count) = (entry.first_rank as usize, entry.count as usize);
+        drop(side0);
+        // The page's records as the writer laid them, re-encoded raw-tailed
+        // with the third record's run length a byte long: the group's
+        // bytes stay the same length, so the lie is in the record alone.
+        let images: Vec<Vec<u8>> = (first_rank..first_rank + count)
+            .map(|rank| {
+                let (k, vals, _) = &fx.recs[rank];
+                assert_eq!(vals.len(), 1, "the suite's records hold one value");
+                record_image(k, &vals[0])
+            })
+            .collect();
+        let mut imgs = images.clone();
+        {
+            // The compact header lies after the key: its first two bytes
+            // are the run's length.
+            let img = &mut imgs[2];
+            let klen = u16::from_le_bytes([img[0], img[1]]) as usize;
+            let e_at = (4 + klen).next_multiple_of(4);
+            let len = u16::from_le_bytes([img[e_at], img[e_at + 1]]);
+            img[e_at..e_at + 2].copy_from_slice(&(len + 64).to_le_bytes());
+        }
+        let ends: Vec<usize> = imgs
+            .iter()
+            .scan(0usize, |at, img| {
+                *at += img.len();
+                Some(*at)
+            })
+            .collect();
+        let flat: Vec<u8> = imgs.concat();
+        let mut payload = vec![0u8; ZCAP];
+        let plen = encode_record_group(&flat, &ends, &mut payload, true).expect("the lie encodes");
+        payload.truncate(plen);
+        let pg = [PageGroup {
+            count: count as u16,
+            payload: &payload,
+            ulen: flat.len() as u32,
+            stored: false,
+            coded: true,
+            key: &[],
+        }];
+        let mut page = [0u8; ZPAGE];
+        encode_page(&mut page, first_rank as u32, &pg, t.bind32()).expect("the forged page fits");
+        let f = OpenOptions::new().write(true).open(&fx.out).unwrap();
+        f.write_all_at(&page, (p * ZPAGE) as u64).unwrap();
+        let zfile = fx.attach().unwrap();
+        assert!(zfile.inplace);
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut c = ZCursor::at(&fx.memo, &zfile, &fx.blob, first_rank.saturating_sub(5));
+        c.walk_until(None, count + 10, &mut |k: &[u8], v: &[u8]| {
+            got.push((k.to_vec(), v.to_vec()))
+        })
+        .unwrap();
+        let mut want: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for rank in first_rank.saturating_sub(5)..first_rank.saturating_sub(5) + count + 10 {
+            let k = fx.blob.key_at(rank).unwrap().to_vec();
+            fx.blob
+                .values_at(rank, |v| want.push((k.clone(), v.to_vec())))
+                .unwrap();
+        }
+        assert_eq!(got, want, "every key and value right across the lie");
+        assert!(c.fell_back(), "the walk fell to the raw form at the lie");
+        assert!(zfile.damaged(), "the page is out of service");
+        assert_eq!(zfile.bad_pages(), 1);
+    }
+
     #[test]
     fn the_cursors_bulk_walk_stops_at_the_key_asked_and_hands_over_what_the_raw_form_has() {
         let mut rng = Rng(79);
