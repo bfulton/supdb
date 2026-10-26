@@ -484,6 +484,30 @@ user's call.
   against 14 million groups the scans decoded) named the bulk scan path
   the clean walks take. The gear's trade is gone; its default is the next
   decision, and the in-place point read the next piece.
+- **The lean process, third fit check** (`stage4.md`, "The lean process,
+  third fit check"): `Options::trim_by_resident` (off) has the trim thread
+  count its stride by `RssAnon` less the allocator's in-use and mmapped
+  bytes, the count that moves with the pages where the free count stood
+  still; `supdb-cache64tofitzpagesrecordrawleanresident` is the lean arm
+  with the look and the count at a stride of eight megabytes. Paired at
+  five million keys under 640 MiB: at thirty-two megabytes the count never
+  fired (one trim, the install's, in 980 looks, the process 31-42 MB
+  resident beyond use in E); at eight it fired, four to nine trims in the
+  mixes, and the process's anonymous bytes in E read 82-88 MB against the
+  LZ4 arm's 76-84, the faults 0.02-0.05 a scan in E and 0.05 a read in D
+  as before, E 1.55x and D 1.9x slower in every pair. Refuted: what a trim
+  returns the mixes touch next. And against LMDB the arm wins every cell
+  but E (A 5.1x, B 2.2x, C 2.3x, D 2.0x, F 4.4x, the scan pass 2.1-2.5x; E
+  0.66x) with E's faults equal to LMDB's (0.024 against 0.025 a scan), so
+  E against LMDB at this rung is not the fit: the LZ4 form reads E with no
+  fault at 1.1x LMDB's faulting median, and a fault-free LMDB would be a
+  good half faster than our best E. E's gap is the walk's own time -- the
+  overlay merge at the Zipfian head, the first group's decode at every
+  seek (the lean arm still decodes 1.5 groups a scan in E: the seek's group
+  and the skip's reopen), the settle -- and that is where E's next lever
+  is, on the LZ4 form the default builds. Beside it: the dev `db` binary
+  as a whole is not a mode (the watchdog shape, `CLAUDE.md`), and the
+  watchdogs write to the real stderr now (`watchdog_exit`).
 - **Where E's time is, by the arm pair's profile at the head**: the LZ4
   decode 25% of the thread (147,000 groups a pass, 2.5 a form walk, nearly
   every one a memo miss, since the form walks are the Zipfian's cold tail),

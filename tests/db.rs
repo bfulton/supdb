@@ -3594,6 +3594,16 @@ fn a_patched_form_kept_to_fit_costs_little_more_than_it_holds() {
     plain_m.check(&plain_db, "forms grown by doubling");
 }
 
+/// Taken by every test that makes a trim or counts what one would return:
+/// a trim is of every arena of the process, and these tests share one, so a
+/// test's dead arena can be returned by another test's trim between the
+/// test's two readings. Through `into_inner`, so that a failure holds nobody.
+static TRIM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn trim_lock() -> std::sync::MutexGuard<'static, ()> {
+    TRIM_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// What a cache that frees forms asks of the allocator
 /// (`Options::forms_trim_bytes`): the trim thread gives back the free
 /// pages once the handles have freed a stride's worth of forms and the
@@ -3610,6 +3620,7 @@ fn a_cache_kept_to_fit_gives_the_allocator_back_the_pages_its_sheds_freed() {
     if !Db::trim_supported() {
         return;
     }
+    let _trims = trim_lock();
     // The requests the trim thread took up and the trims it made.
     let run = |fit: bool, stride: usize| -> (u64, u64) {
         let name = format!("trim-{fit}-{stride}");
@@ -3677,6 +3688,126 @@ fn an_upkeep_pass_end_asks_the_trim_thread_to_look() {
     assert!(run(true) > 0, "with the option a pass end asked for a look");
 }
 
+/// A dead arena's shape: a thread takes `bytes` in pieces of a megabyte,
+/// touches every page, frees them all and exits, leaving the pages resident
+/// in free chunks of its arena -- the shape the seal and build threads leave
+/// in the suite. One allocation past the dynamic mmap threshold's start and
+/// under its cap, freed first, raises the threshold to its size and the trim
+/// threshold to twice it, so the pieces come from the thread's heap and
+/// nothing glibc does at the frees gives the heap back. A keeper of two
+/// megabytes allocated after the pieces is returned to the caller alive:
+/// glibc carves from its bins before its top, so the keeper comes from the
+/// top exactly when the last pieces did and lies above them, and the freed
+/// pieces are a bin chunk a trim reaches, not the heap's top, which a trim
+/// shrinks only past the trim threshold. The caller drops the keeper when
+/// its reading is done.
+fn dead_arena(bytes: usize) -> Vec<u8> {
+    std::thread::spawn(move || {
+        {
+            let mut raise = vec![0u8; 24 << 20];
+            raise[0] = 1;
+            std::hint::black_box(&raise);
+        }
+        let mut held: Vec<Vec<u8>> = Vec::with_capacity(bytes >> 20);
+        for _ in 0..bytes >> 20 {
+            held.push(vec![1u8; 1 << 20]);
+        }
+        let mut keeper = vec![0u8; 2 << 20];
+        keeper[0] = 1;
+        std::hint::black_box(&held);
+        keeper
+    })
+    .join()
+    .unwrap()
+}
+
+/// What the resident count reads (`Options::trim_by_resident`) and what a
+/// trim returns of it: a dead arena of thirty-two megabytes reads as that
+/// much more resident beyond use, and a trim of every arena gives it back.
+/// What the allocator holds is the whole process's and these tests share
+/// one, so each difference is held to half the arena and not to its bytes.
+#[test]
+fn the_resident_count_reads_a_dead_arenas_pages_and_a_trim_returns_them() {
+    if !Db::trim_supported() {
+        return;
+    }
+    let _trims = trim_lock();
+    let before =
+        Db::resident_beyond_use().expect("the resident count reads where the free count does");
+    let keeper = dead_arena(32 << 20);
+    let freed = Db::resident_beyond_use().unwrap();
+    assert!(
+        freed >= before + (16 << 20),
+        "a dead arena of 32 MB read {before} -> {freed} resident beyond use"
+    );
+    Db::trim_now();
+    let trimmed = Db::resident_beyond_use().unwrap();
+    assert!(
+        freed - trimmed.min(freed) >= 16 << 20,
+        "a trim returned {freed} -> {trimmed} of the dead arena's pages"
+    );
+    drop(keeper);
+}
+
+/// The trim thread counting by the resident bytes (`Options::trim_by_resident`)
+/// trims again when a dead arena's pages come back resident, which the free
+/// count never sees, since the pages come back under chunks already free. A
+/// store with the look at every pass end and a stride of eight megabytes,
+/// beside a dead arena of thirty-two: its first look trims, the floor
+/// starting at zero; a thread then re-touches the arena and frees it, and a
+/// pass's look trims again. The positive alone, since what the allocator
+/// holds is the whole process's; the free count's standing still is
+/// `trim_due`'s arithmetic over the census's readings.
+#[test]
+fn the_trim_thread_counting_by_resident_bytes_trims_a_dead_arena_again() {
+    if !Db::trim_supported() {
+        return;
+    }
+    let _trims = trim_lock();
+    let keeper = dead_arena(32 << 20);
+    let name = "trim-resident";
+    let (mut db, mut m) = burst_into_forms_with(name, 8 << 10, true, |o| {
+        o.upkeep = supdb::Upkeep::Background(1);
+        o.upkeep_inline_bursts = false;
+        o.forms_trim_bytes = 8 << 20;
+        o.upkeep_trim_look = true;
+        o.trim_by_resident = true;
+    });
+    let mut rounds = 0u32;
+    while db.forms_trims() == 0 {
+        assert!(
+            rounds < 400,
+            "no first trim: {} looks, held {:?}",
+            db.forms_trim_looks(),
+            db.trim_held_bytes()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        rounds += 1;
+    }
+    let first = db.forms_trims();
+    let keeper2 = dead_arena(32 << 20);
+    let mut rounds = 0u32;
+    while db.forms_trims() <= first {
+        assert!(
+            rounds < 400,
+            "no second trim: {} trims, {} looks, held {:?}",
+            db.forms_trims(),
+            db.forms_trim_looks(),
+            db.trim_held_bytes()
+        );
+        m.append(
+            &mut db,
+            &format!("key-{:05}", 3000 + rounds),
+            "v3-0123456789",
+        );
+        db.commit().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        rounds += 1;
+    }
+    m.check(&db, name);
+    drop((keeper, keeper2));
+}
+
 /// A trim in progress holds nothing of the segment work: the trim is a
 /// thread's of its own, and a seal's landing and a flush's answer, which
 /// wait on the segment work's thread, do not wait for it. The trim thread
@@ -3691,6 +3822,7 @@ fn the_segment_work_goes_on_while_a_trim_is_in_progress() {
     if !Db::trim_supported() {
         return;
     }
+    let _trims = trim_lock();
     let (mut db, mut m) = burst_into_forms_prepared(
         "trim-held",
         8 << 10,
@@ -11843,6 +11975,25 @@ fn a_write_after_a_handed_seal_takes_a_fresh_table_from_whichever_side_swapped()
     }
 }
 
+/// A watchdog's exit: the message on the process's own stderr, past the
+/// harness's capture, then the exit. The harness captures what a test's
+/// threads print, a watchdog's thread among them, so a watchdog that
+/// printed through `eprintln!` and exited left the whole binary ending with
+/// code 101 after a hundred and sixty-six tests, no failure named and no
+/// summary -- the dev binary under the whole file's load, where a window
+/// a minute holds in the checked profile runs several times longer.
+fn watchdog_exit(what: &str) -> ! {
+    use std::io::Write;
+    let said = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/stderr")
+        .and_then(|mut e| writeln!(e, "watchdog: {what}"));
+    if said.is_err() {
+        eprintln!("watchdog: {what}");
+    }
+    std::process::exit(101);
+}
+
 /// Exits the process unless dropped within a minute: for a test whose
 /// failure is a wait that never returns, so it reports itself rather
 /// than hanging. Dropped as the waits end, or by the unwind of a failure
@@ -11861,8 +12012,7 @@ impl Watchdog {
                 let t = std::time::Instant::now();
                 while !done.load(std::sync::atomic::Ordering::Relaxed) {
                     if t.elapsed() > std::time::Duration::from_secs(60) {
-                        eprintln!("{what}");
-                        std::process::exit(101);
+                        watchdog_exit(what);
                     }
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
@@ -13372,8 +13522,7 @@ fn a_commit_past_the_threshold_keeps_writing_while_the_frozen_list_is_full() {
             let t = std::time::Instant::now();
             while !done.load(std::sync::atomic::Ordering::Relaxed) {
                 if t.elapsed() > std::time::Duration::from_secs(60) {
-                    eprintln!("a commit waited for a held seal: seal_defers did not defer");
-                    std::process::exit(101);
+                    watchdog_exit("a commit waited for a held seal: seal_defers did not defer");
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }

@@ -106,7 +106,16 @@ build failed now; and a checked compile that dies is read in `dmesg`
 and sampled before it is read as another process's.
 `cargo test` stops at the first failing test binary, so a red `db` hid
 `dict`, `leak`, `ranges` and `segwriter` for a run; `--no-fail-fast` shows
-the rest. And worktrees that share a target directory overwrite each
+the rest. The dev profile is for a test at a time and never the whole
+`db` binary: its longest tests run four minutes alone under `checked` and
+seven times that in dev, and the whole file in dev ran a held-seal test's
+watchdog past its minute under the other tests' load, which ended the
+binary with code 101 after a hundred and sixty-six tests, no failure
+named and no summary, twice at the same count -- the watchdog's message
+had gone to the harness's capture of the test's threads. The watchdogs
+write to the process's own stderr now (`watchdog_exit`), and a test
+binary that ends with 101 and no `test result` line is read as a
+watchdog's exit before it is read as anything else. And worktrees that share a target directory overwrite each
 other's test binaries, because the root package's artifact hash does not
 depend on the checkout path: a run through the shared directory executed
 another branch's seventy-seven-test library binary with none of its own
@@ -580,7 +589,12 @@ allocator's free bytes (`trim_due`) never fires on pages that come back
 resident under chunks already free, which is what a thread re-using a
 dead arena does, so a look that found nothing to trim nine hundred times
 is read against the arenas line (`SUPDB_MIX_CENSUS=2`) before the
-mechanism is read as having nothing to return. And a pairing of two
+mechanism is read as having nothing to return; and a count that does
+fire there -- the resident bytes beyond the allocator's use
+(`Options::trim_by_resident`), four to nine trims through the mixes --
+lowered neither the process's anonymous bytes in the mixes nor the
+faults, since what a trim returns the mixes touch next, so a trim is
+priced in the phase's census and never by its own count. And a pairing of two
 `Auto` arms is read per sitting with each arm's builds and installs
 (`zpage_builds`, `zpage_sel_installs`, the `zsample` trace line's pick)
 beside its rates, never as the table over both orders: the ski rental's

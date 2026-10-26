@@ -1,0 +1,10 @@
+0341212
+ M CLAUDE.md
+ M bench/DESIGN.md
+ M bench/src/engines.rs
+ M docs/engine.md
+ M src/db.rs
+ M tests/db.rs
+?? scratch/wave2/zleanres-build.log
+?? scratch/wave2/zleanres-head.txt
+2026-10-26T09:48:18Z
