@@ -508,6 +508,20 @@ user's call.
   is, on the LZ4 form the default builds. Beside it: the dev `db` binary
   as a whole is not a mode (the watchdog shape, `CLAUDE.md`), and the
   watchdogs write to the real stderr now (`watchdog_exit`).
+- **The merge path's seek into a raw-tail group read in place** (a fix
+  to the in-place walk): `ZCursor::seek` opened the group in place and
+  sought it by `group_seek` over `c.group()`, which answers the empty
+  slice for `Group::Coded`, so the seek failed the page and
+  `ZFile::fail` took the form file out of service for good at the first
+  merge-path scan over a raw-tail covered partition -- answers right
+  through the raw form, nothing raised, a fallback and a damaged form
+  file in the counters only. The pairings never reached it (no pieces
+  during the mixes, `zpage_fallbacks` 0) and the cursor's seek test had
+  block-coded fixtures only. The seek goes over the coded heads now
+  (`record_group_seek`), the seek test's fixtures carry the raw tails,
+  and the oracle runs under the raw tails too
+  (`the_oracle_holds_with_the_raw_tails_read_in_place`), held to firing
+  on the tree before the fix.
 - **Where E's time is, by the arm pair's profile at the head**: the LZ4
   decode 25% of the thread (147,000 groups a pass, 2.5 a form walk, nearly
   every one a memo miss, since the form walks are the Zipfian's cold tail),

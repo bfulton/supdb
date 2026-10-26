@@ -355,9 +355,11 @@ const ORACLE_KEYS: usize = 240;
 /// of four kilobytes and a seal every eight are where the cache's forms
 /// upkeep trips its assertion (see `forced`), and the stores it is compared
 /// with are opened the same way.
-fn oracle_opts(z: bool, inline: bool) -> Options {
+fn oracle_opts(z: bool, inline: bool, raw_tails: bool) -> Options {
     Options {
         zpages: if z { ZPages::Always } else { ZPages::Off },
+        zpages_record_coding: raw_tails,
+        zpages_raw_tails: raw_tails,
         scan_block_cache: false,
         zpages_min_bytes: 0,
         seal_bytes: 8 << 10,
@@ -381,7 +383,20 @@ fn oracle_keys() -> Vec<Vec<u8>> {
 
 #[test]
 fn the_oracle_holds_with_zpages_forced_on() {
-    oracle(true);
+    oracle(true, false);
+}
+
+/// The same under the record coding with raw tails, read in place: the
+/// merge path's seek into a covered partition (`ZCursor::seek`) sought a
+/// group read in place by the walk of its records, which such a group
+/// answers no bytes for, failed the page and took the form file out of
+/// service at the first scan over pieces -- every key still answered through
+/// the raw form, and nothing of it in the tests, whose covered stores under
+/// the raw tails had no pieces. The oracle's has them, and counts a fallback
+/// and a damaged form file as failures.
+#[test]
+fn the_oracle_holds_with_the_raw_tails_read_in_place() {
+    oracle(true, true);
 }
 
 #[test]
@@ -389,7 +404,7 @@ fn the_oracle_holds_when_runs_in_blocks_decline_the_partitions() {
     // The same operations at the engine's own inline limit: a key that has
     // collected a few hundred bytes of values has its run in a block, and a
     // partition with one is declined and read raw.
-    oracle(false);
+    oracle(false, false);
 }
 
 /// The second form's counters over the life of a test whose store is dropped
@@ -422,7 +437,7 @@ impl Life {
     }
 }
 
-fn oracle(inline: bool) {
+fn oracle(inline: bool, raw_tails: bool) {
     // Puts, multi-value keys, deletes, seals, merges, promotions and
     // reopens, on a store under `Always` and a store under `Off`, each
     // checked against the model after every settle: through the writer, and
@@ -433,13 +448,18 @@ fn oracle(inline: bool) {
     // are written, a value at a time, so that the partitions over the low end
     // are declined and read raw and the ones above them are given form files:
     // a store with both, and merges between them.
-    let tag = if inline { "inline" } else { "blocks" };
+    let tag = match (inline, raw_tails) {
+        (true, false) => "inline",
+        (true, true) => "inline-raw",
+        (false, false) => "blocks",
+        (false, true) => "blocks-raw",
+    };
     let (dz, dr) = (
         scratch(&format!("oracle-z-{tag}")),
         scratch(&format!("oracle-raw-{tag}")),
     );
-    let mut z = Db::create(&dz, oracle_opts(true, inline)).unwrap();
-    let mut raw = Db::create(&dr, oracle_opts(false, inline)).unwrap();
+    let mut z = Db::create(&dz, oracle_opts(true, inline, raw_tails)).unwrap();
+    let mut raw = Db::create(&dr, oracle_opts(false, inline, raw_tails)).unwrap();
     let mut model: Model = BTreeMap::new();
     let mut pending: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
     let mut rng = Rng(0x0AC1E);
@@ -505,8 +525,8 @@ fn oracle(inline: bool) {
                 drop(z);
                 drop(raw);
                 pending.clear();
-                z = Db::open(&dz, oracle_opts(true, inline)).unwrap();
-                raw = Db::open(&dr, oracle_opts(false, inline)).unwrap();
+                z = Db::open(&dz, oracle_opts(true, inline, raw_tails)).unwrap();
+                raw = Db::open(&dr, oracle_opts(false, inline, raw_tails)).unwrap();
                 crashes += 1;
                 check(&z, &model, &keys, "after a crash");
                 check(&raw, &model, &keys, "after a crash, raw");

@@ -485,18 +485,31 @@ impl<'a> ZCursor<'a> {
         if !c.open_at(&entry, j) {
             return Err(ZSeek::Fallback);
         }
-        let pos = match group_seek(c.group(), c.end - c.gstart, key) {
-            Ok(pos) => pos,
+        // A raw-tail coded group opened in place is sought over its heads
+        // (`record_group_seek`), its position a record index; a decoded one
+        // by the walk of its records, its position a byte offset. The first
+        // version sought every group by the walk, and a group read in place
+        // answers no bytes for it, so the seek failed the page and took the
+        // form file out of service at the merge path's first scan over such
+        // a partition, with every key still answered through the raw form.
+        let sought = match &c.group {
+            Group::Coded(payload, _) => {
+                record_group_seek(payload, c.end - c.gstart, key).map(|pos| (pos.index, pos.index))
+            }
+            _ => group_seek(c.group(), c.end - c.gstart, key).map(|pos| (pos.index, pos.off)),
+        };
+        let (index, off) = match sought {
+            Ok(at) => at,
             Err(_) => {
                 zfile.fail(entry.page as usize);
                 return Err(ZSeek::Fallback);
             }
         };
-        c.rank = c.gstart + pos.index;
+        c.rank = c.gstart + index;
         if c.rank >= c.end {
             c.next_group();
         } else {
-            c.off = pos.off;
+            c.off = off;
             c.place();
         }
         Ok(c)
@@ -6806,11 +6819,24 @@ mod tests {
         let big = b"0000000000000750-big";
         recs.insert(750, (big.to_vec(), vec![rng.bytes(6000)], false));
         recs.sort_by(|a, b| a.0.cmp(&b.0));
-        for (name, recs) in [("cursor-suite", suite(1200, 10)), ("cursor-nopage", recs)] {
-            let fx = Fixture::new(name, recs, 1 << 20);
+        // Under the block coding and under the raw tails read in place: the
+        // seek into a group read in place is the seek over its heads, and
+        // the first version sought it by the walk of its records, which such
+        // a group answers no bytes for, and failed the page.
+        for (name, recs, raw) in [
+            ("cursor-suite", suite(1200, 10), false),
+            ("cursor-nopage", recs.clone(), false),
+            ("cursor-suite-raw", suite(1200, 10), true),
+            ("cursor-nopage-raw", recs, true),
+        ] {
+            let fx = if raw {
+                Fixture::with_shape(name, recs, 1 << 20, ZCODING_RECORD, true)
+            } else {
+                Fixture::new(name, recs, 1 << 20)
+            };
             let zfile = fx.zfile();
             let n = fx.recs.len();
-            let nopage = u64::from(name == "cursor-nopage");
+            let nopage = u64::from(name.starts_with("cursor-nopage"));
             for start in (0..n + 3).step_by(53) {
                 let mut c = ZCursor::at(&fx.memo, &zfile, &fx.blob, start);
                 let mut rank = start;
@@ -6836,7 +6862,14 @@ mod tests {
                 assert!(!c.fell_back(), "{name}: from {start}");
                 if start == 0 {
                     assert_eq!(c.nopage, nopage, "{name}: the run no page holds, met once");
-                    assert!(c.decoded > 0, "{name}: groups decoded on the way");
+                    if raw {
+                        assert!(
+                            c.inplace > 0 && c.decoded == 0,
+                            "{name}: the raw-tail groups read in place, none decoded"
+                        );
+                    } else {
+                        assert!(c.decoded > 0, "{name}: groups decoded on the way");
+                    }
                 }
                 // The seek to a key lands where the raw form's does, and so
                 // does one to a key between records.

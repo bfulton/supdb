@@ -3654,7 +3654,11 @@ fn a_cache_kept_to_fit_gives_the_allocator_back_the_pages_its_sheds_freed() {
 /// the pass is the engine's moment inside a run of reads, where the
 /// process's resident free pages compete with its own file's. With a
 /// stride no shed reaches, the looks are the passes' alone: some with the
-/// option and none without, and no trim either way.
+/// option and none without, and no trim either way. The wait for a look
+/// lends a batch each round, since the thread is niced and a pass the
+/// writer's last operation took home is nobody's: the first version waited
+/// two seconds on the helper's last lend, and under the gate's load no
+/// pass had ended in them, once in five gates.
 #[test]
 fn an_upkeep_pass_end_asks_the_trim_thread_to_look() {
     if !Db::trim_supported() {
@@ -3664,16 +3668,22 @@ fn an_upkeep_pass_end_asks_the_trim_thread_to_look() {
         let name = format!("trim-look-{look}");
         // The burst helper files on the writer's thread; the passes are
         // the thread's, so the upkeep is lent, bursts and all.
-        let (db, m) = burst_into_forms_with(&name, 8 << 10, true, |o| {
+        let (mut db, mut m) = burst_into_forms_with(&name, 8 << 10, true, |o| {
             o.upkeep = supdb::Upkeep::Background(1);
             o.upkeep_inline_bursts = false;
             o.forms_trim_bytes = 1 << 40;
             o.upkeep_trim_look = look;
         });
-        for _ in 0..400 {
+        for round in 0..400u32 {
             if db.forms_trim_looks() > 0 {
                 break;
             }
+            m.append(
+                &mut db,
+                &format!("key-{:05}", 3000 + round),
+                "v3-0123456789",
+            );
+            db.commit().unwrap();
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         m.check(&db, &name);
@@ -3732,6 +3742,12 @@ fn the_resident_count_reads_a_dead_arenas_pages_and_a_trim_returns_them() {
         return;
     }
     let _trims = trim_lock();
+    // The process's resident free pages returned first, so the dead arena's
+    // pieces come from pages that have to be faulted in: in the gate's whole
+    // `db` run the process held 118 MB resident and free from the other
+    // tests' dead arenas, the pieces came from pages those had left
+    // resident, and the count rose 3 MB for an arena of 32.
+    Db::trim_now();
     let before =
         Db::resident_beyond_use().expect("the resident count reads where the free count does");
     let keeper = dead_arena(32 << 20);
