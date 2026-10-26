@@ -2930,6 +2930,48 @@ impl ZFile {
             return ZSeek::Fallback;
         };
         let j = view.group_of_key(key);
+        // A record-coded group is sought over its heads where it lies
+        // (`record_group_seek`), as the point read seeks one, nothing
+        // decoded and nothing put in the memo; the page is verified at its
+        // first touch as a first decode verifies it, every group by its own
+        // check. The first version opened the group as a walk opens one,
+        // every record copy-decoded for the raw-tail form, and under the
+        // in-place walk the decode served nobody: 1.5 groups a scan in E,
+        // the start seek's and the cut's, where the walk decoded none.
+        if let Some(g) = view.group(j).filter(|g| g.coded) {
+            let p = entry.page as usize;
+            if let (Some(page), Some(payload)) = (
+                self.page_bytes(p).filter(|_| p < self.n_pages),
+                view.payload(j),
+            ) {
+                memo.touch(self.id, entry.page, self.n_pages);
+                if !bit(&self.verified, p) {
+                    match first_checks(page, self.bind, &entry, None) {
+                        Ok(_) => set_bit(&self.verified, p),
+                        Err(Fail::Misaligned) => return ZSeek::Fallback,
+                        Err(Fail::Check(_)) => {
+                            self.fail(p);
+                            return ZSeek::Fallback;
+                        }
+                    }
+                }
+                return match record_group_seek(payload, usize::from(g.count), key) {
+                    Ok(pos) => ZSeek::Served {
+                        rank: first + usize::from(g.first) + pos.index,
+                        at: if pos.found {
+                            KeyOrder::Equal
+                        } else {
+                            KeyOrder::Greater
+                        },
+                        decoded: false,
+                    },
+                    Err(_) => {
+                        self.fail(p);
+                        ZSeek::Fallback
+                    }
+                };
+            }
+        }
         let mut buf = take_buf();
         let r = match self.open_group(memo, &entry, j, &mut buf, Some(&view), false) {
             None => ZSeek::Fallback,
@@ -5001,10 +5043,12 @@ mod tests {
             // block's cuts were taken.
             let mut want = Vec::with_capacity(probes.len());
             let mut r = 0usize;
+            let mut seek_decoded = false;
             for k in &probes {
                 match zfile.cut_in(&fx.memo, r, nkeys, k) {
-                    ZSeek::Served { rank, at, .. } => {
+                    ZSeek::Served { rank, at, decoded } => {
                         want.push((rank, at));
+                        seek_decoded |= decoded;
                         r = rank;
                     }
                     other => panic!("{other:?}"),
@@ -5015,7 +5059,22 @@ mod tests {
                 Some(nkeys),
                 "the last probe is past every key"
             );
-            fx.memo.take_counts();
+            // A record-coded group is sought over its heads: the suite's
+            // shapes under that coding, every group coded, decode nothing
+            // for a seek and ask the memo for nothing; the block coding
+            // decodes the group the key falls in.
+            let seek_memo = fx.memo.take_counts();
+            if name.starts_with("skipto-suite") && coding == ZCODING_RECORD {
+                assert!(
+                    !seek_decoded && seek_memo == (0, 0),
+                    "{name}: the seeks over the heads decoded nothing: memo {seek_memo:?}"
+                );
+            } else {
+                assert!(
+                    seek_decoded,
+                    "{name}: the seeks decoded the groups they fell in"
+                );
+            }
             let mut cur = ZCursor::unplaced(&fx.memo, &zfile, &fx.blob);
             let got: Vec<(usize, KeyOrder)> = probes
                 .iter()
