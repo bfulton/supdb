@@ -1362,7 +1362,21 @@ builds take, it read 74,000 groups in place over the mixes while the
 scans decoded 14 million through the form file's bulk scan path, which
 the block cache's clean walks take, and the rates alone read as a gain
 of a tenth. Count the paths' own counters beside a pairing before the
-rates are read as the change's.
+rates are read as the change's. A third path was found a commit later by
+reading the code: the merge path's seek into a covered partition
+(`ZCursor::seek`) opened the group in place and then sought it by the
+walk of its records, which a group read in place answers no bytes for,
+so the seek failed the page and `ZFile::fail` took the form file out of
+service for the rest of the store's life, every key still right through
+the raw form and nothing raised; the cursor's seek test ran on
+block-coded fixtures only, and the pairings' stores had no pieces while
+they were measured. The seek goes over the coded heads now
+(`record_group_seek`), the test's fixtures carry the raw tails, and the
+oracle, whose store has pieces, runs under them and counts a fallback or
+a damaged form file as a failure. The corollary of the corollary: a
+shape given to a kind of group is checked at every site that reads the
+group's bytes, and a reader that answers the empty slice for a kind it
+does not hold is a reader every such site has to be read against.
 
 **A list of raw pointers drops the pointers.** A replaced canonical
 form and a replaced scan snapshot wait in lists until every reader
