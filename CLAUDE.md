@@ -580,7 +580,17 @@ allocator's free bytes (`trim_due`) never fires on pages that come back
 resident under chunks already free, which is what a thread re-using a
 dead arena does, so a look that found nothing to trim nine hundred times
 is read against the arenas line (`SUPDB_MIX_CENSUS=2`) before the
-mechanism is read as having nothing to return. `SUPDB_SCAN_OPS=1` times
+mechanism is read as having nothing to return. And a pairing of two
+`Auto` arms is read per sitting with each arm's builds and installs
+(`zpage_builds`, `zpage_sel_installs`, the `zsample` trace line's pick)
+beside its rates, never as the table over both orders: the ski rental's
+buy moves with the order -- at five million keys under 736 MiB the default
+built nothing in one sitting's median rep and its block form in the
+other's, and the gear's pick at 720 MiB flipped with which arm ran first,
+since the budget subtracts the process's anonymous memory at the sample's
+moment -- so the table's gmean mixes arms that bought different things at
+different times, and the coding alone is read in a forced pairing where
+both forms stand from the start. `SUPDB_SCAN_OPS=1` times
 every scan of the single-threaded scan pass on its own, for every arm,
 and prints a `scanops` line a pass with the first scans beside the
 median: a pass of a hundred scans at the smallest rung is a few hundred

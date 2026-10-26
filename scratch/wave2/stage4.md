@@ -2992,3 +2992,101 @@ decodes nothing, each necessary and none sufficient alone. The lighter
 codings and both trims stay as arms, off; the per-pass look is a sound
 mechanism that found nothing to do here, and the record of what a trim
 can return is the census's.
+
+## The coding gear: the selector chooses the raw-tail coding where that form fits
+
+The user's direction after the fit checks: first the gear, the controller
+picking the raw-tail coding where its form fits with margin, since the
+raw-tail form reads the point-read mixes faster wherever it fits; then the
+lean process. The gear is `Options::zpages_coding_auto`: under `Auto` the
+sampler fills the raw-tail record coding beside the options' coding
+(`z_sample_start`, one `FillShape` each, the fills' CPU 10-20% more than one
+coding's in the sample job's wall), and at the collect
+`zselect::choose_coding` picks the raw tails where `model_z` predicts that
+form faults nothing against the budget -- the budget the model already
+prices against, the limit less the process's anonymous memory and a margin
+of a twentieth or 64 MiB -- and the block coding otherwise; the reading fed
+to the selector is the chosen form's, the pick holds for the builds after it
+(`z_start`'s plan), and each form file names its own coding, so a store may
+carry both. The line is at no predicted fault at all, since the fit checks
+had priced a form that faults a little (1.4-1.5x slower in D and E for
+0.02-0.03 faults an operation) against one that wins 1.3x where it fits;
+`zselect::tests` holds the choice to the two measured points and the line
+itself, `tests/zpages.rs` drives an eager `Auto` store under two injected
+budgets to the raw tails built and to the block coding built, and
+`supdb-cache64tofitautozpagescodingauto` is the arm. The counts carry the
+picks, the builds under the raw tails and both forms' estimated bytes
+(`zpage_coding_picks_*`, `zpage_builds_raw_tails`, `zpage_sample_w_z_raw_bytes`).
+
+**Where both codings fit, forced** (`zgearforced-ab-{1,2}`, three million keys
+under 640 MiB, `supdb-cache64tofitzpages` against `supdb-cache64tofitzpagesrecordraw`,
+the block cache and the memo on both, no major fault in either arm): the
+raw-tail form reads the point-read mixes faster in both orders -- D's gets
+1.8-1.95x, C's 1.37-1.46x, B's 1.25-1.32x, F's 1.25x, A's 1.0-1.1x, the read
+pass 1.53x -- and the scans slower: the scan pass at 0.70-0.72x in both
+orders and E 0.89x and 1.02x, since a scan decodes its groups whole and a
+raw-tail group's decode is a parse and a copy a record over 12% more groups,
+where the block coding's is one LZ4 decode. The point read is where the
+coding pays: one record copied out of the payload against a group decoded
+or a memo hit. The in-place walk of a raw-tail group, which would make a
+scan's read a lend from the payload and take the scan pass's loss out, is
+the next piece of the lean-process direction and is not built here.
+
+**Where the raw store fits, Auto** (`zgearauto3m-ab-{1,2}`, three million
+keys under 640 MiB, `supdb-cache64tofitautozpages` against the gear): the
+controller stays FITS, samples nothing and builds nothing in either arm
+(`zpage_builds` 0), and the pairing reads level (0.94-1.0) -- the gear changes
+nothing where no form is built, and the raw store under 640 MiB at three
+million keys is served raw. **Where neither fits** (`zgearauto5m-ab-{1,2}`,
+five million under 640 MiB): the gear sizes the raw-tail form at 595 MB
+against the block form's 391 (`w_z_raw` in the `zsample` trace line, the
+measured files 556 and 360) and picks the block coding in every rep, both
+arms build the same nineteen files, and the pairing reads 1.0-1.1 with the
+point-read mixes 3-10% slower under the gear in 6-9 pairs of twelve, inside
+what the sitting's order moves (below). The gear's window is the budgets
+between the raw-tail form's bytes and the raw store's -- at the suite's
+shape the raw-tail form is 86% of the raw files, the hash index and the
+record headers being what it saves -- so a store that has outgrown its
+budget by less than a seventh is where the controller builds and the raw
+tails fit.
+
+**Inside the window, Auto** (`zgearauto5m720-ab-{1,2}` and
+`zgearauto5m736-ab-{1,2}`, five million keys under 720 and 736 MiB, the
+census on for the second). At 720 MiB the pick flipped with the order:
+the raw-tail form's 595 MB plus its resident 10 against a budget of the
+limit less the process's anonymous memory at the sample's moment less
+64 MiB fits only while the process holds under about 84 MB, and the arm
+that ran second in a rep held more, so one sitting picked the raw tails in
+every rep and the other the block coding in every rep -- a knife edge, read
+per sitting and never as the table's gmean, which would mix the two picks.
+At 736 MiB the gear picked the raw tails in every rep of both orders and
+built nineteen raw-tailed files, and the pairing says two things at once.
+Where the gear picked raw tails its mixes read faster than the Auto
+default's in both orders: in the sitting where the default had built its
+block form, C's gets 2.2x and D's 2.4x, B's 1.4x, A's 1.2x, F's 1.3x, E's
+scans 1.26x and the scan pass 1.12x, with the default's mixes faulting
+0.01-0.04 an operation and the gear's 0.000-0.003; in the other sitting the
+default built nothing in the median rep (`zpage_builds` 0, its mixes at
+0.10-0.16 major faults a read in C and D) and the gear read 5-6x in C and
+D. The controller's rent is what differs: at a rung the raw store misses by
+little, `phi_raw` is small and the excess climbs slowly toward the build's
+price, and the gear's reading -- the raw-tail form's cheaper decode -- makes
+the form's predicted saving larger and the buy earlier, so the pairing
+measures when each arm bought as much as what it built, and the Auto
+default's own buy at this rung is slow or absent within the passes, which
+is a finding about the rent and not about the coding. The clean reading of
+the coding is the forced pairing above: point reads 1.25-1.95x, the scan
+pass 0.70x, E 0.89-1.02.
+
+What the gear is, then: correct in its choice at every rung paired (the
+block coding where the raw-tail form would miss, the raw tails where the
+model says it fits), with a window that is the budgets between the raw-tail
+form's bytes and the raw store's, about a seventh of the store at the
+suite's shape, and a knife edge at its lower end where the process's
+anonymous memory at the sample's moment decides; inside the window the
+point-read mixes read 1.2x to several times faster than the default and
+the scans pay the whole-group copy-decode, 0.70x on the scan pass forced.
+It stays an arm, off, until the in-place walk of a raw-tail group takes the
+scan's cost out, which is the lean-process direction's first piece, since a
+gear that trades the scans for the point reads is not the default for a
+store that does both.

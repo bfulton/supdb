@@ -533,6 +533,13 @@ pub struct ZCounts {
     /// The sampler's estimate of the form's bytes over the partitions it
     /// counted, at its last reading; `file_bytes` is what the build wrote.
     pub sample_w_z_bytes: u64,
+    /// Where the selector chooses the coding (`Options::zpages_coding_auto`):
+    /// the raw-tail form's bytes at the same reading, the codings chosen,
+    /// and the builds started under the raw tails.
+    pub sample_w_z_raw_bytes: u64,
+    pub coding_picks_block: u64,
+    pub coding_picks_raw: u64,
+    pub builds_raw_tails: u64,
     pub sel_samples: u64,
     pub sel_builds: u64,
     pub sel_installs: u64,
@@ -1213,6 +1220,20 @@ pub struct Options {
     /// raw-tail coding (`supdb-cache64tofitzpagesrecordrawleantrim`). Off.
     #[doc(hidden)]
     pub upkeep_trim_look: bool,
+    /// EXPERIMENT: under `ZPages::Auto`, the coding the form files are built
+    /// in is the selector's to choose (`zselect::choose_coding`): the sampler
+    /// sizes the record coding with raw tails beside the block coding, and
+    /// the raw tails are built where the model predicts that form faults
+    /// nothing against the budget, the block coding otherwise -- the gear is
+    /// the lightest coding that fits. The raw-tail form reads the point-read
+    /// mixes 1.3x faster than the block form where it fits and 1.4-1.5x
+    /// slower in D and E where it does not (`docs/engine.md`). A pick holds
+    /// for the builds after it; the files already built keep their coding,
+    /// each file naming its own. Off; `supdb-cache64tofitautozpagescodingauto`
+    /// is the arm. Nothing under `Always`, whose coding is
+    /// `zpages_record_coding` and `zpages_raw_tails`.
+    #[doc(hidden)]
+    pub zpages_coding_auto: bool,
     /// Whether the controller buys its first form at SUSPECT on the model's
     /// prediction, once the sampler has priced it and the partitions have
     /// stood for `zselect::EAGER_SETTLE` with nothing of the segment work in
@@ -2695,6 +2716,7 @@ impl Default for Options {
             zpages_raw_tails: false,
             zpages_trim_install: false,
             upkeep_trim_look: false,
+            zpages_coding_auto: false,
             zpages_build_eager: false,
             zpages_inject: None,
             forms_pieces_only: false,
@@ -16049,6 +16071,10 @@ impl Reader {
             sample_declined: get(&ev.sample_declined),
             sample_us: get(&ev.sample_us),
             sample_w_z_bytes: get(&ev.sample_w_z),
+            sample_w_z_raw_bytes: get(&ev.sample_w_z_raw),
+            coding_picks_block: get(&ev.coding_picks[0]),
+            coding_picks_raw: get(&ev.coding_picks[1]),
+            builds_raw_tails: get(&ev.builds_raw_tails),
             sel_samples: get(&ev.sel_samples),
             sel_builds: get(&ev.sel_builds),
             sel_installs: get(&ev.sel_installs),
@@ -31379,6 +31405,11 @@ struct Maint {
     z_sampling: Option<ZSampling>,
     z_sample_ready: Option<zselect::Sampler>,
     z_sample_size: Option<(u64, u64, f64)>,
+    /// The coding the selector chose at its last reading
+    /// (`Options::zpages_coding_auto`, `zselect::choose_coding`), which the
+    /// builds after it are planned in; none until a reading with both
+    /// codings sized.
+    z_coding_pick: Option<zselect::Coding>,
     z_report: zselect::Build,
     z_scan_len: f64,
     /// Whether the store's raw populations were past its budget at the
@@ -31389,9 +31420,53 @@ struct Maint {
 /// A sample job in flight (`zfile::sample` over the live partitions, on a
 /// thread of its own).
 struct ZSampling {
-    handle: std::thread::JoinHandle<Vec<(std::sync::Arc<Seg>, Result<zfile::Sample>)>>,
+    handle: std::thread::JoinHandle<Vec<ZSampled>>,
     generation: u64,
     started: std::time::Instant,
+}
+
+/// One partition's readings from a sample job: the options' coding, and the
+/// raw-tail record coding beside it where the selector chooses the coding
+/// (`Options::zpages_coding_auto`).
+type ZSampled = (
+    std::sync::Arc<Seg>,
+    Result<zfile::Sample>,
+    Option<Result<zfile::Sample>>,
+);
+
+/// A sample job's readings summed over the partitions it counted, one sum a
+/// coding (`Db::z_sample_collect`).
+#[derive(Clone, Copy, Debug, Default)]
+struct ZSums {
+    counted: usize,
+    w_z: u64,
+    resident: u64,
+    nkeys: u64,
+    recs_len: u64,
+    pages: u64,
+    fill_ns: u64,
+    records: u64,
+    decode_ns: u64,
+    zgroups: u64,
+    wait_ns: u64,
+    faults: u64,
+}
+
+impl ZSums {
+    fn add(&mut self, s: &zfile::Sample) {
+        self.counted += 1;
+        self.w_z = self.w_z.saturating_add(s.w_z);
+        self.resident = self.resident.saturating_add(s.resident_est);
+        self.nkeys = self.nkeys.saturating_add(s.nkeys);
+        self.recs_len = self.recs_len.saturating_add(s.recs_len);
+        self.pages = self.pages.saturating_add(s.pages_est);
+        self.fill_ns = self.fill_ns.saturating_add(s.fill_ns);
+        self.records = self.records.saturating_add(s.records);
+        self.decode_ns = self.decode_ns.saturating_add(s.decode_ns);
+        self.zgroups = self.zgroups.saturating_add(s.zgroups);
+        self.wait_ns = self.wait_ns.saturating_add(s.wait_ns);
+        self.faults = self.faults.saturating_add(s.faults);
+    }
 }
 
 /// The slots' census words, summed: see `Slot`.
@@ -31830,6 +31905,7 @@ impl Maint {
             z_sampling: None,
             z_sample_ready: None,
             z_sample_size: None,
+            z_coding_pick: None,
             z_report: zselect::Build::default(),
             z_scan_len: 0.0,
             z_past_budget: false,
@@ -33315,6 +33391,16 @@ impl Maint {
         let coding = self.opts.z_coding();
         let store_all = self.opts.zpages_store_all;
         let raw_tails = self.opts.zpages_raw_tails;
+        // Where the selector chooses the coding, the raw-tail record coding
+        // is sized beside the options' (`zselect::choose_coding`).
+        let second = (self.opts.zpages_coding_auto && !raw_tails && !store_all).then_some(
+            zfile::FillShape {
+                group_bytes,
+                coding: zpages::ZCODING_RECORD,
+                store_all: false,
+                raw_tails: true,
+            },
+        );
         let wake = self.wake.clone();
         zfile::ZEvents::add(&self.shared.z.samples, 1);
         let io_idle = self.opts.zpages_io_idle;
@@ -33328,22 +33414,21 @@ impl Maint {
                 let out: Vec<_> = segs
                     .into_iter()
                     .map(|s| {
-                        let r = match (Db::name_id(&s.name), Db::name_end_seq(&s.name)) {
-                            (Some(id), Some(end)) => zfile::sample(
-                                s.blob.for_zfile(),
-                                id,
-                                end,
-                                floor,
-                                zfile::FillShape {
-                                    group_bytes,
-                                    coding,
-                                    store_all,
-                                    raw_tails,
-                                },
-                            ),
-                            _ => Err(err("z sample: a partition without an id")),
+                        let ids = Db::name_id(&s.name).zip(Db::name_end_seq(&s.name));
+                        let take = |shape: zfile::FillShape| match ids {
+                            Some((id, end)) => {
+                                zfile::sample(s.blob.for_zfile(), id, end, floor, shape)
+                            }
+                            None => Err(err("z sample: a partition without an id")),
                         };
-                        (s, r)
+                        let r = take(zfile::FillShape {
+                            group_bytes,
+                            coding,
+                            store_all,
+                            raw_tails,
+                        });
+                        let r2 = second.map(take);
+                        (s, r, r2)
                     })
                     .collect();
                 if let Some(t) = wake {
@@ -33386,13 +33471,9 @@ impl Maint {
         let Ok(results) = job.handle.join() else {
             return;
         };
-        let (mut w_z, mut resident, mut nkeys, mut pages) = (0u64, 0u64, 0u64, 0u64);
-        let (mut fill_ns, mut records, mut decode_ns, mut groups) = (0u64, 0u64, 0u64, 0u64);
-        let mut zgroups = 0u64;
-        let mut recs_len = 0u64;
-        let (mut wait_ns, mut faults) = (0u64, 0u64);
-        let (mut on_disk, mut counted) = (0usize, 0usize);
-        for (seg, r) in results {
+        let (mut block, mut raw) = (ZSums::default(), ZSums::default());
+        let mut on_disk = 0usize;
+        for (seg, r, r2) in results {
             zfile::ZEvents::add(&ev.sampled, 1);
             let s = match r {
                 Ok(s) => s,
@@ -33406,24 +33487,59 @@ impl Maint {
                 zfile::ZEvents::add(&ev.sample_declined, 1);
                 continue;
             }
-            counted += 1;
-            w_z = w_z.saturating_add(s.w_z);
-            resident = resident.saturating_add(s.resident_est);
-            nkeys = nkeys.saturating_add(s.nkeys);
-            recs_len = recs_len.saturating_add(s.recs_len);
-            pages = pages.saturating_add(s.pages_est);
-            fill_ns = fill_ns.saturating_add(s.fill_ns);
-            records = records.saturating_add(s.records);
-            decode_ns = decode_ns.saturating_add(s.decode_ns);
-            groups = groups.saturating_add(s.groups);
-            zgroups = zgroups.saturating_add(s.zgroups);
-            wait_ns = wait_ns.saturating_add(s.wait_ns);
-            faults = faults.saturating_add(s.faults);
+            block.add(&s);
+            if let Some(Ok(s2)) = r2 {
+                if s2.declined.is_none() {
+                    raw.add(&s2);
+                }
+            }
             let on = Db::name_id(&seg.name)
                 .zip(Db::name_end_seq(&seg.name))
                 .is_some_and(|(id, end)| self.dir.join(zfile::zpg_name(id, end)).is_file());
             on_disk += usize::from(on);
         }
+        // The coding, where the selector chooses it: the raw tails where the
+        // model predicts that form faults nothing against the budget, the
+        // block coding otherwise (`zselect::choose_coding`); the reading fed
+        // to the selector is the chosen form's. A reading that sized the raw
+        // tails for fewer partitions than the block coding chooses nothing.
+        let pick = (self.opts.zpages_coding_auto
+            && raw.counted > 0
+            && raw.counted == block.counted)
+            .then(|| {
+                let budget = self.z_budget().unwrap_or(0);
+                zselect::choose_coding(
+                    budget,
+                    zselect::FormSize {
+                        w_z: raw.w_z,
+                        resident: raw.resident,
+                    },
+                )
+            });
+        if let Some(c) = pick {
+            let idx = usize::from(c == zselect::Coding::RawTails);
+            zfile::ZEvents::add(&ev.coding_picks[idx], 1);
+            self.z_coding_pick = Some(c);
+        }
+        ev.sample_w_z_raw.store(raw.w_z, AtomicOrdering::Relaxed);
+        let ZSums {
+            counted,
+            w_z,
+            resident,
+            nkeys,
+            recs_len,
+            pages,
+            fill_ns,
+            records,
+            decode_ns,
+            zgroups,
+            wait_ns,
+            faults,
+        } = if pick == Some(zselect::Coding::RawTails) {
+            raw
+        } else {
+            block
+        };
         let declined = counted == 0;
         let fill_per_record = if records > 0 {
             fill_ns as f64 * 1e-9 / records as f64
@@ -33486,7 +33602,9 @@ impl Maint {
         });
         if self.z_trace {
             eprintln!(
-                "zsample partitions {counted} declined {declined} on_disk {on_disk} keys {nkeys} records {recs_len} w_z {w_z} resident {resident} build_cpu {build_cpu:.4} c_build {c_build:.4} t_f {t_f:?} decode_per_page {decode_per_page:.3e}"
+                "zsample partitions {counted} declined {declined} on_disk {on_disk} keys {nkeys} records {recs_len} w_z {w_z} resident {resident} build_cpu {build_cpu:.4} c_build {c_build:.4} t_f {t_f:?} decode_per_page {decode_per_page:.3e} coding {:?} w_z_raw {}",
+                self.z_coding_pick,
+                raw.w_z
             );
         }
     }
@@ -33727,6 +33845,16 @@ impl Maint {
     /// platform, the group's refaults a second over the tick, and the raw
     /// form's predicted faults a read over the partitions' footprint. None
     /// where the platform gives no budget.
+    /// The budget the model prices against: the seam's where a test has set
+    /// one, else the platform's (`zfile::read_budget`), else none.
+    fn z_budget(&self) -> Option<u64> {
+        self.opts
+            .zpages_inject
+            .as_ref()
+            .and_then(|i| i.budget())
+            .or_else(|| zfile::read_budget().map(|b| b.budget))
+    }
+
     fn z_model(&mut self, now: std::time::Duration) -> Option<zselect::Model> {
         let inject = self.opts.zpages_inject.clone();
         let platform = zfile::read_budget();
@@ -33996,9 +34124,23 @@ impl Maint {
             zfile::BuildPlan::new(self.opts.zpages_min_bytes, self.opts.zpages_drop_behind);
         plan.ahead = self.opts.zpages_build_ahead;
         plan.group_bytes = self.opts.zpages_group_bytes;
-        plan.coding = self.opts.z_coding();
+        // The coding: the selector's pick where it chooses one
+        // (`Options::zpages_coding_auto`), else the options'.
+        let (coding, raw_tails) = match self.z_coding_pick {
+            Some(zselect::Coding::RawTails) if self.opts.zpages_coding_auto => {
+                (zpages::ZCODING_RECORD, true)
+            }
+            Some(zselect::Coding::Block) if self.opts.zpages_coding_auto => {
+                (zpages::ZCODING_BLOCK, false)
+            }
+            _ => (self.opts.z_coding(), self.opts.zpages_raw_tails),
+        };
+        plan.coding = coding;
         plan.store_all = self.opts.zpages_store_all;
-        plan.raw_tails = self.opts.zpages_raw_tails;
+        plan.raw_tails = raw_tails;
+        if raw_tails {
+            zfile::ZEvents::add(&ev.builds_raw_tails, 1);
+        }
         plan.cancel = Some(cancel.clone());
         plan.hold = Some(shared.zbuild_hold.clone());
         let fail = shared.fail_zbuild.swap(false, AtomicOrdering::AcqRel);

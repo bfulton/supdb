@@ -2942,6 +2942,12 @@ pub(super) struct ZEvents {
     /// The sampler's estimate of the form's bytes over the partitions it
     /// counted, at its last reading (`Sample::w_z` summed).
     pub sample_w_z: AtomicU64,
+    /// Where the selector chooses the coding (`Options::zpages_coding_auto`):
+    /// the raw-tail form's bytes at the same reading, the codings chosen
+    /// (block, then raw tails) and the builds started under the raw tails.
+    pub sample_w_z_raw: AtomicU64,
+    pub coding_picks: [AtomicU64; 2],
+    pub builds_raw_tails: AtomicU64,
     pub sel_samples: AtomicU64,
     pub sel_builds: AtomicU64,
     pub sel_installs: AtomicU64,

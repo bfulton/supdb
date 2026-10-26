@@ -1,0 +1,29 @@
+2e170d4
+ M bench/DESIGN.md
+ M bench/src/engines.rs
+ M src/db.rs
+ M src/db/zfile.rs
+ M src/db/zselect.rs
+ M tests/zpages.rs
+?? scratch/wave2/pair.sh
+?? scratch/wave2/zgearauto3m-ab-1.err
+?? scratch/wave2/zgearauto3m-ab-1.out
+?? scratch/wave2/zgearauto3m-ab-2.err
+?? scratch/wave2/zgearauto3m-ab-2.out
+?? scratch/wave2/zgearauto3m-build.log
+?? scratch/wave2/zgearauto3m-head.txt
+?? scratch/wave2/zgearauto5m-ab-1.err
+?? scratch/wave2/zgearauto5m-ab-1.out
+?? scratch/wave2/zgearauto5m-ab-2.err
+?? scratch/wave2/zgearauto5m-ab-2.out
+?? scratch/wave2/zgearauto5m-build.log
+?? scratch/wave2/zgearauto5m-head.txt
+?? scratch/wave2/zgearauto5m720-build.log
+?? scratch/wave2/zgearauto5m720-head.txt
+?? scratch/wave2/zgearforced-ab-1.err
+?? scratch/wave2/zgearforced-ab-1.out
+?? scratch/wave2/zgearforced-ab-2.err
+?? scratch/wave2/zgearforced-ab-2.out
+?? scratch/wave2/zgearforced-build.log
+?? scratch/wave2/zgearforced-head.txt
+2026-10-26T03:12:10Z
