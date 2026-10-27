@@ -606,10 +606,13 @@ user's call.
   `supdb-cache64tofitzpagesrecodedrop`: it finds the fit (about 480 MiB of
   form, no fault) but spends it on the uniform read pass, so it reads level
   with the drop arm and behind hot8+drop in C, B, E; a build during a mix
-  costs the durable commits the device flush of its ~30 MiB. **Next**: a
-  heat that outlives a pass (decayed), the raw-tailed partitions' heat as
-  their group opens priced at a decode, a swap between the two, priced at
-  `--ops-div 1` beside hot8+drop.
+  costs the durable commits the device flush of its ~30 MiB. The second
+  version (decayed heat, raw-tailed heat by `ZFile::opens16`, swaps, the
+  coldest given back) at `--ops-div 1`: the mixes grow the process ~150 MiB
+  past the forms' room, both arms fault, and the policy gives all its raw
+  tails back -- D 1.12-1.24x and E 1.10-1.18x of hot8+drop, B and C
+  0.80-0.99x. The way back pays; the way in follows whatever pass runs.
+  The line rests there: a heat kept across restarts is the shape it needs.
 - **Where E's time is, by the arm pair's profile at the head**: the LZ4
   decode 25% of the thread (147,000 groups a pass, 2.5 a form walk, nearly
   every one a memo miss, since the form walks are the Zipfian's cold tail),

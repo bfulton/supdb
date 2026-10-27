@@ -1890,6 +1890,12 @@ pub(super) struct ZFile {
     /// alike -- the first partition's decodes at five million keys were
     /// worth 0.13 µs each to a raw tail, the next three's 1.4.
     pub(super) decode_ns16: AtomicU64,
+    /// The record-coded groups opened without a decode -- a point read's
+    /// record, a seek over the heads, a walk in place -- counted in
+    /// sixteens per thread where the decodes are timed: a raw-tailed form
+    /// file decodes nothing, so its heat is the groups it opens, priced at
+    /// what a decode costs (`Options::zpages_recode`).
+    pub(super) opens16: AtomicU64,
     /// The counted decodes are timed (`Options::zpages_recode`).
     pub(super) time_decodes: bool,
     /// The sampled pages' groups are record-coded ([`ZCODING_RECORD`]):
@@ -2044,6 +2050,7 @@ impl ZFile {
             damaged: AtomicBool::new(false),
             decodes16: AtomicU64::new(0),
             decode_ns16: AtomicU64::new(0),
+            opens16: AtomicU64::new(0),
             time_decodes: false,
             coded: false,
             id: NEXT_ZSIDE_ID.fetch_add(1, Ordering::Relaxed),
@@ -2205,6 +2212,7 @@ impl ZFile {
                             }
                         }
                     }
+                    self.count_open();
                     return Some((
                         Opened::Coded(payload),
                         usize::from(g.first),
@@ -2484,6 +2492,7 @@ impl ZFile {
                     return Locate::Fallback;
                 };
                 let count = usize::from(g.count);
+                self.count_open();
                 let pos = match record_group_seek(payload, count, key) {
                     Ok(pos) => pos,
                     Err(_) => {
@@ -2987,6 +2996,7 @@ impl ZFile {
                         }
                     }
                 }
+                self.count_open();
                 return match record_group_seek(payload, usize::from(g.count), key) {
                     Ok(pos) => ZSeek::Served {
                         rank: first + usize::from(g.first) + pos.index,
@@ -3167,6 +3177,25 @@ impl ZFile {
         if let Some(t0) = tick.1 {
             let ns = t0.elapsed().as_nanos().min(u64::MAX as u128) as u64;
             self.decode_ns16.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    /// A record-coded group opened without a decode, counted once in
+    /// sixteen per thread where the decodes are timed (`ZFile::opens16`).
+    fn count_open(&self) {
+        if !self.time_decodes {
+            return;
+        }
+        thread_local! {
+            static TICK: Cell<u32> = const { Cell::new(0) };
+        }
+        let due = TICK.with(|t| {
+            let v = t.get().wrapping_add(1);
+            t.set(v);
+            v % 16 == 0
+        });
+        if due {
+            self.opens16.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -4312,7 +4341,9 @@ impl ZInject {
     }
 
     /// The decode of a page the sampler prices the compact form by, in
-    /// place of the one it times.
+    /// place of the one it times; and the decode the re-code policy prices
+    /// a form file's decodes at, in place of the time they took
+    /// (`Options::zpages_recode`).
     pub fn set_decode_cost(&self, d: Duration) {
         let ns = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX).max(1);
         self.decode_cost_ns.store(ns, Ordering::Release);

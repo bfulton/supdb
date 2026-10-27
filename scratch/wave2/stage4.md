@@ -3598,3 +3598,38 @@ opens, priced at what they would cost decoded. A build is not free to the
 writer either: its bytes are a device flush the durable commits pay. The
 suite's scale gives a policy a few looks in the mixes, so it is priced on
 a longer shape (`--ops-div 1`) next, beside the key-order bound.
+
+Its second version (`zrecode2hot8-ab-{1,2}`): a partition's heat kept by
+its name and decayed over ten seconds; a raw-tailed form file's heat its
+record-coded groups opened without a decode, counted one in sixteen per
+thread (`ZFile::opens16`) and priced at the block-coded files' mean
+decode; with no room, the coldest raw-tailed partition given back to make
+it when the hottest block-coded one is twice as hot; over the refault
+floor, the coldest given back. `tests/zpages.rs` holds the swap: room for
+one raw-tailed partition, the first heated re-coded, the heat moved to
+another, the first given back and the second re-coded into its room, every
+read and scan right. Priced at `--ops-div 1` (ten times the operations, a
+read pass of some forty seconds and mixes of several each) against hot8
+with the drop; the pairing against the drop arm was stopped by the
+session's limit on a background run in its first sitting
+(`zrecode2drop-ab-1.err`, no table). At that scale the mixes' writes grow
+the process's anonymous bytes by about 150 MiB, the budget falling from 472
+MiB to 315, below the LZ4 form's 373, and both arms fault in A, D, E and F.
+The policy re-coded eight partitions a rep in the read pass, the decay no
+longer than the pass, and gave all eight back as the refaults rose to
+3,000-8,700 a second in the mixes, ending at the LZ4 form. Against hot8
+with the drop, whose raw tails stay: D 1.24 and 1.12x, E 1.18 and 1.10x,
+on fewer faults (D 0.079-0.089 an operation against 0.129-0.134, E
+0.025-0.029 against 0.057-0.064); B 0.99 and 0.81, C 0.97 and 0.80, where
+nothing faults and hot8's raw tails serve the Zipfian head; A and F by the
+sitting's sign, the read pass level.
+
+What the second version says. The way back is worth having: when the
+process grows into the room the forms had, giving the raw tails back takes
+faults off the mixes that a static choice keeps. The way in follows
+whatever pass is running, and the suite's passes, a uniform one first and
+the Zipfian mixes after, each outlast any decay short enough to follow the
+next, while a build cycle costs seconds and a device flush to the writer.
+The key-order arms bound what the way in could win; a store whose hot set
+holds still is the shape it needs, which a heat kept across the store's
+restarts would give it at its build, and the suite does not run.
