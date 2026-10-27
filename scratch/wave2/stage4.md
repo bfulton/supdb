@@ -3679,3 +3679,74 @@ and 2.76x, D 1.74 and 2.32x, C 1.73 and 1.62x -- hot8 with the drop faulting
 nowhere, LMDB 0.04-0.05 a read, 0.13-0.16 a scan and 0.013-0.015 in E. A
 cell read against a comparator is read with the counters off; the counters
 lines are for pairings of supdb arms, which carry the timers alike.
+
+## E's overlay with the timers off: what it is made of, and the two questions it leaves
+
+Profiled again with no instrument on either side (`prof/profile-e-from-d.sh`:
+perf attached at ycsb-D's start so that it is running when E begins -- attached
+at E's own start it took 646 samples of a window of 1.3 s -- and the
+counters' variable unset, so the scan timers are off; hot8 with the drop
+beside LMDB at five million keys under 640 MiB, three windows an arm,
+`prof/ycsb-E-hot8drop-notimers.txt`, `prof/ycsb-E-lmdb-hot8notimers.txt`):
+E's thread 5,142 samples against LMDB's 4,028, the rate 0.73x LMDB's with
+perf on both (LMDB faulting 0.0125 an operation). The overlay of the mixes'
+unsealed writes is 17.8% of the thread: the settle that files them
+(`settle_pending`, 7.2%) and the block builds over them (`materialize`,
+10.7%, of which `deltas_for` 6.6%). Under each, no leaf passes 1.5% of the
+thread: the cursor's placing of each key (`ZFence::entry_of_from`,
+`ZCursor::open_at`, the record parse), the compares, the memtable's chunks
+asked ahead, the sort, the lazy filing's fence and page views -- a fixed
+set of per-key and per-block work, none of it a lever by itself. Take the
+overlay away and the thread is 4,226 samples against LMDB's 4,028: the
+overlay is E's gap. It is the work a B-tree does at the write, and the
+suite's E inherits it from A, F and D, whose commits do not file it (their
+writes are 1.8% of the store, under the backlog bound's 2%, and no scan
+runs between them).
+
+Two experiments follow from it, both arms. Filing at every commit near reads
+(`Options::forms_settle_every`, `supdb-cache64tofitzpageshot8dropsettleevery`):
+priced in core it cost A and F a third, while the writer was CPU-bound; here
+A's and F's commits are durable and lend their batch to the upkeep thread
+through the fsync, so the question is whether the filing hides in that wait.
+And keeping the form file a re-code replaced (`Options::zpages_recode_keep`,
+`supdb-cache64tofitzpagesrecodekeepdrop`): every re-code of a partition
+after its first is the two files exchanged in the cell, the incoming one's
+pages asked for in windows of the device's largest request and the outgoing
+one's dropped, with no build -- the cost that sank the second version's way
+back, which rebuilt the LZ4 files inside the faulting mixes.
+
+Settle-every against hot8 with the drop (`zsettleevery-ab-{1,2}`, both orders,
+six pairs a sitting with the warmup, the counters on for both): the commits
+filed (E's settle phase 39 ms to none, the upkeep thread 64-80 ms a mix in A
+and F against 1), and the cost came back where the in-core pricing put it.
+F read 0.96 and 0.88 of the arm without it, its commits 0.92 and 0.88, slower
+in nine and ten pairs of twelve; D 0.95 and 0.93 in both sittings; A level;
+and E's scans 1.01 and 1.04, its total level -- the filing E no longer did
+was spent on its walk, and E still built every one of its 24,007 blocks,
+since a settle patches only the blocks a scan has formed and the update
+mixes' Zipfian head is mostly blocks none has. Hiding the work behind the
+fsync does not hide its cost: the thread re-reads the entries the writer is
+rewriting, the ownership tax `CLAUDE.md` names, and a durable commit pays it
+as a buffered one does. Refuted as it stands.
+
+The blocks built by the commits that dirty them (`Options::forms_settle_builds`,
+with `forms_settle_every`; `supdb-cache64tofitzpageshot8dropsettlebuilds`):
+the settle remembers each block it filed a write into that held no form, and
+the commit's fill, once the snapshot has moved, builds those as a scan's first
+walk would and sheds to the budget -- the fill's own `complete_forms` is
+skipped under any cache budget, which every forced arm runs with, so without
+this the update mixes left E every block to build. Two pairings against hot8
+with the drop (`zsettlebuilds-ab-{1,2}`, `zsettlebuilds2-ab-{1,2}`, both
+orders, the counters on for both): E 1.17, 1.12, 1.07 and 1.10 by sitting,
+its scans faster in 17 pairs of 24, its settle phase gone and its blocks built 14,811
+against 24,007, the upkeep thread building 9,515 forms in A, 6,420 in F and
+1,627 in B; A 1.01-1.13, F 1.04-1.18, D 0.98-1.09, C 0.97-1.04 -- no
+sitting slower past its spread -- and B 0.86, 0.99, 1.06 and 1.21, either
+side; no major fault in any pass for either arm. Why the write mixes read
+level where filing alone cost F and D a tenth is not established: the
+filing's re-reads are the same, and the forms built beside them are patched
+by the writes after in place of being met unbuilt by the next write's
+settle; the cells read level in four sittings and are read as that. Not
+priced in core or on the shipping arms, where the fill builds every
+overlaid block at the backlog bound already (no budget) and the in-core
+pricing of filing at every commit cost A and F a third.

@@ -7384,6 +7384,15 @@ fn codings(db: &Db) -> Vec<bool> {
 /// raw pages dropped and every read decoding (no memo), its budget and its
 /// refaults the seam's: loaded, settled, and looked at once.
 fn recode_store(name: &str, budget: u64) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>) {
+    recode_store_with(name, budget, |_| {})
+}
+
+/// `recode_store` with `extra` applied to its options.
+fn recode_store_with(
+    name: &str,
+    budget: u64,
+    extra: impl FnOnce(&mut Options),
+) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>) {
     let dir = scratch(name);
     let inject = std::sync::Arc::new(supdb::ZInject::new());
     inject.set_budget(budget);
@@ -7402,6 +7411,7 @@ fn recode_store(name: &str, budget: u64) -> (PathBuf, Db, Model, std::sync::Arc<
             o.zpages_recode = true;
             o.zpages_memo = false;
             o.zpages_inject = Some(inject.clone());
+            extra(o);
         }),
     )
     .unwrap();
@@ -7491,6 +7501,103 @@ fn the_partition_whose_decodes_cost_most_is_recoded_while_it_serves() {
     assert_eq!(c.fallbacks, 0, "no read fell back to the raw form: {c:?}");
     check(&db, &model, &keys, "re-coded again");
     check_scan(&db, &model, "re-coded again");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_kept_form_file_makes_every_later_recode_an_exchange() {
+    // Under `Options::zpages_recode_keep` the form file a re-code replaced
+    // stays attached beside the served one: the partition's first re-code
+    // is a build, and its give-back and its re-code after the hold are the
+    // two files exchanged in the cell, no build started, the kept file
+    // read by nothing, and every read, count and scan answering as the raw
+    // form does across each exchange.
+    let (dir, db, model, inject) =
+        recode_store_with("recode-keep", 1 << 40, |o| o.zpages_recode_keep = true);
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let hot = keys_of_partition(&db, &model, 2);
+    heat_up(&db, &hot, 20_000);
+    recode_look(&db, std::time::Duration::from_secs(1));
+    assert!(
+        recode_until(&db, |c| c.recodes >= 1),
+        "the hot partition re-coded: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.recode_flips, c.spare_files),
+        (0, 1),
+        "the first re-code a build, the block-coded file kept: {c:?}"
+    );
+    let built = c.build_starts;
+    let coded = codings(&db);
+    assert!(
+        coded[2] && coded.iter().filter(|c| **c).count() == 1,
+        "the hot partition alone raw-tailed: {coded:?}"
+    );
+    check(&db, &model, &keys, "re-coded, kept");
+    check_scan(&db, &model, "re-coded, kept");
+    // Over the refault floor: given back by the exchange, at the look.
+    inject.set_refault_rate(1000.0);
+    recode_look(&db, std::time::Duration::from_secs(1));
+    let c = db.zpage_counts();
+    assert_eq!(
+        (
+            c.recodes_back,
+            c.recode_flips,
+            c.build_starts,
+            c.spare_files
+        ),
+        (1, 1, built, 1),
+        "given back without a build: {c:?}"
+    );
+    assert!(
+        codings(&db).iter().all(|c| !c),
+        "the partition served block-coded: {:?}",
+        codings(&db)
+    );
+    check(&db, &model, &keys, "given back, kept");
+    check_scan(&db, &model, "given back, kept");
+    // The hold past and hot again: re-coded by the exchange.
+    inject.set_refault_rate(0.0);
+    recode_look(&db, std::time::Duration::from_secs(61));
+    heat_up(&db, &hot, 20_000);
+    recode_look(&db, std::time::Duration::from_secs(1));
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.recodes, c.recode_flips, c.build_starts, c.spare_files),
+        (2, 2, built, 1),
+        "re-coded again without a build: {c:?}"
+    );
+    assert!(codings(&db)[2], "raw-tailed again: {:?}", codings(&db));
+    assert_eq!(c.recode_failed, 0, "{c:?}");
+    assert_eq!(c.fallbacks, 0, "no read fell back to the raw form: {c:?}");
+    check(&db, &model, &keys, "re-coded again, kept");
+    check_scan(&db, &model, "re-coded again, kept");
+    db.close().unwrap();
+    // A reopen serves the coding that holds the name, the last one built,
+    // and keeps nothing.
+    let mut db = Db::open(
+        &dir,
+        forced(|o| {
+            o.partition_bytes = Some(160 << 10);
+            o.zpages_drop_raw = true;
+            o.zpages_recode = true;
+            o.zpages_recode_keep = true;
+            o.zpages_memo = false;
+        }),
+    )
+    .unwrap();
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert_eq!(c.spare_files, 0, "nothing kept across the reopen: {c:?}");
+    assert!(
+        codings(&db)[2],
+        "the name's coding served: {:?}",
+        codings(&db)
+    );
+    check(&db, &model, &keys, "reopened");
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

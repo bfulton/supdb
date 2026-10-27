@@ -44,6 +44,9 @@
 //!   memo-first ask on, each with a chance of 15%.
 //! - `ZFUZZ_SHAPES`: the key shapes a seed may draw from, as indexes from 0
 //!   to 7 separated by commas.
+//! - `ZFUZZ_SETTLEBUILDS=1`: the `z` store's commits near reads file their
+//!   batches and build the blocks they filed into, under a small cache
+//!   budget (`Options::forms_settle_every`, `forms_settle_builds`).
 //! - `ZFUZZ_NOPUT`, `ZFUZZ_NOBURST`: set, no puts, or no ordered bursts.
 //! - `ZFUZZ_SEEDKEY=1`: the store's first write is a key of its own, and
 //!   one goes ahead of every write of the empty key, so that no write of
@@ -291,6 +294,20 @@ fn opts_z(c: &Cfg) -> Options {
     // cache sheds under a small budget (`Options::zpages_promote_copies`),
     // so the copies, the sheds and the writes spliced into copies are read
     // against the raw store over the same writes.
+    // Under `ZFUZZ_SETTLEBUILDS` every commit near reads files its batch
+    // and builds the blocks it filed into that held no form
+    // (`Options::forms_settle_every`, `forms_settle_builds`), under a
+    // budget small enough to shed, so the forms the commits build, the
+    // patches on them and the sheds are read against the raw store. Set,
+    // not drawn: every seed's stream stays as it was.
+    if env_flag("ZFUZZ_SETTLEBUILDS") {
+        o.forms_settle_every = true;
+        o.forms_settle_builds = true;
+        if c.cache {
+            o.scan_cache_bytes = 64 << 10;
+            o.forms_to_fit = true;
+        }
+    }
     if env_flag("ZFUZZ_PROMOTE") && c.cache {
         o.promote_entries = 8;
         o.zpages_promote_copies = true;

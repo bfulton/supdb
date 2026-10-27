@@ -550,6 +550,13 @@ pub struct ZCounts {
     pub recodes_back: u64,
     pub recode_failed: u64,
     pub recode_looks: u64,
+    /// Re-codes made by exchanging the served form file with the kept one
+    /// (`Options::zpages_recode_keep`), counted among `recodes` and
+    /// `recodes_back` by the coding they served; the kept form files now,
+    /// and their bytes on disk.
+    pub recode_flips: u64,
+    pub spare_files: u64,
+    pub spare_bytes: u64,
     /// The partitions whose raw pages were dropped at their form file's
     /// install (`Options::zpages_drop_raw`).
     pub raw_dropped: u64,
@@ -1323,6 +1330,16 @@ pub struct Options {
     /// store whose raw pages go (`zpages_drop_raw`). Off.
     #[doc(hidden)]
     pub zpages_recode: bool,
+    /// EXPERIMENT: with `zpages_recode`, a partition keeps the form file a
+    /// re-code replaced, attached and unserved beside the one it serves, so
+    /// that every re-code of the partition after its first is the two
+    /// exchanged in the cell -- no build, no bytes written, no device flush
+    /// for the durable commits beside it -- with the incoming file's pages
+    /// asked for and the outgoing one's dropped from the cache. The kept
+    /// file has no name once the build's rename replaced it, and goes with
+    /// the segment; a reopen serves whichever coding holds the name. Off.
+    #[doc(hidden)]
+    pub zpages_recode_keep: bool,
     /// EXPERIMENT: under `ZPages::Auto`, the coding the form files are built
     /// in is the selector's to choose (`zselect::choose_coding`): the sampler
     /// sizes the record coding with raw tails beside the block coding, and
@@ -1879,6 +1896,41 @@ pub struct Options {
     /// after a tenth of the store rewritten was at half of LMDB either
     /// way this engine charged it to the reads.
     pub forms_settle_backlog_pct: usize,
+    /// EXPERIMENT: a commit near reads (`reads_around`: a scan in the
+    /// store's life and no more than two stores' worth of writes since)
+    /// settles its batch into the forms whatever the backlog, as if
+    /// `forms_settle_backlog_pct` were one write. The writes of a mix with
+    /// no scan between its commits are then filed, and their blocks' forms
+    /// built, by the commits that make them -- on the upkeep thread through
+    /// a durable commit's fsync -- instead of by the first scans after the
+    /// mix, which is what a B-tree pays at the write: out of core the
+    /// suite's ycsb-E inherits the update mixes' 49,000 keys and files and
+    /// builds over them in its first scans, a sixth of its thread. Alone
+    /// it moves only the filing: a settle patches the blocks a scan has
+    /// formed and the update mixes' Zipfian head is mostly blocks none
+    /// has, so E builds as many blocks as before, and at five million keys
+    /// under 640 MiB its scans read 1.01-1.04x while F read 0.88-0.96x and
+    /// D 0.93-0.95x in both sittings, the thread re-reading entries the
+    /// writer is rewriting. With `forms_settle_builds` it is the shape that
+    /// pays. Off.
+    #[doc(hidden)]
+    pub forms_settle_every: bool,
+    /// EXPERIMENT: the commit's fill builds a form for every block its
+    /// settle filed a write into that held none, as the scan that first
+    /// walks the block would, under the cache's budget: with
+    /// `forms_settle_every` the update mixes' blocks then hold their forms
+    /// before ycsb-E's first scan, which otherwise builds them -- a tenth
+    /// of its thread at five million keys under 640 MiB, where the settle
+    /// patches only the blocks a scan has formed, and the update mixes'
+    /// Zipfian head is mostly blocks none has. Paired with
+    /// `forms_settle_every` on the forced form with the first eight
+    /// partitions raw-tailed and the raw pages dropped, at five million
+    /// keys under 640 MiB in four sittings: E 1.07-1.17x in every one, its
+    /// settle phase gone and its blocks built down from 24,000 to 15,000,
+    /// with A, C, D and F level or faster and B either side by sitting;
+    /// nothing faulted. Not priced in core or on the shipping arms. Off.
+    #[doc(hidden)]
+    pub forms_settle_builds: bool,
     /// Take the store's keys for `forms_settle_backlog_pct` and
     /// `forms_settle_recent_pct` as every live segment's (`true`, as they
     /// were) rather than the partitions'. A level-0 piece sealed from a
@@ -2835,6 +2887,7 @@ impl Default for Options {
             zpages_raw_tails_first: 0,
             zpages_drop_raw: false,
             zpages_recode: false,
+            zpages_recode_keep: false,
             zpages_coding_auto: false,
             zpages_inplace_walk: true,
             zpages_build_eager: false,
@@ -2873,6 +2926,8 @@ impl Default for Options {
             forms_publish_lazily: true,
             forms_max_unsealed_pct: 0,
             forms_settle_backlog_pct: 2,
+            forms_settle_every: false,
+            forms_settle_builds: false,
             forms_settle_keys_all: false,
             upkeep: Upkeep::default(),
             upkeep_lag_pct: 0,
@@ -3658,6 +3713,12 @@ fn z_retire_cell(shared: &Shared, dir: &Path, seg: &Seg) -> Option<PathBuf> {
     }
     let tag = shared.readers.bump();
     shared.retired_z.push(tag, RetiredZ(p));
+    // The kept form file goes with the served one: it was served once, and
+    // a reader pinned then may still be walking it.
+    let k = seg.z_spare.take();
+    if !k.is_null() {
+        shared.retired_z.push(tag, RetiredZ(k));
+    }
     shared.retired_z.sweep(|low| shared.readers.oldest_for(low));
     let (id, end) = (Db::name_id(&seg.name)?, Db::name_end_seq(&seg.name)?);
     let n = shared.next_dead.fetch_add(1, AtomicOrdering::Relaxed);
@@ -3815,6 +3876,12 @@ struct Seg {
     /// with an empty cell, and its reads go to the raw form until the
     /// form file is attached again.
     z: zfile::ZCell,
+    /// The form file a re-code took out of `z`, in the other coding, kept
+    /// attached and unserved (`Options::zpages_recode_keep`): the next
+    /// re-code of the partition exchanges the two (`ZCell::flip`). Read by
+    /// no reader but one that loaded it while it served, changed only by
+    /// the segment work's thread, and freed with the segment.
+    z_spare: zfile::ZCell,
     /// Why a partition was given no form file, for the life of the segment,
     /// as `zfile::Decline::code` numbers the reasons (`zfile::DECLINED_FAILED`
     /// a build that failed), or zero: what keeps a settle from looking
@@ -6884,6 +6951,7 @@ impl Seg {
                 tombs,
                 data,
                 z: zfile::ZCell::new(),
+                z_spare: zfile::ZCell::new(),
                 z_declined: std::sync::atomic::AtomicU8::new(0),
                 z_rebuilds: std::sync::atomic::AtomicU8::new(0),
                 z_retry: std::sync::Mutex::new(None),
@@ -6924,6 +6992,7 @@ impl Seg {
                 tombs: false,
                 data,
                 z: zfile::ZCell::new(),
+                z_spare: zfile::ZCell::new(),
                 z_declined: std::sync::atomic::AtomicU8::new(0),
                 z_rebuilds: std::sync::atomic::AtomicU8::new(0),
                 z_retry: std::sync::Mutex::new(None),
@@ -6956,6 +7025,7 @@ impl Seg {
             tombs,
             data,
             z: zfile::ZCell::new(),
+            z_spare: zfile::ZCell::new(),
             z_declined: std::sync::atomic::AtomicU8::new(0),
             z_rebuilds: std::sync::atomic::AtomicU8::new(0),
             z_retry: std::sync::Mutex::new(None),
@@ -13344,6 +13414,12 @@ struct FormsState {
     /// backlog's density: settles, keys, blocks those keys fall in, and
     /// blocks at or past `Options::forms_settle_rebuild_from`.
     settle_density: std::cell::Cell<[u64; 4]>,
+    /// The blocks the last settle filed a write into that held no form
+    /// (`Options::forms_settle_builds`): built by the commit's fill after
+    /// the snapshot has moved.
+    settle_blocks: std::cell::RefCell<Vec<(u32, u32)>>,
+    /// Forms the fill built for those blocks, over the store's life.
+    settle_built: std::cell::Cell<u64>,
     /// Whether this fill may rebuild a dense sparse form as a copy, and
     /// the store's scan count at the fill before, which says whether
     /// anything has read since (`Options::forms_convert_unread`).
@@ -13452,6 +13528,8 @@ impl FormsState {
             log_short: std::cell::Cell::new(false),
             lazy_scans: std::cell::Cell::new([0; 2]),
             settle_density: std::cell::Cell::new([0; 4]),
+            settle_blocks: std::cell::RefCell::new(Vec::new()),
+            settle_built: std::cell::Cell::new(0),
             convert_dense: std::cell::Cell::new(true),
             convert_life: std::cell::Cell::new(u64::MAX),
             built: std::cell::RefCell::new(Vec::new()),
@@ -16316,6 +16394,7 @@ impl Reader {
             recodes_back: get(&ev.recodes_back),
             recode_failed: get(&ev.recode_failed),
             recode_looks: get(&ev.recode_looks),
+            recode_flips: get(&ev.recode_flips),
             raw_dropped: get(&ev.raw_dropped),
             sel_samples: get(&ev.sel_samples),
             sel_builds: get(&ev.sel_builds),
@@ -16346,6 +16425,11 @@ impl Reader {
                 c.resident_bytes += z.resident_bytes() as u64;
                 c.file_bytes += z.file_bytes();
                 c.group_bytes += z.group_bytes();
+                if let Some(k) = seg.z_spare.get() {
+                    c.spare_files += 1;
+                    c.spare_bytes += k.file_bytes();
+                    c.resident_bytes += k.resident_bytes() as u64;
+                }
             } else if seg.z_declined.load(AtomicOrdering::Relaxed) == zfile::DECLINED_SMALL {
                 c.small_partitions += 1;
             }
@@ -19536,7 +19620,9 @@ impl Reader {
         // The bound is a share of the store's keys and not a count, for
         // the reason the seal cap's floor is: a count that is free at one
         // rung is five settles at the next.
-        let bound = if self.opts.forms_settle_backlog_pct == 0 {
+        let bound = if self.opts.forms_settle_every {
+            1
+        } else if self.opts.forms_settle_backlog_pct == 0 {
             usize::MAX
         } else {
             (keys / 100 * self.opts.forms_settle_backlog_pct).max(1)
@@ -19659,6 +19745,10 @@ impl Reader {
             let cache = self.fs().scan_keys.borrow();
             let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
             self.install_ahead(unsealed)?;
+            if moved && self.opts.forms_settle_builds {
+                let blocks = std::mem::take(&mut *self.fs().settle_blocks.borrow_mut());
+                self.build_settled(&blocks, unsealed)?;
+            }
         }
         // A form for every overlaid block, once per state: from here on
         // the writer builds one for any block a write lands in, so a
@@ -19707,6 +19797,51 @@ impl Reader {
                 self.mem().committed_log().min(self.log_bound.get()),
                 AtomicOrdering::Release,
             );
+        }
+        Ok(())
+    }
+
+    /// The blocks the settle filed into that held no form, built as a
+    /// scan's first walk would build them and counted against the cache's
+    /// budget (`Options::forms_settle_builds`). A block a scan or an
+    /// earlier build has formed since, or with nothing over it now, is
+    /// left; the table's completeness is not claimed, since the blocks no
+    /// write landed in are as they were.
+    fn build_settled(&self, blocks: &[(u32, u32)], unsealed: &Snapshot) -> Result<()> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        let np = self.segs().partition_point(|s| s.level > 0);
+        let l0 = &self.segs()[np..];
+        let ctx = self.build_ctx();
+        ctx.rank_pieces()?;
+        for &(pi, b) in blocks {
+            let (pi, b) = (pi as usize, b as usize);
+            if pi >= np {
+                continue;
+            }
+            let seg = &self.segs()[pi];
+            let tables = self.fs().tables.borrow();
+            let mut held = tables[pi].borrow_mut();
+            let Some(table) = held.as_mut() else { continue };
+            if table.snap_gen != self.fs().snap_gen.get() {
+                table.resnap(seg, unsealed, self.fs().snap_gen.get());
+            }
+            if b >= table.slots.len()
+                || table.slots[b].is_some()
+                || BuildCtx::overlay_count(table, b) == 0
+            {
+                continue;
+            }
+            table.snap_at(self, seg, unsealed)?;
+            let src = Sources { seg, l0 };
+            let built = self.share_form(ctx.materialize(src, table, b, unsealed)?);
+            self.count_built_kind(&built);
+            let bytes = self.fbytes(&built);
+            table.slots[b] = Some(built);
+            self.list_built_bytes(pi, b, table, bytes);
+            self.shed(pi, b, table);
+            self.fs().settle_built.set(self.fs().settle_built.get() + 1);
         }
         Ok(())
     }
@@ -20044,6 +20179,7 @@ impl Reader {
     /// times costs one seek, the created one's record first so the flag
     /// survives the fold.
     fn settle_pending(&self) -> Result<()> {
+        self.fs().settle_blocks.borrow_mut().clear();
         // The writes read from tables frozen since, first: each through
         // the table it was read from, which a freeze or a landing has
         // taken out of the live slot but not out of the sources a patch
@@ -20363,6 +20499,17 @@ impl Reader {
                     list.push((slot, cut));
                     table.filed += 1;
                 }
+            }
+            // A block the settle filed into and nothing formed, for the
+            // fill to build (`Options::forms_settle_builds`).
+            if self.opts.forms_settle_builds
+                && i + 1 == group_end
+                && table.slots.get(b).is_some_and(|s| s.is_none())
+            {
+                self.fs()
+                    .settle_blocks
+                    .borrow_mut()
+                    .push((at as u32, b as u32));
             }
             // Only a build chooses the wide form, and a patched block is
             // never rebuilt: past the bound, the block is dropped so the
@@ -25761,6 +25908,14 @@ impl Db {
     pub fn settle_density(&self) -> [u64; 4] {
         self.take_back_upkeep();
         self.r.fs().settle_density.get()
+    }
+
+    /// Forms the commits' fills built for blocks their settles filed into
+    /// that held none (`Options::forms_settle_builds`), over the store's
+    /// life.
+    pub fn settle_built(&self) -> u64 {
+        self.take_back_upkeep();
+        self.r.fs().settle_built.get()
     }
 
     /// The writer's own scans whose first block was a copy walked with the
@@ -33748,9 +33903,12 @@ impl Maint {
             .min_by(|a, b| a.heat.total_cmp(&b.heat));
         if refault_rate > RECODE_REFAULTS {
             let ceiling = match coldest_raw {
-                Some(p) => total
-                    .saturating_sub(p.bytes)
-                    .saturating_add((p.records as f64 * block_ratio) as u64),
+                Some(p) => total.saturating_sub(p.bytes).saturating_add(
+                    p.seg
+                        .z_spare
+                        .get()
+                        .map_or((p.records as f64 * block_ratio) as u64, |k| k.file_bytes()),
+                ),
                 None => total,
             };
             self.z_recode_ceiling = Some((ceiling, now));
@@ -33759,7 +33917,7 @@ impl Maint {
             }
             if let Some(p) = coldest_raw {
                 let seg = p.seg.clone();
-                self.z_start(seg, ZKind::Recode, false);
+                self.z_recode(seg);
             }
             return;
         }
@@ -33782,14 +33940,19 @@ impl Maint {
             }
             return;
         }
-        let extra = ((p.records as f64 * raw_ratio) as u64).saturating_sub(p.bytes);
+        // The raw tails' extra: the kept file's own bytes where the
+        // partition keeps one, else the estimate.
+        let extra = match p.seg.z_spare.get() {
+            Some(k) => k.file_bytes().saturating_sub(p.bytes),
+            None => ((p.records as f64 * raw_ratio) as u64).saturating_sub(p.bytes),
+        };
         let limit = self.z_recode_ceiling.map_or(budget, |(c, _)| c.min(budget));
         if total.saturating_add(extra) <= limit {
             if self.z_trace {
                 trace("raw", Some(p), self.z_recode_ceiling.map(|c| c.0));
             }
             let seg = p.seg.clone();
-            self.z_start(seg, ZKind::Recode, false);
+            self.z_recode(seg);
             return;
         }
         // No room: made by the coldest raw-tailed partition where the
@@ -33802,7 +33965,7 @@ impl Maint {
                     trace("swap", Some(q), self.z_recode_ceiling.map(|c| c.0));
                 }
                 let seg = q.seg.clone();
-                self.z_start(seg, ZKind::Recode, false);
+                self.z_recode(seg);
             }
             _ => {
                 if self.z_trace {
@@ -33810,6 +33973,41 @@ impl Maint {
                 }
             }
         }
+    }
+
+    /// `seg` re-coded: its kept form file exchanged with the served one
+    /// where it keeps one (`Options::zpages_recode_keep`) -- the incoming
+    /// file's pages asked for and the outgoing one's dropped, no build --
+    /// else built again in the other coding (`ZKind::Recode`).
+    fn z_recode(&mut self, seg: std::sync::Arc<Seg>) {
+        let shared = self.shared.clone();
+        let ev = &shared.z;
+        // A kept file a check failed in while it served is retired, not
+        // put back: the partition is built again instead.
+        if seg.z_spare.get().is_some_and(|k| k.damaged()) {
+            let k = seg.z_spare.take();
+            let tag = shared.readers.bump();
+            shared.retired_z.push(tag, RetiredZ(k));
+            shared.retired_z.sweep(|low| shared.readers.oldest_for(low));
+        }
+        if seg.z.flip(&seg.z_spare) {
+            // Both live while the segment does, and the kept one is this
+            // thread's alone.
+            if let Some(k) = seg.z_spare.get() {
+                k.drop_cache();
+            }
+            if let Some(z) = seg.z.get() {
+                z.prefetch_all();
+                if z.coded() {
+                    zfile::ZEvents::add(&ev.recodes, 1);
+                } else {
+                    zfile::ZEvents::add(&ev.recodes_back, 1);
+                }
+            }
+            zfile::ZEvents::add(&ev.recode_flips, 1);
+            return;
+        }
+        self.z_start(seg, ZKind::Recode, false);
     }
 
     /// The controller's clock: the injected one where a test has moved it,
@@ -34905,7 +35103,18 @@ impl Maint {
                         side.inplace = self.opts.zpages_inplace_walk;
                         side.time_decodes = self.opts.zpages_recode;
                         let coded = side.coded();
-                        let old = target.z.replace(side);
+                        let mut old = target.z.replace(side);
+                        // Kept where the option keeps it, its pages dropped,
+                        // and whatever the cell kept before retired in its
+                        // place: a build starts only where none is kept.
+                        if self.opts.zpages_recode_keep && !old.is_null() {
+                            // SAFETY: the form file just taken out of
+                            // service, alive until retired or freed with
+                            // the segment; the cell of kept files is this
+                            // thread's alone.
+                            unsafe { &*old }.drop_cache();
+                            old = target.z_spare.keep(old);
+                        }
                         if !old.is_null() {
                             let tag = shared.readers.bump();
                             shared.retired_z.push(tag, RetiredZ(old));

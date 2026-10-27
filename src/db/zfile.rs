@@ -77,6 +77,11 @@ const ZWRITE_PIECE: usize = 1 << 20;
 /// The window of the raw records the build drops behind itself.
 const ZDROP_WINDOW: usize = 8 << 20;
 
+/// The window a kept form file put back in service is asked for in
+/// (`ZFile::prefetch_all`): the device's largest request here
+/// (`max_sectors_kb`), which is what the kernel submits of one advice.
+const ZPREFETCH_WINDOW: usize = 4 << 20;
+
 /// Pages whose checksums an attach reads: the first, the last and the ones
 /// evenly spaced between, sixteen faults a file, once.
 const ZSAMPLE_PAGES: usize = 16;
@@ -1856,6 +1861,12 @@ pub(super) struct ZFile {
     /// not walk this. The stage that makes scans read form files is the one
     /// to decide what their advice is in a scan phase.
     map: MmapBytes,
+    /// The file, open, for the advice a mapping cannot give: the clean
+    /// pages of a form file a re-code took out of service dropped from the
+    /// cache once its name is gone (`ZFile::drop_cache`), since a mapping's
+    /// own advice reaches only the pages it maps. `None` where it did not
+    /// open.
+    file: Option<std::fs::File>,
     /// The mapping was advised random (`ZFile::advised`).
     advised: bool,
     /// Heap copies of the resident part's tables, never evicted.
@@ -1993,6 +2004,7 @@ impl ZFile {
         if advise {
             map.advise_random();
         }
+        let file = std::fs::File::open(path).ok();
         let len = map.len();
         if len < ZTRAILER as u64 || !len.is_multiple_of(ZPAGE as u64) {
             return Err(damage(ZError::Length));
@@ -2035,6 +2047,7 @@ impl ZFile {
         let bind = bind32(id, end_seq, facts.nkeys, facts.row_crc);
         let mut zfile = ZFile {
             map,
+            file,
             advised: advise,
             fence,
             filter,
@@ -3209,6 +3222,35 @@ impl ZFile {
         self.map.len()
     }
 
+    /// This form file's pages out of the cache: the mapping's entries
+    /// dropped (`MADV_DONTNEED`), then the file's clean pages
+    /// (`POSIX_FADV_DONTNEED`), which a drop of a mapped page skips. For the
+    /// form file a re-code took out of service and kept
+    /// (`Options::zpages_recode_keep`): a reader still walking it faults the
+    /// page back, and the bytes are the same.
+    pub(super) fn drop_cache(&self) {
+        self.map.advise_dontneed();
+        if let Some(f) = &self.file {
+            super::fadvise_dontneed(f);
+        }
+    }
+
+    /// The whole file asked for in the background, a window of
+    /// `ZPREFETCH_WINDOW` at a time, since the kernel submits one request's
+    /// worth of an advice and drops the rest: the form file a re-code put
+    /// back in service, whose pages its drop took. The bytes submitted.
+    pub(super) fn prefetch_all(&self) -> u64 {
+        let len = self.map.len();
+        let mut off = 0u64;
+        let mut sent = 0u64;
+        while off < len {
+            let n = (len - off).min(ZPREFETCH_WINDOW as u64) as usize;
+            sent += self.map.advise_willneed(off, n) as u64;
+            off += n as u64;
+        }
+        sent
+    }
+
     /// The decoded bytes of every group the file holds, as its trailer says.
     pub(super) fn group_bytes(&self) -> u64 {
         self.ident.total_ulen
@@ -3325,6 +3367,29 @@ impl ZCell {
         self.p.swap(Box::into_raw(Box::new(z)), Ordering::AcqRel)
     }
 
+    /// The cell's form file and `kept`'s exchanged, where `kept` holds one:
+    /// a reader finds the old or the new, never an empty cell, and one that
+    /// loaded the old keeps it, since `kept` holds it on and frees nothing.
+    /// A cell of kept form files is never read by a reader, and only the
+    /// segment work's thread changes one, so the two stores need not be
+    /// one. Whether there was one to exchange.
+    pub(super) fn flip(&self, kept: &ZCell) -> bool {
+        let k = kept.p.load(Ordering::Acquire);
+        if k.is_null() {
+            return false;
+        }
+        let old = self.p.swap(k, Ordering::AcqRel);
+        kept.p.store(old, Ordering::Release);
+        true
+    }
+
+    /// `p`, a form file taken out of another cell, kept in this one; what
+    /// this one held is handed back for the caller to retire through the
+    /// epoch, as `take`'s is.
+    pub(super) fn keep(&self, p: *mut ZFile) -> *mut ZFile {
+        self.p.swap(p, Ordering::AcqRel)
+    }
+
     /// `z` installed if the cell is empty; whether it was.
     pub(super) fn install(&self, z: ZFile) -> bool {
         let p = Box::into_raw(Box::new(z));
@@ -3387,6 +3452,8 @@ pub(super) struct ZEvents {
     pub recode_failed: AtomicU64,
     /// The re-code policy's looks, one a period it read the heat at.
     pub recode_looks: AtomicU64,
+    /// Re-codes made by exchanging the served form file with the kept one.
+    pub recode_flips: AtomicU64,
     /// Builds started on the builder's thread, and builds its cancel flag
     /// stopped: a merge took the target as an input, or the store closed.
     pub build_starts: AtomicU64,

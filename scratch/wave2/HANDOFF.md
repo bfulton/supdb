@@ -658,6 +658,31 @@ user's call.
   after each mix now (`SUPDB_MIX_CENSUS=1`, the `mixcensus` line, `2` with
   the arenas and the mappings, read by `census_read.py`). The shuffled-load
   kill itself stays untouched.
+- **The user's two questions after it**: "store both LZ4 and non so we can
+  preferentially use the right form?" and "detect an E-shaped workload and
+  update more in place?" (`stage4.md`, "E's overlay with the timers off").
+  E profiled with no instrument on either side (perf attached from D,
+  `prof/profile-e-from-d.sh`): the overlay of the update mixes' writes is
+  18% of E's thread (settle 7%, builds 11%), no leaf in it past 1.5%, and
+  without it E's thread is LMDB's within 5% -- the overlay is E's gap.
+  *Update in place*: filing at every commit near reads
+  (`Options::forms_settle_every`) alone cost F and D a tenth and moved E
+  nothing (a settle patches only blocks a scan has formed, and the update
+  mixes' head has none); with the commit's fill building the blocks the
+  settle filed into (`Options::forms_settle_builds`) E read 1.07-1.17x of
+  hot8+drop in four sittings with every other cell level or faster. Both
+  off, arms `supdb-cache64tofitzpageshot8dropsettle{every,builds}`; not
+  priced in core or on the shipping arms, which is the next step before
+  it can be a default (the fill builds every overlaid block in core at the
+  backlog bound already, and filing at every commit cost A and F a third
+  there in an earlier engine). Its fuzz switch is `ZFUZZ_SETTLEBUILDS=1`.
+  *Both forms*: `Options::zpages_recode_keep` keeps the replaced form file
+  attached beside the served one, so a partition's later re-codes are an
+  exchange of the two (prefetch in, drop out, no build); arm
+  `supdb-cache64tofitzpagesrecodekeepdrop`, to be priced at `--ops-div 1`
+  against the drop arm, where the second version's way back rebuilt LZ4
+  files inside the faulting mixes. Note that a pairing at `--ops-div 1`
+  outlasts a background command's two hours: run it detached.
 - **Untouched**: the shuffled-load kill of the combined arm under 640 MiB
   and the gear shift, as the session before left them.
 

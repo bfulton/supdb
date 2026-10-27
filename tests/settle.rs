@@ -438,3 +438,150 @@ fn a_snapshot_over_the_empty_key_alone_is_sought_at_a_partitions_fence() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// Under `Options::forms_settle_every` a commit near reads files its own
+/// batch: after a scan, a stretch of commits with no scan between them
+/// leaves the first scan after it nothing to settle, where the default
+/// files the first commit's batch and leaves that scan the rest. Both
+/// scans answer every write of the stretch.
+#[test]
+fn a_commit_near_reads_files_its_batch_under_settle_every() {
+    for every in [false, true] {
+        let dir = scratch(&format!("settle-every-{every}"));
+        let mut db = Db::create(
+            &dir,
+            Options {
+                seal_bytes: 1 << 20,
+                partition_bytes: Some(4096),
+                partition_on_flush: true,
+                publish_in_background: false,
+                upkeep: Upkeep::Inline,
+                scan_block_cache: true,
+                forms_settle_every: every,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let value = [b'v'; 100];
+        let keys: Vec<Vec<u8>> = (0..2000).map(|i| format!("k{i:05}").into_bytes()).collect();
+        for k in &keys {
+            db.put(k, &value);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        // A scan: reads are around from here.
+        let mut want = scan_model(&db);
+        assert_eq!(want.len(), 2000);
+        // Ten commits of three updates each, thirty writes, under the
+        // default bound's two percent of the store, and no scan between.
+        for round in 0..10usize {
+            for i in 0..3usize {
+                let k = &keys[(round * 191 + i * 613) % keys.len()];
+                db.append(k, b"u");
+                want.get_mut(k).unwrap().push(b"u".to_vec());
+            }
+            db.commit().unwrap();
+        }
+        let before = db.settle_density();
+        let got = scan_model(&db);
+        let after = db.settle_density();
+        assert!(got == want, "every={every}: the scan answers every write");
+        if every {
+            assert_eq!(
+                after[1], before[1],
+                "the commits filed their batches; the scan settled nothing"
+            );
+        } else {
+            assert!(
+                after[1] > before[1],
+                "by default the scan files what the commits left: {before:?} {after:?}"
+            );
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Under `Options::forms_settle_builds` the commit's fill builds a form for
+/// every block its settle filed into that held none, where under a cache
+/// budget it builds no form at all: after a scan that
+/// formed a few blocks, a stretch of commits over the rest leaves the next
+/// full scan no sparse block to build, where without it that scan builds
+/// one for every block the stretch wrote into. Both scans answer every
+/// write.
+#[test]
+fn a_commits_fill_builds_the_blocks_its_settle_filed_into() {
+    for builds in [false, true] {
+        let dir = scratch(&format!("settle-builds-{builds}"));
+        let mut db = Db::create(
+            &dir,
+            Options {
+                seal_bytes: 1 << 20,
+                partition_bytes: Some(64 << 10),
+                partition_on_flush: true,
+                publish_in_background: false,
+                upkeep: Upkeep::Inline,
+                scan_block_cache: true,
+                forms_settle_every: true,
+                forms_settle_builds: builds,
+                // A budget, as the suite's arms run under, and one large
+                // enough to shed nothing: without one the fill completes
+                // every overlaid block's form whatever this option says.
+                scan_cache_bytes: 1 << 30,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let value = [b'v'; 100];
+        let keys: Vec<Vec<u8>> = (0..2000).map(|i| format!("k{i:05}").into_bytes()).collect();
+        let mut want = std::collections::BTreeMap::new();
+        for k in &keys {
+            db.put(k, &value);
+            want.insert(k.clone(), vec![value.to_vec()]);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        // A scan of one key at each partition's start: reads are around,
+        // every partition has its table, as the suite's passes leave them,
+        // and only each partition's first block holds a form.
+        let fences = partition_fences(&dir);
+        assert!(
+            fences.len() >= 3,
+            "partitions of several blocks: {}",
+            fences.len()
+        );
+        for (lo, _) in &fences {
+            db.scan(lo, 1, |_, _| {}).unwrap();
+        }
+        for round in 0..10usize {
+            for i in 0..3usize {
+                let k = &keys[(round * 191 + i * 613 + 300) % keys.len()];
+                db.append(k, b"u");
+                want.get_mut(k).unwrap().push(b"u".to_vec());
+            }
+            db.commit().unwrap();
+        }
+        let sparse_before = db.build_kinds().0[1];
+        let filled = db.settle_built();
+        let got = scan_model(&db);
+        let sparse_after = db.build_kinds().0[1];
+        assert!(got == want, "builds={builds}: the scan answers every write");
+        if builds {
+            assert!(filled > 0, "the fills built the stretch's blocks");
+            assert_eq!(
+                sparse_after, sparse_before,
+                "the scan found the stretch's blocks formed: {filled} built by the fills"
+            );
+        } else {
+            assert_eq!(filled, 0);
+            assert!(
+                sparse_after > sparse_before,
+                "without, the scan builds them: {sparse_before} {sparse_after}"
+            );
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
