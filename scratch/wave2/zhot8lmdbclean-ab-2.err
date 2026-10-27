@@ -1,0 +1,308 @@
+52795.28 bench: bound 671088640 bytes in group /sys/fs/cgroup/memory/process_api/01a17abf-95fb-7095-bda9-4ebe14e22fdc/claude-code-bash/supdb-bench-1548
+52795.29 bench ab: supdb-cache64tofitzpageshot8drop against lmdb at 5000000 keys, scans of 100, 5 pairs after a warmup, under a bound of 671088640 bytes, passes read,read-threaded,scan,scan-threaded,mixes, ops divided by 10
+52795.39 phasemark supdb-cache64tofitzpageshot8drop load start 52795.392223104
+52803.29 phasemark supdb-cache64tofitzpageshot8drop load sync 52803.295431691
+52804.45 phasemark supdb-cache64tofitzpageshot8drop load end 52804.456708496
+52804.46 phasemark supdb-cache64tofitzpageshot8drop read start 52804.457144491
+52806.38 phasemark supdb-cache64tofitzpageshot8drop read end 52806.378155861
+52810.05 phasemark supdb-cache64tofitzpageshot8drop scan start 52810.057997307
+52810.13 phasemark supdb-cache64tofitzpageshot8drop scan end 52810.136806642
+52830.22 phasemark supdb-cache64tofitzpageshot8drop ycsb-C start 52830.219098991
+52830.44 mixkinds supdb-cache64tofitzpageshot8drop C size 5000000 ops 83334 gets 83334 103.976 scans 0 0.000 commits 1 0.001 total 112.546
+52830.44 phasemark supdb-cache64tofitzpageshot8drop ycsb-C end 52830.437118864
+52830.45 phasemark supdb-cache64tofitzpageshot8drop ycsb-B start 52830.437382049
+52830.74 mixkinds supdb-cache64tofitzpageshot8drop B size 5000000 ops 83334 gets 79152 140.240 scans 0 0.000 commits 42 49.142 total 204.159
+52830.74 phasemark supdb-cache64tofitzpageshot8drop ycsb-B end 52830.741098172
+52830.74 phasemark supdb-cache64tofitzpageshot8drop ycsb-A start 52830.741473449
+52831.37 mixkinds supdb-cache64tofitzpageshot8drop A size 5000000 ops 83334 gets 41595 110.329 scans 0 0.000 commits 418 342.370 total 486.190
+52831.37 phasemark supdb-cache64tofitzpageshot8drop ycsb-A end 52831.368525870
+52831.37 phasemark supdb-cache64tofitzpageshot8drop ycsb-F start 52831.368770627
+52832.03 mixkinds supdb-cache64tofitzpageshot8drop F size 5000000 ops 83334 gets 83334 163.849 scans 0 0.000 commits 417 335.735 total 528.741
+52832.03 phasemark supdb-cache64tofitzpageshot8drop ycsb-F end 52832.029376612
+52832.03 phasemark supdb-cache64tofitzpageshot8drop ycsb-D start 52832.029582710
+52832.34 mixkinds supdb-cache64tofitzpageshot8drop D size 5000000 ops 83334 gets 79150 255.011 scans 0 0.000 commits 42 47.791 total 310.202
+52832.34 phasemark supdb-cache64tofitzpageshot8drop ycsb-D end 52832.339852588
+52832.34 phasemark supdb-cache64tofitzpageshot8drop ycsb-E start 52832.340102218
+52833.07 mixkinds supdb-cache64tofitzpageshot8drop E size 5000000 ops 83334 gets 0 0.000 scans 79198 546.781 commits 42 60.542 total 620.826
+52833.08 phasemark supdb-cache64tofitzpageshot8drop ycsb-E end 52833.075153956
+52833.92 phasemark lmdb load start 52833.917934900
+52845.69 phasemark lmdb load sync 52845.694202544
+52845.69 phasemark lmdb load end 52845.694348179
+52845.70 phasemark lmdb read start 52845.694718664
+52850.74 phasemark lmdb read end 52850.744106871
+52860.04 phasemark lmdb scan start 52860.039644057
+52860.17 phasemark lmdb scan end 52860.168582473
+52888.90 phasemark lmdb ycsb-C start 52888.901362567
+52889.26 mixkinds lmdb C size 5000000 ops 83334 gets 83334 198.935 scans 0 0.000 commits 1 0.000 total 211.035
+52889.26 phasemark lmdb ycsb-C end 52889.259967542
+52889.26 phasemark lmdb ycsb-B start 52889.260259845
+52889.79 mixkinds lmdb B size 5000000 ops 83334 gets 79152 197.380 scans 0 0.000 commits 42 191.773 total 403.758
+52889.79 phasemark lmdb ycsb-B end 52889.791655425
+52889.79 phasemark lmdb ycsb-A start 52889.791954107
+52892.11 mixkinds lmdb A size 5000000 ops 83334 gets 41595 142.020 scans 0 0.000 commits 418 2015.894 total 2193.198
+52892.11 phasemark lmdb ycsb-A end 52892.115445306
+52892.12 phasemark lmdb ycsb-F start 52892.115718988
+52894.37 mixkinds lmdb F size 5000000 ops 83334 gets 83334 255.500 scans 0 0.000 commits 417 1858.335 total 2151.710
+52894.37 phasemark lmdb ycsb-F end 52894.368427439
+52894.37 phasemark lmdb ycsb-D start 52894.368652967
+52895.16 mixkinds lmdb D size 5000000 ops 83334 gets 79150 722.092 scans 0 0.000 commits 42 59.576 total 791.698
+52895.16 phasemark lmdb ycsb-D end 52895.160410188
+52895.16 phasemark lmdb ycsb-E start 52895.160661335
+52895.80 mixkinds lmdb E size 5000000 ops 83334 gets 0 0.000 scans 79198 467.943 commits 42 62.194 total 543.010
+52895.80 phasemark lmdb ycsb-E end 52895.802844499
+52896.37    101s  rep 0/5 (warmup)
+52896.42 phasemark lmdb load start 52896.421818487
+52907.31 phasemark lmdb load sync 52907.316374052
+52907.32 phasemark lmdb load end 52907.316594902
+52907.32 phasemark lmdb read start 52907.317046838
+52912.73 phasemark lmdb read end 52912.731227321
+52921.84 phasemark lmdb scan start 52921.842050230
+52921.95 phasemark lmdb scan end 52921.954056810
+52950.88 phasemark lmdb ycsb-C start 52950.883332762
+52951.21 mixkinds lmdb C size 5000000 ops 83334 gets 83334 209.968 scans 0 0.000 commits 1 0.000 total 219.923
+52951.21 phasemark lmdb ycsb-C end 52951.212542025
+52951.21 phasemark lmdb ycsb-B start 52951.212794832
+52951.77 mixkinds lmdb B size 5000000 ops 83334 gets 79152 200.098 scans 0 0.000 commits 42 216.679 total 429.492
+52951.77 phasemark lmdb ycsb-B end 52951.769545610
+52951.77 phasemark lmdb ycsb-A start 52951.770259546
+52954.13 mixkinds lmdb A size 5000000 ops 83334 gets 41595 149.926 scans 0 0.000 commits 418 2011.584 total 2197.317
+52954.13 phasemark lmdb ycsb-A end 52954.132226847
+52954.13 phasemark lmdb ycsb-F start 52954.132463040
+52956.32 mixkinds lmdb F size 5000000 ops 83334 gets 83334 256.901 scans 0 0.000 commits 417 1786.448 total 2079.816
+52956.32 phasemark lmdb ycsb-F end 52956.323240367
+52956.32 phasemark lmdb ycsb-D start 52956.323492028
+52957.03 mixkinds lmdb D size 5000000 ops 83334 gets 79150 650.651 scans 0 0.000 commits 42 49.956 total 710.020
+52957.03 phasemark lmdb ycsb-D end 52957.033605360
+52957.04 phasemark lmdb ycsb-E start 52957.033921041
+52957.66 mixkinds lmdb E size 5000000 ops 83334 gets 0 0.000 scans 79198 436.740 commits 42 56.811 total 506.126
+52957.67 phasemark lmdb ycsb-E end 52957.666004341
+52958.24 phasemark supdb-cache64tofitzpageshot8drop load start 52958.242881972
+52966.45 phasemark supdb-cache64tofitzpageshot8drop load sync 52966.454608787
+52967.71 phasemark supdb-cache64tofitzpageshot8drop load end 52967.717330980
+52967.72 phasemark supdb-cache64tofitzpageshot8drop read start 52967.718102451
+52969.95 phasemark supdb-cache64tofitzpageshot8drop read end 52969.950895533
+52973.13 phasemark supdb-cache64tofitzpageshot8drop scan start 52973.128721470
+52973.20 phasemark supdb-cache64tofitzpageshot8drop scan end 52973.207374457
+52989.86 phasemark supdb-cache64tofitzpageshot8drop ycsb-C start 52989.867130079
+52990.11 mixkinds supdb-cache64tofitzpageshot8drop C size 5000000 ops 83334 gets 83334 117.026 scans 0 0.000 commits 1 0.001 total 126.552
+52990.12 phasemark supdb-cache64tofitzpageshot8drop ycsb-C end 52990.116435591
+52990.12 phasemark supdb-cache64tofitzpageshot8drop ycsb-B start 52990.116715166
+52990.36 mixkinds supdb-cache64tofitzpageshot8drop B size 5000000 ops 83334 gets 79152 105.065 scans 0 0.000 commits 42 38.626 total 155.196
+52990.37 phasemark supdb-cache64tofitzpageshot8drop ycsb-B end 52990.366459370
+52990.37 phasemark supdb-cache64tofitzpageshot8drop ycsb-A start 52990.366679779
+52990.92 mixkinds supdb-cache64tofitzpageshot8drop A size 5000000 ops 83334 gets 41595 108.730 scans 0 0.000 commits 418 322.627 total 464.238
+52990.92 phasemark supdb-cache64tofitzpageshot8drop ycsb-A end 52990.925404717
+52990.93 phasemark supdb-cache64tofitzpageshot8drop ycsb-F start 52990.925788704
+52991.59 mixkinds supdb-cache64tofitzpageshot8drop F size 5000000 ops 83334 gets 83334 177.084 scans 0 0.000 commits 417 276.751 total 486.073
+52991.60 phasemark supdb-cache64tofitzpageshot8drop ycsb-F end 52991.596382295
+52991.60 phasemark supdb-cache64tofitzpageshot8drop ycsb-D start 52991.596600490
+52991.86 mixkinds supdb-cache64tofitzpageshot8drop D size 5000000 ops 83334 gets 79150 224.891 scans 0 0.000 commits 42 35.595 total 267.603
+52991.86 phasemark supdb-cache64tofitzpageshot8drop ycsb-D end 52991.864245489
+52991.87 phasemark supdb-cache64tofitzpageshot8drop ycsb-E start 52991.864492223
+52992.48 mixkinds supdb-cache64tofitzpageshot8drop E size 5000000 ops 83334 gets 0 0.000 scans 79198 437.780 commits 42 36.012 total 484.177
+52992.48 phasemark supdb-cache64tofitzpageshot8drop ycsb-E end 52992.482281210
+52993.23    198s  rep 1/5
+52993.27 phasemark supdb-cache64tofitzpageshot8drop load start 52993.276939379
+53000.76 phasemark supdb-cache64tofitzpageshot8drop load sync 53000.764876041
+53001.84 phasemark supdb-cache64tofitzpageshot8drop load end 53001.839528310
+53001.84 phasemark supdb-cache64tofitzpageshot8drop read start 53001.840327444
+53003.75 phasemark supdb-cache64tofitzpageshot8drop read end 53003.749965475
+53007.16 phasemark supdb-cache64tofitzpageshot8drop scan start 53007.166148631
+53007.28 phasemark supdb-cache64tofitzpageshot8drop scan end 53007.278951614
+53025.16 phasemark supdb-cache64tofitzpageshot8drop ycsb-C start 53025.159506628
+53025.36 mixkinds supdb-cache64tofitzpageshot8drop C size 5000000 ops 83334 gets 83334 97.297 scans 0 0.000 commits 1 0.001 total 105.675
+53025.36 phasemark supdb-cache64tofitzpageshot8drop ycsb-C end 53025.362401790
+53025.36 phasemark supdb-cache64tofitzpageshot8drop ycsb-B start 53025.362659843
+53025.60 mixkinds supdb-cache64tofitzpageshot8drop B size 5000000 ops 83334 gets 79152 99.788 scans 0 0.000 commits 42 36.783 total 147.754
+53025.61 phasemark supdb-cache64tofitzpageshot8drop ycsb-B end 53025.606669305
+53025.61 phasemark supdb-cache64tofitzpageshot8drop ycsb-A start 53025.606916562
+53026.11 mixkinds supdb-cache64tofitzpageshot8drop A size 5000000 ops 83334 gets 41595 76.443 scans 0 0.000 commits 418 303.720 total 403.577
+53026.11 phasemark supdb-cache64tofitzpageshot8drop ycsb-A end 53026.109245289
+53026.11 phasemark supdb-cache64tofitzpageshot8drop ycsb-F start 53026.109534280
+53026.90 mixkinds supdb-cache64tofitzpageshot8drop F size 5000000 ops 83334 gets 83334 179.823 scans 0 0.000 commits 417 429.699 total 641.903
+53026.90 phasemark supdb-cache64tofitzpageshot8drop ycsb-F end 53026.902367213
+53026.90 phasemark supdb-cache64tofitzpageshot8drop ycsb-D start 53026.902704150
+53027.27 mixkinds supdb-cache64tofitzpageshot8drop D size 5000000 ops 83334 gets 79150 293.292 scans 0 0.000 commits 42 68.024 total 371.249
+53027.27 phasemark supdb-cache64tofitzpageshot8drop ycsb-D end 53027.274011361
+53027.27 phasemark supdb-cache64tofitzpageshot8drop ycsb-E start 53027.274295230
+53027.99 mixkinds supdb-cache64tofitzpageshot8drop E size 5000000 ops 83334 gets 0 0.000 scans 79198 548.994 commits 42 66.709 total 628.189
+53027.99 phasemark supdb-cache64tofitzpageshot8drop ycsb-E end 53027.995535614
+53028.77 phasemark lmdb load start 53028.777129672
+53039.57 phasemark lmdb load sync 53039.575761608
+53039.57 phasemark lmdb load end 53039.575947427
+53039.58 phasemark lmdb read start 53039.576297349
+53045.22 phasemark lmdb read end 53045.218962423
+53055.79 phasemark lmdb scan start 53055.790764985
+53055.91 phasemark lmdb scan end 53055.912954068
+53086.65 phasemark lmdb ycsb-C start 53086.653269606
+53086.98 mixkinds lmdb C size 5000000 ops 83334 gets 83334 215.446 scans 0 0.000 commits 1 0.000 total 226.972
+53086.98 phasemark lmdb ycsb-C end 53086.982493734
+53086.98 phasemark lmdb ycsb-B start 53086.982709823
+53087.46 mixkinds lmdb B size 5000000 ops 83334 gets 79152 183.691 scans 0 0.000 commits 42 197.208 total 392.672
+53087.47 phasemark lmdb ycsb-B end 53087.467523213
+53087.47 phasemark lmdb ycsb-A start 53087.467948807
+53089.62 mixkinds lmdb A size 5000000 ops 83334 gets 41595 132.118 scans 0 0.000 commits 418 1813.793 total 1979.138
+53089.62 phasemark lmdb ycsb-A end 53089.619293567
+53089.62 phasemark lmdb ycsb-F start 53089.619585426
+53091.85 mixkinds lmdb F size 5000000 ops 83334 gets 83334 259.039 scans 0 0.000 commits 417 1807.252 total 2102.927
+53091.85 phasemark lmdb ycsb-F end 53091.850873539
+53091.85 phasemark lmdb ycsb-D start 53091.851188744
+53092.70 mixkinds lmdb D size 5000000 ops 83334 gets 79150 786.267 scans 0 0.000 commits 42 53.185 total 849.117
+53092.70 phasemark lmdb ycsb-D end 53092.700383000
+53092.71 phasemark lmdb ycsb-E start 53092.700762879
+53093.39 mixkinds lmdb E size 5000000 ops 83334 gets 0 0.000 scans 79198 443.063 commits 42 47.300 total 502.203
+53093.39 phasemark lmdb ycsb-E end 53093.394552444
+53093.94    299s  rep 2/5
+53093.99 phasemark lmdb load start 53093.996427393
+53104.41 phasemark lmdb load sync 53104.411586464
+53104.41 phasemark lmdb load end 53104.411730710
+53104.41 phasemark lmdb read start 53104.412197416
+53109.40 phasemark lmdb read end 53109.406674154
+53117.24 phasemark lmdb scan start 53117.243053948
+53117.45 phasemark lmdb scan end 53117.450021267
+53147.66 phasemark lmdb ycsb-C start 53147.666420327
+53147.97 mixkinds lmdb C size 5000000 ops 83334 gets 83334 195.350 scans 0 0.000 commits 1 0.000 total 204.401
+53147.97 phasemark lmdb ycsb-C end 53147.972199596
+53147.97 phasemark lmdb ycsb-B start 53147.972413529
+53148.48 mixkinds lmdb B size 5000000 ops 83334 gets 79152 201.199 scans 0 0.000 commits 42 196.681 total 410.078
+53148.48 phasemark lmdb ycsb-B end 53148.485021122
+53148.49 phasemark lmdb ycsb-A start 53148.485302892
+53150.42 mixkinds lmdb A size 5000000 ops 83334 gets 41595 119.483 scans 0 0.000 commits 418 1664.982 total 1817.348
+53150.43 phasemark lmdb ycsb-A end 53150.426864790
+53150.43 phasemark lmdb ycsb-F start 53150.427084866
+53152.48 mixkinds lmdb F size 5000000 ops 83334 gets 83334 235.588 scans 0 0.000 commits 417 1667.257 total 1937.189
+53152.48 phasemark lmdb ycsb-F end 53152.482644908
+53152.48 phasemark lmdb ycsb-D start 53152.482865774
+53153.22 mixkinds lmdb D size 5000000 ops 83334 gets 79150 687.922 scans 0 0.000 commits 42 48.812 total 745.224
+53153.23 phasemark lmdb ycsb-D end 53153.228141062
+53153.23 phasemark lmdb ycsb-E start 53153.228613009
+53153.84 mixkinds lmdb E size 5000000 ops 83334 gets 0 0.000 scans 79198 452.005 commits 42 47.360 total 511.029
+53153.84 phasemark lmdb ycsb-E end 53153.843064949
+53154.45 phasemark supdb-cache64tofitzpageshot8drop load start 53154.451639847
+53161.45 phasemark supdb-cache64tofitzpageshot8drop load sync 53161.450402776
+53162.52 phasemark supdb-cache64tofitzpageshot8drop load end 53162.521698193
+53162.52 phasemark supdb-cache64tofitzpageshot8drop read start 53162.522298326
+53164.43 phasemark supdb-cache64tofitzpageshot8drop read end 53164.432296142
+53167.65 phasemark supdb-cache64tofitzpageshot8drop scan start 53167.655173886
+53167.73 phasemark supdb-cache64tofitzpageshot8drop scan end 53167.730624159
+53186.06 phasemark supdb-cache64tofitzpageshot8drop ycsb-C start 53186.059278665
+53186.28 mixkinds supdb-cache64tofitzpageshot8drop C size 5000000 ops 83334 gets 83334 120.520 scans 0 0.000 commits 1 0.001 total 130.493
+53186.28 phasemark supdb-cache64tofitzpageshot8drop ycsb-C end 53186.284890547
+53186.29 phasemark supdb-cache64tofitzpageshot8drop ycsb-B start 53186.285202514
+53186.58 mixkinds supdb-cache64tofitzpageshot8drop B size 5000000 ops 83334 gets 79152 103.151 scans 0 0.000 commits 42 38.304 total 151.576
+53186.58 phasemark supdb-cache64tofitzpageshot8drop ycsb-B end 53186.585782134
+53186.59 phasemark supdb-cache64tofitzpageshot8drop ycsb-A start 53186.586011901
+53187.05 mixkinds supdb-cache64tofitzpageshot8drop A size 5000000 ops 83334 gets 41595 79.242 scans 0 0.000 commits 418 269.565 total 372.996
+53187.05 phasemark supdb-cache64tofitzpageshot8drop ycsb-A end 53187.050467170
+53187.05 phasemark supdb-cache64tofitzpageshot8drop ycsb-F start 53187.050689456
+53187.58 mixkinds supdb-cache64tofitzpageshot8drop F size 5000000 ops 83334 gets 83334 150.999 scans 0 0.000 commits 417 239.315 total 417.010
+53187.58 phasemark supdb-cache64tofitzpageshot8drop ycsb-F end 53187.579105293
+53187.58 phasemark supdb-cache64tofitzpageshot8drop ycsb-D start 53187.579443443
+53187.90 mixkinds supdb-cache64tofitzpageshot8drop D size 5000000 ops 83334 gets 79150 269.490 scans 0 0.000 commits 42 48.972 total 326.636
+53187.90 phasemark supdb-cache64tofitzpageshot8drop ycsb-D end 53187.906138597
+53187.91 phasemark supdb-cache64tofitzpageshot8drop ycsb-E start 53187.906416405
+53188.59 mixkinds supdb-cache64tofitzpageshot8drop E size 5000000 ops 83334 gets 0 0.000 scans 79198 523.464 commits 42 49.896 total 585.673
+53188.60 phasemark supdb-cache64tofitzpageshot8drop ycsb-E end 53188.597811999
+53189.37    394s  rep 3/5
+53189.42 phasemark supdb-cache64tofitzpageshot8drop load start 53189.418449500
+53196.46 phasemark supdb-cache64tofitzpageshot8drop load sync 53196.466793715
+53197.51 phasemark supdb-cache64tofitzpageshot8drop load end 53197.517612176
+53197.52 phasemark supdb-cache64tofitzpageshot8drop read start 53197.518337738
+53199.30 phasemark supdb-cache64tofitzpageshot8drop read end 53199.300884065
+53202.31 phasemark supdb-cache64tofitzpageshot8drop scan start 53202.314283443
+53202.41 phasemark supdb-cache64tofitzpageshot8drop scan end 53202.408312067
+53218.78 phasemark supdb-cache64tofitzpageshot8drop ycsb-C start 53218.785915838
+53219.04 mixkinds supdb-cache64tofitzpageshot8drop C size 5000000 ops 83334 gets 83334 121.172 scans 0 0.000 commits 1 0.000 total 131.288
+53219.04 phasemark supdb-cache64tofitzpageshot8drop ycsb-C end 53219.042692919
+53219.04 phasemark supdb-cache64tofitzpageshot8drop ycsb-B start 53219.042910038
+53219.28 mixkinds supdb-cache64tofitzpageshot8drop B size 5000000 ops 83334 gets 79152 98.790 scans 0 0.000 commits 42 29.338 total 138.761
+53219.28 phasemark supdb-cache64tofitzpageshot8drop ycsb-B end 53219.283712127
+53219.29 phasemark supdb-cache64tofitzpageshot8drop ycsb-A start 53219.284089507
+53219.72 mixkinds supdb-cache64tofitzpageshot8drop A size 5000000 ops 83334 gets 41595 64.608 scans 0 0.000 commits 418 204.106 total 289.370
+53219.72 phasemark supdb-cache64tofitzpageshot8drop ycsb-A end 53219.720056757
+53219.72 phasemark supdb-cache64tofitzpageshot8drop ycsb-F start 53219.720396864
+53220.17 mixkinds supdb-cache64tofitzpageshot8drop F size 5000000 ops 83334 gets 83334 128.471 scans 0 0.000 commits 417 208.884 total 360.579
+53220.18 phasemark supdb-cache64tofitzpageshot8drop ycsb-F end 53220.174527498
+53220.18 phasemark supdb-cache64tofitzpageshot8drop ycsb-D start 53220.174832915
+53220.48 mixkinds supdb-cache64tofitzpageshot8drop D size 5000000 ops 83334 gets 79150 258.188 scans 0 0.000 commits 42 39.810 total 306.605
+53220.48 phasemark supdb-cache64tofitzpageshot8drop ycsb-D end 53220.481485632
+53220.48 phasemark supdb-cache64tofitzpageshot8drop ycsb-E start 53220.481700181
+53221.10 mixkinds supdb-cache64tofitzpageshot8drop E size 5000000 ops 83334 gets 0 0.000 scans 79198 479.184 commits 42 38.018 total 529.599
+53221.11 phasemark supdb-cache64tofitzpageshot8drop ycsb-E end 53221.106432637
+53221.93 phasemark lmdb load start 53221.933083854
+53232.28 phasemark lmdb load sync 53232.286937168
+53232.29 phasemark lmdb load end 53232.287159823
+53232.29 phasemark lmdb read start 53232.287544519
+53237.59 phasemark lmdb read end 53237.595242597
+53246.34 phasemark lmdb scan start 53246.345238796
+53246.47 phasemark lmdb scan end 53246.476680238
+53272.04 phasemark lmdb ycsb-C start 53272.037986267
+53272.29 mixkinds lmdb C size 5000000 ops 83334 gets 83334 148.814 scans 0 0.000 commits 1 0.001 total 157.346
+53272.29 phasemark lmdb ycsb-C end 53272.290679632
+53272.29 phasemark lmdb ycsb-B start 53272.290947285
+53272.83 mixkinds lmdb B size 5000000 ops 83334 gets 79152 196.632 scans 0 0.000 commits 42 212.519 total 423.060
+53272.83 phasemark lmdb ycsb-B end 53272.828042778
+53272.83 phasemark lmdb ycsb-A start 53272.828244733
+53274.89 mixkinds lmdb A size 5000000 ops 83334 gets 41595 131.981 scans 0 0.000 commits 418 1793.626 total 1960.519
+53274.89 phasemark lmdb ycsb-A end 53274.890958968
+53274.89 phasemark lmdb ycsb-F start 53274.891269031
+53276.94 mixkinds lmdb F size 5000000 ops 83334 gets 83334 218.257 scans 0 0.000 commits 417 1660.415 total 1912.958
+53276.94 phasemark lmdb ycsb-F end 53276.943023208
+53276.94 phasemark lmdb ycsb-D start 53276.943481514
+53277.50 mixkinds lmdb D size 5000000 ops 83334 gets 79150 499.260 scans 0 0.000 commits 42 50.818 total 558.518
+53277.50 phasemark lmdb ycsb-D end 53277.502055299
+53277.50 phasemark lmdb ycsb-E start 53277.502274281
+53278.16 mixkinds lmdb E size 5000000 ops 83334 gets 0 0.000 scans 79198 472.158 commits 42 58.829 total 546.100
+53278.16 phasemark lmdb ycsb-E end 53278.160053911
+53278.66    483s  rep 4/5
+53278.70 phasemark lmdb load start 53278.698994559
+53288.68 phasemark lmdb load sync 53288.681423973
+53288.68 phasemark lmdb load end 53288.681542701
+53288.68 phasemark lmdb read start 53288.681974170
+53293.41 phasemark lmdb read end 53293.408631041
+53301.82 phasemark lmdb scan start 53301.821053076
+53301.96 phasemark lmdb scan end 53301.958931335
+53328.02 phasemark lmdb ycsb-C start 53328.026470846
+53328.29 mixkinds lmdb C size 5000000 ops 83334 gets 83334 159.274 scans 0 0.000 commits 1 0.000 total 168.204
+53328.29 phasemark lmdb ycsb-C end 53328.295153721
+53328.30 phasemark lmdb ycsb-B start 53328.295396336
+53328.81 mixkinds lmdb B size 5000000 ops 83334 gets 79152 193.971 scans 0 0.000 commits 42 209.126 total 416.126
+53328.81 phasemark lmdb ycsb-B end 53328.808252258
+53328.81 phasemark lmdb ycsb-A start 53328.808675353
+53330.90 mixkinds lmdb A size 5000000 ops 83334 gets 41595 128.251 scans 0 0.000 commits 418 1822.848 total 1984.163
+53330.90 phasemark lmdb ycsb-A end 53330.898317744
+53330.90 phasemark lmdb ycsb-F start 53330.898572810
+53332.86 mixkinds lmdb F size 5000000 ops 83334 gets 83334 237.067 scans 0 0.000 commits 417 1592.450 total 1864.020
+53332.86 phasemark lmdb ycsb-F end 53332.859698732
+53332.86 phasemark lmdb ycsb-D start 53332.859991214
+53333.44 mixkinds lmdb D size 5000000 ops 83334 gets 79150 494.262 scans 0 0.000 commits 42 75.155 total 577.873
+53333.44 phasemark lmdb ycsb-D end 53333.437940437
+53333.44 phasemark lmdb ycsb-E start 53333.438318211
+53334.07 mixkinds lmdb E size 5000000 ops 83334 gets 0 0.000 scans 79198 409.155 commits 42 52.306 total 473.592
+53334.08 phasemark lmdb ycsb-E end 53334.075758426
+53334.70 phasemark supdb-cache64tofitzpageshot8drop load start 53334.703085898
+53341.99 phasemark supdb-cache64tofitzpageshot8drop load sync 53341.992214315
+53343.02 phasemark supdb-cache64tofitzpageshot8drop load end 53343.022776640
+53343.02 phasemark supdb-cache64tofitzpageshot8drop read start 53343.023310506
+53344.91 phasemark supdb-cache64tofitzpageshot8drop read end 53344.914166310
+53348.27 phasemark supdb-cache64tofitzpageshot8drop scan start 53348.276353781
+53348.36 phasemark supdb-cache64tofitzpageshot8drop scan end 53348.367066630
+53366.50 phasemark supdb-cache64tofitzpageshot8drop ycsb-C start 53366.507285932
+53366.74 mixkinds supdb-cache64tofitzpageshot8drop C size 5000000 ops 83334 gets 83334 86.285 scans 0 0.000 commits 1 0.000 total 94.187
+53366.74 phasemark supdb-cache64tofitzpageshot8drop ycsb-C end 53366.741385379
+53366.74 phasemark supdb-cache64tofitzpageshot8drop ycsb-B start 53366.741606468
+53366.98 mixkinds supdb-cache64tofitzpageshot8drop B size 5000000 ops 83334 gets 79152 107.385 scans 0 0.000 commits 42 31.780 total 150.832
+53366.98 phasemark supdb-cache64tofitzpageshot8drop ycsb-B end 53366.983787925
+53366.99 phasemark supdb-cache64tofitzpageshot8drop ycsb-A start 53366.984234722
+53367.47 mixkinds supdb-cache64tofitzpageshot8drop A size 5000000 ops 83334 gets 41595 81.379 scans 0 0.000 commits 418 265.541 total 371.347
+53367.47 phasemark supdb-cache64tofitzpageshot8drop ycsb-A end 53367.467493428
+53367.47 phasemark supdb-cache64tofitzpageshot8drop ycsb-F start 53367.467705158
+53368.03 mixkinds supdb-cache64tofitzpageshot8drop F size 5000000 ops 83334 gets 83334 137.591 scans 0 0.000 commits 417 277.734 total 441.531
+53368.03 phasemark supdb-cache64tofitzpageshot8drop ycsb-F end 53368.029487504
+53368.03 phasemark supdb-cache64tofitzpageshot8drop ycsb-D start 53368.029715603
+53368.33 mixkinds supdb-cache64tofitzpageshot8drop D size 5000000 ops 83334 gets 79150 242.366 scans 0 0.000 commits 42 49.141 total 300.698
+53368.33 phasemark supdb-cache64tofitzpageshot8drop ycsb-D end 53368.330480609
+53368.33 phasemark supdb-cache64tofitzpageshot8drop ycsb-E start 53368.330783339
+53369.07 mixkinds supdb-cache64tofitzpageshot8drop E size 5000000 ops 83334 gets 0 0.000 scans 79198 544.798 commits 42 52.377 total 609.502
+53369.08 phasemark supdb-cache64tofitzpageshot8drop ycsb-E end 53369.077671813
+53369.86    575s  rep 5/5

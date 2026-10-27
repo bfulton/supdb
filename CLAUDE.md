@@ -464,7 +464,14 @@ check the measurement before the count. The same interval said something
 the counters could not: our E executed 24% fewer instructions than LMDB's
 and took 40% longer, and the clean scan workload 38% fewer at level time,
 so what a scan of ours pays over LMDB's is stalls per instruction, and the
-remaining levers are in the walk's memory access, not its arithmetic.
+remaining levers are in the walk's memory access, not its arithmetic. The
+same variable came back the other way: the pairings of supdb arms set
+`SUPDB_MIX_COUNTERS` for their counters lines, which turns the timers on
+for every supdb arm and for no comparator, so a cell read against LMDB
+from such a pairing carries ten clock reads a scan on one side -- E at five
+million keys under 640 MiB read 0.69-0.75x LMDB with them and 0.76-0.86x
+without; a cell against a comparator is read from a pairing with the
+counters off.
 
 Price a structure by taking it away, not by what its doc says it saves.
 The sparse form's doc says it saves the walk the memtable's value

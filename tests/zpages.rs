@@ -7526,11 +7526,12 @@ fn a_partition_the_reads_have_left_gives_its_raw_tails_to_one_they_have_come_to(
             codings(&db)
         );
         heat_up(&db, &second, 20_000);
-        let started = db.zpage_counts().build_starts;
+        // Read before the look: a build the look starts can be collected
+        // before a reading after it, which then waits for a second.
+        let was = db.zpage_counts();
         recode_look(&db, std::time::Duration::from_secs(1));
         // A re-code the look started is collected at a later turn.
-        if db.zpage_counts().build_starts > started {
-            let was = db.zpage_counts();
+        if db.zpage_counts().build_starts > was.build_starts {
             assert!(
                 recode_until(&db, |c| {
                     c.recodes + c.recodes_back + c.recode_failed

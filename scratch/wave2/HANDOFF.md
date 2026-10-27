@@ -613,6 +613,16 @@ user's call.
   tails back -- D 1.12-1.24x and E 1.10-1.18x of hot8+drop, B and C
   0.80-0.99x. The way back pays; the way in follows whatever pass runs.
   The line rests there: a heat kept across restarts is the shape it needs.
+- **E on hot8+drop beside LMDB, and the counters' timers** (`stage4.md`,
+  "E on hot8 with the drop, beside LMDB"): every pairing script here sets
+  `SUPDB_MIX_COUNTERS`, which turns `Options::scan_timers` on for every
+  supdb arm and no comparator, ten clock reads a scan, about 5% of E's
+  thread. With the counters off (`COUNTERS=0 pair.sh`) hot8+drop reads E at
+  0.76-0.86x LMDB, every other cell 1.3-5.3x. Of the engine's E excess the
+  largest piece is the overlay of the update mixes' unsealed writes (49,000
+  keys, 8,900 sparse builds a pass, `deltas_for` and the settle, about a
+  fifth of the thread), then the seek (about 1.5x LMDB's) and the walk.
+  Read a cell against a comparator with the counters off.
 - **Where E's time is, by the arm pair's profile at the head**: the LZ4
   decode 25% of the thread (147,000 groups a pass, 2.5 a form walk, nearly
   every one a memo miss, since the form walks are the Zipfian's cold tail),
