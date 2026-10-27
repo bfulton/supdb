@@ -367,6 +367,10 @@ instead of its free count (`Options::trim_by_resident`);
 key order in the raw-tail coding and the rest in the block coding
 (`Options::zpages_raw_tails_first`), the upper bound of a coding chosen per
 partition by its heat;
+`supdb-cache64tofitzpagesdrop` and `supdb-cache64tofitzpageshot4drop` are
+`supdb-cache64tofitzpages` and its hot4 arm with each partition's raw file
+and ordered index unmapped and dropped from the page cache once its form
+file serves it (`Options::zpages_drop_raw`);
 `supdb-cache64tofitautozpagescodingauto` is the combined arm with the coding
 of its form files the selector's to choose (`Options::zpages_coding_auto`),
 the raw tails where the model predicts that form fits the budget and the

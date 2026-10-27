@@ -3380,6 +3380,9 @@ pub(super) struct ZEvents {
     pub sample_w_z_raw: AtomicU64,
     pub coding_picks: [AtomicU64; 2],
     pub builds_raw_tails: AtomicU64,
+    /// The partitions whose raw pages were dropped at their form file's
+    /// install (`Options::zpages_drop_raw`).
+    pub raw_dropped: AtomicU64,
     pub sel_samples: AtomicU64,
     pub sel_builds: AtomicU64,
     pub sel_installs: AtomicU64,

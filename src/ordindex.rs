@@ -565,6 +565,12 @@ impl OrdIndex {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// The mapping's pages unmapped from the process
+    /// (`Bytes::advise_dontneed`).
+    pub fn advise_dontneed(&self) {
+        self.map.advise_dontneed();
+    }
+
     /// Whether `advise_random` was called on this mapping.
     pub fn advised(&self) -> bool {
         self.advised.load(std::sync::atomic::Ordering::Relaxed)

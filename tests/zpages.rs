@@ -7249,6 +7249,92 @@ fn a_block_read_often_enough_under_the_form_is_held_as_a_copy_and_walked_without
     }
 }
 
+/// The bytes of the files under `dir` whose names start with `prefix` that
+/// the page cache holds: `mincore` over a read-only mapping of each, which
+/// faults nothing in, so the kernel's answer and not the store's record of
+/// what it asked.
+fn resident_under(dir: &Path, prefix: &str) -> (u64, u64) {
+    let page = 4096u64;
+    let (mut size, mut resident) = (0u64, 0u64);
+    for e in std::fs::read_dir(dir).unwrap() {
+        let path = e.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        let f = std::fs::File::open(&path).unwrap();
+        let len = f.metadata().unwrap().len();
+        if len == 0 {
+            continue;
+        }
+        // SAFETY: a read-only mapping of a file no one truncates while the
+        // test holds it; nothing is read through it.
+        let map = unsafe { memmap2::Mmap::map(&f).unwrap() };
+        let pages = len.div_ceil(page) as usize;
+        let mut vec = vec![0u8; pages];
+        // SAFETY: the vector holds a byte for every page of the mapping.
+        let rc = unsafe {
+            libc::mincore(
+                map.as_ptr() as *mut libc::c_void,
+                map.len(),
+                vec.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0, "mincore");
+        size += len;
+        resident += vec.iter().filter(|b| **b & 1 != 0).count() as u64 * page;
+    }
+    (size, resident)
+}
+
+/// A partition its form file serves drops its raw file and its ordered index
+/// from the page cache when asked (`Options::zpages_drop_raw`): with the
+/// option the page cache holds a small share of the raw files it holds
+/// without it, every partition's install counted, and every read, count and
+/// scan answers as before -- what a raw read needs after it comes back from
+/// the file.
+#[test]
+fn a_partition_its_form_serves_drops_its_raw_pages_when_asked() {
+    let mut held = Vec::new();
+    for cold in [false, true] {
+        let what = format!("drop raw {cold}");
+        let dir = scratch(&format!("drop-raw-{cold}"));
+        let mut db = Db::create(
+            &dir,
+            forced(|o| {
+                o.partition_bytes = Some(160 << 10);
+                o.zpages_drop_raw = cold;
+            }),
+        )
+        .unwrap();
+        let model = ordered_load(&mut db, 5000, 0xC01D);
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert!(c.form_files >= 3, "{what}: the form files: {c:?}");
+        assert_eq!(
+            c.raw_dropped,
+            if cold { c.form_files } else { 0 },
+            "{what}: every install dropped its raw pages: {c:?}"
+        );
+        let raw = resident_under(&dir, "par-");
+        held.push(raw);
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        check(&db, &model, &keys, &what);
+        check_scan(&db, &model, &what);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    let ((size, warm), (_, cold)) = (held[0], held[1]);
+    assert!(
+        size > 0 && warm > 0,
+        "the raw partitions are resident without the option: {held:?}"
+    );
+    assert!(
+        cold * 4 < warm,
+        "dropped, the page cache holds a small share of the raw partitions: {held:?}"
+    );
+}
+
 /// The first partitions by key order in the raw-tail coding and the rest in
 /// the block coding (`Options::zpages_raw_tails_first`): the store answers
 /// every read, count and scan as the raw form does, exactly the first

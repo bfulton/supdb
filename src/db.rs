@@ -543,6 +543,9 @@ pub struct ZCounts {
     pub coding_picks_block: u64,
     pub coding_picks_raw: u64,
     pub builds_raw_tails: u64,
+    /// The partitions whose raw pages were dropped at their form file's
+    /// install (`Options::zpages_drop_raw`).
+    pub raw_dropped: u64,
     pub sel_samples: u64,
     pub sel_builds: u64,
     pub sel_installs: u64,
@@ -1274,6 +1277,21 @@ pub struct Options {
     /// ones. Zero, off.
     #[doc(hidden)]
     pub zpages_raw_tails_first: usize,
+    /// EXPERIMENT: once a form file serves a partition, the partition's raw
+    /// file and its ordered index are dropped from the page cache: the
+    /// store's own mappings of them unmapped (`MADV_DONTNEED`), since a cache
+    /// drop skips a mapped page and the open's check of the key section's
+    /// checksum row maps all of it, then the files' clean pages dropped
+    /// (`POSIX_FADV_DONTNEED`). The build drops the records behind it
+    /// already; what it left was the raw key section the raw point read
+    /// probes and the ordered index, 120 MB of the 500 the store's files
+    /// held at five million keys under 640 MiB, which the form's point
+    /// reads and scans never touch, while the form four partitions
+    /// raw-tailed faulted 0.013 a read for its last 21 MB. A raw read after
+    /// it -- a merge's, the controller's trial -- reads them back from the
+    /// device. Off.
+    #[doc(hidden)]
+    pub zpages_drop_raw: bool,
     /// EXPERIMENT: under `ZPages::Auto`, the coding the form files are built
     /// in is the selector's to choose (`zselect::choose_coding`): the sampler
     /// sizes the record coding with raw tails beside the block coding, and
@@ -2784,6 +2802,7 @@ impl Default for Options {
             upkeep_trim_look: false,
             trim_by_resident: false,
             zpages_raw_tails_first: 0,
+            zpages_drop_raw: false,
             zpages_coding_auto: false,
             zpages_inplace_walk: true,
             zpages_build_eager: false,
@@ -3659,6 +3678,10 @@ impl SegBlob {
 
     fn advise_normal(&self) {
         self.0.advise_normal();
+    }
+
+    fn advise_dontneed(&self) {
+        self.0.advise_dontneed();
     }
 
     /// The raw form for the form file: `ZFile` reads a run that lies in a
@@ -6632,6 +6655,25 @@ impl PieceWriter {
 }
 
 impl Seg {
+    /// The partition's raw file and its ordered index dropped from the page
+    /// cache once its form file serves it (`Options::zpages_drop_raw`): the
+    /// store's mappings of them unmapped, then the files' clean pages
+    /// dropped. Neither changes a byte, and a later read of the raw form
+    /// reads them back from the file. A dirty page -- the ordered index is
+    /// written unsynced -- is written back by the drop and goes at a later
+    /// reclaim.
+    fn drop_raw_pages(&self, dir: &Path, ev: &zfile::ZEvents) {
+        self.blob.advise_dontneed();
+        self.ord.advise_dontneed();
+        let names = [Some(self.name.clone()), Db::ord_name_for(&self.name)];
+        for name in names.into_iter().flatten() {
+            if let Ok(f) = std::fs::File::open(dir.join(&name)) {
+                fadvise_dontneed(&f);
+            }
+        }
+        zfile::ZEvents::add(&ev.raw_dropped, 1);
+    }
+
     /// The two populations a raw point read of this partition touches one
     /// page of each, bytes (`zselect::model_raw`): the hash region, which
     /// every read probes, and the record region, which every read lands in.
@@ -12367,6 +12409,22 @@ struct Shared {
     fit_skips: std::sync::atomic::AtomicU32,
 }
 
+/// The clean pages of `file` that nothing maps dropped from the page cache,
+/// the whole file (`POSIX_FADV_DONTNEED`); a dirty page is written back
+/// first and dropped by a later reclaim. Nothing elsewhere.
+#[cfg(target_os = "linux")]
+fn fadvise_dontneed(file: &std::fs::File) {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: an advice over a file descriptor this call holds open; it
+    // changes no byte of the file.
+    unsafe {
+        libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fadvise_dontneed(_file: &std::fs::File) {}
+
 /// What the trim asks of glibc's allocator: the bytes it holds free in its
 /// arenas, and the return of the whole pages inside its free chunks to
 /// the system. The free count is `mallinfo2`'s, looked up by name when
@@ -16212,6 +16270,7 @@ impl Reader {
             coding_picks_block: get(&ev.coding_picks[0]),
             coding_picks_raw: get(&ev.coding_picks[1]),
             builds_raw_tails: get(&ev.builds_raw_tails),
+            raw_dropped: get(&ev.raw_dropped),
             sel_samples: get(&ev.sel_samples),
             sel_builds: get(&ev.sel_builds),
             sel_installs: get(&ev.sel_installs),
@@ -23375,6 +23434,7 @@ impl Db {
                         opts.zpages_fence_tree,
                         opts.zpages_memo_ahead,
                         opts.zpages_inplace_walk,
+                        opts.zpages_drop_raw,
                     ),
                     &zev,
                 );
@@ -26615,7 +26675,7 @@ impl Db {
         prefetch: bool,
         trusted: bool,
         memo_first: bool,
-        lines: (bool, bool, bool),
+        lines: (bool, bool, bool, bool),
         ev: &zfile::ZEvents,
     ) -> bool {
         let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) else {
@@ -26639,6 +26699,9 @@ impl Db {
                 let installed = seg.z.install(side);
                 if installed {
                     zfile::ZEvents::add(&ev.attached, 1);
+                    if lines.3 {
+                        seg.drop_raw_pages(dir, ev);
+                    }
                 }
                 installed
             }
@@ -26688,6 +26751,7 @@ impl Db {
                     self.opts.zpages_fence_tree,
                     self.opts.zpages_memo_ahead,
                     self.opts.zpages_inplace_walk,
+                    self.opts.zpages_drop_raw,
                 ),
                 ev,
             )
@@ -26734,6 +26798,9 @@ impl Db {
                         if seg.z.install(side) {
                             ev.built(&b);
                             zfile::ZEvents::add(&ev.attached, 1);
+                            if self.opts.zpages_drop_raw {
+                                seg.drop_raw_pages(&self.dir, ev);
+                            }
                         }
                     }
                     Err(_) => {
@@ -34273,6 +34340,7 @@ impl Maint {
                     self.opts.zpages_fence_tree,
                     self.opts.zpages_memo_ahead,
                     self.opts.zpages_inplace_walk,
+                    self.opts.zpages_drop_raw,
                 ),
                 ev,
             )
@@ -34464,6 +34532,9 @@ impl Maint {
                                 ev.built(&built);
                                 zfile::ZEvents::add(&ev.attached, 1);
                                 self.z_report.installed += 1;
+                                if self.opts.zpages_drop_raw {
+                                    target.drop_raw_pages(&self.dir, ev);
+                                }
                             }
                         }
                         Err(_) => {
