@@ -596,6 +596,20 @@ user's call.
   not the model's budget, and given back when the faults come; with the
   drop under it, priced on the forced arms first since under `Auto` the
   drop changes what the trial measures.
+- **Re-coding while serving** (`stage4.md`, "Re-coding a partition while it
+  serves"): `Options::zpages_recode` (off, forced form) builds a served
+  partition's form file again in the other coding and swaps the cell
+  (`ZCell::replace`, the old retired under the epoch); a once-a-second
+  policy re-codes the block partition whose decodes cost most (one decode
+  in sixteen timed, `ZFile::decode_ns16`) within the platform's budget, and
+  gives the last back over fifty refaults a second. Arm
+  `supdb-cache64tofitzpagesrecodedrop`: it finds the fit (about 480 MiB of
+  form, no fault) but spends it on the uniform read pass, so it reads level
+  with the drop arm and behind hot8+drop in C, B, E; a build during a mix
+  costs the durable commits the device flush of its ~30 MiB. **Next**: a
+  heat that outlives a pass (decayed), the raw-tailed partitions' heat as
+  their group opens priced at a decode, a swap between the two, priced at
+  `--ops-div 1` beside hot8+drop.
 - **Where E's time is, by the arm pair's profile at the head**: the LZ4
   decode 25% of the thread (147,000 groups a pass, 2.5 a form walk, nearly
   every one a memo miss, since the form walks are the Zipfian's cold tail),

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use supdb::{Db, Isolation, Options, ReadAdvice, Reader};
 
 mod common;
-use common::without_the_clock;
+use common::{dead_arena, without_the_clock};
 
 fn dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-next-{name}-{}", std::process::id()));
@@ -3696,73 +3696,6 @@ fn an_upkeep_pass_end_asks_the_trim_thread_to_look() {
     };
     assert_eq!(run(false), 0, "without the option no pass asks for a look");
     assert!(run(true) > 0, "with the option a pass end asked for a look");
-}
-
-/// A dead arena's shape: a thread takes `bytes` in pieces of a megabyte,
-/// touches every page, frees them all and exits, leaving the pages resident
-/// in free chunks of its arena -- the shape the seal and build threads leave
-/// in the suite. One allocation past the dynamic mmap threshold's start and
-/// under its cap, freed first, raises the threshold to its size and the trim
-/// threshold to twice it, so the pieces come from the thread's heap and
-/// nothing glibc does at the frees gives the heap back. A keeper of two
-/// megabytes allocated after the pieces is returned to the caller alive:
-/// glibc carves from its bins before its top, so the keeper comes from the
-/// top exactly when the last pieces did and lies above them, and the freed
-/// pieces are a bin chunk a trim reaches, not the heap's top, which a trim
-/// shrinks only past the trim threshold. The caller drops the keeper when
-/// its reading is done.
-fn dead_arena(bytes: usize) -> Vec<u8> {
-    std::thread::spawn(move || {
-        {
-            let mut raise = vec![0u8; 24 << 20];
-            raise[0] = 1;
-            std::hint::black_box(&raise);
-        }
-        let mut held: Vec<Vec<u8>> = Vec::with_capacity(bytes >> 20);
-        for _ in 0..bytes >> 20 {
-            held.push(vec![1u8; 1 << 20]);
-        }
-        let mut keeper = vec![0u8; 2 << 20];
-        keeper[0] = 1;
-        std::hint::black_box(&held);
-        keeper
-    })
-    .join()
-    .unwrap()
-}
-
-/// What the resident count reads (`Options::trim_by_resident`) and what a
-/// trim returns of it: a dead arena of thirty-two megabytes reads as that
-/// much more resident beyond use, and a trim of every arena gives it back.
-/// What the allocator holds is the whole process's and these tests share
-/// one, so each difference is held to half the arena and not to its bytes.
-#[test]
-fn the_resident_count_reads_a_dead_arenas_pages_and_a_trim_returns_them() {
-    if !Db::trim_supported() {
-        return;
-    }
-    let _trims = trim_lock();
-    // The process's resident free pages returned first, so the dead arena's
-    // pieces come from pages that have to be faulted in: in the gate's whole
-    // `db` run the process held 118 MB resident and free from the other
-    // tests' dead arenas, the pieces came from pages those had left
-    // resident, and the count rose 3 MB for an arena of 32.
-    Db::trim_now();
-    let before =
-        Db::resident_beyond_use().expect("the resident count reads where the free count does");
-    let keeper = dead_arena(32 << 20);
-    let freed = Db::resident_beyond_use().unwrap();
-    assert!(
-        freed >= before + (16 << 20),
-        "a dead arena of 32 MB read {before} -> {freed} resident beyond use"
-    );
-    Db::trim_now();
-    let trimmed = Db::resident_beyond_use().unwrap();
-    assert!(
-        freed - trimmed.min(freed) >= 16 << 20,
-        "a trim returned {freed} -> {trimmed} of the dead arena's pages"
-    );
-    drop(keeper);
 }
 
 /// The trim thread counting by the resident bytes (`Options::trim_by_resident`)

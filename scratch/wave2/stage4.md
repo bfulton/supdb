@@ -3544,3 +3544,57 @@ and E 0.75 and 0.69x -- where hot4 read it 0.71-0.75x. The decodes the next
 four raw-tailed partitions took were worth the LZ4 form's cells and not
 E's against LMDB; E's gap is the walk around the decode, as the profile of
 hot4's thread put it.
+
+## Re-coding a partition while it serves, by what its decodes cost
+
+The key-order arms know where the decodes will be before a read is made;
+a store does not. `Options::zpages_recode` (an experiment, off, the forced
+form) builds a served partition's form file again in the other coding and
+swaps it into the segment's cell (`ZCell::replace`, the old form file
+retired under the epoch as a taken one is; the build's rename over the
+name unlinked it already). A policy on the segment work's turn decides,
+once a second: each form file's decode time over the second, from the
+decode that `count_decode` samples, one in sixteen per thread, now timed
+where the option is on (`ZFile::decode_ns16`, the decodes outside the memo
+counted too); the platform's budget (`zfile::read_budget`, the limit less
+the anonymous bytes and the model's margin); and the group's file refaults
+a second. It re-codes the block-coded partition whose decodes cost the
+most to the raw tails, past a floor of 2 ms a second, while the form files'
+bytes with its estimated extra stay within the budget; over fifty refaults
+a second it gives the last re-code back and holds the form files' bytes
+there for a minute. A form file knows its own coding from its groups'
+directories (`ZFile::coded`). `tests/zpages.rs` drives the policy through
+the injection seam: the hot partition re-coded alone, every read, count and
+scan right across each swap and no read falling back to the raw form, the
+re-code given back at the refaults and held by the ceiling, re-coded again
+once the hold has passed, and nothing re-coded with no room in the budget.
+The trace (`SUPDB_ZPAGES_TRACE`) prints each look's decision (`zrecode`).
+
+Paired at five million keys under 640 MiB (`supdb-cache64tofitzpagesrecodedrop`,
+the drop arm with the policy): against the drop arm (`zrecode-ab-{1,2}`)
+level by the sign of each sitting, and against hot8 with the drop
+(`zrecodehot8-ab-{1,2}`) behind it in C (0.69-0.76), B (0.71-0.78) and E
+(0.88-0.93) in both sittings. Neither arm faulted. The trace says why: the
+policy found the fit by the budget on its own, re-coding nine or ten
+partitions a rep to about 480 MiB of form with no fault, but it
+spent the room on the uniform read pass, where every partition decodes as
+much as every other and the one-second heat picks them in whatever order
+the second's noise gives (p3, p17, p16, p18, p13, p1, p0, p12 in one rep);
+by the scans it was at the budget, and the Zipfian mixes, a few hundred
+milliseconds each at the suite's scale, came too late and too short for a
+one-second look to move it. Where the budget rose in the mixes, a build ran
+during B and A, and B's gets read level (median 128 ms against 132, twelve
+reps an arm) while its commits read slower (53 against 32): a build writes
+some 30 MiB of form file, and the durable log's next fdatasync pays the
+device's flush of those bytes, about 0.85 ms a megabyte here, as `CLAUDE.md` prices it.
+
+What it says. The mechanism holds -- the swap, the retire, the budget's fit
+under the drop -- and the heat it needs is not a second's: a uniform pass
+makes every partition look as hot as the next, and only a heat that
+outlives a pass, with a way to swap a raw-tailed partition the reads have
+left for a block-coded one they have come to, can find where the decodes
+stay. A raw-tailed partition decodes nothing, so its heat is its group
+opens, priced at what they would cost decoded. A build is not free to the
+writer either: its bytes are a device flush the durable commits pay. The
+suite's scale gives a policy a few looks in the mixes, so it is priced on
+a longer shape (`--ops-div 1`) next, beside the key-order bound.
