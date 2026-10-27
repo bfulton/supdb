@@ -585,6 +585,18 @@ pub struct ZCounts {
     pub group_bytes: u64,
 }
 
+/// One partition's form file as `Db::zpage_heat` reports it: the partition's
+/// lower fence and keys, the file's bytes, and the groups decoded from it
+/// over its life, counted in sixteens (`zfile::ZFile::decodes16`).
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct ZHeat {
+    pub lo: Vec<u8>,
+    pub keys: u64,
+    pub file_bytes: u64,
+    pub decodes: u64,
+}
+
 #[derive(Clone)]
 pub struct Options {
     pub sync: SyncPolicy,
@@ -1245,6 +1257,23 @@ pub struct Options {
     /// next. Off.
     #[doc(hidden)]
     pub trim_by_resident: bool,
+    /// EXPERIMENT: the first this many partitions by key order are built
+    /// in the record coding with raw tails, and the rest as the options say
+    /// (`zpages_raw_tails` off). The upper bound of a coding chosen per
+    /// partition by its heat: under the suite's unscrambled Zipfian half of
+    /// the E mix's decodes at five million keys fall in the first of
+    /// nineteen partitions and three quarters in the first four, so raw
+    /// tails there cost tens of megabytes over the block form where the
+    /// whole raw-tail form overran the budget by about its seventh. Key
+    /// order stands in for a heat no build can know before the reads; the
+    /// shipping choice would be the measured one. With four, the Zipfian
+    /// mixes read 12-21% faster, D level, and the uniform read pass a fifth
+    /// slower on the faults of 44 MB past the fit; with one, the point-read
+    /// mixes 10-15% faster, the read pass level, and E level, since the
+    /// first partition's decodes run warm and a raw tail saves the cold
+    /// ones. Zero, off.
+    #[doc(hidden)]
+    pub zpages_raw_tails_first: usize,
     /// EXPERIMENT: under `ZPages::Auto`, the coding the form files are built
     /// in is the selector's to choose (`zselect::choose_coding`): the sampler
     /// sizes the record coding with raw tails beside the block coding, and
@@ -2754,6 +2783,7 @@ impl Default for Options {
             zpages_trim_install: false,
             upkeep_trim_look: false,
             trim_by_resident: false,
+            zpages_raw_tails_first: 0,
             zpages_coding_auto: false,
             zpages_inplace_walk: true,
             zpages_build_eager: false,
@@ -16069,6 +16099,29 @@ impl Reader {
             .iter()
             .map(|s| s.raw_touches.load(AtomicOrdering::Relaxed))
             .sum()
+    }
+
+    /// Each partition's form file in key order: the partition's lower
+    /// fence and keys, the file's bytes (a raw-tailed one holds about half
+    /// again the bytes a key of a block-coded one at the suite's shape), and
+    /// the groups decoded from it over its life, counted in
+    /// sixteens (`ZFile::decodes16`). For a test, and the suite's per-mix
+    /// heat line (`SUPDB_MIX_HEAT`), which says where the decodes land.
+    #[doc(hidden)]
+    pub fn zpage_heat(&self) -> Vec<ZHeat> {
+        let _entered = self.enter();
+        let mut out = Vec::new();
+        for seg in self.segs().iter().filter(|s| s.level > 0) {
+            if let Some(z) = seg.z.get() {
+                out.push(ZHeat {
+                    lo: seg.lo.clone(),
+                    keys: seg.raw().keys() as u64,
+                    file_bytes: z.file_bytes(),
+                    decodes: 16 * z.decodes16.load(AtomicOrdering::Relaxed),
+                });
+            }
+        }
+        out
     }
 
     pub fn zpage_counts(&self) -> ZCounts {
@@ -34260,7 +34313,25 @@ impl Maint {
             Some(zselect::Coding::Block) if self.opts.zpages_coding_auto => {
                 (zpages::ZCODING_BLOCK, false)
             }
-            _ => (self.opts.z_coding(), self.opts.zpages_raw_tails),
+            _ => {
+                // The first partitions by key order raw-tailed
+                // (`Options::zpages_raw_tails_first`), the rest as the
+                // options say.
+                let first = self.opts.zpages_raw_tails_first;
+                let hot = first > 0 && !self.opts.zpages_raw_tails && {
+                    let _op = self.op();
+                    self.segs()
+                        .iter()
+                        .filter(|s| s.level > 0 && s.lo < seg.lo)
+                        .count()
+                        < first
+                };
+                if hot {
+                    (zpages::ZCODING_RECORD, true)
+                } else {
+                    (self.opts.z_coding(), self.opts.zpages_raw_tails)
+                }
+            }
         };
         plan.coding = coding;
         plan.store_all = self.opts.zpages_store_all;

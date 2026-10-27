@@ -3309,3 +3309,84 @@ cold decode of 2.5 groups a scan and the walk around it, and on the raw-tail
 form the faults and the settle; the raw-tail form's scan at three million,
 decoding nothing, reads 0.80 of the LZ4 form's, which is about LMDB's
 fault-free rate by the profile's shares.
+
+## Raw tails where the reads are: the decodes by partition, and the hottest partitions raw-tailed
+
+The raw-tail form loses D and E at five million keys under 640 MiB on its
+faults alone (the settle's excess in E is the same faults, half of the
+settle's samples in `owner_span_from` reading form pages that are not
+resident, its CPU level with the LZ4 arm's), and the LZ4 form's E thread is a
+quarter cold decode. A probe counted each form file's opens, decodes and memo
+hits by partition, printed after each mix under `SUPDB_MIX_HEAT`
+(`heat_read.py` differencing consecutive mixes); what stays of it is the
+decodes alone, counted once in sixteen decodes per thread so that no reader
+thread writes a shared line on every decode (`ZFile::decodes16`,
+`Db::zpage_heat`). The suite's
+Zipfian is unscrambled, so the reads pile onto the low keys: of E's 147,000
+decodes a mix, 49.7% fall in the first of nineteen partitions, 61.9% in the
+first two and 74.3% in the first four, each 290,000 keys and 21 MB of LZ4
+form (32 MB raw-tailed); B and A put 54% and 52% of theirs in the first, and
+D, whose reads land evenly, 5-6% in each.
+
+So raw tails on the first partitions cost tens of megabytes where the whole
+raw-tail form cost 196 over the LZ4 form's 360. `Options::zpages_raw_tails_first`
+(an experiment, off) builds the first N partitions by key order in the
+record coding with raw tails and the rest in the block coding; key order
+stands in for a heat no build can know before the reads, so these arms are
+the lever's upper bound and not a policy. `supdb-cache64tofitzpageshot4` and
+`supdb-cache64tofitzpageshot1` are the forced LZ4 arm with four and one.
+`tests/zpages.rs` holds a store under the option to the raw form's answers in
+every read, count and scan, exactly the first partitions' builds raw-tailed,
+the scans reading those groups in place, and the raw-tailed files larger a
+key.
+
+Hot4 against the LZ4 form (`zhot4-ab-{1,2}`, both orders, five pairs a
+sitting, the census and the heat on): no major fault in any mix for either
+arm; E's decodes 37,326 a mix against 147,000, three quarters gone as the
+probe said; E's scans 0.877 of the LZ4 form's time in twelve pairs of twelve,
+C's gets 0.79, B 0.84, A 0.80, F 0.84, D 0.97 (level), the process's
+anonymous bytes in E level (76-100 MB against 76-94). And the read pass, the
+uniform point reads right after the build, read 0.78-0.80 of the LZ4 form's
+rate in both orders, with 0.013-0.014 major faults a read where the LZ4 form
+takes none, and its threaded reads 0.74-0.89; the scan pass level to the
+order's noise with 0.007-0.017 faults a scan. A pass that reads every
+partition needs the whole form resident, and the 44 MB over the LZ4 form's
+360 pushed it past the fit at this rung, where the Zipfian mixes' working
+set still fits. The LZ4 form reads that pass at 1.79x LMDB's, so the loss is
+a penalty on a cell already won, and key order is not a rule a store can
+ship.
+
+Hot1 against the LZ4 form (`zhot1-ab-{1,2}`): no fault anywhere, the read
+pass level (0.96-0.98, the threaded reads 0.99-1.01), the scan pass level; C's
+gets 0.86 of the LZ4 form's time, B 0.85, A 0.88, F 0.90 in ten to twelve
+pairs of twelve, D 1.00; and E 0.977, level, though the first partition's
+raw tails took E's decodes from 147,000 a mix to 73,000. Hot4 took the next
+36,000 and read E 0.877. So the first partition's 74,000 decodes were worth
+about 0.13 µs each and p1-p3's 36,000 about 1.4: the first partition's
+groups come back so often that their decodes run warm, at about what the
+in-place walk of the same records costs, and the cold decodes are the ones
+a raw tail saves, at the cycling figure the decoder probe gave. The heat
+that chooses a partition's coding is the cost of its decodes, not their
+count; the hottest partition is not the most profitable.
+
+Hot4 against LMDB (`zhot4lmdb-ab-{1,2}`): hot4 wins every cell but E in both
+orders -- the read pass 1.46-1.71x LMDB's, A 4.9-5.8x, F 4.1-4.9x, B 2.2-2.3x,
+C 1.27-1.44x, D 1.45-1.88x, the scan pass 1.21-1.23x, none of the mixes
+faulting where LMDB takes 0.005-0.04 a operation -- and reads E at 0.71-0.75x,
+LMDB's E faulting 0.011-0.017 a scan in this sitting against 0.025 in the
+one before and running 1.4-1.6x faster than it did there. Hot4's E is about
+6 µs a scan of the engine's own time with most of its decodes gone, where
+LMDB's is about 4.6 with its faults; the walk around the decode is E's gap
+now.
+
+What it says. A coding chosen per partition is the lever the probe pointed
+at, and the arms by key order bound it: up to a fifth off the Zipfian mixes
+where the extra bytes fit, a fifth onto a uniform pass where they do not,
+and the pass's fit line at this rung between 371 and 404 MB of form against
+a budget the controller's model puts at about 486 MiB. A shipping choice has
+three inputs the arms do not have: the heat as decode cost by partition,
+which no build can know before the reads and which moves (the suite's
+uniform passes run before its Zipfian mixes), so a partition is re-coded
+while the store serves; the fit, measured by the census's faults and not by
+the model's budget, which is too generous by about the hot4 arm's extra;
+and a way back when either turns. Both arms stay, off.

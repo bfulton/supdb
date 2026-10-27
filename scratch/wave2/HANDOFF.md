@@ -547,6 +547,24 @@ user's call.
   form where it fits are the levers); on the raw-tail form the faults and
   the settle (121 ms of E against the LZ4 form's 51, unexplained -- profile
   the settle's frames in the lean arm's E).
+- **Raw tails where the reads are** (`stage4.md`, "Raw tails where the reads
+  are"): the lean arm's settle excess was its faults (`owner_span_from`
+  reading form pages not resident), the fit again. A heat probe put half of
+  E's decodes at five million under 640 MiB in the first of nineteen
+  partitions and three quarters in the first four (B and A 52-54% in the
+  first, D even); `Db::zpage_heat` and the `mixheat` line
+  (`SUPDB_MIX_HEAT`, decodes counted one in sixteen a thread) keep the
+  count. `Options::zpages_raw_tails_first` (off) raw-tails the first N
+  partitions by key order: hot4 reads E 0.877, C 0.79, B 0.84, A 0.80, F
+  0.84, D 0.97 against the LZ4 form with no fault in any mix, and the
+  uniform read pass 0.78-0.80 with 0.013 faults a read (44 MB past the fit);
+  hot1 reads C/B/A/F 0.85-0.90, the read pass level and E level (0.977) --
+  p0's decodes run warm (0.13 µs saved each), p1-p3's cold (1.4). Hot4
+  against LMDB wins every cell but E (0.71-0.75x). **Next**: a heat-driven
+  coding, re-coded while serving: heat as decode cost by partition (time
+  one decode in sixteen), the fit by the census's faults and not the
+  model's budget (404 MB faulted where the model allows ~486 MiB), and a
+  way back; and E's walk itself, about 6 µs a scan against LMDB's 4.6.
 - **Where E's time is, by the arm pair's profile at the head**: the LZ4
   decode 25% of the thread (147,000 groups a pass, 2.5 a form walk, nearly
   every one a memo miss, since the form walks are the Zipfian's cold tail),

@@ -290,6 +290,13 @@ pub trait Engine {
         Vec::new()
     }
 
+    /// Each form file's keys, megabytes and decodes, by partition in key
+    /// order (`Db::zpage_heat`): where a mix's decodes land, printed after
+    /// each mix under `SUPDB_MIX_HEAT`. Empty for an engine with no form.
+    fn zpage_heat(&self) -> String {
+        String::new()
+    }
+
     /// The second form as the engine holds it, or `None` for an engine
     /// that has none. A pass asks between its timed phases whether a forced
     /// arm is what it says it is, and `counters` is not for that: it takes
@@ -885,6 +892,11 @@ pub struct Supdb {
     /// `supdb-cache64tofitzpagesrecordrawleanresident` against
     /// `supdb-cache64tofitzpages`.
     ztrimresident: bool,
+    /// The first this many partitions by key order raw-tailed and the rest
+    /// block-coded (`Options::zpages_raw_tails_first`): the upper bound of a
+    /// coding chosen per partition by its heat,
+    /// `supdb-cache64tofitzpageshot4` against `supdb-cache64tofitzpages`.
+    zhotfirst: usize,
     /// before any view (`Options::zpages_memo_first`):
     /// `supdb-cache64tofitautozpagesmemofirst`, the pair against
     /// `supdb-cache64tofitautozpages`.
@@ -1391,6 +1403,9 @@ struct Policy {
     /// Its trim counting by the resident bytes (`Options::trim_by_resident`):
     /// `supdb-cache64tofitzpagesrecordrawleanresident`.
     ztrimresident: bool,
+    /// Its first partitions raw-tailed (`Options::zpages_raw_tails_first`):
+    /// `supdb-cache64tofitzpageshot4`.
+    zhotfirst: usize,
     /// (`Options::zpages_memo_first`): `supdb-cache64tofitautozpagesmemofirst`.
     zmemofirst: bool,
     /// The fence searched through its tree (`Options::zpages_fence_tree`):
@@ -1531,6 +1546,7 @@ impl Default for Policy {
             zdecodewalk: false,
             ztrimpass: false,
             ztrimresident: false,
+            zhotfirst: 0,
             zmemofirst: false,
             zfencetree: false,
             zmemonoahead: false,
@@ -4435,6 +4451,41 @@ impl Supdb {
         )
     }
 
+    /// `supdb-cache64tofitzpages` with its first four partitions by key order
+    /// built in the record coding with raw tails and the rest in the block
+    /// coding (`Options::zpages_raw_tails_first`),
+    /// `supdb-cache64tofitzpageshot4`: the upper bound of a coding chosen per
+    /// partition by its heat, where the suite's unscrambled Zipfian puts
+    /// three quarters of the E mix's decodes at five million keys.
+    pub fn create_cache64_tofit_zpages_hot4(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages: true,
+                zhotfirst: 4,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cache64tofitzpageshot4` with the first partition alone
+    /// raw-tailed, `supdb-cache64tofitzpageshot1`: half of the E mix's
+    /// decodes at five million keys for a quarter of hot4's extra bytes.
+    pub fn create_cache64_tofit_zpages_hot1(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages: true,
+                zhotfirst: 1,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-nocachezpages` with a scan's seek of a covered partition by
     /// the ordered index's heads (`Options::zpages_seek_ord` on): the pair
     /// against `supdb-nocachezpages` differs by that one option and prices
@@ -4768,6 +4819,7 @@ impl Supdb {
             zdecodewalk,
             ztrimpass,
             ztrimresident,
+            zhotfirst,
             zmemofirst,
             zfencetree,
             zmemonoahead,
@@ -5037,6 +5089,7 @@ impl Supdb {
             zpages_inplace_walk: !zdecodewalk,
             upkeep_trim_look: ztrimpass,
             trim_by_resident: ztrimresident,
+            zpages_raw_tails_first: zhotfirst,
             zpages_record_coding: zrecord || zrawtails,
             zpages_memo_first: zmemofirst,
             zpages_fence_tree: zfencetree,
@@ -5237,6 +5290,7 @@ impl Supdb {
             zdecodewalk,
             ztrimpass,
             ztrimresident,
+            zhotfirst,
             zmemofirst,
             zfencetree,
             zmemonoahead,
@@ -5370,6 +5424,10 @@ impl Engine for Supdb {
         if self.budget == 64 << 20 && self.tofit && self.zpages {
             return if self.zstored {
                 "supdb-cache64tofitzpagesstored"
+            } else if self.zhotfirst == 4 {
+                "supdb-cache64tofitzpageshot4"
+            } else if self.zhotfirst == 1 {
+                "supdb-cache64tofitzpageshot1"
             } else if self.zrawtails
                 && self.zpages_nomemo
                 && self.ztrim
@@ -6289,6 +6347,20 @@ impl Engine for Supdb {
             ("zpage_group_bytes_at_end", z.group_bytes as f64),
         ]
     }
+    fn zpage_heat(&self) -> String {
+        let Some(db) = self.db.as_ref() else {
+            return String::new();
+        };
+        db.zpage_heat()
+            .iter()
+            .map(|h| {
+                let lo = String::from_utf8_lossy(&h.lo[..h.lo.len().min(16)]).into_owned();
+                format!("{lo}:{}:{}MB:{}", h.keys, h.file_bytes >> 20, h.decodes)
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     fn memory_census(&self) -> Vec<(String, u64)> {
         self.db
             .as_ref()
@@ -6882,6 +6954,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache64tofitzpagesrecordrawlean"
         | "supdb-cache64tofitzpagesrecordrawleantrim"
         | "supdb-cache64tofitzpagesrecordrawleanresident"
+        | "supdb-cache64tofitzpageshot4"
+        | "supdb-cache64tofitzpageshot1"
         | "supdb-cache64tofitzpagesrecordrawdecode"
         | "supdb-nocachezpagesheads"
         | "supdb-nocachezpagesprefetch"
@@ -7115,6 +7189,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cache64tofitzpagesrecordrawleanresident" => Box::new(
             Supdb::create_cache64_tofit_zpages_record_raw_lean_resident(dir)?,
         ),
+        "supdb-cache64tofitzpageshot4" => Box::new(Supdb::create_cache64_tofit_zpages_hot4(dir)?),
+        "supdb-cache64tofitzpageshot1" => Box::new(Supdb::create_cache64_tofit_zpages_hot1(dir)?),
         "supdb-cache64tofitzpagesrecordrawdecode" => {
             Box::new(Supdb::create_cache64_tofit_zpages_record_raw_decode(dir)?)
         }
@@ -8662,6 +8738,48 @@ mod tests {
             drop(arm);
         }
         assert!(supdb::Options::default().zpages_block_cursor && b.zpages_block_cursor);
+        // The first four partitions raw-tailed, the rest block-coded: the
+        // forced block form's arm but for that one option.
+        for (name, make, first) in [
+            (
+                "supdb-cache64tofitzpageshot4",
+                Supdb::create_cache64_tofit_zpages_hot4 as fn(&Path) -> Res<Supdb>,
+                4,
+            ),
+            (
+                "supdb-cache64tofitzpageshot1",
+                Supdb::create_cache64_tofit_zpages_hot1 as fn(&Path) -> Res<Supdb>,
+                1,
+            ),
+        ] {
+            let hot = new(name, make);
+            assert_eq!(hot.name(), name);
+            assert_eq!(guarantee(hot.name()), guarantee(base.name()));
+            assert_eq!(hot.features(), base.features());
+            let g = hot.db.as_ref().unwrap().options();
+            assert_eq!(g.zpages, supdb::ZPages::Always);
+            assert_eq!(g.zpages_raw_tails_first, first, "{name}: the one option");
+            assert_eq!(supdb::Options::default().zpages_raw_tails_first, 0);
+            assert!(!g.zpages_raw_tails && !g.zpages_record_coding && g.zpages_memo);
+            assert_eq!(
+                (
+                    g.scan_cache_bytes,
+                    g.forms_to_fit,
+                    g.scan_block_cache,
+                    g.zpages_memo_ahead,
+                    g.zpages_inplace_walk
+                ),
+                (
+                    b.scan_cache_bytes,
+                    b.forms_to_fit,
+                    b.scan_block_cache,
+                    b.zpages_memo_ahead,
+                    b.zpages_inplace_walk
+                ),
+                "{name}: the rest as the combined arm's"
+            );
+            drop(hot);
+        }
         let perrun = new(
             "supdb-cache64tofitautozpagesperrun",
             Supdb::create_cache64_tofit_auto_zpages_perrun,

@@ -529,7 +529,12 @@ the whole page slower (`bench/examples/zlines.rs`), where fewer tokens
 to parse did (`zdecode --hc`: liblz4's high-compression mode, 16% off
 the cold decode and 4% off the form at level 9). A software prefetch is
 a lever on a stall the profile shows as a load; a cold decode's stall is
-its branches. And a self time is read as misses only after the
+its branches. And a decode removed is priced by what it cost: raw tails on
+the partition that held half the E mix's decodes took them away and moved
+E by two percent, since that partition's groups came back warm, and the
+next three partitions' third as many decodes moved it by ten -- a heat
+counted in decodes ranks the warm partition first and the profitable ones
+after it. And a self time is read as misses only after the
 structure's size is read against the cache per instance, not per store:
 the fence's search was a twentieth of E's thread and was taken for a
 binary search over 93,000 entries missing on two lines a probe, so a tree
