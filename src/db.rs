@@ -1307,14 +1307,17 @@ pub struct Options {
     /// form file is built again in the other coding while it serves, by
     /// what its decodes cost: once a second the segment work reads each
     /// form file's decode time (one decode in sixteen timed,
-    /// `ZFile::decode_ns16`), and re-codes the block-coded partition whose
-    /// decodes cost the most to the raw-tail record coding, where its
-    /// decodes would be in-place walks, while the form files' bytes with
-    /// the raw tails' extra stay within the budget the platform gives
-    /// (`zfile::read_budget`); and when the group's file refaults pass a
-    /// floor, the last partition it re-coded goes back to the block coding
-    /// and the form files' bytes are held where that leaves them for a
-    /// while. The new form file is built beside the old under the same
+    /// `ZFile::decode_ns16`) and a raw-tailed one's group opens priced at a
+    /// decode (`ZFile::opens16`), into a heat decayed over ten seconds; it
+    /// re-codes the hottest block-coded partition to the raw-tail record
+    /// coding, where its decodes would be in-place walks, while the form
+    /// files' bytes with the raw tails' extra stay within the budget the
+    /// platform gives (`zfile::read_budget`), and where they would not,
+    /// gives the coldest raw-tailed one back to make the room if the hot
+    /// one is twice as hot; and when the group's file refaults pass a
+    /// floor, the coldest raw-tailed partition goes back to the block
+    /// coding and the form files' bytes are held where that leaves them for
+    /// a while. The new form file is built beside the old under the same
     /// name and swapped into the cell, the old retired under the epoch.
     /// The budget counts the form files alone, so it is the shape for a
     /// store whose raw pages go (`zpages_drop_raw`). Off.
@@ -31523,6 +31526,15 @@ const RECODE_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
 const RECODE_FLOOR_NS: f64 = 2.0e6;
 const RECODE_REFAULTS: f64 = 50.0;
 const RECODE_HOLD: std::time::Duration = std::time::Duration::from_secs(60);
+/// The re-code policy's heat: the time its decay takes a partition's heat
+/// down by e, so a uniform pass of a few seconds does not settle where the
+/// raw tails go; how much hotter a block-coded partition has to be than the
+/// coldest raw-tailed one to take its room; and the decode's price a
+/// raw-tailed partition's opens are read at before any block-coded form
+/// file has counted one.
+const RECODE_TAU: std::time::Duration = std::time::Duration::from_secs(10);
+const RECODE_SWAP: f64 = 2.0;
+const RECODE_DECODE_NS: f64 = 1000.0;
 
 /// The store's segment work: a seal's landing, a merge's and a piece
 /// merge's, a promotion, the manifest that names what is live, and the WAL
@@ -31718,14 +31730,14 @@ struct Maint {
     /// model's last reading (`Options::zpages_prebuild`).
     z_past_budget: bool,
     /// The re-code policy's (`Options::zpages_recode`): when it last
-    /// looked; each form file's decode time then, by its attach's identity;
-    /// the group's file refaults then; the partitions it re-coded to the
-    /// raw tails, in the order it did; and the ceiling a give-back set on
-    /// the form files' bytes, with when refaults last held it.
+    /// looked; each form file's decode time and opens then, by its attach's
+    /// identity; each partition's decayed heat, by its name; the group's
+    /// file refaults then; and the ceiling a give-back set on the form
+    /// files' bytes, with when refaults last held it.
     z_recode_last: Option<std::time::Duration>,
-    z_recode_seen: std::collections::HashMap<u64, u64>,
+    z_recode_seen: std::collections::HashMap<u64, (u64, u64)>,
+    z_recode_heat: std::collections::HashMap<String, f64>,
     z_recode_refaults: Option<u64>,
-    z_recoded: Vec<String>,
     z_recode_ceiling: Option<(u64, std::time::Duration)>,
 }
 
@@ -32223,8 +32235,8 @@ impl Maint {
             z_past_budget: false,
             z_recode_last: None,
             z_recode_seen: std::collections::HashMap::new(),
+            z_recode_heat: std::collections::HashMap::new(),
             z_recode_refaults: None,
-            z_recoded: Vec::new(),
             z_recode_ceiling: None,
         }
     }
@@ -33546,15 +33558,18 @@ impl Maint {
     /// The re-code policy's turn (`Options::zpages_recode`), with no build
     /// in flight: once a `RECODE_PERIOD`, each served form file's decode
     /// time a second over the period, the group's file refaults a second,
-    /// and the platform's budget; then at most one re-code. Over the
-    /// refault floor, the last partition re-coded to the raw tails goes
-    /// back to the block coding and the form files' bytes are held where
-    /// that leaves them until `RECODE_HOLD` passes under the floor; under
-    /// it, the block-coded partition whose decodes cost the most a second,
-    /// past `RECODE_FLOOR_NS`, is re-coded to the raw tails if the form
-    /// files' bytes with its estimated extra stay within the budget and the
-    /// ceiling. Nothing is decided while a seal or a merge is rewriting the
-    /// partitions, and nothing without a budget.
+    /// and the platform's budget; then at most one re-code. A partition's
+    /// heat is its decode time a second, or for a raw-tailed one its opens
+    /// priced at a decode, decayed over `RECODE_TAU`. Over the refault
+    /// floor, the coldest raw-tailed partition goes back to the block
+    /// coding and the form files' bytes are held where that leaves them
+    /// until `RECODE_HOLD` passes under the floor; under it, the hottest
+    /// block-coded partition, past `RECODE_FLOOR_NS`, is re-coded to the
+    /// raw tails if the form files' bytes with its estimated extra stay
+    /// within the budget and the ceiling, and where they would not, the
+    /// coldest raw-tailed one goes back to make the room if the hot one is
+    /// `RECODE_SWAP` times hotter. Nothing is decided while a seal or a
+    /// merge is rewriting the partitions, and nothing without a budget.
     fn z_recode_tick(&mut self) {
         let now = self.z_now();
         if self
@@ -33595,8 +33610,8 @@ impl Maint {
             }
         };
         // Each served partition by its form file: its coding, its bytes, its
-        // records' bytes, and its decode time a second over the period -- a
-        // form file first seen is read now, for the next period.
+        // records' bytes, and what its form file has counted -- the decode
+        // time, the decodes and the record-coded groups opened in place.
         struct Served {
             seg: std::sync::Arc<Seg>,
             coded: bool,
@@ -33604,7 +33619,8 @@ impl Maint {
             records: u64,
             heat: f64,
         }
-        let rows: Vec<(std::sync::Arc<Seg>, u64, bool, u64, u64, u64)> = {
+        type Row = (std::sync::Arc<Seg>, u64, bool, u64, u64, u64, u64, u64);
+        let rows: Vec<Row> = {
             let _op = self.op();
             self.segs()
                 .iter()
@@ -33618,20 +33634,67 @@ impl Maint {
                         z.file_bytes(),
                         s.foot().1,
                         16 * z.decode_ns16.load(AtomicOrdering::Relaxed),
+                        16 * z.decodes16.load(AtomicOrdering::Relaxed),
+                        16 * z.opens16.load(AtomicOrdering::Relaxed),
                     ))
                 })
                 .collect()
         };
+        // A decode's time where a test has priced one through the seam: a
+        // form file's decode time is then its decodes at that price, since
+        // the time a decode takes is the build profile's and a test does not
+        // choose it.
+        let priced = inject
+            .as_ref()
+            .and_then(|i| i.decode_cost())
+            .map(|c| c.as_nanos().min(u64::MAX as u128) as u64);
+        let rows: Vec<Row> = match priced {
+            Some(c) => rows
+                .into_iter()
+                .map(|mut r| {
+                    r.5 = r.6.saturating_mul(c);
+                    r
+                })
+                .collect(),
+            None => rows,
+        };
+        // What a decode costs, from the block-coded files' counts: the price
+        // a raw-tailed file's opens are read at, since it decodes nothing.
+        let (ns_all, decodes_all) = rows
+            .iter()
+            .filter(|r| !r.2)
+            .fold((0u64, 0u64), |(n, d), r| (n + r.5, d + r.6));
+        let per_decode = if decodes_all == 0 {
+            RECODE_DECODE_NS
+        } else {
+            ns_all as f64 / decodes_all as f64
+        };
+        // A partition's heat, kept by its name across its re-codes: the
+        // period's rate folded into what the periods before left, decayed
+        // over `RECODE_TAU`, so that a pass a few seconds long does not
+        // settle where the decodes are; a form file first seen gives no rate
+        // and its partition's heat only decays.
+        let keep = dt.map(|d| (-d.as_secs_f64() / RECODE_TAU.as_secs_f64()).exp());
         let mut seen = std::collections::HashMap::with_capacity(rows.len());
+        let mut heats = std::collections::HashMap::with_capacity(rows.len());
         let mut parts = Vec::with_capacity(rows.len());
-        for (seg, id, coded, bytes, records, ns) in rows {
-            let heat = match (self.z_recode_seen.get(&id), dt) {
-                (Some(&ns0), Some(d)) if !d.is_zero() => {
+        for (seg, id, coded, bytes, records, ns, _decodes, opens) in rows {
+            let rate = match (self.z_recode_seen.get(&id), dt) {
+                (Some(&(ns0, opens0)), Some(d)) if !d.is_zero() => Some(if coded {
+                    opens.saturating_sub(opens0) as f64 * per_decode / d.as_secs_f64()
+                } else {
                     ns.saturating_sub(ns0) as f64 / d.as_secs_f64()
-                }
-                _ => 0.0,
+                }),
+                _ => None,
             };
-            seen.insert(id, ns);
+            let old = self.z_recode_heat.get(&seg.name).copied().unwrap_or(0.0);
+            let heat = match (rate, keep) {
+                (Some(r), Some(a)) => a * old + (1.0 - a) * r,
+                (None, Some(a)) => a * old,
+                _ => old,
+            };
+            seen.insert(id, (ns, opens));
+            heats.insert(seg.name.clone(), heat);
             parts.push(Served {
                 seg,
                 coded,
@@ -33641,6 +33704,7 @@ impl Maint {
             });
         }
         self.z_recode_seen = seen;
+        self.z_recode_heat = heats;
         let rewriting =
             self.compacting.is_some() || self.tiering.is_some() || !self.sealing.is_empty();
         let (Some(budget), Some(_)) = (budget, dt) else {
@@ -33678,14 +33742,12 @@ impl Maint {
                 ceiling.map_or_else(|| "-".to_string(), |c| c.to_string()),
             );
         };
+        let coldest_raw = parts
+            .iter()
+            .filter(|p| p.coded)
+            .min_by(|a, b| a.heat.total_cmp(&b.heat));
         if refault_rate > RECODE_REFAULTS {
-            self.z_recoded
-                .retain(|n| parts.iter().any(|p| p.seg.name == *n && p.coded));
-            let back = self
-                .z_recoded
-                .last()
-                .and_then(|n| parts.iter().find(|p| p.seg.name == *n));
-            let ceiling = match back {
+            let ceiling = match coldest_raw {
                 Some(p) => total
                     .saturating_sub(p.bytes)
                     .saturating_add((p.records as f64 * block_ratio) as u64),
@@ -33693,9 +33755,9 @@ impl Maint {
             };
             self.z_recode_ceiling = Some((ceiling, now));
             if self.z_trace {
-                trace("back", back, Some(ceiling));
+                trace("back", coldest_raw, Some(ceiling));
             }
-            if let Some(p) = back {
+            if let Some(p) = coldest_raw {
                 let seg = p.seg.clone();
                 self.z_start(seg, ZKind::Recode, false);
             }
@@ -33722,17 +33784,32 @@ impl Maint {
         }
         let extra = ((p.records as f64 * raw_ratio) as u64).saturating_sub(p.bytes);
         let limit = self.z_recode_ceiling.map_or(budget, |(c, _)| c.min(budget));
-        if total.saturating_add(extra) > limit {
+        if total.saturating_add(extra) <= limit {
             if self.z_trace {
-                trace("full", Some(p), self.z_recode_ceiling.map(|c| c.0));
+                trace("raw", Some(p), self.z_recode_ceiling.map(|c| c.0));
             }
+            let seg = p.seg.clone();
+            self.z_start(seg, ZKind::Recode, false);
             return;
         }
-        if self.z_trace {
-            trace("raw", Some(p), self.z_recode_ceiling.map(|c| c.0));
+        // No room: made by the coldest raw-tailed partition where the
+        // hottest block-coded one is `RECODE_SWAP` times hotter, and taken
+        // by it at a later look. A swap sets no ceiling: the room is made,
+        // not found wanting.
+        match coldest_raw {
+            Some(q) if q.heat * RECODE_SWAP < p.heat => {
+                if self.z_trace {
+                    trace("swap", Some(q), self.z_recode_ceiling.map(|c| c.0));
+                }
+                let seg = q.seg.clone();
+                self.z_start(seg, ZKind::Recode, false);
+            }
+            _ => {
+                if self.z_trace {
+                    trace("full", Some(p), self.z_recode_ceiling.map(|c| c.0));
+                }
+            }
         }
-        let seg = p.seg.clone();
-        self.z_start(seg, ZKind::Recode, false);
     }
 
     /// The controller's clock: the injected one where a test has moved it,
@@ -34838,10 +34915,8 @@ impl Maint {
                         zfile::ZEvents::add(&ev.attached, 1);
                         if coded {
                             zfile::ZEvents::add(&ev.recodes, 1);
-                            self.z_recoded.push(target.name.clone());
                         } else {
                             zfile::ZEvents::add(&ev.recodes_back, 1);
-                            self.z_recoded.retain(|n| *n != target.name);
                         }
                         if self.opts.zpages_drop_raw {
                             target.drop_raw_pages(&self.dir, ev);

@@ -7388,6 +7388,11 @@ fn recode_store(name: &str, budget: u64) -> (PathBuf, Db, Model, std::sync::Arc<
     let inject = std::sync::Arc::new(supdb::ZInject::new());
     inject.set_budget(budget);
     inject.set_refault_rate(0.0);
+    // A decode priced by the seam, so that a partition's heat is its
+    // decodes and not the build profile's speed: the checked build decodes
+    // twenty thousand groups in 13 ms, under the floor once decayed, where
+    // the dev build takes 155.
+    inject.set_decode_cost(std::time::Duration::from_micros(10));
     inject.advance(std::time::Duration::from_millis(1));
     let mut db = Db::create(
         &dir,
@@ -7486,6 +7491,67 @@ fn the_partition_whose_decodes_cost_most_is_recoded_while_it_serves() {
     assert_eq!(c.fallbacks, 0, "no read fell back to the raw form: {c:?}");
     check(&db, &model, &keys, "re-coded again");
     check_scan(&db, &model, "re-coded again");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_partition_the_reads_have_left_gives_its_raw_tails_to_one_they_have_come_to() {
+    // With room in the budget for one raw-tailed partition, the first one
+    // heated is re-coded; heat moved to another, the policy gives the first
+    // back once the second's decayed heat is twice its own, and re-codes
+    // the second into the room. Every read and scan answers as the raw form
+    // does across both swaps.
+    let (dir, db, model, inject) = recode_store("recode-swap", 1);
+    let files = db.zpage_counts().file_bytes;
+    // One partition's extra fits, at the records' bytes or the raw tails'
+    // own ratio; two do not.
+    inject.set_budget(files + files / 20);
+    let first = keys_of_partition(&db, &model, 1);
+    let second = keys_of_partition(&db, &model, 3);
+    heat_up(&db, &first, 20_000);
+    recode_look(&db, std::time::Duration::from_secs(1));
+    assert!(
+        recode_until(&db, |c| c.recodes >= 1),
+        "the first re-coded: {:?}",
+        db.zpage_counts()
+    );
+    assert!(codings(&db)[1], "the first: {:?}", codings(&db));
+    let mut looks = 0;
+    while !(db.zpage_counts().recodes >= 2 && db.zpage_counts().recodes_back >= 1) {
+        assert!(
+            looks < 20,
+            "no swap in {looks} looks: {:?} {:?}",
+            db.zpage_counts(),
+            codings(&db)
+        );
+        heat_up(&db, &second, 20_000);
+        let started = db.zpage_counts().build_starts;
+        recode_look(&db, std::time::Duration::from_secs(1));
+        // A re-code the look started is collected at a later turn.
+        if db.zpage_counts().build_starts > started {
+            let was = db.zpage_counts();
+            assert!(
+                recode_until(&db, |c| {
+                    c.recodes + c.recodes_back + c.recode_failed
+                        > was.recodes + was.recodes_back + was.recode_failed
+                }),
+                "the re-code the look started is collected: {:?}",
+                db.zpage_counts()
+            );
+        }
+        looks += 1;
+    }
+    let coded = codings(&db);
+    assert!(
+        coded[3] && !coded[1] && coded.iter().filter(|c| **c).count() == 1,
+        "the second raw-tailed in the first's room: {coded:?}"
+    );
+    let c = db.zpage_counts();
+    assert_eq!(c.recode_failed, 0, "{c:?}");
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    check(&db, &model, &keys, "swapped");
+    check_scan(&db, &model, "swapped");
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
