@@ -2338,7 +2338,15 @@ pages of the 1,004 (the sixteen sampled, the resident part and the
 trailer), and the test holds the attach to a quarter of the file. The rule
 again: the advice is set before the first read it is for, and what a step
 leaves resident is read from the kernel between the steps, never taken
-from the file's size.
+from the file's size. And a page a mapping holds is not one a drop of the
+file's cache takes: `POSIX_FADV_DONTNEED` skips it and `MADV_COLD` only
+ages it, so the raw key section the open's checksum check maps stayed
+resident beside a form that no read sends there, 85 MB of the 496 a store
+of five million keys held under 640 MiB, with 38 MB of ordered indexes
+beside it, and the form the bound could not hold faulted for the want of
+them; `mincore` over the store's files read it
+(`scratch/wave2/probe/resident.py`), and the drop unmaps first
+(`MADV_DONTNEED`, `Options::zpages_drop_raw`).
 
 **A second mechanism that masks the first in a test.** Once the settle swept
 the directory, the test that a merge takes the form file of the segment it

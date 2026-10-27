@@ -565,6 +565,25 @@ user's call.
   one decode in sixteen), the fit by the census's faults and not the
   model's budget (404 MB faulted where the model allows ~486 MiB), and a
   way back; and E's walk itself, about 6 µs a scan against LMDB's 4.6.
+- **E's walk beside LMDB's, and the raw pages dropped at install**
+  (`stage4.md`, "E with most of its decodes gone" and "What stays resident
+  beside a form"): hot4's E thread is spread -- the start seek 15%, the
+  block walk 18% (its first touch of each record, as LMDB's cursor), the
+  clean walks 13%, the overlay builds over the mixes' updates a sixth, which
+  LMDB has no counterpart of. `mincore` over the store's files
+  (`probe/resident.py`) put 85 MB of the raw files' key sections and 38 MB
+  of ordered indexes resident beside the LZ4 form, which no form read
+  touches and a cache drop skips because the open maps them.
+  `Options::zpages_drop_raw` (off; arms `supdb-cache64tofitzpagesdrop`,
+  `...hot4drop`) unmaps and drops them at install: alone level, and hot4
+  with it takes no fault anywhere and reads the read pass 1.07-1.10x, C
+  1.25, B 1.12-1.32, E 1.13-1.20 of the LZ4 form's; A, F and D are the
+  durable log's fdatasyncs, the same device writes and flushes in both arms
+  by a sampler (`probe/iorun.sh`), sign by sitting. **Next**: the raw-tail
+  form under the drop (183 MB over LZ4 at this rung; the drop widened the
+  fit by about 120), then the heat-driven coding with the drop under it;
+  under `Auto` the drop changes what the trial measures, so it is priced on
+  the forced arms first.
 - **Where E's time is, by the arm pair's profile at the head**: the LZ4
   decode 25% of the thread (147,000 groups a pass, 2.5 a form walk, nearly
   every one a memo miss, since the form walks are the Zipfian's cold tail),

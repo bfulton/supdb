@@ -897,6 +897,11 @@ pub struct Supdb {
     /// coding chosen per partition by its heat,
     /// `supdb-cache64tofitzpageshot4` against `supdb-cache64tofitzpages`.
     zhotfirst: usize,
+    /// A partition's raw file and ordered index dropped from the page cache
+    /// once its form file serves it (`Options::zpages_drop_raw`):
+    /// `supdb-cache64tofitzpagesdrop` and `supdb-cache64tofitzpageshot4drop`
+    /// against the same without.
+    zdropraw: bool,
     /// before any view (`Options::zpages_memo_first`):
     /// `supdb-cache64tofitautozpagesmemofirst`, the pair against
     /// `supdb-cache64tofitautozpages`.
@@ -1406,6 +1411,9 @@ struct Policy {
     /// Its first partitions raw-tailed (`Options::zpages_raw_tails_first`):
     /// `supdb-cache64tofitzpageshot4`.
     zhotfirst: usize,
+    /// Its raw pages dropped behind the form (`Options::zpages_drop_raw`):
+    /// `supdb-cache64tofitzpagesdrop`, `supdb-cache64tofitzpageshot4drop`.
+    zdropraw: bool,
     /// (`Options::zpages_memo_first`): `supdb-cache64tofitautozpagesmemofirst`.
     zmemofirst: bool,
     /// The fence searched through its tree (`Options::zpages_fence_tree`):
@@ -1547,6 +1555,7 @@ impl Default for Policy {
             ztrimpass: false,
             ztrimresident: false,
             zhotfirst: 0,
+            zdropraw: false,
             zmemofirst: false,
             zfencetree: false,
             zmemonoahead: false,
@@ -4470,6 +4479,43 @@ impl Supdb {
         )
     }
 
+    /// `supdb-cache64tofitzpages` with each partition's raw file and ordered
+    /// index dropped from the page cache once its form file serves it
+    /// (`Options::zpages_drop_raw`), `supdb-cache64tofitzpagesdrop`: the
+    /// room the raw key section and the ordered index held, a fifth of the
+    /// files' page cache at five million keys under 640 MiB, given to the
+    /// form.
+    pub fn create_cache64_tofit_zpages_drop(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages: true,
+                zdropraw: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cache64tofitzpageshot4` with the raw pages dropped behind the
+    /// form (`Options::zpages_drop_raw`), `supdb-cache64tofitzpageshot4drop`:
+    /// whether the room makes the four raw-tailed partitions fit the
+    /// uniform read pass the hot4 arm faulted in.
+    pub fn create_cache64_tofit_zpages_hot4_drop(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages: true,
+                zhotfirst: 4,
+                zdropraw: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-cache64tofitzpageshot4` with the first partition alone
     /// raw-tailed, `supdb-cache64tofitzpageshot1`: half of the E mix's
     /// decodes at five million keys for a quarter of hot4's extra bytes.
@@ -4820,6 +4866,7 @@ impl Supdb {
             ztrimpass,
             ztrimresident,
             zhotfirst,
+            zdropraw,
             zmemofirst,
             zfencetree,
             zmemonoahead,
@@ -5090,6 +5137,7 @@ impl Supdb {
             upkeep_trim_look: ztrimpass,
             trim_by_resident: ztrimresident,
             zpages_raw_tails_first: zhotfirst,
+            zpages_drop_raw: zdropraw,
             zpages_record_coding: zrecord || zrawtails,
             zpages_memo_first: zmemofirst,
             zpages_fence_tree: zfencetree,
@@ -5291,6 +5339,7 @@ impl Supdb {
             ztrimpass,
             ztrimresident,
             zhotfirst,
+            zdropraw,
             zmemofirst,
             zfencetree,
             zmemonoahead,
@@ -5424,8 +5473,12 @@ impl Engine for Supdb {
         if self.budget == 64 << 20 && self.tofit && self.zpages {
             return if self.zstored {
                 "supdb-cache64tofitzpagesstored"
+            } else if self.zhotfirst == 4 && self.zdropraw {
+                "supdb-cache64tofitzpageshot4drop"
             } else if self.zhotfirst == 4 {
                 "supdb-cache64tofitzpageshot4"
+            } else if self.zdropraw {
+                "supdb-cache64tofitzpagesdrop"
             } else if self.zhotfirst == 1 {
                 "supdb-cache64tofitzpageshot1"
             } else if self.zrawtails
@@ -6321,6 +6374,7 @@ impl Engine for Supdb {
             ("zpage_coding_picks_block", z.coding_picks_block as f64),
             ("zpage_coding_picks_raw", z.coding_picks_raw as f64),
             ("zpage_builds_raw_tails", z.builds_raw_tails as f64),
+            ("zpage_raw_dropped", z.raw_dropped as f64),
             ("zpage_sel_samples", z.sel_samples as f64),
             ("zpage_sel_builds", z.sel_builds as f64),
             ("zpage_sel_installs", z.sel_installs as f64),
@@ -6956,6 +7010,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache64tofitzpagesrecordrawleanresident"
         | "supdb-cache64tofitzpageshot4"
         | "supdb-cache64tofitzpageshot1"
+        | "supdb-cache64tofitzpagesdrop"
+        | "supdb-cache64tofitzpageshot4drop"
         | "supdb-cache64tofitzpagesrecordrawdecode"
         | "supdb-nocachezpagesheads"
         | "supdb-nocachezpagesprefetch"
@@ -7191,6 +7247,10 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         ),
         "supdb-cache64tofitzpageshot4" => Box::new(Supdb::create_cache64_tofit_zpages_hot4(dir)?),
         "supdb-cache64tofitzpageshot1" => Box::new(Supdb::create_cache64_tofit_zpages_hot1(dir)?),
+        "supdb-cache64tofitzpagesdrop" => Box::new(Supdb::create_cache64_tofit_zpages_drop(dir)?),
+        "supdb-cache64tofitzpageshot4drop" => {
+            Box::new(Supdb::create_cache64_tofit_zpages_hot4_drop(dir)?)
+        }
         "supdb-cache64tofitzpagesrecordrawdecode" => {
             Box::new(Supdb::create_cache64_tofit_zpages_record_raw_decode(dir)?)
         }
@@ -8740,16 +8800,30 @@ mod tests {
         assert!(supdb::Options::default().zpages_block_cursor && b.zpages_block_cursor);
         // The first four partitions raw-tailed, the rest block-coded: the
         // forced block form's arm but for that one option.
-        for (name, make, first) in [
+        for (name, make, first, drop_raw) in [
             (
                 "supdb-cache64tofitzpageshot4",
                 Supdb::create_cache64_tofit_zpages_hot4 as fn(&Path) -> Res<Supdb>,
                 4,
+                false,
             ),
             (
                 "supdb-cache64tofitzpageshot1",
                 Supdb::create_cache64_tofit_zpages_hot1 as fn(&Path) -> Res<Supdb>,
                 1,
+                false,
+            ),
+            (
+                "supdb-cache64tofitzpagesdrop",
+                Supdb::create_cache64_tofit_zpages_drop as fn(&Path) -> Res<Supdb>,
+                0,
+                true,
+            ),
+            (
+                "supdb-cache64tofitzpageshot4drop",
+                Supdb::create_cache64_tofit_zpages_hot4_drop as fn(&Path) -> Res<Supdb>,
+                4,
+                true,
             ),
         ] {
             let hot = new(name, make);
@@ -8758,7 +8832,12 @@ mod tests {
             assert_eq!(hot.features(), base.features());
             let g = hot.db.as_ref().unwrap().options();
             assert_eq!(g.zpages, supdb::ZPages::Always);
-            assert_eq!(g.zpages_raw_tails_first, first, "{name}: the one option");
+            assert_eq!(
+                g.zpages_raw_tails_first, first,
+                "{name}: the partitions raw-tailed"
+            );
+            assert_eq!(g.zpages_drop_raw, drop_raw, "{name}: the raw pages dropped");
+            assert!(!supdb::Options::default().zpages_drop_raw);
             assert_eq!(supdb::Options::default().zpages_raw_tails_first, 0);
             assert!(!g.zpages_raw_tails && !g.zpages_record_coding && g.zpages_memo);
             assert_eq!(

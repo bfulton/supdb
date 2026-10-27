@@ -857,6 +857,12 @@ impl<B: Bytes> Blob<B> {
         self.src.advise_normal();
     }
 
+    /// This source's pages unmapped from the process
+    /// (`Bytes::advise_dontneed`).
+    pub fn advise_dontneed(&self) {
+        self.src.advise_dontneed();
+    }
+
     /// True when the index section is borrowed rather than copied.
     ///
     /// Diagnostic, and the thing `tests/blob.rs` asserts to keep this property

@@ -75,6 +75,13 @@ pub trait Bytes {
     /// file handle about page-fault patterns.
     fn advise_random(&self) {}
 
+    /// This source's pages unmapped from the process (`MADV_DONTNEED`), so
+    /// that a drop of the file's page cache after it can take them: a cache
+    /// drop skips a page a mapping holds. The bytes do not change; a later
+    /// touch faults the page back from the cache or the file. A no-op where
+    /// there is no mapping.
+    fn advise_dontneed(&self) {}
+
     /// Fetch `len` bytes at `off` in the background, now.
     ///
     /// `MADV_WILLNEED` on a mapped file: not a hint about a pattern but an
@@ -250,6 +257,21 @@ impl Bytes for MmapBytes {
     }
     fn advise_normal(&self) {
         let _ = self.0.advise(memmap2::Advice::Normal);
+    }
+    fn advise_dontneed(&self) {
+        #[cfg(target_os = "linux")]
+        // SAFETY: an advice over the whole of a read-only shared file
+        // mapping this value owns: it drops this process's page-table
+        // entries for the range and changes no byte, and a later touch
+        // faults the page back from the file, so a borrow into the mapping
+        // reads the same bytes after it as before.
+        unsafe {
+            libc::madvise(
+                self.0.as_ptr() as *mut libc::c_void,
+                self.0.len(),
+                libc::MADV_DONTNEED,
+            );
+        }
     }
     fn advise_willneed(&self, off: u64, len: usize) -> usize {
         // Clamped rather than trusted: the offsets come from a plan built out

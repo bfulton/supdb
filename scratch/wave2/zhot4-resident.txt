@@ -1,0 +1,48 @@
+resident supdb-cache64tofitzpages/read/start | form:19f:373MB:373MB manifest:2f:0MB:0MB ord:19f:38MB:38MB par:19f:682MB:85MB wal:1f:0MB:0MB
+resident supdb-cache64tofitzpages/read/end | form:19f:373MB:373MB manifest:2f:0MB:0MB ord:19f:38MB:38MB par:19f:682MB:85MB wal:1f:0MB:0MB
+resident supdb-cache64tofitzpages/ycsb-E/end | form:19f:373MB:373MB manifest:2f:0MB:0MB ord:19f:38MB:38MB par:18f:640MB:80MB wal:1f:15MB:15MB
+resident supdb-cache64tofitzpageshot4/read/start | form:19f:418MB:397MB manifest:2f:0MB:0MB ord:19f:38MB:29MB par:19f:682MB:70MB wal:1f:0MB:0MB
+resident supdb-cache64tofitzpageshot4/read/end | form:19f:418MB:417MB manifest:2f:0MB:0MB ord:19f:38MB:29MB par:19f:682MB:70MB wal:1f:0MB:0MB
+resident supdb-cache64tofitzpageshot4/ycsb-E/end | form:19f:418MB:416MB manifest:2f:0MB:0MB ord:19f:38MB:25MB par:18f:640MB:60MB wal:1f:15MB:15MB
+resident supdb-cache64tofitzpageshot4/read/start | form:19f:418MB:398MB manifest:2f:0MB:0MB ord:19f:38MB:29MB par:19f:682MB:70MB wal:1f:0MB:0MB
+resident supdb-cache64tofitzpageshot4/read/end | form:19f:418MB:417MB manifest:2f:0MB:0MB ord:19f:38MB:29MB par:19f:682MB:70MB wal:1f:0MB:0MB
+resident supdb-cache64tofitzpageshot4/ycsb-E/end | form:17f:366MB:364MB manifest:2f:0MB:0MB ord:19f:38MB:24MB par:18f:640MB:57MB wal:1f:15MB:15MB
+resident supdb-cache64tofitzpages/read/start | form:19f:373MB:373MB manifest:2f:0MB:0MB ord:19f:38MB:38MB par:19f:682MB:85MB wal:1f:0MB:0MB
+resident supdb-cache64tofitzpages/read/end | form:19f:373MB:373MB manifest:2f:0MB:0MB ord:19f:38MB:38MB par:19f:682MB:85MB wal:1f:0MB:0MB
+resident supdb-cache64tofitzpages/ycsb-E/end | form:19f:373MB:373MB manifest:2f:0MB:0MB ord:19f:38MB:38MB par:18f:640MB:80MB wal:1f:15MB:15MB
+resident supdb-cache64tofitzpages/read/start | form:19f:373MB:373MB manifest:2f:0MB:0MB ord:19f:38MB:38MB par:19f:682MB:85MB wal:1f:0MB:0MB
+   par by tenth of each file, MB: 1 0 0 0 0 0 0 0 14 67
+   ord by tenth of each file, MB: 3 3 3 3 3 3 3 3 3 3
+resident supdb-cache64tofitzpages/read/end | form:19f:373MB:373MB manifest:2f:0MB:0MB ord:19f:38MB:38MB par:19f:682MB:85MB wal:1f:0MB:0MB
+   par by tenth of each file, MB: 1 0 0 0 0 0 0 0 14 67
+   ord by tenth of each file, MB: 3 3 3 3 3 3 3 3 3 3
+resident supdb-cache64tofitzpages/ycsb-E/end | form:19f:373MB:373MB manifest:2f:0MB:0MB ord:19f:38MB:38MB par:18f:640MB:80MB wal:1f:15MB:15MB
+   par by tenth of each file, MB: 1 0 0 0 0 0 0 0 13 63
+   ord by tenth of each file, MB: 3 3 3 3 3 3 3 3 3 3
+resident supdb-cache64tofitzpageshot4/read/start | form:19f:418MB:395MB manifest:2f:0MB:0MB ord:19f:38MB:29MB par:19f:682MB:70MB wal:1f:0MB:0MB
+   par by tenth of each file, MB: 1 0 0 0 0 0 0 0 13 53
+   ord by tenth of each file, MB: 2 2 2 2 2 2 2 2 2 2
+resident supdb-cache64tofitzpageshot4/read/end | form:19f:418MB:417MB manifest:2f:0MB:0MB ord:19f:38MB:29MB par:19f:682MB:70MB wal:1f:0MB:0MB
+   par by tenth of each file, MB: 1 0 0 0 0 0 0 0 13 53
+   ord by tenth of each file, MB: 2 2 2 2 2 2 2 2 2 2
+resident supdb-cache64tofitzpageshot4/ycsb-E/end | form:19f:418MB:416MB manifest:2f:0MB:0MB ord:19f:38MB:24MB par:18f:640MB:60MB wal:1f:15MB:15MB
+   par by tenth of each file, MB: 1 0 0 0 0 0 0 0 12 44
+   ord by tenth of each file, MB: 2 2 2 2 2 2 2 2 2 2
+resident supdb-cache64tofitzpageshot4/read/start | form:19f:418MB:390MB manifest:2f:0MB:0MB ord:19f:38MB:29MB par:19f:682MB:70MB wal:1f:0MB:0MB
+   par by tenth of each file, MB: 1 0 0 0 0 0 0 0 13 53
+   ord by tenth of each file, MB: 2 2 2 2 2 2 2 2 2 2
+resident supdb-cache64tofitzpageshot4/read/end | form:19f:418MB:416MB manifest:2f:0MB:0MB ord:19f:38MB:29MB par:19f:682MB:70MB wal:1f:0MB:0MB
+   par by tenth of each file, MB: 1 0 0 0 0 0 0 0 13 53
+   ord by tenth of each file, MB: 2 2 2 2 2 2 2 2 2 2
+resident supdb-cache64tofitzpageshot4/ycsb-E/end | form:19f:418MB:415MB manifest:2f:0MB:0MB ord:19f:38MB:24MB par:18f:640MB:57MB wal:1f:15MB:15MB
+   par by tenth of each file, MB: 1 0 0 0 0 0 0 0 12 41
+   ord by tenth of each file, MB: 2 2 2 2 2 2 2 2 2 2
+resident supdb-cache64tofitzpages/read/start | form:19f:373MB:373MB manifest:2f:0MB:0MB ord:19f:38MB:35MB par:19f:682MB:79MB wal:1f:0MB:0MB
+   par by tenth of each file, MB: 1 0 0 0 0 0 0 0 14 62
+   ord by tenth of each file, MB: 3 3 3 3 3 3 3 3 3 3
+resident supdb-cache64tofitzpages/read/end | form:19f:373MB:373MB manifest:2f:0MB:0MB ord:19f:38MB:35MB par:19f:682MB:79MB wal:1f:0MB:0MB
+   par by tenth of each file, MB: 1 0 0 0 0 0 0 0 14 62
+   ord by tenth of each file, MB: 3 3 3 3 3 3 3 3 3 3
+resident supdb-cache64tofitzpages/ycsb-E/end | form:19f:373MB:373MB manifest:2f:0MB:0MB ord:19f:38MB:35MB par:18f:640MB:74MB wal:1f:15MB:15MB
+   par by tenth of each file, MB: 1 0 0 0 0 0 0 0 13 58
+   ord by tenth of each file, MB: 3 3 3 3 3 3 3 3 3 3
