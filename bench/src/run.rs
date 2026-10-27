@@ -1809,6 +1809,12 @@ fn one_pass(
                 &c1,
             );
         }
+        // With `SUPDB_MIX_HEAT` set, each form file's decodes over its life
+        // after each mix, by partition (`Engine::zpage_heat`): a reader
+        // differences consecutive mixes for where a mix's decodes land.
+        if std::env::var_os("SUPDB_MIX_HEAT").is_some() {
+            eprintln!("mixheat {arm} {letter} | {}", e.zpage_heat());
+        }
         if mix_census {
             census_line(
                 "mixcensus",

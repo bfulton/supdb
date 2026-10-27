@@ -362,6 +362,11 @@ asked to look at every upkeep pass end (`Options::upkeep_trim_look`), and
 `supdb-cache64tofitzpagesrecordrawleanresident` the same with the trim's
 stride counted by the anonymous bytes resident beyond the allocator's use
 instead of its free count (`Options::trim_by_resident`);
+`supdb-cache64tofitzpageshot4` and `supdb-cache64tofitzpageshot1` are
+`supdb-cache64tofitzpages` with the first four, or the first, partitions by
+key order in the raw-tail coding and the rest in the block coding
+(`Options::zpages_raw_tails_first`), the upper bound of a coding chosen per
+partition by its heat;
 `supdb-cache64tofitautozpagescodingauto` is the combined arm with the coding
 of its form files the selector's to choose (`Options::zpages_coding_auto`),
 the raw tails where the model predicts that form fits the budget and the

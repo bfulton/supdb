@@ -1877,6 +1877,12 @@ pub(super) struct ZFile {
     /// Any check failed: the form file is out of service, and reads of the
     /// partition go to the raw form until it is dropped.
     damaged: AtomicBool,
+    /// The groups decoded from this form file, in sixteens: a thread bumps
+    /// it once every sixteen decodes it makes (`count_decode`), so that the
+    /// count names where the decodes land -- half of the E mix's at five
+    /// million keys in the first of nineteen partitions -- without a shared
+    /// write on every decode from every reader thread.
+    pub(super) decodes16: AtomicU64,
     /// This attach's identity, which the memo keys its groups by.
     id: u64,
     /// The trailer this attach accepted.
@@ -2023,6 +2029,7 @@ impl ZFile {
                 .map(|_| AtomicU64::new(0))
                 .collect(),
             damaged: AtomicBool::new(false),
+            decodes16: AtomicU64::new(0),
             id: NEXT_ZSIDE_ID.fetch_add(1, Ordering::Relaxed),
             ident: t,
             memo: memo != MemoShape::Off,
@@ -2234,6 +2241,7 @@ impl ZFile {
             if !was_verified {
                 set_bit(&self.verified, p);
             }
+            self.count_decode();
             let g = Arc::new(fresh);
             memo.put(
                 self.id,
@@ -3106,6 +3114,22 @@ impl ZFile {
     /// Heap bytes the form file keeps resident: the fence and the filter.
     pub(super) fn resident_bytes(&self) -> usize {
         self.fence.heap_bytes() + self.filter.as_ref().map_or(0, |f| f.blocks.len() * 64)
+    }
+
+    /// One group decoded, counted once in sixteen per thread
+    /// (`ZFile::decodes16`).
+    fn count_decode(&self) {
+        thread_local! {
+            static TICK: Cell<u32> = const { Cell::new(0) };
+        }
+        let due = TICK.with(|t| {
+            let v = t.get().wrapping_add(1);
+            t.set(v);
+            v % 16 == 0
+        });
+        if due {
+            self.decodes16.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// The file's bytes.

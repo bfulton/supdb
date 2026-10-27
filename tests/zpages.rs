@@ -7249,6 +7249,69 @@ fn a_block_read_often_enough_under_the_form_is_held_as_a_copy_and_walked_without
     }
 }
 
+/// The first partitions by key order in the raw-tail coding and the rest in
+/// the block coding (`Options::zpages_raw_tails_first`): the store answers
+/// every read, count and scan as the raw form does, exactly the first
+/// partitions' builds are raw-tailed, a scan across the boundary reads the
+/// first partitions' groups in place, and the raw-tailed form files are the
+/// larger for the keys they hold.
+#[test]
+fn the_first_partitions_raw_tailed_and_the_rest_block_coded_answer_as_one_form() {
+    let dir = scratch("raw-tails-first");
+    let mut db = Db::create(
+        &dir,
+        forced(|o| {
+            o.partition_bytes = Some(160 << 10);
+            o.zpages_raw_tails_first = 2;
+        }),
+    )
+    .unwrap();
+    let model = ordered_load(&mut db, 5000, 0x2F17);
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert!(c.form_files >= 4, "the form files: {c:?}");
+    assert_eq!(
+        c.builds_raw_tails, 2,
+        "the first two partitions raw-tailed: {c:?}"
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    check(&db, &model, &keys, "raw tails first");
+    check_scan(&db, &model, "raw tails first");
+    for (i, limit) in [(0usize, 5000usize), (1234, 70), (4990, 40)] {
+        same_window(
+            &scanned(&db, &keys[i], limit),
+            &window(&model, &keys[i], limit),
+            "raw tails first",
+        );
+    }
+    let c = db.zpage_counts();
+    assert!(
+        c.inplace_groups > 0,
+        "the scans read the first partitions' groups in place: {c:?}"
+    );
+    // By key order the form files are the first partitions' first: the
+    // raw-tailed ones hold their records' own bytes.
+    let heat = db.zpage_heat();
+    assert!(heat.len() >= 4);
+    let per_key = |i: usize| heat[i].file_bytes as f64 / heat[i].keys.max(1) as f64;
+    assert!(
+        per_key(0) > per_key(2) * 1.2 && per_key(1) > per_key(3) * 1.2,
+        "the raw-tailed form files are the larger a key: {:?}",
+        heat.iter()
+            .map(|h| (h.keys, h.file_bytes))
+            .collect::<Vec<_>>()
+    );
+    // The reads decoded the block-coded partitions' groups, and the heat
+    // counts them where they were made, in sixteens.
+    assert!(
+        heat.iter().all(|h| h.decodes % 16 == 0) && heat.iter().any(|h| h.decodes > 0),
+        "the heat's decodes, in sixteens: {:?}",
+        heat.iter().map(|h| h.decodes).collect::<Vec<_>>()
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Every group stored verbatim (`Options::zpages_store_all`, off): the form
 /// answers reads, counts and scans as the compressed one does, its files are
 /// the records' own bytes and larger than the compressed ones by more than a
