@@ -3633,3 +3633,49 @@ next, while a build cycle costs seconds and a device flush to the writer.
 The key-order arms bound what the way in could win; a store whose hot set
 holds still is the shape it needs, which a heat kept across the store's
 restarts would give it at its build, and the suite does not run.
+
+## E on hot8 with the drop, beside LMDB: the overlay, and an instrument on one side
+
+Profiled at five million keys under 640 MiB (`scratch/wave2/prof/profile-e.sh`
+with hot8 and the drop beside LMDB, two reps, perf over each mixes pass cut
+to E's window and the main thread; `prof/ycsb-E-*-lmdbpair.txt` and
+`prof/ycsb-E-lmdb-hot8pair.txt`): E's scans 627-727 ms against LMDB's
+437-468 (0.735x), 7,263 samples of the thread against 4,588. Both carry the
+harness alike -- the Zipfian generator's `pow` about 800 samples each, the
+pass's own loop and the value copy -- so the engine is some 5,700 samples
+against LMDB's 3,400, and of the 5,700:
+
+- the overlay of the mixes' unsealed writes, about 1,600: the block builds
+  over them (`BuildCtx::materialize`, 730, of which placing each unsealed
+  key at its record through the form, `deltas_for`, 452, and the three
+  buffers a sparse block allocates and trims to fit, with their pages'
+  first touches, about 200) and the settle that files them
+  (`settle_pending`, 465). E runs after A, F and D; with no scan between
+  their commits the forms are not kept (`Options::forms_settle_far`), and
+  E's first scans file the 49,000 keys they left into 17,600 blocks and
+  build 8,900 sparse blocks a pass, about six microseconds a block. LMDB
+  updates in place and pays for it in A, F and D, which hot8 reads at 4-5x
+  LMDB's;
+- the start seek, about 1,100 (`cache_seek_exact`, `ZFile::seek`: the
+  page view, the fence's entry, the heads' search, the group open), against
+  LMDB's page and node searches, about 700;
+- the walk, about 2,000 (the record's parse in place `coded_rec` and
+  `coded_record_to`, the block walk), against LMDB's `mdb_cursor_next`, 945;
+- the clock, about 400: ten reads a scan of the scan phase timers
+  (`Options::scan_timers`), which the suite turns on for every supdb arm
+  wherever `SUPDB_MIX_COUNTERS` is set -- as every pairing script here sets
+  it -- and which LMDB has no counterpart of.
+
+So the overlay and the timers together come to most of the engine's
+excess, and without them the two would be within a tenth of each other.
+`pair.sh` takes `COUNTERS=0` now, which leaves the counters' variable unset
+and the timers off.
+Paired again with the counters off (`zhot8lmdbclean-ab-{1,2}`, both orders,
+five pairs a sitting), so neither arm carries an instrument: E 0.76 and
+0.86x LMDB's, where the pairing with the timers on read 0.69-0.75; the scan
+pass 1.28 and 1.45x, threaded 1.30 and 1.74x; the read pass 2.19 and
+2.78x, threaded 2.64 and 2.73x; A 4.40 and 5.31x, F 4.21 and 4.39x, B 2.34
+and 2.76x, D 1.74 and 2.32x, C 1.73 and 1.62x -- hot8 with the drop faulting
+nowhere, LMDB 0.04-0.05 a read, 0.13-0.16 a scan and 0.013-0.015 in E. A
+cell read against a comparator is read with the counters off; the counters
+lines are for pairings of supdb arms, which carry the timers alike.
