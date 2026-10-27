@@ -2341,8 +2341,8 @@ leaves resident is read from the kernel between the steps, never taken
 from the file's size. And a page a mapping holds is not one a drop of the
 file's cache takes: `POSIX_FADV_DONTNEED` skips it and `MADV_COLD` only
 ages it, so the raw key section the open's checksum check maps stayed
-resident beside a form that no read sends there, 85 MB of the 496 a store
-of five million keys held under 640 MiB, with 38 MB of ordered indexes
+resident beside a form that no read sends there, 85 MiB of the 496 a store
+of five million keys held under 640 MiB, with 38 MiB of ordered indexes
 beside it, and the form the bound could not hold faulted for the want of
 them; `mincore` over the store's files read it
 (`scratch/wave2/probe/resident.py`), and the drop unmaps first

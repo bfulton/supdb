@@ -3421,12 +3421,12 @@ walked every file of the store with `mincore` at the read pass's start and
 end and at E's end, by kind and by tenth of each file
 (`scratch/wave2/probe/resident.py`, beside the pairing by
 `scratch/wave2/probe/watch.sh`; `zhot4-resident.txt`). Under the LZ4 form at five million keys
-under 640 MiB the store's files held 496 MB: the form files 373, whole; the
-partitions' raw files 85 MB of 682, all of it in their last two tenths,
+under 640 MiB the store's files held 496 MiB: the form files 373, whole; the
+partitions' raw files 85 MiB of 682, all of it in their last two tenths,
 the key section, which the raw point read's hash probes and the open's
-check of the section's checksum row reads whole; the ordered indexes 38 MB,
+check of the section's checksum row reads whole; the ordered indexes 38 MiB,
 whole. Under hot4 the form files held 397-417 of 418, the raw files 70 and
-the ordered indexes 29: the page cache gave the form's extra 44 MB out of
+the ordered indexes 29: the page cache gave the form's extra 45 MiB out of
 the raw key section and the indexes, which no read through a form touches,
 and still came short of the form at the read pass's start. The build drops
 the records behind it already; the key section and the indexes were what
@@ -3467,27 +3467,80 @@ sitting ran with a sampler beside it (`scratch/wave2/probe/iorun.sh`:
 `iosample.py` every 50 ms reads the global and the group's dirty bytes and
 `/sys/block/vda/stat`'s writes and flushes, `io_read.py` cuts them to the
 phasemarks; `zhot4drop-io.*`). Both arms made the same device work in every
-mix: A 12.1 MB in 1,650 writes and 418 flushes, F the same, B, D and E a
+mix: A 11.5 MiB in 1,650 writes and 418 flushes, F the same, B, D and E a
 megabyte and 41-42 flushes. The mixes build, seal and merge nothing, the
 upkeep thread ran a millisecond a mix, and the commits' time overlapped rep
 for rep, A's 210-269 ms under the LZ4 form against 163-279. So A, F and D
 are the device's flushes, whose sign moved with the sitting, and no pairing
 of two arms that share the write path resolves them. What did differ is
 where the bytes went before the mixes. The LZ4 arm's ordered indexes,
-written unsynced, sat 38-40 MB dirty in the group through every pass and
+written unsynced, sat 38-39 MiB dirty in the group through every pass and
 were removed with the store unwritten, the store's life being shorter than
 the kernel's thirty seconds; the drop wrote them back at the install (the
-load's device bytes 1,237-1,243 MB against 1,148-1,151: the form's 44 MB
-more, and the indexes). And the group's page cache held 471-486 MB under
-hot4 with the drop against 521-536 under the LZ4 form without it.
+load's device bytes 1,180-1,185 MiB against 1,095-1,098: the form's 45 MiB
+more, and the indexes). And the group's page cache held 449-464 MiB under
+hot4 with the drop against 497-512 under the LZ4 form without it.
 
 What it says. The drop widens what the bound holds for a form by the raw
-key section and the indexes, about 120 MB at this rung -- the group's cache
-50 MB smaller under a form 44 MB larger -- at a cost no pass shows, and with
+key section and the indexes, about 120 MiB at this rung -- the group's cache
+48 MiB smaller under a form 45 MiB larger -- at a cost no pass shows, and with
 it hot4 reads every cell at or above the LZ4 form's. It stays an
 experiment, off. A raw read after it (a merge's inputs, and under `Auto`
 the controller's trial and its exit) reads the key section back from the
 device, and the trial measures the raw form's rate from what the drop left,
 so under `Auto` the drop changes what the controller measures; the forced
 arms are where it is priced. The question it opens is the fit of the
-raw-tail form under it, 183 MB over the LZ4 form's at this rung.
+raw-tail form under it, 195 MiB over the LZ4 form's at this rung.
+
+## The fit line under the drop
+
+Two arms place it: `supdb-cache64tofitzpageshot8drop`, the first eight
+partitions by key order raw-tailed with the drop, and
+`supdb-cache64tofitzpagesrecordrawdrop`, the whole raw-tail form with it,
+each paired against the LZ4 form without the drop at five million keys
+under 640 MiB in both orders, with the census, the heat and the io sampler
+(`scratch/wave2/probe/iowatch.py`, which follows the newest bench group
+across a run of several processes; `zhot8drop-io.samples`,
+`zrawdrop-io.samples`).
+
+Hot8 with the drop, 444 MiB of form against 373 (`zhot8drop-ab-{1,2}`): no
+major fault in either arm in any pass, and hot8 faster in every cell of
+both sittings -- the read pass 1.10 and 1.17x, threaded 1.08-1.15, the scan
+pass 1.12 and 1.19, threaded 1.13-1.14; C 1.33 and 1.28, B 1.24 and 1.23, E
+1.13 and 1.19, F 1.16 and 1.12, D 1.35 and 1.04, A 1.07 and 1.03, the reads
+and E in nine or ten pairs of ten. The group's page cache held 474-489 MiB
+through the passes against the LZ4 arm's 496-511 (38 of those its ordered
+indexes' dirty pages), the process's anonymous bytes in E 80-104
+against 77-90, its bytes in use 67 MiB in both and the difference the
+allocator's free bytes, rep to rep. So about 47 MiB of the bound were left
+in E.
+
+The whole raw-tail form with the drop, 568 MiB (`zrawdrop-ab-{1,2}`): the
+form does not fit. The group's cache stood at 511-558 MiB beside 102-107 of
+anonymous bytes, at the bound, and the reads faulted: 0.076-0.082 major
+faults a read in the read pass, which read 0.44 and 0.47x, the threaded
+reads 0.48-0.79; D 0.51 and 0.56 at 0.048 faults an operation, E 0.93 and
+0.55 at 0.018 and 0.080; while B and C, whose reads stay in the first
+partitions, read 1.10-1.30x with 0.001-0.003 faults.
+
+So at this rung the drop moves the fit line from between 373 and 418 MiB of
+form to between 444 and 568, and by the room hot8 leaves, about 490: the
+bound less the process's anonymous bytes in E and the 45 MiB of other
+cache the group holds (the log, the harness's own text). A form
+whose extra bytes go to the partitions the reads decode most, up to that
+line -- key order is the decode order here, the suite's Zipfian being
+unscrambled -- reads every cell above the LZ4 form's; past it, the uniform passes
+pay the device for every page that does not fit. That is the shape a
+coding chosen per partition by its decode cost can ship: the raw tails
+built where the decodes are, while the store serves, to a line read from
+the group's faults rather than the model's budget, and given back when the
+faults come.
+
+Hot8 with the drop against LMDB (`zhot8lmdb-ab-{1,2}`), LMDB faulting 0.05
+a read, 0.13 a scan and 0.015 in E in this sitting: the read pass 2.63 and
+2.32x LMDB's, threaded 2.3-3.3x, the scan pass 1.51 and 1.15x, A 5.5 and
+5.1x, F 4.4 and 4.3x, B 2.3 and 2.4x, D 1.73 and 1.56x, C 1.46 and 1.43x,
+and E 0.75 and 0.69x -- where hot4 read it 0.71-0.75x. The decodes the next
+four raw-tailed partitions took were worth the LZ4 form's cells and not
+E's against LMDB; E's gap is the walk around the decode, as the profile of
+hot4's thread put it.

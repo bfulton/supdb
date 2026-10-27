@@ -1,7 +1,8 @@
 # Per arm, rep and phase: the device's write MB, write ios and flushes over
 # the phase's window, the dirty bytes (global, cgroup) at its start, and the
-# commits' time from the mixkinds line.
+# commits' time from the mixkinds line. Bytes in MiB.
 import sys, bisect, collections
+MIB = 1 << 20
 err, samples = sys.argv[1], sys.argv[2]
 S = [list(map(float, l.split())) for l in open(samples)]
 T = [s[0] for s in S]
@@ -24,9 +25,9 @@ for arm, ph, ev, t in marks:
         open_[(arm, ph)] = t
     elif ev == 'end' and (arm, ph) in open_:
         t0 = open_.pop((arm, ph)); a, b = at(t0), at(t)
-        rows[(ph, arm)].append(dict(ms=(t - t0) * 1e3, wmb=(b[4] - a[4]) * 512 / 1e6,
+        rows[(ph, arm)].append(dict(ms=(t - t0) * 1e3, wmb=(b[4] - a[4]) * 512 / MIB,
             wios=b[3] - a[3], fl=b[5] - a[5], dirty=a[1] / 1024, wb=a[2] / 1024,
-            cgd=a[6] / 1e6, cgc=a[8] / 1e6))
+            cgd=a[6] / MIB, cgc=a[8] / MIB))
 phs = ['load', 'read', 'scan', 'ycsb-C', 'ycsb-B', 'ycsb-A', 'ycsb-D', 'ycsb-E', 'ycsb-F']
 for ph in phs:
     for (p2, arm), rs in sorted(rows.items()):

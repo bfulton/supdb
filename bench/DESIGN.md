@@ -371,6 +371,10 @@ partition by its heat;
 `supdb-cache64tofitzpages` and its hot4 arm with each partition's raw file
 and ordered index unmapped and dropped from the page cache once its form
 file serves it (`Options::zpages_drop_raw`);
+`supdb-cache64tofitzpageshot8drop` is the hot4 drop arm with the first
+eight partitions raw-tailed, and `supdb-cache64tofitzpagesrecordrawdrop`
+`supdb-cache64tofitzpagesrecordraw` with the drop, the two sides of the fit
+line the drop moves;
 `supdb-cache64tofitautozpagescodingauto` is the combined arm with the coding
 of its form files the selector's to choose (`Options::zpages_coding_auto`),
 the raw tails where the model predicts that form fits the budget and the
