@@ -375,6 +375,9 @@ file serves it (`Options::zpages_drop_raw`);
 eight partitions raw-tailed, and `supdb-cache64tofitzpagesrecordrawdrop`
 `supdb-cache64tofitzpagesrecordraw` with the drop, the two sides of the fit
 line the drop moves;
+`supdb-cache64tofitzpagesrecodedrop` is `supdb-cache64tofitzpagesdrop` with
+its partitions re-coded while served by what their decodes cost
+(`Options::zpages_recode`), the policy the key-order arms bound;
 `supdb-cache64tofitautozpagescodingauto` is the combined arm with the coding
 of its form files the selector's to choose (`Options::zpages_coding_auto`),
 the raw tails where the model predicts that form fits the budget and the

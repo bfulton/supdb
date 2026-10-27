@@ -7335,6 +7335,191 @@ fn a_partition_its_form_serves_drops_its_raw_pages_when_asked() {
     );
 }
 
+/// The re-code policy's next look waited for (`Options::zpages_recode`):
+/// the injected clock moved `by`, and the counts read once the segment
+/// work's turn has looked at it.
+fn recode_look(db: &Db, by: std::time::Duration) {
+    let inject = db.options().zpages_inject.clone().unwrap();
+    let was = db.zpage_counts().recode_looks;
+    inject.advance(by);
+    let t = std::time::Instant::now();
+    while db.zpage_counts().recode_looks == was && t.elapsed().as_secs() < 60 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(
+        db.zpage_counts().recode_looks > was,
+        "the re-code policy looked"
+    );
+}
+
+/// Whether `cond` comes to hold of the counts within a minute of real time:
+/// a re-code the look started is collected at a later turn of the segment
+/// work, whatever the injected clock says.
+fn recode_until(db: &Db, cond: impl Fn(&supdb::db::ZCounts) -> bool) -> bool {
+    let t = std::time::Instant::now();
+    while !cond(&db.zpage_counts()) && t.elapsed().as_secs() < 60 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    cond(&db.zpage_counts())
+}
+
+/// The keys of the `i`th partition by key order, as the model has them.
+fn keys_of_partition(db: &Db, model: &Model, i: usize) -> Vec<Vec<u8>> {
+    let heat = db.zpage_heat();
+    let lo = heat[i].lo.clone();
+    let hi = heat.get(i + 1).map(|h| h.lo.clone());
+    model
+        .keys()
+        .filter(|k| **k >= lo && hi.as_ref().is_none_or(|h| *k < h))
+        .cloned()
+        .collect()
+}
+
+/// Each partition's coding by key order, from its form file.
+fn codings(db: &Db) -> Vec<bool> {
+    db.zpage_heat().iter().map(|h| h.coded).collect()
+}
+
+/// A forced store whose served partitions the re-code policy re-codes, the
+/// raw pages dropped and every read decoding (no memo), its budget and its
+/// refaults the seam's: loaded, settled, and looked at once.
+fn recode_store(name: &str, budget: u64) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>) {
+    let dir = scratch(name);
+    let inject = std::sync::Arc::new(supdb::ZInject::new());
+    inject.set_budget(budget);
+    inject.set_refault_rate(0.0);
+    inject.advance(std::time::Duration::from_millis(1));
+    let mut db = Db::create(
+        &dir,
+        forced(|o| {
+            o.partition_bytes = Some(160 << 10);
+            o.zpages_drop_raw = true;
+            o.zpages_recode = true;
+            o.zpages_memo = false;
+            o.zpages_inject = Some(inject.clone());
+        }),
+    )
+    .unwrap();
+    let model = ordered_load(&mut db, 20_000, 0x2EC0);
+    db.zpages_settle().unwrap();
+    // A look over the settled form files, whose decode time the next look
+    // differences against: the looks during the load saw none of them.
+    recode_look(&db, std::time::Duration::from_secs(1));
+    (dir, db, model, inject)
+}
+
+/// `n` reads of `keys`, round and round: decodes for the heat.
+fn heat_up(db: &Db, keys: &[Vec<u8>], n: usize) {
+    for i in 0..n {
+        let k = &keys[i % keys.len()];
+        assert_eq!(read_vec(db, k).len(), 1, "a key reads back");
+    }
+}
+
+#[test]
+fn the_partition_whose_decodes_cost_most_is_recoded_while_it_serves() {
+    // Under `Options::zpages_recode` the segment work reads each form
+    // file's decode time once a period and re-codes the block-coded
+    // partition whose decodes cost the most to the raw tails, by a build
+    // beside the served file and a swap of the cell; the refaults past the
+    // floor give the last re-code back, and the form files' bytes are held
+    // where that leaves them until the hold passes. Every read, count and
+    // scan answers as the raw form does across each swap.
+    let (dir, db, model, inject) = recode_store("recode", 1 << 40);
+    let c = db.zpage_counts();
+    assert!(c.form_files >= 4, "partitions to choose from: {c:?}");
+    assert!(
+        codings(&db).iter().all(|c| !c),
+        "every form file built in the block coding: {:?}",
+        codings(&db)
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let hot = keys_of_partition(&db, &model, 2);
+    heat_up(&db, &hot, 20_000);
+    recode_look(&db, std::time::Duration::from_secs(1));
+    assert!(
+        recode_until(&db, |c| c.recodes >= 1),
+        "the hot partition re-coded: {:?} {:?}",
+        db.zpage_counts(),
+        db.zpage_heat()
+    );
+    let coded = codings(&db);
+    assert!(
+        coded[2] && coded.iter().filter(|c| **c).count() == 1,
+        "the hot partition alone raw-tailed: {coded:?} {:?}",
+        db.zpage_heat()
+    );
+    check(&db, &model, &keys, "re-coded");
+    check_scan(&db, &model, "re-coded");
+    // Over the refault floor: the re-code given back.
+    inject.set_refault_rate(1000.0);
+    recode_look(&db, std::time::Duration::from_secs(1));
+    assert!(
+        recode_until(&db, |c| c.recodes_back >= 1),
+        "the re-code given back: {:?}",
+        db.zpage_counts()
+    );
+    assert!(
+        codings(&db).iter().all(|c| !c),
+        "the partition back in the block coding: {:?}",
+        codings(&db)
+    );
+    check(&db, &model, &keys, "given back");
+    check_scan(&db, &model, "given back");
+    // Under the floor again and as hot: held by the ceiling.
+    inject.set_refault_rate(0.0);
+    heat_up(&db, &hot, 20_000);
+    recode_look(&db, std::time::Duration::from_secs(1));
+    let c = db.zpage_counts();
+    assert_eq!(c.recodes, 1, "held at the ceiling: {c:?}");
+    // The hold past, and hot again: re-coded again.
+    recode_look(&db, std::time::Duration::from_secs(61));
+    heat_up(&db, &hot, 20_000);
+    recode_look(&db, std::time::Duration::from_secs(1));
+    assert!(
+        recode_until(&db, |c| c.recodes >= 2),
+        "re-coded once the hold has passed: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!(c.recode_failed, 0, "{c:?}");
+    assert_eq!(c.fallbacks, 0, "no read fell back to the raw form: {c:?}");
+    check(&db, &model, &keys, "re-coded again");
+    check_scan(&db, &model, "re-coded again");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn no_partition_is_recoded_past_the_budget() {
+    // The raw tails' extra bytes are held to the budget: with no room past
+    // the form files' own bytes nothing is re-coded however hot, and with
+    // room it is.
+    let (dir, db, model, inject) = recode_store("recode-budget", 1);
+    let files = db.zpage_counts().file_bytes;
+    inject.set_budget(files);
+    let hot = keys_of_partition(&db, &model, 1);
+    for _ in 0..3 {
+        heat_up(&db, &hot, 20_000);
+        recode_look(&db, std::time::Duration::from_secs(1));
+    }
+    let c = db.zpage_counts();
+    assert_eq!(c.recodes, 0, "no room, no re-code: {c:?}");
+    inject.set_budget(files * 4);
+    heat_up(&db, &hot, 20_000);
+    recode_look(&db, std::time::Duration::from_secs(1));
+    assert!(
+        recode_until(&db, |c| c.recodes >= 1),
+        "room, a re-code: {:?}",
+        db.zpage_counts()
+    );
+    assert!(codings(&db)[1], "the hot one: {:?}", codings(&db));
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    check(&db, &model, &keys, "budget");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The first partitions by key order in the raw-tail coding and the rest in
 /// the block coding (`Options::zpages_raw_tails_first`): the store answers
 /// every read, count and scan as the raw form does, exactly the first

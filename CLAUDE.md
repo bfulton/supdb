@@ -2373,7 +2373,12 @@ two of twenty-five whole-binary runs failed, with 148.6 of 300 MB released.
 A lock now, taken for write by the measurement and for read by every test
 that reaches a pass, through `into_inner` so that a failure holds nobody. The
 rule: a test that counts a process-wide effect excludes every test that can
-cause it.
+cause it. A lock excludes the tests that trim and not the ones that
+allocate, and the count of anonymous bytes resident beyond the allocator's
+use is lowered by any allocation from a free chunk already resident: a
+dead arena of thirty-two megabytes read as nine in one run of the whole
+`db` binary, so that test has a binary of its own (`tests/resident.rs`), as
+the allocation count has (`tests/leak.rs`).
 
 **A call site no real input reaches red.** The suite's refusals after the
 read pass and after the shuffled load were green-side only, because a real

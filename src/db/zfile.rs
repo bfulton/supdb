@@ -1883,6 +1883,19 @@ pub(super) struct ZFile {
     /// million keys in the first of nineteen partitions -- without a shared
     /// write on every decode from every reader thread.
     pub(super) decodes16: AtomicU64,
+    /// The time those counted decodes took, nanoseconds, where this form
+    /// file times them (`ZFile::time_decodes`): the heat a re-code prices
+    /// (`Options::zpages_recode`), since a decode the predictor and the
+    /// cache have warm costs a tenth of a cold one and the count reads them
+    /// alike -- the first partition's decodes at five million keys were
+    /// worth 0.13 µs each to a raw tail, the next three's 1.4.
+    pub(super) decode_ns16: AtomicU64,
+    /// The counted decodes are timed (`Options::zpages_recode`).
+    pub(super) time_decodes: bool,
+    /// The sampled pages' groups are record-coded ([`ZCODING_RECORD`]):
+    /// the coding this form file was built in, read from its own
+    /// directories at the attach.
+    coded: bool,
     /// This attach's identity, which the memo keys its groups by.
     id: u64,
     /// The trailer this attach accepted.
@@ -2014,7 +2027,7 @@ impl ZFile {
             None
         };
         let bind = bind32(id, end_seq, facts.nkeys, facts.row_crc);
-        let zfile = ZFile {
+        let mut zfile = ZFile {
             map,
             advised: advise,
             fence,
@@ -2030,6 +2043,9 @@ impl ZFile {
                 .collect(),
             damaged: AtomicBool::new(false),
             decodes16: AtomicU64::new(0),
+            decode_ns16: AtomicU64::new(0),
+            time_decodes: false,
+            coded: false,
             id: NEXT_ZSIDE_ID.fetch_add(1, Ordering::Relaxed),
             ident: t,
             memo: memo != MemoShape::Off,
@@ -2042,7 +2058,7 @@ impl ZFile {
             #[cfg(test)]
             skewed: None,
         };
-        zfile.check_sample().map_err(damage)?;
+        zfile.coded = zfile.check_sample().map_err(damage)?;
         Ok(zfile)
     }
 
@@ -2051,8 +2067,9 @@ impl ZFile {
     /// header, the directory, the padding -- and their rank and count
     /// against the fence entry that names each. Every page where there are no more than
     /// sixteen. These are not first decodes: nothing is decoded and no page
-    /// is marked verified.
-    fn check_sample(&self) -> std::result::Result<(), ZError> {
+    /// is marked verified. Whether the first group of a sampled page is
+    /// record-coded, which is the coding the file was built in.
+    fn check_sample(&self) -> std::result::Result<bool, ZError> {
         let take = self.n_pages.min(ZSAMPLE_PAGES);
         let mut want: Vec<usize> = (0..take)
             .map(|k| {
@@ -2064,6 +2081,7 @@ impl ZFile {
             })
             .collect();
         want.dedup();
+        let mut coded = false;
         for i in 0..self.fence.len() {
             let Some(p) = self.fence.page(i).filter(|&p| p != ZNOPAGE) else {
                 continue;
@@ -2078,8 +2096,9 @@ impl ZFile {
                 .entry(i, self.nkeys as u32)
                 .ok_or(ZError::Fence)?;
             check_entry(&view, &entry)?;
+            coded |= view.group(0).is_some_and(|g| g.coded);
         }
-        Ok(())
+        Ok(coded)
     }
 
     fn page_bytes(&self, p: usize) -> Option<&[u8]> {
@@ -2223,6 +2242,7 @@ impl ZFile {
                 memo.prefetch_victim(self.id, entry.page, index, self.memo_hashed);
             }
             let mut fresh = memo.fresh_buf();
+            let tick = self.decode_tick();
             let (first, count, ulen) = {
                 let opened = if was_verified {
                     verified_group_in(view, j, &mut fresh)
@@ -2241,7 +2261,7 @@ impl ZFile {
             if !was_verified {
                 set_bit(&self.verified, p);
             }
-            self.count_decode();
+            self.count_decode(tick);
             let g = Arc::new(fresh);
             memo.put(
                 self.id,
@@ -2255,6 +2275,7 @@ impl ZFile {
             );
             return Some((Opened::Memo(g, ulen), first, count, true));
         }
+        let tick = self.decode_tick();
         let opened = if was_verified {
             verified_group_in(view, j, buf)
         } else {
@@ -2264,6 +2285,9 @@ impl ZFile {
             Ok((g, first, count, decoded)) => {
                 if !was_verified {
                     set_bit(&self.verified, p);
+                }
+                if decoded {
+                    self.count_decode(tick);
                 }
                 Some((Opened::Borrowed(g), first, count, decoded))
             }
@@ -3116,9 +3140,10 @@ impl ZFile {
         self.fence.heap_bytes() + self.filter.as_ref().map_or(0, |f| f.blocks.len() * 64)
     }
 
-    /// One group decoded, counted once in sixteen per thread
-    /// (`ZFile::decodes16`).
-    fn count_decode(&self) {
+    /// A group's decode begun: whether it is the one in sixteen this
+    /// thread counts (`ZFile::decodes16`), with its start where this form
+    /// file times the decodes it counts (`ZFile::time_decodes`).
+    fn decode_tick(&self) -> (bool, Option<std::time::Instant>) {
         thread_local! {
             static TICK: Cell<u32> = const { Cell::new(0) };
         }
@@ -3127,9 +3152,27 @@ impl ZFile {
             t.set(v);
             v % 16 == 0
         });
-        if due {
+        (
+            due,
+            (due && self.time_decodes).then(std::time::Instant::now),
+        )
+    }
+
+    /// A group's decode done: counted, and its time added, where
+    /// `decode_tick` said so.
+    fn count_decode(&self, tick: (bool, Option<std::time::Instant>)) {
+        if tick.0 {
             self.decodes16.fetch_add(1, Ordering::Relaxed);
         }
+        if let Some(t0) = tick.1 {
+            let ns = t0.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            self.decode_ns16.fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+
+    /// The form file is the record coding's (`ZFile::coded`).
+    pub(super) fn coded(&self) -> bool {
+        self.coded
     }
 
     /// The file's bytes.
@@ -3245,6 +3288,14 @@ impl ZCell {
         self.p.swap(std::ptr::null_mut(), Ordering::AcqRel)
     }
 
+    /// `z` installed in place of whatever the cell held, which is handed
+    /// back for the caller to retire through the epoch as `take`'s is: a
+    /// reader that loaded the old pointer before the swap may still be
+    /// walking it, and one after it finds `z`, never an empty cell.
+    pub(super) fn replace(&self, z: ZFile) -> *mut ZFile {
+        self.p.swap(Box::into_raw(Box::new(z)), Ordering::AcqRel)
+    }
+
     /// `z` installed if the cell is empty; whether it was.
     pub(super) fn install(&self, z: ZFile) -> bool {
         let p = Box::into_raw(Box::new(z));
@@ -3299,6 +3350,14 @@ pub(super) struct ZEvents {
     pub build_retries: AtomicU64,
     pub rebuilds: AtomicU64,
     pub declined_damage: AtomicU64,
+    /// Partitions re-coded while served (`Options::zpages_recode`): to the
+    /// raw tails, back to the block coding, and re-codes that built nothing
+    /// to install -- failed, declined, cancelled or outrun.
+    pub recodes: AtomicU64,
+    pub recodes_back: AtomicU64,
+    pub recode_failed: AtomicU64,
+    /// The re-code policy's looks, one a period it read the heat at.
+    pub recode_looks: AtomicU64,
     /// Builds started on the builder's thread, and builds its cancel flag
     /// stopped: a merge took the target as an input, or the store closed.
     pub build_starts: AtomicU64,

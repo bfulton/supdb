@@ -90,3 +90,36 @@ pub fn zpg_mappings(dir: &std::path::Path) -> Vec<String> {
     v.dedup();
     v
 }
+
+/// A dead arena's shape: a thread takes `bytes` in pieces of a megabyte,
+/// touches every page, frees them all and exits, leaving the pages resident
+/// in free chunks of its arena -- the shape the seal and build threads leave
+/// in the suite. One allocation past the dynamic mmap threshold's start and
+/// under its cap, freed first, raises the threshold to its size and the trim
+/// threshold to twice it, so the pieces come from the thread's heap and
+/// nothing glibc does at the frees gives the heap back. A keeper of two
+/// megabytes allocated after the pieces is returned to the caller alive:
+/// glibc carves from its bins before its top, so the keeper comes from the
+/// top exactly when the last pieces did and lies above them, and the freed
+/// pieces are a bin chunk a trim reaches, not the heap's top, which a trim
+/// shrinks only past the trim threshold. The caller drops the keeper when
+/// its reading is done.
+pub fn dead_arena(bytes: usize) -> Vec<u8> {
+    std::thread::spawn(move || {
+        {
+            let mut raise = vec![0u8; 24 << 20];
+            raise[0] = 1;
+            std::hint::black_box(&raise);
+        }
+        let mut held: Vec<Vec<u8>> = Vec::with_capacity(bytes >> 20);
+        for _ in 0..bytes >> 20 {
+            held.push(vec![1u8; 1 << 20]);
+        }
+        let mut keeper = vec![0u8; 2 << 20];
+        keeper[0] = 1;
+        std::hint::black_box(&held);
+        keeper
+    })
+    .join()
+    .unwrap()
+}
