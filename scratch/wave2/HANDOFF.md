@@ -571,7 +571,7 @@ user's call.
   block walk 18% (its first touch of each record, as LMDB's cursor), the
   clean walks 13%, the overlay builds over the mixes' updates a sixth, which
   LMDB has no counterpart of. `mincore` over the store's files
-  (`probe/resident.py`) put 85 MB of the raw files' key sections and 38 MB
+  (`probe/resident.py`) put 85 MiB of the raw files' key sections and 38 MiB
   of ordered indexes resident beside the LZ4 form, which no form read
   touches and a cache drop skips because the open maps them.
   `Options::zpages_drop_raw` (off; arms `supdb-cache64tofitzpagesdrop`,
@@ -579,11 +579,23 @@ user's call.
   with it takes no fault anywhere and reads the read pass 1.07-1.10x, C
   1.25, B 1.12-1.32, E 1.13-1.20 of the LZ4 form's; A, F and D are the
   durable log's fdatasyncs, the same device writes and flushes in both arms
-  by a sampler (`probe/iorun.sh`), sign by sitting. **Next**: the raw-tail
-  form under the drop (183 MB over LZ4 at this rung; the drop widened the
-  fit by about 120), then the heat-driven coding with the drop under it;
-  under `Auto` the drop changes what the trial measures, so it is priced on
-  the forced arms first.
+  by a sampler (`probe/iorun.sh`), sign by sitting.
+- **The fit line under the drop** (`stage4.md`, "The fit line under the
+  drop"): hot8 with the drop (`supdb-cache64tofitzpageshot8drop`, 444 MiB
+  of form against the LZ4 form's 373) faults nowhere and reads every cell
+  of both sittings faster than the LZ4 form -- C 1.28-1.33, B 1.23, D
+  1.04-1.35, E 1.13-1.19, the read pass 1.10-1.17 -- with about 47 MiB of
+  the bound left in E; the whole raw-tail form with it
+  (`...recordrawdrop`, 568 MiB) faults 0.08 a read and reads the uniform
+  read pass at 0.44-0.47x. So the line sits near 490 MiB of form at five
+  million under 640 MiB. Against LMDB hot8+drop wins every cell but E
+  (0.69-0.75x, as hot4). **Next**: the coding chosen per partition by its
+  decode cost while the store serves (re-code a form file in place: build
+  the raw-tail file beside it, swap the cell, retire the old under the
+  epoch), the extra bytes held to a line read from the group's faults and
+  not the model's budget, and given back when the faults come; with the
+  drop under it, priced on the forced arms first since under `Auto` the
+  drop changes what the trial measures.
 - **Where E's time is, by the arm pair's profile at the head**: the LZ4
   decode 25% of the thread (147,000 groups a pass, 2.5 a form walk, nearly
   every one a memo miss, since the form walks are the Zipfian's cold tail),

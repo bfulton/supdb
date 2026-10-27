@@ -4516,6 +4516,42 @@ impl Supdb {
         )
     }
 
+    /// `supdb-cache64tofitzpageshot4drop` with the first eight partitions
+    /// raw-tailed, `supdb-cache64tofitzpageshot8drop`: where the room the
+    /// drop gives ends for the raw-tail coding by key order.
+    pub fn create_cache64_tofit_zpages_hot8_drop(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages: true,
+                zhotfirst: 8,
+                zdropraw: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cache64tofitzpagesrecordraw` with the raw pages dropped behind
+    /// the form (`Options::zpages_drop_raw`),
+    /// `supdb-cache64tofitzpagesrecordrawdrop`: whether the whole raw-tail
+    /// form fits the bound the raw key section and the ordered index no
+    /// longer share.
+    pub fn create_cache64_tofit_zpages_record_raw_drop(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages: true,
+                zrawtails: true,
+                zdropraw: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-cache64tofitzpageshot4` with the first partition alone
     /// raw-tailed, `supdb-cache64tofitzpageshot1`: half of the E mix's
     /// decodes at five million keys for a quarter of hot4's extra bytes.
@@ -5473,6 +5509,10 @@ impl Engine for Supdb {
         if self.budget == 64 << 20 && self.tofit && self.zpages {
             return if self.zstored {
                 "supdb-cache64tofitzpagesstored"
+            } else if self.zhotfirst == 8 && self.zdropraw {
+                "supdb-cache64tofitzpageshot8drop"
+            } else if self.zrawtails && self.zdropraw {
+                "supdb-cache64tofitzpagesrecordrawdrop"
             } else if self.zhotfirst == 4 && self.zdropraw {
                 "supdb-cache64tofitzpageshot4drop"
             } else if self.zhotfirst == 4 {
@@ -7012,6 +7052,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache64tofitzpageshot1"
         | "supdb-cache64tofitzpagesdrop"
         | "supdb-cache64tofitzpageshot4drop"
+        | "supdb-cache64tofitzpageshot8drop"
+        | "supdb-cache64tofitzpagesrecordrawdrop"
         | "supdb-cache64tofitzpagesrecordrawdecode"
         | "supdb-nocachezpagesheads"
         | "supdb-nocachezpagesprefetch"
@@ -7250,6 +7292,12 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cache64tofitzpagesdrop" => Box::new(Supdb::create_cache64_tofit_zpages_drop(dir)?),
         "supdb-cache64tofitzpageshot4drop" => {
             Box::new(Supdb::create_cache64_tofit_zpages_hot4_drop(dir)?)
+        }
+        "supdb-cache64tofitzpageshot8drop" => {
+            Box::new(Supdb::create_cache64_tofit_zpages_hot8_drop(dir)?)
+        }
+        "supdb-cache64tofitzpagesrecordrawdrop" => {
+            Box::new(Supdb::create_cache64_tofit_zpages_record_raw_drop(dir)?)
         }
         "supdb-cache64tofitzpagesrecordrawdecode" => {
             Box::new(Supdb::create_cache64_tofit_zpages_record_raw_decode(dir)?)
@@ -8825,6 +8873,12 @@ mod tests {
                 4,
                 true,
             ),
+            (
+                "supdb-cache64tofitzpageshot8drop",
+                Supdb::create_cache64_tofit_zpages_hot8_drop as fn(&Path) -> Res<Supdb>,
+                8,
+                true,
+            ),
         ] {
             let hot = new(name, make);
             assert_eq!(hot.name(), name);
@@ -8859,6 +8913,46 @@ mod tests {
             );
             drop(hot);
         }
+        // The whole raw-tail form with the raw pages dropped: the raw-tail
+        // arm's options but for that one.
+        let raw = new(
+            "supdb-cache64tofitzpagesrecordraw",
+            Supdb::create_cache64_tofit_zpages_record_raw,
+        );
+        let rawdrop = new(
+            "supdb-cache64tofitzpagesrecordrawdrop",
+            Supdb::create_cache64_tofit_zpages_record_raw_drop,
+        );
+        assert_eq!(rawdrop.name(), "supdb-cache64tofitzpagesrecordrawdrop");
+        assert_eq!(guarantee(rawdrop.name()), guarantee(base.name()));
+        assert_eq!(rawdrop.features(), base.features());
+        let (r, d) = (
+            raw.db.as_ref().unwrap().options(),
+            rawdrop.db.as_ref().unwrap().options(),
+        );
+        assert!(d.zpages_drop_raw && !r.zpages_drop_raw, "the one option");
+        assert_eq!(
+            (
+                d.zpages,
+                d.zpages_raw_tails,
+                d.zpages_record_coding,
+                d.zpages_memo,
+                d.scan_cache_bytes,
+                d.forms_to_fit,
+                d.zpages_inplace_walk
+            ),
+            (
+                r.zpages,
+                r.zpages_raw_tails,
+                r.zpages_record_coding,
+                r.zpages_memo,
+                r.scan_cache_bytes,
+                r.forms_to_fit,
+                r.zpages_inplace_walk
+            ),
+            "the rest as the raw-tail arm's"
+        );
+        drop((raw, rawdrop));
         let perrun = new(
             "supdb-cache64tofitautozpagesperrun",
             Supdb::create_cache64_tofit_auto_zpages_perrun,
