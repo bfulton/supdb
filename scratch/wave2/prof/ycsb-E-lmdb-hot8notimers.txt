@@ -1,0 +1,67 @@
+3 windows of lmdb ycsb-E, 1706 ms in all
+samples by tid in the windows: {921: 4028}
+tid 921: 4028 samples (2361/s)
+
+== self, top 30 ==
+ 19.61%     790  mdb_cursor_next
+ 14.13%     569  __ieee754_pow_fma
+  7.50%     302  mdb_node_search
+  7.37%     297  mdb_page_search
+  6.28%     253  iowrite16
+  6.18%     249  __memmove_evex_unaligned_erms
+  5.54%     223  _RNvNtCshMaFH5QrrhC_11supdb_bench3run4ycsb
+  4.42%     178  finish_task_switch.isra.0
+  3.82%     154  pow@@GLIBC_2.29
+  3.00%     121  __memcmp_evex_movbe
+  2.95%     119  mdb_cursor_get
+  2.53%     102  _RINvMs2_NtNtCsgczF5crJ4sT_3std6thread5localINtB6_8LocalKeyINtNtCscI6d9CVNmLh_4core4cell7RefCellINtNtCs40k4W9msRzi_5alloc3vec3VechEEE4withNCNvNtCshMaFH5QrrhC_11supdb_bench7engines7consume0uEB2h_
+  2.26%      91  _RNvNtCshMaFH5QrrhC_11supdb_bench7engines10lmdb_range
+  1.56%      63  mdb_cmp_memn
+  1.04%      42  _raw_spin_unlock_irq
+  1.04%      42  next_uptodate_folio
+  0.52%      21  mdb_page_get.constprop.0.isra.0
+  0.47%      19  page_vma_mapped_walk
+  0.45%      18  _raw_spin_unlock_irqrestore
+  0.42%      17  __pow_finite@GLIBC_2.15@plt
+  0.37%      15  cfree@GLIBC_2.2.5
+  0.37%      15  do_user_addr_fault
+  0.35%      14  handle_softirqs
+  0.27%      11  mdb_cursor_sibling
+  0.25%      10  malloc
+  0.22%       9  _int_free
+  0.22%       9  memcmp@plt
+  0.22%       9  _RNvXsc_NtCshMaFH5QrrhC_11supdb_bench7enginesNtB5_4LmdbNtB5_6Engine5range
+  0.22%       9  xas_load
+  0.22%       9  mdb_cursor_set
+
+== inclusive, top 30 ==
+ 99.70%    4016  _RNvNtCshMaFH5QrrhC_11supdb_bench3run4ycsb
+ 99.70%    4016  _RNvNtCshMaFH5QrrhC_11supdb_bench3run8one_pass
+ 99.70%    4016  _RNvNtCshMaFH5QrrhC_11supdb_bench3run2ab
+ 99.70%    4016  _RNvCs3FbAtKiN0Fj_5bench6cmd_ab
+ 99.70%    4016  _RNvCs3FbAtKiN0Fj_5bench4main
+ 99.70%    4016  _RINvNtNtCsgczF5crJ4sT_3std3sys9backtrace28___rust_begin_short_backtraceFEuuECs3FbAtKiN0Fj_5bench
+ 99.70%    4016  main
+ 99.70%    4016  __libc_start_call_main
+ 99.70%    4016  __libc_start_main@@GLIBC_2.34
+ 99.70%    4016  _start
+ 71.50%    2880  _RNvXsc_NtCshMaFH5QrrhC_11supdb_bench7enginesNtB5_4LmdbNtB5_6Engine5range
+ 71.18%    2867  _RNvNtCshMaFH5QrrhC_11supdb_bench7engines10lmdb_range
+ 59.71%    2405  mdb_cursor_get
+ 30.56%    1231  mdb_cursor_next
+ 26.66%    1074  mdb_cursor_set
+ 21.92%     883  mdb_page_search
+ 18.50%     745  pow@@GLIBC_2.29
+ 16.88%     680  exc_page_fault
+ 16.88%     680  asm_exc_page_fault
+ 16.83%     678  do_user_addr_fault
+ 16.29%     656  handle_mm_fault
+ 16.19%     652  __handle_mm_fault
+ 16.06%     647  handle_pte_fault
+ 16.04%     646  do_fault
+ 15.94%     642  do_read_fault
+ 14.45%     582  __do_fault
+ 14.32%     577  filemap_fault
+ 14.25%     574  __ieee754_pow_fma
+ 12.31%     496  mdb_node_search
+ 11.67%     470  filemap_read_folio

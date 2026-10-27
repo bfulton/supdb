@@ -372,12 +372,21 @@ partition by its heat;
 and ordered index unmapped and dropped from the page cache once its form
 file serves it (`Options::zpages_drop_raw`);
 `supdb-cache64tofitzpageshot8drop` is the hot4 drop arm with the first
-eight partitions raw-tailed, and `supdb-cache64tofitzpagesrecordrawdrop`
+eight partitions raw-tailed, `supdb-cache64tofitzpageshot8dropsettleevery`
+the same with every commit near reads settling its batch into the forms
+(`Options::forms_settle_every`), where the update mixes' writes are
+otherwise filed by ycsb-E's first scans,
+`supdb-cache64tofitzpageshot8dropsettlebuilds` that with the commit's fill
+building a form for every block its settle filed into that held none
+(`Options::forms_settle_builds`), and `supdb-cache64tofitzpagesrecordrawdrop`
 `supdb-cache64tofitzpagesrecordraw` with the drop, the two sides of the fit
 line the drop moves;
 `supdb-cache64tofitzpagesrecodedrop` is `supdb-cache64tofitzpagesdrop` with
 its partitions re-coded while served by what their decodes cost
-(`Options::zpages_recode`), the policy the key-order arms bound;
+(`Options::zpages_recode`), the policy the key-order arms bound, and
+`supdb-cache64tofitzpagesrecodekeepdrop` the same with the form file a
+re-code replaced kept beside the served one, so that a partition's later
+re-codes exchange the two without a build (`Options::zpages_recode_keep`);
 `supdb-cache64tofitautozpagescodingauto` is the combined arm with the coding
 of its form files the selector's to choose (`Options::zpages_coding_auto`),
 the raw tails where the model predicts that form fits the budget and the

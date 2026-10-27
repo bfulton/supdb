@@ -906,6 +906,20 @@ pub struct Supdb {
     /// (`Options::zpages_recode`): `supdb-cache64tofitzpagesrecodedrop`
     /// against `supdb-cache64tofitzpagesdrop` and the key-order arms.
     zrecode: bool,
+    /// The form file a re-code replaced kept beside the served one, so the
+    /// partition's later re-codes are the two exchanged
+    /// (`Options::zpages_recode_keep`):
+    /// `supdb-cache64tofitzpagesrecodekeepdrop` against
+    /// `supdb-cache64tofitzpagesrecodedrop`.
+    zrecodekeep: bool,
+    /// Every commit near reads settling its batch into the forms
+    /// (`Options::forms_settle_every`): `supdb-cache64tofitzpageshot8dropsettleevery`
+    /// against `supdb-cache64tofitzpageshot8drop`.
+    settleevery: bool,
+    /// And the commit's fill building a form for every block its settle
+    /// filed into that held none (`Options::forms_settle_builds`):
+    /// `supdb-cache64tofitzpageshot8dropsettlebuilds`.
+    settlebuilds: bool,
     /// before any view (`Options::zpages_memo_first`):
     /// `supdb-cache64tofitautozpagesmemofirst`, the pair against
     /// `supdb-cache64tofitautozpages`.
@@ -1421,6 +1435,16 @@ struct Policy {
     /// Its partitions re-coded while served (`Options::zpages_recode`):
     /// `supdb-cache64tofitzpagesrecodedrop`.
     zrecode: bool,
+    /// The replaced form file kept for the next re-code
+    /// (`Options::zpages_recode_keep`): `supdb-cache64tofitzpagesrecodekeepdrop`.
+    zrecodekeep: bool,
+    /// Every commit near reads settles its batch
+    /// (`Options::forms_settle_every`):
+    /// `supdb-cache64tofitzpageshot8dropsettleevery`.
+    settleevery: bool,
+    /// Its settles' blocks built by the fill (`Options::forms_settle_builds`):
+    /// `supdb-cache64tofitzpageshot8dropsettlebuilds`.
+    settlebuilds: bool,
     /// (`Options::zpages_memo_first`): `supdb-cache64tofitautozpagesmemofirst`.
     zmemofirst: bool,
     /// The fence searched through its tree (`Options::zpages_fence_tree`):
@@ -1564,6 +1588,9 @@ impl Default for Policy {
             zhotfirst: 0,
             zdropraw: false,
             zrecode: false,
+            zrecodekeep: false,
+            settleevery: false,
+            settlebuilds: false,
             zmemofirst: false,
             zfencetree: false,
             zmemonoahead: false,
@@ -4541,6 +4568,49 @@ impl Supdb {
         )
     }
 
+    /// `supdb-cache64tofitzpageshot8drop` with every commit near reads
+    /// settling its batch into the forms (`Options::forms_settle_every`),
+    /// `supdb-cache64tofitzpageshot8dropsettleevery`: the update mixes'
+    /// writes filed and their blocks' forms built by their own commits,
+    /// on the upkeep thread through the fsync, rather than by ycsb-E's
+    /// first scans.
+    pub fn create_cache64_tofit_zpages_hot8_drop_settle_every(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages: true,
+                zhotfirst: 8,
+                zdropraw: true,
+                settleevery: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cache64tofitzpageshot8dropsettleevery` with the commit's fill
+    /// building a form for every block its settle filed into that held
+    /// none (`Options::forms_settle_builds`),
+    /// `supdb-cache64tofitzpageshot8dropsettlebuilds`: the update mixes'
+    /// blocks formed by the commits that dirty them, where the settle
+    /// alone patches only the blocks a scan has formed.
+    pub fn create_cache64_tofit_zpages_hot8_drop_settle_builds(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages: true,
+                zhotfirst: 8,
+                zdropraw: true,
+                settleevery: true,
+                settlebuilds: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-cache64tofitzpagesdrop` with its partitions re-coded while
     /// served by what their decodes cost (`Options::zpages_recode`),
     /// `supdb-cache64tofitzpagesrecodedrop`: the raw tails where the
@@ -4555,6 +4625,25 @@ impl Supdb {
                 zpages: true,
                 zdropraw: true,
                 zrecode: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cache64tofitzpagesrecodedrop` with the form file a re-code
+    /// replaced kept beside the served one (`Options::zpages_recode_keep`),
+    /// `supdb-cache64tofitzpagesrecodekeepdrop`: a partition's re-codes
+    /// after its first are the two files exchanged, no build.
+    pub fn create_cache64_tofit_zpages_recode_keep_drop(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages: true,
+                zdropraw: true,
+                zrecode: true,
+                zrecodekeep: true,
                 ..Policy::default()
             },
         )
@@ -4931,6 +5020,9 @@ impl Supdb {
             zhotfirst,
             zdropraw,
             zrecode,
+            zrecodekeep,
+            settleevery,
+            settlebuilds,
             zmemofirst,
             zfencetree,
             zmemonoahead,
@@ -5203,6 +5295,9 @@ impl Supdb {
             zpages_raw_tails_first: zhotfirst,
             zpages_drop_raw: zdropraw,
             zpages_recode: zrecode,
+            zpages_recode_keep: zrecodekeep,
+            forms_settle_every: settleevery,
+            forms_settle_builds: settlebuilds,
             zpages_record_coding: zrecord || zrawtails,
             zpages_memo_first: zmemofirst,
             zpages_fence_tree: zfencetree,
@@ -5406,6 +5501,9 @@ impl Supdb {
             zhotfirst,
             zdropraw,
             zrecode,
+            zrecodekeep,
+            settleevery,
+            settlebuilds,
             zmemofirst,
             zfencetree,
             zmemonoahead,
@@ -5539,8 +5637,14 @@ impl Engine for Supdb {
         if self.budget == 64 << 20 && self.tofit && self.zpages {
             return if self.zstored {
                 "supdb-cache64tofitzpagesstored"
+            } else if self.zrecodekeep && self.zrecode && self.zdropraw {
+                "supdb-cache64tofitzpagesrecodekeepdrop"
             } else if self.zrecode && self.zdropraw {
                 "supdb-cache64tofitzpagesrecodedrop"
+            } else if self.zhotfirst == 8 && self.zdropraw && self.settlebuilds {
+                "supdb-cache64tofitzpageshot8dropsettlebuilds"
+            } else if self.zhotfirst == 8 && self.zdropraw && self.settleevery {
+                "supdb-cache64tofitzpageshot8dropsettleevery"
             } else if self.zhotfirst == 8 && self.zdropraw {
                 "supdb-cache64tofitzpageshot8drop"
             } else if self.zrawtails && self.zdropraw {
@@ -6298,6 +6402,7 @@ impl Engine for Supdb {
             ("settle_keys", sd[1] as f64),
             ("settle_blocks", sd[2] as f64),
             ("settle_rebuilds", sd[3] as f64),
+            ("settle_built", db.settle_built() as f64),
             ("walk_sparse", wk[1] as f64),
             ("walk_other", wk[2] as f64),
             // Seeks that hinted their stride window's directory: see
@@ -6450,6 +6555,8 @@ impl Engine for Supdb {
             ("zpage_recodes", z.recodes as f64),
             ("zpage_recodes_back", z.recodes_back as f64),
             ("zpage_recode_failed", z.recode_failed as f64),
+            ("zpage_recode_flips", z.recode_flips as f64),
+            ("zpage_spare_files", z.spare_files as f64),
             ("zpage_sel_samples", z.sel_samples as f64),
             ("zpage_sel_builds", z.sel_builds as f64),
             ("zpage_sel_installs", z.sel_installs as f64),
@@ -7088,7 +7195,10 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache64tofitzpagesdrop"
         | "supdb-cache64tofitzpageshot4drop"
         | "supdb-cache64tofitzpageshot8drop"
+        | "supdb-cache64tofitzpageshot8dropsettleevery"
+        | "supdb-cache64tofitzpageshot8dropsettlebuilds"
         | "supdb-cache64tofitzpagesrecodedrop"
+        | "supdb-cache64tofitzpagesrecodekeepdrop"
         | "supdb-cache64tofitzpagesrecordrawdrop"
         | "supdb-cache64tofitzpagesrecordrawdecode"
         | "supdb-nocachezpagesheads"
@@ -7332,8 +7442,17 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cache64tofitzpageshot8drop" => {
             Box::new(Supdb::create_cache64_tofit_zpages_hot8_drop(dir)?)
         }
+        "supdb-cache64tofitzpageshot8dropsettleevery" => Box::new(
+            Supdb::create_cache64_tofit_zpages_hot8_drop_settle_every(dir)?,
+        ),
+        "supdb-cache64tofitzpageshot8dropsettlebuilds" => Box::new(
+            Supdb::create_cache64_tofit_zpages_hot8_drop_settle_builds(dir)?,
+        ),
         "supdb-cache64tofitzpagesrecodedrop" => {
             Box::new(Supdb::create_cache64_tofit_zpages_recode_drop(dir)?)
+        }
+        "supdb-cache64tofitzpagesrecodekeepdrop" => {
+            Box::new(Supdb::create_cache64_tofit_zpages_recode_keep_drop(dir)?)
         }
         "supdb-cache64tofitzpagesrecordrawdrop" => {
             Box::new(Supdb::create_cache64_tofit_zpages_record_raw_drop(dir)?)
@@ -8887,11 +9006,12 @@ mod tests {
         assert!(supdb::Options::default().zpages_block_cursor && b.zpages_block_cursor);
         // The first four partitions raw-tailed, the rest block-coded: the
         // forced block form's arm but for that one option.
-        for (name, make, first, drop_raw, recode) in [
+        for (name, make, first, drop_raw, recode, keep) in [
             (
                 "supdb-cache64tofitzpageshot4",
                 Supdb::create_cache64_tofit_zpages_hot4 as fn(&Path) -> Res<Supdb>,
                 4,
+                false,
                 false,
                 false,
             ),
@@ -8901,12 +9021,14 @@ mod tests {
                 1,
                 false,
                 false,
+                false,
             ),
             (
                 "supdb-cache64tofitzpagesdrop",
                 Supdb::create_cache64_tofit_zpages_drop as fn(&Path) -> Res<Supdb>,
                 0,
                 true,
+                false,
                 false,
             ),
             (
@@ -8915,6 +9037,7 @@ mod tests {
                 4,
                 true,
                 false,
+                false,
             ),
             (
                 "supdb-cache64tofitzpageshot8drop",
@@ -8922,11 +9045,21 @@ mod tests {
                 8,
                 true,
                 false,
+                false,
             ),
             (
                 "supdb-cache64tofitzpagesrecodedrop",
                 Supdb::create_cache64_tofit_zpages_recode_drop as fn(&Path) -> Res<Supdb>,
                 0,
+                true,
+                true,
+                false,
+            ),
+            (
+                "supdb-cache64tofitzpagesrecodekeepdrop",
+                Supdb::create_cache64_tofit_zpages_recode_keep_drop as fn(&Path) -> Res<Supdb>,
+                0,
+                true,
                 true,
                 true,
             ),
@@ -8943,6 +9076,12 @@ mod tests {
             );
             assert_eq!(g.zpages_drop_raw, drop_raw, "{name}: the raw pages dropped");
             assert_eq!(g.zpages_recode, recode, "{name}: the re-code policy");
+            assert_eq!(
+                g.zpages_recode_keep, keep,
+                "{name}: the replaced form file kept"
+            );
+            assert!(!g.forms_settle_every, "{name}: the default settle");
+            assert!(!supdb::Options::default().zpages_recode_keep);
             assert!(!supdb::Options::default().zpages_recode);
             assert!(!supdb::Options::default().zpages_drop_raw);
             assert_eq!(supdb::Options::default().zpages_raw_tails_first, 0);
@@ -8966,6 +9105,41 @@ mod tests {
             );
             drop(hot);
         }
+        // Hot8 with the drop and every commit near reads settling: hot8's
+        // options but for that one.
+        let every = new(
+            "supdb-cache64tofitzpageshot8dropsettleevery",
+            Supdb::create_cache64_tofit_zpages_hot8_drop_settle_every,
+        );
+        assert_eq!(every.name(), "supdb-cache64tofitzpageshot8dropsettleevery");
+        assert_eq!(guarantee(every.name()), guarantee(base.name()));
+        assert_eq!(every.features(), base.features());
+        {
+            let e = every.db.as_ref().unwrap().options();
+            assert!(e.forms_settle_every && !supdb::Options::default().forms_settle_every);
+            assert_eq!(
+                (e.zpages_raw_tails_first, e.zpages_drop_raw, e.zpages_recode),
+                (8, true, false)
+            );
+            assert_eq!(e.forms_settle_backlog_pct, b.forms_settle_backlog_pct);
+            assert!(!e.forms_settle_builds && !supdb::Options::default().forms_settle_builds);
+        }
+        drop(every);
+        let builds = new(
+            "supdb-cache64tofitzpageshot8dropsettlebuilds",
+            Supdb::create_cache64_tofit_zpages_hot8_drop_settle_builds,
+        );
+        assert_eq!(
+            builds.name(),
+            "supdb-cache64tofitzpageshot8dropsettlebuilds"
+        );
+        assert_eq!(guarantee(builds.name()), guarantee(base.name()));
+        {
+            let e = builds.db.as_ref().unwrap().options();
+            assert!(e.forms_settle_every && e.forms_settle_builds);
+            assert_eq!((e.zpages_raw_tails_first, e.zpages_drop_raw), (8, true));
+        }
+        drop(builds);
         // The whole raw-tail form with the raw pages dropped: the raw-tail
         // arm's options but for that one.
         let raw = new(
