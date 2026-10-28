@@ -5320,26 +5320,32 @@ fn an_eager_auto_store_buys_the_form_before_any_read() {
     }
 }
 
-/// Under `Options::zpages_coding_auto` the selector chooses the coding the
-/// form files are built in: the sampler sizes the raw-tail record coding
-/// beside the block coding, and the raw tails are built where the model
-/// predicts that form faults nothing against the budget -- a store of twenty
-/// thousand keys, whose raw-tail form is about 2.2 MB, under 64 MiB -- and
-/// the block coding where it does not: the same store under a budget of
-/// 1.5 MiB, which the block form's 1.4 MB sits under and the raw-tail form's
-/// does not. Both stores are eager and under the group's pressure, as the
-/// eager test has them, so each buys and installs; the counts say which
-/// coding was chosen and built, the raw-tail form reads larger than the
-/// block form at both readings, and the reads answer the model either way.
+/// Under `Options::zpages_coding_auto`, as shipped, the selector chooses
+/// the coding the form files are built in: the sampler sizes the raw-tail
+/// record coding beside the block coding, and the raw tails are built where
+/// the model predicts that form faults nothing against the budget -- a store
+/// of twenty thousand keys, whose raw-tail form is about 2.2 MB, under
+/// 64 MiB -- and the block coding where it does not: the same store under a
+/// budget of 1.5 MiB, which the block form's 1.4 MB sits under and the
+/// raw-tail form's does not. With the option off the options' block coding
+/// is built under 64 MiB too, nothing chosen and nothing raw-tailed. Every
+/// store is eager and under the group's pressure, as the eager test has
+/// them, so each buys and installs; the counts say which coding was chosen
+/// and built, the raw-tail form reads larger than the block form wherever
+/// both are sized, and the reads answer the model every way.
 #[test]
 fn the_selector_builds_the_raw_tails_where_that_form_fits_and_the_block_coding_otherwise() {
     assert!(
-        !Options::default().zpages_coding_auto,
-        "the options' coding as shipped"
+        Options::default().zpages_coding_auto,
+        "the selector's coding as shipped"
     );
-    for (budget, raw) in [(64u64 << 20, true), (1536u64 << 10, false)] {
-        let what = format!("budget {budget}, raw tails expected {raw}");
-        let dir = scratch(&format!("coding-auto-{raw}"));
+    for (budget, gear, raw) in [
+        (64u64 << 20, true, true),
+        (1536u64 << 10, true, false),
+        (64u64 << 20, false, false),
+    ] {
+        let what = format!("budget {budget}, gear {gear}, raw tails expected {raw}");
+        let dir = scratch(&format!("coding-auto-{gear}-{raw}"));
         let inject = std::sync::Arc::new(supdb::ZInject::new());
         inject.set_budget(budget);
         inject.set_refault_rate(1_000_000.0);
@@ -5351,7 +5357,7 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_and_the_block_coding_o
                 zpages: ZPages::Auto,
                 zpages_min_bytes: 0,
                 zpages_build_eager: true,
-                zpages_coding_auto: true,
+                zpages_coding_auto: gear && Options::default().zpages_coding_auto,
                 zpages_inject: Some(inject.clone()),
                 ..Options::default()
             },
@@ -5370,11 +5376,23 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_and_the_block_coding_o
         );
         let c = db.zpage_counts();
         assert!(c.builds >= 1, "{what}: {c:?}");
-        assert!(
-            c.sample_w_z_raw_bytes > 0 && c.sample_w_z_bytes > 0,
-            "{what}: both codings sized: {c:?}"
-        );
-        if raw {
+        if !gear {
+            assert_eq!(
+                (c.coding_picks_raw, c.coding_picks_block, c.builds_raw_tails),
+                (0, 0, 0),
+                "{what}: nothing chosen, nothing raw-tailed: {c:?}"
+            );
+            assert!(
+                c.sample_w_z_bytes > 0 && c.sample_w_z_raw_bytes == 0,
+                "{what}: the options' coding sized alone: {c:?}"
+            );
+        } else {
+            assert!(
+                c.sample_w_z_raw_bytes > 0 && c.sample_w_z_bytes > 0,
+                "{what}: both codings sized: {c:?}"
+            );
+        }
+        if gear && raw {
             assert!(
                 c.coding_picks_raw >= 1 && c.coding_picks_block == 0,
                 "{what}: the raw tails chosen: {c:?}"
@@ -5391,7 +5409,7 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_and_the_block_coding_o
                 c.sample_w_z_raw_bytes < budget,
                 "{what}: the raw-tail form under the budget"
             );
-        } else {
+        } else if gear {
             assert!(
                 c.coding_picks_block >= 1 && c.coding_picks_raw == 0,
                 "{what}: the block coding chosen: {c:?}"

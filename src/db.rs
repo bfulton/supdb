@@ -1360,17 +1360,18 @@ pub struct Options {
     /// rate it shows at once and fades over `RECODE_TAU`. Off.
     #[doc(hidden)]
     pub zpages_both: bool,
-    /// EXPERIMENT: under `ZPages::Auto`, the coding the form files are built
-    /// in is the selector's to choose (`zselect::choose_coding`): the sampler
-    /// sizes the record coding with raw tails beside the block coding, and
-    /// the raw tails are built where the model predicts that form faults
-    /// nothing against the budget, the block coding otherwise -- the gear is
-    /// the lightest coding that fits. The raw-tail form reads the point-read
-    /// mixes 1.3x faster than the block form where it fits and 1.4-1.5x
-    /// slower in D and E where it does not (`docs/engine.md`). A pick holds
-    /// for the builds after it; the files already built keep their coding,
-    /// each file naming its own. Off; `supdb-cache64tofitautozpagescodingauto`
-    /// is the arm. Nothing under `Always`, whose coding is
+    /// Under `ZPages::Auto`, the coding the form files are built in is the
+    /// selector's to choose (`zselect::choose_coding`): the sampler sizes
+    /// the record coding with raw tails beside the block coding, and the raw
+    /// tails are built where the model predicts that form faults nothing
+    /// against the budget, the block coding otherwise -- the gear is the
+    /// coding that fits with the fewest decodes. Where both fit the raw-tail
+    /// form reads every mix at or above the block form's, the point reads
+    /// 1.25-1.95x, and where it does not fit it faults, 1.4-1.5x slower in D
+    /// and E (`docs/engine.md`). A pick holds for the builds after it; the
+    /// files already built keep their coding, each file naming its own. On;
+    /// `supdb-cache64tofitautozpagescodingfixed` is the shape before, the
+    /// options' coding. Nothing under `Always`, whose coding is
     /// `zpages_record_coding` and `zpages_raw_tails`.
     #[doc(hidden)]
     pub zpages_coding_auto: bool,
@@ -2918,7 +2919,7 @@ impl Default for Options {
             zpages_recode: false,
             zpages_recode_keep: false,
             zpages_both: false,
-            zpages_coding_auto: false,
+            zpages_coding_auto: true,
             zpages_inplace_walk: true,
             zpages_build_eager: false,
             zpages_inject: None,

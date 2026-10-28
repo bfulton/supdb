@@ -396,10 +396,11 @@ builder's thread, and the policy only exchanging them
 `supdb-cache64tofitautozpages` with every commit near reads filing its batch
 and building the blocks it filed into (`Options::forms_settle_every`,
 `forms_settle_builds`);
-`supdb-cache64tofitautozpagescodingauto` is the combined arm with the coding
-of its form files the selector's to choose (`Options::zpages_coding_auto`),
-the raw tails where the model predicts that form fits the budget and the
-block coding otherwise, where the default builds the block coding;
+`supdb-cache64tofitautozpagescodingfixed` is the combined arm with the coding
+of its form files the options' block coding wherever the controller builds
+(`Options::zpages_coding_auto` off), where the default's selector picks the
+raw tails where the model predicts that form fits the budget and the block
+coding otherwise;
 `supdb-cache64tofitzpagesrecordrawdecode` is the forced raw-tail form with
 the block cache whose scans decode a group whole before walking it
 (`Options::zpages_inplace_walk` off), where the default reads a raw-tail
