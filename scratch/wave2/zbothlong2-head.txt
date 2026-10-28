@@ -1,0 +1,5 @@
+f94ac45
+?? scratch/wave2/zbothlong2-build.log
+?? scratch/wave2/zbothlong2-driver.log
+?? scratch/wave2/zbothlong2-head.txt
+2026-10-28T04:43:45Z

@@ -3891,3 +3891,15 @@ against 24,007, F filed with no build -- so the win is the filing's share
 of E and a few hundred prebuilt blocks. With the room decided before the
 memory is taken, the option costs neither arm a cell and wins E where
 there is memory to spend on it.
+
+Both codings at ten times the operations again, with a flip under refaults
+asking for none of the incoming file's pages (`zbothlong2-ab-{1,2}`): C 1.08
+(eleven pairs of twelve), B 1.13 (ten), A 1.08 (ten), the read pass 1.19 and
+1.07, E 1.00 (ten pairs; 0.97 before the change), D 0.98, F 0.95 -- 0.89 in
+the first sitting and 1.02 in the second, unresolved. The faulting mixes no
+longer pay the prefetches; E stands level and the read-heavy mixes keep
+their gain. Against the LZ4 form with the drop, keeping both codings from
+write time wins the reads the store can serve from memory once the head is
+found, at the price of the disk the second coding takes and the builds
+after the load; it loses nothing resolved but F, whose two sittings
+disagree.
