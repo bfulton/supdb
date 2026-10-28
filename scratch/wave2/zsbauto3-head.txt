@@ -1,0 +1,9 @@
+1588a9e
+ M scratch/wave2/stage4.md
+ M src/db.rs
+ M src/ordindex.rs
+ M tests/settle.rs
+?? scratch/wave2/chain-room2.log
+?? scratch/wave2/zsbauto3-build.log
+?? scratch/wave2/zsbauto3-head.txt
+2026-10-28T01:43:36Z

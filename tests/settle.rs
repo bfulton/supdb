@@ -587,8 +587,10 @@ fn a_commits_fill_builds_the_blocks_its_settle_filed_into() {
 }
 
 /// Under `Options::forms_settle_builds` the fill builds only while the
-/// memory group's file refaults hold still (`SettleRoom`), here the rate
-/// a test sets through the seam: none built while it reads past zero, and
+/// memory group's file refaults hold still and the bound leaves room past
+/// what the reads keep resident (`SettleRoom`), here the rate and the
+/// budget a test sets through the seam: none built while the rate reads
+/// past zero or the budget leaves nothing, and
 /// when it rises after some were built, the ones no scan has walked since
 /// are shed at the next fill. Every scan answers every write throughout.
 #[test]
@@ -640,8 +642,23 @@ fn the_fills_build_only_while_the_refaults_hold_still() {
     // Refaulting: nothing built.
     stretch(&mut db, &mut want, 300);
     assert_eq!(db.settle_built(), 0, "no room, no build");
-    // Quiet: the stretch's blocks built.
+    // Quiet, but no room left in bytes: the budget the bound leaves is
+    // the form's own reads' already, and nothing is built.
     inject.set_refault_rate(0.0);
+    inject.set_budget(1);
+    stretch(&mut db, &mut want, 600);
+    assert_eq!(db.settle_built(), 0, "no room in bytes, no build");
+    // And no filing at every commit either: the scan after the stretch
+    // files what the commits left, as without the option. A scan of one
+    // key, so that the blocks the next phase builds are unwalked.
+    let filed = db.settle_density()[1];
+    db.scan(&keys[0], 1, |_, _| {}).unwrap();
+    assert!(
+        db.settle_density()[1] > filed,
+        "no room: the commits leave the filing to the scan"
+    );
+    // Quiet and room: the stretch's blocks built.
+    inject.set_budget(1 << 50);
     stretch(&mut db, &mut want, 900);
     let built = db.settle_built();
     assert!(built > 0, "room, builds");

@@ -571,6 +571,11 @@ impl OrdIndex {
         self.map.advise_dontneed();
     }
 
+    /// The file's bytes, mapped.
+    pub fn file_bytes(&self) -> u64 {
+        self.map.len()
+    }
+
     /// Whether `advise_random` was called on this mapping.
     pub fn advised(&self) -> bool {
         self.advised.load(std::sync::atomic::Ordering::Relaxed)
