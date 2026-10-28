@@ -1,0 +1,28 @@
+1588a9e
+ M scratch/wave2/stage4.md
+ M src/db.rs
+ M src/ordindex.rs
+ M tests/settle.rs
+?? scratch/wave2/chain-room2.log
+?? scratch/wave2/chain-room3.log
+?? scratch/wave2/zsbauto3-ab-1.err
+?? scratch/wave2/zsbauto3-ab-1.out
+?? scratch/wave2/zsbauto3-ab-2.err
+?? scratch/wave2/zsbauto3-ab-2.out
+?? scratch/wave2/zsbauto3-build.log
+?? scratch/wave2/zsbauto3-head.txt
+?? scratch/wave2/zsbauto4-ab-1.err
+?? scratch/wave2/zsbauto4-ab-1.out
+?? scratch/wave2/zsbauto4-ab-2.err
+?? scratch/wave2/zsbauto4-ab-2.out
+?? scratch/wave2/zsbauto4-build.log
+?? scratch/wave2/zsbauto4-head.txt
+?? scratch/wave2/zsettlebuilds4-ab-1.err
+?? scratch/wave2/zsettlebuilds4-ab-1.out
+?? scratch/wave2/zsettlebuilds4-ab-2.err
+?? scratch/wave2/zsettlebuilds4-ab-2.out
+?? scratch/wave2/zsettlebuilds4-build.log
+?? scratch/wave2/zsettlebuilds4-head.txt
+?? scratch/wave2/zsettlebuilds5-build.log
+?? scratch/wave2/zsettlebuilds5-head.txt
+2026-10-28T02:51:16Z

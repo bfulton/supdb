@@ -1951,9 +1951,13 @@ pub struct Options {
     /// nothing faulted. On the combined arm, which stands at its fit line,
     /// the same forms cost D a quarter in every pair on 0.008 major faults
     /// an operation: they stay in memory from the write to E's scans. So
-    /// the fill builds only while the memory group's file refaults hold
-    /// still, and sheds what it built unwalked when they move
-    /// (`SettleRoom`). Off.
+    /// the fill builds only while the bound leaves room past what the reads
+    /// keep resident (`Reader::settle_room_bytes`) and the memory group's
+    /// file refaults hold still, and sheds what it built unwalked when they
+    /// move (`SettleRoom`); and with no room a commit files only what the
+    /// backlog bound asks, since filing alone costs F and D a tenth. Gated
+    /// so, the combined arm reads every cell level and hot8 with the drop
+    /// reads E 1.07x. Off.
     #[doc(hidden)]
     pub forms_settle_builds: bool,
     /// Take the store's keys for `forms_settle_backlog_pct` and
@@ -19689,7 +19693,13 @@ impl Reader {
         // The bound is a share of the store's keys and not a count, for
         // the reason the seal cap's floor is: a count that is free at one
         // rung is five settles at the next.
-        let bound = if self.opts.forms_settle_every {
+        // Every write filed at its commit only where the fill may build what
+        // it files into (`SettleRoom`): filing alone cost F and D a tenth
+        // and bought E nothing, and with no room to build that is all a
+        // commit's filing would be.
+        let every =
+            self.opts.forms_settle_every && (!self.opts.forms_settle_builds || self.settle_room());
+        let bound = if every {
             1
         } else if self.opts.forms_settle_backlog_pct == 0 {
             usize::MAX
@@ -19932,18 +19942,18 @@ impl Reader {
         let now = std::time::Instant::now();
         let mut r = self.fs().settle_room.get();
         let was = r.room;
-        if let Some(rate) = self
-            .opts
-            .zpages_inject
-            .as_ref()
-            .and_then(|i| i.refault_rate())
-        {
-            r.room = rate <= 0.0;
+        let inject = self.opts.zpages_inject.as_ref();
+        if let Some(rate) = inject.and_then(|i| i.refault_rate()) {
+            r.room = rate <= 0.0
+                && inject
+                    .and_then(|i| i.budget())
+                    .is_none_or(|b| self.settle_room_bytes(b) > 0);
         } else if r
             .checked
             .is_none_or(|t| now.duration_since(t) >= SETTLE_ROOM_PERIOD)
         {
-            let refaults = zfile::read_budget().and_then(|b| b.refaults);
+            let platform = zfile::read_budget();
+            let refaults = platform.and_then(|b| b.refaults);
             if let (Some(n), Some(n0)) = (refaults, r.refaults) {
                 if n > n0 {
                     r.faulted = Some(now);
@@ -19951,15 +19961,43 @@ impl Reader {
             }
             r.refaults = refaults;
             r.checked = Some(now);
+            let budget = inject
+                .and_then(|i| i.budget())
+                .or(platform.map(|b| b.budget));
             r.room = r
                 .faulted
-                .is_none_or(|t| now.duration_since(t) >= SETTLE_ROOM_QUIET);
+                .is_none_or(|t| now.duration_since(t) >= SETTLE_ROOM_QUIET)
+                && budget.is_none_or(|b| self.settle_room_bytes(b) > 0);
         }
         self.fs().settle_room.set(r);
         if was && !r.room {
             self.shed_settle_built();
         }
         r.room
+    }
+
+    /// The page cache the bound leaves past what the reads need resident,
+    /// bytes, which a form the fill builds would take: `budget` -- the
+    /// limit less the process's anonymous memory and the model's margin --
+    /// less each partition's served form file and, where its raw pages are
+    /// not dropped behind the form (`Options::zpages_drop_raw`) or it has no
+    /// form, its key section and ordered index, which stay resident: the
+    /// raw key section the open's checksum check maps whole and the index
+    /// beside it, 120 MiB of the 500 a store of five million keys held under
+    /// 640 MiB. Negative where the reads' own pages do not fit.
+    fn settle_room_bytes(&self, budget: u64) -> i64 {
+        let np = self.segs().partition_point(|s| s.level > 0);
+        let mut need = 0u64;
+        for s in &self.segs()[..np] {
+            let z = s.z.get();
+            if let Some(z) = z {
+                need += z.file_bytes();
+            }
+            if z.is_none() || !self.opts.zpages_drop_raw {
+                need += s.blob.index_bytes() as u64 + s.ord.file_bytes();
+            }
+        }
+        budget as i64 - need as i64
     }
 
     /// The forms the fills built that no scan has walked since, shed: the
@@ -32048,6 +32086,9 @@ struct Maint {
     /// Partitions whose spare build kept nothing (`Options::zpages_both`),
     /// not built a spare again.
     z_spare_failed: std::collections::HashSet<String>,
+    /// The last look's refaults were past `RECODE_REFAULTS`: a flip asks
+    /// for none of the incoming file's pages.
+    z_recode_pressed: bool,
 }
 
 /// A sample job in flight (`zfile::sample` over the live partitions, on a
@@ -32548,6 +32589,7 @@ impl Maint {
             z_recode_refaults: None,
             z_recode_ceiling: None,
             z_spare_failed: std::collections::HashSet::new(),
+            z_recode_pressed: false,
         }
     }
 
@@ -33965,6 +34007,7 @@ impl Maint {
                 rate
             }
         };
+        self.z_recode_pressed = refault_rate > RECODE_REFAULTS;
         // Each served partition by its form file: its coding, its bytes, its
         // records' bytes, and what its form file has counted -- the decode
         // time, the decodes and the record-coded groups opened in place.
@@ -34278,7 +34321,12 @@ impl Maint {
                 k.drop_cache();
             }
             if let Some(z) = seg.z.get() {
-                z.prefetch_all();
+                // Under refaults the reads fault in only the pages they
+                // touch: a whole file asked for there queues behind the
+                // faults on the device it is short of.
+                if !self.z_recode_pressed {
+                    z.prefetch_all();
+                }
                 if z.coded() {
                     zfile::ZEvents::add(&ev.recodes, 1);
                 } else {

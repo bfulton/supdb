@@ -3854,3 +3854,40 @@ the faults already queue on. So the shape pays where the reads are the
 bottleneck and costs where the device is; a policy that holds its flips
 while the group refaults, and gives back only what lowers the bytes
 without prefetching what replaces them, is the lever the result names.
+
+Two refinements the two results name. The fill's room is decided before the
+memory is taken as well as by the refaults: it builds only while the
+budget the bound leaves exceeds what the reads keep resident -- each served
+form file, and where a partition's raw pages are not dropped behind its form
+or it has none, its key section and ordered index, which stay resident
+(`Reader::settle_room_bytes`; `tests/settle.rs` holds a budget with no room to
+no build, held to firing). And under refaults a flip asks for none of the
+incoming file's pages, the reads faulting in what they touch, since a whole
+file asked for queues behind the faults on the device it is short of.
+
+The room in bytes, paired: on hot8 with the drop (`zsettlebuilds4-ab-{1,2}`)
+the builds went through as before and E read 1.12 (ten pairs of twelve),
+every other cell level, nothing faulting; on the combined arm
+(`zsbauto3-ab-{1,2}`) the gate built nothing -- the room is spent by the
+form files and the raw key sections the arm keeps -- and D still read 0.91
+and F 0.92, with major faults down to 0.001 an operation. The upkeep thread
+worked 60-66 ms a mix in A and F filing every commit's writes, against
+under one millisecond in the arm without: the filing alone, which cost F
+and D a tenth on hot8 with the drop and bought E nothing, was all a commit
+did with no room to build. So the filing at every commit is gated on the
+same room (`Options::forms_settle_every` under `forms_settle_builds`), and
+with no room a commit files what the backlog bound asks, as without the
+option; `tests/settle.rs` holds the scan after a stretch with no room to
+filing what the commits left, held to firing.
+
+The filing gated with the builds, paired: on the combined arm
+(`zsbauto4-ab-{1,2}`) every cell read level -- C 1.03, B 0.98, A 0.99, F
+1.02, D 0.98, E 1.02 -- with no fault and the upkeep thread at 1.6 ms a mix
+where filing had taken it to 60; on hot8 with the drop (`zsettlebuilds5-ab-{1,2}`)
+E read 1.07 in both sittings (ten pairs of twelve), A, C and D level and B
+and F either side by sitting, nothing faulting. There the room ran out as
+A's writes grew the process -- A filed nothing and E built 23,623 blocks
+against 24,007, F filed with no build -- so the win is the filing's share
+of E and a few hundred prebuilt blocks. With the room decided before the
+memory is taken, the option costs neither arm a cell and wins E where
+there is memory to spend on it.

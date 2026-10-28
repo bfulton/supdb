@@ -698,10 +698,14 @@ user's call.
   room (hot8+drop: E 1.05-1.17 in five sittings, nothing faulting); on the
   combined arm, at its fit line, its forms cost D a quarter on major faults,
   and a refault gate (`SettleRoom`) brings that to 0.86 but cannot undo it,
-  since a shed form's memory stays in the allocator's arena. A gate that
-  decides before the memory is taken, from the room the bound actually
-  leaves, is the next step; in core nothing resolved in five pairs a
-  sitting. Arms `supdb-{,ingest}settlebuilds`,
+  since a shed form's memory stays in the allocator's arena. Gated before
+  the memory is taken -- the budget past what the reads keep resident
+  (`Reader::settle_room_bytes`), and no filing at every commit without that
+  room -- the combined arm reads every cell level and hot8+drop reads E
+  1.07x in both sittings; in core nothing resolved in five pairs a sitting.
+  Both codings at `--ops-div 1`: C 1.10, B 1.14, A 1.08, read pass
+  1.08-1.12, F 0.95 and E 0.97 where both arms fault; under refaults a flip
+  now prefetches nothing, unpriced. Arms `supdb-{,ingest}settlebuilds`,
   `supdb-cache64tofitautozpagessettlebuilds`.
 - **Untouched**: the shuffled-load kill of the combined arm under 640 MiB
   and the gear shift, as the session before left them.
