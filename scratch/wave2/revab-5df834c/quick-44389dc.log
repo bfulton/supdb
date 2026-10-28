@@ -1,0 +1,368 @@
+
+== quick ==
+   Compiling supdb-bench v0.2.0 (/home/user/supdb/bench)
+    Finished `release` profile [optimized + debuginfo] target(s) in 2m 21s
+bench run: scale quick on Intel(R) Xeon(R) Processor @ 2.10GHz (5 reps, rungs 10000,30000,100000,300000, arms supdb,supdb-forms,supdb-settle,supdb-nosnap,supdb-noadvice,supdb-nocache,supdb-cache256,lmdb,rocksdb-tuned,supdb-ingest,lmdb-nosync,rocksdb-nosync)
+      0s  floors rep 0 (warmup)  wal    1150896 ops/s  mmap     5.69 GB/s  chase   6641065/s  page  2.10 us
+      0s  floors rep 1  wal    1051131 ops/s  mmap     7.79 GB/s  chase   6289612/s  page  1.55 us
+      1s  floors rep 2  wal    1265430 ops/s  mmap     8.27 GB/s  chase   6630315/s  page  1.66 us
+      1s  floors rep 3  wal    1621224 ops/s  mmap     6.43 GB/s  chase   6545622/s  page  1.87 us
+      1s  floors rep 4  wal    1108507 ops/s  mmap     8.68 GB/s  chase   6977870/s  page  1.63 us
+      2s  floors rep 5  wal    1421499 ops/s  mmap     8.61 GB/s  chase   6598772/s  page  1.67 us
+      2s  reclaimed the scan floor's file, 0.0 GB
+      2s  size     10000  rep 0 (warmup)  supdb           load     899072 ops/s  read    1810541/s  3t   16040362/s  scan    56760776/s  3t   189174991/s  ycsb-A    546919/s  prime  1.36 us/pg  rss 0.06 GB
+      2s  size     10000  rep 0 (warmup)  supdb-forms     load     965033 ops/s  read    4124518/s  3t   16066012/s  scan    81567399/s  3t   288364770/s  ycsb-A    552741/s  prime  1.22 us/pg  rss 0.06 GB
+      2s  size     10000  rep 0 (warmup)  supdb-settle    load     905917 ops/s  read    4006303/s  3t   13428467/s  scan    51487738/s  3t   257198184/s  ycsb-A    526462/s  prime  1.18 us/pg  rss 0.06 GB
+      2s  size     10000  rep 0 (warmup)  supdb-nosnap    load     626727 ops/s  read    3362614/s  3t   14905484/s  scan    76647735/s  3t   305284754/s  ycsb-A    312689/s  prime  1.32 us/pg  rss 0.06 GB
+      3s  size     10000  rep 0 (warmup)  supdb-noadvice  load     984255 ops/s  read    3700713/s  3t   19502593/s  scan    64544445/s  3t   294110871/s  ycsb-A    616316/s  prime  1.30 us/pg  rss 0.06 GB
+      3s  size     10000  rep 0 (warmup)  supdb-nocache   load     961777 ops/s  read    3893196/s  3t   18827688/s  scan    53555840/s  3t   244226267/s  ycsb-A    360840/s  prime  1.24 us/pg  rss 0.07 GB
+      3s  size     10000  rep 0 (warmup)  supdb-cache256  load     879040 ops/s  read    3609781/s  3t   14460361/s  scan    74840216/s  3t   190759738/s  ycsb-A    434713/s  prime  1.14 us/pg  rss 0.07 GB
+      3s  size     10000  rep 0 (warmup)  lmdb            load    1005596 ops/s  read    2680839/s  3t    7786721/s  scan    42228481/s  3t   129366597/s  ycsb-A    131675/s  prime  1.25 us/pg  rss 0.07 GB
+      4s  size     10000  rep 0 (warmup)  rocksdb-tuned   load     684578 ops/s  read     928871/s  3t    3568493/s  scan     6663686/s  3t    24395119/s  ycsb-A    338462/s  prime  1.35 us/pg  rss 0.07 GB
+      4s  size     10000  rep 0 (warmup)  supdb-ingest    load    1608393 ops/s  read    3425068/s  3t   12986338/s  scan    70751380/s  3t   205675746/s  ycsb-A   2091073/s  prime  1.25 us/pg  rss 0.07 GB
+      4s  size     10000  rep 0 (warmup)  lmdb-nosync     load    1576772 ops/s  read    2696753/s  3t   10661204/s  scan    51348146/s  3t   187029667/s  ycsb-A    798644/s  prime  1.36 us/pg  rss 0.07 GB
+      5s  size     10000  rep 0 (warmup)  rocksdb-nosync  load    1202497 ops/s  read    1077892/s  3t    3302371/s  scan     8850137/s  3t    21151137/s  ycsb-A    874558/s  prime  1.25 us/pg  rss 0.07 GB
+      5s  size     10000  rep 1  supdb           load     765167 ops/s  read    2854414/s  3t   16228032/s  scan    82016288/s  3t   249486598/s  ycsb-A    520082/s  prime  1.40 us/pg  rss 0.07 GB
+      5s  size     10000  rep 1  supdb-forms     load     605782 ops/s  read    2737278/s  3t   19343520/s  scan    55052437/s  3t   287226327/s  ycsb-A    547033/s  prime  1.20 us/pg  rss 0.07 GB
+      5s  size     10000  rep 1  supdb-settle    load    1128483 ops/s  read    4412874/s  3t   14803944/s  scan    72806168/s  3t   205506661/s  ycsb-A    605196/s  prime  1.17 us/pg  rss 0.07 GB
+      5s  size     10000  rep 1  supdb-nosnap    load     979237 ops/s  read    3492677/s  3t   17809323/s  scan    50052806/s  3t   224824440/s  ycsb-A    647238/s  prime  1.09 us/pg  rss 0.07 GB
+      5s  size     10000  rep 1  supdb-noadvice  load     967368 ops/s  read    3318712/s  3t   20068017/s  scan    57789104/s  3t   208036751/s  ycsb-A    546434/s  prime  1.40 us/pg  rss 0.07 GB
+      6s  size     10000  rep 1  supdb-nocache   load    1102727 ops/s  read    3449276/s  3t    8462444/s  scan    71967816/s  3t   149263593/s  ycsb-A    713249/s  prime  1.10 us/pg  rss 0.07 GB
+      6s  size     10000  rep 1  supdb-cache256  load     964417 ops/s  read    3529585/s  3t   15214401/s  scan    77292296/s  3t   325403362/s  ycsb-A    345321/s  prime  1.14 us/pg  rss 0.07 GB
+      6s  size     10000  rep 1  lmdb            load     873635 ops/s  read    2414995/s  3t    8616995/s  scan    43379243/s  3t   196927692/s  ycsb-A    198450/s  prime  1.20 us/pg  rss 0.07 GB
+      7s  size     10000  rep 1  rocksdb-tuned   load     712375 ops/s  read     964129/s  3t    3715203/s  scan     6287865/s  3t    25595495/s  ycsb-A    350195/s  prime  1.18 us/pg  rss 0.07 GB
+      7s  size     10000  rep 1  supdb-ingest    load    1494721 ops/s  read    3362494/s  3t   18018137/s  scan    79687625/s  3t   280211833/s  ycsb-A   2526126/s  prime  1.46 us/pg  rss 0.07 GB
+      7s  size     10000  rep 1  lmdb-nosync     load    1212034 ops/s  read    1876530/s  3t    7712861/s  scan    36259867/s  3t   144253565/s  ycsb-A   1191491/s  prime  1.31 us/pg  rss 0.07 GB
+      8s  size     10000  rep 1  rocksdb-nosync  load    1209662 ops/s  read    1267046/s  3t    2766279/s  scan     9501269/s  3t    18473535/s  ycsb-A   1273905/s  prime  1.18 us/pg  rss 0.07 GB
+      8s  size     10000  rep 2  supdb           load     892376 ops/s  read    3103341/s  3t   20361802/s  scan    75515012/s  3t   236144497/s  ycsb-A    519530/s  prime  1.25 us/pg  rss 0.07 GB
+      8s  size     10000  rep 2  supdb-forms     load     944747 ops/s  read    2903391/s  3t   13590520/s  scan    54307981/s  3t   311198348/s  ycsb-A    595633/s  prime  1.38 us/pg  rss 0.08 GB
+      8s  size     10000  rep 2  supdb-settle    load     979884 ops/s  read    3829853/s  3t   14905862/s  scan    75158585/s  3t   169927201/s  ycsb-A    588728/s  prime  1.35 us/pg  rss 0.08 GB
+      8s  size     10000  rep 2  supdb-nosnap    load     776774 ops/s  read    3359010/s  3t   14630521/s  scan    54625406/s  3t   164296003/s  ycsb-A    475943/s  prime  1.32 us/pg  rss 0.08 GB
+      8s  size     10000  rep 2  supdb-noadvice  load     880615 ops/s  read    4246254/s  3t   16295323/s  scan    85139714/s  3t   211097241/s  ycsb-A    561815/s  prime  1.10 us/pg  rss 0.08 GB
+      9s  size     10000  rep 2  supdb-nocache   load     861793 ops/s  read    3804309/s  3t   14019013/s  scan    72424932/s  3t   171460894/s  ycsb-A    470845/s  prime  1.31 us/pg  rss 0.08 GB
+      9s  size     10000  rep 2  supdb-cache256  load     812197 ops/s  read    3968726/s  3t   15265241/s  scan    81652650/s  3t   193184987/s  ycsb-A    376816/s  prime  1.44 us/pg  rss 0.08 GB
+      9s  size     10000  rep 2  lmdb            load    1095905 ops/s  read    2701873/s  3t    7423189/s  scan    60194549/s  3t    94595557/s  ycsb-A    227264/s  prime  1.38 us/pg  rss 0.08 GB
+     10s  size     10000  rep 2  rocksdb-tuned   load     754284 ops/s  read     968220/s  3t    2503078/s  scan     6410770/s  3t    18443455/s  ycsb-A    426182/s  prime  1.52 us/pg  rss 0.08 GB
+     10s  size     10000  rep 2  supdb-ingest    load    1859540 ops/s  read    3516544/s  3t   14180924/s  scan    49682035/s  3t   155327508/s  ycsb-A   1772952/s  prime  1.28 us/pg  rss 0.08 GB
+     10s  size     10000  rep 2  lmdb-nosync     load    1745238 ops/s  read    2663090/s  3t    8639787/s  scan    62789223/s  3t   156452296/s  ycsb-A   1444028/s  prime  1.60 us/pg  rss 0.08 GB
+     11s  size     10000  rep 2  rocksdb-nosync  load    1351863 ops/s  read    1441622/s  3t    2866489/s  scan     9291409/s  3t    25168877/s  ycsb-A    768337/s  prime  1.19 us/pg  rss 0.08 GB
+     11s  size     10000  rep 3  supdb           load     837994 ops/s  read    2847980/s  3t   12912601/s  scan    41917121/s  3t   176441673/s  ycsb-A    468778/s  prime  1.23 us/pg  rss 0.08 GB
+     11s  size     10000  rep 3  supdb-forms     load    1155819 ops/s  read    4298114/s  3t   15702770/s  scan    87415644/s  3t   197020460/s  ycsb-A    576820/s  prime  1.16 us/pg  rss 0.08 GB
+     11s  size     10000  rep 3  supdb-settle    load     823753 ops/s  read    2848149/s  3t   16017333/s  scan    45310171/s  3t   179836417/s  ycsb-A    604911/s  prime  1.18 us/pg  rss 0.08 GB
+     11s  size     10000  rep 3  supdb-nosnap    load     785518 ops/s  read    2648755/s  3t    8528879/s  scan    43818713/s  3t   153836797/s  ycsb-A    417957/s  prime  1.68 us/pg  rss 0.08 GB
+     12s  size     10000  rep 3  supdb-noadvice  load     780360 ops/s  read    2673206/s  3t   10452616/s  scan    49942815/s  3t   151458768/s  ycsb-A    406170/s  prime  1.43 us/pg  rss 0.08 GB
+     12s  size     10000  rep 3  supdb-nocache   load    1143610 ops/s  read    4006847/s  3t   16657283/s  scan    64911039/s  3t   218899506/s  ycsb-A    676418/s  prime  1.33 us/pg  rss 0.08 GB
+     12s  size     10000  rep 3  supdb-cache256  load    1040700 ops/s  read    4314432/s  3t   11175823/s  scan    79292080/s  3t   159883886/s  ycsb-A    512366/s  prime  1.16 us/pg  rss 0.08 GB
+     12s  size     10000  rep 3  lmdb            load    1018558 ops/s  read    3003587/s  3t    8138732/s  scan    26935737/s  3t   123339785/s  ycsb-A    174470/s  prime  1.26 us/pg  rss 0.08 GB
+     13s  size     10000  rep 3  rocksdb-tuned   load     917957 ops/s  read    1416976/s  3t    3971529/s  scan     6196589/s  3t    23059144/s  ycsb-A    376229/s  prime  1.21 us/pg  rss 0.08 GB
+     13s  size     10000  rep 3  supdb-ingest    load    1748880 ops/s  read    3702744/s  3t   17774523/s  scan    72887891/s  3t   263868836/s  ycsb-A   1692843/s  prime  1.25 us/pg  rss 0.08 GB
+     13s  size     10000  rep 3  lmdb-nosync     load    1783395 ops/s  read    2561934/s  3t    7415546/s  scan    62052447/s  3t   122501680/s  ycsb-A   1067341/s  prime  1.16 us/pg  rss 0.08 GB
+     14s  size     10000  rep 3  rocksdb-nosync  load    1186567 ops/s  read     911974/s  3t    2442947/s  scan     2456118/s  3t    23429249/s  ycsb-A   1313637/s  prime  1.42 us/pg  rss 0.08 GB
+     14s  size     10000  rep 4  supdb           load    1050188 ops/s  read    2598214/s  3t   12686202/s  scan    70548728/s  3t   170379056/s  ycsb-A    439609/s  prime  2.26 us/pg  rss 0.09 GB
+     14s  size     10000  rep 4  supdb-forms     load     928862 ops/s  read    3338338/s  3t   12645039/s  scan    54533358/s  3t   172912536/s  ycsb-A    445064/s  prime  1.40 us/pg  rss 0.09 GB
+     14s  size     10000  rep 4  supdb-settle    load     905101 ops/s  read    3551043/s  3t   15575693/s  scan    68363447/s  3t   244517550/s  ycsb-A    560629/s  prime  1.29 us/pg  rss 0.09 GB
+     14s  size     10000  rep 4  supdb-nosnap    load     785166 ops/s  read    2277195/s  3t   10731767/s  scan    76149283/s  3t   131668759/s  ycsb-A    398640/s  prime  1.18 us/pg  rss 0.09 GB
+     15s  size     10000  rep 4  supdb-noadvice  load     952308 ops/s  read    3957907/s  3t   19577057/s  scan    30190502/s  3t   284958657/s  ycsb-A    485550/s  prime  1.51 us/pg  rss 0.09 GB
+     15s  size     10000  rep 4  supdb-nocache   load     823653 ops/s  read    2945831/s  3t   15095205/s  scan    53831454/s  3t   201403960/s  ycsb-A    433432/s  prime  1.42 us/pg  rss 0.09 GB
+     15s  size     10000  rep 4  supdb-cache256  load     885284 ops/s  read    3897215/s  3t   15344217/s  scan    72792389/s  3t   188898784/s  ycsb-A    544035/s  prime  1.37 us/pg  rss 0.09 GB
+     15s  size     10000  rep 4  lmdb            load     678162 ops/s  read    1929867/s  3t    9396480/s  scan    41833478/s  3t   158445184/s  ycsb-A    172192/s  prime  1.36 us/pg  rss 0.09 GB
+     16s  size     10000  rep 4  rocksdb-tuned   load     681201 ops/s  read    1302366/s  3t    3456330/s  scan     5874495/s  3t    23825883/s  ycsb-A    245127/s  prime  1.40 us/pg  rss 0.09 GB
+     16s  size     10000  rep 4  supdb-ingest    load    1624786 ops/s  read    3163928/s  3t   13291038/s  scan    52182807/s  3t   187495981/s  ycsb-A   2439546/s  prime  1.17 us/pg  rss 0.09 GB
+     16s  size     10000  rep 4  lmdb-nosync     load    1722185 ops/s  read    1914000/s  3t    8128511/s  scan    35258071/s  3t   122018806/s  ycsb-A   1033514/s  prime  1.47 us/pg  rss 0.09 GB
+     17s  size     10000  rep 4  rocksdb-nosync  load     964099 ops/s  read    1250120/s  3t    3045262/s  scan     9328750/s  3t    23601066/s  ycsb-A   1045768/s  prime  1.17 us/pg  rss 0.09 GB
+     17s  size     10000  rep 5  supdb           load     863525 ops/s  read    4323608/s  3t   10984830/s  scan    75254171/s  3t   163688473/s  ycsb-A    345265/s  prime  1.14 us/pg  rss 0.09 GB
+     17s  size     10000  rep 5  supdb-forms     load     941981 ops/s  read    3980063/s  3t   20248407/s  scan    49646763/s  3t   305935454/s  ycsb-A    477889/s  prime  1.29 us/pg  rss 0.09 GB
+     17s  size     10000  rep 5  supdb-settle    load     628295 ops/s  read    2436327/s  3t   13564312/s  scan    46990935/s  3t   178083892/s  ycsb-A    447288/s  prime  1.44 us/pg  rss 0.09 GB
+     17s  size     10000  rep 5  supdb-nosnap    load     625054 ops/s  read    2725448/s  3t   13041375/s  scan    53180457/s  3t   170476746/s  ycsb-A    387489/s  prime  1.50 us/pg  rss 0.09 GB
+     18s  size     10000  rep 5  supdb-noadvice  load     969323 ops/s  read    3773746/s  3t   20406039/s  scan    61279016/s  3t   247535128/s  ycsb-A    595973/s  prime  1.31 us/pg  rss 0.09 GB
+     18s  size     10000  rep 5  supdb-nocache   load     727338 ops/s  read    2753509/s  3t    9849933/s  scan    47808232/s  3t   161137779/s  ycsb-A    442496/s  prime  1.47 us/pg  rss 0.09 GB
+     18s  size     10000  rep 5  supdb-cache256  load    1093458 ops/s  read    3533465/s  3t   19370235/s  scan    62420414/s  3t   287729764/s  ycsb-A    528625/s  prime  1.26 us/pg  rss 0.09 GB
+     18s  size     10000  rep 5  lmdb            load    1122646 ops/s  read    2803266/s  3t    8391416/s  scan    62044747/s  3t   134335705/s  ycsb-A    196193/s  prime  1.77 us/pg  rss 0.09 GB
+     19s  size     10000  rep 5  rocksdb-tuned   load     806045 ops/s  read    1079150/s  3t    4597347/s  scan     9134806/s  3t    30533194/s  ycsb-A    347261/s  prime  1.11 us/pg  rss 0.09 GB
+     19s  size     10000  rep 5  supdb-ingest    load    1989316 ops/s  read    3906996/s  3t   22112593/s  scan    85910653/s  3t   298502087/s  ycsb-A   2906241/s  prime  1.50 us/pg  rss 0.09 GB
+     19s  size     10000  rep 5  lmdb-nosync     load    1126961 ops/s  read    1771809/s  3t   10054596/s  scan    41658509/s  3t   131839568/s  ycsb-A   1100841/s  prime  1.43 us/pg  rss 0.09 GB
+     20s  size     10000  rep 5  rocksdb-nosync  load    1244178 ops/s  read    1381150/s  3t    3980653/s  scan     8428384/s  3t    27865695/s  ycsb-A   1189439/s  prime  1.13 us/pg  rss 0.09 GB
+     20s  banked rungs through 10000 to runs-ci/quick/20261028T154843Z-44389dc.json
+     20s  size     30000  rep 0 (warmup)  supdb           load    1219643 ops/s  read    2489149/s  3t   14259637/s  scan    66250320/s  3t   203118799/s  ycsb-A    577876/s  prime  1.31 us/pg  rss 0.09 GB
+     20s  size     30000  rep 0 (warmup)  supdb-forms     load    1201710 ops/s  read    2941010/s  3t   13014225/s  scan    77735311/s  3t   192230919/s  ycsb-A    399085/s  prime  1.33 us/pg  rss 0.10 GB
+     21s  size     30000  rep 0 (warmup)  supdb-settle    load    1133458 ops/s  read    3094248/s  3t   10537289/s  scan    61549446/s  3t   160014622/s  ycsb-A    489068/s  prime  1.42 us/pg  rss 0.10 GB
+     21s  size     30000  rep 0 (warmup)  supdb-nosnap    load    1170237 ops/s  read    3296454/s  3t   16080692/s  scan    75262100/s  3t   275956152/s  ycsb-A    418892/s  prime  1.44 us/pg  rss 0.10 GB
+     22s  size     30000  rep 0 (warmup)  supdb-noadvice  load     925382 ops/s  read    3383430/s  3t   14249530/s  scan    68401792/s  3t   226224991/s  ycsb-A    346477/s  prime  1.51 us/pg  rss 0.10 GB
+     22s  size     30000  rep 0 (warmup)  supdb-nocache   load    1151453 ops/s  read    2821361/s  3t   11203904/s  scan    76431563/s  3t   191130707/s  ycsb-A    486553/s  prime  1.43 us/pg  rss 0.10 GB
+     23s  size     30000  rep 0 (warmup)  supdb-cache256  load    1003782 ops/s  read    3615239/s  3t   17798257/s  scan    68061164/s  3t   220422794/s  ycsb-A    344693/s  prime  1.32 us/pg  rss 0.10 GB
+     24s  size     30000  rep 0 (warmup)  lmdb            load     940503 ops/s  read    2388061/s  3t    7015726/s  scan    61488388/s  3t   110637121/s  ycsb-A    107460/s  prime  1.59 us/pg  rss 0.10 GB
+     26s  size     30000  rep 0 (warmup)  rocksdb-tuned   load     670529 ops/s  read     741846/s  3t    2879686/s  scan     6627331/s  3t    23579470/s  ycsb-A    344524/s  prime  1.46 us/pg  rss 0.10 GB
+     26s  size     30000  rep 0 (warmup)  supdb-ingest    load    1773229 ops/s  read    2866018/s  3t   14510533/s  scan    78278703/s  3t   204901653/s  ycsb-A   2466144/s  prime  1.25 us/pg  rss 0.10 GB
+     26s  size     30000  rep 0 (warmup)  lmdb-nosync     load    1343057 ops/s  read    1743347/s  3t    8312546/s  scan    36187524/s  3t   125317213/s  ycsb-A   1270695/s  prime  1.56 us/pg  rss 0.10 GB
+     28s  size     30000  rep 0 (warmup)  rocksdb-nosync  load    1435483 ops/s  read    1139224/s  3t    3137725/s  scan     6826648/s  3t    23931433/s  ycsb-A   1064355/s  prime  1.39 us/pg  rss 0.10 GB
+     29s  size     30000  rep 1  supdb           load    1283479 ops/s  read    3651004/s  3t   15916490/s  scan    70796961/s  3t   187582935/s  ycsb-A    470919/s  prime  1.38 us/pg  rss 0.10 GB
+     29s  size     30000  rep 1  supdb-forms     load     825424 ops/s  read    2390869/s  3t   12611599/s  scan    49186859/s  3t   211193455/s  ycsb-A    490136/s  prime  1.51 us/pg  rss 0.10 GB
+     30s  size     30000  rep 1  supdb-settle    load    1174663 ops/s  read    3146712/s  3t   16678555/s  scan    75823251/s  3t   282198611/s  ycsb-A    401171/s  prime  1.57 us/pg  rss 0.10 GB
+     30s  size     30000  rep 1  supdb-nosnap    load    1102567 ops/s  read    2989164/s  3t   10572130/s  scan    63286733/s  3t   162246855/s  ycsb-A    479368/s  prime  1.26 us/pg  rss 0.10 GB
+     31s  size     30000  rep 1  supdb-noadvice  load     871613 ops/s  read    2433194/s  3t   13142823/s  scan    77384008/s  3t   182121747/s  ycsb-A    519164/s  prime  1.15 us/pg  rss 0.10 GB
+     31s  size     30000  rep 1  supdb-nocache   load     830768 ops/s  read    2272161/s  3t   13588803/s  scan    52917986/s  3t   203527995/s  ycsb-A    448049/s  prime  1.46 us/pg  rss 0.10 GB
+     32s  size     30000  rep 1  supdb-cache256  load     785025 ops/s  read    3067339/s  3t   11752433/s  scan    72942298/s  3t   181620487/s  ycsb-A    464210/s  prime  1.44 us/pg  rss 0.10 GB
+     32s  size     30000  rep 1  lmdb            load     990839 ops/s  read    2436918/s  3t    8313324/s  scan    60693607/s  3t   172193949/s  ycsb-A    183229/s  prime  1.35 us/pg  rss 0.10 GB
+     35s  size     30000  rep 1  rocksdb-tuned   load     937281 ops/s  read    1256070/s  3t    3972253/s  scan     6919834/s  3t    23057474/s  ycsb-A    287703/s  prime  1.32 us/pg  rss 0.10 GB
+     35s  size     30000  rep 1  supdb-ingest    load    1880625 ops/s  read    2627859/s  3t   14286039/s  scan    81037277/s  3t   203663384/s  ycsb-A   2517906/s  prime  1.55 us/pg  rss 0.10 GB
+     35s  size     30000  rep 1  lmdb-nosync     load    1585009 ops/s  read    2307010/s  3t    5553555/s  scan    31012496/s  3t   152080358/s  ycsb-A   1060792/s  prime  1.17 us/pg  rss 0.10 GB
+     37s  size     30000  rep 1  rocksdb-nosync  load    1047540 ops/s  read     825394/s  3t    4055821/s  scan     6164602/s  3t    27044673/s  ycsb-A    940272/s  prime  1.27 us/pg  rss 0.10 GB
+     38s  size     30000  rep 2  supdb           load    1028633 ops/s  read    2882517/s  3t   15864359/s  scan    69594104/s  3t   196103758/s  ycsb-A    466690/s  prime  1.50 us/pg  rss 0.10 GB
+     38s  size     30000  rep 2  supdb-forms     load    1139077 ops/s  read    2280189/s  3t   11663916/s  scan    49235940/s  3t   279535035/s  ycsb-A    431607/s  prime  1.13 us/pg  rss 0.10 GB
+     38s  size     30000  rep 2  supdb-settle    load     857370 ops/s  read    2676455/s  3t   14421547/s  scan    49284715/s  3t   166708446/s  ycsb-A    398183/s  prime  1.44 us/pg  rss 0.11 GB
+     39s  size     30000  rep 2  supdb-nosnap    load    1427289 ops/s  read    3804652/s  3t   10520183/s  scan    50183001/s  3t   167165855/s  ycsb-A    540058/s  prime  1.22 us/pg  rss 0.10 GB
+     39s  size     30000  rep 2  supdb-noadvice  load     828846 ops/s  read    2114788/s  3t   15381649/s  scan    76094814/s  3t   294842932/s  ycsb-A    539224/s  prime  1.42 us/pg  rss 0.10 GB
+     40s  size     30000  rep 2  supdb-nocache   load     910745 ops/s  read    2630044/s  3t    9529351/s  scan    43741024/s  3t   235792673/s  ycsb-A    330823/s  prime  1.41 us/pg  rss 0.10 GB
+     40s  size     30000  rep 2  supdb-cache256  load     987486 ops/s  read    2966526/s  3t   11008545/s  scan    69562959/s  3t   151435635/s  ycsb-A    316892/s  prime  1.30 us/pg  rss 0.10 GB
+     41s  size     30000  rep 2  lmdb            load     972757 ops/s  read    1949599/s  3t    5888621/s  scan    58775472/s  3t   176134779/s  ycsb-A    153895/s  prime  1.54 us/pg  rss 0.10 GB
+     43s  size     30000  rep 2  rocksdb-tuned   load     898180 ops/s  read     959131/s  3t    4471431/s  scan     6575726/s  3t    24737228/s  ycsb-A    323612/s  prime  1.25 us/pg  rss 0.10 GB
+     44s  size     30000  rep 2  supdb-ingest    load    1550270 ops/s  read    2590760/s  3t    9872019/s  scan    53746200/s  3t   161267442/s  ycsb-A   1917679/s  prime  1.19 us/pg  rss 0.11 GB
+     44s  size     30000  rep 2  lmdb-nosync     load    1957873 ops/s  read    2344644/s  3t    7971702/s  scan    56814416/s  3t   104210409/s  ycsb-A   1228540/s  prime  1.28 us/pg  rss 0.11 GB
+     46s  size     30000  rep 2  rocksdb-nosync  load    1501885 ops/s  read    1353479/s  3t    3084395/s  scan     9007448/s  3t    24023516/s  ycsb-A   1131691/s  prime  1.42 us/pg  rss 0.10 GB
+     46s  size     30000  rep 3  supdb           load    1246632 ops/s  read    3449013/s  3t   12765235/s  scan    78505671/s  3t   277575259/s  ycsb-A    421764/s  prime  1.18 us/pg  rss 0.11 GB
+     47s  size     30000  rep 3  supdb-forms     load    1075539 ops/s  read    3473158/s  3t   12447862/s  scan    69860047/s  3t   288115043/s  ycsb-A    449280/s  prime  1.14 us/pg  rss 0.11 GB
+     47s  size     30000  rep 3  supdb-settle    load    1212836 ops/s  read    3644350/s  3t   10806122/s  scan    76492171/s  3t   181072576/s  ycsb-A    327186/s  prime  1.26 us/pg  rss 0.11 GB
+     47s  size     30000  rep 3  supdb-nosnap    load    1264563 ops/s  read    3069242/s  3t   17341675/s  scan    75077142/s  3t   282416353/s  ycsb-A    501448/s  prime  1.11 us/pg  rss 0.11 GB
+     48s  size     30000  rep 3  supdb-noadvice  load    1016910 ops/s  read    2211543/s  3t   12930085/s  scan    66302299/s  3t   188459723/s  ycsb-A    490124/s  prime  1.42 us/pg  rss 0.11 GB
+     48s  size     30000  rep 3  supdb-nocache   load    1232752 ops/s  read    3251625/s  3t   12016528/s  scan    69730955/s  3t   296916982/s  ycsb-A    529702/s  prime  1.11 us/pg  rss 0.11 GB
+     49s  size     30000  rep 3  supdb-cache256  load    1124339 ops/s  read    3450584/s  3t   17397144/s  scan    71379625/s  3t   193104492/s  ycsb-A    560370/s  prime  1.53 us/pg  rss 0.11 GB
+     50s  size     30000  rep 3  lmdb            load     876801 ops/s  read    1909066/s  3t    6592762/s  scan    35671565/s  3t   147844946/s  ycsb-A    133787/s  prime  1.18 us/pg  rss 0.11 GB
+     51s  size     30000  rep 3  rocksdb-tuned   load     948302 ops/s  read    1385669/s  3t    4725132/s  scan    10019317/s  3t    23601633/s  ycsb-A    404537/s  prime  1.43 us/pg  rss 0.11 GB
+     52s  size     30000  rep 3  supdb-ingest    load    2006826 ops/s  read    2902370/s  3t   13486930/s  scan    49257282/s  3t   212385516/s  ycsb-A   2509264/s  prime  1.31 us/pg  rss 0.11 GB
+     52s  size     30000  rep 3  lmdb-nosync     load    2022058 ops/s  read    2282356/s  3t    9083107/s  scan    60229837/s  3t   191502971/s  ycsb-A   1486737/s  prime  1.28 us/pg  rss 0.11 GB
+     54s  size     30000  rep 3  rocksdb-nosync  load    1419747 ops/s  read     865507/s  3t    2912428/s  scan     7020518/s  3t    22185196/s  ycsb-A   1260033/s  prime  1.24 us/pg  rss 0.11 GB
+     55s  size     30000  rep 4  supdb           load    1148625 ops/s  read    2991627/s  3t   18537010/s  scan    72003744/s  3t   300376161/s  ycsb-A    393492/s  prime  1.23 us/pg  rss 0.11 GB
+     55s  size     30000  rep 4  supdb-forms     load    1099233 ops/s  read    3221195/s  3t   11468793/s  scan    73054023/s  3t   185745192/s  ycsb-A    405649/s  prime  1.32 us/pg  rss 0.11 GB
+     55s  size     30000  rep 4  supdb-settle    load     994789 ops/s  read    3239178/s  3t   12914268/s  scan    82465385/s  3t   196646887/s  ycsb-A    497492/s  prime  1.57 us/pg  rss 0.11 GB
+     56s  size     30000  rep 4  supdb-nosnap    load     948712 ops/s  read    3028298/s  3t   11133613/s  scan    56170729/s  3t   304426215/s  ycsb-A    520070/s  prime  1.66 us/pg  rss 0.11 GB
+     56s  size     30000  rep 4  supdb-noadvice  load     930853 ops/s  read    3349145/s  3t   14302405/s  scan    75396965/s  3t   244441754/s  ycsb-A    438360/s  prime  1.40 us/pg  rss 0.11 GB
+     57s  size     30000  rep 4  supdb-nocache   load     872691 ops/s  read    2256645/s  3t   14151862/s  scan    48152084/s  3t   184249969/s  ycsb-A    510680/s  prime  1.39 us/pg  rss 0.11 GB
+     57s  size     30000  rep 4  supdb-cache256  load    1106357 ops/s  read    2163855/s  3t   11821961/s  scan    46867311/s  3t   201056310/s  ycsb-A    467329/s  prime  1.16 us/pg  rss 0.11 GB
+     58s  size     30000  rep 4  lmdb            load    1192078 ops/s  read    2292828/s  3t    6721060/s  scan    61603793/s  3t   127969493/s  ycsb-A    204692/s  prime  1.25 us/pg  rss 0.11 GB
+     60s  size     30000  rep 4  rocksdb-tuned   load     933936 ops/s  read    1008218/s  3t    2201576/s  scan     6364963/s  3t    27315457/s  ycsb-A    443689/s  prime  1.37 us/pg  rss 0.11 GB
+     60s  size     30000  rep 4  supdb-ingest    load    1553528 ops/s  read    2348628/s  3t   11480596/s  scan    48136477/s  3t   157712933/s  ycsb-A   2489624/s  prime  1.46 us/pg  rss 0.11 GB
+     61s  size     30000  rep 4  lmdb-nosync     load    1999819 ops/s  read    2339193/s  3t    7084533/s  scan    38393906/s  3t   127778486/s  ycsb-A   1151657/s  prime  1.28 us/pg  rss 0.11 GB
+     63s  size     30000  rep 4  rocksdb-nosync  load    1418145 ops/s  read    1259826/s  3t    2851388/s  scan     8572310/s  3t    23765295/s  ycsb-A    886195/s  prime  1.42 us/pg  rss 0.11 GB
+     63s  size     30000  rep 5  supdb           load    1035123 ops/s  read    3436139/s  3t   10532908/s  scan    68366875/s  3t   165825165/s  ycsb-A    370670/s  prime  1.48 us/pg  rss 0.12 GB
+     64s  size     30000  rep 5  supdb-forms     load     936211 ops/s  read    2361389/s  3t   12194074/s  scan    49926026/s  3t   202041526/s  ycsb-A    513647/s  prime  1.40 us/pg  rss 0.12 GB
+     64s  size     30000  rep 5  supdb-settle    load     640530 ops/s  read    3300409/s  3t   11373893/s  scan    69462614/s  3t   181157418/s  ycsb-A    457590/s  prime  1.19 us/pg  rss 0.12 GB
+     65s  size     30000  rep 5  supdb-nosnap    load     850665 ops/s  read    3006618/s  3t   13985697/s  scan    78339822/s  3t   195558204/s  ycsb-A    451836/s  prime  1.41 us/pg  rss 0.12 GB
+     65s  size     30000  rep 5  supdb-noadvice  load     739023 ops/s  read    2408858/s  3t   14527920/s  scan    49538712/s  3t   256228254/s  ycsb-A    320039/s  prime  1.52 us/pg  rss 0.12 GB
+     66s  size     30000  rep 5  supdb-nocache   load     801213 ops/s  read    2463122/s  3t   13906439/s  scan    53378124/s  3t   183157157/s  ycsb-A    341223/s  prime  1.61 us/pg  rss 0.12 GB
+     66s  size     30000  rep 5  supdb-cache256  load     903108 ops/s  read    2897023/s  3t   11495935/s  scan    66077985/s  3t   236533529/s  ycsb-A    477918/s  prime  1.17 us/pg  rss 0.12 GB
+     67s  size     30000  rep 5  lmdb            load     864971 ops/s  read    2183065/s  3t    8420552/s  scan    40874106/s  3t   191713148/s  ycsb-A    182038/s  prime  1.24 us/pg  rss 0.12 GB
+     69s  size     30000  rep 5  rocksdb-tuned   load     977829 ops/s  read    1216287/s  3t    2927906/s  scan     8848260/s  3t    24612812/s  ycsb-A    454793/s  prime  1.22 us/pg  rss 0.12 GB
+     70s  size     30000  rep 5  supdb-ingest    load    1833101 ops/s  read    3291299/s  3t   12201279/s  scan    67968798/s  3t   188686188/s  ycsb-A   2526679/s  prime  1.63 us/pg  rss 0.12 GB
+     70s  size     30000  rep 5  lmdb-nosync     load    2058221 ops/s  read    2193948/s  3t    6283001/s  scan    58428052/s  3t   144748565/s  ycsb-A   1305390/s  prime  1.12 us/pg  rss 0.12 GB
+     72s  size     30000  rep 5  rocksdb-nosync  load    1228451 ops/s  read    1240401/s  3t    2545244/s  scan     9528071/s  3t    26309179/s  ycsb-A    689079/s  prime  1.23 us/pg  rss 0.11 GB
+     72s  banked rungs through 30000 to runs-ci/quick/20261028T154843Z-44389dc.json
+     74s  size    100000  rep 0 (warmup)  supdb           load    1013920 ops/s  read    1887688/s  3t   11692382/s  scan    57119128/s  3t   178334503/s  ycsb-A    525994/s  prime  1.30 us/pg  rss 0.15 GB
+     75s  size    100000  rep 0 (warmup)  supdb-forms     load     785410 ops/s  read    2386738/s  3t    8053913/s  scan    51391977/s  3t   190013836/s  ycsb-A    413952/s  prime  1.20 us/pg  rss 0.16 GB
+     77s  size    100000  rep 0 (warmup)  supdb-settle    load     785195 ops/s  read    2037372/s  3t    9944704/s  scan    44527404/s  3t   183411000/s  ycsb-A    331748/s  prime  1.56 us/pg  rss 0.19 GB
+     79s  size    100000  rep 0 (warmup)  supdb-nosnap    load     988531 ops/s  read    2398930/s  3t   10695578/s  scan    37965476/s  3t   216647697/s  ycsb-A    612814/s  prime  1.53 us/pg  rss 0.20 GB
+     80s  size    100000  rep 0 (warmup)  supdb-noadvice  load     917512 ops/s  read    2278569/s  3t    9934690/s  scan    53763181/s  3t   233495263/s  ycsb-A    476382/s  prime  1.51 us/pg  rss 0.21 GB
+     83s  size    100000  rep 0 (warmup)  supdb-nocache   load     865524 ops/s  read    1820515/s  3t   12932739/s  scan    44236239/s  3t   221654797/s  ycsb-A    367863/s  prime  1.17 us/pg  rss 0.21 GB
+     85s  size    100000  rep 0 (warmup)  supdb-cache256  load    1055030 ops/s  read    2496889/s  3t   12981521/s  scan    56585186/s  3t   185636950/s  ycsb-A    377601/s  prime  1.29 us/pg  rss 0.21 GB
+     88s  size    100000  rep 0 (warmup)  lmdb            load     679651 ops/s  read    1612314/s  3t    7135355/s  scan    34262615/s  3t   162295857/s  ycsb-A    115798/s  prime  1.46 us/pg  rss 0.21 GB
+     95s  size    100000  rep 0 (warmup)  rocksdb-tuned   load     987970 ops/s  read     704580/s  3t    2042106/s  scan     8152416/s  3t    26847261/s  ycsb-A    396416/s  prime  1.22 us/pg  rss 0.21 GB
+     96s  size    100000  rep 0 (warmup)  supdb-ingest    load    1848671 ops/s  read    2028456/s  3t   12336974/s  scan    54218409/s  3t   218060811/s  ycsb-A   1986619/s  prime  1.40 us/pg  rss 0.21 GB
+     98s  size    100000  rep 0 (warmup)  lmdb-nosync     load    2109153 ops/s  read    1979838/s  3t    6173160/s  scan    54034134/s  3t   175759603/s  ycsb-A   1155663/s  prime  1.23 us/pg  rss 0.21 GB
+    104s  size    100000  rep 0 (warmup)  rocksdb-nosync  load    1541495 ops/s  read     917092/s  3t    2744542/s  scan     8809907/s  3t    25188057/s  ycsb-A    926871/s  prime  1.35 us/pg  rss 0.21 GB
+    106s  size    100000  rep 1  supdb           load    1233210 ops/s  read    1842019/s  3t    9050165/s  scan    40897838/s  3t   243108939/s  ycsb-A    355253/s  prime  1.17 us/pg  rss 0.24 GB
+    107s  size    100000  rep 1  supdb-forms     load    1252428 ops/s  read    2326983/s  3t   14048087/s  scan    48789151/s  3t   238444338/s  ycsb-A    303510/s  prime  1.52 us/pg  rss 0.24 GB
+    109s  size    100000  rep 1  supdb-settle    load    1037805 ops/s  read    2415218/s  3t   10165805/s  scan    58681830/s  3t   258795247/s  ycsb-A    635265/s  prime  1.24 us/pg  rss 0.24 GB
+    110s  size    100000  rep 1  supdb-nosnap    load    1157465 ops/s  read    2604451/s  3t   14117652/s  scan    55820797/s  3t   173316876/s  ycsb-A    428748/s  prime  1.03 us/pg  rss 0.24 GB
+    112s  size    100000  rep 1  supdb-noadvice  load     820310 ops/s  read    2063956/s  3t   10397347/s  scan    41546597/s  3t   233193108/s  ycsb-A    547278/s  prime  1.32 us/pg  rss 0.23 GB
+    114s  size    100000  rep 1  supdb-nocache   load    1210953 ops/s  read    1968207/s  3t   13450872/s  scan    57167129/s  3t   201256441/s  ycsb-A    420146/s  prime  1.56 us/pg  rss 0.23 GB
+    116s  size    100000  rep 1  supdb-cache256  load     906452 ops/s  read    2206268/s  3t   12631457/s  scan    61981140/s  3t   200507598/s  ycsb-A    350635/s  prime  1.40 us/pg  rss 0.25 GB
+    120s  size    100000  rep 1  lmdb            load    1057434 ops/s  read    1832133/s  3t    5952409/s  scan    51741462/s  3t   150891466/s  ycsb-A    118972/s  prime  1.58 us/pg  rss 0.25 GB
+    127s  size    100000  rep 1  rocksdb-tuned   load     645694 ops/s  read     479767/s  3t    2962096/s  scan     8249498/s  3t    25226778/s  ycsb-A    430239/s  prime  1.50 us/pg  rss 0.25 GB
+    128s  size    100000  rep 1  supdb-ingest    load    1858239 ops/s  read    2178993/s  3t   10059701/s  scan    42028621/s  3t   196054584/s  ycsb-A   1638632/s  prime  1.56 us/pg  rss 0.25 GB
+    130s  size    100000  rep 1  lmdb-nosync     load    2150724 ops/s  read    1802025/s  3t    6814945/s  scan    36557965/s  3t   111738534/s  ycsb-A   1188798/s  prime  1.51 us/pg  rss 0.25 GB
+    136s  size    100000  rep 1  rocksdb-nosync  load    1359327 ops/s  read    1031564/s  3t    2707840/s  scan     8688914/s  3t    25591391/s  ycsb-A    947523/s  prime  1.22 us/pg  rss 0.25 GB
+    138s  size    100000  rep 2  supdb           load    1183597 ops/s  read    2429448/s  3t   14054277/s  scan    62588328/s  3t   250852678/s  ycsb-A    546665/s  prime  1.19 us/pg  rss 0.25 GB
+    140s  size    100000  rep 2  supdb-forms     load     926434 ops/s  read    2128738/s  3t   10443047/s  scan    33263823/s  3t   168633487/s  ycsb-A    387993/s  prime  1.87 us/pg  rss 0.25 GB
+    142s  size    100000  rep 2  supdb-settle    load     631007 ops/s  read    1717182/s  3t    7636683/s  scan    48022229/s  3t   162050445/s  ycsb-A    444408/s  prime  1.42 us/pg  rss 0.25 GB
+    144s  size    100000  rep 2  supdb-nosnap    load     755258 ops/s  read    1895091/s  3t   11041612/s  scan    52898298/s  3t   140384106/s  ycsb-A    397870/s  prime  1.90 us/pg  rss 0.25 GB
+    146s  size    100000  rep 2  supdb-noadvice  load     646066 ops/s  read    1353091/s  3t    6946269/s  scan    43421379/s  3t   172393224/s  ycsb-A    330573/s  prime  1.29 us/pg  rss 0.25 GB
+    149s  size    100000  rep 2  supdb-nocache   load     815799 ops/s  read    1954241/s  3t    9458527/s  scan    41631904/s  3t   195722157/s  ycsb-A    440977/s  prime  1.67 us/pg  rss 0.25 GB
+    150s  size    100000  rep 2  supdb-cache256  load    1265600 ops/s  read    2481585/s  3t   10485036/s  scan    57602326/s  3t   148097937/s  ycsb-A    489875/s  prime  1.32 us/pg  rss 0.26 GB
+    154s  size    100000  rep 2  lmdb            load     684997 ops/s  read    1906992/s  3t    5351445/s  scan    54826185/s  3t   144301269/s  ycsb-A    100245/s  prime  1.63 us/pg  rss 0.26 GB
+    161s  size    100000  rep 2  rocksdb-tuned   load     748121 ops/s  read     879789/s  3t    2857750/s  scan     8795137/s  3t    24460704/s  ycsb-A    405180/s  prime  1.33 us/pg  rss 0.26 GB
+    163s  size    100000  rep 2  supdb-ingest    load    2254223 ops/s  read    1901573/s  3t   10154982/s  scan    51099978/s  3t   207965803/s  ycsb-A   2468715/s  prime  1.41 us/pg  rss 0.26 GB
+    164s  size    100000  rep 2  lmdb-nosync     load    1934531 ops/s  read    1792501/s  3t    5835855/s  scan    58186659/s  3t   117382471/s  ycsb-A   1022539/s  prime  1.31 us/pg  rss 0.26 GB
+    171s  size    100000  rep 2  rocksdb-nosync  load    1480440 ops/s  read     912629/s  3t    3241971/s  scan     8617924/s  3t    22993333/s  ycsb-A   1012138/s  prime  1.55 us/pg  rss 0.26 GB
+    172s  size    100000  rep 3  supdb           load    1056111 ops/s  read    2239583/s  3t   11100959/s  scan    48522278/s  3t   270126432/s  ycsb-A    483375/s  prime  1.52 us/pg  rss 0.26 GB
+    174s  size    100000  rep 3  supdb-forms     load    1067384 ops/s  read    1836519/s  3t   10951713/s  scan    41578641/s  3t   242818851/s  ycsb-A    517140/s  prime  1.30 us/pg  rss 0.25 GB
+    176s  size    100000  rep 3  supdb-settle    load    1130506 ops/s  read    2192217/s  3t   12065883/s  scan    56291599/s  3t   191317021/s  ycsb-A    501227/s  prime  1.38 us/pg  rss 0.26 GB
+    177s  size    100000  rep 3  supdb-nosnap    load    1148965 ops/s  read    2260092/s  3t   10074151/s  scan    51228458/s  3t   236559222/s  ycsb-A    535150/s  prime  1.42 us/pg  rss 0.26 GB
+    179s  size    100000  rep 3  supdb-noadvice  load    1256320 ops/s  read    2089633/s  3t   13445569/s  scan    40731256/s  3t   174959178/s  ycsb-A    478894/s  prime  1.53 us/pg  rss 0.25 GB
+    181s  size    100000  rep 3  supdb-nocache   load     918879 ops/s  read    1909038/s  3t    8133674/s  scan    55397457/s  3t   202015144/s  ycsb-A    416840/s  prime  1.56 us/pg  rss 0.25 GB
+    183s  size    100000  rep 3  supdb-cache256  load    1131202 ops/s  read    2580042/s  3t   10169854/s  scan    47038016/s  3t   208080915/s  ycsb-A    557054/s  prime  1.26 us/pg  rss 0.25 GB
+    187s  size    100000  rep 3  lmdb            load    1056525 ops/s  read    1795667/s  3t    6849075/s  scan    53960571/s  3t   128301691/s  ycsb-A    104851/s  prime  1.61 us/pg  rss 0.25 GB
+    194s  size    100000  rep 3  rocksdb-tuned   load     864754 ops/s  read     941187/s  3t    2392427/s  scan     8990196/s  3t    23763853/s  ycsb-A    260527/s  prime  1.44 us/pg  rss 0.25 GB
+    195s  size    100000  rep 3  supdb-ingest    load    2593237 ops/s  read    2464548/s  3t   10947371/s  scan    50574859/s  3t   178347811/s  ycsb-A   2237288/s  prime  1.15 us/pg  rss 0.26 GB
+    197s  size    100000  rep 3  lmdb-nosync     load    1634794 ops/s  read    1670081/s  3t    7336069/s  scan    55530228/s  3t   129136588/s  ycsb-A   1034405/s  prime  1.84 us/pg  rss 0.26 GB
+    203s  size    100000  rep 3  rocksdb-nosync  load    1575302 ops/s  read     861032/s  3t    2765612/s  scan     9560536/s  3t    22838424/s  ycsb-A    929678/s  prime  1.53 us/pg  rss 0.26 GB
+    205s  size    100000  rep 4  supdb           load    1279676 ops/s  read    2402053/s  3t    8698226/s  scan    50846648/s  3t   194666817/s  ycsb-A    470268/s  prime  1.15 us/pg  rss 0.26 GB
+    206s  size    100000  rep 4  supdb-forms     load    1009955 ops/s  read    1462019/s  3t   12278380/s  scan    56206584/s  3t   233804251/s  ycsb-A    426231/s  prime  1.50 us/pg  rss 0.26 GB
+    208s  size    100000  rep 4  supdb-settle    load    1192278 ops/s  read    2086886/s  3t   11559854/s  scan    52043406/s  3t   142351772/s  ycsb-A    391142/s  prime  1.44 us/pg  rss 0.27 GB
+    209s  size    100000  rep 4  supdb-nosnap    load    1277864 ops/s  read    2441331/s  3t   12270180/s  scan    54443635/s  3t   231258633/s  ycsb-A    521835/s  prime  1.31 us/pg  rss 0.27 GB
+    211s  size    100000  rep 4  supdb-noadvice  load     906993 ops/s  read    2272403/s  3t   10458917/s  scan    54508181/s  3t   233585274/s  ycsb-A    658499/s  prime  1.45 us/pg  rss 0.26 GB
+    214s  size    100000  rep 4  supdb-nocache   load    1069322 ops/s  read    1904214/s  3t   11422009/s  scan    48408639/s  3t   257406781/s  ycsb-A    507407/s  prime  1.36 us/pg  rss 0.27 GB
+    215s  size    100000  rep 4  supdb-cache256  load     894737 ops/s  read    1678122/s  3t   10311223/s  scan    53038918/s  3t   241310880/s  ycsb-A    514060/s  prime  1.62 us/pg  rss 0.27 GB
+    219s  size    100000  rep 4  lmdb            load     984533 ops/s  read    1827816/s  3t    6219691/s  scan    49989202/s  3t   130162915/s  ycsb-A    102000/s  prime  1.60 us/pg  rss 0.27 GB
+    225s  size    100000  rep 4  rocksdb-tuned   load     783293 ops/s  read    1034384/s  3t    3055636/s  scan     6346713/s  3t    21935467/s  ycsb-A    366556/s  prime  1.25 us/pg  rss 0.27 GB
+    227s  size    100000  rep 4  supdb-ingest    load    2171844 ops/s  read    2285920/s  3t    9050596/s  scan    40565960/s  3t   261702229/s  ycsb-A   2421229/s  prime  1.21 us/pg  rss 0.27 GB
+    228s  size    100000  rep 4  lmdb-nosync     load    2076017 ops/s  read    1801060/s  3t    6749759/s  scan    48296230/s  3t   169709139/s  ycsb-A   1014943/s  prime  1.17 us/pg  rss 0.27 GB
+    235s  size    100000  rep 4  rocksdb-nosync  load    1540119 ops/s  read     970737/s  3t    3084055/s  scan     8968587/s  3t    23637950/s  ycsb-A    739977/s  prime  1.59 us/pg  rss 0.27 GB
+    236s  size    100000  rep 5  supdb           load    1007073 ops/s  read    1755789/s  3t   12348652/s  scan    56662360/s  3t   228977094/s  ycsb-A    511164/s  prime  1.26 us/pg  rss 0.27 GB
+    238s  size    100000  rep 5  supdb-forms     load    1026137 ops/s  read    2135001/s  3t   10617033/s  scan    50718169/s  3t   188200607/s  ycsb-A    334636/s  prime  1.15 us/pg  rss 0.27 GB
+    239s  size    100000  rep 5  supdb-settle    load    1180775 ops/s  read    2282381/s  3t    8362624/s  scan    54144138/s  3t   233821120/s  ycsb-A    385061/s  prime  1.16 us/pg  rss 0.27 GB
+    241s  size    100000  rep 5  supdb-nosnap    load    1000137 ops/s  read    2283033/s  3t   10588430/s  scan    55408078/s  3t   214358633/s  ycsb-A    491328/s  prime  1.32 us/pg  rss 0.27 GB
+    242s  size    100000  rep 5  supdb-noadvice  load    1038443 ops/s  read    2420234/s  3t    9596953/s  scan    34434112/s  3t   186609381/s  ycsb-A    588808/s  prime  1.48 us/pg  rss 0.27 GB
+    245s  size    100000  rep 5  supdb-nocache   load    1209010 ops/s  read    1921760/s  3t   12735198/s  scan    46775770/s  3t   245812627/s  ycsb-A    539011/s  prime  1.15 us/pg  rss 0.27 GB
+    247s  size    100000  rep 5  supdb-cache256  load     844267 ops/s  read    2252443/s  3t   12886897/s  scan    57592175/s  3t   229982993/s  ycsb-A    432518/s  prime  1.23 us/pg  rss 0.27 GB
+    251s  size    100000  rep 5  lmdb            load     670133 ops/s  read    1520122/s  3t    5867156/s  scan    54032208/s  3t   137913453/s  ycsb-A    114523/s  prime  1.52 us/pg  rss 0.27 GB
+    258s  size    100000  rep 5  rocksdb-tuned   load     836235 ops/s  read     512791/s  3t    1974801/s  scan     3829224/s  3t    20848069/s  ycsb-A    237097/s  prime  1.34 us/pg  rss 0.27 GB
+    260s  size    100000  rep 5  supdb-ingest    load    1828446 ops/s  read    1919649/s  3t   10900743/s  scan    55691691/s  3t   151222717/s  ycsb-A   1935557/s  prime  1.53 us/pg  rss 0.27 GB
+    262s  size    100000  rep 5  lmdb-nosync     load    1898016 ops/s  read    1771168/s  3t    6964953/s  scan    40406718/s  3t   107057963/s  ycsb-A   1023452/s  prime  1.62 us/pg  rss 0.27 GB
+    269s  size    100000  rep 5  rocksdb-nosync  load    1017090 ops/s  read     809346/s  3t    2355268/s  scan     5288844/s  3t    19820266/s  ycsb-A    802474/s  prime  2.02 us/pg  rss 0.27 GB
+    269s  banked rungs through 100000 to runs-ci/quick/20261028T154843Z-44389dc.json
+    274s  size    300000  rep 0 (warmup)  supdb           load    1023722 ops/s  read    1807296/s  3t    7517735/s  scan    38981122/s  3t   179547033/s  ycsb-A    475061/s  prime  1.21 us/pg  rss 0.22 GB
+    279s  size    300000  rep 0 (warmup)  supdb-forms     load    1057082 ops/s  read    1589526/s  3t    7129556/s  scan    32732396/s  3t   217998947/s  ycsb-A    620548/s  prime  1.42 us/pg  rss 0.22 GB
+    284s  size    300000  rep 0 (warmup)  supdb-settle    load    1106959 ops/s  read    1902497/s  3t    6824418/s  scan    42619581/s  3t   231925733/s  ycsb-A    379955/s  prime  1.21 us/pg  rss 0.23 GB
+    289s  size    300000  rep 0 (warmup)  supdb-nosnap    load    1284828 ops/s  read    1818065/s  3t    7983457/s  scan    33453636/s  3t   195302033/s  ycsb-A    366232/s  prime  1.61 us/pg  rss 0.21 GB
+    294s  size    300000  rep 0 (warmup)  supdb-noadvice  load     882880 ops/s  read    1900657/s  3t    6262001/s  scan    40245681/s  3t   213482656/s  ycsb-A    446058/s  prime  1.26 us/pg  rss 0.19 GB
+    305s  size    300000  rep 0 (warmup)  supdb-nocache   load     972085 ops/s  read    1463042/s  3t    6620478/s  scan    33045063/s  3t   168958597/s  ycsb-A    294501/s  prime  1.28 us/pg  rss 0.20 GB
+    310s  size    300000  rep 0 (warmup)  supdb-cache256  load     799529 ops/s  read    1685954/s  3t    7130336/s  scan    39262822/s  3t   169902626/s  ycsb-A    323772/s  prime  1.49 us/pg  rss 0.21 GB
+    326s  size    300000  rep 0 (warmup)  lmdb            load     759283 ops/s  read    1362558/s  3t    4833904/s  scan    47530460/s  3t   113021577/s  ycsb-A     89037/s  prime  1.58 us/pg  rss 0.21 GB
+    352s  size    300000  rep 0 (warmup)  rocksdb-tuned   load     811764 ops/s  read     366410/s  3t    1463027/s  scan     6085980/s  3t    17331724/s  ycsb-A    276237/s  prime  1.36 us/pg  rss 0.21 GB
+    356s  size    300000  rep 0 (warmup)  supdb-ingest    load    2489828 ops/s  read    2016532/s  3t    8603084/s  scan    40080760/s  3t   234955554/s  ycsb-A   2360225/s  prime  1.12 us/pg  rss 0.20 GB
+    362s  size    300000  rep 0 (warmup)  lmdb-nosync     load    2113553 ops/s  read    1279204/s  3t    5521377/s  scan    31068022/s  3t   140453083/s  ycsb-A    736438/s  prime  1.16 us/pg  rss 0.20 GB
+    384s  size    300000  rep 0 (warmup)  rocksdb-nosync  load    1621940 ops/s  read     597783/s  3t    2116762/s  scan     5297706/s  3t    23250556/s  ycsb-A    790361/s  prime  1.41 us/pg  rss 0.20 GB
+    390s  size    300000  rep 1  supdb           load     872041 ops/s  read    1521137/s  3t    6032538/s  scan    33512165/s  3t   156164860/s  ycsb-A    485644/s  prime  1.78 us/pg  rss 0.21 GB
+    395s  size    300000  rep 1  supdb-forms     load     812424 ops/s  read    1608285/s  3t    5993075/s  scan    32826999/s  3t   158381882/s  ycsb-A    319534/s  prime  1.52 us/pg  rss 0.18 GB
+    400s  size    300000  rep 1  supdb-settle    load     911784 ops/s  read    1717961/s  3t    6794308/s  scan    39955298/s  3t   230060285/s  ycsb-A    393733/s  prime  1.55 us/pg  rss 0.21 GB
+    405s  size    300000  rep 1  supdb-nosnap    load    1010143 ops/s  read    1836409/s  3t    7056767/s  scan    40202406/s  3t   210552208/s  ycsb-A    445250/s  prime  1.13 us/pg  rss 0.18 GB
+    410s  size    300000  rep 1  supdb-noadvice  load    1040969 ops/s  read    1911308/s  3t    6399700/s  scan    29240838/s  3t   237259650/s  ycsb-A    432361/s  prime  1.51 us/pg  rss 0.19 GB
+    419s  size    300000  rep 1  supdb-nocache   load     958400 ops/s  read    1836093/s  3t    6964130/s  scan    42447164/s  3t   201511620/s  ycsb-A    472411/s  prime  1.49 us/pg  rss 0.19 GB
+    424s  size    300000  rep 1  supdb-cache256  load    1153139 ops/s  read    1868635/s  3t    6932795/s  scan    40629195/s  3t   211538972/s  ycsb-A    413182/s  prime  1.21 us/pg  rss 0.21 GB
+    440s  size    300000  rep 1  lmdb            load     807653 ops/s  read    1161547/s  3t    4775566/s  scan    31474231/s  3t   111426446/s  ycsb-A     82152/s  prime  1.29 us/pg  rss 0.19 GB
+    464s  size    300000  rep 1  rocksdb-tuned   load     781649 ops/s  read     556695/s  3t    1878238/s  scan     6307262/s  3t    23706321/s  ycsb-A    374117/s  prime  1.57 us/pg  rss 0.19 GB
+    469s  size    300000  rep 1  supdb-ingest    load    1915481 ops/s  read    1627583/s  3t    5894578/s  scan    39978721/s  3t   162389571/s  ycsb-A   2160004/s  prime  1.42 us/pg  rss 0.20 GB
+    475s  size    300000  rep 1  lmdb-nosync     load    1979280 ops/s  read    1299908/s  3t    5213111/s  scan    39579330/s  3t   139784634/s  ycsb-A    793764/s  prime  1.54 us/pg  rss 0.20 GB
+    500s  size    300000  rep 1  rocksdb-nosync  load    1369248 ops/s  read     698061/s  3t    2264050/s  scan     5341895/s  3t    20037368/s  ycsb-A    580016/s  prime  1.48 us/pg  rss 0.20 GB
+    505s  size    300000  rep 2  supdb           load    1049606 ops/s  read    1674402/s  3t    7193373/s  scan    38084719/s  3t   238797322/s  ycsb-A    403549/s  prime  1.28 us/pg  rss 0.20 GB
+    511s  size    300000  rep 2  supdb-forms     load     862210 ops/s  read    1566324/s  3t    7401038/s  scan    40123280/s  3t   185467281/s  ycsb-A    473333/s  prime  1.33 us/pg  rss 0.20 GB
+    516s  size    300000  rep 2  supdb-settle    load     958840 ops/s  read    1817560/s  3t    6339826/s  scan    41847529/s  3t   237709322/s  ycsb-A    512685/s  prime  1.54 us/pg  rss 0.22 GB
+    521s  size    300000  rep 2  supdb-nosnap    load    1010940 ops/s  read    1774125/s  3t    7397896/s  scan    33851475/s  3t   151380399/s  ycsb-A    357113/s  prime  1.18 us/pg  rss 0.18 GB
+    526s  size    300000  rep 2  supdb-noadvice  load     834370 ops/s  read    1553089/s  3t    6695593/s  scan    37846924/s  3t   212907402/s  ycsb-A    300116/s  prime  1.31 us/pg  rss 0.19 GB
+    537s  size    300000  rep 2  supdb-nocache   load     996578 ops/s  read    1990465/s  3t    7291817/s  scan    41353472/s  3t   188552276/s  ycsb-A    380231/s  prime  1.40 us/pg  rss 0.19 GB
+    542s  size    300000  rep 2  supdb-cache256  load    1021045 ops/s  read    1749641/s  3t    6367905/s  scan    40196082/s  3t   178774116/s  ycsb-A    351686/s  prime  1.27 us/pg  rss 0.20 GB
+    557s  size    300000  rep 2  lmdb            load     839849 ops/s  read    1443489/s  3t    5489890/s  scan    47309583/s  3t   126425691/s  ycsb-A     89693/s  prime  1.48 us/pg  rss 0.20 GB
+    583s  size    300000  rep 2  rocksdb-tuned   load     820286 ops/s  read     585846/s  3t    2234388/s  scan     8077565/s  3t    18804971/s  ycsb-A    236630/s  prime  1.30 us/pg  rss 0.20 GB
+    587s  size    300000  rep 2  supdb-ingest    load    2659518 ops/s  read    1944168/s  3t    5904451/s  scan    41191047/s  3t   248345415/s  ycsb-A   2460213/s  prime  1.18 us/pg  rss 0.20 GB
+    593s  size    300000  rep 2  lmdb-nosync     load    2100062 ops/s  read    1548158/s  3t    5057531/s  scan    38214029/s  3t   130543429/s  ycsb-A    745111/s  prime  1.32 us/pg  rss 0.20 GB
+    616s  size    300000  rep 2  rocksdb-nosync  load    1456235 ops/s  read     623788/s  3t    1422575/s  scan     6304735/s  3t    22893722/s  ycsb-A    812559/s  prime  1.28 us/pg  rss 0.20 GB
+    621s  size    300000  rep 3  supdb           load    1016107 ops/s  read    1791912/s  3t    6933596/s  scan    29244672/s  3t   234018251/s  ycsb-A    419364/s  prime  1.51 us/pg  rss 0.21 GB
+    626s  size    300000  rep 3  supdb-forms     load    1464949 ops/s  read    1909660/s  3t    6308722/s  scan    40249936/s  3t   238496020/s  ycsb-A    477877/s  prime  1.13 us/pg  rss 0.22 GB
+    630s  size    300000  rep 3  supdb-settle    load    1079068 ops/s  read    1774407/s  3t    6580696/s  scan    32810986/s  3t   245911014/s  ycsb-A    571328/s  prime  1.57 us/pg  rss 0.23 GB
+    635s  size    300000  rep 3  supdb-nosnap    load    1079692 ops/s  read    2028126/s  3t    6712601/s  scan    38459729/s  3t   234569340/s  ycsb-A    358852/s  prime  1.85 us/pg  rss 0.23 GB
+    641s  size    300000  rep 3  supdb-noadvice  load     905913 ops/s  read    1534479/s  3t    5012552/s  scan    31807739/s  3t   171441286/s  ycsb-A    273514/s  prime  1.41 us/pg  rss 0.22 GB
+    650s  size    300000  rep 3  supdb-nocache   load    1069309 ops/s  read    1805397/s  3t    6590822/s  scan    34747780/s  3t   224117129/s  ycsb-A    337817/s  prime  1.19 us/pg  rss 0.20 GB
+    654s  size    300000  rep 3  supdb-cache256  load    1182680 ops/s  read    1862461/s  3t    6277305/s  scan    40458612/s  3t   214594247/s  ycsb-A    502395/s  prime  1.48 us/pg  rss 0.20 GB
+    670s  size    300000  rep 3  lmdb            load     876151 ops/s  read    1251226/s  3t    5030270/s  scan    43836641/s  3t   140345738/s  ycsb-A     89067/s  prime  1.52 us/pg  rss 0.20 GB
+    694s  size    300000  rep 3  rocksdb-tuned   load     981286 ops/s  read     682158/s  3t    2182458/s  scan     8541865/s  3t    23559526/s  ycsb-A    293144/s  prime  1.28 us/pg  rss 0.20 GB
+    699s  size    300000  rep 3  supdb-ingest    load    2703838 ops/s  read    1807272/s  3t    7496588/s  scan    40354789/s  3t   205152718/s  ycsb-A   2291324/s  prime  1.38 us/pg  rss 0.21 GB
+    705s  size    300000  rep 3  lmdb-nosync     load    1465966 ops/s  read    1246107/s  3t    4885888/s  scan    38992876/s  3t   139261607/s  ycsb-A    673510/s  prime  1.54 us/pg  rss 0.21 GB
+    728s  size    300000  rep 3  rocksdb-nosync  load    1396615 ops/s  read     567702/s  3t    1405951/s  scan     6573244/s  3t    24655023/s  ycsb-A    813566/s  prime  1.38 us/pg  rss 0.21 GB
+    732s  size    300000  rep 4  supdb           load    1418764 ops/s  read    2057160/s  3t    7771504/s  scan    39016828/s  3t   230570546/s  ycsb-A    541097/s  prime  1.20 us/pg  rss 0.21 GB
+    737s  size    300000  rep 4  supdb-forms     load    1012080 ops/s  read    1777901/s  3t    7243631/s  scan    28784450/s  3t   220396572/s  ycsb-A    507667/s  prime  1.65 us/pg  rss 0.20 GB
+    742s  size    300000  rep 4  supdb-settle    load    1111069 ops/s  read    1864187/s  3t    8617658/s  scan    33049886/s  3t   232553219/s  ycsb-A    467210/s  prime  1.58 us/pg  rss 0.23 GB
+    746s  size    300000  rep 4  supdb-nosnap    load    1219132 ops/s  read    1835477/s  3t    7463216/s  scan    40918684/s  3t   196215482/s  ycsb-A    482682/s  prime  1.45 us/pg  rss 0.20 GB
+    751s  size    300000  rep 4  supdb-noadvice  load    1012149 ops/s  read    1779452/s  3t    6761591/s  scan    38904390/s  3t   254909239/s  ycsb-A    516396/s  prime  1.27 us/pg  rss 0.23 GB
+    759s  size    300000  rep 4  supdb-nocache   load    1309189 ops/s  read    1950939/s  3t    7128380/s  scan    38432340/s  3t   184658343/s  ycsb-A    556179/s  prime  1.34 us/pg  rss 0.21 GB
+    764s  size    300000  rep 4  supdb-cache256  load    1101482 ops/s  read    1803873/s  3t    6683670/s  scan    39744422/s  3t   249103947/s  ycsb-A    449964/s  prime  1.20 us/pg  rss 0.23 GB
+    779s  size    300000  rep 4  lmdb            load     979595 ops/s  read    1459369/s  3t    6048957/s  scan    50987613/s  3t   153994645/s  ycsb-A     84045/s  prime  1.35 us/pg  rss 0.23 GB
+    802s  size    300000  rep 4  rocksdb-tuned   load     728590 ops/s  read     596989/s  3t    2290637/s  scan     7996356/s  3t    23890071/s  ycsb-A    277334/s  prime  1.42 us/pg  rss 0.23 GB
+    807s  size    300000  rep 4  supdb-ingest    load    2505278 ops/s  read    1491318/s  3t    7745085/s  scan    41011424/s  3t   206208155/s  ycsb-A   1214272/s  prime  1.24 us/pg  rss 0.22 GB
+    813s  size    300000  rep 4  lmdb-nosync     load    1575055 ops/s  read    1299392/s  3t    5030766/s  scan    33791185/s  3t   147430288/s  ycsb-A    900692/s  prime  1.55 us/pg  rss 0.22 GB
+    835s  size    300000  rep 4  rocksdb-nosync  load    1067386 ops/s  read     567658/s  3t    2169969/s  scan     6912836/s  3t    22993317/s  ycsb-A    570836/s  prime  1.49 us/pg  rss 0.22 GB
+    841s  size    300000  rep 5  supdb           load     939379 ops/s  read    1428585/s  3t    5867622/s  scan    37459787/s  3t   217548110/s  ycsb-A    388785/s  prime  1.32 us/pg  rss 0.22 GB
+    846s  size    300000  rep 5  supdb-forms     load    1097555 ops/s  read    1778669/s  3t    7468544/s  scan    32905409/s  3t   235965691/s  ycsb-A    456314/s  prime  1.51 us/pg  rss 0.22 GB
+    850s  size    300000  rep 5  supdb-settle    load     944455 ops/s  read    1628607/s  3t    6251220/s  scan    31839998/s  3t   202861134/s  ycsb-A    553305/s  prime  1.53 us/pg  rss 0.25 GB
+    855s  size    300000  rep 5  supdb-nosnap    load     946978 ops/s  read    1532090/s  3t    6389968/s  scan    40323166/s  3t   221217729/s  ycsb-A    526011/s  prime  1.55 us/pg  rss 0.25 GB
+    860s  size    300000  rep 5  supdb-noadvice  load    1152027 ops/s  read    1874590/s  3t    7772116/s  scan    33933358/s  3t   216327389/s  ycsb-A    478636/s  prime  1.50 us/pg  rss 0.24 GB
+    869s  size    300000  rep 5  supdb-nocache   load     885619 ops/s  read    1870488/s  3t    5709735/s  scan    38901086/s  3t   170355052/s  ycsb-A    561383/s  prime  1.53 us/pg  rss 0.25 GB
+    874s  size    300000  rep 5  supdb-cache256  load    1242286 ops/s  read    1706540/s  3t    6753748/s  scan    40749088/s  3t   204537801/s  ycsb-A    499470/s  prime  1.23 us/pg  rss 0.26 GB
+    890s  size    300000  rep 5  lmdb            load     818068 ops/s  read    1325348/s  3t    5841305/s  scan    35131118/s  3t   119366723/s  ycsb-A     77830/s  prime  1.53 us/pg  rss 0.26 GB
+    914s  size    300000  rep 5  rocksdb-tuned   load    1003576 ops/s  read     687575/s  3t    2147695/s  scan     7677271/s  3t    21451636/s  ycsb-A    226962/s  prime  1.30 us/pg  rss 0.26 GB
+    919s  size    300000  rep 5  supdb-ingest    load    2573658 ops/s  read    1638927/s  3t    6292279/s  scan    35035032/s  3t   174188412/s  ycsb-A   1746647/s  prime  1.47 us/pg  rss 0.25 GB
+    925s  size    300000  rep 5  lmdb-nosync     load    1422755 ops/s  read    1273965/s  3t    4934426/s  scan    29894821/s  3t   142925053/s  ycsb-A    852787/s  prime  1.49 us/pg  rss 0.25 GB
+    948s  size    300000  rep 5  rocksdb-nosync  load    1670468 ops/s  read     681623/s  3t    2168887/s  scan     8819168/s  3t    24013116/s  ycsb-A    709894/s  prime  1.51 us/pg  rss 0.25 GB
+    948s  banked rungs through 300000 to runs-ci/quick/20261028T154843Z-44389dc.json
+runs-ci/quick/20261028T154843Z-44389dc.json
+gate: class x86_64/intel-r-xeon-r-processor-2.10ghz/4c/16g/hypervisor scale quick -- 8 prior rows (window 10)
+host: OUT OF BAND -- mem-floor ops_per_s median 6598772 against the window's medians [6785629, 16532529]. Every quantity that moves with the machine gets no verdict.
+comparators: none below their window
+  REGRESSED mem-floor      floor                      ops_per_s              [6289612, 6977870] chases/s; prior CIs span [6785629, 16532529]
+  flagged   scan           supdb-cache256     100000  entries_per_s_2t       [150847374, 183237429] entries/s; prior CIs span [81328914, 150163667] (better than every prior row -- a win or a broken measurement)
+  flagged   scan           supdb-nocache      300000  entries_per_s_2t       [146113230, 159219910] entries/s; prior CIs span [83089121, 144456305] (better than every prior row -- a win or a broken measurement)
+  no band yet for 145 of 1252 quantities (fewer than 3 prior rows)
+ok: nothing worse than the window (2 flagged)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-load-bytes_on_disk_per_byte-durable.svg  At 3×10⁵ keys supdb is 1.1× behind LMDB and 1.3× behind RocksDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-load-bytes_on_disk_per_byte-buffered.svg  At 3×10⁵ keys supdb is 1.1× behind LMDB (nosync) and 1.3× behind RocksDB (nosync)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-load-device_bytes_per_byte-durable.svg  At 3×10⁵ keys supdb is 1.5× ahead of LMDB, 1.3× behind RocksDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-load-device_bytes_per_byte-buffered.svg  At 3×10⁵ keys supdb is 1.1× behind LMDB (nosync) and 1.3× behind RocksDB (nosync)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-load-ops_per_s-durable.svg  At 3×10⁵ keys supdb is 1.2× ahead of LMDB and 1.2× ahead of RocksDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-load-ops_per_s-buffered.svg  At 3×10⁵ keys supdb is 1.6× ahead of LMDB (nosync) and 1.8× ahead of RocksDB (nosync)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-load-shuffled-ops_per_s-durable.svg  At 3×10⁵ keys supdb is 6.2× ahead of LMDB and 1.3× ahead of RocksDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-load-shuffled-ops_per_s-buffered.svg  At 3×10⁵ keys supdb is 2.4× ahead of LMDB (nosync) and 1.6× ahead of RocksDB (nosync)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-read-p99_us-durable.svg  At 3×10⁵ keys supdb is 1.4× ahead of LMDB and 3.5× ahead of RocksDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-read-p99_us-buffered.svg  At 3×10⁵ keys supdb is 1.5× ahead of LMDB (nosync) and 3.6× ahead of RocksDB (nosync)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-read-reads_per_s-durable.svg  At 3×10⁵ keys supdb is 1.3× ahead of LMDB and 2.8× ahead of RocksDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-read-reads_per_s-buffered.svg  At 3×10⁵ keys supdb is 1.3× ahead of LMDB (nosync) and 2.6× ahead of RocksDB (nosync)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-read-reads_per_s_2t-durable.svg  At 3×10⁵ keys supdb is 1.2× ahead of LMDB and 3.0× ahead of RocksDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-read-reads_per_s_2t-buffered.svg  At 3×10⁵ keys supdb is 1.1× ahead of LMDB (nosync) and 2.7× ahead of RocksDB (nosync)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-read-reads_per_s_3t-durable.svg  At 3×10⁵ keys supdb is 1.3× ahead of LMDB and 3.2× ahead of RocksDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-read-reads_per_s_3t-buffered.svg  At 3×10⁵ keys supdb is 1.3× ahead of LMDB (nosync) and 2.9× ahead of RocksDB (nosync)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-scan-entries_per_s-durable.svg  At 3×10⁵ keys supdb is 4.7× ahead of RocksDB, 1.2× behind LMDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-scan-entries_per_s-buffered.svg  At 3×10⁵ keys supdb is 1.1× ahead of LMDB (nosync) and 6.1× ahead of RocksDB (nosync)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-scan-entries_per_s_2t-durable.svg  At 3×10⁵ keys supdb is 1.1× ahead of LMDB and 6.9× ahead of RocksDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-scan-entries_per_s_2t-buffered.svg  At 3×10⁵ keys supdb is 1.7× ahead of LMDB (nosync) and 10.6× ahead of RocksDB (nosync)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-scan-entries_per_s_3t-durable.svg  At 3×10⁵ keys supdb is 1.8× ahead of LMDB and 9.8× ahead of RocksDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-scan-entries_per_s_3t-buffered.svg  At 3×10⁵ keys supdb is 1.5× ahead of LMDB (nosync) and 8.9× ahead of RocksDB (nosync)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-scan-lag-entries_per_s_lag0pct-durable.svg  At 3×10⁵ keys supdb is 1.9× ahead of LMDB and 9.8× ahead of RocksDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-scan-lag-entries_per_s_lag0pct-buffered.svg  At 3×10⁵ keys supdb is 1.8× ahead of LMDB (nosync) and 8.9× ahead of RocksDB (nosync)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-scan-lag-entries_per_s_lag100pct-durable.svg  At 3×10⁵ keys supdb is 1.2× ahead of LMDB and 11.0× ahead of RocksDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-scan-lag-entries_per_s_lag100pct-buffered.svg  At 3×10⁵ keys supdb is 1.6× ahead of LMDB (nosync) and 12.1× ahead of RocksDB (nosync)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-scan-lag-entries_per_s_lag10pct-durable.svg  At 3×10⁵ keys supdb is 1.4× ahead of LMDB and 7.8× ahead of RocksDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-scan-lag-entries_per_s_lag10pct-buffered.svg  At 3×10⁵ keys supdb is 2.5× ahead of LMDB (nosync) and 12.8× ahead of RocksDB (nosync)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-scan-lag-entries_per_s_lag1pct-durable.svg  At 3×10⁵ keys supdb is 1.8× ahead of LMDB and 11.4× ahead of RocksDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-scan-lag-entries_per_s_lag1pct-buffered.svg  At 3×10⁵ keys supdb is 2.1× ahead of LMDB (nosync) and 12.0× ahead of RocksDB (nosync)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-scan-lag-updates_per_s_lag100pct-durable.svg  At 3×10⁵ keys supdb is 10.2× ahead of LMDB and 2.2× ahead of RocksDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-scan-lag-updates_per_s_lag100pct-buffered.svg  At 3×10⁵ keys supdb is 1.7× ahead of LMDB (nosync) and 1.1× ahead of RocksDB (nosync)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-scan-lag-updates_per_s_lag10pct-durable.svg  At 3×10⁵ keys supdb is 16.3× ahead of LMDB and 3.4× ahead of RocksDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-scan-lag-updates_per_s_lag10pct-buffered.svg  At 3×10⁵ keys supdb is 2.5× ahead of LMDB (nosync) and 2.2× ahead of RocksDB (nosync)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-scan-lag-updates_per_s_lag1pct-durable.svg  At 3×10⁵ keys supdb is 14.9× ahead of LMDB and 3.2× ahead of RocksDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-scan-lag-updates_per_s_lag1pct-buffered.svg  At 3×10⁵ keys supdb is 2.2× ahead of LMDB (nosync) and 1.6× ahead of RocksDB (nosync)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-scan-mixed-entries_per_s_2t-durable.svg  At 3×10⁵ keys supdb is 1.1× ahead of LMDB and 6.8× ahead of RocksDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-scan-mixed-entries_per_s_2t-buffered.svg  At 3×10⁵ keys supdb is 6.7× ahead of RocksDB (nosync), level with LMDB (nosync)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-scan-mixed-entries_per_s_3t-durable.svg  At 3×10⁵ keys supdb is 1.2× ahead of LMDB and 7.2× ahead of RocksDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-scan-mixed-entries_per_s_3t-buffered.svg  At 3×10⁵ keys supdb is 5.8× ahead of RocksDB (nosync), level with LMDB (nosync)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-ycsb-A-ops_per_s-durable.svg  At 3×10⁵ keys supdb is 5.0× ahead of LMDB and 1.5× ahead of RocksDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-ycsb-A-ops_per_s-buffered.svg  At 3×10⁵ keys supdb is 2.7× ahead of LMDB (nosync) and 3.0× ahead of RocksDB (nosync)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-ycsb-B-ops_per_s-durable.svg  At 3×10⁵ keys supdb is 2.4× ahead of LMDB and 1.9× ahead of RocksDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-ycsb-B-ops_per_s-buffered.svg  At 3×10⁵ keys supdb is 1.7× ahead of LMDB (nosync) and 3.4× ahead of RocksDB (nosync)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-ycsb-C-ops_per_s-durable.svg  At 3×10⁵ keys supdb is 1.7× ahead of LMDB and 3.7× ahead of RocksDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-ycsb-C-ops_per_s-buffered.svg  At 3×10⁵ keys supdb is 1.9× ahead of LMDB (nosync) and 4.3× ahead of RocksDB (nosync)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-ycsb-D-ops_per_s-durable.svg  At 3×10⁵ keys supdb is 1.3× ahead of LMDB and 2.5× ahead of RocksDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-ycsb-D-ops_per_s-buffered.svg  At 3×10⁵ keys supdb is 2.3× ahead of RocksDB (nosync), level with LMDB (nosync)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-ycsb-E-ops_per_s-durable.svg  At 3×10⁵ keys supdb is 1.4× ahead of LMDB and 22.8× ahead of RocksDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-ycsb-E-ops_per_s-buffered.svg  At 3×10⁵ keys supdb is 21.9× ahead of RocksDB (nosync), 1.1× behind LMDB (nosync)
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-ycsb-F-ops_per_s-durable.svg  At 3×10⁵ keys supdb is 3.9× ahead of LMDB and 1.6× ahead of RocksDB
+runs-ci/figures/x86_64_intel-r-xeon-r-processor-2.10ghz_4c_16g_hypervisor/quick-ycsb-F-ops_per_s-buffered.svg  At 3×10⁵ keys supdb is 2.1× ahead of LMDB (nosync) and 3.1× ahead of RocksDB (nosync)
+
+all checks passed: quick
+exit 0

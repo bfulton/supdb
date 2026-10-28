@@ -1,0 +1,210 @@
+/tmp/claude-0/-home-user-supdb/95907082-4009-52f5-8d06-b36856ae75e3/scratchpad/revab/s1: 4 complete rounds
+cell                                         arm           ratio-to-LMDB old->new (gmean)   new/old of ratio: gmean [per round]   supdb new/old  lmdb new/old
+load          bytes_on_disk_per_byte     10000 supdb           0.91 ->   0.91    1.00 [1.00 1.00 1.00 1.00]    1.00   1.00
+load          device_bytes_per_byte      10000 supdb           1.11 ->   1.10    1.00 [0.99 1.00 1.00 0.99]    1.00   1.00
+load          ops_per_s                  10000 supdb           1.11 ->   1.10    0.99 [1.18 0.93 1.16 0.75]    0.88   0.89
+load          bytes_on_disk_per_byte     30000 supdb           0.87 ->   0.87    1.00 [1.00 1.00 1.00 1.00]    1.00   1.00
+load          device_bytes_per_byte      30000 supdb           1.33 ->   1.33    1.00 [1.00 1.00 1.00 1.00]    1.00   1.00
+load          ops_per_s                  30000 supdb           1.12 ->   1.13    1.01 [0.98 0.69 1.64 0.96]    0.99   0.98
+load          bytes_on_disk_per_byte    100000 supdb           0.84 ->   0.84    1.00 [1.00 1.00 1.00 1.00]    1.00   1.00
+load          device_bytes_per_byte     100000 supdb           1.37 ->   1.37    1.00 [1.00 1.00 1.00 1.00]    1.00   1.00
+load          ops_per_s                 100000 supdb           1.24 ->   1.41    1.14 [1.26 1.15 1.05 1.12] >    1.01   0.88
+load          bytes_on_disk_per_byte    300000 supdb           0.88 ->   0.88    1.00 [1.00 1.00 1.00 1.00]    1.00   1.00
+load          device_bytes_per_byte     300000 supdb           1.50 ->   1.50    1.00 [1.00 1.00 1.00 1.00]    1.00   1.00
+load          ops_per_s                 300000 supdb           1.24 ->   1.41    1.14 [1.18 1.57 0.89 1.03]    1.07   0.94
+load          bytes_on_disk_per_byte     10000 supdb-ingest    0.91 ->   0.91    1.00 [1.00 1.00 1.00 1.00]    1.00   1.00
+load          device_bytes_per_byte      10000 supdb-ingest    0.90 ->   0.90    1.00 [1.00 1.00 1.00 1.00]    1.00   1.00
+load          ops_per_s                  10000 supdb-ingest    0.83 ->   0.95    1.15 [1.38 1.16 1.23 0.88]    1.02   0.89
+load          bytes_on_disk_per_byte     30000 supdb-ingest    0.87 ->   0.87    1.00 [1.00 1.00 1.00 1.00]    1.00   1.00
+load          device_bytes_per_byte      30000 supdb-ingest    0.86 ->   0.86    1.00 [1.00 1.00 1.00 1.00]    1.00   1.00
+load          ops_per_s                  30000 supdb-ingest    0.90 ->   1.30    1.44 [1.45 2.10 1.03 1.35] >    1.19   0.83
+load          bytes_on_disk_per_byte    100000 supdb-ingest    0.84 ->   0.84    1.00 [1.00 1.00 1.00 1.00]    1.00   1.00
+load          device_bytes_per_byte     100000 supdb-ingest    0.84 ->   0.84    1.00 [1.00 1.00 1.00 1.00]    1.00   1.00
+load          ops_per_s                 100000 supdb-ingest    1.39 ->   1.27    0.91 [0.89 0.91 0.66 1.28]    0.97   1.06
+load          bytes_on_disk_per_byte    300000 supdb-ingest    0.88 ->   0.88    1.00 [1.00 1.00 1.00 1.00]    1.00   1.00
+load          device_bytes_per_byte     300000 supdb-ingest    0.88 ->   0.88    1.00 [1.00 1.00 1.00 1.00]    1.00   1.00
+load          ops_per_s                 300000 supdb-ingest    1.29 ->   1.39    1.08 [1.81 0.91 0.99 0.84]    1.05   0.97
+load-shuffled ops_per_s                  10000 supdb           1.74 ->   1.70    0.98 [0.94 0.99 1.05 0.94]    0.96   0.98
+load-shuffled ops_per_s                  30000 supdb           3.19 ->   3.23    1.01 [1.08 1.01 0.92 1.06]    0.99   0.97
+load-shuffled ops_per_s                 100000 supdb           6.04 ->   6.42    1.06 [1.30 0.93 1.02 1.03]    1.05   0.99
+load-shuffled ops_per_s                 300000 supdb           4.91 ->   4.55    0.93 [1.03 0.99 0.81 0.89]    0.93   1.01
+load-shuffled ops_per_s                  10000 supdb-ingest    1.39 ->   1.29    0.93 [0.88 1.02 0.83 1.00]    0.92   0.99
+load-shuffled ops_per_s                  30000 supdb-ingest    1.76 ->   1.73    0.98 [0.87 1.25 1.07 0.80]    0.96   0.98
+load-shuffled ops_per_s                 100000 supdb-ingest    2.16 ->   2.23    1.03 [0.97 1.06 1.08 1.02]    1.01   0.98
+load-shuffled ops_per_s                 300000 supdb-ingest    2.41 ->   2.29    0.95 [0.86 0.91 0.97 1.07]    0.93   0.98
+read          p99_us                     10000 supdb           1.38 ->   1.39    1.01 [1.20 0.85 1.09 0.93]    0.90   0.89
+read          reads_per_s                10000 supdb           1.48 ->   1.37    0.93 [1.43 0.70 0.89 0.84]    0.80   0.86
+read          reads_per_s_2t             10000 supdb           1.77 ->   1.57    0.88 [0.96 0.82 1.13 0.68]    0.95   1.08
+read          reads_per_s_3t             10000 supdb           1.90 ->   1.76    0.93 [1.07 0.72 1.01 0.95]    0.92   1.00
+read          p99_us                     30000 supdb           1.29 ->   1.27    0.98 [0.98 0.82 1.08 1.08]    1.00   1.02
+read          reads_per_s                30000 supdb           1.30 ->   1.38    1.06 [0.99 0.83 1.20 1.30]    0.99   0.93
+read          reads_per_s_2t             30000 supdb           1.60 ->   1.60    1.00 [0.66 1.15 1.22 1.07]    1.04   1.04
+read          reads_per_s_3t             30000 supdb           1.60 ->   1.78    1.11 [1.14 1.04 1.04 1.26] >    1.17   1.05
+read          p99_us                    100000 supdb           1.29 ->   1.29    1.00 [0.89 1.06 1.06 0.98]    0.97   0.97
+read          reads_per_s               100000 supdb           1.15 ->   1.18    1.02 [0.92 1.15 0.97 1.06]    0.95   0.93
+read          reads_per_s_2t            100000 supdb           1.41 ->   1.57    1.12 [1.06 0.93 1.42 1.11]    1.07   0.96
+read          reads_per_s_3t            100000 supdb           1.85 ->   1.79    0.96 [1.03 0.89 1.18 0.80]    0.97   1.00
+read          p99_us                    300000 supdb           1.39 ->   1.42    1.02 [0.97 1.06 0.88 1.18]    0.98   0.96
+read          reads_per_s               300000 supdb           1.24 ->   1.33    1.07 [1.01 1.19 0.91 1.21]    1.00   0.93
+read          reads_per_s_2t            300000 supdb           1.28 ->   1.25    0.98 [0.96 1.06 1.07 0.85]    0.99   1.01
+read          reads_per_s_3t            300000 supdb           1.34 ->   1.34    1.00 [0.92 1.03 1.12 0.93]    0.92   0.93
+read          p99_us                     10000 supdb-ingest    1.03 ->   1.17    1.14 [1.05 1.15 1.43 0.99]    1.02   0.90
+read          reads_per_s                10000 supdb-ingest    1.11 ->   1.38    1.25 [1.18 1.23 1.79 0.93]    1.12   0.90
+read          reads_per_s_2t             10000 supdb-ingest    1.53 ->   1.50    0.98 [1.03 0.86 1.53 0.67]    0.90   0.92
+read          reads_per_s_3t             10000 supdb-ingest    1.67 ->   1.67    1.00 [0.96 0.77 1.44 0.94]    0.93   0.93
+read          p99_us                     30000 supdb-ingest    1.19 ->   1.32    1.11 [1.24 1.17 1.13 0.91]    1.07   0.97
+read          reads_per_s                30000 supdb-ingest    1.20 ->   1.38    1.15 [1.01 1.26 1.22 1.11] >    1.07   0.94
+read          reads_per_s_2t             30000 supdb-ingest    1.73 ->   1.61    0.93 [0.79 1.18 0.82 0.98]    0.97   1.04
+read          reads_per_s_3t             30000 supdb-ingest    1.95 ->   1.82    0.93 [0.75 0.80 0.67 1.86]    0.90   0.97
+read          p99_us                    100000 supdb-ingest    1.27 ->   1.29    1.02 [1.10 0.93 0.97 1.09]    0.96   0.95
+read          reads_per_s               100000 supdb-ingest    1.21 ->   1.26    1.05 [1.32 0.92 1.02 0.96]    0.96   0.91
+read          reads_per_s_2t            100000 supdb-ingest    1.55 ->   1.28    0.82 [0.86 0.84 0.73 0.88] <    0.79   0.96
+read          reads_per_s_3t            100000 supdb-ingest    1.78 ->   1.59    0.89 [0.97 0.93 0.73 0.97] <    0.92   1.02
+read          p99_us                    300000 supdb-ingest    1.40 ->   1.40    1.00 [1.09 1.05 0.89 0.97]    0.95   0.95
+read          reads_per_s               300000 supdb-ingest    1.27 ->   1.27    1.00 [1.06 1.06 0.86 1.02]    0.93   0.93
+read          reads_per_s_2t            300000 supdb-ingest    1.36 ->   1.16    0.86 [1.01 0.76 0.83 0.85]    0.89   1.04
+read          reads_per_s_3t            300000 supdb-ingest    1.45 ->   1.34    0.93 [0.96 0.81 1.01 0.94]    0.92   0.99
+scan          entries_per_s              10000 supdb           1.36 ->   1.07    0.79 [0.80 0.77 0.69 0.90] <    0.76   0.96
+scan          entries_per_s_2t           10000 supdb           1.79 ->   1.44    0.80 [0.81 0.71 0.77 0.93] <    0.76   0.94
+scan          entries_per_s_3t           10000 supdb           1.48 ->   1.64    1.11 [1.12 1.68 0.84 0.94]    0.99   0.90
+scan          entries_per_s              30000 supdb           1.25 ->   0.91    0.73 [0.74 0.60 0.82 0.77] <    0.75   1.03
+scan          entries_per_s_2t           30000 supdb           1.44 ->   1.27    0.88 [0.65 1.27 0.78 0.93]    0.87   1.00
+scan          entries_per_s_3t           30000 supdb           1.55 ->   1.47    0.95 [0.73 1.36 0.91 0.89]    1.06   1.11
+scan          entries_per_s             100000 supdb           1.10 ->   1.19    1.09 [0.98 1.40 1.26 0.81]    0.99   0.91
+scan          entries_per_s_2t          100000 supdb           1.74 ->   1.46    0.84 [0.83 0.61 0.87 1.13]    0.92   1.09
+scan          entries_per_s_3t          100000 supdb           1.56 ->   1.25    0.80 [0.86 0.63 0.94 0.81] <    0.84   1.06
+scan          entries_per_s             300000 supdb           0.86 ->   0.93    1.08 [1.11 1.13 0.97 1.14]    0.95   0.88
+scan          entries_per_s_2t          300000 supdb           1.44 ->   1.48    1.02 [1.04 0.94 1.15 0.98]    1.05   1.03
+scan          entries_per_s_3t          300000 supdb           1.48 ->   1.64    1.11 [1.13 1.01 1.39 0.97]    1.11   0.99
+scan          entries_per_s              10000 supdb-ingest    0.92 ->   1.36    1.49 [2.39 0.93 1.29 1.70]    1.13   0.76
+scan          entries_per_s_2t           10000 supdb-ingest    1.14 ->   1.14    1.00 [1.02 0.96 1.42 0.72]    0.92   0.92
+scan          entries_per_s_3t           10000 supdb-ingest    1.35 ->   1.34    1.00 [1.42 0.75 0.96 0.97]    0.87   0.87
+scan          entries_per_s              30000 supdb-ingest    1.03 ->   1.07    1.03 [0.90 1.30 0.77 1.27]    1.08   1.04
+scan          entries_per_s_2t           30000 supdb-ingest    1.49 ->   1.58    1.06 [0.84 1.02 0.95 1.57]    1.04   0.98
+scan          entries_per_s_3t           30000 supdb-ingest    1.73 ->   1.54    0.89 [0.86 0.78 0.71 1.31]    0.91   1.03
+scan          entries_per_s             100000 supdb-ingest    0.93 ->   0.92    0.99 [1.10 0.73 0.86 1.39]    0.92   0.93
+scan          entries_per_s_2t          100000 supdb-ingest    1.56 ->   1.38    0.88 [1.14 0.77 0.80 0.86]    0.96   1.09
+scan          entries_per_s_3t          100000 supdb-ingest    1.48 ->   1.45    0.98 [1.65 0.68 0.80 1.04]    0.92   0.93
+scan          entries_per_s             300000 supdb-ingest    1.03 ->   0.92    0.89 [1.05 1.21 0.56 0.89]    0.96   1.08
+scan          entries_per_s_2t          300000 supdb-ingest    1.45 ->   1.56    1.07 [1.15 1.01 1.13 1.00] >    1.10   1.03
+scan          entries_per_s_3t          300000 supdb-ingest    1.44 ->   1.55    1.08 [1.03 1.20 1.16 0.94]    1.02   0.95
+scan-lag      entries_per_s_lag0pct      10000 supdb           2.01 ->   1.84    0.91 [1.00 0.68 0.77 1.34]    1.02   1.12
+scan-lag      entries_per_s_lag100pct    10000 supdb           1.48 ->   1.47    1.00 [1.05 1.26 0.82 0.91]    0.85   0.85
+scan-lag      entries_per_s_lag10pct     10000 supdb           1.15 ->   1.31    1.14 [1.50 0.97 1.17 0.99]    1.27   1.11
+scan-lag      entries_per_s_lag1pct      10000 supdb           1.64 ->   1.52    0.92 [0.83 0.83 0.66 1.61]    1.03   1.11
+scan-lag      updates_per_s_lag100pct    10000 supdb           3.86 ->   3.57    0.93 [0.97 1.20 0.88 0.71]    0.92   0.99
+scan-lag      updates_per_s_lag10pct     10000 supdb           2.98 ->   3.03    1.02 [1.15 0.98 1.16 0.82]    1.00   0.98
+scan-lag      updates_per_s_lag1pct      10000 supdb           2.23 ->   2.13    0.95 [1.04 0.84 1.26 0.74]    0.92   0.97
+scan-lag      entries_per_s_lag0pct      30000 supdb           1.55 ->   1.92    1.24 [1.24 0.90 1.58 1.32]    1.20   0.97
+scan-lag      entries_per_s_lag100pct    30000 supdb           1.36 ->   1.53    1.13 [1.07 0.61 1.56 1.56]    1.08   0.96
+scan-lag      entries_per_s_lag10pct     30000 supdb           1.51 ->   1.37    0.91 [0.89 0.63 0.88 1.42]    1.02   1.12
+scan-lag      entries_per_s_lag1pct      30000 supdb           1.58 ->   1.58    1.01 [0.81 0.88 1.17 1.23]    1.07   1.06
+scan-lag      updates_per_s_lag100pct    30000 supdb           7.09 ->   7.41    1.05 [1.12 0.94 0.93 1.22]    1.01   0.96
+scan-lag      updates_per_s_lag10pct     30000 supdb           6.78 ->   7.51    1.11 [0.91 1.02 1.06 1.53]    1.02   0.92
+scan-lag      updates_per_s_lag1pct      30000 supdb           4.52 ->   4.43    0.98 [0.88 1.03 0.92 1.11]    0.96   0.98
+scan-lag      entries_per_s_lag0pct     100000 supdb           2.01 ->   2.01    1.00 [1.35 1.02 0.93 0.78]    1.07   1.07
+scan-lag      entries_per_s_lag100pct   100000 supdb           1.30 ->   1.28    0.99 [1.34 1.05 0.70 0.98]    0.96   0.97
+scan-lag      entries_per_s_lag10pct    100000 supdb           1.56 ->   1.58    1.01 [0.96 1.18 0.81 1.15]    1.06   1.04
+scan-lag      entries_per_s_lag1pct     100000 supdb           1.88 ->   1.74    0.92 [0.96 0.91 0.84 0.99] <    0.93   1.01
+scan-lag      updates_per_s_lag100pct   100000 supdb           6.99 ->   7.53    1.08 [1.43 0.89 1.00 1.06]    1.07   0.99
+scan-lag      updates_per_s_lag10pct    100000 supdb           9.72 ->   9.85    1.01 [1.39 0.79 0.82 1.16]    0.98   0.96
+scan-lag      updates_per_s_lag1pct     100000 supdb           9.32 ->  10.32    1.11 [1.33 0.90 1.11 1.14]    1.16   1.04
+scan-lag      entries_per_s_lag0pct     300000 supdb           2.06 ->   2.32    1.13 [1.70 0.68 1.14 1.24]    1.10   0.97
+scan-lag      entries_per_s_lag100pct   300000 supdb           1.35 ->   1.23    0.91 [0.78 1.33 0.69 0.97]    0.87   0.95
+scan-lag      entries_per_s_lag10pct    300000 supdb           1.51 ->   1.66    1.10 [1.30 0.97 1.10 1.06]    1.08   0.99
+scan-lag      entries_per_s_lag1pct     300000 supdb           1.91 ->   2.20    1.15 [1.65 0.80 1.07 1.23]    1.00   0.87
+scan-lag      updates_per_s_lag100pct   300000 supdb          10.73 ->  10.04    0.94 [1.00 1.01 0.77 0.99]    0.95   1.02
+scan-lag      updates_per_s_lag10pct    300000 supdb          15.41 ->  15.16    0.98 [1.04 1.03 0.81 1.07]    1.01   1.02
+scan-lag      updates_per_s_lag1pct     300000 supdb          14.65 ->  16.62    1.13 [1.29 0.93 1.01 1.37]    1.10   0.97
+scan-lag      entries_per_s_lag0pct      10000 supdb-ingest    1.63 ->   1.91    1.17 [0.99 1.43 0.96 1.36]    1.07   0.92
+scan-lag      entries_per_s_lag100pct    10000 supdb-ingest    1.57 ->   1.41    0.90 [0.99 0.83 0.55 1.43]    0.80   0.89
+scan-lag      entries_per_s_lag10pct     10000 supdb-ingest    1.20 ->   1.10    0.91 [0.95 1.35 0.53 1.01]    0.71   0.78
+scan-lag      entries_per_s_lag1pct      10000 supdb-ingest    1.09 ->   1.02    0.93 [0.83 1.38 0.64 1.03]    0.81   0.87
+scan-lag      updates_per_s_lag100pct    10000 supdb-ingest    1.08 ->   1.02    0.95 [1.10 1.08 0.77 0.88]    0.90   0.95
+scan-lag      updates_per_s_lag10pct     10000 supdb-ingest    1.12 ->   1.25    1.12 [0.99 1.46 0.96 1.12]    0.96   0.86
+scan-lag      updates_per_s_lag1pct      10000 supdb-ingest    1.57 ->   1.29    0.82 [0.99 0.95 0.64 0.76] <    0.85   1.04
+scan-lag      entries_per_s_lag0pct      30000 supdb-ingest    1.48 ->   1.40    0.95 [0.84 0.85 0.92 1.22]    0.89   0.94
+scan-lag      entries_per_s_lag100pct    30000 supdb-ingest    1.32 ->   1.35    1.02 [1.50 1.01 0.68 1.06]    0.91   0.89
+scan-lag      entries_per_s_lag10pct     30000 supdb-ingest    1.67 ->   1.34    0.81 [1.07 0.51 0.91 0.84]    0.90   1.12
+scan-lag      entries_per_s_lag1pct      30000 supdb-ingest    1.62 ->   1.47    0.91 [0.77 0.71 1.10 1.12]    0.88   0.97
+scan-lag      updates_per_s_lag100pct    30000 supdb-ingest    1.44 ->   1.37    0.95 [1.38 1.02 0.83 0.70]    0.95   0.99
+scan-lag      updates_per_s_lag10pct     30000 supdb-ingest    2.02 ->   1.63    0.81 [0.62 0.72 1.21 0.80]    0.86   1.06
+scan-lag      updates_per_s_lag1pct      30000 supdb-ingest    1.52 ->   1.38    0.91 [1.12 0.62 0.91 1.09]    0.81   0.89
+scan-lag      entries_per_s_lag0pct     100000 supdb-ingest    1.77 ->   1.89    1.06 [1.21 0.97 1.05 1.04]    1.04   0.98
+scan-lag      entries_per_s_lag100pct   100000 supdb-ingest    1.15 ->   1.25    1.08 [0.86 1.06 1.12 1.35]    1.00   0.92
+scan-lag      entries_per_s_lag10pct    100000 supdb-ingest    1.36 ->   1.88    1.38 [1.97 1.01 1.27 1.44] >    1.09   0.79
+scan-lag      entries_per_s_lag1pct     100000 supdb-ingest    1.52 ->   1.80    1.18 [1.74 1.04 0.83 1.30]    1.16   0.98
+scan-lag      updates_per_s_lag100pct   100000 supdb-ingest    1.58 ->   1.69    1.07 [1.33 0.85 0.78 1.48]    1.05   0.98
+scan-lag      updates_per_s_lag10pct    100000 supdb-ingest    1.85 ->   2.38    1.28 [1.70 1.06 0.87 1.72]    1.13   0.88
+scan-lag      updates_per_s_lag1pct     100000 supdb-ingest    2.09 ->   2.63    1.26 [1.44 0.92 1.16 1.65]    1.24   0.99
+scan-lag      entries_per_s_lag0pct     300000 supdb-ingest    2.21 ->   2.16    0.98 [0.94 1.13 0.92 0.92]    1.00   1.02
+scan-lag      entries_per_s_lag100pct   300000 supdb-ingest    2.10 ->   1.74    0.83 [0.84 0.53 1.22 0.86]    0.91   1.10
+scan-lag      entries_per_s_lag10pct    300000 supdb-ingest    2.27 ->   1.99    0.88 [0.68 1.02 1.12 0.76]    0.84   0.96
+scan-lag      entries_per_s_lag1pct     300000 supdb-ingest    2.72 ->   2.59    0.95 [0.86 0.75 0.92 1.38]    0.93   0.97
+scan-lag      updates_per_s_lag100pct   300000 supdb-ingest    1.89 ->   1.82    0.96 [0.96 0.94 0.98 0.96] <    0.91   0.95
+scan-lag      updates_per_s_lag10pct    300000 supdb-ingest    2.51 ->   2.24    0.89 [0.75 0.87 0.93 1.04]    0.86   0.97
+scan-lag      updates_per_s_lag1pct     300000 supdb-ingest    2.74 ->   2.53    0.92 [0.65 0.91 1.22 0.99]    0.88   0.96
+scan-mixed    entries_per_s_2t           10000 supdb           1.13 ->   1.25    1.11 [0.70 1.65 1.43 0.92]    1.09   0.99
+scan-mixed    entries_per_s_3t           10000 supdb           1.20 ->   1.20    1.00 [1.23 1.00 0.92 0.90]    1.12   1.11
+scan-mixed    entries_per_s_2t           30000 supdb           1.00 ->   0.98    0.97 [0.54 0.81 1.56 1.32]    0.99   1.01
+scan-mixed    entries_per_s_3t           30000 supdb           1.01 ->   1.09    1.08 [0.81 0.96 1.03 1.73]    1.22   1.13
+scan-mixed    entries_per_s_2t          100000 supdb           1.06 ->   1.15    1.08 [0.90 1.03 1.46 1.02]    0.97   0.89
+scan-mixed    entries_per_s_3t          100000 supdb           1.09 ->   1.16    1.06 [0.73 1.22 1.28 1.11]    1.05   0.99
+scan-mixed    entries_per_s_2t          300000 supdb           1.25 ->   1.13    0.90 [0.67 1.26 0.82 0.96]    0.94   1.04
+scan-mixed    entries_per_s_3t          300000 supdb           1.13 ->   1.26    1.12 [1.24 1.10 1.18 0.98]    1.12   1.00
+scan-mixed    entries_per_s_2t           10000 supdb-ingest    0.99 ->   1.01    1.01 [0.77 1.98 0.91 0.75]    0.83   0.82
+scan-mixed    entries_per_s_3t           10000 supdb-ingest    1.09 ->   0.90    0.83 [1.27 0.44 0.73 1.18]    0.79   0.95
+scan-mixed    entries_per_s_2t           30000 supdb-ingest    0.93 ->   1.02    1.09 [1.50 0.70 0.92 1.45]    0.93   0.86
+scan-mixed    entries_per_s_3t           30000 supdb-ingest    1.22 ->   0.87    0.72 [0.94 0.67 0.52 0.80] <    0.81   1.13
+scan-mixed    entries_per_s_2t          100000 supdb-ingest    0.91 ->   1.23    1.35 [1.12 1.21 1.68 1.45] >    1.22   0.91
+scan-mixed    entries_per_s_3t          100000 supdb-ingest    1.05 ->   1.21    1.15 [0.95 1.19 1.11 1.40]    1.08   0.94
+scan-mixed    entries_per_s_2t          300000 supdb-ingest    1.20 ->   1.20    1.00 [0.84 1.07 1.13 1.00]    0.94   0.93
+scan-mixed    entries_per_s_3t          300000 supdb-ingest    1.14 ->   1.18    1.03 [0.91 0.97 1.19 1.09]    1.00   0.97
+ycsb-A        ops_per_s                  10000 supdb           2.60 ->   2.91    1.12 [1.44 1.05 0.96 1.09]    0.92   0.82
+ycsb-A        ops_per_s                  30000 supdb           2.99 ->   2.94    0.98 [1.17 0.82 1.01 0.96]    0.96   0.97
+ycsb-A        ops_per_s                 100000 supdb           3.81 ->   3.90    1.02 [1.08 1.46 0.77 0.91]    0.98   0.96
+ycsb-A        ops_per_s                 300000 supdb           4.50 ->   4.82    1.07 [1.33 1.08 0.95 0.96]    1.06   0.99
+ycsb-A        ops_per_s                  10000 supdb-ingest    1.70 ->   1.62    0.96 [0.93 1.33 1.31 0.52]    1.01   1.05
+ycsb-A        ops_per_s                  30000 supdb-ingest    1.65 ->   2.20    1.33 [1.06 1.35 2.34 0.94]    1.15   0.87
+ycsb-A        ops_per_s                 100000 supdb-ingest    2.08 ->   2.89    1.39 [1.35 1.01 1.59 1.72] >    1.17   0.84
+ycsb-A        ops_per_s                 300000 supdb-ingest    2.80 ->   2.48    0.89 [1.13 0.99 0.73 0.76]    0.95   1.07
+ycsb-B        ops_per_s                  10000 supdb           1.55 ->   1.45    0.94 [1.36 0.78 0.89 0.82]    0.83   0.88
+ycsb-B        ops_per_s                  30000 supdb           1.64 ->   1.86    1.13 [0.98 0.80 1.43 1.49]    1.01   0.89
+ycsb-B        ops_per_s                 100000 supdb           2.41 ->   2.36    0.98 [0.72 1.19 0.89 1.20]    0.97   0.98
+ycsb-B        ops_per_s                 300000 supdb           2.63 ->   2.36    0.90 [0.76 1.23 0.98 0.71]    0.92   1.03
+ycsb-B        ops_per_s                  10000 supdb-ingest    1.33 ->   1.44    1.08 [0.82 1.39 1.65 0.73]    0.97   0.89
+ycsb-B        ops_per_s                  30000 supdb-ingest    1.38 ->   1.71    1.23 [1.14 1.32 1.55 0.99]    1.22   0.99
+ycsb-B        ops_per_s                 100000 supdb-ingest    1.49 ->   1.96    1.32 [1.17 1.06 1.48 1.64] >    1.19   0.91
+ycsb-B        ops_per_s                 300000 supdb-ingest    1.79 ->   1.62    0.90 [0.84 1.07 0.72 1.02]    0.86   0.95
+ycsb-C        ops_per_s                  10000 supdb           1.74 ->   1.55    0.89 [1.06 0.66 1.19 0.76]    0.79   0.89
+ycsb-C        ops_per_s                  30000 supdb           1.60 ->   1.66    1.03 [0.67 0.86 1.82 1.08]    1.02   0.99
+ycsb-C        ops_per_s                 100000 supdb           1.84 ->   2.13    1.16 [1.03 1.22 0.95 1.50]    1.04   0.90
+ycsb-C        ops_per_s                 300000 supdb           1.73 ->   1.86    1.07 [1.10 1.37 0.91 0.97]    1.02   0.95
+ycsb-C        ops_per_s                  10000 supdb-ingest    1.44 ->   1.45    1.01 [0.84 1.26 1.80 0.54]    0.95   0.95
+ycsb-C        ops_per_s                  30000 supdb-ingest    1.35 ->   1.76    1.30 [1.16 1.32 2.04 0.92]    1.24   0.95
+ycsb-C        ops_per_s                 100000 supdb-ingest    1.51 ->   1.83    1.21 [0.99 0.96 1.31 1.76]    1.22   1.00
+ycsb-C        ops_per_s                 300000 supdb-ingest    1.73 ->   1.52    0.88 [0.80 0.85 0.53 1.65]    0.90   1.02
+ycsb-D        ops_per_s                  10000 supdb           1.32 ->   1.30    0.98 [1.16 1.27 0.70 0.90]    0.82   0.84
+ycsb-D        ops_per_s                  30000 supdb           1.18 ->   1.09    0.92 [0.87 1.01 0.75 1.11]    0.89   0.96
+ycsb-D        ops_per_s                 100000 supdb           1.17 ->   1.12    0.95 [0.84 1.21 0.83 0.99]    0.93   0.97
+ycsb-D        ops_per_s                 300000 supdb           1.23 ->   1.23    1.00 [0.85 1.24 1.12 0.85]    0.99   0.99
+ycsb-D        ops_per_s                  10000 supdb-ingest    1.12 ->   1.24    1.11 [1.44 1.26 1.22 0.68]    1.04   0.94
+ycsb-D        ops_per_s                  30000 supdb-ingest    1.50 ->   1.54    1.03 [0.90 1.46 0.85 1.00]    0.99   0.97
+ycsb-D        ops_per_s                 100000 supdb-ingest    1.03 ->   1.19    1.16 [1.04 0.87 1.34 1.49]    1.05   0.90
+ycsb-D        ops_per_s                 300000 supdb-ingest    1.17 ->   1.06    0.90 [1.08 1.20 0.66 0.78]    0.83   0.92
+ycsb-E        ops_per_s                  10000 supdb           1.18 ->   0.87    0.74 [1.05 1.04 0.56 0.50]    0.82   1.11
+ycsb-E        ops_per_s                  30000 supdb           1.07 ->   0.92    0.86 [0.78 0.88 0.97 0.81] <    0.89   1.04
+ycsb-E        ops_per_s                 100000 supdb           1.11 ->   1.15    1.03 [0.78 1.06 1.21 1.14]    0.98   0.95
+ycsb-E        ops_per_s                 300000 supdb           1.29 ->   1.24    0.96 [0.94 0.85 1.41 0.76]    0.94   0.98
+ycsb-E        ops_per_s                  10000 supdb-ingest    0.84 ->   1.04    1.24 [1.66 1.70 1.38 0.61]    1.07   0.86
+ycsb-E        ops_per_s                  30000 supdb-ingest    1.09 ->   1.35    1.24 [1.33 1.60 1.05 1.05] >    1.02   0.82
+ycsb-E        ops_per_s                 100000 supdb-ingest    1.06 ->   1.17    1.10 [1.14 0.64 1.39 1.47]    0.97   0.87
+ycsb-E        ops_per_s                 300000 supdb-ingest    1.22 ->   1.33    1.09 [1.26 1.00 1.02 1.11]    1.02   0.93
+ycsb-F        ops_per_s                  10000 supdb           2.73 ->   2.35    0.86 [0.91 1.18 0.66 0.77]    0.81   0.95
+ycsb-F        ops_per_s                  30000 supdb           2.95 ->   2.89    0.98 [1.03 0.72 1.33 0.93]    1.01   1.04
+ycsb-F        ops_per_s                 100000 supdb           3.62 ->   3.18    0.88 [0.88 1.23 0.61 0.89]    0.84   0.96
+ycsb-F        ops_per_s                 300000 supdb           4.39 ->   3.99    0.91 [0.86 0.98 0.98 0.82] <    0.91   1.00
+ycsb-F        ops_per_s                  10000 supdb-ingest    1.22 ->   1.49    1.22 [1.41 1.66 1.32 0.72]    1.03   0.84
+ycsb-F        ops_per_s                  30000 supdb-ingest    1.77 ->   2.03    1.15 [1.02 1.72 0.98 1.00]    1.08   0.94
+ycsb-F        ops_per_s                 100000 supdb-ingest    1.47 ->   1.80    1.23 [1.29 0.90 1.32 1.47]    1.11   0.91
+ycsb-F        ops_per_s                 300000 supdb-ingest    1.86 ->   1.89    1.02 [1.19 1.24 0.80 0.91]    0.94   0.92
