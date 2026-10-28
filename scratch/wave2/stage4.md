@@ -3750,3 +3750,93 @@ settle; the cells read level in four sittings and are read as that. Not
 priced in core or on the shipping arms, where the fill builds every
 overlaid block at the backlog bound already (no budget) and the in-core
 pricing of filing at every commit cost A and F a third.
+
+## Both codings at write time, and the forms built at the write on the shipping arms
+
+The user's direction after the two questions: store the right form at write
+time, off the critical path, for both. For the coding:
+`Options::zpages_both` (with the re-code and the kept file) builds the
+other coding of every served partition on the builder's thread at idle
+priority once the served files are in (`ZKind::Spare`, kept unserved with
+its pages dropped), the hottest partition first, and the policy, once both
+are kept, chooses the raw-tailed set whole each look -- the hottest whose raw
+tails fit the budget, a served raw-tailed partition's heat counted twice
+against the order and the floor -- and only exchanges files, at most 32 MiB
+of incoming pages a look, a look every 200 ms; nothing moves while nothing
+reads. `tests/zpages.rs` holds a spare built for every partition, a flip
+with no build, an exchange inside a budget with room for one, and a store
+at rest flipping nothing, each held to firing by a mutant.
+
+Its first version against the LZ4 form with the drop (`zboth-ab-{1,2}`, five
+million keys under 640 MiB, both orders): E 1.08 (eight pairs of twelve), D
+1.10 (eleven), C, B and F level, A 0.96, the read and scan passes level,
+0.0001-0.0003 major faults an operation where the LZ4 form took none. The
+trace says why it is not more: the policy's looks waited on the builder,
+which the spares' builds held for most of the rep, so they came seven
+seconds apart; and the heat, averaged over two seconds, cannot follow
+mixes of a quarter to three quarters of a second -- the flips in the
+uniform read pass went to whatever partitions its noise ranked first, and
+the Zipfian head was raw-tailed in C's last look and given back in D. The
+second version looks beside a build in flight and lets a partition's heat
+rise to the rate it shows at once and fade over ten seconds, so C's head,
+about 160 ms of decodes a second against the read pass's 12 a partition,
+takes the raw tails at C's first look and keeps them through D.
+
+The forms built at the write, on the combined arm under its budget
+(`supdb-cache64tofitautozpagessettlebuilds` against `supdb-cache64tofitautozpages`,
+`zsbauto-ab-{1,2}`): D 0.765 with every one of twelve pairs slower, B 0.90,
+F 0.94, E level -- and the faults say why: D 0.008-0.009 major faults an
+operation where the arm without took none, F 0.002, E 0.002 against
+0.0004. The forms the commits build stay in the process's anonymous memory,
+up to the cache's 64 MiB, from the write until E reads them, and the
+combined arm stands at its fit line, so they displace form-file pages and
+D's uniform reads fault for them. The forced hot8 arm with the raw pages
+dropped had the room and faulted nothing, which is why it won E for free
+there. Building at write time is paid in memory for the whole span from the
+write to the read, and under a bound that memory is the price.
+
+In core (`incore-pair.sh`, every pass at a hundred and three hundred
+thousand keys, five pairs a sitting, both orders; `zsbcore-*`, `zsbingest-*`),
+settle-builds against `supdb` and `supdb-ingest` resolved nothing: cells
+the mechanism cannot reach -- the read pass, run before any write -- moved
+0.85-1.25x between sittings, and the cells it reaches disagreed with each
+other: the durable arm's E 1.06 and 1.11 at a hundred thousand and 0.94
+and 0.70 at three hundred thousand, the buffered arm's E 1.15 and 1.10 and
+F 1.09 and 1.08 at three hundred thousand with B 0.81 and 0.92. Nothing
+here supports a default; a verdict in core needs twelve pairs a sitting on
+the cells the mechanism reaches.
+
+The second version against the LZ4 form with the drop (`zboth2-ab-{1,2}`):
+E 1.04 (1.07 and 1.02), D 1.08 (1.10 and 1.06), B 1.07, C 1.04, F 0.96 and A
+0.92, slower in both sittings (0.95 and 0.88) -- short of what raw tails by
+key order bought (C about 1.3, B about 1.24, E 1.13-1.19), and the trace says
+why it cannot be more at this scale. The looks now run every 200 ms through
+the spares' builds, and the head takes its raw tails at C's first look, but
+nothing before C says where the head is: the read and scan passes are
+uniform, so the raw set they leave is whatever ranked first, and the head
+(p0 to p2) is flipped in during C and B, each flip a 20-30 MB prefetch from
+the device the durable commits sync to -- A, whose commits sync and during
+which a flip fell, read 0.88-0.95. The key-order arm chose before the mixes,
+by an order that happens to be the suite's Zipfian; a policy that learns
+from the reads pays one mix of flipping and holds after, which mixes of a
+quarter to three quarters of a second do not repay. (A raw-tailed
+partition's point read decodes its one record and bypasses the memo, so the
+mixes' decode counts are not comparable between the codings.) The shape
+where storing both can pay is the long one, `--ops-div 1`.
+
+The fill's builds gated on the room (`SettleRoom`: the memory group's file
+refaults read at most every 100 ms, nothing built within a second of one
+seen grow, and the forms built and not walked since shed when the room
+goes; `tests/settle.rs` holds each, the shed held to firing). On the
+combined arm (`zsbauto2-ab-{1,2}`): the gate fired as designed -- 8,900
+forms built in A, none in F or D, E rebuilding all of its 24,007 -- and D
+still read 0.86 (three pairs of twelve), F 0.95, E 1.04, with D's major
+faults 0.006-0.007 an operation where the arm without took none. A shed
+form's memory goes back to the allocator's arena, not to the kernel, so the
+page cache does not get it back: on an arm at its fit line the room a build
+at the write takes is spent once taken, and a gate has to decide before the
+memory is, from room the bound leaves. On hot8 with the drop
+(`zsettlebuilds3-ab-{1,2}`), where there was room, the gate let every build
+through (9,458 forms in A, 6,438 in F, 1,627 in B) and nothing faulted: E
+1.05, A 1.04, the rest level -- E's gain on that arm 1.17, 1.12, 1.07,
+1.10 and 1.05 across five sittings.

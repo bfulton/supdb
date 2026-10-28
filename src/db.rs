@@ -557,6 +557,10 @@ pub struct ZCounts {
     pub recode_flips: u64,
     pub spare_files: u64,
     pub spare_bytes: u64,
+    /// Form files built in the other coding to be kept beside the served
+    /// one (`Options::zpages_both`), and such builds that kept nothing.
+    pub spare_builds: u64,
+    pub spare_failed: u64,
     /// The partitions whose raw pages were dropped at their form file's
     /// install (`Options::zpages_drop_raw`).
     pub raw_dropped: u64,
@@ -1340,6 +1344,22 @@ pub struct Options {
     /// the segment; a reopen serves whichever coding holds the name. Off.
     #[doc(hidden)]
     pub zpages_recode_keep: bool,
+    /// EXPERIMENT: with `zpages_recode` and `zpages_recode_keep`, every
+    /// served partition gets its form file in the other coding too, built
+    /// on the builder's thread at idle priority once the served ones are in,
+    /// the hottest partition first, and kept attached and unserved with its
+    /// pages dropped: the store holds both codings of every partition from
+    /// write time, and the policy never builds while it serves. It chooses
+    /// the raw-tailed set whole once a period -- the hottest partitions
+    /// whose raw tails fit the budget, a served raw-tailed partition's heat
+    /// counted `RECODE_SWAP` times so that it does not flip on noise -- and
+    /// exchanges each partition whose coding differs, at most
+    /// `RECODE_FLIP_BYTES` of incoming pages a look, a look every
+    /// `RECODE_PERIOD_BOTH` whether or not a build is in flight, since a flip
+    /// costs a prefetch and not a build; and a partition's heat rises to the
+    /// rate it shows at once and fades over `RECODE_TAU`. Off.
+    #[doc(hidden)]
+    pub zpages_both: bool,
     /// EXPERIMENT: under `ZPages::Auto`, the coding the form files are built
     /// in is the selector's to choose (`zselect::choose_coding`): the sampler
     /// sizes the record coding with raw tails beside the block coding, and
@@ -1928,7 +1948,12 @@ pub struct Options {
     /// keys under 640 MiB in four sittings: E 1.07-1.17x in every one, its
     /// settle phase gone and its blocks built down from 24,000 to 15,000,
     /// with A, C, D and F level or faster and B either side by sitting;
-    /// nothing faulted. Not priced in core or on the shipping arms. Off.
+    /// nothing faulted. On the combined arm, which stands at its fit line,
+    /// the same forms cost D a quarter in every pair on 0.008 major faults
+    /// an operation: they stay in memory from the write to E's scans. So
+    /// the fill builds only while the memory group's file refaults hold
+    /// still, and sheds what it built unwalked when they move
+    /// (`SettleRoom`). Off.
     #[doc(hidden)]
     pub forms_settle_builds: bool,
     /// Take the store's keys for `forms_settle_backlog_pct` and
@@ -2888,6 +2913,7 @@ impl Default for Options {
             zpages_drop_raw: false,
             zpages_recode: false,
             zpages_recode_keep: false,
+            zpages_both: false,
             zpages_coding_auto: false,
             zpages_inplace_walk: true,
             zpages_build_eager: false,
@@ -3661,6 +3687,9 @@ struct ZBuild {
     /// swap of the cell, and a build that installs nothing leaves the
     /// partition as it was served.
     recode: bool,
+    /// A re-code collected into the cell of kept form files and not the
+    /// served one (`ZKind::Spare`).
+    spare: bool,
 }
 
 /// What the builder's thread is running: a build, or a warm of an attached
@@ -3699,6 +3728,9 @@ enum ZKind {
     /// The served form file built again in the other coding
     /// (`Options::zpages_recode`).
     Recode,
+    /// The served form file built in the other coding to be kept beside
+    /// it, unserved (`Options::zpages_both`).
+    Spare,
 }
 
 /// `seg`'s form file taken out of its cell and retired through the epoch --
@@ -13279,6 +13311,26 @@ impl StartCache {
     }
 }
 
+/// Whether a commit's fill may build forms for the blocks its settle filed
+/// into (`Options::forms_settle_builds`): the forms it builds stay in the
+/// process's memory from the write until a scan reads them, and under a
+/// memory bound that memory is the page cache's, so the fill builds only
+/// while the memory group's file refaults hold still -- none seen grow in
+/// the last `SETTLE_ROOM_QUIET`, read at most every `SETTLE_ROOM_PERIOD`.
+#[derive(Clone, Copy)]
+struct SettleRoom {
+    checked: Option<std::time::Instant>,
+    refaults: Option<u64>,
+    faulted: Option<std::time::Instant>,
+    room: bool,
+}
+
+/// How often the fill reads the group's refaults, and how long after one
+/// grows it builds nothing: a read of the cgroup's files is tens of
+/// microseconds, and a commit is a few hundred.
+const SETTLE_ROOM_PERIOD: std::time::Duration = std::time::Duration::from_millis(100);
+const SETTLE_ROOM_QUIET: std::time::Duration = std::time::Duration::from_secs(1);
+
 struct FormsState {
     /// PROTOTYPE: the block cache's table for each segment, by position
     /// in `segs`, made on first use and dropped whenever the segments
@@ -13420,6 +13472,13 @@ struct FormsState {
     settle_blocks: std::cell::RefCell<Vec<(u32, u32)>>,
     /// Forms the fill built for those blocks, over the store's life.
     settle_built: std::cell::Cell<u64>,
+    /// Whether the fill may build them now (`SettleRoom`), and the blocks
+    /// it built with the scan tick each was built at, for a shed of the
+    /// ones no scan has walked since when the room goes; and the forms so
+    /// shed, over the store's life.
+    settle_room: std::cell::Cell<SettleRoom>,
+    settle_built_at: std::cell::RefCell<Vec<(u32, u32, u32)>>,
+    settle_shed: std::cell::Cell<u64>,
     /// Whether this fill may rebuild a dense sparse form as a copy, and
     /// the store's scan count at the fill before, which says whether
     /// anything has read since (`Options::forms_convert_unread`).
@@ -13530,6 +13589,14 @@ impl FormsState {
             settle_density: std::cell::Cell::new([0; 4]),
             settle_blocks: std::cell::RefCell::new(Vec::new()),
             settle_built: std::cell::Cell::new(0),
+            settle_room: std::cell::Cell::new(SettleRoom {
+                checked: None,
+                refaults: None,
+                faulted: None,
+                room: true,
+            }),
+            settle_built_at: std::cell::RefCell::new(Vec::new()),
+            settle_shed: std::cell::Cell::new(0),
             convert_dense: std::cell::Cell::new(true),
             convert_life: std::cell::Cell::new(u64::MAX),
             built: std::cell::RefCell::new(Vec::new()),
@@ -16395,6 +16462,8 @@ impl Reader {
             recode_failed: get(&ev.recode_failed),
             recode_looks: get(&ev.recode_looks),
             recode_flips: get(&ev.recode_flips),
+            spare_builds: get(&ev.spare_builds),
+            spare_failed: get(&ev.spare_failed),
             raw_dropped: get(&ev.raw_dropped),
             sel_samples: get(&ev.sel_samples),
             sel_builds: get(&ev.sel_builds),
@@ -19747,7 +19816,9 @@ impl Reader {
             self.install_ahead(unsealed)?;
             if moved && self.opts.forms_settle_builds {
                 let blocks = std::mem::take(&mut *self.fs().settle_blocks.borrow_mut());
-                self.build_settled(&blocks, unsealed)?;
+                if !blocks.is_empty() && self.settle_room() {
+                    self.build_settled(&blocks, unsealed)?;
+                }
             }
         }
         // A form for every overlaid block, once per state: from here on
@@ -19842,8 +19913,73 @@ impl Reader {
             self.list_built_bytes(pi, b, table, bytes);
             self.shed(pi, b, table);
             self.fs().settle_built.set(self.fs().settle_built.get() + 1);
+            self.fs().settle_built_at.borrow_mut().push((
+                pi as u32,
+                b as u32,
+                self.fs().scan_tick.get(),
+            ));
         }
         Ok(())
+    }
+
+    /// Whether the fill may build the blocks its settle filed into
+    /// (`SettleRoom`): the group's file refaults read at most every
+    /// `SETTLE_ROOM_PERIOD` -- from the platform, or the rate a test has
+    /// set through the seam -- and no build within `SETTLE_ROOM_QUIET` of
+    /// one seen grow. Where the room goes, the forms the fills built that
+    /// no scan has walked since are shed, since they are what took it.
+    fn settle_room(&self) -> bool {
+        let now = std::time::Instant::now();
+        let mut r = self.fs().settle_room.get();
+        let was = r.room;
+        if let Some(rate) = self
+            .opts
+            .zpages_inject
+            .as_ref()
+            .and_then(|i| i.refault_rate())
+        {
+            r.room = rate <= 0.0;
+        } else if r
+            .checked
+            .is_none_or(|t| now.duration_since(t) >= SETTLE_ROOM_PERIOD)
+        {
+            let refaults = zfile::read_budget().and_then(|b| b.refaults);
+            if let (Some(n), Some(n0)) = (refaults, r.refaults) {
+                if n > n0 {
+                    r.faulted = Some(now);
+                }
+            }
+            r.refaults = refaults;
+            r.checked = Some(now);
+            r.room = r
+                .faulted
+                .is_none_or(|t| now.duration_since(t) >= SETTLE_ROOM_QUIET);
+        }
+        self.fs().settle_room.set(r);
+        if was && !r.room {
+            self.shed_settle_built();
+        }
+        r.room
+    }
+
+    /// The forms the fills built that no scan has walked since, shed: the
+    /// room they were built in has gone.
+    fn shed_settle_built(&self) {
+        let list = std::mem::take(&mut *self.fs().settle_built_at.borrow_mut());
+        let np = self.segs().partition_point(|s| s.level > 0);
+        let tables = self.fs().tables.borrow();
+        for (pi, b, tick) in list {
+            let (pi, b) = (pi as usize, b as usize);
+            if pi >= np {
+                continue;
+            }
+            let mut held = tables[pi].borrow_mut();
+            let Some(table) = held.as_mut() else { continue };
+            if b < table.slots.len() && table.slots[b].is_some() && table.touched[b] <= tick {
+                self.unlist(pi, b, table);
+                self.fs().settle_shed.set(self.fs().settle_shed.get() + 1);
+            }
+        }
     }
 
     /// EXPERIMENT: a form for every block any unsealed key overlays,
@@ -25918,6 +26054,13 @@ impl Db {
         self.r.fs().settle_built.get()
     }
 
+    /// Those forms shed unwalked when the fills' room went
+    /// (`Options::forms_settle_builds`).
+    pub fn settle_shed(&self) -> u64 {
+        self.take_back_upkeep();
+        self.r.fs().settle_shed.get()
+    }
+
     /// The writer's own scans whose first block was a copy walked with the
     /// rank never sought (`Options::zpages_seek_span`).
     pub fn span_starts(&self) -> u64 {
@@ -31688,6 +31831,14 @@ const RECODE_HOLD: std::time::Duration = std::time::Duration::from_secs(60);
 /// raw-tailed partition's opens are read at before any block-coded form
 /// file has counted one.
 const RECODE_TAU: std::time::Duration = std::time::Duration::from_secs(10);
+/// The policy's period where every partition keeps both codings
+/// (`Options::zpages_both`): a flip costs the prefetch of the incoming
+/// file, a partition's 20-30 MB at the device's 150 MB/s here, about a
+/// fifth of a second, so a look a fifth of a second.
+const RECODE_PERIOD_BOTH: std::time::Duration = std::time::Duration::from_millis(200);
+/// The incoming pages a look asks for at most, beyond its first flip: what
+/// the device reads in one period.
+const RECODE_FLIP_BYTES: u64 = 32 << 20;
 const RECODE_SWAP: f64 = 2.0;
 const RECODE_DECODE_NS: f64 = 1000.0;
 
@@ -31894,6 +32045,9 @@ struct Maint {
     z_recode_heat: std::collections::HashMap<String, f64>,
     z_recode_refaults: Option<u64>,
     z_recode_ceiling: Option<(u64, std::time::Duration)>,
+    /// Partitions whose spare build kept nothing (`Options::zpages_both`),
+    /// not built a spare again.
+    z_spare_failed: std::collections::HashSet<String>,
 }
 
 /// A sample job in flight (`zfile::sample` over the live partitions, on a
@@ -32393,6 +32547,7 @@ impl Maint {
             z_recode_heat: std::collections::HashMap::new(),
             z_recode_refaults: None,
             z_recode_ceiling: None,
+            z_spare_failed: std::collections::HashSet::new(),
         }
     }
 
@@ -33693,6 +33848,13 @@ impl Maint {
             drop(op);
         }
         if self.zbuild.is_some() {
+            // A look needs no builder where the policy only exchanges files
+            // (`Options::zpages_both`): with the spares' builds holding the
+            // builder for most of a pass, the looks it waited on came seven
+            // seconds apart.
+            if self.opts.zpages_both && self.opts.zpages_recode && !self.z_settling {
+                self.z_recode_tick();
+            }
             return;
         }
         if self.z_settling || self.opts.zpages_eager {
@@ -33707,7 +33869,41 @@ impl Maint {
         }
         if self.opts.zpages_recode && !self.z_settling {
             self.z_recode_tick();
+            if self.zbuild.is_none() && self.opts.zpages_both {
+                let next = {
+                    let _op = self.op();
+                    self.z_next_spare()
+                };
+                if let Some(seg) = next {
+                    self.z_start(seg, ZKind::Spare, false);
+                }
+            }
         }
+    }
+
+    /// The served partition to build a spare for next (`Options::zpages_both`):
+    /// one with no kept form file, the hottest by the policy's heat and the
+    /// first by key order among equals, none while a seal or a merge is
+    /// rewriting the partitions.
+    fn z_next_spare(&self) -> Option<std::sync::Arc<Seg>> {
+        if self.compacting.is_some() || self.tiering.is_some() || !self.sealing.is_empty() {
+            return None;
+        }
+        let mut best: Option<(f64, std::sync::Arc<Seg>)> = None;
+        for s in self.segs().iter().filter(|s| s.level > 0) {
+            if self.in_flight_input(&s.name)
+                || s.z_spare.get().is_some()
+                || !s.z.get().is_some_and(|z| !z.damaged())
+                || self.z_spare_failed.contains(&s.name)
+            {
+                continue;
+            }
+            let heat = self.z_recode_heat.get(&s.name).copied().unwrap_or(0.0);
+            if best.as_ref().is_none_or(|(h, _)| heat > *h) {
+                best = Some((heat, s.clone()));
+            }
+        }
+        best.map(|(_, s)| s)
     }
 
     /// The re-code policy's turn (`Options::zpages_recode`), with no build
@@ -33727,9 +33923,14 @@ impl Maint {
     /// merge is rewriting the partitions, and nothing without a budget.
     fn z_recode_tick(&mut self) {
         let now = self.z_now();
+        let period = if self.opts.zpages_both {
+            RECODE_PERIOD_BOTH
+        } else {
+            RECODE_PERIOD
+        };
         if self
             .z_recode_last
-            .is_some_and(|t| now.saturating_sub(t) < RECODE_PERIOD)
+            .is_some_and(|t| now.saturating_sub(t) < period)
         {
             return;
         }
@@ -33843,7 +34044,15 @@ impl Maint {
                 _ => None,
             };
             let old = self.z_recode_heat.get(&seg.name).copied().unwrap_or(0.0);
+            // Where both codings are kept a flip is a prefetch, and the heat
+            // rises to the rate a partition shows at once and fades over
+            // `RECODE_TAU`: the suite's mixes are a quarter to three quarters
+            // of a second each, so an average over seconds gave the head of
+            // a Zipfian mix its raw tails after the mix, and a uniform mix
+            // between two Zipfian ones took them away. Elsewhere a flip is a
+            // build, and the heat is the average.
             let heat = match (rate, keep) {
+                (Some(r), Some(a)) if self.opts.zpages_both => (a * old).max(r),
                 (Some(r), Some(a)) => a * old + (1.0 - a) * r,
                 (None, Some(a)) => a * old,
                 _ => old,
@@ -33927,6 +34136,78 @@ impl Maint {
         {
             self.z_recode_ceiling = None;
         }
+        if self.opts.zpages_both {
+            // The raw-tailed set chosen whole among the partitions that keep
+            // both codings, the rest held at the coding they serve: the
+            // hottest whose raw tails fit, by heat with a served raw-tailed
+            // partition's counted `RECODE_SWAP` times, against the order and
+            // the floor alike, so that one serving its raw tails keeps them
+            // until it is that much colder than what would take them; then
+            // each partition whose coding differs exchanged, the ones going
+            // back first since they make the room, at most
+            // `RECODE_FLIP_BYTES` of incoming pages a look and one at least.
+            // Nothing moves while nothing reads: a store at rest would give
+            // its raw tails back as the heat decays and take them again at
+            // the next pass, a prefetch each way for nothing.
+            let limit = self.z_recode_ceiling.map_or(budget, |(c, _)| c.min(budget));
+            let heat_all: f64 = parts.iter().map(|p| p.heat).sum();
+            if heat_all < RECODE_FLOOR_NS {
+                if self.z_trace {
+                    trace("idle", None, self.z_recode_ceiling.map(|c| c.0));
+                }
+                return;
+            }
+            // (index into parts, raw-tailed bytes, block-coded bytes)
+            let mut two: Vec<(usize, u64, u64)> = Vec::new();
+            let mut fixed = 0u64;
+            for (i, p) in parts.iter().enumerate() {
+                match p.seg.z_spare.get() {
+                    Some(k) if p.coded => two.push((i, p.bytes, k.file_bytes())),
+                    Some(k) => two.push((i, k.file_bytes(), p.bytes)),
+                    None => fixed += p.bytes,
+                }
+            }
+            let rank = |t: &(usize, u64, u64)| {
+                let p = &parts[t.0];
+                p.heat * if p.coded { RECODE_SWAP } else { 1.0 }
+            };
+            two.sort_by(|a, b| rank(b).total_cmp(&rank(a)));
+            let mut total = fixed + two.iter().map(|t| t.2).sum::<u64>();
+            let want: Vec<bool> = two
+                .iter()
+                .map(|t| {
+                    let extra = t.1.saturating_sub(t.2);
+                    let ok = rank(t) >= RECODE_FLOOR_NS && total.saturating_add(extra) <= limit;
+                    if ok {
+                        total += extra;
+                    }
+                    ok
+                })
+                .collect();
+            let mut moved = 0u64;
+            for to_raw in [false, true] {
+                for (t, &w) in two.iter().zip(&want) {
+                    let p = &parts[t.0];
+                    if p.coded == w || w != to_raw {
+                        continue;
+                    }
+                    let incoming = if w { t.1 } else { t.2 };
+                    if moved > 0 && moved.saturating_add(incoming) > RECODE_FLIP_BYTES {
+                        continue;
+                    }
+                    moved = moved.saturating_add(incoming);
+                    if self.z_trace {
+                        trace(
+                            if w { "raw" } else { "back" },
+                            Some(p),
+                            self.z_recode_ceiling.map(|c| c.0),
+                        );
+                    }
+                    self.z_recode(p.seg.clone());
+                }
+            }
+            return;
+        }
         let Some(p) = parts
             .iter()
             .filter(|p| !p.coded)
@@ -34007,7 +34288,9 @@ impl Maint {
             zfile::ZEvents::add(&ev.recode_flips, 1);
             return;
         }
-        self.z_start(seg, ZKind::Recode, false);
+        if self.zbuild.is_none() {
+            self.z_start(seg, ZKind::Recode, false);
+        }
     }
 
     /// The controller's clock: the injected one where a test has moved it,
@@ -34874,13 +35157,16 @@ impl Maint {
                 zfile::ZEvents::add(&ev.rebuilds, 1);
             }
             ZKind::Retry => zfile::ZEvents::add(&ev.build_retries, 1),
-            ZKind::Build | ZKind::Warm | ZKind::Recode => {}
+            ZKind::Build | ZKind::Warm | ZKind::Recode | ZKind::Spare => {}
         }
         let advise = Db::z_advise(&self.opts);
         let refused = seg.z_declined.load(AtomicOrdering::Relaxed) == zfile::DECLINED_REFUSED;
         // A re-code's partition is served by the file under the name, which
         // is the one being replaced.
-        let recode = kind == ZKind::Recode;
+        // A spare is built as a re-code is, the other coding of the served
+        // file, and kept where a re-code swaps.
+        let spare = kind == ZKind::Spare;
+        let recode = kind == ZKind::Recode || spare;
         if !recode
             && !refused
             && Db::z_attach(
@@ -35022,6 +35308,7 @@ impl Maint {
                     refused,
                     dormant,
                     recode,
+                    spare,
                 });
             }
             Err(_) => failed(zfile::DECLINED_FAILED),
@@ -35042,6 +35329,7 @@ impl Maint {
             refused,
             dormant,
             recode,
+            spare,
             ..
         } = b;
         let handle = match job {
@@ -35078,7 +35366,59 @@ impl Maint {
             seg.z_declined.store(why, AtomicOrdering::Relaxed);
             seg.z_schedule_retry(retry_ms);
         };
+        // A spare that kept nothing: counted, and its partition not built
+        // a spare again, so that a build that cannot succeed is not retried
+        // at every turn.
+        let spare_failed = |me: &mut Self| {
+            zfile::ZEvents::add(&ev.spare_failed, 1);
+            me.z_spare_failed.insert(seg.name.clone());
+        };
         match outcome {
+            // A spare: attached beside the served file and kept, its pages
+            // dropped -- the served one is unchanged, though the build's
+            // rename gave the spare its name -- and the raw pages the build
+            // read dropped again where the store drops them.
+            Ok(zfile::Outcome::Built(built)) if spare && live.is_some() => {
+                let target = live.expect("checked");
+                match zfile::ZFile::attach(
+                    &out,
+                    target.blob.for_zfile(),
+                    id,
+                    end,
+                    Db::z_advise(&self.opts),
+                    Db::z_memo(&self.opts),
+                    self.opts.zpages_scan_prefetch,
+                    self.opts.zpages_trusted_views,
+                    self.opts.zpages_memo_first,
+                    self.opts.zpages_fence_tree,
+                    self.opts.zpages_memo_ahead,
+                ) {
+                    Ok(mut side) => {
+                        side.inplace = self.opts.zpages_inplace_walk;
+                        side.time_decodes = self.opts.zpages_recode;
+                        side.drop_cache();
+                        let old = target.z_spare.keep(Box::into_raw(Box::new(side)));
+                        if !old.is_null() {
+                            let tag = shared.readers.bump();
+                            shared.retired_z.push(tag, RetiredZ(old));
+                            shared.retired_z.sweep(|low| shared.readers.oldest_for(low));
+                        }
+                        ev.built(&built);
+                        zfile::ZEvents::add(&ev.attached, 1);
+                        zfile::ZEvents::add(&ev.spare_builds, 1);
+                        if self.opts.zpages_drop_raw {
+                            target.drop_raw_pages(&self.dir, ev);
+                        }
+                    }
+                    Err(_) => spare_failed(self),
+                }
+            }
+            Ok(zfile::Outcome::Cancelled) if spare => {
+                zfile::ZEvents::add(&ev.build_cancelled, 1);
+            }
+            // A spare whose partition a merge retired meanwhile falls to the
+            // dead name below, as a re-code's does.
+            Ok(zfile::Outcome::Declined(_)) | Err(_) if spare => spare_failed(self),
             // A re-code: the new form file attached and swapped into the
             // cell, the old one retired through the epoch -- the build's
             // rename unlinked its name, so there is nothing to rename -- and
@@ -35259,6 +35599,7 @@ impl Maint {
                 refused: false,
                 dormant: false,
                 recode: false,
+                spare: false,
             });
         }
     }

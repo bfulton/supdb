@@ -683,6 +683,26 @@ user's call.
   against the drop arm, where the second version's way back rebuilt LZ4
   files inside the faulting mixes. Note that a pairing at `--ops-div 1`
   outlasts a background command's two hours: run it detached.
+- **"Store the right form at write time, off the critical path, for both"**
+  (`stage4.md`, "Both codings at write time, and the forms built at the
+  write on the shipping arms"). *The coding*: `Options::zpages_both` builds
+  the other coding of every served partition on the builder's thread
+  (`ZKind::Spare`) and the policy only exchanges the two, choosing the
+  raw-tailed set whole each 200 ms look with an attack/release heat; at
+  `--ops-div 10` it reads E 1.04, D 1.08, B 1.07, A 0.92 against the LZ4
+  form with the drop -- nothing before C says where the Zipfian head is, so
+  it pays one mix of flips, each a prefetch on the device the durable
+  commits sync to. Arm `supdb-cache64tofitzpagesbothdrop`; the long shape
+  (`--ops-div 1`, run detached, `$S/both-long-run.sh`) is where it can pay.
+  *The overlay*: `forms_settle_builds` wins E only where the bound leaves
+  room (hot8+drop: E 1.05-1.17 in five sittings, nothing faulting); on the
+  combined arm, at its fit line, its forms cost D a quarter on major faults,
+  and a refault gate (`SettleRoom`) brings that to 0.86 but cannot undo it,
+  since a shed form's memory stays in the allocator's arena. A gate that
+  decides before the memory is taken, from the room the bound actually
+  leaves, is the next step; in core nothing resolved in five pairs a
+  sitting. Arms `supdb-{,ingest}settlebuilds`,
+  `supdb-cache64tofitautozpagessettlebuilds`.
 - **Untouched**: the shuffled-load kill of the combined arm under 640 MiB
   and the gear shift, as the session before left them.
 
