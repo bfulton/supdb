@@ -93,7 +93,11 @@ out of core" (5M keys under 640 MiB):
   under 1 GiB the form takes every cell.
 
 The open cell is E. A secondary one is the minute of raw reads before the
-install (the "gear shift"). The per-record form, probed and built below as
+install (the "gear shift"). In core, the default arms at `44389dc` gave no
+ground resolvable against `5df834c`, the last banked row: three sittings of
+the two binaries alternated put every family within a twentieth of level, F
+on the durable arm at 0.95 ±0.045 and unresolved (`stage4.md`, "Has the
+in-core default given ground"). The per-record form, probed and built below as
 the record coding, took the point reads' group decode away and not E's: a
 scan's memo miss still decodes a group whole, and through its records that
 costs more, so the coding is an arm. The profile at `3a885a9` (below) has

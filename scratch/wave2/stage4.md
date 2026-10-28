@@ -3903,3 +3903,41 @@ write time wins the reads the store can serve from memory once the head is
 found, at the price of the disk the second coding takes and the builds
 after the load; it loses nothing resolved but F, whose two sittings
 disagree.
+
+## Has the in-core default given ground since the last banked row (`5df834c` against `44389dc`)
+
+The quick row at `44389dc` (`revab-5df834c/quick-row-44389dc.json`, not banked:
+the pointer-chase floor read 6.60M chases a second against a window of
+6.79-16.5M, the comparators all in band) gated clean: nothing of 1,107 banded
+quantities worse than every prior row, and nothing withheld. Its ratios to
+LMDB put the default arm's point-read cells at the bottom of the eight priors
+with the comparators mid-window, so the two binaries were alternated a process
+at a time, ABBA, in one sitting (`revab-5df834c/drive.sh`, `read.py`: the ratio
+to LMDB in each process, new over old in each round):
+
+- sitting 1, `supdb`, `supdb-ingest`, `lmdb`, `lmdb-nosync`, three reps, four
+  rounds: the durable arm's scan pass at 10k and 30k read 0.79 and 0.73 in
+  every round;
+- sitting 2, `supdb` and `lmdb` to 30k, eight reps, every scan timed
+  (`SUPDB_SCAN_OPS`): the same scans read 1.06 and 1.04, the median scan 1.15
+  against 1.24 µs at 10k and 1.21 against 1.34 at 30k, the first scan the
+  same in both. Sitting 1's scans were the noise of three reps;
+- sitting 3, sitting 1's arms with five reps: every family within its noise;
+- sitting 4, `supdb` and `lmdb`, eight reps, six rounds, the mixes timed by
+  kind (`SUPDB_MIX_KINDS`), for the one family two sittings had below level.
+
+Pooled over the three sittings with the durable arm, by family over every
+rung and round (`s*-read.txt`): load 1.03 ±0.05, shuffled load 0.99 ±0.02, the
+read pass 1.00 ±0.04 and its p99 1.00 ±0.03, scans 1.01 ±0.06, the lag sweep's
+scans 1.01 ±0.03 and its bursts 1.00 ±0.02, A 1.00, B 0.99, C 1.05, D 0.98, E
+0.99, each ±0.05, and F 0.95 ±0.045 -- 0.90, 0.95 and 0.98 by sitting, the
+sitting with the most reps nearest level. The buffered arm, two sittings:
+every family 0.98-1.05 single-threaded, the threaded reads and the
+threaded mixed scans 0.94-0.95 ±0.07-0.09, the cells the vCPUs move. Timed
+by kind against LMDB in sitting 4, the durable arm's gets read 0.86-0.97 of
+before at 10k and 30k and level above, and its commits level but at 100k,
+where A's read 1.13 in five rounds of six with LMDB's own commits 4% slower
+in the same processes: a commit is an fdatasync's worth here, and the device
+is what moves it. No family moved by a tenth, which is all a pairing
+resolves; F's twentieth is unresolved and no change since `5df834c` touches
+the durable arm's commit beyond a short-circuited branch.
