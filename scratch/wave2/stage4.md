@@ -3941,3 +3941,43 @@ in the same processes: a commit is an fdatasync's worth here, and the device
 is what moves it. No family moved by a tenth, which is all a pairing
 resolves; F's twentieth is unresolved and no change since `5df834c` touches
 the durable arm's commit beyond a short-circuited branch.
+
+## The gear on by default, priced at its three bounds (`01f0771`)
+
+`Options::zpages_coding_auto` ships on; `supdb-cache64tofitautozpagescodingfixed`
+is the options' block coding wherever the controller builds, the shape before.
+Paired at five million keys, five pairs a sitting in both orders
+(`zgearon5m{640,720,736}-ab-{1,2}`), the default over the fixed arm:
+
+- **640 MiB, outside the window:** the gear sizes the raw-tail form at 595 MB
+  and picks the block coding in every rep; both arms build the same nineteen
+  files (391 MB). Every cell reads within the order's noise of level -- read
+  0.93 and 1.05, scans 0.96 and 1.05, A 1.06 and 1.05, B 1.02 and 0.92, C 1.07
+  and 0.85, D 0.87 and 0.99, E 1.00 and 1.05, F 0.95 and 1.11 -- which is what
+  the same build in both arms reads like here. The second coding's sample is
+  the gear's whole cost.
+- **720 MiB, the knife edge:** the gear picked the raw tails in every rep of
+  both sittings this time (596 MB of form files against the fixed arm's 391),
+  where the record of its first pricing had the pick flipping with the
+  order. The raw-tail form faults a little in the mixes that grow the
+  process -- D 0.012-0.019 major faults an operation, E 0.011-0.015, F
+  0.004, A up to 0.0014, where the block form takes none -- and the cells
+  split by sitting: C 1.05 and 1.51, B 1.09 and 1.30, A 0.97 and 1.33, F 0.94
+  and 1.19, the read pass 0.97 and 1.06, scans 0.97 and 1.13, D 1.06 and
+  0.87, E 0.85 and 1.10 (over both sittings C 1.26, B 1.19, A 1.13, F 1.06,
+  scans 1.04, read 1.02, E 0.97, D 0.96). Nothing is resolved against the
+  gear; D and E pay the faults and read level, the point-read mixes gain.
+- **736 MiB, inside the window:** the gear picks the raw tails in every rep
+  and buys earlier, its saving's reading being the raw-tail form's cheaper
+  decode. In the first sitting the fixed arm built nothing in its median rep
+  and the default read 1.3-7.7x (C 7.7, B 3.8, D 2.5, A 2.2, F 1.8, scans
+  1.38, E 1.33, read 1.32); in the second both built and the fixed arm's
+  mixes faulted 0.04-0.17 an operation in B, C and D where the default's
+  took 0.0001-0.012, and the default read 1.27-5.5x (C 5.5, B 2.5, D 3.1, F
+  1.67, E 1.33, A 1.27, scans 1.20, read 1.16).
+
+So the margin stands as it is: at the edge the raw-tail form's few faults
+cost D and E nothing resolved and pay the read-heavy mixes, and widening it
+would give back the 736 MiB rung's gains to protect a cell that has not
+lost. Read any Auto pairing per sitting with the picks and `zpage_builds`
+beside the rates, as before.

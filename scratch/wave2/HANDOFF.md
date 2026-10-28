@@ -93,7 +93,11 @@ out of core" (5M keys under 640 MiB):
   under 1 GiB the form takes every cell.
 
 The open cell is E. A secondary one is the minute of raw reads before the
-install (the "gear shift"). In core, the default arms at `44389dc` gave no
+install (the "gear shift"). Under `Auto` the controller now picks the form
+files' coding (`Options::zpages_coding_auto`, on since `01f0771`): raw tails
+where that form fits, the block coding otherwise -- level at 640 MiB,
+unresolved either way at the 720 MiB edge, 1.2-7.7x at 736 (`stage4.md`, "The
+gear on by default"). In core, the default arms at `44389dc` gave no
 ground resolvable against `5df834c`, the last banked row: three sittings of
 the two binaries alternated put every family within a twentieth of level, F
 on the durable arm at 0.95 ±0.045 and unresolved (`stage4.md`, "Has the
