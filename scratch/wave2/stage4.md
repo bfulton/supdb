@@ -3840,3 +3840,17 @@ memory is, from room the bound leaves. On hot8 with the drop
 through (9,458 forms in A, 6,438 in F, 1,627 in B) and nothing faulted: E
 1.05, A 1.04, the rest level -- E's gain on that arm 1.17, 1.12, 1.07,
 1.10 and 1.05 across five sittings.
+
+At ten times the operations (`zbothlong-ab-{1,2}`, `--ops-div 1`, both
+orders), both codings against the LZ4 form with the drop: C 1.10 (ten
+pairs of twelve; 1.14 and 1.06 by sitting), B 1.14 (ten; 1.22 and 1.06), A
+1.08 (nine; 1.13 and 1.03), the read pass 1.08 and 1.12, D 1.05 (1.14 and
+0.97) -- and F 0.95 (0.99 and 0.90) and E 0.97 (1.01 and 0.94). At this
+length both arms fault in D, E and F, 0.03-0.09 major faults an operation,
+the mixes growing the process past the forms' room; the read-heavy Zipfian
+mixes, which fault nothing, take the raw tails' gain once the head is
+found, and the faulting mixes pay for the flips' prefetches on the device
+the faults already queue on. So the shape pays where the reads are the
+bottleneck and costs where the device is; a policy that holds its flips
+while the group refaults, and gives back only what lowers the bytes
+without prefetching what replaces them, is the lever the result names.
