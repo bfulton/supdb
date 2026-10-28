@@ -1,0 +1,79 @@
+bench ab: supdb-settlebuilds against supdb at 300000 keys, scans of 100, 5 pairs after a warmup
+mixkinds supdb-settlebuilds C size 300000 ops 50000 gets 50000 19.808 scans 0 0.000 commits 1 0.001 total 26.082
+mixkinds supdb-settlebuilds B size 300000 ops 50000 gets 47512 27.536 scans 0 0.000 commits 25 17.243 total 53.048
+mixkinds supdb-settlebuilds A size 300000 ops 50000 gets 25066 20.698 scans 0 0.000 commits 250 145.225 total 180.880
+mixkinds supdb-settlebuilds F size 300000 ops 50000 gets 50000 38.090 scans 0 0.000 commits 252 142.818 total 196.137
+mixkinds supdb-settlebuilds D size 300000 ops 50000 gets 47535 34.665 scans 0 0.000 commits 25 15.078 total 53.545
+mixkinds supdb-settlebuilds E size 300000 ops 50000 gets 0 0.000 scans 47478 61.706 commits 26 23.786 total 91.602
+mixkinds supdb C size 300000 ops 50000 gets 50000 14.612 scans 0 0.000 commits 1 0.001 total 19.282
+mixkinds supdb B size 300000 ops 50000 gets 47512 21.010 scans 0 0.000 commits 25 22.457 total 49.412
+mixkinds supdb A size 300000 ops 50000 gets 25066 17.118 scans 0 0.000 commits 250 149.307 total 180.019
+mixkinds supdb F size 300000 ops 50000 gets 50000 29.632 scans 0 0.000 commits 252 145.006 total 187.390
+mixkinds supdb D size 300000 ops 50000 gets 47535 38.171 scans 0 0.000 commits 25 20.358 total 63.508
+mixkinds supdb E size 300000 ops 50000 gets 0 0.000 scans 47478 66.202 commits 26 23.847 total 96.381
+    15s  rep 0/5 (warmup)
+mixkinds supdb C size 300000 ops 50000 gets 50000 14.598 scans 0 0.000 commits 1 0.000 total 19.033
+mixkinds supdb B size 300000 ops 50000 gets 47512 18.192 scans 0 0.000 commits 25 15.172 total 38.760
+mixkinds supdb A size 300000 ops 50000 gets 25066 13.894 scans 0 0.000 commits 250 115.672 total 140.602
+mixkinds supdb F size 300000 ops 50000 gets 50000 29.299 scans 0 0.000 commits 252 135.852 total 177.688
+mixkinds supdb D size 300000 ops 50000 gets 47535 35.056 scans 0 0.000 commits 25 14.148 total 52.920
+mixkinds supdb E size 300000 ops 50000 gets 0 0.000 scans 47478 63.955 commits 26 20.599 total 90.476
+mixkinds supdb-settlebuilds C size 300000 ops 50000 gets 50000 14.415 scans 0 0.000 commits 1 0.001 total 18.918
+mixkinds supdb-settlebuilds B size 300000 ops 50000 gets 47512 20.997 scans 0 0.000 commits 25 18.290 total 45.213
+mixkinds supdb-settlebuilds A size 300000 ops 50000 gets 25066 20.985 scans 0 0.000 commits 250 140.280 total 176.335
+mixkinds supdb-settlebuilds F size 300000 ops 50000 gets 50000 37.761 scans 0 0.000 commits 252 122.237 total 174.927
+mixkinds supdb-settlebuilds D size 300000 ops 50000 gets 47535 46.903 scans 0 0.000 commits 25 18.993 total 71.722
+mixkinds supdb-settlebuilds E size 300000 ops 50000 gets 0 0.000 scans 47478 71.009 commits 26 21.119 total 98.534
+    29s  rep 1/5
+mixkinds supdb-settlebuilds C size 300000 ops 50000 gets 50000 16.320 scans 0 0.000 commits 1 0.001 total 20.995
+mixkinds supdb-settlebuilds B size 300000 ops 50000 gets 47512 22.670 scans 0 0.000 commits 25 15.635 total 45.037
+mixkinds supdb-settlebuilds A size 300000 ops 50000 gets 25066 15.534 scans 0 0.000 commits 250 124.374 total 152.150
+mixkinds supdb-settlebuilds F size 300000 ops 50000 gets 50000 30.804 scans 0 0.000 commits 252 124.071 total 167.437
+mixkinds supdb-settlebuilds D size 300000 ops 50000 gets 47535 32.848 scans 0 0.000 commits 25 14.937 total 51.367
+mixkinds supdb-settlebuilds E size 300000 ops 50000 gets 0 0.000 scans 47478 71.554 commits 26 18.561 total 96.827
+mixkinds supdb C size 300000 ops 50000 gets 50000 15.508 scans 0 0.000 commits 1 0.001 total 20.112
+mixkinds supdb B size 300000 ops 50000 gets 47512 21.960 scans 0 0.000 commits 25 37.056 total 64.747
+mixkinds supdb A size 300000 ops 50000 gets 25066 17.326 scans 0 0.000 commits 250 159.464 total 190.460
+mixkinds supdb F size 300000 ops 50000 gets 50000 30.320 scans 0 0.000 commits 252 126.732 total 169.631
+mixkinds supdb D size 300000 ops 50000 gets 47535 34.584 scans 0 0.000 commits 25 11.829 total 50.274
+mixkinds supdb E size 300000 ops 50000 gets 0 0.000 scans 47478 61.735 commits 26 15.148 total 82.969
+    44s  rep 2/5
+mixkinds supdb C size 300000 ops 50000 gets 50000 15.191 scans 0 0.000 commits 1 0.000 total 20.110
+mixkinds supdb B size 300000 ops 50000 gets 47512 18.506 scans 0 0.000 commits 25 16.526 total 40.700
+mixkinds supdb A size 300000 ops 50000 gets 25066 17.521 scans 0 0.000 commits 250 142.795 total 175.787
+mixkinds supdb F size 300000 ops 50000 gets 50000 30.503 scans 0 0.000 commits 252 143.869 total 187.482
+mixkinds supdb D size 300000 ops 50000 gets 47535 37.441 scans 0 0.000 commits 25 23.086 total 64.836
+mixkinds supdb E size 300000 ops 50000 gets 0 0.000 scans 47478 66.126 commits 26 20.176 total 92.649
+mixkinds supdb-settlebuilds C size 300000 ops 50000 gets 50000 15.802 scans 0 0.000 commits 1 0.001 total 20.339
+mixkinds supdb-settlebuilds B size 300000 ops 50000 gets 47512 21.801 scans 0 0.000 commits 25 20.850 total 48.531
+mixkinds supdb-settlebuilds A size 300000 ops 50000 gets 25066 17.374 scans 0 0.000 commits 250 126.550 total 156.317
+mixkinds supdb-settlebuilds F size 300000 ops 50000 gets 50000 30.389 scans 0 0.000 commits 252 143.443 total 186.617
+mixkinds supdb-settlebuilds D size 300000 ops 50000 gets 47535 36.176 scans 0 0.000 commits 25 15.746 total 55.608
+mixkinds supdb-settlebuilds E size 300000 ops 50000 gets 0 0.000 scans 47478 93.829 commits 26 23.833 total 126.314
+    58s  rep 3/5
+mixkinds supdb-settlebuilds C size 300000 ops 50000 gets 50000 13.538 scans 0 0.000 commits 1 0.000 total 18.064
+mixkinds supdb-settlebuilds B size 300000 ops 50000 gets 47512 16.944 scans 0 0.000 commits 25 14.347 total 36.701
+mixkinds supdb-settlebuilds A size 300000 ops 50000 gets 25066 14.489 scans 0 0.000 commits 250 97.482 total 122.919
+mixkinds supdb-settlebuilds F size 300000 ops 50000 gets 50000 41.275 scans 0 0.000 commits 252 158.396 total 215.813
+mixkinds supdb-settlebuilds D size 300000 ops 50000 gets 47535 30.777 scans 0 0.000 commits 25 15.694 total 50.032
+mixkinds supdb-settlebuilds E size 300000 ops 50000 gets 0 0.000 scans 47478 59.462 commits 26 16.314 total 81.910
+mixkinds supdb C size 300000 ops 50000 gets 50000 14.811 scans 0 0.000 commits 1 0.001 total 19.346
+mixkinds supdb B size 300000 ops 50000 gets 47512 18.175 scans 0 0.000 commits 25 15.132 total 38.633
+mixkinds supdb A size 300000 ops 50000 gets 25066 16.014 scans 0 0.000 commits 250 131.583 total 159.932
+mixkinds supdb F size 300000 ops 50000 gets 50000 29.919 scans 0 0.000 commits 252 133.660 total 175.874
+mixkinds supdb D size 300000 ops 50000 gets 47535 32.186 scans 0 0.000 commits 25 16.116 total 51.758
+mixkinds supdb E size 300000 ops 50000 gets 0 0.000 scans 47478 57.663 commits 26 20.151 total 83.627
+    72s  rep 4/5
+mixkinds supdb C size 300000 ops 50000 gets 50000 14.482 scans 0 0.000 commits 1 0.001 total 19.015
+mixkinds supdb B size 300000 ops 50000 gets 47512 20.957 scans 0 0.000 commits 25 18.458 total 45.290
+mixkinds supdb A size 300000 ops 50000 gets 25066 20.088 scans 0 0.000 commits 250 197.930 total 232.285
+mixkinds supdb F size 300000 ops 50000 gets 50000 33.516 scans 0 0.000 commits 252 197.773 total 245.885
+mixkinds supdb D size 300000 ops 50000 gets 47535 41.375 scans 0 0.000 commits 25 22.560 total 68.604
+mixkinds supdb E size 300000 ops 50000 gets 0 0.000 scans 47478 69.210 commits 26 26.826 total 102.547
+mixkinds supdb-settlebuilds C size 300000 ops 50000 gets 50000 17.212 scans 0 0.000 commits 1 0.000 total 22.634
+mixkinds supdb-settlebuilds B size 300000 ops 50000 gets 47512 22.594 scans 0 0.000 commits 25 15.980 total 45.306
+mixkinds supdb-settlebuilds A size 300000 ops 50000 gets 25066 14.950 scans 0 0.000 commits 250 111.034 total 137.132
+mixkinds supdb-settlebuilds F size 300000 ops 50000 gets 50000 33.862 scans 0 0.000 commits 252 137.621 total 185.339
+mixkinds supdb-settlebuilds D size 300000 ops 50000 gets 47535 36.419 scans 0 0.000 commits 25 16.904 total 57.441
+mixkinds supdb-settlebuilds E size 300000 ops 50000 gets 0 0.000 scans 47478 66.349 commits 26 21.233 total 93.784
+    86s  rep 5/5

@@ -47,6 +47,9 @@
 //! - `ZFUZZ_SETTLEBUILDS=1`: the `z` store's commits near reads file their
 //!   batches and build the blocks they filed into, under a small cache
 //!   budget (`Options::forms_settle_every`, `forms_settle_builds`).
+//! - `ZFUZZ_BOTH=1`, with `ZFUZZ_ZPAGES`: the `z` store keeps both codings
+//!   of every partition and re-codes by exchanging them
+//!   (`Options::zpages_both`).
 //! - `ZFUZZ_NOPUT`, `ZFUZZ_NOBURST`: set, no puts, or no ordered bursts.
 //! - `ZFUZZ_SEEDKEY=1`: the store's first write is a key of its own, and
 //!   one goes ahead of every write of the empty key, so that no write of
@@ -307,6 +310,17 @@ fn opts_z(c: &Cfg) -> Options {
             o.scan_cache_bytes = 64 << 10;
             o.forms_to_fit = true;
         }
+    }
+    // Under `ZFUZZ_BOTH`, with the form forced, every partition keeps its
+    // form file in both codings and the re-code policy exchanges them
+    // (`Options::zpages_both`): the spares' builds, their collect beside the
+    // served file and their retirement with a merged segment, and whatever
+    // the reads heat into a flip, are read against the raw store.
+    if env_flag("ZFUZZ_BOTH") && env_flag("ZFUZZ_ZPAGES") {
+        o.zpages_recode = true;
+        o.zpages_recode_keep = true;
+        o.zpages_both = true;
+        o.zpages_drop_raw = true;
     }
     if env_flag("ZFUZZ_PROMOTE") && c.cache {
         o.promote_entries = 8;

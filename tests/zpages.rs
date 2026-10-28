@@ -7603,6 +7603,105 @@ fn a_kept_form_file_makes_every_later_recode_an_exchange() {
 }
 
 #[test]
+fn both_codings_are_built_at_write_time_and_the_policy_only_exchanges_them() {
+    // Under `Options::zpages_both` every served partition gets its form file
+    // in the other coding too, built once the served ones are in and kept
+    // unserved; from then on the policy chooses the raw-tailed set by heat
+    // and exchanges files, never building. Heat on one partition flips it;
+    // with room for one, heat moved to another flips the first back and the
+    // second in; a store at rest flips nothing. Every read, count and scan
+    // answers as the raw form does throughout.
+    let (dir, db, model, inject) = recode_store_with("both", 1 << 40, |o| {
+        o.zpages_recode_keep = true;
+        o.zpages_both = true;
+    });
+    let n = db.zpage_counts().form_files;
+    assert!(n >= 4, "partitions to choose from: {n}");
+    assert!(
+        recode_until(&db, |c| c.spare_files == n),
+        "a spare for every partition: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!((c.spare_builds, c.spare_failed), (n, 0), "{c:?}");
+    assert!(
+        codings(&db).iter().all(|c| !c),
+        "the served files as built, block-coded: {:?}",
+        codings(&db)
+    );
+    assert!(
+        c.spare_bytes > c.file_bytes,
+        "the spares raw-tailed, the larger: {c:?}"
+    );
+    let built = c.build_starts;
+    // The store's form with every partition block-coded.
+    let blocks = c.file_bytes;
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    // One hot partition: flipped to its raw tails at the look, no build.
+    // Heated before any check reads the store, so that it alone is past the
+    // floor at the look whatever the budget.
+    let first = keys_of_partition(&db, &model, 1);
+    heat_up(&db, &first, 20_000);
+    recode_look(&db, std::time::Duration::from_millis(200));
+    let c = db.zpage_counts();
+    assert!(
+        c.recode_flips >= 1 && c.build_starts == built,
+        "flipped, not built: {c:?}"
+    );
+    let coded = codings(&db);
+    assert!(
+        coded[1] && coded.iter().filter(|c| **c).count() == 1,
+        "the hot one alone raw-tailed: {coded:?}"
+    );
+    check(&db, &model, &keys, "flipped, spares kept");
+    check_scan(&db, &model, "flipped, spares kept");
+    // Room for one partition's raw tails and a half: the heat moved to
+    // another flips the first back and the second in, by exchange alone.
+    let extra = c.file_bytes - blocks;
+    let budget = blocks + extra + extra / 2;
+    inject.set_budget(budget);
+    let second = keys_of_partition(&db, &model, 3);
+    let mut looks = 0;
+    while !(codings(&db)[3] && !codings(&db)[1]) {
+        assert!(
+            looks < 60,
+            "no exchange in {looks} looks: {:?} {:?}",
+            db.zpage_counts(),
+            codings(&db)
+        );
+        heat_up(&db, &second, 20_000);
+        recode_look(&db, std::time::Duration::from_millis(200));
+        looks += 1;
+    }
+    let c = db.zpage_counts();
+    assert!(
+        c.file_bytes <= budget,
+        "the served files within the budget: {} > {budget}, {:?}",
+        c.file_bytes,
+        codings(&db)
+    );
+    let c = db.zpage_counts();
+    assert_eq!(c.build_starts, built, "nothing built while serving: {c:?}");
+    assert_eq!(c.recode_failed, 0, "{c:?}");
+    assert_eq!(c.fallbacks, 0, "no read fell back to the raw form: {c:?}");
+    check(&db, &model, &keys, "exchanged");
+    check_scan(&db, &model, "exchanged");
+    // At rest: the checks' reads taken into the heat at one look, then a
+    // minute with no read, and nothing flips.
+    recode_look(&db, std::time::Duration::from_millis(200));
+    let before = (codings(&db), db.zpage_counts().recode_flips);
+    recode_look(&db, std::time::Duration::from_secs(60));
+    recode_look(&db, std::time::Duration::from_millis(200));
+    assert_eq!(
+        (codings(&db), db.zpage_counts().recode_flips),
+        before,
+        "a store at rest flips nothing"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_partition_the_reads_have_left_gives_its_raw_tails_to_one_they_have_come_to() {
     // With room in the budget for one raw-tailed partition, the first one
     // heated is re-coded; heat moved to another, the policy gives the first

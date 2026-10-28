@@ -387,6 +387,15 @@ its partitions re-coded while served by what their decodes cost
 `supdb-cache64tofitzpagesrecodekeepdrop` the same with the form file a
 re-code replaced kept beside the served one, so that a partition's later
 re-codes exchange the two without a build (`Options::zpages_recode_keep`);
+`supdb-cache64tofitzpagesbothdrop` is that with both codings of every
+partition built at write time, the other beside each served file on the
+builder's thread, and the policy only exchanging them
+(`Options::zpages_both`);
+`supdb-settlebuilds`, `supdb-ingestsettlebuilds` and
+`supdb-cache64tofitautozpagessettlebuilds` are `supdb`, `supdb-ingest` and
+`supdb-cache64tofitautozpages` with every commit near reads filing its batch
+and building the blocks it filed into (`Options::forms_settle_every`,
+`forms_settle_builds`);
 `supdb-cache64tofitautozpagescodingauto` is the combined arm with the coding
 of its form files the selector's to choose (`Options::zpages_coding_auto`),
 the raw tails where the model predicts that form fits the budget and the

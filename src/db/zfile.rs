@@ -3454,6 +3454,10 @@ pub(super) struct ZEvents {
     pub recode_looks: AtomicU64,
     /// Re-codes made by exchanging the served form file with the kept one.
     pub recode_flips: AtomicU64,
+    /// Spares built and kept (`Options::zpages_both`), and spares that kept
+    /// nothing.
+    pub spare_builds: AtomicU64,
+    pub spare_failed: AtomicU64,
     /// Builds started on the builder's thread, and builds its cancel flag
     /// stopped: a merge took the target as an input, or the store closed.
     pub build_starts: AtomicU64,

@@ -585,3 +585,73 @@ fn a_commits_fill_builds_the_blocks_its_settle_filed_into() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// Under `Options::forms_settle_builds` the fill builds only while the
+/// memory group's file refaults hold still (`SettleRoom`), here the rate
+/// a test sets through the seam: none built while it reads past zero, and
+/// when it rises after some were built, the ones no scan has walked since
+/// are shed at the next fill. Every scan answers every write throughout.
+#[test]
+fn the_fills_build_only_while_the_refaults_hold_still() {
+    let dir = scratch("settle-room");
+    let inject = std::sync::Arc::new(supdb::ZInject::new());
+    inject.set_refault_rate(1000.0);
+    let mut db = Db::create(
+        &dir,
+        Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(64 << 10),
+            partition_on_flush: true,
+            publish_in_background: false,
+            upkeep: Upkeep::Inline,
+            scan_block_cache: true,
+            forms_settle_every: true,
+            forms_settle_builds: true,
+            scan_cache_bytes: 1 << 30,
+            zpages_inject: Some(inject.clone()),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let value = [b'v'; 100];
+    let keys: Vec<Vec<u8>> = (0..2000).map(|i| format!("k{i:05}").into_bytes()).collect();
+    let mut want = std::collections::BTreeMap::new();
+    for k in &keys {
+        db.put(k, &value);
+        want.insert(k.clone(), vec![value.to_vec()]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    for (lo, _) in &partition_fences(&dir) {
+        db.scan(lo, 1, |_, _| {}).unwrap();
+    }
+    let stretch =
+        |db: &mut Db, want: &mut std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>, at: usize| {
+            for round in 0..10usize {
+                for i in 0..3usize {
+                    let k = &keys[(round * 191 + i * 613 + at) % keys.len()];
+                    db.append(k, b"u");
+                    want.get_mut(k).unwrap().push(b"u".to_vec());
+                }
+                db.commit().unwrap();
+            }
+        };
+    // Refaulting: nothing built.
+    stretch(&mut db, &mut want, 300);
+    assert_eq!(db.settle_built(), 0, "no room, no build");
+    // Quiet: the stretch's blocks built.
+    inject.set_refault_rate(0.0);
+    stretch(&mut db, &mut want, 900);
+    let built = db.settle_built();
+    assert!(built > 0, "room, builds");
+    assert_eq!(db.settle_shed(), 0);
+    // Refaulting again: the next fill sheds what was built and not walked.
+    inject.set_refault_rate(1000.0);
+    stretch(&mut db, &mut want, 1500);
+    assert_eq!(db.settle_built(), built, "no room, no build");
+    assert!(db.settle_shed() > 0, "the unwalked forms shed");
+    assert!(scan_model(&db) == want, "the scan answers every write");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
