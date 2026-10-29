@@ -915,13 +915,11 @@ depends on the change.
   refuses `lz4_flex` on one damaged block of the full set, a pointer two past
   its output's end in `duplicate_overlapping` with nothing read or written
   there, so the tests skip `lz4_flex` under Miri.
-- The gate's checked compile of `tests/db.rs` read a `VmHWM` of 13,209 MiB
-  at the own decoder's commit, with `debug = 1`, against the tool group's
-  14,341,885,952-byte limit, whose `memory.max_usage_in_bytes` read the
-  limit itself: about 1% of headroom where `CLAUDE.md` records 7.0 GiB. It
-  survived; the next growth of the engine will have it killed. The checked
-  profile's codegen settings are the lever, measured by peak and by the
-  test group's time before anything moves.
+- The gate's checked compile of `tests/db.rs` had grown to a `VmHWM` of
+  13,209 MiB against the tool group's 13.36 GiB; the checked profile is
+  thin LTO over sixteen codegen units since `b7ce5c2`, 6,841 MiB in the
+  gate that landed it, the test group 40 minutes against 47 (`CLAUDE.md`,
+  running the checks).
 - Nothing is uncommitted.
 - The suite's `the_removal_arms_differ_from_their_default_in_the_one_option`
   overflows the test thread's stack in the dev profile at `3a885a9` already
