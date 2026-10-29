@@ -3981,3 +3981,56 @@ cost D and E nothing resolved and pay the read-heavy mixes, and widening it
 would give back the 736 MiB rung's gains to protect a cell that has not
 lost. Read any Auto pairing per sitting with the picks and `zpage_builds`
 beside the rates, as before.
+
+## The form's groups written by a parsing encoder in Rust (`zlz4`), priced
+
+The decode lever liblz4's high-compression mode had shown (fewer tokens, a
+sixth off the cold decode) needs no C: it is the encoder's search and parse,
+and the format is LZ4's. `src/db/zlz4.rs` is the encoder: a hash chain of
+every position, the longest match at each position a match may start at
+(sixteen chain positions, the walk ended by a match to the limit, the inside
+of a match of eight or more inserted and not searched but for its last three
+positions), and a shortest path over the group priced in the bytes it writes,
+a match tried at its longest and cut only onto a match among its last four
+positions that reaches past its end, and a match carried on from the
+position before and reached by a literal not tried at all, since the match
+before covers it for a byte less -- each of the three prunings exact on the
+form's groups to the byte. `Options::zpages_parse` (off) has the fill's
+block coding written by it; the builder decodes every group it writes as
+before.
+
+Probed on the form's own groups at a million keys (`zdecode --rhc`,
+`zrhc{,2,3}-1m.log`): 0.958 of the greedy encoder's bytes in 51.8 sequences a
+group against 62.1, the same as liblz4 at level 12 (0.958, 51.9), the cold
+decode through `lz4_flex` at 0.82-0.84 of the greedy payloads'. The first
+version took 90 µs a group, the search into every position of a long match
+and the parse's walk of every cut; a sequence priced over its bytes bought
+fewer sequences (43 at a price of 2) and a slower decode, the literals
+costing more than the tokens saved. As kept, 20-24 µs a group against
+`lz4_flex`'s 2.8-3.3, about seven times the encoder's CPU.
+
+Paired at five million keys under 640 MiB (`zparse5m-ab-{1,2}`, the forced
+form with the drop; `zparseauto5m-ab-{1,2}`, the shipping combined arm):
+
+- **Forced:** the form files at 0.958 of the bytes, the decodes the same
+  count. The mixes read E 1.04 and 1.11, F 1.13 and 1.09, the scan pass 1.06
+  and 1.13, C 1.07 and 1.00, B 1.03 and 0.91, A 0.98 and 1.08, D 0.97 and
+  1.19. The read pass right after the load reads 0.75 and 0.77 in every rep
+  of both sittings, with 0.015-0.017 major faults a read against none: the
+  load ends when the builds do, 7.0 s after its sync against 1.2, and over
+  the six seconds more the page cache under the bound turned over -- the
+  builds' own background reads 42x the greedy arm's, the records they read
+  evicted before they reached them, and form pages written early evicted
+  before the read pass, 69 bytes a read from the device.
+- **Auto:** both build nineteen files and install once; the mixes, which
+  decode a sixteenth as many groups through the combined arm's cache, read
+  level (E 1.03 and 0.99, C 0.99 and 1.08, A 1.05 and 0.98, D 1.00 and
+  1.04, F 0.89 and 1.01) but B, 0.94 and 0.91, and the scan pass 1.28 and
+  1.15.
+
+So the parse wins E, F and the scans on the forced form by its fewer tokens
+and loses the pass after a build by the build's length under the bound,
+and on the shipping arm resolves nothing. It is an arm, off
+(`supdb-cache64tofitzpagesdropparse`, `supdb-cache64tofitautozpagesparse`),
+until the encoder costs the build less; the decoder's half of liblz4's lead
+is a read-path lever with no build in it.

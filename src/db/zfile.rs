@@ -3916,6 +3916,9 @@ pub(super) struct BuildPlan {
     /// Under the record coding, every tail stored raw
     /// (`Options::zpages_raw_tails`, `FillScratch::raw_tails`).
     pub raw_tails: bool,
+    /// The block coding's groups written by the parsing encoder
+    /// (`Options::zpages_parse`, `FillScratch::parse`).
+    pub parse: bool,
     /// A build on a thread of its own looks here once a page: set, the
     /// build stops, removes its temp file and answers `Outcome::Cancelled`.
     /// A merge that takes the build's target as an input sets it.
@@ -3938,6 +3941,7 @@ impl BuildPlan {
             coding: ZCODING_BLOCK,
             store_all: false,
             raw_tails: false,
+            parse: false,
             cancel: None,
             hold: None,
         }
@@ -4124,6 +4128,7 @@ fn write_pages(
     scratch.coding = plan.coding;
     scratch.store_all = plan.store_all;
     scratch.raw_tails = plan.raw_tails;
+    scratch.parse = plan.parse;
     let mut verify_buf = GroupBuf::new();
     let mut fence = ZFence::new();
     let recs_at = recs.as_ptr() as usize - base;
@@ -4507,15 +4512,16 @@ pub(super) const SAMPLE_CHAIN: usize = 3;
 /// the partition is declined (`Options::zpages_min_bytes`).
 /// The fill's shape a sample and a build take from the options: the
 /// decoded bytes a group is cut at, the coding of the groups that compress,
-/// and whether every group is stored verbatim or every tail raw
-/// (`Options::zpages_group_bytes`, `z_coding`, `zpages_store_all`,
-/// `zpages_raw_tails`).
+/// whether every group is stored verbatim or every tail raw, and which
+/// encoder writes the block coding's groups (`Options::zpages_group_bytes`,
+/// `z_coding`, `zpages_store_all`, `zpages_raw_tails`, `zpages_parse`).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct FillShape {
     pub group_bytes: usize,
     pub coding: u8,
     pub store_all: bool,
     pub raw_tails: bool,
+    pub parse: bool,
 }
 
 impl Default for FillShape {
@@ -4525,6 +4531,7 @@ impl Default for FillShape {
             coding: ZCODING_BLOCK,
             store_all: false,
             raw_tails: false,
+            parse: false,
         }
     }
 }
@@ -4536,6 +4543,7 @@ impl FillShape {
         scratch.coding = self.coding;
         scratch.store_all = self.store_all;
         scratch.raw_tails = self.raw_tails;
+        scratch.parse = self.parse;
     }
 }
 
