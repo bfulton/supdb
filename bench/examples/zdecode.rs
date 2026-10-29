@@ -45,7 +45,14 @@
 //! learned, and fewer tokens is the one lever on that the form's writer
 //! holds. The split probe is skipped under it unless asked for.
 //!
-//!     cargo run --release --features lz4-c --example zdecode -- [--size N] [--rounds N] [--split k,...] [--pages N] [--count flex|c] [--hc LEVEL]
+//! `--rhc ATTEMPTS:SEQCOST:SKIP` recompresses every group the same way with
+//! the engine's own encoder (`supdb::db::zlz4`), the hash chain walked
+//! `ATTEMPTS` positions deep, each sequence priced `SEQCOST` bytes over its
+//! own and the inside of a match of `SKIP` or more not searched, and prices it as `--hc` does, with the encode's own time a
+//! group beside it. The summary counts the sequences a group's payload
+//! holds, the tokens a decoder parses, whichever encoder wrote it.
+//!
+//!     cargo run --release --features lz4-c --example zdecode -- [--size N] [--rounds N] [--split k,...] [--pages N] [--count flex|c] [--hc LEVEL] [--rhc ATTEMPTS:SEQCOST:SKIP]
 use std::hint::black_box;
 use std::path::Path;
 use std::time::Instant;
@@ -375,6 +382,7 @@ fn main() {
     let mut ks: Vec<usize> = vec![1, 2, 4, 8, 16];
     let mut split_given = false;
     let mut hc: Option<i32> = None;
+    let mut rhc: Option<(u32, u32, u32)> = None;
     let mut first: Option<usize> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -387,6 +395,12 @@ fn main() {
             // is made of, the predictor or the cache level the pages sit in.
             "--pages" => first = Some(val("a count").parse().expect("a count")),
             "--hc" => hc = Some(val("a level").parse().expect("a level")),
+            "--rhc" => {
+                let v = val("ATTEMPTS:SEQCOST:SKIP");
+                let f: Vec<u32> = v.split(':').map(|x| x.parse().expect("a count")).collect();
+                assert_eq!(f.len(), 3, "ATTEMPTS:SEQCOST:SKIP");
+                rhc = Some((f[0], f[1], f[2]));
+            }
             "--split" => {
                 split_given = true;
                 ks = val("a list")
@@ -465,14 +479,65 @@ fn main() {
             ks.clear();
         }
     }
+    if let Some((attempts, seq_cost, skip_min)) = rhc {
+        // The same recompression with the engine's own encoder, timed a
+        // group: the decode into the scratch first, outside the clock.
+        let before: usize = pages.iter().map(|p| p.payload.len()).sum();
+        let ulen_max = pages.iter().map(|p| p.ulen).max().unwrap();
+        let mut g = vec![0u8; ulen_max];
+        let mut out = vec![0u8; supdb::db::zlz4::max_output(ulen_max)];
+        let mut enc = supdb::db::zlz4::Encoder::new();
+        let effort = supdb::db::zlz4::Effort {
+            attempts,
+            seq_cost,
+            skip_min,
+        };
+        let mut enc_ns = 0u128;
+        let mut flex_ns = 0u128;
+        let mut flex_out = vec![0u8; lz4_flex::block::get_maximum_output_size(ulen_max)];
+        for p in pages.iter_mut() {
+            let n = flex(p, &mut g);
+            assert_eq!(n, p.ulen);
+            // The greedy encoder the fill has used, on the same group, for
+            // the build's price of the change.
+            let t = Instant::now();
+            black_box(lz4_flex::block::compress_into(&g[..p.ulen], &mut flex_out).unwrap());
+            flex_ns += t.elapsed().as_nanos();
+            let t = Instant::now();
+            let m = enc
+                .compress_into(&g[..p.ulen], &mut out, effort)
+                .expect("the engine's encoder");
+            enc_ns += t.elapsed().as_nanos();
+            if m < p.payload.len() {
+                p.payload = out[..m].to_vec();
+            }
+        }
+        let after: usize = pages.iter().map(|p| p.payload.len()).sum();
+        println!(
+            "rhc {attempts}:{seq_cost}:{skip_min}: {} compressed bytes recompressed to {} ({:.3} of the engine's), {:.2} us a group to encode, lz4_flex {:.2}",
+            before,
+            after,
+            after as f64 / before as f64,
+            enc_ns as f64 / 1e3 / pages.len() as f64,
+            flex_ns as f64 / 1e3 / pages.len() as f64
+        );
+        if !split_given {
+            ks.clear();
+        }
+    }
     let total_u: usize = pages.iter().map(|p| p.ulen).sum();
     let total_c: usize = pages.iter().map(|p| p.payload.len()).sum();
+    let seqs: usize = pages
+        .iter()
+        .map(|p| supdb::db::zlz4::sequences(&p.payload).expect("a block"))
+        .sum();
     println!(
-        "{} compressed bytes to {} decoded, {:.2} a group decoded, ratio {:.3}",
+        "{} compressed bytes to {} decoded, {:.2} a group decoded, ratio {:.3}, {:.1} sequences a group",
         total_c,
         total_u,
         total_u as f64 / pages.len() as f64,
-        total_c as f64 / total_u as f64
+        total_c as f64 / total_u as f64,
+        seqs as f64 / pages.len() as f64
     );
     let ulen_max = pages.iter().map(|p| p.ulen).max().unwrap();
     let mut a = vec![0u8; ulen_max];

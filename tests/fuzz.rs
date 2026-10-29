@@ -50,6 +50,9 @@
 //! - `ZFUZZ_BOTH=1`, with `ZFUZZ_ZPAGES`: the `z` store keeps both codings
 //!   of every partition and re-codes by exchanging them
 //!   (`Options::zpages_both`).
+//! - `ZFUZZ_PARSE=1`: the `z` store's block-coded groups are written by the
+//!   parsing encoder (`Options::zpages_parse`), a flag and not a draw, so
+//!   that every seed's operations are the ones it had without it.
 //! - `ZFUZZ_NOPUT`, `ZFUZZ_NOBURST`: set, no puts, or no ordered bursts.
 //! - `ZFUZZ_SEEDKEY=1`: the store's first write is a key of its own, and
 //!   one goes ahead of every write of the empty key, so that no write of
@@ -310,6 +313,12 @@ fn opts_z(c: &Cfg) -> Options {
             o.scan_cache_bytes = 64 << 10;
             o.forms_to_fit = true;
         }
+    }
+    // Under `ZFUZZ_PARSE` the form's block-coded groups are the parsing
+    // encoder's (`Options::zpages_parse`): the same format in other
+    // sequences, read against the raw store.
+    if env_flag("ZFUZZ_PARSE") {
+        o.zpages_parse = true;
     }
     // Under `ZFUZZ_BOTH`, with the form forced, every partition keeps its
     // form file in both codings and the re-code policy exchanges them

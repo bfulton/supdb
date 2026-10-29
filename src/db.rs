@@ -63,6 +63,12 @@ pub mod zselect;
 #[cfg(not(target_family = "wasm"))]
 #[doc(hidden)]
 pub mod zpages;
+// The form's LZ4 block encoder: a match search over a hash chain and a
+// parse priced in bytes and sequences, for groups of fewer tokens than the
+// greedy encoder writes. Public for the probe that prices it beside
+// liblz4's high-compression mode (`bench/examples/zdecode.rs`).
+#[doc(hidden)]
+pub mod zlz4;
 // The same form's engine side: the form file mapped, checked and read, the
 // cell a segment holds it in, and the builder. Private: it is the engine's
 // and nothing outside `db` names it.
@@ -1236,6 +1242,19 @@ pub struct Options {
     /// cache, against `supdb-cache64tofitzpages`.
     #[doc(hidden)]
     pub zpages_raw_tails: bool,
+    /// EXPERIMENT: the block coding's groups written by the engine's
+    /// parsing encoder (`db::zlz4`, `zlz4::Effort::SHIPPED`) and not
+    /// `lz4_flex`'s greedy one: the same block format, which any LZ4
+    /// decoder reads, in fewer and longer sequences -- a hash-chain search
+    /// for the longest match at each position and a shortest path over
+    /// the group priced in the bytes it writes. On the form's own groups it
+    /// writes 0.96 of the greedy encoder's bytes in 0.84 of its sequences,
+    /// as liblz4's high-compression mode does, and the cold decode is a
+    /// sixth faster for the fewer tokens, at about seven times the
+    /// encoder's CPU, which is the builder's (`bench/examples/zdecode.rs`,
+    /// `--rhc`). Off; the record coding's tails keep `lz4_flex`.
+    #[doc(hidden)]
+    pub zpages_parse: bool,
     /// EXPERIMENT: the allocator trimmed once (`malloc_trim`) at the end of
     /// `zpages_settle`, after every partition has its form file: what the
     /// builds' threads and the load left free in their arenas is given back
@@ -2911,6 +2930,7 @@ impl Default for Options {
             zpages_record_coding: false,
             zpages_store_all: false,
             zpages_raw_tails: false,
+            zpages_parse: false,
             zpages_trim_install: false,
             upkeep_trim_look: false,
             trim_by_resident: false,
@@ -27156,6 +27176,7 @@ impl Db {
                 plan.coding = self.opts.z_coding();
                 plan.store_all = self.opts.zpages_store_all;
                 plan.raw_tails = self.opts.zpages_raw_tails;
+                plan.parse = self.opts.zpages_parse;
                 plan
             })
         };
@@ -34517,6 +34538,7 @@ impl Maint {
         let coding = self.opts.z_coding();
         let store_all = self.opts.zpages_store_all;
         let raw_tails = self.opts.zpages_raw_tails;
+        let parse = self.opts.zpages_parse;
         // Where the selector chooses the coding, the raw-tail record coding
         // is sized beside the options' (`zselect::choose_coding`).
         let second = (self.opts.zpages_coding_auto && !raw_tails && !store_all).then_some(
@@ -34525,6 +34547,7 @@ impl Maint {
                 coding: zpages::ZCODING_RECORD,
                 store_all: false,
                 raw_tails: true,
+                parse,
             },
         );
         let wake = self.wake.clone();
@@ -34552,6 +34575,7 @@ impl Maint {
                             coding,
                             store_all,
                             raw_tails,
+                            parse,
                         });
                         let r2 = second.map(take);
                         (s, r, r2)
@@ -35307,6 +35331,7 @@ impl Maint {
         plan.coding = coding;
         plan.store_all = self.opts.zpages_store_all;
         plan.raw_tails = raw_tails;
+        plan.parse = self.opts.zpages_parse;
         if raw_tails {
             zfile::ZEvents::add(&ev.builds_raw_tails, 1);
         }

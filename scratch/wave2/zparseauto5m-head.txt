@@ -1,0 +1,22 @@
+ff6c23c
+ M bench/DESIGN.md
+ M bench/examples/zdecode.rs
+ M bench/src/engines.rs
+ M src/db.rs
+ M src/db/zfile.rs
+ M src/db/zpages.rs
+ M tests/fuzz.rs
+ M tests/zpages.rs
+?? scratch/wave2/zparse5m-ab-1.err
+?? scratch/wave2/zparse5m-ab-1.out
+?? scratch/wave2/zparse5m-ab-2.err
+?? scratch/wave2/zparse5m-ab-2.out
+?? scratch/wave2/zparse5m-build.log
+?? scratch/wave2/zparse5m-head.txt
+?? scratch/wave2/zparseauto5m-build.log
+?? scratch/wave2/zparseauto5m-head.txt
+?? scratch/wave2/zrhc-1m.log
+?? scratch/wave2/zrhc2-1m.log
+?? scratch/wave2/zrhc3-1m.log
+?? src/db/zlz4.rs
+2026-10-29T00:37:13Z

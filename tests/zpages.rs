@@ -7959,3 +7959,81 @@ fn a_form_stored_whole_answers_as_the_compressed_one_and_decodes_nothing() {
         "the memo and the trim change nothing of the file: {bytes:?}"
     );
 }
+
+/// The block coding's groups written by the parsing encoder
+/// (`Options::zpages_parse`): the same format in fewer sequences, so the
+/// form answers every read, count and scan as the greedy encoder's does,
+/// through the same decoder, and its files are smaller; the builder's own
+/// check decodes every group it writes against the records, so a group the
+/// encoder got wrong would have failed the build. The values are the shape
+/// the parse wins on, many short matches: half random bytes and half words
+/// of four to seven letters drawn from a dozen, where the motif
+/// `suite_value` repeats is one long match either encoder finds.
+#[test]
+fn a_form_the_parsing_encoder_wrote_answers_as_the_greedy_ones_in_fewer_bytes() {
+    const WORDS: [&[u8]; 12] = [
+        b"oak ", b"birch ", b"pine ", b"elm ", b"cedar ", b"fir ", b"ash ", b"larch ", b"maple ",
+        b"yew ", b"alder ", b"beech ",
+    ];
+    let mut bytes = Vec::new();
+    for parse in [false, true] {
+        let what = format!("parse {parse}");
+        let dir = scratch(&format!("parse-{parse}"));
+        let mut db = Db::create(
+            &dir,
+            forced(|o| {
+                o.partition_bytes = Some(160 << 10);
+                o.zpages_parse = parse;
+            }),
+        )
+        .unwrap();
+        let mut rng = Rng(0x9A25);
+        let mut model = Model::new();
+        for chunk in (0..5000).collect::<Vec<_>>().chunks(500) {
+            for &i in chunk {
+                let k = spaced_key(i);
+                let mut v: Vec<u8> = (0..50).map(|_| (rng.next() >> 24) as u8).collect();
+                while v.len() < 100 {
+                    v.extend_from_slice(WORDS[rng.below(WORDS.len())]);
+                }
+                v.truncate(100);
+                db.append(&k, &v);
+                model.insert(k, vec![v]);
+            }
+            db.commit().unwrap();
+        }
+        db.flush().unwrap();
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert!(c.form_files >= 3, "{what}: the form files: {c:?}");
+        assert_eq!(c.build_failed, 0, "{what}: every build verified: {c:?}");
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        check(&db, &model, &keys, &what);
+        check_scan(&db, &model, &what);
+        for (i, limit) in [(1234usize, 70usize), (0, 3), (4990, 40)] {
+            same_window(
+                &scanned(&db, &keys[i], limit),
+                &window(&model, &keys[i], limit),
+                &what,
+            );
+        }
+        let c = db.zpage_counts();
+        assert!(
+            c.reads > 0 && c.decodes > 0,
+            "{what}: read and decoded: {c:?}"
+        );
+        assert_eq!(c.fallbacks, 0, "{what}: nothing fell back to the raw form");
+        bytes.push(
+            form_files(&dir)
+                .iter()
+                .map(|p| std::fs::metadata(p).unwrap().len())
+                .sum::<u64>(),
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert!(
+        bytes[1] < bytes[0],
+        "the parsing encoder's form is the smaller: {bytes:?}"
+    );
+}

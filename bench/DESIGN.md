@@ -396,6 +396,10 @@ builder's thread, and the policy only exchanging them
 `supdb-cache64tofitautozpages` with every commit near reads filing its batch
 and building the blocks it filed into (`Options::forms_settle_every`,
 `forms_settle_builds`);
+`supdb-cache64tofitzpagesdropparse` and `supdb-cache64tofitautozpagesparse`
+are the forced form with the drop and the combined arm with their
+block-coded groups written by the engine's parsing encoder
+(`Options::zpages_parse`), the same block format in fewer sequences;
 `supdb-cache64tofitautozpagescodingfixed` is the combined arm with the coding
 of its form files the options' block coding wherever the controller builds
 (`Options::zpages_coding_auto` off), where the default's selector picks the

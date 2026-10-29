@@ -93,7 +93,13 @@ out of core" (5M keys under 640 MiB):
   under 1 GiB the form takes every cell.
 
 The open cell is E. A secondary one is the minute of raw reads before the
-install (the "gear shift"). Under `Auto` the controller now picks the form
+install (the "gear shift"). The form's groups may be written by a parsing
+encoder in Rust (`Options::zpages_parse`, off; `src/db/zlz4.rs`): liblz4's
+high-compression output in pure Rust, 0.96 of the bytes in 0.84 of the
+sequences, E and F 4-13% faster on the forced form, but seven times the
+encoder's CPU, which lengthens a build and under the bound costs the pass
+after it a quarter (`stage4.md`, "The form's groups written by a parsing
+encoder"). Under `Auto` the controller now picks the form
 files' coding (`Options::zpages_coding_auto`, on since `01f0771`): raw tails
 where that form fits, the block coding otherwise -- level at 640 MiB,
 unresolved either way at the 720 MiB edge, 1.2-7.7x at 736 (`stage4.md`, "The

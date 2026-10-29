@@ -1696,6 +1696,12 @@ pub struct FillScratch {
     /// one (`Options::zpages_raw_tails`): the heads front-coded, the values
     /// the records' own bytes, a decode a copy a record.
     pub raw_tails: bool,
+    /// The block coding's groups written by the parsing encoder
+    /// (`Options::zpages_parse`, `super::zlz4`) and not `lz4_flex`'s greedy
+    /// one: the same format in fewer sequences.
+    pub parse: bool,
+    /// That encoder's tables, made at its first group.
+    parser: Option<Box<super::zlz4::Encoder>>,
     /// What has been done with this scratch.
     pub stats: FillStats,
 }
@@ -1725,6 +1731,8 @@ impl FillScratch {
             coding: ZCODING_BLOCK,
             store_all: false,
             raw_tails: false,
+            parse: false,
+            parser: None,
             stats: FillStats::default(),
         }
     }
@@ -1834,7 +1842,17 @@ impl FillScratch {
                 return Some((n, true));
             }
         }
-        let n = lz4_flex::block::compress_into(&self.imgs[..ulen], &mut self.out).ok()?;
+        let n = if self.parse {
+            self.parser
+                .get_or_insert_with(|| Box::new(super::zlz4::Encoder::new()))
+                .compress_into(
+                    &self.imgs[..ulen],
+                    &mut self.out,
+                    super::zlz4::Effort::SHIPPED,
+                )?
+        } else {
+            lz4_flex::block::compress_into(&self.imgs[..ulen], &mut self.out).ok()?
+        };
         Some((n, false))
     }
 

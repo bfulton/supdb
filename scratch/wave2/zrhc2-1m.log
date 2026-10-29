@@ -1,0 +1,12 @@
+=== zdecode --size 1000000 --rounds 11 --rhc 64:0
+rhc 64:0: 73564962 compressed bytes recompressed to 70492512 (0.958 of the engine's), 87.90 us a group to encode
+70492512 compressed bytes to 124000000 decoded, 1662.47 a group decoded, ratio 0.568, 51.8 sequences a group
+cycle (11 rounds over 74588 groups): lz4_flex 627 ns a group (0.377 ns a byte), liblz4 529 ns a group (0.318 ns a byte); liblz4 at 0.84 of lz4_flex
+=== zdecode --size 1000000 --rounds 11 --rhc 16:0
+rhc 16:0: 73564962 compressed bytes recompressed to 70500269 (0.958 of the engine's), 82.19 us a group to encode
+70500269 compressed bytes to 124000000 decoded, 1662.47 a group decoded, ratio 0.569, 51.8 sequences a group
+cycle (11 rounds over 74588 groups): lz4_flex 641 ns a group (0.385 ns a byte), liblz4 531 ns a group (0.320 ns a byte); liblz4 at 0.83 of lz4_flex
+=== zdecode --size 1000000 --rounds 11 --hc 9
+hc 9: 73564962 compressed bytes recompressed to 70521948 (0.959 of the engine's) in 1.12 s
+70521948 compressed bytes to 124000000 decoded, 1662.47 a group decoded, ratio 0.569, 51.7 sequences a group
+cycle (11 rounds over 74588 groups): lz4_flex 672 ns a group (0.404 ns a byte), liblz4 581 ns a group (0.349 ns a byte); liblz4 at 0.86 of lz4_flex

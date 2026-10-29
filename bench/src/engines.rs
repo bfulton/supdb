@@ -903,6 +903,12 @@ pub struct Supdb {
     /// `supdb-cache64tofitzpagesdrop` and `supdb-cache64tofitzpageshot4drop`
     /// against the same without.
     zdropraw: bool,
+    /// The block coding's groups written by the parsing encoder
+    /// (`Options::zpages_parse`): `supdb-cache64tofitzpagesdropparse`
+    /// against `supdb-cache64tofitzpagesdrop`, and
+    /// `supdb-cache64tofitautozpagesparse` against
+    /// `supdb-cache64tofitautozpages`.
+    zparse: bool,
     /// Its partitions re-coded while served by what their decodes cost
     /// (`Options::zpages_recode`): `supdb-cache64tofitzpagesrecodedrop`
     /// against `supdb-cache64tofitzpagesdrop` and the key-order arms.
@@ -1440,6 +1446,9 @@ struct Policy {
     /// Its raw pages dropped behind the form (`Options::zpages_drop_raw`):
     /// `supdb-cache64tofitzpagesdrop`, `supdb-cache64tofitzpageshot4drop`.
     zdropraw: bool,
+    /// Its block-coded groups the parsing encoder's (`Options::zpages_parse`):
+    /// `supdb-cache64tofitzpagesdropparse`, `supdb-cache64tofitautozpagesparse`.
+    zparse: bool,
     /// Its partitions re-coded while served (`Options::zpages_recode`):
     /// `supdb-cache64tofitzpagesrecodedrop`.
     zrecode: bool,
@@ -1582,6 +1591,7 @@ impl Default for Policy {
             zpages_buildeager: false,
             zcacheraw: false,
             zcodingfixed: false,
+            zparse: false,
             zpromote: 0,
             zgroup: None,
             zprebuild: false,
@@ -4545,6 +4555,43 @@ impl Supdb {
         )
     }
 
+    /// `supdb-cache64tofitzpagesdrop` with its block-coded groups written by
+    /// the parsing encoder (`Options::zpages_parse`),
+    /// `supdb-cache64tofitzpagesdropparse`: the same block format in fewer
+    /// sequences, priced on the forced form where nothing but the coding
+    /// differs.
+    pub fn create_cache64_tofit_zpages_drop_parse(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages: true,
+                zdropraw: true,
+                zparse: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cache64tofitautozpages` with its block-coded groups written by
+    /// the parsing encoder (`Options::zpages_parse`),
+    /// `supdb-cache64tofitautozpagesparse`: the shipping combined arm, where
+    /// the encoder's price is the builder's and the build is the install's
+    /// wait.
+    pub fn create_cache64_tofit_auto_zpages_parse(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages_auto: true,
+                zparse: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-cache64tofitzpageshot4` with the raw pages dropped behind the
     /// form (`Options::zpages_drop_raw`), `supdb-cache64tofitzpageshot4drop`:
     /// whether the room makes the four raw-tailed partitions fit the
@@ -5100,6 +5147,7 @@ impl Supdb {
             ztrimresident,
             zhotfirst,
             zdropraw,
+            zparse,
             zrecode,
             zrecodekeep,
             settleevery,
@@ -5360,6 +5408,7 @@ impl Supdb {
             zpages_build_eager: zpages_buildeager,
             zpages_block_cache: !zcacheraw,
             zpages_coding_auto: !zcodingfixed,
+            zpages_parse: zparse,
             promote_entries: zpromote,
             zpages_promote_copies: zpromote > 0,
             zpages_group_bytes: zgroup.unwrap_or(supdb::Options::default().zpages_group_bytes),
@@ -5583,6 +5632,7 @@ impl Supdb {
             ztrimresident,
             zhotfirst,
             zdropraw,
+            zparse,
             zrecode,
             zrecodekeep,
             settleevery,
@@ -5678,6 +5728,8 @@ impl Engine for Supdb {
             }
             return if self.settlebuilds {
                 "supdb-cache64tofitautozpagessettlebuilds"
+            } else if self.zparse {
+                "supdb-cache64tofitautozpagesparse"
             } else if self.zcacheraw {
                 "supdb-cache64tofitautozpagesraw"
             } else if self.zpromote > 0 {
@@ -5741,6 +5793,8 @@ impl Engine for Supdb {
                 "supdb-cache64tofitzpageshot4drop"
             } else if self.zhotfirst == 4 {
                 "supdb-cache64tofitzpageshot4"
+            } else if self.zdropraw && self.zparse {
+                "supdb-cache64tofitzpagesdropparse"
             } else if self.zdropraw {
                 "supdb-cache64tofitzpagesdrop"
             } else if self.zhotfirst == 1 {
@@ -7291,6 +7345,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache64tofitzpageshot4"
         | "supdb-cache64tofitzpageshot1"
         | "supdb-cache64tofitzpagesdrop"
+        | "supdb-cache64tofitzpagesdropparse"
         | "supdb-cache64tofitzpageshot4drop"
         | "supdb-cache64tofitzpageshot8drop"
         | "supdb-cache64tofitzpageshot8dropsettleevery"
@@ -7313,6 +7368,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache256tofitautozpages"
         | "supdb-cache64tofitautozpagesraw"
         | "supdb-cache64tofitautozpagescodingfixed"
+        | "supdb-cache64tofitautozpagesparse"
         | "supdb-cache64tofitautozpagessettlebuilds"
         | "supdb-cache64tofitautozpagespromote"
         | "supdb-cache64tofitautozpagesonegroup"
@@ -7538,6 +7594,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cache64tofitzpageshot4" => Box::new(Supdb::create_cache64_tofit_zpages_hot4(dir)?),
         "supdb-cache64tofitzpageshot1" => Box::new(Supdb::create_cache64_tofit_zpages_hot1(dir)?),
         "supdb-cache64tofitzpagesdrop" => Box::new(Supdb::create_cache64_tofit_zpages_drop(dir)?),
+        "supdb-cache64tofitzpagesdropparse" => {
+            Box::new(Supdb::create_cache64_tofit_zpages_drop_parse(dir)?)
+        }
         "supdb-cache64tofitzpageshot4drop" => {
             Box::new(Supdb::create_cache64_tofit_zpages_hot4_drop(dir)?)
         }
@@ -7587,6 +7646,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         }
         "supdb-cache64tofitautozpagescodingfixed" => {
             Box::new(Supdb::create_cache64_tofit_auto_zpages_codingfixed(dir)?)
+        }
+        "supdb-cache64tofitautozpagesparse" => {
+            Box::new(Supdb::create_cache64_tofit_auto_zpages_parse(dir)?)
         }
         "supdb-cache64tofitautozpagespromote" => {
             Box::new(Supdb::create_cache64_tofit_auto_zpages_promote(dir)?)
@@ -8590,6 +8652,70 @@ mod tests {
         drop(opened);
         drop(arm);
         drop(base);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The parsing encoder's arms are their bases with `Options::zpages_parse`
+    /// and nothing else: named, durable like them, opened under their names
+    /// by the dispatch, and the engine's default off.
+    #[test]
+    fn the_parsing_encoders_arms_differ_from_their_bases_in_the_encoder_alone() {
+        let root = std::env::temp_dir().join(format!("supdb-bench-zparse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(!supdb::Options::default().zpages_parse);
+        for (name, make, base_name, base_make) in [
+            (
+                "supdb-cache64tofitzpagesdropparse",
+                Supdb::create_cache64_tofit_zpages_drop_parse as fn(&Path) -> Res<Supdb>,
+                "supdb-cache64tofitzpagesdrop",
+                Supdb::create_cache64_tofit_zpages_drop as fn(&Path) -> Res<Supdb>,
+            ),
+            (
+                "supdb-cache64tofitautozpagesparse",
+                Supdb::create_cache64_tofit_auto_zpages_parse,
+                "supdb-cache64tofitautozpages",
+                Supdb::create_cache64_tofit_auto_zpages,
+            ),
+        ] {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            let arm = make(&d).unwrap();
+            let bd = root.join(base_name);
+            std::fs::create_dir_all(&bd).unwrap();
+            let base = base_make(&bd).unwrap();
+            assert_eq!(arm.name(), name);
+            assert_eq!(base.name(), base_name);
+            assert_eq!(guarantee(arm.name()), guarantee(base.name()));
+            assert_eq!(arm.features(), base.features());
+            let (a, b) = (
+                arm.db.as_ref().unwrap().options(),
+                base.db.as_ref().unwrap().options(),
+            );
+            assert!(a.zpages_parse && !b.zpages_parse, "{name}: the one option");
+            assert_eq!(
+                (
+                    a.zpages,
+                    a.zpages_drop_raw,
+                    a.zpages_coding_auto,
+                    a.scan_cache_bytes,
+                    a.forms_to_fit
+                ),
+                (
+                    b.zpages,
+                    b.zpages_drop_raw,
+                    b.zpages_coding_auto,
+                    b.scan_cache_bytes,
+                    b.forms_to_fit
+                ),
+                "{name}: the rest as {base_name}'s"
+            );
+            drop(arm);
+            drop(base);
+            let od = root.join(format!("{name}-open"));
+            std::fs::create_dir_all(&od).unwrap();
+            let opened = open(name, &od, 1).unwrap();
+            assert_eq!(opened.name(), name);
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
