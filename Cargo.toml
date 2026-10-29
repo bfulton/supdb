@@ -41,9 +41,15 @@ debug = true
 # is line tables here, as in the suite's manifest: a backtrace names its
 # lines with those, and the full information doubled the memory of the
 # fat-LTO compile of `tests/db.rs`, which outgrew what a build has here
-# (CLAUDE.md, running the checks). It changes no code.
+# (CLAUDE.md, running the checks). It changes no code. Thin LTO over
+# sixteen codegen units for the same reason: the one unit of release
+# made `tests/db.rs` a single codegen of 13.2 GiB against a group of
+# 13.4, with LTO off as with it, and sixteen units under thin LTO build
+# it at 6.8 in the same time, the tests running 2% longer.
 [profile.checked]
 inherits = "release"
 overflow-checks = true
 debug-assertions = true
 debug = 1
+lto = "thin"
+codegen-units = 16

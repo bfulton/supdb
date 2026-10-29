@@ -80,8 +80,8 @@ eight tests of one run, one of them in six runs alone, before a syscall
 trace showed the store's directory gone and nothing in the process that
 removed it.
 
-A checked-profile compile of `tests/db.rs` is fat LTO over the engine
-and two hundred tests in one codegen unit, and the tool cgroup that
+A checked-profile compile of `tests/db.rs` is the engine's tests, two
+hundred of them, at opt-level 3, and the tool cgroup that
 every agent and shell here shares holds fourteen gigabytes
 (`memory.limit_in_bytes` of the `claude-code-bash` group, 13.4 GiB): a
 second compile at once gets its `rustc` killed with `could not compile`
@@ -100,7 +100,14 @@ two minutes, where the debug info is emitted, and the same compile with
 line tables alone peaked at 7.0 GiB in 17 minutes against 13.2 in 24, so
 the checked profile asks for line tables (`debug = 1`), which is what a
 backtrace needs to name a line and what the suite's manifest already
-asks for. The gate script that ran the stress on the binaries left on
+asks for. It grew back: at the commit that made the engine's own LZ4
+decoder the default the same compile read 13.2 GiB with line tables,
+the group's peak at its limit, and LTO was not it -- with LTO off the
+compile was killed at 13.6, since the one codegen unit the release
+profile asks for is the whole test crate's codegen at once. Sixteen
+units under fat LTO read 10.2; under thin LTO 6.8, in the same 35
+minutes, the test group's run 259 s against 254, so the checked profile
+asks for thin LTO and sixteen units. The gate script that ran the stress on the binaries left on
 disk from the tree before, and reported their verdict, exits when the
 build failed now; and a checked compile that dies is read in `dmesg`
 and sampled before it is read as another process's.
