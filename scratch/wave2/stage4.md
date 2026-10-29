@@ -4034,3 +4034,140 @@ and on the shipping arm resolves nothing. It is an arm, off
 (`supdb-cache64tofitzpagesdropparse`, `supdb-cache64tofitautozpagesparse`),
 until the encoder costs the build less; the decoder's half of liblz4's lead
 is a read-path lever with no build in it.
+
+## The engine's own LZ4 decoder, first pairing
+
+`zlz4::decompress_into` (`Options::zpages_own_decoder`, off): liblz4's fast
+loop in Rust, safe on any input. In the decode probe (`zdec{,2,3,4}-1m.log`)
+the safe-slice version ran 1.38x `lz4_flex`'s cold decode; over raw pointers
+with the bounds checked once a turn it ran level; with the short sequence's
+fixed moves, the limits hoisted, the long match moved thirty-two a turn and a
+long run under forty-eight three fixed moves, 0.90-0.95 of `lz4_flex` and
+1.02-1.10 of liblz4 cold, but 0.99-1.09 of `lz4_flex` hot, at 4,460
+instructions a group against `lz4_flex`'s 4,109 and liblz4's 3,435
+(callgrind over the probe's `--count`). Paired at five million keys under
+640 MiB (`zowndec5m-ab-{1,2}`, the forced form with the drop;
+`zowndecauto5m-ab-{1,2}`, the combined arm): forced, E 1.01 in both sittings
+and the rest within the sittings' noise; combined, E 0.88 and 0.93, its scans
+10% longer by `mixkinds` in both sittings. The combined arm's E decodes 13.5
+million groups a run through the form file's scan (`zpage_scan_groups`,
+`zpage_memo_misses`), the Zipfian head's groups over and over, hot, where the
+instruction count decides and the decoder's lead on cold input does not
+apply. The arm stays off; the instructions are the lever.
+
+## The decoder under liblz4's instructions, and what a cold decode is made of
+
+Three changes to `zlz4`'s fast loop, each counted by callgrind over the
+decode probe's `--count` at three hundred thousand keys (21,624 groups, 1.34
+million sequences), the engine's shape (the payload with the rest of its
+page after it, the output with its slack):
+
+- The turn split in two straight halves by the lengths the form's groups
+  have (`zdecode`'s histograms: 26.7% of runs fifteen or longer, 95% of
+  those under sixty-four and most at 48-63; 38.5% of matches nineteen or
+  longer, 80% of those under thirty-two): a long run of sixty-four or fewer
+  four fixed moves, a long match two and a loop past thirty-two.
+  79.1 million instructions, from 90.6.
+- A block with `PAD_IN` (64) readable bytes after it runs the loop with no
+  input bound: every length byte is read inside the block, so a turn starts
+  at most a byte past it and reads at most forty-nine past it, and the end
+  is found after each run as before. 77% of the suite's groups have that
+  much of their page after them; the rest, the page's last group, run the
+  bounded loop, whose turn asks eighteen readable bytes now (the token, a
+  move of sixteen, an offset) and not thirty-two. The long run's and the
+  long match's room one compare each. 75.6 million.
+- The rare paths out of line: the move of a run past sixty-four, which the
+  compiler had made a call to `memcpy`, and the match from under eight
+  back. Inline, the registers the call needs had the output's base spilled
+  to the stack and reloaded twice a turn. 72.5 million.
+
+72.5 against liblz4's 74.3 and `lz4_flex`'s 88.9: 3,355 instructions a
+group, 3,438 and 4,112. Cycling the file's 74,588 groups (`zdec7-1m.log`):
+0.86-0.88 of `lz4_flex` and 0.96-1.00 of liblz4, and on the parse
+encoder's blocks 0.84-0.86 and 0.98-0.99. Hot, level with liblz4 within the
+sitting's noise, which ran `lz4_flex`'s hot figure from 276 to 500 ns.
+
+Refuted, the flat loop: each turn's length byte read whether or not the run
+has one and taken by a select, the run moved sixty-four bytes and the match
+forty-eight whatever their lengths, so a turn's only branches on the data
+are the rare ones. Callgrind's branch model counts 1.10 million mispredicts
+in the padded loop's decode, 0.82 a sequence, 382 thousand on "a run of
+fifteen or more" and 521 thousand on "a match of nineteen or more" (liblz4
+1.34 million, `lz4_flex` 1.78), and the flat loop takes those two away.
+Cycling, it read 0.86 of `lz4_flex` against the padded loop's 0.87 over the
+whole file and level at 4, 64, 1,024 and 8,192 groups (`zdec6-pages.log`);
+hot, 6-100% slower, two to four more stores a turn. So on this machine the
+two branches are not what a cold decode pays for, or their misses cost what
+the flat loop's stores cost. And cycling four groups that sit in L1 costs
+twice the hot figure for every decoder, the flat one included: the cold
+excess is neither cache misses nor the length branches. With no PMU here,
+what is left -- the memory-dependence predictor, the other decoders' code
+between the cycle's turns -- cannot be told apart, and the realistic figure
+is the cycle over the whole file, where the engine's own code runs between
+decodes as the other decoders do here.
+
+The decoder is no longer the process's. The first version set a global at
+each store's open, so the last store opened decided for every store, and a
+test that asserted the global after its own open raced every other test of
+its binary that opened one. A form file takes the choice at its attach
+(`ZFile::own_decoder`), the build checks its pages through the same decoder
+(`BuildPlan::own_decode`, `FillScratch::own_decode`, `verify_page_with`) and
+so does the sampler that times a decode for the selector
+(`FillShape::own_decode`); `ZCounts::own_decoder_files` says which a store's
+form files take, and the engine test holds two stores open side by side to
+their own options, red with the attach's assignment taken away. Every page
+`check_build` sees -- every fill test's -- decodes through both decoders to
+its records, the page's last group with no more of its page after it than
+the fill left. The differential fuzz takes `ZFUZZ_OWNDEC=1`.
+
+Under Miri (nightly, `cargo miri test --lib`), the decoder's tests over
+every case of 2 KB or less -- each block an encoder writes decoded exact,
+roomy and with tails of 1 to 200 bytes, and the damage test's blocks, each
+damaged eight ways and decoded with tails of 0xEE and 0xFF that a length
+read past the block would take -- report no undefined behaviour (963 s
+interpreted). `lz4_flex` does, on the damage test's full set: a damaged
+block whose last match ends at an output that is its whole allocation (39
+bytes) has `duplicate_overlapping` evaluate `output_ptr.add(1)` with the
+pointer already at the end, a pointer two past it. Nothing is read or
+written out of bounds and its `checked-decode` feature gates nothing in
+0.11.6; it is UB by the rules of pointer arithmetic, reached only by a
+damaged block (a whole one ends in literals) into an output that ends its
+allocation, which the engine's group buffers, whole pages, rarely do. So
+the decoders' tests skip `lz4_flex` under Miri, and it is no reason to
+change the default.
+
+Paired at five million keys under 640 MiB, two sittings in both orders, the
+counters identical arm to arm (the same builds, installs, decodes and memo
+hits), own decoder over `lz4_flex` by sitting and the two orders' geometric
+mean (`zowndec2-5m-ab-{1,2}`, the forced form with the drop;
+`zowndecauto2-5m-ab-{1,2}`, the combined arm):
+
+| | forced, flex first | own first | both | combined, flex first | own first | both |
+|---|---|---|---|---|---|---|
+| E | 1.11 | 0.91 | 1.00 | 1.14 | 0.98 | 1.06 |
+| D | 1.13 | 0.87 | 0.99 | 1.10 | 0.99 | 1.04 |
+| C | 1.06 | 1.18 | 1.12 | 1.03 | 1.11 | 1.07 |
+| B | 1.03 | 1.04 | 1.03 | 1.10 | 1.08 | 1.09 |
+| A | 1.02 | 1.12 | 1.07 | 0.94 | 1.06 | 0.99 |
+| F | 1.02 | 1.10 | 1.06 | 1.05 | 0.95 | 1.00 |
+| scan pass | 1.06 | 1.18 | 1.12 | 1.08 | 1.04 | 1.06 |
+| point reads | 1.05 | 0.93 | 0.99 | 0.97 | 1.00 | 0.99 |
+
+By kind over the twelve pairs (`mixkinds`, time, own over `lz4_flex`): forced,
+the gets of C, B, A and F 0.93-0.95 and E's scans 0.99; combined, B's gets
+0.93, F's 0.94, D's 0.96, C's 0.98 and E's scans 0.97. No cell loses in both
+orders in either pairing; the forced form's E, D and point reads read
+whichever arm ran second, by a tenth each way. E's 147 thousand decodes a mix
+are a third of its 475 ms, so a decode a seventh faster predicts four percent;
+it reads one to six. The first version's loss on the combined arm's E (0.88
+and 0.93) is gone with the instructions it was made of. The decoder is the
+default now (`Options::zpages_own_decoder` on); `supdb-cache64tofitzpagesdropflexdec`
+and `supdb-cache64tofitautozpagesflexdec` keep `lz4_flex`, and the differential
+fuzz takes `ZFUZZ_FLEXDEC=1` for it.
+
+Beside it, not this change's: the controller's tests in `tests/zpages.rs` fail
+two to six apiece when three processes of the unoptimized test binary share
+the four cores, at the tick's minute (`wait_tick`) and at the trial's, the
+ski rental's and the raw-tail pick's waits -- 18 failures in six processes
+on this tree and 24 on the tree before it (`7e59db2`, a worktree of its own),
+the same tests at the same lines. The gate runs them optimized and alone.

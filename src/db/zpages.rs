@@ -379,6 +379,16 @@ impl<'a> PageView<'a> {
             .get(usize::from(g.coff)..usize::from(g.coff) + usize::from(g.clen))
     }
 
+    /// Group `j`'s payload with the rest of the page after it: the bytes a
+    /// decoder may read past the payload's end inside the page, and the
+    /// payload's length.
+    pub fn payload_and_rest(&self, j: usize) -> Option<(&'a [u8], usize)> {
+        let g = self.group(j)?;
+        let rest = self.page.get(usize::from(g.coff)..)?;
+        let len = usize::from(g.clen);
+        (len <= rest.len()).then_some((rest, len))
+    }
+
     /// The key of group `j`'s first record for `j` in 1..groups, where it
     /// lies in the page; `None` for group 0, whose key is the fence's, and
     /// past the last group.
@@ -773,6 +783,18 @@ impl GroupBuf {
 }
 
 impl GroupBuf {
+    /// The first `n` bytes and up to `slack` more, as many as the buffer's
+    /// whole pages hold past `n`: room for a decoder's wide copies past a
+    /// group's end that grows the buffer no further than the group does.
+    fn bytes_with_slack(&mut self, n: usize, slack: usize) -> &mut [u8] {
+        self.bytes_for(n);
+        let room = (self.words.len() * 8).min(n + slack);
+        // SAFETY: `bytes_for` left `words` owning at least `room` initialised
+        // bytes, `u8` has no alignment to violate, and the borrow of `self`
+        // is the only access while the slice lives.
+        unsafe { std::slice::from_raw_parts_mut(self.words.as_mut_ptr() as *mut u8, room) }
+    }
+
     /// The bytes the buffer holds room for: what the last growth made it,
     /// in whole pages, and zero before the first decode into it.
     pub fn capacity_bytes(&self) -> usize {
@@ -814,6 +836,20 @@ pub fn decode_group<'a>(
     j: usize,
     buf: &'a mut GroupBuf,
 ) -> Result<&'a [u8], ZError> {
+    decode_group_with(view, j, buf, false)
+}
+
+/// [`decode_group`] with the block coding's groups decoded by the engine's
+/// own decoder where `own` (`Options::zpages_own_decoder`, `super::zlz4`)
+/// and by `lz4_flex` where not: the same bytes from every block either
+/// writes, and the same refusals of every damage the page's checks let
+/// through.
+pub fn decode_group_with<'a>(
+    view: &PageView<'a>,
+    j: usize,
+    buf: &'a mut GroupBuf,
+    own: bool,
+) -> Result<&'a [u8], ZError> {
     let g = view
         .group(j)
         .ok_or(ZError::Header("no such group in the page"))?;
@@ -834,6 +870,25 @@ pub fn decode_group<'a>(
     }
     if g.coded {
         return decode_record_group(payload, usize::from(g.count), ulen, buf);
+    }
+    if own {
+        // The engine's own decoder, into the group's bytes and the slack
+        // its fast loop runs to the end in (`zlz4::DECODE_SLACK`), as much
+        // of it as the buffer's whole pages hold past the group. A
+        // payload that decodes past the group is not a block of it, as
+        // `lz4_flex` refuses one into an output of the group's length, and
+        // one that decodes short is the length that disagrees: the same
+        // refusals either decoder gives.
+        let (rest, len) = view.payload_and_rest(j).ok_or(ZError::Length)?;
+        let out = buf.bytes_with_slack(ulen, super::zlz4::DECODE_SLACK);
+        let n = super::zlz4::decompress_in(rest, len, out).map_err(|_| ZError::Decode)?;
+        if n > ulen {
+            return Err(ZError::Decode);
+        }
+        if n < ulen {
+            return Err(ZError::DecodedLen);
+        }
+        return Ok(&out[..ulen]);
     }
     let out = buf.bytes_for(ulen);
     let n = lz4_flex::block::decompress_into(payload, out).map_err(|_| ZError::Decode)?;
@@ -1700,6 +1755,10 @@ pub struct FillScratch {
     /// (`Options::zpages_parse`, `super::zlz4`) and not `lz4_flex`'s greedy
     /// one: the same format in fewer sequences.
     pub parse: bool,
+    /// The pages the fill writes read back through the engine's own decoder
+    /// (`Options::zpages_own_decoder`), as the readers of the store that
+    /// builds them will read them.
+    pub own_decode: bool,
     /// That encoder's tables, made at its first group.
     parser: Option<Box<super::zlz4::Encoder>>,
     /// What has been done with this scratch.
@@ -1732,6 +1791,7 @@ impl FillScratch {
             store_all: false,
             raw_tails: false,
             parse: false,
+            own_decode: false,
             parser: None,
             stats: FillStats::default(),
         }
@@ -2471,7 +2531,7 @@ fn seal_page(
     let Ok(h) = encode_page(page, first_rank, &groups, bind32) else {
         return Fill::Mismatch;
     };
-    if !page_decodes_to(page, bind32, &h, &s.page_imgs, &mut s.verify) {
+    if !page_decodes_to(page, bind32, &h, &s.page_imgs, &mut s.verify, s.own_decode) {
         return Fill::Mismatch;
     }
     let built = Filled {
@@ -2503,6 +2563,7 @@ fn page_decodes_to(
     hdr: &PageHeader,
     want: &[u8],
     verify: &mut GroupBuf,
+    own: bool,
 ) -> bool {
     let Ok(view) = parse_page(page, bind32) else {
         return false;
@@ -2512,7 +2573,7 @@ fn page_decodes_to(
     }
     let mut at = 0usize;
     for j in 0..view.groups() {
-        let Ok(g) = decode_group(&view, j, verify) else {
+        let Ok(g) = decode_group_with(&view, j, verify, own) else {
             return false;
         };
         if want.get(at..at + g.len()) != Some(g) {
@@ -3172,10 +3233,22 @@ pub fn verify_page(
     entry: &FenceEntry<'_>,
     buf: &mut GroupBuf,
 ) -> Result<PageHeader, ZError> {
+    verify_page_with(page, bind32, entry, buf, false)
+}
+
+/// [`verify_page`] through the decoder the readers will take
+/// ([`decode_group_with`]).
+pub fn verify_page_with(
+    page: &[u8],
+    bind32: u32,
+    entry: &FenceEntry<'_>,
+    buf: &mut GroupBuf,
+    own: bool,
+) -> Result<PageHeader, ZError> {
     let view = parse_page(page, bind32)?;
     check_entry(&view, entry)?;
     for j in 0..view.groups() {
-        let group = decode_group(&view, j, buf)?;
+        let group = decode_group_with(&view, j, buf, own)?;
         check_group(group, &view, j, entry)?;
     }
     Ok(view.header)
@@ -6108,6 +6181,7 @@ mod tests {
         let n = src.records();
         let mut covered = vec![0u32; n];
         let mut buf = GroupBuf::new();
+        let mut own_buf = GroupBuf::new();
         for (i, (rank, g, page)) in b.pages.iter().enumerate() {
             for c in &mut covered[*rank..*rank + g.count] {
                 *c += 1;
@@ -6138,6 +6212,13 @@ mod tests {
                     decode_group(&v, j, &mut buf).unwrap(),
                     &group[..],
                     "rank {rank} group {j}"
+                );
+                // And through the engine's own decoder, the page's last group
+                // with no more of its page after it than the fill left.
+                assert_eq!(
+                    decode_group_with(&v, j, &mut own_buf, true).unwrap(),
+                    &group[..],
+                    "rank {rank} group {j}, the own decoder"
                 );
                 let c = lz4_flex::block::compress(&group);
                 let payload = v.payload(j).unwrap();
@@ -7048,17 +7129,18 @@ mod tests {
         let page = manual_page(&group, images.len() as u16, 9, bind, false);
         let hdr = parse_page(&page, bind).unwrap().header;
         let mut v = GroupBuf::new();
-        assert!(page_decodes_to(&page, bind, &hdr, &group, &mut v));
+        assert!(page_decodes_to(&page, bind, &hdr, &group, &mut v, false));
         // Not the group it was asked for.
         let mut other = group.clone();
         other[3] ^= 1;
-        assert!(!page_decodes_to(&page, bind, &hdr, &other, &mut v));
+        assert!(!page_decodes_to(&page, bind, &hdr, &other, &mut v, false));
         assert!(!page_decodes_to(
             &page,
             bind,
             &hdr,
             &group[..group.len() - 4],
-            &mut v
+            &mut v,
+            false
         ));
         // Not the header it was asked for.
         for bad in [
@@ -7072,22 +7154,29 @@ mod tests {
             },
         ] {
             assert!(
-                !page_decodes_to(&page, bind, &bad, &group, &mut v),
+                !page_decodes_to(&page, bind, &bad, &group, &mut v, false),
                 "{bad:?}"
             );
         }
         // Not a page this form file reads: another bind32, or a byte changed.
-        assert!(!page_decodes_to(&page, bind ^ 1, &hdr, &group, &mut v));
+        assert!(!page_decodes_to(
+            &page,
+            bind ^ 1,
+            &hdr,
+            &group,
+            &mut v,
+            false
+        ));
         let mut torn = page;
         torn[100] ^= 1;
-        assert!(!page_decodes_to(&torn, bind, &hdr, &group, &mut v));
+        assert!(!page_decodes_to(&torn, bind, &hdr, &group, &mut v, false));
         // A page whose CRC is good and whose payload is not the group: the
         // payload begins after the one directory entry, at 32.
         let mut signed = page;
         signed[32 + 3] ^= 0x40;
         resign_page(&mut signed, bind);
         assert!(parse_page(&signed, bind).is_ok(), "its CRC is good");
-        assert!(!page_decodes_to(&signed, bind, &hdr, &group, &mut v));
+        assert!(!page_decodes_to(&signed, bind, &hdr, &group, &mut v, false));
         // A page of two groups compares group by group: the second's payload
         // changed under a good CRC is refused.
         let two = suite_images(20, 6);
@@ -7097,12 +7186,14 @@ mod tests {
         let v2 = parse_page(&page2, bind).unwrap();
         let (hdr2, coff1) = (v2.header, usize::from(v2.group(1).unwrap().coff));
         let both = [g0.clone(), g1.clone()].concat();
-        assert!(page_decodes_to(&page2, bind, &hdr2, &both, &mut v));
+        assert!(page_decodes_to(&page2, bind, &hdr2, &both, &mut v, false));
         let mut signed2 = page2;
         signed2[coff1 + 2] ^= 0x40;
         resign_page(&mut signed2, bind);
         assert!(parse_page(&signed2, bind).is_ok());
-        assert!(!page_decodes_to(&signed2, bind, &hdr2, &both, &mut v));
+        assert!(!page_decodes_to(
+            &signed2, bind, &hdr2, &both, &mut v, false
+        ));
     }
 
     #[test]

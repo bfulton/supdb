@@ -1,0 +1,34 @@
+7e59db2
+ M bench/DESIGN.md
+ M bench/examples/zdecode.rs
+ M bench/src/engines.rs
+ M scratch/wave2/stage4.md
+ M src/db.rs
+ M src/db/zfile.rs
+ M src/db/zlz4.rs
+ M src/db/zpages.rs
+ M tests/fuzz.rs
+ M tests/zpages.rs
+?? scratch/wave2/zdec-1m.log
+?? scratch/wave2/zdec2-1m.log
+?? scratch/wave2/zdec3-1m.log
+?? scratch/wave2/zdec4-1m.log
+?? scratch/wave2/zdec5-1m.log
+?? scratch/wave2/zdec6-1m.log
+?? scratch/wave2/zdec6-pages.log
+?? scratch/wave2/zdec7-1m.log
+?? scratch/wave2/zowndec2-5m-build.log
+?? scratch/wave2/zowndec2-5m-head.txt
+?? scratch/wave2/zowndec5m-ab-1.err
+?? scratch/wave2/zowndec5m-ab-1.out
+?? scratch/wave2/zowndec5m-ab-2.err
+?? scratch/wave2/zowndec5m-ab-2.out
+?? scratch/wave2/zowndec5m-build.log
+?? scratch/wave2/zowndec5m-head.txt
+?? scratch/wave2/zowndecauto5m-ab-1.err
+?? scratch/wave2/zowndecauto5m-ab-1.out
+?? scratch/wave2/zowndecauto5m-ab-2.err
+?? scratch/wave2/zowndecauto5m-ab-2.out
+?? scratch/wave2/zowndecauto5m-build.log
+?? scratch/wave2/zowndecauto5m-head.txt
+2026-10-29T15:25:21Z

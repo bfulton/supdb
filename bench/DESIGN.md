@@ -400,6 +400,9 @@ and building the blocks it filed into (`Options::forms_settle_every`,
 are the forced form with the drop and the combined arm with their
 block-coded groups written by the engine's parsing encoder
 (`Options::zpages_parse`), the same block format in fewer sequences;
+`supdb-cache64tofitzpagesdropflexdec` and `supdb-cache64tofitautozpagesflexdec`
+are the same two with their groups decoded by `lz4_flex` and not the engine's
+own LZ4 decoder (`Options::zpages_own_decoder` off);
 `supdb-cache64tofitautozpagescodingfixed` is the combined arm with the coding
 of its form files the options' block coding wherever the controller builds
 (`Options::zpages_coding_auto` off), where the default's selector picks the

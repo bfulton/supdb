@@ -67,6 +67,10 @@ struct Page {
     payload: Vec<u8>,
     ulen: usize,
     count: usize,
+    /// The payload and the rest of its page after it, which the engine's own
+    /// decoder may read into (`zlz4::decompress_in`); a recompressed payload
+    /// is given sixty-four zeros instead.
+    padded: Vec<u8>,
 }
 
 /// Every compressed group of every page of every form file under `dir`, in
@@ -98,10 +102,12 @@ fn form_pages(dir: &Path) -> Vec<Page> {
                     stored += 1;
                     continue;
                 }
+                let (rest, len) = view.payload_and_rest(j).expect("its payload");
                 pages.push(Page {
-                    payload: view.payload(j).expect("its payload").to_vec(),
+                    payload: rest[..len].to_vec(),
                     ulen: g.ulen as usize,
                     count: usize::from(g.count),
+                    padded: rest.to_vec(),
                 });
             }
         }
@@ -131,15 +137,71 @@ fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
 /// The engine's decoder over one page, as `decode_group` calls it.
 #[inline(always)]
 fn flex(p: &Page, out: &mut [u8]) -> usize {
-    lz4_flex::block::decompress_into(&p.payload, &mut out[..p.ulen]).expect("the engine's decoder")
+    lz4_flex::block::decompress_into(&p.padded[..p.payload.len()], &mut out[..p.ulen])
+        .expect("the engine's decoder")
 }
 
 /// liblz4's `LZ4_decompress_safe` over one page, the size known as the
 /// engine knows it from the header, no size prefix.
 #[inline(always)]
 fn c(p: &Page, out: &mut [u8]) -> usize {
-    lz4::block::decompress_to_buffer(&p.payload, Some(p.ulen as i32), &mut out[..p.ulen])
-        .expect("liblz4's decoder")
+    lz4::block::decompress_to_buffer(
+        &p.padded[..p.payload.len()],
+        Some(p.ulen as i32),
+        &mut out[..p.ulen],
+    )
+    .expect("liblz4's decoder")
+}
+
+/// The engine's own decoder (`supdb::db::zlz4`) over one page, into an
+/// output of exactly the decoded length: the shape `lz4_flex` and liblz4
+/// are given, where the last 64 bytes go the careful way.
+#[inline(always)]
+fn ours(p: &Page, out: &mut [u8]) -> usize {
+    supdb::db::zlz4::decompress_into(&p.padded[..p.payload.len()], &mut out[..p.ulen])
+        .expect("the engine's own decoder")
+}
+
+/// The same into an output with the slack the fast loop runs to the end
+/// in (`zlz4::DECODE_SLACK`), the shape the engine can give it.
+#[inline(always)]
+fn ours_roomy(p: &Page, out: &mut [u8]) -> usize {
+    supdb::db::zlz4::decompress_into(
+        &p.padded[..p.payload.len()],
+        &mut out[..p.ulen + supdb::db::zlz4::DECODE_SLACK],
+    )
+    .expect("the engine's own decoder")
+}
+
+/// The engine's own decoder as the engine calls it: the payload with the
+/// rest of its page after it and the output with its slack.
+#[inline(always)]
+fn ours_paged(p: &Page, out: &mut [u8]) -> usize {
+    supdb::db::zlz4::decompress_in(
+        &p.padded,
+        p.payload.len(),
+        &mut out[..p.ulen + supdb::db::zlz4::DECODE_SLACK],
+    )
+    .expect("the engine's own decoder")
+}
+
+/// Every page once through the engine's own decoder, exact and paged.
+#[inline(never)]
+fn decode_all_ours(pages: &[Page], out: &mut [u8]) -> usize {
+    let mut n = 0;
+    for p in pages {
+        n += ours(black_box(p), out);
+    }
+    black_box(n)
+}
+
+#[inline(never)]
+fn decode_all_roomy(pages: &[Page], out: &mut [u8]) -> usize {
+    let mut n = 0;
+    for p in pages {
+        n += ours_paged(black_box(p), out);
+    }
+    black_box(n)
 }
 
 /// Every page once through the engine's decoder; the callgrind toggle.
@@ -375,6 +437,17 @@ fn median(v: &mut [f64]) -> f64 {
     v[v.len() / 2]
 }
 
+/// A payload recompressed given sixty-four zeros after it for the room a
+/// decoder that reads ahead may use; one read from its page keeps the page.
+fn pad(pages: &mut [Page]) {
+    for p in pages.iter_mut() {
+        if !p.padded.starts_with(&p.payload) {
+            p.padded = p.payload.clone();
+            p.padded.extend([0u8; 64]);
+        }
+    }
+}
+
 fn main() {
     let mut size: u64 = 300_000;
     let mut rounds: usize = 21;
@@ -446,6 +519,7 @@ fn main() {
     if let Some(n) = first {
         pages.truncate(n);
     }
+    pad(&mut pages);
     if let Some(level) = hc {
         // Every group recompressed by liblz4's high-compression mode from
         // the bytes the engine's decoder gives for it; a group it would
@@ -525,12 +599,84 @@ fn main() {
             ks.clear();
         }
     }
+    pad(&mut pages);
+    {
+        let room = |p: &Page| p.padded.len() - p.payload.len();
+        let short = pages.iter().filter(|p| room(p) < 64).count();
+        println!(
+            "groups with under 64 bytes of their page after them: {short} of {} ({:.1}%)",
+            pages.len(),
+            100.0 * short as f64 / pages.len() as f64
+        );
+    }
     let total_u: usize = pages.iter().map(|p| p.ulen).sum();
     let total_c: usize = pages.iter().map(|p| p.payload.len()).sum();
     let seqs: usize = pages
         .iter()
         .map(|p| supdb::db::zlz4::sequences(&p.payload).expect("a block"))
         .sum();
+    // The sequences by the decoder's path: a run of fifteen or more, a match
+    // of nineteen or more, and a match from under eight or sixteen back.
+    let (mut long_lit, mut long_ml, mut near8, mut near16) = (0usize, 0usize, 0usize, 0usize);
+    let (mut lit_h, mut ml_h) = ([0usize; 6], [0usize; 6]);
+    let bucket = |n: usize| {
+        [16usize, 32, 48, 64, 128]
+            .iter()
+            .position(|&b| n < b)
+            .unwrap_or(5)
+    };
+    for p in &pages {
+        let b = &p.payload;
+        let mut i = 0;
+        loop {
+            let t = b[i];
+            i += 1;
+            let mut lit = (t >> 4) as usize;
+            if lit == 15 {
+                long_lit += 1;
+                loop {
+                    let x = b[i];
+                    i += 1;
+                    lit += x as usize;
+                    if x != 255 {
+                        break;
+                    }
+                }
+            }
+            if lit >= 15 {
+                lit_h[bucket(lit)] += 1;
+            }
+            i += lit;
+            if i >= b.len() {
+                break;
+            }
+            let off = u16::from_le_bytes([b[i], b[i + 1]]) as usize;
+            i += 2;
+            near8 += usize::from(off < 8);
+            near16 += usize::from(off < 16);
+            if t & 15 == 15 {
+                long_ml += 1;
+                let mut ml = 19usize;
+                loop {
+                    let x = b[i];
+                    i += 1;
+                    ml += x as usize;
+                    if x != 255 {
+                        break;
+                    }
+                }
+                ml_h[bucket(ml)] += 1;
+            }
+        }
+    }
+    println!(
+        "sequences by path: long runs {:.1}%, long matches {:.1}%, offsets under 8 {:.1}%, under 16 {:.1}%",
+        100.0 * long_lit as f64 / seqs as f64,
+        100.0 * long_ml as f64 / seqs as f64,
+        100.0 * near8 as f64 / seqs as f64,
+        100.0 * near16 as f64 / seqs as f64
+    );
+    println!("long runs by length under 16/32/48/64/128/more: {lit_h:?}; long matches: {ml_h:?}");
     println!(
         "{} compressed bytes to {} decoded, {:.2} a group decoded, ratio {:.3}, {:.1} sequences a group",
         total_c,
@@ -540,8 +686,8 @@ fn main() {
         seqs as f64 / pages.len() as f64
     );
     let ulen_max = pages.iter().map(|p| p.ulen).max().unwrap();
-    let mut a = vec![0u8; ulen_max];
-    let mut b = vec![0u8; ulen_max];
+    let mut a = vec![0u8; ulen_max + supdb::db::zlz4::DECODE_SLACK];
+    let mut b = vec![0u8; ulen_max + supdb::db::zlz4::DECODE_SLACK];
 
     // Agreement first: both decoders, every group, byte for byte and in
     // length.
@@ -553,6 +699,21 @@ fn main() {
             a[..p.ulen] == b[..p.ulen],
             "page {i}: the decoders disagree"
         );
+        for dec in [
+            ours as fn(&Page, &mut [u8]) -> usize,
+            ours_roomy,
+            ours_paged,
+        ] {
+            assert_eq!(
+                dec(p, &mut b),
+                p.ulen,
+                "page {i}: the engine's own decoder's length"
+            );
+            assert!(
+                a[..p.ulen] == b[..p.ulen],
+                "page {i}: the engine's own decoder disagrees"
+            );
+        }
     }
     println!("the decoders agree on every group");
 
@@ -560,7 +721,9 @@ fn main() {
         let n = match which.as_str() {
             "flex" => decode_all_flex(&pages, &mut a),
             "c" => decode_all_c(&pages, &mut a),
-            other => panic!("--count takes flex or c, not {other}"),
+            "ours" => decode_all_ours(&pages, &mut a),
+            "paged" => decode_all_roomy(&pages, &mut a),
+            other => panic!("--count takes flex, c, ours or paged, not {other}"),
         };
         println!(
             "counted {which}: {n} bytes decoded over {} groups",
@@ -572,20 +735,21 @@ fn main() {
     // Cycling: every page once a round, the order of the decoders swapped
     // each round.
     let (mut cyc_f, mut cyc_c) = (Vec::new(), Vec::new());
+    let (mut cyc_o, mut cyc_r) = (Vec::new(), Vec::new());
     for r in 0..rounds {
-        let one = |f: &mut Vec<f64>, g: &mut dyn FnMut() -> usize| {
+        // The four decoders in an order rotated a place each round.
+        for k in 0..4 {
+            let which = (k + r) % 4;
             let t = Instant::now();
-            let n = g();
-            let d = t.elapsed().as_nanos() as f64;
+            let n = match which {
+                0 => decode_all_flex(&pages, &mut a),
+                1 => decode_all_c(&pages, &mut a),
+                2 => decode_all_ours(&pages, &mut a),
+                _ => decode_all_roomy(&pages, &mut a),
+            };
+            let d = t.elapsed().as_nanos() as f64 / pages.len() as f64;
             assert_eq!(n, total_u);
-            f.push(d / pages.len() as f64);
-        };
-        if r % 2 == 0 {
-            one(&mut cyc_f, &mut || decode_all_flex(&pages, &mut a));
-            one(&mut cyc_c, &mut || decode_all_c(&pages, &mut a));
-        } else {
-            one(&mut cyc_c, &mut || decode_all_c(&pages, &mut a));
-            one(&mut cyc_f, &mut || decode_all_flex(&pages, &mut a));
+            [&mut cyc_f, &mut cyc_c, &mut cyc_o, &mut cyc_r][which].push(d);
         }
     }
     // Hot: a few pages spread over the file, each decoded many times on
@@ -611,8 +775,22 @@ fn main() {
     let hot_c = hot(&c, &mut a);
     let hot_f2 = hot(&flex, &mut a);
     let hot_c2 = hot(&c, &mut a);
+    let hot_o = hot(&ours, &mut a);
+    let hot_r = hot(&ours_paged, &mut a);
     let bytes = total_u as f64 / pages.len() as f64;
     let (mf, mc) = (median(&mut cyc_f), median(&mut cyc_c));
+    let (mo, mr) = (median(&mut cyc_o), median(&mut cyc_r));
+    println!(
+        "cycle, the engine's own decoder: exact {:.0} ns a group ({:.2} of lz4_flex, {:.2} of liblz4), paged {:.0} ({:.2}, {:.2}); hot exact {:.0}, paged {:.0}",
+        mo,
+        mo / mf,
+        mo / mc,
+        mr,
+        mr / mf,
+        mr / mc,
+        hot_o,
+        hot_r
+    );
     println!(
         "cycle ({rounds} rounds over {} groups): lz4_flex {:.0} ns a group ({:.3} ns a byte), liblz4 {:.0} ns a group ({:.3} ns a byte); liblz4 at {:.2} of lz4_flex",
         pages.len(),

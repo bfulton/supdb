@@ -436,6 +436,392 @@ fn common(b: &[u8], a: usize, s: usize, max: usize) -> usize {
     l
 }
 
+/// A block that is not an LZ4 block, or does not fit the output it was
+/// given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodeError;
+
+/// The output past a block's decoded end the fast loop's wide copies may
+/// write into: given this much more room than the block decodes to, the
+/// decoder runs its fast loop to the block's last few sequences, where an
+/// output cut at the decoded length leaves the last 64 bytes to the
+/// careful loop. The bytes written there are not the block's.
+pub const DECODE_SLACK: usize = 64;
+
+/// The input a fast turn may read from its token: the token, a move of
+/// sixteen literals, and an offset after fewer than fifteen of them, which
+/// end inside the sixteen moved and a byte past them. A longer run checks
+/// its own.
+const FAST_IN: usize = 18;
+/// The output a fast turn may write past where it starts: sixteen bytes of
+/// literals and an eighteen-byte match, with the same room.
+const FAST_OUT: usize = 64;
+/// The readable bytes past a block's end that let the fast loop run with no
+/// input bound of its own: a turn starts at most a byte past the block's
+/// end and reads at most forty-nine past it (a run of sixty-four or fewer
+/// literals ending at the block's end moves sixty-four from fifteen before
+/// it).
+const PAD_IN: usize = 64;
+
+/// `src`, an LZ4 block, decoded into `dst` from its start: the decoded
+/// length, or [`DecodeError`] for bytes that are not a block or a block
+/// that decodes past `dst`. Any input is safe: every read is of `src` and
+/// every write of `dst`, the fast loop's wide copies landing inside `dst`
+/// past the decoded end where there is room for them (`DECODE_SLACK`).
+///
+/// The fast loop is liblz4's: while the input and output have a turn's
+/// room, a run of fewer than fifteen literals is one sixteen-byte move and a
+/// longer one moves of sixteen to sixty-four and of thirty-two past it, and
+/// a match moves sixteen bytes at a time from sixteen or more back, eight
+/// from eight or more, and from closer byte by byte for its first eight and
+/// then eight at a time from the nearest whole number of its periods eight
+/// or more back -- no length in any move but the advance, the moves'
+/// overrun landing on what the next sequence writes or in the slack. Where
+/// a turn lacks the room, the rest of the block goes the careful way, a
+/// sequence at a time with every bound checked.
+pub fn decompress_into(src: &[u8], dst: &mut [u8]) -> Result<usize, DecodeError> {
+    decompress_in(src, src.len(), dst)
+}
+
+/// [`decompress_into`] of the block `src[..len]`, the bytes after it in
+/// `src` readable but not the block's: the fast loop's moves may read into
+/// them, so that a block followed by others in a page runs the fast loop to
+/// its last sequence, the end found after each run of literals, and a block
+/// with `PAD_IN` bytes after it runs it with no input bound at all, its
+/// length bytes read inside the block. One that ends its buffer leaves its
+/// last `FAST_IN` bytes to the careful loop.
+pub fn decompress_in(src: &[u8], len: usize, dst: &mut [u8]) -> Result<usize, DecodeError> {
+    if len > src.len() {
+        return Err(DecodeError);
+    }
+    let (readable, oend) = (src.len(), dst.len());
+    let (mut ip, mut op) = (0usize, 0usize);
+    if len > 0 && oend >= FAST_OUT {
+        let olim = oend - FAST_OUT;
+        // SAFETY: every turn starts at `op <= olim` and, unpadded, at `ip <=
+        // ilim`, so it may write `FAST_OUT` bytes of `dst` from where it
+        // starts and read `FAST_IN` bytes of `src` from its token; padded, a
+        // turn starts at most a byte past the block and reads at most
+        // `PAD_IN` past it, inside `src`. A turn that would go further
+        // checks its own room first. `src` and `dst` are different buffers,
+        // and a match reads `dst` behind what it writes.
+        let done = if readable - len >= PAD_IN {
+            unsafe { fast_loop::<true>(src, len, dst, &mut ip, &mut op, 0, olim)? }
+        } else if readable >= FAST_IN {
+            let ilim = (readable - FAST_IN).min(len - 1);
+            unsafe { fast_loop::<false>(src, len, dst, &mut ip, &mut op, ilim, olim)? }
+        } else {
+            false
+        };
+        if done {
+            return Ok(op);
+        }
+    }
+    let block = &src[..len];
+    while ip < len {
+        if careful_sequence(block, dst, &mut ip, &mut op)? {
+            return Ok(op);
+        }
+    }
+    Err(DecodeError)
+}
+
+/// The fast loop over the block `src[..len]`: turns while `op <= olim` and,
+/// unless `PADDED`, `ip <= ilim`; `true` where the block ended in it, else
+/// the rest left to the careful loop where a turn lacked its room. Every
+/// length byte is read inside the block, so a turn starts at most a byte
+/// past it.
+///
+/// # Safety
+/// `olim + FAST_OUT == dst.len()`, `len <= src.len()`, and either `PADDED`
+/// and `len + PAD_IN <= src.len()`, or `ilim + FAST_IN <= src.len()` and
+/// `ilim < len`.
+#[inline(always)]
+unsafe fn fast_loop<const PADDED: bool>(
+    src: &[u8],
+    len: usize,
+    dst: &mut [u8],
+    ipr: &mut usize,
+    opr: &mut usize,
+    ilim: usize,
+    olim: usize,
+) -> Result<bool, DecodeError> {
+    let (iend, oend) = (src.len(), dst.len());
+    let block = &src[..len];
+    let sp = src.as_ptr();
+    let dp = dst.as_mut_ptr();
+    // A long match's room: thirty-two bytes of moves past its end.
+    let mlim = oend - 32;
+    let (mut ip, mut op) = (*ipr, *opr);
+    // SAFETY, for the whole loop: the caller's room, and each move's source
+    // in `dst` ends at or before its destination starts (`offset >= 8` for
+    // a move of eight, `>= 16` for sixteen, `step >= 8` in `near_copy`).
+    unsafe {
+        while op <= olim && (PADDED || ip <= ilim) {
+            let token = *sp.add(ip);
+            ip += 1;
+            // The run. Under fifteen literals, one move of sixteen inside
+            // the turn's room; a long one, its length bytes read inside the
+            // block and its room checked, moves of sixteen to sixty-four --
+            // a form group's long runs are nearly all under that -- and of
+            // thirty-two past it.
+            let mut lit = (token >> 4) as usize;
+            if lit < 15 {
+                std::ptr::copy_nonoverlapping(sp.add(ip), dp.add(op), 16);
+            } else {
+                let at = ip - 1;
+                lit += var_len(block, &mut ip)?;
+                // Past the block is not a run; past the output's room, or
+                // the input's where nothing follows the block, is the
+                // careful loop's, from the token.
+                if lit > len - ip {
+                    return Err(DecodeError);
+                }
+                // Unpadded, sixty-four moved from the run's start and, past
+                // its end, an offset and the thirty-one a move of thirty-two
+                // may overrun by.
+                if lit > olim - op || (!PADDED && (iend - ip < 64 || iend - ip - lit < 32)) {
+                    ip = at;
+                    break;
+                }
+                if lit <= 64 {
+                    std::ptr::copy_nonoverlapping(sp.add(ip), dp.add(op), 16);
+                    std::ptr::copy_nonoverlapping(sp.add(ip + 16), dp.add(op + 16), 16);
+                    std::ptr::copy_nonoverlapping(sp.add(ip + 32), dp.add(op + 32), 16);
+                    std::ptr::copy_nonoverlapping(sp.add(ip + 48), dp.add(op + 48), 16);
+                } else {
+                    wild_copy::<32>(sp.add(ip), dp.add(op), lit);
+                }
+            }
+            ip += lit;
+            op += lit;
+            // The block's last sequence is literals alone.
+            if ip >= len {
+                *ipr = ip;
+                *opr = op;
+                return if ip == len {
+                    Ok(true)
+                } else {
+                    Err(DecodeError)
+                };
+            }
+            let offset = u16::from_le(std::ptr::read_unaligned(sp.add(ip).cast::<u16>())) as usize;
+            ip += 2;
+            // Zero or past the output's start, in one compare.
+            if offset.wrapping_sub(1) >= op {
+                return Err(DecodeError);
+            }
+            let m = op - offset;
+            // The match. Under nineteen bytes, eighteen in moves of eight,
+            // eight and two, inside the room the run left; a long one, its
+            // length read and its room checked, thirty-two in two moves of
+            // sixteen -- most of a form group's long matches -- and sixteen
+            // at a time past that.
+            let ml_n = (token & 15) as usize;
+            if ml_n < 15 {
+                let ml = ml_n + MINMATCH;
+                if offset >= 8 {
+                    std::ptr::copy_nonoverlapping(dp.add(m), dp.add(op), 8);
+                    std::ptr::copy_nonoverlapping(dp.add(m + 8), dp.add(op + 8), 8);
+                    std::ptr::copy_nonoverlapping(dp.add(m + 16), dp.add(op + 16), 2);
+                } else {
+                    near_copy(dp, m, op, ml, offset);
+                }
+                op += ml;
+                continue;
+            }
+            let ml = 15 + MINMATCH + var_len(block, &mut ip)?;
+            // `op` is under `mlim`: a short run leaves it within thirty-two
+            // of where the turn began.
+            if ml > mlim - op {
+                // A match past the turn's room: copied with its bounds
+                // checked, and the rest of the block the careful way. The
+                // raw pointers are not used after `dst` is.
+                match_checked(dst, op, offset, ml)?;
+                op += ml;
+                break;
+            }
+            if offset >= 16 {
+                std::ptr::copy_nonoverlapping(dp.add(m), dp.add(op), 16);
+                std::ptr::copy_nonoverlapping(dp.add(m + 16), dp.add(op + 16), 16);
+                if ml > 32 {
+                    let (mut s, mut d) = (dp.add(m + 32), dp.add(op + 32));
+                    let end = dp.add(op + ml);
+                    loop {
+                        std::ptr::copy_nonoverlapping(s, d, 16);
+                        s = s.add(16);
+                        d = d.add(16);
+                        if d >= end {
+                            break;
+                        }
+                    }
+                }
+            } else if offset >= 8 {
+                let (mut s, mut d) = (dp.add(m), dp.add(op));
+                let end = dp.add(op + ml);
+                loop {
+                    std::ptr::copy_nonoverlapping(s, d, 8);
+                    std::ptr::copy_nonoverlapping(s.add(8), d.add(8), 8);
+                    s = s.add(16);
+                    d = d.add(16);
+                    if d >= end {
+                        break;
+                    }
+                }
+            } else {
+                near_copy(dp, m, op, ml, offset);
+            }
+            op += ml;
+        }
+    }
+    *ipr = ip;
+    *opr = op;
+    Ok(false)
+}
+
+/// `len` bytes from `s` to `d` in moves of `N`, the last move's overrun
+/// written past `d + len`: at least one move, at most `len + N - 1` bytes.
+/// Out of line: it serves the rare long run, and inline its loop (which the
+/// compiler makes a call to `memcpy`) costs the fast loop's every turn the
+/// registers the call needs.
+///
+/// # Safety
+/// `s` readable and `d` writable for `len + N - 1` bytes, and every move's
+/// source before its destination by at least `N` where the two are one
+/// buffer.
+#[inline(never)]
+unsafe fn wild_copy<const N: usize>(mut s: *const u8, mut d: *mut u8, len: usize) {
+    // SAFETY: the caller's.
+    unsafe {
+        let end = d.add(len);
+        loop {
+            std::ptr::copy_nonoverlapping(s, d, N);
+            s = s.add(N);
+            d = d.add(N);
+            if d >= end {
+                break;
+            }
+        }
+    }
+}
+
+/// A match from fewer than eight bytes back: its first eight bytes one at a
+/// time, each read after the byte it repeats is written, then moves of
+/// eight from `step` back, the least multiple of the period of eight or
+/// more, where the bytes repeat as they do one period back.
+///
+/// Out of line, as the rare case it is.
+///
+/// # Safety
+/// `dp` writable for `op + ml + 7` bytes and `m = op - offset`, `0 < offset
+/// < 8`.
+#[inline(never)]
+unsafe fn near_copy(dp: *mut u8, m: usize, op: usize, ml: usize, offset: usize) {
+    // SAFETY: the caller's.
+    unsafe {
+        for k in 0..8 {
+            *dp.add(op + k) = *dp.add(m + k);
+        }
+        // The least multiple of the period of eight or more, by the
+        // period: no divide on the path.
+        const STEP: [usize; 8] = [8, 8, 8, 9, 8, 10, 12, 14];
+        let step = STEP[offset & 7];
+        let mut k = 8;
+        while k < ml {
+            std::ptr::copy_nonoverlapping(dp.add(op + k - step), dp.add(op + k), 8);
+            k += 8;
+        }
+    }
+}
+
+/// A match of `ml` from `offset` back copied with its bounds checked.
+fn match_checked(dst: &mut [u8], op: usize, offset: usize, ml: usize) -> Result<(), DecodeError> {
+    if ml > dst.len() - op {
+        return Err(DecodeError);
+    }
+    let m = op - offset;
+    if offset >= ml {
+        let (a, b) = dst.split_at_mut(op);
+        b[..ml].copy_from_slice(&a[m..m + ml]);
+    } else {
+        copy_overlap(dst, m, op, ml);
+    }
+    Ok(())
+}
+
+/// `n` bytes of `dst` from `from` to `to` where the match overlaps its own
+/// output, `to - from` smaller than `n`: the bytes behind `to` repeat with
+/// that period, so each move copies as much of the repeat as stands
+/// already written, doubling, and none reads what it writes.
+#[inline(always)]
+fn copy_overlap(dst: &mut [u8], from: usize, to: usize, n: usize) {
+    let period = to - from;
+    let (mut done, mut span) = (0usize, period);
+    while done < n {
+        let k = span.min(n - done);
+        dst.copy_within(to + done - span..to + done - span + k, to + done);
+        done += k;
+        span = (span * 2).min(done + period);
+    }
+}
+
+/// One sequence decoded with every bound checked: `true` for the block's
+/// last, the literals that end it.
+#[inline(never)]
+fn careful_sequence(
+    src: &[u8],
+    dst: &mut [u8],
+    ip: &mut usize,
+    op: &mut usize,
+) -> Result<bool, DecodeError> {
+    let (iend, oend) = (src.len(), dst.len());
+    let token = *src.get(*ip).ok_or(DecodeError)?;
+    *ip += 1;
+    let mut lit = (token >> 4) as usize;
+    if lit == 15 {
+        lit += var_len(src, ip)?;
+    }
+    if lit > iend - *ip || lit > oend - *op {
+        return Err(DecodeError);
+    }
+    dst[*op..*op + lit].copy_from_slice(&src[*ip..*ip + lit]);
+    *ip += lit;
+    *op += lit;
+    if *ip == iend {
+        return Ok(true);
+    }
+    if iend - *ip < 2 {
+        return Err(DecodeError);
+    }
+    let offset = u16::from_le_bytes([src[*ip], src[*ip + 1]]) as usize;
+    *ip += 2;
+    if offset == 0 || offset > *op {
+        return Err(DecodeError);
+    }
+    let mut ml = (token & 15) as usize + MINMATCH;
+    if ml == 15 + MINMATCH {
+        ml += var_len(src, ip)?;
+    }
+    match_checked(dst, *op, offset, ml)?;
+    *op += ml;
+    Ok(false)
+}
+
+/// A length's continuation bytes: each adds its value, and one under 255
+/// ends it.
+#[inline(always)]
+fn var_len(src: &[u8], ip: &mut usize) -> Result<usize, DecodeError> {
+    let mut n = 0usize;
+    loop {
+        let b = *src.get(*ip).ok_or(DecodeError)?;
+        *ip += 1;
+        n += b as usize;
+        if b != 255 {
+            return Ok(n);
+        }
+    }
+}
+
 /// The sequences of an LZ4 block: how many tokens a decoder parses for it,
 /// or `None` for bytes that are not a block.
 pub fn sequences(block: &[u8]) -> Option<usize> {
@@ -668,6 +1054,178 @@ mod tests {
         let s_priced = sequences(&out[..priced]).unwrap();
         assert!(s_priced <= s_plain, "{s_priced} against {s_plain}");
         assert!(priced >= plain, "{priced} against {plain}");
+    }
+
+    /// `block` decoded by this module into an output of exactly `n` bytes
+    /// and into one with the slack the fast loop runs to the end in, both
+    /// held to `want`.
+    fn decodes_to(block: &[u8], want: &[u8]) {
+        let mut exact = vec![0u8; want.len()];
+        assert_eq!(decompress_into(block, &mut exact), Ok(want.len()), "exact");
+        assert!(
+            exact == want,
+            "{} bytes: decoded differently, exact",
+            want.len()
+        );
+        let mut roomy = vec![0xA5u8; want.len() + DECODE_SLACK + 7];
+        assert_eq!(decompress_into(block, &mut roomy), Ok(want.len()), "roomy");
+        assert!(
+            &roomy[..want.len()] == want,
+            "{} bytes: decoded differently, roomy",
+            want.len()
+        );
+        // The block followed by bytes that are not its own, as a payload is
+        // by the rest of its page.
+        for tail in [1usize, 17, 18, 31, 40, 63, 64, 200] {
+            let mut src = block.to_vec();
+            src.extend((0..tail).map(|i| (i * 131 + 7) as u8));
+            for room in [want.len(), want.len() + DECODE_SLACK] {
+                let mut out = vec![0x5Au8; room];
+                assert_eq!(
+                    decompress_in(&src, block.len(), &mut out),
+                    Ok(want.len()),
+                    "tail {tail}, room {room}"
+                );
+                assert!(
+                    &out[..want.len()] == want,
+                    "{} bytes: decoded differently, tail {tail}, room {room}",
+                    want.len()
+                );
+            }
+        }
+    }
+
+    /// The cases a run under Miri can interpret in minutes: the short ones,
+    /// which reach every path of the decoder the long ones do.
+    fn decode_cases() -> impl Iterator<Item = Vec<u8>> {
+        cases()
+            .into_iter()
+            .filter(|c| !cfg!(miri) || c.len() <= 2048)
+    }
+
+    #[test]
+    fn every_block_either_encoder_writes_decodes_to_its_input() {
+        let mut enc = Encoder::new();
+        for c in decode_cases() {
+            for e in [
+                Effort::SHIPPED,
+                Effort {
+                    attempts: 0,
+                    seq_cost: 0,
+                    skip_min: 8,
+                },
+            ] {
+                let mut out = vec![0u8; max_output(c.len())];
+                let n = enc.compress_into(&c, &mut out, e).unwrap();
+                decodes_to(&out[..n], &c);
+            }
+            decodes_to(&lz4_flex::block::compress(&c), &c);
+        }
+    }
+
+    #[test]
+    fn a_block_that_decodes_past_its_output_is_refused() {
+        let input: Vec<u8> = (0..3000).map(|i| (i % 13) as u8).collect();
+        let b = lz4_flex::block::compress(&input);
+        for short in [0usize, 1, 100, 2999] {
+            let mut dst = vec![0u8; short];
+            assert_eq!(decompress_into(&b, &mut dst), Err(DecodeError), "{short}");
+        }
+        assert_eq!(decompress_into(&[], &mut [0u8; 10]), Err(DecodeError));
+        assert_eq!(
+            decompress_in(&b, b.len() + 1, &mut [0u8; 4000]),
+            Err(DecodeError)
+        );
+        let mut cut = b.clone();
+        cut.extend([0u8; 64]);
+        assert_eq!(decompress_in(&cut, 0, &mut [0u8; 4000]), Err(DecodeError));
+    }
+
+    #[test]
+    fn a_damaged_block_never_reads_or_writes_outside_its_buffers_and_agrees_where_both_decode() {
+        // Every block damaged a byte at a time, cut short, and random bytes:
+        // the decoder returns, never panics, and where it and `lz4_flex`
+        // both decode the bytes they agree on what they decode to.
+        let mut r = Rng(0xDEC0DE);
+        let mut enc = Encoder::new();
+        let mut blocks = Vec::new();
+        for c in decode_cases() {
+            if c.len() < 20 || c.len() > 10_000 {
+                continue;
+            }
+            let mut out = vec![0u8; max_output(c.len())];
+            let n = enc.compress_into(&c, &mut out, Effort::SHIPPED).unwrap();
+            blocks.push((out[..n].to_vec(), c.len()));
+            blocks.push((lz4_flex::block::compress(&c), c.len()));
+        }
+        let (mut both, mut tried) = (0, 0);
+        for (b, ulen) in &blocks {
+            for t in 0..if cfg!(miri) { 8 } else { 40 } {
+                let mut d = b.clone();
+                match t % 4 {
+                    0 => {
+                        let i = r.below(d.len() as u64) as usize;
+                        d[i] ^= 1 << r.below(8);
+                    }
+                    1 => {
+                        let i = r.below(d.len() as u64) as usize;
+                        d[i] = r.below(256) as u8;
+                    }
+                    2 => d.truncate(r.below(d.len() as u64) as usize),
+                    _ => {
+                        let n = r.below(64) as usize;
+                        d = (0..n).map(|_| r.below(256) as u8).collect();
+                    }
+                }
+                for room in [*ulen, ulen + DECODE_SLACK] {
+                    tried += 1;
+                    let mut ours = vec![0u8; room];
+                    let mut theirs = vec![0u8; room];
+                    let a = decompress_into(&d, &mut ours);
+                    // `lz4_flex`'s decode of a damaged block can offset its
+                    // output pointer two past the output's end when the
+                    // output is the whole allocation (`duplicate_overlapping`,
+                    // `while output_ptr.add(1) < dst_ptr_end`), which Miri
+                    // refuses though nothing is read or written there, so a
+                    // run under Miri holds this decoder to itself alone.
+                    let f =
+                        (!cfg!(miri)).then(|| lz4_flex::block::decompress_into(&d, &mut theirs));
+                    if let (Ok(n), Some(Ok(m))) = (a, f) {
+                        both += 1;
+                        assert_eq!(n, m, "the decoded lengths");
+                        assert!(ours[..n] == theirs[..m], "the decoded bytes");
+                    }
+                    // The same bytes with a readable tail decode the same,
+                    // unpadded and padded: a tail of 255s is what a length
+                    // read past the block would take for a continuation.
+                    for (tail, fill) in [
+                        (17usize, 0xEEu8),
+                        (48, 0xEE),
+                        (48, 0xFF),
+                        (80, 0xEE),
+                        (80, 0xFF),
+                    ] {
+                        let mut padded = d.clone();
+                        padded.extend(std::iter::repeat_n(fill, tail));
+                        let mut tailed = vec![0u8; room];
+                        let t = decompress_in(&padded, d.len(), &mut tailed);
+                        assert_eq!(
+                            t.is_ok(),
+                            a.is_ok(),
+                            "a tail changes no verdict: {tail} of {fill:#x}"
+                        );
+                        if let (Ok(n), Ok(m)) = (a, t) {
+                            assert_eq!(n, m);
+                            assert!(ours[..n] == tailed[..m], "a tail changes no byte");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            cfg!(miri) || both > tried / 20,
+            "the damage left some blocks decodable: {both} of {tried}"
+        );
     }
 
     #[test]
