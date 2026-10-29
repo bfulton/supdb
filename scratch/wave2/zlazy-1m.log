@@ -9,3 +9,9 @@ rhc 16:0:8:1: 73564962 compressed bytes recompressed to 70605397 (0.960 of the e
 rhc 8:0:8:1: 73564962 compressed bytes recompressed to 70739235 (0.962 of the engine's), 11.14 us a group to encode, lz4_flex 3.11	70739235 ratio 0.570, 52.4 sequences a group
 hc 9: 73564962 compressed bytes recompressed to 70521948 (0.959 of the engine's) in 1.23 s	70521948 ratio 0.569, 51.7 sequences a group
 hc 12: 73564962 compressed bytes recompressed to 70492671 (0.958 of the engine's) in 3.04 s	70492671 ratio 0.568, 51.9 sequences a group
+rhc 16:0:8:1:0: 73564962 compressed bytes recompressed to 70605397 (0.960 of the engine's), 11.22 us a group to encode, lz4_flex 2.84	70605397 ratio 0.569, 51.9 sequences a group
+rhc 16:0:8:1:16: 73564962 compressed bytes recompressed to 70949589 (0.964 of the engine's), 10.50 us a group to encode, lz4_flex 2.76	70949589 ratio 0.572, 53.0 sequences a group
+rhc 16:0:8:1:8: 73564962 compressed bytes recompressed to 71161192 (0.967 of the engine's), 9.58 us a group to encode, lz4_flex 2.78	71161192 ratio 0.574, 54.1 sequences a group
+rhc 16:0:8:1:4: 73564962 compressed bytes recompressed to 71301512 (0.969 of the engine's), 8.92 us a group to encode, lz4_flex 2.77	71301512 ratio 0.575, 54.5 sequences a group
+rhc 16:0:8:1:2: 73564962 compressed bytes recompressed to 71434101 (0.971 of the engine's), 8.43 us a group to encode, lz4_flex 2.80	71434101 ratio 0.576, 55.2 sequences a group
+rhc 16:0:8:2:4: 73564962 compressed bytes recompressed to 71230108 (0.968 of the engine's), 11.52 us a group to encode, lz4_flex 3.02	71230108 ratio 0.574, 53.8 sequences a group
