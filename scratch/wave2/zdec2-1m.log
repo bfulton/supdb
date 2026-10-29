@@ -1,0 +1,13 @@
+=== zdecode --size 1000000 --rounds 11 
+73564962 compressed bytes to 124000000 decoded, 1662.47 a group decoded, ratio 0.593, 62.1 sequences a group
+the decoders agree on every group
+cycle, the engine's own decoder: exact 777 ns a group (1.01 of lz4_flex, 1.20 of liblz4), roomy 759 (0.98, 1.17); hot exact 357, roomy 332
+cycle (11 rounds over 74588 groups): lz4_flex 773 ns a group (0.465 ns a byte), liblz4 650 ns a group (0.391 ns a byte); liblz4 at 0.84 of lz4_flex
+hot (16 groups, 200 decodes a sample, 11 samples): lz4_flex 273 / 272 ns a group, liblz4 232 / 232 ns a group; liblz4 at 0.85 of lz4_flex
+=== zdecode --size 1000000 --rounds 11 --rhc 16:0:8
+rhc 16:0:8: 73564962 compressed bytes recompressed to 70617964 (0.960 of the engine's), 21.71 us a group to encode, lz4_flex 2.89
+70617964 compressed bytes to 124000000 decoded, 1662.47 a group decoded, ratio 0.569, 52.3 sequences a group
+the decoders agree on every group
+cycle, the engine's own decoder: exact 626 ns a group (1.01 of lz4_flex, 1.17 of liblz4), roomy 604 (0.98, 1.12); hot exact 257, roomy 277
+cycle (11 rounds over 74588 groups): lz4_flex 618 ns a group (0.372 ns a byte), liblz4 537 ns a group (0.323 ns a byte); liblz4 at 0.87 of lz4_flex
+hot (16 groups, 200 decodes a sample, 11 samples): lz4_flex 236 / 221 ns a group, liblz4 191 / 189 ns a group; liblz4 at 0.83 of lz4_flex

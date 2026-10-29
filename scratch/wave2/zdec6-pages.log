@@ -1,0 +1,16 @@
+=== --pages 4
+cycle, the engine's own decoder: exact 592 ns a group (1.08 of lz4_flex, 1.29 of liblz4), paged 505 (0.92, 1.10), flat 542 (0.99, 1.18); hot exact 298, paged 235, flat 318
+cycle (11 rounds over 4 groups): lz4_flex 546 ns a group (0.326 ns a byte), liblz4 459 ns a group (0.274 ns a byte); liblz4 at 0.84 of lz4_flex
+hot (16 groups, 200 decodes a sample, 11 samples): lz4_flex 275 / 268 ns a group, liblz4 240 / 241 ns a group; liblz4 at 0.89 of lz4_flex
+=== --pages 64
+cycle, the engine's own decoder: exact 542 ns a group (0.84 of lz4_flex, 1.19 of liblz4), paged 496 (0.77, 1.09), flat 546 (0.85, 1.20); hot exact 306, paged 227, flat 468
+cycle (11 rounds over 64 groups): lz4_flex 644 ns a group (0.386 ns a byte), liblz4 454 ns a group (0.272 ns a byte); liblz4 at 0.70 of lz4_flex
+hot (16 groups, 200 decodes a sample, 11 samples): lz4_flex 266 / 286 ns a group, liblz4 232 / 234 ns a group; liblz4 at 0.84 of lz4_flex
+=== --pages 1024
+cycle, the engine's own decoder: exact 980 ns a group (0.88 of lz4_flex, 1.12 of liblz4), paged 858 (0.77, 0.98), flat 960 (0.86, 1.09); hot exact 298, paged 219, flat 308
+cycle (11 rounds over 1024 groups): lz4_flex 1112 ns a group (0.667 ns a byte), liblz4 879 ns a group (0.527 ns a byte); liblz4 at 0.79 of lz4_flex
+hot (16 groups, 200 decodes a sample, 11 samples): lz4_flex 503 / 270 ns a group, liblz4 402 / 229 ns a group; liblz4 at 0.82 of lz4_flex
+=== --pages 8192
+cycle, the engine's own decoder: exact 689 ns a group (0.87 of lz4_flex, 1.03 of liblz4), paged 638 (0.80, 0.96), flat 644 (0.81, 0.96); hot exact 315, paged 232, flat 335
+cycle (11 rounds over 8192 groups): lz4_flex 795 ns a group (0.478 ns a byte), liblz4 668 ns a group (0.401 ns a byte); liblz4 at 0.84 of lz4_flex
+hot (16 groups, 200 decodes a sample, 11 samples): lz4_flex 284 / 286 ns a group, liblz4 239 / 248 ns a group; liblz4 at 0.85 of lz4_flex

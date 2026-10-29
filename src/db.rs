@@ -602,6 +602,9 @@ pub struct ZCounts {
     /// thing, and one whose partitions could not be is another.
     pub partitions: u64,
     pub form_files: u64,
+    /// The form files whose block-coded groups decode through the engine's
+    /// own decoder (`Options::zpages_own_decoder`), counted as `form_files`.
+    pub own_decoder_files: u64,
     pub small_partitions: u64,
     pub damaged: u64,
     pub pages: u64,
@@ -1255,6 +1258,24 @@ pub struct Options {
     /// `--rhc`). Off; the record coding's tails keep `lz4_flex`.
     #[doc(hidden)]
     pub zpages_parse: bool,
+    /// The form's block-coded groups decoded by the engine's own LZ4 decoder
+    /// (`db::zlz4::decompress_in`) and not `lz4_flex`'s: the same bytes for
+    /// every block, by liblz4's fast loop in Rust -- a run of fewer than
+    /// fifteen literals one sixteen-byte move, a short match moves of
+    /// eight, eight and two, the long ones moves of sixteen, a group with
+    /// the rest of its page after it read with no input bound but its
+    /// block's -- into a buffer with the slack the loop runs to the group's
+    /// end in, and held to every damaged block of its tests under Miri as
+    /// well as against `lz4_flex`. It decodes a form group in a fifth fewer
+    /// instructions than `lz4_flex` and a little fewer than liblz4, and
+    /// cold in about six sevenths of `lz4_flex`'s time
+    /// (`bench/examples/zdecode.rs`). A form file takes it at its attach
+    /// (`ZFile::own_decoder`) and a build checks its pages through it, so
+    /// each store decodes by its own options. On;
+    /// `supdb-cache64tofitautozpagesflexdec` and
+    /// `supdb-cache64tofitzpagesdropflexdec` are the arms with it off.
+    #[doc(hidden)]
+    pub zpages_own_decoder: bool,
     /// EXPERIMENT: the allocator trimmed once (`malloc_trim`) at the end of
     /// `zpages_settle`, after every partition has its form file: what the
     /// builds' threads and the load left free in their arenas is given back
@@ -2931,6 +2952,7 @@ impl Default for Options {
             zpages_store_all: false,
             zpages_raw_tails: false,
             zpages_parse: false,
+            zpages_own_decoder: true,
             zpages_trim_install: false,
             upkeep_trim_look: false,
             trim_by_resident: false,
@@ -16512,6 +16534,7 @@ impl Reader {
             c.partitions += 1;
             if let Some(z) = seg.z.get() {
                 c.form_files += 1;
+                c.own_decoder_files += u64::from(z.own_decoder);
                 c.damaged += u64::from(z.damaged());
                 c.pages += z.pages() as u64;
                 c.verified_pages += z.verified_pages();
@@ -23824,6 +23847,7 @@ impl Db {
                         opts.zpages_inplace_walk,
                         opts.zpages_drop_raw,
                         opts.zpages_recode,
+                        opts.zpages_own_decoder,
                     ),
                     &zev,
                 );
@@ -27079,7 +27103,7 @@ impl Db {
         prefetch: bool,
         trusted: bool,
         memo_first: bool,
-        lines: (bool, bool, bool, bool, bool),
+        lines: (bool, bool, bool, bool, bool, bool),
         ev: &zfile::ZEvents,
     ) -> bool {
         let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) else {
@@ -27101,6 +27125,7 @@ impl Db {
             Ok(mut side) => {
                 side.inplace = lines.2;
                 side.time_decodes = lines.4;
+                side.own_decoder = lines.5;
                 let installed = seg.z.install(side);
                 if installed {
                     zfile::ZEvents::add(&ev.attached, 1);
@@ -27158,6 +27183,7 @@ impl Db {
                     self.opts.zpages_inplace_walk,
                     self.opts.zpages_drop_raw,
                     self.opts.zpages_recode,
+                    self.opts.zpages_own_decoder,
                 ),
                 ev,
             )
@@ -27177,6 +27203,7 @@ impl Db {
                 plan.store_all = self.opts.zpages_store_all;
                 plan.raw_tails = self.opts.zpages_raw_tails;
                 plan.parse = self.opts.zpages_parse;
+                plan.own_decode = self.opts.zpages_own_decoder;
                 plan
             })
         };
@@ -27203,6 +27230,7 @@ impl Db {
                     Ok(mut side) => {
                         side.inplace = self.opts.zpages_inplace_walk;
                         side.time_decodes = self.opts.zpages_recode;
+                        side.own_decoder = self.opts.zpages_own_decoder;
                         if seg.z.install(side) {
                             ev.built(&b);
                             zfile::ZEvents::add(&ev.attached, 1);
@@ -34539,6 +34567,7 @@ impl Maint {
         let store_all = self.opts.zpages_store_all;
         let raw_tails = self.opts.zpages_raw_tails;
         let parse = self.opts.zpages_parse;
+        let own_decode = self.opts.zpages_own_decoder;
         // Where the selector chooses the coding, the raw-tail record coding
         // is sized beside the options' (`zselect::choose_coding`).
         let second = (self.opts.zpages_coding_auto && !raw_tails && !store_all).then_some(
@@ -34548,6 +34577,7 @@ impl Maint {
                 store_all: false,
                 raw_tails: true,
                 parse,
+                own_decode,
             },
         );
         let wake = self.wake.clone();
@@ -34576,6 +34606,7 @@ impl Maint {
                             store_all,
                             raw_tails,
                             parse,
+                            own_decode,
                         });
                         let r2 = second.map(take);
                         (s, r, r2)
@@ -35256,6 +35287,7 @@ impl Maint {
                     self.opts.zpages_inplace_walk,
                     self.opts.zpages_drop_raw,
                     self.opts.zpages_recode,
+                    self.opts.zpages_own_decoder,
                 ),
                 ev,
             )
@@ -35332,6 +35364,7 @@ impl Maint {
         plan.store_all = self.opts.zpages_store_all;
         plan.raw_tails = raw_tails;
         plan.parse = self.opts.zpages_parse;
+        plan.own_decode = self.opts.zpages_own_decoder;
         if raw_tails {
             zfile::ZEvents::add(&ev.builds_raw_tails, 1);
         }
@@ -35470,6 +35503,7 @@ impl Maint {
                     Ok(mut side) => {
                         side.inplace = self.opts.zpages_inplace_walk;
                         side.time_decodes = self.opts.zpages_recode;
+                        side.own_decoder = self.opts.zpages_own_decoder;
                         side.drop_cache();
                         let old = target.z_spare.keep(Box::into_raw(Box::new(side)));
                         if !old.is_null() {
@@ -35516,6 +35550,7 @@ impl Maint {
                     Ok(mut side) => {
                         side.inplace = self.opts.zpages_inplace_walk;
                         side.time_decodes = self.opts.zpages_recode;
+                        side.own_decoder = self.opts.zpages_own_decoder;
                         let coded = side.coded();
                         let mut old = target.z.replace(side);
                         // Kept where the option keeps it, its pages dropped,
@@ -35586,6 +35621,7 @@ impl Maint {
                         Ok(mut side) => {
                             side.inplace = self.opts.zpages_inplace_walk;
                             side.time_decodes = self.opts.zpages_recode;
+                            side.own_decoder = self.opts.zpages_own_decoder;
                             if target.z.install(side) {
                                 ev.built(&built);
                                 zfile::ZEvents::add(&ev.attached, 1);

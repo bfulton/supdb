@@ -32,10 +32,11 @@
 
 use super::zpages::{
     bind32, check_coded_group, check_entry, check_group, cmp_coded_key, coded_first, coded_header,
-    coded_key_into, coded_rec, decode_group, decode_record, fill_page, filter_bytes, group_seek,
-    page_view, parse_page, record_group_seek, verify_page, view_trusted, walk_group, FenceEntry,
-    Fill, FillScratch, FillStats, GroupBuf, Images, NoPage, PageView, SegImages, Trailer, ZError,
-    ZFence, ZCODING_BLOCK, ZGROUP_BYTES, ZMAX_GROUPS, ZNOPAGE, ZPAGE, ZTRAILER,
+    coded_key_into, coded_rec, decode_group_with, decode_record, fill_page, filter_bytes,
+    group_seek, page_view, parse_page, record_group_seek, verify_page_with, view_trusted,
+    walk_group, FenceEntry, Fill, FillScratch, FillStats, GroupBuf, Images, NoPage, PageView,
+    SegImages, Trailer, ZError, ZFence, ZCODING_BLOCK, ZGROUP_BYTES, ZMAX_GROUPS, ZNOPAGE, ZPAGE,
+    ZTRAILER,
 };
 use crate::blob::{Blob, BlobOptions, ZSource};
 use crate::bytes::{Bytes, MmapBytes};
@@ -1333,8 +1334,9 @@ pub(super) fn first_decode<'a>(
     entry: &FenceEntry<'_>,
     j: usize,
     buf: &'a mut GroupBuf,
+    own: bool,
 ) -> std::result::Result<Open<'a>, Fail> {
-    let view = first_checks(page, bind, entry, Some(j))?;
+    let view = first_checks(page, bind, entry, Some(j), own)?;
     let g = view
         .group(j)
         .ok_or(Fail::Check(ZError::Header("no such group in the page")))?;
@@ -1342,7 +1344,7 @@ pub(super) fn first_decode<'a>(
     if g.stored && !aligned_for_extents(payload) {
         return Err(Fail::Misaligned);
     }
-    let group = decode_group(&view, j, buf)?;
+    let group = decode_group_with(&view, j, buf, own)?;
     check_group(group, &view, j, entry)?;
     Ok((group, usize::from(g.first), usize::from(g.count), !g.stored))
 }
@@ -1359,6 +1361,7 @@ pub(super) fn first_checks<'a>(
     bind: u32,
     entry: &FenceEntry<'_>,
     except: Option<usize>,
+    own: bool,
 ) -> std::result::Result<PageView<'a>, Fail> {
     let view = parse_page(page, bind)?;
     check_entry(&view, entry)?;
@@ -1373,7 +1376,7 @@ pub(super) fn first_checks<'a>(
                 let payload = view.payload(k).ok_or(ZError::Length)?;
                 check_coded_group(payload, &view, k, entry)
             } else {
-                let other = decode_group(&view, k, &mut scratch)?;
+                let other = decode_group_with(&view, k, &mut scratch, own)?;
                 check_group(other, &view, k, entry)
             }
         });
@@ -1391,7 +1394,7 @@ pub(super) fn verified_group<'a>(
     buf: &'a mut GroupBuf,
 ) -> std::result::Result<Open<'a>, Fail> {
     let view = page_view(page)?;
-    verified_group_in(&view, j, buf)
+    verified_group_in(&view, j, buf, false)
 }
 
 /// `verified_group` over a view the caller took of the page: the group the
@@ -1400,6 +1403,7 @@ pub(super) fn verified_group_in<'a>(
     view: &PageView<'a>,
     j: usize,
     buf: &'a mut GroupBuf,
+    own: bool,
 ) -> std::result::Result<Open<'a>, Fail> {
     let g = view
         .group(j)
@@ -1408,7 +1412,7 @@ pub(super) fn verified_group_in<'a>(
     if g.stored && !aligned_for_extents(payload) {
         return Err(Fail::Misaligned);
     }
-    let group = decode_group(view, j, buf)?;
+    let group = decode_group_with(view, j, buf, own)?;
     Ok((group, usize::from(g.first), usize::from(g.count), !g.stored))
 }
 
@@ -1880,6 +1884,10 @@ pub(super) struct ZFile {
     /// The hash every page's CRC is xored with, recomputed from the live
     /// segment and not taken from the file.
     bind: u32,
+    /// The block coding's groups decoded by the engine's own decoder
+    /// (`Options::zpages_own_decoder`), set by the store after the attach
+    /// as `inplace` is; `lz4_flex`'s where not.
+    pub(super) own_decoder: bool,
     /// One bit per page: the first-decode checks passed in this process,
     /// over every group of it.
     verified: Box<[AtomicU64]>,
@@ -2054,6 +2062,7 @@ impl ZFile {
             nkeys,
             n_pages,
             bind,
+            own_decoder: false,
             verified: (0..n_pages.div_ceil(64))
                 .map(|_| AtomicU64::new(0))
                 .collect(),
@@ -2216,7 +2225,7 @@ impl ZFile {
             if let Some(payload) = view.payload(j) {
                 if raw_tail_group(payload, usize::from(g.count)) {
                     if !was_verified {
-                        match first_checks(page, self.bind, entry, None) {
+                        match first_checks(page, self.bind, entry, None, self.own_decoder) {
                             Ok(_) => set_bit(&self.verified, p),
                             Err(Fail::Misaligned) => return None,
                             Err(Fail::Check(_)) => {
@@ -2266,9 +2275,9 @@ impl ZFile {
             let tick = self.decode_tick();
             let (first, count, ulen) = {
                 let opened = if was_verified {
-                    verified_group_in(view, j, &mut fresh)
+                    verified_group_in(view, j, &mut fresh, self.own_decoder)
                 } else {
-                    first_decode(page, self.bind, entry, j, &mut fresh)
+                    first_decode(page, self.bind, entry, j, &mut fresh, self.own_decoder)
                 };
                 match opened {
                     Ok((g, first, count, _)) => (first, count, g.len()),
@@ -2298,9 +2307,9 @@ impl ZFile {
         }
         let tick = self.decode_tick();
         let opened = if was_verified {
-            verified_group_in(view, j, buf)
+            verified_group_in(view, j, buf, self.own_decoder)
         } else {
-            first_decode(page, self.bind, entry, j, buf)
+            first_decode(page, self.bind, entry, j, buf, self.own_decoder)
         };
         match opened {
             Ok((g, first, count, decoded)) => {
@@ -2487,7 +2496,7 @@ impl ZFile {
                     self.fail(p);
                     return Locate::Fallback;
                 };
-                match first_checks(page, self.bind, &entry, None) {
+                match first_checks(page, self.bind, &entry, None, self.own_decoder) {
                     Ok(_) => set_bit(&self.verified, p),
                     Err(Fail::Misaligned) => return Locate::Fallback,
                     Err(Fail::Check(_)) => {
@@ -3000,7 +3009,7 @@ impl ZFile {
             ) {
                 memo.touch(self.id, entry.page, self.n_pages);
                 if !bit(&self.verified, p) {
-                    match first_checks(page, self.bind, &entry, None) {
+                    match first_checks(page, self.bind, &entry, None, self.own_decoder) {
                         Ok(_) => set_bit(&self.verified, p),
                         Err(Fail::Misaligned) => return ZSeek::Fallback,
                         Err(Fail::Check(_)) => {
@@ -3919,6 +3928,10 @@ pub(super) struct BuildPlan {
     /// The block coding's groups written by the parsing encoder
     /// (`Options::zpages_parse`, `FillScratch::parse`).
     pub parse: bool,
+    /// The pages the build writes checked through the engine's own decoder
+    /// (`Options::zpages_own_decoder`, `FillScratch::own_decode`), the one
+    /// the store's readers take.
+    pub own_decode: bool,
     /// A build on a thread of its own looks here once a page: set, the
     /// build stops, removes its temp file and answers `Outcome::Cancelled`.
     /// A merge that takes the build's target as an input sets it.
@@ -3942,6 +3955,7 @@ impl BuildPlan {
             store_all: false,
             raw_tails: false,
             parse: false,
+            own_decode: false,
             cancel: None,
             hold: None,
         }
@@ -4129,6 +4143,7 @@ fn write_pages(
     scratch.store_all = plan.store_all;
     scratch.raw_tails = plan.raw_tails;
     scratch.parse = plan.parse;
+    scratch.own_decode = plan.own_decode;
     let mut verify_buf = GroupBuf::new();
     let mut fence = ZFence::new();
     let recs_at = recs.as_ptr() as usize - base;
@@ -4184,9 +4199,9 @@ fn write_pages(
                     page: pages,
                     key,
                 };
-                verify_page(&page, bind, &entry, &mut verify_buf).map_err(|e| {
-                    super::err(&format!("z build: a page fails the reader's checks: {e}"))
-                })?;
+                verify_page_with(&page, bind, &entry, &mut verify_buf, plan.own_decode).map_err(
+                    |e| super::err(&format!("z build: a page fails the reader's checks: {e}")),
+                )?;
                 fence.push(entry.first_rank, pages, key)?;
                 for r in rank..rank + g.count {
                     let k = record_key(images.image(r), 0)
@@ -4522,6 +4537,7 @@ pub(super) struct FillShape {
     pub store_all: bool,
     pub raw_tails: bool,
     pub parse: bool,
+    pub own_decode: bool,
 }
 
 impl Default for FillShape {
@@ -4532,6 +4548,7 @@ impl Default for FillShape {
             store_all: false,
             raw_tails: false,
             parse: false,
+            own_decode: false,
         }
     }
 }
@@ -4544,6 +4561,7 @@ impl FillShape {
         scratch.store_all = self.store_all;
         scratch.raw_tails = self.raw_tails;
         scratch.parse = self.parse;
+        scratch.own_decode = self.own_decode;
     }
 }
 
@@ -4610,9 +4628,10 @@ pub(super) fn sample(
                         super::err(&format!("z sample: a page fails its own parse: {e}"))
                     })?;
                     for j in 0..view.groups() {
-                        let group = decode_group(&view, j, &mut buf).map_err(|e| {
-                            super::err(&format!("z sample: a page fails its own decode: {e}"))
-                        })?;
+                        let group = decode_group_with(&view, j, &mut buf, shape.own_decode)
+                            .map_err(|e| {
+                                super::err(&format!("z sample: a page fails its own decode: {e}"))
+                            })?;
                         let count = view.group(j).map_or(0, |g| usize::from(g.count));
                         walk_group(group, count, None, None).map_err(|e| {
                             super::err(&format!("z sample: a group fails its own walk: {e}"))
@@ -5659,7 +5678,7 @@ mod tests {
         let (aligned, at) = page_at(&page, 0);
         let p = &aligned[at..at + ZPAGE];
         assert_eq!(p.as_ptr() as usize % 8, 0);
-        let (group, _, count, decoded) = first_decode(p, bind, &entry, 0, &mut buf).unwrap();
+        let (group, _, count, decoded) = first_decode(p, bind, &entry, 0, &mut buf, false).unwrap();
         assert!(!decoded && count == usize::from(h.count));
         assert!(group_seek(group, count, &key0).unwrap().found);
         let (group, _, count, decoded) = verified_group(p, 0, &mut buf).unwrap();
@@ -5673,7 +5692,7 @@ mod tests {
             let p = &backing[at..at + ZPAGE];
             assert_ne!((p.as_ptr() as usize + ZHDR) % 4, 0, "skew {skew}");
             assert_eq!(
-                first_decode(p, bind, &entry, 0, &mut buf).unwrap_err(),
+                first_decode(p, bind, &entry, 0, &mut buf, false).unwrap_err(),
                 Fail::Misaligned,
                 "skew {skew}"
             );
@@ -6405,7 +6424,7 @@ mod tests {
         let mut buf = GroupBuf::new();
         let mut group = Vec::new();
         for j in 0..view.groups() {
-            group.extend_from_slice(decode_group(&view, j, &mut buf).unwrap());
+            group.extend_from_slice(decode_group_with(&view, j, &mut buf, false).unwrap());
         }
         let (mut out, mut off) = (Vec::new(), 0usize);
         for _ in 0..view.header.count {

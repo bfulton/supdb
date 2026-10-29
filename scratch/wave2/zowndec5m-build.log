@@ -1,0 +1,5 @@
+   Compiling bindgen v0.72.1
+   Compiling librocksdb-sys v0.17.3+10.4.2
+   Compiling rocksdb v0.23.0
+   Compiling supdb-bench v0.2.0 (/home/user/supdb/bench)
+    Finished `release` profile [optimized + debuginfo] target(s) in 7m 24s

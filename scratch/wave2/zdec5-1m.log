@@ -1,0 +1,73 @@
+=== zdecode --size 1000000 --rounds 11 
+1000000 keys loaded under supdb-nocachezpages in 1.59 s
+4 form files, 18649 pages, 74588 compressed groups, 0 stored groups skipped
+73564962 compressed bytes to 124000000 decoded, 1662.47 a group decoded, ratio 0.593, 62.1 sequences a group
+the decoders agree on every group
+cycle, the engine's own decoder: exact 830 ns a group (0.91 of lz4_flex, 1.06 of liblz4), paged 743 (0.81, 0.95); hot exact 253, paged 245
+cycle (11 rounds over 74588 groups): lz4_flex 917 ns a group (0.552 ns a byte), liblz4 784 ns a group (0.471 ns a byte); liblz4 at 0.85 of lz4_flex
+hot (16 groups, 200 decodes a sample, 11 samples): lz4_flex 266 / 272 ns a group, liblz4 232 / 233 ns a group; liblz4 at 0.86 of lz4_flex
+
+split: each group cut into k runs compressed apart; bytes as the compressed over the decoded (the file's own 0.593); ns a decode cycling 74588 groups, median of 11 rounds
+  k   bytes  ratio     run B  one flex     one C  all flex     all C
+  1   0.593  1.000      1662       829       688       831       701
+  2   0.633  1.067       831       489       443       860       721
+  4   0.701  1.181       416       406       392       905       851
+  8   0.810  1.365       224       356       356       846       841
+ 16   0.961  1.620       124       199       176       713       727
+=== zdecode --size 1000000 --rounds 11 --rhc 16:0:8
+1000000 keys loaded under supdb-nocachezpages in 1.56 s
+4 form files, 18649 pages, 74588 compressed groups, 0 stored groups skipped
+
+thread 'main' (32729) panicked at examples/zdecode.rs:139:47:
+range end index 1147 out of range for slice of length 0
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/core/src/panicking.rs:80:14
+   2: core::slice::index::slice_index_fail
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/core/src/panic.rs:177:9
+   3: zdecode::main
+   4: <fn() as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+=== zdecode --size 1000000 --rounds 11 --rhc 16:0:8
+1000000 keys loaded under supdb-nocachezpages in 1.73 s
+4 form files, 18649 pages, 74588 compressed groups, 0 stored groups skipped
+rhc 16:0:8: 73564962 compressed bytes recompressed to 70617964 (0.960 of the engine's), 22.01 us a group to encode, lz4_flex 2.91
+70617964 compressed bytes to 124000000 decoded, 1662.47 a group decoded, ratio 0.569, 52.3 sequences a group
+the decoders agree on every group
+cycle, the engine's own decoder: exact 639 ns a group (0.87 of lz4_flex, 0.95 of liblz4), paged 606 (0.82, 0.90); hot exact 233, paged 211
+cycle (11 rounds over 74588 groups): lz4_flex 735 ns a group (0.442 ns a byte), liblz4 672 ns a group (0.404 ns a byte); liblz4 at 0.91 of lz4_flex
+hot (16 groups, 200 decodes a sample, 11 samples): lz4_flex 283 / 402 ns a group, liblz4 330 / 331 ns a group; liblz4 at 0.96 of lz4_flex
+
+
+thread 'main' (1502) panicked at examples/zdecode.rs:353:13:
+assertion `left == right` failed: a group recompressed whole is its payload
+  left: 73564962
+ right: 70617964
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/core/src/panicking.rs:434:23
+   3: core::panicking::assert_failed::<usize, usize>
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/core/src/panicking.rs:394:5
+   4: zdecode::split_probe
+             at ./examples/zdecode.rs:353:13
+   5: zdecode::main
+             at ./examples/zdecode.rs:791:9
+   6: <fn() as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/2d8144b7880597b6e6d3dfd63a9a9efae3f533d3/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+=== zdecode --size 1000000 --rounds 11 
+1000000 keys loaded under supdb-nocachezpages in 1.58 s
+4 form files, 18649 pages, 74588 compressed groups, 0 stored groups skipped
+73564962 compressed bytes to 124000000 decoded, 1662.47 a group decoded, ratio 0.593, 62.1 sequences a group
+the decoders agree on every group
+cycle, the engine's own decoder: exact 790 ns a group (0.85 of lz4_flex, 1.00 of liblz4), paged 754 (0.81, 0.95); hot exact 487, paged 472
+cycle (11 rounds over 74588 groups): lz4_flex 926 ns a group (0.557 ns a byte), liblz4 791 ns a group (0.476 ns a byte); liblz4 at 0.85 of lz4_flex
+hot (16 groups, 200 decodes a sample, 11 samples): lz4_flex 290 / 308 ns a group, liblz4 231 / 378 ns a group; liblz4 at 1.02 of lz4_flex
+

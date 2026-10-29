@@ -114,9 +114,16 @@ costs more, so the coding is an arm. The profile at `3a885a9` (below) has
 E's remaining cost spread over the decode (24%, at the cold decoder's
 figure, which is its branches and not its lines), the start seek (20%, a
 third of it decodes wasted on copy starts), the walks, the builds and the
-settle, none above a quarter; the one lever of size left on the decode is
-liblz4 (its high-compression mode and its decoder), a C dependency and the
-user's call.
+settle, none above a quarter. The decode's lever was taken in Rust: the
+form's block-coded groups are decoded by the engine's own decoder now
+(`Options::zpages_own_decoder`, on; `zlz4::decompress_in`), 3,355
+instructions a group against liblz4's 3,438 and `lz4_flex`'s 4,112, cold
+about six sevenths of `lz4_flex`'s time, clean under Miri, and paired at 5M
+under 640 MiB with no cell losing in both orders and E 1.00 forced and 1.06
+combined by the two orders' mean (`stage4.md`, "The decoder under liblz4's
+instructions"). The flat loop, a turn with no branch on a length, was tried
+and refuted: the cold decode's excess over the hot one is not the length
+branches, and with no PMU here what it is cannot be told.
 
 ## This session: a block read through one cursor
 
@@ -898,6 +905,23 @@ depends on the change.
 - The container restarted once during a gate's test group, at the checked
   compile of the engine, with nothing else running; the gate was run again
   from the start. `free` read 15.5 GB free of 16 after it.
+- The controller's tests in `tests/zpages.rs` fail two to six apiece when
+  three processes of the unoptimized test binary share the four cores (the
+  tick's minute in `wait_tick`, the trial's, the ski rental's and the
+  raw-tail pick's waits), on the tree before the decoder as on the tree
+  after it; the gate runs them optimized and alone, green. Not fixed here.
+- Miri (nightly, `cargo +nightly miri test --lib -- zlz4::`) runs the
+  decoder's tests over the cases of 2 KB or less in a quarter hour; it
+  refuses `lz4_flex` on one damaged block of the full set, a pointer two past
+  its output's end in `duplicate_overlapping` with nothing read or written
+  there, so the tests skip `lz4_flex` under Miri.
+- The gate's checked compile of `tests/db.rs` read a `VmHWM` of 13,209 MiB
+  at the own decoder's commit, with `debug = 1`, against the tool group's
+  14,341,885,952-byte limit, whose `memory.max_usage_in_bytes` read the
+  limit itself: about 1% of headroom where `CLAUDE.md` records 7.0 GiB. It
+  survived; the next growth of the engine will have it killed. The checked
+  profile's codegen settings are the lever, measured by peak and by the
+  test group's time before anything moves.
 - Nothing is uncommitted.
 - The suite's `the_removal_arms_differ_from_their_default_in_the_one_option`
   overflows the test thread's stack in the dev profile at `3a885a9` already
