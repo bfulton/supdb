@@ -58,21 +58,29 @@ pub struct Effort {
     /// A match this long has its positions inserted and not searched, but
     /// for the last [`RESUME`] it covers.
     pub skip_min: u32,
+    /// Zero: the shortest path over the longest match at every position.
+    /// Else the lazy parse: a match taken where none of the next `lazy`
+    /// positions starts a longer one, and the positions it covers only
+    /// inserted, searched by nothing.
+    pub lazy: u32,
 }
 
 impl Effort {
-    /// The search the form ships with: sixteen chain positions, a
-    /// sequence priced at its bytes alone, and the inside of a match of
-    /// eight or more not searched. Priced on the form's own groups
+    /// The search the form ships with: sixteen chain positions and the
+    /// lazy parse one step ahead. Priced on the form's own groups
     /// (`bench/examples/zdecode.rs`, `--rhc`): the groups' bytes at 0.96
     /// of the greedy encoder's and their sequences at 0.84, as liblz4's
-    /// high-compression mode writes them; sixty-four positions buy a
-    /// fiftieth of a percent, and a price on sequences buys fewer of them
-    /// and a slower decode, the literals they leave costing more.
+    /// high-compression mode writes them, in half the time of the shortest
+    /// path over every position (`lazy: 0`), whose bytes and sequences it
+    /// matches; sixty-four positions or a second step ahead buy a
+    /// fiftieth of a percent, and a price on sequences, which the shortest
+    /// path takes, buys fewer of them and a slower decode, the literals
+    /// they leave costing more.
     pub const SHIPPED: Effort = Effort {
         attempts: 16,
         seq_cost: 0,
         skip_min: 8,
+        lazy: 1,
     };
 }
 
@@ -135,8 +143,74 @@ impl Encoder {
         if input.len() < MFLIMIT + 1 || e.attempts == 0 {
             return;
         }
+        if e.lazy > 0 {
+            self.lazy(input, e);
+            return;
+        }
         self.search(input, e);
         self.shortest(input, e);
+    }
+
+    /// The lazy parse, its sequences left in `seqs`: at each position not
+    /// inside a match taken, the longest match its chain holds, taken
+    /// where none of the next `e.lazy` positions starts a longer one, the
+    /// longer one tried in its place otherwise; the positions a match
+    /// covers joined to their chains and not searched. Every position is
+    /// inserted before any later one is searched, so a search sees the
+    /// whole window behind it, as `search` does.
+    #[inline(never)]
+    fn lazy(&mut self, input: &[u8], e: Effort) {
+        let n = input.len();
+        if self.base as usize > u32::MAX as usize - 2 * MAX_INPUT - 2 {
+            self.head.iter_mut().for_each(|h| *h = 0);
+            self.base = 0;
+        }
+        let base = self.base;
+        self.base += n as u32 + 1;
+        if self.chain.len() < n {
+            self.chain.resize(n, 0);
+        }
+        let head = &mut self.head[..];
+        let chain = &mut self.chain[..n];
+        let last_start = n - MFLIMIT;
+        let limit = n - LASTLITERALS;
+        // Every position before `ins` is in its chain.
+        let mut ins = 0usize;
+        let at = |p: usize, ins: &mut usize, head: &mut [u32], chain: &mut [u16]| {
+            longest_at(input, p, limit, e.attempts, ins, head, chain, base)
+        };
+        let (mut s, mut anchor) = (0usize, 0usize);
+        while s <= last_start {
+            let (mut len, mut off) = at(s, &mut ins, head, chain);
+            if len < MINMATCH {
+                s += 1;
+                continue;
+            }
+            // A match `k` steps on is taken in this one's place where it is
+            // longer by more than the `k - 1` literals more it leaves, and
+            // the steps after it are asked in turn. The positions are asked
+            // in order, so each is searched once and after every position
+            // before it is in its chain.
+            'ahead: loop {
+                for k in 1..=e.lazy as usize {
+                    if s + k > last_start {
+                        break 'ahead;
+                    }
+                    let (l2, o2) = at(s + k, &mut ins, head, chain);
+                    if l2 > len + k - 1 {
+                        s += k;
+                        (len, off) = (l2, o2);
+                        continue 'ahead;
+                    }
+                }
+                break;
+            }
+            self.seqs
+                .push((anchor as u32, (s - anchor) as u32, off as u16, len as u32));
+            s += len;
+            anchor = s;
+        }
+        self.seqs.reverse();
     }
 
     /// The longest match at every position a match may start at, in
@@ -356,15 +430,66 @@ impl Encoder {
 }
 
 /// Position `s`, whose four bytes hash to `h`, at the head of its chain,
-/// linked to the one it displaces where that is in the window.
+/// linked to the one it displaces. A group is at most [`MAX_INPUT`] bytes,
+/// so every position of it is in the window of every later one.
+#[inline(always)]
 fn insert(head: &mut [u32], chain: &mut [u16], s: usize, h: usize, base: u32) {
     let prev = head[h];
-    chain[s] = if prev > base && s - (prev - base - 1) as usize <= MAX_DISTANCE {
-        (s - (prev - base - 1) as usize) as u16
+    chain[s] = if prev > base {
+        let d = s - (prev - base - 1) as usize;
+        debug_assert!(d <= MAX_DISTANCE);
+        d as u16
     } else {
         0
     };
     head[h] = base + s as u32 + 1;
+}
+
+/// The longest match at `p` among the first `attempts` positions of its
+/// chain, after every position from `*ins` to `p` has joined its own: its
+/// length, `MINMATCH - 1` where there is none, and its offset. `p` itself
+/// joins at the next call.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn longest_at(
+    input: &[u8],
+    p: usize,
+    limit: usize,
+    attempts: u32,
+    ins: &mut usize,
+    head: &mut [u32],
+    chain: &mut [u16],
+    base: u32,
+) -> (usize, usize) {
+    while *ins < p {
+        insert(head, chain, *ins, hash(read_u32(input, *ins)), base);
+        *ins += 1;
+    }
+    let v = read_u32(input, p);
+    let max_len = limit - p;
+    let (mut best_len, mut best_off) = (MINMATCH - 1, 0usize);
+    let mut cand = head[hash(v)];
+    let mut tries = attempts;
+    while cand > base && tries > 0 {
+        let q = (cand - base - 1) as usize;
+        tries -= 1;
+        if input[q + best_len] == input[p + best_len] && read_u32(input, q) == v {
+            let l = common(input, q, p, max_len);
+            if l > best_len {
+                best_len = l;
+                best_off = p - q;
+                if l == max_len {
+                    break;
+                }
+            }
+        }
+        let c = chain[q];
+        if c == 0 {
+            break;
+        }
+        cand -= c as u32;
+    }
+    (best_len, best_off)
 }
 
 /// The longest block an input of `n` bytes can encode to: every byte a
@@ -945,22 +1070,39 @@ mod tests {
                 attempts: 0,
                 seq_cost: 0,
                 skip_min: 8,
+                lazy: 0,
             },
             Effort {
                 attempts: 1,
                 seq_cost: 0,
                 skip_min: 8,
+                lazy: 0,
             },
             Effort::SHIPPED,
             Effort {
                 attempts: 512,
                 seq_cost: 0,
                 skip_min: 8,
+                lazy: 0,
             },
             Effort {
                 attempts: 64,
                 seq_cost: 6,
                 skip_min: 8,
+                lazy: 0,
+            },
+            Effort {
+                lazy: 1,
+                ..Effort::SHIPPED
+            },
+            Effort {
+                lazy: 2,
+                ..Effort::SHIPPED
+            },
+            Effort {
+                attempts: 1,
+                lazy: 3,
+                ..Effort::SHIPPED
             },
         ] {
             for c in cases() {
@@ -1048,6 +1190,7 @@ mod tests {
                     attempts: 16,
                     seq_cost: 8,
                     skip_min: 8,
+                    lazy: 0,
                 },
             )
             .unwrap();
@@ -1113,6 +1256,7 @@ mod tests {
                     attempts: 0,
                     seq_cost: 0,
                     skip_min: 8,
+                    lazy: 0,
                 },
             ] {
                 let mut out = vec![0u8; max_output(c.len())];

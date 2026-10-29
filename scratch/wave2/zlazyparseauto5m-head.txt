@@ -1,0 +1,15 @@
+2abc961
+ M bench/examples/zdecode.rs
+ M scratch/wave2/stage4.md
+ M src/db/zlz4.rs
+?? scratch/wave2/zlazy-1m.log
+?? scratch/wave2/zlazyparse5m-ab-1.err
+?? scratch/wave2/zlazyparse5m-ab-1.out
+?? scratch/wave2/zlazyparse5m-ab-2.err
+?? scratch/wave2/zlazyparse5m-ab-2.out
+?? scratch/wave2/zlazyparse5m-build.log
+?? scratch/wave2/zlazyparse5m-head.txt
+?? scratch/wave2/zlazyparseauto5m-build.log
+?? scratch/wave2/zlazyparseauto5m-head.txt
+?? scratch/wave2/zrhc4-1m.log
+2026-10-29T20:44:03Z

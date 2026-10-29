@@ -1,0 +1,7 @@
+rhc 1:0:8: 73564962 compressed bytes recompressed to 73140631 (0.994 of the engine's), 21.21 us a group to encode, lz4_flex 2.82
+rhc 2:0:8: 73564962 compressed bytes recompressed to 71952736 (0.978 of the engine's), 21.31 us a group to encode, lz4_flex 2.95
+rhc 4:0:8: 73564962 compressed bytes recompressed to 71160185 (0.967 of the engine's), 22.41 us a group to encode, lz4_flex 3.04
+rhc 8:0:8: 73564962 compressed bytes recompressed to 70758530 (0.962 of the engine's), 22.46 us a group to encode, lz4_flex 3.01
+rhc 16:0:8: 73564962 compressed bytes recompressed to 70617964 (0.960 of the engine's), 21.64 us a group to encode, lz4_flex 2.84
+rhc 16:0:4: 73564962 compressed bytes recompressed to 70644337 (0.960 of the engine's), 26.70 us a group to encode, lz4_flex 3.53
+rhc 16:0:16: 73564962 compressed bytes recompressed to 70607004 (0.960 of the engine's), 24.10 us a group to encode, lz4_flex 3.03
