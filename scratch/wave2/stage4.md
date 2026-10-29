@@ -4222,3 +4222,12 @@ the cost is the later install, the gear shift this arm's encoder makes
 longer, and on `Auto` that outweighs every read the better groups save. The
 arm stays off; its encoder is the lazy parse, which does what the shortest
 path did in half the time.
+
+Refuted, a sparse cover: a taken match inserting only its start and its
+last few positions, as the greedy encoder's sparse table does. Its last 16,
+8, 4 and 2 read 10.5, 9.6, 8.9 and 8.4 µs a group against 11.2 for every
+position, and the bytes 0.964, 0.967, 0.969 and 0.971 of the greedy
+encoder's against 0.960, in 53.0-55.2 sequences a group against 51.9
+(`zlazy-1m.log`): the positions inside a match are what the later matches
+are found through, so leaving them out gives back the parse's sequences
+faster than it saves the insert. Taken out again.
