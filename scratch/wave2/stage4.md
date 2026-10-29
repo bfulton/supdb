@@ -4171,3 +4171,54 @@ the four cores, at the tick's minute (`wait_tick`) and at the trial's, the
 ski rental's and the raw-tail pick's waits -- 18 failures in six processes
 on this tree and 24 on the tree before it (`7e59db2`, a worktree of its own),
 the same tests at the same lines. The gate runs them optimized and alone.
+
+## The parsing encoder made lazy: liblz4's high-compression bytes in two thirds of its time
+
+The shortest path over every position (`zlz4::Encoder::shortest`) was
+half the parsing encoder's 211 thousand instructions a group and the
+search the other half, and the search's depth was not what they paid for:
+one chain position a search to sixteen read 21-22 µs a group throughout
+(`zrhc4-1m.log`), the bytes going from 0.994 of the greedy encoder's to
+0.960. A lazy parse (`Effort::lazy`, `Encoder::lazy`) takes the longest
+match at a position unless one of the next `lazy` positions starts a longer
+one, by more than the literals it leaves, and only inserts the positions a
+taken match covers: one step ahead with sixteen chain positions it wrote
+70,605,397 bytes where the shortest path wrote 70,617,964, in 51.9
+sequences a group against 52.3, at 13.9 µs a group against 20.6
+(`zlazy-1m.log`); two steps ahead or sixty-four positions bought a
+hundredth of a percent. The search as a closure was not inlined and paid
+23 instructions of prologue a call over 792 calls a group, and the insert
+checked a distance a group of at most 64 KiB cannot exceed; inlined and
+taken out, 10.6 µs a group, the bytes unchanged. Beside it on the same
+groups liblz4's high-compression mode took 16.5 µs a group at level 9
+(70,521,948 bytes, 51.7 sequences) and 40.8 at level 12 (70,492,671, 51.9),
+each timed with a `lz4_flex` decode of the group, a third of a microsecond:
+the lazy parse writes a tenth of a percent more than level 9 in two thirds
+of its time and a sixth of a percent more than level 12 in a quarter. A
+third of what is left is the insert of every position into its chain, which
+liblz4's mode pays too. It is the shipped effort now (`Effort::SHIPPED`,
+`lazy: 1`); the shortest path stays for `lazy: 0` and the price on
+sequences only it takes.
+
+Paired at five million keys under 640 MiB in both orders, the parse arms
+with the lazy parse against their bases (`zlazyparse5m-ab-{1,2}`, the forced
+form with the drop; `zlazyparseauto5m-ab-{1,2}`, the combined arm). Forced,
+parse over base by sitting and the two orders' mean: the read pass after the
+load 1.09 and 1.09, where the shortest path's build had read it at
+0.75-0.77, the scan pass 1.08 and 1.07, C 1.20 and 1.01, F 1.01 and 1.10, B
+1.06 and 1.02, D 1.07 and 0.98, A 0.97 and 0.99, and E 1.17 and 0.89, the
+arm run second winning it by an eighth either way; by kind over the twelve
+pairs every mix's reads take 0.90-0.95 of the base's time and E's scans
+0.94; the form files 0.957 of the base's bytes. Combined, the mixes read
+the parse arm at 0.24-0.68 with the base first and 1.8-7.8x behind it with
+the parse first, and the controller's trace says why: the sampler prices
+the build at twice the CPU (`c_build` 13-15 s against 7-8), so the ski
+rental buys six seconds later, and the build runs 44-56 s against 31-40, so
+the install lands twenty seconds after the base's -- two to seven seconds
+before C where the base's lands nine to thirteen before it, and in six of
+twelve reps after C has begun, which then reads the raw form. The pairing
+runs a tenth of the operations, so its mixes begin a minute after the load;
+the cost is the later install, the gear shift this arm's encoder makes
+longer, and on `Auto` that outweighs every read the better groups save. The
+arm stays off; its encoder is the lazy parse, which does what the shortest
+path did in half the time.
