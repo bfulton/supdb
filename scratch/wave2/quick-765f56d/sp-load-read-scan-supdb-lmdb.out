@@ -1,0 +1,12 @@
+
+quantity                                   supdb          lmdb      B/A B above A   sign p
+load bytes_on_disk_per_byte               1.3665        1.1511   0.842x     0/12     0.000  **
+load device_bytes_per_byte                1.4018        1.9248   1.373x    12/12     0.000  **
+load ops_per_s                      1062540.3493   824367.2948   0.776x     0/12     0.000  **
+load-shuffled ops_per_s              692289.2710    98225.5483   0.142x     0/12     0.000  **
+prime us_per_page                         1.4369        1.4630   1.018x     8/12     0.388
+read p99_us                               0.7390        1.0870   1.471x    12/12     0.000  **
+read reads_per_s                    2395501.0000  1557410.1161   0.650x     0/12     0.000  **
+scan entries_per_s                 49442950.9926 39556930.7303   0.800x     6/12     1.000
+
+8 quantities: 6 marked *, where a coin marks about 0.4; 6 marked **, which holds for the table as a whole (Holm)
