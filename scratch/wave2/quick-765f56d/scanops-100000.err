@@ -1,0 +1,22 @@
+bench ab: supdb against lmdb at 100000 keys, scans of 100, 6 pairs after a warmup, passes load,scan
+scanops supdb size 100000 scans 1000 first 59.3/9.5/6.7/7.5 med 2.817 max 59.3 sum_us 3378.8 pass_us 3472.3
+scanops lmdb size 100000 scans 1000 first 20.4/9.2/10.2/5.6 med 4.348 max 41.6 sum_us 5208.8 pass_us 5311.4
+     2s  rep 0/6 (warmup)
+scanops lmdb size 100000 scans 1000 first 16.7/6.3/7.9/4.9 med 3.283 max 81.0 sum_us 3902.0 pass_us 3982.0
+scanops supdb size 100000 scans 1000 first 44.3/6.6/7.3/5.4 med 2.643 max 44.3 sum_us 3057.4 pass_us 3150.9
+     3s  rep 1/6
+scanops supdb size 100000 scans 1000 first 49.2/6.6/6.2/4.8 med 2.235 max 49.2 sum_us 2569.6 pass_us 2633.7
+scanops lmdb size 100000 scans 1000 first 20.9/13.4/13.6/9.8 med 4.214 max 52.3 sum_us 4908.1 pass_us 5009.3
+     5s  rep 2/6
+scanops lmdb size 100000 scans 1000 first 16.4/6.8/7.4/4.8 med 3.482 max 45.8 sum_us 3997.5 pass_us 4066.7
+scanops supdb size 100000 scans 1000 first 40.2/7.6/6.1/4.8 med 2.307 max 40.2 sum_us 2678.7 pass_us 2748.1
+     6s  rep 3/6
+scanops supdb size 100000 scans 1000 first 56.9/9.1/6.5/5.8 med 2.716 max 56.9 sum_us 3184.3 pass_us 3261.4
+scanops lmdb size 100000 scans 1000 first 13.4/6.5/8.0/4.8 med 3.145 max 26.3 sum_us 3409.4 pass_us 3469.1
+     7s  rep 4/6
+scanops lmdb size 100000 scans 1000 first 13.2/6.4/7.2/4.9 med 3.046 max 38.4 sum_us 3310.1 pass_us 3372.3
+scanops supdb size 100000 scans 1000 first 75.0/7.2/6.1/4.9 med 2.301 max 75.0 sum_us 2638.5 pass_us 2705.3
+     9s  rep 5/6
+scanops supdb size 100000 scans 1000 first 50.1/9.6/7.9/7.3 med 2.945 max 50.1 sum_us 3515.6 pass_us 3702.9
+scanops lmdb size 100000 scans 1000 first 15.1/5.5/7.7/5.4 med 3.046 max 30.0 sum_us 3323.3 pass_us 3410.1
+    11s  rep 6/6

@@ -189,8 +189,24 @@ merges and reads through a form file nothing (`SUPDB_MIX_COUNTERS`: one
 piece, 3,926 keys unsealed, `maint 0.0ms`, `z reads 0`), which is none of
 the paths the commits since the last quick check (`44389dc`) changed, and
 the default against LMDB on the mixes at 100k, twelve pairs in each order,
-read D 1.14x and 1.16x (`d100k-*.out`). Next: the open cells -- E's
-margin, and `Auto`'s raw passes before its install.
+read D 1.14x and 1.16x (`d100k-*.out`). The same row read LMDB's own
+rates 1.5-2.1x those of the last banked row of its class (guest kernel
+v185 against v139) and the default's 1.1-1.3x, so its ratios to LMDB fell
+in several cells at once: the single-threaded scan pass at 100k 0.82x, E
+at 30k 0.73x. Paired in one process on that host (`scan*-*.out`,
+`sp-*.out`, `scanops-*.err` beside it) the scan pass of two to three
+milliseconds reads by position: with the read pass before it the arm that
+runs first wins by a fifth in each order, without it the default wins
+both (1.05x and 1.32x), and the per-scan timer has its median scan at
+2.2-2.9 us against LMDB's 3.0-4.3; at 30k and 300k it wins or ties, the
+threaded scans win 1.4-1.7x everywhere, and E wins 1.08-1.25x. No cell
+there is lost by more than a position. Next: the open cells -- E's
+margin, and `Auto`'s raw passes before its install, whose reads fault
+0.33-0.35 a read against LMDB's 0.16-0.18 (the passes before the buy run
+in the rent's window, before any build starts, so serving a partition's
+form as it attaches would reach only the threaded passes inside the
+build; the build's own wall, 36 s from the buy to the install at five
+million keys, has no timing of its own in the trace yet).
 
 ## This session: a block read through one cursor
 
