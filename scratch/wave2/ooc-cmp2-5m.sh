@@ -22,14 +22,17 @@ UNSET="-u SUPDB_LAG_COUNTERS -u SUPDB_MIX_COUNTERS -u SUPDB_MIX_KINDS -u SUPDB_M
 -u SUPDB_SCAN_OPS -u SUPDB_THREAD_SPANS -u SUPDB_LOAD_PHASES -u SUPDB_DRAIN_STEPS -u GLIBC_TUNABLES -u MALLOC_ARENA_MAX"
 pairing() {
   name=$1; A=$2; B=$3
+  # ONLY="name:sitting ..." runs those sittings alone, to finish a run a
+  # restart stopped; unset, every sitting.
   for sitting in 1 2; do
+    if [ -n "$ONLY" ] && ! echo " $ONLY " | grep -q " $name:$sitting "; then continue; fi
     if [ "$sitting" = 1 ]; then arms=$A,$B; else arms=$B,$A; fi
     echo "##### $name sitting $sitting: $arms, start $(date -u +%T)"
     env $UNSET SUPDB_ZPAGES_TRACE=1 SUPDB_LAG_MARK=1 "$BIN" ab --arms "$arms" --size 5000000 --bound 671088640 --ops-div 10 --reps 3 \
       --passes load,read,read-threaded,scan,scan-threaded,mixes --pairs 'scan' \
       2>&1 >"$Z/ooc-cmp2-$name-ab-$sitting.out" | while IFS= read -r line; do printf '%s %s\n' "$(cut -d' ' -f1 /proc/uptime)" "$line"; done > "$Z/ooc-cmp2-$name-ab-$sitting.err"
     if grep -q ' quantities: ' "$Z/ooc-cmp2-$name-ab-$sitting.out"; then echo "$name sitting $sitting: the table is whole"; else echo "$name sitting $sitting: NOT whole"; fi
-    rm -rf "$T"/*
+    rm -rf /tmp/claude-0/-home-user-supdb/95907082-4009-52f5-8d06-b36856ae75e3/scratchpad/tmp-ooccmp/supdb-* /tmp/claude-0/-home-user-supdb/95907082-4009-52f5-8d06-b36856ae75e3/scratchpad/tmp-ooccmp/lmdb-*
   done
   echo "##### $name done $(date -u +%T)"
 }

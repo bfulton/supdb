@@ -79,8 +79,24 @@ Both are green at `d5114b6`.
 
 ## Where the out-of-core comparison stands
 
-These figures come from `scratch/wave2/stage4.md`, "Against the comparators
-out of core" (5M keys under 640 MiB):
+At `4e58ad3` (the OOM fix below), 5M keys under 640 MiB, three pairs a
+sitting after the warmup and the reads divided by ten, one sitting in each
+order (`ooc-cmp2-5m.sh`, outputs `ooc-cmp2-lmdb{forced,auto}-ab-{1,2}.*`),
+supdb over LMDB with its readahead off, sitting 1 / sitting 2:
+
+- **Forced form with the drop** (`supdb-cache64tofitzpagesdrop`): every
+  cell, both orders. Load 1.23 / 1.23, shuffled load 10.6 / 9.9, reads
+  3.6 / 2.3 (threaded 3.3-5.5), scans 2.3 / 2.2 (threaded 2.7-4.6), A
+  5.7 / 5.6, B 2.9 / 1.9, C 3.1 / 1.6, D 4.1 / 3.2, F 4.9 / 5.3, and E
+  1.29 / 1.13 with LMDB ahead in one rep of three in each.
+- **Combined `Auto`** (`supdb-cache64tofitautozpages`): the passes before
+  the install still run raw and trail -- reads 0.55 / 0.62 (threaded
+  0.50-0.61), scans 0.26 / 0.26 and 0.54 / 0.57 on two threads, 1.5 / 2.8 on
+  three -- and every mix after it wins: A 5.7 / 4.8, B 2.4 / 2.1, C 1.5 /
+  1.7, D 2.3 / 2.7, F 4.5 / 3.9, E 1.09 / 1.14; loads 1.6 / 1.4 and 12 / 13.
+
+The figures below are from before it, `scratch/wave2/stage4.md`, "Against
+the comparators out of core" (5M keys under 640 MiB):
 
 - **The forced compact form against LMDB (readahead off):** it wins every
   cell but E, which reads at 0.55x. E's loss is CPU, not faults: about
@@ -163,8 +179,9 @@ the default, `Auto`, the forced drop and the no-cache arm. In core, two
 sittings of twelve pairs at 30k-3M (`scratch/wave2/incore-far.sh`, outputs
 `scratch/wave2/far-*`) read every load level and the arms' segment work
 6-27% higher. The 30k first lag point is placement-dominated: identical arms
-read 0.92-1.09x in `bench/examples/lag0_probe.rs`. Next: re-run
-`ooc-cmp2-5m.sh` (it was never completed), then the quick row.
+read 0.92-1.09x in `bench/examples/lag0_probe.rs`. `ooc-cmp2-5m.sh` ran
+whole after it (the section above). Next: the quick row, and the open cells
+-- E's margin, and `Auto`'s raw passes before its install.
 
 ## This session: a block read through one cursor
 
