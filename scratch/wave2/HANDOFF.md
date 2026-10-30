@@ -180,8 +180,17 @@ sittings of twelve pairs at 30k-3M (`scratch/wave2/incore-far.sh`, outputs
 `scratch/wave2/far-*`) read every load level and the arms' segment work
 6-27% higher. The 30k first lag point is placement-dominated: identical arms
 read 0.92-1.09x in `bench/examples/lag0_probe.rs`. `ooc-cmp2-5m.sh` ran
-whole after it (the section above). Next: the quick row, and the open cells
--- E's margin, and `Auto`'s raw passes before its install.
+whole after it (the section above). The quick row after it
+(`scratch/wave2/quick-765f56d/`, not banked) failed its gate on one
+quantity of 1,252: ycsb-D on the default arm at 100k keys, 0.91x LMDB in
+the row against 1.32x in the last banked row of the class, with eleven
+quantities flagged better and the floors in band. D at that rung seals,
+merges and reads through a form file nothing (`SUPDB_MIX_COUNTERS`: one
+piece, 3,926 keys unsealed, `maint 0.0ms`, `z reads 0`), which is none of
+the paths the commits since the last quick check (`44389dc`) changed, and
+the default against LMDB on the mixes at 100k, twelve pairs in each order,
+read D 1.14x and 1.16x (`d100k-*.out`). Next: the open cells -- E's
+margin, and `Auto`'s raw passes before its install.
 
 ## This session: a block read through one cursor
 
