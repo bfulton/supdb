@@ -1,3 +1,1 @@
-   Compiling supdb v0.1.0 (/home/user/supdb)
-   Compiling supdb-bench v0.2.0 (/home/user/supdb/bench)
-    Finished `release` profile [optimized + debuginfo] target(s) in 1m 38s
+    Finished `release` profile [optimized + debuginfo] target(s) in 3.85s
