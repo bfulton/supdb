@@ -5929,6 +5929,86 @@ handle, which are outside any handle's budget. A bounded rung's first
 rows are the arm with no cache against LMDB, and the forms' memory is
 the lead the rows name.
 
+With the forms gated the next bounded rung found two more structures
+kept for readers on a load nobody read, both on the seal's side. A
+shuffled load of five million keys under 640 MiB (`ab --passes load`,
+the arm against itself) killed the default and the combined `Auto` arm
+and peaked the forced-drop arm at 600 MB, while the arm with no cache
+ran in 318. A census by owner every hundred batches
+(`bench/examples/load_census.rs`, in a memory group of 640 MiB) named
+the first: every seal copied its frozen table's chains into a snapshot
+for the scans over the store while it ran (`Options::seal_snapshot`),
+the table's bytes again, set on the table and held until it lands, and
+three frozen tables stood with three copies, 380 MB of the bound. A seal
+of a table frozen far from every scan -- the `reads_around` question,
+asked of the scans on either path (`Shared::scans_merged` counts the
+merge path's, which nothing counted) -- builds none now and writes its
+records from the table's chains (`Options::seal_snapshot_far`;
+`supdb-sealcopyfar` and `supdb-ingestsealcopyfar` build as before). A
+scan that comes while such a seal runs sorts the frozen table itself. A
+drain's seal builds its copy as `drain_snapshot` says: the first lag
+point after a shuffled load of thirty thousand keys read 0.89-0.97x
+without the drain's copy in six sittings of six, at the same
+instructions a scan to within two hundred in three hundred scans and
+over a segment identical byte for byte, but a probe of that point read
+two arms that differ in nothing there at 0.92-1.09x in both orders, so
+the point is the memory its scans run over, and the drain keeps the
+shape its rows were taken in.
+
+With the copies gone the default still peaked at 529 MB in some loads
+and 280 in others in one process, and the count that split them was the
+writer's wait for room at its freezes (`join_wait_ms`): 1.3-2.4 s in the
+slow loads, none in the fast, never any in the arm with no cache. The
+landings had fallen behind the freezes. A profile of the load by thread
+put the segment work's thread at three times the no-cache arm's CPU: a
+fifth of it in the pieces' ranks against their partitions, taken before
+each publish so that the first scan would not pay for them
+(`Maint::rank_before_publish`), and most of the rest in the device
+doorbells and context switches of the major faults that walk took over
+partition pages the bound had pushed out. The next merge folds those
+pieces away before anything reads them. A landing while the writer's
+last seal was far from reads publishes its pieces without ranks or
+bounds now, a flush's landings counted near since reads follow a drain,
+and a reader that comes takes them as it takes them for a piece opened
+from disk (`Options::land_ranks_far`; `supdb-ranksfar` and
+`supdb-ingestranksfar` take them as before). The census lines had not
+moved for either: the census counts what the store holds, and the
+allocator's bytes in use beside it (`mallinfo2`) were what said the
+excess was live and not retained.
+
+The suite's own probe after both, every shipping arm through the
+ordered and the shuffled load twice in one process, peaked the default
+at 312 MB, `Auto` at 338, the forced-drop arm at 333 and the arm with no
+cache at 278, the peak in each the shuffled load's closing sync. In core
+neither gate moved a load: twelve pairs a sitting at thirty thousand to
+three million keys, both policies, two sittings with the order swapped,
+read the ordered and the shuffled load at 0.88-1.22x of the arm that
+builds with the sign swapping between sittings, nothing marked in both,
+while the arm's segment work spent 6-20% more CPU at one and three
+million keys on copies (578 ms of them at three million) and 25-27% more
+on ranks at three million, in ten to twelve pairs of twelve in both
+sittings.
+
+What the sync held after both was the drain's merge, which rewrites
+every partition a shuffled load has put pieces in, and to place its
+cuts it kept every distinct key of its inputs whole with an offset
+each, 24 bytes a key: 120 MB at five million keys, 190 with the
+vectors' doubling, the sync's largest live owner. A cut reads a key's
+first sixteen bytes and nothing more -- a join is a key at an even rank
+cut to the fence's length, and a key is below such a cut exactly when
+its own first sixteen bytes are -- and a fence's cuts are taken from
+that fence's keys alone, so the merge pushes its keys in order through a
+slicer that holds only the fence being walked, cut short, and takes its
+slices as the walk leaves it (`db::Slicer`); with no fences, before the
+first partitioning, it holds every key cut short, as few as there are
+then. The slices are the old ones exactly: the old cut ran beside the
+new one under every merge of the fence tests, the merge and partition
+tests of the engine's suite and 770 seeds of the differential fuzz in
+four ranges, and was held equal by an assertion before it was taken
+out. The bounded load's sync then read 285-329 MB on the default and
+288-307 on `Auto` over three loads each, with the drain's copy back in
+it.
+
 The same probe answered a question the first bounded numbers raised. A
 bounded row divides its read passes' operation counts for time, and at
 a division of ten three of the four lag points at three million read

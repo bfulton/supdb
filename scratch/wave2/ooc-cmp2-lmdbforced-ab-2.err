@@ -1,0 +1,22 @@
+38213.80 bench: bound 671088640 bytes in group /sys/fs/cgroup/memory/process_api/01a18777-6cd5-708b-a866-7aded7120da4/claude-code-bash/supdb-bench-21033
+38213.81 bench ab: supdb-cache64tofitzpagesdrop against lmdb-nordahead at 5000000 keys, scans of 100, 3 pairs after a warmup, under a bound of 671088640 bytes, passes load,read,read-threaded,scan,scan-threaded,mixes, ops divided by 10
+38213.86 phasemark supdb-cache64tofitzpagesdrop load start 38213.865428208
+38218.94 phasemark supdb-cache64tofitzpagesdrop load sync 38218.944923583
+38219.50 phasemark supdb-cache64tofitzpagesdrop load end 38219.498697607
+38219.50 phasemark supdb-cache64tofitzpagesdrop read start 38219.499111748
+38221.08 phasemark supdb-cache64tofitzpagesdrop read end 38221.084051395
+38223.32 phasemark supdb-cache64tofitzpagesdrop scan start 38223.328184897
+38223.40 phasemark supdb-cache64tofitzpagesdrop scan end 38223.408196281
+38235.57 phasemark supdb-cache64tofitzpagesdrop ycsb-C start 38235.574580472
+38235.80 phasemark supdb-cache64tofitzpagesdrop ycsb-C end 38235.803638827
+38235.80 phasemark supdb-cache64tofitzpagesdrop ycsb-B start 38235.803882345
+38236.02 phasemark supdb-cache64tofitzpagesdrop ycsb-B end 38236.020033825
+38236.02 phasemark supdb-cache64tofitzpagesdrop ycsb-A start 38236.020247469
+38236.42 phasemark supdb-cache64tofitzpagesdrop ycsb-A end 38236.426815542
+38236.42 phasemark supdb-cache64tofitzpagesdrop ycsb-F start 38236.427023433
+38236.86 phasemark supdb-cache64tofitzpagesdrop ycsb-F end 38236.863558818
+38236.86 phasemark supdb-cache64tofitzpagesdrop ycsb-D start 38236.863761839
+38237.09 phasemark supdb-cache64tofitzpagesdrop ycsb-D end 38237.090034898
+38237.09 phasemark supdb-cache64tofitzpagesdrop ycsb-E start 38237.090263762
+38237.61 phasemark supdb-cache64tofitzpagesdrop ycsb-E end 38237.609501740
+38238.26 phasemark supdb-cache64tofitzpagesdrop load start 38238.265585952

@@ -1,0 +1,14 @@
+bench ab: supdb against supdb-ranksfar at 1000000 keys, scans of 100, 12 pairs after a warmup, passes load,scan
+     9s  rep 0/12 (warmup)
+    17s  rep 1/12
+    25s  rep 2/12
+    33s  rep 3/12
+    41s  rep 4/12
+    49s  rep 5/12
+    56s  rep 6/12
+    64s  rep 7/12
+    72s  rep 8/12
+    80s  rep 9/12
+    88s  rep 10/12
+    96s  rep 11/12
+   104s  rep 12/12

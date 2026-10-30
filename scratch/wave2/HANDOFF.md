@@ -125,6 +125,47 @@ instructions"). The flat loop, a turn with no branch on a length, was tried
 and refuted: the cold decode's excess over the hot one is not the length
 branches, and with no PMU here what it is cannot be told.
 
+## The bounded shuffled load's kills (the last work of this session)
+
+The comparator script (`ooc-cmp2-5m.sh`) was killed partway: the default
+arm and the combined `Auto` arm were OOM-killed by the shuffled load of
+five million keys under 640 MiB, while the arm with no cache ran in 318 MB.
+Three engine changes, each measured under the bound with
+`bench/examples/load_census.rs` (a census by owner every N batches, the
+allocator's bytes in use beside it, the load's and the sync's peaks from a
+sampler thread, several loads in one process) in a memory group of 640 MiB
+made by hand (`scratch/wave2/census-cg.sh`), and with the suite's own probe
+(`ab --arms X,X --passes load`, `scratch/wave2/oomprobe.sh`, cut by phase with
+`oomphase.sh`):
+
+- **The seal's snapshot copy far from reads** (`Options::seal_snapshot_far`,
+  off; arms `supdb-sealcopyfar`, `supdb-ingestsealcopyfar`). Three frozen
+  tables stood with three copies, 380 MB. A seal far from every scan
+  (`reads_around`, over `scans_life` plus the new `Shared::scans_merged`,
+  the merge path's scans, which nothing counted) builds none; a drain's
+  seal builds its copy as `drain_snapshot` says.
+- **The landing's ranks far from reads** (`Options::land_ranks_far`, off;
+  arms `supdb-ranksfar`, `supdb-ingestranksfar`). With the copies gone, the
+  loads that still peaked high were the ones whose landings fell behind
+  (`join_wait_ms` 1.3-2.4 s): the segment work took the pieces' ranks
+  against partitions whose pages the bound had pushed out. The writer's
+  last seal publishes `Shared::reads_near`, a flush sets it, and
+  `Maint::rank_before_publish` skips without it.
+- **The merge's cuts without the whole key list** (`db::Slicer`): the
+  drain's full merge kept every key, 120-190 MB at five million. The slicer
+  holds one fence's keys cut to sixteen bytes and gives the same slices
+  (held equal by a temporary assertion over the fence, merge and fuzz
+  tests).
+
+Peaks now: the default 285-329 MB at the sync and 291-316 in the load,
+`Auto` 278-307, no freeze waits; the suite's probe 312 / 338 / 333 / 278 for
+the default, `Auto`, the forced drop and the no-cache arm. In core, two
+sittings of twelve pairs at 30k-3M (`scratch/wave2/incore-far.sh`, outputs
+`scratch/wave2/far-*`) read every load level and the arms' segment work
+6-27% higher. The 30k first lag point is placement-dominated: identical arms
+read 0.92-1.09x in `bench/examples/lag0_probe.rs`. Next: re-run
+`ooc-cmp2-5m.sh` (it was never completed), then the quick row.
+
 ## This session: a block read through one cursor
 
 - **Committed: `Options::zpages_block_cursor`** (on; the arm

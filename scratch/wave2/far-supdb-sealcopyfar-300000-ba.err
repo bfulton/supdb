@@ -1,0 +1,14 @@
+bench ab: supdb-sealcopyfar against supdb at 300000 keys, scans of 100, 12 pairs after a warmup, passes load,read,scan,lag
+     4s  rep 0/12 (warmup)
+     9s  rep 1/12
+    13s  rep 2/12
+    17s  rep 3/12
+    22s  rep 4/12
+    26s  rep 5/12
+    30s  rep 6/12
+    34s  rep 7/12
+    38s  rep 8/12
+    43s  rep 9/12
+    47s  rep 10/12
+    51s  rep 11/12
+    55s  rep 12/12
