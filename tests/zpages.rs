@@ -1809,7 +1809,16 @@ fn the_build_drops_the_raw_records_it_passed_when_asked_to_and_not_otherwise() {
     );
     for drop_behind in [true, false] {
         let dir = scratch(&format!("dropbehind-{drop_behind}"));
-        let mut db = Db::create(&dir, forced(|o| o.zpages_drop_behind = drop_behind)).unwrap();
+        // The raw drop off: it takes every raw page once the form serves,
+        // the records' among them, and this is the build's own drop alone.
+        let mut db = Db::create(
+            &dir,
+            forced(|o| {
+                o.zpages_drop_behind = drop_behind;
+                o.zpages_drop_raw = false;
+            }),
+        )
+        .unwrap();
         let model = ordered_load(&mut db, 8000, 0xD20);
         let seg = partition_file(&dir);
         let r = regions_of(&seg);
@@ -6110,6 +6119,38 @@ fn compact_store_with(
     assert_eq!((c.sel_installs, c.sel_switches), (1, 1), "{c:?}");
     assert_eq!(c.form_files, c.partitions, "{c:?}");
     (dir, db, model, inject, r, keys, at)
+}
+
+/// Under `Auto` with the raw drop, a partition whose form file attaches
+/// while the gate still sends reads to the raw form keeps its raw pages for
+/// those reads, and the install drops every attached partition's at once
+/// (`Options::zpages_drop_at_install`); each partition is dropped once
+/// either way, those attached after the install at their attach. Off, each
+/// attach drops its own and the install drops nothing.
+#[test]
+fn auto_drops_the_raw_pages_at_the_install_and_not_at_each_attach() {
+    for at_install in [true, false] {
+        let (dir, db, model, _inject, r, keys, _) =
+            compact_store_with(&format!("auto-drop-install-{at_install}"), 1 << 20, |o| {
+                o.zpages_drop_raw = true;
+                o.zpages_drop_at_install = at_install;
+            });
+        let c = db.zpage_counts();
+        assert_eq!(c.raw_dropped, c.form_files, "each partition once: {c:?}");
+        if at_install {
+            assert!(
+                c.raw_dropped_at_install >= 1,
+                "the install dropped the partitions attached before it: {c:?}"
+            );
+        } else {
+            assert_eq!(c.raw_dropped_at_install, 0, "{c:?}");
+        }
+        let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
+        check(&r, &model, &some, "after the drop");
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// The model says blocked and the census agrees, on faulting reads: the

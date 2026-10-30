@@ -924,6 +924,11 @@ pub struct Supdb {
     /// `supdb-cache64tofitautozpagesflexdec` against
     /// `supdb-cache64tofitautozpages`.
     zflexdec: bool,
+    /// Its raw pages dropped at each attach whatever the gate, as before the
+    /// drop waited for the install (`Options::zpages_drop_at_install` off):
+    /// `supdb-cache64tofitautozpagesdropattach` against
+    /// `supdb-cache64tofitautozpagesdrop`.
+    zdropattach: bool,
     /// Its partitions re-coded while served by what their decodes cost
     /// (`Options::zpages_recode`): `supdb-cache64tofitzpagesrecodedrop`
     /// against `supdb-cache64tofitzpagesdrop` and the key-order arms.
@@ -1476,6 +1481,10 @@ struct Policy {
     /// off): `supdb-cache64tofitzpagesdropflexdec`,
     /// `supdb-cache64tofitautozpagesflexdec`.
     zflexdec: bool,
+    /// Its raw pages dropped at each attach whatever the gate
+    /// (`Options::zpages_drop_at_install` off):
+    /// `supdb-cache64tofitautozpagesdropattach`.
+    zdropattach: bool,
     /// Its partitions re-coded while served (`Options::zpages_recode`):
     /// `supdb-cache64tofitzpagesrecodedrop`.
     zrecode: bool,
@@ -1622,6 +1631,7 @@ impl Default for Policy {
             zcodingfixed: false,
             zparse: false,
             zflexdec: false,
+            zdropattach: false,
             zpromote: 0,
             zgroup: None,
             zprebuild: false,
@@ -4695,6 +4705,43 @@ impl Supdb {
         )
     }
 
+    /// `supdb-cache64tofitautozpages` with the raw pages of a partition its
+    /// form serves dropped from the page cache (`Options::zpages_drop_raw`),
+    /// at the install for the partitions attached while the gate was still
+    /// raw, `supdb-cache64tofitautozpagesdrop`: the combined arm with the
+    /// forced arm's drop, which the trial and the merges pay for by reading
+    /// the pages back.
+    pub fn create_cache64_tofit_auto_zpages_drop(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages_auto: true,
+                zdropraw: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cache64tofitautozpagesdrop` with the raw pages dropped at each
+    /// attach whatever the gate (`Options::zpages_drop_at_install` off),
+    /// `supdb-cache64tofitautozpagesdropattach`: the drop's shape before it
+    /// waited for the install.
+    pub fn create_cache64_tofit_auto_zpages_drop_attach(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages_auto: true,
+                zdropraw: true,
+                zdropattach: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-cache64tofitautozpages` with its block-coded groups written by
     /// the parsing encoder (`Options::zpages_parse`),
     /// `supdb-cache64tofitautozpagesparse`: the shipping combined arm, where
@@ -5272,6 +5319,7 @@ impl Supdb {
             zdropraw,
             zparse,
             zflexdec,
+            zdropattach,
             zrecode,
             zrecodekeep,
             settleevery,
@@ -5552,6 +5600,7 @@ impl Supdb {
             trim_by_resident: ztrimresident,
             zpages_raw_tails_first: zhotfirst,
             zpages_drop_raw: zdropraw,
+            zpages_drop_at_install: !zdropattach,
             zpages_recode: zrecode,
             zpages_recode_keep: zrecodekeep,
             forms_settle_every: settleevery,
@@ -5763,6 +5812,7 @@ impl Supdb {
             zdropraw,
             zparse,
             zflexdec,
+            zdropattach,
             zrecode,
             zrecodekeep,
             settleevery,
@@ -5862,6 +5912,10 @@ impl Engine for Supdb {
                 "supdb-cache64tofitautozpagesparse"
             } else if self.zflexdec {
                 "supdb-cache64tofitautozpagesflexdec"
+            } else if self.zdropraw && self.zdropattach {
+                "supdb-cache64tofitautozpagesdropattach"
+            } else if self.zdropraw {
+                "supdb-cache64tofitautozpagesdrop"
             } else if self.zcacheraw {
                 "supdb-cache64tofitautozpagesraw"
             } else if self.zpromote > 0 {
@@ -6850,6 +6904,13 @@ impl Engine for Supdb {
             ("zpage_coding_picks_raw", z.coding_picks_raw as f64),
             ("zpage_builds_raw_tails", z.builds_raw_tails as f64),
             ("zpage_raw_dropped", z.raw_dropped as f64),
+            (
+                "zpage_raw_dropped_at_install",
+                z.raw_dropped_at_install as f64,
+            ),
+            ("zpage_build_wall_ms", z.build_wall_us as f64 / 1e3),
+            ("zpage_build_cpu_ms", z.build_cpu_us as f64 / 1e3),
+            ("zpage_build_majflt", z.build_majflt as f64),
             ("zpage_recodes", z.recodes as f64),
             ("zpage_recodes_back", z.recodes_back as f64),
             ("zpage_recode_failed", z.recode_failed as f64),
@@ -7519,6 +7580,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache64tofitautozpagescodingfixed"
         | "supdb-cache64tofitautozpagesparse"
         | "supdb-cache64tofitautozpagesflexdec"
+        | "supdb-cache64tofitautozpagesdrop"
+        | "supdb-cache64tofitautozpagesdropattach"
         | "supdb-cache64tofitautozpagessettlebuilds"
         | "supdb-cache64tofitautozpagespromote"
         | "supdb-cache64tofitautozpagesonegroup"
@@ -7809,6 +7872,12 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         }
         "supdb-cache64tofitautozpagesflexdec" => {
             Box::new(Supdb::create_cache64_tofit_auto_zpages_flexdec(dir)?)
+        }
+        "supdb-cache64tofitautozpagesdrop" => {
+            Box::new(Supdb::create_cache64_tofit_auto_zpages_drop(dir)?)
+        }
+        "supdb-cache64tofitautozpagesdropattach" => {
+            Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_attach(dir)?)
         }
         "supdb-cache64tofitautozpagespromote" => {
             Box::new(Supdb::create_cache64_tofit_auto_zpages_promote(dir)?)
@@ -8823,6 +8892,76 @@ mod tests {
     /// `zpages_own_decoder` and nothing else: named, durable like them,
     /// opened under their names by the dispatch, and the engine's defaults
     /// off.
+    /// The combined arm with the raw drop, and with the drop at each attach,
+    /// differ from their bases in the drop's two options alone, and open
+    /// under their names; the engine's default waits for the install.
+    #[test]
+    fn the_auto_drop_arms_differ_from_their_bases_in_the_drop_alone() {
+        let root = std::env::temp_dir().join(format!("supdb-bench-zdrop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(supdb::Options::default().zpages_drop_at_install);
+        for (name, make, base_name, base_make, drop_raw, at_install) in [
+            (
+                "supdb-cache64tofitautozpagesdrop",
+                Supdb::create_cache64_tofit_auto_zpages_drop as fn(&Path) -> Res<Supdb>,
+                "supdb-cache64tofitautozpages",
+                Supdb::create_cache64_tofit_auto_zpages as fn(&Path) -> Res<Supdb>,
+                true,
+                true,
+            ),
+            (
+                "supdb-cache64tofitautozpagesdropattach",
+                Supdb::create_cache64_tofit_auto_zpages_drop_attach,
+                "supdb-cache64tofitautozpagesdrop",
+                Supdb::create_cache64_tofit_auto_zpages_drop,
+                true,
+                false,
+            ),
+        ] {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            let arm = make(&d).unwrap();
+            let bd = root.join(base_name);
+            std::fs::create_dir_all(&bd).unwrap();
+            let base = base_make(&bd).unwrap();
+            assert_eq!(arm.name(), name);
+            assert_eq!(base.name(), base_name);
+            assert_eq!(guarantee(arm.name()), guarantee(base.name()));
+            let (a, b) = (
+                arm.db.as_ref().unwrap().options(),
+                base.db.as_ref().unwrap().options(),
+            );
+            assert_eq!(
+                (a.zpages_drop_raw, a.zpages_drop_at_install),
+                (drop_raw, at_install),
+                "{name}: the drop's options"
+            );
+            assert_eq!(
+                (
+                    a.zpages,
+                    a.zpages_coding_auto,
+                    a.zpages_own_decoder,
+                    a.scan_cache_bytes,
+                    a.forms_to_fit
+                ),
+                (
+                    b.zpages,
+                    b.zpages_coding_auto,
+                    b.zpages_own_decoder,
+                    b.scan_cache_bytes,
+                    b.forms_to_fit
+                ),
+                "{name}: the rest as {base_name}'s"
+            );
+            drop(arm);
+            drop(base);
+            let od = root.join(format!("{name}-open"));
+            std::fs::create_dir_all(&od).unwrap();
+            assert_eq!(open(name, &od, 1).unwrap().name(), name);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn the_lz4_arms_differ_from_their_bases_in_the_codec_alone() {
         let root = std::env::temp_dir().join(format!("supdb-bench-zparse-{}", std::process::id()));
@@ -9508,7 +9647,7 @@ mod tests {
             assert!(!g.forms_settle_every, "{name}: the default settle");
             assert!(!supdb::Options::default().zpages_recode_keep);
             assert!(!supdb::Options::default().zpages_recode);
-            assert!(!supdb::Options::default().zpages_drop_raw);
+            assert!(supdb::Options::default().zpages_drop_raw);
             assert_eq!(supdb::Options::default().zpages_raw_tails_first, 0);
             assert!(!g.zpages_raw_tails && !g.zpages_record_coding && g.zpages_memo);
             assert_eq!(

@@ -570,6 +570,14 @@ pub struct ZCounts {
     /// The partitions whose raw pages were dropped at their form file's
     /// install (`Options::zpages_drop_raw`).
     pub raw_dropped: u64,
+    /// Of those, dropped at the gate's turn to the form
+    /// (`Options::zpages_drop_at_install`).
+    pub raw_dropped_at_install: u64,
+    /// The builds' wall, their threads' CPU and their major faults, summed
+    /// over the builds collected (`zfile::Built::wall_us`).
+    pub build_wall_us: u64,
+    pub build_cpu_us: u64,
+    pub build_majflt: u64,
     pub sel_samples: u64,
     pub sel_builds: u64,
     pub sel_installs: u64,
@@ -1339,7 +1347,7 @@ pub struct Options {
     /// ones. Zero, off.
     #[doc(hidden)]
     pub zpages_raw_tails_first: usize,
-    /// EXPERIMENT: once a form file serves a partition, the partition's raw
+    /// Once a form file serves a partition, the partition's raw
     /// file and its ordered index are dropped from the page cache: the
     /// store's own mappings of them unmapped (`MADV_DONTNEED`), since a cache
     /// drop skips a mapped page and the open's check of the key section's
@@ -1351,9 +1359,27 @@ pub struct Options {
     /// reads and scans never touch, while the form four partitions
     /// raw-tailed faulted 0.013 a read for its last 21 MB. A raw read after
     /// it -- a merge's, the controller's trial -- reads them back from the
-    /// device. Off.
+    /// device. Under `Auto` at its install (`zpages_drop_at_install`), five
+    /// million keys under 640 MiB in both orders: the mixes after the
+    /// install read C 1.24-1.43x, D 1.41-1.69x and E 1.20-1.35x, A level,
+    /// their faults gone from 0.001-0.018 an operation to none, and the
+    /// passes before it level; in core the form serves nothing and nothing
+    /// is dropped. On; off is `supdb-cache64tofitautozpages` and the forced
+    /// arms named without `drop`.
     #[doc(hidden)]
     pub zpages_drop_raw: bool,
+    /// Under the raw drop (`zpages_drop_raw`), a partition's raw pages are
+    /// dropped once the gate serves its form: at the attach where the gate
+    /// already does (`Always`, `Auto` in COMPACT), and for every attached
+    /// partition at the gate's turn to the form where it does not --
+    /// `Auto`'s build, whose reads go to the raw form until the install at
+    /// nine tenths of the footprint, and the return from a trial, whose
+    /// reads refilled them. Off, the attach drops them whatever the gate:
+    /// an `Auto` build's first partitions then read back the pages it had
+    /// just dropped for the rest of the build, and a trial's refill stayed
+    /// beside the form it returned to.
+    #[doc(hidden)]
+    pub zpages_drop_at_install: bool,
     /// EXPERIMENT: under the forced form (`ZPages::Always`), a partition's
     /// form file is built again in the other coding while it serves, by
     /// what its decodes cost: once a second the segment work reads each
@@ -2997,7 +3023,8 @@ impl Default for Options {
             upkeep_trim_look: false,
             trim_by_resident: false,
             zpages_raw_tails_first: 0,
-            zpages_drop_raw: false,
+            zpages_drop_raw: true,
+            zpages_drop_at_install: true,
             zpages_recode: false,
             zpages_recode_keep: false,
             zpages_both: false,
@@ -3765,6 +3792,9 @@ type Compaction = (Vec<String>, std::thread::JoinHandle<Result<Vec<String>>>);
 struct ZBuild {
     seg: std::sync::Arc<Seg>,
     job: ZJob,
+    /// When the job was spawned, for the trace's account of a build's
+    /// collect against its own wall (`SUPDB_ZPAGES_TRACE`).
+    started: std::time::Instant,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     refused: bool,
     /// A build ahead of the controller's decision
@@ -12450,6 +12480,13 @@ impl ZGate {
     }
 }
 
+/// Whether a partition's raw pages go at its attach
+/// (`Options::zpages_drop_raw`): only where the gate serves the form, or
+/// with the drop at the install off; otherwise the gate's turn drops them.
+fn z_drop_now(opts: &Options, shared: &Shared) -> bool {
+    opts.zpages_drop_raw && (!opts.zpages_drop_at_install || shared.zgate.load() == zselect::GATE_Z)
+}
+
 /// Whether `ZPages::Auto` cannot run under these options and behaves as
 /// `Off`: the controller's tick is the segment work's thread's, the cell a
 /// read follows is freed through the epoch, and the budget is read from
@@ -16673,6 +16710,10 @@ impl Reader {
             spare_builds: get(&ev.spare_builds),
             spare_failed: get(&ev.spare_failed),
             raw_dropped: get(&ev.raw_dropped),
+            raw_dropped_at_install: get(&ev.raw_dropped_at_install),
+            build_wall_us: get(&ev.build_wall_us),
+            build_cpu_us: get(&ev.build_cpu_us),
+            build_majflt: get(&ev.build_majflt),
             sel_samples: get(&ev.sel_samples),
             sel_builds: get(&ev.sel_builds),
             sel_installs: get(&ev.sel_installs),
@@ -27398,7 +27439,7 @@ impl Db {
                     self.opts.zpages_fence_tree,
                     self.opts.zpages_memo_ahead,
                     self.opts.zpages_inplace_walk,
-                    self.opts.zpages_drop_raw,
+                    z_drop_now(&self.opts, &self.shared),
                     self.opts.zpages_recode,
                     self.opts.zpages_own_decoder,
                 ),
@@ -27451,7 +27492,7 @@ impl Db {
                         if seg.z.install(side) {
                             ev.built(&b);
                             zfile::ZEvents::add(&ev.attached, 1);
-                            if self.opts.zpages_drop_raw {
+                            if z_drop_now(&self.opts, &self.shared) {
                                 seg.drop_raw_pages(&self.dir, ev);
                             }
                         }
@@ -32306,6 +32347,9 @@ struct Maint {
     zsel: zselect::ZSelect,
     z_auto: bool,
     z_trace: bool,
+    /// When the last build was collected, for the trace's gap between one
+    /// build and the next (`SUPDB_ZPAGES_TRACE`).
+    z_last_collect: Option<std::time::Instant>,
     z_epoch: std::time::Instant,
     z_last_step: Option<std::time::Duration>,
     z_last_s1: Option<std::time::Duration>,
@@ -32834,6 +32878,7 @@ impl Maint {
             },
             z_auto,
             z_trace: std::env::var_os("SUPDB_ZPAGES_TRACE").is_some(),
+            z_last_collect: None,
             z_epoch: std::time::Instant::now(),
             z_last_step: None,
             z_last_s1: None,
@@ -35324,7 +35369,29 @@ impl Maint {
     ) {
         self.z_census_on = d.census;
         let ev = &self.shared.z;
+        let was = self.shared.zgate.load();
         self.shared.zgate.store(d.gate);
+        // The raw pages of every partition the form now serves, where the
+        // attaches left them for the reads the gate kept raw
+        // (`Options::zpages_drop_at_install`).
+        if was != zselect::GATE_Z
+            && d.gate == zselect::GATE_Z
+            && self.opts.zpages_drop_raw
+            && self.opts.zpages_drop_at_install
+        {
+            let segs: Vec<std::sync::Arc<Seg>> = {
+                let _op = self.op();
+                self.segs()
+                    .iter()
+                    .filter(|s| s.level > 0 && s.z.get().is_some())
+                    .cloned()
+                    .collect()
+            };
+            for seg in &segs {
+                seg.drop_raw_pages(&self.dir, ev);
+            }
+            zfile::ZEvents::add(&ev.raw_dropped_at_install, segs.len() as u64);
+        }
         ev.phase
             .store(u64::from(d.phase.code()), AtomicOrdering::Relaxed);
         ev.census
@@ -35505,7 +35572,7 @@ impl Maint {
                     self.opts.zpages_fence_tree,
                     self.opts.zpages_memo_ahead,
                     self.opts.zpages_inplace_walk,
-                    self.opts.zpages_drop_raw,
+                    z_drop_now(&self.opts, &self.shared),
                     self.opts.zpages_recode,
                     self.opts.zpages_own_decoder,
                 ),
@@ -35631,6 +35698,7 @@ impl Maint {
                 self.zbuild = Some(ZBuild {
                     seg,
                     job: ZJob::Build(handle),
+                    started: std::time::Instant::now(),
                     cancel,
                     refused,
                     dormant,
@@ -35653,6 +35721,7 @@ impl Maint {
         let ZBuild {
             seg,
             job,
+            started,
             refused,
             dormant,
             recode,
@@ -35673,6 +35742,41 @@ impl Maint {
         let outcome = handle
             .join()
             .unwrap_or_else(|_| Err(err("the form file's build panicked")));
+        // A build's own wall, CPU and major faults beside the time from its
+        // spawn to this collect, and the time since the last collect: what
+        // a controller's build from the buy to the install is made of.
+        if self.z_trace {
+            let gap = self.z_last_collect.map_or(0.0, |t| {
+                started.saturating_duration_since(t).as_secs_f64() * 1e3
+            });
+            match &outcome {
+                Ok(zfile::Outcome::Built(b)) => eprintln!(
+                    "zbuild t={:.1} {} wall_ms {:.0} cpu_ms {:.0} majflt {} file_mb {:.1} asked_mb {:.1} collect_ms {:.0} gap_ms {:.0}",
+                    self.z_epoch.elapsed().as_secs_f64(),
+                    seg.name,
+                    b.wall_us as f64 / 1e3,
+                    b.cpu_us as f64 / 1e3,
+                    b.majflt,
+                    b.file_bytes as f64 / 1e6,
+                    b.asked as f64 / 1e6,
+                    started.elapsed().as_secs_f64() * 1e3,
+                    gap,
+                ),
+                other => eprintln!(
+                    "zbuild t={:.1} {} {} collect_ms {:.0}",
+                    self.z_epoch.elapsed().as_secs_f64(),
+                    seg.name,
+                    match other {
+                        Ok(zfile::Outcome::Cancelled) => "cancelled",
+                        Ok(zfile::Outcome::Declined(_)) => "declined",
+                        Ok(zfile::Outcome::Built(_)) => "built",
+                        Err(_) => "failed",
+                    },
+                    started.elapsed().as_secs_f64() * 1e3,
+                ),
+            }
+        }
+        self.z_last_collect = Some(std::time::Instant::now());
         let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) else {
             return;
         };
@@ -35734,7 +35838,7 @@ impl Maint {
                         ev.built(&built);
                         zfile::ZEvents::add(&ev.attached, 1);
                         zfile::ZEvents::add(&ev.spare_builds, 1);
-                        if self.opts.zpages_drop_raw {
+                        if z_drop_now(&self.opts, &self.shared) {
                             target.drop_raw_pages(&self.dir, ev);
                         }
                     }
@@ -35796,7 +35900,7 @@ impl Maint {
                         } else {
                             zfile::ZEvents::add(&ev.recodes_back, 1);
                         }
-                        if self.opts.zpages_drop_raw {
+                        if z_drop_now(&self.opts, &self.shared) {
                             target.drop_raw_pages(&self.dir, ev);
                         }
                     }
@@ -35846,7 +35950,7 @@ impl Maint {
                                 ev.built(&built);
                                 zfile::ZEvents::add(&ev.attached, 1);
                                 self.z_report.installed += 1;
-                                if self.opts.zpages_drop_raw {
+                                if z_drop_now(&self.opts, &self.shared) {
                                     target.drop_raw_pages(&self.dir, ev);
                                 }
                             }
@@ -35925,6 +36029,7 @@ impl Maint {
             self.zbuild = Some(ZBuild {
                 seg,
                 job: ZJob::Warm(handle),
+                started: std::time::Instant::now(),
                 cancel,
                 refused: false,
                 dormant: false,
