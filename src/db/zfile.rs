@@ -3551,6 +3551,14 @@ pub(super) struct ZEvents {
     /// The partitions whose raw pages were dropped at their form file's
     /// install (`Options::zpages_drop_raw`).
     pub raw_dropped: AtomicU64,
+    /// Of those, the ones dropped at the gate's turn to the form rather
+    /// than at their attach (`Options::zpages_drop_at_install`).
+    pub raw_dropped_at_install: AtomicU64,
+    /// The builds' wall, their threads' CPU and their major faults
+    /// (`Built::wall_us`).
+    pub build_wall_us: AtomicU64,
+    pub build_cpu_us: AtomicU64,
+    pub build_majflt: AtomicU64,
     pub sel_samples: AtomicU64,
     pub sel_builds: AtomicU64,
     pub sel_installs: AtomicU64,
@@ -3624,6 +3632,9 @@ impl ZEvents {
         ZEvents::add(&self.build_calls, b.fill.calls);
         ZEvents::add(&self.build_nopage, b.fill.nopages);
         ZEvents::add(&self.build_ahead_bytes, b.asked);
+        ZEvents::add(&self.build_wall_us, b.wall_us);
+        ZEvents::add(&self.build_cpu_us, b.cpu_us);
+        ZEvents::add(&self.build_majflt, b.majflt);
     }
 
     /// A warm, counted.
@@ -3709,6 +3720,12 @@ pub(super) struct Built {
     pub total_ulen: u64,
     /// The raw record bytes asked for ahead of the walk (`BuildPlan::ahead`).
     pub asked: u64,
+    /// The build's wall, the building thread's CPU over it, and the
+    /// thread's major faults -- the raw records it read back from the
+    /// device -- in microseconds and a count (`timed_build`).
+    pub wall_us: u64,
+    pub cpu_us: u64,
+    pub majflt: u64,
 }
 
 /// What a warm of a form file did (`warm_file`).
@@ -4013,7 +4030,7 @@ pub(super) fn build(
     end_seq: u64,
     plan: &BuildPlan,
 ) -> Result<Outcome> {
-    build_seen(seg_path, out, id, end_seq, plan, &mut |_, _| {})
+    timed_build(|| build_seen(seg_path, out, id, end_seq, plan, &mut |_, _| {}))
 }
 
 /// `build`, with `seen` called with each range of the segment's file the
@@ -4042,7 +4059,7 @@ pub(super) fn build_file(
     end_seq: u64,
     plan: &BuildPlan,
 ) -> Result<Outcome> {
-    build_file_seen(file, out, id, end_seq, plan, &mut |_, _| {})
+    timed_build(|| build_file_seen(file, out, id, end_seq, plan, &mut |_, _| {}))
 }
 
 fn build_file_seen(
@@ -4294,7 +4311,30 @@ fn write_pages(
         file_bytes,
         total_ulen,
         asked: asked_bytes,
+        wall_us: 0,
+        cpu_us: 0,
+        majflt: 0,
     }))
+}
+
+/// A build run on this thread with its wall, the thread's CPU and its major
+/// faults over it written into what it built, which is what says whether a
+/// build under the readers' faults waited on the device or ran.
+fn timed_build(f: impl FnOnce() -> Result<Outcome>) -> Result<Outcome> {
+    let t = std::time::Instant::now();
+    let (cpu0, flt0) = (super::thread_cpu_ns(), thread_major_faults());
+    let out = f()?;
+    Ok(match out {
+        Outcome::Built(mut b) => {
+            b.wall_us = t.elapsed().as_micros() as u64;
+            b.cpu_us = super::thread_cpu_ns().saturating_sub(cpu0) / 1000;
+            b.majflt = thread_major_faults()
+                .zip(flt0)
+                .map_or(0, |(a, b)| a.saturating_sub(b));
+            Outcome::Built(b)
+        }
+        other => other,
+    })
 }
 
 // ---- the controller's platform side ---------------------------------------
