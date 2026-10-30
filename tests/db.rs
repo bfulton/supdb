@@ -8418,6 +8418,10 @@ fn extend_order_model_with(block_cache: bool, pieces_only: bool) {
         scan_cache_ahead: false,
         share_snapshot: true,
         forms_pieces_only: pieces_only,
+        // The seal's copy is what is tested, and nothing scans the
+        // store before its seal: built whatever the reads
+        // (`Options::seal_snapshot_far`).
+        seal_snapshot_far: true,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -8617,6 +8621,10 @@ fn carry_model_with(block_cache: bool, pieces_only: bool) {
         scan_cache_ahead: false,
         share_snapshot: true,
         forms_pieces_only: pieces_only,
+        // The seal's copy is what is tested, and nothing scans the
+        // store before its seal: built whatever the reads
+        // (`Options::seal_snapshot_far`).
+        seal_snapshot_far: true,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -11187,7 +11195,16 @@ fn reader_handles_across_seals_see_every_value_once_and_in_order() {
 /// few hundred kilobytes did not: this disk's syncs are fast, and the
 /// seal was landed by a commit two milliseconds after its publish.
 fn seal_snapshot_store(name: &str) -> (Db, ScanModel) {
-    seal_snapshot_store_with(name, Options::default())
+    seal_snapshot_store_with(
+        name,
+        Options {
+            // The seal's copy is what is tested, and nothing scans the
+            // store before its seal: built whatever the reads
+            // (`Options::seal_snapshot_far`).
+            seal_snapshot_far: true,
+            ..Options::default()
+        },
+    )
 }
 
 fn seal_snapshot_store_with(name: &str, base: Options) -> (Db, ScanModel) {
@@ -11269,6 +11286,175 @@ fn a_handle_reads_the_seals_snapshot_while_the_seal_runs() {
     db.close().unwrap();
 }
 
+/// A seal far from every scan builds no copy (`Options::seal_snapshot_far`
+/// off), a drain's excepted: the copy is the table's bytes again, held
+/// until the seal lands, and a load nobody read held one beside every
+/// table frozen until a bound killed it. A handle's scan while such a seal runs sorts the
+/// frozen table itself and answers what the copy would have; a seal after
+/// a scan builds the copy, counted on the merge path before the first
+/// partitioning and on the block path after it; and under the arm every
+/// seal builds one. The seal decides on the writer's thread before it
+/// starts, so the counts after its landing are its verdict.
+#[test]
+fn a_seal_far_from_reads_builds_no_copy() {
+    for far in [false, true] {
+        let (mut db, mut m) = seal_snapshot_store_with(
+            &format!("seal-copy-far-{far}"),
+            Options {
+                seal_snapshot_far: far,
+                ..Options::default()
+            },
+        );
+        db.hold_seal_landing(true);
+        db.seal().unwrap();
+        if far {
+            await_seal_snapshot(&db);
+        }
+        let r = db.reader().unwrap();
+        m.check(&r, "a handle during a seal nobody read before");
+        assert_eq!(
+            db.frozen_sorts() > 0,
+            !far,
+            "with no copy the handle sorts the frozen table itself"
+        );
+        assert!(db.in_flight().0, "nothing landed the seal");
+        db.hold_seal_landing(false);
+        db.settle().unwrap();
+        assert_eq!(
+            (db.seal_snapshots(), db.seal_table_snapshots()),
+            (u64::from(far), u64::from(far)),
+            "a copy only under the arm"
+        );
+        m.check(&db, "the writer after the landing");
+        // A scan on the merge path, the store having no partition: the
+        // next seal is near it and builds the copy.
+        assert_eq!(db.levels().0, 0, "no partition yet");
+        let mut sink = 0usize;
+        db.scan(b"key-00000", 10, |_k, v| sink += v.len()).unwrap();
+        let before = db.seal_snapshots();
+        for k in (0..3000u32).step_by(5) {
+            m.append(&mut db, &format!("key-{k:05}"), "after-a-scan");
+        }
+        db.commit().unwrap();
+        db.hold_seal_landing(true);
+        db.seal().unwrap();
+        let t = std::time::Instant::now();
+        while db.seal_snapshots() == before {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(30),
+                "a seal after a scan published no copy"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        db.hold_seal_landing(false);
+        db.settle().unwrap();
+        m.check(&r, "a handle after the second landing");
+        drop(r);
+        db.close().unwrap();
+    }
+    // The block path's count, and the landings' ranks: a store with
+    // partitions, sealed once with no scan and once after one, under the
+    // default and under both arms.
+    for far in [false, true] {
+        let d = dir(&format!("seal-copy-far-blocks-{far}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 1 << 30,
+                partition_bytes: Some(2 << 10),
+                // One seal's pieces stand until the test is done with them.
+                l0_trigger: 1 << 20,
+                seal_snapshot_far: far,
+                land_ranks_far: far,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:06}");
+        for k in (0..6000u32).step_by(3) {
+            m.append(&mut db, &key(k), "p");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        assert!(db.levels().0 > 1, "several partitions");
+        // The flush's own landings count as near for their ranks; this
+        // seal, with no scan in the store's life, is far, and its count is
+        // taken from the flush's, whatever the flush built.
+        let drained = (db.seal_snapshots(), db.seal_table_snapshots());
+        for k in (0..6000u32).step_by(7) {
+            m.append(&mut db, &key(k), "unread");
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        db.settle().unwrap();
+        let (ranked, pieces) = db.pieces_ranked();
+        assert!(pieces > 0, "the seal's pieces stand");
+        assert_eq!(
+            (
+                db.seal_snapshots() - drained.0,
+                db.seal_table_snapshots() - drained.1
+            ),
+            (u64::from(far), u64::from(far)),
+            "no scan in the store's life: a copy only under the arm"
+        );
+        assert_eq!(
+            ranked,
+            if far { pieces } else { 0 },
+            "the landing far from reads published its pieces unranked"
+        );
+        // The first scan takes what the landing left, and answers right.
+        m.check(&db, "the writer over pieces landed unranked");
+        assert_eq!(db.pieces_ranked().0, pieces, "the scan ranked them");
+        // A seal after a scan, through the block path: its copy, and its
+        // pieces ranked at the landing, before anything scans again.
+        let before = db.seal_table_snapshots();
+        for k in (0..6000u32).step_by(11) {
+            m.append(&mut db, &key(k), "read");
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        db.settle().unwrap();
+        assert_eq!(
+            db.seal_table_snapshots(),
+            before + 1,
+            "a seal after a scan through the block path builds its copy"
+        );
+        let (ranked, pieces) = db.pieces_ranked();
+        assert_eq!(ranked, pieces, "a landing near reads ranked its pieces");
+        m.check(&db, "the writer after both seals");
+        db.close().unwrap();
+    }
+    // A drain's seal builds its copy as `drain_snapshot` says, far from
+    // reads or not: shuffled, so the table is hashed and the seal sorts it.
+    for drain_snapshot in [true, false] {
+        let d = dir(&format!("seal-copy-far-drain-{drain_snapshot}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                drain_snapshot,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let mut m = ScanModel::default();
+        for i in 0..4000u64 {
+            m.append(&mut db, &format!("key-{:05}", i * 7919 % 4000), "a");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        assert_eq!(
+            db.seal_table_snapshots(),
+            u64::from(drain_snapshot),
+            "a drain's copy, nobody having scanned"
+        );
+        m.check(&db, "the writer after the drain");
+        db.close().unwrap();
+    }
+}
+
 /// A frozen table's snapshot lives on the table, not in the state it was
 /// published into: a state the writer publishes while the seal runs --
 /// here the switch to an ordered table a key above the store's greatest
@@ -11284,6 +11470,7 @@ fn a_frozen_tables_snapshot_outlives_the_state_it_was_published_in() {
             &format!("frozen-snap-on-table-{frozen_snaps}"),
             Options {
                 frozen_snaps,
+                seal_snapshot_far: true,
                 ..Options::default()
             },
         );
@@ -12494,6 +12681,10 @@ fn a_handed_tables_seal_snapshot_serves_the_state_that_freezes_it() {
                 seal_bytes: 1 << 40,
                 partition_bytes: Some(64 << 20),
                 frozen_snaps,
+                // The seal's copy is what is tested, and nothing scans
+                // the store before its seal: built whatever the reads
+                // (`Options::seal_snapshot_far`).
+                seal_snapshot_far: true,
                 ..Options::default()
             },
         )

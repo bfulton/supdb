@@ -1,0 +1,14 @@
+bench ab: supdb-ingest against supdb-ingestsealcopyfar at 300000 keys, scans of 100, 12 pairs after a warmup, passes load,read,scan,lag
+     4s  rep 0/12 (warmup)
+     7s  rep 1/12
+    11s  rep 2/12
+    14s  rep 3/12
+    17s  rep 4/12
+    21s  rep 5/12
+    24s  rep 6/12
+    28s  rep 7/12
+    31s  rep 8/12
+    34s  rep 9/12
+    38s  rep 10/12
+    41s  rep 11/12
+    45s  rep 12/12

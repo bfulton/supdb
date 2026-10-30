@@ -2173,6 +2173,39 @@ is read as the engine's -- at a tenth of the scans three of the four
 lag points at three million read 0.25-0.4x of LMDB, and whole counts
 read all four at 1.0-1.9x.
 
+It came back on the seal's side, twice in one load, once the forms were
+gated: a shuffled load of five million keys under 640 MiB killed the
+default arm and the combined `Auto` arm while the arm with no cache ran
+in 318 MB. The census by owner, taken every hundred batches
+(`bench/examples/load_census.rs`), named the first: every seal built
+its frozen table's snapshot copy, the table's keys and values again,
+for scans while the seal ran, and three frozen tables stood with three
+copies, 380 MB of the bound; a seal far from every scan builds none now
+(`Options::seal_snapshot_far`), a drain's excepted. With the copies gone the default still
+peaked at 529 MB in some loads and not others, and the count that split
+the loads was the writer's wait at its freezes, 1.3-2.4 s in the slow
+ones and none in the fast: the landings fell behind. The segment work's
+thread took three times the no-cache arm's CPU, a fifth of it in the
+pieces' ranks against their partitions, taken before each publish so
+the first scan would not pay for them, and the rest in the device
+doorbells of the major faults the walk took over partition pages the
+bound had pushed out -- for pieces the next merge folded away unread. A
+landing far from reads publishes its pieces without them now, a flush's
+counted near (`Options::land_ranks_far`), and the default's loads peak at
+256-312 MB. What the sync then held was the drain's merge placing its
+cuts from a copy of every distinct key of the store, 120 MB at five
+million, where a cut reads a key's first sixteen bytes and only within
+its fence (`db::Slicer`). Neither copy nor ranks moved the census lines: the census
+counts what the store holds and not what a worker is doing, and the
+allocator's bytes in use beside it (`mallinfo2`) were what said the
+excess was live. The rule's "every path that builds it" includes the
+seal and the landing, and the signal is the same one: a scan on either
+path counts toward it, since the merge path's scans were counted by
+nothing (`Shared::scans_merged`). And work on the thread every landing
+goes through is priced under a bound by the pile-up it makes behind it,
+since its own time is what a fault costs there, which nothing in core
+shows.
+
 **A budget that counted what a structure held, beside a process that paid for what it cost.** The
 block cache's budget (`scan_cache_bytes`) counted a form's keys, values and entries, and the arm
 budgeted at 256 MB held a median of 935 MB of anonymous memory at the lag sweep's full-rewrite point

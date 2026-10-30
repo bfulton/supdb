@@ -481,6 +481,14 @@ pub struct Supdb {
     /// its records (`Options::drain_snapshot` off), the refuted shape.
     /// `supdb-ingestnodrainsnap`, and `supdb-nodrainsnap` durable.
     nodrainsnap: bool,
+    /// A seal far from reads builds its snapshot copy as any seal did
+    /// (`Options::seal_snapshot_far`). `supdb-ingestsealcopyfar`, and
+    /// `supdb-sealcopyfar` durable.
+    sealcopyfar: bool,
+    /// A landing far from reads takes its pieces' ranks and bounds as any
+    /// landing did (`Options::land_ranks_far`). `supdb-ingestranksfar`,
+    /// and `supdb-ranksfar` durable.
+    ranksfar: bool,
     /// A seal writes every key through the writer's general path, as
     /// before the one-value path (`Options::seal_put_one` off).
     /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
@@ -1083,6 +1091,14 @@ struct Policy {
     /// its records (`Options::drain_snapshot` off), the refuted shape.
     /// `supdb-ingestnodrainsnap`, and `supdb-nodrainsnap` durable.
     nodrainsnap: bool,
+    /// A seal far from reads builds its snapshot copy as any seal did
+    /// (`Options::seal_snapshot_far`). `supdb-ingestsealcopyfar`, and
+    /// `supdb-sealcopyfar` durable.
+    sealcopyfar: bool,
+    /// A landing far from reads takes its pieces' ranks and bounds as any
+    /// landing did (`Options::land_ranks_far`). `supdb-ingestranksfar`,
+    /// and `supdb-ranksfar` durable.
+    ranksfar: bool,
     /// A seal writes every key through the writer's general path, as
     /// before the one-value path (`Options::seal_put_one` off).
     /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
@@ -1543,6 +1559,8 @@ impl Default for Policy {
             lazysettle: false,
             walsync: false,
             nodrainsnap: false,
+            sealcopyfar: false,
+            ranksfar: false,
             sealrun: false,
             closeinline: false,
             timers: false,
@@ -2976,6 +2994,62 @@ impl Supdb {
             path,
             Policy {
                 nodrainsnap: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose seals build their snapshot copy far from reads as
+    /// well: against `supdb` it prices the copy on a load nobody reads,
+    /// the walk the seal does without it and the memory it holds.
+    pub fn create_sealcopyfar(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                sealcopyfar: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose landings take their pieces' ranks and bounds far from
+    /// reads as well: against `supdb` it prices the walk on a load nobody
+    /// reads, which a bound turns into faults on the segment work's thread.
+    pub fn create_ranksfar(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                ranksfar: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` whose landings take their pieces' ranks and bounds
+    /// far from reads as well: against `supdb-ingest` it prices the walk on
+    /// the buffered loads.
+    pub fn create_ingest_ranksfar(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                ranksfar: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` whose seals build their snapshot copy far from
+    /// reads as well: against `supdb-ingest` it prices the copy on the
+    /// buffered loads.
+    pub fn create_ingest_sealcopyfar(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                sealcopyfar: true,
                 ..Policy::default()
             },
         )
@@ -5098,6 +5172,8 @@ impl Supdb {
             lazysettle,
             walsync,
             nodrainsnap,
+            sealcopyfar,
+            ranksfar,
             sealrun,
             closeinline,
             timers,
@@ -5353,6 +5429,8 @@ impl Supdb {
             upkeep_settle_after_scans: !lazysettle,
             drain_syncs_wal: walsync,
             drain_snapshot: !nodrainsnap,
+            seal_snapshot_far: sealcopyfar,
+            land_ranks_far: ranksfar,
             seal_put_one: !sealrun,
             close_finish_inline: closeinline,
             upkeep_wake_parked: wake,
@@ -5585,6 +5663,8 @@ impl Supdb {
             lazysettle,
             walsync,
             nodrainsnap,
+            sealcopyfar,
+            ranksfar,
             sealrun,
             closeinline,
             timers,
@@ -6177,6 +6257,20 @@ impl Engine for Supdb {
                 "supdb-nodrainsnap"
             } else {
                 "supdb-ingestnodrainsnap"
+            };
+        }
+        if self.sealcopyfar {
+            return if self.partition {
+                "supdb-sealcopyfar"
+            } else {
+                "supdb-ingestsealcopyfar"
+            };
+        }
+        if self.ranksfar {
+            return if self.partition {
+                "supdb-ranksfar"
+            } else {
+                "supdb-ingestranksfar"
             };
         }
         if self.sealrun {
@@ -7466,6 +7560,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-settlebuilds"
         | "supdb-walsync"
         | "supdb-nodrainsnap"
+        | "supdb-sealcopyfar"
+        | "supdb-ranksfar"
         | "supdb-sealrun"
         | "supdb-closeinline"
         | "supdb-timers"
@@ -7553,6 +7649,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestsettlebuilds"
         | "supdb-ingestwalsync"
         | "supdb-ingestnodrainsnap"
+        | "supdb-ingestsealcopyfar"
+        | "supdb-ingestranksfar"
         | "supdb-ingestsealrun"
         | "supdb-ingestcloseinline"
         | "supdb-ingesttimers"
@@ -7838,6 +7936,10 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestwalsync" => Box::new(Supdb::create_ingest_walsync(dir)?),
         "supdb-nodrainsnap" => Box::new(Supdb::create_nodrainsnap(dir)?),
         "supdb-ingestnodrainsnap" => Box::new(Supdb::create_ingest_nodrainsnap(dir)?),
+        "supdb-sealcopyfar" => Box::new(Supdb::create_sealcopyfar(dir)?),
+        "supdb-ingestsealcopyfar" => Box::new(Supdb::create_ingest_sealcopyfar(dir)?),
+        "supdb-ranksfar" => Box::new(Supdb::create_ranksfar(dir)?),
+        "supdb-ingestranksfar" => Box::new(Supdb::create_ingest_ranksfar(dir)?),
         "supdb-sealrun" => Box::new(Supdb::create_sealrun(dir)?),
         "supdb-ingestsealrun" => Box::new(Supdb::create_ingest_sealrun(dir)?),
         "supdb-closeinline" => Box::new(Supdb::create_closeinline(dir)?),

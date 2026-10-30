@@ -2478,6 +2478,46 @@ pub struct Options {
     /// the table already taken as it is: `supdb-nodrainsnap` and
     /// `supdb-ingestnodrainsnap`.
     pub drain_snapshot: bool,
+    /// A seal far from reads builds its snapshot copy as any seal does
+    /// (`seal_snapshot`). Off, the default, a seal of a table frozen with
+    /// no scan around (`reads_around`: none in the store's life, or two
+    /// stores' worth of writes since the last) builds none and writes its
+    /// records from the table's chains with the copy's lookahead, as a
+    /// drain's under `drain_snapshot` off; a copy someone set on the
+    /// table already is taken as it is. The copy is the table's key and
+    /// value bytes again, held with the table until the seal lands, and
+    /// a load whose seals fall behind holds it for every table frozen:
+    /// a shuffled load of five million keys under 640 MiB held three
+    /// frozen tables and their three copies, 380 MB of the bound, and
+    /// the bound killed it, where the arm without the block cache, its
+    /// seals landing ahead of the next freeze, held one. A drain's seal
+    /// builds its copy as `drain_snapshot` says, far from reads or not:
+    /// one table's copy at a drain is not what the bound killed, and the
+    /// scans after a shuffled load of thirty thousand keys without it read
+    /// 0.89-0.97x in six sittings, at the same instructions and over the
+    /// same segment byte for byte, where two arms that differ in nothing
+    /// there read 0.92-1.09x -- the memory those scans run over, which
+    /// says nothing either way, so the drain keeps the shape its rows
+    /// were taken in. On, `supdb-sealcopyfar` and
+    /// `supdb-ingestsealcopyfar`.
+    pub seal_snapshot_far: bool,
+    /// A landing far from reads takes its pieces' ranks and bounds
+    /// against their partitions before it publishes, as every landing
+    /// does near them (`Maint::rank_before_publish`). Off, the default, a
+    /// landing while the writer's last seal was far from every scan
+    /// (`reads_around`, as `seal_snapshot_far` asks it; a drain's seal
+    /// counts as near, since a flush is a writer saying it has stopped
+    /// and reads come next) publishes the pieces without them, and a
+    /// reader that comes takes them for itself, as it does for a piece
+    /// opened from disk. The walk reads the partition's keys, and under a
+    /// bound those are pages the load has pushed out: in a shuffled load
+    /// of five million keys under 640 MiB the segment work's thread took
+    /// three times the no-cache arm's time, its landings fell behind the
+    /// freezes, the writer waited 1.3 to 2.4 s for room and three frozen
+    /// tables stood beside the live one; the next merge folds the pieces
+    /// away before anything reads them. On, `supdb-ranksfar` and
+    /// `supdb-ingestranksfar`.
+    pub land_ranks_far: bool,
     /// A seal writes a key whose chain holds one value and no tombstone
     /// -- every key of a load, and most of any table -- through the
     /// writer's one-value path (`SegmentWriter::put_one`), the record
@@ -3034,6 +3074,8 @@ impl Default for Options {
             drain_syncs_wal: false,
             close_finish_inline: false,
             drain_snapshot: true,
+            seal_snapshot_far: false,
+            land_ranks_far: false,
             seal_put_one: true,
             close_presync: true,
             ord_durable: false,
@@ -10398,6 +10440,184 @@ impl KeyList {
     }
 }
 
+/// What a merge's cuts come to (`Slicer::finish`): each output piece's
+/// ranks, the fences each is named by, and the count of distinct keys.
+type MergeSlices = (Vec<(usize, usize)>, Vec<Fence>, usize);
+
+/// A merge's slices -- the ranks each output piece takes and the fences
+/// it is named by -- from its distinct keys pushed once in key order.
+/// What the cuts read of a key is its first `FENCE_MAX` bytes: a join is
+/// a key at an even rank cut to the fence's length, and a key is below
+/// such a cut exactly when its own first bytes are, so each key is held
+/// cut short, and under given fences only the keys of the fence being
+/// walked are held, its slices taken as the walk leaves it. The merge kept
+/// every key of its inputs whole for this, with an offset each, 24 bytes a
+/// key: the drain after a shuffled load of five million keys merges the
+/// store and held 120 MB for the cuts, the largest owner of a sync a bound
+/// had to fit. With no fences the bounds are drawn from the count of all
+/// the keys, so all are held, as before the first partitioning they are
+/// few.
+struct Slicer<'a> {
+    fences: Option<&'a [Fence]>,
+    parts: usize,
+    max_keys: usize,
+    /// The fence being walked, and the rank of its first key.
+    fi: usize,
+    from: usize,
+    /// Its keys cut to the fence's length; every key, with no fences.
+    held: KeyList,
+    total: usize,
+    slices: Vec<(usize, usize)>,
+    given: Vec<Fence>,
+}
+
+impl<'a> Slicer<'a> {
+    fn new(fences: Option<&'a [Fence]>, parts: usize, max_keys: usize) -> Slicer<'a> {
+        Slicer {
+            fences,
+            parts,
+            max_keys,
+            fi: 0,
+            from: 0,
+            held: KeyList::new(),
+            total: 0,
+            slices: Vec::new(),
+            given: Vec::new(),
+        }
+    }
+
+    /// The next distinct key, above every key pushed before it.
+    fn push(&mut self, k: &[u8]) {
+        let short = &k[..k.len().min(FENCE_MAX)];
+        match self.fences {
+            Some(fs) => {
+                // The fences are a sorted run of disjoint ranges: a key at
+                // or past the walked fence's high end closes it, and one
+                // below the next fence's low end is in no fence, a key no
+                // slice takes, as a key outside every fence always was.
+                while let Some((lo, hi)) = fs.get(self.fi) {
+                    if hi.as_ref().is_some_and(|h| k >= h.as_slice()) {
+                        self.close_fence();
+                        continue;
+                    }
+                    // An open fence is the empty vector, and nothing is
+                    // below it; see `Seg::below_lo` for why it is not
+                    // compared.
+                    if !lo.is_empty() && k < lo.as_slice() {
+                        break;
+                    }
+                    if self.held.is_empty() {
+                        self.from = self.total;
+                    }
+                    self.held.push(short);
+                    break;
+                }
+            }
+            None => self.held.push(short),
+        }
+        self.total += 1;
+    }
+
+    /// The walked fence's slices, from the keys it held, and the walk on
+    /// to the next fence.
+    fn close_fence(&mut self) {
+        let fs = self.fences.expect("closing a fence of given fences");
+        let (lo, hi) = &fs[self.fi];
+        self.fi += 1;
+        let held = std::mem::replace(&mut self.held, KeyList::new());
+        if held.is_empty() {
+            // No input holds a key in the fence: the partition that names
+            // it is an input all the same and goes with the landing, so an
+            // empty partition is written for it, or the set that lands has
+            // a hole where it was. The differential fuzz reached it with a
+            // partition whose every key a merge had dropped, pulled into
+            // the next merge by a wide piece with no key inside it. Every
+            // key so far is below the fence, none being inside it.
+            self.slices.push((self.total, self.total));
+            self.given.push((lo.clone(), hi.clone()));
+            return;
+        }
+        // Sub-fences tile the fence they came from: the first keeps its
+        // low bound, the last its high bound, and the joins are single
+        // shared values, each the key at an even rank cut to the fence's
+        // length. A join is made only where that cut separates the keys on
+        // either side of it: a cut inside a run of keys sharing their first
+        // bytes is at or below the whole run and cuts nothing, so the run
+        // stays in one piece rather than being named by a fence its own
+        // keys are outside of.
+        let len = held.len();
+        let n = len.div_ceil(self.max_keys.max(1)).max(1);
+        let per_sub = len.div_ceil(n);
+        let mut sub: Vec<Vec<u8>> = Vec::new();
+        for i in 1..n {
+            let b = fence_lo(held.get((i * per_sub).min(len - 1)));
+            if sub.last().is_none_or(|p| p != &b) {
+                sub.push(b);
+            }
+        }
+        let (s, g) = cut_by_bounds(&held, 0, len, (lo, hi), &sub);
+        let from = self.from;
+        self.slices
+            .extend(s.into_iter().map(|(a, b)| (from + a, from + b)));
+        self.given.extend(g);
+    }
+
+    /// The slices, their fences and the count of keys pushed, or nothing
+    /// when no key was.
+    fn finish(mut self) -> Option<MergeSlices> {
+        if self.total == 0 {
+            return None;
+        }
+        match self.fences {
+            Some(fs) => {
+                while self.fi < fs.len() {
+                    self.close_fence();
+                }
+            }
+            None => {
+                // The partition set must TILE the key space: every key
+                // routes to exactly one partition, with no gap between one
+                // partition's high fence and the next one's low fence.
+                // Deriving each fence separately from its own chunk does
+                // not do that -- `fence_hi(last of chunk i)` and
+                // `fence_lo(first of chunk i+1)` are different values, and
+                // a key landing between them is sealed into a range whose
+                // fence then denies it on the read path. Silent value
+                // loss, found at 1M keys by an experiment's own assertion
+                // after the contract tests (whose stores are too small to
+                // make a gap) passed clean.
+                //
+                // So a boundary is ONE value, shared by the partitions on
+                // either side, and the keys are sliced BY the boundaries
+                // rather than the boundaries derived from the slices. A
+                // slice is named by the bounds that cut it and never by
+                // its position among them: a bound is a key cut to the
+                // fence's length, so a run of keys longer than a fence
+                // that share their first bytes gives a bound at or below
+                // the run's first key, which cuts nothing and makes no
+                // slice, and a piece named by position carried the fence
+                // of the slice before it and refused its own first key
+                // ("compaction would write a key outside its fence",
+                // `tests/fences.rs`).
+                let len = self.held.len();
+                let parts = self.parts.max(1).min(len);
+                let per = len.div_ceil(parts);
+                let mut bounds: Vec<Vec<u8>> = Vec::new();
+                for i in 1..parts {
+                    let b = fence_lo(self.held.get((i * per).min(len - 1)));
+                    if bounds.last().is_none_or(|p| p != &b) {
+                        bounds.push(b);
+                    }
+                }
+                let (s, g) = cut_by_bounds(&self.held, 0, len, (&[], &None), &bounds);
+                self.slices.extend(s);
+                self.given.extend(g);
+            }
+        }
+        Some((self.slices, self.given, self.total))
+    }
+}
+
 /// K-way walk of the inputs in rank order: `f` sees each distinct key once,
 /// with `(input, rank)` for every input that holds it, oldest input first.
 /// Inputs are ordered oldest to newest, so draining those cursors in the
@@ -10625,13 +10845,15 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         );
     }
 
-    // Pass one: every distinct key once, in order.
-    let mut keys = KeyList::new();
-    if cursors {
+    // Pass one: every distinct key once, in order, into the slicer, which
+    // holds only what the slices are taken from (`Slicer`).
+    let mut slicer = Slicer::new(fences.as_deref(), parts, max_keys);
+    let all: Vec<Vec<u8>> = if cursors {
         merge_ranks(&blobs, |k, _| {
-            keys.push(k);
+            slicer.push(k);
             Ok(())
         })?;
+        Vec::new()
     } else {
         let mut all: Vec<Vec<u8>> = Vec::new();
         for b in &blobs {
@@ -10640,107 +10862,13 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         all.sort_unstable();
         all.dedup();
         for k in &all {
-            keys.push(k);
+            slicer.push(k);
         }
-    }
-    if keys.is_empty() {
-        return Ok(Vec::new());
-    }
-    let parts = match &fences {
-        Some(f) => f.len().max(1),
-        None => parts.max(1).min(keys.len()),
+        all
     };
-    let per = keys.len().div_ceil(parts);
-
-    // The partition set must TILE the key space: every key routes to
-    // exactly one partition, with no gap between one partition's high
-    // fence and the next one's low fence. Deriving each fence separately
-    // from its own chunk does not do that -- `fence_hi(last of chunk i)`
-    // and `fence_lo(first of chunk i+1)` are different values, and a key
-    // landing between them is sealed into a range whose fence then denies
-    // it on the read path. Silent value loss, found at 1M keys by an
-    // experiment's own assertion after the contract tests (whose stores
-    // are too small to make a gap) passed clean.
-    //
-    // So a boundary is ONE value, shared by the partitions on either side,
-    // and the keys are sliced BY the boundaries rather than the boundaries
-    // derived from the slices.
-    let mut bounds: Vec<Vec<u8>> = Vec::new();
-    if fences.is_none() {
-        for i in 1..parts {
-            let b = fence_lo(keys.get((i * per).min(keys.len() - 1)));
-            if bounds.last().is_none_or(|p| p != &b) {
-                bounds.push(b);
-            }
-        }
-    }
-    // Slice by whichever boundaries govern: the given fences when the
-    // caller has them, the derived ones when it does not. Either way a
-    // slice is named by the bounds that cut it and never by its position
-    // among them: a bound is a key cut to the fence's length, so a run of
-    // keys longer than a fence that share their first bytes gives a bound
-    // at or below the run's first key, which cuts nothing and makes no
-    // slice, and a piece named by position carried the fence of the slice
-    // before it and refused its own first key ("compaction would write a
-    // key outside its fence", `tests/fences.rs`).
-    let mut slices: Vec<(usize, usize)> = Vec::new();
-    let mut given: Vec<Fence> = Vec::new();
-    match &fences {
-        Some(fs) => {
-            for (lo, hi) in fs {
-                // An open fence is the empty vector, and nothing is below
-                // it; see `Seg::below_lo` for why it is not compared.
-                let from = if lo.is_empty() {
-                    0
-                } else {
-                    keys.partition_point(|k| k < lo.as_slice())
-                };
-                let to = match hi {
-                    Some(h) => keys.partition_point(|k| k < h.as_slice()),
-                    None => keys.len(),
-                };
-                let to = to.max(from);
-                if from == to {
-                    // No input holds a key in the fence: the partition
-                    // that names it is an input all the same and goes with
-                    // the landing, so an empty partition is written for it,
-                    // or the set that lands has a hole where it was. The
-                    // differential fuzz reached it with a partition whose
-                    // every key a merge had dropped, pulled into the next
-                    // merge by a wide piece with no key inside it.
-                    slices.push((from, to));
-                    given.push((lo.clone(), hi.clone()));
-                    continue;
-                }
-                // Sub-fences tile the fence they came from: the first
-                // keeps its low bound, the last its high bound, and the
-                // joins are single shared values, each the key at an even
-                // rank cut to the fence's length. A join is made only
-                // where that cut separates the keys on either side of it:
-                // a cut inside a run of keys sharing their first bytes is
-                // at or below the whole run and cuts nothing, so the run
-                // stays in one piece rather than being named by a fence
-                // its own keys are outside of.
-                let n = (to - from).div_ceil(max_keys.max(1)).max(1);
-                let per_sub = (to - from).div_ceil(n);
-                let mut sub: Vec<Vec<u8>> = Vec::new();
-                for i in 1..n {
-                    let b = fence_lo(keys.get((from + i * per_sub).min(to - 1)));
-                    if sub.last().is_none_or(|p| p != &b) {
-                        sub.push(b);
-                    }
-                }
-                let (s, g) = cut_by_bounds(&keys, from, to, (lo, hi), &sub);
-                slices.extend(s);
-                given.extend(g);
-            }
-        }
-        None => {
-            let (s, g) = cut_by_bounds(&keys, 0, keys.len(), (&[], &None), &bounds);
-            slices.extend(s);
-            given.extend(g);
-        }
-    }
+    let Some((slices, given, total)) = slicer.finish() else {
+        return Ok(Vec::new());
+    };
 
     let mut pieces = Vec::with_capacity(slices.len());
     let mut empties: Vec<String> = Vec::new();
@@ -10822,8 +10950,8 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
             })
         })?;
     } else {
-        for r in 0..keys.len() {
-            let k = keys.get(r);
+        for k in &all {
+            let k = k.as_slice();
             let mut found: Vec<(usize, crate::index::Exts<'_>, &[u8])> =
                 Vec::with_capacity(blobs.len());
             let mut start = 0usize;
@@ -10852,7 +10980,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
             })?;
         }
     }
-    let mut out = em.finish(keys.len())?;
+    let mut out = em.finish(total)?;
     out.extend(empties);
     File::open(&dir)?.sync_all()?;
     Ok(out)
@@ -12439,6 +12567,16 @@ struct Shared {
     /// how long ago the last one was; the state's own count restarts at
     /// every publish.
     scans_life: AtomicU64,
+    /// Scans over the store the block path did not serve -- no cache, or
+    /// none yet with no partition to hang it on -- a handle's said once
+    /// per commit as with `scans_life`, which counts only the block
+    /// path's: the two together are every scan, which is what a seal
+    /// asks before it builds its copy (`Options::seal_snapshot_far`).
+    scans_merged: AtomicU64,
+    /// Whether the writer's last seal was near reads, a drain's counted
+    /// near: the segment work's landings take the pieces' ranks and
+    /// bounds only then (`Options::land_ranks_far`).
+    reads_near: std::sync::atomic::AtomicBool,
     /// Scans and point reads through any handle but the writer's, a
     /// handle's said once per commit as with `scans_life`, where the idle
     /// seals follow the reads (`Options::seal_idle`); the writer counts
@@ -13774,6 +13912,12 @@ pub struct Db {
     upkeep_log: (u64, usize),
     upkeep_life: u64,
     upkeep_since_scan: u64,
+    /// The seals' own view of the same regime, kept at each seal for
+    /// `Options::seal_snapshot_far`: the store's scans on either path as
+    /// the last seal saw them, and the writes of the tables sealed since
+    /// the count moved.
+    seal_life: u64,
+    seal_since_scan: u64,
     /// Writes lent over the store's life, and the count below which all
     /// were filed when the thread was last seen caught up, for
     /// `Options::upkeep_lag_pct`.
@@ -16052,7 +16196,7 @@ impl Reader {
         let base = if !self.opts.seal_grows {
             self.opts.seal_bytes
         } else {
-            let grown = sized / (4 * self.opts.l0_trigger.max(1)) as u64;
+            let grown = sized / self.opts.l0_trigger.max(1).saturating_mul(4) as u64;
             self.opts
                 .seal_bytes
                 .max(usize::try_from(grown).unwrap_or(usize::MAX))
@@ -16325,6 +16469,23 @@ impl Reader {
     pub fn pieces_aligned(&self) -> bool {
         let _entered = self.enter();
         self.state().l0_aligned
+    }
+
+    /// The level-0 pieces standing that hold ranks or bounds against a
+    /// partition, and the pieces standing (`Options::land_ranks_far`).
+    /// For a test.
+    #[doc(hidden)]
+    pub fn pieces_ranked(&self) -> (usize, usize) {
+        let _entered = self.enter();
+        let (mut ranked, mut n) = (0, 0);
+        for s in self.segs().iter().filter(|s| s.level == 0) {
+            let mut any = false;
+            s.ranks.each(|_| any = true);
+            s.bounds.each(|_| any = true);
+            ranked += usize::from(any);
+            n += 1;
+        }
+        (ranked, n)
     }
 
     /// How many segments' ordered companions were advised `MADV_RANDOM`, and
@@ -17554,6 +17715,7 @@ impl Reader {
             self.opts.scan_block_cache && self.segs().first().is_some_and(|s| s.level > 0);
         if !use_cache {
             self.count_unshaped();
+            self.note_merged_scan();
         }
         // A scan pays lag over every unsealed key and every piece its
         // blocks meet. The pieces are counted from the partitions' end,
@@ -18952,6 +19114,22 @@ impl Reader {
                 t.unpark();
             }
         }
+    }
+
+    /// A scan the block path did not serve, counted for the seals
+    /// (`Shared::scans_merged`): the writer's at every scan, a handle's
+    /// once per commit, by the mark the block path keeps for its own
+    /// count, since a scan takes one path or the other within a state.
+    fn note_merged_scan(&self) {
+        if self.slot.is_some() {
+            let now = (self.state().gen, self.mem().committed_log());
+            if self.signalled.replace(now) == now {
+                return;
+            }
+        }
+        self.shared
+            .scans_merged
+            .fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     /// Whether the store's cadence follows its reads at all.
@@ -23506,6 +23684,8 @@ impl Db {
             rd_scans: AtomicU64::new(0),
             rd_blocks: AtomicU64::new(0),
             scans_life: AtomicU64::new(0),
+            scans_merged: AtomicU64::new(0),
+            reads_near: std::sync::atomic::AtomicBool::new(false),
             mode_scans: AtomicU64::new(0),
             mode_points: AtomicU64::new(0),
             live_handles: AtomicUsize::new(0),
@@ -23608,6 +23788,8 @@ impl Db {
             upkeep_log: (0, 0),
             upkeep_life: 0,
             upkeep_since_scan: 0,
+            seal_life: 0,
+            seal_since_scan: 0,
             upkeep_lent: 0,
             upkeep_floor: 0,
             upkeep_hand: Hand::Lend,
@@ -23997,6 +24179,8 @@ impl Db {
             rd_scans: AtomicU64::new(0),
             rd_blocks: AtomicU64::new(0),
             scans_life: AtomicU64::new(0),
+            scans_merged: AtomicU64::new(0),
+            reads_near: std::sync::atomic::AtomicBool::new(false),
             mode_scans: AtomicU64::new(0),
             mode_points: AtomicU64::new(0),
             live_handles: AtomicUsize::new(0),
@@ -24099,6 +24283,8 @@ impl Db {
             upkeep_log: (0, 0),
             upkeep_life: 0,
             upkeep_since_scan: 0,
+            seal_life: 0,
+            seal_since_scan: 0,
             upkeep_lent: 0,
             upkeep_floor: 0,
             upkeep_hand: Hand::Lend,
@@ -25076,7 +25262,33 @@ impl Db {
         };
         let from_snapshot = self.opts.seal_from_snapshot;
         let frozen_snaps = self.opts.frozen_snaps;
-        let build_copy = !self.draining || self.opts.drain_snapshot;
+        // Reads around the table being sealed, by the writes of the
+        // tables sealed since the store's scan count last moved: a seal
+        // far from every scan builds no copy for scans that are not
+        // coming (`Options::seal_snapshot_far`), and its records are the
+        // walk that was the copy's.
+        let life = self.shared.scans_life.load(AtomicOrdering::Relaxed)
+            + self.shared.scans_merged.load(AtomicOrdering::Relaxed);
+        if life != self.seal_life {
+            self.seal_life = life;
+            self.seal_since_scan = 0;
+        }
+        let keys: usize = self
+            .segs()
+            .iter()
+            .filter(|s| s.level > 0)
+            .map(|s| s.blob.keys())
+            .sum();
+        let near = reads_around(life, self.seal_since_scan, keys);
+        self.seal_since_scan += table.committed_at().0 as u64;
+        self.shared
+            .reads_near
+            .store(near || self.draining, AtomicOrdering::Release);
+        let build_copy = if self.draining {
+            self.opts.drain_snapshot
+        } else {
+            near || self.opts.seal_snapshot_far
+        };
         let put_one = self.opts.seal_put_one;
         let job = move |readable: &SealReadable| -> Result<Vec<String>> {
             if background_io == BackgroundIo::Idle {
@@ -25594,6 +25806,11 @@ impl Db {
         self.commit_staged()?;
         self.unsynced = 0;
         self.draining = true;
+        // Reads come after a drain: its landings, and whatever lands
+        // before the next seal says otherwise, take their pieces' ranks
+        // (`Options::land_ranks_far`), whichever path the drain's own
+        // seal takes.
+        self.shared.reads_near.store(true, AtomicOrdering::Release);
         let sealed = self.seal().and_then(|_| {
             self.shared.drain_steps.stamp(1);
             self.maint_request(MaintAsk::Drain)
@@ -32965,7 +33182,10 @@ impl Maint {
     /// at all, and its re-opened partition has a new id. Nothing where
     /// the block cache is off, since nothing reads them then.
     fn rank_before_publish(&self, segs: &[std::sync::Arc<Seg>]) -> Result<()> {
-        if self.opts.scan_block_cache {
+        // Far from reads the pieces go without, and a reader that comes
+        // takes them (`Options::land_ranks_far`).
+        let near = self.opts.land_ranks_far || self.shared.reads_near.load(AtomicOrdering::Acquire);
+        if self.opts.scan_block_cache && near {
             rank_pieces_of(segs, self.opts.piece_ranks_by_heads)?;
             bound_pieces_of(segs)?;
         }
