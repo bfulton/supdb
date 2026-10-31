@@ -38,7 +38,7 @@ class.
 **Never run two timing benchmarks at once.** Four cores measuring each
 other is not a measurement. This includes your own agents.
 
-**Two rows is not a band.** The gate says "insufficient history" below
+**Two rows is not a band.** The gate says "no band yet" below
 three prior rows rather than pretending.
 
 **An A/B of two engine revisions is two runs, however you interleave

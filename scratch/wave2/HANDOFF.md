@@ -208,6 +208,62 @@ form as it attaches would reach only the threaded passes inside the
 build; the build's own wall, 36 s from the buy to the install at five
 million keys, has no timing of its own in the trace yet).
 
+## This session (3): the isolation defect, the comparators, the docs, the PR
+
+The user's order for this stretch: finish the cold-partition work and the
+charts, then clean up every doc and put the branch into a pull request,
+looking at every other non-main branch. On the way:
+
+- **The snapshot isolation defect (hunt I) is fixed.** The windows test's
+  snapshot half had run with the block cache off only, "cause not known";
+  run with the cache on it failed 2 in 1,000 (a `Snapshot` handle's scan
+  read a write made after it). Cause: a scan checks the published forms'
+  position (`State::forms_at`) once at its start while the upkeep thread
+  swaps the slots in place, slots first, position after. Each form carries
+  the position it was published at now (`CanonicalForm::at`) and a reader
+  takes one at or before its own (`Reader::canonical`, `NEWER_FORM`); a
+  freeze restamps the carried forms to 0. Deterministic test
+  `tests/db.rs` `a_scan_takes_no_form_published_after_the_commit_it_reads_at`
+  through the seam `Db::hold_forms_position`; 3,000 of 3,000 runs of the
+  failing variant pass; `scratch/hunt/snapstress.sh` is the stress
+  (`FILTER`, `EXPECT`). `CLAUDE.md`, "A position checked once, of slots
+  swapped under it".
+- **Comparators, the minimum credible set.** The buffered RocksDB was
+  untuned (`rocksdb-nosync`, ROADMAP.md quoted no number from it): the
+  roster runs `rocksdb-tuned-nosync` now. The bounded roster runs LMDB once,
+  with its readahead off (`lmdb-nordahead`); in memory `lmdb` as it opens.
+  No libmdbx, WiredTiger or SQLite arm: the user asked for the fewest that
+  look credible, and those would be one-off checks at most.
+- **A mislabel corrected.** The two LMDB pairings of step (4)
+  (`lp-vslmdb-*`, `lp-vslmdb2-*`) ran against `lmdb`, readahead on, and were
+  written up as readahead off (also in `adf69cc`'s message). Against `lmdb`
+  every cell is ahead (E 1.59-1.61x, the read pass 1.8-2.1x, the install
+  2.2-4.2 s after the load in every rep with the cold partitions built). The
+  pairing against `lmdb-nordahead` is the open question of step (4); run it
+  with `scratch/wave2/land-pair.sh vsnord lmdb-nordahead
+  supdb-cache64tofitautozpagesdropland50 5000000` (about 65 minutes).
+- **Docs.** Two read-only audits (branches, docs) and the fixes in
+  README.md, web/README.md, bench/README.md, bench/DESIGN.md,
+  docs/engine.md, docs/index-theory.md, CLAUDE.md and bench/CLAUDE.md;
+  `scratch/README.md` notes that this branch's history was squashed at its
+  root `63fc686`, which hashes resolve where, and adds the trunk and
+  `wip-hunt-stress0` to the archive tags before any branch is deleted.
+- **Charts.** `scratch/charts/draw.py ROW OUT [--companion ROW] [--ooc
+  TITLE=SITTING.out,...]` draws every figure, the summary matrix, a gate's
+  companion matrix and the out-of-core figure, with the suite's statistic
+  ported bit for bit (checked against the Rust on five sample sets). The
+  plan the user agreed: the headline from a fresh full-scale row to 3M keys
+  at the head (`bench run --scale full --top 3000000` with the six
+  headline arms, about 5-6 hours, banked: it closes ROADMAP's buffered
+  RocksDB item), the companion from a fresh quick row, published to the
+  existing artifact (https://claude.ai/artifact/VnQpysEjRbqnyAymuxs9TW).
+- **Branches.** Every other branch's content is in this branch's tree
+  except the hunt branches (kept as patch series), the August branches'
+  previous engine (replaced by main's first PR), and the ext-analytics
+  LmdbDup scorecard (`82b7498`, only on its branch). This branch has no
+  common ancestor with `main`: the PR joins them by merging `main` with
+  `--allow-unrelated-histories`, keeping this tree.
+
 ## This session (2): the shift brought to the load's end
 
 The user's order for this stretch, after the OOM fix: (1) under `Auto`, drop
