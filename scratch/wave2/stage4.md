@@ -4501,8 +4501,12 @@ every segment work thread idle in its sleep, which is what said so.
 
 ## The shipping `Auto` shape against LMDB, after the builds ahead (`9bb1c6f`)
 
-`supdb-cache64tofitautozpagesdropland50` against LMDB with its readahead
-off, five million keys under 640 MiB, three pairs after the warmup, the
+`supdb-cache64tofitautozpagesdropland50` against LMDB as it opens by
+default (`lmdb`: the kernel's readahead on -- this section said "with its
+readahead off" until the pairing after the next section, and so did the
+commit that carried it, `adf69cc`; every pricing before it ran against
+`lmdb-nordahead`, so the E figures below do not compare with theirs),
+five million keys under 640 MiB, three pairs after the warmup, the
 reads divided by ten (`lp-vslmdb-5000000-{1,2}.*`; sitting 1 with LMDB
 first, sitting 2 rerun alone after the first ran past its time limit,
 `cut/lp-vslmdb-5000000-2-killed.err`), supdb over LMDB:
@@ -4518,9 +4522,13 @@ first, sitting 2 rerun alone after the first ran past its time limit,
 | A, B, C, D, F | 5.9, 1.9, 2.2, 4.1, 4.0 | 4.6, 3.0, 2.9, 5.9, 4.3 |
 | E | 1.40 | 1.63 |
 
-E, the open cell of every comparison before this one (1.09-1.14 on the
-combined arm, 0.55 forced before the decoder), reads 1.40 and 1.63 in all
-three pairs of each order. The one cell LMDB takes is the read pass in
+E reads 1.40 and 1.63 in all three pairs of each order. The figures it
+was first set beside (1.09-1.14 on the combined arm, 0.55 forced before
+the decoder) were read against `lmdb-nordahead`, the LMDB a user
+configures for the regime, which reads E about half again as fast as
+`lmdb` at ten million keys under a gibibyte (`docs/engine.md`, "Out of
+core: against LMDB with its readahead off"); so this E is not the margin
+that closed, and the like-for-like pairing is a section below. The one cell LMDB takes is the read pass in
 sitting 1, and its reps say why: two of the three measured reps found
 three or four partitions cold at the builds' look, the files on disk
 covered too little of the keys for the attach entry, and the install
@@ -4548,3 +4556,32 @@ had all nineteen files on disk at the sample and installed 2.2-3.7 s after
 the load, where the bar's arm installed two of eight at 18.1 and 18.7 s;
 both of those fell in the warmup pairs the table leaves out, so the rates
 read level, the cells that moved moving with the arms' position.
+
+## The shipping `Auto` shape against LMDB again, the cold partitions built (`adf69cc`)
+
+The same pairing on the commit that builds the cold partitions past the
+line (`lp-vslmdb2-5000000-{1,2}.*`, sitting 1 with LMDB first), against
+the same `lmdb` -- LMDB as it opens by default, the kernel's readahead on,
+which is not the comparator the pricings before the last section used.
+supdb over LMDB:
+
+| | sitting 1 | sitting 2 |
+|---|---|---|
+| ordered load | 1.36 | 1.40 |
+| shuffled load | 15.2 | 14.8 |
+| read pass | 2.05 | 1.83 |
+| read, 2 / 3 threads | 8.5 / 10.3 | 10.9 / 14.1 |
+| read p99 (LMDB's over supdb's) | 2.21 | 2.07 |
+| scan pass | 3.90 | 3.32 |
+| scan, 2 / 3 threads | 3.9 / 4.6 | 4.2 / 5.4 |
+| A, B, C, D, F | 5.2, 2.8, 3.2, 7.1, 4.3 | 5.9, 3.4, 3.0, 6.6, 5.0 |
+| E | 1.59 | 1.61 |
+
+Every rep of eight, the warmups included, had all nineteen files on disk
+at the sample and installed 2.2-4.2 s after the load (`land_read.py`),
+the partitions marked cold at the look built ahead all the same; the read
+pass the last pairing lost in the sitting whose reps went cold reads 2.05
+and 1.83 here, every pair of both orders above LMDB in every cell. What it
+does not say is the margin against `lmdb-nordahead`, the LMDB a user
+configures for a store past its memory and the comparator of every
+pricing before; that pairing is the next.
