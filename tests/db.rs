@@ -13305,6 +13305,92 @@ fn a_form_dropped_under_a_landings_carry_is_retracted_at_the_writers_look() {
     std::hint::black_box(sink);
 }
 
+/// A handle's scan takes the published forms when they are current to the
+/// commit it reads at, and it asked once, at the scan's start, by the
+/// forms' position (`forms_at`), while the forms stand in slots whoever
+/// publishes swaps in place, the slots first and the position after. A
+/// publish of the next commit's forms landing inside a scan -- the upkeep
+/// thread's, beside a handle's read -- handed the scan forms of a commit
+/// after its own: a handle holding a snapshot read a write made after it,
+/// in about one run in five hundred of the windows test with the block
+/// cache on (`tests/zpages.rs`), and a handle under `Latest` read one
+/// commit's forms beside another's memtable. The race is the publish's two
+/// stores apart; the test leaves the state it leaves
+/// (`hold_forms_position`: the next commit's forms in their slots, the
+/// position not moved) and holds a snapshot's scans and point reads to
+/// the commit it names.
+#[test]
+fn a_scan_takes_no_form_published_after_the_commit_it_reads_at() {
+    let d = dir("form-after-snapshot");
+    let opts = Options {
+        partition_bytes: Some(2 << 10),
+        scan_block_cache: true,
+        scan_cache_bytes: 64 << 20,
+        commit_forms: true,
+        upkeep: supdb::Upkeep::Inline,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..1500u32 {
+        db.append(key(k).as_bytes(), b"v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    assert!(db.levels().0 > 1, "several partitions");
+    let r = db.reader().unwrap();
+    let collect = |rd: &supdb::Reader, from: u32, n: usize| {
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        rd.scan(key(from).as_bytes(), n, |k, v| {
+            out.push((k.to_vec(), v.to_vec()))
+        })
+        .unwrap();
+        out
+    };
+    // Writes over every fifth key, scans by both sides, and a commit the
+    // writer maintains the forms at and publishes them for the handle.
+    for k in (0..1500u32).step_by(5) {
+        db.put(key(k).as_bytes(), b"v1");
+    }
+    db.commit().unwrap();
+    let _ = collect(&db, 0, 1500);
+    let _ = collect(&r, 0, 1500);
+    db.put(key(1).as_bytes(), b"v1b");
+    db.commit().unwrap();
+    let (_, hits) = db.canonical_tries();
+    let before = collect(&r, 680, 40);
+    assert!(
+        db.canonical_tries().1 > hits,
+        "the handle took the forms current to its commit"
+    );
+    // The snapshot, and the next commit's forms published into the slots
+    // with their position held where the snapshot's commit put it.
+    r.snapshot();
+    assert_eq!(collect(&r, 680, 40), before, "the snapshot as taken");
+    db.hold_forms_position(true);
+    for k in 690..710u32 {
+        db.put(key(k).as_bytes(), b"after the snapshot");
+    }
+    db.commit().unwrap();
+    assert_eq!(
+        collect(&r, 680, 40),
+        before,
+        "the snapshot's scan with the next commit's forms in the slots"
+    );
+    let mut v = Vec::new();
+    r.read_all(key(700).as_bytes(), |x| v.push(x.to_vec()))
+        .unwrap();
+    assert_eq!(v, vec![b"v1".to_vec()], "the snapshot's point read");
+    db.hold_forms_position(false);
+    r.release();
+    let latest = collect(&r, 690, 20);
+    assert!(
+        latest.iter().all(|(_, v)| v == b"after the snapshot"),
+        "the handle released reads the commit after"
+    );
+}
+
 /// An ordered load's tail handed while a threshold seal is still in
 /// flight, the case a promotion at every landing makes common: the seal
 /// in flight is a piece cut open above against the last partition, and

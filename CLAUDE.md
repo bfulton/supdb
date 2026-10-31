@@ -31,10 +31,11 @@ of the change that produced the text.
 | `tests/` | the engine's contract, the read paths held to each other, the format's damage cases; `tests/common` holds what more than one file needs |
 | `bench/` | the benchmark suite: its own cargo workspace, the arms, the runner, the gate and the figures -- `bench/DESIGN.md` |
 
-Two writers produce the format -- `Db` when it seals or compacts, and
-`SegmentWriter` for sorted write-once input -- and three readers parse what
-either produced: `Blob` over a mapped file, `Blob` over a copying source, and
-`SparseBlob` over ranges. That is why `format.rs` belongs to none of them.
+One writer produces the format, `SegmentWriter`, with two callers -- `Db`
+when it seals or compacts, and a caller with sorted write-once input -- and
+three readers parse what it wrote: `Blob` over a mapped file, `Blob` over a
+copying source, and `SparseBlob` over ranges. That is why `format.rs`
+belongs to none of them.
 
 No module carries a blanket lint allowance; `block` and `flatindex` allow
 `dead_code` on the wasm target only, where their writer halves have no
@@ -853,7 +854,7 @@ requires each to fail the open. Its first run found a flip of the piece-shift
 word that made the row look *absent* and opened clean, which is why a row
 named with an impossible shift is damage rather than absence.
 
-**Both writers emit the same shape unless a measurement says otherwise.**
+**Both callers of the writer emit the same shape unless a measurement says otherwise.**
 `Db` passes `Options::inline_bytes` to its seal and its compaction exactly as
 `SegmentWriter` does. This file once said the opposite, and three findings
 were built on a difference that did not exist. If you are relying on a shape
@@ -1519,7 +1520,7 @@ for.
 pass checked that the state was the commit's by its generation and, where
 a landing from the segment thread had moved it between the hand-over and
 the pass, filed nothing -- and reported the commit filed all the same. A
-commit holding for the thread (`Options::upkeep_lag`) was released by
+commit holding for the thread (`Options::upkeep_lag_pct`) was released by
 those reports, the writer ran on through its freezes, and the thread's
 real look fell past the tables the state keeps for it (`State::replaced`):
 the writer's first scan after the burst dropped its tables and built the
@@ -2909,6 +2910,33 @@ handed to the device without a flush is a flush owed, and it is paid by
 whoever syncs next; a background writer that leaves its flush owed puts
 it on the foreground's next commit, so it pays its own where that costs
 it nothing it needs.
+
+**A position checked once, of slots swapped under it.** A handle's
+scan takes the published block forms when they are current to the
+commit it reads at, and it asked so by the table's position
+(`State::forms_at`), once, at the scan's start, while the forms stand
+in slots whoever publishes swaps in place, the slots first and the
+position after. A publish of the next commit's forms landing inside a
+scan -- the upkeep thread's, beside a handle's read -- handed the scan
+forms of a commit after its own, and a handle holding a snapshot read a
+write made after the snapshot, about one run in five hundred of the
+windows test with the block cache on. That half of the test had been
+skipped with the cache on since the hunt that first saw it, "the cause
+is not known here", which is the configuration that ships; the
+differential fuzz never holds a snapshot across a commit, and nothing
+else read a handle's scan against the commit it named. Each form
+carries the position it was published at now (`CanonicalForm::at`,
+carried with it, and the fresh table's first position across a freeze),
+and a reader takes one at or before its own: a reader that found the
+table at its position found every form published up to it, so a form
+past it is a block the reader builds (`Reader::canonical`). The test
+leaves the state the race leaves (`Db::hold_forms_position`: the next
+commit's forms in their slots, the position not moved) and fails on the
+engine before the fix. The rule: a version checked once and the reads
+it licenses are one step, or the things read carry the version; and a
+test that skips a configuration because it fails there is a known bug
+with its alarm off -- the skip names its bug, and the bug is found
+before the skip is forgotten.
 
 ## Standing limitations
 
