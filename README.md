@@ -7,34 +7,35 @@ memory-mapped file on a server and a browser fetching byte ranges out of
 object storage: the read path compiles to wasm and answers the same question
 from either source.
 
-- A durable commit is one WAL append and one `fdatasync`. Batches are atomic,
-  and `Txn` builds one.
+- A durable commit is one log append and one `fdatasync`: the WAL's, or, for
+  keys arriving above the store's greatest, the segment they are written
+  into. Batches are atomic, and `Txn` builds one.
 - Data lives in immutable sealed segments behind a flat hash index. Compaction
-  partitions by key range, so a read routes to one segment.
+  partitions by key range, so a read routes to one partition and the recent
+  pieces over it.
 - Deletes are tombstones the merge collects. Small runs are stored inline in
   the index record, so reading them touches no data block; a run of one width
   is stored without prefixes and read as a memcpy.
-- Every data block and every piece of the key index is checksummed; a damaged
-  file fails to open rather than answering wrongly.
+- Every data block and every piece of the key index is checksummed: a damaged
+  key index fails the open, and a damaged block fails the read that reaches
+  it, rather than answering wrongly.
 
 ## Benchmarks
 
 The suite in [`bench/`](bench/) measures supdb against LMDB and RocksDB on
 ordered and shuffled loads, point reads, ordered scans and the YCSB core
 mixes, over a ladder of store sizes from ten thousand keys to past the
-machine's memory, and against two floors: a durable framed append with no
-engine, and a mapped sequential read of a file. Every comparison is
+machine's memory, and against floors that read the host with no engine in
+the way (a durable framed append, a mapped sequential read, a dependent load,
+a fresh page). Every comparison is
 guarantee-matched, durable against durable and buffered against buffered.
 A run writes one row of raw samples; `bench figures` draws every figure
 from the committed rows, and `bench gate` fails a change whose row is worse
 than the last ten of its machine class. [`bench/DESIGN.md`](bench/DESIGN.md)
 is the specification.
 
-What the curves show, in words: point reads and the read-heavy YCSB mixes
-lead both comparators; the durable ordered load trails both, and shuffled
-arrival inverts that; ordered scans lead RocksDB and trail LMDB; once the
-store leaves memory, reads fall off a cliff, because every miss is a page
-fault. The figures carry the numbers.
+What the curves show is in the figures `bench figures` draws from the
+committed rows; a summary in words goes stale with the next row.
 
 ## Usage
 
@@ -120,7 +121,7 @@ reserve together, since all of them must be set before the first key.
 The same segment in a browser, over ranged HTTP from a Web Worker:
 
 ```js
-import { openSparse } from "./supdb.mjs";
+import { openCached } from "./supdb.mjs";
 import { CachedBytes, httpRangeFetcher } from "./cache.mjs";
 
 const cache = await CachedBytes.open({
@@ -128,8 +129,10 @@ const cache = await CachedBytes.open({
   fetcher: httpRangeFetcher(url),
   budgetBytes: 32 << 20,
 });
-const reader = await openSparse(wasm, cache);
-const values = reader.lookup(new TextEncoder().encode("term"));
+const reader = await openCached(wasm, cache);
+const key = new TextEncoder().encode("term");
+await reader.ensure([key]);             // fetch the ranges the read will touch
+const values = reader.lookup(key);      // then read synchronously, with no miss
 ```
 
 `web/README.md` covers the three byte sources -- memory, OPFS, and a
@@ -141,7 +144,7 @@ Worker.
 ```sh
 sh scripts/deps.sh             # the toolchain pieces the checks need, where missing
 cargo build --release
-cargo test --release
+cargo test --profile checked  # the release profile with overflow checks and debug assertions on
 sh scripts/check.sh            # build, test, lint, wasm, bench -- what CI runs
 sh scripts/check.sh quick      # one quick-scale measurement, on an otherwise idle machine
 sh web/build.sh                # the browser module

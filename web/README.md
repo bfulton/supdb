@@ -30,10 +30,9 @@ System once, asynchronously, and every read after that goes through
 the Rust API changed shape.
 
 That is only viable if a day's index can be downloaded whole, so that was
-settled first and with a number: a day index measures 36.14 bytes per row
-over a 580 KB fixed cost, which puts a 32 MB download budget
-at **912,522 rows** over seven attributes. Above that, shard: a consumer that
-seals one immutable object per period turns 10M rows into eleven objects, each
+settled first, by measuring a day index's bytes per row and fixed cost against
+a download budget. Above the budget, shard: a consumer that seals one
+immutable object per period turns a large index into several objects, each
 under budget and each skippable by a query that can exclude it.
 
 The cost of OPFS is that sync access handles only exist inside a Web Worker.
@@ -92,7 +91,7 @@ Counts stay free, for any schema since format v5: every extent carries its
 record count, so `count` and `scanCounts` are sums over the resident extent
 lists exactly as `countFixed` and `scanCountsFixed` are arithmetic on them,
 and a browser ranks a segment's whole term dictionary over ranged HTTP with
-*zero* fetches after open, at 4.5 ns a key against the fixed form's 5.2.
+*zero* fetches after open.
 
 `readConcat(key)` returns a key's values back to back in one buffer with
 the count, one boundary crossing and one copy per key where `lookup` frames
@@ -141,18 +140,12 @@ The plans are exact, on the recorded reads: `tests/dict.rs` checks 135
 ranges per index shape against the whole reader and holds every plan to the
 reads that follow it, and over ranged HTTP a range fetches exactly the pages
 its plans name that nothing before made resident. On a day index, at
-realistic dictionary sizes, the 64 KiB page rather than the byte count is
-the unit that matters: the sparse open is 23,808 bytes but four pages,
-279,856 against the whole open's 869,680 for a 686 KB index (nowhere near
-the 5% its byte count suggests; the ratio crosses 5% only near 5.6 MB of
-index), and a 210-key
-field's two plans are 9,860 bytes but three pages. Ranking a field
-from the sparse reader costs 10 ns a key. So the sparse reader's
-cache opens at 16 KiB pages (`openSparse` through the worker passes
-`pageSize`): the open is then 70,960 bytes, 8.8% of the whole open, and
-a field's range sits at 0.59 of its share plus four pages;
-`ensure` coalesces adjacent pages into one request, so a block read costs
-the same number of requests at either page.
+realistic dictionary sizes, the page rather than the byte count is the unit
+that matters: the sparse open and a field's plans are a few kilobytes that
+span several 64 KiB pages each. So the sparse reader's cache opens at 16 KiB
+pages (`openSparse` through the worker passes `pageSize`), and `ensure`
+coalesces adjacent pages into one request, so a block read costs the same
+number of requests at either page.
 
 ## What a lookup costs
 
@@ -161,21 +154,15 @@ record, and one block. The index and block table sections are read once at
 open, because a source that cannot lend its bytes -- which an OPFS handle
 cannot -- should pay per section rather than per lookup.
 
-`count(key)` and `countFixed(key, width)` are two different things and the
-difference is 28x. An `Ext` records block, offset, byte length and the offset
-of the last record, and none of those is a count, so the general count walks
-the values -- and walking them turns out to be *no* cheaper than reading them.
-A *fixed-width* posting list does not need to walk: its count is arithmetic on
-`Ext::len`, checked against `Ext::last`, with no block touched. A posting list
-of four-byte ordinals is the case `countFixed` exists for.
-
-Before format v5 the same was true of `scanCounts` versus `scanCountsFixed`,
-by a factor of 283: the general form walked every posting in the range. The
-count now lives in the extent record, both forms are O(extents), and the
-general one is the faster of the two: a whole day's term dictionary ranks in
-about 9 microseconds whatever the value width. That is the answer to "does the
-browser need a scan, or should the roll precompute the panels": it needs a
-scan, and precomputing buys nothing.
+`count(key)` and `countFixed(key, width)` both answer from the extent
+records with no block touched: an `Ext` carries its run's record count
+(`Ext::count`), so `count` is a sum over the key's extents, and `countFixed`
+is arithmetic on `Ext::len` checked against the width you name, which adds
+the check that every value has that width. The same holds for `scanCounts`
+and `scanCountsFixed` over a range of keys: both are O(extents), whatever the
+value width. That is the answer to "does the browser need a scan, or should
+the roll precompute the panels": it needs a scan, and precomputing buys
+nothing.
 
 ## Round trips
 
@@ -192,14 +179,12 @@ open wave, so every dictionary plan's first phase is empty and a lookup
 after open is one round trip, the records. A data read then fetches the 4
 KiB chunks a run spans, not its block. Cold, a search is open, records,
 postings. Small runs -- under 256 bytes -- are inline
-in a segment's index record and cost no postings round trip at all; a
-`Store`-written index never inlines, which is the case for writing the
-roll through `SegmentWriter`.
+in a segment's index record and cost no postings round trip at all.
 
 A segment's blocks can be compressed (`SegmentWriter::set_compress`),
-chunked so a point read decompresses one chunk. It is worth 19.9% on
-a real index when postings are stored as deltas and nothing at all when
-they are stored as absolute ordinals, because LZ4 needs repeated bytes.
+chunked so a point read decompresses one chunk. It pays on a real index
+when postings are stored as deltas and buys nothing when they are stored as
+absolute ordinals, because LZ4 needs repeated bytes.
 Runs under 256 bytes are inline in the key section and are never
 compressed, so inlining and compression trade against each other.
 
@@ -213,8 +198,9 @@ for more than a page-fetching host was going to fetch anyway. A piece is
 verified the first time a plan's bytes are used, so a damaged directory
 entry or record is an error rather than a different answer even over a
 partial fetch. A walk over a piece already verified reads less than it planned;
-`tests/dict.rs` holds reads within plans rather than equal to them. A store
-written by `Store` (not a segment) has no row and is read as before.
+`tests/dict.rs` holds reads within plans rather than equal to them. An
+index without a row (`index_checksummed()` says which kind a reader has) is
+read as before.
 
 `countFixed` and `scanCountsFixed` answer `null` rather than guessing when a
 key's values are not all the width you named. Since format v6 a run whose
@@ -223,18 +209,17 @@ so, and for such a run the count is exact: the flag records the width, so the
 answer is `len / width` and nothing is assumed. For a run written with mixed
 widths the old two-quantity check still applies, and that is a check, not a
 proof -- the contract is that you know your own schema. Reading a fixed run
-is a copy of its bytes rather than a decode, which took the full-list read
-from 0.31x of LMDB's DUPFIXED to parity and the intersection to 1.15x.
+is a copy of its bytes rather than a decode.
 
 ## Size
 
 `build.sh` builds the module and an empty cdylib beside it and prints the four
 sizes; nothing here decides whether a size is acceptable. There is no binding
-generator: the ABI is twenty-eight hand-written C functions passing integers
-and byte ranges, because a generator's shim and descriptor sections are
+generator: the ABI is hand-written C functions passing integers and byte
+ranges, because a generator's shim and descriptor sections are
 exactly what the budget is about.
-The planning seam is the first thing to have moved the marginal number --
-4,225 gzipped bytes -- which is what the number is for.
+The planning seam is the first thing to have moved the marginal number,
+which is what the number is for.
 
 `floor/` is why the number is legible. A wasm cdylib in Rust is not small
 before any of your code is in it, so the floor is built the same way with the
@@ -245,12 +230,11 @@ actual marginal cost.
 
 A wasm `u32` return arrives in JavaScript as a *signed* i32, and a `u64` as a
 signed BigInt, so the failure sentinels (`u32::MAX`, `u64::MAX`) arrive as
-`-1` and `-1n`. The first version of `supdb.mjs` compared them unnormalized,
-which made every error check in the library dead: a reader over an object
-that failed to open answered `[]` for every key, and a lookup whose block
-failed its checksum came back empty — an under-return, which is the one
-thing this index may never do, reported by the first downstream integration.
-The convention now is one rule applied everywhere: normalize to unsigned at
+`-1` and `-1n`. Compared unnormalized, every error check in the library is
+dead: a reader over an object that failed to open answers `[]` for every key,
+and a lookup whose block failed its checksum comes back empty -- an
+under-return, which is the one thing this index may never do. The convention
+is one rule applied everywhere: normalize to unsigned at
 the boundary (`v >>> 0`, `BigInt.asUintN(64, v)`), compare unsigned, return
 unsigned. The native half is pinned in `tests/blob.rs`: a corrupted block
 byte fails the read rather than under-returning. The JS half is that one

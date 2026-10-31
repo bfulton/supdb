@@ -1,5 +1,10 @@
 # The index decision, in theoretical context
 
+This study was run on the engine before this one. Where it says "today",
+"the current layout" or "the current heap index", or names a checkpoint or
+`seal_shard`, it means that engine and its heap-hash index; the engine now
+writes the flat key index (`src/flatindex.rs`, `src/format.rs`).
+
 The experiment measured twelve index layouts at full scale, on 10M
 sixteen-byte decimal keys; every figure below is from that run. This is what
 the theory says about what it showed — including the places the theory
@@ -312,9 +317,11 @@ branch predictor.
 That leaves the granularity constants — records per page, restart group size,
 compression chunk size — which are sized against a cache line or a memory page,
 and those differ by 2× and 4× between x86-64, Graviton and Apple Silicon.
-`Machine::detect` reads them at runtime and derives the constants, so one
+The study proposed reading them at runtime and deriving the constants, so one
 binary adapts rather than being tuned for whichever machine it was benchmarked
-on.
+on. The engine does not do that: its constants are fixed in the format, and
+`Machine::detect` is the suite's record of a row's host
+(`bench/src/machine.rs`).
 
 A sweep of the constant tests whether the derivation is good enough. On x86-64
 (64-byte lines, 4 KiB pages, derived value 32) at 2M keys, interleaved with the

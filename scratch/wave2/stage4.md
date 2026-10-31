@@ -4499,7 +4499,7 @@ tests that build nothing ahead as well. The count is read before the clock
 moves now (`advance_tick`); a stack dump of the stalled run by `gdb` showed
 every segment work thread idle in its sleep, which is what said so.
 
-## The shipping `Auto` shape against LMDB, after the builds ahead (`9bb1c6f`)
+## The `Auto` shape against LMDB, after the builds ahead (`9bb1c6f`)
 
 `supdb-cache64tofitautozpagesdropland50` against LMDB as it opens by
 default (`lmdb`: the kernel's readahead on -- this section said "with its
@@ -4557,7 +4557,7 @@ the load, where the bar's arm installed two of eight at 18.1 and 18.7 s;
 both of those fell in the warmup pairs the table leaves out, so the rates
 read level, the cells that moved moving with the arms' position.
 
-## The shipping `Auto` shape against LMDB again, the cold partitions built (`adf69cc`)
+## The `Auto` shape against LMDB again, the cold partitions built (`adf69cc`)
 
 The same pairing on the commit that builds the cold partitions past the
 line (`lp-vslmdb2-5000000-{1,2}.*`, sitting 1 with LMDB first), against
