@@ -4585,3 +4585,35 @@ and 1.83 here, every pair of both orders above LMDB in every cell. What it
 does not say is the margin against `lmdb-nordahead`, the LMDB a user
 configures for a store past its memory and the comparator of every
 pricing before; that pairing is the next.
+
+## The `Auto` shape against LMDB with its readahead off (`905a341`)
+
+The like-for-like pairing the two before it were not: the same arm against
+`lmdb-nordahead`, LMDB as its documentation configures a store larger than
+memory and the comparator of every pricing before the builds ahead, five
+million keys under 640 MiB, three pairs after the warmup, the reads divided
+by ten, on the commit that fixed the forms' position
+(`lp-vsnord-5000000-{1,2}.*`, sitting 1 with LMDB first). supdb over LMDB,
+p99 as LMDB's latency over supdb's so that above one favours supdb:
+
+| | sitting 1 | sitting 2 |
+|---|---|---|
+| ordered load | 1.24 | 1.40 |
+| shuffled load | 11.6 | 11.6 |
+| read pass | 1.03 | 1.02 |
+| read, 2 / 3 threads | 4.5 / 4.5 | 5.1 / 6.0 |
+| read p99 | 0.66 | 0.77 |
+| scan pass | 2.63 | 3.64 |
+| scan, 2 / 3 threads | 3.7 / 4.1 | 4.3 / 4.6 |
+| A, B, C, D, F | 5.9, 2.8, 2.5, 3.2, 4.2 | 5.6, 2.7, 2.9, 4.2, 4.5 |
+| E | 1.12 | 1.50 |
+
+Every rep of eight installed 2.2-4.5 s after the load with all nineteen
+files on disk. E is ahead in every pair of both orders, 1.12 and 1.50,
+against the 1.09-1.29 this step began from on the arm before the builds
+ahead; the readahead-on pairings' 1.40-1.63 were LMDB's readahead, not E.
+The single-threaded read pass is level (two pairs of three each way) and
+its p99 trails, 0.66 and 0.77: the pass begins at the load's end, its first
+two to four seconds read the raw form before the install, and its tail is
+the device's (0.12-0.23 major faults a read for supdb, 0.17-0.21 for LMDB).
+Every other cell is ahead by 2.5x to 12x in both orders.

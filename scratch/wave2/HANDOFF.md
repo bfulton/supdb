@@ -238,10 +238,12 @@ looking at every other non-main branch. On the way:
   (`lp-vslmdb-*`, `lp-vslmdb2-*`) ran against `lmdb`, readahead on, and were
   written up as readahead off (also in `adf69cc`'s message). Against `lmdb`
   every cell is ahead (E 1.59-1.61x, the read pass 1.8-2.1x, the install
-  2.2-4.2 s after the load in every rep with the cold partitions built). The
-  pairing against `lmdb-nordahead` is the open question of step (4); run it
-  with `scratch/wave2/land-pair.sh vsnord lmdb-nordahead
-  supdb-cache64tofitautozpagesdropland50 5000000` (about 65 minutes).
+  2.2-4.2 s after the load in every rep with the cold partitions built).
+  Against `lmdb-nordahead`, the like-for-like comparator (`lp-vsnord-*`,
+  `stage4.md`): E 1.12 and 1.50 in the two orders, every pair ahead; the
+  single-threaded read pass level (1.03, 1.02) with its p99 trailing (0.66,
+  0.77), the reads before the install raw; every other cell 2.5-12x. The
+  read pass's first seconds and its tail are what is left of step (4).
 - **Docs.** Two read-only audits (branches, docs) and the fixes in
   README.md, web/README.md, bench/README.md, bench/DESIGN.md,
   docs/engine.md, docs/index-theory.md, CLAUDE.md and bench/CLAUDE.md;
