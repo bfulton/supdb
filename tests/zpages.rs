@@ -5296,6 +5296,8 @@ fn an_eager_auto_store_buys_the_form_before_any_read() {
                 zpages_min_bytes: 0,
                 zpages_build_eager: eager,
                 zpages_inject: Some(inject.clone()),
+                // The eager entry's build, not an attach of builds ahead.
+                zpages_land_pct: 0,
                 ..Options::default()
             },
         )
@@ -5303,8 +5305,7 @@ fn an_eager_auto_store_buys_the_form_before_any_read() {
         let _model = ordered_load(&mut db, 20_000, 0x4AA);
         db.settle().unwrap();
         for _ in 0..2 {
-            inject.advance(std::time::Duration::from_secs(1));
-            wait_tick(&db);
+            advance_tick(&db, std::time::Duration::from_secs(1));
         }
         let c = db.zpage_counts();
         // SUSPECT, or, eager, already past it: the settle may have run out
@@ -5375,8 +5376,7 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_and_the_block_coding_o
         let model = ordered_load(&mut db, 20_000, 0x4AA);
         db.settle().unwrap();
         for _ in 0..2 {
-            inject.advance(std::time::Duration::from_secs(1));
-            wait_tick(&db);
+            advance_tick(&db, std::time::Duration::from_secs(1));
         }
         assert!(
             tick_until(&db, 160, |c| c.sel_installs >= 1),
@@ -5475,8 +5475,7 @@ fn an_eager_auto_store_waits_for_the_segment_work_in_flight() {
     db.commit().unwrap();
     db.seal().unwrap();
     for _ in 0..2 {
-        inject.advance(std::time::Duration::from_secs(1));
-        wait_tick(&db);
+        advance_tick(&db, std::time::Duration::from_secs(1));
     }
     let bought = tick_until(&db, 80, |c| c.sel_builds >= 1);
     let c = db.zpage_counts();
@@ -5566,8 +5565,7 @@ fn the_models_populations_are_the_hash_region_and_the_record_region() {
     .unwrap();
     let _model = ordered_load(&mut db, 20_000, 0x5AA);
     db.settle().unwrap();
-    inject.advance(std::time::Duration::from_secs(1));
-    wait_tick(&db);
+    advance_tick(&db, std::time::Duration::from_secs(1));
     let c = db.zpage_counts();
     let (hash, records, sections) = populations_of(&dir);
     assert!(c.partitions >= 1 && hash > 0 && records > 0, "{c:?}");
@@ -5615,8 +5613,7 @@ fn a_store_whose_hash_and_records_fit_the_budget_is_fits() {
     let (hash, records, _) = populations_of(&dir);
     inject.set_budget((hash + records) * 9 / 8);
     for _ in 0..6 {
-        inject.advance(std::time::Duration::from_secs(1));
-        wait_tick(&db);
+        advance_tick(&db, std::time::Duration::from_secs(1));
         let c = db.zpage_counts();
         assert_eq!(c.phase, 0, "a store whose populations fit is FITS: {c:?}");
     }
@@ -5891,10 +5888,14 @@ fn auto_store_with(
     // went uncounted. Under `checked` the line is at 0.05.
     inject.set_decode_cost(DECODE_5US);
     inject.advance(std::time::Duration::from_millis(1));
+    // The purchase as the rent makes it: the builds ahead at landing
+    // (`Options::zpages_land_pct`, on as shipped) buy by attach, and they
+    // are their own tests' (`land_store`).
     let mut opts = Options {
         zpages: ZPages::Auto,
         zpages_min_bytes: 0,
         zpages_inject: Some(inject.clone()),
+        zpages_land_pct: 0,
         ..Options::default()
     };
     extra(&mut opts);
@@ -5903,8 +5904,7 @@ fn auto_store_with(
     let model = ordered_load(&mut db, 20_000, 0x4A9);
     db.settle().unwrap();
     for _ in 0..2 {
-        inject.advance(std::time::Duration::from_secs(1));
-        wait_tick(&db);
+        advance_tick(&db, std::time::Duration::from_secs(1));
     }
     (dir, db, model, inject)
 }
@@ -5951,10 +5951,22 @@ fn blocked_store_at(
     out
 }
 
-/// One tick of the controller waited for, after the injected clock has
-/// been moved: the tick runs on the segment work's thread at its own turn.
-fn wait_tick(db: &Db) {
+/// The injected clock moved on by `d` and the controller's tick after it
+/// waited for. The step count is read before the clock moves: the tick
+/// runs on the segment work's thread at its own turn, and one that ran
+/// between a move and a count read after it was in the count already, so
+/// the wait sat out its minute for a step nothing would make -- the thread
+/// is woken at every build's end, and a store building ahead woke it into
+/// that window in one run of the file in three.
+fn advance_tick(db: &Db, d: std::time::Duration) {
+    let inject = db.options().zpages_inject.clone().unwrap();
     let was = db.zpage_counts().sel_steps;
+    inject.advance(d);
+    wait_tick_past(db, was);
+}
+
+/// A tick of the controller past the step count `was`.
+fn wait_tick_past(db: &Db, was: u64) {
     let t = std::time::Instant::now();
     // A minute: the tick is the segment work's turn, ten milliseconds
     // apart, and under the gate's stress of twelve processes a turn came
@@ -5979,21 +5991,17 @@ fn tick_until(db: &Db, max: u32, cond: impl Fn(&supdb::db::ZCounts) -> bool) -> 
 
 /// `n` census ticks of the injected clock, each waited for.
 fn wait_steps(db: &Db, n: u32) {
-    let inject = db.options().zpages_inject.clone().unwrap();
     for _ in 0..n {
-        inject.advance(std::time::Duration::from_millis(100));
-        wait_tick(db);
+        advance_tick(db, std::time::Duration::from_millis(100));
     }
 }
 
 /// The injected clock moved `step` seconds a tick for `secs` seconds, each
 /// tick waited for: an S1 tick each, since the model is read once a second.
 fn wait_secs(db: &Db, secs: u64, step: u64) {
-    let inject = db.options().zpages_inject.clone().unwrap();
     let mut t = 0;
     while t < secs {
-        inject.advance(std::time::Duration::from_secs(step));
-        wait_tick(db);
+        advance_tick(db, std::time::Duration::from_secs(step));
         t += step;
     }
 }
@@ -6752,8 +6760,7 @@ fn form_files_on_disk_are_dormant_under_auto_and_attached_when_the_form_is_wante
     assert_eq!((c.form_files, c.attached), (0, 0), "dormant: {c:?}");
     assert_eq!(form_files(&dir), on_disk, "and kept");
     for _ in 0..2 {
-        inject.advance(std::time::Duration::from_secs(1));
-        wait_tick(&db);
+        advance_tick(&db, std::time::Duration::from_secs(1));
     }
     let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
     let r = db.reader().unwrap();
@@ -6918,6 +6925,690 @@ fn a_store_that_left_compact_builds_nothing_ahead_again() {
     assert_eq!(c.prebuilt, built, "nothing built ahead again: {c:?}");
     assert_eq!(c.build_starts, starts, "no build at all: {c:?}");
     assert_eq!(c.phase, 1, "still past the budget, SUSPECT: {c:?}");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A store under `Auto` with the builds ahead at landing from `pct`
+/// percent of its budget (`Options::zpages_land_pct`), loaded under a
+/// budget nothing approaches, in FITS with nothing built; and the raw
+/// populations the model read of it, bytes, which the caller sets the
+/// budget against.
+fn land_store(name: &str, pct: u32) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>, u64) {
+    land_store_with(name, pct, |_| {})
+}
+
+/// `land_store` with the caller's options beside.
+fn land_store_with(
+    name: &str,
+    pct: u32,
+    extra: impl FnOnce(&mut Options),
+) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>, u64) {
+    let (dir, db, model, inject) = auto_store_with(
+        name,
+        1 << 40,
+        0.0,
+        FAULT_40US,
+        |o| {
+            o.zpages_land_pct = pct;
+            extra(o);
+        },
+        |_| {},
+    );
+    let c = db.zpage_counts();
+    let raw = c.model_hash_bytes + c.model_record_bytes;
+    assert!(raw > 0 && c.partitions > 0, "{c:?}");
+    assert_eq!(
+        (c.phase, c.gate, c.build_starts),
+        (0, 0, 0),
+        "FITS, nothing built: {c:?}"
+    );
+    (dir, db, model, inject, raw)
+}
+
+/// The builds ahead at landing (`Options::zpages_land_pct`): a store whose
+/// raw populations pass the percent of its budget and stay under the whole
+/// of it builds every partition's form file ahead, dormant, while the
+/// controller stays in FITS and every read is the raw form's -- what the
+/// builds ahead alone (`zpages_prebuild`), which wait for the whole budget,
+/// never do for it -- and leaves the page cache to the raw form, the
+/// records the builds read cached and the files they wrote not; under a
+/// percent above where the store stands it builds
+/// nothing; with its records read out of the page cache it builds
+/// nothing, counts each partition cold once, and looks at none of them
+/// again when they read resident; and past the whole budget the builds drop
+/// the records behind them, and the look that finds the store past it
+/// first swaps the records of the partitions built ahead under it for
+/// their files (`Options::zpages_land_drop_past`).
+#[test]
+fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records() {
+    // Past half, under the whole: the populations are two thirds of it.
+    let (dir, db, model, inject, raw) = land_store("auto-land", 50);
+    inject.set_budget(raw * 3 / 2);
+    assert!(
+        tick_until(&db, 200, |c| c.prebuilt >= c.partitions),
+        "built ahead: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.phase, c.gate, c.prebuilt, c.build_starts, c.ahead_cold),
+        (0, 0, c.partitions, c.partitions, 0),
+        "FITS, one build each ahead: {c:?}"
+    );
+    assert_eq!(
+        (c.form_files, c.attached, c.reads),
+        (0, 0, 0),
+        "dormant: {c:?}"
+    );
+    assert_eq!(form_files(&dir).len() as u64, c.partitions, "on disk");
+    // The cache as the raw form that serves wants it, by the kernel's
+    // reading: the files built ahead under the budget hold none of it, and
+    // the partitions' records the builds read are still there.
+    #[cfg(target_os = "linux")]
+    {
+        let page = 4096usize;
+        for f in form_files(&dir) {
+            let len = std::fs::metadata(&f).unwrap().len() as usize;
+            assert_eq!(cached_pages(&f, 0, len), 0, "{} left cached", f.display());
+        }
+        let parts: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("par-") && n.ends_with(".sup"))
+            })
+            .collect();
+        assert!(!parts.is_empty());
+        for f in parts {
+            let len = std::fs::metadata(&f).unwrap().len() as usize;
+            let cached = cached_pages(&f, 0, len);
+            assert!(
+                cached * 2 >= len.div_ceil(page),
+                "{}: {cached} of {} pages cached",
+                f.display(),
+                len.div_ceil(page)
+            );
+        }
+    }
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
+    let r = db.reader().unwrap();
+    check(&r, &model, &some, "raw beside the files built ahead");
+    assert_eq!(db.zpage_counts().reads, 0, "nothing through the form");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    // The same budget under a percent above where the store stands.
+    let (dir, db, _model, inject, raw) = land_store("auto-land-under", 80);
+    inject.set_budget(raw * 3 / 2);
+    assert!(
+        !tick_until(&db, 40, |c| c.build_starts > 0),
+        "{:?}",
+        db.zpage_counts()
+    );
+    assert!(form_files(&dir).is_empty(), "nothing ahead under the line");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    // Past the line with the records out of the page cache: each partition
+    // looked at once and left; resident again, none looked at again.
+    let (dir, db, _model, inject, raw) = land_store("auto-land-cold", 50);
+    inject.set_records_resident(0.0);
+    inject.set_budget(raw * 3 / 2);
+    assert!(
+        tick_until(&db, 40, |c| c.ahead_cold >= c.partitions),
+        "{:?}",
+        db.zpage_counts()
+    );
+    inject.set_records_resident(1.0);
+    wait_steps(&db, 30);
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.ahead_cold, c.prebuilt, c.build_starts),
+        (c.partitions, 0, 0),
+        "cold once, never built ahead: {c:?}"
+    );
+    assert!(form_files(&dir).is_empty(), "nothing ahead from the device");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    // Past the whole budget the raw form cannot be held, and the builds
+    // ahead drop the records behind them as a bought build does
+    // (`Options::zpages_land_drop_past`), so the records of the partitions
+    // still to land keep the cache; with the option off they stay. Nothing
+    // is bought without the group's refaults, so every read stays raw.
+    #[cfg(target_os = "linux")]
+    for drop_past in [true, false] {
+        let what = format!("drop past {drop_past}");
+        let (dir, db, model, inject, raw) =
+            land_store_with(&format!("auto-land-past-{drop_past}"), 50, |o| {
+                o.zpages_land_drop_past = drop_past;
+            });
+        inject.set_budget(raw * 2 / 3);
+        assert!(
+            tick_until(&db, 200, |c| c.prebuilt >= c.partitions),
+            "{what}: built ahead: {:?}",
+            db.zpage_counts()
+        );
+        let c = db.zpage_counts();
+        assert_eq!(
+            (
+                c.sel_installs,
+                c.attached,
+                c.reads,
+                c.ahead_cold,
+                c.build_synced
+            ),
+            (0, 0, 0, 0, 0),
+            "{what}: dormant, none cold, kept dirty and not synced: {c:?}"
+        );
+        let page = 4096usize;
+        let (mut cached, mut pages) = (0usize, 0usize);
+        for f in std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()) {
+            let is_par = f
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("par-") && n.ends_with(".sup"));
+            if is_par {
+                let len = std::fs::metadata(&f).unwrap().len() as usize;
+                cached += cached_pages(&f, 0, len);
+                pages += len.div_ceil(page);
+            }
+        }
+        assert!(pages > 0, "{what}");
+        if drop_past {
+            assert!(
+                cached * 4 < pages,
+                "{what}: {cached} of {pages} record pages left cached"
+            );
+        } else {
+            assert!(
+                cached * 2 >= pages,
+                "{what}: {cached} of {pages} record pages cached"
+            );
+        }
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
+        let r = db.reader().unwrap();
+        check(&r, &model, &some, &format!("{what}: raw after the drop"));
+        assert_eq!(
+            db.zpage_counts().reads,
+            0,
+            "{what}: nothing through the form"
+        );
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // Built ahead under the budget -- the records kept, the files dropped
+    // as written -- and then past the selector's line to enter: the look
+    // that first finds the store past it swaps the two (`Maint::z_cross`),
+    // the records dropped and the files asked back, once; with the option
+    // off nothing moves, and nothing moves either for a store two percent
+    // past its budget, where the model reads two faults in a hundred reads,
+    // under the line, and the raw form still holds nearly all of itself.
+    #[cfg(target_os = "linux")]
+    for (drop_past, near) in [(true, false), (false, false), (true, true)] {
+        let what = format!("crossing, drop past {drop_past}, near {near}");
+        let (dir, db, model, inject, raw) =
+            land_store_with(&format!("auto-land-cross-{drop_past}-{near}"), 50, |o| {
+                o.zpages_land_drop_past = drop_past;
+            });
+        inject.set_budget(raw * 3 / 2);
+        assert!(
+            tick_until(&db, 200, |c| c.prebuilt >= c.partitions),
+            "{what}: built ahead: {:?}",
+            db.zpage_counts()
+        );
+        let pages_of = |pick: &dyn Fn(&str) -> bool| -> (usize, usize) {
+            let (mut cached, mut pages) = (0usize, 0usize);
+            for f in std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()) {
+                let name = f
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_owned();
+                if pick(&name) {
+                    let len = std::fs::metadata(&f).unwrap().len() as usize;
+                    cached += cached_pages(&f, 0, len);
+                    pages += len.div_ceil(4096);
+                }
+            }
+            (cached, pages)
+        };
+        let records = |n: &str| n.starts_with("par-") && n.ends_with(".sup");
+        let forms = |n: &str| n.starts_with("zpg-") && !n.ends_with(".tmp");
+        let (rc, rp) = pages_of(&records);
+        let (fc, fp) = pages_of(&forms);
+        assert!(
+            rc * 2 >= rp && fc * 4 < fp,
+            "{what}: under: records {rc}/{rp} forms {fc}/{fp}"
+        );
+        inject.set_budget(if near { raw * 98 / 100 } else { raw * 2 / 3 });
+        if drop_past && !near {
+            assert!(
+                tick_until(&db, 200, |c| c.ahead_swapped >= c.partitions),
+                "{what}: swapped: {:?}",
+                db.zpage_counts()
+            );
+            // The files' pages come in behind the advice, asynchronously.
+            let t0 = std::time::Instant::now();
+            while pages_of(&forms).0 * 2 < fp && t0.elapsed() < std::time::Duration::from_secs(20) {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let (rc, _) = pages_of(&records);
+            let (fc, _) = pages_of(&forms);
+            assert!(
+                rc * 4 < rp && fc * 2 >= fp,
+                "{what}: past: records {rc}/{rp} forms {fc}/{fp}"
+            );
+            wait_steps(&db, 10);
+            assert_eq!(
+                db.zpage_counts().ahead_swapped,
+                db.zpage_counts().partitions,
+                "{what}: once"
+            );
+        } else {
+            wait_steps(&db, 20);
+            assert_eq!(db.zpage_counts().ahead_swapped, 0, "{what}");
+            let (rc, _) = pages_of(&records);
+            let (fc, _) = pages_of(&forms);
+            assert!(
+                rc * 2 >= rp && fc * 4 < fp,
+                "{what}: past: records {rc}/{rp} forms {fc}/{fp}"
+            );
+        }
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
+        let r = db.reader().unwrap();
+        check(
+            &r,
+            &model,
+            &some,
+            &format!("{what}: raw after the crossing"),
+        );
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A form file built ahead below the selector's line, written back as it
+/// was built, is synced once it has its name, on its build's thread
+/// (`Options::zpages_build_sync`), so that the device's flush of it is the
+/// build's and not the writer's next commit's: every such build counts its
+/// sync, and with the option off none does. The files read as built either
+/// way.
+#[test]
+fn form_files_are_synced_by_their_build_and_only_with_the_option() {
+    for on in [true, false] {
+        let what = format!("build sync {on}");
+        let (dir, db, model, inject, raw) =
+            land_store_with(&format!("auto-land-sync-{on}"), 50, |o| {
+                o.zpages_build_sync = on;
+            });
+        inject.set_budget(raw * 3 / 2);
+        assert!(
+            tick_until(&db, 200, |c| c.prebuilt >= c.partitions),
+            "{what}: built ahead: {:?}",
+            db.zpage_counts()
+        );
+        let c = db.zpage_counts();
+        assert_eq!(
+            c.build_synced,
+            if on { c.builds } else { 0 },
+            "{what}: {c:?}"
+        );
+        assert_eq!(
+            form_files(&dir).len() as u64,
+            c.partitions,
+            "{what}: on disk"
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
+        let r = db.reader().unwrap();
+        check(&r, &model, &some, &what);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The controller's buy of a store whose form files were built ahead
+/// attaches every one of them in the turn that buys
+/// (`Options::zpages_attach_first`), before the warms, which go one a
+/// turn after; with the option off the turn attaches one partition and
+/// warms it before the next, so the install waits for a warm a partition.
+/// Nothing is built past the files made ahead, and the reads after the
+/// install answer the model through the form.
+#[test]
+fn a_buy_attaches_every_form_file_built_ahead_before_any_warm() {
+    for first in [true, false] {
+        let what = format!("attach first {first}");
+        let (dir, db, model, inject, raw) =
+            land_store_with(&format!("auto-land-attach-{first}"), 50, |o| {
+                o.partition_bytes = Some(160 << 10);
+                o.zpages_attach_first = first;
+            });
+        inject.set_budget(raw * 3 / 2);
+        assert!(
+            tick_until(&db, 400, |c| c.prebuilt >= c.partitions),
+            "{what}: built ahead: {:?}",
+            db.zpage_counts()
+        );
+        let n = db.zpage_counts().partitions;
+        assert!(n >= 8, "{what}: partitions enough to order: {n}");
+        // Built oldest first: the files' times in the order of their ids,
+        // which their names lead with.
+        let mut files = form_files(&dir);
+        files.sort();
+        let times: Vec<std::time::SystemTime> = files
+            .iter()
+            .map(|f| std::fs::metadata(f).unwrap().modified().unwrap())
+            .collect();
+        assert!(
+            times.windows(2).all(|w| w[0] <= w[1]),
+            "{what}: built oldest first: {files:?} {times:?}"
+        );
+        // Past the whole budget and under the group's pressure: SUSPECT,
+        // the sample, the attach's price, the buy.
+        inject.set_budget(1 << 20);
+        inject.set_refault_rate(1_000_000.0);
+        inject.set_fault_cost(FAULT_1MS);
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        // The install comes at nine tenths of the footprint covered
+        // (`zselect::COVERED_ENOUGH`): attached one a turn, the last of
+        // them may come after it.
+        if !first {
+            assert!(
+                tick_until(&db, 400, |c| c.attached >= n),
+                "{what}: every file attached: {:?}",
+                db.zpage_counts()
+            );
+        }
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.build_starts, c.prebuilt, c.ahead_recoded, c.attached),
+            (n, n, 0, n),
+            "{what}: attached, not built again: {c:?}"
+        );
+        if first {
+            assert!(
+                c.warms + 2 < c.attached,
+                "{what}: attached before the warms: {c:?}"
+            );
+        } else {
+            assert!(
+                c.warms + 2 >= c.attached,
+                "{what}: one attach a warm: {c:?}"
+            );
+        }
+        let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
+        check(&r, &model, &some, &what);
+        assert!(db.zpage_counts().reads > 0, "{what}: through the form");
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A form file built ahead at landing comes before the sampler's coding
+/// pick and takes the options' coding, the block coding; where the pick
+/// is then the raw tails, the buy gives each such file back unattached
+/// and builds the partition again raw-tailed (`ZCounts::ahead_recoded`),
+/// and the reads after the install answer the model through the form.
+#[test]
+fn a_form_file_built_ahead_in_the_coding_the_pick_refuses_is_built_again() {
+    assert!(Options::default().zpages_coding_auto);
+    let (dir, db, model, inject, raw) = land_store_with("auto-land-recode", 50, |o| {
+        o.partition_bytes = Some(160 << 10);
+        o.zpages_build_eager = true;
+    });
+    inject.set_budget(raw * 3 / 2);
+    assert!(
+        tick_until(&db, 400, |c| c.prebuilt >= c.partitions),
+        "built ahead: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    let n = c.partitions;
+    assert_eq!(
+        (c.builds_raw_tails, c.phase),
+        (0, 0),
+        "block-coded, FITS: {c:?}"
+    );
+    // A budget the raw-tail form fits under, and the group's pressure: the
+    // eager entry buys on the raw tails, as the coding test's store does.
+    inject.set_budget(64 << 20);
+    inject.set_refault_rate(1_000_000.0);
+    inject.set_fault_cost(FAULT_1MS);
+    assert!(
+        tick_until(&db, 400, |c| c.sel_installs >= 1),
+        "bought and installed: {:?}",
+        db.zpage_counts()
+    );
+    assert!(
+        tick_until(&db, 400, |c| c.attached >= n),
+        "every partition attached: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert!(
+        c.coding_picks_raw >= 1 && c.coding_picks_block == 0,
+        "{c:?}"
+    );
+    assert_eq!(
+        (c.ahead_recoded, c.builds_raw_tails, c.build_starts),
+        (n, n, 2 * n),
+        "each file built ahead given back and built raw-tailed: {c:?}"
+    );
+    assert_eq!(form_files(&dir).len() as u64, n, "one form file each");
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
+    let r = db.reader().unwrap();
+    check(&r, &model, &some, "through the raw tails built again");
+    assert!(db.zpage_counts().reads > 0, "{:?}", db.zpage_counts());
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With the form files built ahead on disk the purchase is an attach,
+/// bought on the model's prediction once the partitions have settled
+/// (`Options::zpages_attach_eager`): a store pushed past its budget under the
+/// group's pressure installs its form with no read made at all, with every
+/// file on disk and with one missing, since the attach covers what the
+/// install asks (`zselect::COVERED_ENOUGH`); with a third of them missing,
+/// or with the option off, or two percent past the budget, where the
+/// model's saving is under the selector's line to enter and only the
+/// group's pressure says otherwise, the rent waits for the evidence reads
+/// would give, and the store stays in SUSPECT with its files dormant.
+#[test]
+fn an_attach_of_form_files_built_ahead_is_bought_on_the_prediction() {
+    for (on, gone, near) in [
+        (true, 0usize, false),
+        (false, 0, false),
+        (true, 1, false),
+        (true, usize::MAX, false),
+        (true, 0, true),
+    ] {
+        let what = format!("attach eager {on}, files removed {gone}, near {near}");
+        let (dir, db, model, inject, raw) =
+            land_store_with(&format!("auto-land-eager-{on}-{gone}-{near}"), 50, |o| {
+                o.partition_bytes = Some(160 << 10);
+                o.zpages_attach_eager = on;
+            });
+        inject.set_budget(raw * 3 / 2);
+        assert!(
+            tick_until(&db, 400, |c| c.prebuilt >= c.partitions),
+            "{what}: built ahead: {:?}",
+            db.zpage_counts()
+        );
+        let n = db.zpage_counts().partitions;
+        assert!(
+            n >= 12,
+            "{what}: partitions enough for one to be under a tenth: {n}"
+        );
+        // The files removed from the oldest, dormant and unattached: one,
+        // under a tenth of the store by its records' bytes, or a third; their
+        // records read cold, so that the builds ahead leave them to the
+        // controller and the sample finds them missing.
+        let gone = gone.min(n as usize / 3);
+        inject.set_records_resident(0.0);
+        let files = form_files(&dir);
+        let total: u64 = files
+            .iter()
+            .map(|f| std::fs::metadata(f).unwrap().len())
+            .sum();
+        let removed: u64 = files[..gone]
+            .iter()
+            .map(|f| std::fs::metadata(f).unwrap().len())
+            .sum();
+        for f in &files[..gone] {
+            std::fs::remove_file(f).unwrap();
+        }
+        let covered = (total - removed) as f64 >= 0.92 * total as f64;
+        assert_eq!(
+            covered,
+            gone <= 1,
+            "{what}: {removed} of {total} bytes removed"
+        );
+        // Past the budget under the group's pressure: far past it, or two
+        // percent past it, where the model's saving is under the line to
+        // enter and the pressure alone buys nothing on the prediction.
+        inject.set_budget(if near { raw * 98 / 100 } else { 1 << 20 });
+        inject.set_refault_rate(1_000_000.0);
+        if !near {
+            inject.set_fault_cost(FAULT_1MS);
+        }
+        let bought = tick_until(&db, 120, |c| c.sel_installs >= 1);
+        let c = db.zpage_counts();
+        if on && gone <= 1 && !near {
+            assert!(bought, "{what}: installed with no read: {c:?}");
+            assert_eq!(c.census_reads, 0, "{what}: nothing read: {c:?}");
+            assert!(
+                tick_until(&db, 400, |c| c.attached >= n),
+                "{what}: every partition attached: {:?}",
+                db.zpage_counts()
+            );
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.build_starts, c.ahead_cold),
+                (n + gone as u64, gone as u64),
+                "{what}: built again only what was removed, after the buy: {c:?}"
+            );
+            let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+            let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
+            let r = db.reader().unwrap();
+            check(&r, &model, &some, &what);
+            assert!(db.zpage_counts().reads > 0, "{what}: through the form");
+            drop(r);
+        } else {
+            assert!(!bought, "{what}: nothing bought without evidence: {c:?}");
+            assert_eq!(
+                (c.phase, c.attached, c.prebuilt),
+                (1, 0, n),
+                "{what}: SUSPECT, the files dormant: {c:?}"
+            );
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The writer's own reads are counted by the census as a handle's are
+/// (`Options::zpages_writer_census`), through the writer's engine slot: a
+/// store in SUSPECT read only through its writer closes windows and counts
+/// its reads and their faults; with the option off it counts none. The
+/// writer's other operations end in the same hook as its reads, and a
+/// window's busy wall takes the reads' time alone: with a sleep and a read
+/// of the counters, an operation of the writer's that is not a read, after
+/// every read, and the price of a fault left to the wall (the seam's price
+/// cleared), the census prices a fault at the reads' own wait and not at
+/// the sleeps between them. (A write would make the window one with a
+/// commit in it, counted for the rate alone.)
+#[test]
+fn the_writers_reads_are_counted_by_the_census_and_only_its_reads() {
+    for on in [true, false] {
+        let what = format!("writer census {on}");
+        let (dir, db, model, inject) = auto_store_with(
+            &format!("census-writer-{on}"),
+            1 << 20,
+            0.0,
+            FAULT_40US,
+            |o| o.zpages_writer_census = on,
+            |_| {},
+        );
+        let c = db.zpage_counts();
+        assert_eq!((c.phase, c.gate), (1, 1), "{what}: SUSPECT: {c:?}");
+        inject
+            .fault_cost_ns
+            .store(0, std::sync::atomic::Ordering::Release);
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        // A window's worth of reads, each with a fault, a sleep and a read
+        // of the counters after it; the next read closes the window and a
+        // tick sums it.
+        for i in 0..64usize {
+            db.count(&keys[(i * 7) % keys.len()]).unwrap();
+            inject.add_faults(1);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let _ = db.zpage_counts();
+        }
+        db.count(&keys[0]).unwrap();
+        wait_steps(&db, 2);
+        let c = db.zpage_counts();
+        if on {
+            assert!(
+                c.census_windows >= 1 && c.census_reads >= 64 && c.census_read_faults >= 64,
+                "{what}: the writer's reads counted: {c:?}"
+            );
+            assert!(
+                c.census_t_f_ns < 2_000_000,
+                "{what}: a fault priced at the reads' wait, not the sleeps': {c:?}"
+            );
+        } else {
+            assert_eq!(
+                (c.census_windows, c.census_reads),
+                (0, 0),
+                "{what}: nothing counted: {c:?}"
+            );
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // In COMPACT the writer's reads are the form's and not the census's:
+    // the exits read the handles' windows, and a handle's reads still count.
+    let (dir, db, _model, inject, r, keys, _) =
+        compact_store_with("census-writer-compact", 1 << 20, |o| {
+            o.zpages_writer_census = true;
+        });
+    let before = db.zpage_counts().census_reads;
+    let mut at = 0usize;
+    reads(&db, &keys, &inject, 200, &mut at, 0);
+    close_window(&db, &db, &keys[0]);
+    let c = db.zpage_counts();
+    assert_eq!(c.gate, 2, "{c:?}");
+    assert_eq!(
+        c.census_reads, before,
+        "the writer's reads uncounted: {c:?}"
+    );
+    reads(&r, &keys, &inject, 200, &mut at, 0);
+    close_window(&db, &r, &keys[0]);
+    assert!(
+        db.zpage_counts().census_reads > before,
+        "a handle's counted: {:?}",
+        db.zpage_counts()
+    );
     drop(r);
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);

@@ -1011,6 +1011,18 @@ impl<B: Bytes> Blob<B> {
         idx.regions(sec)
     }
 
+    /// The record region's offset in the source and its length, bytes:
+    /// `record_regions` placed by offset, for an advice to the file that
+    /// holds it. `None` where there is no region or the source lends none.
+    #[cfg(not(target_family = "wasm"))]
+    #[doc(hidden)]
+    pub fn record_region_span(&self) -> Option<(u64, u64)> {
+        let (recs, _) = self.record_regions()?;
+        let base = self.src.slice_at(0, 1)?.as_ptr() as usize;
+        let at = (recs.as_ptr() as usize).checked_sub(base)?;
+        Some((at as u64, recs.len() as u64))
+    }
+
     /// The hash region's bytes, the slots a point read probes one page of;
     /// 0 for a reader that does not hold the section whole.
     #[cfg(not(target_family = "wasm"))]

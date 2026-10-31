@@ -1,0 +1,469 @@
+
+quantity                           supdb-cache64tofitautozpagesdropland50 supdb-cache64tofitautozpagesdrop      B/A B above A   sign p
+count ahead_built                         0.0000        0.0000     NaNx     0/0      1.000
+count ahead_installed                     0.0000        0.0000     NaNx     0/0      1.000
+count ahead_skip_held                     0.0000        0.0000     NaNx     0/0      1.000
+count ahead_skip_overlay                  0.0000        0.0000     NaNx     0/0      1.000
+count ahead_starts                        0.0000        0.0000     NaNx     0/0      1.000
+count ahead_stops                         0.0000        0.0000     NaNx     0/0      1.000
+count blk_by_engine                   24007.0000    24007.0000   1.000x     0/0      1.000
+count blk_by_reader                       0.0000        0.0000     NaNx     0/0      1.000
+count blk_by_upkeep                       0.0000        0.0000     NaNx     0/0      1.000
+count builds_clean                    14789.0000    14789.0000   1.000x     0/0      1.000
+count builds_copy                       327.0000      327.0000   1.000x     0/0      1.000
+count builds_sparse                    8890.0000     8890.0000   1.000x     0/0      1.000
+count builds_wide                         1.0000        1.0000   1.000x     0/0      1.000
+count cache_bytes_at_end            5814704.0000  5814704.0000   1.000x     0/0      1.000
+count canon_hit                           0.0000        0.0000     NaNx     0/0      1.000
+count canon_tried                   2500000.0000  2500000.0000   1.000x     0/0      1.000
+count convert_build_us                    0.0000        0.0000     NaNx     0/0      1.000
+count convert_total_us                    0.0000        0.0000     NaNx     0/0      1.000
+count dir_prefetches                      0.0000     5001.0000     NaNx     3/3      0.250
+count fill_dense                          0.0000        0.0000     NaNx     0/0      1.000
+count fill_fresh                          0.0000        0.0000     NaNx     0/0      1.000
+count fill_from_form                      0.0000        0.0000     NaNx     0/0      1.000
+count form_bytes_at_end                   0.0000        0.0000     NaNx     0/0      1.000
+count form_takes                          0.0000        0.0000     NaNx     0/0      1.000
+count forms_cloned                        0.0000        0.0000     NaNx     0/0      1.000
+count forms_held_at_end                   0.0000        0.0000     NaNx     0/0      1.000
+count forms_rebased                       0.0000        0.0000     NaNx     0/0      1.000
+count forms_trim_looks                    0.0000        0.0000     NaNx     0/0      1.000
+count forms_trim_us                       0.0000        0.0000     NaNx     0/0      1.000
+count forms_trims                         0.0000        0.0000     NaNx     0/0      1.000
+count freeze_ms                           4.8918        4.9197   1.006x     2/3      1.000
+count frozen_sorts                        0.0000        0.0000     NaNx     0/0      1.000
+count install_gen_drop                    0.0000        0.0000     NaNx     0/0      1.000
+count install_slot_skip                   0.0000        0.0000     NaNx     0/0      1.000
+count join_wait_ms                        0.0000        0.0000     NaNx     0/0      1.000
+count lazy_cuts_filed                 40878.0000    40878.0000   1.000x     0/0      1.000
+count lazy_cuts_resolved                  0.0000        0.0000     NaNx     0/0      1.000
+count lazy_scans_done                     0.0000        0.0000     NaNx     0/0      1.000
+count lazy_scans_resumed                  0.0000        0.0000     NaNx     0/0      1.000
+count maint_cpu_us                  1940883.0000  2338488.0000   1.205x     3/3      0.250
+count ord_point_declined                  0.0000        0.0000     NaNx     0/0      1.000
+count ord_point_declined_threads          0.0000        0.0000     NaNx     0/0      1.000
+count ord_point_reads                     0.0000        0.0000     NaNx     0/0      1.000
+count ord_point_reads_threads             0.0000        0.0000     NaNx     0/0      1.000
+count partitions                         31.0000       31.0000   1.000x     0/0      1.000
+count pieces                              0.0000        0.0000     NaNx     0/0      1.000
+count pieces_aligned                      2.0000        2.0000   1.000x     0/0      1.000
+count pin_barriers                        0.0000        0.0000     NaNx     0/0      1.000
+count publish_ms                         13.6334       23.1805   1.700x     3/3      0.250
+count publishes                          54.0000       54.0000   1.000x     0/0      1.000
+count rd_blockpath                  2500000.0000  2500000.0000   1.000x     0/0      1.000
+count rd_scans                      2500000.0000  2500000.0000   1.000x     0/0      1.000
+count recopies                            0.0000        0.0000     NaNx     0/0      1.000
+count scan_ahead_us                       0.0000        0.0000     NaNx     0/0      1.000
+count scan_install_us                     0.0000        0.0000     NaNx     0/0      1.000
+count scan_settle_us                      0.0000        0.0000     NaNx     0/0      1.000
+count scan_snap_us                        0.0000        0.0000     NaNx     0/0      1.000
+count scan_sync_us                        0.0000        0.0000     NaNx     0/0      1.000
+count scan_take_us                        0.0000        0.0000     NaNx     0/0      1.000
+count seal_snap_ms                       30.8877       19.6081   0.635x     1/3      1.000
+count seal_sort_ms                      259.1943      259.6703   1.002x     1/3      1.000
+count seal_sorts                         20.0000       20.0000   1.000x     0/0      1.000
+count seals                              39.0000       39.0000   1.000x     0/0      1.000
+count seals_deferred                      0.0000        0.0000     NaNx     0/0      1.000
+count seals_idle                          0.0000        0.0000     NaNx     0/0      1.000
+count segments                           31.0000       31.0000   1.000x     0/0      1.000
+count settle_blocks                   17714.0000    17714.0000   1.000x     0/0      1.000
+count settle_built                        0.0000        0.0000     NaNx     0/0      1.000
+count settle_keys                     49079.0000    49079.0000   1.000x     0/0      1.000
+count settle_notable                      0.0000        0.0000     NaNx     0/0      1.000
+count settle_rebuilds                     0.0000        0.0000     NaNx     0/0      1.000
+count settle_runs                        44.0000       44.0000   1.000x     0/0      1.000
+count settle_shed                         0.0000        0.0000     NaNx     0/0      1.000
+count sheds                               0.0000        0.0000     NaNx     0/0      1.000
+count snap_switches                       0.0000        0.0000     NaNx     0/0      1.000
+count snapshot_builds                     1.0000        1.0000   1.000x     0/0      1.000
+count snapshot_extends                    1.0000        1.0000   1.000x     0/0      1.000
+count snapshot_refreshes                  0.0000        0.0000     NaNx     0/0      1.000
+count span_starts                         0.0000        0.0000     NaNx     0/0      1.000
+count start_at_rank                   50978.0000    50978.0000   1.000x     0/0      1.000
+count start_cache_hits                    0.0000        0.0000     NaNx     0/0      1.000
+count start_cache_puts                    0.0000        0.0000     NaNx     0/0      1.000
+count start_search                        0.0000        0.0000     NaNx     0/0      1.000
+count table_drops                        26.0000       26.0000   1.000x     0/0      1.000
+count unsealed_keys                   49035.0000    49035.0000   1.000x     0/0      1.000
+count upkeep_cpu_us                    8553.0000     9141.0000   1.069x     2/3      1.000
+count upkeep_ms                          10.9310       11.0610   1.012x     1/3      1.000
+count upkeep_partial                      0.0000        0.0000     NaNx     0/0      1.000
+count upkeep_passes                    5987.0000     5990.0000   1.001x     2/3      1.000
+count upkeep_skipped                      0.0000        0.0000     NaNx     0/0      1.000
+count upkeep_wait_us                      0.0000        0.0000     NaNx     0/0      1.000
+count wal_rotations                      19.0000       19.0000   1.000x     0/0      1.000
+count walk_copy                       78631.0000    78631.0000   1.000x     0/0      1.000
+count walk_other                      18321.0000    18321.0000   1.000x     0/0      1.000
+count walk_sparse                     30410.0000    30410.0000   1.000x     0/0      1.000
+count zpage_ahead_cold                   16.0000        0.0000   0.000x     0/3      0.250
+count zpage_ahead_recoded                 0.0000        0.0000     NaNx     0/0      1.000
+count zpage_attached                     19.0000       19.0000   1.000x     0/0      1.000
+count zpage_auto                          2.0000        2.0000   1.000x     0/0      1.000
+count zpage_auto_inert                    0.0000        0.0000     NaNx     0/0      1.000
+count zpage_bad_pages_at_end              0.0000        0.0000     NaNx     0/0      1.000
+count zpage_build_ahead_bytes      846968824.0000 620120000.0000   0.732x     0/3      0.250
+count zpage_build_bytes            609165312.0000 391266304.0000   0.642x     0/3      0.250
+count zpage_build_cancelled               0.0000        0.0000     NaNx     0/0      1.000
+count zpage_build_cpu_ms               2907.6910     3909.9950   1.345x     3/3      0.250
+count zpage_build_failed                  0.0000        0.0000     NaNx     0/0      1.000
+count zpage_build_io_class                6.0000        3.0000   0.500x     0/3      0.250
+count zpage_build_majflt                 14.0000     3511.0000 250.786x     3/3      0.250
+count zpage_build_nopage                  0.0000        0.0000     NaNx     0/0      1.000
+count zpage_build_orphaned                0.0000        0.0000     NaNx     0/0      1.000
+count zpage_build_pages              145606.0000    93333.0000   0.641x     0/3      0.250
+count zpage_build_retries                 0.0000        0.0000     NaNx     0/0      1.000
+count zpage_build_starts                 26.0000       19.0000   0.731x     0/3      0.250
+count zpage_build_stored                  1.0000        0.0000   0.000x     0/2      0.500
+count zpage_build_wall_ms              3467.9470    53975.1150  15.564x     3/3      0.250
+count zpage_builds                       25.0000       19.0000   0.760x     0/3      0.250
+count zpage_builds_raw_tails              6.0000        0.0000   0.000x     0/3      0.250
+count zpage_census_commit_windows         0.0000        0.0000     NaNx     0/0      1.000
+count zpage_census_mixed                  0.0000        0.0000     NaNx     0/0      1.000
+count zpage_census_moved                  0.0000        3.0000     NaNx     2/2      0.500
+count zpage_census_read_faults        44057.0000   916170.0000  20.795x     3/3      0.250
+count zpage_census_reads            2469948.0000  2924023.0000   1.184x     3/3      0.250
+count zpage_census_scan_faults            0.0000  2307021.0000     NaNx     3/3      0.250
+count zpage_census_scans            2478991.0000  2487865.0000   1.004x     3/3      0.250
+count zpage_census_t_f_ns             17039.0000    28931.0000   1.698x     3/3      0.250
+count zpage_census_t_hit_ns           10638.0000     4590.0000   0.431x     0/3      0.250
+count zpage_census_t_hit_scan_ns          0.0000    19165.0000     NaNx     3/3      0.250
+count zpage_census_t_z_ns              1934.0000        0.0000   0.000x     0/3      0.250
+count zpage_census_t_z_scan_ns        10016.0000    10162.0000   1.015x     2/3      1.000
+count zpage_census_windows              355.0000     1644.0000   4.631x     3/3      0.250
+count zpage_coding_picks_block            1.0000        3.0000   3.000x     2/2      0.500
+count zpage_coding_picks_raw              6.0000        3.0000   0.500x     0/3      0.250
+count zpage_counts                        0.0000        0.0000     NaNx     0/0      1.000
+count zpage_damaged_at_end                0.0000        0.0000     NaNx     0/0      1.000
+count zpage_declined_block_backed         0.0000        0.0000     NaNx     0/0      1.000
+count zpage_declined_damage               0.0000        0.0000     NaNx     0/0      1.000
+count zpage_declined_incompressible        0.0000        0.0000     NaNx     0/0      1.000
+count zpage_declined_oversize             0.0000        0.0000     NaNx     0/0      1.000
+count zpage_declined_small                0.0000        0.0000     NaNx     0/0      1.000
+count zpage_declined_small_bytes          0.0000        0.0000     NaNx     0/0      1.000
+count zpage_declined_unplaceable          0.0000        0.0000     NaNx     0/0      1.000
+count zpage_decodes                 3066884.0000   190843.0000   0.062x     0/3      0.250
+count zpage_fallbacks                     0.0000        0.0000     NaNx     0/0      1.000
+count zpage_file_bytes_at_end      391266304.0000 391266304.0000   1.000x     0/0      1.000
+count zpage_footprint_bytes        3511930880.0000 3508613120.0000   0.999x     0/3      0.250
+count zpage_footprint_pages          279999.0000   279729.0000   0.999x     0/3      0.250
+count zpage_forced                        0.0000        0.0000     NaNx     0/0      1.000
+count zpage_form files_at_end            19.0000       19.0000   1.000x     0/0      1.000
+count zpage_gate_at_end                   3.0000        3.0000   1.000x     0/0      1.000
+count zpage_group_bytes_at_end     620000000.0000 620000000.0000   1.000x     0/0      1.000
+count zpage_inplace_groups                0.0000        0.0000     NaNx     0/0      1.000
+count zpage_memo_hits               2957462.0000   943095.0000   0.319x     0/3      0.250
+count zpage_memo_misses            24004076.0000  6091472.0000   0.254x     0/3      0.250
+count zpage_nopage_reads                  0.0000        0.0000     NaNx     0/0      1.000
+count zpage_nopage_scans                  0.0000        0.0000     NaNx     0/0      1.000
+count zpage_pages_at_end              93333.0000    93333.0000   1.000x     0/0      1.000
+count zpage_partitions_at_end            31.0000       31.0000   1.000x     0/0      1.000
+count zpage_phase_at_end                  4.0000        4.0000   1.000x     0/0      1.000
+count zpage_prebuilt                     23.0000        0.0000   0.000x     0/3      0.250
+count zpage_prefetches                    0.0000        0.0000     NaNx     0/0      1.000
+count zpage_raw_dropped                  19.0000       19.0000   1.000x     0/0      1.000
+count zpage_raw_dropped_at_install       18.0000       18.0000   1.000x     0/0      1.000
+count zpage_raw_scans                     0.0000        0.0000     NaNx     0/0      1.000
+count zpage_rawserves                 21547.0000        0.0000   0.000x     0/3      0.250
+count zpage_reads                   3180971.0000   269402.0000   0.085x     0/3      0.250
+count zpage_rebuilds                      0.0000        0.0000     NaNx     0/0      1.000
+count zpage_recode_failed                 0.0000        0.0000     NaNx     0/0      1.000
+count zpage_recode_flips                  0.0000        0.0000     NaNx     0/0      1.000
+count zpage_recodes                       0.0000        0.0000     NaNx     0/0      1.000
+count zpage_recodes_back                  0.0000        0.0000     NaNx     0/0      1.000
+count zpage_rejected_damage               0.0000        0.0000     NaNx     0/0      1.000
+count zpage_rejected_identity             0.0000        0.0000     NaNx     0/0      1.000
+count zpage_resident_bytes_at_end   8864088.0000  8864088.0000   1.000x     0/0      1.000
+count zpage_retired                       0.0000        0.0000     NaNx     0/0      1.000
+count zpage_sample_declined               0.0000        0.0000     NaNx     0/0      1.000
+count zpage_sample_us               1024945.0000   843005.0000   0.822x     1/3      1.000
+count zpage_sample_w_z_bytes       736964744.0000 647542656.0000   0.879x     0/3      0.250
+count zpage_sample_w_z_raw_bytes   946574808.0000 948315272.0000   1.002x     1/3      1.000
+count zpage_sampled                      58.0000       55.0000   0.948x     1/3      1.000
+count zpage_samples                       7.0000        7.0000   1.000x     1/2      1.000
+count zpage_scan_groups            20937192.0000  5900629.0000   0.282x     0/3      0.250
+count zpage_scans                   2563785.0000   751389.0000   0.293x     0/3      0.250
+count zpage_sel_builds                    1.0000        1.0000   1.000x     0/0      1.000
+count zpage_sel_c_build_ns                0.0000        0.0000     NaNx     0/0      1.000
+count zpage_sel_cancelled                 0.0000        0.0000     NaNx     0/0      1.000
+count zpage_sel_excess_ns                 0.0000        0.0000     NaNx     0/0      1.000
+count zpage_sel_exit_e1                   0.0000        0.0000     NaNx     0/0      1.000
+count zpage_sel_exit_e2                   0.0000        0.0000     NaNx     0/0      1.000
+count zpage_sel_exit_e3                   0.0000        0.0000     NaNx     0/0      1.000
+count zpage_sel_installs                  1.0000        1.0000   1.000x     0/0      1.000
+count zpage_sel_mixed                     0.0000        0.0000     NaNx     0/0      1.000
+count zpage_sel_retired                   0.0000        0.0000     NaNx     0/0      1.000
+count zpage_sel_s1                       32.0000       84.0000   2.625x     3/3      0.250
+count zpage_sel_samples                   7.0000        6.0000   0.857x     0/1      1.000
+count zpage_sel_steps                   303.0000      824.0000   2.719x     3/3      0.250
+count zpage_sel_suspended                 0.0000        0.0000     NaNx     0/0      1.000
+count zpage_sel_switches                  1.0000        1.0000   1.000x     0/0      1.000
+count zpage_sel_t_f_ns                17039.0000    28931.0000   1.698x     3/3      0.250
+count zpage_sel_t_hit_ns              10638.0000     4590.0000   0.431x     0/3      0.250
+count zpage_sel_t_hit_scan_ns             0.0000    19165.0000     NaNx     3/3      0.250
+count zpage_sel_t_z_ns                 1934.0000        0.0000   0.000x     0/3      0.250
+count zpage_sel_t_z_scan_ns           10016.0000    10162.0000   1.015x     2/3      1.000
+count zpage_sel_threads                   3.0000        2.0000   0.667x     0/1      1.000
+count zpage_sel_trials                    0.0000        0.0000     NaNx     0/0      1.000
+count zpage_sel_trials_back               0.0000        0.0000     NaNx     0/0      1.000
+count zpage_small_partitions_at_end        0.0000        0.0000     NaNx     0/0      1.000
+count zpage_spare_builds                  0.0000        0.0000     NaNx     0/0      1.000
+count zpage_spare_failed                  0.0000        0.0000     NaNx     0/0      1.000
+count zpage_spare_files                   0.0000        0.0000     NaNx     0/0      1.000
+count zpage_swept                         0.0000        0.0000     NaNx     0/0      1.000
+count zpage_verified_pages_at_end     93333.0000    93333.0000   1.000x     0/1      1.000
+count zpage_warm_bytes             80007168.0000 193536000.0000   2.419x     3/3      0.250
+count zpage_warm_skipped           167178240.0000 136192000.0000   0.815x     1/3      1.000
+count zpage_warm_us                 2280391.0000  4973922.0000   2.181x     2/3      1.000
+count zpage_warms                        19.0000       19.0000   1.000x     0/0      1.000
+load bg_read_bytes_per_op                44.7455        0.0016   0.000x     0/3      0.250
+load bytes_on_disk_per_byte               1.7680        1.3033   0.737x     0/3      0.250
+load device_bytes_per_byte                1.8040        1.3393   0.742x     0/3      0.250
+load majfaults_per_op                     0.0000        0.0000     NaNx     0/0      1.000
+load ops_per_s                      1356830.4307  1593978.9122   1.175x     3/3      0.250
+load read_bytes_per_op                    0.0016        0.0000   0.000x     0/2      0.500
+load read_us_per_io                   16026.9360        0.0000   0.000x     0/3      0.250
+load refaults_per_op                      0.0021        0.0000   0.000x     0/3      0.250
+load-shuffled bg_read_bytes_per_op      742.3508      672.1069   0.905x     1/3      1.000
+load-shuffled majfaults_per_op            0.0000        0.0000     NaNx     0/0      1.000
+load-shuffled ops_per_s              367905.6932   354678.5166   0.964x     1/3      1.000
+load-shuffled read_bytes_per_op           0.0033        0.0049   1.500x     1/2      1.000
+load-shuffled read_us_per_io             64.3721       61.5530   0.956x     2/3      1.000
+load-shuffled refaults_per_op             0.1790        0.1641   0.916x     2/3      1.000
+prime us_per_page                         1.2921        1.4498   1.122x     2/3      1.000
+read bg_read_bytes_per_op               195.0925       15.1470   0.078x     0/3      0.250
+read bg_read_bytes_per_op_2t              0.6758       20.9920  31.061x     2/3      1.000
+read bg_read_bytes_per_op_3t              0.0000       23.9889     NaNx     3/3      0.250
+read majfaults_per_op                     0.1964        0.3489   1.777x     2/3      1.000
+read majfaults_per_op_2t                  0.0002        0.3056 1382.905x     2/3      1.000
+read majfaults_per_op_3t                  0.0000        0.3121     NaNx     3/3      0.250
+read p99_us                              79.8710       79.3590   0.994x     1/3      1.000
+read read_bytes_per_op                  804.2660     1429.0862   1.777x     2/3      1.000
+read read_bytes_per_op_2t                 0.9052     1251.8154 1382.891x     2/3      1.000
+read read_bytes_per_op_3t                 0.0000     1278.3807     NaNx     3/3      0.250
+read read_us_per_io                     166.8696       28.3951   0.170x     0/3      0.250
+read read_us_per_io_2t                   74.2358      100.8276   1.358x     2/3      1.000
+read read_us_per_io_3t                  139.0297      135.4028   0.974x     0/1      1.000
+read reads_per_s                      94237.9391    71994.9079   0.764x     1/3      1.000
+read reads_per_s_2t                  912548.5756   144935.9863   0.159x     1/3      1.000
+read reads_per_s_3t                 1435626.2793   181214.8965   0.126x     0/3      0.250
+read refaults_per_op                      0.1795        0.3526   1.964x     3/3      0.250
+read refaults_per_op_2t                   0.0002        0.3104 1272.307x     2/3      1.000
+read refaults_per_op_3t                   0.0000        0.3164     NaNx     3/3      0.250
+scan bg_read_bytes_per_op                 0.0000     1583.5136     NaNx     3/3      0.250
+scan bg_read_bytes_per_op_2t              0.0000      221.2700     NaNx     3/3      0.250
+scan bg_read_bytes_per_op_3t              0.0000       80.4700     NaNx     3/3      0.250
+scan entries_per_s                  7942395.5208  1004457.2832   0.126x     0/3      0.250
+scan entries_per_s_2t              18214616.7189  3448007.6100   0.189x     0/3      0.250
+scan entries_per_s_3t              27448024.4652  7441505.4359   0.271x     0/3      0.250
+scan majfaults_per_op                     0.0000        2.5790     NaNx     3/3      0.250
+scan majfaults_per_op_2t                  0.0000        1.2589     NaNx     3/3      0.250
+scan majfaults_per_op_3t                  0.0000        0.6691     NaNx     3/3      0.250
+scan read_bytes_per_op                    0.0000    10563.5840     NaNx     3/3      0.250
+scan read_bytes_per_op_2t                 0.0000     5156.3930     NaNx     3/3      0.250
+scan read_bytes_per_op_3t                 0.0000     2740.7510     NaNx     3/3      0.250
+scan refaults_per_op                      0.0000        3.0124     NaNx     3/3      0.250
+scan refaults_per_op_2t                   0.0000        1.2994     NaNx     3/3      0.250
+scan refaults_per_op_3t                   0.0000        0.6863     NaNx     3/3      0.250
+ycsb-A bg_read_bytes_per_op               0.0000        0.0000     NaNx     0/0      1.000
+ycsb-A majfaults_per_op                   0.0000        0.0000     NaNx     1/1      1.000
+ycsb-A ops_per_s                     447778.8273   339359.1622   0.758x     1/3      1.000
+ycsb-A read_bytes_per_op                  0.0000        0.0000     NaNx     1/1      1.000
+ycsb-A refaults_per_op                    0.0000        0.0000     NaNx     1/1      1.000
+ycsb-B bg_read_bytes_per_op               0.0000        0.0000     NaNx     1/1      1.000
+ycsb-B majfaults_per_op                   0.0000        0.0000     NaNx     1/1      1.000
+ycsb-B ops_per_s                     803441.0888   571898.7155   0.712x     0/3      0.250
+ycsb-B read_bytes_per_op                  0.0492        0.0492   1.000x     1/1      1.000
+ycsb-B read_us_per_io                     0.0000        0.0000     NaNx     1/1      1.000
+ycsb-B refaults_per_op                    0.0000        0.0000     NaNx     1/2      1.000
+ycsb-C bg_read_bytes_per_op               0.0000        0.0000     NaNx     1/1      1.000
+ycsb-C majfaults_per_op                   0.0000        0.0000     NaNx     1/1      1.000
+ycsb-C ops_per_s                     955903.8286   682422.3460   0.714x     0/3      0.250
+ycsb-C read_bytes_per_op                  0.0000        0.0000     NaNx     1/1      1.000
+ycsb-C refaults_per_op                    0.0000        0.0000     NaNx     1/1      1.000
+ycsb-D bg_read_bytes_per_op               0.0000        0.0000     NaNx     0/0      1.000
+ycsb-D majfaults_per_op                   0.0000        0.0000     NaNx     1/1      1.000
+ycsb-D ops_per_s                     449352.0994   382661.3495   0.852x     0/3      0.250
+ycsb-D read_bytes_per_op                  0.0000        0.0000     NaNx     1/1      1.000
+ycsb-D refaults_per_op                    0.0000        0.0000     NaNx     1/1      1.000
+ycsb-E bg_read_bytes_per_op               0.0000        0.0000     NaNx     0/0      1.000
+ycsb-E majfaults_per_op                   0.0000        0.0000     NaNx     1/1      1.000
+ycsb-E ops_per_s                     232333.3753   212221.4599   0.913x     0/3      0.250
+ycsb-E read_bytes_per_op                  0.0000        0.0000     NaNx     1/1      1.000
+ycsb-E refaults_per_op                    0.0000        0.0000     NaNx     1/1      1.000
+ycsb-F bg_read_bytes_per_op               0.0000        0.0000     NaNx     0/0      1.000
+ycsb-F majfaults_per_op                   0.0000        0.0000     NaNx     1/1      1.000
+ycsb-F ops_per_s                     357258.3767   311661.1582   0.872x     1/3      1.000
+ycsb-F read_bytes_per_op                  0.0000        0.0000     NaNx     1/1      1.000
+ycsb-F refaults_per_op                    0.0000        0.0000     NaNx     1/1      1.000
+
+295 quantities: 0 marked *, where a coin marks about 14.8; 0 marked **, which holds for the table as a whole (Holm)
+
+count lazy_scans_done by rep (A first on even reps):
+  rep   1             0.00            0.00      NaNx
+  rep   2             0.00            0.00      NaNx
+  rep   3             0.00            0.00      NaNx
+
+count lazy_scans_resumed by rep (A first on even reps):
+  rep   1             0.00            0.00      NaNx
+  rep   2             0.00            0.00      NaNx
+  rep   3             0.00            0.00      NaNx
+
+count rd_scans by rep (A first on even reps):
+  rep   1       2500000.00      2500000.00    1.000x
+  rep   2       2500000.00      2500000.00    1.000x
+  rep   3       2500000.00      2500000.00    1.000x
+
+count scan_ahead_us by rep (A first on even reps):
+  rep   1             0.00            0.00      NaNx
+  rep   2             0.00            0.00      NaNx
+  rep   3             0.00            0.00      NaNx
+
+count scan_install_us by rep (A first on even reps):
+  rep   1             0.00            0.00      NaNx
+  rep   2             0.00            0.00      NaNx
+  rep   3             0.00            0.00      NaNx
+
+count scan_settle_us by rep (A first on even reps):
+  rep   1             0.00            0.00      NaNx
+  rep   2             0.00            0.00      NaNx
+  rep   3             0.00            0.00      NaNx
+
+count scan_snap_us by rep (A first on even reps):
+  rep   1             0.00            0.00      NaNx
+  rep   2             0.00            0.00      NaNx
+  rep   3             0.00            0.00      NaNx
+
+count scan_sync_us by rep (A first on even reps):
+  rep   1             0.00            0.00      NaNx
+  rep   2             0.00            0.00      NaNx
+  rep   3             0.00            0.00      NaNx
+
+count scan_take_us by rep (A first on even reps):
+  rep   1             0.00            0.00      NaNx
+  rep   2             0.00            0.00      NaNx
+  rep   3             0.00            0.00      NaNx
+
+count zpage_census_scan_faults by rep (A first on even reps):
+  rep   1             0.00      2141271.00      NaNx
+  rep   2             0.00      3013902.00      NaNx
+  rep   3             0.00      2307021.00      NaNx
+
+count zpage_census_scans by rep (A first on even reps):
+  rep   1       2475972.00      2487865.00    1.005x
+  rep   2       2488128.00      2498677.00    1.004x
+  rep   3       2478991.00      2487707.00    1.004x
+
+count zpage_census_t_hit_scan_ns by rep (A first on even reps):
+  rep   1             0.00        19081.00      NaNx
+  rep   2             0.00        19417.00      NaNx
+  rep   3             0.00        19165.00      NaNx
+
+count zpage_census_t_z_scan_ns by rep (A first on even reps):
+  rep   1         10109.00        10380.00    1.027x
+  rep   2         10016.00            0.00    0.000x
+  rep   3          9448.00        10162.00    1.076x
+
+count zpage_nopage_scans by rep (A first on even reps):
+  rep   1             0.00            0.00      NaNx
+  rep   2             0.00            0.00      NaNx
+  rep   3             0.00            0.00      NaNx
+
+count zpage_raw_scans by rep (A first on even reps):
+  rep   1             0.00            0.00      NaNx
+  rep   2             0.00            0.00      NaNx
+  rep   3             0.00            0.00      NaNx
+
+count zpage_scan_groups by rep (A first on even reps):
+  rep   1      20937224.00      5900629.00    0.282x
+  rep   2      20937192.00       147094.00    0.007x
+  rep   3      20936650.00      6141974.00    0.293x
+
+count zpage_scans by rep (A first on even reps):
+  rep   1       2563785.00       751389.00    0.293x
+  rep   2       2563785.00        57904.00    0.023x
+  rep   3       2563785.00       780476.00    0.304x
+
+count zpage_sel_t_hit_scan_ns by rep (A first on even reps):
+  rep   1             0.00        19081.00      NaNx
+  rep   2             0.00        19417.00      NaNx
+  rep   3             0.00        19165.00      NaNx
+
+count zpage_sel_t_z_scan_ns by rep (A first on even reps):
+  rep   1         10109.00        10380.00    1.027x
+  rep   2         10016.00            0.00    0.000x
+  rep   3          9448.00        10162.00    1.076x
+
+scan bg_read_bytes_per_op by rep (A first on even reps):
+  rep   1             0.00          204.80      NaNx
+  rep   2             0.00         1583.51      NaNx
+  rep   3             0.00         2897.51      NaNx
+
+scan bg_read_bytes_per_op_2t by rep (A first on even reps):
+  rep   1             0.00          221.27      NaNx
+  rep   2             0.00          206.56      NaNx
+  rep   3             0.00          256.95      NaNx
+
+scan bg_read_bytes_per_op_3t by rep (A first on even reps):
+  rep   1             0.00           80.47      NaNx
+  rep   2             0.00          107.09      NaNx
+  rep   3             0.00           76.50      NaNx
+
+scan entries_per_s by rep (A first on even reps):
+  rep   1       7674580.83      1038157.52    0.135x
+  rep   2       9133668.94       872923.19    0.096x
+  rep   3       7942395.52      1004457.28    0.126x
+
+scan entries_per_s_2t by rep (A first on even reps):
+  rep   1      17752755.76      3572548.79    0.201x
+  rep   2      18214616.72      3448007.61    0.189x
+  rep   3      18566327.53      3340068.62    0.180x
+
+scan entries_per_s_3t by rep (A first on even reps):
+  rep   1      27099987.97      7441505.44    0.275x
+  rep   2      27448024.47      4795462.23    0.175x
+  rep   3      28273593.84      7522429.85    0.266x
+
+scan majfaults_per_op by rep (A first on even reps):
+  rep   1             0.00            2.50      NaNx
+  rep   2             0.00            2.71      NaNx
+  rep   3             0.00            2.58      NaNx
+
+scan majfaults_per_op_2t by rep (A first on even reps):
+  rep   1             0.00            1.18      NaNx
+  rep   2             0.00            1.26      NaNx
+  rep   3             0.00            1.30      NaNx
+
+scan majfaults_per_op_3t by rep (A first on even reps):
+  rep   1             0.00            0.64      NaNx
+  rep   2             0.00            1.17      NaNx
+  rep   3             0.00            0.67      NaNx
+
+scan read_bytes_per_op by rep (A first on even reps):
+  rep   1             0.00        10239.18      NaNx
+  rep   2             0.00        11119.00      NaNx
+  rep   3             0.00        10563.58      NaNx
+
+scan read_bytes_per_op_2t by rep (A first on even reps):
+  rep   1             0.00         4823.70      NaNx
+  rep   2             0.00         5156.39      NaNx
+  rep   3             0.00         5344.00      NaNx
+
+scan read_bytes_per_op_3t by rep (A first on even reps):
+  rep   1             0.00         2635.02      NaNx
+  rep   2             0.00         4776.99      NaNx
+  rep   3             0.00         2740.75      NaNx
+
+scan refaults_per_op by rep (A first on even reps):
+  rep   1             0.00            2.51      NaNx
+  rep   2             0.00            3.01      NaNx
+  rep   3             0.00            3.22      NaNx
+
+scan refaults_per_op_2t by rep (A first on even reps):
+  rep   1             0.00            1.22      NaNx
+  rep   2             0.00            1.30      NaNx
+  rep   3             0.00            1.36      NaNx
+
+scan refaults_per_op_3t by rep (A first on even reps):
+  rep   1             0.00            0.66      NaNx
+  rep   2             0.00            1.19      NaNx
+  rep   3             0.00            0.69      NaNx

@@ -3474,6 +3474,20 @@ pub(super) struct ZEvents {
     /// Builds collected dormant, ahead of the controller's decision
     /// (`ZCounts::prebuilt`).
     pub prebuilt: AtomicU64,
+    /// Partitions a build ahead at landing found with their records out of
+    /// the page cache and left to the controller's build
+    /// (`ZCounts::ahead_cold`).
+    pub ahead_cold: AtomicU64,
+    /// Form files built ahead in the coding the controller's pick then
+    /// refused, given back unattached and built again
+    /// (`ZCounts::ahead_recoded`).
+    pub ahead_recoded: AtomicU64,
+    /// Partitions built ahead whose records and form file were swapped in
+    /// the page cache as the store passed its budget
+    /// (`ZCounts::ahead_swapped`).
+    pub ahead_swapped: AtomicU64,
+    /// Form files synced once named (`ZCounts::build_synced`).
+    pub build_synced: AtomicU64,
     /// The I/O class the kernel reported for the last build thread
     /// (`ZCounts::build_io_class`).
     pub build_io_class: AtomicU64,
@@ -3635,6 +3649,7 @@ impl ZEvents {
         ZEvents::add(&self.build_wall_us, b.wall_us);
         ZEvents::add(&self.build_cpu_us, b.cpu_us);
         ZEvents::add(&self.build_majflt, b.majflt);
+        ZEvents::add(&self.build_synced, u64::from(b.sync_us > 0));
     }
 
     /// A warm, counted.
@@ -3726,6 +3741,9 @@ pub(super) struct Built {
     pub wall_us: u64,
     pub cpu_us: u64,
     pub majflt: u64,
+    /// The file's sync once named, microseconds (`BuildPlan::sync`); zero
+    /// where it was not asked for.
+    pub sync_us: u64,
 }
 
 /// What a warm of a form file did (`warm_file`).
@@ -3795,14 +3813,39 @@ trait PieceSink {
 }
 
 /// The build's sink: a piece written to the file whole, and handed to the
-/// device with a hint at once, nothing waited for.
-struct FileSink<'a>(&'a File);
+/// device with a hint at once, nothing waited for -- or, where the file is
+/// to stay out of the page cache (`BuildPlan::drop_output`), the piece
+/// before it waited for and dropped, so that no more than two pieces of the
+/// file are cached at once: a build ahead beside a raw form that fits, whose
+/// dirty pages pushed the raw form's out until the file was dropped whole
+/// at its end, and the raw form's refaults read as the group's pressure.
+struct FileSink<'a> {
+    file: &'a File,
+    drop: bool,
+    prev: Option<(u64, u64)>,
+}
+
+impl<'a> FileSink<'a> {
+    fn new(file: &'a File, drop: bool) -> FileSink<'a> {
+        FileSink {
+            file,
+            drop,
+            prev: None,
+        }
+    }
+}
 
 impl PieceSink for FileSink<'_> {
     fn put(&mut self, at: u64, piece: &[u8]) -> Result<()> {
-        let mut f = self.0;
+        let mut f = self.file;
         f.write_all(piece)?;
-        super::start_writeback(self.0, at, piece.len() as u64);
+        super::start_writeback(self.file, at, piece.len() as u64);
+        if self.drop {
+            if let Some((a, n)) = self.prev {
+                drop_written_range(self.file, a, n);
+            }
+            self.prev = Some((at, piece.len() as u64));
+        }
         Ok(())
     }
 }
@@ -3854,6 +3897,85 @@ impl<S: PieceSink> Pieces<S> {
         self.buf.clear();
         Ok(())
     }
+}
+
+/// A file's own pages written back and dropped from the page cache, the
+/// whole of it (`drop_written_range`).
+fn drop_written(file: &File) {
+    drop_written_range(file, 0, 0);
+}
+
+/// `[at, at + n)` of a file written back and dropped from the page cache,
+/// zero bytes being to the file's end: the writeback started and waited for
+/// by range, which asks the filesystem for no journal commit as an fsync
+/// would, then the clean pages dropped.
+#[cfg(target_os = "linux")]
+fn drop_written_range(file: &File, at: u64, n: u64) {
+    use std::os::unix::io::AsRawFd;
+    let (at, n) = (at as libc::off64_t, n as libc::off64_t);
+    // SAFETY: a writeback and an advice over a descriptor this call holds
+    // open; neither changes a byte of the file.
+    unsafe {
+        libc::sync_file_range(
+            file.as_raw_fd(),
+            at,
+            n,
+            libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                | libc::SYNC_FILE_RANGE_WRITE
+                | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+        );
+        libc::posix_fadvise(file.as_raw_fd(), at, n, libc::POSIX_FADV_DONTNEED);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn drop_written_range(_file: &File, _at: u64, _n: u64) {}
+
+/// A partition built ahead turned, in the page cache, into what a build
+/// past the budget leaves (`Options::zpages_land_drop_past`): the
+/// segment's record region, `[at, at + len)` of `seg`, dropped
+/// (`POSIX_FADV_DONTNEED`, which skips a page a mapping holds), and the
+/// form file at `form` asked for a window at a time (`POSIX_FADV_WILLNEED`),
+/// since the kernel submits one request's worth of an advice. The bytes
+/// asked for; an error opening the form file asks for none.
+#[cfg(target_os = "linux")]
+pub(super) fn swap_ahead(seg: &File, at: u64, len: u64, form: &Path) -> u64 {
+    use std::os::unix::io::AsRawFd;
+    let page = ZPAGE as u64;
+    let (a, b) = (at.next_multiple_of(page), (at + len) & !(page - 1));
+    // SAFETY: advices over file descriptors this call holds open; neither
+    // changes a byte of either file.
+    unsafe {
+        if a < b {
+            libc::posix_fadvise(
+                seg.as_raw_fd(),
+                a as libc::off_t,
+                (b - a) as libc::off_t,
+                libc::POSIX_FADV_DONTNEED,
+            );
+        }
+        let Ok(f) = File::open(form) else {
+            return 0;
+        };
+        let n = f.metadata().map_or(0, |m| m.len());
+        let mut off = 0u64;
+        while off < n {
+            let w = (n - off).min(ZPREFETCH_WINDOW as u64);
+            libc::posix_fadvise(
+                f.as_raw_fd(),
+                off as libc::off_t,
+                w as libc::off_t,
+                libc::POSIX_FADV_WILLNEED,
+            );
+            off += w;
+        }
+        n
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn swap_ahead(_seg: &File, _at: u64, _len: u64, _form: &Path) -> u64 {
+    0
 }
 
 /// Drop `[from, to)` of the file behind the build: the pages of its own
@@ -3957,6 +4079,19 @@ pub(super) struct BuildPlan {
     /// rename while the bit is set, so a test can land what it likes
     /// between a build's last look at the cancel and its file's name.
     pub hold: Option<std::sync::Arc<std::sync::atomic::AtomicU8>>,
+    /// The form file's own pages written back and dropped from the page
+    /// cache once it is written (`drop_written`): a build ahead the
+    /// controller has not bought, beside a raw form that fits its budget,
+    /// whose reads want the cache the file would take.
+    pub drop_output: bool,
+    /// The form file synced (`fdatasync`) once it has its name, on the
+    /// build's own thread (`Options::zpages_build_sync`): its pages reach
+    /// the device by `sync_file_range`, which asks for no flush of the
+    /// device's write-back cache, and the next fsync anyone issues pays
+    /// that flush. The sync's error is the file's alone: a form file is
+    /// checked page by page at its attach, and one a crash tore is refused
+    /// there and built again.
+    pub sync: bool,
 }
 
 impl BuildPlan {
@@ -3975,6 +4110,8 @@ impl BuildPlan {
             own_decode: false,
             cancel: None,
             hold: None,
+            drop_output: false,
+            sync: false,
         }
     }
 
@@ -4107,7 +4244,7 @@ fn build_file_seen(
         &file, base, recs, dir, nkeys, bind, &tmp, &facts, id, end_seq, plan, seen,
     );
     match made {
-        Ok(Outcome::Built(b)) => {
+        Ok(Outcome::Built(mut b)) => {
             // The cancel's last look, before the file gets its name; a
             // build past it renames whatever landed meanwhile, and the
             // collect finds the target gone and the file an orphan.
@@ -4119,6 +4256,13 @@ fn build_file_seen(
             std::fs::rename(&tmp, out).inspect_err(|_| {
                 let _ = std::fs::remove_file(&tmp);
             })?;
+            if plan.sync {
+                let t = std::time::Instant::now();
+                if let Ok(f) = File::open(out) {
+                    let _ = f.sync_data();
+                }
+                b.sync_us = (t.elapsed().as_micros() as u64).max(1);
+            }
             Ok(Outcome::Built(b))
         }
         other => {
@@ -4152,7 +4296,7 @@ fn write_pages(
         .create(true)
         .truncate(true)
         .open(tmp)?;
-    let mut w = Pieces::new(FileSink(&out), plan.piece);
+    let mut w = Pieces::new(FileSink::new(&out, plan.drop_output), plan.piece);
     let images = SegImages::new(recs, dir, nkeys);
     let mut scratch = FillScratch::new();
     scratch.group_bytes = plan.group_bytes;
@@ -4304,6 +4448,9 @@ fn write_pages(
     };
     w.push(&t.encode())?;
     w.flush()?;
+    if plan.drop_output {
+        drop_written(&out);
+    }
     let file_bytes = w.at;
     debug_assert_eq!(Some(file_bytes), t.expected_file_len());
     Ok(Outcome::Built(Built {
@@ -4314,6 +4461,7 @@ fn write_pages(
         wall_us: 0,
         cpu_us: 0,
         majflt: 0,
+        sync_us: 0,
     }))
 }
 
@@ -4384,6 +4532,11 @@ pub struct ZInject {
     /// in the dev profile against five optimized, so a test's premise
     /// that sat on a threshold held in one profile and not the other.
     pub decode_cost_ns: AtomicU64,
+    /// The share of a partition's records the page cache holds, as the
+    /// bits of an `f64`, which a build ahead at landing reads in place of
+    /// `mincore`'s (`Options::zpages_land_pct`); `u64::MAX` for the
+    /// kernel's. A test's files are small and fresh, and resident.
+    pub records_resident: AtomicU64,
 }
 
 impl Default for ZInject {
@@ -4395,6 +4548,7 @@ impl Default for ZInject {
             faults: AtomicU64::new(0),
             fault_cost_ns: AtomicU64::new(0),
             decode_cost_ns: AtomicU64::new(0),
+            records_resident: AtomicU64::new(u64::MAX),
         }
     }
 }
@@ -4485,6 +4639,21 @@ impl ZInject {
         match self.decode_cost_ns.load(Ordering::Acquire) {
             0 => None,
             ns => Some(Duration::from_nanos(ns)),
+        }
+    }
+
+    /// The share of every partition's records the builds ahead at landing
+    /// read as resident, in place of the kernel's.
+    pub fn set_records_resident(&self, share: f64) {
+        self.records_resident
+            .store(share.to_bits(), Ordering::Release);
+    }
+
+    /// The injected share of the records resident, if one is set.
+    pub fn records_resident(&self) -> Option<f64> {
+        match self.records_resident.load(Ordering::Acquire) {
+            u64::MAX => None,
+            bits => Some(f64::from_bits(bits)),
         }
     }
 }

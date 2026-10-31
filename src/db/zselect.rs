@@ -638,6 +638,11 @@ pub struct Sampler {
     /// The [`Input::generation`] the reading was taken at: the partitions it
     /// is a reading of.
     pub generation: u64,
+    /// The form files on disk cover the partitions' keys enough that their
+    /// attach installs the form ([`COVERED_ENOUGH`]), so `c_build` is
+    /// mostly the attach's price: what [`ZSelect::set_attach_eager`] buys on
+    /// the prediction.
+    pub attach: bool,
 }
 
 impl Sampler {
@@ -1103,6 +1108,10 @@ pub struct ZSelect {
     /// prediction once the sampler has priced it and the partitions have
     /// stood for [`EAGER_SETTLE`], without the rent (`set_eager`).
     eager: bool,
+    /// Whether an attach -- form files on disk for [`COVERED_ENOUGH`] of the
+    /// keys, the sampler's [`Sampler::attach`] -- is bought on the
+    /// prediction as an eager selector buys a build (`set_attach_eager`).
+    attach_eager: bool,
     /// The eager purchase made, or a purchase undone: a build cancelled or
     /// COMPACT left. From then on the rent governs, since an eager entry
     /// that could buy again after every exit would buy a form that does not
@@ -1163,6 +1172,7 @@ impl ZSelect {
             excess_anchor: Duration::ZERO,
             last_switch: None,
             eager: false,
+            attach_eager: false,
             eager_spent: false,
             gen_changed_at: Duration::ZERO,
             last_build_wall: Duration::ZERO,
@@ -1270,6 +1280,21 @@ impl ZSelect {
 
     pub fn eager(&self) -> bool {
         self.eager
+    }
+
+    /// Whether the first purchase is bought on the model's prediction, as
+    /// [`set_eager`](Self::set_eager) buys it, where the sampler finds the
+    /// form files on disk for [`COVERED_ENOUGH`] of the partitions' keys and
+    /// the purchase is an attach that installs the form
+    /// (`Options::zpages_attach_eager`): the evidence the rent waits for is
+    /// the group's refaults past half the faults over a trailing window,
+    /// which keeps a restart's first touches from buying a build, and after
+    /// a load past the budget it came eight to nine seconds after the load's
+    /// end while the files built ahead stood on disk, since the records the
+    /// builds ahead dropped come back as faults the kernel does not count as
+    /// refaults.
+    pub fn set_attach_eager(&mut self, on: bool) {
+        self.attach_eager = on;
     }
 
     /// Whether form files are being kept for a re-entry: the form was left (or a
@@ -1727,9 +1752,9 @@ impl ZSelect {
         // and the model's prediction stands in for the rent: the form is
         // bought before any read has wasted its price, on the prediction
         // that every read would.
-        let settled = self.eager
-            && !self.eager_spent
-            && now.saturating_sub(self.gen_changed_at) >= EAGER_SETTLE;
+        let stood = !self.eager_spent && now.saturating_sub(self.gen_changed_at) >= EAGER_SETTLE;
+        let settled_attach = self.attach_eager && s.attach && stood;
+        let settled = (self.eager && stood) || settled_attach;
         if !settled && self.excess < s.c_build {
             return false;
         }
@@ -1747,12 +1772,23 @@ impl ZSelect {
         // page cache is not in the budget, so the pressure term stands for it
         // where the model cannot see why the cache is short; the measured
         // saving still decides.
-        let predicted = pressure
-            || self
-                .phi_z(Class::Read)
-                .is_some_and(|z| m.phi_raw - z >= self.theta_enter(Class::Read));
+        // The attach on the prediction buys on the model's alone: the
+        // group's refaults after a load are the load's as much as the
+        // store's, and a store of three million keys a few percent past its
+        // budget, the model reading a few faults in a hundred reads, was
+        // bought under them and cancelled a second later by the vanish
+        // rule. The eager build keeps the pressure term, as it was priced.
+        let modelled = self
+            .phi_z(Class::Read)
+            .is_some_and(|z| m.phi_raw - z >= self.theta_enter(Class::Read));
+        let predicted = pressure || modelled;
+        let on_prediction = if settled_attach && !self.eager {
+            modelled
+        } else {
+            settled
+        };
         predicted
-            && (settled
+            && (on_prediction
                 || Class::ALL
                     .iter()
                     .any(|&c| ev.valid[c.ix()] && ev.saving[c.ix()] >= self.theta_enter(c)))
@@ -2782,6 +2818,8 @@ mod tests {
         own_refaults: u64,
         /// The segment work has something in flight ([`Input::rewriting`]).
         rewriting: bool,
+        /// Every partition's form file is on disk, priced as the attach.
+        on_disk: bool,
         log: Vec<Rec>,
         checker: Checker,
     }
@@ -2819,6 +2857,7 @@ mod tests {
                 sampler_t_f: PRIOR_T_F,
                 own_refaults: 0,
                 rewriting: false,
+                on_disk: false,
                 log: Vec::new(),
                 checker: Checker::default(),
             }
@@ -2849,9 +2888,14 @@ mod tests {
                     t_z: Some(c.t_z),
                     t_z_scan: Some(c.t_z_scan),
                 },
-                c_build: c.price * (1.0 - self.built) + c.attach * self.built,
+                c_build: if self.on_disk {
+                    c.attach
+                } else {
+                    c.price * (1.0 - self.built) + c.attach * self.built
+                },
                 declined: self.declined,
                 generation: self.generation,
+                attach: self.on_disk,
             }
         }
 
@@ -3244,6 +3288,7 @@ mod tests {
             c_build: 1.0,
             declined: false,
             generation: 0,
+            attach: false,
         });
         assert_eq!(s.saving_star(Class::Read), star / 4.0);
         assert_eq!(s.saving_star(Class::Scan), scan / 4.0);
@@ -3969,6 +4014,41 @@ mod tests {
             sim.sel.counts().builds,
             1,
             "bought once it has ended and the settle has passed"
+        );
+    }
+
+    /// With every partition's form file on disk the purchase is an attach,
+    /// and a selector that buys an attach on the prediction
+    /// (`set_attach_eager`) buys it once priced and settled, with no read to
+    /// give the rent its evidence; with the option off, or with the files
+    /// not on disk, the same idle store buys nothing; and it buys on the
+    /// prediction once, as the eager entry does.
+    #[test]
+    fn an_attach_is_bought_on_the_prediction_where_every_form_file_is_on_disk() {
+        let cell = Cell::ten_million();
+        let mut on = Sim::new(cell.clone(), Load::Idle);
+        on.sel.set_attach_eager(true);
+        on.on_disk = true;
+        let mut off = Sim::new(cell.clone(), Load::Idle);
+        off.on_disk = true;
+        let mut built = Sim::new(cell.clone(), Load::Idle);
+        built.sel.set_attach_eager(true);
+        assert!(!off.sel.eager() && !on.sel.eager());
+        for sim in [&mut on, &mut off, &mut built] {
+            sim.run(EAGER_SETTLE.as_secs_f64() + 6.0);
+        }
+        assert_eq!(
+            on.sel.counts().builds,
+            1,
+            "the attach bought on the prediction"
+        );
+        assert_eq!(off.sel.counts().builds, 0, "the rent waits for evidence");
+        assert_eq!(built.sel.counts().builds, 0, "a build is the rent's");
+        assert!(
+            matches!(off.last.phase, Phase::Suspect) && matches!(built.last.phase, Phase::Suspect),
+            "{:?} {:?}",
+            off.last.phase,
+            built.last.phase
         );
     }
 
@@ -5946,6 +6026,7 @@ mod tests {
                     c_build: weird(&mut rng, 10.0),
                     declined: rng.below(10) == 0,
                     generation: rng.below(3),
+                    attach: false,
                 });
                 let window = |rng: &mut Rng| {
                     let ops = if rng.below(5) == 0 {
@@ -6054,6 +6135,7 @@ mod tests {
                     c_build: 0.0,
                     declined: false,
                     generation: 0,
+                    attach: false,
                 }),
                 footprint: Some(1),
                 ..Input::default()
@@ -6245,6 +6327,7 @@ mod tests {
             c_build,
             declined,
             generation,
+            attach: false,
         }
     }
 
@@ -6792,6 +6875,7 @@ mod tests {
             c_build: 5.0,
             declined: false,
             generation: 0,
+            attach: false,
         });
         let short = 1.0 - 1e-9;
         let mut open = |excess: f64, raw: f64, measured: f64| {
