@@ -20,11 +20,11 @@ is the cost of the design, and showing them is what makes the wins credible.
 
 The suite has to be fair before any of its numbers are quoted.
 
-- [ ] **Tune the buffered RocksDB arm.** `rocksdb-nosync` is
-  `Rocks::create(path, false)`, which runs RocksDB on defaults: no Bloom
-  filter, the default block cache, default write buffers. The durable arm
-  gets the full tuning. Done when the buffered arm uses `rocksdb-tuned`'s
-  options with `sync = false`, and a row is banked with it. Until then, no
+- [ ] **Tune the buffered RocksDB arm.** `rocksdb-nosync` ran RocksDB on
+  defaults (no Bloom filter, the default block cache, default write
+  buffers) while the durable arm got the full tuning. The roster's
+  buffered RocksDB is `rocksdb-tuned-nosync` now, `rocksdb-tuned` with the
+  sync alone off. Done when a row is banked with it. Until then, no
   buffered RocksDB number is quoted.
 - [ ] **A recovery workload.** Crash at a known point (kill the process
   after N committed batches, with an uncommitted tail), then time the open
@@ -61,10 +61,39 @@ What an engine picker would hit, roughly in order.
 - [ ] **Batched point reads (`MultiGet`).** Cheap to add, and a natural new
   benchmark workload.
 
+## Out of core
+
+Where the compact form under `Auto` stands against LMDB with its readahead
+off (`docs/engine.md`, "Out of core: the second form").
+
+- [ ] **The read pass's first seconds.** At five million keys under 640 MiB
+  the single-threaded read pass reads level with LMDB and its p99 trails:
+  the pass starts at the load's end, and for its first seconds the reads go
+  to the raw form, before the compact form installs. Done when the pass
+  reads ahead in both orders of the pairing.
+- [ ] **The ordered load beside the builds ahead.** Building form files
+  during the load costs the ordered load about a tenth at three and five
+  million keys under 640 MiB. Done when it reads level with the controller
+  without the builds ahead, or the trade is priced and stated.
+- [ ] **The writer's reads in the census.** Counting them while the
+  controller decides read the A and F mixes slower in two sittings,
+  unresolved; a store that stays undecided pays it. Done when resolved.
+- [ ] **What is not priced yet.** Ten million keys under a gibibyte with
+  the builds ahead, the lag sweep under a bound, and a shuffled load
+  followed by reads. Done when each is paired against LMDB with its
+  readahead off.
+- [ ] **Whether `Auto` ships on.** The compact form is off by default
+  (`ZPages::Off`) and `Auto` is an arm. Done when `Auto` is priced in
+  memory against the default with no cell given up, and the default is
+  decided on that.
+
 ## Housekeeping
 
-- [ ] **Verify the jump of 2026-10-19.** supdb's engine grew 4.5K lines in
-  one day (23.5K to 28K). Confirm it is real code before quoting 28K.
+- [x] **Verify the jump of 2026-10-19.** It is real code: the compact
+  form's merges of 2026-10-18 and -19, its layout (`src/db/zpages.rs`),
+  its selector (`src/db/zselect.rs`) and the forced form (`src/db/zside.rs`,
+  since replaced by `src/db/zfile.rs`), each with its tests. A line count
+  is quoted from the tree it was taken at.
 
 ## Proposed out of scope
 
