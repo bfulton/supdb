@@ -255,12 +255,18 @@ fifty: load a tenth cheaper, read pass 0.56-0.60x.
 
 Next:
 
-- Residency variance: two reps in eight at 5M leave four or five
-  partitions cold (resident 0.0-0.5 at the look) and install at 11-26 s.
-  The levers to price: a lower `LAND_RESIDENT` (a build from half-resident
-  records reads the rest with its 4 MiB windows) or a second builder. The
-  arms with the build sync read more slow reps than without in both 5M
-  pairings (9 of 16 against 5, unresolved); read the two together.
+- Residency variance: about a third of the reps at 5M left three or four
+  partitions cold and installed at 11-26 s. Past the selector's line the
+  cold partitions are built ahead from the device now
+  (`zpages_land_cold_past`); eight reps of eight installed at 2.2-3.7 s
+  in its pairing. The build sync's arms had read more slow reps than
+  without (9 of 16 against 5, unresolved) before it; read it again with
+  the cold partitions built.
+- Step (4): against LMDB at 5M under 640 MiB the shipping `Auto` shape
+  (`...dropland50`) reads E at 1.40-1.63x and every other cell ahead but
+  the read pass in a sitting whose reps went cold (0.63x; 2.0x in the
+  other). E is not the open cell there any more; the profile of E was
+  not taken.
 - The ordered load's tenth: the form files written beside the load.
 - The writer census's cost on A and F while the controller decides (two
   sittings, 0.84-0.93, unresolved at three pairs, no mechanism found at a
@@ -268,7 +274,8 @@ Next:
   stays in SUSPECT pays it.
 - Not priced with the builds ahead: 10M under 1 GiB, the lag sweep under a
   bound, a shuffled load followed by reads.
-- Step (4), E's margin against LMDB out of core.
+- The LMDB pairing again with the cold partitions built, to see the read
+  pass in every rep.
 
 ## This session: a block read through one cursor
 

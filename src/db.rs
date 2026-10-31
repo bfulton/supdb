@@ -1341,6 +1341,23 @@ pub struct Options {
     /// to the next fsync.
     #[doc(hidden)]
     pub zpages_build_sync: bool,
+    /// Whether a build ahead past the selector's line to enter
+    /// (`zpages_land_drop_past`) takes a partition whatever share of its
+    /// records the page cache holds, one found cold before included. Below
+    /// the line the bar stands (`LAND_RESIDENT`), since a store that fits
+    /// would read records back from the device for a bet it loses; past it
+    /// the bet is the controller's to win, and the controller builds the
+    /// same partitions from the device after its buy, later and under the
+    /// readers -- at five million keys under 640 MiB three or four
+    /// partitions went cold in about a third of the reps, the files on disk
+    /// at the sample covered too little of the keys for the attach entry,
+    /// and the install came at eleven to twenty-six seconds where it comes
+    /// at two. Paired against the bar kept past the line, every rep of eight
+    /// had every file on disk and installed at 2.2-3.7 s, where the bar's
+    /// arm installed two of its eight at eighteen. On as shipped; `supdb-cache64tofitautozpagesdropland50coldskip` is the
+    /// bar past the line too.
+    #[doc(hidden)]
+    pub zpages_land_cold_past: bool,
     /// The decoded bytes a form file's page is cut into groups at, each
     /// compressed on its own, so that a point read decodes the group its
     /// record is in and not the page (`zpages::ZGROUP_BYTES`, two
@@ -3162,6 +3179,7 @@ impl Default for Options {
             zpages_land_pct: 50,
             zpages_land_drop_past: true,
             zpages_build_sync: true,
+            zpages_land_cold_past: true,
             zpages_group_bytes: zpages::ZGROUP_BYTES,
             zpages_record_coding: false,
             zpages_store_all: false,
@@ -35450,6 +35468,9 @@ impl Maint {
         // beside a seal in flight, whose landing adds a partition and
         // supersedes none; never beside a merge.
         let land = self.opts.zpages_land_pct > 0;
+        // Past the line a cold partition is built too, from the device: the
+        // controller would build it so after its buy, under the readers.
+        let cold_ok = land && self.z_land_past && self.opts.zpages_land_cold_past;
         if !(self.opts.zpages_prebuild || land)
             || !self.z_auto
             || !(self.z_past_budget || (land && self.z_land_due))
@@ -35467,7 +35488,7 @@ impl Maint {
             .filter(|s| !self.in_flight_input(&s.name))
             .filter(|s| s.z.get().is_none())
             .filter(|s| s.z_declined.load(AtomicOrdering::Relaxed) == 0)
-            .filter(|s| !s.z_ahead_cold.load(AtomicOrdering::Relaxed))
+            .filter(|s| cold_ok || !s.z_ahead_cold.load(AtomicOrdering::Relaxed))
             .filter(|s| {
                 Db::name_id(&s.name)
                     .zip(Db::name_end_seq(&s.name))
@@ -35485,9 +35506,11 @@ impl Maint {
         // partition was made under -- a direct run's partitions all end at
         // sequence zero -- since the page cache gives up its oldest pages
         // first and the builder, faster than the landings, catches up with
-        // the newest; and only from records the page cache still holds: a
-        // partition found cold is marked and never looked at again, so a
-        // look costs one `mincore` a partition over the store's life.
+        // the newest; and, below the selector's line, only from records the
+        // page cache still holds: a partition found cold is marked and not
+        // looked at again until the store passes the line
+        // (`Options::zpages_land_cold_past`), so a look costs one `mincore`
+        // a partition over the store's life.
         due.sort_by_key(|s| {
             (
                 Db::name_end_seq(&s.name).unwrap_or(0),
@@ -35500,6 +35523,9 @@ impl Maint {
             .as_ref()
             .and_then(|i| i.records_resident());
         for s in due {
+            if cold_ok {
+                return Some(s.clone());
+            }
             let resident = inject.unwrap_or_else(|| s.records_resident());
             if resident >= LAND_RESIDENT {
                 return Some(s.clone());

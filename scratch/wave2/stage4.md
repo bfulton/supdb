@@ -4498,3 +4498,53 @@ into the window often enough to fail a run of the file in three, in two
 tests that build nothing ahead as well. The count is read before the clock
 moves now (`advance_tick`); a stack dump of the stalled run by `gdb` showed
 every segment work thread idle in its sleep, which is what said so.
+
+## The shipping `Auto` shape against LMDB, after the builds ahead (`9bb1c6f`)
+
+`supdb-cache64tofitautozpagesdropland50` against LMDB with its readahead
+off, five million keys under 640 MiB, three pairs after the warmup, the
+reads divided by ten (`lp-vslmdb-5000000-{1,2}.*`; sitting 1 with LMDB
+first, sitting 2 rerun alone after the first ran past its time limit,
+`cut/lp-vslmdb-5000000-2-killed.err`), supdb over LMDB:
+
+| | sitting 1 | sitting 2 |
+|---|---|---|
+| ordered load | 1.22 | 1.29 |
+| shuffled load | 12.3 | 14.0 |
+| read pass | 0.63 | 2.01 |
+| read, 2 / 3 threads | 4.1 / 4.0 | 10.2 / 12.3 |
+| scan pass | 2.19 | 3.22 |
+| scan, 2 / 3 threads | 3.0 / 3.3 | 4.2 / 4.6 |
+| A, B, C, D, F | 5.9, 1.9, 2.2, 4.1, 4.0 | 4.6, 3.0, 2.9, 5.9, 4.3 |
+| E | 1.40 | 1.63 |
+
+E, the open cell of every comparison before this one (1.09-1.14 on the
+combined arm, 0.55 forced before the decoder), reads 1.40 and 1.63 in all
+three pairs of each order. The one cell LMDB takes is the read pass in
+sitting 1, and its reps say why: two of the three measured reps found
+three or four partitions cold at the builds' look, the files on disk
+covered too little of the keys for the attach entry, and the install
+came at 10.9 and 18.4 s, after the read pass, which ran raw; in sitting 2
+three installs of four came at 2.2-2.6 s and the pass read 2.0. The
+cold partitions are the open question, not E.
+
+## The cold partitions built past the line
+
+A build ahead at landing left a partition whose records the page cache
+held less than half of (`LAND_RESIDENT`) to the controller, so that a
+store that fits reads nothing back from the device for a bet it loses.
+Past the selector's line the bet is the controller's to win, and the
+controller builds those partitions from the device after its buy, under
+the readers; the cold ones, three or four in about a third of the reps at
+five million keys (`land_read.py` over every five-million pairing of the
+builds ahead), left the files on disk short of the attach entry's
+coverage and put the install at eleven to twenty-six seconds, after the
+read pass. Past the line a build ahead takes a partition whatever its
+residency now, one marked cold before included
+(`Options::zpages_land_cold_past`; `...dropland50coldskip` keeps the bar),
+reading what is not resident with its four-mebibyte windows. Paired at five
+million keys under 640 MiB (`lp-coldpast-5000000-*`): every rep of eight
+had all nineteen files on disk at the sample and installed 2.2-3.7 s after
+the load, where the bar's arm installed two of eight at 18.1 and 18.7 s;
+both of those fell in the warmup pairs the table leaves out, so the rates
+read level, the cells that moved moving with the arms' position.
