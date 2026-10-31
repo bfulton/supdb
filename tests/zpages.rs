@@ -3200,16 +3200,14 @@ fn windows_over_with(
         latest.raw_touches() - touches.1
     );
     // A snapshot keeps the answers it was taken at, whatever the writer does
-    // after. Not with the block cache on: a handle holding a snapshot read a
-    // post-snapshot write of a key that was unsealed already, in a scan, in
-    // about one run in two hundred (2 of 600 with the second form forced, 8
-    // of 1,300 with it off, on this branch's engine). The cause is not known
-    // here. The scan snapshot a handle adopts from the state is checked for
-    // its keys alone (`refresh_snapshot_to`) and was suspected; adopting one
-    // only when its copies of the runs were taken at or before the handle's
-    // own log position, as a throwaway patch, left the rate where it was (5
-    // of 700 in each form), so that is not the answer.
-    if !cache {
+    // after, with the block cache on as off. With it on this half was
+    // skipped for a while, its cause unknown: a handle holding a snapshot
+    // read a write made after it, in a scan, about one run in five hundred,
+    // because the upkeep thread's publish of the next commit's forms landed
+    // inside the scan after the scan had checked the forms' position; each
+    // form carries the position it was published at now
+    // (`tests/db.rs`, `a_scan_takes_no_form_published_after_the_commit_it_reads_at`).
+    {
         let snap = db.reader().unwrap();
         snap.snapshot();
         let at_snapshot = model.clone();

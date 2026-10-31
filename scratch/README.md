@@ -1,5 +1,18 @@
 # The state at the consolidation of 2026-10-19
 
+Since this file was written the branch's history was cut: its root is
+`63fc686` (2026-10-20), a recovered tree with no parent, so neither `main`
+nor the mainline below is an ancestor of it any more. The hashes this file
+and the notes beside it cite resolve as follows: the mainline's (`4b112f1`,
+`63b7a0a`, `ca738ec`, `fb5a45a`, the hunt series' base `779b2a2` and the
+rest) only on `claude/performance-dimensions-analysis-gijutv`; `c52ea63`,
+the fixexp series' base, only on `claude/wip-hunt-stress0`; and eleven
+nowhere -- `5fa9940`, `667f7e5`, `a95fec8`, `fd3cf19`, `b055ca8`,
+`d370547`, `47dae8b`, `883db09` here and `200439b`, `62d5787`, `e7d9698` in
+`wave2/stage2b.md` were the consolidation's own commits, and their content
+is in the root's tree. Keep those two branches, or tags of them, for as
+long as the patch series and the citations are to resolve.
+
 The session before this one was cut off with its work spread over eleven
 `claude/wip-*` branches beside the mainline; this one recovered the work from
 their commits (its own transcript was not available) and brought
@@ -62,7 +75,17 @@ cache on, a `Snapshot` handle's first scans answered a write committed
 after the snapshot, about one run in two hundred; and the upkeep thread's
 `cut_known` debug assertion fires in about 3% of the oracle's runs under
 `checked`, after which the lent upkeep's assertion aborts the process. The
-cause is not known. The z-pages windows test runs its snapshot half only
+cause was not known when this was written. Both are found now: the
+assertion was a filed key's rank kept across the merge that rewrote its
+partition (hunt II's third class, below), and the snapshot's write was a
+publish of the next commit's block forms landing inside a handle's scan
+after the scan had checked the forms' position -- reproduced with the
+snapshot half run with the cache on (2 of 1,000), held to a deterministic
+test (`tests/db.rs`,
+`a_scan_takes_no_form_published_after_the_commit_it_reads_at`) and fixed
+by stamping each published form with its position (`CLAUDE.md`, "A
+position checked once, of slots swapped under it"). The rest of this
+paragraph is as it was. The z-pages windows test runs its snapshot half only
 with the cache off and says so (`tests/zpages.rs`, "The cause is not known
 here"). The brief is `hunt/ctx.txt`; the tooling (forced schedules,
 minimal forms over the public surface, an event ring in the publisher, a
@@ -191,7 +214,8 @@ value-carrying log, the cached byte source, the analytics scorecard), which
 `main`'s squashed pull requests do not carry; a tag before deletion keeps
 it without a branch:
 
-    for b in supdb-ext-analytics supdb-cached-bytes supdb-wal-values supdb-wasm-reader; do
+    for b in supdb-ext-analytics supdb-cached-bytes supdb-wal-values supdb-wasm-reader \
+             performance-dimensions-analysis-gijutv wip-hunt-stress0; do
       git push origin origin/claude/$b:refs/tags/archive/$b
     done
     git push origin --delete \

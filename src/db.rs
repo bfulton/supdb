@@ -376,9 +376,12 @@ pub enum ZPages {
     /// platform that is not Linux -- behaving as `Off` there, counted
     /// (`ZCounts::auto_inert`) and never refusing the open. It reads the
     /// model (the cache budget against the partitions' footprint) once a
-    /// second and moves between FITS and SUSPECT on it; the census, the
-    /// sampler and the builds under the controller are the pieces after
-    /// this one, so it builds nothing yet.
+    /// second, moves between FITS and SUSPECT on it, samples the partitions
+    /// and buys the form by the ski rental or on the model's prediction,
+    /// builds or attaches its files (and, past the budget's share
+    /// `Options::zpages_land_pct`, builds them ahead at the landings), and
+    /// leaves the form when the reads stop blocking (`docs/engine.md`, the
+    /// controller).
     Auto,
 }
 
@@ -12499,6 +12502,15 @@ struct State {
     forms_bytes: AtomicUsize,
 }
 
+/// What a reader takes for a published form newer than the position it
+/// reads at: a wide mark, which every reader of a slot builds its own for.
+static NEWER_FORM: Cached = Cached::Wide(WideBlock {
+    sorted: Vec::new(),
+    seen: 0,
+    covered: false,
+    walks: 0,
+});
+
 /// EXPERIMENT: a block form the writer keeps current at every commit,
 /// for every reader: the range-read structure written at ingest. A
 /// reader at the table's position walks it as one structure and builds
@@ -12508,6 +12520,14 @@ struct State {
 struct CanonicalForm {
     form: std::sync::Arc<Cached>,
     bytes: usize,
+    /// The write log position the form was published current to: a reader
+    /// takes it only at that position or after (`Reader::canonical`). The
+    /// table's position (`State::forms_at`) is asked once, at a scan's
+    /// start, and the slots are swapped in place by whoever publishes,
+    /// the slots first and the position after, so a publish landing
+    /// inside a scan put the next commit's forms in the hands of a reader
+    /// at the commit before it: a snapshot read a write made after it.
+    at: usize,
 }
 
 impl State {
@@ -12525,7 +12545,13 @@ impl State {
     /// its next look at the log (`Reader::rebase_tables`). It needs no
     /// writer's state, so whichever thread publishes may call it, pinned,
     /// since a slot it reads may be replaced and retired under it.
-    fn carry_published(&self, next: &mut State, pieces_only: bool, by_capacity: bool) -> u64 {
+    fn carry_published(
+        &self,
+        next: &mut State,
+        pieces_only: bool,
+        by_capacity: bool,
+        restamp: Option<usize>,
+    ) -> u64 {
         let np_cur = self.segs.partition_point(|s| s.level > 0);
         let np = next.segs.partition_point(|s| s.level > 0);
         if self.forms.len() < np_cur
@@ -12584,7 +12610,12 @@ impl State {
                 }
                 // SAFETY: the caller is pinned, and a form retired from a
                 // slot is freed only past every pinned reader.
-                let form = &unsafe { &*ptr }.form;
+                let src = unsafe { &*ptr };
+                let form = &src.form;
+                // A form keeps the position it was published at where the
+                // next state's log is this one's, and is current to the
+                // fresh table's first position where it is not (a freeze).
+                let at = restamp.unwrap_or(src.at);
                 let landed = landed_over.get(b).is_some_and(|&o| o);
                 let form = if (rebased && matches!(**form, Cached::Sparse(_))) || landed {
                     std::sync::Arc::new(Cached::Wide(WideBlock {
@@ -12605,6 +12636,7 @@ impl State {
                 let carried = Box::into_raw(Box::new(CanonicalForm {
                     form,
                     bytes: form_bytes,
+                    at,
                 }));
                 next.forms[p][b].store(carried, AtomicOrdering::Relaxed);
             }
@@ -12882,6 +12914,11 @@ struct Shared {
     /// to join a merge in flight before it plans (`Db::plan_joins_merge`),
     /// which is the window a landing otherwise falls in by chance.
     merge_hold: std::sync::atomic::AtomicU8,
+    /// A test's hold on the forms' position (`Db::hold_forms_position`):
+    /// while set, a publish swaps the forms into their slots and leaves
+    /// `forms_at` and `forms_complete` as they were, which is the state a
+    /// reader meets between a publish's slots and its position.
+    forms_position_hold: std::sync::atomic::AtomicBool,
     /// A seal's landing failed before its segments were published: no seal
     /// behind it in the queue lands from here, since a manifest a later
     /// landing wrote would cover the failed seal's sequence with its
@@ -19052,6 +19089,12 @@ impl Reader {
         }
     }
 
+    fn forms_position_held(&self) -> bool {
+        self.shared
+            .forms_position_hold
+            .load(AtomicOrdering::Acquire)
+    }
+
     fn canonical(&self, p: usize, b: usize) -> Option<&Cached> {
         let st = self.state();
         let e = st.forms.get(p)?.get(b)?.load(AtomicOrdering::Acquire);
@@ -19063,6 +19106,14 @@ impl Reader {
         // replacement, and this handle is pinned for the operation or is
         // the writer's own, which frees nothing while it reads.
         let e = unsafe { &*e };
+        // A form published past the position this read is at holds
+        // writes the read must not see: the block is the reader's own to
+        // build, as for a mark. A reader that found the table at its
+        // position found every form published up to it, so a form at or
+        // before it is the block as of that position.
+        if self.forms_bound().is_some_and(|n| e.at > n) {
+            return Some(&NEWER_FORM);
+        }
         Some(&e.form)
     }
 
@@ -19496,7 +19547,9 @@ impl Reader {
             covered: false,
             walks: 0,
         }));
-        self.publish_form(p, b, &marker);
+        // A mark is every reader's to build at any position, so its own
+        // position is no reader's business.
+        self.publish_form(p, b, &marker, 0);
     }
 
     /// EXPERIMENT: whether the forms are published now: always when
@@ -19514,7 +19567,7 @@ impl Reader {
     /// holds wide or no longer holds. Returns whether the table is
     /// current to this handle's tables afterwards, which it is not when
     /// nobody is publishing for and the blocks are left dirty.
-    fn publish_dirty(&self, force: bool) -> bool {
+    fn publish_dirty(&self, force: bool, at: usize) -> bool {
         if !self.publishing(force) {
             return false;
         }
@@ -19532,7 +19585,7 @@ impl Reader {
                 t.dirty[b] = false;
                 match t.slots[b].as_ref() {
                     Some(form) if !matches!(**form, Cached::Wide(_)) => {
-                        self.publish_form(p, b, form)
+                        self.publish_form(p, b, form, at)
                     }
                     _ => self.publish_marker(p, b),
                 }
@@ -19576,15 +19629,15 @@ impl Reader {
         {
             return;
         }
-        if self.publish_dirty(true) {
+        let at = mem.committed_log();
+        if self.publish_dirty(true, at) && !self.forms_position_held() {
             st.forms_complete
                 .store(self.fs().tables_complete.get(), AtomicOrdering::Release);
-            st.forms_at
-                .store(mem.committed_log(), AtomicOrdering::Release);
+            st.forms_at.store(at, AtomicOrdering::Release);
         }
     }
 
-    fn publish_form(&self, p: usize, b: usize, form: &std::sync::Arc<Cached>) {
+    fn publish_form(&self, p: usize, b: usize, form: &std::sync::Arc<Cached>, at: usize) {
         let st = self.state();
         let Some(slot) = st.forms.get(p).and_then(|f| f.get(b)) else {
             return;
@@ -19593,6 +19646,7 @@ impl Reader {
         let new = Box::into_raw(Box::new(CanonicalForm {
             form: form.clone(),
             bytes,
+            at,
         }));
         let old = slot.swap(new, AtomicOrdering::AcqRel);
         st.forms_bytes.fetch_add(bytes, AtomicOrdering::Relaxed);
@@ -20373,13 +20427,11 @@ impl Reader {
         // have committed past it meanwhile, and forms stamped with a
         // later position would be taken by a reader there without the
         // writes between.
-        if self.publish_dirty(false) {
+        let at = self.mem().committed_log().min(self.log_bound.get());
+        if self.publish_dirty(false, at) && !self.forms_position_held() {
             st.forms_complete
                 .store(self.fs().tables_complete.get(), AtomicOrdering::Release);
-            st.forms_at.store(
-                self.mem().committed_log().min(self.log_bound.get()),
-                AtomicOrdering::Release,
-            );
+            st.forms_at.store(at, AtomicOrdering::Release);
         }
         Ok(())
     }
@@ -23983,6 +24035,7 @@ impl Db {
             in_merge: std::sync::atomic::AtomicBool::new(false),
             seal_hold: std::sync::atomic::AtomicU8::new(0),
             merge_hold: std::sync::atomic::AtomicU8::new(0),
+            forms_position_hold: std::sync::atomic::AtomicBool::new(false),
             seal_wedged: std::sync::atomic::AtomicBool::new(false),
             fail_landing: std::sync::atomic::AtomicBool::new(false),
             fail_presync: std::sync::atomic::AtomicBool::new(false),
@@ -24480,6 +24533,7 @@ impl Db {
             in_merge: std::sync::atomic::AtomicBool::new(false),
             seal_hold: std::sync::atomic::AtomicU8::new(0),
             merge_hold: std::sync::atomic::AtomicU8::new(0),
+            forms_position_hold: std::sync::atomic::AtomicBool::new(false),
             seal_wedged: std::sync::atomic::AtomicBool::new(false),
             fail_landing: std::sync::atomic::AtomicBool::new(false),
             fail_presync: std::sync::atomic::AtomicBool::new(false),
@@ -26251,7 +26305,7 @@ impl Db {
             carried.set(carry);
             let mut next = Db::frozen_over(cur, &fresh, from);
             if carry {
-                cur.carry_published(&mut next, pieces_only, by_capacity);
+                cur.carry_published(&mut next, pieces_only, by_capacity, Some(0));
                 next.forms_at = AtomicUsize::new(0);
                 next.forms_complete = std::sync::atomic::AtomicBool::new(complete);
             }
@@ -26371,7 +26425,8 @@ impl Db {
         // before writing it: the lag sweep's burst at a hundred thousand
         // keys wrote in 400 ms against 130 with the forms carried, most
         // of it those clones.
-        self.publish_dirty(false);
+        // Filed to the log's end by the read and the settle above.
+        self.publish_dirty(false, self.mem().log_len());
         true
     }
 
@@ -26507,7 +26562,7 @@ impl Db {
                 layout: cur.layout.clone(),
             };
             if carry {
-                cur.carry_published(&mut next, pieces_only, by_capacity);
+                cur.carry_published(&mut next, pieces_only, by_capacity, None);
                 next.forms_at = AtomicUsize::new(cur.forms_at.load(AtomicOrdering::Acquire));
                 next.forms_complete = std::sync::atomic::AtomicBool::new(
                     cur.forms_complete.load(AtomicOrdering::Acquire),
@@ -27463,6 +27518,17 @@ impl Db {
     #[doc(hidden)]
     pub fn hold_seal_landing(&self, on: bool) {
         self.set_seal_hold(SEAL_HOLD_LANDING, on);
+    }
+
+    /// A test's: while `on`, a publish of the forms swaps them into their
+    /// slots and leaves the position they are current to and their
+    /// completeness where they were, as a reader finds them between the
+    /// publish's slots and its position.
+    #[doc(hidden)]
+    pub fn hold_forms_position(&self, on: bool) {
+        self.shared
+            .forms_position_hold
+            .store(on, AtomicOrdering::Release);
     }
 
     /// A test's: while `on`, a merge's thread waits before it returns its
@@ -33826,6 +33892,7 @@ impl Maint {
                     &mut next,
                     self.opts.forms_pieces_only,
                     self.opts.forms_to_fit,
+                    None,
                 )
             };
             let p = Box::into_raw(Box::new(next));
@@ -37522,6 +37589,7 @@ mod sweep_gate {
             let form = Box::into_raw(Box::new(CanonicalForm {
                 form: std::sync::Arc::new(Cached::Clean),
                 bytes: 0,
+                at: 0,
             }));
             let epoch = db.shared.readers.epoch.load(AtomicOrdering::SeqCst);
             db.shared.retired_forms.push(epoch + 1, RetiredForm(form));
