@@ -2802,6 +2802,114 @@ LTO inlines. Quote a price from the function that holds the inlined read,
 with the probe's source identical for the base and the head, and never set a
 threshold at the figure.
 
+**A price read off a thread that was not running.** The controller's
+sampler times its own touches and reads its wall less its CPU as the
+price of a fault, and it ran under `SCHED_IDLE` beside the read pass:
+five to seven milliseconds a fault, where the readers' own faults took
+forty microseconds and the sampler's took thirty with no reader beside
+it. The wait was the scheduler's, and the controller priced the attach
+of form files already on disk above their build with it, and took nine
+to sixteen seconds to sample at all. Its I/O class changed nothing; its
+CPU class did (`Options::zpages_sample_idle`). The rule: a wait measured as wall less CPU on a
+thread of a low class is the class's until the same quantity on a thread
+at the readers' class says otherwise, and a cost taken from it is read
+beside that before anything is priced on it.
+
+**A wait that read its baseline after causing what it waits for.** The
+tests' tick wait moved the injected clock and then read the step count it
+waited to see move; a tick the segment work's thread took between the two
+was in the count already, and the wait sat out its minute for a step
+nothing would make. It failed a run of the file in three once the builds
+ahead woke that thread at every build's end, and a stack dump of the
+stalled run, every segment work thread idle in its sleep and none blocked,
+is what said the wait and not the engine was wrong. The count is read
+before the clock moves now (`advance_tick`). The rule: a wait reads its
+baseline before it causes the event, never after.
+
+**A bet whose loss cost what it was placed beside.** The builds ahead at
+landing bet that a store passing a share of its budget will pass the
+whole, and the first version built as a bought build does: it dropped the
+raw records behind it, and its file took the page cache. A store of three
+million keys that fits read at a twelfth of its rate after the load, since
+its raw form had lost the cache, and the refaults that followed read as
+the group's pressure, which bought the files, rebuilt them in the coding
+the pick chose and installed a form a store in memory loses to. A build
+ahead leaves the raw form's cache as it found it now: no drop behind it,
+and its own file written back and dropped a piece at a time while the raw
+form fits. Dropped only at the file's end, its dirty pages still pushed
+the raw form out and the store still bought in two reps of three. The
+rule: work done on a bet leaves what the present form needs as it found
+it, so that losing the bet costs the work and nothing else, and the case
+priced first is the one where the bet is lost.
+
+**A verdict on an option whose condition the run never met.** The attach
+bought on the prediction fires where the sampler finds the form files on
+disk, and it was paired at five million keys under 640 MiB and read
+"level, the rest by position", and turned off -- while the builds ahead
+left four to seven of nineteen partitions to the controller in every rep,
+so the condition, every file on disk, held in none, and the two arms ran
+the same code. The figures the shift's paragraph quoted for the builds
+ahead came from the build before the fix that made them leave the raw
+form's cache alone, which cost them the partitions the fix's kept records
+pushed out; nobody re-took them, and the trace's own count of files on
+disk at the sample said 12-16 where the paragraph said nineteen. The
+rule: a pairing of an option is read after the count that says its
+mechanism fired in its arm, and a figure written down for the shipped
+shape is taken again after any change to the path that made it.
+
+**A pass that reads what it replaces keeps it.** A build ahead reads a
+partition's records to write its form, and the reads make those records
+the page cache's most recently used: past the budget the kernel evicted
+the records of the partitions still to be built, written once by the load
+and never read, before the ones already built, and the builder, oldest
+first, found its next partition cold every other time. Dropping the
+records behind the build once the store is past the line the controller
+would buy at, and at the look that first finds it there swapping every
+built partition's records for its form file, took the files on disk at
+the sample from 12-16 of 19 to 18-19 (the entry after this one says where
+that line is). The
+rule: a pass that reads one population to replace it leaves the read one
+the most recent, so where the cache cannot hold both it gives back what it
+has read, or the eviction takes what it has not.
+
+**A posture taken at the budget's line that pays only far past it.** The
+builds ahead stop sparing the raw form's cache once the store is past its
+budget, since past it the raw form cannot be held; the first version drew
+that at the budget itself. The suite's process grows its own memory across
+a sitting's reps, and a store of three million keys under 640 MiB that had
+fit ended its load a few percent past a budget of 380-414 MiB, the model
+reading a few faults in a hundred reads: the crossing swapped out a quarter
+of its records, and its read pass ran ten times longer than the
+controller's without the builds ahead, which kept nearly all of itself
+resident. The same store's refaults from the load bought an attach the
+vanish rule cancelled a second later. The line is the selector's own to
+enter now, by the model's prediction alone. The rule: a decision that
+gives up part of the present form is drawn where the controller would
+give up the form, not where the form first stops fitting, since just past
+the budget the form still holds nearly all of itself; and a line read
+from a budget that moves is checked at both its ends of a sitting, since
+the process's own memory moves it.
+
+**A write that asked for no flush, paid by the next one that did.** The
+builds ahead write their form files back as they go, by
+`sync_file_range`, so that a store that fits keeps its cache for the raw
+form, and never fsynced them, since a form file is regenerable and
+checked page by page at its attach. `sync_file_range` puts the pages in
+the device's write-back cache and asks for no flush, and the next fsync
+anyone issues pays it: at three million keys the builds ended after the
+load's last commit, and the first twenty-five commits of ycsb-B after the
+read passes took 74-1,690 ms where they take ten, while its reads were
+level and the A mix after it was level too -- the mixes' time by kind
+named the commits, and nothing else in the trace moved. The builder
+syncs each file it wrote back once the file has its name now
+(`Options::zpages_build_sync`), on its own thread, for the flush alone.
+Syncing the files kept dirty past the line as well put 50-160 ms each on
+the builder, which races the eviction front there. The rule: a write
+handed to the device without a flush is a flush owed, and it is paid by
+whoever syncs next; a background writer that leaves its flush owed puts
+it on the foreground's next commit, so it pays its own where that costs
+it nothing it needs.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

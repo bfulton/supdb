@@ -4231,3 +4231,270 @@ encoder's against 0.960, in 53.0-55.2 sequences a group against 51.9
 (`zlazy-1m.log`): the positions inside a match are what the later matches
 are found through, so leaving them out gives back the parse's sequences
 faster than it saves the insert. Taken out again.
+
+## The raw drop held for the install, and the controller's build timed (`e1cb5a2`)
+
+Under `Auto` the drop of a served partition's raw pages
+(`Options::zpages_drop_raw`) went at each attach, while the gate still sent
+reads to the raw form: the reads the census counted before the install were
+of a raw form with its pages given back. It waits for the gate's turn to the
+form now (`Options::zpages_drop_at_install`, on; `...dropattach` is the drop
+at each attach), and with it the drop is the engine's default. Paired at five
+million keys under 640 MiB, the combined arm with the drop against it without
+(`autodrop-auto-ab-{1,2}.*`, sitting 2 in the other order): C 1.43 / 1.24,
+D 1.41 / 1.69, E 1.35 / 1.20, A level, the passes before the install level.
+
+Each build now reports its wall, its thread's CPU and its major faults
+(`zbuild` under `SUPDB_ZPAGES_TRACE`, `zbuildtime-5m.*`): 0.3-3.3 s of wall a
+partition on 0.1-0.34 s of CPU, about thirty seconds from the buy to the
+install, a tenth of it CPU and the rest the raw records read back from the
+device beside the readers' faults. The one partition built from records
+still in the page cache took 0.32 s of wall and 3 faults.
+
+## The shift brought to the load's end: builds at the landings, the sampler, the census and the attach
+
+The minute from a load's end to the install, taken apart with the trace
+(`land-probe50*.err`, one traced pair each), was six things in turn, each
+found once the one before it was gone:
+
+- The build itself, thirty seconds re-reading the raw records from the
+  device. Under `Options::zpages_land_pct` the builds ahead start once the
+  raw populations pass the percent of the budget, read at every tick
+  (`Maint::z_land_look`; read with the model once a second, the line was
+  found up to a second late and the oldest partitions were leaving the cache
+  by then), and go on beside the seals landing, never beside a merge, the
+  oldest partition first by its sequence and the id it was made under (a
+  direct run's partitions all end at sequence zero, and a sort by sequence
+  alone went by key order), each from records the page cache holds at least
+  half of by `mincore` (`LAND_RESIDENT`; at nine tenths four partitions of
+  nineteen read under the bar as the eviction front passed them and were
+  built after the buy from colder pages, one with 47 faults; a partition
+  found colder is marked and left to the controller, `ZCounts::ahead_cold`).
+  At fifty percent every partition of the ordered load is built from memory,
+  0.1-0.2 s each, the last about a second after the load's end.
+- The sampler, nine to sixteen seconds: under `SCHED_IDLE` beside the read
+  pass, its wall less its CPU, read as the price of a fault, came out at six
+  to seven milliseconds where the readers' faults took forty microseconds
+  and its own with no reader beside it thirty. Its I/O class was not it (at
+  the readers' class it read the same); the CPU class was: at the normal
+  class it samples in 0.2 s at 27 µs a fault (`Options::zpages_sample_idle`,
+  off; `...dropsampleidle`). Paired on the base, which builds nothing ahead
+  (`lp-sampleidle-5000000-*`), the sampler at the normal class installs about
+  twenty seconds sooner and the cells read by position, the arm second in
+  each sitting 5-15% behind: unresolved by rate there, and with files built
+  ahead the buy cannot come before the sample.
+- The price of the buy: with the sampler's fault at 5-7 ms the attach of the
+  files built ahead was priced above their build (12-17 s against 5-7), and
+  a set with some files on disk was priced as the whole build. The attach is
+  priced at a fault the sampler now measures, and a partial set as the
+  attach of what is on disk and the build of the rest.
+- The rent, which accrues from the census, and the census counted handles
+  alone: the suite's single-threaded passes read through the writer, so the
+  rent waited for the threaded passes, eight to ten seconds after the reads
+  began. The writer's reads are counted through its engine slot now while
+  the gate is the census's (`Options::zpages_writer_census`, on;
+  `...dropnowritercensus`), and a writer operation that is not a read adds
+  nothing to a window's busy wall. Counted under the form's gate as well, the
+  first version cost the writer's mixes after the install a twentieth to a
+  quarter in both sittings (`cut/lp-nowritercensus-*-countedunderz.*`, C 0.72
+  and 0.87, B 0.77 and 0.86), and the exits read the handles' windows as
+  before it. Counted under the census's gate alone, paired on the base,
+  whose controller is still deciding through the mixes at this pass
+  length (`lp-nowritercensus-5000000-*`, counted over not): the reads and
+  the scan pass level by position, A 0.93 / 0.84 and F 0.86 / 0.93 in the
+  two orders, the other mixes either way, none of it resolved at three
+  pairs. A counted read costs two clock reads and a few loads and stores
+  of the window, its syscalls amortised over a window of a fixed wall,
+  which predicts a few percent of an A or F operation and not the tenth
+  the cells read; an open question, and under the builds ahead the census
+  gate after a load lasts two seconds.
+- The evidence: the rent counts an interval only once the group's refaults
+  are half the faults over five seconds, which keeps a restart's first
+  touches from buying a build, and after the load that share came seven to
+  eight seconds after the sample in every rep, with the buy's price at
+  0.08 s. Where the sampler finds form files on disk for the share of the
+  keys whose attach installs the form (`zselect::COVERED_ENOUGH`; at first
+  every file) the purchase is mostly an attach, and it is bought on the
+  model's prediction once the partitions have settled for the eager
+  entry's two seconds, every other clause standing, once before any exit or
+  cancel (`Options::zpages_attach_eager`, on; `ZSelect::set_attach_eager`;
+  `...dropland50noattacheager`; its pairings below).
+- The attach: the build turn took the first partition due a job, and a
+  partition attached and not yet warmed is due its warm, so the attaches of
+  the files built ahead went one a warm, each warm a whole file at idle
+  priority under the readers, ten seconds for nineteen. Every file on disk is
+  attached in the turn that buys now (`Options::zpages_attach_first`, on;
+  `...dropland50attachwarm`; its pairing below), the install 0.2-0.4 s
+  after the buy.
+
+A file built ahead before the sampler's coding pick takes the options'
+coding; where the pick is the raw tails, the buy gives it back unattached
+and builds the partition again (`ZCounts::ahead_recoded`).
+
+With those, at five million keys under 640 MiB, the land arm installs 2.2 s
+after the load's end where the base installs at about forty. Paired at fifty
+percent against the base (`lp-land50b-5000000-{1,2}.*`, sitting 2 in the
+other order, land over base): the read pass 1.65 / 1.43, the threaded reads
+7.6-9.2, the scan pass 11.4 / 9.6, its threaded passes 5.5 / 5.9 and 1.04 /
+1.17, the mixes 0.99-1.25, every read cell in all six pairs; the ordered
+load 0.89 in all six, the builds beside it.
+
+A store that fits pays for the bet, and the first pairing at three million
+keys under 640 MiB, which fits, read the land arm at a twelfth of the
+base's rate (`lp-land50a-3000000-*`): the builds ahead dropped the raw
+records behind them as a bought build does, their files took the cache the
+raw form needed, and the refaults that followed read as the group's
+pressure, which put the store in SUSPECT, bought the files, gave the block
+coding back for the raw tails the pick chose and installed a form a store
+in memory loses to. A build ahead under the budget leaves the raw form's
+cache as it found it now: it drops no record behind it, since the raw form
+still serves, and its own file is written back and dropped a piece at a
+time, two pieces cached at most (`BuildPlan::drop_output`, `FileSink`);
+dropped only at the file's end, its dirty pages still pushed the raw form's
+out and the land arm still bought in two reps of three
+(`lp-land50b-3000000-*`). With the pieces dropped it buys nothing at three
+million keys and its read cells read level (`lp-land50-3000000-*`); the
+ordered load pays 0.94 and 0.82 for files nobody uses.
+
+That fix cost the five-million store what the first pairing had measured,
+and nothing said so until the traces of the next pairings were counted:
+the figures above (`lp-land50b-5000000-*`, nineteen files on disk at the
+sample, the install at 2.2 s) are of the build before it, and every
+five-million pairing after it -- the percent's seventy-five and a hundred,
+the attach entry's -- ran a land arm with twelve to sixteen of nineteen
+files on disk at the sample and the install seven to twenty-four seconds
+after the load (`land_read.py` over `cut/lp-noattacheager-5000000-neverfired-*`).
+Two things had moved. A build's reads leave the records it read the page
+cache's most recently used, so past the budget the kernel evicted the
+records of the partitions still to be built, written once by the load and
+never read, before the ones already built, and the builder, oldest first,
+found every other partition cold (`zahead ... cold` trace lines,
+`lp-keepbehind`). And the attach entry's condition, every file on disk,
+held in no rep, so its pairing ran the same code in both arms and its
+"level, the rest by position" was a verdict on nothing; it had been turned
+off on it.
+
+Past the whole budget the raw form cannot be held whatever is kept, so a
+build ahead past it drops its records behind it and keeps its file, and the
+look that first finds the store past it swaps every partition built under
+it the same way, its records dropped and its file asked back
+(`Options::zpages_land_drop_past`, `Maint::z_cross`,
+`ZCounts::ahead_swapped`; `...dropland50keepbehind` is the shape without
+either). The 3M ordered load never passes its budget (the model's raw
+prediction stays zero through it), so it is untouched. Dropping behind
+alone took the files on disk to 16-17 and the install to 3.5-8 s against
+12-16 and 8.5-25 (`cut/lp-keepbehind-5000000-droponly-*`); with the swap,
+18-19 (`cut/lp-keepbehind-5000000-crossing-noeager-*`, the read pass
+1.09 and 1.07 over keep-behind in the two orders, the scan pass 1.14 and
+1.01, the load 1.10 and 0.99) -- but the buy came eight to nine seconds
+after the load where keep-behind's came at two to six: the rent's evidence
+is the group's refaults, and records the store dropped itself come back as
+faults the kernel does not count as refaults. The attach entry is what
+buys there, and its condition is now the install's own: the files on disk
+cover `zselect::COVERED_ENOUGH` of the sampled partitions' keys
+(`Sampler::attach`), since an attach that installs the form is mostly what
+the purchase is. On again (`...dropland50noattacheager` is the rent
+alone).
+
+With those, land-50 against the base at five million keys under 640 MiB
+(`lp-land50c-5000000-{1,2}.*`, land over base, sitting 1 / sitting 2): the
+install 2.2 s after the load's end (2.8 once) against 38-58 s, eighteen or
+nineteen files on disk at the sample; the read pass 1.33 / 1.41, the
+threaded reads 6.1-7.7 / 5.9-7.7, the scan pass 10.5 / 10.2, its threaded
+passes 5.2 / 5.2 and 1.52 / 1.29; the ordered load 0.92 / 0.89 and the
+shuffled 0.85 / 0.92; the mixes E 1.02 / 1.03, A 1.14 / 0.93, B 0.96 /
+0.83, C 1.04 / 0.89, D 0.99 / 0.85, F 0.99 / 0.85 -- at `--ops-div 10` the
+base installs after the mixes, so they compare the form against the raw
+form still being built under the readers, and they read level in one
+order and a sixth behind in the other. Against LMDB at this bound the
+ordered load read 1.2-1.4x and the shuffled 11x (`ooc-cmp-lmdbforced`),
+so the loads stay won with the builds' tenth.
+
+The first pairing of that shape at three million keys
+(`cut/lp-land50c-3000000-crossbybytes-*`) read the land arm at a tenth to a
+sixteenth of the base on the read and scan passes. In that sitting the
+process's own memory had grown across the reps and the 3M store's budget
+was 380-414 MiB: the store ended its load a few percent past it, the model
+reading 0.01-0.06 faults a read, a store the controller rightly never buys
+for. Past the budget by a byte was enough for the crossing to swap out a
+quarter of its records, its read pass taking 2.7 s where it takes 0.25,
+and for the attach entry to buy on the group's refaults from the load, a
+buy the vanish rule cancelled a second later. Both now wait for the
+selector's own line: the crossing and the drop past it for the model's
+raw faults a read to reach `theta_enter(Read)` (0.13 at the prior costs;
+the 5M store reads 0.33 at its load's end, the 3M one 0.01-0.06), the
+attach entry for the model's predicted saving to pass the same line,
+never the group's pressure alone (the eager build entry, an arm, keeps
+its pressure term as it was priced). On that build
+(`lp-land50c-3000000-*`): the read pass 0.94 / 1.07 and the scan pass
+1.02 / 0.96, the ordered load 0.83 / 0.91; the one rep in four whose
+budget shrank past the line crossed and bought. At five million
+(`lp-land50c-5000000-*`): the install at 2.2 s in six reps of eight (14-15 s
+in two, with fourteen and seventeen files on disk), the read pass 1.39 /
+1.31, its threaded passes 6.3-7.9, the scan pass 8.8 / 7.9, its threaded
+passes 5.3-5.4 and 2.5-3.7, the ordered load 0.89 / 0.85 and the shuffled
+0.99 / 1.04, the mixes by position (0.86-1.0 with the land arm second,
+1.10-1.40 with it first).
+
+The percent, on that build, seventy-five against fifty at five million
+keys (`lp-land75v50-5000000-*`, seventy-five over fifty in the two orders):
+the ordered load 1.17 / 1.10, the read pass 0.60 / 0.56, its two-thread
+pass 0.21 / 0.44, the scans and the mixes level; seventy-five built twelve
+to seventeen partitions ahead and installed 2.6-25 s after the load,
+fifty eighteen in six reps of eight and 2.2 s in those (11.7 and 23.4 s
+in the two with fourteen and fifteen). A hundred starts later still, and
+the earlier pairings of seventy-five and a hundred against the base read
+them at 0.70-0.90 of it on the read pass. Fifty is the line that turns the
+read pass at this bound, and its price is a tenth of the ordered load,
+paid at three million keys as well, where it buys nothing; a store whose
+load ends far under its budget pays nothing.
+
+The attach entry against the rent alone, on that build
+(`lp-noattacheager-5000000-*`, entry over rent in the two orders): the
+read pass 1.81 / 1.84, its two-thread pass 2.7 / 2.1, the scan pass 0.80
+/ 1.24 and the mixes by position (0.96-1.11 with the entry first, 0.74-0.98
+with it second; both arms serve the form by then). Where eighteen or
+nineteen files stood on disk the entry bought 2.0 s after the load and the
+rent 7.8-9.3 s; with fifteen to seventeen the files on disk cover less than
+the install asks and both waited for the rent. On. (Its first pairing,
+`cut/lp-noattacheager-5000000-neverfired-*`, ran it where it never fired.)
+
+The attach turn, every file first against one a warm
+(`lp-attachwarm-5000000-*`, first over warm in the two orders): the read
+pass 1.81 / 2.09, its two-thread pass 1.93 / 1.70, the scans and the mixes
+level; the install 2.2-2.7 s after the load against nine to eleven with
+eighteen files on disk. On.
+
+The 3M B mix read slower with the builds ahead in six reps of eight, with
+no fault in either arm. The mixes' time by kind (`lk-land50c-3000000-*`,
+`SUPDB_MIX_KINDS`) named B's twenty-five commits, the first after the
+load and the read passes: 51-198 ms in the land arm's reps against 7.5-28
+in the base's, its reads level and A's 250 commits after it level. The
+form files built below the line go to the device by `sync_file_range`,
+which asks for no flush of its write-back cache, and the first fsync after
+them paid it. The builder syncs each such file once named now
+(`Options::zpages_build_sync`, `zfile::BuildPlan::sync`;
+`...dropland50nobuildsync` is the shape without): paired at three million
+(`lk-buildsync-3000000-*`), B's commits took 10-13 ms in every rep with
+the sync and 74-1,690 without, B read 2.8x and 17x in the two orders, the
+load and the read pass level. Synced at every build, the files kept dirty
+past the line cost the builder 46-162 ms each at five million keys,
+137-270 ms a store (`cut/lp-buildsync-5000000-syncall-*`), on the thread
+that races the eviction front, and its arm read four slow installs of four
+in one order; so only the files written back as built are synced, 10-19
+ms a store. Paired at five million (`lp-buildsync-5000000-*`, synced over
+not): the load 1.01 / 0.94, the read pass level in one order and 0.44 in
+the other, the scans level and the mixes either way; the slow installs
+(fourteen to seventeen files on disk, 11-22 s after the load) came in four
+reps of eight for the synced arm and two for the other, nine of sixteen
+against five over both five-million pairings, which no pairing of three
+resolves (Fisher p 0.3) and which both arms show: it stands beside the
+residency variance as the open question there.
+
+The tests' tick wait read the step count after moving the injected clock,
+so a tick the segment work's thread took in between was in the count
+already and the wait sat out its minute; the builds ahead woke that thread
+into the window often enough to fail a run of the file in three, in two
+tests that build nothing ahead as well. The count is read before the clock
+moves now (`advance_tick`); a stack dump of the stalled run by `gdb` showed
+every segment work thread idle in its sleep, which is what said so.

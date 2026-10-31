@@ -1,0 +1,427 @@
+11002.07 bench: bound 671088640 bytes in group /sys/fs/cgroup/memory/process_api/01a18f55-9b80-7787-9e37-28a8abc539d0/claude-code-bash/supdb-bench-5362
+11002.07 bench ab: supdb-cache64tofitautozpagesdrop against supdb-cache64tofitautozpagesdropland50 at 3000000 keys, scans of 100, 3 pairs after a warmup, under a bound of 671088640 bytes, passes load,read,read-threaded,scan,scan-threaded,mixes, ops divided by 10
+11002.11 phasemark supdb-cache64tofitautozpagesdrop load start 11002.118505099
+11002.12 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 594415616 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 0/0 gen cbf29ce484222325 inflight 000
+11003.16 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 2.8578271978871435, budget: 562171904 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 16777216/143867840 gen ff6006819a52c68d inflight 001
+11004.05 phasemark supdb-cache64tofitautozpagesdrop load sync 11004.054919982
+11004.08 phasemark supdb-cache64tofitautozpagesdrop load end 11004.084797873
+11004.08 phasemark supdb-cache64tofitautozpagesdrop read start 11004.085081560
+11004.21 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 1.9090282902729938, budget: 555794432 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11004.31 phasemark supdb-cache64tofitautozpagesdrop read end 11004.311029865
+11004.71 phasemark supdb-cache64tofitautozpagesdrop scan start 11004.711377795
+11004.72 phasemark supdb-cache64tofitautozpagesdrop scan end 11004.720860810
+11005.22 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 555773952 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11006.24 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 553426944 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11006.45 phasemark supdb-cache64tofitautozpagesdrop ycsb-C start 11006.452924987
+11006.52 mixkinds supdb-cache64tofitautozpagesdrop C size 3000000 ops 50000 gets 50000 18.866 scans 0 0.000 commits 1 0.001 total 23.267
+11006.52 phasemark supdb-cache64tofitautozpagesdrop ycsb-C end 11006.520617929
+11006.52 phasemark supdb-cache64tofitautozpagesdrop ycsb-B start 11006.520795051
+11006.60 mixkinds supdb-cache64tofitautozpagesdrop B size 3000000 ops 50000 gets 47512 20.343 scans 0 0.000 commits 25 11.530 total 36.980
+11006.60 phasemark supdb-cache64tofitautozpagesdrop ycsb-B end 11006.600313767
+11006.60 phasemark supdb-cache64tofitautozpagesdrop ycsb-A start 11006.600483045
+11006.77 mixkinds supdb-cache64tofitautozpagesdrop A size 3000000 ops 50000 gets 25066 17.857 scans 0 0.000 commits 250 102.993 total 131.904
+11006.77 phasemark supdb-cache64tofitautozpagesdrop ycsb-A end 11006.776656453
+11006.78 phasemark supdb-cache64tofitautozpagesdrop ycsb-F start 11006.776898012
+11006.99 mixkinds supdb-cache64tofitautozpagesdrop F size 3000000 ops 50000 gets 50000 31.950 scans 0 0.000 commits 252 114.760 total 158.127
+11006.99 phasemark supdb-cache64tofitautozpagesdrop ycsb-F end 11006.994326880
+11006.99 phasemark supdb-cache64tofitautozpagesdrop ycsb-D start 11006.994518239
+11007.05 mixkinds supdb-cache64tofitautozpagesdrop D size 3000000 ops 50000 gets 47535 36.873 scans 0 0.000 commits 25 13.924 total 54.103
+11007.05 phasemark supdb-cache64tofitautozpagesdrop ycsb-D end 11007.048660127
+11007.05 phasemark supdb-cache64tofitautozpagesdrop ycsb-E start 11007.048845491
+11007.19 mixkinds supdb-cache64tofitautozpagesdrop E size 3000000 ops 50000 gets 0 0.000 scans 47478 77.902 commits 26 16.847 total 100.255
+11007.19 phasemark supdb-cache64tofitautozpagesdrop ycsb-E end 11007.191534698
+11007.54 phasemark supdb-cache64tofitautozpagesdrop load start 11007.545955138
+11007.54 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 569888768 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 0/0 gen cbf29ce484222325 inflight 000
+11008.59 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 448700416 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 0/0 gen cbf29ce484222325 inflight 000
+11009.62 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 406597632 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 0/0 gen cbf29ce484222325 inflight 101
+11010.72 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 21237.49857297886, budget: 373297152 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 12582912/143840000 gen 1f3cf82d81475279 inflight 100
+11011.38 phasemark supdb-cache64tofitautozpagesdrop load sync 11011.386062266
+11013.45 zselect Suspect gate 1 census true build false sample true event Some(Suspect) model Some(Model { phi_raw: 0.19380837372881496, phi_z: None, phi_z_scan: None, refault_rate: 112584.18114396986, budget: 350236672 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 50331648/372000000 gen 322ab5b94a7bd787 inflight 000
+11013.70 phasemark supdb-cache64tofitautozpagesdrop load end 11013.702476245
+11014.06 phasemark supdb-cache64tofitautozpagesdropland50 load start 11014.062614550
+11014.06 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 522067968 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 0/0 gen cbf29ce484222325 inflight 000
+11015.11 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 493223936 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 16777216/143867840 gen ff6006819a52c68d inflight 000
+11015.52 zbuild t=1.5 par-00000000-0000000000000000--30303030303030303030323930303030.sup ahead wall_ms 119 cpu_ms 117 majflt 0 file_mb 22.7 asked_mb 36.0 collect_ms 210 gap_ms 0
+11015.73 zbuild t=1.7 par-00000001-0000000000000000-30303030303030303030323930303030-30303030303030303030353830303030.sup ahead wall_ms 124 cpu_ms 121 majflt 0 file_mb 22.7 asked_mb 36.0 collect_ms 203 gap_ms 1
+11015.94 zbuild t=1.9 par-00000002-0000000000000000-30303030303030303030353830303030-30303030303030303030383730303030.sup ahead wall_ms 138 cpu_ms 134 majflt 0 file_mb 22.7 asked_mb 36.0 collect_ms 209 gap_ms 1
+11016.05 phasemark supdb-cache64tofitautozpagesdropland50 load sync 11016.053603260
+11016.08 phasemark supdb-cache64tofitautozpagesdropland50 load end 11016.081467257
+11016.08 phasemark supdb-cache64tofitautozpagesdropland50 read start 11016.081794088
+11016.14 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 484028416 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11016.14 zbuild t=2.1 par-00000003-0000000000000000-30303030303030303030383730303030-30303030303030303031313630303030.sup ahead wall_ms 156 cpu_ms 146 majflt 0 file_mb 22.7 asked_mb 36.0 collect_ms 207 gap_ms 1
+11016.25 zbuild t=2.2 par-00000004-0000000000000000-30303030303030303031313630303030-30303030303030303031333233303030.sup ahead wall_ms 66 cpu_ms 65 majflt 0 file_mb 12.8 asked_mb 20.2 collect_ms 107 gap_ms 0
+11016.32 phasemark supdb-cache64tofitautozpagesdropland50 read end 11016.319003164
+11016.36 zbuild t=2.3 par-00000005-0000000000000000-30303030303030303031333233303030-30303030303030303031343836303030.sup ahead wall_ms 66 cpu_ms 65 majflt 0 file_mb 12.8 asked_mb 20.2 collect_ms 107 gap_ms 0
+11016.46 zbuild t=2.4 par-00000006-0000000000000000-30303030303030303031343836303030-30303030303030303031363439303030.sup ahead wall_ms 66 cpu_ms 65 majflt 0 file_mb 12.8 asked_mb 20.2 collect_ms 107 gap_ms 0
+11016.57 zbuild t=2.5 par-00000007-0000000000000000-30303030303030303031363439303030-30303030303030303031383132303030.sup ahead wall_ms 65 cpu_ms 65 majflt 0 file_mb 12.8 asked_mb 20.2 collect_ms 106 gap_ms 0
+11016.68 phasemark supdb-cache64tofitautozpagesdropland50 scan start 11016.686226669
+11016.69 phasemark supdb-cache64tofitautozpagesdropland50 scan end 11016.695692788
+11016.77 zbuild t=2.7 par-00000008-0000000000000000-30303030303030303031383132303030-30303030303030303032303636303030.sup ahead wall_ms 104 cpu_ms 101 majflt 0 file_mb 19.9 asked_mb 31.5 collect_ms 205 gap_ms 0
+11016.98 zbuild t=2.9 par-00000009-0000000000000000-30303030303030303032303636303030-30303030303030303032333230303030.sup ahead wall_ms 103 cpu_ms 101 majflt 0 file_mb 19.9 asked_mb 31.5 collect_ms 204 gap_ms 0
+11017.19 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 481939456 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11017.19 zbuild t=3.1 par-00000010-0000000000000000-30303030303030303032333230303030-30303030303030303032353734303030.sup ahead wall_ms 104 cpu_ms 102 majflt 0 file_mb 19.9 asked_mb 31.5 collect_ms 206 gap_ms 0
+11017.39 zbuild t=3.3 par-00000011-0000000000000000-30303030303030303032353734303030-30303030303030303032383238303030.sup ahead wall_ms 104 cpu_ms 102 majflt 0 file_mb 19.9 asked_mb 31.5 collect_ms 205 gap_ms 0
+11017.49 zbuild t=3.4 par-00000012-0000000000000000-30303030303030303032383238303030-.sup ahead wall_ms 70 cpu_ms 69 majflt 0 file_mb 13.5 asked_mb 21.3 collect_ms 100 gap_ms 0
+11018.20 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 481832960 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11018.35 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-C start 11018.350566106
+11018.41 mixkinds supdb-cache64tofitautozpagesdropland50 C size 3000000 ops 50000 gets 50000 18.484 scans 0 0.000 commits 1 0.000 total 22.905
+11018.42 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-C end 11018.417782045
+11018.42 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-B start 11018.417930832
+11018.56 mixkinds supdb-cache64tofitautozpagesdropland50 B size 3000000 ops 50000 gets 47512 20.430 scans 0 0.000 commits 25 75.308 total 100.929
+11018.56 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-B end 11018.561519755
+11018.56 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-A start 11018.561694470
+11018.71 mixkinds supdb-cache64tofitautozpagesdropland50 A size 3000000 ops 50000 gets 25066 14.430 scans 0 0.000 commits 250 83.781 total 107.297
+11018.71 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-A end 11018.713095448
+11018.71 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-F start 11018.713300531
+11018.87 mixkinds supdb-cache64tofitautozpagesdropland50 F size 3000000 ops 50000 gets 50000 24.154 scans 0 0.000 commits 252 70.391 total 104.284
+11018.87 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-F end 11018.875625351
+11018.87 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-D start 11018.875811339
+11018.92 mixkinds supdb-cache64tofitautozpagesdropland50 D size 3000000 ops 50000 gets 47535 37.066 scans 0 0.000 commits 25 10.441 total 51.407
+11018.92 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-D end 11018.927252194
+11018.93 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-E start 11018.927413229
+11019.07 mixkinds supdb-cache64tofitautozpagesdropland50 E size 3000000 ops 50000 gets 0 0.000 scans 47478 78.840 commits 26 10.850 total 95.284
+11019.07 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-E end 11019.069707005
+11019.46 phasemark supdb-cache64tofitautozpagesdropland50 load start 11019.466434321
+11019.46 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 503152640 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 0/0 gen cbf29ce484222325 inflight 000
+11020.50 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 396062720 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 0/0 gen cbf29ce484222325 inflight 000
+11021.66 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 21025.262060267833, budget: 329801728 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 12582912/143840000 gen 1f3cf82d81475279 inflight 000
+11022.99 zselect Suspect gate 1 census true build false sample true event Some(Suspect) model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 68692.37381995193, budget: 355954688 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 25165824/244280000 gen bcac793e4757054e inflight 000
+11022.99 zahead t=3.5 par-00000021-0000000001971970--30303030303030303030343939363833.sup cold resident 0.000 past false
+11022.99 zahead t=3.5 par-00000022-0000000001971970-30303030303030303030343939363833-30303030303030303030393939343734.sup cold resident 0.000 past false
+11023.20 zbuild t=3.7 par-00000023-0000000001971970-30303030303030303030393939343734-30303030303030303031353030313134.sup ahead wall_ms 171 cpu_ms 149 majflt 1 file_mb 25.7 asked_mb 40.7 collect_ms 212 gap_ms 0
+11023.23 phasemark supdb-cache64tofitautozpagesdropland50 load sync 11023.234144149
+11025.43 zahead t=6.0 crossed swapped 0 asked_mb 0.0
+11025.43 zsample partitions 6 declined false on_disk 0 keys 1970000 records 244280000 w_z 234369152 resident 3813504 build_cpu 0.3124 c_build 0.4686 t_f None decode_per_page 1.101e-6 coding Some(RawTails) w_z_raw 234369152
+11025.43 zselect Suspect gate 1 census true build false sample true event None model Some(Model { phi_raw: 0.299192904336296, phi_z: None, phi_z_scan: None, refault_rate: 78535.345441867, budget: 311074816 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults Some(160361) saving [None, None] vanished 0 theta 0.1327/0.0442 foot 50331648/372000000 gen b1e28751a5c7e21f inflight 000
+11025.44 zahead t=6.0 par-00000062-0000000003003000-30303030303030303030393939343734-30303030303030303031323439373934.sup cold resident 0.000 past true
+11025.44 zahead t=6.0 par-00000063-0000000003003000-30303030303030303031323439373934-30303030303030303031353030313134.sup cold resident 0.000 past true
+11025.44 zahead t=6.0 par-00000064-0000000003003000-30303030303030303031353030313134-30303030303030303031373530323536.sup cold resident 0.000 past true
+11025.44 zahead t=6.0 par-00000065-0000000003003000-30303030303030303031373530323536-30303030303030303032303030333937.sup cold resident 0.000 past true
+11025.70 phasemark supdb-cache64tofitautozpagesdropland50 load end 11025.702205103
+11025.93     24s  rep 0/3 (warmup)
+11025.96 phasemark supdb-cache64tofitautozpagesdropland50 load start 11025.968330041
+11025.97 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 477577216 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 0/0 gen cbf29ce484222325 inflight 000
+11027.02 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 453107712 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 16777216/143867840 gen ff6006819a52c68d inflight 000
+11027.32 zbuild t=1.4 par-00000000-0000000000000000--30303030303030303030323930303030.sup ahead wall_ms 128 cpu_ms 118 majflt 0 file_mb 22.7 asked_mb 36.0 collect_ms 204 gap_ms 0
+11027.53 zbuild t=1.6 par-00000001-0000000000000000-30303030303030303030323930303030-30303030303030303030353830303030.sup ahead wall_ms 122 cpu_ms 119 majflt 0 file_mb 22.7 asked_mb 36.0 collect_ms 208 gap_ms 1
+11027.74 zbuild t=1.8 par-00000002-0000000000000000-30303030303030303030353830303030-30303030303030303030383730303030.sup ahead wall_ms 132 cpu_ms 131 majflt 0 file_mb 22.7 asked_mb 36.0 collect_ms 211 gap_ms 1
+11027.87 phasemark supdb-cache64tofitautozpagesdropland50 load sync 11027.878021098
+11027.90 phasemark supdb-cache64tofitautozpagesdropland50 load end 11027.908556829
+11027.91 phasemark supdb-cache64tofitautozpagesdropland50 read start 11027.908894421
+11027.96 zbuild t=2.0 par-00000003-0000000000000000-30303030303030303030383730303030-30303030303030303031313630303030.sup ahead wall_ms 131 cpu_ms 119 majflt 0 file_mb 22.7 asked_mb 36.0 collect_ms 210 gap_ms 1
+11028.06 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 447119360 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11028.07 zbuild t=2.1 par-00000004-0000000000000000-30303030303030303031313630303030-30303030303030303031333233303030.sup ahead wall_ms 68 cpu_ms 67 majflt 0 file_mb 12.8 asked_mb 20.2 collect_ms 109 gap_ms 0
+11028.14 phasemark supdb-cache64tofitautozpagesdropland50 read end 11028.142204937
+11028.17 zbuild t=2.2 par-00000005-0000000000000000-30303030303030303031333233303030-30303030303030303031343836303030.sup ahead wall_ms 67 cpu_ms 66 majflt 0 file_mb 12.8 asked_mb 20.2 collect_ms 108 gap_ms 0
+11028.28 zbuild t=2.3 par-00000006-0000000000000000-30303030303030303031343836303030-30303030303030303031363439303030.sup ahead wall_ms 69 cpu_ms 67 majflt 0 file_mb 12.8 asked_mb 20.2 collect_ms 110 gap_ms 0
+11028.39 zbuild t=2.4 par-00000007-0000000000000000-30303030303030303031363439303030-30303030303030303031383132303030.sup ahead wall_ms 68 cpu_ms 67 majflt 0 file_mb 12.8 asked_mb 20.2 collect_ms 109 gap_ms 0
+11028.53 phasemark supdb-cache64tofitautozpagesdropland50 scan start 11028.534132148
+11028.54 phasemark supdb-cache64tofitautozpagesdropland50 scan end 11028.546356180
+11028.59 zbuild t=2.6 par-00000008-0000000000000000-30303030303030303031383132303030-30303030303030303032303636303030.sup ahead wall_ms 151 cpu_ms 145 majflt 0 file_mb 19.9 asked_mb 31.5 collect_ms 202 gap_ms 0
+11028.80 zbuild t=2.8 par-00000009-0000000000000000-30303030303030303032303636303030-30303030303030303032333230303030.sup ahead wall_ms 144 cpu_ms 141 majflt 0 file_mb 19.9 asked_mb 31.5 collect_ms 205 gap_ms 0
+11029.00 zbuild t=3.0 par-00000010-0000000000000000-30303030303030303032333230303030-30303030303030303032353734303030.sup ahead wall_ms 103 cpu_ms 102 majflt 0 file_mb 19.9 asked_mb 31.5 collect_ms 205 gap_ms 0
+11029.10 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 446275584 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11029.21 zbuild t=3.2 par-00000011-0000000000000000-30303030303030303032353734303030-30303030303030303032383238303030.sup ahead wall_ms 102 cpu_ms 101 majflt 0 file_mb 19.9 asked_mb 31.5 collect_ms 203 gap_ms 0
+11029.31 zbuild t=3.3 par-00000012-0000000000000000-30303030303030303032383238303030-.sup ahead wall_ms 71 cpu_ms 70 majflt 0 file_mb 13.5 asked_mb 21.3 collect_ms 102 gap_ms 0
+11030.12 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 446275584 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11030.32 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-C start 11030.325305157
+11030.39 mixkinds supdb-cache64tofitautozpagesdropland50 C size 3000000 ops 50000 gets 50000 18.942 scans 0 0.000 commits 1 0.001 total 23.371
+11030.39 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-C end 11030.397414712
+11030.40 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-B start 11030.397594471
+11030.47 mixkinds supdb-cache64tofitautozpagesdropland50 B size 3000000 ops 50000 gets 47512 20.155 scans 0 0.000 commits 25 8.894 total 34.272
+11030.47 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-B end 11030.474453165
+11030.47 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-A start 11030.474627019
+11030.60 mixkinds supdb-cache64tofitautozpagesdropland50 A size 3000000 ops 50000 gets 25066 12.338 scans 0 0.000 commits 250 71.132 total 91.315
+11030.61 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-A end 11030.608440118
+11030.61 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-F start 11030.608620144
+11030.75 mixkinds supdb-cache64tofitautozpagesdropland50 F size 3000000 ops 50000 gets 50000 24.959 scans 0 0.000 commits 252 70.422 total 104.672
+11030.75 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-F end 11030.755846095
+11030.75 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-D start 11030.756048418
+11030.80 mixkinds supdb-cache64tofitautozpagesdropland50 D size 3000000 ops 50000 gets 47535 37.308 scans 0 0.000 commits 25 10.714 total 51.384
+11030.80 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-D end 11030.807464010
+11030.81 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-E start 11030.807635396
+11030.95 mixkinds supdb-cache64tofitautozpagesdropland50 E size 3000000 ops 50000 gets 0 0.000 scans 47478 81.648 commits 26 12.079 total 99.377
+11030.95 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-E end 11030.949496746
+11031.29 phasemark supdb-cache64tofitautozpagesdropland50 load start 11031.291957564
+11031.29 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 470388736 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 0/0 gen cbf29ce484222325 inflight 000
+11032.33 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 351604736 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 0/0 gen cbf29ce484222325 inflight 000
+11033.39 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 20638.558861314297, budget: 309100544 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 12582912/143840000 gen 1f3cf82d81475279 inflight 000
+11033.60 zbuild t=2.3 par-00000004-0000000001161160--30303030303030303030393939343734.sup ahead wall_ms 200 cpu_ms 174 majflt 0 file_mb 30.2 asked_mb 47.9 collect_ms 211 gap_ms 0
+11034.68 zselect Suspect gate 1 census true build false sample true event Some(Suspect) model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 69846.1893421571, budget: 326643712 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 25165824/238080000 gen a489880e49367412 inflight 000
+11034.68 zahead t=3.4 par-00000021-0000000001921920--30303030303030303030343939383234.sup cold resident 0.000 past false
+11034.68 zahead t=3.4 par-00000022-0000000001921920-30303030303030303030343939383234-30303030303030303030393939343734.sup cold resident 0.263 past false
+11034.90 zbuild t=3.6 par-00000023-0000000001921920-30303030303030303030393939343734-30303030303030303031353030303837.sup ahead wall_ms 161 cpu_ms 130 majflt 0 file_mb 25.0 asked_mb 39.7 collect_ms 212 gap_ms 1083
+11035.00 zsample partitions 6 declined false on_disk 1 keys 1920000 records 238080000 w_z 228415216 resident 3716848 build_cpu 0.2646 c_build 0.3808 t_f Some(0.00029711580000000003) decode_per_page 7.141e-7 coding Some(RawTails) w_z_raw 228415216
+11035.06 phasemark supdb-cache64tofitautozpagesdropland50 load sync 11035.067626909
+11037.12 zahead t=5.8 crossed swapped 0 asked_mb 0.0
+11037.12 zselect Suspect gate 1 census true build false sample true event None model Some(Model { phi_raw: 0.38021445733680836, phi_z: Some(0.0), phi_z_scan: Some(0.0), refault_rate: 56774.30042191102, budget: 281141248 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults Some(112081) saving [None, None] vanished 0 theta 0.1327/0.0442 foot 50331648/372000000 gen 7f3e103c2cae6ce9 inflight 000
+11037.13 zahead t=5.8 par-00000065-0000000003003000-30303030303030303030393939343734-30303030303030303031323439373831.sup cold resident 0.000 past true
+11037.13 zahead t=5.8 par-00000066-0000000003003000-30303030303030303031323439373831-30303030303030303031353030303837.sup cold resident 0.000 past true
+11037.13 zahead t=5.8 par-00000067-0000000003003000-30303030303030303031353030303837-30303030303030303031373530323432.sup cold resident 0.000 past true
+11037.13 zahead t=5.8 par-00000068-0000000003003000-30303030303030303031373530323432-30303030303030303032303030333937.sup cold resident 0.000 past true
+11037.13 zahead t=5.8 par-00000073-0000000003003000-30303030303030303032303030333937-30303030303030303032323530333830.sup cold resident 0.000 past true
+11037.13 zahead t=5.8 par-00000074-0000000003003000-30303030303030303032323530333830-30303030303030303032353030333632.sup cold resident 0.000 past true
+11037.13 zahead t=5.8 par-00000075-0000000003003000-30303030303030303032353030333632-30303030303030303032373530313831.sup cold resident 0.000 past true
+11037.13 zahead t=5.8 par-00000076-0000000003003000-30303030303030303032373530313831-.sup cold resident 0.154 past true
+11037.23 zbuild t=5.9 par-00000081-0000000003003000--30303030303030303030323439393132.sup ahead wall_ms 61 cpu_ms 60 majflt 0 file_mb 29.8 asked_mb 31.0 collect_ms 102 gap_ms 2230
+11037.33 zbuild t=6.0 par-00000082-0000000003003000-30303030303030303030323439393132-30303030303030303030343939383234.sup ahead wall_ms 64 cpu_ms 63 majflt 0 file_mb 29.8 asked_mb 31.0 collect_ms 105 gap_ms 0
+11037.39 phasemark supdb-cache64tofitautozpagesdropland50 load end 11037.394952707
+11037.71 phasemark supdb-cache64tofitautozpagesdrop load start 11037.709253556
+11037.71 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 432820224 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 0/0 gen cbf29ce484222325 inflight 000
+11038.74 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 409583616 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 16777216/143867840 gen ff6006819a52c68d inflight 000
+11039.68 phasemark supdb-cache64tofitautozpagesdrop load sync 11039.688242243
+11039.71 phasemark supdb-cache64tofitautozpagesdrop load end 11039.717053496
+11039.71 phasemark supdb-cache64tofitautozpagesdrop read start 11039.717339679
+11039.81 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.031769678987057695, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 404291584 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11039.96 phasemark supdb-cache64tofitautozpagesdrop read end 11039.967706238
+11040.36 phasemark supdb-cache64tofitautozpagesdrop scan start 11040.367606763
+11040.37 phasemark supdb-cache64tofitautozpagesdrop scan end 11040.378293703
+11040.83 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.03654742092991887, phi_z: None, phi_z_scan: None, refault_rate: 2681.1366443649254, budget: 402513920 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11041.84 zselect Suspect gate 1 census true build false sample true event Some(Suspect) model Some(Model { phi_raw: 0.03699877443146129, phi_z: None, phi_z_scan: None, refault_rate: 4535.895082628343, budget: 402345984 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11041.94 zsample partitions 13 declined false on_disk 0 keys 3000000 records 372072000 w_z 356929160 resident 5807752 build_cpu 0.3657 c_build 0.5485 t_f None decode_per_page 6.588e-7 coding Some(RawTails) w_z_raw 356929160
+11042.41 phasemark supdb-cache64tofitautozpagesdrop ycsb-C start 11042.409135536
+11042.48 mixkinds supdb-cache64tofitautozpagesdrop C size 3000000 ops 50000 gets 50000 23.484 scans 0 0.000 commits 1 0.001 total 27.886
+11042.48 phasemark supdb-cache64tofitautozpagesdrop ycsb-C end 11042.480140268
+11042.48 phasemark supdb-cache64tofitautozpagesdrop ycsb-B start 11042.480314647
+11042.56 mixkinds supdb-cache64tofitautozpagesdrop B size 3000000 ops 50000 gets 47512 23.690 scans 0 0.000 commits 25 9.733 total 38.565
+11042.56 phasemark supdb-cache64tofitautozpagesdrop ycsb-B end 11042.562428771
+11042.56 phasemark supdb-cache64tofitautozpagesdrop ycsb-A start 11042.562591447
+11042.71 mixkinds supdb-cache64tofitautozpagesdrop A size 3000000 ops 50000 gets 25066 19.268 scans 0 0.000 commits 250 78.839 total 106.038
+11042.71 phasemark supdb-cache64tofitautozpagesdrop ycsb-A end 11042.711143888
+11042.71 phasemark supdb-cache64tofitautozpagesdrop ycsb-F start 11042.711330934
+11042.85 zselect Suspect gate 1 census true build false sample false event None model Some(Model { phi_raw: 0.03958580059898313, phi_z: Some(0.0), phi_z_scan: Some(0.0), refault_rate: 2844.7008996557656, budget: 401383424 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: Some(8.314916561314791e-6), t_hit: Some(1.017796875e-6), t_hit_scan: Some(2.768605494892568e-6), t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults Some(1018) saving [None, None] vanished 0 theta 0.1655/0.0552 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11042.95 mixkinds supdb-cache64tofitautozpagesdrop F size 3000000 ops 50000 gets 50000 83.168 scans 0 0.000 commits 252 102.671 total 195.235
+11042.95 phasemark supdb-cache64tofitautozpagesdrop ycsb-F end 11042.949566266
+11042.95 phasemark supdb-cache64tofitautozpagesdrop ycsb-D start 11042.949742744
+11043.03 mixkinds supdb-cache64tofitautozpagesdrop D size 3000000 ops 50000 gets 47535 68.302 scans 0 0.000 commits 25 11.756 total 83.325
+11043.03 phasemark supdb-cache64tofitautozpagesdrop ycsb-D end 11043.033100462
+11043.03 phasemark supdb-cache64tofitautozpagesdrop ycsb-E start 11043.033275432
+11043.31 mixkinds supdb-cache64tofitautozpagesdrop E size 3000000 ops 50000 gets 0 0.000 scans 47478 211.033 commits 26 15.927 total 232.913
+11043.31 phasemark supdb-cache64tofitautozpagesdrop ycsb-E end 11043.308651371
+11043.57 phasemark supdb-cache64tofitautozpagesdrop load start 11043.569870643
+11043.57 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 431173632 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 0/0 gen cbf29ce484222325 inflight 000
+11044.61 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 331177984 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 0/0 gen cbf29ce484222325 inflight 000
+11045.72 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 19731.404848304137, budget: 314884096 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 12582912/143840000 gen 1f3cf82d81475279 inflight 000
+11046.77 zselect Suspect gate 1 census true build false sample true event Some(Suspect) model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 23728.105119156156, budget: 285466624 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 12582912/143840000 gen 1f3cf82d81475279 inflight 101
+11047.07 zsample partitions 3 declined false on_disk 0 keys 1160000 records 143840000 w_z 138003456 resident 2245632 build_cpu 0.1924 c_build 0.2886 t_f None decode_per_page 7.281e-7 coding Some(RawTails) w_z_raw 138003456
+11047.15 phasemark supdb-cache64tofitautozpagesdrop load sync 11047.155128273
+11049.34 zsample partitions 6 declined false on_disk 0 keys 1921000 records 238204000 w_z 228539968 resident 3718720 build_cpu 0.2332 c_build 0.3499 t_f None decode_per_page 6.682e-7 coding Some(RawTails) w_z_raw 228539968
+11049.34 zselect Suspect gate 1 census true build false sample true event None model Some(Model { phi_raw: 0.3402577503387161, phi_z: Some(0.0), phi_z_scan: Some(0.0), refault_rate: 116706.2085914022, budget: 295866368 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults Some(224975) saving [None, None] vanished 0 theta 0.1327/0.0442 foot 50331648/372000000 gen 7e4cb7a8abf4c5c inflight 000
+11049.61 phasemark supdb-cache64tofitautozpagesdrop load end 11049.612764926
+11049.90     48s  rep 1/3
+11049.94 phasemark supdb-cache64tofitautozpagesdrop load start 11049.941417307
+11049.94 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 431710208 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 0/0 gen cbf29ce484222325 inflight 000
+11050.98 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 1.9166297602037232, budget: 406790144 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 16777216/143867840 gen ff6006819a52c68d inflight 000
+11051.93 phasemark supdb-cache64tofitautozpagesdrop load sync 11051.935933676
+11051.97 phasemark supdb-cache64tofitautozpagesdrop load end 11051.970214884
+11051.97 phasemark supdb-cache64tofitautozpagesdrop read start 11051.970538634
+11052.03 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.034830075899712105, phi_z: None, phi_z_scan: None, refault_rate: 112.90071393531885, budget: 403152896 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11052.23 phasemark supdb-cache64tofitautozpagesdrop read end 11052.231992573
+11052.63 phasemark supdb-cache64tofitautozpagesdrop scan start 11052.629664563
+11052.64 phasemark supdb-cache64tofitautozpagesdrop scan end 11052.642125044
+11053.04 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.03814367111833136, phi_z: None, phi_z_scan: None, refault_rate: 4059.265862475157, budget: 401920000 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11054.05 zselect Suspect gate 1 census true build false sample true event Some(Suspect) model Some(Model { phi_raw: 0.044836913289178965, phi_z: None, phi_z_scan: None, refault_rate: 5537.235706674488, budget: 399429632 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11054.16 zsample partitions 13 declined false on_disk 0 keys 3000000 records 372072000 w_z 356929160 resident 5807752 build_cpu 0.3582 c_build 0.5372 t_f None decode_per_page 7.118e-7 coding Some(RawTails) w_z_raw 356929160
+11054.67 phasemark supdb-cache64tofitautozpagesdrop ycsb-C start 11054.670150220
+11054.80 mixkinds supdb-cache64tofitautozpagesdrop C size 3000000 ops 50000 gets 50000 86.770 scans 0 0.000 commits 1 0.000 total 92.512
+11054.80 phasemark supdb-cache64tofitautozpagesdrop ycsb-C end 11054.806044673
+11054.80 phasemark supdb-cache64tofitautozpagesdrop ycsb-B start 11054.806251449
+11054.91 mixkinds supdb-cache64tofitautozpagesdrop B size 3000000 ops 50000 gets 47512 34.458 scans 0 0.000 commits 25 27.711 total 67.353
+11054.92 phasemark supdb-cache64tofitautozpagesdrop ycsb-B end 11054.918352708
+11054.92 phasemark supdb-cache64tofitautozpagesdrop ycsb-A start 11054.918534211
+11055.08 zselect Suspect gate 1 census true build false sample false event None model Some(Model { phi_raw: 0.0459597927326992, phi_z: Some(0.0), phi_z_scan: Some(0.0), refault_rate: 1425.1336971498117, budget: 399011840 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: Some(1.1661738521233025e-6), t_hit_scan: Some(2.7675012746169148e-6), t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults Some(111) saving [None, None] vanished 0 theta 0.0332/0.0111 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11055.09 mixkinds supdb-cache64tofitautozpagesdrop A size 3000000 ops 50000 gets 25066 22.520 scans 0 0.000 commits 250 98.548 total 129.275
+11055.09 phasemark supdb-cache64tofitautozpagesdrop ycsb-A end 11055.092709501
+11055.09 phasemark supdb-cache64tofitautozpagesdrop ycsb-F start 11055.092905045
+11055.27 mixkinds supdb-cache64tofitautozpagesdrop F size 3000000 ops 50000 gets 50000 47.226 scans 0 0.000 commits 252 86.345 total 142.927
+11055.28 phasemark supdb-cache64tofitautozpagesdrop ycsb-F end 11055.278362726
+11055.28 phasemark supdb-cache64tofitautozpagesdrop ycsb-D start 11055.278535554
+11055.39 mixkinds supdb-cache64tofitautozpagesdrop D size 3000000 ops 50000 gets 47535 94.572 scans 0 0.000 commits 25 13.229 total 111.417
+11055.39 phasemark supdb-cache64tofitautozpagesdrop ycsb-D end 11055.389991811
+11055.39 phasemark supdb-cache64tofitautozpagesdrop ycsb-E start 11055.390166534
+11055.65 mixkinds supdb-cache64tofitautozpagesdrop E size 3000000 ops 50000 gets 0 0.000 scans 47478 199.319 commits 26 14.393 total 219.838
+11055.65 phasemark supdb-cache64tofitautozpagesdrop ycsb-E end 11055.654256578
+11055.93 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 431177728 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 0/0 gen cbf29ce484222325 inflight 000
+11055.93 phasemark supdb-cache64tofitautozpagesdrop load start 11055.929249285
+11056.96 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 326651904 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 0/0 gen cbf29ce484222325 inflight 000
+11058.01 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 19333.614576289645, budget: 319594496 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 12582912/143840000 gen 1f3cf82d81475279 inflight 001
+11059.27 zselect Suspect gate 1 census true build false sample true event Some(Suspect) model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 73315.41019973597, budget: 332759040 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 25165824/235972000 gen c60bcc1875bf0d46 inflight 000
+11059.38 zsample partitions 6 declined false on_disk 0 keys 1903000 records 235972000 w_z 226399888 resident 3683984 build_cpu 0.3007 c_build 0.4510 t_f None decode_per_page 7.679e-7 coding Some(RawTails) w_z_raw 226399888
+11059.45 phasemark supdb-cache64tofitautozpagesdrop load sync 11059.458092484
+11062.27 zselect Suspect gate 1 census true build false sample true event None model Some(Model { phi_raw: 0.30734411486430946, phi_z: Some(0.0), phi_z_scan: Some(0.0), refault_rate: 66427.14346571836, budget: 308051968 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults Some(168985) saving [None, None] vanished 0 theta 0.1327/0.0442 foot 50331648/372000000 gen 880136fb295ff243 inflight 000
+11062.62 phasemark supdb-cache64tofitautozpagesdrop load end 11062.625461823
+11062.93 phasemark supdb-cache64tofitautozpagesdropland50 load start 11062.933145850
+11062.93 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 456716288 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 0/0 gen cbf29ce484222325 inflight 000
+11063.96 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 442626048 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 16777216/143867840 gen ff6006819a52c68d inflight 001
+11064.38 zbuild t=1.5 par-00000000-0000000000000000--30303030303030303030323930303030.sup ahead wall_ms 137 cpu_ms 118 majflt 0 file_mb 22.7 asked_mb 36.0 collect_ms 208 gap_ms 0
+11064.59 zbuild t=1.7 par-00000001-0000000000000000-30303030303030303030323930303030-30303030303030303030353830303030.sup ahead wall_ms 121 cpu_ms 119 majflt 0 file_mb 22.7 asked_mb 36.0 collect_ms 212 gap_ms 1
+11064.80 zbuild t=1.9 par-00000002-0000000000000000-30303030303030303030353830303030-30303030303030303030383730303030.sup ahead wall_ms 134 cpu_ms 120 majflt 0 file_mb 22.7 asked_mb 36.0 collect_ms 204 gap_ms 1
+11064.93 phasemark supdb-cache64tofitautozpagesdropland50 load sync 11064.936785008
+11064.96 phasemark supdb-cache64tofitautozpagesdropland50 load end 11064.962909934
+11064.96 phasemark supdb-cache64tofitautozpagesdropland50 read start 11064.963230652
+11065.01 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 429711360 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11065.01 zbuild t=2.1 par-00000003-0000000000000000-30303030303030303030383730303030-30303030303030303031313630303030.sup ahead wall_ms 122 cpu_ms 116 majflt 0 file_mb 22.7 asked_mb 36.0 collect_ms 211 gap_ms 1
+11065.12 zbuild t=2.2 par-00000004-0000000000000000-30303030303030303031313630303030-30303030303030303031333233303030.sup ahead wall_ms 66 cpu_ms 65 majflt 0 file_mb 12.8 asked_mb 20.2 collect_ms 107 gap_ms 0
+11065.18 phasemark supdb-cache64tofitautozpagesdropland50 read end 11065.186453194
+11065.22 zbuild t=2.3 par-00000005-0000000000000000-30303030303030303031333233303030-30303030303030303031343836303030.sup ahead wall_ms 66 cpu_ms 65 majflt 0 file_mb 12.8 asked_mb 20.2 collect_ms 107 gap_ms 0
+11065.33 zbuild t=2.4 par-00000006-0000000000000000-30303030303030303031343836303030-30303030303030303031363439303030.sup ahead wall_ms 67 cpu_ms 65 majflt 0 file_mb 12.8 asked_mb 20.2 collect_ms 107 gap_ms 0
+11065.44 zbuild t=2.5 par-00000007-0000000000000000-30303030303030303031363439303030-30303030303030303031383132303030.sup ahead wall_ms 69 cpu_ms 67 majflt 0 file_mb 12.8 asked_mb 20.2 collect_ms 109 gap_ms 0
+11065.59 phasemark supdb-cache64tofitautozpagesdropland50 scan start 11065.593889827
+11065.60 phasemark supdb-cache64tofitautozpagesdropland50 scan end 11065.603846582
+11065.65 zbuild t=2.7 par-00000008-0000000000000000-30303030303030303031383132303030-30303030303030303032303636303030.sup ahead wall_ms 113 cpu_ms 107 majflt 0 file_mb 19.9 asked_mb 31.5 collect_ms 204 gap_ms 0
+11065.85 zbuild t=2.9 par-00000009-0000000000000000-30303030303030303032303636303030-30303030303030303032333230303030.sup ahead wall_ms 103 cpu_ms 102 majflt 0 file_mb 19.9 asked_mb 31.5 collect_ms 205 gap_ms 0
+11066.06 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 426172416 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11066.06 zbuild t=3.1 par-00000010-0000000000000000-30303030303030303032333230303030-30303030303030303032353734303030.sup ahead wall_ms 147 cpu_ms 146 majflt 0 file_mb 19.9 asked_mb 31.5 collect_ms 208 gap_ms 0
+11066.26 zbuild t=3.3 par-00000011-0000000000000000-30303030303030303032353734303030-30303030303030303032383238303030.sup ahead wall_ms 112 cpu_ms 109 majflt 0 file_mb 19.9 asked_mb 31.5 collect_ms 204 gap_ms 0
+11066.37 zbuild t=3.4 par-00000012-0000000000000000-30303030303030303032383238303030-.sup ahead wall_ms 99 cpu_ms 98 majflt 0 file_mb 13.5 asked_mb 21.3 collect_ms 109 gap_ms 0
+11067.09 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 426172416 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11067.43 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-C start 11067.437729010
+11067.50 mixkinds supdb-cache64tofitautozpagesdropland50 C size 3000000 ops 50000 gets 50000 18.555 scans 0 0.000 commits 1 0.001 total 22.906
+11067.50 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-C end 11067.503348065
+11067.50 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-B start 11067.503507269
+11067.62 mixkinds supdb-cache64tofitautozpagesdropland50 B size 3000000 ops 50000 gets 47512 20.499 scans 0 0.000 commits 25 50.838 total 76.475
+11067.62 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-B end 11067.622637619
+11067.62 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-A start 11067.622825980
+11067.76 mixkinds supdb-cache64tofitautozpagesdropland50 A size 3000000 ops 50000 gets 25066 12.324 scans 0 0.000 commits 250 81.364 total 101.838
+11067.77 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-A end 11067.767383904
+11067.77 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-F start 11067.767566762
+11067.94 mixkinds supdb-cache64tofitautozpagesdropland50 F size 3000000 ops 50000 gets 50000 24.942 scans 0 0.000 commits 252 99.097 total 133.620
+11067.94 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-F end 11067.943652826
+11067.94 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-D start 11067.943863271
+11067.99 mixkinds supdb-cache64tofitautozpagesdropland50 D size 3000000 ops 50000 gets 47535 36.606 scans 0 0.000 commits 25 13.252 total 53.198
+11067.99 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-D end 11067.997096598
+11068.00 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-E start 11067.997278614
+11068.10 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 416407552 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11068.13 mixkinds supdb-cache64tofitautozpagesdropland50 E size 3000000 ops 50000 gets 0 0.000 scans 47478 77.373 commits 26 12.491 total 95.405
+11068.13 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-E end 11068.135112562
+11068.48 phasemark supdb-cache64tofitautozpagesdropland50 load start 11068.485119060
+11068.48 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 454082560 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 0/0 gen cbf29ce484222325 inflight 000
+11069.52 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 342753280 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 0/0 gen cbf29ce484222325 inflight 000
+11070.62 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 19927.30989851307, budget: 316157952 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 12582912/143840000 gen 1f3cf82d81475279 inflight 001
+11071.72 zselect Suspect gate 1 census true build false sample true event Some(Suspect) model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 66601.41721384964, budget: 364371968 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 25165824/215760000 gen 1797c2db29cabda inflight 001
+11071.93 zbuild t=3.5 par-00000021-0000000001741740--30303030303030303030343939393931.sup ahead wall_ms 202 cpu_ms 147 majflt 3 file_mb 22.6 asked_mb 35.9 collect_ms 208 gap_ms 0
+11072.04 zsample partitions 6 declined false on_disk 1 keys 1740000 records 215760000 w_z 207013392 resident 3368464 build_cpu 0.2745 c_build 0.3496 t_f None decode_per_page 7.775e-7 coding Some(RawTails) w_z_raw 207013392
+11072.23 zahead t=3.8 par-00000023-0000000001741740-30303030303030303030393939343734-30303030303030303031353030323235.sup cold resident 0.383 past false
+11072.23 zahead t=3.8 par-00000024-0000000001741740-30303030303030303031353030323235-30303030303030303032303030333937.sup cold resident 0.424 past false
+11072.34 zbuild t=3.9 par-00000025-0000000001741740-30303030303030303032303030333937-30303030303030303032353030333532.sup ahead wall_ms 85 cpu_ms 74 majflt 1 file_mb 34.5 asked_mb 36.0 collect_ms 108 gap_ms 299
+11072.54 phasemark supdb-cache64tofitautozpagesdropland50 load sync 11072.543717632
+11075.02 zahead t=6.5 crossed swapped 0 asked_mb 0.0
+11075.02 zselect Suspect gate 1 census true build false sample true event None model Some(Model { phi_raw: 0.2757097790448684, phi_z: Some(0.0), phi_z_scan: Some(0.0), refault_rate: 104084.6844560229, budget: 319791104 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults Some(322841) saving [None, None] vanished 0 theta 0.1327/0.0442 foot 50331648/372000000 gen 2325b5165adef3f inflight 000
+11075.02 zbuild t=6.5 par-00000026-0000000001741740-30303030303030303032353030333532-.sup ahead wall_ms 116 cpu_ms 77 majflt 1 file_mb 34.5 asked_mb 36.0 collect_ms 2679 gap_ms 0
+11075.02 zahead t=6.5 par-00000076-0000000003003000-30303030303030303030393939343734-30303030303030303031323439383931.sup cold resident 0.000 past true
+11075.02 zahead t=6.5 par-00000077-0000000003003000-30303030303030303031323439383931-30303030303030303031353030323235.sup cold resident 0.000 past true
+11075.02 zahead t=6.5 par-00000084-0000000003003000-30303030303030303031353030323235-30303030303030303031373530333134.sup cold resident 0.000 past true
+11075.02 zahead t=6.5 par-00000085-0000000003003000-30303030303030303031373530333134-30303030303030303032303030333937.sup cold resident 0.000 past true
+11075.03 zahead t=6.5 par-00000092-0000000003003000-30303030303030303032303030333937-30303030303030303032323530333735.sup cold resident 0.005 past true
+11075.03 zahead t=6.5 par-00000093-0000000003003000-30303030303030303032323530333735-30303030303030303032353030333532.sup cold resident 0.119 past true
+11075.03 zahead t=6.5 par-00000094-0000000003003000-30303030303030303032353030333532-30303030303030303032373530313736.sup cold resident 0.339 past true
+11075.03 zahead t=6.5 par-00000095-0000000003003000-30303030303030303032373530313736-.sup cold resident 0.013 past true
+11075.12 zbuild t=6.6 par-00000100-0000000003003000--30303030303030303030323439393936.sup ahead wall_ms 70 cpu_ms 67 majflt 0 file_mb 29.8 asked_mb 31.0 collect_ms 101 gap_ms 1
+11075.32 phasemark supdb-cache64tofitautozpagesdropland50 load end 11075.324182730
+11075.55     73s  rep 2/3
+11075.59 phasemark supdb-cache64tofitautozpagesdropland50 load start 11075.594731111
+11075.59 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 456577024 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 0/0 gen cbf29ce484222325 inflight 000
+11076.62 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.9690003296374392, budget: 439238656 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 16777216/143867840 gen ff6006819a52c68d inflight 000
+11077.25 zbuild t=1.7 par-00000000-0000000000000000--30303030303030303030323930303030.sup ahead wall_ms 137 cpu_ms 132 majflt 0 file_mb 22.7 asked_mb 36.0 collect_ms 208 gap_ms 0
+11077.45 zbuild t=1.9 par-00000001-0000000000000000-30303030303030303030323930303030-30303030303030303030353830303030.sup ahead wall_ms 121 cpu_ms 117 majflt 0 file_mb 22.7 asked_mb 36.0 collect_ms 203 gap_ms 1
+11077.66 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.9666531376149049, budget: 430370816 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 25165824/224731488 gen e3b43ee6a62f1d45 inflight 000
+11077.66 zbuild t=2.1 par-00000002-0000000000000000-30303030303030303030353830303030-30303030303030303030383730303030.sup ahead wall_ms 172 cpu_ms 161 majflt 0 file_mb 22.7 asked_mb 36.0 collect_ms 203 gap_ms 1
+11077.82 phasemark supdb-cache64tofitautozpagesdropland50 load sync 11077.827152768
+11077.85 phasemark supdb-cache64tofitautozpagesdropland50 load end 11077.852134735
+11077.85 phasemark supdb-cache64tofitautozpagesdropland50 read start 11077.852429851
+11077.87 zbuild t=2.3 par-00000003-0000000000000000-30303030303030303030383730303030-30303030303030303031313630303030.sup ahead wall_ms 149 cpu_ms 131 majflt 0 file_mb 22.7 asked_mb 36.0 collect_ms 210 gap_ms 1
+11077.97 zbuild t=2.4 par-00000004-0000000000000000-30303030303030303031313630303030-30303030303030303031333233303030.sup ahead wall_ms 72 cpu_ms 67 majflt 0 file_mb 12.8 asked_mb 20.2 collect_ms 103 gap_ms 0
+11078.07 phasemark supdb-cache64tofitautozpagesdropland50 read end 11078.078276235
+11078.08 zbuild t=2.5 par-00000005-0000000000000000-30303030303030303031333233303030-30303030303030303031343836303030.sup ahead wall_ms 67 cpu_ms 66 majflt 0 file_mb 12.8 asked_mb 20.2 collect_ms 107 gap_ms 0
+11078.19 zbuild t=2.6 par-00000006-0000000000000000-30303030303030303031343836303030-30303030303030303031363439303030.sup ahead wall_ms 66 cpu_ms 66 majflt 0 file_mb 12.8 asked_mb 20.2 collect_ms 107 gap_ms 0
+11078.29 zbuild t=2.7 par-00000007-0000000000000000-30303030303030303031363439303030-30303030303030303031383132303030.sup ahead wall_ms 65 cpu_ms 65 majflt 0 file_mb 12.8 asked_mb 20.2 collect_ms 106 gap_ms 0
+11078.46 phasemark supdb-cache64tofitautozpagesdropland50 scan start 11078.461187500
+11078.47 phasemark supdb-cache64tofitautozpagesdropland50 scan end 11078.470786852
+11078.50 zbuild t=2.9 par-00000008-0000000000000000-30303030303030303031383132303030-30303030303030303032303636303030.sup ahead wall_ms 102 cpu_ms 101 majflt 0 file_mb 19.9 asked_mb 31.5 collect_ms 203 gap_ms 0
+11078.70 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.9593500917340151, budget: 428924928 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11078.70 zbuild t=3.1 par-00000009-0000000000000000-30303030303030303032303636303030-30303030303030303032333230303030.sup ahead wall_ms 103 cpu_ms 102 majflt 0 file_mb 19.9 asked_mb 31.5 collect_ms 204 gap_ms 0
+11078.91 zbuild t=3.3 par-00000010-0000000000000000-30303030303030303032333230303030-30303030303030303032353734303030.sup ahead wall_ms 104 cpu_ms 103 majflt 0 file_mb 19.9 asked_mb 31.5 collect_ms 206 gap_ms 0
+11079.11 zbuild t=3.5 par-00000011-0000000000000000-30303030303030303032353734303030-30303030303030303032383238303030.sup ahead wall_ms 104 cpu_ms 103 majflt 0 file_mb 19.9 asked_mb 31.5 collect_ms 205 gap_ms 0
+11079.21 zbuild t=3.6 par-00000012-0000000000000000-30303030303030303032383238303030-.sup ahead wall_ms 69 cpu_ms 69 majflt 0 file_mb 13.5 asked_mb 21.3 collect_ms 100 gap_ms 0
+11079.72 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 428924928 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11080.12 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-C start 11080.122200352
+11080.19 mixkinds supdb-cache64tofitautozpagesdropland50 C size 3000000 ops 50000 gets 50000 19.050 scans 0 0.000 commits 1 0.001 total 23.879
+11080.19 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-C end 11080.188647896
+11080.19 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-B start 11080.188849170
+11080.34 mixkinds supdb-cache64tofitautozpagesdropland50 B size 3000000 ops 50000 gets 47512 21.512 scans 0 0.000 commits 25 79.697 total 106.368
+11080.34 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-B end 11080.339414510
+11080.34 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-A start 11080.339587300
+11080.46 mixkinds supdb-cache64tofitautozpagesdropland50 A size 3000000 ops 50000 gets 25066 11.966 scans 0 0.000 commits 250 65.379 total 85.145
+11080.47 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-A end 11080.467255428
+11080.47 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-F start 11080.467433957
+11080.60 mixkinds supdb-cache64tofitautozpagesdropland50 F size 3000000 ops 50000 gets 50000 23.793 scans 0 0.000 commits 252 65.351 total 98.023
+11080.61 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-F end 11080.607907363
+11080.61 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-D start 11080.608131348
+11080.67 mixkinds supdb-cache64tofitautozpagesdropland50 D size 3000000 ops 50000 gets 47535 46.223 scans 0 0.000 commits 25 14.326 total 65.649
+11080.67 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-D end 11080.673827613
+11080.67 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-E start 11080.674099411
+11080.73 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 428077056 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11080.88 mixkinds supdb-cache64tofitautozpagesdropland50 E size 3000000 ops 50000 gets 0 0.000 scans 47478 119.949 commits 26 16.830 total 144.002
+11080.88 phasemark supdb-cache64tofitautozpagesdropland50 ycsb-E end 11080.883902805
+11081.25 phasemark supdb-cache64tofitautozpagesdropland50 load start 11081.250959699
+11081.25 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 456032256 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 0/0 gen cbf29ce484222325 inflight 000
+11082.30 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.9463312943508925, budget: 357220352 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 0/0 gen cbf29ce484222325 inflight 000
+11083.50 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 21036.63627148549, budget: 307572736 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 12582912/143840000 gen 1f3cf82d81475279 inflight 000
+11083.72 zbuild t=2.5 par-00000004-0000000001161160--30303030303030303030393939343734.sup ahead wall_ms 189 cpu_ms 173 majflt 0 file_mb 30.2 asked_mb 47.9 collect_ms 220 gap_ms 0
+11084.59 zselect Suspect gate 1 census true build false sample true event Some(Suspect) model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 17082.783845062717, budget: 295084032 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 12582912/143840000 gen 1f3cf82d81475279 inflight 100
+11084.70 zsample partitions 3 declined false on_disk 1 keys 1160000 records 143840000 w_z 138003456 resident 2245632 build_cpu 0.1527 c_build 0.1610 t_f None decode_per_page 7.239e-7 coding Some(RawTails) w_z_raw 138003456
+11085.06 zahead t=3.8 par-00000021-0000000001904903--30303030303030303030343939383431.sup cold resident 0.000 past false
+11085.06 zahead t=3.8 par-00000022-0000000001904903-30303030303030303030343939383431-30303030303030303030393939343734.sup cold resident 0.343 past false
+11085.14 phasemark supdb-cache64tofitautozpagesdropland50 load sync 11085.147811119
+11087.34 zahead t=6.1 crossed swapped 0 asked_mb 0.0
+11087.34 zselect Suspect gate 1 census true build false sample true event None model Some(Model { phi_raw: 0.29665340412501034, phi_z: Some(0.0), phi_z_scan: Some(0.0), refault_rate: 87259.23752941765, budget: 312016896 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults Some(167601) saving [None, None] vanished 0 theta 0.1327/0.0442 foot 50331648/372000000 gen 94298bf350a3f698 inflight 000
+11087.34 zbuild t=6.1 par-00000023-0000000001904903-30303030303030303030393939343734-30303030303030303031353030313337.sup ahead wall_ms 139 cpu_ms 82 majflt 1 file_mb 37.8 asked_mb 39.3 collect_ms 2282 gap_ms 1335
+11087.34 zahead t=6.1 par-00000065-0000000003003000--30303030303030303030323439393538.sup cold resident 0.000 past true
+11087.34 zahead t=6.1 par-00000066-0000000003003000-30303030303030303030323439393538-30303030303030303030343939383431.sup cold resident 0.000 past true
+11087.34 zahead t=6.1 par-00000073-0000000003003000-30303030303030303030343939383431-30303030303030303030373439363336.sup cold resident 0.000 past true
+11087.35 zahead t=6.1 par-00000074-0000000003003000-30303030303030303030373439363336-30303030303030303030393939343734.sup cold resident 0.000 past true
+11087.35 zahead t=6.1 par-00000081-0000000003003000-30303030303030303030393939343734-30303030303030303031323439383036.sup cold resident 0.000 past true
+11087.35 zahead t=6.1 par-00000082-0000000003003000-30303030303030303031323439383036-30303030303030303031353030313337.sup cold resident 0.000 past true
+11087.64 phasemark supdb-cache64tofitautozpagesdropland50 load end 11087.639364127
+11087.89 phasemark supdb-cache64tofitautozpagesdrop load start 11087.893231026
+11087.89 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 448843776 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 0/0 gen cbf29ce484222325 inflight 000
+11088.92 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.9725679506773289, budget: 423608320 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 16777216/143867840 gen ff6006819a52c68d inflight 000
+11089.96 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 421769216 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 41943040/350739872 gen b39c8459ec1def83 inflight 000
+11089.99 phasemark supdb-cache64tofitautozpagesdrop load sync 11089.998582675
+11090.03 phasemark supdb-cache64tofitautozpagesdrop load end 11090.030484549
+11090.03 phasemark supdb-cache64tofitautozpagesdrop read start 11090.030804106
+11090.27 phasemark supdb-cache64tofitautozpagesdrop read end 11090.276083568
+11090.70 phasemark supdb-cache64tofitautozpagesdrop scan start 11090.699867442
+11090.72 phasemark supdb-cache64tofitautozpagesdrop scan end 11090.719015172
+11090.97 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 420397056 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11091.98 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 420397056 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11092.42 phasemark supdb-cache64tofitautozpagesdrop ycsb-C start 11092.424700256
+11092.51 mixkinds supdb-cache64tofitautozpagesdrop C size 3000000 ops 50000 gets 50000 23.923 scans 0 0.000 commits 1 0.001 total 29.528
+11092.51 phasemark supdb-cache64tofitautozpagesdrop ycsb-C end 11092.515947194
+11092.51 phasemark supdb-cache64tofitautozpagesdrop ycsb-B start 11092.516228211
+11092.62 mixkinds supdb-cache64tofitautozpagesdrop B size 3000000 ops 50000 gets 47512 27.116 scans 0 0.000 commits 25 11.139 total 44.562
+11092.62 phasemark supdb-cache64tofitautozpagesdrop ycsb-B end 11092.623017808
+11092.62 phasemark supdb-cache64tofitautozpagesdrop ycsb-A start 11092.623260142
+11092.78 mixkinds supdb-cache64tofitautozpagesdrop A size 3000000 ops 50000 gets 25066 13.147 scans 0 0.000 commits 250 83.511 total 104.776
+11092.78 phasemark supdb-cache64tofitautozpagesdrop ycsb-A end 11092.782333561
+11092.78 phasemark supdb-cache64tofitautozpagesdrop ycsb-F start 11092.782511505
+11092.96 mixkinds supdb-cache64tofitautozpagesdrop F size 3000000 ops 50000 gets 50000 25.807 scans 0 0.000 commits 252 105.242 total 140.621
+11092.96 phasemark supdb-cache64tofitautozpagesdrop ycsb-F end 11092.966347340
+11092.96 phasemark supdb-cache64tofitautozpagesdrop ycsb-D start 11092.966530107
+11092.99 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 416190464 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 44040192/372072000 gen 70725307f574a5b1 inflight 000
+11093.02 mixkinds supdb-cache64tofitautozpagesdrop D size 3000000 ops 50000 gets 47535 37.978 scans 0 0.000 commits 25 15.833 total 57.132
+11093.02 phasemark supdb-cache64tofitautozpagesdrop ycsb-D end 11093.023696694
+11093.02 phasemark supdb-cache64tofitautozpagesdrop ycsb-E start 11093.023874855
+11093.33 mixkinds supdb-cache64tofitautozpagesdrop E size 3000000 ops 50000 gets 0 0.000 scans 47478 238.207 commits 26 14.998 total 259.330
+11093.33 phasemark supdb-cache64tofitautozpagesdrop ycsb-E end 11093.331508765
+11093.62 phasemark supdb-cache64tofitautozpagesdrop load start 11093.620915365
+11093.62 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 449245184 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 0/0 gen cbf29ce484222325 inflight 000
+11094.65 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 0.0, budget: 340185088 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 0/0 gen cbf29ce484222325 inflight 000
+11095.82 zselect Fits gate 0 census false build false sample false event None model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 25019.275850886555, budget: 289173504 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 12582912/143840000 gen 1f3cf82d81475279 inflight 000
+11096.87 zselect Suspect gate 1 census true build false sample true event Some(Suspect) model Some(Model { phi_raw: 0.0, phi_z: None, phi_z_scan: None, refault_rate: 32523.03336714784, budget: 278347776 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults None saving [None, None] vanished 0 theta 0.1327/0.0442 foot 12582912/143840000 gen 1f3cf82d81475279 inflight 100
+11097.25 zsample partitions 3 declined false on_disk 0 keys 1160000 records 143840000 w_z 138003456 resident 2245632 build_cpu 0.2837 c_build 0.4256 t_f Some(7.935e-5) decode_per_page 1.222e-6 coding Some(RawTails) w_z_raw 138003456
+11097.37 phasemark supdb-cache64tofitautozpagesdrop load sync 11097.377835460
+11099.45 zsample partitions 6 declined false on_disk 0 keys 1911000 records 236964000 w_z 227349104 resident 3699312 build_cpu 0.3204 c_build 0.4806 t_f None decode_per_page 7.846e-7 coding Some(RawTails) w_z_raw 227349104
+11099.45 zselect Suspect gate 1 census true build false sample true event None model Some(Model { phi_raw: 0.384108929573397, phi_z: Some(0.0), phi_z_scan: Some(0.0), refault_rate: 83498.51379073589, budget: 279711744 }) e2 (0, [Window { ops: 0, faults: 0 }, Window { ops: 0, faults: 0 }], None, 60s) costs Costs { t_f: None, t_hit: None, t_hit_scan: None, t_z: None, t_z_scan: None } win r 0/0 s 0/0 refaults Some(130807) saving [None, None] vanished 0 theta 0.1327/0.0442 foot 50331648/372000000 gen 978af85862443fef inflight 000
+11099.71 phasemark supdb-cache64tofitautozpagesdrop load end 11099.710887668
+11100.01     98s  rep 3/3

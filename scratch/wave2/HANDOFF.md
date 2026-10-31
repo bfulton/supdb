@@ -208,6 +208,68 @@ form as it attaches would reach only the threaded passes inside the
 build; the build's own wall, 36 s from the buy to the install at five
 million keys, has no timing of its own in the trace yet).
 
+## This session (2): the shift brought to the load's end
+
+The user's order for this stretch, after the OOM fix: (1) under `Auto`, drop
+a partition's raw pages at the install and not at its attach; (2) time the
+controller's build; (3) `Auto` builds at landing once the store heads past
+its budget -- "the lever is probably a percent page cache threshold, find
+the optimal default"; (4) E's margin against LMDB out of core.
+
+(1) and (2) are `e1cb5a2`. (3) is the commit after it: the builds ahead at
+landing from fifty percent of the budget (`Options::zpages_land_pct`), and
+the changes to the controller and the builds the traces of those builds
+named, each an option with an arm keeping the shape before
+(`docs/engine.md`, the paragraph after the sampler's;
+`scratch/wave2/stage4.md`, "The shift brought to the load's end", for the
+record and every pairing's file; `scratch/wave2/land_read.py` reads a
+pairing's installs, files on disk and cold partitions rep by rep):
+
+- builds ahead below the selector's line leave the raw form's cache as
+  they found it (no drop behind, their own file written back and dropped a
+  piece at a time) -- a 3M store that fits read at a twelfth without it;
+- past the line (`theta_enter` by the model, not the budget: a 3M store a
+  few percent past a budget the process's memory shrank swapped out a
+  quarter of its records at the budget's line) a build drops its records
+  behind it, and the first look past it swaps every built partition's
+  records for its file (`zpages_land_drop_past`, `Maint::z_cross`): a
+  build's reads keep the records it read most recent, and the kernel
+  evicted the unbuilt partitions' first;
+- the sampler at the CPU's normal class (`zpages_sample_idle` off);
+- the writer's reads in the census while the gate is the census's
+  (`zpages_writer_census`);
+- the attach bought on the model's prediction where the files on disk
+  cover `COVERED_ENOUGH` of the keys, never on the group's pressure alone
+  (`zpages_attach_eager`; its first pairing ran where it never fired);
+- every file on disk attached before any warm (`zpages_attach_first`);
+- a partial set priced as the attach plus the build of the rest;
+- the files written back as built synced by the builder
+  (`zpages_build_sync`): the next fsync paid the device's flush, ycsb-B's
+  first commits at 3M.
+
+At 5M under 640 MiB the install comes 2.2 s after the load's end in most
+reps (40-80 s without the builds ahead): read pass 1.31-1.39x, threaded
+reads 6-8x, scan pass 8-9x, ordered load 0.85-0.89x. At 3M (fits) the
+reads are level and the ordered load pays 0.83-0.91x. Seventy-five against
+fifty: load a tenth cheaper, read pass 0.56-0.60x.
+
+Next:
+
+- Residency variance: two reps in eight at 5M leave four or five
+  partitions cold (resident 0.0-0.5 at the look) and install at 11-26 s.
+  The levers to price: a lower `LAND_RESIDENT` (a build from half-resident
+  records reads the rest with its 4 MiB windows) or a second builder. The
+  arms with the build sync read more slow reps than without in both 5M
+  pairings (9 of 16 against 5, unresolved); read the two together.
+- The ordered load's tenth: the form files written beside the load.
+- The writer census's cost on A and F while the controller decides (two
+  sittings, 0.84-0.93, unresolved at three pairs, no mechanism found at a
+  few percent predicted): short under the builds ahead, but a store that
+  stays in SUSPECT pays it.
+- Not priced with the builds ahead: 10M under 1 GiB, the lag sweep under a
+  bound, a shuffled load followed by reads.
+- Step (4), E's margin against LMDB out of core.
+
 ## This session: a block read through one cursor
 
 - **Committed: `Options::zpages_block_cursor`** (on; the arm
@@ -988,11 +1050,14 @@ depends on the change.
 - The container restarted once during a gate's test group, at the checked
   compile of the engine, with nothing else running; the gate was run again
   from the start. `free` read 15.5 GB free of 16 after it.
-- The controller's tests in `tests/zpages.rs` fail two to six apiece when
-  three processes of the unoptimized test binary share the four cores (the
+- The controller's tests in `tests/zpages.rs` failed two to six apiece when
+  three processes of the unoptimized test binary shared the four cores (the
   tick's minute in `wait_tick`, the trial's, the ski rental's and the
-  raw-tail pick's waits), on the tree before the decoder as on the tree
-  after it; the gate runs them optimized and alone, green. Not fixed here.
+  raw-tail pick's waits). The tick wait read the step count after moving
+  the injected clock, so a step the segment work's thread took between the
+  two was in its baseline and the wait sat out its minute; it reads the
+  count first now (`advance_tick`, `CLAUDE.md`). Not re-run under the
+  three-process load since.
 - Miri (nightly, `cargo +nightly miri test --lib -- zlz4::`) runs the
   decoder's tests over the cases of 2 KB or less in a quarter hour; it
   refuses `lz4_flex` on one damaged block of the full set, a pointer two past

@@ -929,6 +929,38 @@ pub struct Supdb {
     /// `supdb-cache64tofitautozpagesdropattach` against
     /// `supdb-cache64tofitautozpagesdrop`.
     zdropattach: bool,
+    /// The builds ahead from this percent of the budget, beside the seals
+    /// that land (`Options::zpages_land_pct`): the `...dropland<pct>` arms
+    /// against `supdb-cache64tofitautozpagesdrop`.
+    zlandpct: u32,
+    /// The sampler at the idle classes (`Options::zpages_sample_idle`):
+    /// `supdb-cache64tofitautozpagesdropsampleidle` against
+    /// `supdb-cache64tofitautozpagesdrop`.
+    zsampleidle: bool,
+    /// The build turn's attaches one a warm (`Options::zpages_attach_first`
+    /// off): `supdb-cache64tofitautozpagesdropland50attachwarm` against
+    /// `...dropland50`.
+    zattachwarm: bool,
+    /// The writer's reads left out of the controller's census
+    /// (`Options::zpages_writer_census` off):
+    /// `supdb-cache64tofitautozpagesdropnowritercensus` against
+    /// `supdb-cache64tofitautozpagesdrop`.
+    znowritercensus: bool,
+    /// The attach of form files built ahead left to the rent's evidence
+    /// (`Options::zpages_attach_eager` off):
+    /// `supdb-cache64tofitautozpagesdropland50noattacheager` against
+    /// `...dropland50`.
+    znoattacheager: bool,
+    /// The builds ahead keeping the raw records behind them past the
+    /// budget too (`Options::zpages_land_drop_past` off):
+    /// `supdb-cache64tofitautozpagesdropland50keepbehind` against
+    /// `...dropland50`.
+    zkeepbehind: bool,
+    /// Form files left unsynced at their build's end
+    /// (`Options::zpages_build_sync` off):
+    /// `supdb-cache64tofitautozpagesdropland50nobuildsync` against
+    /// `...dropland50`.
+    znobuildsync: bool,
     /// Its partitions re-coded while served by what their decodes cost
     /// (`Options::zpages_recode`): `supdb-cache64tofitzpagesrecodedrop`
     /// against `supdb-cache64tofitzpagesdrop` and the key-order arms.
@@ -1485,6 +1517,31 @@ struct Policy {
     /// (`Options::zpages_drop_at_install` off):
     /// `supdb-cache64tofitautozpagesdropattach`.
     zdropattach: bool,
+    /// The builds ahead from this percent of the budget
+    /// (`Options::zpages_land_pct`).
+    zlandpct: u32,
+    /// The sampler at the idle classes (`Options::zpages_sample_idle`):
+    /// `supdb-cache64tofitautozpagesdropsampleidle`.
+    zsampleidle: bool,
+    /// The build turn's attaches one a warm (`Options::zpages_attach_first`
+    /// off): `supdb-cache64tofitautozpagesdropland50attachwarm`.
+    zattachwarm: bool,
+    /// The writer's reads left out of the controller's census
+    /// (`Options::zpages_writer_census` off):
+    /// `supdb-cache64tofitautozpagesdropnowritercensus`.
+    znowritercensus: bool,
+    /// The attach of form files built ahead left to the rent's evidence
+    /// (`Options::zpages_attach_eager` off):
+    /// `supdb-cache64tofitautozpagesdropland50noattacheager`.
+    znoattacheager: bool,
+    /// The builds ahead keeping the raw records behind them past the
+    /// budget (`Options::zpages_land_drop_past` off):
+    /// `supdb-cache64tofitautozpagesdropland50keepbehind`.
+    zkeepbehind: bool,
+    /// Form files left unsynced at their build's end
+    /// (`Options::zpages_build_sync` off):
+    /// `supdb-cache64tofitautozpagesdropland50nobuildsync`.
+    znobuildsync: bool,
     /// Its partitions re-coded while served (`Options::zpages_recode`):
     /// `supdb-cache64tofitzpagesrecodedrop`.
     zrecode: bool,
@@ -1632,6 +1689,13 @@ impl Default for Policy {
             zparse: false,
             zflexdec: false,
             zdropattach: false,
+            zlandpct: 0,
+            zsampleidle: false,
+            zattachwarm: false,
+            znowritercensus: false,
+            znoattacheager: false,
+            zkeepbehind: false,
+            znobuildsync: false,
             zpromote: 0,
             zgroup: None,
             zprebuild: false,
@@ -4724,6 +4788,138 @@ impl Supdb {
         )
     }
 
+    /// `supdb-cache64tofitautozpagesdrop` with its form files built ahead,
+    /// at the landings, from `pct` percent of the budget
+    /// (`Options::zpages_land_pct`), `supdb-cache64tofitautozpagesdropland<pct>`:
+    /// the sweep that sets the percent.
+    pub fn create_cache64_tofit_auto_zpages_drop_land(path: &Path, pct: u32) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages_auto: true,
+                zdropraw: true,
+                zlandpct: pct,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cache64tofitautozpagesdropland50` with the build turn's
+    /// attaches one a warm (`Options::zpages_attach_first` off),
+    /// `supdb-cache64tofitautozpagesdropland50attachwarm`: the order before
+    /// the attaches went first.
+    pub fn create_cache64_tofit_auto_zpages_drop_land50_attach_warm(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages_auto: true,
+                zdropraw: true,
+                zlandpct: 50,
+                zattachwarm: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cache64tofitautozpagesdropland50` with the attach of the form
+    /// files built ahead left to the rent's evidence
+    /// (`Options::zpages_attach_eager` off),
+    /// `supdb-cache64tofitautozpagesdropland50noattacheager`: the shape the
+    /// entry was priced against.
+    pub fn create_cache64_tofit_auto_zpages_drop_land50_no_attach_eager(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages_auto: true,
+                zdropraw: true,
+                zlandpct: 50,
+                znoattacheager: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cache64tofitautozpagesdropland50` with the builds ahead
+    /// keeping the raw records behind them past the budget as below it
+    /// (`Options::zpages_land_drop_past` off),
+    /// `supdb-cache64tofitautozpagesdropland50keepbehind`: the shape the
+    /// drop past the budget was priced against.
+    pub fn create_cache64_tofit_auto_zpages_drop_land50_keep_behind(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages_auto: true,
+                zdropraw: true,
+                zlandpct: 50,
+                zkeepbehind: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cache64tofitautozpagesdropland50` with the form files left
+    /// unsynced at their build's end (`Options::zpages_build_sync` off),
+    /// `supdb-cache64tofitautozpagesdropland50nobuildsync`: the device's
+    /// flush of them left to the next fsync, the writer's commits among them.
+    pub fn create_cache64_tofit_auto_zpages_drop_land50_no_build_sync(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages_auto: true,
+                zdropraw: true,
+                zlandpct: 50,
+                znobuildsync: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cache64tofitautozpagesdrop` with the sampler at the idle
+    /// classes (`Options::zpages_sample_idle`),
+    /// `supdb-cache64tofitautozpagesdropsampleidle`: the sampler's class
+    /// before it read at the readers'.
+    pub fn create_cache64_tofit_auto_zpages_drop_sample_idle(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages_auto: true,
+                zdropraw: true,
+                zsampleidle: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-cache64tofitautozpagesdrop` with the writer's reads left out of
+    /// the controller's census (`Options::zpages_writer_census` off),
+    /// `supdb-cache64tofitautozpagesdropnowritercensus`: the census before
+    /// it counted the writer's reads, a handle's alone.
+    pub fn create_cache64_tofit_auto_zpages_drop_no_writer_census(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                budget: 64 << 20,
+                tofit: true,
+                zpages_auto: true,
+                zdropraw: true,
+                znowritercensus: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-cache64tofitautozpagesdrop` with the raw pages dropped at each
     /// attach whatever the gate (`Options::zpages_drop_at_install` off),
     /// `supdb-cache64tofitautozpagesdropattach`: the drop's shape before it
@@ -5320,6 +5516,13 @@ impl Supdb {
             zparse,
             zflexdec,
             zdropattach,
+            zlandpct,
+            zsampleidle,
+            zattachwarm,
+            znowritercensus,
+            znoattacheager,
+            zkeepbehind,
+            znobuildsync,
             zrecode,
             zrecodekeep,
             settleevery,
@@ -5601,6 +5804,13 @@ impl Supdb {
             zpages_raw_tails_first: zhotfirst,
             zpages_drop_raw: zdropraw,
             zpages_drop_at_install: !zdropattach,
+            zpages_land_pct: zlandpct,
+            zpages_sample_idle: zsampleidle,
+            zpages_attach_first: !zattachwarm,
+            zpages_writer_census: !znowritercensus,
+            zpages_attach_eager: !znoattacheager,
+            zpages_land_drop_past: !zkeepbehind,
+            zpages_build_sync: !znobuildsync,
             zpages_recode: zrecode,
             zpages_recode_keep: zrecodekeep,
             forms_settle_every: settleevery,
@@ -5813,6 +6023,13 @@ impl Supdb {
             zparse,
             zflexdec,
             zdropattach,
+            zlandpct,
+            zsampleidle,
+            zattachwarm,
+            znowritercensus,
+            znoattacheager,
+            zkeepbehind,
+            znobuildsync,
             zrecode,
             zrecodekeep,
             settleevery,
@@ -5912,6 +6129,26 @@ impl Engine for Supdb {
                 "supdb-cache64tofitautozpagesparse"
             } else if self.zflexdec {
                 "supdb-cache64tofitautozpagesflexdec"
+            } else if self.zdropraw && self.znowritercensus {
+                "supdb-cache64tofitautozpagesdropnowritercensus"
+            } else if self.zdropraw && self.zsampleidle {
+                "supdb-cache64tofitautozpagesdropsampleidle"
+            } else if self.zdropraw && self.zlandpct == 50 && self.znobuildsync {
+                "supdb-cache64tofitautozpagesdropland50nobuildsync"
+            } else if self.zdropraw && self.zlandpct == 50 && self.zkeepbehind {
+                "supdb-cache64tofitautozpagesdropland50keepbehind"
+            } else if self.zdropraw && self.zlandpct == 50 && self.znoattacheager {
+                "supdb-cache64tofitautozpagesdropland50noattacheager"
+            } else if self.zdropraw && self.zlandpct == 50 && self.zattachwarm {
+                "supdb-cache64tofitautozpagesdropland50attachwarm"
+            } else if self.zdropraw && self.zlandpct > 0 {
+                match self.zlandpct {
+                    25 => "supdb-cache64tofitautozpagesdropland25",
+                    50 => "supdb-cache64tofitautozpagesdropland50",
+                    75 => "supdb-cache64tofitautozpagesdropland75",
+                    100 => "supdb-cache64tofitautozpagesdropland100",
+                    _ => "supdb-cache64tofitautozpagesdropland",
+                }
             } else if self.zdropraw && self.zdropattach {
                 "supdb-cache64tofitautozpagesdropattach"
             } else if self.zdropraw {
@@ -6837,6 +7074,8 @@ impl Engine for Supdb {
             ("zpage_build_starts", z.build_starts as f64),
             ("zpage_build_cancelled", z.build_cancelled as f64),
             ("zpage_prebuilt", z.prebuilt as f64),
+            ("zpage_ahead_cold", z.ahead_cold as f64),
+            ("zpage_ahead_recoded", z.ahead_recoded as f64),
             ("zpage_build_io_class", z.build_io_class as f64),
             ("zpage_build_ahead_bytes", z.build_ahead_bytes as f64),
             ("zpage_build_nopage", z.build_nopage as f64),
@@ -7582,6 +7821,16 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cache64tofitautozpagesflexdec"
         | "supdb-cache64tofitautozpagesdrop"
         | "supdb-cache64tofitautozpagesdropattach"
+        | "supdb-cache64tofitautozpagesdropland25"
+        | "supdb-cache64tofitautozpagesdropland50"
+        | "supdb-cache64tofitautozpagesdropland75"
+        | "supdb-cache64tofitautozpagesdropland100"
+        | "supdb-cache64tofitautozpagesdropland50attachwarm"
+        | "supdb-cache64tofitautozpagesdropland50noattacheager"
+        | "supdb-cache64tofitautozpagesdropland50keepbehind"
+        | "supdb-cache64tofitautozpagesdropland50nobuildsync"
+        | "supdb-cache64tofitautozpagesdropsampleidle"
+        | "supdb-cache64tofitautozpagesdropnowritercensus"
         | "supdb-cache64tofitautozpagessettlebuilds"
         | "supdb-cache64tofitautozpagespromote"
         | "supdb-cache64tofitautozpagesonegroup"
@@ -7878,6 +8127,36 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         }
         "supdb-cache64tofitautozpagesdropattach" => {
             Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_attach(dir)?)
+        }
+        "supdb-cache64tofitautozpagesdropland25" => {
+            Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land(dir, 25)?)
+        }
+        "supdb-cache64tofitautozpagesdropland50" => {
+            Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land(dir, 50)?)
+        }
+        "supdb-cache64tofitautozpagesdropland75" => {
+            Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land(dir, 75)?)
+        }
+        "supdb-cache64tofitautozpagesdropland100" => {
+            Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land(dir, 100)?)
+        }
+        "supdb-cache64tofitautozpagesdropland50attachwarm" => {
+            Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land50_attach_warm(dir)?)
+        }
+        "supdb-cache64tofitautozpagesdropland50noattacheager" => {
+            Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land50_no_attach_eager(dir)?)
+        }
+        "supdb-cache64tofitautozpagesdropland50keepbehind" => {
+            Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land50_keep_behind(dir)?)
+        }
+        "supdb-cache64tofitautozpagesdropland50nobuildsync" => {
+            Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land50_no_build_sync(dir)?)
+        }
+        "supdb-cache64tofitautozpagesdropsampleidle" => Box::new(
+            Supdb::create_cache64_tofit_auto_zpages_drop_sample_idle(dir)?,
+        ),
+        "supdb-cache64tofitautozpagesdropnowritercensus" => {
+            Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_no_writer_census(dir)?)
         }
         "supdb-cache64tofitautozpagespromote" => {
             Box::new(Supdb::create_cache64_tofit_auto_zpages_promote(dir)?)
@@ -8952,6 +9231,154 @@ mod tests {
                     b.forms_to_fit
                 ),
                 "{name}: the rest as {base_name}'s"
+            );
+            drop(arm);
+            drop(base);
+            let od = root.join(format!("{name}-open"));
+            std::fs::create_dir_all(&od).unwrap();
+            assert_eq!(open(name, &od, 1).unwrap().name(), name);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The controller's shift arms -- the builds ahead at landing by
+    /// percent, the sampler at the idle classes, the writer's reads out of
+    /// the census, the build turn's attaches one a warm, the attach left to
+    /// the rent's evidence, the records kept behind the builds ahead past the
+    /// budget, the form files left unsynced -- differ from their bases in their own option alone, and
+    /// open under their names. The arms name their percent, none by default,
+    /// as they name the raw drop; `...dropland50` is the shape the engine
+    /// ships under `Auto`.
+    #[test]
+    fn the_auto_shift_arms_differ_from_their_bases_in_their_option_alone() {
+        let root = std::env::temp_dir().join(format!("supdb-bench-zshift-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let o = supdb::Options::default();
+        assert_eq!(
+            (
+                o.zpages_land_pct,
+                o.zpages_sample_idle,
+                o.zpages_writer_census,
+                o.zpages_attach_first,
+                o.zpages_attach_eager,
+                o.zpages_land_drop_past,
+                o.zpages_build_sync
+            ),
+            (50, false, true, true, true, true, true)
+        );
+        type Shape = (u32, bool, bool, bool, bool, bool, bool);
+        let shape = |s: &Supdb| -> Shape {
+            let o = s.db.as_ref().unwrap().options();
+            (
+                o.zpages_land_pct,
+                o.zpages_sample_idle,
+                o.zpages_writer_census,
+                o.zpages_attach_first,
+                o.zpages_attach_eager,
+                o.zpages_land_drop_past,
+                o.zpages_build_sync,
+            )
+        };
+        let base_drop = Supdb::create_cache64_tofit_auto_zpages_drop as fn(&Path) -> Res<Supdb>;
+        let base_land50 = |p: &Path| Supdb::create_cache64_tofit_auto_zpages_drop_land(p, 50);
+        type Make = Box<dyn Fn(&Path) -> Res<Supdb>>;
+        let mut cases: Vec<(&str, Make, &str, Shape)> = vec![
+            (
+                "supdb-cache64tofitautozpagesdropsampleidle",
+                Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_sample_idle),
+                "supdb-cache64tofitautozpagesdrop",
+                (0, true, true, true, true, true, true),
+            ),
+            (
+                "supdb-cache64tofitautozpagesdropnowritercensus",
+                Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_no_writer_census),
+                "supdb-cache64tofitautozpagesdrop",
+                (0, false, false, true, true, true, true),
+            ),
+            (
+                "supdb-cache64tofitautozpagesdropland50attachwarm",
+                Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land50_attach_warm),
+                "supdb-cache64tofitautozpagesdropland50",
+                (50, false, true, false, true, true, true),
+            ),
+            (
+                "supdb-cache64tofitautozpagesdropland50noattacheager",
+                Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land50_no_attach_eager),
+                "supdb-cache64tofitautozpagesdropland50",
+                (50, false, true, true, false, true, true),
+            ),
+            (
+                "supdb-cache64tofitautozpagesdropland50keepbehind",
+                Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land50_keep_behind),
+                "supdb-cache64tofitautozpagesdropland50",
+                (50, false, true, true, true, false, true),
+            ),
+            (
+                "supdb-cache64tofitautozpagesdropland50nobuildsync",
+                Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land50_no_build_sync),
+                "supdb-cache64tofitautozpagesdropland50",
+                (50, false, true, true, true, true, false),
+            ),
+        ];
+        for pct in [25u32, 50, 75, 100] {
+            let name: &'static str =
+                Box::leak(format!("supdb-cache64tofitautozpagesdropland{pct}").into_boxed_str());
+            cases.push((
+                name,
+                Box::new(move |p: &Path| Supdb::create_cache64_tofit_auto_zpages_drop_land(p, pct)),
+                "supdb-cache64tofitautozpagesdrop",
+                (pct, false, true, true, true, true, true),
+            ));
+        }
+        for (name, make, base_name, want) in cases {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            let arm = make(&d).unwrap();
+            let bd = root.join(format!("{name}-base"));
+            std::fs::create_dir_all(&bd).unwrap();
+            let base = if base_name == "supdb-cache64tofitautozpagesdrop" {
+                base_drop(&bd).unwrap()
+            } else {
+                base_land50(&bd).unwrap()
+            };
+            assert_eq!(arm.name(), name);
+            assert_eq!(base.name(), base_name);
+            assert_eq!(guarantee(arm.name()), guarantee(base.name()));
+            assert_eq!(shape(&arm), want, "{name}: its option");
+            let (a, b) = (
+                arm.db.as_ref().unwrap().options(),
+                base.db.as_ref().unwrap().options(),
+            );
+            assert_eq!(
+                (
+                    a.zpages,
+                    a.zpages_drop_raw,
+                    a.zpages_coding_auto,
+                    a.scan_cache_bytes,
+                    a.forms_to_fit
+                ),
+                (
+                    b.zpages,
+                    b.zpages_drop_raw,
+                    b.zpages_coding_auto,
+                    b.scan_cache_bytes,
+                    b.forms_to_fit
+                ),
+                "{name}: the rest as {base_name}'s"
+            );
+            let differ = [
+                a.zpages_land_pct != b.zpages_land_pct,
+                a.zpages_sample_idle != b.zpages_sample_idle,
+                a.zpages_writer_census != b.zpages_writer_census,
+                a.zpages_attach_first != b.zpages_attach_first,
+                a.zpages_attach_eager != b.zpages_attach_eager,
+                a.zpages_land_drop_past != b.zpages_land_drop_past,
+                a.zpages_build_sync != b.zpages_build_sync,
+            ];
+            assert_eq!(
+                differ.iter().filter(|d| **d).count(),
+                1,
+                "{name}: one option apart from {base_name}"
             );
             drop(arm);
             drop(base);
