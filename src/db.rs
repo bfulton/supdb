@@ -1004,8 +1004,11 @@ pub struct Options {
     /// head's, and a hit on a cold group costs the walk its lines from
     /// memory, about what the decode would have. Eight is at the knee for
     /// the suite's shape; `supdb-cache64tofitautozpagesmemo4`, `...memo16`
-    /// and `...memo32` are the arms, and the pairings are in
-    /// `scratch/wave2/stage4.md`.
+    /// and `...memo32` are the arms, paired against the default by
+    /// `bench/scripts/pair.sh supdb-cache64tofitautozpages
+    /// supdb-cache64tofitautozpagesmemo4 5000000 --reps 5 --bound 671088640
+    /// --passes read,read-threaded,scan,scan-threaded,mixes --ops-div 10` and
+    /// the same with the others, at `feb44f5`.
     #[doc(hidden)]
     pub zpages_memo_bytes: usize,
     /// EXPERIMENT: a verified page's group asked of the handle's memo before
@@ -1384,8 +1387,10 @@ pub struct Options {
     /// mixes a quarter to a third faster and E's scans a fifth slower -- a
     /// group decoded whole through its records, which a scan's memo miss
     /// does, costs 2.2x the block decode's instructions -- and E is the cell
-    /// the compact form has left to win (`scratch/wave2/stage4.md`, "The
-    /// record coding paired").
+    /// the compact form has left to win (`bench/scripts/pair.sh
+    /// supdb-cache64tofitautozpages supdb-cache64tofitautozpagesrecord 5000000
+    /// --reps 5 --bound 671088640 --passes
+    /// read,read-threaded,scan,scan-threaded,mixes --ops-div 10` at `5059187`).
     #[doc(hidden)]
     pub zpages_record_coding: bool,
     /// EXPERIMENT: the form file's groups stored verbatim, every one, LZ4

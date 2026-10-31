@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""draw.py ROW OUT [--ooc TITLE=SITTING.out,SITTING.out ...]
+"""charts.py ROW OUT [--companion ROW] [--ooc TITLE=SITTING.out,SITTING.out ...]
 
 The suite's figures from one row of `bench run` (its JSON, written under
 `bench/runs/<scale>/` or wherever `--out` put it), into the directory OUT:
@@ -14,11 +14,18 @@ bits, ported here bit for bit so that a cell prints what `bench` would.
 Arms: supdb, lmdb, rocksdb-tuned are the durable three; supdb-ingest,
 lmdb-nosync, rocksdb-tuned-nosync the buffered three (a row whose buffered
 RocksDB is the untuned rocksdb-nosync is drawn without it). A row without one of them
-leaves its lines out.
+leaves its lines out. The published set is drawn from a full row with
+`--companion` a quick row, both of those six arms on an otherwise idle
+machine, the quick one first:
 
-`--ooc` adds the out-of-core figure from `bench ab` pairings
-(`scratch/wave2/land-pair.sh`), one argument a comparator: a title, then
-the sittings' `.out` tables. The `.err` beside each, where it carries the
+    A=supdb,lmdb,rocksdb-tuned,supdb-ingest,lmdb-nosync,rocksdb-tuned-nosync
+    bench run --scale quick --arms $A --out OUT
+    bench run --scale full --top 3000000 --arms $A --out OUT
+
+`--ooc` adds the out-of-core figure from `bench ab` tables (two arms
+paired under `--bound`, one sitting in each order), one argument a
+comparator: a title, then the sittings' tables as `bench ab` prints them
+to stdout, saved one sitting a file as `NAME.out`. The `.err` beside each, where it carries the
 controller's trace, gives the install's delay after the load per rep.
 """
 import argparse

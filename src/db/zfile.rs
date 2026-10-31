@@ -1517,7 +1517,7 @@ struct Memo {
     /// decodes: a decode into a buffer made for it was an allocation of
     /// whole pages a miss, and a uniform read set, which misses every
     /// time, read a tenth slower with the memo than without it for that
-    /// alone (`scratch/wave2/memo-ab-v1-*.out`).
+    /// alone.
     free: Vec<GroupBuf>,
     hits: u64,
     misses: u64,

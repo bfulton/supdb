@@ -20,6 +20,8 @@ sh scripts/ooc.sh 1610612736                     # out of core under a 1.5 GiB b
 ./target/release/bench gate runs/quick/<row>.json # a row against the series
 ./target/release/bench figures --scale quick    # every figure, from runs/
 ./target/release/bench machine                  # the host as a row records it
+python3 scripts/charts.py ROW OUT                # the published figure set, from one row
+sh scripts/pair.sh A B SIZE [ab options]          # two arms paired, a sitting in each order
 ```
 
 `quick` tops its ladder at 300 000 keys. `full` sizes its ladder to the

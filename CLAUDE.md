@@ -6,6 +6,14 @@ against LMDB and RocksDB. `bench/DESIGN.md` says how a thing is measured and
 `bench/CLAUDE.md` carries that side's rules; this file is about how a thing
 is built.
 
+A measurement the docs cite is given as the command that reproduces it
+-- for a pairing, `bench/scripts/pair.sh A B SIZE [bench ab options]` at
+the commit it ran at -- never as a log: the logs, stage notes and handoffs
+of the sessions that built the compact form were kept under `scratch/` on
+their branch, `claude/recover-consolidate-branches-5rwvr5`, until the
+commit that took `scratch/` off it, and nothing on the main line needs
+them.
+
 This file is notes to whoever picks the work up next with no memory of it:
 dense, contextual, and it explains a rule by naming the failure that produced
 it. `README.md`, a PR description and the crate docs are for people who either
@@ -30,6 +38,7 @@ of the change that produced the text.
 | `web/` | the browser reader, its byte sources, the Worker it runs in, and the size control -- `web/README.md` |
 | `tests/` | the engine's contract, the read paths held to each other, the format's damage cases; `tests/common` holds what more than one file needs |
 | `bench/` | the benchmark suite: its own cargo workspace, the arms, the runner, the gate and the figures -- `bench/DESIGN.md` |
+| `experiments/ffi/` | what a C ABI and a Python binding cost a point read, borrowed against copied, beside LMDB's and RocksDB's C APIs; its own manifest and dated results, and not built by the gate -- its `README.md` |
 
 One writer produces the format, `SegmentWriter`, with two callers -- `Db`
 when it seals or compacts, and a caller with sorted write-once input -- and
@@ -2393,7 +2402,7 @@ resident beside a form that no read sends there, 85 MiB of the 496 a store
 of five million keys held under 640 MiB, with 38 MiB of ordered indexes
 beside it, and the form the bound could not hold faulted for the want of
 them; `mincore` over the store's files read it
-(`scratch/wave2/probe/resident.py`), and the drop unmaps first
+(`scripts/resident.py`), and the drop unmaps first
 (`MADV_DONTNEED`, `Options::zpages_drop_raw`).
 
 **A second mechanism that masks the first in a test.** Once the settle swept

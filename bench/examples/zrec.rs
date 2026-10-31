@@ -7,8 +7,10 @@
 //! hundred and sixteen bytes, and a scan of fifty records decodes the whole
 //! of every group it touches. Under the bound at five million keys the
 //! decode is the largest cost the form's reads have left, and the cells the
-//! engine loses there are E's scans and D's reads
-//! (`scratch/wave2/stage4.md`). This probe writes the same records as a form
+//! engine loses there are E's scans and D's reads (`bench/scripts/pair.sh
+//! lmdb-nordahead supdb-cache64tofitautozpages 5000000 --reps 3 --bound
+//! 671088640 --passes read,read-threaded,scan,scan-threaded,mixes --ops-div
+//! 10` at `dda952d`). This probe writes the same records as a form
 //! whose records decode on their own -- a group of sixteen records, its
 //! first key raw, each record's key front-coded against it (the shared
 //! prefix's length and the suffix), each value compressed on its own with

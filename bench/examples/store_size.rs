@@ -43,9 +43,7 @@ fn main() {
     let mut a = std::env::args().skip(1);
     let size: u64 = a.next().unwrap().parse().unwrap();
     let arms: Vec<String> = a.next().unwrap().split(',').map(str::to_string).collect();
-    let base = std::path::PathBuf::from(
-        "/tmp/claude-0/-home-user-supdb/ee7b8ded-0bc9-50fc-95d2-e84de73c4b53/scratchpad/ssz",
-    );
+    let base = std::env::temp_dir().join("supdb-store-size");
     let payload = Payload::new(100, 0.5, 0xE1);
     let stored = size * (16 + 100);
     // The map LMDB is opened with, as run.rs sizes it.

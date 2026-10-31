@@ -1,5 +1,15 @@
 # Z-pages: a compact second form for out-of-core point reads and scans
 
+> The design as it was registered before the compact form was built, kept
+> for its predictions, its verdict rules and its reasoning. The engine as
+> built is described by `docs/engine.md` ("Out of core: the second form")
+> and the module docs of `src/db/zpages.rs`, `src/db/zfile.rs` and
+> `src/db/zselect.rs`; where they differ from this document, they are
+> current. The commits and line numbers below are those of the trunk the
+> design was written against, `claude/performance-dimensions-analysis-gijutv`;
+> the probe its commands run is `bench/examples/zprobe/`, and the `$Z` they
+> set is the scratchpad of the session that wrote them.
+
 Pre-registered design for the first instance of the principle in `CLAUDE.md:526-543` ("a cell a
 comparator wins is a workload the engine has no strategy for"). Written against HEAD `4ea80c4` and revised
 against three adversarial reviews at HEAD `5dbfa23`; every change the revision made is listed, finding by
