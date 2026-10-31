@@ -262,11 +262,16 @@ Next:
   in its pairing. The build sync's arms had read more slow reps than
   without (9 of 16 against 5, unresolved) before it; read it again with
   the cold partitions built.
-- Step (4): against LMDB at 5M under 640 MiB the shipping `Auto` shape
-  (`...dropland50`) reads E at 1.40-1.63x and every other cell ahead but
-  the read pass in a sitting whose reps went cold (0.63x; 2.0x in the
-  other). E is not the open cell there any more; the profile of E was
-  not taken.
+- Step (4): the two pairings of this step (`lp-vslmdb-*`, `lp-vslmdb2-*`)
+  ran against `lmdb`, LMDB as it opens by default with the kernel's
+  readahead on, and were written up, in `adf69cc`'s message too, as
+  against LMDB with its readahead off; every pricing before them ran
+  against `lmdb-nordahead`. Against `lmdb`, with the cold partitions
+  built, every cell of both orders is ahead (E 1.59-1.61x, the read pass
+  1.8-2.1x, the install 2.2-4.2 s after the load in every rep;
+  `stage4.md`). The margin against `lmdb-nordahead`, which reads E about
+  half again as fast as `lmdb` at 10M under 1 GiB, is the open question
+  of the step.
 - The ordered load's tenth: the form files written beside the load.
 - The writer census's cost on A and F while the controller decides (two
   sittings, 0.84-0.93, unresolved at three pairs, no mechanism found at a
