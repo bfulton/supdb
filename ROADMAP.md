@@ -20,12 +20,12 @@ is the cost of the design, and showing them is what makes the wins credible.
 
 The suite has to be fair before any of its numbers are quoted.
 
-- [ ] **Tune the buffered RocksDB arm.** `rocksdb-nosync` ran RocksDB on
+- [x] **Tune the buffered RocksDB arm.** `rocksdb-nosync` ran RocksDB on
   defaults (no Bloom filter, the default block cache, default write
   buffers) while the durable arm got the full tuning. The roster's
-  buffered RocksDB is `rocksdb-tuned-nosync` now, `rocksdb-tuned` with the
-  sync alone off. Done when a row is banked with it. Until then, no
-  buffered RocksDB number is quoted.
+  buffered RocksDB is `rocksdb-tuned-nosync`, `rocksdb-tuned` with the
+  sync alone off, and the rows banked from 2026-10-31 carry it. A buffered
+  RocksDB number is quoted from those rows and never from `rocksdb-nosync`.
 - [ ] **A recovery workload.** Crash at a known point (kill the process
   after N committed batches, with an uncommitted tail), then time the open
   and the first read, for every arm. Done when it runs in the suite and

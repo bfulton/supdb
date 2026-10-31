@@ -669,6 +669,14 @@ def load_ooc(specs):
     return groups
 
 
+def arm_note(arm):
+    """The supdb arm of an out-of-core pairing, named as the suite names it
+    and said in words where it is not the default."""
+    if "autozpages" in arm:
+        return f"as {arm}, the compact form under ZPages::Auto, which the default leaves off"
+    return f"as {arm}"
+
+
 def ooc_ratio(sit, wl, q):
     v = sit["vals"].get((wl, q))
     if not v or not v[sit["comp"]] or not v[sit["sup"]]:
@@ -695,7 +703,9 @@ def ooc_figure(T, groups, foot):
     left = 0.2 if ng > 1 else 0.27
     span = 0.97 - left
     gap = 0.06
-    pw = (span - gap * (ng - 1)) / ng - 0.07
+    # room right of each panel for its range label, "0.66–0.77×" the widest
+    tail = 0.10 if ng == 1 else 0.07
+    pw = (span - gap * (ng - 1)) / ng - tail
     bottom, height = 1.45 / h, n * 0.36 / h
     marks = ["o", "D", "s", "^"]
     allr = [ooc_ratio(s, wl, q) for g in groups for s in g["sittings"] for _, wl, q in OOC_ROWS]
@@ -703,7 +713,7 @@ def ooc_figure(T, groups, foot):
     lo = min(0.5, min(allr) / 1.25)
     hi = max(allr) * 1.3
     for gi, g in enumerate(groups):
-        ax = fig.add_axes([left + gi * (pw + gap + 0.07), bottom, pw, height])
+        ax = fig.add_axes([left + gi * (pw + gap + tail), bottom, pw, height])
         ax.set_facecolor(T["plot"])
         ax.set_xscale("log")
         ax.set_xlim(lo, hi)
@@ -1119,7 +1129,12 @@ def save(fig, out, name, dark=False):
     else:
         fig.savefig(os.path.join(out, name + ".png"))
         fig.savefig(os.path.join(out, name + ".pdf"))
-        fig.savefig(os.path.join(out, name + ".svg"))
+        svg = os.path.join(out, name + ".svg")
+        fig.savefig(svg)
+        # matplotlib writes the SVG 1.1 DOCTYPE, which nothing needs and
+        # which hosts that refuse DTDs in served XML refuse the file for
+        text = open(svg).read()
+        open(svg, "w").write(re.sub(r"<!DOCTYPE[^>]*>\s*", "", text, count=1))
     plt.close(fig)
 
 
@@ -1167,7 +1182,10 @@ def main():
             ooc_foot = (
                 "bench ab, two arms a process, three pairs a sitting after a warmup pair, the order swapped between sittings; "
                 "--bound 671088640, a cgroup memory limit of 640 MiB over the process and its page cache; reads divided by ten; "
-                + " · ".join(f"{g['title']}: supdb {', '.join(sorted({s['sha'] for s in g['sittings']}))}" for g in groups)
+                + " · ".join(
+                    f"against {g['title']}: supdb {arm_note(g['sittings'][0]['sup'])}, at {', '.join(sorted({s['sha'] for s in g['sittings']}))}"
+                    for g in groups
+                )
             )
             save(ooc_figure(T, groups, ooc_foot), args.out, "fig7-out-of-core", theme == "dark")
 
