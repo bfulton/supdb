@@ -87,7 +87,12 @@ pub fn is_seek_floor(workload: &str) -> bool {
 pub fn is_comparator(arm: &str) -> bool {
     matches!(
         arm,
-        "lmdb" | "lmdb-nordahead" | "lmdb-nosync" | "rocksdb-tuned" | "rocksdb-nosync"
+        "lmdb"
+            | "lmdb-nordahead"
+            | "lmdb-nosync"
+            | "rocksdb-tuned"
+            | "rocksdb-nosync"
+            | "rocksdb-tuned-nosync"
     )
 }
 

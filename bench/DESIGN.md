@@ -14,11 +14,12 @@ The workloads below, plus four floors. Each yields one or more quantities.
 
 | workload | shape | quantities |
 |---|---|---|
-| `load` | n keys in key order, 100-byte values, durable per batch | ops/s, device bytes written per byte stored, bytes on disk per byte stored |
+| `load` | n keys in key order, 100-byte values, a commit per batch under the arm's guarantee | ops/s, device bytes written per byte stored, bytes on disk per byte stored |
 | `load-shuffled` | the same keys in shuffled order | ops/s |
 | `read` | uniform point reads over the loaded set, on one thread and again on each of the class's reader-thread counts: two, doubling, one fewer than its cores | reads/s, p99 µs; reads/s per thread count |
 | `scan` | `size/100` scans of 100 entries, from uniform random starts, on one thread; `size` scans a thread again on each of the class's reader-thread counts | entries/s; entries/s per thread count |
 | `ycsb` | core A–F on the loaded store, zipfian, a sixth of the keys in operations per mix | ops/s per mix |
+| `scan-mixed` | the threaded `scan` passes again on the store the six mixes leave | entries/s per thread count |
 | `scan-lag` | on the store the shuffled load leaves, the keys updated in slices to 0, 1, 10 and 100% of the store, each slice a burst of batches followed by the `scan` workload's scans with nothing merged between | entries/s of each point's scans; updates/s of each point's burst |
 | `wal-floor` | framed 1,000-record batches appended to one file, one `fdatasync` each, no engine | ops/s |
 | `scan-floor` | one `mmap` sequential walk of a file the top rung's size (capped at 4 GiB), no engine | bytes/s |
@@ -207,14 +208,31 @@ comparator a user would otherwise pick.
 
 | guarantee | supdb | comparators |
 |---|---|---|
-| durable per batch | `supdb` (default), `supdb-forms`, `supdb-noadvice`, `supdb-nocache`, `supdb-cache256` | `lmdb`, `rocksdb-tuned` |
-| buffered | `supdb-ingest` | `lmdb-nosync`, `rocksdb-nosync` |
+| durable per batch | `supdb` (default), `supdb-forms`, `supdb-settle`, `supdb-nosnap`, `supdb-noadvice`, `supdb-nocache`, `supdb-cache256` | `lmdb`, `rocksdb-tuned` |
+| buffered | `supdb-ingest` | `lmdb-nosync`, `rocksdb-tuned-nosync` |
+
+A comparator runs one stated configuration in both groups, the two
+differing in the sync alone: RocksDB as its tuning guide sets it for this
+load (`rocksdb-tuned`, `rocksdb-tuned-nosync`: a 256 MB block cache, a
+10-bit Bloom filter with index and filter blocks cached, bulk-load write
+buffers, four background jobs), and LMDB as it opens, which in memory is
+how its documentation configures it (past memory the bounded roster's
+LMDB has its readahead off, below). The buffered group ran
+RocksDB as it ships (`rocksdb-nosync`: its 32 MB default block cache and
+no Bloom filter) beside the tuned durable arm until the rows of November 2026, so
+every buffered cell against RocksDB in the rows before is against a
+configuration no deployment would choose; that series stops there and the
+tuned one starts.
 
 Every shipping option is an arm because a user can choose it and deserves the
-number. `supdb-forms` is where the range-read structure is kept: the writer
-holds every overlaid block's form current at each commit, so a reader walks
-one structure, against the default where each reader merges the partition
-with the unsealed keys for itself. The pair prices the trade directly --
+number. `supdb-forms` is where the range-read structure is kept at every
+commit: the writer holds every overlaid block's form current whether or not
+a handle is there to read it, so a reader walks one structure, against the
+default, which keeps the forms only once a caller's handle is live and
+otherwise leaves each read to merge the partition with the unsealed keys for
+itself. `supdb-settle` files the writes at the commit with no forms, and
+`supdb-nosnap` gives each handle a scan snapshot of its own instead of the
+one the state publishes (`Options::share_snapshot` off). The pair prices the trade directly --
 what the writer pays at its commits against what a scan past unsealed
 writes costs -- and `scan-mixed`, the threaded scans on the store the mixes
 leave, is the workload it was added for. A cache is matched like a guarantee: `supdb`'s block cache has no
@@ -233,7 +251,7 @@ out-of-core regime reached under a memory bound.
 
 | scale | top of the ladder | reps | where |
 |---|---|---|---|
-| `quick` | 300 000 keys — measured once: 160 s with every arm, the six YCSB mixes and the floors on a 4-core VM | 5 | every pull request, on a GitHub Actions runner |
+| `quick` | 300 000 keys | 5 | every pull request, on a GitHub Actions runner |
 | `full` | the rung at which the store is at least 1.5× the machine's memory | 7 | on demand or scheduled, on a quiet machine |
 | `ooc` | ten million keys, from three million, under `--bound BYTES`: a cgroup of the run's own with that memory limit, the process moved into it before anything is measured | 3 | on demand, on a quiet Linux machine with the cgroup v1 memory controller writable (`scripts/ooc.sh`) |
 
@@ -243,12 +261,14 @@ reads from the device where the same store unbounded reads from memory,
 and its rows live under `runs/ooc/`. Its default arms are the default,
 the three options whose difference is what a read past the page cache
 costs (`supdb-nocache`, `supdb-cache256`, `supdb-noadvice`) and the
-durable comparators, LMDB twice: as a user gets it and with its readahead
-off (`lmdb-nordahead`), the LMDB a user configures for the regime. The
+durable comparators: LMDB with its readahead off (`lmdb-nordahead`), as
+LMDB's documentation configures a store larger than memory, and RocksDB
+tuned. LMDB as it opens by default, which reads every random read past the
+cache with its readahead window, is not in the roster. The
 scan floor's file is written and synced outside the group and dropped
 from the cache; the floors and every pass run inside it.
 
-Sixteen more arms exist for a bounded pairing and are in no roster, because
+Further arms exist for a bounded pairing and are in no roster, because
 each prices one engine option against the arm it differs from in one
 process (`bench ab --arms <base>,<arm>`) and is chosen by hand:
 `supdb-autozpages` and `supdb-nocacheautozpages` are `supdb` and
@@ -344,7 +364,7 @@ combined arm with a scan's start key kept with its block
 scan started skipping the partition's seek, where the default seeks every
 start; `supdb-cache128tofitautozpages` and `supdb-cache256tofitautozpages`
 are the combined arm with the block cache's budget at 128 and 256 MB
-(`Options::scan_cache_bytes`), where the default's is 64;
+(`Options::scan_cache_bytes`), where the combined arm's is 64;
 `supdb-nocachezpagesstored` is the forced form with every group stored
 verbatim (`Options::zpages_store_all`), no LZ4, where the default compresses
 every group that shrinks; `supdb-cache64tofitzpages` is the forced form with
@@ -428,7 +448,8 @@ default.
 `full`'s top is a function of the machine, not a constant, so its curve
 crosses the memory line everywhere it runs — the 16 GB box and the 4 GB VM
 alike. It is also why `full` is not a job with a timeout on it: on a 16 GiB
-M2 its top rung is 222 million keys, and the ladder measured 344s at 300 000
+M2 the top it asks for is 222 million keys, which the ladder rounds up to its
+300-million rung, and the ladder measured 344s at 300 000
 against 19 815s at ten million — about 4.3× a rung for 3.3× the keys.
 
 Do not size a run from that. It is a whole-rung figure averaged over seven
@@ -541,7 +562,7 @@ alike, position zero included. Part of it is the device: syncing and
 letting it settle before each pass cut the penalty to 1.067x, 1.056x and
 1.019x at the first three rungs, so the first arm of a rep does wait on
 what the pass before it queued -- position zero is the only arm whose
-predecessor is the previous rep's last, `rocksdb-nosync`, which never
+predecessor is the previous rep's last, the buffered RocksDB, which never
 flushes and hands the kernel its memtable at close. A sync without the
 settle did not reproduce that, so queued writeback is part of the cause
 and not all of it.
@@ -564,7 +585,7 @@ Nothing here corrects for it yet, then, and not because the interventions
 are unclean so much as unmeasured: at the two smallest rungs a load is 11-37 ms
 and settling the device before each pass moves it by about as much as the
 bias does, so the cure is inside the error of the disease. Rotating the
-roster would spread the cost rather than remove it, and with eleven arms
+roster would spread the cost rather than remove it, and with twelve arms
 and five reps it cannot spread it evenly, so it would trade a bias that is
 named for one that is not. Until the residual is found, read a cross-arm
 ratio on `load` or `scan-lag` against `supdb` as carrying a few percent
@@ -607,7 +628,7 @@ measurements[]:
 
 `size` is the ladder rung in keys. The floors carry no size.
 
-`samples` is the raw per-rep values — five or seven floats. Median,
+`samples` is the raw per-rep values — three, five or seven floats. Median,
 confidence interval (CI) and spread are computed when the series is read, so a change to the statistic
 recomputes history rather than stranding it.
 
@@ -735,9 +756,9 @@ disagrees with the data is a bug in that program and not a stale file.
 
 ## Machines
 
-The series is columns, one per class. Nothing is the canonical machine. The
-README figure is drawn per class from the latest `full` row, stamped with
-its engine commit and date.
+The series is columns, one per class. Nothing is the canonical machine. A
+figure is drawn per class from the class's rows, stamped with its engine
+commit and date.
 
 ## Where the old suite went
 

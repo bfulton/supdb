@@ -7312,13 +7312,12 @@ impl Engine for Supdb {
     }
 }
 
-// ------------------------------------------------------------------- redb --
+// ---------------------------------------------------------------- rocksdb --
 
-/// redb: the closest architectural sibling in the field.
-///
-/// Single writer, many readers, MVCC, a copy-on-write B-tree -- and
-/// deliberately *not* mmap-based. It is therefore the comparison that isolates
-/// the mmap decision rather than confounding it with the storage model.
+/// RocksDB: the LSM a user who wants writes would otherwise pick, opened
+/// with one stated configuration (`create_tuned`) in both guarantees; the
+/// configuration it ships with is kept as `rocksdb-nosync`, for the rows
+/// that carry it.
 pub struct Rocks {
     /// Shared with the reader threads: the handle is `Sync`, and a thread
     /// reads through this one with read options of its own.
@@ -7348,6 +7347,17 @@ impl Rocks {
     /// reader can recognise as a deployment.
     pub fn create_tuned(path: &Path) -> Res<Rocks> {
         Rocks::with(path, true, true, false)
+    }
+
+    /// The tuned configuration with commits that do not reach the device:
+    /// the buffered group's RocksDB. The buffered group ran RocksDB as it
+    /// ships (`rocksdb-nosync`: its 32 MB default block cache and no Bloom filter)
+    /// while the durable group ran it tuned, so every buffered cell
+    /// against RocksDB was read against a configuration no deployment
+    /// would choose; this is the one stated configuration in both groups,
+    /// differing from `rocksdb-tuned` in the sync alone.
+    pub fn create_tuned_nosync(path: &Path) -> Res<Rocks> {
+        Rocks::with(path, false, true, false)
     }
 
     /// Tuned, and drained at `sync`: memtable flushed, every level
@@ -7446,7 +7456,8 @@ impl Engine for Rocks {
     fn name(&self) -> &'static str {
         match (self.sync, self.tuned, self.drain) {
             (_, true, true) => "rocksdb-tuned-drain",
-            (_, true, false) => "rocksdb-tuned",
+            (true, true, false) => "rocksdb-tuned",
+            (false, true, false) => "rocksdb-tuned-nosync",
             (true, false, _) => "rocksdb",
             (false, false, _) => "rocksdb-nosync",
         }
@@ -7735,9 +7746,6 @@ impl Engine for Lmdb {
     }
 }
 
-// ------------------------------------------------------------------- sled --
-
-/// sled: a log-structured B-tree, and the other well-known Rust embedded store.
 // ---------------------------------------------------------------------------
 // The arms.
 use crate::row::Guarantee;
@@ -7757,24 +7765,25 @@ pub const ARMS: [&str; 12] = [
     "rocksdb-tuned",
     "supdb-ingest",
     "lmdb-nosync",
-    "rocksdb-nosync",
+    "rocksdb-tuned-nosync",
 ];
 
 /// The arms a bounded run (`Scale::Ooc`) measures by default: the default
 /// and the three shipping options whose difference is what a read past
 /// the page cache costs -- no block cache, the cache bounded at RocksDB's
 /// 256 MB, and no read advice -- against the durable comparators, LMDB
-/// twice: as a user gets it and with its readahead off, which is the LMDB
-/// a user configures for the regime. The buffered group is not here: a
-/// bounded row is about reads from the device, and a buffered load reads
-/// nothing a durable one does not. `--arms` overrides it as it does
+/// with its readahead off, which is how LMDB's documentation configures a
+/// store larger than memory, and RocksDB tuned. LMDB as it opens by default
+/// ran beside it for a while, a second comparison that read the same
+/// question against a weaker configuration. The buffered group is not
+/// here: a bounded row is about reads from the device, and a buffered load
+/// reads nothing a durable one does not. `--arms` overrides it as it does
 /// `ARMS`.
-pub const OOC_ARMS: [&str; 7] = [
+pub const OOC_ARMS: [&str; 6] = [
     "supdb",
     "supdb-nocache",
     "supdb-cache256",
     "supdb-noadvice",
-    "lmdb",
     "lmdb-nordahead",
     "rocksdb-tuned",
 ];
@@ -8029,7 +8038,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestbglag"
         | "supdb-ingesthold"
         | "lmdb-nosync"
-        | "rocksdb-nosync" => Guarantee::Buffered,
+        | "rocksdb-nosync"
+        | "rocksdb-tuned-nosync" => Guarantee::Buffered,
         _ => return None,
     })
 }
@@ -8393,6 +8403,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "lmdb-nosync" => Box::new(Lmdb::create_nosync(dir, map_gb)?),
         "rocksdb-tuned" => Box::new(Rocks::create_tuned(dir)?),
         "rocksdb-nosync" => Box::new(Rocks::create(dir, false)?),
+        "rocksdb-tuned-nosync" => Box::new(Rocks::create_tuned_nosync(dir)?),
         other => return Err(format!("no such arm: {other}")),
     })
 }
@@ -8457,7 +8468,10 @@ mod tests {
     fn the_readahead_arm_differs_from_lmdb_in_one_flag() {
         assert_eq!(guarantee("lmdb-nordahead"), Some(Guarantee::Durable));
         assert!(OOC_ARMS.contains(&"lmdb-nordahead"));
-        assert!(OOC_ARMS.contains(&"lmdb"));
+        assert!(
+            !OOC_ARMS.contains(&"lmdb"),
+            "the bounded roster runs LMDB once, as its docs configure it past memory"
+        );
         let root =
             std::env::temp_dir().join(format!("supdb-bench-nordahead-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -8474,6 +8488,47 @@ mod tests {
         assert!(!plain.env_flags().contains(heed::EnvFlags::NO_READ_AHEAD));
         drop(plain);
         drop(off);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The buffered comparators are the durable ones with commits that do
+    /// not reach the device, and nothing else: `rocksdb-tuned-nosync` is
+    /// `rocksdb-tuned` in every option but the sync, and `lmdb-nosync` is
+    /// `lmdb` with `NO_SYNC` over its flags. The buffered RocksDB the
+    /// roster ran before was RocksDB as it ships beside a tuned durable
+    /// one: a difference that was not the one the group is for, and the
+    /// roster holds the tuned one now.
+    #[test]
+    fn the_buffered_comparators_differ_from_the_durable_ones_in_the_sync() {
+        assert_eq!(guarantee("rocksdb-tuned-nosync"), Some(Guarantee::Buffered));
+        assert!(ARMS.contains(&"rocksdb-tuned-nosync"));
+        assert!(!ARMS.contains(&"rocksdb-nosync"));
+        let root = std::env::temp_dir().join(format!("supdb-bench-nosync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let durable = Rocks::create_tuned(&root.join("rocksdb-tuned")).unwrap();
+        let buffered = Rocks::create_tuned_nosync(&root.join("rocksdb-tuned-nosync")).unwrap();
+        assert_eq!(durable.name(), "rocksdb-tuned");
+        assert_eq!(buffered.name(), "rocksdb-tuned-nosync");
+        assert!(durable.features().durable_commit);
+        assert!(!buffered.features().durable_commit);
+        assert_eq!(
+            Features {
+                durable_commit: true,
+                ..buffered.features()
+            },
+            durable.features()
+        );
+        assert_eq!(
+            (buffered.tuned, buffered.drain),
+            (durable.tuned, durable.drain)
+        );
+        let d = Lmdb::create(&root.join("lmdb"), 1).unwrap();
+        let b = Lmdb::create_nosync(&root.join("lmdb-nosync"), 1).unwrap();
+        assert_eq!(d.name(), "lmdb");
+        assert_eq!(b.name(), "lmdb-nosync");
+        assert!(!b.features().durable_commit);
+        assert_eq!(b.env_flags() ^ d.env_flags(), heed::EnvFlags::NO_SYNC);
+        drop((durable, buffered, d, b));
         let _ = std::fs::remove_dir_all(&root);
     }
 
