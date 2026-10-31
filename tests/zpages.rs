@@ -6977,7 +6977,8 @@ fn land_store_with(
 /// percent above where the store stands it builds
 /// nothing; with its records read out of the page cache it builds
 /// nothing, counts each partition cold once, and looks at none of them
-/// again when they read resident; and past the whole budget the builds drop
+/// again when they read resident -- until the store passes the selector's
+/// line, past which it builds them from the device; and past it the builds drop
 /// the records behind them, and the look that finds the store past it
 /// first swaps the records of the partitions built ahead under it for
 /// their files (`Options::zpages_land_drop_past`).
@@ -7073,6 +7074,36 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
         "cold once, never built ahead: {c:?}"
     );
     assert!(form_files(&dir).is_empty(), "nothing ahead from the device");
+    // Past the selector's line the bet is the controller's to win, and the
+    // partitions found cold are built ahead from the device after all
+    // (`Options::zpages_land_cold_past`); with the option off they stay
+    // the controller's.
+    inject.set_budget(raw * 2 / 3);
+    assert!(
+        tick_until(&db, 200, |c| c.prebuilt >= c.partitions),
+        "cold past the line, built ahead: {:?}",
+        db.zpage_counts()
+    );
+    assert_eq!(form_files(&dir).len() as u64, db.zpage_counts().partitions);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let (dir, db, _model, inject, raw) = land_store_with("auto-land-cold-skip", 50, |o| {
+        o.zpages_land_cold_past = false
+    });
+    inject.set_records_resident(0.0);
+    inject.set_budget(raw * 2 / 3);
+    assert!(
+        tick_until(&db, 40, |c| c.ahead_cold >= c.partitions),
+        "{:?}",
+        db.zpage_counts()
+    );
+    wait_steps(&db, 20);
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.prebuilt, c.build_starts),
+        (0, 0),
+        "the bar past the line too: {c:?}"
+    );
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     // Past the whole budget the raw form cannot be held, and the builds
@@ -7447,6 +7478,10 @@ fn an_attach_of_form_files_built_ahead_is_bought_on_the_prediction() {
             land_store_with(&format!("auto-land-eager-{on}-{gone}-{near}"), 50, |o| {
                 o.partition_bytes = Some(160 << 10);
                 o.zpages_attach_eager = on;
+                // The partitions read cold stay the controller's past the
+                // line too, so that the sample finds their files missing;
+                // the cold builds past it are the builds-ahead test's.
+                o.zpages_land_cold_past = false;
             });
         inject.set_budget(raw * 3 / 2);
         assert!(
@@ -7491,9 +7526,14 @@ fn an_attach_of_form_files_built_ahead_is_bought_on_the_prediction() {
         if !near {
             inject.set_fault_cost(FAULT_1MS);
         }
-        let bought = tick_until(&db, 120, |c| c.sel_installs >= 1);
+        // The buy waits for the sample job, which runs in wall time while
+        // the ticks run the injected clock: under the file's load it lands
+        // late, so the cases that buy get the four hundred ticks the other
+        // buys in this file get.
+        let buys = on && gone <= 1 && !near;
+        let bought = tick_until(&db, if buys { 400 } else { 120 }, |c| c.sel_installs >= 1);
         let c = db.zpage_counts();
-        if on && gone <= 1 && !near {
+        if buys {
             assert!(bought, "{what}: installed with no read: {c:?}");
             assert_eq!(c.census_reads, 0, "{what}: nothing read: {c:?}");
             assert!(
