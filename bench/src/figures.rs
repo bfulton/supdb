@@ -53,7 +53,7 @@ fn style(arm: &str) -> (&'static str, &'static str) {
         "supdb-cache256" => (ACCENT, "2,3"),
         "lmdb" | "lmdb-nosync" => (GREY, ""),
         "lmdb-nordahead" => (GREY, "4,2"),
-        "rocksdb-tuned" | "rocksdb-nosync" => (GREY, "7,4"),
+        "rocksdb-tuned" | "rocksdb-tuned-nosync" | "rocksdb-nosync" => (GREY, "7,4"),
         _ => (GREY, "2,3"),
     }
 }
@@ -73,7 +73,8 @@ fn pretty(arm: &str) -> &'static str {
         "lmdb-nordahead" => "LMDB (no readahead)",
         "lmdb-nosync" => "LMDB (nosync)",
         "rocksdb-tuned" => "RocksDB",
-        "rocksdb-nosync" => "RocksDB (nosync)",
+        "rocksdb-tuned-nosync" => "RocksDB (nosync)",
+        "rocksdb-nosync" => "RocksDB (untuned, nosync)",
         _ => "?",
     }
 }
@@ -557,6 +558,7 @@ fn message(
         "lmdb-nordahead",
         "lmdb-nosync",
         "rocksdb-tuned",
+        "rocksdb-tuned-nosync",
         "rocksdb-nosync",
     ] {
         if let (Some(m), Some(c)) = (mine, at(comp)) {

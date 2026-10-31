@@ -14,10 +14,10 @@ error bars and the machine class are computed when the series is read.
 ```sh
 cd bench
 cargo build --release
-./target/release/bench run --scale quick        # about three minutes; gates a PR
+./target/release/bench run --scale quick        # tens of minutes; gates a PR
 ./target/release/bench run --scale full         # hours, on a quiet machine
 sh scripts/ooc.sh 1610612736                     # out of core under a 1.5 GiB bound; Linux, cgroup v1
-./target/release/bench gate runs-ci/quick/*.json # a row against the series
+./target/release/bench gate runs/quick/<row>.json # a row against the series
 ./target/release/bench figures --scale quick    # every figure, from runs/
 ./target/release/bench machine                  # the host as a row records it
 ```
@@ -42,12 +42,19 @@ unversioned exists). CI runs the same script, and so does the engine's
 | `load-shuffled` | the same keys in a shuffled order |
 | `read` | uniform point reads over the loaded set, on one thread and on each of the class's reader-thread counts |
 | `scan` | ordered scans of 100 entries from uniform starts, on one thread and on each of the class's reader-thread counts |
+| `scan-lag` | scans after a burst of updates over 1%, 10% and 100% of the keys, before the engine has caught up, and the bursts' own rates |
 | `ycsb-A` … `ycsb-F` | the YCSB core mixes on the loaded store |
-| `wal-floor`, `scan-floor` | what the device does with no engine in the way |
+| `scan-mixed` | threaded scans on the store the mixes leave |
+| `wal-floor`, `scan-floor`, `mem-floor`, `page-floor` | what the host does with no engine in the way |
 
-Arms: `supdb`, `supdb-noadvice`, `supdb-nocache`, `supdb-cache256`, `lmdb`,
-`rocksdb-tuned` (durable per batch); `supdb-ingest`, `lmdb-nosync`,
-`rocksdb-nosync` (buffered). Every comparison is within a guarantee.
+`DESIGN.md` has every workload and quantity, and the bounded scale's
+floors.
+
+Arms: `supdb`, `supdb-forms`, `supdb-settle`, `supdb-nosnap`,
+`supdb-noadvice`, `supdb-nocache`, `supdb-cache256`, `lmdb`, `rocksdb-tuned`
+(durable per batch); `supdb-ingest`, `lmdb-nosync`, `rocksdb-tuned-nosync`
+(buffered). Every comparison is within a guarantee, and a comparator differs
+between the two groups in the sync alone (`DESIGN.md`, Arms).
 
 ## Checks
 

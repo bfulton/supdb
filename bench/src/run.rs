@@ -3353,7 +3353,6 @@ fn resident_bytes() -> Option<u64> {
     Some(pages * u64::try_from(page).ok()?)
 }
 
-/// The top rung for `full` on this machine: the store at least 1.5x memory.
 /// Free bytes on the filesystem holding `dir`, or None if it cannot be read.
 fn free_bytes(dir: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
@@ -3370,6 +3369,7 @@ fn free_bytes(dir: &Path) -> Option<u64> {
     u64::try_from(u128::from(st.f_bavail) * u128::from(st.f_frsize)).ok()
 }
 
+/// The top rung for `full` on this machine: the store at least 1.5x memory.
 pub fn full_top(mem_total_kb: u64, value_size: usize) -> u64 {
     let need = mem_total_kb as f64 * 1024.0 * 1.5;
     (need / (KEY_SIZE + value_size) as f64).ceil() as u64
