@@ -2466,6 +2466,47 @@ pub struct Options {
     /// first scan about what the copies returned over the pass. The arms
     /// that cap the conversions turn it on.
     pub ahead_converts: bool,
+    /// Whether the builder ahead sends each form with the keys that bound
+    /// its block -- the block's first record's key and the next block's,
+    /// or the partition's fences at the ends -- read on its own thread
+    /// beside the records the build has just walked, so that the install
+    /// splices the keys written since the builder's commit by them and
+    /// reads nothing of the partition. Off: the install reads the two
+    /// keys from the partition's records itself, as it did. Out of core
+    /// those were two cold pages a form: at ten million keys under 2 GiB
+    /// the install of a builder's forms was one pass of the upkeep thread
+    /// of twelve seconds and eighty thousand major faults, pinned, and
+    /// every table a publish retired meanwhile waited behind the pin with
+    /// its snapshot copy until the process was killed. `supdb-installreads`
+    /// is the arm that reads them at the install.
+    pub ahead_sends_bounds: bool,
+    /// The bytes the live tables kept for the writer's upkeep's next look
+    /// (`State::replaced`) may take, each counted at twice its capacity,
+    /// the table and the snapshot copy a seal near reads makes of it; the
+    /// newest are kept, one at least and `REPLACED_CAP` at most. Zero,
+    /// the default, is an eighth of the memory available to the process
+    /// (`zfile::read_budget`'s limit: the cgroup's bound, or the
+    /// machine's memory), and where that cannot be read the count alone
+    /// bounds them. A look further behind than the tables kept drops the
+    /// writer's tables, as it does past the count.
+    pub upkeep_keep_bytes: usize,
+    /// Whether the upkeep thread gives its forms up when the writes have
+    /// outrun it: it drops its tables wherever it is in its pass, and
+    /// nothing is filed into forms, no seal makes a snapshot copy for
+    /// scans and no landing takes its pieces' ranks until the store is
+    /// scanned again, as far from reads. Two things say the writes have
+    /// outrun it: a publish that keeps fewer tables for its look than the
+    /// look is behind, and its own pass, once the tables landed since it
+    /// pinned -- held by nobody but the pin -- cost more than
+    /// `upkeep_keep_bytes`. Out of core every key a pass resolves is a
+    /// major fault on a partition's page, so a pass runs for seconds while
+    /// the writer freezes and the seals land: at ten million keys under
+    /// 2 GiB the tables that landed behind one pass's pin, each with its
+    /// snapshot copy, were what the group killed the process for, with the
+    /// look current throughout. Off: the thread files on and the look
+    /// drops the tables when it falls behind. `supdb-noabandon` is the arm
+    /// that files on.
+    pub upkeep_abandons: bool,
     /// Whether a fill on the upkeep thread leaves the rest of its
     /// conversions of dense forms the moment a newer commit is posted or
     /// the writer wants the upkeep back, so that through a burst the
@@ -3270,6 +3311,9 @@ impl Default for Options {
             forms_convert_unread: true,
             forms_convert_cap: 0,
             ahead_converts: false,
+            ahead_sends_bounds: true,
+            upkeep_keep_bytes: 0,
+            upkeep_abandons: true,
             forms_convert_yield: true,
             forms_convert_behind: usize::MAX,
             convert_from_form: true,
@@ -8904,6 +8948,14 @@ impl MemTable {
         [au, ac, eu + su + lu, ec + sc + lc, ix]
     }
 
+    /// What keeping the table for a look costs, by
+    /// `Options::upkeep_keep_bytes`: its capacity twice, the table and the
+    /// snapshot copy a seal near reads makes of it.
+    fn kept_bytes(&self) -> u64 {
+        let c = self.census();
+        2 * (c[1] + c[3] + c[4])
+    }
+
     fn new(prefault: bool) -> MemTable {
         MemTable {
             entries: Slab::new(),
@@ -12136,6 +12188,15 @@ const FIT_SWEEP_RETRY: u32 = 64;
 /// The most live tables `State::replaced` keeps.
 const REPLACED_CAP: usize = 8;
 
+/// What a publish keeps in `State::replaced`: the tables live from the
+/// upkeep's last look, `from` (`u64::MAX` before any), on, within `bytes`
+/// (`Options::upkeep_keep_bytes`).
+#[derive(Clone, Copy)]
+struct Keep {
+    from: u64,
+    bytes: u64,
+}
+
 /// PROTOTYPE: records a block spans. A scan of the suite's length touches
 /// one or two.
 const CACHE_BLOCK: usize = 64;
@@ -12981,6 +13042,34 @@ struct Shared {
     /// tables live from there on are the ones a look may still have to
     /// read, and `State::replaced` keeps those. Nothing before a look.
     upkeep_lives: AtomicU64,
+    /// `Options::upkeep_keep_bytes` as resolved at open: the bytes the
+    /// tables kept for the upkeep's look may take, `u64::MAX` where
+    /// nothing bounds them but the count.
+    keep_bytes: u64,
+    /// The store's scans (`Shared::scans_all`) when a publish kept fewer
+    /// tables than the upkeep was behind and asked the thread to give up
+    /// its forms (`Options::upkeep_abandons`), `u64::MAX` when nothing is
+    /// asked. A scan since makes the ask stale: the writer's look has
+    /// dropped the tables by then, and the scan wants forms again.
+    abandon_at: AtomicU64,
+    /// The store's scans when the upkeep thread last gave up its forms,
+    /// `u64::MAX` before it ever has: while the count is still that, the
+    /// writes have outrun the upkeep since the last scan, and the store
+    /// is far from reads whatever the count of writes says.
+    outran_at: AtomicU64,
+    /// The times the upkeep thread gave its forms up, on an ask and on
+    /// what its own pin held.
+    abandons: AtomicU64,
+    abandons_pinned: AtomicU64,
+    /// Tables a landing has retired, the live one a seal was handed or
+    /// the oldest frozen one: what a pass pinned before the landing holds
+    /// and nobody else does.
+    tables_landed: AtomicU64,
+    /// A test's (`Db::hold_upkeep_pass`): bit 1 holds the upkeep thread
+    /// before it begins a pass, bit 2 holds it inside one, pinned; and
+    /// whether it is waiting at either.
+    upkeep_hold_at: std::sync::atomic::AtomicU8,
+    upkeep_holding: std::sync::atomic::AtomicBool,
     /// `Options::forms_trim_bytes`: a handle has freed enough forms that
     /// the trim thread is to look at what the allocator holds free, and
     /// the thread to wake; what the allocator held free after the last
@@ -13439,6 +13528,22 @@ impl Drop for Shared {
 }
 
 impl Shared {
+    /// Every scan over the store, the block path's and the merge path's:
+    /// the count the seal's copy, the abandon's ask and the outrun mark
+    /// are kept by.
+    fn scans_all(&self) -> u64 {
+        self.scans_life.load(AtomicOrdering::Relaxed)
+            + self.scans_merged.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Whether the writes have outrun the upkeep since the store was last
+    /// scanned (`Options::upkeep_abandons`): the thread gave its forms up
+    /// and no scan has come since.
+    fn outran(&self) -> bool {
+        let at = self.outran_at.load(AtomicOrdering::Acquire);
+        at != u64::MAX && at == self.scans_all()
+    }
+
     /// `spare` offered for the writer's next rotation; a spare already
     /// waiting keeps its place and this one is removed.
     fn offer_spare(&self, spare: PathBuf) {
@@ -13893,6 +13998,22 @@ struct FormsState {
     /// form in this handle's tables, which the state's `forms_complete`
     /// takes at each publish.
     tables_complete: std::cell::Cell<bool>,
+    /// The ask to give the forms up (`Shared::abandon_at`) as a step of
+    /// the upkeep thread's pass found it, `u64::MAX` when none did: the
+    /// step stops where it is, every caller up to the pass returns, and
+    /// the forms are given up where nothing is borrowed
+    /// (`Reader::abandon_forms`), the pass's end at the latest, so that
+    /// tables a step left half-settled never go back to the writer.
+    abandoned: std::cell::Cell<u64>,
+    /// `Shared::tables_landed` as the upkeep thread's pass in flight
+    /// pinned its state, and what a table landed under the pin costs
+    /// (`MemTable::kept_bytes` of the largest table the state stands on),
+    /// zero until a landing makes it wanted: what the pass holds that
+    /// would otherwise be freed (`Reader::abandon_asked`).
+    pass_landed: std::cell::Cell<u64>,
+    pass_unit: std::cell::Cell<u64>,
+    /// The ask in `abandoned` was the pass's own pin's, not the writer's.
+    abandon_pinned: std::cell::Cell<bool>,
     /// EXPERIMENT: a handle was claimed while writes were staged, so
     /// the next commit publishes whether or not a scan preceded it.
     publish_due: std::cell::Cell<bool>,
@@ -14059,6 +14180,10 @@ impl FormsState {
             resume_key: std::cell::RefCell::new(Vec::new()),
             dirty_any: std::cell::Cell::new(false),
             tables_complete: std::cell::Cell::new(false),
+            abandoned: std::cell::Cell::new(u64::MAX),
+            pass_landed: std::cell::Cell::new(0),
+            pass_unit: std::cell::Cell::new(0),
+            abandon_pinned: std::cell::Cell::new(false),
             publish_due: std::cell::Cell::new(false),
             scans_seen: std::cell::Cell::new(0),
             scans_life_seen: std::cell::Cell::new(0),
@@ -16400,23 +16525,46 @@ impl State {
     }
 
     /// `replaced` for the state that replaces this one, with `old`, the
-    /// live table, replaced as well when it is: the tables from `from`,
-    /// a value of `lives`, on, and at most `REPLACED_CAP` of them, since
-    /// a look that has fallen further behind drops its tables anyway.
+    /// live table, replaced as well when it is: the tables from
+    /// `keep.from`, a value of `lives`, on, and of those the newest, at
+    /// most `REPLACED_CAP` and while they take no more than `keep.bytes`
+    /// (`Options::upkeep_keep_bytes`), one at least, since a look that has
+    /// fallen further behind drops its tables anyway.
     fn replaced_after(
         &self,
         old: Option<&std::sync::Arc<MemTable>>,
-        from: Option<u64>,
+        keep: Option<Keep>,
     ) -> Vec<std::sync::Arc<MemTable>> {
-        let Some(from) = from else {
+        let Some(keep) = keep else {
             return Vec::new();
         };
         let first = self.lives - self.replaced.len() as u64;
         let all: Vec<_> = self.replaced.iter().chain(old).collect();
-        let skip = (from.saturating_sub(first) as usize)
+        let mut skip = (keep.from.saturating_sub(first) as usize)
             .max(all.len().saturating_sub(REPLACED_CAP))
             .min(all.len());
+        if keep.bytes != u64::MAX {
+            let mut taken = 0u64;
+            let mut held = 0usize;
+            for t in all[skip..].iter().rev() {
+                taken = taken.saturating_add(t.kept_bytes());
+                if held > 0 && taken > keep.bytes {
+                    break;
+                }
+                held += 1;
+            }
+            skip = all.len() - held;
+        }
         all[skip..].iter().map(|t| (*t).clone()).collect()
+    }
+
+    /// Whether `replaced` keeps fewer tables than were live since the
+    /// look `keep` names: the look is further behind than what was kept
+    /// for it, and drops its tables when it comes.
+    fn keeps_short(&self, keep: Option<Keep>) -> bool {
+        keep.is_some_and(|k| {
+            k.from != u64::MAX && self.lives.saturating_sub(k.from) > self.replaced.len() as u64
+        })
     }
 
     /// The level-0 pieces a read of a key in partition `at` consults.
@@ -17558,6 +17706,26 @@ impl Reader {
     /// whether the rank holds one. Through the form file where `zc` says
     /// so (`ZFile::key_at_into`, counted as a walk's parts are) and through
     /// the door otherwise.
+    /// The keys that bound block `b` of `seg` for a splice (`BlockBounds`):
+    /// the block's first record's key, or the lower fence for the first
+    /// block, and the next block's first record's key, or the upper fence
+    /// past the last.
+    fn block_bounds(&self, seg: &Seg, b: usize) -> BlockBounds {
+        let lo = if b == 0 {
+            (!seg.lo.is_empty()).then(|| seg.lo.clone())
+        } else {
+            let mut k = Vec::new();
+            self.cache_key_at(seg, b * CACHE_BLOCK, &mut k).then_some(k)
+        };
+        let mut k = Vec::new();
+        let hi = if self.cache_key_at(seg, (b + 1) * CACHE_BLOCK, &mut k) {
+            Some(k)
+        } else {
+            seg.hi.clone()
+        };
+        (lo, hi)
+    }
+
     fn cache_key_at(&self, seg: &Seg, rank: usize, out: &mut Vec<u8>) -> bool {
         if let Some(z) = self.zc(seg) {
             let r = z.key_at_into(&self.zmemo, rank, out);
@@ -18904,6 +19072,127 @@ impl Reader {
         self.shared.trim_begun.load(AtomicOrdering::Acquire)
     }
 
+    /// Whether a step of the upkeep thread's pass is to stop and give
+    /// the forms up (`Options::upkeep_abandons`), checked where the steps
+    /// loop: an ask found now is noted in `FormsState::abandoned`, and one
+    /// noted before still holds. Two things ask. The writer, where a
+    /// publish kept fewer tables than the look is behind
+    /// (`Db::ask_abandon`), for an ask no scan has made stale -- a stale
+    /// one is cleared. And the pass's own pin, where the tables landed
+    /// since it pinned, each held by nobody but the pass, cost more than
+    /// `Options::upkeep_keep_bytes`: out of core a pass that resolves a
+    /// key a major fault runs for seconds, and the look stays current
+    /// while every table a landing retires waits behind its pin. Only on
+    /// the thread, since the writer's own look drops what was not kept
+    /// for it and its operations pin for one operation.
+    fn abandon_asked(&self) -> bool {
+        if !self.understudy {
+            return false;
+        }
+        if self.fs().abandoned.get() != u64::MAX {
+            return true;
+        }
+        let now = self.shared.scans_all();
+        let at = self.shared.abandon_at.load(AtomicOrdering::Acquire);
+        if at != u64::MAX {
+            if at == now {
+                self.fs().abandoned.set(at);
+                return true;
+            }
+            let _ = self.shared.abandon_at.compare_exchange(
+                at,
+                u64::MAX,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Relaxed,
+            );
+        }
+        if !self.opts.upkeep_abandons || self.shared.keep_bytes == u64::MAX {
+            return false;
+        }
+        let landed = self
+            .shared
+            .tables_landed
+            .load(AtomicOrdering::Acquire)
+            .saturating_sub(self.fs().pass_landed.get());
+        if landed == 0 {
+            return false;
+        }
+        let mut unit = self.fs().pass_unit.get();
+        if unit == 0 {
+            let st = self.state();
+            unit = st
+                .frozen
+                .iter()
+                .chain(std::iter::once(&st.mem))
+                .map(|t| t.kept_bytes())
+                .max()
+                .unwrap_or(0)
+                .max(1);
+            self.fs().pass_unit.set(unit);
+        }
+        if landed.saturating_mul(unit) > self.shared.keep_bytes {
+            self.fs().abandoned.set(now);
+            self.fs().abandon_pinned.set(true);
+            return true;
+        }
+        false
+    }
+
+    /// A test's hold (`Db::hold_upkeep_pass`, `Db::hold_upkeep_pinned`):
+    /// the upkeep thread waits here while `bit` is set.
+    fn upkeep_held(shared: &Shared, bit: u8) {
+        if shared.upkeep_hold_at.load(AtomicOrdering::Acquire) & bit == 0 {
+            return;
+        }
+        shared.upkeep_holding.store(true, AtomicOrdering::Release);
+        while shared.upkeep_hold_at.load(AtomicOrdering::Acquire) & bit != 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        shared.upkeep_holding.store(false, AtomicOrdering::Release);
+    }
+
+    /// Whether a step has found the ask and the forms are still to be
+    /// given up: every caller up to the pass returns.
+    fn abandon_pending(&self) -> bool {
+        self.fs().abandoned.get() != u64::MAX
+    }
+
+    /// The forms given up on the ask a step noted, if one did, with
+    /// nothing borrowed (`Options::upkeep_abandons`): the tables, the
+    /// backlog and the scan snapshot dropped as a change of generation
+    /// drops them, the builder stopped, the look forgotten so that no
+    /// publish keeps tables for it, and the store marked outrun at the
+    /// scan count the ask was made at, which nothing files into forms
+    /// past until a scan moves it. Whether it did.
+    fn abandon_forms(&self) -> bool {
+        let at = self.fs().abandoned.replace(u64::MAX);
+        if at == u64::MAX {
+            return false;
+        }
+        self.stop_ahead();
+        *self.fs().scan_keys.borrow_mut() = None;
+        self.fs().snap_added.borrow_mut().clear();
+        self.fs().snap_stale.borrow_mut().clear();
+        self.drop_blocks();
+        self.shared
+            .upkeep_lives
+            .store(u64::MAX, AtomicOrdering::Relaxed);
+        let _ = self.shared.abandon_at.compare_exchange(
+            at,
+            u64::MAX,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Relaxed,
+        );
+        self.shared.outran_at.store(at, AtomicOrdering::Release);
+        self.shared.abandons.fetch_add(1, AtomicOrdering::Relaxed);
+        if self.fs().abandon_pinned.replace(false) {
+            self.shared
+                .abandons_pinned
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        true
+    }
+
     fn drop_blocks(&self) {
         self.shared.forms_events[0].fetch_add(1, AtomicOrdering::Relaxed);
         self.note_freed(self.fs().cache_bytes.get());
@@ -18950,6 +19239,12 @@ impl Reader {
         since.settle();
         let mut done = false;
         loop {
+            // What is not installed waits in the channel; given up, the
+            // builder is stopped and the channel goes with it.
+            if self.abandon_asked() {
+                a.posted.store(true, std::sync::atomic::Ordering::Release);
+                break;
+            }
             let built = match a.rx.try_recv() {
                 Ok(b) => b,
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -18981,7 +19276,13 @@ impl Reader {
                 table.resnap(seg, unsealed, self.fs().snap_gen.get());
             }
             table.snap_at(self, seg, unsealed)?;
-            for (b, bytes, form) in built.forms {
+            for AheadForm {
+                block: b,
+                bytes,
+                form,
+                bounds,
+            } in built.forms
+            {
                 let b = b as usize;
                 if b >= table.slots.len() || BuildCtx::overlay_count(table, b) > WIDE {
                     continue;
@@ -19028,19 +19329,8 @@ impl Reader {
                 if past_all {
                     continue;
                 }
-                let (mut lob, mut hib) = (Vec::new(), Vec::new());
-                let lo: Option<&[u8]> = if b == 0 {
-                    (!seg.lo.is_empty()).then_some(seg.lo.as_slice())
-                } else if self.cache_key_at(seg, b * CACHE_BLOCK, &mut lob) {
-                    Some(&lob)
-                } else {
-                    None
-                };
-                let hi: Option<&[u8]> = if self.cache_key_at(seg, (b + 1) * CACHE_BLOCK, &mut hib) {
-                    Some(&hib)
-                } else {
-                    seg.hi.as_deref()
-                };
+                let (lo, hi) = bounds.unwrap_or_else(|| self.block_bounds(seg, b));
+                let (lo, hi) = (lo.as_deref(), hi.as_deref());
                 if since.meets(lo, hi) {
                     for i in since.range(lo, hi) {
                         let k = since.at(i);
@@ -20309,7 +20599,10 @@ impl Reader {
         // without them: left to the upkeep's hold, the lag sweep's last
         // burst at ten thousand keys had its forms built on the thread,
         // and the scans after it ran at 0.74x.
-        let far = !reads_around(life, writes - self.fs().writes_at_scan.get(), keys);
+        // Outrun since the last scan, the upkeep gave its forms up: far,
+        // whatever the count of writes (`Options::upkeep_abandons`).
+        let far = !reads_around(life, writes - self.fs().writes_at_scan.get(), keys)
+            || self.shared.outran();
         // Far from any scan nothing is filed unless the hand-over forces
         // it (`Options::forms_settle_far`): what a commit files here is
         // dropped at the next landing before anything reads it, and the
@@ -20390,18 +20683,24 @@ impl Reader {
         if moved {
             self.settle_pending()?;
         }
+        if self.abandon_forms() {
+            return Ok(());
+        }
         self.refresh_snapshot(gen, true, moved);
         self.refresh_runs();
         {
             let cache = self.fs().scan_keys.borrow();
             let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
             self.install_ahead(unsealed)?;
-            if moved && self.opts.forms_settle_builds {
+            if moved && self.opts.forms_settle_builds && !self.abandon_pending() {
                 let blocks = std::mem::take(&mut *self.fs().settle_blocks.borrow_mut());
                 if !blocks.is_empty() && self.settle_room() {
                     self.build_settled(&blocks, unsealed)?;
                 }
             }
+        }
+        if self.abandon_forms() {
+            return Ok(());
         }
         // A form for every overlaid block, once per state: from here on
         // the writer builds one for any block a write lands in, so a
@@ -20433,6 +20732,10 @@ impl Reader {
                 let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
                 self.complete_forms(unsealed)?;
                 drop(cache);
+                // A fill cut short is no table to call complete.
+                if self.abandon_forms() {
+                    return Ok(());
+                }
                 self.fs().tables_complete.set(true);
             }
         }
@@ -20467,6 +20770,9 @@ impl Reader {
         let ctx = self.build_ctx();
         ctx.rank_pieces()?;
         for &(pi, b) in blocks {
+            if self.abandon_asked() {
+                return Ok(());
+            }
             let (pi, b) = (pi as usize, b as usize);
             if pi >= np {
                 continue;
@@ -20605,6 +20911,9 @@ impl Reader {
         let ctx = self.build_ctx();
         ctx.rank_pieces()?;
         for pi in 0..np {
+            if self.abandon_asked() {
+                return Ok(());
+            }
             let seg = &self.segs()[pi];
             let tables = self.fs().tables.borrow();
             let mut held = tables[pi].borrow_mut();
@@ -20625,6 +20934,9 @@ impl Reader {
                 ..self.build_ctx()
             };
             for b in 0..table.slots.len() {
+                if b % 64 == 63 && self.abandon_asked() {
+                    return Ok(());
+                }
                 // An empty slot with an overlay, or a form the patches
                 // grew to what a build would have copied -- the latter up
                 // to a cap, if one is set, and on the upkeep thread only
@@ -20949,6 +21261,9 @@ impl Reader {
                 self.drop_blocks();
                 return Err(e);
             }
+            if self.abandon_pending() {
+                return Ok(());
+            }
             if !later.is_empty() {
                 rest.push((table, later));
             }
@@ -21037,7 +21352,12 @@ impl Reader {
             Vec::with_capacity(pending.len());
         let lazy = self.opts.zpages_settle_span && !self.opts.forms_pieces_only;
         let mut lazy_n = 0u64;
-        for &(_, _, i) in &keyed {
+        for (n, &(_, _, i)) in keyed.iter().enumerate() {
+            // A resolve out of core is a major fault a key: the ask to
+            // give up is heard between them, not after the batch.
+            if n % 64 == 63 && self.abandon_asked() {
+                return Ok(());
+            }
             let (off, len, new, slot) = pending[i as usize];
             // A key's writes are adjacent here and skipped past the first,
             // by the slot: the offset is shared by the empty key and the
@@ -24068,6 +24388,14 @@ impl Db {
             snap_on_table: AtomicU64::new(0),
             upkeep: Lend::default(),
             upkeep_lives: AtomicU64::new(u64::MAX),
+            keep_bytes: Db::resolve_keep_bytes(&opts),
+            abandon_at: AtomicU64::new(u64::MAX),
+            outran_at: AtomicU64::new(u64::MAX),
+            abandons: AtomicU64::new(0),
+            abandons_pinned: AtomicU64::new(0),
+            tables_landed: AtomicU64::new(0),
+            upkeep_hold_at: std::sync::atomic::AtomicU8::new(0),
+            upkeep_holding: std::sync::atomic::AtomicBool::new(false),
             trim_wanted: std::sync::atomic::AtomicBool::new(false),
             trim_floor: AtomicUsize::new(0),
             trims: AtomicU64::new(0),
@@ -24567,6 +24895,14 @@ impl Db {
             snap_on_table: AtomicU64::new(0),
             upkeep: Lend::default(),
             upkeep_lives: AtomicU64::new(u64::MAX),
+            keep_bytes: Db::resolve_keep_bytes(&opts),
+            abandon_at: AtomicU64::new(u64::MAX),
+            outran_at: AtomicU64::new(u64::MAX),
+            abandons: AtomicU64::new(0),
+            abandons_pinned: AtomicU64::new(0),
+            tables_landed: AtomicU64::new(0),
+            upkeep_hold_at: std::sync::atomic::AtomicU8::new(0),
+            upkeep_holding: std::sync::atomic::AtomicBool::new(false),
             trim_wanted: std::sync::atomic::AtomicBool::new(false),
             trim_floor: AtomicUsize::new(0),
             trims: AtomicU64::new(0),
@@ -25635,7 +25971,7 @@ impl Db {
             .filter(|s| s.level > 0)
             .map(|s| s.blob.keys())
             .sum();
-        let near = reads_around(life, self.seal_since_scan, keys);
+        let near = reads_around(life, self.seal_since_scan, keys) && !self.shared.outran();
         self.seal_since_scan += table.committed_at().0 as u64;
         self.shared
             .reads_near
@@ -26331,6 +26667,7 @@ impl Db {
         }) else {
             return false;
         };
+        Db::ask_abandon(&self.opts, &self.shared, self.state(), from);
         // SAFETY: retired by `published` below, and the writer is pinned.
         let cur = unsafe { &*old };
         if carried.get() {
@@ -26370,12 +26707,13 @@ impl Db {
             return false;
         };
         self.published_away(old);
+        Db::ask_abandon(&self.opts, &self.shared, self.state(), from);
         true
     }
 
     /// The state `cur` makes with its live table frozen, at the frozen
     /// list's back, under `fresh`; no form carried.
-    fn frozen_over(cur: &State, fresh: &std::sync::Arc<MemTable>, from: Option<u64>) -> State {
+    fn frozen_over(cur: &State, fresh: &std::sync::Arc<MemTable>, from: Option<Keep>) -> State {
         State {
             forms: Reader::forms_for(&cur.segs),
             forms_moved: std::sync::atomic::AtomicBool::new(false),
@@ -26410,9 +26748,37 @@ impl Db {
     /// Where `State::replaced` keeps tables from: the writer's upkeep's
     /// last look, or nowhere when nothing looks across a change of the
     /// live table (`Reader::rebase_tables`).
-    fn replaced_from(opts: &Options, shared: &Shared) -> Option<u64> {
+    fn replaced_from(opts: &Options, shared: &Shared) -> Option<Keep> {
         (opts.forms_carry && opts.commit_forms && opts.scan_block_cache && !opts.freeze_settles)
-            .then(|| shared.upkeep_lives.load(AtomicOrdering::Relaxed))
+            .then(|| Keep {
+                from: shared.upkeep_lives.load(AtomicOrdering::Relaxed),
+                bytes: shared.keep_bytes,
+            })
+    }
+
+    /// `Options::upkeep_keep_bytes` resolved: as given, or an eighth of
+    /// the memory available, or no bound where that cannot be read.
+    fn resolve_keep_bytes(opts: &Options) -> u64 {
+        if opts.upkeep_keep_bytes > 0 {
+            return opts.upkeep_keep_bytes as u64;
+        }
+        zfile::read_budget().map_or(u64::MAX, |b| b.limit / 8)
+    }
+
+    /// After a publish that kept tables for the upkeep's look: where it
+    /// kept fewer than the upkeep is behind, the upkeep thread asked to
+    /// give its forms up (`Options::upkeep_abandons`), at the store's
+    /// scan count, so that a scan before the thread gets to it makes the
+    /// ask stale.
+    fn ask_abandon(opts: &Options, shared: &Shared, st: &State, keep: Option<Keep>) {
+        if opts.upkeep_abandons
+            && matches!(opts.upkeep, Upkeep::Background(_))
+            && st.keeps_short(keep)
+        {
+            shared
+                .abandon_at
+                .store(shared.scans_all(), AtomicOrdering::Release);
+        }
     }
 
     /// Whether the freeze carries the forms (`Options::forms_carry`), with
@@ -26589,6 +26955,7 @@ impl Db {
             next
         });
         self.published(old);
+        Db::ask_abandon(&self.opts, &self.shared, self.state(), from);
     }
 
     /// EXPERIMENT: partitions whose copies were carried across a merge
@@ -28556,12 +28923,29 @@ impl Since {
 struct Built {
     gen: u64,
     name: String,
-    /// (block, bytes, form), up to `AHEAD_BATCH` of one partition's: a
-    /// message per form cost the install 150 ns to receive each and a
-    /// name each, and the form's size is read here so the install does
-    /// not touch the form's buffers, which another core wrote.
-    forms: Vec<(u32, usize, Cached)>,
+    /// Up to `AHEAD_BATCH` of one partition's forms: a message per form
+    /// cost the install 150 ns to receive each and a name each.
+    forms: Vec<AheadForm>,
 }
+
+/// A form the builder ahead built, as it sends it.
+struct AheadForm {
+    block: u32,
+    /// The form's size, read here so the install does not touch the
+    /// form's buffers, which another core wrote.
+    bytes: usize,
+    form: Cached,
+    /// The keys that bound the block (`Reader::block_bounds`), read by
+    /// the builder under `Options::ahead_sends_bounds`, and none
+    /// otherwise, for the install to read itself.
+    bounds: Option<BlockBounds>,
+}
+
+/// A block's range for a splice: its first record's key, or the
+/// partition's lower fence for the first block (none where it is open),
+/// and the next block's first record's key, or the upper fence past the
+/// last block (none where it is open).
+type BlockBounds = (Option<Vec<u8>>, Option<Vec<u8>>);
 
 /// PROTOTYPE: forms the builder sends in one message.
 const AHEAD_BATCH: usize = 64;
@@ -28646,7 +29030,7 @@ impl Reader {
             }
             table.snap_at(self, seg, &unsealed)?;
             let src = Sources { seg, l0 };
-            let mut forms: Vec<(u32, usize, Cached)> = Vec::with_capacity(AHEAD_BATCH);
+            let mut forms: Vec<AheadForm> = Vec::with_capacity(AHEAD_BATCH);
             for b in 0..=nblocks {
                 let full = forms.len() == AHEAD_BATCH || (b == nblocks && !forms.is_empty());
                 if full {
@@ -28695,7 +29079,16 @@ impl Reader {
                 self.shared.forms_events[9].fetch_add(1, AtomicOrdering::Relaxed);
                 let bytes = self.fbytes(&form);
                 sent += bytes;
-                forms.push((b as u32, bytes, form));
+                let bounds = self
+                    .opts
+                    .ahead_sends_bounds
+                    .then(|| self.block_bounds(seg, b));
+                forms.push(AheadForm {
+                    block: b as u32,
+                    bytes,
+                    form,
+                    bounds,
+                });
             }
         }
         Ok(())
@@ -29553,6 +29946,7 @@ impl Reader {
                 continue;
             };
             alert_until = std::time::Instant::now() + UPKEEP_ALERT;
+            Reader::upkeep_held(&shared, 1);
             let began = std::time::Instant::now();
             let cpu0 = thread_cpu_ns();
             let lent = to.lent;
@@ -29618,9 +30012,15 @@ impl Reader {
     ) -> (FormsState, bool, bool, Result<()>) {
         *self.fs.0.get_mut() = Some(fs);
         // Pinned, and the state held, for the pass: what it walks is not
-        // freed under it, and one state answers for all of it.
+        // freed under it, and one state answers for all of it. A table a
+        // landing retires from here on is this pass's to hold.
         std::mem::forget(self.enter());
         let op = Op(self);
+        self.fs()
+            .pass_landed
+            .set(self.shared.tables_landed.load(AtomicOrdering::Acquire));
+        self.fs().pass_unit.set(0);
+        Reader::upkeep_held(&self.shared, 2);
         // The writer's own publishes take the upkeep back before they
         // swap the state, so the live table is the commit's unless a
         // landing replaced a handed one meanwhile; the segment thread's
@@ -29650,7 +30050,15 @@ impl Reader {
             self.fs().read_cap.set(to.cap as usize);
             self.fs().pass_lent.set(to.lent);
             self.fs().log_short.set(false);
+            // Asked to give the forms up before the pass began: nothing of
+            // it is filed, and `settle_due` finds the store outrun.
+            if self.abandon_asked() {
+                self.abandon_forms();
+            }
             let done = self.maintain_forms();
+            // A step that found the ask and returned leaves the forms to
+            // give up here, before the upkeep goes back to the writer.
+            self.abandon_forms();
             whole = !self.fs().log_short.replace(false);
             self.fs().read_cap.set(0);
             self.sweep_retired_forms();
@@ -29799,7 +30207,8 @@ impl Db {
         } else {
             self.upkeep_since_scan += batch as u64;
         }
-        let reads_around = reads_around(life, self.upkeep_since_scan, keys);
+        let reads_around =
+            reads_around(life, self.upkeep_since_scan, keys) && !self.shared.outran();
         // The thread stays alert on its own timer while reads are around
         // (`Options::upkeep_alert`), but it chooses a park's length only
         // when it parks: one that fell into a long park while nothing was
@@ -30153,6 +30562,78 @@ impl Db {
     /// writing it, over the store's life.
     pub fn forms_cloned(&self) -> u64 {
         self.shared.forms_cloned.load(AtomicOrdering::Relaxed)
+    }
+
+    /// A test's: while `on`, the upkeep thread holds the writer's upkeep
+    /// before each pass it begins, as a thread behind the writer does, and
+    /// the writer's writes and freezes go on past it. Nothing that takes
+    /// the upkeep home -- a scan, a read of the forms' counters -- is made
+    /// while it holds, since that waits for the pass in flight.
+    #[doc(hidden)]
+    pub fn hold_upkeep_pass(&self, on: bool) {
+        Db::set_hold_bit(&self.shared.upkeep_hold_at, 1, on);
+    }
+
+    /// A test's: while `on`, the upkeep thread waits inside its pass, its
+    /// state pinned, as a pass that faults on every key does; the writer's
+    /// freezes and the seals' landings go on past it.
+    #[doc(hidden)]
+    pub fn hold_upkeep_pinned(&self, on: bool) {
+        Db::set_hold_bit(&self.shared.upkeep_hold_at, 2, on);
+    }
+
+    /// Whether the upkeep thread is waiting at a hold: for a test.
+    #[doc(hidden)]
+    pub fn upkeep_holding(&self) -> bool {
+        self.shared.upkeep_holding.load(AtomicOrdering::Acquire)
+    }
+
+    /// Tables the seals' landings have retired: for a test.
+    #[doc(hidden)]
+    pub fn tables_landed(&self) -> u64 {
+        self.shared.tables_landed.load(AtomicOrdering::Acquire)
+    }
+
+    fn set_hold_bit(hold: &std::sync::atomic::AtomicU8, bit: u8, on: bool) {
+        if on {
+            hold.fetch_or(bit, AtomicOrdering::AcqRel);
+        } else {
+            hold.fetch_and(!bit, AtomicOrdering::AcqRel);
+        }
+    }
+
+    /// The times the upkeep thread gave its forms up because the writes
+    /// outran it (`Options::upkeep_abandons`).
+    #[doc(hidden)]
+    pub fn upkeep_abandons(&self) -> u64 {
+        self.shared.abandons.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Of those, the ones the thread's own pin decided.
+    #[doc(hidden)]
+    pub fn upkeep_abandons_pinned(&self) -> u64 {
+        self.shared.abandons_pinned.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Whether the writes have outrun the upkeep since the last scan:
+    /// nothing is filed into forms until a scan comes.
+    #[doc(hidden)]
+    pub fn upkeep_outran(&self) -> bool {
+        self.shared.outran()
+    }
+
+    /// Whether the upkeep thread is asked to give its forms up and has not
+    /// yet, and what `State::replaced` keeps: for a test.
+    #[doc(hidden)]
+    pub fn upkeep_abandon_state(&self) -> (bool, usize, u64, u64) {
+        let _e = self.enter();
+        let st = self.state();
+        (
+            self.shared.abandon_at.load(AtomicOrdering::Acquire) != u64::MAX,
+            st.replaced.len(),
+            st.lives,
+            self.shared.upkeep_lives.load(AtomicOrdering::Relaxed),
+        )
     }
 
     pub fn upkeep_counts(&self) -> [u64; 11] {
@@ -33871,6 +34352,7 @@ impl Maint {
             let layout = Db::layout_of(cur, &segs, !tier && self.opts.forms_rebase);
             let from = Db::replaced_from(&self.opts, &self.shared);
             let mut swapped_live = false;
+            let mut retired_table = false;
             let (mem, frozen) = match landed {
                 Some(t) if std::sync::Arc::ptr_eq(&cur.mem, t) => {
                     // A handed table still live: the seals before it have
@@ -33880,6 +34362,7 @@ impl Maint {
                         "a live table lands after the frozen ones"
                     );
                     swapped_live = true;
+                    retired_table = true;
                     (
                         fresh.clone().expect("made for a landing"),
                         cur.frozen.clone(),
@@ -33891,6 +34374,7 @@ impl Maint {
                         .first()
                         .is_some_and(|f| std::sync::Arc::ptr_eq(f, t)) =>
                 {
+                    retired_table = true;
                     (cur.mem.clone(), cur.frozen[1..].to_vec())
                 }
                 Some(_) => {
@@ -33953,8 +34437,15 @@ impl Maint {
             self.shared
                 .forms_rebased
                 .fetch_add(rebases, AtomicOrdering::Relaxed);
+            if retired_table {
+                self.shared
+                    .tables_landed
+                    .fetch_add(1, AtomicOrdering::Release);
+            }
             if swapped_live {
                 SealCounts::add(&self.shared.seal_counts.tail_by_landing, 1);
+                // SAFETY: just published, and this operation is pinned.
+                Db::ask_abandon(&self.opts, &self.shared, unsafe { &*p }, from);
             }
             // This operation reads what it published from here on.
             if !self.r.held.load(AtomicOrdering::Relaxed).is_null() {

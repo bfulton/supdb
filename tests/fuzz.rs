@@ -56,6 +56,11 @@
 //! - `ZFUZZ_FLEXDEC=1`: the `z` store's block-coded groups are decoded by
 //!   `lz4_flex` and not the engine's own decoder (`Options::zpages_own_decoder`
 //!   off), a flag and not a draw for the same reason.
+//! - `ZFUZZ_KEEPONE=1`: both stores keep one table, and a byte's worth, for
+//!   the upkeep's look (`Options::upkeep_keep_bytes`), so that a look a
+//!   table behind and a pass with a table landed under its pin give the
+//!   forms up (`Options::upkeep_abandons`) and the store reads as far from
+//!   reads until its next scan; a flag and not a draw.
 //! - `ZFUZZ_NOPUT`, `ZFUZZ_NOBURST`: set, no puts, or no ordered bursts.
 //! - `ZFUZZ_SEEDKEY=1`: the store's first write is a key of its own, and
 //!   one goes ahead of every write of the empty key, so that no write of
@@ -284,6 +289,9 @@ fn opts(c: &Cfg) -> Options {
     };
     if let Some(i) = c.inline_bytes {
         o.inline_bytes = i;
+    }
+    if env_flag("ZFUZZ_KEEPONE") {
+        o.upkeep_keep_bytes = 1;
     }
     o
 }
@@ -671,6 +679,10 @@ struct Handle {
 
 struct Stats {
     reopens: u64,
+    /// The times either store's upkeep thread gave its forms up
+    /// (`Options::upkeep_abandons`), summed over the store's opens: what
+    /// says a run under `ZFUZZ_KEEPONE` reached the path it is for.
+    abandons: u64,
 }
 
 fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
@@ -744,7 +756,10 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
     }
     let mut hi = 0u64;
     let mut handles: Vec<Handle> = Vec::new();
-    let mut st = Stats { reopens: 0 };
+    let mut st = Stats {
+        reopens: 0,
+        abandons: 0,
+    };
     let mut fails: Vec<String> = Vec::new();
     let mut absent = absent_around(&pool, &mut rng);
 
@@ -921,6 +936,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                 160..=169 => {
                     // A crash or a clean close, then the reopen.
                     handles.clear();
+                    st.abandons += z.upkeep_abandons() + r.upkeep_abandons();
                     let clean = rng.chance(50) || !matches!(cfg.sync, SyncPolicy::Always);
                     if clean {
                         for op in staged.drain(..) {
@@ -1082,6 +1098,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
     }
     let ok = fails.is_empty();
     drop(handles);
+    st.abandons += z.upkeep_abandons() + r.upkeep_abandons();
     drop(z);
     drop(r);
     if ok {
@@ -1108,15 +1125,18 @@ fn fuzz_range() {
         .ok()
         .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect());
     let seeds: Vec<u64> = list.unwrap_or_else(|| (from..to).collect());
-    let (mut bad, mut reopens) = (Vec::new(), 0u64);
+    let (mut bad, mut reopens, mut abandons) = (Vec::new(), 0u64, 0u64);
     for seed in seeds {
         match run_seed(seed, want_cache, verbose) {
-            Ok(s) => reopens += s.reopens,
+            Ok(s) => {
+                reopens += s.reopens;
+                abandons += s.abandons;
+            }
             Err(e) => bad.push(format!("seed {seed}: {e}")),
         }
     }
     eprintln!(
-        "seeds {from}..{to}: reopens {reopens}, FAILURES {}",
+        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, FAILURES {}",
         bad.len()
     );
     for b in &bad {

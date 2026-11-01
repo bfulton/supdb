@@ -2943,6 +2943,30 @@ test that skips a configuration because it fails there is a known bug
 with its alarm off -- the skip names its bug, and the bug is found
 before the skip is forgotten.
 
+**A pin held for a pass the bound made long.** The upkeep thread pins
+one state for its whole pass, and whatever a publish retires while it
+runs -- a landed table, the seal's snapshot copy of it, the states over
+them -- waits behind the pin. In core a pass is milliseconds. Under a
+bound every key its settle resolves is a major fault on a partition page
+the bound pushed out, and the lag sweep's full rewrite at ten million
+keys under 2 GiB ran passes of seconds, one of twelve with eighty
+thousand faults, while table after table landed and waited behind it
+with its copy until the group killed the process. Two steps faulted: the
+install of the builder's forms read two keys of the partition a form,
+which the builder now sends with each form (`ahead_sends_bounds`), and
+the settle itself. The look stayed current through all of it, so the
+tables kept for it (`State::replaced`) were never the owner, and the
+first trigger, built on how far the look lagged, never fired. The pass
+now prices what its own pin holds -- the tables landed since it pinned
+-- against an eighth of the memory available and gives its forms up
+past it, and the store reads as far from reads until it is scanned
+(`Options::upkeep_abandons`). The rule: work done under a pin is priced
+by what the pin holds as well as by its time, and a backlog's length is
+not what a long operation holds. Read the owner by counting while the
+operation runs and from a thread that touches nothing of the writer's:
+a census taken between batches took the upkeep home, which ended every
+pass, and that run survived where the one beside it was killed.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

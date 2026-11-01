@@ -585,6 +585,13 @@ pub struct Supdb {
     /// `Options::close_presync`. `supdb-latesync`, and
     /// `supdb-ingestlatesync` buffered.
     latesync: bool,
+    /// The install of the builder ahead's forms reads each block's bounds
+    /// from the partition itself, `Options::ahead_sends_bounds` off.
+    /// `supdb-installreads`.
+    installreads: bool,
+    /// The upkeep thread files on however far the writes have outrun it,
+    /// `Options::upkeep_abandons` off. `supdb-noabandon`.
+    noabandon: bool,
     /// A direct run's record stream kept whole in the arena, the shape
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
@@ -1237,6 +1244,13 @@ struct Policy {
     /// `Options::close_presync`. `supdb-latesync`, and
     /// `supdb-ingestlatesync` buffered.
     latesync: bool,
+    /// The install of the builder ahead's forms reads each block's bounds
+    /// from the partition itself, `Options::ahead_sends_bounds` off.
+    /// `supdb-installreads`.
+    installreads: bool,
+    /// The upkeep thread files on however far the writes have outrun it,
+    /// `Options::upkeep_abandons` off. `supdb-noabandon`.
+    noabandon: bool,
     /// A direct run's record stream kept whole in the arena, the shape
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
@@ -1658,6 +1672,8 @@ impl Default for Policy {
             keycopies: false,
             fillplain: false,
             latesync: false,
+            installreads: false,
+            noabandon: false,
             norecycle: false,
             keysarena: false,
             noalert: false,
@@ -4062,6 +4078,30 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with the install of the builder ahead's forms reading
+    /// each block's bounds itself.
+    pub fn create_installreads(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                installreads: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with the upkeep thread filing on however far the writes
+    /// have outrun it.
+    pub fn create_noabandon(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                noabandon: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-ingest` as `supdb-latesync`.
     pub fn create_ingest_latesync(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
@@ -5468,6 +5508,8 @@ impl Supdb {
             keycopies,
             fillplain,
             latesync,
+            installreads,
+            noabandon,
             norecycle,
             keysarena,
             noalert,
@@ -5737,6 +5779,8 @@ impl Supdb {
             manifest_pending: manifestpending,
             flush_waits_manifest: waitmanifest,
             close_presync: !latesync,
+            ahead_sends_bounds: !installreads,
+            upkeep_abandons: !noabandon,
             prefault: populate,
             direct_put_one: !recordsteps,
             direct_stream: !copyvals && !refvals,
@@ -5977,6 +6021,8 @@ impl Supdb {
             keycopies,
             fillplain,
             latesync,
+            installreads,
+            noabandon,
             norecycle,
             keysarena,
             noalert,
@@ -6724,6 +6770,12 @@ impl Engine for Supdb {
                 "supdb-ingestlatesync"
             };
         }
+        if self.installreads {
+            return "supdb-installreads";
+        }
+        if self.noabandon {
+            return "supdb-noabandon";
+        }
         if self.norecycle {
             return if self.partition {
                 "supdb-norecycle"
@@ -6977,6 +7029,10 @@ impl Engine for Supdb {
             ("upkeep_ms", db.upkeep_counts()[6] as f64 / 1e3),
             ("upkeep_passes", db.upkeep_counts()[0] as f64),
             ("upkeep_skipped", db.upkeep_counts()[7] as f64),
+            // The times the upkeep thread gave its forms up, and of those
+            // the ones its own pin decided (`Options::upkeep_abandons`).
+            ("upkeep_abandons", db.upkeep_abandons() as f64),
+            ("upkeep_abandons_pinned", db.upkeep_abandons_pinned() as f64),
             ("snap_switches", db.snapshot_switches() as f64),
             // The store's shape as it stands: what a read has to consult.
             ("segments", db.segments() as f64),
@@ -7940,6 +7996,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-keycopies"
         | "supdb-fillplain"
         | "supdb-latesync"
+        | "supdb-installreads"
+        | "supdb-noabandon"
         | "supdb-norecycle"
         | "supdb-keysarena"
         | "supdb-noalert"
@@ -8375,6 +8433,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-fillplain" => Box::new(Supdb::create_fillplain(dir)?),
         "supdb-ingestfillplain" => Box::new(Supdb::create_ingest_fillplain(dir)?),
         "supdb-latesync" => Box::new(Supdb::create_latesync(dir)?),
+        "supdb-installreads" => Box::new(Supdb::create_installreads(dir)?),
+        "supdb-noabandon" => Box::new(Supdb::create_noabandon(dir)?),
         "supdb-ingestlatesync" => Box::new(Supdb::create_ingest_latesync(dir)?),
         "supdb-norecycle" => Box::new(Supdb::create_norecycle(dir)?),
         "supdb-ingestnorecycle" => Box::new(Supdb::create_ingest_norecycle(dir)?),

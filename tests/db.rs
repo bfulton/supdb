@@ -604,6 +604,188 @@ fn the_oracle_holds_on_a_buffered_store_that_lends_every_batch() {
     );
 }
 
+/// A thread the writes have outrun gives its forms up until the next scan
+/// (`Options::upkeep_abandons`): with one table kept for its look and the
+/// thread held before its pass while the writer freezes tables past it, the
+/// publish asks, the thread gives the forms up as its pass begins, the store
+/// is far from reads until it is scanned, and the scan reads every key's
+/// values as written. The thread is held through the seam rather than bet
+/// to fall behind, which it does out of core and not here.
+#[test]
+fn an_upkeep_thread_the_writes_outran_gives_its_forms_up_until_a_scan() {
+    let d = dir("upkeep-abandon");
+    let mut db = Db::create(
+        &d,
+        Options {
+            upkeep: supdb::Upkeep::Background(1),
+            upkeep_keep_bytes: 1,
+            seal_bytes: 64 << 10,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    type Model = BTreeMap<Vec<u8>, Vec<Vec<u8>>>;
+    fn put(db: &mut Db, model: &mut Model, i: u32, v: &str) {
+        let k = format!("k{:08}", i).into_bytes();
+        db.append(&k, v.as_bytes());
+        model.entry(k).or_default().push(v.as_bytes().to_vec());
+    }
+    let mut model = Model::new();
+    for i in 0..20_000 {
+        put(&mut db, &mut model, i, "a");
+    }
+    db.commit().unwrap();
+    db.sync().unwrap();
+    // A scan makes the forms and the look the tables are kept for.
+    let mut n = 0;
+    db.scan(b"", 100, kv(&mut |_, _| n += 1)).unwrap();
+    assert!(n > 0);
+    for i in (0..20_000).step_by(7) {
+        put(&mut db, &mut model, i, "b");
+    }
+    db.commit().unwrap();
+    db.hold_upkeep_pass(true);
+    let mut asked = false;
+    for round in 0..400u32 {
+        for j in 0..100 {
+            put(&mut db, &mut model, (round * 131 + j * 17) % 20_000, "c");
+        }
+        db.commit().unwrap();
+        if db.upkeep_abandon_state().0 {
+            asked = true;
+            break;
+        }
+    }
+    let (_, kept, lives, look) = db.upkeep_abandon_state();
+    assert!(
+        asked,
+        "a publish keeping fewer tables than the look is behind asks: kept {kept}, lives {lives}, look {look}"
+    );
+    assert_eq!(kept, 1, "one table kept for the look");
+    db.hold_upkeep_pass(false);
+    let t = std::time::Instant::now();
+    while db.upkeep_abandons() == 0 {
+        assert!(
+            t.elapsed().as_secs() < 60,
+            "the thread never gave its forms up"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(db.upkeep_outran(), "outrun until a scan");
+    let mut scanned: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    db.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| scanned.entry(k.to_vec()).or_default().push(v.to_vec())),
+    )
+    .unwrap();
+    assert!(
+        scanned == model,
+        "the scan after the forms were given up reads every write"
+    );
+    assert!(!db.upkeep_outran(), "a scan ends the outrun");
+    // Filed again from here: writes after the scan read back through it.
+    for i in (0..20_000).step_by(11) {
+        put(&mut db, &mut model, i, "d");
+    }
+    db.commit().unwrap();
+    let mut again: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    db.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| again.entry(k.to_vec()).or_default().push(v.to_vec())),
+    )
+    .unwrap();
+    assert!(again == model, "and the scans after it");
+    assert!(db.upkeep_abandons() >= 1);
+}
+
+/// And the pass's own pin asks: a pass held pinned while a table the writer
+/// froze lands holds that table, and nobody else does, so with one table's
+/// worth allowed the pass gives its forms up as it goes on, though its look
+/// is current and the writer asked nothing. Out of core that pass is the one
+/// that resolves a key a major fault for seconds.
+#[test]
+fn an_upkeep_pass_that_pins_a_landed_table_gives_its_forms_up() {
+    let d = dir("upkeep-abandon-pinned");
+    let mut db = Db::create(
+        &d,
+        Options {
+            upkeep: supdb::Upkeep::Background(1),
+            upkeep_keep_bytes: 1,
+            seal_bytes: 64 << 10,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    type Model = BTreeMap<Vec<u8>, Vec<Vec<u8>>>;
+    fn put(db: &mut Db, model: &mut Model, i: u32, v: &str) {
+        let k = format!("k{:08}", i).into_bytes();
+        db.append(&k, v.as_bytes());
+        model.entry(k).or_default().push(v.as_bytes().to_vec());
+    }
+    let mut model = Model::new();
+    for i in 0..20_000 {
+        put(&mut db, &mut model, i, "a");
+    }
+    db.commit().unwrap();
+    db.sync().unwrap();
+    let mut n = 0;
+    db.scan(b"", 100, kv(&mut |_, _| n += 1)).unwrap();
+    assert!(n > 0);
+    db.hold_upkeep_pinned(true);
+    // A commit lends a pass, which the thread begins and holds pinned.
+    let t = std::time::Instant::now();
+    let mut i = 0u32;
+    while !db.upkeep_holding() {
+        assert!(t.elapsed().as_secs() < 60, "the thread never began a pass");
+        put(&mut db, &mut model, i % 20_000, "b");
+        i += 1;
+        db.commit().unwrap();
+    }
+    // One freeze past the pin, and its landing: the look is a table behind,
+    // which one table kept covers, so the writer asks nothing.
+    let (_, _, lives0, _) = db.upkeep_abandon_state();
+    let landed0 = db.tables_landed();
+    while db.upkeep_abandon_state().2 == lives0 {
+        assert!(t.elapsed().as_secs() < 60, "no freeze");
+        for _ in 0..100 {
+            put(&mut db, &mut model, (i * 37) % 20_000, "c");
+            i += 1;
+        }
+        db.commit().unwrap();
+    }
+    while db.tables_landed() == landed0 {
+        assert!(t.elapsed().as_secs() < 60, "the frozen table never landed");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let (asked, kept, lives, look) = db.upkeep_abandon_state();
+    assert!(
+        !asked,
+        "the writer asks nothing: kept {kept}, lives {lives}, look {look}"
+    );
+    assert_eq!(db.upkeep_abandons(), 0);
+    db.hold_upkeep_pinned(false);
+    while db.upkeep_abandons() == 0 {
+        assert!(
+            t.elapsed().as_secs() < 60,
+            "the pass never gave its forms up"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert_eq!(db.upkeep_abandons_pinned(), 1, "the pin's own ask");
+    assert!(db.upkeep_outran());
+    let mut scanned = Model::new();
+    db.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| scanned.entry(k.to_vec()).or_default().push(v.to_vec())),
+    )
+    .unwrap();
+    assert!(scanned == model, "the scan after reads every write");
+    assert!(!db.upkeep_outran());
+}
+
 /// The probe merge stays behind `cursor_merge` as the comparison arm -- and
 /// a path only one arm exercises is a path nothing tests.
 #[test]
