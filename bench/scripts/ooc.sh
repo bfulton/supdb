@@ -10,7 +10,12 @@
 # A run the kernel kills for exceeding the bound never gets there: its
 # group stays, named on stderr by the run's own `bench: bound ... in
 # group PATH` line, and the next run removes a stale sibling only where
-# it is empty. The trap below removes it on any exit after that line.
+# it is empty. The trap below removes it on any exit after that line,
+# reading the path from the run's kept stderr when the exit came before
+# the run's end; an interrupt or a TERM is turned into such an exit,
+# since the shell runs no EXIT trap for a signal that ends it, and it
+# takes effect once the run in the foreground has ended, so the group
+# is removed with nothing left in it.
 #
 # Exit 137 is the kernel's kill (SIGKILL under the group's limit) and is
 # passed through as "raise L": a bound the run's own anonymous memory
@@ -38,6 +43,9 @@ err="$work/stderr"
 st="$work/status"
 group=""
 cleanup() {
+  if [ -z "$group" ] && [ -f "$err" ]; then
+    group=$(sed -n 's/^bench: bound [0-9]* bytes in group //p' "$err" | tail -n 1)
+  fi
   if [ -n "$group" ] && [ -d "$group" ]; then
     if rmdir "$group" 2>/dev/null; then
       echo "ooc.sh: removed the run's group $group" >&2
@@ -48,6 +56,8 @@ cleanup() {
   rm -rf "$work"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [ "${1:-}" = "--prove-red" ]; then
   L=$((64 * 1024 * 1024))

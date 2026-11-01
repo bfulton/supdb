@@ -7,7 +7,9 @@
  * caller: the view holds no reference to the store and is valid only while
  * the borrow it wraps is (`supdb_capi_get_borrow`) -- the store open, and,
  * for a value read out of a compressed block, until the next read on the
- * thread. Built by run.sh. */
+ * thread; for a key with more than one value, whose first value the ABI
+ * copies into the handle, until the next read on the handle. Built by
+ * run.sh. */
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #include "capi/supdb_capi.h"

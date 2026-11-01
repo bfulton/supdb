@@ -11,8 +11,12 @@
 # Writes OUT/NAME-SIZE-1.{out,err} and OUT/NAME-SIZE-2.{out,err}, the table
 # on stdout and the progress on stderr, OUT defaulting to `pairs` and NAME
 # to `A-vs-B`; the commit and the tree's state go to OUT/NAME-SIZE-head.txt.
-# The suite's timers and counters a pairing can turn on for supdb's arms
-# alone are unset, so both arms run alike, whatever the shell exported; a
+# Every SUPDB_ variable the shell exported is unset, and glibc's two
+# tunables with them, so both arms run alike whatever the shell carried:
+# the timers, counters and traces turn on for supdb's arms alone, and
+# some change what a pass does (`SUPDB_LAG_TRIM`) or the index's layout
+# (`SUPDB_FENCE_TARGET`). The scrub takes the names from the environment
+# and not from a list, which missed seven variables added after it. A
 # VAR=VALUE before the arms sets one for the run on purpose, as a count a
 # sentence quotes needs (`SUPDB_MIX_COUNTERS=1`, `SUPDB_ZPAGES_TRACE=1`),
 # and its rates are then read knowing supdb timed itself. Run it on an
@@ -34,8 +38,10 @@ NAME=${NAME:-$A-vs-$B}
 [ -x "$BIN" ] || { echo "pair.sh: no bench binary at $BIN (cargo build --release)" >&2; exit 2; }
 mkdir -p "$OUT"
 { git -C "$HERE" rev-parse --short HEAD; git -C "$HERE" status --short; echo "set:$SETS"; } > "$OUT/$NAME-$SIZE-head.txt"
-UNSET="-u SUPDB_LAG_COUNTERS -u SUPDB_MIX_COUNTERS -u SUPDB_MIX_KINDS -u SUPDB_MIX_EVENTS -u SUPDB_MIX_CENSUS \
--u SUPDB_SCAN_OPS -u SUPDB_THREAD_SPANS -u SUPDB_LOAD_PHASES -u SUPDB_DRAIN_STEPS -u GLIBC_TUNABLES -u MALLOC_ARENA_MAX"
+UNSET="-u GLIBC_TUNABLES -u MALLOC_ARENA_MAX"
+for v in $(env | sed -n 's/^\(SUPDB_[A-Za-z0-9_]*\)=.*/\1/p'); do
+  UNSET="$UNSET -u $v"
+done
 for sitting in 1 2; do
   if [ "$sitting" = 1 ]; then arms=$A,$B; else arms=$B,$A; fi
   f="$OUT/$NAME-$SIZE-$sitting"

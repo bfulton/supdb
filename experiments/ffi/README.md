@@ -12,7 +12,9 @@ lead measured natively could be narrower through a binding. Two halves:
   hands that pointer out -- valid until the next commit, flush or close,
   LMDB's rule with the transaction replaced by the store's quiescence, and
   for a value read out of a compressed block until the next read on the
-  thread -- and `get_copy` fills the caller's buffer. `bench_native` runs the
+  thread; for a key with more than one value the first is copied into the
+  handle as it is handed over, and that copy is valid until the next read
+  on the handle -- and `get_copy` fills the caller's buffer. `bench_native` runs the
   suite's read pass inside the library, so the same loop is measured with
   no boundary crossed per read.
 - `harness.c` opens a supdb store through that ABI, an LMDB store through
