@@ -90,6 +90,10 @@ pub fn partition_fences(d: &std::path::Path) -> Vec<(Vec<u8>, Option<Vec<u8>>)> 
 /// `/proc/self/maps` names them: a renamed file shows under its new name,
 /// an unlinked one with ` (deleted)`. One line a mapping, deduplicated by
 /// the file the line names, since a mapping may be split into several.
+/// The name is the whole of the line after its five fixed fields, so a
+/// path with a space in it -- a `TMPDIR` with one -- and the ` (deleted)`
+/// suffix are kept; the sixth token alone was neither, and an unlinked
+/// file read as the live one under the same name.
 #[cfg(target_os = "linux")]
 pub fn zpg_mappings(dir: &std::path::Path) -> Vec<String> {
     let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
@@ -97,13 +101,26 @@ pub fn zpg_mappings(dir: &std::path::Path) -> Vec<String> {
     let prefix = prefix.to_string_lossy();
     let mut v: Vec<String> = maps
         .lines()
-        .filter_map(|l| l.split_whitespace().nth(5))
+        .filter_map(maps_path)
         .filter(|p| p.starts_with(&*prefix))
         .map(str::to_owned)
         .collect();
     v.sort();
     v.dedup();
     v
+}
+
+/// The path a `/proc/self/maps` line names: everything after its address,
+/// permissions, offset, device and inode, the padding before it trimmed;
+/// none for an anonymous mapping.
+#[cfg(target_os = "linux")]
+fn maps_path(line: &str) -> Option<&str> {
+    let mut rest = line;
+    for _ in 0..5 {
+        rest = rest.trim_start();
+        rest = &rest[rest.find(char::is_whitespace)?..];
+    }
+    Some(rest.trim_start()).filter(|p| !p.is_empty())
 }
 
 /// A dead arena's shape: a thread takes `bytes` in pieces of a megabyte,
