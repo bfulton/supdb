@@ -60,14 +60,20 @@ for g in $groups; do
       # cached output for good; once that directory is gone, every later
       # build fails at the link of RocksDB's build script ("unable to find
       # library -lclang"). Such an output is cleaned, and the next build
-      # finds libclang afresh and compiles RocksDB again.
+      # finds libclang afresh and compiles RocksDB again. The output is
+      # cleaned in the profile it was built under, the directory it sits
+      # in (`debug` is the `dev` profile's), since a clean names one.
       for out in bench/target/*/build/clang-sys-*/output; do
         [ -f "$out" ] || continue
+        dir=$(echo "$out" | cut -d/ -f3)
+        profile=$dir
+        [ "$dir" = debug ] && profile=dev
         for d in $(sed -n 's/^cargo:rustc-link-search=\(native=\)\{0,1\}//p' "$out"); do
           if ! ls "$d"/libclang*.so* >/dev/null 2>&1 \
             && ! ls "$d"/libclang*.dylib >/dev/null 2>&1; then
-            echo "stale: $out names $d, which holds no libclang; cleaning clang-sys"
-            (cd bench && cargo clean -p clang-sys --release)
+            echo "stale: $out names $d, which holds no libclang; cleaning clang-sys ($profile)"
+            (cd bench && cargo clean -p clang-sys --profile "$profile") || exit 1
+            break
           fi
         done
       done

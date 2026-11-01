@@ -179,6 +179,23 @@ pub fn render_all(runs: &Path, out: &Path, scale: Scale) -> io::Result<Vec<Rende
     Ok(written)
 }
 
+/// The order a figure's curves are drawn in, the first last and so on
+/// top: the arms either roster names, in the rosters' order with the
+/// default first (a bounded row's arms are not all in `ARMS`), then any
+/// arm of the row that neither names, by name. A row is history and the
+/// rosters are today's, so they order the curves and never choose them:
+/// a comparator retired since a row was banked is still that row's.
+fn arm_order<'a>(present: impl Iterator<Item = &'a String>) -> Vec<String> {
+    let mut order: Vec<String> = crate::engines::every_arm()
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+    let mut rest: Vec<String> = present.filter(|a| !order.contains(*a)).cloned().collect();
+    rest.sort();
+    order.extend(rest);
+    order
+}
+
 fn render_row(row: &Row, out: &Path) -> io::Result<Vec<Rendered>> {
     let mut groups: Groups = BTreeMap::new();
     let mut floors = Floors::default();
@@ -215,13 +232,10 @@ fn render_row(row: &Row, out: &Path) -> io::Result<Vec<Rendered>> {
     }
     let mut written = Vec::new();
     for ((workload, quantity, unit, guarantee), arms) in groups {
-        // Arm order: the default first so it is drawn last (on top), and
-        // every arm either roster names, since a bounded row's arms are
-        // not all in `ARMS`.
-        let order = crate::engines::every_arm();
+        let order = arm_order(arms.keys());
         let mut curves: Vec<Curve> = order
             .iter()
-            .filter_map(|a| arms.get(*a).map(|pts| (a.to_string(), pts)))
+            .filter_map(|a| arms.get(a).map(|pts| (a.clone(), pts)))
             .map(|(arm, pts)| {
                 let mut points: Vec<Point> = pts
                     .iter()
@@ -690,6 +704,36 @@ mod tests {
         assert!(top >= 6_500_184.0);
         assert!(ticks.len() >= 4 && ticks.len() <= 6, "{ticks:?}");
         assert_eq!(ticks[0], 0.0);
+    }
+
+    /// An arm a banked row carries that today's rosters do not name is
+    /// still drawn, after the rosters' arms, and the default leads.
+    #[test]
+    fn a_row_keeps_the_arms_the_rosters_no_longer_name() {
+        let present: Vec<String> = ["zz-retired", "supdb", "rocksdb-nosync"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        let order = arm_order(present.iter());
+        assert_eq!(order[0], crate::engines::ARMS[0]);
+        let at = |a: &str| order.iter().position(|o| o == a);
+        let roster = crate::engines::every_arm().len();
+        for retired in ["rocksdb-nosync", "zz-retired"] {
+            if !crate::engines::every_arm().contains(&retired) {
+                assert!(
+                    at(retired).is_some_and(|i| i >= roster),
+                    "{retired}: {order:?}"
+                );
+            }
+        }
+        assert!(at("rocksdb-nosync") < at("zz-retired"));
+        assert_eq!(
+            order.len(),
+            order
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        );
     }
 
     #[test]
