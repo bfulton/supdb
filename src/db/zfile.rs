@@ -78,11 +78,6 @@ const ZWRITE_PIECE: usize = 1 << 20;
 /// The window of the raw records the build drops behind itself.
 const ZDROP_WINDOW: usize = 8 << 20;
 
-/// The window a kept form file put back in service is asked for in
-/// (`ZFile::prefetch_all`): the device's largest request here
-/// (`max_sectors_kb`), which is what the kernel submits of one advice.
-const ZPREFETCH_WINDOW: usize = 4 << 20;
-
 /// Pages whose checksums an attach reads: the first, the last and the ones
 /// evenly spaced between, sixteen faults a file, once.
 const ZSAMPLE_PAGES: usize = 16;
@@ -3244,20 +3239,12 @@ impl ZFile {
         }
     }
 
-    /// The whole file asked for in the background, a window of
-    /// `ZPREFETCH_WINDOW` at a time, since the kernel submits one request's
-    /// worth of an advice and drops the rest: the form file a re-code put
-    /// back in service, whose pages its drop took. The bytes submitted.
+    /// The whole file asked for in the background, in the pieces the
+    /// kernel reads whole (`MmapBytes::advise_willneed`): the form file a
+    /// re-code put back in service, whose pages its drop took. The bytes
+    /// submitted.
     pub(super) fn prefetch_all(&self) -> u64 {
-        let len = self.map.len();
-        let mut off = 0u64;
-        let mut sent = 0u64;
-        while off < len {
-            let n = (len - off).min(ZPREFETCH_WINDOW as u64) as usize;
-            sent += self.map.advise_willneed(off, n) as u64;
-            off += n as u64;
-        }
-        sent
+        self.map.advise_willneed(0, self.map.len() as usize) as u64
     }
 
     /// The decoded bytes of every group the file holds, as its trailer says.
@@ -3935,9 +3922,11 @@ fn drop_written_range(_file: &File, _at: u64, _n: u64) {}
 /// past the budget leaves (`Options::zpages_land_drop_past`): the
 /// segment's record region, `[at, at + len)` of `seg`, dropped
 /// (`POSIX_FADV_DONTNEED`, which skips a page a mapping holds), and the
-/// form file at `form` asked for a window at a time (`POSIX_FADV_WILLNEED`),
-/// since the kernel submits one request's worth of an advice. The bytes
-/// asked for; an error opening the form file asks for none.
+/// form file at `form` asked for (`POSIX_FADV_WILLNEED`) in the pieces the
+/// kernel reads whole (`crate::bytes::WILLNEED_PIECE`): asked in windows of
+/// this machine's 4 MiB requests, a device of 256 KiB requests read 64 pages
+/// of each. The bytes asked for; an error opening the form file asks for
+/// none.
 #[cfg(target_os = "linux")]
 pub(super) fn swap_ahead(seg: &File, at: u64, len: u64, form: &Path) -> u64 {
     use std::os::unix::io::AsRawFd;
@@ -3960,7 +3949,7 @@ pub(super) fn swap_ahead(seg: &File, at: u64, len: u64, form: &Path) -> u64 {
         let n = f.metadata().map_or(0, |m| m.len());
         let mut off = 0u64;
         while off < n {
-            let w = (n - off).min(ZPREFETCH_WINDOW as u64);
+            let w = (n - off).min(crate::bytes::WILLNEED_PIECE as u64);
             libc::posix_fadvise(
                 f.as_raw_fd(),
                 off as libc::off_t,
