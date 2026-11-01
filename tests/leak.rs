@@ -10,6 +10,7 @@ use supdb::db::zpages::ZPAGE;
 use supdb::{Db, Options};
 
 mod common;
+use common::{kv, vf};
 
 struct Counting;
 
@@ -71,7 +72,7 @@ fn a_store_life(name: &str) {
     let key = |k: u32| format!("key-{k:08}").into_bytes();
     let scan_all = |r: &supdb::Reader| {
         for s in (0..keys).step_by(500) {
-            r.scan(&key(s), 100, |_, _| {}).unwrap();
+            r.scan(&key(s), 100, kv(&mut |_, _| {})).unwrap();
         }
     };
     for k in 0..keys {
@@ -125,7 +126,7 @@ fn a_handed_life(name: &str) {
     let key = |k: u32| format!("key-{k:08}").into_bytes();
     let scan_all = |r: &supdb::Reader| {
         for s in (0..keys).step_by(500) {
-            r.scan(&key(s), 100, |_, _| {}).unwrap();
+            r.scan(&key(s), 100, kv(&mut |_, _| {})).unwrap();
         }
     };
     for k in 0..keys {
@@ -175,7 +176,7 @@ fn a_three_frozen_life(name: &str) {
     let key = |k: u32| format!("key-{k:08}").into_bytes();
     let scan_all = |r: &supdb::Reader| {
         for s in (0..keys).step_by(500) {
-            r.scan(&key(s), 100, |_, _| {}).unwrap();
+            r.scan(&key(s), 100, kv(&mut |_, _| {})).unwrap();
         }
     };
     for k in 0..keys {
@@ -261,7 +262,7 @@ fn a_zpages_life(name: &str) {
     fn read_some(r: &supdb::Reader, keys: u32) {
         for k in (0..keys).step_by(97) {
             let key = format!("key-{k:08}").into_bytes();
-            r.read_all(&key, |_| {}).unwrap();
+            r.read_all(&key, vf(&mut |_| {})).unwrap();
             r.count(&key).unwrap();
         }
     }
@@ -343,7 +344,7 @@ fn a_zpages_life(name: &str) {
     }
     let before = db.zpage_counts();
     for k in 0..keys {
-        db.read_all(&key(k), |_| {}).unwrap();
+        db.read_all(&key(k), vf(&mut |_| {})).unwrap();
     }
     let c = db.zpage_counts();
     assert_eq!((c.damaged, c.bad_pages), (1, 1), "the flipped page: {c:?}");

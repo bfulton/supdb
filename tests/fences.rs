@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use supdb::{Db, Options};
 
 mod common;
-use common::{partition_fences, seg_names};
+use common::{kv, partition_fences, seg_names, vf};
 
 fn scratch(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-next-fences-{name}-{}", std::process::id()));
@@ -25,16 +25,20 @@ fn scratch(name: &str) -> PathBuf {
 fn hold_to(db: &Db, keys: &[Vec<u8>]) {
     for k in keys {
         let mut n = 0;
-        db.read_all(k, |_| n += 1)
+        db.read_all(k, vf(&mut |_| n += 1))
             .unwrap_or_else(|e| panic!("read of {:?}: {e}", String::from_utf8_lossy(k)));
         assert_eq!(n, 1, "key {:?}", String::from_utf8_lossy(k));
     }
     let mut seen: Vec<Vec<u8>> = Vec::new();
-    db.scan(b"", usize::MAX, |k, _| {
-        if seen.last().map(|l| l.as_slice()) != Some(k) {
-            seen.push(k.to_vec());
-        }
-    })
+    db.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, _| {
+            if seen.last().map(|l| l.as_slice()) != Some(k) {
+                seen.push(k.to_vec());
+            }
+        }),
+    )
     .unwrap();
     let mut want = keys.to_vec();
     want.sort();
@@ -307,11 +311,15 @@ fn a_promotion_never_closes_a_partition_at_its_own_lower_fence() {
     db.seal().unwrap();
     db.settle().unwrap();
     let mut got: Vec<Vec<u8>> = Vec::new();
-    db.scan(b"", usize::MAX, |k, v| {
-        if k == lo.as_slice() {
-            got.push(v.to_vec());
-        }
-    })
+    db.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| {
+            if k == lo.as_slice() {
+                got.push(v.to_vec());
+            }
+        }),
+    )
     .unwrap();
     assert_eq!(
         got,

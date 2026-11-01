@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use supdb::{Db, Options, Upkeep};
 
 mod common;
-use common::partition_fences;
+use common::{kv, partition_fences, vf};
 
 fn scratch(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-next-settle-{name}-{}", std::process::id()));
@@ -23,11 +23,15 @@ fn scratch(name: &str) -> PathBuf {
 /// A scan through the writer, as the model it answers.
 fn scan_model(db: &Db) -> std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>> {
     let mut m = std::collections::BTreeMap::new();
-    db.scan(b"", usize::MAX, |k, v| {
-        m.entry(k.to_vec())
-            .or_insert_with(Vec::new)
-            .push(v.to_vec());
-    })
+    db.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| {
+            m.entry(k.to_vec())
+                .or_insert_with(Vec::new)
+                .push(v.to_vec());
+        }),
+    )
     .unwrap();
     m
 }
@@ -88,7 +92,7 @@ fn a_key_at_the_empty_keys_arena_offset_is_filed_and_patched() {
         "the value appended after the empty key's write, in a scan"
     );
     let mut n = 0;
-    db.read_all(b"k00150x", |_| n += 1).unwrap();
+    db.read_all(b"k00150x", vf(&mut |_| n += 1)).unwrap();
     assert_eq!(n, 1, "the point read");
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
@@ -187,13 +191,17 @@ fn a_key_written_into_an_empty_partitions_range_is_in_a_scan_through_the_cache()
     assert_eq!(got.len(), before.len() + 2);
     // A scan from inside the range, and one across its lower fence.
     let mut from_inside: Vec<Vec<u8>> = Vec::new();
-    db.scan(&inside[0], 2, |k, _| from_inside.push(k.to_vec()))
+    db.scan(&inside[0], 2, kv(&mut |k, _| from_inside.push(k.to_vec())))
         .unwrap();
     assert_eq!(from_inside, vec![inside[0].clone(), fresh.clone()]);
     let below: Vec<&Vec<u8>> = keys.iter().filter(|k| **k < lo).collect();
     let mut across: Vec<Vec<u8>> = Vec::new();
-    db.scan(below[below.len() - 1], 3, |k, _| across.push(k.to_vec()))
-        .unwrap();
+    db.scan(
+        below[below.len() - 1],
+        3,
+        kv(&mut |k, _| across.push(k.to_vec())),
+    )
+    .unwrap();
     assert_eq!(
         across,
         vec![
@@ -206,12 +214,16 @@ fn a_key_written_into_an_empty_partitions_range_is_in_a_scan_through_the_cache()
     // A handle's scan, through the published forms.
     let r = db.reader().unwrap();
     let mut via_handle = std::collections::BTreeMap::new();
-    r.scan(b"", usize::MAX, |k, v| {
-        via_handle
-            .entry(k.to_vec())
-            .or_insert_with(Vec::new)
-            .push(v.to_vec());
-    })
+    r.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| {
+            via_handle
+                .entry(k.to_vec())
+                .or_insert_with(Vec::new)
+                .push(v.to_vec());
+        }),
+    )
     .unwrap();
     assert_eq!(via_handle.get(&inside[0]), want_back, "the handle's scan");
     assert_eq!(via_handle.get(&fresh), want_new, "the handle's scan");
@@ -229,7 +241,7 @@ fn a_key_written_into_an_empty_partitions_range_is_in_a_scan_through_the_cache()
     assert_eq!(got.get(&fresh), want_new, "the new key, sealed");
     assert_eq!(got.len(), before.len() + 2);
     let mut n = 0;
-    db.read_all(&fresh, |_| n += 1).unwrap();
+    db.read_all(&fresh, vf(&mut |_| n += 1)).unwrap();
     assert_eq!(n, 1, "the point read");
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
@@ -338,14 +350,18 @@ fn a_filed_keys_cut_is_resolved_again_across_its_partitions_rewrite() {
     let mut order: Vec<Vec<u8>> = Vec::new();
     let got = {
         let mut m = std::collections::BTreeMap::new();
-        db.scan(b"", usize::MAX, |k, v| {
-            if order.last().map(|l| l.as_slice()) != Some(k) {
-                order.push(k.to_vec());
-            }
-            m.entry(k.to_vec())
-                .or_insert_with(Vec::new)
-                .push(v.to_vec());
-        })
+        db.scan(
+            b"",
+            usize::MAX,
+            kv(&mut |k, v| {
+                if order.last().map(|l| l.as_slice()) != Some(k) {
+                    order.push(k.to_vec());
+                }
+                m.entry(k.to_vec())
+                    .or_insert_with(Vec::new)
+                    .push(v.to_vec());
+            }),
+        )
         .unwrap();
         m
     };
@@ -367,12 +383,16 @@ fn a_filed_keys_cut_is_resolved_again_across_its_partitions_rewrite() {
     assert_eq!(got.len(), 300 + 1 + 8, "the keys");
     let r = db.reader().unwrap();
     let mut via_handle = std::collections::BTreeMap::new();
-    r.scan(b"", usize::MAX, |k, v| {
-        via_handle
-            .entry(k.to_vec())
-            .or_insert_with(Vec::new)
-            .push(v.to_vec());
-    })
+    r.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| {
+            via_handle
+                .entry(k.to_vec())
+                .or_insert_with(Vec::new)
+                .push(v.to_vec());
+        }),
+    )
     .unwrap();
     assert_eq!(via_handle, got, "the handle's scan");
     drop(r);
@@ -425,13 +445,14 @@ fn a_snapshot_over_the_empty_key_alone_is_sought_at_a_partitions_fence() {
         assert_eq!(got.get(&b""[..]), Some(&vec![b"e".to_vec()]), "runs {runs}");
         let r = db.reader().unwrap();
         let mut seen = Vec::new();
-        r.scan(b"", 3, |k, _| seen.push(k.to_vec())).unwrap();
+        r.scan(b"", 3, kv(&mut |k, _| seen.push(k.to_vec())))
+            .unwrap();
         assert_eq!(
             seen[0], b"",
             "runs {runs}: the handle's scan starts at the empty key"
         );
         let mut n = 0;
-        db.read_all(b"", |_| n += 1).unwrap();
+        db.read_all(b"", vf(&mut |_| n += 1)).unwrap();
         assert_eq!(n, 1, "runs {runs}: the point read");
         drop(r);
         drop(db);
@@ -553,7 +574,7 @@ fn a_commits_fill_builds_the_blocks_its_settle_filed_into() {
             fences.len()
         );
         for (lo, _) in &fences {
-            db.scan(lo, 1, |_, _| {}).unwrap();
+            db.scan(lo, 1, kv(&mut |_, _| {})).unwrap();
         }
         for round in 0..10usize {
             for i in 0..3usize {
@@ -626,7 +647,7 @@ fn the_fills_build_only_while_the_refaults_hold_still() {
     db.flush().unwrap();
     db.settle().unwrap();
     for (lo, _) in &partition_fences(&dir) {
-        db.scan(lo, 1, |_, _| {}).unwrap();
+        db.scan(lo, 1, kv(&mut |_, _| {})).unwrap();
     }
     let stretch =
         |db: &mut Db, want: &mut std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>, at: usize| {
@@ -652,7 +673,7 @@ fn the_fills_build_only_while_the_refaults_hold_still() {
     // files what the commits left, as without the option. A scan of one
     // key, so that the blocks the next phase builds are unwalked.
     let filed = db.settle_density()[1];
-    db.scan(&keys[0], 1, |_, _| {}).unwrap();
+    db.scan(&keys[0], 1, kv(&mut |_, _| {})).unwrap();
     assert!(
         db.settle_density()[1] > filed,
         "no room: the commits leave the filing to the scan"

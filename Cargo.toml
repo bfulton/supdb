@@ -39,24 +39,24 @@ lto = true
 codegen-units = 1
 debug = true
 
-# What the tests run under: the release profile with the arithmetic and
-# the invariants checked. `cargo test --release` ran with neither, and a
+# What the tests run under: optimized, with the arithmetic and the
+# invariants checked. `cargo test --release` ran with neither, and a
 # prefetch span that summed a rank and a scan's limit of `usize::MAX`
-# wrapped through the checks green and panicked in every debug build.
-# The wasm module and the suite's binaries keep the release profile:
-# the checks cost code size there and time in a measurement. Debug info
-# is line tables here, as in the suite's manifest: a backtrace names its
-# lines with those, and the full information doubled the memory of the
-# fat-LTO compile of `tests/db.rs`, which outgrew what a build has here
-# (CLAUDE.md, running the checks). It changes no code. Thin LTO over
-# sixteen codegen units for the same reason: the one unit of release
-# made `tests/db.rs` a single codegen of 13.2 GiB against a group of
-# 13.4, with LTO off as with it, and sixteen units under thin LTO build
-# it at 6.8 in the same time, the tests running 2% longer.
+# wrapped through the checks green and panicked in every debug build;
+# unoptimized, the longest tests run seven times as long. The wasm module
+# and the suite's binaries keep the release profile: the checks cost code
+# size there and time in a measurement. Level 2 with no LTO, many codegen
+# units and incremental builds: every test target builds from nothing in
+# under a minute and a half and after a one-line engine change in under
+# one, at under two gigabytes for four compiles at once, and the tests run
+# within a fifth of their time at level 3 (CLAUDE.md, running the checks).
+# Debug info is line tables, what a backtrace needs to name a line.
 [profile.checked]
 inherits = "release"
 overflow-checks = true
 debug-assertions = true
 debug = 1
-lto = "thin"
-codegen-units = 16
+opt-level = 2
+lto = false
+codegen-units = 256
+incremental = true

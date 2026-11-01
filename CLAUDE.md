@@ -90,41 +90,37 @@ eight tests of one run, one of them in six runs alone, before a syscall
 trace showed the store's directory gone and nothing in the process that
 removed it.
 
-A checked-profile compile of `tests/db.rs` is the engine's tests, two
-hundred of them, at opt-level 3, and the tool cgroup that
-every agent and shell here shares holds fourteen gigabytes
-(`memory.limit_in_bytes` of the `claude-code-bash` group, 13.4 GiB): a
-second compile at once gets its `rustc` killed with `could not compile`
-and no reason given, so they are serialised (`CARGO_BUILD_JOBS=1`, one
-at a time) and the iteration is done in the dev profile, which builds
-the same tests in a minute. The peak grows with the engine. This note
-said nine gigabytes when the engine was eighteen thousand lines
-shorter; nobody measured it again until the gate's checked build was
-killed with nothing else running, twice, and the tree before those
-twenty-two lines read 13.2 GiB, two percent under the limit. The kill
-is in `dmesg` (`Memory cgroup out of memory: Killed process ... (rustc)`,
-with the anonymous bytes at the kill), and a compile's peak is read by
-sampling `VmHWM` of the `rustc` process through it, by crate. Full
-debug information was half of it: the peak comes in the codegen's last
-two minutes, where the debug info is emitted, and the same compile with
-line tables alone peaked at 7.0 GiB in 17 minutes against 13.2 in 24, so
-the checked profile asks for line tables (`debug = 1`), which is what a
-backtrace needs to name a line and what the suite's manifest already
-asks for. It grew back: at the commit that made the engine's own LZ4
-decoder the default the same compile read 13.2 GiB with line tables,
-the group's peak at its limit, and LTO was not it -- with LTO off the
-compile was killed at 13.6, since the one codegen unit the release
-profile asks for is the whole test crate's codegen at once. Sixteen
-units under fat LTO read 10.2; under thin LTO 6.8, in the same 35
-minutes, the test group's run 259 s against 254, so the checked profile
-asks for thin LTO and sixteen units. The gate script that ran the stress on the binaries left on
-disk from the tree before, and reported their verdict, exits when the
-build failed now; and a checked compile that dies is read in `dmesg`
-and sampled before it is read as another process's.
+The test group's compile was thirty-three minutes of a gate's
+thirty-seven, for four minutes of tests, and the cause was in the
+tests. `scan` and `read_all` are generic over their callback, so every
+closure a test handed one compiled its own copy of the engine's read
+path: `tests/db.rs` held about a thousand copies each of `read_exts`
+and `values_at`, a 328 MB binary whose optimization was the compile,
+466 s of it even at level 1. This note spent a year on the symptom --
+the compile's memory at 13.2 GiB against the tool cgroup's 13.4
+(`memory.limit_in_bytes` of the `claude-code-bash` group), compiles
+serialised one at a time, line tables and then thin LTO over sixteen
+units to fit -- and every figure in it was that one crate's size. The
+tests hand their callbacks over as one trait object each now
+(`tests/common`'s `kv` and `vf`, one copy of the read path apiece; the
+binary is 34 MB), and the `checked` profile is level 2 with no LTO, 256
+codegen units and incremental builds: every test target builds from
+nothing in about a minute and a half with four compiles at once under
+two gigabytes, and after a one-line engine change in under one, and the
+tests run within a fifth of their time at level 3. A test that hands a
+closure straight to a generic read call adds a copy of the read path;
+hand it through `kv` or `vf`. And a compile that is slow is measured
+before it is accommodated: `cargo build --timings` names the unit, and
+`nm -C` over its binary counts the copies. A compile killed for memory
+is in `dmesg` (`Memory cgroup out of memory: Killed process ...
+(rustc)`), and its peak is read by sampling the `rustc` processes'
+resident sizes through it. The gate script that ran the stress on the
+binaries left on disk from the tree before, and reported their verdict,
+exits when the build failed now.
 `cargo test` stops at the first failing test binary, so a red `db` hid
 `dict`, `leak`, `ranges` and `segwriter` for a run; `--no-fail-fast` shows
 the rest. The dev profile is for a test at a time and never the whole
-`db` binary: its longest tests run four minutes alone under `checked` and
+`db` binary: its longest tests run over a minute under `checked` and
 seven times that in dev, and the whole file in dev ran a held-seal test's
 watchdog past its minute under the other tests' load, which ended the
 binary with code 101 after a hundred and sixty-six tests, no failure

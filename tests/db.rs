@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use supdb::{Db, Isolation, Options, ReadAdvice, Reader};
 
 mod common;
-use common::{dead_arena, without_the_clock};
+use common::{dead_arena, kv, vf, without_the_clock};
 
 fn dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-next-{name}-{}", std::process::id()));
@@ -134,7 +134,7 @@ fn remove_manifests(d: &std::path::Path) {
 
 fn read_vec(db: &Reader, key: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
-    let n = db.read_all(key, |v| out.push(v.to_vec())).unwrap();
+    let n = db.read_all(key, vf(&mut |v| out.push(v.to_vec()))).unwrap();
     // The number `read_all` returns is how many values it handed over. A
     // path that works the number out by another route than the one that
     // delivers the values (the point read through the ordered index asks
@@ -281,14 +281,16 @@ fn a_transaction_is_all_or_nothing_and_sees_its_own_writes() {
         tx.delete(b"z");
         tx.append(b"z", b"new");
         let mut got = Vec::new();
-        tx.read_all(b"x", |v| got.push(v.to_vec())).unwrap();
+        tx.read_all(b"x", vf(&mut |v| got.push(v.to_vec())))
+            .unwrap();
         assert_eq!(
             got,
             vec![b"1".to_vec(), b"2".to_vec()],
             "read-your-writes inside"
         );
         let mut got = Vec::new();
-        tx.read_all(b"z", |v| got.push(v.to_vec())).unwrap();
+        tx.read_all(b"z", vf(&mut |v| got.push(v.to_vec())))
+            .unwrap();
         assert_eq!(
             got,
             vec![b"new".to_vec()],
@@ -492,9 +494,11 @@ fn oracle_in(name: &str, opts: Options) -> supdb::db::SealWaits {
     // The scan agrees with the point reads: every live key, every live
     // value, and no key whose values were all deleted.
     let mut scanned: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
-    db.scan(b"", usize::MAX, |k, v| {
-        scanned.entry(k.to_vec()).or_default().push(v.to_vec())
-    })
+    db.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| scanned.entry(k.to_vec()).or_default().push(v.to_vec())),
+    )
     .unwrap();
     let live: HashMap<Vec<u8>, Vec<Vec<u8>>> = model
         .iter()
@@ -742,7 +746,7 @@ fn a_lone_piece_is_promoted_rather_than_rewritten() {
         );
     }
     let mut seen = Vec::new();
-    db.scan(b"", model.len(), |k, _| seen.push(k.to_vec()))
+    db.scan(b"", model.len(), kv(&mut |k, _| seen.push(k.to_vec())))
         .unwrap();
     let mut want: Vec<Vec<u8>> = model.keys().cloned().collect();
     want.sort();
@@ -857,16 +861,20 @@ fn a_segment_whose_ordered_index_is_missing_or_damaged_rebuilds_it_at_open() {
 
     let reads_whole = |db: &Db| {
         let mut n = 0usize;
-        db.scan(b"", usize::MAX, |k, val| {
-            n += 1;
-            let i: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
-            assert!(
-                !i.is_multiple_of(7),
-                "deleted key {} read back",
-                String::from_utf8_lossy(k)
-            );
-            assert_eq!(val, format!("v-{i}").as_bytes());
-        })
+        db.scan(
+            b"",
+            usize::MAX,
+            kv(&mut |k, val| {
+                n += 1;
+                let i: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                assert!(
+                    !i.is_multiple_of(7),
+                    "deleted key {} read back",
+                    String::from_utf8_lossy(k)
+                );
+                assert_eq!(val, format!("v-{i}").as_bytes());
+            }),
+        )
         .unwrap();
         assert_eq!(n, 2_000 - 2_000usize.div_ceil(7));
     };
@@ -1646,11 +1654,15 @@ fn a_direct_runs_table_reads_its_values_through_the_runs_segment() {
     // A scan through a fresh handle walks the run in order.
     let r = db.reader().unwrap();
     let mut n = 0u32;
-    r.scan(b"", usize::MAX, |k, v| {
-        assert_eq!(k, key(n).as_slice());
-        assert_eq!(v, val(n).as_slice());
-        n += 1;
-    })
+    r.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| {
+            assert_eq!(k, key(n).as_slice());
+            assert_eq!(v, val(n).as_slice());
+            n += 1;
+        }),
+    )
     .unwrap();
     assert_eq!(n, 6000);
     // A staged tail and then a key below the run's greatest: the run
@@ -1669,11 +1681,15 @@ fn a_direct_runs_table_reads_its_values_through_the_runs_segment() {
 
     let db = Db::open(&d, opts).unwrap();
     let mut n = 0u32;
-    db.scan(&key(0), usize::MAX, |k, v| {
-        assert_eq!(k, key(n).as_slice());
-        assert_eq!(v, val(n).as_slice());
-        n += 1;
-    })
+    db.scan(
+        &key(0),
+        usize::MAX,
+        kv(&mut |k, v| {
+            assert_eq!(k, key(n).as_slice());
+            assert_eq!(v, val(n).as_slice());
+            n += 1;
+        }),
+    )
     .unwrap();
     assert_eq!(n, 6300);
     assert_eq!(read_vec(&db, b"aaa"), vec![b"below".to_vec()]);
@@ -1758,11 +1774,15 @@ fn a_streamed_runs_recycled_blocks_read_through_the_runs_segment() {
     // mapping and the arena alike.
     let r = db.reader().unwrap();
     let mut n = 0u32;
-    r.scan(b"", usize::MAX, |k, v| {
-        assert_eq!(k, key(n).as_slice());
-        assert_eq!(v, val(n).as_slice());
-        n += 1;
-    })
+    r.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| {
+            assert_eq!(k, key(n).as_slice());
+            assert_eq!(v, val(n).as_slice());
+            n += 1;
+        }),
+    )
     .unwrap();
     assert_eq!(n, 16000);
     // The run closed by a key below its greatest, flushed, reopened.
@@ -1777,11 +1797,15 @@ fn a_streamed_runs_recycled_blocks_read_through_the_runs_segment() {
     db.close().unwrap();
     let db = Db::open(&d, opts).unwrap();
     let mut n = 0u32;
-    db.scan(&key(0), usize::MAX, |k, v| {
-        assert_eq!(k, key(n).as_slice());
-        assert_eq!(v, val(n).as_slice());
-        n += 1;
-    })
+    db.scan(
+        &key(0),
+        usize::MAX,
+        kv(&mut |k, v| {
+            assert_eq!(k, key(n).as_slice());
+            assert_eq!(v, val(n).as_slice());
+            n += 1;
+        }),
+    )
     .unwrap();
     assert_eq!(n, 16000);
     assert_eq!(read_vec(&db, b"aaa"), vec![b"below".to_vec()]);
@@ -1849,7 +1873,7 @@ fn an_ordered_index_survives_promotion_and_reopen() {
         );
     }
     let mut seen = Vec::new();
-    db.scan(b"", model.len(), |k, _| seen.push(k.to_vec()))
+    db.scan(b"", model.len(), kv(&mut |k, _| seen.push(k.to_vec())))
         .unwrap();
     let mut want: Vec<Vec<u8>> = model.keys().cloned().collect();
     want.sort();
@@ -1913,11 +1937,15 @@ fn compaction_partitions_the_key_space_and_keeps_every_value() {
     }
     // Ordered scan over a compacted store: keys ascending, no duplicates.
     let mut seen: Vec<Vec<u8>> = Vec::new();
-    db.scan(b"", 1000, |k, _| {
-        if seen.last().map(|l| l.as_slice()) != Some(k) {
-            seen.push(k.to_vec());
-        }
-    })
+    db.scan(
+        b"",
+        1000,
+        kv(&mut |k, _| {
+            if seen.last().map(|l| l.as_slice()) != Some(k) {
+                seen.push(k.to_vec());
+            }
+        }),
+    )
     .unwrap();
     let mut sorted = seen.clone();
     sorted.sort();
@@ -2451,9 +2479,11 @@ fn a_delete_ends_older_values_and_later_appends_start_fresh() {
     assert_eq!(read_vec(&db, b"k"), vec![b"v4".to_vec()], "after the merge");
     assert_eq!(db.count(b"k").unwrap(), 1);
     let mut scanned = Vec::new();
-    db.scan(b"", usize::MAX, |k, v| {
-        scanned.push((k.to_vec(), v.to_vec()))
-    })
+    db.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| scanned.push((k.to_vec(), v.to_vec()))),
+    )
     .unwrap();
     assert_eq!(scanned, vec![(b"k".to_vec(), b"v4".to_vec())]);
     // A delete of a key never written is a tombstone too; it masks nothing.
@@ -2468,9 +2498,11 @@ fn a_delete_ends_older_values_and_later_appends_start_fresh() {
     assert_eq!(read_vec(&db, b"k"), Vec::<Vec<u8>>::new());
     assert_eq!(db.count(b"k").unwrap(), 0);
     let mut scanned = Vec::new();
-    db.scan(b"", usize::MAX, |k, v| {
-        scanned.push((k.to_vec(), v.to_vec()))
-    })
+    db.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| scanned.push((k.to_vec(), v.to_vec()))),
+    )
     .unwrap();
     assert!(
         scanned.is_empty(),
@@ -2523,11 +2555,15 @@ fn deleted_values_do_not_survive_the_merge() {
         }
     }
     let mut keys: Vec<Vec<u8>> = Vec::new();
-    db.scan(b"", usize::MAX, |k, _| {
-        if keys.last().map(|l| l.as_slice()) != Some(k) {
-            keys.push(k.to_vec());
-        }
-    })
+    db.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, _| {
+            if keys.last().map(|l| l.as_slice()) != Some(k) {
+                keys.push(k.to_vec());
+            }
+        }),
+    )
     .unwrap();
     assert_eq!(keys.len(), 2_000, "only the live half scans");
     drop(db);
@@ -2626,7 +2662,7 @@ fn idle_io_priority_and_sync_spreading_change_nothing_observable() {
     drop(db);
     let db = Db::open(&d, opts).unwrap();
     let mut n = 0usize;
-    db.scan(b"", usize::MAX, |_, _| n += 1).unwrap();
+    db.scan(b"", usize::MAX, kv(&mut |_, _| n += 1)).unwrap();
     assert_eq!(n, 40_000, "every value survives the knobs and a reopen");
 }
 
@@ -2672,11 +2708,15 @@ fn ordered_pieces_are_promoted_to_partitions_without_a_merge() {
     }
     let mut n = 0usize;
     let mut last: Vec<u8> = Vec::new();
-    db.scan(b"", usize::MAX, |k, _| {
-        assert!(k >= last.as_slice(), "scan order");
-        last = k.to_vec();
-        n += 1;
-    })
+    db.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, _| {
+            assert!(k >= last.as_slice(), "scan order");
+            last = k.to_vec();
+            n += 1;
+        }),
+    )
     .unwrap();
     assert_eq!(n, 24_000);
     drop(db);
@@ -3053,7 +3093,7 @@ fn an_advising_store_advises_the_ordered_companions_too() {
     // search is random in either phase. It has to be a long one: a scan is
     // advised by the span it will walk, and a short scan now keeps
     // MADV_RANDOM for the segments too.
-    db.scan(b"key-000000", 100_000, |_, _| {}).unwrap();
+    db.scan(b"key-000000", 100_000, kv(&mut |_, _| {})).unwrap();
     assert!(!db.advice_random(), "the scan did not switch the segments");
     let (advised, total) = db.ords_advised();
     assert_eq!(
@@ -3102,12 +3142,12 @@ fn a_short_scan_keeps_the_random_advice_and_a_long_one_gives_it_up() {
     db.settle().unwrap();
 
     // A point read leaves the store advised random; that much was already so.
-    let _ = db.read_all(b"key-000001", |_| {}).unwrap();
+    let _ = db.read_all(b"key-000001", vf(&mut |_| {})).unwrap();
     assert!(db.advice_random(), "a point read should advise random");
 
     // A scan of one entry cannot span the threshold, so it must NOT give the
     // advice up. This is the case that was 9.4x slow.
-    db.scan(b"key-000000", 1, |_, _| {}).unwrap();
+    db.scan(b"key-000000", 1, kv(&mut |_, _| {})).unwrap();
     assert!(
         db.advice_random(),
         "a one-entry scan dropped MADV_RANDOM: it cannot span {} bytes",
@@ -3116,14 +3156,14 @@ fn a_short_scan_keeps_the_random_advice_and_a_long_one_gives_it_up() {
 
     // A scan long enough to cover the threshold several times over wants the
     // readahead, and has to be able to ask for it.
-    db.scan(b"key-000000", 100_000, |_, _| {}).unwrap();
+    db.scan(b"key-000000", 100_000, kv(&mut |_, _| {})).unwrap();
     assert!(
         !db.advice_random(),
         "a 100,000-entry scan kept MADV_RANDOM: readahead is what it is for"
     );
 
     // And back, because the span is asked per scan rather than latched once.
-    db.scan(b"key-000000", 1, |_, _| {}).unwrap();
+    db.scan(b"key-000000", 1, kv(&mut |_, _| {})).unwrap();
     assert!(
         db.advice_random(),
         "the advice did not come back for a short scan"
@@ -3145,12 +3185,12 @@ fn a_short_scan_keeps_the_random_advice_and_a_long_one_gives_it_up() {
         },
     )
     .unwrap();
-    db.scan(b"key-000000", 100_000, |_, _| {}).unwrap();
+    db.scan(b"key-000000", 100_000, kv(&mut |_, _| {})).unwrap();
     assert!(
         !db.advice_random(),
         "after reopen a 100,000-entry scan kept MADV_RANDOM: the mean was never seeded"
     );
-    db.scan(b"key-000000", 1, |_, _| {}).unwrap();
+    db.scan(b"key-000000", 1, kv(&mut |_, _| {})).unwrap();
     assert!(
         db.advice_random(),
         "after reopen the advice did not come back"
@@ -3202,29 +3242,65 @@ impl ScanModel {
     }
     /// One scan against the model, stream and count.
     fn check_one(&self, db: &Reader, from: &[u8], limit: usize, state: &str) {
-        let mut want: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        let mut want_n = 0usize;
-        for k in self.visited().iter().filter(|k| **k >= from).take(limit) {
-            want_n += 1;
-            for v in &self.vals[*k] {
-                want.push((k.to_vec(), v.clone()));
+        self.compare_scan(db, &self.visited(), from, limit, state);
+    }
+    /// One scan of `db` from `from` at `limit` held to the model as it
+    /// streams: every entry the scan hands over against the model's next, in
+    /// order, none missing at the end, and the count it returns against the
+    /// keys the model visits. The model's entries are found by a binary
+    /// search over `visited` (sorted, as `visited` makes it) and walked beside
+    /// the scan, and nothing is collected: comparing two vectors of cloned
+    /// entries, the unbounded scans from every start allocated millions of
+    /// pairs a check, which was most of the time of the tests that check
+    /// after every step. The first divergence is what a failure names.
+    fn compare_scan(&self, db: &Reader, visited: &[&[u8]], from: &[u8], limit: usize, state: &str) {
+        let lossy = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        let i = visited.partition_point(|k| *k < from);
+        let keys = &visited[i..visited.len().min(i.saturating_add(limit))];
+        let mut want = keys
+            .iter()
+            .flat_map(|k| self.vals[*k].iter().map(move |v| (*k, v.as_slice())));
+        let mut at = 0usize;
+        let mut bad: Option<String> = None;
+        let n = db
+            .scan(
+                from,
+                limit,
+                kv(&mut |k, v| {
+                    if bad.is_none() {
+                        match want.next() {
+                            Some((wk, wv)) if wk == k && wv == v => {}
+                            w => {
+                                bad = Some(format!(
+                                    "entry {at}: got ({:?}, {:?}), want {:?}",
+                                    lossy(k),
+                                    lossy(v),
+                                    w.map(|(a, b)| (lossy(a), lossy(b)))
+                                ))
+                            }
+                        }
+                    }
+                    at += 1;
+                }),
+            )
+            .unwrap();
+        if bad.is_none() {
+            if let Some((wk, wv)) = want.next() {
+                bad = Some(format!(
+                    "entry {at}: the scan ended, want ({:?}, {:?})",
+                    lossy(wk),
+                    lossy(wv)
+                ));
             }
         }
-        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        let n = db
-            .scan(from, limit, |k, v| got.push((k.to_vec(), v.to_vec())))
-            .unwrap();
-        assert_eq!(
-            got,
-            want,
-            "{state}: scan from {:?} limit {limit}",
-            String::from_utf8_lossy(from)
-        );
+        if let Some(bad) = bad {
+            panic!("{state}: scan from {:?} limit {limit}: {bad}", lossy(from));
+        }
         assert_eq!(
             n,
-            want_n,
+            keys.len(),
             "{state}: count from {:?} limit {limit}",
-            String::from_utf8_lossy(from)
+            lossy(from)
         );
     }
     /// Every scan the store can be asked for, against the model: from every
@@ -3264,34 +3340,7 @@ impl ScanModel {
         starts.push(b"zzz".to_vec());
         for from in &starts {
             for &limit in &[1usize, 2, 3, 5, 17, usize::MAX] {
-                let mut want: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-                let mut want_n = 0usize;
-                for k in visited
-                    .iter()
-                    .filter(|k| **k >= from.as_slice())
-                    .take(limit)
-                {
-                    want_n += 1;
-                    for v in &self.vals[*k] {
-                        want.push((k.to_vec(), v.clone()));
-                    }
-                }
-                let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-                let n = db
-                    .scan(from, limit, |k, v| got.push((k.to_vec(), v.to_vec())))
-                    .unwrap();
-                assert_eq!(
-                    got,
-                    want,
-                    "{state}: scan from {:?} limit {limit}",
-                    String::from_utf8_lossy(from)
-                );
-                assert_eq!(
-                    n,
-                    want_n,
-                    "{state}: count from {:?} limit {limit}",
-                    String::from_utf8_lossy(from)
-                );
+                self.compare_scan(db, &visited, from, limit, state);
             }
         }
     }
@@ -3481,8 +3530,12 @@ fn burst_into_forms_prepared(
         m.append(&mut db, &key(k), "v1-0123456789");
     }
     db.commit().unwrap();
-    db.scan(key(0).as_bytes(), usize::MAX, |_k, v| sink += v.len())
-        .unwrap();
+    db.scan(
+        key(0).as_bytes(),
+        usize::MAX,
+        kv(&mut |_k, v| sink += v.len()),
+    )
+    .unwrap();
     for k in (0..3000u32).filter(|k| k % 8 < 5) {
         m.delete(&mut db, &key(k));
         m.append(&mut db, &key(k), "v2-0123456789");
@@ -3497,7 +3550,7 @@ fn burst_into_forms_prepared(
                 .is_some_and(|s| s.4 != "unbuilt")
         })
         .expect("a block holds a form");
-    db.scan(key(held).as_bytes(), 1, |_k, v| sink += v.len())
+    db.scan(key(held).as_bytes(), 1, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     std::hint::black_box(sink);
     (db, m)
@@ -3873,16 +3926,22 @@ fn shed_over_published_forms_with(
         m.append(&mut db, &key(k), "v1-0123456789");
     }
     db.commit().unwrap();
-    db.scan(key(0).as_bytes(), usize::MAX, |_k, v| sink += v.len())
-        .unwrap();
+    db.scan(
+        key(0).as_bytes(),
+        usize::MAX,
+        kv(&mut |_k, v| sink += v.len()),
+    )
+    .unwrap();
     // The claim publishes the forms the writer holds.
     let r = db.reader().unwrap();
     assert!(db.canonical_forms().0 > 0, "published at the claim");
     for round in 0..8u32 {
         for start in (0..3000u32).step_by(250) {
-            db.scan(key(start + round * 7).as_bytes(), 120, |_k, v| {
-                sink += v.len()
-            })
+            db.scan(
+                key(start + round * 7).as_bytes(),
+                120,
+                kv(&mut |_k, v| sink += v.len()),
+            )
             .unwrap();
         }
     }
@@ -3956,8 +4015,12 @@ fn waiting_after_a_pin(name: &str, sweep: bool) -> ((usize, usize), (usize, usiz
         }
         db.commit().unwrap();
         for start in (0..3000u32).step_by(500) {
-            db.scan(key(start + round).as_bytes(), 120, |_k, v| sink += v.len())
-                .unwrap();
+            db.scan(
+                key(start + round).as_bytes(),
+                120,
+                kv(&mut |_k, v| sink += v.len()),
+            )
+            .unwrap();
         }
     }
     let held = db.retired_waiting();
@@ -3967,7 +4030,7 @@ fn waiting_after_a_pin(name: &str, sweep: bool) -> ((usize, usize), (usize, usiz
     );
     r.release();
     for i in 0..400u32 {
-        db.read_all(key(i * 7 % 3000).as_bytes(), |v| sink += v.len())
+        db.read_all(key(i * 7 % 3000).as_bytes(), vf(&mut |v| sink += v.len()))
             .unwrap();
     }
     let after = db.retired_waiting();
@@ -4042,15 +4105,19 @@ fn one_delta_a_block(name: &str, fit: bool) -> (Db, ScanModel) {
         m.append(&mut db, &key(k), "v1-0123456789");
     }
     db.commit().unwrap();
-    db.scan(key(0).as_bytes(), usize::MAX, |_k, v| sink += v.len())
-        .unwrap();
+    db.scan(
+        key(0).as_bytes(),
+        usize::MAX,
+        kv(&mut |_k, v| sink += v.len()),
+    )
+    .unwrap();
     for k in (5..3000u32).step_by(64) {
         m.delete(&mut db, &key(k));
         m.append(&mut db, &key(k), "v1-0123456789");
     }
     db.commit().unwrap();
     // Filed into the forms by a scan that builds nothing.
-    db.scan(key(1000).as_bytes(), 1, |_k, v| sink += v.len())
+    db.scan(key(1000).as_bytes(), 1, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     std::hint::black_box(sink);
     (db, m)
@@ -4144,7 +4211,8 @@ fn the_published_forms_are_recorded_as_the_budget_counts_them_across_a_landing()
         }
         db.commit().unwrap();
         let mut sink = 0usize;
-        db.scan(b"key-00000", 400, |_k, v| sink += v.len()).unwrap();
+        db.scan(b"key-00000", 400, kv(&mut |_k, v| sink += v.len()))
+            .unwrap();
         std::hint::black_box(sink);
         recorded_as_counted(&db, "in the frozen state");
         db.hold_seal_landing(false);
@@ -4504,7 +4572,8 @@ fn fold_model_with(block_cache: bool, pieces_only: bool) {
     // range, and the check makes the last partition's table with those
     // keys already written.
     let mut n = 0usize;
-    db.scan(key(0).as_bytes(), 1, |_, _| n += 1).unwrap();
+    db.scan(key(0).as_bytes(), 1, kv(&mut |_, _| n += 1))
+        .unwrap();
     assert_eq!(n, 1);
     m.append(&mut db, "key-00590a", "before-the-table");
     m.delete(&mut db, &key(594));
@@ -4698,10 +4767,14 @@ fn a_manifest_publish_leaves_its_spare_to_the_sweep() {
     );
     let r = db.reader().unwrap();
     let mut n = 0usize;
-    r.scan(b"key-00000", 5000, |_k, v| {
-        assert_eq!(v, b"v1");
-        n += 1;
-    })
+    r.scan(
+        b"key-00000",
+        5000,
+        kv(&mut |_k, v| {
+            assert_eq!(v, b"v1");
+            n += 1;
+        }),
+    )
     .unwrap();
     assert_eq!(n, 2000, "the store reads as published");
 }
@@ -4930,7 +5003,7 @@ fn a_write_settles_into_the_block_it_lands_in() {
     }
     db.commit().unwrap();
     let mut sink = 0usize;
-    db.scan(key(600).as_bytes(), 40, |_k, v| sink += v.len())
+    db.scan(key(600).as_bytes(), 40, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     assert!(sink > 0);
     m.append(&mut db, &key(632), "inserted");
@@ -5006,14 +5079,14 @@ fn a_builder_ahead_of_the_reader_fills_the_cache() {
     // the memtable as of the last commit; the keys written after it are
     // the builder's to lack and the install's to splice.
     let mut sink = 0usize;
-    db.scan(key(0).as_bytes(), 3, |_k, v| sink += v.len())
+    db.scan(key(0).as_bytes(), 3, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     db.settle().unwrap();
     for k in (1..1200).step_by(50) {
         m.append(&mut db, &key(k), "live");
     }
     db.commit().unwrap();
-    db.scan(key(0).as_bytes(), 3, |_k, v| sink += v.len())
+    db.scan(key(0).as_bytes(), 3, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     let (blocks, _) = db.block_cache_size();
     assert!(
@@ -5050,7 +5123,7 @@ fn a_builder_ahead_of_the_reader_fills_the_cache() {
         },
     )
     .unwrap();
-    db.scan(key(0).as_bytes(), 3, |_k, v| sink += v.len())
+    db.scan(key(0).as_bytes(), 3, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     let between = |k: u32| format!("key-{k:05}x");
     for k in 0..1100 {
@@ -5071,7 +5144,7 @@ fn a_builder_ahead_of_the_reader_fills_the_cache() {
     m.delete(&mut db, &key(9));
     m.delete(&mut db, &between(7));
     db.commit().unwrap();
-    db.scan(key(0).as_bytes(), 3, |_k, v| sink += v.len())
+    db.scan(key(0).as_bytes(), 3, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     let (blocks, _) = db.block_cache_size();
     assert!(
@@ -5178,9 +5251,10 @@ fn a_read_consults_the_pieces_over_its_range() {
     let read = |db: &Db, k: u32| -> (Vec<String>, u64, u64) {
         let mut got = Vec::new();
         let n = db
-            .read_all(key(k).as_bytes(), |v| {
-                got.push(String::from_utf8(v.to_vec()).unwrap())
-            })
+            .read_all(
+                key(k).as_bytes(),
+                vf(&mut |v| got.push(String::from_utf8(v.to_vec()).unwrap())),
+            )
             .unwrap();
         (got, n, db.count(key(k).as_bytes()).unwrap())
     };
@@ -5212,12 +5286,16 @@ fn a_read_consults_the_pieces_over_its_range() {
     for from in [0, 297, 591] {
         let mut got: Vec<(String, String)> = Vec::new();
         let n = db
-            .scan(key(from).as_bytes(), 3, |k, v| {
-                got.push((
-                    String::from_utf8(k.to_vec()).unwrap(),
-                    String::from_utf8(v.to_vec()).unwrap(),
-                ))
-            })
+            .scan(
+                key(from).as_bytes(),
+                3,
+                kv(&mut |k, v| {
+                    got.push((
+                        String::from_utf8(k.to_vec()).unwrap(),
+                        String::from_utf8(v.to_vec()).unwrap(),
+                    ))
+                }),
+            )
             .unwrap();
         assert_eq!(n, 3, "scan from {from}");
         let mut want_all: Vec<(String, String)> = Vec::new();
@@ -5469,9 +5547,11 @@ fn a_seek_brackets_its_search_in_the_top_level() {
                     .flat_map(|k| m.vals[*k].iter().map(move |v| (k.to_vec(), v.clone())))
                     .collect();
                 let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-                db.scan(from.as_bytes(), 3, |k, v| {
-                    got.push((k.to_vec(), v.to_vec()))
-                })
+                db.scan(
+                    from.as_bytes(),
+                    3,
+                    kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))),
+                )
                 .unwrap();
                 assert_eq!(got, want, "scan from {from} at a sample's edge");
             }
@@ -6284,7 +6364,7 @@ fn serve(
             Ask::Read(k) => answers.send(read_vec(&r, &k)).unwrap(),
             Ask::Scan(from, n) => {
                 let mut out = Vec::new();
-                r.scan(&from, n, |k, v| out.push([k, b":", v].concat()))
+                r.scan(&from, n, kv(&mut |k, v| out.push([k, b":", v].concat())))
                     .unwrap();
                 answers.send(out).unwrap();
             }
@@ -6491,17 +6571,21 @@ fn readers_through_seals_and_merges(name: &str, zpages: bool, cache: bool) {
                 let k = (x % keys as u64) as u32;
                 if x.is_multiple_of(8) {
                     let mut last: Option<Vec<u8>> = None;
-                    r.scan(&key(k), 20, |kk, v| {
-                        if let Some(l) = &last {
-                            assert!(l.as_slice() < kk, "a scan out of key order");
-                        }
-                        last = Some(kk.to_vec());
-                        let s = std::str::from_utf8(v).unwrap();
-                        assert!(
-                            s.parse::<u64>().is_ok(),
-                            "a scanned value that is no version: {s}"
-                        );
-                    })
+                    r.scan(
+                        &key(k),
+                        20,
+                        kv(&mut |kk, v| {
+                            if let Some(l) = &last {
+                                assert!(l.as_slice() < kk, "a scan out of key order");
+                            }
+                            last = Some(kk.to_vec());
+                            let s = std::str::from_utf8(v).unwrap();
+                            assert!(
+                                s.parse::<u64>().is_ok(),
+                                "a scanned value that is no version: {s}"
+                            );
+                        }),
+                    )
                     .unwrap();
                     scans += 1;
                 } else {
@@ -6565,7 +6649,7 @@ fn readers_through_seals_and_merges(name: &str, zpages: bool, cache: bool) {
         // the form files and every partition has one, and without the block
         // cache that the scans' partition walks were too.
         let mut n = 0;
-        db.scan(&key(0), 200, |_, _| n += 1).unwrap();
+        db.scan(&key(0), 200, kv(&mut |_, _| n += 1)).unwrap();
         assert!(n > 0);
         let c = db.zpage_counts();
         assert!(
@@ -6628,11 +6712,15 @@ fn a_reader_sees_the_replayed_writes_from_the_open_on() {
     assert_eq!(reader.count(b"key-00014").unwrap(), 2);
     let mut n = 0;
     reader
-        .scan(b"key-00006", 3, |k, v| {
-            if k == b"key-00007" && v == b"v1" {
-                n += 1;
-            }
-        })
+        .scan(
+            b"key-00006",
+            3,
+            kv(&mut |k, v| {
+                if k == b"key-00007" && v == b"v1" {
+                    n += 1;
+                }
+            }),
+        )
         .unwrap();
     assert_eq!(n, 1, "the replayed append in a scan");
     reader.snapshot();
@@ -6674,11 +6762,15 @@ fn a_reader_under_latest_sees_the_commit_of_a_key_it_settled_uncommitted() {
     let scan_one = |r: &supdb::Reader, k: u32| -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         let want = key(k);
-        r.scan(want.as_bytes(), 1, |kk, v| {
-            if kk == want.as_bytes() {
-                out.push(v.to_vec());
-            }
-        })
+        r.scan(
+            want.as_bytes(),
+            1,
+            kv(&mut |kk, v| {
+                if kk == want.as_bytes() {
+                    out.push(v.to_vec());
+                }
+            }),
+        )
         .unwrap();
         out
     };
@@ -6773,7 +6865,7 @@ fn a_first_flush_seals_the_partition_in_one_publish() {
         );
         assert_eq!(read_vec(&db, &key(7)), vec![b"v".to_vec()]);
         let mut n = 0usize;
-        db.scan(&key(0), 5000, |_k, _v| n += 1).unwrap();
+        db.scan(&key(0), 5000, kv(&mut |_k, _v| n += 1)).unwrap();
         assert_eq!(n, 3000, "{name}");
     }
     let d = dir("first-partition-tombstone");
@@ -6844,7 +6936,7 @@ fn a_first_flush_seals_the_partition_in_one_publish() {
     );
     assert_eq!(read_vec(&db, &key(7)), vec![b"v".to_vec()]);
     let mut n = 0usize;
-    db.scan(&key(0), 5000, |_k, _v| n += 1).unwrap();
+    db.scan(&key(0), 5000, kv(&mut |_k, _v| n += 1)).unwrap();
     assert_eq!(n, 3000);
 }
 
@@ -6995,7 +7087,7 @@ fn overlapping_pieces_are_merged_once_the_store_is_read() {
     let mut scans = 0u64;
     while db.levels().0 == 0 && t.elapsed() < std::time::Duration::from_secs(20) {
         let from = format!("k{:08}", (scans * 131) % n);
-        r.scan(from.as_bytes(), 100, |_, _| {}).unwrap();
+        r.scan(from.as_bytes(), 100, kv(&mut |_, _| {})).unwrap();
         scans += 1;
     }
     assert!(db.levels().0 > 0, "{scans} scans and nothing was merged");
@@ -7127,15 +7219,19 @@ fn a_flush_that_does_not_partition_merges_the_rest_in_the_background() {
         }
         let mut n = 0usize;
         let mut last: Option<Vec<u8>> = None;
-        db.scan(&key(0), keys as usize + 10, |k, v| {
-            if let Some(l) = &last {
-                assert!(l.as_slice() < k, "a scan out of key order");
-            }
-            let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
-            assert_eq!(v, val(kn).as_slice());
-            last = Some(k.to_vec());
-            n += 1;
-        })
+        db.scan(
+            &key(0),
+            keys as usize + 10,
+            kv(&mut |k, v| {
+                if let Some(l) = &last {
+                    assert!(l.as_slice() < k, "a scan out of key order");
+                }
+                let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                assert_eq!(v, val(kn).as_slice());
+                last = Some(k.to_vec());
+                n += 1;
+            }),
+        )
         .unwrap();
         assert_eq!(n, keys as usize, "schedules {schedules}: every key, once");
     }
@@ -7187,7 +7283,7 @@ fn a_reader_walks_the_forms_the_writer_maintains_at_commit() {
     let mut sink = 0usize;
     // The first scan is what tells the store it is range-read; nothing
     // was maintained before it, so this one builds for itself.
-    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+    r.scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     assert_eq!(
         db.canonical_forms().0,
@@ -7199,7 +7295,7 @@ fn a_reader_walks_the_forms_the_writer_maintains_at_commit() {
     }
     db.commit().unwrap();
     let r = db.reader().unwrap();
-    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+    r.scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     let (forms, bytes, takes, complete) = db.canonical_forms();
     assert!(forms > 0 && bytes > 0, "{forms} forms, {bytes} bytes");
@@ -7216,11 +7312,15 @@ fn a_reader_walks_the_forms_the_writer_maintains_at_commit() {
     }
     // Key 1 took "v1b" at the commit before, and "staged" after it.
     let mut got = Vec::new();
-    r.scan(key(1).as_bytes(), 1, |k, v| {
-        if k == key(1).as_bytes() {
-            got.push(v.to_vec());
-        }
-    })
+    r.scan(
+        key(1).as_bytes(),
+        1,
+        kv(&mut |k, v| {
+            if k == key(1).as_bytes() {
+                got.push(v.to_vec());
+            }
+        }),
+    )
     .unwrap();
     assert_eq!(
         got,
@@ -7228,11 +7328,15 @@ fn a_reader_walks_the_forms_the_writer_maintains_at_commit() {
         "a staged write is not in what a reader walks"
     );
     let mut staged = 0usize;
-    r.scan(key(0).as_bytes(), 1500, |_k, v| {
-        if v == b"staged" {
-            staged += 1;
-        }
-    })
+    r.scan(
+        key(0).as_bytes(),
+        1500,
+        kv(&mut |_k, v| {
+            if v == b"staged" {
+                staged += 1;
+            }
+        }),
+    )
     .unwrap();
     assert_eq!(staged, 0, "no staged value anywhere in a reader's scan");
     db.commit().unwrap();
@@ -7247,11 +7351,15 @@ fn a_reader_walks_the_forms_the_writer_maintains_at_commit() {
     let before: Vec<Vec<u8>> = {
         let mut v = Vec::new();
         pinned
-            .scan(key(4).as_bytes(), 1, |k, val| {
-                if k == key(4).as_bytes() {
-                    v.push(val.to_vec());
-                }
-            })
+            .scan(
+                key(4).as_bytes(),
+                1,
+                kv(&mut |k, val| {
+                    if k == key(4).as_bytes() {
+                        v.push(val.to_vec());
+                    }
+                }),
+            )
             .unwrap();
         v
     };
@@ -7262,11 +7370,15 @@ fn a_reader_walks_the_forms_the_writer_maintains_at_commit() {
     let after: Vec<Vec<u8>> = {
         let mut v = Vec::new();
         pinned
-            .scan(key(4).as_bytes(), 1, |k, val| {
-                if k == key(4).as_bytes() {
-                    v.push(val.to_vec());
-                }
-            })
+            .scan(
+                key(4).as_bytes(),
+                1,
+                kv(&mut |k, val| {
+                    if k == key(4).as_bytes() {
+                        v.push(val.to_vec());
+                    }
+                }),
+            )
             .unwrap();
         v
     };
@@ -7372,8 +7484,12 @@ fn a_handle_reads_replaced_keys_over_pieces_only_forms() {
     let r = db.reader().unwrap();
     let scan_all = |r: &supdb::Reader| {
         let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        r.scan(b"", usize::MAX, |k, v| got.push((k.to_vec(), v.to_vec())))
-            .unwrap();
+        r.scan(
+            b"",
+            usize::MAX,
+            kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))),
+        )
+        .unwrap();
         got
     };
     let first = scan_all(&r);
@@ -7575,23 +7691,27 @@ fn reader_threads_over_blocks_tuned(
                     // handle was taking.
                     let mut bad: Option<(u32, u64, u64, usize)> = None;
                     let mut scanned: Vec<(u32, u64)> = Vec::new();
-                    r.scan(&key(k), 30, |kk, v| {
-                        if let Some(l) = &last {
-                            assert!(l.as_slice() < kk, "a scan out of key order");
-                        }
-                        last = Some(kk.to_vec());
-                        let s = std::str::from_utf8(v).unwrap();
-                        let ver: u64 = s
-                            .parse()
-                            .unwrap_or_else(|_| panic!("a scanned value that is no version: {s}"));
-                        let kn: u32 = std::str::from_utf8(&kk[4..]).unwrap().parse().unwrap();
-                        scanned.push((kn, ver));
-                        let prev = seen.entry(kn).or_insert(0);
-                        if ver < *prev && bad.is_none() {
-                            bad = Some((kn, ver, *prev, scanned.len() - 1));
-                        }
-                        *prev = (*prev).max(ver);
-                    })
+                    r.scan(
+                        &key(k),
+                        30,
+                        kv(&mut |kk, v| {
+                            if let Some(l) = &last {
+                                assert!(l.as_slice() < kk, "a scan out of key order");
+                            }
+                            last = Some(kk.to_vec());
+                            let s = std::str::from_utf8(v).unwrap();
+                            let ver: u64 = s.parse().unwrap_or_else(|_| {
+                                panic!("a scanned value that is no version: {s}")
+                            });
+                            let kn: u32 = std::str::from_utf8(&kk[4..]).unwrap().parse().unwrap();
+                            scanned.push((kn, ver));
+                            let prev = seen.entry(kn).or_insert(0);
+                            if ver < *prev && bad.is_none() {
+                                bad = Some((kn, ver, *prev, scanned.len() - 1));
+                            }
+                            *prev = (*prev).max(ver);
+                        }),
+                    )
                     .unwrap();
                     if let Some((kn, ver, prev, at)) = bad {
                         let point: Vec<String> = read_vec(&r, &key(kn))
@@ -7599,9 +7719,11 @@ fn reader_threads_over_blocks_tuned(
                             .map(|v| String::from_utf8_lossy(v).into_owned())
                             .collect();
                         let mut again: Vec<String> = Vec::new();
-                        r.scan(&key(kn), 1, |_, v| {
-                            again.push(String::from_utf8_lossy(v).into_owned())
-                        })
+                        r.scan(
+                            &key(kn),
+                            1,
+                            kv(&mut |_, v| again.push(String::from_utf8_lossy(v).into_owned())),
+                        )
                         .unwrap();
                         let (forms, _, takes, complete) = r.canonical_forms();
                         let kinds = r.block_cache_kinds();
@@ -7676,14 +7798,16 @@ fn reader_threads_over_blocks_tuned(
     quiet(&mut db);
     let r = db.reader().unwrap();
     let mut sink = 0usize;
-    r.scan(&key(0), 500, |_k, v| sink += v.len()).unwrap();
+    r.scan(&key(0), 500, kv(&mut |_k, v| sink += v.len()))
+        .unwrap();
     for k in (1..keys).step_by(11) {
         db.put(&key(k), b"902");
     }
     db.commit().unwrap();
     quiet(&mut db);
     let before = db.canonical_forms().2;
-    r.scan(&key(0), 500, |_k, v| sink += v.len()).unwrap();
+    r.scan(&key(0), 500, kv(&mut |_k, v| sink += v.len()))
+        .unwrap();
     let (forms, _, takes, complete) = db.canonical_forms();
     // Under `forms_pieces_only` the forms hold the pieces' fold alone, so
     // the keys just put make none and the reader reaches them through
@@ -7743,13 +7867,17 @@ fn the_adaptive_upkeep_holds_only_for_what_a_commit_leaves_to_a_read() {
     let mut want: HashMap<u32, String> = HashMap::new();
     let check = |db: &Db, want: &HashMap<u32, String>, when: &str| {
         let mut seen = 0u32;
-        db.scan(&key(0), keys as usize, |k, v| {
-            let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
-            let got = std::str::from_utf8(v).unwrap();
-            let expect = want.get(&kn).map_or("0", |s| s.as_str());
-            assert_eq!(got, expect, "key {kn} {when}");
-            seen += 1;
-        })
+        db.scan(
+            &key(0),
+            keys as usize,
+            kv(&mut |k, v| {
+                let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                let got = std::str::from_utf8(v).unwrap();
+                let expect = want.get(&kn).map_or("0", |s| s.as_str());
+                assert_eq!(got, expect, "key {kn} {when}");
+                seen += 1;
+            }),
+        )
         .unwrap();
         assert_eq!(seen, keys, "every key {when}");
     };
@@ -7823,18 +7951,26 @@ fn a_buffered_commit_near_reads_files_its_burst_and_lends_a_small_batch() {
             assert_eq!(got, expect, "key {kn} {when} through {who}");
         };
         let mut seen = 0u32;
-        db.scan(&key(0), keys as usize, |k, v| {
-            verify(k, v, "the writer");
-            seen += 1;
-        })
+        db.scan(
+            &key(0),
+            keys as usize,
+            kv(&mut |k, v| {
+                verify(k, v, "the writer");
+                seen += 1;
+            }),
+        )
         .unwrap();
         assert_eq!(seen, keys, "every key {when} through the writer");
         let r = db.reader().unwrap();
         let mut seen = 0u32;
-        r.scan(&key(0), keys as usize, |k, v| {
-            verify(k, v, "a handle");
-            seen += 1;
-        })
+        r.scan(
+            &key(0),
+            keys as usize,
+            kv(&mut |k, v| {
+                verify(k, v, "a handle");
+                seen += 1;
+            }),
+        )
         .unwrap();
         assert_eq!(seen, keys, "every key {when} through a handle");
     };
@@ -7903,7 +8039,7 @@ fn a_commit_that_syncs_lends_its_burst_to_the_thread() {
     // A handle's scan: reads around, and a scan since the writer's last
     // maintenance, so the commit's own rules file the batch -- on the
     // thread, since the commit syncs.
-    live.scan(&key(0), keys as usize, |_k, v| sink += v.len())
+    live.scan(&key(0), keys as usize, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     let mut x = 0x2545_F491_4F6C_DD1Du64;
     for _ in 0..300 {
@@ -7932,12 +8068,16 @@ fn a_commit_that_syncs_lends_its_burst_to_the_thread() {
         "and published the forms at the commit's position"
     );
     let mut seen = 0u32;
-    live.scan(&key(0), keys as usize, |k, v| {
-        let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
-        let expect = want.get(&kn).map_or("0", |s| s.as_str());
-        assert_eq!(std::str::from_utf8(v).unwrap(), expect, "key {kn}");
-        seen += 1;
-    })
+    live.scan(
+        &key(0),
+        keys as usize,
+        kv(&mut |k, v| {
+            let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+            let expect = want.get(&kn).map_or("0", |s| s.as_str());
+            assert_eq!(std::str::from_utf8(v).unwrap(), expect, "key {kn}");
+            seen += 1;
+        }),
+    )
     .unwrap();
     assert_eq!(seen, keys);
     std::hint::black_box(sink);
@@ -7988,7 +8128,7 @@ fn a_block_the_reads_pay_for_is_held_as_a_copy_too() {
     }
     db.commit().unwrap();
     let mut sink = 0usize;
-    db.scan(key(0).as_bytes(), 64, |_k, v| sink += v.len())
+    db.scan(key(0).as_bytes(), 64, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     let [promoted, dropped, on_copy, on_cheap, bytes] = db.form_choices();
     assert_eq!(promoted, 0, "nothing promoted by one scan of a block");
@@ -7996,7 +8136,7 @@ fn a_block_the_reads_pay_for_is_held_as_a_copy_too() {
     assert!(on_cheap > 0 && dropped == 0 && bytes == 0);
     // The hot range, read until the reads have paid for a copy of it.
     for _ in 0..12 {
-        db.scan(key(0).as_bytes(), 64, |_k, v| sink += v.len())
+        db.scan(key(0).as_bytes(), 64, kv(&mut |_k, v| sink += v.len()))
             .unwrap();
     }
     let [promoted, _, on_copy, _, bytes] = db.form_choices();
@@ -8011,7 +8151,7 @@ fn a_block_the_reads_pay_for_is_held_as_a_copy_too() {
     let before = db.form_choices();
     m.append(&mut db, &key(7), "v2");
     db.commit().unwrap();
-    db.scan(hot.as_bytes(), 64, |_k, v| sink += v.len())
+    db.scan(hot.as_bytes(), 64, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     let after = db.form_choices();
     assert!(
@@ -8029,7 +8169,7 @@ fn a_block_the_reads_pay_for_is_held_as_a_copy_too() {
     // that follows is the reads' and no model check is between.
     let mut promoted_again = 0u64;
     for _ in 0..4 {
-        db.scan(hot.as_bytes(), 64, |_k, v| sink += v.len())
+        db.scan(hot.as_bytes(), 64, kv(&mut |_k, v| sink += v.len()))
             .unwrap();
         let now = db.form_choices();
         if now[0] > after[0] {
@@ -8052,7 +8192,7 @@ fn a_block_the_reads_pay_for_is_held_as_a_copy_too() {
     for r in 0..40u32 {
         m.append(&mut db, &key(3000 + r), "w");
         db.commit().unwrap();
-        db.scan(key(3000).as_bytes(), 1, |_k, v| sink += v.len())
+        db.scan(key(3000).as_bytes(), 1, kv(&mut |_k, v| sink += v.len()))
             .unwrap();
     }
     assert_eq!(
@@ -8065,7 +8205,7 @@ fn a_block_the_reads_pay_for_is_held_as_a_copy_too() {
     // own choices, over the same store.
     let r = db.reader().unwrap();
     for _ in 0..12 {
-        r.scan(key(0).as_bytes(), 64, |_k, v| sink += v.len())
+        r.scan(key(0).as_bytes(), 64, kv(&mut |_k, v| sink += v.len()))
             .unwrap();
     }
     assert!(
@@ -8174,9 +8314,11 @@ fn a_piece_kept_across_a_merge_is_ranked_against_the_partition_it_meets() {
         "a new partition, and the third piece kept over it"
     );
     let mut seen: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
-    db.scan(b"", usize::MAX, |k, v| {
-        seen.entry(k.to_vec()).or_default().push(v.to_vec())
-    })
+    db.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| seen.entry(k.to_vec()).or_default().push(v.to_vec())),
+    )
     .unwrap();
     assert_eq!(seen.len(), model.len(), "the scan's key count");
     assert!(seen == model, "the scan disagrees with the model");
@@ -8185,10 +8327,14 @@ fn a_piece_kept_across_a_merge_is_ranked_against_the_partition_it_meets() {
     for k in [2990u32, 2999, 3000, 3004, 3009, 3010] {
         let from = key(k);
         let mut got: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
-        db.scan(&from, 20, |k, v| match got.last_mut() {
-            Some((last, vals)) if last.as_slice() == k => vals.push(v.to_vec()),
-            _ => got.push((k.to_vec(), vec![v.to_vec()])),
-        })
+        db.scan(
+            &from,
+            20,
+            kv(&mut |k, v| match got.last_mut() {
+                Some((last, vals)) if last.as_slice() == k => vals.push(v.to_vec()),
+                _ => got.push((k.to_vec(), vec![v.to_vec()])),
+            }),
+        )
         .unwrap();
         let want: Vec<(Vec<u8>, Vec<Vec<u8>>)> = model
             .range(from.clone()..)
@@ -8242,7 +8388,7 @@ fn every_handle_after_the_first_adopts_the_snapshot_it_published() {
     let mut sink = 0usize;
     let first = db.reader().unwrap();
     first
-        .scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        .scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     assert_eq!(
         db.snapshot_builds(),
@@ -8252,7 +8398,7 @@ fn every_handle_after_the_first_adopts_the_snapshot_it_published() {
     let mut others = Vec::new();
     for _ in 0..4 {
         let r = db.reader().unwrap();
-        r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        r.scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
             .unwrap();
         others.push(r);
     }
@@ -8311,7 +8457,7 @@ fn a_handle_that_adopts_a_snapshot_sees_the_keys_written_past_it() {
     let mut sink = 0usize;
     let first = db.reader().unwrap();
     first
-        .scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        .scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     let published = db.snapshot_builds();
     // Keys the published snapshot cannot hold: some beyond its greatest,
@@ -8330,12 +8476,16 @@ fn a_handle_that_adopts_a_snapshot_sees_the_keys_written_past_it() {
     // here with the key's every source, since the check's own message
     // says only which value came back.
     let mut got: Vec<(String, String)> = Vec::new();
-    next.scan(key(0).as_bytes(), 2, |k, v| {
-        got.push((
-            String::from_utf8_lossy(k).into_owned(),
-            String::from_utf8_lossy(v).into_owned(),
-        ))
-    })
+    next.scan(
+        key(0).as_bytes(),
+        2,
+        kv(&mut |k, v| {
+            got.push((
+                String::from_utf8_lossy(k).into_owned(),
+                String::from_utf8_lossy(v).into_owned(),
+            ))
+        }),
+    )
     .unwrap();
     let want: Vec<(String, String)> = [(0, "v0"), (0, "v1"), (1, "v0"), (1, "v2")]
         .iter()
@@ -8453,7 +8603,7 @@ fn extend_order_model_with(block_cache: bool, pieces_only: bool) {
     }
     db.commit().unwrap();
     let mut sink = 0usize;
-    db.scan(key(0).as_bytes(), 100, |_k, v| sink += v.len())
+    db.scan(key(0).as_bytes(), 100, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     assert_eq!(
         (db.snapshot_builds() - b0) + (db.snapshot_extends() - e0),
@@ -8475,7 +8625,7 @@ fn extend_order_model_with(block_cache: bool, pieces_only: bool) {
         m.append(&mut db, &tie((x >> 8) % 100_000), "t");
     }
     db.commit().unwrap();
-    db.scan(key(0).as_bytes(), 100, |_k, v| sink += v.len())
+    db.scan(key(0).as_bytes(), 100, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     assert_eq!(
         db.snapshot_builds(),
@@ -8546,14 +8696,14 @@ fn the_cap_and_the_trigger_follow_the_reads_and_relax_over_a_write_only_stretch(
     );
     // A scan over a drained store costs no lag, and counts for none.
     let mut sink = 0usize;
-    db.scan(key(0).as_bytes(), 10, |_k, v| sink += v.len())
+    db.scan(key(0).as_bytes(), 10, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     db.put(key(6000).as_bytes(), b"w");
     db.commit().unwrap();
     assert_eq!(db.lag_level(), 0, "a drained scan is not a read over lag");
     assert_eq!(db.lag_reads(), 0);
     // A scan over the key just written is; the next commit takes it.
-    db.scan(key(5990).as_bytes(), 20, |_k, v| sink += v.len())
+    db.scan(key(5990).as_bytes(), 20, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     assert_eq!(db.lag_reads(), 1);
     assert_eq!(
@@ -8598,7 +8748,7 @@ fn the_cap_and_the_trigger_follow_the_reads_and_relax_over_a_write_only_stretch(
     db.settle().unwrap();
     assert!(db.levels().1 > 0, "the seal left a piece");
     let mut got = 0usize;
-    db.read_all(key(7100).as_bytes(), |v| got += v.len())
+    db.read_all(key(7100).as_bytes(), vf(&mut |v| got += v.len()))
         .unwrap();
     assert_eq!(got, 1);
     assert_eq!(db.lag_reads(), 2, "a point read over a piece");
@@ -8669,7 +8819,7 @@ fn carry_model_with(block_cache: bool, pieces_only: bool) {
     }
     db.commit().unwrap();
     let mut sink = 0usize;
-    db.scan(key(0).as_bytes(), 6000, |_k, v| sink += v.len())
+    db.scan(key(0).as_bytes(), 6000, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     let built = db.snapshot_builds();
     let extended = db.snapshot_extends();
@@ -8689,7 +8839,7 @@ fn carry_model_with(block_cache: bool, pieces_only: bool) {
         m.append(&mut db, &key(k), "l1");
     }
     db.commit().unwrap();
-    db.scan(key(0).as_bytes(), 6000, |_k, v| sink += v.len())
+    db.scan(key(0).as_bytes(), 6000, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     assert_eq!(
         db.snapshot_builds(),
@@ -8744,7 +8894,7 @@ fn the_writer_maintains_the_forms_once_a_reader_handle_is_live() {
         for k in (0..1500u32).step_by(5) {
             m.append(&mut db, &key(k), "vw");
         }
-        db.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        db.scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
             .unwrap();
         db.commit().unwrap();
         assert_eq!(
@@ -8756,7 +8906,7 @@ fn the_writer_maintains_the_forms_once_a_reader_handle_is_live() {
     // A handle the caller holds, scanning: from the next commit the
     // writer keeps the forms current for it.
     let r = db.reader().unwrap();
-    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+    r.scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     for k in (1..1500u32).step_by(7) {
         m.append(&mut db, &key(k), "vr");
@@ -8781,7 +8931,7 @@ fn the_writer_maintains_the_forms_once_a_reader_handle_is_live() {
     for k in (2..1500u32).step_by(11) {
         m.append(&mut db, &key(k), "vg");
     }
-    r2.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+    r2.scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     db.commit().unwrap();
     assert!(
@@ -8831,7 +8981,7 @@ fn the_writers_own_handle_takes_the_forms_it_maintains() {
         // the commit after it has something to maintain for, then writes,
         // then the commit that maintains.
         let _handle = db.reader().unwrap();
-        db.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        db.scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
             .unwrap();
         for k in (0..1500u32).step_by(5) {
             m.append(&mut db, &key(k), "vw");
@@ -9042,7 +9192,7 @@ fn a_write_burst_is_settled_once_its_backlog_passes_the_bound() {
         // commit, so the forms exist and are current.
         let _handle = db.reader().unwrap();
         let mut sink = 0usize;
-        db.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        db.scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
             .unwrap();
         db.commit().unwrap();
         let before = db.forms_position();
@@ -9121,7 +9271,7 @@ fn the_settle_bound_is_a_share_of_the_partitions_keys() {
         );
         let _handle = db.reader().unwrap();
         let mut sink = 0usize;
-        db.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        db.scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
             .unwrap();
         db.commit().unwrap();
         let before = db.forms_position();
@@ -9186,7 +9336,7 @@ fn a_reader_meets_a_block_gone_wide_through_the_forms() {
     let mut sink = 0usize;
     // A handle's scan, so the writer maintains the forms from here on.
     let r = db.reader().unwrap();
-    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+    r.scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     // A few keys in the last block first, so it has a published form to
     // go stale, then keys past the end until the block is wide, a
@@ -9196,7 +9346,7 @@ fn a_reader_meets_a_block_gone_wide_through_the_forms() {
     }
     db.commit().unwrap();
     let r = db.reader().unwrap();
-    r.scan(key(1400).as_bytes(), 100, |_k, v| sink += v.len())
+    r.scan(key(1400).as_bytes(), 100, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     for batch in 0..5u32 {
         for k in 0..100u32 {
@@ -9204,7 +9354,7 @@ fn a_reader_meets_a_block_gone_wide_through_the_forms() {
         }
         db.commit().unwrap();
         let r = db.reader().unwrap();
-        r.scan(key(1400).as_bytes(), 50, |_k, v| sink += v.len())
+        r.scan(key(1400).as_bytes(), 50, kv(&mut |_k, v| sink += v.len()))
             .unwrap();
     }
     db.commit().unwrap();
@@ -9292,7 +9442,7 @@ fn the_copies_survive_a_merge_with(compact: bool) {
     }
     db.commit().unwrap();
     let r = db.reader().unwrap();
-    r.scan(key(0).as_bytes(), 3000, |_k, v| sink += v.len())
+    r.scan(key(0).as_bytes(), 3000, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     db.commit().unwrap();
     db.seal().unwrap();
@@ -9321,7 +9471,7 @@ fn the_copies_survive_a_merge_with(compact: bool) {
     m.delete(&mut db, &key(33));
     db.commit().unwrap();
     let r = db.reader().unwrap();
-    r.scan(key(0).as_bytes(), 10, |_k, v| sink += v.len())
+    r.scan(key(0).as_bytes(), 10, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     db.commit().unwrap();
     let r = db.reader().unwrap();
@@ -9402,7 +9552,7 @@ fn the_forms_survive_a_seal_with(snapshot_carry: bool) {
     }
     db.commit().unwrap();
     let r = db.reader().unwrap();
-    r.scan(key(0).as_bytes(), 2000, |_k, v| sink += v.len())
+    r.scan(key(0).as_bytes(), 2000, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     db.commit().unwrap();
     let (forms, _, _, _) = db.canonical_forms();
@@ -9456,7 +9606,7 @@ fn the_forms_survive_a_seal_with(snapshot_carry: bool) {
     }
     db.commit().unwrap();
     let r = db.reader().unwrap();
-    r.scan(key(0).as_bytes(), 10, |_k, v| sink += v.len())
+    r.scan(key(0).as_bytes(), 10, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     db.commit().unwrap();
     let r = db.reader().unwrap();
@@ -9534,7 +9684,7 @@ fn the_forms_survive_a_direct_runs_start() {
     }
     db.commit().unwrap();
     let r = db.reader().unwrap();
-    r.scan(key(0).as_bytes(), 2000, |_k, v| sink += v.len())
+    r.scan(key(0).as_bytes(), 2000, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     db.commit().unwrap();
     let (forms, _, _, _) = db.canonical_forms();
@@ -9688,7 +9838,7 @@ fn the_forms_are_published_when_a_handle_asks() {
     // A handle's scan and a commit: maintained and, with the handle
     // live, published.
     let r = db.reader().unwrap();
-    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+    r.scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     db.commit().unwrap();
     let at_first = db.forms_position();
@@ -9701,7 +9851,7 @@ fn the_forms_are_published_when_a_handle_asks() {
         for k in (round..1500u32).step_by(7) {
             m.append(&mut db, &key(k), "quiet");
         }
-        db.scan(key(0).as_bytes(), 10, |_k, v| sink += v.len())
+        db.scan(key(0).as_bytes(), 10, kv(&mut |_k, v| sink += v.len()))
             .unwrap();
         db.commit().unwrap();
     }
@@ -9730,7 +9880,7 @@ fn the_forms_are_published_when_a_handle_asks() {
     for k in (3..1500u32).step_by(11) {
         m.append(&mut db, &key(k), "staged");
     }
-    db.scan(key(0).as_bytes(), 10, |_k, v| sink += v.len())
+    db.scan(key(0).as_bytes(), 10, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     let r = db.reader().unwrap();
     assert_eq!(
@@ -9794,7 +9944,7 @@ fn a_table_the_commit_filled_takes_the_writes_after_it() {
     // A handle's scan, not the writer's, and the commit that maintains:
     // the writer's tables are the commit's fill.
     let r = db.reader().unwrap();
-    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+    r.scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     db.commit().unwrap();
     assert!(db.canonical_forms().0 > 0, "maintained");
@@ -9842,7 +9992,7 @@ fn a_handle_claimed_after_a_burst_adopts_the_writers_snapshot() {
     let mut sink = 0usize;
     // The writer scans the drained store, then a burst: its snapshot is
     // the empty one and the burst's keys are filed by block.
-    db.scan(key(0).as_bytes(), 10, |_k, v| sink += v.len())
+    db.scan(key(0).as_bytes(), 10, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     for k in (0..1500u32).step_by(3) {
         m.append(&mut db, &key(k), "burst");
@@ -9854,9 +10004,9 @@ fn a_handle_claimed_after_a_burst_adopts_the_writers_snapshot() {
     let r = db.reader().unwrap();
     let at_claim = db.snapshot_builds() + db.snapshot_extends();
     assert!(at_claim > builds, "the claim brought the snapshot current");
-    r.scan(key(0).as_bytes(), 200, |_k, v| sink += v.len())
+    r.scan(key(0).as_bytes(), 200, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
-    r.scan(key(700).as_bytes(), 200, |_k, v| sink += v.len())
+    r.scan(key(700).as_bytes(), 200, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     assert_eq!(
         db.snapshot_builds() + db.snapshot_extends(),
@@ -9872,11 +10022,15 @@ fn a_handle_claimed_after_a_burst_adopts_the_writers_snapshot() {
     }
     let r2 = db.reader().unwrap();
     let mut got = Vec::new();
-    r2.scan(key(1).as_bytes(), 1, |k, v| {
-        if k == key(1).as_bytes() {
-            got.push(v.to_vec());
-        }
-    })
+    r2.scan(
+        key(1).as_bytes(),
+        1,
+        kv(&mut |k, v| {
+            if k == key(1).as_bytes() {
+                got.push(v.to_vec());
+            }
+        }),
+    )
     .unwrap();
     assert_eq!(got, vec![b"v0".to_vec()], "a handle sees nothing staged");
     db.commit().unwrap();
@@ -9924,7 +10078,7 @@ fn a_burst_is_settled_by_its_backlog_only_near_a_scan() {
     assert!(db.levels().0 > 1, "several partitions");
     let scan = |db: &Db| {
         let mut sink = 0usize;
-        db.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        db.scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
             .unwrap();
         std::hint::black_box(sink);
     };
@@ -10037,8 +10191,12 @@ fn pieces_merge_case(tier_pieces: usize, l0_trigger: usize) {
     let opts = |tier: usize| opts(tier, l0_trigger);
     let scan_all = |db: &Db| {
         let mut out = Vec::new();
-        db.scan(b"", usize::MAX, |k, v| out.push((k.to_vec(), v.to_vec())))
-            .unwrap();
+        db.scan(
+            b"",
+            usize::MAX,
+            kv(&mut |k, v| out.push((k.to_vec(), v.to_vec()))),
+        )
+        .unwrap();
         out
     };
     let want = scan_all(&b);
@@ -10116,7 +10274,7 @@ fn the_snapshots_runs_answer_as_the_chains_do() {
         db.commit().unwrap();
         let reader = db.reader().unwrap();
         let mut sink = 0usize;
-        db.scan(key(0).as_bytes(), 3000, |_k, v| sink += v.len())
+        db.scan(key(0).as_bytes(), 3000, kv(&mut |_k, v| sink += v.len()))
             .unwrap();
         m.check(
             &db,
@@ -10132,11 +10290,15 @@ fn the_snapshots_runs_answer_as_the_chains_do() {
         let scan_one = |r: &supdb::Reader, k: u32| -> Vec<Vec<u8>> {
             let mut out = Vec::new();
             let want = key(k);
-            r.scan(want.as_bytes(), 1, |kk, v| {
-                if kk == want.as_bytes() {
-                    out.push(v.to_vec());
-                }
-            })
+            r.scan(
+                want.as_bytes(),
+                1,
+                kv(&mut |kk, v| {
+                    if kk == want.as_bytes() {
+                        out.push(v.to_vec());
+                    }
+                }),
+            )
             .unwrap();
             out
         };
@@ -10421,7 +10583,7 @@ fn a_replacing_write_patches_a_copy_in_place() {
     // Every key replaced once: each block's deltas grow past the dense
     // bound and the commit's fill builds the block as a copy.
     let mut replace = |db: &mut Db, m: &mut ScanModel, val: &str| {
-        db.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        db.scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
             .unwrap();
         for k in 0..1500u32 {
             m.delete(db, &key(k));
@@ -10503,13 +10665,13 @@ fn a_scan_builds_the_snapshot_only_where_a_block_needs_it() {
         let mut sink = 0usize;
         // The first half overlaid, so its blocks get forms from the fill;
         // the second half's blocks stay without one.
-        db.scan(key(0).as_bytes(), 3000, |_k, v| sink += v.len())
+        db.scan(key(0).as_bytes(), 3000, kv(&mut |_k, v| sink += v.len()))
             .unwrap();
         for k in (0..1500u32).step_by(3) {
             m.append(&mut db, &key(k), "v1");
         }
         db.commit().unwrap();
-        db.scan(key(0).as_bytes(), 10, |_k, v| sink += v.len())
+        db.scan(key(0).as_bytes(), 10, kv(&mut |_k, v| sink += v.len()))
             .unwrap();
         db.commit().unwrap();
         // More overlay, then the seal, whose landing drops the snapshot.
@@ -10899,9 +11061,11 @@ fn a_merge_that_finishes_while_a_seal_is_between_its_phases_lands_after_it() {
     assert_ne!(manifest_after, manifest_before, "the landings wrote it");
     let check = |db: &Reader, state: &str| {
         let mut seen: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
-        db.scan(b"", usize::MAX, |k, v| {
-            seen.entry(k.to_vec()).or_default().push(v.to_vec())
-        })
+        db.scan(
+            b"",
+            usize::MAX,
+            kv(&mut |k, v| seen.entry(k.to_vec()).or_default().push(v.to_vec())),
+        )
         .unwrap();
         assert_eq!(seen.len(), model.len(), "{state}: the scan's key count");
         assert!(seen == model, "{state}: the scan disagrees with the model");
@@ -10930,7 +11094,11 @@ fn a_held_handle_never_names_an_entry_a_direct_run_left_uncommitted() {
     r.snapshot();
     let mut first = Vec::new();
     let n = r
-        .scan(b"", 10, |k, v| first.push((k.to_vec(), v.to_vec())))
+        .scan(
+            b"",
+            10,
+            kv(&mut |k, v| first.push((k.to_vec(), v.to_vec()))),
+        )
         .unwrap();
     assert!(first.is_empty(), "the held commit has nothing: {first:?}");
     assert_eq!(n, 0, "a scan counted a key its commit does not hold");
@@ -10939,14 +11107,19 @@ fn a_held_handle_never_names_an_entry_a_direct_run_left_uncommitted() {
     db.append(b"key-1", b"staged");
     let mut again = Vec::new();
     let n = r
-        .scan(b"", 10, |k, v| again.push((k.to_vec(), v.to_vec())))
+        .scan(
+            b"",
+            10,
+            kv(&mut |k, v| again.push((k.to_vec(), v.to_vec()))),
+        )
         .unwrap();
     assert!(again.is_empty(), "the held commit has nothing: {again:?}");
     assert_eq!(n, 0);
     r.release();
     db.commit().unwrap();
     let mut after = Vec::new();
-    r.scan(b"", 10, |k, _| after.push(k.to_vec())).unwrap();
+    r.scan(b"", 10, kv(&mut |k, _| after.push(k.to_vec())))
+        .unwrap();
     assert_eq!(after, vec![b"key-1".to_vec(), b"key-5".to_vec()]);
 }
 
@@ -10971,7 +11144,9 @@ fn a_handles_scan_limit_counts_only_committed_keys() {
         db.append(format!("key-{k:02}a").as_bytes(), b"staged");
     }
     let mut got = Vec::new();
-    let n = r.scan(b"", 10, |k, _| got.push(k.to_vec())).unwrap();
+    let n = r
+        .scan(b"", 10, kv(&mut |k, _| got.push(k.to_vec())))
+        .unwrap();
     let want: Vec<Vec<u8>> = (0..10u32)
         .map(|k| format!("key-{k:02}").into_bytes())
         .collect();
@@ -11004,7 +11179,9 @@ fn a_handle_adopts_no_snapshot_past_its_commit() {
         .collect();
     let scan10 = |r: &Reader| {
         let mut got = Vec::new();
-        let n = r.scan(b"", 10, |k, _| got.push(k.to_vec())).unwrap();
+        let n = r
+            .scan(b"", 10, kv(&mut |k, _| got.push(k.to_vec())))
+            .unwrap();
         (got, n)
     };
     // A handle pinned at this commit, and a later commit's snapshot
@@ -11029,7 +11206,7 @@ fn a_handle_adopts_no_snapshot_past_its_commit() {
         db.append(format!("key-{k:02}b").as_bytes(), b"staged");
     }
     let mut mine = 0usize;
-    db.scan(b"", 40, |_, _| mine += 1).unwrap();
+    db.scan(b"", 40, kv(&mut |_, _| mine += 1)).unwrap();
     assert_eq!(mine, 40, "the writer reads what it has staged");
     let fresh = db.reader().unwrap();
     let (got, n) = scan10(&fresh);
@@ -11100,10 +11277,14 @@ fn reader_handles_across_seals_see_every_value_once_and_in_order() {
                 let k = (x % keys as u64) as u32;
                 if x.is_multiple_of(4) {
                     let mut by_key: BTreeMap<u32, Vec<Vec<u8>>> = BTreeMap::new();
-                    r.scan(&key(k), 20, |kk, v| {
-                        let kn: u32 = std::str::from_utf8(&kk[4..]).unwrap().parse().unwrap();
-                        by_key.entry(kn).or_default().push(v.to_vec());
-                    })
+                    r.scan(
+                        &key(k),
+                        20,
+                        kv(&mut |kk, v| {
+                            let kn: u32 = std::str::from_utf8(&kk[4..]).unwrap().parse().unwrap();
+                            by_key.entry(kn).or_default().push(v.to_vec());
+                        }),
+                    )
                     .unwrap();
                     for (kn, vals) in &by_key {
                         check(&mut seen, *kn, vals, "scan");
@@ -11330,7 +11511,8 @@ fn a_seal_far_from_reads_builds_no_copy() {
         // next seal is near it and builds the copy.
         assert_eq!(db.levels().0, 0, "no partition yet");
         let mut sink = 0usize;
-        db.scan(b"key-00000", 10, |_k, v| sink += v.len()).unwrap();
+        db.scan(b"key-00000", 10, kv(&mut |_k, v| sink += v.len()))
+            .unwrap();
         let before = db.seal_snapshots();
         for k in (0..3000u32).step_by(5) {
             m.append(&mut db, &format!("key-{k:05}"), "after-a-scan");
@@ -11861,18 +12043,22 @@ fn tail_readers(
                     let k = (x % n as u64) as u32;
                     if x.is_multiple_of(8) {
                         let mut expect = k;
-                        r.scan(&tail_key(k), 50, |kk, v| {
-                            assert_eq!(
-                                kk,
-                                tail_key(expect).as_slice(),
-                                "scan from {k}: key {expect} missing or out of order"
-                            );
-                            let ver = tail_ver(v);
-                            let prev = seen.entry(expect).or_insert(0);
-                            assert!(ver >= *prev, "key {expect} scanned {ver} after {prev}");
-                            *prev = ver;
-                            expect += 1;
-                        })
+                        r.scan(
+                            &tail_key(k),
+                            50,
+                            kv(&mut |kk, v| {
+                                assert_eq!(
+                                    kk,
+                                    tail_key(expect).as_slice(),
+                                    "scan from {k}: key {expect} missing or out of order"
+                                );
+                                let ver = tail_ver(v);
+                                let prev = seen.entry(expect).or_insert(0);
+                                assert!(ver >= *prev, "key {expect} scanned {ver} after {prev}");
+                                *prev = ver;
+                                expect += 1;
+                            }),
+                        )
                         .unwrap();
                         assert_eq!(expect, (k + 50).min(n), "scan from {k} came up short");
                     } else {
@@ -12557,17 +12743,21 @@ fn readers_on_threads_keep_answering_beside_three_frozen_tables() {
                 let k = (x % keys as u64) as u32;
                 if x.is_multiple_of(8) {
                     let mut last: Option<Vec<u8>> = None;
-                    r.scan(&key(k), 20, |kk, v| {
-                        if let Some(l) = &last {
-                            assert!(l.as_slice() < kk, "a scan out of key order");
-                        }
-                        last = Some(kk.to_vec());
-                        let s = std::str::from_utf8(v).unwrap();
-                        assert!(
-                            s.parse::<u64>().is_ok(),
-                            "a scanned value that is no version: {s}"
-                        );
-                    })
+                    r.scan(
+                        &key(k),
+                        20,
+                        kv(&mut |kk, v| {
+                            if let Some(l) = &last {
+                                assert!(l.as_slice() < kk, "a scan out of key order");
+                            }
+                            last = Some(kk.to_vec());
+                            let s = std::str::from_utf8(v).unwrap();
+                            assert!(
+                                s.parse::<u64>().is_ok(),
+                                "a scanned value that is no version: {s}"
+                            );
+                        }),
+                    )
                     .unwrap();
                     scans += 1;
                 } else {
@@ -13131,16 +13321,16 @@ fn a_landing_that_replaces_the_live_table_carries_no_form() {
         m.append(&mut db, &key(k), "v1");
     }
     db.commit().unwrap();
-    db.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+    db.scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     let r = db.reader().unwrap();
-    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+    r.scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     for k in (1..1500u32).step_by(13) {
         m.append(&mut db, &key(k), "v1b");
     }
     db.commit().unwrap();
-    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+    r.scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     let (forms, _, takes, _) = db.canonical_forms();
     assert!(forms > 0, "forms published before the hand-off: {forms}");
@@ -13226,10 +13416,10 @@ fn a_form_dropped_under_a_landings_carry_is_retracted_at_the_writers_look() {
         m.append(&mut db, &key(k), "v1");
     }
     db.commit().unwrap();
-    db.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+    db.scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     let r = db.reader().unwrap();
-    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+    r.scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     m.append(&mut db, &key(1), "v1b");
     db.commit().unwrap();
@@ -13250,7 +13440,7 @@ fn a_form_dropped_under_a_landings_carry_is_retracted_at_the_writers_look() {
     assert!(db.in_flight().0, "a seal in flight, held");
     // The freeze carries no form; a maintained commit publishes them again
     // into the state the landing will carry from.
-    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+    r.scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     m.append(&mut db, &key(3), "v3");
     db.commit().unwrap();
@@ -13279,7 +13469,7 @@ fn a_form_dropped_under_a_landings_carry_is_retracted_at_the_writers_look() {
     );
     // The writer's look and, in the same commit, a write into the block
     // settled: the check that a block with no form has none published.
-    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+    r.scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     m.append(&mut db, &key(700), "into");
     db.commit().unwrap();
@@ -13292,9 +13482,9 @@ fn a_form_dropped_under_a_landings_carry_is_retracted_at_the_writers_look() {
     // a handle's scans after the commit that publishes.
     m.append(&mut db, &key(701), "after");
     db.commit().unwrap();
-    db.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+    db.scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
-    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+    r.scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     m.append(&mut db, &key(702), "after2");
     db.commit().unwrap();
@@ -13342,9 +13532,11 @@ fn a_scan_takes_no_form_published_after_the_commit_it_reads_at() {
     let r = db.reader().unwrap();
     let collect = |rd: &supdb::Reader, from: u32, n: usize| {
         let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        rd.scan(key(from).as_bytes(), n, |k, v| {
-            out.push((k.to_vec(), v.to_vec()))
-        })
+        rd.scan(
+            key(from).as_bytes(),
+            n,
+            kv(&mut |k, v| out.push((k.to_vec(), v.to_vec()))),
+        )
         .unwrap();
         out
     };
@@ -13379,7 +13571,7 @@ fn a_scan_takes_no_form_published_after_the_commit_it_reads_at() {
         "the snapshot's scan with the next commit's forms in the slots"
     );
     let mut v = Vec::new();
-    r.read_all(key(700).as_bytes(), |x| v.push(x.to_vec()))
+    r.read_all(key(700).as_bytes(), vf(&mut |x| v.push(x.to_vec())))
         .unwrap();
     assert_eq!(v, vec![b"v1".to_vec()], "the snapshot's point read");
     db.hold_forms_position(false);
@@ -13530,13 +13722,15 @@ fn wal_files(d: &std::path::Path) -> Vec<std::path::PathBuf> {
 fn holds_all(db: &Reader, want: &BTreeMap<Vec<u8>, Vec<Vec<u8>>>, state: &str) {
     for (k, v) in want {
         let mut got = Vec::new();
-        db.read_all(k, |x| got.push(x.to_vec())).unwrap();
+        db.read_all(k, vf(&mut |x| got.push(x.to_vec()))).unwrap();
         assert_eq!(&got, v, "{state}: key {:?}", String::from_utf8_lossy(k));
     }
     let mut scanned: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
-    db.scan(b"", usize::MAX, |k, v| {
-        scanned.entry(k.to_vec()).or_default().push(v.to_vec())
-    })
+    db.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| scanned.entry(k.to_vec()).or_default().push(v.to_vec())),
+    )
     .unwrap();
     assert_eq!(&scanned, want, "{state}: the scan");
 }
@@ -13691,7 +13885,7 @@ fn a_rotated_wal_torn_in_its_new_file_reopens_to_a_prefix() {
         let db = Db::open(&d, opts.clone())
             .unwrap_or_else(|e| panic!("the store must open with the new file cut at {cut}: {e}"));
         let mut got = 0u32;
-        db.scan(b"", usize::MAX, |_, _| got += 1).unwrap();
+        db.scan(b"", usize::MAX, kv(&mut |_, _| got += 1)).unwrap();
         assert!(
             got >= closed,
             "cut {cut}: every record of the closed file ({closed}), got {got}"
@@ -13852,7 +14046,7 @@ fn a_commit_seals_whenever_the_sealer_is_idle() {
             next += n;
         };
         let scan_once = |db: &Db| {
-            db.scan(b"", 1, |_, _| {}).unwrap();
+            db.scan(b"", 1, kv(&mut |_, _| {})).unwrap();
         };
         db.hold_seal_landing(true);
         let watch = Watchdog::arm("a commit waited for a held seal");
@@ -14173,7 +14367,7 @@ fn the_next_look_carries_the_forms_across_a_freeze_with(
     }
     db.commit().unwrap();
     let r = db.reader().unwrap();
-    r.scan(key(0).as_bytes(), 2000, |_k, v| sink += v.len())
+    r.scan(key(0).as_bytes(), 2000, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     db.commit().unwrap();
     // A burst nobody settles -- no scan between these commits and the
@@ -14210,7 +14404,7 @@ fn the_next_look_carries_the_forms_across_a_freeze_with(
     }
     db.commit().unwrap();
     let r = db.reader().unwrap();
-    r.scan(key(0).as_bytes(), 10, |_k, v| sink += v.len())
+    r.scan(key(0).as_bytes(), 10, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     db.commit().unwrap();
     let r = db.reader().unwrap();
@@ -14279,9 +14473,9 @@ fn a_commit_that_freezes_leaves_the_carry_to_the_upkeep_thread() {
         m.append(&mut db, &key(k), "v1");
     }
     db.commit().unwrap();
-    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+    r.scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
-    db.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+    db.scan(key(0).as_bytes(), 1500, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     db.commit().unwrap();
     db.settle().unwrap();
@@ -14353,7 +14547,7 @@ fn a_commit_past_the_bound_holds_for_the_thread() {
     db.settle().unwrap();
     // A scan, so the burst after it has reads around.
     let mut sink = 0usize;
-    db.scan(key(0).as_bytes(), 10, |_k, v| sink += v.len())
+    db.scan(key(0).as_bytes(), 10, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     let holds = db.upkeep_counts()[4];
     for round in 0..10u32 {
@@ -14724,7 +14918,11 @@ fn a_scans_answers_are_the_same_with_the_directory_hint_and_without() {
     let scan_all = |db: &Reader, from: &[u8]| -> (usize, Seen) {
         let mut got = Vec::new();
         let n = db
-            .scan(from, usize::MAX, |k, v| got.push((k.to_vec(), v.to_vec())))
+            .scan(
+                from,
+                usize::MAX,
+                kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))),
+            )
             .unwrap();
         (n, got)
     };
@@ -14802,7 +15000,7 @@ fn a_seek_counts_its_directory_hint_once_a_scan_and_the_threads_pass_none() {
     assert_eq!(live.dir_prefetches(), 0);
     let mut sink = 0usize;
     for i in 0..5u32 {
-        live.scan(&key(100 + i), 10, |_k, v| sink += v.len())
+        live.scan(&key(100 + i), 10, kv(&mut |_k, v| sink += v.len()))
             .unwrap();
         assert_eq!(
             live.dir_prefetches(),
@@ -14816,7 +15014,8 @@ fn a_seek_counts_its_directory_hint_once_a_scan_and_the_threads_pass_none() {
         "the handle's scans are not the writer's"
     );
     for i in 0..3u32 {
-        db.scan(&key(200 + i), 10, |_k, v| sink += v.len()).unwrap();
+        db.scan(&key(200 + i), 10, kv(&mut |_k, v| sink += v.len()))
+            .unwrap();
         assert_eq!(
             db.dir_prefetches(),
             u64::from(i) + 1,
@@ -14851,7 +15050,7 @@ fn a_seek_counts_its_directory_hint_once_a_scan_and_the_threads_pass_none() {
     assert!(db.levels().0 > 0, "partitions for the forms to hang on");
     let live = db.reader().unwrap();
     // Reads around, through the handle: the commit lends the burst.
-    live.scan(&key(0), keys as usize, |_k, v| sink += v.len())
+    live.scan(&key(0), keys as usize, kv(&mut |_k, v| sink += v.len()))
         .unwrap();
     // One hint a partition the scan crossed: a seek in each.
     let crossed = db.levels().0 as u64;
@@ -14914,7 +15113,7 @@ fn the_directory_hint_writes_the_segment_and_the_ordered_index_the_default_does(
         db.flush().unwrap();
         // A scan each way, so the hint ran over what it reads.
         let mut n = 0usize;
-        db.scan(b"k1000", 100, |_, _| n += 1).unwrap();
+        db.scan(b"k1000", 100, kv(&mut |_, _| n += 1)).unwrap();
         assert!(n > 0);
         drop(db);
         let mut m = BTreeMap::new();
@@ -15084,9 +15283,11 @@ fn a_handle_claimed_between_two_scans_leaves_the_writers_scan_whole_before_the_f
     type Model = BTreeMap<Vec<u8>, Vec<Vec<u8>>>;
     let scanned = |r: &Reader| -> Model {
         let mut m: Model = BTreeMap::new();
-        r.scan(b"", usize::MAX, |k, v| {
-            m.entry(k.to_vec()).or_default().push(v.to_vec())
-        })
+        r.scan(
+            b"",
+            usize::MAX,
+            kv(&mut |k, v| m.entry(k.to_vec()).or_default().push(v.to_vec())),
+        )
         .unwrap();
         m
     };

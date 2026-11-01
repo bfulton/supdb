@@ -27,6 +27,7 @@ use supdb::{Blob, Bytes, Db, MmapBytes, Options};
 mod common;
 #[cfg(target_os = "linux")]
 use common::zpg_mappings;
+use common::{kv, vf};
 
 fn scratch(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-next-zpages-{name}-{}", std::process::id()));
@@ -251,7 +252,7 @@ fn forced(extra: impl FnOnce(&mut Options)) -> Options {
 
 fn read_vec(r: &Reader, key: &[u8]) -> Vec<Vec<u8>> {
     let mut v = Vec::new();
-    let n = r.read_all(key, |x| v.push(x.to_vec())).unwrap();
+    let n = r.read_all(key, vf(&mut |x| v.push(x.to_vec()))).unwrap();
     assert_eq!(n as usize, v.len(), "the count read_all returns");
     v
 }
@@ -299,9 +300,11 @@ fn check_counts_first(r: &Reader, model: &Model, keys: &[Vec<u8>], what: &str) {
 /// Every key the model holds, scanned, is what the model says.
 fn check_scan(r: &Reader, model: &Model, what: &str) {
     let mut scanned: Model = BTreeMap::new();
-    r.scan(b"", usize::MAX, |k, v| {
-        scanned.entry(k.to_vec()).or_default().push(v.to_vec())
-    })
+    r.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| scanned.entry(k.to_vec()).or_default().push(v.to_vec())),
+    )
     .unwrap();
     let live: Model = model
         .iter()
@@ -1448,9 +1451,11 @@ fn a_scan_of_a_covered_partition_is_served_by_its_form_file_and_counted() {
     for start in (0..keys.len()).step_by(500) {
         let mut got: Model = BTreeMap::new();
         let n = db
-            .scan(&keys[start], 100, |k, v| {
-                got.entry(k.to_vec()).or_default().push(v.to_vec())
-            })
+            .scan(
+                &keys[start],
+                100,
+                kv(&mut |k, v| got.entry(k.to_vec()).or_default().push(v.to_vec())),
+            )
             .unwrap();
         let want: Model = model
             .range(keys[start].clone()..)
@@ -2021,21 +2026,24 @@ fn a_callback_that_reads_again_leaves_the_value_it_was_lent_alone() {
     let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
     let (a, b) = (&keys[100], &keys[4000]);
     let mut calls = 0;
-    db.read_all(a, |outer| {
-        assert_eq!(outer, &model[a][0][..]);
-        // Another page, another read, inside the callback.
-        assert_eq!(read_vec(&db, b), model[b]);
-        assert_eq!(db.count(b).unwrap(), 1);
-        // The value read again byte by byte, volatile: a slice lent for a
-        // call is one the compiler may take to be unchanged under any call
-        // made inside it, and what is asked is whether the call changed it.
-        let again: Vec<u8> = (0..outer.len())
-            // SAFETY: inside the slice the callback was lent.
-            .map(|i| unsafe { std::ptr::read_volatile(outer.as_ptr().add(i)) })
-            .collect();
-        assert_eq!(again, model[a][0], "the outer value was overwritten");
-        calls += 1;
-    })
+    db.read_all(
+        a,
+        vf(&mut |outer| {
+            assert_eq!(outer, &model[a][0][..]);
+            // Another page, another read, inside the callback.
+            assert_eq!(read_vec(&db, b), model[b]);
+            assert_eq!(db.count(b).unwrap(), 1);
+            // The value read again byte by byte, volatile: a slice lent for a
+            // call is one the compiler may take to be unchanged under any call
+            // made inside it, and what is asked is whether the call changed it.
+            let again: Vec<u8> = (0..outer.len())
+                // SAFETY: inside the slice the callback was lent.
+                .map(|i| unsafe { std::ptr::read_volatile(outer.as_ptr().add(i)) })
+                .collect();
+            assert_eq!(again, model[a][0], "the outer value was overwritten");
+            calls += 1;
+        }),
+    )
     .unwrap();
     assert_eq!(calls, 1);
     assert_eq!(db.zpage_counts().reads, 2);
@@ -2111,7 +2119,11 @@ fn window(model: &Model, start: &[u8], limit: usize) -> Window {
 fn scanned(r: &Reader, start: &[u8], limit: usize) -> Window {
     let mut got = Vec::new();
     let n = r
-        .scan(start, limit, |k, v| got.push((k.to_vec(), v.to_vec())))
+        .scan(
+            start,
+            limit,
+            kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))),
+        )
         .unwrap();
     (got, n)
 }
@@ -3009,7 +3021,7 @@ fn the_prefetch_arm_scans_the_same_and_asks_once_a_walk() {
     db.close().unwrap();
     let off = Db::open(&dir, forced(|o| o.partition_bytes = Some(160 << 10))).unwrap();
     assert_eq!(off.zpage_counts().prefetches, 0);
-    off.scan(b"", 500, |_, _| {}).unwrap();
+    off.scan(b"", 500, kv(&mut |_, _| {})).unwrap();
     assert_eq!(off.zpage_counts().prefetches, 0, "off: no walk asks");
     drop(off);
     let _ = std::fs::remove_dir_all(&dir);
@@ -3862,7 +3874,7 @@ fn a_scans_walks_are_served_by_the_form_files_it_crosses_and_raw_where_there_is_
     // (raw walks, served walks) of a scan of five keys from `start`.
     fn delta(db: &Db, start: &[u8]) -> (u64, u64) {
         let before = db.zpage_counts();
-        db.scan(start, 5, |_, _| {}).unwrap();
+        db.scan(start, 5, kv(&mut |_, _| {})).unwrap();
         let c = db.zpage_counts();
         (c.raw_scans - before.raw_scans, c.scans - before.scans)
     }
@@ -7811,12 +7823,12 @@ fn a_scan_only_handle_reaches_the_census() {
     for i in 0..200 {
         let from = &keys[(i * 97) % keys.len()];
         let mut n = 0;
-        r.scan(from, 50, |_, _| n += 1).unwrap();
+        r.scan(from, 50, kv(&mut |_, _| n += 1)).unwrap();
         assert!(n > 0);
         inject.add_faults(3);
     }
     wait_steps(&db, 3);
-    r.scan(b"", 1, |_, _| {}).unwrap();
+    r.scan(b"", 1, kv(&mut |_, _| {})).unwrap();
     wait_steps(&db, 1);
     let c = db.zpage_counts();
     assert_eq!(
@@ -7848,7 +7860,7 @@ fn mixed_windows_are_counted_and_dropped() {
         if i.is_multiple_of(2) {
             r.count(k).unwrap();
         } else {
-            r.scan(k, 10, |_, _| {}).unwrap();
+            r.scan(k, 10, kv(&mut |_, _| {})).unwrap();
         }
         inject.add_faults(1);
     }

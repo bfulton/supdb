@@ -5,6 +5,21 @@
 //! that and nothing else.
 #![allow(dead_code)]
 
+/// A scan's callback as a trait object. `scan` and `read_all` are generic
+/// over the callback, so every closure handed to one compiles its own copy
+/// of the engine's whole read path into the test binary: `tests/db.rs` held
+/// a thousand copies of `read_exts` and as many of `values_at`, and its
+/// compile was nine tenths of the test group's. A `&mut dyn FnMut` is one
+/// type, so every call site that hands one over shares one copy.
+pub fn kv(f: &mut dyn FnMut(&[u8], &[u8])) -> &mut dyn FnMut(&[u8], &[u8]) {
+    f
+}
+
+/// A point read's callback as a trait object, as `kv` is a scan's.
+pub fn vf(f: &mut dyn FnMut(&[u8])) -> &mut dyn FnMut(&[u8]) {
+    f
+}
+
 /// A segment file without the part of it that is a function of when it was
 /// written.
 ///

@@ -15,7 +15,7 @@ use supdb::SegmentWriter;
 use supdb::{Blob, SegmentOptions, SparseBlob};
 
 mod common;
-use common::without_the_clock;
+use common::{kv, vf, without_the_clock};
 
 /// `block::CHECKSUMS` is process-wide -- every writer here
 /// set it from `SegmentOptions::checksums` -- and the test harness runs tests
@@ -154,11 +154,11 @@ fn agree(a: &Blob<MmapBytes>, b: &Blob<MmapBytes>, data: &[(Vec<u8>, Vec<Vec<u8>
     for (rank, (key, vals)) in data.iter().enumerate() {
         let mut ga = Vec::new();
         let na = a
-            .read_all(key, |v| ga.push(v.to_vec()))
+            .read_all(key, vf(&mut |v| ga.push(v.to_vec())))
             .expect("block-layout read_all");
         let mut gb = Vec::new();
         let nb = b
-            .read_all(key, |v| gb.push(v.to_vec()))
+            .read_all(key, vf(&mut |v| gb.push(v.to_vec())))
             .expect("bulk read_all");
         assert_eq!(
             na,
@@ -194,16 +194,24 @@ fn agree(a: &Blob<MmapBytes>, b: &Blob<MmapBytes>, data: &[(Vec<u8>, Vec<Vec<u8>
             .expect("values_at");
         assert_eq!(&by_rank, vals, "values by rank for {key:?}");
     }
-    assert_eq!(a.read_all(b"no such key", |_| {}).unwrap(), 0);
-    assert_eq!(b.read_all(b"no such key", |_| {}).unwrap(), 0);
+    assert_eq!(a.read_all(b"no such key", vf(&mut |_| {})).unwrap(), 0);
+    assert_eq!(b.read_all(b"no such key", vf(&mut |_| {})).unwrap(), 0);
     assert_eq!(b.count(b"no such key").unwrap(), 0);
 
     let mut sa = Vec::new();
-    a.scan(b"", usize::MAX, |k, v| sa.push((k.to_vec(), v.to_vec())))
-        .expect("block-layout scan");
+    a.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| sa.push((k.to_vec(), v.to_vec()))),
+    )
+    .expect("block-layout scan");
     let mut sb = Vec::new();
-    b.scan(b"", usize::MAX, |k, v| sb.push((k.to_vec(), v.to_vec())))
-        .expect("bulk scan");
+    b.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| sb.push((k.to_vec(), v.to_vec()))),
+    )
+    .expect("bulk scan");
     let want: Vec<(Vec<u8>, Vec<u8>)> = data
         .iter()
         .flat_map(|(k, vals)| vals.iter().map(move |v| (k.clone(), v.clone())))
@@ -422,7 +430,7 @@ fn a_record_put_in_one_call_is_the_record_the_three_calls_write() {
         for (k, v) in &data {
             let mut got = Vec::new();
             let n = blob
-                .read_all(k, |x| got.push(x.to_vec()))
+                .read_all(k, vf(&mut |x| got.push(x.to_vec())))
                 .expect("read_all");
             assert_eq!(n, 1, "one value for {}", String::from_utf8_lossy(k));
             assert_eq!(&got[0], v);
@@ -477,7 +485,10 @@ fn the_checksum_recorded_is_the_one_the_reader_checks() {
     write_bulk_with(&path, &data, opts(), 0);
     // Intact first.
     let b = open(&path);
-    assert_eq!(b.read_all(b"\x00first", |_| {}).expect("intact"), 1);
+    assert_eq!(
+        b.read_all(b"\x00first", vf(&mut |_| {})).expect("intact"),
+        1
+    );
     drop(b);
     // The first key is the first record of the first block, which starts
     // right after the header region; flip a byte inside its 50-byte value.
@@ -487,7 +498,7 @@ fn the_checksum_recorded_is_the_one_the_reader_checks() {
     std::fs::write(&path, &bytes).expect("write");
     let b = open(&path);
     let e = b
-        .read_all(b"\x00first", |_| {})
+        .read_all(b"\x00first", vf(&mut |_| {}))
         .expect_err("a corrupted block must not be served");
     assert!(
         e.to_string().contains("checksum"),
@@ -567,13 +578,15 @@ fn a_run_of_one_width_is_stored_without_prefixes_and_reads_the_same() {
     assert!(eo[0].is_fixed());
 
     let mut got = Vec::new();
-    blob.read_all(b"fixed", |v| got.push(v.to_vec())).unwrap();
+    blob.read_all(b"fixed", vf(&mut |v| got.push(v.to_vec())))
+        .unwrap();
     assert_eq!(got.len(), 1000);
     for (i, v) in got.iter().enumerate() {
         assert_eq!(v.as_slice(), (i as u32).to_be_bytes());
     }
     let mut got = Vec::new();
-    blob.read_all(b"mixed", |v| got.push(v.to_vec())).unwrap();
+    blob.read_all(b"mixed", vf(&mut |v| got.push(v.to_vec())))
+        .unwrap();
     assert_eq!(got.len(), 1000);
     assert_eq!(got[999], b"999".to_vec());
     // Counts: exact from the flag, and a wrong width is refused outright.
@@ -587,7 +600,8 @@ fn a_run_of_one_width_is_stored_without_prefixes_and_reads_the_same() {
     assert_eq!(blob.count_fixed(b"one", 4), Some(1));
     // The scan agrees.
     let mut pairs = 0usize;
-    blob.scan(b"", usize::MAX, |_, _| pairs += 1).unwrap();
+    blob.scan(b"", usize::MAX, kv(&mut |_, _| pairs += 1))
+        .unwrap();
     assert_eq!(pairs, 2001);
     // read_concat of a fixed run is the bytes back to back.
     let mut out = Vec::new();
@@ -1288,7 +1302,8 @@ fn write_sorted_matches_on(data: Vec<(Vec<u8>, Vec<Vec<u8>>)>, compact: bool, na
     assert_eq!(blob.keys(), data.len());
     for (k, vals) in data.iter().take(50) {
         let mut got: Vec<Vec<u8>> = Vec::new();
-        blob.read_all(k, |v| got.push(v.to_vec())).expect("read");
+        blob.read_all(k, vf(&mut |v| got.push(v.to_vec())))
+            .expect("read");
         assert_eq!(&got, vals, "values differ for a key");
     }
 }
@@ -1363,7 +1378,8 @@ fn write_sorted_applies_every_per_file_setting() {
     assert_eq!(blob.keys(), data.len());
     for (k, vals) in data.iter().take(40) {
         let mut got: Vec<Vec<u8>> = Vec::new();
-        blob.read_all(k, |v| got.push(v.to_vec())).expect("read");
+        blob.read_all(k, vf(&mut |v| got.push(v.to_vec())))
+            .expect("read");
         assert_eq!(&got, vals, "a compressed key read back differently");
     }
 
@@ -1679,7 +1695,7 @@ fn a_segment_can_be_written_without_holding_its_records() {
     assert_eq!(blob.keys(), n);
     for i in (0..n).step_by(997) {
         let mut got: Vec<Vec<u8>> = Vec::new();
-        blob.read_all(&key_of(i), |v| got.push(v.to_vec()))
+        blob.read_all(&key_of(i), vf(&mut |v| got.push(v.to_vec())))
             .expect("read");
         assert_eq!(got, values_of(i), "key {i} read back differently");
     }
