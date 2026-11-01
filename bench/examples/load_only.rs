@@ -37,6 +37,11 @@ fn main() {
         }
         buf.flush(e.as_mut()).unwrap();
         let loaded = t.elapsed();
+        // The closing sync before anything is reported, so the report's own
+        // time is neither counted as the sync's nor given to the engine's
+        // background work to finish ahead of it.
+        e.sync().unwrap();
+        let all = t.elapsed();
         let mut sorted = batches.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let med = sorted[sorted.len() / 2];
@@ -61,8 +66,6 @@ fn main() {
             slow_sum / 1e3
         );
         println!("  slow batches (index:us): {}", slow_at.join(" "));
-        e.sync().unwrap();
-        let all = t.elapsed();
         println!(
             "{arm} rep {rep}: {:.2} M ops/s over the commits, {:.2} M ops/s with the sync ({:.1} ms + {:.1} ms)",
             size as f64 / loaded.as_secs_f64() / 1e6,

@@ -7,7 +7,11 @@
 //! each value to a callback. A borrow hands the callback's pointer out
 //! across the boundary, as `mdb_get` does; it stays valid until the next
 //! commit, flush or close, which is LMDB's rule with the transaction
-//! replaced by the store's quiescence. A copy fills a caller's buffer.
+//! replaced by the store's quiescence -- and, for a value read out of a
+//! compressed block, only until the next read on the thread, since the
+//! reader lends it from the thread's decompression buffer. A value of the
+//! experiment's shape is stored inline in its index record and lent from
+//! the mapping. A copy fills a caller's buffer.
 //!
 //! Every function takes a handle from `supdb_capi_open`. Errors return a
 //! negative status and leave the message in `supdb_capi_error`.
@@ -136,7 +140,9 @@ pub unsafe extern "C" fn supdb_capi_flush(h: *mut Handle) -> i32 {
 }
 
 /// The first value of `key`, borrowed: `*out` and `*len` describe bytes the
-/// store owns, valid until the next commit, flush or close. Returns 1 when
+/// store owns, valid until the next commit, flush or close, and for a value
+/// read out of a compressed block until the next read on the thread (the
+/// module's docs). Returns 1 when
 /// the key has a value, 0 when it has none, -1 on error.
 ///
 /// # Safety

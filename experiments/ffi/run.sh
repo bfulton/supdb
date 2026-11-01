@@ -5,7 +5,14 @@
 set -e
 cd "$(dirname "$0")"
 ROOT=${1:?root}; KEYS=${2:-300000}; VLEN=${3:-100}; REPS=${4:-5}
-(cd capi && cargo build --release 2>&1 | grep -E "^(warning|error)|Finished")
+# Cargo's own status decides, not the filter's: a failed build that left a
+# library behind would otherwise link and measure stale engine code.
+LOG=$(mktemp)
+if ! (cd capi && cargo build --release) > "$LOG" 2>&1; then
+  cat "$LOG"; rm -f "$LOG"; exit 1
+fi
+grep -E "^(warning|error)|Finished" "$LOG"
+rm -f "$LOG"
 LIB=$PWD/capi/target/release
 cc -O2 -Wall -o harness harness.c -L"$LIB" -lsupdb_capi -llmdb -lrocksdb -Wl,-rpath,"$LIB"
 PY=${PYTHON:-python3}

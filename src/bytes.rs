@@ -201,17 +201,19 @@ impl MmapBytes {
         Ok(MmapBytes(unsafe { memmap2::Mmap::map(&file)? }))
     }
 
-    /// How many of the system pages under `len` bytes at `off` the kernel
-    /// holds in memory now, by `mincore`: what a warm of the file can skip.
-    /// `off` is rounded down to a page and the range clamped to the
-    /// mapping; zero where the kernel will not say.
+    /// How many of the system pages that `len` bytes at `off` lie in the
+    /// kernel holds in memory now, by `mincore`: what a warm of the file can
+    /// skip. The range is clamped to the mapping, and every page a byte of
+    /// it lies in counts, the first one from its start; zero for a range
+    /// that is empty or past the mapping, and where the kernel will not say.
     pub fn resident_pages(&self, off: usize, len: usize) -> usize {
         let page = os_page_size();
-        let start = off.min(self.0.len()) / page * page;
-        let span = len.min(self.0.len() - start);
-        if span == 0 {
+        let end = off.saturating_add(len).min(self.0.len());
+        if end <= off {
             return 0;
         }
+        let start = off / page * page;
+        let span = end - start;
         let mut vec = vec![0u8; span.div_ceil(page)];
         // SAFETY: the range lies inside this mapping, which lives for the
         // call, and `vec` has a byte for every page of it.
@@ -300,6 +302,39 @@ impl Bytes for MmapBytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every page a byte of the range lies in counts, from the first one's
+    /// start, and nothing past the mapping does: a file of three pages and a
+    /// hundred bytes, all of it just written and so in the page cache.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn resident_pages_counts_every_page_a_range_touches_and_none_past_the_end() {
+        let page = os_page_size();
+        let len = 3 * page + 100;
+        let path =
+            std::env::temp_dir().join(format!("supdb-next-resident-pages-{}", std::process::id()));
+        std::fs::write(&path, vec![7u8; len]).unwrap();
+        let m = MmapBytes::open(&path).unwrap();
+        let sum: u64 = (0..len).step_by(page).map(|o| u64::from(m.0[o])).sum();
+        assert_eq!(sum, 4 * 7, "every page touched");
+        assert_eq!(m.resident_pages(0, len), 4);
+        assert_eq!(
+            m.resident_pages(page - 1, 2),
+            2,
+            "two bytes across a page boundary"
+        );
+        assert_eq!(m.resident_pages(page, page), 1, "one page exactly");
+        assert_eq!(
+            m.resident_pages(len - 1, 100),
+            1,
+            "clamped to the last page"
+        );
+        assert_eq!(m.resident_pages(len, 5), 0, "past the mapping");
+        assert_eq!(m.resident_pages(len + page, 5), 0, "well past the mapping");
+        assert_eq!(m.resident_pages(5, 0), 0, "an empty range");
+        drop(m);
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn slice_source_lends_and_refuses_past_the_end() {

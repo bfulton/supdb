@@ -10,8 +10,9 @@ lead measured natively could be narrower through a binding. Two halves:
   `supdb` arm opened and read through the writer's own handle. A read is
   `Reader::read_all`, which lends each value to a callback. `get_borrow`
   hands that pointer out -- valid until the next commit, flush or close,
-  LMDB's rule with the transaction replaced by the store's quiescence --
-  and `get_copy` fills the caller's buffer. `bench_native` runs the
+  LMDB's rule with the transaction replaced by the store's quiescence, and
+  for a value read out of a compressed block until the next read on the
+  thread -- and `get_copy` fills the caller's buffer. `bench_native` runs the
   suite's read pass inside the library, so the same loop is measured with
   no boundary crossed per read.
 - `harness.c` opens a supdb store through that ABI, an LMDB store through

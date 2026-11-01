@@ -3,7 +3,11 @@
  * a type holding the handle and single-argument methods (METH_O), so a
  * call parses no tuple. `get` returns bytes, one copy, as py-lmdb's default
  * does; `view` returns a memoryview over the store's own bytes, no copy,
- * as py-lmdb's buffers=True does. Built by run.sh. */
+ * as py-lmdb's buffers=True does, and with the same care asked of its
+ * caller: the view holds no reference to the store and is valid only while
+ * the borrow it wraps is (`supdb_capi_get_borrow`) -- the store open, and,
+ * for a value read out of a compressed block, until the next read on the
+ * thread. Built by run.sh. */
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #include "capi/supdb_capi.h"
@@ -17,6 +21,7 @@ static void store_dealloc(Store *self) {
 
 static int store_init(Store *self, PyObject *args, PyObject *kw) {
     const char *dir;
+    if (self->h) { PyErr_SetString(PyExc_RuntimeError, "the store is open already"); return -1; }
     if (!PyArg_ParseTuple(args, "s", &dir)) return -1;
     self->h = supdb_capi_open(dir, 0);
     if (!self->h) { PyErr_SetString(PyExc_OSError, supdb_capi_error()); return -1; }
