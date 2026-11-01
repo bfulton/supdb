@@ -25,6 +25,9 @@ use supdb::{Db, Options, SegmentOptions};
 
 pub struct Handle {
     db: Db,
+    /// The first value of a key with more than one, copied as it was handed
+    /// over (`supdb_capi_get_borrow`): lent until the next read on the handle.
+    first: Vec<u8>,
 }
 
 thread_local! {
@@ -76,7 +79,10 @@ pub unsafe extern "C" fn supdb_capi_open(dir: *const c_char, create: i32) -> *mu
         Db::open(dir, arm_options())
     };
     match r {
-        Ok(db) => Box::into_raw(Box::new(Handle { db })),
+        Ok(db) => Box::into_raw(Box::new(Handle {
+            db,
+            first: Vec::new(),
+        })),
         Err(e) => fail(e.to_string(), std::ptr::null_mut()),
     }
 }
@@ -142,8 +148,13 @@ pub unsafe extern "C" fn supdb_capi_flush(h: *mut Handle) -> i32 {
 /// The first value of `key`, borrowed: `*out` and `*len` describe bytes the
 /// store owns, valid until the next commit, flush or close, and for a value
 /// read out of a compressed block until the next read on the thread (the
-/// module's docs). Returns 1 when
-/// the key has a value, 0 when it has none, -1 on error.
+/// module's docs). A key with more than one value is read a second time and
+/// its first value copied as it is handed over, into the handle, valid until
+/// the next read on the handle: the read goes on decoding the key's later
+/// values after lending the first, and a later block decoded into the
+/// thread's buffer would overwrite a first value lent from it before this
+/// call returned. Returns 1 when the key has a value, 0 when it has none, -1
+/// on error.
 ///
 /// # Safety
 /// `key` points at `klen` readable bytes; `out` and `len` are writable.
@@ -156,21 +167,36 @@ pub unsafe extern "C" fn supdb_capi_get_borrow(
     len: *mut usize,
 ) -> i32 {
     let key = std::slice::from_raw_parts(key, klen);
+    let Handle { db, first } = &mut *h;
     let mut got: Option<(*const u8, usize)> = None;
-    match (*h).db.read_all(key, |v| {
+    let values = match db.read_all(key, |v| {
         if got.is_none() {
             got = Some((v.as_ptr(), v.len()));
         }
     }) {
-        Ok(_) => match got {
-            Some((p, n)) => {
-                *out = p;
-                *len = n;
-                1
+        Ok(n) => n,
+        Err(e) => return fail(e.to_string(), -1),
+    };
+    if values > 1 {
+        first.clear();
+        let mut taken = false;
+        if let Err(e) = db.read_all(key, |v| {
+            if !taken {
+                first.extend_from_slice(v);
+                taken = true;
             }
-            None => 0,
-        },
-        Err(e) => fail(e.to_string(), -1),
+        }) {
+            return fail(e.to_string(), -1);
+        }
+        got = Some((first.as_ptr(), first.len()));
+    }
+    match got {
+        Some((p, n)) => {
+            *out = p;
+            *len = n;
+            1
+        }
+        None => 0,
     }
 }
 

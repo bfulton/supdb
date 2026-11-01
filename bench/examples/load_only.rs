@@ -19,7 +19,8 @@ fn main() {
         let dir = root.join(format!("r{rep}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut e = engines::open(&arm, &dir, 1).unwrap();
+        let map_gb = supdb_bench::run::lmdb_map_gb(size, payload.value_size());
+        let mut e = engines::open(&arm, &dir, map_gb).unwrap();
         let mut vrng = Rng::new(0xE1);
         let mut buf = Batch::with_capacity(1000, payload.value_size());
         // Each batch's flush timed on its own, for the shape of the
@@ -35,7 +36,13 @@ fn main() {
                 batches.push(tb.elapsed().as_secs_f64() * 1e6);
             }
         }
-        buf.flush(e.as_mut()).unwrap();
+        // The last, partial batch timed as the others are: for a load under a
+        // thousand keys it is the only one.
+        if !buf.is_empty() {
+            let tb = Instant::now();
+            buf.flush(e.as_mut()).unwrap();
+            batches.push(tb.elapsed().as_secs_f64() * 1e6);
+        }
         let loaded = t.elapsed();
         // The closing sync before anything is reported, so the report's own
         // time is neither counted as the sync's nor given to the engine's

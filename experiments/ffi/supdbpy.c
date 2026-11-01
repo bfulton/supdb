@@ -28,6 +28,13 @@ static int store_init(Store *self, PyObject *args, PyObject *kw) {
     return 0;
 }
 
+/* `Store.__new__` makes a store `__init__` never opened: its reads refuse
+ * rather than hand the C ABI a null handle. */
+static inline int is_open(Store *self) {
+    if (!self->h) { PyErr_SetString(PyExc_RuntimeError, "the store is not open"); return 0; }
+    return 1;
+}
+
 static inline int key_of(PyObject *key, const uint8_t **p, size_t *n) {
     if (!PyBytes_Check(key)) { PyErr_SetString(PyExc_TypeError, "key must be bytes"); return -1; }
     *p = (const uint8_t *)PyBytes_AS_STRING(key);
@@ -37,6 +44,7 @@ static inline int key_of(PyObject *key, const uint8_t **p, size_t *n) {
 
 static PyObject *store_get(Store *self, PyObject *key) {
     const uint8_t *k; size_t klen;
+    if (!is_open(self)) return NULL;
     if (key_of(key, &k, &klen)) return NULL;
     const uint8_t *p; size_t n;
     int rc = supdb_capi_get_borrow(self->h, k, klen, &p, &n);
@@ -47,6 +55,7 @@ static PyObject *store_get(Store *self, PyObject *key) {
 
 static PyObject *store_view(Store *self, PyObject *key) {
     const uint8_t *k; size_t klen;
+    if (!is_open(self)) return NULL;
     if (key_of(key, &k, &klen)) return NULL;
     const uint8_t *p; size_t n;
     int rc = supdb_capi_get_borrow(self->h, k, klen, &p, &n);
@@ -59,6 +68,7 @@ static PyObject *store_view(Store *self, PyObject *key) {
  * which is the floor a binding can reach. */
 static PyObject *store_len_of(Store *self, PyObject *key) {
     const uint8_t *k; size_t klen;
+    if (!is_open(self)) return NULL;
     if (key_of(key, &k, &klen)) return NULL;
     const uint8_t *p; size_t n;
     int rc = supdb_capi_get_borrow(self->h, k, klen, &p, &n);

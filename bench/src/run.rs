@@ -3315,7 +3315,7 @@ fn mem_floor() -> f64 {
 
 /// LMDB needs its map sized up front. Three times the raw payload, at least
 /// 8 GB: sparse until used, so generosity costs nothing.
-fn lmdb_map_gb(size: u64, value_size: usize) -> usize {
+pub fn lmdb_map_gb(size: u64, value_size: usize) -> usize {
     let raw = size as f64 * (KEY_SIZE + value_size) as f64;
     ((raw * 3.0 / 1073741824.0).ceil() as usize).max(8)
 }

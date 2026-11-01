@@ -21,8 +21,16 @@ fn main() {
     // and the row named a commit whose code it was not built from with the
     // `-dirty` below never firing -- which is how an A/B of two engine
     // revisions wrote two rows bearing one SHA. The stamp describes the
-    // sources, so the sources are what it watches.
-    for p in ["../src", "src", "../Cargo.toml", "Cargo.toml"] {
+    // sources, so the sources are what it watches -- and the lockfiles, since
+    // a dependency moved by `cargo update` alone rebuilds what is measured.
+    for p in [
+        "../src",
+        "src",
+        "../Cargo.toml",
+        "Cargo.toml",
+        "../Cargo.lock",
+        "Cargo.lock",
+    ] {
         if std::path::Path::new(p).exists() {
             println!("cargo:rerun-if-changed={p}");
         }

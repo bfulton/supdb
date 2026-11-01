@@ -38,7 +38,8 @@ fn main() {
             ));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
-            let mut e = engines::open(arm, &dir, 1).unwrap();
+            let map_gb = supdb_bench::run::lmdb_map_gb(size, payload.value_size());
+            let mut e = engines::open(arm, &dir, map_gb).unwrap();
             let perm = Permutation::new(size, 0x5EED);
             let mut vrng = Rng::new(0xE1);
             let mut buf = Batch::with_capacity(1000, payload.value_size());
