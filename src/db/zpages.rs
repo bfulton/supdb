@@ -1739,10 +1739,12 @@ pub struct FillScratch {
     /// state.
     pub hint: usize,
     /// The coding tried first for a group that compresses:
-    /// [`ZCODING_BLOCK`], the shape this module's figures were taken on,
-    /// until a caller says [`ZCODING_RECORD`] (`Options::zpages_record_coding`,
-    /// the engine's default), under which a record alone that only the
-    /// block holds is the block's (`compress`).
+    /// [`ZCODING_BLOCK`], the options' coding and the shape this module's
+    /// figures were taken on, unless a caller says [`ZCODING_RECORD`] (the
+    /// arm `Options::zpages_record_coding`, or the selector's pick of the
+    /// raw-tail form under `ZPages::Auto`, `zselect::choose_coding`), under
+    /// which a record alone that only the block holds is the block's
+    /// (`compress`).
     pub coding: u8,
     /// Every group stored verbatim, LZ4 never tried (`Options::zpages_store_all`):
     /// a decode is the payload itself, and the form is the records' bytes.

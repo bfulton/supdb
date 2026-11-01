@@ -33,9 +33,15 @@ The suite has to be fair before any of its numbers are quoted.
 - [ ] **Rows past memory.** The `full` ladder to at least 1.5x the machine's
   memory, as `bench/DESIGN.md` specifies; nothing is banked past 3M keys.
   In progress. The supdb README already says reads "fall off a cliff" there.
-- [ ] **State the checksum asymmetry in the methods.** RocksDB reads with
-  `verify_checksums(false)` (its cached blocks were checked when loaded);
-  supdb verifies every piece once per reader. Roughly matched; say so.
+- [ ] **Match the checksum work, or state it.** RocksDB reads with
+  `verify_checksums(false)`, under which it verifies no data block it
+  reads, from the file or into its cache. supdb verifies a segment's key
+  section against its checksum row when it opens the segment, and a value
+  block once per reader. In the suite's shape neither checks a data block
+  on the read path: every supdb value is inline, and the `quick` row's
+  RocksDB reads a memtable (`bench/DESIGN.md`, Arms). Either RocksDB reads
+  with its default, `verify_checksums(true)`, or the methods say what each
+  engine verifies.
 - [ ] **Check the 2026-10-17 run's other flags.** The buffered 1% burst at
   1M keys (185K updates/s, below supdb's own durable rate); buffered
   "device bytes written" equalling bytes on disk exactly, which may not be

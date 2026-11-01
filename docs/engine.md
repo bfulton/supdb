@@ -342,7 +342,7 @@ side goes to it; point reads **7.62x** and ordered scan **5.95x** stay
 with the engine by margins the LMDB pair never showed; shuffled durable
 load **1.18x**, the number the 6x over LMDB on shuffled arrival needed
 beside it. The prediction was a tie on the load and 2-3x on reads, wrong
-both ways. RocksDB's 8 MB block cache and absent filter are its shipped
+both ways. RocksDB's 32 MB block cache and absent filter are its shipped
 defaults; tuned as deployed (a 256 MB block cache, a Bloom filter, four
 background threads) its read moved 1.19x and its scan 1.09x at 1M keys,
 so the pair reads **6.45x** and scans **4.70x** either way; the load stays

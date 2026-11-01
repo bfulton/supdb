@@ -4047,9 +4047,11 @@ pub(super) struct BuildPlan {
     /// (`Options::zpages_group_bytes`, `FillScratch::group_bytes`); zero is
     /// one group a page.
     pub group_bytes: usize,
-    /// The coding of the groups that compress (`Options::zpages_record_coding`,
-    /// `FillScratch::coding`): `ZCODING_RECORD` as the engine ships,
-    /// `ZCODING_BLOCK` the shape before.
+    /// The coding of the groups that compress (`FillScratch::coding`):
+    /// `ZCODING_BLOCK` as the options give it (`Options::z_coding`), and
+    /// `ZCODING_RECORD` under the arm `Options::zpages_record_coding` or
+    /// where the selector picks the raw-tail form under `ZPages::Auto`
+    /// (`zselect::choose_coding`).
     pub coding: u8,
     /// Every group stored verbatim, LZ4 never tried
     /// (`Options::zpages_store_all`, `FillScratch::store_all`).

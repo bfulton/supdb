@@ -219,10 +219,24 @@ buffers, four background jobs), and LMDB as it opens, which in memory is
 how its documentation configures it (past memory the bounded roster's
 LMDB has its readahead off, below). The buffered group ran
 RocksDB as it ships (`rocksdb-nosync`: its 32 MB default block cache and
-no Bloom filter) beside the tuned durable arm until the rows of November 2026, so
-every buffered cell against RocksDB in the rows before is against a
-configuration no deployment would choose; that series stops there and the
-tuned one starts.
+no Bloom filter) beside the tuned durable arm until the rows banked at
+`19bf68a` on 31 October 2026, so every buffered cell against RocksDB in the
+rows before is against a configuration no deployment would choose; that
+series stops there and the tuned one starts.
+
+What the suite's shape reaches in each engine. Every key holds one
+100-byte value, appended at the load and replaced by a `put` after it, so
+every supdb value lies inline in its index record (`Options::inline_bytes`
+is 256): no pass writes or reads a value block, and the block format's
+numbers are the tests' and the probes', never a row's. The tuned RocksDB
+arms flush a memtable only once two of their 128 MB write buffers have
+filled, and their `sync` fsyncs the WAL and flushes nothing. So every
+RocksDB cell of the `quick` scale reads a memtable: its top rung loads
+35 MB into a store and its lag sweep rewrites that store about once more.
+At the `full` scale's top rung the ordered load leaves one SST beside
+about 140 MB of memtable (`bench/examples/store_size.rs` lists a store's
+files). The arms' compaction trigger is eight level-0 files, and no
+banked row is known to have compacted them.
 
 Every shipping option is an arm because a user can choose it and deserves the
 number. `supdb-forms` is where the range-read structure is kept at every
