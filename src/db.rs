@@ -28739,7 +28739,7 @@ fn idle_cpu_priority() {
 /// gap between a pass's wall time and its time running: zero where the
 /// clock is not had.
 fn thread_cpu_ns() -> u64 {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let mut ts = libc::timespec {
             tv_sec: 0,

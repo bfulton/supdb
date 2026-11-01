@@ -190,6 +190,16 @@ impl Bytes for VecBytes {
 #[cfg(not(target_family = "wasm"))]
 pub struct MmapBytes(pub memmap2::Mmap);
 
+/// The most of a mapping one `MADV_WILLNEED` asks for. Linux reads a
+/// will-need range ahead only up to the larger of the device's largest
+/// request and the file's readahead window, and drops the rest of the
+/// range without a word (`force_page_cache_ra`): one ask over 104 evicted
+/// pages brought in all of them where the device takes 4 MiB a request and
+/// 64 where it takes 256 KiB, the ARM runner's. The window is 128 KiB unless
+/// it was lowered, so an ask cut into pieces of that is read whole.
+#[cfg(not(target_family = "wasm"))]
+pub const WILLNEED_PIECE: usize = 128 << 10;
+
 #[cfg(not(target_family = "wasm"))]
 impl MmapBytes {
     pub fn open(path: &std::path::Path) -> Result<MmapBytes> {
@@ -287,15 +297,21 @@ impl Bytes for MmapBytes {
         };
         let start = start.min(self.0.len());
         let span = len.min(self.0.len() - start);
-        if span > 0
-            && self
+        // In pieces, each read whole (`WILLNEED_PIECE`); what is reported
+        // is what was submitted, up to the first piece the kernel refused.
+        let mut done = 0;
+        while done < span {
+            let n = WILLNEED_PIECE.min(span - done);
+            if self
                 .0
-                .advise_range(memmap2::Advice::WillNeed, start, span)
-                .is_ok()
-        {
-            return span;
+                .advise_range(memmap2::Advice::WillNeed, start + done, n)
+                .is_err()
+            {
+                break;
+            }
+            done += n;
         }
-        0
+        done
     }
 }
 

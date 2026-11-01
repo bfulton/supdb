@@ -4012,17 +4012,21 @@ fn drop_behind(_base: usize, _file: &File, _from: usize, _to: usize) {}
 /// (`MADV_WILLNEED`): the reads are issued at once and the walk's faults
 /// then find the pages in flight or resident, so one wait of the walk's
 /// fetches the window and not the device's readahead. The start is taken
-/// down to its page; the call is advice and its failure is nobody's.
+/// down to its page, and the window is asked in pieces the kernel reads
+/// whole (`crate::bytes::WILLNEED_PIECE`): asked at once, a window past the
+/// device's largest request was read only up to it. The call is advice and
+/// its failure is nobody's.
 #[cfg(target_os = "linux")]
 fn ask_ahead(base: usize, from: usize, to: usize) {
-    let a = from & !(ZPAGE - 1);
-    if a >= to {
-        return;
-    }
-    // SAFETY: a read-only shared mapping of a file, advised over a range
-    // inside it; the kernel reads pages in and changes nothing else.
-    unsafe {
-        libc::madvise((base + a) as *mut libc::c_void, to - a, libc::MADV_WILLNEED);
+    let mut a = from & !(ZPAGE - 1);
+    while a < to {
+        let n = crate::bytes::WILLNEED_PIECE.min(to - a);
+        // SAFETY: a read-only shared mapping of a file, advised over a range
+        // inside it; the kernel reads pages in and changes nothing else.
+        unsafe {
+            libc::madvise((base + a) as *mut libc::c_void, n, libc::MADV_WILLNEED);
+        }
+        a += n;
     }
 }
 
