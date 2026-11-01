@@ -8483,6 +8483,41 @@ fn a_kept_form_file_makes_every_later_recode_an_exchange() {
 }
 
 #[test]
+fn a_spare_started_as_a_settle_ends_is_not_the_settles_to_sweep() {
+    // A settle of the form ends with a sweep of the form files and temp
+    // names no live segment claims, and under `Options::zpages_both` the
+    // segment work starts its first spare the moment the settle has its
+    // answer. Swept by the settle's caller after the answer, the sweep met
+    // that spare in flight on a runner slow enough to start it first,
+    // removed its temp name, and the spare's rename failed: a partition
+    // counted `spare_failed` and never given its spare, which the test
+    // below waited a minute for. The seam stands the spare there every
+    // time: the builds after the answer held before their renames, and the
+    // settle returning only once one is parked.
+    let (_dir, db, _model, _inject) = recode_store_with("sparesweep", 1 << 40, |o| {
+        o.zpages_recode_keep = true;
+        o.zpages_both = true;
+        o.zpages_hold_after_settle = true;
+    });
+    assert!(
+        db.zpage_build_waiting(),
+        "a spare parked at its rename as the settle ended: {:?}",
+        db.zpage_counts()
+    );
+    db.hold_zpage_after_settle(false);
+    db.hold_zpage_rename(false);
+    let n = db.zpage_counts().form_files;
+    assert!(n >= 4, "partitions to give spares: {n}");
+    assert!(
+        recode_until(&db, |c| c.spare_files == n),
+        "a spare for every partition: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert_eq!((c.spare_builds, c.spare_failed), (n, 0), "{c:?}");
+}
+
+#[test]
 fn both_codings_are_built_at_write_time_and_the_policy_only_exchanges_them() {
     // Under `Options::zpages_both` every served partition gets its form file
     // in the other coding too, built once the served ones are in and kept

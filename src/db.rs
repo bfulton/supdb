@@ -912,6 +912,12 @@ pub struct Options {
     pub zpages_hold_build: bool,
     #[doc(hidden)]
     pub zpages_hold_rename: bool,
+    /// A test's: a settle of the form, once its segment work has answered,
+    /// holds the builds after it before their renames and returns only
+    /// once the next has parked there (`Db::hold_zpage_after_settle`), so a
+    /// test can stand a build in flight at the instant a settle ends.
+    #[doc(hidden)]
+    pub zpages_hold_after_settle: bool,
     /// Under `ZPages::Always`, a partition's form file is built as soon as
     /// the partition lands, on the builder's thread at idle priority,
     /// rather than at the next settle of the form, which then waits for
@@ -3159,6 +3165,7 @@ impl Default for Options {
             zpages_retry_ms: 60_000,
             zpages_hold_build: false,
             zpages_hold_rename: false,
+            zpages_hold_after_settle: false,
             zpages_eager: true,
             zpages_warm: true,
             zpages_memo: true,
@@ -12794,6 +12801,8 @@ struct Shared {
     zbuild_hold: std::sync::Arc<std::sync::atomic::AtomicU8>,
     /// A test's: the next form file build fails as a write error would.
     fail_zbuild: std::sync::atomic::AtomicBool,
+    /// A test's: `Options::zpages_hold_after_settle`, as it stands.
+    zsettle_hold: std::sync::atomic::AtomicBool,
     /// Direct runs whose mapping was grown past the file's end
     /// (`Options::direct_table_refs`); see `Db::run_remaps`.
     run_remaps: AtomicU64,
@@ -24011,6 +24020,7 @@ impl Db {
             next_dead: AtomicU64::new(1),
             zbuild_hold: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(zhold_of(&opts))),
             fail_zbuild: std::sync::atomic::AtomicBool::new(false),
+            zsettle_hold: std::sync::atomic::AtomicBool::new(opts.zpages_hold_after_settle),
             zgate: ZGate::new(opts.zpages),
             run_remaps: AtomicU64::new(0),
             stream_recycled: AtomicU64::new(0),
@@ -24509,6 +24519,7 @@ impl Db {
             next_dead: AtomicU64::new(1),
             zbuild_hold: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(zhold_of(&opts))),
             fail_zbuild: std::sync::atomic::AtomicBool::new(false),
+            zsettle_hold: std::sync::atomic::AtomicBool::new(opts.zpages_hold_after_settle),
             zgate: ZGate::new(opts.zpages),
             run_remaps: AtomicU64::new(0),
             stream_recycled: AtomicU64::new(0),
@@ -27628,6 +27639,12 @@ impl Db {
 /// for.
 const ZSETTLE_ROUNDS: usize = 4;
 
+/// How long a settle under `Options::zpages_hold_after_settle` waits for
+/// the build after it to park at its rename: a test's bound, so that a
+/// seam that never sees its build fails the test's assertion and does not
+/// hang it.
+const ZSETTLE_HOLD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Where in a round of `Db::zpages_settle_with` its seam is called.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27851,22 +27868,12 @@ impl Db {
         z_retire_cell(&self.shared, &self.dir, seg).is_some()
     }
 
-    /// The form files no live segment claims removed, as `z_sweep`,
-    /// over the live segments as they stand.
-    fn z_sweep_live(&self) -> Result<()> {
-        let names: Vec<String> = {
-            let _op = self.op();
-            self.segs().iter().map(|s| s.name.clone()).collect()
-        };
-        let swept = Db::z_sweep(&self.dir, names.iter().map(String::as_str))?;
-        zfile::ZEvents::add(&self.shared.z.swept, swept);
-        Ok(())
-    }
-
     /// The form files in `dir` that none of the segments named `live`
     /// claims, the dead names of retired ones, and the temp names of builds
     /// that did not finish, removed; how many. Called where nothing is
-    /// building: at open, and at the end of `zpages_settle`.
+    /// building: at open, and by the segment work at the end of
+    /// `zpages_settle` (`Maint::z_sweep_settled`), the one side that starts
+    /// builds.
     fn z_sweep<'a>(dir: &Path, live: impl Iterator<Item = &'a str>) -> Result<u64> {
         let claimed: std::collections::HashSet<String> =
             live.filter_map(zfile::zpg_name_for).collect();
@@ -27918,6 +27925,12 @@ impl Db {
         if matches!(self.maint, MaintHome::Away(_)) {
             self.settle()?;
             self.maint_request(MaintAsk::ZSettle)?;
+            if self.shared.zsettle_hold.load(AtomicOrdering::Acquire) {
+                let t = std::time::Instant::now();
+                while !self.zpage_build_waiting() && t.elapsed() < ZSETTLE_HOLD_WAIT {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
             return self.z_settle_end();
         }
         for _ in 0..ZSETTLE_ROUNDS {
@@ -28021,12 +28034,16 @@ impl Db {
     }
 
     /// The end of `zpages_settle`, whichever home the segment work has: the
-    /// form files no live segment claims swept, and under
+    /// form files no live segment claims swept, by the segment work
+    /// (`Maint::z_sweep_settled`) -- on its own thread the `ZSettle`
+    /// answer has swept already, inline it is swept here -- and under
     /// `Options::zpages_trim_install` the allocator trimmed once, now that
     /// every partition has its form file and the builds' threads have left
     /// what they freed in their arenas.
-    fn z_settle_end(&self) -> Result<()> {
-        self.z_sweep_live()?;
+    fn z_settle_end(&mut self) -> Result<()> {
+        if matches!(self.maint, MaintHome::Here(_)) {
+            self.with_maint(|m| m.z_sweep_settled())?;
+        }
         if self.opts.zpages_trim_install {
             heap::trim();
             // Counted with the trim thread's trims, and the floor its
@@ -28068,6 +28085,13 @@ impl Db {
     #[doc(hidden)]
     pub fn hold_zpage_rename(&self, on: bool) {
         Db::set_zhold(&self.shared.zbuild_hold, ZHOLD_RENAME, on);
+    }
+
+    /// A test's: `Options::zpages_hold_after_settle` set or cleared. The
+    /// rename hold it arms stays until `hold_zpage_rename(false)`.
+    #[doc(hidden)]
+    pub fn hold_zpage_after_settle(&self, on: bool) {
+        self.shared.zsettle_hold.store(on, AtomicOrdering::Release);
     }
 
     /// Whether the builder's thread is parked at one of the holds. A test
@@ -32946,7 +32970,20 @@ impl Maint {
                     }
                     std::thread::park_timeout(MAINT_POLL);
                 }
+                // Swept here, where nothing is building and nothing starts
+                // before the answer, and not by the caller after it, which
+                // met the spare this thread started next in flight
+                // (`Maint::z_sweep_settled`).
+                let swept = if self.shared.maint_stop.load(AtomicOrdering::Acquire) {
+                    Ok(())
+                } else {
+                    self.z_sweep_settled()
+                };
+                if self.shared.zsettle_hold.load(AtomicOrdering::Acquire) {
+                    Db::set_zhold(&self.shared.zbuild_hold, ZHOLD_RENAME, true);
+                }
                 self.z_settling = false;
+                swept?;
                 self.sync_owed_slot()
             }
         }
@@ -34589,6 +34626,31 @@ impl Maint {
                 }
             }
         }
+    }
+
+    /// The form files no live segment claims swept (`Db::z_sweep`) at the
+    /// end of a settle of the form, by the side that starts the builds: a
+    /// build in flight is finished and collected first, and none starts
+    /// before this returns, so no temp name it removes is a build's in
+    /// flight. Swept by the settle's caller once the segment work had
+    /// answered, it met the spare that work started next
+    /// (`Options::zpages_both`) with its temp name written, removed the
+    /// name, and the spare's rename failed: a partition counted
+    /// `spare_failed` and never given its spare, on a runner slow enough to
+    /// start the spare first.
+    fn z_sweep_settled(&mut self) -> Result<()> {
+        if let Some(b) = self.zbuild.take() {
+            let op = self.op();
+            self.z_collect(b);
+            drop(op);
+        }
+        let names: Vec<String> = {
+            let _op = self.op();
+            self.segs().iter().map(|s| s.name.clone()).collect()
+        };
+        let swept = Db::z_sweep(&self.dir, names.iter().map(String::as_str))?;
+        zfile::ZEvents::add(&self.shared.z.swept, swept);
+        Ok(())
     }
 
     /// The served partition to build a spare for next (`Options::zpages_both`):
