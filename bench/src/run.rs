@@ -3577,7 +3577,12 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             let mut e = engines::open(arm, &dir, 1).unwrap();
             load(e.as_mut(), size, &plan, &payload, |i| i).unwrap();
-            let got = threaded(e.as_ref(), "read", 2, size, size, 1, Op::Get, true).unwrap();
+            // The threads' own counters are Linux's `/proc` files, read by
+            // the runner only for a bounded pass, whose bound is a
+            // cgroup's; elsewhere the pass counts nothing, as the runner's
+            // passes there do.
+            let count = cfg!(target_os = "linux");
+            let got = threaded(e.as_ref(), "read", 2, size, size, 1, Op::Get, count).unwrap();
             assert_eq!(
                 got.bytes,
                 size * plan.value_size as u64,
@@ -4145,6 +4150,9 @@ mod tests {
         assert_eq!(stat_majflt(stat), Some(42));
         assert_eq!(stat_minflt(stat), 8);
         assert_eq!(stat_majflt("garbage"), None);
+        // The file is Linux's, and the runner reads it only for a bounded
+        // pass, whose bound is a cgroup's.
+        #[cfg(target_os = "linux")]
         assert!(majflt_self().is_some_and(|n| n < u64::MAX));
     }
 
