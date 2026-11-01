@@ -1866,9 +1866,10 @@ impl<B: Bytes> Blob<B> {
             let words = dir
                 .get(rank * 4..(rank + want) * 4)
                 .unwrap_or(&[])
-                .chunks_exact(4);
+                .as_chunks::<4>()
+                .0;
             for w in words {
-                let off = u32::from_le_bytes([w[0], w[1], w[2], w[3]]) as usize;
+                let off = u32::from_le_bytes(*w) as usize;
                 let Some(h) = recs.get(off..off + 4) else {
                     break;
                 };

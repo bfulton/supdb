@@ -2714,7 +2714,11 @@ fn threaded(
         // pass is its wake from the barrier, the join and the second
         // reading's walk of /proc, which says nothing of the pass.
         // SAFETY: a plain syscall with no arguments.
+        #[cfg(target_os = "linux")]
         let me = unsafe { libc::gettid() } as u32;
+        // Off Linux there is no /proc/self/task, and both readings are empty.
+        #[cfg(not(target_os = "linux"))]
+        let me = 0u32;
         for (tid, comm, run1, wait1, slices1) in &sched_after {
             if *tid == me {
                 continue;

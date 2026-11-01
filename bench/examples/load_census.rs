@@ -41,14 +41,21 @@ fn line(e: &dyn Engine, at: u64, t: &Instant) {
         .map(|(k, b)| format!("{k} {}", b >> 20))
         .collect();
     parts.sort();
-    // SAFETY: mallinfo2 reads the allocator's own totals.
-    let mi = unsafe { libc::mallinfo2() };
+    // The allocator's own totals, glibc's; elsewhere there are none.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    let (inuse, mmap) = {
+        // SAFETY: mallinfo2 reads the allocator's own totals.
+        let mi = unsafe { libc::mallinfo2() };
+        (mi.uordblks + mi.hblkhd, mi.hblkhd)
+    };
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    let (inuse, mmap) = (0usize, 0usize);
     println!(
         "at {at} s {:.1} anon_mb {} inuse_mb {} mmap_mb {} | {}",
         t.elapsed().as_secs_f64(),
         rss_anon() >> 20,
-        (mi.uordblks + mi.hblkhd) >> 20,
-        mi.hblkhd >> 20,
+        inuse >> 20,
+        mmap >> 20,
         parts.join(" ")
     );
 }
@@ -144,6 +151,7 @@ fn main() {
         let _ = std::fs::remove_dir_all(&dir);
         // SAFETY: `malloc_trim` takes no pointer and only returns free
         // memory to the system, as the runner does between passes.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
         unsafe {
             libc::malloc_trim(0);
         }

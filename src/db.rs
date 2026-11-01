@@ -3943,11 +3943,13 @@ impl BlockedBloom {
             return None;
         }
         let blocks = bytes
-            .chunks_exact(64)
+            .as_chunks::<64>()
+            .0
+            .iter()
             .map(|c| {
                 let mut b = [0u64; 8];
-                for (w, x) in b.iter_mut().zip(c.chunks_exact(8)) {
-                    *w = u64::from_le_bytes(x.try_into().expect("eight bytes"));
+                for (w, x) in b.iter_mut().zip(c.as_chunks::<8>().0) {
+                    *w = u64::from_le_bytes(*x);
                 }
                 b
             })

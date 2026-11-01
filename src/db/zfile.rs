@@ -4487,9 +4487,12 @@ fn timed_build(f: impl FnOnce() -> Result<Outcome>) -> Result<Outcome> {
 
 // ---- the controller's platform side ---------------------------------------
 
+use super::zselect::Budget;
+// The readings `read_budget` parses, which exist on Linux alone.
+#[cfg(target_os = "linux")]
 use super::zselect::{
     parse_cgroup_v1_path, parse_cgroup_v2_path, parse_limit, parse_meminfo_total, parse_mount,
-    parse_stat_v1, parse_stat_v2, parse_status_rss_anon, Budget, V1_NO_LIMIT,
+    parse_stat_v1, parse_stat_v2, parse_status_rss_anon, V1_NO_LIMIT,
 };
 use std::time::Duration;
 
@@ -7072,8 +7075,11 @@ mod tests {
     /// The ask ahead of a build's walk asks the kernel, not a note: a
     /// copy of a segment evicted from the page cache, asked for whole
     /// through a mapping of its own, is resident within a moment, and one
-    /// not asked for stays cold.
-    #[cfg(target_os = "linux")]
+    /// not asked for stays cold. Not under qemu-user (`supdb_emulated`),
+    /// which answers `madvise(MADV_WILLNEED)` with success and passes
+    /// nothing to the kernel: a file of 1,024 evicted pages advised so read
+    /// 1,024 resident natively and none emulated. The native ARM leg runs it.
+    #[cfg(all(target_os = "linux", not(supdb_emulated)))]
     #[test]
     fn an_ask_ahead_brings_the_cold_pages_in() {
         let fx = Fixture::new("ahead", suite(3000, 9), 1 << 20);
@@ -7758,7 +7764,10 @@ mod tests {
     /// still wanted over the mean a page and sixteen at most, and they are
     /// resident soon after while the same walk without the prefetch
     /// leaves them cold; a walk of one key and a walk from the last page
-    /// ask for nothing.
+    /// ask for nothing. Not under qemu-user (`supdb_emulated`), which passes
+    /// neither the attach's `MADV_RANDOM` nor the ask's `MADV_WILLNEED` to
+    /// the kernel, as `an_ask_ahead_brings_the_cold_pages_in` says.
+    #[cfg(all(target_os = "linux", not(supdb_emulated)))]
     #[test]
     fn a_scan_asks_for_the_pages_it_will_cross_once_and_they_come_in_behind_it() {
         let fx = Fixture::new("prefetch", suite(6000, 12), 1 << 20);

@@ -58,8 +58,8 @@ const fn build_crc_tables() -> [[u32; 256]; 8] {
 /// Portable slice-by-8. Consumes eight bytes per round rather than one.
 fn crc32c_scalar(init: u32, data: &[u8]) -> u32 {
     let mut c = init;
-    let mut chunks = data.chunks_exact(8);
-    for w in &mut chunks {
+    let (words, rest) = data.as_chunks::<8>();
+    for w in words {
         let lo = u32::from_le_bytes([w[0], w[1], w[2], w[3]]) ^ c;
         let hi = u32::from_le_bytes([w[4], w[5], w[6], w[7]]);
         c = CRC_TABLES[7][(lo & 0xff) as usize]
@@ -71,7 +71,7 @@ fn crc32c_scalar(init: u32, data: &[u8]) -> u32 {
             ^ CRC_TABLES[1][((hi >> 16) & 0xff) as usize]
             ^ CRC_TABLES[0][((hi >> 24) & 0xff) as usize];
     }
-    for b in chunks.remainder() {
+    for b in rest {
         c = CRC_TABLES[0][((c ^ *b as u32) & 0xff) as usize] ^ (c >> 8);
     }
     c ^ 0xFFFF_FFFF
@@ -82,12 +82,12 @@ fn crc32c_scalar(init: u32, data: &[u8]) -> u32 {
 unsafe fn crc32c_hw(init: u32, data: &[u8]) -> u32 {
     use core::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8};
     let mut c = init as u64;
-    let mut chunks = data.chunks_exact(8);
-    for w in &mut chunks {
-        c = _mm_crc32_u64(c, u64::from_le_bytes(w.try_into().unwrap()));
+    let (words, rest) = data.as_chunks::<8>();
+    for w in words {
+        c = _mm_crc32_u64(c, u64::from_le_bytes(*w));
     }
     let mut c = c as u32;
-    for b in chunks.remainder() {
+    for b in rest {
         c = _mm_crc32_u8(c, *b);
     }
     c ^ 0xFFFF_FFFF
@@ -100,11 +100,11 @@ unsafe fn crc32c_hw(init: u32, data: &[u8]) -> u32 {
 unsafe fn crc32c_hw(init: u32, data: &[u8]) -> u32 {
     use core::arch::aarch64::{__crc32cb, __crc32cd};
     let mut c = init;
-    let mut chunks = data.chunks_exact(8);
-    for w in &mut chunks {
-        c = __crc32cd(c, u64::from_le_bytes(w.try_into().unwrap()));
+    let (words, rest) = data.as_chunks::<8>();
+    for w in words {
+        c = __crc32cd(c, u64::from_le_bytes(*w));
     }
-    for b in chunks.remainder() {
+    for b in rest {
         c = __crc32cb(c, *b);
     }
     c ^ 0xFFFF_FFFF

@@ -12,7 +12,7 @@
 //! suite's `Payload`), so a read finds its record by binary search inside a page and nothing here stands for a
 //! variable-length record, a tombstone, a multi-value key or the unsealed overlay: the probe is the physics of
 //! the page cache under a bound, not a model of the engine. Its notes and the results are in `prereg.md`.
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::time::Instant;
@@ -95,11 +95,19 @@ impl Fence {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn drop_cache(path: &str) {
-    if let Ok(f) = OpenOptions::new().read(true).open(path) {
+    if let Ok(f) = std::fs::OpenOptions::new().read(true).open(path) {
         // SAFETY: advice over a descriptor this function owns for the call.
         unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
     }
+}
+
+// The probe measures Linux's page cache under a Linux cgroup, and `main`
+// refuses to run anywhere else; these keep it compiling there.
+#[cfg(not(target_os = "linux"))]
+fn drop_cache(_: &str) {
+    unreachable!("zprobe runs on Linux only")
 }
 
 fn build(dir: &str, n: u64, hash_mb: usize) {
@@ -219,7 +227,7 @@ fn build(dir: &str, n: u64, hash_mb: usize) {
 fn load_fence(dir: &str, name: &str) -> Fence {
     let b = std::fs::read(format!("{dir}/{name}.fence")).expect("read fence");
     let mut f = Fence::default();
-    for e in b.chunks_exact(4 + KEY) {
+    for e in b.as_chunks::<{ 4 + KEY }>().0 {
         f.first_rank
             .push(u32::from_le_bytes(e[..4].try_into().expect("four bytes")));
         let mut k = [0u8; KEY];
@@ -250,6 +258,12 @@ fn map(path: &str) -> (*const u8, usize) {
     (p as *const u8, len)
 }
 
+#[cfg(not(target_os = "linux"))]
+fn majflt() -> u64 {
+    unreachable!("zprobe runs on Linux only")
+}
+
+#[cfg(target_os = "linux")]
 fn majflt() -> u64 {
     // SAFETY: getrusage fills a zeroed struct of the right type.
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
@@ -336,6 +350,10 @@ fn read(dir: &str, n: u64, layout: &str, hash_mb: usize, reads: u64, passes: u32
 }
 
 fn main() {
+    if !cfg!(target_os = "linux") {
+        eprintln!("zprobe measures Linux's page cache under a Linux cgroup; it runs on Linux only");
+        std::process::exit(2);
+    }
     let a: Vec<String> = std::env::args().collect();
     let num = |i: usize| -> u64 {
         a.get(i)

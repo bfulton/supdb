@@ -2648,8 +2648,8 @@ mod tests {
                 assert!(b <= dir.len(), "inside the directory");
                 // The bytes between are the words of the ranks `r..end`,
                 // and each word is what `at_full_in` resolves the rank by.
-                for (i, w) in dir[a..b].chunks_exact(4).enumerate() {
-                    let off = u32::from_le_bytes([w[0], w[1], w[2], w[3]]) as usize;
+                for (i, w) in dir[a..b].as_chunks::<4>().0.iter().enumerate() {
+                    let off = u32::from_le_bytes(*w) as usize;
                     assert_eq!(ix.record_off(dir, r + i), Some(off));
                     let (k, _, _) = ix.at_full_in(recs, dir, r + i).expect("resolves");
                     assert_eq!(k, all[r + i].0.as_slice(), "rank {}", r + i);

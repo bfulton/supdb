@@ -3068,8 +3068,10 @@ impl ZFence {
         };
         let words = |from: usize, n: usize| -> Vec<u32> {
             region[from..from + 4 * n]
-                .chunks_exact(4)
-                .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|w| u32::from_le_bytes(*w))
                 .collect()
         };
         let key_off = words(8 * e, e + 1);

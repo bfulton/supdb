@@ -1759,6 +1759,9 @@ fn the_forms_threads_take_the_io_class_the_option_names_and_the_build_records_it
     }
 }
 
+// The page cache is read through `cached_pages` and the regions of a
+// partition file, Linux's alone, like the asks the build makes.
+#[cfg(target_os = "linux")]
 #[test]
 fn the_build_asks_the_records_ahead_when_told_to_and_counts_what_it_asked() {
     // `Options::zpages_build_ahead` is the window of raw records a build
@@ -1795,6 +1798,7 @@ fn the_build_asks_the_records_ahead_when_told_to_and_counts_what_it_asked() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn the_build_drops_the_raw_records_it_passed_when_asked_to_and_not_otherwise() {
     // The build reads a partition's records once, through a mapping of its
@@ -4930,7 +4934,7 @@ fn a_filter_of_another_layout_cannot_attach_and_never_answers_absent() {
         );
         let (fence, filter) = ZFence::decode_resident(&bytes[t.res_off as usize..at], &t).unwrap();
         let mut words = Vec::with_capacity(filter.len());
-        for block in filter.chunks_exact(64).rev() {
+        for block in filter.as_chunks::<64>().0.iter().rev() {
             words.extend_from_slice(block);
         }
         let (res, rf) = fence.encode_resident(&words).unwrap();
@@ -5819,12 +5823,18 @@ fn the_model_moves_the_rung_between_fits_and_suspect_on_the_injected_budget() {
     let keys: Vec<Vec<u8>> = model.keys().step_by(9).cloned().collect();
     check(&db, &model, &keys, "suspect");
     check_scan(&db, &model, "suspect");
+    // The selector built nothing and no form served. A build ahead at
+    // landing may have run, since the raw form is past the share of this
+    // budget the builds ahead start at (`Options::zpages_land_pct`), and
+    // whether its build is counted by now is the build thread's timing:
+    // it leaves a dormant file and serves nothing, which is what is read.
     let c = db.zpage_counts();
     assert_eq!(
-        (c.reads, c.scans, c.builds, c.form_files),
+        (c.reads, c.scans, c.sel_builds, c.form_files),
         (0, 0, 0, 0),
         "raw throughout: {c:?}"
     );
+    assert_eq!(c.builds, c.prebuilt, "every build a build ahead: {c:?}");
     // The budget lifted: five calm ticks relax the rung.
     inject.set_budget(1 << 40);
     tick(&db, 5);
@@ -8065,7 +8075,8 @@ fn resident_under(dir: &Path, prefix: &str) -> (u64, u64) {
             libc::mincore(
                 map.as_ptr() as *mut libc::c_void,
                 map.len(),
-                vec.as_mut_ptr(),
+                // `unsigned char` on Linux, `char` on macOS.
+                vec.as_mut_ptr().cast(),
             )
         };
         assert_eq!(rc, 0, "mincore");

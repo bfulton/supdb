@@ -26,6 +26,13 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std", "fra
 memmap2 = "0.9"
 libc = "0.2"
 
+# `supdb_emulated` is set by the CI job that runs the unit tests under
+# qemu-user (`.github/workflows/ci.yml`, cross-arm), which takes `madvise`
+# advice as a no-op: the tests that read the kernel's answer to that advice
+# are compiled out there and run on the native legs.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(supdb_emulated)'] }
+
 [profile.release]
 opt-level = 3
 lto = true
