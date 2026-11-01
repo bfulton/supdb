@@ -1014,7 +1014,7 @@ pub struct Options {
     /// `bench/scripts/pair.sh supdb-cache64tofitautozpages
     /// supdb-cache64tofitautozpagesmemo4 5000000 --reps 5 --bound 671088640
     /// --passes read,read-threaded,scan,scan-threaded,mixes --ops-div 10` and
-    /// the same with the others, at `feb44f5`.
+    /// the same with the others, at `89e309d`.
     #[doc(hidden)]
     pub zpages_memo_bytes: usize,
     /// EXPERIMENT: a verified page's group asked of the handle's memo before
@@ -1396,7 +1396,7 @@ pub struct Options {
     /// the compact form has left to win (`bench/scripts/pair.sh
     /// supdb-cache64tofitautozpages supdb-cache64tofitautozpagesrecord 5000000
     /// --reps 5 --bound 671088640 --passes
-    /// read,read-threaded,scan,scan-threaded,mixes --ops-div 10` at `5059187`).
+    /// read,read-threaded,scan,scan-threaded,mixes --ops-div 10` at `589e7df`).
     #[doc(hidden)]
     pub zpages_record_coding: bool,
     /// EXPERIMENT: the form file's groups stored verbatim, every one, LZ4

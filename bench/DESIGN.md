@@ -220,7 +220,7 @@ how its documentation configures it (past memory the bounded roster's
 LMDB has its readahead off, below). The buffered group ran
 RocksDB as it ships (`rocksdb-nosync`: its 32 MB default block cache and
 no Bloom filter) beside the tuned durable arm until the rows banked at
-`19bf68a` on 31 October 2026, so every buffered cell against RocksDB in the
+`b1bd544` on 31 October 2026, so every buffered cell against RocksDB in the
 rows before is against a configuration no deployment would choose; that
 series stops there and the tuned one starts.
 

@@ -10,7 +10,7 @@
 //! engine loses there are E's scans and D's reads (`bench/scripts/pair.sh
 //! lmdb-nordahead supdb-cache64tofitautozpages 5000000 --reps 3 --bound
 //! 671088640 --passes read,read-threaded,scan,scan-threaded,mixes --ops-div
-//! 10` at `dda952d`). This probe writes the same records as a form
+//! 10` at `e38e44b`). This probe writes the same records as a form
 //! whose records decode on their own -- a group of sixteen records, its
 //! first key raw, each record's key front-coded against it (the shared
 //! prefix's length and the suffix), each value compressed on its own with
