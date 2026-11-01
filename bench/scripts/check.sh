@@ -32,7 +32,11 @@ for g in $groups; do
       ;;
     test)
       say test
-      cargo test --profile checked
+      # The library, the binary and the test targets: the examples hold no
+      # tests, and each links RocksDB into a binary of a third of a
+      # gigabyte, twenty of them, which filled this host's disk allowance;
+      # `lint` compiles every one of them under clippy (`--all-targets`).
+      cargo test --profile checked --lib --bins --tests
       ;;
     lint)
       say lint
