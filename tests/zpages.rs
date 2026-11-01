@@ -13,6 +13,11 @@
 //! because a `Db` is threads, a log and fsyncs, and the unit tests are what
 //! the emulated ARM job runs (`cargo test --lib` under qemu-user), which has
 //! not been asked to open a store; the native legs run this file.
+//!
+//! The controller (`ZPages::Auto`) runs on Linux alone and is inert anywhere
+//! else, which `auto_degrades_where_it_cannot_run_and_always_is_refused_beside_an_unpinned_writer`
+//! holds; the tests of what it does, and the helpers they share, are
+//! Linux's, as are the ones that read what the kernel's page cache holds.
 
 use std::path::{Path, PathBuf};
 use supdb::db::zpages::{
@@ -5280,6 +5285,7 @@ fn the_z_reader_agrees_with_the_blob_on_every_scan_window() {
 /// form file is built or attached, no thread beyond the segment work's is
 /// spawned for it, and the directory is a store under `Off`'s, file for
 /// file; and every read and scan answers the model.
+#[cfg(target_os = "linux")]
 #[test]
 fn an_eager_auto_store_buys_the_form_before_any_read() {
     // The controller as shipped buys the form once the readers have wasted
@@ -5357,6 +5363,7 @@ fn an_eager_auto_store_buys_the_form_before_any_read() {
 /// them, so each buys and installs; the counts say which coding was chosen
 /// and built, the raw-tail form reads larger than the block form wherever
 /// both are sized, and the reads answer the model every way.
+#[cfg(target_os = "linux")]
 #[test]
 fn the_selector_builds_the_raw_tails_where_that_form_fits_and_the_block_coding_otherwise() {
     assert!(
@@ -5459,6 +5466,7 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_and_the_block_coding_o
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn an_eager_auto_store_waits_for_the_segment_work_in_flight() {
     // The eager store of the test above buys within a few ticks of the
@@ -5506,6 +5514,7 @@ fn an_eager_auto_store_waits_for_the_segment_work_in_flight() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn the_samplers_estimate_of_the_form_is_within_a_tenth_of_its_files() {
     // The compact-form rate the model predicts is drawn from the sampler's
@@ -5641,6 +5650,7 @@ fn a_store_whose_hash_and_records_fit_the_budget_is_fits() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn an_auto_store_that_fits_builds_nothing() {
     let files_of = |dir: &Path| -> Vec<String> {
@@ -5790,6 +5800,7 @@ fn auto_degrades_where_it_cannot_run_and_always_is_refused_beside_an_unpinned_wr
 /// at the census, and a budget over it takes SUSPECT back to FITS on the
 /// fifth; the ticks are the injected clock's, and the reads stay the raw
 /// form's throughout, since nothing is built.
+#[cfg(target_os = "linux")]
 #[test]
 fn the_model_moves_the_rung_between_fits_and_suspect_on_the_injected_budget() {
     let dir = scratch("auto-model");
@@ -5873,6 +5884,7 @@ fn census_sum(c: &supdb::db::ZCounts) -> u64 {
 /// A store under `Auto` through the seam, loaded with twenty thousand keys
 /// and ticked twice with the budget and the group's refault rate given,
 /// with the price of a fault set so a window's faults cost something.
+#[cfg(target_os = "linux")]
 fn auto_store(
     name: &str,
     budget: u64,
@@ -5884,6 +5896,7 @@ fn auto_store(
 
 /// `auto_store` with the options moved by `extra` before the store opens
 /// and `prep` run on the store before its load.
+#[cfg(target_os = "linux")]
 fn auto_store_with(
     name: &str,
     budget: u64,
@@ -5931,6 +5944,7 @@ fn auto_store_with(
 
 /// A store under `Auto` in SUSPECT: the budget under the footprint, no
 /// refaults, two hot ticks, the gate at the census.
+#[cfg(target_os = "linux")]
 fn suspect_store(name: &str) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>) {
     let out = auto_store(name, 1 << 20, 0.0, FAULT_40US);
     let c = out.1.zpage_counts();
@@ -5945,22 +5959,27 @@ fn suspect_store(name: &str) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInje
 /// microseconds where an optimized one takes five, so at this host's price
 /// the form would not pay in the dev profile and the selector would be
 /// right to build nothing.
+#[cfg(target_os = "linux")]
 const FAULT_40US: std::time::Duration = std::time::Duration::from_micros(40);
+#[cfg(target_os = "linux")]
 const FAULT_1MS: std::time::Duration = std::time::Duration::from_millis(1);
 /// The decode of a page the sampler is told, the optimized build's
 /// (`zdecode`, cycling the pages of the suite's shape: 3.4 µs, and the
 /// sampler's chain of fills reads about five on this host).
+#[cfg(target_os = "linux")]
 const DECODE_5US: std::time::Duration = std::time::Duration::from_micros(5);
 
 /// A store under `Auto` whose measure says blocked: the budget under the
 /// footprint and the group refaulting at a rate that makes every interval
 /// evidence -- and the pressure term true, as a store's own refaults make
 /// it out of core -- in SUSPECT after two hot ticks.
+#[cfg(target_os = "linux")]
 fn blocked_store(name: &str) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>) {
     blocked_store_at(name, 1 << 20)
 }
 
 /// `blocked_store` under a budget of the caller's choosing, bytes.
+#[cfg(target_os = "linux")]
 fn blocked_store_at(
     name: &str,
     budget: u64,
@@ -5978,6 +5997,7 @@ fn blocked_store_at(
 /// the wait sat out its minute for a step nothing would make -- the thread
 /// is woken at every build's end, and a store building ahead woke it into
 /// that window in one run of the file in three.
+#[cfg(target_os = "linux")]
 fn advance_tick(db: &Db, d: std::time::Duration) {
     let inject = db.options().zpages_inject.clone().unwrap();
     let was = db.zpage_counts().sel_steps;
@@ -5986,6 +6006,7 @@ fn advance_tick(db: &Db, d: std::time::Duration) {
 }
 
 /// A tick of the controller past the step count `was`.
+#[cfg(target_os = "linux")]
 fn wait_tick_past(db: &Db, was: u64) {
     let t = std::time::Instant::now();
     // A minute: the tick is the segment work's turn, ten milliseconds
@@ -5999,6 +6020,7 @@ fn wait_tick_past(db: &Db, was: u64) {
 
 /// Ticks of the injected clock until `cond` holds of the counts, at most
 /// `max` of them: whether it held.
+#[cfg(target_os = "linux")]
 fn tick_until(db: &Db, max: u32, cond: impl Fn(&supdb::db::ZCounts) -> bool) -> bool {
     for _ in 0..max {
         if cond(&db.zpage_counts()) {
@@ -6010,6 +6032,7 @@ fn tick_until(db: &Db, max: u32, cond: impl Fn(&supdb::db::ZCounts) -> bool) -> 
 }
 
 /// `n` census ticks of the injected clock, each waited for.
+#[cfg(target_os = "linux")]
 fn wait_steps(db: &Db, n: u32) {
     for _ in 0..n {
         advance_tick(db, std::time::Duration::from_millis(100));
@@ -6018,6 +6041,7 @@ fn wait_steps(db: &Db, n: u32) {
 
 /// The injected clock moved `step` seconds a tick for `secs` seconds, each
 /// tick waited for: an S1 tick each, since the model is read once a second.
+#[cfg(target_os = "linux")]
 fn wait_secs(db: &Db, secs: u64, step: u64) {
     let mut t = 0;
     while t < secs {
@@ -6028,6 +6052,7 @@ fn wait_secs(db: &Db, secs: u64, step: u64) {
 
 /// `n` point reads through `r` from `at` on, each with `faults` faults on
 /// the seam, over the keys.
+#[cfg(target_os = "linux")]
 fn reads(
     r: &Reader,
     keys: &[Vec<u8>],
@@ -6049,6 +6074,7 @@ fn reads(
 /// ticks, until the controller's phase reads `phase` or `max` stretches
 /// have gone: whether it was reached.
 #[allow(clippy::too_many_arguments)]
+#[cfg(target_os = "linux")]
 fn drive_to(
     db: &Db,
     r: &Reader,
@@ -6071,6 +6097,7 @@ fn drive_to(
 }
 
 /// `cond` waited for, up to ten seconds.
+#[cfg(target_os = "linux")]
 fn wait_for(what: &str, cond: impl Fn() -> bool) {
     let t = std::time::Instant::now();
     while !cond() {
@@ -6082,6 +6109,7 @@ fn wait_for(what: &str, cond: impl Fn() -> bool) {
 /// A blocked store driven to COMPACT by faulting reads through a handle:
 /// the price paid, the form built and installed, the gate at the form.
 #[allow(clippy::type_complexity)]
+#[cfg(target_os = "linux")]
 fn compact_store(
     name: &str,
 ) -> (
@@ -6098,6 +6126,7 @@ fn compact_store(
 
 /// `compact_store` under a budget of the caller's choosing, bytes.
 #[allow(clippy::type_complexity)]
+#[cfg(target_os = "linux")]
 fn compact_store_at(
     name: &str,
     budget: u64,
@@ -6115,6 +6144,7 @@ fn compact_store_at(
 
 /// `compact_store_at` with the options moved by `extra`.
 #[allow(clippy::type_complexity)]
+#[cfg(target_os = "linux")]
 fn compact_store_with(
     name: &str,
     budget: u64,
@@ -6155,6 +6185,7 @@ fn compact_store_with(
 /// (`Options::zpages_drop_at_install`); each partition is dropped once
 /// either way, those attached after the install at their attach. Off, each
 /// attach drops its own and the install drops nothing.
+#[cfg(target_os = "linux")]
 #[test]
 fn auto_drops_the_raw_pages_at_the_install_and_not_at_each_attach() {
     for at_install in [true, false] {
@@ -6185,6 +6216,7 @@ fn auto_drops_the_raw_pages_at_the_install_and_not_at_each_attach() {
 /// sampler reads the partitions, the rent reaches the price, one build at
 /// a time covers the store, the cells are installed and then the gate, and
 /// the reads after it go through the form, every answer the model's.
+#[cfg(target_os = "linux")]
 #[test]
 fn auto_builds_when_the_measure_says_blocked_and_the_limit_is_below_the_footprint() {
     let (dir, db, model, _inject, r, keys, _) = compact_store("auto-build");
@@ -6213,6 +6245,7 @@ fn auto_builds_when_the_measure_says_blocked_and_the_limit_is_below_the_footprin
 
 /// While the form is building, every read is served raw and nothing is
 /// counted through the form; the gate moves only once the cells are in.
+#[cfg(target_os = "linux")]
 #[test]
 fn auto_serves_raw_until_the_form_file_is_whole() {
     let (dir, db, model, inject) = blocked_store("auto-raw-until");
@@ -6251,6 +6284,7 @@ fn auto_serves_raw_until_the_form_file_is_whole() {
 /// a dwell, E1 leaves the form, the rung relaxes to FITS with the form
 /// files kept for the retention, and the retention's end retires them and
 /// gives the disk back.
+#[cfg(target_os = "linux")]
 #[test]
 fn auto_returns_to_raw_when_the_limit_is_lifted_and_gives_the_disk_back() {
     // E1 trusts the model's word that the store fits only where the model
@@ -6288,6 +6322,7 @@ fn auto_returns_to_raw_when_the_limit_is_lifted_and_gives_the_disk_back() {
 /// A workload that fits the cache in the raw form faults nothing however
 /// large the store is: the model says blocked, the census says no, and the
 /// rung stays SUSPECT with nothing built.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_skewed_workload_that_fits_never_builds() {
     let (dir, db, model, inject) = blocked_store("auto-skewed");
@@ -6309,6 +6344,7 @@ fn a_skewed_workload_that_fits_never_builds() {
 
 /// First touches with no refaults are a cold start, not capacity misses:
 /// the faults count for nothing and nothing is built.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_cold_start_is_not_a_capacity_miss() {
     let (dir, db, model, inject) = suspect_store("auto-cold");
@@ -6330,6 +6366,7 @@ fn a_cold_start_is_not_a_capacity_miss() {
 /// The build waits for the rent to reach the price: at every stretch of
 /// evidence, no build has started while the rent is under the price, and
 /// the build that starts finds the rent at or over it.
+#[cfg(target_os = "linux")]
 #[test]
 fn the_ski_rental_price_is_paid_before_a_build() {
     let (dir, db, model, inject) = blocked_store("auto-price");
@@ -6373,6 +6410,7 @@ fn the_ski_rental_price_is_paid_before_a_build() {
 /// A build whose evidence vanishes is cancelled, and a cancel is a switch:
 /// the rung is back at SUSPECT, the builder's thread stops at its next
 /// look, and no form file is left.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_cancelled_build_counts_as_a_switch() {
     let (dir, db, model, inject) = blocked_store("auto-cancel");
@@ -6416,6 +6454,7 @@ fn a_cancelled_build_counts_as_a_switch() {
 /// set back serves the form again; every answer the model's. The gate's
 /// first test ran under `Always` alone, and the dispatch asked for that
 /// option before the gate.
+#[cfg(target_os = "linux")]
 #[test]
 fn the_gate_decides_the_form_under_auto_as_under_always() {
     let (dir, db, model, _inject, r, keys, _) = compact_store("auto-gate");
@@ -6445,6 +6484,7 @@ fn the_gate_decides_the_form_under_auto_as_under_always() {
 /// close through the ticks, for `secs` seconds of the injected clock, each
 /// read with `faults` faults on the seam: what a COMPACT store's handle
 /// does for the footprint and the exits.
+#[cfg(target_os = "linux")]
 fn hot_reads(
     db: &Db,
     r: &Reader,
@@ -6471,6 +6511,7 @@ fn hot_reads(
 /// Stretches of sixty-four reads over `hot` with `faults` a read, each
 /// window closed through the ticks, until `cond` holds of the counts or
 /// `max` stretches have gone: whether it held.
+#[cfg(target_os = "linux")]
 fn stretch_until(
     db: &Db,
     r: &Reader,
@@ -6495,6 +6536,7 @@ fn stretch_until(
 /// form serves and the raw bound is drawn from them, a hot set of a few
 /// keys reading as a few pages and the whole store as all of them; the
 /// count goes when the form stops serving.
+#[cfg(target_os = "linux")]
 #[test]
 fn the_footprint_counts_the_compact_pages_a_handle_touched() {
     let (dir, db, _model, inject, r, keys, _) = compact_store("auto-footprint");
@@ -6537,6 +6579,7 @@ fn the_footprint_counts_the_compact_pages_a_handle_touched() {
 /// with the cells kept, and once the refill's wall has passed the reads
 /// fault nothing and the trial leaves the form, kept for the retention;
 /// a hot set the raw form cannot hold never reaches a trial.
+#[cfg(target_os = "linux")]
 #[test]
 fn the_trial_judges_the_refilled_state() {
     let (dir, db, _model, inject, r, keys, _) = compact_store("auto-trial");
@@ -6593,6 +6636,7 @@ fn the_trial_judges_the_refilled_state() {
 
 /// A trial whose raw reads still fault goes back to the form, and a
 /// wrong trial doubles the back-off.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_trial_that_finds_the_raw_form_faulting_goes_back() {
     let (dir, db, _model, inject, r, keys, _) = compact_store("auto-trial-back");
@@ -6624,6 +6668,7 @@ fn a_trial_that_finds_the_raw_form_faulting_goes_back() {
 
 /// A form that stops paying is left: reads through it faulting as much as
 /// the raw form would, for a dwell, and E3 leaves it.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_form_that_stops_paying_is_left() {
     let (dir, db, _model, inject, r, keys, _) = compact_store("auto-e3");
@@ -6640,6 +6685,7 @@ fn a_form_that_stops_paying_is_left() {
 /// A square wave between a uniform workload that faults and one that
 /// does not switches at most once a dwell: the price, the dwell and the
 /// retention bound the switches whatever the period.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_square_wave_switches_at_most_once_per_dwell() {
     let (dir, db, model, inject) = blocked_store("auto-wave");
@@ -6671,6 +6717,7 @@ fn a_square_wave_switches_at_most_once_per_dwell() {
 
 /// Two stores in one process keep measures of their own: one driven to
 /// COMPACT, the other, which fits, stays FITS with nothing sampled.
+#[cfg(target_os = "linux")]
 #[test]
 fn two_stores_in_one_process_do_not_share_a_measure() {
     let (dir_b, db_b, model_b, _inject_b) = auto_store("auto-two-b", 1 << 40, 0.0, FAULT_40US);
@@ -6705,6 +6752,7 @@ fn two_stores_in_one_process_do_not_share_a_measure() {
 /// A neighbour's pressure opens the build clause: the model says the
 /// store fits, the group refaults, the rung suspects on the pressure, and
 /// faulting reads buy the form.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_neighbours_pressure_opens_the_build_clause() {
     let (dir, db, model, inject) = auto_store("auto-pressure", 1 << 40, 1_000_000.0, FAULT_1MS);
@@ -6727,6 +6775,7 @@ fn a_neighbours_pressure_opens_the_build_clause() {
 /// predicted faults are a page a read and the raw form's the two the
 /// model's two populations predict, so the saving stands at a fault a
 /// read, measured and predicted alike.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_store_far_past_the_cache_still_builds() {
     let (dir, db, model, inject) = auto_store("auto-far", 4096, 1_000_000.0, FAULT_1MS);
@@ -6747,6 +6796,7 @@ fn a_store_far_past_the_cache_still_builds() {
 
 /// Form files on disk are dormant under `Auto` until the form is wanted,
 /// and then attached in place of a build, at the attach's price.
+#[cfg(target_os = "linux")]
 #[test]
 fn form_files_on_disk_are_dormant_under_auto_and_attached_when_the_form_is_wanted() {
     let dir = scratch("auto-dormant");
@@ -6817,6 +6867,7 @@ fn form_files_on_disk_are_dormant_under_auto_and_attached_when_the_form_is_wante
 /// started past the ones made ahead, and the reads after the install go
 /// through the form, every answer the model's. The same store without
 /// the option has no form file on disk at the same point.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_store_past_its_budget_builds_its_form_files_ahead_and_buys_them_by_attach() {
     // Every build held at its start from before the load.
@@ -6915,6 +6966,7 @@ fn a_store_past_its_budget_builds_its_form_files_ahead_and_buys_them_by_attach()
 /// populations still past the budget) and retired its form files at the
 /// retention's end builds none of them again ahead, however long it
 /// stays past its budget.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_store_that_left_compact_builds_nothing_ahead_again() {
     let (dir, db, _model, inject, r, keys, _) =
@@ -6955,11 +7007,13 @@ fn a_store_that_left_compact_builds_nothing_ahead_again() {
 /// budget nothing approaches, in FITS with nothing built; and the raw
 /// populations the model read of it, bytes, which the caller sets the
 /// budget against.
+#[cfg(target_os = "linux")]
 fn land_store(name: &str, pct: u32) -> (PathBuf, Db, Model, std::sync::Arc<supdb::ZInject>, u64) {
     land_store_with(name, pct, |_| {})
 }
 
 /// `land_store` with the caller's options beside.
+#[cfg(target_os = "linux")]
 fn land_store_with(
     name: &str,
     pct: u32,
@@ -7002,6 +7056,7 @@ fn land_store_with(
 /// the records behind them, and the look that finds the store past it
 /// first swaps the records of the partitions built ahead under it for
 /// their files (`Options::zpages_land_drop_past`).
+#[cfg(target_os = "linux")]
 #[test]
 fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records() {
     // Past half, under the whole: the populations are two thirds of it.
@@ -7293,6 +7348,7 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
 /// build's and not the writer's next commit's: every such build counts its
 /// sync, and with the option off none does. The files read as built either
 /// way.
+#[cfg(target_os = "linux")]
 #[test]
 fn form_files_are_synced_by_their_build_and_only_with_the_option() {
     for on in [true, false] {
@@ -7335,6 +7391,7 @@ fn form_files_are_synced_by_their_build_and_only_with_the_option() {
 /// warms it before the next, so the install waits for a warm a partition.
 /// Nothing is built past the files made ahead, and the reads after the
 /// install answer the model through the form.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_buy_attaches_every_form_file_built_ahead_before_any_warm() {
     for first in [true, false] {
@@ -7418,6 +7475,7 @@ fn a_buy_attaches_every_form_file_built_ahead_before_any_warm() {
 /// is then the raw tails, the buy gives each such file back unattached
 /// and builds the partition again raw-tailed (`ZCounts::ahead_recoded`),
 /// and the reads after the install answer the model through the form.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_form_file_built_ahead_in_the_coding_the_pick_refuses_is_built_again() {
     assert!(Options::default().zpages_coding_auto);
@@ -7484,6 +7542,7 @@ fn a_form_file_built_ahead_in_the_coding_the_pick_refuses_is_built_again() {
 /// model's saving is under the selector's line to enter and only the
 /// group's pressure says otherwise, the rent waits for the evidence reads
 /// would give, and the store stays in SUSPECT with its files dormant.
+#[cfg(target_os = "linux")]
 #[test]
 fn an_attach_of_form_files_built_ahead_is_bought_on_the_prediction() {
     for (on, gone, near) in [
@@ -7597,6 +7656,7 @@ fn an_attach_of_form_files_built_ahead_is_bought_on_the_prediction() {
 /// cleared), the census prices a fault at the reads' own wait and not at
 /// the sleeps between them. (A write would make the window one with a
 /// commit in it, counted for the rate alone.)
+#[cfg(target_os = "linux")]
 #[test]
 fn the_writers_reads_are_counted_by_the_census_and_only_its_reads() {
     for on in [true, false] {
@@ -7684,6 +7744,7 @@ fn the_writers_reads_are_counted_by_the_census_and_only_its_reads() {
 /// threshold of an optimized build and under the dev profile's, so E2
 /// never measured the raw form fitting under `checked` and did under
 /// `dev`.
+#[cfg(target_os = "linux")]
 fn close_window(db: &Db, r: &Reader, key: &[u8]) {
     wait_steps(db, 3);
     r.count(key).unwrap();
@@ -7692,6 +7753,7 @@ fn close_window(db: &Db, r: &Reader, key: &[u8]) {
 
 /// `close_window` with the closing read's fault, for a test whose every
 /// read has one and counts them.
+#[cfg(target_os = "linux")]
 fn close_window_faulting(db: &Db, r: &Reader, key: &[u8]) {
     wait_steps(db, 3);
     r.count(key).unwrap();
@@ -7705,6 +7767,7 @@ fn close_window_faulting(db: &Db, r: &Reader, key: &[u8]) {
 /// measures the price the seam set, to the nanosecond; the least CPU a
 /// read took is measured under the raw gate and nothing is measured of
 /// the form.
+#[cfg(target_os = "linux")]
 #[test]
 fn windows_with_commits_count_for_the_rate_and_not_for_the_price_of_a_fault() {
     let (dir, mut db, model, inject) = suspect_store("census-commits");
@@ -7786,6 +7849,7 @@ fn windows_with_commits_count_for_the_rate_and_not_for_the_price_of_a_fault() {
 /// the handle's: a handle idle between its calls, with no price set on the
 /// seam, prices a fault at what its operations spent and not at its
 /// idleness, which would read as milliseconds a fault.
+#[cfg(target_os = "linux")]
 #[test]
 fn the_price_of_a_fault_is_the_operations_wall_and_not_the_handles_idle() {
     let (dir, db, model, inject) = suspect_store("census-idle");
@@ -7815,6 +7879,7 @@ fn the_price_of_a_fault_is_the_operations_wall_and_not_the_handles_idle() {
 /// A handle that only scans reaches the census: its windows are scan
 /// windows, counted with their faults, and the least CPU a scan took is
 /// measured; nothing of the reads.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_scan_only_handle_reaches_the_census() {
     let (dir, db, model, inject) = suspect_store("census-scans");
@@ -7850,6 +7915,7 @@ fn a_scan_only_handle_reaches_the_census() {
 
 /// A window of reads and scans together is dropped and counted, by the
 /// engine and by the selector, and nothing of it is a rate.
+#[cfg(target_os = "linux")]
 #[test]
 fn mixed_windows_are_counted_and_dropped() {
     let (dir, db, model, inject) = suspect_store("census-mixed");
@@ -7885,6 +7951,7 @@ fn mixed_windows_are_counted_and_dropped() {
 
 /// A window opened on one thread and closed on another is dropped as
 /// moved: the faults it would difference are two threads' counters.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_handle_that_moved_threads_yields_nothing() {
     let (dir, db, model, inject) = suspect_store("census-moved");
@@ -8063,6 +8130,7 @@ fn a_block_read_often_enough_under_the_form_is_held_as_a_copy_and_walked_without
 /// the page cache holds: `mincore` over a read-only mapping of each, which
 /// faults nothing in, so the kernel's answer and not the store's record of
 /// what it asked.
+#[cfg(target_os = "linux")]
 fn resident_under(dir: &Path, prefix: &str) -> (u64, u64) {
     let page = 4096u64;
     let (mut size, mut resident) = (0u64, 0u64);
@@ -8104,6 +8172,7 @@ fn resident_under(dir: &Path, prefix: &str) -> (u64, u64) {
 /// without it, every partition's install counted, and every read, count and
 /// scan answers as before -- what a raw read needs after it comes back from
 /// the file.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_partition_its_form_serves_drops_its_raw_pages_when_asked() {
     let mut held = Vec::new();
