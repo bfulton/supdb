@@ -592,6 +592,9 @@ pub struct Supdb {
     /// The upkeep thread files on however far the writes have outrun it,
     /// `Options::upkeep_abandons` off. `supdb-noabandon`.
     noabandon: bool,
+    /// No budget of the cache's own, `Options::scan_cache_auto` off.
+    /// `supdb-cachenoauto`.
+    cachenoauto: bool,
     /// A direct run's record stream kept whole in the arena, the shape
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
@@ -1251,6 +1254,9 @@ struct Policy {
     /// The upkeep thread files on however far the writes have outrun it,
     /// `Options::upkeep_abandons` off. `supdb-noabandon`.
     noabandon: bool,
+    /// No budget of the cache's own, `Options::scan_cache_auto` off.
+    /// `supdb-cachenoauto`.
+    cachenoauto: bool,
     /// A direct run's record stream kept whole in the arena, the shape
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
@@ -1674,6 +1680,7 @@ impl Default for Policy {
             latesync: false,
             installreads: false,
             noabandon: false,
+            cachenoauto: false,
             norecycle: false,
             keysarena: false,
             noalert: false,
@@ -4102,6 +4109,17 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with no budget of the cache's own.
+    pub fn create_cachenoauto(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cachenoauto: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-ingest` as `supdb-latesync`.
     pub fn create_ingest_latesync(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
@@ -5510,6 +5528,7 @@ impl Supdb {
             latesync,
             installreads,
             noabandon,
+            cachenoauto,
             norecycle,
             keysarena,
             noalert,
@@ -5781,6 +5800,7 @@ impl Supdb {
             close_presync: !latesync,
             ahead_sends_bounds: !installreads,
             upkeep_abandons: !noabandon,
+            scan_cache_auto: !cachenoauto,
             prefault: populate,
             direct_put_one: !recordsteps,
             direct_stream: !copyvals && !refvals,
@@ -6023,6 +6043,7 @@ impl Supdb {
             latesync,
             installreads,
             noabandon,
+            cachenoauto,
             norecycle,
             keysarena,
             noalert,
@@ -6776,6 +6797,9 @@ impl Engine for Supdb {
         if self.noabandon {
             return "supdb-noabandon";
         }
+        if self.cachenoauto {
+            return "supdb-cachenoauto";
+        }
         if self.norecycle {
             return if self.partition {
                 "supdb-norecycle"
@@ -7033,6 +7057,9 @@ impl Engine for Supdb {
             // the ones its own pin decided (`Options::upkeep_abandons`).
             ("upkeep_abandons", db.upkeep_abandons() as f64),
             ("upkeep_abandons_pinned", db.upkeep_abandons_pinned() as f64),
+            // The times the cache's own budget bound
+            // (`Options::scan_cache_auto`).
+            ("cache_bindings", db.cache_bindings() as f64),
             ("snap_switches", db.snapshot_switches() as f64),
             // The store's shape as it stands: what a read has to consult.
             ("segments", db.segments() as f64),
@@ -7998,6 +8025,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-latesync"
         | "supdb-installreads"
         | "supdb-noabandon"
+        | "supdb-cachenoauto"
         | "supdb-norecycle"
         | "supdb-keysarena"
         | "supdb-noalert"
@@ -8435,6 +8463,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-latesync" => Box::new(Supdb::create_latesync(dir)?),
         "supdb-installreads" => Box::new(Supdb::create_installreads(dir)?),
         "supdb-noabandon" => Box::new(Supdb::create_noabandon(dir)?),
+        "supdb-cachenoauto" => Box::new(Supdb::create_cachenoauto(dir)?),
         "supdb-ingestlatesync" => Box::new(Supdb::create_ingest_latesync(dir)?),
         "supdb-norecycle" => Box::new(Supdb::create_norecycle(dir)?),
         "supdb-ingestnorecycle" => Box::new(Supdb::create_ingest_norecycle(dir)?),

@@ -1835,6 +1835,30 @@ pub struct Options {
     /// when a scan next wants it, so the pieces on disk are what the
     /// cache overflows to.
     pub scan_cache_bytes: usize,
+    /// Whether a store with no `scan_cache_bytes` budgets its block cache
+    /// from the memory available: `scan_cache_auto_bytes`, by default an
+    /// eighth of `zfile::read_budget`'s limit -- the cgroup's bound, or the
+    /// machine's memory -- with forms counted by their buffers' capacity,
+    /// as `forms_to_fit` counts them. Below the budget the cache is the
+    /// unbounded one exactly: the commit's fill, the tables called
+    /// complete, no per-block bookkeeping. The first time it passes the
+    /// budget it binds, for the store's life: a shed drops the writer's
+    /// claim that its tables are complete (a reader finds the shed block's
+    /// mark and builds it), the bookkeeping the shed chooses by starts,
+    /// the commit's fill stops, and forms are built and grown to fit with
+    /// the budget kept after a patch, as `scan_cache_bytes` with
+    /// `forms_to_fit` has them from the start. A budget that binds from
+    /// the start cost the lag sweep's full rewrite three quarters of its
+    /// rate in core, at sizes where it never bound, which is why this one
+    /// waits; unbounded, the default's cache after the sweep's tenth
+    /// rewrite at ten million keys was the store's own size and the group
+    /// of 1.5 GiB killed the process for it. Off: no budget, as before.
+    /// `supdb-cachenoauto` is the arm that has none.
+    pub scan_cache_auto: bool,
+    /// The automatic budget (`scan_cache_auto`), or 0, the default, for an
+    /// eighth of the memory available, and no budget where that cannot be
+    /// read.
+    pub scan_cache_auto_bytes: usize,
     /// PROTOTYPE: with the block cache, build ahead of the reader on a
     /// thread of its own. At the writer's first scan over a published
     /// state, a reader handle pins the store as of the last commit and
@@ -3165,6 +3189,16 @@ impl Options {
     }
 }
 
+impl Options {
+    /// Whether the block cache counts a form by its buffers' capacity:
+    /// `forms_to_fit`, or a budget the store sets itself
+    /// (`scan_cache_auto`). A function of the options alone, so that every
+    /// count of one store is made the same way from its open.
+    fn counts_capacity(&self) -> bool {
+        self.forms_to_fit || (self.scan_cache_auto && self.scan_cache_bytes == 0)
+    }
+}
+
 impl Default for Options {
     fn default() -> Options {
         Options {
@@ -3268,6 +3302,8 @@ impl Default for Options {
             scan_merge: true,
             scan_block_cache: true,
             scan_cache_bytes: 0,
+            scan_cache_auto: true,
+            scan_cache_auto_bytes: 0,
             scan_cache_ahead: true,
             scan_prefetch: true,
             scan_prefetch_bytes: 4096,
@@ -13046,6 +13082,11 @@ struct Shared {
     /// tables kept for the upkeep's look may take, `u64::MAX` where
     /// nothing bounds them but the count.
     keep_bytes: u64,
+    /// The block cache's automatic budget as resolved at open
+    /// (`Options::scan_cache_auto`), zero for none.
+    auto_cache_bytes: usize,
+    /// The times a handle's automatic budget bound.
+    cache_bindings: AtomicU64,
     /// The store's scans (`Shared::scans_all`) when a publish kept fewer
     /// tables than the upkeep was behind and asked the thread to give up
     /// its forms (`Options::upkeep_abandons`), `u64::MAX` when nothing is
@@ -14005,6 +14046,10 @@ struct FormsState {
     /// (`Reader::abandon_forms`), the pass's end at the latest, so that
     /// tables a step left half-settled never go back to the writer.
     abandoned: std::cell::Cell<u64>,
+    /// The automatic budget (`Options::scan_cache_auto`) has bound: the
+    /// cache passed it once, and from then on this handle keeps it as a
+    /// budget it was given keeps it.
+    cache_bound: std::cell::Cell<bool>,
     /// `Shared::tables_landed` as the upkeep thread's pass in flight
     /// pinned its state, and what a table landed under the pin costs
     /// (`MemTable::kept_bytes` of the largest table the state stands on),
@@ -14181,6 +14226,7 @@ impl FormsState {
             dirty_any: std::cell::Cell::new(false),
             tables_complete: std::cell::Cell::new(false),
             abandoned: std::cell::Cell::new(u64::MAX),
+            cache_bound: std::cell::Cell::new(false),
             pass_landed: std::cell::Cell::new(0),
             pass_unit: std::cell::Cell::new(0),
             abandon_pinned: std::cell::Cell::new(false),
@@ -20165,7 +20211,7 @@ impl Reader {
             offs: Some(&self.fs().emit_offs),
             copy_dense: false,
             copy_exact: self.opts.copy_exact,
-            fit: self.opts.forms_to_fit,
+            fit: self.fits(),
             merge_pieces: self.opts.overlay_merge,
             pieces_only: self.opts.forms_pieces_only,
             ranks_by_heads: self.opts.piece_ranks_by_heads,
@@ -20714,10 +20760,7 @@ impl Reader {
         // filled read 1.01x-1.33x. The builder declines a store too
         // small for one, and there the commit fills it, which at ten
         // thousand keys is a few hundred blocks.
-        if self.opts.commit_forms_build
-            && self.opts.scan_cache_bytes == 0
-            && !self.fs().tables_complete.get()
-        {
+        if self.opts.commit_forms_build && !self.cache_binds() && !self.fs().tables_complete.get() {
             if self.opts.scan_cache_ahead && self.fs().ahead.borrow().is_none() {
                 self.start_ahead();
             }
@@ -20732,11 +20775,14 @@ impl Reader {
                 let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
                 self.complete_forms(unsealed)?;
                 drop(cache);
-                // A fill cut short is no table to call complete.
+                // A fill cut short is no table to call complete, and
+                // nor is one that reached the budget.
                 if self.abandon_forms() {
                     return Ok(());
                 }
-                self.fs().tables_complete.set(true);
+                if !self.cache_binds() {
+                    self.fs().tables_complete.set(true);
+                }
             }
         }
         // The table's position and completeness move with a publish and
@@ -20937,6 +20983,13 @@ impl Reader {
                 if b % 64 == 63 && self.abandon_asked() {
                     return Ok(());
                 }
+                // The store's own budget reached: it binds, and what the
+                // fill has not built is left to the scans that want it.
+                let budget = self.cache_budget();
+                if budget > 0 && !self.cache_binds() && self.fs().cache_bytes.get() > budget {
+                    self.bind_cache();
+                    return Ok(());
+                }
                 // An empty slot with an overlay, or a form the patches
                 // grew to what a build would have copied -- the latter up
                 // to a cap, if one is set, and on the upkeep thread only
@@ -21060,10 +21113,46 @@ impl Reader {
         lent.saturating_sub(self.fs().pass_lent.get()) > allow as u64
     }
 
+    /// The block cache's budget: the one given (`scan_cache_bytes`), or
+    /// the store's own (`scan_cache_auto`), zero for none.
+    fn cache_budget(&self) -> usize {
+        if self.opts.scan_cache_bytes > 0 {
+            self.opts.scan_cache_bytes
+        } else {
+            self.shared.auto_cache_bytes
+        }
+    }
+
+    /// Whether the budget is kept: a budget given from the start, the
+    /// store's own once it has bound.
+    fn cache_binds(&self) -> bool {
+        self.opts.scan_cache_bytes > 0 || self.fs().cache_bound.get()
+    }
+
+    /// Whether forms are built and grown to fit: `forms_to_fit`, or the
+    /// store's own budget once it has bound.
+    fn fits(&self) -> bool {
+        self.opts.forms_to_fit || self.fs().cache_bound.get()
+    }
+
+    /// The store's own budget bound, where the cache has passed it: the
+    /// tables' claim to completeness dropped, since a shed leaves a block
+    /// with no form, and kept from here on.
+    fn bind_cache(&self) {
+        if self.fs().cache_bound.replace(true) {
+            return;
+        }
+        self.fs().tables_complete.set(false);
+        self.shared
+            .cache_bindings
+            .fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
     /// What the budget counts a form as: what it holds, or with
-    /// `Options::forms_to_fit` what its buffers cost.
+    /// `Options::forms_to_fit` or the store's own budget what its buffers
+    /// cost (`Options::counts_capacity`).
     fn fbytes(&self, c: &Cached) -> usize {
-        if self.opts.forms_to_fit {
+        if self.opts.counts_capacity() {
             c.cap_bytes()
         } else {
             c.bytes()
@@ -21139,9 +21228,12 @@ impl Reader {
     /// rather than borrowed again, and `keep` the block it is about to
     /// walk, never shed: a budget below one block holds that block.
     fn shed(&self, cur: usize, keep: usize, table: &mut BlockTable) {
-        let budget = self.opts.scan_cache_bytes;
-        if budget == 0 {
+        let budget = self.cache_budget();
+        if budget == 0 || self.fs().cache_bytes.get() <= budget {
             return;
+        }
+        if !self.cache_binds() {
+            self.bind_cache();
         }
         let tick = self.fs().scan_tick.get();
         while self.fs().cache_bytes.get() > budget {
@@ -21728,7 +21820,11 @@ impl Reader {
         // splice, which the rebase's fold (`fold_piece_block`) also calls
         // while the tables are away: a block that fold grows is not shed
         // for (`Options::forms_fit_shed`).
-        if self.opts.forms_to_fit && self.opts.forms_fit_shed {
+        // The cache's own budget, not yet bound, binds here as well as
+        // where a scan builds: a burst's patches grow forms no scan built.
+        if (self.fits() && self.opts.forms_fit_shed)
+            || (!self.cache_binds() && self.cache_budget() > 0)
+        {
             self.shed(at, b, table);
         }
         Ok(())
@@ -21806,7 +21902,7 @@ impl Reader {
                     blk.vals[at..at + run.len()].copy_from_slice(run);
                     blk.ents[i][3] = run.len() as u32;
                 } else if found {
-                    if self.opts.forms_to_fit {
+                    if self.fits() {
                         fit_room(&mut blk.vals, run.len());
                     }
                     let at_run = blk.vals.len() as u32;
@@ -21814,7 +21910,7 @@ impl Reader {
                     blk.ents[i][2] = at_run;
                     blk.ents[i][3] = run.len() as u32;
                 } else {
-                    if self.opts.forms_to_fit {
+                    if self.fits() {
                         fit_room(&mut blk.vals, run.len());
                         fit_room(&mut blk.keys, key.len());
                         fit_room(&mut blk.ents, 1);
@@ -21869,7 +21965,7 @@ impl Reader {
                 // three times on the way to sixteen, and the allocator
                 // was a fifth of the upkeep thread's time over the
                 // tenth-rewritten burst.
-                if self.opts.forms_to_fit {
+                if self.fits() {
                     // Only the buffers this write grows, and by a quarter:
                     // the doubling left a form that a burst had patched
                     // to forty deltas in the capacity of sixty-four, and
@@ -21924,7 +22020,7 @@ impl Reader {
                 // Sized for the dense count at birth, and the run copied
                 // rather than its scratch taken: taken, the next splice
                 // allocated the scratch again, one allocation a write.
-                let mut sb = SparseBlock::with_room(key.len(), run.len(), self.opts.forms_to_fit);
+                let mut sb = SparseBlock::with_room(key.len(), run.len(), self.fits());
                 sb.keys.extend_from_slice(key);
                 sb.ents.push(DeltaEnt {
                     key: (0, key.len() as u32),
@@ -22242,7 +22338,7 @@ impl Reader {
         // each of those is an array as long as the partition's blocks in
         // an allocation of its own, so reading one is a cold line of its
         // own on a scan that streams past the cache.
-        let bookkeep = self.opts.scan_cache_bytes > 0;
+        let bookkeep = self.cache_binds();
         let promoting = self.opts.promote_entries > 0;
         let mut seen = 0usize;
         let mut cursor: &[u8] = from;
@@ -23007,7 +23103,7 @@ impl Reader {
         // The bytes the cache counts itself holding are the contents', or
         // with `Options::forms_to_fit` the buffers'; the walk adds up the
         // same by its own arithmetic.
-        let fit = self.opts.forms_to_fit;
+        let fit = self.opts.counts_capacity();
         for t in self.fs().tables.borrow().iter() {
             for c in t.borrow().iter().flat_map(|t| t.slots.iter()).flatten() {
                 match &**c {
@@ -23048,6 +23144,28 @@ impl Reader {
 
     /// PROTOTYPE: the bytes the cache counts itself holding, for a test
     /// to hold against a walk of it.
+    /// The times a handle's own cache budget bound
+    /// (`Options::scan_cache_auto`): for a test, and the suite's counters.
+    #[doc(hidden)]
+    pub fn cache_bindings(&self) -> u64 {
+        self.shared.cache_bindings.load(AtomicOrdering::Relaxed)
+    }
+
+    /// The store's own cache budget as resolved at open, zero for none.
+    #[doc(hidden)]
+    pub fn auto_cache_bytes(&self) -> usize {
+        self.shared.auto_cache_bytes
+    }
+
+    /// Whether the writer's block tables claim a form for every overlaid
+    /// block, so that an empty slot is clean: for a test. Takes the upkeep
+    /// home, as every read of the writer's tables does.
+    #[doc(hidden)]
+    pub fn forms_tables_complete(&self) -> bool {
+        let _e = self.enter();
+        self.fs().tables_complete.get()
+    }
+
     pub fn block_cache_bytes(&self) -> usize {
         let _e = self.enter();
         self.fs().cache_bytes.get()
@@ -24389,6 +24507,8 @@ impl Db {
             upkeep: Lend::default(),
             upkeep_lives: AtomicU64::new(u64::MAX),
             keep_bytes: Db::resolve_keep_bytes(&opts),
+            auto_cache_bytes: Db::resolve_auto_cache(&opts),
+            cache_bindings: AtomicU64::new(0),
             abandon_at: AtomicU64::new(u64::MAX),
             outran_at: AtomicU64::new(u64::MAX),
             abandons: AtomicU64::new(0),
@@ -24896,6 +25016,8 @@ impl Db {
             upkeep: Lend::default(),
             upkeep_lives: AtomicU64::new(u64::MAX),
             keep_bytes: Db::resolve_keep_bytes(&opts),
+            auto_cache_bytes: Db::resolve_auto_cache(&opts),
+            cache_bindings: AtomicU64::new(0),
             abandon_at: AtomicU64::new(u64::MAX),
             outran_at: AtomicU64::new(u64::MAX),
             abandons: AtomicU64::new(0),
@@ -26650,7 +26772,7 @@ impl Db {
         let fresh = std::sync::Arc::new(MemTable::new(self.opts.prefault));
         let carried = std::cell::Cell::new(false);
         let pieces_only = self.opts.forms_pieces_only;
-        let by_capacity = self.opts.forms_to_fit;
+        let by_capacity = self.opts.counts_capacity();
         let Some(old) = self.try_publish_writer(|cur| {
             if !std::sync::Arc::ptr_eq(&cur.mem, table) || cur.frozen.len() >= FROZEN_CAP {
                 return None;
@@ -26754,6 +26876,19 @@ impl Db {
                 from: shared.upkeep_lives.load(AtomicOrdering::Relaxed),
                 bytes: shared.keep_bytes,
             })
+    }
+
+    /// `Options::scan_cache_auto` resolved: zero where the store has a
+    /// budget of its own or none at all, else as given or an eighth of the
+    /// memory available, and zero where that cannot be read.
+    fn resolve_auto_cache(opts: &Options) -> usize {
+        if !opts.scan_cache_auto || opts.scan_cache_bytes > 0 || !opts.scan_block_cache {
+            return 0;
+        }
+        if opts.scan_cache_auto_bytes > 0 {
+            return opts.scan_cache_auto_bytes;
+        }
+        zfile::read_budget().map_or(0, |b| (b.limit / 8) as usize)
     }
 
     /// `Options::upkeep_keep_bytes` resolved: as given, or an eighth of
@@ -26921,7 +27056,7 @@ impl Db {
     fn set_mem_with(&mut self, mem: std::sync::Arc<MemTable>, carry: bool) {
         let from = Db::replaced_from(&self.opts, &self.shared);
         let pieces_only = self.opts.forms_pieces_only;
-        let by_capacity = self.opts.forms_to_fit;
+        let by_capacity = self.opts.counts_capacity();
         let old = self.publish_writer(|cur| {
             let mut next = State {
                 forms: Reader::forms_for(&cur.segs),
@@ -28997,7 +29132,7 @@ impl Reader {
         };
         // Under a budget, the forms queued for the install are bounded
         // by it too: the store sheds past the budget only as it installs.
-        let budget = self.opts.scan_cache_bytes;
+        let budget = self.cache_budget();
         let mut sent = 0usize;
         ctx.rank_pieces()?;
         let np = self.segs().partition_point(|s| s.level > 0);
@@ -34419,7 +34554,7 @@ impl Maint {
                 cur.carry_published(
                     &mut next,
                     self.opts.forms_pieces_only,
-                    self.opts.forms_to_fit,
+                    self.opts.counts_capacity(),
                     None,
                 )
             };

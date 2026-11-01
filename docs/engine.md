@@ -6190,6 +6190,20 @@ holds read zero in these runs, which have one handle). And the budgeted arm was 
 bound -- a group limit of a gibibyte at three million keys -- where the process's anonymous bytes
 and the page cache compete and the arms' rows would say whether 630 MB is enough.
 
+Both were followed under a bound, at ten million keys, where every cached arm was killed by the
+lag sweep's tenth or full rewrite. What the write path held under a pin was the larger part: the
+upkeep thread pins one state for its pass, out of core a pass resolves a key a major fault and runs
+for seconds, and every table that landed meanwhile waited behind the pin with its snapshot copy.
+The thread now gives its forms up once the tables landed under its pin, or the tables a look has
+fallen behind, cost more than an eighth of the memory available, and the store reads as far from
+reads until it is scanned (`Options::upkeep_abandons`, `upkeep_keep_bytes`); and the install of the
+builder's forms no longer reads the partition (`ahead_sends_bounds`). The default's cache, the
+store's own size after a rewrite, has a budget of its own from the same reading of the memory
+available, counted by capacity (`Options::scan_cache_auto`): below it the cache is the unbounded one
+exactly, and the first time it passes the budget it binds, as `scan_cache_bytes` with
+`forms_to_fit` has it from the start -- a budget that binds from the start costs the full-rewrite
+point its rate in core at sizes where it never binds, which is why this one waits.
+
 #### Out of core: against LMDB with its readahead off
 
 The first bounded rung at ten million keys under a gibibyte read the

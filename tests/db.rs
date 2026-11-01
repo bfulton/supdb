@@ -3632,6 +3632,124 @@ fn the_block_cache_answers_the_same_model_under_a_budget_kept_to_fit_on_a_thread
     );
 }
 
+/// The overlay model under the cache's own budget, small enough to bind
+/// part way, inline and on the upkeep thread: every answer as without it,
+/// and the cache held to the budget at every step once bound.
+#[test]
+fn the_block_cache_answers_the_same_model_under_its_own_budget() {
+    for (name, upkeep) in [
+        ("overlay-auto", supdb::Upkeep::Inline),
+        ("overlay-auto-upkeep", supdb::Upkeep::Background(3)),
+    ] {
+        let (_, bound) = overlay_model_z(name, true, 0, upkeep, false, false, false, Some(2048));
+        assert!(bound > 0, "{name}: the budget bound");
+    }
+}
+
+/// A table called complete under the cache's own budget and then grown past
+/// it by a burst's patches: the binding's shed leaves a block that has
+/// unsealed keys without a form, and the writer and a handle read every
+/// key through it. What keeps a handle right is the mark the shed publishes
+/// in the block's slot, and the writer builds any empty block an overlay
+/// lands in; the binding also drops the table's claim to be complete, as a
+/// budget given never makes it, but no read here depends on the drop --
+/// the burst's writes into blocks with no form drop the claim too. The
+/// budget is set from a run with none, just above what the complete table
+/// holds, so that the fill completes under it and the patches cross it.
+#[test]
+fn a_cache_bound_after_its_tables_were_complete_reads_no_shed_block_as_clean() {
+    let run = |name: &str, auto: usize| {
+        let d = dir(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 1 << 20,
+                partition_bytes: Some(2 << 10),
+                l0_trigger: 64,
+                scan_block_cache: true,
+                scan_cache_ahead: false,
+                commit_forms: true,
+                forms_settle_backlog_pct: 0,
+                scan_cache_auto_bytes: auto,
+                upkeep: supdb::Upkeep::Inline,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in 0..3000u32 {
+            m.append(&mut db, &key(k), "v0-0123456789");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        db.settle().unwrap();
+        // One key in each of twenty blocks, a scan, and a commit near it
+        // that fills a form for every overlaid block.
+        for b in 0..20u32 {
+            m.append(&mut db, &key(b * 64 + 1), "v1");
+        }
+        db.commit().unwrap();
+        m.check(&db, &format!("{name}: overlaid"));
+        m.append(&mut db, &key(5), "v1b");
+        db.commit().unwrap();
+        let filled = (db.block_cache_bytes(), db.forms_tables_complete());
+        // The burst: the same blocks patched, each form grown.
+        for round in 0..6u32 {
+            for b in 0..20u32 {
+                m.append(
+                    &mut db,
+                    &key(b * 64 + 2 + round),
+                    "v2-patched-into-the-form",
+                );
+            }
+            db.commit().unwrap();
+        }
+        m.check(&db, &format!("{name}: after the burst"));
+        let h = db.reader().unwrap();
+        m.check(&h, &format!("{name}: a handle after the burst"));
+        (filled, db.cache_bindings())
+    };
+    let ((bytes, complete), _) = run("bound-after-complete-dry", 1 << 40);
+    assert!(
+        complete && bytes > 0,
+        "the dry run fills and calls its table complete: {bytes} B, {complete}"
+    );
+    let ((under, complete), bound) = run("bound-after-complete", bytes + 256);
+    assert!(complete, "the fill completed under the budget ({under} B)");
+    assert!(
+        bound > 0,
+        "the burst's patches crossed the budget and it bound"
+    );
+}
+
+/// And a budget the cache never reaches keeps the unbounded shape: the
+/// same blocks built over the same model as the store with none.
+#[test]
+fn a_budget_the_cache_never_reaches_keeps_the_unbounded_shape() {
+    let run = |name: &str, auto: Option<usize>| {
+        overlay_model_z(
+            name,
+            true,
+            0,
+            supdb::Upkeep::Inline,
+            false,
+            false,
+            false,
+            auto,
+        )
+    };
+    let (built, bound) = run("overlay-auto-unreached", Some(1 << 40));
+    let (built_off, _) = run("overlay-auto-off", None);
+    assert_eq!(bound, 0, "never bound");
+    assert_eq!(built, built_off, "the same blocks built as with no budget");
+    assert!(
+        built_off.0 + built_off.1 > 0,
+        "blocks were built to compare"
+    );
+}
+
 /// The memory census of a store as a map, by name.
 fn census_of(db: &Db) -> BTreeMap<String, u64> {
     db.memory_census().into_iter().collect()
@@ -4421,7 +4539,21 @@ fn differential_under_a_budget(
     seed: u64,
     upkeep: supdb::Upkeep,
     budget: usize,
-) {
+) -> u64 {
+    differential_budgeted(name, fit, seed, upkeep, budget, 0)
+}
+
+/// `differential_under_a_budget` with the cache's own budget
+/// (`Options::scan_cache_auto_bytes`) at `auto` beside the one given:
+/// whichever is set is the one held. The bindings it made come back.
+fn differential_budgeted(
+    name: &str,
+    fit: bool,
+    seed: u64,
+    upkeep: supdb::Upkeep,
+    budget: usize,
+    auto: usize,
+) -> u64 {
     let d = dir(name);
     let opts = Options {
         seal_bytes: 1 << 20,
@@ -4430,6 +4562,7 @@ fn differential_under_a_budget(
         scan_block_cache: true,
         scan_cache_ahead: false,
         scan_cache_bytes: budget,
+        scan_cache_auto_bytes: auto,
         forms_settle_backlog_pct: 0,
         commit_forms: true,
         upkeep,
@@ -4456,7 +4589,7 @@ fn differential_under_a_budget(
     };
     for step in 0..120u32 {
         if fit && step % 3 == 0 {
-            held(&db, budget);
+            held(&db, budget.max(auto));
         }
         match rng() % 10 {
             0..=3 => {
@@ -4522,11 +4655,12 @@ fn differential_under_a_budget(
         }
     }
     db.commit().unwrap();
-    if fit {
-        held(&db, budget);
+    if fit || auto > 0 {
+        held(&db, budget.max(auto));
     }
     m.check(&r, &format!("{name}: the handle at the end"));
     m.check(&db, &format!("{name}: the writer at the end"));
+    db.cache_bindings()
 }
 
 /// The differential runs above, kept to fit or not, on the upkeep inline
@@ -4552,6 +4686,33 @@ fn a_budgeted_cache_answers_the_model_with_a_handle_claimed() {
             );
         }
     }
+}
+
+/// The cache's own budget (`Options::scan_cache_auto`) small enough to
+/// bind, with a handle claimed beside the writer: the binding drops the
+/// writer's claim that its tables are complete as a shed begins, and the
+/// handle and the writer answer the model before it, across it and after.
+#[test]
+fn the_caches_own_budget_answers_the_model_with_a_handle_claimed() {
+    let mut bound = 0;
+    for seed in 1..=2u64 {
+        for upkeep in [
+            supdb::Upkeep::Inline,
+            supdb::Upkeep::Background(1),
+            supdb::Upkeep::Background(3),
+        ] {
+            let name = format!("differential-auto-{upkeep:?}-{seed}");
+            bound += differential_budgeted(
+                &name,
+                false,
+                seed.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                upkeep,
+                0,
+                6 << 10,
+            );
+        }
+    }
+    assert!(bound > 0, "the budget bound, so the runs above crossed it");
 }
 
 /// The seal grows with the partitions: past the floor, a memtable seals
@@ -6307,7 +6468,16 @@ fn overlay_model_opts(
     pieces_only: bool,
     fit: bool,
 ) {
-    overlay_model_z(name, block_cache, budget, upkeep, pieces_only, fit, false)
+    overlay_model_z(
+        name,
+        block_cache,
+        budget,
+        upkeep,
+        pieces_only,
+        fit,
+        false,
+        Some(0),
+    );
 }
 
 /// The overlay model with the compact form forced: every partition the
@@ -6324,6 +6494,7 @@ fn the_bulk_walk_lays_unsealed_keys_over_the_partitions_as_the_merge_does_with_z
         false,
         false,
         true,
+        Some(0),
     );
 }
 
@@ -6337,6 +6508,7 @@ fn the_block_cache_answers_the_same_model_with_zpages() {
         false,
         false,
         true,
+        Some(0),
     );
 }
 
@@ -6355,6 +6527,7 @@ fn the_block_cache_answers_the_same_model_with_pieces_only_forms_and_zpages() {
         true,
         false,
         true,
+        Some(0),
     );
 }
 
@@ -6367,13 +6540,19 @@ fn overlay_model_z(
     pieces_only: bool,
     fit: bool,
     zpages: bool,
-) {
+    auto: Option<usize>,
+) -> ((u64, u64), u64) {
     let d = dir(name);
+    // The cache's own budget held as a budget given is, where it is small
+    // enough to bind; `None` is the store with none.
+    let budget_held = budget.max(auto.unwrap_or(0));
     let opts = Options {
         seal_bytes: 1 << 20,
         partition_bytes: Some(2 << 10),
         scan_block_cache: block_cache,
         scan_cache_bytes: budget,
+        scan_cache_auto: auto.is_some(),
+        scan_cache_auto_bytes: auto.unwrap_or(0),
         upkeep,
         forms_pieces_only: pieces_only,
         forms_to_fit: fit,
@@ -6410,7 +6589,7 @@ fn overlay_model_z(
         "want several partitions and no piece, got {parts}/{l0}"
     );
     m.check(&db, "partitions only");
-    held(&db, budget);
+    held(&db, budget_held);
 
     // A few writes in one partition's range: an update, a delete, a new
     // key between two, so a block holds unsealed keys without being dense
@@ -6421,7 +6600,7 @@ fn overlay_model_z(
     db.commit().unwrap();
     pass(&mut db);
     m.check(&db, "a few unsealed keys in one partition");
-    held(&db, budget);
+    held(&db, budget_held);
 
     // The YCSB shape: inserts past the end, committed, nothing sealed.
     for k in (600..660).step_by(3) {
@@ -6430,7 +6609,7 @@ fn overlay_model_z(
     db.commit().unwrap();
     assert_eq!(db.levels(), (parts, 0));
     m.check(&db, "live inserts past the end");
-    held(&db, budget);
+    held(&db, budget_held);
 
     // What the frozen memtable will hold.
     for k in (0..600).step_by(3) {
@@ -6477,20 +6656,20 @@ fn overlay_model_z(
     assert!(db.in_flight().0);
     assert_eq!(db.levels(), (parts, 0));
     m.check(&db, "frozen and live over the partitions");
-    held(&db, budget);
+    held(&db, budget_held);
 
     db.hold_seal_landing(false);
     db.settle().unwrap();
     assert!(db.levels().1 > 0, "settle publishes the sealed pieces");
     m.check(&db, "level-0 pieces and live over the partitions");
-    held(&db, budget);
+    held(&db, budget_held);
 
     db.flush().unwrap();
     m.flushed();
     assert_eq!(db.levels().1, 0);
     db.zpages_settle().unwrap();
     m.check(&db, "partitions only, after the merge");
-    held(&db, budget);
+    held(&db, budget_held);
 
     // And the YCSB shape once more on the merged store.
     for k in (660..700).step_by(3) {
@@ -6500,7 +6679,7 @@ fn overlay_model_z(
     pass(&mut db);
     assert_eq!(db.levels().1, 0);
     m.check(&db, "live inserts past the end, after the merge");
-    held(&db, budget);
+    held(&db, budget_held);
     if upkeep != supdb::Upkeep::Inline {
         assert!(
             db.upkeep_counts()[0] > 0,
@@ -6522,7 +6701,9 @@ fn overlay_model_z(
             "the scans went through the form files: {c:?}"
         );
     }
+    let counts = (db.blocks_built(), db.cache_bindings());
     db.close().unwrap();
+    counts
 }
 
 /// What a reader handle on another thread asks of the store, and what it
@@ -10743,6 +10924,11 @@ fn a_replacing_write_patches_a_copy_in_place() {
         scan_block_cache: true,
         scan_cache_ahead: false,
         forms_from_reader_scans: 0,
+        // The bytes compared below are the forms' contents. The store's
+        // own budget counts their buffers' capacity, and a copy the claimed
+        // handle shares is cloned at its first patch to buffers of exactly
+        // its contents, so its capacity falls where nothing grew.
+        scan_cache_auto: false,
         // The commit's own fill, which this is about: on the thread, which
         // commit a pass files is the thread's timing, and a count read
         // before the pass began counts a table nothing has been filed into.
