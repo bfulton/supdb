@@ -31,8 +31,12 @@ The suite has to be fair before any of its numbers are quoted.
   and the first read, for every arm. Done when it runs in the suite and
   banks a row. An accepted loss against LMDB; the point is to measure it.
 - [ ] **Rows past memory.** The `full` ladder to at least 1.5x the machine's
-  memory, as `bench/DESIGN.md` specifies; nothing is banked past 3M keys.
-  In progress. The supdb README already says reads "fall off a cliff" there.
+  memory, as `bench/DESIGN.md` specifies, is banked to 3M keys. The bounded
+  scale (`--scale ooc`) is banked through 10M keys under 1.5 GiB, where
+  LMDB's store fits the bound and supdb's raw form does not, and supdb
+  trails every read cell there while leading the writes. Its roster runs
+  the defaults, and the compact form the controller builds out of core
+  (`ZPages::Auto`) is off by default, so no banked row measures it yet.
 - [ ] **Match the checksum work, or state it.** RocksDB reads with
   `verify_checksums(false)`, under which it verifies no data block it
   reads, from the file or into its cache. supdb verifies a segment's key
