@@ -786,6 +786,223 @@ fn an_upkeep_pass_that_pins_a_landed_table_gives_its_forms_up() {
     assert!(!db.upkeep_outran());
 }
 
+/// A burst's batch lent to the upkeep thread while reads are around is
+/// filed by the thread at once (`Options::upkeep_files_bursts`), and not
+/// left to the first scan after it as the backlog bound would leave it: the
+/// bound is set past the burst here, so the bound alone would file nothing,
+/// and with the option off nothing is filed until the scan. A mix's commits
+/// of a hundred, as many of them, are no burst under either, since the
+/// measure is the commit's own size and not the sum lent. Both halves run,
+/// and the scans after each read every key as the model has it.
+#[test]
+fn a_burst_lent_to_the_upkeep_thread_is_filed_before_the_first_scan() {
+    let run = |name: &str, files_bursts: bool| {
+        let d = dir(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                upkeep: supdb::Upkeep::Background(1),
+                upkeep_files_bursts: files_bursts,
+                // The bound unreachable by the burst below: 50% of 20,000.
+                forms_settle_backlog_pct: 50,
+                partition_bytes: Some(256 << 10),
+                seal_max_pct: 0,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let keys = 20_000u32;
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        let mut want: HashMap<u32, String> = HashMap::new();
+        for k in 0..keys {
+            db.append(&key(k), b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        assert!(db.levels().0 > 0, "partitions for the forms to hang on");
+        let check = |db: &Reader, want: &HashMap<u32, String>, when: &str| {
+            let mut seen = 0u32;
+            db.scan(
+                &key(0),
+                keys as usize,
+                kv(&mut |k, v| {
+                    let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                    let expect = want.get(&kn).map_or("0", |s| s.as_str());
+                    assert_eq!(std::str::from_utf8(v).unwrap(), expect, "key {kn} {when}");
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, keys, "every key {when}");
+        };
+        // Reads around: a scan over the store, and the forms it leaves.
+        check(&db, &want, "before the burst");
+        // The first commit after a scan files its batch whatever the bound
+        // (the blocks touched since the scan are published by the first
+        // commit a scan precedes), so one write spends that before the
+        // burst and the burst meets the bound alone.
+        db.put(&key(0), b"w");
+        want.insert(0, "w".to_string());
+        db.commit().unwrap();
+        db.settle().unwrap();
+        let settled = |db: &mut Db| db.settle_density()[1];
+        let before = settled(&mut db);
+        // The burst: three batches of a thousand, each past the wake and
+        // all of them under the bound.
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        for round in 0..3u32 {
+            for _ in 0..1000 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % keys as u64) as u32;
+                db.put(&key(k), format!("b{round}").as_bytes());
+                want.insert(k, format!("b{round}"));
+            }
+            db.commit().unwrap();
+        }
+        // The thread's passes joined and the upkeep home, nothing of the
+        // backlog settled by this call.
+        db.settle().unwrap();
+        let by_thread = settled(&mut db) - before;
+        check(&db, &want, "after the burst");
+        let by_scan = settled(&mut db) - before - by_thread;
+        let h = db.reader().unwrap();
+        check(&h, &want, "through a handle after the burst");
+        // A mix's commits: the scan's term spent as above, then five
+        // commits of a hundred, lent one after another and never a burst.
+        db.put(&key(1), b"w");
+        want.insert(1, "w".to_string());
+        db.commit().unwrap();
+        db.settle().unwrap();
+        let before = settled(&mut db);
+        for round in 0..5u32 {
+            for _ in 0..100 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % keys as u64) as u32;
+                db.put(&key(k), format!("m{round}").as_bytes());
+                want.insert(k, format!("m{round}"));
+            }
+            db.commit().unwrap();
+        }
+        db.settle().unwrap();
+        let small_by_thread = settled(&mut db) - before;
+        check(&db, &want, "after the small commits");
+        (by_thread, by_scan, small_by_thread)
+    };
+    // A settle counts a key once, so three thousand writes drawn at random
+    // from twenty thousand keys are two to three hundred short of three
+    // thousand, and fewer settled in one than in three.
+    let (thread_on, scan_on, small_on) = run("burst-filed-on", true);
+    assert!(
+        thread_on > 2_500 && scan_on == 0,
+        "the thread filed the burst before the scan: thread {thread_on}, scan {scan_on}"
+    );
+    let (thread_off, scan_off, small_off) = run("burst-filed-off", false);
+    assert!(
+        thread_off == 0 && scan_off > 2_500,
+        "under the bound alone the first scan files them: thread {thread_off}, scan {scan_off}"
+    );
+    assert_eq!(
+        (small_on, small_off),
+        (0, 0),
+        "five commits of a hundred are a mix's, filed by the thread under neither"
+    );
+}
+
+/// A pass the writer wants its upkeep back from gives it back at the pass's
+/// next step (`Options::upkeep_yields`), the rest of the commit's writes the
+/// writer's own to file at its look. The thread's pass is held inside until
+/// a burst of sixty thousand writes is lent and the pass has begun, released
+/// as the scan asks for the upkeep, and the scan reads every key as written:
+/// with the yield the pass is cut, and without it -- the default -- the scan
+/// waits the whole pass out and no pass is cut.
+#[test]
+fn a_pass_the_writer_wants_its_upkeep_back_from_yields_at_its_next_step() {
+    let run = |name: &str, yields: bool| {
+        let d = dir(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                upkeep: supdb::Upkeep::Background(1),
+                upkeep_yields: yields,
+                partition_bytes: Some(256 << 10),
+                seal_max_pct: 0,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let keys = 100_000u32;
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        let mut want: HashMap<u32, &str> = HashMap::new();
+        for k in 0..keys {
+            db.append(&key(k), b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        assert!(db.levels().0 > 0, "partitions for the forms to hang on");
+        let check = |db: &Reader, want: &HashMap<u32, &str>, when: &str| {
+            let mut seen = 0u32;
+            db.scan(
+                &key(0),
+                keys as usize,
+                kv(&mut |k, v| {
+                    let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                    let expect = want.get(&kn).copied().unwrap_or("0");
+                    assert_eq!(std::str::from_utf8(v).unwrap(), expect, "key {kn} {when}");
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, keys, "every key {when}");
+        };
+        // Reads around, and the forms a scan leaves.
+        check(&db, &want, "before the burst");
+        // The thread's next pass holds inside, pinned, until released.
+        db.hold_upkeep_pinned(true);
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..60_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = (x % keys as u64) as u32;
+            db.put(&key(k), b"b");
+            want.insert(k, "b");
+        }
+        db.commit().unwrap();
+        let t = std::time::Instant::now();
+        while !db.upkeep_holding() {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(20),
+                "the pass began"
+            );
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+        // Released as the scan asks for the upkeep: the pass runs on into
+        // the burst's sixty thousand writes with the writer wanting it.
+        db.hold_upkeep_pinned(false);
+        check(&db, &want, "after the burst");
+        let c = db.upkeep_counts();
+        let h = db.reader().unwrap();
+        check(&h, &want, "through a handle after the burst");
+        // Passes cut short, and the microseconds the writer waited.
+        (c[8], c[3])
+    };
+    let (cut_on, wait_on) = run("pass-yield-on", true);
+    let (cut_off, wait_off) = run("pass-yield-off", false);
+    eprintln!("yield: cut {cut_on} waited {wait_on} us; whole: cut {cut_off} waited {wait_off} us");
+    assert!(
+        cut_on >= 1,
+        "the pass gave the upkeep back at a step: cut {cut_on}, waited {wait_on} us"
+    );
+    assert_eq!(
+        cut_off, 0,
+        "without the yield no pass is cut: waited {wait_off} us"
+    );
+}
+
 /// The probe merge stays behind `cursor_merge` as the comparison arm -- and
 /// a path only one arm exercises is a path nothing tests.
 #[test]

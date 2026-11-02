@@ -3443,6 +3443,49 @@ one-millisecond fallback for a stopped writer runs the pass and the due
 rule skips it. The option's own entry says the bound decides who files
 a burst's tail; the first read after a burst is who.
 
+The thread is who now (`Options::upkeep_files_bursts`). The bound was
+drawn for the mixes, whose commits are a hundred operations with reads
+between them, and the thread applied it to a burst's batches of a
+thousand: under a bound at three million keys, two percent of the store
+is sixty thousand writes, the whole one-percent burst and the tail of the
+ten-percent one, and with the lag pass divided by thirty the first scan's
+settle was 14 of the pass's 26 ms at one percent and 50 of 69 at ten,
+the thread lent every batch and filing none -- thirty passes, 2.7 ms --
+and the cells at a quarter of LMDB's. A pass lent a commit of
+`UPKEEP_WAKE_WRITES` writes or more since the thread was last caught up
+settles what it was lent whatever the bound says, by the commit's own
+size: the sum lent would do, and three of a mix's commits unfiled cross
+it. In core the thread had been filing most of a burst anyway, the bound
+being two batches at a hundred thousand keys and six at three hundred
+thousand, and the pairing reads so (`supdb-deferbursts` is the arm that
+waits, twelve pairs a sitting, both orders): level at a hundred thousand
+keys, with the thread's passes and keys the same in both arms; at three
+hundred thousand the lag scans at one, ten and all of the store 1.28x
+and 1.31x, 1.37x and 1.19x, 1.13x and 1.10x, the bursts within noise, the
+mixes level, and the thread 1.1x the passes and blocks it was.
+Under the bound at three million keys, three pairs in each order with the
+pass divided by thirty, the thread filing its bursts read two shapes: the
+pass after the ten-percent burst at 8-16 ms where the thread had finished
+its last pass before the scans came and 30-85 where the first scan waited
+for a pass in flight, against 25-50 for the arm that waits for the bound,
+whose first scan settles the residue itself; the one-percent pass 12-28
+against 25-35. One sitting read the option 1.9x and 6.4x on the two
+points' scans and the other 0.93x and 0.87x, which is the thread's phase
+at the burst's end and not the option. A pass settles a batch and then
+builds a form for every block the burst dirtied, 30-55 ms a pass here,
+and the residue the first scan meets is anything from nothing to a pass.
+`Options::upkeep_yields` has the pass give the upkeep back at its next
+step when the writer asks, so that a reader waits for a step and not a
+pass, and against the pass waited out it read the one-percent point
+1.15x and 1.38x and the ten-percent point 0.62x and 0.78x, the two points'
+bursts and weighted passes summed 8-10% worse in both orders: the scan
+then settles a pass's worth of residue itself where the thread had
+finished it with the blocks built. So the default waits, and the yield is
+the arm `supdb-passyield`. What the divided pass weights thirty times is
+the first scan; an undivided pass over the same store reads the eager
+builds as forms its scans find built, and the quick row's lag points in
+core read 1.3-2.6x of LMDB with the same engine.
+
 The third is the copy's own search. The partition's seek has found the
 cursor's rank, and the walk then searched the copy's entries for the
 cursor again, six dependent misses into two buffers the prefetch above

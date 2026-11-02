@@ -2967,6 +2967,65 @@ operation runs and from a thread that touches nothing of the writer's:
 a census taken between batches took the upkeep home, which ended every
 pass, and that run survived where the one beside it was killed.
 
+**A bound drawn for one regime that held the other, and a sum read
+where a size was meant.** The settle's backlog bound
+(`forms_settle_backlog_pct`, two percent of the store's keys) was drawn
+for the mixes, whose commits are a hundred operations with reads between
+them, and the upkeep thread applied it to a burst's batches of a thousand
+as well: lent every batch, it filed the first, by the term that files the
+first commit after a scan, and then nothing until the backlog crossed the
+bound, and whatever was under the bound when the burst ended -- the whole
+burst at one percent, sixty thousand writes at ten -- waited for the first
+scan. In core the residue was two or three thousand writes at three
+hundred thousand keys, a couple of milliseconds the rows read as the
+first scan's; under the bound at three million keys, with the pass
+divided by thirty, it was 14 of the pass's 26 ms at one percent and 50
+of 69 at ten, the cells at a quarter of LMDB's, and the thread's own
+counters said so before anything was changed: thirty passes and 2.7 ms
+of filing over a burst of thirty thousand writes. The thread files a
+burst's batch at once now (`Options::upkeep_files_bursts`), and the
+first version measured the batch as the sum lent since the thread last
+filed, which three of a mix's commits unfiled also cross: the first
+pairing read the mixes moving in both directions across its two
+sittings, and the measure is the largest commit lent since the thread
+was last caught up (`UpkeepTo::big`), a quantity a mix never reaches.
+The test holds all three: the burst filed on the thread, deferred to the
+scan without the option, and five commits of a hundred filed by the
+thread under neither. Priced under the bound the filing read two shapes:
+the pass after the ten-percent burst at 8-16 ms where the thread had
+finished and 30-85 where the first scan waited for the pass in flight,
+which with the thread filing every batch covers whatever was lent since
+its last, half the burst at times; the arm that waits settled the same
+writes itself in 20-35, one shape. The writer waits for a pass because
+nothing in a pass asked whether it was wanted: a pass on the thread can
+read and settle the log a step at a time and ask between steps, giving
+the upkeep back marked short with the rest the writer's own
+(`Options::upkeep_yields`), the writer's wait in the test from 40-55 ms
+to 1-2 -- and priced under the bound against the pass waited out it is a
+trade, the one-percent point up and the ten-percent point down in both
+orders and their sum 8-10% worse, since the scan then settles a pass's
+worth of residue itself where the thread had finished it with the blocks
+built, so it is the arm `supdb-passyield` and the default waits. The
+first version of it cut the settle itself at a step and left the cut's
+writes pending across the snapshot's refresh, which carried the snapshot
+past their keys, so the next settle filed them as new into blocks the
+snapshot held them in already and three tests read a key twice: the rule
+already written at that refresh -- settle before the snapshot moves --
+holds for every step, so a step is a read and its settle, never a read
+alone. What is left at the bounded rung is the thread's phase: a pass
+settles a batch and then builds a form for every block the burst
+dirtied, thirty to fifty milliseconds a pass at three million keys, so
+the residue the first scan meets is anything from nothing to a pass,
+and the divided pass of the out-of-core rows weights that first scan
+thirty times; the undivided pass reads the eager builds as what they
+are, forms the scans find built. The rule: a bound drawn for one regime's
+operations is applied by the size of the operation in front of it, read
+off that operation and never off a sum that other regimes grow too;
+work a thread was lent and did not do is counted, per pass, at the
+reader that did it, before a pass is read as the reader's own; and a
+wait for a worker's step is a wait for the whole step until the worker
+asks, at a place where stopping leaves every invariant standing.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

@@ -592,6 +592,13 @@ pub struct Supdb {
     /// The upkeep thread files on however far the writes have outrun it,
     /// `Options::upkeep_abandons` off. `supdb-noabandon`.
     noabandon: bool,
+    /// The upkeep thread waits for the backlog bound before it files a
+    /// burst's batch, `Options::upkeep_files_bursts` off.
+    /// `supdb-deferbursts`.
+    deferbursts: bool,
+    /// A pass on the upkeep thread gives the writer its upkeep back at
+    /// its next step, `Options::upkeep_yields` on. `supdb-passyield`.
+    passyield: bool,
     /// No budget of the cache's own, `Options::scan_cache_auto` off.
     /// `supdb-cachenoauto`.
     cachenoauto: bool,
@@ -1254,6 +1261,13 @@ struct Policy {
     /// The upkeep thread files on however far the writes have outrun it,
     /// `Options::upkeep_abandons` off. `supdb-noabandon`.
     noabandon: bool,
+    /// The upkeep thread waits for the backlog bound before it files a
+    /// burst's batch, `Options::upkeep_files_bursts` off.
+    /// `supdb-deferbursts`.
+    deferbursts: bool,
+    /// A pass on the upkeep thread gives the writer its upkeep back at
+    /// its next step, `Options::upkeep_yields` on. `supdb-passyield`.
+    passyield: bool,
     /// No budget of the cache's own, `Options::scan_cache_auto` off.
     /// `supdb-cachenoauto`.
     cachenoauto: bool,
@@ -1680,6 +1694,8 @@ impl Default for Policy {
             latesync: false,
             installreads: false,
             noabandon: false,
+            deferbursts: false,
+            passyield: false,
             cachenoauto: false,
             norecycle: false,
             keysarena: false,
@@ -4109,6 +4125,29 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with the upkeep thread waiting for the backlog bound before
+    /// it files a burst's batch.
+    pub fn create_deferbursts(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                deferbursts: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose upkeep passes yield to the writer at their next step.
+    pub fn create_passyield(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                passyield: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with no budget of the cache's own.
     pub fn create_cachenoauto(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
@@ -5528,6 +5567,8 @@ impl Supdb {
             latesync,
             installreads,
             noabandon,
+            deferbursts,
+            passyield,
             cachenoauto,
             norecycle,
             keysarena,
@@ -5800,6 +5841,8 @@ impl Supdb {
             close_presync: !latesync,
             ahead_sends_bounds: !installreads,
             upkeep_abandons: !noabandon,
+            upkeep_files_bursts: !deferbursts,
+            upkeep_yields: passyield,
             scan_cache_auto: !cachenoauto,
             prefault: populate,
             direct_put_one: !recordsteps,
@@ -6043,6 +6086,8 @@ impl Supdb {
             latesync,
             installreads,
             noabandon,
+            deferbursts,
+            passyield,
             cachenoauto,
             norecycle,
             keysarena,
@@ -6796,6 +6841,12 @@ impl Engine for Supdb {
         }
         if self.noabandon {
             return "supdb-noabandon";
+        }
+        if self.deferbursts {
+            return "supdb-deferbursts";
+        }
+        if self.passyield {
+            return "supdb-passyield";
         }
         if self.cachenoauto {
             return "supdb-cachenoauto";
@@ -8025,6 +8076,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-latesync"
         | "supdb-installreads"
         | "supdb-noabandon"
+        | "supdb-deferbursts"
+        | "supdb-passyield"
         | "supdb-cachenoauto"
         | "supdb-norecycle"
         | "supdb-keysarena"
@@ -8463,6 +8516,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-latesync" => Box::new(Supdb::create_latesync(dir)?),
         "supdb-installreads" => Box::new(Supdb::create_installreads(dir)?),
         "supdb-noabandon" => Box::new(Supdb::create_noabandon(dir)?),
+        "supdb-deferbursts" => Box::new(Supdb::create_deferbursts(dir)?),
+        "supdb-passyield" => Box::new(Supdb::create_passyield(dir)?),
         "supdb-cachenoauto" => Box::new(Supdb::create_cachenoauto(dir)?),
         "supdb-ingestlatesync" => Box::new(Supdb::create_ingest_latesync(dir)?),
         "supdb-norecycle" => Box::new(Supdb::create_norecycle(dir)?),

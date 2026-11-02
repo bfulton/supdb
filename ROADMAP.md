@@ -37,6 +37,11 @@ The suite has to be fair before any of its numbers are quoted.
   trails every read cell there while leading the writes. Its roster runs
   the defaults, and the compact form the controller builds out of core
   (`ZPages::Auto`) is off by default, so no banked row measures it yet.
+  The lag points' first scan there paid for the burst the upkeep thread
+  had been lent and not filed; the thread files a burst's batches now
+  (`Options::upkeep_files_bursts`), and what the divided pass still
+  weights is the thread's phase at the burst's end and the full
+  rewrite's pieces (`docs/engine.md`, the pass after a burst).
 - [ ] **Match the checksum work, or state it.** RocksDB reads with
   `verify_checksums(false)`, under which it verifies no data block it
   reads, from the file or into its cache. supdb verifies a segment's key

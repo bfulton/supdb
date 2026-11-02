@@ -2531,6 +2531,52 @@ pub struct Options {
     /// drops the tables when it falls behind. `supdb-noabandon` is the arm
     /// that files on.
     pub upkeep_abandons: bool,
+    /// Whether the upkeep thread files a burst's batch at once: a pass
+    /// lent a commit of at least `UPKEEP_WAKE_WRITES` writes since the
+    /// thread was last caught up, with reads around, settles what it was
+    /// lent whatever the backlog bound (`forms_settle_backlog_pct`) says.
+    /// The bound is for the mixes, whose commits are a hundred operations
+    /// with reads between them -- the commit's own size tells them apart,
+    /// never the sum lent, which three of a mix's commits cross -- and
+    /// for a commit that files on the writer's own path; a burst is
+    /// batches of a thousand writes over keys the writer never touches
+    /// again, lent to a thread that otherwise waits for two percent of
+    /// the store to pile up and leaves the rest to the first scan. At
+    /// three million keys under a bound the lag sweep's one-percent point
+    /// read a 1000-scan pass of 26 ms with 14 of it the first scan's
+    /// settle of the burst's thirty thousand keys, and the ten-percent
+    /// point 50 of 69, with the thread lent every batch and filing none:
+    /// 0.35x and 0.27x of LMDB, where the drained point reads 1.8x. Off:
+    /// the thread waits for the bound, as a commit that files itself
+    /// does. `supdb-deferbursts` is the arm that waits.
+    pub upkeep_files_bursts: bool,
+    /// Whether a pass on the upkeep thread gives the writer its upkeep
+    /// back at the pass's next step once the writer wants it: the log is
+    /// read and settled `UPKEEP_YIELD_ENTRIES` entries at a time and the
+    /// frozen tables' carried tails `UPKEEP_YIELD_WRITES` writes at a
+    /// time, the fill stops at its next sixty-four blocks, the pass is
+    /// marked short -- nothing of it published, the commit re-posted --
+    /// and the rest is the writer's own to file at its look, as a pass
+    /// bounded by `upkeep_pass_pct` leaves it. The writer takes
+    /// its upkeep back at every scan and at most of its publishes, waiting
+    /// for the pass in flight, and with the thread filing a burst's
+    /// batches (`upkeep_files_bursts`) that pass covers whatever was lent
+    /// since the thread's last: at three million keys under a bound the
+    /// first scan after the ten-percent burst waited 30-65 ms for it in
+    /// half the reps and 3-6 in the rest, a pass of two shapes, where the
+    /// arm that waits for the bound settled the same writes itself in
+    /// 20-35. The yield bounds that wait -- in its test the writer's wait
+    /// for a pass over sixty thousand writes went from 40-55 ms to 1-2 --
+    /// and moves the rest of the pass's work to the scan, which under the
+    /// bound read as a trade and not a win: against the pass waited out,
+    /// three pairs in each order at three million keys, the lag point at
+    /// one percent 1.15x and 1.38x, the point at ten 0.62x and 0.78x, the
+    /// two points' bursts and weighted passes summed 8-10% worse both
+    /// times, since the scan then settles a pass's worth of residue
+    /// itself where the thread, left to finish, had it built as well; in
+    /// core level, two passes cut a rep. Off, the default: the writer
+    /// waits a pass out. `supdb-passyield` is the arm that yields.
+    pub upkeep_yields: bool,
     /// Whether a fill on the upkeep thread leaves the rest of its
     /// conversions of dense forms the moment a newer commit is posted or
     /// the writer wants the upkeep back, so that through a burst the
@@ -3350,6 +3396,8 @@ impl Default for Options {
             ahead_sends_bounds: true,
             upkeep_keep_bytes: 0,
             upkeep_abandons: true,
+            upkeep_files_bursts: true,
+            upkeep_yields: false,
             forms_convert_yield: true,
             forms_convert_behind: usize::MAX,
             convert_from_form: true,
@@ -14116,6 +14164,11 @@ struct FormsState {
     /// yield measures how far the writer has gone on
     /// (`Options::forms_convert_behind`).
     pass_lent: std::cell::Cell<u64>,
+    /// The largest commit lent to the pass in flight on the upkeep thread
+    /// since the thread was last caught up (`UpkeepTo::big`), for
+    /// `settle_due` to tell a burst's batch from a mix's
+    /// (`Options::upkeep_files_bursts`); zero off the thread.
+    pass_batch: std::cell::Cell<u64>,
     log_short: std::cell::Cell<bool>,
     /// What the lazy snapshot did, for a measurement and for the test
     /// that must know the path was taken: scans that finished without a
@@ -14248,6 +14301,7 @@ impl FormsState {
             lazy_cuts: std::cell::Cell::new([0; 2]),
             read_cap: std::cell::Cell::new(0),
             pass_lent: std::cell::Cell::new(0),
+            pass_batch: std::cell::Cell::new(0),
             log_short: std::cell::Cell::new(false),
             lazy_scans: std::cell::Cell::new([0; 2]),
             settle_density: std::cell::Cell::new([0; 4]),
@@ -14402,6 +14456,8 @@ pub struct Db {
     /// `Options::upkeep_lag_pct`.
     upkeep_lent: u64,
     upkeep_floor: u64,
+    /// The largest commit lent since then, for `UpkeepTo::big`.
+    upkeep_big: u64,
     /// What the commit in progress does with its batch, decided when it
     /// hands the upkeep over: see `Hand`.
     upkeep_hand: Hand,
@@ -18544,6 +18600,13 @@ impl Reader {
             n = seen + cap;
             self.fs().log_short.set(true);
         }
+        // And in steps of `UPKEEP_YIELD_ENTRIES` where the pass yields
+        // (`Options::upkeep_yields`): the caller settles each step before
+        // it reads the next, and asks between them whether the writer
+        // wants its upkeep back. A step is not a short pass.
+        if self.understudy && self.opts.upkeep_yields {
+            n = n.min(seen.saturating_add(UPKEEP_YIELD_ENTRIES));
+        }
         if seen >= n {
             return moved;
         }
@@ -19131,6 +19194,15 @@ impl Reader {
     /// while every table a landing retires waits behind its pin. Only on
     /// the thread, since the writer's own look drops what was not kept
     /// for it and its operations pin for one operation.
+    /// Whether the writer wants its upkeep back while this pass holds it
+    /// (`Options::upkeep_yields`): asked at a pass's steps, so that the
+    /// writer waits for a step and not a pass. Off the thread, never.
+    fn upkeep_wanted(&self) -> bool {
+        self.understudy
+            && self.opts.upkeep_yields
+            && self.shared.upkeep.state.load(AtomicOrdering::Acquire) & LEND_WANT != 0
+    }
+
     fn abandon_asked(&self) -> bool {
         if !self.understudy {
             return false;
@@ -20665,6 +20737,13 @@ impl Reader {
             return Some(false);
         }
         let quiet = self.opts.seal_idle && self.mode_note.get().quiet && far;
+        // A burst's batch on the upkeep thread is filed at once
+        // (`Options::upkeep_files_bursts`): the bound below is for a mix's
+        // small commits and for a commit that files on its own path.
+        let burst = self.understudy
+            && self.opts.upkeep_files_bursts
+            && !far
+            && self.fs().pass_batch.get() >= UPKEEP_WAKE_WRITES as u64;
         let recent = !quiet
             && (self.opts.forms_settle_recent_pct == 0
                 || writes - self.fs().writes_at_scan.get()
@@ -20695,6 +20774,7 @@ impl Reader {
             self.force_due.get()
                 || scans != self.fs().scans_seen.get()
                 || (backlog >= bound && recent)
+                || burst
                 || posted
                 || publish_due
                 || (froze && !far),
@@ -20712,7 +20792,7 @@ impl Reader {
             .convert_dense
             .set(self.opts.forms_convert_unread || life != self.fs().convert_life.replace(life));
         let gen = st.gen;
-        let moved = self.sync_log() || self.fs().scan_keys.borrow().is_none();
+        let mut moved = self.sync_log() || self.fs().scan_keys.borrow().is_none();
         // Settle before the snapshot moves, which is the order the scan
         // path takes and the reason it was never wrong. A pending write
         // carries the flag `sync_log` gave it -- created since the
@@ -20728,6 +20808,32 @@ impl Reader {
         // maintained the forms by default, so nothing reached this line.
         if moved {
             self.settle_pending()?;
+        }
+        // On the upkeep thread the read and the settle go in steps
+        // (`Options::upkeep_yields`), each step's writes settled before
+        // the next is read and all of them before the snapshot moves, as
+        // above; between steps the pass asks whether the writer wants its
+        // upkeep back, and gives it back marked short, what it has not
+        // read the writer's own. A first version cut the settle itself
+        // and left writes pending across the refresh below, which filed
+        // them as new into blocks the snapshot held them in already:
+        // three tests read a key twice.
+        while self.understudy
+            && self.opts.upkeep_yields
+            && !self.fs().log_short.get()
+            && !self.abandon_pending()
+        {
+            let more = self.fs().log_seen.get() < self.log_end()
+                || !self.fs().pending_frozen.borrow().is_empty();
+            if !more {
+                break;
+            }
+            if self.upkeep_wanted() {
+                self.fs().log_short.set(true);
+                break;
+            }
+            moved |= self.sync_log();
+            self.settle_pending_more()?;
         }
         if self.abandon_forms() {
             return Ok(());
@@ -20760,7 +20866,15 @@ impl Reader {
         // filled read 1.01x-1.33x. The builder declines a store too
         // small for one, and there the commit fills it, which at ten
         // thousand keys is a few hundred blocks.
-        if self.opts.commit_forms_build && !self.cache_binds() && !self.fs().tables_complete.get() {
+        // A pass cut short -- the read or the settle stopped at a step for
+        // the writer, or bounded by `upkeep_pass_pct` -- fills nothing: the
+        // fill builds from the sources as they stand, and belongs after
+        // the settle that brings the tables to them.
+        if self.opts.commit_forms_build
+            && !self.cache_binds()
+            && !self.fs().tables_complete.get()
+            && !self.fs().log_short.get()
+        {
             if self.opts.scan_cache_ahead && self.fs().ahead.borrow().is_none() {
                 self.start_ahead();
             }
@@ -20780,7 +20894,7 @@ impl Reader {
                 if self.abandon_forms() {
                     return Ok(());
                 }
-                if !self.cache_binds() {
+                if !self.cache_binds() && !self.fs().log_short.get() {
                     self.fs().tables_complete.set(true);
                 }
             }
@@ -20792,8 +20906,15 @@ impl Reader {
         // have committed past it meanwhile, and forms stamped with a
         // later position would be taken by a reader there without the
         // writes between.
+        // A short pass publishes nothing: its forms are current to a
+        // position short of the commit's, which no reader is at, and the
+        // blocks stay dirty for the whole pass or the writer's look that
+        // follows, which publishes them at its own.
         let at = self.mem().committed_log().min(self.log_bound.get());
-        if self.publish_dirty(false, at) && !self.forms_position_held() {
+        if !self.fs().log_short.get()
+            && self.publish_dirty(false, at)
+            && !self.forms_position_held()
+        {
             st.forms_complete
                 .store(self.fs().tables_complete.get(), AtomicOrdering::Release);
             st.forms_at.store(at, AtomicOrdering::Release);
@@ -20816,7 +20937,7 @@ impl Reader {
         let ctx = self.build_ctx();
         ctx.rank_pieces()?;
         for &(pi, b) in blocks {
-            if self.abandon_asked() {
+            if self.abandon_asked() || self.upkeep_wanted() {
                 return Ok(());
             }
             let (pi, b) = (pi as usize, b as usize);
@@ -20960,6 +21081,10 @@ impl Reader {
             if self.abandon_asked() {
                 return Ok(());
             }
+            if self.upkeep_wanted() {
+                self.fs().log_short.set(true);
+                return Ok(());
+            }
             let seg = &self.segs()[pi];
             let tables = self.fs().tables.borrow();
             let mut held = tables[pi].borrow_mut();
@@ -20980,8 +21105,17 @@ impl Reader {
                 ..self.build_ctx()
             };
             for b in 0..table.slots.len() {
-                if b % 64 == 63 && self.abandon_asked() {
-                    return Ok(());
+                if b % 64 == 63 {
+                    if self.abandon_asked() {
+                        return Ok(());
+                    }
+                    // The writer wants its upkeep back: the fill stops
+                    // here, the table not called complete, and the pass
+                    // is short (`Options::upkeep_yields`).
+                    if self.upkeep_wanted() {
+                        self.fs().log_short.set(true);
+                        return Ok(());
+                    }
                 }
                 // The store's own budget reached: it binds, and what the
                 // fill has not built is left to the scans that want it.
@@ -21328,6 +21462,13 @@ impl Reader {
     /// survives the fold.
     fn settle_pending(&self) -> Result<()> {
         self.fs().settle_blocks.borrow_mut().clear();
+        self.settle_pending_more()
+    }
+
+    /// `settle_pending` for a later step of one pass (`Options::upkeep_yields`):
+    /// the blocks it files into join the first step's list rather than
+    /// replace it.
+    fn settle_pending_more(&self) -> Result<()> {
         // The writes read from tables frozen since, first: each through
         // the table it was read from, which a freeze or a landing has
         // taken out of the live slot but not out of the sources a patch
@@ -21335,9 +21476,17 @@ impl Reader {
         // At most `read_cap` of them on a pass of the upkeep thread, the
         // rest kept ahead of whatever the next look carries, and the pass
         // marked short: a pass that settled a frozen table's whole tail
-        // ran as long as the tail, and a reader waited it out.
+        // ran as long as the tail, and a reader waited it out. Where the
+        // pass yields, a step of them at a time, the rest kept the same
+        // way for the pass's next step or the writer's look.
         let cap = self.fs().read_cap.get();
-        let mut budget = if cap > 0 { cap } else { usize::MAX };
+        let mut budget = if cap > 0 {
+            cap
+        } else if self.understudy && self.opts.upkeep_yields {
+            UPKEEP_YIELD_WRITES
+        } else {
+            usize::MAX
+        };
         let mut carried = std::mem::take(&mut *self.fs().pending_frozen.borrow_mut());
         let mut rest: PendingFrozen = Vec::new();
         for (table, mut writes) in carried.drain(..) {
@@ -21361,7 +21510,9 @@ impl Reader {
             }
         }
         if !rest.is_empty() {
-            self.fs().log_short.set(true);
+            if cap > 0 {
+                self.fs().log_short.set(true);
+            }
             let mut pf = self.fs().pending_frozen.borrow_mut();
             rest.append(&mut pf);
             *pf = rest;
@@ -24592,6 +24743,7 @@ impl Db {
             seal_since_scan: 0,
             upkeep_lent: 0,
             upkeep_floor: 0,
+            upkeep_big: 0,
             upkeep_hand: Hand::Lend,
             unsynced: 0,
             lag_writes: usize::MAX,
@@ -25101,6 +25253,7 @@ impl Db {
             seal_since_scan: 0,
             upkeep_lent: 0,
             upkeep_floor: 0,
+            upkeep_big: 0,
             upkeep_hand: Hand::Lend,
             unsynced: 0,
             lag_writes: usize::MAX,
@@ -29617,6 +29770,13 @@ struct UpkeepTo {
     /// The most writes a pass files before it re-posts the rest, from
     /// `Options::upkeep_pass_pct`; zero files everything.
     cap: u64,
+    /// The writes of the largest commit lent since the thread was last
+    /// seen caught up, this one included: what tells a burst's batch,
+    /// a commit of a thousand writes, from a mix's hundred, for
+    /// `Options::upkeep_files_bursts`. The sum of the commits lent would
+    /// not, since three of a mix's commits unfiled sum past any burst's
+    /// one.
+    big: u64,
     /// `State::lives` at the commit: the live table the three bounds are
     /// of. A pass runs against whatever state holds that table, since a
     /// landing from the segment thread moves the generation and not the
@@ -29734,6 +29894,7 @@ struct SeqTo {
     lives: AtomicU64,
     batch: AtomicU64,
     cap: AtomicU64,
+    big: AtomicU64,
 }
 
 impl SeqTo {
@@ -29751,6 +29912,7 @@ impl SeqTo {
         self.lives.store(to.lives, AtomicOrdering::Relaxed);
         self.batch.store(to.batch, AtomicOrdering::Relaxed);
         self.cap.store(to.cap, AtomicOrdering::Relaxed);
+        self.big.store(to.big, AtomicOrdering::Relaxed);
         self.seq.store(n + 2, AtomicOrdering::Release);
     }
 
@@ -29769,6 +29931,7 @@ impl SeqTo {
                     lives: self.lives.load(AtomicOrdering::Relaxed),
                     batch: self.batch.load(AtomicOrdering::Relaxed),
                     cap: self.cap.load(AtomicOrdering::Relaxed),
+                    big: self.big.load(AtomicOrdering::Relaxed),
                 };
                 std::sync::atomic::fence(AtomicOrdering::Acquire);
                 if self.seq.load(AtomicOrdering::Relaxed) == n {
@@ -29801,6 +29964,13 @@ const UPKEEP_POLL_MAX: std::time::Duration = std::time::Duration::from_millis(20
 /// `Options::upkeep_alert_poll_us`.
 const UPKEEP_ALERT: std::time::Duration = std::time::Duration::from_millis(100);
 const UPKEEP_WAKE_WRITES: usize = 256;
+/// The steps a pass on the upkeep thread reads and settles in where it
+/// yields (`Options::upkeep_yields`): entries of the live log a step, and
+/// writes of the frozen tables' carried tails a step. A step is what a
+/// writer waits for, read at about a tenth of a microsecond an entry and
+/// settled at half to one and a half a write: a few milliseconds here.
+const UPKEEP_YIELD_ENTRIES: usize = 2048;
+const UPKEEP_YIELD_WRITES: usize = 2048;
 
 /// How long the upkeep thread lets a commit short of
 /// `Options::upkeep_batch_pct` wait before it begins the pass anyway:
@@ -30184,6 +30354,7 @@ impl Reader {
             self.force_due.set(to.force);
             self.fs().read_cap.set(to.cap as usize);
             self.fs().pass_lent.set(to.lent);
+            self.fs().pass_batch.set(to.big);
             self.fs().log_short.set(false);
             // Asked to give the forms up before the pass began: nothing of
             // it is filed, and `settle_due` finds the store outrun.
@@ -30196,6 +30367,7 @@ impl Reader {
             self.abandon_forms();
             whole = !self.fs().log_short.replace(false);
             self.fs().read_cap.set(0);
+            self.fs().pass_batch.set(0);
             self.sweep_retired_forms();
             done
         } else {
@@ -30395,8 +30567,10 @@ impl Db {
         // batch where it is caught up now.
         if self.shared.upkeep.caught_up() {
             self.upkeep_floor = self.upkeep_lent;
+            self.upkeep_big = 0;
         }
         self.upkeep_lent += batch as u64;
+        self.upkeep_big = self.upkeep_big.max(batch as u64);
         // The bound and the batch, shares of the store's keys.
         let lag = (keys / 100 * self.opts.upkeep_lag_pct).max(1) as u64;
         let batch_of = if self.opts.upkeep_batch_pct > 0 {
@@ -30470,6 +30644,7 @@ impl Db {
             lives,
             batch: batch_of,
             cap: cap_of,
+            big: self.upkeep_big,
         };
         match self.r.lend_fs() {
             Some(fs) => self.shared.upkeep.lend(fs, to),
@@ -33361,6 +33536,9 @@ struct Maint {
     /// controller's to win from there, and the builds ahead stop sparing
     /// the raw form's cache (`Options::zpages_land_drop_past`).
     z_land_past: bool,
+    /// What held the builds ahead at the last look, for the trace
+    /// (`z_prebuild_next`).
+    z_land_reason: std::cell::Cell<u8>,
     /// Whether the store's look past that line has swapped the partitions
     /// built ahead under it (`Maint::z_cross`): once a store.
     z_crossed: bool,
@@ -33897,6 +34075,7 @@ impl Maint {
             z_scan_len: 0.0,
             z_past_budget: false,
             z_land_past: false,
+            z_land_reason: std::cell::Cell::new(u8::MAX),
             z_crossed: false,
             z_land_due: false,
             z_ahead_coding: std::collections::HashMap::new(),
@@ -36233,14 +36412,38 @@ impl Maint {
         // Past the line a cold partition is built too, from the device: the
         // controller would build it so after its buy, under the readers.
         let cold_ok = land && self.z_land_past && self.opts.zpages_land_cold_past;
-        if !(self.opts.zpages_prebuild || land)
-            || !self.z_auto
-            || !(self.z_past_budget || (land && self.z_land_due))
-            || self.zsel.counts().installs > 0
-            || self.compacting.is_some()
-            || self.tiering.is_some()
-            || (!land && !self.sealing.is_empty())
-        {
+        // Why no build ahead starts, for the trace: one line a change of
+        // reason, since the question is asked every tick.
+        let held_by: u8 = if !(self.opts.zpages_prebuild || land) || !self.z_auto {
+            1
+        } else if !(self.z_past_budget || (land && self.z_land_due)) {
+            2
+        } else if self.zsel.counts().installs > 0 {
+            3
+        } else if self.compacting.is_some() {
+            4
+        } else if self.tiering.is_some() {
+            5
+        } else if !land && !self.sealing.is_empty() {
+            6
+        } else {
+            0
+        };
+        if self.z_trace && land && self.z_land_reason.replace(held_by) != held_by {
+            eprintln!(
+                "zland t={:.1} held_by {} due {} past_budget {} past_line {} compacting {} tiering {} sealing {} partitions {}",
+                self.z_epoch.elapsed().as_secs_f64(),
+                ["none", "off", "under the line", "installed", "a merge", "a piece merge", "a seal"][held_by as usize],
+                self.z_land_due,
+                self.z_past_budget,
+                self.z_land_past,
+                self.compacting.is_some(),
+                self.tiering.is_some(),
+                self.sealing.len(),
+                self.segs().iter().filter(|s| s.level > 0).count(),
+            );
+        }
+        if held_by != 0 {
             return None;
         }
         let mut due: Vec<&std::sync::Arc<Seg>> = self
