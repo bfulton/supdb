@@ -606,6 +606,10 @@ pub struct Supdb {
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
     norecycle: bool,
+    /// The engine's large blocks from the global allocator, the shape
+    /// before `Options::blocks_mapped`. `supdb-heapblocks`, and
+    /// `supdb-ingestheapblocks` buffered.
+    heapblocks: bool,
     /// A streamed table keeping a copy of every key, the shape before
     /// `Options::direct_keys_in_stream`. `supdb-keysarena`, and
     /// `supdb-ingestkeysarena` buffered.
@@ -1278,6 +1282,10 @@ struct Policy {
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
     norecycle: bool,
+    /// The engine's large blocks from the global allocator, the shape
+    /// before `Options::blocks_mapped`. `supdb-heapblocks`, and
+    /// `supdb-ingestheapblocks` buffered.
+    heapblocks: bool,
     /// A streamed table keeping a copy of every key, the shape before
     /// `Options::direct_keys_in_stream`. `supdb-keysarena`, and
     /// `supdb-ingestkeysarena` buffered.
@@ -1701,6 +1709,7 @@ impl Default for Policy {
             passyield: false,
             cachenoauto: false,
             norecycle: false,
+            heapblocks: false,
             keysarena: false,
             noalert: false,
             ordlog: false,
@@ -4245,6 +4254,31 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with its large blocks from the global allocator, the shape
+    /// before `Options::blocks_mapped`.
+    pub fn create_heapblocks(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                heapblocks: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-heapblocks`.
+    pub fn create_ingest_heapblocks(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                heapblocks: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with a streamed table keeping a copy of every key, the
     /// shape before `Options::direct_keys_in_stream`.
     pub fn create_keysarena(path: &Path) -> Res<Supdb> {
@@ -5638,6 +5672,7 @@ impl Supdb {
             passyield,
             cachenoauto,
             norecycle,
+            heapblocks,
             keysarena,
             noalert,
             ordlog,
@@ -5916,6 +5951,7 @@ impl Supdb {
             direct_stream: !copyvals && !refvals,
             direct_derive_keys: !keycopies,
             direct_recycle: !norecycle,
+            blocks_mapped: !heapblocks,
             direct_keys_in_stream: !keysarena,
             upkeep_alert: !noalert,
             direct_log_range: !ordlog,
@@ -6157,6 +6193,7 @@ impl Supdb {
             passyield,
             cachenoauto,
             norecycle,
+            heapblocks,
             keysarena,
             noalert,
             ordlog,
@@ -6927,6 +6964,13 @@ impl Engine for Supdb {
                 "supdb-norecycle"
             } else {
                 "supdb-ingestnorecycle"
+            };
+        }
+        if self.heapblocks {
+            return if self.partition {
+                "supdb-heapblocks"
+            } else {
+                "supdb-ingestheapblocks"
             };
         }
         if self.keysarena {
@@ -8155,6 +8199,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-passyield"
         | "supdb-cachenoauto"
         | "supdb-norecycle"
+        | "supdb-heapblocks"
         | "supdb-keysarena"
         | "supdb-noalert"
         | "supdb-ordlog"
@@ -8240,6 +8285,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestfillplain"
         | "supdb-ingestlatesync"
         | "supdb-ingestnorecycle"
+        | "supdb-ingestheapblocks"
         | "supdb-ingestkeysarena"
         | "supdb-ingestnoalert"
         | "supdb-ingestordlog"
@@ -8597,6 +8643,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestlatesync" => Box::new(Supdb::create_ingest_latesync(dir)?),
         "supdb-norecycle" => Box::new(Supdb::create_norecycle(dir)?),
         "supdb-ingestnorecycle" => Box::new(Supdb::create_ingest_norecycle(dir)?),
+        "supdb-heapblocks" => Box::new(Supdb::create_heapblocks(dir)?),
+        "supdb-ingestheapblocks" => Box::new(Supdb::create_ingest_heapblocks(dir)?),
         "supdb-keysarena" => Box::new(Supdb::create_keysarena(dir)?),
         "supdb-ingestkeysarena" => Box::new(Supdb::create_ingest_keysarena(dir)?),
         "supdb-noalert" => Box::new(Supdb::create_noalert(dir)?),

@@ -72,6 +72,7 @@ pub mod zlz4;
 // The same form's engine side: the form file mapped, checked and read, the
 // cell a segment holds it in, and the builder. Private: it is the engine's
 // and nothing outside `db` names it.
+mod blocks;
 mod zfile;
 pub use zfile::ZInject;
 
@@ -2578,6 +2579,23 @@ pub struct Options {
     /// core level, two passes cut a rep. Off, the default: the writer
     /// waits a pass out. `supdb-passyield` is the arm that yields.
     pub upkeep_yields: bool,
+    /// Whether the engine's large blocks -- a memtable's arena blocks,
+    /// its entry slabs and its hash index, a scan snapshot's arena
+    /// blocks -- are mapped from the kernel, from `blocks::MAP_FROM`
+    /// bytes, and unmapped at their drop, so what a store frees goes
+    /// back at once. Off, they come from the global allocator, which
+    /// keeps a freed block in its heap for the next allocation of its
+    /// size: glibc raises its mmap threshold to the size of the first
+    /// large chunk it frees, so every arena block after the first stayed
+    /// in the heap when its table dropped, and across the lag sweep at
+    /// ten million keys the process held 150-620 MB beyond its bytes in
+    /// use, page cache the store cannot have under a memory bound and
+    /// memory the compact form's budget subtracts, where glibc told to
+    /// map every allocation of a megabyte or more held 0-135. A mapped
+    /// block's pages are fresh at their first touch, where the heap's
+    /// were touched before. `supdb-heapblocks` is the arm that keeps the
+    /// heap shape.
+    pub blocks_mapped: bool,
     /// Whether a fill on the upkeep thread leaves the rest of its
     /// conversions of dense forms the moment a newer commit is posted or
     /// the writer wants the upkeep back, so that through a burst the
@@ -3246,6 +3264,16 @@ impl Options {
     }
 }
 
+impl Options {
+    /// How a table's blocks are made, for `MemTable::new`.
+    fn block_shape(&self) -> BlockShape {
+        BlockShape {
+            prefault: self.prefault,
+            mapped: self.blocks_mapped,
+        }
+    }
+}
+
 impl Default for Options {
     fn default() -> Options {
         Options {
@@ -3399,6 +3427,7 @@ impl Default for Options {
             upkeep_abandons: true,
             upkeep_files_bursts: true,
             upkeep_yields: false,
+            blocks_mapped: true,
             forms_convert_yield: true,
             forms_convert_behind: usize::MAX,
             convert_from_form: true,
@@ -7688,7 +7717,19 @@ struct CommitMark {
 /// The writer is the store, made single by `&mut Db`; the writer-only
 /// fields are cells it alone touches, and that is the whole of what the
 /// `Sync` below asserts.
+/// How a table's blocks are made: populated ahead of the fill
+/// (`Options::prefault`) and mapped from the kernel (`Options::blocks_mapped`).
+#[derive(Clone, Copy)]
+struct BlockShape {
+    prefault: bool,
+    mapped: bool,
+}
+
 struct MemTable {
+    /// Whether the table's blocks -- the arenas', the slabs', the index's
+    /// -- are mapped from the kernel (`Options::blocks_mapped`); the seal's
+    /// snapshot copy of the table follows it.
+    mapped: bool,
     /// Every entry in the order it was made -- key order, when
     /// `ordered`, since ordered ingest pushes each key above the last and
     /// a lookup there is a binary search, never a probe.
@@ -7984,15 +8025,58 @@ fn mem_hash(key: &[u8]) -> u64 {
 /// entry it will not match -- the entry is a line of its own, and at
 /// thirty million keys the slot and the entry are both misses.
 struct Index {
-    slots: Box<[AtomicU64]>,
+    slots: Slots,
     mask: usize,
 }
 
+/// The index's slots: `n` words, zero to begin with, in one block from
+/// `blocks::alloc` (`Options::blocks_mapped`) that goes with the index.
+struct Slots {
+    ptr: *mut AtomicU64,
+    n: usize,
+    mapped: bool,
+}
+
+// SAFETY: the words are atomics, read and written through shared
+// references, and the block is owned here and freed once, by the drop.
+unsafe impl Send for Slots {}
+unsafe impl Sync for Slots {}
+
+impl Slots {
+    fn new(n: usize, mapped: bool) -> Slots {
+        let ptr =
+            blocks::alloc(n * std::mem::size_of::<AtomicU64>(), true, mapped) as *mut AtomicU64;
+        Slots { ptr, n, mapped }
+    }
+}
+
+impl std::ops::Deref for Slots {
+    type Target = [AtomicU64];
+    fn deref(&self) -> &[AtomicU64] {
+        // SAFETY: `n` words, zeroed at the allocation (a zero is a valid
+        // atomic), owned for the life of `self`.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.n) }
+    }
+}
+
+impl Drop for Slots {
+    fn drop(&mut self) {
+        // SAFETY: allocated by `new` with this length.
+        unsafe {
+            blocks::free(
+                self.ptr as *mut u8,
+                self.n * std::mem::size_of::<AtomicU64>(),
+                self.mapped,
+            )
+        };
+    }
+}
+
 impl Index {
-    fn with_slots(n: usize) -> Index {
+    fn with_slots(n: usize, mapped: bool) -> Index {
         debug_assert!(n.is_power_of_two());
         Index {
-            slots: (0..n).map(|_| AtomicU64::new(0)).collect(),
+            slots: Slots::new(n, mapped),
             mask: n - 1,
         }
     }
@@ -8094,6 +8178,9 @@ struct ByteArena {
     /// so reclaimed and waiting.
     retired: UnsafeCell<Vec<(u64, *mut u8)>>,
     free: UnsafeCell<Vec<*mut u8>>,
+    /// Whether the blocks are mapped from the kernel (`blocks::alloc`,
+    /// `Options::blocks_mapped`).
+    mapped: bool,
 }
 
 #[derive(Default)]
@@ -8111,12 +8198,12 @@ struct ArenaTail {
 }
 
 impl ByteArena {
-    fn new(prefault: bool) -> ByteArena {
-        ByteArena::with_shift(prefault, ARENA_SHIFT)
+    fn new(prefault: bool, mapped: bool) -> ByteArena {
+        ByteArena::with_shift(prefault, ARENA_SHIFT, mapped)
     }
 
     /// An arena of blocks of `1 << shift` bytes.
-    fn with_shift(prefault: bool, shift: u32) -> ByteArena {
+    fn with_shift(prefault: bool, shift: u32, mapped: bool) -> ByteArena {
         ByteArena {
             blocks: (0..ARENA_BLOCKS)
                 .map(|_| AtomicPtr::new(std::ptr::null_mut()))
@@ -8128,6 +8215,7 @@ impl ByteArena {
             shift,
             retired: UnsafeCell::new(Vec::new()),
             free: UnsafeCell::new(Vec::new()),
+            mapped,
         }
     }
 
@@ -8239,14 +8327,11 @@ impl ByteArena {
                 "memtable arena: more bytes than it addresses"
             );
             let cap = self.block_len().max((n + 63) & !63);
-            let layout = std::alloc::Layout::from_size_align(cap, 64).expect("arena block layout");
             // Not zeroed: a byte is read only past a write that covered
             // it, and zeroing a fresh table's first blocks -- eleven
             // megabytes with the slabs -- cost its first write 3.7 ms,
-            // which was 3x of ycsb-B at ten thousand keys.
-            // SAFETY: a non-zero layout; the block is freed by `Drop`.
-            let p = unsafe { std::alloc::alloc(layout) };
-            assert!(!p.is_null(), "memtable arena: out of memory");
+            // which was 3x of ycsb-B at ten thousand keys. Freed by `Drop`.
+            let p = blocks::alloc(cap, false, self.mapped);
             self.caps[b].store(cap, AtomicOrdering::Release);
             self.blocks[b].store(p, AtomicOrdering::Release);
             t.at = b << self.shift;
@@ -8337,14 +8422,8 @@ impl ByteArena {
         // SAFETY: writer-only.
         let p = match unsafe { &mut *self.free.get() }.pop() {
             Some(p) => p,
-            None => {
-                let layout = std::alloc::Layout::from_size_align(self.block_len(), 64)
-                    .expect("arena block layout");
-                // SAFETY: a non-zero layout; the block is freed by `Drop`.
-                let p = unsafe { std::alloc::alloc(layout) };
-                assert!(!p.is_null(), "memtable arena: out of memory");
-                p
-            }
+            // Freed by `Drop`.
+            None => blocks::alloc(self.block_len(), false, self.mapped),
         };
         self.caps[b].store(self.block_len(), AtomicOrdering::Release);
         self.blocks[b].store(p, AtomicOrdering::Release);
@@ -8488,22 +8567,19 @@ impl Drop for ByteArena {
             let p = b.load(AtomicOrdering::Relaxed);
             if !p.is_null() {
                 let cap = cap.load(AtomicOrdering::Relaxed);
-                let layout =
-                    std::alloc::Layout::from_size_align(cap, 64).expect("arena block layout");
-                // SAFETY: allocated by `reserve` with this layout.
-                unsafe { std::alloc::dealloc(p, layout) };
+                // SAFETY: allocated by `reserve` with this length.
+                unsafe { blocks::free(p, cap, self.mapped) };
             }
         }
         // The recycled blocks, retired or waiting: plain blocks every one.
-        let layout =
-            std::alloc::Layout::from_size_align(self.block_len(), 64).expect("arena block layout");
+        let len = self.block_len();
         for &(_, p) in self.retired.get_mut().iter() {
-            // SAFETY: allocated by `block_at` with this layout, owned here.
-            unsafe { std::alloc::dealloc(p, layout) };
+            // SAFETY: allocated by `block_at` with this length, owned here.
+            unsafe { blocks::free(p, len, self.mapped) };
         }
         for &p in self.free.get_mut().iter() {
             // SAFETY: as above.
-            unsafe { std::alloc::dealloc(p, layout) };
+            unsafe { blocks::free(p, len, self.mapped) };
         }
     }
 }
@@ -8518,6 +8594,9 @@ const SLAB_BLOCKS: usize = 1 << 12;
 
 struct Slab<T> {
     blocks: Box<[AtomicPtr<T>]>,
+    /// Whether the blocks are mapped from the kernel (`blocks::alloc`,
+    /// `Options::blocks_mapped`).
+    mapped: bool,
     len: AtomicUsize,
     /// The most entries ever published, which a truncation leaves where
     /// it was: a reader that loaded the length before a truncation may
@@ -8528,11 +8607,12 @@ struct Slab<T> {
 }
 
 impl<T> Slab<T> {
-    fn new() -> Slab<T> {
+    fn new(mapped: bool) -> Slab<T> {
         Slab {
             blocks: (0..SLAB_BLOCKS)
                 .map(|_| AtomicPtr::new(std::ptr::null_mut()))
                 .collect(),
+            mapped,
             len: AtomicUsize::new(0),
             #[cfg(debug_assertions)]
             pushed: AtomicUsize::new(0),
@@ -8541,6 +8621,16 @@ impl<T> Slab<T> {
 
     fn len(&self) -> usize {
         self.len.load(AtomicOrdering::Acquire)
+    }
+
+    /// A block's bytes: `SLAB_BLOCK` entries, each at most a cache line
+    /// aligned, which is what a block from `blocks::alloc` is.
+    fn block_bytes() -> usize {
+        const {
+            assert!(std::mem::align_of::<T>() <= 64);
+            assert!(std::mem::size_of::<T>() > 0);
+        }
+        SLAB_BLOCK * std::mem::size_of::<T>()
     }
 
     /// The bytes of the entries written and the bytes of the blocks
@@ -8565,12 +8655,10 @@ impl<T> Slab<T> {
         );
         let mut p = self.blocks[b].load(AtomicOrdering::Acquire);
         if p.is_null() {
-            let layout = std::alloc::Layout::array::<T>(SLAB_BLOCK).expect("slab block layout");
             // Not zeroed: an entry is read only below `len`, and each is
-            // written whole before `len` covers it. See the arena.
-            // SAFETY: a non-zero layout; the block is freed by `Drop`.
-            p = unsafe { std::alloc::alloc(layout) } as *mut T;
-            assert!(!p.is_null(), "memtable: out of memory");
+            // written whole before `len` covers it. See the arena. Freed
+            // by `Drop`.
+            p = blocks::alloc(Self::block_bytes(), false, self.mapped) as *mut T;
             self.blocks[b].store(p, AtomicOrdering::Release);
         }
         // SAFETY: inside the block, at a number no reader has been given.
@@ -8623,9 +8711,8 @@ impl<T> Drop for Slab<T> {
         for b in self.blocks.iter() {
             let p = b.load(AtomicOrdering::Relaxed);
             if !p.is_null() {
-                let layout = std::alloc::Layout::array::<T>(SLAB_BLOCK).expect("slab block layout");
-                // SAFETY: allocated by `push` with this layout.
-                unsafe { std::alloc::dealloc(p as *mut u8, layout) };
+                // SAFETY: allocated by `push` with this length.
+                unsafe { blocks::free(p as *mut u8, Self::block_bytes(), self.mapped) };
             }
         }
     }
@@ -9041,10 +9128,12 @@ impl MemTable {
         2 * (c[1] + c[3] + c[4])
     }
 
-    fn new(prefault: bool) -> MemTable {
+    fn new(shape: BlockShape) -> MemTable {
+        let BlockShape { prefault, mapped } = shape;
         MemTable {
-            entries: Slab::new(),
-            index: AtomicPtr::new(Box::into_raw(Box::new(Index::with_slots(1024)))),
+            mapped,
+            entries: Slab::new(mapped),
+            index: AtomicPtr::new(Box::into_raw(Box::new(Index::with_slots(1024, mapped)))),
             ordered: false,
             refs: false,
             stream: false,
@@ -9058,16 +9147,16 @@ impl MemTable {
             keys_in_stream: false,
             log_range: false,
             slim_entries: false,
-            slim: Slab::new(),
-            vals2: ByteArena::new(prefault),
+            slim: Slab::new(mapped),
+            vals2: ByteArena::new(prefault, mapped),
             staging: UnsafeCell::new(Staging::default()),
-            keys: ByteArena::new(prefault),
-            vals: ByteArena::new(prefault),
+            keys: ByteArena::new(prefault, mapped),
+            vals: ByteArena::new(prefault, mapped),
             tombs: AtomicUsize::new(0),
             marks: Default::default(),
             mark: AtomicU64::new(0),
             retired: UnsafeCell::new(Vec::new()),
-            log: Slab::new(),
+            log: Slab::new(mapped),
             snaps: FrozenSnaps::new(),
         }
     }
@@ -9079,16 +9168,18 @@ impl MemTable {
     /// compact where it says.
     fn new_ordered(
         refs: bool,
-        prefault: bool,
+        shape: BlockShape,
         stream: Option<bool>,
         recycle: bool,
         keys_in_stream: bool,
         log_range: bool,
         slim_entries: bool,
     ) -> MemTable {
+        let BlockShape { prefault, mapped } = shape;
         debug_assert!(!(refs && stream.is_some()), "two shapes of one table");
         MemTable {
-            entries: Slab::new(),
+            mapped,
+            entries: Slab::new(mapped),
             index: AtomicPtr::new(std::ptr::null_mut()),
             ordered: true,
             refs,
@@ -9103,20 +9194,20 @@ impl MemTable {
             keys_in_stream: stream.is_some() && keys_in_stream,
             log_range,
             slim_entries: stream.is_some() && keys_in_stream && slim_entries,
-            slim: Slab::new(),
-            vals2: ByteArena::new(prefault),
+            slim: Slab::new(mapped),
+            vals2: ByteArena::new(prefault, mapped),
             staging: UnsafeCell::new(Staging::default()),
-            keys: ByteArena::new(prefault),
+            keys: ByteArena::new(prefault, mapped),
             vals: if stream.is_some() && recycle {
-                ByteArena::with_shift(prefault, STREAM_SHIFT)
+                ByteArena::with_shift(prefault, STREAM_SHIFT, mapped)
             } else {
-                ByteArena::new(prefault)
+                ByteArena::new(prefault, mapped)
             },
             tombs: AtomicUsize::new(0),
             marks: Default::default(),
             mark: AtomicU64::new(0),
             retired: UnsafeCell::new(Vec::new()),
-            log: Slab::new(),
+            log: Slab::new(mapped),
             snaps: FrozenSnaps::new(),
         }
     }
@@ -9575,7 +9666,7 @@ impl MemTable {
     /// published, the old one retired at the epoch the publish bumps.
     fn rebuild_index(&self, old: &Index, rd: &Readers) -> &Index {
         let cap = old.slots.len() * 2;
-        let fresh = Index::with_slots(cap);
+        let fresh = Index::with_slots(cap, old.slots.mapped);
         for id in 0..self.len() {
             let hash = u64::from(self.fat(id).hash) << 32;
             let mut i = slot_of(hash, fresh.mask);
@@ -13278,7 +13369,15 @@ mod heap {
         let anon = super::zselect::parse_status_rss_anon(&text)? as usize;
         // SAFETY: reads the allocator's own totals under its own locks.
         let mi = unsafe { f() };
-        Some(anon.saturating_sub(mi.uordblks.saturating_add(mi.hblkhd)))
+        // The engine's own mapped blocks (`Options::blocks_mapped`) are
+        // anonymous bytes the allocator knows nothing of, so they come
+        // out too; a mapped page never touched is resident nowhere and is
+        // taken out all the same, so the count reads low by the untouched
+        // part of the blocks, an arena's tail block at most.
+        Some(
+            anon.saturating_sub(mi.uordblks.saturating_add(mi.hblkhd))
+                .saturating_sub(super::blocks::mapped_bytes()),
+        )
     }
 
     /// What the trim counts its stride by: the resident bytes beyond use
@@ -14795,6 +14894,9 @@ struct SnapArena {
     base_shift: u32,
     blocks: [AtomicPtr<u8>; SNAP_BLOCKS],
     tail: AtomicUsize,
+    /// Whether the blocks are mapped from the kernel (`blocks::alloc`,
+    /// `Options::blocks_mapped`).
+    mapped: bool,
 }
 
 const SNAP_BLOCKS: usize = 32;
@@ -14803,14 +14905,14 @@ const SNAP_BASE_SHIFT: u32 = 12;
 
 impl Default for SnapArena {
     fn default() -> SnapArena {
-        SnapArena::with_capacity(0)
+        SnapArena::with_capacity(0, false)
     }
 }
 
 impl SnapArena {
     /// An arena whose first block holds `bytes`, so a build of that many
     /// allocates once.
-    fn with_capacity(bytes: usize) -> SnapArena {
+    fn with_capacity(bytes: usize, mapped: bool) -> SnapArena {
         let base_shift = bytes
             .next_power_of_two()
             .trailing_zeros()
@@ -14819,6 +14921,7 @@ impl SnapArena {
             base_shift,
             blocks: std::array::from_fn(|_| AtomicPtr::new(std::ptr::null_mut())),
             tail: AtomicUsize::new(0),
+            mapped,
         }
     }
 
@@ -14869,13 +14972,10 @@ impl SnapArena {
             }
             assert!(b < SNAP_BLOCKS, "snapshot arena: more blocks than it has");
             if self.blocks[b].load(AtomicOrdering::Acquire).is_null() {
-                let layout =
-                    std::alloc::Layout::from_size_align(cap, 64).expect("arena block layout");
                 // Not zeroed: a byte is read only past a write that
-                // covered it. SAFETY: a non-zero layout; the block is
-                // freed by `Drop`, or below when another thread's won.
-                let p = unsafe { std::alloc::alloc(layout) };
-                assert!(!p.is_null(), "snapshot arena: out of memory");
+                // covered it. Freed by `Drop`, or below when another
+                // thread's won.
+                let p = blocks::alloc(cap, false, self.mapped);
                 if self.blocks[b]
                     .compare_exchange(
                         std::ptr::null_mut(),
@@ -14885,9 +14985,9 @@ impl SnapArena {
                     )
                     .is_err()
                 {
-                    // SAFETY: allocated just above with this layout, and
+                    // SAFETY: allocated just above with this length, and
                     // published nowhere.
-                    unsafe { std::alloc::dealloc(p, layout) };
+                    unsafe { blocks::free(p, cap, self.mapped) };
                 }
             }
             return off as u32;
@@ -15061,10 +15161,8 @@ impl Drop for SnapArena {
         for (b, slot) in self.blocks.iter().enumerate() {
             let p = slot.load(AtomicOrdering::Relaxed);
             if !p.is_null() {
-                let layout = std::alloc::Layout::from_size_align(self.cap(b), 64)
-                    .expect("arena block layout");
-                // SAFETY: allocated by `reserve` with this layout.
-                unsafe { std::alloc::dealloc(p, layout) };
+                // SAFETY: allocated by `reserve` with this length.
+                unsafe { blocks::free(p, self.cap(b), self.mapped) };
             }
         }
     }
@@ -15290,7 +15388,7 @@ impl Snapshot {
         if bytes > u32::MAX as usize {
             return None;
         }
-        let arena = SnapArena::with_capacity(bytes);
+        let arena = SnapArena::with_capacity(bytes, mem.mapped);
         let (base, buf) = arena.reserve_bytes(bytes);
         let mut p = 0usize;
         let mut ents: Vec<SnapKey> = Vec::with_capacity(n);
@@ -18137,7 +18235,7 @@ impl Reader {
         let mut snap = Snapshot {
             live_len,
             log_at,
-            arena: std::sync::Arc::new(SnapArena::with_capacity(bytes)),
+            arena: std::sync::Arc::new(SnapArena::with_capacity(bytes, self.opts.blocks_mapped)),
             runs,
             bases: Vec::new(),
             ents: Vec::with_capacity(n),
@@ -24598,7 +24696,7 @@ impl Db {
             scans: AtomicU64::new(0),
             forms_bytes: AtomicUsize::new(0),
             segs,
-            mem: std::sync::Arc::new(MemTable::new(opts.prefault)),
+            mem: std::sync::Arc::new(MemTable::new(opts.block_shape())),
             frozen: Vec::new(),
             gen: 1,
             lives: 0,
@@ -25033,7 +25131,7 @@ impl Db {
             }
         }
         wal_ids.sort_unstable();
-        let mem = MemTable::new(opts.prefault);
+        let mem = MemTable::new(opts.block_shape());
         // Replay's own table, for the index resizes a replayed delete
         // frees through; nothing reads beside it.
         let readers = Readers::new(false);
@@ -25318,7 +25416,7 @@ impl Db {
                     self.set_mem_with(
                         std::sync::Arc::new(MemTable::new_ordered(
                             self.opts.direct_table_refs,
-                            self.opts.prefault,
+                            self.opts.block_shape(),
                             self.opts
                                 .direct_stream
                                 .then_some(self.opts.segment.compact_records),
@@ -25947,7 +26045,7 @@ impl Db {
         self.mem_bytes = 0;
         let Some(d) = self.direct.take() else {
             // A run forming with nothing committed: no file, nothing to close.
-            self.set_mem(std::sync::Arc::new(MemTable::new(self.opts.prefault)));
+            self.set_mem(std::sync::Arc::new(MemTable::new(self.opts.block_shape())));
             return Ok(());
         };
         self.land_seal()?;
@@ -26945,7 +27043,7 @@ impl Db {
         let settled_at = self.state() as *const State;
         let from = Db::replaced_from(&self.opts, &self.shared);
         let complete = self.fs().tables_complete.get();
-        let fresh = std::sync::Arc::new(MemTable::new(self.opts.prefault));
+        let fresh = std::sync::Arc::new(MemTable::new(self.opts.block_shape()));
         let carried = std::cell::Cell::new(false);
         let pieces_only = self.opts.forms_pieces_only;
         let by_capacity = self.opts.counts_capacity();
@@ -26994,7 +27092,7 @@ impl Db {
     /// vouch for nothing until a publish into it says otherwise -- so a
     /// handle at it builds its own blocks until the upkeep has looked.
     fn freeze_swap(&mut self, table: &std::sync::Arc<MemTable>) -> bool {
-        let fresh = std::sync::Arc::new(MemTable::new(self.opts.prefault));
+        let fresh = std::sync::Arc::new(MemTable::new(self.opts.block_shape()));
         let from = Db::replaced_from(&self.opts, &self.shared);
         let Some(old) = self.try_publish_writer_away(|cur| {
             if !std::sync::Arc::ptr_eq(&cur.mem, table) || cur.frozen.len() >= FROZEN_CAP {
@@ -31120,6 +31218,14 @@ impl Db {
         heap::resident_beyond_use()
     }
 
+    /// The bytes of the engine's blocks mapped from the kernel and not yet
+    /// unmapped (`Options::blocks_mapped`), process-wide: zero past every
+    /// store's close, which the leak test holds it to, and what the suite
+    /// reads beside the allocator's bytes in use.
+    pub fn mapped_bytes() -> usize {
+        blocks::mapped_bytes()
+    }
+
     /// The bytes the trim counts its stride by at this moment, by the
     /// store's option. For a test.
     #[doc(hidden)]
@@ -34667,7 +34773,7 @@ impl Maint {
         segs.sort_by(|a, b| seg_order(a, b));
         // One fresh table for every attempt: a landing that lost the swap
         // installs the same empty table on its retry.
-        let fresh = landed.map(|_| std::sync::Arc::new(MemTable::new(self.opts.prefault)));
+        let fresh = landed.map(|_| std::sync::Arc::new(MemTable::new(self.opts.block_shape())));
         debug_assert!(
             Self::partitions_tile(&segs),
             "a segment publish left partitions that do not tile the key space: {:?}",
@@ -38020,7 +38126,18 @@ mod streaming_writes {
     fn a_streamed_tables_keys_read_in_place_and_across_a_seam() {
         for compact in [false, true] {
             let rd = Readers::new(false);
-            let mem = MemTable::new_ordered(false, false, Some(compact), true, true, true, true);
+            let mem = MemTable::new_ordered(
+                false,
+                BlockShape {
+                    prefault: false,
+                    mapped: true,
+                },
+                Some(compact),
+                true,
+                true,
+                true,
+                true,
+            );
             let block = mem.vals.block_len();
             let value = vec![b'v'; 10];
             let (ext, tail) = MemTable::stream_ext(value.len());
@@ -38196,7 +38313,7 @@ mod snap_arena {
 
     #[test]
     fn offsets_cross_blocks_and_two_threads_append_without_overlap() {
-        let a = std::sync::Arc::new(SnapArena::with_capacity(100));
+        let a = std::sync::Arc::new(SnapArena::with_capacity(100, true));
         assert_eq!(a.base_shift, SNAP_BASE_SHIFT);
         // Block edges: a reservation that would cross one moves whole
         // into the next block, and every offset locates back to it.
@@ -38288,7 +38405,10 @@ mod threading {
         };
         let mut want = std::collections::HashMap::new();
         want.insert(0usize, (0usize, 0u64));
-        let dry = super::MemTable::new(false);
+        let dry = super::MemTable::new(super::BlockShape {
+            prefault: false,
+            mapped: true,
+        });
         fill(
             &dry,
             Box::new(|m: &super::MemTable| {
@@ -38296,7 +38416,10 @@ mod threading {
                 want.insert(log, (len, wm));
             }),
         );
-        let mem = super::MemTable::new(false);
+        let mem = super::MemTable::new(super::BlockShape {
+            prefault: false,
+            mapped: true,
+        });
         let stop = AtomicBool::new(false);
         std::thread::scope(|s| {
             let reader = s.spawn(|| {

@@ -48,16 +48,12 @@ The suite has to be fair before any of its numbers are quoted.
   form at ten million keys); a row under that bound is the one to bank
   next, and `ZPages::Auto` as the engine's default is the decision after
   it, once the in-core pairing of the two reads level. The bound such a
-  row can run under is set by the allocator's retention and not by the
-  engine's live bytes: the full rewrite at ten million keys holds 550 MB
-  of freed memory in glibc's arenas beside 434 in use, since the
-  memtables' blocks are allocated under the mmap threshold and freed
-  into the heap, and under 1.25 GiB the roster was killed there twice,
-  once in the arm with a 256 MB cache and once in the default arm's
-  second rep, each at 1.3 GB of anonymous memory. An engine that took
-  its arenas from `mmap` directly would give them back at the seal, and
-  a runner that opened each arm in a process of its own would start each
-  from nothing; either is what a banked row under 1.25 GiB needs.
+  row could run under was set by the allocator's retention and not by
+  the engine's live bytes -- the full rewrite at ten million keys held
+  550 MB of freed memory in glibc's arenas beside 434 in use, and under
+  1.25 GiB the roster was killed there twice -- until the engine took
+  its blocks from the kernel (`Options::blocks_mapped`); the roster
+  under 1.25 GiB and then 1 GiB is the row to bank next.
 - [ ] **Match the checksum work, or state it.** RocksDB reads with
   `verify_checksums(false)`, under which it verifies no data block it
   reads, from the file or into its cache. supdb verifies a segment's key

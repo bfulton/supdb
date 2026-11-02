@@ -57,7 +57,7 @@ static ALLOC: Counting = Counting;
 /// last one was given, which retires them, and the store closes with
 /// them retired and not yet swept, as a pass's closing threaded scans
 /// leave it.
-fn a_store_life(name: &str) {
+fn a_store_life(name: &str, blocks_mapped: bool) {
     let d = std::env::temp_dir().join(format!("supdb-next-leak-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
@@ -65,6 +65,7 @@ fn a_store_life(name: &str) {
         seal_bytes: 32 << 20,
         partition_bytes: Some(64 << 20),
         scan_block_cache: true,
+        blocks_mapped,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -384,19 +385,32 @@ fn a_zpages_life(name: &str) {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// A store's blocks come from the kernel by default (`Options::blocks_mapped`)
+/// and the allocator the count below sees nothing of them, so they are
+/// counted on their own (`Db::mapped_bytes`): zero past every store's
+/// close. The store life runs once with its blocks on the heap too, where
+/// the allocation count is what sees them.
 #[test]
 fn a_closed_store_gives_back_what_it_allocated() {
     // The first life allocates what lives for the process -- the test
     // harness's buffers, lazily built statics, the buffer a thread that
     // reads from a form file decodes into -- so the count starts after.
-    a_store_life("warm");
+    a_store_life("warm", true);
+    a_store_life("warm-heap", false);
     a_handed_life("warm-handed");
     a_three_frozen_life("warm-three");
     a_zpages_life("warm-zpages");
+    assert_eq!(
+        Db::mapped_bytes(),
+        0,
+        "mapped blocks past the warm stores' close"
+    );
     let before = LIVE.load(Ordering::SeqCst);
     let lives = 4;
+    let kinds = 5;
     for i in 0..lives {
-        a_store_life(&format!("life-{i}"));
+        a_store_life(&format!("life-{i}"), true);
+        a_store_life(&format!("heap-{i}"), false);
         a_handed_life(&format!("handed-{i}"));
         a_three_frozen_life(&format!("three-{i}"));
         a_zpages_life(&format!("zpages-{i}"));
@@ -406,7 +420,13 @@ fn a_closed_store_gives_back_what_it_allocated() {
     assert!(
         kept < 64 << 10,
         "{} closed stores kept {kept} bytes allocated ({} a store)",
-        4 * lives,
-        kept / (4 * lives)
+        kinds * lives,
+        kept / (kinds * lives)
+    );
+    assert_eq!(
+        Db::mapped_bytes(),
+        0,
+        "{} closed stores kept blocks mapped",
+        kinds * lives
     );
 }

@@ -3026,6 +3026,40 @@ reader that did it, before a pass is read as the reader's own; and a
 wait for a worker's step is a wait for the whole step until the worker
 asks, at a place where stopping leaves every invariant standing.
 
+**A block freed into a heap that kept it.** The memtables' arena
+blocks, their slabs and their hash indexes, and the scan snapshots'
+arenas, came from the global allocator in blocks of four megabytes, one
+and half of one, and glibc's heap kept every one it freed: its mmap
+threshold starts at 128 KB and rises to the size of the first large
+chunk freed, so the first arena block a landing freed raised it past the
+block, and every block after came from the heap and went back to it.
+Nothing was wrong and nothing raised. The lag sweep at ten million keys
+held 150-620 MB beyond its bytes in use (`lagmem`: anon less in use less
+the allocator's own mapped chunks), 1.3 GB of anonymous memory at the
+full rewrite with 434 in use, which under 1.25 GiB killed the roster
+twice; and the compact form's budget subtracts the process's anonymous
+memory, so the retention bought forms late as well. The runner's trim
+between phases returned what was free at a phase's end and nothing
+inside a burst. The owner was named by taking the allocator's choice
+away for one run: with glibc told to map every allocation of a megabyte
+or more (`GLIBC_TUNABLES=glibc.malloc.mmap_threshold=1048576:glibc.malloc.trim_threshold=4194304`
+around `bench ab --arms supdb,supdb-nocache --size 10000000 --passes
+load,lag --reps 1 --ops-div 10` under `SUPDB_LAG_COUNTERS=1`, beside the
+same run as shipped, at `f2381c3`) the same sweep held 0-135 beyond use,
+so the retained memory was the large blocks and not the forms' small
+chunks. The engine maps those blocks from the kernel now, from 128 KB,
+and unmaps each at its drop (`src/db/blocks.rs`, `Options::blocks_mapped`;
+`supdb-heapblocks` is the heap shape); the bytes mapped are counted and
+held to zero past every store's close (`tests/leak.rs`, `tests/mapped.rs`),
+and the resident count the trim reads takes them out. The rule: a
+library gives its large transient buffers back itself, since what an
+allocator does with a freed chunk is the process's policy and not the
+store's; a process's memory beyond its bytes in use is read against the
+allocator's thresholds -- what it maps, what it keeps -- before its free
+bytes are read as anyone's; and the owner of retained memory is named
+fastest by changing the allocator's policy for one run and reading the
+difference.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

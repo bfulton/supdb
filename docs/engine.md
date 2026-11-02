@@ -6247,6 +6247,34 @@ exactly, and the first time it passes the budget it binds, as `scan_cache_bytes`
 `forms_to_fit` has it from the start -- a budget that binds from the start costs the full-rewrite
 point its rate in core at sizes where it never binds, which is why this one waits.
 
+The load's own retention named above was the allocator's, and the engine keeps its blocks out of
+the allocator now (`Options::blocks_mapped`). The memtables' arena blocks (four megabytes, one in a
+recycled stream), their slabs (half a megabyte to a megabyte and a half) and their hash indexes, and
+the scan snapshots' arenas, came from glibc, whose mmap threshold starts at 128 KB and rises to the
+size of the first large chunk it frees, so every such block after the first came from the heap and
+stayed in it when its table dropped, until a trim or a reuse. At ten million keys the lag sweep held
+150-620 MB beyond its bytes in use (`lagmem`'s anon less in use less the allocator's own mapped
+chunks) and 1.3 GB of anonymous memory at the full rewrite, which under 1.25 GiB was the kill, and
+the compact form's budget, which subtracts the process's anonymous memory, bought late by as much.
+One run with glibc told to map every allocation of a megabyte or more and to trim a heap's top past
+four (`GLIBC_TUNABLES=glibc.malloc.mmap_threshold=1048576:glibc.malloc.trim_threshold=4194304`
+around `bench ab --arms supdb,supdb-nocache --size 10000000 --passes load,lag --reps 1 --ops-div 10`
+under `SUPDB_LAG_COUNTERS=1`, beside the same run as shipped, at `f2381c3`) held 0-135 beyond use
+at every point, so the owner was the large blocks and not the forms' chunks; what the forms' arena
+still held free there, 96 MB at the full rewrite, is the trim's to return. The engine maps those
+blocks from the kernel itself now, from 128 KB (`blocks::MAP_FROM`), and unmaps each at its drop
+(`src/db/blocks.rs`), so a landing gives its table's memory back at once and the process's anonymous
+bytes read the engine's own; a block's pages are fresh at their first touch where the heap's were
+touched before, which is the price. `supdb-heapblocks` keeps the heap shape, and the pairing reads the two level in core, twelve pairs a
+sitting at three hundred thousand keys in both orders (`pair.sh supdb supdb-heapblocks 300000`), the
+loads and the lag bursts within a tenth with their signs swapping between the sittings and nothing
+marked over the table; at three million keys with the memory lines on (`pair.sh SUPDB_LAG_COUNTERS=1
+supdb supdb-heapblocks 3000000 --passes load,lag --reps 2`) the mapped shape holds half the heap
+shape's retention at the ten-percent and the full-rewrite points, rep for rep in both orders, and
+what it still holds beyond use there is the forms' chunks and the writers' vectors.
+The `lagmem` line prints the mapped bytes (`mapped_mb`) beside the allocator's in use and free, and
+the resident count the trim reads (`Options::trim_by_resident`) takes them out.
+
 #### Out of core: against LMDB with its readahead off
 
 The first bounded rung at ten million keys under a gibibyte read the

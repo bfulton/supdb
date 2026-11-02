@@ -513,8 +513,10 @@ fn counters_line(
     );
     // The process's memory beside the structures that count their own: the
     // resident bytes, what the allocator has handed out and what it holds
-    // free, and the writer's tables and the published forms by their
-    // counts. The gap between the resident bytes and the sum of the
+    // free (`inuse`, `free`, and `mmapped` for the chunks it mapped),
+    // the engine's own mapped blocks (`mapped`, `Options::blocks_mapped`,
+    // anonymous bytes the allocator knows nothing of), and the writer's
+    // tables and the published forms by their counts. The gap between the resident bytes and the sum of the
     // structures is slack, retention and everything uncounted, which the
     // lag sweep's peak is made of under a memory bound.
     if tag == "lagcounters" {
@@ -527,12 +529,13 @@ fn counters_line(
         let (inuse, free, mapped) = (0u64, 0u64, 0u64);
         let mb = |b: u64| b / (1 << 20);
         eprintln!(
-            "lagmem {arm} {point} anon_mb {} rss_mb {} inuse_mb {} free_mb {} mmapped_mb {} cache_mb {} forms_mb {}",
+            "lagmem {arm} {point} anon_mb {} rss_mb {} inuse_mb {} free_mb {} mmapped_mb {} mapped_mb {} cache_mb {} forms_mb {}",
             anon_resident_bytes().map_or(0, mb),
             resident_bytes().map_or(0, mb),
             mb(inuse),
             mb(free),
             mb(mapped),
+            mb(supdb::Db::mapped_bytes() as u64),
             mb(get(c1, "cache_bytes_at_end") as u64),
             mb(get(c1, "form_bytes_at_end") as u64),
         );
@@ -2142,10 +2145,11 @@ fn census_line(tag: &str, arm: &str, point: &str, e: &dyn Engine, detail: bool) 
             .map_or(0.0, |(_, v)| *v)
     };
     eprintln!(
-        "{tag} {arm} {point} anon_mb {} inuse_mb {:.0} free_mb {:.0} trims {:.0} looks {:.0} look_ms {:.1} | {}",
+        "{tag} {arm} {point} anon_mb {} inuse_mb {:.0} free_mb {:.0} mapped_mb {:.0} trims {:.0} looks {:.0} look_ms {:.1} | {}",
         anon_resident_bytes().map_or(0, |b| b >> 20),
         mb(mi.0),
         mb(mi.1),
+        mb(supdb::Db::mapped_bytes() as u64),
         counter("forms_trims"),
         counter("forms_trim_looks"),
         counter("forms_trim_us") / 1e3,
