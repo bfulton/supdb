@@ -1897,6 +1897,14 @@ fn one_pass(
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let mut e = engines::open(arm, dir, map_gb)?;
         shuf_s = shuffled_load(e.as_mut(), arm, size, plan, payload, &mut counting)?;
+        // What the shuffled load freed, returned before the sweep: its
+        // merges at ten million keys left 742 MB of freed memory in the
+        // allocator's arenas, the engine holding 11 of it, and under a
+        // bound of 1 GiB the sweep's full rewrite put the process's
+        // anonymous bytes over the bound with the engine's own at a
+        // quarter of them. A pass is measured on the memory it needs, not
+        // on what the pass before it left.
+        release_freed_memory();
         if passes.lag {
             lag_sweep(
                 e.as_mut(),
@@ -2164,14 +2172,22 @@ fn census_line(tag: &str, arm: &str, point: &str, e: &dyn Engine, detail: bool) 
             top.join(" | ")
         );
     }
-    // The probe of what a trim would give back, for the pairing that asks:
-    // the freed memory returned to the system and the process's anonymous
-    // bytes read again. It changes the points after it, so it is its own
-    // variable and off by default.
-    if std::env::var_os("SUPDB_LAG_TRIM").is_some() {
-        let before = anon_resident_bytes().unwrap_or(0);
-        let t = Instant::now();
-        release_freed_memory();
+    // The freed memory returned after every point, between its pass and
+    // the next burst, where nothing is timed: a point's burst and pass are
+    // measured on the memory they need and not on what the points before
+    // left in the arenas, which at ten million keys under a bound of 1 GiB
+    // was the difference between a sweep that ran and one the kernel
+    // killed at the full rewrite. `SUPDB_LAG_TRIM` prints what the return
+    // gave back.
+    let probe = std::env::var_os("SUPDB_LAG_TRIM").is_some();
+    let before = if probe {
+        anon_resident_bytes().unwrap_or(0)
+    } else {
+        0
+    };
+    let t = Instant::now();
+    release_freed_memory();
+    if probe {
         let ms = t.elapsed().as_secs_f64() * 1e3;
         eprintln!(
             "lagtrim {arm} {point} anon_mb {} -> {} trim_ms {ms:.1}",

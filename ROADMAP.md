@@ -47,7 +47,14 @@ The suite has to be fair before any of its numbers are quoted.
   several times LMDB's rate (`docs/engine.md`, the shift to the compact
   form at ten million keys); a row under that bound is the one to bank
   next, and `ZPages::Auto` as the engine's default is the decision after
-  it, once the in-core pairing of the two reads level.
+  it, once the in-core pairing of the two reads level. The bound such a
+  row can run under is set by the allocator's retention and not by the
+  engine's live bytes: the full rewrite at ten million keys holds 550 MB
+  of freed memory in glibc's arenas beside 434 in use, since the
+  memtables' blocks are allocated under the mmap threshold and freed
+  into the heap; an engine that took its arenas from `mmap` directly
+  would give them back at the seal, and a process under a cgroup would
+  be charged for what it holds.
 - [ ] **Match the checksum work, or state it.** RocksDB reads with
   `verify_checksums(false)`, under which it verifies no data block it
   reads, from the file or into its cache. supdb verifies a segment's key

@@ -284,8 +284,11 @@ and the durable comparators: LMDB with its readahead off
 than memory, and RocksDB tuned. The bound is chosen so that the top rung
 is out of core for every engine: a store of ten million keys is 1.3 GB
 in LMDB and 1.4 in supdb's raw form, so under 1.5 GiB LMDB's fits and
-supdb's sits at the edge of its budget, and under 1 GiB both read from
-the device, which is the regime the second form is for. LMDB as it opens by default, which reads every random read past the
+supdb's sits at the edge of its budget, and under 1.25 GiB both read
+from the device, which is the regime the second form is for. Under
+1 GiB the default arm's full-rewrite point ends at 940 MB of anonymous
+memory, 550 of it freed memory the allocator holds inside the point, and
+a row of three reps there is one the kernel may kill. LMDB as it opens by default, which reads every random read past the
 cache with its readahead window, is not in the roster. The
 scan floor's file is written and synced outside the group and dropped
 from the cache; the floors and every pass run inside it.

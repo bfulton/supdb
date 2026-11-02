@@ -265,7 +265,15 @@ store a pass drops, and the pass line prints what the process holds as
 the next pass opens, so a climb shows while it is happening.
 `a_dropped_stores_freed_memory_is_returned_before_the_next_pass`
 reproduces the shape and released 0 of its 300 MB without the release.
-The release has a price, and it is the load's: a store that opens in
+It came back inside one store's life: the shuffled load's merges at ten
+million keys left 742 MB of freed memory in the arenas with the engine
+holding 11, and under a bound of 1 GiB the lag sweep's full rewrite put
+the process over the bound with the engine's own bytes at a quarter of
+it (`lagmem`: anon 871 MB, in use 247, free 593 at the ten-percent point;
+killed at the next). The runner returns the freed memory after the
+shuffled load and after every lag point's pass now, between the timed
+phases and never inside one. The release has a price, and it is the
+load's: a store that opens in
 memory just handed back faults its pages in where it used to be given
 the passes before it, warm. In one process releasing only before the
 odd reps, the default arm's ordered load read slower in all eight
