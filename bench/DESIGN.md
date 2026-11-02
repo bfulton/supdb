@@ -277,28 +277,32 @@ reached. The bound is the row's class (`/b<MiB>m`), since a store past it
 reads from the device where the same store unbounded reads from memory,
 and its rows live under `runs/ooc/`. Its default arms are the default,
 the three options whose difference is what a read past the page cache
-costs (`supdb-nocache`, `supdb-cache256`, `supdb-noadvice`), the default
-with the compact form the controller's to choose (`supdb-autozpages`),
-and the durable comparators: LMDB with its readahead off
-(`lmdb-nordahead`), as LMDB's documentation configures a store larger
-than memory, and RocksDB tuned. The bound is chosen so that the top rung
-is out of core for every engine: a store of ten million keys is 1.3 GB
-in LMDB and 1.4 in supdb's raw form, so under 1.5 GiB LMDB's fits and
-supdb's sits at the edge of its budget, and under 1.25 GiB both read
-from the device, which is the regime the second form is for. Under
-1 GiB the default arm's full-rewrite point ends at 940 MB of anonymous
-memory, 550 of it freed memory the allocator holds inside the point, and
-a row of three reps there is one the kernel may kill; under 1.25 GiB the
-arm with the cache bounded at 256 MB was killed at that point holding
-1.29 GB, and without it the default arm was killed there in its second
-rep holding 1.30, the arenas more fragmented for every store the process
-had opened before. So a bounded row at ten million keys runs under
-1.5 GiB today, where LMDB's store fits and supdb's raw form sits at the
-edge of its budget, and the regime where both engines leave core is
-reached by a pairing (`bench ab --bound`) over the passes that hold one
-store at a time; what moves the row's bound down is the process's
-anonymous memory at the full rewrite, not the engine's live bytes
-(`ROADMAP.md`). LMDB as it opens by default, which reads every random read past the
+costs (`supdb-nocache`, `supdb-cache256tofit`, `supdb-noadvice`), the
+default with the compact form the controller's to choose
+(`supdb-autozpages`), and the durable comparators: LMDB with its
+readahead off (`lmdb-nordahead`), as LMDB's documentation configures a
+store larger than memory, and RocksDB tuned. The bound is chosen so that
+the top rung is out of core for every engine: a store of ten million keys
+is 1.3 GB in LMDB and 1.4 in supdb's raw form, so under 1.5 GiB LMDB's
+fits and supdb's sits at the edge of its budget, and under 1.25 GiB both
+read from the device, which is the regime the second form is for and the
+bound the roster runs under. What sets the bound a row can run under is
+the process's anonymous memory at the lag sweep's full rewrite, not the
+engine's live bytes, and two things set that. The memtables' blocks came
+from the allocator's heap and stayed there when their tables dropped, so
+the default arm held 1.3 GB at that point with the engine holding a
+third, until the engine mapped its blocks from the kernel itself
+(`Options::blocks_mapped`). And the cache arm whose budget counts
+contents (`supdb-cache256`) keeps its budget only where a scan builds a
+block, so the full rewrite builds the whole store's forms and the first
+scan sheds them into the allocator's free lists: two gigabytes of
+anonymous memory for a cache of 256 MB at ten million keys, 1.3 GB of it
+free chunks nothing trims, which a bound of 1.25 GiB kills every time.
+The roster's budgeted cache is the one held to its budget by capacity
+(`supdb-cache256tofit`), which ends the same point under a gigabyte; the
+contents-counted arm stays for the pairing that prices the difference.
+Under 1 GiB the default arm's full rewrite is the next line to find.
+LMDB as it opens by default, which reads every random read past the
 cache with its readahead window, is not in the roster. The
 scan floor's file is written and synced outside the group and dropped
 from the cache; the floors and every pass run inside it.
