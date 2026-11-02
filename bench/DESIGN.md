@@ -288,7 +288,17 @@ supdb's sits at the edge of its budget, and under 1.25 GiB both read
 from the device, which is the regime the second form is for. Under
 1 GiB the default arm's full-rewrite point ends at 940 MB of anonymous
 memory, 550 of it freed memory the allocator holds inside the point, and
-a row of three reps there is one the kernel may kill. LMDB as it opens by default, which reads every random read past the
+a row of three reps there is one the kernel may kill; under 1.25 GiB the
+arm with the cache bounded at 256 MB was killed at that point holding
+1.29 GB, and without it the default arm was killed there in its second
+rep holding 1.30, the arenas more fragmented for every store the process
+had opened before. So a bounded row at ten million keys runs under
+1.5 GiB today, where LMDB's store fits and supdb's raw form sits at the
+edge of its budget, and the regime where both engines leave core is
+reached by a pairing (`bench ab --bound`) over the passes that hold one
+store at a time; what moves the row's bound down is the process's
+anonymous memory at the full rewrite, not the engine's live bytes
+(`ROADMAP.md`). LMDB as it opens by default, which reads every random read past the
 cache with its readahead window, is not in the roster. The
 scan floor's file is written and synced outside the group and dropped
 from the cache; the floors and every pass run inside it.

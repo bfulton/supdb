@@ -52,9 +52,12 @@ The suite has to be fair before any of its numbers are quoted.
   engine's live bytes: the full rewrite at ten million keys holds 550 MB
   of freed memory in glibc's arenas beside 434 in use, since the
   memtables' blocks are allocated under the mmap threshold and freed
-  into the heap; an engine that took its arenas from `mmap` directly
-  would give them back at the seal, and a process under a cgroup would
-  be charged for what it holds.
+  into the heap, and under 1.25 GiB the roster was killed there twice,
+  once in the arm with a 256 MB cache and once in the default arm's
+  second rep, each at 1.3 GB of anonymous memory. An engine that took
+  its arenas from `mmap` directly would give them back at the seal, and
+  a runner that opened each arm in a process of its own would start each
+  from nothing; either is what a banked row under 1.25 GiB needs.
 - [ ] **Match the checksum work, or state it.** RocksDB reads with
   `verify_checksums(false)`, under which it verifies no data block it
   reads, from the file or into its cache. supdb verifies a segment's key
