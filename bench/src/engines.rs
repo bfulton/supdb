@@ -7976,19 +7976,23 @@ pub const ARMS: [&str; 12] = [
 /// The arms a bounded run (`Scale::Ooc`) measures by default: the default
 /// and the three shipping options whose difference is what a read past
 /// the page cache costs -- no block cache, the cache bounded at RocksDB's
-/// 256 MB, and no read advice -- against the durable comparators, LMDB
-/// with its readahead off, which is how LMDB's documentation configures a
-/// store larger than memory, and RocksDB tuned. LMDB as it opens by default
-/// ran beside it for a while, a second comparison that read the same
-/// question against a weaker configuration. The buffered group is not
-/// here: a bounded row is about reads from the device, and a buffered load
-/// reads nothing a durable one does not. `--arms` overrides it as it does
-/// `ARMS`.
-pub const OOC_ARMS: [&str; 6] = [
+/// 256 MB, and no read advice -- the default with the compact form the
+/// controller's to choose (`supdb-autozpages`, `Options::zpages` at
+/// `Auto`), which is the engine's answer to a store past memory and reads
+/// its own faults to decide, against the durable comparators, LMDB with
+/// its readahead off, which is how LMDB's documentation configures a
+/// store larger than memory, and RocksDB tuned. LMDB as it opens by
+/// default ran beside it for a while, a second comparison that read the
+/// same question against a weaker configuration. The buffered group is
+/// not here: a bounded row is about reads from the device, and a buffered
+/// load reads nothing a durable one does not. `--arms` overrides it as it
+/// does `ARMS`.
+pub const OOC_ARMS: [&str; 7] = [
     "supdb",
     "supdb-nocache",
     "supdb-cache256",
     "supdb-noadvice",
+    "supdb-autozpages",
     "lmdb-nordahead",
     "rocksdb-tuned",
 ];

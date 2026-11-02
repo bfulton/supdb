@@ -41,7 +41,13 @@ The suite has to be fair before any of its numbers are quoted.
   had been lent and not filed; the thread files a burst's batches now
   (`Options::upkeep_files_bursts`), and what the divided pass still
   weights is the thread's phase at the burst's end and the full
-  rewrite's pieces (`docs/engine.md`, the pass after a burst).
+  rewrite's pieces (`docs/engine.md`, the pass after a burst). The
+  controller arm is in the roster now, and under a bound both engines
+  leave core at -- 1 GiB at ten million keys -- it reads and scans
+  several times LMDB's rate (`docs/engine.md`, the shift to the compact
+  form at ten million keys); a row under that bound is the one to bank
+  next, and `ZPages::Auto` as the engine's default is the decision after
+  it, once the in-core pairing of the two reads level.
 - [ ] **Match the checksum work, or state it.** RocksDB reads with
   `verify_checksums(false)`, under which it verifies no data block it
   reads, from the file or into its cache. supdb verifies a segment's key

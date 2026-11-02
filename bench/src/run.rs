@@ -212,8 +212,15 @@ impl Passes {
 pub const MIN_BOUND_BYTES: u64 = 256 << 20;
 
 /// The default divisor of a bounded run's read operations
-/// (`Plan::ops_div`).
-pub const OOC_OPS_DIV: u64 = 30;
+/// (`Plan::ops_div`). Thirty for a while: at ten million keys that made a
+/// read pass of some two seconds, and an engine that reads its own faults
+/// to choose a form (`supdb-autozpages`), with a census that ticks once a
+/// second and an entry that needs a sample, reached SUSPECT as the pass
+/// ended and acted in none of them -- a pass shorter than the engine's
+/// own adaptation measures the engine before it has adapted. Ten keeps a
+/// pass at ten million keys in the tens of seconds for every arm, and the
+/// row's time in the hour.
+pub const OOC_OPS_DIV: u64 = 10;
 
 pub struct Plan {
     pub scale: Scale,
@@ -4053,22 +4060,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The divisor: thirty at thirty million keys gives a million point
-    /// reads, ten thousand scans, a sixth of a million mix operations
-    /// and ten thousand lag scans; at ten thousand keys every divided
-    /// count sits on the floor of a thousand, or at the rung where the
-    /// rung is smaller; and at the two unbounded scales nothing is
-    /// divided at all.
+    /// The divisor: at thirty million keys the point reads, the scans, the
+    /// mix operations and the lag scans each divide by it, read from the
+    /// constant and not written out, so that moving the constant moves
+    /// the test with it; at ten thousand keys every divided count sits
+    /// on the floor of a thousand, or at the rung where the rung is
+    /// smaller; and at the two unbounded scales nothing is divided at
+    /// all.
     #[test]
     fn the_divisor_floors_at_a_thousand_and_divides_nothing_at_quick_and_full() {
         let ooc = Plan::new(Scale::Ooc, vec![], 30_000_000, 4);
         assert_eq!(ooc.ops_div, OOC_OPS_DIV);
         let size = 30_000_000u64;
-        assert_eq!(ooc.divided(size), 1_000_000);
-        assert_eq!(ooc.divided(size / ooc.scan_len as u64), 10_000);
-        assert_eq!(ooc.divided(ycsb_ops(size)), 166_667);
+        let scans = size / ooc.scan_len as u64;
+        assert_eq!(ooc.divided(size), size / OOC_OPS_DIV);
+        assert_eq!(ooc.divided(scans), scans / OOC_OPS_DIV);
+        assert_eq!(ooc.divided(ycsb_ops(size)), ycsb_ops(size) / OOC_OPS_DIV);
         // The lag scans are the scan pass's count.
-        assert_eq!(ooc.divided((size / ooc.scan_len as u64).max(1)), 10_000);
+        assert_eq!(ooc.divided(scans.max(1)), scans / OOC_OPS_DIV);
         // The floor at ten thousand keys: the reads at a thousand, the
         // scans at the rung's hundred, the mixes at their own thousand.
         assert_eq!(ooc.divided(10_000), 1_000);

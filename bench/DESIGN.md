@@ -103,9 +103,12 @@ counts beside the word. A pread engine fails the second leg by
 construction, since its refaults are `read()`s and not faults, so `odd`
 on a comparator's phase is the engine's read path and not a broken
 count. Every count is a cost and moves with the machine. A bounded
-row's read passes run a divided count of operations (`--ops-div`,
-thirty by default, never below a thousand operations); its loads and
-bursts are whole.
+row's read passes run a divided count of operations (`--ops-div`, ten
+by default, never below a thousand operations); its loads and bursts are
+whole. Ten and not thirty because a divided pass has to outlast the
+engine's own adaptation: at ten million keys a pass divided by thirty was
+some two seconds, and the arm whose controller reads its faults to choose
+a form reached SUSPECT as the pass ended.
 A divided pass is a different pass where its first operation builds
 what the rest reuse: at a tenth of the scans three of the four lag
 points at three million keys read supdb at a quarter to two fifths of
@@ -274,10 +277,15 @@ reached. The bound is the row's class (`/b<MiB>m`), since a store past it
 reads from the device where the same store unbounded reads from memory,
 and its rows live under `runs/ooc/`. Its default arms are the default,
 the three options whose difference is what a read past the page cache
-costs (`supdb-nocache`, `supdb-cache256`, `supdb-noadvice`) and the
-durable comparators: LMDB with its readahead off (`lmdb-nordahead`), as
-LMDB's documentation configures a store larger than memory, and RocksDB
-tuned. LMDB as it opens by default, which reads every random read past the
+costs (`supdb-nocache`, `supdb-cache256`, `supdb-noadvice`), the default
+with the compact form the controller's to choose (`supdb-autozpages`),
+and the durable comparators: LMDB with its readahead off
+(`lmdb-nordahead`), as LMDB's documentation configures a store larger
+than memory, and RocksDB tuned. The bound is chosen so that the top rung
+is out of core for every engine: a store of ten million keys is 1.3 GB
+in LMDB and 1.4 in supdb's raw form, so under 1.5 GiB LMDB's fits and
+supdb's sits at the edge of its budget, and under 1 GiB both read from
+the device, which is the regime the second form is for. LMDB as it opens by default, which reads every random read past the
 cache with its readahead window, is not in the roster. The
 scan floor's file is written and synced outside the group and dropped
 from the cache; the floors and every pass run inside it.
@@ -285,9 +293,9 @@ from the cache; the floors and every pass run inside it.
 Further arms exist for a bounded pairing and are in no roster, because
 each prices one engine option against the arm it differs from in one
 process (`bench ab --arms <base>,<arm>`) and is chosen by hand:
-`supdb-autozpages` and `supdb-nocacheautozpages` are `supdb` and
-`supdb-nocache` with the compact form the controller's to choose (a pass
-asks nothing of the form under them: what the controller builds and reads
+`supdb-nocacheautozpages` is `supdb-nocache` with the compact form the
+controller's to choose, as `supdb-autozpages` is `supdb` (a pass asks
+nothing of the form under them: what the controller builds and reads
 through is its decision, carried by the `zpage_*` rows, and only a form
 file out of service refuses the pass),
 `supdb-nocacheordread` reads a point through the ordered index,
