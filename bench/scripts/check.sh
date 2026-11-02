@@ -43,6 +43,7 @@ for g in $groups; do
       cargo clippy --release --all-targets -- -D warnings
       sh scripts/fmt.sh --check
       sh scripts/workflows.sh
+      python3 scripts/policy_defaults.py
       ;;
     quick)
       say quick

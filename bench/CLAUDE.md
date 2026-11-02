@@ -390,6 +390,22 @@ the threaded read pass's count, tens of milliseconds at the smallest
 rung as the read passes are; the first row after it banks on its
 controls as a definition step.
 
+**A policy default that restated the engine's.** `Policy` says what an
+arm differs from `supdb` by, and two of its fields -- the controller's
+drop of the raw pages a form serves and its builds ahead at landing --
+carried defaults of their own, off, while the engine's had moved to on:
+every arm that pinned neither, the plain controller arm among them, ran
+the controller without both, and every measurement of it at scale was
+of a shape the engine does not ship, read for a week as the controller
+reaching its form late. A field that follows the engine is an `Option`
+resolved through `unwrap_or(supdb::Options::default().<field>)`, as the
+seal cap and the trigger already were, and the arms whose pairs were
+priced against the old shape pin it. `scripts/policy_defaults.py` runs
+in `lint` and holds every field the policy maps as its own value or its
+negation to the engine's default. The rule: a default stated twice is
+two defaults, and an arm that pins nothing inherits the engine's rather
+than restating it.
+
 **A workflow that never runs can be syntactically invalid for months.**
 Both self-hosted pickup watchdogs arrived with a block of an older draft
 pasted after their `exit 1`. `scripts/workflows.sh` parses every `run:`

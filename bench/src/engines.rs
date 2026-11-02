@@ -926,8 +926,10 @@ pub struct Supdb {
     /// A partition's raw file and ordered index dropped from the page cache
     /// once its form file serves it (`Options::zpages_drop_raw`):
     /// `supdb-cache64tofitzpagesdrop` and `supdb-cache64tofitzpageshot4drop`
-    /// against the same without.
-    zdropraw: bool,
+    /// against the same without. `None` follows the engine; the
+    /// `cache64tofit` arms pin the shape before the drop, since their pairs
+    /// were priced against it.
+    zdropraw: Option<bool>,
     /// The block coding's groups written by the parsing encoder
     /// (`Options::zpages_parse`): `supdb-cache64tofitzpagesdropparse`
     /// against `supdb-cache64tofitzpagesdrop`, and
@@ -948,8 +950,9 @@ pub struct Supdb {
     zdropattach: bool,
     /// The builds ahead from this percent of the budget, beside the seals
     /// that land (`Options::zpages_land_pct`): the `...dropland<pct>` arms
-    /// against `supdb-cache64tofitautozpagesdrop`.
-    zlandpct: u32,
+    /// against `supdb-cache64tofitautozpagesdrop`. `None` follows the
+    /// engine; the `cache64tofit` arms pin zero, the shape before.
+    zlandpct: Option<u32>,
     /// The sampler at the idle classes (`Options::zpages_sample_idle`):
     /// `supdb-cache64tofitautozpagesdropsampleidle` against
     /// `supdb-cache64tofitautozpagesdrop`.
@@ -1544,7 +1547,7 @@ struct Policy {
     zhotfirst: usize,
     /// Its raw pages dropped behind the form (`Options::zpages_drop_raw`):
     /// `supdb-cache64tofitzpagesdrop`, `supdb-cache64tofitzpageshot4drop`.
-    zdropraw: bool,
+    zdropraw: Option<bool>,
     /// Its block-coded groups the parsing encoder's (`Options::zpages_parse`):
     /// `supdb-cache64tofitzpagesdropparse`, `supdb-cache64tofitautozpagesparse`.
     zparse: bool,
@@ -1558,7 +1561,7 @@ struct Policy {
     zdropattach: bool,
     /// The builds ahead from this percent of the budget
     /// (`Options::zpages_land_pct`).
-    zlandpct: u32,
+    zlandpct: Option<u32>,
     /// The sampler at the idle classes (`Options::zpages_sample_idle`):
     /// `supdb-cache64tofitautozpagesdropsampleidle`.
     zsampleidle: bool,
@@ -1737,7 +1740,7 @@ impl Default for Policy {
             zparse: false,
             zflexdec: false,
             zdropattach: false,
-            zlandpct: 0,
+            zlandpct: None,
             zsampleidle: false,
             zattachwarm: false,
             znowritercensus: false,
@@ -1760,7 +1763,7 @@ impl Default for Policy {
             ztrimpass: false,
             ztrimresident: false,
             zhotfirst: 0,
-            zdropraw: false,
+            zdropraw: None,
             zrecode: false,
             zrecodekeep: false,
             settleevery: false,
@@ -3430,6 +3433,9 @@ impl Supdb {
     /// head against what the point reads lose to the page cache the cache
     /// displaces; against `supdb-cache64tofit`, what the compact form adds
     /// to the cache arm out of core.
+    /// The controller as it was before the drop of the raw pages a form
+    /// serves and the builds ahead at landing, both of which the engine
+    /// ships on: the `drop` and `dropland` arms are paired against this.
     pub fn create_cache64_tofit_auto_zpages(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
@@ -3437,6 +3443,8 @@ impl Supdb {
                 budget: 64 << 20,
                 tofit: true,
                 zpages_auto: true,
+                zdropraw: Some(false),
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -3454,6 +3462,8 @@ impl Supdb {
                 budget: 128 << 20,
                 tofit: true,
                 zpages_auto: true,
+                zdropraw: Some(false),
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -3467,6 +3477,8 @@ impl Supdb {
                 budget: 256 << 20,
                 tofit: true,
                 zpages_auto: true,
+                zdropraw: Some(false),
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -3487,6 +3499,8 @@ impl Supdb {
                 tofit: true,
                 zpages_auto: true,
                 zcacheraw: true,
+                zdropraw: Some(false),
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -3507,6 +3521,8 @@ impl Supdb {
                 tofit: true,
                 zpages_auto: true,
                 zcodingfixed: true,
+                zdropraw: Some(false),
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -3529,6 +3545,8 @@ impl Supdb {
                 tofit: true,
                 zpages_auto: true,
                 zpromote: 64,
+                zdropraw: Some(false),
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -3549,6 +3567,8 @@ impl Supdb {
                 tofit: true,
                 zpages_auto: true,
                 zgroup: Some(0),
+                zdropraw: Some(false),
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -3568,6 +3588,8 @@ impl Supdb {
                 tofit: true,
                 zpages_auto: true,
                 zgroup: Some(1024),
+                zdropraw: Some(false),
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -3590,6 +3612,8 @@ impl Supdb {
                 tofit: true,
                 zpages_auto: true,
                 zprebuild: true,
+                zdropraw: Some(false),
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -3608,6 +3632,8 @@ impl Supdb {
                 tofit: true,
                 zpages_auto: true,
                 zspan: true,
+                zdropraw: Some(false),
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -3630,6 +3656,8 @@ impl Supdb {
                 tofit: true,
                 zpages_auto: true,
                 zexactcut: true,
+                zdropraw: Some(false),
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -3643,6 +3671,8 @@ impl Supdb {
                 tofit: true,
                 zpages_auto: true,
                 zmemolinear: true,
+                zdropraw: Some(false),
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -3661,6 +3691,8 @@ impl Supdb {
                 tofit: true,
                 zpages_auto: true,
                 zcheckedviews: true,
+                zdropraw: Some(false),
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -3680,6 +3712,8 @@ impl Supdb {
                 tofit: true,
                 zpages_auto: true,
                 zrecord: true,
+                zdropraw: Some(false),
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -3698,6 +3732,8 @@ impl Supdb {
                 tofit: true,
                 zpages_auto: true,
                 zmemofirst: true,
+                zdropraw: Some(false),
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -3715,6 +3751,8 @@ impl Supdb {
                 tofit: true,
                 zpages_auto: true,
                 zfencetree: true,
+                zdropraw: Some(false),
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -3732,6 +3770,8 @@ impl Supdb {
                 tofit: true,
                 zpages_auto: true,
                 zmemonoahead: true,
+                zdropraw: Some(false),
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -3749,6 +3789,8 @@ impl Supdb {
                 tofit: true,
                 zpages_auto: true,
                 zstartcache: true,
+                zdropraw: Some(false),
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -3768,6 +3810,8 @@ impl Supdb {
                 tofit: true,
                 zpages_auto: true,
                 zperrun: true,
+                zdropraw: Some(false),
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -3786,6 +3830,8 @@ impl Supdb {
                 tofit: true,
                 zpages_auto: true,
                 zmemo_mib: mib,
+                zdropraw: Some(false),
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -3814,6 +3860,8 @@ impl Supdb {
                 budget: 256 << 20,
                 tofit: true,
                 notrim: true,
+                zdropraw: Some(false),
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -4647,6 +4695,7 @@ impl Supdb {
                 budget: 64 << 20,
                 tofit: true,
                 zpages: true,
+                zdropraw: Some(false),
                 ..Policy::default()
             },
         )
@@ -4663,6 +4712,7 @@ impl Supdb {
                 tofit: true,
                 zpages: true,
                 zstored: true,
+                zdropraw: Some(false),
                 ..Policy::default()
             },
         )
@@ -4694,6 +4744,7 @@ impl Supdb {
                 tofit: true,
                 zpages: true,
                 zrawtails: true,
+                zdropraw: Some(false),
                 ..Policy::default()
             },
         )
@@ -4714,6 +4765,7 @@ impl Supdb {
                 zpages: true,
                 zrawtails: true,
                 zdecodewalk: true,
+                zdropraw: Some(false),
                 ..Policy::default()
             },
         )
@@ -4735,6 +4787,7 @@ impl Supdb {
                 zrawtails: true,
                 zpages_nomemo: true,
                 ztrim: true,
+                zdropraw: Some(false),
                 ..Policy::default()
             },
         )
@@ -4756,6 +4809,7 @@ impl Supdb {
                 zpages_nomemo: true,
                 ztrim: true,
                 ztrimpass: true,
+                zdropraw: Some(false),
                 ..Policy::default()
             },
         )
@@ -4779,6 +4833,7 @@ impl Supdb {
                 ztrim: true,
                 ztrimpass: true,
                 ztrimresident: true,
+                zdropraw: Some(false),
                 ..Policy::default()
             },
         )
@@ -4798,6 +4853,7 @@ impl Supdb {
                 tofit: true,
                 zpages: true,
                 zhotfirst: 4,
+                zdropraw: Some(false),
                 ..Policy::default()
             },
         )
@@ -4816,7 +4872,7 @@ impl Supdb {
                 budget: 64 << 20,
                 tofit: true,
                 zpages: true,
-                zdropraw: true,
+                zdropraw: Some(true),
                 ..Policy::default()
             },
         )
@@ -4834,7 +4890,7 @@ impl Supdb {
                 budget: 64 << 20,
                 tofit: true,
                 zpages: true,
-                zdropraw: true,
+                zdropraw: Some(true),
                 zparse: true,
                 ..Policy::default()
             },
@@ -4853,7 +4909,7 @@ impl Supdb {
                 budget: 64 << 20,
                 tofit: true,
                 zpages: true,
-                zdropraw: true,
+                zdropraw: Some(true),
                 zflexdec: true,
                 ..Policy::default()
             },
@@ -4871,6 +4927,8 @@ impl Supdb {
                 tofit: true,
                 zpages_auto: true,
                 zflexdec: true,
+                zdropraw: Some(false),
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -4889,7 +4947,8 @@ impl Supdb {
                 budget: 64 << 20,
                 tofit: true,
                 zpages_auto: true,
-                zdropraw: true,
+                zdropraw: Some(true),
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -4906,8 +4965,8 @@ impl Supdb {
                 budget: 64 << 20,
                 tofit: true,
                 zpages_auto: true,
-                zdropraw: true,
-                zlandpct: pct,
+                zdropraw: Some(true),
+                zlandpct: Some(pct),
                 ..Policy::default()
             },
         )
@@ -4924,8 +4983,8 @@ impl Supdb {
                 budget: 64 << 20,
                 tofit: true,
                 zpages_auto: true,
-                zdropraw: true,
-                zlandpct: 50,
+                zdropraw: Some(true),
+                zlandpct: Some(50),
                 zattachwarm: true,
                 ..Policy::default()
             },
@@ -4944,8 +5003,8 @@ impl Supdb {
                 budget: 64 << 20,
                 tofit: true,
                 zpages_auto: true,
-                zdropraw: true,
-                zlandpct: 50,
+                zdropraw: Some(true),
+                zlandpct: Some(50),
                 znoattacheager: true,
                 ..Policy::default()
             },
@@ -4964,8 +5023,8 @@ impl Supdb {
                 budget: 64 << 20,
                 tofit: true,
                 zpages_auto: true,
-                zdropraw: true,
-                zlandpct: 50,
+                zdropraw: Some(true),
+                zlandpct: Some(50),
                 zkeepbehind: true,
                 ..Policy::default()
             },
@@ -4983,8 +5042,8 @@ impl Supdb {
                 budget: 64 << 20,
                 tofit: true,
                 zpages_auto: true,
-                zdropraw: true,
-                zlandpct: 50,
+                zdropraw: Some(true),
+                zlandpct: Some(50),
                 znobuildsync: true,
                 ..Policy::default()
             },
@@ -5002,8 +5061,8 @@ impl Supdb {
                 budget: 64 << 20,
                 tofit: true,
                 zpages_auto: true,
-                zdropraw: true,
-                zlandpct: 50,
+                zdropraw: Some(true),
+                zlandpct: Some(50),
                 zcoldskip: true,
                 ..Policy::default()
             },
@@ -5021,8 +5080,9 @@ impl Supdb {
                 budget: 64 << 20,
                 tofit: true,
                 zpages_auto: true,
-                zdropraw: true,
+                zdropraw: Some(true),
                 zsampleidle: true,
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -5039,8 +5099,9 @@ impl Supdb {
                 budget: 64 << 20,
                 tofit: true,
                 zpages_auto: true,
-                zdropraw: true,
+                zdropraw: Some(true),
                 znowritercensus: true,
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -5057,8 +5118,9 @@ impl Supdb {
                 budget: 64 << 20,
                 tofit: true,
                 zpages_auto: true,
-                zdropraw: true,
+                zdropraw: Some(true),
                 zdropattach: true,
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -5077,6 +5139,8 @@ impl Supdb {
                 tofit: true,
                 zpages_auto: true,
                 zparse: true,
+                zdropraw: Some(false),
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -5094,7 +5158,7 @@ impl Supdb {
                 tofit: true,
                 zpages: true,
                 zhotfirst: 4,
-                zdropraw: true,
+                zdropraw: Some(true),
                 ..Policy::default()
             },
         )
@@ -5111,7 +5175,7 @@ impl Supdb {
                 tofit: true,
                 zpages: true,
                 zhotfirst: 8,
-                zdropraw: true,
+                zdropraw: Some(true),
                 ..Policy::default()
             },
         )
@@ -5131,7 +5195,7 @@ impl Supdb {
                 tofit: true,
                 zpages: true,
                 zhotfirst: 8,
-                zdropraw: true,
+                zdropraw: Some(true),
                 settleevery: true,
                 ..Policy::default()
             },
@@ -5152,7 +5216,7 @@ impl Supdb {
                 tofit: true,
                 zpages: true,
                 zhotfirst: 8,
-                zdropraw: true,
+                zdropraw: Some(true),
                 settleevery: true,
                 settlebuilds: true,
                 ..Policy::default()
@@ -5173,7 +5237,7 @@ impl Supdb {
                 budget: 64 << 20,
                 tofit: true,
                 zpages: true,
-                zdropraw: true,
+                zdropraw: Some(true),
                 zrecode: true,
                 zrecodekeep: true,
                 zboth: true,
@@ -5224,6 +5288,8 @@ impl Supdb {
                 zpages_auto: true,
                 settleevery: true,
                 settlebuilds: true,
+                zdropraw: Some(false),
+                zlandpct: Some(0),
                 ..Policy::default()
             },
         )
@@ -5241,7 +5307,7 @@ impl Supdb {
                 budget: 64 << 20,
                 tofit: true,
                 zpages: true,
-                zdropraw: true,
+                zdropraw: Some(true),
                 zrecode: true,
                 ..Policy::default()
             },
@@ -5259,7 +5325,7 @@ impl Supdb {
                 budget: 64 << 20,
                 tofit: true,
                 zpages: true,
-                zdropraw: true,
+                zdropraw: Some(true),
                 zrecode: true,
                 zrecodekeep: true,
                 ..Policy::default()
@@ -5280,7 +5346,7 @@ impl Supdb {
                 tofit: true,
                 zpages: true,
                 zrawtails: true,
-                zdropraw: true,
+                zdropraw: Some(true),
                 ..Policy::default()
             },
         )
@@ -5297,6 +5363,7 @@ impl Supdb {
                 tofit: true,
                 zpages: true,
                 zhotfirst: 1,
+                zdropraw: Some(false),
                 ..Policy::default()
             },
         )
@@ -5939,9 +6006,9 @@ impl Supdb {
             upkeep_trim_look: ztrimpass,
             trim_by_resident: ztrimresident,
             zpages_raw_tails_first: zhotfirst,
-            zpages_drop_raw: zdropraw,
+            zpages_drop_raw: zdropraw.unwrap_or(supdb::Options::default().zpages_drop_raw),
             zpages_drop_at_install: !zdropattach,
-            zpages_land_pct: zlandpct,
+            zpages_land_pct: zlandpct.unwrap_or(supdb::Options::default().zpages_land_pct),
             zpages_sample_idle: zsampleidle,
             zpages_attach_first: !zattachwarm,
             zpages_writer_census: !znowritercensus,
@@ -6258,6 +6325,10 @@ impl ThreadReader for TallyReader {
 
 impl Engine for Supdb {
     fn name(&self) -> &'static str {
+        // The pinned shapes alone name an arm; a field that follows the
+        // engine names nothing.
+        let zdropraw = self.zdropraw == Some(true);
+        let zlandpct = self.zlandpct.unwrap_or(0);
         // Before the budget branch, which would name the policy the cache
         // arm whatever else it carries.
         if self.budget > 0 && self.tofit && self.zpages_auto {
@@ -6273,31 +6344,31 @@ impl Engine for Supdb {
                 "supdb-cache64tofitautozpagesparse"
             } else if self.zflexdec {
                 "supdb-cache64tofitautozpagesflexdec"
-            } else if self.zdropraw && self.znowritercensus {
+            } else if zdropraw && self.znowritercensus {
                 "supdb-cache64tofitautozpagesdropnowritercensus"
-            } else if self.zdropraw && self.zsampleidle {
+            } else if zdropraw && self.zsampleidle {
                 "supdb-cache64tofitautozpagesdropsampleidle"
-            } else if self.zdropraw && self.zlandpct == 50 && self.zcoldskip {
+            } else if zdropraw && zlandpct == 50 && self.zcoldskip {
                 "supdb-cache64tofitautozpagesdropland50coldskip"
-            } else if self.zdropraw && self.zlandpct == 50 && self.znobuildsync {
+            } else if zdropraw && zlandpct == 50 && self.znobuildsync {
                 "supdb-cache64tofitautozpagesdropland50nobuildsync"
-            } else if self.zdropraw && self.zlandpct == 50 && self.zkeepbehind {
+            } else if zdropraw && zlandpct == 50 && self.zkeepbehind {
                 "supdb-cache64tofitautozpagesdropland50keepbehind"
-            } else if self.zdropraw && self.zlandpct == 50 && self.znoattacheager {
+            } else if zdropraw && zlandpct == 50 && self.znoattacheager {
                 "supdb-cache64tofitautozpagesdropland50noattacheager"
-            } else if self.zdropraw && self.zlandpct == 50 && self.zattachwarm {
+            } else if zdropraw && zlandpct == 50 && self.zattachwarm {
                 "supdb-cache64tofitautozpagesdropland50attachwarm"
-            } else if self.zdropraw && self.zlandpct > 0 {
-                match self.zlandpct {
+            } else if zdropraw && zlandpct > 0 {
+                match zlandpct {
                     25 => "supdb-cache64tofitautozpagesdropland25",
                     50 => "supdb-cache64tofitautozpagesdropland50",
                     75 => "supdb-cache64tofitautozpagesdropland75",
                     100 => "supdb-cache64tofitautozpagesdropland100",
                     _ => "supdb-cache64tofitautozpagesdropland",
                 }
-            } else if self.zdropraw && self.zdropattach {
+            } else if zdropraw && self.zdropattach {
                 "supdb-cache64tofitautozpagesdropattach"
-            } else if self.zdropraw {
+            } else if zdropraw {
                 "supdb-cache64tofitautozpagesdrop"
             } else if self.zcacheraw {
                 "supdb-cache64tofitautozpagesraw"
@@ -6344,29 +6415,29 @@ impl Engine for Supdb {
         if self.budget == 64 << 20 && self.tofit && self.zpages {
             return if self.zstored {
                 "supdb-cache64tofitzpagesstored"
-            } else if self.zboth && self.zrecodekeep && self.zrecode && self.zdropraw {
+            } else if self.zboth && self.zrecodekeep && self.zrecode && zdropraw {
                 "supdb-cache64tofitzpagesbothdrop"
-            } else if self.zrecodekeep && self.zrecode && self.zdropraw {
+            } else if self.zrecodekeep && self.zrecode && zdropraw {
                 "supdb-cache64tofitzpagesrecodekeepdrop"
-            } else if self.zrecode && self.zdropraw {
+            } else if self.zrecode && zdropraw {
                 "supdb-cache64tofitzpagesrecodedrop"
-            } else if self.zhotfirst == 8 && self.zdropraw && self.settlebuilds {
+            } else if self.zhotfirst == 8 && zdropraw && self.settlebuilds {
                 "supdb-cache64tofitzpageshot8dropsettlebuilds"
-            } else if self.zhotfirst == 8 && self.zdropraw && self.settleevery {
+            } else if self.zhotfirst == 8 && zdropraw && self.settleevery {
                 "supdb-cache64tofitzpageshot8dropsettleevery"
-            } else if self.zhotfirst == 8 && self.zdropraw {
+            } else if self.zhotfirst == 8 && zdropraw {
                 "supdb-cache64tofitzpageshot8drop"
-            } else if self.zrawtails && self.zdropraw {
+            } else if self.zrawtails && zdropraw {
                 "supdb-cache64tofitzpagesrecordrawdrop"
-            } else if self.zhotfirst == 4 && self.zdropraw {
+            } else if self.zhotfirst == 4 && zdropraw {
                 "supdb-cache64tofitzpageshot4drop"
             } else if self.zhotfirst == 4 {
                 "supdb-cache64tofitzpageshot4"
-            } else if self.zdropraw && self.zparse {
+            } else if zdropraw && self.zparse {
                 "supdb-cache64tofitzpagesdropparse"
-            } else if self.zdropraw && self.zflexdec {
+            } else if zdropraw && self.zflexdec {
                 "supdb-cache64tofitzpagesdropflexdec"
-            } else if self.zdropraw {
+            } else if zdropraw {
                 "supdb-cache64tofitzpagesdrop"
             } else if self.zhotfirst == 1 {
                 "supdb-cache64tofitzpageshot1"

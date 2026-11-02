@@ -1537,8 +1537,9 @@ pub struct Options {
     /// install read C 1.24-1.43x, D 1.41-1.69x and E 1.20-1.35x, A level,
     /// their faults gone from 0.001-0.018 an operation to none, and the
     /// passes before it level; in core the form serves nothing and nothing
-    /// is dropped. On; off is `supdb-cache64tofitautozpages` and the forced
-    /// arms named without `drop`.
+    /// is dropped. On; off is `supdb-cache64tofitautozpages` and the
+    /// `cache64tofit` arms named without `drop`, which pin the shape before
+    /// it; the suite's other arms follow the engine.
     #[doc(hidden)]
     pub zpages_drop_raw: bool,
     /// Under the raw drop (`zpages_drop_raw`), a partition's raw pages are
@@ -16893,6 +16894,7 @@ impl Reader {
         };
         // An empty piece has nothing to promote; leave it to the merge.
         if pieces.iter().any(|&si| self.segs()[si].blob.keys() == 0) {
+            self.z_refused("promotion: an empty piece");
             return None;
         }
         pieces.sort_by_key(|&si| first_of(si));
@@ -16904,6 +16906,12 @@ impl Reader {
             // Strictly above everything before it, and inside the range.
             if let Some(pl) = &prev_last {
                 if *pl >= b {
+                    self.z_refused(&format!(
+                        "promotion: {} first {} not above {}",
+                        self.segs()[si].name,
+                        String::from_utf8_lossy(&first),
+                        String::from_utf8_lossy(pl)
+                    ));
                     return None;
                 }
             }
@@ -16922,12 +16930,27 @@ impl Reader {
                 b <= range.0
             };
             if under || range.1.as_ref().is_some_and(|h| &b >= h) {
+                self.z_refused(&format!(
+                    "promotion: {} first {} outside the range",
+                    self.segs()[si].name,
+                    String::from_utf8_lossy(&first)
+                ));
                 return None;
             }
             bounds.push(b);
             prev_last = last_of(si);
         }
         Some(bounds)
+    }
+
+    /// The controller's trace of a promotion refused, one line: what the
+    /// builds ahead at landing wait behind is the merge a refusal makes.
+    fn z_refused(&self, why: &str) {
+        // The flag the segment work reads at its start, read here per
+        // refusal: a promotion is decided once a landing.
+        if std::env::var_os("SUPDB_ZPAGES_TRACE").is_some() {
+            eprintln!("zpromote refused: {why}");
+        }
     }
 
     // The starvation lesson that shaped `merge_due`: EVERY range that is
@@ -34944,6 +34967,13 @@ impl Maint {
                     .iter()
                     .any(|s| zfile::zpg_fields(&s.name) == Some(fields))
             {
+                if self.z_trace {
+                    eprintln!(
+                        "zretire t={:.1} {} form file unlinked with its segment",
+                        self.z_epoch.elapsed().as_secs_f64(),
+                        name
+                    );
+                }
                 if self.wake.is_some() {
                     let n = self.shared.next_dead.fetch_add(1, AtomicOrdering::Relaxed);
                     let dead = self.dir.join(zfile::zpg_dead_name(n));
@@ -35066,6 +35096,7 @@ impl Maint {
                 .map(|(i, _)| i)
                 .collect();
             let Some(pi) = part else {
+                self.z_refused("promotion: no partition over the range");
                 rest.push(f);
                 continue;
             };
@@ -35074,6 +35105,10 @@ impl Maint {
                     .iter()
                     .any(|&i| self.in_flight_input(&self.segs()[i].name))
             {
+                self.z_refused(&format!(
+                    "promotion: {} or a piece over it is a merge's input",
+                    self.segs()[pi].name
+                ));
                 rest.push(f);
                 continue;
             }
@@ -35087,6 +35122,10 @@ impl Maint {
                 .iter()
                 .any(|s| s.level == 0 && !candidate(s) && fences_overlap(&s.lo, &s.hi, &f.0, &f.1));
             if unaligned {
+                self.z_refused(&format!(
+                    "promotion: a piece over {} is cut at other fences",
+                    self.segs()[pi].name
+                ));
                 rest.push(f);
                 continue;
             }
@@ -35181,6 +35220,9 @@ impl Maint {
                 .iter()
                 .any(|&i| self.in_flight_input(&self.segs()[i].name))
         {
+            if !pieces.is_empty() {
+                self.z_refused("promotion: a full-range piece is a merge's input");
+            }
             return Ok(false);
         }
         if pieces.len() == 1 {
@@ -36510,18 +36552,20 @@ impl Maint {
         None
     }
 
-    /// Whether builds ahead are still to run or running: the sampler
-    /// waits for them, so that its reading prices the attach of files
-    /// already written and not a build the builder is in the middle of.
+    /// Whether a build ahead is running: the sampler waits for it, so that
+    /// its reading prices the attach of a file already written and not a
+    /// build the builder is in the middle of. Not for the builds still
+    /// due: at ten million keys under a bound the load's last partitions
+    /// land as the reads begin, a build ahead is a third of a second, and
+    /// a sampler that waited for every one due sampled after the read
+    /// pass had ended, with thirty-six files on disk it never priced; the
+    /// sample prices those as an attach and the rest as the build they
+    /// are, and the buy attaches and builds.
     fn z_prebuild_pending(&self) -> bool {
         if !self.opts.zpages_prebuild && self.opts.zpages_land_pct == 0 {
             return false;
         }
-        if self.zbuild.as_ref().is_some_and(|b| b.dormant) {
-            return true;
-        }
-        let _op = self.op();
-        self.z_prebuild_next().is_some()
+        self.zbuild.as_ref().is_some_and(|b| b.dormant)
     }
 
     /// One build ahead started where one is due and the builder is free.
@@ -36592,7 +36636,7 @@ impl Maint {
     /// kernel evicted the unbuilt partitions' records before them. Once a
     /// store, before any install.
     fn z_cross(&self) {
-        let (mut n, mut asked) = (0u64, 0u64);
+        let (mut n, mut asked, mut live) = (0u64, 0u64, 0u64);
         {
             let _op = self.op();
             for s in self
@@ -36600,6 +36644,7 @@ impl Maint {
                 .iter()
                 .filter(|s| s.level > 0 && s.z.get().is_none())
             {
+                live += 1;
                 let Some((id, end)) = Db::name_id(&s.name).zip(Db::name_end_seq(&s.name)) else {
                     continue;
                 };
@@ -36619,11 +36664,32 @@ impl Maint {
         }
         zfile::ZEvents::add(&self.shared.z.ahead_swapped, n);
         if self.z_trace {
+            // What the directory holds beside what the live partitions
+            // are named: a form file for a partition no longer live is a
+            // build ahead a merge retired.
+            let on_disk = std::fs::read_dir(&self.dir)
+                .map(|d| {
+                    d.filter_map(|e| e.ok())
+                        .filter(|e| e.file_name().to_string_lossy().ends_with(".zpg"))
+                        .count()
+                })
+                .unwrap_or(0);
+            let live_ids: Vec<String> = {
+                let _op = self.op();
+                self.segs()
+                    .iter()
+                    .filter(|s| s.level > 0)
+                    .map(|s| Db::name_id(&s.name).unwrap_or(0).to_string())
+                    .collect()
+            };
             eprintln!(
-                "zahead t={:.1} crossed swapped {} asked_mb {:.1}",
+                "zahead t={:.1} crossed swapped {} of {} live asked_mb {:.1} zpg_on_disk {} live_ids [{}]",
                 self.z_epoch.elapsed().as_secs_f64(),
                 n,
-                asked as f64 / 1048576.0
+                live,
+                asked as f64 / 1048576.0,
+                on_disk,
+                live_ids.join(" ")
             );
         }
     }
@@ -37613,6 +37679,28 @@ impl Maint {
         };
         if inputs.is_empty() {
             return Ok(());
+        }
+        if self.z_trace {
+            // The merge's inputs by level and id, for the controller's trace:
+            // a build ahead of a partition a merge then retires is a build
+            // for nothing.
+            let ids: Vec<String> = inputs
+                .iter()
+                .map(|n| {
+                    format!(
+                        "{}{}",
+                        if n.starts_with("par-") { "p" } else { "l0:" },
+                        Db::name_id(n).unwrap_or(0)
+                    )
+                })
+                .collect();
+            eprintln!(
+                "zmerge t={:.1} inputs {} [{}] fences {}",
+                self.z_epoch.elapsed().as_secs_f64(),
+                inputs.len(),
+                ids.join(" "),
+                fences.as_ref().map_or(0, |f| f.len())
+            );
         }
         let pb = self
             .opts
