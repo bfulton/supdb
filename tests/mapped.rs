@@ -3,7 +3,10 @@
 //! Its own test binary, with one test, because what it reads is the
 //! process's: the anonymous bytes resident, which every other test's
 //! stores move, and the count of the engine's mapped blocks, which every
-//! store in the process maps into.
+//! store in the process maps into. Linux only, for the kernel's count of
+//! the anonymous bytes (`RssAnon`); elsewhere the binary holds no test.
+
+#![cfg(target_os = "linux")]
 
 use supdb::{Db, Options};
 
@@ -11,7 +14,6 @@ mod common;
 use common::kv;
 
 /// The anonymous bytes this process has resident, from the kernel.
-#[cfg(target_os = "linux")]
 fn anon_resident() -> u64 {
     let text = std::fs::read_to_string("/proc/self/status").unwrap();
     supdb::db::zselect::parse_status_rss_anon(&text).expect("RssAnon in /proc/self/status")
@@ -23,7 +25,6 @@ fn anon_resident() -> u64 {
 /// have kept the heap's. The write is a batch of appends and one commit,
 /// a seal never reached (`seal_bytes` above the table), so the table lives
 /// until the close and nothing but the close frees it.
-#[cfg(target_os = "linux")]
 #[test]
 fn a_closed_stores_blocks_are_not_resident() {
     let d = std::env::temp_dir().join(format!("supdb-next-mapped-{}", std::process::id()));
