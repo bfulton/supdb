@@ -39,6 +39,8 @@ run    measures every arm over the size ladder and writes runs/<scale>/<utc>-<sh
                count; --resume-passes keeps a cut rep's passes, for a loop that is not the series'
        A pass killed under the bound is a cell of the row, which then goes under
        <out>/killed/<scale>/, and the command exits 137 once the row is written.
+       Stores on a RAM-backed block device (zram, loop) are refused: a row's rates are
+       the device's, and that one is nobody's; scripts/zram.sh runs ab on one for counts.
 ab     two arms in one process, alternating and paired rep by rep, for choosing
        between them rather than for the series: the order swaps every other rep
        so neither stands first more often, and the verdict is a sign test over
@@ -59,6 +61,8 @@ ab     two arms in one process, alternating and paired rep by rep, for choosing
        --fresh-process each pass in a process of its own, --one-process both arms in this one
                (default: fresh under a bound, one in core); a pass killed under the bound
                loses its rep's pair, the pairing goes on, and the command exits 137.
+       On a RAM-backed block device (scripts/zram.sh) the table names the device at its
+       head and its foot: the counts are the disk's own, the rates are not.
        An arm against itself (--arms supdb,supdb) is the control: what a
        verdict looks like when nothing differs.
 gate   compares ROW to the last ten rows of its class and scale under runs/ (--runs, default runs);
@@ -243,6 +247,26 @@ fn cmd_gate(a: Args) -> i32 {
     }
 }
 
+/// The refusal of a RAM-backed device under the stores for a command that
+/// writes a row, or none. A row's out-of-core rates are the faults an
+/// operation takes times the device's answer, and on zram the answer is a
+/// tenth of the disk's; the counts are the same, which is what
+/// `scripts/zram.sh` runs `ab` for, and a row of them would be the
+/// series' only by a reader's care.
+fn ram_backed_refusal() -> Option<String> {
+    let dev = env::ram_backed_device(&std::env::temp_dir())?;
+    Some(format!(
+        "the stores would be on {dev}, a RAM-backed block device, whose rates are nobody's; \
+         a row of the series is the machine's disk's. For the counts, run a pairing through \
+         scripts/zram.sh instead"
+    ))
+}
+
+/// The line a pairing on a RAM-backed device carries at its table's head
+/// and foot, so a table read later says what its rates are not.
+const RAM_BACKED_LINE: &str =
+    "a RAM-backed block device: the counts are the disk's own, the rates are not; quote none";
+
 fn cmd_ab(a: Args) -> i32 {
     let arms: Vec<String> = a
         .get("--arms")
@@ -351,6 +375,10 @@ fn cmd_ab(a: Args) -> i32 {
             String::new()
         }
     );
+    let ram = env::ram_backed_device(&std::env::temp_dir());
+    if let Some(dev) = &ram {
+        eprintln!("bench ab: stores on {dev}, {RAM_BACKED_LINE}");
+    }
     let mut log = std::io::stderr();
     let (got, killed) = match run::ab((a0, b0), size, reps, &plan, &mut log) {
         Ok(g) => g,
@@ -359,6 +387,9 @@ fn cmd_ab(a: Args) -> i32 {
             return 1;
         }
     };
+    if let Some(dev) = &ram {
+        println!("\nstores on {dev}, {RAM_BACKED_LINE}");
+    }
     println!(
         "\n{:<34} {:>13} {:>13} {:>8} {:>9} {:>8}",
         "quantity", a0, b0, "B/A", "B above A", "sign p"
@@ -403,6 +434,9 @@ fn cmd_ab(a: Args) -> i32 {
                 println!("  rep {:>3}  {:>15.2} {:>15.2}  {:>7.3}x", i + 1, x, y, r);
             }
         }
+    }
+    if let Some(dev) = &ram {
+        println!("\nstores on {dev}, {RAM_BACKED_LINE}");
     }
     if !killed.is_empty() {
         eprintln!(
@@ -533,6 +567,10 @@ fn cmd_resume(dir: &Path, a: Args) -> i32 {
         r => r,
     };
     let passes_only = a.has("--resume-passes");
+    if let Some(why) = ram_backed_refusal() {
+        eprintln!("bench run: refused: {why}");
+        return 2;
+    }
     // Then as a run: the root, the scan floor's file under a bound, the
     // bound, the capture, and the refusal before anything is measured.
     let root = match run::prepare_root() {
@@ -614,6 +652,10 @@ fn cmd_run(a: Args) -> i32 {
     }
     if a.has("--resume-passes") {
         eprintln!("--resume-passes is for --resume DIR\n\n{USAGE}");
+        return 2;
+    }
+    if let Some(why) = ram_backed_refusal() {
+        eprintln!("bench run: refused: {why}");
         return 2;
     }
     let Some(scale) = a.get("--scale").and_then(Scale::parse) else {

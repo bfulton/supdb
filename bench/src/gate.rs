@@ -535,6 +535,7 @@ mod tests {
             read_ahead_kb: None,
             rotational: None,
             write_cache: None,
+            device: None,
         }
     }
 

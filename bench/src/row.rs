@@ -66,6 +66,12 @@ pub struct MachineInfo {
     pub rotational: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_cache: Option<String>,
+    /// The block device's name (`vda`), from the same lookup. A row from
+    /// a RAM-backed one is never written (`env::ram_backed_device`): the
+    /// device is in every out-of-core rate, and one that is not the
+    /// machine's is for the counts alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -312,6 +318,7 @@ mod tests {
                 read_ahead_kb: Some(128),
                 rotational: Some(true),
                 write_cache: Some("write back".into()),
+                device: Some("vda".into()),
             },
             killed: vec![],
             resumptions: vec![],

@@ -466,6 +466,29 @@ what its ledger holds; a result the run discards is work the run does
 not do; and a failure a process boundary was built to contain is
 reported by the boundary, not relayed through it.
 
+**A device the series does not measure.** Out of core a rate is the
+faults an operation takes times the device's answer to one, about 40 µs
+on this fleet's disk, and the faults are the kernel's reclaim over the
+engine's page touches, which a probe read identically on the disk and on
+zram under the same bound, 0.77 refaults a read on each, where zram
+answers a fault in about 4. So a pairing with its stores on zram reads
+the disk's counts at a tenth of the wait, and its rates are nobody's:
+the comparator pays the same cheap faults, and the controller, which
+prices a fault by timing it, is a different controller there unless its
+price is pinned. `scripts/zram.sh` runs `ab` or `pair.sh` on one for the
+counts, the faults, refaults and bytes an operation takes, the `zpage_*`
+counters and the group's memory. Three things keep it out of the
+series, since a reader's care is not a guard: `run` refuses a RAM-backed
+device under its stores (`env::ram_backed_device`, every device the
+kernel files as virtual), so no row can come from one; `ab` names the
+device at its table's head and foot; and every row records the device
+under its stores (`MachineInfo::device`). It is a diagnostic, for the
+loop between edits at three million keys where a pass is seconds, and
+the figure a note quotes is the disk's. The rule: a count is the
+engine's and a rate is the device's, so a device that is not the
+machine's is for counts alone, and the suite refuses to bank it rather
+than trusting anyone to remember.
+
 **A workflow that never runs can be syntactically invalid for months.**
 Both self-hosted pickup watchdogs arrived with a block of an older draft
 pasted after their `exit 1`. `scripts/workflows.sh` parses every `run:`

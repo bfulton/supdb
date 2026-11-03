@@ -50,6 +50,60 @@ pub fn capture() -> MachineInfo {
         write_cache: dev
             .as_deref()
             .and_then(|d| trimmed(&format!("/sys/block/{d}/queue/write_cache"))),
+        device: dev,
+    }
+}
+
+/// The RAM-backed block device under `path`, by name, or none: zram, a
+/// loop device, brd, anything the kernel files under
+/// `/sys/devices/virtual/block/`, where a disk's entry names its bus.
+/// Such a device answers a fault in microseconds where the machine's
+/// disk takes tens, with the kernel's reclaim and the engine's page
+/// touches the same, so a pairing on one reads the disk's counts at a
+/// price no user pays: `scripts/zram.sh` runs `ab` on one for the
+/// counts, `run` refuses it, and `ab` names it on its table.
+#[cfg(target_os = "linux")]
+pub fn ram_backed_device(path: &std::path::Path) -> Option<String> {
+    let dev = block_device_of(path)?;
+    virtual_block_device(std::path::Path::new("/sys/block"), &dev).then_some(dev)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn ram_backed_device(_path: &std::path::Path) -> Option<String> {
+    None
+}
+
+/// Whether `sys_block/<dev>` links into the kernel's virtual devices.
+fn virtual_block_device(sys_block: &std::path::Path, dev: &str) -> bool {
+    std::fs::read_link(sys_block.join(dev))
+        .map(|target| target.components().any(|c| c.as_os_str() == "virtual"))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A device under the kernel's virtual devices is RAM-backed by this
+    /// test, a disk under its bus is not, and a name with no entry is not.
+    #[test]
+    fn a_virtual_block_device_is_told_from_a_disk_by_its_link() {
+        let root =
+            std::env::temp_dir().join(format!("supdb-bench-sysblock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink("../devices/virtual/block/zram0", root.join("zram0")).unwrap();
+        std::os::unix::fs::symlink("../devices/virtual/block/loop3", root.join("loop3")).unwrap();
+        std::os::unix::fs::symlink(
+            "../devices/pci0000:00/0000:00:02.0/virtio1/block/vda",
+            root.join("vda"),
+        )
+        .unwrap();
+        assert!(virtual_block_device(&root, "zram0"));
+        assert!(virtual_block_device(&root, "loop3"));
+        assert!(!virtual_block_device(&root, "vda"));
+        assert!(!virtual_block_device(&root, "nvme0n1"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 

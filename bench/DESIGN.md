@@ -553,7 +553,13 @@ within a rep; one warmup pass is discarded where the arms share the process,
 and none is run where each pass has a process of its own.
 
 `bench ab` is the instrument for choosing between two arms; the series is
-not. It runs both in one process with the order swapped every other rep,
+not. For a question whose answer is a count -- the faults, refaults and
+bytes an operation takes under a bound, the controller's counters, the
+group's memory -- `scripts/zram.sh` runs it with the stores on a RAM-backed
+block device, where a fault costs a tenth of the disk's and the counts are
+the disk's own; its rates are nobody's, the table says so, `run` refuses
+such a device, and a row of the series never comes from one.
+It runs both in one process with the order swapped every other rep,
 so neither stands first more often than the other, pairs them rep by rep
 so a drift that lifts or drops both cancels, and reports a sign test over
 the pairs rather than two medians. It also reports what the engine counts

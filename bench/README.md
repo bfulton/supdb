@@ -23,6 +23,7 @@ sh scripts/ooc.sh 1610612736                     # out of core under a 1.5 GiB b
 ./target/release/bench machine                  # the host as a row records it
 python3 scripts/charts.py ROW OUT                # the published figure set, from one row
 sh scripts/pair.sh A B SIZE [ab options]          # two arms paired, a sitting in each order
+sh scripts/zram.sh -- pair.sh A B SIZE --bound BYTES --passes read  # the same on a RAM-backed device, for counts only; never a row
 ```
 
 `quick` tops its ladder at 300 000 keys. `full` sizes its ladder to the
