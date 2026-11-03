@@ -315,8 +315,9 @@ back, and a pass the kernel kills ends the run with the kill's own
 status as before. The reps stay interleaved as they were, and each
 store opens from nothing. In core the arms share the process as they
 always have, so the quick and full rows' conditions are unchanged. The
-regime where both engines leave core is also reached by a pairing
-(`bench ab --bound`) over the passes that hold one store at a time.
+roster runs under 1.25 GiB, where both engines leave core at ten million
+keys; the same regime is reached by a pairing (`bench ab --bound`) over
+the passes that hold one store at a time.
 LMDB as it opens by default, which reads every random read past the
 cache with its readahead window, is not in the roster. The
 scan floor's file is written and synced outside the group and dropped

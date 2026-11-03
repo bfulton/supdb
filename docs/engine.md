@@ -6275,6 +6275,23 @@ what it still holds beyond use there is the forms' chunks and the writers' vecto
 The `lagmem` line prints the mapped bytes (`mapped_mb`) beside the allocator's in use and free, and
 the resident count the trim reads (`Options::trim_by_resident`) takes them out.
 
+The first bounded row where both engines leave core banked at `5bf1f88` (`sh bench/scripts/ooc.sh
+1342177280`, `bench/runs/ooc/20261103T040436Z-5bf1f88.json`: ten million keys under 1.25 GiB, three
+reps, the roster's seven arms, each arm's rep in a process of its own, the read passes divided by
+ten). Against LMDB with its readahead off, the configuration its documentation gives for a store
+larger than memory, the controller arm (`supdb-autozpages`) reads level on one thread and 1.7x on
+three, scans 1.3x on both, takes the read-heavy mixes at 1.3-2x (B 2.0, C 1.3, D 1.7) and the update
+mixes at 4x (A 4.3, F 4.1), with E at 0.8x, and loads at 1.3x ordered and 11.6x shuffled -- at a
+tenth of LMDB's major faults a point read (0.06 against 0.07 for the reads that go raw before the
+form installs, and none in the mixes) where the raw form takes three times LMDB's. The default arm,
+whose raw form of 1.4 GB does not fit the bound while LMDB's 1.3 GB nearly does, reads at 0.5x,
+scans at 0.16x and takes C and D at 0.2-0.3x, the regime the compact form exists for; three of the
+raw arms read alike, and the arm without the read advice pays 2.2 refaults a read for the readahead
+the advice turns off. What the row does not win: the lag points, the controller arm's ten-percent
+point at 0.3x and every arm's full-rewrite point at 0.03x, which is the merge streaming a store
+rewritten whole while the scans walk its pieces. At three million keys, where both fit, every supdb
+arm reads 1.6-1.9x, scans 1.2-1.4x and takes the mixes at 1.5-7x, E level.
+
 #### Out of core: against LMDB with its readahead off
 
 The first bounded rung at ten million keys under a gibibyte read the
