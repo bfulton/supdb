@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use supdb::{Db, Options};
 
 mod common;
-use common::{kv, partition_fences, seg_names, vf};
+use common::{kv, partition_fences, seg_names, vf, without_the_clock};
 
 fn scratch(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-next-fences-{name}-{}", std::process::id()));
@@ -466,4 +466,89 @@ fn a_merge_writes_an_empty_partition_for_a_fence_no_input_key_lies_in() {
     hold_to(&db, &live);
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A merge's first pass reads its inputs' keys off their ordered indexes'
+/// heads where a head is a whole key (`Options::merge_keys_by_heads`), and
+/// off the records otherwise. Two stores fed the same operations, one each
+/// way, merge to the same files byte for byte, the superblock's clock
+/// aside; a store whose keys are of two lengths reads every input's keys
+/// off the records under either, and merges to the same files as its
+/// twin too.
+#[test]
+fn a_merges_first_pass_over_the_heads_writes_what_the_records_write() {
+    for mixed in [false, true] {
+        let mut dirs = Vec::new();
+        for heads in [true, false] {
+            let d = scratch(&format!("merge-heads-{mixed}-{heads}"));
+            let mut db = Db::create(
+                &d,
+                Options {
+                    seal_bytes: 32 << 10,
+                    partition_bytes: Some(32 << 10),
+                    l0_trigger: 2,
+                    merge_keys_by_heads: heads,
+                    ..Options::default()
+                },
+            )
+            .unwrap();
+            // One length of key, so a head is a whole key; or two, with a
+            // third of them a suffix longer, so the heads cannot say.
+            let key = |k: u32| {
+                if mixed && k.is_multiple_of(3) {
+                    format!("key-{k:05}-x").into_bytes()
+                } else {
+                    format!("key-{k:05}").into_bytes()
+                }
+            };
+            for k in 0..3000u32 {
+                db.append(&key(k), b"0");
+            }
+            db.commit().unwrap();
+            db.flush().unwrap();
+            assert!(partition_fences(&d).len() >= 2, "partitions");
+            // Two pieces of updates and of new keys over every partition:
+            // the second's landing starts the merge of every range.
+            for round in 0..2u32 {
+                for k in (round..3000u32).step_by(7) {
+                    db.append(&key(k), b"n");
+                }
+                for k in 0..300u32 {
+                    db.append(&key(90000 + k * 10 + round), b"m");
+                }
+                db.commit().unwrap();
+                db.seal().unwrap();
+            }
+            db.settle().unwrap();
+            let (by_heads, by_records) = db.merge_key_sources();
+            assert!(by_heads + by_records > 0, "a merge ran");
+            if heads && !mixed {
+                assert_eq!(
+                    by_records, 0,
+                    "every input's keys off its heads: {by_records} inputs off the records"
+                );
+            } else {
+                assert_eq!(
+                    by_heads, 0,
+                    "the records' pass: {by_heads} inputs off their heads"
+                );
+            }
+            db.close().unwrap();
+            dirs.push(d);
+        }
+        let names: Vec<Vec<String>> = dirs.iter().map(|d| seg_names(d)).collect();
+        assert_eq!(names[0], names[1], "the same segments (mixed {mixed})");
+        for n in &names[0] {
+            let a = std::fs::read(dirs[0].join(n)).unwrap();
+            let b = std::fs::read(dirs[1].join(n)).unwrap();
+            assert_eq!(
+                without_the_clock(&a),
+                without_the_clock(&b),
+                "{n} differs between the heads' pass and the records' (mixed {mixed})"
+            );
+        }
+        for d in &dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
 }

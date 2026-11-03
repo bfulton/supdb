@@ -506,6 +506,10 @@ pub struct Supdb {
     /// off). `supdb-ingestnoblockwillneed`, and `supdb-noblockwillneed`
     /// durable.
     noblockwillneed: bool,
+    /// A merge's first pass reads its inputs' keys off the records, as
+    /// before the heads carried them (`Options::merge_keys_by_heads` off).
+    /// `supdb-ingestmergerecordkeys`, and `supdb-mergerecordkeys` durable.
+    mergerecordkeys: bool,
     /// A seal writes every key through the writer's general path, as
     /// before the one-value path (`Options::seal_put_one` off).
     /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
@@ -1207,6 +1211,10 @@ struct Policy {
     /// off). `supdb-ingestnoblockwillneed`, and `supdb-noblockwillneed`
     /// durable.
     noblockwillneed: bool,
+    /// A merge's first pass reads its inputs' keys off the records, as
+    /// before the heads carried them (`Options::merge_keys_by_heads` off).
+    /// `supdb-ingestmergerecordkeys`, and `supdb-mergerecordkeys` durable.
+    mergerecordkeys: bool,
     /// A seal writes every key through the writer's general path, as
     /// before the one-value path (`Options::seal_put_one` off).
     /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
@@ -1728,6 +1736,7 @@ impl Default for Policy {
             rankswhole: false,
             nowillneed: false,
             noblockwillneed: false,
+            mergerecordkeys: false,
             sealrun: false,
             closeinline: false,
             timers: false,
@@ -3304,6 +3313,34 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 noblockwillneed: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose merges read their inputs' keys off the records in the
+    /// first pass, as before the heads carried them
+    /// (`Options::merge_keys_by_heads`): against `supdb` under a bound it
+    /// prices the second streaming of the inputs.
+    pub fn create_mergerecordkeys(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                mergerecordkeys: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` whose merges read their keys off the records, as
+    /// `supdb-mergerecordkeys`.
+    pub fn create_ingest_mergerecordkeys(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                mergerecordkeys: true,
                 ..Policy::default()
             },
         )
@@ -5797,6 +5834,7 @@ impl Supdb {
             rankswhole,
             nowillneed,
             noblockwillneed,
+            mergerecordkeys,
             sealrun,
             closeinline,
             timers,
@@ -6073,6 +6111,7 @@ impl Supdb {
             piece_ranks_whole: rankswhole,
             pieces_willneed: !nowillneed,
             blocks_willneed: !noblockwillneed,
+            merge_keys_by_heads: !mergerecordkeys,
             seal_put_one: !sealrun,
             close_finish_inline: closeinline,
             upkeep_wake_parked: wake,
@@ -6327,6 +6366,7 @@ impl Supdb {
             rankswhole,
             nowillneed,
             noblockwillneed,
+            mergerecordkeys,
             sealrun,
             closeinline,
             timers,
@@ -7002,6 +7042,13 @@ impl Engine for Supdb {
                 "supdb-ingestnoblockwillneed"
             };
         }
+        if self.mergerecordkeys {
+            return if self.partition {
+                "supdb-mergerecordkeys"
+            } else {
+                "supdb-ingestmergerecordkeys"
+            };
+        }
         if self.sealrun {
             return if self.partition {
                 "supdb-sealrun"
@@ -7418,6 +7465,8 @@ impl Engine for Supdb {
             ("segments", db.segments() as f64),
             ("partitions", db.levels().0 as f64),
             ("pieces", db.levels().1 as f64),
+            ("merge_head_inputs", db.merge_key_sources().0 as f64),
+            ("merge_record_inputs", db.merge_key_sources().1 as f64),
             ("unsealed_keys", db.unsealed_keys() as f64),
             ("pieces_aligned", db.pieces_aligned() as u8 as f64),
             // What the forms' upkeep did: see `Db::forms_events`.
@@ -8375,6 +8424,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-rankswhole"
         | "supdb-nowillneed"
         | "supdb-noblockwillneed"
+        | "supdb-mergerecordkeys"
         | "supdb-sealrun"
         | "supdb-closeinline"
         | "supdb-timers"
@@ -8473,6 +8523,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestrankswhole"
         | "supdb-ingestnowillneed"
         | "supdb-ingestnoblockwillneed"
+        | "supdb-ingestmergerecordkeys"
         | "supdb-ingestsealrun"
         | "supdb-ingestcloseinline"
         | "supdb-ingesttimers"
@@ -8810,6 +8861,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestnowillneed" => Box::new(Supdb::create_ingest_nowillneed(dir)?),
         "supdb-noblockwillneed" => Box::new(Supdb::create_noblockwillneed(dir)?),
         "supdb-ingestnoblockwillneed" => Box::new(Supdb::create_ingest_noblockwillneed(dir)?),
+        "supdb-mergerecordkeys" => Box::new(Supdb::create_mergerecordkeys(dir)?),
+        "supdb-ingestmergerecordkeys" => Box::new(Supdb::create_ingest_mergerecordkeys(dir)?),
         "supdb-sealrun" => Box::new(Supdb::create_sealrun(dir)?),
         "supdb-ingestsealrun" => Box::new(Supdb::create_ingest_sealrun(dir)?),
         "supdb-closeinline" => Box::new(Supdb::create_closeinline(dir)?),

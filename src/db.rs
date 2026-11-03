@@ -830,6 +830,18 @@ pub struct Options {
     /// order (the default) rather than by collecting, sorting and probing
     /// them. The probe path is kept as the comparison arm.
     pub cursor_merge: bool,
+    /// A merge's first pass -- every distinct key once, in order, for the
+    /// slices it cuts -- reads each input's keys off its ordered index's
+    /// heads where a head is a whole key (`OrdIndex::whole_key_at`), eight
+    /// bytes a key, and off the records only for an input whose keys are
+    /// not one length. Off, both passes read the records, the first for
+    /// the keys and the second for the values, so a merge streamed its
+    /// inputs through the page cache twice: 5.2 GB for a store of 1.3
+    /// rewritten whole at ten million keys under 1.25 GiB, while the scans
+    /// of the full-rewrite lag point faulted beside it.
+    /// `supdb-mergerecordkeys` and `supdb-ingestmergerecordkeys` read as
+    /// before.
+    pub merge_keys_by_heads: bool,
     /// I/O priority of the seal and merge threads.
     pub background_io: BackgroundIo,
     /// Have the segment writer fdatasync every this many bytes as it
@@ -3365,6 +3377,7 @@ impl Default for Options {
             compact: true,
             partition_on_flush: true,
             cursor_merge: true,
+            merge_keys_by_heads: true,
             background_io: BackgroundIo::Normal,
             seal_sync_every: 0,
             inline_bytes: 256,
@@ -10900,6 +10913,11 @@ struct MergePlan {
     sync_every: usize,
     inline_max: usize,
     ord_durable: bool,
+    /// The first pass's keys off the inputs' heads where they can be
+    /// (`Options::merge_keys_by_heads`), and where the inputs' sources are
+    /// counted (`Shared::merge_head_inputs`).
+    heads: bool,
+    counts: Option<std::sync::Arc<Shared>>,
 }
 
 fn compact_job(plan: MergePlan) -> Result<Vec<String>> {
@@ -11220,6 +11238,75 @@ fn merge_ranks(
     }
 }
 
+/// `merge_ranks` for a merge's first pass, which wants the keys alone: an
+/// input with an ordered index in `ords` reads each key off its heads
+/// (`OrdIndex::whole_key_at`), eight bytes a key and no record touched,
+/// and an input without reads the record as `merge_ranks` does
+/// (`Options::merge_keys_by_heads`). The keys stand in a buffer an input
+/// each, filled for every input at the head of a step and compared by
+/// index, since a borrow of one input's buffer cannot stand while
+/// another's is written.
+fn merge_keys(
+    blobs: &[Blob<MmapBytes>],
+    ords: &[Option<crate::ordindex::OrdIndex>],
+    mut f: impl FnMut(&[u8], &[(usize, usize)]) -> Result<()>,
+) -> Result<()> {
+    let n: Vec<usize> = blobs.iter().map(|b| b.keys()).collect();
+    let mut rank = vec![0usize; blobs.len()];
+    let mut bufs: Vec<Vec<u8>> = vec![Vec::new(); blobs.len()];
+    let mut have = vec![false; blobs.len()];
+    let mut tied: Vec<(usize, usize)> = Vec::with_capacity(blobs.len());
+    loop {
+        for i in 0..blobs.len() {
+            have[i] = false;
+            if rank[i] >= n[i] {
+                continue;
+            }
+            let by_heads = match &ords[i] {
+                Some(o) => o.whole_key_at(rank[i], &mut bufs[i]).is_some(),
+                None => false,
+            };
+            if !by_heads {
+                let k = blobs[i]
+                    .key_at(rank[i])
+                    .ok_or_else(|| err("segment key walk: a rank the index does not have"))?;
+                bufs[i].clear();
+                bufs[i].extend_from_slice(k);
+            }
+            have[i] = true;
+        }
+        let mut min: Option<usize> = None;
+        tied.clear();
+        for i in 0..blobs.len() {
+            if !have[i] {
+                continue;
+            }
+            match min {
+                None => {
+                    min = Some(i);
+                    tied.push((i, rank[i]));
+                }
+                Some(m) => match bufs[i].as_slice().cmp(bufs[m].as_slice()) {
+                    std::cmp::Ordering::Less => {
+                        min = Some(i);
+                        tied.clear();
+                        tied.push((i, rank[i]));
+                    }
+                    std::cmp::Ordering::Equal => tied.push((i, rank[i])),
+                    std::cmp::Ordering::Greater => {}
+                },
+            }
+        }
+        let Some(m) = min else {
+            return Ok(());
+        };
+        f(&bufs[m], &tied)?;
+        for &(i, _) in &tied {
+            rank[i] += 1;
+        }
+    }
+}
+
 /// One output of a merge: the ranks it holds, the fence it must contain,
 /// and its names on disk.
 struct Piece {
@@ -11380,6 +11467,8 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         sync_every,
         inline_max,
         ord_durable,
+        heads,
+        counts,
     } = plan;
     if background_io == BackgroundIo::Idle {
         idle_io_priority();
@@ -11398,11 +11487,39 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         );
     }
 
+    // The inputs' ordered indexes, for the first pass's keys where a head
+    // is a whole key (`Options::merge_keys_by_heads`): opened beside the
+    // records, the prefix learned off each input's first key as
+    // `Seg::open` learns it. An input whose heads cannot say, or whose
+    // index will not open, reads its keys off the records as before.
+    let ords: Vec<Option<crate::ordindex::OrdIndex>> = inputs
+        .iter()
+        .zip(&blobs)
+        .map(|(name, b)| {
+            if !heads {
+                return None;
+            }
+            let oname = Db::ord_name_for(name)?;
+            let mut ord = crate::ordindex::OrdIndex::open(&dir.join(&oname), b.keys()).ok()?;
+            ord.learn_prefix(b.key_at(0)?);
+            let mut buf = Vec::new();
+            ord.whole_key_at(0, &mut buf)?;
+            Some(ord)
+        })
+        .collect();
+    if let Some(c) = &counts {
+        let by_heads = ords.iter().filter(|o| o.is_some()).count() as u64;
+        c.merge_head_inputs
+            .fetch_add(by_heads, AtomicOrdering::Relaxed);
+        c.merge_record_inputs
+            .fetch_add(inputs.len() as u64 - by_heads, AtomicOrdering::Relaxed);
+    }
+
     // Pass one: every distinct key once, in order, into the slicer, which
     // holds only what the slices are taken from (`Slicer`).
     let mut slicer = Slicer::new(fences.as_deref(), parts, max_keys);
     let all: Vec<Vec<u8>> = if cursors {
-        merge_ranks(&blobs, |k, _| {
+        merge_keys(&blobs, &ords, |k, _| {
             slicer.push(k);
             Ok(())
         })?;
@@ -13179,6 +13296,11 @@ struct Shared {
     /// path's: the two together are every scan, which is what a seal
     /// asks before it builds its copy (`Options::seal_snapshot_far`).
     scans_merged: AtomicU64,
+    /// A merge's inputs by where its first pass read their keys: off the
+    /// ordered index's heads, and off the records
+    /// (`Options::merge_keys_by_heads`; `Db::merge_key_sources`).
+    merge_head_inputs: AtomicU64,
+    merge_record_inputs: AtomicU64,
     /// Whether the writer's last seal was near reads, a drain's counted
     /// near: the segment work's landings take the pieces' ranks and
     /// bounds only then (`Options::land_ranks_far`).
@@ -17310,6 +17432,18 @@ impl Reader {
             n += 1;
         }
         (ranked, bounded, n)
+    }
+
+    /// The merges' inputs over the store's life by where the first pass
+    /// read their keys: off the ordered index's heads, and off the records
+    /// (`Options::merge_keys_by_heads`).
+    pub fn merge_key_sources(&self) -> (u64, u64) {
+        (
+            self.shared.merge_head_inputs.load(AtomicOrdering::Relaxed),
+            self.shared
+                .merge_record_inputs
+                .load(AtomicOrdering::Relaxed),
+        )
     }
 
     /// How many segments' ordered companions were advised `MADV_RANDOM`, and
@@ -24936,6 +25070,8 @@ impl Db {
             rd_blocks: AtomicU64::new(0),
             scans_life: AtomicU64::new(0),
             scans_merged: AtomicU64::new(0),
+            merge_head_inputs: AtomicU64::new(0),
+            merge_record_inputs: AtomicU64::new(0),
             reads_near: std::sync::atomic::AtomicBool::new(false),
             mode_scans: AtomicU64::new(0),
             mode_points: AtomicU64::new(0),
@@ -25447,6 +25583,8 @@ impl Db {
             rd_blocks: AtomicU64::new(0),
             scans_life: AtomicU64::new(0),
             scans_merged: AtomicU64::new(0),
+            merge_head_inputs: AtomicU64::new(0),
+            merge_record_inputs: AtomicU64::new(0),
             reads_near: std::sync::atomic::AtomicBool::new(false),
             mode_scans: AtomicU64::new(0),
             mode_points: AtomicU64::new(0),
@@ -38102,6 +38240,7 @@ impl Maint {
         let sync_every = self.opts.seal_sync_every;
         let inline_max = self.opts.inline_bytes;
         let ord_durable = self.opts.ord_durable;
+        let heads = self.opts.merge_keys_by_heads;
         let job_inputs = inputs.clone();
         let wake = self.wake.clone();
         let held = self.shared.clone();
@@ -38120,6 +38259,8 @@ impl Maint {
                 sync_every,
                 inline_max,
                 ord_durable,
+                heads,
+                counts: Some(held.clone()),
             });
             // A test's hold before the landing (`Db::hold_merge_landing`).
             while held.merge_hold.load(AtomicOrdering::Acquire) & MERGE_HOLD_LANDING != 0 {

@@ -81,10 +81,13 @@ The suite has to be fair before any of its numbers are quoted.
   together now (`Options::pieces_willneed`, the pass 1.5x for it), and
   the partition's own pages a raw scan takes are asked for the same way
   (`Options::blocks_willneed`), the drained point level with LMDB for it
-  and the full-rewrite point at 0.12x; what is left there is the merge's
-  two passes over its inputs, and the compact form's shorter pages once
-  the row's read passes have installed it; the engine's trimmer running
-  while the
+  and the full-rewrite point at 0.12x; the merge's first pass reads its
+  keys off the ordered index's heads now (`Options::merge_keys_by_heads`,
+  the bursts' background reads an operation 1.6-1.75x fewer, the cells
+  within the spread), and what is left there is the merge's second pass
+  streaming its inputs through a cache that cannot hold them, and the
+  compact form's shorter pages once the row's read passes have installed
+  it; the engine's trimmer running while the
   store is under a cgroup bound, where free memory is page cache the
   store does not have (`Options::forms_to_fit`'s trim, priced in core
   before it is the default under a bound); and 1 GiB.

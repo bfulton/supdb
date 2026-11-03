@@ -6501,6 +6501,36 @@ one-percent point at 0.6x, which is the first scan settling the burst
 where LMDB has nothing to settle, the ten-percent point at 0.4x and the
 full-rewrite point at 0.12x, where the row had 0.03x.
 
+The merge's two passes over its inputs were the other half of the device's
+bytes under the full rewrite: the first pass reads every input's keys for
+the slices it cuts, the second reads them again for the values, and both
+read the records, so a store of 1.3 GB rewritten whole streamed 5.2
+through a cache that holds a third of it. The first pass reads each
+input's keys off its ordered index's heads now where a head is a whole
+key (`Options::merge_keys_by_heads`, `OrdIndex::whole_key_at`; eight
+bytes a key, the index opened beside the records and its prefix learned
+off the first key as `Seg::open` learns it), and off the records only
+for an input whose keys are not one length; `supdb-mergerecordkeys` and
+`supdb-ingestmergerecordkeys` read as before, and the merges' inputs are
+counted by their source (`merge_head_inputs`, `merge_record_inputs`).
+The two shapes write the same files byte for byte, the superblock's
+clock aside, which `tests/fences.rs` holds over keys of one length and of
+two. Paired at ten million keys under 1.25 GiB, a warmup and a pair
+(`bench ab --arms supdb,supdb-mergerecordkeys ...`): the background
+threads' reads an operation fell 1.75x through the full-rewrite burst
+and 1.6x through the one-percent burst, where the merges' first passes
+run, while every lag cell's pair and warmup disagreed in sign and the
+pass's device reads stayed the scans' own (1.75-1.89 GB against
+1.73-2.06), since the first passes fall mostly in the burst. In core a
+run has one or two merges (ten and twelve inputs at a hundred and three
+hundred thousand keys), the arms run the same code otherwise, and the
+pairings there, twelve pairs a sitting in both orders, disagree in sign
+between the sittings on every cell that moved, the update mix's marked
+cell included (1.41x for the records' pass in one sitting at a hundred
+thousand keys, 1.14x for the heads' in one at three hundred thousand,
+1.32x for the records' in the other), a mix whose rate the seal's timing
+makes bimodal at these rungs.
+
 #### Out of core: the second form
 
 A pairing this section cites is given as the command that reproduces it, `pair.sh A B SIZE [bench ab options]` (`bench/scripts/pair.sh`: `bench ab` over the two arms, one sitting in each order), at the commit it ran at; a binary built at that commit runs it (`BIN=`), and every arm named exists at the head as well. A rerun reproduces the comparison, not the rates, which this host moves by tens of percent between sittings. A count a sentence quotes -- decodes, faults by mix, the controller's events, the census -- was read with the variable before the command set, which turns supdb's own timers on as well, so a rate against a comparator is read from a run without it. Pairings made before this history's root (2026-10-20) cite the root, `18c3a30`, the first commit here that holds their arms. The design the form was built to is `docs/zpages-design.md`.
