@@ -671,9 +671,13 @@ def load_ooc(specs):
 
 def arm_note(arm):
     """The supdb arm of an out-of-core pairing, named as the suite names it
-    and said in words where it is not the default."""
+    and said in words where its second form is not the default's: the
+    controller (ZPages::Auto) is the engine's default, so an arm that names
+    it is the default's shape, and the raw form alone is the arm."""
+    if "nozpages" in arm:
+        return f"as {arm}, the raw form alone with the second form off, where the default runs its controller"
     if "autozpages" in arm:
-        return f"as {arm}, the compact form under ZPages::Auto, which the default leaves off"
+        return f"as {arm}, the compact form under ZPages::Auto, the default's own shape"
     return f"as {arm}"
 
 

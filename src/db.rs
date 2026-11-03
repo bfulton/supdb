@@ -356,7 +356,8 @@ impl ReadAdvice {
 pub enum ZPages {
     /// No form file is built, read or attached. One already on disk is not
     /// read, and goes with its segment when the store retires the segment.
-    #[default]
+    /// The raw form alone, the shape the engine shipped before the
+    /// controller was its default; `supdb-nozpages` is its arm.
     Off,
     /// Every partition has a form file, and every point read and count of a
     /// partition is answered from it. Built on demand by
@@ -382,7 +383,11 @@ pub enum ZPages {
     /// builds or attaches its files (and, past the budget's share
     /// `Options::zpages_land_pct`, builds them ahead at the landings), and
     /// leaves the form when the reads stop blocking (`docs/engine.md`, the
-    /// controller).
+    /// controller). The default: in memory it runs its tick on the segment
+    /// work's thread, counts nothing and builds nothing, and a read pays
+    /// the hooks' loads and branches, twelve instructions by callgrind
+    /// (`CLAUDE.md`, a hook priced behind its flag).
+    #[default]
     Auto,
 }
 
@@ -878,12 +883,15 @@ pub struct Options {
     /// chosen by hand for a store that does not fit and is not the
     /// default. `supdb-nocacheordread`.
     pub point_via_ord: bool,
-    /// The partitions' second form (`ZPages`). `Off`, the default: the
-    /// read path pays one load of this field and one branch not taken, and
-    /// nothing else. `Always` is the arm that prices the form
-    /// (`supdb-nocachezpages`): a point read and a count of a partition is
-    /// answered from its form file, a scan of one is not. Refused beside
-    /// `writer_pins` off.
+    /// The partitions' second form (`ZPages`). `Auto`, the default: the
+    /// controller builds and reads the form where the store's reads block
+    /// past the page cache and leaves it where they do not, and in memory
+    /// a read pays its hooks' loads and branches and nothing else. `Off`
+    /// is the raw form alone (`supdb-nozpages`): the read path pays one
+    /// load of this field and one branch not taken. `Always` is the arm
+    /// that prices the form (`supdb-nocachezpages`): a point read and a
+    /// count of a partition is answered from its form file, a scan of one
+    /// is not. Refused beside `writer_pins` off.
     pub zpages: ZPages,
     /// The record bytes below which `ZPages::Always` declines a partition
     /// and writes no file. A test's: it lowers the floor to build form files
@@ -3309,7 +3317,7 @@ impl Default for Options {
             asym_pins: false,
             exts_by_value: false,
             point_via_ord: false,
-            zpages: ZPages::Off,
+            zpages: ZPages::Auto,
             zpages_min_bytes: zfile::ZMIN_RECS,
             zpages_drop_behind: true,
             zpages_retry_ms: 60_000,

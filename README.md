@@ -45,10 +45,11 @@ each scale, on the host class each figure names:
 
 ![Point reads under a memory bound, where both engines leave core](docs/figures/ooc/latest/ooc-read-reads_per_s-durable.svg)
 
-The bounded figure's title reads the default arm; the arm with the compact
-form the controller builds (`supdb-autozpages`) is the curve above it, and
-the rest of the set, every workload and option, is under `docs/figures/`
-by scale and machine class.
+The bounded figure reads its rows by arm: `supdb` is the engine's defaults
+at the row's commit, `supdb-autozpages` the compact form's controller named
+on its own where it was not yet the default, and `supdb-nozpages` the raw
+form alone where it is. The rest of the set, every workload and option, is
+under `docs/figures/` by scale and machine class.
 
 ## Usage
 

@@ -1262,7 +1262,7 @@ fn a_reopened_store_attaches_the_form_files_it_finds_and_off_leaves_them_alone()
     );
     db.close().unwrap();
     // Under `Off`: nothing attached, nothing read, the file untouched.
-    let db = Db::open(&dir, Options::default()).unwrap();
+    let db = Db::open(&dir, off()).unwrap();
     check(&db, &model, &keys[..500], "reopened under Off");
     let c = db.zpage_counts();
     assert_eq!(
@@ -1416,12 +1416,22 @@ fn the_form_is_refused_beside_an_unpinned_writer_and_off_is_not() {
     }
 }
 
+/// The raw form alone: the engine's defaults with the second form off,
+/// which is what every test that reads a store as "under `Off`" opens,
+/// since the controller is the default.
+fn off() -> Options {
+    Options {
+        zpages: ZPages::Off,
+        ..Options::default()
+    }
+}
+
 #[test]
-fn the_default_is_off_and_an_off_store_makes_nothing() {
-    assert_eq!(Options::default().zpages, ZPages::Off);
-    assert_eq!(ZPages::default(), ZPages::Off);
+fn the_default_is_the_controller_and_an_off_store_makes_nothing() {
+    assert_eq!(Options::default().zpages, ZPages::Auto);
+    assert_eq!(ZPages::default(), ZPages::Auto);
     let dir = scratch("off");
-    let mut db = Db::create(&dir, Options::default()).unwrap();
+    let mut db = Db::create(&dir, off()).unwrap();
     let model = ordered_load(&mut db, 3000, 0x0FF);
     db.zpages_settle().unwrap();
     let keys: Vec<Vec<u8>> = model.keys().step_by(3).cloned().collect();
@@ -1931,7 +1941,7 @@ fn a_point_read_from_the_form_file_touches_no_page_of_the_raw_records() {
         }
     };
     let zfile = build("cold-z", forced(|_| {}));
-    let raw = build("cold-raw", Options::default());
+    let raw = build("cold-raw", off());
     let region_pages = zfile.rec.1.div_ceil(4096);
     let hash_pages = zfile.hash.1.div_ceil(4096);
     assert!(region_pages > 150, "{region_pages} pages of records");
@@ -3590,7 +3600,7 @@ fn a_stale_temp_name_and_a_form_file_no_segment_claims_are_swept_at_open() {
     let live = form_files(&dir).remove(0);
     let name = live.file_name().unwrap().to_string_lossy().into_owned();
     let good = std::fs::read(&live).unwrap();
-    for (setting, opts) in [("Always", forced(|_| {})), ("Off", Options::default())] {
+    for (setting, opts) in [("Always", forced(|_| {})), ("Off", off())] {
         let copy = scratch(&format!("sweep-{setting}"));
         copy_dir(&dir, &copy);
         let stamp = std::fs::metadata(copy.join(&name))

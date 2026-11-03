@@ -278,8 +278,9 @@ reads from the device where the same store unbounded reads from memory,
 and its rows live under `runs/ooc/`. Its default arms are the default,
 the three options whose difference is what a read past the page cache
 costs (`supdb-nocache`, `supdb-cache256tofit`, `supdb-noadvice`), the
-default with the compact form the controller's to choose
-(`supdb-autozpages`), and the durable comparators: LMDB with its
+raw form alone (`supdb-nozpages`), the shape the engine shipped before
+the compact form's controller was its default, and the durable
+comparators: LMDB with its
 readahead off (`lmdb-nordahead`), as LMDB's documentation configures a
 store larger than memory, and RocksDB tuned. The bound is chosen so that
 the top rung is out of core for every engine: a store of ten million keys
@@ -327,10 +328,12 @@ Further arms exist for a bounded pairing and are in no roster, because
 each prices one engine option against the arm it differs from in one
 process (`bench ab --arms <base>,<arm>`) and is chosen by hand:
 `supdb-nocacheautozpages` is `supdb-nocache` with the compact form the
-controller's to choose, as `supdb-autozpages` is `supdb` (a pass asks
-nothing of the form under them: what the controller builds and reads
-through is its decision, carried by the `zpage_*` rows, and only a form
-file out of service refuses the pass),
+controller's to choose, as `supdb-autozpages` is `supdb` -- the
+controller is the engine's default, so each is its base's shape under
+the name the rows and the pairings before the default moved carry (a
+pass asks nothing of the form under the controller: what it builds and
+reads through is its decision, carried by the `zpage_*` rows, and only a
+form file out of service refuses the pass),
 `supdb-nocacheordread` reads a point through the ordered index,
 `supdb-nocachezpages` forces the compact second form for point reads and
 counts (a pass refuses it unless every partition has its form file and the

@@ -36,7 +36,9 @@ The suite has to be fair before any of its numbers are quoted.
   LMDB's store fits the bound and supdb's raw form does not, and supdb
   trails every read cell there while leading the writes. Its roster runs
   the defaults, and the compact form the controller builds out of core
-  (`ZPages::Auto`) is off by default, so no banked row measures it yet.
+  (`ZPages::Auto`) was off by default until its in-core cost was named,
+  so the rows banked before then measure the raw form under `supdb` and
+  the controller under `supdb-autozpages`.
   The lag points' first scan there paid for the burst the upkeep thread
   had been lent and not filed; the thread files a burst's batches now
   (`Options::upkeep_files_bursts`), and what the divided pass still
@@ -128,10 +130,23 @@ off (`docs/engine.md`, "Out of core: the second form").
   the builds ahead, the lag sweep under a bound, and a shuffled load
   followed by reads. Done when each is paired against LMDB with its
   readahead off.
-- [ ] **Whether `Auto` ships on.** The compact form is off by default
-  (`ZPages::Off`) and `Auto` is an arm. Done when `Auto` is priced in
-  memory against the default with no cell given up, and the default is
-  decided on that.
+- [x] **Whether `Auto` ships on.** It does: `ZPages::Auto` is the default
+  and the raw form alone is the arm (`supdb-nozpages`), in both rosters
+  in the controller arm's place. What the controller cost a read in
+  memory was named by count and not by the pairings that had read it as
+  5-28% on the point-read mixes in three sittings of four: the census
+  hooks' flag said the controller was on where their work ran only
+  under the census gate, so every read paid the call and the window's
+  copy out of its cell to be sent back, and the form dispatch its
+  out-of-line gate check beside them, 124 instructions of a read's 830
+  by callgrind. The hooks test the state they work on now and the
+  dispatch asks the gate inline, 12 instructions a read, and the
+  pairings against the raw form read level in both orders at a hundred
+  thousand, three hundred thousand and three million keys
+  (`docs/engine.md`, the controller; `CLAUDE.md`, a hook priced behind
+  its flag). The in-core rows banked after it carry the controller
+  under `supdb`, as the bounded rows do, and the first of each is a
+  definition step banked on its controls (`bench/CLAUDE.md`).
 
 ## Housekeeping
 
