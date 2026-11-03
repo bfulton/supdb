@@ -18,11 +18,18 @@
 //! and a fault a page that a small block does not earn.
 //!
 //! The bytes mapped and not yet unmapped are counted (`mapped_bytes`): the
-//! leak test holds the count to zero past every store's close, the
-//! resident count beyond the allocator's use takes them out, and the suite
-//! prints them beside the allocator's bytes in use.
+//! leak test holds the count to zero past every store's close, and the
+//! suite prints them beside the allocator's bytes in use. The blocks alive
+//! are kept by address as well (`LIVE`), so the resident count beyond the
+//! allocator's use can take out what of them the kernel has resident
+//! (`mapped_resident_bytes`, by `mincore`) and not the blocks whole: a
+//! mapped page never touched is resident nowhere, and a store's tables in
+//! flight map tens of megabytes they have barely written -- subtracted
+//! whole, they read a dead arena of thirty-two megabytes as seven, and the
+//! trim that counts by the resident bytes never fired on it.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 /// A block of at least this many bytes is mapped when the option says so;
 /// glibc's own threshold starts here, before its first large free raises
@@ -34,9 +41,57 @@ const ALIGN: usize = 64;
 
 static MAPPED: AtomicUsize = AtomicUsize::new(0);
 
+/// The mapped blocks alive, each by its address and length, for the
+/// resident count. A block comes and goes once per megabytes written, so
+/// the lock is nobody's wait.
+static LIVE: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+fn live() -> std::sync::MutexGuard<'static, Vec<(usize, usize)>> {
+    LIVE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The bytes of the blocks mapped and not yet unmapped, process-wide.
 pub(crate) fn mapped_bytes() -> usize {
     MAPPED.load(Ordering::Relaxed)
+}
+
+/// The bytes of the mapped blocks alive that the kernel has resident, in
+/// whole pages, read from the kernel for each block (`resident_of`): what
+/// the resident count beyond the allocator's use takes out, since these
+/// are anonymous bytes the allocator knows nothing of. A block that goes
+/// between the listing and its read counts nothing.
+#[cfg(target_os = "linux")]
+pub(crate) fn mapped_resident_bytes() -> usize {
+    let blocks: Vec<(usize, usize)> = live().clone();
+    blocks
+        .iter()
+        .map(|&(p, len)| resident_of(p as *mut u8, len))
+        .sum()
+}
+
+/// Where the kernel cannot be asked, every mapped byte is taken as
+/// resident, which is the count before this one.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn mapped_resident_bytes() -> usize {
+    mapped_bytes()
+}
+
+/// The bytes of the `len` at `p` that are resident, in whole pages, by
+/// `mincore`; none where the range is not a mapping any more.
+#[cfg(target_os = "linux")]
+fn resident_of(p: *mut u8, len: usize) -> usize {
+    // SAFETY: a constant's read.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as usize;
+    let pages = len.div_ceil(page);
+    let mut vec = vec![0u8; pages];
+    // SAFETY: `mincore` reads the mapping's state and writes one byte a
+    // page into `vec`, which has a byte for every page of `len`; a range
+    // that is no mapping fails and writes nothing.
+    let r = unsafe { libc::mincore(p as *mut libc::c_void, len, vec.as_mut_ptr()) };
+    if r != 0 {
+        return 0;
+    }
+    vec.iter().filter(|&&b| b & 1 != 0).count() * page
 }
 
 /// Whether a block of `len` bytes is mapped under `mapped`: the one rule
@@ -55,6 +110,7 @@ pub(crate) fn alloc(len: usize, zeroed: bool, mapped: bool) -> *mut u8 {
     if maps(len, mapped) {
         let p = map(len);
         MAPPED.fetch_add(len, Ordering::Relaxed);
+        live().push((p as usize, len));
         return p;
     }
     let layout = std::alloc::Layout::from_size_align(len, ALIGN).expect("block layout");
@@ -77,6 +133,12 @@ pub(crate) fn alloc(len: usize, zeroed: bool, mapped: bool) -> *mut u8 {
 /// it after.
 pub(crate) unsafe fn free(p: *mut u8, len: usize, mapped: bool) {
     if maps(len, mapped) {
+        {
+            let mut l = live();
+            if let Some(i) = l.iter().position(|&(a, n)| a == p as usize && n == len) {
+                l.swap_remove(i);
+            }
+        }
         // SAFETY: mapped by `map` with this length.
         unsafe { unmap(p, len) };
         MAPPED.fetch_sub(len, Ordering::Relaxed);
@@ -164,5 +226,39 @@ mod tests {
         assert!(maps(MAP_FROM, true));
         assert!(!maps(MAP_FROM - 1, true));
         assert!(!maps(MAP_FROM, false));
+    }
+
+    /// A mapped block's resident bytes are the pages it has touched, read
+    /// from the kernel: none fresh, at least the touched ones after, and
+    /// never more than the block; and the live blocks' sum counts it while
+    /// it lives. The sum is the process's, moved by every other test's
+    /// blocks, so it is held to no less than this block's and no more.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_mapped_blocks_resident_bytes_are_the_pages_it_touched() {
+        let len = 64 * 4096;
+        let p = alloc(len, false, true);
+        assert_eq!(resident_of(p, len), 0, "fresh pages are resident nowhere");
+        // SAFETY: `len` bytes just allocated.
+        let s = unsafe { std::slice::from_raw_parts_mut(p, len) };
+        for i in 0..16 {
+            s[i * 4096] = 1;
+        }
+        let r = resident_of(p, len);
+        assert!(
+            (16 * 4096..=len).contains(&r),
+            "sixteen pages touched: {r} resident"
+        );
+        assert!(
+            mapped_resident_bytes() >= r,
+            "the live blocks' sum holds it"
+        );
+        // SAFETY: from `alloc` with these arguments, read no more.
+        unsafe { free(p, len, true) };
+        assert_eq!(
+            resident_of(p, len),
+            0,
+            "an unmapped range is resident nowhere"
+        );
     }
 }

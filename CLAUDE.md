@@ -3051,14 +3051,20 @@ chunks. The engine maps those blocks from the kernel now, from 128 KB,
 and unmaps each at its drop (`src/db/blocks.rs`, `Options::blocks_mapped`;
 `supdb-heapblocks` is the heap shape); the bytes mapped are counted and
 held to zero past every store's close (`tests/leak.rs`, `tests/mapped.rs`),
-and the resident count the trim reads takes them out. The rule: a
+and the resident count the trim reads takes out what of them the kernel
+has resident (`mincore` over the blocks alive), never the blocks whole:
+taken out whole, a store whose tables in flight had mapped tens of
+megabytes they had barely written read a dead arena of thirty-two
+megabytes as seven, and the trim test that waits for the second trim
+failed one CI run in five with the engine unchanged. The rule: a
 library gives its large transient buffers back itself, since what an
 allocator does with a freed chunk is the process's policy and not the
 store's; a process's memory beyond its bytes in use is read against the
 allocator's thresholds -- what it maps, what it keeps -- before its free
-bytes are read as anyone's; and the owner of retained memory is named
+bytes are read as anyone's; the owner of retained memory is named
 fastest by changing the allocator's policy for one run and reading the
-difference.
+difference; and a quantity taken out of a kernel count is itself read
+from the kernel, since a page mapped is not a page resident.
 
 ## Standing limitations
 

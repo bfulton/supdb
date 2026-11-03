@@ -13370,13 +13370,15 @@ mod heap {
         // SAFETY: reads the allocator's own totals under its own locks.
         let mi = unsafe { f() };
         // The engine's own mapped blocks (`Options::blocks_mapped`) are
-        // anonymous bytes the allocator knows nothing of, so they come
-        // out too; a mapped page never touched is resident nowhere and is
-        // taken out all the same, so the count reads low by the untouched
-        // part of the blocks, an arena's tail block at most.
+        // anonymous bytes the allocator knows nothing of, so what of them
+        // is resident comes out too, read from the kernel and never the
+        // blocks whole: a store's tables in flight map tens of megabytes
+        // they have barely written, and taken out whole they read a dead
+        // arena of thirty-two megabytes as seven, so the trim that counts
+        // by this never fired on it.
         Some(
             anon.saturating_sub(mi.uordblks.saturating_add(mi.hblkhd))
-                .saturating_sub(super::blocks::mapped_bytes()),
+                .saturating_sub(super::blocks::mapped_resident_bytes()),
         )
     }
 
