@@ -425,6 +425,25 @@ pub fn thread_cpu_us() -> u64 {
     ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000
 }
 
+/// This thread's voluntary and involuntary context switches so far, from
+/// `/proc/thread-self/status`: the second says how often it was taken off
+/// its core with work left, which a pass slower than its CPU is read by.
+pub fn thread_switches() -> (u64, u64) {
+    let status = std::fs::read_to_string("/proc/thread-self/status").unwrap_or_default();
+    let field = |k: &str| -> u64 {
+        status
+            .lines()
+            .find(|l| l.starts_with(k))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+    (
+        field("voluntary_ctxt_switches:"),
+        field("nonvoluntary_ctxt_switches:"),
+    )
+}
+
 /// This thread's minor page faults so far.
 pub fn minflt_self() -> u64 {
     std::fs::read_to_string("/proc/thread-self/stat").map_or(0, |s| stat_minflt(&s))
@@ -2206,17 +2225,66 @@ fn lag_sweep(
             e.sync()?;
         }
         let mut g3 = KeyGen::new(KeyDist::Uniform, scan_keys, 0x1A7);
+        // With `SUPDB_SCAN_OPS` set, every scan of the point's pass is timed
+        // on its own, as the scan pass's are, and a `lagops` line per point
+        // gives the first scans, the median, the pass in tenths -- the mean
+        // of each tenth's scans in the order they ran, which says whether a
+        // slow pass is slow at its start or throughout -- and the scanning
+        // thread's CPU and context switches over the pass beside its wall:
+        // a pass slower than its CPU was descheduled or waiting, one as slow
+        // as its CPU stalled. The clock reads are a cost the rows must not
+        // carry.
+        let per_op = std::env::var_os("SUPDB_SCAN_OPS").is_some();
+        let mut op_us: Vec<f64> = Vec::with_capacity(if per_op { scans as usize } else { 0 });
+        let (cpu0, sw0) = if per_op {
+            (thread_cpu_us(), thread_switches())
+        } else {
+            (0, (0, 0))
+        };
         let cs = counting.begin();
         lag_mark(arm, pct, "start");
         let t = Instant::now();
         for _ in 0..scans {
             db_key_into(g3.next(), &mut kb);
-            e.range(&kb, plan.scan_len)?;
+            if per_op {
+                let t0 = Instant::now();
+                e.range(&kb, plan.scan_len)?;
+                op_us.push(t0.elapsed().as_secs_f64() * 1e6);
+            } else {
+                e.range(&kb, plan.scan_len)?;
+            }
         }
         let secs = t.elapsed().as_secs_f64();
         lag_mark(arm, pct, "end");
         counting.end(cs, "scan-lag", &suffix, None, scans);
         scan_lag.push((pct, (scans * plan.scan_len as u64) as f64 / secs));
+        if per_op && !op_us.is_empty() {
+            let cpu_ms = thread_cpu_us().saturating_sub(cpu0) as f64 / 1e3;
+            let sw1 = thread_switches();
+            let n = op_us.len();
+            let tenths: Vec<String> = (0..10)
+                .map(|i| {
+                    let a = i * n / 10;
+                    let b = ((i + 1) * n / 10).max(a + 1).min(n);
+                    let sum: f64 = op_us[a..b].iter().sum();
+                    format!("{:.0}", sum / (b - a) as f64)
+                })
+                .collect();
+            let mut sorted = op_us.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let head: Vec<String> = op_us.iter().take(4).map(|u| format!("{u:.0}")).collect();
+            eprintln!(
+                "lagops {arm} {pct} scans {n} first {} med {:.1} max {:.0} sum_ms {:.1} pass_ms {:.1} cpu_ms {cpu_ms:.1} vcsw {} nvcsw {} tenths {}",
+                head.join("/"),
+                sorted[n / 2],
+                sorted[n - 1],
+                op_us.iter().sum::<f64>() / 1e3,
+                secs * 1e3,
+                sw1.0.saturating_sub(sw0.0),
+                sw1.1.saturating_sub(sw0.1),
+                tenths.join("/")
+            );
+        }
         if counting_store {
             let c1 = e.counters();
             counters_line(
