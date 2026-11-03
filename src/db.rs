@@ -356,7 +356,8 @@ impl ReadAdvice {
 pub enum ZPages {
     /// No form file is built, read or attached. One already on disk is not
     /// read, and goes with its segment when the store retires the segment.
-    #[default]
+    /// The raw form alone, the shape the engine shipped before the
+    /// controller was its default; `supdb-nozpages` is its arm.
     Off,
     /// Every partition has a form file, and every point read and count of a
     /// partition is answered from it. Built on demand by
@@ -382,7 +383,11 @@ pub enum ZPages {
     /// builds or attaches its files (and, past the budget's share
     /// `Options::zpages_land_pct`, builds them ahead at the landings), and
     /// leaves the form when the reads stop blocking (`docs/engine.md`, the
-    /// controller).
+    /// controller). The default: in memory it runs its tick on the segment
+    /// work's thread, counts nothing and builds nothing, and a read pays
+    /// the hooks' loads and branches, twelve instructions by callgrind
+    /// (`CLAUDE.md`, a hook priced behind its flag).
+    #[default]
     Auto,
 }
 
@@ -878,12 +883,15 @@ pub struct Options {
     /// chosen by hand for a store that does not fit and is not the
     /// default. `supdb-nocacheordread`.
     pub point_via_ord: bool,
-    /// The partitions' second form (`ZPages`). `Off`, the default: the
-    /// read path pays one load of this field and one branch not taken, and
-    /// nothing else. `Always` is the arm that prices the form
-    /// (`supdb-nocachezpages`): a point read and a count of a partition is
-    /// answered from its form file, a scan of one is not. Refused beside
-    /// `writer_pins` off.
+    /// The partitions' second form (`ZPages`). `Auto`, the default: the
+    /// controller builds and reads the form where the store's reads block
+    /// past the page cache and leaves it where they do not, and in memory
+    /// a read pays its hooks' loads and branches and nothing else. `Off`
+    /// is the raw form alone (`supdb-nozpages`): the read path pays one
+    /// load of this field and one branch not taken. `Always` is the arm
+    /// that prices the form (`supdb-nocachezpages`): a point read and a
+    /// count of a partition is answered from its form file, a scan of one
+    /// is not. Refused beside `writer_pins` off.
     pub zpages: ZPages,
     /// The record bytes below which `ZPages::Always` declines a partition
     /// and writes no file. A test's: it lowers the floor to build form files
@@ -3309,7 +3317,7 @@ impl Default for Options {
             asym_pins: false,
             exts_by_value: false,
             point_via_ord: false,
-            zpages: ZPages::Off,
+            zpages: ZPages::Auto,
             zpages_min_bytes: zfile::ZMIN_RECS,
             zpages_drop_behind: true,
             zpages_retry_ms: 60_000,
@@ -13897,6 +13905,12 @@ pub struct Reader {
     zmemo: zfile::ZMemo,
     /// The census's window in progress (`ZPages::Auto`): see `ZWindow`.
     zwin: std::cell::Cell<ZWindow>,
+    /// Whether a census window is open on this handle: the one word the
+    /// inlined hooks read, beside the gate, so that an operation under the
+    /// raw gate pays a byte's load and a branch and never the window's
+    /// copy out of its cell (`zcensus_begin`). Set where the window opens
+    /// and cleared where it closes or is abandoned, and nowhere else.
+    zwin_open: std::cell::Cell<bool>,
     /// Whether this handle runs the census at all: a counted handle of a
     /// store under `Auto` where the controller runs. Decided once, so a
     /// read under `Off` or `Always` pays one load and a branch for it.
@@ -13924,7 +13938,6 @@ pub struct Reader {
 /// window is opened and an operation pays a load and a branch.
 #[derive(Clone, Copy)]
 struct ZWindow {
-    open: bool,
     /// Operations to go before the window closes.
     down: u32,
     /// The window's length in operations, resized at each close.
@@ -13969,7 +13982,6 @@ impl ZWindow {
     fn closed() -> ZWindow {
         let now = std::time::Instant::now();
         ZWindow {
-            open: false,
             down: 0,
             n: ZWINDOW_MIN,
             reads: 0,
@@ -16275,7 +16287,7 @@ impl Reader {
                 self.sweep_at_leave();
             }
         }
-        if self.zcensus {
+        if self.zcensus && self.zwin_open.get() {
             self.zcensus_end();
         }
         if let Some(slot) = self.slot {
@@ -16294,12 +16306,19 @@ impl Reader {
     /// where none is, and the operation is counted by its class.
     #[inline(always)]
     fn zcensus_begin(&self, scan: bool) {
-        // The flag's load and branch inlined into the operation and the
-        // rest out of line: grown past what the compiler inlines, the
-        // whole hook cost a read through the form seventeen instructions
-        // of call and prologue under `Always`, counted, for a flag that
-        // said no.
-        if self.zcensus {
+        // The flag, the open word and the gate inlined into the operation
+        // and the rest out of line: grown past what the compiler inlines,
+        // the whole hook cost a read through the form seventeen
+        // instructions of call and prologue under `Always`, counted, for a
+        // flag that said no. The gate is asked here and not only out of
+        // line, since FITS is the in-memory regime and the raw gate is
+        // what every read under it finds: behind the flag alone a store
+        // under `Auto` with nothing to count paid the call and the window's
+        // copy out of its cell on every read, 56 instructions of a read's
+        // 830 by callgrind, and the end's hook 38 more. Under the raw gate
+        // the slow path is entered only to abandon a window still open
+        // from a gate that has changed.
+        if self.zcensus && (self.zwin_open.get() || self.shared.zgate.load() != zselect::GATE_RAW) {
             self.zcensus_begin_slow(scan);
         }
     }
@@ -16307,7 +16326,6 @@ impl Reader {
     #[inline(never)]
     fn zcensus_begin_slow(&self, scan: bool) {
         let gate = self.shared.zgate.load();
-        let mut w = self.zwin.get();
         // The writer's reads are counted while the controller decides, under
         // the census gate, and not while the form serves: the exits read
         // the handles' windows as they did before the writer's were counted,
@@ -16315,20 +16333,21 @@ impl Reader {
         // install a twentieth to a quarter (`Options::zpages_writer_census`).
         if gate == zselect::GATE_RAW || (gate == zselect::GATE_Z && self.slot.is_none()) {
             // Under the raw gate the window in progress is abandoned, and
-            // the footprint with it: nothing else is asked here, since
-            // FITS is the in-memory regime and an operation under it pays
-            // the two loads and branches above and no more.
-            if w.open {
-                w.open = false;
-                self.zwin.set(w);
+            // the footprint with it: nothing else is asked here, and the
+            // window itself is not read, since FITS is the in-memory regime
+            // and an operation under it reaches this only with a window to
+            // abandon.
+            if self.zwin_open.get() {
+                self.zwin_open.set(false);
                 self.zfootprint_track(false);
             }
             return;
         }
+        let mut w = self.zwin.get();
         // E2's footprint: kept while the form serves and dropped, with the
         // word the tick reads, when it stops.
         self.zfootprint_track(gate == zselect::GATE_Z);
-        if w.open {
+        if self.zwin_open.get() {
             let ticks = self
                 .shared
                 .z
@@ -16339,7 +16358,7 @@ impl Reader {
                 self.zwindow_close(&mut w, gate);
             }
         }
-        if !w.open {
+        if !self.zwin_open.get() {
             self.zwindow_open(&mut w, gate);
         }
         if scan {
@@ -16354,11 +16373,12 @@ impl Reader {
     }
 
     /// The census's hook at an operation's end: the operation's wall goes
-    /// onto the window's busy wall. Called behind the flag.
+    /// onto the window's busy wall. Called behind the flag and the open
+    /// word.
     #[inline(never)]
     fn zcensus_end(&self) {
         let mut w = self.zwin.get();
-        if !w.open || !w.counting {
+        if !w.counting {
             return;
         }
         w.busy = w
@@ -16389,7 +16409,7 @@ impl Reader {
     /// Opens a window at this operation: the readings before it.
     fn zwindow_open(&self, w: &mut ZWindow, gate: u8) {
         let now = std::time::Instant::now();
-        w.open = true;
+        self.zwin_open.set(true);
         w.down = w.n;
         w.reads = 0;
         w.scans = 0;
@@ -16426,7 +16446,7 @@ impl Reader {
     /// The census's note of a scan's emitted keys, onto the window.
     #[inline(always)]
     fn zcensus_scanned(&self, n: usize) {
-        if self.zcensus {
+        if self.zcensus && self.zwin_open.get() {
             self.zcensus_scanned_slow(n);
         }
     }
@@ -16434,10 +16454,8 @@ impl Reader {
     #[inline(never)]
     fn zcensus_scanned_slow(&self, n: usize) {
         let mut w = self.zwin.get();
-        if w.open {
-            w.skeys = w.skeys.saturating_add(n as u64);
-            self.zwin.set(w);
-        }
+        w.skeys = w.skeys.saturating_add(n as u64);
+        self.zwin.set(w);
     }
 
     /// Closes the window before this operation: the readings after its
@@ -16445,7 +16463,7 @@ impl Reader {
     /// next window's length is this one's resized toward
     /// `ZWINDOW_TARGET` of wall.
     fn zwindow_close(&self, w: &mut ZWindow, gate: u8) {
-        w.open = false;
+        self.zwin_open.set(false);
         let Some(slot) = self.zcensus_slot() else {
             return;
         };
@@ -18134,11 +18152,16 @@ impl Reader {
         if start == 0 {
             if let Some(seg) = part {
                 // The form's dispatch under either option that may serve
-                // it; the gate inside decides, and `Off` keeps the raw path
-                // without the gate's load. The dispatch asked for `Always`
-                // here for as long as only `Always` was tested through it:
-                // a store under `Auto` in COMPACT read every key raw.
-                if self.opts.zpages != ZPages::Off {
+                // it, and only with the gate at the form: `Off` keeps the
+                // raw path without the gate's load, and the raw gate takes
+                // the path `Off` takes, since the dispatch's own gate check
+                // was out of line and a store under `Auto` with the gate at
+                // raw paid its call, its closure and its return on every
+                // read, 23 instructions by callgrind, to be sent back to
+                // the raw read. The dispatch asked for `Always` here for as
+                // long as only `Always` was tested through it: a store
+                // under `Auto` in COMPACT read every key raw.
+                if self.opts.zpages != ZPages::Off && self.z_on() {
                     // The partition from its form file, or from the raw form
                     // and counted where it has none in service.
                     n += self.part_read_z(seg, key, &mut f, seg_read)?;
@@ -24343,7 +24366,9 @@ impl Reader {
         let mut n = 0u64;
         if start == 0 {
             if let Some(seg) = part {
-                if self.opts.zpages != ZPages::Off {
+                // As the read's dispatch: the gate asked here, so that the
+                // raw gate takes the raw count without the call.
+                if self.opts.zpages != ZPages::Off && self.z_on() {
                     n += self.part_count_z(seg, key)?;
                 } else {
                     n += seg
@@ -24816,6 +24841,7 @@ impl Db {
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(opts.zpages_memo_bytes),
             zwin: std::cell::Cell::new(ZWindow::closed()),
+            zwin_open: std::cell::Cell::new(false),
             zcensus: opts.zpages_writer_census
                 && opts.zpages == ZPages::Auto
                 && !z_auto_inert(&opts),
@@ -25326,6 +25352,7 @@ impl Db {
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(opts.zpages_memo_bytes),
             zwin: std::cell::Cell::new(ZWindow::closed()),
+            zwin_open: std::cell::Cell::new(false),
             zcensus: opts.zpages_writer_census
                 && opts.zpages == ZPages::Auto
                 && !z_auto_inert(&opts),
@@ -27603,6 +27630,7 @@ impl Reader {
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes),
             zwin: std::cell::Cell::new(ZWindow::closed()),
+            zwin_open: std::cell::Cell::new(false),
             zcensus: false,
             slot: None,
             pin_slot,
@@ -27637,6 +27665,7 @@ impl Reader {
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes),
             zwin: std::cell::Cell::new(ZWindow::closed()),
+            zwin_open: std::cell::Cell::new(false),
             zcensus: false,
             slot: Some(slot),
             pin_slot: None,
@@ -27678,6 +27707,7 @@ impl Reader {
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes),
             zwin: std::cell::Cell::new(ZWindow::closed()),
+            zwin_open: std::cell::Cell::new(false),
             zcensus: counted && self.opts.zpages == ZPages::Auto && !z_auto_inert(&self.opts),
             slot: Some(slot),
             pin_slot: None,
@@ -30305,6 +30335,7 @@ impl Reader {
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes),
             zwin: std::cell::Cell::new(ZWindow::closed()),
+            zwin_open: std::cell::Cell::new(false),
             zcensus: false,
             slot: None,
             // A slot of its own for the passes, which pin it as the
