@@ -16290,3 +16290,120 @@ fn the_oracle_holds_with_loose_rotations() {
     );
     assert!(w.wal_rotations > 0 && w.rotated_unsynced > 0, "{w:?}");
 }
+
+/// A buffered commit near reads whose batch is worth waking the thread for
+/// files it in the commit only where a scan preceded the commit; the
+/// batches after that one, up to a share of the store's keys each, are
+/// lent and paced behind the thread (`Options::upkeep_pace_pct`): after
+/// every such commit the thread trails by at most the share, every paced
+/// commit held for that, the scan after the burst finds nothing left to
+/// settle, and every key reads as written through the writer and through
+/// a handle. A batch over the share, or every batch at zero, is filed in
+/// the commit: nothing is lent and the thread makes no pass.
+#[test]
+fn a_bursts_batches_after_the_first_are_lent_a_batch_behind_the_thread() {
+    // Batches of a thousand over twenty thousand keys: five percent of
+    // the store, paced at a share of ten and filed at one.
+    let run = |name: &str, pace_pct: usize| {
+        let pace = pace_pct >= 5;
+        let d = dir(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                sync: supdb::SyncPolicy::EveryN(u32::MAX),
+                upkeep: supdb::Upkeep::Background(1),
+                upkeep_pace_pct: pace_pct,
+                partition_bytes: Some(256 << 10),
+                seal_max_pct: 0,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let keys = 20_000u32;
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        let mut want: HashMap<u32, String> = HashMap::new();
+        for k in 0..keys {
+            db.append(&key(k), b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        assert!(db.levels().0 > 0, "partitions for the forms to hang on");
+        let check = |db: &Reader, want: &HashMap<u32, String>, when: &str| {
+            let mut seen = 0u32;
+            db.scan(
+                &key(0),
+                keys as usize,
+                kv(&mut |k, v| {
+                    let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                    let expect = want.get(&kn).map_or("0", |s| s.as_str());
+                    assert_eq!(std::str::from_utf8(v).unwrap(), expect, "key {kn} {when}");
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, keys, "every key {when}");
+        };
+        // Reads around: a scan over the store.
+        check(&db, &want, "before the burst");
+        let before = db.upkeep_counts();
+        // The burst: eight commits of a thousand random puts. The first is
+        // the commit after the scan, filed in the commit; the rest are
+        // paced, or filed too with the pace off.
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        for round in 0..8u32 {
+            for _ in 0..1000 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % keys as u64) as u32;
+                db.put(&key(k), format!("b{round}").as_bytes());
+                want.insert(k, format!("b{round}"));
+            }
+            db.commit().unwrap();
+            // The count is of writes lent and not filed by the thread's
+            // report, meaningful once a commit has lent: the first commit
+            // files in the commit and lends nothing.
+            if pace && round > 0 {
+                let behind = db.upkeep_behind_writes();
+                let share = keys as u64 * pace_pct as u64 / 100;
+                assert!(
+                    behind <= share,
+                    "commit {round}: the thread trails by at most the share {share}, not {behind}"
+                );
+            }
+        }
+        let after = db.upkeep_counts();
+        let (passes, holds) = (after[0] - before[0], after[4] - before[4]);
+        // The thread's passes joined and the upkeep home, nothing of the
+        // backlog settled by this call.
+        db.settle().unwrap();
+        let settled = db.settle_density()[1];
+        check(&db, &want, "after the burst");
+        let by_scan = db.settle_density()[1] - settled;
+        let h = db.reader().unwrap();
+        check(&h, &want, "through a handle after the burst");
+        (passes, holds, by_scan)
+    };
+    let (passes, holds, by_scan) = run("paced-burst", 10);
+    assert!(
+        passes >= 1,
+        "the thread filed the lent batches: {passes} passes"
+    );
+    assert_eq!(holds, 7, "every commit after the first held for the thread");
+    assert_eq!(
+        by_scan, 0,
+        "the scan after the burst found nothing left to settle"
+    );
+    let (passes, holds, by_scan) = run("unpaced-burst", 0);
+    assert_eq!(
+        (passes, holds, by_scan),
+        (0, 0, 0),
+        "filed in the commits: no pass, no hold, nothing for the scan"
+    );
+    let (passes, holds, by_scan) = run("over-the-share-burst", 1);
+    assert_eq!(
+        (passes, holds, by_scan),
+        (0, 0, 0),
+        "a batch over the share is filed in the commit"
+    );
+}

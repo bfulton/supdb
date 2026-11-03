@@ -2790,6 +2790,45 @@ orders: the one-percent burst 2.6x and 2.7x (6/6 each), its weighted sum
 with their bursts 24 against 61 ms, 186 against 182 and 2,327 against
 2,394 in the counters, and the loads and the scans level.
 
+The pipeline described above is built (`Options::upkeep_pace_pct`,
+`Hand::Pace`): of the batches a buffered commit near reads would file
+itself, the first after a scan still is, and the rest, each at most a
+hundredth of the store's keys, are lent, the commit returning once the
+thread trails by at most that hundredth. Two depths were priced, each
+against the inline fill (`supdb-ingestnopace`) and against lending every
+batch (`pair.sh SUPDB_LAG_COUNTERS=1 supdb-ingest ARM SIZE --passes
+load,lag --reps 8`, six pairs a sitting at a million and three million,
+at the commit that added the option). A batch deep -- the commit holding
+until the thread had filed the batch before it -- the pace read the
+sweep's weighted sum at 0.77x and 0.83x of the inline fill's at a
+million keys and at 1.35x and 1.39x of lending's: every batch was a pass
+of the thread's, and a pass has a fixed part, the log read, the snapshot
+moved and the bounds walked, which read 2 ms a pass of a thousand writes
+at a million keys and 3.2 at three million against 1.0-1.5 of filing, so
+the thread did twice the work a batch and the writer waited for it. With
+the depth the share, the hundredth, the thread's passes cover several
+batches where it falls behind, and against the inline fill the pace
+reads the sum at 0.79x and 0.82x at three hundred thousand keys, 0.75x
+and 0.81x at a million and 0.64x and 0.64x at three million, 8/8 or 6/6
+in both orders, the bursts 1.3-4.7x faster and the scans after the tenth
+and the full rewrite at 0.6-0.9x; at a hundred thousand 0.85x and 1.02x,
+and at ten thousand, where a batch of a thousand is a tenth of the store
+and is filed in the commit as before, a control. Against lending every
+batch the pace reads 1.21x and 1.29x at a million and 1.23x and 1.29x at
+three million: lending's bursts run 1.7-2.5x faster still, since the
+thread's filing is cheapest in the long passes a run-ahead writer leaves
+it -- a block dirtied by many writes is built once where the pace
+patches it a few batches at a time -- and its scans after the tenth and
+the full rewrite run 2-7.8x slower, the residue the first scan settles.
+The share is where the two are traded: the pass in flight the first scan
+waits for is at most a hundredth of the store's fill, and what lending
+saves on the burst past that is what the pace leaves. The lever left
+unpriced is the thread gathering half the share before it begins a pass
+while the writer runs ahead, so its passes are as long as lending's
+while the first scan's wait stays bounded; `Options::upkeep_batch_pct`
+has the gather, gated to every commit and a bound a hold at the same
+size would serialise with.
+
 #### The freeze that leaves its carry to the next look
 
 At level 1 the freeze is the one place the writer still does work for

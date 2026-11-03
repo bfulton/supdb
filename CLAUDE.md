@@ -798,13 +798,31 @@ behind an atomic would let one in unasked.
 its block tables and scan snapshot -- to a thread of the store's own and
 returns without waiting for it; at level 2 (`supdb-hold`) a commit that
 would leave its batch to the next scan returns only once the thread has
-filed it. A commit with no fsync to work beside lends nothing of a
-burst's batch while reads are around and files it itself
-(`Options::upkeep_inline_bursts`): the thread's window is the barrier,
-and a buffered burst of one commit left it none, so the burst's whole
-filing fell to the first scan after it -- the buffered lag cells read
-0.2-0.6x of LMDB with the scans themselves at the drained store's rate.
-`supdb-ingestlendbursts` is the arm that lends anyway. One thread holds it at a time, and one word says which:
+filed it. A commit with no fsync to work beside files a burst's first
+batch after a scan itself (`Options::upkeep_inline_bursts`): the
+thread's window is the barrier, and a buffered burst of one commit left
+it none, so the burst's whole filing fell to the first scan after it --
+the buffered lag cells read 0.2-0.6x of LMDB with the scans themselves
+at the drained store's rate. The batches after that one, each at most
+a hundredth of the store's keys, it lends paced
+(`Options::upkeep_pace_pct`, `Hand::Pace`): the commit returns once the
+thread trails by at most that hundredth, so the thread's core files
+behind the writer's commits, the writer waits only where the thread has
+fallen that far behind, and the first scan after the burst meets at most
+the share -- filing every batch inline had put the whole fill on the
+writer, a third to half of a buffered burst from a hundred thousand keys
+up, and lending every batch had left the scans after a burst 1.8-3.5x
+slower. The share is the first scan's wait for the pass in flight
+against the pass over the store: at ten thousand keys a batch of a
+thousand is a tenth of the store and its fill several passes, and paced
+there the burst gained a third while its scans after lost two thirds.
+It is the pipeline's depth too: paced a batch deep, every batch was a
+pass of the thread's, whose fixed part doubled the thread's cost a batch
+at three million keys, and the sweep's weighted sum read a third worse
+than lending at a million. `supdb-ingestlendbursts` is the arm that
+lends every batch and `supdb-ingestnopace` the one that files every
+batch.
+One thread holds it at a time, and one word says which:
 every hand-over is a single operation on that word, the side giving it
 up fills the cell before it and the side taking it empties the cell
 after, so nothing in it needs to be `Sync`. A writer's touch of it takes
