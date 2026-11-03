@@ -3147,12 +3147,19 @@ trips where one wait would do. The build asks the kernel for every run
 first now (`Options::pieces_willneed`), and the full-rewrite pass reads
 1.5x; a store in core asks nothing, since the ask is a syscall a piece a
 block, and the gate that says the store is out of core (`Options::zpages`)
-is what turns it on. The rule: a walk that knows its pages before it
-reads them asks for them together where a page is a fault, and the ask
-is gated on the fault being there to save, since in core the ask is the
-cost; and the thread's major-fault count is not the measure of such a
-change, since a page asked for and reached before it arrives faults as
-minor -- read the pass's time.
+is what turns it on. The partition's own spans, asked for the same way
+(`Options::blocks_willneed`), lost the one-percent point 1.4x before the
+ask was gated on residency as well: that point's pages the burst's
+settle had just pulled in, and an `madvise` over resident pages still
+walks them in the kernel, ten to twenty microseconds on a scan of five;
+one `mincore` of the span's first page first, and nothing asked where it
+is there, kept the gains and lost the loss. The rule: a walk that knows
+its pages before it reads them asks for them together where a page is a
+fault, and the ask is gated on the fault being there to save -- the store
+out of core, and the page not resident -- since in core, or on a resident
+span, the ask is the whole cost; and the thread's major-fault count is
+not the measure of such a change, since a page asked for and reached
+before it arrives faults as minor -- read the pass's time.
 
 ## Standing limitations
 

@@ -409,6 +409,12 @@ pub struct ZCounts {
     /// Pieces' runs a block's build asked the kernel for ahead of reading
     /// them, out of core (`Options::pieces_willneed`).
     pub piece_willneeds: u64,
+    /// Raw partition spans a scan asked the kernel for ahead of walking
+    /// them, out of core (`Options::blocks_willneed`).
+    pub block_willneeds: u64,
+    /// Of the spans counted above, those submitted to the kernel: the rest
+    /// had their first page resident and were left alone.
+    pub willneed_asks: u64,
     /// Point reads and counts of a partition answered from its form file.
     pub reads: u64,
     pub counts: u64,
@@ -2897,6 +2903,17 @@ pub struct Options {
     /// an `madvise` a piece a block would cost a build more than it
     /// builds. Off, `supdb-nowillneed` and `supdb-ingestnowillneed`.
     pub pieces_willneed: bool,
+    /// Out of core, a scan asks the kernel for the raw partition records
+    /// it is about to walk before it walks them -- a clean block's records
+    /// from the seek, and a block's records ahead of its build
+    /// (`Blob::willneed_ranks`, at most `WILLNEED_CAP` bytes an ask) --
+    /// where the records were read as the walk met them, a fault a page
+    /// each, and a scan of a hundred keys over a drained store took three
+    /// to four, in turn. Asked only for a partition no form file serves
+    /// and while the controller's gate is away from the raw form, as
+    /// `pieces_willneed` is. Off, `supdb-noblockwillneed` and
+    /// `supdb-ingestnoblockwillneed`.
+    pub blocks_willneed: bool,
     /// A seal writes a key whose chain holds one value and no tombstone
     /// -- every key of a load, and most of any table -- through the
     /// writer's one-value path (`SegmentWriter::put_one`), the record
@@ -3495,6 +3512,7 @@ impl Default for Options {
             land_ranks_far: false,
             piece_ranks_whole: false,
             pieces_willneed: true,
+            blocks_willneed: true,
             seal_put_one: true,
             close_presync: true,
             ord_durable: false,
@@ -8889,6 +8907,12 @@ struct Slot {
     /// Pieces' runs a block's build asked the kernel for ahead of reading
     /// them (`Options::pieces_willneed`).
     zwillneeds: AtomicU64,
+    /// Raw partition spans a scan asked the kernel for ahead of walking
+    /// them (`Options::blocks_willneed`).
+    zblkwillneeds: AtomicU64,
+    /// Of the spans above, pieces' and partitions', those the kernel was
+    /// asked for: the rest had their first page resident and were not.
+    zwillneedasks: AtomicU64,
     /// Partition walks of a scan served by a form file, the groups decoded
     /// for them, and the runs of records no page holds the raw form walked
     /// inside them.
@@ -8965,6 +8989,8 @@ impl Slot {
             zcuts: AtomicU64::new(0),
             zcutrecs: AtomicU64::new(0),
             zwillneeds: AtomicU64::new(0),
+            zblkwillneeds: AtomicU64::new(0),
+            zwillneedasks: AtomicU64::new(0),
             zscanz: AtomicU64::new(0),
             zscangroups: AtomicU64::new(0),
             znopagescans: AtomicU64::new(0),
@@ -12691,6 +12717,12 @@ fn block_bounds_of(
 /// writer freezes into room and waits for the oldest to land only when
 /// the list is full.
 const FROZEN_CAP: usize = 3;
+
+/// The most a scan asks the kernel for ahead of one walk
+/// (`Options::blocks_willneed`, `Options::pieces_willneed`): a scan's
+/// limit can be every rank of a partition, and a block's records are a
+/// few pages.
+const WILLNEED_CAP: usize = 64 << 10;
 
 /// What a reader reads: the store as of a publish. The writer builds a
 /// new one at every seal, join, merge or freeze and swaps it in whole,
@@ -17384,6 +17416,8 @@ impl Reader {
             cuts: rd.stat(|s| &s.zcuts),
             cut_records: rd.stat(|s| &s.zcutrecs),
             piece_willneeds: rd.stat(|s| &s.zwillneeds),
+            block_willneeds: rd.stat(|s| &s.zblkwillneeds),
+            willneed_asks: rd.stat(|s| &s.zwillneedasks),
             nopage_reads: rd.stat(|s| &s.znopage),
             scans: rd.stat(|s| &s.zscanz),
             scan_groups: rd.stat(|s| &s.zscangroups),
@@ -17635,6 +17669,16 @@ impl Reader {
     /// raw form, which is the store's own measure of being out of core.
     fn pieces_willneed(&self) -> bool {
         self.opts.pieces_willneed && self.shared.zgate.load() != zselect::GATE_RAW
+    }
+
+    /// Whether a scan asks for the raw partition records it is about to
+    /// walk (`Options::blocks_willneed`): the option, the gate away from
+    /// the raw form, and no form file serving the partition, whose pages
+    /// are then the form file's and not these.
+    fn blocks_willneed(&self, seg: &Seg) -> bool {
+        self.opts.blocks_willneed
+            && self.shared.zgate.load() != zselect::GATE_RAW
+            && self.zc(seg).is_none()
     }
 
     #[inline(never)]
@@ -22469,8 +22513,13 @@ impl Reader {
         let lo = b * CACHE_BLOCK;
         let hi = ((b + 1) * CACHE_BLOCK).min(keys);
         if self.pieces_willneed() && ranks.start < ranks.end {
-            p.raw().willneed_ranks(ranks.start, ranks.end - ranks.start);
+            let n = p
+                .raw()
+                .willneed_ranks(ranks.start, ranks.end - ranks.start, WILLNEED_CAP);
             self.zbump(|s| &s.zwillneeds);
+            if n > 0 {
+                self.zbump(|s| &s.zwillneedasks);
+            }
         }
         if table.slots[b].is_none() {
             table.slots[b] = Some(std::sync::Arc::new(Cached::Clean));
@@ -22845,6 +22894,13 @@ impl Reader {
                 }
                 if rank < keys {
                     let want = (keys - rank).min(limit - seen);
+                    if self.blocks_willneed(seg) {
+                        let n = seg.raw().willneed_ranks(rank, want, WILLNEED_CAP);
+                        self.zbump(|s| &s.zblkwillneeds);
+                        if n > 0 {
+                            self.zbump(|s| &s.zwillneedasks);
+                        }
+                    }
                     seen += self.cache_scan(seg, rank, want, &mut *f)?;
                 }
                 match &seg.hi {
@@ -22909,6 +22965,13 @@ impl Reader {
                     None => &NO_SNAPSHOT,
                 };
                 if canon.is_none() && table.slots[b].is_none() {
+                    if self.blocks_willneed(seg) {
+                        let n = seg.raw().willneed_ranks(lo, hi - lo, WILLNEED_CAP);
+                        self.zbump(|s| &s.zblkwillneeds);
+                        if n > 0 {
+                            self.zbump(|s| &s.zwillneedasks);
+                        }
+                    }
                     let built = self.share_form(ctx.materialize(src, table, b, unsealed)?);
                     self.count_built_kind(&built);
                     let bytes = self.fbytes(&built);
@@ -31932,10 +31995,15 @@ impl<'s> BuildCtx<'s> {
         if self.rd.pieces_willneed() {
             for (j, run, _) in pieces {
                 if run.start < run.end {
-                    src.l0[*j]
-                        .raw()
-                        .willneed_ranks(run.start, run.end - run.start);
+                    let n = src.l0[*j].raw().willneed_ranks(
+                        run.start,
+                        run.end - run.start,
+                        WILLNEED_CAP,
+                    );
                     self.rd.zbump(|s| &s.zwillneeds);
+                    if n > 0 {
+                        self.rd.zbump(|s| &s.zwillneedasks);
+                    }
                 }
             }
         }

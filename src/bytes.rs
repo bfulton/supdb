@@ -104,6 +104,17 @@ pub trait Bytes {
     /// side once; whether that is worth doing is a measurement, not a given. A
     /// no-op wherever `advise_random` is one.
     fn advise_normal(&self) {}
+
+    /// Whether the page holding `off` is in the page cache now (`mincore`),
+    /// `None` where the source cannot say: a mapping with no page cache
+    /// behind it, or no mapping at all. The one question a reader asks
+    /// before `advise_willneed`: an ask over pages already resident walks
+    /// them in the kernel for nothing, ten to twenty microseconds a scan
+    /// whose pages a settle had just pulled in, where a scan that hits is
+    /// five.
+    fn resident_at(&self, _off: u64) -> Option<bool> {
+        None
+    }
 }
 
 /// Read `len` bytes at `off`, borrowing when the source allows it.
@@ -269,6 +280,23 @@ impl Bytes for MmapBytes {
     }
     fn advise_normal(&self) {
         let _ = self.0.advise(memmap2::Advice::Normal);
+    }
+    #[cfg(target_os = "linux")]
+    fn resident_at(&self, off: u64) -> Option<bool> {
+        let off = usize::try_from(off).ok()?;
+        if off >= self.0.len() {
+            return None;
+        }
+        // SAFETY: the page size is a constant of the process, and the
+        // address handed to `mincore` is one page of this mapping, aligned
+        // down to the page and within it.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let page = usize::try_from(page).ok().filter(|p| p.is_power_of_two())?;
+        let base = self.0.as_ptr() as usize;
+        let at = (base + off) & !(page - 1);
+        let mut vec = [0u8; 1];
+        let rc = unsafe { libc::mincore(at as *mut libc::c_void, page, vec.as_mut_ptr()) };
+        (rc == 0).then_some(vec[0] & 1 == 1)
     }
     fn advise_dontneed(&self) {
         #[cfg(target_os = "linux")]

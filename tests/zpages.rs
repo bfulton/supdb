@@ -3067,6 +3067,11 @@ fn a_build_asks_for_its_pieces_pages_together_only_out_of_core() {
             on,
             "the builds asked for the piece's pages only with the option: {asked}"
         );
+        assert_eq!(
+            db.zpage_counts().block_willneeds,
+            0,
+            "a partition a form file serves is never asked for raw"
+        );
         // The gate at the raw form, as a store in core has it: another
         // handle builds the same blocks afresh, and asks nothing.
         db.zgate_set(0);
@@ -3077,6 +3082,89 @@ fn a_build_asks_for_its_pieces_pages_together_only_out_of_core() {
             db.zpage_counts().piece_willneeds,
             asked,
             "with the gate at raw the builds ask nothing"
+        );
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Out of core a scan asks the kernel for the raw partition records it is
+/// about to walk (`Options::blocks_willneed`): a clean block's records from
+/// the seek, and a block's records ahead of its build. A store with no
+/// form file (`ZPages::Off`) and the gate set away from raw by hand, as
+/// the census leaves it, asks on every walk; with the gate at raw, as a
+/// store in core has it, or with the option off, it asks nothing. The
+/// scans answer the same either way, over a drained store and over one
+/// with unsealed keys.
+#[test]
+fn a_scan_asks_for_the_raw_records_it_is_about_to_walk_only_out_of_core() {
+    for on in [true, false] {
+        let dir = scratch(&format!("block-willneed-{on}"));
+        let mut db = Db::create(
+            &dir,
+            Options {
+                zpages: ZPages::Off,
+                partition_bytes: Some(160 << 10),
+                scan_block_cache: true,
+                commit_forms: false,
+                blocks_willneed: on,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let mut model = ordered_load(&mut db, 4000, 0x3B10C);
+        let check = |r: &supdb::Reader, model: &Model, what: &str| {
+            for start in [b"".to_vec(), spaced_key(1000), spaced_key(2500)] {
+                for limit in [1usize, 57, 300] {
+                    same_window(
+                        &scanned(r, &start, limit),
+                        &window(model, &start, limit),
+                        &format!(
+                            "{what}, from {:?} for {limit}",
+                            String::from_utf8_lossy(&start)
+                        ),
+                    );
+                }
+            }
+        };
+        // The gate as the census leaves it: the drained store's walks ask.
+        db.zgate_set(1);
+        let r = db.reader().unwrap();
+        check(&r, &model, "drained, the gate at the census");
+        drop(r);
+        let drained = db.zpage_counts().block_willneeds;
+        assert_eq!(
+            drained > 0,
+            on,
+            "the drained walks asked for their records only with the option: {drained}"
+        );
+        // Unsealed keys over every block: the builds ask too.
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let mut rng = Rng(0x3B10C1);
+        for k in keys.iter().step_by(5) {
+            let v = suite_value(&mut rng);
+            db.append(k, &v);
+            model.entry(k.clone()).or_default().push(v);
+        }
+        db.commit().unwrap();
+        let r = db.reader().unwrap();
+        check(&r, &model, "unsealed keys, the gate at the census");
+        drop(r);
+        let built = db.zpage_counts().block_willneeds;
+        assert_eq!(
+            built > drained,
+            on,
+            "the builds asked for their records only with the option: {built}"
+        );
+        // The gate at raw: the same walks and builds afresh, nothing asked.
+        db.zgate_set(0);
+        let r = db.reader().unwrap();
+        check(&r, &model, "the gate at raw");
+        drop(r);
+        assert_eq!(
+            db.zpage_counts().block_willneeds,
+            built,
+            "with the gate at raw nothing is asked"
         );
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);

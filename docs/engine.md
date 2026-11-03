@@ -6469,6 +6469,38 @@ LMDB's leaves are two, which is the compact form's to shorten and a
 reason the row's sweep runs after the read passes that install it; and
 the merge's two passes over its inputs.
 
+The partition's own pages were asked for the same way next
+(`Options::blocks_willneed`; `supdb-noblockwillneed` and
+`supdb-ingestnoblockwillneed` read as before): a clean block's records
+from the seek, which is the drained store's whole walk, and a block's
+records ahead of its build, for a partition no form file serves and with
+the gate away from raw, at most 64 KB an ask (`WILLNEED_CAP`), since a
+scan's limit can be every rank. The first version asked whether the
+pages were resident or not, and lost the one-percent point 1.4x while
+winning the other three: that point's pages the burst's settle had just
+pulled in, and an `madvise` over resident pages still walks them in the
+kernel, ten to twenty microseconds a scan of five. An ask asks `mincore`
+of the span's first page first now and asks for nothing where it is
+resident (`Bytes::resident_at`), the pieces' asks the same; over the
+sweep at ten million keys 23% of the spans considered were asked for
+(`willneed_asks` against `block_willneeds` and `piece_willneeds`).
+Paired at ten million keys under 1.25 GiB, a warmup and a pair (`bench
+ab --arms supdb,supdb-noblockwillneed --size 10000000 --bound 1342177280
+--passes load,lag --ops-div 10 --reps 1`): the drained point 1.12 and
+1.26 s against 1.88 and 1.94, its scanning thread 0.9 major faults a
+scan against 2.7, the cell 1.7x; the ten-percent point 2.7 and 2.8 s
+against 1.9 and 4.0, 2.5 faults a scan against 4.9, the cell 1.5x in the
+pair; the full-rewrite point 9.9 and 10.1 s against 10.6 and 13.1, 7.3
+faults against 12.7, 1.3x; the one-percent point 0.61 and 0.62 s against
+1.0 and 1.6 here, and against 0.49 and 0.50 in the pairing before the
+residency check, where it had read 0.70 and 0.77 -- its scans after the
+first 20 us against 6, the checks and the asks that found a page cold.
+Against LMDB's figures from the pairing before these two asks, the
+drained point stands level (1.1-1.3 s against 1.15-1.17), the
+one-percent point at 0.6x, which is the first scan settling the burst
+where LMDB has nothing to settle, the ten-percent point at 0.4x and the
+full-rewrite point at 0.12x, where the row had 0.03x.
+
 #### Out of core: the second form
 
 A pairing this section cites is given as the command that reproduces it, `pair.sh A B SIZE [bench ab options]` (`bench/scripts/pair.sh`: `bench ab` over the two arms, one sitting in each order), at the commit it ran at; a binary built at that commit runs it (`BIN=`), and every arm named exists at the head as well. A rerun reproduces the comparison, not the rates, which this host moves by tens of percent between sittings. A count a sentence quotes -- decodes, faults by mix, the controller's events, the census -- was read with the variable before the command set, which turns supdb's own timers on as well, so a rate against a comparator is read from a run without it. Pairings made before this history's root (2026-10-20) cite the root, `18c3a30`, the first commit here that holds their arms. The design the form was built to is `docs/zpages-design.md`.

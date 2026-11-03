@@ -78,10 +78,13 @@ The suite has to be fair before any of its numbers are quoted.
   the rest is the merge streaming the rewritten store twice through a
   cache that cannot hold it, beside scans that found their keys' pages
   in the burst's pieces one fault at a time, which a build asks for
-  together now (`Options::pieces_willneed`, the pass 1.5x for it); the
-  partition's own pages a raw scan takes where LMDB takes two leaves are
-  the compact form's, and the merge's two passes over its inputs are the
-  next lever; the engine's trimmer running while the
+  together now (`Options::pieces_willneed`, the pass 1.5x for it), and
+  the partition's own pages a raw scan takes are asked for the same way
+  (`Options::blocks_willneed`), the drained point level with LMDB for it
+  and the full-rewrite point at 0.12x; what is left there is the merge's
+  two passes over its inputs, and the compact form's shorter pages once
+  the row's read passes have installed it; the engine's trimmer running
+  while the
   store is under a cgroup bound, where free memory is page cache the
   store does not have (`Options::forms_to_fit`'s trim, priced in core
   before it is the default under a bound); and 1 GiB.

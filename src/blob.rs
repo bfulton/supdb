@@ -949,10 +949,13 @@ impl<B: Bytes> Blob<B> {
     /// this segment come in together, where read one fault at a time each
     /// was a device round trip of its own. The span runs to the record
     /// after the last asked for, or a few lines past the last record where
-    /// the ranks end at it. The bytes submitted; zero where the source has
-    /// no mapping behind it or the ranks resolve to nothing.
+    /// the ranks end at it, and no further than `cap` bytes from the first:
+    /// a scan's whole limit can be every rank. The bytes submitted; zero
+    /// where the source has no mapping behind it, the ranks resolve to
+    /// nothing, or the span's first page is resident already
+    /// (`Bytes::resident_at`).
     #[cfg(not(target_family = "wasm"))]
-    pub fn willneed_ranks(&self, rank: usize, n: usize) -> usize {
+    pub fn willneed_ranks(&self, rank: usize, n: usize, cap: usize) -> usize {
         let Some((sec, idx)) = self.flat() else {
             return 0;
         };
@@ -962,12 +965,22 @@ impl<B: Bytes> Blob<B> {
         let Some((a, b)) = idx.record_span(dir, rank, n) else {
             return 0;
         };
-        let b = b.saturating_add(256).min(recs.len());
+        let b = b
+            .saturating_add(256)
+            .min(a.saturating_add(cap))
+            .min(recs.len());
         if a >= b {
             return 0;
         }
         let recs_at = recs.as_ptr() as usize - sec.as_ptr() as usize;
         let off = self.index_offset() + recs_at as u64 + a as u64;
+        // A span whose first page is resident is taken as resident whole,
+        // and nothing is asked: the records of a run or a block are a few
+        // pages the same walk brought in or left out together, and an ask
+        // over resident pages costs the kernel's walk of them for nothing.
+        if self.src.resident_at(off) == Some(true) {
+            return 0;
+        }
         self.src.advise_willneed(off, b - a)
     }
 
