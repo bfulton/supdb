@@ -6651,6 +6651,23 @@ each, and no cell was marked in either sitting, since the merges land
 under the load with no read around and the partitions fit a merge's cap
 whole.
 
+Paired against LMDB with its readahead off at the head that holds all of
+these (`bench ab --arms supdb,lmdb-nordahead --size 10000000 --bound
+1342177280 --passes load,lag --ops-div 10 --reps 1`, a warmup and a pair):
+the drained pass 0.78 and 0.86 s against 1.02 and 1.20, the one-percent
+pass 0.34 and 0.43 against 0.33 and 0.35 (its first scan the burst's
+settle, 217 and 331 ms), the ten-percent pass 2.5 and 2.7 s against 0.86
+and 1.0 with 3.0 major faults a scan against 1.8, and the full-rewrite pass
+6.3 and 6.5 s against 1.1 with 5.9 faults a scan against 2.0 -- 0.17x
+where the row had 0.03x. LMDB's bursts run at 14,000 updates a second
+under the bound against our 350,000 to 430,000, so the suite's weighted
+cells, the burst and the pass together, read 1.9x, 1.4x and 4.5x in our
+favour at the three points and 3.6x over the sweep, and the shuffled load
+10x. What the full-rewrite pass still pays is the pieces standing at its
+start and the merges' streaming beside its scans, and the ten-percent
+pass's three faults a scan against LMDB's 1.8 are the next thing to take
+apart.
+
 #### Out of core: the second form
 
 A pairing this section cites is given as the command that reproduces it, `pair.sh A B SIZE [bench ab options]` (`bench/scripts/pair.sh`: `bench ab` over the two arms, one sitting in each order), at the commit it ran at; a binary built at that commit runs it (`BIN=`), and every arm named exists at the head as well. A rerun reproduces the comparison, not the rates, which this host moves by tens of percent between sittings. A count a sentence quotes -- decodes, faults by mix, the controller's events, the census -- was read with the variable before the command set, which turns supdb's own timers on as well, so a rate against a comparator is read from a run without it. Pairings made before this history's root (2026-10-20) cite the root, `18c3a30`, the first commit here that holds their arms. The design the form was built to is `docs/zpages-design.md`.

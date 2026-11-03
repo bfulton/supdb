@@ -92,8 +92,11 @@ The suite has to be fair before any of its numbers are quoted.
   `Options::merge_bytes_cap`), since the planner ran at the seals alone and
   the full rewrite's pass met the burst's 336 pieces for the whole of it
   with one merge over every range in flight -- the pass 6.9 s against
-  10.0-10.7, its cell 1.33-1.39x in two sittings, the burst level; the
-  merge's first pass reads its
+  10.0-10.7, its cell 1.33-1.39x in two sittings, the burst level, and
+  against LMDB at that head the drained pass 1.3x, the one-percent pass
+  level, the ten-percent pass 0.35x and the full rewrite 0.17x, with the
+  weighted cells 1.4-4.5x ours since LMDB's bursts run at 14k updates a
+  second under the bound; the merge's first pass reads its
   keys off the ordered index's heads now (`Options::merge_keys_by_heads`,
   the bursts' background reads an operation 1.6-1.75x fewer, the cells
   within the spread), and what is left there is the merge's second pass
