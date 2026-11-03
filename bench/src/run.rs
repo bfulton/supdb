@@ -1426,6 +1426,30 @@ pub fn probe_counts(bound: &Bound) -> Result<(), String> {
 
 /// `/sys/block/<dev>/stat`'s (read I/Os, read ticks in ms): the first and
 /// fourth fields (`Documentation/block/stat.rst`).
+/// The device's sectors read and written so far, from its `stat` file
+/// (fields 3 and 7): what a pass's window of them says the device did,
+/// whoever asked.
+fn dev_sectors(path: &Path) -> Option<(u64, u64)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let f: Vec<u64> = text
+        .split_whitespace()
+        .filter_map(|x| x.parse().ok())
+        .collect();
+    Some((*f.get(2)?, *f.get(6)?))
+}
+
+/// The process's bytes read from and written to the device so far, from
+/// `/proc/self/io` (`read_bytes`, `write_bytes`), every thread's together.
+fn proc_io() -> Option<(u64, u64)> {
+    let s = std::fs::read_to_string("/proc/self/io").ok()?;
+    let field = |k: &str| -> Option<u64> {
+        s.lines()
+            .find_map(|l| l.strip_prefix(k))
+            .and_then(|v| v.trim().parse().ok())
+    };
+    Some((field("read_bytes:")?, field("write_bytes:")?))
+}
+
 fn dev_read_stat(path: &Path) -> Option<(u64, u64)> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut f = text.split_whitespace().map(|x| x.parse::<u64>().ok());
@@ -2241,6 +2265,23 @@ fn lag_sweep(
         } else {
             (0, (0, 0))
         };
+        // With `SUPDB_LAG_COUNTERS`, the device's and the group's side of
+        // the pass: sectors the device read and wrote while the scans ran,
+        // the process's own read and write bytes, and the group's dirty and
+        // writeback pages at the pass's end with its faults over it, as a
+        // `lagdev` line -- what a pass that reads nothing itself and runs
+        // at a tenth of its CPU is waiting on.
+        let dev0 = if counting_store {
+            counting.dev_stat.as_deref().and_then(dev_sectors)
+        } else {
+            None
+        };
+        let io0 = if counting_store { proc_io() } else { None };
+        let grp0 = if counting_store {
+            counting.bound.and_then(|b| b.stat().ok())
+        } else {
+            None
+        };
         let cs = counting.begin();
         lag_mark(arm, pct, "start");
         let t = Instant::now();
@@ -2258,6 +2299,45 @@ fn lag_sweep(
         lag_mark(arm, pct, "end");
         counting.end(cs, "scan-lag", &suffix, None, scans);
         scan_lag.push((pct, (scans * plan.scan_len as u64) as f64 / secs));
+        if counting_store {
+            let mb = |sectors: u64| sectors as f64 * 512.0 / (1u64 << 20) as f64;
+            let dev = match (dev0, counting.dev_stat.as_deref().and_then(dev_sectors)) {
+                (Some((r0, w0)), Some((r1, w1))) => {
+                    format!(
+                        "dev_read_mb {:.1} dev_write_mb {:.1}",
+                        mb(r1 - r0),
+                        mb(w1 - w0)
+                    )
+                }
+                _ => "dev n/a".to_string(),
+            };
+            let io = match (io0, proc_io()) {
+                (Some((r0, w0)), Some((r1, w1))) => format!(
+                    "proc_read_mb {:.1} proc_write_mb {:.1}",
+                    (r1 - r0) as f64 / (1u64 << 20) as f64,
+                    (w1 - w0) as f64 / (1u64 << 20) as f64
+                ),
+                _ => "proc n/a".to_string(),
+            };
+            let grp = match (grp0, counting.bound.and_then(|b| b.stat().ok())) {
+                (Some(g0), Some(g1)) => format!(
+                    "dirty_mb {:.1} writeback_mb {:.1} pgfault {} pgmajfault {} refaults {} cache_mb {:.0} rss_mb {:.0}",
+                    g1.dirty as f64 / (1u64 << 20) as f64,
+                    g1.writeback as f64 / (1u64 << 20) as f64,
+                    g1.pgfault.saturating_sub(g0.pgfault),
+                    g1.pgmajfault.saturating_sub(g0.pgmajfault),
+                    g1.workingset_refault_file
+                        .saturating_sub(g0.workingset_refault_file),
+                    g1.cache as f64 / (1u64 << 20) as f64,
+                    g1.rss as f64 / (1u64 << 20) as f64
+                ),
+                _ => "group n/a".to_string(),
+            };
+            eprintln!(
+                "lagdev {arm} {pct} pass_ms {:.1} | {dev} | {io} | {grp}",
+                secs * 1e3
+            );
+        }
         if per_op && !op_us.is_empty() {
             let cpu_ms = thread_cpu_us().saturating_sub(cpu0) as f64 / 1e3;
             let sw1 = thread_switches();
