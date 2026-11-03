@@ -252,6 +252,15 @@ pub trait Engine {
     fn range(&mut self, from: &[u8], n: usize) -> Res<usize>;
     /// Make everything written durable and readable.
     fn sync(&mut self) -> Res<()>;
+    /// Join whatever the engine still does in the background after a
+    /// `sync` -- supdb's merges of the pieces a drain left, which the
+    /// flush hands to a thread and the writer publishes at its next
+    /// commit -- so a pass that wants a store in a known shape has one.
+    /// Outside every timed window. Nothing, for an engine whose `sync`
+    /// leaves nothing in flight.
+    fn settle(&mut self) -> Res<()> {
+        Ok(())
+    }
     fn size_bytes(&self) -> u64;
     /// A reader for a thread of its own, made here on the thread that
     /// owns the engine and opened on the thread that reads through it.
@@ -7688,6 +7697,11 @@ impl Engine for Supdb {
             ("frozen_sorts", db.frozen_sorts() as f64),
             // What the upkeep thread spent, and the passes it spent it in.
             ("upkeep_ms", db.upkeep_counts()[6] as f64 / 1e3),
+            // The writer's holds for the thread and their time
+            // (`Db::hold_within`, `hold_for_upkeep`): a burst slower than
+            // its commits is read against them before anything else.
+            ("upkeep_holds", db.upkeep_counts()[4] as f64),
+            ("upkeep_hold_us", db.upkeep_counts()[5] as f64),
             ("upkeep_passes", db.upkeep_counts()[0] as f64),
             ("upkeep_skipped", db.upkeep_counts()[7] as f64),
             // The times the upkeep thread gave its forms up, and of those
@@ -8039,6 +8053,19 @@ impl Engine for Supdb {
             if self.zpages {
                 db.zpages_settle().map_err(|e| e.to_string())?;
             }
+        }
+        Ok(())
+    }
+    /// The seals and merges in flight joined (`Db::settle`): a drain is
+    /// answered before the merge of the pieces it leaves, which ran on
+    /// into the lag sweep's points beside the bursts, and the buffered
+    /// arm's one-percent burst read one rep in six at a third of its rate
+    /// for it (`CLAUDE.md`, the sweep's first point). The pieces the
+    /// background leaves below its trigger still stand after this, and
+    /// the `lagcounters` line counts them.
+    fn settle(&mut self) -> Res<()> {
+        if let Some(db) = self.db.as_mut() {
+            db.settle().map_err(|e| e.to_string())?;
         }
         Ok(())
     }

@@ -3287,6 +3287,42 @@ than its commits is listed under `strace` before its profile is read,
 since the profile of a thread that waits shows the work and not the
 wait.
 
+**A point that was not the store it said, and a burst as wide as the
+share it is held to.** The buffered arm's one-percent burst at three
+million keys read bimodal in every pairing, 24-70 ms in five reps of six
+and 110-290 in the sixth, every slow rep with level-0 pieces standing,
+its thread building twice the forms and its pass after faster. The first
+two readings went after the writer's syscalls and found nothing: the
+rotation inside the burst is an eight-byte create in every rep
+(`recycle_wal` off), and the WAL's thirty-one writes took under four
+milliseconds in every traced burst. The writer's own CPU over the burst
+beside its wall named a wait, and the hold counters named whose:
+`hold_within`, the paced commit's wait for the thread to trail by at
+most the share, 47 ms of the slow burst's 48 ms gap and nothing in the
+clean ones. Two things coincided. The share is a hundredth of the
+partitions' keys, and the drain the sweep's first point ends in is
+answered before the merge of the pieces it leaves, so at the burst those
+pieces still held keys no partition did, the share undercounted the
+store by them, and a burst of exactly a hundredth crossed it by a batch
+or two at its last commits; and the merge was running beside the burst
+on the guest's four vCPUs, so the pass in flight the hold waited for was
+long. The sweep's comment called its first point "the fully merged
+store", and `sync` joins no merge -- `settle` does, as this file already
+said of an experiment that assumed otherwise. The sweep settles at its
+first point now (`Engine::settle`, `bench/CLAUDE.md`), the probe and the
+`lagburst` and `lagcounters` lines carry the writer's CPU over the burst
+and its holds, and the burst reads one shape, 22-48 ms in twenty-eight
+bursts with holds of 0-9 ms; the pieces the background leaves below its
+trigger still stand in some reps, and the share still undercounts by
+them, so the hold at a burst of exactly the share is the few milliseconds
+of a short pass and not the merge's. The rule: a premise about the
+store's shape at a point is held to the count the counters print -- the
+pieces standing -- before the point's cells are read; a cell as wide as
+a threshold measures the threshold's other side whenever the threshold's
+count moves, so it is read with that count beside it; and a burst slower
+than its commits is read against the writer's CPU and its holds before a
+syscall is suspected.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

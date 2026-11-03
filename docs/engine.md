@@ -2878,7 +2878,24 @@ were 15-20 ns apiece, L2 and L3 hits: one miss into a cold stride costs
 what a dozen of them do, and the seek is not kept. What is left of the
 paced burst is the visit, a form's three buffers fetched for a patch that
 reads a few lines of two of them, 5.6 visits a block for lending's one
-under a trail the share bounds.
+under a trail the share bounds. The `lagburst` line carries the writer's
+CPU over the burst beside its wall now, and `lagcounters` its holds, and
+they say the same from the writer's side (`SUPDB_LAG_COUNTERS=1 bench ab
+--arms supdb-ingest,supdb-ingest --size 3000000 --passes load,lag --reps
+6`): over the full rewrite at three million keys the writer's CPU is 3.2-3.5
+s of a burst of 7.4-9.3, its holds 3.1-4.1 s, and over the ten-percent
+burst 0.3 s of 0.7-1.4 with holds of 0.26-1.04 -- the writer's own work is
+lending's burst, and the rest is the thread's throughput waited for at the
+share. The one-percent burst there read bimodal, one rep in six at 110-290
+ms against 24-70, and it was the hold too, 47 ms of a slow burst's 48 ms
+gap: the drain the sweep's first point ends in left the merge of its pieces
+running into the burst, so the pieces' keys were in no partition and the
+share, a hundredth of the partitions' keys, fell short of a burst of a
+hundredth by a batch or two, which held at the last commits for a pass the
+merge had made long. The sweep joins that merge at its first point now
+(`Engine::settle`) and the burst reads one shape, 22-48 ms in twenty-eight
+bursts with holds of 0-9 ms (`CLAUDE.md`, the point that was not the store
+it said).
 
 #### The freeze that leaves its carry to the next look
 

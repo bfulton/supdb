@@ -425,6 +425,25 @@ negation to the engine's default. The rule: a default stated twice is
 two defaults, and an arm that pins nothing inherits the engine's rather
 than restating it.
 
+**A point whose premise the drain no longer kept.** The lag sweep's
+first point ends in `sync`, "so the first point is the fully merged
+store", and was, until the flush handed the merge of the pieces it
+leaves to the segment work and was answered before it: the store at the
+point held level-0 pieces in most reps and none in some, its scans built
+forms over them (`eng` 2,000-10,000 at a point that had built nothing),
+and the merge ran into the next point, where the buffered arm's
+one-percent burst read one rep in six at a third of its rate for it
+(`CLAUDE.md`, the sweep's first point). `Engine::settle` joins what
+`sync` leaves in flight, nothing for the comparators, and the sweep calls
+it at its first point outside every timed window; the pieces the
+background leaves below its trigger still stand, and `lagcounters`
+counts them, as it now carries the writer's holds and `lagburst` the
+writer's CPU over the burst beside its wall. The first row after it
+banks on its controls, as a definition step does. The rule: a pass's
+comment about the store's shape is a claim the counters check, and an
+engine's `sync` is what its contract says and not what a pass assumes
+of it.
+
 **A workflow that never runs can be syntactically invalid for months.**
 Both self-hosted pickup watchdogs arrived with a block of an older draft
 pasted after their `exit 1`. `scripts/workflows.sh` parses every `run:`
