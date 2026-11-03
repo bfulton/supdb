@@ -115,6 +115,15 @@ pub trait Bytes {
     fn resident_at(&self, _off: u64) -> Option<bool> {
         None
     }
+
+    /// The pages holding `len` bytes at `off` unmapped from the process
+    /// (`MADV_DONTNEED` over the whole pages inside the range), so that a
+    /// drop of the file's page cache behind them can take them: a merge
+    /// streams its inputs once and never again, and the pages it has read
+    /// would otherwise stand in the cache as the newest, pushing out what
+    /// the readers beside it are using. The bytes do not change; a later
+    /// touch faults the page back. A no-op where there is no mapping.
+    fn advise_dontneed_range(&self, _off: u64, _len: usize) {}
 }
 
 /// Read `len` bytes at `off`, borrowing when the source allows it.
@@ -280,6 +289,29 @@ impl Bytes for MmapBytes {
     }
     fn advise_normal(&self) {
         let _ = self.0.advise(memmap2::Advice::Normal);
+    }
+    #[cfg(target_os = "linux")]
+    fn advise_dontneed_range(&self, off: u64, len: usize) {
+        let Ok(off) = usize::try_from(off) else {
+            return;
+        };
+        let end = off.saturating_add(len).min(self.0.len());
+        // SAFETY: the page size is a constant of the process; the range is
+        // whole pages of this read-only shared mapping, aligned in, and the
+        // advice drops the page-table entries for them and nothing else.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let Some(page) = usize::try_from(page).ok().filter(|p| p.is_power_of_two()) else {
+            return;
+        };
+        let a = off.next_multiple_of(page);
+        let b = end & !(page - 1);
+        if a >= b {
+            return;
+        }
+        let base = self.0.as_ptr() as usize;
+        unsafe {
+            libc::madvise((base + a) as *mut libc::c_void, b - a, libc::MADV_DONTNEED);
+        }
     }
     #[cfg(target_os = "linux")]
     fn resident_at(&self, off: u64) -> Option<bool> {

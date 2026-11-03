@@ -6531,6 +6531,27 @@ thousand keys, 1.14x for the heads' in one at three hundred thousand,
 1.32x for the records' in the other), a mix whose rate the seal's timing
 makes bimodal at these rungs.
 
+The next reading was wrong, and is kept as an arm for the record
+(`Options::merge_drop_behind`, off; `supdb-mergedropbehind` and
+`supdb-ingestmergedropbehind` drop). It said that the second pass's
+input pages, read once and retired at the landing, stand in the cache as
+the newest for nothing and push out what the scans beside the merge are
+reading, so the merge should drop them behind itself (`MADV_DONTNEED`
+and `POSIX_FADV_DONTNEED` over the records a chunk behind the walk,
+`Blob::drop_records`). Paired at ten million keys under 1.25 GiB, a
+warmup and a pair, the drop read slower in every sweep: the drained lag
+point 1.13-1.26 s against 0.88-1.05, the ten-percent point 3.1 s against
+2.2-2.4 with 3.2 major faults a scan against 2.4, the full rewrite
+9.8-10.7 against 9.3-9.9, and more read from the device at every point
+(644-694 MB against 449-508 over the ten-percent pass), 3.3 GB dropped
+over the sweep. A merge's inputs are the live pieces and the partition
+under rewrite, which is what every scan beside it reads until the
+landing, so the pages the merge had just streamed were the scans' next
+hits and the kernel's recency was keeping the right ones. The rule the
+refutation gives: a page is dropped behind a walk only when nothing else
+reads the object the walk is consuming, and a merge's inputs are read by
+everyone until they are gone.
+
 #### Out of core: the second form
 
 A pairing this section cites is given as the command that reproduces it, `pair.sh A B SIZE [bench ab options]` (`bench/scripts/pair.sh`: `bench ab` over the two arms, one sitting in each order), at the commit it ran at; a binary built at that commit runs it (`BIN=`), and every arm named exists at the head as well. A rerun reproduces the comparison, not the rates, which this host moves by tens of percent between sittings. A count a sentence quotes -- decodes, faults by mix, the controller's events, the census -- was read with the variable before the command set, which turns supdb's own timers on as well, so a rate against a comparator is read from a run without it. Pairings made before this history's root (2026-10-20) cite the root, `18c3a30`, the first commit here that holds their arms. The design the form was built to is `docs/zpages-design.md`.

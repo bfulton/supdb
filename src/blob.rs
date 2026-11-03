@@ -984,6 +984,26 @@ impl<B: Bytes> Blob<B> {
         self.src.advise_willneed(off, b - a)
     }
 
+    /// Where the record at `rank` begins in the file, by the directory:
+    /// `None` past the last rank or for a source with no flat index.
+    pub fn record_offset(&self, rank: usize) -> Option<u64> {
+        let (sec, idx) = self.flat()?;
+        let (recs, dir) = idx.regions(sec)?;
+        let (a, _) = idx.record_span(dir, rank, 0)?;
+        let recs_at = recs.as_ptr() as usize - sec.as_ptr() as usize;
+        Some(self.index_offset() + recs_at as u64 + a as u64)
+    }
+
+    /// The pages of the records in `from..to` (file offsets, as
+    /// `record_offset` gives them) unmapped from the process
+    /// (`Bytes::advise_dontneed_range`), for a walk that has read them once
+    /// and will not again; the caller drops the file's cache behind.
+    pub fn drop_records(&self, from: u64, to: u64) {
+        if to > from {
+            self.src.advise_dontneed_range(from, (to - from) as usize);
+        }
+    }
+
     /// PROTOTYPE: a hint to fetch the directory's lines for the ranks
     /// `rank` to `n` on, ahead of a seek that will read one of them;
     /// nothing is waited for and nothing is read. A scan's start was three

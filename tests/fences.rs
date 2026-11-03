@@ -552,3 +552,73 @@ fn a_merges_first_pass_over_the_heads_writes_what_the_records_write() {
         }
     }
 }
+
+/// A merge drops its inputs' record pages from the page cache behind its
+/// second pass (`Options::merge_drop_behind`), and changes no byte doing
+/// so: two stores fed the same operations, one dropping and one not, merge
+/// to the same files, the superblock's clock aside, and the one that drops
+/// counts what it dropped.
+#[test]
+fn a_merge_drops_its_inputs_pages_behind_its_second_pass() {
+    let mut dirs = Vec::new();
+    for drop in [true, false] {
+        let d = scratch(&format!("merge-drop-{drop}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 32 << 10,
+                partition_bytes: Some(32 << 10),
+                l0_trigger: 2,
+                merge_drop_behind: drop,
+                // A drop every sixteen kilobytes, so a store of kilobytes
+                // reaches one.
+                merge_drop_chunk: 16 << 10,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let key = |k: u32| format!("key-{k:05}").into_bytes();
+        for k in 0..3000u32 {
+            db.append(&key(k), b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        for round in 0..2u32 {
+            for k in (round..3000u32).step_by(7) {
+                db.append(&key(k), b"n");
+            }
+            for k in 0..300u32 {
+                db.append(&key(90000 + k * 10 + round), b"m");
+            }
+            db.commit().unwrap();
+            db.seal().unwrap();
+        }
+        db.settle().unwrap();
+        let (by_heads, by_records) = db.merge_key_sources();
+        assert!(by_heads + by_records > 0, "a merge ran");
+        let dropped = db.merge_dropped_bytes();
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                dropped > 0,
+                drop,
+                "the merge dropped its inputs' pages only with the option: {dropped}"
+            );
+        }
+        db.close().unwrap();
+        dirs.push(d);
+    }
+    let names: Vec<Vec<String>> = dirs.iter().map(|d| seg_names(d)).collect();
+    assert_eq!(names[0], names[1], "the same segments");
+    for n in &names[0] {
+        let a = std::fs::read(dirs[0].join(n)).unwrap();
+        let b = std::fs::read(dirs[1].join(n)).unwrap();
+        assert_eq!(
+            without_the_clock(&a),
+            without_the_clock(&b),
+            "{n} differs between dropping and keeping"
+        );
+    }
+    for d in &dirs {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}

@@ -842,6 +842,27 @@ pub struct Options {
     /// `supdb-mergerecordkeys` and `supdb-ingestmergerecordkeys` read as
     /// before.
     pub merge_keys_by_heads: bool,
+    /// REFUTED: a merge drops its inputs' record pages from the page cache
+    /// as its second pass leaves them behind (`Blob::drop_records` and
+    /// `POSIX_FADV_DONTNEED`, every `merge_drop_chunk` bytes, a page short
+    /// of the record it stands on), on the reading that the inputs are read
+    /// once and retired at the landing, so the pages it has streamed stand
+    /// in the cache as the newest for nothing and push out what the scans
+    /// beside it are reading. The reading was wrong about who reads them:
+    /// a merge's inputs are the live pieces and the partition under
+    /// rewrite, which is what every scan beside it reads until the landing,
+    /// and the kernel's recency was keeping exactly those. Paired at ten
+    /// million keys under 1.25 GiB the drop read slower in every sweep: the
+    /// drained lag point 1.13-1.26 s against 0.88-1.05, the ten-percent
+    /// point 3.1 s against 2.2-2.4, the full rewrite 9.8-10.7 against
+    /// 9.3-9.9, with more read from the device at each. Off; the arm
+    /// `supdb-mergedropbehind` and `supdb-ingestmergedropbehind` drops.
+    pub merge_drop_behind: bool,
+    /// How far a merge's second pass runs past the pages it last dropped
+    /// before it drops again (`merge_drop_behind`): a drop is two
+    /// syscalls, and two megabytes is a few hundred records a page. A
+    /// test lowers it to reach a drop over a store of kilobytes.
+    pub merge_drop_chunk: u64,
     /// I/O priority of the seal and merge threads.
     pub background_io: BackgroundIo,
     /// Have the segment writer fdatasync every this many bytes as it
@@ -3378,6 +3399,8 @@ impl Default for Options {
             partition_on_flush: true,
             cursor_merge: true,
             merge_keys_by_heads: true,
+            merge_drop_behind: false,
+            merge_drop_chunk: 2 << 20,
             background_io: BackgroundIo::Normal,
             seal_sync_every: 0,
             inline_bytes: 256,
@@ -10918,6 +10941,10 @@ struct MergePlan {
     /// counted (`Shared::merge_head_inputs`).
     heads: bool,
     counts: Option<std::sync::Arc<Shared>>,
+    /// The inputs' pages dropped behind the second pass, every this many
+    /// bytes (`Options::merge_drop_behind`, `Options::merge_drop_chunk`).
+    drop_behind: bool,
+    drop_chunk: u64,
 }
 
 fn compact_job(plan: MergePlan) -> Result<Vec<String>> {
@@ -11469,6 +11496,8 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         ord_durable,
         heads,
         counts,
+        drop_behind,
+        drop_chunk,
     } = plan;
     if background_io == BackgroundIo::Idle {
         idle_io_priority();
@@ -11593,11 +11622,47 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
     // key the inputs older than its newest flagged extent are dropped, the
     // flag itself is not carried, and a key with nothing live is left out
     // -- which is how a delete gets its bytes back.
+    // The inputs' files beside their mappings, for the drop of the pages
+    // behind the second pass (`Options::merge_drop_behind`): each input's
+    // records dropped from its last drop to a page short of the record the
+    // walk stands on, once the walk is a chunk past the last drop.
+    let files: Vec<Option<std::fs::File>> = if drop_behind {
+        inputs
+            .iter()
+            .map(|name| std::fs::File::open(dir.join(name)).ok())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut dropped_to: Vec<u64> = blobs
+        .iter()
+        .map(|b| b.record_offset(0).unwrap_or(0))
+        .collect();
+    let mut dropped_bytes = 0u64;
+    let mut drop_at = |i: usize, rank: usize| {
+        if !drop_behind {
+            return;
+        }
+        let Some(off) = blobs[i].record_offset(rank) else {
+            return;
+        };
+        let to = off.saturating_sub(4096) & !4095;
+        if to < dropped_to[i].saturating_add(drop_chunk.max(4096)) {
+            return;
+        }
+        blobs[i].drop_records(dropped_to[i], to);
+        if let Some(f) = files.get(i).and_then(|f| f.as_ref()) {
+            fadvise_dontneed_range(f, dropped_to[i], to - dropped_to[i]);
+        }
+        dropped_bytes += to - dropped_to[i];
+        dropped_to[i] = to;
+    };
     if cursors {
         merge_ranks(&blobs, |k, tied| {
             let mut start = 0usize;
             let mut live = 0u64;
             for (j, &(i, rank)) in tied.iter().enumerate() {
+                drop_at(i, rank);
                 let Some((_, exts)) = blobs[i].exts_at(rank) else {
                     return Err(err("segment key walk: a rank the index does not have"));
                 };
@@ -11649,6 +11714,10 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
                 Ok(())
             })?;
         }
+    }
+    if let Some(c) = &counts {
+        c.merge_dropped_bytes
+            .fetch_add(dropped_bytes, AtomicOrdering::Relaxed);
     }
     let mut out = em.finish(total)?;
     out.extend(empties);
@@ -13301,6 +13370,9 @@ struct Shared {
     /// (`Options::merge_keys_by_heads`; `Db::merge_key_sources`).
     merge_head_inputs: AtomicU64,
     merge_record_inputs: AtomicU64,
+    /// Bytes of input records a merge's second pass dropped from the page
+    /// cache behind itself (`Options::merge_drop_behind`).
+    merge_dropped_bytes: AtomicU64,
     /// Whether the writer's last seal was near reads, a drain's counted
     /// near: the segment work's landings take the pieces' ranks and
     /// bounds only then (`Options::land_ranks_far`).
@@ -13506,6 +13578,23 @@ struct Shared {
 /// the whole file (`POSIX_FADV_DONTNEED`); a dirty page is written back
 /// first and dropped by a later reclaim. Nothing elsewhere.
 #[cfg(target_os = "linux")]
+/// `POSIX_FADV_DONTNEED` over `len` bytes at `off` of `file`: the clean
+/// pages of that range dropped from the page cache, a mapped page skipped,
+/// which is why `Bytes::advise_dontneed_range` goes first.
+#[cfg(target_os = "linux")]
+fn fadvise_dontneed_range(file: &std::fs::File, off: u64, len: u64) {
+    use std::os::unix::io::AsRawFd;
+    let (Ok(off), Ok(len)) = (libc::off_t::try_from(off), libc::off_t::try_from(len)) else {
+        return;
+    };
+    // SAFETY: an advice over a range of an open file; nothing is written.
+    unsafe {
+        libc::posix_fadvise(file.as_raw_fd(), off, len, libc::POSIX_FADV_DONTNEED);
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn fadvise_dontneed_range(_file: &std::fs::File, _off: u64, _len: u64) {}
+
 fn fadvise_dontneed(file: &std::fs::File) {
     use std::os::unix::io::AsRawFd;
     // SAFETY: an advice over a file descriptor this call holds open; it
@@ -17444,6 +17533,15 @@ impl Reader {
                 .merge_record_inputs
                 .load(AtomicOrdering::Relaxed),
         )
+    }
+
+    /// Bytes of input records the merges' second passes dropped from the
+    /// page cache behind themselves over the store's life
+    /// (`Options::merge_drop_behind`).
+    pub fn merge_dropped_bytes(&self) -> u64 {
+        self.shared
+            .merge_dropped_bytes
+            .load(AtomicOrdering::Relaxed)
     }
 
     /// How many segments' ordered companions were advised `MADV_RANDOM`, and
@@ -25072,6 +25170,7 @@ impl Db {
             scans_merged: AtomicU64::new(0),
             merge_head_inputs: AtomicU64::new(0),
             merge_record_inputs: AtomicU64::new(0),
+            merge_dropped_bytes: AtomicU64::new(0),
             reads_near: std::sync::atomic::AtomicBool::new(false),
             mode_scans: AtomicU64::new(0),
             mode_points: AtomicU64::new(0),
@@ -25585,6 +25684,7 @@ impl Db {
             scans_merged: AtomicU64::new(0),
             merge_head_inputs: AtomicU64::new(0),
             merge_record_inputs: AtomicU64::new(0),
+            merge_dropped_bytes: AtomicU64::new(0),
             reads_near: std::sync::atomic::AtomicBool::new(false),
             mode_scans: AtomicU64::new(0),
             mode_points: AtomicU64::new(0),
@@ -38241,6 +38341,8 @@ impl Maint {
         let inline_max = self.opts.inline_bytes;
         let ord_durable = self.opts.ord_durable;
         let heads = self.opts.merge_keys_by_heads;
+        let drop_behind = self.opts.merge_drop_behind;
+        let drop_chunk = self.opts.merge_drop_chunk;
         let job_inputs = inputs.clone();
         let wake = self.wake.clone();
         let held = self.shared.clone();
@@ -38261,6 +38363,8 @@ impl Maint {
                 ord_durable,
                 heads,
                 counts: Some(held.clone()),
+                drop_behind,
+                drop_chunk,
             });
             // A test's hold before the landing (`Db::hold_merge_landing`).
             while held.merge_hold.load(AtomicOrdering::Acquire) & MERGE_HOLD_LANDING != 0 {
