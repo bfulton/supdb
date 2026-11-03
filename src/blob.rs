@@ -943,6 +943,34 @@ impl<B: Bytes> Blob<B> {
         }
     }
 
+    /// PROTOTYPE: the records from `rank` for `n` ranks asked of the kernel
+    /// ahead of a walk over them (`Bytes::advise_willneed`), by the span
+    /// the directory says they lie in: the pages a block's build reads of
+    /// this segment come in together, where read one fault at a time each
+    /// was a device round trip of its own. The span runs to the record
+    /// after the last asked for, or a few lines past the last record where
+    /// the ranks end at it. The bytes submitted; zero where the source has
+    /// no mapping behind it or the ranks resolve to nothing.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn willneed_ranks(&self, rank: usize, n: usize) -> usize {
+        let Some((sec, idx)) = self.flat() else {
+            return 0;
+        };
+        let Some((recs, dir)) = idx.regions(sec) else {
+            return 0;
+        };
+        let Some((a, b)) = idx.record_span(dir, rank, n) else {
+            return 0;
+        };
+        let b = b.saturating_add(256).min(recs.len());
+        if a >= b {
+            return 0;
+        }
+        let recs_at = recs.as_ptr() as usize - sec.as_ptr() as usize;
+        let off = self.index_offset() + recs_at as u64 + a as u64;
+        self.src.advise_willneed(off, b - a)
+    }
+
     /// PROTOTYPE: a hint to fetch the directory's lines for the ranks
     /// `rank` to `n` on, ahead of a seek that will read one of them;
     /// nothing is waited for and nothing is read. A scan's start was three

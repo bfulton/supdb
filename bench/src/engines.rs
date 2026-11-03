@@ -494,6 +494,12 @@ pub struct Supdb {
     /// (`Options::piece_ranks_whole`). `supdb-ingestrankswhole`, and
     /// `supdb-rankswhole` durable.
     rankswhole: bool,
+    /// A block's build reads each piece's records over it as it meets
+    /// them, one fault at a time, where the default asks the kernel for
+    /// every piece's run before any is read once the store is out of core
+    /// (`Options::pieces_willneed` off). `supdb-ingestnowillneed`, and
+    /// `supdb-nowillneed` durable.
+    nowillneed: bool,
     /// A seal writes every key through the writer's general path, as
     /// before the one-value path (`Options::seal_put_one` off).
     /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
@@ -1183,6 +1189,12 @@ struct Policy {
     /// (`Options::piece_ranks_whole`). `supdb-ingestrankswhole`, and
     /// `supdb-rankswhole` durable.
     rankswhole: bool,
+    /// A block's build reads each piece's records over it as it meets
+    /// them, one fault at a time, where the default asks the kernel for
+    /// every piece's run before any is read once the store is out of core
+    /// (`Options::pieces_willneed` off). `supdb-ingestnowillneed`, and
+    /// `supdb-nowillneed` durable.
+    nowillneed: bool,
     /// A seal writes every key through the writer's general path, as
     /// before the one-value path (`Options::seal_put_one` off).
     /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
@@ -1702,6 +1714,7 @@ impl Default for Policy {
             sealcopyfar: false,
             ranksfar: false,
             rankswhole: false,
+            nowillneed: false,
             sealrun: false,
             closeinline: false,
             timers: false,
@@ -3220,6 +3233,35 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 rankswhole: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose block builds read each piece's records as they meet
+    /// them, one fault at a time, where the default asks the kernel for
+    /// every piece's run over the block first once the store is out of
+    /// core (`Options::pieces_willneed`): against `supdb` under a bound it
+    /// prices the asking.
+    pub fn create_nowillneed(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                nowillneed: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` reading its pieces as it meets them, as
+    /// `supdb-nowillneed`.
+    pub fn create_ingest_nowillneed(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                nowillneed: true,
                 ..Policy::default()
             },
         )
@@ -5711,6 +5753,7 @@ impl Supdb {
             sealcopyfar,
             ranksfar,
             rankswhole,
+            nowillneed,
             sealrun,
             closeinline,
             timers,
@@ -5985,6 +6028,7 @@ impl Supdb {
             seal_snapshot_far: sealcopyfar,
             land_ranks_far: ranksfar,
             piece_ranks_whole: rankswhole,
+            pieces_willneed: !nowillneed,
             seal_put_one: !sealrun,
             close_finish_inline: closeinline,
             upkeep_wake_parked: wake,
@@ -6237,6 +6281,7 @@ impl Supdb {
             sealcopyfar,
             ranksfar,
             rankswhole,
+            nowillneed,
             sealrun,
             closeinline,
             timers,
@@ -6898,6 +6943,13 @@ impl Engine for Supdb {
                 "supdb-ingestrankswhole"
             };
         }
+        if self.nowillneed {
+            return if self.partition {
+                "supdb-nowillneed"
+            } else {
+                "supdb-ingestnowillneed"
+            };
+        }
         if self.sealrun {
             return if self.partition {
                 "supdb-sealrun"
@@ -7425,6 +7477,7 @@ impl Engine for Supdb {
             ("zpage_fallbacks", z.fallbacks as f64),
             ("cut_asks", z.cuts as f64),
             ("cut_record_reads", z.cut_records as f64),
+            ("piece_willneeds", z.piece_willneeds as f64),
             ("zpage_nopage_reads", z.nopage_reads as f64),
             ("zpage_scans", z.scans as f64),
             ("zpage_scan_groups", z.scan_groups as f64),
@@ -8266,6 +8319,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-sealcopyfar"
         | "supdb-ranksfar"
         | "supdb-rankswhole"
+        | "supdb-nowillneed"
         | "supdb-sealrun"
         | "supdb-closeinline"
         | "supdb-timers"
@@ -8362,6 +8416,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestsealcopyfar"
         | "supdb-ingestranksfar"
         | "supdb-ingestrankswhole"
+        | "supdb-ingestnowillneed"
         | "supdb-ingestsealrun"
         | "supdb-ingestcloseinline"
         | "supdb-ingesttimers"
@@ -8695,6 +8750,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestranksfar" => Box::new(Supdb::create_ingest_ranksfar(dir)?),
         "supdb-rankswhole" => Box::new(Supdb::create_rankswhole(dir)?),
         "supdb-ingestrankswhole" => Box::new(Supdb::create_ingest_rankswhole(dir)?),
+        "supdb-nowillneed" => Box::new(Supdb::create_nowillneed(dir)?),
+        "supdb-ingestnowillneed" => Box::new(Supdb::create_ingest_nowillneed(dir)?),
         "supdb-sealrun" => Box::new(Supdb::create_sealrun(dir)?),
         "supdb-ingestsealrun" => Box::new(Supdb::create_ingest_sealrun(dir)?),
         "supdb-closeinline" => Box::new(Supdb::create_closeinline(dir)?),

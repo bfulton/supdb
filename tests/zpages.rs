@@ -2997,6 +2997,92 @@ fn the_heads_arm_seeks_through_the_raw_form_and_scans_the_same() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Out of core a block's build asks the kernel for every piece's records
+/// over the block before it reads any (`Options::pieces_willneed`). With
+/// no form published (`commit_forms` off) a handle builds every block its
+/// scans touch from the partition and the piece standing over it: under
+/// the forced form the gate is away from raw and the builds over the
+/// piece ask; with the gate set to raw by hand, as a store in core has
+/// it, or with the option off, they ask nothing. The scans answer the
+/// same either way.
+#[test]
+fn a_build_asks_for_its_pieces_pages_together_only_out_of_core() {
+    for on in [true, false] {
+        let dir = scratch(&format!("willneed-{on}"));
+        let mut db = Db::create(
+            &dir,
+            forced(|o| {
+                o.partition_bytes = Some(160 << 10);
+                // One seal's pieces stand until the test is done with them.
+                o.seal_bytes = 1 << 30;
+                o.l0_trigger = 1 << 20;
+                // The block path, which `forced` leaves off: the builds
+                // over the piece are its.
+                o.scan_block_cache = true;
+                o.commit_forms = false;
+                o.pieces_willneed = on;
+            }),
+        )
+        .unwrap();
+        let mut model = ordered_load(&mut db, 4000, 0x11EED);
+        db.zpages_settle().unwrap();
+        // A scan first, so the seal after it lands near reads; then a piece
+        // of updates over every partition.
+        let _ = scanned(&db, b"", 5);
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let mut rng = Rng(0x11EED1);
+        for k in keys.iter().step_by(7) {
+            let v = suite_value(&mut rng);
+            db.append(k, &v);
+            model.entry(k.clone()).or_default().push(v);
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        db.settle().unwrap();
+        assert!(db.levels().1 > 0, "a piece stands");
+        let c = db.zpage_counts();
+        assert_eq!(c.gate, 2, "the forced form's gate: {c:?}");
+        let check = |r: &supdb::Reader, what: &str| {
+            for start in [b"".to_vec(), spaced_key(1000), spaced_key(2500)] {
+                for limit in [1usize, 57, 300] {
+                    same_window(
+                        &scanned(r, &start, limit),
+                        &window(&model, &start, limit),
+                        &format!(
+                            "{what}, from {:?} for {limit}",
+                            String::from_utf8_lossy(&start)
+                        ),
+                    );
+                }
+            }
+        };
+        // A handle builds its own blocks, from the partition and the piece,
+        // with the gate at the form.
+        let r = db.reader().unwrap();
+        check(&r, "a handle, the gate at the form");
+        drop(r);
+        let asked = db.zpage_counts().piece_willneeds;
+        assert_eq!(
+            asked > 0,
+            on,
+            "the builds asked for the piece's pages only with the option: {asked}"
+        );
+        // The gate at the raw form, as a store in core has it: another
+        // handle builds the same blocks afresh, and asks nothing.
+        db.zgate_set(0);
+        let r = db.reader().unwrap();
+        check(&r, "a handle, the gate at raw");
+        drop(r);
+        assert_eq!(
+            db.zpage_counts().piece_willneeds,
+            asked,
+            "with the gate at raw the builds ask nothing"
+        );
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// The prefetch arm (`Options::zpages_scan_prefetch`): the scans agree
 /// with the model as without it, every walk that wants more than its
 /// first page asks once, and a walk of one key asks for nothing.

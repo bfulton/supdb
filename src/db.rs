@@ -406,6 +406,9 @@ pub struct ZCounts {
     /// (`BuildCtx::cut_at`).
     pub cuts: u64,
     pub cut_records: u64,
+    /// Pieces' runs a block's build asked the kernel for ahead of reading
+    /// them, out of core (`Options::pieces_willneed`).
+    pub piece_willneeds: u64,
     /// Point reads and counts of a partition answered from its form file.
     pub reads: u64,
     pub counts: u64,
@@ -2879,6 +2882,21 @@ pub struct Options {
     /// rank the walk was about to reach anyway. On, `supdb-rankswhole`
     /// and `supdb-ingestrankswhole`.
     pub piece_ranks_whole: bool,
+    /// Out of core, a block's build asks the kernel for every piece's
+    /// records over the block before it reads any of them
+    /// (`Blob::willneed_ranks`), where it read them as it met them, one
+    /// fault at a time. After a burst a block's updates sit in as many
+    /// pieces as the burst's seals that touched its range, a page in
+    /// each, and under 1.25 GiB at ten million keys the ten-percent lag
+    /// pass read nine major faults a scan at some 260 us a scan, each
+    /// fault a device round trip taken alone, while LMDB's scan over the
+    /// same keys took one. Asked only while the controller's gate is away
+    /// from the raw form -- the census running or the compact form served
+    /// (`Options::zpages`) -- which is the store's own measure of being
+    /// out of core; in core the gate is raw and nothing is asked, since
+    /// an `madvise` a piece a block would cost a build more than it
+    /// builds. Off, `supdb-nowillneed` and `supdb-ingestnowillneed`.
+    pub pieces_willneed: bool,
     /// A seal writes a key whose chain holds one value and no tombstone
     /// -- every key of a load, and most of any table -- through the
     /// writer's one-value path (`SegmentWriter::put_one`), the record
@@ -3476,6 +3494,7 @@ impl Default for Options {
             seal_snapshot_far: false,
             land_ranks_far: false,
             piece_ranks_whole: false,
+            pieces_willneed: true,
             seal_put_one: true,
             close_presync: true,
             ord_durable: false,
@@ -8867,6 +8886,9 @@ struct Slot {
     /// keys are one length.
     zcuts: AtomicU64,
     zcutrecs: AtomicU64,
+    /// Pieces' runs a block's build asked the kernel for ahead of reading
+    /// them (`Options::pieces_willneed`).
+    zwillneeds: AtomicU64,
     /// Partition walks of a scan served by a form file, the groups decoded
     /// for them, and the runs of records no page holds the raw form walked
     /// inside them.
@@ -8942,6 +8964,7 @@ impl Slot {
             zscans: AtomicU64::new(0),
             zcuts: AtomicU64::new(0),
             zcutrecs: AtomicU64::new(0),
+            zwillneeds: AtomicU64::new(0),
             zscanz: AtomicU64::new(0),
             zscangroups: AtomicU64::new(0),
             znopagescans: AtomicU64::new(0),
@@ -17360,6 +17383,7 @@ impl Reader {
             fallbacks: rd.stat(|s| &s.zfallbacks),
             cuts: rd.stat(|s| &s.zcuts),
             cut_records: rd.stat(|s| &s.zcutrecs),
+            piece_willneeds: rd.stat(|s| &s.zwillneeds),
             nopage_reads: rd.stat(|s| &s.znopage),
             scans: rd.stat(|s| &s.zscanz),
             scan_groups: rd.stat(|s| &s.zscangroups),
@@ -17604,6 +17628,13 @@ impl Reader {
     #[inline]
     fn z_on(&self) -> bool {
         self.shared.zgate.load() == zselect::GATE_Z
+    }
+
+    /// Whether a block's build asks for its pieces' pages ahead
+    /// (`Options::pieces_willneed`): the option, and the gate away from the
+    /// raw form, which is the store's own measure of being out of core.
+    fn pieces_willneed(&self) -> bool {
+        self.opts.pieces_willneed && self.shared.zgate.load() != zselect::GATE_RAW
     }
 
     #[inline(never)]
@@ -22437,6 +22468,10 @@ impl Reader {
         let keys = seg.blob.keys();
         let lo = b * CACHE_BLOCK;
         let hi = ((b + 1) * CACHE_BLOCK).min(keys);
+        if self.pieces_willneed() && ranks.start < ranks.end {
+            p.raw().willneed_ranks(ranks.start, ranks.end - ranks.start);
+            self.zbump(|s| &s.zwillneeds);
+        }
         if table.slots[b].is_none() {
             table.slots[b] = Some(std::sync::Arc::new(Cached::Clean));
         }
@@ -31889,6 +31924,21 @@ impl<'s> BuildCtx<'s> {
         // piece's run starts and ends in `held`.
         let mut pre: Vec<(u64, u64)> = Vec::new();
         let mut runs: Vec<(usize, usize)> = Vec::with_capacity(pieces.len());
+        // Out of core, every piece's records over the block asked for
+        // before any is read: a block's updates sit in as many pieces as
+        // touched its range, a page in each, and read one fault at a time
+        // each page was a device round trip of its own
+        // (`Options::pieces_willneed`).
+        if self.rd.pieces_willneed() {
+            for (j, run, _) in pieces {
+                if run.start < run.end {
+                    src.l0[*j]
+                        .raw()
+                        .willneed_ranks(run.start, run.end - run.start);
+                    self.rd.zbump(|s| &s.zwillneeds);
+                }
+            }
+        }
         for (j, run, ranks) in pieces {
             let p = &src.l0[*j];
             let start = held.len();

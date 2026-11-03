@@ -6428,9 +6428,46 @@ scan of a hundred keys over a store rewritten in random order finds its
 keys in as many pieces, some 35 major faults a scan at the device's
 latency, while the merge that folds the pieces away streams its inputs
 twice -- once for its slices and once for their values -- through a
-cache that cannot hold them, 3.9-4.4 GB read over a pass of 19 s; the
-cell reads 0.2x of LMDB's where it read 0.07x, and the merge's reads are
-the next lever.
+cache that cannot hold them, 3.9-4.4 GB read over a pass of 19 s. Paired
+against LMDB with its readahead off the same way (`bench ab --arms
+supdb,lmdb-nordahead ...`, a warmup and a pair), whose lag passes run at
+100-120 us a scan at every point here with 1.7-1.9 faults a scan, the
+sweep read 0.56x at the drained point, 0.78x at one percent, 0.37x at
+ten and 0.07x at the full rewrite, where the row had read 0.03x; the
+scanning thread took 3.4, 0.5, 4.9 and 23 major faults a scan.
+
+The faults a scan still takes at the full rewrite are the pieces': a
+block's updates sit in as many pieces as the burst's seals that touched
+its range, a page in each, and the build read them as it met them, one
+fault at a time, each a device round trip taken alone -- while the
+table's bounds had said where every piece's run over the block lies
+before a record of it was read. A block's build asks the kernel for every
+piece's run first now (`Blob::willneed_ranks`, `MADV_WILLNEED` over the
+span the directory gives; `Options::pieces_willneed`; `supdb-nowillneed`
+and `supdb-ingestnowillneed` read as before), where the controller's gate
+is away from the raw form, the store's own measure of being out of core;
+in core the gate is raw and nothing is asked, since an `madvise` a piece
+a block would cost a build more than it builds, and the count
+(`piece_willneeds`) reads zero through the in-core sweep. Paired at ten
+million keys under 1.25 GiB, a warmup and a pair (`bench ab --arms
+supdb,supdb-nowillneed --size 10000000 --bound 1342177280 --passes
+load,lag --ops-div 10 --reps 1`): the full-rewrite pass 12.2 and 12.7 s
+against 15.7 and 19.0, its median scan 0.85-0.97 ms against 1.32-1.63,
+the scanning thread's major faults 11 a scan against 26 with the
+device's reads over the pass the same 3.6-4.2 GB, the cell 1.5x; the
+ten-percent point within the spread both ways (2.7-4.0 s against
+3.1-3.7), since a ten-percent burst's pieces are 130 MB and sit in the
+cache beside the merge that streams them, so there is nothing to ask
+ahead for, and its five faults a scan are the ones the drained point
+takes too, three and a half of them the partition's own record pages;
+the one-percent point and the drained scans level. A page asked for
+ahead and reached before it has arrived is a fault the kernel counts as
+minor, since the folio is there, so the thread's major faults fall by
+more than its waits do and the pass is read by its time. What is left:
+the partition's own pages a raw scan touches, three to four a scan where
+LMDB's leaves are two, which is the compact form's to shorten and a
+reason the row's sweep runs after the read passes that install it; and
+the merge's two passes over its inputs.
 
 #### Out of core: the second form
 

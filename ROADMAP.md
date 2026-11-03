@@ -76,8 +76,12 @@ The suite has to be fair before any of its numbers are quoted.
   them again, which nobody does now (`Options::piece_ranks_whole`, off;
   `docs/engine.md`, under "against LMDB with its readahead off"), and
   the rest is the merge streaming the rewritten store twice through a
-  cache that cannot hold it, beside scans that find a hundred keys in a
-  hundred pieces; the engine's trimmer running while the
+  cache that cannot hold it, beside scans that found their keys' pages
+  in the burst's pieces one fault at a time, which a build asks for
+  together now (`Options::pieces_willneed`, the pass 1.5x for it); the
+  partition's own pages a raw scan takes where LMDB takes two leaves are
+  the compact form's, and the merge's two passes over its inputs are the
+  next lever; the engine's trimmer running while the
   store is under a cgroup bound, where free memory is page cache the
   store does not have (`Options::forms_to_fit`'s trim, priced in core
   before it is the default under a bound); and 1 GiB.
