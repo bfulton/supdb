@@ -284,6 +284,17 @@ every loading arm that allocates, and the first full row after it
 failed its gate on the load alone, the engine unchanged. The rule:
 what one pass leaves in the process is a variable of every pass after
 it, and a run is only as interleaved as its passes are independent.
+What the trim cannot return came next, under a bound: twenty to thirty
+megabytes of the allocator's fragments a store, so the fifth arm of a
+rep opened 0.3 GB above the first at ten million keys and the kernel
+killed it at its own full rewrite under 1.25 GiB, where the same arm
+runs four reps alone under the same bound. A bounded run gives each
+arm's rep a process of its own now (`Plan::fresh_process`, `run`
+spawning its own binary for the pass inside the group), and in core the
+arms share the process as they always have, since the rows' history is
+theirs. The rule's corollary: a residue a trim cannot return is a
+process's, and only a process boundary gives the next pass a floor the
+passes before did not raise.
 
 **A read that never read the value priced the lookup alone.** Every
 arm's point read and scan summed the lengths of the values it was lent

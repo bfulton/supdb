@@ -8,6 +8,7 @@ use supdb_bench::{engines, env, figures, gate, row, run, Scale};
 const USAGE: &str = "\
 usage:
   bench run --scale quick|full [--out DIR] [--arms a,b,...] [--top KEYS] [--bottom KEYS] [--reps N]
+            [--fresh-process|--one-process]
   bench run --scale ooc --bound BYTES [--ops-div N] [the options above]
   bench ab --arms A,B [--size KEYS] [--reps N] [--len ENTRIES] [--pairs TEXT] [--bound BYTES] [--passes a,b,...]
            [--ops-div N] [--compress FRACTION]
@@ -18,6 +19,8 @@ usage:
 run    measures every arm over the size ladder and writes runs/<scale>/<utc>-<sha7>.json
        --out   directory holding runs/ (default: runs)
        --arms  comma-separated subset of the arms (default: all; at ooc the bounded roster)
+       --fresh-process  each arm's rep in a process of its own, --one-process all in this one
+               (default: fresh at ooc, one in core; see Plan::fresh_process)
        --top   the ladder's top rung in keys (default: quick 300000; full sized to 1.5x memory;
                ooc 10000000)
        --bottom the ladder's bottom rung in keys (default: the whole ladder from 10000; ooc 3000000)
@@ -113,12 +116,29 @@ impl Args {
     fn num(&self, n: &str) -> Option<u64> {
         self.get(n).and_then(|v| v.replace('_', "").parse().ok())
     }
+    fn has(&self, n: &str) -> bool {
+        self.0.iter().any(|a| a == n)
+    }
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(|s| s.as_str()) {
         Some("run") => cmd_run(Args(args[1..].to_vec())),
+        // A pass's own process (`run::one_pass_child`), spawned by `run`.
+        Some("one-pass") => match args.get(1) {
+            Some(spec) => match run::one_pass_child(std::path::Path::new(spec)) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("one-pass failed: {e}");
+                    2
+                }
+            },
+            None => {
+                eprintln!("one-pass SPEC: the spec file `run` wrote is required");
+                2
+            }
+        },
         Some("ab") => cmd_ab(Args(args[1..].to_vec())),
         Some("gate") => cmd_gate(Args(args[1..].to_vec())),
         Some("figures") => cmd_figures(Args(args[1..].to_vec())),
@@ -511,6 +531,11 @@ fn cmd_run(a: Args) -> i32 {
     if let Some(r) = reps {
         plan.reps = r as usize;
     }
+    if a.has("--fresh-process") {
+        plan.fresh_process = true;
+    } else if a.has("--one-process") {
+        plan.fresh_process = false;
+    }
 
     // The rungs, not just the top: with a bottom set, the top alone does not
     // say what was measured, and this line is the only record of the plan a
@@ -544,6 +569,14 @@ fn cmd_run(a: Args) -> i32 {
                 1
             }
         },
+        // A pass's process killed under the bound ends the run with the
+        // kill's own status, as the pass in this process would have, so
+        // `scripts/ooc.sh` reads it the same; the bound drops first and
+        // leaves no group behind.
+        Err(e) if e.starts_with(run::PASS_KILLED) => {
+            eprintln!("run failed: {e}");
+            137
+        }
         Err(e) => {
             eprintln!("run failed: {e}");
             1

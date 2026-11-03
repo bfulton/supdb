@@ -57,10 +57,11 @@ The suite has to be fair before any of its numbers are quoted.
   fragments past each store's trim, 0.3 GB by the fifth arm of a rep,
   under the controller arm's own 0.9 GB at the full rewrite, a third of
   it forms shed into free lists that nothing returns while the store
-  runs. Two remedies, either of which banks the row: the runner gives
-  each arm's rep a process of its own (`one_pass` re-executed as a
-  child, its samples handed back), or the engine runs its trimmer while
-  the store is under a cgroup bound, where free memory is page cache the
+  runs. The runner gives each arm's rep a process of its own now
+  (`Plan::fresh_process`, the bounded scale's default), so the residue
+  is gone from under the bound; the row under 1.25 GiB is the one to
+  bank. The engine's own lever is left: its trimmer running while the
+  store is under a cgroup bound, where free memory is page cache the
   store does not have (`Options::forms_to_fit`'s trim, priced in core
   before it is the default under a bound). Then 1 GiB.
 - [ ] **Match the checksum work, or state it.** RocksDB reads with

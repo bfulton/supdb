@@ -15,6 +15,7 @@ use crate::hist::Hist;
 use crate::row::{Guarantee, MachineInfo, Measurement, Row};
 use crate::workload::{db_key_into, KeyDist, KeyGen, Payload, Permutation, Rng};
 use crate::{ladder_from, Scale};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::os::unix::fs::FileExt as _;
@@ -124,7 +125,7 @@ fn count_unit(base: &str) -> &'static str {
 /// where the whole pass is an hour. The loads are one name, since the
 /// second store exists for the shuffled load and the lag sweep, and is
 /// built only when one of them runs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Passes {
     pub load: bool,
     pub read: bool,
@@ -222,6 +223,7 @@ pub const MIN_BOUND_BYTES: u64 = 256 << 20;
 /// row's time in the hour.
 pub const OOC_OPS_DIV: u64 = 10;
 
+#[derive(Serialize, Deserialize)]
 pub struct Plan {
     pub scale: Scale,
     pub arms: Vec<String>,
@@ -258,6 +260,17 @@ pub struct Plan {
     /// each phase's quantity whether it ran or not, and a subset only
     /// through `ab`, which pairs what ran.
     pub passes: Passes,
+    /// Whether each arm's rep runs in a process of its own
+    /// (`pass_in_child`): the bounded scale's default, since the arms
+    /// share one process otherwise and what each store leaves in the
+    /// allocator past its trim, twenty to thirty megabytes a store, is
+    /// under the bound for every arm after it -- the fifth arm of a rep
+    /// opened 0.3 GB above the first at ten million keys and the kernel
+    /// killed it at its own full rewrite, where the same arm runs alone
+    /// under the same bound. In core the arms share the process as they
+    /// always have, so the quick and full rows' conditions are unchanged.
+    /// `--fresh-process` and `--one-process` set it either way.
+    pub fresh_process: bool,
 }
 
 impl Plan {
@@ -280,6 +293,7 @@ impl Plan {
             compress: 0.5,
             bound: None,
             passes: Passes::all(),
+            fresh_process: scale == Scale::Ooc,
         }
     }
 
@@ -901,7 +915,11 @@ pub fn run(
             for arm in &plan.arms {
                 let g = engines::guarantee(arm).expect("checked at start");
                 let dir = root.join(format!("{arm}-{size}-{rep}"));
-                let one = one_pass(arm, &dir, size, map_gb, plan, &payload)?;
+                let one = if plan.fresh_process {
+                    pass_in_child(arm, &dir, size, map_gb, plan)?
+                } else {
+                    one_pass(arm, &dir, size, map_gb, plan, &payload)?
+                };
                 let _ = std::fs::remove_dir_all(&dir);
                 if rep > 0 {
                     let sz = Some(size);
@@ -989,6 +1007,8 @@ pub fn run(
                 // What the process holds as the next pass opens: a figure
                 // that climbs from pass to pass is memory the passes before
                 // left behind, and it comes out of the next store's cache.
+                // With each pass in a process of its own (`fresh_process`)
+                // this is the parent's, and flat.
                 let rss = resident_bytes()
                     .map(|b| format!("{:.2} GB", b as f64 / 1e9))
                     .unwrap_or_else(|| "-".into());
@@ -1090,6 +1110,7 @@ fn row_of(utc: &str, machine: &MachineInfo, plan: &Plan, s: &Samples) -> Row {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 struct OnePass {
     /// The dearer of the pass's two primes, microseconds a page: the
     /// host's price for a load-sized footprint this pass, logged and
@@ -1124,8 +1145,9 @@ struct OnePass {
     /// throughput).
     scan_mixed_threaded: Vec<(usize, f64)>,
     /// What the engine says it did, rather than how fast; see
-    /// `Engine::counters`.
-    counters: Vec<(&'static str, f64)>,
+    /// `Engine::counters`. Owned names, since a pass crosses a process
+    /// boundary as JSON (`pass_in_child`).
+    counters: Vec<(String, f64)>,
     /// A bounded pass's counts around each timed phase (`PhaseCounts`):
     /// the phase's workload, the suffix its quantities carry (`_3t`,
     /// `_lag10pct`, or none), and the counts. Empty unbounded.
@@ -1206,7 +1228,7 @@ impl OnePass {
 /// The counts a bounded row records around one timed phase, per
 /// operation of the phase (`COUNTS`), from readings taken before its
 /// first operation and after its last and never between.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct PhaseCounts {
     /// The operating threads' own device bytes read, from each thread's
     /// `/proc/thread-self/io`.
@@ -1583,6 +1605,115 @@ fn shuffled_load(
     counting.end(c0, "load-shuffled", "", None, size);
     zpages_refusal(arm, size, ZStage::Shuffled, e.zpages_state())?;
     Ok(secs)
+}
+
+/// The prefix of the error `pass_in_child` answers when the pass's process
+/// was killed by SIGKILL, which under a bound is the group's limit: the
+/// command exits with the kill's own status (137), as the pass would have,
+/// so a bounded run's gate reads it the same.
+pub const PASS_KILLED: &str = "pass killed";
+
+/// What a pass's own process is handed (`pass_in_child` writes it,
+/// `one_pass_child` reads it): the arm, its store's directory, the rung,
+/// LMDB's map size, the plan whole, and where the result goes.
+#[derive(Serialize)]
+struct PassSpecRef<'a> {
+    arm: &'a str,
+    dir: &'a Path,
+    size: u64,
+    map_gb: usize,
+    plan: &'a Plan,
+    out: &'a Path,
+}
+
+#[derive(Deserialize)]
+struct PassSpec {
+    arm: String,
+    dir: PathBuf,
+    size: u64,
+    map_gb: usize,
+    plan: Plan,
+    out: PathBuf,
+}
+
+/// `one_pass` in a process of its own (`Plan::fresh_process`): this
+/// binary again, `bench one-pass SPEC`, spawned inside whatever group this
+/// process is in -- a child is born into its parent's cgroup -- with the
+/// pass's spec in a file beside the store and its result written to
+/// another, since the pass prints its own lines to both streams and the
+/// result must not share one. A child killed by SIGKILL is the bound's
+/// kill, and the error says so (`PASS_KILLED`).
+fn pass_in_child(
+    arm: &str,
+    dir: &Path,
+    size: u64,
+    map_gb: usize,
+    plan: &Plan,
+) -> Result<OnePass, String> {
+    let spec_path = PathBuf::from(format!("{}.spec.json", dir.display()));
+    let out = PathBuf::from(format!("{}.pass.json", dir.display()));
+    let spec = PassSpecRef {
+        arm,
+        dir,
+        size,
+        map_gb,
+        plan,
+        out: &out,
+    };
+    let text = serde_json::to_vec(&spec).map_err(|e| format!("the pass's spec: {e}"))?;
+    std::fs::write(&spec_path, text).map_err(|e| format!("writing the pass's spec: {e}"))?;
+    let exe = std::env::current_exe().map_err(|e| format!("this binary's own path: {e}"))?;
+    let status = std::process::Command::new(&exe)
+        .arg("one-pass")
+        .arg(&spec_path)
+        .stdin(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("spawning the pass's process: {e}"))?;
+    let _ = std::fs::remove_file(&spec_path);
+    if !status.success() {
+        let _ = std::fs::remove_file(&out);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            if status.signal() == Some(9) {
+                return Err(format!(
+                    "{PASS_KILLED}: the pass of {arm} at {size} keys, in a process of its own, \
+                     was killed by SIGKILL -- under a bound, the group's limit"
+                ));
+            }
+        }
+        return Err(format!(
+            "the pass of {arm} at {size} keys failed in a process of its own ({status})"
+        ));
+    }
+    let text = std::fs::read_to_string(&out)
+        .map_err(|e| format!("the pass's result for {arm} at {size} keys: {e}"))?;
+    let _ = std::fs::remove_file(&out);
+    serde_json::from_str(&text).map_err(|e| format!("the pass's result for {arm}: {e}"))
+}
+
+/// The pass's own process: `bench one-pass SPEC` reads the spec its parent
+/// wrote, runs the pass as the parent would have, and writes the result
+/// where the spec says. The bound in the spec is attached, not owned
+/// (`Bound`), so this process neither leaves the group nor removes it.
+pub fn one_pass_child(spec_path: &Path) -> Result<(), String> {
+    let text = std::fs::read_to_string(spec_path)
+        .map_err(|e| format!("the pass's spec {}: {e}", spec_path.display()))?;
+    let spec: PassSpec =
+        serde_json::from_str(&text).map_err(|e| format!("the pass's spec: {e}"))?;
+    debug_assert!(spec.plan.bound.as_ref().is_none_or(|b| !b.is_owned()));
+    let payload = Payload::new(spec.plan.value_size, spec.plan.compress, 0xE1);
+    let one = one_pass(
+        &spec.arm,
+        &spec.dir,
+        spec.size,
+        spec.map_gb,
+        &spec.plan,
+        &payload,
+    )?;
+    let text = serde_json::to_vec(&one).map_err(|e| format!("the pass's result: {e}"))?;
+    std::fs::write(&spec.out, text)
+        .map_err(|e| format!("writing the pass's result {}: {e}", spec.out.display()))
 }
 
 fn one_pass(
@@ -1967,7 +2098,10 @@ fn one_pass(
         scan_entries_s_threaded,
         ycsb_ops_s,
         scan_mixed_threaded,
-        counters,
+        counters: counters
+            .into_iter()
+            .map(|(n, v)| (n.to_string(), v))
+            .collect(),
         phase_counts: counting.out,
     })
 }

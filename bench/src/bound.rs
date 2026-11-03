@@ -17,6 +17,7 @@
 //! are pure functions over the files' text so that a host without a
 //! controller can still test them.
 
+use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -113,6 +114,7 @@ pub fn parse_stat(text: &str) -> BoundStat {
 
 /// The group this process runs in while it measures. Dropping it moves
 /// the process back to the group it came from and removes the group.
+#[derive(Serialize, Deserialize)]
 pub struct Bound {
     /// The group's directory under the controller's mount.
     group: PathBuf,
@@ -121,6 +123,14 @@ pub struct Bound {
     /// The limit as the kernel reports it after the write: v1 rounds the
     /// number written down to a page, and the row records what holds.
     limit: u64,
+    /// Whether this process entered the group and leaves and removes it at
+    /// the drop. A bound deserialized -- in the process a bounded run
+    /// gives each arm's rep (`run::one_pass_child`), which its parent
+    /// spawned inside the group -- is attached and not owned: it reads the
+    /// group's counts and neither leaves the group nor removes it, since
+    /// the parent is still in it.
+    #[serde(skip)]
+    owned: bool,
 }
 
 fn err_at(path: &Path, what: &str, e: io::Error) -> io::Error {
@@ -254,6 +264,7 @@ impl Bound {
             group,
             parent,
             limit: got,
+            owned: true,
         })
     }
 
@@ -281,8 +292,19 @@ impl Bound {
     }
 }
 
+impl Bound {
+    /// Whether this process entered the group, as against a bound a pass's
+    /// own process was handed (`owned`).
+    pub fn is_owned(&self) -> bool {
+        self.owned
+    }
+}
+
 impl Drop for Bound {
     fn drop(&mut self) {
+        if !self.owned {
+            return;
+        }
         // Back to the parent first: a group with a task in it refuses to
         // go. Neither failure can be handled here, and neither is silent.
         let procs = self.parent.join("cgroup.procs");
@@ -435,5 +457,32 @@ cgroup2 /sys/fs/cgroup/unified cgroup2 rw,relatime 0 0\n";
         assert!(text.contains("supdb-bench-2"), "{text}");
         assert!(text.contains("stale"), "{text}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod attached {
+    use super::Bound;
+
+    /// A bound read back from a pass's spec is attached, not owned: the
+    /// process a bounded run gives a pass was spawned inside the group and
+    /// must neither leave it nor remove it at its drop, which is what
+    /// `owned` gates. The group named here does not exist, and the drop
+    /// must not try to leave or remove it.
+    #[test]
+    fn a_deserialized_bound_is_attached_and_its_drop_touches_nothing() {
+        let b: Bound = serde_json::from_str(
+            r#"{"group":"/no/such/group","parent":"/no/such/parent","limit":4096}"#,
+        )
+        .unwrap();
+        assert!(!b.is_owned());
+        assert_eq!(b.limit(), 4096);
+        assert_eq!(b.group(), std::path::Path::new("/no/such/group"));
+        let text = serde_json::to_string(&b).unwrap();
+        assert!(
+            !text.contains("owned"),
+            "owned is this process's own and never travels: {text}"
+        );
+        drop(b);
     }
 }

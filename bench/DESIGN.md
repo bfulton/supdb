@@ -307,12 +307,16 @@ fragments past each store's trim, so the fifth arm of a rep opens
 holds 0.9 GB with a third of it forms shed into the allocator's free
 lists and returned by nothing, was killed there in its second rep under
 1.25 GiB, where it runs four reps alone under the same bound in 0.9.
-So a bounded row at ten million keys runs under 1.5 GiB today, and
-under 1.25 GiB once the runner gives each arm's rep a process of its
-own, or the engine returns what its sheds free while the store runs
-under a bound (`ROADMAP.md`); meanwhile the regime where both engines
-leave core is reached by a pairing (`bench ab --bound`) over the passes
-that hold one store at a time.
+So a bounded run gives each arm's rep a process of its own
+(`Plan::fresh_process`; `--fresh-process` and `--one-process` set it at
+any scale): `run` spawns its own binary again for the pass, inside the
+group it entered, hands it the plan and reads the pass's quantities
+back, and a pass the kernel kills ends the run with the kill's own
+status as before. The reps stay interleaved as they were, and each
+store opens from nothing. In core the arms share the process as they
+always have, so the quick and full rows' conditions are unchanged. The
+regime where both engines leave core is also reached by a pairing
+(`bench ab --bound`) over the passes that hold one store at a time.
 LMDB as it opens by default, which reads every random read past the
 cache with its readahead window, is not in the roster. The
 scan floor's file is written and synced outside the group and dropped
