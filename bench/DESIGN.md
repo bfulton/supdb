@@ -312,13 +312,39 @@ So a bounded run gives each arm's rep a process of its own
 (`Plan::fresh_process`; `--fresh-process` and `--one-process` set it at
 any scale): `run` spawns its own binary again for the pass, inside the
 group it entered, hands it the plan and reads the pass's quantities
-back, and a pass the kernel kills ends the run with the kill's own
-status as before. The reps stay interleaved as they were, and each
-store opens from nothing. In core the arms share the process as they
-always have, so the quick and full rows' conditions are unchanged. The
-roster runs under 1.25 GiB, where both engines leave core at ten million
-keys; the same regime is reached by a pairing (`bench ab --bound`) over
-the passes that hold one store at a time.
+back. A pass the kernel kills is a cell of the row and not the end of
+the run (`run::PassOutcome`): the run goes on to the next arm, the row
+records the arm, the rung, the rep and the phase the kill fell after,
+with what the group held at that phase's end, and the row is written
+under `runs/killed/<scale>/`, where neither the gate's history nor the
+figures read, with the command's status the kill's, 137, once it is.
+A roster the bound does not fit is not a measurement of the bound, and
+the number to move is the bound; what the other arms measured stands,
+and the kill says where to look. The reps stay interleaved as they
+were, and each store opens from nothing; with every pass in a process
+of its own there is no warmup rep, since a warmup warms a process and
+under a bound every rep costs what the first does (`run::first_rep`).
+In core the arms share the process as they always have, so the quick
+and full rows' conditions are unchanged. The roster runs under 1.25 GiB,
+where both engines leave core at ten million keys; the same regime is
+reached by a pairing (`bench ab --bound`) over the passes that hold one
+store at a time, each pass there in a process of its own too, a killed
+rep's pair lost and the pairing going on.
+
+A run writes what it measures to a ledger as it goes, one fragment a
+pass and one a rep, under `runs/inflight/<utc>-<sha7>/`, and composes
+its row from the ledger; `bench run --resume DIR` takes a cut run up
+from its last whole rep (`ledger`). The pass is the grain the suite
+already paid to make independent, and the rep is the grain a bankable
+row resumes at, since the arms are interleaved within one: a rep cut
+between two arms is taken again whole, unless `--resume-passes` keeps
+what it holds for a loop that is not the series'. A resume is the same
+binary, the same class and the same bound, with the plan the ledger's
+and `--reps` the one thing it may raise; the floors are taken again at
+every sitting, since the host may have moved between them, and the row
+records where each later sitting began (`Row::resumptions`). What a
+resume cannot do is make two sittings one host, so that record is the
+part that matters.
 LMDB as it opens by default, which reads every random read past the
 cache with its readahead window, is not in the roster. The
 scan floor's file is written and synced outside the group and dropped
@@ -523,7 +549,8 @@ out-of-core regime is where an embedded store on a small VM lives, and the
 old suite's largest run (100 MB) never entered it.
 
 A rep is one complete pass of a workload for one arm. Arms are round-robined
-within a rep; one warmup pass is discarded.
+within a rep; one warmup pass is discarded where the arms share the process,
+and none is run where each pass has a process of its own.
 
 `bench ab` is the instrument for choosing between two arms; the series is
 not. It runs both in one process with the order swapped every other rep,

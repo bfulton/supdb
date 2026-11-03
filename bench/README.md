@@ -17,6 +17,7 @@ cargo build --release
 ./target/release/bench run --scale quick        # tens of minutes; gates a PR
 ./target/release/bench run --scale full         # hours, on a quiet machine
 sh scripts/ooc.sh 1610612736                     # out of core under a 1.5 GiB bound; Linux, cgroup v1
+./target/release/bench run --resume runs/inflight/<utc>-<sha7>  # a cut run, taken up at its last whole rep
 ./target/release/bench gate runs/quick/<row>.json # a row against the series
 ./target/release/bench figures --scale quick    # every figure, from runs/
 ./target/release/bench machine                  # the host as a row records it
@@ -26,7 +27,11 @@ sh scripts/pair.sh A B SIZE [ab options]          # two arms paired, a sitting i
 
 `quick` tops its ladder at 300 000 keys. `full` sizes its ladder to the
 machine: the store crosses 1.5× memory wherever it runs. A row lands at
-`runs/<scale>/<utc>-<sha7>.json`; commit the ones worth keeping.
+`runs/<scale>/<utc>-<sha7>.json`; commit the ones worth keeping. A run
+writes what it measures to `runs/inflight/` as it goes and composes its
+row from that, so a run that was cut is resumed rather than repeated;
+a bounded row with a pass the bound killed lands under `runs/killed/`
+instead, with the kill named, and the command exits 137.
 
 Building the RocksDB comparator runs bindgen, which needs the libclang
 shared library (`libclang.so` on Linux, `libclang.dylib` on macOS). If the

@@ -3,6 +3,7 @@
 # bound's group cleaned up if the run dies inside it.
 #
 #   sh scripts/ooc.sh BYTES [bench run options...]   # e.g. 1610612736 --arms supdb,lmdb
+#   sh scripts/ooc.sh BYTES --resume DIR             # a cut run taken up from its ledger
 #   sh scripts/ooc.sh --prove-red                     # the gate, proved on a known-red input
 #
 # The run makes a cgroup of its own under the group this shell is in,
@@ -17,10 +18,15 @@
 # takes effect once the run in the foreground has ended, so the group
 # is removed with nothing left in it.
 #
-# Exit 137 is the kernel's kill (SIGKILL under the group's limit) and is
-# passed through as "raise L": a bound the run's own anonymous memory
-# does not fit is not a measurement of anything, and the number to move
-# is the bound.
+# Exit 137 is the kernel's kill (SIGKILL under the group's limit), which
+# takes a pass and not the run: the run goes on to the next arm, records
+# the kill with the phase it fell in, writes its row under
+# runs/killed/<scale>/ and exits 137 once it has. It is passed through
+# as "raise L": a bound the roster's own anonymous memory does not fit is
+# not a measurement of the bound, and the number to move is the bound;
+# the row names the arm and the phase to look at. A run cut by anything
+# else leaves its ledger under runs/inflight/, and `--resume DIR` takes
+# it up from its last whole rep.
 #
 # Gated on `&&` and on the run's own "banked rungs through" line, never
 # on `set -e`: this environment's shell walks straight past a failed
@@ -90,7 +96,7 @@ status=$(cat "$st" 2>/dev/null)
 case "$status" in ''|*[!0-9]*) status=1;; esac
 group=$(sed -n 's/^bench: bound [0-9]* bytes in group //p' "$err" | tail -n 1)
 if [ "$status" -eq 137 ]; then
-  echo "ooc.sh: the run was killed under its bound of $L bytes: raise L" >&2
+  echo "ooc.sh: a pass was killed under the bound of $L bytes; the row with the kills is under runs/killed/ (see above): raise L" >&2
   exit 137
 fi
 if [ "$status" -eq 0 ] && grep -q "banked rungs through" "$err"; then

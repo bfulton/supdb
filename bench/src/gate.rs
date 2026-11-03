@@ -554,6 +554,8 @@ mod tests {
             rustc: "r".into(),
             scale: Scale::Quick,
             machine: machine(cpus),
+            killed: vec![],
+            resumptions: vec![],
             measurements: vec![m("reads_per_s", "reads/s", reads), m("p99_us", "µs", p99)],
         }
     }
@@ -674,6 +676,8 @@ mod tests {
                 rustc: "r".into(),
                 scale: Scale::Quick,
                 machine: machine(4),
+                killed: vec![],
+                resumptions: vec![],
                 measurements: vec![
                     q("scan", "supdb", "entries_per_s", "entries/s", scan_supdb),
                     q("scan", "lmdb", "entries_per_s", "entries/s", scan_lmdb),
@@ -743,6 +747,8 @@ mod tests {
                 rustc: "r".into(),
                 scale: Scale::Quick,
                 machine: machine(4),
+                killed: vec![],
+                resumptions: vec![],
                 measurements: vec![q("supdb", 100.0), q("lmdb", lmdb)],
             }
         };

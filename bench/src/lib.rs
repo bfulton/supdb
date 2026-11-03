@@ -12,6 +12,7 @@ pub mod env;
 pub mod figures;
 pub mod gate;
 pub mod hist;
+pub mod ledger;
 pub mod machine;
 pub mod row;
 pub mod run;

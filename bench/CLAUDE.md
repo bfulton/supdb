@@ -444,6 +444,28 @@ comment about the store's shape is a claim the counters check, and an
 engine's `sync` is what its contract says and not what a pass assumes
 of it.
 
+**A kill that ended the run, and a warmup no row held.** A bounded run
+gave each pass a process of its own and still read the bound's kill of
+one as the end of the run: the parent returned the kill's status, wrote
+no row, and every cell the arms before it had measured went with it --
+two hours of a roster at ten million keys when the fifth arm's full
+rewrite was killed in its second rep, with the phase it was in, as the
+engine's notes say of one such kill, not known. And every arm ran a
+warmup rep under the bound, a quarter of the row, for a result the row
+discards: a warmup warms a process, and a pass in a fresh one has
+nothing warmed. A killed pass is a cell now (`run::PassOutcome`), named
+by its arm, rung, rep and the phase it fell after, and the run goes on;
+a row with one goes under `runs/killed/` with the kill's status, and a
+run of fresh processes starts at rep one (`run::first_rep`). The row's
+cells enter it through one function, live or replayed, and a run writes
+them to a ledger as it goes (`ledger`), so a run cut by anything --
+the kill, a timeout, a hand, the disk -- is taken up from its last
+whole rep (`bench run --resume`). The rule: a pass that was made
+independent so that it could be isolated is a checkpoint, and a run is
+what its ledger holds; a result the run discards is work the run does
+not do; and a failure a process boundary was built to contain is
+reported by the boundary, not relayed through it.
+
 **A workflow that never runs can be syntactically invalid for months.**
 Both self-hosted pickup watchdogs arrived with a block of an older draft
 pasted after their `exit 1`. `scripts/workflows.sh` parses every `run:`
