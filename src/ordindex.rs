@@ -612,6 +612,60 @@ impl OrdIndex {
         self.seek_in_exact(lo, hi, key, key_at).0
     }
 
+    /// The stride of heads a seek for `key` will search, from the top
+    /// level alone (`seek_exact_hint`'s window): `None` where the key does
+    /// not carry the common prefix, or the prefix is not learned, since the
+    /// seek then reads no head for it. For a reader asking for the stride's
+    /// page ahead of the seek (`willneed_heads`).
+    pub fn stride_window(&self, key: &[u8]) -> Option<(usize, usize)> {
+        if self.n == 0 {
+            return None;
+        }
+        if self.pfx > 0 {
+            let prefix = self.prefix.as_deref()?;
+            if key.len() < self.pfx || key[..self.pfx] != prefix[..self.pfx.min(prefix.len())] {
+                return None;
+            }
+        }
+        let h = head_of(key, self.pfx);
+        let t = lower_bound(&self.top, h);
+        Some(if t == 0 {
+            (0, TOP_STRIDE.min(self.n))
+        } else {
+            ((t - 1) * TOP_STRIDE + 1, (t * TOP_STRIDE).min(self.n))
+        })
+    }
+
+    /// The heads of ranks `lo..hi` asked of the kernel ahead of a seek over
+    /// them (`Bytes::advise_willneed`), nothing where their first page is
+    /// resident already (`Bytes::resident_at`): the bytes submitted. A
+    /// settle resolving a burst's keys out of core faulted a page of heads
+    /// a key, ten to fourteen thousand in a row on one thread.
+    pub fn willneed_heads(&self, lo: usize, hi: usize) -> usize {
+        let hi = hi.min(self.n);
+        if lo >= hi {
+            return 0;
+        }
+        let off = (HEADER + lo * HEAD) as u64;
+        if self.map.resident_at(off) == Some(true) {
+            return 0;
+        }
+        self.map.advise_willneed(off, (hi - lo) * HEAD)
+    }
+
+    /// The page of `page` bytes holding the head of `rank`, and the first
+    /// rank whose head is on the page after it: a settle's asks for the
+    /// heads coalesce by page (`willneed_heads`).
+    pub fn head_page(&self, rank: usize, page: usize) -> usize {
+        (HEADER + rank * HEAD) / page
+    }
+
+    pub fn page_end(&self, rank: usize, page: usize) -> usize {
+        ((self.head_page(rank, page) + 1) * page)
+            .saturating_sub(HEADER)
+            .div_ceil(HEAD)
+    }
+
     /// `seek_in`, and whether the key at the rank it answers is `key`
     /// where the heads can say: `Some(true)` for the key itself;
     /// `Some(false)` for a rank whose head differs from the query's, for
@@ -1084,6 +1138,36 @@ mod tests {
     /// the heads can: always over keys of one length, and never wrongly
     /// over keys of two lengths whose heads tie, where it leaves the
     /// records to say.
+    #[test]
+    fn a_heads_page_ends_where_the_next_begins() {
+        let keys: Vec<Vec<u8>> = (0..3000u32)
+            .map(|i| format!("k{i:08}").into_bytes())
+            .collect();
+        let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let p = write(&build(&refs), "head-pages");
+        let idx = OrdIndex::open(&p, refs.len()).expect("opens");
+        for page in [4096usize, 16384] {
+            for rank in (0..refs.len()).step_by(7).chain([0, 1, refs.len() - 1]) {
+                let end = idx.page_end(rank, page);
+                assert!(
+                    end > rank,
+                    "the end is past the rank: {rank} {end} at {page}"
+                );
+                assert_eq!(
+                    idx.head_page(end - 1, page),
+                    idx.head_page(rank, page),
+                    "{rank} {page}"
+                );
+                assert_eq!(
+                    idx.head_page(end, page),
+                    idx.head_page(rank, page) + 1,
+                    "{rank} {page}"
+                );
+            }
+        }
+        std::fs::remove_file(&p).ok();
+    }
+
     #[test]
     fn the_windowed_seek_says_whether_its_rank_is_the_key() {
         let uniform: Vec<Vec<u8>> = (0..300u32)

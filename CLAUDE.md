@@ -3161,6 +3161,41 @@ span, the ask is the whole cost; and the thread's major-fault count is
 not the measure of such a change, since a page asked for and reached
 before it arrives faults as minor -- read the pass's time.
 
+**A prefetch issued the microsecond before the fault it was to save, and
+a counter it satisfied for the path it was not for.** The heads a block's
+cuts seek were asked of the kernel at the block's build, beside the ask
+for its records, and seized by the first cut: an ask with no lead is the
+fault with a syscall before it, and the kernel said so -- the pass took
+more major faults an operation with the ask than without, 9.0 against 7.4
+at the full rewrite under 1.25 GiB at ten million keys and 1.1 against
+0.9 at the drained store, and the full-rewrite pass a tenth longer --
+where the fault it was aimed at already overlapped the records' ask issued
+before it. The test that held the mechanism counted the asks after a
+commit and a scan, and the build's asks satisfied it while the settle's,
+the site the asks were for, never ran in that test: a store whose commits
+keep no forms has nothing to settle, and its writes are cut at the build.
+Removing the build's ask read the counter at zero and named the test. The
+rule: a prefetch is placed by its lead, the work between the ask and the
+touch, and priced by the faults the kernel counts against the arm without
+it; and a mechanism with two sites is held at each site on its own,
+driven by the path that site is for, since a counter the wrong site
+satisfies passes with the right site dead.
+
+**A lead sized in pages for a walk whose work is in keys.** The settle's
+run asks kept the heads' frontier half a run of 256 KB ahead of the rank
+being resolved, thirty-two pages, which at the one-percent burst's density
+of five keys a page is 0.8 ms of resolves -- under the run's own round
+trip and transfer -- so the settle waited on most of its runs and the asks
+saved three faults in ten where an ask a key had saved nine. The lead is a
+time only through the batch's density, so it is set for the sparsest
+density the dense shape admits and kept as several requests in flight
+(`SETTLE_LEAD`, eight runs of 64 KB): the first scan then reads what the
+ask a key read, 248 and 276 ms against 427 and 460, with the pass's
+faults halved. The rule: a lead ahead of a walk is sized by the work
+between the ask and the touch and not by the pages it covers, and it is
+read off the faults the walk still takes, since a lead that is short by
+half looks like a lever that half works.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

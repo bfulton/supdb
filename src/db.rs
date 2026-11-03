@@ -415,6 +415,10 @@ pub struct ZCounts {
     /// Of the spans counted above, those submitted to the kernel: the rest
     /// had their first page resident and were left alone.
     pub willneed_asks: u64,
+    /// Runs and strides of heads a settle asked for ahead of the resolves
+    /// that seek them, and those submitted (`Options::heads_willneed`).
+    pub head_asks: u64,
+    pub head_submitted: u64,
     /// Point reads and counts of a partition answered from its form file.
     pub reads: u64,
     pub counts: u64,
@@ -2947,6 +2951,21 @@ pub struct Options {
     /// `pieces_willneed` is. Off, `supdb-noblockwillneed` and
     /// `supdb-ingestnoblockwillneed`.
     pub blocks_willneed: bool,
+    /// Out of core, the heads a settle's resolves will seek asked of the
+    /// kernel ahead of them (`OrdIndex::willneed_heads`): runs of them
+    /// where the batch is dense in a partition, the strides of the keys a
+    /// window ahead where it is sparse (`SETTLE_RUN`, `SETTLE_LEAD`,
+    /// `SETTLE_AHEAD`). A
+    /// burst's batch resolved one fault at a time was the whole of the
+    /// first scan after it under 1.25 GiB at ten million keys, ten to
+    /// fourteen thousand faults in a row on one thread. A block's build
+    /// asks nothing for the seek its cuts make: their one page faults
+    /// beside the records' ask already, and asked the microsecond before
+    /// it was seized it saved nothing and took more major faults. Gated as
+    /// `blocks_willneed` is: the gate away from raw, a partition no form
+    /// file serves. Off, `supdb-noheadwillneed` and
+    /// `supdb-ingestnoheadwillneed`.
+    pub heads_willneed: bool,
     /// A seal writes a key whose chain holds one value and no tombstone
     /// -- every key of a load, and most of any table -- through the
     /// writer's one-value path (`SegmentWriter::put_one`), the record
@@ -3549,6 +3568,7 @@ impl Default for Options {
             piece_ranks_whole: false,
             pieces_willneed: true,
             blocks_willneed: true,
+            heads_willneed: true,
             seal_put_one: true,
             close_presync: true,
             ord_durable: false,
@@ -8949,6 +8969,11 @@ struct Slot {
     /// Of the spans above, pieces' and partitions', those the kernel was
     /// asked for: the rest had their first page resident and were not.
     zwillneedasks: AtomicU64,
+    /// Runs and strides of a partition's heads a settle asked for ahead
+    /// of the resolves that seek them, and those submitted
+    /// (`Options::heads_willneed`).
+    zheadasks: AtomicU64,
+    zheadsubmitted: AtomicU64,
     /// Partition walks of a scan served by a form file, the groups decoded
     /// for them, and the runs of records no page holds the raw form walked
     /// inside them.
@@ -9027,6 +9052,8 @@ impl Slot {
             zwillneeds: AtomicU64::new(0),
             zblkwillneeds: AtomicU64::new(0),
             zwillneedasks: AtomicU64::new(0),
+            zheadasks: AtomicU64::new(0),
+            zheadsubmitted: AtomicU64::new(0),
             zscanz: AtomicU64::new(0),
             zscangroups: AtomicU64::new(0),
             znopagescans: AtomicU64::new(0),
@@ -12903,6 +12930,24 @@ fn block_bounds_of(
 /// writer freezes into room and waits for the oldest to land only when
 /// the list is full.
 const FROZEN_CAP: usize = 3;
+
+/// A settle's asks for the heads ahead of its resolves
+/// (`Options::heads_willneed`). Where a batch is dense in a partition --
+/// each key's page the one before's or the next -- the asks are runs of
+/// `SETTLE_RUN` heads, sixty-four kilobytes and sixteen pages each, one
+/// device request, issued from the page after the one the key resolved to
+/// until the frontier stands `SETTLE_LEAD` heads past the rank: half a
+/// megabyte of heads in flight as eight requests, which at the
+/// one-percent burst's density of five keys a page is a lead of a few
+/// hundred resolves, several round trips. A lead of half a 256 KB run
+/// left the settle waiting on most of its runs there, the asks saving
+/// three faults in ten. Where the batch is sparse the asks are the
+/// strides of the keys `SETTLE_AHEAD` ahead in it, a page each, which
+/// reads no page the batch will not: a run for a batch of fifty keys
+/// over a store would read sixteen pages a key.
+const SETTLE_RUN: usize = 8192;
+const SETTLE_LEAD: usize = 65536;
+const SETTLE_AHEAD: usize = 64;
 
 /// The most a scan asks the kernel for ahead of one walk
 /// (`Options::blocks_willneed`, `Options::pieces_willneed`): a scan's
@@ -17650,6 +17695,8 @@ impl Reader {
             piece_willneeds: rd.stat(|s| &s.zwillneeds),
             block_willneeds: rd.stat(|s| &s.zblkwillneeds),
             willneed_asks: rd.stat(|s| &s.zwillneedasks),
+            head_asks: rd.stat(|s| &s.zheadasks),
+            head_submitted: rd.stat(|s| &s.zheadsubmitted),
             nopage_reads: rd.stat(|s| &s.znopage),
             scans: rd.stat(|s| &s.zscanz),
             scan_groups: rd.stat(|s| &s.zscangroups),
@@ -17911,6 +17958,32 @@ impl Reader {
         self.opts.blocks_willneed
             && self.shared.zgate.load() != zselect::GATE_RAW
             && self.zc(seg).is_none()
+    }
+
+    /// The heads of ranks `lo..hi` of `seg` asked for ahead of a seek over
+    /// them (`OrdIndex::willneed_heads`), counted on this handle's line.
+    fn ask_heads(&self, seg: &Seg, lo: usize, hi: usize) {
+        self.zbump(|s| &s.zheadasks);
+        if seg.ord.willneed_heads(lo, hi) > 0 {
+            self.zbump(|s| &s.zheadsubmitted);
+        }
+    }
+
+    /// The partition `key` falls in, of the first `np` segments: stepped to
+    /// from `from`, the one the key before it in key order fell in, and
+    /// found from the top for a key that sorts below it -- keys longer than
+    /// the sixteen bytes a batch is sorted by, tied on them, may arrive out
+    /// of order (`settle_each`). `np` where no partition holds it.
+    fn settle_partition(&self, np: usize, from: usize, key: &[u8]) -> usize {
+        let segs = self.segs();
+        let mut at = from;
+        while at < np && segs[at].hi.as_ref().is_some_and(|h| h.as_slice() <= key) {
+            at += 1;
+        }
+        if at < np && at > 0 && segs[at].below_lo(key) {
+            at = segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
+        }
+        at
     }
 
     #[inline(never)]
@@ -22115,6 +22188,34 @@ impl Reader {
             Vec::with_capacity(pending.len());
         let lazy = self.opts.zpages_settle_span && !self.opts.forms_pieces_only;
         let mut lazy_n = 0u64;
+        // Out of core, the heads a resolve will seek asked for ahead of it
+        // (`Options::heads_willneed`): a resolve is a seek over one stride
+        // of a partition's heads, a page cold under a bound, and a burst's
+        // batch resolved one fault at a time was the whole of the first
+        // scan after it, ten to fourteen thousand faults in a row on one
+        // thread. Two shapes, by the batch's density in the partition as
+        // the pages its keys resolve to read it: dense, each key's page the
+        // one before's or the next, and the asks are runs from the rank the
+        // key resolved to, `SETTLE_RUN` heads at a time and `SETTLE_LEAD`
+        // ahead, a compare a key and nothing more; sparse, and a cursor
+        // `SETTLE_AHEAD` keys ahead asks each key's stride, found from the
+        // top level in memory, which reads no page the batch will not. An
+        // ask a key whatever the density cost a syscall a key, half a
+        // second of the full rewrite's settles.
+        let page = crate::bytes::os_page_size();
+        let asking =
+            self.opts.heads_willneed && self.shared.zgate.load() != zselect::GATE_RAW && np > 0;
+        // Per partition: the rank the asks have reached, the page of the
+        // last resolve and whether the batch reads dense there; then the
+        // sparse cursor's position in the batch and its partition.
+        let mut frontier: Vec<usize> = if asking { vec![0; np] } else { Vec::new() };
+        let mut last_page: Vec<usize> = if asking {
+            vec![usize::MAX; np]
+        } else {
+            Vec::new()
+        };
+        let mut dense: Vec<bool> = if asking { vec![false; np] } else { Vec::new() };
+        let (mut ahead, mut at_ahead) = (0usize, 0usize);
         for (n, &(_, _, i)) in keyed.iter().enumerate() {
             // A resolve out of core is a major fault a key: the ask to
             // give up is heard between them, not after the batch.
@@ -22131,28 +22232,45 @@ impl Reader {
             last = slot;
             let key = src.key_at(off, len);
             // The partition holding the key: the one before's or a later
-            // one in key order, found by stepping, and from the top for a
-            // key that sorts below it -- keys longer than the sixteen
-            // bytes sorted by, tied on them, may arrive out of order.
-            while at < np
-                && self.segs()[at]
-                    .hi
-                    .as_ref()
-                    .is_some_and(|h| h.as_slice() <= key)
-            {
-                at += 1;
-                floor = 0;
-                zhint = usize::MAX;
-            }
-            if at < np && at > 0 && self.segs()[at].below_lo(key) {
-                at = self.segs()[..np]
-                    .partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
+            // one in key order (`settle_partition`); the seek's floor and
+            // the lazy filing's hint are the partition's.
+            let was = at;
+            at = self.settle_partition(np, at, key);
+            if at != was {
                 floor = 0;
                 zhint = usize::MAX;
             }
             let Some(seg) = self.segs()[..np].get(at) else {
                 continue;
             };
+            // The sparse shape's cursor: ahead of this key and never at it
+            // -- a page asked and seized the next microsecond is the fault
+            // with a syscall before it -- and resting while the batch
+            // reads dense here, where the run below covers what it would
+            // reach. A stride asked moves the partition's frontier to the
+            // end of its page, so the keys sharing the page ask nothing.
+            if asking && !dense[at] {
+                ahead = ahead.max(n + 1);
+                while ahead < keyed.len() && ahead < n + 1 + SETTLE_AHEAD {
+                    let (_, _, j) = keyed[ahead];
+                    ahead += 1;
+                    let (off, len, _, _) = pending[j as usize];
+                    let k = src.key_at(off, len);
+                    at_ahead = self.settle_partition(np, at_ahead, k);
+                    let Some(s) = self.segs()[..np].get(at_ahead) else {
+                        continue;
+                    };
+                    if dense[at_ahead] || self.zc(s).is_some() {
+                        continue;
+                    }
+                    if let Some((lo, hi)) = s.ord.stride_window(k) {
+                        if lo >= frontier[at_ahead] {
+                            self.ask_heads(s, lo, hi);
+                            frontier[at_ahead] = s.ord.page_end(hi.max(lo + 1) - 1, page);
+                        }
+                    }
+                }
+            }
             let (b, cut) = match lazy
                 .then(|| self.lazy_block(at, seg, key, &mut zhint))
                 .flatten()
@@ -22167,6 +22285,28 @@ impl Reader {
                     (b, cut)
                 }
             };
+            // The dense shape, read off the rank: runs asked from the page
+            // after this one -- this one is resident, the resolve just
+            // seized it, and an ask that starts on a resident page asks
+            // nothing -- until the frontier stands the lead past the rank.
+            if asking && cut != LAZY_CUT && self.zc(seg).is_none() {
+                let rank = (cut >> 1) as usize;
+                let pg = seg.ord.head_page(rank, page);
+                dense[at] = last_page[at] != usize::MAX && pg.saturating_sub(last_page[at]) <= 1;
+                last_page[at] = pg;
+                if dense[at] {
+                    let n = seg.ord.len();
+                    while frontier[at] < (rank + SETTLE_LEAD).min(n) {
+                        let from = frontier[at].max(seg.ord.page_end(rank, page));
+                        if from >= n {
+                            break;
+                        }
+                        let to = (from + SETTLE_RUN).min(n);
+                        self.ask_heads(seg, from, to);
+                        frontier[at] = seg.ord.page_end(to - 1, page);
+                    }
+                }
+            }
             resolved.push((at as u32, b as u32, cut, off, len, new, slot));
         }
         if lazy_n > 0 {

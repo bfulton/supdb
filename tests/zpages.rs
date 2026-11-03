@@ -3171,6 +3171,108 @@ fn a_scan_asks_for_the_raw_records_it_is_about_to_walk_only_out_of_core() {
     }
 }
 
+/// A settle's resolve seeks one stride of a partition's heads, a page cold
+/// under a bound: out of core the heads are asked for ahead of the
+/// resolves (`Options::heads_willneed`), runs of them where the batch is
+/// dense in the partition and the strides of the keys a window ahead
+/// where it is sparse, and the scans agree with the model either way. A
+/// block's build asks nothing, since its one page of heads faults beside
+/// the records' ask already; the gate at raw asks nothing.
+#[test]
+fn a_settle_asks_for_the_heads_its_resolves_will_seek_only_out_of_core() {
+    for on in [true, false] {
+        let dir = scratch(&format!("head-willneed-{on}"));
+        let mut db = Db::create(
+            &dir,
+            Options {
+                zpages: ZPages::Off,
+                partition_bytes: Some(160 << 10),
+                scan_block_cache: true,
+                upkeep: supdb::Upkeep::Inline,
+                publish_in_background: false,
+                heads_willneed: on,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let mut model = ordered_load(&mut db, 4000, 0x3B10D);
+        let check = |db: &Db, model: &Model, what: &str| {
+            for start in [b"".to_vec(), spaced_key(1000), spaced_key(2500)] {
+                for limit in [1usize, 57, 300] {
+                    same_window(
+                        &scanned(db, &start, limit),
+                        &window(model, &start, limit),
+                        &format!(
+                            "{what}, from {:?} for {limit}",
+                            String::from_utf8_lossy(&start)
+                        ),
+                    );
+                }
+            }
+        };
+        db.zgate_set(1);
+        // A scan first: the commit after it files its batch into the forms
+        // (`Options::forms_settle_far`), and that settle is what asks. The
+        // drained store's scans build their blocks and ask for no heads.
+        check(&db, &model, "drained, the gate at the census");
+        assert_eq!(
+            db.zpage_counts().head_asks,
+            0,
+            "a drained store's builds ask for no heads"
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let mut rng = Rng(0x3B10D1);
+        // Dense: every fifth key, the pages of heads shared, runs asked.
+        for k in keys.iter().step_by(5) {
+            let v = suite_value(&mut rng);
+            db.append(k, &v);
+            model.entry(k.clone()).or_default().push(v);
+        }
+        db.commit().unwrap();
+        let dense = db.zpage_counts().head_asks;
+        assert_eq!(
+            dense > 0,
+            on,
+            "a dense batch's settle asked for heads only with the option: {dense}"
+        );
+        check(&db, &model, "a dense batch settled, the gate at the census");
+        // Sparse: three keys pages apart, a stride each ahead of its turn.
+        for i in [100usize, 2000, 3900] {
+            let v = suite_value(&mut rng);
+            db.append(&keys[i], &v);
+            model.entry(keys[i].clone()).or_default().push(v);
+        }
+        db.commit().unwrap();
+        let sparse = db.zpage_counts().head_asks;
+        assert_eq!(
+            sparse > dense,
+            on,
+            "a sparse batch's settle asked for heads only with the option: {dense} then {sparse}"
+        );
+        check(
+            &db,
+            &model,
+            "a sparse batch settled, the gate at the census",
+        );
+        // The gate at raw: the same settle asks nothing.
+        db.zgate_set(0);
+        for k in keys.iter().skip(2).step_by(7) {
+            let v = suite_value(&mut rng);
+            db.append(k, &v);
+            model.entry(k.clone()).or_default().push(v);
+        }
+        db.commit().unwrap();
+        assert_eq!(
+            db.zpage_counts().head_asks,
+            sparse,
+            "with the gate at raw no heads are asked for"
+        );
+        check(&db, &model, "the gate at raw");
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// The prefetch arm (`Options::zpages_scan_prefetch`): the scans agree
 /// with the model as without it, every walk that wants more than its
 /// first page asks once, and a walk of one key asks for nothing.

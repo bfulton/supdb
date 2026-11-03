@@ -81,7 +81,12 @@ The suite has to be fair before any of its numbers are quoted.
   together now (`Options::pieces_willneed`, the pass 1.5x for it), and
   the partition's own pages a raw scan takes are asked for the same way
   (`Options::blocks_willneed`), the drained point level with LMDB for it
-  and the full-rewrite point at 0.12x; the merge's first pass reads its
+  and the full-rewrite point at 0.12x; the settle's resolves ask for the
+  heads they will seek ahead of them (`Options::heads_willneed`: runs
+  where the batch is dense in a partition, a stride a key ahead where it
+  is sparse, and nothing at a block's build, whose page of heads faults
+  beside the records' ask already), the one-percent point's first scan
+  0.6x of what it was and its cell 1.46x; the merge's first pass reads its
   keys off the ordered index's heads now (`Options::merge_keys_by_heads`,
   the bursts' background reads an operation 1.6-1.75x fewer, the cells
   within the spread), and what is left there is the merge's second pass

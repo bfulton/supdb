@@ -514,6 +514,11 @@ pub struct Supdb {
     /// second pass (`Options::merge_drop_behind`, refuted and off).
     /// `supdb-ingestmergedropbehind`, and `supdb-mergedropbehind` durable.
     mergedropbehind: bool,
+    /// A settle's resolves read the heads they seek as they meet them,
+    /// where the default asks for them ahead once the store is out of core
+    /// (`Options::heads_willneed` off). `supdb-ingestnoheadwillneed`, and
+    /// `supdb-noheadwillneed` durable.
+    noheadwillneed: bool,
     /// A seal writes every key through the writer's general path, as
     /// before the one-value path (`Options::seal_put_one` off).
     /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
@@ -1223,6 +1228,11 @@ struct Policy {
     /// second pass (`Options::merge_drop_behind`, refuted and off).
     /// `supdb-ingestmergedropbehind`, and `supdb-mergedropbehind` durable.
     mergedropbehind: bool,
+    /// A settle's resolves read the heads they seek as they meet them,
+    /// where the default asks for them ahead once the store is out of core
+    /// (`Options::heads_willneed` off). `supdb-ingestnoheadwillneed`, and
+    /// `supdb-noheadwillneed` durable.
+    noheadwillneed: bool,
     /// A seal writes every key through the writer's general path, as
     /// before the one-value path (`Options::seal_put_one` off).
     /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
@@ -1746,6 +1756,7 @@ impl Default for Policy {
             noblockwillneed: false,
             mergerecordkeys: false,
             mergedropbehind: false,
+            noheadwillneed: false,
             sealrun: false,
             closeinline: false,
             timers: false,
@@ -3377,6 +3388,34 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 mergedropbehind: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose settles read the heads they seek as they meet them,
+    /// where the default asks for them ahead once the store is out of core
+    /// (`Options::heads_willneed`): against `supdb` under a bound it
+    /// prices the asking.
+    pub fn create_noheadwillneed(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                noheadwillneed: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` reading its heads as it meets them, as
+    /// `supdb-noheadwillneed`.
+    pub fn create_ingest_noheadwillneed(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                noheadwillneed: true,
                 ..Policy::default()
             },
         )
@@ -5872,6 +5911,7 @@ impl Supdb {
             noblockwillneed,
             mergerecordkeys,
             mergedropbehind,
+            noheadwillneed,
             sealrun,
             closeinline,
             timers,
@@ -6150,6 +6190,7 @@ impl Supdb {
             blocks_willneed: !noblockwillneed,
             merge_keys_by_heads: !mergerecordkeys,
             merge_drop_behind: mergedropbehind,
+            heads_willneed: !noheadwillneed,
             seal_put_one: !sealrun,
             close_finish_inline: closeinline,
             upkeep_wake_parked: wake,
@@ -6406,6 +6447,7 @@ impl Supdb {
             noblockwillneed,
             mergerecordkeys,
             mergedropbehind,
+            noheadwillneed,
             sealrun,
             closeinline,
             timers,
@@ -7095,6 +7137,13 @@ impl Engine for Supdb {
                 "supdb-ingestmergedropbehind"
             };
         }
+        if self.noheadwillneed {
+            return if self.partition {
+                "supdb-noheadwillneed"
+            } else {
+                "supdb-ingestnoheadwillneed"
+            };
+        }
         if self.sealrun {
             return if self.partition {
                 "supdb-sealrun"
@@ -7631,6 +7680,8 @@ impl Engine for Supdb {
             ("piece_willneeds", z.piece_willneeds as f64),
             ("block_willneeds", z.block_willneeds as f64),
             ("willneed_asks", z.willneed_asks as f64),
+            ("head_asks", z.head_asks as f64),
+            ("head_submitted", z.head_submitted as f64),
             ("zpage_nopage_reads", z.nopage_reads as f64),
             ("zpage_scans", z.scans as f64),
             ("zpage_scan_groups", z.scan_groups as f64),
@@ -8476,6 +8527,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-noblockwillneed"
         | "supdb-mergerecordkeys"
         | "supdb-mergedropbehind"
+        | "supdb-noheadwillneed"
         | "supdb-sealrun"
         | "supdb-closeinline"
         | "supdb-timers"
@@ -8576,6 +8628,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestnoblockwillneed"
         | "supdb-ingestmergerecordkeys"
         | "supdb-ingestmergedropbehind"
+        | "supdb-ingestnoheadwillneed"
         | "supdb-ingestsealrun"
         | "supdb-ingestcloseinline"
         | "supdb-ingesttimers"
@@ -8917,6 +8970,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestmergerecordkeys" => Box::new(Supdb::create_ingest_mergerecordkeys(dir)?),
         "supdb-mergedropbehind" => Box::new(Supdb::create_mergedropbehind(dir)?),
         "supdb-ingestmergedropbehind" => Box::new(Supdb::create_ingest_mergedropbehind(dir)?),
+        "supdb-noheadwillneed" => Box::new(Supdb::create_noheadwillneed(dir)?),
+        "supdb-ingestnoheadwillneed" => Box::new(Supdb::create_ingest_noheadwillneed(dir)?),
         "supdb-sealrun" => Box::new(Supdb::create_sealrun(dir)?),
         "supdb-ingestsealrun" => Box::new(Supdb::create_ingest_sealrun(dir)?),
         "supdb-closeinline" => Box::new(Supdb::create_closeinline(dir)?),

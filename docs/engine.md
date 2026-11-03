@@ -6552,6 +6552,49 @@ refutation gives: a page is dropped behind a walk only when nothing else
 reads the object the walk is consuming, and a merge's inputs are read by
 everyone until they are gone.
 
+The one-percent point's first scan is the burst's settle, and a resolve is
+a seek over one stride of a partition's heads, a page cold under the
+bound: the settle of the burst's hundred thousand keys took its faults one
+at a time on one thread, the whole of that scan. The heads are asked for
+ahead of the resolves now (`Options::heads_willneed`;
+`supdb-noheadwillneed` and `supdb-ingestnoheadwillneed` seek them as they
+meet them), gated as the records' asks are, in two shapes by the batch's
+density in the partition as the pages its keys resolve to read it: dense,
+each key's page the one before's or the next, and the asks are runs of
+sixty-four kilobytes of heads from the page after the one the key resolved
+to, kept half a megabyte ahead as eight requests (`SETTLE_RUN`,
+`SETTLE_LEAD`); sparse, and a cursor sixty-four keys ahead in the batch
+asks each key's stride, found from the top level in memory
+(`SETTLE_AHEAD`), which reads no page the batch will not. Paired at ten
+million keys under 1.25 GiB, a warmup and a pair (`bench ab --arms
+supdb,supdb-noheadwillneed --size 10000000 --bound 1342177280 --passes
+load,lag --ops-div 10 --reps 1`): the one-percent point's first scan 248
+and 276 ms against 427 and 460, its settle 216 and 249 against 387 and
+401, the pass 0.45 and 0.46 s against 0.65 and 0.66 with 2,700 and 3,000
+major faults against 5,200 and 6,400, the cell 1.46x; the ten-percent
+point 2.4 and 2.8 s against 2.7 and 4.5; the full rewrite 9.6 and 9.8
+against 9.8 and 10.9, 7.2 major faults a scan against 8.9; the drained
+point 1.0 and 1.2 against 1.2 and 1.3; 74,000 asks over the sweep and
+2,300 of them submitted, the rest finding their first page resident.
+Three shapes were paired before it, the same way. An ask a key, the
+stride's page a window of keys ahead, took the first scan to 259 and 286
+ms against 463 and 482 and the full-rewrite pass to 11.3 s against 10.0,
+half a second of it a syscall a key over ten million resolves. Runs of
+sixty-four kilobytes asked half a run ahead kept a tenth of the gain and
+the whole of the loss, which was not the settle's: a block's build asked
+for the page of heads its cuts seek the microsecond before the seek, which
+is the fault with a syscall before it -- the records' ask, already issued,
+is what that fault overlaps -- and the pass took more major faults an
+operation with it than without, 9.0 against 7.4 at the full rewrite and
+1.1 against 0.9 at the drained store, where it saved nothing; the build
+asks nothing now. Runs of 256 KB kept half a run ahead ran the settle in
+317 ms against 399 and saved three faults in ten: at five keys a page half
+a run is 0.8 ms of resolves, under the run's own round trip and transfer,
+so the settle waited on most of its runs, and the lead is sized by the
+resolves between the ask and the touch at the sparsest density the dense
+shape admits, not by the pages it covers. In core the gate is raw and
+`head_asks` reads zero through the sweep.
+
 #### Out of core: the second form
 
 A pairing this section cites is given as the command that reproduces it, `pair.sh A B SIZE [bench ab options]` (`bench/scripts/pair.sh`: `bench ab` over the two arms, one sitting in each order), at the commit it ran at; a binary built at that commit runs it (`BIN=`), and every arm named exists at the head as well. A rerun reproduces the comparison, not the rates, which this host moves by tens of percent between sittings. A count a sentence quotes -- decodes, faults by mix, the controller's events, the census -- was read with the variable before the command set, which turns supdb's own timers on as well, so a rate against a comparator is read from a run without it. Pairings made before this history's root (2026-10-20) cite the root, `18c3a30`, the first commit here that holds their arms. The design the form was built to is `docs/zpages-design.md`.
