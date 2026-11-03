@@ -2745,6 +2745,51 @@ the slot walk bounded to the slots the batch touched, the resolve's
 stride hinted a key ahead, the forms sized by count rather than room,
 each priced on this burst and on the mixes before it is the default.
 
+Paired the same way at ten thousand, a hundred thousand, three hundred
+thousand, a million and three million keys (`pair.sh
+SUPDB_LAG_COUNTERS=1 supdb-ingest supdb-ingestlendbursts SIZE --passes
+load,lag --reps 8` at `37ea8f2`, six pairs a sitting at the two largest
+rungs), lending every batch reads the sweep's weighted sum at
+0.88-0.90x, 0.74x, 0.61x, 0.55x and 0.43x of the inline fill's, resolved
+in both orders from a hundred thousand up and at the fully rewritten
+point at every rung but ten thousand; the bursts 1.4-4x faster, the
+passes after the tenth and the full rewrite 1.8-3.5x slower, the
+one-percent point level everywhere but three million, where it reads
+0.89x and 0.92x. The thread files a burst's batch at once now, so the
+pass after a lent burst no longer pays what it paid when the inline fill
+was chosen. The inline fill still holds the lag scan cells against LMDB
+at the smallest rungs, which lending would read at about 0.3x of today's
+at ten thousand; the pipeline a batch deep described above is the shape
+that would keep both, and it is not built.
+
+The larger part of the one-percent cell was not the fill. The lending
+arm ran its own one-percent burst at 5 µs a write where its second and
+third one-percent bursts, run after it through the lag probe
+(`LAG_PCTS=0,1,2,3,10 lag_only supdb-ingestlendbursts 1000000 3` at
+`37ea8f2`), ran 0.6-1.2, and `strace -f -tt -T` over the probe put the
+difference in one call: the burst's third commit crossed `seal_bytes` of
+the live WAL, the rotation fdatasynced the file it closed, 31 MB of
+frames a buffered store had never synced, 43.5 ms on the writer's
+thread, and then the directory; at three million keys the two took
+106 ms of the lending arm's 92-147 ms burst. The shuffled load leaves
+the live file within a few commits of the boundary at both rungs, so
+every rep paid it, and the durable arm's rotation, every frame of it
+synced at its commit, paid nothing. A rotation leaves the frames the
+policy left unsynced now; the file it begins says so in its header
+kind; the first sync by policy syncs the closed file before the live one
+and chains the kind; and replay reads a gap at a loose boundary as the
+log's end, where at a chained one it refuses the open (`Db::rotate_wal`,
+`Wal::replay`). The probe reads the shipped arm's first one-percent
+burst at 24-34 ms and its second at 28-29 at the commit that made the
+change, against 71-76 and 22-27 before it (`LAG_PCTS=0,1,2 lag_only
+supdb-ingest 1000000 1`, three runs each). Paired in one process against
+the shape before, kept as an arm in the measuring tree alone, at a
+million keys over the load and lag passes, six pairs a sitting in both
+orders: the one-percent burst 2.6x and 2.7x (6/6 each), its weighted sum
+0.75x and 0.65x (6/6 each), the tenth and the full rewrite within noise
+with their bursts 24 against 61 ms, 186 against 182 and 2,327 against
+2,394 in the counters, and the loads and the scans level.
+
 #### The freeze that leaves its carry to the next look
 
 At level 1 the freeze is the one place the writer still does work for
@@ -5367,7 +5412,9 @@ against the arm it adds to, twelve pairs a rung at 10k, 100k and 300k:
   the live file's sequence, the file is not synced or rotated, and it
   rotates by size at a commit, synced first -- replay carries each
   file's sequence into the next and refuses a gap, so a file rotated
-  away with an unsynced tail could leave a store that does not open.
+  away with an unsynced tail could leave a store that does not open
+  (the sync came off the writer's thread later; "The buffered
+  one-percent burst at a million keys", above).
   The writer's time in the seals its commits start fell to 4-10% on the
   shape arm and 22-56% on the durable default, ycsb-F rose 1.2-1.3x on
   the shape arm, and nothing fell.

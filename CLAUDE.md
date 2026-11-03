@@ -925,11 +925,14 @@ commit here: the slots' first version dropped it as the manifest's own,
 and it was the segment's too -- an fsync taken off a path is first asked
 what else it made durable. The seal leaves the WAL open and ends at
 its sequence, since replay skips every record a manifest covers; the log
-rotates by size at a commit, synced and its directory entry synced
-first, because replay refuses a sequence gap across files, and a closed
-file retires at the next seal's durable landing, whose manifest covers
-it (`seal_rotates_wal` is the arm that syncs and rotates at every seal
-instead). Readers wait for no
+rotates by size at a commit, leaving what the policy left unsynced to
+the policy's next sync -- the file it begins says in its header kind
+that its predecessor was left loose, the first sync by policy syncs that
+file before the live one and chains the kind, and a replay that meets a
+sequence gap at a loose boundary ends the log there where at a chained
+one it refuses the open -- and a closed file retires at the next seal's
+durable landing, whose manifest covers it (`seal_rotates_wal` is the arm
+that syncs and rotates at every seal instead). Readers wait for no
 fsync and the manifest does, and no manifest is written while a seal's
 segments are published and unsynced -- it would name a segment that may be
 torn and cover a sequence the WAL still has to hold -- so a merge that
@@ -3225,6 +3228,34 @@ measure of a merge policy is the pieces a reader meets, read off the pass
 (`pieces` in the lag counters, `merges_landed`, `merge_plans`), beside the
 burst's rate and the pass's together, since a policy that leaves the
 pieces for later wins both cells and pays in the pass nobody measured.
+
+**A sync the policy never asked for, at the rotation this time.** The
+log rotates by size at a commit, and the rotation fsynced the file it
+closed before starting the next, since replay refuses a sequence gap
+across files. Every frame of a buffered store is unsynced, so every
+rotation was a 32 MiB fdatasync on the writer's thread, 43-70 ms here,
+in a store whose commits never sync; and at a million and at three
+million keys the lag sweep's shuffled load left the live file within a
+few commits of the boundary, so the one-percent burst's first commits
+paid it in every rep, two thirds of a cell that read 0.33x of RocksDB
+without sync. The notes had decomposed that cell to the inline fill and
+listed levers for it; the profile was of the fill's window, and an
+fdatasync is not in a CPU profile. Running the lag probe with two more
+one-percent bursts behind the first (`LAG_PCTS=0,1,2,3,10`) read the
+first at 5 µs a write and the rest at 0.6-1.2 on the arm that filed
+nothing, and `strace -f -tt -T` over it named the call: three 168 KB
+WAL writes, an fdatasync of 43.5 ms, the next file. A rotation leaves
+the frames the policy left unsynced now, the file it begins says so in
+its header kind, the first sync by policy syncs the closed file first
+and chains the kind, and replay reads a gap at a loose boundary as the
+log's end and at a chained one as a record lost. The shape before is no
+arm: a sync the policy never asked for is a wrong answer and not a
+trade, and the pairing that priced its removal kept it as one only in
+the tree that measured. The rule is the drain's, again: a sync is issued by the policy, never by the shape
+of the call that happens to need the write; and a burst that costs more
+than its commits is listed under `strace` before its profile is read,
+since the profile of a thread that waits shows the work and not the
+wait.
 
 ## Standing limitations
 
