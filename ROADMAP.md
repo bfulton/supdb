@@ -70,8 +70,14 @@ The suite has to be fair before any of its numbers are quoted.
   the row leaves: `ZPages::Auto` as the engine's default once its
   in-core cost on the point-read mixes is named; the lag points under
   the bound, where the controller arm's ten-percent point reads 0.3x and
-  every arm's full-rewrite point 0.03x, the latter the merge's streaming
-  of a store rewritten whole; the engine's trimmer running while the
+  every arm's full-rewrite point 0.03x -- half of the full rewrite's
+  pass was the first scan ranking every piece of the burst whole against
+  its partition, and the first scan after the merge's landing ranking
+  them again, which nobody does now (`Options::piece_ranks_whole`, off;
+  `docs/engine.md`, under "against LMDB with its readahead off"), and
+  the rest is the merge streaming the rewritten store twice through a
+  cache that cannot hold it, beside scans that find a hundred keys in a
+  hundred pieces; the engine's trimmer running while the
   store is under a cgroup bound, where free memory is page cache the
   store does not have (`Options::forms_to_fit`'s trim, priced in core
   before it is the default under a bound); and 1 GiB.

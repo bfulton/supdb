@@ -401,6 +401,11 @@ pub enum ZPages {
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ZCounts {
+    /// Cuts a block's build asked of the raw form's heads, and those whose
+    /// compare read the record because the heads could not say
+    /// (`BuildCtx::cut_at`).
+    pub cuts: u64,
+    pub cut_records: u64,
     /// Point reads and counts of a partition answered from its form file.
     pub reads: u64,
     pub counts: u64,
@@ -2838,9 +2843,10 @@ pub struct Options {
     /// were taken in. On, `supdb-sealcopyfar` and
     /// `supdb-ingestsealcopyfar`.
     pub seal_snapshot_far: bool,
-    /// A landing far from reads takes its pieces' ranks and bounds
-    /// against their partitions before it publishes, as every landing
-    /// does near them (`Maint::rank_before_publish`). Off, the default, a
+    /// A landing far from reads takes its pieces' bounds -- and their
+    /// ranks, under `piece_ranks_whole` -- against their partitions before
+    /// it publishes, as every landing does near them
+    /// (`Maint::rank_before_publish`). Off, the default, a
     /// landing while the writer's last seal was far from every scan
     /// (`reads_around`, as `seal_snapshot_far` asks it; a drain's seal
     /// counts as near, since a flush is a writer saying it has stopped
@@ -2855,6 +2861,24 @@ pub struct Options {
     /// away before anything reads them. On, `supdb-ranksfar` and
     /// `supdb-ingestranksfar`.
     pub land_ranks_far: bool,
+    /// A level-0 piece's keys ranked against its partition whole -- every
+    /// key's cut in one forward walk, kept on the piece under the
+    /// partition's identity (`Seg::ranks`) -- by the segment work before
+    /// it publishes the piece near reads (`Maint::rank_before_publish`)
+    /// and by a reader that meets a piece without them
+    /// (`BuildCtx::rank_pieces`). Off, the default, nobody does: a build
+    /// finds each piece key's cut where its walk of the partition stops at
+    /// the key, or by one seek over the block's heads where it does not
+    /// walk, as it always did for a piece holding none. Under a bound the
+    /// whole ranking was the first scan after the full rewrite at ten
+    /// million keys: the burst's landings were far from reads and took
+    /// none, so the writer's rebase ranked every piece standing -- three
+    /// to four hundred of them, the store's records once more -- through
+    /// major faults for twenty seconds before the scan that asked walked
+    /// a block, and the scans after it read every piece key's cut from a
+    /// rank the walk was about to reach anyway. On, `supdb-rankswhole`
+    /// and `supdb-ingestrankswhole`.
+    pub piece_ranks_whole: bool,
     /// A seal writes a key whose chain holds one value and no tombstone
     /// -- every key of a load, and most of any table -- through the
     /// writer's one-value path (`SegmentWriter::put_one`), the record
@@ -3451,6 +3475,7 @@ impl Default for Options {
             drain_snapshot: true,
             seal_snapshot_far: false,
             land_ranks_far: false,
+            piece_ranks_whole: false,
             seal_put_one: true,
             close_presync: true,
             ord_durable: false,
@@ -4317,7 +4342,9 @@ struct Seg {
     /// shared vector and reads it at every block build after: a lookup
     /// per block build and piece, when it was a lock, bounced the lock's
     /// word between a builder's thread and the scan's, twenty-two pieces
-    /// a block at three million keys.
+    /// a block at three million keys. Taken at all only under
+    /// `Options::piece_ranks_whole`; a piece without them has each key's
+    /// cut found at the build, where the walk stops at the key.
     ranks: IdCache<Vec<u32>>,
     /// Where this piece's positions fall against a partition's block
     /// boundaries, by the partition's blob id: a function of two sealed
@@ -8834,6 +8861,12 @@ struct Slot {
     zraw: AtomicU64,
     zfallbacks: AtomicU64,
     zscans: AtomicU64,
+    /// Cuts a block's build asked of the raw form's heads (`cache_cut`),
+    /// and those whose compare had to read the record because the heads
+    /// could not say (`OrdIndex::seek_in_exact`): none in a store whose
+    /// keys are one length.
+    zcuts: AtomicU64,
+    zcutrecs: AtomicU64,
     /// Partition walks of a scan served by a form file, the groups decoded
     /// for them, and the runs of records no page holds the raw form walked
     /// inside them.
@@ -8907,6 +8940,8 @@ impl Slot {
             zraw: AtomicU64::new(0),
             zfallbacks: AtomicU64::new(0),
             zscans: AtomicU64::new(0),
+            zcuts: AtomicU64::new(0),
+            zcutrecs: AtomicU64::new(0),
             zscanz: AtomicU64::new(0),
             zscangroups: AtomicU64::new(0),
             znopagescans: AtomicU64::new(0),
@@ -17204,6 +17239,24 @@ impl Reader {
         (ranked, n)
     }
 
+    /// The level-0 pieces standing that hold ranks against a partition,
+    /// those that hold bounds against one, and the pieces standing
+    /// (`Options::piece_ranks_whole`). For a test.
+    #[doc(hidden)]
+    pub fn pieces_with_ranks(&self) -> (usize, usize, usize) {
+        let _entered = self.enter();
+        let (mut ranked, mut bounded, mut n) = (0, 0, 0);
+        for s in self.segs().iter().filter(|s| s.level == 0) {
+            let (mut r, mut b) = (false, false);
+            s.ranks.each(|_| r = true);
+            s.bounds.each(|_| b = true);
+            ranked += usize::from(r);
+            bounded += usize::from(b);
+            n += 1;
+        }
+        (ranked, bounded, n)
+    }
+
     /// How many segments' ordered companions were advised `MADV_RANDOM`, and
     /// how many there are.
     ///
@@ -17305,6 +17358,8 @@ impl Reader {
             inplace_groups: rd.stat(|s| &s.zinplace),
             rawserves: rd.stat(|s| &s.zraw),
             fallbacks: rd.stat(|s| &s.zfallbacks),
+            cuts: rd.stat(|s| &s.zcuts),
+            cut_records: rd.stat(|s| &s.zcutrecs),
             nopage_reads: rd.stat(|s| &s.znopage),
             scans: rd.stat(|s| &s.zscanz),
             scan_groups: rd.stat(|s| &s.zscangroups),
@@ -17722,10 +17777,10 @@ impl Reader {
     /// ordered index's heads and the raw records otherwise.
     fn part_cut_z(&self, seg: &Seg, rank: usize, end: usize, uk: &[u8]) -> (usize, Ordering) {
         if !self.z_on() || self.opts.zpages_seek_ord {
-            return BuildCtx::cut_at(seg, rank, end, uk);
+            return self.cut_raw(seg, rank, end, uk);
         }
         let Some(z) = seg.z.get() else {
-            return BuildCtx::cut_at(seg, rank, end, uk);
+            return self.cut_raw(seg, rank, end, uk);
         };
         let r = z.cut_in(&self.zmemo, rank, end, uk);
         self.zmemo_take();
@@ -17738,9 +17793,9 @@ impl Reader {
             }
             zfile::ZSeek::Fallback => {
                 self.zbump(|s| &s.zfallbacks);
-                BuildCtx::cut_at(seg, rank, end, uk)
+                self.cut_raw(seg, rank, end, uk)
             }
-            zfile::ZSeek::Out | zfile::ZSeek::NoPage => BuildCtx::cut_at(seg, rank, end, uk),
+            zfile::ZSeek::Out | zfile::ZSeek::NoPage => self.cut_raw(seg, rank, end, uk),
         }
     }
 
@@ -17847,8 +17902,19 @@ impl Reader {
         if self.zc(seg).is_some() {
             self.part_cut_z(seg, rank, end, key)
         } else {
-            BuildCtx::cut_at(seg, rank, end, key)
+            self.cut_raw(seg, rank, end, key)
         }
+    }
+
+    /// `BuildCtx::cut_at` counted on this handle's line: the cuts asked of
+    /// the raw form's heads, and those whose compare read a record.
+    fn cut_raw(&self, seg: &Seg, rank: usize, end: usize, key: &[u8]) -> (usize, Ordering) {
+        self.zbump(|s| &s.zcuts);
+        let (cut, read) = BuildCtx::cut_at(seg, rank, end, key);
+        if read {
+            self.zbump(|s| &s.zcutrecs);
+        }
+        cut
     }
 
     /// `OrdIndex::seek_exact` for the block cache: the rank of the first
@@ -20433,6 +20499,7 @@ impl Reader {
             merge_pieces: self.opts.overlay_merge,
             pieces_only: self.opts.forms_pieces_only,
             ranks_by_heads: self.opts.piece_ranks_by_heads,
+            ranks_whole: self.opts.piece_ranks_whole,
         }
     }
 
@@ -31468,6 +31535,8 @@ struct BuildCtx<'s> {
     pieces_only: bool,
     /// See `Options::piece_ranks_by_heads`.
     ranks_by_heads: bool,
+    /// See `Options::piece_ranks_whole`.
+    ranks_whole: bool,
     /// The pieces' runs over a block merged on their keys' leading words
     /// (`merge_runs`) rather than sorted whole: `Options::overlay_merge`.
     merge_pieces: bool,
@@ -31634,7 +31703,12 @@ impl<'s> BuildCtx<'s> {
     /// that has no ranks against that partition yet: what the segment
     /// work does before it publishes a set (`Maint::rank_before_publish`),
     /// and a table's making does for pieces that were opened from disk.
+    /// Only under `Options::piece_ranks_whole`; otherwise nothing, and
+    /// every build finds its cuts.
     fn rank_pieces(&self) -> Result<()> {
+        if !self.ranks_whole {
+            return Ok(());
+        }
         rank_pieces_of(self.segs, self.ranks_by_heads)
     }
     /// PROTOTYPE: where the snapshot's keys fall against the partition's
@@ -33007,19 +33081,34 @@ impl<'s> BuildCtx<'s> {
     ///
     /// Searched over the ordered index's heads for the window -- sixty-four
     /// eight-byte heads in eight lines, hot after the block's first build
-    /// -- with one key read after, for the comparison the emit needs.
-    /// Before this the search read the records: the rank itself first,
-    /// then the window's last key, then a gallop from the rank and a
-    /// binary search over the gap it landed in, a parsed key at every
-    /// probe; at 300k keys a sparse block's build was 3 us, most of it
-    /// here, and a fifth of E's first pass.
-    fn cut_at(seg: &Seg, rank: usize, end: usize, uk: &[u8]) -> (usize, Ordering) {
-        let r = seg.ord.seek_in(rank, end, uk, |i| seg.raw().key_at(i));
+    /// -- which answer the comparison the emit needs too where a head is a
+    /// whole key, and one key read for it otherwise
+    /// (`OrdIndex::seek_in_exact`). Before this the search read the
+    /// records: the rank itself first, then the window's last key, then a
+    /// gallop from the rank and a binary search over the gap it landed in,
+    /// a parsed key at every probe; at 300k keys a sparse block's build
+    /// was 3 us, most of it here, and a fifth of E's first pass. Then it
+    /// read the one key at the cut for the compare, a record page a sparse
+    /// build touches for nothing else: with the pieces' cuts found at the
+    /// builds (`Options::piece_ranks_whole` off), under a bound that was a
+    /// major fault per overlay key, a quarter more over the ten-percent lag
+    /// pass at ten million keys. The second answer is whether the compare
+    /// read a record.
+    fn cut_at(seg: &Seg, rank: usize, end: usize, uk: &[u8]) -> ((usize, Ordering), bool) {
+        let (r, exact) = seg
+            .ord
+            .seek_in_exact(rank, end, uk, |i| seg.raw().key_at(i));
         if r >= end {
-            return (end, Ordering::Greater);
+            return ((end, Ordering::Greater), false);
         }
-        let at = seg.raw().key_at(r).map_or(Ordering::Greater, |k| k.cmp(uk));
-        (r, at)
+        match exact {
+            Some(true) => ((r, Ordering::Equal), false),
+            Some(false) => ((r, Ordering::Greater), false),
+            None => {
+                let at = seg.raw().key_at(r).map_or(Ordering::Greater, |k| k.cmp(uk));
+                ((r, at), true)
+            }
+        }
     }
 }
 
@@ -34586,7 +34675,12 @@ impl Maint {
         // takes them (`Options::land_ranks_far`).
         let near = self.opts.land_ranks_far || self.shared.reads_near.load(AtomicOrdering::Acquire);
         if self.opts.scan_block_cache && near {
-            rank_pieces_of(segs, self.opts.piece_ranks_by_heads)?;
+            // The ranks only under the arm (`Options::piece_ranks_whole`);
+            // the bounds are a table's, and every table over the pair
+            // would walk them otherwise.
+            if self.opts.piece_ranks_whole {
+                rank_pieces_of(segs, self.opts.piece_ranks_by_heads)?;
+            }
             bound_pieces_of(segs)?;
         }
         Ok(())

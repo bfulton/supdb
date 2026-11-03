@@ -2955,7 +2955,6 @@ fn the_heads_arm_seeks_through_the_raw_form_and_scans_the_same() {
         }
     }
     let before = db.zpage_counts();
-    let touches = db.raw_touches();
     let r = db.reader().unwrap();
     for start in &starts {
         for limit in [1usize, 5, 57, 300] {
@@ -2983,9 +2982,18 @@ fn the_heads_arm_seeks_through_the_raw_form_and_scans_the_same() {
         (before.raw_scans, 0),
         "{after:?}"
     );
-    if cfg!(debug_assertions) {
-        assert!(db.raw_touches() > touches, "the seeks read the raw form");
-    }
+    // The seeks went to the raw form's heads, and read no record: every
+    // key of the partition is one length, so a head is a whole key and
+    // the compare is the heads' too (`OrdIndex::seek_in_exact`); before
+    // that the cut read the record at the rank for the compare.
+    assert!(
+        after.cuts > before.cuts,
+        "the seeks went to the raw form's heads: {after:?}"
+    );
+    assert_eq!(
+        after.cut_records, before.cut_records,
+        "the seeks read no record: {after:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -5240,7 +5240,9 @@ fourteen cold lines a key, 1-2 ms for a thousand keys over ten thousand,
 and sorted the batch through the arena, a millisecond for five thousand.
 
 The segment work takes the ranks and the pieces' bounds before it
-publishes now (`Maint::rank_before_publish`), at a seal's landing, a
+publishes now (`Maint::rank_before_publish`; the ranks are an arm's
+since, `Options::piece_ranks_whole`, under "against LMDB with its
+readahead off" below), at a seal's landing, a
 merge's, a piece merge's and a promotion's, and the extension orders its
 batch by prefix words and walks the run where the batch is dense in it,
 galloping where it is sparse. Through the probe, the landing's scan at
@@ -6374,6 +6376,61 @@ has 371 KB a scan read by background threads; neither count says why,
 and the candidates, untested, are the seek into the burst's piece, which
 has no ordered index and binary-searches its records, and the merge the
 burst starts streaming the store while the pass runs.
+
+Neither candidate was the pass's first half, and the second was its
+second. Timed scan by scan under the bound (`SUPDB_SCAN_OPS`, the
+`lagops` line) beside the device's and the group's counters over the
+pass (`lagdev`), the full-rewrite pass of 50-54 s over ten thousand
+scans was a first scan of 18.5-19.8 s, one tenth of 17 s in its middle,
+and eight tenths of 1.5-1.8 s around a median scan of 1.5 ms, with
+8.1-8.6 GB read from the device. The first scan was the writer's rebase
+ranking every piece standing against its partition whole
+(`BuildCtx::rank_pieces`): the burst's landings had been far from reads
+and took no ranks (`Options::land_ranks_far`), three to four hundred
+pieces stood, and ranking them read every piece's records through major
+faults, half the device's bytes of the pass; the middle tenth was the
+same ranking again, at the first scan after the merge's landing, every
+piece re-ranked against the partitions the merge had rewritten. Nobody
+ranks a piece whole now (`Options::piece_ranks_whole`, off;
+`supdb-rankswhole` and `supdb-ingestrankswhole` do, the segment work at
+a landing near reads and a reader that meets a piece without them): a
+build finds each piece key's cut where its walk of the partition stops
+at the key, or by one seek over the block's heads where it does not
+walk, the path every build took for a piece without ranks. The first
+version of that cost the ten-percent pass a quarter to two fifths more
+major faults than the ranks had: the cut's compare read the partition's
+record at the cut, a page a sparse build touches for nothing else, for
+an answer the ordered index's heads have wherever a head is a whole key
+(`OrdIndex::seek_in_exact`); the heads answer it now, and the sweep's
+1.6 million cuts read no record (`cut_asks`, `cut_record_reads`). Paired
+at ten million keys under 1.25 GiB, two sittings of a warmup and a pair
+each, `supdb` against `supdb-rankswhole` (`bench ab --arms
+supdb,supdb-rankswhole --size 10000000 --bound 1342177280 --passes
+load,lag --ops-div 10 --reps 1`, under `SUPDB_SCAN_OPS=1` and
+`SUPDB_LAG_COUNTERS=1`): the full-rewrite pass 18.8-19.7 s against
+49.6-52.8 in every sweep, its first scan 111-120 ms against 18.5-19.4 s,
+the device's reads over it 3.9-4.4 GB against 8.1-8.6, the cell 2.6x
+and 2.8x; the ten-percent point's first scan 47-61 ms against 460-865,
+and its pass 3.4-3.7 s against 3.4-4.8 with the compare on the heads
+where it had read 4.0-4.4 against 3.8 with the compare on the records;
+the one-percent point, whose pass is the first scan settling the burst,
+and the drained scans level. In core the two arms run the same code
+wherever no piece stands, which is every drained pass -- `cut_asks`
+reads zero over the whole sweep at a hundred and three hundred thousand
+keys -- and the pairings there, twelve pairs a sitting in both orders,
+disagree in sign between the sittings on every cell that moved, nothing
+marked in both: the 300k sittings read the drained scan pass 1.09x for
+the whole arm twice, one marked, over a store with no piece at that pass
+(`pieces` 0 after the load) and with the two arms' per-scan medians
+interleaved (`scanops`, 2.6-3.3 us against 2.9-3.4), which is the
+position effect and not the arm. What the full-rewrite pass still is: a
+scan of a hundred keys over a store rewritten in random order finds its
+keys in as many pieces, some 35 major faults a scan at the device's
+latency, while the merge that folds the pieces away streams its inputs
+twice -- once for its slices and once for their values -- through a
+cache that cannot hold them, 3.9-4.4 GB read over a pass of 19 s; the
+cell reads 0.2x of LMDB's where it read 0.07x, and the merge's reads are
+the next lever.
 
 #### Out of core: the second form
 

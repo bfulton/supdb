@@ -489,6 +489,11 @@ pub struct Supdb {
     /// landing did (`Options::land_ranks_far`). `supdb-ingestranksfar`,
     /// and `supdb-ranksfar` durable.
     ranksfar: bool,
+    /// The pieces ranked whole against their partitions, by the segment
+    /// work near reads and by a reader that meets a piece without ranks
+    /// (`Options::piece_ranks_whole`). `supdb-ingestrankswhole`, and
+    /// `supdb-rankswhole` durable.
+    rankswhole: bool,
     /// A seal writes every key through the writer's general path, as
     /// before the one-value path (`Options::seal_put_one` off).
     /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
@@ -1173,6 +1178,11 @@ struct Policy {
     /// landing did (`Options::land_ranks_far`). `supdb-ingestranksfar`,
     /// and `supdb-ranksfar` durable.
     ranksfar: bool,
+    /// The pieces ranked whole against their partitions, by the segment
+    /// work near reads and by a reader that meets a piece without ranks
+    /// (`Options::piece_ranks_whole`). `supdb-ingestrankswhole`, and
+    /// `supdb-rankswhole` durable.
+    rankswhole: bool,
     /// A seal writes every key through the writer's general path, as
     /// before the one-value path (`Options::seal_put_one` off).
     /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
@@ -1691,6 +1701,7 @@ impl Default for Policy {
             nodrainsnap: false,
             sealcopyfar: false,
             ranksfar: false,
+            rankswhole: false,
             sealrun: false,
             closeinline: false,
             timers: false,
@@ -3181,6 +3192,34 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 ranksfar: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose pieces are ranked whole against their partitions --
+    /// by the segment work near reads and by a reader that meets a piece
+    /// without ranks -- as every arm's were before the cuts were found at
+    /// the builds (`Options::piece_ranks_whole`): against `supdb` it
+    /// prices the whole ranking.
+    pub fn create_rankswhole(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                rankswhole: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` whose pieces are ranked whole, as `supdb-rankswhole`.
+    pub fn create_ingest_rankswhole(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                rankswhole: true,
                 ..Policy::default()
             },
         )
@@ -5671,6 +5710,7 @@ impl Supdb {
             nodrainsnap,
             sealcopyfar,
             ranksfar,
+            rankswhole,
             sealrun,
             closeinline,
             timers,
@@ -5944,6 +5984,7 @@ impl Supdb {
             drain_snapshot: !nodrainsnap,
             seal_snapshot_far: sealcopyfar,
             land_ranks_far: ranksfar,
+            piece_ranks_whole: rankswhole,
             seal_put_one: !sealrun,
             close_finish_inline: closeinline,
             upkeep_wake_parked: wake,
@@ -6195,6 +6236,7 @@ impl Supdb {
             nodrainsnap,
             sealcopyfar,
             ranksfar,
+            rankswhole,
             sealrun,
             closeinline,
             timers,
@@ -6849,6 +6891,13 @@ impl Engine for Supdb {
                 "supdb-ingestranksfar"
             };
         }
+        if self.rankswhole {
+            return if self.partition {
+                "supdb-rankswhole"
+            } else {
+                "supdb-ingestrankswhole"
+            };
+        }
         if self.sealrun {
             return if self.partition {
                 "supdb-sealrun"
@@ -7374,6 +7423,8 @@ impl Engine for Supdb {
             ("zpage_inplace_groups", z.inplace_groups as f64),
             ("zpage_rawserves", z.rawserves as f64),
             ("zpage_fallbacks", z.fallbacks as f64),
+            ("cut_asks", z.cuts as f64),
+            ("cut_record_reads", z.cut_records as f64),
             ("zpage_nopage_reads", z.nopage_reads as f64),
             ("zpage_scans", z.scans as f64),
             ("zpage_scan_groups", z.scan_groups as f64),
@@ -8214,6 +8265,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nodrainsnap"
         | "supdb-sealcopyfar"
         | "supdb-ranksfar"
+        | "supdb-rankswhole"
         | "supdb-sealrun"
         | "supdb-closeinline"
         | "supdb-timers"
@@ -8309,6 +8361,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestnodrainsnap"
         | "supdb-ingestsealcopyfar"
         | "supdb-ingestranksfar"
+        | "supdb-ingestrankswhole"
         | "supdb-ingestsealrun"
         | "supdb-ingestcloseinline"
         | "supdb-ingesttimers"
@@ -8640,6 +8693,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestsealcopyfar" => Box::new(Supdb::create_ingest_sealcopyfar(dir)?),
         "supdb-ranksfar" => Box::new(Supdb::create_ranksfar(dir)?),
         "supdb-ingestranksfar" => Box::new(Supdb::create_ingest_ranksfar(dir)?),
+        "supdb-rankswhole" => Box::new(Supdb::create_rankswhole(dir)?),
+        "supdb-ingestrankswhole" => Box::new(Supdb::create_ingest_rankswhole(dir)?),
         "supdb-sealrun" => Box::new(Supdb::create_sealrun(dir)?),
         "supdb-ingestsealrun" => Box::new(Supdb::create_ingest_sealrun(dir)?),
         "supdb-closeinline" => Box::new(Supdb::create_closeinline(dir)?),

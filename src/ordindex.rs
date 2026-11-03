@@ -609,12 +609,34 @@ impl OrdIndex {
         key: &[u8],
         key_at: impl Fn(usize) -> Option<&'a [u8]>,
     ) -> usize {
+        self.seek_in_exact(lo, hi, key, key_at).0
+    }
+
+    /// `seek_in`, and whether the key at the rank it answers is `key`
+    /// where the heads can say: `Some(true)` for the key itself;
+    /// `Some(false)` for a rank whose head differs from the query's, for
+    /// one that ties it where a head is a whole key and the query is not
+    /// that key, and for `hi`; `None` where only the record could say,
+    /// which the caller then reads. A block's build asks this for each
+    /// overlay key's cut and read the record at the cut for the compare
+    /// the emit needs, a page a sparse build touches for nothing else:
+    /// under a bound a major fault per overlay key, a quarter more faults
+    /// over the ten-percent lag pass at ten million keys, for an answer
+    /// the heads had.
+    pub fn seek_in_exact<'a>(
+        &self,
+        lo: usize,
+        hi: usize,
+        key: &[u8],
+        key_at: impl Fn(usize) -> Option<&'a [u8]>,
+    ) -> (usize, Option<bool>) {
         let hi = hi.min(self.n);
         if lo >= hi {
-            return hi;
+            return (hi, Some(false));
         }
         // A query without the common prefix is below or above every key,
-        // as `seek` decides it; below is `lo` here, above is `hi`.
+        // as `seek` decides it; below is `lo` here, above is `hi`, and
+        // neither rank's key is the query.
         if self.pfx > 0 {
             let m = self.pfx.min(key.len());
             let learned = self.prefix.as_deref();
@@ -622,14 +644,14 @@ impl OrdIndex {
                 Some(p) => p,
                 None => match key_at(0) {
                     Some(k) => k,
-                    None => return lo,
+                    None => return (lo, Some(false)),
                 },
             };
             let m = m.min(first.len());
             match cmp_short(&key[..m], &first[..m]) {
-                std::cmp::Ordering::Less => return lo,
-                std::cmp::Ordering::Greater => return hi,
-                std::cmp::Ordering::Equal if m < self.pfx => return lo,
+                std::cmp::Ordering::Less => return (lo, Some(false)),
+                std::cmp::Ordering::Greater => return (hi, Some(false)),
+                std::cmp::Ordering::Equal if m < self.pfx => return (lo, Some(false)),
                 std::cmp::Ordering::Equal => {}
             }
         }
@@ -644,13 +666,19 @@ impl OrdIndex {
             }
         }
         if a >= hi || self.head(a) != h {
-            return a;
+            // No head in the window ties the query: a head is a function
+            // of its key's bytes, so the key at `a`, if the window has
+            // one, is not the query.
+            return (a, Some(false));
         }
         if let Some(len) = self.uniform_len {
+            // A head is a whole key: a query of the keys' length that ties
+            // one is that key, a shorter one a proper prefix of it, and a
+            // longer one is above every key with this head.
             return if key.len() <= len {
-                a
+                (a, Some(key.len() == len))
             } else {
-                self.run_end(h, a).min(hi)
+                (self.run_end(h, a).min(hi), Some(false))
             };
         }
         let (mut a, mut b) = (a, self.run_end(h, a).min(hi));
@@ -661,7 +689,7 @@ impl OrdIndex {
                 _ => b = m,
             }
         }
-        a
+        (a, if a >= hi { Some(false) } else { None })
     }
 
     /// The end of the run of heads equal to `h` that starts at `from`.
@@ -1049,6 +1077,72 @@ mod tests {
             );
         }
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// `seek_in_exact` answers `seek_in`'s rank, which is the window's
+    /// lower bound, and says whether the key at it is the query wherever
+    /// the heads can: always over keys of one length, and never wrongly
+    /// over keys of two lengths whose heads tie, where it leaves the
+    /// records to say.
+    #[test]
+    fn the_windowed_seek_says_whether_its_rank_is_the_key() {
+        let uniform: Vec<Vec<u8>> = (0..300u32)
+            .map(|i| format!("k{:08}", i * 7).into_bytes())
+            .collect();
+        let mut mixed = uniform.clone();
+        for i in (0..300u32).step_by(5) {
+            for j in 1..=3u32 {
+                mixed.push(format!("k{:08}{:08}", i * 7, j).into_bytes());
+            }
+        }
+        for (name, mut keys) in [("uniform", uniform), ("mixed", mixed)] {
+            keys.sort();
+            keys.dedup();
+            let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+            let p = write(&build(&refs), &format!("seek-in-exact-{name}"));
+            let idx = OrdIndex::open(&p, refs.len()).expect("opens");
+            assert_eq!(idx.uniform_len.is_some(), name == "uniform", "{name}");
+            let n = refs.len();
+            let mut probes: Vec<Vec<u8>> = keys.clone();
+            probes.extend(keys.iter().map(|k| [k.as_slice(), b"+"].concat()));
+            probes.extend(keys.iter().map(|k| k[..k.len() - 1].to_vec()));
+            probes.extend([b"a".to_vec(), b"zzz".to_vec(), b"k0".to_vec(), Vec::new()]);
+            let mut said = 0usize;
+            let mut left = 0usize;
+            for lo in (0..=n).step_by(23) {
+                for hi in (lo..=n).step_by(41).chain([n, lo]) {
+                    for q in &probes {
+                        let (r, exact) = idx.seek_in_exact(lo, hi, q, resolver(&refs));
+                        let want = lo + refs[lo..hi].partition_point(|k| *k < q.as_slice());
+                        let q = String::from_utf8_lossy(q);
+                        assert_eq!(r, want, "{name}: [{lo}, {hi}) {q}");
+                        assert_eq!(
+                            r,
+                            idx.seek_in(lo, hi, q.as_bytes(), resolver(&refs)),
+                            "{name}: [{lo}, {hi}) {q}: the two seeks agree"
+                        );
+                        let is = r < hi && refs[r] == q.as_bytes();
+                        match exact {
+                            Some(e) => {
+                                said += 1;
+                                assert_eq!(e, is, "{name}: [{lo}, {hi}) {q}");
+                            }
+                            None => {
+                                left += 1;
+                                assert_eq!(name, "mixed", "[{lo}, {hi}) {q}: whole heads say");
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(said > 0, "{name}: the heads said something");
+            assert_eq!(
+                left > 0,
+                name == "mixed",
+                "{name}: ties left to the records"
+            );
+            let _ = std::fs::remove_file(&p);
+        }
     }
 
     /// `seek_exact_from` answers as `seek_exact` does from every rank,

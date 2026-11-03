@@ -82,7 +82,13 @@ error but the linker: `ld terminated with signal 7 [Bus error]` on the
 bench group's three RocksDB-sized links, with `df` still showing gigabytes
 free. A scratch directory of old bench binaries at a third of a gigabyte
 each is where the allowance went; delete those before reading the link
-failure as anything else. On a box other runs share, give each
+failure as anything else. The stores of pairings killed before their end
+are the other sink: `bench ab` keeps its store under
+`$TMPDIR/supdb-ab-<pid>` and removes it at its exit alone, so five
+bounded pairings at ten million keys killed after their first sweep left
+ten gigabytes, and the sixth died at its second load with `No space left
+on device`. Remove them by name after a kill; a glob over `/tmp` takes
+other processes' stores with them. On a box other runs share, give each
 run a `TMPDIR` of its own and clean that: the glob takes every process's
 stores, and a run whose store another run's cleanup removed mid-test
 fails with a bare `NotFound` from whatever file operation came next --
@@ -636,7 +642,21 @@ median: a pass of a hundred scans at the smallest rung is a few hundred
 microseconds, and a first scan that builds what the pass needs once is a
 share of it no rate shows. Its median prints to the nanosecond: printed
 to the tenth of a microsecond it hid a fifty-nanosecond move behind four
-sittings of pairs, and the move was read off the pass sums instead. Read a thread's
+sittings of pairs, and the move was read off the pass sums instead. Under
+the same variable the lag sweep prints a `lagops` line per point -- the
+first four scans, the median and the longest, the pass in tenths, and
+the thread's CPU and context switches beside its wall -- and
+`SUPDB_LAG_COUNTERS=1` a `lagdev` line beside `lagcounters`, the pass's
+device and group side: bytes read and written at the device and by the
+process, and the group's faults, refaults, dirty pages and cache. The
+two told the full-rewrite pass at ten million keys under a bound apart
+from its rate -- a first scan of nineteen seconds and one tenth of
+seventeen in a pass of fifty, half the device's eight gigabytes under
+them -- where the row's own quantities for the point, bytes read by
+background threads and major faults per operation, read 371 KB and
+zero: the first counts the merge's reads as the pass's, and the second
+is blind to a fault on a page the cache holds and has not read yet,
+which the kernel counts as minor. Read a thread's
 passes per rep there before reading its cell: a thread that ran in
 two reps of five made a cell that read neither shape.
 
@@ -3093,6 +3113,29 @@ bytes are read as anyone's; the owner of retained memory is named
 fastest by changing the allocator's policy for one run and reading the
 difference; and a quantity taken out of a kernel count is itself read
 from the kernel, since a page mapped is not a page resident.
+
+**A cache taken whole for a reader who wanted a few of its entries, and
+the fallback that read a page per entry.** A level-0 piece's ranks
+against its partition -- every key's cut, in one walk, kept on the piece
+-- were taken whole by whoever first needed one: the segment work before
+a landing near reads, and otherwise the reader whose table met the
+piece. Under a bound the full rewrite at ten million keys landed three
+to four hundred pieces far from reads, and the first scan after it
+ranked them all through major faults for nineteen seconds, with the
+first scan after the merge's landing ranking them again against the
+rewritten partitions for seventeen, in a pass of fifty; in core the same
+walk is milliseconds, and no row showed it. Nobody ranks a piece whole
+now (`Options::piece_ranks_whole`), and a build finds the cut where its
+walk stops at the key, the path a piece without ranks always took. That
+path then cost the ten-percent pass a quarter more faults than the ranks
+had: the cut's compare read the partition's record at the cut, a page
+the sparse build touched for nothing else, for an answer the ordered
+index's heads had wherever a head is a whole key
+(`OrdIndex::seek_in_exact`). The rule: a derived table over a source is
+taken for the entries a reader asks for, in the reader's order, or not
+at all, since a whole-table pass costs the source's size however few
+entries are read; and a fallback priced in core is priced again by its
+pages under a bound, where a line touched for a compare is a fault.
 
 ## Standing limitations
 
