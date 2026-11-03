@@ -809,6 +809,16 @@ where the eye lands first, and remove anything the reader would not miss.
 Every figure is SVG, drawn from `runs/` by one program, so a figure that
 disagrees with the data is a bug in that program and not a stale file.
 
+The set it draws is committed under `docs/figures/<scale>/<class>/`, with
+`latest/` a copy of the newest row's class so the README can embed a
+figure by a path that survives a change of host, and the checks hold the
+committed set to the rows: `bench/scripts/figures.sh --check` (the
+`figures` group) draws the set again and fails where the committed one
+differs, so a committed figure is never older than its rows and never
+edited by hand. A row's banking commit redraws them
+(`sh bench/scripts/figures.sh`), and a change to the renderer redraws
+every one, which is the diff that shows what the change did.
+
 ## Machines
 
 The series is columns, one per class. Nothing is the canonical machine. A

@@ -452,3 +452,18 @@ built, which here is this directory, so the engine's release profile is
 repeated in `Cargo.toml` and cargo warns on every build that it is ignoring
 the engine's -- the warning is expected, the repetition is what keeps the
 measured engine the shipped one.
+
+**A picture in a document is a figure that cannot go stale.** The README
+carries three of the suite's figures, and the whole set is committed under
+`docs/figures/`, which breaks the rule that a figure is drawn and never
+stored -- unless the stored copy is held to its source the way a formatted
+file is held to the formatter. `bench/scripts/figures.sh --check` draws the
+set from `runs/` again and fails where the committed set differs, in the
+`figures` group every check run and CI run takes; a banked row's commit
+redraws the set, and a renderer change redraws every figure, which is the
+diff that reviews it. The renderer is a function of the rows alone, no
+clock and no host in it but what the row records, and its test draws the
+same rows twice and holds the bytes equal, since a check that compares a
+drawing to a redrawing is only as good as the drawing's determinism. The
+rule: a derived file may be committed when a check regenerates it and
+fails on a difference, and never otherwise.

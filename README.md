@@ -34,8 +34,21 @@ from the committed rows, and `bench gate` fails a change whose row is worse
 than the last ten of its machine class. [`bench/DESIGN.md`](bench/DESIGN.md)
 is the specification.
 
-What the curves show is in the figures `bench figures` draws from the
-committed rows; a summary in words goes stale with the next row.
+What the curves show is in the figures, drawn from the committed rows into
+[`docs/figures/`](docs/figures/) and held to them by the checks; a summary
+in words goes stale with the next row. Three of them, from the newest row of
+each scale, on the host class each figure names:
+
+![Point reads across the ladder, durable](docs/figures/full/latest/full-read-reads_per_s-durable.svg)
+
+![Shuffled loads across the ladder, durable](docs/figures/full/latest/full-load-shuffled-ops_per_s-durable.svg)
+
+![Point reads under a memory bound, where both engines leave core](docs/figures/ooc/latest/ooc-read-reads_per_s-durable.svg)
+
+The bounded figure's title reads the default arm; the arm with the compact
+form the controller builds (`supdb-autozpages`) is the curve above it, and
+the rest of the set, every workload and option, is under `docs/figures/`
+by scale and machine class.
 
 ## Usage
 
