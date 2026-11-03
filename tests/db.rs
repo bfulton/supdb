@@ -12815,6 +12815,13 @@ fn an_ordered_tail_handed_at_sync_is_promoted_beside_the_partition() {
         merges_before,
         "promoted by link, not merged"
     );
+    // The landing retires the piece's and the old partition's files after
+    // it has published the state the wait above read and written the
+    // manifest; a settle joins the segment work, so the listing is of the
+    // directory the landing leaves and not of the moment the state moved
+    // (thirty milliseconds after it, the files were still there on a
+    // loaded runner).
+    db.settle().unwrap();
     let names = sup_files(&d);
     assert!(
         names.len() == 2 && names.iter().all(|nm| nm.starts_with("par-")),
