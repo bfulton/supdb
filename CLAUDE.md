@@ -819,9 +819,13 @@ there the burst gained a third while its scans after lost two thirds.
 It is the pipeline's depth too: paced a batch deep, every batch was a
 pass of the thread's, whose fixed part doubled the thread's cost a batch
 at three million keys, and the sweep's weighted sum read a third worse
-than lending at a million. `supdb-ingestlendbursts` is the arm that
-lends every batch and `supdb-ingestnopace` the one that files every
-batch.
+than lending at a million; and a thread gathering half the share before
+a pass, for longer passes while the writer ran ahead, read level, since
+the trailing thread took several batches a pass already and the share
+bounds the trail that lending's long passes amortise, so a lever on a
+pass's length is read against the passes counted before it is built.
+`supdb-ingestlendbursts` is the arm that lends every batch and
+`supdb-ingestnopace` the one that files every batch.
 One thread holds it at a time, and one word says which:
 every hand-over is a single operation on that word, the side giving it
 up fills the cell before it and the side taking it empties the cell

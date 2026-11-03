@@ -2429,7 +2429,18 @@ pub struct Options {
     /// fixed part -- the log read, the snapshot moved, the bounds walked
     /// -- that doubled the thread's cost a batch at three million keys
     /// and read the sweep's weighted sum a third worse than lending at a
-    /// million. The first batch after a scan stays in the commit because
+    /// million. The thread gathering half the share before a pass, for
+    /// longer passes while the writer ran ahead, read level and is not
+    /// kept: the thread trails the writer and takes what it finds, so
+    /// its passes over a full rewrite held four batches at a million
+    /// keys and fourteen at three million already, the gather made them
+    /// five and fifteen, and a gather of the whole share would idle the
+    /// thread while the writer fills to it and then hold the writer for
+    /// the pass. The trail the share bounds is what lending's passes of
+    /// hundreds of batches amortise -- the fixed part, and a visit a
+    /// block a pass -- and only a longer trail, which is the first
+    /// scan's wait, buys it (`docs/engine.md`). The first batch after a
+    /// scan stays in the commit because
     /// a burst of one commit with scans at once behind it, the lag
     /// sweep's bursts at the small rungs, gains nothing from a thread
     /// that has to be woken and whose pass the first scan then waits
@@ -31490,6 +31501,9 @@ impl Db {
         // `Options::upkeep_inline_min` for where "worth waking for" is
         // drawn.
         let mut pace = false;
+        // The share of the store's keys a paced batch is within and the
+        // thread may trail by (`Options::upkeep_pace_pct`).
+        let share = (keys as u64).saturating_mul(self.opts.upkeep_pace_pct as u64) / 100;
         if level == 1
             && self.opts.upkeep_inline_bursts
             && !syncs
@@ -31498,12 +31512,9 @@ impl Db {
         {
             // The first such batch after a scan is filed here, and so is
             // one over the share of the store the first scan's wait is
-            // measured against; the rest are lent and paced a batch
-            // behind the thread (`Options::upkeep_pace_pct`), the hand
-            // set once the batch is lent below.
-            let within_share = (batch as u64).saturating_mul(100)
-                <= (keys as u64).saturating_mul(self.opts.upkeep_pace_pct as u64);
-            if !within_share || self.upkeep_since_scan == 0 {
+            // measured against; the rest are lent and paced behind the
+            // thread, the hand set once the batch is lent below.
+            if batch as u64 > share || self.upkeep_since_scan == 0 {
                 self.upkeep_hand = Hand::File;
                 return;
             }
@@ -31630,7 +31641,6 @@ impl Db {
         // the thread at three million keys against 1.5 of filing, and
         // the writer waited for all of it.
         if pace && self.upkeep_hand == Hand::Lend {
-            let share = (keys as u64).saturating_mul(self.opts.upkeep_pace_pct as u64) / 100;
             self.upkeep_hand = Hand::Pace(share.max(batch as u64));
         }
     }

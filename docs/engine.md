@@ -2822,12 +2822,40 @@ patches it a few batches at a time -- and its scans after the tenth and
 the full rewrite run 2-7.8x slower, the residue the first scan settles.
 The share is where the two are traded: the pass in flight the first scan
 waits for is at most a hundredth of the store's fill, and what lending
-saves on the burst past that is what the pace leaves. The lever left
-unpriced is the thread gathering half the share before it begins a pass
-while the writer runs ahead, so its passes are as long as lending's
-while the first scan's wait stays bounded; `Options::upkeep_batch_pct`
-has the gather, gated to every commit and a bound a hold at the same
-size would serialise with.
+saves on the burst past that is what the pace leaves. The lever that
+left, the thread gathering half the share before it begins a pass while
+the writer runs ahead, so that its passes are longer while the first
+scan's wait stays bounded, was built on `Options::upkeep_batch_pct`'s
+gate and priced the same way, eight pairs a sitting at three hundred
+thousand keys and six at a million and three million, both orders, at
+the commit after the option's. It read level: against the inline fill
+0.83x and 0.74x, 0.83x and 0.70x and 0.66x and 0.66x where the pace
+without it read 0.79x and 0.82x, 0.75x and 0.81x and 0.64x and 0.64x;
+against lending 1.26x and 1.28x at a million and 1.39x and 1.30x at
+three million where it read 1.21x and 1.29x and 1.29x and 1.23x; and
+the one-percent burst at three million, thirty batches with a gather of
+fifteen, at 0.6-0.8x of the pace's without it in all four sittings. The
+counters say why it could not gain. The thread trails the writer and
+takes what it finds, so its passes over the full rewrite already held
+4.3 batches at a million keys and 14.5 at three million, 232 and 207
+passes, and the gather made them 5.6 and 15.5, 179 and 193; the fixed
+part those passes cost is three tenths of the thread's time at a
+million keys (232 passes at 2 ms of 1,580) and a ninth at three million
+(207 at 3.2 ms of 5,944), the share bounds the trail at ten and thirty
+batches, so no gather under it reaches lending's eight to ten passes,
+and one of the whole share has the thread idle while the writer fills
+to it and the writer wait the pass out. What lending's passes save
+besides is the visit: a block is visited once a pass for the writes the
+pass holds for it, and over a rewrite each block takes its sixty-four
+writes in about fifty-five visits under the pace against eight to ten
+under lending; the visit is priced by its misses, so the thread's
+per-write work, its time less the fixed parts over the writes, reads
+1.1x lending's at a million keys and 1.6x at three million (1.76 µs a
+write against 1.1). The gather is not kept. The pace's burst is the
+thread's throughput -- the burst reads within a tenth of the thread's
+time at both rungs -- and what is left of it is the fixed part at a
+million keys and the visit at three million, both the thread's own and
+neither profiled.
 
 #### The freeze that leaves its carry to the next look
 
