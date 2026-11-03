@@ -13574,10 +13574,6 @@ struct Shared {
     fit_skips: std::sync::atomic::AtomicU32,
 }
 
-/// The clean pages of `file` that nothing maps dropped from the page cache,
-/// the whole file (`POSIX_FADV_DONTNEED`); a dirty page is written back
-/// first and dropped by a later reclaim. Nothing elsewhere.
-#[cfg(target_os = "linux")]
 /// `POSIX_FADV_DONTNEED` over `len` bytes at `off` of `file`: the clean
 /// pages of that range dropped from the page cache, a mapped page skipped,
 /// which is why `Bytes::advise_dontneed_range` goes first.
@@ -13595,6 +13591,10 @@ fn fadvise_dontneed_range(file: &std::fs::File, off: u64, len: u64) {
 #[cfg(not(target_os = "linux"))]
 fn fadvise_dontneed_range(_file: &std::fs::File, _off: u64, _len: u64) {}
 
+/// The clean pages of `file` that nothing maps dropped from the page cache,
+/// the whole file (`POSIX_FADV_DONTNEED`); a dirty page is written back
+/// first and dropped by a later reclaim. Nothing elsewhere.
+#[cfg(target_os = "linux")]
 fn fadvise_dontneed(file: &std::fs::File) {
     use std::os::unix::io::AsRawFd;
     // SAFETY: an advice over a file descriptor this call holds open; it
