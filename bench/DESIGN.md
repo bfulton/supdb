@@ -285,23 +285,34 @@ store larger than memory, and RocksDB tuned. The bound is chosen so that
 the top rung is out of core for every engine: a store of ten million keys
 is 1.3 GB in LMDB and 1.4 in supdb's raw form, so under 1.5 GiB LMDB's
 fits and supdb's sits at the edge of its budget, and under 1.25 GiB both
-read from the device, which is the regime the second form is for and the
-bound the roster runs under. What sets the bound a row can run under is
-the process's anonymous memory at the lag sweep's full rewrite, not the
-engine's live bytes, and two things set that. The memtables' blocks came
-from the allocator's heap and stayed there when their tables dropped, so
-the default arm held 1.3 GB at that point with the engine holding a
-third, until the engine mapped its blocks from the kernel itself
-(`Options::blocks_mapped`). And the cache arm whose budget counts
-contents (`supdb-cache256`) keeps its budget only where a scan builds a
-block, so the full rewrite builds the whole store's forms and the first
-scan sheds them into the allocator's free lists: two gigabytes of
-anonymous memory for a cache of 256 MB at ten million keys, 1.3 GB of it
-free chunks nothing trims, which a bound of 1.25 GiB kills every time.
-The roster's budgeted cache is the one held to its budget by capacity
-(`supdb-cache256tofit`), which ends the same point under a gigabyte; the
-contents-counted arm stays for the pairing that prices the difference.
-Under 1 GiB the default arm's full rewrite is the next line to find.
+read from the device, which is the regime the second form is for. What
+sets the bound a row can run under is the process's anonymous memory at
+the lag sweep's full rewrite, not the engine's live bytes, and three
+things set that. The memtables' blocks came from the allocator's heap
+and stayed there when their tables dropped, so the default arm held
+1.3 GB at that point with the engine holding a third, until the engine
+mapped its blocks from the kernel itself (`Options::blocks_mapped`). The
+cache arm whose budget counts contents (`supdb-cache256`) keeps its
+budget only where a scan builds a block, so the full rewrite builds the
+whole store's forms and the first scan sheds them into the allocator's
+free lists: two gigabytes of anonymous memory for a cache of 256 MB at
+ten million keys, 1.3 GB of it free chunks nothing trims, which a bound
+of 1.25 GiB kills every time; the roster's budgeted cache is the one
+held to its budget by capacity (`supdb-cache256tofit`), which ends the
+same point under a gigabyte, and the contents-counted arm stays for the
+pairing that prices the difference. And the roster runs its arms in one
+process, which keeps twenty to thirty megabytes of the allocator's
+fragments past each store's trim, so the fifth arm of a rep opens
+0.3 GB above the first; the controller arm, whose own full rewrite
+holds 0.9 GB with a third of it forms shed into the allocator's free
+lists and returned by nothing, was killed there in its second rep under
+1.25 GiB, where it runs four reps alone under the same bound in 0.9.
+So a bounded row at ten million keys runs under 1.5 GiB today, and
+under 1.25 GiB once the runner gives each arm's rep a process of its
+own, or the engine returns what its sheds free while the store runs
+under a bound (`ROADMAP.md`); meanwhile the regime where both engines
+leave core is reached by a pairing (`bench ab --bound`) over the passes
+that hold one store at a time.
 LMDB as it opens by default, which reads every random read past the
 cache with its readahead window, is not in the roster. The
 scan floor's file is written and synced outside the group and dropped

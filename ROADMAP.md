@@ -48,12 +48,21 @@ The suite has to be fair before any of its numbers are quoted.
   form at ten million keys); a row under that bound is the one to bank
   next, and `ZPages::Auto` as the engine's default is the decision after
   it, once the in-core pairing of the two reads level. The bound such a
-  row could run under was set by the allocator's retention and not by
-  the engine's live bytes -- the full rewrite at ten million keys held
-  550 MB of freed memory in glibc's arenas beside 434 in use, and under
-  1.25 GiB the roster was killed there twice -- until the engine took
-  its blocks from the kernel (`Options::blocks_mapped`); the roster
-  under 1.25 GiB and then 1 GiB is the row to bank next.
+  row can run under is set by the process's anonymous memory at the full
+  rewrite and not by the engine's live bytes. The memtables' blocks the
+  allocator kept are mapped from the kernel now (`Options::blocks_mapped`)
+  and the contents-counted cache arm is out of the roster
+  (`bench/DESIGN.md`); what still kills the roster under 1.25 GiB is the
+  one process its arms share, which keeps 20-30 MB of allocator
+  fragments past each store's trim, 0.3 GB by the fifth arm of a rep,
+  under the controller arm's own 0.9 GB at the full rewrite, a third of
+  it forms shed into free lists that nothing returns while the store
+  runs. Two remedies, either of which banks the row: the runner gives
+  each arm's rep a process of its own (`one_pass` re-executed as a
+  child, its samples handed back), or the engine runs its trimmer while
+  the store is under a cgroup bound, where free memory is page cache the
+  store does not have (`Options::forms_to_fit`'s trim, priced in core
+  before it is the default under a bound). Then 1 GiB.
 - [ ] **Match the checksum work, or state it.** RocksDB reads with
   `verify_checksums(false)`, under which it verifies no data block it
   reads, from the file or into its cache. supdb verifies a segment's key
