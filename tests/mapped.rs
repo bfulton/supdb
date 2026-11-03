@@ -46,7 +46,15 @@ fn a_closed_stores_blocks_are_not_resident() {
     db.commit().unwrap();
     db.scan(&key(0), 10, kv(&mut |_, _| {})).unwrap();
     let mapped_open = Db::mapped_bytes() - mapped_before;
+    let resident_open = Db::mapped_resident_bytes();
     let anon_open = anon_resident();
+    // The kernel's count of the blocks' resident pages: no more than the
+    // blocks, and most of them once written through.
+    assert!(
+        resident_open <= Db::mapped_bytes() && resident_open >= 40 << 20,
+        "the blocks' resident pages {resident_open} of {} mapped",
+        Db::mapped_bytes()
+    );
     // The keys and values alone are 46 MB, in blocks of four megabytes;
     // the slabs and the index are more.
     assert!(

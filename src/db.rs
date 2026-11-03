@@ -31228,6 +31228,15 @@ impl Db {
         blocks::mapped_bytes()
     }
 
+    /// The bytes of those blocks the kernel has resident, read from it
+    /// (`mincore`), process-wide: what the resident count the trim reads
+    /// (`Options::trim_by_resident`) takes out, since a mapped page never
+    /// touched is resident nowhere; the mapped bytes whole where the kernel
+    /// cannot be asked.
+    pub fn mapped_resident_bytes() -> usize {
+        blocks::mapped_resident_bytes()
+    }
+
     /// The bytes the trim counts its stride by at this moment, by the
     /// store's option. For a test.
     #[doc(hidden)]
