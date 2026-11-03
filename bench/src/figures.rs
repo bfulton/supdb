@@ -141,13 +141,20 @@ struct Curve {
 /// (workload, quantity, unit, guarantee) -> arm -> points.
 type Groups = BTreeMap<(String, String, String, Guarantee), BTreeMap<String, Vec<Point>>>;
 
+#[derive(Clone, Debug)]
 pub struct Rendered {
     pub path: PathBuf,
     pub title: String,
 }
 
 /// Render every figure for the latest row of `scale` in each class under
-/// `runs/`, into `out/<class-slug>/`. Returns what was written.
+/// `runs/`, into `out/<class-slug>/`, and copy the newest class's set --
+/// the class of the row most recently banked -- into `out/latest/`, so a
+/// document can embed a figure by a path that survives a change of host
+/// (`docs/figures/`, the README). The index lists the classes' own files.
+/// Returns what was written. A function of the rows alone: drawn twice
+/// from the same rows it writes the same bytes, which is what lets the
+/// gate hold a committed set to them (`scripts/figures.sh --check`).
 pub fn render_all(runs: &Path, out: &Path, scale: Scale) -> io::Result<Vec<Rendered>> {
     let dir = runs.join(scale.as_str());
     let mut latest: BTreeMap<String, Row> = BTreeMap::new();
@@ -176,8 +183,28 @@ pub fn render_all(runs: &Path, out: &Path, scale: Scale) -> io::Result<Vec<Rende
     if !written.is_empty() {
         write_index(out, &written)?;
     }
+    if let Some((class, _)) = latest.iter().max_by_key(|(_, r)| r.utc.clone()) {
+        let from = out.join(class.replace('/', "_"));
+        let to = out.join(LATEST);
+        std::fs::create_dir_all(&to)?;
+        for r in written.clone() {
+            if r.path.starts_with(&from) {
+                let name = r.path.file_name().expect("a figure has a file name");
+                let copy = to.join(name);
+                std::fs::copy(&r.path, &copy)?;
+                written.push(Rendered {
+                    path: copy,
+                    title: r.title,
+                });
+            }
+        }
+    }
     Ok(written)
 }
+
+/// The directory under a scale's figures that holds a copy of the newest
+/// class's set.
+pub const LATEST: &str = "latest";
 
 /// The order a figure's curves are drawn in, the first last and so on
 /// top: the arms either roster names, in the rosters' order with the
@@ -734,6 +761,84 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>()
                 .len()
         );
+    }
+
+    /// Two classes' rows under one scale: every class gets its figures, and
+    /// `latest/` holds a byte-identical copy of the newer row's class and
+    /// nothing of the older. Drawn again from the same rows, the same bytes.
+    #[test]
+    fn the_latest_copy_is_the_newest_rows_class_and_the_drawing_is_a_function_of_the_rows() {
+        let root =
+            std::env::temp_dir().join(format!("supdb-next-figlatest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let runs = root.join("runs");
+        let row = |utc: &str, cpu: &str| {
+            let mut machine = crate::env::capture();
+            machine.cpu_model = cpu.to_string();
+            machine.mem_limit_bytes = None;
+            let m = |arm: &str, v: f64| crate::row::Measurement {
+                workload: "read".to_string(),
+                arm: arm.to_string(),
+                guarantee: Guarantee::Durable,
+                size: Some(10_000),
+                quantity: "reads_per_s".to_string(),
+                unit: "reads/s".to_string(),
+                samples: vec![v, v * 1.1, v * 0.9],
+            };
+            Row {
+                utc: utc.to_string(),
+                sha: "0123456".to_string(),
+                rustc: "test".to_string(),
+                scale: Scale::Quick,
+                machine,
+                measurements: vec![m("supdb", 2.0e6), m("lmdb", 1.0e6)],
+            }
+        };
+        let older = row("20260101T000000Z", "Old Host");
+        let newer = row("20260102T000000Z", "New Host");
+        older.write(&runs).unwrap();
+        newer.write(&runs).unwrap();
+        let out = root.join("figs");
+        let written = render_all(&runs, &out, Scale::Quick).unwrap();
+        let latest = out.join(LATEST);
+        let newer_dir = out.join(newer.class().replace('/', "_"));
+        let older_dir = out.join(older.class().replace('/', "_"));
+        assert!(older_dir.is_dir() && newer_dir.is_dir(), "{written:?}");
+        let names = |d: &Path| -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(d)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names(&latest), names(&newer_dir));
+        for n in names(&latest) {
+            assert_eq!(
+                std::fs::read(latest.join(&n)).unwrap(),
+                std::fs::read(newer_dir.join(&n)).unwrap(),
+                "{n} is a copy of the newer class's"
+            );
+            assert!(
+                std::fs::read_to_string(latest.join(&n))
+                    .unwrap()
+                    .contains(&newer.class()),
+                "{n} is stamped with the newer row's class"
+            );
+        }
+        assert!(!std::fs::read_to_string(out.join("index.html"))
+            .unwrap()
+            .contains(LATEST));
+        let again = root.join("figs-again");
+        render_all(&runs, &again, Scale::Quick).unwrap();
+        for n in names(&latest) {
+            assert_eq!(
+                std::fs::read(latest.join(&n)).unwrap(),
+                std::fs::read(again.join(LATEST).join(&n)).unwrap(),
+                "{n}: drawn twice from the same rows, the same bytes"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

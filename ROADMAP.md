@@ -58,12 +58,21 @@ The suite has to be fair before any of its numbers are quoted.
   under the controller arm's own 0.9 GB at the full rewrite, a third of
   it forms shed into free lists that nothing returns while the store
   runs. The runner gives each arm's rep a process of its own now
-  (`Plan::fresh_process`, the bounded scale's default), so the residue
-  is gone from under the bound; the row under 1.25 GiB is the one to
-  bank. The engine's own lever is left: its trimmer running while the
+  (`Plan::fresh_process`, the bounded scale's default), and the roster's
+  row under 1.25 GiB is banked (`bench/runs/ooc/`, at `5bf1f88`, by
+  `sh bench/scripts/ooc.sh 1342177280`). Where both engines leave core
+  at ten million keys the controller arm reads level with LMDB's
+  readahead-off configuration on one thread and 1.7x on three, scans
+  1.3x, the read-heavy mixes 1.3-2x and the update mixes 4x, at a tenth
+  of its major faults a read, while the raw form reads 0.2-0.5x. What
+  the row leaves: `ZPages::Auto` as the engine's default once its
+  in-core cost on the point-read mixes is named; the lag points under
+  the bound, where the controller arm's ten-percent point reads 0.3x and
+  every arm's full-rewrite point 0.03x, the latter the merge's streaming
+  of a store rewritten whole; the engine's trimmer running while the
   store is under a cgroup bound, where free memory is page cache the
   store does not have (`Options::forms_to_fit`'s trim, priced in core
-  before it is the default under a bound). Then 1 GiB.
+  before it is the default under a bound); and 1 GiB.
 - [ ] **Match the checksum work, or state it.** RocksDB reads with
   `verify_checksums(false)`, under which it verifies no data block it
   reads, from the file or into its cache. supdb verifies a segment's key

@@ -64,7 +64,7 @@ for g in $groups; do
       ;;
     bench)
       say "bench"
-      sh bench/scripts/check.sh build test lint
+      sh bench/scripts/check.sh build test lint figures
       ;;
     quick)
       say "quick"

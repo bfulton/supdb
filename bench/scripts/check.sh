@@ -9,6 +9,8 @@
 # test   unit tests, under the release profile with the arithmetic and the
 #        invariants checked -- see [profile.checked] in Cargo.toml
 # lint   clippy -D warnings, rustfmt --check, the shell inside the workflows
+# figures the committed figures under docs/figures/ are what `bench figures`
+#        draws from runs/ (scripts/figures.sh --check)
 # quick  a quick-scale run of every arm, written under runs-ci/ (ignored),
 #        then the gate against runs/ and the figures; proves the runner,
 #        the gate and the renderer work end to end on this host. A timing
@@ -21,7 +23,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-groups="${*:-build test lint quick}"
+groups="${*:-build test lint figures quick}"
 say() { printf '\n== %s ==\n' "$1"; }
 
 for g in $groups; do
@@ -45,6 +47,11 @@ for g in $groups; do
       sh scripts/workflows.sh
       python3 scripts/policy_defaults.py
       ;;
+    figures)
+      say figures
+      cargo build --release --bin bench
+      sh scripts/figures.sh --check
+      ;;
     quick)
       say quick
       cargo build --release --bin bench
@@ -59,7 +66,7 @@ for g in $groups; do
       ./target/release/bench figures --runs runs-ci --out runs-ci/figures --scale quick
       ;;
     *)
-      echo "unknown group: $g (build test lint quick)" >&2
+      echo "unknown group: $g (build test lint figures quick)" >&2
       exit 2
       ;;
   esac
