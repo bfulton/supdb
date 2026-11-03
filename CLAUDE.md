@@ -572,7 +572,15 @@ for the partitions a Zipfian reads, and a search that was instructions
 and L2 hits had no misses for a tree to save. A lever on misses is held to
 the profile of the arm pair, where the symbol it is aimed at loses its
 samples or does not; a pairing resolves nothing under a tenth and an
-instruction count sees no miss.
+instruction count sees no miss. It came again in the settle's resolve
+under the pace: the gallop over the heads for a batch's keys two hundred
+ranks apart put nine tenths of its samples on head loads, so a seek that
+paid one miss into a prefetched stride was built in its place, and kept
+the same tenth of the thread in both arms' profiles -- at 200 ns a key
+over a dozen probes the loads were L2 and L3 hits, which the self time
+divided by the loads had said before anything was built. Price a load by
+the latency the profile's self time over the loads implies, against a
+miss's, before building a lever on the miss.
 
 A pass that reads bimodal across rounds is two shapes, not noise. The
 run keeper's lag pass at ten thousand keys read 2 µs a scan in four

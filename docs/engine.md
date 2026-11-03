@@ -2853,9 +2853,32 @@ per-write work, its time less the fixed parts over the writes, reads
 1.1x lending's at a million keys and 1.6x at three million (1.76 µs a
 write against 1.1). The gather is not kept. The pace's burst is the
 thread's throughput -- the burst reads within a tenth of the thread's
-time at both rungs -- and what is left of it is the fixed part at a
-million keys and the visit at three million, both the thread's own and
-neither profiled.
+time at both rungs -- and the thread's pass under it is profiled against
+lending's (`SUPDB_LAG_MARK=1 perf record -e cpu-clock -F 4000 -k
+CLOCK_MONOTONIC` over `lag_only ARM SIZE 2`, the samples cut to the full
+rewrite's burst window and the `supdb-upkeep` thread, at `18aefe7`). Of
+what the paced thread costs over lending's, 426 ms of 1,850 at a million
+keys and 2,450 of 6,200 at three million, three quarters and two thirds
+are in `settle_each` and `cache_seek_exact`, with the builds and the
+patches level between the arms: the visits, and the resolve. Half of
+`settle_each`'s samples sit on `prefetch_form`'s loop, the next block's
+form fetched whole before its one or two keys are patched into it -- the
+fetch is the visit's price, and the pace makes 5.6 times lending's
+visits -- and the resolve's samples sit on the gallop's head loads. A
+seek that galloped over the index's in-memory top level and then
+searched the one stride the answer lies in, its eight lines asked for at
+once, was built for the resolve and priced against the gallop as an arm
+at three hundred thousand, a million and three million keys, both
+orders, and read level: the symbol kept its tenth of the thread in the
+profile of either arm, 740 of 7,228 samples against 821 of 7,406 at a
+million and 2,767 of 25,855 against 3,064 of 24,843 at three million,
+and no cell resolved in either order. The gallop's probes for a key two
+hundred ranks past the last are a dozen lines, and at 200 ns a key they
+were 15-20 ns apiece, L2 and L3 hits: one miss into a cold stride costs
+what a dozen of them do, and the seek is not kept. What is left of the
+paced burst is the visit, a form's three buffers fetched for a patch that
+reads a few lines of two of them, 5.6 visits a block for lending's one
+under a trail the share bounds.
 
 #### The freeze that leaves its carry to the next look
 
