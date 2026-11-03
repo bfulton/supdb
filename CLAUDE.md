@@ -2653,6 +2653,34 @@ exercises" gave, for a mechanism with two modes: a test of the mechanism
 runs under every mode that reaches it, and the condition at the call
 site is the mechanism's own (the gate) and not the mode's name.
 
+**A hook priced behind its flag, with the gate behind the call.** The
+census hook at every read's and scan's start was a flag inlined into the
+operation and the rest out of line, and the flag said the controller was
+on where the work it guarded ran only under the census gate: a store
+under `Auto` in core is FITS for its life, and every read paid the call,
+the window's copy out of its cell and the gate's load to be sent straight
+back, 56 instructions of a read's 830 by callgrind, the end's hook 38
+more and the form dispatch's own gate check, out of line too, 23 -- 124 a
+read, 15% of a point read's instructions, under a comment that said FITS
+pays "the two loads and branches above and no more", above a copy it was
+below. No pairing could name it: the arm's pairings against the default
+at a hundred and three hundred thousand keys read the point-read mixes
+5-28% slower in three readings of four and level in a fourth, since a mix
+at those rungs is three to fifteen milliseconds and reads in two shapes
+with the host, 3.5 and 5.5 million reads a second within one sitting, so
+the readings were booked as the host's and the default stayed `Off`. The
+hooks test the state they work on now, a window open on the handle or
+the gate away from raw, and the dispatch asks the gate inline: 12
+instructions a read over the default (`bench/examples/read_only.rs` under
+`valgrind --tool=callgrind --collect-atstart=no
+--toggle-collect='<supdb_bench::engines::Supdb as supdb_bench::engines::Engine>::get'`,
+`supdb` against `supdb-autozpages` at 100000). The rule: a hook's inlined
+check tests the condition under which the hook does work, never the
+option that makes the work possible; and a cost "behind a flag" is
+counted under callgrind with the flag on and nothing to do, since a
+pairing resolves nothing under a tenth and a tenth is what the hooks
+cost.
+
 **A build priced by its class and limited by its window.** Under a
 bound the controller's build of a store's form files took 136-196 s of
 wall for 8-22 s of CPU, and the note that first timed it blamed the idle
