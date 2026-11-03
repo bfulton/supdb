@@ -2966,6 +2966,33 @@ pub struct Options {
     /// file serves. Off, `supdb-noheadwillneed` and
     /// `supdb-ingestnoheadwillneed`.
     pub heads_willneed: bool,
+    /// A merge's landing plans the next merge while reads are around -- a
+    /// scan since the last landing -- as a seal's durable landing plans
+    /// one (`Maint::collect`): the planner ran at a seal's landing alone,
+    /// so after a burst's last seal the pieces it left stood for as long as
+    /// nothing wrote, the whole of a read pass under a bound, 336 of them
+    /// at the full rewrite of ten million keys under 1.25 GiB, seventeen a
+    /// range, a page of each in every block's build, with one merge in
+    /// flight and nothing to start the next. A write-only stretch keeps
+    /// its seals' plans: chained through a burst as well, the merges ran
+    /// beside the burst's writes and the burst paid a seventh. The chain
+    /// plans at the base trigger (`l0_trigger`) and not the one reads
+    /// lower, which paces the seals' plans and gave a chain no pace: it
+    /// rewrote partitions to fold a piece or two each while the
+    /// ten-percent pass read, a quarter slower for it. Off, a landing
+    /// plans nothing: `supdb-nomergechain` and `supdb-ingestnomergechain`.
+    pub merge_chains: bool,
+    /// The most bytes of partitions one merge rewrites, under
+    /// `merge_chains`: the due ranges are taken in key order up to it, at
+    /// least one, and the rest wait for the next plan, so a store out of
+    /// core lands a range or a few at a time where one merge over every
+    /// due range landed them all at once at its end -- chained without a
+    /// cap, the pass after a full rewrite met the same 336 pieces as
+    /// without the chain, the one merge in flight through the whole of it.
+    /// Zero takes every due range: `supdb-mergeuncapped` and
+    /// `supdb-ingestmergeuncapped`. A wide piece's ranges stay one merge
+    /// whatever the cap (`Maint::cover_inputs`).
+    pub merge_bytes_cap: u64,
     /// A seal writes a key whose chain holds one value and no tombstone
     /// -- every key of a load, and most of any table -- through the
     /// writer's one-value path (`SegmentWriter::put_one`), the record
@@ -3569,6 +3596,8 @@ impl Default for Options {
             pieces_willneed: true,
             blocks_willneed: true,
             heads_willneed: true,
+            merge_chains: true,
+            merge_bytes_cap: 64 << 20,
             seal_put_one: true,
             close_presync: true,
             ord_durable: false,
@@ -11999,6 +12028,8 @@ struct SealCounts {
     publishes: AtomicU64,
     seal_ns: AtomicU64,
     merge_ns: AtomicU64,
+    merges: AtomicU64,
+    plans: AtomicU64,
     held_landings: AtomicU64,
     /// The seal thread's phases, summed over seals: the sort of the frozen
     /// table, the snapshot's build and publish, and the record loop.
@@ -12045,6 +12076,8 @@ impl SealCounts {
             joins: get(&self.joins),
             publishes: get(&self.publishes),
             held_landings: get(&self.held_landings),
+            merges: get(&self.merges),
+            plans: get(&self.plans),
             seal_sort_ns: get(&self.seal_sort_ns),
             seal_snap_ns: get(&self.seal_snap_ns),
             seal_records_ns: get(&self.seal_records_ns),
@@ -12078,6 +12111,11 @@ pub struct SealWaits {
     /// landing writes the manifest. One per look, so a merge held across
     /// several polls counts several.
     pub held_landings: u64,
+    /// Partition merges landed, and the plans landings made: a seal's
+    /// durable landing plans the merges the landed set makes due, and so
+    /// does a merge's own under `Options::merge_chains`.
+    pub merges: u64,
+    pub plans: u64,
     /// The seal thread's phases, summed over seals: sorting the frozen
     /// table, building and publishing its snapshot (`Options::seal_snapshot`),
     /// writing the records, and the thread's whole run.
@@ -34170,6 +34208,11 @@ struct Maint {
     /// seals start waits for the next seal, since a store that has stopped
     /// sealing would otherwise never see it.
     flush_merge: bool,
+    /// The store's scan life at the last landing's plan (`Shared::scans_life`
+    /// and `scans_merged`): a merge's landing plans the next merge only
+    /// where the life has moved since, reads around now
+    /// (`Options::merge_chains`).
+    chain_life: u64,
     /// WAL files whose records no segment has been *named* as covering
     /// yet. One rule governs every one of them: a WAL may be deleted only
     /// after the manifest names a segment that covers its records. The
@@ -34571,6 +34614,33 @@ impl Maint {
         if tiered && done.is_ok() && !between {
             done = self.join_tier();
         }
+        // The merges the landed set makes due, planned here as a seal's
+        // durable landing plans them (`Options::merge_chains`), while reads
+        // are around -- the store's scan life moved since the last landing.
+        // The planner ran at the seals alone, so a store nothing wrote
+        // after a burst kept the burst's pieces for as long as it was read:
+        // under 1.25 GiB at ten million keys the full rewrite's pass met
+        // 336 of them, seventeen a range, with one merge in flight and
+        // nothing to start the next. A write-only stretch keeps its seals'
+        // plans, since merges chained through a burst ran beside its
+        // writes; a settle joins the merge in flight itself and plans
+        // nothing, as before.
+        if (merged || tiered) && done.is_ok() && !between {
+            let life = self.scan_life();
+            let reads = life != self.chain_life;
+            self.chain_life = life;
+            // At the base trigger and not the one reads lower: the lowered
+            // trigger paces the seals' plans, a merge a seal at most, and
+            // a chain at it rewrote partitions of seventy megabytes to fold
+            // one or two pieces each, one after another, while the
+            // ten-percent pass read -- 2.9 major faults a scan against 2.0
+            // with the same pieces standing, the pass a quarter slower.
+            if reads && self.opts.merge_chains && self.opts.compact {
+                let base = self.opts.l0_trigger.max(1);
+                done = self.maybe_compact_at(base).and_then(|()| self.maybe_tier());
+                SealCounts::add(&self.shared.seal_counts.plans, 1);
+            }
+        }
         if let Err(e) = done {
             self.shared.put_maint_err(e);
         }
@@ -34801,6 +34871,7 @@ impl Maint {
             tiering: None,
             sealing: std::collections::VecDeque::new(),
             flush_merge: false,
+            chain_life: 0,
             wake: None,
             shaped_at: 0,
             zbuild: None,
@@ -35277,8 +35348,17 @@ impl Maint {
             self.maybe_compact()?;
             self.maybe_tier()?;
         }
+        self.chain_life = self.scan_life();
+        SealCounts::add(&self.shared.seal_counts.plans, 1);
         self.shape_if_read(true);
         Ok(())
+    }
+
+    /// The store's scan life: the scans the block path served and those it
+    /// did not, the count the seals read reads by (`reads_around`).
+    fn scan_life(&self) -> u64 {
+        self.shared.scans_life.load(AtomicOrdering::Relaxed)
+            + self.shared.scans_merged.load(AtomicOrdering::Relaxed)
     }
 
     fn publish_segs(&mut self, segs: Vec<std::sync::Arc<Seg>>) {
@@ -35732,6 +35812,14 @@ impl Maint {
     /// reads -- or, before the first partitioning, when that many
     /// full-range segments have piled up.
     fn maybe_compact(&mut self) -> Result<()> {
+        let trigger = self.l0_trigger_now();
+        self.maybe_compact_at(trigger)
+    }
+
+    /// `maybe_compact` with the trigger given: a range is due at `trigger`
+    /// pieces. The seals plan at the trigger reads lower
+    /// (`l0_trigger_now`), a chained landing at the base one.
+    fn maybe_compact_at(&mut self, trigger: usize) -> Result<()> {
         // Collect a finished merge BEFORE deciding. Its outputs are the
         // partitions the decision depends on, and deciding first meant
         // deciding against a store that still looked unpartitioned: every
@@ -35765,7 +35853,6 @@ impl Maint {
         // range is due when it holds `l0_trigger` pieces, a piece not
         // aligned to the live ranges selects every range it overlaps, and
         // before the first partitioning the trigger counts every piece.
-        let trigger = self.l0_trigger_now();
         match self.merge_due(trigger) {
             None => {
                 if self.l0_len() >= trigger {
@@ -35785,10 +35872,42 @@ impl Maint {
                 if due.is_empty() {
                     return Ok(());
                 }
+                let due = self.cap_due(due);
                 self.start_compact(Some(due))
             }
             Some(_) => Ok(()),
         }
+    }
+
+    /// The due ranges one merge takes under the landing's plan
+    /// (`Options::merge_bytes_cap`, with `merge_chains`): in key order, the
+    /// partitions' bytes summed up to the cap and at least one range, the
+    /// rest left due for the plan the landing makes. A merge over every due
+    /// range landed all of them at once at its end, and under a bound a
+    /// full rewrite's pass read beside it the whole way. A wide piece's
+    /// ranges stay one merge whatever the cap (`cover_inputs`).
+    fn cap_due(&self, due: Vec<Fence>) -> Vec<Fence> {
+        let cap = self.opts.merge_bytes_cap;
+        if cap == 0 || !self.opts.merge_chains || due.len() <= 1 {
+            return due;
+        }
+        let mut taken: Vec<Fence> = Vec::new();
+        let mut bytes = 0u64;
+        for f in due {
+            let size: u64 = self
+                .segs()
+                .iter()
+                .filter(|s| s.level > 0 && s.lo == f.0 && s.hi == f.1)
+                .filter_map(|s| std::fs::metadata(self.dir.join(&s.name)).ok())
+                .map(|m| m.len())
+                .sum();
+            if !taken.is_empty() && bytes.saturating_add(size) > cap {
+                break;
+            }
+            bytes = bytes.saturating_add(size);
+            taken.push(f);
+        }
+        taken
     }
 
     /// Try to promote the aligned pieces of each of `due`'s ranges instead
@@ -38559,6 +38678,7 @@ impl Maint {
         for name in &inputs {
             self.retire_seg(name);
         }
+        SealCounts::add(&self.shared.seal_counts.merges, 1);
         self.shared
             .seal_counts
             .merge_ns

@@ -6595,6 +6595,62 @@ resolves between the ask and the touch at the sparsest density the dense
 shape admits, not by the pages it covers. In core the gate is raw and
 `head_asks` reads zero through the sweep.
 
+What the pass met after the full-rewrite burst was the burst's pieces, 336
+of them, seventeen a range, a page of each in every block's build (527,000
+piece runs asked for over a sweep, twenty a block), and they stood for the
+whole pass: the planner ran at a seal's durable landing alone
+(`Maint::landed_decisions`), a merge's own landing planned nothing, and one
+merge took every due range, so after the burst's last seal one merge over
+the whole store was in flight, landed all nineteen ranges at once at its
+end, and nothing started another while the pass read. A merge's landing
+plans the next now, while reads are around -- the store's scan life moved
+since the last landing -- and at the base trigger (`Options::merge_chains`;
+`supdb-nomergechain` and `supdb-ingestnomergechain` plan at seals alone),
+and a merge takes the due ranges in key order up to a cap of partition
+bytes, at least one, leaving the rest to the next plan
+(`Options::merge_bytes_cap`, 64 MB, a range at ten million keys;
+`supdb-mergeuncapped` and `supdb-ingestmergeuncapped` take them all), so
+out of core the ranges land one at a time while in core, where a store's
+partitions are megabytes, nothing splits. A settle joins the merge in
+flight and plans nothing, as before; the landings' plans and the merges
+landed are counted (`SealWaits::plans`, `SealWaits::merges`; `merge_plans`
+and `merges_landed` in the suite). Paired at ten million keys under
+1.25 GiB, a warmup and a pair (`bench ab --arms supdb,supdb-nomergechain
+--size 10000000 --bound 1342177280 --passes load,lag --ops-div 10 --reps
+1`): the full-rewrite pass 6.9 s in both rounds against 10.7 and 10.0, 6.2
+major faults a scan against 8.6 and 1.3-1.5 GB read from the device
+against 1.9-3.8, with the burst's rate level (428,000 updates a second
+against 435,000) and 286 pieces standing at the pass against 336, the cell
+1.385x, after 1.33x in the sitting before; the ten-percent point 0.88x on
+a burst 8% slower and a pass faster in one round and slower in the other,
+with the same 24 pieces and the same 3.1 faults a scan in both arms; the
+one-percent point 0.92x, 1.16x in the sitting before; the drained point
+level; the sweep's sum 1.23x. Three shapes were paired before this one,
+the same way, and each taught something the previous had hidden. Chained
+without a cap the pass met the same 336 pieces, the one merge in flight
+through the whole of it, so the cap is what drains them. Capped at 256 MB
+and chained through the burst as well, the pass met 108 to 192 pieces and
+ran 5.3 to 9.5 s against 9.0 to 11.7, but the chained merges ran beside the
+burst's writes and the burst's rate fell a seventh (378,000 against
+433,000), the weighted cell 0.95x with the ten-percent and one-percent
+points 0.93x and 0.95x: so the chain is gated on reads around, and a
+write-only stretch keeps its seals' plans. Gated on reads at the trigger
+reads lower (`l0_trigger_now`), the full rewrite read 1.33x and the
+ten-percent point 0.73x: its pass took 2.9 major faults a scan against 2.0
+with the same 24 pieces standing, the chain rewriting partitions of
+seventy megabytes to fold a piece or two each, one after another, through
+the pass, since that trigger paces the seals' plans, a merge a seal at
+most, and gave a chain no pace. The suite's weighted cell charges the
+burst and the pass and nothing after, so a policy that leaves the pieces
+for later wins both cells and pays in the pass nobody measured: the pieces
+standing at each point are read beside the cells (`pieces` in the lag
+counters). In core the arms run the same code (`bench/scripts/pair.sh supdb
+supdb-nomergechain 100000` and `300000`, twelve pairs a sitting in both
+orders): one and two merges landed in each arm, eleven and thirteen plans
+each, and no cell was marked in either sitting, since the merges land
+under the load with no read around and the partitions fit a merge's cap
+whole.
+
 #### Out of core: the second form
 
 A pairing this section cites is given as the command that reproduces it, `pair.sh A B SIZE [bench ab options]` (`bench/scripts/pair.sh`: `bench ab` over the two arms, one sitting in each order), at the commit it ran at; a binary built at that commit runs it (`BIN=`), and every arm named exists at the head as well. A rerun reproduces the comparison, not the rates, which this host moves by tens of percent between sittings. A count a sentence quotes -- decodes, faults by mix, the controller's events, the census -- was read with the variable before the command set, which turns supdb's own timers on as well, so a rate against a comparator is read from a run without it. Pairings made before this history's root (2026-10-20) cite the root, `18c3a30`, the first commit here that holds their arms. The design the form was built to is `docs/zpages-design.md`.

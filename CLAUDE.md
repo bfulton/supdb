@@ -3196,6 +3196,36 @@ between the ask and the touch and not by the pages it covers, and it is
 read off the faults the walk still takes, since a lead that is short by
 half looks like a lever that half works.
 
+**A planner that ran only where the writes were, and a chain at the pace
+the writes set.** The merge planner ran at a seal's durable landing alone,
+so a store written in a burst and then only read kept the burst's pieces
+for as long as it was read: under 1.25 GiB at ten million keys the pass
+after the full rewrite met 336 of them, seventeen a range, a page of each
+in every block's build, with one merge over every due range in flight and
+nothing to start the next when it landed. Three shapes of the fix each
+taught something the previous had hidden. A merge's landing planning the
+next, with every due range in one merge as before, met the same 336
+pieces: the one merge took the whole pass to run, so the chain never got
+its turn, and a cap on the bytes a merge rewrites is what drained them
+(`Options::merge_bytes_cap`). Chained through the burst as well, the
+merges ran beside the burst's writes and the burst paid a seventh where
+the pass gained; the chain is gated on reads around, a scan since the last
+landing, and a write-only stretch keeps the seals' plans
+(`Options::merge_chains`). And a chain at the trigger reads lower
+(`l0_trigger_now`) rewrote partitions of seventy megabytes to fold a piece
+or two each, one after another, through the ten-percent pass -- 2.9 major
+faults a scan against 2.0 with the same pieces standing, the pass a
+quarter slower -- because that trigger paces the seals' plans, a merge a
+seal at most, and a chain has no such pace; it plans at the base trigger.
+The rules: a background job's planner runs wherever the condition it
+serves can hold, which for the pieces readers walk is while the store is
+read, and not only where the writes happen to call it; a threshold tuned
+for one caller's cadence is retuned for a caller with none; and the
+measure of a merge policy is the pieces a reader meets, read off the pass
+(`pieces` in the lag counters, `merges_landed`, `merge_plans`), beside the
+burst's rate and the pass's together, since a policy that leaves the
+pieces for later wins both cells and pays in the pass nobody measured.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

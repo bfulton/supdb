@@ -622,3 +622,125 @@ fn a_merge_drops_its_inputs_pages_behind_its_second_pass() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// A merge's landing plans the next (`Options::merge_chains`). The planner
+/// ran at a seal's durable landing alone, so a store that was only read
+/// after a burst kept the burst's pieces for as long as it was read: under
+/// a bound the full rewrite's pass met seventeen pieces a range with one
+/// merge in flight and nothing to start the next. A range made due while a
+/// held merge runs is merged by the landing's plan with no write after the
+/// hold is lifted, and stays as it is with the chain off; and the cap on a
+/// merge's bytes (`Options::merge_bytes_cap`) takes two ranges due at once
+/// as two merges, one after the other, where no cap takes them as one.
+#[test]
+fn a_merges_landing_plans_the_next_and_a_cap_lands_a_range_at_a_time() {
+    // (chain, cap, both ranges due at once) -> (pieces left, merges landed).
+    for (chain, cap, at_once, left, merges) in [
+        (true, 0u64, false, 0usize, 2u64),
+        (false, 0, false, 2, 1),
+        (true, 1, true, 0, 2),
+        (true, 0, true, 0, 1),
+    ] {
+        let d = scratch(&format!("merge-chain-{chain}-{cap}-{at_once}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 32 << 10,
+                partition_bytes: Some(32 << 10),
+                l0_trigger: 2,
+                merge_chains: chain,
+                merge_bytes_cap: cap,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let key = |k: u32| format!("key-{k:05}").into_bytes();
+        let mut keys: Vec<Vec<u8>> = (0..3000).map(key).collect();
+        for k in &keys {
+            db.append(k, b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        let fences = partition_fences(&d);
+        assert!(fences.len() >= 3, "partitions: {fences:?}");
+        let (merges0, plans0) = (db.seal_waits().merges, db.seal_waits().plans);
+        // Keys new to a range, between its first two keys: its lower fence
+        // and a suffix sorts above the fence and below every other key.
+        let in_range = |r: usize, round: u32, i: u32| -> Vec<u8> {
+            let (lo, hi) = &fences[r];
+            let k = [lo.as_slice(), format!("-{round}{i:03}").as_bytes()].concat();
+            assert!(k.as_slice() > lo.as_slice(), "{k:?} above {lo:?}");
+            if let Some(h) = hi {
+                assert!(k.as_slice() < h.as_slice(), "{k:?} below {h:?}");
+            }
+            k
+        };
+        // The merge's thread waits before returning while held, so the merge
+        // the second seal's landing plans is in flight through the seals
+        // after it, whose landings find it running and plan nothing.
+        db.hold_merge_landing(true);
+        let rounds: Vec<Vec<usize>> = if at_once {
+            vec![vec![1, 2], vec![1, 2]]
+        } else {
+            vec![vec![1], vec![1], vec![2], vec![2]]
+        };
+        for (round, ranges) in rounds.iter().enumerate() {
+            for &r in ranges {
+                for i in 0..200u32 {
+                    let k = in_range(r, round as u32, i);
+                    db.append(&k, b"n");
+                    keys.push(k);
+                }
+            }
+            db.commit().unwrap();
+            db.seal().unwrap();
+        }
+        // Every seal landed durable and made its plan: the planner's count,
+        // never the clock.
+        let t = std::time::Instant::now();
+        while db.seal_waits().plans < plans0 + rounds.len() as u64 {
+            assert!(
+                t.elapsed().as_secs() < 30,
+                "the seals' landings never planned"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(db.seal_waits().merges, merges0, "nothing landed while held");
+        // Reads around: a landing plans the next merge only where the
+        // store's scan life moved since the last landing.
+        let mut seen = 0usize;
+        db.scan(b"", 5, kv(&mut |_, _| seen += 1)).unwrap();
+        assert_eq!(seen, 5);
+        db.hold_merge_landing(false);
+        // The segment work's own loop lands the merge and, with the chain,
+        // plans and lands the next; a settle would join the merge itself and
+        // plan nothing, so the loop is waited for by the merges it lands.
+        let t = std::time::Instant::now();
+        while db.seal_waits().merges < merges0 + merges {
+            assert!(
+                t.elapsed().as_secs() < 30,
+                "chain {chain} cap {cap} at once {at_once}: {} merges landed, {merges} expected",
+                db.seal_waits().merges - merges0
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        db.settle().unwrap();
+        let pieces = seg_names(&d)
+            .iter()
+            .filter(|n| !n.starts_with("par-"))
+            .count();
+        assert_eq!(
+            pieces, left,
+            "chain {chain} cap {cap} at once {at_once}: pieces left after the landings"
+        );
+        assert_eq!(
+            db.seal_waits().merges - merges0,
+            merges,
+            "chain {chain} cap {cap} at once {at_once}: merges landed"
+        );
+        hold_to(&db, &keys);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

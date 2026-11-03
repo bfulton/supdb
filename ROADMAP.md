@@ -86,7 +86,14 @@ The suite has to be fair before any of its numbers are quoted.
   where the batch is dense in a partition, a stride a key ahead where it
   is sparse, and nothing at a block's build, whose page of heads faults
   beside the records' ask already), the one-percent point's first scan
-  0.6x of what it was and its cell 1.46x; the merge's first pass reads its
+  0.6x of what it was and its cell 1.46x; a merge's landing plans the next
+  merge while reads are around, at the base trigger, and a merge takes its
+  due ranges up to a cap of partition bytes (`Options::merge_chains`,
+  `Options::merge_bytes_cap`), since the planner ran at the seals alone and
+  the full rewrite's pass met the burst's 336 pieces for the whole of it
+  with one merge over every range in flight -- the pass 6.9 s against
+  10.0-10.7, its cell 1.33-1.39x in two sittings, the burst level; the
+  merge's first pass reads its
   keys off the ordered index's heads now (`Options::merge_keys_by_heads`,
   the bursts' background reads an operation 1.6-1.75x fewer, the cells
   within the spread), and what is left there is the merge's second pass

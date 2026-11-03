@@ -519,6 +519,16 @@ pub struct Supdb {
     /// (`Options::heads_willneed` off). `supdb-ingestnoheadwillneed`, and
     /// `supdb-noheadwillneed` durable.
     noheadwillneed: bool,
+    /// A merge's landing plans nothing, as a seal's landing alone did, so a
+    /// store nothing writes keeps its pieces however long it is read
+    /// (`Options::merge_chains` off). `supdb-ingestnomergechain`, and
+    /// `supdb-nomergechain` durable.
+    nomergechain: bool,
+    /// One merge takes every due range, where the default takes them up to
+    /// a cap of partition bytes and leaves the rest to the landing's plan
+    /// (`Options::merge_bytes_cap` at zero). `supdb-ingestmergeuncapped`,
+    /// and `supdb-mergeuncapped` durable.
+    mergeuncapped: bool,
     /// A seal writes every key through the writer's general path, as
     /// before the one-value path (`Options::seal_put_one` off).
     /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
@@ -1233,6 +1243,16 @@ struct Policy {
     /// (`Options::heads_willneed` off). `supdb-ingestnoheadwillneed`, and
     /// `supdb-noheadwillneed` durable.
     noheadwillneed: bool,
+    /// A merge's landing plans nothing, as a seal's landing alone did, so a
+    /// store nothing writes keeps its pieces however long it is read
+    /// (`Options::merge_chains` off). `supdb-ingestnomergechain`, and
+    /// `supdb-nomergechain` durable.
+    nomergechain: bool,
+    /// One merge takes every due range, where the default takes them up to
+    /// a cap of partition bytes and leaves the rest to the landing's plan
+    /// (`Options::merge_bytes_cap` at zero). `supdb-ingestmergeuncapped`,
+    /// and `supdb-mergeuncapped` durable.
+    mergeuncapped: bool,
     /// A seal writes every key through the writer's general path, as
     /// before the one-value path (`Options::seal_put_one` off).
     /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
@@ -1757,6 +1777,8 @@ impl Default for Policy {
             mergerecordkeys: false,
             mergedropbehind: false,
             noheadwillneed: false,
+            nomergechain: false,
+            mergeuncapped: false,
             sealrun: false,
             closeinline: false,
             timers: false,
@@ -3416,6 +3438,61 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 noheadwillneed: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose merge landings plan nothing, where the default plans
+    /// the next merge at each (`Options::merge_chains`): against `supdb`
+    /// under a bound it prices the pieces a read pass meets.
+    pub fn create_nomergechain(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                nomergechain: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` whose merge landings plan nothing, as
+    /// `supdb-nomergechain`.
+    pub fn create_ingest_nomergechain(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                nomergechain: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose merges take every due range, where the default takes
+    /// them up to a cap of partition bytes (`Options::merge_bytes_cap`):
+    /// against `supdb` under a bound it prices the landing a few ranges at
+    /// a time.
+    pub fn create_mergeuncapped(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                mergeuncapped: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` whose merges take every due range, as
+    /// `supdb-mergeuncapped`.
+    pub fn create_ingest_mergeuncapped(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                mergeuncapped: true,
                 ..Policy::default()
             },
         )
@@ -5912,6 +5989,8 @@ impl Supdb {
             mergerecordkeys,
             mergedropbehind,
             noheadwillneed,
+            nomergechain,
+            mergeuncapped,
             sealrun,
             closeinline,
             timers,
@@ -6191,6 +6270,12 @@ impl Supdb {
             merge_keys_by_heads: !mergerecordkeys,
             merge_drop_behind: mergedropbehind,
             heads_willneed: !noheadwillneed,
+            merge_chains: !nomergechain,
+            merge_bytes_cap: if mergeuncapped {
+                0
+            } else {
+                supdb::Options::default().merge_bytes_cap
+            },
             seal_put_one: !sealrun,
             close_finish_inline: closeinline,
             upkeep_wake_parked: wake,
@@ -6448,6 +6533,8 @@ impl Supdb {
             mergerecordkeys,
             mergedropbehind,
             noheadwillneed,
+            nomergechain,
+            mergeuncapped,
             sealrun,
             closeinline,
             timers,
@@ -7144,6 +7231,20 @@ impl Engine for Supdb {
                 "supdb-ingestnoheadwillneed"
             };
         }
+        if self.nomergechain {
+            return if self.partition {
+                "supdb-nomergechain"
+            } else {
+                "supdb-ingestnomergechain"
+            };
+        }
+        if self.mergeuncapped {
+            return if self.partition {
+                "supdb-mergeuncapped"
+            } else {
+                "supdb-ingestmergeuncapped"
+            };
+        }
         if self.sealrun {
             return if self.partition {
                 "supdb-sealrun"
@@ -7567,6 +7668,8 @@ impl Engine for Supdb {
                 db.merge_dropped_bytes() as f64 / 1048576.0,
             ),
             ("unsealed_keys", db.unsealed_keys() as f64),
+            ("merges_landed", db.seal_waits().merges as f64),
+            ("merge_plans", db.seal_waits().plans as f64),
             ("pieces_aligned", db.pieces_aligned() as u8 as f64),
             // What the forms' upkeep did: see `Db::forms_events`.
             ("blk_by_upkeep", ev[0] as f64),
@@ -8528,6 +8631,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-mergerecordkeys"
         | "supdb-mergedropbehind"
         | "supdb-noheadwillneed"
+        | "supdb-nomergechain"
+        | "supdb-mergeuncapped"
         | "supdb-sealrun"
         | "supdb-closeinline"
         | "supdb-timers"
@@ -8629,6 +8734,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestmergerecordkeys"
         | "supdb-ingestmergedropbehind"
         | "supdb-ingestnoheadwillneed"
+        | "supdb-ingestnomergechain"
+        | "supdb-ingestmergeuncapped"
         | "supdb-ingestsealrun"
         | "supdb-ingestcloseinline"
         | "supdb-ingesttimers"
@@ -8972,6 +9079,10 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestmergedropbehind" => Box::new(Supdb::create_ingest_mergedropbehind(dir)?),
         "supdb-noheadwillneed" => Box::new(Supdb::create_noheadwillneed(dir)?),
         "supdb-ingestnoheadwillneed" => Box::new(Supdb::create_ingest_noheadwillneed(dir)?),
+        "supdb-nomergechain" => Box::new(Supdb::create_nomergechain(dir)?),
+        "supdb-ingestnomergechain" => Box::new(Supdb::create_ingest_nomergechain(dir)?),
+        "supdb-mergeuncapped" => Box::new(Supdb::create_mergeuncapped(dir)?),
+        "supdb-ingestmergeuncapped" => Box::new(Supdb::create_ingest_mergeuncapped(dir)?),
         "supdb-sealrun" => Box::new(Supdb::create_sealrun(dir)?),
         "supdb-ingestsealrun" => Box::new(Supdb::create_ingest_sealrun(dir)?),
         "supdb-closeinline" => Box::new(Supdb::create_closeinline(dir)?),
