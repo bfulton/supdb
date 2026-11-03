@@ -75,6 +75,13 @@ pub trait Bytes {
     /// file handle about page-fault patterns.
     fn advise_random(&self) {}
 
+    /// This source's pages unmapped from the process (`MADV_DONTNEED`), so
+    /// that a drop of the file's page cache after it can take them: a cache
+    /// drop skips a page a mapping holds. The bytes do not change; a later
+    /// touch faults the page back from the cache or the file. A no-op where
+    /// there is no mapping.
+    fn advise_dontneed(&self) {}
+
     /// Fetch `len` bytes at `off` in the background, now.
     ///
     /// `MADV_WILLNEED` on a mapped file: not a hint about a pattern but an
@@ -183,6 +190,16 @@ impl Bytes for VecBytes {
 #[cfg(not(target_family = "wasm"))]
 pub struct MmapBytes(pub memmap2::Mmap);
 
+/// The most of a mapping one `MADV_WILLNEED` asks for. Linux reads a
+/// will-need range ahead only up to the larger of the device's largest
+/// request and the file's readahead window, and drops the rest of the
+/// range without a word (`force_page_cache_ra`): one ask over 104 evicted
+/// pages brought in all of them where the device takes 4 MiB a request and
+/// 64 where it takes 256 KiB, the ARM runner's. The window is 128 KiB unless
+/// it was lowered, so an ask cut into pieces of that is read whole.
+#[cfg(not(target_family = "wasm"))]
+pub const WILLNEED_PIECE: usize = 128 << 10;
+
 #[cfg(not(target_family = "wasm"))]
 impl MmapBytes {
     pub fn open(path: &std::path::Path) -> Result<MmapBytes> {
@@ -193,6 +210,43 @@ impl MmapBytes {
         // sees it.
         Ok(MmapBytes(unsafe { memmap2::Mmap::map(&file)? }))
     }
+
+    /// How many of the system pages that `len` bytes at `off` lie in the
+    /// kernel holds in memory now, by `mincore`: what a warm of the file can
+    /// skip. The range is clamped to the mapping, and every page a byte of
+    /// it lies in counts, the first one from its start; zero for a range
+    /// that is empty or past the mapping, and where the kernel will not say.
+    pub fn resident_pages(&self, off: usize, len: usize) -> usize {
+        let page = os_page_size();
+        let end = off.saturating_add(len).min(self.0.len());
+        if end <= off {
+            return 0;
+        }
+        let start = off / page * page;
+        let span = end - start;
+        let mut vec = vec![0u8; span.div_ceil(page)];
+        // SAFETY: the range lies inside this mapping, which lives for the
+        // call, and `vec` has a byte for every page of it.
+        let rc = unsafe {
+            libc::mincore(
+                self.0.as_ptr().add(start).cast_mut().cast(),
+                span,
+                vec.as_mut_ptr().cast(),
+            )
+        };
+        if rc != 0 {
+            return 0;
+        }
+        vec.iter().filter(|&&b| b & 1 != 0).count()
+    }
+}
+
+/// The system's page size.
+#[cfg(not(target_family = "wasm"))]
+pub fn os_page_size() -> usize {
+    // SAFETY: a query with no side effect.
+    let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    usize::try_from(n).unwrap_or(4096).max(1)
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -216,6 +270,21 @@ impl Bytes for MmapBytes {
     fn advise_normal(&self) {
         let _ = self.0.advise(memmap2::Advice::Normal);
     }
+    fn advise_dontneed(&self) {
+        #[cfg(target_os = "linux")]
+        // SAFETY: an advice over the whole of a read-only shared file
+        // mapping this value owns: it drops this process's page-table
+        // entries for the range and changes no byte, and a later touch
+        // faults the page back from the file, so a borrow into the mapping
+        // reads the same bytes after it as before.
+        unsafe {
+            libc::madvise(
+                self.0.as_ptr() as *mut libc::c_void,
+                self.0.len(),
+                libc::MADV_DONTNEED,
+            );
+        }
+    }
     fn advise_willneed(&self, off: u64, len: usize) -> usize {
         // Clamped rather than trusted: the offsets come from a plan built out
         // of a file's own block table, and a damaged one must not hand the
@@ -228,21 +297,60 @@ impl Bytes for MmapBytes {
         };
         let start = start.min(self.0.len());
         let span = len.min(self.0.len() - start);
-        if span > 0
-            && self
+        // In pieces, each read whole (`WILLNEED_PIECE`); what is reported
+        // is what was submitted, up to the first piece the kernel refused.
+        let mut done = 0;
+        while done < span {
+            let n = WILLNEED_PIECE.min(span - done);
+            if self
                 .0
-                .advise_range(memmap2::Advice::WillNeed, start, span)
-                .is_ok()
-        {
-            return span;
+                .advise_range(memmap2::Advice::WillNeed, start + done, n)
+                .is_err()
+            {
+                break;
+            }
+            done += n;
         }
-        0
+        done
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every page a byte of the range lies in counts, from the first one's
+    /// start, and nothing past the mapping does: a file of three pages and a
+    /// hundred bytes, all of it just written and so in the page cache.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn resident_pages_counts_every_page_a_range_touches_and_none_past_the_end() {
+        let page = os_page_size();
+        let len = 3 * page + 100;
+        let path =
+            std::env::temp_dir().join(format!("supdb-next-resident-pages-{}", std::process::id()));
+        std::fs::write(&path, vec![7u8; len]).unwrap();
+        let m = MmapBytes::open(&path).unwrap();
+        let sum: u64 = (0..len).step_by(page).map(|o| u64::from(m.0[o])).sum();
+        assert_eq!(sum, 4 * 7, "every page touched");
+        assert_eq!(m.resident_pages(0, len), 4);
+        assert_eq!(
+            m.resident_pages(page - 1, 2),
+            2,
+            "two bytes across a page boundary"
+        );
+        assert_eq!(m.resident_pages(page, page), 1, "one page exactly");
+        assert_eq!(
+            m.resident_pages(len - 1, 100),
+            1,
+            "clamped to the last page"
+        );
+        assert_eq!(m.resident_pages(len, 5), 0, "past the mapping");
+        assert_eq!(m.resident_pages(len + page, 5), 0, "well past the mapping");
+        assert_eq!(m.resident_pages(5, 0), 0, "an empty range");
+        drop(m);
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn slice_source_lends_and_refuses_past_the_end() {

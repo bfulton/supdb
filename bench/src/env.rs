@@ -17,6 +17,9 @@ fn trimmed(p: &str) -> Option<String> {
 pub fn capture() -> MachineInfo {
     let m = Machine::detect();
     let (cpu_model, cpus, mem_total_kb) = cpu_and_memory();
+    // The device the stores are built on: the temp directory's, which is
+    // where `run` puts every store.
+    let dev = block_device_of(&std::env::temp_dir());
     MachineInfo {
         arch: std::env::consts::ARCH.to_string(),
         cpu_model,
@@ -38,7 +41,55 @@ pub fn capture() -> MachineInfo {
             && std::path::Path::new("/sys/bus/event_source/devices/cpu").exists(),
         aslr_disabled: trimmed("/proc/sys/kernel/randomize_va_space").as_deref() == Some("0"),
         virtualised: virtualised(),
+        mem_limit_bytes: None,
+        read_ahead_kb: dev.as_deref().and_then(|d| queue_num(d, "read_ahead_kb")),
+        rotational: dev
+            .as_deref()
+            .and_then(|d| queue_num(d, "rotational"))
+            .map(|n| n != 0),
+        write_cache: dev
+            .as_deref()
+            .and_then(|d| trimmed(&format!("/sys/block/{d}/queue/write_cache"))),
     }
+}
+
+/// A number from the device's queue directory, or none where the file is
+/// not there or does not parse.
+fn queue_num(dev: &str, name: &str) -> Option<u64> {
+    trimmed(&format!("/sys/block/{dev}/queue/{name}")).and_then(|s| s.parse().ok())
+}
+
+/// The block device holding `path`, by name under `/sys/block` (`vda`):
+/// the device number the file sits on, resolved through `/sys/dev/block`,
+/// and a partition resolved to its disk, since the queue and the stat are
+/// the disk's. None where the device has no entry there -- an overlay or
+/// a tmpfs, whose numbers are anonymous -- or on a host without `/sys`.
+#[cfg(target_os = "linux")]
+pub fn block_device_of(path: &std::path::Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let dev = std::fs::metadata(path).ok()?.dev();
+    // The kernel's encoding of a device number (`include/linux/kdev_t.h`,
+    // the `new_encode_dev` form glibc's `major` and `minor` undo): twelve
+    // bits of major split around the low byte of minor.
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    let link = std::fs::read_link(format!("/sys/dev/block/{major}:{minor}")).ok()?;
+    let sys = std::path::Path::new("/sys/dev/block").join(&link);
+    let node = if sys.join("partition").exists() {
+        sys.parent()?.to_path_buf()
+    } else {
+        sys
+    };
+    let name = node.file_name()?.to_str()?.to_string();
+    std::path::Path::new("/sys/block")
+        .join(&name)
+        .exists()
+        .then_some(name)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn block_device_of(_path: &std::path::Path) -> Option<String> {
+    None
 }
 
 #[cfg(not(target_os = "macos"))]

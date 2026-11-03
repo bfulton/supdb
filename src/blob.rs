@@ -30,9 +30,10 @@
 use crate::block::{self, BlockLoc};
 use crate::bytes::{short, take, Bytes};
 use crate::flatindex::{self, FlatIndex, MappedBlocks};
-use crate::index::Ext;
-use std::cell::{Cell, RefCell};
+use crate::index::{Ext, Exts};
+use std::cell::Cell;
 use std::io::{Error, ErrorKind, Result};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 fn corrupt(msg: &str) -> Error {
     Error::new(ErrorKind::InvalidData, format!("supdb: {msg}"))
@@ -116,7 +117,7 @@ fn fixed_count(exts: &[Ext], stride: u64, width: u64) -> Option<u64> {
 /// the constants below are asserted equal to `store.rs`'s at compile time on
 /// every native build, which says *why* in one line instead of six stack
 /// traces.
-const MAGIC: u64 = 0x5355_5044_4200_0006;
+const MAGIC: u64 = 0x5355_5044_4200_0007;
 const SUPER: u64 = 4096;
 const SLOT: u64 = 512;
 const SB_BYTES: usize = 144;
@@ -124,13 +125,14 @@ const SB_FIELDS: usize = 16;
 
 /// The superblock page's extension: what a write-once segment adds after
 /// the two slots so a sparse open can plan itself from the probe alone.
-/// Sixteen words -- magic, generation, then the
-/// absolute offset and length of the fence, the directory, the hash region
-/// and the checksum row, a copy of the block table and a copy of the fence
-/// when the writer placed them in a head reserve, and the fence copy's
-/// CRC -- then a copy of the key section's 192-byte header, then the FNV of
-/// all of it. A store writes none of this; the page is zero there and the
-/// magic says so.
+/// Twenty words -- magic, generation, then the absolute offset and length
+/// of the fence, the directory, the hash region and the checksum row, a
+/// copy of the block table and a copy of the fence when the writer placed
+/// them in a head reserve, the fence copy's CRC, the row copy's offset,
+/// the directory copy's offset and CRC, the segment's payload, and one
+/// spare -- then a copy of the key section's 192-byte header, then the FNV
+/// of all of it. A store writes none of this; the page is zero there and
+/// the magic says so.
 const SX_OFF: usize = 1024;
 const SX_MAGIC: u64 = 0x5355_5044_4253_5831;
 const SX_WORDS: usize = 20;
@@ -155,6 +157,12 @@ pub struct SuperExt {
     /// its CRC32C, so a directory-resident open needs nothing from the
     /// section either.
     pub dir_copy: Option<(u64, u32)>,
+    /// The key and value bytes the writer took in, counted as a store's
+    /// memtable counts them: what the store's seal is sized against, since
+    /// the file's own length moves with the record format and the payload
+    /// does not. A reader from before the word ignores it and a segment
+    /// from before it wrote zero there, which reads as `None`.
+    pub payload: Option<u64>,
     pub header: [u8; flatindex::HEADER_BYTES],
 }
 
@@ -190,7 +198,7 @@ pub fn encode_super_ext(x: &SuperExt, generation: u64) -> Vec<u8> {
         x.row_copy.unwrap_or(0),
         x.dir_copy.map_or(0, |d| d.0),
         x.dir_copy.map_or(0, |d| d.1 as u64),
-        0,
+        x.payload.unwrap_or(0),
         0,
     ];
     let mut out = Vec::with_capacity(SX_BYTES);
@@ -240,6 +248,7 @@ pub fn decode_super_ext(page: &[u8], generation: u64) -> Option<SuperExt> {
         } else {
             None
         },
+        payload: if w(18) > 0 { Some(w(18)) } else { None },
         header,
     })
 }
@@ -589,9 +598,11 @@ struct SparseIndex {
     hdr: flatindex::Header,
     fence: Vec<u8>,
     /// The checksum row, empty for a section without one, and one bit per
-    /// piece already verified by this reader.
+    /// piece already verified through this reader. Atomic words, since a
+    /// reader is shared between threads; a piece verified twice by two
+    /// of them is a race nobody loses.
     crcs: Vec<u8>,
-    verified: RefCell<Vec<u64>>,
+    verified: Box<[AtomicU64]>,
     /// The directory, when `resident_directory` fetched it at open.
     dir: Option<Vec<u32>>,
     /// Whether the open planned itself from the superblock extension.
@@ -609,15 +620,93 @@ pub struct Blob<B: Bytes> {
     /// One bit per (block, chunk), so a chunk is checksummed once per reader
     /// and not once per value. Same argument as `Reader::verified`: an
     /// uncompressed block is handed out where it lies, so re-verifying it per
-    /// read is O(block) work to return O(value) bytes.
-    verified: RefCell<Vec<u64>>,
-    /// Reused buffers for a source that cannot lend, and for decompression.
-    ///
-    /// `Cell` rather than `RefCell` on purpose: these are held across a
-    /// user callback, and a callback that re-enters the reader should get a
-    /// fresh buffer rather than a panic. A host callback here is JavaScript.
-    raw_buf: Cell<Vec<u8>>,
-    dec_buf: Cell<Vec<u8>>,
+    /// read is O(block) work to return O(value) bytes. Atomic words, since
+    /// a reader is shared between threads.
+    verified: Box<[AtomicU64]>,
+    /// Which reader this is, for the thread's scratch: the decoded span it
+    /// remembers is this reader's or nobody's.
+    id: u64,
+    /// How many times a block was actually decompressed. The saving is
+    /// invisible to any correctness check -- the bytes are identical either
+    /// way -- so a test needs to be able to count the work instead.
+    decodes: AtomicU64,
+}
+
+/// The thread's reused buffers for a source that cannot lend and for
+/// decompression, and which block and which chunk-aligned span of it the
+/// decompression buffer holds, for which reader. A reader is shared
+/// between threads, so the buffers are the thread's rather than the
+/// reader's; `Cell` rather than `RefCell` on purpose: they are held
+/// across a user callback, and a callback that re-enters the reader
+/// should get a fresh buffer rather than a panic. A host callback here
+/// is JavaScript.
+///
+/// The decompression buffer was once nothing more than a reused buffer:
+/// `with_run` decompressed the chunks covering one extent, handed them
+/// out, and kept no record of what was in the buffer. A run of values is
+/// laid down in key order, so a walk over them asks for the same chunk
+/// once per value -- about forty times over at four kibibyte chunks and
+/// hundred byte values. Remembering what is already decoded makes the
+/// walk pay once.
+struct Scratch {
+    raw: Cell<Vec<u8>>,
+    dec: Cell<Vec<u8>>,
+    /// Reader id, block, and the chunk-aligned span decoded.
+    dec_at: Cell<Option<(u64, u32, usize, usize)>>,
+}
+
+thread_local! {
+    static SCRATCH: Scratch = const {
+        Scratch {
+            raw: Cell::new(Vec::new()),
+            dec: Cell::new(Vec::new()),
+            dec_at: Cell::new(None),
+        }
+    };
+}
+
+/// Reader ids, one per open.
+static NEXT_BLOB_ID: AtomicU64 = AtomicU64::new(1);
+
+/// What a derived file that copies a segment's records (a form file of the z
+/// form, `db::zpages`) binds itself to, as the segment says it of itself:
+/// every quantity a writer fixes once and nothing changes after. The form file
+/// holds values, so it is bound to the segment's content and not to a name --
+/// the engine hands segment ids out again after a crash -- and the strong
+/// part is `row_crc`, the CRC-32C of the key section's checksum row: four
+/// bytes per 16 KiB are a fingerprint of every byte the records live in, and
+/// reading it costs a few hundred kilobytes per gigabyte, not a pass over
+/// the file.
+///
+/// Native only: there is no form file in a browser, and nothing that reaches
+/// the wasm module changes with it.
+#[cfg(not(target_family = "wasm"))]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ZSource {
+    /// The segment's key count.
+    pub nkeys: u64,
+    /// Its record region's length.
+    pub recs_len: u64,
+    /// Where its key section's checksum row lies in the section.
+    pub crc_off: u64,
+    /// The key section's offset in the file.
+    pub key_off: u64,
+    /// The hash table's capacity.
+    pub hash_cap: u64,
+    /// The file's length.
+    pub file_len: u64,
+    /// The superblock's timestamp, and the index section's generation
+    /// (`Blob::version`).
+    pub timestamp: u64,
+    pub generation: u64,
+    /// CRC-32C of the checksum row.
+    pub row_crc: u32,
+    /// The record format's version and the file format's magic as this
+    /// engine reads them: a form file copied records laid out by these, and an
+    /// engine that lays them out otherwise must not attach it.
+    pub rec_version: u32,
+    pub rec_magic: u64,
 }
 
 impl<B: Bytes> Blob<B> {
@@ -663,9 +752,9 @@ impl<B: Bytes> Blob<B> {
             blocks,
             timestamp: sb.timestamp,
             opts,
-            verified: RefCell::new(verified),
-            raw_buf: Cell::new(Vec::new()),
-            dec_buf: Cell::new(Vec::new()),
+            verified: verified.into_iter().map(AtomicU64::new).collect(),
+            id: NEXT_BLOB_ID.fetch_add(1, AtomicOrdering::Relaxed),
+            decodes: AtomicU64::new(0),
         })
     }
 
@@ -699,6 +788,18 @@ impl<B: Bytes> Blob<B> {
     }
 
     /// Number of distinct keys.
+    /// Blocks decompressed so far by this reader.
+    pub fn decodes(&self) -> u64 {
+        self.decodes.load(AtomicOrdering::Relaxed)
+    }
+
+    /// A number no other open blob in this process has: what a cache
+    /// derived from one blob is keyed by, so it cannot be read against
+    /// another over the same range.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     pub fn keys(&self) -> usize {
         match &self.index {
             Index::Flat { idx, .. } => idx.len(),
@@ -728,6 +829,16 @@ impl<B: Bytes> Blob<B> {
         (self.generation, self.timestamp)
     }
 
+    /// The key and value bytes the segment's writer recorded
+    /// (`SuperExt::payload`), or `None` for a file that records none: a
+    /// store's, or a segment from before the word. One read of the
+    /// superblock page, so asked once per open rather than per read.
+    pub fn payload_bytes(&self) -> Option<u64> {
+        let mut page = vec![0u8; SUPER as usize];
+        self.src.read_at(0, &mut page).ok()?;
+        decode_super_ext(&page, self.generation)?.payload
+    }
+
     /// Tell the byte source that this reader's access pattern is random.
     ///
     /// `MADV_RANDOM` on a mapped file, and a no-op on every source with no
@@ -744,6 +855,12 @@ impl<B: Bytes> Blob<B> {
     /// side once.
     pub fn advise_normal(&self) {
         self.src.advise_normal();
+    }
+
+    /// This source's pages unmapped from the process
+    /// (`Bytes::advise_dontneed`).
+    pub fn advise_dontneed(&self) {
+        self.src.advise_dontneed();
     }
 
     /// True when the index section is borrowed rather than copied.
@@ -770,20 +887,28 @@ impl<B: Bytes> Blob<B> {
     /// The extents of a key, borrowed out of the index. No allocation, no
     /// decode -- this is the borrow `flatindex` exists to make possible, and
     /// it survives the byte-source abstraction on any source that can lend.
-    pub fn lookup(&self, key: &[u8]) -> Option<&[Ext]> {
+    pub fn lookup(&self, key: &[u8]) -> Option<Exts<'_>> {
         let (sec, idx) = self.flat()?;
         idx.lookup(sec, key, flatindex::key_hash)
     }
 
     /// `lookup`, with the record's tail: the bytes of any inline runs, which
     /// `read_exts` needs to serve an extent that names `Ext::INLINE`.
-    pub fn lookup_full(&self, key: &[u8]) -> Option<(&[Ext], &[u8])> {
+    pub fn lookup_full(&self, key: &[u8]) -> Option<(Exts<'_>, &[u8])> {
         let (sec, idx) = self.flat()?;
         idx.lookup_full(sec, key, flatindex::key_hash)
     }
 
+    /// `lookup_full` with the extents and tail lent to `f` on the index's
+    /// frame rather than returned by value; see `FlatIndex::with_lookup`.
+    #[inline]
+    pub fn with_lookup<R>(&self, key: &[u8], f: impl FnOnce(&[Ext], &[u8]) -> R) -> Option<R> {
+        let (sec, idx) = self.flat()?;
+        idx.with_lookup(sec, key, flatindex::key_hash, f)
+    }
+
     /// `exts_at`, with the record's tail of inline runs.
-    pub fn exts_at_full(&self, rank: usize) -> Option<(&[u8], &[Ext], &[u8])> {
+    pub fn exts_at_full(&self, rank: usize) -> Option<(&[u8], Exts<'_>, &[u8])> {
         let (sec, idx) = self.flat()?;
         idx.at_full(sec, rank)
     }
@@ -796,15 +921,155 @@ impl<B: Bytes> Blob<B> {
         }
     }
 
+    /// PROTOTYPE: a hint to fetch the lines of the records from `rank`
+    /// for `n` ranks, ahead of a walk over them; nothing is waited for.
+    /// The directory says where the first and the last lie, and the span
+    /// between them, capped at `cap` bytes, is what the walk streams; past
+    /// the directory's own lines nothing is read here.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn prefetch_ranks(&self, rank: usize, n: usize, cap: usize) {
+        let Some((sec, idx)) = self.flat() else {
+            return;
+        };
+        let Some((recs, dir)) = idx.regions(sec) else {
+            return;
+        };
+        let Some((a, b)) = idx.record_span(dir, rank, n) else {
+            return;
+        };
+        let b = b.min(a + cap).min(recs.len());
+        if a < b {
+            crate::db::prefetch_lines(recs[a..].as_ptr(), b - a);
+        }
+    }
+
+    /// PROTOTYPE: a hint to fetch the directory's lines for the ranks
+    /// `rank` to `n` on, ahead of a seek that will read one of them;
+    /// nothing is waited for and nothing is read. A scan's start was three
+    /// fills in a row -- the stride's heads, then the directory word the
+    /// record hint needs, then the first record -- and the stride's window
+    /// is known before its heads are read, so the window's directory lines
+    /// asked for with the heads make the directory's fill the heads' and
+    /// not a fill of its own (`Options::seek_prefetch_dir`).
+    #[cfg(not(target_family = "wasm"))]
+    pub fn prefetch_dir(&self, rank: usize, n: usize) {
+        let Some((sec, idx)) = self.flat() else {
+            return;
+        };
+        let Some((_, dir)) = idx.regions(sec) else {
+            return;
+        };
+        let Some((a, b)) = idx.dir_span(rank, n) else {
+            return;
+        };
+        let b = b.min(dir.len());
+        if a < b {
+            crate::db::prefetch_lines(dir[a..].as_ptr(), b - a);
+        }
+    }
+
+    /// `prefetch_ranks` with the span's end estimated rather than read:
+    /// the directory word at `rank` says where the first record lies, and
+    /// `n` ranks at the index's mean record length says about where the
+    /// last does, capped at `cap` bytes and the region's end. The second
+    /// directory word `prefetch_ranks` reads is a load the hint waits for
+    /// before it can issue anything, on the scan's serial chain; an
+    /// estimate puts nothing there. Hints only: past the one word nothing
+    /// is read, and every sum saturates, since a span that wraps past a
+    /// scan's limit is the failure the checked profile exists for.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn prefetch_ranks_est(&self, rank: usize, n: usize, cap: usize) {
+        let Some((sec, idx)) = self.flat() else {
+            return;
+        };
+        let Some((recs, dir)) = idx.regions(sec) else {
+            return;
+        };
+        let Some(a) = idx.record_off(dir, rank) else {
+            return;
+        };
+        let b = a
+            .saturating_add(n.saturating_mul(idx.mean_record_len()))
+            .min(a.saturating_add(cap))
+            .min(recs.len());
+        if a < b {
+            crate::db::prefetch_lines(recs[a..].as_ptr(), b - a);
+        }
+    }
+
+    /// The record region and the directory as they lie in the mapping: the
+    /// bytes a derived file copies records from, and the words that say
+    /// where each record starts. The directory is the authority for where a
+    /// record lies and never the difference of two of its words -- a segment
+    /// closed from a direct run keeps its commit markers inside the record
+    /// region, counted in every later word. `None` for a reader that does
+    /// not hold the section whole.
+    #[cfg(not(target_family = "wasm"))]
+    #[doc(hidden)]
+    pub fn record_regions(&self) -> Option<(&[u8], &[u8])> {
+        let (sec, idx) = self.flat()?;
+        idx.regions(sec)
+    }
+
+    /// The record region's offset in the source and its length, bytes:
+    /// `record_regions` placed by offset, for an advice to the file that
+    /// holds it. `None` where there is no region or the source lends none.
+    #[cfg(not(target_family = "wasm"))]
+    #[doc(hidden)]
+    pub fn record_region_span(&self) -> Option<(u64, u64)> {
+        let (recs, _) = self.record_regions()?;
+        let base = self.src.slice_at(0, 1)?.as_ptr() as usize;
+        let at = (recs.as_ptr() as usize).checked_sub(base)?;
+        Some((at as u64, recs.len() as u64))
+    }
+
+    /// The hash region's bytes, the slots a point read probes one page of;
+    /// 0 for a reader that does not hold the section whole.
+    #[cfg(not(target_family = "wasm"))]
+    #[doc(hidden)]
+    pub fn hash_region_bytes(&self) -> usize {
+        self.flat().map_or(0, |(_, idx)| idx.hash_bytes())
+    }
+
+    /// What a form file binds itself to (`ZSource`), or `None` where there is
+    /// nothing to bind to: a reader that does not hold the section whole,
+    /// or a section with no checksum row (a store's in-place-editable
+    /// index, which no form file is built for).
+    #[cfg(not(target_family = "wasm"))]
+    #[doc(hidden)]
+    pub fn z_source_facts(&self) -> Option<ZSource> {
+        let (sec, idx) = self.flat()?;
+        let h = flatindex::Header::parse(sec)?;
+        if h.crc_off == 0 {
+            return None;
+        }
+        let base = self.index_offset();
+        let n = flatindex::checksum_row_len(h.crc_off, h.piece_shift, base);
+        let row = sec.get(h.crc_off..h.crc_off.checked_add(n)?)?;
+        Some(ZSource {
+            nkeys: idx.len() as u64,
+            recs_len: h.recs_len as u64,
+            crc_off: h.crc_off as u64,
+            key_off: base,
+            hash_cap: h.hash_cap as u64,
+            file_len: self.src.len(),
+            timestamp: self.timestamp,
+            generation: self.generation,
+            row_crc: block::crc32(row),
+            rec_version: flatindex::REC_VERSION,
+            rec_magic: crate::format::MAGIC,
+        })
+    }
+
     /// The key at `rank` in key order.
     pub fn key_at(&self, rank: usize) -> Option<&[u8]> {
         let (sec, idx) = self.flat()?;
-        idx.at(sec, rank).map(|(k, _)| k)
+        idx.key_at(sec, rank)
     }
 
     /// The key and extents at `rank`, borrowed from the mapping: the flags
     /// on the extents are how `db::Db` sees a tombstone without a probe.
-    pub fn exts_at(&self, rank: usize) -> Option<(&[u8], &[Ext])> {
+    pub fn exts_at(&self, rank: usize) -> Option<(&[u8], Exts<'_>)> {
         let (sec, idx) = self.flat()?;
         idx.at(sec, rank)
     }
@@ -817,16 +1082,19 @@ impl<B: Bytes> Blob<B> {
     /// read must not pay, and it is the whole difference between a scan
     /// and a sequence of lookups.
     pub fn values_at<F: FnMut(&[u8])>(&self, rank: usize, mut f: F) -> Result<u64> {
-        let Some((_, exts, tail)) = self.exts_at_full(rank) else {
+        let Some((sec, idx)) = self.flat() else {
             return Ok(0);
         };
-        let mut n = 0u64;
-        for e in exts {
-            n += self.with_run(*e, tail, |run| {
-                crate::index::each_value(run, e, &mut |v| f(v)).map_err(corrupt)
-            })?;
-        }
-        Ok(n)
+        let read = idx.with_record_at(sec, rank, |exts, tail| -> Result<u64> {
+            let mut n = 0u64;
+            for e in exts {
+                n += self.with_run(*e, tail, |run| {
+                    crate::index::each_value(run, e, &mut |v| f(v)).map_err(corrupt)
+                })?;
+            }
+            Ok(n)
+        });
+        read.unwrap_or(Ok(0))
     }
 
     // ------------------------------------------------------------ planning --
@@ -888,7 +1156,7 @@ impl<B: Bytes> Blob<B> {
         let Some(exts) = self.lookup(key) else {
             return Ok(());
         };
-        self.plan_exts(exts, out)
+        self.plan_exts(&exts, out)
     }
 
     /// The data ranges these extents reach: every block a non-inline one
@@ -968,17 +1236,29 @@ impl<B: Bytes> Blob<B> {
         let (w, bit) = (slot / 64, 1u64 << (slot % 64));
         // Out of room means never remembered: check every time rather than skip.
         self.verified
-            .borrow()
             .get(w)
-            .is_some_and(|cell| cell & bit != 0)
+            .is_some_and(|cell| cell.load(AtomicOrdering::Relaxed) & bit != 0)
     }
 
     fn set_verified(&self, i: u32, j: usize) {
         let slot = i as usize * block::MAX_CHUNK_CRCS + j;
         let (w, bit) = (slot / 64, 1u64 << (slot % 64));
-        if let Some(cell) = self.verified.borrow_mut().get_mut(w) {
-            *cell |= bit;
+        if let Some(cell) = self.verified.get(w) {
+            cell.fetch_or(bit, AtomicOrdering::Relaxed);
         }
+    }
+
+    /// The span of a block the thread's decompression buffer holds, when
+    /// it is this reader's.
+    fn dec_at(&self) -> Option<(u32, usize, usize)> {
+        SCRATCH.with(|s| match s.dec_at.get() {
+            Some((id, b, lo, hi)) if id == self.id => Some((b, lo, hi)),
+            _ => None,
+        })
+    }
+
+    fn set_dec_at(&self, at: Option<(u32, usize, usize)>) {
+        SCRATCH.with(|s| s.dec_at.set(at.map(|(b, lo, hi)| (self.id, b, lo, hi))));
     }
 
     /// Verify only the chunks `lo..hi` of a block actually touches.
@@ -1077,7 +1357,7 @@ impl<B: Bytes> Blob<B> {
         // `plan_exts` names the same bytes, which is what keeps a plan
         // exactly what the read after it touches.
         let (c0, c1) = chunk_span(&loc, &e);
-        let mut raw_buf = self.raw_buf.take();
+        let mut raw_buf = SCRATCH.with(|s| s.raw.take());
         let out = (|| -> Result<R> {
             let raw = take(&self.src, loc.off + c0 as u64, c1 - c0, &mut raw_buf)?;
             if loc.is_plain() {
@@ -1091,23 +1371,50 @@ impl<B: Bytes> Blob<B> {
             if b > un {
                 return Err(corrupt("extent runs past its block"));
             }
-            let mut dec = self.dec_buf.take();
+            let mut dec = SCRATCH.with(|s| s.dec.take());
             let r = (|| -> Result<R> {
                 if dec.len() < un {
                     dec.resize(un, 0);
+                    self.set_dec_at(None);
                 }
                 if loc.chunked {
-                    block::read_chunked_range(raw, un, a, b, &mut dec[..un])?;
+                    // Reuse when this extent falls inside the chunk span the
+                    // buffer already holds for this block.
+                    let lo = a / block::CHUNK * block::CHUNK;
+                    let hi = b.div_ceil(block::CHUNK) * block::CHUNK;
+                    let hi = hi.min(un);
+                    let have = self.dec_at();
+                    let hit = matches!(have, Some((blk, l, h))
+                        if blk == e.block && l <= lo && hi <= h);
+                    if !hit {
+                        self.set_dec_at(None);
+                        self.decodes.fetch_add(1, AtomicOrdering::Relaxed);
+                        block::read_chunked_range(
+                            raw,
+                            un,
+                            a,
+                            b,
+                            &mut dec[..un],
+                            self.opts.verify_checksums,
+                        )?;
+                        self.set_dec_at(Some((e.block, lo, hi)));
+                    }
                 } else {
                     self.verify(e.block, loc, raw, 0, 0, raw.len())?;
-                    block::decompress_into(raw, &mut dec, un)?;
+                    let have = self.dec_at();
+                    if !matches!(have, Some((blk, 0, h)) if blk == e.block && h == un) {
+                        self.set_dec_at(None);
+                        self.decodes.fetch_add(1, AtomicOrdering::Relaxed);
+                        block::decompress_into(raw, &mut dec, un)?;
+                        self.set_dec_at(Some((e.block, 0, un)));
+                    }
                 }
                 f(&dec[a..b])
             })();
-            self.dec_buf.set(dec);
+            SCRATCH.with(|s| s.dec.set(dec));
             r
         })();
-        self.raw_buf.set(raw_buf);
+        SCRATCH.with(|s| s.raw.set(raw_buf));
         out
     }
 
@@ -1121,10 +1428,18 @@ impl<B: Bytes> Blob<B> {
     /// this work was written against says "read_all returns a count", and it
     /// does not.
     pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], f: F) -> Result<u64> {
+        self.with_lookup(key, |exts, tail| self.read_exts(exts, tail, f))
+            .unwrap_or(Ok(0))
+    }
+
+    /// EXPERIMENT: `read_all` through `lookup_full`, the extents returned
+    /// by value: the shape before `with_lookup`, kept to price it
+    /// (`Options::exts_by_value`).
+    pub fn read_all_by_value<F: FnMut(&[u8])>(&self, key: &[u8], f: F) -> Result<u64> {
         let Some((exts, tail)) = self.lookup_full(key) else {
             return Ok(0);
         };
-        self.read_exts(exts, tail, f)
+        self.read_exts(&exts, tail, f)
     }
 
     /// Every value in `exts`, in order -- the extents and tail a
@@ -1164,14 +1479,14 @@ impl<B: Bytes> Blob<B> {
         };
         let (ra, rb) = match (
             width,
-            self.fixed_runs(ea, ta, width)?,
-            self.fixed_runs(eb, tb, width)?,
+            self.fixed_runs(&ea, ta, width)?,
+            self.fixed_runs(&eb, tb, width)?,
         ) {
             (w, Some(ra), Some(rb)) if w > 0 => (ra, rb),
             _ => {
                 let (mut va, mut vb) = (Vec::new(), Vec::new());
-                self.read_exts(ea, ta, |v| va.push(v.to_vec()))?;
-                self.read_exts(eb, tb, |v| vb.push(v.to_vec()))?;
+                self.read_exts(&ea, ta, |v| va.push(v.to_vec()))?;
+                self.read_exts(&eb, tb, |v| vb.push(v.to_vec()))?;
                 let (mut i, mut j, mut n) = (0, 0, 0u64);
                 while i < va.len() && j < vb.len() {
                     match va[i].cmp(&vb[j]) {
@@ -1333,7 +1648,7 @@ impl<B: Bytes> Blob<B> {
     pub fn count_fixed(&self, key: &[u8], width: u32) -> Option<u64> {
         let stride = width as u64 + varint_len(width as u64);
         match self.lookup(key) {
-            Some(exts) => fixed_count(exts, stride, width as u64),
+            Some(exts) => fixed_count(&exts, stride, width as u64),
             // A key that is not there holds no values, which is a count.
             None => Some(0),
         }
@@ -1351,8 +1666,14 @@ impl<B: Bytes> Blob<B> {
     ) -> Result<usize> {
         let mut rank = self.seek(from);
         let mut seen = 0usize;
+        let walk = self
+            .flat()
+            .and_then(|(sec, idx)| idx.regions(sec).map(|(recs, dir)| (idx, recs, dir)));
         while seen < limit {
-            let Some((k, exts)) = self.exts_at(rank) else {
+            let Some((k, exts)) = (match walk {
+                Some((idx, recs, dir)) => idx.at_full_in(recs, dir, rank).map(|(k, e, _)| (k, e)),
+                None => self.exts_at(rank),
+            }) else {
                 break;
             };
             // Read out of the extent records before the callback so the borrow
@@ -1392,11 +1713,17 @@ impl<B: Bytes> Blob<B> {
         let stride = width as u64 + varint_len(width as u64);
         let mut rank = self.seek(from);
         let mut seen = 0usize;
+        let walk = self
+            .flat()
+            .and_then(|(sec, idx)| idx.regions(sec).map(|(recs, dir)| (idx, recs, dir)));
         while seen < limit {
-            let Some((k, exts)) = self.exts_at(rank) else {
+            let Some((k, exts)) = (match walk {
+                Some((idx, recs, dir)) => idx.at_full_in(recs, dir, rank).map(|(k, e, _)| (k, e)),
+                None => self.exts_at(rank),
+            }) else {
                 break;
             };
-            let n = fixed_count(exts, stride, width as u64);
+            let n = fixed_count(&exts, stride, width as u64);
             seen += 1;
             rank += 1;
             if !f(k, n) {
@@ -1447,7 +1774,7 @@ impl<B: Bytes> Blob<B> {
             let Some((_k, exts, _tail)) = self.exts_at_full(rank) else {
                 break;
             };
-            self.plan_exts(exts, &mut ranges)?;
+            self.plan_exts(&exts, &mut ranges)?;
             seen += 1;
             rank += 1;
         }
@@ -1467,20 +1794,172 @@ impl<B: Bytes> Blob<B> {
         Ok(asked)
     }
 
-    pub fn scan<F: FnMut(&[u8], &[u8])>(
+    pub fn scan<F: FnMut(&[u8], &[u8])>(&self, from: &[u8], limit: usize, f: F) -> Result<usize> {
+        self.scan_at(self.seek(from), limit, f)
+    }
+
+    /// `scan`, from a rank a caller already has.
+    ///
+    /// `db::Db` has one out of its ordered index and would otherwise pay for
+    /// the seek twice. The rank is a position, not a promise: a rank past the
+    /// end walks nothing, exactly as a `from` above every key does.
+    pub fn scan_at<F: FnMut(&[u8], &[u8])>(
         &self,
-        from: &[u8],
+        from_rank: usize,
         limit: usize,
-        mut f: F,
+        f: F,
     ) -> Result<usize> {
-        let mut rank = self.seek(from);
+        let mut f = f;
+        let mut rank = from_rank;
         let mut seen = 0usize;
         let mut cached: Option<(u32, &[u8])> = None;
+        // The regions once, not once a key: `exts_at_full` re-resolves the
+        // section and re-slices the directory and the records every call, and
+        // that plumbing rather than the record read is most of what resolving
+        // a rank costs.
+        let walk = self
+            .flat()
+            .and_then(|(sec, idx)| idx.regions(sec).map(|(recs, dir)| (idx, recs, dir)));
+        // The common shape first -- one extent, inline, fixed width -- in a
+        // loop of its own, with nothing per entry but the parse, a bounds
+        // check and the call. The first record of any other shape breaks
+        // out to the general loop below, which continues from the same rank.
+        //
+        // This is not the general loop with cases removed; it is the same
+        // work in a loop the compiler can keep in registers. Measured on the
+        // suite's own segment, rank-walks over identical ranks: the record
+        // layout parses at about 12 ns an entry and the general loop walked
+        // it at 29, while a verbatim copy of that loop's SHAPE outside this
+        // function walked it at 17 and the raw parse at 12-14 -- so neither
+        // the format, nor the mapping, nor the inline arm's plumbing was the
+        // cost; the codegen of this function was. With this loop the walk is
+        // 12.7 ns an entry, inside the raw parse's spread, and at 300,000
+        // keys in memory a hundred-entry scan went from 29.8 million entries
+        // a second to 60.5 million, where LMDB's cursor does 43.7.
+        //
+        // The record is read in place here rather than through
+        // `parse_record`, which resolves a record's regions one checked
+        // step at a time for any shape: the header, then the key, then the
+        // extents as a slice, then a pass over them for the tail's length,
+        // then the tail, each through an `Option`. For one inline fixed
+        // extent the whole record is a header, a key, five words and a
+        // run, and each of those is one bounds check against the region;
+        // a step that finds another shape falls through to the general
+        // loop at the same rank, exactly as before. Measured with
+        // callgrind on the suite's scan pass: 145 instructions an entry
+        // through the parse, of which the parse was 78, and 69 in place;
+        // the probe's warm scan pass, two binaries alternated over three
+        // rounds, went from 78-84M entries a second to 99-116M at ten
+        // thousand keys, 62-68M to 70-83M at a hundred thousand, and
+        // 37-44M to 45-50M at three hundred thousand.
+        if let Some((idx, recs, dir)) = walk {
+            let nkeys = idx.len();
+            // The directory words from `rank` on, as many as the scan may
+            // take, through an iterator whose end is the loop's one test:
+            // a bounds check on the word, a compare of the rank against
+            // the key count and one of the count against the limit were
+            // seven of the loop's fifty-six instructions an entry. Each
+            // region of a record is read as an array of its exact size,
+            // so a word read is one load: the count word was read as four
+            // bytes and reassembled, nine instructions for one.
+            let want = limit.saturating_sub(seen).min(nkeys.saturating_sub(rank));
+            let words = dir
+                .get(rank * 4..(rank + want) * 4)
+                .unwrap_or(&[])
+                .as_chunks::<4>()
+                .0;
+            for w in words {
+                let off = u32::from_le_bytes(*w) as usize;
+                let Some(h) = recs.get(off..off + 4) else {
+                    break;
+                };
+                let Ok(h) = <&[u8; 4]>::try_from(h) else {
+                    break;
+                };
+                let klen = u16::from_le_bytes([h[0], h[1]]) as usize;
+                let n = u16::from_le_bytes([h[2], h[3]]);
+                let key_at = off + 4;
+                let e_at = (key_at + klen + 3) & !3;
+                // The compact record: a four-byte header where the full
+                // record has its extent, and the run straight after it.
+                let (a, elen, records) = if n == flatindex::COMPACT {
+                    let Some(cb) = recs.get(e_at..e_at + 4) else {
+                        break;
+                    };
+                    let Ok(cb) = <&[u8; 4]>::try_from(cb) else {
+                        break;
+                    };
+                    let c = u16::from_le_bytes([cb[2], cb[3]]);
+                    if c & flatindex::C_FIXED == 0 {
+                        break;
+                    }
+                    (
+                        e_at + 4,
+                        u16::from_le_bytes([cb[0], cb[1]]) as usize,
+                        (c & !(flatindex::C_FIXED | flatindex::C_TOMB)) as usize,
+                    )
+                } else if n == 1 {
+                    let Some(eb) = recs.get(e_at..e_at + 20) else {
+                        break;
+                    };
+                    let Ok(eb) = <&[u8; 20]>::try_from(eb) else {
+                        break;
+                    };
+                    let word =
+                        |i: usize| u32::from_le_bytes([eb[i], eb[i + 1], eb[i + 2], eb[i + 3]]);
+                    let block = word(0);
+                    let count = word(16);
+                    if block != Ext::INLINE || count & Ext::FIXED == 0 {
+                        break;
+                    }
+                    (
+                        e_at + 20 + word(4) as usize,
+                        word(8) as usize,
+                        (count & !(Ext::TOMBSTONE | Ext::FIXED)) as usize,
+                    )
+                } else {
+                    break;
+                };
+                if records == 0 || elen == 0 {
+                    return Err(corrupt("fixed run's length is not a multiple of its count"));
+                }
+                let Some(run) = recs.get(a..a + elen) else {
+                    return Err(corrupt("inline run runs past its record"));
+                };
+                let Some(k) = recs.get(key_at..key_at + klen) else {
+                    break;
+                };
+                // One value is the common record, and it is emitted
+                // without a division: the general run below divided
+                // twice an entry, once for the stride and once inside
+                // `chunks_exact` for the remainder, and the two were a
+                // dependent chain of two 32-bit divides in a loop of
+                // twenty-five cycles an entry.
+                if records == 1 {
+                    f(k, run);
+                } else {
+                    if !elen.is_multiple_of(records) {
+                        return Err(corrupt("fixed run's length is not a multiple of its count"));
+                    }
+                    let w = elen / records;
+                    let mut p = 0usize;
+                    while let Some(v) = run.get(p..p + w) {
+                        f(k, v);
+                        p += w;
+                    }
+                }
+                seen += 1;
+                rank += 1;
+            }
+        }
         while seen < limit {
-            let Some((k, exts, tail)) = self.exts_at_full(rank) else {
+            let Some((k, exts, tail)) = (match walk {
+                Some((idx, recs, dir)) => idx.at_full_in(recs, dir, rank),
+                None => self.exts_at_full(rank),
+            }) else {
                 break;
             };
-            for e in exts {
+            for e in exts.iter() {
                 // An inline run is right here in the record the walk is
                 // already on: no block, no cache, no fetch.
                 if e.is_inline() {
@@ -1905,7 +2384,9 @@ impl<B: Bytes> SparseBlob<B> {
                     hdr,
                     fence,
                     crcs,
-                    verified: RefCell::new(vec![0u64; pieces.div_ceil(64)]),
+                    verified: (0..pieces.div_ceil(64))
+                        .map(|_| AtomicU64::new(0))
+                        .collect(),
                     dir,
                     from_ext: ext.is_some(),
                 }),
@@ -1913,9 +2394,9 @@ impl<B: Bytes> SparseBlob<B> {
                 blocks,
                 timestamp: sb.timestamp,
                 opts,
-                verified: RefCell::new(verified),
-                raw_buf: Cell::new(Vec::new()),
-                dec_buf: Cell::new(Vec::new()),
+                verified: verified.into_iter().map(AtomicU64::new).collect(),
+                id: NEXT_BLOB_ID.fetch_add(1, AtomicOrdering::Relaxed),
+                decodes: AtomicU64::new(0),
             },
         };
         // What was read out of the section is verified before it is trusted:
@@ -1952,7 +2433,7 @@ impl<B: Bytes> SparseBlob<B> {
         let p1 = (b.div_ceil(piece) - first_page) as usize;
         let mut buf: Vec<u8> = Vec::new();
         for p in p0..p1 {
-            if s.verified.borrow()[p / 64] & (1u64 << (p % 64)) != 0 {
+            if s.verified[p / 64].load(AtomicOrdering::Relaxed) & (1u64 << (p % 64)) != 0 {
                 continue;
             }
             let start = ((first_page + p as u64) * piece).max(s.off);
@@ -1967,7 +2448,7 @@ impl<B: Bytes> SparseBlob<B> {
                     "key index checksum mismatch in piece {p}"
                 )));
             }
-            s.verified.borrow_mut()[p / 64] |= 1u64 << (p % 64);
+            s.verified[p / 64].fetch_or(1u64 << (p % 64), AtomicOrdering::Relaxed);
         }
         Ok(())
     }
@@ -2167,7 +2648,7 @@ impl<B: Bytes> SparseBlob<B> {
                 break;
             }
             out += 1;
-            if !f(key, exts, tail) {
+            if !f(key, &exts, tail) {
                 break;
             }
         }

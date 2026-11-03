@@ -107,6 +107,11 @@ fn cut(staged: &mut usize, n: usize, block_size: usize) -> usize {
 /// overflows, not the length.
 const MAX_RUN: usize = (u32::MAX as usize) - 8;
 
+/// Whether a writer writes compact records unless told otherwise:
+/// `SegmentOptions::compact_records`'s default, kept here because the
+/// planner is built for wasm and the writer's options are not.
+pub(crate) const COMPACT_RECORDS: bool = true;
+
 /// The reserve, accumulated one key at a time.
 ///
 /// This is the shape a caller wants who will not hold their records: the
@@ -135,6 +140,10 @@ pub struct Planner {
     sample_stride: usize,
     /// Cleared when the input cannot be a segment, so `finish` says so.
     viable: bool,
+    /// Whether a short inline run's record is compact, as the writer's
+    /// `SegmentOptions::compact_records` says; the writer's default until
+    /// `compact_records` says otherwise.
+    compact: bool,
 }
 
 impl Planner {
@@ -155,7 +164,14 @@ impl Planner {
             // of these.
             sample_stride: flatindex::fence_stride(0),
             viable: true,
+            compact: COMPACT_RECORDS,
         }
+    }
+
+    /// Size for a writer given `SegmentOptions::compact_records`.
+    pub fn compact_records(mut self, on: bool) -> Planner {
+        self.compact = on;
+        self
     }
 
     /// One key, by its key length and the bytes its values encode to.
@@ -174,15 +190,17 @@ impl Planner {
             self.sampled.push(key_len as u32);
         }
         let inline = self.inline_max > 0 && run_len <= self.inline_max;
-        let tail = if inline { run_len } else { 0 };
-        // One extent per key: that is what a segment writes. Checked, as
+        // One record per key, compact when its run is inline and short, by
+        // the rule the writer's `stream_record` applies. Checked, as
         // `plan_inline` checks the same sum -- unchecked it would wrap where
         // a usize is 32 bits and hand back a reserve for the wrapped total,
         // which is a wrong number rather than a refusal.
-        match self
-            .rec_bytes
-            .checked_add(flatindex::record_len_tail(key_len, 1, tail))
-        {
+        match self.rec_bytes.checked_add(flatindex::segment_record_len(
+            key_len,
+            run_len,
+            inline,
+            self.compact,
+        )) {
             Some(n) => self.rec_bytes = n,
             None => {
                 self.viable = false;
@@ -323,7 +341,18 @@ pub fn for_lengths(
     block_size: usize,
     inline_max: usize,
 ) -> Option<Reserve> {
-    let mut p = Planner::new(block_size, inline_max);
+    for_lengths_as(keys, block_size, inline_max, COMPACT_RECORDS)
+}
+
+/// `for_lengths` for a writer with `SegmentOptions::compact_records` as
+/// given; `for_lengths` takes the writer's default.
+pub fn for_lengths_as(
+    keys: &[(usize, usize)],
+    block_size: usize,
+    inline_max: usize,
+    compact_records: bool,
+) -> Option<Reserve> {
+    let mut p = Planner::new(block_size, inline_max).compact_records(compact_records);
     for &(key_len, run) in keys {
         p.push(key_len, run);
     }
@@ -357,7 +386,9 @@ pub fn from_totals(
     // long as the longest, runs as long as the longest, as many of both as
     // the totals allow.
     let per_key_run = run_bytes.div_ceil(keys).max(1).min(max_run_len);
-    let mut p = Planner::new(block_size, inline_max);
+    // Full records, which are never shorter than compact ones, so the
+    // bound holds for a writer of either.
+    let mut p = Planner::new(block_size, inline_max).compact_records(false);
     for _ in 0..keys {
         p.push(max_key_len, per_key_run);
     }

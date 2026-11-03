@@ -99,11 +99,16 @@ jobs:
       # repository: `.cargo/config.toml` set them for the aarch64 target,
       # which is also the *host* target on the native ARM runner, so that
       # leg tried to run its own tests through a qemu it does not have.
+      # qemu-user answers `madvise` advice with success and passes it to no
+      # kernel, so the unit tests that read the kernel's answer to it cannot
+      # pass here; `supdb_emulated` compiles them out of this job alone, and
+      # the native ARM leg of `test` runs them.
       - name: Build and test under emulation
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64-static -L /usr/aarch64-linux-gnu
-        run: cargo test --release --target aarch64-unknown-linux-gnu --lib
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: --cfg supdb_emulated
+        run: cargo test --profile checked --target aarch64-unknown-linux-gnu --lib
 
   wasm:
     # The browser reader, built. Nothing else in this workflow compiles the

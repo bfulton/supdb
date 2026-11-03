@@ -6,7 +6,8 @@
 #   sh scripts/check.sh lint quick   # some groups
 #
 # build  the crate, release
-# test   unit tests
+# test   unit tests, under the release profile with the arithmetic and the
+#        invariants checked -- see [profile.checked] in Cargo.toml
 # lint   clippy -D warnings, rustfmt --check, the shell inside the workflows
 # quick  a quick-scale run of every arm, written under runs-ci/ (ignored),
 #        then the gate against runs/ and the figures; proves the runner,
@@ -31,13 +32,18 @@ for g in $groups; do
       ;;
     test)
       say test
-      cargo test --release
+      # The library, the binary and the test targets: the examples hold no
+      # tests, and each links RocksDB into a binary of a third of a
+      # gigabyte, twenty of them, which filled this host's disk allowance;
+      # `lint` compiles every one of them under clippy (`--all-targets`).
+      cargo test --profile checked --lib --bins --tests
       ;;
     lint)
       say lint
       cargo clippy --release --all-targets -- -D warnings
       sh scripts/fmt.sh --check
       sh scripts/workflows.sh
+      python3 scripts/policy_defaults.py
       ;;
     quick)
       say quick

@@ -5,10 +5,6 @@
 //! roughly a kilobyte and one of tens of kilobytes -- the measured difference
 //! between no compression at all and 2.7-3.6x on realistic event data.
 
-use std::collections::HashMap;
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
-
 /// CRC-32C (Castagnoli) over stored bytes.
 ///
 /// Nothing outside the 120-byte superblock used to be checksummed, so a bit
@@ -60,10 +56,10 @@ const fn build_crc_tables() -> [[u32; 256]; 8] {
 }
 
 /// Portable slice-by-8. Consumes eight bytes per round rather than one.
-fn crc32c_scalar(data: &[u8]) -> u32 {
-    let mut c = 0xFFFF_FFFFu32;
-    let mut chunks = data.chunks_exact(8);
-    for w in &mut chunks {
+fn crc32c_scalar(init: u32, data: &[u8]) -> u32 {
+    let mut c = init;
+    let (words, rest) = data.as_chunks::<8>();
+    for w in words {
         let lo = u32::from_le_bytes([w[0], w[1], w[2], w[3]]) ^ c;
         let hi = u32::from_le_bytes([w[4], w[5], w[6], w[7]]);
         c = CRC_TABLES[7][(lo & 0xff) as usize]
@@ -75,7 +71,7 @@ fn crc32c_scalar(data: &[u8]) -> u32 {
             ^ CRC_TABLES[1][((hi >> 16) & 0xff) as usize]
             ^ CRC_TABLES[0][((hi >> 24) & 0xff) as usize];
     }
-    for b in chunks.remainder() {
+    for b in rest {
         c = CRC_TABLES[0][((c ^ *b as u32) & 0xff) as usize] ^ (c >> 8);
     }
     c ^ 0xFFFF_FFFF
@@ -83,15 +79,15 @@ fn crc32c_scalar(data: &[u8]) -> u32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.2")]
-unsafe fn crc32c_hw(data: &[u8]) -> u32 {
+unsafe fn crc32c_hw(init: u32, data: &[u8]) -> u32 {
     use core::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8};
-    let mut c = 0xFFFF_FFFFu64;
-    let mut chunks = data.chunks_exact(8);
-    for w in &mut chunks {
-        c = _mm_crc32_u64(c, u64::from_le_bytes(w.try_into().unwrap()));
+    let mut c = init as u64;
+    let (words, rest) = data.as_chunks::<8>();
+    for w in words {
+        c = _mm_crc32_u64(c, u64::from_le_bytes(*w));
     }
     let mut c = c as u32;
-    for b in chunks.remainder() {
+    for b in rest {
         c = _mm_crc32_u8(c, *b);
     }
     c ^ 0xFFFF_FFFF
@@ -101,14 +97,14 @@ unsafe fn crc32c_hw(data: &[u8]) -> u32 {
 /// optional in the base ISA, so it is still feature-detected.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "crc")]
-unsafe fn crc32c_hw(data: &[u8]) -> u32 {
+unsafe fn crc32c_hw(init: u32, data: &[u8]) -> u32 {
     use core::arch::aarch64::{__crc32cb, __crc32cd};
-    let mut c = 0xFFFF_FFFFu32;
-    let mut chunks = data.chunks_exact(8);
-    for w in &mut chunks {
-        c = __crc32cd(c, u64::from_le_bytes(w.try_into().unwrap()));
+    let mut c = init;
+    let (words, rest) = data.as_chunks::<8>();
+    for w in words {
+        c = __crc32cd(c, u64::from_le_bytes(*w));
     }
-    for b in chunks.remainder() {
+    for b in rest {
         c = __crc32cb(c, *b);
     }
     c ^ 0xFFFF_FFFF
@@ -118,6 +114,97 @@ unsafe fn crc32c_hw(data: &[u8]) -> u32 {
 static CRC_IMPL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 pub fn crc32(data: &[u8]) -> u32 {
+    crc32_from(0xFFFF_FFFF, data)
+}
+
+/// The CRC of `data` appended to what `prev` is the CRC of: the state a
+/// finished CRC hides behind its final xor, resumed. Zero is the empty
+/// input's CRC, so `crc32_resume(0, d)` is `crc32(d)`.
+pub fn crc32_resume(prev: u32, data: &[u8]) -> u32 {
+    crc32_from(prev ^ 0xFFFF_FFFF, data)
+}
+
+/// The CRC of two inputs' concatenation from the CRC of each and the
+/// second's length: `crc32_combine(crc32(a), crc32(b), b.len()) ==
+/// crc32(a ++ b)`, and `crc32_combine(0, c, n)` is `c`, zero being the
+/// empty input's CRC. This is what lets one pass over a byte stream yield
+/// both the CRC of a run that crosses chunk boundaries and the CRC of each
+/// chunk: a direct segment's commit marker covers a batch of records and
+/// its checksum row covers the key section in aligned pieces, and the
+/// writer hashed every byte once for each until the pieces' CRCs were
+/// combined into the batch's instead.
+///
+/// zlib's method: shifting a CRC past `len2` zero bytes is a linear map
+/// over GF(2), the product of the maps for the powers of two in `len2`,
+/// each a 32x32 matrix built once; the shifted first CRC xored with the
+/// second is the whole's.
+pub fn crc32_combine(crc1: u32, crc2: u32, len2: u64) -> u32 {
+    if len2 == 0 {
+        return crc1;
+    }
+    let shifts = CRC_SHIFTS.get_or_init(crc32c_shift_matrices);
+    let mut c = crc1;
+    let mut n = len2;
+    let mut k = 0usize;
+    while n != 0 {
+        if n & 1 != 0 {
+            c = gf2_times(&shifts[k], c);
+        }
+        n >>= 1;
+        k += 1;
+    }
+    c ^ crc2
+}
+
+/// The operator for shifting a CRC-32C past `2^k` zero bytes, for every
+/// `k` a length can hold.
+static CRC_SHIFTS: std::sync::OnceLock<Vec<[u32; 32]>> = std::sync::OnceLock::new();
+
+fn gf2_times(mat: &[u32; 32], mut vec: u32) -> u32 {
+    let mut sum = 0u32;
+    let mut i = 0usize;
+    while vec != 0 {
+        if vec & 1 != 0 {
+            sum ^= mat[i];
+        }
+        vec >>= 1;
+        i += 1;
+    }
+    sum
+}
+
+fn gf2_square(mat: &[u32; 32]) -> [u32; 32] {
+    let mut sq = [0u32; 32];
+    for (n, s) in sq.iter_mut().enumerate() {
+        *s = gf2_times(mat, mat[n]);
+    }
+    sq
+}
+
+fn crc32c_shift_matrices() -> Vec<[u32; 32]> {
+    // The operator for one zero bit, over the reflected Castagnoli
+    // polynomial; squared, the operator for one byte; squared again for
+    // each further power of two bytes.
+    let mut odd = [0u32; 32];
+    odd[0] = 0x82F6_3B78;
+    let mut row = 1u32;
+    for o in odd.iter_mut().skip(1) {
+        *o = row;
+        row <<= 1;
+    }
+    let even = gf2_square(&odd); // two bits
+    let mut byte = gf2_square(&even); // four bits
+    byte = gf2_square(&byte); // eight bits: one byte
+    let mut out = Vec::with_capacity(64);
+    let mut m = byte;
+    for _ in 0..64 {
+        out.push(m);
+        m = gf2_square(&m);
+    }
+    out
+}
+
+fn crc32_from(init: u32, data: &[u8]) -> u32 {
     #[allow(unused_imports)]
     use std::sync::atomic::Ordering;
     #[cfg(target_arch = "aarch64")]
@@ -133,7 +220,7 @@ pub fn crc32(data: &[u8]) -> u32 {
         }
         if which == 1 {
             // SAFETY: only reached once the CPU has advertised the CRC extension.
-            return unsafe { crc32c_hw(data) };
+            return unsafe { crc32c_hw(init, data) };
         }
     }
     #[cfg(target_arch = "x86_64")]
@@ -149,10 +236,10 @@ pub fn crc32(data: &[u8]) -> u32 {
         }
         if which == 1 {
             // SAFETY: only reached once the CPU has advertised SSE4.2.
-            return unsafe { crc32c_hw(data) };
+            return unsafe { crc32c_hw(init, data) };
         }
     }
-    crc32c_scalar(data)
+    crc32c_scalar(init, data)
 }
 
 /// Where a block lives and how big it is in each form.
@@ -235,76 +322,8 @@ impl BlockBuilder {
         off
     }
 
-    /// The bytes staged so far.
-    ///
-    /// A writer that wants to read its own writes has to see extents that are
-    /// in the builder but not yet in a block, because their block id does not
-    /// exist until the builder is flushed. Exposing the buffer is what lets
-    /// `Store::read_all` answer without sealing anything.
-    pub fn staged(&self) -> &[u8] {
-        &self.buf
-    }
-
     pub fn take(&mut self) -> Vec<u8> {
         std::mem::replace(&mut self.buf, Vec::with_capacity(self.cap))
-    }
-}
-
-/// A bounded cache of decompressed blocks.
-///
-/// Without this, a compressed store pays decompression on every read and warm
-/// reads collapse -- the measured tradeoff that forced Uppend to choose
-/// between 407 MB at 16,988 reads/s and 1,065 MB at 53,507 reads/s.
-pub struct BlockCache {
-    shards: Vec<Mutex<Shard>>,
-    mask: usize,
-}
-
-struct Shard {
-    map: HashMap<u32, Arc<Vec<u8>>>,
-    order: VecDeque<u32>,
-    cap: usize,
-}
-
-impl BlockCache {
-    pub fn new(total_blocks: usize) -> Self {
-        let shard_count = 16;
-        let per = (total_blocks / shard_count).max(4);
-        BlockCache {
-            shards: (0..shard_count)
-                .map(|_| {
-                    Mutex::new(Shard {
-                        map: HashMap::with_capacity(per),
-                        order: VecDeque::with_capacity(per),
-                        cap: per,
-                    })
-                })
-                .collect(),
-            mask: shard_count - 1,
-        }
-    }
-
-    fn shard(&self, id: u32) -> &Mutex<Shard> {
-        &self.shards[(id as usize) & self.mask]
-    }
-
-    pub fn get(&self, id: u32) -> Option<Arc<Vec<u8>>> {
-        let s = self.shard(id).lock().unwrap();
-        s.map.get(&id).map(Arc::clone)
-    }
-
-    pub fn put(&self, id: u32, bytes: Arc<Vec<u8>>) {
-        let mut s = self.shard(id).lock().unwrap();
-        if s.map.contains_key(&id) {
-            return;
-        }
-        if s.map.len() >= s.cap {
-            if let Some(old) = s.order.pop_front() {
-                s.map.remove(&old);
-            }
-        }
-        s.order.push_back(id);
-        s.map.insert(id, bytes);
     }
 }
 
@@ -315,11 +334,6 @@ pub fn compress(src: &[u8]) -> Option<Vec<u8>> {
     } else {
         None
     }
-}
-
-pub fn decompress(src: &[u8], uncompressed: usize) -> std::io::Result<Vec<u8>> {
-    lz4_flex::decompress(src, uncompressed)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 /// Decompress into a caller-owned buffer, allocating nothing.
@@ -345,6 +359,12 @@ pub fn decompress_into(src: &[u8], dst: &mut Vec<u8>, uncompressed: usize) -> st
 /// `start_n` is the end. `crc_i` covers the *stored* bytes of chunk `i`, so a
 /// point read verifies only the chunk it decodes rather than the whole block --
 /// which is the whole reason the chunking exists.
+///
+/// The chunk size is the read-amplification dial. A wide key holds under a
+/// kilobyte, so a 4 KiB chunk inflates 4 KiB to hand back 960 bytes. Smaller
+/// chunks decompress less per read and compress slightly worse; the reader
+/// takes the size from the block header, so this is a write-time choice and
+/// old blocks stay readable.
 pub const CHUNK: usize = 4096;
 
 /// How many chunk checksums a block may carry beside it.
@@ -376,13 +396,14 @@ pub fn chunk_crcs(bytes: &[u8]) -> Option<[u32; MAX_CHUNK_CRCS]> {
     Some(out)
 }
 
-/// The chunk size is the read-amplification dial. A wide key holds under a
-/// kilobyte, so a 4 KiB chunk inflates 4 KiB to hand back 960 bytes. Smaller
-/// chunks decompress less per read and compress slightly worse; the reader
-/// takes the size from the block header, so this is a write-time choice and
-/// old blocks stay readable.
-/// When false, chunk checksums are written as zero and not verified. Set once
-/// at store creation; this is a measurement knob, not a per-call switch.
+/// When false, chunk checksums are written as zero. Set once at store
+/// creation; this is a measurement knob, not a per-call switch, and it is
+/// WRITE time only. Whether a reader verifies is the reader's own
+/// `BlobOptions::verify_checksums`, threaded down to the decoders here,
+/// because this switch is process-wide: while the read path consulted it,
+/// a store written with checksums off and then opened by any process that
+/// had not itself written a segment verified the zeroes it had stored on
+/// purpose and refused every run that reached a block.
 pub static CHECKSUMS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 #[inline]
@@ -434,102 +455,13 @@ pub fn chunk_header_len(n: usize) -> usize {
     8 + 4 * (n + 1) + 4 * n
 }
 
-pub fn write_chunked(src: &[u8]) -> Vec<u8> {
-    write_chunked_sz(src, CHUNK)
-}
-
-/// Populate `dst[a..b]` from a chunked block, touching only the chunks that
-/// cover that range. `dst` must already be sized to the uncompressed length.
-/// Chunk size and count of a chunked block, without decoding anything.
-pub fn chunk_geometry(blk: &[u8]) -> Option<(usize, usize)> {
-    if blk.len() < 8 {
-        return None;
-    }
-    let cs = u32::from_le_bytes(blk[0..4].try_into().unwrap()) as usize;
-    let n = u32::from_le_bytes(blk[4..8].try_into().unwrap()) as usize;
-    if cs == 0 || n == 0 || n > (1 << 20) {
-        return None;
-    }
-    Some((cs, n))
-}
-
-/// Decode only the chunks covering `a..b` that `have` does not already mark as
-/// decoded, setting their bits.
-///
-/// A scan revisits a block many times as it walks keys in order, but a key may
-/// need only one chunk of it. Decoding the whole block on first touch suits a
-/// block holding hundreds of single-value keys and wastes sixty-fold on one
-/// holding a few keys with many values each. Tracking which chunks are already
-/// decoded serves both.
-pub fn read_chunks_into(
-    blk: &[u8],
-    uncompressed: usize,
-    a: usize,
-    b: usize,
-    dst: &mut [u8],
-    have: &mut [u64],
-) -> std::io::Result<()> {
-    let Some((cs, n)) = chunk_geometry(blk) else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "not a valid chunked block; its space may have been reused",
-        ));
-    };
-    let header = chunk_header_len(n);
-    if blk.len() < header {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "chunk directory extends past the block",
-        ));
-    }
-    let start = |i: usize| -> usize {
-        u32::from_le_bytes(blk[8 + 4 * i..12 + 4 * i].try_into().unwrap()) as usize
-    };
-    let crc_base = 8 + 4 * (n + 1);
-    let stored_crc = |i: usize| {
-        u32::from_le_bytes(
-            blk[crc_base + 4 * i..crc_base + 4 * i + 4]
-                .try_into()
-                .unwrap(),
-        )
-    };
-    for i in (a / cs)..=((b.saturating_sub(1)) / cs).min(n - 1) {
-        let (w, bit) = (i / 64, 1u64 << (i % 64));
-        if have[w] & bit != 0 {
-            continue;
-        }
-        let (s0, s1) = (start(i), start(i + 1));
-        if s1 < s0 || header + s1 > blk.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "chunk offsets out of range",
-            ));
-        }
-        let raw = &blk[header + s0..header + s1];
-        if checksums_on() && crc32(raw) != stored_crc(i) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "chunk checksum mismatch: these bytes are not what was written",
-            ));
-        }
-        let (lo, hi) = (i * cs, ((i + 1) * cs).min(uncompressed));
-        if raw.len() == hi - lo {
-            dst[lo..hi].copy_from_slice(raw);
-        } else {
-            lz4_flex::block::decompress_into(raw, &mut dst[lo..hi])
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        }
-        have[w] |= bit;
-    }
-    Ok(())
-}
-
 pub fn read_chunked_range(
     blk: &[u8],
     uncompressed: usize,
     a: usize,
     b: usize,
     dst: &mut [u8],
+    verify: bool,
 ) -> std::io::Result<()> {
     // These bytes may not be a chunk directory at all -- under Retain::Reclaim
     // the space a superseded value occupied can have been written over. Decode
@@ -575,7 +507,7 @@ pub fn read_chunked_range(
         // Verify before decoding. LZ4 decodes many corrupted inputs into
         // plausible bytes, so a successful decompression is not evidence that
         // the bytes are the ones that were written.
-        if checksums_on() && crc32(raw) != stored_crc(i) {
+        if verify && crc32(raw) != stored_crc(i) {
             return Err(bad("chunk checksum mismatch"));
         }
         let lo = i * cs;
@@ -594,6 +526,47 @@ pub fn read_chunked_range(
 mod checksum_tests {
     use super::*;
 
+    #[test]
+    fn a_combined_crc_is_the_concatenation_s_crc() {
+        let data: Vec<u8> = (0..70_000u32).map(|i| (i * 31 + i / 7) as u8).collect();
+        for &split in &[
+            0usize, 1, 7, 255, 256, 4096, 16_383, 16_384, 16_385, 40_000, 69_999, 70_000,
+        ] {
+            let (a, b) = data.split_at(split);
+            assert_eq!(
+                crc32_combine(crc32(a), crc32(b), b.len() as u64),
+                crc32(&data),
+                "split at {split}"
+            );
+            assert_eq!(crc32_combine(0, crc32(b), b.len() as u64), crc32(b));
+            assert_eq!(crc32_resume(crc32(a), b), crc32(&data));
+        }
+        // Three pieces folded in turn, as a row's pieces into a batch's marker.
+        let (x, rest) = data.split_at(10_000);
+        let (y, z) = rest.split_at(16_384);
+        let c = crc32_combine(
+            crc32_combine(crc32(x), crc32(y), y.len() as u64),
+            crc32(z),
+            z.len() as u64,
+        );
+        assert_eq!(c, crc32(&data));
+    }
+
+    #[test]
+    fn a_resumed_crc_is_the_whole_input_s_crc() {
+        use super::{crc32, crc32_resume};
+        let data: Vec<u8> = (0..1000u32).map(|i| (i * 7 + i / 13) as u8).collect();
+        for cut in [0usize, 1, 7, 8, 9, 500, 999, 1000] {
+            let (a, b) = data.split_at(cut);
+            assert_eq!(crc32_resume(crc32(a), b), crc32(&data), "cut at {cut}");
+        }
+        assert_eq!(crc32_resume(0, &data), crc32(&data));
+        assert_ne!(
+            crc32_resume(crc32(&data[..500]), &data[499..]),
+            crc32(&data)
+        );
+    }
+
     fn payload() -> Vec<u8> {
         // Compressible enough that chunks actually shrink, varied enough that
         // they are not all identical.
@@ -605,7 +578,7 @@ mod checksum_tests {
         let src = payload();
         let blk = write_chunked_sz(&src, 1024);
         let mut out = vec![0u8; src.len()];
-        read_chunked_range(&blk, src.len(), 0, src.len(), &mut out).unwrap();
+        read_chunked_range(&blk, src.len(), 0, src.len(), &mut out, true).unwrap();
         assert_eq!(out, src);
     }
 
@@ -616,7 +589,7 @@ mod checksum_tests {
         let src = payload();
         let blk = write_chunked_sz(&src, 1024);
         let header = {
-            let (_, n) = chunk_geometry(&blk).unwrap();
+            let n = u32::from_le_bytes(blk[4..8].try_into().unwrap()) as usize;
             chunk_header_len(n)
         };
         let mut caught = 0;
@@ -625,7 +598,7 @@ mod checksum_tests {
             let mut damaged = blk.clone();
             damaged[off] ^= 0x01;
             let mut out = vec![0u8; src.len()];
-            match read_chunked_range(&damaged, src.len(), 0, src.len(), &mut out) {
+            match read_chunked_range(&damaged, src.len(), 0, src.len(), &mut out, true) {
                 Err(_) => caught += 1,
                 Ok(()) => {
                     if out == src {
@@ -652,7 +625,7 @@ mod checksum_tests {
             damaged[off] ^= 0xff;
             let mut out = vec![0u8; src.len()];
             // Either an error or a correct decode; never a panic.
-            let _ = read_chunked_range(&damaged, src.len(), 0, src.len(), &mut out);
+            let _ = read_chunked_range(&damaged, src.len(), 0, src.len(), &mut out, true);
         }
     }
 
@@ -679,8 +652,12 @@ mod checksum_tests {
                     (seed & 0xff) as u8
                 })
                 .collect();
-            let hw = unsafe { crc32c_hw(&data) };
-            assert_eq!(hw, crc32c_scalar(&data), "diverged at len {len}");
+            let hw = unsafe { crc32c_hw(0xFFFF_FFFF, &data) };
+            assert_eq!(
+                hw,
+                crc32c_scalar(0xFFFF_FFFF, &data),
+                "diverged at len {len}"
+            );
             assert_eq!(
                 hw,
                 crc32(&data),

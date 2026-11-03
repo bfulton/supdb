@@ -14,6 +14,9 @@ use supdb::bytes::MmapBytes;
 use supdb::SegmentWriter;
 use supdb::{Blob, SegmentOptions, SparseBlob};
 
+mod common;
+use common::{kv, vf, without_the_clock};
+
 /// `block::CHECKSUMS` is process-wide -- every writer here
 /// set it from `SegmentOptions::checksums` -- and the test harness runs tests
 /// concurrently, so a checksums-off test flips the switch under a
@@ -151,11 +154,11 @@ fn agree(a: &Blob<MmapBytes>, b: &Blob<MmapBytes>, data: &[(Vec<u8>, Vec<Vec<u8>
     for (rank, (key, vals)) in data.iter().enumerate() {
         let mut ga = Vec::new();
         let na = a
-            .read_all(key, |v| ga.push(v.to_vec()))
+            .read_all(key, vf(&mut |v| ga.push(v.to_vec())))
             .expect("block-layout read_all");
         let mut gb = Vec::new();
         let nb = b
-            .read_all(key, |v| gb.push(v.to_vec()))
+            .read_all(key, vf(&mut |v| gb.push(v.to_vec())))
             .expect("bulk read_all");
         assert_eq!(
             na,
@@ -191,16 +194,24 @@ fn agree(a: &Blob<MmapBytes>, b: &Blob<MmapBytes>, data: &[(Vec<u8>, Vec<Vec<u8>
             .expect("values_at");
         assert_eq!(&by_rank, vals, "values by rank for {key:?}");
     }
-    assert_eq!(a.read_all(b"no such key", |_| {}).unwrap(), 0);
-    assert_eq!(b.read_all(b"no such key", |_| {}).unwrap(), 0);
+    assert_eq!(a.read_all(b"no such key", vf(&mut |_| {})).unwrap(), 0);
+    assert_eq!(b.read_all(b"no such key", vf(&mut |_| {})).unwrap(), 0);
     assert_eq!(b.count(b"no such key").unwrap(), 0);
 
     let mut sa = Vec::new();
-    a.scan(b"", usize::MAX, |k, v| sa.push((k.to_vec(), v.to_vec())))
-        .expect("block-layout scan");
+    a.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| sa.push((k.to_vec(), v.to_vec()))),
+    )
+    .expect("block-layout scan");
     let mut sb = Vec::new();
-    b.scan(b"", usize::MAX, |k, v| sb.push((k.to_vec(), v.to_vec())))
-        .expect("bulk scan");
+    b.scan(
+        b"",
+        usize::MAX,
+        kv(&mut |k, v| sb.push((k.to_vec(), v.to_vec()))),
+    )
+    .expect("bulk scan");
     let want: Vec<(Vec<u8>, Vec<u8>)> = data
         .iter()
         .flat_map(|(k, vals)| vals.iter().map(move |v| (k.clone(), v.clone())))
@@ -312,6 +323,122 @@ fn the_two_segment_layouts_agree_with_checksums_off_too() {
     );
 }
 
+/// The writer's piece decides how the file is written, never what it
+/// holds: the same keys written in pieces of 4 KB, of a megabyte and of
+/// 2 MB make the same bytes, so the piece is priced as a write path alone.
+#[test]
+fn the_write_piece_changes_how_a_segment_is_written_and_not_what() {
+    let _serial = serial();
+    let dir = scratch("piece");
+    let data = varlen(4_000, 23);
+    let files: Vec<Vec<u8>> = [4096usize, 1 << 20, 2 << 20]
+        .iter()
+        .map(|&piece| {
+            let path = dir.join(format!("piece-{piece}.sup"));
+            write_bulk(
+                &path,
+                &data,
+                SegmentOptions {
+                    write_piece: piece,
+                    ..opts()
+                },
+            );
+            without_the_clock(&std::fs::read(&path).unwrap())
+        })
+        .collect();
+    assert!(
+        files[0].len() > 2 * (2 << 20),
+        "the segment spans several 2 MB pieces, or the pieces were never tested"
+    );
+    for (a, b, what) in [(0, 1, "4 KB and 1 MB"), (1, 2, "1 MB and 2 MB")] {
+        let first = files[a].iter().zip(&files[b]).position(|(x, y)| x != y);
+        assert!(
+            files[a].len() == files[b].len() && first.is_none(),
+            "{what} pieces wrote different segments: lengths {} and {}, first difference at {first:?}",
+            files[a].len(),
+            files[b].len()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_record_put_in_one_call_is_the_record_the_three_calls_write() {
+    // `put_one` streams a one-value record from the caller's slices;
+    // `begin`, `value` and `end` stage the value, encode the run and
+    // build the record first. The file must not know which was used:
+    // over values inline and in blocks, empty and not, with and without
+    // the batch markers, the two segments are byte for byte the same.
+    let _serial = serial();
+    let dir = scratch("putone");
+    let mut x = 7u64;
+    let data: Vec<(Vec<u8>, Vec<u8>)> = (0..3_000u32)
+        .map(|i| {
+            let len = match i % 7 {
+                0 => 0,
+                1 => 1,
+                2 => 255,
+                3 => 256,
+                4 => 257,
+                5 => 9_000,
+                _ => 100,
+            };
+            let v: Vec<u8> = (0..len).map(|_| splitmix(&mut x) as u8).collect();
+            (format!("key-{i:06}").into_bytes(), v)
+        })
+        .collect();
+    for marks in [false, true] {
+        let steps = dir.join(format!("steps-{marks}.sup"));
+        let one = dir.join(format!("one-{marks}.sup"));
+        {
+            let mut w = SegmentWriter::create(&steps, &opts()).expect("create");
+            w.set_inline_max(INLINE);
+            w.set_marks(marks);
+            for (k, v) in &data {
+                w.begin(k).expect("begin");
+                w.value(v);
+                w.end().expect("end");
+                if marks {
+                    w.mark().expect("mark");
+                }
+            }
+            w.finish(1).expect("finish");
+        }
+        {
+            let mut w = SegmentWriter::create(&one, &opts()).expect("create");
+            w.set_inline_max(INLINE);
+            w.set_marks(marks);
+            for (k, v) in &data {
+                w.put_one(k, v).expect("put_one");
+                if marks {
+                    w.mark().expect("mark");
+                }
+            }
+            assert_eq!(w.keys(), data.len());
+            w.finish(1).expect("finish");
+        }
+        let a = without_the_clock(&std::fs::read(&steps).unwrap());
+        let b = without_the_clock(&std::fs::read(&one).unwrap());
+        let first = a.iter().zip(&b).position(|(x, y)| x != y);
+        assert!(
+            a.len() == b.len() && first.is_none(),
+            "marks {marks}: the one-call record differs: lengths {} and {}, first difference at {first:?}",
+            a.len(),
+            b.len()
+        );
+        let blob = open(&one);
+        for (k, v) in &data {
+            let mut got = Vec::new();
+            let n = blob
+                .read_all(k, vf(&mut |x| got.push(x.to_vec())))
+                .expect("read_all");
+            assert_eq!(n, 1, "one value for {}", String::from_utf8_lossy(k));
+            assert_eq!(&got[0], v);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn fixed_width_counts_come_from_the_extent_alone() {
     let _serial = serial();
@@ -358,7 +485,10 @@ fn the_checksum_recorded_is_the_one_the_reader_checks() {
     write_bulk_with(&path, &data, opts(), 0);
     // Intact first.
     let b = open(&path);
-    assert_eq!(b.read_all(b"\x00first", |_| {}).expect("intact"), 1);
+    assert_eq!(
+        b.read_all(b"\x00first", vf(&mut |_| {})).expect("intact"),
+        1
+    );
     drop(b);
     // The first key is the first record of the first block, which starts
     // right after the header region; flip a byte inside its 50-byte value.
@@ -368,7 +498,7 @@ fn the_checksum_recorded_is_the_one_the_reader_checks() {
     std::fs::write(&path, &bytes).expect("write");
     let b = open(&path);
     let e = b
-        .read_all(b"\x00first", |_| {})
+        .read_all(b"\x00first", vf(&mut |_| {}))
         .expect_err("a corrupted block must not be served");
     assert!(
         e.to_string().contains("checksum"),
@@ -448,13 +578,15 @@ fn a_run_of_one_width_is_stored_without_prefixes_and_reads_the_same() {
     assert!(eo[0].is_fixed());
 
     let mut got = Vec::new();
-    blob.read_all(b"fixed", |v| got.push(v.to_vec())).unwrap();
+    blob.read_all(b"fixed", vf(&mut |v| got.push(v.to_vec())))
+        .unwrap();
     assert_eq!(got.len(), 1000);
     for (i, v) in got.iter().enumerate() {
         assert_eq!(v.as_slice(), (i as u32).to_be_bytes());
     }
     let mut got = Vec::new();
-    blob.read_all(b"mixed", |v| got.push(v.to_vec())).unwrap();
+    blob.read_all(b"mixed", vf(&mut |v| got.push(v.to_vec())))
+        .unwrap();
     assert_eq!(got.len(), 1000);
     assert_eq!(got[999], b"999".to_vec());
     // Counts: exact from the flag, and a wrong width is refused outright.
@@ -468,7 +600,8 @@ fn a_run_of_one_width_is_stored_without_prefixes_and_reads_the_same() {
     assert_eq!(blob.count_fixed(b"one", 4), Some(1));
     // The scan agrees.
     let mut pairs = 0usize;
-    blob.scan(b"", usize::MAX, |_, _| pairs += 1).unwrap();
+    blob.scan(b"", usize::MAX, kv(&mut |_, _| pairs += 1))
+        .unwrap();
     assert_eq!(pairs, 2001);
     // read_concat of a fixed run is the bytes back to back.
     let mut out = Vec::new();
@@ -501,11 +634,28 @@ fn a_run_of_one_width_is_stored_without_prefixes_and_reads_the_same() {
 /// misread: a flipped FIXED bit re-decodes a run under the other encoding.
 #[test]
 fn every_flip_in_the_key_section_fails_the_open() {
+    for compact in [false, true] {
+        every_flip_in_the_key_section_fails_the_open_with(compact);
+    }
+}
+
+fn every_flip_in_the_key_section_fails_the_open_with(compact: bool) {
     let _g = serial();
-    let dir = scratch("segwriter-indexsum");
+    let dir = scratch(if compact {
+        "segwriter-indexsum-compact"
+    } else {
+        "segwriter-indexsum"
+    });
     let path = dir.join("seg.sup");
     let data = fixed(1500, 4, 0x1D5);
-    write_bulk(&path, &data, opts());
+    write_bulk(
+        &path,
+        &data,
+        SegmentOptions {
+            compact_records: compact,
+            ..opts()
+        },
+    );
     let clean = std::fs::read(&path).unwrap();
     let (key_off, key_len) = {
         let b = open(&path);
@@ -1067,10 +1217,36 @@ fn the_computed_reserve_is_the_smallest_one_that_works() {
 /// sizes the reserve itself.
 #[test]
 fn write_sorted_matches_the_streaming_writer_and_reserves_exactly() {
+    // And with compact records, whose length the planner takes from the
+    // same rule the writer applies: a reserve short by sixteen bytes a key
+    // would fail the equality below.
+    for compact in [false, true] {
+        write_sorted_matches_with(compact);
+    }
+    // A varying width, whose compact record rebuilds `last` from the
+    // prefixes, through the same two writers.
+    write_sorted_matches_on(varlen(900, 0xBA8), true, "segwriter-batch-varlen");
+}
+
+fn write_sorted_matches_with(compact: bool) {
+    write_sorted_matches_on(
+        fixed(1500, 4, 0xBA7),
+        compact,
+        if compact {
+            "segwriter-batch-compact"
+        } else {
+            "segwriter-batch"
+        },
+    );
+}
+
+fn write_sorted_matches_on(data: Vec<(Vec<u8>, Vec<Vec<u8>>)>, compact: bool, name: &str) {
     let _g = serial();
-    let dir = scratch("segwriter-batch");
-    let o = opts();
-    let data = fixed(1500, 4, 0xBA7);
+    let dir = scratch(name);
+    let o = SegmentOptions {
+        compact_records: compact,
+        ..opts()
+    };
 
     let streamed = dir.join("streamed.sup");
     let batched = dir.join("batched.sup");
@@ -1082,7 +1258,7 @@ fn write_sorted_matches_the_streaming_writer_and_reserves_exactly() {
             (k.len(), supdb::reserve::run_len(&lens))
         })
         .collect();
-    let want = supdb::reserve::for_lengths(&lengths, o.block_size, INLINE)
+    let want = supdb::reserve::for_lengths_as(&lengths, o.block_size, INLINE, compact)
         .expect("plannable")
         .bytes();
     let write = supdb::SegmentWrite {
@@ -1126,36 +1302,14 @@ fn write_sorted_matches_the_streaming_writer_and_reserves_exactly() {
     assert_eq!(blob.keys(), data.len());
     for (k, vals) in data.iter().take(50) {
         let mut got: Vec<Vec<u8>> = Vec::new();
-        blob.read_all(k, |v| got.push(v.to_vec())).expect("read");
+        blob.read_all(k, vf(&mut |v| got.push(v.to_vec())))
+            .expect("read");
         assert_eq!(&got, vals, "values differ for a key");
     }
 }
 
 /// A segment's bytes with the wall clock taken out of them.
 ///
-/// The superblock records `SystemTime::now()` in seconds as its third field,
-/// and the FNV-1a over the fields that follows it covers that second, in each
-/// of the two slots. So two writes of identical input differ in eighteen-odd
-/// bytes whenever they straddle a tick, and comparing whole files is a test
-/// that passes on a fast machine and fails on a slow one -- which is what it
-/// did: green here, red on the macOS runner, on the arm of a loop where
-/// nothing about the setting under test touches a byte.
-///
-/// Everything else is compared, including the superblock's offsets, which are
-/// what a mis-applied setting would actually move.
-fn without_the_clock(bytes: &[u8]) -> Vec<u8> {
-    const SLOT: usize = 512;
-    const TS: usize = 16;
-    const FNV: usize = 136;
-    let mut out = bytes.to_vec();
-    for slot in [0, SLOT] {
-        for at in [slot + TS, slot + FNV] {
-            out[at..at + 8].fill(0);
-        }
-    }
-    out
-}
-
 /// Values that compress: the same few bytes over and over, so LZ4 has
 /// something to find. `fixed`'s random values deliberately have none, which
 /// makes them the wrong fixture for asking whether compression happened.
@@ -1224,7 +1378,8 @@ fn write_sorted_applies_every_per_file_setting() {
     assert_eq!(blob.keys(), data.len());
     for (k, vals) in data.iter().take(40) {
         let mut got: Vec<Vec<u8>> = Vec::new();
-        blob.read_all(k, |v| got.push(v.to_vec())).expect("read");
+        blob.read_all(k, vf(&mut |v| got.push(v.to_vec())))
+            .expect("read");
         assert_eq!(&got, vals, "a compressed key read back differently");
     }
 
@@ -1540,7 +1695,7 @@ fn a_segment_can_be_written_without_holding_its_records() {
     assert_eq!(blob.keys(), n);
     for i in (0..n).step_by(997) {
         let mut got: Vec<Vec<u8>> = Vec::new();
-        blob.read_all(&key_of(i), |v| got.push(v.to_vec()))
+        blob.read_all(&key_of(i), vf(&mut |v| got.push(v.to_vec())))
             .expect("read");
         assert_eq!(got, values_of(i), "key {i} read back differently");
     }

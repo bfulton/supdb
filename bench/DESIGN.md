@@ -10,17 +10,28 @@ row outside the error bars its neighbours drew.
 
 ## Workloads
 
-Five, plus two floors. Each yields one or more quantities.
+The workloads below, plus four floors. Each yields one or more quantities.
 
 | workload | shape | quantities |
 |---|---|---|
-| `load` | n keys in key order, 100-byte values, durable per batch | ops/s, device bytes written per byte stored |
+| `load` | n keys in key order, 100-byte values, a commit per batch under the arm's guarantee | ops/s, device bytes written per byte stored, bytes on disk per byte stored |
 | `load-shuffled` | the same keys in shuffled order | ops/s |
-| `read` | uniform point reads over the loaded set | reads/s, p99 µs |
-| `scan` | one ordered pass over everything | entries/s |
+| `read` | uniform point reads over the loaded set, on one thread and again on each of the class's reader-thread counts: two, doubling, one fewer than its cores | reads/s, p99 µs; reads/s per thread count |
+| `scan` | `size/100` scans of 100 entries, from uniform random starts, on one thread; `size` scans a thread again on each of the class's reader-thread counts | entries/s; entries/s per thread count |
 | `ycsb` | core A–F on the loaded store, zipfian, a sixth of the keys in operations per mix | ops/s per mix |
+| `scan-mixed` | the threaded `scan` passes again on the store the six mixes leave | entries/s per thread count |
+| `scan-lag` | on the store the shuffled load leaves, the keys updated in slices to 0, 1, 10 and 100% of the store, each slice a burst of batches followed by the `scan` workload's scans with nothing merged between | entries/s of each point's scans; updates/s of each point's burst |
 | `wal-floor` | framed 1,000-record batches appended to one file, one `fdatasync` each, no engine | ops/s |
 | `scan-floor` | one `mmap` sequential walk of a file the top rung's size (capped at 4 GiB), no engine | bytes/s |
+| `mem-floor` | one dependent load at a time around a permutation of a 64 MiB buffer's cache lines, no engine | chases/s |
+| `page-floor` | one first touch per page of a fresh anonymous mapping of a thousand pages, the mapping held to the row's end; sampled with the other floors and again after every rep of every rung, no engine: the price of a page inside the pool every store is primed with (below) | pages/s |
+| `seek-floor` | bounded rows only: 1,024 reads of one page at page-aligned uniform offsets of the scan floor's file, its pages dropped from the cache first (`posix_fadvise(DONTNEED)`) and the kernel's readahead asked off (`RANDOM`), each read timed on its own; sampled with the other floors and after every rep of every rung, no engine: the device's random read, which every out-of-core point read costs before an engine adds anything | p50 µs, p99 µs |
+| `seek-floor-again` | the same offsets after a second drop | p50 µs, p99 µs |
+
+A read or a scan consumes what it returns: every value is copied out, into
+the reading thread's own buffer, on every arm, in the workloads above and in
+the mixes. A caller gets a value to use it, and a read that only measured the
+length of what it was lent priced the lookup and nothing after it.
 
 Every workload runs at a ladder of store sizes, not one: keys at 1, 3, 10,
 30 ... × 10⁴ up to the scale's cap. A number is a point on a curve, and the
@@ -28,15 +39,169 @@ curve is what shows where an engine's behaviour changes — most importantly
 the knee where the store crosses the machine's memory. A geometric ladder
 costs about 1.5× its largest rung, so the curve is nearly free.
 
+`--bottom` starts the ladder above 10 000. The low rungs are cheap next to
+the top one but not free, and when the question is at the top they are hours
+spent re-answering what is already answered: on a 16 GiB M2 the rungs below
+ten million keys took 7h17m of a run whose next rung alone needed about a
+day. A row records the size of every measurement, so a bottom-limited run
+contributes the points it took and claims nothing about the ones it skipped
+— it is points rather than a curve, and the gate keys on size, so those
+points still land in the series beside every other run's.
+
 The floors are per-machine constants, not per-engine and not per-size. They
 are what "as fast as possible" means on that host; an engine's distance from
-them is the headroom left. The scan floor's file fits in memory at `quick`
+them is the headroom left, and they are the gate's control over the host
+(below). Four, because a host moves in four ways this suite feels: the
+device's sync rate, the mapped sequential read, the latency of a load
+that nothing can predict, which is the shape of every table, index and
+chain the engine walks and the one the sequential floors cannot see, and
+the price of a page nobody has touched since it was freed, which every
+load's tables and every written file's page cache pay and which the
+other three cannot see either: about a microsecond where the guest still
+backs the page, five to fifteen where its host has to. That last one
+moves within a row, with what was freed before each pass and how long
+ago, so it is sampled after every rep of every rung as well as at the
+start, and its mappings are kept to the row's end, since pages freed are
+cheap again for the pass that follows.
+
+That price is paid before the measurement, not inside it. Before every
+store a pass opens, the runner touches and frees a fresh anonymous
+mapping of 512 bytes a key of the rung, between 16 and 512 MB, so the
+load that follows draws its tables and its files' page cache from pages
+the guest still backs: the largest footprint a load on the quick ladder
+takes is about 340 bytes a key, RocksDB's memtable and files or the
+supdb arms' shuffled load at the top rung, and a load at the full scale
+is gigabytes, which no prime covers. Without it, which arm ran before
+which decided how large a pool each load met, and two rows read every
+arm's load at the top rung at a third to a half of the rows before with
+every control in band. The pages stay fresh to the allocator, zeroed on
+the load's first touch as before; only the host's part of the price
+moves to the prime, whose microseconds a page the pass line prints and
+`ab` pairs, and the page floor reads the price inside the primed pool,
+which is the price the loads then pay. The scan floor's file fits in memory at `quick`
 and is served from the page cache after its first walk, which is also what a
 store that fits in memory sees; at `full` neither fits.
+
+A bounded row (`ooc`, below) carries two floors more, the seek floors,
+and five counts beside every timed phase of every arm. The counts are
+per operation of the phase, read before its first operation and after
+its last and never between: `read_bytes_per_op` and `majfaults_per_op`
+are the operating threads' own, from each thread's `/proc/thread-self`;
+`bg_read_bytes_per_op` is the process's device bytes less the operating
+threads', which is the merges' streaming and a comparator's background
+jobs and, for a threaded phase, the readers' opening before their
+release; `refaults_per_op` is the group's `workingset_refault_file`, the
+file pages reclaimed under the bound and read back; `read_us_per_io` is
+the device's read ticks over its read I/Os across the phase, from
+`/sys/block/<dev>/stat`, and is omitted where that file cannot be read.
+None is a sum of any two, so a reader can tell the engine's reads from
+the kernel's readahead and both from the comparator's compaction. The
+pass line prints a self-check per phase, `counts ok` where the threads'
+device bytes cover their major faults and those cover the refaults, and
+`counts odd` where a count is not what its name says, with the three raw
+counts beside the word. A pread engine fails the second leg by
+construction, since its refaults are `read()`s and not faults, so `odd`
+on a comparator's phase is the engine's read path and not a broken
+count. Every count is a cost and moves with the machine. A bounded
+row's read passes run a divided count of operations (`--ops-div`, ten
+by default, never below a thousand operations); its loads and bursts are
+whole. Ten and not thirty because a divided pass has to outlast the
+engine's own adaptation: at ten million keys a pass divided by thirty was
+some two seconds, and the arm whose controller reads its faults to choose
+a form reached SUSPECT as the pass ended.
+A divided pass is a different pass where its first operation builds
+what the rest reuse: at a tenth of the scans three of the four lag
+points at three million keys read supdb at a quarter to two fifths of
+LMDB, and with the whole count in one process all four read 1.0-1.9x. A
+bounded row's divided passes are
+read beside an undivided rung of the same size before a trailing cell
+is called the engine's, and the engine's anonymous memory is read by
+phase first, since under the bound it is page cache the store does not
+have: the default's forms, maintained at every commit, held about the
+store's own size during a shuffled load until they were gated on a
+reader being there.
+
+The load's two byte quantities are taken apart, and they are not the same
+question. Device bytes written per byte stored is a flow: the device's
+write counter across the load, what the engine made the disk do to take
+the keys durably, amplification included. Bytes on disk per byte stored is
+a state: what the store's files hold once the load is done and before any
+read, every file under the arm's directory at any depth, in allocated
+blocks rather than lengths, since a map file's length can run past what
+was ever written to it.
+
+Neither follows from the other. Ordered ingest cut supdb's device bytes
+from 2.63 to 1.48 and left its 1.44 on disk exactly where it was, because
+what went away was the WAL write and not a byte of the segment. The state
+is also what the ladder's own top depends on, since `full` stops at the
+rung where the store is 1.5x the machine's memory.
+
+Both are read at one point, the moment the load's guarantee is met, so the
+pair describes one moment rather than two. That is what an arm has on disk
+when it says the load is durable and not what it settles to, so whatever an
+engine leaves unmerged at that point -- a log tail, a memtable's worth not
+yet sealed -- counts as a user would find it. What the choice of point
+costs is measured rather than assumed: `rocksdb-tuned` holds its memtable
+there on purpose, because flushing it would charge that arm a compaction
+the others do not pay, and at 300 000 keys its WAL weighs 1.03 against the
+1.00 of the SST it becomes.
+
+A lag point's burst is timed beside its scans. An engine can convert a
+burst's writes into the form its scans read while it takes them, and
+another leaves them for its scans or its background; timed alone, the
+scans would credit the first for work they never see it do. The two
+quantities are each a rate, and a change that moves work between them
+is read by both.
 
 YCSB-D reads uniformly over the loaded keys rather than skewed to the latest
 inserts: the latest distribution needs a Zipfian over a count that grows
 with every insert, and tracking that is not a cost to charge the engines.
+
+Every workload runs one thread against the engine, and `read` and `scan`
+run again on each reader-thread count of the machine's class -- two,
+doubling, and one fewer than its cores as the top; two and three on four
+cores -- so a row shows where an arm's throughput stops scaling against
+LMDB and RocksDB at the same count. Each count is a quantity of its own
+on the workload it repeats: `reads_per_s_2t`, `entries_per_s_3t`. The
+top stops one short of the cores because a pass with as many readers as
+cores shares them with the harness's thread, the engines' own threads and
+the host: at the core count the cells read two to four times the spread
+of the counts below, within a row and across rows, for every engine, and
+the class is keyed on the core count, so one class runs one set of counts
+and names one set of quantities. The threaded passes run on the store as loaded, after
+the single-threaded pass they repeat and before the mixes, with the writer
+idle. Every thread reads through a handle of its own -- supdb's
+`Db::reader`, an LMDB read transaction begun on the thread, RocksDB's
+shared handle -- and draws its keys from a uniform generator seeded apart
+from the others'. Every thread runs `size` operations -- the
+single-threaded read pass's count, and for the scans a hundred times
+the single-threaded scan pass's, since that pass is a few milliseconds at
+the small rungs and a threaded pass that short reads the host's
+unevenness between its vCPUs rather than the engine -- so a pass on
+three threads is as long as the pass on one and not a third of it, and
+the quantity is total operations over the pass; they are released
+together, each times itself from its release to its finish, and the
+quantity is the aggregate throughput over the span from the first
+release to the last finish, so the spawning and the opening are outside
+the clock. Every thread's bytes are held to what the loaded store
+holds, because a reader that answered a different store would post a
+throughput like any other. The counts are a function of the class's
+cores, since the counts name the quantities and the gate names every
+quantity. The threaded scans run once more after the
+mixes, on the store they leave, as the workload `scan-mixed`: the keys
+the mixes updated and inserted are unsealed there, so every handle's
+pass builds the blocks it walks over them, and what the pass measures
+is an engine's cost of reading past its own unsealed writes on several
+threads; the pass on the store as loaded walks clean partitions and
+measures the walk. Every thread's bytes are held to at least the loaded
+store's, since a mix only adds to a key. Still on the backlog: the mixes threaded,
+readers beside a writer, and writers beside each other, which is an
+engine question first, since supdb is single-writer. An engine's own
+threads are the engine's: supdb seals, merges and, with the block cache,
+builds the cache ahead of a scan on threads of its own, as RocksDB
+compacts on its own; a workload's thread count is the count of threads
+reading, and the figure is their throughput with the engine doing what it
+does beside them.
 
 ## Arms
 
@@ -46,11 +211,51 @@ comparator a user would otherwise pick.
 
 | guarantee | supdb | comparators |
 |---|---|---|
-| durable per batch | `supdb` (default), `supdb-noadvice` | `lmdb`, `rocksdb-tuned` |
-| buffered | `supdb-ingest` | `lmdb-nosync`, `rocksdb-nosync` |
+| durable per batch | `supdb` (default), `supdb-forms`, `supdb-settle`, `supdb-nosnap`, `supdb-noadvice`, `supdb-nocache`, `supdb-cache256` | `lmdb`, `rocksdb-tuned` |
+| buffered | `supdb-ingest` | `lmdb-nosync`, `rocksdb-tuned-nosync` |
+
+A comparator runs one stated configuration in both groups, the two
+differing in the sync alone: RocksDB as its tuning guide sets it for this
+load (`rocksdb-tuned`, `rocksdb-tuned-nosync`: a 256 MB block cache, a
+10-bit Bloom filter with index and filter blocks cached, bulk-load write
+buffers, four background jobs), and LMDB as it opens, which in memory is
+how its documentation configures it (past memory the bounded roster's
+LMDB has its readahead off, below). The buffered group ran
+RocksDB as it ships (`rocksdb-nosync`: its 32 MB default block cache and
+no Bloom filter) beside the tuned durable arm until the rows banked at
+`b1bd544` on 31 October 2026, so every buffered cell against RocksDB in the
+rows before is against a configuration no deployment would choose; that
+series stops there and the tuned one starts.
+
+What the suite's shape reaches in each engine. Every key holds one
+100-byte value, appended at the load and replaced by a `put` after it, so
+every supdb value lies inline in its index record (`Options::inline_bytes`
+is 256): no pass writes or reads a value block, and the block format's
+numbers are the tests' and the probes', never a row's. The tuned RocksDB
+arms flush a memtable only once two of their 128 MB write buffers have
+filled, and their `sync` fsyncs the WAL and flushes nothing. So every
+RocksDB cell of the `quick` scale reads a memtable: its top rung loads
+35 MB into a store and its lag sweep rewrites that store about once more.
+At the `full` scale's top rung the ordered load leaves one SST beside
+about 140 MB of memtable (`bench/examples/store_size.rs` lists a store's
+files). The arms' compaction trigger is eight level-0 files, and no
+banked row is known to have compacted them.
 
 Every shipping option is an arm because a user can choose it and deserves the
-number. An option that is never better than the default on any machine class
+number. `supdb-forms` is where the range-read structure is kept at every
+commit: the writer holds every overlaid block's form current whether or not
+a handle is there to read it, so a reader walks one structure, against the
+default, which keeps the forms only once a caller's handle is live and
+otherwise leaves each read to merge the partition with the unsealed keys for
+itself. `supdb-settle` files the writes at the commit with no forms, and
+`supdb-nosnap` gives each handle a scan snapshot of its own instead of the
+one the state publishes (`Options::share_snapshot` off). The pair prices the trade directly --
+what the writer pays at its commits against what a scan past unsealed
+writes costs -- and `scan-mixed`, the threaded scans on the store the mixes
+leave, is the workload it was added for. A cache is matched like a guarantee: `supdb`'s block cache has no
+bound, as LMDB's page cache has none but the machine's, and `supdb-cache256`
+bounds it at the 256 MB `rocksdb-tuned` runs its block cache on, so each
+comparator is read against the arm on the same memory. An option that is never better than the default on any machine class
 is a question the series answers.
 
 All arms in one process, interleaved one round at a time, so a machine that
@@ -58,25 +263,410 @@ drifts drifts across all of them.
 
 ## Scale
 
-Two. `quick` gates pull requests; `full` is the number.
+Three. `quick` gates pull requests; `full` is the number; `ooc` is the
+out-of-core regime reached under a memory bound.
 
 | scale | top of the ladder | reps | where |
 |---|---|---|---|
-| `quick` | 300 000 keys — measured once: 160 s with every arm, the six YCSB mixes and the floors on a 4-core VM | 5 | every pull request, on a GitHub Actions runner |
+| `quick` | 300 000 keys | 5 | every pull request, on a GitHub Actions runner |
 | `full` | the rung at which the store is at least 1.5× the machine's memory | 7 | on demand or scheduled, on a quiet machine |
+| `ooc` | ten million keys, from three million, under `--bound BYTES`: a cgroup of the run's own with that memory limit, the process moved into it before anything is measured | 3 | on demand, on a quiet Linux machine with the cgroup v1 memory controller writable (`scripts/ooc.sh`) |
+
+`ooc` exists because every banked row is in-core: `full`'s top was never
+reached. The bound is the row's class (`/b<MiB>m`), since a store past it
+reads from the device where the same store unbounded reads from memory,
+and its rows live under `runs/ooc/`. Its default arms are the default,
+the three options whose difference is what a read past the page cache
+costs (`supdb-nocache`, `supdb-cache256tofit`, `supdb-noadvice`), the
+default with the compact form the controller's to choose
+(`supdb-autozpages`), and the durable comparators: LMDB with its
+readahead off (`lmdb-nordahead`), as LMDB's documentation configures a
+store larger than memory, and RocksDB tuned. The bound is chosen so that
+the top rung is out of core for every engine: a store of ten million keys
+is 1.3 GB in LMDB and 1.4 in supdb's raw form, so under 1.5 GiB LMDB's
+fits and supdb's sits at the edge of its budget, and under 1.25 GiB both
+read from the device, which is the regime the second form is for. What
+sets the bound a row can run under is the process's anonymous memory at
+the lag sweep's full rewrite, not the engine's live bytes, and three
+things set that. The memtables' blocks came from the allocator's heap
+and stayed there when their tables dropped, so the default arm held
+1.3 GB at that point with the engine holding a third, until the engine
+mapped its blocks from the kernel itself (`Options::blocks_mapped`). The
+cache arm whose budget counts contents (`supdb-cache256`) keeps its
+budget only where a scan builds a block, so the full rewrite builds the
+whole store's forms and the first scan sheds them into the allocator's
+free lists: two gigabytes of anonymous memory for a cache of 256 MB at
+ten million keys, 1.3 GB of it free chunks nothing trims, which a bound
+of 1.25 GiB kills every time; the roster's budgeted cache is the one
+held to its budget by capacity (`supdb-cache256tofit`), which ends the
+same point under a gigabyte, and the contents-counted arm stays for the
+pairing that prices the difference. And the roster runs its arms in one
+process, which keeps twenty to thirty megabytes of the allocator's
+fragments past each store's trim, so the fifth arm of a rep opens
+0.3 GB above the first; the controller arm, whose own full rewrite
+holds 0.9 GB with a third of it forms shed into the allocator's free
+lists and returned by nothing, was killed there in its second rep under
+1.25 GiB, where it runs four reps alone under the same bound in 0.9.
+So a bounded run gives each arm's rep a process of its own
+(`Plan::fresh_process`; `--fresh-process` and `--one-process` set it at
+any scale): `run` spawns its own binary again for the pass, inside the
+group it entered, hands it the plan and reads the pass's quantities
+back, and a pass the kernel kills ends the run with the kill's own
+status as before. The reps stay interleaved as they were, and each
+store opens from nothing. In core the arms share the process as they
+always have, so the quick and full rows' conditions are unchanged. The
+regime where both engines leave core is also reached by a pairing
+(`bench ab --bound`) over the passes that hold one store at a time.
+LMDB as it opens by default, which reads every random read past the
+cache with its readahead window, is not in the roster. The
+scan floor's file is written and synced outside the group and dropped
+from the cache; the floors and every pass run inside it.
+
+Further arms exist for a bounded pairing and are in no roster, because
+each prices one engine option against the arm it differs from in one
+process (`bench ab --arms <base>,<arm>`) and is chosen by hand:
+`supdb-nocacheautozpages` is `supdb-nocache` with the compact form the
+controller's to choose, as `supdb-autozpages` is `supdb` (a pass asks
+nothing of the form under them: what the controller builds and reads
+through is its decision, carried by the `zpage_*` rows, and only a form
+file out of service refuses the pass),
+`supdb-nocacheordread` reads a point through the ordered index,
+`supdb-nocachezpages` forces the compact second form for point reads and
+counts (a pass refuses it unless every partition has its form file and the
+reads went through the form files), and `supdb-nocachezpagesnodrop`,
+`supdb-nocachezpagesnowarm`, `supdb-nocachezpagessettle`,
+`supdb-nocachezpagesnomemo`, `supdb-nocachezpagesheads`,
+`supdb-nocachezpagesprefetch` and `supdb-nocachezpagesrankwalk` are that
+arm with one of its options moved: the build's release of the raw
+records off, the warm of a form file after its attach off, every
+build left to the settle of the form rather than started as its
+partition lands, the memo of decoded groups off, a scan's seeks by the
+ordered index's heads instead of the form file's fence, a scan's prefetch
+of the pages it will cross on, and the overlay walk of a covered
+partition cut by rank rather than carried through a cursor; and
+`supdb-nocacheautozpagesfairio` is `supdb-nocacheautozpages` with the
+form's threads at the readers' I/O class rather than the device's idle
+class, for a build under a bound that shares the device with the faults it
+is there to remove, and `supdb-nocacheautozpagesnoahead` the same with its
+builds asking nothing of the raw records ahead of their walks, the shape
+before the window, whose every wait fetched the device's readahead and no
+more, and `supdb-nocacheautozpageseager` the controller buying the form at
+SUSPECT on the model's prediction, once the sampler has priced it and the
+partitions have stood for the settle, instead of after the ski rental's
+wait; `supdb-cache64tofit` is `supdb-cache256tofit` with its bound at
+64 MB, and `supdb-cache64tofitautozpages` is that arm with the compact
+form the controller's to choose, the block cache's merged forms over the
+hot blocks kept to fit beside the compact form for the rest of the
+store, so that the pair against `supdb-nocacheautozpages` prices the
+cache under a bound: what the short scans of the Zipfian head gain from
+the merged forms against what the point reads lose to the page cache the
+cache displaces (a cache of 256 MB beside the form did not fit a 640 MiB
+bound at five million keys: the cgroup killed the harness in the shuffled
+load), and `supdb-cache64tofitautozpagesraw` is that arm with the cache's
+reads of a partition through the raw records rather than the form file
+(`Options::zpages_block_cache` off), the shape the combined arm was first
+priced in, and `supdb-cache64tofitautozpagespromote` is the combined arm
+with a block that reads have walked a block's worth of entries held as a
+merged copy in its slot under the form, a clean block included
+(`Options::zpages_promote_copies`), so the hot blocks are walked without
+a group decoded. The form's page is a container of groups, each
+compressed on its own and cut at `Options::zpages_group_bytes` of
+records, so that a point read decodes the group its record is in and not
+the page: `supdb-cache64tofitautozpagesonegroup` is the combined arm with
+the target at zero, the page as one group, the shape before the cut,
+`supdb-nocachezpagesonegroup` is the forced arm with the same, which
+prices the cut on a point read through the form from the pass's first
+read, and `supdb-cache64tofitautozpagesgroup1k` cuts at a kibibyte where
+the default cuts at two. `supdb-cache64tofitautozpagesprebuild` is the
+combined arm with the form files built ahead of the controller's
+decision once the store outgrows its budget and left dormant on disk
+(`Options::zpages_prebuild`), so that the shift to the form is an attach
+and not a build under the readers' faults; a store that fits builds
+nothing. `supdb-cache64tofitautozpagesspan` is the combined arm with a
+block-cache scan's block taken from the fence and the page's directory
+and its rank sought only for a block not held as a copy
+(`Options::zpages_seek_span`), where the default seeks every scan's rank
+through a group. `supdb-cache64tofitautozpagesmemolinear` is the combined arm with the
+memo's slot the group's number plus a multiple of the form file's
+identity (`Options::zpages_memo_hash` off), where the default hashes the
+two over every slot. `supdb-cache64tofitautozpagesexactcut` is the combined arm with a
+settle resolving every written key's cut through a seek
+(`Options::zpages_settle_span` off), where the default files a key under
+the block the fence and the directory name and leaves its cut to the build
+that reads the block. `supdb-cache64tofitautozpagescheckedviews` is the
+combined arm with every view of a form file's page checked and the memo
+asked after it (`Options::zpages_trusted_views` off), where the default
+reads a verified page's directory trusted, and `supdb-nocachezpagescheckedviews`
+is the forced arm with the same, the pair against `supdb-nocachezpages`;
+`supdb-cache64tofitautozpagesrecord` is the combined arm with the form
+file's groups holding their records one by one, each decodable alone
+(`Options::zpages_record_coding`), where the default holds a group as one
+LZ4 block, and `supdb-nocachezpagesrecord` is the forced arm with the same,
+the pair against `supdb-nocachezpages`;
+`supdb-cache64tofitautozpagesmemofirst` is the combined arm with a
+verified page's group asked of the memo before any view of the page
+(`Options::zpages_memo_first`), where the default asks after it;
+`supdb-cache64tofitautozpagesfencetree` is the combined arm with the
+form file's fence searched through a tree over the entries' words built at
+the attach (`Options::zpages_fence_tree`), where the default searches the
+keys; `supdb-cache64tofitautozpagesmemonoahead` is the combined arm
+with a decode asking nothing ahead for the memo entry its put displaces
+(`Options::zpages_memo_ahead` off), where the default asks for its line
+before the decode; `supdb-cache64tofitautozpagesstartcache` is the
+combined arm with a scan's start key kept with its block
+(`Options::scan_start_cache` at 4,096 entries), a scan starting where a
+scan started skipping the partition's seek, where the default seeks every
+start; `supdb-cache128tofitautozpages` and `supdb-cache256tofitautozpages`
+are the combined arm with the block cache's budget at 128 and 256 MB
+(`Options::scan_cache_bytes`), where the combined arm's is 64;
+`supdb-nocachezpagesstored` is the forced form with every group stored
+verbatim (`Options::zpages_store_all`), no LZ4, where the default compresses
+every group that shrinks; `supdb-cache64tofitzpages` is the forced form with
+the combined arm's block cache and budget, the form installed from the start
+whatever the controller would decide, and `supdb-cache64tofitzpagesstored`
+the same with every group stored; `supdb-nocachezpagesrecordraw` and
+`supdb-cache64tofitzpagesrecordraw` are the two under the record coding with
+every tail stored raw (`Options::zpages_raw_tails`), the heads front-coded
+and the values the records' own bytes, and
+`supdb-cache64tofitzpagesrecordrawlean` is the cached one with the memo of
+decoded groups off and the allocator trimmed once after the form files'
+install (`Options::zpages_trim_install`), the fit check of that form, and
+`supdb-cache64tofitzpagesrecordrawleantrim` the same with the trim thread
+asked to look at every upkeep pass end (`Options::upkeep_trim_look`), and
+`supdb-cache64tofitzpagesrecordrawleanresident` the same with the trim's
+stride counted by the anonymous bytes resident beyond the allocator's use
+instead of its free count (`Options::trim_by_resident`);
+`supdb-cache64tofitzpageshot4` and `supdb-cache64tofitzpageshot1` are
+`supdb-cache64tofitzpages` with the first four, or the first, partitions by
+key order in the raw-tail coding and the rest in the block coding
+(`Options::zpages_raw_tails_first`), the upper bound of a coding chosen per
+partition by its heat;
+`supdb-cache64tofitzpagesdrop` and `supdb-cache64tofitzpageshot4drop` are
+`supdb-cache64tofitzpages` and its hot4 arm with each partition's raw file
+and ordered index unmapped and dropped from the page cache once its form
+file serves it (`Options::zpages_drop_raw`);
+`supdb-cache64tofitzpageshot8drop` is the hot4 drop arm with the first
+eight partitions raw-tailed, `supdb-cache64tofitzpageshot8dropsettleevery`
+the same with every commit near reads settling its batch into the forms
+(`Options::forms_settle_every`), where the update mixes' writes are
+otherwise filed by ycsb-E's first scans,
+`supdb-cache64tofitzpageshot8dropsettlebuilds` that with the commit's fill
+building a form for every block its settle filed into that held none
+(`Options::forms_settle_builds`), and `supdb-cache64tofitzpagesrecordrawdrop`
+`supdb-cache64tofitzpagesrecordraw` with the drop, the two sides of the fit
+line the drop moves;
+`supdb-cache64tofitzpagesrecodedrop` is `supdb-cache64tofitzpagesdrop` with
+its partitions re-coded while served by what their decodes cost
+(`Options::zpages_recode`), the policy the key-order arms bound, and
+`supdb-cache64tofitzpagesrecodekeepdrop` the same with the form file a
+re-code replaced kept beside the served one, so that a partition's later
+re-codes exchange the two without a build (`Options::zpages_recode_keep`);
+`supdb-cache64tofitzpagesbothdrop` is that with both codings of every
+partition built at write time, the other beside each served file on the
+builder's thread, and the policy only exchanging them
+(`Options::zpages_both`);
+`supdb-settlebuilds`, `supdb-ingestsettlebuilds` and
+`supdb-cache64tofitautozpagessettlebuilds` are `supdb`, `supdb-ingest` and
+`supdb-cache64tofitautozpages` with every commit near reads filing its batch
+and building the blocks it filed into (`Options::forms_settle_every`,
+`forms_settle_builds`);
+`supdb-cache64tofitzpagesdropparse` and `supdb-cache64tofitautozpagesparse`
+are the forced form with the drop and the combined arm with their
+block-coded groups written by the engine's parsing encoder
+(`Options::zpages_parse`), the same block format in fewer sequences;
+`supdb-cache64tofitzpagesdropflexdec` and `supdb-cache64tofitautozpagesflexdec`
+are the same two with their groups decoded by `lz4_flex` and not the engine's
+own LZ4 decoder (`Options::zpages_own_decoder` off);
+`supdb-cache64tofitautozpagescodingfixed` is the combined arm with the coding
+of its form files the options' block coding wherever the controller builds
+(`Options::zpages_coding_auto` off), where the default's selector picks the
+raw tails where the model predicts that form fits the budget and the block
+coding otherwise;
+`supdb-cache64tofitzpagesrecordrawdecode` is the forced raw-tail form with
+the block cache whose scans decode a group whole before walking it
+(`Options::zpages_inplace_walk` off), where the default reads a raw-tail
+group record by record where it lies;
+`supdb-cache64tofitautozpagesperrun` is the combined arm with a block read
+through a cursor a run, a seek a cut and a read by rank a replaced record
+(`Options::zpages_block_cursor` off), where the default reads a block through
+one cursor held across it; `supdb-cache64tofitautozpagesmemo4`,
+`supdb-cache64tofitautozpagesmemo16` and `supdb-cache64tofitautozpagesmemo32`
+are the combined arm with the memo of decoded groups capped at four, sixteen
+and thirty-two mebibytes (`Options::zpages_memo_bytes`), where the default
+caps it at eight. The
+forced arm's
+`sync` builds the form files, so its load carries the build, and in memory
+it reads slower than the raw form: it is an arm for the bound, not a
+default.
 
 `full`'s top is a function of the machine, not a constant, so its curve
 crosses the memory line everywhere it runs — the 16 GB box and the 4 GB VM
-alike. The out-of-core regime is where an embedded store on a small VM
-lives, and the old suite's largest run (100 MB) never entered it.
+alike. It is also why `full` is not a job with a timeout on it: on a 16 GiB
+M2 the top it asks for is 222 million keys, which the ladder rounds up to its
+300-million rung, and the ladder measured 344s at 300 000
+against 19 815s at ten million — about 4.3× a rung for 3.3× the keys.
+
+Do not size a run from that. It is a whole-rung figure averaged over seven
+arms, and per arm the law holds for one engine and breaks for the other. One
+pass at ten million took supdb 467s and LMDB 665s; at thirty million, LMDB
+2 624s — 3.9×, as the ladder says — and supdb 10 288s, which is 22×. A pass
+at a hundred million then ran 27.5 hours without supdb finishing it, already
+past 9.6× its own thirty-million pass. Size a run from the arm that is slowest
+at the rung you want, and treat any rung past the one you have measured as
+unbounded until you have. (The run those figures come from also carried an
+ordered-index leak, since fixed, so supdb's share of them is an upper bound.) The
+out-of-core regime is where an embedded store on a small VM lives, and the
+old suite's largest run (100 MB) never entered it.
 
 A rep is one complete pass of a workload for one arm. Arms are round-robined
 within a rep; one warmup pass is discarded.
 
+`bench ab` is the instrument for choosing between two arms; the series is
+not. It runs both in one process with the order swapped every other rep,
+so neither stands first more often than the other, pairs them rep by rep
+so a drift that lifts or drops both cancels, and reports a sign test over
+the pairs rather than two medians. It also reports what the engine counts
+-- forms held, snapshot builds, snapshot merges -- because a count is
+exact where a whole-pass throughput is not. The first question put to it
+had defeated three rows of this series: maintaining the canonical forms
+regardless read 1.156x, then 1.186x, then 1.247x the other way on the
+threaded scan mix. Fifteen pairs give it as 1.075x on thirteen of fifteen
+(p 0.007) and `scan-lag` at full lag as 0.859x on fourteen of fifteen
+(p 0.001) -- a real trade rather than a coin, and neither sign is the one
+a single row happened to show.
+
+The counts are the half that no timing gives, and they have to be read
+as carefully as a timing. Maintaining regardless holds 3,099 forms and
+2.8 MB at the end of a pass against 1,537 and 1.3 MB, twice the memory,
+while reads take a form 24,225 times either way, on 6,000 of 12,000
+scans through a caller's handle. That equality was read here as "the
+forms built at a commit are not the ones read", and it is not: both arms
+maintain by the end of a pass, since the gate moves when maintenance
+starts and not whether it happens. The arm that actually separates them
+is `supdb-settle`, which settles at a commit and builds no form -- takes
+fall to zero and the threaded scan mix to 0.585x on four threads, all
+fifteen pairs. Forms at a commit are worth 1.71x there and cost 1.172x
+on `scan-lag` and 1.130x on ycsb-E. A count says what happened; which
+two things to put beside it is still the hard part.
+
+Swept over `--len`, `ab` separates what a scan pays once from what it
+pays per entry, which is the difference between a structural cost and a
+loop. Four threads at a hundred thousand keys, seven pairs a point,
+against LMDB, fitting microseconds per scan over lengths 1, 10, 100 and
+1000:
+
+| | fixed per scan | per entry |
+|---|---|---|
+| `scan`, drained | 232 ns vs 126 (1.84x) | 3.99 ns vs 4.81 (**0.83x**) |
+| `scan-mixed`, unsealed keys | 301 ns vs 134 (2.24x) | 6.91 ns vs 5.84 (1.18x) |
+
+So the walk itself is faster than LMDB's and the losses are two things
+that can be named: a fixed cost of about 230-300 ns a scan against its
+130, which is the whole of why short scans read 1.7x to 2.0x behind, and
+an unsealed key costing 6.91 ns against this engine's own 3.99 on a
+drained store. At a length of a hundred those are 167 ns and 290 ns of a
+993 ns scan, and closing both would put `scan-mixed` at about 0.70 us
+against LMDB's 0.682. That is what the aggregate throughput of a row
+cannot tell anyone, and it took four `ab` runs.
+
+A counter has to be read where the thing happens. These said no read ever
+took a form until the instrument was fixed: a pass opens two stores, the
+loaded one and a fresh one for the shuffled load and the lag sweep, and
+the counters were read from the second, where no reader handle scans at
+all. Use `ab` for an option; use the series for a commit.
+
+**`ab` has a control, and it is an arm against itself.** `--arms
+supdb,supdb` runs one arm twice under the same alternation, so every
+difference it reports is the instrument's. Over three dozen quantities a
+sign test at one in twenty marks one or two by chance, and the control
+did: two runs at a hundred thousand keys marked ycsb-F ten of ten at
+p=0.002, and then the load and the scan two of twelve at p=0.039 with
+ycsb-F back at five of twelve. So `ab` marks a quantity once at p<0.05
+and twice only where Holm's step-down holds it for the whole table, and
+its last line says how many a coin would have marked. A single mark is
+a place to look, and `--pairs` prints the pairs rep by rep to look with;
+it is not a result. The order is the rep's parity, not the name: by name
+an arm against itself was always A, and the control measured standing
+first instead.
+
+**The arm order is the same in every rep, and the arm that goes first pays
+for it.** Interleaving was meant to spread a drifting machine across the
+arms, and it does, but position is not drift: `plan.arms[0]` is first in
+every rep, so whatever a rep's first pass pays it pays in the same arm every
+time. Measured over four rows at one commit, every supdb arm beat `supdb` on
+the load -- 1.041x, 1.076x, 1.058x, 1.072x, 1.072x for the arms in positions
+two to six -- and `supdb-cache256`, whose budget is above anything the quick
+ladder reaches, was 1.072x with fifteen of sixteen rungs ahead. On
+`scan-lag` at full lag the same arm was 1.083x. Rotating the roster so that
+one arm ran first instead inverted both: the arm that had been 1.076x on the
+load became 0.934x, and 1.081x on `scan-lag` became 0.943x. So a cross-arm
+ratio against `supdb` on those two quantities carries about 7% that belongs
+to the order, and the direction always favours the arm being tried. What
+survives the swap is what the suite can say: `scan-mixed` on four threads
+read 1.135x with the arm third and 1.136x with it first.
+
+What the penalty is made of, measured by timing each pass's load in two
+parts and printing it by position. It is a fixed cost and not a rate: the
+arm at position zero was dearer than the five behind it by 1.167x at ten
+thousand keys, 1.062x at thirty, 1.100x at a hundred and 0.979x at three
+hundred -- a few milliseconds, which is a fifth of a twelve-millisecond
+load and a hundredth of a three-hundred-millisecond one. It is not the
+teardown: removing the store a pass leaves took 0 to 6 ms for every arm
+alike, position zero included. Part of it is the device: syncing and
+letting it settle before each pass cut the penalty to 1.067x, 1.056x and
+1.019x at the first three rungs, so the first arm of a rep does wait on
+what the pass before it queued -- position zero is the only arm whose
+predecessor is the previous rep's last, the buffered RocksDB, which never
+flushes and hands the kernel its memtable at close. A sync without the
+settle did not reproduce that, so queued writeback is part of the cause
+and not all of it.
+
+Two corrections were tried and neither is confirmed, so neither landed. A
+discarded pass at the head of every rep, so that no measured arm stands
+first -- the rule rep zero already follows one rung up -- removed the
+penalty at a hundred thousand keys in one run (1.095x to 1.016x) and left
+it at ten and thirty thousand; made a whole discarded pass rather than a
+load, it removed it at thirty thousand (1.143x to 1.039x) and left it at a
+hundred. The scatter is the instrument, not the fix: the same statistic on
+`ycsb-C` and on `scan`, where the arms differ by an option that cannot move
+either much, wandered between 0.838x and 1.059x across those runs. One run
+of five reps cannot resolve a six-to-fifteen percent effect at these rungs,
+so confirming any fix needs about three rows per condition, and what is
+written above survives only because the rotation test compares one
+quantity between two orderings rather than across conditions.
+
+Nothing here corrects for it yet, then, and not because the interventions
+are unclean so much as unmeasured: at the two smallest rungs a load is 11-37 ms
+and settling the device before each pass moves it by about as much as the
+bias does, so the cure is inside the error of the disease. Rotating the
+roster would spread the cost rather than remove it, and with twelve arms
+and five reps it cannot spread it evenly, so it would trade a bias that is
+named for one that is not. Until the residual is found, read a cross-arm
+ratio on `load` or `scan-lag` against `supdb` as carrying a few percent
+that is the order's, and confirm any ratio worth acting on by running the
+roster with the arm somewhere else.
+
+Disk, because a run has run a host out of it. One pass builds its store and
+the store is dropped when the pass ends, so the peak is one arm's, never the
+ladder's or the matrix's: measured, about 3.1x the rung's records at the
+small rungs and 1.9x at a hundred million, where a fixed seal size amortises
+over more keys. LMDB's map is sized at three times the records but grows with
+what is written, so it costs its data and not its map. The scan floor's file
+is reclaimed once the floors are measured rather than held for the rung
+phase, and a rung whose filesystem cannot hold it is refused before it
+starts rather than dying on ENOSPC hours in.
+
 ## Rows
 
 One file per run: `runs/<scale>/<utc>-<engine-sha7>.json`. Nothing in it is
-derived; everything is what was read or measured. The file is JSON; this is
+derived; everything is what was read or measured.
+
+The file is written when each rung finishes, not once at the end, and every
+write replaces the last — so the row on disk always holds the rungs that
+have completed. Two `full` runs were lost whole for want of that: both were
+killed by a job timeout, the artifact step never ran, and the only survivor
+was whatever the log had printed. A rung past the memory line takes days,
+which is long enough that the rungs below it must not depend on it. The file is JSON; this is
 its shape in outline:
 
 ```
@@ -92,7 +682,7 @@ measurements[]:
 
 `size` is the ladder rung in keys. The floors carry no size.
 
-`samples` is the raw per-rep values — five or seven floats. Median,
+`samples` is the raw per-rep values — three, five or seven floats. Median,
 confidence interval (CI) and spread are computed when the series is read, so a change to the statistic
 recomputes history rather than stranding it.
 
@@ -123,6 +713,60 @@ regression fails. A row better than every prior CI is flagged, not failed:
 it is either a win or a broken measurement, and a person should know which.
 
 Fewer than three prior rows: no band, and the gate says so.
+
+### The machine is judged first
+
+A class is the architecture, the CPU model, the core count, memory and
+whether the host is virtualised — which does not pin the host a guest lands
+on. So a row is read for its machine before it is read for its engine, from
+two controls the row already carries.
+
+**The comparators**, which are exact. LMDB and RocksDB are measured in the
+same process as the arms, interleaved within a rep, over the same data, and
+no engine change can touch their code. So a comparator below its own window
+is this row's own statement that this machine is slower at that workload
+and quantity, and an arm's regression there gets **no verdict**. It is a
+statement about a workload and a quantity, not about the row.
+
+**The floors**, which are coarse and global. When a floor's median is below
+every prior median in the window, every quantity that moves with the
+machine gets no verdict. A floor is judged on medians where an engine's
+quantity is judged on disjoint CIs, and the asymmetry is deliberate: a
+regression claim costs a day when it is wrong, so it must survive the
+noise; a control costs a rerun, so it must survive a bad machine. The CI
+rule was tried first and is useless here — a floor's samples range over a
+factor of two inside one run, so its CI overlaps the window on a host where
+LMDB's own scan ran at a third of its band.
+
+The wal, scan, mem and page floors are judged on that one side, below:
+a page that costs less or a chase that runs faster is a host that got
+better and takes the engine's cells with it. The two seek floors are
+judged on both sides: a seek faster than every prior row's is the host
+serving the device's reads from a cache the guest cannot see, which
+flatters every out-of-core cell under it, so a bounded row whose seek
+floor is above its window withholds the machine's verdicts as one below
+it does.
+
+Either control withholds; neither ever fails. A floor or a comparator below
+its window is the machine, and the run did not choose its machine. What
+keeps its verdict whatever they say is `device_bytes_per_byte` and
+`bytes_on_disk_per_byte`: arithmetic on what the engine stored, which came
+back identical to three decimals across hosts that moved every rate by
+half.
+
+The case this answers cost a day. A quick row failed with 121 of 1,106
+quantities regressed; LMDB's scan at three hundred thousand keys read a
+third of its window, ten of eleven workloads had a comparator among their
+regressions, and the row's own wal floor stood at 0.74 of the window's
+lowest. A second row on the same host repeated it. Both now read "no
+verdict", and the same rows with their floors raised by hand still fail on
+what the comparators do not explain, which is the check that the control
+did not simply switch the gate off.
+
+The price is a verdict withheld when the machine dips and the engine is
+fine. Over the twenty-six rows banked in this class, the floors call the
+machine out of band on five, and in only one of those does that withhold a
+verdict that would otherwise have been given.
 
 That is the whole rule. The window is the only parameter and it is stated
 once, here.
@@ -166,9 +810,9 @@ disagrees with the data is a bug in that program and not a stale file.
 
 ## Machines
 
-The series is columns, one per class. Nothing is the canonical machine. The
-README figure is drawn per class from the latest `full` row, stamped with
-its engine commit and date.
+The series is columns, one per class. Nothing is the canonical machine. A
+figure is drawn per class from the class's rows, stamped with its engine
+commit and date.
 
 ## Where the old suite went
 

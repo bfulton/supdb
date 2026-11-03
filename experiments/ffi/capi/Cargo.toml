@@ -1,0 +1,21 @@
+[package]
+name = "supdb-capi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "A native C ABI over the engine, for the borrowed-versus-copied experiment"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+supdb = { path = "../../.." }
+
+# Standalone: the engine's crate is not a workspace and bench/ is its own.
+[workspace]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = true

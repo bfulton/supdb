@@ -1,0 +1,5095 @@
+{
+  "utc": "20260907T184735Z",
+  "sha": "4f0797cf01eb11953842c0226197a988c4cce17c",
+  "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+  "scale": "quick",
+  "machine": {
+    "arch": "x86_64",
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "cpus": 4,
+    "mem_total_kb": 16461028,
+    "page_size": 4096,
+    "cache_line": 64,
+    "cache_line_detected": true,
+    "l1d": 32768,
+    "l2": 1048576,
+    "l3": 34603008,
+    "kernel": "6.18.44-fc-v24",
+    "governor": "unknown",
+    "thp": "always [madvise] never",
+    "smt_on": false,
+    "pmu_available": false,
+    "aslr_disabled": false,
+    "virtualised": "hypervisor"
+  },
+  "measurements": [
+    {
+      "workload": "load",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        1.4936275862068966,
+        1.4936275862068966,
+        1.4936275862068966,
+        1.4936275862068966,
+        1.4936275862068966
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1069667.0971363622,
+        797076.1334442545,
+        926703.9281960141,
+        1014010.6870642352,
+        898401.8867877066
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        1.1864275862068965,
+        1.1864275862068965,
+        1.1864275862068965,
+        1.1864275862068965,
+        1.1864275862068965
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1858341.5936617171,
+        1725373.0601630684,
+        1872497.1734655167,
+        1850672.9046681374,
+        1897536.8074702232
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        1.0275310344827586,
+        1.0275310344827586,
+        1.0275310344827586,
+        1.0275310344827586,
+        1.0275310344827586
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1307238.4144034665,
+        182634.54495160314,
+        1175079.1562696642,
+        1336755.7846101446,
+        1293807.1789996466
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        1.0593103448275862,
+        1.0593103448275862,
+        1.0593103448275862,
+        1.0593103448275862,
+        1.0593103448275862
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        934502.7576241874,
+        836882.9724610269,
+        976901.3626601727,
+        1007746.3446016842,
+        897297.8056043785
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        2.7506758620689653,
+        2.7506758620689653,
+        2.7506758620689653,
+        2.7506758620689653,
+        2.7506758620689653
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        598706.5663082788,
+        501757.68224880163,
+        518632.70991607074,
+        583343.2404460335,
+        568216.7505979629
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        2.7471448275862067,
+        2.7471448275862067,
+        2.7471448275862067,
+        2.7471448275862067,
+        2.7471448275862067
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        620356.3612302833,
+        527793.5001597103,
+        597901.0325511672,
+        559096.3437615052,
+        579806.7457731798
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        2.7506758620689653,
+        2.7506758620689653,
+        2.7506758620689653,
+        2.7506758620689653,
+        2.7506758620689653
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        366796.4820549406,
+        518485.8615905103,
+        522036.19172509987,
+        544330.7301260496,
+        541654.3282324481
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        1.8278988505747127,
+        1.8278988505747127,
+        1.8278988505747127,
+        1.8278988505747127,
+        1.8278988505747127
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        871712.9665386004,
+        959287.0578585995,
+        846661.7172704146,
+        945841.8223950561,
+        831886.5670534264
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        1.1593563218390806,
+        1.1593563218390806,
+        1.1593563218390806,
+        1.1593563218390806,
+        1.1593563218390806
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1824691.7654640954,
+        1933750.1080482872,
+        2007593.6560843505,
+        1897804.8534081762,
+        1946101.8024016453
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        1.0263540229885058,
+        1.0263540229885058,
+        1.0263540229885058,
+        1.0263540229885058,
+        1.0263540229885058
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1457927.1386333196,
+        1505342.913603252,
+        1483016.9349658515,
+        1395194.846633904,
+        1330147.3053898057
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        1.061664367816092,
+        1.060487356321839,
+        1.060487356321839,
+        1.060487356321839,
+        1.060487356321839
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        908097.0931358001,
+        986283.1357846567,
+        1015398.5872691761,
+        976143.254098484,
+        1022034.0665076404
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        2.6671080459770113,
+        2.6671080459770113,
+        2.6671080459770113,
+        2.6671080459770113,
+        2.6671080459770113
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        588502.7628537292,
+        610195.1404059018,
+        561998.809461722,
+        491459.7563755354,
+        630401.1059420789
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        2.6659310344827585,
+        2.6659310344827585,
+        2.6659310344827585,
+        2.6659310344827585,
+        2.6659310344827585
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        616627.0398150941,
+        655726.7833047239,
+        656637.8657273185,
+        642072.7271925654,
+        647027.079873401
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        2.6671080459770113,
+        2.6671080459770113,
+        2.6671080459770113,
+        2.6671080459770113,
+        2.6671080459770113
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        573389.3774304423,
+        562561.1503970481,
+        600362.1864998717,
+        644400.1221267111,
+        602728.055671017
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        1.9247668965517242,
+        1.9247668965517242,
+        1.9247668965517242,
+        1.9247668965517242,
+        1.9247668965517242
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        944518.5282799426,
+        806536.4683448874,
+        965486.3817711383,
+        809181.6809585819,
+        921438.036374264
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        1.1500579310344827,
+        1.1500579310344827,
+        1.1500579310344827,
+        1.1500579310344827,
+        1.1500579310344827
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1921671.6267893862,
+        2085931.752443205,
+        2028698.9079534065,
+        1970403.4369510703,
+        1797829.861148566
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        1.0268248275862069,
+        1.026471724137931,
+        1.026471724137931,
+        1.026471724137931,
+        1.026471724137931
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1334868.6280363074,
+        1507769.3393958928,
+        1540135.594769872,
+        1492507.3296288704,
+        1486439.8263368567
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        1.0614289655172413,
+        1.0617820689655173,
+        1.0614289655172413,
+        1.0614289655172413,
+        1.0617820689655173
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        924830.0707979614,
+        1026140.6245687003,
+        937521.3110313013,
+        925032.6099433402,
+        951615.2917801888
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        2.6941793103448277,
+        2.6941793103448277,
+        2.6945324137931035,
+        2.6945324137931035,
+        2.6941793103448277
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        562546.2300491855,
+        596946.3638558338,
+        617323.7184588014,
+        597317.61027727,
+        586179.8819465372
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        2.693826206896552,
+        2.693826206896552,
+        2.693826206896552,
+        2.693826206896552,
+        2.693826206896552
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        585343.2953845324,
+        638039.1963174063,
+        575902.7566541446,
+        603318.8728055944,
+        592766.4215652597
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        2.6941793103448277,
+        2.6941793103448277,
+        2.6941793103448277,
+        2.6941793103448277,
+        2.6941793103448277
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        582366.5771528472,
+        582729.2295955962,
+        600208.8606793393,
+        578950.2031440736,
+        606609.050494204
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        2.005392183908046,
+        2.005392183908046,
+        2.005392183908046,
+        2.005392183908046,
+        2.005392183908046
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        884966.2647762485,
+        821113.2050136483,
+        832886.6261592626,
+        789808.683642137,
+        889066.3122793026
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        1.147703908045977,
+        1.147703908045977,
+        1.147703908045977,
+        1.147703908045977,
+        1.147703908045977
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1726593.8122733827,
+        2074146.6210651242,
+        1768100.7189380417,
+        1868764.3421823375,
+        1933613.0940617756
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        1.026471724137931,
+        1.0265894252873564,
+        1.026471724137931,
+        1.026471724137931,
+        1.026471724137931
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1578808.1009275182,
+        1469501.2077928395,
+        1447206.7515552482,
+        1422579.665279239,
+        1529220.2955303858
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        1.061664367816092,
+        1.0615466666666666,
+        1.0615466666666666,
+        1.061664367816092,
+        1.0615466666666666
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1015450.2344036549,
+        948742.5007953546,
+        983030.5304936382,
+        943635.0996285692,
+        866011.2303008462
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        2.7563255172413794,
+        2.756207816091954,
+        2.75656091954023,
+        2.7564432183908045,
+        2.756678620689655
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        451905.8280976591,
+        501809.484018262,
+        472579.89230086986,
+        419797.15057450574,
+        435085.1158099772
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        2.7564432183908045,
+        2.756207816091954,
+        2.7563255172413794,
+        2.7564432183908045,
+        2.756207816091954
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        440039.77149861166,
+        462855.3326696101,
+        470466.58481206745,
+        462015.9130477674,
+        459937.82977427414
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "device_bytes_per_byte",
+      "unit": "B/B",
+      "samples": [
+        2.7563255172413794,
+        2.756207816091954,
+        2.756207816091954,
+        2.756207816091954,
+        2.756207816091954
+      ]
+    },
+    {
+      "workload": "load",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        509347.2434933649,
+        481315.279096673,
+        497777.161153554,
+        512907.4168722273,
+        466495.4791013454
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        295384.7171787333,
+        290508.1938271831,
+        307210.9978588008,
+        313860.16205290664,
+        293906.9417145796
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        710102.6013046573,
+        637396.6883545138,
+        708946.6874217899,
+        761753.7460383092,
+        753546.1126515268
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        776444.1142313898,
+        750477.0970525236,
+        861455.623965661,
+        859562.0084594655,
+        835916.0352435575
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        703531.3828113353,
+        552681.5806317382,
+        621228.8689776753,
+        679572.8884396157,
+        651597.09379877
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        543746.913216742,
+        475485.33144394483,
+        459124.1536447961,
+        517023.5964916227,
+        469011.4958938747
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        483707.47461551544,
+        431955.2363060795,
+        492785.2785720108,
+        446522.9392676113,
+        504709.90233762446
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        498795.6081246223,
+        458328.9811177168,
+        485805.32702058455,
+        501241.8768741434,
+        455656.51081209106
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        138697.73515660074,
+        144842.44514383283,
+        134197.95225018563,
+        150828.47441497847,
+        135089.45542684692
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        498793.7338604896,
+        544071.8807456824,
+        536792.5005507044,
+        482574.3604864253,
+        464640.4080509235
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        678679.4896972721,
+        789746.1882110479,
+        789427.0456916428,
+        780498.4856508216,
+        735210.6315966621
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        553462.6978594554,
+        589205.8895135256,
+        564526.3921827697,
+        557811.7802484873,
+        593534.028423672
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        564488.9910722679,
+        587507.0963513401,
+        556468.060124519,
+        599043.3397672585,
+        568281.2889331878
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        507551.2459266475,
+        564587.7466843833,
+        570332.6202654693,
+        584438.5520916705,
+        571094.1495725656
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        200533.0113967456,
+        587675.8842910847,
+        509585.76690262865,
+        606357.6355544834,
+        494543.82165167254
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        94405.54781678664,
+        96842.94985600856,
+        100879.12027362444,
+        97402.12879716087,
+        101296.09282696151
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        385761.8346629174,
+        403237.15562639624,
+        407604.53598142695,
+        421663.25145435554,
+        394287.98155426193
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        626279.5792080114,
+        646810.1972991016,
+        665146.0673734301,
+        643727.1948778318,
+        672455.0657287505
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        491004.51978007535,
+        507518.4339069249,
+        435446.1263570428,
+        518394.7746138491,
+        504730.5313850479
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        520562.5377856825,
+        507855.671501319,
+        528621.1256782823,
+        527625.1913571258,
+        526268.8906060224
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        502203.5688192651,
+        542611.998507817,
+        560288.6185625794,
+        527983.3526426525,
+        539109.6851540137
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        526390.0187777532,
+        494015.89164152683,
+        555088.562631639,
+        551891.2703996743,
+        531572.108777174
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        78965.71402666162,
+        78454.07028581953,
+        79345.07191745412,
+        73049.99241708207,
+        81700.86414562822
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        348855.69865435426,
+        328570.26774831885,
+        319861.45648818254,
+        303156.2160555669,
+        332397.553705578
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        487781.60015905194,
+        462430.67457054614,
+        417236.51845215086,
+        428458.17238647235,
+        494084.0117956365
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        359461.93350965035,
+        369768.27076053846,
+        383293.852767558,
+        389698.9448998491,
+        389180.4796245702
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        335448.89921526826,
+        299675.82328075945,
+        304198.54558842455,
+        319764.14265054447,
+        346593.99533320195
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        471989.4568631356,
+        495415.0296805457,
+        436230.89653659106,
+        441977.15314904816,
+        481813.2614243529
+      ]
+    },
+    {
+      "workload": "load-shuffled",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        344571.7939297621,
+        320615.72788532655,
+        323383.2932746411,
+        337717.2229683415,
+        362270.6983915989
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        0.647,
+        1.103,
+        0.687,
+        0.751,
+        0.763
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        2813120.7326716688,
+        1866771.8530380125,
+        2814096.0321527356,
+        2625406.478558043,
+        2627634.0388968666
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        0.555,
+        0.723,
+        0.635,
+        0.691,
+        0.679
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        2632201.6708689765,
+        2609712.9863754716,
+        2807449.398532041,
+        2768881.208627723,
+        2687261.8414193043
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        1.591,
+        3.295,
+        1.487,
+        1.383,
+        2.367
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        1434302.6972492512,
+        1154529.9019781023,
+        1430191.8359215276,
+        1424922.8119312776,
+        1189294.1170733992
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        1.399,
+        1.807,
+        1.391,
+        1.215,
+        1.543
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        1429057.5122766758,
+        1351164.0142866678,
+        1447306.815295428,
+        1530059.3938455503,
+        1461458.6321711766
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        0.2,
+        0.238,
+        0.201,
+        0.197,
+        0.205
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        5986597.206174816,
+        5557559.364459741,
+        6302110.576832182,
+        6339706.851955165,
+        6050719.5515690725
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        0.254,
+        0.233,
+        0.241,
+        0.205,
+        0.195
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        5487414.067095709,
+        4926207.869222974,
+        5680920.854546838,
+        5824644.420019769,
+        5794706.304003041
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        0.271,
+        0.243,
+        0.206,
+        0.265,
+        0.201
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        4504729.740991554,
+        5125069.636883691,
+        6294506.092137721,
+        5541277.530452091,
+        6034507.728997499
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        0.755,
+        0.795,
+        0.731,
+        0.787,
+        0.851
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        2376584.1815032195,
+        2390711.2262300546,
+        2414903.237242187,
+        2398678.4241354386,
+        2400309.7359683295
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        0.839,
+        0.667,
+        0.727,
+        0.683,
+        1.111
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        2314173.417367656,
+        2411474.9553455124,
+        2371259.2002880923,
+        2388402.6808705507,
+        2056035.6056022036
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        1.551,
+        1.583,
+        1.791,
+        1.991,
+        2.511
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        1256520.345849686,
+        1241834.2156289471,
+        1193864.9191986253,
+        1044665.8733706173,
+        1140215.8816337334
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        1.743,
+        1.623,
+        1.711,
+        1.567,
+        1.503
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        1189882.052148326,
+        1243182.0271682513,
+        1214513.2388825282,
+        1247222.5911922387,
+        1269740.4967859695
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        0.437,
+        0.467,
+        0.429,
+        0.247,
+        0.535
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        4811002.95620095,
+        4653492.422795846,
+        4910093.728779188,
+        5604135.104489099,
+        4217008.375540901
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        0.457,
+        0.351,
+        0.415,
+        0.411,
+        0.275
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        4521943.181482461,
+        4410059.050690689,
+        4790412.277251817,
+        4479863.238735048,
+        5013155.355177879
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        0.455,
+        0.267,
+        0.397,
+        0.377,
+        0.419
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        4698594.556396291,
+        5128853.906306096,
+        4999089.332559919,
+        5116884.131399538,
+        4730322.724691118
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        0.839,
+        0.859,
+        0.787,
+        0.911,
+        0.795
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        2071888.6949900344,
+        2059788.2797181774,
+        2144278.4625197495,
+        2052058.42390914,
+        2101522.403773443
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        0.855,
+        0.739,
+        0.815,
+        0.791,
+        0.803
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        2042072.0341318455,
+        2186871.9713736707,
+        2085594.7263151207,
+        2133614.538039808,
+        2079952.2842306378
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        2.367,
+        2.207,
+        1.879,
+        2.063,
+        2.255
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        854429.2557397417,
+        885810.4573963792,
+        982010.2594539846,
+        924971.8089404501,
+        915300.3566358004
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        2.751,
+        2.015,
+        4.639,
+        2.223,
+        1.943
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        843875.2337217944,
+        952394.140772197,
+        866694.4315116783,
+        886441.9073708806,
+        952516.4455774395
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        0.603,
+        0.599,
+        0.551,
+        0.607,
+        0.611
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        3510958.4561978616,
+        3558980.1486137575,
+        4010369.049800402,
+        3454529.990813023,
+        3452272.7606185437
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        0.619,
+        0.535,
+        0.587,
+        0.591,
+        0.627
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        3329423.147807776,
+        4024039.450717005,
+        3647387.7664134093,
+        3570174.8025416643,
+        3233460.783423573
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        0.611,
+        0.611,
+        0.615,
+        0.579,
+        0.583
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        3418538.11687093,
+        3427299.1367935846,
+        3381485.117830385,
+        3773900.6316113314,
+        3778293.800352613
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        1.127,
+        1.151,
+        1.319,
+        1.383,
+        1.087
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        1521593.7278202355,
+        1465118.0876387928,
+        1325779.0912104286,
+        1329097.1698554861,
+        1567826.502730477
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        1.127,
+        1.079,
+        1.183,
+        1.199,
+        1.095
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        1583400.1563385979,
+        1590752.8645164056,
+        1443236.046956262,
+        1405530.908425829,
+        1557917.6934426154
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        2.591,
+        2.895,
+        4.223,
+        5.055,
+        3.551
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        719871.4488120541,
+        663611.3792309997,
+        542975.718153033,
+        620363.3102721062,
+        579976.2761477543
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        2.735,
+        3.391,
+        2.895,
+        4.191,
+        3.375
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        695736.0316827614,
+        598387.6731373398,
+        672757.0238776605,
+        567231.4798496406,
+        601688.0092356382
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        0.651,
+        0.659,
+        0.659,
+        0.651,
+        0.687
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        2932508.8656341154,
+        2898547.8400924876,
+        2883984.2634821865,
+        2951123.028226823,
+        2756485.155059457
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        0.711,
+        0.711,
+        0.703,
+        0.703,
+        0.711
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        2499029.772516069,
+        2531004.1469574915,
+        2560313.8029836994,
+        2551364.1480745077,
+        2531536.8096717466
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "p99_us",
+      "unit": "µs",
+      "samples": [
+        0.651,
+        0.667,
+        0.671,
+        0.679,
+        0.651
+      ]
+    },
+    {
+      "workload": "read",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "reads_per_s",
+      "unit": "reads/s",
+      "samples": [
+        2923520.2711779443,
+        2836478.677750125,
+        2813147.744850425,
+        2761054.6831297684,
+        2934246.5856324267
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        62366302.23957392,
+        32823259.874877736,
+        75933027.07012415,
+        72297692.98061699,
+        75988419.36488879
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        76501728.93907402,
+        71949692.77481186,
+        73474845.88651076,
+        76591963.97114015,
+        73977629.16494052
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        9174758.038693625,
+        9626751.587451335,
+        8976781.554509262,
+        10049655.347069873,
+        9789228.129151244
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        9613924.038463388,
+        9089975.302537102,
+        9991147.84301109,
+        9813504.166813869,
+        9016555.297181154
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        19997600.287965447,
+        18283140.019599527,
+        18327639.546647508,
+        19017191.541153204,
+        18579245.12527056
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        13603887.44687682,
+        11424797.981009701,
+        14413604.136127843,
+        23085997.649845436,
+        22804601.056309123
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        19916113.3306513,
+        12310677.173419278,
+        17990238.49659175,
+        18695817.184821237,
+        19704782.9419635
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        54922422.07881367,
+        70214693.12668368,
+        71810363.19288024,
+        66057033.64284723,
+        66612192.69575103
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        71109594.10643685,
+        52691758.48205582,
+        65408212.65518098,
+        72851252.31302726,
+        40475342.42139688
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        8694986.818399983,
+        9457540.686340032,
+        9943985.529512258,
+        8840497.967569517,
+        9241119.284367723
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        9344260.30368223,
+        9671198.590326093,
+        9642346.098513922,
+        9951516.213010214,
+        9633679.342983069
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        30942030.106595293,
+        32263372.36125943,
+        32586416.460919656,
+        34384781.75405941,
+        30799999.17866669
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        21237013.566204265,
+        20433781.945663847,
+        19367158.721612588,
+        13190059.970806,
+        21260235.917751234
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        32740047.298454996,
+        31622553.20494577,
+        34052522.61087501,
+        32221996.668245547,
+        32519232.41603805
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        58189943.61394464,
+        53384953.02391059,
+        59879629.96783865,
+        60933513.61528895,
+        59038080.742840745
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        55969950.85278616,
+        62824962.11654784,
+        61222815.53933015,
+        59617032.10913733,
+        60636342.02777629
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        8473235.632972308,
+        9004864.337666564,
+        9396839.429438945,
+        9039905.94158666,
+        9534445.424691372
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        8943973.429959252,
+        9437394.448641464,
+        9177136.63242218,
+        9251740.506812194,
+        8990160.449191568
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        41680195.36341171,
+        41474312.26258548,
+        45936397.38291157,
+        40487911.72663534,
+        26225690.424082525
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        23234341.099644188,
+        24937954.369528614,
+        24091503.384494856,
+        23924841.545774445,
+        23339107.42851115
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        38952793.11002996,
+        42795193.757379495,
+        42087046.1122512,
+        42244554.57130437,
+        39600604.146816865
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        42262265.24896489,
+        36660398.96045773,
+        34403649.99790712,
+        41818730.02371541,
+        40992969.97893508
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        42836036.929804154,
+        41334275.93853263,
+        37421274.99273403,
+        38128776.89365617,
+        40392279.042789154
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        8882672.071200185,
+        8548213.577230202,
+        8024429.358755011,
+        8500242.200234424,
+        8265627.739711194
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        8519113.909924,
+        8065547.738605921,
+        8504161.383810747,
+        5900259.766803247,
+        5421637.788945508
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        42126690.122807726,
+        40808231.50999434,
+        41784149.7677637,
+        43350402.31340867,
+        40907876.68893283
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        19879826.4491151,
+        21476562.341162924,
+        21198913.004536778,
+        21122647.597140417,
+        20764497.581870433
+      ]
+    },
+    {
+      "workload": "scan",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "entries_per_s",
+      "unit": "entries/s",
+      "samples": [
+        43071361.34933961,
+        43625220.96174417,
+        40025178.50562527,
+        41663495.61172289,
+        41999142.37751265
+      ]
+    },
+    {
+      "workload": "scan-floor",
+      "arm": "floor",
+      "guarantee": "buffered",
+      "quantity": "bytes_per_s",
+      "unit": "B/s",
+      "samples": [
+        10502442270.519373,
+        10290408334.047945,
+        10960260551.84912,
+        10730457385.746067,
+        10861992763.66551
+      ]
+    },
+    {
+      "workload": "wal-floor",
+      "arm": "floor",
+      "guarantee": "durable",
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1500928.1965106453,
+        1538181.6603923468,
+        1562481.3478789097,
+        1623771.2577840956,
+        1562927.4118056472
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        198313.1478879233,
+        160617.27939202214,
+        214314.29074962405,
+        211927.68711840932,
+        194874.72456106983
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1397345.0444156104,
+        1369727.8631916468,
+        1479228.2086866035,
+        1557523.1828818293,
+        1648364.1519384107
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        823268.5540567719,
+        1070072.400096602,
+        1164682.3024916232,
+        1273684.7255691062,
+        1256980.9219570272
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        442125.5997622182,
+        367613.8792112586,
+        431736.8571629965,
+        454647.5430884977,
+        417871.5589242792
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        684784.54770926,
+        559417.2658464343,
+        630058.2406777097,
+        613055.8072134516,
+        511038.085220662
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        618398.8888121768,
+        386295.9987293505,
+        678096.6242917329,
+        596115.1611478903,
+        581434.3069973141
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        675610.1883314091,
+        481399.37539442384,
+        603793.388136221,
+        612035.7978489109,
+        535929.470909581
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        163863.8841705194,
+        181195.50182891492,
+        144609.7343348541,
+        239613.65843858925,
+        125307.1340509155
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1366524.5754413123,
+        1348494.3655859923,
+        1376898.0194974267,
+        1378033.8103351435,
+        905651.9018237112
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1120484.8382714593,
+        1091651.572764254,
+        1117384.8546081174,
+        1110880.7884942966,
+        934909.7157687483
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        352667.8547341357,
+        390491.22624788305,
+        419191.421666747,
+        374072.24472225213,
+        405962.97909923963
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        558254.7171127959,
+        602705.9084465617,
+        511951.8748855147,
+        560607.249772954,
+        642846.4624223458
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        461239.67757132585,
+        564063.3226511021,
+        643152.9105048866,
+        473975.43100955815,
+        564993.2020017935
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        548711.115998298,
+        669370.0290908215,
+        583663.4923154864,
+        651379.4001004166,
+        573096.117388424
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        146915.67483673614,
+        148364.3005011813,
+        154773.4486696727,
+        152738.6621328597,
+        157393.2534278151
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1054754.7853343645,
+        1109263.3003438544,
+        1054501.9183633544,
+        1127117.7247614495,
+        1042240.9644099664
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        897631.9826286183,
+        914736.7236661918,
+        978409.8192753897,
+        880143.57335439,
+        991129.433201944
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        379509.2339428723,
+        364040.28977572115,
+        303158.01483051333,
+        380565.0502722184,
+        347366.9859673617
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        558621.9915661687,
+        500313.3337586167,
+        674190.5021420697,
+        590400.4137691607,
+        555343.017281311
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        615573.5907774917,
+        602199.5858387344,
+        585935.7833225927,
+        590776.6458398935,
+        504174.3067255388
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        631390.9342248325,
+        549748.0958960444,
+        639319.9654876163,
+        591399.3585449631,
+        545049.2385564679
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        128541.14365364106,
+        119056.80938289763,
+        116278.12710336958,
+        114270.25267166307,
+        129719.37472988697
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        753520.1409227339,
+        824068.7540998451,
+        837389.3683036065,
+        835403.9516444802,
+        897700.0099860149
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        798331.6401517577,
+        775780.0957604331,
+        699869.913779386,
+        721263.2146239869,
+        759118.8852442411
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        334651.1740396467,
+        309750.1753944881,
+        333659.98646007775,
+        299403.12669319956,
+        283128.25212081603
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        587810.5629511138,
+        581792.2596938198,
+        483491.07632607705,
+        533633.4089178808,
+        523825.9345277298
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        446922.4127138629,
+        554270.719077353,
+        583216.3469383282,
+        538188.9573464047,
+        576319.1299406918
+      ]
+    },
+    {
+      "workload": "ycsb-A",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        582089.8429362111,
+        491873.5988734599,
+        551838.5184521998,
+        551415.8257510993,
+        567140.7475575205
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1294091.145651279,
+        944652.7607278476,
+        1340034.0397602418,
+        1161565.701321438,
+        1204659.8499019858
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        2809666.196140335,
+        2682825.888464654,
+        2793104.084202197,
+        2895588.485777551,
+        3060918.900347431
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1692220.9638346173,
+        1579118.480330686,
+        1643850.7549280985,
+        1741521.0608016644,
+        1544053.724913761
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1090027.3619113294,
+        1067583.2759811706,
+        1178595.4057417263,
+        1239642.3639220914,
+        1105135.8302150504
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        2714495.667560636,
+        2067436.1434001506,
+        2218009.27676389,
+        2444453.2479975587,
+        2166449.934980494
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1790450.6433155793,
+        1751497.6040437936,
+        1902527.9869175504,
+        1988982.9921658426,
+        2143393.818380181
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        2532072.667141874,
+        2038970.5279416067,
+        2185631.7669639,
+        2254245.3149313307,
+        2503561.4890330182
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        937139.669796963,
+        1075731.9602977452,
+        994371.8552990076,
+        1098628.2527635994,
+        839473.3815582809
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        2419650.6605162374,
+        2409665.26375955,
+        2512295.17257458,
+        2583589.453167791,
+        1706697.250681399
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1481471.3855283356,
+        1542759.4288828014,
+        1500253.092696738,
+        1476468.0521842868,
+        1445651.177670819
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        947279.1773827624,
+        1044373.7705109786,
+        1125299.6391614175,
+        1050206.8172285168,
+        1046270.2557921521
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        2111190.4918736056,
+        2341636.3073519417,
+        2107984.4548794357,
+        2276856.6627656524,
+        2253595.27321913
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1935332.0410476185,
+        2329761.963560659,
+        2124494.5296390355,
+        1676403.2165483797,
+        2215379.1621436006
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1915979.692148047,
+        2646921.3393210224,
+        1924850.0060632776,
+        2596132.17843528,
+        2336981.517280576
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        913149.5396610772,
+        877164.6350545641,
+        888067.1452509856,
+        880510.5545298664,
+        891983.266937687
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        2211154.508965418,
+        2318264.981888294,
+        2261314.0668904465,
+        2258479.1894951584,
+        2193369.485895302
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1214261.4887999932,
+        1298850.8918240976,
+        1340499.8248164756,
+        1269549.8179088032,
+        1395311.0649523747
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        994000.8061271388,
+        1013825.708967783,
+        917094.9671483441,
+        1020659.3179930674,
+        978148.1951446147
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1780497.917642196,
+        2156748.483604972,
+        2359816.680219636,
+        1928237.5381314587,
+        1956562.3436766441
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        2184932.9561463795,
+        2136186.846236589,
+        2239014.6078708363,
+        2174543.591796441,
+        2009855.6005700824
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        2260825.7073762254,
+        2325577.8257145053,
+        2191490.7409976423,
+        2298053.0391634237,
+        2340715.8719805665
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        835493.0689917926,
+        734352.6235871038,
+        787409.7589045807,
+        822514.9044635778,
+        849210.065646146
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1790084.3931706992,
+        1989012.7730024455,
+        1836265.1571293932,
+        1916999.1509994161,
+        2018232.5514108413
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1118824.8365150772,
+        1075817.5304165352,
+        997876.6183438263,
+        1045905.8757088549,
+        1053255.460961044
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        861011.4208171106,
+        804431.2319653557,
+        861944.8454594952,
+        767474.8929414735,
+        757121.553472906
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        2057635.3539285073,
+        2093202.609202171,
+        2053698.464490732,
+        2094999.424922658,
+        1948082.1306750898
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1986805.465956148,
+        1961467.2889434719,
+        1911772.6847218813,
+        1892861.7533275564,
+        1926085.839559438
+      ]
+    },
+    {
+      "workload": "ycsb-B",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        2058776.4197631008,
+        1931643.9124164835,
+        1967712.5911764225,
+        1909294.4607090876,
+        2124226.6434270605
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        3360510.57169022,
+        2719156.506553069,
+        3810691.43692345,
+        3779826.255045251,
+        3421724.45875754
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        3173871.3801006265,
+        3666897.773669209,
+        3796579.8876978047,
+        3837074.0582931237,
+        3268140.5339662987
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1978237.017967997,
+        1669096.17340166,
+        1994617.167595732,
+        1931043.4357273174,
+        1992780.0597594788
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1928461.7103117139,
+        1490671.6701696557,
+        1825323.348471319,
+        1988346.8077843897,
+        1875891.6396711671
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        8378385.174382056,
+        7176920.127685421,
+        6720804.237414628,
+        8399971.76480079,
+        8063891.577928363
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        7233225.949306635,
+        4684314.855688799,
+        6453487.24603436,
+        7571935.661271776,
+        7567636.317386486
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        8544860.517718019,
+        6065769.544448327,
+        8486101.843409518,
+        8365175.5632434385,
+        6155051.131997399
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        3364004.079864148,
+        3337427.2440860793,
+        3415615.5109931584,
+        3050739.285651092,
+        3299082.261296552
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        3330118.6587880496,
+        2824523.644087425,
+        3410920.4027614812,
+        3243572.8603771627,
+        2887738.0290263873
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1723428.948022417,
+        1771641.755611941,
+        1742455.9498423599,
+        1753649.4321507772,
+        1640123.993373899
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1689508.2551062852,
+        1849953.93614699,
+        1760747.5147929203,
+        1823083.5927581287,
+        1860434.6570698004
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        7433617.79310755,
+        7432910.549381285,
+        7560784.930448339,
+        7772810.08848567,
+        7289097.259882557
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        6957722.097447073,
+        7156515.8645643685,
+        6588136.084538962,
+        5031142.773769635,
+        6748922.534517365
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        7743006.516514285,
+        7669711.5421489,
+        7695895.163437726,
+        7466319.433037568,
+        7243542.381966477
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        2876157.318522602,
+        2916704.001971304,
+        2946763.237139472,
+        2972432.852285283,
+        3012121.684221713
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        2883356.0839228593,
+        2993544.104032932,
+        2874243.6484578922,
+        3059586.671246439,
+        2367244.808850592
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1366922.2530776255,
+        1426767.7589181974,
+        1532436.276681894,
+        1396664.0796619782,
+        1577346.6296353957
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1362513.9911939378,
+        1394824.5698021569,
+        1371790.0988296324,
+        1424715.871083474,
+        1389307.318680223
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        5114772.411655396,
+        6001589.524550664,
+        7037599.598334049,
+        5939174.245950093,
+        5237309.909470525
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        5487917.920294463,
+        6428449.650496926,
+        5837030.364395866,
+        5873161.421371317,
+        5973384.6395915765
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        6194007.801045466,
+        6193678.627386273,
+        6227265.678858273,
+        6728406.301108495,
+        6221182.330737255
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        2538750.8584151343,
+        2339518.83396884,
+        2311872.6357923476,
+        2498623.0088598174,
+        2563615.214276958
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        2406738.289593673,
+        2352007.235903221,
+        2440615.9099260434,
+        2482823.7014918937,
+        2514601.789672269
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1226322.8933685755,
+        1203216.5346978772,
+        1077884.018817268,
+        1183521.0598932905,
+        1125403.5612765471
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1139827.3384988334,
+        1100718.7605448856,
+        1138294.7015842057,
+        1007988.9576019282,
+        787762.2955002561
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        5044910.8049679855,
+        4675711.362726726,
+        4922376.582482542,
+        4985790.497083313,
+        4967309.6385378195
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        4063321.171813066,
+        4079379.8363597575,
+        3979983.5483400044,
+        3913722.151714343,
+        3965114.2900577853
+      ]
+    },
+    {
+      "workload": "ycsb-C",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        4764493.470023475,
+        5003749.810107695,
+        4715415.703032172,
+        4802945.704235756,
+        5012187.133013924
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1538109.2888506465,
+        1441536.8548019358,
+        1715976.0875745204,
+        1673907.5392152527,
+        1569110.561074756
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        2861009.218425861,
+        3120884.6377919274,
+        2809751.490466915,
+        3389078.8662656457,
+        3303110.9912703494
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1275926.3485683738,
+        1338888.1923884286,
+        1475224.0286189918,
+        1513391.1498411666,
+        1454267.3931602295
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1130616.0092783805,
+        987531.3790170329,
+        1126389.5631150012,
+        1189024.9995004097,
+        1079831.7121814222
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        2908671.892731812,
+        2285827.185427783,
+        2270067.1345784636,
+        2825999.192571659,
+        2692943.0667222715
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        2222830.0388928545,
+        1630234.2899135859,
+        1888736.8477140728,
+        2156452.855099571,
+        2463877.427274206
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        2487996.8340016278,
+        2232364.1889121444,
+        2388773.624268564,
+        2348053.060925353,
+        2691316.063247543
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1265981.1125745852,
+        1382950.269938063,
+        1462240.5619682928,
+        1568462.6086356414,
+        1174012.620166062
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        2456537.706625528,
+        2654056.008013126,
+        2589411.069525169,
+        2503617.727616406,
+        1966340.9619497291
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1149584.1149547328,
+        1176945.2433287213,
+        1270887.6743721433,
+        1108710.3835605746,
+        1008026.5119036844
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        794027.2634025053,
+        822456.7539901901,
+        857269.7330633505,
+        863160.1189641802,
+        987340.7123228809
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        2020981.0165211156,
+        1953570.6583064261,
+        2082096.2211619264,
+        2031386.5472644737,
+        2233416.1037341375
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1759238.376448161,
+        1792422.4266460084,
+        2132930.1810900383,
+        1704097.1608037206,
+        1956121.839787362
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1829176.8338412347,
+        2024393.1274282595,
+        2036263.4077764084,
+        2350633.6838284866,
+        2100715.8819582537
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1208496.719561542,
+        1324006.7625556015,
+        1419554.1410930855,
+        1287531.234182046,
+        1352274.3703518105
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1992775.262994082,
+        2236328.6530916984,
+        2130709.6940643,
+        2100566.545459129,
+        2091626.1784850156
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        761354.1285736442,
+        857843.1057152909,
+        923849.9008327565,
+        908877.1326382544,
+        772939.1705313625
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        714011.0334540688,
+        753255.6975865943,
+        668676.6285281057,
+        727275.361437221,
+        736753.3376703317
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1893730.214462163,
+        1866393.7143317894,
+        1997542.6845003227,
+        1792894.1535148136,
+        1947948.1966868984
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1861100.0278171136,
+        1813726.7971985508,
+        1691887.2857502808,
+        1794991.6222594902,
+        1732631.090654157
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        2055420.1253576884,
+        1899165.9782864226,
+        2077847.337192383,
+        1968069.4721674519,
+        1907241.6360484918
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1178202.0740032492,
+        1138407.880569356,
+        1130315.8301364987,
+        1110666.9677314595,
+        1095066.177148724
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1701795.237410306,
+        1584173.1721794095,
+        1619857.1681222864,
+        1575298.7112922329,
+        1694846.8858374865
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        700275.5710421654,
+        659228.5557136928,
+        584337.7885661597,
+        596184.1969741076,
+        559545.118467396
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        432229.13427685614,
+        484802.9639069138,
+        423736.4013136947,
+        510797.99375710863,
+        512764.3296273496
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1804340.4275067078,
+        1876828.1948842842,
+        1400214.8377629875,
+        1786063.524921391,
+        1815832.329238583
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1366355.2615499105,
+        1565897.0668837542,
+        1528678.4666376626,
+        1471169.5636202127,
+        1523442.9225046523
+      ]
+    },
+    {
+      "workload": "ycsb-D",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1886546.2051575985,
+        1745374.809117084,
+        1773854.7364103305,
+        1900236.663074966,
+        1738965.5506055322
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        833443.3918844825,
+        806480.8920666195,
+        975923.5100910843,
+        881209.6586079532,
+        861068.2414671031
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1220698.8317633749,
+        1152284.0954362357,
+        1285455.1444825348,
+        1251547.5317619627,
+        1274151.3242072691
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        72606.57291702485,
+        77706.40542388844,
+        77897.42779046377,
+        80976.67789047491,
+        76818.21711281175
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        75794.12659211455,
+        75319.76200221086,
+        77797.8810117367,
+        76241.48690120001,
+        75934.05150416195
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        268183.86402402003,
+        239596.0864438519,
+        252374.11174840876,
+        263181.84001071687,
+        248888.47988447748
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        233914.28599910674,
+        225372.7511086689,
+        257339.50495046444,
+        255157.67702980535,
+        250728.5198574429
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        187111.89864330395,
+        239388.93459854074,
+        253674.66635157817,
+        256993.5091399294,
+        251018.80335750457
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        854386.2652965045,
+        685090.5792509357,
+        892536.4672549791,
+        947437.6737600694,
+        782771.879765613
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1214466.2360169394,
+        1227511.6791598715,
+        1221880.258667163,
+        871798.9938393453,
+        628375.8708189912
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        53530.32836766736,
+        49996.30377326204,
+        47844.05318896116,
+        48194.16557961513,
+        46581.10872205921
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        50218.929927206955,
+        51036.54716935488,
+        53423.07384015462,
+        53814.92554161521,
+        48723.31467906011
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        241161.78241708738,
+        233800.7196760233,
+        241570.2491357462,
+        236827.37709322243,
+        243012.6688822618
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        223073.55020484398,
+        237818.6097533122,
+        232510.65328936774,
+        212142.16019524887,
+        238902.51243738426
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        225717.2787254016,
+        232339.67540102755,
+        243997.1456237916,
+        246613.94126366166,
+        230805.27545155553
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        757637.1630802401,
+        812142.2725510678,
+        885227.6298101918,
+        786198.8652903957,
+        834271.6762212949
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1050224.1698638343,
+        1107717.666920344,
+        1063263.610648254,
+        1106694.1182056363,
+        1032756.0140872728
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        36131.91451966904,
+        39844.28149043395,
+        42373.530451017104,
+        39336.18848383398,
+        42032.67048708148
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        40156.09362215169,
+        39025.15947769809,
+        40203.23480592183,
+        40746.93657839074,
+        40569.42905936062
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        205287.1378394488,
+        199967.3040379513,
+        199017.53690087973,
+        203064.16588829056,
+        213490.56158688385
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        206262.04438037414,
+        213801.2435853373,
+        200596.91846254028,
+        216658.4363500908,
+        212672.83017182525
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        205139.1656788513,
+        200728.38895607003,
+        213855.95934986506,
+        208228.41585216217,
+        200649.63721194764
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        742485.4716011558,
+        445498.23190216225,
+        742140.6378772996,
+        692351.5043108852,
+        714746.1128890024
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        975631.457948528,
+        919044.883707461,
+        939057.4443788293,
+        905527.2477676489,
+        977709.3416001656
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        33315.91623874654,
+        32773.798270668376,
+        31369.25518384486,
+        31244.045646473394,
+        32109.940140013816
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        31125.008347104736,
+        32297.94151343539,
+        32479.46284913489,
+        30965.0696667527,
+        31819.30360194498
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        148728.7592241688,
+        150547.18149571356,
+        135118.02444585023,
+        147436.1677544404,
+        146048.14374240575
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        135950.66754863848,
+        139367.35482605765,
+        137912.33357032647,
+        140967.76598640368,
+        143335.4951766058
+      ]
+    },
+    {
+      "workload": "ycsb-E",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        148994.11598992874,
+        146817.53711167816,
+        147753.41887005308,
+        145278.9504323388,
+        153272.0542668414
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        189260.7368831574,
+        177115.69535292426,
+        193930.84910166133,
+        183946.89080069013,
+        177181.0578772667
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1461911.3306025602,
+        1339116.3439712436,
+        1460280.117839171,
+        1434264.4573599033,
+        1508403.5097091026
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        616187.3831010056,
+        809575.7356642894,
+        923774.7231725507,
+        940189.0761993335,
+        860709.6876853419
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        362196.7471862357,
+        309131.45750286727,
+        368810.66088612407,
+        386382.4536909265,
+        335234.3360448546
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        588627.2689178657,
+        521693.3301225917,
+        510360.37691921234,
+        592403.5797390863,
+        526410.5812950459
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        548153.2565436206,
+        411535.4421931035,
+        491662.1071351209,
+        579652.2573558602,
+        522006.85000825627
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 10000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        549598.819253245,
+        470310.3201215467,
+        531084.882729381,
+        585413.4368196238,
+        555973.8151684074
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        156581.57616705648,
+        165022.32917136018,
+        147721.4585449566,
+        210759.22469942996,
+        142890.8569341875
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        1175414.6510264424,
+        1213533.0290925126,
+        1242074.6322900157,
+        1177005.0870159862,
+        718808.6637720721
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        809214.951443866,
+        816967.1662529818,
+        837778.165389809,
+        831097.1279942767,
+        714705.9613910122
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        308925.4239198237,
+        313293.1407474447,
+        344703.37412897765,
+        308881.5682584405,
+        356942.7652270356
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        555505.1897516848,
+        522787.9066192059,
+        564478.13601191,
+        565151.2587783532,
+        544147.0886171829
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        532928.6486347062,
+        531052.6110635465,
+        609715.4250807903,
+        442424.70683611656,
+        545718.3159220085
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 30000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        516935.8523962045,
+        560915.9802831302,
+        518606.45880781504,
+        623633.3853900909,
+        574278.3704139134
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        116561.70634476296,
+        140663.09067093366,
+        139769.7589684512,
+        55907.42037124164,
+        146223.259649509
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        917017.2563873725,
+        981628.8854989925,
+        931906.936796289,
+        970014.5263545833,
+        853153.9153959624
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        500601.226097538,
+        691741.2995455659,
+        700152.9321204127,
+        677187.0804277291,
+        671546.9397651085
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        305578.04241528106,
+        315914.2016001189,
+        252749.43875626774,
+        300782.074904338,
+        279382.0583846142
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        501305.542088279,
+        489282.5370024689,
+        548343.9771705181,
+        455980.994024887,
+        486378.49825312605
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        536199.0156086163,
+        534562.1055575727,
+        479974.4305473169,
+        487272.7549154874,
+        453782.8090266783
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 100000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        567838.5073554269,
+        495311.2310083019,
+        577585.3494467608,
+        213817.36130516703,
+        476625.0530612149
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "lmdb",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        119304.9897367286,
+        84409.58893402985,
+        111695.74999860492,
+        103770.86556075925,
+        124380.93432320988
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "lmdb-nosync",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        690209.1390288407,
+        755200.2979234967,
+        748410.3166146851,
+        710720.4056769332,
+        812342.2208013093
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "rocksdb-nosync",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        560748.4664174304,
+        540580.1928281982,
+        483134.37328393693,
+        507919.00585378683,
+        516578.94519063295
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "rocksdb-tuned",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        233302.66694204469,
+        248181.2434662565,
+        268815.62320273236,
+        242554.99985558275,
+        239642.2612655276
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "supdb",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        518914.2425198641,
+        517588.9938634131,
+        383730.4490679257,
+        504783.4898808275,
+        491533.386569676
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "supdb-ingest",
+      "guarantee": "buffered",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        461945.61756303936,
+        503121.6282046282,
+        479970.52289831854,
+        518331.686438066,
+        544328.4723603228
+      ]
+    },
+    {
+      "workload": "ycsb-F",
+      "arm": "supdb-noadvice",
+      "guarantee": "durable",
+      "size": 300000,
+      "quantity": "ops_per_s",
+      "unit": "ops/s",
+      "samples": [
+        533516.4817165983,
+        500590.8824599292,
+        438120.2429944551,
+        481884.2367570502,
+        503747.91978555894
+      ]
+    }
+  ]
+}

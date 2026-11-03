@@ -45,7 +45,21 @@ fn build_with(
     compress: bool,
     inline_max: usize,
 ) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
-    let mut w = SegmentWriter::create(path, &SegmentOptions::default()).expect("create");
+    build_opts(path, keys, compress, inline_max, false)
+}
+
+fn build_opts(
+    path: &Path,
+    keys: usize,
+    compress: bool,
+    inline_max: usize,
+    compact: bool,
+) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
+    let opts = SegmentOptions {
+        compact_records: compact,
+        ..SegmentOptions::default()
+    };
+    let mut w = SegmentWriter::create(path, &opts).expect("create");
     w.set_compress(compress);
     w.set_inline_max(inline_max);
     let mut want = Vec::new();
@@ -177,6 +191,33 @@ fn a_source_that_cannot_lend_answers_the_same() {
         "this source has nothing to lend, and the test is worthless if it does"
     );
     reads_what_was_written(&blob, &want);
+}
+
+/// Compact records, through a source that lends and one that copies: the
+/// same answers as each other and as what was written, and the lending one
+/// still copies nothing. The fixture's runs straddle the inline bound, so
+/// the segment holds compact records, full ones for runs in blocks, and
+/// both kinds of fixed and prefixed run.
+#[test]
+fn compact_records_read_the_same_through_both_sources() {
+    let path = scratch("compact-agree");
+    let want = build_opts(&path, 700, false, 256, true);
+    let full = scratch("compact-agree-full");
+    build_opts(&full, 700, false, 256, false);
+    let (a, b) = (
+        std::fs::metadata(&path).unwrap().len(),
+        std::fs::metadata(&full).unwrap().len(),
+    );
+    assert!(
+        a < b,
+        "compact records make the file smaller: {a} against {b}"
+    );
+    let lending = Blob::open(MmapBytes::open(&path).unwrap()).expect("blob open");
+    assert!(lending.zero_copy(), "the native path must not copy");
+    reads_what_was_written(&lending, &want);
+    let copying = Blob::open(Copying(std::fs::read(&path).unwrap())).expect("copying open");
+    assert!(!copying.zero_copy());
+    reads_what_was_written(&copying, &want);
 }
 
 #[test]
@@ -587,4 +628,120 @@ fn the_writer_stores_uniform_runs_without_prefixes() {
         "a mixed run declines rather than guessing"
     );
     reads_what_was_written(&blob, &want);
+}
+
+#[test]
+fn a_walk_over_a_compressed_block_decompresses_each_chunk_once() {
+    // `dec_buf` is a reused buffer, and for a long time that was all it was:
+    // `with_run` decompressed the chunks covering one extent, handed them
+    // out, and kept no record of what the buffer held. Extents are laid down
+    // in key order and many share a chunk, so a walk decoded the same chunk
+    // once per key -- about forty times over where a key holds one hundred
+    // byte value and chunks are four kibibytes.
+    //
+    // Nothing is wrong with the bytes either way, which is why no correctness
+    // check ever saw this and why the assertion below counts work instead.
+    let path = scratch("dec-reuse");
+    // inline_max 0 keeps every run in a block. An inline run lives in the key
+    // section and is never compressed, so a fixture that inlines measures
+    // nothing at all.
+    let want = build_with(&path, 400, true, 0);
+    let blob = Blob::open(MmapBytes::open(&path).expect("map")).expect("open");
+
+    for (key, runs) in &want {
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        blob.read_all(key, |v| got.push(v.to_vec())).expect("read");
+        assert_eq!(&got, runs, "value bytes differ for {key:?}");
+    }
+
+    // One `with_run` per key, so without reuse this is exactly the key count
+    // -- measured at 400 of 400. With it, 71. Half the keys is the line: it
+    // cannot be reached by decoding per key, and it is not so tight that a
+    // change in the fixture's run lengths trips it.
+    let keys = want.len() as u64;
+    let decodes = blob.decodes();
+    assert!(keys >= 400, "{keys} keys: this proves nothing");
+    assert!(
+        decodes * 2 < keys,
+        "{decodes} decompressions for {keys} keys: the walk is decoding the \
+         same chunk once per key again"
+    );
+}
+
+#[test]
+fn a_scan_hands_out_the_bytes_read_all_does() {
+    // Every scan test before this one counted: pairs, or values a key. A
+    // fast path that walks the record region and returns the right NUMBER
+    // of entries with the wrong bytes passes all of them. This holds the
+    // scan's (key, value) stream to `read_all` key by key, over the mixed
+    // fixture -- runs that live in the record, runs that spill to a block,
+    // runs of one value and of fifteen hundred -- so a walk that takes a
+    // short cut for the common shape has to come back correctly for the
+    // rest, mid-scan, in both directions.
+    for compress in [false, true] {
+        let path = scratch(if compress {
+            "scan-bytes-lz4"
+        } else {
+            "scan-bytes"
+        });
+        let want = build(&path, 400, compress);
+        let blob = Blob::open(MmapBytes::open(&path).expect("map")).expect("open");
+
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        blob.scan(b"", usize::MAX, |k, v| got.push((k.to_vec(), v.to_vec())))
+            .expect("scan");
+
+        // Group the stream by key, keeping order.
+        let mut keys: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+        for (k, v) in got {
+            match keys.last_mut() {
+                Some((last, vals)) if *last == k => vals.push(v),
+                _ => keys.push((k, vec![v])),
+            }
+        }
+        assert_eq!(
+            keys.len(),
+            want.len(),
+            "compress={compress}: the scan visited {} keys of {}",
+            keys.len(),
+            want.len()
+        );
+        for ((k, vals), (wk, wvals)) in keys.iter().zip(&want) {
+            assert_eq!(k, wk, "compress={compress}: keys out of order or missing");
+            assert_eq!(vals, wvals, "compress={compress}: values differ for {k:?}");
+            let mut via_read = Vec::new();
+            blob.read_all(k, |v| via_read.push(v.to_vec()))
+                .expect("read_all");
+            assert_eq!(
+                vals, &via_read,
+                "compress={compress}: scan and read_all disagree for {k:?}"
+            );
+        }
+
+        // And a bounded scan from the middle: the limit counts keys, the
+        // start is exact, and the bytes are still the right ones.
+        let from = &want[150].0;
+        let mut seen: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let n = blob
+            .scan(from, 20, |k, v| seen.push((k.to_vec(), v.to_vec())))
+            .expect("scan");
+        assert_eq!(n, 20, "compress={compress}: a limit of 20 keys");
+        let mut at = 150usize;
+        let mut i = 0usize;
+        while i < seen.len() {
+            let (wk, wvals) = &want[at];
+            let run: Vec<Vec<u8>> = seen[i..i + wvals.len()]
+                .iter()
+                .map(|(_, v)| v.clone())
+                .collect();
+            assert!(seen[i..i + wvals.len()].iter().all(|(k, _)| k == wk));
+            assert_eq!(&run, wvals, "compress={compress}: bytes differ at key {at}");
+            i += wvals.len();
+            at += 1;
+        }
+        assert_eq!(
+            at, 170,
+            "compress={compress}: the bounded scan covered keys 150..170"
+        );
+    }
 }

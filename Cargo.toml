@@ -26,8 +26,37 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std", "fra
 memmap2 = "0.9"
 libc = "0.2"
 
+# `supdb_emulated` is set by the CI job that runs the unit tests under
+# qemu-user (`.github/workflows/ci.yml`, cross-arm), which takes `madvise`
+# advice as a no-op: the tests that read the kernel's answer to that advice
+# are compiled out there and run on the native legs.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(supdb_emulated)'] }
+
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 debug = true
+
+# What the tests run under: optimized, with the arithmetic and the
+# invariants checked. `cargo test --release` ran with neither, and a
+# prefetch span that summed a rank and a scan's limit of `usize::MAX`
+# wrapped through the checks green and panicked in every debug build;
+# unoptimized, the longest tests run seven times as long. The wasm module
+# and the suite's binaries keep the release profile: the checks cost code
+# size there and time in a measurement. Level 2 with no LTO, many codegen
+# units and incremental builds: every test target builds from nothing in
+# under a minute and a half and after a one-line engine change in under
+# one, at under two gigabytes for four compiles at once, and the tests run
+# within a fifth of their time at level 3 (CLAUDE.md, running the checks).
+# Debug info is line tables, what a backtrace needs to name a line.
+[profile.checked]
+inherits = "release"
+overflow-checks = true
+debug-assertions = true
+debug = 1
+opt-level = 2
+lto = false
+codegen-units = 256
+incremental = true

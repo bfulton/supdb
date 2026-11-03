@@ -38,8 +38,24 @@ class.
 **Never run two timing benchmarks at once.** Four cores measuring each
 other is not a measurement. This includes your own agents.
 
-**Two rows is not a band.** The gate says "insufficient history" below
+**Two rows is not a band.** The gate says "no band yet" below
 three prior rows rather than pretending.
+
+**An A/B of two engine revisions is two runs, however you interleave
+them.** There is no arm for "the other revision", so the only honest shape
+is two binaries alternated within one sitting, several rounds each -- and
+even that is not a result until an independent sitting says the same.
+Pricing a branch here, a comparison of two full rows found a 32% load
+regression and a 1.9x scan regression that were both the machine; the
+alternating rerun found a 5% load regression at 300k and a 6% read
+regression at 100k that the next sitting turned into no effect and a 24%
+IMPROVEMENT. What survived every sitting was the large effects and the
+quantities that are not rates: device bytes per byte stored came back
+identical to three decimals every time, and it is what named the
+mechanism; bytes on disk per byte stored, the store's files as
+allocated after the load, is the other. Prefer the deterministic quantity for the WHY, demand a second
+sitting for the WHETHER, and claim nothing from a margin that only one
+sitting has seen.
 
 **Nothing typed.** The window of ten is the one parameter and it is stated
 once, in `DESIGN.md`. The moment a threshold appears in code, ask what
@@ -50,6 +66,21 @@ Every gate this suite has broken has broken the same way: a check that was
 not running, or one reporting a verdict it had not earned. The engine's
 `scripts/check.sh` calls this one by group name and CI calls that.
 
+**The tests run under `checked`; only what a measurement times runs under
+`release`.** This side ran `cargo test --release` for a while after the
+engine had moved off it -- so every test here, and every line of engine
+code they reach, ran with the arithmetic and the invariants unchecked,
+which is how a prefetch span that summed a rank and a scan's limit of
+`usize::MAX` wrapped past a green engine test suite. There was no reason
+for the difference; nobody had written one down, which is the shape of a
+check that is not running rather than a decision. `[profile.checked]`
+inherits `release` and turns both on. The `quick` group's binary stays on
+`release`, because the checks cost time and time is what it measures. A
+profile is worth as much as the proof it is in effect: both flags were
+held to firing, a `usize::MAX + 1` that wraps silently under `release` and
+panics under `checked`, and a `debug_assert!(false)` that is compiled out
+under one and fails under the other.
+
 ## Shapes the bugs come in
 
 **A gate can be red for a reason that is not the engine's.** A "not
@@ -59,6 +90,100 @@ eighty-five minutes earlier. Near-zero true effects and a fixed floor are
 the shape. The design answers it with bands drawn from the series rather
 than a typed floor, and with the arms as the dimension rather than the
 ratio between two near-identical arms.
+
+**A guarantee is what the arm was opened with, not the row it sits in.**
+`supdb-ingest` sat in the buffered row and committed durably on every
+batch: no supdb arm set a sync policy, the engine's default is durable, and
+the matching check let it through, because it skipped the durability axis
+for the buffered group on the reasoning that a buffered metric does not
+care when a commit lands -- true of a read, false of the group. So every
+buffered load figure priced a durable supdb against comparators that were
+not. The arm now sets the policy its row names, `Features` reports it from
+the options the arm was opened with, and the check compares every axis
+within a group.
+
+**A red gate reads its own control first, and the control is the
+comparators.** A quick row taken here failed with 121 of 1,106
+quantities worse than every row in the window, and the row carried the
+reason inside it: LMDB's scan at three hundred thousand keys, code no
+engine change can touch, read 18.7M entries a second against 30.3-51.6M
+in the ten priors of its class, its load 557k ops a second against
+733-789k, and RocksDB's read 748k against 798k-1.05M. Ten of the eleven
+workloads had a comparator among their regressions; the eleventh was
+ycsb-C, which only reads. The comparators' median row-top against
+window-floor was 0.92 and the default supdb arm's 0.86 on six
+quantities, the fewest of any arm. The class is keyed on the CPU model,
+the core count, the memory and virtualisation, which does not pin the
+host a guest lands on, and the engine's own probes see the same
+host-to-host spread (`docs/engine.md` on memory placement). So a row
+whose comparators moved is a row about the machine: it cannot adjudicate
+the change beside it, whichever way it reads, and the change is priced
+within one sitting instead, and do not read its verdict as the change's.
+
+Whether to bank it is a different question from whether to believe it. A
+row from a machine that was *disturbed* -- its floors dipping while its
+comparators stand -- is not history and is not banked. A row from a machine
+that is what the fleet *is* now is banked, because the alternative is a
+window that fossilises: three hosts in one day, on two classes, all came in
+below a window measured six days earlier with every comparator below its
+band too, and a gate whose control withholds every verdict is as useless as
+one that cries regression. The evidence for the second case is the
+comparators on independent hosts across several rows, never one row's
+floors.
+
+**A window keyed on the host hides a move that lands with a host
+change.** The class carries the CPU model's string as the hypervisor
+reports it, and the same fleet reports a Xeon as `Intel(R) Xeon(R)
+Processor @ 2.10GHz` on one host and `Intel(R) Xeon(R) Processor` on
+another with twice the L3. A quick row on the first, after eleven rows
+on the second, was gated against the seven rows of its own class from a
+fortnight before, and flagged the load's device bytes per byte as better
+than every one of them at every rung -- a quantity that had read the
+same in all eleven rows of the other class, since the engine change that
+moved it (the streamed ordered load, 61b7240) landed the day before the
+fleet moved, and the first row of the new class had no priors to gate it
+against. A bisect by the deterministic quantity, one rep a commit, named
+it in five builds, and the device's own counter said what the count had
+not: two fifths fewer bytes a load where the count read three and a half
+percent (`CLAUDE.md`, profiling). The rule: a deterministic quantity
+flagged against a short window is read across every class the series
+has before it is read as new, and a move that lands on the day the
+class changes is gated by nobody, so it is looked for there.
+
+The gate does that reading itself now, from two controls the row carries.
+The comparators are the exact one: their code is untouchable by an engine
+change, so one below its own window withholds the arms' verdict in that
+workload and quantity. The floors are the coarse one, global and judged on
+medians rather than CIs -- a floor's samples range over a factor of two
+within one run, so the CI rule fired on neither of the two rows that
+produced this entry. A third floor went in with them, a pointer chase
+around a 64 MiB buffer, because the other two are sequential and a host
+whose memory latency has moved shows in neither. Neither control ever
+fails a row: the run did not choose its machine.
+
+Held to the rows that produced the rule, in both directions: as measured
+they read "host: OUT OF BAND" and give no verdict, and with their floors
+raised by hand the comparator control still withholds 72 and the gate
+fails on the 4 it does not explain -- which is the check that a control
+is not just the gate switched off. Its price, over the twenty-six rows
+banked in this class: the floors call the machine out of band on five, and
+in one of those it withholds a verdict that would otherwise have been
+given.
+
+**The ratio to the comparator is not more stable than the rate, so it
+cannot stand in for it.** The obvious answer to a fleet that has moved is
+to gate the ratio of an arm to the comparator beside it in the same row,
+since a machine both arms run on cancels. It does not. Over the
+twenty-five rows banked in one class, the coefficient of variation of
+supdb's rate against that of supdb over LMDB: point reads at a hundred
+thousand keys 18.3% against 13.2%, scans at three hundred thousand 10.9%
+against 14.6%, ycsb-E 35.7% against 38.3%, the load at three hundred
+thousand 22.8% against 23.2%, ycsb-D 10.5% against 8.7%. Two better, two
+worse, one level -- because the two engines do not respond to a host the
+same way, so a ratio carries both their noise instead of cancelling
+either. Every engine quantity in a row does have a comparator of its own
+guarantee to pair with, so the coverage was there; the stability was not.
+This was checked before it was built.
 
 **A one-sided bound passes a broken measurement.** A one-sided bound,
 `ratio >= 0.90`, recorded a pass on a run where the ratio came out 8.5x --
@@ -82,6 +207,223 @@ was read, and `apple-silicon.yml` fails if it was not.
 so is invisible in every ratio.** `Batch` builds a batch without allocating
 per record after that was found to cost as much as an engine's whole commit
 path.
+
+**A clock on the thread that releases the others starts late.** The
+threaded read and scan passes release their threads on a barrier, and
+the first version started the clock when the main thread's own `wait`
+returned -- on a loaded box, tens of microseconds after the workers were
+running, and a hundred scans of a hundred entries on four threads at ten
+thousand keys were over by then: the smoke run recorded them at billions
+of entries a second, a thousand times the single-threaded figure, with
+nothing raised. Each thread times itself now, from its release to its
+finish, and the aggregate is the span from the first release to the
+last finish. The threads also split the single-threaded pass's
+operations at first, so the pass on four threads was a quarter as long
+and the smallest rung's scans were tens of microseconds, a few times the
+scheduler's skew; every thread runs the whole pass now, and a pass on
+four threads is as long as the pass on one.
+
+**A library's cache of handles is a store the runner did not drop.**
+heed keeps every environment it opens in a registry of its own and
+closes one only once `prepare_for_closing` has taken the registry's
+handle; the LMDB arm never called it. A pass opens two stores at one
+path -- the ordered load's, then, after dropping it and removing the
+directory, a fresh one for the shuffled load and the lag sweep -- and
+heed answered the second open with the first environment, still mapped
+over its removed file. So LMDB's shuffled load overwrote its ordered
+load's keys in place and its lag sweep scanned the ordered load's tree,
+while every other arm loaded and scanned a fresh store. Nothing raised:
+the key set was the same, so the byte checks held, and the rates were
+plausible. The full run found it by filling the disk: every LMDB store
+opened since the start was still held, 4.5 GB of removed files when the
+3M rung began, which its eight reps would have tripled. Every row
+before the fix carries LMDB's `load-shuffled` and `scan-lag` from that
+store, and it flattered the lag sweep: rows of one engine either side
+of the fix read LMDB's lag scans at 0.6-0.8x of the old figures from
+30k up, its plain scan steady. The first reading of the fix compared
+the new row to the window, where hosts and engine changes move the
+lag points by more than that, and called the shift unresolvable; the
+row of the same engine before the fix was already banked and resolved
+it. `a_store_reopened_where_its_predecessor_was_is_a_fresh_store`
+holds every arm to the runner's sequence -- the first store's key gone
+from the second, and nothing under the path still open. The rule: an
+arm's drop closes everything its open made, and a store that was
+removed and is still readable is the check that says it did not.
+
+**A runner that opens hundreds of stores keeps what each one freed.**
+glibc keeps what a thread frees in that thread's arena and gives a heap
+back to the system only from its top, so a store dropped at the end of
+a pass stayed resident, and the stores after it opened in what was
+left. At the full run's 10M rung the arenas held 13 GB taken from the
+system with 1.8 GB of it in use; the store's own files were down to a
+tenth of a gigabyte of page cache, and from the rung's third rep every
+pass read at a tenth to a twentieth of the reps before, faulting on
+every page. Nothing raised, and the rungs below it fit in what was
+left. `malloc_trim(0)` in the live process took it from 12.9 GB
+resident to 2.1 GB. The runner now releases freed memory after every
+store a pass drops, and the pass line prints what the process holds as
+the next pass opens, so a climb shows while it is happening.
+`a_dropped_stores_freed_memory_is_returned_before_the_next_pass`
+reproduces the shape and released 0 of its 300 MB without the release.
+It came back inside one store's life: the shuffled load's merges at ten
+million keys left 742 MB of freed memory in the arenas with the engine
+holding 11, and under a bound of 1 GiB the lag sweep's full rewrite put
+the process over the bound with the engine's own bytes at a quarter of
+it (`lagmem`: anon 871 MB, in use 247, free 593 at the ten-percent point;
+killed at the next). The runner returns the freed memory after the
+shuffled load and after every lag point's pass now, between the timed
+phases and never inside one. The release has a price, and it is the
+load's: a store that opens in
+memory just handed back faults its pages in where it used to be given
+the passes before it, warm. In one process releasing only before the
+odd reps, the default arm's ordered load read slower in all eight
+pairs (0.70-0.98, about 0.9), the other supdb arms in 18 of 24, and
+LMDB, which allocates next to nothing, in 9 of 16; reads, scans and the
+mixes showed no direction. So the rows before the release flattered
+every loading arm that allocates, and the first full row after it
+failed its gate on the load alone, the engine unchanged. The rule:
+what one pass leaves in the process is a variable of every pass after
+it, and a run is only as interleaved as its passes are independent.
+What the trim cannot return came next, under a bound: twenty to thirty
+megabytes of the allocator's fragments a store, so the fifth arm of a
+rep opened 0.3 GB above the first at ten million keys and the kernel
+killed it at its own full rewrite under 1.25 GiB, where the same arm
+runs four reps alone under the same bound. A bounded run gives each
+arm's rep a process of its own now (`Plan::fresh_process`, `run`
+spawning its own binary for the pass inside the group), and in core the
+arms share the process as they always have, since the rows' history is
+theirs. The rule's corollary: a residue a trim cannot return is a
+process's, and only a process boundary gives the next pass a floor the
+passes before did not raise.
+
+**A read that never read the value priced the lookup alone.** Every
+arm's point read and scan summed the lengths of the values it was lent
+-- a pinned slice, a slice of the mapping, a borrow through a callback --
+and read no byte of one. No caller gets a value to leave it unread, and
+the omission was not even: an LMDB leaf keeps the key beside its value,
+so the first touch of the value lands on lines the lookup loaded, while
+supdb keeps values in blocks apart from its index, where that touch is a
+miss the suite never charged. Measured outside the suite, a point read
+that consumed its hundred bytes read 1.6x of LMDB where the row said 2x.
+Every read and scan now copies each value into its thread's own buffer
+(`consume`), and the read and scan series stepped at that commit on
+every arm, comparators included. The rule: a workload does what its
+caller would with the answer, or it measures something the caller never
+sees. The first row banked after such a step fails its gate on the
+quantities the step moved, against a window that predates it, and is
+banked on its controls -- floors and comparators in band -- so the next
+window carries the new definition; the engine's part of the step was
+read by alternating two binaries in one sitting, never from the row.
+
+**A host that moved on an axis no floor read.** A quick row read the
+buffered arm's load at three hundred thousand keys at 0.41x of LMDB,
+five slow reps of five, where the two rows before read 1.1-1.2x and
+every arm's load at that rung was down a fifth to a half, with the
+comparators in band and all three floors within their window. Paired an
+hour later in one process with the row's own binary, the arm loaded at
+its old rate and its one slow rep had the shape the profiles know: the
+same fault count as the fast reps at three to four times the CPU, in
+the kernel's zeroing of its fresh anonymous pages and its copy into
+fresh page-cache pages. A probe of the price itself read 1.1-1.3 µs a
+page while the fresh footprint fit what had recently been freed and
+5-15 past it, and which price a load gets depends on what the pass
+before it freed and how long ago -- the arm before it in `ARMS`, a
+variable nobody chose. The write piece's size was not it: a probe
+wrote the same forty megabytes in pieces of a megabyte, 64 KB and 4 KB
+at the same price per page in the same state. The fourth floor reads
+that axis (`page-floor`), sampled after every rep of every rung as well
+as at the start because the price moves within a row, and it holds the
+pages it touched to the row's end, since a floor that freed them would
+hand the next pass a cheaper load than the one before had. The rule: a
+control reads the axis the measurement moves on, where and when the
+measurement is taken; and a floor that gives back what it measured has
+measured the pass after it instead.
+
+**A floor inside the pool the loads exhaust.** The fresh-page floor
+read 1.0-1.4 µs a page in all twenty-five samples of the first row that
+carried it, while every arm's load at the top rung read a third to a
+half of the rows before, LMDB's included. Its thousand pages drew from
+the pool of recently freed pages, and a forty-megabyte load draws past
+it: probes put the pool at about what the pass before had freed, cheap
+for seconds, and everything past it at the host's price. So the floor
+read the price the loads were not paying. Rather than a floor sized to a
+load, which would consume the pool it measured and prime the next pass
+unevenly, the runner primes the pool itself before every store a pass
+opens -- a touch and free of 512 bytes a key of the rung, between 16 and
+512 MB -- so every load meets a pool larger than its footprint whatever
+ran before it, and the first row after it banks on its controls against
+a window that predates the definition. The prime's own price per page
+is printed on the pass line and paired by `ab`, never banked. The rule:
+a control reads the quantity at the footprint the measurement has, not
+at a sample's; and when the quantity is the machine's and the
+measurement cannot be made independent of it, make the measurement
+independent of it and read the quantity beside it.
+
+**As many reader threads as cores measures the scheduler.** The
+threaded passes ran on two and on four threads, four being the gating
+class's cores, and the four-thread cells read two to four times the
+spread of the one- and two-thread cells within a row and across rows --
+23-29% against 3-10% at thirty thousand keys -- for LMDB as much as for
+supdb, and LMDB runs no thread of its own. Four readers on four vCPUs
+share them with the harness's thread, the engines' threads, the kernel
+and the host, so the cell was the scheduler's and read our ratio to LMDB
+on the 30k scans from 0.65x to 2.1x across rows where the counts below
+sat within a fifth. The counts derive from the class's cores now
+(`run::thread_counts`): two, doubling, and one fewer than the cores as
+the top, which keeps one core for everything a reader is not. The gate
+names the threaded quantities by their suffix and its test derives the
+counts from the same function for every core count, so a count can
+never be measured and then refused. The rule: a cell that reads the
+machine for both engines is the machine's, and a count of threads that
+leaves nothing for the rest of the process measures the rest of the
+process.
+
+**A threaded cell at the small rungs that read the guest's vCPUs.** The
+three-thread scan cells at thirty and a hundred thousand keys read 0.94x
+of LMDB in the first row that carried them, 2 and 3 wins of 5, with
+both engines spreading 34-59% where the one-thread cells spread 6-18%,
+and the loss was taken for the engine's: the upkeep thread as a fourth
+runnable thread beside three readers. Paired against the arm whose
+thread backs off, the cells did not move. `SUPDB_THREAD_SPANS` was
+written to take the pass apart, one line a pass with each thread's own
+wall and CPU, the release and finish skew, and every other thread's run
+and wait across it, and it said: the skew was 8-58 µs of a span of 0.5
+to 5 ms; the engine's threads ran 0-0.4 ms of a free core; and the
+three threads ran uneven by 1.5-3x in both engines, the slowest a
+random index, with wall equal to CPU, so the slow thread had its vCPU
+and the vCPU was slow. A control with no engine in it, three threads of
+identical fixed work released by a barrier, ran the same way: a thread's
+own CPU time 1.4-2x its siblings' at random, for tens of milliseconds,
+and every thread at 0.6x for its first millisecond or two after its
+vCPU had idled ten milliseconds, which a threaded pass's fresh threads
+on vCPUs the single-threaded phase before left idle always are. The
+span is the slowest thread's wall, so a pass of a few milliseconds reads
+which vCPU the host shorted, for both engines alike; the same arms paired
+on another host read the cells at 1.2-1.7x in both orders. The rule: a
+cell whose length is within the host's own unevenness is the host's for
+every engine, and the statistic a threaded pass reports has to be one
+that length can carry -- the per-thread columns are read before the
+span, and a threaded pass as short as a thread hand-off is a floor, not
+a measurement. The threaded scan passes run `size` scans a thread now,
+the threaded read pass's count, tens of milliseconds at the smallest
+rung as the read passes are; the first row after it banks on its
+controls as a definition step.
+
+**A policy default that restated the engine's.** `Policy` says what an
+arm differs from `supdb` by, and two of its fields -- the controller's
+drop of the raw pages a form serves and its builds ahead at landing --
+carried defaults of their own, off, while the engine's had moved to on:
+every arm that pinned neither, the plain controller arm among them, ran
+the controller without both, and every measurement of it at scale was
+of a shape the engine does not ship, read for a week as the controller
+reaching its form late. A field that follows the engine is an `Option`
+resolved through `unwrap_or(supdb::Options::default().<field>)`, as the
+seal cap and the trigger already were, and the arms whose pairs were
+priced against the old shape pin it. `scripts/policy_defaults.py` runs
+in `lint` and holds every field the policy maps as its own value or its
+negation to the engine's default. The rule: a default stated twice is
+two defaults, and an arm that pins nothing inherits the engine's rather
+than restating it.
 
 **A workflow that never runs can be syntactically invalid for months.**
 Both self-hosted pickup watchdogs arrived with a block of an older draft

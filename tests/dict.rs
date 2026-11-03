@@ -145,7 +145,19 @@ fn build_segment(path: &Path, all: &[(Vec<u8>, Vec<Vec<u8>>)]) {
 }
 
 fn build_segment_with(path: &Path, all: &[(Vec<u8>, Vec<Vec<u8>>)], inline_max: usize) {
-    let opts = SegmentOptions::default();
+    build_segment_opts(path, all, inline_max, false)
+}
+
+fn build_segment_opts(
+    path: &Path,
+    all: &[(Vec<u8>, Vec<Vec<u8>>)],
+    inline_max: usize,
+    compact: bool,
+) {
+    let opts = SegmentOptions {
+        compact_records: compact,
+        ..SegmentOptions::default()
+    };
     let mut w = SegmentWriter::create(path, &opts).expect("create");
     w.set_inline_max(inline_max);
     for (k, vals) in all {
@@ -374,6 +386,9 @@ fn sparse_ranges_agree_with_the_whole_reader_and_read_exactly_their_plans() {
     let seg = scratch("segment");
     build_segment(&seg, &all);
     check_shape(&seg, &all, "segment");
+    let compact = scratch("segment-compact");
+    build_segment_opts(&compact, &all, 256, true);
+    check_shape(&compact, &all, "compact records");
 }
 
 #[test]

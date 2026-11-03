@@ -6,6 +6,7 @@
 //! sizes, and a regression is a row whose error bars lie entirely on the
 //! worse side of the last ten rows' on the same machine class.
 
+pub mod bound;
 pub mod engines;
 pub mod env;
 pub mod figures;
@@ -28,6 +29,15 @@ pub enum Scale {
     /// least 1.5x the machine's memory, so the curve crosses the memory line
     /// wherever it runs.
     Full,
+    /// Out of core, under a memory bound (`bound::Bound`): the store past
+    /// the page cache the run is allowed, on a machine whose memory it
+    /// would otherwise fit. Every banked row is in-core -- the full
+    /// scale's top was never reached -- and a bound of a gigabyte or two
+    /// over the rungs from three to ten million keys reaches the regime in
+    /// hours rather than days. Its rows live under `runs/ooc/`, apart from
+    /// the other two, since a bounded row's class carries the bound and
+    /// its quantities include counts no unbounded row records.
+    Ooc,
 }
 
 impl Scale {
@@ -35,6 +45,7 @@ impl Scale {
         match s {
             "quick" => Some(Scale::Quick),
             "full" => Some(Scale::Full),
+            "ooc" => Some(Scale::Ooc),
             _ => None,
         }
     }
@@ -42,16 +53,20 @@ impl Scale {
         match self {
             Scale::Quick => "quick",
             Scale::Full => "full",
+            Scale::Ooc => "ooc",
         }
     }
-    /// Repetitions per (size, arm). Five at quick, seven at full. With this
-    /// few samples a bootstrap CI of the median is essentially the sample
-    /// range -- coarse, true, and conservative in the direction a gate on a
-    /// noisy machine should be.
+    /// Repetitions per (size, arm). Five at quick, seven at full, three
+    /// at ooc, where a rep reads its store off the device and the bound
+    /// makes every rep cost what the first does. With this few samples a
+    /// bootstrap CI of the median is essentially the sample range --
+    /// coarse, true, and conservative in the direction a gate on a noisy
+    /// machine should be.
     pub fn reps(&self) -> usize {
         match self {
             Scale::Quick => 5,
             Scale::Full => 7,
+            Scale::Ooc => 3,
         }
     }
 }
@@ -59,6 +74,18 @@ impl Scale {
 /// The size ladder: 1, 3, 10, 30 ... x 10^4 keys, up to and including the
 /// first rung at or above `top`. A geometric ladder costs about 1.5x its
 /// largest rung, so the curve is nearly free next to the top rung alone.
+/// The ladder from `bottom` to `top`, both rounded up to a rung.
+///
+/// A bottom exists because the cheap rungs are not free when the question is
+/// at the top. Measured on a 16 GiB M2: the rungs below ten million keys
+/// took 7h17m of a `full` run whose top rung alone needs a day, and not one
+/// of them was the measurement that run was dispatched for. Rows record the
+/// size of every measurement, so a run that skips the low rungs contributes
+/// the points it took and nothing claims the ones it did not.
+pub fn ladder_from(bottom: u64, top: u64) -> Vec<u64> {
+    ladder(top).into_iter().filter(|&r| r >= bottom).collect()
+}
+
 pub fn ladder(top: u64) -> Vec<u64> {
     let mut out = Vec::new();
     let mut rung = 10_000u64;
@@ -88,5 +115,57 @@ mod tests {
         );
         // A top between rungs rounds up to the next rung, never down.
         assert_eq!(ladder(50_000), vec![10_000, 30_000, 100_000]);
+    }
+
+    #[test]
+    fn a_bottom_drops_the_rungs_below_it() {
+        assert_eq!(ladder_from(0, 100_000), ladder(100_000));
+        assert_eq!(
+            ladder_from(100_000, 1_000_000),
+            vec![100_000, 300_000, 1_000_000]
+        );
+        // A bottom between rungs rounds up, the same way a top does, so the
+        // rung it names is always one the ladder has.
+        assert_eq!(
+            ladder_from(50_000, 1_000_000),
+            vec![100_000, 300_000, 1_000_000]
+        );
+        // One rung is a legal ladder: the point of a bottom is to ask for it.
+        assert_eq!(ladder_from(1_000_000, 1_000_000), vec![1_000_000]);
+        // A bottom above the top leaves nothing, which the runner refuses
+        // rather than writing a row with no measurements in it.
+        assert!(ladder_from(3_000_000, 1_000_000).is_empty());
+    }
+
+    /// The bounded scale's default ladder: three and ten million, the two
+    /// rungs either side of a one-and-a-half-gigabyte bound at a hundred
+    /// and sixteen bytes a record, and nothing below them.
+    #[test]
+    fn the_ooc_ladder_is_the_two_rungs_either_side_of_the_bound() {
+        assert_eq!(
+            ladder_from(3_000_000, 10_000_000),
+            vec![3_000_000, 10_000_000]
+        );
+    }
+
+    #[test]
+    fn every_scale_round_trips_by_name_and_has_its_reps() {
+        for (s, name, reps) in [
+            (Scale::Quick, "quick", 5),
+            (Scale::Full, "full", 7),
+            (Scale::Ooc, "ooc", 3),
+        ] {
+            assert_eq!(s.as_str(), name);
+            assert_eq!(Scale::parse(name), Some(s));
+            assert_eq!(s.reps(), reps);
+            // The row's path and its JSON carry the same word.
+            assert_eq!(
+                serde_json::to_string(&s).unwrap(),
+                format!("{name:?}"),
+                "{name}"
+            );
+        }
+        assert_eq!(Scale::parse("ooc "), None);
+        assert_eq!(Scale::parse("OOC"), None);
     }
 }

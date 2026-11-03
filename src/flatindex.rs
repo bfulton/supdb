@@ -25,18 +25,27 @@
 //!   * **It is native-endian.** Extents are read as `&[Ext]` straight out of
 //!     the mapping with no decode step at all, which is the whole point, and
 //!     that means a file written on a little-endian machine is not readable on
-//!     a big-endian one. LMDB makes the same trade for the same reason.
+//!     a big-endian one. LMDB makes the same trade for the same reason. The
+//!     one exception is the compact record (`COMPACT`), whose single inline
+//!     run is described by a four-byte header the reader turns into an
+//!     extent: two loads and a shift where the extent was sixteen bytes of
+//!     file a record, and `Exts` carries either kind.
 //!
 //! Every offset and length below comes out of a file that a corruption
 //! experiment deliberately damages, so every one is checked against the bytes
 //! actually present. The module returns `None` where the shipped decoder used
 //! to panic the calling process.
 
-use crate::index::Ext;
+use crate::index::{Ext, Exts};
 
 /// "SFIX", little-endian.
 const MAGIC: u32 = 0x5849_4653;
 const VERSION: u32 = 3;
+/// The record format's version, for a derived file that copies records
+/// verbatim (`db::zpages`): its trailer names the version it copied from,
+/// and an engine whose records are laid out otherwise does not attach it.
+/// The one definition; the constant above is its value.
+pub(crate) const REC_VERSION: u32 = VERSION;
 /// Header size, padded so the hash region starts 8-byte aligned.
 ///
 /// Version 1 was 128 and used every slot but the last. Version 2 adds the
@@ -44,13 +53,140 @@ const VERSION: u32 = 3;
 /// reader that took a v1 header for a v2 one would read the fence offset as a
 /// record offset, and this repository has already shipped one misparse that
 /// presented as file corruption.
-const HEADER: usize = 192;
+pub(crate) const HEADER: usize = 192;
 /// Bytes per hash slot: a tag in the top eight bits, a record offset below.
 const SLOT: usize = 8;
+/// The most of the hash table that may be occupied: three quarters.
+const HASH_LOAD_NUM: usize = 3;
+const HASH_LOAD_DEN: usize = 4;
 /// Records are 4-aligned so an extent array can be borrowed as `&[Ext]`.
 const REC_ALIGN: usize = 4;
 /// Bytes per extent record: five little-endian u32s, `Ext`'s layout.
 const EXT_BYTES: usize = std::mem::size_of::<Ext>();
+
+/// Hash slots for `keys`: the smallest power of two that keeps the table at
+/// or under `HASH_MAX_LOAD`.
+///
+/// Two things ride on the bound. Neither probe loop has a termination guard
+/// -- an insert and a lookup both walk `s = (s + 1) & mask` until they find
+/// what they came for -- so a full table does not slow down, it spins. And
+/// the capacity is what the section costs: eight bytes a slot, every slot,
+/// whether or not a key ever lands in it.
+///
+/// The rule was `cap >= keys * 2`. Rounded to a power of two that is not two
+/// slots a key, it is between two and four: 290,000 keys took 1,048,576 slots,
+/// 3.62 a key at 27.7% load, and 28.93 bytes a key of a segment that came to
+/// 181.6. Three quarters is the same guarantee -- there is always an empty
+/// slot -- at half the slots: the same segment takes 524,288, 55.3% load and
+/// 14.46 bytes a key, and the store falls to 167.1.
+///
+/// What that buys is not the disk. A scan never reads a hash slot, so the
+/// bytes come off the file without coming out of the scan's working set, and
+/// the store crosses the page cache later: at thirty million keys under a
+/// four gibibyte cap, scans went from 1,981,237 entries/s to 2,638,810, a
+/// third faster, with faults a scan down from 1.14 to 0.88. In-core point
+/// reads, which are what the extra slots were buying, did not move --
+/// 1,016,175 ops/s against 999,432, inside the spread of either.
+///
+/// `nkeys > hash_cap` is refused at open, so a reader from before this reads
+/// a smaller table without noticing: the capacity is a header field and the
+/// probe masks with it, which is why this is a writer's choice and not a
+/// format change.
+fn hash_cap_for(keys: usize) -> Option<usize> {
+    let want = keys.checked_mul(HASH_LOAD_DEN)?.div_ceil(HASH_LOAD_NUM);
+    let mut cap = 1usize;
+    while cap < want {
+        cap = cap.checked_mul(2)?;
+    }
+    Some(cap.max(16))
+}
+
+/// The hash table `t` -- `mask + 1` slots of `SLOT` bytes, zeroed --
+/// filled with the `n` keys `at` gives as (hash, record offset), each
+/// placed by linear probing from its hash's home slot, in the order given.
+/// The two writers of a section call this one function, so their bytes
+/// agree. A fill in home-slot order, sorted first so the writes walked the
+/// table forward, was tried against this and not kept: the fill is under
+/// one percent of a seal's thread at three hundred thousand keys, and the
+/// sort's own passes and scratch were not priced.
+///
+/// `lookahead` asks for each key `FILL_AHEAD` keys before its slot is
+/// probed and hints its home slot to the core meanwhile: the probe is a
+/// load at a random slot of a table that outgrows the core's own cache
+/// at a few hundred thousand keys -- four megabytes at three hundred
+/// thousand -- and four fifths of the time a streamed run's finish spent
+/// in this loop was on that load. The keys are placed in the order given
+/// either way, so the bytes are the plain fill's.
+fn fill_hash(
+    t: &mut [u8],
+    mask: usize,
+    n: usize,
+    mut at: impl FnMut(usize) -> (u64, u32),
+    lookahead: bool,
+) {
+    #[inline(always)]
+    fn place(t: &mut [u8], mask: usize, h: u64, off: u32) {
+        // The tag is forced non-zero so an occupied slot is never all zero,
+        // which is what marks a slot empty.
+        let tag = ((h >> 56) | 1) & 0xff;
+        let packed = (tag << 56) | off as u64;
+        let mut s = (h as usize) & mask;
+        loop {
+            let a = s * SLOT;
+            if t[a..a + 8] == [0u8; 8] {
+                t[a..a + 8].copy_from_slice(&packed.to_le_bytes());
+                break;
+            }
+            s = (s + 1) & mask;
+        }
+    }
+    if !lookahead {
+        for i in 0..n {
+            let (h, off) = at(i);
+            place(t, mask, h, off);
+        }
+        return;
+    }
+    let mut ring = [(0u64, 0u32); FILL_AHEAD];
+    for (i, slot) in ring.iter_mut().enumerate().take(n) {
+        *slot = at(i);
+        prefetch_slot(t, mask, slot.0);
+    }
+    for i in 0..n {
+        let (h, off) = ring[i % FILL_AHEAD];
+        if i + FILL_AHEAD < n {
+            let next = at(i + FILL_AHEAD);
+            prefetch_slot(t, mask, next.0);
+            ring[i % FILL_AHEAD] = next;
+        }
+        place(t, mask, h, off);
+    }
+}
+
+/// Keys a lookahead fill asks for ahead of placing them: enough that a
+/// slot's line has arrived from memory by the time its key is placed,
+/// at a line's latency of a few hundred cycles over the loop's few dozen
+/// a key.
+const FILL_AHEAD: usize = 16;
+
+/// A hint to fetch the line of hash `h`'s home slot in `t`; nothing is
+/// read, and on any architecture but x86-64 nothing is done.
+#[inline(always)]
+fn prefetch_slot(t: &[u8], mask: usize, h: u64) {
+    let a = ((h as usize) & mask) * SLOT;
+    debug_assert!(a + SLOT <= t.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        // SAFETY: a prefetch is a hint that faults on no address, and the
+        // slot is inside the table.
+        unsafe { _mm_prefetch(t.as_ptr().add(a) as *const i8, _MM_HINT_T0) };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (t, a);
+    }
+}
 
 /// Spare room left at the end of the record region, as a fraction of it.
 ///
@@ -81,6 +217,19 @@ const SLACK_DEN: usize = 2;
 /// are sixteen zero-padded ASCII digits, so for a million keys the first ten
 /// bytes are identical on every one of them. Whole keys cost more space and
 /// work for any key shape.
+///
+/// **The density is at its optimum and the rest of the seek is not the
+/// fence's to give.** The stride was swept 32 (this policy's answer at 300k
+/// keys) down to 1, every setting and LMDB in one process: the seek falls
+/// only 1,171ns to 899ns and turns back up at stride 1, while the 50- and
+/// 100-entry scans get monotonically *worse* (1,469 to 1,763ns, 1,854 to
+/// 2,216ns) and the store grows 11%. A denser fence does not remove probes,
+/// it moves them -- a binary search costs log2(nkeys) of them however the
+/// two levels are cut, and at 300k keys both levels are already cold. What
+/// is left is about twenty dependent cache misses against the three page
+/// touches LMDB's descent pays, so the lever is fanout -- nodes searched
+/// within a cache line -- and not stride. Sweeping this again will find the
+/// same floor.
 fn fence_target() -> usize {
     std::env::var("SUPDB_FENCE_TARGET")
         .ok()
@@ -333,14 +482,102 @@ impl Header {
 /// relative to `buf`, and the extents are borrowed in place, so `buf` must
 /// be 4-aligned where the record's extents fall (a buffer of `u32`s viewed
 /// as bytes is; a `Vec<u8>` is not promised to be).
-pub type ParsedRecord<'a> = (&'a [u8], &'a [Ext], &'a [u8], usize);
+pub type ParsedRecord<'a> = (&'a [u8], Exts<'a>, &'a [u8], usize);
 
+/// The key of the record at `off`, read without its extents: what a seek
+/// and a cursor compare. It refuses what `parse_record` refuses in the
+/// words it reads -- a count word carrying the compact bit beside any
+/// other -- and leaves the extents and the tail to the reader that wants
+/// them, which is where a compact header its run contradicts is found:
+/// such a record has a key here and no values there, and a segment's
+/// checksum row refuses it at open before either. Decoded in full, a record's compact extent was rebuilt for every
+/// key a merge compared, twice a key with the values read after, and the
+/// buffered arm's scans over one level-0 piece ran at 0.6x.
+#[inline]
+pub fn record_key(buf: &[u8], off: usize) -> Option<&[u8]> {
+    let klen = rd_u16(buf, off)? as usize;
+    let n = rd_u16(buf, off + 2)?;
+    if n & COMPACT != 0 && n != COMPACT {
+        return None;
+    }
+    buf.get(off + 4..off + 4 + klen)
+}
+
+/// The key of the record at `off` and the offset of the record after it,
+/// for a walk over records laid end to end -- a decoded group of the z
+/// form (`db::zpages`) -- that needs each record's length and nothing of
+/// its extents. `parse_record` is the only other function that says where
+/// a record ends, and it rebuilds a compact record's extent to say so.
+///
+/// The compact case reads the four-byte header's run length and returns
+/// `record_len_compact`'s answer, which is `parse_record`'s fourth element
+/// by the same arithmetic; every other shape asks `parse_record`. As
+/// `record_key` does, it leaves a compact header its run contradicts to
+/// the reader that wants the values. The next record must lie whole in
+/// `buf`, padding included: a record cut short is `None`, never an offset
+/// past the buffer, so a walk that follows the offsets cannot be led out of
+/// it. An offset past the buffer is `None` as well.
+#[inline]
+pub fn record_key_next(buf: &[u8], off: usize) -> Option<(&[u8], usize)> {
+    if off > buf.len() {
+        return None;
+    }
+    let klen = rd_u16(buf, off)? as usize;
+    let n = rd_u16(buf, off + 2)?;
+    if n == COMPACT {
+        let key = buf.get(off + 4..off + 4 + klen)?;
+        let run = rd_u16(buf, off + align_up(4 + klen, REC_ALIGN))? as usize;
+        let next = off.checked_add(record_len_compact(klen, run))?;
+        return (next <= buf.len()).then_some((key, next));
+    }
+    let (key, _, _, len) = parse_record(buf, off)?;
+    let next = off.checked_add(len)?;
+    (next <= buf.len()).then_some((key, next))
+}
+
+#[inline]
 pub fn parse_record(buf: &[u8], off: usize) -> Option<ParsedRecord<'_>> {
     let klen = rd_u16(buf, off)? as usize;
-    let n = rd_u16(buf, off + 2)? as usize;
+    let header: [u8; 4] = buf.get(off..off.checked_add(4)?)?.try_into().ok()?;
     let key = buf.get(off + 4..off + 4 + klen)?;
     let e_at = off.checked_add(align_up(4 + klen, REC_ALIGN))?;
-    let bytes = buf.get(e_at..e_at.checked_add(n.checked_mul(EXT_BYTES)?)?)?;
+    let (exts, tail, used) = parse_record_tail(header, buf.get(e_at..)?)?;
+    Some((key, exts, tail, align_up(e_at + used - off, REC_ALIGN)))
+}
+
+/// The part of `parse_record` past the key: for a record whose four header
+/// bytes are `header` and whose image from its aligned tail start is
+/// `rest`, the extents, the inline tail the extents' runs lie in, and how
+/// many bytes of `rest` the record spans (the extents' region and the inline
+/// tail, before the record's padding). `parse_record` is this over the
+/// record's own bytes; a reader of the compact form's record coding with raw
+/// tails (`db::zpages`, `zfile::ZCursor`) has the header and the tail apart,
+/// the head front-coded against the group's first record and the tail where
+/// it lies in the page, and parses the record without assembling it. One
+/// definition for both: a second one is a second reader.
+///
+/// The compact shape's four-byte header and run lie at the start of `rest`;
+/// the other shape's extents must be aligned for `Ext` where they lie, as
+/// the decoded group's buffer and the mapping place them, and a tail at an
+/// offset that is not is `None`, which the caller reads as a record it must
+/// decode first.
+#[inline]
+pub fn parse_record_tail(header: [u8; 4], rest: &[u8]) -> Option<(Exts<'_>, &[u8], usize)> {
+    let n = u16::from_le_bytes([header[2], header[3]]);
+    if n & COMPACT != 0 {
+        // One shape carries the bit, and any other count beside it is
+        // damage rather than a record.
+        if n != COMPACT {
+            return None;
+        }
+        let h: [u8; 4] = rest.get(..4)?.try_into().ok()?;
+        let len = u16::from_le_bytes([h[0], h[1]]) as usize;
+        let tail = rest.get(4..4usize.checked_add(len)?)?;
+        let e = compact_ext(h, tail)?;
+        return Some((Exts::One(e), tail, 4 + len));
+    }
+    let n = n as usize;
+    let bytes = rest.get(..n.checked_mul(EXT_BYTES)?)?;
     if !(bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<Ext>()) {
         return None;
     }
@@ -351,10 +588,9 @@ pub fn parse_record(buf: &[u8], off: usize) -> Option<ParsedRecord<'_>> {
             tail_len = tail_len.max((e.off as usize).checked_add(e.len as usize)?);
         }
     }
-    let t_at = e_at + n * EXT_BYTES;
-    let tail = buf.get(t_at..t_at.checked_add(tail_len)?)?;
-    let len = align_up(t_at + tail_len - off, REC_ALIGN);
-    Some((key, exts, tail, len))
+    let t_at = n * EXT_BYTES;
+    let tail = rest.get(t_at..t_at.checked_add(tail_len)?)?;
+    Some((Exts::Borrowed(exts), tail, t_at + tail_len))
 }
 
 /// The fence, held on its own: `fence_n + 1` offsets and the key blob they
@@ -436,7 +672,7 @@ fn rd_ne_u32(b: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_ne_bytes(b.get(at..at + 4)?.try_into().ok()?))
 }
 
-fn rd_u32(b: &[u8], at: usize) -> Option<u32> {
+pub(crate) fn rd_u32(b: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
 }
 fn rd_u64(b: &[u8], at: usize) -> Option<u64> {
@@ -488,6 +724,123 @@ fn record_len(klen: usize, next: usize) -> usize {
     align_up(4 + klen, REC_ALIGN) + next * EXT_BYTES
 }
 
+/// The extent count's top bit: the record is compact. It holds one inline
+/// run from its tail's start, and in place of the run's twenty-byte extent a
+/// four-byte header -- the run's length, and its record count with the
+/// fixed and tombstone flags in the two bits above it -- from which
+/// `compact_ext` rebuilds the extent exactly. Format 0007.
+///
+/// The extent was a sixth of the suite's 140-byte record and said nothing
+/// the record's position did not: that the run is inline, starts at the
+/// tail, and ends where the tail does. At 124 bytes a record, a segment's
+/// scan read 0.86-0.98x the time from a hundred thousand keys to three
+/// million, 29 rounds of 36 faster, with point reads level.
+pub(crate) const COMPACT: u16 = 0x8000;
+/// Runs shorter than this are written compact. Every record of a run takes
+/// at least one byte -- a fixed run's width is never zero and a prefixed
+/// record carries its prefix -- so the count fits the header's fourteen
+/// bits.
+pub const COMPACT_RUN: usize = 1 << 14;
+pub(crate) const C_FIXED: u16 = 1 << 14;
+pub(crate) const C_TOMB: u16 = 1 << 15;
+
+/// Whether a record with these extents is written compact: the rule every
+/// writer and the reserve planner share, through `record_len_exts` and
+/// `segment_record_len`.
+fn compacts(exts: &[Ext]) -> bool {
+    matches!(exts, [e] if e.is_inline() && e.off == 0 && (e.len as usize) < COMPACT_RUN)
+}
+
+/// A compact record's length: the header, the key padded to 4, the run's
+/// header, and the run padded to 4.
+pub(crate) fn record_len_compact(klen: usize, run: usize) -> usize {
+    align_up(4 + klen, REC_ALIGN) + 4 + align_up(run, REC_ALIGN)
+}
+
+/// The bytes a record with these extents and a tail of `tail` bytes takes,
+/// compact or not.
+pub fn record_len_exts(klen: usize, exts: &[Ext], tail: usize) -> usize {
+    if compacts(exts) {
+        record_len_compact(klen, tail)
+    } else {
+        record_len_tail(klen, exts.len(), tail)
+    }
+}
+
+/// The bytes a segment writer's record takes for a key whose values encode
+/// to one run of `run` bytes, written inline or into a block: what
+/// `reserve::Planner` sizes a section by, from the same rule as the writer.
+pub fn segment_record_len(klen: usize, run: usize, inline: bool, compact: bool) -> usize {
+    if compact && inline && run < COMPACT_RUN {
+        record_len_compact(klen, run)
+    } else {
+        record_len_tail(klen, 1, if inline { run } else { 0 })
+    }
+}
+
+fn compact_header(e: &Ext) -> [u8; 4] {
+    let records = e.records();
+    debug_assert!(
+        (records as usize) < COMPACT_RUN && (e.len as usize) < COMPACT_RUN,
+        "a compact run's count fits fourteen bits"
+    );
+    let mut c = records as u16;
+    if e.is_fixed() {
+        c |= C_FIXED;
+    }
+    if e.is_tombstone() {
+        c |= C_TOMB;
+    }
+    let mut h = [0u8; 4];
+    h[0..2].copy_from_slice(&(e.len as u16).to_le_bytes());
+    h[2..4].copy_from_slice(&c.to_le_bytes());
+    h
+}
+
+/// The extent a compact record's header stands for, over the run it
+/// describes. `last` is not stored: it is where the last record starts,
+/// which is zero for one record, `(n - 1) * width` for a fixed run, and for
+/// a prefixed one the offset its prefixes walk to -- what `encode_run`
+/// computed as it wrote them. `None` for a header the run contradicts.
+#[inline]
+fn compact_ext(h: [u8; 4], run: &[u8]) -> Option<Ext> {
+    let len = u16::from_le_bytes([h[0], h[1]]) as usize;
+    let c = u16::from_le_bytes([h[2], h[3]]);
+    let records = (c & !(C_FIXED | C_TOMB)) as u32;
+    let fixed = c & C_FIXED != 0;
+    if run.len() != len || records as usize > len.max(1) {
+        return None;
+    }
+    let last = if records <= 1 {
+        0
+    } else if fixed {
+        let n = records as usize;
+        if !len.is_multiple_of(n) {
+            return None;
+        }
+        ((n - 1) * (len / n)) as u32
+    } else {
+        let mut p = 0usize;
+        for _ in 0..records - 1 {
+            let l = crate::index::get_uvarint(run, &mut p) as usize;
+            p = p.checked_add(l)?;
+            if p >= len {
+                return None;
+            }
+        }
+        p as u32
+    };
+    Some(Ext {
+        block: Ext::INLINE,
+        off: 0,
+        len: len as u32,
+        last,
+        count: records
+            | if fixed { Ext::FIXED } else { 0 }
+            | if c & C_TOMB != 0 { Ext::TOMBSTONE } else { 0 },
+    })
+}
+
 /// `record_len` plus the record's tail: the bytes of its inline runs, padded
 /// so the next record stays 4-aligned.
 pub fn record_len_tail(klen: usize, next: usize, tail: usize) -> usize {
@@ -498,17 +851,94 @@ pub fn record_len_tail(klen: usize, next: usize, tail: usize) -> usize {
 /// for a writer that streams records as keys arrive instead of building the
 /// section at the end. Returns the bytes appended.
 pub fn stream_record(out: &mut Vec<u8>, key: &[u8], exts: &[Ext], tail: &[u8]) -> Option<usize> {
-    if key.len() > u16::MAX as usize || exts.len() > u16::MAX as usize {
+    stream_record_as(out, key, exts, tail, true)
+}
+
+/// `stream_record`, and with `compact` false the full form whatever the
+/// extents, as `SegmentOptions::compact_records` off writes it. Readers take
+/// either.
+pub fn stream_record_as(
+    out: &mut Vec<u8>,
+    key: &[u8],
+    exts: &[Ext],
+    tail: &[u8],
+    compact: bool,
+) -> Option<usize> {
+    stream_record_tail_at(out, key, exts, tail, compact).map(|(len, _)| len)
+}
+
+/// `stream_record_as`, reporting beside the record's length where its tail
+/// begins within it, since the record is padded to its alignment after the
+/// tail: what a reader that keeps a reference to the tail's bytes in place
+/// of a copy needs from the one definition of the layout.
+/// The bytes a record of a key `klen` long, `exts` and a tail of `tail`
+/// bytes takes in `stream_record_tail_at`'s layout, compact where
+/// `compact` and the extents allow; `None` where no record can hold them.
+pub(crate) fn record_len_for(
+    klen: usize,
+    exts: &[Ext],
+    tail: usize,
+    compact: bool,
+) -> Option<usize> {
+    if klen > u16::MAX as usize || exts.len() >= COMPACT as usize {
         return None;
     }
-    let len = record_len_tail(key.len(), exts.len(), tail.len());
-    let base = out.len();
-    out.resize(base + len, 0);
-    let rec = &mut out[base..];
+    Some(if compact && compacts(exts) {
+        record_len_compact(klen, tail)
+    } else {
+        record_len_tail(klen, exts.len(), tail)
+    })
+}
+
+/// Where such a record's tail begins within it.
+pub(crate) fn record_tail_at(klen: usize, exts: &[Ext], compact: bool) -> usize {
+    let at = align_up(4 + klen, REC_ALIGN);
+    if compact && compacts(exts) {
+        at + 4
+    } else {
+        at + exts.len() * EXT_BYTES
+    }
+}
+
+/// One record into `rec`, exactly `record_len_for` bytes of it, the
+/// padding zeroed wherever the slice came from; the tail's offset within
+/// the record is returned. The one definition of the layout that
+/// `stream_record_tail_at` and a writer laying records out in place share.
+/// Where a record's key begins: after its two-byte key length and its
+/// two-byte extent count. A table that reads its keys in place in a
+/// record stream reads them here (`MemTable::key_of`).
+pub(crate) const RECORD_KEY_AT: usize = 4;
+
+pub(crate) fn record_into(
+    rec: &mut [u8],
+    key: &[u8],
+    exts: &[Ext],
+    tail: &[u8],
+    compact: bool,
+) -> usize {
     rec[0..2].copy_from_slice(&(key.len() as u16).to_le_bytes());
+    rec[RECORD_KEY_AT..RECORD_KEY_AT + key.len()].copy_from_slice(key);
+    let at = align_up(4 + key.len(), REC_ALIGN);
+    rec[4 + key.len()..at].fill(0);
+    if compact && compacts(exts) {
+        debug_assert_eq!(
+            tail.len(),
+            exts[0].len as usize,
+            "a compact run is its tail"
+        );
+        debug_assert_eq!(rec.len(), record_len_compact(key.len(), tail.len()));
+        rec[2..4].copy_from_slice(&COMPACT.to_le_bytes());
+        rec[at..at + 4].copy_from_slice(&compact_header(&exts[0]));
+        rec[at + 4..at + 4 + tail.len()].copy_from_slice(tail);
+        rec[at + 4 + tail.len()..].fill(0);
+        return at + 4;
+    }
+    debug_assert_eq!(
+        rec.len(),
+        record_len_tail(key.len(), exts.len(), tail.len())
+    );
     rec[2..4].copy_from_slice(&(exts.len() as u16).to_le_bytes());
-    rec[4..4 + key.len()].copy_from_slice(key);
-    let mut at = align_up(4 + key.len(), REC_ALIGN);
+    let mut at = at;
     for e in exts {
         rec[at..at + 4].copy_from_slice(&e.block.to_le_bytes());
         rec[at + 4..at + 8].copy_from_slice(&e.off.to_le_bytes());
@@ -518,35 +948,52 @@ pub fn stream_record(out: &mut Vec<u8>, key: &[u8], exts: &[Ext], tail: &[u8]) -
         at += EXT_BYTES;
     }
     rec[at..at + tail.len()].copy_from_slice(tail);
-    Some(len)
+    rec[at + tail.len()..].fill(0);
+    at
+}
+
+pub fn stream_record_tail_at(
+    out: &mut Vec<u8>,
+    key: &[u8],
+    exts: &[Ext],
+    tail: &[u8],
+    compact: bool,
+) -> Option<(usize, usize)> {
+    let len = record_len_for(key.len(), exts, tail.len(), compact)?;
+    let base = out.len();
+    out.resize(base + len, 0);
+    let tail_at = record_into(&mut out[base..], key, exts, tail, compact);
+    Some((len, tail_at))
 }
 
 /// The section header and the trailer for a records-first section: the
 /// records were streamed starting at `HEADER`, `recs_len` bytes of them, and
 /// the trailer -- fences, directory, hash slots, each aligned -- follows
-/// them. `key_at(i)` returns the i-th key (for the fence samples) and
-/// `hashes[i]` its hash. Returns (header, trailer, section total).
+/// them. The `n` keys are answered by position: `key_at(i)` is the i-th
+/// key, asked for the fence samples alone, and `each(i)` is where the
+/// i-th record starts in the section with the key's `key_hash`, asked
+/// exactly once for each i in key order -- the directory and the hash
+/// slots are filled in that one pass -- so a caller whose keys live in a
+/// table it already keeps reads each entry once and copies nothing for
+/// the trailer. `lookahead` is the slot fill's (`fill_hash`). Returns
+/// (header, trailer, section total).
 ///
 /// The layout is one `FlatIndex::parse` accepts because every region is
 /// addressed by offset; it differs from `encode`'s only in order, and
 /// `tests/segwriter.rs` holds the two to the same answers on every read.
 pub fn stream_trailer<'a>(
+    n: usize,
     recs_len: usize,
-    rec_offs: &[u32],
     key_at: &dyn Fn(usize) -> &'a [u8],
-    hashes: &[u64],
+    each: &mut dyn FnMut(usize) -> (u32, u64),
     generation: u64,
+    lookahead: bool,
 ) -> Option<(Vec<u8>, Vec<u8>, usize)> {
-    let n = rec_offs.len();
-    if hashes.len() != n || recs_len > MAX_RECS {
+    if recs_len > MAX_RECS {
         return None;
     }
     let recs_off = HEADER;
-    let mut cap = 1usize;
-    while cap < n * 2 {
-        cap = cap.checked_mul(2)?;
-    }
-    cap = cap.max(16);
+    let cap = hash_cap_for(n)?;
     let mask = cap - 1;
 
     let mut t: Vec<u8> = Vec::new();
@@ -574,30 +1021,32 @@ pub fn stream_trailer<'a>(
         t.extend_from_slice(&blob);
         at += offs_len + blob.len();
     }
-    // Directory.
+    // Directory, then the hash slots, 8-aligned: both regions laid out
+    // first and filled in one pass, each key's offset into its directory
+    // word and its slot, the slots as `encode` fills its own, byte for
+    // byte.
     pad_to(&mut t, &mut at, 4);
     let dir_off = at;
-    for o in rec_offs {
-        t.extend_from_slice(&o.to_le_bytes());
-    }
+    let dir_start = t.len();
+    t.resize(dir_start + n * 4, 0);
     at += n * 4;
-    // Hash slots: 8-aligned, `encode`'s probe and tag, byte for byte.
     pad_to(&mut t, &mut at, 8);
     let hash_off = at;
     let hash_start = t.len();
     t.resize(hash_start + cap * SLOT, 0);
-    for (i, &h) in hashes.iter().enumerate() {
-        let tag = ((h >> 56) | 1) & 0xff;
-        let packed = (tag << 56) | rec_offs[i] as u64;
-        let mut s = (h as usize) & mask;
-        loop {
-            let a = hash_start + s * SLOT;
-            if t[a..a + 8] == [0u8; 8] {
-                t[a..a + 8].copy_from_slice(&packed.to_le_bytes());
-                break;
-            }
-            s = (s + 1) & mask;
-        }
+    {
+        let (dir, slots) = t[dir_start..].split_at_mut(hash_start - dir_start);
+        fill_hash(
+            &mut slots[..cap * SLOT],
+            mask,
+            n,
+            |i| {
+                let (off, h) = each(i);
+                dir[i * 4..i * 4 + 4].copy_from_slice(&off.to_le_bytes());
+                (h, off)
+            },
+            lookahead,
+        );
     }
     at += cap * SLOT;
     let total = at;
@@ -660,7 +1109,7 @@ pub fn plan_inline(
             return None;
         }
         let n = exts.as_slice().len();
-        if n > u16::MAX as usize {
+        if n >= COMPACT as usize {
             return None;
         }
         if at > MAX_RECS {
@@ -668,7 +1117,7 @@ pub fn plan_inline(
         }
         rec_offs.push(at as u32);
         let tail = tails.get(rec_offs.len() - 1).map_or(0, |t| t.len());
-        at = at.checked_add(record_len_tail(k.len(), n, tail))?;
+        at = at.checked_add(record_len_exts(k.len(), exts.as_slice(), tail))?;
     }
     // The fence samples every `stride`-th key. `fence_n + 1` offsets, so an
     // entry's key is the span between its offset and the next.
@@ -732,11 +1181,7 @@ pub fn section_layout(
     if rec_bytes > MAX_RECS {
         return None;
     }
-    let mut cap = 1usize;
-    while cap < keys * 2 {
-        cap = cap.checked_mul(2)?;
-    }
-    cap = cap.max(16);
+    let cap = hash_cap_for(keys)?;
 
     // Half again, so a store whose keys gain extents can publish updates
     // without rewriting anything -- unless the caller says the section is
@@ -900,9 +1345,20 @@ pub fn encode_inline(
             let base = p.rec_offs[i] as usize - rec_base;
             let slice = exts.as_slice();
             recs[base..base + 2].copy_from_slice(&(k.len() as u16).to_le_bytes());
-            recs[base + 2..base + 4].copy_from_slice(&(slice.len() as u16).to_le_bytes());
             recs[base + 4..base + 4 + k.len()].copy_from_slice(k);
             let mut e_at = base + align_up(4 + k.len(), REC_ALIGN);
+            if compacts(slice) {
+                recs[base + 2..base + 4].copy_from_slice(&COMPACT.to_le_bytes());
+                recs[e_at..e_at + 4].copy_from_slice(&compact_header(&slice[0]));
+                e_at += 4;
+                if let Some(tail) = tails.get(i) {
+                    recs[e_at..e_at + tail.len()].copy_from_slice(tail);
+                }
+                let d = (i - from) * 4;
+                dir[d..d + 4].copy_from_slice(&p.rec_offs[i].to_le_bytes());
+                continue;
+            }
+            recs[base + 2..base + 4].copy_from_slice(&(slice.len() as u16).to_le_bytes());
             for e in slice {
                 recs[e_at..e_at + 4].copy_from_slice(&e.block.to_le_bytes());
                 recs[e_at + 4..e_at + 8].copy_from_slice(&e.off.to_le_bytes());
@@ -1005,22 +1461,16 @@ pub fn encode_inline(
     // currently relies on.
     let aligned = (out.as_ptr() as usize + hash_off).is_multiple_of(8);
     if !parallel || threads < 2 || all.len() < 64 * 1024 || !aligned {
-        for (i, (k, _)) in all.iter().enumerate() {
-            let h = hash_of(k);
-            // The tag is forced non-zero so an occupied slot is never all zero,
-            // which is what marks a slot empty.
-            let tag = ((h >> 56) | 1) & 0xff;
-            let packed = (tag << 56) | p.rec_offs[i] as u64;
-            let mut s = (h as usize) & mask;
-            loop {
-                let at = hash_off + s * SLOT;
-                if rd_u64(&out, at) == Some(0) {
-                    out[at..at + 8].copy_from_slice(&packed.to_le_bytes());
-                    break;
-                }
-                s = (s + 1) & mask;
-            }
-        }
+        let n = all.len();
+        // The plain fill: the lookahead is priced on the streamed finish
+        // (`stream_trailer`) and on nothing this path writes.
+        fill_hash(
+            &mut out[hash_off..hash_off + p.hash_cap * SLOT],
+            mask,
+            n,
+            |i| (hash_of(all[i].0), p.rec_offs[i]),
+            false,
+        );
     } else {
         use std::sync::atomic::{AtomicU64, Ordering};
         /// The slot array, shared across the scope. Every write is a
@@ -1090,6 +1540,11 @@ pub struct FlatIndex {
     hash_cap: usize,
     mask: usize,
     nkeys: usize,
+    /// The record region's bytes over its keys, at least one: what a hint
+    /// that estimates a span of records from a count of ranks scales by
+    /// (`Blob::prefetch_ranks_est`). Taken once here and never divided
+    /// for on a scan.
+    mean_record_len: usize,
     /// Absolute offset of the record region within the section, and how much
     /// of it is reserved. `bump` is where the next in-place update lands.
     recs_off: usize,
@@ -1290,6 +1745,7 @@ impl FlatIndex {
             hash_cap,
             mask: hash_cap - 1,
             nkeys,
+            mean_record_len: (recs_len / nkeys.max(1)).max(1),
             recs_off,
             recs_cap,
             bump,
@@ -1314,18 +1770,14 @@ impl FlatIndex {
 
     /// The key and extents of the record at `off` within the record region.
     #[inline]
-    fn record<'a>(&self, sec: &'a [u8], off: usize) -> Option<(&'a [u8], &'a [Ext])> {
+    fn record<'a>(&self, sec: &'a [u8], off: usize) -> Option<(&'a [u8], Exts<'a>)> {
         self.record_full(sec, off).map(|(k, e, _)| (k, e))
     }
 
     /// `record`, plus the record's tail: the bytes of its inline runs, sized
     /// from the extents that name `Ext::INLINE`. Empty for a record without
     /// one, which is every record `Store` writes.
-    fn record_full<'a>(
-        &self,
-        sec: &'a [u8],
-        off: usize,
-    ) -> Option<(&'a [u8], &'a [Ext], &'a [u8])> {
+    fn record_full<'a>(&self, sec: &'a [u8], off: usize) -> Option<(&'a [u8], Exts<'a>, &'a [u8])> {
         // Records are laid out 4-aligned within the section and the section is
         // written at an 8-aligned file offset, so the extent borrow inside
         // `parse_record` is aligned by construction. It checks anyway, and the
@@ -1343,8 +1795,49 @@ impl FlatIndex {
         sec: &'a [u8],
         key: &[u8],
         hash_of: fn(&[u8]) -> u64,
-    ) -> Option<&'a [Ext]> {
+    ) -> Option<Exts<'a>> {
         self.lookup_full(sec, key, hash_of).map(|(e, _)| e)
+    }
+
+    /// `lookup_full` with the extents and tail handed to `f` rather than
+    /// returned: a compact record's extent is rebuilt on this frame and
+    /// lent, as `with_record_at` lends it to a scan, where `lookup_full`
+    /// returns it by value through every layer above. The point read is
+    /// the most frequent call this index takes, and the shape that
+    /// returned the rebuilt extent read the C mix at about 0.85x of the
+    /// shape before compact records (`docs/engine.md`).
+    #[inline]
+    pub fn with_lookup<'a, R>(
+        &self,
+        sec: &'a [u8],
+        key: &[u8],
+        hash_of: fn(&[u8]) -> u64,
+        f: impl FnOnce(&[Ext], &'a [u8]) -> R,
+    ) -> Option<R> {
+        let hash = sec.get(self.hash.0..self.hash.1)?;
+        let recs = sec.get(self.recs.0..self.recs.1)?;
+        let h = hash_of(key);
+        let tag = ((h >> 56) | 1) & 0xff;
+        let mut s = (h as usize) & self.mask;
+        for _ in 0..self.hash_cap {
+            let packed = rd_u64(hash, s * SLOT)?;
+            if packed == 0 {
+                return None;
+            }
+            if packed >> 56 == tag {
+                let off = (packed & 0x00ff_ffff_ffff_ffff) as usize;
+                if let Some((k, exts, tail, _)) = parse_record(recs, off) {
+                    if k == key {
+                        return Some(match exts {
+                            Exts::One(e) => f(std::slice::from_ref(&e), tail),
+                            Exts::Borrowed(exts) => f(exts, tail),
+                        });
+                    }
+                }
+            }
+            s = (s + 1) & self.mask;
+        }
+        None
     }
 
     /// `lookup`, with the record's tail of inline runs.
@@ -1353,7 +1846,7 @@ impl FlatIndex {
         sec: &'a [u8],
         key: &[u8],
         hash_of: fn(&[u8]) -> u64,
-    ) -> Option<(&'a [Ext], &'a [u8])> {
+    ) -> Option<(Exts<'a>, &'a [u8])> {
         let hash = sec.get(self.hash.0..self.hash.1)?;
         let h = hash_of(key);
         let tag = ((h >> 56) | 1) & 0xff;
@@ -1404,9 +1897,47 @@ impl FlatIndex {
     /// Byte offset of the publish word within the section.
     pub const DIR_STATE_AT: usize = 152;
 
-    /// The record at `rank` in key order.    /// The record at `rank` in key order.
-    pub fn at<'a>(&self, sec: &'a [u8], rank: usize) -> Option<(&'a [u8], &'a [Ext])> {
+    /// The record at `rank` in key order.
+    pub fn at<'a>(&self, sec: &'a [u8], rank: usize) -> Option<(&'a [u8], Exts<'a>)> {
         self.at_full(sec, rank).map(|(k, e, _)| (k, e))
+    }
+
+    /// The extents and tail of the record at `rank`, handed to `f` rather
+    /// than returned: a compact record's extent is rebuilt on this frame
+    /// and lent, where `at_full` returns it by value through every layer
+    /// above. Returned, the rebuilt extent left the buffered arm's scans
+    /// over one level-0 piece at 0.88x of the same scans over full
+    /// records, with the instructions level.
+    #[inline]
+    pub fn with_record_at<'a, R>(
+        &self,
+        sec: &'a [u8],
+        rank: usize,
+        f: impl FnOnce(&[Ext], &'a [u8]) -> R,
+    ) -> Option<R> {
+        if rank >= self.nkeys {
+            return None;
+        }
+        let recs = sec.get(self.recs.0..self.recs.1)?;
+        let dir = sec.get(self.dir.0..self.dir.1)?;
+        let off = rd_u32(dir, rank * 4)? as usize;
+        let (_, exts, tail, _) = parse_record(recs, off)?;
+        Some(match exts {
+            Exts::One(e) => f(std::slice::from_ref(&e), tail),
+            Exts::Borrowed(exts) => f(exts, tail),
+        })
+    }
+
+    /// The key at `rank` alone; see `record_key`.
+    #[inline]
+    pub fn key_at<'a>(&self, sec: &'a [u8], rank: usize) -> Option<&'a [u8]> {
+        if rank >= self.nkeys {
+            return None;
+        }
+        let recs = sec.get(self.recs.0..self.recs.1)?;
+        let dir = sec.get(self.dir.0..self.dir.1)?;
+        let off = rd_u32(dir, rank * 4)? as usize;
+        record_key(recs, off)
     }
 
     /// `at`, with the record's tail of inline runs.
@@ -1414,13 +1945,98 @@ impl FlatIndex {
         &self,
         sec: &'a [u8],
         rank: usize,
-    ) -> Option<(&'a [u8], &'a [Ext], &'a [u8])> {
+    ) -> Option<(&'a [u8], Exts<'a>, &'a [u8])> {
+        let (recs, dir) = self.regions(sec)?;
+        self.at_full_in(recs, dir, rank)
+    }
+
+    /// The record region and the directory, sliced once.
+    ///
+    /// A walk resolves rank after rank, and `at_full` re-slices both regions
+    /// and re-checks both bounds every time. Measured on a segment whose
+    /// records average 140 bytes, resolving a rank costs 9.6ns against the
+    /// 1.6ns a mapped stride walk of the same bytes takes, and the record
+    /// read is not most of it. A caller walking a range slices here once and
+    /// calls `at_full_in`; a caller resolving one rank keeps `at_full`.
+    pub fn regions<'a>(&self, sec: &'a [u8]) -> Option<(&'a [u8], &'a [u8])> {
+        Some((
+            sec.get(self.recs.0..self.recs.1)?,
+            sec.get(self.dir.0..self.dir.1)?,
+        ))
+    }
+
+    /// The hash region's bytes: the slots a point read probes one page of,
+    /// the first of the two populations the raw form's fault model takes
+    /// (`db::Seg::foot`).
+    pub fn hash_bytes(&self) -> usize {
+        self.hash.1.saturating_sub(self.hash.0)
+    }
+
+    /// Where the records at `rank` and `n` ranks on lie by the directory:
+    /// the first's offset and the last's, for a hint of what a walk
+    /// between them streams. Records ascend with rank in a segment; where
+    /// a store's index has republished one into the slack the span is
+    /// clipped to the first, since this is a hint and not a read.
+    pub fn record_span(&self, dir: &[u8], rank: usize, n: usize) -> Option<(usize, usize)> {
         if rank >= self.nkeys {
             return None;
         }
-        let dir = sec.get(self.dir.0..self.dir.1)?;
+        // A caller's span can be a scan's whole limit, `usize::MAX`
+        // included: the sum saturates rather than wraps.
+        let last = rank.saturating_add(n).min(self.nkeys - 1);
+        let a = rd_u32(dir, rank * 4)? as usize;
+        let b = rd_u32(dir, last * 4)? as usize;
+        Some((a, b.max(a)))
+    }
+
+    /// The byte range of the directory words for the ranks `rank` to
+    /// `n` on, `rank..min(rank + n, nkeys)`, within the directory; `None`
+    /// past the last rank. A seek's stride window is known before its
+    /// heads are read, and the directory words of the window asked for
+    /// then are one fill the scan's first record read no longer waits
+    /// for behind the stride's (`Blob::prefetch_dir`). The word's width
+    /// is this file's alone, the arithmetic `at_full_in` reads by.
+    pub fn dir_span(&self, rank: usize, n: usize) -> Option<(usize, usize)> {
+        if rank >= self.nkeys {
+            return None;
+        }
+        // A window can be a scan's whole limit: the sum saturates.
+        let end = rank.saturating_add(n).min(self.nkeys);
+        Some((rank * 4, end * 4))
+    }
+
+    /// Where the record at `rank` lies by the directory: the one word, for
+    /// a hint that estimates the span past it rather than reading a second
+    /// word for it. `None` past the last rank or off the directory.
+    pub fn record_off(&self, dir: &[u8], rank: usize) -> Option<usize> {
+        if rank >= self.nkeys {
+            return None;
+        }
+        Some(rd_u32(dir, rank * 4)? as usize)
+    }
+
+    /// The record region's bytes over its keys, at least one.
+    pub fn mean_record_len(&self) -> usize {
+        self.mean_record_len
+    }
+
+    /// `at_full` against regions `regions` already sliced. The directory is
+    /// still the authority for where a record lies: records happen to ascend
+    /// with rank in a segment, but a store's index republishes a grown record
+    /// into the section's slack, so a cursor that advanced by record length
+    /// would read the wrong bytes there.
+    #[inline]
+    pub fn at_full_in<'a>(
+        &self,
+        recs: &'a [u8],
+        dir: &'a [u8],
+        rank: usize,
+    ) -> Option<(&'a [u8], Exts<'a>, &'a [u8])> {
+        if rank >= self.nkeys {
+            return None;
+        }
         let off = rd_u32(dir, rank * 4)? as usize;
-        self.record_full(sec, off)
+        parse_record(recs, off).map(|(k, e, t, _)| (k, e, t))
     }
 
     /// Where a key that is *not* present would claim a hash slot.
@@ -1490,7 +2106,7 @@ impl FlatIndex {
         if rank >= self.nkeys {
             return None;
         }
-        let (k, _) = self.at(sec, rank)?;
+        let k = self.key_at(sec, rank)?;
         if k != key {
             return None;
         }
@@ -1568,9 +2184,14 @@ impl FlatIndex {
     /// and the damage tests feed it garbage on purpose.
     pub fn decode_record(rec: &[u8]) -> Option<(Vec<u8>, Vec<Ext>)> {
         let klen = rd_u16(rec, 0)? as usize;
-        let n = rd_u16(rec, 2)? as usize;
+        let n = rd_u16(rec, 2)?;
         let key = rec.get(4..4 + klen)?.to_vec();
         let mut at = align_up(4 + klen, REC_ALIGN);
+        if n & COMPACT != 0 {
+            let (_, exts, _, _) = parse_record(rec, 0)?;
+            return Some((key, exts.to_vec()));
+        }
+        let n = n as usize;
         let mut exts = Vec::with_capacity(n);
         for _ in 0..n {
             let b = rec.get(at..at + EXT_BYTES)?;
@@ -1683,13 +2304,13 @@ impl FlatIndex {
             return false;
         }
         if r > 0 {
-            match self.at(sec, r - 1).map(|(k, _)| k.cmp(key)) {
+            match self.key_at(sec, r - 1).map(|k| k.cmp(key)) {
                 Some(std::cmp::Ordering::Less) => {}
                 _ => return false,
             }
         }
         if r < self.nkeys {
-            match self.at(sec, r).map(|(k, _)| k.cmp(key)) {
+            match self.key_at(sec, r).map(|k| k.cmp(key)) {
                 Some(std::cmp::Ordering::Less) => return false,
                 None => return false,
                 _ => {}
@@ -1701,7 +2322,7 @@ impl FlatIndex {
     fn search(&self, sec: &[u8], key: &[u8], mut lo: usize, mut hi: usize) -> usize {
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            match self.at(sec, mid).map(|(k, _)| k.cmp(key)) {
+            match self.key_at(sec, mid).map(|k| k.cmp(key)) {
                 Some(std::cmp::Ordering::Less) => lo = mid + 1,
                 // A record that will not decode sorts as "not less", which
                 // keeps the search terminating on damaged input.
@@ -1709,6 +2330,219 @@ impl FlatIndex {
             }
         }
         lo
+    }
+}
+
+#[cfg(test)]
+mod fill_tests {
+    use super::*;
+
+    /// The lookahead fill places every key where the plain fill does, so
+    /// the section is the same bytes either way, and each key is asked
+    /// for once, in order, by both.
+    #[test]
+    fn the_lookahead_fill_writes_the_plain_fills_bytes() {
+        for n in [0usize, 1, 7, 16, 17, 33, 5000] {
+            let keys: Vec<Vec<u8>> = (0..n).map(|i| format!("key-{i:08}").into_bytes()).collect();
+            let mut outs = Vec::new();
+            for lookahead in [false, true] {
+                let mut asked = Vec::new();
+                let r = stream_trailer(
+                    n,
+                    n * 20,
+                    &|i| &keys[i][..],
+                    &mut |i| {
+                        asked.push(i);
+                        ((i * 20) as u32, key_hash(&keys[i]))
+                    },
+                    7,
+                    lookahead,
+                )
+                .expect("a section within the limits");
+                assert_eq!(
+                    asked,
+                    (0..n).collect::<Vec<_>>(),
+                    "{n} keys, each asked once in order"
+                );
+                outs.push(r);
+            }
+            assert_eq!(outs[0], outs[1], "{n} keys");
+        }
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+
+    #[test]
+    fn the_hash_never_fills_past_three_quarters() {
+        // Neither probe loop has a termination guard, so a table that can
+        // reach full does not get slow, it hangs. The bound is what keeps an
+        // empty slot in it. Powers of two and the counts either side of them
+        // are the cases that a "round up to the next power of two" rule gets
+        // wrong: `cap >= keys` puts 524,288 keys in 524,288 slots.
+        let mut counts: Vec<usize> = vec![0, 1, 2, 15, 16, 17, 290_000, 30_000_000];
+        for p in 4..25 {
+            let n = 1usize << p;
+            counts.extend([n - 1, n, n + 1]);
+        }
+        for n in counts {
+            let cap = hash_cap_for(n).expect("capacity");
+            assert!(
+                cap.is_power_of_two(),
+                "{n} keys: {cap} is not a power of two"
+            );
+            assert!(cap >= 16, "{n} keys: {cap} is below the floor");
+            assert!(
+                cap > n,
+                "{n} keys in {cap} slots: a full table spins in the probe loop"
+            );
+            assert!(
+                n * HASH_LOAD_DEN <= cap * HASH_LOAD_NUM,
+                "{n} keys in {cap} slots is {:.1}% load, past the bound",
+                n as f64 / cap as f64 * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn the_rule_is_tight_enough_to_be_worth_having() {
+        // The old rule asked for two slots a key and the rounding made it
+        // 3.62 at the size the suite runs. Guard the other direction too, or
+        // a future loosening buys back the bytes silently.
+        let cap = hash_cap_for(290_000).expect("capacity");
+        assert_eq!(cap, 524_288, "290,000 keys should take 524,288 slots");
+        assert!(
+            cap * SLOT / 290_000 < 16,
+            "{} bytes a key of hash is more than the rule intends",
+            cap * SLOT / 290_000
+        );
+    }
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+    use crate::index::encode_run;
+
+    /// The extent a segment writer makes for one key's values, as
+    /// `SegmentWriter::end_with` makes it.
+    fn ext_for(lens: &[u32], tombstone: bool) -> (Ext, Vec<u8>) {
+        let mut values = Vec::new();
+        for (i, &l) in lens.iter().enumerate() {
+            values.extend((0..l).map(|j| (i as u32 * 7 + j) as u8));
+        }
+        let mut run = Vec::new();
+        let (last, flag) = encode_run(&values, lens, &mut run);
+        let count = lens.len() as u32 | flag | if tombstone { Ext::TOMBSTONE } else { 0 };
+        let e = Ext {
+            block: Ext::INLINE,
+            off: 0,
+            len: run.len() as u32,
+            last,
+            count,
+        };
+        (e, run)
+    }
+
+    /// Every run shape a writer makes comes back from a compact record as
+    /// the extent it was written from, at the length the planner sized it
+    /// by: one value, many of one width, many of mixed widths (whose last
+    /// record is found by walking the prefixes), a zero-length value, an
+    /// empty tombstone run, and runs either side of the compact bound.
+    #[test]
+    fn a_compact_record_gives_back_the_extent_it_was_written_from() {
+        let big = COMPACT_RUN as u32;
+        let shapes: Vec<(Vec<u32>, bool)> = vec![
+            (vec![100], false),
+            (vec![8; 12], false),
+            (vec![3, 17, 1, 200], false),
+            (vec![0], false),
+            (vec![5, 0, 5], false),
+            (vec![], true),
+            (vec![4, 4], true),
+            (vec![big - 1], false),
+            (vec![big - 3], false),
+            (vec![big], false),
+            (vec![300; 60], false),
+        ];
+        for key in [&b"k"[..], b"key-0000012345", &[7u8; 250]] {
+            for (lens, tomb) in &shapes {
+                let (e, run) = ext_for(lens, *tomb);
+                let mut out = Vec::new();
+                let wrote = stream_record(&mut out, key, &[e], &run).expect("a record");
+                assert_eq!(wrote, out.len());
+                assert_eq!(
+                    wrote,
+                    segment_record_len(key.len(), run.len(), true, true),
+                    "the planner's length for {lens:?}"
+                );
+                assert_eq!(wrote, record_len_exts(key.len(), &[e], run.len()));
+                let compact = (run.len()) < COMPACT_RUN;
+                assert_eq!(rd_u16(&out, 2) == Some(COMPACT), compact, "{lens:?}");
+                let (k, exts, tail, len) = parse_record(&out, 0).expect("it parses");
+                assert_eq!(k, key);
+                assert_eq!(record_key(&out, 0), Some(k), "the key read alone");
+                assert_eq!(&*exts, &[e][..], "{lens:?} tomb {tomb}");
+                assert_eq!(tail, &run[..]);
+                assert_eq!(len, wrote);
+                // The legacy decoder reads it too.
+                let (dk, de) = FlatIndex::decode_record(&out).expect("it decodes");
+                assert_eq!((&dk[..], &de[..]), (key, &[e][..]));
+            }
+        }
+    }
+
+    /// A compact record costs sixteen bytes less than the record it
+    /// replaces for the suite's key and value, and a run in a block, or two
+    /// extents, keeps the full form.
+    #[test]
+    fn only_one_inline_run_from_the_tail_is_compact() {
+        let (e, run) = ext_for(&[100], false);
+        assert_eq!(segment_record_len(16, 100, true, true), 124);
+        assert_eq!(segment_record_len(16, 100, true, false), 140);
+        assert_eq!(record_len_tail(16, 1, 100), 140);
+        let in_block = Ext { block: 3, ..e };
+        assert!(!compacts(&[in_block]));
+        assert!(!compacts(&[e, e]));
+        assert!(!compacts(&[Ext { off: 4, ..e }]));
+        assert!(compacts(&[e]));
+        let mut out = Vec::new();
+        stream_record(&mut out, b"key", &[in_block], &[]).unwrap();
+        assert_eq!(rd_u16(&out, 2), Some(1));
+        let _ = run;
+    }
+
+    /// A header the run contradicts is damage and parses to nothing rather
+    /// than to an extent: a count past the run, a fixed width that does not
+    /// divide it, prefixes that walk past it, and a count word beside the
+    /// compact bit.
+    #[test]
+    fn a_compact_header_the_run_contradicts_does_not_parse() {
+        let (e, run) = ext_for(&[3, 17, 1, 200], false);
+        let mut good = Vec::new();
+        stream_record(&mut good, b"key", &[e], &run).unwrap();
+        let h_at = align_up(4 + 3, REC_ALIGN);
+        let set = |c: u16| {
+            let mut b = good.clone();
+            b[h_at + 2..h_at + 4].copy_from_slice(&c.to_le_bytes());
+            b
+        };
+        // More records than the prefixes hold.
+        assert!(parse_record(&set(40), 0).is_none());
+        // Claimed fixed, and 221 bytes are not four equal widths.
+        assert!(parse_record(&set(4 | C_FIXED), 0).is_none());
+        // The key read alone does not look at the run, and keeps its key.
+        assert_eq!(record_key(&set(40), 0), Some(&b"key"[..]));
+        let mut bad = good.clone();
+        bad[2..4].copy_from_slice(&(COMPACT | 1).to_le_bytes());
+        assert!(parse_record(&bad, 0).is_none());
+        assert!(
+            record_key(&bad, 0).is_none(),
+            "the count word is its to refuse"
+        );
+        assert!(parse_record(&good, 0).is_some());
     }
 }
 
@@ -1792,6 +2626,44 @@ mod tests {
         }
     }
 
+    /// `dir_span` names exactly the directory bytes `at_full_in` reads
+    /// for the ranks of the window, clipped at the key count, and nothing
+    /// for a rank past it; a window of a scan's whole limit saturates
+    /// rather than wraps. The mean record length is the record region's
+    /// bytes over its keys and never zero, so a span scaled by it is
+    /// never empty by arithmetic.
+    #[test]
+    fn a_directory_span_is_the_words_the_ranks_read_by() {
+        let all = corpus(1000);
+        let sec = padded(encode(&refs(&all), 1, None, h, 0, false).unwrap());
+        let ix = FlatIndex::parse(&sec).unwrap();
+        let (recs, dir) = ix.regions(&sec).unwrap();
+        let nkeys = ix.len();
+        assert_eq!(nkeys, all.len());
+        for r in [0usize, nkeys / 2, nkeys - 1] {
+            for n in [0usize, 1, 64, usize::MAX] {
+                let (a, b) = ix.dir_span(r, n).expect("a rank in range");
+                let end = r.saturating_add(n).min(nkeys);
+                assert_eq!((a, b), (r * 4, end * 4), "rank {r} n {n}");
+                assert!(b <= dir.len(), "inside the directory");
+                // The bytes between are the words of the ranks `r..end`,
+                // and each word is what `at_full_in` resolves the rank by.
+                for (i, w) in dir[a..b].as_chunks::<4>().0.iter().enumerate() {
+                    let off = u32::from_le_bytes(*w) as usize;
+                    assert_eq!(ix.record_off(dir, r + i), Some(off));
+                    let (k, _, _) = ix.at_full_in(recs, dir, r + i).expect("resolves");
+                    assert_eq!(k, all[r + i].0.as_slice(), "rank {}", r + i);
+                }
+            }
+        }
+        assert_eq!(ix.dir_span(nkeys, 1), None);
+        assert_eq!(ix.dir_span(usize::MAX, usize::MAX), None);
+        assert_eq!(ix.record_off(dir, nkeys), None);
+        let recs_len = rd_u64(&sec, 96).unwrap() as usize;
+        assert_eq!(ix.mean_record_len(), (recs_len / nkeys).max(1));
+        assert!(ix.mean_record_len() >= 1);
+    }
+
     #[test]
     fn rank_order_matches_key_order() {
         let all = corpus(1000);
@@ -1801,8 +2673,13 @@ mod tests {
             let (gk, ge) = ix.at(&sec, i).expect("rank present");
             assert_eq!(gk, k.as_slice());
             assert_eq!(ge, e.as_slice());
+            assert_eq!(ix.key_at(&sec, i), Some(k.as_slice()));
+            let lent = ix.with_record_at(&sec, i, |exts, _| exts.to_vec());
+            assert_eq!(lent.as_deref(), Some(e.as_slice()));
         }
         assert!(ix.at(&sec, all.len()).is_none());
+        assert!(ix.key_at(&sec, all.len()).is_none());
+        assert!(ix.with_record_at(&sec, all.len(), |_, _| ()).is_none());
     }
 
     /// The fence is an optimisation, so the only thing that makes it safe is

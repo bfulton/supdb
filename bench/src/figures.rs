@@ -40,13 +40,20 @@ const TOP: f64 = 88.0;
 const BOTTOM: f64 = 48.0;
 
 /// How an arm is drawn: colour and dash. The default in ink, the shipping
-/// option in the accent, comparators in grey with the second dashed.
+/// options in the accent with the second dashed, comparators in grey with
+/// the second dashed.
 fn style(arm: &str) -> (&'static str, &'static str) {
     match arm {
         "supdb" | "supdb-ingest" => (INK, ""),
         "supdb-noadvice" => (ACCENT, ""),
+        "supdb-nocache" => (ACCENT, "7,4"),
+        "supdb-forms" => (ACCENT, "4,2"),
+        "supdb-nosnap" => (ACCENT, "6,2"),
+        "supdb-settle" => (ACCENT, "8,2"),
+        "supdb-cache256" => (ACCENT, "2,3"),
         "lmdb" | "lmdb-nosync" => (GREY, ""),
-        "rocksdb-tuned" | "rocksdb-nosync" => (GREY, "7,4"),
+        "lmdb-nordahead" => (GREY, "4,2"),
+        "rocksdb-tuned" | "rocksdb-tuned-nosync" | "rocksdb-nosync" => (GREY, "7,4"),
         _ => (GREY, "2,3"),
     }
 }
@@ -56,11 +63,18 @@ fn pretty(arm: &str) -> &'static str {
     match arm {
         "supdb" => "supdb",
         "supdb-noadvice" => "supdb (no advice)",
+        "supdb-nocache" => "supdb (no block cache)",
+        "supdb-forms" => "supdb (forms at ingest)",
+        "supdb-nosnap" => "supdb (a snapshot per handle)",
+        "supdb-settle" => "supdb (settle at commit, no forms)",
+        "supdb-cache256" => "supdb (256 MB block cache)",
         "supdb-ingest" => "supdb (buffered)",
         "lmdb" => "LMDB",
+        "lmdb-nordahead" => "LMDB (no readahead)",
         "lmdb-nosync" => "LMDB (nosync)",
         "rocksdb-tuned" => "RocksDB",
-        "rocksdb-nosync" => "RocksDB (nosync)",
+        "rocksdb-tuned-nosync" => "RocksDB (nosync)",
+        "rocksdb-nosync" => "RocksDB (untuned, nosync)",
         _ => "?",
     }
 }
@@ -71,6 +85,9 @@ fn workload_noun(w: &str) -> &'static str {
         "load-shuffled" => "Shuffled load",
         "read" => "Point reads",
         "scan" => "Ordered scans",
+        "scan-mixed" => "Ordered scans on the store the mixes leave",
+        "scan-lag" => "Ordered scans against merge lag",
+        "lag-burst" => "The lag sweep's bursts",
         "ycsb-A" => "YCSB-A, update-heavy (50/50 read/update, zipfian)",
         "ycsb-B" => "YCSB-B, read-mostly (95/5 read/update, zipfian)",
         "ycsb-C" => "YCSB-C, read-only (zipfian)",
@@ -162,6 +179,23 @@ pub fn render_all(runs: &Path, out: &Path, scale: Scale) -> io::Result<Vec<Rende
     Ok(written)
 }
 
+/// The order a figure's curves are drawn in, the first last and so on
+/// top: the arms either roster names, in the rosters' order with the
+/// default first (a bounded row's arms are not all in `ARMS`), then any
+/// arm of the row that neither names, by name. A row is history and the
+/// rosters are today's, so they order the curves and never choose them:
+/// a comparator retired since a row was banked is still that row's.
+fn arm_order<'a>(present: impl Iterator<Item = &'a String>) -> Vec<String> {
+    let mut order: Vec<String> = crate::engines::every_arm()
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+    let mut rest: Vec<String> = present.filter(|a| !order.contains(*a)).cloned().collect();
+    rest.sort();
+    order.extend(rest);
+    order
+}
+
 fn render_row(row: &Row, out: &Path) -> io::Result<Vec<Rendered>> {
     let mut groups: Groups = BTreeMap::new();
     let mut floors = Floors::default();
@@ -198,11 +232,10 @@ fn render_row(row: &Row, out: &Path) -> io::Result<Vec<Rendered>> {
     }
     let mut written = Vec::new();
     for ((workload, quantity, unit, guarantee), arms) in groups {
-        // Arm order: the default first so it is drawn last (on top).
-        let order = crate::engines::ARMS;
+        let order = arm_order(arms.keys());
         let mut curves: Vec<Curve> = order
             .iter()
-            .filter_map(|a| arms.get(*a).map(|pts| (a.to_string(), pts)))
+            .filter_map(|a| arms.get(a).map(|pts| (a.clone(), pts)))
             .map(|(arm, pts)| {
                 let mut points: Vec<Point> = pts
                     .iter()
@@ -517,10 +550,14 @@ fn message(
     let mine = at("supdb").or_else(|| at("supdb-ingest"));
     let noun = workload_noun(workload);
     let what = match quantity {
-        "ops_per_s" | "reads_per_s" | "entries_per_s" => "throughput",
-        "p99_us" => "p99 latency",
-        "device_bytes_per_byte" => "device bytes per byte",
-        _ => quantity,
+        "ops_per_s" | "reads_per_s" | "entries_per_s" => "throughput".to_string(),
+        "p99_us" => "p99 latency".to_string(),
+        "device_bytes_per_byte" => "device bytes per byte".to_string(),
+        "bytes_on_disk_per_byte" => "bytes on disk per byte".to_string(),
+        q => match crate::run::threads_of(q) {
+            Some(t) => format!("aggregate throughput on {t} threads"),
+            None => q.to_string(),
+        },
     };
     let g = match guarantee {
         Guarantee::Durable => "durable per batch",
@@ -530,7 +567,14 @@ fn message(
     let mut ahead = Vec::new();
     let mut behind = Vec::new();
     let mut level = Vec::new();
-    for comp in ["lmdb", "lmdb-nosync", "rocksdb-tuned", "rocksdb-nosync"] {
+    for comp in [
+        "lmdb",
+        "lmdb-nordahead",
+        "lmdb-nosync",
+        "rocksdb-tuned",
+        "rocksdb-tuned-nosync",
+        "rocksdb-nosync",
+    ] {
         if let (Some(m), Some(c)) = (mine, at(comp)) {
             if c > 0.0 && m > 0.0 {
                 let adv = if up { m / c } else { c / m };
@@ -660,6 +704,36 @@ mod tests {
         assert!(top >= 6_500_184.0);
         assert!(ticks.len() >= 4 && ticks.len() <= 6, "{ticks:?}");
         assert_eq!(ticks[0], 0.0);
+    }
+
+    /// An arm a banked row carries that today's rosters do not name is
+    /// still drawn, after the rosters' arms, and the default leads.
+    #[test]
+    fn a_row_keeps_the_arms_the_rosters_no_longer_name() {
+        let present: Vec<String> = ["zz-retired", "supdb", "rocksdb-nosync"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        let order = arm_order(present.iter());
+        assert_eq!(order[0], crate::engines::ARMS[0]);
+        let at = |a: &str| order.iter().position(|o| o == a);
+        let roster = crate::engines::every_arm().len();
+        for retired in ["rocksdb-nosync", "zz-retired"] {
+            if !crate::engines::every_arm().contains(&retired) {
+                assert!(
+                    at(retired).is_some_and(|i| i >= roster),
+                    "{retired}: {order:?}"
+                );
+            }
+        }
+        assert!(at("rocksdb-nosync") < at("zz-retired"));
+        assert_eq!(
+            order.len(),
+            order
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        );
     }
 
     #[test]
