@@ -10467,6 +10467,69 @@ fn the_splice_bounds_off_the_top_level_are_the_records_bounds() {
     }
 }
 
+/// The builder ahead starts while the store is in core, the controller's
+/// gate at the raw form, and not while it is out of core
+/// (`Options::ahead_out_of_core`): a burst out of core dirties every block,
+/// and the builder built each from pages the bound pushed out for scans
+/// that read a few. A publish over a piece starts the builder and the next
+/// commit installs its forms with the gate at raw, installs nothing with
+/// the gate away from it, and installs them again under the option; the
+/// model holds through a handle and the writer in every case.
+#[test]
+fn the_builder_ahead_starts_in_core_and_out_of_core_only_under_the_option() {
+    for (gate, ooc, builds) in [(0u8, false, true), (1, false, false), (1, true, true)] {
+        let d = dir(&format!("ahead-gate-{gate}-{ooc}"));
+        let opts = Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(2 << 10),
+            l0_trigger: 64,
+            scan_block_cache: true,
+            scan_cache_ahead_min_blocks: 0,
+            forms_settle_backlog_pct: 0,
+            commit_forms: true,
+            build_ahead_on_publish: true,
+            upkeep: supdb::Upkeep::Inline,
+            zpages: supdb::ZPages::Off,
+            ahead_out_of_core: ooc,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        db.zgate_set(gate);
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in 0..1500u32 {
+            m.append(&mut db, &key(k), "v0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        db.settle().unwrap();
+        for k in (0..1500u32).step_by(5) {
+            m.append(&mut db, &key(k), "v1");
+        }
+        db.commit().unwrap();
+        let _handle = db.reader().unwrap();
+        db.seal().unwrap();
+        db.settle().unwrap();
+        assert_eq!(db.canonical_forms().0, 0, "the seal emptied the table");
+        for k in (1..1500u32).step_by(11) {
+            m.append(&mut db, &key(k), "v2");
+        }
+        db.commit().unwrap();
+        let forms = db.canonical_forms().0;
+        assert_eq!(
+            forms > 0,
+            builds,
+            "gate {gate}, out of core {ooc}: the builder's forms installed: {forms}"
+        );
+        let r = db.reader().unwrap();
+        m.check(&r, "a reader");
+        drop(r);
+        m.check(&db, "the writer");
+        db.close().unwrap();
+    }
+}
+
 /// EXPERIMENT: the forms are published for a handle and not before.
 /// Commits with no handle live leave the table where it was, so a
 /// handle at that commit still finds its forms; a claim files the

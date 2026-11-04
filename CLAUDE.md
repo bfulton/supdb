@@ -3240,7 +3240,13 @@ off the reader's path, pacing a producer whose output the reader consumes
 at a price. The rule is the phases' sum again, across threads: a cost
 removed from a background thread is priced on the thread that consumes
 what it makes, and a fault count that falls while the pass rises names a
-pace that changed, not a saving.
+pace that changed, not a saving. And the refutation named the lever: the
+producer itself. Out of core a burst dirties every block, and the builder
+built each from pages the bound had pushed out for scans that read a few;
+started in core alone (`Options::ahead_out_of_core`, off) the ten-percent
+pass took half the faults and nine tenths of the time in two sittings. A
+producer whose faults pace the reader's install is priced by removing it
+before making it faster.
 
 ## Standing limitations
 

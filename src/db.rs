@@ -1992,6 +1992,16 @@ pub struct Options {
     /// 529k-772k; at a hundred thousand, 1,560 blocks, 702k-773k against
     /// 682k-758k. A test that wants the builder on a small store sets 0.
     pub scan_cache_ahead_min_blocks: usize,
+    /// The builder ahead starts while the store is out of core too -- the
+    /// controller's gate away from the raw form. Off, it starts in core
+    /// alone: a burst out of core dirties every block of the store, and the
+    /// builder built every one of them from partition pages the bound had
+    /// pushed out, for scans that read a few of them -- at ten million keys
+    /// under 1.25 GiB the ten-percent lag pass took 69,000-83,000 major
+    /// faults with the builder and 31,000 without, and the scanning thread
+    /// paid its install of the forms besides. `supdb-aheadooc` and
+    /// `supdb-ingestaheadooc` keep it running out of core.
+    pub ahead_out_of_core: bool,
     /// EXPERIMENT: the range-read structure written at ingest. The writer
     /// keeps a canonical form of every block an unsealed key overlays
     /// current at each commit, the builder ahead having made the first
@@ -3580,6 +3590,7 @@ impl Default for Options {
             scan_prefetch_bytes: 4096,
             seek_prefetch_dir: true,
             scan_cache_ahead_min_blocks: 1024,
+            ahead_out_of_core: false,
             commit_forms: true,
             forms_from_reader_scans: 0,
             commit_forms_build: true,
@@ -28496,6 +28507,12 @@ impl Reader {
         }
         self.stop_ahead();
         if self.segs().first().is_none_or(|s| s.level == 0) {
+            return;
+        }
+        // Out of core the builder builds every block a burst dirtied from
+        // pages the bound pushed out, for scans that read a few of them
+        // (`Options::ahead_out_of_core`).
+        if !self.opts.ahead_out_of_core && self.shared.zgate.load() != zselect::GATE_RAW {
             return;
         }
         // A store too small for a builder: its run beside the scans costs

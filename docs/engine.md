@@ -6708,6 +6708,25 @@ in-core sweep at a hundred thousand keys reads every count of them at
 zero, so they ship on: what each costs where it fires is a syscall a piece
 a block, and what it buys is the faults the counts name.
 
+The refutation named its producer, and the producer was the cost. Out of
+core a burst dirties every block of the store -- a ten-percent burst at ten
+million keys is six writes a block -- and the builder ahead built a form
+for every one of them from partition pages the bound had pushed out, for
+scans that read a few thousand blocks of a hundred and fifty thousand. It
+starts in core alone now, the controller's gate at the raw form
+(`Options::ahead_out_of_core`, off; `supdb-aheadooc` and
+`supdb-ingestaheadooc` keep it running out of core, and `supdb-noahead`
+starts no builder at any size). Two sittings at ten million keys under
+1.25 GiB agree: against no builder at all, the ten-percent pass took
+31,000 major faults against 69,000-83,000 and ran 3.02 and 2.76 s against
+3.34 and 2.96; against the arm that keeps it out of core, 30,000 and
+31,000 against 68,000 and 70,000, 2.74 s in both rounds against 3.10 and
+3.15, the full rewrite 7.09 and 6.83 against 9.62 and 7.39, the scanning
+thread's install of builder forms under a millisecond against 15-47 ms,
+and the sweep's weighted sum 1.03x and 1.108x in the gate's favour. The
+one-percent point read 0.9x in the first sitting and 1.1x in the second.
+In core the gate is raw and the builder starts as before.
+
 #### Out of core: the second form
 
 A pairing this section cites is given as the command that reproduces it, `pair.sh A B SIZE [bench ab options]` (`bench/scripts/pair.sh`: `bench ab` over the two arms, one sitting in each order), at the commit it ran at; a binary built at that commit runs it (`BIN=`), and every arm named exists at the head as well. A rerun reproduces the comparison, not the rates, which this host moves by tens of percent between sittings. A count a sentence quotes -- decodes, faults by mix, the controller's events, the census -- was read with the variable before the command set, which turns supdb's own timers on as well, so a rate against a comparator is read from a run without it. Pairings made before this history's root (2026-10-20) cite the root, `18c3a30`, the first commit here that holds their arms. The design the form was built to is `docs/zpages-design.md`.

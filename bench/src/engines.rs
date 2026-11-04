@@ -543,6 +543,10 @@ pub struct Supdb {
     /// `supdb-ingestnoboundsheadwillneed`, and `supdb-noboundsheadwillneed`
     /// durable.
     noboundsheadwillneed: bool,
+    /// The builder ahead runs out of core too, where the default starts it
+    /// in core alone (`Options::ahead_out_of_core`). `supdb-ingestaheadooc`,
+    /// and `supdb-aheadooc` durable.
+    aheadooc: bool,
     /// A seal writes every key through the writer's general path, as
     /// before the one-value path (`Options::seal_put_one` off).
     /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
@@ -1281,6 +1285,10 @@ struct Policy {
     /// `supdb-ingestnoboundsheadwillneed`, and `supdb-noboundsheadwillneed`
     /// durable.
     noboundsheadwillneed: bool,
+    /// The builder ahead runs out of core too, where the default starts it
+    /// in core alone (`Options::ahead_out_of_core`). `supdb-ingestaheadooc`,
+    /// and `supdb-aheadooc` durable.
+    aheadooc: bool,
     /// A seal writes every key through the writer's general path, as
     /// before the one-value path (`Options::seal_put_one` off).
     /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
@@ -1810,6 +1818,7 @@ impl Default for Policy {
             boundarytop: false,
             nodirwillneed: false,
             noboundsheadwillneed: false,
+            aheadooc: false,
             sealrun: false,
             closeinline: false,
             timers: false,
@@ -2821,6 +2830,20 @@ impl Supdb {
             path,
             Policy {
                 lazyforms: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with no builder ahead at any size
+    /// (`Options::scan_cache_ahead_min_blocks` past every store): against
+    /// `supdb` under a bound it prices the forms the builder posts against
+    /// the scanning thread's install of them.
+    pub fn create_noahead(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                aheadmin: Some(usize::MAX),
                 ..Policy::default()
             },
         )
@@ -6053,6 +6076,7 @@ impl Supdb {
             boundarytop,
             nodirwillneed,
             noboundsheadwillneed,
+            aheadooc,
             sealrun,
             closeinline,
             timers,
@@ -6341,6 +6365,7 @@ impl Supdb {
             boundary_keys_from_top: boundarytop,
             pieces_dir_willneed: !nodirwillneed,
             bounds_heads_willneed: !noboundsheadwillneed,
+            ahead_out_of_core: aheadooc,
             seal_put_one: !sealrun,
             close_finish_inline: closeinline,
             upkeep_wake_parked: wake,
@@ -6603,6 +6628,7 @@ impl Supdb {
             boundarytop,
             nodirwillneed,
             noboundsheadwillneed,
+            aheadooc,
             sealrun,
             closeinline,
             timers,
@@ -7120,6 +7146,9 @@ impl Engine for Supdb {
         if self.lazyforms {
             return "supdb-lazyforms";
         }
+        if self.aheadmin == Some(usize::MAX) {
+            return "supdb-noahead";
+        }
         if self.aheadmin.is_some() {
             return "supdb-ahead";
         }
@@ -7332,6 +7361,13 @@ impl Engine for Supdb {
                 "supdb-noboundsheadwillneed"
             } else {
                 "supdb-ingestnoboundsheadwillneed"
+            };
+        }
+        if self.aheadooc {
+            return if self.partition {
+                "supdb-aheadooc"
+            } else {
+                "supdb-ingestaheadooc"
             };
         }
         if self.sealrun {
@@ -8597,6 +8633,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-regime"
         | "supdb-noseal"
         | "supdb-ahead"
+        | "supdb-noahead"
         | "supdb-lazyforms"
         | "supdb-eager"
         | "supdb-nosettle"
@@ -8730,6 +8767,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-boundarytop"
         | "supdb-nodirwillneed"
         | "supdb-noboundsheadwillneed"
+        | "supdb-aheadooc"
         | "supdb-sealrun"
         | "supdb-closeinline"
         | "supdb-timers"
@@ -8836,6 +8874,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestboundarytop"
         | "supdb-ingestnodirwillneed"
         | "supdb-ingestnoboundsheadwillneed"
+        | "supdb-ingestaheadooc"
         | "supdb-ingestsealrun"
         | "supdb-ingestcloseinline"
         | "supdb-ingesttimers"
@@ -8903,6 +8942,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-pubalways" => Box::new(Supdb::create_pubalways(dir)?),
         "supdb-lazyforms" => Box::new(Supdb::create_lazyforms(dir)?),
         "supdb-ahead" => Box::new(Supdb::create_ahead(dir)?),
+        "supdb-noahead" => Box::new(Supdb::create_noahead(dir)?),
         "supdb-noseal" => Box::new(Supdb::create_noseal(dir)?),
         "supdb-regime" => Box::new(Supdb::create_regime(dir)?),
         "supdb-wforms" => Box::new(Supdb::create_wforms(dir)?),
@@ -9214,6 +9254,22 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                 partition: false,
                 durable: false,
                 noboundsheadwillneed: true,
+                ..Policy::default()
+            },
+        )?),
+        "supdb-aheadooc" => Box::new(Supdb::with_policy(
+            dir,
+            Policy {
+                aheadooc: true,
+                ..Policy::default()
+            },
+        )?),
+        "supdb-ingestaheadooc" => Box::new(Supdb::with_policy(
+            dir,
+            Policy {
+                partition: false,
+                durable: false,
+                aheadooc: true,
                 ..Policy::default()
             },
         )?),
