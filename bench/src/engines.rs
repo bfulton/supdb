@@ -562,6 +562,16 @@ pub struct Supdb {
     /// in core alone (`Options::ahead_out_of_core`). `supdb-ingestaheadooc`,
     /// and `supdb-aheadooc` durable.
     aheadooc: bool,
+    /// Out of core a merge's landing chains the next merge through a
+    /// write-only stretch too, where the default chains only while reads
+    /// are around (`Options::merge_chains_writes`).
+    /// `supdb-ingestchainwrites`, and `supdb-chainwrites` durable.
+    chainwrites: bool,
+    /// The controller builds nothing ahead at a landing, where the default
+    /// builds a partition's form file from memory once the raw form passes
+    /// a share of the page cache's budget (`Options::zpages_land_pct` at
+    /// zero). `supdb-ingestnoland`, and `supdb-noland` durable.
+    noland: bool,
     /// A seal writes every key through the writer's general path, as
     /// before the one-value path (`Options::seal_put_one` off).
     /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
@@ -1310,6 +1320,16 @@ struct Policy {
     /// in core alone (`Options::ahead_out_of_core`). `supdb-ingestaheadooc`,
     /// and `supdb-aheadooc` durable.
     aheadooc: bool,
+    /// Out of core a merge's landing chains the next merge through a
+    /// write-only stretch too, where the default chains only while reads
+    /// are around (`Options::merge_chains_writes`).
+    /// `supdb-ingestchainwrites`, and `supdb-chainwrites` durable.
+    chainwrites: bool,
+    /// The controller builds nothing ahead at a landing, where the default
+    /// builds a partition's form file from memory once the raw form passes
+    /// a share of the page cache's budget (`Options::zpages_land_pct` at
+    /// zero). `supdb-ingestnoland`, and `supdb-noland` durable.
+    noland: bool,
     /// A seal writes every key through the writer's general path, as
     /// before the one-value path (`Options::seal_put_one` off).
     /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
@@ -1841,6 +1861,8 @@ impl Default for Policy {
             nodirwillneed: false,
             noboundsheadwillneed: false,
             aheadooc: false,
+            chainwrites: false,
+            noland: false,
             sealrun: false,
             closeinline: false,
             timers: false,
@@ -6118,6 +6140,8 @@ impl Supdb {
             nodirwillneed,
             noboundsheadwillneed,
             aheadooc,
+            chainwrites,
+            noland,
             sealrun,
             closeinline,
             timers,
@@ -6412,6 +6436,7 @@ impl Supdb {
             pieces_dir_willneed: !nodirwillneed,
             bounds_heads_willneed: !noboundsheadwillneed,
             ahead_out_of_core: aheadooc,
+            merge_chains_writes: chainwrites,
             seal_put_one: !sealrun,
             close_finish_inline: closeinline,
             upkeep_wake_parked: wake,
@@ -6542,7 +6567,11 @@ impl Supdb {
             zpages_raw_tails_first: zhotfirst,
             zpages_drop_raw: zdropraw.unwrap_or(supdb::Options::default().zpages_drop_raw),
             zpages_drop_at_install: !zdropattach,
-            zpages_land_pct: zlandpct.unwrap_or(supdb::Options::default().zpages_land_pct),
+            zpages_land_pct: if noland {
+                0
+            } else {
+                zlandpct.unwrap_or(supdb::Options::default().zpages_land_pct)
+            },
             zpages_sample_idle: zsampleidle,
             zpages_attach_first: !zattachwarm,
             zpages_writer_census: !znowritercensus,
@@ -6676,6 +6705,8 @@ impl Supdb {
             nodirwillneed,
             noboundsheadwillneed,
             aheadooc,
+            chainwrites,
+            noland,
             sealrun,
             closeinline,
             timers,
@@ -7418,6 +7449,20 @@ impl Engine for Supdb {
                 "supdb-aheadooc"
             } else {
                 "supdb-ingestaheadooc"
+            };
+        }
+        if self.chainwrites {
+            return if self.partition {
+                "supdb-chainwrites"
+            } else {
+                "supdb-ingestchainwrites"
+            };
+        }
+        if self.noland {
+            return if self.partition {
+                "supdb-noland"
+            } else {
+                "supdb-ingestnoland"
             };
         }
         if self.sealrun {
@@ -8836,6 +8881,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nodirwillneed"
         | "supdb-noboundsheadwillneed"
         | "supdb-aheadooc"
+        | "supdb-chainwrites"
+        | "supdb-noland"
         | "supdb-sealrun"
         | "supdb-closeinline"
         | "supdb-timers"
@@ -8944,6 +8991,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestnodirwillneed"
         | "supdb-ingestnoboundsheadwillneed"
         | "supdb-ingestaheadooc"
+        | "supdb-ingestchainwrites"
+        | "supdb-ingestnoland"
         | "supdb-ingestsealrun"
         | "supdb-ingestcloseinline"
         | "supdb-ingesttimers"
@@ -9340,6 +9389,38 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                 partition: false,
                 durable: false,
                 aheadooc: true,
+                ..Policy::default()
+            },
+        )?),
+        "supdb-chainwrites" => Box::new(Supdb::with_policy(
+            dir,
+            Policy {
+                chainwrites: true,
+                ..Policy::default()
+            },
+        )?),
+        "supdb-ingestchainwrites" => Box::new(Supdb::with_policy(
+            dir,
+            Policy {
+                partition: false,
+                durable: false,
+                chainwrites: true,
+                ..Policy::default()
+            },
+        )?),
+        "supdb-noland" => Box::new(Supdb::with_policy(
+            dir,
+            Policy {
+                noland: true,
+                ..Policy::default()
+            },
+        )?),
+        "supdb-ingestnoland" => Box::new(Supdb::with_policy(
+            dir,
+            Policy {
+                partition: false,
+                durable: false,
+                noland: true,
                 ..Policy::default()
             },
         )?),

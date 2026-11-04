@@ -631,17 +631,30 @@ fn a_merge_drops_its_inputs_pages_behind_its_second_pass() {
 /// held merge runs is merged by the landing's plan with no write after the
 /// hold is lifted, and stays as it is with the chain off; and the cap on a
 /// merge's bytes (`Options::merge_bytes_cap`) takes two ranges due at once
-/// as two merges, one after the other, where no cap takes them as one.
+/// as two merges, one after the other, where no cap takes them as one. The
+/// chain waits for reads -- a scan since the last landing -- and a store
+/// that has only been written plans nothing at the landing, unless the
+/// store is out of core under `Options::merge_chains_writes`, where the
+/// chain runs through the write-only stretch too; in core that option
+/// changes nothing.
 #[test]
 fn a_merges_landing_plans_the_next_and_a_cap_lands_a_range_at_a_time() {
-    // (chain, cap, both ranges due at once) -> (pieces left, merges landed).
-    for (chain, cap, at_once, left, merges) in [
-        (true, 0u64, false, 0usize, 2u64),
-        (false, 0, false, 2, 1),
-        (true, 1, true, 0, 2),
-        (true, 0, true, 0, 1),
+    // (chain, cap, both ranges due at once, a scan before the landing,
+    // chained through writes, the controller's gate) -> (pieces left,
+    // merges landed).
+    for (chain, cap, at_once, scan, writes, gate, left, merges) in [
+        (true, 0u64, false, true, false, 0u8, 0usize, 2u64),
+        (false, 0, false, true, false, 0, 2, 1),
+        (true, 1, true, true, false, 0, 0, 2),
+        (true, 0, true, true, false, 0, 0, 1),
+        (true, 0, false, false, false, 0, 2, 1),
+        (true, 0, false, false, true, 1, 0, 2),
+        (true, 0, false, false, true, 0, 2, 1),
+        (true, 0, false, false, false, 1, 2, 1),
     ] {
-        let d = scratch(&format!("merge-chain-{chain}-{cap}-{at_once}"));
+        let d = scratch(&format!(
+            "merge-chain-{chain}-{cap}-{at_once}-{scan}-{writes}-{gate}"
+        ));
         let mut db = Db::create(
             &d,
             Options {
@@ -650,10 +663,20 @@ fn a_merges_landing_plans_the_next_and_a_cap_lands_a_range_at_a_time() {
                 l0_trigger: 2,
                 merge_chains: chain,
                 merge_bytes_cap: cap,
+                merge_chains_writes: writes,
+                // The gate is the test's to set where it is not raw.
+                zpages: if gate == 0 {
+                    supdb::ZPages::default()
+                } else {
+                    supdb::ZPages::Off
+                },
                 ..Options::default()
             },
         )
         .unwrap();
+        if gate != 0 {
+            db.zgate_set(gate);
+        }
         let key = |k: u32| format!("key-{k:05}").into_bytes();
         let mut keys: Vec<Vec<u8>> = (0..3000).map(key).collect();
         for k in &keys {
@@ -709,9 +732,11 @@ fn a_merges_landing_plans_the_next_and_a_cap_lands_a_range_at_a_time() {
         assert_eq!(db.seal_waits().merges, merges0, "nothing landed while held");
         // Reads around: a landing plans the next merge only where the
         // store's scan life moved since the last landing.
-        let mut seen = 0usize;
-        db.scan(b"", 5, kv(&mut |_, _| seen += 1)).unwrap();
-        assert_eq!(seen, 5);
+        if scan {
+            let mut seen = 0usize;
+            db.scan(b"", 5, kv(&mut |_, _| seen += 1)).unwrap();
+            assert_eq!(seen, 5);
+        }
         db.hold_merge_landing(false);
         // The segment work's own loop lands the merge and, with the chain,
         // plans and lands the next; a settle would join the merge itself and
@@ -720,7 +745,7 @@ fn a_merges_landing_plans_the_next_and_a_cap_lands_a_range_at_a_time() {
         while db.seal_waits().merges < merges0 + merges {
             assert!(
                 t.elapsed().as_secs() < 30,
-                "chain {chain} cap {cap} at once {at_once}: {} merges landed, {merges} expected",
+                "chain {chain} cap {cap} at once {at_once} scan {scan} writes {writes} gate {gate}: {} merges landed, {merges} expected",
                 db.seal_waits().merges - merges0
             );
             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -732,12 +757,12 @@ fn a_merges_landing_plans_the_next_and_a_cap_lands_a_range_at_a_time() {
             .count();
         assert_eq!(
             pieces, left,
-            "chain {chain} cap {cap} at once {at_once}: pieces left after the landings"
+            "chain {chain} cap {cap} at once {at_once} scan {scan} writes {writes} gate {gate}: pieces left after the landings"
         );
         assert_eq!(
             db.seal_waits().merges - merges0,
             merges,
-            "chain {chain} cap {cap} at once {at_once}: merges landed"
+            "chain {chain} cap {cap} at once {at_once} scan {scan} writes {writes} gate {gate}: merges landed"
         );
         hold_to(&db, &keys);
         drop(db);

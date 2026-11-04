@@ -3065,6 +3065,28 @@ pub struct Options {
     /// `supdb-ingestmergeuncapped`. A wide piece's ranges stay one merge
     /// whatever the cap (`Maint::cover_inputs`).
     pub merge_bytes_cap: u64,
+    /// EXPERIMENT: under `merge_chains`, a merge's landing plans the next
+    /// merge out of core -- the controller's gate away from the raw form --
+    /// whether or not a scan has come since the last landing, so the
+    /// merges a burst's seals left are chained through the burst's own
+    /// writes and not first through the scans after it. The ten-percent
+    /// lag pass at ten million keys under 1.25 GiB read 1.7-3.8 s across
+    /// sittings of one binary, by the merges' device bytes inside it --
+    /// 350-410 MB read and 157-187 MB written in the fast shape, 585-730
+    /// and 261-481 in the slow -- where LMDB's reads 70 MB and writes
+    /// nothing. Refuted by the phases' sum: paired at that rung, a warmup
+    /// and a pair, the full rewrite's pass ran 5.1-5.4 s against 7.7-10.9
+    /// and its burst 26.9-27.9 s against 23.0-23.4, the ten-percent point
+    /// 5.4-6.5 s burst and pass against 4.8-6.4, and the one-percent point
+    /// and the drained store slower in both rounds; chained through the
+    /// burst the merges start sooner and spill into the pass all the same.
+    /// The merge trace (`SUPDB_MERGE_TRACE`) then put no merge inside any
+    /// ten-percent pass of either arm: the device bytes there were the
+    /// controller's builds ahead at landing (`zpages_land_pct`,
+    /// `supdb-noland`). In core the gate is at raw and nothing changes.
+    /// Off: `supdb-chainwrites`, `supdb-ingestchainwrites`.
+    #[doc(hidden)]
+    pub merge_chains_writes: bool,
     /// The block cache reads a block boundary's key -- a partition's key at
     /// a block's first rank, which every table's bounds, splice and resumed
     /// walk asks for -- off the partition's ordered index's top level,
@@ -3705,6 +3727,7 @@ impl Default for Options {
             blocks_willneed: true,
             heads_willneed: true,
             merge_chains: true,
+            merge_chains_writes: false,
             merge_bytes_cap: 64 << 20,
             boundary_keys_from_top: false,
             pieces_dir_willneed: true,
@@ -14053,6 +14076,18 @@ fn trim_free_memory(shared: &Shared, stride: usize, by_resident: bool) {
     shared
         .trim_ns
         .fetch_add(t.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+}
+
+/// The monotonic clock in seconds, as the suite's lag marks print it, for
+/// the engine's traces to be read against the passes they ran beside.
+fn mono_secs() -> f64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a clock read into a timespec on the stack.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
 }
 
 /// The trim thread (`Options::forms_trim_bytes`): asleep until a handle
@@ -34733,6 +34768,16 @@ struct Maint {
     zsel: zselect::ZSelect,
     z_auto: bool,
     z_trace: bool,
+    /// A line on stderr at every merge's start and landing, on the
+    /// monotonic clock the suite's lag marks print (`SUPDB_MERGE_TRACE`):
+    /// which merges a pass ran beside, who planned them and what they
+    /// rewrote.
+    merge_trace: bool,
+    /// The planner a merge started from, for `merge_trace`: the trigger it
+    /// was due at and whether a landing's chain asked.
+    merge_why: (usize, bool),
+    /// When the merge in flight started, for `merge_trace`.
+    merge_began: Option<std::time::Instant>,
     /// When the last build was collected, for the trace's gap between one
     /// build and the next (`SUPDB_ZPAGES_TRACE`).
     z_last_collect: Option<std::time::Instant>,
@@ -35080,9 +35125,16 @@ impl Maint {
             // one or two pieces each, one after another, while the
             // ten-percent pass read -- 2.9 major faults a scan against 2.0
             // with the same pieces standing, the pass a quarter slower.
-            if reads && self.opts.merge_chains && self.opts.compact {
+            // Out of core a write-only stretch chains as well under
+            // `Options::merge_chains_writes`, so a burst's merge debt is paid
+            // beside its writes rather than beside the scans after it.
+            let writes =
+                self.opts.merge_chains_writes && self.shared.zgate.load() != zselect::GATE_RAW;
+            if (reads || writes) && self.opts.merge_chains && self.opts.compact {
                 let base = self.opts.l0_trigger.max(1);
+                self.merge_why.1 = true;
                 done = self.maybe_compact_at(base).and_then(|()| self.maybe_tier());
+                self.merge_why.1 = false;
                 SealCounts::add(&self.shared.seal_counts.plans, 1);
             }
         }
@@ -35301,6 +35353,12 @@ impl Maint {
         let z_auto = r.opts.zpages == ZPages::Auto && !z_auto_inert(&r.opts);
         let z_eager = r.opts.zpages_build_eager;
         let z_attach_eager = r.opts.zpages_attach_eager;
+        if std::env::var_os("SUPDB_ZPAGES_TRACE").is_some() {
+            // The epoch the trace's `t=` counts from, on the monotonic clock
+            // the suite's lag marks print, so its events can be read against
+            // the passes they ran beside.
+            eprintln!("zepoch mono={:.6}", mono_secs());
+        }
         Maint {
             r,
             dir: dir.to_path_buf(),
@@ -35329,6 +35387,9 @@ impl Maint {
             },
             z_auto,
             z_trace: std::env::var_os("SUPDB_ZPAGES_TRACE").is_some(),
+            merge_trace: std::env::var_os("SUPDB_MERGE_TRACE").is_some(),
+            merge_why: (0, false),
+            merge_began: None,
             z_last_collect: None,
             z_epoch: std::time::Instant::now(),
             z_last_step: None,
@@ -36268,6 +36329,7 @@ impl Maint {
     /// pieces. The seals plan at the trigger reads lower
     /// (`l0_trigger_now`), a chained landing at the base one.
     fn maybe_compact_at(&mut self, trigger: usize) -> Result<()> {
+        self.merge_why.0 = trigger;
         // Collect a finished merge BEFORE deciding. Its outputs are the
         // partitions the decision depends on, and deciding first meant
         // deciding against a store that still looked unpartitioned: every
@@ -39028,6 +39090,21 @@ impl Maint {
             .filter_map(|n| std::fs::metadata(self.dir.join(n)).ok())
             .map(|m| m.len())
             .sum();
+        if self.merge_trace {
+            let parts_in = inputs.iter().filter(|n| n.starts_with("par-")).count();
+            eprintln!(
+                "mergetrace start t={:.6} trigger {} chain {} partitions {} pieces {} mb {:.1} fences {} l0 {}",
+                mono_secs(),
+                self.merge_why.0,
+                self.merge_why.1,
+                parts_in,
+                inputs.len() - parts_in,
+                bytes as f64 / (1u64 << 20) as f64,
+                fences.as_ref().map_or(0, |f| f.len()),
+                self.l0_len()
+            );
+            self.merge_began = Some(std::time::Instant::now());
+        }
         let live_keys: usize = self
             .segs()
             .iter()
@@ -39100,6 +39177,22 @@ impl Maint {
         let outputs = handle
             .join()
             .map_err(|_| err("compaction thread panicked"))??;
+        if self.merge_trace {
+            let bytes: u64 = outputs
+                .iter()
+                .filter_map(|n| std::fs::metadata(self.dir.join(n)).ok())
+                .map(|m| m.len())
+                .sum();
+            eprintln!(
+                "mergetrace land t={:.6} ran_ms {:.1} outputs {} mb {:.1}",
+                mono_secs(),
+                self.merge_began
+                    .take()
+                    .map_or(0.0, |b| b.elapsed().as_secs_f64() * 1e3),
+                outputs.len(),
+                bytes as f64 / (1u64 << 20) as f64
+            );
+        }
         let kept: Vec<std::sync::Arc<Seg>> = self
             .segs()
             .iter()
