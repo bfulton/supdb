@@ -2929,6 +2929,38 @@ rule: work done on a bet leaves what the present form needs as it found
 it, so that losing the bet costs the work and nothing else, and the case
 priced first is the one where the bet is lost.
 
+**A bet placed where nothing could pay it, beside the reads it cost.**
+The same builds ahead ran on in a store that was only scanned: the lag
+sweep's store at ten million keys under 1.25 GiB, past the share of its
+budget the bet is placed at, built a partition's form file at every
+landing of its bursts' merges, ninety-three through the sweep, each a
+partition read from the device and a file written beside the scans, and
+the controller never bought one -- it buys on its point reads' faults,
+and the sweep has none. The ten-percent pass read and wrote half a
+gigabyte at the device where LMDB's read seventy megabytes, and the
+store with no builds ahead read the pass in half the time, a burst no
+slower. Two readings came before that one, and each was a measurement
+of something else. An allocator held 380-490 MB free beside 78 in use,
+and glibc told to map every allocation of 128 KB or more read the pass
+1.7x faster -- in a run of its own, an allocator's policy being no arm;
+the shipped binary across six runs read the pass from 1.9 to 3.8 s,
+by the device bytes inside it, under both policies. Merges chained
+through the bursts were to move the device bytes out of the pass, and
+lost by the phases' sum; a merge trace on the lag marks' clock then put
+no merge inside any ten-percent pass at all. The gate (builds ahead wait
+while scans are near) first read nearness off a flag the writer's seal
+set, and the one-percent burst is too small to seal, so the flag kept
+the write-only load's reading through the passes after it and the
+builds ran on; the gate reads the scans' count now, and a seal records
+only that the writes since the last scan have made the store far. The
+rule: a bet is placed where the event that pays it can happen, and the
+event's own signal says so -- a buy that comes from point reads is not
+bet on beside scans; a quantity that separates a cell's shapes is read
+within one run before an intervention outside the run is credited with
+the difference; and a signal published only at an event is stale for
+as long as the event does not come, so a gate reads the count the event
+is about, not a flag the event happens to set.
+
 **A verdict on an option whose condition the run never met.** The attach
 bought on the prediction fires where the sampler finds the form files on
 disk, and it was paired at five million keys under 640 MiB and read

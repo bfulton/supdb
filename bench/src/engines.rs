@@ -572,6 +572,11 @@ pub struct Supdb {
     /// a share of the page cache's budget (`Options::zpages_land_pct` at
     /// zero). `supdb-ingestnoland`, and `supdb-noland` durable.
     noland: bool,
+    /// The builds ahead at landing take no account of the scans around
+    /// them, where the default waits while the writer's last seal came near
+    /// scans (`Options::zpages_land_scans_far` off).
+    /// `supdb-ingestlandnearscans`, and `supdb-landnearscans` durable.
+    landnearscans: bool,
     /// A seal writes every key through the writer's general path, as
     /// before the one-value path (`Options::seal_put_one` off).
     /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
@@ -1330,6 +1335,11 @@ struct Policy {
     /// a share of the page cache's budget (`Options::zpages_land_pct` at
     /// zero). `supdb-ingestnoland`, and `supdb-noland` durable.
     noland: bool,
+    /// The builds ahead at landing take no account of the scans around
+    /// them, where the default waits while the writer's last seal came near
+    /// scans (`Options::zpages_land_scans_far` off).
+    /// `supdb-ingestlandnearscans`, and `supdb-landnearscans` durable.
+    landnearscans: bool,
     /// A seal writes every key through the writer's general path, as
     /// before the one-value path (`Options::seal_put_one` off).
     /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
@@ -1863,6 +1873,7 @@ impl Default for Policy {
             aheadooc: false,
             chainwrites: false,
             noland: false,
+            landnearscans: false,
             sealrun: false,
             closeinline: false,
             timers: false,
@@ -6142,6 +6153,7 @@ impl Supdb {
             aheadooc,
             chainwrites,
             noland,
+            landnearscans,
             sealrun,
             closeinline,
             timers,
@@ -6437,6 +6449,7 @@ impl Supdb {
             bounds_heads_willneed: !noboundsheadwillneed,
             ahead_out_of_core: aheadooc,
             merge_chains_writes: chainwrites,
+            zpages_land_scans_far: !landnearscans,
             seal_put_one: !sealrun,
             close_finish_inline: closeinline,
             upkeep_wake_parked: wake,
@@ -6707,6 +6720,7 @@ impl Supdb {
             aheadooc,
             chainwrites,
             noland,
+            landnearscans,
             sealrun,
             closeinline,
             timers,
@@ -7463,6 +7477,13 @@ impl Engine for Supdb {
                 "supdb-noland"
             } else {
                 "supdb-ingestnoland"
+            };
+        }
+        if self.landnearscans {
+            return if self.partition {
+                "supdb-landnearscans"
+            } else {
+                "supdb-ingestlandnearscans"
             };
         }
         if self.sealrun {
@@ -8883,6 +8904,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-aheadooc"
         | "supdb-chainwrites"
         | "supdb-noland"
+        | "supdb-landnearscans"
         | "supdb-sealrun"
         | "supdb-closeinline"
         | "supdb-timers"
@@ -8993,6 +9015,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestaheadooc"
         | "supdb-ingestchainwrites"
         | "supdb-ingestnoland"
+        | "supdb-ingestlandnearscans"
         | "supdb-ingestsealrun"
         | "supdb-ingestcloseinline"
         | "supdb-ingesttimers"
@@ -9421,6 +9444,22 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                 partition: false,
                 durable: false,
                 noland: true,
+                ..Policy::default()
+            },
+        )?),
+        "supdb-landnearscans" => Box::new(Supdb::with_policy(
+            dir,
+            Policy {
+                landnearscans: true,
+                ..Policy::default()
+            },
+        )?),
+        "supdb-ingestlandnearscans" => Box::new(Supdb::with_policy(
+            dir,
+            Policy {
+                partition: false,
+                durable: false,
+                landnearscans: true,
                 ..Policy::default()
             },
         )?),

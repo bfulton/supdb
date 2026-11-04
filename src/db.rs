@@ -1383,6 +1383,31 @@ pub struct Options {
     /// whole budget with nothing in flight, or none.
     #[doc(hidden)]
     pub zpages_land_pct: u32,
+    /// The builds ahead at landing (`zpages_land_pct`) wait while scans
+    /// are near -- from the store's first scan until a writer's seal finds
+    /// two stores' worth of writes since the last one
+    /// (`Shared::scans_far_at`) -- since the controller
+    /// buys on its point reads' faults and a store that is scanned and not
+    /// point-read gives it nothing to buy on, so a form file built ahead
+    /// there waits dormant until a merge replaces its partition. Over the
+    /// bounded roster at ten million keys under 1.25 GiB the store the lag
+    /// sweep runs on was never bought and built ninety-three files ahead
+    /// through its bursts and passes, each a partition read from the device
+    /// and a file written beside the scans: the ten-percent pass read
+    /// 580-680 MB and wrote 380-450 MB at the device against 64-105 and
+    /// none with no builds ahead (`supdb-noland`), and ran at half its
+    /// rate; and the store the ordered load made built its files in the
+    /// load and the point-read pass after it, before any scan, where they
+    /// are what let the controller install a second after it bought --
+    /// with none ahead, the read and scan passes after the load ran at a
+    /// fifth and a tenth. Paired against the shape before it over the whole
+    /// roster in two sittings, the ten-percent pass read 2.2x and 1.4x, the
+    /// sweep's weighted sum 1.71x and 1.03x, the passes after the load
+    /// level or ahead, and the mixes, half a second each at that rung,
+    /// either way by sitting. Off, the builds ahead take no account of the
+    /// scans: `supdb-landnearscans`, `supdb-ingestlandnearscans`.
+    #[doc(hidden)]
+    pub zpages_land_scans_far: bool,
     /// Whether a build ahead (`zpages_land_pct`, `zpages_prebuild`) drops
     /// the raw records behind it, as a bought build does
     /// (`zpages_drop_behind`), once the model's prediction of the raw
@@ -3619,6 +3644,7 @@ impl Default for Options {
             zpages_build_ahead: 4 << 20,
             zpages_prebuild: false,
             zpages_land_pct: 50,
+            zpages_land_scans_far: true,
             zpages_land_drop_past: true,
             zpages_build_sync: true,
             zpages_land_cold_past: true,
@@ -13690,6 +13716,17 @@ struct Shared {
     /// near: the segment work's landings take the pieces' ranks and
     /// bounds only then (`Options::land_ranks_far`).
     reads_near: std::sync::atomic::AtomicBool,
+    /// The store's scan count (`Maint::scan_life`) at which the writer's
+    /// last seal found two stores' worth of writes since the last scan
+    /// (`reads_around`), `u64::MAX` before any: scans are near from the
+    /// store's first scan until such a seal, and near again at the next
+    /// scan, which moves the count past it. The builds ahead at landing
+    /// wait while they are near (`Options::zpages_land_scans_far`). A
+    /// count and not a flag the seal sets, since a burst too small to seal
+    /// sets nothing: a flag left the write-only load's reading standing
+    /// through the passes after it, and the builds ahead ran on beside
+    /// their scans.
+    scans_far_at: AtomicU64,
     /// Scans and point reads through any handle but the writer's, a
     /// handle's said once per commit as with `scans_life`, where the idle
     /// seals follow the reads (`Options::seal_idle`); the writer counts
@@ -25682,6 +25719,7 @@ impl Db {
             merge_record_inputs: AtomicU64::new(0),
             merge_dropped_bytes: AtomicU64::new(0),
             reads_near: std::sync::atomic::AtomicBool::new(false),
+            scans_far_at: AtomicU64::new(u64::MAX),
             mode_scans: AtomicU64::new(0),
             mode_points: AtomicU64::new(0),
             live_handles: AtomicUsize::new(0),
@@ -26214,6 +26252,7 @@ impl Db {
             merge_record_inputs: AtomicU64::new(0),
             merge_dropped_bytes: AtomicU64::new(0),
             reads_near: std::sync::atomic::AtomicBool::new(false),
+            scans_far_at: AtomicU64::new(u64::MAX),
             mode_scans: AtomicU64::new(0),
             mode_points: AtomicU64::new(0),
             live_handles: AtomicUsize::new(0),
@@ -27327,7 +27366,13 @@ impl Db {
             .filter(|s| s.level > 0)
             .map(|s| s.blob.keys())
             .sum();
-        let near = reads_around(life, self.seal_since_scan, keys) && !self.shared.outran();
+        let scans = reads_around(life, self.seal_since_scan, keys);
+        if !scans {
+            self.shared
+                .scans_far_at
+                .store(life, AtomicOrdering::Release);
+        }
+        let near = scans && !self.shared.outran();
         self.seal_since_scan += table.committed_at().0 as u64;
         self.shared
             .reads_near
@@ -35870,6 +35915,14 @@ impl Maint {
             + self.shared.scans_merged.load(AtomicOrdering::Relaxed)
     }
 
+    /// Whether scans are near (`Shared::scans_far_at`): a scan in the
+    /// store's life, and none of the writer's seals since it has found the
+    /// store two stores' worth of writes past it.
+    fn scans_near(&self) -> bool {
+        let life = self.scan_life();
+        life > 0 && self.shared.scans_far_at.load(AtomicOrdering::Acquire) != life
+    }
+
     fn publish_segs(&mut self, segs: Vec<std::sync::Arc<Seg>>) {
         self.publish_segs_with(segs, false, None)
     }
@@ -37835,6 +37888,8 @@ impl Maint {
             5
         } else if !land && !self.sealing.is_empty() {
             6
+        } else if land && self.opts.zpages_land_scans_far && self.scans_near() {
+            7
         } else {
             0
         };
@@ -37842,7 +37897,7 @@ impl Maint {
             eprintln!(
                 "zland t={:.1} held_by {} due {} past_budget {} past_line {} compacting {} tiering {} sealing {} partitions {}",
                 self.z_epoch.elapsed().as_secs_f64(),
-                ["none", "off", "under the line", "installed", "a merge", "a piece merge", "a seal"][held_by as usize],
+                ["none", "off", "under the line", "installed", "a merge", "a piece merge", "a seal", "scans near"][held_by as usize],
                 self.z_land_due,
                 self.z_past_budget,
                 self.z_land_past,
