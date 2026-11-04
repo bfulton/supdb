@@ -7357,6 +7357,66 @@ fn land_store_with(
     (dir, db, model, inject, raw)
 }
 
+/// The builds ahead at landing wait while scans are near
+/// (`Options::zpages_land_scans_far`): a store scanned, its raw
+/// populations past the percent of its budget, builds nothing ahead, and
+/// builds ahead as before with the option off; and once the writer's seals
+/// have taken two stores' worth of writes since the scan, the store is far
+/// from scans and the builds ahead start. The writes go inside the store's
+/// range, so they seal through the writer's table and not a direct run,
+/// which is where a seal reads the scans around it.
+#[cfg(target_os = "linux")]
+#[test]
+fn builds_ahead_at_landing_wait_while_scans_are_around() {
+    for far in [true, false] {
+        let (dir, mut db, model, inject, raw) =
+            land_store_with(&format!("auto-land-scans-{far}"), 50, |o| {
+                o.zpages_land_scans_far = far;
+            });
+        let mut seen = 0usize;
+        db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
+        assert_eq!(seen, 10);
+        inject.set_budget(raw * 3 / 2);
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        if far {
+            assert!(
+                !tick_until(&db, 40, |c| c.build_starts > 0),
+                "built ahead beside the scans: {:?}",
+                db.zpage_counts()
+            );
+            assert!(form_files(&dir).is_empty(), "nothing ahead near scans");
+            // Every key written again, newest first and twice over, sealed,
+            // and then one more seal: that one finds two stores' worth of
+            // writes since the scan. Below the store's greatest, so through
+            // the writer's table and its seal.
+            for round in 0..3u8 {
+                for k in keys.iter().rev() {
+                    db.append(k, &[b'a' + round]);
+                }
+                db.commit().unwrap();
+                db.flush().unwrap();
+            }
+            db.append(&keys[0], b"last");
+            db.commit().unwrap();
+            db.flush().unwrap();
+            db.settle().unwrap();
+            assert!(
+                tick_until(&db, 200, |c| c.build_starts > 0),
+                "nothing built ahead far from the scans: {:?}",
+                db.zpage_counts()
+            );
+        } else {
+            assert!(
+                tick_until(&db, 200, |c| c.build_starts > 0),
+                "nothing built ahead with the option off: {:?}",
+                db.zpage_counts()
+            );
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// The builds ahead at landing (`Options::zpages_land_pct`): a store whose
 /// raw populations pass the percent of its budget and stay under the whole
 /// of it builds every partition's form file ahead, dormant, while the

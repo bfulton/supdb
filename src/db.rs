@@ -1383,6 +1383,31 @@ pub struct Options {
     /// whole budget with nothing in flight, or none.
     #[doc(hidden)]
     pub zpages_land_pct: u32,
+    /// The builds ahead at landing (`zpages_land_pct`) wait while scans
+    /// are near -- from the store's first scan until a writer's seal finds
+    /// two stores' worth of writes since the last one
+    /// (`Shared::scans_far_at`) -- since the controller
+    /// buys on its point reads' faults and a store that is scanned and not
+    /// point-read gives it nothing to buy on, so a form file built ahead
+    /// there waits dormant until a merge replaces its partition. Over the
+    /// bounded roster at ten million keys under 1.25 GiB the store the lag
+    /// sweep runs on was never bought and built ninety-three files ahead
+    /// through its bursts and passes, each a partition read from the device
+    /// and a file written beside the scans: the ten-percent pass read
+    /// 580-680 MB and wrote 380-450 MB at the device against 64-105 and
+    /// none with no builds ahead (`supdb-noland`), and ran at half its
+    /// rate; and the store the ordered load made built its files in the
+    /// load and the point-read pass after it, before any scan, where they
+    /// are what let the controller install a second after it bought --
+    /// with none ahead, the read and scan passes after the load ran at a
+    /// fifth and a tenth. Paired against the shape before it over the whole
+    /// roster in two sittings, the ten-percent pass read 2.2x and 1.4x, the
+    /// sweep's weighted sum 1.71x and 1.03x, the passes after the load
+    /// level or ahead, and the mixes, half a second each at that rung,
+    /// either way by sitting. Off, the builds ahead take no account of the
+    /// scans: `supdb-landnearscans`, `supdb-ingestlandnearscans`.
+    #[doc(hidden)]
+    pub zpages_land_scans_far: bool,
     /// Whether a build ahead (`zpages_land_pct`, `zpages_prebuild`) drops
     /// the raw records behind it, as a bought build does
     /// (`zpages_drop_behind`), once the model's prediction of the raw
@@ -3065,6 +3090,40 @@ pub struct Options {
     /// `supdb-ingestmergeuncapped`. A wide piece's ranges stay one merge
     /// whatever the cap (`Maint::cover_inputs`).
     pub merge_bytes_cap: u64,
+    /// EXPERIMENT: under `merge_chains`, a merge's landing plans the next
+    /// merge out of core -- the controller's gate away from the raw form --
+    /// whether or not a scan has come since the last landing, so the
+    /// merges a burst's seals left are chained through the burst's own
+    /// writes and not first through the scans after it. By the suite's
+    /// decision quantity (`weighted_ms`, the burst and twice the undivided
+    /// pass) it read ahead in three sittings at ten million keys under
+    /// 1.25 GiB, the full rewrite at 0.54-0.98x of the default's time, for
+    /// a reason that was not its own: the default chained only at a
+    /// landing, and where no merge was in flight when a burst ended its
+    /// pieces stood through the pass, 286 of them over 76 s against 6 over
+    /// 32 in the other round, and a chain kept going through the burst
+    /// always had one in flight. With the default's own loop planning a
+    /// merge when none is in flight (`merge_plan_idle`), undivided, it
+    /// reads 1.06x of the default's time over the sweep, the full rewrite
+    /// 1.08x and the shuffled load at 0.83x of its rate, so it stays off.
+    /// In core the gate is at raw and nothing changes. Off:
+    /// `supdb-chainwrites`, `supdb-ingestchainwrites`.
+    #[doc(hidden)]
+    pub merge_chains_writes: bool,
+    /// Under `merge_chains`, the segment work's own loop plans a merge
+    /// when none is in flight and a scan has come since its last look,
+    /// at the base trigger as a landing's chain does: the chain plans
+    /// only at a merge's landing, so where no merge was in flight when a
+    /// burst ended nothing started one while the store was only read,
+    /// and the pieces stood through the pass. The full-rewrite pass at
+    /// ten million keys under 1.25 GiB, undivided, read 31.6 s with six
+    /// pieces left at its end in one round and 76.6 s with 286 in the
+    /// other. One merge is all the look starts: its landing's publish
+    /// makes the next scan count, and the chain goes on from there. Off,
+    /// only a landing plans: `supdb-noidleplan`,
+    /// `supdb-ingestnoidleplan`.
+    #[doc(hidden)]
+    pub merge_plan_idle: bool,
     /// The block cache reads a block boundary's key -- a partition's key at
     /// a block's first rank, which every table's bounds, splice and resumed
     /// walk asks for -- off the partition's ordered index's top level,
@@ -3597,6 +3656,7 @@ impl Default for Options {
             zpages_build_ahead: 4 << 20,
             zpages_prebuild: false,
             zpages_land_pct: 50,
+            zpages_land_scans_far: true,
             zpages_land_drop_past: true,
             zpages_build_sync: true,
             zpages_land_cold_past: true,
@@ -3705,6 +3765,8 @@ impl Default for Options {
             blocks_willneed: true,
             heads_willneed: true,
             merge_chains: true,
+            merge_chains_writes: false,
+            merge_plan_idle: true,
             merge_bytes_cap: 64 << 20,
             boundary_keys_from_top: false,
             pieces_dir_willneed: true,
@@ -13667,6 +13729,17 @@ struct Shared {
     /// near: the segment work's landings take the pieces' ranks and
     /// bounds only then (`Options::land_ranks_far`).
     reads_near: std::sync::atomic::AtomicBool,
+    /// The store's scan count (`Maint::scan_life`) at which the writer's
+    /// last seal found two stores' worth of writes since the last scan
+    /// (`reads_around`), `u64::MAX` before any: scans are near from the
+    /// store's first scan until such a seal, and near again at the next
+    /// scan, which moves the count past it. The builds ahead at landing
+    /// wait while they are near (`Options::zpages_land_scans_far`). A
+    /// count and not a flag the seal sets, since a burst too small to seal
+    /// sets nothing: a flag left the write-only load's reading standing
+    /// through the passes after it, and the builds ahead ran on beside
+    /// their scans.
+    scans_far_at: AtomicU64,
     /// Scans and point reads through any handle but the writer's, a
     /// handle's said once per commit as with `scans_life`, where the idle
     /// seals follow the reads (`Options::seal_idle`); the writer counts
@@ -14053,6 +14126,18 @@ fn trim_free_memory(shared: &Shared, stride: usize, by_resident: bool) {
     shared
         .trim_ns
         .fetch_add(t.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+}
+
+/// The monotonic clock in seconds, as the suite's lag marks print it, for
+/// the engine's traces to be read against the passes they ran beside.
+fn mono_secs() -> f64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a clock read into a timespec on the stack.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
 }
 
 /// The trim thread (`Options::forms_trim_bytes`): asleep until a handle
@@ -25647,6 +25732,7 @@ impl Db {
             merge_record_inputs: AtomicU64::new(0),
             merge_dropped_bytes: AtomicU64::new(0),
             reads_near: std::sync::atomic::AtomicBool::new(false),
+            scans_far_at: AtomicU64::new(u64::MAX),
             mode_scans: AtomicU64::new(0),
             mode_points: AtomicU64::new(0),
             live_handles: AtomicUsize::new(0),
@@ -26179,6 +26265,7 @@ impl Db {
             merge_record_inputs: AtomicU64::new(0),
             merge_dropped_bytes: AtomicU64::new(0),
             reads_near: std::sync::atomic::AtomicBool::new(false),
+            scans_far_at: AtomicU64::new(u64::MAX),
             mode_scans: AtomicU64::new(0),
             mode_points: AtomicU64::new(0),
             live_handles: AtomicUsize::new(0),
@@ -27292,7 +27379,13 @@ impl Db {
             .filter(|s| s.level > 0)
             .map(|s| s.blob.keys())
             .sum();
-        let near = reads_around(life, self.seal_since_scan, keys) && !self.shared.outran();
+        let scans = reads_around(life, self.seal_since_scan, keys);
+        if !scans {
+            self.shared
+                .scans_far_at
+                .store(life, AtomicOrdering::Release);
+        }
+        let near = scans && !self.shared.outran();
         self.seal_since_scan += table.committed_at().0 as u64;
         self.shared
             .reads_near
@@ -34658,6 +34751,9 @@ struct Maint {
     /// where the life has moved since, reads around now
     /// (`Options::merge_chains`).
     chain_life: u64,
+    /// The store's scan count at the loop's last idle look
+    /// (`Options::merge_plan_idle`).
+    idle_life: u64,
     /// WAL files whose records no segment has been *named* as covering
     /// yet. One rule governs every one of them: a WAL may be deleted only
     /// after the manifest names a segment that covers its records. The
@@ -34733,6 +34829,16 @@ struct Maint {
     zsel: zselect::ZSelect,
     z_auto: bool,
     z_trace: bool,
+    /// A line on stderr at every merge's start and landing, on the
+    /// monotonic clock the suite's lag marks print (`SUPDB_MERGE_TRACE`):
+    /// which merges a pass ran beside, who planned them and what they
+    /// rewrote.
+    merge_trace: bool,
+    /// The planner a merge started from, for `merge_trace`: the trigger it
+    /// was due at and whether a landing's chain asked.
+    merge_why: (usize, bool),
+    /// When the merge in flight started, for `merge_trace`.
+    merge_began: Option<std::time::Instant>,
     /// When the last build was collected, for the trace's gap between one
     /// build and the next (`SUPDB_ZPAGES_TRACE`).
     z_last_collect: Option<std::time::Instant>,
@@ -34916,6 +35022,7 @@ impl Maint {
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
             self.collect();
+            self.idle_plan();
             self.shape_if_read(false);
             self.z_step();
             self.sweep_spares();
@@ -35080,9 +35187,16 @@ impl Maint {
             // one or two pieces each, one after another, while the
             // ten-percent pass read -- 2.9 major faults a scan against 2.0
             // with the same pieces standing, the pass a quarter slower.
-            if reads && self.opts.merge_chains && self.opts.compact {
+            // Out of core a write-only stretch chains as well under
+            // `Options::merge_chains_writes`, so a burst's merge debt is paid
+            // beside its writes rather than beside the scans after it.
+            let writes =
+                self.opts.merge_chains_writes && self.shared.zgate.load() != zselect::GATE_RAW;
+            if (reads || writes) && self.opts.merge_chains && self.opts.compact {
                 let base = self.opts.l0_trigger.max(1);
+                self.merge_why.1 = true;
                 done = self.maybe_compact_at(base).and_then(|()| self.maybe_tier());
+                self.merge_why.1 = false;
                 SealCounts::add(&self.shared.seal_counts.plans, 1);
             }
         }
@@ -35301,6 +35415,12 @@ impl Maint {
         let z_auto = r.opts.zpages == ZPages::Auto && !z_auto_inert(&r.opts);
         let z_eager = r.opts.zpages_build_eager;
         let z_attach_eager = r.opts.zpages_attach_eager;
+        if std::env::var_os("SUPDB_ZPAGES_TRACE").is_some() {
+            // The epoch the trace's `t=` counts from, on the monotonic clock
+            // the suite's lag marks print, so its events can be read against
+            // the passes they ran beside.
+            eprintln!("zepoch mono={:.6}", mono_secs());
+        }
         Maint {
             r,
             dir: dir.to_path_buf(),
@@ -35317,6 +35437,7 @@ impl Maint {
             sealing: std::collections::VecDeque::new(),
             flush_merge: false,
             chain_life: 0,
+            idle_life: 0,
             wake: None,
             shaped_at: 0,
             zbuild: None,
@@ -35329,6 +35450,9 @@ impl Maint {
             },
             z_auto,
             z_trace: std::env::var_os("SUPDB_ZPAGES_TRACE").is_some(),
+            merge_trace: std::env::var_os("SUPDB_MERGE_TRACE").is_some(),
+            merge_why: (0, false),
+            merge_began: None,
             z_last_collect: None,
             z_epoch: std::time::Instant::now(),
             z_last_step: None,
@@ -35809,6 +35933,45 @@ impl Maint {
             + self.shared.scans_merged.load(AtomicOrdering::Relaxed)
     }
 
+    /// A merge planned with none in flight where a scan has come since the
+    /// last look (`Options::merge_plan_idle`), so a store that is only
+    /// read after a burst drains its pieces whether or not a merge was
+    /// in flight when the writes stopped.
+    fn idle_plan(&mut self) {
+        if !(self.opts.merge_plan_idle && self.opts.merge_chains && self.opts.compact) {
+            return;
+        }
+        // As the landing's chain: no plan while a merge or a piece merge
+        // runs, and none while a seal is between its phases, since a
+        // promotion the plan makes publishes a manifest that would name
+        // the seal's segments before they are durable; the count is left
+        // as it was, so the next turn of the loop looks again.
+        if self.compacting.is_some() || self.tiering.is_some() || self.seal_between_phases() {
+            return;
+        }
+        let life = self.scan_life();
+        if life == self.idle_life {
+            return;
+        }
+        self.idle_life = life;
+        let op = self.op();
+        let base = self.opts.l0_trigger.max(1);
+        let done = self.maybe_compact_at(base).and_then(|()| self.maybe_tier());
+        SealCounts::add(&self.shared.seal_counts.plans, 1);
+        if let Err(e) = done {
+            self.shared.put_maint_err(e);
+        }
+        drop(op);
+    }
+
+    /// Whether scans are near (`Shared::scans_far_at`): a scan in the
+    /// store's life, and none of the writer's seals since it has found the
+    /// store two stores' worth of writes past it.
+    fn scans_near(&self) -> bool {
+        let life = self.scan_life();
+        life > 0 && self.shared.scans_far_at.load(AtomicOrdering::Acquire) != life
+    }
+
     fn publish_segs(&mut self, segs: Vec<std::sync::Arc<Seg>>) {
         self.publish_segs_with(segs, false, None)
     }
@@ -36268,6 +36431,7 @@ impl Maint {
     /// pieces. The seals plan at the trigger reads lower
     /// (`l0_trigger_now`), a chained landing at the base one.
     fn maybe_compact_at(&mut self, trigger: usize) -> Result<()> {
+        self.merge_why.0 = trigger;
         // Collect a finished merge BEFORE deciding. Its outputs are the
         // partitions the decision depends on, and deciding first meant
         // deciding against a store that still looked unpartitioned: every
@@ -37773,6 +37937,8 @@ impl Maint {
             5
         } else if !land && !self.sealing.is_empty() {
             6
+        } else if land && self.opts.zpages_land_scans_far && self.scans_near() {
+            7
         } else {
             0
         };
@@ -37780,7 +37946,7 @@ impl Maint {
             eprintln!(
                 "zland t={:.1} held_by {} due {} past_budget {} past_line {} compacting {} tiering {} sealing {} partitions {}",
                 self.z_epoch.elapsed().as_secs_f64(),
-                ["none", "off", "under the line", "installed", "a merge", "a piece merge", "a seal"][held_by as usize],
+                ["none", "off", "under the line", "installed", "a merge", "a piece merge", "a seal", "scans near"][held_by as usize],
                 self.z_land_due,
                 self.z_past_budget,
                 self.z_land_past,
@@ -39028,6 +39194,21 @@ impl Maint {
             .filter_map(|n| std::fs::metadata(self.dir.join(n)).ok())
             .map(|m| m.len())
             .sum();
+        if self.merge_trace {
+            let parts_in = inputs.iter().filter(|n| n.starts_with("par-")).count();
+            eprintln!(
+                "mergetrace start t={:.6} trigger {} chain {} partitions {} pieces {} mb {:.1} fences {} l0 {}",
+                mono_secs(),
+                self.merge_why.0,
+                self.merge_why.1,
+                parts_in,
+                inputs.len() - parts_in,
+                bytes as f64 / (1u64 << 20) as f64,
+                fences.as_ref().map_or(0, |f| f.len()),
+                self.l0_len()
+            );
+            self.merge_began = Some(std::time::Instant::now());
+        }
         let live_keys: usize = self
             .segs()
             .iter()
@@ -39100,6 +39281,22 @@ impl Maint {
         let outputs = handle
             .join()
             .map_err(|_| err("compaction thread panicked"))??;
+        if self.merge_trace {
+            let bytes: u64 = outputs
+                .iter()
+                .filter_map(|n| std::fs::metadata(self.dir.join(n)).ok())
+                .map(|m| m.len())
+                .sum();
+            eprintln!(
+                "mergetrace land t={:.6} ran_ms {:.1} outputs {} mb {:.1}",
+                mono_secs(),
+                self.merge_began
+                    .take()
+                    .map_or(0.0, |b| b.elapsed().as_secs_f64() * 1e3),
+                outputs.len(),
+                bytes as f64 / (1u64 << 20) as f64
+            );
+        }
         let kept: Vec<std::sync::Arc<Seg>> = self
             .segs()
             .iter()
