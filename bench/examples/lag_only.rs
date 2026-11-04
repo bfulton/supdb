@@ -76,10 +76,15 @@ fn main() {
         std::fs::create_dir_all(&dir).unwrap();
         let mut e = engines::open(&arm, &dir, 1).unwrap();
         let perm = Permutation::new(size, 0x5EED);
+        let ordered = std::env::var_os("LAG_ORDERED").is_some();
         let mut vrng = Rng::new(0xE1);
         let mut buf = Batch::with_capacity(1000, payload.value_size());
         for i in 0..size {
-            db_key_into(perm.at(i), &mut kb);
+            // LAG_ORDERED=1 loads the keys in order, the suite's `load`
+            // pass, whose drain leaves tail pieces to a background merge
+            // the writer publishes at its next commit -- the lag sweep's
+            // first; the shuffled load leaves none.
+            db_key_into(if ordered { i } else { perm.at(i) }, &mut kb);
             buf.push(&kb, payload.get(&mut vrng));
             if buf.len() == 1000 {
                 buf.flush(e.as_mut()).unwrap();
@@ -104,6 +109,7 @@ fn main() {
             let want = size * pct / 100;
             let wrote = want.saturating_sub(updated);
             let (flt_up0, flt_main0) = (minflt_of("supdb-upkeep"), minflt_self());
+            let bcpu0 = thread_cpu_ms();
             let tw = Instant::now();
             while updated < want {
                 db_key_into(ug.next(), &mut kb);
@@ -120,6 +126,9 @@ fn main() {
                 e.sync().unwrap();
             }
             let burst = tw.elapsed().as_secs_f64() * 1e3;
+            // The writer's own CPU over the burst beside its wall: a burst
+            // slower than its CPU was waiting or descheduled.
+            let burst_cpu = thread_cpu_ms() - bcpu0;
             // LAG_SETTLE=1: the burst's background work joined before the
             // pass -- not the suite's shape, a decomposition of the pass
             // into its own cost and what runs beside it.
@@ -160,6 +169,8 @@ fn main() {
             let maint = (get(&c1, "maint_cpu_us") - get(&c0, "maint_cpu_us")) / 1e3;
             let barriers = get(&c1, "pin_barriers") - get(&c0, "pin_barriers");
             let passes = get(&c1, "upkeep_passes") - get(&c0, "upkeep_passes");
+            let holds = get(&c1, "upkeep_holds") - get(&c0, "upkeep_holds");
+            let hold_ms = (get(&c1, "upkeep_hold_us") - get(&c0, "upkeep_hold_us")) / 1e3;
             let built = get(&c1, "blk_by_engine") - get(&c0, "blk_by_engine");
             let skipped = get(&c1, "upkeep_skipped") - get(&c0, "upkeep_skipped");
             let scans_n = get(&c1, "rd_scans") - get(&c0, "rd_scans");
@@ -221,7 +232,7 @@ fn main() {
                 0.0
             };
             line.push_str(&format!(
-                "\n  lag{pct} {burst:.1}+{pass:.1}ms (cpu {pass_cpu:.1}) up {up:.1}ms/{passes:.0}p cpu {cpu:.1}ms maint {maint:.1}ms flt {flt_up}/{flt_main} mb {barriers:.0} c_t {ct:.2} c_w {cw:.2} built {built:.0} skipped {skipped:.0} blockpath {blockpath:.0}/{scans_n:.0} seals {seals:.0} pubs {pubs:.0} snaps {snaps:.0} refr {refr:.0} swit {swit:.0} ext {ext:.0} | {layout} | {upkeep_built} | {phases}"
+                "\n  lag{pct} {burst:.1}+{pass:.1}ms (bcpu {burst_cpu:.1}, cpu {pass_cpu:.1}) up {up:.1}ms/{passes:.0}p holds {holds:.0}/{hold_ms:.1}ms cpu {cpu:.1}ms maint {maint:.1}ms flt {flt_up}/{flt_main} mb {barriers:.0} c_t {ct:.2} c_w {cw:.2} built {built:.0} skipped {skipped:.0} blockpath {blockpath:.0}/{scans_n:.0} seals {seals:.0} pubs {pubs:.0} snaps {snaps:.0} refr {refr:.0} swit {swit:.0} ext {ext:.0} | {layout} | {upkeep_built} | {phases}"
             ));
             c0 = c1;
         }

@@ -14565,8 +14565,8 @@ fn holds_all(db: &Reader, want: &BTreeMap<Vec<u8>, Vec<Vec<u8>>>, state: &str) {
 /// A seal that keeps the WAL (`seal_rotates_wal` off) rotates nothing:
 /// the seal ends at the live file's sequence, a reopen replays the file
 /// from the manifest's covered sequence and finds nothing to replay, and
-/// the file rotates only once it passes `seal_bytes`, synced whole first,
-/// retiring at the next seal's landing.
+/// the file rotates only once it passes `seal_bytes`, its unsynced frames
+/// left to the policy's next sync, retiring at the next seal's landing.
 #[test]
 fn a_seal_that_keeps_the_wal_retires_files_by_sequence() {
     let d = dir("walseq-retire");
@@ -14574,8 +14574,8 @@ fn a_seal_that_keeps_the_wal_retires_files_by_sequence() {
         seal_rotates_wal: false,
         seal_bytes: 1 << 20,
         seal_max_pct: 0,
-        // Buffered, the shape whose commits never sync: a rotation must
-        // sync the file itself before it starts the next.
+        // Buffered, the shape whose commits never sync: a rotation leaves
+        // the file's frames as the policy left them.
         sync: supdb::SyncPolicy::EveryN(u32::MAX),
         // Ascending keys would go to ordered ingest, which writes a
         // segment and not the log.
@@ -14611,8 +14611,8 @@ fn a_seal_that_keeps_the_wal_retires_files_by_sequence() {
     holds_all(&db, &want, "reopened over a WAL that spans the seal");
 
     // Past `seal_bytes` of log -- the first phase's bytes are in the file
-    // still -- the commit rotates, synced first, while the memtable is
-    // well under the seal.
+    // still -- the commit rotates, leaving the file loose, while the
+    // memtable is well under the seal.
     let levels = db.levels();
     let mut i = 3_000u32;
     while db.seal_waits().wal_rotations == 0 {
@@ -14625,7 +14625,10 @@ fn a_seal_that_keeps_the_wal_retires_files_by_sequence() {
     }
     db.commit().unwrap();
     let w = db.seal_waits();
-    assert_eq!(w.rotated_unsynced, 0, "every rotated file was synced whole");
+    assert!(
+        w.rotated_unsynced > 0,
+        "the rotation left the closed file's frames to the policy: {w:?}"
+    );
     assert_eq!(db.levels(), levels, "nothing sealed since the reopen");
     assert_eq!(db.unsealed_keys(), (i - 3_000) as usize);
     assert_eq!(wal_files(&d).len(), 2, "the closed file and the live one");
@@ -14650,11 +14653,11 @@ fn a_seal_that_keeps_the_wal_retires_files_by_sequence() {
     holds_all(&db, &want, "reopened after a crash past the seal");
 }
 
-/// The crash the rotation's sync exists for: the closed file whole and
-/// the new file torn anywhere, including before its header. Every record
-/// of the closed file comes back, and of the new file the batches before
-/// the tear, each whole -- and the store opens, where a closed file with
-/// an unsynced tail could leave a sequence gap replay refuses.
+/// The closed file whole and the new file torn anywhere, including before
+/// its header. Every record of the closed file comes back, and of the new
+/// file the batches before the tear, each whole -- and the store opens.
+/// The closed file's own tail torn, the boundary's other crash, is
+/// `a_loose_rotation_syncs_nothing_and_a_gap_at_its_boundary_ends_the_log`.
 #[test]
 fn a_rotated_wal_torn_in_its_new_file_reopens_to_a_prefix() {
     let d = dir("walseq-torn");
@@ -14687,7 +14690,7 @@ fn a_rotated_wal_torn_in_its_new_file_reopens_to_a_prefix() {
         (0, 0),
         "nothing sealed: the closed file is not covered"
     );
-    assert_eq!(db.seal_waits().rotated_unsynced, 0);
+    assert!(db.seal_waits().rotated_unsynced > 0, "left loose");
     // Five batches of a hundred into the new file.
     for b in 0..5u32 {
         for j in 0..100u32 {
@@ -16178,4 +16181,382 @@ fn a_handle_claimed_between_two_scans_leaves_the_writers_scan_whole_before_the_f
     drop(h);
     drop(h2);
     let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A size rotation under a policy that leaves frames unsynced syncs nothing
+/// on the writer's thread and leaves the closed file loose, with the file it
+/// begins saying so in its header kind. A power loss that takes the closed
+/// file's tail while keeping the new file's frames leaves a store that opens
+/// at the tear, the log ending there and the new file cut to its header; the
+/// same files under a chained header are a record lost, and refused, as they
+/// are under a policy that syncs every commit, whose rotation leaves nothing
+/// loose. The rotation synced the closed file itself before, 32 MiB of a
+/// buffered store's frames on the writer's thread, inside the lag sweep's
+/// one-percent burst at a million keys.
+#[test]
+fn a_loose_rotation_syncs_nothing_and_a_gap_at_its_boundary_ends_the_log() {
+    let buffered = Options {
+        sync: supdb::SyncPolicy::EveryN(u32::MAX),
+        seal_rotates_wal: false,
+        seal_bytes: 16 << 10,
+        // Ascending keys through the log, not a direct run.
+        direct_ingest: false,
+        ..Options::default()
+    };
+    let key = |i: u32| format!("k{i:05}").into_bytes();
+    let val = vec![7u8; 100];
+    // Commits of eight records until the log rotates: the frames outrun
+    // the table's bytes, so the rotation comes before the first seal, and
+    // the rotating commit's batch is the closed file's last.
+    let rotate_once = |db: &mut Db, n: &mut u32| {
+        while db.seal_waits().wal_rotations == 0 {
+            assert!(*n < 10_000, "the log never rotated");
+            for _ in 0..8 {
+                db.append(&key(*n), &val);
+                *n += 1;
+            }
+            db.commit().unwrap();
+        }
+    };
+    let tear = |p: &std::path::Path| {
+        let len = std::fs::metadata(p).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_len(len - 1)
+            .unwrap();
+    };
+    let d = dir("loose-rotation");
+    let mut db = Db::create(&d, buffered.clone()).unwrap();
+    let mut n = 0u32;
+    rotate_once(&mut db, &mut n);
+    let closed = n;
+    let w = db.seal_waits();
+    assert!(
+        w.rotated_unsynced > 0,
+        "the rotation left the closed file's frames unsynced: {w:?}"
+    );
+    assert_eq!(w.loose_synced, 0, "{w:?}");
+    // One batch into the new file.
+    for _ in 0..8 {
+        db.append(&key(n), &val);
+        n += 1;
+    }
+    db.commit().unwrap();
+    drop(db);
+    assert_eq!(
+        std::fs::read(d.join("wal-00000000")).unwrap()[7],
+        4,
+        "the first file heads the chain"
+    );
+    assert_eq!(
+        std::fs::read(d.join("wal-00000001")).unwrap()[7],
+        5,
+        "the new file says the one before it was left loose"
+    );
+    // The power loss: the closed file's last batch torn, the new file whole.
+    let crashed = |name: &str| -> PathBuf {
+        let dd = dir(name);
+        for e in std::fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            std::fs::copy(e.path(), dd.join(e.file_name())).unwrap();
+        }
+        tear(&dd.join("wal-00000000"));
+        dd
+    };
+    // Loose: the log ends at the tear, and the store goes on from there.
+    let dd = crashed("loose-rotation-loose");
+    let mut db = Db::open(&dd, buffered.clone()).unwrap();
+    for i in 0..closed - 8 {
+        assert_eq!(
+            read_vec(&db, &key(i)),
+            vec![val.clone()],
+            "key {i}, before the tear"
+        );
+    }
+    for i in closed - 8..n {
+        assert!(
+            read_vec(&db, &key(i)).is_empty(),
+            "key {i}: the torn batch, and the file after the gap"
+        );
+    }
+    assert_eq!(
+        std::fs::metadata(dd.join("wal-00000001")).unwrap().len(),
+        8,
+        "the live file is cut to its header"
+    );
+    db.append(b"after", b"A");
+    db.commit().unwrap();
+    drop(db);
+    let db = Db::open(&dd, buffered.clone()).unwrap();
+    assert_eq!(read_vec(&db, b"after"), vec![b"A".to_vec()]);
+    assert_eq!(read_vec(&db, &key(0)), vec![val.clone()]);
+    drop(db);
+    // Chained: the same tear is a record lost.
+    let dd = crashed("loose-rotation-chained");
+    let p = dd.join("wal-00000001");
+    let mut file = std::fs::read(&p).unwrap();
+    file[7] = 4;
+    std::fs::write(&p, &file).unwrap();
+    let e = Db::open(&dd, buffered.clone())
+        .err()
+        .expect("a gap under a chained header is refused");
+    assert!(e.to_string().contains("wal sequence gap"), "{e}");
+    // A policy that syncs every commit leaves nothing loose: its rotation
+    // chains, and the same tear is refused.
+    let durable = Options {
+        sync: supdb::SyncPolicy::Always,
+        ..buffered.clone()
+    };
+    let d2 = dir("loose-rotation-durable");
+    let mut db = Db::create(&d2, durable.clone()).unwrap();
+    let mut n = 0u32;
+    rotate_once(&mut db, &mut n);
+    let w = db.seal_waits();
+    assert_eq!(w.rotated_unsynced, 0, "{w:?}");
+    for _ in 0..8 {
+        db.append(&key(n), &val);
+        n += 1;
+    }
+    db.commit().unwrap();
+    drop(db);
+    assert_eq!(std::fs::read(d2.join("wal-00000001")).unwrap()[7], 4);
+    tear(&d2.join("wal-00000000"));
+    let e = Db::open(&d2, durable)
+        .err()
+        .expect("a torn tail behind a synced rotation is refused");
+    assert!(e.to_string().contains("wal sequence gap"), "{e}");
+}
+
+/// Under a policy that syncs every so many commits, a rotation at a commit
+/// that did not sync leaves the closed file loose, and the first commit
+/// that syncs by policy syncs that file before the live one and rewrites
+/// the live file's header chained: from then on a gap at that boundary is
+/// a record lost again. `Db::sync`, the caller's own durability point, does
+/// the same for a store whose commits never sync.
+#[test]
+fn the_first_sync_by_policy_after_a_loose_rotation_syncs_the_closed_file_and_chains_the_header() {
+    let key = |i: u32| format!("k{i:05}").into_bytes();
+    let val = vec![7u8; 100];
+    let shape = Options {
+        sync: supdb::SyncPolicy::EveryN(u32::MAX),
+        seal_rotates_wal: false,
+        seal_bytes: 16 << 10,
+        direct_ingest: false,
+        ..Options::default()
+    };
+    // Commits of eight records until the log rotates once; how many that
+    // takes, counted on a store of its own, so the policy below can sync
+    // at the commit right after the rotation -- before any seal, whose
+    // landing would retire the file the sync is for.
+    let rotate_once = |db: &mut Db, n: &mut u32| -> u32 {
+        let mut commits = 0u32;
+        while db.seal_waits().wal_rotations == 0 {
+            assert!(commits < 1_000, "the log never rotated");
+            for _ in 0..8 {
+                db.append(&key(*n), &val);
+                *n += 1;
+            }
+            db.commit().unwrap();
+            commits += 1;
+        }
+        commits
+    };
+    let count = {
+        let d = dir("loose-chained-count");
+        let mut db = Db::create(&d, shape.clone()).unwrap();
+        rotate_once(&mut db, &mut 0)
+    };
+    let policy = Options {
+        sync: supdb::SyncPolicy::EveryN(count + 1),
+        ..shape.clone()
+    };
+    let d = dir("loose-chained");
+    let mut db = Db::create(&d, policy.clone()).unwrap();
+    let mut n = 0u32;
+    assert_eq!(
+        rotate_once(&mut db, &mut n),
+        count,
+        "the same writes rotate at the same commit"
+    );
+    let w = db.seal_waits();
+    assert!(w.rotated_unsynced > 0 && w.loose_synced == 0, "{w:?}");
+    let header = |d: &std::path::Path| std::fs::read(d.join("wal-00000001")).unwrap()[7];
+    assert_eq!(header(&d), 5, "left loose");
+    // The next commit is the policy's first sync.
+    for _ in 0..8 {
+        db.append(&key(n), &val);
+        n += 1;
+    }
+    db.commit().unwrap();
+    let w = db.seal_waits();
+    assert_eq!(
+        w.loose_synced, 1,
+        "the sync by policy synced the file the rotation left loose: {w:?}"
+    );
+    assert_eq!(header(&d), 4, "and chained the live file's header");
+    drop(db);
+    let db = Db::open(&d, policy.clone()).unwrap();
+    for i in 0..n {
+        assert_eq!(read_vec(&db, &key(i)), vec![val.clone()], "key {i}");
+    }
+    drop(db);
+    // Both files synced: a torn tail in the closed one is damage, refused.
+    let p = d.join("wal-00000000");
+    let len = std::fs::metadata(&p).unwrap().len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&p)
+        .unwrap()
+        .set_len(len - 1)
+        .unwrap();
+    let e = Db::open(&d, policy).err().expect("refused");
+    assert!(e.to_string().contains("wal sequence gap"), "{e}");
+    // `Db::sync` on a store whose commits never sync.
+    let d2 = dir("loose-synced");
+    let mut db = Db::create(&d2, shape).unwrap();
+    rotate_once(&mut db, &mut 0);
+    assert_eq!(header(&d2), 5);
+    db.sync().unwrap();
+    let w = db.seal_waits();
+    assert_eq!(w.loose_synced, 1, "{w:?}");
+    assert_eq!(header(&d2), 4, "chained by the caller's sync");
+    drop(db);
+}
+
+/// The oracle under a policy that never syncs and a log small enough to
+/// rotate every few commits: every rotation loose, every file after the
+/// first headed so, and crash-reopens across them with every frame still
+/// on disk, since a drop takes no page from the cache, so no boundary gaps
+/// and nothing is lost.
+#[test]
+fn the_oracle_holds_with_loose_rotations() {
+    let w = oracle_in(
+        "oracle-loose",
+        Options {
+            sync: supdb::SyncPolicy::EveryN(u32::MAX),
+            seal_rotates_wal: false,
+            seal_bytes: 2 << 10,
+            ..Options::default()
+        },
+    );
+    assert!(w.wal_rotations > 0 && w.rotated_unsynced > 0, "{w:?}");
+}
+
+/// A buffered commit near reads whose batch is worth waking the thread for
+/// files it in the commit only where a scan preceded the commit; the
+/// batches after that one, up to a share of the store's keys each, are
+/// lent and paced behind the thread (`Options::upkeep_pace_pct`): after
+/// every such commit the thread trails by at most the share, every paced
+/// commit held for that, the scan after the burst finds nothing left to
+/// settle, and every key reads as written through the writer and through
+/// a handle. A batch over the share, or every batch at zero, is filed in
+/// the commit: nothing is lent and the thread makes no pass.
+#[test]
+fn a_bursts_batches_after_the_first_are_lent_a_batch_behind_the_thread() {
+    // Batches of a thousand over twenty thousand keys: five percent of
+    // the store, paced at a share of ten and filed at one.
+    let run = |name: &str, pace_pct: usize| {
+        let pace = pace_pct >= 5;
+        let d = dir(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                sync: supdb::SyncPolicy::EveryN(u32::MAX),
+                upkeep: supdb::Upkeep::Background(1),
+                upkeep_pace_pct: pace_pct,
+                partition_bytes: Some(256 << 10),
+                seal_max_pct: 0,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let keys = 20_000u32;
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        let mut want: HashMap<u32, String> = HashMap::new();
+        for k in 0..keys {
+            db.append(&key(k), b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        assert!(db.levels().0 > 0, "partitions for the forms to hang on");
+        let check = |db: &Reader, want: &HashMap<u32, String>, when: &str| {
+            let mut seen = 0u32;
+            db.scan(
+                &key(0),
+                keys as usize,
+                kv(&mut |k, v| {
+                    let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                    let expect = want.get(&kn).map_or("0", |s| s.as_str());
+                    assert_eq!(std::str::from_utf8(v).unwrap(), expect, "key {kn} {when}");
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, keys, "every key {when}");
+        };
+        // Reads around: a scan over the store.
+        check(&db, &want, "before the burst");
+        let before = db.upkeep_counts();
+        // The burst: eight commits of a thousand random puts. The first is
+        // the commit after the scan, filed in the commit; the rest are
+        // paced, or filed too with the pace off.
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        for round in 0..8u32 {
+            for _ in 0..1000 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % keys as u64) as u32;
+                db.put(&key(k), format!("b{round}").as_bytes());
+                want.insert(k, format!("b{round}"));
+            }
+            db.commit().unwrap();
+            // The count is of writes lent and not filed by the thread's
+            // report, meaningful once a commit has lent: the first commit
+            // files in the commit and lends nothing.
+            if pace && round > 0 {
+                let behind = db.upkeep_behind_writes();
+                let share = keys as u64 * pace_pct as u64 / 100;
+                assert!(
+                    behind <= share,
+                    "commit {round}: the thread trails by at most the share {share}, not {behind}"
+                );
+            }
+        }
+        let after = db.upkeep_counts();
+        let (passes, holds) = (after[0] - before[0], after[4] - before[4]);
+        // The thread's passes joined and the upkeep home, nothing of the
+        // backlog settled by this call.
+        db.settle().unwrap();
+        let settled = db.settle_density()[1];
+        check(&db, &want, "after the burst");
+        let by_scan = db.settle_density()[1] - settled;
+        let h = db.reader().unwrap();
+        check(&h, &want, "through a handle after the burst");
+        (passes, holds, by_scan)
+    };
+    let (passes, holds, by_scan) = run("paced-burst", 10);
+    assert!(
+        passes >= 1,
+        "the thread filed the lent batches: {passes} passes"
+    );
+    assert_eq!(holds, 7, "every commit after the first held for the thread");
+    assert_eq!(
+        by_scan, 0,
+        "the scan after the burst found nothing left to settle"
+    );
+    let (passes, holds, by_scan) = run("unpaced-burst", 0);
+    assert_eq!(
+        (passes, holds, by_scan),
+        (0, 0, 0),
+        "filed in the commits: no pass, no hold, nothing for the scan"
+    );
+    let (passes, holds, by_scan) = run("over-the-share-burst", 1);
+    assert_eq!(
+        (passes, holds, by_scan),
+        (0, 0, 0),
+        "a batch over the share is filed in the commit"
+    );
 }
