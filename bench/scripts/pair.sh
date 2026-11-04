@@ -4,7 +4,10 @@
 # Two arms priced against each other the way the docs cite a pairing: one
 # process, the arms alternating rep by rep, one sitting with A first and a
 # second with B first, so that what the order does reads as a disagreement
-# between the sittings and not as an effect (`bench ab`, DESIGN.md). Options
+# between the sittings and not as an effect (`bench ab`, DESIGN.md); under
+# a bound each pass has a process of its own, as a bounded row's, and a
+# pass the bound kills loses its rep's pair and ends the sitting with 137
+# once the table is printed. Options
 # after SIZE go to `bench ab` unchanged: `--bound BYTES` for a bounded
 # pairing, `--passes`, `--reps`, `--ops-div`, `--len`, `--pairs`.
 #

@@ -1,8 +1,9 @@
 //! `bench run` measures and writes a row; `bench machine` prints the host as
 //! a row would record it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use supdb_bench::bound::Bound;
+use supdb_bench::ledger::{self, Ledger};
 use supdb_bench::{engines, env, figures, gate, row, run, Scale};
 
 const USAGE: &str = "\
@@ -10,8 +11,9 @@ usage:
   bench run --scale quick|full [--out DIR] [--arms a,b,...] [--top KEYS] [--bottom KEYS] [--reps N]
             [--fresh-process|--one-process]
   bench run --scale ooc --bound BYTES [--ops-div N] [the options above]
+  bench run --resume DIR [--reps N] [--resume-passes]
   bench ab --arms A,B [--size KEYS] [--reps N] [--len ENTRIES] [--pairs TEXT] [--bound BYTES] [--passes a,b,...]
-           [--ops-div N] [--compress FRACTION]
+           [--ops-div N] [--compress FRACTION] [--fresh-process|--one-process]
   bench gate ROW.json [--runs DIR]
   bench figures [--runs DIR] [--out DIR] [--scale quick|full|ooc]
   bench machine
@@ -29,8 +31,16 @@ run    measures every arm over the size ladder and writes runs/<scale>/<utc>-<sh
                required at ooc, refused at quick and full. The process is moved into the
                group before anything is measured, the limit as read back goes into the row's
                class, and a bound too small for the floors is refused before the floors
-       --ops-div what the read passes' operation counts are divided by at ooc (default 30);
+       --ops-div what the read passes' operation counts are divided by at ooc (default 10);
                loads and bursts are never divided, and no divided count goes below 1000
+       --resume DIR  take up the run whose ledger is DIR (<out>/inflight/<utc>-<sha7>, what a run
+               that was cut leaves): the same binary, class and bound, the plan the ledger's,
+               every whole rep kept and a cut rep taken again whole. --reps may raise the
+               count; --resume-passes keeps a cut rep's passes, for a loop that is not the series'
+       A pass killed under the bound is a cell of the row, which then goes under
+       <out>/killed/<scale>/, and the command exits 137 once the row is written.
+       Stores on a RAM-backed block device (zram, loop) are refused: a row's rates are
+       the device's, and that one is nobody's; scripts/zram.sh runs ab on one for counts.
 ab     two arms in one process, alternating and paired rep by rep, for choosing
        between them rather than for the series: the order swaps every other rep
        so neither stands first more often, and the verdict is a sign test over
@@ -48,6 +58,11 @@ ab     two arms in one process, alternating and paired rep by rep, for choosing
                divided, for a pairing at a rung where the whole pass is an hour.
        --compress the fraction of each value that is a repeated phrase (default 0.5,
                the suite's); 0.0 is the incompressible control for a compact form.
+       --fresh-process each pass in a process of its own, --one-process both arms in this one
+               (default: fresh under a bound, one in core); a pass killed under the bound
+               loses its rep's pair, the pairing goes on, and the command exits 137.
+       On a RAM-backed block device (scripts/zram.sh) the table names the device at its
+       head and its foot: the counts are the disk's own, the rates are not.
        An arm against itself (--arms supdb,supdb) is the control: what a
        verdict looks like when nothing differs.
 gate   compares ROW to the last ten rows of its class and scale under runs/ (--runs, default runs);
@@ -166,6 +181,8 @@ fn cmd_machine() -> i32 {
         rustc: String::new(),
         scale: Scale::Quick,
         machine: m,
+        killed: vec![],
+        resumptions: vec![],
         measurements: vec![],
     };
     println!("class: {}", probe.class());
@@ -230,6 +247,26 @@ fn cmd_gate(a: Args) -> i32 {
     }
 }
 
+/// The refusal of a RAM-backed device under the stores for a command that
+/// writes a row, or none. A row's out-of-core rates are the faults an
+/// operation takes times the device's answer, and on zram the answer is a
+/// tenth of the disk's; the counts are the same, which is what
+/// `scripts/zram.sh` runs `ab` for, and a row of them would be the
+/// series' only by a reader's care.
+fn ram_backed_refusal() -> Option<String> {
+    let dev = env::ram_backed_device(&std::env::temp_dir())?;
+    Some(format!(
+        "the stores would be on {dev}, a RAM-backed block device, whose rates are nobody's; \
+         a row of the series is the machine's disk's. For the counts, run a pairing through \
+         scripts/zram.sh instead"
+    ))
+}
+
+/// The line a pairing on a RAM-backed device carries at its table's head
+/// and foot, so a table read later says what its rates are not.
+const RAM_BACKED_LINE: &str =
+    "a RAM-backed block device: the counts are the disk's own, the rates are not; quote none";
+
 fn cmd_ab(a: Args) -> i32 {
     let arms: Vec<String> = a
         .get("--arms")
@@ -279,6 +316,16 @@ fn cmd_ab(a: Args) -> i32 {
     );
     plan.bound = bound;
     plan.passes = passes;
+    // Each pass in a process of its own under a bound, as a bounded row's
+    // (`Plan::fresh_process`): a kill then takes the rep's pair and not
+    // the pairing, and the allocator's residue of one arm's store is not
+    // under the bound for the other's.
+    plan.fresh_process = plan.bound.is_some();
+    if a.has("--fresh-process") {
+        plan.fresh_process = true;
+    } else if a.has("--one-process") {
+        plan.fresh_process = false;
+    }
     if let Some(l) = a.num("--len") {
         plan.scan_len = (l as usize).max(1);
     }
@@ -301,8 +348,13 @@ fn cmd_ab(a: Args) -> i32 {
         }
     }
     eprintln!(
-        "bench ab: {a0} against {b0} at {size} keys, scans of {}, {reps} pairs after a warmup{}{}{}{}",
+        "bench ab: {a0} against {b0} at {size} keys, scans of {}, {reps} pairs{}{}{}{}{}",
         plan.scan_len,
+        if plan.fresh_process {
+            ", each pass in a process of its own"
+        } else {
+            " after a warmup"
+        },
         match plan.bound_bytes() {
             Some(b) => format!(", under a bound of {b} bytes"),
             None => String::new(),
@@ -323,14 +375,21 @@ fn cmd_ab(a: Args) -> i32 {
             String::new()
         }
     );
+    let ram = env::ram_backed_device(&std::env::temp_dir());
+    if let Some(dev) = &ram {
+        eprintln!("bench ab: stores on {dev}, {RAM_BACKED_LINE}");
+    }
     let mut log = std::io::stderr();
-    let got = match run::ab((a0, b0), size, reps, &plan, &mut log) {
+    let (got, killed) = match run::ab((a0, b0), size, reps, &plan, &mut log) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("bench ab: {e}");
             return 1;
         }
     };
+    if let Some(dev) = &ram {
+        println!("\nstores on {dev}, {RAM_BACKED_LINE}");
+    }
     println!(
         "\n{:<34} {:>13} {:>13} {:>8} {:>9} {:>8}",
         "quantity", a0, b0, "B/A", "B above A", "sign p"
@@ -376,10 +435,229 @@ fn cmd_ab(a: Args) -> i32 {
             }
         }
     }
+    if let Some(dev) = &ram {
+        println!("\nstores on {dev}, {RAM_BACKED_LINE}");
+    }
+    if !killed.is_empty() {
+        eprintln!(
+            "bench ab: {} of {reps} reps killed under the bound: {}; the table is the pairs that ran",
+            killed.len(),
+            killed
+                .iter()
+                .map(|k| format!("rep {} {}{}", k.rep, k.arm, after_phase(k)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        return 137;
+    }
     0
 }
 
+/// The phase a kill says the pass had finished, for a line that names it.
+fn after_phase(k: &row::Kill) -> String {
+    match &k.after_phase {
+        Some(p) => format!(" after {p}"),
+        None => " in its first phase".to_string(),
+    }
+}
+
+/// The row written and its path printed; the status is the kill's, 137,
+/// for a row with a pass killed under the bound (`run::PassOutcome`),
+/// which a bounded run's wrapper reads as it read the kill before, and 0
+/// for a row of the series.
+fn finish(row: row::Row, out: &Path) -> i32 {
+    match row.write(out) {
+        Ok(p) => {
+            println!("{}", p.display());
+            if row.killed.is_empty() {
+                return 0;
+            }
+            for k in &row.killed {
+                eprintln!(
+                    "killed: {} at rep {} of {} keys{}",
+                    k.arm,
+                    k.rep,
+                    k.size,
+                    after_phase(k)
+                );
+            }
+            eprintln!(
+                "{} passes were killed under the bound; the row is under {}/ and not the series': \
+                 raise the bound",
+                row.killed.len(),
+                row::KILLED_DIR
+            );
+            137
+        }
+        Err(e) => {
+            eprintln!("could not write the row: {e}");
+            1
+        }
+    }
+}
+
+/// `bench run --resume DIR`: the run whose ledger is DIR taken up where it
+/// was cut. The plan is the ledger's; the line may raise `--reps`, may
+/// keep a cut rep's passes (`--resume-passes`), and may name the scale,
+/// the bound and the runs directory only as the ledger has them. The
+/// binary, the machine's class and the bound are held to the ledger's
+/// before anything is measured (`ledger::refusal`).
+fn cmd_resume(dir: &Path, a: Args) -> i32 {
+    let (ledger, head) = match Ledger::open(dir) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("bench run: --resume: {e}");
+            return 2;
+        }
+    };
+    for flag in [
+        "--arms",
+        "--top",
+        "--bottom",
+        "--ops-div",
+        "--fresh-process",
+        "--one-process",
+    ] {
+        if a.has(flag) {
+            eprintln!(
+                "{flag} with --resume: a resumed run takes its plan from the ledger\n\n{USAGE}"
+            );
+            return 2;
+        }
+    }
+    if let Some(s) = a.get("--scale") {
+        if Scale::parse(s) != Some(head.plan.scale) {
+            eprintln!(
+                "--scale {s} with a ledger of a {} run",
+                head.plan.scale.as_str()
+            );
+            return 2;
+        }
+    }
+    let Some(out) = ledger.out().map(Path::to_path_buf) else {
+        eprintln!(
+            "bench run: --resume: {} is not under a runs directory",
+            dir.display()
+        );
+        return 2;
+    };
+    if let Some(o) = a.get("--out") {
+        if Path::new(o) != out {
+            eprintln!("--out {o} with a ledger under {}", out.display());
+            return 2;
+        }
+    }
+    let bound_bytes = head.plan.bound_bytes();
+    if a.has("--bound") && a.num("--bound") != bound_bytes {
+        eprintln!(
+            "--bound {} with a ledger under a bound of {}",
+            a.get("--bound").unwrap_or_default(),
+            bound_bytes.map_or_else(|| "none".to_string(), |b| b.to_string())
+        );
+        return 2;
+    }
+    let reps = match a.num("--reps") {
+        Some(r) if (r as usize) < head.plan.reps => {
+            eprintln!(
+                "--reps {r} is fewer than the ledger's {}; a resume may only add reps",
+                head.plan.reps
+            );
+            return 2;
+        }
+        r => r,
+    };
+    let passes_only = a.has("--resume-passes");
+    if let Some(why) = ram_backed_refusal() {
+        eprintln!("bench run: refused: {why}");
+        return 2;
+    }
+    // Then as a run: the root, the scan floor's file under a bound, the
+    // bound, the capture, and the refusal before anything is measured.
+    let root = match run::prepare_root() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("bench run: {e}");
+            return 1;
+        }
+    };
+    if bound_bytes.is_some() {
+        let bytes = run::scan_floor_bytes(head.plan.top, head.plan.value_size);
+        let path = match run::write_scan_floor(&root, bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("bench run: the scan floor's file: {e}");
+                return 1;
+            }
+        };
+        if let Err(e) = run::drop_cache(&path) {
+            eprintln!("bench run: the scan floor's file: {e}");
+            return 1;
+        }
+    }
+    let bound = match bound_bytes.map(enter_bound).transpose() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("bench run: {e}");
+            let _ = std::fs::remove_dir_all(&root);
+            return 1;
+        }
+    };
+    let mut machine = env::capture();
+    machine.mem_limit_bytes = bound.as_ref().map(Bound::limit);
+    if let Some(why) = ledger::refusal(&head, run::sha(), run::rustc(), &machine) {
+        eprintln!("bench run: refused: {why}");
+        let _ = std::fs::remove_dir_all(&root);
+        return 1;
+    }
+    let mut plan = head.plan.clone();
+    plan.bound = bound;
+    if let Some(r) = reps {
+        plan.reps = r as usize;
+    }
+    eprintln!(
+        "bench run: resuming {} ({} scale, {} reps, arms {}, {} earlier sittings{}{})",
+        ledger.dir().display(),
+        plan.scale.as_str(),
+        plan.reps,
+        plan.arms.join(","),
+        head.resumptions.len() + 1,
+        match machine.mem_limit_bytes {
+            Some(b) => format!(", bound {b} bytes"),
+            None => String::new(),
+        },
+        if passes_only {
+            ", a cut rep's passes kept"
+        } else {
+            ""
+        }
+    );
+    let mut log = |s: &str| eprintln!("{s}");
+    let resume = run::Resume {
+        ledger,
+        head,
+        passes_only,
+    };
+    match run::run(&plan, machine, &mut log, Some(&out), &root, Some(resume)) {
+        Ok(row) => finish(row, &out),
+        Err(e) => {
+            eprintln!("run failed: {e}");
+            1
+        }
+    }
+}
+
 fn cmd_run(a: Args) -> i32 {
+    if let Some(dir) = a.get("--resume").map(PathBuf::from) {
+        return cmd_resume(&dir, a);
+    }
+    if a.has("--resume-passes") {
+        eprintln!("--resume-passes is for --resume DIR\n\n{USAGE}");
+        return 2;
+    }
+    if let Some(why) = ram_backed_refusal() {
+        eprintln!("bench run: refused: {why}");
+        return 2;
+    }
     let Some(scale) = a.get("--scale").and_then(Scale::parse) else {
         eprintln!("--scale quick|full|ooc is required\n\n{USAGE}");
         return 2;
@@ -558,25 +836,8 @@ fn cmd_run(a: Args) -> i32 {
         }
     );
     let mut log = |s: &str| eprintln!("{s}");
-    match run::run(&plan, machine, &mut log, Some(&out), &root) {
-        Ok(row) => match row.write(&out) {
-            Ok(p) => {
-                println!("{}", p.display());
-                0
-            }
-            Err(e) => {
-                eprintln!("could not write the row: {e}");
-                1
-            }
-        },
-        // A pass's process killed under the bound ends the run with the
-        // kill's own status, as the pass in this process would have, so
-        // `scripts/ooc.sh` reads it the same; the bound drops first and
-        // leaves no group behind.
-        Err(e) if e.starts_with(run::PASS_KILLED) => {
-            eprintln!("run failed: {e}");
-            137
-        }
+    match run::run(&plan, machine, &mut log, Some(&out), &root, None) {
+        Ok(row) => finish(row, &out),
         Err(e) => {
             eprintln!("run failed: {e}");
             1

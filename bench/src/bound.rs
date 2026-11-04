@@ -114,6 +114,9 @@ pub fn parse_stat(text: &str) -> BoundStat {
 
 /// The group this process runs in while it measures. Dropping it moves
 /// the process back to the group it came from and removes the group.
+/// A clone is attached and not owned, as a deserialized bound is: the
+/// group is one process's to leave and remove, and a plan copied into a
+/// run's ledger (`ledger::Head`) names the group without holding it.
 #[derive(Serialize, Deserialize)]
 pub struct Bound {
     /// The group's directory under the controller's mount.
@@ -297,6 +300,17 @@ impl Bound {
     /// own process was handed (`owned`).
     pub fn is_owned(&self) -> bool {
         self.owned
+    }
+}
+
+impl Clone for Bound {
+    fn clone(&self) -> Bound {
+        Bound {
+            group: self.group.clone(),
+            parent: self.parent.clone(),
+            limit: self.limit,
+            owned: false,
+        }
     }
 }
 
