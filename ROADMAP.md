@@ -70,8 +70,42 @@ The suite has to be fair before any of its numbers are quoted.
   the row leaves: `ZPages::Auto` as the engine's default once its
   in-core cost on the point-read mixes is named; the lag points under
   the bound, where the controller arm's ten-percent point reads 0.3x and
-  every arm's full-rewrite point 0.03x, the latter the merge's streaming
-  of a store rewritten whole; the engine's trimmer running while the
+  every arm's full-rewrite point 0.03x -- half of the full rewrite's
+  pass was the first scan ranking every piece of the burst whole against
+  its partition, and the first scan after the merge's landing ranking
+  them again, which nobody does now (`Options::piece_ranks_whole`, off;
+  `docs/engine.md`, under "against LMDB with its readahead off"), and
+  the rest is the merge streaming the rewritten store twice through a
+  cache that cannot hold it, beside scans that found their keys' pages
+  in the burst's pieces one fault at a time, which a build asks for
+  together now (`Options::pieces_willneed`, the pass 1.5x for it), and
+  the partition's own pages a raw scan takes are asked for the same way
+  (`Options::blocks_willneed`), the drained point level with LMDB for it
+  and the full-rewrite point at 0.12x; the settle's resolves ask for the
+  heads they will seek ahead of them (`Options::heads_willneed`: runs
+  where the batch is dense in a partition, a stride a key ahead where it
+  is sparse, and nothing at a block's build, whose page of heads faults
+  beside the records' ask already), the one-percent point's first scan
+  0.6x of what it was and its cell 1.46x; a merge's landing plans the next
+  merge while reads are around, at the base trigger, and a merge takes its
+  due ranges up to a cap of partition bytes (`Options::merge_chains`,
+  `Options::merge_bytes_cap`), since the planner ran at the seals alone and
+  the full rewrite's pass met the burst's 336 pieces for the whole of it
+  with one merge over every range in flight -- the pass 6.9 s against
+  10.0-10.7, its cell 1.33-1.39x in two sittings, the burst level, and
+  against LMDB at that head the drained pass 1.3x, the one-percent pass
+  level, the ten-percent pass 0.35x and the full rewrite 0.17x, with the
+  weighted cells 1.4-4.5x ours since LMDB's bursts run at 14k updates a
+  second under the bound; the merge's first pass reads its
+  keys off the ordered index's heads now (`Options::merge_keys_by_heads`,
+  the bursts' background reads an operation 1.6-1.75x fewer, the cells
+  within the spread), and what is left there is the merge's second pass
+  streaming its inputs through a cache that cannot hold them -- dropping
+  those pages behind the merge was tried and read slower at every point,
+  since the scans beside it read the same pieces until the landing
+  (`Options::merge_drop_behind`, off) -- and the compact form's shorter
+  pages once the row's read passes have installed it; the engine's
+  trimmer running while the
   store is under a cgroup bound, where free memory is page cache the
   store does not have (`Options::forms_to_fit`'s trim, priced in core
   before it is the default under a bound); and 1 GiB.

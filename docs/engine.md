@@ -5240,7 +5240,9 @@ fourteen cold lines a key, 1-2 ms for a thousand keys over ten thousand,
 and sorted the batch through the arena, a millisecond for five thousand.
 
 The segment work takes the ranks and the pieces' bounds before it
-publishes now (`Maint::rank_before_publish`), at a seal's landing, a
+publishes now (`Maint::rank_before_publish`; the ranks are an arm's
+since, `Options::piece_ranks_whole`, under "against LMDB with its
+readahead off" below), at a seal's landing, a
 merge's, a piece merge's and a promotion's, and the extension orders its
 batch by prefix words and walks the run where the batch is dense in it,
 galloping where it is sparse. Through the probe, the landing's scan at
@@ -6374,6 +6376,297 @@ has 371 KB a scan read by background threads; neither count says why,
 and the candidates, untested, are the seek into the burst's piece, which
 has no ordered index and binary-searches its records, and the merge the
 burst starts streaming the store while the pass runs.
+
+Neither candidate was the pass's first half, and the second was its
+second. Timed scan by scan under the bound (`SUPDB_SCAN_OPS`, the
+`lagops` line) beside the device's and the group's counters over the
+pass (`lagdev`), the full-rewrite pass of 50-54 s over ten thousand
+scans was a first scan of 18.5-19.8 s, one tenth of 17 s in its middle,
+and eight tenths of 1.5-1.8 s around a median scan of 1.5 ms, with
+8.1-8.6 GB read from the device. The first scan was the writer's rebase
+ranking every piece standing against its partition whole
+(`BuildCtx::rank_pieces`): the burst's landings had been far from reads
+and took no ranks (`Options::land_ranks_far`), three to four hundred
+pieces stood, and ranking them read every piece's records through major
+faults, half the device's bytes of the pass; the middle tenth was the
+same ranking again, at the first scan after the merge's landing, every
+piece re-ranked against the partitions the merge had rewritten. Nobody
+ranks a piece whole now (`Options::piece_ranks_whole`, off;
+`supdb-rankswhole` and `supdb-ingestrankswhole` do, the segment work at
+a landing near reads and a reader that meets a piece without them): a
+build finds each piece key's cut where its walk of the partition stops
+at the key, or by one seek over the block's heads where it does not
+walk, the path every build took for a piece without ranks. The first
+version of that cost the ten-percent pass a quarter to two fifths more
+major faults than the ranks had: the cut's compare read the partition's
+record at the cut, a page a sparse build touches for nothing else, for
+an answer the ordered index's heads have wherever a head is a whole key
+(`OrdIndex::seek_in_exact`); the heads answer it now, and the sweep's
+1.6 million cuts read no record (`cut_asks`, `cut_record_reads`). Paired
+at ten million keys under 1.25 GiB, two sittings of a warmup and a pair
+each, `supdb` against `supdb-rankswhole` (`bench ab --arms
+supdb,supdb-rankswhole --size 10000000 --bound 1342177280 --passes
+load,lag --ops-div 10 --reps 1`, under `SUPDB_SCAN_OPS=1` and
+`SUPDB_LAG_COUNTERS=1`): the full-rewrite pass 18.8-19.7 s against
+49.6-52.8 in every sweep, its first scan 111-120 ms against 18.5-19.4 s,
+the device's reads over it 3.9-4.4 GB against 8.1-8.6, the cell 2.6x
+and 2.8x; the ten-percent point's first scan 47-61 ms against 460-865,
+and its pass 3.4-3.7 s against 3.4-4.8 with the compare on the heads
+where it had read 4.0-4.4 against 3.8 with the compare on the records;
+the one-percent point, whose pass is the first scan settling the burst,
+and the drained scans level. In core the two arms run the same code
+wherever no piece stands, which is every drained pass -- `cut_asks`
+reads zero over the whole sweep at a hundred and three hundred thousand
+keys -- and the pairings there, twelve pairs a sitting in both orders,
+disagree in sign between the sittings on every cell that moved, nothing
+marked in both: the 300k sittings read the drained scan pass 1.09x for
+the whole arm twice, one marked, over a store with no piece at that pass
+(`pieces` 0 after the load) and with the two arms' per-scan medians
+interleaved (`scanops`, 2.6-3.3 us against 2.9-3.4), which is the
+position effect and not the arm. What the full-rewrite pass still is: a
+scan of a hundred keys over a store rewritten in random order finds its
+keys in as many pieces, some 35 major faults a scan at the device's
+latency, while the merge that folds the pieces away streams its inputs
+twice -- once for its slices and once for their values -- through a
+cache that cannot hold them, 3.9-4.4 GB read over a pass of 19 s. Paired
+against LMDB with its readahead off the same way (`bench ab --arms
+supdb,lmdb-nordahead ...`, a warmup and a pair), whose lag passes run at
+100-120 us a scan at every point here with 1.7-1.9 faults a scan, the
+sweep read 0.56x at the drained point, 0.78x at one percent, 0.37x at
+ten and 0.07x at the full rewrite, where the row had read 0.03x; the
+scanning thread took 3.4, 0.5, 4.9 and 23 major faults a scan.
+
+The faults a scan still takes at the full rewrite are the pieces': a
+block's updates sit in as many pieces as the burst's seals that touched
+its range, a page in each, and the build read them as it met them, one
+fault at a time, each a device round trip taken alone -- while the
+table's bounds had said where every piece's run over the block lies
+before a record of it was read. A block's build asks the kernel for every
+piece's run first now (`Blob::willneed_ranks`, `MADV_WILLNEED` over the
+span the directory gives; `Options::pieces_willneed`; `supdb-nowillneed`
+and `supdb-ingestnowillneed` read as before), where the controller's gate
+is away from the raw form, the store's own measure of being out of core;
+in core the gate is raw and nothing is asked, since an `madvise` a piece
+a block would cost a build more than it builds, and the count
+(`piece_willneeds`) reads zero through the in-core sweep. Paired at ten
+million keys under 1.25 GiB, a warmup and a pair (`bench ab --arms
+supdb,supdb-nowillneed --size 10000000 --bound 1342177280 --passes
+load,lag --ops-div 10 --reps 1`): the full-rewrite pass 12.2 and 12.7 s
+against 15.7 and 19.0, its median scan 0.85-0.97 ms against 1.32-1.63,
+the scanning thread's major faults 11 a scan against 26 with the
+device's reads over the pass the same 3.6-4.2 GB, the cell 1.5x; the
+ten-percent point within the spread both ways (2.7-4.0 s against
+3.1-3.7), since a ten-percent burst's pieces are 130 MB and sit in the
+cache beside the merge that streams them, so there is nothing to ask
+ahead for, and its five faults a scan are the ones the drained point
+takes too, three and a half of them the partition's own record pages;
+the one-percent point and the drained scans level. A page asked for
+ahead and reached before it has arrived is a fault the kernel counts as
+minor, since the folio is there, so the thread's major faults fall by
+more than its waits do and the pass is read by its time. What is left:
+the partition's own pages a raw scan touches, three to four a scan where
+LMDB's leaves are two, which is the compact form's to shorten and a
+reason the row's sweep runs after the read passes that install it; and
+the merge's two passes over its inputs.
+
+The partition's own pages were asked for the same way next
+(`Options::blocks_willneed`; `supdb-noblockwillneed` and
+`supdb-ingestnoblockwillneed` read as before): a clean block's records
+from the seek, which is the drained store's whole walk, and a block's
+records ahead of its build, for a partition no form file serves and with
+the gate away from raw, at most 64 KB an ask (`WILLNEED_CAP`), since a
+scan's limit can be every rank. The first version asked whether the
+pages were resident or not, and lost the one-percent point 1.4x while
+winning the other three: that point's pages the burst's settle had just
+pulled in, and an `madvise` over resident pages still walks them in the
+kernel, ten to twenty microseconds a scan of five. An ask asks `mincore`
+of the span's first page first now and asks for nothing where it is
+resident (`Bytes::resident_at`), the pieces' asks the same; over the
+sweep at ten million keys 23% of the spans considered were asked for
+(`willneed_asks` against `block_willneeds` and `piece_willneeds`).
+Paired at ten million keys under 1.25 GiB, a warmup and a pair (`bench
+ab --arms supdb,supdb-noblockwillneed --size 10000000 --bound 1342177280
+--passes load,lag --ops-div 10 --reps 1`): the drained point 1.12 and
+1.26 s against 1.88 and 1.94, its scanning thread 0.9 major faults a
+scan against 2.7, the cell 1.7x; the ten-percent point 2.7 and 2.8 s
+against 1.9 and 4.0, 2.5 faults a scan against 4.9, the cell 1.5x in the
+pair; the full-rewrite point 9.9 and 10.1 s against 10.6 and 13.1, 7.3
+faults against 12.7, 1.3x; the one-percent point 0.61 and 0.62 s against
+1.0 and 1.6 here, and against 0.49 and 0.50 in the pairing before the
+residency check, where it had read 0.70 and 0.77 -- its scans after the
+first 20 us against 6, the checks and the asks that found a page cold.
+Against LMDB's figures from the pairing before these two asks, the
+drained point stands level (1.1-1.3 s against 1.15-1.17), the
+one-percent point at 0.6x, which is the first scan settling the burst
+where LMDB has nothing to settle, the ten-percent point at 0.4x and the
+full-rewrite point at 0.12x, where the row had 0.03x.
+
+The merge's two passes over its inputs were the other half of the device's
+bytes under the full rewrite: the first pass reads every input's keys for
+the slices it cuts, the second reads them again for the values, and both
+read the records, so a store of 1.3 GB rewritten whole streamed 5.2
+through a cache that holds a third of it. The first pass reads each
+input's keys off its ordered index's heads now where a head is a whole
+key (`Options::merge_keys_by_heads`, `OrdIndex::whole_key_at`; eight
+bytes a key, the index opened beside the records and its prefix learned
+off the first key as `Seg::open` learns it), and off the records only
+for an input whose keys are not one length; `supdb-mergerecordkeys` and
+`supdb-ingestmergerecordkeys` read as before, and the merges' inputs are
+counted by their source (`merge_head_inputs`, `merge_record_inputs`).
+The two shapes write the same files byte for byte, the superblock's
+clock aside, which `tests/fences.rs` holds over keys of one length and of
+two. Paired at ten million keys under 1.25 GiB, a warmup and a pair
+(`bench ab --arms supdb,supdb-mergerecordkeys ...`): the background
+threads' reads an operation fell 1.75x through the full-rewrite burst
+and 1.6x through the one-percent burst, where the merges' first passes
+run, while every lag cell's pair and warmup disagreed in sign and the
+pass's device reads stayed the scans' own (1.75-1.89 GB against
+1.73-2.06), since the first passes fall mostly in the burst. In core a
+run has one or two merges (ten and twelve inputs at a hundred and three
+hundred thousand keys), the arms run the same code otherwise, and the
+pairings there, twelve pairs a sitting in both orders, disagree in sign
+between the sittings on every cell that moved, the update mix's marked
+cell included (1.41x for the records' pass in one sitting at a hundred
+thousand keys, 1.14x for the heads' in one at three hundred thousand,
+1.32x for the records' in the other), a mix whose rate the seal's timing
+makes bimodal at these rungs.
+
+The next reading was wrong, and is kept as an arm for the record
+(`Options::merge_drop_behind`, off; `supdb-mergedropbehind` and
+`supdb-ingestmergedropbehind` drop). It said that the second pass's
+input pages, read once and retired at the landing, stand in the cache as
+the newest for nothing and push out what the scans beside the merge are
+reading, so the merge should drop them behind itself (`MADV_DONTNEED`
+and `POSIX_FADV_DONTNEED` over the records a chunk behind the walk,
+`Blob::drop_records`). Paired at ten million keys under 1.25 GiB, a
+warmup and a pair, the drop read slower in every sweep: the drained lag
+point 1.13-1.26 s against 0.88-1.05, the ten-percent point 3.1 s against
+2.2-2.4 with 3.2 major faults a scan against 2.4, the full rewrite
+9.8-10.7 against 9.3-9.9, and more read from the device at every point
+(644-694 MB against 449-508 over the ten-percent pass), 3.3 GB dropped
+over the sweep. A merge's inputs are the live pieces and the partition
+under rewrite, which is what every scan beside it reads until the
+landing, so the pages the merge had just streamed were the scans' next
+hits and the kernel's recency was keeping the right ones. The rule the
+refutation gives: a page is dropped behind a walk only when nothing else
+reads the object the walk is consuming, and a merge's inputs are read by
+everyone until they are gone.
+
+The one-percent point's first scan is the burst's settle, and a resolve is
+a seek over one stride of a partition's heads, a page cold under the
+bound: the settle of the burst's hundred thousand keys took its faults one
+at a time on one thread, the whole of that scan. The heads are asked for
+ahead of the resolves now (`Options::heads_willneed`;
+`supdb-noheadwillneed` and `supdb-ingestnoheadwillneed` seek them as they
+meet them), gated as the records' asks are, in two shapes by the batch's
+density in the partition as the pages its keys resolve to read it: dense,
+each key's page the one before's or the next, and the asks are runs of
+sixty-four kilobytes of heads from the page after the one the key resolved
+to, kept half a megabyte ahead as eight requests (`SETTLE_RUN`,
+`SETTLE_LEAD`); sparse, and a cursor sixty-four keys ahead in the batch
+asks each key's stride, found from the top level in memory
+(`SETTLE_AHEAD`), which reads no page the batch will not. Paired at ten
+million keys under 1.25 GiB, a warmup and a pair (`bench ab --arms
+supdb,supdb-noheadwillneed --size 10000000 --bound 1342177280 --passes
+load,lag --ops-div 10 --reps 1`): the one-percent point's first scan 248
+and 276 ms against 427 and 460, its settle 216 and 249 against 387 and
+401, the pass 0.45 and 0.46 s against 0.65 and 0.66 with 2,700 and 3,000
+major faults against 5,200 and 6,400, the cell 1.46x; the ten-percent
+point 2.4 and 2.8 s against 2.7 and 4.5; the full rewrite 9.6 and 9.8
+against 9.8 and 10.9, 7.2 major faults a scan against 8.9; the drained
+point 1.0 and 1.2 against 1.2 and 1.3; 74,000 asks over the sweep and
+2,300 of them submitted, the rest finding their first page resident.
+Three shapes were paired before it, the same way. An ask a key, the
+stride's page a window of keys ahead, took the first scan to 259 and 286
+ms against 463 and 482 and the full-rewrite pass to 11.3 s against 10.0,
+half a second of it a syscall a key over ten million resolves. Runs of
+sixty-four kilobytes asked half a run ahead kept a tenth of the gain and
+the whole of the loss, which was not the settle's: a block's build asked
+for the page of heads its cuts seek the microsecond before the seek, which
+is the fault with a syscall before it -- the records' ask, already issued,
+is what that fault overlaps -- and the pass took more major faults an
+operation with it than without, 9.0 against 7.4 at the full rewrite and
+1.1 against 0.9 at the drained store, where it saved nothing; the build
+asks nothing now. Runs of 256 KB kept half a run ahead ran the settle in
+317 ms against 399 and saved three faults in ten: at five keys a page half
+a run is 0.8 ms of resolves, under the run's own round trip and transfer,
+so the settle waited on most of its runs, and the lead is sized by the
+resolves between the ask and the touch at the sparsest density the dense
+shape admits, not by the pages it covers. In core the gate is raw and
+`head_asks` reads zero through the sweep.
+
+What the pass met after the full-rewrite burst was the burst's pieces, 336
+of them, seventeen a range, a page of each in every block's build (527,000
+piece runs asked for over a sweep, twenty a block), and they stood for the
+whole pass: the planner ran at a seal's durable landing alone
+(`Maint::landed_decisions`), a merge's own landing planned nothing, and one
+merge took every due range, so after the burst's last seal one merge over
+the whole store was in flight, landed all nineteen ranges at once at its
+end, and nothing started another while the pass read. A merge's landing
+plans the next now, while reads are around -- the store's scan life moved
+since the last landing -- and at the base trigger (`Options::merge_chains`;
+`supdb-nomergechain` and `supdb-ingestnomergechain` plan at seals alone),
+and a merge takes the due ranges in key order up to a cap of partition
+bytes, at least one, leaving the rest to the next plan
+(`Options::merge_bytes_cap`, 64 MB, a range at ten million keys;
+`supdb-mergeuncapped` and `supdb-ingestmergeuncapped` take them all), so
+out of core the ranges land one at a time while in core, where a store's
+partitions are megabytes, nothing splits. A settle joins the merge in
+flight and plans nothing, as before; the landings' plans and the merges
+landed are counted (`SealWaits::plans`, `SealWaits::merges`; `merge_plans`
+and `merges_landed` in the suite). Paired at ten million keys under
+1.25 GiB, a warmup and a pair (`bench ab --arms supdb,supdb-nomergechain
+--size 10000000 --bound 1342177280 --passes load,lag --ops-div 10 --reps
+1`): the full-rewrite pass 6.9 s in both rounds against 10.7 and 10.0, 6.2
+major faults a scan against 8.6 and 1.3-1.5 GB read from the device
+against 1.9-3.8, with the burst's rate level (428,000 updates a second
+against 435,000) and 286 pieces standing at the pass against 336, the cell
+1.385x, after 1.33x in the sitting before; the ten-percent point 0.88x on
+a burst 8% slower and a pass faster in one round and slower in the other,
+with the same 24 pieces and the same 3.1 faults a scan in both arms; the
+one-percent point 0.92x, 1.16x in the sitting before; the drained point
+level; the sweep's sum 1.23x. Three shapes were paired before this one,
+the same way, and each taught something the previous had hidden. Chained
+without a cap the pass met the same 336 pieces, the one merge in flight
+through the whole of it, so the cap is what drains them. Capped at 256 MB
+and chained through the burst as well, the pass met 108 to 192 pieces and
+ran 5.3 to 9.5 s against 9.0 to 11.7, but the chained merges ran beside the
+burst's writes and the burst's rate fell a seventh (378,000 against
+433,000), the weighted cell 0.95x with the ten-percent and one-percent
+points 0.93x and 0.95x: so the chain is gated on reads around, and a
+write-only stretch keeps its seals' plans. Gated on reads at the trigger
+reads lower (`l0_trigger_now`), the full rewrite read 1.33x and the
+ten-percent point 0.73x: its pass took 2.9 major faults a scan against 2.0
+with the same 24 pieces standing, the chain rewriting partitions of
+seventy megabytes to fold a piece or two each, one after another, through
+the pass, since that trigger paces the seals' plans, a merge a seal at
+most, and gave a chain no pace. The suite's weighted cell charges the
+burst and the pass and nothing after, so a policy that leaves the pieces
+for later wins both cells and pays in the pass nobody measured: the pieces
+standing at each point are read beside the cells (`pieces` in the lag
+counters). In core the arms run the same code (`bench/scripts/pair.sh supdb
+supdb-nomergechain 100000` and `300000`, twelve pairs a sitting in both
+orders): one and two merges landed in each arm, eleven and thirteen plans
+each, and no cell was marked in either sitting, since the merges land
+under the load with no read around and the partitions fit a merge's cap
+whole.
+
+Paired against LMDB with its readahead off at the head that holds all of
+these (`bench ab --arms supdb,lmdb-nordahead --size 10000000 --bound
+1342177280 --passes load,lag --ops-div 10 --reps 1`, a warmup and a pair):
+the drained pass 0.78 and 0.86 s against 1.02 and 1.20, the one-percent
+pass 0.34 and 0.43 against 0.33 and 0.35 (its first scan the burst's
+settle, 217 and 331 ms), the ten-percent pass 2.5 and 2.7 s against 0.86
+and 1.0 with 3.0 major faults a scan against 1.8, and the full-rewrite pass
+6.3 and 6.5 s against 1.1 with 5.9 faults a scan against 2.0 -- 0.17x
+where the row had 0.03x. LMDB's bursts run at 14,000 updates a second
+under the bound against our 350,000 to 430,000, so the suite's weighted
+cells, the burst and the pass together, read 1.9x, 1.4x and 4.5x in our
+favour at the three points and 3.6x over the sweep, and the shuffled load
+10x. What the full-rewrite pass still pays is the pieces standing at its
+start and the merges' streaming beside its scans, and the ten-percent
+pass's three faults a scan against LMDB's 1.8 are the next thing to take
+apart.
 
 #### Out of core: the second form
 

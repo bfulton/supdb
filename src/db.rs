@@ -401,6 +401,24 @@ pub enum ZPages {
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ZCounts {
+    /// Cuts a block's build asked of the raw form's heads, and those whose
+    /// compare read the record because the heads could not say
+    /// (`BuildCtx::cut_at`).
+    pub cuts: u64,
+    pub cut_records: u64,
+    /// Pieces' runs a block's build asked the kernel for ahead of reading
+    /// them, out of core (`Options::pieces_willneed`).
+    pub piece_willneeds: u64,
+    /// Raw partition spans a scan asked the kernel for ahead of walking
+    /// them, out of core (`Options::blocks_willneed`).
+    pub block_willneeds: u64,
+    /// Of the spans counted above, those submitted to the kernel: the rest
+    /// had their first page resident and were left alone.
+    pub willneed_asks: u64,
+    /// Runs and strides of heads a settle asked for ahead of the resolves
+    /// that seek them, and those submitted (`Options::heads_willneed`).
+    pub head_asks: u64,
+    pub head_submitted: u64,
     /// Point reads and counts of a partition answered from its form file.
     pub reads: u64,
     pub counts: u64,
@@ -816,6 +834,39 @@ pub struct Options {
     /// order (the default) rather than by collecting, sorting and probing
     /// them. The probe path is kept as the comparison arm.
     pub cursor_merge: bool,
+    /// A merge's first pass -- every distinct key once, in order, for the
+    /// slices it cuts -- reads each input's keys off its ordered index's
+    /// heads where a head is a whole key (`OrdIndex::whole_key_at`), eight
+    /// bytes a key, and off the records only for an input whose keys are
+    /// not one length. Off, both passes read the records, the first for
+    /// the keys and the second for the values, so a merge streamed its
+    /// inputs through the page cache twice: 5.2 GB for a store of 1.3
+    /// rewritten whole at ten million keys under 1.25 GiB, while the scans
+    /// of the full-rewrite lag point faulted beside it.
+    /// `supdb-mergerecordkeys` and `supdb-ingestmergerecordkeys` read as
+    /// before.
+    pub merge_keys_by_heads: bool,
+    /// REFUTED: a merge drops its inputs' record pages from the page cache
+    /// as its second pass leaves them behind (`Blob::drop_records` and
+    /// `POSIX_FADV_DONTNEED`, every `merge_drop_chunk` bytes, a page short
+    /// of the record it stands on), on the reading that the inputs are read
+    /// once and retired at the landing, so the pages it has streamed stand
+    /// in the cache as the newest for nothing and push out what the scans
+    /// beside it are reading. The reading was wrong about who reads them:
+    /// a merge's inputs are the live pieces and the partition under
+    /// rewrite, which is what every scan beside it reads until the landing,
+    /// and the kernel's recency was keeping exactly those. Paired at ten
+    /// million keys under 1.25 GiB the drop read slower in every sweep: the
+    /// drained lag point 1.13-1.26 s against 0.88-1.05, the ten-percent
+    /// point 3.1 s against 2.2-2.4, the full rewrite 9.8-10.7 against
+    /// 9.3-9.9, with more read from the device at each. Off; the arm
+    /// `supdb-mergedropbehind` and `supdb-ingestmergedropbehind` drops.
+    pub merge_drop_behind: bool,
+    /// How far a merge's second pass runs past the pages it last dropped
+    /// before it drops again (`merge_drop_behind`): a drop is two
+    /// syscalls, and two megabytes is a few hundred records a page. A
+    /// test lowers it to reach a drop over a store of kilobytes.
+    pub merge_drop_chunk: u64,
     /// I/O priority of the seal and merge threads.
     pub background_io: BackgroundIo,
     /// Have the segment writer fdatasync every this many bytes as it
@@ -2838,9 +2889,10 @@ pub struct Options {
     /// were taken in. On, `supdb-sealcopyfar` and
     /// `supdb-ingestsealcopyfar`.
     pub seal_snapshot_far: bool,
-    /// A landing far from reads takes its pieces' ranks and bounds
-    /// against their partitions before it publishes, as every landing
-    /// does near them (`Maint::rank_before_publish`). Off, the default, a
+    /// A landing far from reads takes its pieces' bounds -- and their
+    /// ranks, under `piece_ranks_whole` -- against their partitions before
+    /// it publishes, as every landing does near them
+    /// (`Maint::rank_before_publish`). Off, the default, a
     /// landing while the writer's last seal was far from every scan
     /// (`reads_around`, as `seal_snapshot_far` asks it; a drain's seal
     /// counts as near, since a flush is a writer saying it has stopped
@@ -2855,6 +2907,92 @@ pub struct Options {
     /// away before anything reads them. On, `supdb-ranksfar` and
     /// `supdb-ingestranksfar`.
     pub land_ranks_far: bool,
+    /// A level-0 piece's keys ranked against its partition whole -- every
+    /// key's cut in one forward walk, kept on the piece under the
+    /// partition's identity (`Seg::ranks`) -- by the segment work before
+    /// it publishes the piece near reads (`Maint::rank_before_publish`)
+    /// and by a reader that meets a piece without them
+    /// (`BuildCtx::rank_pieces`). Off, the default, nobody does: a build
+    /// finds each piece key's cut where its walk of the partition stops at
+    /// the key, or by one seek over the block's heads where it does not
+    /// walk, as it always did for a piece holding none. Under a bound the
+    /// whole ranking was the first scan after the full rewrite at ten
+    /// million keys: the burst's landings were far from reads and took
+    /// none, so the writer's rebase ranked every piece standing -- three
+    /// to four hundred of them, the store's records once more -- through
+    /// major faults for twenty seconds before the scan that asked walked
+    /// a block, and the scans after it read every piece key's cut from a
+    /// rank the walk was about to reach anyway. On, `supdb-rankswhole`
+    /// and `supdb-ingestrankswhole`.
+    pub piece_ranks_whole: bool,
+    /// Out of core, a block's build asks the kernel for every piece's
+    /// records over the block before it reads any of them
+    /// (`Blob::willneed_ranks`), where it read them as it met them, one
+    /// fault at a time. After a burst a block's updates sit in as many
+    /// pieces as the burst's seals that touched its range, a page in
+    /// each, and under 1.25 GiB at ten million keys the ten-percent lag
+    /// pass read nine major faults a scan at some 260 us a scan, each
+    /// fault a device round trip taken alone, while LMDB's scan over the
+    /// same keys took one. Asked only while the controller's gate is away
+    /// from the raw form -- the census running or the compact form served
+    /// (`Options::zpages`) -- which is the store's own measure of being
+    /// out of core; in core the gate is raw and nothing is asked, since
+    /// an `madvise` a piece a block would cost a build more than it
+    /// builds. Off, `supdb-nowillneed` and `supdb-ingestnowillneed`.
+    pub pieces_willneed: bool,
+    /// Out of core, a scan asks the kernel for the raw partition records
+    /// it is about to walk before it walks them -- a clean block's records
+    /// from the seek, and a block's records ahead of its build
+    /// (`Blob::willneed_ranks`, at most `WILLNEED_CAP` bytes an ask) --
+    /// where the records were read as the walk met them, a fault a page
+    /// each, and a scan of a hundred keys over a drained store took three
+    /// to four, in turn. Asked only for a partition no form file serves
+    /// and while the controller's gate is away from the raw form, as
+    /// `pieces_willneed` is. Off, `supdb-noblockwillneed` and
+    /// `supdb-ingestnoblockwillneed`.
+    pub blocks_willneed: bool,
+    /// Out of core, the heads a settle's resolves will seek asked of the
+    /// kernel ahead of them (`OrdIndex::willneed_heads`): runs of them
+    /// where the batch is dense in a partition, the strides of the keys a
+    /// window ahead where it is sparse (`SETTLE_RUN`, `SETTLE_LEAD`,
+    /// `SETTLE_AHEAD`). A
+    /// burst's batch resolved one fault at a time was the whole of the
+    /// first scan after it under 1.25 GiB at ten million keys, ten to
+    /// fourteen thousand faults in a row on one thread. A block's build
+    /// asks nothing for the seek its cuts make: their one page faults
+    /// beside the records' ask already, and asked the microsecond before
+    /// it was seized it saved nothing and took more major faults. Gated as
+    /// `blocks_willneed` is: the gate away from raw, a partition no form
+    /// file serves. Off, `supdb-noheadwillneed` and
+    /// `supdb-ingestnoheadwillneed`.
+    pub heads_willneed: bool,
+    /// A merge's landing plans the next merge while reads are around -- a
+    /// scan since the last landing -- as a seal's durable landing plans
+    /// one (`Maint::collect`): the planner ran at a seal's landing alone,
+    /// so after a burst's last seal the pieces it left stood for as long as
+    /// nothing wrote, the whole of a read pass under a bound, 336 of them
+    /// at the full rewrite of ten million keys under 1.25 GiB, seventeen a
+    /// range, a page of each in every block's build, with one merge in
+    /// flight and nothing to start the next. A write-only stretch keeps
+    /// its seals' plans: chained through a burst as well, the merges ran
+    /// beside the burst's writes and the burst paid a seventh. The chain
+    /// plans at the base trigger (`l0_trigger`) and not the one reads
+    /// lower, which paces the seals' plans and gave a chain no pace: it
+    /// rewrote partitions to fold a piece or two each while the
+    /// ten-percent pass read, a quarter slower for it. Off, a landing
+    /// plans nothing: `supdb-nomergechain` and `supdb-ingestnomergechain`.
+    pub merge_chains: bool,
+    /// The most bytes of partitions one merge rewrites, under
+    /// `merge_chains`: the due ranges are taken in key order up to it, at
+    /// least one, and the rest wait for the next plan, so a store out of
+    /// core lands a range or a few at a time where one merge over every
+    /// due range landed them all at once at its end -- chained without a
+    /// cap, the pass after a full rewrite met the same 336 pieces as
+    /// without the chain, the one merge in flight through the whole of it.
+    /// Zero takes every due range: `supdb-mergeuncapped` and
+    /// `supdb-ingestmergeuncapped`. A wide piece's ranges stay one merge
+    /// whatever the cap (`Maint::cover_inputs`).
+    pub merge_bytes_cap: u64,
     /// A seal writes a key whose chain holds one value and no tombstone
     /// -- every key of a load, and most of any table -- through the
     /// writer's one-value path (`SegmentWriter::put_one`), the record
@@ -3306,6 +3444,9 @@ impl Default for Options {
             compact: true,
             partition_on_flush: true,
             cursor_merge: true,
+            merge_keys_by_heads: true,
+            merge_drop_behind: false,
+            merge_drop_chunk: 2 << 20,
             background_io: BackgroundIo::Normal,
             seal_sync_every: 0,
             inline_bytes: 256,
@@ -3451,6 +3592,12 @@ impl Default for Options {
             drain_snapshot: true,
             seal_snapshot_far: false,
             land_ranks_far: false,
+            piece_ranks_whole: false,
+            pieces_willneed: true,
+            blocks_willneed: true,
+            heads_willneed: true,
+            merge_chains: true,
+            merge_bytes_cap: 64 << 20,
             seal_put_one: true,
             close_presync: true,
             ord_durable: false,
@@ -4317,7 +4464,9 @@ struct Seg {
     /// shared vector and reads it at every block build after: a lookup
     /// per block build and piece, when it was a lock, bounced the lock's
     /// word between a builder's thread and the scan's, twenty-two pieces
-    /// a block at three million keys.
+    /// a block at three million keys. Taken at all only under
+    /// `Options::piece_ranks_whole`; a piece without them has each key's
+    /// cut found at the build, where the walk stops at the key.
     ranks: IdCache<Vec<u32>>,
     /// Where this piece's positions fall against a partition's block
     /// boundaries, by the partition's blob id: a function of two sealed
@@ -8834,6 +8983,26 @@ struct Slot {
     zraw: AtomicU64,
     zfallbacks: AtomicU64,
     zscans: AtomicU64,
+    /// Cuts a block's build asked of the raw form's heads (`cache_cut`),
+    /// and those whose compare had to read the record because the heads
+    /// could not say (`OrdIndex::seek_in_exact`): none in a store whose
+    /// keys are one length.
+    zcuts: AtomicU64,
+    zcutrecs: AtomicU64,
+    /// Pieces' runs a block's build asked the kernel for ahead of reading
+    /// them (`Options::pieces_willneed`).
+    zwillneeds: AtomicU64,
+    /// Raw partition spans a scan asked the kernel for ahead of walking
+    /// them (`Options::blocks_willneed`).
+    zblkwillneeds: AtomicU64,
+    /// Of the spans above, pieces' and partitions', those the kernel was
+    /// asked for: the rest had their first page resident and were not.
+    zwillneedasks: AtomicU64,
+    /// Runs and strides of a partition's heads a settle asked for ahead
+    /// of the resolves that seek them, and those submitted
+    /// (`Options::heads_willneed`).
+    zheadasks: AtomicU64,
+    zheadsubmitted: AtomicU64,
     /// Partition walks of a scan served by a form file, the groups decoded
     /// for them, and the runs of records no page holds the raw form walked
     /// inside them.
@@ -8907,6 +9076,13 @@ impl Slot {
             zraw: AtomicU64::new(0),
             zfallbacks: AtomicU64::new(0),
             zscans: AtomicU64::new(0),
+            zcuts: AtomicU64::new(0),
+            zcutrecs: AtomicU64::new(0),
+            zwillneeds: AtomicU64::new(0),
+            zblkwillneeds: AtomicU64::new(0),
+            zwillneedasks: AtomicU64::new(0),
+            zheadasks: AtomicU64::new(0),
+            zheadsubmitted: AtomicU64::new(0),
             zscanz: AtomicU64::new(0),
             zscangroups: AtomicU64::new(0),
             znopagescans: AtomicU64::new(0),
@@ -10816,6 +10992,15 @@ struct MergePlan {
     sync_every: usize,
     inline_max: usize,
     ord_durable: bool,
+    /// The first pass's keys off the inputs' heads where they can be
+    /// (`Options::merge_keys_by_heads`), and where the inputs' sources are
+    /// counted (`Shared::merge_head_inputs`).
+    heads: bool,
+    counts: Option<std::sync::Arc<Shared>>,
+    /// The inputs' pages dropped behind the second pass, every this many
+    /// bytes (`Options::merge_drop_behind`, `Options::merge_drop_chunk`).
+    drop_behind: bool,
+    drop_chunk: u64,
 }
 
 fn compact_job(plan: MergePlan) -> Result<Vec<String>> {
@@ -11136,6 +11321,75 @@ fn merge_ranks(
     }
 }
 
+/// `merge_ranks` for a merge's first pass, which wants the keys alone: an
+/// input with an ordered index in `ords` reads each key off its heads
+/// (`OrdIndex::whole_key_at`), eight bytes a key and no record touched,
+/// and an input without reads the record as `merge_ranks` does
+/// (`Options::merge_keys_by_heads`). The keys stand in a buffer an input
+/// each, filled for every input at the head of a step and compared by
+/// index, since a borrow of one input's buffer cannot stand while
+/// another's is written.
+fn merge_keys(
+    blobs: &[Blob<MmapBytes>],
+    ords: &[Option<crate::ordindex::OrdIndex>],
+    mut f: impl FnMut(&[u8], &[(usize, usize)]) -> Result<()>,
+) -> Result<()> {
+    let n: Vec<usize> = blobs.iter().map(|b| b.keys()).collect();
+    let mut rank = vec![0usize; blobs.len()];
+    let mut bufs: Vec<Vec<u8>> = vec![Vec::new(); blobs.len()];
+    let mut have = vec![false; blobs.len()];
+    let mut tied: Vec<(usize, usize)> = Vec::with_capacity(blobs.len());
+    loop {
+        for i in 0..blobs.len() {
+            have[i] = false;
+            if rank[i] >= n[i] {
+                continue;
+            }
+            let by_heads = match &ords[i] {
+                Some(o) => o.whole_key_at(rank[i], &mut bufs[i]).is_some(),
+                None => false,
+            };
+            if !by_heads {
+                let k = blobs[i]
+                    .key_at(rank[i])
+                    .ok_or_else(|| err("segment key walk: a rank the index does not have"))?;
+                bufs[i].clear();
+                bufs[i].extend_from_slice(k);
+            }
+            have[i] = true;
+        }
+        let mut min: Option<usize> = None;
+        tied.clear();
+        for i in 0..blobs.len() {
+            if !have[i] {
+                continue;
+            }
+            match min {
+                None => {
+                    min = Some(i);
+                    tied.push((i, rank[i]));
+                }
+                Some(m) => match bufs[i].as_slice().cmp(bufs[m].as_slice()) {
+                    std::cmp::Ordering::Less => {
+                        min = Some(i);
+                        tied.clear();
+                        tied.push((i, rank[i]));
+                    }
+                    std::cmp::Ordering::Equal => tied.push((i, rank[i])),
+                    std::cmp::Ordering::Greater => {}
+                },
+            }
+        }
+        let Some(m) = min else {
+            return Ok(());
+        };
+        f(&bufs[m], &tied)?;
+        for &(i, _) in &tied {
+            rank[i] += 1;
+        }
+    }
+}
+
 /// One output of a merge: the ranks it holds, the fence it must contain,
 /// and its names on disk.
 struct Piece {
@@ -11296,6 +11550,10 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         sync_every,
         inline_max,
         ord_durable,
+        heads,
+        counts,
+        drop_behind,
+        drop_chunk,
     } = plan;
     if background_io == BackgroundIo::Idle {
         idle_io_priority();
@@ -11314,11 +11572,39 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         );
     }
 
+    // The inputs' ordered indexes, for the first pass's keys where a head
+    // is a whole key (`Options::merge_keys_by_heads`): opened beside the
+    // records, the prefix learned off each input's first key as
+    // `Seg::open` learns it. An input whose heads cannot say, or whose
+    // index will not open, reads its keys off the records as before.
+    let ords: Vec<Option<crate::ordindex::OrdIndex>> = inputs
+        .iter()
+        .zip(&blobs)
+        .map(|(name, b)| {
+            if !heads {
+                return None;
+            }
+            let oname = Db::ord_name_for(name)?;
+            let mut ord = crate::ordindex::OrdIndex::open(&dir.join(&oname), b.keys()).ok()?;
+            ord.learn_prefix(b.key_at(0)?);
+            let mut buf = Vec::new();
+            ord.whole_key_at(0, &mut buf)?;
+            Some(ord)
+        })
+        .collect();
+    if let Some(c) = &counts {
+        let by_heads = ords.iter().filter(|o| o.is_some()).count() as u64;
+        c.merge_head_inputs
+            .fetch_add(by_heads, AtomicOrdering::Relaxed);
+        c.merge_record_inputs
+            .fetch_add(inputs.len() as u64 - by_heads, AtomicOrdering::Relaxed);
+    }
+
     // Pass one: every distinct key once, in order, into the slicer, which
     // holds only what the slices are taken from (`Slicer`).
     let mut slicer = Slicer::new(fences.as_deref(), parts, max_keys);
     let all: Vec<Vec<u8>> = if cursors {
-        merge_ranks(&blobs, |k, _| {
+        merge_keys(&blobs, &ords, |k, _| {
             slicer.push(k);
             Ok(())
         })?;
@@ -11392,11 +11678,47 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
     // key the inputs older than its newest flagged extent are dropped, the
     // flag itself is not carried, and a key with nothing live is left out
     // -- which is how a delete gets its bytes back.
+    // The inputs' files beside their mappings, for the drop of the pages
+    // behind the second pass (`Options::merge_drop_behind`): each input's
+    // records dropped from its last drop to a page short of the record the
+    // walk stands on, once the walk is a chunk past the last drop.
+    let files: Vec<Option<std::fs::File>> = if drop_behind {
+        inputs
+            .iter()
+            .map(|name| std::fs::File::open(dir.join(name)).ok())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut dropped_to: Vec<u64> = blobs
+        .iter()
+        .map(|b| b.record_offset(0).unwrap_or(0))
+        .collect();
+    let mut dropped_bytes = 0u64;
+    let mut drop_at = |i: usize, rank: usize| {
+        if !drop_behind {
+            return;
+        }
+        let Some(off) = blobs[i].record_offset(rank) else {
+            return;
+        };
+        let to = off.saturating_sub(4096) & !4095;
+        if to < dropped_to[i].saturating_add(drop_chunk.max(4096)) {
+            return;
+        }
+        blobs[i].drop_records(dropped_to[i], to);
+        if let Some(f) = files.get(i).and_then(|f| f.as_ref()) {
+            fadvise_dontneed_range(f, dropped_to[i], to - dropped_to[i]);
+        }
+        dropped_bytes += to - dropped_to[i];
+        dropped_to[i] = to;
+    };
     if cursors {
         merge_ranks(&blobs, |k, tied| {
             let mut start = 0usize;
             let mut live = 0u64;
             for (j, &(i, rank)) in tied.iter().enumerate() {
+                drop_at(i, rank);
                 let Some((_, exts)) = blobs[i].exts_at(rank) else {
                     return Err(err("segment key walk: a rank the index does not have"));
                 };
@@ -11448,6 +11770,10 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
                 Ok(())
             })?;
         }
+    }
+    if let Some(c) = &counts {
+        c.merge_dropped_bytes
+            .fetch_add(dropped_bytes, AtomicOrdering::Relaxed);
     }
     let mut out = em.finish(total)?;
     out.extend(empties);
@@ -11702,6 +12028,8 @@ struct SealCounts {
     publishes: AtomicU64,
     seal_ns: AtomicU64,
     merge_ns: AtomicU64,
+    merges: AtomicU64,
+    plans: AtomicU64,
     held_landings: AtomicU64,
     /// The seal thread's phases, summed over seals: the sort of the frozen
     /// table, the snapshot's build and publish, and the record loop.
@@ -11748,6 +12076,8 @@ impl SealCounts {
             joins: get(&self.joins),
             publishes: get(&self.publishes),
             held_landings: get(&self.held_landings),
+            merges: get(&self.merges),
+            plans: get(&self.plans),
             seal_sort_ns: get(&self.seal_sort_ns),
             seal_snap_ns: get(&self.seal_snap_ns),
             seal_records_ns: get(&self.seal_records_ns),
@@ -11781,6 +12111,11 @@ pub struct SealWaits {
     /// landing writes the manifest. One per look, so a merge held across
     /// several polls counts several.
     pub held_landings: u64,
+    /// Partition merges landed, and the plans landings made: a seal's
+    /// durable landing plans the merges the landed set makes due, and so
+    /// does a merge's own under `Options::merge_chains`.
+    pub merges: u64,
+    pub plans: u64,
     /// The seal thread's phases, summed over seals: sorting the frozen
     /// table, building and publishing its snapshot (`Options::seal_snapshot`),
     /// writing the records, and the thread's whole run.
@@ -12634,6 +12969,30 @@ fn block_bounds_of(
 /// the list is full.
 const FROZEN_CAP: usize = 3;
 
+/// A settle's asks for the heads ahead of its resolves
+/// (`Options::heads_willneed`). Where a batch is dense in a partition --
+/// each key's page the one before's or the next -- the asks are runs of
+/// `SETTLE_RUN` heads, sixty-four kilobytes and sixteen pages each, one
+/// device request, issued from the page after the one the key resolved to
+/// until the frontier stands `SETTLE_LEAD` heads past the rank: half a
+/// megabyte of heads in flight as eight requests, which at the
+/// one-percent burst's density of five keys a page is a lead of a few
+/// hundred resolves, several round trips. A lead of half a 256 KB run
+/// left the settle waiting on most of its runs there, the asks saving
+/// three faults in ten. Where the batch is sparse the asks are the
+/// strides of the keys `SETTLE_AHEAD` ahead in it, a page each, which
+/// reads no page the batch will not: a run for a batch of fifty keys
+/// over a store would read sixteen pages a key.
+const SETTLE_RUN: usize = 8192;
+const SETTLE_LEAD: usize = 65536;
+const SETTLE_AHEAD: usize = 64;
+
+/// The most a scan asks the kernel for ahead of one walk
+/// (`Options::blocks_willneed`, `Options::pieces_willneed`): a scan's
+/// limit can be every rank of a partition, and a block's records are a
+/// few pages.
+const WILLNEED_CAP: usize = 64 << 10;
+
 /// What a reader reads: the store as of a publish. The writer builds a
 /// new one at every seal, join, merge or freeze and swaps it in whole,
 /// so a reader that loaded the old one keeps it, unchanged, until its
@@ -13089,6 +13448,14 @@ struct Shared {
     /// path's: the two together are every scan, which is what a seal
     /// asks before it builds its copy (`Options::seal_snapshot_far`).
     scans_merged: AtomicU64,
+    /// A merge's inputs by where its first pass read their keys: off the
+    /// ordered index's heads, and off the records
+    /// (`Options::merge_keys_by_heads`; `Db::merge_key_sources`).
+    merge_head_inputs: AtomicU64,
+    merge_record_inputs: AtomicU64,
+    /// Bytes of input records a merge's second pass dropped from the page
+    /// cache behind itself (`Options::merge_drop_behind`).
+    merge_dropped_bytes: AtomicU64,
     /// Whether the writer's last seal was near reads, a drain's counted
     /// near: the segment work's landings take the pieces' ranks and
     /// bounds only then (`Options::land_ranks_far`).
@@ -13289,6 +13656,23 @@ struct Shared {
     fit_swept: AtomicUsize,
     fit_skips: std::sync::atomic::AtomicU32,
 }
+
+/// `POSIX_FADV_DONTNEED` over `len` bytes at `off` of `file`: the clean
+/// pages of that range dropped from the page cache, a mapped page skipped,
+/// which is why `Bytes::advise_dontneed_range` goes first.
+#[cfg(target_os = "linux")]
+fn fadvise_dontneed_range(file: &std::fs::File, off: u64, len: u64) {
+    use std::os::unix::io::AsRawFd;
+    let (Ok(off), Ok(len)) = (libc::off_t::try_from(off), libc::off_t::try_from(len)) else {
+        return;
+    };
+    // SAFETY: an advice over a range of an open file; nothing is written.
+    unsafe {
+        libc::posix_fadvise(file.as_raw_fd(), off, len, libc::POSIX_FADV_DONTNEED);
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn fadvise_dontneed_range(_file: &std::fs::File, _off: u64, _len: u64) {}
 
 /// The clean pages of `file` that nothing maps dropped from the page cache,
 /// the whole file (`POSIX_FADV_DONTNEED`); a dirty page is written back
@@ -17204,6 +17588,45 @@ impl Reader {
         (ranked, n)
     }
 
+    /// The level-0 pieces standing that hold ranks against a partition,
+    /// those that hold bounds against one, and the pieces standing
+    /// (`Options::piece_ranks_whole`). For a test.
+    #[doc(hidden)]
+    pub fn pieces_with_ranks(&self) -> (usize, usize, usize) {
+        let _entered = self.enter();
+        let (mut ranked, mut bounded, mut n) = (0, 0, 0);
+        for s in self.segs().iter().filter(|s| s.level == 0) {
+            let (mut r, mut b) = (false, false);
+            s.ranks.each(|_| r = true);
+            s.bounds.each(|_| b = true);
+            ranked += usize::from(r);
+            bounded += usize::from(b);
+            n += 1;
+        }
+        (ranked, bounded, n)
+    }
+
+    /// The merges' inputs over the store's life by where the first pass
+    /// read their keys: off the ordered index's heads, and off the records
+    /// (`Options::merge_keys_by_heads`).
+    pub fn merge_key_sources(&self) -> (u64, u64) {
+        (
+            self.shared.merge_head_inputs.load(AtomicOrdering::Relaxed),
+            self.shared
+                .merge_record_inputs
+                .load(AtomicOrdering::Relaxed),
+        )
+    }
+
+    /// Bytes of input records the merges' second passes dropped from the
+    /// page cache behind themselves over the store's life
+    /// (`Options::merge_drop_behind`).
+    pub fn merge_dropped_bytes(&self) -> u64 {
+        self.shared
+            .merge_dropped_bytes
+            .load(AtomicOrdering::Relaxed)
+    }
+
     /// How many segments' ordered companions were advised `MADV_RANDOM`, and
     /// how many there are.
     ///
@@ -17305,6 +17728,13 @@ impl Reader {
             inplace_groups: rd.stat(|s| &s.zinplace),
             rawserves: rd.stat(|s| &s.zraw),
             fallbacks: rd.stat(|s| &s.zfallbacks),
+            cuts: rd.stat(|s| &s.zcuts),
+            cut_records: rd.stat(|s| &s.zcutrecs),
+            piece_willneeds: rd.stat(|s| &s.zwillneeds),
+            block_willneeds: rd.stat(|s| &s.zblkwillneeds),
+            willneed_asks: rd.stat(|s| &s.zwillneedasks),
+            head_asks: rd.stat(|s| &s.zheadasks),
+            head_submitted: rd.stat(|s| &s.zheadsubmitted),
             nopage_reads: rd.stat(|s| &s.znopage),
             scans: rd.stat(|s| &s.zscanz),
             scan_groups: rd.stat(|s| &s.zscangroups),
@@ -17551,6 +17981,49 @@ impl Reader {
         self.shared.zgate.load() == zselect::GATE_Z
     }
 
+    /// Whether a block's build asks for its pieces' pages ahead
+    /// (`Options::pieces_willneed`): the option, and the gate away from the
+    /// raw form, which is the store's own measure of being out of core.
+    fn pieces_willneed(&self) -> bool {
+        self.opts.pieces_willneed && self.shared.zgate.load() != zselect::GATE_RAW
+    }
+
+    /// Whether a scan asks for the raw partition records it is about to
+    /// walk (`Options::blocks_willneed`): the option, the gate away from
+    /// the raw form, and no form file serving the partition, whose pages
+    /// are then the form file's and not these.
+    fn blocks_willneed(&self, seg: &Seg) -> bool {
+        self.opts.blocks_willneed
+            && self.shared.zgate.load() != zselect::GATE_RAW
+            && self.zc(seg).is_none()
+    }
+
+    /// The heads of ranks `lo..hi` of `seg` asked for ahead of a seek over
+    /// them (`OrdIndex::willneed_heads`), counted on this handle's line.
+    fn ask_heads(&self, seg: &Seg, lo: usize, hi: usize) {
+        self.zbump(|s| &s.zheadasks);
+        if seg.ord.willneed_heads(lo, hi) > 0 {
+            self.zbump(|s| &s.zheadsubmitted);
+        }
+    }
+
+    /// The partition `key` falls in, of the first `np` segments: stepped to
+    /// from `from`, the one the key before it in key order fell in, and
+    /// found from the top for a key that sorts below it -- keys longer than
+    /// the sixteen bytes a batch is sorted by, tied on them, may arrive out
+    /// of order (`settle_each`). `np` where no partition holds it.
+    fn settle_partition(&self, np: usize, from: usize, key: &[u8]) -> usize {
+        let segs = self.segs();
+        let mut at = from;
+        while at < np && segs[at].hi.as_ref().is_some_and(|h| h.as_slice() <= key) {
+            at += 1;
+        }
+        if at < np && at > 0 && segs[at].below_lo(key) {
+            at = segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
+        }
+        at
+    }
+
     #[inline(never)]
     fn part_read_z<F: FnMut(&[u8])>(
         &self,
@@ -17722,10 +18195,10 @@ impl Reader {
     /// ordered index's heads and the raw records otherwise.
     fn part_cut_z(&self, seg: &Seg, rank: usize, end: usize, uk: &[u8]) -> (usize, Ordering) {
         if !self.z_on() || self.opts.zpages_seek_ord {
-            return BuildCtx::cut_at(seg, rank, end, uk);
+            return self.cut_raw(seg, rank, end, uk);
         }
         let Some(z) = seg.z.get() else {
-            return BuildCtx::cut_at(seg, rank, end, uk);
+            return self.cut_raw(seg, rank, end, uk);
         };
         let r = z.cut_in(&self.zmemo, rank, end, uk);
         self.zmemo_take();
@@ -17738,9 +18211,9 @@ impl Reader {
             }
             zfile::ZSeek::Fallback => {
                 self.zbump(|s| &s.zfallbacks);
-                BuildCtx::cut_at(seg, rank, end, uk)
+                self.cut_raw(seg, rank, end, uk)
             }
-            zfile::ZSeek::Out | zfile::ZSeek::NoPage => BuildCtx::cut_at(seg, rank, end, uk),
+            zfile::ZSeek::Out | zfile::ZSeek::NoPage => self.cut_raw(seg, rank, end, uk),
         }
     }
 
@@ -17847,8 +18320,19 @@ impl Reader {
         if self.zc(seg).is_some() {
             self.part_cut_z(seg, rank, end, key)
         } else {
-            BuildCtx::cut_at(seg, rank, end, key)
+            self.cut_raw(seg, rank, end, key)
         }
+    }
+
+    /// `BuildCtx::cut_at` counted on this handle's line: the cuts asked of
+    /// the raw form's heads, and those whose compare read a record.
+    fn cut_raw(&self, seg: &Seg, rank: usize, end: usize, key: &[u8]) -> (usize, Ordering) {
+        self.zbump(|s| &s.zcuts);
+        let (cut, read) = BuildCtx::cut_at(seg, rank, end, key);
+        if read {
+            self.zbump(|s| &s.zcutrecs);
+        }
+        cut
     }
 
     /// `OrdIndex::seek_exact` for the block cache: the rank of the first
@@ -20433,6 +20917,7 @@ impl Reader {
             merge_pieces: self.opts.overlay_merge,
             pieces_only: self.opts.forms_pieces_only,
             ranks_by_heads: self.opts.piece_ranks_by_heads,
+            ranks_whole: self.opts.piece_ranks_whole,
         }
     }
 
@@ -21741,6 +22226,34 @@ impl Reader {
             Vec::with_capacity(pending.len());
         let lazy = self.opts.zpages_settle_span && !self.opts.forms_pieces_only;
         let mut lazy_n = 0u64;
+        // Out of core, the heads a resolve will seek asked for ahead of it
+        // (`Options::heads_willneed`): a resolve is a seek over one stride
+        // of a partition's heads, a page cold under a bound, and a burst's
+        // batch resolved one fault at a time was the whole of the first
+        // scan after it, ten to fourteen thousand faults in a row on one
+        // thread. Two shapes, by the batch's density in the partition as
+        // the pages its keys resolve to read it: dense, each key's page the
+        // one before's or the next, and the asks are runs from the rank the
+        // key resolved to, `SETTLE_RUN` heads at a time and `SETTLE_LEAD`
+        // ahead, a compare a key and nothing more; sparse, and a cursor
+        // `SETTLE_AHEAD` keys ahead asks each key's stride, found from the
+        // top level in memory, which reads no page the batch will not. An
+        // ask a key whatever the density cost a syscall a key, half a
+        // second of the full rewrite's settles.
+        let page = crate::bytes::os_page_size();
+        let asking =
+            self.opts.heads_willneed && self.shared.zgate.load() != zselect::GATE_RAW && np > 0;
+        // Per partition: the rank the asks have reached, the page of the
+        // last resolve and whether the batch reads dense there; then the
+        // sparse cursor's position in the batch and its partition.
+        let mut frontier: Vec<usize> = if asking { vec![0; np] } else { Vec::new() };
+        let mut last_page: Vec<usize> = if asking {
+            vec![usize::MAX; np]
+        } else {
+            Vec::new()
+        };
+        let mut dense: Vec<bool> = if asking { vec![false; np] } else { Vec::new() };
+        let (mut ahead, mut at_ahead) = (0usize, 0usize);
         for (n, &(_, _, i)) in keyed.iter().enumerate() {
             // A resolve out of core is a major fault a key: the ask to
             // give up is heard between them, not after the batch.
@@ -21757,28 +22270,45 @@ impl Reader {
             last = slot;
             let key = src.key_at(off, len);
             // The partition holding the key: the one before's or a later
-            // one in key order, found by stepping, and from the top for a
-            // key that sorts below it -- keys longer than the sixteen
-            // bytes sorted by, tied on them, may arrive out of order.
-            while at < np
-                && self.segs()[at]
-                    .hi
-                    .as_ref()
-                    .is_some_and(|h| h.as_slice() <= key)
-            {
-                at += 1;
-                floor = 0;
-                zhint = usize::MAX;
-            }
-            if at < np && at > 0 && self.segs()[at].below_lo(key) {
-                at = self.segs()[..np]
-                    .partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
+            // one in key order (`settle_partition`); the seek's floor and
+            // the lazy filing's hint are the partition's.
+            let was = at;
+            at = self.settle_partition(np, at, key);
+            if at != was {
                 floor = 0;
                 zhint = usize::MAX;
             }
             let Some(seg) = self.segs()[..np].get(at) else {
                 continue;
             };
+            // The sparse shape's cursor: ahead of this key and never at it
+            // -- a page asked and seized the next microsecond is the fault
+            // with a syscall before it -- and resting while the batch
+            // reads dense here, where the run below covers what it would
+            // reach. A stride asked moves the partition's frontier to the
+            // end of its page, so the keys sharing the page ask nothing.
+            if asking && !dense[at] {
+                ahead = ahead.max(n + 1);
+                while ahead < keyed.len() && ahead < n + 1 + SETTLE_AHEAD {
+                    let (_, _, j) = keyed[ahead];
+                    ahead += 1;
+                    let (off, len, _, _) = pending[j as usize];
+                    let k = src.key_at(off, len);
+                    at_ahead = self.settle_partition(np, at_ahead, k);
+                    let Some(s) = self.segs()[..np].get(at_ahead) else {
+                        continue;
+                    };
+                    if dense[at_ahead] || self.zc(s).is_some() {
+                        continue;
+                    }
+                    if let Some((lo, hi)) = s.ord.stride_window(k) {
+                        if lo >= frontier[at_ahead] {
+                            self.ask_heads(s, lo, hi);
+                            frontier[at_ahead] = s.ord.page_end(hi.max(lo + 1) - 1, page);
+                        }
+                    }
+                }
+            }
             let (b, cut) = match lazy
                 .then(|| self.lazy_block(at, seg, key, &mut zhint))
                 .flatten()
@@ -21793,6 +22323,28 @@ impl Reader {
                     (b, cut)
                 }
             };
+            // The dense shape, read off the rank: runs asked from the page
+            // after this one -- this one is resident, the resolve just
+            // seized it, and an ask that starts on a resident page asks
+            // nothing -- until the frontier stands the lead past the rank.
+            if asking && cut != LAZY_CUT && self.zc(seg).is_none() {
+                let rank = (cut >> 1) as usize;
+                let pg = seg.ord.head_page(rank, page);
+                dense[at] = last_page[at] != usize::MAX && pg.saturating_sub(last_page[at]) <= 1;
+                last_page[at] = pg;
+                if dense[at] {
+                    let n = seg.ord.len();
+                    while frontier[at] < (rank + SETTLE_LEAD).min(n) {
+                        let from = frontier[at].max(seg.ord.page_end(rank, page));
+                        if from >= n {
+                            break;
+                        }
+                        let to = (from + SETTLE_RUN).min(n);
+                        self.ask_heads(seg, from, to);
+                        frontier[at] = seg.ord.page_end(to - 1, page);
+                    }
+                }
+            }
             resolved.push((at as u32, b as u32, cut, off, len, new, slot));
         }
         if lazy_n > 0 {
@@ -22370,6 +22922,15 @@ impl Reader {
         let keys = seg.blob.keys();
         let lo = b * CACHE_BLOCK;
         let hi = ((b + 1) * CACHE_BLOCK).min(keys);
+        if self.pieces_willneed() && ranks.start < ranks.end {
+            let n = p
+                .raw()
+                .willneed_ranks(ranks.start, ranks.end - ranks.start, WILLNEED_CAP);
+            self.zbump(|s| &s.zwillneeds);
+            if n > 0 {
+                self.zbump(|s| &s.zwillneedasks);
+            }
+        }
         if table.slots[b].is_none() {
             table.slots[b] = Some(std::sync::Arc::new(Cached::Clean));
         }
@@ -22743,6 +23304,13 @@ impl Reader {
                 }
                 if rank < keys {
                     let want = (keys - rank).min(limit - seen);
+                    if self.blocks_willneed(seg) {
+                        let n = seg.raw().willneed_ranks(rank, want, WILLNEED_CAP);
+                        self.zbump(|s| &s.zblkwillneeds);
+                        if n > 0 {
+                            self.zbump(|s| &s.zwillneedasks);
+                        }
+                    }
                     seen += self.cache_scan(seg, rank, want, &mut *f)?;
                 }
                 match &seg.hi {
@@ -22807,6 +23375,13 @@ impl Reader {
                     None => &NO_SNAPSHOT,
                 };
                 if canon.is_none() && table.slots[b].is_none() {
+                    if self.blocks_willneed(seg) {
+                        let n = seg.raw().willneed_ranks(lo, hi - lo, WILLNEED_CAP);
+                        self.zbump(|s| &s.zblkwillneeds);
+                        if n > 0 {
+                            self.zbump(|s| &s.zwillneedasks);
+                        }
+                    }
                     let built = self.share_form(ctx.materialize(src, table, b, unsealed)?);
                     self.count_built_kind(&built);
                     let bytes = self.fbytes(&built);
@@ -24771,6 +25346,9 @@ impl Db {
             rd_blocks: AtomicU64::new(0),
             scans_life: AtomicU64::new(0),
             scans_merged: AtomicU64::new(0),
+            merge_head_inputs: AtomicU64::new(0),
+            merge_record_inputs: AtomicU64::new(0),
+            merge_dropped_bytes: AtomicU64::new(0),
             reads_near: std::sync::atomic::AtomicBool::new(false),
             mode_scans: AtomicU64::new(0),
             mode_points: AtomicU64::new(0),
@@ -25282,6 +25860,9 @@ impl Db {
             rd_blocks: AtomicU64::new(0),
             scans_life: AtomicU64::new(0),
             scans_merged: AtomicU64::new(0),
+            merge_head_inputs: AtomicU64::new(0),
+            merge_record_inputs: AtomicU64::new(0),
+            merge_dropped_bytes: AtomicU64::new(0),
             reads_near: std::sync::atomic::AtomicBool::new(false),
             mode_scans: AtomicU64::new(0),
             mode_points: AtomicU64::new(0),
@@ -31468,6 +32049,8 @@ struct BuildCtx<'s> {
     pieces_only: bool,
     /// See `Options::piece_ranks_by_heads`.
     ranks_by_heads: bool,
+    /// See `Options::piece_ranks_whole`.
+    ranks_whole: bool,
     /// The pieces' runs over a block merged on their keys' leading words
     /// (`merge_runs`) rather than sorted whole: `Options::overlay_merge`.
     merge_pieces: bool,
@@ -31634,7 +32217,12 @@ impl<'s> BuildCtx<'s> {
     /// that has no ranks against that partition yet: what the segment
     /// work does before it publishes a set (`Maint::rank_before_publish`),
     /// and a table's making does for pieces that were opened from disk.
+    /// Only under `Options::piece_ranks_whole`; otherwise nothing, and
+    /// every build finds its cuts.
     fn rank_pieces(&self) -> Result<()> {
+        if !self.ranks_whole {
+            return Ok(());
+        }
         rank_pieces_of(self.segs, self.ranks_by_heads)
     }
     /// PROTOTYPE: where the snapshot's keys fall against the partition's
@@ -31815,6 +32403,26 @@ impl<'s> BuildCtx<'s> {
         // piece's run starts and ends in `held`.
         let mut pre: Vec<(u64, u64)> = Vec::new();
         let mut runs: Vec<(usize, usize)> = Vec::with_capacity(pieces.len());
+        // Out of core, every piece's records over the block asked for
+        // before any is read: a block's updates sit in as many pieces as
+        // touched its range, a page in each, and read one fault at a time
+        // each page was a device round trip of its own
+        // (`Options::pieces_willneed`).
+        if self.rd.pieces_willneed() {
+            for (j, run, _) in pieces {
+                if run.start < run.end {
+                    let n = src.l0[*j].raw().willneed_ranks(
+                        run.start,
+                        run.end - run.start,
+                        WILLNEED_CAP,
+                    );
+                    self.rd.zbump(|s| &s.zwillneeds);
+                    if n > 0 {
+                        self.rd.zbump(|s| &s.zwillneedasks);
+                    }
+                }
+            }
+        }
         for (j, run, ranks) in pieces {
             let p = &src.l0[*j];
             let start = held.len();
@@ -33007,19 +33615,34 @@ impl<'s> BuildCtx<'s> {
     ///
     /// Searched over the ordered index's heads for the window -- sixty-four
     /// eight-byte heads in eight lines, hot after the block's first build
-    /// -- with one key read after, for the comparison the emit needs.
-    /// Before this the search read the records: the rank itself first,
-    /// then the window's last key, then a gallop from the rank and a
-    /// binary search over the gap it landed in, a parsed key at every
-    /// probe; at 300k keys a sparse block's build was 3 us, most of it
-    /// here, and a fifth of E's first pass.
-    fn cut_at(seg: &Seg, rank: usize, end: usize, uk: &[u8]) -> (usize, Ordering) {
-        let r = seg.ord.seek_in(rank, end, uk, |i| seg.raw().key_at(i));
+    /// -- which answer the comparison the emit needs too where a head is a
+    /// whole key, and one key read for it otherwise
+    /// (`OrdIndex::seek_in_exact`). Before this the search read the
+    /// records: the rank itself first, then the window's last key, then a
+    /// gallop from the rank and a binary search over the gap it landed in,
+    /// a parsed key at every probe; at 300k keys a sparse block's build
+    /// was 3 us, most of it here, and a fifth of E's first pass. Then it
+    /// read the one key at the cut for the compare, a record page a sparse
+    /// build touches for nothing else: with the pieces' cuts found at the
+    /// builds (`Options::piece_ranks_whole` off), under a bound that was a
+    /// major fault per overlay key, a quarter more over the ten-percent lag
+    /// pass at ten million keys. The second answer is whether the compare
+    /// read a record.
+    fn cut_at(seg: &Seg, rank: usize, end: usize, uk: &[u8]) -> ((usize, Ordering), bool) {
+        let (r, exact) = seg
+            .ord
+            .seek_in_exact(rank, end, uk, |i| seg.raw().key_at(i));
         if r >= end {
-            return (end, Ordering::Greater);
+            return ((end, Ordering::Greater), false);
         }
-        let at = seg.raw().key_at(r).map_or(Ordering::Greater, |k| k.cmp(uk));
-        (r, at)
+        match exact {
+            Some(true) => ((r, Ordering::Equal), false),
+            Some(false) => ((r, Ordering::Greater), false),
+            None => {
+                let at = seg.raw().key_at(r).map_or(Ordering::Greater, |k| k.cmp(uk));
+                ((r, at), true)
+            }
+        }
     }
 }
 
@@ -33585,6 +34208,11 @@ struct Maint {
     /// seals start waits for the next seal, since a store that has stopped
     /// sealing would otherwise never see it.
     flush_merge: bool,
+    /// The store's scan life at the last landing's plan (`Shared::scans_life`
+    /// and `scans_merged`): a merge's landing plans the next merge only
+    /// where the life has moved since, reads around now
+    /// (`Options::merge_chains`).
+    chain_life: u64,
     /// WAL files whose records no segment has been *named* as covering
     /// yet. One rule governs every one of them: a WAL may be deleted only
     /// after the manifest names a segment that covers its records. The
@@ -33986,6 +34614,33 @@ impl Maint {
         if tiered && done.is_ok() && !between {
             done = self.join_tier();
         }
+        // The merges the landed set makes due, planned here as a seal's
+        // durable landing plans them (`Options::merge_chains`), while reads
+        // are around -- the store's scan life moved since the last landing.
+        // The planner ran at the seals alone, so a store nothing wrote
+        // after a burst kept the burst's pieces for as long as it was read:
+        // under 1.25 GiB at ten million keys the full rewrite's pass met
+        // 336 of them, seventeen a range, with one merge in flight and
+        // nothing to start the next. A write-only stretch keeps its seals'
+        // plans, since merges chained through a burst ran beside its
+        // writes; a settle joins the merge in flight itself and plans
+        // nothing, as before.
+        if (merged || tiered) && done.is_ok() && !between {
+            let life = self.scan_life();
+            let reads = life != self.chain_life;
+            self.chain_life = life;
+            // At the base trigger and not the one reads lower: the lowered
+            // trigger paces the seals' plans, a merge a seal at most, and
+            // a chain at it rewrote partitions of seventy megabytes to fold
+            // one or two pieces each, one after another, while the
+            // ten-percent pass read -- 2.9 major faults a scan against 2.0
+            // with the same pieces standing, the pass a quarter slower.
+            if reads && self.opts.merge_chains && self.opts.compact {
+                let base = self.opts.l0_trigger.max(1);
+                done = self.maybe_compact_at(base).and_then(|()| self.maybe_tier());
+                SealCounts::add(&self.shared.seal_counts.plans, 1);
+            }
+        }
         if let Err(e) = done {
             self.shared.put_maint_err(e);
         }
@@ -34216,6 +34871,7 @@ impl Maint {
             tiering: None,
             sealing: std::collections::VecDeque::new(),
             flush_merge: false,
+            chain_life: 0,
             wake: None,
             shaped_at: 0,
             zbuild: None,
@@ -34586,7 +35242,12 @@ impl Maint {
         // takes them (`Options::land_ranks_far`).
         let near = self.opts.land_ranks_far || self.shared.reads_near.load(AtomicOrdering::Acquire);
         if self.opts.scan_block_cache && near {
-            rank_pieces_of(segs, self.opts.piece_ranks_by_heads)?;
+            // The ranks only under the arm (`Options::piece_ranks_whole`);
+            // the bounds are a table's, and every table over the pair
+            // would walk them otherwise.
+            if self.opts.piece_ranks_whole {
+                rank_pieces_of(segs, self.opts.piece_ranks_by_heads)?;
+            }
             bound_pieces_of(segs)?;
         }
         Ok(())
@@ -34687,8 +35348,17 @@ impl Maint {
             self.maybe_compact()?;
             self.maybe_tier()?;
         }
+        self.chain_life = self.scan_life();
+        SealCounts::add(&self.shared.seal_counts.plans, 1);
         self.shape_if_read(true);
         Ok(())
+    }
+
+    /// The store's scan life: the scans the block path served and those it
+    /// did not, the count the seals read reads by (`reads_around`).
+    fn scan_life(&self) -> u64 {
+        self.shared.scans_life.load(AtomicOrdering::Relaxed)
+            + self.shared.scans_merged.load(AtomicOrdering::Relaxed)
     }
 
     fn publish_segs(&mut self, segs: Vec<std::sync::Arc<Seg>>) {
@@ -35142,6 +35812,14 @@ impl Maint {
     /// reads -- or, before the first partitioning, when that many
     /// full-range segments have piled up.
     fn maybe_compact(&mut self) -> Result<()> {
+        let trigger = self.l0_trigger_now();
+        self.maybe_compact_at(trigger)
+    }
+
+    /// `maybe_compact` with the trigger given: a range is due at `trigger`
+    /// pieces. The seals plan at the trigger reads lower
+    /// (`l0_trigger_now`), a chained landing at the base one.
+    fn maybe_compact_at(&mut self, trigger: usize) -> Result<()> {
         // Collect a finished merge BEFORE deciding. Its outputs are the
         // partitions the decision depends on, and deciding first meant
         // deciding against a store that still looked unpartitioned: every
@@ -35175,7 +35853,6 @@ impl Maint {
         // range is due when it holds `l0_trigger` pieces, a piece not
         // aligned to the live ranges selects every range it overlaps, and
         // before the first partitioning the trigger counts every piece.
-        let trigger = self.l0_trigger_now();
         match self.merge_due(trigger) {
             None => {
                 if self.l0_len() >= trigger {
@@ -35195,10 +35872,42 @@ impl Maint {
                 if due.is_empty() {
                     return Ok(());
                 }
+                let due = self.cap_due(due);
                 self.start_compact(Some(due))
             }
             Some(_) => Ok(()),
         }
+    }
+
+    /// The due ranges one merge takes under the landing's plan
+    /// (`Options::merge_bytes_cap`, with `merge_chains`): in key order, the
+    /// partitions' bytes summed up to the cap and at least one range, the
+    /// rest left due for the plan the landing makes. A merge over every due
+    /// range landed all of them at once at its end, and under a bound a
+    /// full rewrite's pass read beside it the whole way. A wide piece's
+    /// ranges stay one merge whatever the cap (`cover_inputs`).
+    fn cap_due(&self, due: Vec<Fence>) -> Vec<Fence> {
+        let cap = self.opts.merge_bytes_cap;
+        if cap == 0 || !self.opts.merge_chains || due.len() <= 1 {
+            return due;
+        }
+        let mut taken: Vec<Fence> = Vec::new();
+        let mut bytes = 0u64;
+        for f in due {
+            let size: u64 = self
+                .segs()
+                .iter()
+                .filter(|s| s.level > 0 && s.lo == f.0 && s.hi == f.1)
+                .filter_map(|s| std::fs::metadata(self.dir.join(&s.name)).ok())
+                .map(|m| m.len())
+                .sum();
+            if !taken.is_empty() && bytes.saturating_add(size) > cap {
+                break;
+            }
+            bytes = bytes.saturating_add(size);
+            taken.push(f);
+        }
+        taken
     }
 
     /// Try to promote the aligned pieces of each of `due`'s ranges instead
@@ -37890,6 +38599,9 @@ impl Maint {
         let sync_every = self.opts.seal_sync_every;
         let inline_max = self.opts.inline_bytes;
         let ord_durable = self.opts.ord_durable;
+        let heads = self.opts.merge_keys_by_heads;
+        let drop_behind = self.opts.merge_drop_behind;
+        let drop_chunk = self.opts.merge_drop_chunk;
         let job_inputs = inputs.clone();
         let wake = self.wake.clone();
         let held = self.shared.clone();
@@ -37908,6 +38620,10 @@ impl Maint {
                 sync_every,
                 inline_max,
                 ord_durable,
+                heads,
+                counts: Some(held.clone()),
+                drop_behind,
+                drop_chunk,
             });
             // A test's hold before the landing (`Db::hold_merge_landing`).
             while held.merge_hold.load(AtomicOrdering::Acquire) & MERGE_HOLD_LANDING != 0 {
@@ -37962,6 +38678,7 @@ impl Maint {
         for name in &inputs {
             self.retire_seg(name);
         }
+        SealCounts::add(&self.shared.seal_counts.merges, 1);
         self.shared
             .seal_counts
             .merge_ns

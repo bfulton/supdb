@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use supdb::{Db, Options};
 
 mod common;
-use common::{kv, partition_fences, seg_names, vf};
+use common::{kv, partition_fences, seg_names, vf, without_the_clock};
 
 fn scratch(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-next-fences-{name}-{}", std::process::id()));
@@ -466,4 +466,281 @@ fn a_merge_writes_an_empty_partition_for_a_fence_no_input_key_lies_in() {
     hold_to(&db, &live);
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A merge's first pass reads its inputs' keys off their ordered indexes'
+/// heads where a head is a whole key (`Options::merge_keys_by_heads`), and
+/// off the records otherwise. Two stores fed the same operations, one each
+/// way, merge to the same files byte for byte, the superblock's clock
+/// aside; a store whose keys are of two lengths reads every input's keys
+/// off the records under either, and merges to the same files as its
+/// twin too.
+#[test]
+fn a_merges_first_pass_over_the_heads_writes_what_the_records_write() {
+    for mixed in [false, true] {
+        let mut dirs = Vec::new();
+        for heads in [true, false] {
+            let d = scratch(&format!("merge-heads-{mixed}-{heads}"));
+            let mut db = Db::create(
+                &d,
+                Options {
+                    seal_bytes: 32 << 10,
+                    partition_bytes: Some(32 << 10),
+                    l0_trigger: 2,
+                    merge_keys_by_heads: heads,
+                    ..Options::default()
+                },
+            )
+            .unwrap();
+            // One length of key, so a head is a whole key; or two, with a
+            // third of them a suffix longer, so the heads cannot say.
+            let key = |k: u32| {
+                if mixed && k.is_multiple_of(3) {
+                    format!("key-{k:05}-x").into_bytes()
+                } else {
+                    format!("key-{k:05}").into_bytes()
+                }
+            };
+            for k in 0..3000u32 {
+                db.append(&key(k), b"0");
+            }
+            db.commit().unwrap();
+            db.flush().unwrap();
+            assert!(partition_fences(&d).len() >= 2, "partitions");
+            // Two pieces of updates and of new keys over every partition:
+            // the second's landing starts the merge of every range.
+            for round in 0..2u32 {
+                for k in (round..3000u32).step_by(7) {
+                    db.append(&key(k), b"n");
+                }
+                for k in 0..300u32 {
+                    db.append(&key(90000 + k * 10 + round), b"m");
+                }
+                db.commit().unwrap();
+                db.seal().unwrap();
+            }
+            db.settle().unwrap();
+            let (by_heads, by_records) = db.merge_key_sources();
+            assert!(by_heads + by_records > 0, "a merge ran");
+            if heads && !mixed {
+                assert_eq!(
+                    by_records, 0,
+                    "every input's keys off its heads: {by_records} inputs off the records"
+                );
+            } else {
+                assert_eq!(
+                    by_heads, 0,
+                    "the records' pass: {by_heads} inputs off their heads"
+                );
+            }
+            db.close().unwrap();
+            dirs.push(d);
+        }
+        let names: Vec<Vec<String>> = dirs.iter().map(|d| seg_names(d)).collect();
+        assert_eq!(names[0], names[1], "the same segments (mixed {mixed})");
+        for n in &names[0] {
+            let a = std::fs::read(dirs[0].join(n)).unwrap();
+            let b = std::fs::read(dirs[1].join(n)).unwrap();
+            assert_eq!(
+                without_the_clock(&a),
+                without_the_clock(&b),
+                "{n} differs between the heads' pass and the records' (mixed {mixed})"
+            );
+        }
+        for d in &dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+}
+
+/// A merge drops its inputs' record pages from the page cache behind its
+/// second pass (`Options::merge_drop_behind`), and changes no byte doing
+/// so: two stores fed the same operations, one dropping and one not, merge
+/// to the same files, the superblock's clock aside, and the one that drops
+/// counts what it dropped.
+#[test]
+fn a_merge_drops_its_inputs_pages_behind_its_second_pass() {
+    let mut dirs = Vec::new();
+    for drop in [true, false] {
+        let d = scratch(&format!("merge-drop-{drop}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 32 << 10,
+                partition_bytes: Some(32 << 10),
+                l0_trigger: 2,
+                merge_drop_behind: drop,
+                // A drop every sixteen kilobytes, so a store of kilobytes
+                // reaches one.
+                merge_drop_chunk: 16 << 10,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let key = |k: u32| format!("key-{k:05}").into_bytes();
+        for k in 0..3000u32 {
+            db.append(&key(k), b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        for round in 0..2u32 {
+            for k in (round..3000u32).step_by(7) {
+                db.append(&key(k), b"n");
+            }
+            for k in 0..300u32 {
+                db.append(&key(90000 + k * 10 + round), b"m");
+            }
+            db.commit().unwrap();
+            db.seal().unwrap();
+        }
+        db.settle().unwrap();
+        let (by_heads, by_records) = db.merge_key_sources();
+        assert!(by_heads + by_records > 0, "a merge ran");
+        let dropped = db.merge_dropped_bytes();
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                dropped > 0,
+                drop,
+                "the merge dropped its inputs' pages only with the option: {dropped}"
+            );
+        }
+        db.close().unwrap();
+        dirs.push(d);
+    }
+    let names: Vec<Vec<String>> = dirs.iter().map(|d| seg_names(d)).collect();
+    assert_eq!(names[0], names[1], "the same segments");
+    for n in &names[0] {
+        let a = std::fs::read(dirs[0].join(n)).unwrap();
+        let b = std::fs::read(dirs[1].join(n)).unwrap();
+        assert_eq!(
+            without_the_clock(&a),
+            without_the_clock(&b),
+            "{n} differs between dropping and keeping"
+        );
+    }
+    for d in &dirs {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+/// A merge's landing plans the next (`Options::merge_chains`). The planner
+/// ran at a seal's durable landing alone, so a store that was only read
+/// after a burst kept the burst's pieces for as long as it was read: under
+/// a bound the full rewrite's pass met seventeen pieces a range with one
+/// merge in flight and nothing to start the next. A range made due while a
+/// held merge runs is merged by the landing's plan with no write after the
+/// hold is lifted, and stays as it is with the chain off; and the cap on a
+/// merge's bytes (`Options::merge_bytes_cap`) takes two ranges due at once
+/// as two merges, one after the other, where no cap takes them as one.
+#[test]
+fn a_merges_landing_plans_the_next_and_a_cap_lands_a_range_at_a_time() {
+    // (chain, cap, both ranges due at once) -> (pieces left, merges landed).
+    for (chain, cap, at_once, left, merges) in [
+        (true, 0u64, false, 0usize, 2u64),
+        (false, 0, false, 2, 1),
+        (true, 1, true, 0, 2),
+        (true, 0, true, 0, 1),
+    ] {
+        let d = scratch(&format!("merge-chain-{chain}-{cap}-{at_once}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 32 << 10,
+                partition_bytes: Some(32 << 10),
+                l0_trigger: 2,
+                merge_chains: chain,
+                merge_bytes_cap: cap,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let key = |k: u32| format!("key-{k:05}").into_bytes();
+        let mut keys: Vec<Vec<u8>> = (0..3000).map(key).collect();
+        for k in &keys {
+            db.append(k, b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        let fences = partition_fences(&d);
+        assert!(fences.len() >= 3, "partitions: {fences:?}");
+        let (merges0, plans0) = (db.seal_waits().merges, db.seal_waits().plans);
+        // Keys new to a range, between its first two keys: its lower fence
+        // and a suffix sorts above the fence and below every other key.
+        let in_range = |r: usize, round: u32, i: u32| -> Vec<u8> {
+            let (lo, hi) = &fences[r];
+            let k = [lo.as_slice(), format!("-{round}{i:03}").as_bytes()].concat();
+            assert!(k.as_slice() > lo.as_slice(), "{k:?} above {lo:?}");
+            if let Some(h) = hi {
+                assert!(k.as_slice() < h.as_slice(), "{k:?} below {h:?}");
+            }
+            k
+        };
+        // The merge's thread waits before returning while held, so the merge
+        // the second seal's landing plans is in flight through the seals
+        // after it, whose landings find it running and plan nothing.
+        db.hold_merge_landing(true);
+        let rounds: Vec<Vec<usize>> = if at_once {
+            vec![vec![1, 2], vec![1, 2]]
+        } else {
+            vec![vec![1], vec![1], vec![2], vec![2]]
+        };
+        for (round, ranges) in rounds.iter().enumerate() {
+            for &r in ranges {
+                for i in 0..200u32 {
+                    let k = in_range(r, round as u32, i);
+                    db.append(&k, b"n");
+                    keys.push(k);
+                }
+            }
+            db.commit().unwrap();
+            db.seal().unwrap();
+        }
+        // Every seal landed durable and made its plan: the planner's count,
+        // never the clock.
+        let t = std::time::Instant::now();
+        while db.seal_waits().plans < plans0 + rounds.len() as u64 {
+            assert!(
+                t.elapsed().as_secs() < 30,
+                "the seals' landings never planned"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(db.seal_waits().merges, merges0, "nothing landed while held");
+        // Reads around: a landing plans the next merge only where the
+        // store's scan life moved since the last landing.
+        let mut seen = 0usize;
+        db.scan(b"", 5, kv(&mut |_, _| seen += 1)).unwrap();
+        assert_eq!(seen, 5);
+        db.hold_merge_landing(false);
+        // The segment work's own loop lands the merge and, with the chain,
+        // plans and lands the next; a settle would join the merge itself and
+        // plan nothing, so the loop is waited for by the merges it lands.
+        let t = std::time::Instant::now();
+        while db.seal_waits().merges < merges0 + merges {
+            assert!(
+                t.elapsed().as_secs() < 30,
+                "chain {chain} cap {cap} at once {at_once}: {} merges landed, {merges} expected",
+                db.seal_waits().merges - merges0
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        db.settle().unwrap();
+        let pieces = seg_names(&d)
+            .iter()
+            .filter(|n| !n.starts_with("par-"))
+            .count();
+        assert_eq!(
+            pieces, left,
+            "chain {chain} cap {cap} at once {at_once}: pieces left after the landings"
+        );
+        assert_eq!(
+            db.seal_waits().merges - merges0,
+            merges,
+            "chain {chain} cap {cap} at once {at_once}: merges landed"
+        );
+        hold_to(&db, &keys);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

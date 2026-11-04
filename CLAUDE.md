@@ -82,7 +82,13 @@ error but the linker: `ld terminated with signal 7 [Bus error]` on the
 bench group's three RocksDB-sized links, with `df` still showing gigabytes
 free. A scratch directory of old bench binaries at a third of a gigabyte
 each is where the allowance went; delete those before reading the link
-failure as anything else. On a box other runs share, give each
+failure as anything else. The stores of pairings killed before their end
+are the other sink: `bench ab` keeps its store under
+`$TMPDIR/supdb-ab-<pid>` and removes it at its exit alone, so five
+bounded pairings at ten million keys killed after their first sweep left
+ten gigabytes, and the sixth died at its second load with `No space left
+on device`. Remove them by name after a kill; a glob over `/tmp` takes
+other processes' stores with them. On a box other runs share, give each
 run a `TMPDIR` of its own and clean that: the glob takes every process's
 stores, and a run whose store another run's cleanup removed mid-test
 fails with a bare `NotFound` from whatever file operation came next --
@@ -636,7 +642,21 @@ median: a pass of a hundred scans at the smallest rung is a few hundred
 microseconds, and a first scan that builds what the pass needs once is a
 share of it no rate shows. Its median prints to the nanosecond: printed
 to the tenth of a microsecond it hid a fifty-nanosecond move behind four
-sittings of pairs, and the move was read off the pass sums instead. Read a thread's
+sittings of pairs, and the move was read off the pass sums instead. Under
+the same variable the lag sweep prints a `lagops` line per point -- the
+first four scans, the median and the longest, the pass in tenths, and
+the thread's CPU and context switches beside its wall -- and
+`SUPDB_LAG_COUNTERS=1` a `lagdev` line beside `lagcounters`, the pass's
+device and group side: bytes read and written at the device and by the
+process, and the group's faults, refaults, dirty pages and cache. The
+two told the full-rewrite pass at ten million keys under a bound apart
+from its rate -- a first scan of nineteen seconds and one tenth of
+seventeen in a pass of fifty, half the device's eight gigabytes under
+them -- where the row's own quantities for the point, bytes read by
+background threads and major faults per operation, read 371 KB and
+zero: the first counts the merge's reads as the pass's, and the second
+is blind to a fault on a page the cache holds and has not read yet,
+which the kernel counts as minor. Read a thread's
 passes per rep there before reading its cell: a thread that ran in
 two reps of five made a cell that read neither shape.
 
@@ -3093,6 +3113,118 @@ bytes are read as anyone's; the owner of retained memory is named
 fastest by changing the allocator's policy for one run and reading the
 difference; and a quantity taken out of a kernel count is itself read
 from the kernel, since a page mapped is not a page resident.
+
+**A cache taken whole for a reader who wanted a few of its entries, and
+the fallback that read a page per entry.** A level-0 piece's ranks
+against its partition -- every key's cut, in one walk, kept on the piece
+-- were taken whole by whoever first needed one: the segment work before
+a landing near reads, and otherwise the reader whose table met the
+piece. Under a bound the full rewrite at ten million keys landed three
+to four hundred pieces far from reads, and the first scan after it
+ranked them all through major faults for nineteen seconds, with the
+first scan after the merge's landing ranking them again against the
+rewritten partitions for seventeen, in a pass of fifty; in core the same
+walk is milliseconds, and no row showed it. Nobody ranks a piece whole
+now (`Options::piece_ranks_whole`), and a build finds the cut where its
+walk stops at the key, the path a piece without ranks always took. That
+path then cost the ten-percent pass a quarter more faults than the ranks
+had: the cut's compare read the partition's record at the cut, a page
+the sparse build touched for nothing else, for an answer the ordered
+index's heads had wherever a head is a whole key
+(`OrdIndex::seek_in_exact`). The rule: a derived table over a source is
+taken for the entries a reader asks for, in the reader's order, or not
+at all, since a whole-table pass costs the source's size however few
+entries are read; and a fallback priced in core is priced again by its
+pages under a bound, where a line touched for a compare is a fault.
+
+**A fault taken alone for pages known before the first was read.** A
+block's build over a burst's pieces reads one page of each piece its
+range touches, and read them as it met them, each a synchronous fault
+and a device round trip, while the table's bounds had named every
+piece's run over the block before any record was read: ten pieces a
+block after a full rewrite at ten million keys under a bound, ten round
+trips where one wait would do. The build asks the kernel for every run
+first now (`Options::pieces_willneed`), and the full-rewrite pass reads
+1.5x; a store in core asks nothing, since the ask is a syscall a piece a
+block, and the gate that says the store is out of core (`Options::zpages`)
+is what turns it on. The partition's own spans, asked for the same way
+(`Options::blocks_willneed`), lost the one-percent point 1.4x before the
+ask was gated on residency as well: that point's pages the burst's
+settle had just pulled in, and an `madvise` over resident pages still
+walks them in the kernel, ten to twenty microseconds on a scan of five;
+one `mincore` of the span's first page first, and nothing asked where it
+is there, kept the gains and lost the loss. The rule: a walk that knows
+its pages before it reads them asks for them together where a page is a
+fault, and the ask is gated on the fault being there to save -- the store
+out of core, and the page not resident -- since in core, or on a resident
+span, the ask is the whole cost; and the thread's major-fault count is
+not the measure of such a change, since a page asked for and reached
+before it arrives faults as minor -- read the pass's time.
+
+**A prefetch issued the microsecond before the fault it was to save, and
+a counter it satisfied for the path it was not for.** The heads a block's
+cuts seek were asked of the kernel at the block's build, beside the ask
+for its records, and seized by the first cut: an ask with no lead is the
+fault with a syscall before it, and the kernel said so -- the pass took
+more major faults an operation with the ask than without, 9.0 against 7.4
+at the full rewrite under 1.25 GiB at ten million keys and 1.1 against
+0.9 at the drained store, and the full-rewrite pass a tenth longer --
+where the fault it was aimed at already overlapped the records' ask issued
+before it. The test that held the mechanism counted the asks after a
+commit and a scan, and the build's asks satisfied it while the settle's,
+the site the asks were for, never ran in that test: a store whose commits
+keep no forms has nothing to settle, and its writes are cut at the build.
+Removing the build's ask read the counter at zero and named the test. The
+rule: a prefetch is placed by its lead, the work between the ask and the
+touch, and priced by the faults the kernel counts against the arm without
+it; and a mechanism with two sites is held at each site on its own,
+driven by the path that site is for, since a counter the wrong site
+satisfies passes with the right site dead.
+
+**A lead sized in pages for a walk whose work is in keys.** The settle's
+run asks kept the heads' frontier half a run of 256 KB ahead of the rank
+being resolved, thirty-two pages, which at the one-percent burst's density
+of five keys a page is 0.8 ms of resolves -- under the run's own round
+trip and transfer -- so the settle waited on most of its runs and the asks
+saved three faults in ten where an ask a key had saved nine. The lead is a
+time only through the batch's density, so it is set for the sparsest
+density the dense shape admits and kept as several requests in flight
+(`SETTLE_LEAD`, eight runs of 64 KB): the first scan then reads what the
+ask a key read, 248 and 276 ms against 427 and 460, with the pass's
+faults halved. The rule: a lead ahead of a walk is sized by the work
+between the ask and the touch and not by the pages it covers, and it is
+read off the faults the walk still takes, since a lead that is short by
+half looks like a lever that half works.
+
+**A planner that ran only where the writes were, and a chain at the pace
+the writes set.** The merge planner ran at a seal's durable landing alone,
+so a store written in a burst and then only read kept the burst's pieces
+for as long as it was read: under 1.25 GiB at ten million keys the pass
+after the full rewrite met 336 of them, seventeen a range, a page of each
+in every block's build, with one merge over every due range in flight and
+nothing to start the next when it landed. Three shapes of the fix each
+taught something the previous had hidden. A merge's landing planning the
+next, with every due range in one merge as before, met the same 336
+pieces: the one merge took the whole pass to run, so the chain never got
+its turn, and a cap on the bytes a merge rewrites is what drained them
+(`Options::merge_bytes_cap`). Chained through the burst as well, the
+merges ran beside the burst's writes and the burst paid a seventh where
+the pass gained; the chain is gated on reads around, a scan since the last
+landing, and a write-only stretch keeps the seals' plans
+(`Options::merge_chains`). And a chain at the trigger reads lower
+(`l0_trigger_now`) rewrote partitions of seventy megabytes to fold a piece
+or two each, one after another, through the ten-percent pass -- 2.9 major
+faults a scan against 2.0 with the same pieces standing, the pass a
+quarter slower -- because that trigger paces the seals' plans, a merge a
+seal at most, and a chain has no such pace; it plans at the base trigger.
+The rules: a background job's planner runs wherever the condition it
+serves can hold, which for the pieces readers walk is while the store is
+read, and not only where the writes happen to call it; a threshold tuned
+for one caller's cadence is retuned for a caller with none; and the
+measure of a merge policy is the pieces a reader meets, read off the pass
+(`pieces` in the lag counters, `merges_landed`, `merge_plans`), beside the
+burst's rate and the pass's together, since a policy that leaves the
+pieces for later wins both cells and pays in the pass nobody measured.
 
 ## Standing limitations
 

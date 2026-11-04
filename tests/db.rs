@@ -12230,6 +12230,88 @@ fn a_seal_far_from_reads_builds_no_copy() {
 /// sorting the table again. The seal sorted it once and nobody else does.
 /// The seal is held after its publish until the settle, since the commit
 /// that opens the run lands a seal that has finished.
+// The pieces' ranks are taken whole only under the arm
+// (`Options::piece_ranks_whole`): a landing near reads and the first scan
+// over pieces landed far from reads take every piece's bounds and leave
+// the ranks, and a build finds each piece key's cut where its walk stops
+// at the key. The model holds every read, count and scan to the same
+// answer either way, through the writer and through a handle.
+#[test]
+fn the_pieces_are_ranked_whole_only_under_the_arm() {
+    for whole in [false, true] {
+        let d = dir(&format!("ranks-whole-{whole}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 1 << 30,
+                partition_bytes: Some(2 << 10),
+                // One seal's pieces stand until the test is done with them.
+                l0_trigger: 1 << 20,
+                piece_ranks_whole: whole,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:06}");
+        for k in (0..6000u32).step_by(3) {
+            m.append(&mut db, &key(k), "p");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        assert!(db.levels().0 > 1, "several partitions");
+        // A seal with no scan in the store's life lands far from reads and
+        // takes neither ranks nor bounds, under either shape.
+        for k in (0..6000u32).step_by(7) {
+            m.append(&mut db, &key(k), "far");
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        db.settle().unwrap();
+        let (ranks, bounds, pieces) = db.pieces_with_ranks();
+        assert!(pieces > 0, "the seal's pieces stand");
+        assert_eq!(
+            (ranks, bounds),
+            (0, 0),
+            "a landing far from reads published its pieces bare"
+        );
+        // The first scan makes every partition's table: the bounds for
+        // every piece, and the ranks only under the arm.
+        m.check(&db, "the writer over pieces landed bare");
+        let (ranks, bounds, pieces) = db.pieces_with_ranks();
+        assert_eq!(bounds, pieces, "the scan took every piece's bounds");
+        assert_eq!(
+            ranks,
+            if whole { pieces } else { 0 },
+            "the scan ranked the pieces whole only under the arm"
+        );
+        // A seal after a scan lands near reads: its landing takes the
+        // bounds, and the ranks only under the arm, before anything scans.
+        for k in (0..6000u32).step_by(11) {
+            m.append(&mut db, &key(k), "near");
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        db.settle().unwrap();
+        let (ranks, bounds, pieces) = db.pieces_with_ranks();
+        assert_eq!(
+            bounds, pieces,
+            "a landing near reads took its pieces' bounds"
+        );
+        assert_eq!(
+            ranks,
+            if whole { pieces } else { 0 },
+            "a landing near reads ranked its pieces whole only under the arm"
+        );
+        m.check(&db, "the writer after both seals");
+        let r = db.reader().unwrap();
+        m.check(&r, "a handle after both seals");
+        drop(r);
+        db.close().unwrap();
+    }
+}
+
 #[test]
 fn a_frozen_tables_snapshot_outlives_the_state_it_was_published_in() {
     for frozen_snaps in [true, false] {
@@ -12733,6 +12815,13 @@ fn an_ordered_tail_handed_at_sync_is_promoted_beside_the_partition() {
         merges_before,
         "promoted by link, not merged"
     );
+    // The landing retires the piece's and the old partition's files after
+    // it has published the state the wait above read and written the
+    // manifest; a settle joins the segment work, so the listing is of the
+    // directory the landing leaves and not of the moment the state moved
+    // (thirty milliseconds after it, the files were still there on a
+    // loaded runner).
+    db.settle().unwrap();
     let names = sup_files(&d);
     assert!(
         names.len() == 2 && names.iter().all(|nm| nm.starts_with("par-")),

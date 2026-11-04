@@ -943,6 +943,67 @@ impl<B: Bytes> Blob<B> {
         }
     }
 
+    /// PROTOTYPE: the records from `rank` for `n` ranks asked of the kernel
+    /// ahead of a walk over them (`Bytes::advise_willneed`), by the span
+    /// the directory says they lie in: the pages a block's build reads of
+    /// this segment come in together, where read one fault at a time each
+    /// was a device round trip of its own. The span runs to the record
+    /// after the last asked for, or a few lines past the last record where
+    /// the ranks end at it, and no further than `cap` bytes from the first:
+    /// a scan's whole limit can be every rank. The bytes submitted; zero
+    /// where the source has no mapping behind it, the ranks resolve to
+    /// nothing, or the span's first page is resident already
+    /// (`Bytes::resident_at`).
+    #[cfg(not(target_family = "wasm"))]
+    pub fn willneed_ranks(&self, rank: usize, n: usize, cap: usize) -> usize {
+        let Some((sec, idx)) = self.flat() else {
+            return 0;
+        };
+        let Some((recs, dir)) = idx.regions(sec) else {
+            return 0;
+        };
+        let Some((a, b)) = idx.record_span(dir, rank, n) else {
+            return 0;
+        };
+        let b = b
+            .saturating_add(256)
+            .min(a.saturating_add(cap))
+            .min(recs.len());
+        if a >= b {
+            return 0;
+        }
+        let recs_at = recs.as_ptr() as usize - sec.as_ptr() as usize;
+        let off = self.index_offset() + recs_at as u64 + a as u64;
+        // A span whose first page is resident is taken as resident whole,
+        // and nothing is asked: the records of a run or a block are a few
+        // pages the same walk brought in or left out together, and an ask
+        // over resident pages costs the kernel's walk of them for nothing.
+        if self.src.resident_at(off) == Some(true) {
+            return 0;
+        }
+        self.src.advise_willneed(off, b - a)
+    }
+
+    /// Where the record at `rank` begins in the file, by the directory:
+    /// `None` past the last rank or for a source with no flat index.
+    pub fn record_offset(&self, rank: usize) -> Option<u64> {
+        let (sec, idx) = self.flat()?;
+        let (recs, dir) = idx.regions(sec)?;
+        let (a, _) = idx.record_span(dir, rank, 0)?;
+        let recs_at = recs.as_ptr() as usize - sec.as_ptr() as usize;
+        Some(self.index_offset() + recs_at as u64 + a as u64)
+    }
+
+    /// The pages of the records in `from..to` (file offsets, as
+    /// `record_offset` gives them) unmapped from the process
+    /// (`Bytes::advise_dontneed_range`), for a walk that has read them once
+    /// and will not again; the caller drops the file's cache behind.
+    pub fn drop_records(&self, from: u64, to: u64) {
+        if to > from {
+            self.src.advise_dontneed_range(from, (to - from) as usize);
+        }
+    }
+
     /// PROTOTYPE: a hint to fetch the directory's lines for the ranks
     /// `rank` to `n` on, ahead of a seek that will read one of them;
     /// nothing is waited for and nothing is read. A scan's start was three

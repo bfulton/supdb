@@ -2955,7 +2955,6 @@ fn the_heads_arm_seeks_through_the_raw_form_and_scans_the_same() {
         }
     }
     let before = db.zpage_counts();
-    let touches = db.raw_touches();
     let r = db.reader().unwrap();
     for start in &starts {
         for limit in [1usize, 5, 57, 300] {
@@ -2983,10 +2982,295 @@ fn the_heads_arm_seeks_through_the_raw_form_and_scans_the_same() {
         (before.raw_scans, 0),
         "{after:?}"
     );
-    if cfg!(debug_assertions) {
-        assert!(db.raw_touches() > touches, "the seeks read the raw form");
-    }
+    // The seeks went to the raw form's heads, and read no record: every
+    // key of the partition is one length, so a head is a whole key and
+    // the compare is the heads' too (`OrdIndex::seek_in_exact`); before
+    // that the cut read the record at the rank for the compare.
+    assert!(
+        after.cuts > before.cuts,
+        "the seeks went to the raw form's heads: {after:?}"
+    );
+    assert_eq!(
+        after.cut_records, before.cut_records,
+        "the seeks read no record: {after:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Out of core a block's build asks the kernel for every piece's records
+/// over the block before it reads any (`Options::pieces_willneed`). With
+/// no form published (`commit_forms` off) a handle builds every block its
+/// scans touch from the partition and the piece standing over it: under
+/// the forced form the gate is away from raw and the builds over the
+/// piece ask; with the gate set to raw by hand, as a store in core has
+/// it, or with the option off, they ask nothing. The scans answer the
+/// same either way.
+#[test]
+fn a_build_asks_for_its_pieces_pages_together_only_out_of_core() {
+    for on in [true, false] {
+        let dir = scratch(&format!("willneed-{on}"));
+        let mut db = Db::create(
+            &dir,
+            forced(|o| {
+                o.partition_bytes = Some(160 << 10);
+                // One seal's pieces stand until the test is done with them.
+                o.seal_bytes = 1 << 30;
+                o.l0_trigger = 1 << 20;
+                // The block path, which `forced` leaves off: the builds
+                // over the piece are its.
+                o.scan_block_cache = true;
+                o.commit_forms = false;
+                o.pieces_willneed = on;
+            }),
+        )
+        .unwrap();
+        let mut model = ordered_load(&mut db, 4000, 0x11EED);
+        db.zpages_settle().unwrap();
+        // A scan first, so the seal after it lands near reads; then a piece
+        // of updates over every partition.
+        let _ = scanned(&db, b"", 5);
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let mut rng = Rng(0x11EED1);
+        for k in keys.iter().step_by(7) {
+            let v = suite_value(&mut rng);
+            db.append(k, &v);
+            model.entry(k.clone()).or_default().push(v);
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        db.settle().unwrap();
+        assert!(db.levels().1 > 0, "a piece stands");
+        let c = db.zpage_counts();
+        assert_eq!(c.gate, 2, "the forced form's gate: {c:?}");
+        let check = |r: &supdb::Reader, what: &str| {
+            for start in [b"".to_vec(), spaced_key(1000), spaced_key(2500)] {
+                for limit in [1usize, 57, 300] {
+                    same_window(
+                        &scanned(r, &start, limit),
+                        &window(&model, &start, limit),
+                        &format!(
+                            "{what}, from {:?} for {limit}",
+                            String::from_utf8_lossy(&start)
+                        ),
+                    );
+                }
+            }
+        };
+        // A handle builds its own blocks, from the partition and the piece,
+        // with the gate at the form.
+        let r = db.reader().unwrap();
+        check(&r, "a handle, the gate at the form");
+        drop(r);
+        let asked = db.zpage_counts().piece_willneeds;
+        assert_eq!(
+            asked > 0,
+            on,
+            "the builds asked for the piece's pages only with the option: {asked}"
+        );
+        assert_eq!(
+            db.zpage_counts().block_willneeds,
+            0,
+            "a partition a form file serves is never asked for raw"
+        );
+        // The gate at the raw form, as a store in core has it: another
+        // handle builds the same blocks afresh, and asks nothing.
+        db.zgate_set(0);
+        let r = db.reader().unwrap();
+        check(&r, "a handle, the gate at raw");
+        drop(r);
+        assert_eq!(
+            db.zpage_counts().piece_willneeds,
+            asked,
+            "with the gate at raw the builds ask nothing"
+        );
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Out of core a scan asks the kernel for the raw partition records it is
+/// about to walk (`Options::blocks_willneed`): a clean block's records from
+/// the seek, and a block's records ahead of its build. A store with no
+/// form file (`ZPages::Off`) and the gate set away from raw by hand, as
+/// the census leaves it, asks on every walk; with the gate at raw, as a
+/// store in core has it, or with the option off, it asks nothing. The
+/// scans answer the same either way, over a drained store and over one
+/// with unsealed keys.
+#[test]
+fn a_scan_asks_for_the_raw_records_it_is_about_to_walk_only_out_of_core() {
+    for on in [true, false] {
+        let dir = scratch(&format!("block-willneed-{on}"));
+        let mut db = Db::create(
+            &dir,
+            Options {
+                zpages: ZPages::Off,
+                partition_bytes: Some(160 << 10),
+                scan_block_cache: true,
+                commit_forms: false,
+                blocks_willneed: on,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let mut model = ordered_load(&mut db, 4000, 0x3B10C);
+        let check = |r: &supdb::Reader, model: &Model, what: &str| {
+            for start in [b"".to_vec(), spaced_key(1000), spaced_key(2500)] {
+                for limit in [1usize, 57, 300] {
+                    same_window(
+                        &scanned(r, &start, limit),
+                        &window(model, &start, limit),
+                        &format!(
+                            "{what}, from {:?} for {limit}",
+                            String::from_utf8_lossy(&start)
+                        ),
+                    );
+                }
+            }
+        };
+        // The gate as the census leaves it: the drained store's walks ask.
+        db.zgate_set(1);
+        let r = db.reader().unwrap();
+        check(&r, &model, "drained, the gate at the census");
+        drop(r);
+        let drained = db.zpage_counts().block_willneeds;
+        assert_eq!(
+            drained > 0,
+            on,
+            "the drained walks asked for their records only with the option: {drained}"
+        );
+        // Unsealed keys over every block: the builds ask too.
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let mut rng = Rng(0x3B10C1);
+        for k in keys.iter().step_by(5) {
+            let v = suite_value(&mut rng);
+            db.append(k, &v);
+            model.entry(k.clone()).or_default().push(v);
+        }
+        db.commit().unwrap();
+        let r = db.reader().unwrap();
+        check(&r, &model, "unsealed keys, the gate at the census");
+        drop(r);
+        let built = db.zpage_counts().block_willneeds;
+        assert_eq!(
+            built > drained,
+            on,
+            "the builds asked for their records only with the option: {built}"
+        );
+        // The gate at raw: the same walks and builds afresh, nothing asked.
+        db.zgate_set(0);
+        let r = db.reader().unwrap();
+        check(&r, &model, "the gate at raw");
+        drop(r);
+        assert_eq!(
+            db.zpage_counts().block_willneeds,
+            built,
+            "with the gate at raw nothing is asked"
+        );
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A settle's resolve seeks one stride of a partition's heads, a page cold
+/// under a bound: out of core the heads are asked for ahead of the
+/// resolves (`Options::heads_willneed`), runs of them where the batch is
+/// dense in the partition and the strides of the keys a window ahead
+/// where it is sparse, and the scans agree with the model either way. A
+/// block's build asks nothing, since its one page of heads faults beside
+/// the records' ask already; the gate at raw asks nothing.
+#[test]
+fn a_settle_asks_for_the_heads_its_resolves_will_seek_only_out_of_core() {
+    for on in [true, false] {
+        let dir = scratch(&format!("head-willneed-{on}"));
+        let mut db = Db::create(
+            &dir,
+            Options {
+                zpages: ZPages::Off,
+                partition_bytes: Some(160 << 10),
+                scan_block_cache: true,
+                upkeep: supdb::Upkeep::Inline,
+                publish_in_background: false,
+                heads_willneed: on,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let mut model = ordered_load(&mut db, 4000, 0x3B10D);
+        let check = |db: &Db, model: &Model, what: &str| {
+            for start in [b"".to_vec(), spaced_key(1000), spaced_key(2500)] {
+                for limit in [1usize, 57, 300] {
+                    same_window(
+                        &scanned(db, &start, limit),
+                        &window(model, &start, limit),
+                        &format!(
+                            "{what}, from {:?} for {limit}",
+                            String::from_utf8_lossy(&start)
+                        ),
+                    );
+                }
+            }
+        };
+        db.zgate_set(1);
+        // A scan first: the commit after it files its batch into the forms
+        // (`Options::forms_settle_far`), and that settle is what asks. The
+        // drained store's scans build their blocks and ask for no heads.
+        check(&db, &model, "drained, the gate at the census");
+        assert_eq!(
+            db.zpage_counts().head_asks,
+            0,
+            "a drained store's builds ask for no heads"
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let mut rng = Rng(0x3B10D1);
+        // Dense: every fifth key, the pages of heads shared, runs asked.
+        for k in keys.iter().step_by(5) {
+            let v = suite_value(&mut rng);
+            db.append(k, &v);
+            model.entry(k.clone()).or_default().push(v);
+        }
+        db.commit().unwrap();
+        let dense = db.zpage_counts().head_asks;
+        assert_eq!(
+            dense > 0,
+            on,
+            "a dense batch's settle asked for heads only with the option: {dense}"
+        );
+        check(&db, &model, "a dense batch settled, the gate at the census");
+        // Sparse: three keys pages apart, a stride each ahead of its turn.
+        for i in [100usize, 2000, 3900] {
+            let v = suite_value(&mut rng);
+            db.append(&keys[i], &v);
+            model.entry(keys[i].clone()).or_default().push(v);
+        }
+        db.commit().unwrap();
+        let sparse = db.zpage_counts().head_asks;
+        assert_eq!(
+            sparse > dense,
+            on,
+            "a sparse batch's settle asked for heads only with the option: {dense} then {sparse}"
+        );
+        check(
+            &db,
+            &model,
+            "a sparse batch settled, the gate at the census",
+        );
+        // The gate at raw: the same settle asks nothing.
+        db.zgate_set(0);
+        for k in keys.iter().skip(2).step_by(7) {
+            let v = suite_value(&mut rng);
+            db.append(k, &v);
+            model.entry(k.clone()).or_default().push(v);
+        }
+        db.commit().unwrap();
+        assert_eq!(
+            db.zpage_counts().head_asks,
+            sparse,
+            "with the gate at raw no heads are asked for"
+        );
+        check(&db, &model, "the gate at raw");
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// The prefetch arm (`Options::zpages_scan_prefetch`): the scans agree

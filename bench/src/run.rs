@@ -425,6 +425,25 @@ pub fn thread_cpu_us() -> u64 {
     ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000
 }
 
+/// This thread's voluntary and involuntary context switches so far, from
+/// `/proc/thread-self/status`: the second says how often it was taken off
+/// its core with work left, which a pass slower than its CPU is read by.
+pub fn thread_switches() -> (u64, u64) {
+    let status = std::fs::read_to_string("/proc/thread-self/status").unwrap_or_default();
+    let field = |k: &str| -> u64 {
+        status
+            .lines()
+            .find(|l| l.starts_with(k))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+    (
+        field("voluntary_ctxt_switches:"),
+        field("nonvoluntary_ctxt_switches:"),
+    )
+}
+
 /// This thread's minor page faults so far.
 pub fn minflt_self() -> u64 {
     std::fs::read_to_string("/proc/thread-self/stat").map_or(0, |s| stat_minflt(&s))
@@ -1407,6 +1426,30 @@ pub fn probe_counts(bound: &Bound) -> Result<(), String> {
 
 /// `/sys/block/<dev>/stat`'s (read I/Os, read ticks in ms): the first and
 /// fourth fields (`Documentation/block/stat.rst`).
+/// The device's sectors read and written so far, from its `stat` file
+/// (fields 3 and 7): what a pass's window of them says the device did,
+/// whoever asked.
+fn dev_sectors(path: &Path) -> Option<(u64, u64)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let f: Vec<u64> = text
+        .split_whitespace()
+        .filter_map(|x| x.parse().ok())
+        .collect();
+    Some((*f.get(2)?, *f.get(6)?))
+}
+
+/// The process's bytes read from and written to the device so far, from
+/// `/proc/self/io` (`read_bytes`, `write_bytes`), every thread's together.
+fn proc_io() -> Option<(u64, u64)> {
+    let s = std::fs::read_to_string("/proc/self/io").ok()?;
+    let field = |k: &str| -> Option<u64> {
+        s.lines()
+            .find_map(|l| l.strip_prefix(k))
+            .and_then(|v| v.trim().parse().ok())
+    };
+    Some((field("read_bytes:")?, field("write_bytes:")?))
+}
+
 fn dev_read_stat(path: &Path) -> Option<(u64, u64)> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut f = text.split_whitespace().map(|x| x.parse::<u64>().ok());
@@ -2206,17 +2249,122 @@ fn lag_sweep(
             e.sync()?;
         }
         let mut g3 = KeyGen::new(KeyDist::Uniform, scan_keys, 0x1A7);
+        // With `SUPDB_SCAN_OPS` set, every scan of the point's pass is timed
+        // on its own, as the scan pass's are, and a `lagops` line per point
+        // gives the first scans, the median, the pass in tenths -- the mean
+        // of each tenth's scans in the order they ran, which says whether a
+        // slow pass is slow at its start or throughout -- and the scanning
+        // thread's CPU and context switches over the pass beside its wall:
+        // a pass slower than its CPU was descheduled or waiting, one as slow
+        // as its CPU stalled. The clock reads are a cost the rows must not
+        // carry.
+        let per_op = std::env::var_os("SUPDB_SCAN_OPS").is_some();
+        let mut op_us: Vec<f64> = Vec::with_capacity(if per_op { scans as usize } else { 0 });
+        let (cpu0, sw0) = if per_op {
+            (thread_cpu_us(), thread_switches())
+        } else {
+            (0, (0, 0))
+        };
+        // With `SUPDB_LAG_COUNTERS`, the device's and the group's side of
+        // the pass: sectors the device read and wrote while the scans ran,
+        // the process's own read and write bytes, and the group's dirty and
+        // writeback pages at the pass's end with its faults over it, as a
+        // `lagdev` line -- what a pass that reads nothing itself and runs
+        // at a tenth of its CPU is waiting on.
+        let dev0 = if counting_store {
+            counting.dev_stat.as_deref().and_then(dev_sectors)
+        } else {
+            None
+        };
+        let io0 = if counting_store { proc_io() } else { None };
+        let grp0 = if counting_store {
+            counting.bound.and_then(|b| b.stat().ok())
+        } else {
+            None
+        };
         let cs = counting.begin();
         lag_mark(arm, pct, "start");
         let t = Instant::now();
         for _ in 0..scans {
             db_key_into(g3.next(), &mut kb);
-            e.range(&kb, plan.scan_len)?;
+            if per_op {
+                let t0 = Instant::now();
+                e.range(&kb, plan.scan_len)?;
+                op_us.push(t0.elapsed().as_secs_f64() * 1e6);
+            } else {
+                e.range(&kb, plan.scan_len)?;
+            }
         }
         let secs = t.elapsed().as_secs_f64();
         lag_mark(arm, pct, "end");
         counting.end(cs, "scan-lag", &suffix, None, scans);
         scan_lag.push((pct, (scans * plan.scan_len as u64) as f64 / secs));
+        if counting_store {
+            let mb = |sectors: u64| sectors as f64 * 512.0 / (1u64 << 20) as f64;
+            let dev = match (dev0, counting.dev_stat.as_deref().and_then(dev_sectors)) {
+                (Some((r0, w0)), Some((r1, w1))) => {
+                    format!(
+                        "dev_read_mb {:.1} dev_write_mb {:.1}",
+                        mb(r1 - r0),
+                        mb(w1 - w0)
+                    )
+                }
+                _ => "dev n/a".to_string(),
+            };
+            let io = match (io0, proc_io()) {
+                (Some((r0, w0)), Some((r1, w1))) => format!(
+                    "proc_read_mb {:.1} proc_write_mb {:.1}",
+                    (r1 - r0) as f64 / (1u64 << 20) as f64,
+                    (w1 - w0) as f64 / (1u64 << 20) as f64
+                ),
+                _ => "proc n/a".to_string(),
+            };
+            let grp = match (grp0, counting.bound.and_then(|b| b.stat().ok())) {
+                (Some(g0), Some(g1)) => format!(
+                    "dirty_mb {:.1} writeback_mb {:.1} pgfault {} pgmajfault {} refaults {} cache_mb {:.0} rss_mb {:.0}",
+                    g1.dirty as f64 / (1u64 << 20) as f64,
+                    g1.writeback as f64 / (1u64 << 20) as f64,
+                    g1.pgfault.saturating_sub(g0.pgfault),
+                    g1.pgmajfault.saturating_sub(g0.pgmajfault),
+                    g1.workingset_refault_file
+                        .saturating_sub(g0.workingset_refault_file),
+                    g1.cache as f64 / (1u64 << 20) as f64,
+                    g1.rss as f64 / (1u64 << 20) as f64
+                ),
+                _ => "group n/a".to_string(),
+            };
+            eprintln!(
+                "lagdev {arm} {pct} pass_ms {:.1} | {dev} | {io} | {grp}",
+                secs * 1e3
+            );
+        }
+        if per_op && !op_us.is_empty() {
+            let cpu_ms = thread_cpu_us().saturating_sub(cpu0) as f64 / 1e3;
+            let sw1 = thread_switches();
+            let n = op_us.len();
+            let tenths: Vec<String> = (0..10)
+                .map(|i| {
+                    let a = i * n / 10;
+                    let b = ((i + 1) * n / 10).max(a + 1).min(n);
+                    let sum: f64 = op_us[a..b].iter().sum();
+                    format!("{:.0}", sum / (b - a) as f64)
+                })
+                .collect();
+            let mut sorted = op_us.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let head: Vec<String> = op_us.iter().take(4).map(|u| format!("{u:.0}")).collect();
+            eprintln!(
+                "lagops {arm} {pct} scans {n} first {} med {:.1} max {:.0} sum_ms {:.1} pass_ms {:.1} cpu_ms {cpu_ms:.1} vcsw {} nvcsw {} tenths {}",
+                head.join("/"),
+                sorted[n / 2],
+                sorted[n - 1],
+                op_us.iter().sum::<f64>() / 1e3,
+                secs * 1e3,
+                sw1.0.saturating_sub(sw0.0),
+                sw1.1.saturating_sub(sw0.1),
+                tenths.join("/")
+            );
+        }
         if counting_store {
             let c1 = e.counters();
             counters_line(
