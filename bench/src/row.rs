@@ -66,9 +66,15 @@ pub struct MachineInfo {
     pub rotational: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_cache: Option<String>,
+    /// The block device's name (`vda`), from the same lookup. A row from
+    /// a RAM-backed one is never written (`env::ram_backed_device`): the
+    /// device is in every out-of-core rate, and one that is not the
+    /// machine's is for the counts alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Measurement {
     pub workload: String,
     pub arm: String,
@@ -82,6 +88,48 @@ pub struct Measurement {
     pub samples: Vec<f64>,
 }
 
+/// A pass the kernel killed under the run's bound (`run::PassOutcome`):
+/// the arm, the rung and the rep it was, the last phase it finished and
+/// what the group held at that phase's end. A row that carries one is
+/// written under `killed/` and never beside the series (`Row::write`),
+/// since a roster the bound does not fit is not a measurement of the
+/// bound; what the other arms measured is kept in it, and the kill says
+/// where to look. Before this the kill ended the run, with every cell
+/// measured before it gone and, as the engine's notes record of one,
+/// the phase it was in not known.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Kill {
+    pub arm: String,
+    pub size: u64,
+    pub rep: usize,
+    /// The last phase the pass completed, as the row names it
+    /// (`load-shuffled`, `read_2t`, `scan-lag_lag10pct`), or none when
+    /// it died in its first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_phase: Option<String>,
+    /// The group's anonymous and file bytes at that phase's end, from its
+    /// `memory.stat`, where the pass recorded them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rss_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_bytes: Option<u64>,
+    pub utc: String,
+}
+
+/// Where a later sitting of a resumed run began (`bench run --resume`,
+/// `ledger`): the rung and the rep it took up at, and when. A run in
+/// one sitting has none, and its row is the file it always was.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Resumption {
+    pub utc: String,
+    pub size: u64,
+    pub rep: usize,
+}
+
+/// The directory under the runs directory a row with a kill goes to,
+/// beside `<scale>/` and never in it.
+pub const KILLED_DIR: &str = "killed";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Row {
     /// When the run started, `YYYYMMDDThhmmssZ`.
@@ -91,6 +139,14 @@ pub struct Row {
     pub scale: Scale,
     pub machine: MachineInfo,
     pub measurements: Vec<Measurement>,
+    /// The passes the bound's kill took (`Kill`): empty, and absent from
+    /// the file, for a row every pass of which ran.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub killed: Vec<Kill>,
+    /// The sittings after the first of a resumed run (`Resumption`):
+    /// empty, and absent, for a run in one sitting.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resumptions: Vec<Resumption>,
 }
 
 impl Row {
@@ -100,13 +156,31 @@ impl Row {
         format!("{}-{sha7}.json", self.utc)
     }
 
-    /// Write under `runs/<scale>/` and return the path.
+    /// Write under `runs/<scale>/` and return the path -- or, for a row
+    /// with a pass killed under its bound (`killed`), under
+    /// `runs/killed/<scale>/`, where neither the gate's history nor the
+    /// figures read: the other arms' cells are kept for whoever reads
+    /// them, and the series never sees a row of a roster its bound did
+    /// not fit. A run banks its row after every rung, so the copy an
+    /// earlier rung left in the other place is removed here, and the row
+    /// on disk is in one place and whole.
     pub fn write(&self, runs: &Path) -> io::Result<PathBuf> {
-        let dir = runs.join(self.scale.as_str());
+        let banked = runs.join(self.scale.as_str());
+        let killed = runs.join(KILLED_DIR).join(self.scale.as_str());
+        let (dir, other) = if self.killed.is_empty() {
+            (banked, killed)
+        } else {
+            (killed, banked)
+        };
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(self.file_name());
         let text = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
         std::fs::write(&path, text + "\n")?;
+        match std::fs::remove_file(other.join(self.file_name())) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
         Ok(path)
     }
 
@@ -127,7 +201,16 @@ impl Row {
     /// is the string it always was, which `every_banked_row_keeps_its_class`
     /// holds over every row under `runs/`.
     pub fn class(&self) -> String {
-        let m = &self.machine;
+        self.machine.class()
+    }
+}
+
+impl MachineInfo {
+    /// The class of the machine as read (`Row::class`), computed here so
+    /// that a resumed run holds the host it is on to the one its ledger
+    /// names before it measures anything.
+    pub fn class(&self) -> String {
+        let m = self;
         let cpu = slug(&m.cpu_model);
         let mem_gb = (m.mem_total_kb as f64 / 1048576.0).log2().round().exp2() as u64;
         let class = format!("{}/{cpu}/{}c/{mem_gb}g/{}", m.arch, m.cpus, m.virtualised);
@@ -235,7 +318,10 @@ mod tests {
                 read_ahead_kb: Some(128),
                 rotational: Some(true),
                 write_cache: Some("write back".into()),
+                device: Some("vda".into()),
             },
+            killed: vec![],
+            resumptions: vec![],
             measurements: vec![Measurement {
                 workload: "read".into(),
                 arm: "supdb".into(),

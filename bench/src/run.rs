@@ -5,14 +5,22 @@
 //! that drifts drifts across all of them rather than into one. A rep is one
 //! complete pass of every workload for one arm; rep zero is a warmup and is
 //! discarded, because the first touch of a fresh file pays for allocation
-//! and first-fault costs that no steady state repeats.
+//! and first-fault costs that no steady state repeats -- and a run whose
+//! every pass has a process of its own runs none (`first_rep`).
+//!
+//! What a run measures it writes to a ledger as it goes (`ledger`), one
+//! fragment a pass and one a rep, and the row is the ledger's merge: a run
+//! that was cut is taken up from its last whole rep (`bench run --resume`),
+//! and a pass the bound's kill takes is a cell of the row (`PassOutcome`),
+//! not the end of the run.
 
 use crate::bound::Bound;
 use crate::engines::{self, Batch, Engine, ZState};
 use crate::env::{self, IoCounters};
 use crate::gate;
 use crate::hist::Hist;
-use crate::row::{Guarantee, MachineInfo, Measurement, Row};
+use crate::ledger::{Head, Ledger, RepState};
+use crate::row::{Guarantee, Kill, MachineInfo, Measurement, Resumption, Row};
 use crate::workload::{db_key_into, KeyDist, KeyGen, Payload, Permutation, Rng};
 use crate::{ladder_from, Scale};
 use serde::{Deserialize, Serialize};
@@ -223,7 +231,7 @@ pub const MIN_BOUND_BYTES: u64 = 256 << 20;
 /// row's time in the hour.
 pub const OOC_OPS_DIV: u64 = 10;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Plan {
     pub scale: Scale,
     pub arms: Vec<String>,
@@ -695,17 +703,60 @@ const PRIME_MAX_BYTES: u64 = 512 << 20;
 type Key = (String, Option<u64>, String, String); // workload, size, arm, quantity
 
 struct Samples {
-    map: BTreeMap<Key, (Guarantee, &'static str, Vec<f64>)>,
+    map: BTreeMap<Key, (Guarantee, String, Vec<f64>)>,
 }
 
 impl Samples {
+    fn new() -> Samples {
+        Samples {
+            map: BTreeMap::new(),
+        }
+    }
+
+    /// The samples as a row holds them, in key order.
+    fn measurements(&self) -> Vec<Measurement> {
+        self.map
+            .iter()
+            .map(
+                |((workload, size, arm, quantity), (guarantee, unit, samples))| Measurement {
+                    workload: workload.clone(),
+                    arm: arm.clone(),
+                    guarantee: *guarantee,
+                    size: *size,
+                    quantity: quantity.clone(),
+                    unit: unit.clone(),
+                    samples: samples.clone(),
+                },
+            )
+            .collect()
+    }
+
+    /// A fragment merged in: each measurement's samples after the ones
+    /// this already holds for its key, through the same push a live
+    /// sample takes, so a replayed quantity is held to the gate's list as
+    /// a live one is.
+    fn extend(&mut self, m: &[Measurement]) {
+        for x in m {
+            for &v in &x.samples {
+                self.push(
+                    &x.workload,
+                    x.size,
+                    &x.arm,
+                    x.guarantee,
+                    (&x.quantity, &x.unit),
+                    v,
+                );
+            }
+        }
+    }
+
     fn push(
         &mut self,
         workload: &str,
         size: Option<u64>,
         arm: &str,
         guarantee: Guarantee,
-        (quantity, unit): (&str, &'static str),
+        (quantity, unit): (&str, &str),
         v: f64,
     ) {
         // A quantity the gate has no direction for is a quantity the gate
@@ -724,7 +775,7 @@ impl Samples {
                 arm.to_string(),
                 quantity.to_string(),
             ))
-            .or_insert_with(|| (guarantee, unit, Vec::new()))
+            .or_insert_with(|| (guarantee, unit.to_string(), Vec::new()))
             .2
             .push(v);
     }
@@ -765,73 +816,113 @@ pub fn scan_floor_bytes(top: u64, value_size: usize) -> u64 {
     (rung * (KEY_SIZE + value_size) as u64).min(SCAN_FLOOR_CAP)
 }
 
-pub fn run(
-    plan: &Plan,
-    machine: MachineInfo,
-    log: &mut dyn FnMut(&str),
-    bank: Option<&Path>,
+/// The binary's stamp of the engine it was built from, `-dirty` and all
+/// (`build.rs`), which every row carries and a resume is held to.
+pub fn sha() -> &'static str {
+    option_env!("SUPDB_SHA").unwrap_or("unknown")
+}
+
+/// The compiler that built this binary, the row's `rustc`.
+pub fn rustc() -> &'static str {
+    option_env!("SUPDB_RUSTC").unwrap_or("unknown")
+}
+
+/// A run taken up from its ledger (`bench run --resume DIR`): the ledger
+/// and its head, and whether a cut rep keeps the passes it holds
+/// (`--resume-passes`) rather than being taken again whole.
+pub struct Resume {
+    pub ledger: Ledger,
+    pub head: Head,
+    pub passes_only: bool,
+}
+
+/// The seam a test cuts a run at: `SUPDB_BENCH_STOP_AFTER=<size>-<rep>`
+/// ends the run, its ledger left as it stands, once that rep's file is
+/// written, and `<size>-<rep>-<arm>` once that arm's pass is: the state
+/// an interrupt leaves, chosen rather than waited for.
+pub const STOP_AFTER: &str = "SUPDB_BENCH_STOP_AFTER";
+
+/// The seam's (rung, rep, arm), or none for a value that is not one.
+fn stop_after(v: &str) -> Option<(u64, usize, Option<String>)> {
+    let mut it = v.splitn(3, '-');
+    let size = it.next()?.trim().parse().ok()?;
+    let rep = it.next()?.trim().parse().ok()?;
+    Some((size, rep, it.next().map(str::to_string)))
+}
+
+/// The first rep a ladder runs: the warmup, rep zero, where the arms
+/// share this process, and none where each pass has a process of its
+/// own (`Plan::fresh_process`). A warmup warms a process, and a pass in
+/// a fresh one has nothing warmed and its store removed after it, while
+/// under a bound every rep costs what the first does: the warmup was a
+/// quarter of every bounded row for a result no row held.
+pub fn first_rep(plan: &Plan) -> usize {
+    usize::from(plan.fresh_process)
+}
+
+/// The seek floors, under a bound: the device's random read over the
+/// scan floor's file, cold, and again over the same offsets; nothing
+/// unbounded. Pushed into `s` after the warmup, and the line's text
+/// either way.
+fn seek_floors(floor: &Path, bounded: bool, s: &mut Samples, rep: usize) -> Result<String, String> {
+    if !bounded {
+        return Ok(String::new());
+    }
+    drop_cache(floor)?;
+    let first = seek_floor(floor)?;
+    drop_cache(floor)?;
+    let again = seek_floor(floor)?;
+    if rep > 0 {
+        for (name, f) in [("seek-floor", &first), ("seek-floor-again", &again)] {
+            s.push(
+                name,
+                None,
+                FLOOR_ARM,
+                Guarantee::Buffered,
+                ("p50_us", "us"),
+                f.p50_us,
+            );
+            s.push(
+                name,
+                None,
+                FLOOR_ARM,
+                Guarantee::Buffered,
+                ("p99_us", "us"),
+                f.p99_us,
+            );
+        }
+    }
+    Ok(format!(
+        "  seek p50 {:>7.0} p99 {:>7.0} us x{:.2}  again p50 {:>7.0} p99 {:>7.0} us x{:.2}",
+        first.p50_us,
+        first.p99_us,
+        first.amplification,
+        again.p50_us,
+        again.p99_us,
+        again.amplification
+    ))
+}
+
+/// The floors at a sitting's start: what the device does with no engine
+/// in the way, once a rep after a warmup, as one fragment. The page
+/// floor's mappings go to `fresh`, held to the run's end.
+#[allow(clippy::too_many_arguments)]
+fn start_floors(
     root: &Path,
-) -> Result<Row, String> {
-    let utc = crate::row::utc_now();
-    engines::check_matched(&plan.arms, root)?;
-
-    let rungs = ladder_from(plan.bottom, plan.top);
-    let payload = Payload::new(plan.value_size, plan.compress, 0xE1);
-    let mut s = Samples {
-        map: BTreeMap::new(),
-    };
-    let started = Instant::now();
-
-    // The floors first: what the device does with no engine in the way.
-    let floor_bytes = scan_floor_bytes(*rungs.last().unwrap_or(&0), plan.value_size);
-    let floor = root.join("scan-floor.dat");
-    // The page floor's mappings, held to the row's end (`FreshPages`).
-    let mut fresh: Vec<FreshPages> = Vec::new();
-    // The seek floors, under a bound: the device's random read over the
-    // scan floor's file, cold, and again over the same offsets.
+    plan: &Plan,
+    payload: &Payload,
+    floor: &Path,
+    floor_bytes: u64,
+    fresh: &mut Vec<FreshPages>,
+    log: &mut dyn FnMut(&str),
+    started: Instant,
+) -> Result<Vec<Measurement>, String> {
     let bounded = plan.bound.is_some();
-    let seek_floors = |s: &mut Samples, rep: usize| -> Result<String, String> {
-        if !bounded {
-            return Ok(String::new());
-        }
-        drop_cache(&floor)?;
-        let first = seek_floor(&floor)?;
-        drop_cache(&floor)?;
-        let again = seek_floor(&floor)?;
-        if rep > 0 {
-            for (name, f) in [("seek-floor", &first), ("seek-floor-again", &again)] {
-                s.push(
-                    name,
-                    None,
-                    FLOOR_ARM,
-                    Guarantee::Buffered,
-                    ("p50_us", "us"),
-                    f.p50_us,
-                );
-                s.push(
-                    name,
-                    None,
-                    FLOOR_ARM,
-                    Guarantee::Buffered,
-                    ("p99_us", "us"),
-                    f.p99_us,
-                );
-            }
-        }
-        Ok(format!(
-            "  seek p50 {:>7.0} p99 {:>7.0} us x{:.2}  again p50 {:>7.0} p99 {:>7.0} us x{:.2}",
-            first.p50_us,
-            first.p99_us,
-            first.amplification,
-            again.p50_us,
-            again.p99_us,
-            again.amplification
-        ))
-    };
+    let mut s = Samples::new();
     for rep in 0..=plan.reps {
-        let wal = wal_floor(root, plan, &payload)?;
+        let wal = wal_floor(root, plan, payload)?;
         let scan = scan_floor(root, floor_bytes)?;
-        let seek = seek_floors(&mut s, rep)?;
+        let seek = seek_floors(floor, bounded, &mut s, rep)?;
         let mem = mem_floor();
         let (page, held) = page_floor()?;
         fresh.push(held);
@@ -880,6 +971,270 @@ pub fn run(
             1e6 / page,
         ));
     }
+    Ok(s.measurements())
+}
+
+/// A pass's quantities as the row holds them, for the arm's rep: the one
+/// place a pass enters a row, whether it just ran or is replayed from
+/// the ledger.
+fn pass_measurements(size: u64, arm: &str, g: Guarantee, one: &OnePass) -> Vec<Measurement> {
+    let mut s = Samples::new();
+    let sz = Some(size);
+    s.push("load", sz, arm, g, ("ops_per_s", "ops/s"), one.load_ops_s);
+    s.push(
+        "load",
+        sz,
+        arm,
+        g,
+        ("device_bytes_per_byte", "B/B"),
+        one.load_bpb,
+    );
+    s.push(
+        "load",
+        sz,
+        arm,
+        g,
+        ("bytes_on_disk_per_byte", "B/B"),
+        one.disk_bpb,
+    );
+    s.push(
+        "load-shuffled",
+        sz,
+        arm,
+        g,
+        ("ops_per_s", "ops/s"),
+        one.shuffled_ops_s,
+    );
+    s.push("read", sz, arm, g, ("reads_per_s", "reads/s"), one.reads_s);
+    s.push("read", sz, arm, g, ("p99_us", "µs"), one.p99_us);
+    s.push(
+        "scan",
+        sz,
+        arm,
+        g,
+        ("entries_per_s", "entries/s"),
+        one.scan_entries_s,
+    );
+    for (pct, v) in &one.scan_lag {
+        let q = format!("entries_per_s_lag{pct}pct");
+        s.push("scan-lag", sz, arm, g, (q.as_str(), "entries/s"), *v);
+    }
+    for (pct, v) in &one.burst_lag {
+        let q = format!("updates_per_s_lag{pct}pct");
+        s.push("scan-lag", sz, arm, g, (q.as_str(), "ops/s"), *v);
+    }
+    for (threads, v) in &one.reads_s_threaded {
+        let q = threaded_quantity("reads_per_s", *threads);
+        s.push("read", sz, arm, g, (q.as_str(), "reads/s"), *v);
+    }
+    for (threads, v) in &one.scan_entries_s_threaded {
+        let q = threaded_quantity("entries_per_s", *threads);
+        s.push("scan", sz, arm, g, (q.as_str(), "entries/s"), *v);
+    }
+    for (letter, ops_s) in &one.ycsb_ops_s {
+        s.push(
+            &format!("ycsb-{letter}"),
+            sz,
+            arm,
+            g,
+            ("ops_per_s", "ops/s"),
+            *ops_s,
+        );
+    }
+    for (threads, v) in &one.scan_mixed_threaded {
+        let q = threaded_quantity("entries_per_s", *threads);
+        s.push("scan-mixed", sz, arm, g, (q.as_str(), "entries/s"), *v);
+    }
+    // The counts around each phase, a bounded row's only.
+    for (workload, suffix, c) in &one.phase_counts {
+        for (base, v) in c.each() {
+            let Some(v) = v else { continue };
+            let q = format!("{base}{suffix}");
+            s.push(workload, sz, arm, g, (q.as_str(), count_unit(base)), v);
+        }
+    }
+    s.measurements()
+}
+
+/// An arm's rep as the ledger holds it: its pass's measurements into
+/// `s`, or its kill into `killed`.
+fn replay_arm(
+    l: &Ledger,
+    size: u64,
+    rep: usize,
+    arm: &str,
+    s: &mut Samples,
+    killed: &mut Vec<Kill>,
+) -> Result<(), String> {
+    if let Some(frag) = l
+        .read_pass(size, rep, arm)
+        .map_err(|e| format!("the run's ledger, {arm} at rep {rep} of {size}: {e}"))?
+    {
+        s.extend(&frag);
+        return Ok(());
+    }
+    if let Some(k) = l
+        .read_kill(size, rep, arm)
+        .map_err(|e| format!("the run's ledger, {arm} at rep {rep} of {size}: {e}"))?
+    {
+        killed.push(k);
+        return Ok(());
+    }
+    Err(format!(
+        "the run's ledger holds neither a pass nor a kill of {arm} at rep {rep} of {size}, \
+         in a rep it calls whole"
+    ))
+}
+
+pub fn run(
+    plan: &Plan,
+    machine: MachineInfo,
+    log: &mut dyn FnMut(&str),
+    bank: Option<&Path>,
+    root: &Path,
+    resume: Option<Resume>,
+) -> Result<Row, String> {
+    engines::check_matched(&plan.arms, root)?;
+    // The run's identity: its own, with a fresh ledger under the runs
+    // directory where there is one, or the ledger's for a run taken up,
+    // whose row is the row its first sitting began.
+    let resumed = resume.is_some();
+    let (utc, sha, rustc, mut resumptions, ledger, passes_only) = match resume {
+        Some(r) => (
+            r.head.utc,
+            r.head.sha,
+            r.head.rustc,
+            r.head.resumptions,
+            Some(r.ledger),
+            r.passes_only,
+        ),
+        None => {
+            let utc = crate::row::utc_now();
+            let ledger = match bank {
+                Some(out) => {
+                    let head = Head {
+                        utc: utc.clone(),
+                        sha: sha().to_string(),
+                        rustc: rustc().to_string(),
+                        machine: machine.clone(),
+                        plan: plan.clone(),
+                        resumptions: Vec::new(),
+                    };
+                    Some(Ledger::create(out, &head).map_err(|e| format!("the run's ledger: {e}"))?)
+                }
+                None => None,
+            };
+            (
+                utc,
+                sha().to_string(),
+                rustc().to_string(),
+                Vec::new(),
+                ledger,
+                false,
+            )
+        }
+    };
+    let ledger_err = |what: &str, e: std::io::Error| format!("the run's ledger, {what}: {e}");
+
+    let rungs = ladder_from(plan.bottom, plan.top);
+    let payload = Payload::new(plan.value_size, plan.compress, 0xE1);
+    let mut s = Samples::new();
+    let mut killed: Vec<Kill> = Vec::new();
+    let started = Instant::now();
+    let first = first_rep(plan);
+    let stop = std::env::var(STOP_AFTER).ok().and_then(|v| stop_after(&v));
+
+    // What the ledger holds: every earlier sitting's floors, and which
+    // reps are whole. A cut rep is taken again whole, from its first
+    // arm, unless the resume keeps passes.
+    let mut sittings = 0;
+    if let Some(l) = &ledger {
+        for f in l.read_floors().map_err(|e| ledger_err("its floors", e))? {
+            s.extend(&f);
+            sittings += 1;
+        }
+    }
+    let mut todo: Vec<(u64, usize, Vec<String>)> = Vec::new();
+    for &size in &rungs {
+        for rep in first..=plan.reps {
+            let Some(l) = &ledger else {
+                todo.push((size, rep, plan.arms.clone()));
+                continue;
+            };
+            match l.rep_state(size, rep, &plan.arms) {
+                RepState::Whole => {}
+                RepState::Cut(done) if passes_only => {
+                    let left: Vec<String> = plan
+                        .arms
+                        .iter()
+                        .filter(|a| !done.contains(a))
+                        .cloned()
+                        .collect();
+                    todo.push((size, rep, left));
+                }
+                RepState::Cut(done) => {
+                    if !done.is_empty() {
+                        log(&format!(
+                            "rep {rep} at {size} was cut after {}; taken again whole",
+                            done.join(",")
+                        ));
+                        l.forget_rep(size, rep, &plan.arms)
+                            .map_err(|e| ledger_err("a cut rep", e))?;
+                    }
+                    todo.push((size, rep, plan.arms.clone()));
+                }
+            }
+        }
+    }
+
+    // The floors first, for a sitting that runs anything: what the
+    // device does with no engine in the way, taken again at every
+    // sitting since the host may have moved between them.
+    let floor_bytes = scan_floor_bytes(*rungs.last().unwrap_or(&0), plan.value_size);
+    let floor = root.join("scan-floor.dat");
+    // The page floor's mappings, held to the row's end (`FreshPages`).
+    let mut fresh: Vec<FreshPages> = Vec::new();
+    let bounded = plan.bound.is_some();
+    if let Some((size, rep, _)) = todo.first() {
+        if resumed {
+            resumptions.push(Resumption {
+                utc: crate::row::utc_now(),
+                size: *size,
+                rep: *rep,
+            });
+            if let Some(l) = &ledger {
+                l.write_head(&Head {
+                    utc: utc.clone(),
+                    sha: sha.clone(),
+                    rustc: rustc.clone(),
+                    machine: machine.clone(),
+                    plan: plan.clone(),
+                    resumptions: resumptions.clone(),
+                })
+                .map_err(|e| ledger_err("its head", e))?;
+            }
+            log(&format!(
+                "{:>7}s  taken up at rep {rep} of {size}, sitting {}",
+                started.elapsed().as_secs(),
+                sittings + 1
+            ));
+        }
+        let floors = start_floors(
+            root,
+            plan,
+            &payload,
+            &floor,
+            floor_bytes,
+            &mut fresh,
+            log,
+            started,
+        )?;
+        if let Some(l) = &ledger {
+            l.write_floors(sittings, &floors)
+                .map_err(|e| ledger_err("its floors", e))?;
+        }
+        s.extend(&floors);
+    }
     // The scan floor's file is dead weight from here: it is the top rung's
     // bytes capped at four gibibytes, and at `full` it sat on all four for
     // the whole rung phase -- the days-long part, on the host that ran out
@@ -905,6 +1260,7 @@ pub fn run(
         }
     }
 
+    let mut banked = true;
     for &size in &rungs {
         // Refuse a rung that cannot fit before starting it, rather than
         // dying part way through. A pass rebuilds its store and the store is
@@ -918,138 +1274,128 @@ pub fn run(
         // cheap ones. If it refuses a rung you believe fits, the message
         // names both numbers. The host carrying these runs reached 967 of
         // 994 GB used, and a rung that dies on ENOSPC costs every hour it
-        // had already spent.
+        // had already spent. A rung the ledger holds whole runs nothing
+        // and is not refused.
         let need = size * (KEY_SIZE + plan.value_size) as u64 * 3;
-        if let Some(free) = free_bytes(root) {
-            if free < need {
-                return Err(format!(
-                    "rung {size} needs about {:.0} GB and {:.0} GB is free where the \
-                     stores are built ({}); the rungs below it are already written",
-                    need as f64 / 1e9,
-                    free as f64 / 1e9,
-                    root.display()
-                ));
+        if todo.iter().any(|(sz, _, _)| *sz == size) {
+            if let Some(free) = free_bytes(root) {
+                if free < need {
+                    return Err(format!(
+                        "rung {size} needs about {:.0} GB and {:.0} GB is free where the \
+                         stores are built ({}); the rungs below it are already written",
+                        need as f64 / 1e9,
+                        free as f64 / 1e9,
+                        root.display()
+                    ));
+                }
             }
         }
         let map_gb = lmdb_map_gb(size, plan.value_size);
-        for rep in 0..=plan.reps {
+        for rep in first..=plan.reps {
+            let Some((_, _, arms_to_run)) = todo.iter().find(|(sz, r, _)| *sz == size && *r == rep)
+            else {
+                // A rep the ledger holds whole: replayed, each arm's pass
+                // or kill and then the floors sampled after it.
+                let l = ledger.as_ref().expect("a rep is whole only in a ledger");
+                for arm in &plan.arms {
+                    replay_arm(l, size, rep, arm, &mut s, &mut killed)?;
+                }
+                let frag = l
+                    .read_rep(size, rep)
+                    .map_err(|e| ledger_err("a rep", e))?
+                    .unwrap_or_default();
+                s.extend(&frag);
+                continue;
+            };
             for arm in &plan.arms {
+                if !arms_to_run.contains(arm) {
+                    let l = ledger.as_ref().expect("a pass is kept only in a ledger");
+                    replay_arm(l, size, rep, arm, &mut s, &mut killed)?;
+                    continue;
+                }
                 let g = engines::guarantee(arm).expect("checked at start");
                 let dir = root.join(format!("{arm}-{size}-{rep}"));
-                let one = if plan.fresh_process {
-                    pass_in_child(arm, &dir, size, map_gb, plan)?
+                let outcome = if plan.fresh_process {
+                    pass_in_child(arm, &dir, size, rep, map_gb, plan)?
                 } else {
-                    one_pass(arm, &dir, size, map_gb, plan, &payload)?
+                    PassOutcome::Done(one_pass(arm, &dir, size, map_gb, plan, &payload, None)?)
                 };
                 let _ = std::fs::remove_dir_all(&dir);
-                if rep > 0 {
-                    let sz = Some(size);
-                    s.push("load", sz, arm, g, ("ops_per_s", "ops/s"), one.load_ops_s);
-                    s.push(
-                        "load",
-                        sz,
-                        arm,
-                        g,
-                        ("device_bytes_per_byte", "B/B"),
-                        one.load_bpb,
-                    );
-                    s.push(
-                        "load",
-                        sz,
-                        arm,
-                        g,
-                        ("bytes_on_disk_per_byte", "B/B"),
-                        one.disk_bpb,
-                    );
-                    s.push(
-                        "load-shuffled",
-                        sz,
-                        arm,
-                        g,
-                        ("ops_per_s", "ops/s"),
-                        one.shuffled_ops_s,
-                    );
-                    s.push("read", sz, arm, g, ("reads_per_s", "reads/s"), one.reads_s);
-                    s.push("read", sz, arm, g, ("p99_us", "µs"), one.p99_us);
-                    s.push(
-                        "scan",
-                        sz,
-                        arm,
-                        g,
-                        ("entries_per_s", "entries/s"),
-                        one.scan_entries_s,
-                    );
-                    for (pct, v) in &one.scan_lag {
-                        let q = format!("entries_per_s_lag{pct}pct");
-                        s.push("scan-lag", sz, arm, g, (q.as_str(), "entries/s"), *v);
-                    }
-                    for (pct, v) in &one.burst_lag {
-                        let q = format!("updates_per_s_lag{pct}pct");
-                        s.push("scan-lag", sz, arm, g, (q.as_str(), "ops/s"), *v);
-                    }
-                    for (threads, v) in &one.reads_s_threaded {
-                        let q = threaded_quantity("reads_per_s", *threads);
-                        s.push("read", sz, arm, g, (q.as_str(), "reads/s"), *v);
-                    }
-                    for (threads, v) in &one.scan_entries_s_threaded {
-                        let q = threaded_quantity("entries_per_s", *threads);
-                        s.push("scan", sz, arm, g, (q.as_str(), "entries/s"), *v);
-                    }
-                    for (letter, ops_s) in &one.ycsb_ops_s {
-                        s.push(
-                            &format!("ycsb-{letter}"),
-                            sz,
-                            arm,
-                            g,
-                            ("ops_per_s", "ops/s"),
-                            *ops_s,
-                        );
-                    }
-                    for (threads, v) in &one.scan_mixed_threaded {
-                        let q = threaded_quantity("entries_per_s", *threads);
-                        s.push("scan-mixed", sz, arm, g, (q.as_str(), "entries/s"), *v);
-                    }
-                    // The counts around each phase, a bounded row's only.
-                    for (workload, suffix, c) in &one.phase_counts {
-                        for (base, v) in c.each() {
-                            let Some(v) = v else { continue };
-                            let q = format!("{base}{suffix}");
-                            s.push(workload, sz, arm, g, (q.as_str(), count_unit(base)), v);
+                match outcome {
+                    PassOutcome::Killed(k) => {
+                        log(&format!(
+                            "{:>7}s  size {size:>9}  rep {rep}  {arm:<15} KILLED under the bound{}{}",
+                            started.elapsed().as_secs(),
+                            match &k.after_phase {
+                                Some(p) => format!(" after {p}"),
+                                None => " in its first phase".to_string(),
+                            },
+                            match (k.rss_bytes, k.cache_bytes) {
+                                (Some(r), Some(c)) => format!(
+                                    ", the group at {} MB anon and {} MB cache there",
+                                    r >> 20,
+                                    c >> 20
+                                ),
+                                _ => String::new(),
+                            },
+                        ));
+                        if let Some(l) = &ledger {
+                            l.write_kill(&k).map_err(|e| ledger_err("a kill", e))?;
                         }
+                        killed.push(k);
+                    }
+                    PassOutcome::Done(one) => {
+                        let frag = if rep > 0 {
+                            pass_measurements(size, arm, g, &one)
+                        } else {
+                            Vec::new()
+                        };
+                        if let Some(l) = &ledger {
+                            l.write_pass(size, rep, arm, &frag)
+                                .map_err(|e| ledger_err("a pass", e))?;
+                        }
+                        s.extend(&frag);
+                        let top = *plan.threads.last().unwrap_or(&1);
+                        let at_top = |v: &[(usize, f64)]| {
+                            v.iter()
+                                .find(|(t, _)| *t == top)
+                                .map(|(_, v)| *v)
+                                .unwrap_or(0.0)
+                        };
+                        // What the process holds as the next pass opens: a figure
+                        // that climbs from pass to pass is memory the passes before
+                        // left behind, and it comes out of the next store's cache.
+                        // With each pass in a process of its own (`fresh_process`)
+                        // this is the parent's, and flat.
+                        let rss = resident_bytes()
+                            .map(|b| format!("{:.2} GB", b as f64 / 1e9))
+                            .unwrap_or_else(|| "-".into());
+                        // A bounded pass's self-check per phase: the operating
+                        // threads' device bytes cover their major faults, which
+                        // cover the group's refaults, or the counts are odd and
+                        // the line says so before anyone reads the cells.
+                        let counts = one.counts_verdicts();
+                        log(&format!(
+                            "{:>7}s  size {size:>9}  rep {rep}{}  {arm:<15} load {:>10.0} ops/s  read {:>10.0}/s  {top}t {:>10.0}/s  scan {:>11.0}/s  {top}t {:>11.0}/s  ycsb-A {:>9.0}/s  prime {:>5.2} us/pg  rss {rss}{counts}",
+                            started.elapsed().as_secs(),
+                            if rep == 0 { " (warmup)" } else { "" },
+                            one.load_ops_s,
+                            one.reads_s,
+                            at_top(&one.reads_s_threaded),
+                            one.scan_entries_s,
+                            at_top(&one.scan_entries_s_threaded),
+                            one.ycsb_ops_s.iter().find(|(l, _)| *l == 'A').map(|(_, v)| *v).unwrap_or(0.0),
+                            one.prime_us_per_page,
+                        ));
                     }
                 }
-                let top = *plan.threads.last().unwrap_or(&1);
-                let at_top = |v: &[(usize, f64)]| {
-                    v.iter()
-                        .find(|(t, _)| *t == top)
-                        .map(|(_, v)| *v)
-                        .unwrap_or(0.0)
-                };
-                // What the process holds as the next pass opens: a figure
-                // that climbs from pass to pass is memory the passes before
-                // left behind, and it comes out of the next store's cache.
-                // With each pass in a process of its own (`fresh_process`)
-                // this is the parent's, and flat.
-                let rss = resident_bytes()
-                    .map(|b| format!("{:.2} GB", b as f64 / 1e9))
-                    .unwrap_or_else(|| "-".into());
-                // A bounded pass's self-check per phase: the operating
-                // threads' device bytes cover their major faults, which
-                // cover the group's refaults, or the counts are odd and
-                // the line says so before anyone reads the cells.
-                let counts = one.counts_verdicts();
-                log(&format!(
-                    "{:>7}s  size {size:>9}  rep {rep}{}  {arm:<15} load {:>10.0} ops/s  read {:>10.0}/s  {top}t {:>10.0}/s  scan {:>11.0}/s  {top}t {:>11.0}/s  ycsb-A {:>9.0}/s  prime {:>5.2} us/pg  rss {rss}{counts}",
-                    started.elapsed().as_secs(),
-                    if rep == 0 { " (warmup)" } else { "" },
-                    one.load_ops_s,
-                    one.reads_s,
-                    at_top(&one.reads_s_threaded),
-                    one.scan_entries_s,
-                    at_top(&one.scan_entries_s_threaded),
-                    one.ycsb_ops_s.iter().find(|(l, _)| *l == 'A').map(|(_, v)| *v).unwrap_or(0.0),
-                    one.prime_us_per_page,
-                ));
+                if stop.as_ref().is_some_and(|(sz, r, a)| {
+                    *sz == size && *r == rep && a.as_deref() == Some(arm.as_str())
+                }) {
+                    return Err(format!(
+                        "{STOP_AFTER}: stopped after the pass of {arm} at rep {rep} of {size}"
+                    ));
+                }
             }
             // The price of a fresh page as this rep leaves it for the next
             // (`page_floor`): what the pass after it will pay for its
@@ -1057,11 +1403,13 @@ pub fn run(
             // only at the row's start. Under a bound the seek floors are
             // sampled here too, since the device a rep leaves behind --
             // its queue, the host's cache of what the rep read -- is the
-            // device the next pass reads from.
+            // device the next pass reads from. The rep's fragment, and the
+            // mark that the rep is whole.
+            let mut after = Samples::new();
             let (page, held) = page_floor()?;
             fresh.push(held);
             if rep > 0 {
-                s.push(
+                after.push(
                     "page-floor",
                     None,
                     FLOOR_ARM,
@@ -1070,12 +1418,24 @@ pub fn run(
                     page,
                 );
             }
-            let seek = seek_floors(&mut s, rep)?;
+            let seek = seek_floors(&floor, bounded, &mut after, rep)?;
             if !seek.is_empty() {
                 log(&format!(
                     "{:>7}s  size {size:>9}  rep {rep}  floors{seek}",
                     started.elapsed().as_secs()
                 ));
+            }
+            let frag = after.measurements();
+            if let Some(l) = &ledger {
+                l.write_rep(size, rep, &frag)
+                    .map_err(|e| ledger_err("a rep", e))?;
+            }
+            s.extend(&frag);
+            if stop
+                .as_ref()
+                .is_some_and(|(sz, r, a)| *sz == size && *r == rep && a.is_none())
+            {
+                return Err(format!("{STOP_AFTER}: stopped after rep {rep} of {size}"));
             }
         }
         // Bank the row now that this rung is whole. A rung past the memory
@@ -1083,18 +1443,55 @@ pub fn run(
         // a timeout, so the rungs that finished must not depend on the ones
         // that did not.
         if let Some(dir) = bank {
-            match row_of(&utc, &machine, plan, &s).write(dir) {
-                Ok(p) => log(&format!(
-                    "{:>7}s  banked rungs through {size} to {}",
-                    started.elapsed().as_secs(),
-                    p.display()
-                )),
-                Err(e) => log(&format!("could not bank the row: {e}")),
+            match row_of(
+                &utc,
+                &sha,
+                &rustc,
+                &machine,
+                plan,
+                &s,
+                &killed,
+                &resumptions,
+            )
+            .write(dir)
+            {
+                Ok(p) => {
+                    banked = true;
+                    log(&format!(
+                        "{:>7}s  banked rungs through {size} to {}",
+                        started.elapsed().as_secs(),
+                        p.display()
+                    ))
+                }
+                Err(e) => {
+                    banked = false;
+                    log(&format!("could not bank the row: {e}"))
+                }
             }
         }
     }
     let _ = std::fs::remove_dir_all(root);
-    Ok(row_of(&utc, &machine, plan, &s))
+    // The ledger is done with once its row is banked; one whose row could
+    // not be written stays, as the only record of the run.
+    if let Some(l) = ledger {
+        if banked {
+            if let Err(e) = l.remove() {
+                log(&format!("could not remove the run's ledger: {e}"));
+            }
+        } else {
+            log(&format!("the run's ledger stays at {}", l.dir().display()));
+        }
+    }
+    Ok(row_of(
+        &utc,
+        &sha,
+        &rustc,
+        &machine,
+        plan,
+        &s,
+        &killed,
+        &resumptions,
+    ))
 }
 
 /// The row for the samples taken so far.
@@ -1105,47 +1502,74 @@ pub fn run(
 /// has finished. Two `full` runs were lost whole because this was built once,
 /// after the last rung: the artifact step never ran, and the only survivor
 /// was what the log happened to print.
-fn row_of(utc: &str, machine: &MachineInfo, plan: &Plan, s: &Samples) -> Row {
-    let measurements = s
-        .map
-        .iter()
-        .map(
-            |((workload, size, arm, quantity), (guarantee, unit, samples))| Measurement {
-                workload: workload.clone(),
-                arm: arm.clone(),
-                guarantee: *guarantee,
-                size: *size,
-                quantity: quantity.clone(),
-                unit: unit.to_string(),
-                samples: samples.clone(),
-            },
-        )
-        .collect();
+#[allow(clippy::too_many_arguments)]
+fn row_of(
+    utc: &str,
+    sha: &str,
+    rustc: &str,
+    machine: &MachineInfo,
+    plan: &Plan,
+    s: &Samples,
+    killed: &[Kill],
+    resumptions: &[Resumption],
+) -> Row {
     Row {
         utc: utc.to_string(),
-        sha: option_env!("SUPDB_SHA").unwrap_or("unknown").to_string(),
-        rustc: option_env!("SUPDB_RUSTC").unwrap_or("unknown").to_string(),
+        sha: sha.to_string(),
+        rustc: rustc.to_string(),
         scale: plan.scale,
         machine: machine.clone(),
-        measurements,
+        measurements: s.measurements(),
+        killed: killed.to_vec(),
+        resumptions: resumptions.to_vec(),
+    }
+}
+
+/// A rate's NaN across the process boundary a pass crosses as JSON
+/// (`pass_in_child`): a phase the plan's passes left out leaves a NaN
+/// where its rate would be, JSON has no NaN and serde writes it as null,
+/// and a null read back as an `f64` refused the whole result -- every
+/// pairing of a subset of the passes under a bound, where each pass has
+/// a process of its own. Null is NaN here, both ways.
+mod nan_null {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+        if v.is_nan() {
+            None::<f64>.serialize(s)
+        } else {
+            Some(*v).serialize(s)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+        Ok(Option::<f64>::deserialize(d)?.unwrap_or(f64::NAN))
     }
 }
 
 #[derive(Serialize, Deserialize)]
-struct OnePass {
+pub struct OnePass {
     /// The dearer of the pass's two primes, microseconds a page: the
     /// host's price for a load-sized footprint this pass, logged and
     /// paired, never banked.
+    #[serde(with = "nan_null")]
     prime_us_per_page: f64,
+    #[serde(with = "nan_null")]
     load_ops_s: f64,
+    #[serde(with = "nan_null")]
     load_bpb: f64,
     /// Bytes the store's files hold on disk after the load, per byte
     /// stored: what a user pays in space, beside what the device was made
     /// to write to get there.
+    #[serde(with = "nan_null")]
     disk_bpb: f64,
+    #[serde(with = "nan_null")]
     shuffled_ops_s: f64,
+    #[serde(with = "nan_null")]
     reads_s: f64,
+    #[serde(with = "nan_null")]
     p99_us: f64,
+    #[serde(with = "nan_null")]
     scan_entries_s: f64,
     /// Scans over a store with this much of itself written and nothing
     /// merged since: (percent updated, entries per second). The axis the
@@ -1308,6 +1732,59 @@ struct CountSnap {
     dev: Option<(u64, u64)>,
 }
 
+/// What a pass in a process of its own leaves for its parent: the last
+/// phase it finished, with what the group held at that phase's end, in a
+/// file beside the store (`<dir>.phase`), rewritten at every phase's end,
+/// so that a pass the bound's kill takes is placed by the phase after the
+/// one recorded (`Kill::after_phase`). And the seam a test kills a pass
+/// with: `SUPDB_BENCH_KILL_AFTER=<arm>:<phase>[:<rep>]` sends the pass
+/// SIGKILL once that phase is recorded, the kill the bound would make,
+/// chosen rather than waited for (`one_pass_child` reads it).
+pub struct PhaseTrace {
+    file: PathBuf,
+    kill_after: Option<String>,
+}
+
+pub const KILL_AFTER: &str = "SUPDB_BENCH_KILL_AFTER";
+
+impl PhaseTrace {
+    /// The trace for the pass of `arm`, rep `rep`, whose store is `dir`;
+    /// `seam` is the kill seam's value, if set.
+    fn new(dir: &Path, arm: &str, rep: usize, seam: Option<&str>) -> PhaseTrace {
+        let kill_after = seam.and_then(|v| {
+            let mut it = v.splitn(3, ':');
+            let (a, phase, r) = (it.next()?, it.next()?, it.next());
+            let rep_matches = match r {
+                Some(r) => r.parse::<usize>().ok() == Some(rep),
+                None => true,
+            };
+            (a == arm && rep_matches).then(|| phase.to_string())
+        });
+        PhaseTrace {
+            file: PathBuf::from(format!("{}.phase", dir.display())),
+            kill_after,
+        }
+    }
+
+    /// The parent's side: the mark the pass left, if any, and the file
+    /// gone with it.
+    fn take(dir: &Path) -> Option<PhaseMark> {
+        let file = PathBuf::from(format!("{}.phase", dir.display()));
+        let text = std::fs::read_to_string(&file).ok();
+        let _ = std::fs::remove_file(&file);
+        serde_json::from_str(&text?).ok()
+    }
+}
+
+/// The phase a pass last finished, with the group's `rss` and `cache` at
+/// its end where the pass was bounded.
+#[derive(Serialize, Deserialize)]
+struct PhaseMark {
+    phase: String,
+    rss_bytes: Option<u64>,
+    cache_bytes: Option<u64>,
+}
+
 /// Takes the readings around a bounded pass's phases, and nothing for
 /// an unbounded one. The device is the temp directory's, falling back to
 /// `vda`, and its stat file read once to decide whether it is there.
@@ -1315,6 +1792,7 @@ struct Counting<'a> {
     bound: Option<&'a Bound>,
     dev_stat: Option<PathBuf>,
     out: Vec<(String, String, PhaseCounts)>,
+    trace: Option<PhaseTrace>,
 }
 
 impl<'a> Counting<'a> {
@@ -1323,7 +1801,11 @@ impl<'a> Counting<'a> {
     /// missing refuses the pass by name before anything is measured
     /// rather than recording a zero that reads as a store that never
     /// left the cache. Unbounded, none of them is read at all.
-    fn new(bound: Option<&'a Bound>, dir: &Path) -> Result<Counting<'a>, String> {
+    fn new(
+        bound: Option<&'a Bound>,
+        dir: &Path,
+        trace: Option<PhaseTrace>,
+    ) -> Result<Counting<'a>, String> {
         if let Some(b) = bound {
             probe_counts(b)?;
         }
@@ -1336,7 +1818,28 @@ impl<'a> Counting<'a> {
             bound,
             dev_stat,
             out: Vec::new(),
+            trace,
         })
+    }
+
+    /// The phase just finished, left for the parent (`PhaseTrace`), and
+    /// the seam's kill after it.
+    fn mark(&self, workload: &str, suffix: &str) {
+        let Some(t) = &self.trace else { return };
+        let phase = format!("{workload}{suffix}");
+        let stat = self.bound.and_then(|b| b.stat().ok());
+        let mark = PhaseMark {
+            phase: phase.clone(),
+            rss_bytes: stat.map(|s| s.rss),
+            cache_bytes: stat.map(|s| s.cache),
+        };
+        if let Ok(text) = serde_json::to_string(&mark) {
+            let _ = std::fs::write(&t.file, text);
+        }
+        if t.kill_after.as_deref() == Some(phase.as_str()) {
+            // SAFETY: a signal to this process itself.
+            unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+        }
     }
 
     /// The readings before a phase's first operation, or none unbounded.
@@ -1365,6 +1868,7 @@ impl<'a> Counting<'a> {
         workers: Option<(u64, u64)>,
         ops: u64,
     ) {
+        self.mark(workload, suffix);
         let (Some(b), Some(bound)) = (begun, self.bound) else {
             return;
         };
@@ -1652,20 +2156,29 @@ fn shuffled_load(
     Ok(secs)
 }
 
-/// The prefix of the error `pass_in_child` answers when the pass's process
-/// was killed by SIGKILL, which under a bound is the group's limit: the
-/// command exits with the kill's own status (137), as the pass would have,
-/// so a bounded run's gate reads it the same.
-pub const PASS_KILLED: &str = "pass killed";
+/// How a pass in a process of its own ended: with its result, or killed
+/// by SIGKILL, which under a bound is the group's limit. A kill is a cell
+/// of the row and not the end of the run: the kill names the arm, the
+/// rung, the rep and the phase after the last the pass recorded
+/// (`PhaseTrace`), and the run goes on to the next arm, so the hours the
+/// other arms took stand. The command exits with the kill's status, 137,
+/// once the row is written (`main`), which is the status a bounded run's
+/// wrapper reads.
+pub enum PassOutcome {
+    Done(OnePass),
+    Killed(Kill),
+}
 
 /// What a pass's own process is handed (`pass_in_child` writes it,
-/// `one_pass_child` reads it): the arm, its store's directory, the rung,
-/// LMDB's map size, the plan whole, and where the result goes.
+/// `one_pass_child` reads it): the arm, its store's directory, the rung
+/// and the rep, LMDB's map size, the plan whole, and where the result
+/// goes.
 #[derive(Serialize)]
 struct PassSpecRef<'a> {
     arm: &'a str,
     dir: &'a Path,
     size: u64,
+    rep: usize,
     map_gb: usize,
     plan: &'a Plan,
     out: &'a Path,
@@ -1676,6 +2189,8 @@ struct PassSpec {
     arm: String,
     dir: PathBuf,
     size: u64,
+    #[serde(default)]
+    rep: usize,
     map_gb: usize,
     plan: Plan,
     out: PathBuf,
@@ -1687,20 +2202,23 @@ struct PassSpec {
 /// pass's spec in a file beside the store and its result written to
 /// another, since the pass prints its own lines to both streams and the
 /// result must not share one. A child killed by SIGKILL is the bound's
-/// kill, and the error says so (`PASS_KILLED`).
+/// kill, answered as the outcome it is (`PassOutcome::Killed`) with the
+/// phase the child had last recorded.
 fn pass_in_child(
     arm: &str,
     dir: &Path,
     size: u64,
+    rep: usize,
     map_gb: usize,
     plan: &Plan,
-) -> Result<OnePass, String> {
+) -> Result<PassOutcome, String> {
     let spec_path = PathBuf::from(format!("{}.spec.json", dir.display()));
     let out = PathBuf::from(format!("{}.pass.json", dir.display()));
     let spec = PassSpecRef {
         arm,
         dir,
         size,
+        rep,
         map_gb,
         plan,
         out: &out,
@@ -1715,16 +2233,22 @@ fn pass_in_child(
         .status()
         .map_err(|e| format!("spawning the pass's process: {e}"))?;
     let _ = std::fs::remove_file(&spec_path);
+    let mark = PhaseTrace::take(dir);
     if !status.success() {
         let _ = std::fs::remove_file(&out);
         #[cfg(unix)]
         {
             use std::os::unix::process::ExitStatusExt as _;
             if status.signal() == Some(9) {
-                return Err(format!(
-                    "{PASS_KILLED}: the pass of {arm} at {size} keys, in a process of its own, \
-                     was killed by SIGKILL -- under a bound, the group's limit"
-                ));
+                return Ok(PassOutcome::Killed(Kill {
+                    arm: arm.to_string(),
+                    size,
+                    rep,
+                    after_phase: mark.as_ref().map(|m| m.phase.clone()),
+                    rss_bytes: mark.as_ref().and_then(|m| m.rss_bytes),
+                    cache_bytes: mark.as_ref().and_then(|m| m.cache_bytes),
+                    utc: crate::row::utc_now(),
+                }));
             }
         }
         return Err(format!(
@@ -1734,7 +2258,9 @@ fn pass_in_child(
     let text = std::fs::read_to_string(&out)
         .map_err(|e| format!("the pass's result for {arm} at {size} keys: {e}"))?;
     let _ = std::fs::remove_file(&out);
-    serde_json::from_str(&text).map_err(|e| format!("the pass's result for {arm}: {e}"))
+    serde_json::from_str(&text)
+        .map(PassOutcome::Done)
+        .map_err(|e| format!("the pass's result for {arm}: {e}"))
 }
 
 /// The pass's own process: `bench one-pass SPEC` reads the spec its parent
@@ -1748,6 +2274,8 @@ pub fn one_pass_child(spec_path: &Path) -> Result<(), String> {
         serde_json::from_str(&text).map_err(|e| format!("the pass's spec: {e}"))?;
     debug_assert!(spec.plan.bound.as_ref().is_none_or(|b| !b.is_owned()));
     let payload = Payload::new(spec.plan.value_size, spec.plan.compress, 0xE1);
+    let seam = std::env::var(KILL_AFTER).ok();
+    let trace = PhaseTrace::new(&spec.dir, &spec.arm, spec.rep, seam.as_deref());
     let one = one_pass(
         &spec.arm,
         &spec.dir,
@@ -1755,6 +2283,7 @@ pub fn one_pass_child(spec_path: &Path) -> Result<(), String> {
         spec.map_gb,
         &spec.plan,
         &payload,
+        Some(trace),
     )?;
     let text = serde_json::to_vec(&one).map_err(|e| format!("the pass's result: {e}"))?;
     std::fs::write(&spec.out, text)
@@ -1768,6 +2297,7 @@ fn one_pass(
     map_gb: usize,
     plan: &Plan,
     payload: &Payload,
+    trace: Option<PhaseTrace>,
 ) -> Result<OnePass, String> {
     // Ordered load, then reads, scans and the YCSB mixes over it. The
     // store opens into a primed pool (`prime_fresh_pool`), as every store
@@ -1777,7 +2307,7 @@ fn one_pass(
     let passes = plan.passes;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     // The directory first, since the counting finds the device through it.
-    let mut counting = Counting::new(plan.bound.as_ref(), dir)?;
+    let mut counting = Counting::new(plan.bound.as_ref(), dir, trace)?;
     let prime_a = prime_fresh_pool(prime_bytes_for(size, plan.bound_bytes()))?;
     let mut e = engines::open(arm, dir, map_gb)?;
     let c0 = counting.begin();
@@ -2693,14 +3223,17 @@ pub fn ab(
     reps: usize,
     plan: &Plan,
     log: &mut dyn std::io::Write,
-) -> Result<Vec<AbQuantity>, String> {
+) -> Result<(Vec<AbQuantity>, Vec<Kill>), String> {
     let payload = Payload::new(plan.value_size, plan.compress, 0xE1);
     let map_gb = lmdb_map_gb(size, plan.value_size);
     let root = std::env::temp_dir().join(format!("supdb-ab-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&root);
     let mut pairs: std::collections::BTreeMap<String, Vec<(f64, f64)>> = Default::default();
+    let mut killed: Vec<Kill> = Vec::new();
     let t0 = Instant::now();
-    for rep in 0..=reps {
+    // Rep zero is the warmup, as it is for a row, and as for a row there
+    // is none with each pass in a process of its own (`first_rep`).
+    for rep in first_rep(plan)..=reps {
         // Alternate which arm goes first, so the cost of standing first
         // falls on each of them equally instead of on one of them always.
         // Which one is A is the order's, not the name's: an arm set
@@ -2715,8 +3248,30 @@ pub fn ab(
         let mut got: Vec<(String, f64)> = Vec::new();
         for (i, arm) in order.iter().enumerate() {
             let dir = root.join(format!("{arm}-{rep}-{i}"));
-            let one = one_pass(arm, &dir, size, map_gb, plan, &payload)?;
+            let outcome = if plan.fresh_process {
+                pass_in_child(arm, &dir, size, rep, map_gb, plan)?
+            } else {
+                PassOutcome::Done(one_pass(arm, &dir, size, map_gb, plan, &payload, None)?)
+            };
             let _ = std::fs::remove_dir_all(&dir);
+            let one = match outcome {
+                PassOutcome::Done(one) => one,
+                PassOutcome::Killed(k) => {
+                    // The rep's pair is lost with either arm's pass, and
+                    // the other arm is not run for a pair it cannot be in.
+                    let _ = writeln!(
+                        log,
+                        "{:>6.0}s  rep {rep}/{reps}  {arm} KILLED under the bound{}; the rep's pair is lost",
+                        t0.elapsed().as_secs_f64(),
+                        match &k.after_phase {
+                            Some(p) => format!(" after {p}"),
+                            None => " in its first phase".to_string(),
+                        }
+                    );
+                    killed.push(k);
+                    break;
+                }
+            };
             if i == 0 {
                 got = one.flat();
             } else if rep > 0 {
@@ -2742,6 +3297,12 @@ pub fn ab(
         );
     }
     let _ = std::fs::remove_dir_all(&root);
+    if pairs.is_empty() {
+        return Err(format!(
+            "no pair was measured: {} of {reps} reps were killed under the bound",
+            killed.len()
+        ));
+    }
     // The sweep's decision quantity, per point and summed: the burst's
     // milliseconds plus `READ_WEIGHT` times the pass's, from the two
     // rates of each pair. A rate alone credits a change that moves work
@@ -2774,10 +3335,13 @@ pub fn ab(
     if !total.is_empty() {
         pairs.insert("scan-lag weighted_ms_lagall".into(), total);
     }
-    Ok(pairs
-        .into_iter()
-        .map(|(quantity, v)| AbQuantity::of(quantity, v))
-        .collect())
+    Ok((
+        pairs
+            .into_iter()
+            .map(|(quantity, v)| AbQuantity::of(quantity, v))
+            .collect(),
+        killed,
+    ))
 }
 
 /// One quantity's verdict over the pairs.
@@ -3712,6 +4276,32 @@ pub fn full_top(mem_total_kb: u64, value_size: usize) -> u64 {
 mod tests {
     use super::*;
 
+    /// A run whose passes have processes of their own runs no warmup rep,
+    /// and one whose arms share this process still does.
+    #[test]
+    fn the_warmup_rep_is_run_only_where_the_arms_share_the_process() {
+        let mut plan = Plan::new(Scale::Ooc, vec![], 3_000_000, 4);
+        assert!(plan.fresh_process);
+        assert_eq!(first_rep(&plan), 1);
+        plan.fresh_process = false;
+        assert_eq!(first_rep(&plan), 0);
+        let quick = Plan::new(Scale::Quick, vec![], 300_000, 4);
+        assert_eq!(first_rep(&quick), 0);
+    }
+
+    /// The cut seam names a rep, or a rep and an arm, and nothing else.
+    #[test]
+    fn the_stop_seam_names_a_rep_or_an_arm_of_it() {
+        assert_eq!(stop_after("10000-1"), Some((10_000, 1, None)));
+        assert_eq!(
+            stop_after("3000000-2-supdb-nocache"),
+            Some((3_000_000, 2, Some("supdb-nocache".into())))
+        );
+        assert_eq!(stop_after("10000"), None);
+        assert_eq!(stop_after("ten-1"), None);
+        assert_eq!(stop_after(""), None);
+    }
+
     /// Held between the one test that counts what `release_freed_memory`
     /// returns and the tests that run a pass, which call it: the release is
     /// the process's, so a pass's `malloc_trim` in another test's thread
@@ -4204,7 +4794,7 @@ mod tests {
     /// reaches red, because a real forced arm reads through its form files.
     #[test]
     fn the_read_phase_asks_whether_a_forced_arm_read_through_its_form() {
-        let mut counting = Counting::new(None, Path::new(".")).unwrap();
+        let mut counting = Counting::new(None, Path::new("."), None).unwrap();
         let covered = ZState {
             forced: true,
             reads: 50,
@@ -4263,7 +4853,7 @@ mod tests {
     /// reaches red only when its merges outlast the settle's rounds.
     #[test]
     fn the_shuffled_load_asks_whether_a_forced_arm_covers_the_second_store() {
-        let mut counting = Counting::new(None, Path::new(".")).unwrap();
+        let mut counting = Counting::new(None, Path::new("."), None).unwrap();
         let plan = Plan::new(Scale::Quick, vec![], 1_000, 4);
         let payload = Payload::new(plan.value_size, plan.compress, 0xE1);
         let mut phase = |z: Option<ZState>| {
@@ -4333,6 +4923,7 @@ mod tests {
             1,
             &plan,
             &payload,
+            None,
         );
         let why = small
             .err()
@@ -4355,6 +4946,7 @@ mod tests {
             1,
             &plan,
             &payload,
+            None,
         )
         .unwrap();
         assert_eq!(count(&forced, "zpage_forced"), 2.0, "both stores forced");
@@ -4371,6 +4963,7 @@ mod tests {
             1,
             &plan,
             &payload,
+            None,
         )
         .unwrap();
         assert_eq!(count(&base, "zpage_forced"), 0.0);

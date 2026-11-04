@@ -791,6 +791,8 @@ mod tests {
                 rustc: "test".to_string(),
                 scale: Scale::Quick,
                 machine,
+                killed: vec![],
+                resumptions: vec![],
                 measurements: vec![m("supdb", 2.0e6), m("lmdb", 1.0e6)],
             }
         };
