@@ -356,7 +356,14 @@ read-back made the lag pass at ten thousand keys, a hundred scans over
 the section it had just pulled through, a fifth faster than without it,
 forty microseconds against the three hundred the read-back cost, so a
 cell that moves when a step is removed is read beside the phase the step
-was in before it is read as the step's.
+was in before it is read as the step's. It came again at a merge's open,
+a third of the merge's wall under a bound for a second verification of
+each input's key section: skipped, the merge took the same faults in its
+value pass and no less wall, because the section holds the inline
+records the pass reads, so the check was the merge's one sequential read
+of its inputs (`Options::merge_verifies_inputs`, refuted off). A step's
+faults are priced against the step after it that reads the same pages
+before the step is called the cost.
 
 The same counters have a memory half, for what the process holds and
 not what a pass costs: `lagmem` (anonymous bytes, the allocator's bytes

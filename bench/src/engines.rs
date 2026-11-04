@@ -530,6 +530,10 @@ pub struct Supdb {
     /// advance in (`Options::merge_walk_cached` off).
     /// `supdb-ingestmergewalkrescan`, and `supdb-mergewalkrescan` durable.
     mergewalkrescan: bool,
+    /// A merge opens its inputs without verifying their key sections again
+    /// (`Options::merge_verifies_inputs` off, refuted).
+    /// `supdb-ingestmergenoverify`, and `supdb-mergenoverify` durable.
+    mergenoverify: bool,
     /// A merge drops its inputs' pages from the page cache behind its
     /// second pass (`Options::merge_drop_behind`, refuted and off).
     /// `supdb-ingestmergedropbehind`, and `supdb-mergedropbehind` durable.
@@ -1303,6 +1307,10 @@ struct Policy {
     /// advance in (`Options::merge_walk_cached` off).
     /// `supdb-ingestmergewalkrescan`, and `supdb-mergewalkrescan` durable.
     mergewalkrescan: bool,
+    /// A merge opens its inputs without verifying their key sections again
+    /// (`Options::merge_verifies_inputs` off, refuted).
+    /// `supdb-ingestmergenoverify`, and `supdb-mergenoverify` durable.
+    mergenoverify: bool,
     /// A merge drops its inputs' pages from the page cache behind its
     /// second pass (`Options::merge_drop_behind`, refuted and off).
     /// `supdb-ingestmergedropbehind`, and `supdb-mergedropbehind` durable.
@@ -1884,6 +1892,7 @@ impl Default for Policy {
             noblockwillneed: false,
             mergerecordkeys: false,
             mergewalkrescan: false,
+            mergenoverify: false,
             mergedropbehind: false,
             noheadwillneed: false,
             nomergechain: false,
@@ -3559,6 +3568,34 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 mergewalkrescan: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose merges open their inputs without verifying their key
+    /// sections again (`Options::merge_verifies_inputs` off, refuted):
+    /// under a bound the verification is the merge's sequential read of
+    /// its inputs, and the arm moves its faults into the value pass.
+    pub fn create_mergenoverify(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                mergenoverify: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` whose merges skip the verification, as
+    /// `supdb-mergenoverify`.
+    pub fn create_ingest_mergenoverify(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                mergenoverify: true,
                 ..Policy::default()
             },
         )
@@ -6193,6 +6230,7 @@ impl Supdb {
             noblockwillneed,
             mergerecordkeys,
             mergewalkrescan,
+            mergenoverify,
             mergedropbehind,
             noheadwillneed,
             nomergechain,
@@ -6488,6 +6526,7 @@ impl Supdb {
             blocks_willneed: !noblockwillneed,
             merge_keys_by_heads: !mergerecordkeys,
             merge_walk_cached: !mergewalkrescan,
+            merge_verifies_inputs: !mergenoverify,
             merge_drop_behind: mergedropbehind,
             heads_willneed: !noheadwillneed,
             merge_chains: !nomergechain,
@@ -6764,6 +6803,7 @@ impl Supdb {
             noblockwillneed,
             mergerecordkeys,
             mergewalkrescan,
+            mergenoverify,
             mergedropbehind,
             noheadwillneed,
             nomergechain,
@@ -7469,6 +7509,13 @@ impl Engine for Supdb {
                 "supdb-mergewalkrescan"
             } else {
                 "supdb-ingestmergewalkrescan"
+            };
+        }
+        if self.mergenoverify {
+            return if self.partition {
+                "supdb-mergenoverify"
+            } else {
+                "supdb-ingestmergenoverify"
             };
         }
         if self.mergedropbehind {
@@ -8964,6 +9011,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-noblockwillneed"
         | "supdb-mergerecordkeys"
         | "supdb-mergewalkrescan"
+        | "supdb-mergenoverify"
         | "supdb-mergedropbehind"
         | "supdb-noheadwillneed"
         | "supdb-nomergechain"
@@ -9077,6 +9125,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestnoblockwillneed"
         | "supdb-ingestmergerecordkeys"
         | "supdb-ingestmergewalkrescan"
+        | "supdb-ingestmergenoverify"
         | "supdb-ingestmergedropbehind"
         | "supdb-ingestnoheadwillneed"
         | "supdb-ingestnomergechain"
@@ -9432,6 +9481,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestmergerecordkeys" => Box::new(Supdb::create_ingest_mergerecordkeys(dir)?),
         "supdb-mergewalkrescan" => Box::new(Supdb::create_mergewalkrescan(dir)?),
         "supdb-ingestmergewalkrescan" => Box::new(Supdb::create_ingest_mergewalkrescan(dir)?),
+        "supdb-mergenoverify" => Box::new(Supdb::create_mergenoverify(dir)?),
+        "supdb-ingestmergenoverify" => Box::new(Supdb::create_ingest_mergenoverify(dir)?),
         "supdb-mergedropbehind" => Box::new(Supdb::create_mergedropbehind(dir)?),
         "supdb-ingestmergedropbehind" => Box::new(Supdb::create_ingest_mergedropbehind(dir)?),
         "supdb-noheadwillneed" => Box::new(Supdb::create_noheadwillneed(dir)?),

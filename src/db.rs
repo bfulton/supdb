@@ -869,6 +869,21 @@ pub struct Options {
     /// read every input at every step.
     #[doc(hidden)]
     pub merge_walk_cached: bool,
+    /// A merge verifies each input's key section against its checksum row
+    /// again as it opens the input, reading the whole section in one
+    /// sequential pass. REFUTED off: the open was a third of a merge's
+    /// wall in the full-rewrite lag pass at ten million keys under
+    /// 1.25 GiB, 150-170 ms with two hundred major faults, and a merge
+    /// that skipped it under the store's trust -- the row verified at the
+    /// store's open, a segment this process wrote taken unverified at its
+    /// landing -- took the same faults in its value pass instead and no
+    /// less wall: the section holds the records whose values are inline,
+    /// every record of the suite's shape, so the verification was the
+    /// merge's one sequential read of its inputs and the value pass after
+    /// it ran from the cache. The arms `supdb-mergenoverify` and
+    /// `supdb-ingestmergenoverify` skip it.
+    #[doc(hidden)]
+    pub merge_verifies_inputs: bool,
     /// REFUTED: a merge drops its inputs' record pages from the page cache
     /// as its second pass leaves them behind (`Blob::drop_records` and
     /// `POSIX_FADV_DONTNEED`, every `merge_drop_chunk` bytes, a page short
@@ -3621,6 +3636,7 @@ impl Default for Options {
             cursor_merge: true,
             merge_keys_by_heads: true,
             merge_walk_cached: true,
+            merge_verifies_inputs: true,
             merge_drop_behind: false,
             merge_drop_chunk: 2 << 20,
             background_io: BackgroundIo::Normal,
@@ -11277,6 +11293,9 @@ struct MergePlan {
     /// Each input's key kept across the steps it does not advance in
     /// (`Options::merge_walk_cached`).
     walk_cached: bool,
+    /// Each input's key section verified against its checksum row again
+    /// as the merge opens it (`Options::merge_verifies_inputs`).
+    verify_inputs: bool,
 }
 
 fn compact_job(plan: MergePlan) -> Result<Vec<String>> {
@@ -11559,7 +11578,7 @@ impl<'a> Slicer<'a> {
 /// input's key is read again at every step, an input count's reads a key
 /// where the inputs a step advanced need one each.
 fn merge_ranks(
-    blobs: &[Blob<MmapBytes>],
+    blobs: &[&Blob<MmapBytes>],
     cached: bool,
     mut f: impl FnMut(&[u8], &[(usize, usize)]) -> Result<()>,
 ) -> Result<()> {
@@ -11630,8 +11649,8 @@ fn merge_ranks(
 /// once a rank, at its input's advance, as `merge_ranks` keeps its keys,
 /// and without, every input's at the head of every step.
 fn merge_keys(
-    blobs: &[Blob<MmapBytes>],
-    ords: &[Option<crate::ordindex::OrdIndex>],
+    blobs: &[&Blob<MmapBytes>],
+    ords: &[Option<&crate::ordindex::OrdIndex>],
     cached: bool,
     mut f: impl FnMut(&[u8], &[(usize, usize)]) -> Result<()>,
 ) -> Result<()> {
@@ -11866,24 +11885,14 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         drop_behind,
         drop_chunk,
         walk_cached,
+        verify_inputs,
     } = plan;
     let mut steps = MergeSteps::new();
     if background_io == BackgroundIo::Idle {
         idle_io_priority();
     }
-    let mut blobs = Vec::with_capacity(inputs.len());
-    for name in &inputs {
-        blobs.push(
-            Blob::open_with(
-                MmapBytes::open(&dir.join(name))?,
-                crate::blob::BlobOptions {
-                    verify_checksums: opts.checksums,
-                    ..Default::default()
-                },
-            )
-            .map_err(|e| err(&format!("compact input {name}: {e}")))?,
-        );
-    }
+    let opened = merge_open_inputs(&dir, &inputs, &opts, verify_inputs, "compact")?;
+    let blobs: Vec<&Blob<MmapBytes>> = opened.iter().collect();
     steps.step("open");
 
     // The inputs' ordered indexes, for the first pass's keys where a head
@@ -11891,7 +11900,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
     // records, the prefix learned off each input's first key as
     // `Seg::open` learns it. An input whose heads cannot say, or whose
     // index will not open, reads its keys off the records as before.
-    let ords: Vec<Option<crate::ordindex::OrdIndex>> = inputs
+    let ords_opened: Vec<Option<crate::ordindex::OrdIndex>> = inputs
         .iter()
         .zip(&blobs)
         .map(|(name, b)| {
@@ -11906,6 +11915,8 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
             Some(ord)
         })
         .collect();
+    let ords: Vec<Option<&crate::ordindex::OrdIndex>> =
+        ords_opened.iter().map(Option::as_ref).collect();
     if let Some(c) = &counts {
         let by_heads = ords.iter().filter(|o| o.is_some()).count() as u64;
         c.merge_head_inputs
@@ -12123,6 +12134,39 @@ struct TierPlan {
     /// Each input's key kept across the steps it does not advance in
     /// (`Options::merge_walk_cached`).
     walk_cached: bool,
+    /// Each input's key section verified again (`MergePlan::verify_inputs`).
+    verify_inputs: bool,
+}
+
+/// A merge's inputs, each mapped by name for the merge's own walk. With
+/// `verify` each key section is verified against its checksum row as it
+/// opens, which reads the whole section (`Options::merge_verifies_inputs`);
+/// without, the merge holds its inputs to what the store holds them to: a
+/// segment's row is verified when the store opens it, and a segment this
+/// process wrote and synced is taken unverified at its landing
+/// (`Seg::open_landed`).
+fn merge_open_inputs(
+    dir: &Path,
+    inputs: &[String],
+    opts: &SegmentOptions,
+    verify: bool,
+    what: &str,
+) -> Result<Vec<Blob<MmapBytes>>> {
+    let mut blobs = Vec::with_capacity(inputs.len());
+    for name in inputs {
+        blobs.push(
+            Blob::open_with(
+                MmapBytes::open(&dir.join(name))?,
+                crate::blob::BlobOptions {
+                    verify_checksums: opts.checksums,
+                    verify_index: verify,
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| err(&format!("{what} input {name}: {e}")))?,
+        );
+    }
+    Ok(blobs)
 }
 
 /// The piece merge's body: the inputs' keys walked once for their count
@@ -12149,23 +12193,13 @@ fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
         inline_max,
         ord_durable,
         walk_cached,
+        verify_inputs,
     } = plan;
     if background_io == BackgroundIo::Idle {
         idle_io_priority();
     }
-    let mut blobs = Vec::with_capacity(inputs.len());
-    for name in &inputs {
-        blobs.push(
-            Blob::open_with(
-                MmapBytes::open(&dir.join(name))?,
-                crate::blob::BlobOptions {
-                    verify_checksums: opts.checksums,
-                    ..Default::default()
-                },
-            )
-            .map_err(|e| err(&format!("tier input {name}: {e}")))?,
-        );
-    }
+    let opened = merge_open_inputs(&dir, &inputs, &opts, verify_inputs, "tier")?;
+    let blobs: Vec<&Blob<MmapBytes>> = opened.iter().collect();
     let mut total = 0usize;
     merge_ranks(&blobs, walk_cached, |_, _| {
         total += 1;
@@ -36418,6 +36452,7 @@ impl Maint {
             inline_max: self.opts.inline_bytes,
             ord_durable: self.opts.ord_durable,
             walk_cached: self.opts.merge_walk_cached,
+            verify_inputs: self.opts.merge_verifies_inputs,
         };
         let wake = self.wake.clone();
         let handle = std::thread::spawn(move || {
@@ -39363,6 +39398,7 @@ impl Maint {
         let drop_behind = self.opts.merge_drop_behind;
         let drop_chunk = self.opts.merge_drop_chunk;
         let walk_cached = self.opts.merge_walk_cached;
+        let verify_inputs = self.opts.merge_verifies_inputs;
         let job_inputs = inputs.clone();
         let wake = self.wake.clone();
         let held = self.shared.clone();
@@ -39386,6 +39422,7 @@ impl Maint {
                 drop_behind,
                 drop_chunk,
                 walk_cached,
+                verify_inputs,
             });
             // A test's hold before the landing (`Db::hold_merge_landing`).
             while held.merge_hold.load(AtomicOrdering::Acquire) & MERGE_HOLD_LANDING != 0 {

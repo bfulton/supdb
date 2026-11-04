@@ -608,8 +608,12 @@ fn a_merges_walk_with_its_keys_kept_writes_what_a_walk_reading_every_input_write
                 }
                 db.commit().unwrap();
                 db.seal().unwrap();
+                // Each round's merges joined before the next, so both
+                // stores merge the same inputs in the same order and
+                // allocate the same segment ids: a piece merge started at
+                // a landing otherwise runs or not by the thread's timing.
+                db.settle().unwrap();
             }
-            db.settle().unwrap();
             let (by_heads, by_records) = db.merge_key_sources();
             if tier == 0 {
                 assert!(by_heads + by_records > 0, "a partition merge ran");
