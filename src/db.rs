@@ -884,6 +884,25 @@ pub struct Options {
     /// `supdb-ingestmergenoverify` skip it.
     #[doc(hidden)]
     pub merge_verifies_inputs: bool,
+    /// REFUTED: the store's open fixes glibc's mmap threshold for the
+    /// process at this many bytes (`mallopt(M_MMAP_THRESHOLD)`), where
+    /// zero leaves the process's policy alone. The threshold starts at
+    /// 128 KB and rises to the size of the largest chunk the process has
+    /// mapped and freed, so after the first large free every buffer under
+    /// it comes from an arena's heap; at ten million keys under 1.25 GiB
+    /// the lag sweep's ten-percent burst asked 272 MB in allocations of
+    /// 128 KB or more -- the seal's writer and sort, the upkeep thread's
+    /// settle, the scan snapshot's extension -- held 7 MB of it at the
+    /// burst's end, and the arenas held 392 MB free and resident there,
+    /// page cache the scans after it did not have. Fixed at 128 KB, and
+    /// paired arm against arm (each bounded arm's rep a process of its
+    /// own), the arenas held the same 290 MB free at the ten-percent
+    /// point: the free bytes are small chunks and not those buffers. The
+    /// pass ran 18.7 s in both rounds against 14.3 and 15.5, with more
+    /// faults, the burst a third faster, the sweep's weighted sum 1.045x
+    /// worse. Zero; the arm is `supdb-mmapthr`.
+    #[doc(hidden)]
+    pub malloc_mmap_threshold: usize,
     /// REFUTED: a merge drops its inputs' record pages from the page cache
     /// as its second pass leaves them behind (`Blob::drop_records` and
     /// `POSIX_FADV_DONTNEED`, every `merge_drop_chunk` bytes, a page short
@@ -3637,6 +3656,7 @@ impl Default for Options {
             merge_keys_by_heads: true,
             merge_walk_cached: true,
             merge_verifies_inputs: true,
+            malloc_mmap_threshold: 0,
             merge_drop_behind: false,
             merge_drop_chunk: 2 << 20,
             background_io: BackgroundIo::Normal,
@@ -14235,6 +14255,13 @@ mod heap {
         // locks.
         unsafe { libc::malloc_trim(0) };
     }
+
+    /// A fixed mmap threshold for the process (`Options::malloc_mmap_threshold`).
+    pub fn set_mmap_threshold(bytes: usize) {
+        let n = bytes.min(i32::MAX as usize) as libc::c_int;
+        // SAFETY: a tunable of the allocator, set under its own lock.
+        unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, n) };
+    }
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
@@ -14252,6 +14279,8 @@ mod heap {
     }
 
     pub fn trim() {}
+
+    pub fn set_mmap_threshold(_bytes: usize) {}
 }
 
 /// Whether an allocator holding `held` bytes free is to be trimmed, and
@@ -26029,6 +26058,9 @@ impl Db {
         };
         db.go_away()?;
         db.start_trimmer();
+        if db.opts.malloc_mmap_threshold > 0 {
+            heap::set_mmap_threshold(db.opts.malloc_mmap_threshold);
+        }
         Ok(db)
     }
 
@@ -26562,6 +26594,9 @@ impl Db {
         };
         db.go_away()?;
         db.start_trimmer();
+        if db.opts.malloc_mmap_threshold > 0 {
+            heap::set_mmap_threshold(db.opts.malloc_mmap_threshold);
+        }
         Ok(db)
     }
 

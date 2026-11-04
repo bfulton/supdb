@@ -534,6 +534,11 @@ pub struct Supdb {
     /// (`Options::merge_verifies_inputs` off, refuted).
     /// `supdb-ingestmergenoverify`, and `supdb-mergenoverify` durable.
     mergenoverify: bool,
+    /// The store's open fixes the process's mmap threshold at 128 KB
+    /// (`Options::malloc_mmap_threshold`, refuted), so every buffer of
+    /// that size or more is mapped and unmapped at its free.
+    /// `supdb-ingestmmapthr`, and `supdb-mmapthr` durable.
+    mmapthr: bool,
     /// A merge drops its inputs' pages from the page cache behind its
     /// second pass (`Options::merge_drop_behind`, refuted and off).
     /// `supdb-ingestmergedropbehind`, and `supdb-mergedropbehind` durable.
@@ -1311,6 +1316,11 @@ struct Policy {
     /// (`Options::merge_verifies_inputs` off, refuted).
     /// `supdb-ingestmergenoverify`, and `supdb-mergenoverify` durable.
     mergenoverify: bool,
+    /// The store's open fixes the process's mmap threshold at 128 KB
+    /// (`Options::malloc_mmap_threshold`, refuted), so every buffer of
+    /// that size or more is mapped and unmapped at its free.
+    /// `supdb-ingestmmapthr`, and `supdb-mmapthr` durable.
+    mmapthr: bool,
     /// A merge drops its inputs' pages from the page cache behind its
     /// second pass (`Options::merge_drop_behind`, refuted and off).
     /// `supdb-ingestmergedropbehind`, and `supdb-mergedropbehind` durable.
@@ -1893,6 +1903,7 @@ impl Default for Policy {
             mergerecordkeys: false,
             mergewalkrescan: false,
             mergenoverify: false,
+            mmapthr: false,
             mergedropbehind: false,
             noheadwillneed: false,
             nomergechain: false,
@@ -6231,6 +6242,7 @@ impl Supdb {
             mergerecordkeys,
             mergewalkrescan,
             mergenoverify,
+            mmapthr,
             mergedropbehind,
             noheadwillneed,
             nomergechain,
@@ -6527,6 +6539,7 @@ impl Supdb {
             merge_keys_by_heads: !mergerecordkeys,
             merge_walk_cached: !mergewalkrescan,
             merge_verifies_inputs: !mergenoverify,
+            malloc_mmap_threshold: if mmapthr { 128 << 10 } else { 0 },
             merge_drop_behind: mergedropbehind,
             heads_willneed: !noheadwillneed,
             merge_chains: !nomergechain,
@@ -6804,6 +6817,7 @@ impl Supdb {
             mergerecordkeys,
             mergewalkrescan,
             mergenoverify,
+            mmapthr,
             mergedropbehind,
             noheadwillneed,
             nomergechain,
@@ -7509,6 +7523,13 @@ impl Engine for Supdb {
                 "supdb-mergewalkrescan"
             } else {
                 "supdb-ingestmergewalkrescan"
+            };
+        }
+        if self.mmapthr {
+            return if self.partition {
+                "supdb-mmapthr"
+            } else {
+                "supdb-ingestmmapthr"
             };
         }
         if self.mergenoverify {
@@ -9012,6 +9033,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-mergerecordkeys"
         | "supdb-mergewalkrescan"
         | "supdb-mergenoverify"
+        | "supdb-mmapthr"
         | "supdb-mergedropbehind"
         | "supdb-noheadwillneed"
         | "supdb-nomergechain"
@@ -9126,6 +9148,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestmergerecordkeys"
         | "supdb-ingestmergewalkrescan"
         | "supdb-ingestmergenoverify"
+        | "supdb-ingestmmapthr"
         | "supdb-ingestmergedropbehind"
         | "supdb-ingestnoheadwillneed"
         | "supdb-ingestnomergechain"
@@ -9482,6 +9505,22 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-mergewalkrescan" => Box::new(Supdb::create_mergewalkrescan(dir)?),
         "supdb-ingestmergewalkrescan" => Box::new(Supdb::create_ingest_mergewalkrescan(dir)?),
         "supdb-mergenoverify" => Box::new(Supdb::create_mergenoverify(dir)?),
+        "supdb-mmapthr" => Box::new(Supdb::with_policy(
+            dir,
+            Policy {
+                mmapthr: true,
+                ..Policy::default()
+            },
+        )?),
+        "supdb-ingestmmapthr" => Box::new(Supdb::with_policy(
+            dir,
+            Policy {
+                partition: false,
+                durable: false,
+                mmapthr: true,
+                ..Policy::default()
+            },
+        )?),
         "supdb-ingestmergenoverify" => Box::new(Supdb::create_ingest_mergenoverify(dir)?),
         "supdb-mergedropbehind" => Box::new(Supdb::create_mergedropbehind(dir)?),
         "supdb-ingestmergedropbehind" => Box::new(Supdb::create_ingest_mergedropbehind(dir)?),
