@@ -859,6 +859,16 @@ pub struct Options {
     /// `supdb-mergerecordkeys` and `supdb-ingestmergerecordkeys` read as
     /// before.
     pub merge_keys_by_heads: bool,
+    /// A merge's walks keep each input's key at its rank across the steps
+    /// it does not advance in (`merge_ranks`, `merge_keys`), and read an
+    /// input's next key only when a step advances it. Off, every input's
+    /// key was read again at every step: a merge of a partition and
+    /// fourteen pieces read fifteen keys an output key where two inputs
+    /// advance, in both passes. The output is the same key for key. The
+    /// arms `supdb-mergewalkrescan` and `supdb-ingestmergewalkrescan`
+    /// read every input at every step.
+    #[doc(hidden)]
+    pub merge_walk_cached: bool,
     /// REFUTED: a merge drops its inputs' record pages from the page cache
     /// as its second pass leaves them behind (`Blob::drop_records` and
     /// `POSIX_FADV_DONTNEED`, every `merge_drop_chunk` bytes, a page short
@@ -3610,6 +3620,7 @@ impl Default for Options {
             partition_on_flush: true,
             cursor_merge: true,
             merge_keys_by_heads: true,
+            merge_walk_cached: true,
             merge_drop_behind: false,
             merge_drop_chunk: 2 << 20,
             background_io: BackgroundIo::Normal,
@@ -11263,6 +11274,9 @@ struct MergePlan {
     /// bytes (`Options::merge_drop_behind`, `Options::merge_drop_chunk`).
     drop_behind: bool,
     drop_chunk: u64,
+    /// Each input's key kept across the steps it does not advance in
+    /// (`Options::merge_walk_cached`).
+    walk_cached: bool,
 }
 
 fn compact_job(plan: MergePlan) -> Result<Vec<String>> {
@@ -11539,24 +11553,44 @@ impl<'a> Slicer<'a> {
 /// Inputs are ordered oldest to newest, so draining those cursors in the
 /// order given returns a key's values in append order -- the order the probe
 /// path got by asking each input in turn. Each input's key section is read
-/// forwards, once, and nothing is hashed.
+/// forwards, once, and nothing is hashed. With `cached`
+/// (`Options::merge_walk_cached`) each input's key at its rank is read once
+/// a rank and kept across the steps it does not advance in; without, every
+/// input's key is read again at every step, an input count's reads a key
+/// where the inputs a step advanced need one each.
 fn merge_ranks(
     blobs: &[Blob<MmapBytes>],
+    cached: bool,
     mut f: impl FnMut(&[u8], &[(usize, usize)]) -> Result<()>,
 ) -> Result<()> {
     let n: Vec<usize> = blobs.iter().map(|b| b.keys()).collect();
     let mut rank = vec![0usize; blobs.len()];
+    let key = |i: usize, r: usize| -> Result<Option<&[u8]>> {
+        if r >= n[i] {
+            return Ok(None);
+        }
+        blobs[i]
+            .key_at(r)
+            .map(Some)
+            .ok_or_else(|| err("segment key walk: a rank the index does not have"))
+    };
+    let mut cur: Vec<Option<&[u8]>> = Vec::with_capacity(blobs.len());
+    for i in 0..blobs.len() {
+        cur.push(key(i, 0)?);
+    }
     let mut tied: Vec<(usize, usize)> = Vec::with_capacity(blobs.len());
     loop {
+        if !cached {
+            for (i, c) in cur.iter_mut().enumerate() {
+                *c = key(i, rank[i])?;
+            }
+        }
         let mut min: Option<&[u8]> = None;
         tied.clear();
-        for (i, b) in blobs.iter().enumerate() {
-            if rank[i] >= n[i] {
+        for (i, c) in cur.iter().enumerate() {
+            let Some(k) = *c else {
                 continue;
-            }
-            let k = b
-                .key_at(rank[i])
-                .ok_or_else(|| err("segment key walk: a rank the index does not have"))?;
+            };
             match min {
                 None => {
                     min = Some(k);
@@ -11579,6 +11613,9 @@ fn merge_ranks(
         f(k, &tied)?;
         for &(i, _) in &tied {
             rank[i] += 1;
+            if cached {
+                cur[i] = key(i, rank[i])?;
+            }
         }
     }
 }
@@ -11588,37 +11625,46 @@ fn merge_ranks(
 /// (`OrdIndex::whole_key_at`), eight bytes a key and no record touched,
 /// and an input without reads the record as `merge_ranks` does
 /// (`Options::merge_keys_by_heads`). The keys stand in a buffer an input
-/// each, filled for every input at the head of a step and compared by
-/// index, since a borrow of one input's buffer cannot stand while
-/// another's is written.
+/// each, compared by index, since a borrow of one input's buffer cannot
+/// stand while another's is written; with `cached` a buffer is filled
+/// once a rank, at its input's advance, as `merge_ranks` keeps its keys,
+/// and without, every input's at the head of every step.
 fn merge_keys(
     blobs: &[Blob<MmapBytes>],
     ords: &[Option<crate::ordindex::OrdIndex>],
+    cached: bool,
     mut f: impl FnMut(&[u8], &[(usize, usize)]) -> Result<()>,
 ) -> Result<()> {
     let n: Vec<usize> = blobs.iter().map(|b| b.keys()).collect();
     let mut rank = vec![0usize; blobs.len()];
     let mut bufs: Vec<Vec<u8>> = vec![Vec::new(); blobs.len()];
     let mut have = vec![false; blobs.len()];
+    let fill = |i: usize, r: usize, buf: &mut Vec<u8>| -> Result<bool> {
+        if r >= n[i] {
+            return Ok(false);
+        }
+        let by_heads = match &ords[i] {
+            Some(o) => o.whole_key_at(r, buf).is_some(),
+            None => false,
+        };
+        if !by_heads {
+            let k = blobs[i]
+                .key_at(r)
+                .ok_or_else(|| err("segment key walk: a rank the index does not have"))?;
+            buf.clear();
+            buf.extend_from_slice(k);
+        }
+        Ok(true)
+    };
+    for i in 0..blobs.len() {
+        have[i] = fill(i, 0, &mut bufs[i])?;
+    }
     let mut tied: Vec<(usize, usize)> = Vec::with_capacity(blobs.len());
     loop {
-        for i in 0..blobs.len() {
-            have[i] = false;
-            if rank[i] >= n[i] {
-                continue;
+        if !cached {
+            for i in 0..blobs.len() {
+                have[i] = fill(i, rank[i], &mut bufs[i])?;
             }
-            let by_heads = match &ords[i] {
-                Some(o) => o.whole_key_at(rank[i], &mut bufs[i]).is_some(),
-                None => false,
-            };
-            if !by_heads {
-                let k = blobs[i]
-                    .key_at(rank[i])
-                    .ok_or_else(|| err("segment key walk: a rank the index does not have"))?;
-                bufs[i].clear();
-                bufs[i].extend_from_slice(k);
-            }
-            have[i] = true;
         }
         let mut min: Option<usize> = None;
         tied.clear();
@@ -11648,6 +11694,9 @@ fn merge_keys(
         f(&bufs[m], &tied)?;
         for &(i, _) in &tied {
             rank[i] += 1;
+            if cached {
+                have[i] = fill(i, rank[i], &mut bufs[i])?;
+            }
         }
     }
 }
@@ -11816,7 +11865,9 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         counts,
         drop_behind,
         drop_chunk,
+        walk_cached,
     } = plan;
+    let mut steps = MergeSteps::new();
     if background_io == BackgroundIo::Idle {
         idle_io_priority();
     }
@@ -11833,6 +11884,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
             .map_err(|e| err(&format!("compact input {name}: {e}")))?,
         );
     }
+    steps.step("open");
 
     // The inputs' ordered indexes, for the first pass's keys where a head
     // is a whole key (`Options::merge_keys_by_heads`): opened beside the
@@ -11866,7 +11918,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
     // holds only what the slices are taken from (`Slicer`).
     let mut slicer = Slicer::new(fences.as_deref(), parts, max_keys);
     let all: Vec<Vec<u8>> = if cursors {
-        merge_keys(&blobs, &ords, |k, _| {
+        merge_keys(&blobs, &ords, walk_cached, |k, _| {
             slicer.push(k);
             Ok(())
         })?;
@@ -11886,6 +11938,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
     let Some((slices, given, total)) = slicer.finish() else {
         return Ok(Vec::new());
     };
+    steps.step("keys");
 
     let mut pieces = Vec::with_capacity(slices.len());
     let mut empties: Vec<String> = Vec::new();
@@ -11976,7 +12029,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         dropped_to[i] = to;
     };
     if cursors {
-        merge_ranks(&blobs, |k, tied| {
+        merge_ranks(&blobs, walk_cached, |k, tied| {
             let mut start = 0usize;
             let mut live = 0u64;
             for (j, &(i, rank)) in tied.iter().enumerate() {
@@ -12037,9 +12090,19 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         c.merge_dropped_bytes
             .fetch_add(dropped_bytes, AtomicOrdering::Relaxed);
     }
+    steps.step("values");
     let mut out = em.finish(total)?;
     out.extend(empties);
     File::open(&dir)?.sync_all()?;
+    steps.step("finish");
+    if steps.on {
+        let bytes: u64 = inputs
+            .iter()
+            .filter_map(|n| std::fs::metadata(dir.join(n)).ok())
+            .map(|m| m.len())
+            .sum();
+        steps.print("merge", total, bytes);
+    }
     Ok(out)
 }
 
@@ -12057,6 +12120,9 @@ struct TierPlan {
     sync_every: usize,
     inline_max: usize,
     ord_durable: bool,
+    /// Each input's key kept across the steps it does not advance in
+    /// (`Options::merge_walk_cached`).
+    walk_cached: bool,
 }
 
 /// The piece merge's body: the inputs' keys walked once for their count
@@ -12082,6 +12148,7 @@ fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
         sync_every,
         inline_max,
         ord_durable,
+        walk_cached,
     } = plan;
     if background_io == BackgroundIo::Idle {
         idle_io_priority();
@@ -12100,7 +12167,7 @@ fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
         );
     }
     let mut total = 0usize;
-    merge_ranks(&blobs, |_, _| {
+    merge_ranks(&blobs, walk_cached, |_, _| {
         total += 1;
         Ok(())
     })?;
@@ -12132,7 +12199,7 @@ fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
         w: None,
         out: Vec::new(),
     };
-    merge_ranks(&blobs, |k, tied| {
+    merge_ranks(&blobs, walk_cached, |k, tied| {
         let mut start = 0usize;
         let mut live = 0u64;
         let mut tomb = false;
@@ -12194,6 +12261,69 @@ fn thread_minflt() -> u64 {
             rest.split_whitespace().nth(7)?.parse().ok()
         })
         .unwrap_or(0)
+}
+
+/// This thread's major faults so far, from `/proc/thread-self/stat`; for
+/// the merge trace's `mergejob` line alone.
+fn thread_majflt() -> u64 {
+    std::fs::read_to_string("/proc/thread-self/stat")
+        .ok()
+        .and_then(|s| {
+            let rest = s.rsplit_once(')')?.1;
+            rest.split_whitespace().nth(9)?.parse().ok()
+        })
+        .unwrap_or(0)
+}
+
+/// A merge job's own account under `SUPDB_MERGE_TRACE`: at each step the
+/// wall since the job began, the thread's CPU and its major faults, so a
+/// merge's time is read as its work or its waits on the device. Off, a
+/// branch a step.
+struct MergeSteps {
+    on: bool,
+    t0: std::time::Instant,
+    cpu0: u64,
+    flt0: u64,
+    out: String,
+}
+
+impl MergeSteps {
+    fn new() -> MergeSteps {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var_os("SUPDB_MERGE_TRACE").is_some());
+        MergeSteps {
+            on,
+            t0: std::time::Instant::now(),
+            cpu0: if on { thread_cpu_ns() } else { 0 },
+            flt0: if on { thread_majflt() } else { 0 },
+            out: String::new(),
+        }
+    }
+
+    fn step(&mut self, name: &str) {
+        if !self.on {
+            return;
+        }
+        use std::fmt::Write as _;
+        let _ = write!(
+            self.out,
+            " {name} {:.1}/{:.1}/{}",
+            self.t0.elapsed().as_secs_f64() * 1e3,
+            thread_cpu_ns().saturating_sub(self.cpu0) as f64 / 1e6,
+            thread_majflt().saturating_sub(self.flt0)
+        );
+    }
+
+    fn print(&self, what: &str, keys: usize, bytes_in: u64) {
+        if self.on {
+            eprintln!(
+                "mergejob t={:.6} {what} keys {keys} mb_in {:.1} wall/cpu/majflt{}",
+                mono_secs(),
+                bytes_in as f64 / (1u64 << 20) as f64,
+                self.out
+            );
+        }
+    }
 }
 
 /// `SUPDB_DRAIN_STEPS`, read once: the segment writer's finish prints
@@ -36287,6 +36417,7 @@ impl Maint {
             sync_every: self.opts.seal_sync_every,
             inline_max: self.opts.inline_bytes,
             ord_durable: self.opts.ord_durable,
+            walk_cached: self.opts.merge_walk_cached,
         };
         let wake = self.wake.clone();
         let handle = std::thread::spawn(move || {
@@ -39231,6 +39362,7 @@ impl Maint {
         let heads = self.opts.merge_keys_by_heads;
         let drop_behind = self.opts.merge_drop_behind;
         let drop_chunk = self.opts.merge_drop_chunk;
+        let walk_cached = self.opts.merge_walk_cached;
         let job_inputs = inputs.clone();
         let wake = self.wake.clone();
         let held = self.shared.clone();
@@ -39253,6 +39385,7 @@ impl Maint {
                 counts: Some(held.clone()),
                 drop_behind,
                 drop_chunk,
+                walk_cached,
             });
             // A test's hold before the landing (`Db::hold_merge_landing`).
             while held.merge_hold.load(AtomicOrdering::Acquire) & MERGE_HOLD_LANDING != 0 {
