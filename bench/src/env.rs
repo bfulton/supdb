@@ -61,16 +61,13 @@ pub fn capture() -> MachineInfo {
 /// disk takes tens, with the kernel's reclaim and the engine's page
 /// touches the same, so a pairing on one reads the disk's counts at a
 /// price no user pays: `scripts/zram.sh` runs `ab` on one for the
-/// counts, `run` refuses it, and `ab` names it on its table.
-#[cfg(target_os = "linux")]
+/// counts, `run` refuses it, and `ab` names it on its table. One
+/// definition for every platform: off Linux `block_device_of` finds no
+/// device, so nothing is RAM-backed there, and the helper below is used
+/// on every target rather than dead code on all but one.
 pub fn ram_backed_device(path: &std::path::Path) -> Option<String> {
     let dev = block_device_of(path)?;
     virtual_block_device(std::path::Path::new("/sys/block"), &dev).then_some(dev)
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn ram_backed_device(_path: &std::path::Path) -> Option<String> {
-    None
 }
 
 /// Whether `sys_block/<dev>` links into the kernel's virtual devices.
