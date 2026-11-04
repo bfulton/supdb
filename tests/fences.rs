@@ -553,6 +553,115 @@ fn a_merges_first_pass_over_the_heads_writes_what_the_records_write() {
     }
 }
 
+/// A merge's walks keep each input's key across the steps it does not
+/// advance in (`Options::merge_walk_cached`), where they read every
+/// input's key again at every step without it. Two stores fed the same
+/// operations, one each way, write the same files byte for byte, the
+/// superblock's clock aside: through a partition merge, with keys of one
+/// length (the first pass off the heads) and of two (off the records), and
+/// through a piece merge, with values appended to a key across pieces and
+/// keys deleted between them.
+#[test]
+fn a_merges_walk_with_its_keys_kept_writes_what_a_walk_reading_every_input_writes() {
+    // (piece merges, the partition merge's trigger, keys of two lengths)
+    for (tier, l0, mixed) in [(0usize, 2usize, false), (0, 2, true), (2, 1000, true)] {
+        let mut dirs = Vec::new();
+        let mut merged = Vec::new();
+        for cached in [true, false] {
+            let d = scratch(&format!("merge-walk-{tier}-{mixed}-{cached}"));
+            let mut db = Db::create(
+                &d,
+                Options {
+                    seal_bytes: 32 << 10,
+                    partition_bytes: Some(32 << 10),
+                    l0_trigger: l0,
+                    tier_pieces: tier,
+                    merge_walk_cached: cached,
+                    ..Options::default()
+                },
+            )
+            .unwrap();
+            let key = |k: u32| {
+                if mixed && k.is_multiple_of(3) {
+                    format!("key-{k:05}-x").into_bytes()
+                } else {
+                    format!("key-{k:05}").into_bytes()
+                }
+            };
+            for k in 0..3000u32 {
+                db.append(&key(k), b"0");
+            }
+            db.commit().unwrap();
+            db.flush().unwrap();
+            assert!(partition_fences(&d).len() >= 2, "partitions");
+            // Three pieces over every partition: values appended to keys a
+            // piece before held, keys deleted, keys new to the store.
+            for round in 0..3u32 {
+                for k in (round..3000u32).step_by(7) {
+                    db.append(&key(k), format!("n{round}").as_bytes());
+                }
+                for k in (round..3000u32).step_by(11) {
+                    db.delete(&key(k));
+                }
+                for k in 0..300u32 {
+                    db.append(&key(90000 + k * 10 + round), b"m");
+                }
+                db.commit().unwrap();
+                db.seal().unwrap();
+                // Each round's merges joined before the next, so both
+                // stores merge the same inputs in the same order and
+                // allocate the same segment ids: a piece merge started at
+                // a landing otherwise runs or not by the thread's timing.
+                db.settle().unwrap();
+            }
+            let (by_heads, by_records) = db.merge_key_sources();
+            if tier == 0 {
+                assert!(by_heads + by_records > 0, "a partition merge ran");
+            } else {
+                // Each seal cut a piece over every partition; the piece
+                // merges leave fewer.
+                let parts = partition_fences(&d).len();
+                assert!(
+                    db.levels().1 < 3 * parts,
+                    "a piece merge ran: {:?} over {parts} partitions",
+                    db.levels()
+                );
+            }
+            let mut all = Vec::new();
+            db.scan(
+                b"",
+                usize::MAX,
+                kv(&mut |k, v| all.push((k.to_vec(), v.to_vec()))),
+            )
+            .unwrap();
+            merged.push(all);
+            db.close().unwrap();
+            dirs.push(d);
+        }
+        assert_eq!(
+            merged[0], merged[1],
+            "the same answers (tier {tier}, mixed {mixed})"
+        );
+        let names: Vec<Vec<String>> = dirs.iter().map(|d| seg_names(d)).collect();
+        assert_eq!(
+            names[0], names[1],
+            "the same segments (tier {tier}, mixed {mixed})"
+        );
+        for n in &names[0] {
+            let a = std::fs::read(dirs[0].join(n)).unwrap();
+            let b = std::fs::read(dirs[1].join(n)).unwrap();
+            assert_eq!(
+                without_the_clock(&a),
+                without_the_clock(&b),
+                "{n} differs between the kept keys' walk and the rescan (tier {tier}, mixed {mixed})"
+            );
+        }
+        for d in &dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+}
+
 /// A merge drops its inputs' record pages from the page cache behind its
 /// second pass (`Options::merge_drop_behind`), and changes no byte doing
 /// so: two stores fed the same operations, one dropping and one not, merge
