@@ -489,6 +489,22 @@ engine's and a rate is the device's, so a device that is not the
 machine's is for counts alone, and the suite refuses to bank it rather
 than trusting anyone to remember.
 
+**A dispatch whose frame grew by an arm at a time.** `open` matched
+the arm's name and built the arm in place, and every constructor was
+inlined into it with its `Supdb` -- a few kilobytes, the engine's
+options among them -- in a slot of its own: three hundred arms made a
+frame of two megabytes, the default stack of a test's thread, and the
+two arms past it aborted the bench's library tests with a stack
+overflow in a test that never called `open` by name. Nothing pointed
+at the frame: gdb at the fault, each frame's stack pointer against its
+caller's, read 1.98 MB for `open` and a few kilobytes for every other
+frame. A supdb arm hands its constructor to `supdb_arm`, which is not
+inlined, and `open`'s frame is a kilobyte and a half. The rule: a
+match whose arms each build a large value is sized by its arms, not by
+the one it takes, so the value is built behind a call the match does
+not inline; and a stack overflow is read off the frames' sizes before
+the stack is made larger.
+
 **A workflow that never runs can be syntactically invalid for months.**
 Both self-hosted pickup watchdogs arrived with a block of an older draft
 pasted after their `exit 1`. `scripts/workflows.sh` parses every `run:`

@@ -3134,6 +3134,17 @@ pub struct Options {
     /// `supdb-ingestmergeuncapped`. A wide piece's ranges stay one merge
     /// whatever the cap (`Maint::cover_inputs`).
     pub merge_bytes_cap: u64,
+    /// EXPERIMENT: the most partition merges in flight at once, each over
+    /// ranges no other holds -- its partitions, and every piece over them,
+    /// no other merge's input. At one a merge waits for the one in flight
+    /// to land, and under a bound the full rewrite's merge debt drained one
+    /// capped merge at a time, each a few seconds of the thread's CPU in
+    /// ten of wall, through the first third of the pass after it. The
+    /// first partitioning, which takes every segment, runs alone whatever
+    /// this says, and a piece merge still waits for every partition merge.
+    /// One is `supdb`'s shape; `supdb-mergepar2` and
+    /// `supdb-ingestmergepar2` run two.
+    pub merge_parallel: usize,
     /// EXPERIMENT: under `merge_chains`, a merge's landing plans the next
     /// merge out of core -- the controller's gate away from the raw form --
     /// whether or not a scan has come since the last landing, so the
@@ -3815,6 +3826,7 @@ impl Default for Options {
             merge_chains_writes: false,
             merge_plan_idle: true,
             merge_bytes_cap: 64 << 20,
+            merge_parallel: 1,
             boundary_keys_from_top: false,
             pieces_dir_willneed: true,
             bounds_heads_willneed: true,
@@ -4591,6 +4603,44 @@ impl BlockedBloom {
 /// producing the outputs that replace them.
 type Compaction = (Vec<String>, std::thread::JoinHandle<Result<Vec<String>>>);
 
+/// A partition merge in flight (`Maint::compacting`): the input names it
+/// will retire, the fences it rewrites (`None` for the first
+/// partitioning, which takes every segment), the thread producing the
+/// outputs, and for `SUPDB_MERGE_TRACE` the planner it started from and
+/// when.
+struct Merging {
+    inputs: Vec<String>,
+    fences: Option<Vec<Fence>>,
+    handle: std::thread::JoinHandle<Result<Vec<String>>>,
+    why: (usize, bool),
+    began: Option<std::time::Instant>,
+}
+
+impl Merging {
+    /// Whether this merge holds any of `inputs`, or a range any of
+    /// `fences` overlaps (`merges_meet`).
+    fn holds(&self, inputs: &[String], fences: Option<&[Fence]>) -> bool {
+        merges_meet(&self.inputs, self.fences.as_deref(), inputs, fences)
+    }
+}
+
+/// Whether two merges, each its inputs and its fences, would touch the
+/// same thing: an input both take, or a range both rewrite. The first
+/// partitioning (no fences) takes every segment and meets everything.
+fn merges_meet(
+    a_inputs: &[String],
+    a_fences: Option<&[Fence]>,
+    b_inputs: &[String],
+    b_fences: Option<&[Fence]>,
+) -> bool {
+    let (Some(a), Some(b)) = (a_fences, b_fences) else {
+        return true;
+    };
+    b_inputs.iter().any(|n| a_inputs.contains(n))
+        || a.iter()
+            .any(|(lo, hi)| b.iter().any(|(blo, bhi)| fences_overlap(lo, hi, blo, bhi)))
+}
+
 /// A form file build in flight on the builder's thread (`Maint::z_step`):
 /// its target, its thread, the flag that stops it, and whether the file
 /// under the form file's name was one an attach refused, which the build
@@ -4937,6 +4987,30 @@ fn resolve_fences(parts: &[Fence], pieces: &[Fence], given: &[Fence]) -> Vec<Fen
 #[cfg(test)]
 mod merge_fences {
     use super::*;
+
+    /// Two merges meet where they share an input or a range, and not where
+    /// their ranges only touch at a fence; the first partitioning meets
+    /// every merge.
+    #[test]
+    fn merges_over_disjoint_ranges_do_not_meet() {
+        let s = |n: &str| n.to_string();
+        let a = vec![f("", Some("key-00750"))];
+        let b = vec![f("key-00750", Some("key-01500"))];
+        let c = vec![f("key-00500", Some("key-01000"))];
+        let (ai, bi) = (vec![s("par-1"), s("pcs-3")], vec![s("par-2"), s("pcs-4")]);
+        assert!(!merges_meet(&ai, Some(&a), &bi, Some(&b)));
+        assert!(!merges_meet(&bi, Some(&b), &ai, Some(&a)));
+        assert!(merges_meet(&ai, Some(&a), &bi, Some(&c)));
+        assert!(merges_meet(&bi, Some(&b), &bi, Some(&c)));
+        assert!(merges_meet(
+            &ai,
+            Some(&a),
+            &[s("pcs-3")],
+            Some(&[f("key-02000", None)])
+        ));
+        assert!(merges_meet(&ai, None, &bi, Some(&b)));
+        assert!(merges_meet(&ai, Some(&a), &bi, None));
+    }
 
     fn f(lo: &str, hi: Option<&str>) -> Fence {
         (lo.as_bytes().to_vec(), hi.map(|h| h.as_bytes().to_vec()))
@@ -12476,6 +12550,7 @@ struct SealCounts {
     merge_ns: AtomicU64,
     merges: AtomicU64,
     plans: AtomicU64,
+    merges_beside: AtomicU64,
     held_landings: AtomicU64,
     /// The seal thread's phases, summed over seals: the sort of the frozen
     /// table, the snapshot's build and publish, and the record loop.
@@ -12527,6 +12602,7 @@ impl SealCounts {
             held_landings: get(&self.held_landings),
             merges: get(&self.merges),
             plans: get(&self.plans),
+            merges_beside: get(&self.merges_beside),
             seal_sort_ns: get(&self.seal_sort_ns),
             seal_snap_ns: get(&self.seal_snap_ns),
             seal_records_ns: get(&self.seal_records_ns),
@@ -12566,6 +12642,9 @@ pub struct SealWaits {
     /// does a merge's own under `Options::merge_chains`.
     pub merges: u64,
     pub plans: u64,
+    /// Partition merges started while another was in flight
+    /// (`Options::merge_parallel`).
+    pub merges_beside: u64,
     /// The seal thread's phases, summed over seals: sorting the frozen
     /// table, building and publishing its snapshot (`Options::seal_snapshot`),
     /// writing the records, and the thread's whole run.
@@ -13993,7 +14072,8 @@ struct Shared {
     /// of zero is one whose landings the state shows, and a table still
     /// waiting beside it is a landing that failed.
     in_seal: AtomicUsize,
-    in_merge: std::sync::atomic::AtomicBool,
+    /// The partition merges in flight (`Maint::compacting`).
+    in_merge: AtomicUsize,
     /// A test's: bits under which a seal thread waits, so a test can hold
     /// the store at a point of the seal and ask what it sees there.
     /// `SEAL_HOLD_LANDING` holds it before its segments are renamed into
@@ -25940,7 +26020,7 @@ impl Db {
             seal_counts: SealCounts::default(),
             drain_steps: DrainSteps::new(),
             in_seal: AtomicUsize::new(0),
-            in_merge: std::sync::atomic::AtomicBool::new(false),
+            in_merge: AtomicUsize::new(0),
             seal_hold: std::sync::atomic::AtomicU8::new(0),
             merge_hold: std::sync::atomic::AtomicU8::new(0),
             forms_position_hold: std::sync::atomic::AtomicBool::new(false),
@@ -26476,7 +26556,7 @@ impl Db {
             seal_counts: SealCounts::default(),
             drain_steps: DrainSteps::new(),
             in_seal: AtomicUsize::new(0),
-            in_merge: std::sync::atomic::AtomicBool::new(false),
+            in_merge: AtomicUsize::new(0),
             seal_hold: std::sync::atomic::AtomicU8::new(0),
             merge_hold: std::sync::atomic::AtomicU8::new(0),
             forms_position_hold: std::sync::atomic::AtomicBool::new(false),
@@ -26948,7 +27028,7 @@ impl Db {
         // first commit after it finishes, and before the maintenance for
         // the seal's reason above.
         if self.flush_merge_finished() {
-            self.with_maint(|m| m.join_compact())?;
+            self.with_maint(|m| m.join_finished())?;
         }
         let lent = if background {
             if let Some(e) = self.shared.upkeep.take_err() {
@@ -29231,11 +29311,7 @@ impl Db {
     /// phases, since the landing writes the manifest.
     fn flush_merge_finished(&self) -> bool {
         match &self.maint {
-            MaintHome::Here(m) => {
-                m.flush_merge
-                    && !m.seal_between_phases()
-                    && m.compacting.as_ref().is_some_and(|(_, h)| h.is_finished())
-            }
+            MaintHome::Here(m) => m.flush_merge && !m.seal_between_phases() && m.merge_finished(),
             MaintHome::Away(_) => false,
         }
     }
@@ -29578,6 +29654,13 @@ impl Db {
         self.shared.merge_hold.load(AtomicOrdering::Acquire) & MERGE_HOLD_JOINING != 0
     }
 
+    /// A test's: the partition merges in flight now, started and not yet
+    /// landed (`Options::merge_parallel`).
+    #[doc(hidden)]
+    pub fn merges_in_flight(&self) -> usize {
+        self.shared.in_merge.load(AtomicOrdering::Acquire)
+    }
+
     fn set_hold(hold: &std::sync::atomic::AtomicU8, bit: u8, on: bool) {
         if on {
             hold.fetch_or(bit, AtomicOrdering::AcqRel);
@@ -29603,7 +29686,7 @@ impl Db {
     pub fn in_flight(&self) -> (bool, bool) {
         (
             self.shared.in_seal.load(AtomicOrdering::Acquire) > 0,
-            self.shared.in_merge.load(AtomicOrdering::Acquire),
+            self.shared.in_merge.load(AtomicOrdering::Acquire) > 0,
         )
     }
 
@@ -34990,10 +35073,12 @@ struct Maint {
     /// (`Options::flush_waits_manifest` off): synced once the drain is
     /// answered, and the WAL and temp names it covers retired behind it.
     slot_sync_due: Option<File>,
-    /// A partitioning merge in flight. Its inputs stay live and readable
-    /// until the manifest names its outputs instead, which is what makes
-    /// the swap atomic across a crash.
-    compacting: Option<Compaction>,
+    /// The partition merges in flight, oldest first, at most
+    /// `Options::merge_parallel` of them and over disjoint inputs and
+    /// ranges. Each one's inputs stay live and readable until the manifest
+    /// names its outputs instead, which is what makes the swap atomic
+    /// across a crash.
+    compacting: Vec<Merging>,
     /// A piece merge in flight: its inputs' names and its thread. Its
     /// inputs and a partition merge's are disjoint, each excluding the
     /// other's at its start, so the two run beside each other.
@@ -35033,11 +35118,10 @@ struct Maint {
     /// which merges a pass ran beside, who planned them and what they
     /// rewrote.
     merge_trace: bool,
-    /// The planner a merge started from, for `merge_trace`: the trigger it
-    /// was due at and whether a landing's chain asked.
+    /// The planner a merge starts from, for `merge_trace`: the trigger it
+    /// was due at and whether a landing's chain asked; each merge in flight
+    /// keeps its own (`Merging::why`).
     merge_why: (usize, bool),
-    /// When the merge in flight started, for `merge_trace`.
-    merge_began: Option<std::time::Instant>,
     /// When the last build was collected, for the trace's gap between one
     /// build and the next (`SUPDB_ZPAGES_TRACE`).
     z_last_collect: Option<std::time::Instant>,
@@ -35303,7 +35387,7 @@ impl Maint {
                 loop {
                     self.collect();
                     self.z_step();
-                    let quiet = self.compacting.is_none()
+                    let quiet = self.compacting.is_empty()
                         && self.tiering.is_none()
                         && self.sealing.is_empty();
                     if quiet && !self.z_pending() {
@@ -35339,10 +35423,7 @@ impl Maint {
     /// finished does the same through `Db::commit`.
     fn collect(&mut self) {
         let (readable, sealed) = self.seal_phases_due();
-        let merged = self
-            .compacting
-            .as_ref()
-            .is_some_and(|(_, h)| h.is_finished());
+        let merged = self.merge_finished();
         let tiered = self.tiering.as_ref().is_some_and(|(_, h)| h.is_finished());
         if !(readable || sealed || merged || tiered) {
             return;
@@ -35360,7 +35441,7 @@ impl Maint {
             SealCounts::add(&self.shared.seal_counts.held_landings, 1);
         }
         if merged && done.is_ok() && !between {
-            done = self.join_compact();
+            done = self.join_finished();
         }
         if tiered && done.is_ok() && !between {
             done = self.join_tier();
@@ -35394,7 +35475,7 @@ impl Maint {
             if (reads || writes) && self.opts.merge_chains && self.opts.compact {
                 let base = self.opts.l0_trigger.max(1);
                 self.merge_why.1 = true;
-                done = self.maybe_compact_at(base).and_then(|()| self.maybe_tier());
+                done = self.plan_merges(base);
                 self.merge_why.1 = false;
                 SealCounts::add(&self.shared.seal_counts.plans, 1);
             }
@@ -35506,7 +35587,7 @@ impl Maint {
         // A promotion writes the manifest, so not between a seal's phases
         // either; the seal's durable landing looks again.
         if !(self.opts.adaptive_shape && self.opts.compact)
-            || self.compacting.is_some()
+            || !self.compacting.is_empty()
             || self.tiering.is_some()
             || self.seal_between_phases()
         {
@@ -35582,8 +35663,8 @@ impl Maint {
         for job in self.sealing.drain(..) {
             let _ = job.handle.join();
         }
-        if let Some((_, h)) = self.compacting.take() {
-            let _ = h.join();
+        for m in self.compacting.drain(..) {
+            let _ = m.handle.join();
         }
         if let Some((_, h)) = self.tiering.take() {
             let _ = h.join();
@@ -35631,7 +35712,7 @@ impl Maint {
             retiring_wals,
             retiring_tmps: Vec::new(),
             spares: Vec::new(),
-            compacting: None,
+            compacting: Vec::new(),
             tiering: None,
             sealing: std::collections::VecDeque::new(),
             flush_merge: false,
@@ -35651,7 +35732,6 @@ impl Maint {
             z_trace: std::env::var_os("SUPDB_ZPAGES_TRACE").is_some(),
             merge_trace: std::env::var_os("SUPDB_MERGE_TRACE").is_some(),
             merge_why: (0, false),
-            merge_began: None,
             z_last_collect: None,
             z_epoch: std::time::Instant::now(),
             z_last_step: None,
@@ -35748,11 +35828,13 @@ impl Maint {
     /// them found keys outside every fence it was given. The ranges it
     /// holds wait for it instead.
     fn in_flight_input(&self, name: &str) -> bool {
-        let holds = |c: &Option<Compaction>| {
-            c.as_ref()
+        self.compacting
+            .iter()
+            .any(|m| m.inputs.iter().any(|n| n == name))
+            || self
+                .tiering
+                .as_ref()
                 .is_some_and(|(inputs, _)| inputs.iter().any(|n| n == name))
-        };
-        holds(&self.compacting) || holds(&self.tiering)
     }
 
     /// `n` segment ids, the first returned: one counter for the writer's
@@ -36145,7 +36227,10 @@ impl Maint {
         // promotion the plan makes publishes a manifest that would name
         // the seal's segments before they are durable; the count is left
         // as it was, so the next turn of the loop looks again.
-        if self.compacting.is_some() || self.tiering.is_some() || self.seal_between_phases() {
+        if self.compacting.len() >= self.opts.merge_parallel.max(1)
+            || self.tiering.is_some()
+            || self.seal_between_phases()
+        {
             return;
         }
         let life = self.scan_life();
@@ -36155,7 +36240,7 @@ impl Maint {
         self.idle_life = life;
         let op = self.op();
         let base = self.opts.l0_trigger.max(1);
-        let done = self.maybe_compact_at(base).and_then(|()| self.maybe_tier());
+        let done = self.plan_merges(base);
         SealCounts::add(&self.shared.seal_counts.plans, 1);
         if let Err(e) = done {
             self.shared.put_maint_err(e);
@@ -36213,7 +36298,7 @@ impl Maint {
                         }
                         Some(_) => {}
                     }
-                    self.flush_merge = self.compacting.is_some();
+                    self.flush_merge = !self.compacting.is_empty();
                 }
             }
             return Ok(());
@@ -36442,9 +36527,9 @@ impl Maint {
         }
         let busy: Vec<String> = self
             .compacting
-            .as_ref()
-            .map(|(i, _)| i.clone())
-            .unwrap_or_default();
+            .iter()
+            .flat_map(|m| m.inputs.iter().cloned())
+            .collect();
         let parts: Vec<Fence> = self
             .segs()
             .iter()
@@ -36638,13 +36723,7 @@ impl Maint {
         // deciding against a store that still looked unpartitioned: every
         // merge then took the full re-partitioning path and the
         // incremental one never ran once in a whole load.
-        if self
-            .compacting
-            .as_ref()
-            .is_some_and(|(_, h)| h.is_finished())
-        {
-            self.join_compact()?;
-        }
+        self.join_finished()?;
         // Level 0 is newer than the level below it, every piece of it, so
         // a partition merge may take only a prefix of a range's pieces by
         // age: the pieces present when it starts. A piece merge in flight
@@ -36677,6 +36756,29 @@ impl Maint {
                 Ok(())
             }
             Some(due) if !due.is_empty() => {
+                // Beside merges in flight under `merge_parallel`, the ranges
+                // they hold are not due again: the next merge takes the
+                // next capped run of the rest. At one, a merge in flight
+                // defers the start whatever is due, as it always has.
+                let due = if self.opts.merge_parallel > 1 && !self.compacting.is_empty() {
+                    let held: Vec<Fence> = self
+                        .compacting
+                        .iter()
+                        .flat_map(|m| m.fences.iter().flatten().cloned())
+                        .collect();
+                    due.into_iter()
+                        .filter(|(lo, hi)| {
+                            !held
+                                .iter()
+                                .any(|(hlo, hhi)| fences_overlap(lo, hi, hlo, hhi))
+                        })
+                        .collect()
+                } else {
+                    due
+                };
+                if due.is_empty() {
+                    return Ok(());
+                }
                 let due = if self.opts.promote {
                     self.promote_ranges(due)?
                 } else {
@@ -36690,6 +36792,21 @@ impl Maint {
             }
             Some(_) => Ok(()),
         }
+    }
+
+    /// The landing's chain and the idle plan: merges planned at `trigger`
+    /// until as many run as may (`Options::merge_parallel`) or a plan
+    /// starts none, then a piece merge.
+    fn plan_merges(&mut self, trigger: usize) -> Result<()> {
+        loop {
+            let before = self.compacting.len();
+            self.maybe_compact_at(trigger)?;
+            let after = self.compacting.len();
+            if after <= before || after >= self.opts.merge_parallel.max(1) {
+                break;
+            }
+        }
+        self.maybe_tier()
     }
 
     /// The due ranges one merge takes under the landing's plan
@@ -37175,7 +37292,7 @@ impl Maint {
     /// first by key order among equals, none while a seal or a merge is
     /// rewriting the partitions.
     fn z_next_spare(&self) -> Option<std::sync::Arc<Seg>> {
-        if self.compacting.is_some() || self.tiering.is_some() || !self.sealing.is_empty() {
+        if !self.compacting.is_empty() || self.tiering.is_some() || !self.sealing.is_empty() {
             return None;
         }
         let mut best: Option<(f64, std::sync::Arc<Seg>)> = None;
@@ -37360,7 +37477,7 @@ impl Maint {
         self.z_recode_seen = seen;
         self.z_recode_heat = heats;
         let rewriting =
-            self.compacting.is_some() || self.tiering.is_some() || !self.sealing.is_empty();
+            !self.compacting.is_empty() || self.tiering.is_some() || !self.sealing.is_empty();
         let (Some(budget), Some(_)) = (budget, dt) else {
             return;
         };
@@ -37642,7 +37759,7 @@ impl Maint {
             census,
             build,
             footprint,
-            rewriting: self.compacting.is_some()
+            rewriting: !self.compacting.is_empty()
                 || self.tiering.is_some()
                 || !self.sealing.is_empty(),
         };
@@ -38132,7 +38249,7 @@ impl Maint {
             2
         } else if self.zsel.counts().installs > 0 {
             3
-        } else if self.compacting.is_some() {
+        } else if !self.compacting.is_empty() {
             4
         } else if self.tiering.is_some() {
             5
@@ -38151,7 +38268,7 @@ impl Maint {
                 self.z_land_due,
                 self.z_past_budget,
                 self.z_land_past,
-                self.compacting.is_some(),
+                !self.compacting.is_empty(),
                 self.tiering.is_some(),
                 self.sealing.len(),
                 self.segs().iter().filter(|s| s.level > 0).count(),
@@ -38648,7 +38765,7 @@ impl Maint {
                 ev.model_hash.load(AtomicOrdering::Relaxed),
                 ev.model_records.load(AtomicOrdering::Relaxed),
                 input.generation,
-                u8::from(self.compacting.is_some()),
+                u8::from(!self.compacting.is_empty()),
                 u8::from(self.tiering.is_some()),
                 self.sealing.len(),
             );
@@ -39301,28 +39418,32 @@ impl Maint {
     /// with the same fence. The second reads and writes O(range) where the
     /// first is O(store), which is what the merge measurements convicted.
     fn start_compact(&mut self, fences: Option<Vec<Fence>>) -> Result<()> {
-        if let Some((_, h)) = &self.compacting {
+        if !self.compacting.is_empty() {
             let joins =
                 self.shared.merge_hold.load(AtomicOrdering::Acquire) & MERGE_HOLD_JOINS != 0;
-            if !h.is_finished() && !joins {
-                // A merge is still running. Deferring rather than blocking
-                // keeps it off the commit path; the range it would have
-                // merged waits for the next seal.
-                return Ok(());
-            }
-            // The landing that joins it replaces the partitions the merge
+            // The landing that joins a merge replaces the partitions it
             // rewrote, so the fences planned before it are resolved against
             // the partitions standing after it (`cover_inputs`).
             if joins {
                 self.shared
                     .merge_hold
                     .fetch_or(MERGE_HOLD_JOINING, AtomicOrdering::AcqRel);
+                let joined = self.join_compact();
+                self.shared
+                    .merge_hold
+                    .fetch_and(!MERGE_HOLD_JOINING, AtomicOrdering::AcqRel);
+                joined?;
+            } else {
+                self.join_finished()?;
             }
-            let joined = self.join_compact();
-            self.shared
-                .merge_hold
-                .fetch_and(!MERGE_HOLD_JOINING, AtomicOrdering::AcqRel);
-            joined?;
+            // Merges still running, as many as may run, or one at all for
+            // the first partitioning. Deferring rather than blocking keeps
+            // it off the commit path; the range it would have merged waits
+            // for the next plan.
+            let room = self.opts.merge_parallel.max(1);
+            if !self.compacting.is_empty() && (fences.is_none() || self.compacting.len() >= room) {
+                return Ok(());
+            }
         }
         // No piece merge runs when a partition merge starts, so the pieces
         // taken here are every piece of the ranges, the oldest included.
@@ -39350,6 +39471,18 @@ impl Maint {
                 .collect(),
         };
         if inputs.is_empty() {
+            return Ok(());
+        }
+        // Beside merges in flight, a merge over ranges they hold, or over
+        // a piece one of them takes, waits: its partitions are their
+        // inputs, which their landings retire, and a piece over both is
+        // one output's key on either side. The fences are the resolved
+        // ones, so a piece over a held range has grown them into it.
+        if self
+            .compacting
+            .iter()
+            .any(|m| m.holds(&inputs, fences.as_deref()))
+        {
             return Ok(());
         }
         if self.z_trace {
@@ -39398,7 +39531,7 @@ impl Maint {
         if self.merge_trace {
             let parts_in = inputs.iter().filter(|n| n.starts_with("par-")).count();
             eprintln!(
-                "mergetrace start t={:.6} trigger {} chain {} partitions {} pieces {} mb {:.1} fences {} l0 {}",
+                "mergetrace start t={:.6} trigger {} chain {} partitions {} pieces {} mb {:.1} fences {} l0 {} inflight {}",
                 mono_secs(),
                 self.merge_why.0,
                 self.merge_why.1,
@@ -39406,10 +39539,11 @@ impl Maint {
                 inputs.len() - parts_in,
                 bytes as f64 / (1u64 << 20) as f64,
                 fences.as_ref().map_or(0, |f| f.len()),
-                self.l0_len()
+                self.l0_len(),
+                self.compacting.len()
             );
-            self.merge_began = Some(std::time::Instant::now());
         }
+        let began = self.merge_trace.then(std::time::Instant::now);
         let live_keys: usize = self
             .segs()
             .iter()
@@ -39435,6 +39569,7 @@ impl Maint {
         let walk_cached = self.opts.merge_walk_cached;
         let verify_inputs = self.opts.merge_verifies_inputs;
         let job_inputs = inputs.clone();
+        let kept_fences = fences.clone();
         let wake = self.wake.clone();
         let held = self.shared.clone();
         let handle = std::thread::spawn(move || {
@@ -39468,20 +39603,63 @@ impl Maint {
             }
             out
         });
-        self.compacting = Some((inputs, handle));
-        self.shared.in_merge.store(true, AtomicOrdering::Release);
+        if !self.compacting.is_empty() {
+            SealCounts::add(&self.shared.seal_counts.merges_beside, 1);
+        }
+        self.compacting.push(Merging {
+            inputs,
+            fences: kept_fences,
+            handle,
+            why: self.merge_why,
+            began,
+        });
+        self.shared
+            .in_merge
+            .store(self.compacting.len(), AtomicOrdering::Release);
         Ok(())
     }
 
-    /// Collect a merge: swap its outputs in, name them in the manifest --
-    /// the atomic instant -- and only then delete the inputs.
+    /// Every merge in flight collected, oldest first.
     fn join_compact(&mut self) -> Result<()> {
-        let Some((inputs, handle)) = self.compacting.take() else {
-            return Ok(());
-        };
+        while !self.compacting.is_empty() {
+            self.join_merge(0)?;
+        }
+        Ok(())
+    }
+
+    /// The merges in flight that have finished collected, oldest first,
+    /// and the rest left running.
+    fn join_finished(&mut self) -> Result<()> {
+        while let Some(i) = self.compacting.iter().position(|m| m.handle.is_finished()) {
+            self.join_merge(i)?;
+        }
+        Ok(())
+    }
+
+    /// Whether a merge in flight has finished and waits to be landed.
+    fn merge_finished(&self) -> bool {
+        self.compacting.iter().any(|m| m.handle.is_finished())
+    }
+
+    /// Collect merge `i`: swap its outputs in, name them in the manifest --
+    /// the atomic instant -- and only then delete the inputs. The merges
+    /// still in flight hold none of its inputs, so the set it publishes
+    /// keeps theirs live for their own landings.
+    fn join_merge(&mut self, i: usize) -> Result<()> {
+        let Merging {
+            inputs,
+            handle,
+            began,
+            why,
+            ..
+        } = self.compacting.remove(i);
         self.z_cancel_inputs(&inputs);
-        self.shared.in_merge.store(false, AtomicOrdering::Release);
-        self.flush_merge = false;
+        self.shared
+            .in_merge
+            .store(self.compacting.len(), AtomicOrdering::Release);
+        if self.compacting.is_empty() {
+            self.flush_merge = false;
+        }
         let t = std::time::Instant::now();
         let outputs = handle
             .join()
@@ -39493,13 +39671,14 @@ impl Maint {
                 .map(|m| m.len())
                 .sum();
             eprintln!(
-                "mergetrace land t={:.6} ran_ms {:.1} outputs {} mb {:.1}",
+                "mergetrace land t={:.6} ran_ms {:.1} outputs {} mb {:.1} inflight {} trigger {} chain {}",
                 mono_secs(),
-                self.merge_began
-                    .take()
-                    .map_or(0.0, |b| b.elapsed().as_secs_f64() * 1e3),
+                began.map_or(0.0, |b| b.elapsed().as_secs_f64() * 1e3),
                 outputs.len(),
-                bytes as f64 / (1u64 << 20) as f64
+                bytes as f64 / (1u64 << 20) as f64,
+                self.compacting.len(),
+                why.0,
+                why.1
             );
         }
         let kept: Vec<std::sync::Arc<Seg>> = self
