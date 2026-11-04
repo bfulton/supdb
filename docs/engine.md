@@ -6822,6 +6822,65 @@ start and the merges' streaming beside its scans, and the ten-percent
 pass's three faults a scan against LMDB's 1.8 are the next thing to take
 apart.
 
+Every major fault of a sweep recorded with the instruction that took it
+(`perf record -e major-faults -c 1 -d -k CLOCK_MONOTONIC` around the
+pairing above, cut to the passes by `SUPDB_LAG_MARK`'s stamps) put the
+ten-percent pass's 69,000 faults 54% in `Reader::cache_key_at` over the
+partitions' records -- the builder ahead's splice bounds of every block it
+built, a block's first key at a record a page -- 20% in the copies out of
+them and 8% in the asks for them, and the full-rewrite pass's 85,000 in
+the pieces' records and directory words (`overlay_runs`,
+`Blob::willneed_ranks`), the pieces' heads a bounds walk reads
+(`table_bounds`) and the compact form's pages. Three levers came of it.
+The first was refuted and is kept as an arm (`Options::boundary_keys_from_top`,
+off; `supdb-boundarytop` and `supdb-ingestboundarytop`): a block's first
+key is in the ordered index's top level, in memory, where the heads are
+whole keys, and read there the ten-percent pass's faults fell from 72,000
+to 46,000 in both rounds of a pairing while its pass ran slower, 3.18 and
+2.89 s against 2.68 and 2.49, and its install phase grew from 25 and 21 ms
+to 133 and 148: the builder ahead, freed of its record faults, posted its
+forms faster, and the scanning thread paid to install them. The other two
+ask the kernel for pages a walk already knows: a block's build asks for
+its pieces' directory words together before it asks for their records
+(`Options::pieces_dir_willneed`, `Blob::willneed_dir`; `supdb-nodirwillneed`
+and `supdb-ingestnodirwillneed`), since the record asks read a piece's
+directory word for each run's start, a cold page each, one at a time; and
+a walk of a piece's keys against a partition's block boundaries, at a
+landing or at a table's making, asks for the piece's heads over the
+partition's range first (`Options::bounds_heads_willneed`,
+`ask_bounds_heads`; `supdb-noboundsheadwillneed` and
+`supdb-ingestnoboundsheadwillneed`), since the heads are advised random and
+the walk reads them in order. Each was paired against its arm, a warmup
+and a pair at ten million keys under 1.25 GiB: the full-rewrite pass's
+major faults fell 15% with each (52,800 and 57,900 against 67,400 and
+67,800 for the directory words, 58,600 and 64,700 against 69,700 and
+75,900 for the heads), 30% with both against the head before them, and
+its pass moved 2-4% the right way in three rounds of four, 5.9-6.8 s
+against 6.5-6.9, inside the spread a pairing resolves; the other points
+read level both ways. Both are gated as the records' asks are, and an
+in-core sweep at a hundred thousand keys reads every count of them at
+zero, so they ship on: what each costs where it fires is a syscall a piece
+a block, and what it buys is the faults the counts name.
+
+The refutation named its producer, and the producer was the cost. Out of
+core a burst dirties every block of the store -- a ten-percent burst at ten
+million keys is six writes a block -- and the builder ahead built a form
+for every one of them from partition pages the bound had pushed out, for
+scans that read a few thousand blocks of a hundred and fifty thousand. It
+starts in core alone now, the controller's gate at the raw form
+(`Options::ahead_out_of_core`, off; `supdb-aheadooc` and
+`supdb-ingestaheadooc` keep it running out of core, and `supdb-noahead`
+starts no builder at any size). Two sittings at ten million keys under
+1.25 GiB agree: against no builder at all, the ten-percent pass took
+31,000 major faults against 69,000-83,000 and ran 3.02 and 2.76 s against
+3.34 and 2.96; against the arm that keeps it out of core, 30,000 and
+31,000 against 68,000 and 70,000, 2.74 s in both rounds against 3.10 and
+3.15, the full rewrite 7.09 and 6.83 against 9.62 and 7.39, the scanning
+thread's install of builder forms under a millisecond against 15-47 ms,
+and the sweep's weighted sum 1.03x and 1.108x in the gate's favour. The
+one-percent point read 0.9x in the first sitting and 1.1x in the second.
+In core the gate is raw and the builder starts as before.
+
 #### Out of core: the second form
 
 A pairing this section cites is given as the command that reproduces it, `pair.sh A B SIZE [bench ab options]` (`bench/scripts/pair.sh`: `bench ab` over the two arms, one sitting in each order), at the commit it ran at; a binary built at that commit runs it (`BIN=`), and every arm named exists at the head as well. A rerun reproduces the comparison, not the rates, which this host moves by tens of percent between sittings. A count a sentence quotes -- decodes, faults by mix, the controller's events, the census -- was read with the variable before the command set, which turns supdb's own timers on as well, so a rate against a comparator is read from a run without it. Pairings made before this history's root (2026-10-20) cite the root, `18c3a30`, the first commit here that holds their arms. The design the form was built to is `docs/zpages-design.md`.

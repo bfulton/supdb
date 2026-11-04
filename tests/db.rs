@@ -10377,6 +10377,159 @@ fn a_publish_starts_the_builder_and_a_commit_installs_its_forms_with(upkeep: sup
     m.check(&db, "the writer over its own");
 }
 
+/// A block boundary's key -- a partition's key at a block's first rank,
+/// which the builder ahead and its install bound every block they splice
+/// by (`Reader::block_bounds`) -- is read off the ordered index's top level
+/// in memory where the heads are whole keys
+/// (`Options::boundary_keys_from_top`), where it is a record read, a page
+/// of its own out of core. Two stores of the same writes, one with the
+/// option and one without, answer the same bounds for every block of every
+/// partition, over keys of one length and over keys of two, and only the
+/// option reads the top, and only where the heads are whole keys.
+#[test]
+fn the_splice_bounds_off_the_top_level_are_the_records_bounds() {
+    for (shape, key) in [
+        (
+            "one length",
+            Box::new(|k: u32| format!("key-{k:05}")) as Box<dyn Fn(u32) -> String>,
+        ),
+        (
+            "two lengths",
+            Box::new(|k: u32| {
+                if k.is_multiple_of(3) {
+                    format!("key-{k:05}-long")
+                } else {
+                    format!("key-{k:05}")
+                }
+            }),
+        ),
+    ] {
+        let stores: Vec<(Db, std::path::PathBuf)> = [true, false]
+            .into_iter()
+            .map(|on| {
+                let d = dir(&format!("splice-bounds-{on}-{}", shape.replace(' ', "-")));
+                let mut db = Db::create(
+                    &d,
+                    Options {
+                        partition_bytes: Some(32 << 10),
+                        scan_block_cache: true,
+                        boundary_keys_from_top: on,
+                        ..Options::default()
+                    },
+                )
+                .unwrap();
+                for k in 0..6000u32 {
+                    db.append(key(k).as_bytes(), b"v0");
+                }
+                db.commit().unwrap();
+                db.flush().unwrap();
+                db.settle().unwrap();
+                (db, d)
+            })
+            .collect();
+        let (on, off) = (&stores[0].0, &stores[1].0);
+        let mut blocks = 0usize;
+        for part in 0.. {
+            if on.splice_bounds(part, 0).is_none() {
+                assert!(
+                    off.splice_bounds(part, 0).is_none(),
+                    "{shape}: the partitions differ"
+                );
+                break;
+            }
+            for b in 0.. {
+                let a = on.splice_bounds(part, b);
+                assert_eq!(
+                    a,
+                    off.splice_bounds(part, b),
+                    "{shape}: partition {part} block {b}"
+                );
+                if a.is_none() {
+                    break;
+                }
+                blocks += 1;
+            }
+        }
+        assert!(blocks > 20, "{shape}: the bounds of {blocks} blocks");
+        let (top_on, top_off) = (on.zpage_counts().top_keys, off.zpage_counts().top_keys);
+        assert_eq!(
+            top_off, 0,
+            "{shape}: nothing read off the top without the option"
+        );
+        assert_eq!(
+            top_on > 0,
+            shape == "one length",
+            "{shape}: the top read only where heads are whole keys: {top_on}"
+        );
+        for (db, _) in stores {
+            db.close().unwrap();
+        }
+    }
+}
+
+/// The builder ahead starts while the store is in core, the controller's
+/// gate at the raw form, and not while it is out of core
+/// (`Options::ahead_out_of_core`): a burst out of core dirties every block,
+/// and the builder built each from pages the bound pushed out for scans
+/// that read a few. A publish over a piece starts the builder and the next
+/// commit installs its forms with the gate at raw, installs nothing with
+/// the gate away from it, and installs them again under the option; the
+/// model holds through a handle and the writer in every case.
+#[test]
+fn the_builder_ahead_starts_in_core_and_out_of_core_only_under_the_option() {
+    for (gate, ooc, builds) in [(0u8, false, true), (1, false, false), (1, true, true)] {
+        let d = dir(&format!("ahead-gate-{gate}-{ooc}"));
+        let opts = Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(2 << 10),
+            l0_trigger: 64,
+            scan_block_cache: true,
+            scan_cache_ahead_min_blocks: 0,
+            forms_settle_backlog_pct: 0,
+            commit_forms: true,
+            build_ahead_on_publish: true,
+            upkeep: supdb::Upkeep::Inline,
+            zpages: supdb::ZPages::Off,
+            ahead_out_of_core: ooc,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        db.zgate_set(gate);
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in 0..1500u32 {
+            m.append(&mut db, &key(k), "v0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        db.settle().unwrap();
+        for k in (0..1500u32).step_by(5) {
+            m.append(&mut db, &key(k), "v1");
+        }
+        db.commit().unwrap();
+        let _handle = db.reader().unwrap();
+        db.seal().unwrap();
+        db.settle().unwrap();
+        assert_eq!(db.canonical_forms().0, 0, "the seal emptied the table");
+        for k in (1..1500u32).step_by(11) {
+            m.append(&mut db, &key(k), "v2");
+        }
+        db.commit().unwrap();
+        let forms = db.canonical_forms().0;
+        assert_eq!(
+            forms > 0,
+            builds,
+            "gate {gate}, out of core {ooc}: the builder's forms installed: {forms}"
+        );
+        let r = db.reader().unwrap();
+        m.check(&r, "a reader");
+        drop(r);
+        m.check(&db, "the writer");
+        db.close().unwrap();
+    }
+}
+
 /// EXPERIMENT: the forms are published for a handle and not before.
 /// Commits with no handle live leave the table where it was, so a
 /// handle at that commit still finds its forms; a claim files the
@@ -11987,7 +12140,7 @@ fn seal_snapshot_store_with(name: &str, base: Options) -> (Db, ScanModel) {
     let val = |k: u32, v: &str| format!("{v}-{k}-{}", "x".repeat(1000));
     for k in 0..3000u32 {
         m.append(&mut db, &key(k), &val(k, "v0"));
-        if k % 3 == 0 {
+        if k.is_multiple_of(3) {
             m.append(&mut db, &key(k), &val(k, "v1"));
         }
         if k % 5 == 0 {

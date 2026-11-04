@@ -3021,6 +3021,8 @@ fn a_build_asks_for_its_pieces_pages_together_only_out_of_core() {
                 o.scan_block_cache = true;
                 o.commit_forms = false;
                 o.pieces_willneed = on;
+                o.pieces_dir_willneed = on;
+                o.bounds_heads_willneed = on;
             }),
         )
         .unwrap();
@@ -3067,6 +3069,21 @@ fn a_build_asks_for_its_pieces_pages_together_only_out_of_core() {
             on,
             "the builds asked for the piece's pages only with the option: {asked}"
         );
+        // The pieces' directory words, asked before their records; and the
+        // piece's heads, asked whole before a bounds walk read them -- at
+        // the seal's landing near reads, or at the handle's table.
+        let dirs = db.zpage_counts().dir_willneeds;
+        assert_eq!(
+            dirs > 0,
+            on,
+            "the directory words asked for only with the option: {dirs}"
+        );
+        let heads = db.zpage_counts().bounds_head_asks;
+        assert_eq!(
+            heads > 0,
+            on,
+            "the bounds walks' heads asked for only with the option: {heads}"
+        );
         assert_eq!(
             db.zpage_counts().block_willneeds,
             0,
@@ -3082,6 +3099,11 @@ fn a_build_asks_for_its_pieces_pages_together_only_out_of_core() {
             db.zpage_counts().piece_willneeds,
             asked,
             "with the gate at raw the builds ask nothing"
+        );
+        assert_eq!(
+            db.zpage_counts().dir_willneeds,
+            dirs,
+            "nor for the directory words"
         );
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);

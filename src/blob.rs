@@ -986,6 +986,34 @@ impl<B: Bytes> Blob<B> {
 
     /// Where the record at `rank` begins in the file, by the directory:
     /// `None` past the last rank or for a source with no flat index.
+    /// The directory words of ranks `rank..rank + n` and the one past them
+    /// asked of the kernel ahead of the reads that will want them
+    /// (`willneed_ranks`, `key_at`), nothing where their first page is
+    /// resident already: the bytes submitted. Out of core a block's build
+    /// over a burst's pieces read each piece's directory page one fault at
+    /// a time before it could ask for the records it names.
+    pub fn willneed_dir(&self, rank: usize, n: usize) -> usize {
+        let Some((sec, idx)) = self.flat() else {
+            return 0;
+        };
+        let Some((_, dir)) = idx.regions(sec) else {
+            return 0;
+        };
+        let Some((a, b)) = idx.dir_span(rank, n.saturating_add(1)) else {
+            return 0;
+        };
+        let b = b.min(dir.len());
+        if a >= b {
+            return 0;
+        }
+        let dir_at = dir.as_ptr() as usize - sec.as_ptr() as usize;
+        let off = self.index_offset() + dir_at as u64 + a as u64;
+        if self.src.resident_at(off) == Some(true) {
+            return 0;
+        }
+        self.src.advise_willneed(off, b - a)
+    }
+
     pub fn record_offset(&self, rank: usize) -> Option<u64> {
         let (sec, idx) = self.flat()?;
         let (recs, dir) = idx.regions(sec)?;

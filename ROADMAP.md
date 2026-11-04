@@ -96,7 +96,16 @@ The suite has to be fair before any of its numbers are quoted.
   against LMDB at that head the drained pass 1.3x, the one-percent pass
   level, the ten-percent pass 0.35x and the full rewrite 0.17x, with the
   weighted cells 1.4-4.5x ours since LMDB's bursts run at 14k updates a
-  second under the bound; the merge's first pass reads its
+  second under the bound; out of core a block's build asks for its pieces'
+  directory words and a bounds walk for a piece's heads before reading
+  them (`Options::pieces_dir_willneed`, `Options::bounds_heads_willneed`,
+  the full rewrite's faults 30% fewer, its pass 2-4%), and the splice
+  bounds read off the ordered index's top level were refuted, the builder
+  they freed costing the reader its installs
+  (`Options::boundary_keys_from_top`, off), and the builder ahead starts in
+  core alone, since out of core it built every block a burst dirtied from
+  cold pages (`Options::ahead_out_of_core`, off; the ten-percent pass's
+  faults halved and its time 0.88x in two sittings); the merge's first pass reads its
   keys off the ordered index's heads now (`Options::merge_keys_by_heads`,
   the bursts' background reads an operation 1.6-1.75x fewer, the cells
   within the spread), and what is left there is the merge's second pass
