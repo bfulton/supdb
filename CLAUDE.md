@@ -572,7 +572,15 @@ for the partitions a Zipfian reads, and a search that was instructions
 and L2 hits had no misses for a tree to save. A lever on misses is held to
 the profile of the arm pair, where the symbol it is aimed at loses its
 samples or does not; a pairing resolves nothing under a tenth and an
-instruction count sees no miss.
+instruction count sees no miss. It came again in the settle's resolve
+under the pace: the gallop over the heads for a batch's keys two hundred
+ranks apart put nine tenths of its samples on head loads, so a seek that
+paid one miss into a prefetched stride was built in its place, and kept
+the same tenth of the thread in both arms' profiles -- at 200 ns a key
+over a dozen probes the loads were L2 and L3 hits, which the self time
+divided by the loads had said before anything was built. Price a load by
+the latency the profile's self time over the loads implies, against a
+miss's, before building a lever on the miss.
 
 A pass that reads bimodal across rounds is two shapes, not noise. The
 run keeper's lag pass at ten thousand keys read 2 µs a scan in four
@@ -798,13 +806,35 @@ behind an atomic would let one in unasked.
 its block tables and scan snapshot -- to a thread of the store's own and
 returns without waiting for it; at level 2 (`supdb-hold`) a commit that
 would leave its batch to the next scan returns only once the thread has
-filed it. A commit with no fsync to work beside lends nothing of a
-burst's batch while reads are around and files it itself
-(`Options::upkeep_inline_bursts`): the thread's window is the barrier,
-and a buffered burst of one commit left it none, so the burst's whole
-filing fell to the first scan after it -- the buffered lag cells read
-0.2-0.6x of LMDB with the scans themselves at the drained store's rate.
-`supdb-ingestlendbursts` is the arm that lends anyway. One thread holds it at a time, and one word says which:
+filed it. A commit with no fsync to work beside files a burst's first
+batch after a scan itself (`Options::upkeep_inline_bursts`): the
+thread's window is the barrier, and a buffered burst of one commit left
+it none, so the burst's whole filing fell to the first scan after it --
+the buffered lag cells read 0.2-0.6x of LMDB with the scans themselves
+at the drained store's rate. The batches after that one, each at most
+a hundredth of the store's keys, it lends paced
+(`Options::upkeep_pace_pct`, `Hand::Pace`): the commit returns once the
+thread trails by at most that hundredth, so the thread's core files
+behind the writer's commits, the writer waits only where the thread has
+fallen that far behind, and the first scan after the burst meets at most
+the share -- filing every batch inline had put the whole fill on the
+writer, a third to half of a buffered burst from a hundred thousand keys
+up, and lending every batch had left the scans after a burst 1.8-3.5x
+slower. The share is the first scan's wait for the pass in flight
+against the pass over the store: at ten thousand keys a batch of a
+thousand is a tenth of the store and its fill several passes, and paced
+there the burst gained a third while its scans after lost two thirds.
+It is the pipeline's depth too: paced a batch deep, every batch was a
+pass of the thread's, whose fixed part doubled the thread's cost a batch
+at three million keys, and the sweep's weighted sum read a third worse
+than lending at a million; and a thread gathering half the share before
+a pass, for longer passes while the writer ran ahead, read level, since
+the trailing thread took several batches a pass already and the share
+bounds the trail that lending's long passes amortise, so a lever on a
+pass's length is read against the passes counted before it is built.
+`supdb-ingestlendbursts` is the arm that lends every batch and
+`supdb-ingestnopace` the one that files every batch.
+One thread holds it at a time, and one word says which:
 every hand-over is a single operation on that word, the side giving it
 up fills the cell before it and the side taking it empties the cell
 after, so nothing in it needs to be `Sync`. A writer's touch of it takes
@@ -925,11 +955,14 @@ commit here: the slots' first version dropped it as the manifest's own,
 and it was the segment's too -- an fsync taken off a path is first asked
 what else it made durable. The seal leaves the WAL open and ends at
 its sequence, since replay skips every record a manifest covers; the log
-rotates by size at a commit, synced and its directory entry synced
-first, because replay refuses a sequence gap across files, and a closed
-file retires at the next seal's durable landing, whose manifest covers
-it (`seal_rotates_wal` is the arm that syncs and rotates at every seal
-instead). Readers wait for no
+rotates by size at a commit, leaving what the policy left unsynced to
+the policy's next sync -- the file it begins says in its header kind
+that its predecessor was left loose, the first sync by policy syncs that
+file before the live one and chains the kind, and a replay that meets a
+sequence gap at a loose boundary ends the log there where at a chained
+one it refuses the open -- and a closed file retires at the next seal's
+durable landing, whose manifest covers it (`seal_rotates_wal` is the arm
+that syncs and rotates at every seal instead). Readers wait for no
 fsync and the manifest does, and no manifest is written while a seal's
 segments are published and unsynced -- it would name a segment that may be
 torn and cover a sequence the WAL still has to hold -- so a merge that
@@ -3225,6 +3258,70 @@ measure of a merge policy is the pieces a reader meets, read off the pass
 (`pieces` in the lag counters, `merges_landed`, `merge_plans`), beside the
 burst's rate and the pass's together, since a policy that leaves the
 pieces for later wins both cells and pays in the pass nobody measured.
+
+**A sync the policy never asked for, at the rotation this time.** The
+log rotates by size at a commit, and the rotation fsynced the file it
+closed before starting the next, since replay refuses a sequence gap
+across files. Every frame of a buffered store is unsynced, so every
+rotation was a 32 MiB fdatasync on the writer's thread, 43-70 ms here,
+in a store whose commits never sync; and at a million and at three
+million keys the lag sweep's shuffled load left the live file within a
+few commits of the boundary, so the one-percent burst's first commits
+paid it in every rep, two thirds of a cell that read 0.33x of RocksDB
+without sync. The notes had decomposed that cell to the inline fill and
+listed levers for it; the profile was of the fill's window, and an
+fdatasync is not in a CPU profile. Running the lag probe with two more
+one-percent bursts behind the first (`LAG_PCTS=0,1,2,3,10`) read the
+first at 5 µs a write and the rest at 0.6-1.2 on the arm that filed
+nothing, and `strace -f -tt -T` over it named the call: three 168 KB
+WAL writes, an fdatasync of 43.5 ms, the next file. A rotation leaves
+the frames the policy left unsynced now, the file it begins says so in
+its header kind, the first sync by policy syncs the closed file first
+and chains the kind, and replay reads a gap at a loose boundary as the
+log's end and at a chained one as a record lost. The shape before is no
+arm: a sync the policy never asked for is a wrong answer and not a
+trade, and the pairing that priced its removal kept it as one only in
+the tree that measured. The rule is the drain's, again: a sync is issued by the policy, never by the shape
+of the call that happens to need the write; and a burst that costs more
+than its commits is listed under `strace` before its profile is read,
+since the profile of a thread that waits shows the work and not the
+wait.
+
+**A point that was not the store it said, and a burst as wide as the
+share it is held to.** The buffered arm's one-percent burst at three
+million keys read bimodal in every pairing, 24-70 ms in five reps of six
+and 110-290 in the sixth, every slow rep with level-0 pieces standing,
+its thread building twice the forms and its pass after faster. The first
+two readings went after the writer's syscalls and found nothing: the
+rotation inside the burst is an eight-byte create in every rep
+(`recycle_wal` off), and the WAL's thirty-one writes took under four
+milliseconds in every traced burst. The writer's own CPU over the burst
+beside its wall named a wait, and the hold counters named whose:
+`hold_within`, the paced commit's wait for the thread to trail by at
+most the share, 47 ms of the slow burst's 48 ms gap and nothing in the
+clean ones. Two things coincided. The share is a hundredth of the
+partitions' keys, and the drain the sweep's first point ends in is
+answered before the merge of the pieces it leaves, so at the burst those
+pieces still held keys no partition did, the share undercounted the
+store by them, and a burst of exactly a hundredth crossed it by a batch
+or two at its last commits; and the merge was running beside the burst
+on the guest's four vCPUs, so the pass in flight the hold waited for was
+long. The sweep's comment called its first point "the fully merged
+store", and `sync` joins no merge -- `settle` does, as this file already
+said of an experiment that assumed otherwise. The sweep settles at its
+first point now (`Engine::settle`, `bench/CLAUDE.md`), the probe and the
+`lagburst` and `lagcounters` lines carry the writer's CPU over the burst
+and its holds, and the burst reads one shape, 22-48 ms in twenty-eight
+bursts with holds of 0-9 ms; the pieces the background leaves below its
+trigger still stand in some reps, and the share still undercounts by
+them, so the hold at a burst of exactly the share is the few milliseconds
+of a short pass and not the merge's. The rule: a premise about the
+store's shape at a point is held to the count the counters print -- the
+pieces standing -- before the point's cells are read; a cell as wide as
+a threshold measures the threshold's other side whenever the threshold's
+count moves, so it is read with that count beside it; and a burst slower
+than its commits is read against the writer's CPU and its holds before a
+syscall is suspected.
 
 ## Standing limitations
 

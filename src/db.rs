@@ -1766,10 +1766,12 @@ pub struct Options {
     /// sequence inside a file as it does across files, and a seal ends
     /// on a commit frame, so a file that spans a landed seal replays as
     /// one that does not. The log rotates by size instead, at a commit
-    /// past `seal_bytes` of it, and only once the file is synced: replay carries each file's sequence into the next
-    /// and refuses a gap, so a file rotated away with an unsynced tail
-    /// could leave a store that does not open. A closed file retires at
-    /// the landing of the next seal, which covers every record in it.
+    /// past `seal_bytes` of it, leaving what the policy left unsynced to
+    /// the policy's next sync (`Db::rotate_wal`): replay carries each
+    /// file's sequence into the next, refuses a gap where
+    /// the file before was synced when the next began, and ends the log
+    /// at one where it was not. A closed file retires at the landing of
+    /// the next seal, which covers every record in it.
     pub seal_rotates_wal: bool,
     /// EXPERIMENT: a commit past the seal threshold while the frozen
     /// tables fill the list keeps writing instead of waiting for the
@@ -2383,7 +2385,9 @@ pub struct Options {
     /// commit keeps because its thread works through the fsync. Off,
     /// every commit lends: `supdb-ingestlendbursts` is that arm, and
     /// `supdb-lendbursts` the durable store, whose commits lend either
-    /// way (`docs/engine.md`).
+    /// way (`docs/engine.md`). With `upkeep_pace_pct`, only the first
+    /// such batch after a scan is filed in the commit and the rest, up to
+    /// a share of the store, are lent a batch behind the thread.
     pub upkeep_inline_bursts: bool,
     /// The smallest batch `upkeep_inline_bursts` files in the commit;
     /// below it the batch is lent, as a mix's batches of a hundred are,
@@ -2398,6 +2402,51 @@ pub struct Options {
     /// thirty thousand keys, filed inline, read 1.3x. `supdb-inlineall`
     /// and `supdb-ingestinlineall` file every batch.
     pub upkeep_inline_min: usize,
+    /// Of the batches `upkeep_inline_bursts` would file in the commit,
+    /// one of at most this percentage of the store's keys is instead
+    /// lent to the thread and paced, unless it is the first after a scan:
+    /// the commit returns once the thread trails by at most that share
+    /// of the store (`Hand::Pace`), so the thread's core files a burst
+    /// behind the writer's commits, the writer waits only where the
+    /// thread has fallen the share behind, and the first scan after the
+    /// burst meets at most the share and the pass in flight. Filing every
+    /// batch in the commit put the whole fill on the writer: paired
+    /// against lending every batch at five rungs, the inline fill read
+    /// the lag sweep's burst plus twice its pass at 1.1-1.4x of lending's
+    /// from a hundred thousand keys up and 2.3x at three million, while
+    /// lending left the scans after a burst 1.8-3.5x slower, the thread's
+    /// pass in flight and its residue the first scan's to wait out and
+    /// settle. The share is what the first scan's wait is measured
+    /// against: the scan waits for the pass in flight, a fill of a
+    /// microsecond or two a write, and a pass over the store is a
+    /// hundredth of its keys in scans of a hundred entries at tens of
+    /// nanoseconds each, so a share of a hundredth is a wait of a third
+    /// of the pass at most, and a batch over the share -- a tenth of the
+    /// store at ten thousand keys -- would be several passes: paced
+    /// there, the burst gained a third and its scans after lost two
+    /// thirds. The share is the pipeline's depth as well: paced a batch
+    /// deep, every batch was a pass of the thread's, and a pass has a
+    /// fixed part -- the log read, the snapshot moved, the bounds walked
+    /// -- that doubled the thread's cost a batch at three million keys
+    /// and read the sweep's weighted sum a third worse than lending at a
+    /// million. The thread gathering half the share before a pass, for
+    /// longer passes while the writer ran ahead, read level and is not
+    /// kept: the thread trails the writer and takes what it finds, so
+    /// its passes over a full rewrite held four batches at a million
+    /// keys and fourteen at three million already, the gather made them
+    /// five and fifteen, and a gather of the whole share would idle the
+    /// thread while the writer fills to it and then hold the writer for
+    /// the pass. The trail the share bounds is what lending's passes of
+    /// hundreds of batches amortise -- the fixed part, and a visit a
+    /// block a pass -- and only a longer trail, which is the first
+    /// scan's wait, buys it (`docs/engine.md`). The first batch after a
+    /// scan stays in the commit because
+    /// a burst of one commit with scans at once behind it, the lag
+    /// sweep's bursts at the small rungs, gains nothing from a thread
+    /// that has to be woken and whose pass the first scan then waits
+    /// out. Zero files every such batch in the commit, the shape before:
+    /// `supdb-ingestnopace` (`docs/engine.md`).
+    pub upkeep_pace_pct: usize,
     /// A buffered commit near reads whose batch is under
     /// `upkeep_inline_min` settles it here when a scan ran since the last
     /// commit, and lends the rest -- the forms the scans will walk, built
@@ -3559,6 +3608,7 @@ impl Default for Options {
             upkeep_alert_poll_us: 200,
             upkeep_inline_bursts: true,
             upkeep_inline_min: UPKEEP_WAKE_WRITES,
+            upkeep_pace_pct: 1,
             upkeep_settle_after_scans: true,
             scan_timers: false,
             upkeep_batch_pct: 0,
@@ -3662,13 +3712,51 @@ struct Wal {
     /// frame left in a recycled file by its previous life -- written under
     /// another id -- fails its check and replay stops at the true tail.
     seed: u32,
+    /// Whether the header says the file before this one was left with
+    /// frames no sync had covered when this one began (`WAL_LOOSE`), so a
+    /// gap at that boundary reads as the log's end; rewritten chained by
+    /// the first sync by policy, which syncs that file first (`chain`).
+    loose: bool,
 }
 
-/// The WAL file starts with this, so a file from before frames carried a
-/// kind byte, before CRCs were seeded by file id, or before the CRC moved
-/// from the frame to the batch, is refused by name rather than replayed as
-/// something else.
+/// The WAL file starts with eight bytes, this name and a kind byte, so a
+/// file from before frames carried a kind byte, before CRCs were seeded by
+/// file id, or before the CRC moved from the frame to the batch, is refused
+/// by name rather than replayed as something else. The kind says what a
+/// gap in the sequence at the file's start means. `WAL_CHAINED`: every
+/// frame of the file before it was behind a barrier when this one began,
+/// or there was no file before it, so a gap there is a record lost and the
+/// open refuses. `WAL_LOOSE`: the file before it still held frames no sync
+/// had covered when this one began, frames a power loss can take while
+/// keeping this file's, so a gap there is where the log ends. A rotation
+/// writes the kind the policy left it, and the first sync by policy after
+/// a loose rotation syncs the file left loose and rewrites the kind as
+/// chained, since a gap there is damage again from then on
+/// (`Db::sync_wal`). Every file from before the kind byte could say
+/// otherwise reads as chained, which is what its rotation did.
+const WAL_HEAD: &[u8; 7] = b"SUPDBWL";
+const WAL_CHAINED: u8 = 4;
+const WAL_LOOSE: u8 = 5;
+/// The header of a file begun on a chained boundary.
 const WAL_MAGIC: &[u8; 8] = b"SUPDBWL\x04";
+
+fn wal_header(kind: u8) -> [u8; 8] {
+    let mut h = [0u8; 8];
+    h[..WAL_HEAD.len()].copy_from_slice(WAL_HEAD);
+    h[WAL_HEAD.len()] = kind;
+    h
+}
+
+/// The kind byte of a header, or none for bytes that are not a WAL's header.
+fn wal_kind(header: &[u8]) -> Option<u8> {
+    if header.len() < WAL_MAGIC.len() || &header[..WAL_HEAD.len()] != WAL_HEAD {
+        return None;
+    }
+    match header[WAL_HEAD.len()] {
+        k @ (WAL_CHAINED | WAL_LOOSE) => Some(k),
+        _ => None,
+    }
+}
 
 /// The per-file CRC seed. Any mix that separates neighbouring ids will do;
 /// this is splitmix64's finalizer.
@@ -3685,13 +3773,13 @@ const WAL_DEL: u8 = 1;
 const WAL_COMMIT: u8 = 2;
 
 impl Wal {
-    fn create(path: &Path, id: u64) -> Result<Wal> {
+    fn create(path: &Path, id: u64, kind: u8) -> Result<Wal> {
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(path)?;
-        file.write_all(WAL_MAGIC)?;
+        file.write_all(&wal_header(kind))?;
         Ok(Wal {
             file,
             path: path.to_path_buf(),
@@ -3700,6 +3788,7 @@ impl Wal {
             written: WAL_MAGIC.len() as u64,
             synced: 0,
             seed: wal_seed(id),
+            loose: kind == WAL_LOOSE,
         })
     }
 
@@ -3732,11 +3821,11 @@ impl Wal {
     /// previous life's frames, written under another id, and is overwritten
     /// as this life appends; replay stops at the first frame whose CRC does
     /// not verify under this id.
-    fn recycle(spare: &Path, path: &Path, id: u64) -> Result<Wal> {
+    fn recycle(spare: &Path, path: &Path, id: u64, kind: u8) -> Result<Wal> {
         std::fs::rename(spare, path)?;
         let mut file = OpenOptions::new().write(true).open(path)?;
         file.seek(SeekFrom::Start(0))?;
-        file.write_all(WAL_MAGIC)?;
+        file.write_all(&wal_header(kind))?;
         Ok(Wal {
             file,
             path: path.to_path_buf(),
@@ -3745,6 +3834,7 @@ impl Wal {
             written: WAL_MAGIC.len() as u64,
             synced: 0,
             seed: wal_seed(id),
+            loose: kind == WAL_LOOSE,
         })
     }
 
@@ -3752,11 +3842,23 @@ impl Wal {
     /// its last commit frame. A file that does not exist yet gets its header
     /// so the next replay finds one.
     fn open_append(path: &Path, id: u64, seq: u64) -> Result<Wal> {
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .create(true)
+            .append(true)
+            .open(path)?;
         let mut written = file.metadata()?.len();
+        let mut loose = false;
         if written == 0 {
             file.write_all(WAL_MAGIC)?;
             written = WAL_MAGIC.len() as u64;
+        } else {
+            // The kind replay accepted, kept so a sync by policy knows
+            // whether the header is to be rewritten chained.
+            let mut head = [0u8; 8];
+            file.seek(SeekFrom::Start(0))?;
+            file.read_exact(&mut head)?;
+            loose = wal_kind(&head) == Some(WAL_LOOSE);
         }
         // What replay kept was read back from the device, so it counts as
         // synced; a header written just now does not until the first
@@ -3774,6 +3876,7 @@ impl Wal {
             written,
             synced,
             seed: wal_seed(id),
+            loose,
         })
     }
 
@@ -3838,12 +3941,6 @@ impl Wal {
         }
     }
 
-    fn commit(&mut self) -> Result<()> {
-        self.mark_commit();
-        self.write()?;
-        self.sync()
-    }
-
     fn write(&mut self) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
@@ -3873,6 +3970,22 @@ impl Wal {
         self.written > self.synced.max(WAL_MAGIC.len() as u64)
     }
 
+    /// The header rewritten chained once no file before this one is
+    /// loose: through a handle of its own, since this one may be in append
+    /// mode, where a write lands at the end whatever the offset. The byte
+    /// reaches the device with the file's next sync, which is what follows
+    /// it (`Db::sync_wal`).
+    fn chain(&mut self) -> Result<()> {
+        if !self.loose {
+            return Ok(());
+        }
+        let mut f = OpenOptions::new().write(true).open(&self.path)?;
+        f.seek(SeekFrom::Start(WAL_HEAD.len() as u64))?;
+        f.write_all(&[WAL_CHAINED])?;
+        self.loose = false;
+        Ok(())
+    }
+
     /// Replay committed batches: `apply(kind, key, value)` for every record
     /// of every batch whose commit frame was read intact, in order. Frames
     /// after the last commit frame are a batch that never committed -- torn,
@@ -3883,41 +3996,54 @@ impl Wal {
     /// that length before appending, because a partial batch left in place
     /// would sit in front of the next batch's commit frame and be adopted by
     /// it on the following replay.
+    ///
+    /// `first` says whether this file heads the chain the open replays.
+    /// The third answer is whether the log ended at this file's start: a
+    /// gap between the file before and this one's first record to apply,
+    /// where this one's header says that file was left loose
+    /// (`WAL_LOOSE`) and it is still in the chain. Nothing of such a file
+    /// is applied, and the caller applies nothing after it. Where the
+    /// file before was synced when this one began, or where this file
+    /// heads the chain -- its predecessor retired behind a manifest that
+    /// covered every record in it -- a gap is a record lost, and the
+    /// open refuses as it always did.
     fn replay(
         path: &Path,
         id: u64,
         from: u64,
+        first: bool,
         mut apply: impl FnMut(u8, &[u8], &[u8]),
-    ) -> Result<(u64, u64)> {
+    ) -> Result<(u64, u64, bool)> {
         let seed = wal_seed(id);
         let mut buf = Vec::new();
         match File::open(path) {
             Ok(mut f) => {
                 f.read_to_end(&mut buf)?;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((from, 0)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((from, 0, false)),
             Err(e) => return Err(e),
         }
         if buf.is_empty() {
-            return Ok((from, 0));
+            return Ok((from, 0, false));
         }
         // A file shorter than the header but a prefix of it is a header a
         // power loss tore before its first barrier -- a WAL with nothing in
         // it, not a foreign one. The caller truncates it and the header is
         // rewritten.
         if buf.len() < WAL_MAGIC.len() {
-            if WAL_MAGIC.starts_with(&buf) {
-                return Ok((from, 0));
+            if WAL_HEAD.starts_with(&buf[..buf.len().min(WAL_HEAD.len())]) {
+                return Ok((from, 0, false));
             }
             return Err(err(
                 "not a supdb WAL: the header is missing or from an older format",
             ));
         }
-        if &buf[..WAL_MAGIC.len()] != WAL_MAGIC {
+        let Some(kind) = wal_kind(&buf[..WAL_MAGIC.len()]) else {
             return Err(err(
                 "not a supdb WAL: the header is missing or from an older format",
             ));
-        }
+        };
+        let loose = kind == WAL_LOOSE && !first;
         let mut p = WAL_MAGIC.len();
         let mut next_seq = from;
         let mut committed_seq = from;
@@ -3955,7 +4081,20 @@ impl Wal {
                     // Intact. Now the sequence has to be continuous, which is
                     // a statement about durability rather than damage: a gap
                     // in a verified batch is a record the writer lost, and
-                    // that is an error, not a torn tail.
+                    // that is an error, not a torn tail -- except at the
+                    // first record this file would apply, under a loose
+                    // boundary, where it is the tail the file before lost
+                    // and the log ends before this file.
+                    if loose && committed_seq == from {
+                        let first_applied = batch
+                            .iter()
+                            .map(|&(_, s, _, _, _)| s)
+                            .chain(std::iter::once(seq))
+                            .find(|&s| s >= from);
+                        if first_applied.is_some_and(|s| s != next_seq) {
+                            return Ok((from, WAL_MAGIC.len() as u64, true));
+                        }
+                    }
                     for &(_, s, _, _, _) in &batch {
                         if s >= from {
                             if s != next_seq {
@@ -4006,7 +4145,7 @@ impl Wal {
             p = end;
         }
         // Whatever `batch` still holds never committed: lost whole.
-        Ok((committed_seq, valid_len))
+        Ok((committed_seq, valid_len, false))
     }
 }
 
@@ -12055,11 +12194,14 @@ struct SealCounts {
     /// Seals a commit under the threshold started because no seal was
     /// writing (`Options::seal_idle`).
     idle_seals: AtomicU64,
-    /// WAL rotations, at seals or by size, and the bytes a rotation left
-    /// unsynced in the file it closed -- zero by construction, and the
-    /// quantity a test holds to it.
+    /// WAL rotations, at seals or by size; the bytes a rotation left
+    /// unsynced in the file it closed, none under a policy that syncs
+    /// every commit, which a test holds it to, and the file's tail under
+    /// one that does not (`Db::rotate_wal`); and the closed files a later
+    /// sync by policy synced.
     wal_rotations: AtomicU64,
     rotated_unsynced: AtomicU64,
+    loose_synced: AtomicU64,
     /// Time the writer spent in the seals its commits started: the wait
     /// for room, the freeze, and the seal's writer half.
     freeze_ns: AtomicU64,
@@ -12087,6 +12229,7 @@ impl SealCounts {
             idle_seals: get(&self.idle_seals),
             wal_rotations: get(&self.wal_rotations),
             rotated_unsynced: get(&self.rotated_unsynced),
+            loose_synced: get(&self.loose_synced),
             freeze_ns: get(&self.freeze_ns),
         }
     }
@@ -12135,6 +12278,7 @@ pub struct SealWaits {
     pub idle_seals: u64,
     pub wal_rotations: u64,
     pub rotated_unsynced: u64,
+    pub loose_synced: u64,
     pub freeze_ns: u64,
 }
 
@@ -14866,6 +15010,10 @@ pub struct Db {
     /// next seal's job: every record in them is below that seal's end, so
     /// its durable landing's manifest covers them.
     closed_wals: Vec<PathBuf>,
+    /// The files size rotations closed with frames the policy had not
+    /// synced (`rotate_wal`): synced by the first sync by policy after
+    /// them, ahead of the live file, unless a landing retires them first.
+    loose_wals: Vec<PathBuf>,
     mem_bytes: usize,
     /// The segment ordered ingest streams into, while one is open. The
     /// memtable is ordered exactly while a run is forming or open.
@@ -14979,6 +15127,12 @@ enum Hand {
     /// The batch settled here and its forms left to the scans that walk
     /// them (`Options::upkeep_settle_after_scans`).
     Settle,
+    /// Lent, and the commit returns once the thread trails by at most
+    /// this many writes, a share of the store's keys: a burst's batches
+    /// are filed on the thread's core behind the writer's commits, the
+    /// thread never further behind than the share
+    /// (`Options::upkeep_pace_pct`).
+    Pace(u64),
 }
 
 /// A read in progress on a handle; dropping it ends the read.
@@ -25036,13 +25190,24 @@ impl Db {
     /// file at sequence zero under the old id, whose commits replay
     /// skipped as covered, and the next rotation created the same name
     /// over the live file and retired it. A failed barrier is sticky
-    /// instead (`wal_dir_unsynced`) and every commit retries it first.
+    /// instead (`wal_dir_unsynced`) and the next sync by policy retries
+    /// it first.
+    ///
+    /// The frames the policy has left unsynced stay so. The rotation
+    /// synced them once, so that replay would never meet a gap: an
+    /// fdatasync of the whole file, 32 MiB of a buffered store's frames,
+    /// 43-70 ms here, on a writer whose commits never sync, inside
+    /// whichever burst crossed the boundary -- two thirds of the lag
+    /// sweep's one-percent burst at a million keys, in every rep, since
+    /// the shuffled load leaves the live file within a few commits of the
+    /// boundary at that rung and at three million. A sync is the
+    /// policy's to issue. The new file's header says the one before it
+    /// was left loose, and the first sync by policy after it syncs that
+    /// file and chains the header (`sync_wal`).
     fn rotate_wal(&mut self) -> Result<()> {
-        if self.wal.frames_unsynced() {
-            self.wal.sync()?;
-            self.unsynced = 0;
-        }
-        let mut new_wal = self.next_wal(self.wal_id + 1)?;
+        let loose = self.wal.frames_unsynced();
+        let kind = if loose { WAL_LOOSE } else { WAL_CHAINED };
+        let mut new_wal = self.next_wal(self.wal_id + 1, kind)?;
         new_wal.seq = self.wal.seq;
         let old_wal = std::mem::replace(&mut self.wal, new_wal);
         self.wal_id += 1;
@@ -25052,12 +25217,54 @@ impl Db {
         );
         SealCounts::add(&self.shared.seal_counts.wal_rotations, 1);
         self.closed_wals.push(old_wal.path.clone());
+        if loose {
+            // Pruned of the files the landings have retired, so a store
+            // whose policy never syncs keeps a name per closed file still
+            // standing and not one per rotation of its life.
+            self.loose_wals.retain(|p| p.exists());
+            self.loose_wals.push(old_wal.path.clone());
+        }
+        // The directory barrier the new name needs before anything is
+        // acknowledged into it: now, where the policy has acknowledged
+        // everything in the file just closed, and otherwise with the
+        // first sync by policy, which is the first acknowledgement
+        // (`sync_wal`). A store whose commits never sync owes it to
+        // nothing, and the landings' own directory fsyncs carry the name.
         self.wal_dir_unsynced = true;
-        self.wal_dir_barrier()
+        if loose {
+            Ok(())
+        } else {
+            self.wal_dir_barrier()
+        }
     }
 
-    /// The directory fsync a rotation owes its new file, retried by every
-    /// commit until it succeeds; see `wal_dir_unsynced`.
+    /// The barrier a sync by policy is: the directory a rotation owes its
+    /// new file, then the files loose rotations closed, each synced and
+    /// forgotten, then the live file's header chained, since nothing
+    /// before it is loose any more, and the live file itself; `unsynced`
+    /// starts over. A loose file a landing has retired meanwhile is
+    /// covered by a durable segment, and its absence is no error.
+    fn sync_wal(&mut self) -> Result<()> {
+        self.wal_dir_barrier()?;
+        while let Some(p) = self.loose_wals.first().cloned() {
+            match File::open(&p) {
+                Ok(f) => {
+                    f.sync_data()?;
+                    SealCounts::add(&self.shared.seal_counts.loose_synced, 1);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            self.loose_wals.remove(0);
+        }
+        self.wal.chain()?;
+        self.wal.sync()?;
+        self.unsynced = 0;
+        Ok(())
+    }
+
+    /// The directory fsync a rotation owes its new file, retried by the
+    /// syncs by policy after it until it succeeds; see `wal_dir_unsynced`.
     fn wal_dir_barrier(&mut self) -> Result<()> {
         if self.wal_dir_unsynced {
             File::open(&self.dir)?.sync_all()?;
@@ -25135,20 +25342,20 @@ impl Db {
     /// The new live WAL for a rotation: a recycled retiree when the pool
     /// has one, else a fresh file -- never over the live file's own name,
     /// which a create would truncate and a retirement would delete.
-    fn next_wal(&mut self, id: u64) -> Result<Wal> {
+    fn next_wal(&mut self, id: u64, kind: u8) -> Result<Wal> {
         let path = Db::wal_path(&self.dir, id);
         if path == self.wal.path {
             return Err(err("a rotation named the live WAL"));
         }
         if self.opts.recycle_wal {
             if let Some(spare) = self.shared.take_spare() {
-                return Wal::recycle(&spare, &path, id);
+                return Wal::recycle(&spare, &path, id, kind);
             }
-            let mut wal = Wal::create(&path, id)?;
+            let mut wal = Wal::create(&path, id, kind)?;
             wal.prefill(self.opts.seal_bytes as u64)?;
             return Ok(wal);
         }
-        Wal::create(&path, id)
+        Wal::create(&path, id, kind)
     }
 
     /// The end-of-covered-sequence rides the file name so the rename that
@@ -25251,7 +25458,7 @@ impl Db {
         check_options(&opts)?;
         let starts_random = opts.read_advice.starts_random();
         std::fs::create_dir_all(dir)?;
-        let mut wal = Wal::create(&Db::wal_path(dir, 0), 0)?;
+        let mut wal = Wal::create(&Db::wal_path(dir, 0), 0, WAL_CHAINED)?;
         let mut spare_wal: *mut PathBuf = std::ptr::null_mut();
         let next_seg = 0u64;
         if opts.recycle_wal {
@@ -25260,7 +25467,7 @@ impl Db {
             // pre-write on the commit path.
             wal.prefill(opts.seal_bytes as u64)?;
             let spare = Db::spare_path(dir, 0);
-            Wal::create(&spare, 0)?.prefill(opts.seal_bytes as u64)?;
+            Wal::create(&spare, 0, WAL_CHAINED)?.prefill(opts.seal_bytes as u64)?;
             spare_wal = Box::into_raw(Box::new(spare));
             File::open(dir)?.sync_all()?;
         }
@@ -25451,6 +25658,7 @@ impl Db {
             wal,
             wal_id: 0,
             closed_wals: Vec::new(),
+            loose_wals: Vec::new(),
             mem_bytes: 0,
             direct: None,
             mem_handed: None,
@@ -25744,19 +25952,35 @@ impl Db {
         let mut mem_bytes = 0usize;
         let mut from = sealed;
         let mut valid_len = 0u64;
-        for &id in &wal_ids {
-            let (next, valid) = Wal::replay(&Db::wal_path(dir, id), id, from, |kind, k, v| {
-                if kind == WAL_DEL {
-                    mem.delete(mem_hash(k), k, &readers);
-                    mem_bytes += k.len() + 16;
-                } else {
-                    mem.append(mem_hash(k), k, v, &readers);
-                    mem_bytes += k.len() + v.len();
+        // The file the writer appends to: the last, unless the log ended
+        // at a loose boundary before it (`Wal::replay`), where it is the
+        // file that boundary begins, cut to its header below, with every
+        // file after it removed: their records continue a tail a power
+        // loss took, and would read as a gap at every open after this one.
+        let mut live = wal_ids.len().saturating_sub(1);
+        for (i, &id) in wal_ids.iter().enumerate() {
+            let (next, valid, ended) =
+                Wal::replay(&Db::wal_path(dir, id), id, from, i == 0, |kind, k, v| {
+                    if kind == WAL_DEL {
+                        mem.delete(mem_hash(k), k, &readers);
+                        mem_bytes += k.len() + 16;
+                    } else {
+                        mem.append(mem_hash(k), k, v, &readers);
+                        mem_bytes += k.len() + v.len();
+                    }
+                })?;
+            if ended {
+                live = i;
+                valid_len = valid;
+                for &later in &wal_ids[i + 1..] {
+                    std::fs::remove_file(Db::wal_path(dir, later))?;
                 }
-            })?;
+                break;
+            }
             from = next;
             valid_len = valid;
         }
+        wal_ids.truncate(live + 1);
         // What replayed is what the WAL had committed: a reader under
         // `Latest` sees it from the open on, not from the first commit
         // after. The builder ahead of the reader found it missing, reading
@@ -25965,6 +26189,7 @@ impl Db {
             wal,
             wal_id,
             closed_wals: Vec::new(),
+            loose_wals: Vec::new(),
             mem_bytes,
             direct: None,
             mem_handed: None,
@@ -26307,7 +26532,6 @@ impl Db {
         if self.mem().ordered {
             self.commit_direct()?;
         } else {
-            self.wal_dir_barrier()?;
             self.wal.mark_commit();
             self.wal.write()?;
             self.mem().commit();
@@ -26324,8 +26548,7 @@ impl Db {
                 self.hand_over_upkeep(due);
             }
             if due {
-                self.wal.sync()?;
-                self.unsynced = 0;
+                self.sync_wal()?;
             }
             self.rotate_wal_by_size();
         }
@@ -26471,7 +26694,6 @@ impl Db {
         if self.mem().ordered {
             self.commit_direct()
         } else {
-            self.wal_dir_barrier()?;
             // Under the policy, as `commit` is: the sync `Wal::commit`
             // made whatever the policy was cost a buffered drain a
             // fdatasync of the whole log before its seal began
@@ -26490,9 +26712,12 @@ impl Db {
                     SyncPolicy::Always => true,
                     SyncPolicy::EveryN(n) => self.unsynced >= n.max(1),
                 };
-            if due && self.wal.frames_unsynced() {
-                self.wal.sync()?;
-                self.unsynced = 0;
+            if due
+                && (self.wal.frames_unsynced()
+                    || !self.loose_wals.is_empty()
+                    || self.wal_dir_unsynced)
+            {
+                self.sync_wal()?;
             }
             Ok(())
         }
@@ -26853,11 +27078,11 @@ impl Db {
             self.commit_direct()?;
             return self.close_direct();
         }
-        self.wal_dir_barrier()?;
         if self.opts.seal_rotates_wal {
-            self.wal.commit()?;
+            self.wal.mark_commit();
+            self.wal.write()?;
             self.mem().commit();
-            self.unsynced = 0;
+            self.sync_wal()?;
         } else {
             // What is staged commits as any commit does, synced when the
             // policy is due and not otherwise: the seal no longer rotates
@@ -26874,8 +27099,7 @@ impl Db {
                 SyncPolicy::EveryN(n) => self.unsynced >= n.max(1),
             };
             if due {
-                self.wal.sync()?;
-                self.unsynced = 0;
+                self.sync_wal()?;
             }
         }
         if self.mem().is_empty() {
@@ -27361,9 +27585,12 @@ impl Db {
     pub fn sync(&mut self) -> Result<()> {
         let _op = self.op();
         self.commit_staged()?;
-        // The promise is this call's, whatever the policy left unsynced.
-        if !self.mem().ordered && self.wal.frames_unsynced() {
-            self.wal.sync()?;
+        // The promise is this call's, whatever the policy left unsynced,
+        // in the live file and in the files loose rotations closed.
+        if !self.mem().ordered
+            && (self.wal.frames_unsynced() || !self.loose_wals.is_empty() || self.wal_dir_unsynced)
+        {
+            self.sync_wal()?;
         }
         self.unsynced = 0;
         // The tail goes to a seal too, without waiting for it and without
@@ -28712,7 +28939,7 @@ impl Db {
             wal,
             tmp,
             draining,
-            wal_unsynced: self.wal.frames_unsynced(),
+            wal_unsynced: self.wal.frames_unsynced() || !self.loose_wals.is_empty(),
         };
         // Counted before it is sent, so the count never reads zero with a
         // seal in flight.
@@ -31273,14 +31500,25 @@ impl Db {
         // the fsync: see `Options::upkeep_inline_bursts`, and
         // `Options::upkeep_inline_min` for where "worth waking for" is
         // drawn.
+        let mut pace = false;
+        // The share of the store's keys a paced batch is within and the
+        // thread may trail by (`Options::upkeep_pace_pct`).
+        let share = (keys as u64).saturating_mul(self.opts.upkeep_pace_pct as u64) / 100;
         if level == 1
             && self.opts.upkeep_inline_bursts
             && !syncs
             && reads_around
             && batch >= self.opts.upkeep_inline_min
         {
-            self.upkeep_hand = Hand::File;
-            return;
+            // The first such batch after a scan is filed here, and so is
+            // one over the share of the store the first scan's wait is
+            // measured against; the rest are lent and paced behind the
+            // thread, the hand set once the batch is lent below.
+            if batch as u64 > share || self.upkeep_since_scan == 0 {
+                self.upkeep_hand = Hand::File;
+                return;
+            }
+            pace = true;
         }
         // A smaller batch with a scan since the last commit: the scans
         // behind it take the batch back before the thread's first poll,
@@ -31394,6 +31632,17 @@ impl Db {
         {
             self.shared.upkeep.wake();
         }
+        // Lent as a batch of a burst: the commit waits at its end until
+        // the thread trails by at most the share of the store's keys the
+        // batch was within (`finish_hand`), so the thread's passes cover
+        // several batches where it falls behind. A pass has a fixed part
+        // -- the log read, the snapshot moved, the bounds walked -- and a
+        // depth of one batch made every batch a pass: 3.2 ms a batch on
+        // the thread at three million keys against 1.5 of filing, and
+        // the writer waited for all of it.
+        if pace && self.upkeep_hand == Hand::Lend {
+            self.upkeep_hand = Hand::Pace(share.max(batch as u64));
+        }
     }
 
     /// Whether the commit's own maintenance files its batch at this
@@ -31428,6 +31677,14 @@ impl Db {
                     self.r.settle_pending()?;
                 }
                 Ok(false)
+            }
+            // A burst's batch lent: the thread brought within a share of
+            // the store of the writer before the next batch is committed,
+            // so the thread files behind the writer and the backlog never
+            // grows past the share (`Options::upkeep_pace_pct`).
+            Hand::Pace(within) => {
+                self.hold_within(within);
+                Ok(true)
             }
             Hand::Hold if matches!(self.opts.upkeep, Upkeep::Background(1)) => {
                 let keys: usize = self
@@ -31679,6 +31936,14 @@ impl Db {
             st.lives,
             self.shared.upkeep_lives.load(AtomicOrdering::Relaxed),
         )
+    }
+
+    /// Writes lent to the upkeep thread and not yet filed, by its last
+    /// report: what a paced commit holds to at most its batch
+    /// (`Options::upkeep_pace_pct`).
+    #[doc(hidden)]
+    pub fn upkeep_behind_writes(&self) -> u64 {
+        self.upkeep_behind()
     }
 
     pub fn upkeep_counts(&self) -> [u64; 11] {

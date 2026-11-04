@@ -511,7 +511,7 @@ fn counters_line(
     let get = |c: &[(&str, f64)], n: &str| c.iter().find(|(k, _)| *k == n).map_or(0.0, |(_, v)| *v);
     let d = |n: &str| get(c1, n) - get(c0, n);
     eprintln!(
-        "{tag} {arm} {point} flt up {flt_up} main {flt_main} memfree_mb {} burst_ms {burst_ms:.1} pass_ms {pass_ms:.1} | ph take {:.2} sync {:.2} settle {:.2} snap {:.2} ahead {:.2} install {:.2} | thread {:.1}ms/{:.0}p maint {:.1}ms | built up {:.0} eng {:.0} rd {:.0} cloned {:.0} | snaps {:.0} refr {:.0} | walks {:.0}/{:.0}/{:.0} starts {:.0}/{:.0} | pieces {:.0} unsealed {:.0} handles-scans {:.0} | z reads {:.0} dec {:.0} scans {:.0} groups {:.0} memo {:.0}/{:.0} pf {:.0}",
+        "{tag} {arm} {point} flt up {flt_up} main {flt_main} memfree_mb {} burst_ms {burst_ms:.1} pass_ms {pass_ms:.1} | ph take {:.2} sync {:.2} settle {:.2} snap {:.2} ahead {:.2} install {:.2} | thread {:.1}ms/{:.0}p holds {:.0}/{:.1}ms maint {:.1}ms | built up {:.0} eng {:.0} rd {:.0} cloned {:.0} | snaps {:.0} refr {:.0} | walks {:.0}/{:.0}/{:.0} starts {:.0}/{:.0} | pieces {:.0} unsealed {:.0} handles-scans {:.0} | z reads {:.0} dec {:.0} scans {:.0} groups {:.0} memo {:.0}/{:.0} pf {:.0}",
         mem_free_mb(),
         d("scan_take_us") / 1e3,
         d("scan_sync_us") / 1e3,
@@ -521,6 +521,8 @@ fn counters_line(
         d("scan_install_us") / 1e3,
         d("upkeep_cpu_us") / 1e3,
         d("upkeep_passes"),
+        d("upkeep_holds"),
+        d("upkeep_hold_us") / 1e3,
         d("maint_cpu_us") / 1e3,
         d("blk_by_upkeep"),
         d("blk_by_engine"),
@@ -2204,6 +2206,7 @@ fn lag_sweep(
             (0, 0)
         };
         let cb = if wrote > 0 { counting.begin() } else { None };
+        let burst_cpu0 = thread_cpu_us();
         let tw = Instant::now();
         while updated < want {
             db_key_into(ug.next(), &mut kb);
@@ -2217,6 +2220,10 @@ fn lag_sweep(
             buf.flush_updates(e)?;
         }
         let burst_secs = tw.elapsed().as_secs_f64();
+        // The writer's own CPU over the burst, for the `lagburst` line: a
+        // burst slower than its CPU was waiting or descheduled, one as slow
+        // as its CPU was its own work.
+        let burst_cpu_ms = thread_cpu_us().saturating_sub(burst_cpu0) as f64 / 1e3;
         if wrote > 0 {
             counting.end(cb, "lag-burst", &suffix, None, wrote);
             burst_lag.push((pct, wrote as f64 / burst_secs));
@@ -2236,17 +2243,30 @@ fn lag_sweep(
         // every arm; the rates of a run that counts are not read for it.
         if counting_store {
             eprintln!(
-                "lagburst {arm} {pct} anon_mb {}",
-                anon_resident_bytes().map_or(0, |b| b >> 20)
+                "lagburst {arm} {pct} anon_mb {} burst_ms {:.1} burst_cpu_ms {burst_cpu_ms:.1}",
+                anon_resident_bytes().map_or(0, |b| b >> 20),
+                burst_secs * 1e3
             );
             if std::env::var_os("SUPDB_LAG_ARENAS").is_some() {
                 lag_arenas("lagburstarenas", arm, &pct.to_string());
             }
         }
         if pct == 0 {
-            // Nothing unmerged: the shuffled load's own tail is drained
-            // here, so the first point is the fully merged store.
+            // The shuffled load's own tail is drained here and the merge
+            // the drain hands to the segment work is joined, so no merge
+            // runs into the points. This said "the fully merged store" and
+            // called `sync` alone, which joins no merge: the merge ran
+            // beside the first burst on the guest's four vCPUs, and the
+            // buffered arm's one-percent burst read one rep in six at a
+            // third of its rate -- a burst a hundredth of the store wide
+            // against a paced share of a hundredth of the partitions'
+            // keys, which the pieces still unmerged undercounted, so the
+            // burst crossed the share at its last commits and held for a
+            // pass the merge had made long (`CLAUDE.md`). The pieces the
+            // background leaves below its trigger still stand here, in
+            // some reps and not others, and `lagcounters` counts them.
             e.sync()?;
+            e.settle()?;
         }
         let mut g3 = KeyGen::new(KeyDist::Uniform, scan_keys, 0x1A7);
         // With `SUPDB_SCAN_OPS` set, every scan of the point's pass is timed

@@ -2745,6 +2745,158 @@ the slot walk bounded to the slots the batch touched, the resolve's
 stride hinted a key ahead, the forms sized by count rather than room,
 each priced on this burst and on the mixes before it is the default.
 
+Paired the same way at ten thousand, a hundred thousand, three hundred
+thousand, a million and three million keys (`pair.sh
+SUPDB_LAG_COUNTERS=1 supdb-ingest supdb-ingestlendbursts SIZE --passes
+load,lag --reps 8` at `37ea8f2`, six pairs a sitting at the two largest
+rungs), lending every batch reads the sweep's weighted sum at
+0.88-0.90x, 0.74x, 0.61x, 0.55x and 0.43x of the inline fill's, resolved
+in both orders from a hundred thousand up and at the fully rewritten
+point at every rung but ten thousand; the bursts 1.4-4x faster, the
+passes after the tenth and the full rewrite 1.8-3.5x slower, the
+one-percent point level everywhere but three million, where it reads
+0.89x and 0.92x. The thread files a burst's batch at once now, so the
+pass after a lent burst no longer pays what it paid when the inline fill
+was chosen. The inline fill still holds the lag scan cells against LMDB
+at the smallest rungs, which lending would read at about 0.3x of today's
+at ten thousand; the pipeline a batch deep described above is the shape
+that would keep both, and it is not built.
+
+The larger part of the one-percent cell was not the fill. The lending
+arm ran its own one-percent burst at 5 µs a write where its second and
+third one-percent bursts, run after it through the lag probe
+(`LAG_PCTS=0,1,2,3,10 lag_only supdb-ingestlendbursts 1000000 3` at
+`37ea8f2`), ran 0.6-1.2, and `strace -f -tt -T` over the probe put the
+difference in one call: the burst's third commit crossed `seal_bytes` of
+the live WAL, the rotation fdatasynced the file it closed, 31 MB of
+frames a buffered store had never synced, 43.5 ms on the writer's
+thread, and then the directory; at three million keys the two took
+106 ms of the lending arm's 92-147 ms burst. The shuffled load leaves
+the live file within a few commits of the boundary at both rungs, so
+every rep paid it, and the durable arm's rotation, every frame of it
+synced at its commit, paid nothing. A rotation leaves the frames the
+policy left unsynced now; the file it begins says so in its header
+kind; the first sync by policy syncs the closed file before the live one
+and chains the kind; and replay reads a gap at a loose boundary as the
+log's end, where at a chained one it refuses the open (`Db::rotate_wal`,
+`Wal::replay`). The probe reads the shipped arm's first one-percent
+burst at 24-34 ms and its second at 28-29 at the commit that made the
+change, against 71-76 and 22-27 before it (`LAG_PCTS=0,1,2 lag_only
+supdb-ingest 1000000 1`, three runs each). Paired in one process against
+the shape before, kept as an arm in the measuring tree alone, at a
+million keys over the load and lag passes, six pairs a sitting in both
+orders: the one-percent burst 2.6x and 2.7x (6/6 each), its weighted sum
+0.75x and 0.65x (6/6 each), the tenth and the full rewrite within noise
+with their bursts 24 against 61 ms, 186 against 182 and 2,327 against
+2,394 in the counters, and the loads and the scans level.
+
+The pipeline described above is built (`Options::upkeep_pace_pct`,
+`Hand::Pace`): of the batches a buffered commit near reads would file
+itself, the first after a scan still is, and the rest, each at most a
+hundredth of the store's keys, are lent, the commit returning once the
+thread trails by at most that hundredth. Two depths were priced, each
+against the inline fill (`supdb-ingestnopace`) and against lending every
+batch (`pair.sh SUPDB_LAG_COUNTERS=1 supdb-ingest ARM SIZE --passes
+load,lag --reps 8`, six pairs a sitting at a million and three million,
+at the commit that added the option). A batch deep -- the commit holding
+until the thread had filed the batch before it -- the pace read the
+sweep's weighted sum at 0.77x and 0.83x of the inline fill's at a
+million keys and at 1.35x and 1.39x of lending's: every batch was a pass
+of the thread's, and a pass has a fixed part, the log read, the snapshot
+moved and the bounds walked, which read 2 ms a pass of a thousand writes
+at a million keys and 3.2 at three million against 1.0-1.5 of filing, so
+the thread did twice the work a batch and the writer waited for it. With
+the depth the share, the hundredth, the thread's passes cover several
+batches where it falls behind, and against the inline fill the pace
+reads the sum at 0.79x and 0.82x at three hundred thousand keys, 0.75x
+and 0.81x at a million and 0.64x and 0.64x at three million, 8/8 or 6/6
+in both orders, the bursts 1.3-4.7x faster and the scans after the tenth
+and the full rewrite at 0.6-0.9x; at a hundred thousand 0.85x and 1.02x,
+and at ten thousand, where a batch of a thousand is a tenth of the store
+and is filed in the commit as before, a control. Against lending every
+batch the pace reads 1.21x and 1.29x at a million and 1.23x and 1.29x at
+three million: lending's bursts run 1.7-2.5x faster still, since the
+thread's filing is cheapest in the long passes a run-ahead writer leaves
+it -- a block dirtied by many writes is built once where the pace
+patches it a few batches at a time -- and its scans after the tenth and
+the full rewrite run 2-7.8x slower, the residue the first scan settles.
+The share is where the two are traded: the pass in flight the first scan
+waits for is at most a hundredth of the store's fill, and what lending
+saves on the burst past that is what the pace leaves. The lever that
+left, the thread gathering half the share before it begins a pass while
+the writer runs ahead, so that its passes are longer while the first
+scan's wait stays bounded, was built on `Options::upkeep_batch_pct`'s
+gate and priced the same way, eight pairs a sitting at three hundred
+thousand keys and six at a million and three million, both orders, at
+the commit after the option's. It read level: against the inline fill
+0.83x and 0.74x, 0.83x and 0.70x and 0.66x and 0.66x where the pace
+without it read 0.79x and 0.82x, 0.75x and 0.81x and 0.64x and 0.64x;
+against lending 1.26x and 1.28x at a million and 1.39x and 1.30x at
+three million where it read 1.21x and 1.29x and 1.29x and 1.23x; and
+the one-percent burst at three million, thirty batches with a gather of
+fifteen, at 0.6-0.8x of the pace's without it in all four sittings. The
+counters say why it could not gain. The thread trails the writer and
+takes what it finds, so its passes over the full rewrite already held
+4.3 batches at a million keys and 14.5 at three million, 232 and 207
+passes, and the gather made them 5.6 and 15.5, 179 and 193; the fixed
+part those passes cost is three tenths of the thread's time at a
+million keys (232 passes at 2 ms of 1,580) and a ninth at three million
+(207 at 3.2 ms of 5,944), the share bounds the trail at ten and thirty
+batches, so no gather under it reaches lending's eight to ten passes,
+and one of the whole share has the thread idle while the writer fills
+to it and the writer wait the pass out. What lending's passes save
+besides is the visit: a block is visited once a pass for the writes the
+pass holds for it, and over a rewrite each block takes its sixty-four
+writes in about fifty-five visits under the pace against eight to ten
+under lending; the visit is priced by its misses, so the thread's
+per-write work, its time less the fixed parts over the writes, reads
+1.1x lending's at a million keys and 1.6x at three million (1.76 µs a
+write against 1.1). The gather is not kept. The pace's burst is the
+thread's throughput -- the burst reads within a tenth of the thread's
+time at both rungs -- and the thread's pass under it is profiled against
+lending's (`SUPDB_LAG_MARK=1 perf record -e cpu-clock -F 4000 -k
+CLOCK_MONOTONIC` over `lag_only ARM SIZE 2`, the samples cut to the full
+rewrite's burst window and the `supdb-upkeep` thread, at `18aefe7`). Of
+what the paced thread costs over lending's, 426 ms of 1,850 at a million
+keys and 2,450 of 6,200 at three million, three quarters and two thirds
+are in `settle_each` and `cache_seek_exact`, with the builds and the
+patches level between the arms: the visits, and the resolve. Half of
+`settle_each`'s samples sit on `prefetch_form`'s loop, the next block's
+form fetched whole before its one or two keys are patched into it -- the
+fetch is the visit's price, and the pace makes 5.6 times lending's
+visits -- and the resolve's samples sit on the gallop's head loads. A
+seek that galloped over the index's in-memory top level and then
+searched the one stride the answer lies in, its eight lines asked for at
+once, was built for the resolve and priced against the gallop as an arm
+at three hundred thousand, a million and three million keys, both
+orders, and read level: the symbol kept its tenth of the thread in the
+profile of either arm, 740 of 7,228 samples against 821 of 7,406 at a
+million and 2,767 of 25,855 against 3,064 of 24,843 at three million,
+and no cell resolved in either order. The gallop's probes for a key two
+hundred ranks past the last are a dozen lines, and at 200 ns a key they
+were 15-20 ns apiece, L2 and L3 hits: one miss into a cold stride costs
+what a dozen of them do, and the seek is not kept. What is left of the
+paced burst is the visit, a form's three buffers fetched for a patch that
+reads a few lines of two of them, 5.6 visits a block for lending's one
+under a trail the share bounds. The `lagburst` line carries the writer's
+CPU over the burst beside its wall now, and `lagcounters` its holds, and
+they say the same from the writer's side (`SUPDB_LAG_COUNTERS=1 bench ab
+--arms supdb-ingest,supdb-ingest --size 3000000 --passes load,lag --reps
+6`): over the full rewrite at three million keys the writer's CPU is 3.2-3.5
+s of a burst of 7.4-9.3, its holds 3.1-4.1 s, and over the ten-percent
+burst 0.3 s of 0.7-1.4 with holds of 0.26-1.04 -- the writer's own work is
+lending's burst, and the rest is the thread's throughput waited for at the
+share. The one-percent burst there read bimodal, one rep in six at 110-290
+ms against 24-70, and it was the hold too, 47 ms of a slow burst's 48 ms
+gap: the drain the sweep's first point ends in left the merge of its pieces
+running into the burst, so the pieces' keys were in no partition and the
+share, a hundredth of the partitions' keys, fell short of a burst of a
+hundredth by a batch or two, which held at the last commits for a pass the
+merge had made long. The sweep joins that merge at its first point now
+(`Engine::settle`) and the burst reads one shape, 22-48 ms in twenty-eight
+bursts with holds of 0-9 ms (`CLAUDE.md`, the point that was not the store
+it said).
+
 #### The freeze that leaves its carry to the next look
 
 At level 1 the freeze is the one place the writer still does work for
@@ -5367,7 +5519,9 @@ against the arm it adds to, twelve pairs a rung at 10k, 100k and 300k:
   the live file's sequence, the file is not synced or rotated, and it
   rotates by size at a commit, synced first -- replay carries each
   file's sequence into the next and refuses a gap, so a file rotated
-  away with an unsynced tail could leave a store that does not open.
+  away with an unsynced tail could leave a store that does not open
+  (the sync came off the writer's thread later; "The buffered
+  one-percent burst at a million keys", above).
   The writer's time in the seals its commits start fell to 4-10% on the
   shape arm and 22-56% on the durable default, ycsb-F rose 1.2-1.3x on
   the shape arm, and nothing fell.

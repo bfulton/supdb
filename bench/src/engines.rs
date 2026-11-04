@@ -252,6 +252,15 @@ pub trait Engine {
     fn range(&mut self, from: &[u8], n: usize) -> Res<usize>;
     /// Make everything written durable and readable.
     fn sync(&mut self) -> Res<()>;
+    /// Join whatever the engine still does in the background after a
+    /// `sync` -- supdb's merges of the pieces a drain left, which the
+    /// flush hands to a thread and the writer publishes at its next
+    /// commit -- so a pass that wants a store in a known shape has one.
+    /// Outside every timed window. Nothing, for an engine whose `sync`
+    /// leaves nothing in flight.
+    fn settle(&mut self) -> Res<()> {
+        Ok(())
+    }
     fn size_bytes(&self) -> u64;
     /// A reader for a thread of its own, made here on the thread that
     /// owns the engine and opened on the thread that reads through it.
@@ -463,6 +472,12 @@ pub struct Supdb {
     /// and `supdb-lendbursts` durable, where the commits sync and so
     /// lend either way.
     lendbursts: bool,
+    /// A buffered commit near reads files every large batch itself, as
+    /// before the batches after the first were lent a batch behind the
+    /// thread (`Options::upkeep_pace_pct` at zero). `supdb-ingestnopace`;
+    /// a durable store's commits lend either way, so it has no durable
+    /// twin.
+    nopace: bool,
     /// A buffered commit near reads files any batch itself, however
     /// small (`Options::upkeep_inline_min` at one). `supdb-ingestinlineall`,
     /// and `supdb-inlineall` durable, where the commits sync and so lend
@@ -1187,6 +1202,12 @@ struct Policy {
     /// and `supdb-lendbursts` durable, where the commits sync and so
     /// lend either way.
     lendbursts: bool,
+    /// A buffered commit near reads files every large batch itself, as
+    /// before the batches after the first were lent a batch behind the
+    /// thread (`Options::upkeep_pace_pct` at zero). `supdb-ingestnopace`;
+    /// a durable store's commits lend either way, so it has no durable
+    /// twin.
+    nopace: bool,
     /// A buffered commit near reads files any batch itself, however
     /// small (`Options::upkeep_inline_min` at one). `supdb-ingestinlineall`,
     /// and `supdb-inlineall` durable, where the commits sync and so lend
@@ -1765,6 +1786,7 @@ impl Default for Policy {
             refvals: false,
             rowatclose: false,
             lendbursts: false,
+            nopace: false,
             inlineall: false,
             lazysettle: false,
             walsync: false,
@@ -3128,6 +3150,24 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 lendbursts: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` with every large batch near reads filed in the
+    /// commit, as before the batches after a scan's first were lent a
+    /// batch behind the thread (`Options::upkeep_pace_pct` at zero):
+    /// against `supdb-ingest` it prices the pace, and against
+    /// `supdb-ingestlendbursts` the pace is read between the two shapes
+    /// it sits between.
+    pub fn create_ingest_nopace(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                nopace: true,
                 ..Policy::default()
             },
         )
@@ -5977,6 +6017,7 @@ impl Supdb {
             refvals,
             rowatclose,
             lendbursts,
+            nopace,
             inlineall,
             lazysettle,
             walsync,
@@ -6254,6 +6295,11 @@ impl Supdb {
             // The upkeep where the arm puts it, or where the engine does.
             upkeep: upkeep.unwrap_or(supdb::Options::default().upkeep),
             upkeep_inline_bursts: !lendbursts,
+            upkeep_pace_pct: if nopace {
+                0
+            } else {
+                supdb::Options::default().upkeep_pace_pct
+            },
             upkeep_inline_min: if inlineall {
                 1
             } else {
@@ -6521,6 +6567,7 @@ impl Supdb {
             refvals,
             rowatclose,
             lendbursts,
+            nopace,
             inlineall,
             lazysettle,
             walsync,
@@ -7140,6 +7187,9 @@ impl Engine for Supdb {
                 "supdb-ingestlendbursts"
             };
         }
+        if self.nopace {
+            return "supdb-ingestnopace";
+        }
         if self.inlineall {
             return if self.partition {
                 "supdb-inlineall"
@@ -7647,6 +7697,11 @@ impl Engine for Supdb {
             ("frozen_sorts", db.frozen_sorts() as f64),
             // What the upkeep thread spent, and the passes it spent it in.
             ("upkeep_ms", db.upkeep_counts()[6] as f64 / 1e3),
+            // The writer's holds for the thread and their time
+            // (`Db::hold_within`, `hold_for_upkeep`): a burst slower than
+            // its commits is read against them before anything else.
+            ("upkeep_holds", db.upkeep_counts()[4] as f64),
+            ("upkeep_hold_us", db.upkeep_counts()[5] as f64),
             ("upkeep_passes", db.upkeep_counts()[0] as f64),
             ("upkeep_skipped", db.upkeep_counts()[7] as f64),
             // The times the upkeep thread gave its forms up, and of those
@@ -7998,6 +8053,19 @@ impl Engine for Supdb {
             if self.zpages {
                 db.zpages_settle().map_err(|e| e.to_string())?;
             }
+        }
+        Ok(())
+    }
+    /// The seals and merges in flight joined (`Db::settle`): a drain is
+    /// answered before the merge of the pieces it leaves, which ran on
+    /// into the lag sweep's points beside the bursts, and the buffered
+    /// arm's one-percent burst read one rep in six at a third of its rate
+    /// for it (`CLAUDE.md`, the sweep's first point). The pieces the
+    /// background leaves below its trigger still stand after this, and
+    /// the `lagcounters` line counts them.
+    fn settle(&mut self) -> Res<()> {
+        if let Some(db) = self.db.as_mut() {
+            db.settle().map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -8721,6 +8789,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestrefvals"
         | "supdb-ingestrowatclose"
         | "supdb-ingestlendbursts"
+        | "supdb-ingestnopace"
         | "supdb-ingestinlineall"
         | "supdb-ingestlazysettle"
         | "supdb-ingestsettlebuilds"
@@ -9053,6 +9122,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestbglag" => Box::new(Supdb::create_ingest_bglag(dir)?),
         "supdb-lendbursts" => Box::new(Supdb::create_lendbursts(dir)?),
         "supdb-ingestlendbursts" => Box::new(Supdb::create_ingest_lendbursts(dir)?),
+        "supdb-ingestnopace" => Box::new(Supdb::create_ingest_nopace(dir)?),
         "supdb-inlineall" => Box::new(Supdb::create_inlineall(dir)?),
         "supdb-ingestinlineall" => Box::new(Supdb::create_ingest_inlineall(dir)?),
         "supdb-lazysettle" => Box::new(Supdb::create_lazysettle(dir)?),
