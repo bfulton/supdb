@@ -5126,6 +5126,22 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with the read advice pinned to `MADV_RANDOM` for the store's
+    /// life (`ReadAdvice::Random`): out of core a scan asks the kernel for
+    /// the spans it will walk (`Options::blocks_willneed`,
+    /// `Options::pieces_willneed`), which the kernel reads whatever the
+    /// advice, and the random advice takes away the read-around each fault
+    /// adds beside them.
+    pub fn create_advicerandom(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                advice: Some(supdb::ReadAdvice::Random),
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` in every respect but the block cache, off: the merge on
     /// every scan, the shape before the cache, kept as the comparison arm.
     /// The pair differs by one option and needs no matching.
@@ -7924,6 +7940,9 @@ impl Engine for Supdb {
             self.block_cache,
         ) {
             (true, true, false, false) => "supdb-nocache",
+            (true, true, true, _) if self.advice == Some(supdb::ReadAdvice::Random) => {
+                "supdb-advicerandom"
+            }
             (true, true, true, _) => "supdb-noadvice",
             (true, true, false, true) => "supdb",
             (false, _, _, _) => "supdb-ingest",
@@ -8925,6 +8944,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-pubalways"
         | "supdb-nosnap"
         | "supdb-noadvice"
+        | "supdb-advicerandom"
         | "supdb-nocache"
         | "supdb-nocacheordread"
         | "supdb-nocachezpages"
@@ -9234,6 +9254,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-wforms" => Box::new(Supdb::create_wforms(dir)?),
         "supdb-nosnap" => Box::new(Supdb::create_nosnap(dir)?),
         "supdb-noadvice" => Box::new(Supdb::create_noadvice(dir)?),
+        "supdb-advicerandom" => Box::new(Supdb::create_advicerandom(dir)?),
         "supdb-nocache" => Box::new(Supdb::create_nocache(dir)?),
         "supdb-nocacheordread" => Box::new(Supdb::create_nocache_ordread(dir)?),
         "supdb-nocachezpages" => Box::new(Supdb::create_nocache_zpages(dir)?),
