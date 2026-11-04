@@ -529,6 +529,20 @@ pub struct Supdb {
     /// (`Options::merge_bytes_cap` at zero). `supdb-ingestmergeuncapped`,
     /// and `supdb-mergeuncapped` durable.
     mergeuncapped: bool,
+    /// The block cache reads a block boundary's key off the ordered index's
+    /// top level in memory, where the default reads the partition's record
+    /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
+    /// `supdb-boundarytop` durable.
+    boundarytop: bool,
+    /// A block's build asks for its pieces' records without asking for
+    /// their directory words first (`Options::pieces_dir_willneed` off).
+    /// `supdb-ingestnodirwillneed`, and `supdb-nodirwillneed` durable.
+    nodirwillneed: bool,
+    /// A bounds walk reads a piece's heads as it meets them
+    /// (`Options::bounds_heads_willneed` off).
+    /// `supdb-ingestnoboundsheadwillneed`, and `supdb-noboundsheadwillneed`
+    /// durable.
+    noboundsheadwillneed: bool,
     /// A seal writes every key through the writer's general path, as
     /// before the one-value path (`Options::seal_put_one` off).
     /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
@@ -1253,6 +1267,20 @@ struct Policy {
     /// (`Options::merge_bytes_cap` at zero). `supdb-ingestmergeuncapped`,
     /// and `supdb-mergeuncapped` durable.
     mergeuncapped: bool,
+    /// The block cache reads a block boundary's key off the ordered index's
+    /// top level in memory, where the default reads the partition's record
+    /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
+    /// `supdb-boundarytop` durable.
+    boundarytop: bool,
+    /// A block's build asks for its pieces' records without asking for
+    /// their directory words first (`Options::pieces_dir_willneed` off).
+    /// `supdb-ingestnodirwillneed`, and `supdb-nodirwillneed` durable.
+    nodirwillneed: bool,
+    /// A bounds walk reads a piece's heads as it meets them
+    /// (`Options::bounds_heads_willneed` off).
+    /// `supdb-ingestnoboundsheadwillneed`, and `supdb-noboundsheadwillneed`
+    /// durable.
+    noboundsheadwillneed: bool,
     /// A seal writes every key through the writer's general path, as
     /// before the one-value path (`Options::seal_put_one` off).
     /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
@@ -1779,6 +1807,9 @@ impl Default for Policy {
             noheadwillneed: false,
             nomergechain: false,
             mergeuncapped: false,
+            boundarytop: false,
+            nodirwillneed: false,
+            noboundsheadwillneed: false,
             sealrun: false,
             closeinline: false,
             timers: false,
@@ -3493,6 +3524,34 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 mergeuncapped: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose block cache reads its boundary keys off the ordered
+    /// index's top level, where the default reads the partition's records
+    /// (`Options::boundary_keys_from_top`): against `supdb` under a bound
+    /// it prices the records' pages.
+    pub fn create_boundarytop(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                boundarytop: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` reading its boundary keys off the top level, as
+    /// `supdb-boundarytop`.
+    pub fn create_ingest_boundarytop(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                boundarytop: true,
                 ..Policy::default()
             },
         )
@@ -5991,6 +6050,9 @@ impl Supdb {
             noheadwillneed,
             nomergechain,
             mergeuncapped,
+            boundarytop,
+            nodirwillneed,
+            noboundsheadwillneed,
             sealrun,
             closeinline,
             timers,
@@ -6276,6 +6338,9 @@ impl Supdb {
             } else {
                 supdb::Options::default().merge_bytes_cap
             },
+            boundary_keys_from_top: boundarytop,
+            pieces_dir_willneed: !nodirwillneed,
+            bounds_heads_willneed: !noboundsheadwillneed,
             seal_put_one: !sealrun,
             close_finish_inline: closeinline,
             upkeep_wake_parked: wake,
@@ -6535,6 +6600,9 @@ impl Supdb {
             noheadwillneed,
             nomergechain,
             mergeuncapped,
+            boundarytop,
+            nodirwillneed,
+            noboundsheadwillneed,
             sealrun,
             closeinline,
             timers,
@@ -7245,6 +7313,27 @@ impl Engine for Supdb {
                 "supdb-ingestmergeuncapped"
             };
         }
+        if self.boundarytop {
+            return if self.partition {
+                "supdb-boundarytop"
+            } else {
+                "supdb-ingestboundarytop"
+            };
+        }
+        if self.nodirwillneed {
+            return if self.partition {
+                "supdb-nodirwillneed"
+            } else {
+                "supdb-ingestnodirwillneed"
+            };
+        }
+        if self.noboundsheadwillneed {
+            return if self.partition {
+                "supdb-noboundsheadwillneed"
+            } else {
+                "supdb-ingestnoboundsheadwillneed"
+            };
+        }
         if self.sealrun {
             return if self.partition {
                 "supdb-sealrun"
@@ -7785,6 +7874,11 @@ impl Engine for Supdb {
             ("willneed_asks", z.willneed_asks as f64),
             ("head_asks", z.head_asks as f64),
             ("head_submitted", z.head_submitted as f64),
+            ("top_keys", z.top_keys as f64),
+            ("dir_willneeds", z.dir_willneeds as f64),
+            ("dir_asks", z.dir_asks as f64),
+            ("bounds_head_asks", z.bounds_head_asks as f64),
+            ("bounds_head_submitted", z.bounds_head_submitted as f64),
             ("zpage_nopage_reads", z.nopage_reads as f64),
             ("zpage_scans", z.scans as f64),
             ("zpage_scan_groups", z.scan_groups as f64),
@@ -8633,6 +8727,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-noheadwillneed"
         | "supdb-nomergechain"
         | "supdb-mergeuncapped"
+        | "supdb-boundarytop"
+        | "supdb-nodirwillneed"
+        | "supdb-noboundsheadwillneed"
         | "supdb-sealrun"
         | "supdb-closeinline"
         | "supdb-timers"
@@ -8736,6 +8833,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestnoheadwillneed"
         | "supdb-ingestnomergechain"
         | "supdb-ingestmergeuncapped"
+        | "supdb-ingestboundarytop"
+        | "supdb-ingestnodirwillneed"
+        | "supdb-ingestnoboundsheadwillneed"
         | "supdb-ingestsealrun"
         | "supdb-ingestcloseinline"
         | "supdb-ingesttimers"
@@ -9083,6 +9183,40 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestnomergechain" => Box::new(Supdb::create_ingest_nomergechain(dir)?),
         "supdb-mergeuncapped" => Box::new(Supdb::create_mergeuncapped(dir)?),
         "supdb-ingestmergeuncapped" => Box::new(Supdb::create_ingest_mergeuncapped(dir)?),
+        "supdb-boundarytop" => Box::new(Supdb::create_boundarytop(dir)?),
+        "supdb-ingestboundarytop" => Box::new(Supdb::create_ingest_boundarytop(dir)?),
+        "supdb-nodirwillneed" => Box::new(Supdb::with_policy(
+            dir,
+            Policy {
+                nodirwillneed: true,
+                ..Policy::default()
+            },
+        )?),
+        "supdb-ingestnodirwillneed" => Box::new(Supdb::with_policy(
+            dir,
+            Policy {
+                partition: false,
+                durable: false,
+                nodirwillneed: true,
+                ..Policy::default()
+            },
+        )?),
+        "supdb-noboundsheadwillneed" => Box::new(Supdb::with_policy(
+            dir,
+            Policy {
+                noboundsheadwillneed: true,
+                ..Policy::default()
+            },
+        )?),
+        "supdb-ingestnoboundsheadwillneed" => Box::new(Supdb::with_policy(
+            dir,
+            Policy {
+                partition: false,
+                durable: false,
+                noboundsheadwillneed: true,
+                ..Policy::default()
+            },
+        )?),
         "supdb-sealrun" => Box::new(Supdb::create_sealrun(dir)?),
         "supdb-ingestsealrun" => Box::new(Supdb::create_ingest_sealrun(dir)?),
         "supdb-closeinline" => Box::new(Supdb::create_closeinline(dir)?),

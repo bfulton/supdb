@@ -473,6 +473,19 @@ impl OrdIndex {
         self.prefix = Some(first_key[..m].to_vec());
     }
 
+    /// The key of `rank` from the top level alone, read from no page:
+    /// `Some` where the rank is one the top level holds, every
+    /// `TOP_STRIDE`th, and the heads are whole keys (`whole_key_at`). A
+    /// block's first rank is one: the block cache's boundaries are its keys
+    /// (`Reader::cache_key_at`), each a record on a page of its own out of
+    /// core where the top level has it in memory.
+    pub fn top_key_at<'b>(&self, rank: usize, buf: &'b mut Vec<u8>) -> Option<&'b [u8]> {
+        if !rank.is_multiple_of(TOP_STRIDE) {
+            return None;
+        }
+        self.whole_key_at(rank, buf)
+    }
+
     /// The key at `rank` from its head alone, written into `buf`: `Some`
     /// when every key is one length no longer than a head, so a head is a
     /// whole key, and the prefix is learned, which is what a segment's
@@ -1138,6 +1151,41 @@ mod tests {
     /// the heads can: always over keys of one length, and never wrongly
     /// over keys of two lengths whose heads tie, where it leaves the
     /// records to say.
+    #[test]
+    fn the_top_level_answers_a_strides_first_key_as_the_records_do() {
+        let uniform: Vec<Vec<u8>> = (0..3000u32)
+            .map(|i| format!("k{:08}", i * 3).into_bytes())
+            .collect();
+        let mut mixed = uniform.clone();
+        mixed.push(b"k00000001extra".to_vec());
+        for (name, mut keys) in [("uniform", uniform), ("mixed", mixed)] {
+            keys.sort();
+            let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+            let p = write(&build(&refs), &format!("top-keys-{name}"));
+            let mut idx = OrdIndex::open(&p, refs.len()).expect("opens");
+            let mut buf = Vec::new();
+            // The prefix unlearned: nothing is answered.
+            assert!(idx.top_key_at(0, &mut buf).is_none(), "{name}");
+            idx.learn_prefix(refs[0]);
+            for (r, want) in refs.iter().enumerate() {
+                let got = idx.top_key_at(r, &mut buf).map(<[u8]>::to_vec);
+                match got {
+                    Some(k) => {
+                        assert_eq!(name, "uniform", "a mixed index answers nothing");
+                        assert_eq!(r % TOP_STRIDE, 0, "only a stride's first rank: {r}");
+                        assert_eq!(k.as_slice(), *want, "rank {r}");
+                    }
+                    None => assert!(name == "mixed" || r % TOP_STRIDE != 0, "{name} rank {r}"),
+                }
+            }
+            assert!(
+                idx.top_key_at(refs.len(), &mut buf).is_none(),
+                "past the end"
+            );
+            std::fs::remove_file(&p).ok();
+        }
+    }
+
     #[test]
     fn a_heads_page_ends_where_the_next_begins() {
         let keys: Vec<Vec<u8>> = (0..3000u32)

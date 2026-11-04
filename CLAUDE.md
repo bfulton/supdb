@@ -3226,6 +3226,22 @@ measure of a merge policy is the pieces a reader meets, read off the pass
 burst's rate and the pass's together, since a policy that leaves the
 pieces for later wins both cells and pays in the pass nobody measured.
 
+**A fault removed from a producer whose output the reader pays for.**
+The block cache's splice bounds -- a block's first key, which the builder
+ahead asks for every block it builds -- were record reads, a page each out
+of core and over half the ten-percent lag pass's major faults at ten
+million keys under 1.25 GiB, and the ordered index's top level holds those
+keys in memory. Read there, the faults fell by twenty-five thousand in
+both rounds of a pairing and the pass ran slower in both: the builder,
+freed of its faults, posted its forms faster, and the scanning thread's
+install of them grew from 25 and 21 ms to 133 and 148
+(`Options::boundary_keys_from_top`, off). The faults had been on a thread
+off the reader's path, pacing a producer whose output the reader consumes
+at a price. The rule is the phases' sum again, across threads: a cost
+removed from a background thread is priced on the thread that consumes
+what it makes, and a fault count that falls while the pass rises names a
+pace that changed, not a saving.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
