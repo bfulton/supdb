@@ -2945,9 +2945,9 @@ and glibc told to map every allocation of 128 KB or more read the pass
 1.7x faster -- in a run of its own, an allocator's policy being no arm;
 the shipped binary across six runs read the pass from 1.9 to 3.8 s,
 by the device bytes inside it, under both policies. Merges chained
-through the bursts were to move the device bytes out of the pass, and
-lost by the phases' sum; a merge trace on the lag marks' clock then put
-no merge inside any ten-percent pass at all. The gate (builds ahead wait
+through the bursts were to move the device bytes out of the pass; a
+merge trace on the lag marks' clock then put no merge inside any
+ten-percent pass at all. The gate (builds ahead wait
 while scans are near) first read nearness off a flag the writer's seal
 set, and the one-percent burst is too small to seal, so the flag kept
 the write-only load's reading through the passes after it and the
@@ -2960,6 +2960,31 @@ within one run before an intervention outside the run is credited with
 the difference; and a signal published only at an event is stale for
 as long as the event does not come, so a gate reads the count the event
 is about, not a flag the event happens to set.
+
+**A planner that ran only where a merge landed, and a verdict summed
+by hand.** The merge chain plans the next merge at a merge's landing
+while reads are around, so it needs a merge in flight to go on: where a
+burst's last merge landed before the pass's first scan, nothing started
+another while the store was only read, and the full-rewrite pass at ten
+million keys under 1.25 GiB ran 76 s with 286 pieces at its end where
+the round before ran 32 with six. The segment work's loop plans a merge
+when none is in flight and a scan has come since its last look now
+(`Options::merge_plan_idle`), and the test holds the state the race
+leaves: the merge in flight released with no scan, a range still due.
+The arm that chained through the bursts as well (`merge_chains_writes`)
+read ahead by the suite's own sum because its chain always had a merge
+in flight; once the default's loop started one, it read 1.06x behind.
+And it was first written off by a sum of the burst's milliseconds and
+the divided pass's, which weighs a pass a tenth or a thirtieth of what
+it stands for; the suite's `weighted_ms` (the burst and twice the
+undivided pass) read the same pairing the other way, and the undivided
+pass, with nothing extrapolated, read the stall. The rules: a planner
+that runs at an event needs another way in when the event can stop
+coming while the work stands, so the loop that owns the work looks for
+it itself; a trade between a burst and its pass is read off the
+quantity the suite defines for it, never a hand sum of a divided pass;
+and where a divided pass and the undivided one disagree, the undivided
+one is the measurement and the divided one the model.
 
 **A verdict on an option whose condition the run never met.** The attach
 bought on the prediction fires where the sampler finds the form files on

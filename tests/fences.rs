@@ -623,6 +623,107 @@ fn a_merge_drops_its_inputs_pages_behind_its_second_pass() {
     }
 }
 
+/// The segment work's loop plans a merge when none is in flight and a scan
+/// has come since its last look (`Options::merge_plan_idle`): the chain
+/// plans only at a landing, so a range left due when the last merge landed
+/// with no scan before it -- the shape a burst's end leaves when no merge is
+/// in flight -- stood for as long as the store was only read. Here the first
+/// merge is held while two ranges become due, released with no scan, and
+/// lands alone; then one scan, and with the option the loop merges the
+/// range left, where without it the pieces stay.
+#[test]
+fn a_store_read_with_no_merge_in_flight_plans_one_in_its_loop() {
+    for idle in [true, false] {
+        let d = scratch(&format!("merge-idle-{idle}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 32 << 10,
+                partition_bytes: Some(32 << 10),
+                l0_trigger: 2,
+                merge_chains: true,
+                merge_bytes_cap: 0,
+                merge_plan_idle: idle,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let key = |k: u32| format!("key-{k:05}").into_bytes();
+        let mut keys: Vec<Vec<u8>> = (0..3000).map(key).collect();
+        for k in &keys {
+            db.append(k, b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        let fences = partition_fences(&d);
+        assert!(fences.len() >= 3, "partitions: {fences:?}");
+        let (merges0, plans0) = (db.seal_waits().merges, db.seal_waits().plans);
+        let in_range = |r: usize, round: u32, i: u32| -> Vec<u8> {
+            let (lo, _) = &fences[r];
+            [lo.as_slice(), format!("-{round}{i:03}").as_bytes()].concat()
+        };
+        db.hold_merge_landing(true);
+        let rounds = [1usize, 1, 2, 2];
+        for (round, &r) in rounds.iter().enumerate() {
+            for i in 0..200u32 {
+                let k = in_range(r, round as u32, i);
+                db.append(&k, b"n");
+                keys.push(k);
+            }
+            db.commit().unwrap();
+            db.seal().unwrap();
+        }
+        let t = std::time::Instant::now();
+        while db.seal_waits().plans < plans0 + rounds.len() as u64 {
+            assert!(
+                t.elapsed().as_secs() < 30,
+                "the seals' landings never planned"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // Released with no scan: the held merge lands and plans nothing.
+        db.hold_merge_landing(false);
+        let t = std::time::Instant::now();
+        while db.seal_waits().merges < merges0 + 1 {
+            assert!(t.elapsed().as_secs() < 30, "the held merge never landed");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            db.seal_waits().merges,
+            merges0 + 1,
+            "idle {idle}: nothing more merged before a scan"
+        );
+        let mut seen = 0usize;
+        db.scan(b"", 5, kv(&mut |_, _| seen += 1)).unwrap();
+        assert_eq!(seen, 5);
+        let want = if idle { 2 } else { 1 };
+        let t = std::time::Instant::now();
+        while db.seal_waits().merges < merges0 + want {
+            assert!(
+                t.elapsed().as_secs() < 30,
+                "idle {idle}: {} merges landed, {want} expected",
+                db.seal_waits().merges - merges0
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let pieces = seg_names(&d)
+            .iter()
+            .filter(|n| !n.starts_with("par-"))
+            .count();
+        assert_eq!(
+            (db.seal_waits().merges - merges0, pieces),
+            (want, if idle { 0 } else { 2 }),
+            "idle {idle}: merges landed and pieces left"
+        );
+        hold_to(&db, &keys);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
 /// A merge's landing plans the next (`Options::merge_chains`). The planner
 /// ran at a seal's durable landing alone, so a store that was only read
 /// after a burst kept the burst's pieces for as long as it was read: under

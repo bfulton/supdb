@@ -577,6 +577,11 @@ pub struct Supdb {
     /// scans (`Options::zpages_land_scans_far` off).
     /// `supdb-ingestlandnearscans`, and `supdb-landnearscans` durable.
     landnearscans: bool,
+    /// Only a merge's landing plans the next, where the default's segment
+    /// work loop also plans one when none is in flight and a scan has come
+    /// since its last look (`Options::merge_plan_idle` off).
+    /// `supdb-ingestnoidleplan`, and `supdb-noidleplan` durable.
+    noidleplan: bool,
     /// A seal writes every key through the writer's general path, as
     /// before the one-value path (`Options::seal_put_one` off).
     /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
@@ -1340,6 +1345,11 @@ struct Policy {
     /// scans (`Options::zpages_land_scans_far` off).
     /// `supdb-ingestlandnearscans`, and `supdb-landnearscans` durable.
     landnearscans: bool,
+    /// Only a merge's landing plans the next, where the default's segment
+    /// work loop also plans one when none is in flight and a scan has come
+    /// since its last look (`Options::merge_plan_idle` off).
+    /// `supdb-ingestnoidleplan`, and `supdb-noidleplan` durable.
+    noidleplan: bool,
     /// A seal writes every key through the writer's general path, as
     /// before the one-value path (`Options::seal_put_one` off).
     /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
@@ -1874,6 +1884,7 @@ impl Default for Policy {
             chainwrites: false,
             noland: false,
             landnearscans: false,
+            noidleplan: false,
             sealrun: false,
             closeinline: false,
             timers: false,
@@ -6154,6 +6165,7 @@ impl Supdb {
             chainwrites,
             noland,
             landnearscans,
+            noidleplan,
             sealrun,
             closeinline,
             timers,
@@ -6450,6 +6462,7 @@ impl Supdb {
             ahead_out_of_core: aheadooc,
             merge_chains_writes: chainwrites,
             zpages_land_scans_far: !landnearscans,
+            merge_plan_idle: !noidleplan,
             seal_put_one: !sealrun,
             close_finish_inline: closeinline,
             upkeep_wake_parked: wake,
@@ -6721,6 +6734,7 @@ impl Supdb {
             chainwrites,
             noland,
             landnearscans,
+            noidleplan,
             sealrun,
             closeinline,
             timers,
@@ -7484,6 +7498,13 @@ impl Engine for Supdb {
                 "supdb-landnearscans"
             } else {
                 "supdb-ingestlandnearscans"
+            };
+        }
+        if self.noidleplan {
+            return if self.partition {
+                "supdb-noidleplan"
+            } else {
+                "supdb-ingestnoidleplan"
             };
         }
         if self.sealrun {
@@ -8905,6 +8926,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-chainwrites"
         | "supdb-noland"
         | "supdb-landnearscans"
+        | "supdb-noidleplan"
         | "supdb-sealrun"
         | "supdb-closeinline"
         | "supdb-timers"
@@ -9016,6 +9038,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestchainwrites"
         | "supdb-ingestnoland"
         | "supdb-ingestlandnearscans"
+        | "supdb-ingestnoidleplan"
         | "supdb-ingestsealrun"
         | "supdb-ingestcloseinline"
         | "supdb-ingesttimers"
@@ -9460,6 +9483,22 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                 partition: false,
                 durable: false,
                 landnearscans: true,
+                ..Policy::default()
+            },
+        )?),
+        "supdb-noidleplan" => Box::new(Supdb::with_policy(
+            dir,
+            Policy {
+                noidleplan: true,
+                ..Policy::default()
+            },
+        )?),
+        "supdb-ingestnoidleplan" => Box::new(Supdb::with_policy(
+            dir,
+            Policy {
+                partition: false,
+                durable: false,
+                noidleplan: true,
                 ..Policy::default()
             },
         )?),

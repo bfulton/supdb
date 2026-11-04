@@ -3094,24 +3094,36 @@ pub struct Options {
     /// merge out of core -- the controller's gate away from the raw form --
     /// whether or not a scan has come since the last landing, so the
     /// merges a burst's seals left are chained through the burst's own
-    /// writes and not first through the scans after it. The ten-percent
-    /// lag pass at ten million keys under 1.25 GiB read 1.7-3.8 s across
-    /// sittings of one binary, by the merges' device bytes inside it --
-    /// 350-410 MB read and 157-187 MB written in the fast shape, 585-730
-    /// and 261-481 in the slow -- where LMDB's reads 70 MB and writes
-    /// nothing. Refuted by the phases' sum: paired at that rung, a warmup
-    /// and a pair, the full rewrite's pass ran 5.1-5.4 s against 7.7-10.9
-    /// and its burst 26.9-27.9 s against 23.0-23.4, the ten-percent point
-    /// 5.4-6.5 s burst and pass against 4.8-6.4, and the one-percent point
-    /// and the drained store slower in both rounds; chained through the
-    /// burst the merges start sooner and spill into the pass all the same.
-    /// The merge trace (`SUPDB_MERGE_TRACE`) then put no merge inside any
-    /// ten-percent pass of either arm: the device bytes there were the
-    /// controller's builds ahead at landing (`zpages_land_pct`,
-    /// `supdb-noland`). In core the gate is at raw and nothing changes.
-    /// Off: `supdb-chainwrites`, `supdb-ingestchainwrites`.
+    /// writes and not first through the scans after it. By the suite's
+    /// decision quantity (`weighted_ms`, the burst and twice the undivided
+    /// pass) it read ahead in three sittings at ten million keys under
+    /// 1.25 GiB, the full rewrite at 0.54-0.98x of the default's time, for
+    /// a reason that was not its own: the default chained only at a
+    /// landing, and where no merge was in flight when a burst ended its
+    /// pieces stood through the pass, 286 of them over 76 s against 6 over
+    /// 32 in the other round, and a chain kept going through the burst
+    /// always had one in flight. With the default's own loop planning a
+    /// merge when none is in flight (`merge_plan_idle`), undivided, it
+    /// reads 1.06x of the default's time over the sweep, the full rewrite
+    /// 1.08x and the shuffled load at 0.83x of its rate, so it stays off.
+    /// In core the gate is at raw and nothing changes. Off:
+    /// `supdb-chainwrites`, `supdb-ingestchainwrites`.
     #[doc(hidden)]
     pub merge_chains_writes: bool,
+    /// Under `merge_chains`, the segment work's own loop plans a merge
+    /// when none is in flight and a scan has come since its last look,
+    /// at the base trigger as a landing's chain does: the chain plans
+    /// only at a merge's landing, so where no merge was in flight when a
+    /// burst ended nothing started one while the store was only read,
+    /// and the pieces stood through the pass. The full-rewrite pass at
+    /// ten million keys under 1.25 GiB, undivided, read 31.6 s with six
+    /// pieces left at its end in one round and 76.6 s with 286 in the
+    /// other. One merge is all the look starts: its landing's publish
+    /// makes the next scan count, and the chain goes on from there. Off,
+    /// only a landing plans: `supdb-noidleplan`,
+    /// `supdb-ingestnoidleplan`.
+    #[doc(hidden)]
+    pub merge_plan_idle: bool,
     /// The block cache reads a block boundary's key -- a partition's key at
     /// a block's first rank, which every table's bounds, splice and resumed
     /// walk asks for -- off the partition's ordered index's top level,
@@ -3754,6 +3766,7 @@ impl Default for Options {
             heads_willneed: true,
             merge_chains: true,
             merge_chains_writes: false,
+            merge_plan_idle: true,
             merge_bytes_cap: 64 << 20,
             boundary_keys_from_top: false,
             pieces_dir_willneed: true,
@@ -34738,6 +34751,9 @@ struct Maint {
     /// where the life has moved since, reads around now
     /// (`Options::merge_chains`).
     chain_life: u64,
+    /// The store's scan count at the loop's last idle look
+    /// (`Options::merge_plan_idle`).
+    idle_life: u64,
     /// WAL files whose records no segment has been *named* as covering
     /// yet. One rule governs every one of them: a WAL may be deleted only
     /// after the manifest names a segment that covers its records. The
@@ -35006,6 +35022,7 @@ impl Maint {
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
             self.collect();
+            self.idle_plan();
             self.shape_if_read(false);
             self.z_step();
             self.sweep_spares();
@@ -35420,6 +35437,7 @@ impl Maint {
             sealing: std::collections::VecDeque::new(),
             flush_merge: false,
             chain_life: 0,
+            idle_life: 0,
             wake: None,
             shaped_at: 0,
             zbuild: None,
@@ -35913,6 +35931,37 @@ impl Maint {
     fn scan_life(&self) -> u64 {
         self.shared.scans_life.load(AtomicOrdering::Relaxed)
             + self.shared.scans_merged.load(AtomicOrdering::Relaxed)
+    }
+
+    /// A merge planned with none in flight where a scan has come since the
+    /// last look (`Options::merge_plan_idle`), so a store that is only
+    /// read after a burst drains its pieces whether or not a merge was
+    /// in flight when the writes stopped.
+    fn idle_plan(&mut self) {
+        if !(self.opts.merge_plan_idle && self.opts.merge_chains && self.opts.compact) {
+            return;
+        }
+        // As the landing's chain: no plan while a merge or a piece merge
+        // runs, and none while a seal is between its phases, since a
+        // promotion the plan makes publishes a manifest that would name
+        // the seal's segments before they are durable; the count is left
+        // as it was, so the next turn of the loop looks again.
+        if self.compacting.is_some() || self.tiering.is_some() || self.seal_between_phases() {
+            return;
+        }
+        let life = self.scan_life();
+        if life == self.idle_life {
+            return;
+        }
+        self.idle_life = life;
+        let op = self.op();
+        let base = self.opts.l0_trigger.max(1);
+        let done = self.maybe_compact_at(base).and_then(|()| self.maybe_tier());
+        SealCounts::add(&self.shared.seal_counts.plans, 1);
+        if let Err(e) = done {
+            self.shared.put_maint_err(e);
+        }
+        drop(op);
     }
 
     /// Whether scans are near (`Shared::scans_far_at`): a scan in the
