@@ -6,9 +6,10 @@
 > and the module docs of `src/db/zpages.rs`, `src/db/zfile.rs` and
 > `src/db/zselect.rs`; where they differ from this document, they are
 > current. The commits and line numbers below are those of the trunk the
-> design was written against, `claude/performance-dimensions-analysis-gijutv`;
-> the probe its commands run is `bench/examples/zprobe/`, and the `$Z` they
-> set is the scratchpad of the session that wrote them.
+> design was written against, whose commits are in the history of PR #6
+> (`refs/pull/6/head`); the probe its commands run is
+> `bench/examples/zprobe/`, and the `$Z` they set is the scratchpad of the
+> session that wrote them.
 
 Pre-registered design for the first instance of the principle in `CLAUDE.md:526-543` ("a cell a
 comparator wins is a workload the engine has no strategy for"). Written against HEAD `4ea80c4` and revised

@@ -9,10 +9,13 @@ is built.
 A measurement the docs cite is given as the command that reproduces it
 -- for a pairing, `bench/scripts/pair.sh A B SIZE [bench ab options]` at
 the commit it ran at -- never as a log: the logs, stage notes and handoffs
-of the sessions that built the compact form were kept under `scratch/` on
-their branch, `claude/recover-consolidate-branches-5rwvr5`, until the
-commit that took `scratch/` off it, and nothing on the main line needs
-them.
+of the sessions that built the compact form were kept under `scratch/` in
+the history of PR #6, until the commit that took `scratch/` off it
+(`cc9c21f`), and nothing on the main line needs them. The main line is
+merged by squash, so a commit the docs cite lives in the history of the
+pull request that brought it, which GitHub keeps under `refs/pull/<n>/head`
+whatever happens to the branch: `git fetch origin
+'+refs/pull/*/head:refs/remotes/pull/*'` brings every one of them.
 
 This file is notes to whoever picks the work up next with no memory of it:
 dense, contextual, and it explains a rule by naming the failure that produced
