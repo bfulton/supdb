@@ -653,7 +653,12 @@ other's, and the gear's pick at 720 MiB flipped with which arm ran first,
 since the budget subtracts the process's anonymous memory at the sample's
 moment -- so the table's gmean mixes arms that bought different things at
 different times, and the coding alone is read in a forced pairing where
-both forms stand from the start. `SUPDB_SCAN_OPS=1` times
+both forms stand from the start. The lag sweep under a bound carries the
+same buy: the controller bought its form during the ten-percent pass in
+one arm and during the full rewrite's in the other, and that pass read
+12.8 s against 17.4 between arms that differed in their merges alone, so
+an option that is not the controller's is priced there with the form off
+in both arms (`supdb-nozpages` and a sibling of it). `SUPDB_SCAN_OPS=1` times
 every scan of the single-threaded scan pass on its own, for every arm,
 and prints a `scanops` line a pass with the first scans beside the
 median: a pass of a hundred scans at the smallest rung is a few hundred

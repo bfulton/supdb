@@ -3142,8 +3142,10 @@ pub struct Options {
     /// ten of wall, through the first third of the pass after it. The
     /// first partitioning, which takes every segment, runs alone whatever
     /// this says, and a piece merge still waits for every partition merge.
-    /// One is `supdb`'s shape; `supdb-mergepar2` and
-    /// `supdb-ingestmergepar2` run two.
+    /// Two paid that debt a third sooner under the bound and left the pass
+    /// level, its tenths after the merges moving by as much between reps
+    /// (`docs/engine.md`), so the default is one. `supdb-mergepar2`,
+    /// `supdb-ingestmergepar2` and `supdb-nozpagesmergepar2` run two.
     pub merge_parallel: usize,
     /// EXPERIMENT: under `merge_chains`, a merge's landing plans the next
     /// merge out of core -- the controller's gate away from the raw form --
