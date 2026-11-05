@@ -7160,7 +7160,13 @@ fn a_store_past_its_budget_builds_its_form_files_ahead_and_buys_them_by_attach()
         1 << 20,
         1_000_000.0,
         FAULT_1MS,
-        |o| o.zpages_prebuild = true,
+        |o| {
+            o.zpages_prebuild = true;
+            // The sample's wait for the builds ahead, which a store whose
+            // in-flight partitions count as covered never makes.
+            o.zpages_cover_resident = false;
+            o.zpages_suspect_at_crossing = false;
+        },
         |db| db.hold_zpage_build(true),
     );
     let c = db.zpage_counts();
@@ -7377,6 +7383,13 @@ fn the_sample_starts_between_builds_ahead_when_told_to() {
                 o.zpages_sample_between = between;
                 o.zpages_ahead_builders = 1;
                 o.partition_bytes = Some(400 << 10);
+                // The sample's wait for a build ahead, which a store whose
+                // resident and in-flight partitions count as covered never
+                // makes, and the build ahead started before the sample,
+                // which a controller suspecting at the crossing does not
+                // give it time for.
+                o.zpages_cover_resident = false;
+                o.zpages_suspect_at_crossing = false;
             });
         // Past the whole budget the builds ahead run, and the model calls
         // for the controller's sample: the first build ahead is held at its
@@ -7647,6 +7660,11 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
         let (dir, db, model, inject, raw) =
             land_store_with(&format!("auto-land-past-{drop_past}"), 50, |o| {
                 o.zpages_land_drop_past = drop_past;
+                // The sample waits for the builds ahead, so that its fills
+                // and their readahead take nothing of the records back
+                // while the cache is read.
+                o.zpages_cover_resident = false;
+                o.zpages_suspect_at_crossing = false;
             });
         inject.set_budget(raw * 2 / 3);
         assert!(
@@ -7717,6 +7735,11 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
         let (dir, db, model, inject, raw) =
             land_store_with(&format!("auto-land-cross-{drop_past}-{near}"), 50, |o| {
                 o.zpages_land_drop_past = drop_past;
+                // The swap at the crossing before any buy: a controller
+                // that suspects at the crossing buys the attach on the
+                // prediction inside the steps this waits.
+                o.zpages_cover_resident = false;
+                o.zpages_suspect_at_crossing = false;
             });
         inject.set_budget(raw * 3 / 2);
         assert!(
@@ -7858,6 +7881,11 @@ fn a_buy_attaches_every_form_file_built_ahead_before_any_warm() {
                 // One builder ahead, whose order the files' times read:
                 // two finish in whatever order their builds take.
                 o.zpages_ahead_builders = 1;
+                // The turn's order of attach and warm: where resident and
+                // in-flight partitions count as covered, every attach goes
+                // before any warm whether or not it is asked to.
+                o.zpages_cover_resident = false;
+                o.zpages_suspect_at_crossing = false;
             });
         inject.set_budget(raw * 3 / 2);
         assert!(

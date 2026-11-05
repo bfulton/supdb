@@ -3682,12 +3682,13 @@ pub struct Options {
     /// it read C 0.97x, the install at the same moment either way: off is
     /// the order before it; `supdb-zsamplegap` is the arm.
     pub zpages_sample_between: bool,
-    /// EXPERIMENT: a partition with no form file attached whose raw records
+    /// A partition with no form file attached whose raw records
     /// are resident (at least `LAND_RESIDENT` of them, by `mincore`), or
-    /// whose build ahead is in flight, counts as covered: where the sampler
-    /// weighs an attach of the files on disk (`zselect::Sampler::attach`)
-    /// and prices the buy, and in the coverage the install waits for
-    /// (`zselect::COVERED_ENOUGH`). Its reads, left to the raw form until its
+    /// whose build ahead is in flight, counts as covered beside a form at
+    /// least half there (`stands_in`): where the sampler weighs an attach
+    /// of the files on disk (`zselect::Sampler::attach`) and prices the buy,
+    /// and in the coverage the install waits for (`zselect::COVERED_ENOUGH`).
+    /// Its reads, left to the raw form until its
     /// file lands, fault little or nothing, and its build is paid whether
     /// the controller buys or not. With it the sample waits for no build
     /// ahead, and the buy attaches the files on disk while a build ahead
@@ -3695,10 +3696,11 @@ pub struct Options {
     /// at its drain, written a moment ago, and the install waited for their
     /// builds ahead while C's reads of the partitions built long before took
     /// the raw form's faults, half of C's time at ten million keys under
-    /// 1.25 GiB. Off counts attached partitions alone; `supdb-zcoverres` is
-    /// the arm, with `zpages_sample_between`.
+    /// 1.25 GiB. On as shipped, with `zpages_suspect_at_crossing`; off counts
+    /// attached partitions alone, and `supdb-zinstallwaits` is the arm with
+    /// both off.
     pub zpages_cover_resident: bool,
-    /// EXPERIMENT: the controller suspects at the moment the store crosses
+    /// The controller suspects at the moment the store crosses
     /// the selector's line to suspect, where it suspected on two hot model
     /// readings a second apart: the look the builds at landing take at every
     /// tick (`Maint::z_land_look`) reads the model at the tick its raw
@@ -3710,8 +3712,8 @@ pub struct Options {
     /// in flight, and the attach on the prediction counts as settled at a
     /// step whose census saw reads (`zselect::ZSelect::set_attach_on_reads`),
     /// where it waited for the partitions to stand two seconds after the
-    /// drain. Off waits for the ticks; `supdb-zcrossing` is the arm, with
-    /// `zpages_cover_resident` and `zpages_sample_between`.
+    /// drain. On as shipped, with `zpages_cover_resident`; off waits for the
+    /// ticks, and `supdb-zinstallwaits` is the arm with both off.
     pub zpages_suspect_at_crossing: bool,
 }
 
@@ -3968,8 +3970,8 @@ impl Default for Options {
             wal_drop_bytes: 1 << 20,
             zpages_ahead_builders: 2,
             zpages_sample_between: false,
-            zpages_cover_resident: false,
-            zpages_suspect_at_crossing: false,
+            zpages_cover_resident: true,
+            zpages_suspect_at_crossing: true,
         }
     }
 }
@@ -35154,6 +35156,18 @@ const RECODE_DECODE_NS: f64 = 1000.0;
 /// from pages colder still; one of them took 47 faults then.
 const LAND_RESIDENT: f64 = 0.5;
 
+/// Whether the partitions that stand in for their form files
+/// (`Options::zpages_cover_resident`: resident, or built ahead in flight)
+/// count beside a form `have` of `of` there, by footprint bytes or keys:
+/// at least half. The early install bridges the last partitions of a form
+/// built ahead, and a store whose records all fit has every partition
+/// resident: counted with no form there, it installed with no form file
+/// attached and its reads all raw, the census in COMPACT reading them as
+/// the form's.
+fn stands_in(have: u64, of: u64) -> bool {
+    have.saturating_mul(2) >= of
+}
+
 /// The store's segment work: a seal's landing, a merge's and a piece
 /// merge's, a promotion, the manifest that names what is live, and the WAL
 /// files and temp names retired once the manifest covers what they held.
@@ -38081,7 +38095,7 @@ impl Maint {
     /// Read under the caller's pin.
     fn z_report_take(&mut self) -> zselect::Build {
         let mut b = std::mem::take(&mut self.z_report);
-        let (mut covered, mut coverable) = (0u64, 0u64);
+        let (mut attached, mut stand_in, mut coverable) = (0u64, 0u64, 0u64);
         for s in self.segs().iter().filter(|s| s.level > 0) {
             if s.z_declined.load(AtomicOrdering::Relaxed) != 0 {
                 continue;
@@ -38089,11 +38103,19 @@ impl Maint {
             let (h, r) = s.foot();
             let bytes = h.saturating_add(r);
             coverable = coverable.saturating_add(bytes);
-            let in_flight = self.opts.zpages_cover_resident && self.z_building_ahead(&s.name);
-            if s.z.get().is_some() || in_flight || self.z_covers_resident(s) {
-                covered = covered.saturating_add(bytes);
+            if s.z.get().is_some() {
+                attached = attached.saturating_add(bytes);
+            } else if self.opts.zpages_cover_resident
+                && (self.z_building_ahead(&s.name) || self.z_covers_resident(s))
+            {
+                stand_in = stand_in.saturating_add(bytes);
             }
         }
+        let covered = if stands_in(attached, coverable) {
+            attached.saturating_add(stand_in)
+        } else {
+            attached
+        };
         b.coverage = if coverable == 0 {
             0.0
         } else {
@@ -38227,6 +38249,7 @@ impl Maint {
         // not changed, so the store read the whole of C and B raw.
         let mut missing_keys = 0u64;
         let mut uncovered_keys = 0u64;
+        let mut on_disk_keys = 0u64;
         for (seg, r, r2) in results {
             zfile::ZEvents::add(&ev.sampled, 1);
             let s = match r {
@@ -38257,7 +38280,14 @@ impl Maint {
                 if !in_flight && !self.z_covers_resident(&seg) {
                     uncovered_keys = uncovered_keys.saturating_add(seg.blob.keys() as u64);
                 }
+            } else {
+                on_disk_keys = on_disk_keys.saturating_add(seg.blob.keys() as u64);
             }
+        }
+        // The stand-ins count beside a form mostly on disk, as the install
+        // counts them beside one mostly attached (`stands_in`).
+        if !stands_in(on_disk_keys, on_disk_keys.saturating_add(missing_keys)) {
+            uncovered_keys = missing_keys;
         }
         // The coding, where the selector chooses it: the raw tails where the
         // model predicts that form faults nothing against the budget, the
