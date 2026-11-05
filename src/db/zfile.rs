@@ -3461,6 +3461,9 @@ pub(super) struct ZEvents {
     /// Builds collected dormant, ahead of the controller's decision
     /// (`ZCounts::prebuilt`).
     pub prebuilt: AtomicU64,
+    /// Builds ahead started in the second slot, beside another build
+    /// ahead (`ZCounts::ahead_paired`).
+    pub ahead_paired: AtomicU64,
     /// Partitions a build ahead at landing found with their records out of
     /// the page cache and left to the controller's build
     /// (`ZCounts::ahead_cold`).

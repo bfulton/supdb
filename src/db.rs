@@ -500,6 +500,9 @@ pub struct ZCounts {
     /// Form files built ahead of the controller's decision and left on
     /// disk unattached (`Options::zpages_prebuild`).
     pub prebuilt: u64,
+    /// Builds ahead started beside another build ahead
+    /// (`Options::zpages_ahead_builders`).
+    pub ahead_paired: u64,
     /// Partitions the builds ahead at landing found with their records out
     /// of the page cache, and left to the controller's build
     /// (`Options::zpages_land_pct`).
@@ -3658,6 +3661,27 @@ pub struct Options {
     /// sittings, with the write mixes' commits 2-3% slower in both
     /// (`docs/engine.md`). Off is `supdb-walkeep`.
     pub wal_drop_bytes: usize,
+    /// How many of the controller's builds ahead run at once
+    /// (`zpages_land_pct`): the second in a slot of its own beside the
+    /// builder's, which the controller's own jobs keep. An ordered load of
+    /// ten million keys under 1.25 GiB lands its last partitions at its
+    /// drain, and with the two the builds passed over as cold, seven of
+    /// twenty-nine waited after the load for one builder at 0.25-0.6 s
+    /// each, beside C's reads, and the install waited for them; with two
+    /// the install came a second into C where it had come three to four,
+    /// and C read 1.46x and 1.39x in two sittings (`docs/engine.md`). 1 is
+    /// the one builder, `supdb-zahead1`.
+    pub zpages_ahead_builders: usize,
+    /// EXPERIMENT: the controller's sample asked for before a build ahead
+    /// takes the builder its last one left, where the sample waits for no
+    /// build ahead in flight (`z_prebuild_pending`): the next build ahead
+    /// started in the same tick, so the sample, meant to price the files
+    /// on disk as an attach and the rest as the builds they are, waited
+    /// for the last build ahead instead. Beside two builders ahead the
+    /// builds are done by the time the order would matter, and paired so
+    /// it read C 0.97x, the install at the same moment either way: off is
+    /// the order before it; `supdb-zsamplegap` is the arm.
+    pub zpages_sample_between: bool,
 }
 
 impl Options {
@@ -3911,6 +3935,8 @@ impl Default for Options {
             forms_trim_bytes: 32 << 20,
             forms_fit_when_short: true,
             wal_drop_bytes: 1 << 20,
+            zpages_ahead_builders: 2,
+            zpages_sample_between: false,
         }
     }
 }
@@ -18474,6 +18500,7 @@ impl Reader {
             build_ahead_bytes: get(&ev.build_ahead_bytes),
             build_cancelled: get(&ev.build_cancelled),
             prebuilt: get(&ev.prebuilt),
+            ahead_paired: get(&ev.ahead_paired),
             ahead_cold: get(&ev.ahead_cold),
             ahead_recoded: get(&ev.ahead_recoded),
             ahead_swapped: get(&ev.ahead_swapped),
@@ -35252,6 +35279,10 @@ struct Maint {
     /// The form file build in flight, if one is (`Options::zpages`), one at a
     /// time, collected by polling and never joined on this thread.
     zbuild: Option<ZBuild>,
+    /// A second build ahead in flight beside the builder's job
+    /// (`Options::zpages_ahead_builders`): only builds ahead take it, and
+    /// nothing picks the partition it holds.
+    zahead: Option<ZBuild>,
     /// Inside a `ZSettle` answer: every kind of build is due, where the
     /// loop's own turns start only the builds of partitions with none.
     z_settling: bool,
@@ -35807,7 +35838,10 @@ impl Maint {
     fn stop(&mut self) {
         // The build cancelled and joined: a test's hold on it is lifted
         // before the close, as the seal holds are.
-        if let Some(b) = self.zbuild.take() {
+        for b in [self.zbuild.take(), self.zahead.take()]
+            .into_iter()
+            .flatten()
+        {
             b.cancel.store(true, AtomicOrdering::Release);
             b.job.join();
         }
@@ -35875,6 +35909,7 @@ impl Maint {
             wake: None,
             shaped_at: 0,
             zbuild: None,
+            zahead: None,
             z_settling: false,
             zsel: {
                 let mut sel = zselect::ZSelect::default();
@@ -37428,7 +37463,10 @@ impl Maint {
     /// `spare_failed` and never given its spare, on a runner slow enough to
     /// start the spare first.
     fn z_sweep_settled(&mut self) -> Result<()> {
-        if let Some(b) = self.zbuild.take() {
+        for b in [self.zbuild.take(), self.zahead.take()]
+            .into_iter()
+            .flatten()
+        {
             let op = self.op();
             self.z_collect(b);
             drop(op);
@@ -38310,6 +38348,12 @@ impl Maint {
             self.z_collect(b);
             drop(op);
         }
+        if self.zahead.as_ref().is_some_and(|b| b.job.is_finished()) {
+            let b = self.zahead.take().expect("checked");
+            let op = self.op();
+            self.z_collect(b);
+            drop(op);
+        }
         if d.build {
             // Every form file on disk attached first, where the option says,
             // so that no attach waits for a warm (`Options::zpages_attach_first`).
@@ -38320,6 +38364,7 @@ impl Maint {
                         .iter()
                         .filter(|s| s.level > 0)
                         .filter(|s| !self.in_flight_input(&s.name))
+                        .filter(|s| !self.z_ahead_holds(&s.name))
                         .filter(|s| s.z.get().is_none())
                         .filter(|s| {
                             let why = s.z_declined.load(AtomicOrdering::Relaxed);
@@ -38365,9 +38410,24 @@ impl Maint {
                 b.cancel.store(true, AtomicOrdering::Release);
             }
         }
+        // The sample first where the option says, while the builder the
+        // last build ahead left is still free, and after the next build
+        // ahead otherwise, which leaves it waiting for the last one.
+        let between = self.opts.zpages_sample_between;
+        if between {
+            self.z_sample_due(d);
+        }
         if !d.build {
             self.z_prebuild_step();
         }
+        if !between {
+            self.z_sample_due(d);
+        }
+    }
+
+    /// The sample started where the decision asks for one and none is in
+    /// flight or waiting, with no build ahead in flight.
+    fn z_sample_due(&mut self, d: &zselect::Decision) {
         if d.sample
             && self.z_sampling.is_none()
             && self.z_sample_ready.is_none()
@@ -38375,6 +38435,11 @@ impl Maint {
         {
             self.z_sample_start();
         }
+    }
+
+    /// Whether the second build ahead holds `name` (`Maint::zahead`).
+    fn z_ahead_holds(&self, name: &str) -> bool {
+        self.zahead.as_ref().is_some_and(|b| b.seg.name == name)
     }
 
     /// The partition a build ahead takes next (`Options::zpages_prebuild`),
@@ -38437,6 +38502,8 @@ impl Maint {
             .iter()
             .filter(|s| s.level > 0)
             .filter(|s| !self.in_flight_input(&s.name))
+            .filter(|s| !self.z_ahead_holds(&s.name))
+            .filter(|s| !self.zbuild.as_ref().is_some_and(|b| b.seg.name == s.name))
             .filter(|s| s.z.get().is_none())
             .filter(|s| s.z_declined.load(AtomicOrdering::Relaxed) == 0)
             .filter(|s| cold_ok || !s.z_ahead_cold.load(AtomicOrdering::Relaxed))
@@ -38509,20 +38576,43 @@ impl Maint {
         if !self.opts.zpages_prebuild && self.opts.zpages_land_pct == 0 {
             return false;
         }
-        self.zbuild.as_ref().is_some_and(|b| b.dormant)
+        self.zbuild.as_ref().is_some_and(|b| b.dormant) || self.zahead.is_some()
     }
 
     /// One build ahead started where one is due and the builder is free.
     fn z_prebuild_step(&mut self) {
-        if (!self.opts.zpages_prebuild && self.opts.zpages_land_pct == 0) || self.zbuild.is_some() {
+        if !self.opts.zpages_prebuild && self.opts.zpages_land_pct == 0 {
             return;
         }
-        let next = {
-            let _op = self.op();
-            self.z_prebuild_next()
-        };
-        if let Some(seg) = next {
-            self.z_start(seg, ZKind::Build, true);
+        if self.zbuild.is_none() {
+            let next = {
+                let _op = self.op();
+                self.z_prebuild_next()
+            };
+            if let Some(seg) = next {
+                self.z_start(seg, ZKind::Build, true);
+            }
+        }
+        // The second build ahead, beside a build ahead in the builder's
+        // slot and never beside the controller's own job: started into the
+        // builder's slot, which `z_start` fills, and moved to its own.
+        if self.opts.zpages_ahead_builders >= 2
+            && self.zahead.is_none()
+            && self.zbuild.as_ref().is_some_and(|b| b.dormant)
+        {
+            let next = {
+                let _op = self.op();
+                self.z_prebuild_next()
+            };
+            if let Some(seg) = next {
+                let first = self.zbuild.take();
+                self.z_start(seg, ZKind::Build, true);
+                self.zahead = self.zbuild.take();
+                self.zbuild = first;
+                if self.zahead.is_some() {
+                    zfile::ZEvents::add(&self.shared.z.ahead_paired, 1);
+                }
+            }
         }
     }
 
@@ -38968,7 +39058,7 @@ impl Maint {
     /// Whether the form has anything left to do: a build in flight, or a
     /// partition due one.
     fn z_pending(&self) -> bool {
-        if self.zbuild.is_some() {
+        if self.zbuild.is_some() || self.zahead.is_some() {
             return true;
         }
         let _op = self.op();
@@ -38979,7 +39069,7 @@ impl Maint {
     /// merge in flight, which retires it. Read under the caller's pin.
     fn z_next(&self) -> Option<(std::sync::Arc<Seg>, ZKind)> {
         for s in self.segs().iter().filter(|s| s.level > 0) {
-            if self.in_flight_input(&s.name) {
+            if self.in_flight_input(&s.name) || self.z_ahead_holds(&s.name) {
                 continue;
             }
             let why = s.z_declined.load(AtomicOrdering::Relaxed);
@@ -39586,7 +39676,7 @@ impl Maint {
     /// The job in flight cancelled if its target is among `inputs`, the
     /// segments a landing is about to retire; collected at the next turn.
     fn z_cancel_inputs(&self, inputs: &[String]) {
-        if let Some(b) = &self.zbuild {
+        for b in [&self.zbuild, &self.zahead].into_iter().flatten() {
             if inputs.iter().any(|n| *n == b.seg.name) {
                 b.cancel.store(true, AtomicOrdering::Release);
             }

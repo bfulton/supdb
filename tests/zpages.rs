@@ -7325,6 +7325,117 @@ fn land_store_with(
     (dir, db, model, inject, raw)
 }
 
+/// Two builds ahead at once (`Options::zpages_ahead_builders`): the second
+/// slot runs beside the first, and every partition is still built ahead
+/// once, its form file on disk and nothing attached; with one builder the
+/// second slot never runs.
+#[cfg(target_os = "linux")]
+#[test]
+fn two_builds_ahead_run_beside_each_other_and_build_each_partition_once() {
+    for builders in [2usize, 1] {
+        let (dir, db, _model, inject, raw) =
+            land_store_with(&format!("auto-ahead2-{builders}"), 50, |o| {
+                o.zpages_ahead_builders = builders;
+                o.partition_bytes = Some(400 << 10);
+            });
+        inject.set_budget(raw * 3 / 2);
+        assert!(
+            tick_until(&db, 200, |c| c.prebuilt >= c.partitions),
+            "built ahead: {:?}",
+            db.zpage_counts()
+        );
+        let c = db.zpage_counts();
+        assert!(c.partitions >= 3, "{c:?}");
+        assert_eq!(
+            (c.phase, c.prebuilt, c.build_starts, c.attached),
+            (0, c.partitions, c.partitions, 0),
+            "builders {builders}: each partition built ahead once: {c:?}"
+        );
+        assert_eq!(form_files(&dir).len() as u64, c.partitions, "on disk");
+        if builders == 2 {
+            assert!(c.ahead_paired > 0, "no second build ahead ran: {c:?}");
+        } else {
+            assert_eq!(c.ahead_paired, 0, "{c:?}");
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The sample asked for between builds ahead
+/// (`Options::zpages_sample_between`): past its budget a store's controller
+/// wants a sample while its builds ahead go on, and with the option the
+/// sample starts while builds ahead remain due, at a tick that collected
+/// one and before the next takes the builder; without it the next build
+/// ahead starts first and the sample waits for the last.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_sample_starts_between_builds_ahead_when_told_to() {
+    for between in [true, false] {
+        let (dir, db, _model, inject, raw) =
+            land_store_with(&format!("auto-sample-gap-{between}"), 50, |o| {
+                o.zpages_sample_between = between;
+                o.zpages_ahead_builders = 1;
+                o.partition_bytes = Some(400 << 10);
+            });
+        // Past the whole budget the builds ahead run, and the model calls
+        // for the controller's sample: the first build ahead is held at its
+        // rename until the controller is past FITS, so the sample is wanted
+        // while builds ahead are still due, and the hold is then lifted.
+        db.hold_zpage_rename(true);
+        inject.set_budget(raw / 2);
+        assert!(
+            tick_until(&db, 400, |c| c.phase >= 1 && c.build_starts >= 1),
+            "past FITS with a build ahead in flight: {:?}",
+            db.zpage_counts()
+        );
+        let t = std::time::Instant::now();
+        while !db.zpage_build_waiting() {
+            assert!(
+                t.elapsed().as_secs() < 20,
+                "the build never reached its hold"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        wait_steps(&db, 3);
+        assert_eq!(
+            db.zpage_counts().samples,
+            0,
+            "a sample beside a build ahead in flight"
+        );
+        db.hold_zpage_rename(false);
+        // The counts at the first tick that shows a sample started: the
+        // sample's count is bumped at its start, in the tick.
+        let mut first: Option<supdb::db::ZCounts> = None;
+        for _ in 0..400 {
+            let c = db.zpage_counts();
+            if first.is_none() && c.samples > 0 {
+                first = Some(c);
+            }
+            if first.is_some() && c.prebuilt + c.ahead_cold >= c.partitions {
+                break;
+            }
+            wait_steps(&db, 1);
+        }
+        let f = first.unwrap_or_else(|| panic!("no sample: {:?}", db.zpage_counts()));
+        assert!(f.partitions >= 3, "{f:?}");
+        let left = f.partitions - (f.prebuilt + f.ahead_cold).min(f.partitions);
+        if between {
+            assert!(
+                left > 0,
+                "the sample waited for the last build ahead: {f:?}"
+            );
+        } else {
+            assert_eq!(
+                left, 0,
+                "a sample between builds ahead without the option: {f:?}"
+            );
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// The builds ahead at landing wait while scans are near
 /// (`Options::zpages_land_scans_far`): a store scanned, its raw
 /// populations past the percent of its budget, builds nothing ahead, and
@@ -7744,6 +7855,9 @@ fn a_buy_attaches_every_form_file_built_ahead_before_any_warm() {
             land_store_with(&format!("auto-land-attach-{first}"), 50, |o| {
                 o.partition_bytes = Some(160 << 10);
                 o.zpages_attach_first = first;
+                // One builder ahead, whose order the files' times read:
+                // two finish in whatever order their builds take.
+                o.zpages_ahead_builders = 1;
             });
         inject.set_budget(raw * 3 / 2);
         assert!(
