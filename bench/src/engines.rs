@@ -588,6 +588,10 @@ pub struct Supdb {
     /// (`Options::zpages_cover_resident`, `Options::zpages_suspect_at_crossing`
     /// off). `supdb-zinstallwaits`, durable.
     zinstallwaits: bool,
+    /// The controller's re-code of its hottest partitions to the raw tails
+    /// once the form is installed (`Options::zpages_recode_auto`).
+    /// `supdb-zrecodeauto`, durable.
+    zrecodeauto: bool,
     /// The block cache reads a block boundary's key off the ordered index's
     /// top level in memory, where the default reads the partition's record
     /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
@@ -1400,6 +1404,10 @@ struct Policy {
     /// (`Options::zpages_cover_resident`, `Options::zpages_suspect_at_crossing`
     /// off). `supdb-zinstallwaits`, durable.
     zinstallwaits: bool,
+    /// The controller's re-code of its hottest partitions to the raw tails
+    /// once the form is installed (`Options::zpages_recode_auto`).
+    /// `supdb-zrecodeauto`, durable.
+    zrecodeauto: bool,
     /// The block cache reads a block boundary's key off the ordered index's
     /// top level in memory, where the default reads the partition's record
     /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
@@ -1975,6 +1983,7 @@ impl Default for Policy {
             zahead1: false,
             zsamplegap: false,
             zinstallwaits: false,
+            zrecodeauto: false,
             boundarytop: false,
             nodirwillneed: false,
             noboundsheadwillneed: false,
@@ -3862,6 +3871,19 @@ impl Supdb {
             path,
             Policy {
                 zinstallwaits: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose controller re-codes its hottest partitions to the raw
+    /// tails once the form is installed (`Options::zpages_recode_auto`):
+    /// against `supdb` it prices the re-code under the controller.
+    pub fn create_zrecodeauto(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zrecodeauto: true,
                 ..Policy::default()
             },
         )
@@ -6487,6 +6509,7 @@ impl Supdb {
             zahead1,
             zsamplegap,
             zinstallwaits,
+            zrecodeauto,
             boundarytop,
             nodirwillneed,
             noboundsheadwillneed,
@@ -6803,6 +6826,7 @@ impl Supdb {
             zpages_sample_between: zsamplegap,
             zpages_cover_resident: !zinstallwaits,
             zpages_suspect_at_crossing: !zinstallwaits,
+            zpages_recode_auto: zrecodeauto,
             wal_drop_bytes: if walkeep {
                 0
             } else {
@@ -7089,6 +7113,7 @@ impl Supdb {
             zahead1,
             zsamplegap,
             zinstallwaits,
+            zrecodeauto,
             boundarytop,
             nodirwillneed,
             noboundsheadwillneed,
@@ -7845,6 +7870,9 @@ impl Engine for Supdb {
         }
         if self.zinstallwaits {
             return "supdb-zinstallwaits";
+        }
+        if self.zrecodeauto {
+            return "supdb-zrecodeauto";
         }
         if self.zsamplegap {
             return "supdb-zsamplegap";
@@ -9353,6 +9381,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zahead1"
         | "supdb-zsamplegap"
         | "supdb-zinstallwaits"
+        | "supdb-zrecodeauto"
         | "supdb-nozpagesnofitshort"
         | "supdb-nozpagesmergepar2"
         | "supdb-boundarytop"
@@ -9896,6 +9925,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zahead1" => supdb_arm(Supdb::create_zahead1, dir)?,
         "supdb-zsamplegap" => supdb_arm(Supdb::create_zsamplegap, dir)?,
         "supdb-zinstallwaits" => supdb_arm(Supdb::create_zinstallwaits, dir)?,
+        "supdb-zrecodeauto" => supdb_arm(Supdb::create_zrecodeauto, dir)?,
         "supdb-nozpagesnofitshort" => supdb_arm(Supdb::create_nozpages_nofitshort, dir)?,
         "supdb-nozpagesmergepar2" => supdb_arm(Supdb::create_nozpages_mergepar2, dir)?,
         "supdb-ingestmergepar2" => supdb_arm(Supdb::create_ingest_mergepar2, dir)?,
@@ -11469,6 +11499,7 @@ mod tests {
             "supdb-zahead1",
             "supdb-zsamplegap",
             "supdb-zinstallwaits",
+            "supdb-zrecodeauto",
         ] {
             assert_eq!(
                 open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
@@ -11530,6 +11561,17 @@ mod tests {
                         b.wal_drop_bytes,
                         b.zpages_sample_between
                     )
+                );
+            }
+            {
+                let z = Supdb::create_zrecodeauto(&dir("zrecodeauto")).unwrap();
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_recode_auto && !b.zpages_recode_auto);
+                assert!(!o.zpages_recode && !o.zpages_both);
+                assert_eq!(
+                    (o.zpages, o.zpages_cover_resident, o.wal_drop_bytes),
+                    (b.zpages, b.zpages_cover_resident, b.wal_drop_bytes)
                 );
             }
             let w = Supdb::create_walkeep(&dir("walkeep")).unwrap();

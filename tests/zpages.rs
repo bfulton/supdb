@@ -8995,6 +8995,137 @@ fn codings(db: &Db) -> Vec<bool> {
     db.zpage_heat().iter().map(|h| h.coded).collect()
 }
 
+/// Under the controller with the re-code (`Options::zpages_recode_auto`),
+/// once the form is installed, the partition whose decodes cost the most is
+/// re-coded to the raw tails while the form with their extra stays within
+/// the fill share of the budget, the partitions under their share of the
+/// decode time are left block-coded, and once the budget falls under the
+/// form past the evict share the raw tails go back; every read answers as
+/// the raw form does across each swap. Without the option nothing is
+/// re-coded however hot a partition reads.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_controller_recodes_the_hottest_partition_within_the_budget() {
+    for on in [true, false] {
+        let what = format!("recode auto {on}");
+        let (dir, db, model, inject) = auto_store_with(
+            &format!("auto-recode-{on}"),
+            1 << 20,
+            1_000_000.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_recode_auto = on;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        // Every file attached and warmed: the policy's turn comes once the
+        // builder has nothing due.
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        // A decode priced by the seam, so that the heat is the decodes.
+        inject.set_decode_cost(std::time::Duration::from_micros(10));
+        assert!(
+            codings(&db).iter().all(|c| !c),
+            "{what}: built in the block coding: {:?}",
+            codings(&db)
+        );
+        let c = db.zpage_counts();
+        assert!(
+            c.form_files >= 5,
+            "{what}: partitions to choose from: {c:?}"
+        );
+        let total = c.file_bytes;
+        // A partition hot, and one past the floor and under its share of
+        // the decode time: a hundred thousand reads to three thousand.
+        let hot = keys_of_partition(&db, &model, 2);
+        let warm = keys_of_partition(&db, &model, 4);
+        let heat = |db: &Db| {
+            heat_up(db, &hot, 100_000);
+            heat_up(db, &warm, 3_000);
+        };
+        if on {
+            // The fill share of the budget the form itself: no room.
+            inject.set_budget(total * 100 / 85 + 1);
+            recode_look(&db, std::time::Duration::from_secs(1));
+            heat(&db);
+            recode_look(&db, std::time::Duration::from_secs(1));
+            wait_steps(&db, 5);
+            let c = db.zpage_counts();
+            assert_eq!(c.recodes, 0, "{what}: no room in the fill: {c:?}");
+            // Room within the fill share for a partition's raw tails.
+            inject.set_budget(total * 2);
+            heat(&db);
+            recode_look(&db, std::time::Duration::from_secs(1));
+            // The re-code is collected at a later step of the controller,
+            // which the injected clock paces.
+            assert!(
+                tick_until(&db, 400, |c| c.recodes >= 1),
+                "{what}: the hot partition re-coded: {:?} {:?}",
+                db.zpage_counts(),
+                db.zpage_heat()
+            );
+            let coded = codings(&db);
+            assert!(
+                coded[2] && coded.iter().filter(|c| **c).count() == 1,
+                "{what}: the hot partition alone raw-tailed: {coded:?} {:?}",
+                db.zpage_heat()
+            );
+            // The warm one under its share: a look more re-codes nothing.
+            heat(&db);
+            recode_look(&db, std::time::Duration::from_secs(1));
+            wait_steps(&db, 5);
+            assert_eq!(
+                codings(&db).iter().filter(|c| **c).count(),
+                1,
+                "{what}: one raw-tailed: {:?}",
+                db.zpage_heat()
+            );
+            check(&r, &model, &keys, &format!("{what}: raw-tailed"));
+            // The budget under the form past the evict share: given back.
+            inject.set_budget(db.zpage_counts().file_bytes);
+            recode_look(&db, std::time::Duration::from_secs(1));
+            assert!(
+                tick_until(&db, 400, |c| c.recodes_back >= 1),
+                "{what}: given back: {:?} {:?}",
+                db.zpage_counts(),
+                db.zpage_heat()
+            );
+            assert!(
+                codings(&db).iter().all(|c| !c),
+                "{what}: all block-coded again: {:?}",
+                codings(&db)
+            );
+        } else {
+            inject.set_budget(total * 2);
+            for _ in 0..3 {
+                heat(&db);
+                advance_tick(&db, std::time::Duration::from_secs(1));
+            }
+            wait_steps(&db, 5);
+            let c = db.zpage_counts();
+            assert_eq!((c.recodes, c.recode_looks), (0, 0), "{what}: {c:?}");
+        }
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// A forced store whose served partitions the re-code policy re-codes, the
 /// raw pages dropped and every read decoding (no memo), its budget and its
 /// refaults the seam's: loaded, settled, and looked at once.

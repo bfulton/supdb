@@ -3715,9 +3715,40 @@ pub struct Options {
     /// drain. On as shipped, with `zpages_cover_resident`; off waits for the
     /// ticks, and `supdb-zinstallwaits` is the arm with both off.
     pub zpages_suspect_at_crossing: bool,
+    /// EXPERIMENT: under the controller (`ZPages::Auto`), once the form is
+    /// installed, the re-code policy (`zpages_recode`) re-codes the hottest
+    /// partitions to the raw tails while they serve, where their decodes
+    /// would be walks in place: a partition holding at least
+    /// `RECODE_AUTO_SHARE` of the store's decode time, while the form with
+    /// its raw tails' extra stays within `RECODE_AUTO_FILL` of the budget,
+    /// the rest of the budget left to the page cache's other tenants -- the
+    /// partitions the form does not cover yet, the files a write mix lands,
+    /// the indexes; and a raw-tailed partition goes back, coldest first,
+    /// only once the form passes `RECODE_AUTO_EVICT` of it. Under the forced
+    /// form the policy filled the budget to its edge with the form's bytes
+    /// alone and gave raw tails back at the group's refaults: the budget
+    /// falls a tenth through a write mix as the process's memory grows, the
+    /// write mixes refault whatever the form does, and at ten million keys
+    /// under 1.25 GiB the policy made 77 re-codes and 229 give-backs over
+    /// the mixes, E 0.68x and D 0.64x. Refuted there too: the policy took
+    /// the raw tails of the three hottest partitions in B and of two more in
+    /// D and gave those two back in E, with no flip after, and E read 0.87x
+    /// in both reps with the major faults the default does not take, since
+    /// E's own memory takes a fifth of the budget from the page cache and
+    /// the 36 MB the raw tails added were past what was left
+    /// (`docs/engine.md`). Off; `supdb-zrecodeauto` is the arm.
+    #[doc(hidden)]
+    pub zpages_recode_auto: bool,
 }
 
 impl Options {
+    /// Whether a form file times one decode in sixteen and counts a
+    /// raw-tailed group's opens (`zfile::ZFile::time_decodes`): the heat the
+    /// re-code policy reads, under the forced form or the controller.
+    pub(crate) fn z_times_decodes(&self) -> bool {
+        self.zpages_recode || self.zpages_recode_auto
+    }
+
     /// The form file's group coding the options ask for
     /// (`zpages_record_coding`), as the builder's plan and the sampler take it.
     pub(crate) fn z_coding(&self) -> u8 {
@@ -3972,6 +4003,7 @@ impl Default for Options {
             zpages_sample_between: false,
             zpages_cover_resident: true,
             zpages_suspect_at_crossing: true,
+            zpages_recode_auto: false,
         }
     }
 }
@@ -26562,7 +26594,7 @@ impl Db {
                         opts.zpages_memo_ahead,
                         opts.zpages_inplace_walk,
                         opts.zpages_drop_raw,
-                        opts.zpages_recode,
+                        opts.z_times_decodes(),
                         opts.zpages_own_decoder,
                     ),
                     &zev,
@@ -30076,7 +30108,7 @@ impl Db {
                     self.opts.zpages_memo_ahead,
                     self.opts.zpages_inplace_walk,
                     z_drop_now(&self.opts, &self.shared),
-                    self.opts.zpages_recode,
+                    self.opts.z_times_decodes(),
                     self.opts.zpages_own_decoder,
                 ),
                 ev,
@@ -30123,7 +30155,7 @@ impl Db {
                 ) {
                     Ok(mut side) => {
                         side.inplace = self.opts.zpages_inplace_walk;
-                        side.time_decodes = self.opts.zpages_recode;
+                        side.time_decodes = self.opts.z_times_decodes();
                         side.own_decoder = self.opts.zpages_own_decoder;
                         if seg.z.install(side) {
                             ev.built(&b);
@@ -35144,6 +35176,18 @@ const RECODE_PERIOD_BOTH: std::time::Duration = std::time::Duration::from_millis
 const RECODE_FLIP_BYTES: u64 = 32 << 20;
 const RECODE_SWAP: f64 = 2.0;
 const RECODE_DECODE_NS: f64 = 1000.0;
+/// The re-code policy under the controller (`Options::zpages_recode_auto`):
+/// the share of the store's decode time a partition holds before its raw
+/// tails are built -- at ten million keys the suite's Zipfian put a fifth
+/// to a quarter of E's decode time on each of its two hottest partitions
+/// and a fiftieth on each of the tail's -- the share of the budget the
+/// form with its raw tails may take, the rest left to the page cache's
+/// other tenants, and the share past which raw tails are given back. The
+/// budget falls a tenth through a write mix, so the gap between the last
+/// two is the hold that keeps a raw-tailed set from flipping at each move.
+const RECODE_AUTO_SHARE: f64 = 0.05;
+const RECODE_AUTO_FILL: f64 = 0.85;
+const RECODE_AUTO_EVICT: f64 = 0.95;
 
 /// The share of a partition's records the page cache must hold for a build
 /// ahead at landing to take it (`Options::zpages_land_pct`): the build
@@ -37765,6 +37809,66 @@ impl Maint {
             .iter()
             .filter(|p| p.coded)
             .min_by(|a, b| a.heat.total_cmp(&b.heat));
+        // Under the controller (`Options::zpages_recode_auto`): the hottest
+        // block-coded partition, at least `RECODE_AUTO_SHARE` of the decode
+        // time, re-coded to the raw tails where the form with their extra
+        // stays within `RECODE_AUTO_FILL` of the budget, else the room made
+        // by the coldest raw-tailed one if the hot one is `RECODE_SWAP`
+        // times hotter; and past `RECODE_AUTO_EVICT` of the budget the
+        // coldest raw-tailed partition given back. The refaults decide
+        // nothing: the write mixes raise them whatever the form does.
+        if self.opts.zpages == ZPages::Auto {
+            let heat_all: f64 = parts.iter().map(|p| p.heat).sum();
+            let fill = (budget as f64 * RECODE_AUTO_FILL) as u64;
+            let evict = (budget as f64 * RECODE_AUTO_EVICT) as u64;
+            if total > evict {
+                if self.z_trace {
+                    trace("back", coldest_raw, Some(evict));
+                }
+                if let Some(p) = coldest_raw {
+                    let seg = p.seg.clone();
+                    self.z_recode(seg);
+                }
+                return;
+            }
+            let Some(p) = parts
+                .iter()
+                .filter(|p| !p.coded)
+                .max_by(|a, b| a.heat.total_cmp(&b.heat))
+            else {
+                return;
+            };
+            if p.heat < RECODE_FLOOR_NS || p.heat < RECODE_AUTO_SHARE * heat_all {
+                if self.z_trace {
+                    trace("cold", Some(p), Some(fill));
+                }
+                return;
+            }
+            let extra = ((p.records as f64 * raw_ratio) as u64).saturating_sub(p.bytes);
+            if total.saturating_add(extra) <= fill {
+                if self.z_trace {
+                    trace("raw", Some(p), Some(fill));
+                }
+                let seg = p.seg.clone();
+                self.z_recode(seg);
+                return;
+            }
+            match coldest_raw {
+                Some(q) if q.heat * RECODE_SWAP < p.heat => {
+                    if self.z_trace {
+                        trace("swap", Some(q), Some(fill));
+                    }
+                    let seg = q.seg.clone();
+                    self.z_recode(seg);
+                }
+                _ => {
+                    if self.z_trace {
+                        trace("full", Some(p), Some(fill));
+                    }
+                }
+            }
+            return;
+        }
         if refault_rate > RECODE_REFAULTS {
             let ceiling = match coldest_raw {
                 Some(p) => total.saturating_sub(p.bytes).saturating_add(
@@ -38516,6 +38620,22 @@ impl Maint {
         } else if let Some(b) = &self.zbuild {
             if matches!(b.job, ZJob::Build(_)) && !b.dormant {
                 b.cancel.store(true, AtomicOrdering::Release);
+            }
+        }
+        // Once the form is installed and the builder has nothing due, the
+        // re-code policy's turn (`Options::zpages_recode_auto`).
+        if d.build
+            && self.opts.zpages_recode_auto
+            && self.zbuild.is_none()
+            && self.zsel.phase() == zselect::Phase::Compact
+            && !self.z_settling
+        {
+            let idle = {
+                let _op = self.op();
+                self.z_next().is_none()
+            };
+            if idle {
+                self.z_recode_tick();
             }
         }
         // The sample first where the option says, while the builder the
@@ -39360,7 +39480,7 @@ impl Maint {
                     self.opts.zpages_memo_ahead,
                     self.opts.zpages_inplace_walk,
                     z_drop_now(&self.opts, &self.shared),
-                    self.opts.zpages_recode,
+                    self.opts.z_times_decodes(),
                     self.opts.zpages_own_decoder,
                 ),
                 ev,
@@ -39686,7 +39806,7 @@ impl Maint {
                 ) {
                     Ok(mut side) => {
                         side.inplace = self.opts.zpages_inplace_walk;
-                        side.time_decodes = self.opts.zpages_recode;
+                        side.time_decodes = self.opts.z_times_decodes();
                         side.own_decoder = self.opts.zpages_own_decoder;
                         side.drop_cache();
                         let old = target.z_spare.keep(Box::into_raw(Box::new(side)));
@@ -39733,7 +39853,7 @@ impl Maint {
                 ) {
                     Ok(mut side) => {
                         side.inplace = self.opts.zpages_inplace_walk;
-                        side.time_decodes = self.opts.zpages_recode;
+                        side.time_decodes = self.opts.z_times_decodes();
                         side.own_decoder = self.opts.zpages_own_decoder;
                         let coded = side.coded();
                         let mut old = target.z.replace(side);
@@ -39804,7 +39924,7 @@ impl Maint {
                     ) {
                         Ok(mut side) => {
                             side.inplace = self.opts.zpages_inplace_walk;
-                            side.time_decodes = self.opts.zpages_recode;
+                            side.time_decodes = self.opts.z_times_decodes();
                             side.own_decoder = self.opts.zpages_own_decoder;
                             if target.z.install(side) {
                                 ev.built(&built);
