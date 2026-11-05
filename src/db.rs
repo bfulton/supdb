@@ -3682,6 +3682,37 @@ pub struct Options {
     /// it read C 0.97x, the install at the same moment either way: off is
     /// the order before it; `supdb-zsamplegap` is the arm.
     pub zpages_sample_between: bool,
+    /// EXPERIMENT: a partition with no form file attached whose raw records
+    /// are resident (at least `LAND_RESIDENT` of them, by `mincore`), or
+    /// whose build ahead is in flight, counts as covered: where the sampler
+    /// weighs an attach of the files on disk (`zselect::Sampler::attach`)
+    /// and prices the buy, and in the coverage the install waits for
+    /// (`zselect::COVERED_ENOUGH`). Its reads, left to the raw form until its
+    /// file lands, fault little or nothing, and its build is paid whether
+    /// the controller buys or not. With it the sample waits for no build
+    /// ahead, and the buy attaches the files on disk while a build ahead
+    /// holds the builder's slot. An ordered load lands its last partitions
+    /// at its drain, written a moment ago, and the install waited for their
+    /// builds ahead while C's reads of the partitions built long before took
+    /// the raw form's faults, half of C's time at ten million keys under
+    /// 1.25 GiB. Off counts attached partitions alone; `supdb-zcoverres` is
+    /// the arm, with `zpages_sample_between`.
+    pub zpages_cover_resident: bool,
+    /// EXPERIMENT: the controller suspects at the moment the store crosses
+    /// the selector's line to suspect, where it suspected on two hot model
+    /// readings a second apart: the look the builds at landing take at every
+    /// tick (`Maint::z_land_look`) reads the model at the tick its raw
+    /// prediction first reaches the line, and one hot reading suspects
+    /// (`zselect::ZSelect::set_suspect_at_reading`). An ordered load past
+    /// its budget crosses at its drain's landing, the moment C's reads
+    /// begin, and the install came with the second reading, one to two
+    /// seconds into C's raw faults. With it no sample starts while a seal is
+    /// in flight, and the attach on the prediction counts as settled at a
+    /// step whose census saw reads (`zselect::ZSelect::set_attach_on_reads`),
+    /// where it waited for the partitions to stand two seconds after the
+    /// drain. Off waits for the ticks; `supdb-zcrossing` is the arm, with
+    /// `zpages_cover_resident` and `zpages_sample_between`.
+    pub zpages_suspect_at_crossing: bool,
 }
 
 impl Options {
@@ -3937,6 +3968,8 @@ impl Default for Options {
             wal_drop_bytes: 1 << 20,
             zpages_ahead_builders: 2,
             zpages_sample_between: false,
+            zpages_cover_resident: false,
+            zpages_suspect_at_crossing: false,
         }
     }
 }
@@ -35353,6 +35386,10 @@ struct Maint {
     /// controller's to win from there, and the builds ahead stop sparing
     /// the raw form's cache (`Options::zpages_land_drop_past`).
     z_land_past: bool,
+    /// Whether the raw prediction stood at the selector's line to suspect
+    /// at the last look (`Options::zpages_suspect_at_crossing`), so that the
+    /// look takes the model's reading at the tick it first crosses.
+    z_land_sus: bool,
     /// What held the builds ahead at the last look, for the trace
     /// (`z_prebuild_next`).
     z_land_reason: std::cell::Cell<u8>,
@@ -35883,6 +35920,7 @@ impl Maint {
         let z_auto = r.opts.zpages == ZPages::Auto && !z_auto_inert(&r.opts);
         let z_eager = r.opts.zpages_build_eager;
         let z_attach_eager = r.opts.zpages_attach_eager;
+        let z_suspect_crossing = r.opts.zpages_suspect_at_crossing;
         if std::env::var_os("SUPDB_ZPAGES_TRACE").is_some() {
             // The epoch the trace's `t=` counts from, on the monotonic clock
             // the suite's lag marks print, so its events can be read against
@@ -35915,6 +35953,8 @@ impl Maint {
                 let mut sel = zselect::ZSelect::default();
                 sel.set_eager(z_eager);
                 sel.set_attach_eager(z_attach_eager);
+                sel.set_suspect_at_reading(z_suspect_crossing);
+                sel.set_attach_on_reads(z_suspect_crossing);
                 sel
             },
             z_auto,
@@ -35940,6 +35980,7 @@ impl Maint {
             z_scan_len: 0.0,
             z_past_budget: false,
             z_land_past: false,
+            z_land_sus: false,
             z_land_reason: std::cell::Cell::new(u8::MAX),
             z_crossed: false,
             z_land_due: false,
@@ -38029,7 +38070,14 @@ impl Maint {
 
     /// The builder's report for this tick: the builds collected since the
     /// last, by fate, and the coverage -- the footprint bytes of the
-    /// partitions with a cell over those of the partitions not declined.
+    /// partitions with a cell over those of the partitions not declined,
+    /// and, where resident records count (`Options::zpages_cover_resident`),
+    /// of the partitions resident or built ahead in flight. Before the
+    /// install every read goes raw, the records the crossing swapped out
+    /// included; after it a partition built ahead in flight reads raw until
+    /// its file lands and no other does, so the install waits for none: at
+    /// ten million keys under 1.25 GiB the drain's last two builds ahead
+    /// were a ninth of the footprint and held the install 0.6 s.
     /// Read under the caller's pin.
     fn z_report_take(&mut self) -> zselect::Build {
         let mut b = std::mem::take(&mut self.z_report);
@@ -38041,7 +38089,8 @@ impl Maint {
             let (h, r) = s.foot();
             let bytes = h.saturating_add(r);
             coverable = coverable.saturating_add(bytes);
-            if s.z.get().is_some() {
+            let in_flight = self.opts.zpages_cover_resident && self.z_building_ahead(&s.name);
+            if s.z.get().is_some() || in_flight || self.z_covers_resident(s) {
                 covered = covered.saturating_add(bytes);
             }
         }
@@ -38166,8 +38215,18 @@ impl Maint {
         let (mut block, mut raw) = (ZSums::default(), ZSums::default());
         let mut on_disk = 0usize;
         // The keys of the sampled partitions with no form file on disk,
-        // which the build is priced over where some have one.
+        // which the build is priced over where some have one; and of those,
+        // where resident records count (`Options::zpages_cover_resident`),
+        // the keys of the partitions neither resident nor built ahead in
+        // flight. A build ahead past the line drops its records behind it as
+        // it reads them, so a partition resident when its build started is
+        // not by the reading's end, and its file is a fraction of a second
+        // away: counted as uncovered, the reading at ten million keys under
+        // 1.25 GiB priced two such builds, refused the attach, and was never
+        // taken again once their files had landed, since the partitions had
+        // not changed, so the store read the whole of C and B raw.
         let mut missing_keys = 0u64;
+        let mut uncovered_keys = 0u64;
         for (seg, r, r2) in results {
             zfile::ZEvents::add(&ev.sampled, 1);
             let s = match r {
@@ -38194,6 +38253,10 @@ impl Maint {
             on_disk += usize::from(on);
             if !on {
                 missing_keys = missing_keys.saturating_add(seg.blob.keys() as u64);
+                let in_flight = self.opts.zpages_cover_resident && self.z_building_ahead(&seg.name);
+                if !in_flight && !self.z_covers_resident(&seg) {
+                    uncovered_keys = uncovered_keys.saturating_add(seg.blob.keys() as u64);
+                }
             }
         }
         // The coding, where the selector chooses it: the raw tails where the
@@ -38269,12 +38332,26 @@ impl Maint {
         // build of the rest, over the keys of the partitions without one --
         // a build ahead at landing leaves the partitions the load pushed out
         // of the page cache to this build, and priced as the whole build
-        // the files on disk bought the controller nothing.
+        // the files on disk bought the controller nothing. Where resident
+        // records count as covering a partition and the builds ahead are
+        // due (`Options::zpages_cover_resident`), over the keys left
+        // uncovered: the builds ahead build every partition whose records
+        // are resident whether the controller buys or not, and pass over
+        // the rest as cold by the same line, and a build in flight is paid
+        // already, so the buy causes the others alone -- priced over all
+        // three of the drain's partitions in flight, the buy at ten million
+        // keys under 1.25 GiB came 1.4 s into C for the rent to reach a
+        // second's price.
+        let priced_keys = if self.z_land_due {
+            uncovered_keys
+        } else {
+            missing_keys
+        };
         let c_build = if !declined && on_disk == counted {
             attach
         } else if !declined && on_disk > 0 {
             attach * on_disk as f64 / counted as f64
-                + zselect::ski_rental_price(fill_per_record * missing_keys as f64, None)
+                + zselect::ski_rental_price(fill_per_record * priced_keys as f64, None)
         } else {
             zselect::ski_rental_price(build_cpu, None)
         };
@@ -38307,7 +38384,7 @@ impl Maint {
             generation: job.generation,
             attach: !declined
                 && on_disk > 0
-                && missing_keys as f64 <= (1.0 - zselect::COVERED_ENOUGH) * nkeys as f64,
+                && uncovered_keys as f64 <= (1.0 - zselect::COVERED_ENOUGH) * nkeys as f64,
         });
         if self.z_trace {
             eprintln!(
@@ -38358,35 +38435,36 @@ impl Maint {
             // Every form file on disk attached first, where the option says,
             // so that no attach waits for a warm (`Options::zpages_attach_first`).
             if self.opts.zpages_attach_first && self.zbuild.is_none() {
-                let on_disk: Vec<std::sync::Arc<Seg>> = {
-                    let _op = self.op();
-                    self.segs()
-                        .iter()
-                        .filter(|s| s.level > 0)
-                        .filter(|s| !self.in_flight_input(&s.name))
-                        .filter(|s| !self.z_ahead_holds(&s.name))
-                        .filter(|s| s.z.get().is_none())
-                        .filter(|s| {
-                            let why = s.z_declined.load(AtomicOrdering::Relaxed);
-                            why == 0 || why == zfile::DECLINED_REFUSED
-                        })
-                        .filter(|s| {
-                            Db::name_id(&s.name)
-                                .zip(Db::name_end_seq(&s.name))
-                                .is_some_and(|(id, end)| {
-                                    self.dir.join(zfile::zpg_name(id, end)).is_file()
-                                })
-                        })
-                        .cloned()
-                        .collect()
-                };
-                for seg in on_disk {
+                for seg in self.z_unattached_on_disk() {
                     // A file that does not check out starts its build, and
                     // the turn goes on after it as below.
                     if self.zbuild.is_some() {
                         break;
                     }
                     self.z_start(seg, ZKind::Build, false);
+                }
+            }
+            // Where resident records count (`Options::zpages_cover_resident`),
+            // the files on disk are attached while a build ahead holds the
+            // builder's slot as well, the attach alone: the install counts
+            // the partition in flight as covered, and with its slot taken the
+            // attach of every other file waited for the build -- 0.6 s into C
+            // at ten million keys under 1.25 GiB, the drain's last two builds
+            // ahead in both slots. A file that does not check out is left for
+            // the turn that builds, once the slot is free.
+            if self.opts.zpages_attach_first
+                && self.opts.zpages_cover_resident
+                && self.zbuild.as_ref().is_some_and(|b| b.dormant)
+            {
+                for seg in self.z_unattached_on_disk() {
+                    let (Some(id), Some(end)) =
+                        (Db::name_id(&seg.name), Db::name_end_seq(&seg.name))
+                    else {
+                        continue;
+                    };
+                    let refused =
+                        seg.z_declined.load(AtomicOrdering::Relaxed) == zfile::DECLINED_REFUSED;
+                    self.z_attach_on_disk(&seg, id, end, false, refused);
                 }
             }
             // A turn attaches what is on disk and starts one job; a
@@ -38425,16 +38503,93 @@ impl Maint {
         }
     }
 
+    /// The partitions with a form file on disk and none attached, neither a
+    /// merge's input nor built ahead in either slot, nor declined but for a
+    /// refused coding: what a buy attaches before it builds.
+    fn z_unattached_on_disk(&self) -> Vec<std::sync::Arc<Seg>> {
+        let _op = self.op();
+        self.segs()
+            .iter()
+            .filter(|s| s.level > 0)
+            .filter(|s| !self.in_flight_input(&s.name))
+            .filter(|s| !self.z_building_ahead(&s.name))
+            .filter(|s| s.z.get().is_none())
+            .filter(|s| {
+                let why = s.z_declined.load(AtomicOrdering::Relaxed);
+                why == 0 || why == zfile::DECLINED_REFUSED
+            })
+            .filter(|s| {
+                Db::name_id(&s.name)
+                    .zip(Db::name_end_seq(&s.name))
+                    .is_some_and(|(id, end)| self.dir.join(zfile::zpg_name(id, end)).is_file())
+            })
+            .cloned()
+            .collect()
+    }
+
     /// The sample started where the decision asks for one and none is in
-    /// flight or waiting, with no build ahead in flight.
+    /// flight or waiting, with no build ahead in flight -- none over a
+    /// partition its resident records do not cover, where they count
+    /// (`Options::zpages_cover_resident`) -- and, where the controller
+    /// suspects at the crossing, no seal in flight.
     fn z_sample_due(&mut self, d: &zselect::Decision) {
         if d.sample
             && self.z_sampling.is_none()
             && self.z_sample_ready.is_none()
-            && !self.z_prebuild_pending()
+            && !self.z_sample_held()
         {
             self.z_sample_start();
         }
+    }
+
+    /// Whether the sample waits. For a build ahead in flight
+    /// (`z_prebuild_pending`), so that the reading prices the attach of a
+    /// file written and not a build half done; where resident records
+    /// count as covering a partition, not at all, since the reading counts
+    /// a partition whose build ahead is in flight as covered too
+    /// (`Maint::z_sample_collect`): at ten million keys under 1.25 GiB the
+    /// two builders took the drain's last five partitions one after the
+    /// other, and a sample waiting for both slots to be empty at once came
+    /// 1.3 s after the drain, its partitions resident all the while. And,
+    /// where the controller suspects at the crossing
+    /// (`Options::zpages_suspect_at_crossing`), for a seal in flight: the
+    /// crossing falls inside a load as often as at its end, a reading
+    /// taken while a seal is in flight is of a store the landing is about
+    /// to change, and the selector drops it at the landing while the
+    /// coding it picked steers the builds ahead after it -- a store a
+    /// partition short of its drain picked the raw tails, which fit it,
+    /// the drain's sample picked the block coding, and the three files
+    /// built ahead between them were built again.
+    fn z_sample_held(&self) -> bool {
+        if self.opts.zpages_suspect_at_crossing && !self.sealing.is_empty() {
+            return true;
+        }
+        self.z_prebuild_pending() && !self.opts.zpages_cover_resident
+    }
+
+    /// Whether a build ahead is in flight for `name`, in either slot.
+    fn z_building_ahead(&self, name: &str) -> bool {
+        self.z_ahead_holds(name)
+            || self
+                .zbuild
+                .as_ref()
+                .is_some_and(|b| b.dormant && b.seg.name == name)
+    }
+
+    /// Whether `seg`'s raw records count as covering it for want of a form
+    /// file (`Options::zpages_cover_resident`): resident by the test's seam
+    /// where it is set, else by `mincore`.
+    fn z_covers_resident(&self, seg: &Seg) -> bool {
+        if !self.opts.zpages_cover_resident {
+            return false;
+        }
+        let share = self
+            .opts
+            .zpages_inject
+            .as_ref()
+            .and_then(|i| i.records_resident())
+            .unwrap_or_else(|| seg.records_resident());
+        share >= LAND_RESIDENT
     }
 
     /// Whether the second build ahead holds `name` (`Maint::zahead`).
@@ -38651,8 +38806,17 @@ impl Maint {
         // hundred reads: the builds ahead swapped a quarter of its records
         // out and its read pass ran ten times longer. The line is the
         // selector's own to enter, by the model's prediction alone.
-        self.z_land_past = zselect::model_raw(budget, hash, records)
-            >= self.zsel.theta_enter(zselect::Class::Read);
+        let phi_raw = zselect::model_raw(budget, hash, records);
+        self.z_land_past = phi_raw >= self.zsel.theta_enter(zselect::Class::Read);
+        // The model is read at the tick the prediction first reaches the
+        // line to suspect, not at the next second's reading, where the
+        // selector suspects on that one reading
+        // (`Options::zpages_suspect_at_crossing`).
+        let sus = phi_raw >= self.zsel.theta_sus(zselect::Class::Read);
+        if sus && !self.z_land_sus && self.opts.zpages_suspect_at_crossing {
+            self.z_last_s1 = None;
+        }
+        self.z_land_sus = sus;
         if self.z_land_past && !self.z_crossed && self.opts.zpages_land_drop_past {
             self.z_crossed = true;
             self.z_cross();
@@ -39066,8 +39230,24 @@ impl Maint {
     }
 
     /// The first live partition due a job, and which: not an input of a
-    /// merge in flight, which retires it. Read under the caller's pin.
+    /// merge in flight, which retires it. Where resident records count as
+    /// covering a partition (`Options::zpages_cover_resident`), a build
+    /// before any warm: the install comes before every partition has its
+    /// file, and in key order the warms of the files attached took the
+    /// builder for three seconds while the drain's last two partitions
+    /// waited for their builds, into the next mix at ten million keys under
+    /// 1.25 GiB. Read under the caller's pin.
     fn z_next(&self) -> Option<(std::sync::Arc<Seg>, ZKind)> {
+        if self.opts.zpages_cover_resident {
+            if let Some(next) = self.z_next_where(|k| k != ZKind::Warm) {
+                return Some(next);
+            }
+        }
+        self.z_next_where(|_| true)
+    }
+
+    /// `z_next` over the jobs `take` admits.
+    fn z_next_where(&self, take: impl Fn(ZKind) -> bool) -> Option<(std::sync::Arc<Seg>, ZKind)> {
         for s in self.segs().iter().filter(|s| s.level > 0) {
             if self.in_flight_input(&s.name) || self.z_ahead_holds(&s.name) {
                 continue;
@@ -39092,9 +39272,69 @@ impl Maint {
                 }
                 None => continue,
             };
+            if !take(kind) {
+                continue;
+            }
             return Some((s.clone(), kind));
         }
         None
+    }
+
+    /// The coding check a build makes of a form file built ahead -- a file
+    /// in the coding the selector's pick refused is given a dead name,
+    /// unlinked at the idle tick, and built again -- then the attach of the
+    /// file on disk: whether it attached. Not for a re-code, whose file
+    /// under the name is the one it replaces.
+    fn z_attach_on_disk(
+        &mut self,
+        seg: &std::sync::Arc<Seg>,
+        id: u64,
+        end: u64,
+        dormant: bool,
+        refused: bool,
+    ) -> bool {
+        let shared = self.shared.clone();
+        let ev = &shared.z;
+        if !dormant {
+            let name = zfile::zpg_name(id, end);
+            let want = self
+                .z_coding_pick
+                .filter(|_| self.opts.zpages_coding_auto)
+                .map(|c| c == zselect::Coding::RawTails);
+            if let (Some(want), Some(&built)) = (want, self.z_ahead_coding.get(&name)) {
+                // A build ahead cancelled or failed left no file to give.
+                if built != want && self.dir.join(&name).is_file() {
+                    let n = shared.next_dead.fetch_add(1, AtomicOrdering::Relaxed);
+                    let dead = self.dir.join(zfile::zpg_dead_name(n));
+                    if std::fs::rename(self.dir.join(&name), &dead).is_ok() {
+                        self.spares.push(dead);
+                    } else {
+                        let _ = std::fs::remove_file(self.dir.join(&name));
+                    }
+                    zfile::ZEvents::add(&ev.ahead_recoded, 1);
+                }
+                self.z_ahead_coding.remove(&name);
+            }
+        }
+        !refused
+            && Db::z_attach(
+                &self.dir,
+                seg,
+                Db::z_advise(&self.opts),
+                Db::z_memo(&self.opts),
+                self.opts.zpages_scan_prefetch,
+                self.opts.zpages_trusted_views,
+                self.opts.zpages_memo_first,
+                (
+                    self.opts.zpages_fence_tree,
+                    self.opts.zpages_memo_ahead,
+                    self.opts.zpages_inplace_walk,
+                    z_drop_now(&self.opts, &self.shared),
+                    self.opts.zpages_recode,
+                    self.opts.zpages_own_decoder,
+                ),
+                ev,
+            )
     }
 
     /// `seg`'s build started on the builder's thread, or the segment given
@@ -39132,7 +39372,6 @@ impl Maint {
             ZKind::Retry => zfile::ZEvents::add(&ev.build_retries, 1),
             ZKind::Build | ZKind::Warm | ZKind::Recode | ZKind::Spare => {}
         }
-        let advise = Db::z_advise(&self.opts);
         let refused = seg.z_declined.load(AtomicOrdering::Relaxed) == zfile::DECLINED_REFUSED;
         // A re-code's partition is served by the file under the name, which
         // is the one being replaced.
@@ -39140,50 +39379,7 @@ impl Maint {
         // file, and kept where a re-code swaps.
         let spare = kind == ZKind::Spare;
         let recode = kind == ZKind::Recode || spare;
-        // A file built ahead in the coding the pick refused: given a dead
-        // name, unlinked at the idle tick, and built again below.
-        if !recode && !dormant {
-            let name = zfile::zpg_name(id, end);
-            let want = self
-                .z_coding_pick
-                .filter(|_| self.opts.zpages_coding_auto)
-                .map(|c| c == zselect::Coding::RawTails);
-            if let (Some(want), Some(&built)) = (want, self.z_ahead_coding.get(&name)) {
-                // A build ahead cancelled or failed left no file to give.
-                if built != want && self.dir.join(&name).is_file() {
-                    let n = shared.next_dead.fetch_add(1, AtomicOrdering::Relaxed);
-                    let dead = self.dir.join(zfile::zpg_dead_name(n));
-                    if std::fs::rename(self.dir.join(&name), &dead).is_ok() {
-                        self.spares.push(dead);
-                    } else {
-                        let _ = std::fs::remove_file(self.dir.join(&name));
-                    }
-                    zfile::ZEvents::add(&ev.ahead_recoded, 1);
-                }
-                self.z_ahead_coding.remove(&name);
-            }
-        }
-        if !recode
-            && !refused
-            && Db::z_attach(
-                &self.dir,
-                &seg,
-                advise,
-                Db::z_memo(&self.opts),
-                self.opts.zpages_scan_prefetch,
-                self.opts.zpages_trusted_views,
-                self.opts.zpages_memo_first,
-                (
-                    self.opts.zpages_fence_tree,
-                    self.opts.zpages_memo_ahead,
-                    self.opts.zpages_inplace_walk,
-                    z_drop_now(&self.opts, &self.shared),
-                    self.opts.zpages_recode,
-                    self.opts.zpages_own_decoder,
-                ),
-                ev,
-            )
-        {
+        if !recode && self.z_attach_on_disk(&seg, id, end, dormant, refused) {
             return;
         }
         let failed = |why: u8| {

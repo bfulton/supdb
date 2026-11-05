@@ -582,6 +582,13 @@ pub struct Supdb {
     /// The controller's sample asked for between builds ahead
     /// (`Options::zpages_sample_between`). `supdb-zsamplegap`, durable.
     zsamplegap: bool,
+    /// A partition with resident raw records counted as covered
+    /// (`Options::zpages_cover_resident`), with the sample between builds
+    /// ahead. `supdb-zcoverres`, durable.
+    zcoverres: bool,
+    /// The controller's `supdb-zcoverres` and its suspicion at the crossing
+    /// (`Options::zpages_suspect_at_crossing`). `supdb-zcrossing`, durable.
+    zcrossing: bool,
     /// The block cache reads a block boundary's key off the ordered index's
     /// top level in memory, where the default reads the partition's record
     /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
@@ -1388,6 +1395,13 @@ struct Policy {
     /// The controller's sample asked for between builds ahead
     /// (`Options::zpages_sample_between`). `supdb-zsamplegap`, durable.
     zsamplegap: bool,
+    /// A partition with resident raw records counted as covered
+    /// (`Options::zpages_cover_resident`), with the sample between builds
+    /// ahead. `supdb-zcoverres`, durable.
+    zcoverres: bool,
+    /// The controller's `supdb-zcoverres` and its suspicion at the crossing
+    /// (`Options::zpages_suspect_at_crossing`). `supdb-zcrossing`, durable.
+    zcrossing: bool,
     /// The block cache reads a block boundary's key off the ordered index's
     /// top level in memory, where the default reads the partition's record
     /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
@@ -1962,6 +1976,8 @@ impl Default for Policy {
             walkeep: false,
             zahead1: false,
             zsamplegap: false,
+            zcoverres: false,
+            zcrossing: false,
             boundarytop: false,
             nodirwillneed: false,
             noboundsheadwillneed: false,
@@ -3835,6 +3851,33 @@ impl Supdb {
             path,
             Policy {
                 zsamplegap: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose controller counts a partition with resident raw records
+    /// as covered and takes its sample between builds ahead
+    /// (`Options::zpages_cover_resident`, `Options::zpages_sample_between`):
+    /// against `supdb` it prices the install brought to the load's end.
+    pub fn create_zcoverres(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zcoverres: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-zcoverres` whose controller suspects at the tick the store
+    /// crosses the line (`Options::zpages_suspect_at_crossing`): against
+    /// `supdb` it prices the install at the load's end whole.
+    pub fn create_zcrossing(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zcrossing: true,
                 ..Policy::default()
             },
         )
@@ -6459,6 +6502,8 @@ impl Supdb {
             walkeep,
             zahead1,
             zsamplegap,
+            zcoverres,
+            zcrossing,
             boundarytop,
             nodirwillneed,
             noboundsheadwillneed,
@@ -6772,7 +6817,9 @@ impl Supdb {
             } else {
                 supdb::Options::default().zpages_ahead_builders
             },
-            zpages_sample_between: zsamplegap,
+            zpages_sample_between: zsamplegap || zcoverres || zcrossing,
+            zpages_cover_resident: zcoverres || zcrossing,
+            zpages_suspect_at_crossing: zcrossing,
             wal_drop_bytes: if walkeep {
                 0
             } else {
@@ -7058,6 +7105,8 @@ impl Supdb {
             walkeep,
             zahead1,
             zsamplegap,
+            zcoverres,
+            zcrossing,
             boundarytop,
             nodirwillneed,
             noboundsheadwillneed,
@@ -7811,6 +7860,12 @@ impl Engine for Supdb {
         }
         if self.zahead1 {
             return "supdb-zahead1";
+        }
+        if self.zcrossing {
+            return "supdb-zcrossing";
+        }
+        if self.zcoverres {
+            return "supdb-zcoverres";
         }
         if self.zsamplegap {
             return "supdb-zsamplegap";
@@ -9318,6 +9373,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-walkeep"
         | "supdb-zahead1"
         | "supdb-zsamplegap"
+        | "supdb-zcoverres"
+        | "supdb-zcrossing"
         | "supdb-nozpagesnofitshort"
         | "supdb-nozpagesmergepar2"
         | "supdb-boundarytop"
@@ -9860,6 +9917,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-walkeep" => supdb_arm(Supdb::create_walkeep, dir)?,
         "supdb-zahead1" => supdb_arm(Supdb::create_zahead1, dir)?,
         "supdb-zsamplegap" => supdb_arm(Supdb::create_zsamplegap, dir)?,
+        "supdb-zcoverres" => supdb_arm(Supdb::create_zcoverres, dir)?,
+        "supdb-zcrossing" => supdb_arm(Supdb::create_zcrossing, dir)?,
         "supdb-nozpagesnofitshort" => supdb_arm(Supdb::create_nozpages_nofitshort, dir)?,
         "supdb-nozpagesmergepar2" => supdb_arm(Supdb::create_nozpages_mergepar2, dir)?,
         "supdb-ingestmergepar2" => supdb_arm(Supdb::create_ingest_mergepar2, dir)?,
@@ -11432,6 +11491,8 @@ mod tests {
             "supdb-walkeep",
             "supdb-zahead1",
             "supdb-zsamplegap",
+            "supdb-zcoverres",
+            "supdb-zcrossing",
         ] {
             assert_eq!(
                 open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
@@ -11472,6 +11533,29 @@ mod tests {
                         b.wal_drop_bytes,
                         b.forms_fit_when_short
                     )
+                );
+            }
+            {
+                let z = Supdb::create_zcoverres(&dir("zcoverres")).unwrap();
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_cover_resident && !b.zpages_cover_resident);
+                assert!(o.zpages_sample_between && !b.zpages_sample_between);
+                assert!(!o.zpages_suspect_at_crossing);
+                assert_eq!(
+                    (o.zpages_ahead_builders, o.zpages, o.wal_drop_bytes),
+                    (b.zpages_ahead_builders, b.zpages, b.wal_drop_bytes)
+                );
+            }
+            {
+                let z = Supdb::create_zcrossing(&dir("zcrossing")).unwrap();
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_suspect_at_crossing && !b.zpages_suspect_at_crossing);
+                assert!(o.zpages_cover_resident && o.zpages_sample_between);
+                assert_eq!(
+                    (o.zpages_ahead_builders, o.zpages, o.wal_drop_bytes),
+                    (b.zpages_ahead_builders, b.zpages, b.wal_drop_bytes)
                 );
             }
             let w = Supdb::create_walkeep(&dir("walkeep")).unwrap();
