@@ -979,3 +979,106 @@ fn a_merges_landing_plans_the_next_and_a_cap_lands_a_range_at_a_time() {
         let _ = std::fs::remove_dir_all(&d);
     }
 }
+
+/// Merges in flight beside each other (`Options::merge_parallel`). A
+/// merge held before its landing over one range, and a second range made
+/// due while it runs: at one the second waits, at two it starts beside the
+/// first, and at three a range the first holds made due again by pieces
+/// sealed after it started is not merged a second time beside it. Nothing
+/// lands while held; released, both land, the partitions tile, every key
+/// reads back, and the store reopens to the same keys.
+#[test]
+fn a_second_merge_runs_beside_the_first_over_ranges_it_does_not_hold() {
+    for par in [1usize, 2, 3] {
+        let d = scratch(&format!("merge-parallel-{par}"));
+        let opts = || Options {
+            seal_bytes: 32 << 10,
+            partition_bytes: Some(32 << 10),
+            l0_trigger: 2,
+            merge_parallel: par,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts()).unwrap();
+        let key = |k: u32| format!("key-{k:05}").into_bytes();
+        let mut keys: Vec<Vec<u8>> = (0..3000).map(key).collect();
+        for k in &keys {
+            db.append(k, b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        let fences = partition_fences(&d);
+        assert!(fences.len() >= 3, "partitions: {fences:?}");
+        let (merges0, plans0) = (db.seal_waits().merges, db.seal_waits().plans);
+        let beside0 = db.seal_waits().merges_beside;
+        let in_range = |r: usize, round: u32, i: u32| -> Vec<u8> {
+            let (lo, hi) = &fences[r];
+            let k = [lo.as_slice(), format!("-{round}{i:03}").as_bytes()].concat();
+            if let Some(h) = hi {
+                assert!(k.as_slice() < h.as_slice(), "{k:?} below {h:?}");
+            }
+            k
+        };
+        // Range 1 twice, which starts the first merge, held; range 2 twice,
+        // due beside it; range 1 twice more, due again under the first.
+        db.hold_merge_landing(true);
+        let rounds = [1usize, 1, 2, 2, 1, 1];
+        for (round, &r) in rounds.iter().enumerate() {
+            for i in 0..200u32 {
+                let k = in_range(r, round as u32, i);
+                db.append(&k, b"n");
+                keys.push(k);
+            }
+            db.commit().unwrap();
+            db.seal().unwrap();
+        }
+        let t = std::time::Instant::now();
+        while db.seal_waits().plans < plans0 + rounds.len() as u64 {
+            assert!(
+                t.elapsed().as_secs() < 30,
+                "par {par}: the seals' landings never planned"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let want = par.min(2);
+        assert_eq!(
+            db.merges_in_flight(),
+            want,
+            "par {par}: merges in flight while held"
+        );
+        assert_eq!(
+            db.seal_waits().merges,
+            merges0,
+            "par {par}: nothing landed while held"
+        );
+        assert_eq!(
+            db.seal_waits().merges_beside - beside0,
+            want as u64 - 1,
+            "par {par}: merges started beside another"
+        );
+        db.hold_merge_landing(false);
+        db.settle().unwrap();
+        assert_eq!(db.merges_in_flight(), 0, "par {par}: settled");
+        assert_eq!(
+            db.seal_waits().merges - merges0,
+            want as u64,
+            "par {par}: the merges in flight landed"
+        );
+        db.flush().unwrap();
+        db.settle().unwrap();
+        let after = partition_fences(&d);
+        for w in after.windows(2) {
+            assert_eq!(
+                w[0].1.as_ref(),
+                Some(&w[1].0),
+                "par {par}: the partitions tile: {after:?}"
+            );
+        }
+        hold_to(&db, &keys);
+        drop(db);
+        let db = Db::open(&d, opts()).unwrap();
+        hold_to(&db, &keys);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

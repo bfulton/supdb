@@ -558,6 +558,10 @@ pub struct Supdb {
     /// (`Options::merge_bytes_cap` at zero). `supdb-ingestmergeuncapped`,
     /// and `supdb-mergeuncapped` durable.
     mergeuncapped: bool,
+    /// Two partition merges in flight at once over disjoint ranges, where
+    /// the default runs one (`Options::merge_parallel` at two).
+    /// `supdb-ingestmergepar2`, and `supdb-mergepar2` durable.
+    mergepar2: bool,
     /// The block cache reads a block boundary's key off the ordered index's
     /// top level in memory, where the default reads the partition's record
     /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
@@ -1340,6 +1344,10 @@ struct Policy {
     /// (`Options::merge_bytes_cap` at zero). `supdb-ingestmergeuncapped`,
     /// and `supdb-mergeuncapped` durable.
     mergeuncapped: bool,
+    /// Two partition merges in flight at once over disjoint ranges, where
+    /// the default runs one (`Options::merge_parallel` at two).
+    /// `supdb-ingestmergepar2`, and `supdb-mergepar2` durable.
+    mergepar2: bool,
     /// The block cache reads a block boundary's key off the ordered index's
     /// top level in memory, where the default reads the partition's record
     /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
@@ -1908,6 +1916,7 @@ impl Default for Policy {
             noheadwillneed: false,
             nomergechain: false,
             mergeuncapped: false,
+            mergepar2: false,
             boundarytop: false,
             nodirwillneed: false,
             noboundsheadwillneed: false,
@@ -3717,6 +3726,46 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 mergeuncapped: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with two partition merges in flight at once over disjoint
+    /// ranges (`Options::merge_parallel` at two): against `supdb` under a
+    /// bound it prices a burst's merge debt drained two merges at a time.
+    pub fn create_mergepar2(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                mergepar2: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-nozpages` with two merges in flight, as `supdb-mergepar2`:
+    /// the pair with `supdb-nozpages` prices the merges with no controller
+    /// in either arm, whose buy moves a lag pass by more than the merges do.
+    pub fn create_nozpages_mergepar2(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zpages_off: true,
+                mergepar2: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` with two merges in flight, as `supdb-mergepar2`.
+    pub fn create_ingest_mergepar2(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                mergepar2: true,
                 ..Policy::default()
             },
         )
@@ -6263,6 +6312,7 @@ impl Supdb {
             noheadwillneed,
             nomergechain,
             mergeuncapped,
+            mergepar2,
             boundarytop,
             nodirwillneed,
             noboundsheadwillneed,
@@ -6564,6 +6614,11 @@ impl Supdb {
             } else {
                 supdb::Options::default().merge_bytes_cap
             },
+            merge_parallel: if mergepar2 {
+                2
+            } else {
+                supdb::Options::default().merge_parallel
+            },
             boundary_keys_from_top: boundarytop,
             pieces_dir_willneed: !nodirwillneed,
             bounds_heads_willneed: !noboundsheadwillneed,
@@ -6838,6 +6893,7 @@ impl Supdb {
             noheadwillneed,
             nomergechain,
             mergeuncapped,
+            mergepar2,
             boundarytop,
             nodirwillneed,
             noboundsheadwillneed,
@@ -7583,6 +7639,15 @@ impl Engine for Supdb {
                 "supdb-ingestmergeuncapped"
             };
         }
+        if self.mergepar2 {
+            return if self.zpages_off {
+                "supdb-nozpagesmergepar2"
+            } else if self.partition {
+                "supdb-mergepar2"
+            } else {
+                "supdb-ingestmergepar2"
+            };
+        }
         if self.boundarytop {
             return if self.partition {
                 "supdb-boundarytop"
@@ -8072,6 +8137,7 @@ impl Engine for Supdb {
             ("unsealed_keys", db.unsealed_keys() as f64),
             ("merges_landed", db.seal_waits().merges as f64),
             ("merge_plans", db.seal_waits().plans as f64),
+            ("merges_beside", db.seal_waits().merges_beside as f64),
             ("pieces_aligned", db.pieces_aligned() as u8 as f64),
             // What the forms' upkeep did: see `Db::forms_events`.
             ("blk_by_upkeep", ev[0] as f64),
@@ -9058,6 +9124,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-noheadwillneed"
         | "supdb-nomergechain"
         | "supdb-mergeuncapped"
+        | "supdb-mergepar2"
+        | "supdb-nozpagesmergepar2"
         | "supdb-boundarytop"
         | "supdb-nodirwillneed"
         | "supdb-noboundsheadwillneed"
@@ -9173,6 +9241,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestnoheadwillneed"
         | "supdb-ingestnomergechain"
         | "supdb-ingestmergeuncapped"
+        | "supdb-ingestmergepar2"
         | "supdb-ingestboundarytop"
         | "supdb-ingestnodirwillneed"
         | "supdb-ingestnoboundsheadwillneed"
@@ -9221,519 +9290,631 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
 
 /// Open an arm on a fresh directory. `map_gb` sizes LMDB's map; the other
 /// engines grow on their own.
+/// A supdb arm opened by its constructor, outside `open`: a `Supdb` is a
+/// few kilobytes, and the match built every arm's in a slot of its own in
+/// `open`'s frame, two megabytes at three hundred arms -- the default
+/// stack of a test's thread, which the first arm past it overflowed.
+#[inline(never)]
+fn supdb_arm(make: fn(&Path) -> Res<Supdb>, dir: &Path) -> Res<Box<dyn Engine>> {
+    Ok(Box::new(make(dir)?))
+}
+
 pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
     Ok(match arm {
-        "supdb" => Box::new(Supdb::create(dir)?),
-        "supdb-forms" => Box::new(Supdb::create_forms(dir)?),
-        "supdb-settle" => Box::new(Supdb::create_settle(dir)?),
-        "supdb-nosettle" => Box::new(Supdb::create_nosettle(dir)?),
-        "supdb-eager" => Box::new(Supdb::create_eager(dir)?),
-        "supdb-recency" => Box::new(Supdb::create_recency(dir)?),
-        "supdb-nocarry" => Box::new(Supdb::create_nocarry(dir)?),
-        "supdb-rebuild" => Box::new(Supdb::create_rebuild(dir)?),
-        "supdb-ingestrebuild" => Box::new(Supdb::create_ingest_rebuild(dir)?),
-        "supdb-snapcarry" => Box::new(Supdb::create_snapcarry(dir)?),
-        "supdb-lazysnap" => Box::new(Supdb::create_lazysnap(dir)?),
-        "supdb-fullrec" => Box::new(Supdb::create_fullrec(dir)?),
-        "supdb-norebase" => Box::new(Supdb::create_norebase(dir)?),
-        "supdb-sealfile" => Box::new(Supdb::create_sealfile(dir)?),
-        "supdb-settleall" => Box::new(Supdb::create_settleall(dir)?),
-        "supdb-inline" => Box::new(Supdb::create_inline(dir)?),
-        "supdb-hold" => Box::new(Supdb::create_hold(dir)?),
-        "supdb-ingesthold" => Box::new(Supdb::create_ingest_hold(dir)?),
-        "supdb-tier" => Box::new(Supdb::create_tier(dir)?),
-        "supdb-runs" => Box::new(Supdb::create_runs(dir)?),
-        "supdb-keeper" => Box::new(Supdb::create_keeper(dir)?),
-        "supdb-aheadpub" => Box::new(Supdb::create_aheadpub(dir)?),
-        "supdb-pubalways" => Box::new(Supdb::create_pubalways(dir)?),
-        "supdb-lazyforms" => Box::new(Supdb::create_lazyforms(dir)?),
-        "supdb-ahead" => Box::new(Supdb::create_ahead(dir)?),
-        "supdb-noahead" => Box::new(Supdb::create_noahead(dir)?),
-        "supdb-noseal" => Box::new(Supdb::create_noseal(dir)?),
-        "supdb-regime" => Box::new(Supdb::create_regime(dir)?),
-        "supdb-wforms" => Box::new(Supdb::create_wforms(dir)?),
-        "supdb-nosnap" => Box::new(Supdb::create_nosnap(dir)?),
-        "supdb-noadvice" => Box::new(Supdb::create_noadvice(dir)?),
-        "supdb-advicerandom" => Box::new(Supdb::create_advicerandom(dir)?),
-        "supdb-nocache" => Box::new(Supdb::create_nocache(dir)?),
-        "supdb-nocacheordread" => Box::new(Supdb::create_nocache_ordread(dir)?),
-        "supdb-nocachezpages" => Box::new(Supdb::create_nocache_zpages(dir)?),
-        "supdb-nocachezpagesnodrop" => Box::new(Supdb::create_nocache_zpages_nodrop(dir)?),
-        "supdb-nocachezpagesnowarm" => Box::new(Supdb::create_nocache_zpages_nowarm(dir)?),
-        "supdb-nocachezpagesnomemo" => Box::new(Supdb::create_nocache_zpages_nomemo(dir)?),
+        "supdb" => supdb_arm(Supdb::create, dir)?,
+        "supdb-forms" => supdb_arm(Supdb::create_forms, dir)?,
+        "supdb-settle" => supdb_arm(Supdb::create_settle, dir)?,
+        "supdb-nosettle" => supdb_arm(Supdb::create_nosettle, dir)?,
+        "supdb-eager" => supdb_arm(Supdb::create_eager, dir)?,
+        "supdb-recency" => supdb_arm(Supdb::create_recency, dir)?,
+        "supdb-nocarry" => supdb_arm(Supdb::create_nocarry, dir)?,
+        "supdb-rebuild" => supdb_arm(Supdb::create_rebuild, dir)?,
+        "supdb-ingestrebuild" => supdb_arm(Supdb::create_ingest_rebuild, dir)?,
+        "supdb-snapcarry" => supdb_arm(Supdb::create_snapcarry, dir)?,
+        "supdb-lazysnap" => supdb_arm(Supdb::create_lazysnap, dir)?,
+        "supdb-fullrec" => supdb_arm(Supdb::create_fullrec, dir)?,
+        "supdb-norebase" => supdb_arm(Supdb::create_norebase, dir)?,
+        "supdb-sealfile" => supdb_arm(Supdb::create_sealfile, dir)?,
+        "supdb-settleall" => supdb_arm(Supdb::create_settleall, dir)?,
+        "supdb-inline" => supdb_arm(Supdb::create_inline, dir)?,
+        "supdb-hold" => supdb_arm(Supdb::create_hold, dir)?,
+        "supdb-ingesthold" => supdb_arm(Supdb::create_ingest_hold, dir)?,
+        "supdb-tier" => supdb_arm(Supdb::create_tier, dir)?,
+        "supdb-runs" => supdb_arm(Supdb::create_runs, dir)?,
+        "supdb-keeper" => supdb_arm(Supdb::create_keeper, dir)?,
+        "supdb-aheadpub" => supdb_arm(Supdb::create_aheadpub, dir)?,
+        "supdb-pubalways" => supdb_arm(Supdb::create_pubalways, dir)?,
+        "supdb-lazyforms" => supdb_arm(Supdb::create_lazyforms, dir)?,
+        "supdb-ahead" => supdb_arm(Supdb::create_ahead, dir)?,
+        "supdb-noahead" => supdb_arm(Supdb::create_noahead, dir)?,
+        "supdb-noseal" => supdb_arm(Supdb::create_noseal, dir)?,
+        "supdb-regime" => supdb_arm(Supdb::create_regime, dir)?,
+        "supdb-wforms" => supdb_arm(Supdb::create_wforms, dir)?,
+        "supdb-nosnap" => supdb_arm(Supdb::create_nosnap, dir)?,
+        "supdb-noadvice" => supdb_arm(Supdb::create_noadvice, dir)?,
+        "supdb-advicerandom" => supdb_arm(Supdb::create_advicerandom, dir)?,
+        "supdb-nocache" => supdb_arm(Supdb::create_nocache, dir)?,
+        "supdb-nocacheordread" => supdb_arm(Supdb::create_nocache_ordread, dir)?,
+        "supdb-nocachezpages" => supdb_arm(Supdb::create_nocache_zpages, dir)?,
+        "supdb-nocachezpagesnodrop" => supdb_arm(Supdb::create_nocache_zpages_nodrop, dir)?,
+        "supdb-nocachezpagesnowarm" => supdb_arm(Supdb::create_nocache_zpages_nowarm, dir)?,
+        "supdb-nocachezpagesnomemo" => supdb_arm(Supdb::create_nocache_zpages_nomemo, dir)?,
         "supdb-nocachezpagescheckedviews" => {
-            Box::new(Supdb::create_nocache_zpages_checkedviews(dir)?)
+            supdb_arm(Supdb::create_nocache_zpages_checkedviews, dir)?
         }
-        "supdb-nocachezpagesrecord" => Box::new(Supdb::create_nocache_zpages_record(dir)?),
-        "supdb-nocachezpagesstored" => Box::new(Supdb::create_nocache_zpages_stored(dir)?),
-        "supdb-nocachezpagesrecordraw" => Box::new(Supdb::create_nocache_zpages_record_raw(dir)?),
+        "supdb-nocachezpagesrecord" => supdb_arm(Supdb::create_nocache_zpages_record, dir)?,
+        "supdb-nocachezpagesstored" => supdb_arm(Supdb::create_nocache_zpages_stored, dir)?,
+        "supdb-nocachezpagesrecordraw" => supdb_arm(Supdb::create_nocache_zpages_record_raw, dir)?,
         "supdb-cache64tofitzpagesrecordraw" => {
-            Box::new(Supdb::create_cache64_tofit_zpages_record_raw(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_zpages_record_raw, dir)?
         }
         "supdb-cache64tofitzpagesrecordrawlean" => {
-            Box::new(Supdb::create_cache64_tofit_zpages_record_raw_lean(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_zpages_record_raw_lean, dir)?
         }
-        "supdb-cache64tofitzpagesrecordrawleantrim" => Box::new(
-            Supdb::create_cache64_tofit_zpages_record_raw_lean_trim(dir)?,
-        ),
-        "supdb-cache64tofitzpagesrecordrawleanresident" => Box::new(
-            Supdb::create_cache64_tofit_zpages_record_raw_lean_resident(dir)?,
-        ),
-        "supdb-cache64tofitzpageshot4" => Box::new(Supdb::create_cache64_tofit_zpages_hot4(dir)?),
-        "supdb-cache64tofitzpageshot1" => Box::new(Supdb::create_cache64_tofit_zpages_hot1(dir)?),
-        "supdb-cache64tofitzpagesdrop" => Box::new(Supdb::create_cache64_tofit_zpages_drop(dir)?),
+        "supdb-cache64tofitzpagesrecordrawleantrim" => {
+            supdb_arm(Supdb::create_cache64_tofit_zpages_record_raw_lean_trim, dir)?
+        }
+        "supdb-cache64tofitzpagesrecordrawleanresident" => supdb_arm(
+            Supdb::create_cache64_tofit_zpages_record_raw_lean_resident,
+            dir,
+        )?,
+        "supdb-cache64tofitzpageshot4" => supdb_arm(Supdb::create_cache64_tofit_zpages_hot4, dir)?,
+        "supdb-cache64tofitzpageshot1" => supdb_arm(Supdb::create_cache64_tofit_zpages_hot1, dir)?,
+        "supdb-cache64tofitzpagesdrop" => supdb_arm(Supdb::create_cache64_tofit_zpages_drop, dir)?,
         "supdb-cache64tofitzpagesdropparse" => {
-            Box::new(Supdb::create_cache64_tofit_zpages_drop_parse(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_zpages_drop_parse, dir)?
         }
         "supdb-cache64tofitzpagesdropflexdec" => {
-            Box::new(Supdb::create_cache64_tofit_zpages_drop_flexdec(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_zpages_drop_flexdec, dir)?
         }
         "supdb-cache64tofitzpageshot4drop" => {
-            Box::new(Supdb::create_cache64_tofit_zpages_hot4_drop(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_zpages_hot4_drop, dir)?
         }
         "supdb-cache64tofitzpageshot8drop" => {
-            Box::new(Supdb::create_cache64_tofit_zpages_hot8_drop(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_zpages_hot8_drop, dir)?
         }
-        "supdb-cache64tofitzpageshot8dropsettleevery" => Box::new(
-            Supdb::create_cache64_tofit_zpages_hot8_drop_settle_every(dir)?,
-        ),
-        "supdb-cache64tofitzpageshot8dropsettlebuilds" => Box::new(
-            Supdb::create_cache64_tofit_zpages_hot8_drop_settle_builds(dir)?,
-        ),
+        "supdb-cache64tofitzpageshot8dropsettleevery" => supdb_arm(
+            Supdb::create_cache64_tofit_zpages_hot8_drop_settle_every,
+            dir,
+        )?,
+        "supdb-cache64tofitzpageshot8dropsettlebuilds" => supdb_arm(
+            Supdb::create_cache64_tofit_zpages_hot8_drop_settle_builds,
+            dir,
+        )?,
         "supdb-cache64tofitzpagesrecodedrop" => {
-            Box::new(Supdb::create_cache64_tofit_zpages_recode_drop(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_zpages_recode_drop, dir)?
         }
         "supdb-cache64tofitzpagesrecodekeepdrop" => {
-            Box::new(Supdb::create_cache64_tofit_zpages_recode_keep_drop(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_zpages_recode_keep_drop, dir)?
         }
         "supdb-cache64tofitzpagesrecordrawdrop" => {
-            Box::new(Supdb::create_cache64_tofit_zpages_record_raw_drop(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_zpages_record_raw_drop, dir)?
         }
         "supdb-cache64tofitzpagesrecordrawdecode" => {
-            Box::new(Supdb::create_cache64_tofit_zpages_record_raw_decode(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_zpages_record_raw_decode, dir)?
         }
-        "supdb-cache64tofitzpages" => Box::new(Supdb::create_cache64_tofit_zpages(dir)?),
+        "supdb-cache64tofitzpages" => supdb_arm(Supdb::create_cache64_tofit_zpages, dir)?,
         "supdb-cache64tofitzpagesstored" => {
-            Box::new(Supdb::create_cache64_tofit_zpages_stored(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_zpages_stored, dir)?
         }
-        "supdb-nocachezpagesheads" => Box::new(Supdb::create_nocache_zpages_heads(dir)?),
-        "supdb-nocachezpagesprefetch" => Box::new(Supdb::create_nocache_zpages_prefetch(dir)?),
-        "supdb-nocachezpagesrankwalk" => Box::new(Supdb::create_nocache_zpages_rankwalk(dir)?),
-        "supdb-nocachezpagesonegroup" => Box::new(Supdb::create_nocache_zpages_onegroup(dir)?),
-        "supdb-nocachezpagessettle" => Box::new(Supdb::create_nocache_zpages_settle(dir)?),
-        "supdb-autozpages" => Box::new(Supdb::create_auto_zpages(dir)?),
-        "supdb-nozpages" => Box::new(Supdb::create_nozpages(dir)?),
-        "supdb-cache64tofit" => Box::new(Supdb::create_cache64_tofit(dir)?),
-        "supdb-cache64tofitautozpages" => Box::new(Supdb::create_cache64_tofit_auto_zpages(dir)?),
-        "supdb-cache128tofitautozpages" => Box::new(Supdb::create_cache128_tofit_auto_zpages(dir)?),
-        "supdb-cache256tofitautozpages" => Box::new(Supdb::create_cache256_tofit_auto_zpages(dir)?),
+        "supdb-nocachezpagesheads" => supdb_arm(Supdb::create_nocache_zpages_heads, dir)?,
+        "supdb-nocachezpagesprefetch" => supdb_arm(Supdb::create_nocache_zpages_prefetch, dir)?,
+        "supdb-nocachezpagesrankwalk" => supdb_arm(Supdb::create_nocache_zpages_rankwalk, dir)?,
+        "supdb-nocachezpagesonegroup" => supdb_arm(Supdb::create_nocache_zpages_onegroup, dir)?,
+        "supdb-nocachezpagessettle" => supdb_arm(Supdb::create_nocache_zpages_settle, dir)?,
+        "supdb-autozpages" => supdb_arm(Supdb::create_auto_zpages, dir)?,
+        "supdb-nozpages" => supdb_arm(Supdb::create_nozpages, dir)?,
+        "supdb-cache64tofit" => supdb_arm(Supdb::create_cache64_tofit, dir)?,
+        "supdb-cache64tofitautozpages" => supdb_arm(Supdb::create_cache64_tofit_auto_zpages, dir)?,
+        "supdb-cache128tofitautozpages" => {
+            supdb_arm(Supdb::create_cache128_tofit_auto_zpages, dir)?
+        }
+        "supdb-cache256tofitautozpages" => {
+            supdb_arm(Supdb::create_cache256_tofit_auto_zpages, dir)?
+        }
         "supdb-cache64tofitautozpagesraw" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_raw(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_raw, dir)?
         }
         "supdb-cache64tofitautozpagessettlebuilds" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_settlebuilds(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_settlebuilds, dir)?
         }
         "supdb-cache64tofitzpagesbothdrop" => {
-            Box::new(Supdb::create_cache64_tofit_zpages_both_drop(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_zpages_both_drop, dir)?
         }
         "supdb-cache64tofitautozpagescodingfixed" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_codingfixed(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_codingfixed, dir)?
         }
         "supdb-cache64tofitautozpagesparse" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_parse(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_parse, dir)?
         }
         "supdb-cache64tofitautozpagesflexdec" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_flexdec(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_flexdec, dir)?
         }
         "supdb-cache64tofitautozpagesdrop" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_drop(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_drop, dir)?
         }
         "supdb-cache64tofitautozpagesdropattach" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_attach(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_drop_attach, dir)?
         }
-        "supdb-cache64tofitautozpagesdropland25" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land(dir, 25)?)
-        }
-        "supdb-cache64tofitautozpagesdropland50" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land(dir, 50)?)
-        }
-        "supdb-cache64tofitautozpagesdropland75" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land(dir, 75)?)
-        }
-        "supdb-cache64tofitautozpagesdropland100" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land(dir, 100)?)
-        }
-        "supdb-cache64tofitautozpagesdropland50attachwarm" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land50_attach_warm(dir)?)
-        }
-        "supdb-cache64tofitautozpagesdropland50noattacheager" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land50_no_attach_eager(dir)?)
-        }
-        "supdb-cache64tofitautozpagesdropland50keepbehind" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land50_keep_behind(dir)?)
-        }
-        "supdb-cache64tofitautozpagesdropland50nobuildsync" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land50_no_build_sync(dir)?)
-        }
-        "supdb-cache64tofitautozpagesdropland50coldskip" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_land50_cold_skip(dir)?)
-        }
-        "supdb-cache64tofitautozpagesdropsampleidle" => Box::new(
-            Supdb::create_cache64_tofit_auto_zpages_drop_sample_idle(dir)?,
-        ),
-        "supdb-cache64tofitautozpagesdropnowritercensus" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_drop_no_writer_census(dir)?)
-        }
+        "supdb-cache64tofitautozpagesdropland25" => supdb_arm(
+            |d| Supdb::create_cache64_tofit_auto_zpages_drop_land(d, 25),
+            dir,
+        )?,
+        "supdb-cache64tofitautozpagesdropland50" => supdb_arm(
+            |d| Supdb::create_cache64_tofit_auto_zpages_drop_land(d, 50),
+            dir,
+        )?,
+        "supdb-cache64tofitautozpagesdropland75" => supdb_arm(
+            |d| Supdb::create_cache64_tofit_auto_zpages_drop_land(d, 75),
+            dir,
+        )?,
+        "supdb-cache64tofitautozpagesdropland100" => supdb_arm(
+            |d| Supdb::create_cache64_tofit_auto_zpages_drop_land(d, 100),
+            dir,
+        )?,
+        "supdb-cache64tofitautozpagesdropland50attachwarm" => supdb_arm(
+            Supdb::create_cache64_tofit_auto_zpages_drop_land50_attach_warm,
+            dir,
+        )?,
+        "supdb-cache64tofitautozpagesdropland50noattacheager" => supdb_arm(
+            Supdb::create_cache64_tofit_auto_zpages_drop_land50_no_attach_eager,
+            dir,
+        )?,
+        "supdb-cache64tofitautozpagesdropland50keepbehind" => supdb_arm(
+            Supdb::create_cache64_tofit_auto_zpages_drop_land50_keep_behind,
+            dir,
+        )?,
+        "supdb-cache64tofitautozpagesdropland50nobuildsync" => supdb_arm(
+            Supdb::create_cache64_tofit_auto_zpages_drop_land50_no_build_sync,
+            dir,
+        )?,
+        "supdb-cache64tofitautozpagesdropland50coldskip" => supdb_arm(
+            Supdb::create_cache64_tofit_auto_zpages_drop_land50_cold_skip,
+            dir,
+        )?,
+        "supdb-cache64tofitautozpagesdropsampleidle" => supdb_arm(
+            Supdb::create_cache64_tofit_auto_zpages_drop_sample_idle,
+            dir,
+        )?,
+        "supdb-cache64tofitautozpagesdropnowritercensus" => supdb_arm(
+            Supdb::create_cache64_tofit_auto_zpages_drop_no_writer_census,
+            dir,
+        )?,
         "supdb-cache64tofitautozpagespromote" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_promote(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_promote, dir)?
         }
         "supdb-cache64tofitautozpagesonegroup" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_onegroup(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_onegroup, dir)?
         }
         "supdb-cache64tofitautozpagesgroup1k" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_group1k(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_group1k, dir)?
         }
         "supdb-cache64tofitautozpagesprebuild" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_prebuild(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_prebuild, dir)?
         }
         "supdb-cache64tofitautozpagesspan" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_span(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_span, dir)?
         }
         "supdb-cache64tofitautozpagesmemolinear" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_memolinear(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_memolinear, dir)?
         }
         "supdb-cache64tofitautozpagesexactcut" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_exactcut(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_exactcut, dir)?
         }
         "supdb-cache64tofitautozpagescheckedviews" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_checkedviews(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_checkedviews, dir)?
         }
         "supdb-cache64tofitautozpagesrecord" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_record(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_record, dir)?
         }
         "supdb-cache64tofitautozpagesmemofirst" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_memofirst(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_memofirst, dir)?
         }
         "supdb-cache64tofitautozpagesfencetree" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_fencetree(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_fencetree, dir)?
         }
         "supdb-cache64tofitautozpagesmemonoahead" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_memonoahead(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_memonoahead, dir)?
         }
         "supdb-cache64tofitautozpagesstartcache" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_startcache(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_startcache, dir)?
         }
         "supdb-cache64tofitautozpagesperrun" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_perrun(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_perrun, dir)?
         }
         "supdb-cache64tofitautozpagesmemo4" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_memo4(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_memo4, dir)?
         }
         "supdb-cache64tofitautozpagesmemo16" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_memo16(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_memo16, dir)?
         }
         "supdb-cache64tofitautozpagesmemo32" => {
-            Box::new(Supdb::create_cache64_tofit_auto_zpages_memo32(dir)?)
+            supdb_arm(Supdb::create_cache64_tofit_auto_zpages_memo32, dir)?
         }
-        "supdb-nocacheautozpages" => Box::new(Supdb::create_nocache_auto_zpages(dir)?),
-        "supdb-nocacheautozpagesfairio" => Box::new(Supdb::create_nocache_auto_zpages_fairio(dir)?),
+        "supdb-nocacheautozpages" => supdb_arm(Supdb::create_nocache_auto_zpages, dir)?,
+        "supdb-nocacheautozpagesfairio" => {
+            supdb_arm(Supdb::create_nocache_auto_zpages_fairio, dir)?
+        }
         "supdb-nocacheautozpagesnoahead" => {
-            Box::new(Supdb::create_nocache_auto_zpages_noahead(dir)?)
+            supdb_arm(Supdb::create_nocache_auto_zpages_noahead, dir)?
         }
-        "supdb-nocacheautozpageseager" => Box::new(Supdb::create_nocache_auto_zpages_eager(dir)?),
-        "supdb-cache256" => Box::new(Supdb::create_cache256(dir)?),
-        "supdb-ingest" => Box::new(Supdb::create_ingest(dir)?),
-        "supdb-ingestleave" => Box::new(Supdb::create_ingest_leave(dir)?),
-        "supdb-l0" => Box::new(Supdb::create_l0(dir)?),
-        "supdb-nopin" => Box::new(Supdb::create_nopin(dir)?),
-        "supdb-asympin" => Box::new(Supdb::create_asympin(dir)?),
-        "supdb-extsval" => Box::new(Supdb::create_extsval(dir)?),
-        "supdb-piecesonly" => Box::new(Supdb::create_piecesonly(dir)?),
-        "supdb-ingestpiecesonly" => Box::new(Supdb::create_ingest_piecesonly(dir)?),
-        "supdb-latewb" => Box::new(Supdb::create_latewb(dir)?),
-        "supdb-copysearch" => Box::new(Supdb::create_copysearch(dir)?),
-        "supdb-convertsources" => Box::new(Supdb::create_convertsources(dir)?),
-        "supdb-copyslack" => Box::new(Supdb::create_copyslack(dir)?),
-        "supdb-manifestfree" => Box::new(Supdb::create_manifestfree(dir)?),
-        "supdb-oidxsync" => Box::new(Supdb::create_oidxsync(dir)?),
-        "supdb-refvals" => Box::new(Supdb::create_refvals(dir)?),
-        "supdb-rowatclose" => Box::new(Supdb::create_rowatclose(dir)?),
-        "supdb-ingestcopysearch" => Box::new(Supdb::create_ingest_copysearch(dir)?),
-        "supdb-ingestconvertsources" => Box::new(Supdb::create_ingest_convertsources(dir)?),
-        "supdb-ingestcopyslack" => Box::new(Supdb::create_ingest_copyslack(dir)?),
-        "supdb-ingestdrainpromote" => Box::new(Supdb::create_ingest_drainpromote(dir)?),
-        "supdb-ingestmanifestfree" => Box::new(Supdb::create_ingest_manifestfree(dir)?),
-        "supdb-ingestoidxsync" => Box::new(Supdb::create_ingest_oidxsync(dir)?),
-        "supdb-ingestrefvals" => Box::new(Supdb::create_ingest_refvals(dir)?),
-        "supdb-ingestrowatclose" => Box::new(Supdb::create_ingest_rowatclose(dir)?),
-        "supdb-rankrecords" => Box::new(Supdb::create_rankrecords(dir)?),
-        "supdb-ingestrankrecords" => Box::new(Supdb::create_ingest_rankrecords(dir)?),
-        "supdb-ingestlatewb" => Box::new(Supdb::create_ingest_latewb(dir)?),
-        "supdb-inlinemaint" => Box::new(Supdb::create_inlinemaint(dir)?),
-        "supdb-ingestinline" => Box::new(Supdb::create_ingest_inline(dir)?),
-        "supdb-ingestsync" => Box::new(Supdb::create_ingest_sync(dir)?),
-        "supdb-ingestshape" => Box::new(Supdb::create_ingest_shape(dir)?),
-        "supdb-adapt" => Box::new(Supdb::create_adapt(dir)?),
-        "supdb-adapttrig" => Box::new(Supdb::create_adapttrig(dir)?),
-        "supdb-ingestadapt" => Box::new(Supdb::create_ingest_adapt(dir)?),
-        "supdb-ingestadapttrig" => Box::new(Supdb::create_ingest_adapttrig(dir)?),
-        "supdb-adaptloose" => Box::new(Supdb::create_adaptloose(dir)?),
-        "supdb-rotate" => Box::new(Supdb::create_rotate(dir)?),
-        "supdb-nofrozen" => Box::new(Supdb::create_nofrozen(dir)?),
-        "supdb-shaperotate" => Box::new(Supdb::create_shape_rotate(dir)?),
-        "supdb-shapedefer" => Box::new(Supdb::create_shape_defer(dir)?),
-        "supdb-shapefloor" => Box::new(Supdb::create_shape_floor(dir)?),
-        "supdb-shapenofrozen" => Box::new(Supdb::create_shape_nofrozen(dir)?),
-        "supdb-sortover" => Box::new(Supdb::create_sortover(dir)?),
-        "supdb-shapesortover" => Box::new(Supdb::create_shape_sortover(dir)?),
-        "supdb-pmd" => Box::new(Supdb::create_pmd(dir)?),
-        "supdb-ingestpmd" => Box::new(Supdb::create_ingest_pmd(dir)?),
-        "supdb-settlefreeze" => Box::new(Supdb::create_settlefreeze(dir)?),
-        "supdb-convertcap" => Box::new(Supdb::create_convertcap(dir)?),
-        "supdb-shortpass" => Box::new(Supdb::create_shortpass(dir)?),
-        "supdb-noyield" => Box::new(Supdb::create_noyield(dir)?),
-        "supdb-postedyield" => Box::new(Supdb::create_postedyield(dir)?),
-        "supdb-behindyield" => Box::new(Supdb::create_behindyield(dir)?),
-        "supdb-bg" => Box::new(Supdb::create_bg(dir)?),
-        "supdb-ingestbg" => Box::new(Supdb::create_ingest_bg(dir)?),
-        "supdb-bglag" => Box::new(Supdb::create_bglag(dir)?),
-        "supdb-ingestbglag" => Box::new(Supdb::create_ingest_bglag(dir)?),
-        "supdb-lendbursts" => Box::new(Supdb::create_lendbursts(dir)?),
-        "supdb-ingestlendbursts" => Box::new(Supdb::create_ingest_lendbursts(dir)?),
-        "supdb-ingestnopace" => Box::new(Supdb::create_ingest_nopace(dir)?),
-        "supdb-inlineall" => Box::new(Supdb::create_inlineall(dir)?),
-        "supdb-ingestinlineall" => Box::new(Supdb::create_ingest_inlineall(dir)?),
-        "supdb-lazysettle" => Box::new(Supdb::create_lazysettle(dir)?),
-        "supdb-settlebuilds" => Box::new(Supdb::create_settlebuilds(dir)?),
-        "supdb-ingestsettlebuilds" => Box::new(Supdb::create_ingest_settlebuilds(dir)?),
-        "supdb-ingestlazysettle" => Box::new(Supdb::create_ingest_lazysettle(dir)?),
-        "supdb-walsync" => Box::new(Supdb::create_walsync(dir)?),
-        "supdb-ingestwalsync" => Box::new(Supdb::create_ingest_walsync(dir)?),
-        "supdb-nodrainsnap" => Box::new(Supdb::create_nodrainsnap(dir)?),
-        "supdb-ingestnodrainsnap" => Box::new(Supdb::create_ingest_nodrainsnap(dir)?),
-        "supdb-sealcopyfar" => Box::new(Supdb::create_sealcopyfar(dir)?),
-        "supdb-ingestsealcopyfar" => Box::new(Supdb::create_ingest_sealcopyfar(dir)?),
-        "supdb-ranksfar" => Box::new(Supdb::create_ranksfar(dir)?),
-        "supdb-ingestranksfar" => Box::new(Supdb::create_ingest_ranksfar(dir)?),
-        "supdb-rankswhole" => Box::new(Supdb::create_rankswhole(dir)?),
-        "supdb-ingestrankswhole" => Box::new(Supdb::create_ingest_rankswhole(dir)?),
-        "supdb-nowillneed" => Box::new(Supdb::create_nowillneed(dir)?),
-        "supdb-ingestnowillneed" => Box::new(Supdb::create_ingest_nowillneed(dir)?),
-        "supdb-noblockwillneed" => Box::new(Supdb::create_noblockwillneed(dir)?),
-        "supdb-ingestnoblockwillneed" => Box::new(Supdb::create_ingest_noblockwillneed(dir)?),
-        "supdb-mergerecordkeys" => Box::new(Supdb::create_mergerecordkeys(dir)?),
-        "supdb-ingestmergerecordkeys" => Box::new(Supdb::create_ingest_mergerecordkeys(dir)?),
-        "supdb-mergewalkrescan" => Box::new(Supdb::create_mergewalkrescan(dir)?),
-        "supdb-ingestmergewalkrescan" => Box::new(Supdb::create_ingest_mergewalkrescan(dir)?),
-        "supdb-mergenoverify" => Box::new(Supdb::create_mergenoverify(dir)?),
-        "supdb-mmapthr" => Box::new(Supdb::with_policy(
-            dir,
-            Policy {
-                mmapthr: true,
-                ..Policy::default()
+        "supdb-nocacheautozpageseager" => supdb_arm(Supdb::create_nocache_auto_zpages_eager, dir)?,
+        "supdb-cache256" => supdb_arm(Supdb::create_cache256, dir)?,
+        "supdb-ingest" => supdb_arm(Supdb::create_ingest, dir)?,
+        "supdb-ingestleave" => supdb_arm(Supdb::create_ingest_leave, dir)?,
+        "supdb-l0" => supdb_arm(Supdb::create_l0, dir)?,
+        "supdb-nopin" => supdb_arm(Supdb::create_nopin, dir)?,
+        "supdb-asympin" => supdb_arm(Supdb::create_asympin, dir)?,
+        "supdb-extsval" => supdb_arm(Supdb::create_extsval, dir)?,
+        "supdb-piecesonly" => supdb_arm(Supdb::create_piecesonly, dir)?,
+        "supdb-ingestpiecesonly" => supdb_arm(Supdb::create_ingest_piecesonly, dir)?,
+        "supdb-latewb" => supdb_arm(Supdb::create_latewb, dir)?,
+        "supdb-copysearch" => supdb_arm(Supdb::create_copysearch, dir)?,
+        "supdb-convertsources" => supdb_arm(Supdb::create_convertsources, dir)?,
+        "supdb-copyslack" => supdb_arm(Supdb::create_copyslack, dir)?,
+        "supdb-manifestfree" => supdb_arm(Supdb::create_manifestfree, dir)?,
+        "supdb-oidxsync" => supdb_arm(Supdb::create_oidxsync, dir)?,
+        "supdb-refvals" => supdb_arm(Supdb::create_refvals, dir)?,
+        "supdb-rowatclose" => supdb_arm(Supdb::create_rowatclose, dir)?,
+        "supdb-ingestcopysearch" => supdb_arm(Supdb::create_ingest_copysearch, dir)?,
+        "supdb-ingestconvertsources" => supdb_arm(Supdb::create_ingest_convertsources, dir)?,
+        "supdb-ingestcopyslack" => supdb_arm(Supdb::create_ingest_copyslack, dir)?,
+        "supdb-ingestdrainpromote" => supdb_arm(Supdb::create_ingest_drainpromote, dir)?,
+        "supdb-ingestmanifestfree" => supdb_arm(Supdb::create_ingest_manifestfree, dir)?,
+        "supdb-ingestoidxsync" => supdb_arm(Supdb::create_ingest_oidxsync, dir)?,
+        "supdb-ingestrefvals" => supdb_arm(Supdb::create_ingest_refvals, dir)?,
+        "supdb-ingestrowatclose" => supdb_arm(Supdb::create_ingest_rowatclose, dir)?,
+        "supdb-rankrecords" => supdb_arm(Supdb::create_rankrecords, dir)?,
+        "supdb-ingestrankrecords" => supdb_arm(Supdb::create_ingest_rankrecords, dir)?,
+        "supdb-ingestlatewb" => supdb_arm(Supdb::create_ingest_latewb, dir)?,
+        "supdb-inlinemaint" => supdb_arm(Supdb::create_inlinemaint, dir)?,
+        "supdb-ingestinline" => supdb_arm(Supdb::create_ingest_inline, dir)?,
+        "supdb-ingestsync" => supdb_arm(Supdb::create_ingest_sync, dir)?,
+        "supdb-ingestshape" => supdb_arm(Supdb::create_ingest_shape, dir)?,
+        "supdb-adapt" => supdb_arm(Supdb::create_adapt, dir)?,
+        "supdb-adapttrig" => supdb_arm(Supdb::create_adapttrig, dir)?,
+        "supdb-ingestadapt" => supdb_arm(Supdb::create_ingest_adapt, dir)?,
+        "supdb-ingestadapttrig" => supdb_arm(Supdb::create_ingest_adapttrig, dir)?,
+        "supdb-adaptloose" => supdb_arm(Supdb::create_adaptloose, dir)?,
+        "supdb-rotate" => supdb_arm(Supdb::create_rotate, dir)?,
+        "supdb-nofrozen" => supdb_arm(Supdb::create_nofrozen, dir)?,
+        "supdb-shaperotate" => supdb_arm(Supdb::create_shape_rotate, dir)?,
+        "supdb-shapedefer" => supdb_arm(Supdb::create_shape_defer, dir)?,
+        "supdb-shapefloor" => supdb_arm(Supdb::create_shape_floor, dir)?,
+        "supdb-shapenofrozen" => supdb_arm(Supdb::create_shape_nofrozen, dir)?,
+        "supdb-sortover" => supdb_arm(Supdb::create_sortover, dir)?,
+        "supdb-shapesortover" => supdb_arm(Supdb::create_shape_sortover, dir)?,
+        "supdb-pmd" => supdb_arm(Supdb::create_pmd, dir)?,
+        "supdb-ingestpmd" => supdb_arm(Supdb::create_ingest_pmd, dir)?,
+        "supdb-settlefreeze" => supdb_arm(Supdb::create_settlefreeze, dir)?,
+        "supdb-convertcap" => supdb_arm(Supdb::create_convertcap, dir)?,
+        "supdb-shortpass" => supdb_arm(Supdb::create_shortpass, dir)?,
+        "supdb-noyield" => supdb_arm(Supdb::create_noyield, dir)?,
+        "supdb-postedyield" => supdb_arm(Supdb::create_postedyield, dir)?,
+        "supdb-behindyield" => supdb_arm(Supdb::create_behindyield, dir)?,
+        "supdb-bg" => supdb_arm(Supdb::create_bg, dir)?,
+        "supdb-ingestbg" => supdb_arm(Supdb::create_ingest_bg, dir)?,
+        "supdb-bglag" => supdb_arm(Supdb::create_bglag, dir)?,
+        "supdb-ingestbglag" => supdb_arm(Supdb::create_ingest_bglag, dir)?,
+        "supdb-lendbursts" => supdb_arm(Supdb::create_lendbursts, dir)?,
+        "supdb-ingestlendbursts" => supdb_arm(Supdb::create_ingest_lendbursts, dir)?,
+        "supdb-ingestnopace" => supdb_arm(Supdb::create_ingest_nopace, dir)?,
+        "supdb-inlineall" => supdb_arm(Supdb::create_inlineall, dir)?,
+        "supdb-ingestinlineall" => supdb_arm(Supdb::create_ingest_inlineall, dir)?,
+        "supdb-lazysettle" => supdb_arm(Supdb::create_lazysettle, dir)?,
+        "supdb-settlebuilds" => supdb_arm(Supdb::create_settlebuilds, dir)?,
+        "supdb-ingestsettlebuilds" => supdb_arm(Supdb::create_ingest_settlebuilds, dir)?,
+        "supdb-ingestlazysettle" => supdb_arm(Supdb::create_ingest_lazysettle, dir)?,
+        "supdb-walsync" => supdb_arm(Supdb::create_walsync, dir)?,
+        "supdb-ingestwalsync" => supdb_arm(Supdb::create_ingest_walsync, dir)?,
+        "supdb-nodrainsnap" => supdb_arm(Supdb::create_nodrainsnap, dir)?,
+        "supdb-ingestnodrainsnap" => supdb_arm(Supdb::create_ingest_nodrainsnap, dir)?,
+        "supdb-sealcopyfar" => supdb_arm(Supdb::create_sealcopyfar, dir)?,
+        "supdb-ingestsealcopyfar" => supdb_arm(Supdb::create_ingest_sealcopyfar, dir)?,
+        "supdb-ranksfar" => supdb_arm(Supdb::create_ranksfar, dir)?,
+        "supdb-ingestranksfar" => supdb_arm(Supdb::create_ingest_ranksfar, dir)?,
+        "supdb-rankswhole" => supdb_arm(Supdb::create_rankswhole, dir)?,
+        "supdb-ingestrankswhole" => supdb_arm(Supdb::create_ingest_rankswhole, dir)?,
+        "supdb-nowillneed" => supdb_arm(Supdb::create_nowillneed, dir)?,
+        "supdb-ingestnowillneed" => supdb_arm(Supdb::create_ingest_nowillneed, dir)?,
+        "supdb-noblockwillneed" => supdb_arm(Supdb::create_noblockwillneed, dir)?,
+        "supdb-ingestnoblockwillneed" => supdb_arm(Supdb::create_ingest_noblockwillneed, dir)?,
+        "supdb-mergerecordkeys" => supdb_arm(Supdb::create_mergerecordkeys, dir)?,
+        "supdb-ingestmergerecordkeys" => supdb_arm(Supdb::create_ingest_mergerecordkeys, dir)?,
+        "supdb-mergewalkrescan" => supdb_arm(Supdb::create_mergewalkrescan, dir)?,
+        "supdb-ingestmergewalkrescan" => supdb_arm(Supdb::create_ingest_mergewalkrescan, dir)?,
+        "supdb-mergenoverify" => supdb_arm(Supdb::create_mergenoverify, dir)?,
+        "supdb-mmapthr" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        mmapthr: true,
+                        ..Policy::default()
+                    },
+                )
             },
-        )?),
-        "supdb-ingestmmapthr" => Box::new(Supdb::with_policy(
             dir,
-            Policy {
-                partition: false,
-                durable: false,
-                mmapthr: true,
-                ..Policy::default()
+        )?,
+        "supdb-ingestmmapthr" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        mmapthr: true,
+                        ..Policy::default()
+                    },
+                )
             },
-        )?),
-        "supdb-ingestmergenoverify" => Box::new(Supdb::create_ingest_mergenoverify(dir)?),
-        "supdb-mergedropbehind" => Box::new(Supdb::create_mergedropbehind(dir)?),
-        "supdb-ingestmergedropbehind" => Box::new(Supdb::create_ingest_mergedropbehind(dir)?),
-        "supdb-noheadwillneed" => Box::new(Supdb::create_noheadwillneed(dir)?),
-        "supdb-ingestnoheadwillneed" => Box::new(Supdb::create_ingest_noheadwillneed(dir)?),
-        "supdb-nomergechain" => Box::new(Supdb::create_nomergechain(dir)?),
-        "supdb-ingestnomergechain" => Box::new(Supdb::create_ingest_nomergechain(dir)?),
-        "supdb-mergeuncapped" => Box::new(Supdb::create_mergeuncapped(dir)?),
-        "supdb-ingestmergeuncapped" => Box::new(Supdb::create_ingest_mergeuncapped(dir)?),
-        "supdb-boundarytop" => Box::new(Supdb::create_boundarytop(dir)?),
-        "supdb-ingestboundarytop" => Box::new(Supdb::create_ingest_boundarytop(dir)?),
-        "supdb-nodirwillneed" => Box::new(Supdb::with_policy(
             dir,
-            Policy {
-                nodirwillneed: true,
-                ..Policy::default()
+        )?,
+        "supdb-ingestmergenoverify" => supdb_arm(Supdb::create_ingest_mergenoverify, dir)?,
+        "supdb-mergedropbehind" => supdb_arm(Supdb::create_mergedropbehind, dir)?,
+        "supdb-ingestmergedropbehind" => supdb_arm(Supdb::create_ingest_mergedropbehind, dir)?,
+        "supdb-noheadwillneed" => supdb_arm(Supdb::create_noheadwillneed, dir)?,
+        "supdb-ingestnoheadwillneed" => supdb_arm(Supdb::create_ingest_noheadwillneed, dir)?,
+        "supdb-nomergechain" => supdb_arm(Supdb::create_nomergechain, dir)?,
+        "supdb-ingestnomergechain" => supdb_arm(Supdb::create_ingest_nomergechain, dir)?,
+        "supdb-mergeuncapped" => supdb_arm(Supdb::create_mergeuncapped, dir)?,
+        "supdb-ingestmergeuncapped" => supdb_arm(Supdb::create_ingest_mergeuncapped, dir)?,
+        "supdb-mergepar2" => supdb_arm(Supdb::create_mergepar2, dir)?,
+        "supdb-nozpagesmergepar2" => supdb_arm(Supdb::create_nozpages_mergepar2, dir)?,
+        "supdb-ingestmergepar2" => supdb_arm(Supdb::create_ingest_mergepar2, dir)?,
+        "supdb-boundarytop" => supdb_arm(Supdb::create_boundarytop, dir)?,
+        "supdb-ingestboundarytop" => supdb_arm(Supdb::create_ingest_boundarytop, dir)?,
+        "supdb-nodirwillneed" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        nodirwillneed: true,
+                        ..Policy::default()
+                    },
+                )
             },
-        )?),
-        "supdb-ingestnodirwillneed" => Box::new(Supdb::with_policy(
             dir,
-            Policy {
-                partition: false,
-                durable: false,
-                nodirwillneed: true,
-                ..Policy::default()
+        )?,
+        "supdb-ingestnodirwillneed" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        nodirwillneed: true,
+                        ..Policy::default()
+                    },
+                )
             },
-        )?),
-        "supdb-noboundsheadwillneed" => Box::new(Supdb::with_policy(
             dir,
-            Policy {
-                noboundsheadwillneed: true,
-                ..Policy::default()
+        )?,
+        "supdb-noboundsheadwillneed" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        noboundsheadwillneed: true,
+                        ..Policy::default()
+                    },
+                )
             },
-        )?),
-        "supdb-ingestnoboundsheadwillneed" => Box::new(Supdb::with_policy(
             dir,
-            Policy {
-                partition: false,
-                durable: false,
-                noboundsheadwillneed: true,
-                ..Policy::default()
+        )?,
+        "supdb-ingestnoboundsheadwillneed" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        noboundsheadwillneed: true,
+                        ..Policy::default()
+                    },
+                )
             },
-        )?),
-        "supdb-aheadooc" => Box::new(Supdb::with_policy(
             dir,
-            Policy {
-                aheadooc: true,
-                ..Policy::default()
+        )?,
+        "supdb-aheadooc" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        aheadooc: true,
+                        ..Policy::default()
+                    },
+                )
             },
-        )?),
-        "supdb-ingestaheadooc" => Box::new(Supdb::with_policy(
             dir,
-            Policy {
-                partition: false,
-                durable: false,
-                aheadooc: true,
-                ..Policy::default()
+        )?,
+        "supdb-ingestaheadooc" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        aheadooc: true,
+                        ..Policy::default()
+                    },
+                )
             },
-        )?),
-        "supdb-chainwrites" => Box::new(Supdb::with_policy(
             dir,
-            Policy {
-                chainwrites: true,
-                ..Policy::default()
+        )?,
+        "supdb-chainwrites" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        chainwrites: true,
+                        ..Policy::default()
+                    },
+                )
             },
-        )?),
-        "supdb-ingestchainwrites" => Box::new(Supdb::with_policy(
             dir,
-            Policy {
-                partition: false,
-                durable: false,
-                chainwrites: true,
-                ..Policy::default()
+        )?,
+        "supdb-ingestchainwrites" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        chainwrites: true,
+                        ..Policy::default()
+                    },
+                )
             },
-        )?),
-        "supdb-noland" => Box::new(Supdb::with_policy(
             dir,
-            Policy {
-                noland: true,
-                ..Policy::default()
+        )?,
+        "supdb-noland" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        noland: true,
+                        ..Policy::default()
+                    },
+                )
             },
-        )?),
-        "supdb-ingestnoland" => Box::new(Supdb::with_policy(
             dir,
-            Policy {
-                partition: false,
-                durable: false,
-                noland: true,
-                ..Policy::default()
+        )?,
+        "supdb-ingestnoland" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        noland: true,
+                        ..Policy::default()
+                    },
+                )
             },
-        )?),
-        "supdb-landnearscans" => Box::new(Supdb::with_policy(
             dir,
-            Policy {
-                landnearscans: true,
-                ..Policy::default()
+        )?,
+        "supdb-landnearscans" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        landnearscans: true,
+                        ..Policy::default()
+                    },
+                )
             },
-        )?),
-        "supdb-ingestlandnearscans" => Box::new(Supdb::with_policy(
             dir,
-            Policy {
-                partition: false,
-                durable: false,
-                landnearscans: true,
-                ..Policy::default()
+        )?,
+        "supdb-ingestlandnearscans" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        landnearscans: true,
+                        ..Policy::default()
+                    },
+                )
             },
-        )?),
-        "supdb-noidleplan" => Box::new(Supdb::with_policy(
             dir,
-            Policy {
-                noidleplan: true,
-                ..Policy::default()
+        )?,
+        "supdb-noidleplan" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        noidleplan: true,
+                        ..Policy::default()
+                    },
+                )
             },
-        )?),
-        "supdb-ingestnoidleplan" => Box::new(Supdb::with_policy(
             dir,
-            Policy {
-                partition: false,
-                durable: false,
-                noidleplan: true,
-                ..Policy::default()
+        )?,
+        "supdb-ingestnoidleplan" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        noidleplan: true,
+                        ..Policy::default()
+                    },
+                )
             },
-        )?),
-        "supdb-sealrun" => Box::new(Supdb::create_sealrun(dir)?),
-        "supdb-ingestsealrun" => Box::new(Supdb::create_ingest_sealrun(dir)?),
-        "supdb-closeinline" => Box::new(Supdb::create_closeinline(dir)?),
-        "supdb-ingestcloseinline" => Box::new(Supdb::create_ingest_closeinline(dir)?),
-        "supdb-timers" => Box::new(Supdb::create_timers(dir)?),
-        "supdb-ingesttimers" => Box::new(Supdb::create_ingest_timers(dir)?),
-        "supdb-wake" => Box::new(Supdb::create_wake(dir)?),
-        "supdb-ingestwake" => Box::new(Supdb::create_ingest_wake(dir)?),
-        "supdb-noprefetch" => Box::new(Supdb::create_noprefetch(dir)?),
-        "supdb-ingestnoprefetch" => Box::new(Supdb::create_ingest_noprefetch(dir)?),
-        "supdb-dirplain" => Box::new(Supdb::create_dirplain(dir)?),
-        "supdb-ingestdirplain" => Box::new(Supdb::create_ingest_dirplain(dir)?),
-        "supdb-settlefar" => Box::new(Supdb::create_settlefar(dir)?),
-        "supdb-ingestsettlefar" => Box::new(Supdb::create_ingest_settlefar(dir)?),
-        "supdb-tofit" => Box::new(Supdb::create_tofit(dir)?),
-        "supdb-ingesttofit" => Box::new(Supdb::create_ingest_tofit(dir)?),
-        "supdb-cache256tofit" => Box::new(Supdb::create_cache256_tofit(dir)?),
-        "supdb-cache256tofitnotrim" => Box::new(Supdb::create_cache256_tofit_notrim(dir)?),
-        "supdb-cache256tofitnoshed" => Box::new(Supdb::create_cache256_tofit_noshed(dir)?),
-        "supdb-cache256tofitnosweep" => Box::new(Supdb::create_cache256_tofit_nosweep(dir)?),
-        "supdb-prefetch1k" => Box::new(Supdb::create_prefetch1k(dir)?),
-        "supdb-ingestprefetch1k" => Box::new(Supdb::create_ingest_prefetch1k(dir)?),
-        "supdb-manifestrename" => Box::new(Supdb::create_manifestrename(dir)?),
-        "supdb-manifestpending" => Box::new(Supdb::create_manifestpending(dir)?),
-        "supdb-ingestmanifestrename" => Box::new(Supdb::create_ingest_manifestrename(dir)?),
-        "supdb-ingestmanifestpending" => Box::new(Supdb::create_ingest_manifestpending(dir)?),
-        "supdb-populate" => Box::new(Supdb::create_populate(dir)?),
-        "supdb-ingestpopulate" => Box::new(Supdb::create_ingest_populate(dir)?),
-        "supdb-piece256" => Box::new(Supdb::create_piece256(dir)?),
-        "supdb-ingestpiece256" => Box::new(Supdb::create_ingest_piece256(dir)?),
-        "supdb-recordsteps" => Box::new(Supdb::create_recordsteps(dir)?),
-        "supdb-ingestrecordsteps" => Box::new(Supdb::create_ingest_recordsteps(dir)?),
-        "supdb-copyvals" => Box::new(Supdb::create_copyvals(dir)?),
-        "supdb-ingestcopyvals" => Box::new(Supdb::create_ingest_copyvals(dir)?),
-        "supdb-keycopies" => Box::new(Supdb::create_keycopies(dir)?),
-        "supdb-ingestkeycopies" => Box::new(Supdb::create_ingest_keycopies(dir)?),
-        "supdb-fillplain" => Box::new(Supdb::create_fillplain(dir)?),
-        "supdb-ingestfillplain" => Box::new(Supdb::create_ingest_fillplain(dir)?),
-        "supdb-latesync" => Box::new(Supdb::create_latesync(dir)?),
-        "supdb-installreads" => Box::new(Supdb::create_installreads(dir)?),
-        "supdb-noabandon" => Box::new(Supdb::create_noabandon(dir)?),
-        "supdb-deferbursts" => Box::new(Supdb::create_deferbursts(dir)?),
-        "supdb-passyield" => Box::new(Supdb::create_passyield(dir)?),
-        "supdb-cachenoauto" => Box::new(Supdb::create_cachenoauto(dir)?),
-        "supdb-ingestlatesync" => Box::new(Supdb::create_ingest_latesync(dir)?),
-        "supdb-norecycle" => Box::new(Supdb::create_norecycle(dir)?),
-        "supdb-ingestnorecycle" => Box::new(Supdb::create_ingest_norecycle(dir)?),
-        "supdb-heapblocks" => Box::new(Supdb::create_heapblocks(dir)?),
-        "supdb-ingestheapblocks" => Box::new(Supdb::create_ingest_heapblocks(dir)?),
-        "supdb-keysarena" => Box::new(Supdb::create_keysarena(dir)?),
-        "supdb-ingestkeysarena" => Box::new(Supdb::create_ingest_keysarena(dir)?),
-        "supdb-noalert" => Box::new(Supdb::create_noalert(dir)?),
-        "supdb-ingestnoalert" => Box::new(Supdb::create_ingest_noalert(dir)?),
-        "supdb-ordlog" => Box::new(Supdb::create_ordlog(dir)?),
-        "supdb-ingestordlog" => Box::new(Supdb::create_ingest_ordlog(dir)?),
-        "supdb-fatentries" => Box::new(Supdb::create_fatentries(dir)?),
-        "supdb-ingestfatentries" => Box::new(Supdb::create_ingest_fatentries(dir)?),
-        "supdb-waitmanifest" => Box::new(Supdb::create_waitmanifest(dir)?),
-        "supdb-ingestwaitmanifest" => Box::new(Supdb::create_ingest_waitmanifest(dir)?),
-        "supdb-ingestsettlefreeze" => Box::new(Supdb::create_ingest_settlefreeze(dir)?),
-        "supdb-ingestconvertcap" => Box::new(Supdb::create_ingest_convertcap(dir)?),
-        "supdb-ingestshortpass" => Box::new(Supdb::create_ingest_shortpass(dir)?),
-        "supdb-ingestnoyield" => Box::new(Supdb::create_ingest_noyield(dir)?),
-        "supdb-ingestpostedyield" => Box::new(Supdb::create_ingest_postedyield(dir)?),
-        "supdb-ingestbehindyield" => Box::new(Supdb::create_ingest_behindyield(dir)?),
-        "supdb-idle" => Box::new(Supdb::create_idle(dir)?),
-        "supdb-shapeidle" => Box::new(Supdb::create_shape_idle(dir)?),
-        "supdb-ingestadaptloose" => Box::new(Supdb::create_ingest_adaptloose(dir)?),
-        "supdb-ingestnoseal" => Box::new(Supdb::create_ingest_noseal(dir)?),
+            dir,
+        )?,
+        "supdb-sealrun" => supdb_arm(Supdb::create_sealrun, dir)?,
+        "supdb-ingestsealrun" => supdb_arm(Supdb::create_ingest_sealrun, dir)?,
+        "supdb-closeinline" => supdb_arm(Supdb::create_closeinline, dir)?,
+        "supdb-ingestcloseinline" => supdb_arm(Supdb::create_ingest_closeinline, dir)?,
+        "supdb-timers" => supdb_arm(Supdb::create_timers, dir)?,
+        "supdb-ingesttimers" => supdb_arm(Supdb::create_ingest_timers, dir)?,
+        "supdb-wake" => supdb_arm(Supdb::create_wake, dir)?,
+        "supdb-ingestwake" => supdb_arm(Supdb::create_ingest_wake, dir)?,
+        "supdb-noprefetch" => supdb_arm(Supdb::create_noprefetch, dir)?,
+        "supdb-ingestnoprefetch" => supdb_arm(Supdb::create_ingest_noprefetch, dir)?,
+        "supdb-dirplain" => supdb_arm(Supdb::create_dirplain, dir)?,
+        "supdb-ingestdirplain" => supdb_arm(Supdb::create_ingest_dirplain, dir)?,
+        "supdb-settlefar" => supdb_arm(Supdb::create_settlefar, dir)?,
+        "supdb-ingestsettlefar" => supdb_arm(Supdb::create_ingest_settlefar, dir)?,
+        "supdb-tofit" => supdb_arm(Supdb::create_tofit, dir)?,
+        "supdb-ingesttofit" => supdb_arm(Supdb::create_ingest_tofit, dir)?,
+        "supdb-cache256tofit" => supdb_arm(Supdb::create_cache256_tofit, dir)?,
+        "supdb-cache256tofitnotrim" => supdb_arm(Supdb::create_cache256_tofit_notrim, dir)?,
+        "supdb-cache256tofitnoshed" => supdb_arm(Supdb::create_cache256_tofit_noshed, dir)?,
+        "supdb-cache256tofitnosweep" => supdb_arm(Supdb::create_cache256_tofit_nosweep, dir)?,
+        "supdb-prefetch1k" => supdb_arm(Supdb::create_prefetch1k, dir)?,
+        "supdb-ingestprefetch1k" => supdb_arm(Supdb::create_ingest_prefetch1k, dir)?,
+        "supdb-manifestrename" => supdb_arm(Supdb::create_manifestrename, dir)?,
+        "supdb-manifestpending" => supdb_arm(Supdb::create_manifestpending, dir)?,
+        "supdb-ingestmanifestrename" => supdb_arm(Supdb::create_ingest_manifestrename, dir)?,
+        "supdb-ingestmanifestpending" => supdb_arm(Supdb::create_ingest_manifestpending, dir)?,
+        "supdb-populate" => supdb_arm(Supdb::create_populate, dir)?,
+        "supdb-ingestpopulate" => supdb_arm(Supdb::create_ingest_populate, dir)?,
+        "supdb-piece256" => supdb_arm(Supdb::create_piece256, dir)?,
+        "supdb-ingestpiece256" => supdb_arm(Supdb::create_ingest_piece256, dir)?,
+        "supdb-recordsteps" => supdb_arm(Supdb::create_recordsteps, dir)?,
+        "supdb-ingestrecordsteps" => supdb_arm(Supdb::create_ingest_recordsteps, dir)?,
+        "supdb-copyvals" => supdb_arm(Supdb::create_copyvals, dir)?,
+        "supdb-ingestcopyvals" => supdb_arm(Supdb::create_ingest_copyvals, dir)?,
+        "supdb-keycopies" => supdb_arm(Supdb::create_keycopies, dir)?,
+        "supdb-ingestkeycopies" => supdb_arm(Supdb::create_ingest_keycopies, dir)?,
+        "supdb-fillplain" => supdb_arm(Supdb::create_fillplain, dir)?,
+        "supdb-ingestfillplain" => supdb_arm(Supdb::create_ingest_fillplain, dir)?,
+        "supdb-latesync" => supdb_arm(Supdb::create_latesync, dir)?,
+        "supdb-installreads" => supdb_arm(Supdb::create_installreads, dir)?,
+        "supdb-noabandon" => supdb_arm(Supdb::create_noabandon, dir)?,
+        "supdb-deferbursts" => supdb_arm(Supdb::create_deferbursts, dir)?,
+        "supdb-passyield" => supdb_arm(Supdb::create_passyield, dir)?,
+        "supdb-cachenoauto" => supdb_arm(Supdb::create_cachenoauto, dir)?,
+        "supdb-ingestlatesync" => supdb_arm(Supdb::create_ingest_latesync, dir)?,
+        "supdb-norecycle" => supdb_arm(Supdb::create_norecycle, dir)?,
+        "supdb-ingestnorecycle" => supdb_arm(Supdb::create_ingest_norecycle, dir)?,
+        "supdb-heapblocks" => supdb_arm(Supdb::create_heapblocks, dir)?,
+        "supdb-ingestheapblocks" => supdb_arm(Supdb::create_ingest_heapblocks, dir)?,
+        "supdb-keysarena" => supdb_arm(Supdb::create_keysarena, dir)?,
+        "supdb-ingestkeysarena" => supdb_arm(Supdb::create_ingest_keysarena, dir)?,
+        "supdb-noalert" => supdb_arm(Supdb::create_noalert, dir)?,
+        "supdb-ingestnoalert" => supdb_arm(Supdb::create_ingest_noalert, dir)?,
+        "supdb-ordlog" => supdb_arm(Supdb::create_ordlog, dir)?,
+        "supdb-ingestordlog" => supdb_arm(Supdb::create_ingest_ordlog, dir)?,
+        "supdb-fatentries" => supdb_arm(Supdb::create_fatentries, dir)?,
+        "supdb-ingestfatentries" => supdb_arm(Supdb::create_ingest_fatentries, dir)?,
+        "supdb-waitmanifest" => supdb_arm(Supdb::create_waitmanifest, dir)?,
+        "supdb-ingestwaitmanifest" => supdb_arm(Supdb::create_ingest_waitmanifest, dir)?,
+        "supdb-ingestsettlefreeze" => supdb_arm(Supdb::create_ingest_settlefreeze, dir)?,
+        "supdb-ingestconvertcap" => supdb_arm(Supdb::create_ingest_convertcap, dir)?,
+        "supdb-ingestshortpass" => supdb_arm(Supdb::create_ingest_shortpass, dir)?,
+        "supdb-ingestnoyield" => supdb_arm(Supdb::create_ingest_noyield, dir)?,
+        "supdb-ingestpostedyield" => supdb_arm(Supdb::create_ingest_postedyield, dir)?,
+        "supdb-ingestbehindyield" => supdb_arm(Supdb::create_ingest_behindyield, dir)?,
+        "supdb-idle" => supdb_arm(Supdb::create_idle, dir)?,
+        "supdb-shapeidle" => supdb_arm(Supdb::create_shape_idle, dir)?,
+        "supdb-ingestadaptloose" => supdb_arm(Supdb::create_ingest_adaptloose, dir)?,
+        "supdb-ingestnoseal" => supdb_arm(Supdb::create_ingest_noseal, dir)?,
         "lmdb" => Box::new(Lmdb::create(dir, map_gb)?),
         "lmdb-nordahead" => Box::new(Lmdb::create_nordahead(dir, map_gb)?),
         "lmdb-nosync" => Box::new(Lmdb::create_nosync(dir, map_gb)?),
@@ -10960,6 +11141,76 @@ mod tests {
     /// (`Options::zpages_block_cache` off) and nothing else: named, durable
     /// like it, opened under its name by the dispatch, the cache and the
     /// controller as the base has them, and the engine's default on.
+    /// Each arm with two merges in flight is named as itself, opened through
+    /// `open` by that name, and differs from its base in the merges alone:
+    /// the arm without the compact form was named `supdb-mergepar2` by a
+    /// branch that came before the one for the form.
+    #[test]
+    fn the_parallel_merge_arms_differ_from_their_bases_in_the_merges_alone() {
+        let root =
+            std::env::temp_dir().join(format!("supdb-bench-mergepar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        type Make = fn(&Path) -> Res<Supdb>;
+        let pairs: [(&str, &str, Make, Make); 3] = [
+            (
+                "supdb-mergepar2",
+                "supdb",
+                Supdb::create_mergepar2,
+                Supdb::create,
+            ),
+            (
+                "supdb-ingestmergepar2",
+                "supdb-ingest",
+                Supdb::create_ingest_mergepar2,
+                Supdb::create_ingest,
+            ),
+            (
+                "supdb-nozpagesmergepar2",
+                "supdb-nozpages",
+                Supdb::create_nozpages_mergepar2,
+                Supdb::create_nozpages,
+            ),
+        ];
+        for (arm, base, make_arm, make_base) in pairs {
+            let dir = |n: &str| {
+                let d = root.join(n);
+                std::fs::create_dir_all(&d).unwrap();
+                d
+            };
+            let opened = open(arm, &dir(&format!("{arm}-open")), 1).unwrap();
+            assert_eq!(opened.name(), arm);
+            drop(opened);
+            let (a, b) = (make_arm(&dir(arm)).unwrap(), make_base(&dir(base)).unwrap());
+            assert_eq!((a.name(), b.name()), (arm, base));
+            assert_eq!(guarantee(arm), guarantee(base), "{arm}");
+            assert!(!ARMS.contains(&arm) && !OOC_ARMS.contains(&arm), "{arm}");
+            assert_eq!(a.features(), b.features(), "{arm}");
+            let (oa, ob) = (
+                a.db.as_ref().unwrap().options(),
+                b.db.as_ref().unwrap().options(),
+            );
+            assert_eq!((oa.merge_parallel, ob.merge_parallel), (2, 1), "{arm}");
+            assert_eq!(
+                (
+                    oa.zpages,
+                    oa.sync,
+                    oa.partition_on_flush,
+                    oa.merge_bytes_cap,
+                    oa.scan_block_cache
+                ),
+                (
+                    ob.zpages,
+                    ob.sync,
+                    ob.partition_on_flush,
+                    ob.merge_bytes_cap,
+                    ob.scan_block_cache
+                ),
+                "{arm}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn the_raw_cache_arm_differs_from_the_combined_arm_in_the_cache_reads_alone() {
         let root =
