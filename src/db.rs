@@ -716,6 +716,22 @@ pub struct Options {
     /// takes in, held to four. Off, the seal is `seal_bytes` and nothing
     /// else, the shape the suite's arms were measured in before this.
     pub seal_grows: bool,
+    /// EXPERIMENT: with `seal_grows`, the seal holds at `seal_bytes` while
+    /// the compact form's gate is away from the raw form -- the store out
+    /// of core -- and grows with the store only in core. Grown, the
+    /// memtable is the store's bytes over four times `l0_trigger`, 77 MB at
+    /// ten million keys, and under a bound it and the scan snapshot's copy
+    /// of it are anonymous memory beside the form files' page cache, where
+    /// LMDB holds 17 MB; the floor leaves the unsealed writes in pieces on
+    /// disk instead, at the price of more and smaller pieces for the scans
+    /// to fold and the merges to take. Refuted: paired undivided at ten
+    /// million keys under 1.25 GiB, two pairs, the floor held E's
+    /// anonymous memory at 230-249 MB against 381-404 and its major faults
+    /// to 0.6x, and read E at 0.70x, D and F at 0.78x and A, B and C at
+    /// 0.92-0.95x in both pairs, the pieces' folds and merges costing more
+    /// than the memory freed. Off: the seal grows whatever the gate.
+    /// `supdb-sealfloorooc` is the arm.
+    pub seal_floor_out_of_core: bool,
     /// EXPERIMENT: the share of the store's bytes the memtable may reach
     /// before a commit seals, as a cap on `seal_threshold` rather than a
     /// floor under it; zero is no cap.
@@ -3659,6 +3675,7 @@ impl Default for Options {
             lag_relax_pct: 100,
             seal_on_file: false,
             seal_grows: true,
+            seal_floor_out_of_core: false,
             direct_ingest: true,
             segment: SegmentOptions::default(),
             l0_trigger: 4,
@@ -17848,7 +17865,9 @@ impl Reader {
         } else {
             st.data_bytes.saturating_mul(DATA_PER_FILE.1) / DATA_PER_FILE.0
         };
-        let base = if !self.opts.seal_grows {
+        let floored =
+            self.opts.seal_floor_out_of_core && self.shared.zgate.load() != zselect::GATE_RAW;
+        let base = if !self.opts.seal_grows || floored {
             self.opts.seal_bytes
         } else {
             let grown = sized / self.opts.l0_trigger.max(1).saturating_mul(4) as u64;

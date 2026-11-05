@@ -4986,6 +4986,74 @@ fn the_seal_grows_with_the_store() {
     }
 }
 
+/// Out of core the seal holds at its floor (`seal_floor_out_of_core`):
+/// with the compact form's gate away from the raw form, a store whose
+/// threshold grew in core reads the floor, and a commit of twice the
+/// floor seals; back at the raw form the threshold grows again. Without
+/// the option the gate changes nothing.
+#[test]
+fn the_seal_holds_at_its_floor_out_of_core() {
+    for floor_ooc in [true, false] {
+        let d = dir(if floor_ooc {
+            "seal-floor-ooc"
+        } else {
+            "seal-floor-ooc-off"
+        });
+        let opts = Options {
+            seal_bytes: 64 << 10,
+            partition_bytes: Some(256 << 10),
+            seal_grows: true,
+            seal_floor_out_of_core: floor_ooc,
+            // The gate is the test's to set.
+            zpages: supdb::ZPages::Off,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let val = vec![7u8; 200];
+        for k in 0..20_000u32 {
+            db.append(format!("key-{k:06}").as_bytes(), &val);
+            if k % 500 == 499 {
+                db.commit().unwrap();
+            }
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        let floor = 64usize << 10;
+        let grown = db.seal_threshold();
+        assert!(grown > 4 * floor, "the threshold did not grow: {grown}");
+        for gate in [1u8, 2] {
+            db.zgate_set(gate);
+            let t = db.seal_threshold();
+            if floor_ooc {
+                assert_eq!(t, floor, "gate {gate}: the threshold under the bound");
+            } else {
+                assert_eq!(t, grown, "gate {gate}: the gate moved the threshold");
+            }
+        }
+        // Twice the floor, under the grown threshold: out of core it seals.
+        let parts = db.levels().0;
+        for k in 0..600u32 {
+            db.append(format!("late-{k:06}").as_bytes(), &val);
+        }
+        db.commit().unwrap();
+        let sealed = db.in_flight().0 || db.levels().1 > 0 || db.levels().0 > parts;
+        assert_eq!(
+            sealed, floor_ooc,
+            "floor_ooc={floor_ooc}: a commit of twice the floor sealed={sealed}"
+        );
+        // The late keys may have landed as a partition more, so the grown
+        // threshold is read again rather than held to the first.
+        db.zgate_set(0);
+        assert!(
+            db.seal_threshold() >= grown,
+            "back at the raw form: {}",
+            db.seal_threshold()
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
 /// A key the frozen memtable holds and the live one then touches, with a
 /// scan between the seal and the touch so the snapshot of unsealed keys
 /// was built with the frozen entry and the live one arrives through the
