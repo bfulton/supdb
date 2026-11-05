@@ -4986,6 +4986,131 @@ fn the_seal_grows_with_the_store() {
     }
 }
 
+/// The forms fit for want of memory (`forms_fit_when_short`): the
+/// segment work finds the store short while its partitions' raw bytes
+/// exceed the budget the memory available leaves, here the one a test
+/// sets through the seam, and not short once the budget holds them, and
+/// the trim thread starts at the first look that finds it short and not
+/// before; without the option it never looks and no thread starts.
+#[test]
+fn the_store_is_short_of_memory_while_its_raw_form_exceeds_the_budget() {
+    let wait = |db: &Db, want: bool, what: &str| {
+        let t = std::time::Instant::now();
+        while db.forms_short() != want {
+            assert!(t.elapsed().as_secs() < 20, "{what}: never {want}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    for on in [true, false] {
+        let d = dir(if on { "fit-short" } else { "fit-short-off" });
+        let inject = std::sync::Arc::new(supdb::ZInject::new());
+        inject.set_budget(1 << 50);
+        let opts = Options {
+            seal_bytes: 64 << 10,
+            partition_bytes: Some(256 << 10),
+            forms_fit_when_short: on,
+            zpages: supdb::ZPages::Off,
+            zpages_inject: Some(inject.clone()),
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let val = vec![7u8; 200];
+        for k in 0..5_000u32 {
+            db.append(format!("key-{k:06}").as_bytes(), &val);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        assert!(db.levels().0 > 0, "the store has partitions");
+        // Room for every byte: not short, whatever the option.
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        assert!(!db.forms_short(), "on={on}: short with room");
+        assert!(!db.trimmer_started(), "on={on}: a trim thread with room");
+        // A budget of a byte: short with the option, and nothing without.
+        inject.set_budget(1);
+        if on {
+            wait(&db, true, "a budget of a byte");
+            assert!(db.trimmer_started(), "short, and no trim thread");
+            inject.set_budget(1 << 50);
+            wait(&db, false, "room again");
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(2500));
+            assert!(!db.forms_short(), "off: the store was looked at");
+            assert!(!db.trimmer_started(), "off: a trim thread");
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// Out of core the seal holds at its floor (`seal_floor_out_of_core`):
+/// with the compact form's gate away from the raw form, a store whose
+/// threshold grew in core reads the floor, and a commit of twice the
+/// floor seals; back at the raw form the threshold grows again. Without
+/// the option the gate changes nothing.
+#[test]
+fn the_seal_holds_at_its_floor_out_of_core() {
+    for floor_ooc in [true, false] {
+        let d = dir(if floor_ooc {
+            "seal-floor-ooc"
+        } else {
+            "seal-floor-ooc-off"
+        });
+        let opts = Options {
+            seal_bytes: 64 << 10,
+            partition_bytes: Some(256 << 10),
+            seal_grows: true,
+            seal_floor_out_of_core: floor_ooc,
+            // The gate is the test's to set.
+            zpages: supdb::ZPages::Off,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let val = vec![7u8; 200];
+        for k in 0..20_000u32 {
+            db.append(format!("key-{k:06}").as_bytes(), &val);
+            if k % 500 == 499 {
+                db.commit().unwrap();
+            }
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        let floor = 64usize << 10;
+        let grown = db.seal_threshold();
+        assert!(grown > 4 * floor, "the threshold did not grow: {grown}");
+        for gate in [1u8, 2] {
+            db.zgate_set(gate);
+            let t = db.seal_threshold();
+            if floor_ooc {
+                assert_eq!(t, floor, "gate {gate}: the threshold under the bound");
+            } else {
+                assert_eq!(t, grown, "gate {gate}: the gate moved the threshold");
+            }
+        }
+        // Twice the floor, under the grown threshold: out of core it seals.
+        let parts = db.levels().0;
+        for k in 0..600u32 {
+            db.append(format!("late-{k:06}").as_bytes(), &val);
+        }
+        db.commit().unwrap();
+        let sealed = db.in_flight().0 || db.levels().1 > 0 || db.levels().0 > parts;
+        assert_eq!(
+            sealed, floor_ooc,
+            "floor_ooc={floor_ooc}: a commit of twice the floor sealed={sealed}"
+        );
+        // The late keys may have landed as a partition more, so the grown
+        // threshold is read again rather than held to the first.
+        db.zgate_set(0);
+        assert!(
+            db.seal_threshold() >= grown,
+            "back at the raw form: {}",
+            db.seal_threshold()
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
 /// A key the frozen memtable holds and the live one then touches, with a
 /// scan between the seal and the touch so the snapshot of unsealed keys
 /// was built with the frozen entry and the live one arrives through the

@@ -4486,8 +4486,9 @@ use super::zselect::Budget;
 // The readings `read_budget` parses, which exist on Linux alone.
 #[cfg(target_os = "linux")]
 use super::zselect::{
-    parse_cgroup_v1_path, parse_cgroup_v2_path, parse_limit, parse_meminfo_total, parse_mount,
-    parse_stat_v1, parse_stat_v2, parse_status_rss_anon, V1_NO_LIMIT,
+    parse_cgroup_v1_path, parse_cgroup_v2_path, parse_limit, parse_meminfo_available,
+    parse_meminfo_total, parse_mount, parse_stat_v1, parse_stat_v2, parse_status_rss_anon,
+    V1_NO_LIMIT,
 };
 use std::time::Duration;
 
@@ -4892,11 +4893,22 @@ pub(super) fn sample(
 /// unified hierarchy's group with the least of `memory.max` and
 /// `memory.high` over the path to its mount, else the machine's total and
 /// the process's own anonymous memory; and `None` where even `/proc/meminfo`
-/// cannot be read. Off Linux there is no reading.
+/// cannot be read. Whichever it is, the budget is held under the machine's
+/// `MemAvailable` less the margin (`Budget::within_available`), since
+/// neither a group's limit nor the machine's total sees the other processes
+/// beside the store. Off Linux there is no reading.
 #[cfg(target_os = "linux")]
 pub fn read_budget() -> Option<Budget> {
-    let read = |p: &Path| std::fs::read_to_string(p).ok();
-    let total = parse_meminfo_total(&read(Path::new("/proc/meminfo"))?)?;
+    budget_from(&|p: &Path| std::fs::read_to_string(p).ok())
+}
+
+/// `read_budget` over the files `read` gives, so a test can hand it a
+/// machine this host is not.
+#[cfg(target_os = "linux")]
+fn budget_from(read: &dyn Fn(&Path) -> Option<String>) -> Option<Budget> {
+    let meminfo = read(Path::new("/proc/meminfo"))?;
+    let total = parse_meminfo_total(&meminfo)?;
+    let available = parse_meminfo_available(&meminfo);
     let cg = read(Path::new("/proc/self/cgroup")).unwrap_or_default();
     let mounts = read(Path::new("/proc/mounts")).unwrap_or_default();
     if let Some(path) = parse_cgroup_v1_path(&cg) {
@@ -4908,11 +4920,10 @@ pub fn read_budget() -> Option<Budget> {
                     .filter(|l| *l < V1_NO_LIMIT)
                     .unwrap_or(total)
                     .min(total);
-                return Some(Budget::of(
-                    limit,
-                    st.rss.saturating_add(st.rss_huge),
-                    st.refaults,
-                ));
+                return Some(
+                    Budget::of(limit, st.rss.saturating_add(st.rss_huge), st.refaults)
+                        .within_available(available),
+                );
             }
         }
     }
@@ -4937,14 +4948,14 @@ pub fn read_budget() -> Option<Budget> {
                         _ => break,
                     }
                 }
-                return Some(Budget::of(limit, st.anon, st.refaults));
+                return Some(Budget::of(limit, st.anon, st.refaults).within_available(available));
             }
         }
     }
     let anon = read(Path::new("/proc/self/status"))
         .and_then(|t| parse_status_rss_anon(&t))
         .unwrap_or(0);
-    Some(Budget::of(total, anon, None))
+    Some(Budget::of(total, anon, None).within_available(available))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -4956,6 +4967,80 @@ pub fn read_budget() -> Option<Budget> {
 mod tests {
     use super::*;
     use crate::db::zpages::ZCODING_RECORD;
+
+    /// A machine of 16 GiB with `available` free of it, the process in a
+    /// v1 group limited to `v1` or a v2 group limited to `v2` where given,
+    /// and in neither otherwise; 100 MiB anonymous in every case.
+    #[cfg(target_os = "linux")]
+    fn machine(
+        available: Option<u64>,
+        v1: Option<u64>,
+        v2: Option<u64>,
+    ) -> impl Fn(&Path) -> Option<String> {
+        move |p: &Path| {
+            let anon = 100u64 << 20;
+            let text = match p.to_str()? {
+                "/proc/meminfo" => {
+                    let mut t = format!("MemTotal: {} kB\nMemFree: 1 kB\n", 16u64 << 20);
+                    if let Some(a) = available {
+                        t += &format!("MemAvailable: {} kB\n", a >> 10);
+                    }
+                    t
+                }
+                "/proc/self/cgroup" => match (v1, v2) {
+                    (Some(_), _) => "4:memory:/g\n0::/\n".to_string(),
+                    (None, Some(_)) => "0::/g\n".to_string(),
+                    (None, None) => "0::/\n".to_string(),
+                },
+                "/proc/mounts" => match (v1, v2) {
+                    (Some(_), _) => "cgroup /cg cgroup rw,memory 0 0\n".to_string(),
+                    (None, Some(_)) => "cgroup2 /cg2 cgroup2 rw 0 0\n".to_string(),
+                    (None, None) => String::new(),
+                },
+                "/cg/g/memory.stat" => format!(
+                    "rss {anon}\nrss_huge 0\nhierarchical_memory_limit {}\n",
+                    v1?
+                ),
+                "/cg2/g/memory.stat" => {
+                    v2?;
+                    format!("anon {anon}\n")
+                }
+                "/cg2/g/memory.max" => format!("{}\n", v2?),
+                "/proc/self/status" => format!("RssAnon: {} kB\n", anon >> 10),
+                _ => return None,
+            };
+            Some(text)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_reading_is_held_under_what_the_machine_has_available() {
+        use crate::db::zselect::margin;
+        let gib = 1u64 << 30;
+        let anon = 100u64 << 20;
+        // Each path's budget with room to spare, and then on a machine
+        // whose other processes leave the store less than its limit.
+        let cases = [
+            ("v1", Some(4 * gib), None, 4 * gib),
+            ("v2", None, Some(4 * gib), 4 * gib),
+            ("host", None, None, 16 * gib),
+        ];
+        for (name, v1, v2, limit) in cases {
+            let roomy = budget_from(&machine(Some(16 * gib), v1, v2)).expect(name);
+            assert_eq!(roomy.limit, limit, "{name}");
+            assert_eq!(roomy.budget, limit - anon - margin(limit), "{name}");
+            let unsaid = budget_from(&machine(None, v1, v2)).expect(name);
+            assert_eq!(unsaid, roomy, "{name}");
+            let crowded = budget_from(&machine(Some(2 * gib), v1, v2)).expect(name);
+            assert_eq!(crowded.budget, 2 * gib - margin(limit), "{name}");
+            assert_eq!(
+                (crowded.limit, crowded.anon),
+                (roomy.limit, roomy.anon),
+                "{name}"
+            );
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

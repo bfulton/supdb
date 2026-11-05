@@ -716,6 +716,22 @@ pub struct Options {
     /// takes in, held to four. Off, the seal is `seal_bytes` and nothing
     /// else, the shape the suite's arms were measured in before this.
     pub seal_grows: bool,
+    /// EXPERIMENT: with `seal_grows`, the seal holds at `seal_bytes` while
+    /// the compact form's gate is away from the raw form -- the store out
+    /// of core -- and grows with the store only in core. Grown, the
+    /// memtable is the store's bytes over four times `l0_trigger`, 77 MB at
+    /// ten million keys, and under a bound it and the scan snapshot's copy
+    /// of it are anonymous memory beside the form files' page cache, where
+    /// LMDB holds 17 MB; the floor leaves the unsealed writes in pieces on
+    /// disk instead, at the price of more and smaller pieces for the scans
+    /// to fold and the merges to take. Refuted: paired undivided at ten
+    /// million keys under 1.25 GiB, two pairs, the floor held E's
+    /// anonymous memory at 230-249 MB against 381-404 and its major faults
+    /// to 0.6x, and read E at 0.70x, D and F at 0.78x and A, B and C at
+    /// 0.92-0.95x in both pairs, the pieces' folds and merges costing more
+    /// than the memory freed. Off: the seal grows whatever the gate.
+    /// `supdb-sealfloorooc` is the arm.
+    pub seal_floor_out_of_core: bool,
     /// EXPERIMENT: the share of the store's bytes the memtable may reach
     /// before a commit seals, as a cap on `seal_threshold` rather than a
     /// floor under it; zero is no cap.
@@ -3608,6 +3624,26 @@ pub struct Options {
     /// the free bytes by; the engine does not link against it, so such a
     /// build still links.
     pub forms_trim_bytes: usize,
+    /// The forms are built and grown to fit, with their three parts
+    /// (`forms_fit_shed`, `forms_fit_sweep`, `forms_trim_bytes`), while
+    /// the store is short of memory and not otherwise: while its
+    /// partitions' raw bytes, the hash slots and the records a read
+    /// touches, exceed the memory available to cache them -- the limit in
+    /// effect, the group's or the machine's, less the anonymous memory
+    /// charged against it and a margin, and no more than the machine's
+    /// `MemAvailable` less the margin (`zselect::Budget`), the budget the
+    /// compact form's controller is decided by. The segment work looks
+    /// once a second and publishes what it finds; inline, it never looks
+    /// and the forms are not fitted. A store that fits is never short, so
+    /// in core the option changes nothing; the trim thread starts at the
+    /// look that first finds the store short. Under 1.25 GiB at ten
+    /// million keys it read E 1.11x and 1.31x in two sittings, the
+    /// point-read mixes 0.78-1.11x, unresolved, and the lag sweep's
+    /// weighted sum 0.89x of the time with no compact form in either arm
+    /// (`docs/engine.md`, ycsb-E taken apart). Off: fitted only by
+    /// `forms_to_fit` or a bound budget; `supdb-nofitshort` is that shape,
+    /// and `supdb-nozpagesnofitshort` beside `supdb-nozpages`.
+    pub forms_fit_when_short: bool,
 }
 
 impl Options {
@@ -3659,6 +3695,7 @@ impl Default for Options {
             lag_relax_pct: 100,
             seal_on_file: false,
             seal_grows: true,
+            seal_floor_out_of_core: false,
             direct_ingest: true,
             segment: SegmentOptions::default(),
             l0_trigger: 4,
@@ -3858,6 +3895,7 @@ impl Default for Options {
             forms_fit_shed: true,
             forms_fit_sweep: true,
             forms_trim_bytes: 32 << 20,
+            forms_fit_when_short: true,
         }
     }
 }
@@ -14076,6 +14114,10 @@ struct Shared {
     in_seal: AtomicUsize,
     /// The partition merges in flight (`Maint::compacting`).
     in_merge: AtomicUsize,
+    /// Whether the store is short of memory: its partitions' raw bytes
+    /// over the budget, as the segment work last looked
+    /// (`Options::forms_fit_when_short`).
+    forms_short: std::sync::atomic::AtomicBool,
     /// A test's: bits under which a seal thread waits, so a test can hold
     /// the store at a point of the seal and ask what it sees there.
     /// `SEAL_HOLD_LANDING` holds it before its segments are renamed into
@@ -14179,6 +14221,12 @@ struct Shared {
     /// writes the counts.
     trim_wanted: std::sync::atomic::AtomicBool,
     trim_thread: std::sync::OnceLock<std::thread::Thread>,
+    /// The trim thread in flight, where whoever starts it puts it: the
+    /// writer at the open of a store that fits its forms from the start,
+    /// the segment work at the look that first finds the store short
+    /// (`Options::forms_fit_when_short`); the writer's close marks it
+    /// closed and joins the thread, so a start after that is refused.
+    trimmer: std::sync::Mutex<TrimSlot>,
     trim_floor: AtomicUsize,
     trims: AtomicU64,
     /// The looks the thread made at the allocator, those that trimmed and
@@ -14447,6 +14495,42 @@ fn trim_loop(
 struct Trimmer {
     handle: Option<std::thread::JoinHandle<()>>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Where the trim thread is kept (`Shared::trimmer`): the thread, once
+/// started, and whether the store has closed it.
+#[derive(Default)]
+struct TrimSlot {
+    trimmer: Option<Trimmer>,
+    closed: bool,
+}
+
+/// The trim thread started, unless one runs, the store has closed it, or
+/// the stride is zero: one thread for whoever frees forms to ask, and a
+/// request made before it starts is waiting for it (`Shared::trim_wanted`).
+fn start_trimmer(shared: &std::sync::Arc<Shared>, opts: &Options) {
+    if opts.forms_trim_bytes == 0 {
+        return;
+    }
+    let mut slot = shared.trimmer.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.closed || slot.trimmer.is_some() {
+        return;
+    }
+    let held = shared.clone();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = stop.clone();
+    let stride = opts.forms_trim_bytes;
+    let by_resident = opts.trim_by_resident;
+    let spawned = std::thread::Builder::new()
+        .name("supdb-trim".into())
+        .spawn(move || trim_loop(&held, &flag, stride, by_resident));
+    if let Ok(handle) = spawned {
+        let _ = shared.trim_thread.set(handle.thread().clone());
+        slot.trimmer = Some(Trimmer {
+            handle: Some(handle),
+            stop,
+        });
+    }
 }
 
 /// EXPERIMENT: a replaced canonical form on its way to being freed. A
@@ -15504,9 +15588,6 @@ pub struct Db {
     /// EXPERIMENT: the upkeep thread, once a commit has had something
     /// for it; see `Upkeep::Background`.
     upkeeper: Option<Upkeeper>,
-    /// The trim thread, started at the open of a store that keeps its forms
-    /// to fit (`Options::forms_trim_bytes`).
-    trimmer: Option<Trimmer>,
     /// The upkeep thread's regime, kept by the writer since the upkeep
     /// itself may be lent: the generation and committed log length at
     /// the last hand-over, the store's scan count as last seen, and the
@@ -17244,7 +17325,10 @@ impl Reader {
             // handle that holds its upkeep, as the commit's sweep is: a
             // writer that has lent it leaves the sweeping to the thread
             // that has it.
-            if self.opts.forms_to_fit && self.opts.forms_fit_sweep && self.fs_home() {
+            if (self.opts.forms_to_fit || self.fits_short())
+                && self.opts.forms_fit_sweep
+                && self.fs_home()
+            {
                 self.sweep_at_leave();
             }
         }
@@ -17848,7 +17932,9 @@ impl Reader {
         } else {
             st.data_bytes.saturating_mul(DATA_PER_FILE.1) / DATA_PER_FILE.0
         };
-        let base = if !self.opts.seal_grows {
+        let floored =
+            self.opts.seal_floor_out_of_core && self.shared.zgate.load() != zselect::GATE_RAW;
+        let base = if !self.opts.seal_grows || floored {
             self.opts.seal_bytes
         } else {
             let grown = sized / self.opts.l0_trigger.max(1).saturating_mul(4) as u64;
@@ -20373,7 +20459,7 @@ impl Reader {
     /// asked in vain.
     fn note_freed(&self, bytes: usize) {
         let stride = self.opts.forms_trim_bytes;
-        if !self.opts.forms_to_fit || stride == 0 || bytes == 0 {
+        if !(self.opts.forms_to_fit || self.fits_short()) || stride == 0 || bytes == 0 {
             return;
         }
         let total = self.fs().freed.get() + bytes;
@@ -22500,7 +22586,13 @@ impl Reader {
     /// Whether forms are built and grown to fit: `forms_to_fit`, or the
     /// store's own budget once it has bound.
     fn fits(&self) -> bool {
-        self.opts.forms_to_fit || self.fs().cache_bound.get()
+        self.opts.forms_to_fit || self.fs().cache_bound.get() || self.fits_short()
+    }
+
+    /// Whether the forms are fitted with their three parts for want of
+    /// memory (`Options::forms_fit_when_short`).
+    fn fits_short(&self) -> bool {
+        self.opts.forms_fit_when_short && self.shared.forms_short.load(AtomicOrdering::Relaxed)
     }
 
     /// The store's own budget bound, where the cache has passed it: the
@@ -26023,6 +26115,7 @@ impl Db {
             drain_steps: DrainSteps::new(),
             in_seal: AtomicUsize::new(0),
             in_merge: AtomicUsize::new(0),
+            forms_short: std::sync::atomic::AtomicBool::new(false),
             seal_hold: std::sync::atomic::AtomicU8::new(0),
             merge_hold: std::sync::atomic::AtomicU8::new(0),
             forms_position_hold: std::sync::atomic::AtomicBool::new(false),
@@ -26059,6 +26152,7 @@ impl Db {
             fit_swept: AtomicUsize::new(0),
             fit_skips: std::sync::atomic::AtomicU32::new(0),
             trim_thread: std::sync::OnceLock::new(),
+            trimmer: std::sync::Mutex::new(TrimSlot::default()),
             trim_hold: std::sync::atomic::AtomicBool::new(false),
             trim_begun: AtomicU64::new(0),
         });
@@ -26121,7 +26215,6 @@ impl Db {
             wal_dir_unsynced: false,
             keeper: None,
             upkeeper: None,
-            trimmer: None,
             upkeep_log: (0, 0),
             upkeep_life: 0,
             upkeep_since_scan: 0,
@@ -26559,6 +26652,7 @@ impl Db {
             drain_steps: DrainSteps::new(),
             in_seal: AtomicUsize::new(0),
             in_merge: AtomicUsize::new(0),
+            forms_short: std::sync::atomic::AtomicBool::new(false),
             seal_hold: std::sync::atomic::AtomicU8::new(0),
             merge_hold: std::sync::atomic::AtomicU8::new(0),
             forms_position_hold: std::sync::atomic::AtomicBool::new(false),
@@ -26595,6 +26689,7 @@ impl Db {
             fit_swept: AtomicUsize::new(0),
             fit_skips: std::sync::atomic::AtomicU32::new(0),
             trim_thread: std::sync::OnceLock::new(),
+            trimmer: std::sync::Mutex::new(TrimSlot::default()),
             trim_hold: std::sync::atomic::AtomicBool::new(false),
             trim_begun: AtomicU64::new(0),
         });
@@ -26657,7 +26752,6 @@ impl Db {
             wal_dir_unsynced: false,
             keeper: None,
             upkeeper: None,
-            trimmer: None,
             upkeep_log: (0, 0),
             upkeep_life: 0,
             upkeep_since_scan: 0,
@@ -29663,6 +29757,25 @@ impl Db {
         self.shared.in_merge.load(AtomicOrdering::Acquire)
     }
 
+    /// A test's: whether the segment work last found the store short of
+    /// memory (`Options::forms_fit_when_short`).
+    #[doc(hidden)]
+    pub fn forms_short(&self) -> bool {
+        self.shared.forms_short.load(AtomicOrdering::Acquire)
+    }
+
+    /// A test's: whether the store's trim thread has started
+    /// (`Shared::trimmer`).
+    #[doc(hidden)]
+    pub fn trimmer_started(&self) -> bool {
+        self.shared
+            .trimmer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .trimmer
+            .is_some()
+    }
+
     fn set_hold(hold: &std::sync::atomic::AtomicU8, bit: u8, on: bool) {
         if on {
             hold.fetch_or(bit, AtomicOrdering::AcqRel);
@@ -32515,36 +32628,33 @@ impl Db {
         }
     }
 
-    /// The trim thread started, if the options ask for one
-    /// (`Options::forms_to_fit` with a stride): at the open, so that a
-    /// handle's first request has a thread to wake, and a store that is
-    /// never asked costs a parked thread.
+    /// The trim thread started at the open of a store that fits its forms
+    /// from the start (`Options::forms_to_fit` with a stride), so that a
+    /// handle's first request has a thread to wake. A store that fits them
+    /// only while short of memory starts it at the segment work's look
+    /// that first finds it short (`Maint::short_look`), and a store that
+    /// is never short has none.
     fn start_trimmer(&mut self) {
-        if self.trimmer.is_some() || !self.opts.forms_to_fit || self.opts.forms_trim_bytes == 0 {
-            return;
-        }
-        let shared = self.shared.clone();
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = stop.clone();
-        let stride = self.opts.forms_trim_bytes;
-        let by_resident = self.opts.trim_by_resident;
-        let spawned = std::thread::Builder::new()
-            .name("supdb-trim".into())
-            .spawn(move || trim_loop(&shared, &flag, stride, by_resident));
-        if let Ok(handle) = spawned {
-            let _ = self.shared.trim_thread.set(handle.thread().clone());
-            self.trimmer = Some(Trimmer {
-                handle: Some(handle),
-                stop,
-            });
+        if self.opts.forms_to_fit {
+            start_trimmer(&self.shared, &self.opts);
         }
     }
 
     /// The trim thread stopped and joined, which waits out a trim in
-    /// progress. A test's hold on it is lifted first.
+    /// progress, and the slot closed so that nothing starts it again. A
+    /// test's hold on it is lifted first.
     fn stop_trimmer(&mut self) {
         self.shared.trim_hold.store(false, AtomicOrdering::Release);
-        if let Some(mut t) = self.trimmer.take() {
+        let taken = {
+            let mut slot = self
+                .shared
+                .trimmer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            slot.closed = true;
+            slot.trimmer.take()
+        };
+        if let Some(mut t) = taken {
             t.stop.store(true, AtomicOrdering::SeqCst);
             if let Some(th) = self.shared.trim_thread.get() {
                 th.unpark();
@@ -35124,6 +35234,9 @@ struct Maint {
     /// was due at and whether a landing's chain asked; each merge in flight
     /// keeps its own (`Merging::why`).
     merge_why: (usize, bool),
+    /// When the store's shortness of memory was last looked at
+    /// (`Maint::short_look`).
+    short_last: Option<std::time::Instant>,
     /// When the last build was collected, for the trace's gap between one
     /// build and the next (`SUPDB_ZPAGES_TRACE`).
     z_last_collect: Option<std::time::Instant>,
@@ -35310,6 +35423,7 @@ impl Maint {
             self.idle_plan();
             self.shape_if_read(false);
             self.z_step();
+            self.short_look();
             self.sweep_spares();
             std::thread::park_timeout(MAINT_POLL);
         }
@@ -35734,6 +35848,7 @@ impl Maint {
             z_trace: std::env::var_os("SUPDB_ZPAGES_TRACE").is_some(),
             merge_trace: std::env::var_os("SUPDB_MERGE_TRACE").is_some(),
             merge_why: (0, false),
+            short_last: None,
             z_last_collect: None,
             z_epoch: std::time::Instant::now(),
             z_last_step: None,
@@ -38588,10 +38703,44 @@ impl Maint {
         }
     }
 
-    /// The model's reading (S1): the cache budget from the injection or the
-    /// platform, the group's refaults a second over the tick, and the raw
-    /// form's predicted faults a read over the partitions' footprint. None
-    /// where the platform gives no budget.
+    /// Once a second, whether the store is short of memory
+    /// (`Options::forms_fit_when_short`): its partitions' raw bytes, the
+    /// hash slots and records a read touches, over the budget the memory
+    /// available leaves (`z_budget`). A budget that cannot be read is not
+    /// short. The first look that finds it short starts the trim thread.
+    fn short_look(&mut self) {
+        if !self.opts.forms_fit_when_short {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .short_last
+            .is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(1))
+        {
+            return;
+        }
+        self.short_last = Some(now);
+        let raw = {
+            let _op = self.op();
+            self.segs()
+                .iter()
+                .filter(|s| s.level > 0)
+                .fold(0u64, |acc, s| {
+                    let (h, r) = s.foot();
+                    acc.saturating_add(h).saturating_add(r)
+                })
+        };
+        let short = self.z_budget().is_some_and(|budget| raw > budget);
+        // The thread before the word, so that a handle that reads the
+        // store short and asks for a trim finds a thread to ask.
+        if short {
+            start_trimmer(&self.shared, &self.opts);
+        }
+        self.shared
+            .forms_short
+            .store(short, AtomicOrdering::Release);
+    }
+
     /// The budget the model prices against: the seam's where a test has set
     /// one, else the platform's (`zfile::read_budget`), else none.
     fn z_budget(&self) -> Option<u64> {
@@ -38602,6 +38751,10 @@ impl Maint {
             .or_else(|| zfile::read_budget().map(|b| b.budget))
     }
 
+    /// The model's reading (S1): the cache budget from the injection or the
+    /// platform, the group's refaults a second over the tick, and the raw
+    /// form's predicted faults a read over the partitions' footprint. None
+    /// where the platform gives no budget.
     fn z_model(&mut self, now: std::time::Duration) -> Option<zselect::Model> {
         let inject = self.opts.zpages_inject.clone();
         let platform = zfile::read_budget();
