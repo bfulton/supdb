@@ -1113,6 +1113,17 @@ pub struct ZSelect {
     /// keys, the sampler's [`Sampler::attach`] -- is bought on the
     /// prediction as an eager selector buys a build (`set_attach_eager`).
     attach_eager: bool,
+    /// Whether FITS suspects at the first hot model reading, whenever it
+    /// comes, rather than on [`FITS_TO_SUSPECT_TICKS`] consecutive ticks
+    /// (`set_suspect_at_reading`).
+    suspect_at_reading: bool,
+    /// Whether the attach on the prediction counts as settled at a step
+    /// whose census saw reads, as well as once the partitions have stood
+    /// (`set_attach_on_reads`).
+    attach_on_reads: bool,
+    /// Whether the census of the step under way saw reads, at least
+    /// [`MIN_EVIDENCE_OPS`] operations, with no segment work in flight.
+    reads_now: bool,
     /// The eager purchase made, or a purchase undone: a build cancelled or
     /// COMPACT left. From then on the rent governs, since an eager entry
     /// that could buy again after every exit would buy a form that does not
@@ -1174,6 +1185,9 @@ impl ZSelect {
             last_switch: None,
             eager: false,
             attach_eager: false,
+            suspect_at_reading: false,
+            attach_on_reads: false,
+            reads_now: false,
             eager_spent: false,
             gen_changed_at: Duration::ZERO,
             last_build_wall: Duration::ZERO,
@@ -1298,6 +1312,34 @@ impl ZSelect {
         self.attach_eager = on;
     }
 
+    /// Whether FITS becomes SUSPECT at the first hot model reading rather
+    /// than on [`FITS_TO_SUSPECT_TICKS`] consecutive S1 ticks, and at a
+    /// reading between ticks as well as at a tick
+    /// (`Options::zpages_suspect_at_crossing`): the caller reads the model
+    /// at the moment the store crosses the line, where the ticks would
+    /// suspect one to two seconds after it. SUSPECT turns the census and
+    /// the sampler on and buys nothing, and every clause of the buy still
+    /// stands, so a reading that suspects too soon costs the census and a
+    /// sample until the calm ticks relax it. Ticks still pace the
+    /// smoothing, the calm count and every rule after SUSPECT.
+    pub fn set_suspect_at_reading(&mut self, on: bool) {
+        self.suspect_at_reading = on;
+    }
+
+    /// Whether the attach on the prediction (`set_attach_eager`) counts as
+    /// settled at a step whose census saw reads with no segment work in
+    /// flight, as well as once the partitions have stood for
+    /// [`EAGER_SETTLE`] (`Options::zpages_suspect_at_crossing`). The settle
+    /// keeps a store that is still being written from buying on a reading
+    /// its next landing changes, and a load does not read: the reads say
+    /// the writing is over as the settle does, and say it at once, where
+    /// the settle after an ordered load's drain came two seconds into the
+    /// reads it was for. Work in flight still holds it, as it holds the
+    /// settle, and every other clause of the buy stands.
+    pub fn set_attach_on_reads(&mut self, on: bool) {
+        self.attach_on_reads = on;
+    }
+
     /// Whether form files are being kept for a re-entry: the form was left (or a
     /// build cancelled) and the retention has not ended.
     pub fn retained(&self) -> bool {
@@ -1335,6 +1377,14 @@ impl ZSelect {
         let now = input.now.max(self.now);
         self.now = now;
         self.counts.steps += 1;
+        let fresh = input.model.is_some_and(|m| m.sanitized().is_some());
+        self.reads_now = !input.rewriting
+            && input
+                .census
+                .reads
+                .ops
+                .saturating_add(input.census.scans.ops)
+                >= MIN_EVIDENCE_OPS;
         let tick = self.absorb(input, now);
         if tick {
             self.read_s1(now);
@@ -1345,7 +1395,7 @@ impl ZSelect {
         let tripped = self.record_outcomes(&input.build);
         let phase = self.phase;
         let event = match phase {
-            Phase::Fits => self.fits(now, tick),
+            Phase::Fits => self.fits(now, tick, fresh),
             Phase::Suspect => self.suspect(input, now, tick),
             Phase::Building => self.building(input, now, tripped),
             Phase::Compact => self.compact(input, now, tick, tripped),
@@ -1651,12 +1701,20 @@ impl ZSelect {
 
     // ---- transitions -----------------------------------------------------
 
-    fn fits(&mut self, now: Duration, tick: bool) -> Option<Event> {
-        if !tick {
+    fn fits(&mut self, now: Duration, tick: bool, fresh: bool) -> Option<Event> {
+        if !(tick || (self.suspect_at_reading && fresh)) {
             return None;
         }
         let m = self.model?;
         let hot = m.phi_raw >= self.theta_sus(Class::Read) || self.pressure();
+        if self.suspect_at_reading {
+            self.hot_ticks = 0;
+            if hot {
+                self.enter_suspect(now);
+                return Some(Event::Suspect);
+            }
+            return None;
+        }
         self.hot_ticks = if hot {
             self.hot_ticks.saturating_add(1)
         } else {
@@ -1754,7 +1812,8 @@ impl ZSelect {
         // bought before any read has wasted its price, on the prediction
         // that every read would.
         let stood = !self.eager_spent && now.saturating_sub(self.gen_changed_at) >= EAGER_SETTLE;
-        let settled_attach = self.attach_eager && s.attach && stood;
+        let read_now = !self.eager_spent && self.attach_on_reads && self.reads_now;
+        let settled_attach = self.attach_eager && s.attach && (stood || read_now);
         let settled = (self.eager && stood) || settled_attach;
         if !settled && self.excess < s.c_build {
             return false;
@@ -4112,6 +4171,56 @@ mod tests {
             off.last.phase,
             built.last.phase
         );
+    }
+
+    /// The attach on the prediction counts as settled at a step whose
+    /// census saw reads with no segment work in flight
+    /// (`set_attach_on_reads`): every form file on disk, the segment work
+    /// just ended, and reads whose faults are no refaults,
+    /// so the rent has no evidence and the attach is bought on the
+    /// prediction or not at all -- with the option within a second of the
+    /// work's end, without it once the settle has passed.
+    #[test]
+    fn an_attach_is_bought_at_the_first_reads_where_told_to() {
+        let cell = Cell::ten_million();
+        let reads = match cell.uniform() {
+            Load::Rated {
+                class,
+                raw,
+                z,
+                bound,
+                ..
+            } => Load::Rated {
+                class,
+                raw,
+                z,
+                refaults: false,
+                bound,
+            },
+            _ => unreachable!(),
+        };
+        for on_reads in [true, false] {
+            let mut sim = Sim::new(cell.clone(), reads);
+            sim.sel.set_attach_eager(true);
+            sim.sel.set_attach_on_reads(on_reads);
+            sim.on_disk = true;
+            sim.rewriting = true;
+            sim.run(5.0);
+            assert_eq!(
+                sim.sel.counts().builds,
+                0,
+                "{on_reads}: nothing while it runs"
+            );
+            sim.rewriting = false;
+            sim.run(1.0);
+            assert_eq!(
+                sim.sel.counts().builds,
+                u64::from(on_reads),
+                "{on_reads}: within a second of its end"
+            );
+            sim.run(EAGER_SETTLE.as_secs_f64());
+            assert_eq!(sim.sel.counts().builds, 1, "{on_reads}: once settled");
+        }
     }
 
     // ---- hysteresis ----------------------------------------------------------------
@@ -6897,6 +7006,47 @@ mod tests {
         sel.faults_since_suspect = 998;
         assert!(!sel.evidence(&census, DT).any());
         assert!(sel.evidence(&census, 2 * DT).valid[Class::Read.ix()]);
+    }
+
+    #[test]
+    fn a_selector_told_to_suspects_at_the_first_hot_reading_between_ticks() {
+        let sus = ZSelect::new().theta_sus(Class::Read);
+        let at = |t: Duration, phi_raw: f64| Input {
+            now: t,
+            model: Some(model_of(phi_raw)),
+            ..Input::default()
+        };
+        let none = |t: Duration| Input {
+            now: t,
+            ..Input::default()
+        };
+        // As shipped: a reading a quarter second after the tick is not a
+        // tick, and one hot tick is not two.
+        let mut sel = ZSelect::new();
+        assert_eq!(sel.step(&at(S1_PERIOD, 0.5 * sus)).event, None);
+        let between = S1_PERIOD + Duration::from_millis(250);
+        assert_eq!(sel.step(&at(between, sus)).event, None);
+        assert_eq!(sel.step(&at(2 * S1_PERIOD, sus)).event, None);
+        assert_eq!(sel.phase(), Phase::Fits);
+        // Told to, the reading between the ticks suspects on its own, and a
+        // step that carries no reading does not.
+        let mut sel = ZSelect::new();
+        sel.set_suspect_at_reading(true);
+        assert_eq!(sel.step(&at(S1_PERIOD, 0.5 * sus)).event, None);
+        assert_eq!(sel.step(&none(between)).event, None);
+        assert_eq!(sel.step(&at(between, 0.99 * sus)).event, None);
+        assert_eq!(sel.phase(), Phase::Fits);
+        let later = between + CENSUS_INTERVAL;
+        assert_eq!(sel.step(&at(later, sus)).event, Some(Event::Suspect));
+        assert_eq!(sel.phase(), Phase::Suspect);
+        // And the way out is the ticks' as before: five calm ticks.
+        for k in 3..=6 {
+            assert_eq!(sel.step(&at(k * S1_PERIOD, 0.1 * sus)).event, None, "{k}");
+        }
+        assert_eq!(
+            sel.step(&at(7 * S1_PERIOD, 0.1 * sus)).event,
+            Some(Event::Relax)
+        );
     }
 
     #[test]

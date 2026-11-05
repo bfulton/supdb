@@ -582,6 +582,12 @@ pub struct Supdb {
     /// The controller's sample asked for between builds ahead
     /// (`Options::zpages_sample_between`). `supdb-zsamplegap`, durable.
     zsamplegap: bool,
+    /// The install as it was before it came at the load's end: no
+    /// partition counted as covered but by its form file, and the
+    /// controller suspecting on two hot readings
+    /// (`Options::zpages_cover_resident`, `Options::zpages_suspect_at_crossing`
+    /// off). `supdb-zinstallwaits`, durable.
+    zinstallwaits: bool,
     /// The block cache reads a block boundary's key off the ordered index's
     /// top level in memory, where the default reads the partition's record
     /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
@@ -1388,6 +1394,12 @@ struct Policy {
     /// The controller's sample asked for between builds ahead
     /// (`Options::zpages_sample_between`). `supdb-zsamplegap`, durable.
     zsamplegap: bool,
+    /// The install as it was before it came at the load's end: no
+    /// partition counted as covered but by its form file, and the
+    /// controller suspecting on two hot readings
+    /// (`Options::zpages_cover_resident`, `Options::zpages_suspect_at_crossing`
+    /// off). `supdb-zinstallwaits`, durable.
+    zinstallwaits: bool,
     /// The block cache reads a block boundary's key off the ordered index's
     /// top level in memory, where the default reads the partition's record
     /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
@@ -1962,6 +1974,7 @@ impl Default for Policy {
             walkeep: false,
             zahead1: false,
             zsamplegap: false,
+            zinstallwaits: false,
             boundarytop: false,
             nodirwillneed: false,
             noboundsheadwillneed: false,
@@ -3835,6 +3848,20 @@ impl Supdb {
             path,
             Policy {
                 zsamplegap: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose controller counts a partition as covered by its form
+    /// file alone and suspects on two hot readings a second apart
+    /// (`Options::zpages_cover_resident`, `Options::zpages_suspect_at_crossing`
+    /// off): against `supdb` it prices the install brought to the load's end.
+    pub fn create_zinstallwaits(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zinstallwaits: true,
                 ..Policy::default()
             },
         )
@@ -6459,6 +6486,7 @@ impl Supdb {
             walkeep,
             zahead1,
             zsamplegap,
+            zinstallwaits,
             boundarytop,
             nodirwillneed,
             noboundsheadwillneed,
@@ -6773,6 +6801,8 @@ impl Supdb {
                 supdb::Options::default().zpages_ahead_builders
             },
             zpages_sample_between: zsamplegap,
+            zpages_cover_resident: !zinstallwaits,
+            zpages_suspect_at_crossing: !zinstallwaits,
             wal_drop_bytes: if walkeep {
                 0
             } else {
@@ -7058,6 +7088,7 @@ impl Supdb {
             walkeep,
             zahead1,
             zsamplegap,
+            zinstallwaits,
             boundarytop,
             nodirwillneed,
             noboundsheadwillneed,
@@ -7811,6 +7842,9 @@ impl Engine for Supdb {
         }
         if self.zahead1 {
             return "supdb-zahead1";
+        }
+        if self.zinstallwaits {
+            return "supdb-zinstallwaits";
         }
         if self.zsamplegap {
             return "supdb-zsamplegap";
@@ -9318,6 +9352,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-walkeep"
         | "supdb-zahead1"
         | "supdb-zsamplegap"
+        | "supdb-zinstallwaits"
         | "supdb-nozpagesnofitshort"
         | "supdb-nozpagesmergepar2"
         | "supdb-boundarytop"
@@ -9860,6 +9895,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-walkeep" => supdb_arm(Supdb::create_walkeep, dir)?,
         "supdb-zahead1" => supdb_arm(Supdb::create_zahead1, dir)?,
         "supdb-zsamplegap" => supdb_arm(Supdb::create_zsamplegap, dir)?,
+        "supdb-zinstallwaits" => supdb_arm(Supdb::create_zinstallwaits, dir)?,
         "supdb-nozpagesnofitshort" => supdb_arm(Supdb::create_nozpages_nofitshort, dir)?,
         "supdb-nozpagesmergepar2" => supdb_arm(Supdb::create_nozpages_mergepar2, dir)?,
         "supdb-ingestmergepar2" => supdb_arm(Supdb::create_ingest_mergepar2, dir)?,
@@ -11432,6 +11468,7 @@ mod tests {
             "supdb-walkeep",
             "supdb-zahead1",
             "supdb-zsamplegap",
+            "supdb-zinstallwaits",
         ] {
             assert_eq!(
                 open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
@@ -11471,6 +11508,27 @@ mod tests {
                         b.zpages_land_pct,
                         b.wal_drop_bytes,
                         b.forms_fit_when_short
+                    )
+                );
+            }
+            {
+                let z = Supdb::create_zinstallwaits(&dir("zinstallwaits")).unwrap();
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(b.zpages_cover_resident && b.zpages_suspect_at_crossing);
+                assert!(!o.zpages_cover_resident && !o.zpages_suspect_at_crossing);
+                assert_eq!(
+                    (
+                        o.zpages_ahead_builders,
+                        o.zpages,
+                        o.wal_drop_bytes,
+                        o.zpages_sample_between
+                    ),
+                    (
+                        b.zpages_ahead_builders,
+                        b.zpages,
+                        b.wal_drop_bytes,
+                        b.zpages_sample_between
                     )
                 );
             }

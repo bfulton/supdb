@@ -7160,7 +7160,13 @@ fn a_store_past_its_budget_builds_its_form_files_ahead_and_buys_them_by_attach()
         1 << 20,
         1_000_000.0,
         FAULT_1MS,
-        |o| o.zpages_prebuild = true,
+        |o| {
+            o.zpages_prebuild = true;
+            // The sample's wait for the builds ahead, which a store whose
+            // in-flight partitions count as covered never makes.
+            o.zpages_cover_resident = false;
+            o.zpages_suspect_at_crossing = false;
+        },
         |db| db.hold_zpage_build(true),
     );
     let c = db.zpage_counts();
@@ -7377,6 +7383,13 @@ fn the_sample_starts_between_builds_ahead_when_told_to() {
                 o.zpages_sample_between = between;
                 o.zpages_ahead_builders = 1;
                 o.partition_bytes = Some(400 << 10);
+                // The sample's wait for a build ahead, which a store whose
+                // resident and in-flight partitions count as covered never
+                // makes, and the build ahead started before the sample,
+                // which a controller suspecting at the crossing does not
+                // give it time for.
+                o.zpages_cover_resident = false;
+                o.zpages_suspect_at_crossing = false;
             });
         // Past the whole budget the builds ahead run, and the model calls
         // for the controller's sample: the first build ahead is held at its
@@ -7647,6 +7660,11 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
         let (dir, db, model, inject, raw) =
             land_store_with(&format!("auto-land-past-{drop_past}"), 50, |o| {
                 o.zpages_land_drop_past = drop_past;
+                // The sample waits for the builds ahead, so that its fills
+                // and their readahead take nothing of the records back
+                // while the cache is read.
+                o.zpages_cover_resident = false;
+                o.zpages_suspect_at_crossing = false;
             });
         inject.set_budget(raw * 2 / 3);
         assert!(
@@ -7717,6 +7735,11 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
         let (dir, db, model, inject, raw) =
             land_store_with(&format!("auto-land-cross-{drop_past}-{near}"), 50, |o| {
                 o.zpages_land_drop_past = drop_past;
+                // The swap at the crossing before any buy: a controller
+                // that suspects at the crossing buys the attach on the
+                // prediction inside the steps this waits.
+                o.zpages_cover_resident = false;
+                o.zpages_suspect_at_crossing = false;
             });
         inject.set_budget(raw * 3 / 2);
         assert!(
@@ -7858,6 +7881,11 @@ fn a_buy_attaches_every_form_file_built_ahead_before_any_warm() {
                 // One builder ahead, whose order the files' times read:
                 // two finish in whatever order their builds take.
                 o.zpages_ahead_builders = 1;
+                // The turn's order of attach and warm: where resident and
+                // in-flight partitions count as covered, every attach goes
+                // before any warm whether or not it is asked to.
+                o.zpages_cover_resident = false;
+                o.zpages_suspect_at_crossing = false;
             });
         inject.set_budget(raw * 3 / 2);
         assert!(
@@ -7923,6 +7951,255 @@ fn a_buy_attaches_every_form_file_built_ahead_before_any_warm() {
         check(&r, &model, &some, &what);
         assert!(db.zpage_counts().reads > 0, "{what}: through the form");
         drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A partition whose form file is still to be built and whose raw records
+/// are resident counts as covered (`Options::zpages_cover_resident`): the
+/// buy attaches the files on disk and installs the form with that one
+/// partition left to the raw form, where without the option the install
+/// waits for its build. The largest partition's file is taken away after
+/// the builds ahead, the builds ahead held off by a scan near and the
+/// controller's own build of it held at its start, so it stays without a
+/// file, a share of the footprint past the tenth the install leaves out.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_partition_whose_raw_records_are_resident_counts_as_covered() {
+    // The buy's price with the option and without: the builds ahead are
+    // due, and build the resident partition whether the controller buys or
+    // not, so with the option its build is not in the price.
+    let mut prices = Vec::new();
+    for cover in [true, false] {
+        let what = format!("cover resident {cover}");
+        let (dir, db, model, inject, raw) =
+            land_store_with(&format!("auto-cover-res-{cover}"), 50, |o| {
+                o.partition_bytes = Some(512 << 10);
+                o.zpages_cover_resident = cover;
+                o.zpages_ahead_builders = 1;
+            });
+        inject.set_budget(raw * 3 / 2);
+        assert!(
+            tick_until(&db, 400, |c| c.prebuilt >= c.partitions),
+            "{what}: built ahead: {:?}",
+            db.zpage_counts()
+        );
+        let n = db.zpage_counts().partitions;
+        assert!(
+            (3..=8).contains(&n),
+            "{what}: a partition past a tenth: {n}"
+        );
+        // The largest file but the first partition's, so that a warm of
+        // the first comes before its build in key order.
+        let mut files = form_files(&dir);
+        files.sort();
+        let largest = files
+            .into_iter()
+            .skip(1)
+            .max_by_key(|f| std::fs::metadata(f).unwrap().len())
+            .unwrap();
+        std::fs::remove_file(&largest).unwrap();
+        db.scan(b"", 10, kv(&mut |_, _| {})).unwrap();
+        db.hold_zpage_build(true);
+        inject.set_records_resident(1.0);
+        inject.set_budget(1 << 20);
+        inject.set_refault_rate(1_000_000.0);
+        inject.set_fault_cost(FAULT_1MS);
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        // The price as the sampler gave it, which the selector forgets
+        // once it installs.
+        let (mut compact, mut price) = (false, 0u64);
+        for _ in 0..300 {
+            compact = drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 1);
+            price = price.max(db.zpage_counts().sel_c_build_ns);
+            if compact {
+                break;
+            }
+        }
+        let c = db.zpage_counts();
+        if cover {
+            assert!(compact, "{what}: installed with one partition raw: {c:?}");
+            assert_eq!(c.attached, n - 1, "{what}: the rest attached: {c:?}");
+            // The partition still to build goes before the warms of the
+            // files attached: its build, held at its start, holds the
+            // builder, and no warm has run.
+            wait_steps(&db, 5);
+            let c = db.zpage_counts();
+            assert_eq!(c.warms, 0, "{what}: the build before the warms: {c:?}");
+        } else {
+            assert!(!compact, "{what}: installed short of the coverage: {c:?}");
+        }
+        assert!(price > 0, "{what}: priced: {c:?}");
+        prices.push(price);
+        db.hold_zpage_build(false);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert!(
+        prices[0] < prices[1],
+        "the resident partition's build out of the price: {prices:?}"
+    );
+}
+
+/// The controller suspects at the tick the store crosses the line
+/// (`Options::zpages_suspect_at_crossing`): the look the builds at landing
+/// take at every tick reads the model there and one hot reading suspects,
+/// where without the option the crossing a tenth of a second after a
+/// reading waits for the next second's reading and the one after it.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_controller_suspects_at_the_tick_the_store_crosses_its_budget() {
+    for at_crossing in [true, false] {
+        let what = format!("at the crossing {at_crossing}");
+        let (dir, db, _model, inject, _raw) =
+            land_store_with(&format!("auto-crossing-{at_crossing}"), 50, |o| {
+                o.zpages_suspect_at_crossing = at_crossing;
+            });
+        // A reading under the huge budget: FITS, the reading this tick's.
+        advance_tick(&db, std::time::Duration::from_secs(1));
+        assert_eq!(db.zpage_counts().phase, 0, "{what}: FITS");
+        // The store crosses: the next census tick, a tenth of a second on.
+        inject.set_budget(1 << 20);
+        wait_steps(&db, 1);
+        let c = db.zpage_counts();
+        if at_crossing {
+            assert_eq!(c.phase, 1, "{what}: SUSPECT at the crossing: {c:?}");
+        } else {
+            assert_eq!(c.phase, 0, "{what}: FITS a tick past it: {c:?}");
+            // Two readings a second apart: the second suspects, at the
+            // second second.
+            assert!(
+                tick_until(&db, 30, |c| c.phase == 1),
+                "{what}: SUSPECT in the end: {:?}",
+                db.zpage_counts()
+            );
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A build ahead in flight holds no sample where resident records count as
+/// covering a partition (`Options::zpages_cover_resident`): its file is
+/// coming and its build paid whether the controller buys or not, so the
+/// reading counts it as covered, resident or not -- a build ahead past the
+/// line drops the records behind it. Past its budget the controller wants a
+/// sample while a build ahead of a partition whose file was taken away is
+/// held at its rename, its records no longer resident, and with the option
+/// the sample starts beside it, the attach of the other files is bought and
+/// the form installed; without it the sample waits.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_build_ahead_over_resident_records_holds_no_sample() {
+    for cover in [true, false] {
+        let what = format!("cover resident {cover}");
+        let (dir, db, _model, inject, raw) =
+            land_store_with(&format!("auto-held-res-{cover}"), 50, |o| {
+                o.zpages_cover_resident = cover;
+                o.zpages_ahead_builders = 1;
+                o.partition_bytes = Some(400 << 10);
+            });
+        inject.set_records_resident(1.0);
+        inject.set_budget(raw * 3 / 2);
+        assert!(
+            tick_until(&db, 400, |c| c.prebuilt >= c.partitions),
+            "{what}: built ahead: {:?}",
+            db.zpage_counts()
+        );
+        let n = db.zpage_counts().partitions;
+        // The largest file taken away and built ahead again past the
+        // budget, held at its rename.
+        db.hold_zpage_rename(true);
+        let largest = form_files(&dir)
+            .into_iter()
+            .max_by_key(|f| std::fs::metadata(f).unwrap().len())
+            .unwrap();
+        std::fs::remove_file(&largest).unwrap();
+        inject.set_budget(raw / 2);
+        assert!(
+            tick_until(&db, 400, |c| c.phase >= 1 && c.build_starts > n),
+            "{what}: past FITS with a build ahead in flight: {:?}",
+            db.zpage_counts()
+        );
+        wait_for(&format!("{what}: the build at its hold"), || {
+            db.zpage_build_waiting()
+        });
+        inject.set_records_resident(0.0);
+        wait_steps(&db, 3);
+        let c = db.zpage_counts();
+        if cover {
+            assert!(c.samples >= 1, "{what}: sampled beside it: {c:?}");
+            // And the reading counts the partition in flight as covered:
+            // the attach is bought on the prediction once the partitions
+            // have stood, with the build still held and no read made.
+            assert!(
+                tick_until(&db, 60, |c| c.sel_builds >= 1),
+                "{what}: bought beside it: {:?}",
+                db.zpage_counts()
+            );
+            // And installed: the other files attached with the build ahead
+            // in the builder's slot, the partition in flight counted as
+            // covered.
+            assert!(
+                tick_until(&db, 30, |c| c.phase == 3),
+                "{what}: installed beside it: {:?}",
+                db.zpage_counts()
+            );
+            let c = db.zpage_counts();
+            assert_eq!(c.attached, n - 1, "{what}: the rest attached: {c:?}");
+            assert!(db.zpage_build_waiting(), "{what}: the build still held");
+        } else {
+            assert_eq!(c.samples, 0, "{what}: waited for it: {c:?}");
+        }
+        db.hold_zpage_rename(false);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Where the controller suspects at the crossing
+/// (`Options::zpages_suspect_at_crossing`), no sample starts while a seal is
+/// in flight: its reading would be of a store the landing changes. The seal
+/// is held before its landing while the controller passes FITS, and the
+/// sample starts once it lands; without the option it starts beside it.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_sample_waits_for_a_seal_in_flight_where_the_controller_suspects_at_the_crossing() {
+    for crossing in [true, false] {
+        let what = format!("at the crossing {crossing}");
+        let (dir, mut db, model, inject, _raw) =
+            land_store_with(&format!("auto-seal-sample-{crossing}"), 0, |o| {
+                o.zpages_suspect_at_crossing = crossing;
+            });
+        let k = model.keys().next().unwrap().clone();
+        db.append(&k, b"a write inside the store");
+        db.commit().unwrap();
+        db.hold_seal_landing(true);
+        db.seal().unwrap();
+        assert!(db.in_flight().0, "{what}: the seal is in flight, held");
+        inject.set_budget(1 << 20);
+        assert!(
+            tick_until(&db, 60, |c| c.phase >= 1),
+            "{what}: past FITS: {:?}",
+            db.zpage_counts()
+        );
+        wait_steps(&db, 3);
+        let c = db.zpage_counts();
+        if crossing {
+            assert_eq!(c.samples, 0, "{what}: waited for the seal: {c:?}");
+        } else {
+            assert!(c.samples >= 1, "{what}: sampled beside it: {c:?}");
+        }
+        db.hold_seal_landing(false);
+        assert!(
+            tick_until(&db, 100, |c| c.samples >= 1),
+            "{what}: sampled once it landed: {:?}",
+            db.zpage_counts()
+        );
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
