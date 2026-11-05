@@ -3744,6 +3744,20 @@ impl Supdb {
         )
     }
 
+    /// `supdb-nozpages` with two merges in flight, as `supdb-mergepar2`:
+    /// the pair with `supdb-nozpages` prices the merges with no controller
+    /// in either arm, whose buy moves a lag pass by more than the merges do.
+    pub fn create_nozpages_mergepar2(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zpages_off: true,
+                mergepar2: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-ingest` with two merges in flight, as `supdb-mergepar2`.
     pub fn create_ingest_mergepar2(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
@@ -7626,7 +7640,9 @@ impl Engine for Supdb {
             };
         }
         if self.mergepar2 {
-            return if self.partition {
+            return if self.zpages_off {
+                "supdb-nozpagesmergepar2"
+            } else if self.partition {
                 "supdb-mergepar2"
             } else {
                 "supdb-ingestmergepar2"
@@ -9109,6 +9125,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nomergechain"
         | "supdb-mergeuncapped"
         | "supdb-mergepar2"
+        | "supdb-nozpagesmergepar2"
         | "supdb-boundarytop"
         | "supdb-nodirwillneed"
         | "supdb-noboundsheadwillneed"
@@ -9643,6 +9660,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-mergeuncapped" => supdb_arm(Supdb::create_mergeuncapped, dir)?,
         "supdb-ingestmergeuncapped" => supdb_arm(Supdb::create_ingest_mergeuncapped, dir)?,
         "supdb-mergepar2" => supdb_arm(Supdb::create_mergepar2, dir)?,
+        "supdb-nozpagesmergepar2" => supdb_arm(Supdb::create_nozpages_mergepar2, dir)?,
         "supdb-ingestmergepar2" => supdb_arm(Supdb::create_ingest_mergepar2, dir)?,
         "supdb-boundarytop" => supdb_arm(Supdb::create_boundarytop, dir)?,
         "supdb-ingestboundarytop" => supdb_arm(Supdb::create_ingest_boundarytop, dir)?,
@@ -11123,6 +11141,76 @@ mod tests {
     /// (`Options::zpages_block_cache` off) and nothing else: named, durable
     /// like it, opened under its name by the dispatch, the cache and the
     /// controller as the base has them, and the engine's default on.
+    /// Each arm with two merges in flight is named as itself, opened through
+    /// `open` by that name, and differs from its base in the merges alone:
+    /// the arm without the compact form was named `supdb-mergepar2` by a
+    /// branch that came before the one for the form.
+    #[test]
+    fn the_parallel_merge_arms_differ_from_their_bases_in_the_merges_alone() {
+        let root =
+            std::env::temp_dir().join(format!("supdb-bench-mergepar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        type Make = fn(&Path) -> Res<Supdb>;
+        let pairs: [(&str, &str, Make, Make); 3] = [
+            (
+                "supdb-mergepar2",
+                "supdb",
+                Supdb::create_mergepar2,
+                Supdb::create,
+            ),
+            (
+                "supdb-ingestmergepar2",
+                "supdb-ingest",
+                Supdb::create_ingest_mergepar2,
+                Supdb::create_ingest,
+            ),
+            (
+                "supdb-nozpagesmergepar2",
+                "supdb-nozpages",
+                Supdb::create_nozpages_mergepar2,
+                Supdb::create_nozpages,
+            ),
+        ];
+        for (arm, base, make_arm, make_base) in pairs {
+            let dir = |n: &str| {
+                let d = root.join(n);
+                std::fs::create_dir_all(&d).unwrap();
+                d
+            };
+            let opened = open(arm, &dir(&format!("{arm}-open")), 1).unwrap();
+            assert_eq!(opened.name(), arm);
+            drop(opened);
+            let (a, b) = (make_arm(&dir(arm)).unwrap(), make_base(&dir(base)).unwrap());
+            assert_eq!((a.name(), b.name()), (arm, base));
+            assert_eq!(guarantee(arm), guarantee(base), "{arm}");
+            assert!(!ARMS.contains(&arm) && !OOC_ARMS.contains(&arm), "{arm}");
+            assert_eq!(a.features(), b.features(), "{arm}");
+            let (oa, ob) = (
+                a.db.as_ref().unwrap().options(),
+                b.db.as_ref().unwrap().options(),
+            );
+            assert_eq!((oa.merge_parallel, ob.merge_parallel), (2, 1), "{arm}");
+            assert_eq!(
+                (
+                    oa.zpages,
+                    oa.sync,
+                    oa.partition_on_flush,
+                    oa.merge_bytes_cap,
+                    oa.scan_block_cache
+                ),
+                (
+                    ob.zpages,
+                    ob.sync,
+                    ob.partition_on_flush,
+                    ob.merge_bytes_cap,
+                    ob.scan_block_cache
+                ),
+                "{arm}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn the_raw_cache_arm_differs_from_the_combined_arm_in_the_cache_reads_alone() {
         let root =
