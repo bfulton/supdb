@@ -3624,9 +3624,9 @@ pub struct Options {
     /// the free bytes by; the engine does not link against it, so such a
     /// build still links.
     pub forms_trim_bytes: usize,
-    /// EXPERIMENT: the forms are built and grown to fit, with their three
-    /// parts (`forms_fit_shed`, `forms_fit_sweep`, `forms_trim_bytes`),
-    /// while the store is short of memory and not otherwise: while its
+    /// The forms are built and grown to fit, with their three parts
+    /// (`forms_fit_shed`, `forms_fit_sweep`, `forms_trim_bytes`), while
+    /// the store is short of memory and not otherwise: while its
     /// partitions' raw bytes, the hash slots and the records a read
     /// touches, exceed the memory available to cache them -- the limit in
     /// effect, the group's or the machine's, less the anonymous memory
@@ -3635,11 +3635,14 @@ pub struct Options {
     /// compact form's controller is decided by. The segment work looks
     /// once a second and publishes what it finds; inline, it never looks
     /// and the forms are not fitted. A store that fits is never short, so
-    /// in core the option changes nothing but a parked trim thread. Off:
-    /// fitted only by `forms_to_fit` or a bound budget, as before.
-    /// `supdb-fitshort` is the arm, and `supdb-nozpagesfitshort` beside
-    /// `supdb-nozpages` prices it on the lag sweep with no controller in
-    /// either arm.
+    /// in core the option changes nothing; the trim thread starts at the
+    /// look that first finds the store short. Under 1.25 GiB at ten
+    /// million keys it read E 1.11x and 1.31x in two sittings, the
+    /// point-read mixes 0.78-1.11x, unresolved, and the lag sweep's
+    /// weighted sum 0.89x of the time with no compact form in either arm
+    /// (`docs/engine.md`, ycsb-E taken apart). Off: fitted only by
+    /// `forms_to_fit` or a bound budget; `supdb-nofitshort` is that shape,
+    /// and `supdb-nozpagesnofitshort` beside `supdb-nozpages`.
     pub forms_fit_when_short: bool,
 }
 
@@ -3892,7 +3895,7 @@ impl Default for Options {
             forms_fit_shed: true,
             forms_fit_sweep: true,
             forms_trim_bytes: 32 << 20,
-            forms_fit_when_short: false,
+            forms_fit_when_short: true,
         }
     }
 }
@@ -14218,6 +14221,12 @@ struct Shared {
     /// writes the counts.
     trim_wanted: std::sync::atomic::AtomicBool,
     trim_thread: std::sync::OnceLock<std::thread::Thread>,
+    /// The trim thread in flight, where whoever starts it puts it: the
+    /// writer at the open of a store that fits its forms from the start,
+    /// the segment work at the look that first finds the store short
+    /// (`Options::forms_fit_when_short`); the writer's close marks it
+    /// closed and joins the thread, so a start after that is refused.
+    trimmer: std::sync::Mutex<TrimSlot>,
     trim_floor: AtomicUsize,
     trims: AtomicU64,
     /// The looks the thread made at the allocator, those that trimmed and
@@ -14486,6 +14495,42 @@ fn trim_loop(
 struct Trimmer {
     handle: Option<std::thread::JoinHandle<()>>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Where the trim thread is kept (`Shared::trimmer`): the thread, once
+/// started, and whether the store has closed it.
+#[derive(Default)]
+struct TrimSlot {
+    trimmer: Option<Trimmer>,
+    closed: bool,
+}
+
+/// The trim thread started, unless one runs, the store has closed it, or
+/// the stride is zero: one thread for whoever frees forms to ask, and a
+/// request made before it starts is waiting for it (`Shared::trim_wanted`).
+fn start_trimmer(shared: &std::sync::Arc<Shared>, opts: &Options) {
+    if opts.forms_trim_bytes == 0 {
+        return;
+    }
+    let mut slot = shared.trimmer.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.closed || slot.trimmer.is_some() {
+        return;
+    }
+    let held = shared.clone();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = stop.clone();
+    let stride = opts.forms_trim_bytes;
+    let by_resident = opts.trim_by_resident;
+    let spawned = std::thread::Builder::new()
+        .name("supdb-trim".into())
+        .spawn(move || trim_loop(&held, &flag, stride, by_resident));
+    if let Ok(handle) = spawned {
+        let _ = shared.trim_thread.set(handle.thread().clone());
+        slot.trimmer = Some(Trimmer {
+            handle: Some(handle),
+            stop,
+        });
+    }
 }
 
 /// EXPERIMENT: a replaced canonical form on its way to being freed. A
@@ -15543,9 +15588,6 @@ pub struct Db {
     /// EXPERIMENT: the upkeep thread, once a commit has had something
     /// for it; see `Upkeep::Background`.
     upkeeper: Option<Upkeeper>,
-    /// The trim thread, started at the open of a store that keeps its forms
-    /// to fit (`Options::forms_trim_bytes`).
-    trimmer: Option<Trimmer>,
     /// The upkeep thread's regime, kept by the writer since the upkeep
     /// itself may be lent: the generation and committed log length at
     /// the last hand-over, the store's scan count as last seen, and the
@@ -26110,6 +26152,7 @@ impl Db {
             fit_swept: AtomicUsize::new(0),
             fit_skips: std::sync::atomic::AtomicU32::new(0),
             trim_thread: std::sync::OnceLock::new(),
+            trimmer: std::sync::Mutex::new(TrimSlot::default()),
             trim_hold: std::sync::atomic::AtomicBool::new(false),
             trim_begun: AtomicU64::new(0),
         });
@@ -26172,7 +26215,6 @@ impl Db {
             wal_dir_unsynced: false,
             keeper: None,
             upkeeper: None,
-            trimmer: None,
             upkeep_log: (0, 0),
             upkeep_life: 0,
             upkeep_since_scan: 0,
@@ -26647,6 +26689,7 @@ impl Db {
             fit_swept: AtomicUsize::new(0),
             fit_skips: std::sync::atomic::AtomicU32::new(0),
             trim_thread: std::sync::OnceLock::new(),
+            trimmer: std::sync::Mutex::new(TrimSlot::default()),
             trim_hold: std::sync::atomic::AtomicBool::new(false),
             trim_begun: AtomicU64::new(0),
         });
@@ -26709,7 +26752,6 @@ impl Db {
             wal_dir_unsynced: false,
             keeper: None,
             upkeeper: None,
-            trimmer: None,
             upkeep_log: (0, 0),
             upkeep_life: 0,
             upkeep_since_scan: 0,
@@ -29719,7 +29761,19 @@ impl Db {
     /// memory (`Options::forms_fit_when_short`).
     #[doc(hidden)]
     pub fn forms_short(&self) -> bool {
-        self.shared.forms_short.load(AtomicOrdering::Relaxed)
+        self.shared.forms_short.load(AtomicOrdering::Acquire)
+    }
+
+    /// A test's: whether the store's trim thread has started
+    /// (`Shared::trimmer`).
+    #[doc(hidden)]
+    pub fn trimmer_started(&self) -> bool {
+        self.shared
+            .trimmer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .trimmer
+            .is_some()
     }
 
     fn set_hold(hold: &std::sync::atomic::AtomicU8, bit: u8, on: bool) {
@@ -32574,39 +32628,33 @@ impl Db {
         }
     }
 
-    /// The trim thread started, if the options ask for one
-    /// (`Options::forms_to_fit` with a stride): at the open, so that a
-    /// handle's first request has a thread to wake, and a store that is
-    /// never asked costs a parked thread.
+    /// The trim thread started at the open of a store that fits its forms
+    /// from the start (`Options::forms_to_fit` with a stride), so that a
+    /// handle's first request has a thread to wake. A store that fits them
+    /// only while short of memory starts it at the segment work's look
+    /// that first finds it short (`Maint::short_look`), and a store that
+    /// is never short has none.
     fn start_trimmer(&mut self) {
-        if self.trimmer.is_some()
-            || !(self.opts.forms_to_fit || self.opts.forms_fit_when_short)
-            || self.opts.forms_trim_bytes == 0
-        {
-            return;
-        }
-        let shared = self.shared.clone();
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = stop.clone();
-        let stride = self.opts.forms_trim_bytes;
-        let by_resident = self.opts.trim_by_resident;
-        let spawned = std::thread::Builder::new()
-            .name("supdb-trim".into())
-            .spawn(move || trim_loop(&shared, &flag, stride, by_resident));
-        if let Ok(handle) = spawned {
-            let _ = self.shared.trim_thread.set(handle.thread().clone());
-            self.trimmer = Some(Trimmer {
-                handle: Some(handle),
-                stop,
-            });
+        if self.opts.forms_to_fit {
+            start_trimmer(&self.shared, &self.opts);
         }
     }
 
     /// The trim thread stopped and joined, which waits out a trim in
-    /// progress. A test's hold on it is lifted first.
+    /// progress, and the slot closed so that nothing starts it again. A
+    /// test's hold on it is lifted first.
     fn stop_trimmer(&mut self) {
         self.shared.trim_hold.store(false, AtomicOrdering::Release);
-        if let Some(mut t) = self.trimmer.take() {
+        let taken = {
+            let mut slot = self
+                .shared
+                .trimmer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            slot.closed = true;
+            slot.trimmer.take()
+        };
+        if let Some(mut t) = taken {
             t.stop.store(true, AtomicOrdering::SeqCst);
             if let Some(th) = self.shared.trim_thread.get() {
                 th.unpark();
@@ -38659,7 +38707,7 @@ impl Maint {
     /// (`Options::forms_fit_when_short`): its partitions' raw bytes, the
     /// hash slots and records a read touches, over the budget the memory
     /// available leaves (`z_budget`). A budget that cannot be read is not
-    /// short.
+    /// short. The first look that finds it short starts the trim thread.
     fn short_look(&mut self) {
         if !self.opts.forms_fit_when_short {
             return;
@@ -38683,9 +38731,14 @@ impl Maint {
                 })
         };
         let short = self.z_budget().is_some_and(|budget| raw > budget);
+        // The thread before the word, so that a handle that reads the
+        // store short and asks for a trim finds a thread to ask.
+        if short {
+            start_trimmer(&self.shared, &self.opts);
+        }
         self.shared
             .forms_short
-            .store(short, AtomicOrdering::Relaxed);
+            .store(short, AtomicOrdering::Release);
     }
 
     /// The budget the model prices against: the seam's where a test has set

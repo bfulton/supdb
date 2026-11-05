@@ -4989,8 +4989,9 @@ fn the_seal_grows_with_the_store() {
 /// The forms fit for want of memory (`forms_fit_when_short`): the
 /// segment work finds the store short while its partitions' raw bytes
 /// exceed the budget the memory available leaves, here the one a test
-/// sets through the seam, and not short once the budget holds them;
-/// without the option it never looks.
+/// sets through the seam, and not short once the budget holds them, and
+/// the trim thread starts at the first look that finds it short and not
+/// before; without the option it never looks and no thread starts.
 #[test]
 fn the_store_is_short_of_memory_while_its_raw_form_exceeds_the_budget() {
     let wait = |db: &Db, want: bool, what: &str| {
@@ -5024,15 +5025,18 @@ fn the_store_is_short_of_memory_while_its_raw_form_exceeds_the_budget() {
         // Room for every byte: not short, whatever the option.
         std::thread::sleep(std::time::Duration::from_millis(1200));
         assert!(!db.forms_short(), "on={on}: short with room");
+        assert!(!db.trimmer_started(), "on={on}: a trim thread with room");
         // A budget of a byte: short with the option, and nothing without.
         inject.set_budget(1);
         if on {
             wait(&db, true, "a budget of a byte");
+            assert!(db.trimmer_started(), "short, and no trim thread");
             inject.set_budget(1 << 50);
             wait(&db, false, "room again");
         } else {
             std::thread::sleep(std::time::Duration::from_millis(2500));
             assert!(!db.forms_short(), "off: the store was looked at");
+            assert!(!db.trimmer_started(), "off: a trim thread");
         }
         drop(db);
         let _ = std::fs::remove_dir_all(&d);
