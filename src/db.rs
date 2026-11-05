@@ -3624,6 +3624,23 @@ pub struct Options {
     /// the free bytes by; the engine does not link against it, so such a
     /// build still links.
     pub forms_trim_bytes: usize,
+    /// EXPERIMENT: the forms are built and grown to fit, with their three
+    /// parts (`forms_fit_shed`, `forms_fit_sweep`, `forms_trim_bytes`),
+    /// while the store is short of memory and not otherwise: while its
+    /// partitions' raw bytes, the hash slots and the records a read
+    /// touches, exceed the memory available to cache them -- the limit in
+    /// effect, the group's or the machine's, less the anonymous memory
+    /// charged against it and a margin, and no more than the machine's
+    /// `MemAvailable` less the margin (`zselect::Budget`), the budget the
+    /// compact form's controller is decided by. The segment work looks
+    /// once a second and publishes what it finds; inline, it never looks
+    /// and the forms are not fitted. A store that fits is never short, so
+    /// in core the option changes nothing but a parked trim thread. Off:
+    /// fitted only by `forms_to_fit` or a bound budget, as before.
+    /// `supdb-fitshort` is the arm, and `supdb-nozpagesfitshort` beside
+    /// `supdb-nozpages` prices it on the lag sweep with no controller in
+    /// either arm.
+    pub forms_fit_when_short: bool,
 }
 
 impl Options {
@@ -3875,6 +3892,7 @@ impl Default for Options {
             forms_fit_shed: true,
             forms_fit_sweep: true,
             forms_trim_bytes: 32 << 20,
+            forms_fit_when_short: false,
         }
     }
 }
@@ -14093,6 +14111,10 @@ struct Shared {
     in_seal: AtomicUsize,
     /// The partition merges in flight (`Maint::compacting`).
     in_merge: AtomicUsize,
+    /// Whether the store is short of memory: its partitions' raw bytes
+    /// over the budget, as the segment work last looked
+    /// (`Options::forms_fit_when_short`).
+    forms_short: std::sync::atomic::AtomicBool,
     /// A test's: bits under which a seal thread waits, so a test can hold
     /// the store at a point of the seal and ask what it sees there.
     /// `SEAL_HOLD_LANDING` holds it before its segments are renamed into
@@ -17261,7 +17283,10 @@ impl Reader {
             // handle that holds its upkeep, as the commit's sweep is: a
             // writer that has lent it leaves the sweeping to the thread
             // that has it.
-            if self.opts.forms_to_fit && self.opts.forms_fit_sweep && self.fs_home() {
+            if (self.opts.forms_to_fit || self.fits_short())
+                && self.opts.forms_fit_sweep
+                && self.fs_home()
+            {
                 self.sweep_at_leave();
             }
         }
@@ -20392,7 +20417,7 @@ impl Reader {
     /// asked in vain.
     fn note_freed(&self, bytes: usize) {
         let stride = self.opts.forms_trim_bytes;
-        if !self.opts.forms_to_fit || stride == 0 || bytes == 0 {
+        if !(self.opts.forms_to_fit || self.fits_short()) || stride == 0 || bytes == 0 {
             return;
         }
         let total = self.fs().freed.get() + bytes;
@@ -22519,7 +22544,13 @@ impl Reader {
     /// Whether forms are built and grown to fit: `forms_to_fit`, or the
     /// store's own budget once it has bound.
     fn fits(&self) -> bool {
-        self.opts.forms_to_fit || self.fs().cache_bound.get()
+        self.opts.forms_to_fit || self.fs().cache_bound.get() || self.fits_short()
+    }
+
+    /// Whether the forms are fitted with their three parts for want of
+    /// memory (`Options::forms_fit_when_short`).
+    fn fits_short(&self) -> bool {
+        self.opts.forms_fit_when_short && self.shared.forms_short.load(AtomicOrdering::Relaxed)
     }
 
     /// The store's own budget bound, where the cache has passed it: the
@@ -26042,6 +26073,7 @@ impl Db {
             drain_steps: DrainSteps::new(),
             in_seal: AtomicUsize::new(0),
             in_merge: AtomicUsize::new(0),
+            forms_short: std::sync::atomic::AtomicBool::new(false),
             seal_hold: std::sync::atomic::AtomicU8::new(0),
             merge_hold: std::sync::atomic::AtomicU8::new(0),
             forms_position_hold: std::sync::atomic::AtomicBool::new(false),
@@ -26578,6 +26610,7 @@ impl Db {
             drain_steps: DrainSteps::new(),
             in_seal: AtomicUsize::new(0),
             in_merge: AtomicUsize::new(0),
+            forms_short: std::sync::atomic::AtomicBool::new(false),
             seal_hold: std::sync::atomic::AtomicU8::new(0),
             merge_hold: std::sync::atomic::AtomicU8::new(0),
             forms_position_hold: std::sync::atomic::AtomicBool::new(false),
@@ -29682,6 +29715,13 @@ impl Db {
         self.shared.in_merge.load(AtomicOrdering::Acquire)
     }
 
+    /// A test's: whether the segment work last found the store short of
+    /// memory (`Options::forms_fit_when_short`).
+    #[doc(hidden)]
+    pub fn forms_short(&self) -> bool {
+        self.shared.forms_short.load(AtomicOrdering::Relaxed)
+    }
+
     fn set_hold(hold: &std::sync::atomic::AtomicU8, bit: u8, on: bool) {
         if on {
             hold.fetch_or(bit, AtomicOrdering::AcqRel);
@@ -32539,7 +32579,10 @@ impl Db {
     /// handle's first request has a thread to wake, and a store that is
     /// never asked costs a parked thread.
     fn start_trimmer(&mut self) {
-        if self.trimmer.is_some() || !self.opts.forms_to_fit || self.opts.forms_trim_bytes == 0 {
+        if self.trimmer.is_some()
+            || !(self.opts.forms_to_fit || self.opts.forms_fit_when_short)
+            || self.opts.forms_trim_bytes == 0
+        {
             return;
         }
         let shared = self.shared.clone();
@@ -35143,6 +35186,9 @@ struct Maint {
     /// was due at and whether a landing's chain asked; each merge in flight
     /// keeps its own (`Merging::why`).
     merge_why: (usize, bool),
+    /// When the store's shortness of memory was last looked at
+    /// (`Maint::short_look`).
+    short_last: Option<std::time::Instant>,
     /// When the last build was collected, for the trace's gap between one
     /// build and the next (`SUPDB_ZPAGES_TRACE`).
     z_last_collect: Option<std::time::Instant>,
@@ -35329,6 +35375,7 @@ impl Maint {
             self.idle_plan();
             self.shape_if_read(false);
             self.z_step();
+            self.short_look();
             self.sweep_spares();
             std::thread::park_timeout(MAINT_POLL);
         }
@@ -35753,6 +35800,7 @@ impl Maint {
             z_trace: std::env::var_os("SUPDB_ZPAGES_TRACE").is_some(),
             merge_trace: std::env::var_os("SUPDB_MERGE_TRACE").is_some(),
             merge_why: (0, false),
+            short_last: None,
             z_last_collect: None,
             z_epoch: std::time::Instant::now(),
             z_last_step: None,
@@ -38607,10 +38655,39 @@ impl Maint {
         }
     }
 
-    /// The model's reading (S1): the cache budget from the injection or the
-    /// platform, the group's refaults a second over the tick, and the raw
-    /// form's predicted faults a read over the partitions' footprint. None
-    /// where the platform gives no budget.
+    /// Once a second, whether the store is short of memory
+    /// (`Options::forms_fit_when_short`): its partitions' raw bytes, the
+    /// hash slots and records a read touches, over the budget the memory
+    /// available leaves (`z_budget`). A budget that cannot be read is not
+    /// short.
+    fn short_look(&mut self) {
+        if !self.opts.forms_fit_when_short {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .short_last
+            .is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(1))
+        {
+            return;
+        }
+        self.short_last = Some(now);
+        let raw = {
+            let _op = self.op();
+            self.segs()
+                .iter()
+                .filter(|s| s.level > 0)
+                .fold(0u64, |acc, s| {
+                    let (h, r) = s.foot();
+                    acc.saturating_add(h).saturating_add(r)
+                })
+        };
+        let short = self.z_budget().is_some_and(|budget| raw > budget);
+        self.shared
+            .forms_short
+            .store(short, AtomicOrdering::Relaxed);
+    }
+
     /// The budget the model prices against: the seam's where a test has set
     /// one, else the platform's (`zfile::read_budget`), else none.
     fn z_budget(&self) -> Option<u64> {
@@ -38621,6 +38698,10 @@ impl Maint {
             .or_else(|| zfile::read_budget().map(|b| b.budget))
     }
 
+    /// The model's reading (S1): the cache budget from the injection or the
+    /// platform, the group's refaults a second over the tick, and the raw
+    /// form's predicted faults a read over the partitions' footprint. None
+    /// where the platform gives no budget.
     fn z_model(&mut self, now: std::time::Duration) -> Option<zselect::Model> {
         let inject = self.opts.zpages_inject.clone();
         let platform = zfile::read_budget();

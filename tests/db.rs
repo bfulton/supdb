@@ -4986,6 +4986,59 @@ fn the_seal_grows_with_the_store() {
     }
 }
 
+/// The forms fit for want of memory (`forms_fit_when_short`): the
+/// segment work finds the store short while its partitions' raw bytes
+/// exceed the budget the memory available leaves, here the one a test
+/// sets through the seam, and not short once the budget holds them;
+/// without the option it never looks.
+#[test]
+fn the_store_is_short_of_memory_while_its_raw_form_exceeds_the_budget() {
+    let wait = |db: &Db, want: bool, what: &str| {
+        let t = std::time::Instant::now();
+        while db.forms_short() != want {
+            assert!(t.elapsed().as_secs() < 20, "{what}: never {want}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    for on in [true, false] {
+        let d = dir(if on { "fit-short" } else { "fit-short-off" });
+        let inject = std::sync::Arc::new(supdb::ZInject::new());
+        inject.set_budget(1 << 50);
+        let opts = Options {
+            seal_bytes: 64 << 10,
+            partition_bytes: Some(256 << 10),
+            forms_fit_when_short: on,
+            zpages: supdb::ZPages::Off,
+            zpages_inject: Some(inject.clone()),
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let val = vec![7u8; 200];
+        for k in 0..5_000u32 {
+            db.append(format!("key-{k:06}").as_bytes(), &val);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        assert!(db.levels().0 > 0, "the store has partitions");
+        // Room for every byte: not short, whatever the option.
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        assert!(!db.forms_short(), "on={on}: short with room");
+        // A budget of a byte: short with the option, and nothing without.
+        inject.set_budget(1);
+        if on {
+            wait(&db, true, "a budget of a byte");
+            inject.set_budget(1 << 50);
+            wait(&db, false, "room again");
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(2500));
+            assert!(!db.forms_short(), "off: the store was looked at");
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
 /// Out of core the seal holds at its floor (`seal_floor_out_of_core`):
 /// with the compact form's gate away from the raw form, a store whose
 /// threshold grew in core reads the floor, and a commit of twice the

@@ -598,7 +598,8 @@ pub struct Model {
     /// the counter does not say whose they are.
     pub refault_rate: f64,
     /// The cache budget `B`, bytes: the limit less the anonymous memory less
-    /// the margin.
+    /// the margin, and no more than the machine has available less the
+    /// margin (`Budget::within_available`).
     pub budget: u64,
 }
 
@@ -2158,7 +2159,9 @@ impl ZSelect {
 /// What the platform says of the memory the store's page cache may use
 /// (design 4.2): the limit in effect, the anonymous memory charged against
 /// it, the group's file refaults so far where the platform counts them, and
-/// the budget `B = limit - anon - margin`.
+/// the budget `B = limit - anon - margin`, held under what the machine has
+/// available less the margin where the platform says
+/// (`Budget::within_available`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Budget {
     pub limit: u64,
@@ -2180,6 +2183,25 @@ impl Budget {
             anon,
             refaults,
             budget: limit.saturating_sub(anon).saturating_sub(margin(limit)),
+        }
+    }
+
+    /// The budget held under the machine's `MemAvailable` less the margin:
+    /// a group's limit, or the machine's total less this process's
+    /// anonymous memory, says nothing of the other processes beside it, and
+    /// the memory they hold is memory the store's pages cannot have. The
+    /// kernel counts the page cache it could reclaim as available, the
+    /// store's own with it, so the store's cache does not shrink its own
+    /// budget; the anonymous memory of every process is out of it, this
+    /// one's too, which the limit's side subtracts already. `None`, where
+    /// the kernel does not say, leaves the budget as it is.
+    pub fn within_available(self, available: Option<u64>) -> Budget {
+        let Some(avail) = available else {
+            return self;
+        };
+        Budget {
+            budget: self.budget.min(avail.saturating_sub(margin(self.limit))),
+            ..self
         }
     }
 }
@@ -2298,6 +2320,13 @@ pub fn parse_limit(text: &str) -> Option<u64> {
 /// `MemTotal` of `/proc/meminfo`, bytes.
 pub fn parse_meminfo_total(text: &str) -> Option<u64> {
     parse_kb(text, "MemTotal:")
+}
+
+/// `MemAvailable` of `/proc/meminfo`, bytes: the kernel's estimate of what
+/// can be had without swapping, free memory and the page cache it could
+/// reclaim; absent before Linux 3.14.
+pub fn parse_meminfo_available(text: &str) -> Option<u64> {
+    parse_kb(text, "MemAvailable:")
 }
 
 /// `RssAnon` of `/proc/self/status`, bytes.
@@ -2445,6 +2474,16 @@ mod tests {
             Some(16479232 * 1024)
         );
         assert_eq!(
+            parse_meminfo_available(
+                "MemTotal: 16479232 kB\nMemFree: 1 kB\nMemAvailable:    8000000 kB\n"
+            ),
+            Some(8000000 * 1024)
+        );
+        assert_eq!(
+            parse_meminfo_available("MemTotal: 16479232 kB\nMemFree: 1 kB\n"),
+            None
+        );
+        assert_eq!(
             parse_status_rss_anon("Name:\tx\nRssAnon:\t  4096 kB\nRssFile: 1 kB\n"),
             Some(4096 * 1024)
         );
@@ -2462,6 +2501,29 @@ mod tests {
         assert_eq!(b.refaults, Some(7));
         // The anon past the limit leaves nothing, never a wrap.
         assert_eq!(Budget::of(1 << 30, 2 << 30, None).budget, 0);
+    }
+
+    #[test]
+    fn the_budget_is_held_under_what_the_machine_has_available() {
+        let g = Budget::of(1 << 30, 100 << 20, Some(7));
+        // A machine with room past the group's limit changes nothing.
+        assert_eq!(g.within_available(Some(16 << 30)), g);
+        // Room at the limit's own budget plus the margin is the budget.
+        let edge = g.budget + margin(1 << 30);
+        assert_eq!(g.within_available(Some(edge)), g);
+        // Less than that is the budget, the margin taken off the
+        // available, and the rest of the reading as it was.
+        let tight = g.within_available(Some(512 << 20));
+        assert_eq!(tight.budget, (512 << 20) - margin(1 << 30));
+        assert_eq!(
+            (tight.limit, tight.anon, tight.refaults),
+            (g.limit, g.anon, g.refaults)
+        );
+        assert_eq!(g.within_available(Some(edge - 1)).budget, g.budget - 1);
+        // Less than the margin leaves nothing, never a wrap.
+        assert_eq!(g.within_available(Some(10 << 20)).budget, 0);
+        // A kernel that does not say leaves the budget.
+        assert_eq!(g.within_available(None), g);
     }
 
     #[test]

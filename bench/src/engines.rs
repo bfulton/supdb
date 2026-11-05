@@ -566,6 +566,10 @@ pub struct Supdb {
     /// default grows it with the store (`Options::seal_floor_out_of_core`).
     /// `supdb-sealfloorooc`, durable.
     sealfloorooc: bool,
+    /// The forms fitted while the store is short of memory, and not in core
+    /// (`Options::forms_fit_when_short`). `supdb-fitshort`, and
+    /// `supdb-nozpagesfitshort` beside `supdb-nozpages`, durable.
+    fitshort: bool,
     /// The block cache reads a block boundary's key off the ordered index's
     /// top level in memory, where the default reads the partition's record
     /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
@@ -1356,6 +1360,10 @@ struct Policy {
     /// default grows it with the store (`Options::seal_floor_out_of_core`).
     /// `supdb-sealfloorooc`, durable.
     sealfloorooc: bool,
+    /// The forms fitted while the store is short of memory, and not in core
+    /// (`Options::forms_fit_when_short`). `supdb-fitshort`, and
+    /// `supdb-nozpagesfitshort` beside `supdb-nozpages`, durable.
+    fitshort: bool,
     /// The block cache reads a block boundary's key off the ordered index's
     /// top level in memory, where the default reads the partition's record
     /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
@@ -1926,6 +1934,7 @@ impl Default for Policy {
             mergeuncapped: false,
             mergepar2: false,
             sealfloorooc: false,
+            fitshort: false,
             boundarytop: false,
             nodirwillneed: false,
             noboundsheadwillneed: false,
@@ -3761,6 +3770,34 @@ impl Supdb {
             path,
             Policy {
                 sealfloorooc: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose forms are fitted while the store is short of memory
+    /// (`Options::forms_fit_when_short`): against `supdb` it prices the fit
+    /// under a bound with the in-core shape left as it is.
+    pub fn create_fitshort(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                fitshort: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-nozpages` whose forms are fitted while the store is short of
+    /// memory, as `supdb-fitshort`: the pair with `supdb-nozpages` prices the
+    /// fit on the lag sweep under a bound with no controller in either arm,
+    /// whose buy moves a lag pass by more than the fit does.
+    pub fn create_nozpages_fitshort(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zpages_off: true,
+                fitshort: true,
                 ..Policy::default()
             },
         )
@@ -6353,6 +6390,7 @@ impl Supdb {
             mergeuncapped,
             mergepar2,
             sealfloorooc,
+            fitshort,
             boundarytop,
             nodirwillneed,
             noboundsheadwillneed,
@@ -6660,6 +6698,7 @@ impl Supdb {
                 supdb::Options::default().merge_parallel
             },
             seal_floor_out_of_core: sealfloorooc,
+            forms_fit_when_short: fitshort,
             boundary_keys_from_top: boundarytop,
             pieces_dir_willneed: !nodirwillneed,
             bounds_heads_willneed: !noboundsheadwillneed,
@@ -6936,6 +6975,7 @@ impl Supdb {
             mergeuncapped,
             mergepar2,
             sealfloorooc,
+            fitshort,
             boundarytop,
             nodirwillneed,
             noboundsheadwillneed,
@@ -7683,6 +7723,13 @@ impl Engine for Supdb {
         }
         if self.sealfloorooc {
             return "supdb-sealfloorooc";
+        }
+        if self.fitshort {
+            return if self.zpages_off {
+                "supdb-nozpagesfitshort"
+            } else {
+                "supdb-fitshort"
+            };
         }
         if self.zcacheraw && !self.zpages_auto && !self.tofit && self.budget == 0 {
             return "supdb-cacheraw";
@@ -9175,6 +9222,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-mergepar2"
         | "supdb-sealfloorooc"
         | "supdb-cacheraw"
+        | "supdb-fitshort"
+        | "supdb-nozpagesfitshort"
         | "supdb-nozpagesmergepar2"
         | "supdb-boundarytop"
         | "supdb-nodirwillneed"
@@ -9712,6 +9761,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-mergepar2" => supdb_arm(Supdb::create_mergepar2, dir)?,
         "supdb-sealfloorooc" => supdb_arm(Supdb::create_sealfloorooc, dir)?,
         "supdb-cacheraw" => supdb_arm(Supdb::create_cacheraw, dir)?,
+        "supdb-fitshort" => supdb_arm(Supdb::create_fitshort, dir)?,
+        "supdb-nozpagesfitshort" => supdb_arm(Supdb::create_nozpages_fitshort, dir)?,
         "supdb-nozpagesmergepar2" => supdb_arm(Supdb::create_nozpages_mergepar2, dir)?,
         "supdb-ingestmergepar2" => supdb_arm(Supdb::create_ingest_mergepar2, dir)?,
         "supdb-boundarytop" => supdb_arm(Supdb::create_boundarytop, dir)?,
@@ -11276,7 +11327,7 @@ mod tests {
         };
         let base = Supdb::create(&dir("base")).unwrap();
         let b = base.db.as_ref().unwrap().options();
-        for arm in ["supdb-sealfloorooc", "supdb-cacheraw"] {
+        for arm in ["supdb-sealfloorooc", "supdb-cacheraw", "supdb-fitshort"] {
             assert_eq!(
                 open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
                 arm
@@ -11286,6 +11337,61 @@ mod tests {
         }
         let floor = Supdb::create_sealfloorooc(&dir("floor")).unwrap();
         let raw = Supdb::create_cacheraw(&dir("raw")).unwrap();
+        let short = Supdb::create_fitshort(&dir("short")).unwrap();
+        assert_eq!(short.features(), base.features());
+        {
+            // The sibling beside `supdb-nozpages` differs from it in the
+            // fit alone, as `supdb-fitshort` does from `supdb`.
+            let arm = "supdb-nozpagesfitshort";
+            assert_eq!(
+                open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
+                arm
+            );
+            assert_eq!(guarantee(arm), guarantee("supdb-nozpages"));
+            let (a, z) = (
+                Supdb::create_nozpages_fitshort(&dir("nozshort")).unwrap(),
+                Supdb::create_nozpages(&dir("noz")).unwrap(),
+            );
+            assert_eq!((a.name(), z.name()), (arm, "supdb-nozpages"));
+            assert_eq!(a.features(), z.features());
+            let (oa, oz) = (
+                a.db.as_ref().unwrap().options(),
+                z.db.as_ref().unwrap().options(),
+            );
+            assert!(oa.forms_fit_when_short && !oz.forms_fit_when_short);
+            assert_eq!(
+                (
+                    oa.forms_to_fit,
+                    oa.zpages,
+                    oa.zpages_block_cache,
+                    oa.merge_parallel
+                ),
+                (
+                    oz.forms_to_fit,
+                    oz.zpages,
+                    oz.zpages_block_cache,
+                    oz.merge_parallel
+                )
+            );
+        }
+        {
+            let s = short.db.as_ref().unwrap().options();
+            assert!(s.forms_fit_when_short && !b.forms_fit_when_short);
+            assert_eq!(
+                (
+                    s.forms_to_fit,
+                    s.zpages,
+                    s.zpages_block_cache,
+                    s.seal_floor_out_of_core
+                ),
+                (
+                    b.forms_to_fit,
+                    b.zpages,
+                    b.zpages_block_cache,
+                    b.seal_floor_out_of_core
+                )
+            );
+        }
         assert_eq!(floor.features(), base.features());
         assert_eq!(raw.features(), base.features());
         let (f, r) = (
@@ -11322,7 +11428,7 @@ mod tests {
                 b.forms_to_fit
             )
         );
-        drop((base, floor, raw));
+        drop((base, floor, raw, short));
         let _ = std::fs::remove_dir_all(&root);
     }
 
