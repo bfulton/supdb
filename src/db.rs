@@ -3644,16 +3644,19 @@ pub struct Options {
     /// `forms_to_fit` or a bound budget; `supdb-nofitshort` is that shape,
     /// and `supdb-nozpagesnofitshort` beside `supdb-nozpages`.
     pub forms_fit_when_short: bool,
-    /// EXPERIMENT: the WAL's frames dropped from the page cache once a
-    /// sync has covered them, this many bytes at a time (0: never). A
+    /// The WAL's frames dropped from the page cache once a sync has
+    /// covered them, this many bytes at a time (0: never). A
     /// frame is read again only by a replay at the open, and a synced
     /// page is clean, so the drop costs no write; under a bound the log's
     /// pages are page cache the store's reads cannot use, 99-102 MiB of
     /// it beside a form 0-64 MiB short of whole in E at ten million keys
     /// under 1.25 GiB. The page that holds the log's tail is never
     /// dropped, since the next append writes into it and a partial page
-    /// the cache no longer holds is read back first. `supdb-waldrop` is
-    /// the arm.
+    /// the cache no longer holds is read back first. A drop costs about
+    /// 0.13 ms a megabyte of log. Under 1.25 GiB at ten million keys it
+    /// took E's major faults to none and E 1.53x and 1.22x in two
+    /// sittings, with the write mixes' commits 2-3% slower in both
+    /// (`docs/engine.md`). Off is `supdb-walkeep`.
     pub wal_drop_bytes: usize,
 }
 
@@ -3907,7 +3910,7 @@ impl Default for Options {
             forms_fit_sweep: true,
             forms_trim_bytes: 32 << 20,
             forms_fit_when_short: true,
-            wal_drop_bytes: 0,
+            wal_drop_bytes: 1 << 20,
         }
     }
 }

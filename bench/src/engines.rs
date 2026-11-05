@@ -571,9 +571,10 @@ pub struct Supdb {
     /// (`Options::forms_fit_when_short` off). `supdb-nofitshort`, and
     /// `supdb-nozpagesnofitshort` beside `supdb-nozpages`, durable.
     nofitshort: bool,
-    /// The WAL's synced frames dropped from the page cache a megabyte at a
-    /// time (`Options::wal_drop_bytes`). `supdb-waldrop`, durable.
-    waldrop: bool,
+    /// The WAL's synced frames kept in the page cache, where the default
+    /// drops them a megabyte at a time (`Options::wal_drop_bytes` zero).
+    /// `supdb-walkeep`, durable.
+    walkeep: bool,
     /// The block cache reads a block boundary's key off the ordered index's
     /// top level in memory, where the default reads the partition's record
     /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
@@ -1369,9 +1370,10 @@ struct Policy {
     /// (`Options::forms_fit_when_short` off). `supdb-nofitshort`, and
     /// `supdb-nozpagesnofitshort` beside `supdb-nozpages`, durable.
     nofitshort: bool,
-    /// The WAL's synced frames dropped from the page cache a megabyte at a
-    /// time (`Options::wal_drop_bytes`). `supdb-waldrop`, durable.
-    waldrop: bool,
+    /// The WAL's synced frames kept in the page cache, where the default
+    /// drops them a megabyte at a time (`Options::wal_drop_bytes` zero).
+    /// `supdb-walkeep`, durable.
+    walkeep: bool,
     /// The block cache reads a block boundary's key off the ordered index's
     /// top level in memory, where the default reads the partition's record
     /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
@@ -1943,7 +1945,7 @@ impl Default for Policy {
             mergepar2: false,
             sealfloorooc: false,
             nofitshort: false,
-            waldrop: false,
+            walkeep: false,
             boundarytop: false,
             nodirwillneed: false,
             noboundsheadwillneed: false,
@@ -3797,14 +3799,14 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose WAL drops its synced frames from the page cache a
-    /// megabyte at a time (`Options::wal_drop_bytes`): against `supdb` it
-    /// prices the log's pages given back to the reads under a bound.
-    pub fn create_waldrop(path: &Path) -> Res<Supdb> {
+    /// `supdb` whose WAL keeps its synced frames in the page cache
+    /// (`Options::wal_drop_bytes` zero): against `supdb` it prices the
+    /// log's pages given back to the reads under a bound.
+    pub fn create_walkeep(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
-                waldrop: true,
+                walkeep: true,
                 ..Policy::default()
             },
         )
@@ -6413,7 +6415,7 @@ impl Supdb {
             mergepar2,
             sealfloorooc,
             nofitshort,
-            waldrop,
+            walkeep,
             boundarytop,
             nodirwillneed,
             noboundsheadwillneed,
@@ -6722,7 +6724,11 @@ impl Supdb {
             },
             seal_floor_out_of_core: sealfloorooc,
             forms_fit_when_short: !nofitshort,
-            wal_drop_bytes: if waldrop { 1 << 20 } else { 0 },
+            wal_drop_bytes: if walkeep {
+                0
+            } else {
+                supdb::Options::default().wal_drop_bytes
+            },
             boundary_keys_from_top: boundarytop,
             pieces_dir_willneed: !nodirwillneed,
             bounds_heads_willneed: !noboundsheadwillneed,
@@ -7000,7 +7006,7 @@ impl Supdb {
             mergepar2,
             sealfloorooc,
             nofitshort,
-            waldrop,
+            walkeep,
             boundarytop,
             nodirwillneed,
             noboundsheadwillneed,
@@ -7749,8 +7755,8 @@ impl Engine for Supdb {
         if self.sealfloorooc {
             return "supdb-sealfloorooc";
         }
-        if self.waldrop {
-            return "supdb-waldrop";
+        if self.walkeep {
+            return "supdb-walkeep";
         }
         if self.nofitshort {
             return if self.zpages_off {
@@ -9251,7 +9257,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-sealfloorooc"
         | "supdb-cacheraw"
         | "supdb-nofitshort"
-        | "supdb-waldrop"
+        | "supdb-walkeep"
         | "supdb-nozpagesnofitshort"
         | "supdb-nozpagesmergepar2"
         | "supdb-boundarytop"
@@ -9791,7 +9797,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-sealfloorooc" => supdb_arm(Supdb::create_sealfloorooc, dir)?,
         "supdb-cacheraw" => supdb_arm(Supdb::create_cacheraw, dir)?,
         "supdb-nofitshort" => supdb_arm(Supdb::create_nofitshort, dir)?,
-        "supdb-waldrop" => supdb_arm(Supdb::create_waldrop, dir)?,
+        "supdb-walkeep" => supdb_arm(Supdb::create_walkeep, dir)?,
         "supdb-nozpagesnofitshort" => supdb_arm(Supdb::create_nozpages_nofitshort, dir)?,
         "supdb-nozpagesmergepar2" => supdb_arm(Supdb::create_nozpages_mergepar2, dir)?,
         "supdb-ingestmergepar2" => supdb_arm(Supdb::create_ingest_mergepar2, dir)?,
@@ -11361,7 +11367,7 @@ mod tests {
             "supdb-sealfloorooc",
             "supdb-cacheraw",
             "supdb-nofitshort",
-            "supdb-waldrop",
+            "supdb-walkeep",
         ] {
             assert_eq!(
                 open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
@@ -11374,10 +11380,10 @@ mod tests {
         let raw = Supdb::create_cacheraw(&dir("raw")).unwrap();
         let short = Supdb::create_nofitshort(&dir("short")).unwrap();
         {
-            let w = Supdb::create_waldrop(&dir("waldrop")).unwrap();
+            let w = Supdb::create_walkeep(&dir("walkeep")).unwrap();
             assert_eq!(w.features(), base.features());
             let o = w.db.as_ref().unwrap().options();
-            assert!(o.wal_drop_bytes > 0 && b.wal_drop_bytes == 0);
+            assert!(o.wal_drop_bytes == 0 && b.wal_drop_bytes > 0);
             assert_eq!(
                 (o.forms_fit_when_short, o.forms_to_fit, o.zpages, o.sync),
                 (b.forms_fit_when_short, b.forms_to_fit, b.zpages, b.sync)
