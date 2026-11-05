@@ -3661,22 +3661,26 @@ pub struct Options {
     /// sittings, with the write mixes' commits 2-3% slower in both
     /// (`docs/engine.md`). Off is `supdb-walkeep`.
     pub wal_drop_bytes: usize,
-    /// EXPERIMENT: how many of the controller's builds ahead run at once
+    /// How many of the controller's builds ahead run at once
     /// (`zpages_land_pct`): the second in a slot of its own beside the
     /// builder's, which the controller's own jobs keep. An ordered load of
     /// ten million keys under 1.25 GiB lands its last partitions at its
     /// drain, and with the two the builds passed over as cold, seven of
     /// twenty-nine waited after the load for one builder at 0.25-0.6 s
-    /// each, beside C's reads, and the install waited for them. 1 is the
-    /// one builder; `supdb-zahead2` is the arm at 2.
+    /// each, beside C's reads, and the install waited for them; with two
+    /// the install came a second into C where it had come three to four,
+    /// and C read 1.46x and 1.39x in two sittings (`docs/engine.md`). 1 is
+    /// the one builder, `supdb-zahead1`.
     pub zpages_ahead_builders: usize,
     /// EXPERIMENT: the controller's sample asked for before a build ahead
     /// takes the builder its last one left, where the sample waits for no
     /// build ahead in flight (`z_prebuild_pending`): the next build ahead
     /// started in the same tick, so the sample, meant to price the files
     /// on disk as an attach and the rest as the builds they are, waited
-    /// for the last build ahead instead. Off is that order;
-    /// `supdb-zsamplegap` is the arm.
+    /// for the last build ahead instead. Beside two builders ahead the
+    /// builds are done by the time the order would matter, and paired so
+    /// it read C 0.97x, the install at the same moment either way: off is
+    /// the order before it; `supdb-zsamplegap` is the arm.
     pub zpages_sample_between: bool,
 }
 
@@ -3931,7 +3935,7 @@ impl Default for Options {
             forms_trim_bytes: 32 << 20,
             forms_fit_when_short: true,
             wal_drop_bytes: 1 << 20,
-            zpages_ahead_builders: 1,
+            zpages_ahead_builders: 2,
             zpages_sample_between: false,
         }
     }

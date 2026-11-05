@@ -7375,6 +7375,7 @@ fn the_sample_starts_between_builds_ahead_when_told_to() {
         let (dir, db, _model, inject, raw) =
             land_store_with(&format!("auto-sample-gap-{between}"), 50, |o| {
                 o.zpages_sample_between = between;
+                o.zpages_ahead_builders = 1;
                 o.partition_bytes = Some(400 << 10);
             });
         // Past the whole budget the builds ahead run, and the model calls
@@ -7854,6 +7855,9 @@ fn a_buy_attaches_every_form_file_built_ahead_before_any_warm() {
             land_store_with(&format!("auto-land-attach-{first}"), 50, |o| {
                 o.partition_bytes = Some(160 << 10);
                 o.zpages_attach_first = first;
+                // One builder ahead, whose order the files' times read:
+                // two finish in whatever order their builds take.
+                o.zpages_ahead_builders = 1;
             });
         inject.set_budget(raw * 3 / 2);
         assert!(
