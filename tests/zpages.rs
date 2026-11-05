@@ -31,6 +31,8 @@ use supdb::{Blob, Bytes, Db, MmapBytes, Options};
 
 mod common;
 #[cfg(target_os = "linux")]
+use common::cached_pages;
+#[cfg(target_os = "linux")]
 use common::zpg_mappings;
 use common::{kv, vf};
 
@@ -1604,40 +1606,6 @@ fn a_promotion_that_closes_a_fence_keeps_the_form_file_of_the_partition_it_renam
         "{after:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// How many pages of `[off, off + len)` of the file at `path` the page cache
-/// holds: `mincore` over a mapping of the file's own that touches nothing.
-#[cfg(target_os = "linux")]
-fn cached_pages(path: &Path, off: usize, len: usize) -> usize {
-    use std::os::unix::io::AsRawFd;
-    let f = std::fs::File::open(path).unwrap();
-    let size = f.metadata().unwrap().len() as usize;
-    // SAFETY: a read-only shared mapping of the whole file, advised over a
-    // range inside it, and unmapped before it returns; nothing reads it.
-    unsafe {
-        let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
-        let base = libc::mmap(
-            std::ptr::null_mut(),
-            size,
-            libc::PROT_READ,
-            libc::MAP_SHARED,
-            f.as_raw_fd(),
-            0,
-        );
-        assert_ne!(base, libc::MAP_FAILED, "mapping {}", path.display());
-        let (first, last) = (off / page, (off + len).div_ceil(page));
-        let mut vec = vec![0u8; last - first];
-        let r = libc::mincore(
-            (base as usize + first * page) as *mut libc::c_void,
-            (last - first) * page,
-            vec.as_mut_ptr().cast(),
-        );
-        let err = std::io::Error::last_os_error();
-        libc::munmap(base, size);
-        assert_eq!(r, 0, "mincore: {err}");
-        vec.iter().filter(|b| **b & 1 != 0).count()
-    }
 }
 
 /// The file's pages dropped from the page cache, as far as the cache lets a

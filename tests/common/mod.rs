@@ -155,3 +155,37 @@ pub fn dead_arena(bytes: usize) -> Vec<u8> {
     .join()
     .unwrap()
 }
+
+/// How many pages of `[off, off + len)` of the file at `path` the page cache
+/// holds: `mincore` over a mapping of the file's own that touches nothing.
+#[cfg(target_os = "linux")]
+pub fn cached_pages(path: &std::path::Path, off: usize, len: usize) -> usize {
+    use std::os::unix::io::AsRawFd;
+    let f = std::fs::File::open(path).unwrap();
+    let size = f.metadata().unwrap().len() as usize;
+    // SAFETY: a read-only shared mapping of the whole file, advised over a
+    // range inside it, and unmapped before it returns; nothing reads it.
+    unsafe {
+        let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+        let base = libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            f.as_raw_fd(),
+            0,
+        );
+        assert_ne!(base, libc::MAP_FAILED, "mapping {}", path.display());
+        let (first, last) = (off / page, (off + len).div_ceil(page));
+        let mut vec = vec![0u8; last - first];
+        let r = libc::mincore(
+            (base as usize + first * page) as *mut libc::c_void,
+            (last - first) * page,
+            vec.as_mut_ptr().cast(),
+        );
+        let err = std::io::Error::last_os_error();
+        libc::munmap(base, size);
+        assert_eq!(r, 0, "mincore: {err}");
+        vec.iter().filter(|b| **b & 1 != 0).count()
+    }
+}

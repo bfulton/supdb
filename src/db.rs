@@ -3644,6 +3644,17 @@ pub struct Options {
     /// `forms_to_fit` or a bound budget; `supdb-nofitshort` is that shape,
     /// and `supdb-nozpagesnofitshort` beside `supdb-nozpages`.
     pub forms_fit_when_short: bool,
+    /// EXPERIMENT: the WAL's frames dropped from the page cache once a
+    /// sync has covered them, this many bytes at a time (0: never). A
+    /// frame is read again only by a replay at the open, and a synced
+    /// page is clean, so the drop costs no write; under a bound the log's
+    /// pages are page cache the store's reads cannot use, 99-102 MiB of
+    /// it beside a form 0-64 MiB short of whole in E at ten million keys
+    /// under 1.25 GiB. The page that holds the log's tail is never
+    /// dropped, since the next append writes into it and a partial page
+    /// the cache no longer holds is read back first. `supdb-waldrop` is
+    /// the arm.
+    pub wal_drop_bytes: usize,
 }
 
 impl Options {
@@ -3896,6 +3907,7 @@ impl Default for Options {
             forms_fit_sweep: true,
             forms_trim_bytes: 32 << 20,
             forms_fit_when_short: true,
+            wal_drop_bytes: 0,
         }
     }
 }
@@ -3939,6 +3951,9 @@ struct Wal {
     /// gap at that boundary reads as the log's end; rewritten chained by
     /// the first sync by policy, which syncs that file first (`chain`).
     loose: bool,
+    /// How far from the file's start its pages have been dropped from
+    /// the page cache (`Options::wal_drop_bytes`), a page boundary.
+    dropped: u64,
 }
 
 /// The WAL file starts with eight bytes, this name and a kind byte, so a
@@ -4011,6 +4026,7 @@ impl Wal {
             synced: 0,
             seed: wal_seed(id),
             loose: kind == WAL_LOOSE,
+            dropped: 0,
         })
     }
 
@@ -4057,6 +4073,7 @@ impl Wal {
             synced: 0,
             seed: wal_seed(id),
             loose: kind == WAL_LOOSE,
+            dropped: 0,
         })
     }
 
@@ -4099,6 +4116,7 @@ impl Wal {
             synced,
             seed: wal_seed(id),
             loose,
+            dropped: 0,
         })
     }
 
@@ -4177,6 +4195,22 @@ impl Wal {
         self.file.sync_data()?;
         self.synced = self.written;
         Ok(())
+    }
+
+    /// The pages of the frames a sync has covered dropped from the page
+    /// cache once `stride` bytes of them have gathered, up to the page that
+    /// holds the tail (`Options::wal_drop_bytes`): that page takes the next
+    /// append, and a partial page the cache no longer holds is read from
+    /// the device before the write lands in it.
+    fn drop_synced(&mut self, stride: u64) {
+        if stride == 0 {
+            return;
+        }
+        let floor = self.synced & !(zselect::PAGE - 1);
+        if floor >= self.dropped.saturating_add(stride) {
+            fadvise_dontneed_range(&self.file, self.dropped, floor - self.dropped);
+            self.dropped = floor;
+        }
     }
 
     /// Whether the file holds frames no sync has covered. `written`
@@ -25800,6 +25834,7 @@ impl Db {
         }
         self.wal.chain()?;
         self.wal.sync()?;
+        self.wal.drop_synced(self.opts.wal_drop_bytes as u64);
         self.unsynced = 0;
         Ok(())
     }

@@ -10,6 +10,8 @@ use std::path::PathBuf;
 use supdb::{Db, Isolation, Options, ReadAdvice, Reader};
 
 mod common;
+#[cfg(target_os = "linux")]
+use common::cached_pages;
 use common::{dead_arena, kv, vf, without_the_clock};
 
 fn dir(name: &str) -> PathBuf {
@@ -5038,6 +5040,64 @@ fn the_store_is_short_of_memory_while_its_raw_form_exceeds_the_budget() {
             assert!(!db.forms_short(), "off: the store was looked at");
             assert!(!db.trimmer_started(), "off: a trim thread");
         }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// The WAL's synced frames leave the page cache a stride at a time
+/// (`wal_drop_bytes`), and the page that holds the log's tail stays for
+/// the next append; without the option every page of the log stays
+/// cached. Writes go through the log (`direct_ingest` off), each commit
+/// synced, and no seal comes near.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_wal_drops_its_synced_frames_from_the_page_cache() {
+    let stride = 256usize << 10;
+    for on in [true, false] {
+        let d = dir(if on { "wal-drop" } else { "wal-keep" });
+        let opts = Options {
+            sync: supdb::SyncPolicy::Always,
+            direct_ingest: false,
+            seal_bytes: 256 << 20,
+            wal_drop_bytes: if on { stride } else { 0 },
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let val = vec![9u8; 1000];
+        for b in 0..200u32 {
+            for k in 0..20u32 {
+                let key = format!("k{:08}", (k * 7919 + b * 31) % 100_000);
+                db.append(key.as_bytes(), &val);
+            }
+            db.commit().unwrap();
+        }
+        let wal = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("wal-"))
+            })
+            .expect("a WAL");
+        let len = std::fs::metadata(&wal).unwrap().len() as usize;
+        assert!(len > 3 << 20, "the log holds {len} bytes");
+        // Everything below the last stride before the tail was synced and
+        // dropped; the tail's own stretch, and its page, stay.
+        let below = len - stride - 4096;
+        let cached = cached_pages(&wal, 0, below);
+        let tail = cached_pages(&wal, len - 1, 1);
+        if on {
+            assert_eq!(cached, 0, "{cached} synced pages left cached");
+        } else {
+            assert_eq!(
+                cached,
+                below.div_ceil(4096),
+                "pages dropped without the option"
+            );
+        }
+        assert_eq!(tail, 1, "on={on}: the tail's page dropped");
         drop(db);
         let _ = std::fs::remove_dir_all(&d);
     }
