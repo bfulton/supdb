@@ -50,7 +50,15 @@ checkpoint.
   (0.84ms/barrier), 2.08x LMDB's measured durable load, and **1,014,003**
   with the per-op bookkeeping no engine can skip. The previous engine
   committed 5.85x below its own floor on work — arena append, section
-  publication — that this design deletes rather than optimizes.
+  publication — that this design deletes rather than optimizes. What
+  "durable" is held to is `tests/kill.rs`: the test runs itself as a child
+  that commits batches of a hundred keys without end and acknowledges each
+  once its commit has returned, kills it with SIGKILL after a random count
+  of acknowledgements, ten rounds a run, and finds every acknowledged batch
+  in the reopened store, the one batch the child may have been inside whole
+  or absent, and nothing beyond it. That is process death, with the device's
+  word taken for what it synced; power loss, where a device may lie about
+  its sync, needs a rig that pulls the plug, and is not promised here.
 - **Ordered ingest** = a run of keys above the store's greatest, with
   values the record holds inline, goes to an ordered memtable -- appended
   in key order, searched by binary search, never hashed -- and at each
