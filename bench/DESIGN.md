@@ -18,8 +18,9 @@ The workloads below, plus four floors. Each yields one or more quantities.
 | `load-shuffled` | the same keys in shuffled order | ops/s |
 | `read` | uniform point reads over the loaded set, on one thread and again on each of the class's reader-thread counts: two, doubling, one fewer than its cores | reads/s, p99 µs; reads/s per thread count |
 | `scan` | `size/100` scans of 100 entries, from uniform random starts, on one thread; `size` scans a thread again on each of the class's reader-thread counts | entries/s; entries/s per thread count |
-| `ycsb` | core A–F on the loaded store, zipfian, a sixth of the keys in operations per mix | ops/s per mix |
+| `ycsb` | core A–F on the loaded store, a Zipfian over the key space itself (the hot keys the lowest, contiguous) and D's reads uniform, a sixth of the keys in operations per mix | ops/s per mix |
 | `scan-mixed` | the threaded `scan` passes again on the store the six mixes leave | entries/s per thread count |
+| `ycsbs` | core A–F again, on the store `scan-mixed` leaves, with YCSB's own key distributions: its scrambled Zipfian for A, B, C, E and F, and the latest distribution for D | ops/s per mix |
 | `scan-lag` | on the store the shuffled load leaves, the keys updated in slices to 0, 1, 10 and 100% of the store, each slice a burst of batches followed by the `scan` workload's scans with nothing merged between | entries/s of each point's scans; updates/s of each point's burst |
 | `wal-floor` | framed 1,000-record batches appended to one file, one `fdatasync` each, no engine | ops/s |
 | `scan-floor` | one `mmap` sequential walk of a file the top rung's size (capped at 4 GiB), no engine | bytes/s |
@@ -153,9 +154,29 @@ scans would credit the first for work they never see it do. The two
 quantities are each a rate, and a change that moves work between them
 is read by both.
 
-YCSB-D reads uniformly over the loaded keys rather than skewed to the latest
-inserts: the latest distribution needs a Zipfian over a count that grows
-with every insert, and tracking that is not a cost to charge the engines.
+The mixes run twice, as two families of six. The first, `ycsb-A..F`, is the
+one every row so far carries: its Zipfian is over the key space itself, so
+rank 0 is key 0 and the hot keys are the lowest keys and contiguous, and its
+D reads uniformly over the loaded keys. The second, `ycsbs-A..F`, runs the
+same six with YCSB's own distributions. A, B, C, E and F draw from YCSB's
+scrambled Zipfian: a Zipfian over YCSB's ten billion items, hashed with its
+FNV-1a and folded onto a key space fixed at the mix's start (the keys that
+exist plus twice the inserts the mix expects, YCSB's own margin, so which
+keys are popular does not move as keys are inserted; a draw above the last
+committed key is drawn again, as YCSB draws it), so the hot keys are spread
+over the store rather than piled at its head. D draws from YCSB's latest
+distribution: a Zipfian over the keys that exist with the newest the hottest,
+and the count grows as this mix's inserts commit -- one more term of the
+harmonic sum a key, one `powf`, at each insert batch's flush, inside the
+mix's window: about two microseconds for a batch of a hundred, beside a
+commit of at least hundreds. The second family runs
+after `scan-mixed`, on the store the first family and the threaded scans
+leave, so every quantity before it is of the store it was of before the
+family existed; what it reads is the store the first family grew, as
+`scan-mixed` reads it, and that is part of its definition. The first family
+stays as it is because a time series is compared to its own history, and
+its Zipfian's contiguous head is a workload of its own, the one an
+unscrambled key space gives any engine with a sorted layout.
 
 Every workload runs one thread against the engine, and `read` and `scan`
 run again on each reader-thread count of the machine's class -- two,

@@ -96,6 +96,12 @@ fn workload_noun(w: &str) -> &'static str {
         "ycsb-D" => "YCSB-D, read-latest (95/5 read/insert)",
         "ycsb-E" => "YCSB-E, short ranges (95/5 scan/insert, zipfian)",
         "ycsb-F" => "YCSB-F, read-modify-write (50/50, zipfian)",
+        "ycsbs-A" => "YCSB-A, update-heavy (50/50 read/update, scrambled zipfian)",
+        "ycsbs-B" => "YCSB-B, read-mostly (95/5 read/update, scrambled zipfian)",
+        "ycsbs-C" => "YCSB-C, read-only (scrambled zipfian)",
+        "ycsbs-D" => "YCSB-D, read-latest (95/5 read/insert, latest)",
+        "ycsbs-E" => "YCSB-E, short ranges (95/5 scan/insert, scrambled zipfian)",
+        "ycsbs-F" => "YCSB-F, read-modify-write (50/50, scrambled zipfian)",
         _ => "",
     }
 }

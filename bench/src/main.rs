@@ -52,8 +52,8 @@ ab     two arms in one process, alternating and paired rep by rep, for choosing
        --bound as for run: the pairing under a memory bound, with the counts per
                operation a bounded row records paired like any other quantity.
        --passes a comma-separated subset of load,read,read-threaded,scan,scan-threaded,
-               mixes,scan-mixed,lag (default: all), for a question one phase answers
-               at a rung where the whole pass is an hour.
+               mixes,scan-mixed,mixes-scrambled,lag (default: all), for a question one
+               phase answers at a rung where the whole pass is an hour.
        --ops-div as for run, here at any scale (default 1): the read passes' counts
                divided, for a pairing at a rung where the whole pass is an hour.
        --compress the fraction of each value that is a repeated phrase (default 0.5,

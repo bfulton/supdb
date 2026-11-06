@@ -142,11 +142,13 @@ pub struct Passes {
     pub scan_threaded: bool,
     pub mixes: bool,
     pub scan_mixed: bool,
+    /// The second mix family, `ycsbs-A..F`, after `scan-mixed`.
+    pub mixes_scrambled: bool,
     pub lag: bool,
 }
 
 impl Passes {
-    pub const NAMES: [&'static str; 8] = [
+    pub const NAMES: [&'static str; 9] = [
         "load",
         "read",
         "read-threaded",
@@ -154,6 +156,7 @@ impl Passes {
         "scan-threaded",
         "mixes",
         "scan-mixed",
+        "mixes-scrambled",
         "lag",
     ];
 
@@ -166,6 +169,7 @@ impl Passes {
             scan_threaded: true,
             mixes: true,
             scan_mixed: true,
+            mixes_scrambled: true,
             lag: true,
         }
     }
@@ -181,6 +185,7 @@ impl Passes {
             scan_threaded: false,
             mixes: false,
             scan_mixed: false,
+            mixes_scrambled: false,
             lag: false,
         };
         let mut any = false;
@@ -194,6 +199,7 @@ impl Passes {
                 "scan-threaded" => p.scan_threaded = true,
                 "mixes" => p.mixes = true,
                 "scan-mixed" => p.scan_mixed = true,
+                "mixes-scrambled" => p.mixes_scrambled = true,
                 "lag" => p.lag = true,
                 other => {
                     return Err(format!(
@@ -325,10 +331,10 @@ impl Plan {
 
 /// YCSB's core workloads: (letter, read %, update %, insert %, scan %,
 /// read-modify-write %, key distribution). Theta 0.99 for the Zipfian, as
-/// in the original. D's reads are uniform over the loaded keys rather than
-/// skewed to the latest inserts: the latest distribution needs a Zipfian
-/// over a count that grows with every insert, and the cost of tracking
-/// that is not a cost the engines should be charged for.
+/// in the original. This family's Zipfian is over the key space itself, so
+/// its hot keys are the lowest keys, contiguous, and D's reads are uniform
+/// over the loaded keys; it is the family every row so far carries, and it
+/// does not change. `YCSBS` is the family with YCSB's own distributions.
 const YCSB: [(char, u32, u32, u32, u32, u32, KeyDist); 6] = [
     ('A', 50, 50, 0, 0, 0, KeyDist::Zipfian),
     ('B', 95, 5, 0, 0, 0, KeyDist::Zipfian),
@@ -337,10 +343,28 @@ const YCSB: [(char, u32, u32, u32, u32, u32, KeyDist); 6] = [
     ('E', 0, 0, 5, 95, 0, KeyDist::Zipfian),
     ('F', 50, 0, 0, 0, 50, KeyDist::Zipfian),
 ];
+/// The same six mixes with YCSB's key distributions, the workloads
+/// `ycsbs-A..F`: the scrambled Zipfian for A, B, C, E and F, whose hot
+/// keys are spread over the space (`KeyDist::Scrambled`), and the latest
+/// distribution for D, whose reads are skewed to the newest inserts over a
+/// count that grows as they commit (`KeyDist::Latest`). The family runs
+/// after `scan-mixed`, on the store the first family leaves, so every
+/// quantity before it is of the store it was of before the family existed.
+const YCSBS: [(char, u32, u32, u32, u32, u32, KeyDist); 6] = [
+    ('A', 50, 50, 0, 0, 0, KeyDist::Scrambled),
+    ('B', 95, 5, 0, 0, 0, KeyDist::Scrambled),
+    ('C', 100, 0, 0, 0, 0, KeyDist::Scrambled),
+    ('D', 95, 0, 5, 0, 0, KeyDist::Latest),
+    ('E', 0, 0, 5, 95, 0, KeyDist::Scrambled),
+    ('F', 50, 0, 0, 0, 50, KeyDist::Scrambled),
+];
 /// The order the six run in on one store: the read-only mix first, on the
 /// store as loaded, and the two that insert last, so no earlier workload
 /// reads a store another has grown.
 const YCSB_ORDER: [char; 6] = ['C', 'B', 'A', 'F', 'D', 'E'];
+/// The salt on the second family's key seeds; the first family's seeds are
+/// the ones every row so far drew with, unsalted.
+const YCSBS_SEED_SALT: u64 = 0x5300;
 const YCSB_BATCH: usize = 100;
 const YCSB_SCAN: usize = 50;
 
@@ -1041,6 +1065,16 @@ fn pass_measurements(size: u64, arm: &str, g: Guarantee, one: &OnePass) -> Vec<M
             *ops_s,
         );
     }
+    for (letter, ops_s) in &one.ycsbs_ops_s {
+        s.push(
+            &format!("ycsbs-{letter}"),
+            sz,
+            arm,
+            g,
+            ("ops_per_s", "ops/s"),
+            *ops_s,
+        );
+    }
     for (threads, v) in &one.scan_mixed_threaded {
         let q = threaded_quantity("entries_per_s", *threads);
         s.push("scan-mixed", sz, arm, g, (q.as_str(), "entries/s"), *v);
@@ -1585,6 +1619,9 @@ pub struct OnePass {
     reads_s_threaded: Vec<(usize, f64)>,
     scan_entries_s_threaded: Vec<(usize, f64)>,
     ycsb_ops_s: Vec<(char, f64)>,
+    /// The second mix family (`YCSBS`), on the store the first and the
+    /// threaded scans after it leave.
+    ycsbs_ops_s: Vec<(char, f64)>,
     /// The threaded scans again on the store the mixes leave, where the
     /// keys they updated and inserted are unsealed: (threads, aggregate
     /// throughput).
@@ -1632,6 +1669,9 @@ impl OnePass {
         }
         for (c, x) in &self.ycsb_ops_s {
             v.push((format!("ycsb-{c} ops_per_s"), *x));
+        }
+        for (c, x) in &self.ycsbs_ops_s {
+            v.push((format!("ycsbs-{c} ops_per_s"), *x));
         }
         for (n, x) in &self.counters {
             v.push((format!("count {n}"), *x));
@@ -2471,88 +2511,24 @@ fn one_pass(
         scan_entries_s_threaded.push((threads, (ops * plan.scan_len as u64) as f64 / got.secs));
     }
 
-    let mut ycsb_ops_s = Vec::with_capacity(YCSB.len());
     let mut inserted = 0u64;
     let mix_ops = plan.divided(ycsb_ops(size));
-    // With `SUPDB_MIX_COUNTERS` set, the store's counters around each mix,
-    // as `SUPDB_LAG_COUNTERS` reads them around a lag point: one
-    // `mixcounters` line a mix on stderr, read before the mix and after it
-    // and never between. A mix's commits are inside its timed region, so
-    // the line's burst is zero and its pass is the whole mix.
-    let mix_counting = std::env::var_os("SUPDB_MIX_COUNTERS").is_some();
-    // With `SUPDB_MIX_CENSUS` set, the engine's census of what the process
-    // holds after each mix, one `mixcensus` line a mix, as the lag sweep's
-    // `lagcensus`: the form files' fit beside the process is read there.
-    // Set to `2`, the allocator's bytes by arena and the anonymous mappings
-    // by size follow it, as they follow `lagcensus`: a walk of every free
-    // chunk under each arena's lock, asked for and not given.
-    let mix_census = std::env::var_os("SUPDB_MIX_CENSUS").is_some();
-    let mix_census_detail = std::env::var("SUPDB_MIX_CENSUS").is_ok_and(|v| v == "2");
-    for letter in YCSB_ORDER {
-        if !passes.mixes {
-            break;
-        }
-        let w = YCSB.iter().find(|w| w.0 == letter).unwrap();
-        let c0 = if mix_counting {
-            e.counters()
-        } else {
-            Vec::new()
-        };
-        let (flt_up0, flt_main0) = if mix_counting {
-            (minflt_of("supdb-upkeep"), minflt_self())
-        } else {
-            (0, 0)
-        };
-        let mix = format!("ycsb-{letter}");
-        // A probe's fold before the mixes it names (`SUPDB_MIX_FOLD`, the
-        // letters, `Engine::fold`): the writes before the mix folded into
-        // the store outside its window, its time and the form's cover on a
-        // `mixfold` line. Never set for a row.
-        if std::env::var("SUPDB_MIX_FOLD").is_ok_and(|v| v.contains(letter)) {
-            let t = std::time::Instant::now();
-            e.fold()?;
-            eprintln!(
-                "mixfold {arm} {letter} ms {:.0}",
-                t.elapsed().as_secs_f64() * 1e3
-            );
-        }
-        let cb = counting.begin();
-        phase_mark(arm, &mix, "start");
-        let secs = ycsb(e.as_mut(), arm, w, size, mix_ops, &mut inserted, payload)?;
-        phase_mark(arm, &mix, "end");
-        counting.end(cb, &mix, "", None, mix_ops);
-        ycsb_ops_s.push((letter, mix_ops as f64 / secs));
-        if mix_counting {
-            let c1 = e.counters();
-            counters_line(
-                "mixcounters",
-                arm,
-                &letter.to_string(),
-                (
-                    minflt_of("supdb-upkeep").saturating_sub(flt_up0),
-                    minflt_self().saturating_sub(flt_main0),
-                ),
-                (0.0, secs * 1e3),
-                &c0,
-                &c1,
-            );
-        }
-        // With `SUPDB_MIX_HEAT` set, each form file's decodes over its life
-        // after each mix, by partition (`Engine::zpage_heat`): a reader
-        // differences consecutive mixes for where a mix's decodes land.
-        if std::env::var_os("SUPDB_MIX_HEAT").is_some() {
-            eprintln!("mixheat {arm} {letter} | {}", e.zpage_heat());
-        }
-        if mix_census {
-            census_line(
-                "mixcensus",
-                arm,
-                &letter.to_string(),
-                e.as_ref(),
-                mix_census_detail,
-            );
-        }
-    }
+    let ycsb_ops_s = if passes.mixes {
+        mix_family(
+            e.as_mut(),
+            arm,
+            "ycsb",
+            &YCSB,
+            0,
+            size,
+            mix_ops,
+            &mut inserted,
+            payload,
+            &mut counting,
+        )?
+    } else {
+        Vec::new()
+    };
 
     // The threaded scans again, on the store the mixes leave: the keys
     // they updated and inserted are unsealed, so a handle's pass builds
@@ -2595,6 +2571,25 @@ fn one_pass(
         }
         scan_mixed_threaded.push((threads, (ops * plan.scan_len as u64) as f64 / got.secs));
     }
+
+    // The second family, with YCSB's own key distributions, on the store
+    // the first family and the threaded scans after it leave (`YCSBS`).
+    let ycsbs_ops_s = if passes.mixes_scrambled {
+        mix_family(
+            e.as_mut(),
+            arm,
+            "ycsbs",
+            &YCSBS,
+            YCSBS_SEED_SALT,
+            size,
+            mix_ops,
+            &mut inserted,
+            payload,
+            &mut counting,
+        )?
+    } else {
+        Vec::new()
+    };
     // A pass opens two stores -- this one, and a fresh one below for the
     // shuffled load and the lag sweep -- so the counts of the first are
     // taken before it goes. Read from the second alone they described the
@@ -2684,6 +2679,7 @@ fn one_pass(
         reads_s_threaded,
         scan_entries_s_threaded,
         ycsb_ops_s,
+        ycsbs_ops_s,
         scan_mixed_threaded,
         counters: counters
             .into_iter()
@@ -3693,10 +3689,10 @@ impl MixKinds {
         }
     }
 
-    fn report(&self, arm: &str, letter: char, size: u64, ops: u64, total: f64) {
+    fn report(&self, arm: &str, mix: &str, size: u64, ops: u64, total: f64) {
         if self.on {
             eprintln!(
-                "mixkinds {arm} {letter} size {size} ops {ops} gets {} {:.3} scans {} {:.3} commits {} {:.3} total {:.3}",
+                "mixkinds {arm} {mix} size {size} ops {ops} gets {} {:.3} scans {} {:.3} commits {} {:.3} total {:.3}",
                 self.gets.0,
                 self.gets.1 * 1e3,
                 self.scans.0,
@@ -3709,33 +3705,155 @@ impl MixKinds {
     }
 }
 
+/// One family of the six mixes, each in `YCSB_ORDER` on the store the one
+/// before leaves: the rate of each, with the counters, census, heat and
+/// fold lines the environment asks for. `prefix` names the family's
+/// workloads (`ycsb`, `ycsbs`) and `seed_salt` its key seeds, and
+/// `inserted` carries the insert count across the families, since both
+/// insert above the loaded keys.
+#[allow(clippy::too_many_arguments)]
+fn mix_family(
+    e: &mut dyn Engine,
+    arm: &str,
+    prefix: &str,
+    table: &[(char, u32, u32, u32, u32, u32, KeyDist); 6],
+    seed_salt: u64,
+    size: u64,
+    mix_ops: u64,
+    inserted: &mut u64,
+    payload: &Payload,
+    counting: &mut Counting,
+) -> Result<Vec<(char, f64)>, String> {
+    let mut ops_s = Vec::with_capacity(table.len());
+    // With `SUPDB_MIX_COUNTERS` set, the store's counters around each mix,
+    // as `SUPDB_LAG_COUNTERS` reads them around a lag point: one
+    // `mixcounters` line a mix on stderr, read before the mix and after it
+    // and never between. A mix's commits are inside its timed region, so
+    // the line's burst is zero and its pass is the whole mix.
+    let mix_counting = std::env::var_os("SUPDB_MIX_COUNTERS").is_some();
+    // With `SUPDB_MIX_CENSUS` set, the engine's census of what the process
+    // holds after each mix, one `mixcensus` line a mix, as the lag sweep's
+    // `lagcensus`: the form files' fit beside the process is read there.
+    // Set to `2`, the allocator's bytes by arena and the anonymous mappings
+    // by size follow it, as they follow `lagcensus`: a walk of every free
+    // chunk under each arena's lock, asked for and not given.
+    let mix_census = std::env::var_os("SUPDB_MIX_CENSUS").is_some();
+    let mix_census_detail = std::env::var("SUPDB_MIX_CENSUS").is_ok_and(|v| v == "2");
+    for letter in YCSB_ORDER {
+        let w = table.iter().find(|w| w.0 == letter).unwrap();
+        let c0 = if mix_counting {
+            e.counters()
+        } else {
+            Vec::new()
+        };
+        let (flt_up0, flt_main0) = if mix_counting {
+            (minflt_of("supdb-upkeep"), minflt_self())
+        } else {
+            (0, 0)
+        };
+        let mix = format!("{prefix}-{letter}");
+        // A probe's fold before the mixes it names (`SUPDB_MIX_FOLD`, the
+        // letters, `Engine::fold`): the writes before the mix folded into
+        // the store outside its window, its time and the form's cover on a
+        // `mixfold` line. Never set for a row.
+        if std::env::var("SUPDB_MIX_FOLD").is_ok_and(|v| v.contains(letter)) {
+            let t = std::time::Instant::now();
+            e.fold()?;
+            eprintln!(
+                "mixfold {arm} {mix} ms {:.0}",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        let cb = counting.begin();
+        phase_mark(arm, &mix, "start");
+        let secs = ycsb(e, arm, &mix, w, seed_salt, size, mix_ops, inserted, payload)?;
+        phase_mark(arm, &mix, "end");
+        counting.end(cb, &mix, "", None, mix_ops);
+        ops_s.push((letter, mix_ops as f64 / secs));
+        if mix_counting {
+            let c1 = e.counters();
+            counters_line(
+                "mixcounters",
+                arm,
+                &mix,
+                (
+                    minflt_of("supdb-upkeep").saturating_sub(flt_up0),
+                    minflt_self().saturating_sub(flt_main0),
+                ),
+                (0.0, secs * 1e3),
+                &c0,
+                &c1,
+            );
+        }
+        // With `SUPDB_MIX_HEAT` set, each form file's decodes over its life
+        // after each mix, by partition (`Engine::zpage_heat`): a reader
+        // differences consecutive mixes for where a mix's decodes land.
+        if std::env::var_os("SUPDB_MIX_HEAT").is_some() {
+            eprintln!("mixheat {arm} {mix} | {}", e.zpage_heat());
+        }
+        if mix_census {
+            census_line("mixcensus", arm, &mix, &*e, mix_census_detail);
+        }
+    }
+    Ok(ops_s)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn ycsb(
     e: &mut dyn Engine,
     arm: &str,
+    mix: &str,
     w: &(char, u32, u32, u32, u32, u32, KeyDist),
+    seed_salt: u64,
     size: u64,
     ops: u64,
     inserted: &mut u64,
     payload: &Payload,
 ) -> Result<f64, String> {
     let (letter, pread, pupd, pins, pscan, prmw, dist) = *w;
-    let mut keys = KeyGen::new(dist, size, 0x9C5B ^ letter as u64);
+    // The key space each distribution draws over. The latest distribution
+    // is over every key that exists, the loaded ones and the ones the mixes
+    // before this one committed, and grows as this mix's inserts commit.
+    // YCSB's scrambled Zipfian folds onto a space fixed at the mix's start
+    // -- the keys that exist plus twice the inserts expected, YCSB's own
+    // fudge factor -- so which keys are popular does not move as keys are
+    // inserted, and a draw above the last committed key is drawn again, as
+    // YCSB draws it. The first family draws over the loaded keys, as every
+    // row so far has.
+    let keyspace = match dist {
+        KeyDist::Latest => size + *inserted,
+        KeyDist::Scrambled => size + *inserted + 2 * (ops * pins as u64 / 100),
+        _ => size,
+    };
+    let mut keys = KeyGen::new(dist, keyspace, 0x9C5B ^ letter as u64 ^ seed_salt);
+    // The inserts committed so far: every insert of the mixes before this
+    // one, and this one's as its batches flush. A read never targets a key
+    // whose commit has not returned.
+    let mut committed = *inserted;
     let mut pick = Rng::new(0x5EED ^ letter as u64);
     let mut vrng = Rng::new(0xE2);
     let mut kb = [0u8; KEY_SIZE];
     let mut wbuf = Batch::with_capacity(YCSB_BATCH, payload.value_size());
     let mut wbuf_is_insert = false;
     let mut kinds = MixKinds::new();
+    // A key that exists: a draw at or above the committed keys is drawn
+    // again, which only the scrambled family's fixed space can produce.
+    let existing = |keys: &mut KeyGen, committed: u64| loop {
+        let k = keys.next();
+        if k < size + committed {
+            return k;
+        }
+    };
     let t = Instant::now();
     for _ in 0..ops {
         let roll = pick.below(100) as u32;
         if roll < pread {
-            db_key_into(keys.next(), &mut kb);
+            db_key_into(existing(&mut keys, committed), &mut kb);
             let t0 = kinds.start();
             e.get(&kb)?;
             MixKinds::add(&mut kinds.gets, t0);
         } else if roll < pread + pupd {
-            db_key_into(keys.next(), &mut kb);
+            db_key_into(existing(&mut keys, committed), &mut kb);
             wbuf.push(&kb, payload.get(&mut vrng));
             wbuf_is_insert = false;
         } else if roll < pread + pupd + pins {
@@ -3744,12 +3862,12 @@ fn ycsb(
             wbuf.push(&kb, payload.get(&mut vrng));
             wbuf_is_insert = true;
         } else if roll < pread + pupd + pins + pscan {
-            db_key_into(keys.next(), &mut kb);
+            db_key_into(existing(&mut keys, committed), &mut kb);
             let t0 = kinds.start();
             e.range(&kb, YCSB_SCAN)?;
             MixKinds::add(&mut kinds.scans, t0);
         } else if prmw > 0 {
-            db_key_into(keys.next(), &mut kb);
+            db_key_into(existing(&mut keys, committed), &mut kb);
             let t0 = kinds.start();
             e.get(&kb)?;
             MixKinds::add(&mut kinds.gets, t0);
@@ -3757,16 +3875,23 @@ fn ycsb(
             wbuf_is_insert = false;
         }
         if wbuf.len() >= YCSB_BATCH {
+            let n = wbuf.len() as u64;
             let t0 = kinds.start();
             flush_ycsb(&mut wbuf, e, wbuf_is_insert)?;
             MixKinds::add(&mut kinds.commits, t0);
+            if wbuf_is_insert {
+                committed += n;
+                if dist == KeyDist::Latest {
+                    keys.set_keys(size + committed);
+                }
+            }
         }
     }
     let t0 = kinds.start();
     flush_ycsb(&mut wbuf, e, wbuf_is_insert)?;
     MixKinds::add(&mut kinds.commits, t0);
     let total = t.elapsed().as_secs_f64();
-    kinds.report(arm, letter, size, ops, total);
+    kinds.report(arm, mix, size, ops, total);
     Ok(total)
 }
 
@@ -4913,6 +5038,241 @@ mod tests {
         }))
         .unwrap_err();
         assert!(out.contains("out of service"), "{out}");
+    }
+
+    /// An engine that records what a mix asks of it, in order: the keys
+    /// read, the keys scans start from, and each batch's keys as it is
+    /// written, so a test can hold every read to the keys committed before
+    /// it.
+    #[derive(Default)]
+    struct Recording {
+        events: Vec<Ev>,
+    }
+
+    enum Ev {
+        Get(u64),
+        Scan(u64),
+        Batch(Vec<u64>),
+    }
+
+    fn key_number(k: &[u8]) -> u64 {
+        std::str::from_utf8(k).unwrap().parse().unwrap()
+    }
+
+    impl Engine for Recording {
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+        fn features(&self) -> engines::Features {
+            engines::Features {
+                durable_commit: true,
+                transactions: false,
+                checksums: false,
+                reopen_for_write: false,
+                read_your_writes: true,
+                ordered_scan: true,
+            }
+        }
+        fn write_batch(&mut self, items: &[(&[u8], &[u8])]) -> engines::Res<()> {
+            self.events.push(Ev::Batch(
+                items.iter().map(|(k, _)| key_number(k)).collect(),
+            ));
+            Ok(())
+        }
+        fn update_batch(&mut self, items: &[(&[u8], &[u8])]) -> engines::Res<()> {
+            self.write_batch(items)
+        }
+        fn get(&mut self, key: &[u8]) -> engines::Res<usize> {
+            self.events.push(Ev::Get(key_number(key)));
+            Ok(0)
+        }
+        fn range(&mut self, from: &[u8], _: usize) -> engines::Res<usize> {
+            self.events.push(Ev::Scan(key_number(from)));
+            Ok(0)
+        }
+        fn sync(&mut self) -> engines::Res<()> {
+            Ok(())
+        }
+        fn size_bytes(&self) -> u64 {
+            0
+        }
+        fn thread_reader(&self) -> engines::Res<engines::ReaderOpener> {
+            Err("no reader".into())
+        }
+    }
+
+    /// One mix of a family over the recording engine: the keys it read and
+    /// scanned, each with the count of keys committed when it was asked
+    /// (the loaded keys plus the inserts whose batches had been written),
+    /// and the inserts committed by its end.
+    fn recorded_mix(
+        family: &[(char, u32, u32, u32, u32, u32, KeyDist); 6],
+        letter: char,
+        salt: u64,
+        size: u64,
+        ops: u64,
+        inserted: &mut u64,
+    ) -> (Vec<(u64, u64)>, u64) {
+        let w = family.iter().find(|w| w.0 == letter).unwrap();
+        let payload = Payload::new(100, 0.5, 0xE1);
+        let mut e = Recording::default();
+        let mix = format!("{}-{letter}", if salt == 0 { "ycsb" } else { "ycsbs" });
+        let before = *inserted;
+        ycsb(
+            &mut e,
+            "recording",
+            &mix,
+            w,
+            salt,
+            size,
+            ops,
+            inserted,
+            &payload,
+        )
+        .unwrap();
+        let mut committed = size + before;
+        let mut asked = Vec::new();
+        for ev in &e.events {
+            match ev {
+                Ev::Get(k) | Ev::Scan(k) => asked.push((*k, committed)),
+                Ev::Batch(keys) => committed += keys.iter().filter(|&&k| k >= size).count() as u64,
+            }
+        }
+        (asked, committed - size)
+    }
+
+    /// The second family's D reads the latest inserts: every key it reads
+    /// exists -- at or above one, as YCSB draws them, and below the keys
+    /// committed when the read was made, never one still in the batch --
+    /// and the keys this mix inserted take a large share of its reads,
+    /// where the first family's D, uniform over the loaded keys, reads none
+    /// of them. The reads after the family's E, which inserted before it,
+    /// start from every key that exists then.
+    #[test]
+    fn the_latest_mix_reads_the_keys_it_has_committed_and_no_others() {
+        let (size, ops) = (10_000u64, 20_000u64);
+        let mut inserted = 0u64;
+        let (asked, committed) =
+            recorded_mix(&YCSBS, 'D', YCSBS_SEED_SALT, size, ops, &mut inserted);
+        assert!(
+            committed >= ops * 5 / 100 - 100 && committed <= ops * 5 / 100 + 100,
+            "{committed}"
+        );
+        assert_eq!(
+            inserted, committed,
+            "the last batch is flushed at the mix's end"
+        );
+        assert!(
+            asked.len() > ops as usize * 90 / 100,
+            "{} reads",
+            asked.len()
+        );
+        for &(k, committed_then) in &asked {
+            assert!(
+                k >= 1 && k < committed_then,
+                "read {k} with {committed_then} keys committed"
+            );
+        }
+        let newest = asked.iter().filter(|(k, _)| *k >= size).count();
+        assert!(
+            newest > asked.len() / 4,
+            "{newest} of {} reads hit the keys the mix inserted",
+            asked.len()
+        );
+        // The first family's D never reads what it inserted.
+        let mut inserted_u = 0u64;
+        let (asked_u, _) = recorded_mix(&YCSB, 'D', 0, size, ops, &mut inserted_u);
+        assert!(asked_u.iter().all(|(k, _)| *k < size));
+        // A second mix after an inserting one draws over every key that
+        // exists: the loaded keys and the inserts before it.
+        let (asked_after, _) = recorded_mix(&YCSBS, 'D', YCSBS_SEED_SALT, size, ops, &mut inserted);
+        assert!(asked_after.iter().all(|&(k, c)| k >= 1 && k < c));
+        assert!(asked_after
+            .iter()
+            .any(|&(k, _)| k >= size && k < size + committed));
+    }
+
+    /// The scrambled mixes read keys that exist and spread their hot keys:
+    /// the read-only mix's hottest key is where YCSB's hash puts rank 0,
+    /// its lowest hundred keys take about their uniform share, and the
+    /// inserting mix's scans, drawn over a space that holds the inserts it
+    /// expects, start below the keys committed when each was asked.
+    #[test]
+    fn the_scrambled_mixes_read_existing_keys_from_a_spread_head() {
+        let (size, ops) = (10_000u64, 20_000u64);
+        let mut inserted = 0u64;
+        let (asked, committed) =
+            recorded_mix(&YCSBS, 'C', YCSBS_SEED_SALT, size, ops, &mut inserted);
+        assert_eq!(committed, 0);
+        assert_eq!(asked.len(), ops as usize);
+        let mut counts = vec![0u32; size as usize];
+        for &(k, _) in &asked {
+            counts[k as usize] += 1;
+        }
+        let hottest = (0..size).max_by_key(|&k| counts[k as usize]).unwrap();
+        assert_eq!(hottest, crate::workload::fnv64(0) % size);
+        let low: u32 = counts[..size as usize / 100].iter().sum();
+        assert!(
+            low < ops as u32 / 100 * 3,
+            "the lowest 1% took {low} of {ops}"
+        );
+        // The first family's C piles its reads on the lowest keys.
+        let (asked_z, _) = recorded_mix(&YCSB, 'C', 0, size, ops, &mut 0);
+        let low_z = asked_z.iter().filter(|(k, _)| *k < size / 100).count();
+        assert!(
+            low_z > ops as usize / 3,
+            "the plain Zipfian's lowest 1% took {low_z}"
+        );
+        let (scans, committed) =
+            recorded_mix(&YCSBS, 'E', YCSBS_SEED_SALT, size, ops, &mut inserted);
+        assert!(committed > 0);
+        assert!(scans.len() > ops as usize * 90 / 100);
+        for &(k, committed_then) in &scans {
+            assert!(
+                k < committed_then,
+                "a scan from {k} with {committed_then} keys committed"
+            );
+        }
+    }
+
+    /// The second family runs in a pass after the threaded scans on the
+    /// store the mixes leave, and reports a rate for each of its six mixes,
+    /// under its own pass name: a pass without it reports none.
+    #[test]
+    fn the_second_mix_family_reports_six_rates_under_its_pass() {
+        let _pass = TRIM.read().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("supdb-bench-ycsbs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut plan = Plan::new(Scale::Quick, vec![], 30_000, 4);
+        let payload = Payload::new(plan.value_size, plan.compress, 0xE1);
+        plan.passes = Passes::parse("load,mixes,scan-mixed,mixes-scrambled").unwrap();
+        let both = one_pass("supdb", &root.join("both"), 2_000, 1, &plan, &payload, None).unwrap();
+        let flat = both.flat();
+        for family in ["ycsb", "ycsbs"] {
+            for letter in YCSB_ORDER {
+                let name = format!("{family}-{letter} ops_per_s");
+                let rate = flat
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .unwrap_or_else(|| panic!("no {name}"))
+                    .1;
+                assert!(rate.is_finite() && rate > 0.0, "{name} {rate}");
+            }
+        }
+        plan.passes = Passes::parse("load,mixes").unwrap();
+        let first = one_pass(
+            "supdb",
+            &root.join("first"),
+            2_000,
+            1,
+            &plan,
+            &payload,
+            None,
+        )
+        .unwrap();
+        assert!(first.flat().iter().any(|(n, _)| n.starts_with("ycsb-")));
+        assert!(!first.flat().iter().any(|(n, _)| n.starts_with("ycsbs-")));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The pass itself refuses a forced arm over a store with no form file to
