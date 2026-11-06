@@ -172,6 +172,12 @@ pub enum SyncPolicy {
     EveryN(u32),
 }
 
+/// The window the merge asks ahead of its second pass where
+/// `Options::merge_read_ahead` is set by the arm: four mebibytes, the
+/// device's largest request here and the window the controller's build asks
+/// ahead of its walk (`Options::zpages_build_ahead`).
+pub const MERGE_AHEAD_WINDOW: usize = 4 << 20;
+
 /// I/O priority for the seal and merge threads. `Idle` asks the block layer
 /// to serve everything else -- the commit path's barrier above all -- before
 /// this thread's pages; the commit phase was measured slowing whenever a
@@ -956,6 +962,23 @@ pub struct Options {
     /// syscalls, and two megabytes is a few hundred records a page. A
     /// test lowers it to reach a drop over a store of kilobytes.
     pub merge_drop_chunk: u64,
+    /// A merge asks the kernel for each input's key section this many
+    /// bytes ahead of the walk that reads it, a window at a time (the next
+    /// window asked as the walk comes within half a window of the asks'
+    /// frontier, `blob::ahead_span`), each window only where its first page
+    /// is not resident, so in core a merge costs a residency probe a window
+    /// and no advice. The walk is the open's verification of the section's
+    /// checksum row (`BlobOptions::read_ahead`), which over a mapping is
+    /// the merge's one sequential read of its inputs -- the record region
+    /// lies inside the section -- and the second pass over the records
+    /// asks the same way behind it (`MergeAhead`, `Blob::willneed_at`)
+    /// where a bound has taken the pages back by then. Under a bound each
+    /// input was read one kernel readahead window a wait, each wait a
+    /// device round trip behind the readers' faults: the shape the
+    /// controller's build had before `zpages_build_ahead`. Zero asks
+    /// nothing; `supdb-mergeahead` is the arm with a window of
+    /// `MERGE_AHEAD_WINDOW`; the asks are counted (`Db::merge_ahead`).
+    pub merge_read_ahead: usize,
     /// I/O priority of the seal and merge threads.
     pub background_io: BackgroundIo,
     /// Have the segment writer fdatasync every this many bytes as it
@@ -3883,6 +3906,7 @@ impl Default for Options {
             malloc_mmap_threshold: 0,
             merge_drop_behind: false,
             merge_drop_chunk: 2 << 20,
+            merge_read_ahead: 0,
             background_io: BackgroundIo::Normal,
             seal_sync_every: 0,
             inline_bytes: 256,
@@ -11778,6 +11802,9 @@ struct MergePlan {
     /// bytes (`Options::merge_drop_behind`, `Options::merge_drop_chunk`).
     drop_behind: bool,
     drop_chunk: u64,
+    /// The window the second pass asks ahead of its walk of each input
+    /// (`Options::merge_read_ahead`); zero asks nothing.
+    read_ahead: usize,
     /// Each input's key kept across the steps it does not advance in
     /// (`Options::merge_walk_cached`).
     walk_cached: bool,
@@ -11786,6 +11813,78 @@ struct MergePlan {
     verify_inputs: bool,
     /// The builds at each output's finish (`Options::zpages_build_at_finish`).
     zfinish: Option<std::sync::Arc<ZFinish>>,
+}
+
+/// The merge's second pass asked ahead of itself (`Options::merge_read_ahead`):
+/// for each input the file offset its asks have reached, moved a window at a
+/// time as the walk's record offset comes within half a window of it
+/// (`blob::ahead_span`), the window asked only where its first page is not
+/// resident (`Blob::willneed_at`), so that in core a pass costs one
+/// residency probe a window and no advice. The asks and their bytes go to
+/// the store's counters at the drop.
+struct MergeAhead {
+    window: u64,
+    asked_to: Vec<u64>,
+    end: Vec<u64>,
+    asks: u64,
+    bytes: u64,
+    counts: Option<std::sync::Arc<Shared>>,
+}
+
+impl MergeAhead {
+    fn new(
+        blobs: &[&Blob<MmapBytes>],
+        window: usize,
+        counts: Option<std::sync::Arc<Shared>>,
+    ) -> Option<MergeAhead> {
+        if window == 0 {
+            return None;
+        }
+        let spans: Vec<(u64, u64)> = blobs
+            .iter()
+            .map(|b| {
+                b.record_region_span()
+                    .map_or((0, 0), |(at, len)| (at, at.saturating_add(len)))
+            })
+            .collect();
+        Some(MergeAhead {
+            window: window as u64,
+            asked_to: spans.iter().map(|s| s.0).collect(),
+            end: spans.iter().map(|s| s.1).collect(),
+            asks: 0,
+            bytes: 0,
+            counts,
+        })
+    }
+
+    /// The walk of input `i` stands at `rank`.
+    fn at(&mut self, blobs: &[&Blob<MmapBytes>], i: usize, rank: usize) {
+        let Some(off) = blobs[i].record_offset(rank) else {
+            return;
+        };
+        let Some((from, to)) =
+            crate::blob::ahead_span(self.asked_to[i], self.end[i], off, self.window)
+        else {
+            return;
+        };
+        self.asked_to[i] = to;
+        let n = blobs[i].willneed_at(from, (to - from) as usize);
+        if n > 0 {
+            self.asks += 1;
+            self.bytes += n as u64;
+        }
+    }
+}
+
+impl Drop for MergeAhead {
+    fn drop(&mut self) {
+        if let Some(c) = &self.counts {
+            c.merge_ahead_asks
+                .fetch_add(self.asks, AtomicOrdering::Relaxed);
+            c.merge_ahead_bytes
+                .fetch_add(self.bytes, AtomicOrdering::Relaxed);
+        }
+    }
 }
 
 fn compact_job(plan: MergePlan) -> Result<Vec<String>> {
@@ -12383,6 +12482,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         drop_behind,
         drop_chunk,
         walk_cached,
+        read_ahead,
         verify_inputs,
         zfinish,
     } = plan;
@@ -12390,7 +12490,15 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
     if background_io == BackgroundIo::Idle {
         idle_io_priority();
     }
-    let opened = merge_open_inputs(&dir, &inputs, &opts, verify_inputs, "compact")?;
+    let opened = merge_open_inputs(
+        &dir,
+        &inputs,
+        &opts,
+        verify_inputs,
+        read_ahead,
+        counts.as_deref(),
+        "compact",
+    )?;
     let blobs: Vec<&Blob<MmapBytes>> = opened.iter().collect();
     steps.step("open");
 
@@ -12539,11 +12647,15 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         dropped_bytes += to - dropped_to[i];
         dropped_to[i] = to;
     };
+    let mut ahead = MergeAhead::new(&blobs, read_ahead, counts.clone());
     if cursors {
         merge_ranks(&blobs, walk_cached, |k, tied| {
             let mut start = 0usize;
             let mut live = 0u64;
             for (j, &(i, rank)) in tied.iter().enumerate() {
+                if let Some(a) = ahead.as_mut() {
+                    a.at(&blobs, i, rank);
+                }
                 drop_at(i, rank);
                 let Some((_, exts)) = blobs[i].exts_at(rank) else {
                     return Err(err("segment key walk: a rank the index does not have"));
@@ -12636,6 +12748,10 @@ struct TierPlan {
     walk_cached: bool,
     /// Each input's key section verified again (`MergePlan::verify_inputs`).
     verify_inputs: bool,
+    /// The window the second pass asks ahead of its walk
+    /// (`Options::merge_read_ahead`), and where its asks are counted.
+    read_ahead: usize,
+    counts: Option<std::sync::Arc<Shared>>,
     /// The builds at each output's finish (`Options::zpages_build_at_finish`).
     zfinish: Option<std::sync::Arc<ZFinish>>,
 }
@@ -12647,26 +12763,41 @@ struct TierPlan {
 /// segment's row is verified when the store opens it, and a segment this
 /// process wrote and synced is taken unverified at its landing
 /// (`Seg::open_landed`).
+/// The merge's inputs opened over their mappings, each open's
+/// verification of its key section asking the kernel `read_ahead` bytes
+/// ahead of its walk (`BlobOptions::read_ahead`) and the asks counted
+/// where `counts` is given: that verification is the merge's one
+/// sequential read of its inputs (`Options::merge_verifies_inputs`,
+/// refuted off, said so), and out of core it faulted one kernel readahead
+/// window a wait behind the readers.
 fn merge_open_inputs(
     dir: &Path,
     inputs: &[String],
     opts: &SegmentOptions,
     verify: bool,
+    read_ahead: usize,
+    counts: Option<&Shared>,
     what: &str,
 ) -> Result<Vec<Blob<MmapBytes>>> {
     let mut blobs = Vec::with_capacity(inputs.len());
     for name in inputs {
-        blobs.push(
-            Blob::open_with(
-                MmapBytes::open(&dir.join(name))?,
-                crate::blob::BlobOptions {
-                    verify_checksums: opts.checksums,
-                    verify_index: verify,
-                    ..Default::default()
-                },
-            )
-            .map_err(|e| err(&format!("{what} input {name}: {e}")))?,
-        );
+        let b = Blob::open_with(
+            MmapBytes::open(&dir.join(name))?,
+            crate::blob::BlobOptions {
+                verify_checksums: opts.checksums,
+                verify_index: verify,
+                read_ahead,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| err(&format!("{what} input {name}: {e}")))?;
+        if let Some(c) = counts {
+            let (asks, bytes) = b.open_ahead();
+            c.merge_ahead_asks.fetch_add(asks, AtomicOrdering::Relaxed);
+            c.merge_ahead_bytes
+                .fetch_add(bytes, AtomicOrdering::Relaxed);
+        }
+        blobs.push(b);
     }
     Ok(blobs)
 }
@@ -12696,12 +12827,22 @@ fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
         ord_durable,
         walk_cached,
         verify_inputs,
+        read_ahead,
+        counts,
         zfinish,
     } = plan;
     if background_io == BackgroundIo::Idle {
         idle_io_priority();
     }
-    let opened = merge_open_inputs(&dir, &inputs, &opts, verify_inputs, "tier")?;
+    let opened = merge_open_inputs(
+        &dir,
+        &inputs,
+        &opts,
+        verify_inputs,
+        read_ahead,
+        counts.as_deref(),
+        "tier",
+    )?;
     let blobs: Vec<&Blob<MmapBytes>> = opened.iter().collect();
     let mut total = 0usize;
     merge_ranks(&blobs, walk_cached, |_, _| {
@@ -12737,11 +12878,15 @@ fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
         out: Vec::new(),
         zfinish: zfinish.clone(),
     };
+    let mut ahead = MergeAhead::new(&blobs, read_ahead, counts);
     merge_ranks(&blobs, walk_cached, |k, tied| {
         let mut start = 0usize;
         let mut live = 0u64;
         let mut tomb = false;
         for (j, &(i, rank)) in tied.iter().enumerate() {
+            if let Some(a) = ahead.as_mut() {
+                a.at(&blobs, i, rank);
+            }
             let Some((_, exts)) = blobs[i].exts_at(rank) else {
                 return Err(err("segment key walk: a rank the index does not have"));
             };
@@ -14409,6 +14554,11 @@ struct Shared {
     /// (`Options::merge_keys_by_heads`; `Db::merge_key_sources`).
     merge_head_inputs: AtomicU64,
     merge_record_inputs: AtomicU64,
+    /// The windows a merge's second pass asked the kernel for ahead of
+    /// its walk, and their bytes (`Options::merge_read_ahead`;
+    /// `Db::merge_ahead`).
+    merge_ahead_asks: AtomicU64,
+    merge_ahead_bytes: AtomicU64,
     /// Bytes of input records a merge's second pass dropped from the page
     /// cache behind itself (`Options::merge_drop_behind`).
     merge_dropped_bytes: AtomicU64,
@@ -18668,6 +18818,16 @@ impl Reader {
             self.shared
                 .merge_record_inputs
                 .load(AtomicOrdering::Relaxed),
+        )
+    }
+
+    /// The windows the merges' second passes asked the kernel for ahead of
+    /// their walks over the store's life, and their bytes
+    /// (`Options::merge_read_ahead`).
+    pub fn merge_ahead(&self) -> (u64, u64) {
+        (
+            self.shared.merge_ahead_asks.load(AtomicOrdering::Relaxed),
+            self.shared.merge_ahead_bytes.load(AtomicOrdering::Relaxed),
         )
     }
 
@@ -26097,6 +26257,30 @@ impl Reader {
 }
 
 impl Db {
+    /// A test's seam: every live segment's pages dropped from this
+    /// process's mapping and then from the file's cache, as the drop of a
+    /// served raw form does (`Options::zpages_drop_raw`), so that a merge
+    /// over the segments reads cold. The record bytes dropped. A landing
+    /// reads the partitions again -- a flush's piece is bounded against
+    /// their records -- so a test drops after the landing and before the
+    /// commit that publishes the merge the flush scheduled.
+    #[doc(hidden)]
+    pub fn drop_record_pages(&self) -> u64 {
+        let _entered = self.enter();
+        let mut dropped = 0u64;
+        for seg in self.segs() {
+            let Some((_, len)) = seg.blob.0.record_region_span() else {
+                continue;
+            };
+            seg.blob.advise_dontneed();
+            if let Ok(f) = std::fs::File::open(self.dir.join(&seg.name)) {
+                fadvise_dontneed_range(&f, 0, 0);
+            }
+            dropped += len;
+        }
+        dropped
+    }
+
     /// WAL files are numbered and rotate at each seal: the sealing thread
     /// owns the old file and deletes it once its segment is renamed into
     /// place, while commits continue into the next file. Replay walks them
@@ -26502,6 +26686,8 @@ impl Db {
             scans_merged: AtomicU64::new(0),
             merge_head_inputs: AtomicU64::new(0),
             merge_record_inputs: AtomicU64::new(0),
+            merge_ahead_asks: AtomicU64::new(0),
+            merge_ahead_bytes: AtomicU64::new(0),
             merge_dropped_bytes: AtomicU64::new(0),
             reads_near: std::sync::atomic::AtomicBool::new(false),
             scans_far_at: AtomicU64::new(u64::MAX),
@@ -27041,6 +27227,8 @@ impl Db {
             scans_merged: AtomicU64::new(0),
             merge_head_inputs: AtomicU64::new(0),
             merge_record_inputs: AtomicU64::new(0),
+            merge_ahead_asks: AtomicU64::new(0),
+            merge_ahead_bytes: AtomicU64::new(0),
             merge_dropped_bytes: AtomicU64::new(0),
             reads_near: std::sync::atomic::AtomicBool::new(false),
             scans_far_at: AtomicU64::new(u64::MAX),
@@ -37161,6 +37349,8 @@ impl Maint {
             ord_durable: self.opts.ord_durable,
             walk_cached: self.opts.merge_walk_cached,
             verify_inputs: self.opts.merge_verifies_inputs,
+            read_ahead: self.opts.merge_read_ahead,
+            counts: Some(self.shared.clone()),
             zfinish: self.z_finish_plan(),
         };
         let wake = self.wake.clone();
@@ -40796,6 +40986,7 @@ impl Maint {
         let drop_chunk = self.opts.merge_drop_chunk;
         let walk_cached = self.opts.merge_walk_cached;
         let verify_inputs = self.opts.merge_verifies_inputs;
+        let read_ahead = self.opts.merge_read_ahead;
         let zfinish = self.z_finish_plan();
         let job_inputs = inputs.clone();
         let kept_fences = fences.clone();
@@ -40821,6 +41012,7 @@ impl Maint {
                 drop_behind,
                 drop_chunk,
                 walk_cached,
+                read_ahead,
                 verify_inputs,
                 zfinish,
             });

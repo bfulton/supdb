@@ -3521,6 +3521,75 @@ fn a_merge_takes_the_ordered_index_with_the_segment_it_retires() {
     );
 }
 
+/// The merge's second pass asks the kernel for its inputs' records a window
+/// ahead of its walk (`Options::merge_read_ahead`), and only where the
+/// window's first page is not resident. Four rounds of distinct keys,
+/// interleaved so that each round's piece overlaps every partition, leave
+/// partitions of single-value records (a key with several values keeps them
+/// in blocks, and this holds the records to the region the asks cover);
+/// their pages dropped as a bound would drop them, a fifth round over every
+/// key is sealed by size at its commit -- a flush's landing is counted near
+/// reads and walks the partitions' records for the piece's bounds, where a
+/// commit's seal lands far from reads and only plans the merge -- and the
+/// merge that folds it in asks for windows that cover the cold inputs. The
+/// same merge over resident inputs asks for nothing, and with the option
+/// off nothing is asked cold either.
+#[test]
+fn a_merge_asks_ahead_only_where_its_inputs_are_not_resident() {
+    let build = |name: &str, window: usize, cold: bool| -> (u64, u64) {
+        let d = dir(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 4 << 20,
+                partition_bytes: None,
+                l0_trigger: 1,
+                merge_read_ahead: window,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let value = |round: u32, k: u32| format!("value-{round}-{k}-{}", "z".repeat(60));
+        for round in 0u32..4 {
+            for k in 0u32..24_000 {
+                db.append(
+                    format!("key-{:06}", k * 4 + round).as_bytes(),
+                    value(round, k).as_bytes(),
+                );
+            }
+            db.commit().unwrap();
+            db.flush().unwrap();
+        }
+        db.settle().unwrap();
+        let (parts, pieces) = db.levels();
+        assert!(
+            parts >= 2 && pieces == 0,
+            "{parts} partitions, {pieces} pieces"
+        );
+        let before = db.merge_ahead();
+        if cold {
+            let dropped = db.drop_record_pages();
+            assert!(dropped > 6 << 20, "dropped {dropped} bytes of records");
+        }
+        for k in 0u32..96_000 {
+            db.append(format!("key-{k:06}").as_bytes(), value(9, k).as_bytes());
+        }
+        db.commit().unwrap();
+        db.settle().unwrap();
+        let (_, pieces_after) = db.levels();
+        assert_eq!(pieces_after, 0, "the fifth round's piece was not folded in");
+        let after = db.merge_ahead();
+        (after.0 - before.0, after.1 - before.1)
+    };
+    let (asks, bytes) = build("mergeahead-cold", 1 << 20, true);
+    assert!(asks >= 6, "cold inputs: {asks} asks of {bytes} bytes");
+    assert!(bytes >= 4 << 20, "{bytes} bytes over {asks} asks");
+    let (asks, bytes) = build("mergeahead-warm", 1 << 20, false);
+    assert_eq!((asks, bytes), (0, 0), "resident inputs were asked for");
+    let (asks, bytes) = build("mergeahead-off", 0, true);
+    assert_eq!((asks, bytes), (0, 0), "the option off asked");
+}
+
 #[test]
 fn an_advising_store_advises_the_ordered_companions_too() {
     // `Db::advise` walks the segments, and a segment's ordered companion is

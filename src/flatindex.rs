@@ -355,11 +355,26 @@ pub fn verify_pieces(
     shift: u32,
     base: u64,
 ) -> std::result::Result<(), usize> {
+    verify_pieces_with(sec, crc_off, shift, base, |_, _| {})
+}
+
+/// `verify_pieces`, telling `each` the section-relative range of every
+/// piece before it is hashed: the hook a reader asks the kernel ahead of
+/// the walk through (`blob::BlobOptions::read_ahead`), since over a
+/// mapping this walk is the one sequential read of the section.
+pub fn verify_pieces_with(
+    sec: &[u8],
+    crc_off: usize,
+    shift: u32,
+    base: u64,
+    mut each: impl FnMut(usize, usize),
+) -> std::result::Result<(), usize> {
     let n = checksum_row_len(crc_off, shift, base);
     let row = sec
         .get(crc_off..crc_off.checked_add(n).ok_or(usize::MAX)?)
         .ok_or(usize::MAX)?;
     for (i, (a, b)) in pieces(crc_off, shift, base).enumerate() {
+        each(a, b);
         if crate::block::crc32(&sec[a..b]) != piece_crc(row, i).ok_or(usize::MAX)? {
             return Err(i);
         }

@@ -535,12 +535,71 @@ fn open_head<B: Bytes>(src: &B) -> Result<Super> {
 }
 
 /// How much to check on the way out.
+/// The span a walk asks next, ahead of itself: the asks' frontier
+/// `asked_to` over a region ending at `end`, the walk at offset `off`, a
+/// window of `window` bytes. `None` while the walk is more than half a
+/// window short of the frontier, or the frontier is at the region's end;
+/// else the window from the frontier, or from the walk where the walk has
+/// passed it, cut at the end. Shared by the open's verification walk
+/// (`BlobOptions::read_ahead`) and the merge's second pass
+/// (`Options::merge_read_ahead`).
+pub fn ahead_span(asked_to: u64, end: u64, off: u64, window: u64) -> Option<(u64, u64)> {
+    if asked_to >= end || off.saturating_add(window / 2) < asked_to {
+        return None;
+    }
+    let from = asked_to.max(off);
+    let to = from.saturating_add(window).min(end);
+    (from < to).then_some((from, to))
+}
+
+#[cfg(test)]
+mod ahead_tests {
+    use super::ahead_span;
+
+    const M: u64 = 1 << 20;
+
+    /// The first window from the region's start, the next once the walk is
+    /// within half a window of the frontier, the last cut at the region's
+    /// end and nothing after it, and a walk past the frontier asked from
+    /// where it stands.
+    #[test]
+    fn the_window_follows_the_walk_half_a_window_ahead() {
+        assert_eq!(ahead_span(0, 10 * M, 0, 4 * M), Some((0, 4 * M)));
+        assert_eq!(ahead_span(4 * M, 10 * M, M, 4 * M), None);
+        assert_eq!(ahead_span(4 * M, 10 * M, 2 * M - 1, 4 * M), None);
+        assert_eq!(
+            ahead_span(4 * M, 10 * M, 2 * M, 4 * M),
+            Some((4 * M, 8 * M))
+        );
+        assert_eq!(
+            ahead_span(8 * M, 10 * M, 7 * M, 4 * M),
+            Some((8 * M, 10 * M))
+        );
+        assert_eq!(ahead_span(10 * M, 10 * M, 9 * M, 4 * M), None);
+        assert_eq!(
+            ahead_span(4 * M, 10 * M, 9 * M, 4 * M),
+            Some((9 * M, 10 * M))
+        );
+        // A region of nothing asks nothing.
+        assert_eq!(ahead_span(0, 0, 0, 4 * M), None);
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct BlobOptions {
     /// Verify block checksums. On by default, matching `ReadOptions`: a
     /// browser reading an object off a CDN has more reason to check than a
     /// process reading its own disk, not less.
     pub verify_checksums: bool,
+    /// The open's verification of the key section's checksum row asks the
+    /// kernel for the section this many bytes ahead of its walk, a window
+    /// at a time (`ahead_span`, `Bytes::advise_willneed`), each window
+    /// only where its first page is not resident: over a mapping that walk
+    /// is the one sequential read of the section, and a merge's inputs
+    /// out of core read it one kernel readahead window a wait behind the
+    /// readers' faults (`Options::merge_read_ahead`). Zero asks nothing;
+    /// the asks made are `Blob::open_ahead`.
+    pub read_ahead: usize,
     /// Verify the key index's checksum row when the section carries one:
     /// every piece at a resident open, each piece as it is first used in a
     /// sparse reader. On by default for the same reason.
@@ -556,6 +615,7 @@ impl Default for BlobOptions {
     fn default() -> Self {
         BlobOptions {
             verify_checksums: true,
+            read_ahead: 0,
             verify_index: true,
             resident_directory: false,
         }
@@ -603,6 +663,9 @@ pub struct Blob<B: Bytes> {
     /// read is O(block) work to return O(value) bytes. Atomic words, since
     /// a reader is shared between threads.
     verified: Box<[AtomicU64]>,
+    /// The windows the open's verification asked the kernel for ahead of
+    /// its walk and their bytes (`BlobOptions::read_ahead`).
+    open_ahead: (u64, u64),
     /// Which reader this is, for the thread's scratch: the decoded span it
     /// remembers is this reader's or nobody's.
     id: u64,
@@ -706,10 +769,38 @@ impl<B: Bytes> Blob<B> {
         })?;
         // The whole section is resident, so the whole row is checked here,
         // once, and no read path pays anything after.
+        let mut open_ahead = (0u64, 0u64);
         if idx.crc_off != 0 && opts.verify_index {
-            if let Err(p) =
-                flatindex::verify_pieces(key.get(&src)?, idx.crc_off, idx.piece_shift, sb.key_off)
-            {
+            let sec = key.get(&src)?;
+            // The walk asked ahead of itself where the option says so: the
+            // frontier of asked bytes over the section, moved a window at a
+            // time as the pieces come within half a window of it, each
+            // window only where its first page is not resident.
+            let window = opts.read_ahead as u64;
+            let (mut asked_to, end) = (sb.key_off, sb.key_off.saturating_add(sec.len() as u64));
+            let verdict = flatindex::verify_pieces_with(
+                sec,
+                idx.crc_off,
+                idx.piece_shift,
+                sb.key_off,
+                |a, _| {
+                    if window == 0 {
+                        return;
+                    }
+                    let off = sb.key_off.saturating_add(a as u64);
+                    if let Some((from, to)) = ahead_span(asked_to, end, off, window) {
+                        asked_to = to;
+                        if src.resident_at(from) != Some(true) {
+                            let n = src.advise_willneed(from, (to - from) as usize);
+                            if n > 0 {
+                                open_ahead.0 += 1;
+                                open_ahead.1 += n as u64;
+                            }
+                        }
+                    }
+                },
+            );
+            if let Err(p) = verdict {
                 return Err(corrupt(&format!(
                     "key index checksum mismatch in piece {p}"
                 )));
@@ -720,6 +811,7 @@ impl<B: Bytes> Blob<B> {
         let verified = vec![0u64; (blocks.len() * block::MAX_CHUNK_CRCS).div_ceil(64)];
         Ok(Blob {
             src,
+            open_ahead,
             // The generation of the index *section*, not of the superblock.
             // They are not always the same number -- a publish can move the
             // superblock on without writing a new index -- and `Reader`
@@ -995,6 +1087,25 @@ impl<B: Bytes> Blob<B> {
             return 0;
         }
         self.src.advise_willneed(off, b - a)
+    }
+
+    /// The bytes at file offset `off` for `len`, asked of the kernel ahead
+    /// of a walk that will read them (`Bytes::advise_willneed`), unless the
+    /// span's first page is resident already (`Bytes::resident_at`), where
+    /// an ask would cost the kernel's walk of resident pages for nothing:
+    /// the bytes submitted.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn willneed_at(&self, off: u64, len: usize) -> usize {
+        if len == 0 || self.src.resident_at(off) == Some(true) {
+            return 0;
+        }
+        self.src.advise_willneed(off, len)
+    }
+
+    /// The windows the open's verification asked the kernel for ahead of
+    /// its walk, and their bytes (`BlobOptions::read_ahead`).
+    pub fn open_ahead(&self) -> (u64, u64) {
+        self.open_ahead
     }
 
     pub fn record_offset(&self, rank: usize) -> Option<u64> {
@@ -2467,6 +2578,7 @@ impl<B: Bytes> SparseBlob<B> {
                 timestamp: sb.timestamp,
                 opts,
                 verified: verified.into_iter().map(AtomicU64::new).collect(),
+                open_ahead: (0, 0),
                 id: NEXT_BLOB_ID.fetch_add(1, AtomicOrdering::Relaxed),
                 decodes: AtomicU64::new(0),
             },

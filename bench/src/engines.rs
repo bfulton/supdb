@@ -616,6 +616,10 @@ pub struct Supdb {
     /// (`Options::background_io` Idle), so the readers' faults are served
     /// before the merges' reads and writes. `supdb-bgidle`, durable.
     bgidle: bool,
+    /// The merge's second pass asks the kernel for its inputs' records a
+    /// window ahead of its walk (`Options::merge_read_ahead` at
+    /// `MERGE_AHEAD_WINDOW`). `supdb-mergeahead`, durable.
+    mergeahead: bool,
     /// The block cache reads a block boundary's key off the ordered index's
     /// top level in memory, where the default reads the partition's record
     /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
@@ -1447,6 +1451,10 @@ struct Policy {
     /// (`Options::background_io` Idle), so the readers' faults are served
     /// before the merges' reads and writes. `supdb-bgidle`, durable.
     bgidle: bool,
+    /// The merge's second pass asks the kernel for its inputs' records a
+    /// window ahead of its walk (`Options::merge_read_ahead` at
+    /// `MERGE_AHEAD_WINDOW`). `supdb-mergeahead`, durable.
+    mergeahead: bool,
     /// The block cache reads a block boundary's key off the ordered index's
     /// top level in memory, where the default reads the partition's record
     /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
@@ -2027,6 +2035,7 @@ impl Default for Policy {
             zaheadscans: false,
             nozfinish: false,
             bgidle: false,
+            mergeahead: false,
             boundarytop: false,
             nodirwillneed: false,
             noboundsheadwillneed: false,
@@ -3987,6 +3996,22 @@ impl Supdb {
             path,
             Policy {
                 bgidle: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose merges ask the kernel for their inputs' records four
+    /// mebibytes ahead of their second pass (`Options::merge_read_ahead`),
+    /// `supdb-mergeahead`: against `supdb` it prices the ask where the
+    /// full rewrite's chain reads its inputs behind the scans' faults one
+    /// readahead window a wait, and in core, where every window is resident
+    /// and the ask is a residency probe.
+    pub fn create_mergeahead(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                mergeahead: true,
                 ..Policy::default()
             },
         )
@@ -6631,6 +6656,7 @@ impl Supdb {
             zaheadscans,
             nozfinish,
             bgidle,
+            mergeahead,
             boundarytop,
             nodirwillneed,
             noboundsheadwillneed,
@@ -6956,6 +6982,11 @@ impl Supdb {
             } else {
                 supdb::BackgroundIo::Normal
             },
+            merge_read_ahead: if mergeahead {
+                supdb::MERGE_AHEAD_WINDOW
+            } else {
+                0
+            },
             wal_drop_bytes: if walkeep {
                 0
             } else {
@@ -7247,6 +7278,7 @@ impl Supdb {
             zaheadscans,
             nozfinish,
             bgidle,
+            mergeahead,
             boundarytop,
             nodirwillneed,
             noboundsheadwillneed,
@@ -8019,6 +8051,9 @@ impl Engine for Supdb {
         if self.bgidle {
             return "supdb-bgidle";
         }
+        if self.mergeahead {
+            return "supdb-mergeahead";
+        }
         if self.zparse && self.budget == 0 {
             return "supdb-zparse";
         }
@@ -8526,6 +8561,8 @@ impl Engine for Supdb {
             ("pieces", db.levels().1 as f64),
             ("merge_head_inputs", db.merge_key_sources().0 as f64),
             ("merge_record_inputs", db.merge_key_sources().1 as f64),
+            ("merge_ahead_asks", db.merge_ahead().0 as f64),
+            ("merge_ahead_mb", db.merge_ahead().1 as f64 / 1048576.0),
             (
                 "merge_dropped_mb",
                 db.merge_dropped_bytes() as f64 / 1048576.0,
@@ -9593,6 +9630,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zaheadscans"
         | "supdb-nozfinish"
         | "supdb-bgidle"
+        | "supdb-mergeahead"
         | "supdb-zparse"
         | "supdb-nozpagesnofitshort"
         | "supdb-nozpagesmergepar2"
@@ -10143,6 +10181,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zaheadscans" => supdb_arm(Supdb::create_zaheadscans, dir)?,
         "supdb-nozfinish" => supdb_arm(Supdb::create_nozfinish, dir)?,
         "supdb-bgidle" => supdb_arm(Supdb::create_bgidle, dir)?,
+        "supdb-mergeahead" => supdb_arm(Supdb::create_mergeahead, dir)?,
         "supdb-zparse" => supdb_arm(Supdb::create_zparse, dir)?,
         "supdb-nozpagesnofitshort" => supdb_arm(Supdb::create_nozpages_nofitshort, dir)?,
         "supdb-nozpagesmergepar2" => supdb_arm(Supdb::create_nozpages_mergepar2, dir)?,
@@ -11744,6 +11783,7 @@ mod tests {
             "supdb-zaheadscans",
             "supdb-nozfinish",
             "supdb-bgidle",
+            "supdb-mergeahead",
         ] {
             assert_eq!(
                 open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
@@ -11784,6 +11824,17 @@ mod tests {
                         b.wal_drop_bytes,
                         b.forms_fit_when_short
                     )
+                );
+            }
+            {
+                let z = Supdb::create_mergeahead(&dir("mergeahead")).unwrap();
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert_eq!(b.merge_read_ahead, 0);
+                assert_eq!(o.merge_read_ahead, supdb::MERGE_AHEAD_WINDOW);
+                assert_eq!(
+                    (o.background_io, o.zpages, o.merge_bytes_cap, o.upkeep),
+                    (b.background_io, b.zpages, b.merge_bytes_cap, b.upkeep)
                 );
             }
             {
