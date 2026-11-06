@@ -913,6 +913,11 @@ pub struct Supdb {
     /// off), the shape before. `supdb-noyield`, and `supdb-ingestnoyield`
     /// buffered.
     noyield: bool,
+    /// The upkeep thread's complete-table fill holding the writer's
+    /// upkeep until the fill is done (`Options::upkeep_fill_yields` off),
+    /// the shape before the fill gave it back at a block.
+    /// `supdb-fillholds`, and `supdb-ingestfillholds` buffered.
+    fillholds: bool,
     /// The fill yielding its conversions at any posted commit
     /// (`Options::forms_convert_behind` zero), the shape before it
     /// converted in the thread's slack. `supdb-postedyield`, and
@@ -1765,6 +1770,9 @@ struct Policy {
     /// The upkeep thread's fill never yielding its conversions:
     /// `supdb-noyield`, and `supdb-ingestnoyield` buffered.
     noyield: bool,
+    /// The complete-table fill holding the writer until it is done:
+    /// `supdb-fillholds`, and `supdb-ingestfillholds` buffered.
+    fillholds: bool,
     /// The fill yielding at any posted commit: `supdb-postedyield`, and
     /// `supdb-ingestpostedyield` buffered.
     postedyield: bool,
@@ -2090,6 +2098,7 @@ impl Default for Policy {
             convertcap: false,
             shortpass: false,
             noyield: false,
+            fillholds: false,
             postedyield: false,
             behindyield: false,
             bg: false,
@@ -2491,6 +2500,47 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 noyield: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose upkeep thread's complete-table fill holds the writer's
+    /// upkeep until the fill is done (`Options::upkeep_fill_yields` off):
+    /// the shape before the fill gave it back at a block.
+    pub fn create_fillholds(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                fillholds: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// DIAGNOSTIC: `supdb` with no trim thread (`Options::forms_trim_bytes`
+    /// zero), so the forms the block cache sheds stay with the allocator and
+    /// the builds after them fault no fresh page -- the bound on what the
+    /// churn's faults cost, not a shape to ship, since what the allocator
+    /// keeps is page cache the store cannot have.
+    pub fn create_notrim(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                notrim: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` whose fill holds the writer, as `supdb-fillholds`.
+    pub fn create_ingest_fillholds(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                fillholds: true,
                 ..Policy::default()
             },
         )
@@ -6732,6 +6782,7 @@ impl Supdb {
             convertcap,
             shortpass,
             noyield,
+            fillholds,
             postedyield,
             behindyield,
             bg,
@@ -7028,6 +7079,7 @@ impl Supdb {
             upkeep_abandons: !noabandon,
             upkeep_files_bursts: !deferbursts,
             upkeep_yields: passyield,
+            upkeep_fill_yields: !fillholds,
             scan_cache_auto: !cachenoauto,
             prefault: populate,
             direct_put_one: !recordsteps,
@@ -7354,6 +7406,7 @@ impl Supdb {
             convertcap,
             shortpass,
             noyield,
+            fillholds,
             postedyield,
             behindyield,
             bg,
@@ -7683,6 +7736,16 @@ impl Engine for Supdb {
             } else {
                 "supdb-ingestnoyield"
             };
+        }
+        if self.fillholds {
+            return if self.partition {
+                "supdb-fillholds"
+            } else {
+                "supdb-ingestfillholds"
+            };
+        }
+        if self.notrim {
+            return "supdb-notrim";
         }
         if self.postedyield {
             return if self.partition {
@@ -8633,6 +8696,14 @@ impl Engine for Supdb {
             ("maint_cpu_us", db.maint_cpu_us() as f64),
             ("convert_build_us", db.convert_us().0 as f64),
             ("convert_total_us", db.convert_us().1 as f64),
+            // The maintenance pass's steps: see `Db::pass_steps`.
+            ("pass_settle_us", db.pass_steps().0[0] as f64),
+            ("pass_snap_us", db.pass_steps().0[1] as f64),
+            ("pass_fillwalk_us", db.pass_steps().0[2] as f64),
+            ("pass_fillbuild_us", db.pass_steps().0[3] as f64),
+            ("fill_walked", db.pass_steps().1 as f64),
+            ("fill_passes", db.pass_steps().2 as f64),
+            ("fill_cuts", db.pass_steps().3 as f64),
             ("forms_cloned", db.forms_cloned() as f64),
             ("forms_trims", db.forms_trims() as f64),
             ("forms_trim_looks", db.forms_trim_looks() as f64),
@@ -9690,6 +9761,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-convertcap"
         | "supdb-shortpass"
         | "supdb-noyield"
+        | "supdb-fillholds"
+        | "supdb-notrim"
         | "supdb-postedyield"
         | "supdb-behindyield"
         | "supdb-bg"
@@ -9718,6 +9791,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestconvertcap"
         | "supdb-ingestshortpass"
         | "supdb-ingestnoyield"
+        | "supdb-ingestfillholds"
         | "supdb-ingestpostedyield"
         | "supdb-ingestbehindyield"
         | "supdb-ingestpiecesonly"
@@ -10099,6 +10173,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-convertcap" => supdb_arm(Supdb::create_convertcap, dir)?,
         "supdb-shortpass" => supdb_arm(Supdb::create_shortpass, dir)?,
         "supdb-noyield" => supdb_arm(Supdb::create_noyield, dir)?,
+        "supdb-fillholds" => supdb_arm(Supdb::create_fillholds, dir)?,
+        "supdb-notrim" => supdb_arm(Supdb::create_notrim, dir)?,
         "supdb-postedyield" => supdb_arm(Supdb::create_postedyield, dir)?,
         "supdb-behindyield" => supdb_arm(Supdb::create_behindyield, dir)?,
         "supdb-bg" => supdb_arm(Supdb::create_bg, dir)?,
@@ -10433,6 +10509,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestconvertcap" => supdb_arm(Supdb::create_ingest_convertcap, dir)?,
         "supdb-ingestshortpass" => supdb_arm(Supdb::create_ingest_shortpass, dir)?,
         "supdb-ingestnoyield" => supdb_arm(Supdb::create_ingest_noyield, dir)?,
+        "supdb-ingestfillholds" => supdb_arm(Supdb::create_ingest_fillholds, dir)?,
         "supdb-ingestpostedyield" => supdb_arm(Supdb::create_ingest_postedyield, dir)?,
         "supdb-ingestbehindyield" => supdb_arm(Supdb::create_ingest_behindyield, dir)?,
         "supdb-idle" => supdb_arm(Supdb::create_idle, dir)?,

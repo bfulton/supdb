@@ -2877,6 +2877,22 @@ pub struct Options {
     /// core level, two passes cut a rep. Off, the default: the writer
     /// waits a pass out. `supdb-passyield` is the arm that yields.
     pub upkeep_yields: bool,
+    /// Whether the complete-table fill of a pass on the upkeep thread --
+    /// a form built for every block an unsealed key or a piece overlays
+    /// that holds none, the work the builder ahead does where there is one
+    /// -- gives the writer its upkeep back at the fill's next block once
+    /// the writer wants it, the settle before it standing and the pass
+    /// published; the fill goes on at the thread's next pass, and a scan
+    /// meanwhile builds the blocks it walks itself, as it does for any
+    /// block without a form. Where the pass yields whole
+    /// (`upkeep_yields`) this changes nothing. On. Off, the writer waits
+    /// the fill out: at ten million keys under 1.25 GiB, with the builder
+    /// ahead off out of core, the fill built 143 forms a pass over the
+    /// store's blocks in order, 684 ms of E's 832 passes against a settle
+    /// of 19, and E's scans waited 735 ms of 6.7 s on them for forms over
+    /// blocks they mostly never read (`docs/engine.md`). `supdb-fillholds`
+    /// and `supdb-ingestfillholds` are the arms that wait.
+    pub upkeep_fill_yields: bool,
     /// Whether the engine's large blocks -- a memtable's arena blocks,
     /// its entry slabs and its hash index, a scan snapshot's arena
     /// blocks -- are mapped from the kernel, from `blocks::MAP_FROM`
@@ -4043,6 +4059,7 @@ impl Default for Options {
             upkeep_abandons: true,
             upkeep_files_bursts: true,
             upkeep_yields: false,
+            upkeep_fill_yields: true,
             blocks_mapped: true,
             forms_convert_yield: true,
             forms_convert_behind: usize::MAX,
@@ -14480,6 +14497,17 @@ struct Shared {
     /// life; see `Db::convert_us`.
     convert_build_ns: AtomicU64,
     convert_total_ns: AtomicU64,
+    /// The maintenance pass's steps, nanoseconds over the store's life, for
+    /// a decomposition of what a scan waits for (`Db::pass_steps`): the
+    /// log read and settle; the snapshot's and runs' refresh with the
+    /// builds ahead installed and the settled blocks built; the
+    /// complete-table fill's walk over the blocks; and the forms that
+    /// fill built. Then the blocks the fill walked and the passes stamped.
+    pass_ns: [AtomicU64; 4],
+    fill_walked: AtomicU64,
+    fill_passes: AtomicU64,
+    /// Fills that stopped at a block for the writer (`Options::upkeep_fill_yields`).
+    fill_cuts: AtomicU64,
     /// Ordered indexes the open rebuilt from their segments
     /// (`Seg::open_ord`); see `Db::ord_rebuilt`.
     ord_rebuilt: AtomicU64,
@@ -21086,6 +21114,18 @@ impl Reader {
             && self.shared.upkeep.state.load(AtomicOrdering::Acquire) & LEND_WANT != 0
     }
 
+    /// Whether the writer wants its upkeep back while this pass's fill
+    /// holds it, where the pass is not one that yields whole
+    /// (`Options::upkeep_fill_yields`): asked at the fill's blocks, so that
+    /// the writer waits for a block's build and not for the fill. Off the
+    /// thread, never.
+    fn fill_wanted(&self) -> bool {
+        self.understudy
+            && self.opts.upkeep_fill_yields
+            && !self.opts.upkeep_yields
+            && self.shared.upkeep.state.load(AtomicOrdering::Acquire) & LEND_WANT != 0
+    }
+
     fn abandon_asked(&self) -> bool {
         if !self.understudy {
             return false;
@@ -22676,6 +22716,7 @@ impl Reader {
             .convert_dense
             .set(self.opts.forms_convert_unread || life != self.fs().convert_life.replace(life));
         let gen = st.gen;
+        let t_pass = std::time::Instant::now();
         let mut moved = self.sync_log() || self.fs().scan_keys.borrow().is_none();
         // Settle before the snapshot moves, which is the order the scan
         // path takes and the reason it was never wrong. A pending write
@@ -22719,6 +22760,14 @@ impl Reader {
             moved |= self.sync_log();
             self.settle_pending_more()?;
         }
+        let t_settled = std::time::Instant::now();
+        self.shared.pass_ns[0].fetch_add(
+            (t_settled - t_pass).as_nanos() as u64,
+            AtomicOrdering::Relaxed,
+        );
+        self.shared
+            .fill_passes
+            .fetch_add(1, AtomicOrdering::Relaxed);
         if self.abandon_forms() {
             return Ok(());
         }
@@ -22735,6 +22784,10 @@ impl Reader {
                 }
             }
         }
+        self.shared.pass_ns[1].fetch_add(
+            t_settled.elapsed().as_nanos() as u64,
+            AtomicOrdering::Relaxed,
+        );
         if self.abandon_forms() {
             return Ok(());
         }
@@ -22771,14 +22824,15 @@ impl Reader {
             if !filling {
                 let cache = self.fs().scan_keys.borrow();
                 let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
-                self.complete_forms(unsealed)?;
+                let whole = self.complete_forms(unsealed)?;
                 drop(cache);
-                // A fill cut short is no table to call complete, and
-                // nor is one that reached the budget.
+                // A fill cut short is no table to call complete, nor one
+                // that stopped for the writer, and nor is one that reached
+                // the budget.
                 if self.abandon_forms() {
                     return Ok(());
                 }
-                if !self.cache_binds() && !self.fs().log_short.get() {
+                if whole && !self.cache_binds() && !self.fs().log_short.get() {
                     self.fs().tables_complete.set(true);
                 }
             }
@@ -22821,7 +22875,7 @@ impl Reader {
         let ctx = self.build_ctx();
         ctx.rank_pieces()?;
         for &(pi, b) in blocks {
-            if self.abandon_asked() || self.upkeep_wanted() {
+            if self.abandon_asked() || self.upkeep_wanted() || self.fill_wanted() {
                 return Ok(());
             }
             let (pi, b) = (pi as usize, b as usize);
@@ -22955,19 +23009,48 @@ impl Reader {
     /// the blocks with a count and no form. It is the work the builder
     /// ahead does on a spare core, done here for the store the builder
     /// declined (too small) or has not reached.
-    fn complete_forms(&self, unsealed: &Snapshot) -> Result<()> {
+    fn complete_forms(&self, unsealed: &Snapshot) -> Result<bool> {
         let mut converted = 0usize;
+        // The fill's walk and its builds apart, on the thread's clock, for
+        // `Db::pass_steps`, recorded at every exit.
+        struct FillStamp<'a> {
+            ns: &'a [AtomicU64; 4],
+            walked_ctr: &'a AtomicU64,
+            t: std::time::Instant,
+            build_ns: u64,
+            walked: u64,
+        }
+        impl Drop for FillStamp<'_> {
+            fn drop(&mut self) {
+                let total = self.t.elapsed().as_nanos() as u64;
+                self.ns[2].fetch_add(total.saturating_sub(self.build_ns), AtomicOrdering::Relaxed);
+                self.ns[3].fetch_add(self.build_ns, AtomicOrdering::Relaxed);
+                self.walked_ctr
+                    .fetch_add(self.walked, AtomicOrdering::Relaxed);
+            }
+        }
+        let mut stamp = FillStamp {
+            ns: &self.shared.pass_ns,
+            walked_ctr: &self.shared.fill_walked,
+            t: std::time::Instant::now(),
+            build_ns: 0,
+            walked: 0,
+        };
         let np = self.segs().partition_point(|s| s.level > 0);
         let l0 = &self.segs()[np..];
         let ctx = self.build_ctx();
         ctx.rank_pieces()?;
         for pi in 0..np {
             if self.abandon_asked() {
-                return Ok(());
+                return Ok(false);
             }
             if self.upkeep_wanted() {
                 self.fs().log_short.set(true);
-                return Ok(());
+                return Ok(false);
+            }
+            if self.fill_wanted() {
+                self.shared.fill_cuts.fetch_add(1, AtomicOrdering::Relaxed);
+                return Ok(false);
             }
             let seg = &self.segs()[pi];
             let tables = self.fs().tables.borrow();
@@ -22989,24 +23072,38 @@ impl Reader {
                 ..self.build_ctx()
             };
             for b in 0..table.slots.len() {
+                stamp.walked += 1;
                 if b % 64 == 63 {
                     if self.abandon_asked() {
-                        return Ok(());
+                        return Ok(false);
                     }
                     // The writer wants its upkeep back: the fill stops
                     // here, the table not called complete, and the pass
                     // is short (`Options::upkeep_yields`).
                     if self.upkeep_wanted() {
                         self.fs().log_short.set(true);
-                        return Ok(());
+                        return Ok(false);
                     }
+                }
+                // The writer wants its upkeep back and the pass is not one
+                // that yields whole: the fill alone stops here, at a block,
+                // the table not called complete, the settle before it
+                // standing and the pass published; the fill goes on at the
+                // thread's next pass (`Options::upkeep_fill_yields`). A
+                // scan waited the whole fill out before: at ten million keys
+                // under 1.25 GiB the fill built 143 forms a pass over the
+                // store's blocks in order, 684 ms of E's 832 passes, for
+                // the scans that waited 735 ms on them.
+                if self.fill_wanted() {
+                    self.shared.fill_cuts.fetch_add(1, AtomicOrdering::Relaxed);
+                    return Ok(false);
                 }
                 // The store's own budget reached: it binds, and what the
                 // fill has not built is left to the scans that want it.
                 let budget = self.cache_budget();
                 if budget > 0 && !self.cache_binds() && self.fs().cache_bytes.get() > budget {
                     self.bind_cache();
-                    return Ok(());
+                    return Ok(false);
                 }
                 // An empty slot with an overlay, or a form the patches
                 // grew to what a build would have copied -- the latter up
@@ -23079,6 +23176,7 @@ impl Reader {
                         self.shared.forms_events[5].fetch_add(1, AtomicOrdering::Relaxed);
                         ctx.materialize(src, table, b, unsealed)?
                     };
+                    stamp.build_ns += t_build.elapsed().as_nanos() as u64;
                     self.shared
                         .convert_build_ns
                         .fetch_add(t_build.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
@@ -23101,14 +23199,16 @@ impl Reader {
                     continue;
                 }
                 self.shared.forms_events[6].fetch_add(1, AtomicOrdering::Relaxed);
+                let t_build = std::time::Instant::now();
                 let built = self.share_form(ctx.materialize(src, table, b, unsealed)?);
+                stamp.build_ns += t_build.elapsed().as_nanos() as u64;
                 self.count_built_kind(&built);
                 let bytes = self.fbytes(&built);
                 table.slots[b] = Some(built);
                 self.list_built_bytes(pi, b, table, bytes);
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Whether the upkeep thread is behind the writer by more than the
@@ -26663,6 +26763,10 @@ impl Db {
             maint_cpu_ns: AtomicU64::new(0),
             convert_build_ns: AtomicU64::new(0),
             convert_total_ns: AtomicU64::new(0),
+            pass_ns: [const { AtomicU64::new(0) }; 4],
+            fill_walked: AtomicU64::new(0),
+            fill_passes: AtomicU64::new(0),
+            fill_cuts: AtomicU64::new(0),
             ord_rebuilt: AtomicU64::new(0),
             z: zfile::ZEvents::default(),
             retired_z: RetireList::new(),
@@ -27204,6 +27308,10 @@ impl Db {
             maint_cpu_ns: AtomicU64::new(0),
             convert_build_ns: AtomicU64::new(0),
             convert_total_ns: AtomicU64::new(0),
+            pass_ns: [const { AtomicU64::new(0) }; 4],
+            fill_walked: AtomicU64::new(0),
+            fill_passes: AtomicU64::new(0),
+            fill_cuts: AtomicU64::new(0),
             ord_rebuilt: AtomicU64::new(ord_rebuilt),
             z: zev,
             retired_z: RetireList::new(),
@@ -32996,6 +33104,24 @@ impl Db {
     /// last turn of its loop; zero where the segment work runs inline.
     pub fn maint_cpu_us(&self) -> u64 {
         self.shared.maint_cpu_ns.load(AtomicOrdering::Relaxed) / 1000
+    }
+
+    /// The maintenance pass's steps, microseconds over the store's life
+    /// -- the log read and settle; the snapshot's and runs' refresh with
+    /// the builds ahead installed and the settled blocks built; the
+    /// complete-table fill's walk over the blocks; and that fill's builds
+    /// -- then the blocks the fill walked, the passes stamped and the fills
+    /// that stopped at a block for the writer (`Options::upkeep_fill_yields`).
+    /// Atomics only: a read takes nothing back from the thread.
+    #[doc(hidden)]
+    pub fn pass_steps(&self) -> ([u64; 4], u64, u64, u64) {
+        let ns = &self.shared.pass_ns;
+        (
+            [0, 1, 2, 3].map(|i| ns[i].load(AtomicOrdering::Relaxed) / 1000),
+            self.shared.fill_walked.load(AtomicOrdering::Relaxed),
+            self.shared.fill_passes.load(AtomicOrdering::Relaxed),
+            self.shared.fill_cuts.load(AtomicOrdering::Relaxed),
+        )
     }
 
     /// Microseconds the fill's dense conversions spent building their

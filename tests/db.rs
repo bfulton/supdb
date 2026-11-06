@@ -1075,6 +1075,122 @@ fn a_pass_the_writer_wants_its_upkeep_back_from_yields_at_its_next_step() {
     );
 }
 
+/// The complete-table fill of a pass on the upkeep thread gives the writer
+/// its upkeep back at the fill's next block once the writer wants it
+/// (`Options::upkeep_fill_yields`), the settle before it standing and the
+/// pass published. The store: reads around from one short scan, so no
+/// block holds a form but the one it walked; a burst over every block is
+/// lent, and the thread's pass holds inside until the scan asks for the
+/// upkeep, so the pass settles the burst whole and begins its fill -- a
+/// form for every block of the store -- with the writer wanting it, and
+/// the scan reads every key as written. With the fill's yield the fill
+/// stops at a block and the pass is whole; without it the scan waits the
+/// fill out over every block, the pass whole too, since the fill's yield
+/// is not the pass's (`upkeep_yields`).
+#[test]
+fn a_fill_the_writer_wants_its_upkeep_back_from_stops_at_its_next_block() {
+    const KEYS: u32 = 300_000;
+    let run = |name: &str, yields: bool| {
+        let d = dir(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                upkeep: supdb::Upkeep::Background(1),
+                upkeep_fill_yields: yields,
+                // The fill is the commit's where no builder ahead runs, as
+                // out of core (`Options::ahead_out_of_core`).
+                scan_cache_ahead: false,
+                partition_bytes: Some(256 << 10),
+                seal_max_pct: 0,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        let mut want: HashMap<u32, &str> = HashMap::new();
+        for k in 0..KEYS {
+            db.append(&key(k), b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        assert!(db.levels().0 > 0, "partitions for the forms to hang on");
+        let check = |db: &Reader, want: &HashMap<u32, &str>, when: &str| {
+            let mut seen = 0u32;
+            db.scan(
+                &key(0),
+                KEYS as usize,
+                kv(&mut |k, v| {
+                    let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                    let expect = want.get(&kn).copied().unwrap_or("0");
+                    assert_eq!(std::str::from_utf8(v).unwrap(), expect, "key {kn} {when}");
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, KEYS, "every key {when}");
+        };
+        // Reads around: one short scan by the writer, which forms the one
+        // block it walks and no other.
+        let mut n = 0usize;
+        db.scan(&key(0), 8, kv(&mut |_, _| n += 1)).unwrap();
+        assert_eq!(n, 8);
+        // The thread's next pass holds inside, pinned, until released: a
+        // burst over every block lent to it, every block of the store the
+        // fill's to form after the settle.
+        db.hold_upkeep_pinned(true);
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..200_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = (x % KEYS as u64) as u32;
+            db.put(&key(k), b"b");
+            want.insert(k, "b");
+        }
+        db.commit().unwrap();
+        let t = std::time::Instant::now();
+        while !db.upkeep_holding() {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(20),
+                "the pass began"
+            );
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+        // Released as the scan asks for the upkeep: the pass settles the
+        // burst whole and begins its fill with the writer wanting it.
+        db.hold_upkeep_pinned(false);
+        check(&db, &want, "after the burst");
+        let (steps, walked, _passes, cuts) = db.pass_steps();
+        let c = db.upkeep_counts();
+        let h = db.reader().unwrap();
+        check(&h, &want, "through a handle after the burst");
+        // Fills cut for the writer, the blocks the fill walked, its builds'
+        // microseconds, and the passes cut short.
+        (cuts, walked, steps[3], c[8])
+    };
+    let (cuts_on, walked_on, build_on, short_on) = run("fill-yield-on", true);
+    let (cuts_off, walked_off, build_off, short_off) = run("fill-yield-off", false);
+    eprintln!(
+        "fill yield: cut {cuts_on} walked {walked_on} built {build_on} us; \
+         holds: cut {cuts_off} walked {walked_off} built {build_off} us"
+    );
+    let blocks = u64::from(KEYS / 64);
+    assert!(
+        cuts_on >= 1 && walked_on < walked_off,
+        "the fill stopped at a block for the writer: cut {cuts_on}, walked {walked_on} of {walked_off}"
+    );
+    assert_eq!(cuts_off, 0, "the fill that holds is never cut");
+    assert!(
+        walked_off >= blocks && build_off > 0,
+        "the fill that holds walked the store: walked {walked_off} of {blocks} blocks, built {build_off} us"
+    );
+    assert_eq!(
+        (short_on, short_off),
+        (0, 0),
+        "neither pass is cut short: the fill's yield is not the pass's"
+    );
+}
+
 /// The probe merge stays behind `cursor_merge` as the comparison arm -- and
 /// a path only one arm exercises is a path nothing tests.
 #[test]
