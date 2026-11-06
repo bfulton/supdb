@@ -612,6 +612,10 @@ pub struct Supdb {
     /// A merge's outputs given their form files as each is finished
     /// (`Options::zpages_build_at_finish` off). `supdb-nozfinish`, durable.
     nozfinish: bool,
+    /// The seal and merge threads at the block layer's idle I/O class
+    /// (`Options::background_io` Idle), so the readers' faults are served
+    /// before the merges' reads and writes. `supdb-bgidle`, durable.
+    bgidle: bool,
     /// The block cache reads a block boundary's key off the ordered index's
     /// top level in memory, where the default reads the partition's record
     /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
@@ -1439,6 +1443,10 @@ struct Policy {
     /// A merge's outputs given their form files as each is finished
     /// (`Options::zpages_build_at_finish` off). `supdb-nozfinish`, durable.
     nozfinish: bool,
+    /// The seal and merge threads at the block layer's idle I/O class
+    /// (`Options::background_io` Idle), so the readers' faults are served
+    /// before the merges' reads and writes. `supdb-bgidle`, durable.
+    bgidle: bool,
     /// The block cache reads a block boundary's key off the ordered index's
     /// top level in memory, where the default reads the partition's record
     /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
@@ -2018,6 +2026,7 @@ impl Default for Policy {
             zreparse: false,
             zaheadscans: false,
             nozfinish: false,
+            bgidle: false,
             boundarytop: false,
             nodirwillneed: false,
             noboundsheadwillneed: false,
@@ -3962,6 +3971,22 @@ impl Supdb {
             path,
             Policy {
                 nozfinish: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with its seal and merge threads at the block layer's idle
+    /// I/O class (`Options::background_io` Idle), `supdb-bgidle`: against
+    /// `supdb` it prices the class on the lag sweep under a bound, where
+    /// the full rewrite's merges read and write gigabytes at the device
+    /// inside the pass whose scans fault behind them, and on the loads,
+    /// whose seals the class would hold behind the commits' own I/O.
+    pub fn create_bgidle(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                bgidle: true,
                 ..Policy::default()
             },
         )
@@ -6605,6 +6630,7 @@ impl Supdb {
             zreparse,
             zaheadscans,
             nozfinish,
+            bgidle,
             boundarytop,
             nodirwillneed,
             noboundsheadwillneed,
@@ -6925,6 +6951,11 @@ impl Supdb {
             zpages_reparse: zreparse,
             zpages_ahead_past_scans: zaheadscans,
             zpages_build_at_finish: !nozfinish,
+            background_io: if bgidle {
+                supdb::BackgroundIo::Idle
+            } else {
+                supdb::BackgroundIo::Normal
+            },
             wal_drop_bytes: if walkeep {
                 0
             } else {
@@ -7215,6 +7246,7 @@ impl Supdb {
             zreparse,
             zaheadscans,
             nozfinish,
+            bgidle,
             boundarytop,
             nodirwillneed,
             noboundsheadwillneed,
@@ -7983,6 +8015,9 @@ impl Engine for Supdb {
         }
         if self.nozfinish {
             return "supdb-nozfinish";
+        }
+        if self.bgidle {
+            return "supdb-bgidle";
         }
         if self.zparse && self.budget == 0 {
             return "supdb-zparse";
@@ -9557,6 +9592,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zreparse"
         | "supdb-zaheadscans"
         | "supdb-nozfinish"
+        | "supdb-bgidle"
         | "supdb-zparse"
         | "supdb-nozpagesnofitshort"
         | "supdb-nozpagesmergepar2"
@@ -10106,6 +10142,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zreparse" => supdb_arm(Supdb::create_zreparse, dir)?,
         "supdb-zaheadscans" => supdb_arm(Supdb::create_zaheadscans, dir)?,
         "supdb-nozfinish" => supdb_arm(Supdb::create_nozfinish, dir)?,
+        "supdb-bgidle" => supdb_arm(Supdb::create_bgidle, dir)?,
         "supdb-zparse" => supdb_arm(Supdb::create_zparse, dir)?,
         "supdb-nozpagesnofitshort" => supdb_arm(Supdb::create_nozpages_nofitshort, dir)?,
         "supdb-nozpagesmergepar2" => supdb_arm(Supdb::create_nozpages_mergepar2, dir)?,
@@ -11706,6 +11743,7 @@ mod tests {
             "supdb-zreparse",
             "supdb-zaheadscans",
             "supdb-nozfinish",
+            "supdb-bgidle",
         ] {
             assert_eq!(
                 open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
@@ -11745,6 +11783,27 @@ mod tests {
                         b.zpages_land_pct,
                         b.wal_drop_bytes,
                         b.forms_fit_when_short
+                    )
+                );
+            }
+            {
+                let z = Supdb::create_bgidle(&dir("bgidle")).unwrap();
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert_eq!(b.background_io, supdb::BackgroundIo::Normal);
+                assert_eq!(o.background_io, supdb::BackgroundIo::Idle);
+                assert_eq!(
+                    (
+                        o.zpages,
+                        o.zpages_build_at_finish,
+                        o.merge_bytes_cap,
+                        o.upkeep
+                    ),
+                    (
+                        b.zpages,
+                        b.zpages_build_at_finish,
+                        b.merge_bytes_cap,
+                        b.upkeep
                     )
                 );
             }
