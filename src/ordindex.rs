@@ -666,6 +666,16 @@ impl OrdIndex {
         self.map.advise_willneed(off, (hi - lo) * HEAD)
     }
 
+    /// Every head asked of the kernel, resident or not: for a release under
+    /// the hot-raw policy, which brings the index back whole. The bytes
+    /// submitted.
+    pub fn willneed_heads_all(&self) -> usize {
+        if self.n == 0 {
+            return 0;
+        }
+        self.map.advise_willneed(HEADER as u64, self.n * HEAD)
+    }
+
     /// The page of `page` bytes holding the head of `rank`, and the first
     /// rank whose head is on the page after it: a settle's asks for the
     /// heads coalesce by page (`willneed_heads`).

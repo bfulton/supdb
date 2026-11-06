@@ -934,6 +934,9 @@ pub struct Supdb {
     /// before the reading from the files (`Options::zpages_reading_from_files`
     /// off): `supdb-zsamplefills`.
     zsamplefills: bool,
+    /// Every covered partition served from its form file, the shape before
+    /// the hot-raw policy (`Options::zpages_hot_raw` off): `supdb-znohotraw`.
+    znohotraw: bool,
     /// The fill yielding its conversions at any posted commit
     /// (`Options::forms_convert_behind` zero), the shape before it
     /// converted in the thread's slack. `supdb-postedyield`, and
@@ -1801,6 +1804,8 @@ struct Policy {
     fencekeys: bool,
     /// The reading at the crossing by a fill sample: `supdb-zsamplefills`.
     zsamplefills: bool,
+    /// No hot-raw policy: `supdb-znohotraw`.
+    znohotraw: bool,
     /// The fill yielding at any posted commit: `supdb-postedyield`, and
     /// `supdb-ingestpostedyield` buffered.
     postedyield: bool,
@@ -2131,6 +2136,7 @@ impl Default for Policy {
             fillholds: false,
             fencekeys: false,
             zsamplefills: false,
+            znohotraw: false,
             postedyield: false,
             behindyield: false,
             bg: false,
@@ -2574,6 +2580,20 @@ impl Supdb {
             path,
             Policy {
                 zsamplefills: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose controller serves every covered partition from its
+    /// form file (`Options::zpages_hot_raw` off): the shape before the
+    /// hot-raw policy, which serves the hottest partitions raw while their
+    /// pages fit beside the form files of the rest.
+    pub fn create_znohotraw(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                znohotraw: true,
                 ..Policy::default()
             },
         )
@@ -6846,6 +6866,7 @@ impl Supdb {
             fillholds,
             fencekeys,
             zsamplefills,
+            znohotraw,
             postedyield,
             behindyield,
             bg,
@@ -7276,6 +7297,7 @@ impl Supdb {
             zpages_fence_tree: zfencetree,
             zpages_fence_words: !fencekeys,
             zpages_reading_from_files: !zsamplefills,
+            zpages_hot_raw: !znohotraw,
             zpages_memo_ahead: !zmemonoahead,
             scan_start_cache: if zstartcache { 4096 } else { 0 },
             zpages_block_cursor: !zperrun,
@@ -7486,6 +7508,7 @@ impl Supdb {
             fillholds,
             fencekeys,
             zsamplefills,
+            znohotraw,
             postedyield,
             behindyield,
             bg,
@@ -7831,6 +7854,9 @@ impl Engine for Supdb {
         }
         if self.zsamplefills {
             return "supdb-zsamplefills";
+        }
+        if self.znohotraw {
+            return "supdb-znohotraw";
         }
         if self.postedyield {
             return if self.partition {
@@ -8958,6 +8984,12 @@ impl Engine for Supdb {
             ("zpage_reparses", z.reparses as f64),
             ("zpage_recode_failed", z.recode_failed as f64),
             ("zpage_recode_flips", z.recode_flips as f64),
+            ("zpage_hot_raw", z.hot_raw as f64),
+            ("zpage_hot_back", z.hot_back as f64),
+            ("zpage_hot_looks", z.hot_looks as f64),
+            ("zpage_hot_raw_now", z.hot_raw_now as f64),
+            ("zpage_hot_asks", z.hot_asks as f64),
+            ("zpage_hot_dropped", z.hot_dropped as f64),
             ("zpage_spare_files", z.spare_files as f64),
             ("zpage_spare_builds", z.spare_builds as f64),
             ("zpage_spare_failed", z.spare_failed as f64),
@@ -9860,6 +9892,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-notrim"
         | "supdb-fencekeys"
         | "supdb-zsamplefills"
+        | "supdb-znohotraw"
         | "supdb-postedyield"
         | "supdb-behindyield"
         | "supdb-bg"
@@ -10274,6 +10307,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-notrim" => supdb_arm(Supdb::create_notrim, dir)?,
         "supdb-fencekeys" => supdb_arm(Supdb::create_fencekeys, dir)?,
         "supdb-zsamplefills" => supdb_arm(Supdb::create_zsamplefills, dir)?,
+        "supdb-znohotraw" => supdb_arm(Supdb::create_znohotraw, dir)?,
         "supdb-postedyield" => supdb_arm(Supdb::create_postedyield, dir)?,
         "supdb-behindyield" => supdb_arm(Supdb::create_behindyield, dir)?,
         "supdb-bg" => supdb_arm(Supdb::create_bg, dir)?,
@@ -12088,6 +12122,17 @@ mod tests {
                 assert_eq!(
                     (o.zpages, o.zpages_cover_resident, o.wal_drop_bytes),
                     (b.zpages, b.zpages_cover_resident, b.wal_drop_bytes)
+                );
+            }
+            {
+                let z = Supdb::create_znohotraw(&dir("znohotraw")).unwrap();
+                assert_eq!(z.name(), "supdb-znohotraw");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.zpages_hot_raw && b.zpages_hot_raw);
+                assert_eq!(
+                    (o.zpages, o.zpages_recode_auto, o.zpages_reading_from_files),
+                    (b.zpages, b.zpages_recode_auto, b.zpages_reading_from_files)
                 );
             }
             {

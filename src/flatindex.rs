@@ -1996,6 +1996,14 @@ impl FlatIndex {
         self.hash.1.saturating_sub(self.hash.0)
     }
 
+    /// Where the hash region and the record region lie in the section, as
+    /// offsets: the two populations a raw point read touches a page of each,
+    /// for an ask of their pages ahead of reads sent to the raw form
+    /// (`db::Seg`).
+    pub fn population_spans(&self) -> ((usize, usize), (usize, usize)) {
+        (self.hash, self.recs)
+    }
+
     /// Where the records at `rank` and `n` ranks on lie by the directory:
     /// the first's offset and the last's, for a hint of what a walk
     /// between them streams. Records ascend with rank in a segment; where

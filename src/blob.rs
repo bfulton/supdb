@@ -1102,6 +1102,17 @@ impl<B: Bytes> Blob<B> {
         self.src.advise_willneed(off, len)
     }
 
+    /// `willneed_at` whether or not the span's first page is resident: for
+    /// a span a release under the hot-raw policy brings back whole, whose
+    /// first page a read may have touched already.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn willneed_span(&self, off: u64, len: usize) -> usize {
+        if len == 0 {
+            return 0;
+        }
+        self.src.advise_willneed(off, len)
+    }
+
     /// The windows the open's verification asked the kernel for ahead of
     /// its walk, and their bytes (`BlobOptions::read_ahead`).
     pub fn open_ahead(&self) -> (u64, u64) {
@@ -1204,6 +1215,22 @@ impl<B: Bytes> Blob<B> {
         let base = self.src.slice_at(0, 1)?.as_ptr() as usize;
         let at = (recs.as_ptr() as usize).checked_sub(base)?;
         Some((at as u64, recs.len() as u64))
+    }
+
+    /// The span of the file a raw point read touches a page of each
+    /// population in -- the hash slots and the records, and whatever lies
+    /// between them in the index section -- as offset and length: what the
+    /// hot-raw policy asks the kernel for ahead of the reads it sends to the
+    /// raw form (`db::Seg`). `None` for a reader that does not hold the
+    /// section whole.
+    #[cfg(not(target_family = "wasm"))]
+    #[doc(hidden)]
+    pub fn raw_read_span(&self) -> Option<(u64, u64)> {
+        let (_, idx) = self.flat()?;
+        let (h, r) = idx.population_spans();
+        let (lo, hi) = (h.0.min(r.0), h.1.max(r.1));
+        let base = self.index_offset();
+        Some((base + lo as u64, (hi - lo) as u64))
     }
 
     /// The hash region's bytes, the slots a point read probes one page of;

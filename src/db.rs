@@ -633,6 +633,17 @@ pub struct ZCounts {
     pub recodes_back: u64,
     pub recode_failed: u64,
     pub recode_looks: u64,
+    /// The hot-raw policy's (`Options::zpages_hot_raw`): partitions released
+    /// to the raw form, form files attached again, its looks, and the
+    /// partitions it holds raw now.
+    pub hot_raw: u64,
+    pub hot_back: u64,
+    pub hot_looks: u64,
+    pub hot_raw_now: u64,
+    /// Its asks for a partition's raw pages ahead of a release, and the
+    /// asks it dropped.
+    pub hot_asks: u64,
+    pub hot_dropped: u64,
     /// Block-coded partitions re-parsed while served
     /// (`Options::zpages_reparse`).
     pub reparses: u64,
@@ -3929,6 +3940,34 @@ pub struct Options {
     /// the arm.
     #[doc(hidden)]
     pub zpages_reparse: bool,
+    /// Under the controller (`ZPages::Auto`), once the form is installed,
+    /// the hot-raw policy: the partitions whose reads cost the most are
+    /// served from the raw form, their pages held in the page cache beside
+    /// the form files of the rest, while the form files and the raw
+    /// partitions together stay within `HOT_RAW_FILL` of the budget; the
+    /// coldest raw partition's form file is attached again, its raw pages
+    /// dropped, once they pass `zselect::FORM_FILL` of it, or where a served
+    /// partition reads `RECODE_SWAP` times hotter than it and would fit in
+    /// its room. A partition is hot when the look's window read it, a key,
+    /// half again over the median partition; its heat is its form file's
+    /// decodes a second, or its raw reads a second (`Seg::hot_read`),
+    /// priced at the store's mean decode, risen at once and decayed over a
+    /// second, and kept by the partition's lower fence, so a merge's output
+    /// over a released
+    /// partition's range inherits it and is released at the look after its
+    /// landing. A release is two looks: the raw pages asked of the kernel
+    /// first, the form file taken out of its cell once they are resident,
+    /// so the reads sent raw find their pages and not the device; the
+    /// file stays on disk for the way back. The
+    /// compact form answers a point read or a scan in core at two to three
+    /// times the raw form's time, and the suite's Zipfian puts four fifths
+    /// of its reads on one partition of twenty-nine at ten million keys, so
+    /// under a bound LMDB's B-tree fits whole the form that fits the bound
+    /// lost the mixes to the decode (`docs/engine.md`). On as shipped;
+    /// `supdb-znohotraw` is the shape with every covered partition served
+    /// from its form file. Stands down where the re-code policy runs
+    /// (`zpages_recode_auto`, `zpages_reparse`).
+    pub zpages_hot_raw: bool,
 }
 
 impl Options {
@@ -3936,7 +3975,7 @@ impl Options {
     /// raw-tailed group's opens (`zfile::ZFile::time_decodes`): the heat the
     /// re-code policy reads, under the forced form or the controller.
     pub(crate) fn z_times_decodes(&self) -> bool {
-        self.zpages_recode || self.zpages_recode_auto || self.zpages_reparse
+        self.zpages_recode || self.zpages_recode_auto || self.zpages_reparse || self.zpages_hot_raw
     }
 
     /// The form file's group coding the options ask for
@@ -4203,6 +4242,7 @@ impl Default for Options {
             zpages_reading_from_files: true,
             zpages_recode_auto: false,
             zpages_reparse: false,
+            zpages_hot_raw: true,
         }
     }
 }
@@ -5232,19 +5272,46 @@ enum ZKind {
 /// of the dead name, for the caller to unlink where nobody waits, or
 /// `None` where there was nothing to retire or the rename failed.
 fn z_retire_cell(shared: &Shared, dir: &Path, seg: &Seg) -> Option<PathBuf> {
-    let p = seg.z.take();
-    if p.is_null() {
+    if !z_take_cell(shared, seg, false) {
         return None;
     }
+    z_dead_rename(shared, dir, seg)
+}
+
+/// The take of `z_retire_cell`, with the file left under its name: whether
+/// there was a form file to take. With `drop`, the taken files' pages go out
+/// of the page cache (`ZFile::drop_cache`), which a reader still walking one
+/// faults back, for a release under the hot-raw policy, whose raw pages take
+/// the room.
+fn z_take_cell(shared: &Shared, seg: &Seg, drop: bool) -> bool {
+    let p = seg.z.take();
+    if p.is_null() {
+        return false;
+    }
     let tag = shared.readers.bump();
+    if drop {
+        // SAFETY: taken from the cell above and owned here until the push;
+        // the retire list frees it past every pinned reader.
+        unsafe { &*p }.drop_cache();
+    }
     shared.retired_z.push(tag, RetiredZ(p));
     // The kept form file goes with the served one: it was served once, and
     // a reader pinned then may still be walking it.
     let k = seg.z_spare.take();
     if !k.is_null() {
+        if drop {
+            // SAFETY: as above.
+            unsafe { &*k }.drop_cache();
+        }
         shared.retired_z.push(tag, RetiredZ(k));
     }
     shared.retired_z.sweep(|low| shared.readers.oldest_for(low));
+    true
+}
+
+/// `seg`'s form file on disk renamed to a dead name for the idle sweep to
+/// unlink: the dead name's path, or `None` where the rename failed.
+fn z_dead_rename(shared: &Shared, dir: &Path, seg: &Seg) -> Option<PathBuf> {
     let (id, end) = (Db::name_id(&seg.name)?, Db::name_end_seq(&seg.name)?);
     let n = shared.next_dead.fetch_add(1, AtomicOrdering::Relaxed);
     let dead = dir.join(zfile::zpg_dead_name(n));
@@ -5416,6 +5483,11 @@ struct Seg {
     /// reads to tell a sliver left raw for its size from one that could not
     /// be covered.
     z_declined: std::sync::atomic::AtomicU8,
+    /// Reads of the raw form while the hot-raw policy holds this partition
+    /// there (`zfile::DECLINED_HOT_RAW`), one in sixteen per thread
+    /// (`Seg::hot_read`): the partition's heat, as a form file's opens are
+    /// a raw-tailed partition's.
+    hot_reads16: AtomicU64,
     /// Form files of this segment built again after a page of one failed a
     /// check, up to `zfile::ZREBUILDS`.
     z_rebuilds: std::sync::atomic::AtomicU8,
@@ -8337,6 +8409,41 @@ impl Seg {
         zfile::ZEvents::add(&ev.raw_dropped, 1);
     }
 
+    /// A read of this partition through the raw form while the hot-raw
+    /// policy holds it there (`Options::zpages_hot_raw`): counted once in
+    /// sixteen per thread on the segment's own word, as a form file counts
+    /// its opens (`zfile::ZFile::opens16`). Every other raw read pays a
+    /// byte's load and a branch here.
+    #[inline]
+    fn hot_read(&self) {
+        if self.z_declined.load(AtomicOrdering::Relaxed) == zfile::DECLINED_HOT_RAW {
+            self.hot_read_counted();
+        }
+    }
+
+    #[inline(never)]
+    fn hot_read_counted(&self) {
+        thread_local! {
+            static TICK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        let due = TICK.with(|t| {
+            let v = t.get().wrapping_add(1);
+            t.set(v);
+            v % 16 == 0
+        });
+        if due {
+            self.hot_reads16.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+
+    /// The bytes this partition's raw form holds in the page cache while it
+    /// serves: the hash region, the record region and the ordered index,
+    /// what a release under the hot-raw policy charges the budget with.
+    fn raw_bytes(&self) -> u64 {
+        let (h, r) = self.foot();
+        h.saturating_add(r).saturating_add(self.ord.file_bytes())
+    }
+
     /// The two populations a raw point read of this partition touches one
     /// page of each, bytes (`zselect::model_raw`): the hash region, which
     /// every read probes, and the record region, which every read lands in.
@@ -8519,6 +8626,7 @@ impl Seg {
                 data,
                 z: zfile::ZCell::new(),
                 z_spare: zfile::ZCell::new(),
+                hot_reads16: AtomicU64::new(0),
                 z_declined: std::sync::atomic::AtomicU8::new(0),
                 z_rebuilds: std::sync::atomic::AtomicU8::new(0),
                 z_retry: std::sync::Mutex::new(None),
@@ -8561,6 +8669,7 @@ impl Seg {
                 data,
                 z: zfile::ZCell::new(),
                 z_spare: zfile::ZCell::new(),
+                hot_reads16: AtomicU64::new(0),
                 z_declined: std::sync::atomic::AtomicU8::new(0),
                 z_rebuilds: std::sync::atomic::AtomicU8::new(0),
                 z_retry: std::sync::Mutex::new(None),
@@ -8595,6 +8704,7 @@ impl Seg {
             data,
             z: zfile::ZCell::new(),
             z_spare: zfile::ZCell::new(),
+            hot_reads16: AtomicU64::new(0),
             z_declined: std::sync::atomic::AtomicU8::new(0),
             z_rebuilds: std::sync::atomic::AtomicU8::new(0),
             z_retry: std::sync::Mutex::new(None),
@@ -19169,6 +19279,11 @@ impl Reader {
             recodes_back: get(&ev.recodes_back),
             recode_failed: get(&ev.recode_failed),
             recode_looks: get(&ev.recode_looks),
+            hot_raw: get(&ev.hot_raw),
+            hot_back: get(&ev.hot_back),
+            hot_looks: get(&ev.hot_looks),
+            hot_asks: get(&ev.hot_asks),
+            hot_dropped: get(&ev.hot_dropped),
             reparses: get(&ev.reparses),
             recode_flips: get(&ev.recode_flips),
             spare_builds: get(&ev.spare_builds),
@@ -19213,8 +19328,12 @@ impl Reader {
                     c.spare_bytes += k.file_bytes();
                     c.resident_bytes += k.resident_bytes() as u64;
                 }
-            } else if seg.z_declined.load(AtomicOrdering::Relaxed) == zfile::DECLINED_SMALL {
-                c.small_partitions += 1;
+            } else {
+                match seg.z_declined.load(AtomicOrdering::Relaxed) {
+                    zfile::DECLINED_SMALL => c.small_partitions += 1,
+                    zfile::DECLINED_HOT_RAW => c.hot_raw_now += 1,
+                    _ => {}
+                }
             }
         }
         c
@@ -19388,6 +19507,7 @@ impl Reader {
         }
         let Some(z) = seg.z.get() else {
             self.zbump(|s| &s.zraw);
+            seg.hot_read();
             return raw(seg, f);
         };
         let served = z
@@ -19430,6 +19550,7 @@ impl Reader {
         }
         let Some(z) = seg.z.get() else {
             self.zbump(|s| &s.zraw);
+            seg.hot_read();
             return raw();
         };
         let served = z.count(&self.zmemo, key);
@@ -19484,6 +19605,7 @@ impl Reader {
             if self.z_on() {
                 self.zbump(|s| &s.zscans);
             }
+            seg.hot_read();
             return raw(rank, n, f);
         };
         let r = z
@@ -19637,6 +19759,7 @@ impl Reader {
         let got = if self.zc(seg).is_some() {
             self.part_scan_z(seg, rank, n, f)?
         } else {
+            seg.hot_read();
             seg.raw()
                 .scan_at(rank, n, &mut *f)
                 .map_err(|e| err(&format!("segment scan: {e}")))?
@@ -35928,6 +36051,45 @@ const RECODE_DECODE_NS: f64 = 1000.0;
 /// a raw-tailed set from flipping at each move.
 const RECODE_AUTO_SHARE: f64 = 0.05;
 const RECODE_AUTO_EVICT: f64 = 0.95;
+/// The hot-raw policy (`Options::zpages_hot_raw`): its period, the census
+/// interval, since a release is a take and an ask for the raw pages with no
+/// build, and a divided mix at the suite's bounded rung is half a second;
+/// the share of the budget the form files and the raw partitions may fill
+/// together for a release, under `zselect::FORM_FILL`, the line the way
+/// back is taken at, so that the budget's fall through a write mix -- a
+/// tenth, as the process's memory grows -- does not take back at one look
+/// what the look before released; how long the decay takes a partition's
+/// heat down by e, a second, so that a shift in the workload shows within
+/// a mix of the suite's divided shape and a partition read a second ago
+/// does not hold its room against one read now; how far a partition's
+/// reads a key in the look's window have to stand over the median
+/// partition's to be hot at all, so that a uniform pass, under which every
+/// partition reads at the median, releases nothing -- a release is for
+/// skew -- while the Zipfian's second to fourth partitions, at 1.2x their
+/// share of the keys and two to four times the median, are; and the
+/// sampled events a candidate's window has to hold, since the shares of a
+/// thin window are noise: the first window after the install, under the
+/// read pass, had a partition at 1.3x its share of twenty-four, and at
+/// thirty-two samples the most-read of twenty-eight uniform partitions
+/// crossed half again over the median once a sitting (sixty-nine samples
+/// against a median of forty); at a hundred and twenty-eight the Poisson
+/// spread is a tenth and the line is five of them away, while the
+/// Zipfian's third partition reads a hundred and fifty a window.
+const HOT_RAW_PERIOD: std::time::Duration = zselect::CENSUS_INTERVAL;
+const HOT_RAW_FILL: f64 = 0.75;
+const HOT_RAW_TAU: std::time::Duration = std::time::Duration::from_secs(1);
+const HOT_RAW_SKEW: f64 = 1.5;
+const HOT_RAW_MIN_SAMPLES: u64 = 128;
+/// A release's two steps: the raw pages are asked of the kernel at one look
+/// and the form file taken out of its cell at a later one, once this share
+/// of the record region is resident, so the reads sent raw find their pages
+/// and not the device; an ask whose pages have not come within this wait is
+/// dropped where under half of them are there -- the device is busy, and
+/// raw reads would queue behind it -- and no ask is made again for this
+/// long.
+const HOT_RAW_RESIDENT: f64 = 0.9;
+const HOT_RAW_ASK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+const HOT_RAW_HOLD: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The share of a partition's records the page cache must hold for a build
 /// ahead at landing to take it (`Options::zpages_land_pct`): the build
@@ -36243,6 +36405,20 @@ struct Maint {
     /// The last look's refaults were past `RECODE_REFAULTS`: a flip asks
     /// for none of the incoming file's pages.
     z_recode_pressed: bool,
+    /// The hot-raw policy's (`Options::zpages_hot_raw`): when it last
+    /// looked; each served form file's decodes and opens then, by its
+    /// attach's identity, and each raw partition's counted reads, by its
+    /// lower fence; each partition's heat, by its lower fence, which a
+    /// merge's output over the same range inherits; the partition whose raw
+    /// pages a look asked for, by its lower fence, with when, for the take
+    /// at a later look (`HOT_RAW_RESIDENT`); and until when no ask is made
+    /// after one was dropped (`HOT_RAW_HOLD`).
+    z_hot_last: Option<std::time::Duration>,
+    z_hot_seen: std::collections::HashMap<u64, (u64, u64)>,
+    z_hot_raw_seen: std::collections::HashMap<Vec<u8>, u64>,
+    z_hot_heat: std::collections::HashMap<Vec<u8>, f64>,
+    z_hot_ask: Option<(Vec<u8>, std::time::Duration)>,
+    z_hot_hold: Option<std::time::Duration>,
 }
 
 /// A sample job in flight (`zfile::sample` over the live partitions, on a
@@ -36825,6 +37001,12 @@ impl Maint {
             z_reparsed: std::collections::HashSet::new(),
             z_finish_seen: 0,
             z_recode_pressed: false,
+            z_hot_last: None,
+            z_hot_seen: std::collections::HashMap::new(),
+            z_hot_raw_seen: std::collections::HashMap::new(),
+            z_hot_heat: std::collections::HashMap::new(),
+            z_hot_ask: None,
+            z_hot_hold: None,
         }
     }
 
@@ -38870,6 +39052,420 @@ impl Maint {
         }
     }
 
+    /// The hot-raw policy's turn (`Options::zpages_hot_raw`), with the form
+    /// installed and nothing to build: once a `HOT_RAW_PERIOD`, a look
+    /// (`z_hot_look`), counted once it is done so that a test that waits for
+    /// one reads the decision it made.
+    fn z_hot_raw_tick(&mut self) {
+        let now = self.z_now();
+        if self
+            .z_hot_last
+            .is_some_and(|t| now.saturating_sub(t) < HOT_RAW_PERIOD)
+        {
+            return;
+        }
+        let dt = self.z_hot_last.map(|t| now.saturating_sub(t));
+        self.z_hot_last = Some(now);
+        self.z_hot_look(now, dt);
+        zfile::ZEvents::add(&self.shared.z.hot_looks, 1);
+    }
+
+    /// One look of the hot-raw policy at `now`, `dt` after the last one
+    /// (none at the first). Each partition the policy may move -- served by
+    /// a form file, or released to the raw form -- has its heat read: a
+    /// served form file's decodes and opens a second over the period, a raw
+    /// partition's counted reads, each priced at the store's mean decode,
+    /// risen at once and decayed over `HOT_RAW_TAU`, and kept by the
+    /// partition's lower fence. Then at most
+    /// one move. A partition asked for at the look before is taken once its
+    /// records are resident (`HOT_RAW_RESIDENT`), or once the wait is out
+    /// and most of them are; its ask is dropped where they are not, or the
+    /// room has gone. Else, past `zselect::FORM_FILL` of the budget -- the
+    /// form files and the raw partitions together -- the coldest raw
+    /// partition's file is attached again. Under it, the served partition
+    /// the window read most a key, past `RECODE_FLOOR_NS`, over the median
+    /// partition's reads a key by `HOT_RAW_SKEW` and over
+    /// `HOT_RAW_MIN_SAMPLES`, is asked for where the files and the raw
+    /// partitions with its own stay within `HOT_RAW_FILL` of the budget;
+    /// where they would not, the coldest raw partition goes back if
+    /// the hot one is `RECODE_SWAP` times hotter and would fit in its room,
+    /// and takes the room at a later look. The refaults decide nothing: the
+    /// write mixes raise them whatever the form does. Nothing without a
+    /// budget, and no partition a merge holds as an input or a build holds.
+    fn z_hot_look(&mut self, now: std::time::Duration, dt: Option<std::time::Duration>) {
+        let inject = self.opts.zpages_inject.clone();
+        let budget = inject
+            .as_ref()
+            .and_then(|i| i.budget())
+            .or(zfile::read_budget().map(|b| b.budget));
+        struct Part {
+            seg: std::sync::Arc<Seg>,
+            raw: bool,
+            /// The served form file's bytes, or the file on disk's for a
+            /// raw partition, which the way back brings in.
+            file_bytes: u64,
+            raw_bytes: u64,
+            keys: u64,
+            heat: f64,
+            /// Whether this look read a rate for it: a form file attached
+            /// since the last look has no baseline, and a partition with
+            /// no rate is no part of the shares the skew is read from; and
+            /// the sampled events of its window, decodes and opens or raw
+            /// reads, one in sixteen.
+            rated: bool,
+            delta: u64,
+        }
+        // A served form file: its attach's identity, its coding, its bytes
+        // with the kept file's, its decode time, its decodes and its opens.
+        type Served = (u64, bool, u64, u64, u64, u64);
+        type Row = (std::sync::Arc<Seg>, Option<Served>, u64);
+        let (rows, live): (Vec<Row>, std::collections::HashSet<Vec<u8>>) = {
+            let _op = self.op();
+            let live = self
+                .segs()
+                .iter()
+                .filter(|s| s.level > 0)
+                .map(|s| s.lo.clone())
+                .collect();
+            let rows = self
+                .segs()
+                .iter()
+                .filter(|s| {
+                    s.level > 0
+                        && !self.in_flight_input(&s.name)
+                        && !self.z_finishing(&s.name)
+                        && !self.z_ahead_holds(&s.name)
+                })
+                .filter_map(|s| match s.z.get() {
+                    Some(z) if !z.damaged() => Some((
+                        s.clone(),
+                        Some((
+                            z.id(),
+                            z.coded(),
+                            z.file_bytes() + s.z_spare.get().map_or(0, |k| k.file_bytes()),
+                            16 * z.decode_ns16.load(AtomicOrdering::Relaxed),
+                            16 * z.decodes16.load(AtomicOrdering::Relaxed),
+                            16 * z.opens16.load(AtomicOrdering::Relaxed),
+                        )),
+                        0,
+                    )),
+                    Some(_) => None,
+                    None if s.z_declined.load(AtomicOrdering::Relaxed)
+                        == zfile::DECLINED_HOT_RAW =>
+                    {
+                        Some((
+                            s.clone(),
+                            None,
+                            16 * s.hot_reads16.load(AtomicOrdering::Relaxed),
+                        ))
+                    }
+                    None => None,
+                })
+                .collect();
+            (rows, live)
+        };
+        // A decode priced through the seam: a form file's decode time is
+        // then its decodes at that price, as the re-code policy reads it.
+        let priced = inject
+            .as_ref()
+            .and_then(|i| i.decode_cost())
+            .map(|c| c.as_nanos().min(u64::MAX as u128) as u64);
+        let rows: Vec<Row> = match priced {
+            Some(c) => rows
+                .into_iter()
+                .map(|(s, served, reads)| {
+                    let served = served.map(|(id, coded, b, _ns, decodes, opens)| {
+                        (id, coded, b, decodes.saturating_mul(c), decodes, opens)
+                    });
+                    (s, served, reads)
+                })
+                .collect(),
+            None => rows,
+        };
+        // What a decode costs, from the block-coded files' counts: the price
+        // every count is read at -- a served file's decodes and opens, a raw
+        // partition's reads. The counts and not the time: a decode's time
+        // holds the fault on a page of the form file not yet in, so under a
+        // uniform read pass the partitions whose files were coldest read
+        // hottest, and two were released for it.
+        let (ns_all, decodes_all) = rows
+            .iter()
+            .filter_map(|r| r.1)
+            .filter(|f| !f.1)
+            .fold((0u64, 0u64), |(n, d), f| (n + f.3, d + f.4));
+        let per_decode = if decodes_all == 0 {
+            RECODE_DECODE_NS
+        } else {
+            ns_all as f64 / decodes_all as f64
+        };
+        let keep = dt.map(|d| (-d.as_secs_f64() / HOT_RAW_TAU.as_secs_f64()).exp());
+        let mut seen = std::collections::HashMap::with_capacity(rows.len());
+        let mut raw_seen = std::collections::HashMap::with_capacity(rows.len());
+        let mut heats = std::collections::HashMap::with_capacity(rows.len());
+        let mut parts = Vec::with_capacity(rows.len());
+        for (seg, served, reads) in rows {
+            // The window's sampled events, one in sixteen of the reads the
+            // partition answered, and the rate they make.
+            let delta = match (served, dt) {
+                (Some((id, _, _, _, decodes, opens)), Some(d)) if !d.is_zero() => {
+                    self.z_hot_seen.get(&id).map(|&(decodes0, opens0)| {
+                        (decodes.saturating_sub(decodes0) + opens.saturating_sub(opens0)) / 16
+                    })
+                }
+                (None, Some(d)) if !d.is_zero() => self
+                    .z_hot_raw_seen
+                    .get(&seg.lo)
+                    .map(|&r0| reads.saturating_sub(r0) / 16),
+                _ => None,
+            };
+            let rate = delta
+                .zip(dt)
+                .map(|(n, d)| 16.0 * n as f64 * per_decode / d.as_secs_f64());
+            let old = self.z_hot_heat.get(&seg.lo).copied().unwrap_or(0.0);
+            // Risen at once and decayed over `RECODE_TAU`: a release costs
+            // no build, so the heat a partition shows is acted on when it
+            // shows, and a mix of a few seconds is not averaged away.
+            let heat = match (rate, keep) {
+                (Some(r), Some(a)) => (a * old).max(r),
+                (None, Some(a)) => a * old,
+                _ => old,
+            };
+            let file_bytes = match served {
+                Some((id, _, b, _, decodes, opens)) => {
+                    seen.insert(id, (decodes, opens));
+                    b
+                }
+                None => {
+                    raw_seen.insert(seg.lo.clone(), reads);
+                    Db::name_id(&seg.name)
+                        .zip(Db::name_end_seq(&seg.name))
+                        .and_then(|(id, end)| {
+                            std::fs::metadata(self.dir.join(zfile::zpg_name(id, end))).ok()
+                        })
+                        .map_or(0, |m| m.len())
+                }
+            };
+            heats.insert(seg.lo.clone(), heat);
+            parts.push(Part {
+                raw: served.is_none(),
+                file_bytes,
+                raw_bytes: seg.raw_bytes(),
+                keys: seg.blob.keys() as u64,
+                heat,
+                rated: delta.is_some(),
+                delta: delta.unwrap_or(0),
+                seg,
+            });
+        }
+        // A partition a merge or a build holds keeps its heat, decayed, for
+        // itself or for the output over its range.
+        for (lo, old) in &self.z_hot_heat {
+            if live.contains(lo) && !heats.contains_key(lo) {
+                heats.insert(lo.clone(), keep.map_or(*old, |a| a * old));
+            }
+        }
+        self.z_hot_seen = seen;
+        self.z_hot_raw_seen.retain(|lo, _| live.contains(lo));
+        self.z_hot_raw_seen.extend(raw_seen);
+        self.z_hot_heat = heats;
+        let (Some(budget), Some(_)) = (budget, dt) else {
+            return;
+        };
+        let forms: u64 = parts.iter().filter(|p| !p.raw).map(|p| p.file_bytes).sum();
+        let raws: u64 = parts.iter().filter(|p| p.raw).map(|p| p.raw_bytes).sum();
+        let total = forms.saturating_add(raws);
+        let fill = zselect::form_fill(budget);
+        let line = (budget as f64 * HOT_RAW_FILL) as u64;
+        // The skew is read from the window: a partition's sampled events a
+        // key against the median partition's, over the partitions rated this
+        // look, raw ones among them.
+        let per_key = |p: &Part| p.delta as f64 / p.keys.max(1) as f64;
+        let median = {
+            let mut v: Vec<f64> = parts.iter().filter(|p| p.rated).map(per_key).collect();
+            v.sort_by(|a, b| a.total_cmp(b));
+            v.get(v.len() / 2).copied().unwrap_or(0.0)
+        };
+        let rated = parts.iter().filter(|p| p.rated).count();
+        let trace = |what: &str, p: Option<&Part>| {
+            eprintln!(
+                "zhot t={:.1} {what} seg={} heat_ms_s={:.2} delta={} per_key={:.5} median={:.5} rated={rated}/{} forms={forms} raw={raws} line={line} fill={fill} budget={budget}",
+                now.as_secs_f64(),
+                p.map_or("-", |p| p.seg.name.as_str()),
+                p.map_or(0.0, |p| p.heat / 1e6),
+                p.map_or(0, |p| p.delta),
+                p.map_or(0.0, per_key),
+                median,
+                parts.len(),
+            );
+        };
+        // The partition asked for at a look before: taken once its pages
+        // are there and the room still holds, else dropped.
+        if let Some((lo, since)) = self.z_hot_ask.clone() {
+            let Some(p) = parts.iter().find(|p| !p.raw && p.seg.lo == lo) else {
+                // Merged, retired, or held by a job: no partition to take.
+                self.z_hot_ask = None;
+                return;
+            };
+            let resident = p.seg.records_resident();
+            let waited = now.saturating_sub(since) >= HOT_RAW_ASK_WAIT;
+            if resident < HOT_RAW_RESIDENT && !waited {
+                if self.z_trace {
+                    trace("asked", Some(p));
+                }
+                return;
+            }
+            self.z_hot_ask = None;
+            let after = total
+                .saturating_sub(p.file_bytes)
+                .saturating_add(p.raw_bytes);
+            if after <= fill && (resident >= HOT_RAW_RESIDENT || resident >= 0.5) {
+                if self.z_trace {
+                    trace("release", Some(p));
+                }
+                let seg = p.seg.clone();
+                self.z_hot_release(seg);
+            } else {
+                if self.z_trace {
+                    trace("dropped", Some(p));
+                }
+                self.z_hot_hold = Some(now.saturating_add(HOT_RAW_HOLD));
+                zfile::ZEvents::add(&self.shared.z.hot_dropped, 1);
+            }
+            return;
+        }
+        let coldest_raw = parts
+            .iter()
+            .filter(|p| p.raw)
+            .min_by(|a, b| a.heat.total_cmp(&b.heat));
+        if total > fill {
+            // Over the fill with nothing raw: the form files alone are past
+            // it, which is the budget's to say and not this policy's.
+            if self.z_trace {
+                trace(
+                    if coldest_raw.is_some() {
+                        "back"
+                    } else {
+                        "over"
+                    },
+                    coldest_raw,
+                );
+            }
+            if let Some(q) = coldest_raw {
+                let seg = q.seg.clone();
+                self.z_hot_back(seg);
+            }
+            return;
+        }
+        if self.z_hot_hold.is_some_and(|t| now < t) {
+            return;
+        }
+        // The candidate: the served partition the window read most, a key
+        // of it against a key of the median partition.
+        let Some(p) = parts
+            .iter()
+            .filter(|p| !p.raw && p.rated)
+            .max_by(|a, b| per_key(a).total_cmp(&per_key(b)))
+        else {
+            return;
+        };
+        // Hot: past the floor, its window not thin, and over the median by
+        // `HOT_RAW_SKEW`.
+        let skewed = p.delta >= HOT_RAW_MIN_SAMPLES && per_key(p) >= HOT_RAW_SKEW * median;
+        if p.heat < RECODE_FLOOR_NS || !skewed {
+            if self.z_trace {
+                trace("cold", Some(p));
+            }
+            return;
+        }
+        let after = total
+            .saturating_sub(p.file_bytes)
+            .saturating_add(p.raw_bytes);
+        if after <= line {
+            if self.z_trace {
+                trace("ask", Some(p));
+            }
+            Maint::z_hot_ask(&p.seg);
+            self.z_hot_ask = Some((p.seg.lo.clone(), now));
+            zfile::ZEvents::add(&self.shared.z.hot_asks, 1);
+            return;
+        }
+        // No room: made by the coldest raw partition where the hot one is
+        // `RECODE_SWAP` times hotter and fits in it, taken at a later look.
+        match coldest_raw {
+            Some(q)
+                if q.heat * RECODE_SWAP < p.heat
+                    && after
+                        .saturating_sub(q.raw_bytes)
+                        .saturating_add(q.file_bytes)
+                        <= line =>
+            {
+                if self.z_trace {
+                    trace("swap", Some(q));
+                }
+                let seg = q.seg.clone();
+                self.z_hot_back(seg);
+            }
+            _ => {
+                if self.z_trace {
+                    trace("full", Some(p));
+                }
+            }
+        }
+    }
+
+    /// `seg`'s raw pages asked of the kernel ahead of the reads the hot-raw
+    /// policy sends raw: the index section from its hash slots through its
+    /// records (`Blob::raw_read_span`), and the ordered index's heads.
+    fn z_hot_ask(seg: &Seg) {
+        let raw = seg.blob.for_zfile();
+        if let Some((off, len)) = raw.raw_read_span() {
+            raw.willneed_span(off, len as usize);
+        }
+        seg.ord.willneed_heads_all();
+    }
+
+    /// `seg` released to the raw form under the hot-raw policy, its raw pages
+    /// asked for at the look before: the partition declined under the policy
+    /// (`zfile::DECLINED_HOT_RAW`), which the builder leaves alone and the
+    /// reads count themselves under, and its form file taken out of its cell
+    /// with its pages dropped, the file left on disk for the way back.
+    fn z_hot_release(&mut self, seg: std::sync::Arc<Seg>) {
+        let shared = self.shared.clone();
+        self.z_hot_raw_seen.insert(
+            seg.lo.clone(),
+            16 * seg.hot_reads16.load(AtomicOrdering::Relaxed),
+        );
+        seg.z_declined
+            .store(zfile::DECLINED_HOT_RAW, AtomicOrdering::Relaxed);
+        z_take_cell(&shared, &seg, true);
+        zfile::ZEvents::add(&shared.z.hot_raw, 1);
+    }
+
+    /// `seg`'s form file attached again from disk, the way back from a
+    /// release: the decline cleared first, and the attach as a buy makes it
+    /// (`z_attach_on_disk`), which
+    /// drops the raw pages where the options say. A file that does not
+    /// attach is counted by the attach, and the partition is the builder's
+    /// as any without a file is.
+    fn z_hot_back(&mut self, seg: std::sync::Arc<Seg>) {
+        let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) else {
+            return;
+        };
+        seg.z_declined.store(0, AtomicOrdering::Relaxed);
+        self.z_hot_raw_seen.remove(&seg.lo);
+        if self.z_attach_on_disk(&seg, id, end, false, false) {
+            zfile::ZEvents::add(&self.shared.z.hot_back, 1);
+        }
+    }
+
+    /// Whether the hot-raw policy is this store's: on, under the controller,
+    /// and standing down where the re-code policy runs.
+    fn z_hot_runs(&self) -> bool {
+        self.opts.zpages_hot_raw
+            && self.opts.zpages == ZPages::Auto
+            && !(self.opts.zpages_recode_auto || self.opts.zpages_reparse)
+    }
+
     /// The controller's clock: the injected one where a test has moved it,
     /// else the monotonic clock since this segment work began.
     fn z_now(&self) -> std::time::Duration {
@@ -38968,8 +39564,16 @@ impl Maint {
             return None;
         }
         let (mut hash, mut records, mut nkeys, mut n_pages) = (0u64, 0u64, 0u64, 0u64);
+        // A partition the hot-raw policy holds raw is raw footprint whole.
+        let mut held = 0u64;
         for s in self.segs().iter().filter(|s| s.level > 0) {
-            let Some(z) = s.z.get() else { continue };
+            let Some(z) = s.z.get() else {
+                if s.z_declined.load(AtomicOrdering::Relaxed) == zfile::DECLINED_HOT_RAW {
+                    let (h, r) = s.foot();
+                    held = held.saturating_add(h).saturating_add(r);
+                }
+                continue;
+            };
             let (h, r) = s.foot();
             hash = hash.saturating_add(h);
             records = records.saturating_add(r);
@@ -38983,8 +39587,9 @@ impl Maint {
         let keys_per_page = nkeys.div_ceil(n_pages).max(1);
         let record_pages = records.div_ceil(n_pages).div_ceil(page) + 1;
         let hash_part = hash.min(pages.saturating_mul(keys_per_page).saturating_mul(page));
-        let bound =
-            hash_part.saturating_add(pages.saturating_mul(record_pages).saturating_mul(page));
+        let bound = hash_part
+            .saturating_add(pages.saturating_mul(record_pages).saturating_mul(page))
+            .saturating_add(held);
         self.shared
             .z
             .footprint_pages
@@ -39697,16 +40302,33 @@ impl Maint {
                 let _op = self.op();
                 self.segs()
                     .iter()
-                    .filter(|s| s.level > 0 && s.z.get().is_some())
+                    .filter(|s| {
+                        s.level > 0
+                            && (s.z.get().is_some()
+                                || s.z_declined.load(AtomicOrdering::Relaxed)
+                                    == zfile::DECLINED_HOT_RAW)
+                    })
                     .cloned()
                     .collect()
             };
             for seg in segs {
-                if let Some(dead) = z_retire_cell(&self.shared, &self.dir, &seg) {
+                // A partition the hot-raw policy holds raw has its file on
+                // disk retired as a served one's is, and its decline
+                // cleared: the retention ended for every partition.
+                let dead =
+                    if seg.z_declined.load(AtomicOrdering::Relaxed) == zfile::DECLINED_HOT_RAW {
+                        seg.z_declined.store(0, AtomicOrdering::Relaxed);
+                        z_dead_rename(&self.shared, &self.dir, &seg)
+                    } else {
+                        z_retire_cell(&self.shared, &self.dir, &seg)
+                    };
+                if let Some(dead) = dead {
                     self.spares.push(dead);
                 }
                 zfile::ZEvents::add(&self.shared.z.retired, 1);
             }
+            self.z_hot_ask = None;
+            self.z_hot_raw_seen.clear();
         }
         if self.zbuild.as_ref().is_some_and(|b| b.job.is_finished()) {
             let b = self.zbuild.take().expect("checked");
@@ -39787,19 +40409,24 @@ impl Maint {
         }
         // Once the form is installed and the builder has nothing due, the
         // re-code policy's turn (`Options::zpages_recode_auto`,
-        // `Options::zpages_reparse`).
-        if d.build
-            && (self.opts.zpages_recode_auto || self.opts.zpages_reparse)
-            && self.zbuild.is_none()
-            && self.zsel.phase() == zselect::Phase::Compact
-            && !self.z_settling
-        {
-            let idle = {
-                let _op = self.op();
-                self.z_next().is_none()
-            };
-            if idle {
-                self.z_recode_tick();
+        // `Options::zpages_reparse`); or, where it does not run, the hot-raw
+        // policy's (`Options::zpages_hot_raw`) at every tick with the form
+        // installed, since a release builds nothing and a build in flight for
+        // another partition is no reason to wait -- the mixes at the bounded
+        // rung run beside the builds of the files the load's drain left, and
+        // a policy that waited for the builder never looked through them.
+        let recode = self.opts.zpages_recode_auto || self.opts.zpages_reparse;
+        if d.build && self.zsel.phase() == zselect::Phase::Compact && !self.z_settling {
+            if recode {
+                let idle = self.zbuild.is_none() && {
+                    let _op = self.op();
+                    self.z_next().is_none()
+                };
+                if idle {
+                    self.z_recode_tick();
+                }
+            } else if self.z_hot_runs() {
+                self.z_hot_raw_tick();
             }
         }
         // The sample first where the option says, while the builder the

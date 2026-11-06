@@ -6251,11 +6251,17 @@ fn auto_store_with(
     // The purchase as the rent makes it: the builds ahead at landing
     // (`Options::zpages_land_pct`, on as shipped) buy by attach, and they
     // are their own tests' (`land_store`).
+    // The hot-raw policy off unless a test asks for it: it releases a hot
+    // partition to the raw form where the budget has room, and the tests
+    // here count the form files a store holds and read the codings by
+    // partition, which a release moves under them. Its own test turns it
+    // on (`the_controller_serves_the_hottest_partition_raw_within_the_budget`).
     let mut opts = Options {
         zpages: ZPages::Auto,
         zpages_min_bytes: 0,
         zpages_inject: Some(inject.clone()),
         zpages_land_pct: 0,
+        zpages_hot_raw: false,
         ..Options::default()
     };
     extra(&mut opts);
@@ -9620,6 +9626,209 @@ fn the_controller_recodes_the_hottest_partition_within_the_budget() {
             wait_steps(&db, 5);
             let c = db.zpage_counts();
             assert_eq!((c.recodes, c.recode_looks), (0, 0), "{what}: {c:?}");
+        }
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The hot-raw policy's next look waited for (`Options::zpages_hot_raw`):
+/// the injected clock moved `by`, and the counts read once the segment
+/// work's turn has looked at it.
+#[cfg(target_os = "linux")]
+fn hot_look(db: &Db, by: std::time::Duration) {
+    let inject = db.options().zpages_inject.clone().unwrap();
+    let was = db.zpage_counts().hot_looks;
+    inject.advance(by);
+    let t = std::time::Instant::now();
+    while db.zpage_counts().hot_looks == was && t.elapsed().as_secs() < 60 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(
+        db.zpage_counts().hot_looks > was,
+        "the hot-raw policy looked"
+    );
+}
+
+/// Looks of the hot-raw policy, each a period on, until `cond` holds of the
+/// counts or `max` looks have gone: whether it holds.
+#[cfg(target_os = "linux")]
+fn hot_until(db: &Db, max: u32, cond: impl Fn(&supdb::db::ZCounts) -> bool) -> bool {
+    for _ in 0..max {
+        if cond(&db.zpage_counts()) {
+            return true;
+        }
+        hot_look(db, std::time::Duration::from_millis(200));
+    }
+    cond(&db.zpage_counts())
+}
+
+/// Under the controller with the hot-raw policy (`Options::zpages_hot_raw`),
+/// once the form is installed, the partition whose decodes cost the most is
+/// released to the raw form -- its form file taken out of its cell and left
+/// on disk, the partition declined under the policy, its reads going raw and
+/// counted -- where the form files and the raw partitions together stay
+/// within the release share of the budget, and not where they would not;
+/// a partition under the floor is left served however much room there is;
+/// once the budget falls under the files and the raw partitions past the
+/// fill share, the coldest raw partition's file is attached again, and the
+/// store serves every partition from its form file as before. Every read
+/// and scan answers as the raw form does across each move. Without the
+/// option nothing is released however hot a partition reads.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_controller_serves_the_hottest_partition_raw_within_the_budget() {
+    for on in [true, false] {
+        let what = format!("hot raw {on}");
+        let (dir, db, model, inject) = auto_store_with(
+            &format!("auto-hotraw-{on}"),
+            1 << 20,
+            1_000_000.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_hot_raw = on;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        // A decode priced by the seam, so that the heat is the decodes.
+        inject.set_decode_cost(std::time::Duration::from_micros(10));
+        let c = db.zpage_counts();
+        assert!(
+            c.form_files >= 5,
+            "{what}: partitions to choose from: {c:?}"
+        );
+        assert_eq!(
+            c.form_files, c.partitions,
+            "{what}: every partition served: {c:?}"
+        );
+        let (partitions, total) = (c.partitions, c.file_bytes);
+        let hot = keys_of_partition(&db, &model, 2);
+        let heat = |db: &Db| heat_up(db, &hot, 100_000);
+        if on {
+            // The release share of the budget filled by the form files
+            // themselves: no room for a raw partition.
+            inject.set_budget(total * 100 / 75 + 1);
+            hot_look(&db, std::time::Duration::from_millis(200));
+            heat(&db);
+            hot_look(&db, std::time::Duration::from_millis(200));
+            heat(&db);
+            hot_look(&db, std::time::Duration::from_millis(200));
+            let c = db.zpage_counts();
+            assert_eq!((c.hot_raw, c.hot_raw_now), (0, 0), "{what}: no room: {c:?}");
+            // Room for one partition's raw form and no more: the line at the
+            // files plus one and a half times what a release adds, a raw
+            // partition less its form file, the raw partition read as the
+            // records and the hash slots the model counts (the ordered index
+            // comes with it, a few percent more). The hot one is released at
+            // the look after the heat shows.
+            let file_one = total / partitions;
+            let raw_one = (c.model_record_bytes + c.model_hash_bytes) / partitions;
+            assert!(
+                raw_one > file_one,
+                "{what}: the raw form over the file: {c:?}"
+            );
+            let line = total + (raw_one - file_one) * 3 / 2;
+            inject.set_budget(line * 100 / 75);
+            heat(&db);
+            // The look asks for the raw pages; the look after, with the
+            // pages resident, takes the form file out of its cell.
+            hot_look(&db, std::time::Duration::from_millis(200));
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_asks, c.hot_raw, c.form_files),
+                (1, 0, partitions),
+                "{what}: asked, still served: {c:?}"
+            );
+            assert!(
+                hot_until(&db, 10, |c| c.hot_raw >= 1),
+                "{what}: the hot partition released: {:?}",
+                db.zpage_counts()
+            );
+            let c = db.zpage_counts();
+            assert_eq!(
+                (
+                    c.hot_asks,
+                    c.hot_dropped,
+                    c.hot_raw,
+                    c.hot_raw_now,
+                    c.form_files
+                ),
+                (1, 0, 1, 1, partitions - 1),
+                "{what}: the hot partition released: {c:?}"
+            );
+            assert_eq!(c.hot_back, 0, "{what}: {c:?}");
+            // Its reads go raw and are counted; the others' still through
+            // the form. Every value as the model has it.
+            let before = db.zpage_counts();
+            check(&r, &model, &hot, &format!("{what}: released, raw"));
+            let after = db.zpage_counts();
+            assert!(
+                after.rawserves > before.rawserves,
+                "{what}: the released partition read raw: {before:?} {after:?}"
+            );
+            let cold = keys_of_partition(&db, &model, 0);
+            let before = db.zpage_counts();
+            check(&r, &model, &cold, &format!("{what}: served"));
+            let after = db.zpage_counts();
+            assert!(
+                after.reads > before.reads,
+                "{what}: a served partition read through the form: {before:?} {after:?}"
+            );
+            check_scan(&r, &model, &format!("{what}: scans across a raw partition"));
+            // Another look with the hot one raw: its own reads keep it the
+            // hottest, the checks above read the others past the floor, and
+            // there is no room for a second: nothing moves.
+            heat(&db);
+            hot_look(&db, std::time::Duration::from_millis(200));
+            hot_look(&db, std::time::Duration::from_millis(200));
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_asks, c.hot_raw, c.hot_back, c.hot_raw_now),
+                (1, 1, 0, 1),
+                "{what}: one released and nothing more: {c:?}"
+            );
+            // The budget under the form files and the raw partition past the
+            // fill share: the raw one's file attached again.
+            inject.set_budget(total);
+            hot_look(&db, std::time::Duration::from_millis(200));
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_back, c.hot_raw_now, c.form_files),
+                (1, 0, partitions),
+                "{what}: the way back: {c:?}"
+            );
+            check(&r, &model, &hot, &format!("{what}: served again"));
+        } else {
+            inject.set_budget(total * 4);
+            for _ in 0..3 {
+                heat(&db);
+                advance_tick(&db, std::time::Duration::from_millis(200));
+            }
+            wait_steps(&db, 5);
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_raw, c.hot_looks, c.form_files),
+                (0, 0, partitions),
+                "{what}: {c:?}"
+            );
         }
         check(&r, &model, &keys, &format!("{what}: after"));
         drop(r);

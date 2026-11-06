@@ -3467,6 +3467,17 @@ pub(super) struct ZEvents {
     pub reparses: AtomicU64,
     /// The re-code policy's looks, one a period it read the heat at.
     pub recode_looks: AtomicU64,
+    /// The hot-raw policy's (`Options::zpages_hot_raw`): partitions released
+    /// to the raw form, partitions whose form file it attached again, and
+    /// its looks, one a period it read the heat at.
+    pub hot_raw: AtomicU64,
+    pub hot_back: AtomicU64,
+    pub hot_looks: AtomicU64,
+    /// Its asks for a partition's raw pages ahead of a release, and the
+    /// asks dropped: the pages not there when the wait ran out, or the
+    /// room gone.
+    pub hot_asks: AtomicU64,
+    pub hot_dropped: AtomicU64,
     /// Re-codes made by exchanging the served form file with the kept one.
     pub recode_flips: AtomicU64,
     /// Spares built and kept (`Options::zpages_both`), and spares that kept
@@ -3745,6 +3756,15 @@ pub(super) fn zpg_dead_name(n: u64) -> String {
 /// counted twice. Unlike the others it is not a reason to leave the
 /// partition raw, and a settle still gives it a form file.
 pub(super) const DECLINED_REFUSED: u8 = 7;
+
+/// The code `Seg::z_declined` keeps for a partition the hot-raw policy serves
+/// raw while its form file waits on disk (`Options::zpages_hot_raw`): the
+/// partition is hot enough that its raw pages are worth their room in the
+/// page cache, and reads of it go through the raw form and are counted for
+/// the policy's heat (`Seg::hot_read`). Not a reason to build: the policy
+/// takes the code back when it attaches the file again, and a settle or a
+/// retire clears it.
+pub(super) const DECLINED_HOT_RAW: u8 = 9;
 
 /// What a build made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
