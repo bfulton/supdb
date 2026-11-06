@@ -3548,6 +3548,42 @@ noise, and the counter that names the decision is read before the cells
 are read as the host's; and two policies that bound one quantity bound it
 at one line, named once.
 
+**A fill that held the writer for forms nobody read, and a wait that was
+faults in disguise.** The upkeep thread's pass settles the commit it was
+lent and then fills the table: a form for every block an unsealed key
+overlays that holds none, the builder ahead's work done on the pass where
+no builder runs, as out of core. The writer's next scan takes the upkeep
+back and waits for the pass in flight, and nothing in the fill asked
+whether it was wanted: at ten million keys under 1.25 GiB E's scans waited
+735 ms of 6.7 s on 832 passes whose settles took 19 ms and whose fills
+built 143 forms each, 119,000 over the mix, for blocks the scans never
+read -- the walks met the same forms with those builds and without them.
+The pass's whole yield (`upkeep_yields`) had been priced as a trade and
+left off, since it cut the settle and the scan then settled the residue
+itself; only the pass's steps timed apart on the thread's clock
+(`Db::pass_steps`) told the step the writer needed from the one it did
+not, where a profile of the thread put its time in builds and decodes,
+which is what a fill is made of, and said nothing about who waited for
+them. The fill gives the writer its upkeep back at its next block now,
+the settle whole and the pass published (`Options::upkeep_fill_yields`;
+`tests/db.rs` holds the fill cut at a block for the writer and whole
+without the option) -- and the pairing read level, the wait gone and the
+writer's minor faults doubled: E is the only mix that scans, so it builds
+its whole block cache inside its own window, 137,000 forms and 97 MB of
+first touches that are reclaims of about 10 µs each under a group at its
+limit, and the thread's builds had been taking them while the writer
+waited, leaving the pages warm for the writer's own builds once the forms
+were dropped. The trim thread trimmed nothing in either arm (`trims 0` in
+the census) and an arm with no trim thread read the same faults: not a
+churn, the cache's building itself. The yield stands; the building is the
+lever. The rule: a wait for a worker is decomposed by the worker's steps
+before it is priced as the worker's work, since a step the waiter needs
+and a step it does not are one wait from the waiter's side; a yield is
+placed per step, because the steps differ in what stopping them costs;
+and a wait removed is read beside the waiter's own counts after the
+removal -- faults, CPU -- since work a worker did for nobody can still
+have been paying a bill the waiter inherits.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
