@@ -1597,7 +1597,10 @@ pub struct Options {
     /// as liblz4's high-compression mode does, and the cold decode is a
     /// sixth faster for the fewer tokens, at about seven times the
     /// encoder's CPU, which is the builder's (`bench/examples/zdecode.rs`,
-    /// `--rhc`). Off; the record coding's tails keep `lz4_flex`.
+    /// `--rhc`). Off: under `Auto` the builds ahead carry the build beside
+    /// the load, and at twice their CPU they fall behind it, so the install
+    /// comes later (`supdb-zparse`, `docs/engine.md`). The record coding's
+    /// tails keep `lz4_flex`.
     #[doc(hidden)]
     pub zpages_parse: bool,
     /// The form's block-coded groups decoded by the engine's own LZ4 decoder
