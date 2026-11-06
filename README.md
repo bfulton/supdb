@@ -51,6 +51,27 @@ on its own where it was not yet the default, and `supdb-nozpages` the raw
 form alone where it is. The rest of the set, every workload and option, is
 under `docs/figures/` by scale and machine class.
 
+### Reproducing a row
+
+The quick ladder runs on a hosted runner from a fork, with no toolchain
+installed anywhere:
+
+1. Fork the repository.
+2. Under Actions, choose the `ci` workflow and run it by hand. Its `arms`
+   input takes a comma-separated list, `supdb,lmdb` for instance, and runs
+   those arms alone in a fraction of the time; empty, it runs every arm.
+3. When the `quick` job ends, download its `quick-row` artifact: one JSON
+   row under `quick/` holding the raw per-rep samples of every quantity and
+   the machine as the row records it, with the gate's verdict in the job's
+   log. [`bench/DESIGN.md`](bench/DESIGN.md) names every quantity and says
+   how it is measured.
+
+A run of every arm takes twenty to thirty minutes on `ubuntu-latest`. The
+row's class is the runner's CPU model, and the hosted runners rotate between
+several, so the gate has a band for a class only once three rows of it are
+committed; the `bank-row` workflow proposes the hosted rows as a pull
+request after each merge, and merging one is a person's decision.
+
 ## Usage
 
 ```toml

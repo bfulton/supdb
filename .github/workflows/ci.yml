@@ -13,6 +13,11 @@ on:
     tags: ['*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      arms:
+        description: 'Arms for the quick job, comma-separated (empty runs every arm)'
+        required: false
+        default: ''
 
 env:
   CARGO_TERM_COLOR: always
@@ -76,6 +81,8 @@ jobs:
         with:
           workspaces: bench -> bench/target
       - name: One quick-scale run of every arm
+        env:
+          ARMS: ${{ inputs.arms }}
         run: sh scripts/check.sh quick
       - uses: actions/upload-artifact@v4
         if: always()

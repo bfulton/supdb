@@ -1,0 +1,130 @@
+name: bank-row
+
+# One quick-scale row from each hosted runner, proposed as a pull request
+# that adds the rows under bench/runs/quick/ with the figures redrawn. The
+# merge is a person's decision: the row says what the machine did, and
+# bench/CLAUDE.md says when such a row is history and when it is not. Runs
+# on a push to main and by hand, never on a pull request -- one row a merge
+# a class is enough, and more floods the series -- and never on a
+# self-hosted runner. The hosted runners rotate between CPU models (three
+# in three consecutive runs of `ubuntu-latest`), and the row's class is the
+# model, so a class's band forms as its own rows accumulate.
+#
+# The pull request needs the repository to allow Actions to create pull
+# requests (Settings, Actions, General); where it does not, the branch the
+# job pushes still holds the rows, and a person opens the pull request from
+# it.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  row:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: libclang, for bindgen
+        run: sh bench/scripts/libclang.sh
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bench -> bench/target
+      # The run and the gate apart, and the gate's exit not the step's: a
+      # verdict against the series is what the pull request carries, not a
+      # reason to lose the row.
+      - name: One quick-scale run of every arm, and the gate's verdict
+        working-directory: bench
+        run: |
+          set -eu
+          cargo build --release --bin bench
+          rm -rf runs-ci
+          ./target/release/bench run --scale quick --out runs-ci
+          ./target/release/bench gate runs-ci/quick/*.json --runs runs > runs-ci/gate.txt 2>&1 || true
+          cat runs-ci/gate.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: row-${{ matrix.runner }}
+          path: bench/runs-ci/
+          if-no-files-found: ignore
+
+  propose:
+    needs: row
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: libclang, for bindgen
+        run: sh bench/scripts/libclang.sh
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bench -> bench/target
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: row-*
+          path: rows
+      # Each row under bench/runs/quick/, its gate verdict into the body,
+      # and the figures redrawn from the rows -- the check holds the drawn
+      # set to the committed one, as every check run does.
+      - name: Add the rows and redraw the figures
+        id: rows
+        run: |
+          set -eu
+          n=0
+          : > body.md
+          for d in rows/row-*; do
+            [ -d "$d" ] || continue
+            for f in "$d"/quick/*.json; do
+              [ -f "$f" ] || continue
+              cp "$f" bench/runs/quick/
+              n=$((n + 1))
+              class=$(python3 -c 'import json,sys; m=json.load(open(sys.argv[1]))["machine"]; print(m["cpu_model"], "--", m["cpus"], "cores")' "$f")
+              runner=$(basename "$d" | sed 's/^row-//')
+              printf '## %s\n\n`%s`: %s\n\n```\n' "$runner" "$(basename "$f")" "$class" >> body.md
+              if [ -f "$d/gate.txt" ]; then cat "$d/gate.txt" >> body.md; else echo "(no gate output)" >> body.md; fi
+              printf '```\n\n' >> body.md
+            done
+          done
+          echo "rows=$n" >> "$GITHUB_OUTPUT"
+          if [ "$n" -eq 0 ]; then
+            echo "no row to propose"
+            exit 0
+          fi
+          sh bench/scripts/figures.sh
+          sh bench/scripts/figures.sh --check
+      - name: Propose the rows as a pull request
+        if: steps.rows.outputs.rows != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          branch="bank/quick-$RUN_ID"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add bench/runs/quick docs/figures
+          git commit -q -F - <<MSG
+          Bank the hosted quick rows from run $RUN_ID
+
+          $(cat body.md)
+          MSG
+          git push -u origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "Bank quick rows at $(git rev-parse --short "$SHA") from the hosted runners" \
+            --body-file body.md || echo "the pull request was not created; the rows are on branch $branch"

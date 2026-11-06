@@ -547,3 +547,17 @@ same rows twice and holds the bytes equal, since a check that compares a
 drawing to a redrawing is only as good as the drawing's determinism. The
 rule: a derived file may be committed when a check regenerates it and
 fails on a difference, and never otherwise.
+
+**Rows from the hosted runners.** `bank-row.yml` runs the quick ladder on
+each hosted runner after a merge to `main` and proposes the rows as one
+pull request, the figures redrawn and each row's gate verdict in the body;
+merging it is a person's decision, as `quiet-bench.yml`'s rule already
+says, and the workflow never runs on a pull request or a self-hosted
+runner. The runner label is not the class: the three most recent quick
+jobs on `ubuntu-latest` ran on an EPYC 9V45, an EPYC 7763 and an EPYC
+9V74, three classes under one label, so a band for a hosted class forms
+as its own rows arrive, slowly for that label and faster for the ARM and
+macOS runners. A hosted row is never read against a Firecracker row, which
+the class key forbids anyway, and no default changes on a hosted number
+alone: the runners are shared machines whose model varies between runs,
+and the row's floors judge the machine before its cells are read.
