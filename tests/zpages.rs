@@ -7513,9 +7513,10 @@ fn builds_ahead_at_landing_wait_while_scans_are_around() {
 /// (`Options::zpages_ahead_past_scans`): a store scanned and never
 /// point-read, its raw populations past its budget, builds its partitions
 /// ahead, and the landing that brings the files on disk to the install's
-/// coverage has the selector sample again, so the attach on the prediction
-/// follows and the form installs; without the option nothing is built
-/// ahead beside the scans, the first reading stands, and nothing installs.
+/// coverage has the selector's reading refreshed against them, in place of
+/// a sample, so the attach on the prediction follows and the form installs;
+/// without the option nothing is built ahead beside the scans, the first
+/// reading stands, and nothing installs.
 #[cfg(target_os = "linux")]
 #[test]
 fn builds_ahead_run_beside_scans_past_the_line_and_the_attach_follows() {
@@ -7577,8 +7578,8 @@ fn builds_ahead_run_beside_scans_past_the_line_and_the_attach_follows() {
             );
             let c = db.zpage_counts();
             assert!(
-                c.samples >= 2 && c.prebuilt >= 1,
-                "{what}: sampled again once the files landed and covered the keys: {c:?}"
+                c.samples == 1 && c.sample_refreshed >= 1 && c.prebuilt >= 1,
+                "{what}: the reading refreshed once the files landed and covered the keys, not sampled again: {c:?}"
             );
             assert!(
                 c.attached >= 1 && c.phase == 3,
@@ -7603,6 +7604,237 @@ fn builds_ahead_run_beside_scans_past_the_line_and_the_attach_follows() {
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// A merge's outputs are given their form files as each is finished
+/// (`Options::zpages_build_at_finish`): a store under the controller past
+/// its budget, every key written again and the pieces merged, has a form
+/// file beside every output once the builds the merge started have ended,
+/// at most the builders' count of them at once -- with the builds held at
+/// their start, a merge of more outputs than builders waits for a slot and
+/// does not land -- and the tick after the last build has the selector's
+/// reading refreshed against the files, so the attach follows without the
+/// rent and with no landing after; without the option the merge lands with
+/// no file and builds nothing at its outputs' finish.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_merges_outputs_have_their_form_files_when_it_lands() {
+    // Eight builders: every output's build starts, the merges land with
+    // them parked, and the install follows the builds' landing alone;
+    // two: an output waits for a slot, which is the cap, and its merge
+    // with it.
+    for (on, builders) in [(true, 8usize), (true, 2), (false, 2)] {
+        let what = format!("build at finish {on}, {builders} builders");
+        let (dir, mut db, mut model, inject, raw) =
+            land_store_with(&format!("auto-finish-{on}-{builders}"), 50, |o| {
+                o.zpages_build_at_finish = on;
+                o.zpages_ahead_builders = builders;
+                // Three partitions, so that one merge's outputs cover the
+                // keys the attach needs.
+                o.partition_bytes = Some(1 << 20);
+                // A merge at the first piece's landing, planned by the
+                // segment work: a flush would join the merge, and the merge
+                // waits for its builds, which the test holds.
+                o.l0_trigger = 1;
+            });
+        // Past the line, the decode priced through the seam; scanned, so
+        // that the builds ahead at landing would wait for the scans.
+        let mut seen = 0usize;
+        db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
+        assert_eq!(seen, 10);
+        inject.set_decode_cost(std::time::Duration::from_micros(1));
+        inject.set_budget(raw / 2);
+        wait_steps(&db, 2);
+        let partitions = db.zpage_counts().partitions;
+        assert!(partitions == 3, "{what}: {:?}", db.zpage_counts());
+        // The builds held at their start: the merge's outputs finish, their
+        // builds park, and the merge waits for them before it lands. Every
+        // key written again and sealed, the merge the landing plans.
+        db.hold_zpage_build(true);
+        let landed = db.seal_waits().merges;
+        // Values of the suite's size, so the rewrite leaves the store's
+        // footprint, and the line, where they were.
+        let mut rng = Rng(0x5EED);
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        for chunk in keys.chunks(250) {
+            for k in chunk {
+                let v = suite_value(&mut rng);
+                db.put(k, &v);
+                model.insert(k.clone(), vec![v]);
+            }
+            db.commit().unwrap();
+        }
+        db.seal().unwrap();
+        wait_for("a merge of the pieces", || db.merges_in_flight() >= 1);
+        if on {
+            wait_for("builds at the outputs' finish, at their hold", || {
+                db.zpage_build_waiting() && db.zpage_counts().finish_live >= 1
+            });
+            // Twenty ticks with the builds parked: with a slot for every
+            // output the merges land, their files to come; with two slots
+            // an output waits for one, and its merge with it.
+            wait_steps(&db, 20);
+            let c = db.zpage_counts();
+            let waits = builders == 2;
+            assert_eq!(
+                (
+                    db.seal_waits().merges > landed,
+                    db.merges_in_flight() >= 1,
+                    c.finish_builds,
+                    c.sel_installs
+                ),
+                (true, waits, 0, 0),
+                "{what}: the merges against their builds' slots: {c:?}"
+            );
+            assert!(
+                c.finish_live >= 1
+                    && c.finish_live <= builders as u64
+                    && c.finish_starts <= builders as u64,
+                "{what}: at most the builders' count at once: {c:?}"
+            );
+            db.hold_zpage_build(false);
+            wait_for("the builds at the outputs' finish to end", || {
+                db.zpage_counts().finish_live == 0 && db.merges_in_flight() == 0
+            });
+            db.settle().unwrap();
+            // Every live partition has its file, built at its output's
+            // finish and nowhere else: the builds ahead at landing are held
+            // by the scans. A build whose output the next merge of the chain
+            // retired first finds no file to build from, and counts failed.
+            let c = db.zpage_counts();
+            assert!(
+                c.finish_builds >= c.partitions && c.finish_live == 0 && c.build_starts == 0,
+                "{what}: every output built at its finish: {c:?}"
+            );
+            assert!(
+                form_files(&dir).len() as u64 >= c.partitions,
+                "{what}: a file beside every partition: {:?}",
+                form_files(&dir)
+            );
+            // No landing since the builds ended: the tick after them asked
+            // for the reading the attach follows.
+            let landed_now = db.seal_waits().merges;
+            assert!(
+                tick_until(&db, 400, |c| c.sel_installs >= 1),
+                "{what}: the attach did not follow the files: {:?}",
+                db.zpage_counts()
+            );
+            assert_eq!(
+                db.seal_waits().merges,
+                landed_now,
+                "{what}: the install followed the files, not a landing"
+            );
+            // The one sample's reading carried across the landings by a
+            // refresh against the files on disk, never sampled again: a
+            // reading is of the partitions at a generation, and under a
+            // chain of merges none ever reached a step.
+            let c = db.zpage_counts();
+            assert!(
+                c.sample_refreshed >= 1 && c.samples == 1,
+                "{what}: the reading refreshed, not sampled again: {c:?}"
+            );
+        } else {
+            db.hold_zpage_build(false);
+            db.settle().unwrap();
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.finish_starts, c.finish_builds, c.finish_live),
+                (0, 0, 0),
+                "{what}: nothing built at the outputs' finish: {c:?}"
+            );
+            assert!(
+                form_files(&dir).is_empty(),
+                "{what}: no file at the landing: {:?}",
+                form_files(&dir)
+            );
+        }
+        let r = db.reader().unwrap();
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        check(&r, &model, &keys, &what);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// An output being built at its merge's finish is a build in flight
+/// (`Options::zpages_build_at_finish`): the builds ahead at landing, run
+/// beside scans so they would take the landing's outputs, start on none of
+/// them while their builds are parked, and every output's file comes from
+/// its finish alone.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_output_being_built_at_its_finish_is_not_built_ahead_again() {
+    let what = "built at finish, ahead beside scans";
+    let (dir, mut db, mut model, inject, raw) = land_store_with("auto-finish-ahead", 50, |o| {
+        o.zpages_build_at_finish = true;
+        o.zpages_ahead_builders = 8;
+        o.zpages_land_scans_far = false;
+        o.partition_bytes = Some(1 << 20);
+        o.l0_trigger = 1;
+    });
+    let mut seen = 0usize;
+    db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
+    assert_eq!(seen, 10);
+    inject.set_decode_cost(std::time::Duration::from_micros(1));
+    inject.set_budget(raw / 2);
+    // Past the line the builds ahead build the load's partitions, which
+    // no merge finished; every one on disk before the rewrite.
+    let partitions = db.zpage_counts().partitions;
+    assert!(partitions == 3, "{what}: {:?}", db.zpage_counts());
+    assert!(
+        tick_until(&db, 400, |c| c.prebuilt >= partitions
+            && c.build_starts >= partitions),
+        "{what}: the load's partitions not built ahead: {:?}",
+        db.zpage_counts()
+    );
+    wait_for("the builds ahead to end", || !db.zpage_build_waiting());
+    let starts = db.zpage_counts().build_starts;
+    db.hold_zpage_build(true);
+    let mut rng = Rng(0x5EED);
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    for chunk in keys.chunks(250) {
+        for k in chunk {
+            let v = suite_value(&mut rng);
+            db.put(k, &v);
+            model.insert(k.clone(), vec![v]);
+        }
+        db.commit().unwrap();
+    }
+    db.seal().unwrap();
+    wait_for("a merge of the pieces", || db.merges_in_flight() >= 1);
+    wait_for("builds at the outputs' finish, at their hold", || {
+        db.zpage_build_waiting() && db.zpage_counts().finish_live >= 1
+    });
+    // Twenty ticks with the outputs' builds parked and the merge landed:
+    // the builds ahead, free to run beside the scans, take none of them.
+    wait_steps(&db, 20);
+    let c = db.zpage_counts();
+    assert_eq!(
+        (c.build_starts, c.finish_builds),
+        (starts, 0),
+        "{what}: a build ahead started on an output being built at its finish: {c:?}"
+    );
+    db.hold_zpage_build(false);
+    wait_for("the builds at the outputs' finish to end", || {
+        db.zpage_counts().finish_live == 0 && db.merges_in_flight() == 0
+    });
+    db.settle().unwrap();
+    let c = db.zpage_counts();
+    assert!(
+        c.finish_builds >= partitions && c.build_starts == starts,
+        "{what}: every output built at its finish and nowhere else: {c:?}"
+    );
+    assert!(
+        form_files(&dir).len() as u64 >= c.partitions,
+        "{what}: a file beside every partition: {:?}",
+        form_files(&dir)
+    );
+    let r = db.reader().unwrap();
+    check(&r, &model, &keys, what);
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The builds ahead at landing (`Options::zpages_land_pct`): a store whose

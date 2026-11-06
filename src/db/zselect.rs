@@ -652,6 +652,23 @@ impl Sampler {
     }
 }
 
+/// What the build clause reads at a step, for the trace
+/// ([`ZSelect::buy_state`]): the rent, the sampler's reading as (price,
+/// attach, generation) where one stands, whether the partitions have stood
+/// for the settle, whether the eager purchase is spent, whether building is
+/// suspended, and whether a switch is allowed. The suspension is what the
+/// first line of it named: a store with a file beside every partition read
+/// raw through a sweep with `suspended` true from its load's end.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BuyState {
+    pub excess: f64,
+    pub reading: Option<(f64, bool, u64)>,
+    pub stood: bool,
+    pub eager_spent: bool,
+    pub suspended: bool,
+    pub switch_allowed: bool,
+}
+
 /// One census interval: S2, summed over the handles' valid windows.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Census {
@@ -1129,6 +1146,14 @@ pub struct ZSelect {
     /// that could buy again after every exit would buy a form that does not
     /// pay once a dwell, forever, where the rent asks the evidence each time.
     eager_spent: bool,
+    /// Whether the purchase under way is an attach: the sampler's reading
+    /// said the form files on disk cover the keys ([`Sampler::attach`]),
+    /// so what it builds is at most the rest. The wasted-build budget holds
+    /// off builds and never an attach, which wastes no build: the
+    /// suspension a load's merge chain set, a dwell long, kept a store with
+    /// a file beside every partition reading raw through a sweep of scans
+    /// (`Options::zpages_build_at_finish`).
+    attach_bought: bool,
     /// When the generation last changed, for the settle.
     gen_changed_at: Duration,
     /// The wall time of the last build or cancelled build; the dwell and the
@@ -1189,6 +1214,7 @@ impl ZSelect {
             attach_on_reads: false,
             reads_now: false,
             eager_spent: false,
+            attach_bought: false,
             gen_changed_at: Duration::ZERO,
             last_build_wall: Duration::ZERO,
             build_started: Duration::ZERO,
@@ -1243,6 +1269,18 @@ impl ZSelect {
             self.footprint,
             self.dwell(),
         )
+    }
+
+    /// For the trace: what the build clause reads at `now`.
+    pub fn buy_state(&self, now: Duration) -> BuyState {
+        BuyState {
+            excess: self.excess,
+            reading: self.sampler.map(|s| (s.c_build, s.attach, s.generation)),
+            stood: now.saturating_sub(self.gen_changed_at) >= EAGER_SETTLE,
+            eager_spent: self.eager_spent,
+            suspended: self.suspended(now),
+            switch_allowed: self.switch_allowed(now),
+        }
     }
 
     /// For the trace: the last interval's evidence, the measured saving by
@@ -1339,15 +1377,6 @@ impl ZSelect {
     /// The attach flag of the sampler's reading, where one stands.
     pub fn sampler_attach(&self) -> Option<bool> {
         self.sampler.map(|s| s.attach)
-    }
-
-    /// Drops the sampler's reading, so that the next step in SUSPECT asks
-    /// for a sample again: for the files on disk changing under one
-    /// generation, which a build ahead's dormant landing does
-    /// (`Options::zpages_ahead_past_scans`). True where a reading was
-    /// dropped.
-    pub fn resample(&mut self) -> bool {
-        self.sampler.take().is_some()
     }
 
     pub fn set_attach_on_reads(&mut self, on: bool) {
@@ -1800,6 +1829,7 @@ impl ZSelect {
             self.vanished = 0;
             self.retain_until = None;
             self.counts.builds += 1;
+            self.attach_bought = self.sampler.is_some_and(|s| s.attach);
             return Some(Event::BuildStart);
         }
         None
@@ -1810,8 +1840,11 @@ impl ZSelect {
         let (Some(m), Some(s)) = (self.model, self.sampler) else {
             return false;
         };
-        // (e), and the budget: the sampler declined, or building is held off.
-        if s.declined || self.suspended(now) {
+        // (e), and the budget: the sampler declined, or building is held
+        // off -- and an attach is not a build: with the files on disk the
+        // purchase builds at most a tenth of the keys, and the suspension
+        // is for the builder's wasted CPU.
+        if s.declined || (self.suspended(now) && !s.attach) {
             return false;
         }
         // (d)
@@ -1885,6 +1918,12 @@ impl ZSelect {
             return Some(installed);
         }
         if tripped {
+            if self.attach_bought {
+                // The files are on disk and nothing of theirs is wasted:
+                // what the budget holds off is the building of the rest.
+                self.suspend(now);
+                return Some(Event::BuildsSuspended);
+            }
             return Some(self.cancel(now, Cancel::Budget));
         }
         if ev.any() {
@@ -1906,6 +1945,7 @@ impl ZSelect {
     fn install(&mut self, now: Duration) -> Event {
         self.last_build_wall = now.saturating_sub(self.build_started);
         self.phase = Phase::Compact;
+        self.attach_bought = false;
         self.last_switch = Some(now);
         self.retain_until = None;
         self.z_realized = None;
@@ -1926,6 +1966,7 @@ impl ZSelect {
     /// the partitions (and the build clause refuses them until it does not).
     fn cancel(&mut self, now: Duration, why: Cancel) -> Event {
         self.eager_spent = true;
+        self.attach_bought = false;
         self.last_build_wall = now.saturating_sub(self.build_started);
         self.last_switch = Some(now);
         self.counts.switches += 1;
@@ -6446,6 +6487,74 @@ mod tests {
         assert_eq!(kinds(&drive(&mut calm, 5, |_| (0.0, 0.0))), [Event::Relax]);
         let mut hot = sel.clone();
         assert!(drive(&mut hot, 60, |_| (1.1 * floor_sus, 0.0)).is_empty());
+    }
+
+    /// The wasted-build budget's suspension holds off a build and never an
+    /// attach: under it a reading that says the form files on disk cover
+    /// the keys is bought, and one that says they do not waits it out. The
+    /// suspension a load's merge chain set kept a store with a file beside
+    /// every partition reading raw through a sweep of scans.
+    #[test]
+    fn a_suspension_holds_off_a_build_and_not_an_attach() {
+        for attach in [true, false] {
+            let (mut sel, step) = suspect_by_hand();
+            sel.set_attach_eager(true);
+            sel.suspend(DT * step as u32);
+            assert!(sel.suspended(DT * step as u32));
+            let mut s = reading(0.2, false, 0);
+            s.attach = attach;
+            let bought = (1..=60)
+                .any(|i| hand(&mut sel, step + i, 0, Some(s)).event == Some(Event::BuildStart));
+            assert_eq!(bought, attach, "attach {attach}: {:?}", sel.phase());
+            assert_eq!(sel.phase() == Phase::Building, attach);
+        }
+    }
+
+    /// The budget tripped while a purchase is under way: an attach keeps
+    /// going, with building suspended behind it, where a build is cancelled.
+    #[test]
+    fn a_trip_during_an_attach_suspends_building_and_keeps_the_attach() {
+        for attach in [true, false] {
+            let (mut sel, step) = suspect_by_hand();
+            if attach {
+                sel.set_attach_eager(true);
+            } else {
+                sel.set_eager(true);
+            }
+            let mut s = reading(0.2, false, 0);
+            s.attach = attach;
+            let at = (1..=60)
+                .find(|&i| hand(&mut sel, step + i, 0, Some(s)).event == Some(Event::BuildStart))
+                .map(|i| step + i)
+                .expect("the purchase made");
+            let d = sel.step(&Input {
+                now: DT * (at + 1) as u32,
+                census: Census {
+                    reads: Window {
+                        ops: 5000,
+                        faults: 2000,
+                    },
+                    refaults: Some(2000),
+                    ..Census::default()
+                },
+                build: Build {
+                    coverage: 0.5,
+                    superseded: BUDGET_SUPERSEDED + 1,
+                    ..Build::default()
+                },
+                sampler: Some(s),
+                generation: 0,
+                ..Input::default()
+            });
+            if attach {
+                assert_eq!(d.event, Some(Event::BuildsSuspended), "attach {attach}");
+                assert_eq!(sel.phase(), Phase::Building);
+            } else {
+                assert_eq!(d.event, Some(Event::BuildAbandoned), "attach {attach}");
+                assert_ne!(sel.phase(), Phase::Building);
+            }
+            assert!(sel.suspended(DT * (at + 1) as u32));
+        }
     }
 
     /// A selector fed by hand in SUSPECT with a hot model, a census that has

@@ -3417,6 +3417,34 @@ count moves, so it is read with that count beside it; and a burst slower
 than its commits is read against the writer's CPU and its holds before a
 syscall is suspected.
 
+**A rule right for a build and wrong for an attach, and a reading dropped
+at every landing of a chain.** The form files a merge's outputs are given
+at their finish (`Options::zpages_build_at_finish`) stood on disk beside
+every partition through a sweep of scans while the controller read raw,
+in three reps of four, and the arm's pairing read as a loss; the trace
+line, given the buy clause's inputs (`ZSelect::buy_state`), said
+`suspended true` from the load's end on. The wasted-build budget suspends
+building for a dwell of sixty seconds once more than half the last eight
+builds were superseded, the load's merge chain had superseded the builds
+ahead it ran beside, and the suspension refused an attach as it refuses
+a build -- a rule for the builder's wasted CPU applied to a purchase that
+wastes none. And where the attach was not refused the reading was never
+there: a sampler's reading is of the partitions at a generation and is
+dropped when one arrives at another, so under a chain of merges -- a
+landing every half second, a sample longer than that -- no reading ever
+reached a step, and forty-one samples ran through one pass of fifteen
+seconds, each over every partition's pages on the thread the landings go
+through. The suspension holds off builds and never an attach now, a trip
+during an attach suspends the building of the rest without cancelling it,
+and where files land under the store's own writing the reading is
+refreshed against a count of them in place of a sample
+(`Maint::z_sample_refresh`). The rule: a guard is tested against the kind
+of purchase it was written for, and a reading that a changing input
+invalidates is refreshed from the part of it that changed, or it never
+stands for long enough to be read; and a controller's refusal is read off
+its clause's inputs on the trace before its evidence is reasoned about,
+since four clauses looked satisfied from the fields the line carried.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

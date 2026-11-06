@@ -606,9 +606,12 @@ pub struct Supdb {
     /// `supdb-zreparse`, durable.
     zreparse: bool,
     /// The builds ahead run beside scans past the selector's line, and a
-    /// landing that covers the keys has the selector sample again
+    /// landing that covers the keys has the selector's reading refreshed
     /// (`Options::zpages_ahead_past_scans`). `supdb-zaheadscans`, durable.
     zaheadscans: bool,
+    /// A merge's outputs given their form files as each is finished
+    /// (`Options::zpages_build_at_finish`). `supdb-zfinish`, durable.
+    zfinish: bool,
     /// The block cache reads a block boundary's key off the ordered index's
     /// top level in memory, where the default reads the partition's record
     /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
@@ -1430,9 +1433,12 @@ struct Policy {
     /// `supdb-zreparse`, durable.
     zreparse: bool,
     /// The builds ahead run beside scans past the selector's line, and a
-    /// landing that covers the keys has the selector sample again
+    /// landing that covers the keys has the selector's reading refreshed
     /// (`Options::zpages_ahead_past_scans`). `supdb-zaheadscans`, durable.
     zaheadscans: bool,
+    /// A merge's outputs given their form files as each is finished
+    /// (`Options::zpages_build_at_finish`). `supdb-zfinish`, durable.
+    zfinish: bool,
     /// The block cache reads a block boundary's key off the ordered index's
     /// top level in memory, where the default reads the partition's record
     /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
@@ -2011,6 +2017,7 @@ impl Default for Policy {
             zrecodeauto: false,
             zreparse: false,
             zaheadscans: false,
+            zfinish: false,
             boundarytop: false,
             nodirwillneed: false,
             noboundsheadwillneed: false,
@@ -3940,6 +3947,21 @@ impl Supdb {
             path,
             Policy {
                 zaheadscans: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose merges give each output partition its form file as it
+    /// is finished, from the pages the merge just wrote
+    /// (`Options::zpages_build_at_finish`), `supdb-zfinish`: against `supdb`
+    /// it prices the install for a store whose partitions a merge just
+    /// rewrote, on the lag sweep and the mixes under a bound.
+    pub fn create_zfinish(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zfinish: true,
                 ..Policy::default()
             },
         )
@@ -6582,6 +6604,7 @@ impl Supdb {
             zrecodeauto,
             zreparse,
             zaheadscans,
+            zfinish,
             boundarytop,
             nodirwillneed,
             noboundsheadwillneed,
@@ -6901,6 +6924,7 @@ impl Supdb {
             zpages_recode_auto: zrecodeauto,
             zpages_reparse: zreparse,
             zpages_ahead_past_scans: zaheadscans,
+            zpages_build_at_finish: zfinish,
             wal_drop_bytes: if walkeep {
                 0
             } else {
@@ -7190,6 +7214,7 @@ impl Supdb {
             zrecodeauto,
             zreparse,
             zaheadscans,
+            zfinish,
             boundarytop,
             nodirwillneed,
             noboundsheadwillneed,
@@ -7956,6 +7981,9 @@ impl Engine for Supdb {
         if self.zaheadscans {
             return "supdb-zaheadscans";
         }
+        if self.zfinish {
+            return "supdb-zfinish";
+        }
         if self.zparse && self.budget == 0 {
             return "supdb-zparse";
         }
@@ -8608,6 +8636,10 @@ impl Engine for Supdb {
             ("zpage_build_starts", z.build_starts as f64),
             ("zpage_build_cancelled", z.build_cancelled as f64),
             ("zpage_prebuilt", z.prebuilt as f64),
+            ("zpage_finish_builds", z.finish_builds as f64),
+            ("zpage_finish_failed", z.finish_failed as f64),
+            ("zpage_finish_waits", z.finish_waits as f64),
+            ("zpage_sample_refreshed", z.sample_refreshed as f64),
             ("zpage_ahead_paired", z.ahead_paired as f64),
             ("zpage_ahead_cold", z.ahead_cold as f64),
             ("zpage_ahead_recoded", z.ahead_recoded as f64),
@@ -8734,10 +8766,20 @@ impl Engine for Supdb {
     }
 
     fn memory_census(&self) -> Vec<(String, u64)> {
-        self.db
-            .as_ref()
-            .map(|db| db.memory_census())
-            .unwrap_or_default()
+        let Some(db) = self.db.as_ref() else {
+            return Vec::new();
+        };
+        let mut c = db.memory_census();
+        // Where the tables `State::replaced` keeps are kept from: the live
+        // tables over the store's life, the writer's upkeep's last look
+        // among them, and how many the state holds for it -- a table held
+        // past the look is the trim's to make at the next publish, which a
+        // store that is only read may never make.
+        let (_, kept, lives, look) = db.upkeep_abandon_state();
+        c.push(("look_lives_n".into(), lives));
+        c.push(("look_at_n".into(), if look == u64::MAX { 0 } else { look }));
+        c.push(("replaced_kept_n".into(), kept as u64));
+        c
     }
     fn zpages_state(&self) -> Option<ZState> {
         let db = self.db.as_ref()?;
@@ -9490,6 +9532,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zrecodeauto"
         | "supdb-zreparse"
         | "supdb-zaheadscans"
+        | "supdb-zfinish"
         | "supdb-zparse"
         | "supdb-nozpagesnofitshort"
         | "supdb-nozpagesmergepar2"
@@ -10037,6 +10080,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zrecodeauto" => supdb_arm(Supdb::create_zrecodeauto, dir)?,
         "supdb-zreparse" => supdb_arm(Supdb::create_zreparse, dir)?,
         "supdb-zaheadscans" => supdb_arm(Supdb::create_zaheadscans, dir)?,
+        "supdb-zfinish" => supdb_arm(Supdb::create_zfinish, dir)?,
         "supdb-zparse" => supdb_arm(Supdb::create_zparse, dir)?,
         "supdb-nozpagesnofitshort" => supdb_arm(Supdb::create_nozpages_nofitshort, dir)?,
         "supdb-nozpagesmergepar2" => supdb_arm(Supdb::create_nozpages_mergepar2, dir)?,
@@ -11615,6 +11659,7 @@ mod tests {
             "supdb-zparse",
             "supdb-zreparse",
             "supdb-zaheadscans",
+            "supdb-zfinish",
         ] {
             assert_eq!(
                 open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
@@ -11712,6 +11757,13 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.zpages_ahead_past_scans && !b.zpages_ahead_past_scans);
                 assert!(o.zpages_land_scans_far && b.zpages_land_scans_far);
+            }
+            {
+                let z = Supdb::create_zfinish(&dir("zfinish")).unwrap();
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_build_at_finish && !b.zpages_build_at_finish);
+                assert!(!o.zpages_ahead_past_scans && o.zpages_land_scans_far);
                 assert_eq!(
                     (o.zpages, o.zpages_land_pct, o.zpages_reparse),
                     (b.zpages, b.zpages_land_pct, b.zpages_reparse)

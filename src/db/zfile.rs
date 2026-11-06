@@ -3464,6 +3464,12 @@ pub(super) struct ZEvents {
     /// Builds collected dormant, ahead of the controller's decision
     /// (`ZCounts::prebuilt`).
     pub prebuilt: AtomicU64,
+    /// Builds at a merge's output finish (`Options::zpages_build_at_finish`):
+    /// started, built, failed, and the merge's waits for a slot.
+    pub finish_starts: AtomicU64,
+    pub finish_builds: AtomicU64,
+    pub finish_failed: AtomicU64,
+    pub finish_waits: AtomicU64,
     /// Builds ahead started in the second slot, beside another build
     /// ahead (`ZCounts::ahead_paired`).
     pub ahead_paired: AtomicU64,
@@ -3546,6 +3552,9 @@ pub(super) struct ZEvents {
     pub sampled: AtomicU64,
     pub sample_declined: AtomicU64,
     pub sample_us: AtomicU64,
+    /// Readings refreshed from the last sample's costs and a count of the
+    /// form files on disk, in place of a sample (`Maint::z_sample_refresh`).
+    pub sample_refreshed: AtomicU64,
     /// The sampler's estimate of the form's bytes over the partitions it
     /// counted, at its last reading (`Sample::w_z` summed).
     pub sample_w_z: AtomicU64,

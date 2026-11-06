@@ -500,6 +500,13 @@ pub struct ZCounts {
     /// Form files built ahead of the controller's decision and left on
     /// disk unattached (`Options::zpages_prebuild`).
     pub prebuilt: u64,
+    /// Builds at a merge's output finish (`Options::zpages_build_at_finish`):
+    /// started, built, failed, the merge's waits for a slot, and in flight.
+    pub finish_starts: u64,
+    pub finish_builds: u64,
+    pub finish_failed: u64,
+    pub finish_waits: u64,
+    pub finish_live: u64,
     /// Builds ahead started beside another build ahead
     /// (`Options::zpages_ahead_builders`).
     pub ahead_paired: u64,
@@ -597,6 +604,9 @@ pub struct ZCounts {
     pub sampled: u64,
     pub sample_declined: u64,
     pub sample_us: u64,
+    /// Readings refreshed from the last sample in place of a sample
+    /// (`Options::zpages_build_at_finish`, `Options::zpages_ahead_past_scans`).
+    pub sample_refreshed: u64,
     /// The sampler's estimate of the form's bytes over the partitions it
     /// counted, at its last reading; `file_bytes` is what the build wrote.
     pub sample_w_z_bytes: u64,
@@ -1478,9 +1488,10 @@ pub struct Options {
     /// builds ahead at landing run beside scans -- the hold for scans near
     /// (`zpages_land_scans_far`) applies under the line alone -- and a
     /// build ahead whose landing brings the files on disk to the install's
-    /// coverage (`zselect::COVERED_ENOUGH`) has the selector drop the
-    /// reading that refused the attach for want of them and sample again,
-    /// so the attach on the prediction follows. The hold was drawn when a
+    /// coverage (`zselect::COVERED_ENOUGH`) has the reading that refused the
+    /// attach for want of them refreshed against the files as they are
+    /// (`Maint::z_sample_refresh`), so the attach on the prediction
+    /// follows. The hold was drawn when a
     /// store that was scanned and never point-read gave the controller
     /// nothing to buy on; its scans' faults are evidence now, and at ten
     /// million keys under 1.25 GiB the lag sweep's store -- every partition
@@ -1491,6 +1502,26 @@ pub struct Options {
     /// scans they would have served (`docs/engine.md`). Off.
     #[doc(hidden)]
     pub zpages_ahead_past_scans: bool,
+    /// EXPERIMENT: a merge's output partition is given its form file as it
+    /// is finished, by a builder the merge's thread starts while the pages
+    /// it just wrote are in the page cache -- at most `zpages_ahead_builders`
+    /// at once, the merge waiting for a slot, which keeps it at the
+    /// builders' pace and its outputs resident for them -- where the store
+    /// is past the share of its budget the builds ahead at landing start
+    /// at (`zpages_land_pct`) or the form is installed; the landing finds
+    /// the files on disk, and the segment work's tick after the last build
+    /// asks the selector for a fresh reading where the files cover the
+    /// keys (`Maint::z_prebuilt_landed`), so the attach follows. The builds ahead at
+    /// landing wait for the landing, for the scans around them and for the
+    /// builder's slot, and read the partition back from the device once
+    /// the merge's later outputs have pushed it out: at ten million keys
+    /// under 1.25 GiB the lag sweep's store came out of the shuffled load's
+    /// last merge with two files of twenty-four and its first pass walked
+    /// the raw form, and the full rewrite's pass read the merges' outputs
+    /// back for their builds, a third of the 3.7 GB it read at the device
+    /// (`docs/engine.md`). Off.
+    #[doc(hidden)]
+    pub zpages_build_at_finish: bool,
     /// Whether a build ahead (`zpages_land_pct`, `zpages_prebuild`) drops
     /// the raw records behind it, as a bought build does
     /// (`zpages_drop_behind`), once the model's prediction of the raw
@@ -3901,6 +3932,7 @@ impl Default for Options {
             zpages_build_sync: true,
             zpages_land_cold_past: true,
             zpages_ahead_past_scans: false,
+            zpages_build_at_finish: false,
             zpages_group_bytes: zpages::ZGROUP_BYTES,
             zpages_record_coding: false,
             zpages_store_all: false,
@@ -4881,6 +4913,149 @@ struct ZBuild {
     /// A re-code in the served coding by the parsing encoder
     /// (`ZKind::Reparse`).
     reparse: bool,
+}
+
+/// What a merge's thread is given to build each output's form file as the
+/// output is finished (`Options::zpages_build_at_finish`): the builder's
+/// plan as the builds ahead would have it, the store's counters and holds,
+/// and how many builds may run at once.
+struct ZFinish {
+    dir: PathBuf,
+    plan: zfile::BuildPlan,
+    shared: std::sync::Arc<Shared>,
+    slots: usize,
+    /// `SUPDB_ZPAGES_TRACE`: one line a build, its wall, CPU and major
+    /// faults, which say whether it read the output warm.
+    trace: bool,
+    epoch: std::time::Instant,
+}
+
+impl ZFinish {
+    /// `name`'s form file built on a thread of its own once a slot is
+    /// free; the merge's thread waits for the slot. The count of builds in
+    /// flight is bumped before the thread exists, so that a wait for every
+    /// build to end reads it whole.
+    fn build(&self, name: &str) {
+        let (Some(id), Some(end)) = (Db::name_id(name), Db::name_end_seq(name)) else {
+            return;
+        };
+        let path = self.dir.join(name);
+        let out = self.dir.join(zfile::zpg_name(id, end));
+        let shared = self.shared.clone();
+        loop {
+            let n = shared.z_finish_live.load(AtomicOrdering::Acquire);
+            if n < self.slots
+                && shared
+                    .z_finish_live
+                    .compare_exchange(n, n + 1, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+                    .is_ok()
+            {
+                break;
+            }
+            zfile::ZEvents::add(&shared.z.finish_waits, 1);
+            std::thread::park_timeout(MAINT_LAND_POLL);
+        }
+        zfile::ZEvents::add(&shared.z.finish_starts, 1);
+        shared
+            .z_finish_names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(name.to_string());
+        let plan = self.plan.clone();
+        let hold = shared.zbuild_hold.clone();
+        let (trace, epoch, label) = (self.trace, self.epoch, name.to_string());
+        let spawned = std::thread::Builder::new()
+            .name("supdb-zbuild".into())
+            .spawn(move || {
+                zbuild_hold_wait(&hold, ZHOLD_START);
+                let r = File::open(&path).and_then(|f| zfile::build_file(f, &out, id, end, &plan));
+                let ev = &shared.z;
+                match r {
+                    Ok(zfile::Outcome::Built(b)) => {
+                        if trace {
+                            eprintln!(
+                                "zfinish t={:.1} {label} wall_ms {} cpu_ms {} majflt {} file_mb {:.1}",
+                                epoch.elapsed().as_secs_f64(),
+                                b.wall_us / 1000,
+                                b.cpu_us / 1000,
+                                b.majflt,
+                                b.file_bytes as f64 / 1e6
+                            );
+                        }
+                        ev.built(&b);
+                        zfile::ZEvents::add(&ev.prebuilt, 1);
+                        zfile::ZEvents::add(&ev.finish_builds, 1);
+                    }
+                    Ok(zfile::Outcome::Declined(d)) => ev.declined(d),
+                    Ok(zfile::Outcome::Cancelled) => zfile::ZEvents::add(&ev.build_cancelled, 1),
+                    Err(_) => zfile::ZEvents::add(&ev.finish_failed, 1),
+                }
+                z_finish_release(&shared, &label);
+                shared.z_finish_live.fetch_sub(1, AtomicOrdering::AcqRel);
+            });
+        if spawned.is_err() {
+            zfile::ZEvents::add(&self.shared.z.finish_failed, 1);
+            z_finish_release(&self.shared, name);
+            self.shared
+                .z_finish_live
+                .fetch_sub(1, AtomicOrdering::AcqRel);
+        }
+    }
+}
+
+/// `name` no longer being built at its merge's output finish: one entry
+/// taken out, since an output is built once.
+fn z_finish_release(shared: &Shared, name: &str) {
+    let mut names = shared
+        .z_finish_names
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = names.iter().position(|n| n == name) {
+        names.swap_remove(i);
+    }
+}
+
+/// The live partitions against the form files on disk, by the sample's rule
+/// (`Maint::z_files_cover`).
+#[derive(Clone, Copy, Debug, Default)]
+struct ZCover {
+    /// Partitions counted: not declined (a refused coding aside) and not a
+    /// merge's input.
+    counted: usize,
+    /// Of them, with a form file on disk or attached.
+    on_disk: usize,
+    /// Their keys, and the keys of those on disk, missing a file, and
+    /// uncovered: missing with no build in flight and no resident records
+    /// to stand in.
+    nkeys: u64,
+    on_disk_keys: u64,
+    missing_keys: u64,
+    uncovered_keys: u64,
+}
+
+impl ZCover {
+    /// Whether the files on disk cover the keys the install needs
+    /// (`zselect::COVERED_ENOUGH`).
+    fn covers(&self) -> bool {
+        self.on_disk > 0
+            && self.uncovered_keys as f64 <= (1.0 - zselect::COVERED_ENOUGH) * self.nkeys as f64
+    }
+}
+
+/// What a sampler's reading is refreshed from (`Maint::z_sample_refresh`):
+/// its costs, the fill's time a record, and the attach's price a file.
+#[derive(Clone, Copy, Debug)]
+struct ZReading {
+    costs: zselect::Costs,
+    fill_per_record: f64,
+    attach_per_file: f64,
+}
+
+/// Waits for every build at a merge's output finish to end.
+fn z_finish_wait(shared: &Shared) {
+    while shared.z_finish_live.load(AtomicOrdering::Acquire) > 0 {
+        std::thread::park_timeout(MAINT_LAND_POLL);
+    }
 }
 
 /// What the builder's thread is running: a build, or a warm of an attached
@@ -11609,6 +11784,8 @@ struct MergePlan {
     /// Each input's key section verified against its checksum row again
     /// as the merge opens it (`Options::merge_verifies_inputs`).
     verify_inputs: bool,
+    /// The builds at each output's finish (`Options::zpages_build_at_finish`).
+    zfinish: Option<std::sync::Arc<ZFinish>>,
 }
 
 fn compact_job(plan: MergePlan) -> Result<Vec<String>> {
@@ -12060,6 +12237,9 @@ struct Emitter<'a> {
     r: usize,
     w: Option<PieceWriter>,
     out: Vec<String>,
+    /// Each output's form file built as it is finished
+    /// (`Options::zpages_build_at_finish`).
+    zfinish: Option<std::sync::Arc<ZFinish>>,
 }
 
 impl Emitter<'_> {
@@ -12135,6 +12315,11 @@ impl Emitter<'_> {
             write_ord(self.dir, &p.name, &ord, self.ord_durable)?;
             std::fs::rename(&p.tmp, self.dir.join(&p.name))?;
             self.out.push(p.name.clone());
+            // Its form file, from the pages just written, while the merge
+            // goes on to the next output.
+            if let Some(z) = &self.zfinish {
+                z.build(&p.name);
+            }
             self.pi += 1;
         }
         Ok(())
@@ -12199,6 +12384,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         drop_chunk,
         walk_cached,
         verify_inputs,
+        zfinish,
     } = plan;
     let mut steps = MergeSteps::new();
     if background_io == BackgroundIo::Idle {
@@ -12312,6 +12498,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         r: 0,
         w: None,
         out: Vec::new(),
+        zfinish: zfinish.clone(),
     };
     // Tombstones end here. Every merge writes the bottom level, so for each
     // key the inputs older than its newest flagged extent are dropped, the
@@ -12449,6 +12636,8 @@ struct TierPlan {
     walk_cached: bool,
     /// Each input's key section verified again (`MergePlan::verify_inputs`).
     verify_inputs: bool,
+    /// The builds at each output's finish (`Options::zpages_build_at_finish`).
+    zfinish: Option<std::sync::Arc<ZFinish>>,
 }
 
 /// A merge's inputs, each mapped by name for the merge's own walk. With
@@ -12507,6 +12696,7 @@ fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
         ord_durable,
         walk_cached,
         verify_inputs,
+        zfinish,
     } = plan;
     if background_io == BackgroundIo::Idle {
         idle_io_priority();
@@ -12545,6 +12735,7 @@ fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
         r: 0,
         w: None,
         out: Vec::new(),
+        zfinish: zfinish.clone(),
     };
     merge_ranks(&blobs, walk_cached, |k, tied| {
         let mut start = 0usize;
@@ -14154,6 +14345,14 @@ struct Shared {
     /// A test's holds on the builder's thread (`ZHOLD_START`,
     /// `ZHOLD_RENAME`), shared with the build's plan.
     zbuild_hold: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// Builds at a merge's output finish in flight
+    /// (`Options::zpages_build_at_finish`), bumped before each starts.
+    z_finish_live: std::sync::atomic::AtomicUsize,
+    /// The outputs those builds are of, by name, each from its slot taken
+    /// to its thread's end: an output being built at its finish is a build
+    /// in flight -- not built ahead again, and in flight for the sample's
+    /// count -- until its file is on disk.
+    z_finish_names: std::sync::Mutex<Vec<String>>,
     /// A test's: the next form file build fails as a write error would.
     fail_zbuild: std::sync::atomic::AtomicBool,
     /// A test's: `Options::zpages_hold_after_settle`, as it stands.
@@ -18616,6 +18815,11 @@ impl Reader {
             build_ahead_bytes: get(&ev.build_ahead_bytes),
             build_cancelled: get(&ev.build_cancelled),
             prebuilt: get(&ev.prebuilt),
+            finish_starts: get(&ev.finish_starts),
+            finish_builds: get(&ev.finish_builds),
+            finish_failed: get(&ev.finish_failed),
+            finish_waits: get(&ev.finish_waits),
+            finish_live: self.shared.z_finish_live.load(AtomicOrdering::Acquire) as u64,
             ahead_paired: get(&ev.ahead_paired),
             ahead_cold: get(&ev.ahead_cold),
             ahead_recoded: get(&ev.ahead_recoded),
@@ -18668,6 +18872,7 @@ impl Reader {
             sampled: get(&ev.sampled),
             sample_declined: get(&ev.sample_declined),
             sample_us: get(&ev.sample_us),
+            sample_refreshed: get(&ev.sample_refreshed),
             sample_w_z_bytes: get(&ev.sample_w_z),
             sample_w_z_raw_bytes: get(&ev.sample_w_z_raw),
             coding_picks_block: get(&ev.coding_picks[0]),
@@ -26261,6 +26466,8 @@ impl Db {
             retired_z: RetireList::new(),
             next_dead: AtomicU64::new(1),
             zbuild_hold: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(zhold_of(&opts))),
+            z_finish_live: std::sync::atomic::AtomicUsize::new(0),
+            z_finish_names: std::sync::Mutex::new(Vec::new()),
             fail_zbuild: std::sync::atomic::AtomicBool::new(false),
             zsettle_hold: std::sync::atomic::AtomicBool::new(opts.zpages_hold_after_settle),
             zgate: ZGate::new(opts.zpages),
@@ -26798,6 +27005,8 @@ impl Db {
             retired_z: RetireList::new(),
             next_dead: AtomicU64::new(1),
             zbuild_hold: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(zhold_of(&opts))),
+            z_finish_live: std::sync::atomic::AtomicUsize::new(0),
+            z_finish_names: std::sync::Mutex::new(Vec::new()),
             fail_zbuild: std::sync::atomic::AtomicBool::new(false),
             zsettle_hold: std::sync::atomic::AtomicBool::new(opts.zpages_hold_after_settle),
             zgate: ZGate::new(opts.zpages),
@@ -35474,6 +35683,13 @@ struct Maint {
     z_sampling: Option<ZSampling>,
     z_sample_ready: Option<zselect::Sampler>,
     z_sample_size: Option<(u64, u64, f64)>,
+    /// What the last sample read, for a reading refreshed in place of a
+    /// sample; the generation the selector was last handed; and whether a
+    /// landing asked for a refresh under one generation
+    /// (`z_sample_refresh`).
+    z_sample_last: Option<ZReading>,
+    z_handed_gen: u64,
+    z_refresh_due: bool,
     /// The coding the selector chose at its last reading
     /// (`Options::zpages_coding_auto`, `zselect::choose_coding`), which the
     /// builds after it are planned in; none until a reading with both
@@ -35526,6 +35742,10 @@ struct Maint {
     /// The partitions re-parsed while served (`Options::zpages_reparse`),
     /// by segment name, so that each is re-parsed once while it lives.
     z_reparsed: std::collections::HashSet<String>,
+    /// The builds at a merge's output finish counted at the last tick
+    /// (`Options::zpages_build_at_finish`): a tick that finds more asks
+    /// the selector for a fresh reading where their files cover the keys.
+    z_finish_seen: u64,
     /// The last look's refaults were past `RECODE_REFAULTS`: a flip asks
     /// for none of the incoming file's pages.
     z_recode_pressed: bool,
@@ -35706,12 +35926,14 @@ impl Maint {
                 self.join_seal(false)?;
                 self.join_compact()?;
                 self.join_tier()?;
+                z_finish_wait(&self.shared);
                 self.sync_owed_slot()
             }
             MaintAsk::ZSettle => {
                 self.join_seal(false)?;
                 self.join_compact()?;
                 self.join_tier()?;
+                z_finish_wait(&self.shared);
                 // Every partition given its form file or its reason, one
                 // build at a time, with whatever lands meanwhile landed:
                 // a merge's outputs are partitions of their own and get
@@ -35993,6 +36215,7 @@ impl Maint {
             b.cancel.store(true, AtomicOrdering::Release);
             b.job.join();
         }
+        z_finish_wait(&self.shared);
         if let Some(s) = self.z_sampling.take() {
             let _ = s.handle.join();
         }
@@ -36086,6 +36309,9 @@ impl Maint {
             z_sampling: None,
             z_sample_ready: None,
             z_sample_size: None,
+            z_sample_last: None,
+            z_handed_gen: u64::MAX,
+            z_refresh_due: false,
             z_coding_pick: None,
             z_report: zselect::Build::default(),
             z_scan_len: 0.0,
@@ -36103,6 +36329,7 @@ impl Maint {
             z_recode_ceiling: None,
             z_spare_failed: std::collections::HashSet::new(),
             z_reparsed: std::collections::HashSet::new(),
+            z_finish_seen: 0,
             z_recode_pressed: false,
         }
     }
@@ -36916,6 +37143,7 @@ impl Maint {
             ord_durable: self.opts.ord_durable,
             walk_cached: self.opts.merge_walk_cached,
             verify_inputs: self.opts.merge_verifies_inputs,
+            zfinish: self.z_finish_plan(),
         };
         let wake = self.wake.clone();
         let handle = std::thread::spawn(move || {
@@ -38190,6 +38418,26 @@ impl Maint {
                 self.z_footprint(),
             )
         };
+        // A reading the selector would drop at this generation -- one just
+        // collected at another, or the one it holds -- or one that refused
+        // the attach for want of files a landing has since put on disk, is
+        // refreshed from the last sample and a count of the files, where
+        // files land under the store's own writing (`z_sample_refresh`).
+        if self.zsel.phase() == zselect::Phase::Suspect {
+            let stale = self
+                .z_sample_ready
+                .as_ref()
+                .is_some_and(|s| s.generation != generation);
+            let gone = self.z_sample_ready.is_none()
+                && (self.zsel.sampler_attach().is_none()
+                    || generation != self.z_handed_gen
+                    || self.z_refresh_due);
+            if stale || gone {
+                self.z_sample_refresh(generation);
+            }
+        }
+        self.z_refresh_due = false;
+        self.z_handed_gen = generation;
         let input = zselect::Input {
             now,
             model,
@@ -38467,7 +38715,8 @@ impl Maint {
             on_disk += usize::from(on);
             if !on {
                 missing_keys = missing_keys.saturating_add(seg.blob.keys() as u64);
-                let in_flight = self.opts.zpages_cover_resident && self.z_building_ahead(&seg.name);
+                let in_flight = self.z_finishing(&seg.name)
+                    || (self.opts.zpages_cover_resident && self.z_building_ahead(&seg.name));
                 if !in_flight && !self.z_covers_resident(&seg) {
                     uncovered_keys = uncovered_keys.saturating_add(seg.blob.keys() as u64);
                 }
@@ -38549,33 +38798,16 @@ impl Maint {
         // The attach reads the trailer, the resident part and sixteen
         // sampled pages of each file, each a page the device may fault.
         let attach = (resident as f64 / zselect::PAGE as f64 + 17.0 * counted as f64) * priced_t_f;
-        // Every file on disk: the attach. Some: the attach of those and the
-        // build of the rest, over the keys of the partitions without one --
-        // a build ahead at landing leaves the partitions the load pushed out
-        // of the page cache to this build, and priced as the whole build
-        // the files on disk bought the controller nothing. Where resident
-        // records count as covering a partition and the builds ahead are
-        // due (`Options::zpages_cover_resident`), over the keys left
-        // uncovered: the builds ahead build every partition whose records
-        // are resident whether the controller buys or not, and pass over
-        // the rest as cold by the same line, and a build in flight is paid
-        // already, so the buy causes the others alone -- priced over all
-        // three of the drain's partitions in flight, the buy at ten million
-        // keys under 1.25 GiB came 1.4 s into C for the rent to reach a
-        // second's price.
-        let priced_keys = if self.z_land_due {
-            uncovered_keys
-        } else {
-            missing_keys
-        };
-        let c_build = if !declined && on_disk == counted {
-            attach
-        } else if !declined && on_disk > 0 {
-            attach * on_disk as f64 / counted as f64
-                + zselect::ski_rental_price(fill_per_record * priced_keys as f64, None)
-        } else {
-            zselect::ski_rental_price(build_cpu, None)
-        };
+        let c_build = self.z_price(
+            declined,
+            on_disk,
+            counted,
+            attach,
+            fill_per_record,
+            nkeys,
+            missing_keys,
+            uncovered_keys,
+        );
         let pages_per_key = if nkeys > 0 {
             pages as f64 / nkeys as f64
         } else {
@@ -38598,6 +38830,15 @@ impl Maint {
         };
         self.z_sample_size = (!declined).then_some((w_z, resident, pages_per_key));
         ev.sample_w_z.store(w_z, AtomicOrdering::Relaxed);
+        self.z_sample_last = Some(ZReading {
+            costs,
+            fill_per_record,
+            attach_per_file: if counted > 0 {
+                attach / counted as f64
+            } else {
+                0.0
+            },
+        });
         self.z_sample_ready = Some(zselect::Sampler {
             costs,
             c_build,
@@ -38612,6 +38853,144 @@ impl Maint {
                 "zsample partitions {counted} declined {declined} on_disk {on_disk} keys {nkeys} records {recs_len} w_z {w_z} resident {resident} build_cpu {build_cpu:.4} c_build {c_build:.4} t_f {t_f:?} decode_per_page {decode_per_page:.3e} coding {:?} w_z_raw {}",
                 self.z_coding_pick,
                 raw.w_z
+            );
+        }
+    }
+
+    /// The price of the purchase a reading offers, as the ski rental prices
+    /// it. Every file on disk: the attach. Some: the attach of those and
+    /// the build of the rest, over the keys of the partitions without one
+    /// -- a build ahead at landing leaves the partitions the load pushed
+    /// out of the page cache to this build, and priced as the whole build
+    /// the files on disk bought the controller nothing. Where resident
+    /// records count as covering a partition and the builds ahead are due
+    /// (`Options::zpages_cover_resident`), over the keys left uncovered:
+    /// the builds ahead build every partition whose records are resident
+    /// whether the controller buys or not, and pass over the rest as cold
+    /// by the same line, and a build in flight is paid already, so the buy
+    /// causes the others alone -- priced over all three of the drain's
+    /// partitions in flight, the buy at ten million keys under 1.25 GiB
+    /// came 1.4 s into C for the rent to reach a second's price.
+    #[allow(clippy::too_many_arguments)]
+    fn z_price(
+        &self,
+        declined: bool,
+        on_disk: usize,
+        counted: usize,
+        attach: f64,
+        fill_per_record: f64,
+        nkeys: u64,
+        missing_keys: u64,
+        uncovered_keys: u64,
+    ) -> f64 {
+        let priced_keys = if self.z_land_due {
+            uncovered_keys
+        } else {
+            missing_keys
+        };
+        if !declined && on_disk == counted {
+            attach
+        } else if !declined && on_disk > 0 {
+            attach * on_disk as f64 / counted as f64
+                + zselect::ski_rental_price(fill_per_record * priced_keys as f64, None)
+        } else {
+            zselect::ski_rental_price(fill_per_record * nkeys as f64, None)
+        }
+    }
+
+    /// The live partitions against the form files on disk, by the sample's
+    /// rule (`z_sample_collect`): counted unless declined (a refused coding
+    /// aside) or a merge's input; on disk, or attached; else missing, and
+    /// uncovered unless a build is in flight for it -- ahead where resident
+    /// records count, or at its merge's output finish -- or its resident
+    /// records stand in. The stand-ins count beside a form mostly on disk
+    /// (`stands_in`).
+    fn z_files_cover(&self) -> ZCover {
+        let mut c = ZCover::default();
+        let _op = self.op();
+        for seg in self.segs().iter().filter(|s| s.level > 0) {
+            if self.in_flight_input(&seg.name) {
+                continue;
+            }
+            let why = seg.z_declined.load(AtomicOrdering::Relaxed);
+            if why != 0 && why != zfile::DECLINED_REFUSED {
+                continue;
+            }
+            c.counted += 1;
+            let keys = seg.blob.keys() as u64;
+            c.nkeys = c.nkeys.saturating_add(keys);
+            let on = seg.z.get().is_some()
+                || Db::name_id(&seg.name)
+                    .zip(Db::name_end_seq(&seg.name))
+                    .is_some_and(|(id, end)| self.dir.join(zfile::zpg_name(id, end)).is_file());
+            if on {
+                c.on_disk += 1;
+                c.on_disk_keys = c.on_disk_keys.saturating_add(keys);
+            } else {
+                c.missing_keys = c.missing_keys.saturating_add(keys);
+                let in_flight = self.z_finishing(&seg.name)
+                    || (self.opts.zpages_cover_resident && self.z_building_ahead(&seg.name));
+                if !in_flight && !self.z_covers_resident(seg) {
+                    c.uncovered_keys = c.uncovered_keys.saturating_add(keys);
+                }
+            }
+        }
+        if !stands_in(
+            c.on_disk_keys,
+            c.on_disk_keys.saturating_add(c.missing_keys),
+        ) {
+            c.uncovered_keys = c.missing_keys;
+        }
+        c
+    }
+
+    /// The sampler's last reading refreshed for the partitions as they stand
+    /// and handed to the selector at `generation`, where form files land
+    /// under the store's own writing (`Options::zpages_build_at_finish`,
+    /// `Options::zpages_ahead_past_scans`): the files counted again, cheaply,
+    /// the purchase priced on the count with the reading's own costs. A
+    /// reading is of the partitions at a generation and the selector drops
+    /// one taken at another, so under a chain of merges, a landing every
+    /// half second and a sample longer than that, no reading reached a step:
+    /// forty-one samples ran through one pass of fifteen seconds, each over
+    /// every partition's pages on the thread the landings go through, and
+    /// the attach the files on disk offered was never bought.
+    fn z_sample_refresh(&mut self, generation: u64) {
+        if !(self.opts.zpages_build_at_finish || self.opts.zpages_ahead_past_scans) {
+            return;
+        }
+        let Some(last) = self.z_sample_last else {
+            return;
+        };
+        let c = self.z_files_cover();
+        let declined = c.counted == 0;
+        let attach = !declined && c.covers();
+        let c_build = self.z_price(
+            declined,
+            c.on_disk,
+            c.counted,
+            last.attach_per_file * c.counted as f64,
+            last.fill_per_record,
+            c.nkeys,
+            c.missing_keys,
+            c.uncovered_keys,
+        );
+        self.z_sample_ready = Some(zselect::Sampler {
+            costs: last.costs,
+            c_build,
+            declined,
+            generation,
+            attach,
+        });
+        zfile::ZEvents::add(&self.shared.z.sample_refreshed, 1);
+        if self.z_trace {
+            eprintln!(
+                "zrefresh t={:.1} partitions {} on_disk {} uncovered {} of {} attach {attach} c_build {c_build:.4}",
+                self.z_epoch.elapsed().as_secs_f64(),
+                c.counted,
+                c.on_disk,
+                c.uncovered_keys,
+                c.nkeys
             );
         }
     }
@@ -38709,6 +39088,14 @@ impl Maint {
                 b.cancel.store(true, AtomicOrdering::Release);
             }
         }
+        // The builds at a merge's output finish that landed since the last
+        // tick (`Options::zpages_build_at_finish`): where their files cover
+        // the keys the attach needs, the reading that refused it is dropped.
+        let finished = self.shared.z.finish_builds.load(AtomicOrdering::Relaxed);
+        if finished != self.z_finish_seen {
+            self.z_finish_seen = finished;
+            self.z_prebuilt_landed();
+        }
         // Once the form is installed and the builder has nothing due, the
         // re-code policy's turn (`Options::zpages_recode_auto`,
         // `Options::zpages_reparse`).
@@ -38741,61 +39128,24 @@ impl Maint {
         }
     }
 
-    /// The partitions with a form file on disk and none attached, neither a
-    /// merge's input nor built ahead in either slot, nor declined but for a
-    /// refused coding: what a buy attaches before it builds.
-    /// A build ahead landed dormant (`Options::zpages_ahead_past_scans`):
-    /// where the selector holds a reading that refused the attach for want
-    /// of files on disk, and the files now cover the keys the install needs
-    /// by the sample's own rule (`z_sample_collect`: on disk, or resident or
-    /// building ahead beside a form mostly on disk), the reading is dropped
-    /// so that the next step samples again and the attach on the prediction
-    /// can follow. A dormant landing changes no generation, so nothing else
-    /// would ask.
+    /// A build ahead landed dormant (`Options::zpages_ahead_past_scans`), or
+    /// a build at a merge's output finish ended
+    /// (`Options::zpages_build_at_finish`): where the selector holds a
+    /// reading that refused the attach for want of files on disk, the next
+    /// tick refreshes it against the files as they are (`z_sample_refresh`),
+    /// so that the attach can follow files that landed under one generation,
+    /// which nothing else would ask for.
     fn z_prebuilt_landed(&mut self) {
-        if !self.opts.zpages_ahead_past_scans || self.zsel.sampler_attach() != Some(false) {
-            return;
-        }
-        let (mut on_disk, mut nkeys, mut on_disk_keys, mut missing_keys, mut uncovered_keys) =
-            (0usize, 0u64, 0u64, 0u64, 0u64);
+        if (self.opts.zpages_ahead_past_scans || self.opts.zpages_build_at_finish)
+            && self.zsel.sampler_attach() == Some(false)
         {
-            let _op = self.op();
-            for seg in self.segs().iter().filter(|s| s.level > 0) {
-                if self.in_flight_input(&seg.name) {
-                    continue;
-                }
-                let keys = seg.blob.keys() as u64;
-                nkeys = nkeys.saturating_add(keys);
-                let on = seg.z.get().is_some()
-                    || Db::name_id(&seg.name)
-                        .zip(Db::name_end_seq(&seg.name))
-                        .is_some_and(|(id, end)| self.dir.join(zfile::zpg_name(id, end)).is_file());
-                on_disk += usize::from(on);
-                if on {
-                    on_disk_keys = on_disk_keys.saturating_add(keys);
-                } else {
-                    missing_keys = missing_keys.saturating_add(keys);
-                    let in_flight =
-                        self.opts.zpages_cover_resident && self.z_building_ahead(&seg.name);
-                    if !in_flight && !self.z_covers_resident(seg) {
-                        uncovered_keys = uncovered_keys.saturating_add(keys);
-                    }
-                }
-            }
-        }
-        if !stands_in(on_disk_keys, on_disk_keys.saturating_add(missing_keys)) {
-            uncovered_keys = missing_keys;
-        }
-        let covers =
-            on_disk > 0 && uncovered_keys as f64 <= (1.0 - zselect::COVERED_ENOUGH) * nkeys as f64;
-        if covers && self.zsel.resample() && self.z_trace {
-            eprintln!(
-                "zresample t={:.1} on_disk {on_disk} uncovered {uncovered_keys} of {nkeys}",
-                self.z_epoch.elapsed().as_secs_f64()
-            );
+            self.z_refresh_due = true;
         }
     }
 
+    /// The partitions with a form file on disk and none attached, neither a
+    /// merge's input nor built ahead in either slot, nor declined but for a
+    /// refused coding: what a buy attaches before it builds.
     fn z_unattached_on_disk(&self) -> Vec<std::sync::Arc<Seg>> {
         let _op = self.op();
         self.segs()
@@ -38857,13 +39207,27 @@ impl Maint {
         self.z_prebuild_pending() && !self.opts.zpages_cover_resident
     }
 
-    /// Whether a build ahead is in flight for `name`, in either slot.
+    /// Whether a build ahead is in flight for `name`, in either slot, or a
+    /// build at its merge's output finish.
     fn z_building_ahead(&self, name: &str) -> bool {
         self.z_ahead_holds(name)
             || self
                 .zbuild
                 .as_ref()
                 .is_some_and(|b| b.dormant && b.seg.name == name)
+            || self.z_finishing(name)
+    }
+
+    /// Whether `name`'s form file is being built at its merge's output
+    /// finish (`Options::zpages_build_at_finish`), from the build's slot
+    /// taken to its thread's end.
+    fn z_finishing(&self, name: &str) -> bool {
+        self.shared
+            .z_finish_names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|n| n == name)
     }
 
     /// Whether `seg`'s raw records count as covering it for want of a form
@@ -38885,6 +39249,55 @@ impl Maint {
     /// Whether the second build ahead holds `name` (`Maint::zahead`).
     fn z_ahead_holds(&self, name: &str) -> bool {
         self.zahead.as_ref().is_some_and(|b| b.seg.name == name)
+    }
+
+    /// The builds at a merge's output finish (`Options::zpages_build_at_finish`),
+    /// where forms are wanted: under the controller, the store past the share
+    /// of its budget the builds ahead start at, past its budget, or the form
+    /// installed. The plan is the builds ahead's: past the selector's line,
+    /// or installed, the records behind a build are dropped as a bought
+    /// build's are and its file kept; under it the file's pages go and the
+    /// records stay.
+    fn z_finish_plan(&self) -> Option<std::sync::Arc<ZFinish>> {
+        if !self.opts.zpages_build_at_finish || !self.z_auto || self.opts.zpages_land_pct == 0 {
+            return None;
+        }
+        let installed = self.zsel.counts().installs > 0;
+        if !(installed || self.z_past_budget || self.z_land_due) {
+            return None;
+        }
+        let past = installed || self.z_land_past;
+        let mut plan = zfile::BuildPlan::new(
+            self.opts.zpages_min_bytes,
+            self.opts.zpages_drop_behind && past && self.opts.zpages_land_drop_past,
+        );
+        plan.drop_output = !past;
+        plan.sync = self.opts.zpages_build_sync && plan.drop_output;
+        plan.ahead = self.opts.zpages_build_ahead;
+        plan.group_bytes = self.opts.zpages_group_bytes;
+        let (coding, raw_tails) = match self.z_coding_pick {
+            Some(zselect::Coding::RawTails) if self.opts.zpages_coding_auto => {
+                (zpages::ZCODING_RECORD, true)
+            }
+            Some(zselect::Coding::Block) if self.opts.zpages_coding_auto => {
+                (zpages::ZCODING_BLOCK, false)
+            }
+            _ => (self.opts.z_coding(), self.opts.zpages_raw_tails),
+        };
+        plan.coding = coding;
+        plan.store_all = self.opts.zpages_store_all;
+        plan.raw_tails = raw_tails;
+        plan.parse = self.opts.zpages_parse;
+        plan.own_decode = self.opts.zpages_own_decoder;
+        plan.hold = Some(self.shared.zbuild_hold.clone());
+        Some(std::sync::Arc::new(ZFinish {
+            dir: self.dir.clone(),
+            plan,
+            shared: self.shared.clone(),
+            slots: self.opts.zpages_ahead_builders.max(1),
+            trace: self.z_trace,
+            epoch: self.z_epoch,
+        }))
     }
 
     /// The partition a build ahead takes next (`Options::zpages_prebuild`),
@@ -38952,6 +39365,7 @@ impl Maint {
             .filter(|s| s.level > 0)
             .filter(|s| !self.in_flight_input(&s.name))
             .filter(|s| !self.z_ahead_holds(&s.name))
+            .filter(|s| !self.z_finishing(&s.name))
             .filter(|s| !self.zbuild.as_ref().is_some_and(|b| b.seg.name == s.name))
             .filter(|s| s.z.get().is_none())
             .filter(|s| s.z_declined.load(AtomicOrdering::Relaxed) == 0)
@@ -39483,8 +39897,9 @@ impl Maint {
                 || (d.phase == zselect::Phase::Building && ops > 0))
         {
             let (saving, vanished) = self.zsel.evidence_state();
+            let buy = self.zsel.buy_state(input.now);
             eprintln!(
-                "zselect {:?} gate {} census {} build {} sample {} event {:?} model {:?} e2 {:?} costs {:?} win r {}/{} s {}/{} refaults {:?} saving {:?} vanished {} theta {:.4}/{:.4} foot {}/{} gen {:x} inflight {}{}{}",
+                "zselect {:?} gate {} census {} build {} sample {} event {:?} model {:?} e2 {:?} costs {:?} win r {}/{} s {}/{} refaults {:?} saving {:?} vanished {} theta {:.4}/{:.4} foot {}/{} gen {:x} inflight {}{}{} buy {:?}",
                 d.phase,
                 d.gate,
                 d.census,
@@ -39509,6 +39924,7 @@ impl Maint {
                 u8::from(!self.compacting.is_empty()),
                 u8::from(self.tiering.is_some()),
                 self.sealing.len(),
+                buy,
             );
         }
     }
@@ -39543,7 +39959,10 @@ impl Maint {
     /// `z_next` over the jobs `take` admits.
     fn z_next_where(&self, take: impl Fn(ZKind) -> bool) -> Option<(std::sync::Arc<Seg>, ZKind)> {
         for s in self.segs().iter().filter(|s| s.level > 0) {
-            if self.in_flight_input(&s.name) || self.z_ahead_holds(&s.name) {
+            if self.in_flight_input(&s.name)
+                || self.z_ahead_holds(&s.name)
+                || self.z_finishing(&s.name)
+            {
                 continue;
             }
             let why = s.z_declined.load(AtomicOrdering::Relaxed);
@@ -40353,6 +40772,7 @@ impl Maint {
         let drop_chunk = self.opts.merge_drop_chunk;
         let walk_cached = self.opts.merge_walk_cached;
         let verify_inputs = self.opts.merge_verifies_inputs;
+        let zfinish = self.z_finish_plan();
         let job_inputs = inputs.clone();
         let kept_fences = fences.clone();
         let wake = self.wake.clone();
@@ -40378,6 +40798,7 @@ impl Maint {
                 drop_chunk,
                 walk_cached,
                 verify_inputs,
+                zfinish,
             });
             // A test's hold before the landing (`Db::hold_merge_landing`).
             while held.merge_hold.load(AtomicOrdering::Acquire) & MERGE_HOLD_LANDING != 0 {
@@ -40489,6 +40910,10 @@ impl Maint {
         self.rank_before_publish(&merged)?;
         self.publish_segs(merged);
         self.publish()?;
+        // The outputs' files built at their finish
+        // (`Options::zpages_build_at_finish`) may cover the keys the attach
+        // needs: the reading that refused it is dropped where they do.
+        self.z_prebuilt_landed();
         for name in &inputs {
             self.retire_seg(name);
         }
