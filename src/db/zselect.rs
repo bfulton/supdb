@@ -1336,6 +1336,20 @@ impl ZSelect {
     /// the settle after an ordered load's drain came two seconds into the
     /// reads it was for. Work in flight still holds it, as it holds the
     /// settle, and every other clause of the buy stands.
+    /// The attach flag of the sampler's reading, where one stands.
+    pub fn sampler_attach(&self) -> Option<bool> {
+        self.sampler.map(|s| s.attach)
+    }
+
+    /// Drops the sampler's reading, so that the next step in SUSPECT asks
+    /// for a sample again: for the files on disk changing under one
+    /// generation, which a build ahead's dormant landing does
+    /// (`Options::zpages_ahead_past_scans`). True where a reading was
+    /// dropped.
+    pub fn resample(&mut self) -> bool {
+        self.sampler.take().is_some()
+    }
+
     pub fn set_attach_on_reads(&mut self, on: bool) {
         self.attach_on_reads = on;
     }

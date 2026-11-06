@@ -1474,6 +1474,23 @@ pub struct Options {
     /// scans: `supdb-landnearscans`, `supdb-ingestlandnearscans`.
     #[doc(hidden)]
     pub zpages_land_scans_far: bool,
+    /// EXPERIMENT: past the selector's line to enter (`z_land_past`), the
+    /// builds ahead at landing run beside scans -- the hold for scans near
+    /// (`zpages_land_scans_far`) applies under the line alone -- and a
+    /// build ahead whose landing brings the files on disk to the install's
+    /// coverage (`zselect::COVERED_ENOUGH`) has the selector drop the
+    /// reading that refused the attach for want of them and sample again,
+    /// so the attach on the prediction follows. The hold was drawn when a
+    /// store that was scanned and never point-read gave the controller
+    /// nothing to buy on; its scans' faults are evidence now, and at ten
+    /// million keys under 1.25 GiB the lag sweep's store -- every partition
+    /// fresh from the shuffled load's last merge, two files of twenty-four
+    /// on disk -- bought on the rent thirty seconds after its sample, its
+    /// ten-percent pass walking the raw form at 1.7 major faults a scan the
+    /// while, since the files that make the attach cheap were held by the
+    /// scans they would have served (`docs/engine.md`). Off.
+    #[doc(hidden)]
+    pub zpages_ahead_past_scans: bool,
     /// Whether a build ahead (`zpages_land_pct`, `zpages_prebuild`) drops
     /// the raw records behind it, as a bought build does
     /// (`zpages_drop_behind`), once the model's prediction of the raw
@@ -3883,6 +3900,7 @@ impl Default for Options {
             zpages_land_drop_past: true,
             zpages_build_sync: true,
             zpages_land_cold_past: true,
+            zpages_ahead_past_scans: false,
             zpages_group_bytes: zpages::ZGROUP_BYTES,
             zpages_record_coding: false,
             zpages_store_all: false,
@@ -38726,6 +38744,58 @@ impl Maint {
     /// The partitions with a form file on disk and none attached, neither a
     /// merge's input nor built ahead in either slot, nor declined but for a
     /// refused coding: what a buy attaches before it builds.
+    /// A build ahead landed dormant (`Options::zpages_ahead_past_scans`):
+    /// where the selector holds a reading that refused the attach for want
+    /// of files on disk, and the files now cover the keys the install needs
+    /// by the sample's own rule (`z_sample_collect`: on disk, or resident or
+    /// building ahead beside a form mostly on disk), the reading is dropped
+    /// so that the next step samples again and the attach on the prediction
+    /// can follow. A dormant landing changes no generation, so nothing else
+    /// would ask.
+    fn z_prebuilt_landed(&mut self) {
+        if !self.opts.zpages_ahead_past_scans || self.zsel.sampler_attach() != Some(false) {
+            return;
+        }
+        let (mut on_disk, mut nkeys, mut on_disk_keys, mut missing_keys, mut uncovered_keys) =
+            (0usize, 0u64, 0u64, 0u64, 0u64);
+        {
+            let _op = self.op();
+            for seg in self.segs().iter().filter(|s| s.level > 0) {
+                if self.in_flight_input(&seg.name) {
+                    continue;
+                }
+                let keys = seg.blob.keys() as u64;
+                nkeys = nkeys.saturating_add(keys);
+                let on = seg.z.get().is_some()
+                    || Db::name_id(&seg.name)
+                        .zip(Db::name_end_seq(&seg.name))
+                        .is_some_and(|(id, end)| self.dir.join(zfile::zpg_name(id, end)).is_file());
+                on_disk += usize::from(on);
+                if on {
+                    on_disk_keys = on_disk_keys.saturating_add(keys);
+                } else {
+                    missing_keys = missing_keys.saturating_add(keys);
+                    let in_flight =
+                        self.opts.zpages_cover_resident && self.z_building_ahead(&seg.name);
+                    if !in_flight && !self.z_covers_resident(seg) {
+                        uncovered_keys = uncovered_keys.saturating_add(keys);
+                    }
+                }
+            }
+        }
+        if !stands_in(on_disk_keys, on_disk_keys.saturating_add(missing_keys)) {
+            uncovered_keys = missing_keys;
+        }
+        let covers =
+            on_disk > 0 && uncovered_keys as f64 <= (1.0 - zselect::COVERED_ENOUGH) * nkeys as f64;
+        if covers && self.zsel.resample() && self.z_trace {
+            eprintln!(
+                "zresample t={:.1} on_disk {on_disk} uncovered {uncovered_keys} of {nkeys}",
+                self.z_epoch.elapsed().as_secs_f64()
+            );
+        }
+    }
+
     fn z_unattached_on_disk(&self) -> Vec<std::sync::Arc<Seg>> {
         let _op = self.op();
         self.segs()
@@ -38850,7 +38920,11 @@ impl Maint {
             5
         } else if !land && !self.sealing.is_empty() {
             6
-        } else if land && self.opts.zpages_land_scans_far && self.scans_near() {
+        } else if land
+            && self.opts.zpages_land_scans_far
+            && self.scans_near()
+            && !(self.opts.zpages_ahead_past_scans && self.z_land_past)
+        {
             7
         } else {
             0
@@ -39986,6 +40060,7 @@ impl Maint {
             Ok(zfile::Outcome::Built(built)) if dormant && !self.z_want_build && live.is_some() => {
                 ev.built(&built);
                 zfile::ZEvents::add(&ev.prebuilt, 1);
+                self.z_prebuilt_landed();
             }
             Ok(zfile::Outcome::Built(built)) => match live {
                 Some(target) => {

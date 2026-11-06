@@ -7509,6 +7509,102 @@ fn builds_ahead_at_landing_wait_while_scans_are_around() {
     }
 }
 
+/// Past the selector's line the builds ahead at landing run beside scans
+/// (`Options::zpages_ahead_past_scans`): a store scanned and never
+/// point-read, its raw populations past its budget, builds its partitions
+/// ahead, and the landing that brings the files on disk to the install's
+/// coverage has the selector sample again, so the attach on the prediction
+/// follows and the form installs; without the option nothing is built
+/// ahead beside the scans, the first reading stands, and nothing installs.
+#[cfg(target_os = "linux")]
+#[test]
+fn builds_ahead_run_beside_scans_past_the_line_and_the_attach_follows() {
+    for on in [true, false] {
+        let what = format!("ahead past scans {on}");
+        let (dir, db, model, inject, raw) =
+            land_store_with(&format!("auto-ahead-scans-{on}"), 50, |o| {
+                o.zpages_ahead_past_scans = on;
+                o.partition_bytes = Some(400 << 10);
+            });
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let mut seen = 0usize;
+        db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
+        assert_eq!(seen, 10);
+        // Well past the line: the budget at half the raw populations, and
+        // the decode priced through the seam, so the line to enter is not
+        // the build profile's to draw.
+        inject.set_decode_cost(std::time::Duration::from_micros(1));
+        // The builds ahead held at their start, so that the first reading
+        // finds no file on disk and refuses the attach, as the store the
+        // lag sweep runs on did; in core they would land before it.
+        db.hold_zpage_build(on);
+        inject.set_budget(raw / 2);
+        if on {
+            // A build ahead at its hold, and the reading taken in by the
+            // selector with it there: no file on disk, so the reading
+            // refuses the attach.
+            assert!(
+                tick_until(&db, 200, |c| c.build_starts >= 1),
+                "{what}: nothing built ahead beside the scans: {:?}",
+                db.zpage_counts()
+            );
+            wait_for("a build ahead at its hold", || db.zpage_build_waiting());
+            // `sample_us` is written as the reading is collected, where the
+            // files on disk are counted; one tick more and the selector
+            // holds it.
+            assert!(
+                tick_until(&db, 200, |c| c.sample_us > 0),
+                "{what}: no reading: {:?}",
+                db.zpage_counts()
+            );
+            wait_steps(&db, 1);
+            let c = db.zpage_counts();
+            assert_eq!(
+                (
+                    c.prebuilt,
+                    c.sel_installs,
+                    c.samples,
+                    form_files(&dir).len()
+                ),
+                (0, 0, 1, 0),
+                "{what}: the reading taken with the builds held: {c:?}"
+            );
+            db.hold_zpage_build(false);
+            assert!(
+                tick_until(&db, 400, |c| c.sel_installs >= 1),
+                "{what}: the attach did not follow the files: {:?}",
+                db.zpage_counts()
+            );
+            let c = db.zpage_counts();
+            assert!(
+                c.samples >= 2 && c.prebuilt >= 1,
+                "{what}: sampled again once the files landed and covered the keys: {c:?}"
+            );
+            assert!(
+                c.attached >= 1 && c.phase == 3,
+                "{what}: the files attached and the form installed: {c:?}"
+            );
+        } else {
+            assert!(
+                !tick_until(&db, 60, |c| c.build_starts > 0),
+                "{what}: built ahead beside the scans: {:?}",
+                db.zpage_counts()
+            );
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.sel_installs, c.prebuilt),
+                (0, 0),
+                "{what}: the first reading stands: {c:?}"
+            );
+        }
+        let r = db.reader().unwrap();
+        check(&r, &model, &keys, &what);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// The builds ahead at landing (`Options::zpages_land_pct`): a store whose
 /// raw populations pass the percent of its budget and stay under the whole
 /// of it builds every partition's form file ahead, dormant, while the
