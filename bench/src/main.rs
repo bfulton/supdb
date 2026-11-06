@@ -27,10 +27,12 @@ run    measures every arm over the size ladder and writes runs/<scale>/<utc>-<sh
                ooc 10000000)
        --bottom the ladder's bottom rung in keys (default: the whole ladder from 10000; ooc 3000000)
        --reps  repetitions per size and arm (default: quick 5, full 7, ooc 3)
-       --bound the memory the run may use, in bytes, enforced by a cgroup of the run's own:
-               required at ooc, refused at quick and full. The process is moved into the
-               group before anything is measured, the limit as read back goes into the row's
-               class, and a bound too small for the floors is refused before the floors
+       --bound the memory the run may use, in bytes, enforced by a cgroup: required at ooc,
+               refused at quick and full. Under cgroup v1 the run makes a group of its own
+               and moves into it before anything is measured; under v2 alone it attaches to
+               the group it was started in, whose limit has to be this number (systemd-run
+               -p MemoryMax=BYTES -p MemorySwapMax=0). The limit as read back goes into the
+               row's class, and a bound too small for the floors is refused before the floors
        --ops-div what the read passes' operation counts are divided by at ooc (default 10);
                loads and bursts are never divided, and no divided count goes below 1000
        --resume DIR  take up the run whose ledger is DIR (<out>/inflight/<utc>-<sha7>, what a run

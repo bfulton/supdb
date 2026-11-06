@@ -312,7 +312,7 @@ out-of-core regime reached under a memory bound.
 |---|---|---|---|
 | `quick` | 300 000 keys | 5 | every pull request, on a GitHub Actions runner |
 | `full` | the rung at which the store is at least 1.5× the machine's memory | 7 | on demand or scheduled, on a quiet machine |
-| `ooc` | ten million keys, from three million, under `--bound BYTES`: a cgroup of the run's own with that memory limit, the process moved into it before anything is measured | 3 | on demand, on a quiet Linux machine with the cgroup v1 memory controller writable (`scripts/ooc.sh`) |
+| `ooc` | ten million keys, from three million, under `--bound BYTES`: under cgroup v1 a group of the run's own with that memory limit, the process moved into it before anything is measured; under cgroup v2 alone the group the run was started in, bounded by its starter (`systemd-run -p MemoryMax=BYTES -p MemorySwapMax=0`), whose limit the run holds to the bound it was asked for | 3 | on demand, on a quiet Linux machine with the cgroup v1 memory controller writable (`scripts/ooc.sh`), or by hand on a hosted runner (`ooc-hosted.yml`), its own class |
 
 `ooc` exists because every banked row is in-core: `full`'s top was never
 reached. The bound is the row's class (`/b<MiB>m`), since a store past it

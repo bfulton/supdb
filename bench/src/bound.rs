@@ -10,12 +10,21 @@
 //! reads from the device, which is the regime the `ooc` scale measures.
 //! The bound is the row's class as much as the memory is (`Row::class`).
 //!
-//! Only cgroup v1 is handled, because this host is v1 with the memory
-//! controller mounted read-write and v2 mounted with nothing delegated;
-//! on a v2-only host `enter` refuses, naming the file it could not find,
-//! rather than measuring an unbounded run as a bounded one. The parsers
-//! are pure functions over the files' text so that a host without a
-//! controller can still test them.
+//! Two hierarchies, two ways in. Under cgroup v1 -- this host, with the
+//! memory controller mounted read-write -- the run makes a group of its
+//! own under the one it was started in, writes the limit and moves itself
+//! in (`enter_at`). Under cgroup v2 alone -- GitHub's hosted runners --
+//! a process cannot bound itself from inside a leaf, since a group with
+//! processes in it may not hand the memory controller to a child, so
+//! whoever starts the run bounds it (`systemd-run -p MemoryMax=BYTES
+//! -p MemorySwapMax=0`) and the run attaches to the group it finds itself
+//! in, holding that group's `memory.max` to the bound it was asked for
+//! (`attach_at`): a limit of `max` is no bound, and another number is
+//! another row's class. Either way a run that cannot be bounded refuses,
+//! naming the file, rather than measuring an unbounded run as a bounded
+//! one. The parsers are pure functions over the files' text so that a
+//! host without the controller can still test them, and the attach runs
+//! against a directory of plain files.
 
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -62,6 +71,27 @@ pub fn parse_mount(text: &str) -> Option<PathBuf> {
     None
 }
 
+/// The unified hierarchy's path for this process from `/proc/self/cgroup`
+/// text: the `0::/path` line, which every host with cgroup2 mounted has,
+/// v2-only or hybrid. It is the group to attach to only where no v1
+/// memory controller line exists (`Bound::enter`).
+pub fn parse_unified_path(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("0::").map(str::to_string))
+}
+
+/// Where the unified hierarchy is mounted, from `/proc/mounts` text: the
+/// first mount of type `cgroup2`.
+pub fn parse_unified_mount(text: &str) -> Option<PathBuf> {
+    for line in text.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() >= 3 && f[2] == "cgroup2" {
+            return Some(PathBuf::from(f[1]));
+        }
+    }
+    None
+}
+
 /// What the group's `memory.stat` and its two counters say, as read.
 /// Every field is the file's own name, so a reader of a row's stderr can
 /// look each up in the kernel's documentation under that name.
@@ -84,9 +114,9 @@ pub struct BoundStat {
     pub failcnt: u64,
 }
 
-/// `memory.stat`'s text into the fields above. The file carries each key
-/// twice, plain and as `total_`; the plain one is this group's own, which
-/// is what the run is.
+/// v1's `memory.stat` text into the fields above. The file carries each
+/// key twice, plain and as `total_`; the plain one is this group's own,
+/// which is what the run is.
 pub fn parse_stat(text: &str) -> BoundStat {
     let mut s = BoundStat::default();
     for line in text.lines() {
@@ -112,6 +142,50 @@ pub fn parse_stat(text: &str) -> BoundStat {
     s
 }
 
+/// v2's `memory.stat` text into the same fields, under the names v1 gave
+/// them: `anon` is `rss`, `file` is `cache`, and `file_mapped`,
+/// `file_dirty` and `file_writeback` are the three without the prefix;
+/// the faults, the refaults and the two file lists share their names.
+pub fn parse_stat_v2(text: &str) -> BoundStat {
+    let mut s = BoundStat::default();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(k), Some(v)) = (it.next(), it.next()) else {
+            continue;
+        };
+        let v: u64 = v.parse().unwrap_or(0);
+        match k {
+            "file" => s.cache = v,
+            "anon" => s.rss = v,
+            "file_mapped" => s.mapped_file = v,
+            "file_dirty" => s.dirty = v,
+            "file_writeback" => s.writeback = v,
+            "pgfault" => s.pgfault = v,
+            "pgmajfault" => s.pgmajfault = v,
+            "workingset_refault_file" => s.workingset_refault_file = v,
+            "inactive_file" => s.inactive_file = v,
+            "active_file" => s.active_file = v,
+            _ => {}
+        }
+    }
+    s
+}
+
+/// v2's `memory.events` text: the `max` line, the times the group's
+/// memory reached its limit and was reclaimed, which is what v1's
+/// `failcnt` counts.
+pub fn parse_events_max(text: &str) -> u64 {
+    text.lines()
+        .find_map(|line| {
+            let mut it = line.split_whitespace();
+            match (it.next(), it.next()) {
+                (Some("max"), Some(v)) => v.parse().ok(),
+                _ => None,
+            }
+        })
+        .unwrap_or(0)
+}
+
 /// The group this process runs in while it measures. Dropping it moves
 /// the process back to the group it came from and removes the group.
 /// A clone is attached and not owned, as a deserialized bound is: the
@@ -134,6 +208,12 @@ pub struct Bound {
     /// the parent is still in it.
     #[serde(skip)]
     owned: bool,
+    /// Whether the group is cgroup v2's, read through its files
+    /// (`memory.max`, `memory.stat`'s v2 keys, `memory.peak`,
+    /// `memory.events`), as against v1's. Travels with the bound to the
+    /// pass's process, which reads the same group.
+    #[serde(default)]
+    v2: bool,
 }
 
 fn err_at(path: &Path, what: &str, e: io::Error) -> io::Error {
@@ -181,14 +261,22 @@ impl Bound {
     /// still names the old group after the move.
     pub fn enter(limit: u64) -> io::Result<Bound> {
         let cgroup = Path::new("/proc/self/cgroup");
-        let own = parse_cgroup_path(&read_from(cgroup)?).ok_or_else(|| {
-            io::Error::other(format!(
-                "no memory controller in {}: a cgroup v2-only host, which this bound does not \
-                 drive",
-                cgroup.display()
-            ))
-        })?;
+        let text = read_from(cgroup)?;
         let mounts = Path::new("/proc/mounts");
+        let Some(own) = parse_cgroup_path(&text) else {
+            // No v1 memory controller: a v2-only host, where the bound is
+            // the group this process was started in (`attach_at`).
+            let own = parse_unified_path(&text).ok_or_else(|| {
+                io::Error::other(format!(
+                    "no memory controller and no unified hierarchy in {}",
+                    cgroup.display()
+                ))
+            })?;
+            let root = parse_unified_mount(&read_from(mounts)?).ok_or_else(|| {
+                io::Error::other(format!("no cgroup2 mount in {}", mounts.display()))
+            })?;
+            return Bound::attach_at(&root, &own, limit);
+        };
         let root = parse_mount(&read_from(mounts)?).ok_or_else(|| {
             io::Error::other(format!(
                 "no cgroup mount with the memory controller in {}",
@@ -268,6 +356,64 @@ impl Bound {
             parent,
             limit: got,
             owned: true,
+            v2: false,
+        })
+    }
+
+    /// The bound as cgroup v2 gives it: the group this process was started
+    /// in, `own` under the unified mount at `root`, whose `memory.max` is
+    /// held to `limit` -- `max` is no bound, and another number is another
+    /// row's class -- and whose `memory.swap.max`, where the kernel
+    /// accounts swap, is held to zero, since a group that can swap its
+    /// anonymous memory out is in another regime from this host's, which
+    /// has none. v2 lets no process bound itself from inside a leaf, so
+    /// the wrapper that starts the run sets both (`systemd-run -p
+    /// MemoryMax=BYTES -p MemorySwapMax=0`, as the `ooc-hosted` workflow
+    /// does), and the group is nobody's to leave or remove here: the bound
+    /// is attached, never owned.
+    pub fn attach_at(root: &Path, own: &str, limit: u64) -> io::Result<Bound> {
+        let group = root.join(own.trim_start_matches('/'));
+        let max_file = group.join("memory.max");
+        let text = read_from(&max_file)?;
+        let got = text.trim();
+        if got == "max" {
+            return Err(io::Error::other(format!(
+                "{} is \"max\": the group this process runs in has no limit, and on cgroup v2 \
+                 the run is bounded by whoever starts it (systemd-run -p MemoryMax={limit} -p \
+                 MemorySwapMax=0)",
+                max_file.display()
+            )));
+        }
+        let got: u64 = got.parse().map_err(|_| {
+            io::Error::other(format!(
+                "could not parse {} as a number: {got:?}",
+                max_file.display()
+            ))
+        })?;
+        if got != limit {
+            return Err(io::Error::other(format!(
+                "{} is {got} and --bound is {limit}: the group's limit and the row's bound have \
+                 to be one number",
+                max_file.display()
+            )));
+        }
+        let swap_file = group.join("memory.swap.max");
+        if let Ok(swap) = std::fs::read_to_string(&swap_file) {
+            if swap.trim() != "0" {
+                return Err(io::Error::other(format!(
+                    "{} is {:?}: a group that can swap is not this bound (systemd-run -p \
+                     MemorySwapMax=0)",
+                    swap_file.display(),
+                    swap.trim()
+                )));
+            }
+        }
+        Ok(Bound {
+            parent: group.clone(),
+            group,
+            limit: got,
+            owned: false,
+            v2: true,
         })
     }
 
@@ -288,6 +434,12 @@ impl Bound {
     /// of a phase and after its last, never between, as every counter the
     /// suite reads around a phase is.
     pub fn stat(&self) -> io::Result<BoundStat> {
+        if self.v2 {
+            let mut s = parse_stat_v2(&read_from(&self.group.join("memory.stat"))?);
+            s.max_usage_in_bytes = read_u64(&self.group.join("memory.peak"))?;
+            s.failcnt = parse_events_max(&read_from(&self.group.join("memory.events"))?);
+            return Ok(s);
+        }
         let mut s = parse_stat(&read_from(&self.group.join("memory.stat"))?);
         s.max_usage_in_bytes = read_u64(&self.group.join("memory.max_usage_in_bytes"))?;
         s.failcnt = read_u64(&self.group.join("memory.failcnt"))?;
@@ -310,6 +462,7 @@ impl Clone for Bound {
             parent: self.parent.clone(),
             limit: self.limit,
             owned: false,
+            v2: self.v2,
         }
     }
 }
@@ -377,6 +530,33 @@ cgroup2 /sys/fs/cgroup/unified cgroup2 rw,relatime 0 0\n";
         assert_eq!(parse_cgroup_path(""), None);
     }
 
+    const V2: &str = "0::/system.slice/run-u1234.service\n";
+
+    const MOUNTS_V2: &str = "sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n\
+cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot 0 0\n";
+
+    #[test]
+    fn the_unified_path_is_the_zero_line_and_its_mount_the_cgroup2_one() {
+        assert_eq!(
+            parse_unified_path(V2).as_deref(),
+            Some("/system.slice/run-u1234.service")
+        );
+        // A hybrid host has the line too, at the root; `enter` takes the
+        // v1 controller first wherever one is named.
+        assert_eq!(parse_unified_path(V1).as_deref(), Some("/"));
+        assert_eq!(parse_cgroup_path(V2), None);
+        assert_eq!(parse_unified_path(""), None);
+        assert_eq!(
+            parse_unified_mount(MOUNTS_V2),
+            Some(PathBuf::from("/sys/fs/cgroup"))
+        );
+        assert_eq!(
+            parse_unified_mount(MOUNTS),
+            Some(PathBuf::from("/sys/fs/cgroup/unified"))
+        );
+        assert_eq!(parse_unified_mount(""), None);
+    }
+
     #[test]
     fn the_controllers_mount_is_the_cgroup_mount_with_memory_in_its_options() {
         assert_eq!(
@@ -405,6 +585,100 @@ cgroup2 /sys/fs/cgroup/unified cgroup2 rw,relatime 0 0\n";
         assert_eq!(s.inactive_file, 9);
         assert_eq!(s.active_file, 11);
         assert_eq!(s.max_usage_in_bytes, 0);
+    }
+
+    #[test]
+    fn the_v2_stat_is_read_under_v1s_names_and_the_events_max_is_the_failcnt() {
+        let s = parse_stat_v2(
+            "anon 8192\nfile 4096\nkernel 77\nfile_mapped 1\nfile_dirty 2\nfile_writeback 3\n\
+             pgfault 40\npgmajfault 5\nworkingset_refault_anon 6\nworkingset_refault_file 7\n\
+             inactive_file 9\nactive_file 11\n",
+        );
+        assert_eq!(s.rss, 8192);
+        assert_eq!(s.cache, 4096);
+        assert_eq!(s.mapped_file, 1);
+        assert_eq!(s.dirty, 2);
+        assert_eq!(s.writeback, 3);
+        assert_eq!(s.pgfault, 40);
+        assert_eq!(s.pgmajfault, 5);
+        assert_eq!(s.workingset_refault_file, 7);
+        assert_eq!(s.inactive_file, 9);
+        assert_eq!(s.active_file, 11);
+        assert_eq!(
+            parse_events_max("low 0\nhigh 2\nmax 13\noom 0\noom_kill 0\noom_group_kill 0\n"),
+            13
+        );
+        assert_eq!(parse_events_max("low 0\nhigh 2\n"), 0);
+        assert_eq!(parse_events_max(""), 0);
+    }
+
+    /// A fake unified hierarchy: a directory of plain files for the group
+    /// a wrapper started this process in. The attach holds the group's
+    /// limit to the bound and its swap to zero, each refusal naming the
+    /// file, and reads the counts through v2's files; it makes nothing and
+    /// removes nothing, so the group outlives the bound.
+    #[test]
+    fn a_v2_group_is_attached_at_its_bound_and_refused_at_any_other() {
+        let root =
+            std::env::temp_dir().join(format!("supdb-bench-bound-v2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let own = "/system.slice/run-u1234.service";
+        let group = root.join("system.slice/run-u1234.service");
+        std::fs::create_dir_all(&group).unwrap();
+        let limit = 1u64 << 30;
+        let refusal = |why: &str| {
+            let err = Bound::attach_at(&root, own, limit)
+                .err()
+                .unwrap_or_else(|| panic!("attached with {why}"));
+            err.to_string()
+        };
+        let text = refusal("no memory.max");
+        assert!(text.contains("memory.max"), "{text}");
+        std::fs::write(group.join("memory.max"), "max\n").unwrap();
+        let text = refusal("memory.max of max");
+        assert!(
+            text.contains("no limit") && text.contains(&format!("MemoryMax={limit}")),
+            "{text}"
+        );
+        std::fs::write(group.join("memory.max"), format!("{}\n", limit * 2)).unwrap();
+        let text = refusal("another limit");
+        assert!(
+            text.contains(&(limit * 2).to_string()) && text.contains(&limit.to_string()),
+            "{text}"
+        );
+        std::fs::write(group.join("memory.max"), format!("{limit}\n")).unwrap();
+        std::fs::write(group.join("memory.swap.max"), "max\n").unwrap();
+        let text = refusal("swap allowed");
+        assert!(
+            text.contains("memory.swap.max") && text.contains("MemorySwapMax=0"),
+            "{text}"
+        );
+        std::fs::write(group.join("memory.swap.max"), "0\n").unwrap();
+        let b = Bound::attach_at(&root, own, limit).unwrap();
+        assert_eq!(b.limit(), limit);
+        assert!(!b.is_owned(), "a v2 group is nobody's to remove");
+        assert_eq!(b.group(), group);
+        std::fs::write(
+            group.join("memory.stat"),
+            "anon 8192\nfile 4096\nfile_dirty 2\npgmajfault 5\nworkingset_refault_file 7\n",
+        )
+        .unwrap();
+        std::fs::write(group.join("memory.peak"), "123456\n").unwrap();
+        std::fs::write(group.join("memory.events"), "low 0\nhigh 0\nmax 3\noom 0\n").unwrap();
+        let s = b.stat().unwrap();
+        assert_eq!((s.rss, s.cache, s.dirty), (8192, 4096, 2));
+        assert_eq!((s.pgmajfault, s.workingset_refault_file), (5, 7));
+        assert_eq!((s.max_usage_in_bytes, s.failcnt), (123456, 3));
+        // The bound a pass's process is handed reads the same files.
+        let text = serde_json::to_string(&b).unwrap();
+        assert!(text.contains("\"v2\":true"), "{text}");
+        let handed: Bound = serde_json::from_str(&text).unwrap();
+        assert!(!handed.is_owned());
+        assert_eq!(handed.stat().unwrap().failcnt, 3);
+        drop(handed);
+        drop(b);
+        assert!(group.is_dir(), "the group outlives the bound");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A fake controller: a directory of plain files. The group's

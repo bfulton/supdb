@@ -1,0 +1,102 @@
+name: ooc-hosted
+
+# One bounded (`ooc`) row on a hosted runner, by hand only. The runner is
+# cgroup v2, where a process cannot bound itself from inside a leaf, so the
+# run is started inside a transient systemd service with the limit on it
+# (MemoryMax, and no swap) and the suite attaches to that group, holding
+# its limit to the --bound it was asked for (bench/src/bound.rs). The row's
+# class is this runner's with the bound in it: it is compared to its own
+# class's history alone and never to a cell from any other machine
+# (bench/CLAUDE.md), and until three rows of the class exist the gate can
+# only say "no band yet". The row, the gate's verdict and the figures are
+# artifacts; committing a row is a person's decision.
+#
+# The defaults keep a run inside the six hours a hosted job has: the
+# engine and its two comparators at one rep. The bounded roster is
+# `all`; more reps are `reps`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      arms:
+        description: 'Arms, comma-separated; `all` is the bounded roster'
+        required: false
+        default: 'supdb,lmdb-nordahead,rocksdb-tuned-lz4'
+      bound_mib:
+        description: 'The memory bound, in MiB (whole MiB; the ladder is the two rungs either side of it)'
+        required: false
+        default: '1280'
+      reps:
+        description: 'Repetitions per rung and arm'
+        required: false
+        default: '1'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ooc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: libclang, for bindgen
+        run: sh bench/scripts/libclang.sh
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bench -> bench/target
+      - name: The runner is cgroup v2 with systemd, and has no swap in use
+        run: |
+          set -eu
+          test "$(stat -f -c %T /sys/fs/cgroup)" = cgroup2fs
+          systemd-run --version | head -1
+          cat /proc/swaps
+          free -m
+          df -h /tmp .
+      - name: Build the suite
+        working-directory: bench
+        run: cargo build --release --bin bench
+      - name: The machine, as the row records it
+        working-directory: bench
+        run: ./target/release/bench machine | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: The bounded run, inside a transient service with the limit on it
+        working-directory: bench
+        env:
+          ARMS: ${{ inputs.arms }}
+          BOUND_MIB: ${{ inputs.bound_mib }}
+          REPS: ${{ inputs.reps }}
+        run: |
+          set -eu
+          BOUND=$(( BOUND_MIB * 1048576 ))
+          ARM_FLAG=""
+          if [ -n "$ARMS" ] && [ "$ARMS" != all ]; then ARM_FLAG="--arms $ARMS"; fi
+          rm -rf runs-ci
+          # --same-dir keeps this directory; --uid/--gid keep the files the
+          # runner's; --wait --pipe keep the run in the foreground with its
+          # output here. The suite's own stderr lines (the bound's group,
+          # the counters) go to the kept log as well as the job's.
+          sudo systemd-run --wait --pipe --collect --same-dir \
+            --uid="$(id -un)" --gid="$(id -gn)" \
+            --setenv=HOME="$HOME" --setenv=CARGO_TERM_COLOR=always \
+            -p MemoryMax="$BOUND" -p MemorySwapMax=0 \
+            ./target/release/bench run --scale ooc --bound "$BOUND" --reps "$REPS" --out runs-ci $ARM_FLAG \
+            2> >(tee ooc-stderr.log >&2)
+          ls runs-ci/ooc/*.json
+      - name: The gate, against the committed rows of this class
+        working-directory: bench
+        run: |
+          set -eu
+          ./target/release/bench gate runs-ci/ooc/*.json --runs runs | tee runs-ci/gate.txt
+          cat runs-ci/gate.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: The figures from the row
+        working-directory: bench
+        run: ./target/release/bench figures --runs runs-ci --out runs-ci/figures --scale ooc
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ooc-row
+          if-no-files-found: ignore
+          path: |
+            bench/runs-ci/
+            bench/ooc-stderr.log

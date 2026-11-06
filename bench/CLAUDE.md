@@ -560,4 +560,16 @@ as its own rows arrive, slowly for that label and faster for the ARM and
 macOS runners. A hosted row is never read against a Firecracker row, which
 the class key forbids anyway, and no default changes on a hosted number
 alone: the runners are shared machines whose model varies between runs,
-and the row's floors judge the machine before its cells are read.
+and the row's floors judge the machine before its cells are read. A
+bounded row can be taken there too, by hand (`ooc-hosted.yml`): the
+runners are cgroup v2, where a process cannot bound itself from inside a
+leaf -- a group with processes in it may not hand the memory controller to
+a child -- so the job starts the run inside a transient systemd service
+with the limit on it and no swap, and the suite attaches to the group it
+finds itself in, holding its `memory.max` to the `--bound` it was asked
+for and refusing a `max` or any other number (`bound::Bound::attach_at`).
+That path cannot run on this host, which is v1 with nothing delegated on
+its unified mount, so it is held by its parsers' tests and an attach
+against a directory of plain files, and the job's first run is its first
+exercise. A hosted bounded row is a class of its own, the bound in it, and
+is read against nothing from here.
