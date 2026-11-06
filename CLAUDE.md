@@ -3450,6 +3450,22 @@ queue it stands in; and a lever on a shared device is read against the
 count of what the other side left undone before it is read against the
 rate.
 
+**A prefetch aimed at a device that was not waiting.** The merge chain
+inside the full rewrite's lag pass reads each input through a mapping, one
+kernel readahead window a wait behind the scans' faults, the shape whose
+ask-ahead had halved the controller's build; the same ask ahead of the
+merge's walk fired -- six hundred windows, two gigabytes asked, counted --
+and the pass did not move by a tenth of a second in either rep, with the
+device bytes inside it identical. A prefetch moves a wait earlier; it
+moves no byte, and a device carrying 4.5 GB in eleven seconds beside the
+scans is not waiting for anyone's request. The rule: before a prefetch is
+built, read the device's bytes over the window beside the thread's waits
+-- a walk whose device is saturated gains nothing from asking sooner, and
+the lever on it is the bytes or when they are paid; and a lever that
+worked on one walk is priced on the next by the counter that says it
+fired, since a mechanism firing to no effect is a refutation and not a
+bug.
+
 **A thing kept for a reader, freed by whoever published next.** The tables
 a publish replaced are kept for the writer's upkeep's look
 (`State::replaced`), and a publish trimmed the list to the tables since the
@@ -3508,6 +3524,19 @@ from the fields the line carried.
 These are the engine's, as opposed to refuted predictions. Each is a curve
 in the suite's figures, at `full` scale where it says so:
 
+- The lag pass after a full rewrite under a bound runs beside the merge
+  chain that rewrites the store once, and reads at the device's rate for
+  both: at ten million keys under 1.25 GiB the pass carries 4.5 GB of the
+  chain's reads and writes beside its scans' faults and trails LMDB, whose
+  burst rewrote in place and took thirty-five times ours, at 0.8x. Three
+  levers were priced on it and refuted (`docs/engine.md`): the merges at
+  the idle I/O class, which left the pieces standing for the scans (3x
+  slower); the merge's inputs asked of the kernel ahead of its walk, which
+  fired and moved nothing, the device not waiting; and the chain run through
+  the burst itself, which paid more. The bytes are the design's -- an
+  out-of-place rewrite is written once wherever it is paid -- and the sweep's
+  weighted sum of the burst and the pass reads 13.9x in the engine's favour
+  at that point.
 - Out-of-core reads run at the speed of their misses. Once the file exceeds
   the memory that can cache it, every miss is a synchronous page fault and a
   rate is the faults an operation takes over the device's latency. The faults
