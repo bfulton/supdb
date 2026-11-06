@@ -4476,8 +4476,8 @@ impl Supdb {
     /// `supdb-cache64tofitautozpagescodingfixed`: the block coding wherever
     /// the controller builds, the shape before the gear. The pair against
     /// the combined arm prices the gear, which picks the raw-tail record
-    /// coding where the model predicts that form fits the budget and the
-    /// block coding otherwise.
+    /// coding where the model predicts that form fits the fill share of the
+    /// budget (`zselect::FORM_FILL`) and the block coding otherwise.
     pub fn create_cache64_tofit_auto_zpages_codingfixed(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,

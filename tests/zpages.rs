@@ -5637,30 +5637,56 @@ fn an_eager_auto_store_buys_the_form_before_any_read() {
 /// Under `Options::zpages_coding_auto`, as shipped, the selector chooses
 /// the coding the form files are built in: the sampler sizes the raw-tail
 /// record coding beside the block coding, and the raw tails are built where
-/// the model predicts that form faults nothing against the budget -- a store
-/// of twenty thousand keys, whose raw-tail form is about 2.2 MB, under
-/// 64 MiB -- and the block coding where it does not: the same store under a
-/// budget of 1.5 MiB, which the block form's 1.4 MB sits under and the
-/// raw-tail form's does not. With the option off the options' block coding
-/// is built under 64 MiB too, nothing chosen and nothing raw-tailed. Every
+/// the model predicts that form faults nothing against `zselect::FORM_FILL`
+/// of the budget -- a store of twenty thousand keys, whose raw-tail form is
+/// about 2.2 MB, under 64 MiB -- and the block coding where it does not:
+/// the same store under a budget of 1.5 MiB, which the block form's 1.4 MB
+/// sits under and the raw-tail form's does not, and under a budget five
+/// percent over the raw-tail form's own bytes, which that form fits whole
+/// and fills past the share -- the shape a line at the budget itself
+/// picked the raw tails for, at ten million keys under 1.25 GiB
+/// (`docs/engine.md`). With the option off the options' block coding is
+/// built under 64 MiB too, nothing chosen and nothing raw-tailed. Every
 /// store is eager and under the group's pressure, as the eager test has
 /// them, so each buys and installs; the counts say which coding was chosen
 /// and built, the raw-tail form reads larger than the block form wherever
 /// both are sized, and the reads answer the model every way.
 #[cfg(target_os = "linux")]
 #[test]
-fn the_selector_builds_the_raw_tails_where_that_form_fits_and_the_block_coding_otherwise() {
+fn the_selector_builds_the_raw_tails_where_that_form_fits_the_fill_share_and_the_block_coding_otherwise(
+) {
     assert!(
         Options::default().zpages_coding_auto,
         "the selector's coding as shipped"
     );
-    for (budget, gear, raw) in [
-        (64u64 << 20, true, true),
-        (1536u64 << 10, true, false),
-        (64u64 << 20, false, false),
-    ] {
-        let what = format!("budget {budget}, gear {gear}, raw tails expected {raw}");
-        let dir = scratch(&format!("coding-auto-{gear}-{raw}"));
+    // A case's budget: bytes, or a percentage of the first case's raw-tail
+    // form, which every case's store sizes alike (the same keys and values,
+    // the sampler's ranks evenly spaced).
+    enum At {
+        Bytes(u64),
+        OfRaw(u64),
+    }
+    let cases = [
+        (At::Bytes(64 << 20), true, true),
+        (At::Bytes(1536 << 10), true, false),
+        (At::OfRaw(105), true, false),
+        (At::Bytes(64 << 20), false, false),
+    ];
+    let mut raw_w_z = 0u64;
+    for (i, (at, gear, raw)) in cases.into_iter().enumerate() {
+        let edge = matches!(at, At::OfRaw(_));
+        let budget = match at {
+            At::Bytes(b) => b,
+            At::OfRaw(pct) => {
+                assert!(raw_w_z > 0, "the first case sized the raw-tail form");
+                raw_w_z * pct / 100
+            }
+        };
+        let fill = supdb::db::zselect::form_fill(budget);
+        let what = format!(
+            "case {i}: budget {budget} (fill {fill}), gear {gear}, raw tails expected {raw}"
+        );
+        let dir = scratch(&format!("coding-auto-{i}"));
         let inject = std::sync::Arc::new(supdb::ZInject::new());
         inject.set_budget(budget);
         inject.set_refault_rate(1_000_000.0);
@@ -5690,6 +5716,9 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_and_the_block_coding_o
         );
         let c = db.zpage_counts();
         assert!(c.builds >= 1, "{what}: {c:?}");
+        if i == 0 {
+            raw_w_z = c.sample_w_z_raw_bytes;
+        }
         if !gear {
             assert_eq!(
                 (c.coding_picks_raw, c.coding_picks_block, c.builds_raw_tails),
@@ -5720,8 +5749,8 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_and_the_block_coding_o
                 "{what}: the reading fed to the selector is the chosen form's"
             );
             assert!(
-                c.sample_w_z_raw_bytes < budget,
-                "{what}: the raw-tail form under the budget"
+                c.sample_w_z_raw_bytes <= fill,
+                "{what}: the raw-tail form within the fill share: {c:?}"
             );
         } else if gear {
             assert!(
@@ -5734,9 +5763,20 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_and_the_block_coding_o
                 "{what}: the block form the smaller: {c:?}"
             );
             assert!(
-                c.sample_w_z_raw_bytes > budget,
-                "{what}: the raw-tail form over the budget: {c:?}"
+                c.sample_w_z_raw_bytes > fill,
+                "{what}: the raw-tail form over the fill share: {c:?}"
             );
+            if edge {
+                assert!(
+                    c.sample_w_z_raw_bytes < budget,
+                    "{what}: and within the budget whole, where the line at the budget picked it: {c:?}"
+                );
+            } else {
+                assert!(
+                    c.sample_w_z_raw_bytes > budget,
+                    "{what}: the raw-tail form over the budget: {c:?}"
+                );
+            }
         }
         let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
         check(&db, &model, &keys, &what);

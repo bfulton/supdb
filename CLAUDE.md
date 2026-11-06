@@ -3519,6 +3519,35 @@ and a controller's refusal is read off its clause's inputs on the trace
 before its evidence is reasoned about, since four clauses looked satisfied
 from the fields the line carried.
 
+**A pick at the budget's edge, flipped by a partition in flight.** The
+coding gear picked the raw-tail form wherever the model predicted it fit
+the budget, and a pick holds for the builds after it while the budget
+moves: a form that fits at the load's end is a form the mixes may not
+hold, since the budget subtracts the process's memory at the sample and
+fell by a quarter through the mixes at ten million keys under 1.25 GiB.
+There the raw-tail form sat at 97-99% of the budget, and one pass of four
+sampled 28 partitions with one in flight where the others sampled 29: the
+pick flipped with the count, that pass built every form file again at the
+larger coding and refaulted through every mix, C and E at 2.6-2.8 and
+2.0-2.3 times the others', with the engine and the arm the same in all
+four. The
+cells had been read as bimodal, the shape the host's two speeds have,
+until the table's `zpage_builds_raw_tails` read 29 in one arm and 0 in the
+other and the trace's `zsample` line named the pick. The line is at the
+share of the budget the re-code policy already leaves to the page cache's
+other tenants (`zselect::FORM_FILL`), one constant for both; a fix for a
+wrong answer and not an arm, since the shape before is the pick at the
+edge. `tests/zpages.rs` builds the shape, a budget the raw-tail form fits
+whole and fills past the share, and the selector's unit test holds the
+two partition counts to one pick. The rule: a choice made once for a
+store's life is made with the headroom its inputs will lose, never
+against their value at the sample, since a line at the inputs' edge is
+crossed by whatever moves them next -- here a partition in flight; a cell
+that reads bimodal under one engine and one arm is two decisions and not
+noise, and the counter that names the decision is read before the cells
+are read as the host's; and two policies that bound one quantity bound it
+at one line, named once.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

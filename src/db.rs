@@ -1842,8 +1842,10 @@ pub struct Options {
     /// selector's to choose (`zselect::choose_coding`): the sampler sizes
     /// the record coding with raw tails beside the block coding, and the raw
     /// tails are built where the model predicts that form faults nothing
-    /// against the budget, the block coding otherwise -- the gear is the
-    /// coding that fits with the fewest decodes. Where both fit the raw-tail
+    /// against `zselect::FORM_FILL` of the budget, the rest left to the page
+    /// cache's other tenants and to the budget's fall through a mix, the
+    /// block coding otherwise -- the gear is the coding that fits with the
+    /// fewest decodes. Where both fit the raw-tail
     /// form reads every mix at or above the block form's, the point reads
     /// 1.25-1.95x, and where it does not fit it faults, 1.4-1.5x slower in D
     /// and E (`docs/engine.md`). A pick holds for the builds after it; the
@@ -3797,7 +3799,7 @@ pub struct Options {
     /// partitions to the raw tails while they serve, where their decodes
     /// would be walks in place: a partition holding at least
     /// `RECODE_AUTO_SHARE` of the store's decode time, while the form with
-    /// its raw tails' extra stays within `RECODE_AUTO_FILL` of the budget,
+    /// its raw tails' extra stays within `zselect::FORM_FILL` of the budget,
     /// the rest of the budget left to the page cache's other tenants -- the
     /// partitions the form does not cover yet, the files a write mix lands,
     /// the indexes; and a raw-tailed partition goes back, coldest first,
@@ -35643,13 +35645,13 @@ const RECODE_DECODE_NS: f64 = 1000.0;
 /// the share of the store's decode time a partition holds before its raw
 /// tails are built -- at ten million keys the suite's Zipfian put a fifth
 /// to a quarter of E's decode time on each of its two hottest partitions
-/// and a fiftieth on each of the tail's -- the share of the budget the
-/// form with its raw tails may take, the rest left to the page cache's
-/// other tenants, and the share past which raw tails are given back. The
-/// budget falls a tenth through a write mix, so the gap between the last
-/// two is the hold that keeps a raw-tailed set from flipping at each move.
+/// and a fiftieth on each of the tail's -- and the share of the budget
+/// past which raw tails are given back. The share the form with its raw
+/// tails may fill is `zselect::FORM_FILL`, the coding pick's line too, the
+/// rest left to the page cache's other tenants; the budget falls a tenth
+/// through a write mix, so the gap between the two is the hold that keeps
+/// a raw-tailed set from flipping at each move.
 const RECODE_AUTO_SHARE: f64 = 0.05;
-const RECODE_AUTO_FILL: f64 = 0.85;
 const RECODE_AUTO_EVICT: f64 = 0.95;
 
 /// The share of a partition's records the page cache must hold for a build
@@ -38335,14 +38337,14 @@ impl Maint {
         // Under the controller (`Options::zpages_recode_auto`): the hottest
         // block-coded partition, at least `RECODE_AUTO_SHARE` of the decode
         // time, re-coded to the raw tails where the form with their extra
-        // stays within `RECODE_AUTO_FILL` of the budget, else the room made
+        // stays within `zselect::FORM_FILL` of the budget, else the room made
         // by the coldest raw-tailed one if the hot one is `RECODE_SWAP`
         // times hotter; and past `RECODE_AUTO_EVICT` of the budget the
         // coldest raw-tailed partition given back. The refaults decide
         // nothing: the write mixes raise them whatever the form does.
         if self.opts.zpages == ZPages::Auto {
             let heat_all: f64 = parts.iter().map(|p| p.heat).sum();
-            let fill = (budget as f64 * RECODE_AUTO_FILL) as u64;
+            let fill = zselect::form_fill(budget);
             let evict = (budget as f64 * RECODE_AUTO_EVICT) as u64;
             if total > evict {
                 if self.z_trace {
@@ -38938,8 +38940,9 @@ impl Maint {
             uncovered_keys = missing_keys;
         }
         // The coding, where the selector chooses it: the raw tails where the
-        // model predicts that form faults nothing against the budget, the
-        // block coding otherwise (`zselect::choose_coding`); the reading fed
+        // model predicts that form faults nothing against the fill share of
+        // the budget, the block coding otherwise (`zselect::choose_coding`,
+        // `zselect::FORM_FILL`); the reading fed
         // to the selector is the chosen form's. A reading that sized the raw
         // tails for fewer partitions than the block coding chooses nothing.
         let pick = (self.opts.zpages_coding_auto

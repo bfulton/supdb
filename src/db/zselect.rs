@@ -441,18 +441,42 @@ pub struct FormSize {
     pub resident: u64,
 }
 
+/// The share of the budget a form the selector builds may fill, the rest
+/// left to the page cache's other tenants -- the partitions the form does
+/// not cover yet, the files a write mix lands, the indexes -- and to the
+/// budget's own fall through a mix as the process's memory grows, which
+/// the next sample subtracts and the pick's sample cannot: at ten million
+/// keys under 1.25 GiB the budget read 1.2 GB at the load's end and 0.87
+/// through E. One line for the coding's pick ([`choose_coding`]) and the
+/// re-code policy's fill (`Options::zpages_recode_auto`).
+pub const FORM_FILL: f64 = 0.85;
+
+/// [`FORM_FILL`] of a budget, in bytes.
+pub fn form_fill(budget: u64) -> u64 {
+    (budget as f64 * FORM_FILL) as u64
+}
+
 /// The coding to build in, with the raw-tail form sized: the raw tails where
-/// [`model_z`] predicts that form faults nothing against the budget, the
-/// block coding otherwise. The line is at no predicted fault at all, since a
-/// form that faults a little loses more than it wins: at five million keys
-/// under 640 MiB the raw-tail form's 556 MB against a budget of about 490 MiB
-/// (the limit less the process's 90 and the margin's 64) predicts about a
-/// tenth of a fault a read and took 0.02-0.03, with D and E 1.4-1.5x slower
-/// for them where the point-read mixes read 1.3x faster, and the block
-/// form's 360 MB predicts none and took none. A size of zero is a form the
-/// sampler declined, and the block coding stands for it.
+/// [`model_z`] predicts that form faults nothing against [`FORM_FILL`] of
+/// the budget, the block coding otherwise. The line is at no predicted
+/// fault at all, since a form that faults a little loses more than it wins:
+/// at five million keys under 640 MiB the raw-tail form's 556 MB against a
+/// budget of about 490 MiB (the limit less the process's 90 and the
+/// margin's 64) predicts about a tenth of a fault a read and took
+/// 0.02-0.03, with D and E 1.4-1.5x slower for them where the point-read
+/// mixes read 1.3x faster, and the block form's 360 MB predicts none and
+/// took none. And it is drawn at the fill share and not at the budget
+/// itself, since a pick holds for the builds after it while the budget
+/// moves: at ten million keys under 1.25 GiB the raw-tail form sat at
+/// 97-99% of the budget, the sampler counted 28 partitions with one in
+/// flight in one pass of four and 29 in the others, and a line at the
+/// budget flipped with the count -- the pass that bought the raw tails
+/// refaulted through every mix, C and E at 2.6-2.8 and 2.0-2.3 times the
+/// others' (`docs/engine.md`). A size of zero is a form the sampler
+/// declined, and the block coding stands for it.
 pub fn choose_coding(budget: u64, raw_tails: FormSize) -> Coding {
-    if raw_tails.w_z > 0 && model_z(budget, raw_tails.resident, raw_tails.w_z) <= 0.0 {
+    let fill = form_fill(budget);
+    if raw_tails.w_z > 0 && model_z(fill, raw_tails.resident, raw_tails.w_z) <= 0.0 {
         Coding::RawTails
     } else {
         Coding::Block
@@ -2463,14 +2487,23 @@ mod tests {
     use super::*;
 
     /// The coding the selector chooses is the raw tails exactly where the
-    /// model predicts that form faults nothing, and the block coding
-    /// otherwise: the two measured points (five million keys under 640 MiB,
-    /// where the raw-tail form missed and the block form fit, and three
-    /// million under the same bound, where both fit), the line itself, a
-    /// budget of nothing, and a form the sampler declined.
+    /// model predicts that form faults nothing against `FORM_FILL` of the
+    /// budget, and the block coding otherwise: the measured points (five
+    /// million keys under 640 MiB, where the raw-tail form missed and the
+    /// block form fit; three million under the same bound, where both fit;
+    /// ten million under 1.25 GiB at the two partition counts the sampler
+    /// read, where the raw-tail form sat within the budget at one count and
+    /// a hair over it at the other, and over the fill share at both), the
+    /// line itself, the share the docs name, a budget of nothing, and a
+    /// form the sampler declined.
     #[test]
-    fn the_coding_is_the_raw_tails_only_where_that_form_is_predicted_to_fault_nothing() {
+    fn the_coding_is_the_raw_tails_only_where_that_form_fits_the_fill_share_of_the_budget() {
         let mb = |n: u64| n << 20;
+        let fill = form_fill(mb(1000));
+        assert!(
+            fill.abs_diff(mb(850)) <= 1,
+            "the fill share the docs name, 85% (`docs/engine.md`): {fill}"
+        );
         let budget = Budget::of(mb(640), mb(90), None).budget;
         let raw = FormSize {
             w_z: mb(530),
@@ -2494,8 +2527,9 @@ mod tests {
             w_z: mb(318),
             resident: mb(6),
         };
+        assert!(smaller.w_z + smaller.resident <= form_fill(budget));
         assert_eq!(choose_coding(budget, smaller), Coding::RawTails);
-        let room = budget - raw.resident;
+        let room = form_fill(budget) - raw.resident;
         assert_eq!(
             choose_coding(
                 budget,
@@ -2505,7 +2539,7 @@ mod tests {
                 }
             ),
             Coding::RawTails,
-            "the line: the form exactly the room"
+            "the line: the form exactly the fill share"
         );
         assert_eq!(
             choose_coding(
@@ -2516,8 +2550,40 @@ mod tests {
                 }
             ),
             Coding::Block,
-            "one byte over the room"
+            "one byte over the fill share"
         );
+        // Ten million keys under 1.25 GiB, the sampler's two readings: 28
+        // partitions with one in flight, 1168 MB within a budget of 1199,
+        // and 29, 1190 MB a hair over a budget of 1198. A line at the
+        // budget itself picked them apart; the fill share picks the block
+        // coding for both, so a partition in flight moves no pick.
+        let at_28 = (
+            1_199_144_960u64,
+            FormSize {
+                w_z: 1_168_282_048,
+                resident: 19_009_984,
+            },
+        );
+        let at_29 = (
+            1_197_764_608u64,
+            FormSize {
+                w_z: 1_189_696_232,
+                resident: 16_979_608,
+            },
+        );
+        assert_eq!(
+            model_z(at_28.0, at_28.1.resident, at_28.1.w_z),
+            0.0,
+            "within the budget whole"
+        );
+        assert!(
+            model_z(at_29.0, at_29.1.resident, at_29.1.w_z) > 0.0,
+            "a hair over it"
+        );
+        for (budget, form) in [at_28, at_29] {
+            assert!(form.w_z > form_fill(budget), "over the fill share");
+            assert_eq!(choose_coding(budget, form), Coding::Block);
+        }
         assert_eq!(
             choose_coding(0, raw),
             Coding::Block,

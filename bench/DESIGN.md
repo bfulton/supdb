@@ -552,8 +552,8 @@ own LZ4 decoder (`Options::zpages_own_decoder` off);
 `supdb-cache64tofitautozpagescodingfixed` is the combined arm with the coding
 of its form files the options' block coding wherever the controller builds
 (`Options::zpages_coding_auto` off), where the default's selector picks the
-raw tails where the model predicts that form fits the budget and the block
-coding otherwise;
+raw tails where the model predicts that form fits the fill share of the
+budget (`zselect::FORM_FILL`) and the block coding otherwise;
 `supdb-cache64tofitzpagesrecordrawdecode` is the forced raw-tail form with
 the block cache whose scans decode a group whole before walking it
 (`Options::zpages_inplace_walk` off), where the default reads a raw-tail
