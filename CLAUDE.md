@@ -3433,6 +3433,23 @@ count moves, so it is read with that count beside it; and a burst slower
 than its commits is read against the writer's CPU and its holds before a
 syscall is suspected.
 
+**A background job's I/O class, priced by the device's queue.** The
+full rewrite's lag pass under a bound ran beside its merge chain, the
+scans' faults waiting behind the merges' reads and writes, and the obvious
+lever was the block layer's idle class for the merge thread, so the
+readers' faults would be served first. Paired at ten million keys under
+1.25 GiB the pass read three times slower under it: the merges, served
+last, never drained inside the pass, 160 pieces stood at its end where
+the default left 6, and every scan touched a page of every piece over its
+range -- four times the major faults, and the tenths flat where the
+default's fall tenfold as its chain drains. Under a bound a merge's I/O is
+the readers' I/O deferred, and a class that puts the readers first hands
+them the pieces. The rule: a background job that reduces what the readers
+have to walk is priced by the pieces the readers meet, never by the device
+queue it stands in; and a lever on a shared device is read against the
+count of what the other side left undone before it is read against the
+rate.
+
 **A thing kept for a reader, freed by whoever published next.** The tables
 a publish replaced are kept for the writer's upkeep's look
 (`State::replaced`), and a publish trimmed the list to the tables since the
