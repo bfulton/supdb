@@ -3889,6 +3889,20 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with its block-coded groups written by the parsing encoder
+    /// (`Options::zpages_parse`), `supdb-zparse`: the same block format in
+    /// fewer sequences, a faster cold decode for the builders' CPU, priced
+    /// where the builds ahead carry the build beside the load.
+    pub fn create_zparse(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zparse: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` whose WAL keeps its synced frames in the page cache
     /// (`Options::wal_drop_bytes` zero): against `supdb` it prices the
     /// log's pages given back to the reads under a bound.
@@ -7874,6 +7888,9 @@ impl Engine for Supdb {
         if self.zrecodeauto {
             return "supdb-zrecodeauto";
         }
+        if self.zparse && self.budget == 0 {
+            return "supdb-zparse";
+        }
         if self.zsamplegap {
             return "supdb-zsamplegap";
         }
@@ -9382,6 +9399,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zsamplegap"
         | "supdb-zinstallwaits"
         | "supdb-zrecodeauto"
+        | "supdb-zparse"
         | "supdb-nozpagesnofitshort"
         | "supdb-nozpagesmergepar2"
         | "supdb-boundarytop"
@@ -9926,6 +9944,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zsamplegap" => supdb_arm(Supdb::create_zsamplegap, dir)?,
         "supdb-zinstallwaits" => supdb_arm(Supdb::create_zinstallwaits, dir)?,
         "supdb-zrecodeauto" => supdb_arm(Supdb::create_zrecodeauto, dir)?,
+        "supdb-zparse" => supdb_arm(Supdb::create_zparse, dir)?,
         "supdb-nozpagesnofitshort" => supdb_arm(Supdb::create_nozpages_nofitshort, dir)?,
         "supdb-nozpagesmergepar2" => supdb_arm(Supdb::create_nozpages_mergepar2, dir)?,
         "supdb-ingestmergepar2" => supdb_arm(Supdb::create_ingest_mergepar2, dir)?,
@@ -11500,6 +11519,7 @@ mod tests {
             "supdb-zsamplegap",
             "supdb-zinstallwaits",
             "supdb-zrecodeauto",
+            "supdb-zparse",
         ] {
             assert_eq!(
                 open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
@@ -11572,6 +11592,16 @@ mod tests {
                 assert_eq!(
                     (o.zpages, o.zpages_cover_resident, o.wal_drop_bytes),
                     (b.zpages, b.zpages_cover_resident, b.wal_drop_bytes)
+                );
+            }
+            {
+                let z = Supdb::create_zparse(&dir("zparse")).unwrap();
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_parse && !b.zpages_parse);
+                assert_eq!(
+                    (o.zpages, o.zpages_cover_resident, o.zpages_recode_auto),
+                    (b.zpages, b.zpages_cover_resident, b.zpages_recode_auto)
                 );
             }
             let w = Supdb::create_walkeep(&dir("walkeep")).unwrap();

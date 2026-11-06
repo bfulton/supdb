@@ -40,6 +40,11 @@ rocksdb = { version = "0.23", default-features = false }
 # form's own pages (`examples/zdecode.rs`, `--features lz4-c`). Optional, so
 # nothing the suite measures links the C library.
 lz4 = { version = "1", optional = true }
+# Other codecs beside LZ4, for the probe that prices each on the form's own
+# groups (`examples/zcodec.rs`, `--features codecs`). Optional, so nothing
+# the suite measures links them.
+zstd = { version = "0.13", optional = true }
+snap = { version = "1", optional = true }
 
 [dev-dependencies]
 # The payload test checks that values compress to the compressibility asked
@@ -52,6 +57,10 @@ lz4 = { version = "1", optional = true }
 # is the feature below.
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "frame"] }
 
+[build-dependencies]
+# For LZAV under `codecs` alone; already in the graph for the comparators.
+cc = { version = "1", optional = true }
+
 [features]
 # `zsize` built with the crate's safe encoder and decoder, to be run beside
 # the build without it: the pages come out byte for byte the same, and the
@@ -60,10 +69,17 @@ lz4-safe = ["lz4_flex/safe-encode", "lz4_flex/safe-decode"]
 # `zdecode` built with liblz4 beside the engine's decoder. Off for
 # everything the suite measures.
 lz4-c = ["dep:lz4"]
+# `zcodec` built with zstd, Snappy and LZAV (`vendor/lzav`, compiled by
+# `build.rs`) beside LZ4. Off for everything the suite measures.
+codecs = ["lz4-c", "dep:zstd", "dep:snap", "dep:cc"]
 
 [[example]]
 name = "zdecode"
 required-features = ["lz4-c"]
+
+[[example]]
+name = "zcodec"
+required-features = ["codecs"]
 
 # Cargo takes profiles from the root of the workspace being built, which is
 # this manifest, so the engine's own [profile.release] is ignored here and
