@@ -71,7 +71,15 @@ it.
 
 `sh scripts/check.sh` runs every group -- build, test, lint, wasm, bench --
 and CI calls the same script with the same names, so a green run here is a
-green run there. Use a group name to run one. `quick` is a group too, the
+green run there. Every group denies warnings, the wasm group since it was
+found printing six dead-code warnings and reporting green: the module built
+under cargo's default of warn, and nobody reads a build log that ends in
+sizes. Four were `format`'s superblock constants, which `blob` kept copies
+of from the time they lived in the write path, so on wasm the originals had
+no reader; the copies are gone and the reader names the one definition. One
+was a writer's phase timer that sat in `format` and belongs beside its
+caller in `flatindex`, whose writer half carries the wasm allowance; one was
+`Blob::id`, whose callers are the engine's caches, compiled where they are. Use a group name to run one. `quick` is a group too, the
 suite's quick-scale measurement, twenty minutes or so with half of it
 the threaded scans; it is not in the default set because a
 timing run needs the machine to itself, and CI gives it a job of its own.

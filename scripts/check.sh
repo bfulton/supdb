@@ -58,8 +58,8 @@ for g in $groups; do
       ;;
     wasm)
       say "wasm"
-      # Builds the module and the floor and prints their sizes; the check
-      # is that the module still links.
+      # Builds the module and the floor under -D warnings and prints their
+      # sizes; the check is that the module still links, and builds clean.
       sh web/build.sh
       ;;
     bench)

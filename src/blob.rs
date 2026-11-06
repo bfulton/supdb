@@ -98,29 +98,21 @@ fn fixed_count(exts: &[Ext], stride: u64, width: u64) -> Option<u64> {
     Some(total)
 }
 
-/// Superblock magic and geometry.
+/// Superblock magic and geometry: `format`'s, the one definition, which
+/// compiles on every target.
 ///
-/// Duplicated from `store.rs` rather than shared, because `store.rs` does not
-/// compile for wasm -- it is the write path and it maps files -- so this
-/// reader cannot call into it.
-///
-/// A duplicated format constant is a liability and this one has already gone
-/// off. `store.rs` grew two superblock fields, the encoded size went from 120
+/// This module kept a copy once, from when the constants lived in the write
+/// path and the write path did not compile for wasm, and the copy went off:
+/// the writer grew two superblock fields, the encoded size went from 120
 /// bytes to 136 and the magic to version 2, and this decoder went on slicing
 /// 120 -- reading a prefix that no longer reached the checksum, and reporting
-/// a perfectly healthy file as "no valid supdb checkpoint". That is the same
-/// trap the commit which added those fields describes eight instances of
-/// inside `store.rs` itself; this was the ninth, in another module.
-///
-/// Two things catch it now. `tests/blob.rs` opens a store written by
-/// `store.rs` and fails on six paths at once, which is how it was found. And
-/// the constants below are asserted equal to `store.rs`'s at compile time on
-/// every native build, which says *why* in one line instead of six stack
-/// traces.
-const MAGIC: u64 = 0x5355_5044_4200_0007;
-const SUPER: u64 = 4096;
-const SLOT: u64 = 512;
-const SB_BYTES: usize = 144;
+/// a perfectly healthy file as "no valid supdb checkpoint". `tests/blob.rs`,
+/// which opens a store the writer wrote, failed on six paths at once, which
+/// is how it was found, and the copy was then asserted equal to the writer's
+/// at compile time on native builds. With the constants in `format`, the
+/// copy was the only reason `format`'s own were unread on wasm; the reader
+/// names them now, and the assertion left is the superblock's arithmetic.
+use crate::format::{MAGIC, SLOT, SUPER, SUPER_BYTES as SB_BYTES};
 const SB_FIELDS: usize = 16;
 
 /// The superblock page's extension: what a write-once segment adds after
@@ -253,20 +245,8 @@ pub fn decode_super_ext(page: &[u8], generation: u64) -> Option<SuperExt> {
     })
 }
 
-// The write path is not compiled for wasm, so this can only be checked where
-// it is -- which is every build that could have changed it.
-#[cfg(not(target_family = "wasm"))]
-const _: () = {
-    assert!(MAGIC == crate::format::MAGIC, "superblock magic drifted");
-    assert!(
-        SB_BYTES == crate::format::SUPER_BYTES,
-        "the superblock changed size and blob.rs still slices the old one"
-    );
-    assert!(SUPER == crate::format::SUPER);
-    assert!(SLOT == crate::format::SLOT);
-    // The fields, then the magic, then the checksum.
-    assert!(SB_BYTES == SB_FIELDS * 8 + 16, "field count disagrees");
-};
+// The fields, then the magic, then the checksum.
+const _: () = assert!(SB_BYTES == SB_FIELDS * 8 + 16, "field count disagrees");
 
 #[derive(Clone, Copy, Debug)]
 struct Super {
@@ -795,7 +775,10 @@ impl<B: Bytes> Blob<B> {
 
     /// A number no other open blob in this process has: what a cache
     /// derived from one blob is keyed by, so it cannot be read against
-    /// another over the same range.
+    /// another over the same range. The caches are the engine's, which
+    /// the wasm build has none of, so the accessor is compiled where a
+    /// caller can be; the field stays, the decode scratch is keyed by it.
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn id(&self) -> u64 {
         self.id
     }

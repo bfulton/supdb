@@ -39,6 +39,11 @@ fi
 # ignored there; keeping a second copy in the other manifest meant two
 # definitions of one thing with nothing holding them equal. As overrides
 # they travel with the only script that wants them.
+# `-D warnings`, as every other group holds: for a year the module built
+# with six dead-code warnings nobody read, and this group reported green.
+# Cargo caps lints on registry dependencies, so the flag reaches this
+# crate and the floor alone.
+export RUSTFLAGS="${RUSTFLAGS:-} -D warnings"
 cargo build --release --lib --target wasm32-unknown-unknown \
   --config 'profile.release.opt-level="z"' \
   --config 'profile.release.lto="fat"' \

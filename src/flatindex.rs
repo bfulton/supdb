@@ -38,6 +38,15 @@
 
 use crate::index::{Ext, Exts};
 
+/// Sub-phases of `encode`, printed under `SUPDB_CKPT_PHASES`. Here beside
+/// its caller, the writer half this module compiles on every target: in
+/// `format` it was the one item there with no reader behind it.
+fn enc_phase(what: &str, t: std::time::Instant) {
+    if std::env::var_os("SUPDB_CKPT_PHASES").is_some() {
+        eprintln!("      enc:{what} {:.4}s", t.elapsed().as_secs_f64());
+    }
+}
+
 /// "SFIX", little-endian.
 const MAGIC: u32 = 0x5849_4653;
 const VERSION: u32 = 3;
@@ -1419,7 +1428,7 @@ pub fn encode_inline(
 
     // `store` is cfg'd off the wasm build; the timing hook goes with it.
     #[cfg(not(target_family = "wasm"))]
-    crate::format::enc_phase("recs", _t_enc);
+    enc_phase("recs", _t_enc);
     let _t_enc = std::time::Instant::now();
     // The fence: every stride-th key copied out, with one more offset than
     // entries so an entry's key is the span to the next.
@@ -1438,7 +1447,7 @@ pub fn encode_inline(
 
     // `store` is cfg'd off the wasm build; the timing hook goes with it.
     #[cfg(not(target_family = "wasm"))]
-    crate::format::enc_phase("fence", _t_enc);
+    enc_phase("fence", _t_enc);
     let _t_enc = std::time::Instant::now();
     let mask = p.hash_cap - 1;
     // The hash is two thirds of the encode: the probe writes land at random
