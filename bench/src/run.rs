@@ -2504,6 +2504,18 @@ fn one_pass(
             (0, 0)
         };
         let mix = format!("ycsb-{letter}");
+        // A probe's fold before the mixes it names (`SUPDB_MIX_FOLD`, the
+        // letters, `Engine::fold`): the writes before the mix folded into
+        // the store outside its window, its time and the form's cover on a
+        // `mixfold` line. Never set for a row.
+        if std::env::var("SUPDB_MIX_FOLD").is_ok_and(|v| v.contains(letter)) {
+            let t = std::time::Instant::now();
+            e.fold()?;
+            eprintln!(
+                "mixfold {arm} {letter} ms {:.0}",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
         let cb = counting.begin();
         phase_mark(arm, &mix, "start");
         let secs = ycsb(e.as_mut(), arm, w, size, mix_ops, &mut inserted, payload)?;

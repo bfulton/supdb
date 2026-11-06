@@ -9126,6 +9126,129 @@ fn the_controller_recodes_the_hottest_partition_within_the_budget() {
     }
 }
 
+/// Under the controller with the re-parse (`Options::zpages_reparse`), once
+/// the form is installed, the block-coded partition whose decodes cost the
+/// most is built again by the parsing encoder and swapped in -- its form
+/// file smaller, as only the parse makes it, its coding the same -- once
+/// while its segment lives, and a partition under its share of the decode
+/// time is left as it was; every read answers as the raw form does across
+/// the swap. Without the option nothing is re-parsed however hot a
+/// partition reads.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_controller_reparses_the_hottest_partition_once() {
+    for on in [true, false] {
+        let what = format!("reparse {on}");
+        let (dir, db, model, inject) = auto_store_with(
+            &format!("auto-reparse-{on}"),
+            1 << 20,
+            1_000_000.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_reparse = on;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        // A decode priced by the seam, so that the heat is the decodes: at
+        // twenty microseconds the warm partition's thousand reads a look are
+        // past the floor and a hundredth of the hot one's, under its share
+        // through the heat's average, which lags the rates, and through the
+        // look after the swap, when the hot partition's new file gives no
+        // rate yet.
+        inject.set_decode_cost(std::time::Duration::from_micros(20));
+        inject.set_budget(db.zpage_counts().file_bytes * 2);
+        assert!(
+            codings(&db).iter().all(|c| !c),
+            "{what}: built in the block coding: {:?}",
+            codings(&db)
+        );
+        assert!(
+            db.zpage_counts().form_files >= 5,
+            "{what}: partitions to choose from: {:?}",
+            db.zpage_counts()
+        );
+        let bytes =
+            |db: &Db| -> Vec<u64> { db.zpage_heat().iter().map(|h| h.file_bytes).collect() };
+        let before = bytes(&db);
+        let hot = keys_of_partition(&db, &model, 2);
+        let warm = keys_of_partition(&db, &model, 4);
+        let heat = |db: &Db| {
+            heat_up(db, &hot, 100_000);
+            heat_up(db, &warm, 1_000);
+        };
+        if on {
+            recode_look(&db, std::time::Duration::from_secs(1));
+            heat(&db);
+            recode_look(&db, std::time::Duration::from_secs(1));
+            assert!(
+                tick_until(&db, 400, |c| c.reparses >= 1),
+                "{what}: the hot partition re-parsed: {:?} {:?}",
+                db.zpage_counts(),
+                db.zpage_heat()
+            );
+            let after = bytes(&db);
+            assert!(
+                after[2] < before[2],
+                "{what}: the parse's smaller file: {before:?} -> {after:?}"
+            );
+            for (i, (a, b)) in after.iter().zip(&before).enumerate() {
+                if i != 2 {
+                    assert_eq!(a, b, "{what}: partition {i} as it was");
+                }
+            }
+            assert!(
+                codings(&db).iter().all(|c| !c),
+                "{what}: still block-coded: {:?}",
+                codings(&db)
+            );
+            // The hot one again and the warm one under its share: more
+            // looks re-parse nothing. The reads are checked after them,
+            // since a read of every key is a heat of its own.
+            for _ in 0..3 {
+                heat(&db);
+                recode_look(&db, std::time::Duration::from_secs(1));
+            }
+            wait_steps(&db, 5);
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.reparses, c.recodes, c.recodes_back),
+                (1, 0, 0),
+                "{what}: {c:?}"
+            );
+            assert_eq!(bytes(&db), after, "{what}: nothing built again");
+        } else {
+            for _ in 0..3 {
+                heat(&db);
+                advance_tick(&db, std::time::Duration::from_secs(1));
+            }
+            wait_steps(&db, 5);
+            let c = db.zpage_counts();
+            assert_eq!((c.reparses, c.recode_looks), (0, 0), "{what}: {c:?}");
+            assert_eq!(bytes(&db), before, "{what}: nothing built again");
+        }
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// A forced store whose served partitions the re-code policy re-codes, the
 /// raw pages dropped and every read decoding (no memo), its budget and its
 /// refaults the seam's: loaded, settled, and looked at once.

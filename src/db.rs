@@ -614,6 +614,9 @@ pub struct ZCounts {
     pub recodes_back: u64,
     pub recode_failed: u64,
     pub recode_looks: u64,
+    /// Block-coded partitions re-parsed while served
+    /// (`Options::zpages_reparse`).
+    pub reparses: u64,
     /// Re-codes made by exchanging the served form file with the kept one
     /// (`Options::zpages_recode_keep`), counted among `recodes` and
     /// `recodes_back` by the coding they served; the kept form files now,
@@ -3742,6 +3745,24 @@ pub struct Options {
     /// (`docs/engine.md`). Off; `supdb-zrecodeauto` is the arm.
     #[doc(hidden)]
     pub zpages_recode_auto: bool,
+    /// EXPERIMENT: under the controller (`ZPages::Auto`), once the form is
+    /// installed and the builder has nothing due, the hottest block-coded
+    /// partitions are built again by the parsing encoder (`zpages_parse`)
+    /// and swapped into their cells while they serve (`ZKind::Reparse`):
+    /// the builds the install waits for keep the greedy encoder, whose CPU
+    /// keeps the builds ahead level with the load, and the decodes the
+    /// parse makes cheaper are bought where the builder is free. A
+    /// partition holding at least `RECODE_AUTO_SHARE` of the store's decode
+    /// time, timed as the re-code policy times it, is re-parsed once while
+    /// its segment lives; the form only shrinks, so no budget is checked,
+    /// and no build starts while a seal or a merge runs. Refuted at ten
+    /// million keys under 1.25 GiB: eight partitions re-parsed a rep took
+    /// E's scans 1.4% faster, and the write mixes they were built in paid
+    /// for their bytes at the durable commits' fsyncs, D's commits a fifth
+    /// slower and A's a tenth (`docs/engine.md`). Off; `supdb-zreparse` is
+    /// the arm.
+    #[doc(hidden)]
+    pub zpages_reparse: bool,
 }
 
 impl Options {
@@ -3749,7 +3770,7 @@ impl Options {
     /// raw-tailed group's opens (`zfile::ZFile::time_decodes`): the heat the
     /// re-code policy reads, under the forced form or the controller.
     pub(crate) fn z_times_decodes(&self) -> bool {
-        self.zpages_recode || self.zpages_recode_auto
+        self.zpages_recode || self.zpages_recode_auto || self.zpages_reparse
     }
 
     /// The form file's group coding the options ask for
@@ -4007,6 +4028,7 @@ impl Default for Options {
             zpages_cover_resident: true,
             zpages_suspect_at_crossing: true,
             zpages_recode_auto: false,
+            zpages_reparse: false,
         }
     }
 }
@@ -4838,6 +4860,9 @@ struct ZBuild {
     /// A re-code collected into the cell of kept form files and not the
     /// served one (`ZKind::Spare`).
     spare: bool,
+    /// A re-code in the served coding by the parsing encoder
+    /// (`ZKind::Reparse`).
+    reparse: bool,
 }
 
 /// What the builder's thread is running: a build, or a warm of an attached
@@ -4879,6 +4904,9 @@ enum ZKind {
     /// The served form file built in the other coding to be kept beside
     /// it, unserved (`Options::zpages_both`).
     Spare,
+    /// The served block-coded form file built again in its coding by the
+    /// parsing encoder and swapped in (`Options::zpages_reparse`).
+    Reparse,
 }
 
 /// `seg`'s form file taken out of its cell and retired through the epoch --
@@ -18631,6 +18659,7 @@ impl Reader {
             recodes_back: get(&ev.recodes_back),
             recode_failed: get(&ev.recode_failed),
             recode_looks: get(&ev.recode_looks),
+            reparses: get(&ev.reparses),
             recode_flips: get(&ev.recode_flips),
             spare_builds: get(&ev.spare_builds),
             spare_failed: get(&ev.spare_failed),
@@ -35476,6 +35505,9 @@ struct Maint {
     /// Partitions whose spare build kept nothing (`Options::zpages_both`),
     /// not built a spare again.
     z_spare_failed: std::collections::HashSet<String>,
+    /// The partitions re-parsed while served (`Options::zpages_reparse`),
+    /// by segment name, so that each is re-parsed once while it lives.
+    z_reparsed: std::collections::HashSet<String>,
     /// The last look's refaults were past `RECODE_REFAULTS`: a flip asks
     /// for none of the incoming file's pages.
     z_recode_pressed: bool,
@@ -36052,6 +36084,7 @@ impl Maint {
             z_recode_refaults: None,
             z_recode_ceiling: None,
             z_spare_failed: std::collections::HashSet::new(),
+            z_reparsed: std::collections::HashSet::new(),
             z_recode_pressed: false,
         }
     }
@@ -37812,6 +37845,39 @@ impl Maint {
             .iter()
             .filter(|p| p.coded)
             .min_by(|a, b| a.heat.total_cmp(&b.heat));
+        // The re-parse under the controller (`Options::zpages_reparse`):
+        // the hottest block-coded partition not yet re-parsed, at least
+        // `RECODE_AUTO_SHARE` of the decode time, built again by the
+        // parsing encoder. The form shrinks by it, so no budget is checked.
+        if self.opts.zpages == ZPages::Auto
+            && self.opts.zpages_reparse
+            && !self.opts.zpages_recode_auto
+        {
+            let live: std::collections::HashSet<&str> =
+                parts.iter().map(|p| p.seg.name.as_str()).collect();
+            self.z_reparsed.retain(|n| live.contains(n.as_str()));
+            let heat_all: f64 = parts.iter().map(|p| p.heat).sum();
+            let Some(p) = parts
+                .iter()
+                .filter(|p| !p.coded && !self.z_reparsed.contains(&p.seg.name))
+                .max_by(|a, b| a.heat.total_cmp(&b.heat))
+            else {
+                return;
+            };
+            if p.heat < RECODE_FLOOR_NS || p.heat < RECODE_AUTO_SHARE * heat_all {
+                if self.z_trace {
+                    trace("cold", Some(p), None);
+                }
+                return;
+            }
+            if self.z_trace {
+                trace("reparse", Some(p), None);
+            }
+            let seg = p.seg.clone();
+            self.z_reparsed.insert(seg.name.clone());
+            self.z_start(seg, ZKind::Reparse, false);
+            return;
+        }
         // Under the controller (`Options::zpages_recode_auto`): the hottest
         // block-coded partition, at least `RECODE_AUTO_SHARE` of the decode
         // time, re-coded to the raw tails where the form with their extra
@@ -38626,9 +38692,10 @@ impl Maint {
             }
         }
         // Once the form is installed and the builder has nothing due, the
-        // re-code policy's turn (`Options::zpages_recode_auto`).
+        // re-code policy's turn (`Options::zpages_recode_auto`,
+        // `Options::zpages_reparse`).
         if d.build
-            && self.opts.zpages_recode_auto
+            && (self.opts.zpages_recode_auto || self.opts.zpages_reparse)
             && self.zbuild.is_none()
             && self.zsel.phase() == zselect::Phase::Compact
             && !self.z_settling
@@ -39523,7 +39590,7 @@ impl Maint {
                 zfile::ZEvents::add(&ev.rebuilds, 1);
             }
             ZKind::Retry => zfile::ZEvents::add(&ev.build_retries, 1),
-            ZKind::Build | ZKind::Warm | ZKind::Recode | ZKind::Spare => {}
+            ZKind::Build | ZKind::Warm | ZKind::Recode | ZKind::Spare | ZKind::Reparse => {}
         }
         let refused = seg.z_declined.load(AtomicOrdering::Relaxed) == zfile::DECLINED_REFUSED;
         // A re-code's partition is served by the file under the name, which
@@ -39531,7 +39598,8 @@ impl Maint {
         // A spare is built as a re-code is, the other coding of the served
         // file, and kept where a re-code swaps.
         let spare = kind == ZKind::Spare;
-        let recode = kind == ZKind::Recode || spare;
+        let reparse = kind == ZKind::Reparse;
+        let recode = kind == ZKind::Recode || spare || reparse;
         if !recode && self.z_attach_on_disk(&seg, id, end, dormant, refused) {
             return;
         }
@@ -39592,6 +39660,11 @@ impl Maint {
         // it chooses one (`Options::zpages_coding_auto`), else the options'.
         let served_coded = seg.z.get().map(|z| z.coded());
         let (coding, raw_tails) = match self.z_coding_pick {
+            // A re-parse keeps the served block coding.
+            _ if reparse => match served_coded {
+                Some(false) => (zpages::ZCODING_BLOCK, false),
+                _ => return,
+            },
             _ if recode => match served_coded {
                 Some(true) => (zpages::ZCODING_BLOCK, false),
                 Some(false) => (zpages::ZCODING_RECORD, true),
@@ -39631,7 +39704,7 @@ impl Maint {
             self.z_ahead_coding
                 .insert(zfile::zpg_name(id, end), raw_tails);
         }
-        plan.parse = self.opts.zpages_parse;
+        plan.parse = self.opts.zpages_parse || reparse;
         plan.own_decode = self.opts.zpages_own_decoder;
         if raw_tails {
             zfile::ZEvents::add(&ev.builds_raw_tails, 1);
@@ -39685,6 +39758,7 @@ impl Maint {
                     dormant,
                     recode,
                     spare,
+                    reparse,
                 });
             }
             Err(_) => failed(zfile::DECLINED_FAILED),
@@ -39707,6 +39781,7 @@ impl Maint {
             dormant,
             recode,
             spare,
+            reparse,
             ..
         } = b;
         let handle = match job {
@@ -39878,7 +39953,9 @@ impl Maint {
                         }
                         ev.built(&built);
                         zfile::ZEvents::add(&ev.attached, 1);
-                        if coded {
+                        if reparse {
+                            zfile::ZEvents::add(&ev.reparses, 1);
+                        } else if coded {
                             zfile::ZEvents::add(&ev.recodes, 1);
                         } else {
                             zfile::ZEvents::add(&ev.recodes_back, 1);
@@ -40018,6 +40095,7 @@ impl Maint {
                 dormant: false,
                 recode: false,
                 spare: false,
+                reparse: false,
             });
         }
     }

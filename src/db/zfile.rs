@@ -3446,6 +3446,9 @@ pub(super) struct ZEvents {
     pub recodes: AtomicU64,
     pub recodes_back: AtomicU64,
     pub recode_failed: AtomicU64,
+    /// Block-coded partitions built again by the parsing encoder while
+    /// served (`Options::zpages_reparse`), and swapped in.
+    pub reparses: AtomicU64,
     /// The re-code policy's looks, one a period it read the heat at.
     pub recode_looks: AtomicU64,
     /// Re-codes made by exchanging the served form file with the kept one.

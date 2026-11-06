@@ -261,6 +261,15 @@ pub trait Engine {
     fn settle(&mut self) -> Res<()> {
         Ok(())
     }
+    /// A probe's step and never the suite's (`SUPDB_MIX_FOLD`): what the
+    /// writes since the load left over the store folded into it -- for
+    /// supdb the memtable sealed, the merges joined and the compact form
+    /// covering the partitions they rewrote again -- so that a mix after it
+    /// reads the same data with nothing overlaid. Outside every timed
+    /// window. Nothing, for an engine that applies its writes in place.
+    fn fold(&mut self) -> Res<()> {
+        Ok(())
+    }
     fn size_bytes(&self) -> u64;
     /// A reader for a thread of its own, made here on the thread that
     /// owns the engine and opened on the thread that reads through it.
@@ -592,6 +601,10 @@ pub struct Supdb {
     /// once the form is installed (`Options::zpages_recode_auto`).
     /// `supdb-zrecodeauto`, durable.
     zrecodeauto: bool,
+    /// The controller's re-parse of its hottest block-coded partitions once
+    /// the form is installed (`Options::zpages_reparse`).
+    /// `supdb-zreparse`, durable.
+    zreparse: bool,
     /// The block cache reads a block boundary's key off the ordered index's
     /// top level in memory, where the default reads the partition's record
     /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
@@ -1408,6 +1421,10 @@ struct Policy {
     /// once the form is installed (`Options::zpages_recode_auto`).
     /// `supdb-zrecodeauto`, durable.
     zrecodeauto: bool,
+    /// The controller's re-parse of its hottest block-coded partitions once
+    /// the form is installed (`Options::zpages_reparse`).
+    /// `supdb-zreparse`, durable.
+    zreparse: bool,
     /// The block cache reads a block boundary's key off the ordered index's
     /// top level in memory, where the default reads the partition's record
     /// (`Options::boundary_keys_from_top`). `supdb-ingestboundarytop`, and
@@ -1984,6 +2001,7 @@ impl Default for Policy {
             zsamplegap: false,
             zinstallwaits: false,
             zrecodeauto: false,
+            zreparse: false,
             boundarytop: false,
             nodirwillneed: false,
             noboundsheadwillneed: false,
@@ -3884,6 +3902,20 @@ impl Supdb {
             path,
             Policy {
                 zrecodeauto: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose controller re-parses its hottest block-coded
+    /// partitions once the form is installed and the builder is free
+    /// (`Options::zpages_reparse`), `supdb-zreparse`: the parse's cheaper
+    /// decodes without its CPU in the builds the install waits for.
+    pub fn create_zreparse(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zreparse: true,
                 ..Policy::default()
             },
         )
@@ -6524,6 +6556,7 @@ impl Supdb {
             zsamplegap,
             zinstallwaits,
             zrecodeauto,
+            zreparse,
             boundarytop,
             nodirwillneed,
             noboundsheadwillneed,
@@ -6841,6 +6874,7 @@ impl Supdb {
             zpages_cover_resident: !zinstallwaits,
             zpages_suspect_at_crossing: !zinstallwaits,
             zpages_recode_auto: zrecodeauto,
+            zpages_reparse: zreparse,
             wal_drop_bytes: if walkeep {
                 0
             } else {
@@ -7128,6 +7162,7 @@ impl Supdb {
             zsamplegap,
             zinstallwaits,
             zrecodeauto,
+            zreparse,
             boundarytop,
             nodirwillneed,
             noboundsheadwillneed,
@@ -7888,6 +7923,9 @@ impl Engine for Supdb {
         if self.zrecodeauto {
             return "supdb-zrecodeauto";
         }
+        if self.zreparse {
+            return "supdb-zreparse";
+        }
         if self.zparse && self.budget == 0 {
             return "supdb-zparse";
         }
@@ -8619,6 +8657,7 @@ impl Engine for Supdb {
             ("zpage_build_majflt", z.build_majflt as f64),
             ("zpage_recodes", z.recodes as f64),
             ("zpage_recodes_back", z.recodes_back as f64),
+            ("zpage_reparses", z.reparses as f64),
             ("zpage_recode_failed", z.recode_failed as f64),
             ("zpage_recode_flips", z.recode_flips as f64),
             ("zpage_spare_files", z.spare_files as f64),
@@ -8750,6 +8789,26 @@ impl Engine for Supdb {
     fn settle(&mut self) -> Res<()> {
         if let Some(db) = self.db.as_mut() {
             db.settle().map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+    fn fold(&mut self) -> Res<()> {
+        if let Some(db) = self.db.as_mut() {
+            db.flush().map_err(|e| e.to_string())?;
+            db.settle().map_err(|e| e.to_string())?;
+            // Under the controller the partitions a merge rewrote are built
+            // again by the segment work in its own time: waited for here, a
+            // two-minute cap on the wait.
+            if db.options().zpages != supdb::db::ZPages::Off {
+                let t = std::time::Instant::now();
+                loop {
+                    let c = db.zpage_counts();
+                    if c.form_files >= c.partitions || t.elapsed().as_secs() >= 120 {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
         }
         Ok(())
     }
@@ -9399,6 +9458,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zsamplegap"
         | "supdb-zinstallwaits"
         | "supdb-zrecodeauto"
+        | "supdb-zreparse"
         | "supdb-zparse"
         | "supdb-nozpagesnofitshort"
         | "supdb-nozpagesmergepar2"
@@ -9944,6 +10004,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zsamplegap" => supdb_arm(Supdb::create_zsamplegap, dir)?,
         "supdb-zinstallwaits" => supdb_arm(Supdb::create_zinstallwaits, dir)?,
         "supdb-zrecodeauto" => supdb_arm(Supdb::create_zrecodeauto, dir)?,
+        "supdb-zreparse" => supdb_arm(Supdb::create_zreparse, dir)?,
         "supdb-zparse" => supdb_arm(Supdb::create_zparse, dir)?,
         "supdb-nozpagesnofitshort" => supdb_arm(Supdb::create_nozpages_nofitshort, dir)?,
         "supdb-nozpagesmergepar2" => supdb_arm(Supdb::create_nozpages_mergepar2, dir)?,
@@ -11520,6 +11581,7 @@ mod tests {
             "supdb-zinstallwaits",
             "supdb-zrecodeauto",
             "supdb-zparse",
+            "supdb-zreparse",
         ] {
             assert_eq!(
                 open(arm, &dir(&format!("{arm}-open")), 1).unwrap().name(),
@@ -11599,6 +11661,17 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.zpages_parse && !b.zpages_parse);
+                assert_eq!(
+                    (o.zpages, o.zpages_cover_resident, o.zpages_reparse),
+                    (b.zpages, b.zpages_cover_resident, b.zpages_reparse)
+                );
+            }
+            {
+                let z = Supdb::create_zreparse(&dir("zreparse")).unwrap();
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_reparse && !b.zpages_reparse);
+                assert!(!o.zpages_parse && !o.zpages_recode_auto);
                 assert_eq!(
                     (o.zpages, o.zpages_cover_resident, o.zpages_recode_auto),
                     (b.zpages, b.zpages_cover_resident, b.zpages_recode_auto)
