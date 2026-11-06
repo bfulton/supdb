@@ -3417,6 +3417,22 @@ count moves, so it is read with that count beside it; and a burst slower
 than its commits is read against the writer's CPU and its holds before a
 syscall is suspected.
 
+**A thing kept for a reader, freed by whoever published next.** The tables
+a publish replaced are kept for the writer's upkeep's look
+(`State::replaced`), and a publish trimmed the list to the tables since the
+look; the look itself, having read a table, dropped nothing. A store only
+read after its writes publishes nothing for seconds, so a replaced memtable
+of a hundred megabytes and the seal's snapshot copy of it, another hundred,
+stood through a pass of scans under a bound that could not spare them,
+named by the lag census (`mem_replaced`, `snap_tables`) in one arm of a
+pairing and absent in the other, since the other's chain of landings had
+happened to publish after the look. The list is behind a lock and the look
+drops what it has read where the state stands (`tests/db.rs`). The rule:
+whatever is kept for a reader is freed by that reader when it is done,
+never by an event that may not come; and a retention that a pairing's
+census shows in one arm alone is read as a timing the other arm escaped
+before it is read as that arm's.
+
 **A rule right for a build and wrong for an attach, and a reading dropped
 at every landing of a chain.** The form files a merge's outputs are given
 at their finish (`Options::zpages_build_at_finish`) stood on disk beside

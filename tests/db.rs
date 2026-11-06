@@ -606,6 +606,76 @@ fn the_oracle_holds_on_a_buffered_store_that_lends_every_batch() {
     );
 }
 
+/// A look that passes a table drops it from `State::replaced` where the
+/// state stands, with the seal's snapshot copy it holds, and not at the
+/// next publish: a store only read after its writes may publish nothing
+/// for seconds, and a replaced memtable and its copy, a hundred megabytes
+/// each at ten million keys, stood through a pass of scans for a look that
+/// had come. The thread is held before its pass while a table freezes and
+/// lands, so the table is kept for a look that has not come; the look --
+/// the thread's pass, or the scan that takes the upkeep home -- then
+/// leaves nothing kept, with no publish between.
+#[test]
+fn a_look_drops_the_tables_it_passed_before_any_publish() {
+    let d = dir("look-drops-replaced");
+    let mut db = Db::create(
+        &d,
+        Options {
+            upkeep: supdb::Upkeep::Background(1),
+            seal_bytes: 64 << 10,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let put = |db: &mut Db, i: u32, v: &str| {
+        db.append(format!("k{:08}", i).as_bytes(), v.as_bytes());
+    };
+    for i in 0..20_000 {
+        put(&mut db, i, "a");
+    }
+    db.commit().unwrap();
+    db.sync().unwrap();
+    // A scan makes the forms and the look the tables are kept for.
+    let mut n = 0;
+    db.scan(b"", 100, kv(&mut |_, _| n += 1)).unwrap();
+    assert!(n > 0);
+    db.hold_upkeep_pass(true);
+    let (_, _, lives0, _) = db.upkeep_abandon_state();
+    let landed0 = db.tables_landed();
+    let t = std::time::Instant::now();
+    let mut i = 0u32;
+    while db.upkeep_abandon_state().2 == lives0 {
+        assert!(t.elapsed().as_secs() < 60, "no freeze");
+        for _ in 0..100 {
+            put(&mut db, (i * 37) % 20_000, "b");
+            i += 1;
+        }
+        db.commit().unwrap();
+    }
+    while db.tables_landed() == landed0 {
+        assert!(t.elapsed().as_secs() < 60, "the frozen table never landed");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let (_, kept, lives, look) = db.upkeep_abandon_state();
+    assert!(
+        kept >= 1 && look < lives,
+        "a table kept for the look that has not come: kept {kept}, lives {lives}, look {look}"
+    );
+    let landed = db.tables_landed();
+    db.hold_upkeep_pass(false);
+    let mut n = 0;
+    db.scan(b"", 100, kv(&mut |_, _| n += 1)).unwrap();
+    assert!(n > 0);
+    let (_, kept, lives_now, look) = db.upkeep_abandon_state();
+    assert_eq!(
+        (kept, look, lives_now, db.tables_landed()),
+        (0, lives, lives, landed),
+        "the look dropped the tables it passed, with no publish between"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// A thread the writes have outrun gives its forms up until the next scan
 /// (`Options::upkeep_abandons`): with one table kept for its look and the
 /// thread held before its pass while the writer freezes tables past it, the

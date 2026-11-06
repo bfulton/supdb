@@ -13967,8 +13967,14 @@ struct State {
     /// the one live before `mem`, from the one live at the writer's
     /// upkeep's last look (`Shared::upkeep_lives`) on: a look reads the
     /// writes it has not read from each, a landing having retired it or
-    /// not. Empty where the upkeep reads none (`Db::replaced_from`).
-    replaced: Vec<std::sync::Arc<MemTable>>,
+    /// not. Empty where the upkeep reads none (`Db::replaced_from`). Behind
+    /// a lock, since the look that has read a table drops it where the
+    /// state stands (`Reader::note_over`) rather than at the next publish,
+    /// which a store only read may not make for seconds: the table a
+    /// landing replaced and the seal's snapshot copy it holds, a hundred
+    /// megabytes each at ten million keys, stood through a pass of scans
+    /// under a bound that could not spare them.
+    replaced: std::sync::Mutex<Vec<std::sync::Arc<MemTable>>>,
     /// Mean bytes a key costs across the live segments, kept rather than
     /// recomputed because `scan` asks it on every call and a fold over the
     /// segments there measured 5% of an in-core scan. Refreshed by
@@ -18182,8 +18188,9 @@ impl State {
         let Some(keep) = keep else {
             return Vec::new();
         };
-        let first = self.lives - self.replaced.len() as u64;
-        let all: Vec<_> = self.replaced.iter().chain(old).collect();
+        let replaced = self.replaced();
+        let first = self.lives - replaced.len() as u64;
+        let all: Vec<_> = replaced.iter().chain(old).collect();
         let mut skip = (keep.from.saturating_sub(first) as usize)
             .max(all.len().saturating_sub(REPLACED_CAP))
             .min(all.len());
@@ -18207,8 +18214,13 @@ impl State {
     /// for it, and drops its tables when it comes.
     fn keeps_short(&self, keep: Option<Keep>) -> bool {
         keep.is_some_and(|k| {
-            k.from != u64::MAX && self.lives.saturating_sub(k.from) > self.replaced.len() as u64
+            k.from != u64::MAX && self.lives.saturating_sub(k.from) > self.replaced().len() as u64
         })
+    }
+
+    /// The tables kept for the upkeep's look, under their lock.
+    fn replaced(&self) -> std::sync::MutexGuard<'_, Vec<std::sync::Arc<MemTable>>> {
+        self.replaced.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The level-0 pieces a read of a key in partition `at` consults.
@@ -20390,6 +20402,9 @@ impl Reader {
             self.shared
                 .upkeep_lives
                 .store(st.lives, AtomicOrdering::Relaxed);
+            // The tables kept for this look are read: dropped here, with
+            // the snapshot copies they hold, and not at the next publish.
+            st.replaced().clear();
         }
     }
 
@@ -20451,13 +20466,14 @@ impl Reader {
         } else if self.opts.freeze_settles {
             return false;
         } else {
-            let Some(at) = st.replaced.len().checked_sub(changes) else {
+            let replaced = st.replaced();
+            let Some(at) = replaced.len().checked_sub(changes) else {
                 return false;
             };
-            if !std::ptr::eq(over.mem.as_ptr(), std::sync::Arc::as_ptr(&st.replaced[at])) {
+            if !std::ptr::eq(over.mem.as_ptr(), std::sync::Arc::as_ptr(&replaced[at])) {
                 return false;
             }
-            st.replaced[at..].to_vec()
+            replaced[at..].to_vec()
         };
         let froze = !read_from.is_empty();
         // The frozen tables older than the table of the look: the list up
@@ -25313,7 +25329,7 @@ impl Reader {
                 .iter()
                 .map(|(m, _)| (2, m.clone())),
         );
-        mems.extend(st.replaced.iter().map(|m| (3, m.clone())));
+        mems.extend(st.replaced().iter().map(|m| (3, m.clone())));
         let mut rets = FormTally::default();
         let mut rets_n = 0u64;
         self.shared.retired.census(|b| {
@@ -25340,7 +25356,7 @@ impl Reader {
             mems.extend(
                 b.frozen
                     .iter()
-                    .chain(b.replaced.iter())
+                    .chain(b.replaced().iter())
                     .map(|m| (4, m.clone())),
             );
         });
@@ -26437,7 +26453,7 @@ impl Db {
             frozen: Vec::new(),
             gen: 1,
             lives: 0,
-            replaced: Vec::new(),
+            replaced: std::sync::Mutex::new(Vec::new()),
             mean_key_bytes,
             store_bytes,
             data_bytes,
@@ -26976,7 +26992,7 @@ impl Db {
             frozen: Vec::new(),
             gen: 1,
             lives: 0,
-            replaced: Vec::new(),
+            replaced: std::sync::Mutex::new(Vec::new()),
             mean_key_bytes,
             store_bytes,
             data_bytes,
@@ -28918,7 +28934,7 @@ impl Db {
                 .collect(),
             gen: cur.gen + 1,
             lives: cur.lives + 1,
-            replaced: cur.replaced_after(Some(&cur.mem), from),
+            replaced: std::sync::Mutex::new(cur.replaced_after(Some(&cur.mem), from)),
             mean_key_bytes: cur.mean_key_bytes,
             store_bytes: cur.store_bytes,
             data_bytes: cur.data_bytes,
@@ -29133,7 +29149,7 @@ impl Db {
                 frozen: cur.frozen.clone(),
                 gen: cur.gen + 1,
                 lives: cur.lives + 1,
-                replaced: cur.replaced_after(Some(&cur.mem), from),
+                replaced: std::sync::Mutex::new(cur.replaced_after(Some(&cur.mem), from)),
                 mean_key_bytes: cur.mean_key_bytes,
                 store_bytes: cur.store_bytes,
                 data_bytes: cur.data_bytes,
@@ -32910,7 +32926,7 @@ impl Db {
         let st = self.state();
         (
             self.shared.abandon_at.load(AtomicOrdering::Acquire) != u64::MAX,
-            st.replaced.len(),
+            st.replaced().len(),
             st.lives,
             self.shared.upkeep_lives.load(AtomicOrdering::Relaxed),
         )
@@ -37026,7 +37042,9 @@ impl Maint {
                 frozen,
                 gen: cur.gen + 1,
                 lives: cur.lives + u64::from(swapped_live),
-                replaced: cur.replaced_after(swapped_live.then_some(&cur.mem), from),
+                replaced: std::sync::Mutex::new(
+                    cur.replaced_after(swapped_live.then_some(&cur.mem), from),
+                ),
                 mean_key_bytes,
                 store_bytes,
                 data_bytes,
