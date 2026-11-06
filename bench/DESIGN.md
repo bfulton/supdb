@@ -211,7 +211,7 @@ comparator a user would otherwise pick.
 
 | guarantee | supdb | comparators |
 |---|---|---|
-| durable per batch | `supdb` (default), `supdb-forms`, `supdb-settle`, `supdb-nosnap`, `supdb-noadvice`, `supdb-nocache`, `supdb-cache256` | `lmdb`, `rocksdb-tuned` |
+| durable per batch | `supdb` (default), `supdb-forms`, `supdb-settle`, `supdb-nosnap`, `supdb-noadvice`, `supdb-nocache`, `supdb-cache256` | `lmdb`, `rocksdb-tuned`, and in the bounded roster `rocksdb-tuned-lz4` |
 | buffered | `supdb-ingest` | `lmdb-nosync`, `rocksdb-tuned-nosync` |
 
 A comparator runs one stated configuration in both groups, the two
@@ -226,6 +226,17 @@ no Bloom filter) beside the tuned durable arm until the rows banked at
 `b1bd544` on 31 October 2026, so every buffered cell against RocksDB in the
 rows before is against a configuration no deployment would choose; that
 series stops there and the tuned one starts.
+
+RocksDB stores its blocks uncompressed in every arm but `rocksdb-tuned-lz4`,
+the tuned durable arm with LZ4 over its SSTs, which the bounded roster
+(`ooc`) carries: past memory what the device holds is what a read costs, and
+an uncompressed RocksDB there is a shape no deployment would run. Every arm
+runs RocksDB on the system allocator, its own guidance being jemalloc; the
+`rocksdb-alloc` workflow builds the suite with and without the crate's
+prefixed jemalloc, runs `rocksdb-tuned` over the quick ladder from each on
+one hosted runner, and prints the two beside each other with the reps'
+spread. A switch of the suite's RocksDB to jemalloc is a definition step,
+banked with the row that priced it, never a change the table makes alone.
 
 The comparator cells are held to the comparators' own tools once a week
 (`comparators.yml`, by hand as well): db_bench built from the RocksDB

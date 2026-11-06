@@ -1,0 +1,60 @@
+name: rocksdb-alloc
+
+# RocksDB on the system allocator, as every arm runs it, against RocksDB on
+# the prefixed jemalloc its own guidance names: the suite built twice, the
+# `rocksdb-tuned` arm run over the quick ladder from each build on one hosted
+# runner in one job, and the two rows printed beside each other with the
+# reps' spread (bench/scripts/alloc_compare.py). A table for a person to
+# read, by hand and weekly; a switch of the suite's RocksDB is a definition
+# step banked with its row (bench/DESIGN.md), never a change this job makes.
+# The jemalloc is prefixed, so only RocksDB's allocations move.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '41 7 * * 1'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  pair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: libclang, for bindgen
+        run: sh bench/scripts/libclang.sh
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bench -> bench/target
+      - name: RocksDB on glibc malloc
+        working-directory: bench
+        run: |
+          set -eu
+          cargo build --release --bin bench
+          rm -rf runs-glibc
+          ./target/release/bench run --scale quick --out runs-glibc --arms rocksdb-tuned
+      - name: RocksDB on the prefixed jemalloc
+        working-directory: bench
+        run: |
+          set -eu
+          cargo build --release --bin bench --features rocksdb-jemalloc --target-dir target-jemalloc
+          rm -rf runs-jemalloc
+          ./target-jemalloc/release/bench run --scale quick --out runs-jemalloc --arms rocksdb-tuned
+      - name: The two beside each other
+        working-directory: bench
+        run: |
+          set -eu
+          python3 scripts/alloc_compare.py runs-glibc runs-jemalloc | tee alloc.md
+          cat alloc.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rocksdb-alloc
+          if-no-files-found: ignore
+          path: |
+            bench/runs-glibc/quick/
+            bench/runs-jemalloc/quick/
+            bench/alloc.md

@@ -54,6 +54,7 @@ fn style(arm: &str) -> (&'static str, &'static str) {
         "lmdb" | "lmdb-nosync" => (GREY, ""),
         "lmdb-nordahead" => (GREY, "4,2"),
         "rocksdb-tuned" | "rocksdb-tuned-nosync" | "rocksdb-nosync" => (GREY, "7,4"),
+        "rocksdb-tuned-lz4" => (GREY, "1,3"),
         _ => (GREY, "2,3"),
     }
 }
@@ -74,6 +75,7 @@ fn pretty(arm: &str) -> &'static str {
         "lmdb-nosync" => "LMDB (nosync)",
         "rocksdb-tuned" => "RocksDB",
         "rocksdb-tuned-nosync" => "RocksDB (nosync)",
+        "rocksdb-tuned-lz4" => "RocksDB (LZ4)",
         "rocksdb-nosync" => "RocksDB (untuned, nosync)",
         _ => "?",
     }
@@ -599,6 +601,7 @@ fn message(
         "lmdb-nordahead",
         "lmdb-nosync",
         "rocksdb-tuned",
+        "rocksdb-tuned-lz4",
         "rocksdb-tuned-nosync",
         "rocksdb-nosync",
     ] {

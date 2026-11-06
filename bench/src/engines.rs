@@ -8902,6 +8902,11 @@ pub struct Rocks {
     path: PathBuf,
     sync: bool,
     tuned: bool,
+    /// Whether the SSTs are LZ4-compressed (`rocksdb-tuned-lz4`): the tuned
+    /// arm with the one compression a deployment would turn on, for the
+    /// bounded roster, where what the device holds is what a read costs.
+    /// Off, every block is stored uncompressed, as every arm's was.
+    lz4: bool,
     /// Whether `sync` flushes the memtable and compacts everything, so the
     /// load window carries the same drain the engine's default does
     /// and the reads run against a fully compacted tree.
@@ -8911,7 +8916,7 @@ pub struct Rocks {
 
 impl Rocks {
     pub fn create(path: &Path, sync: bool) -> Res<Rocks> {
-        Rocks::with(path, sync, false, false)
+        Rocks::with(path, sync, false, false, false)
     }
 
     /// The deployed shape rather than the shipped one, stated in full so the
@@ -8923,7 +8928,7 @@ impl Rocks {
     /// load (see `with`). Not a tuning contest: one stated configuration a
     /// reader can recognise as a deployment.
     pub fn create_tuned(path: &Path) -> Res<Rocks> {
-        Rocks::with(path, true, true, false)
+        Rocks::with(path, true, true, false, false)
     }
 
     /// The tuned configuration with commits that do not reach the device:
@@ -8934,21 +8939,35 @@ impl Rocks {
     /// would choose; this is the one stated configuration in both groups,
     /// differing from `rocksdb-tuned` in the sync alone.
     pub fn create_tuned_nosync(path: &Path) -> Res<Rocks> {
-        Rocks::with(path, false, true, false)
+        Rocks::with(path, false, true, false, false)
+    }
+
+    /// The tuned configuration with its SSTs LZ4-compressed, the one
+    /// compression a deployment would turn on, `rocksdb-tuned-lz4`: for
+    /// the bounded roster, where a comparison against an uncompressed
+    /// RocksDB measured a shape no deployment past memory would run. The
+    /// suite's own values are a hundred bytes of the payload generator's,
+    /// so what LZ4 makes of them is the row's `bytes_on_disk_per_byte`.
+    pub fn create_tuned_lz4(path: &Path) -> Res<Rocks> {
+        Rocks::with(path, true, true, false, true)
     }
 
     /// Tuned, and drained at `sync`: memtable flushed, every level
     /// compacted into one, inside the window -- the engine's default
     /// shape, charged to RocksDB.
     pub fn create_tuned_drain(path: &Path) -> Res<Rocks> {
-        Rocks::with(path, true, true, true)
+        Rocks::with(path, true, true, true, false)
     }
 
-    fn with(path: &Path, sync: bool, tuned: bool, drain: bool) -> Res<Rocks> {
+    fn with(path: &Path, sync: bool, tuned: bool, drain: bool, lz4: bool) -> Res<Rocks> {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         let mut o = rocksdb::Options::default();
         o.create_if_missing(true);
-        o.set_compression_type(rocksdb::DBCompressionType::None);
+        o.set_compression_type(if lz4 {
+            rocksdb::DBCompressionType::Lz4
+        } else {
+            rocksdb::DBCompressionType::None
+        });
         if tuned {
             let mut bbo = rocksdb::BlockBasedOptions::default();
             let cache = rocksdb::Cache::new_lru_cache(256 << 20);
@@ -8977,6 +8996,7 @@ impl Rocks {
             path: path.to_path_buf(),
             sync,
             tuned,
+            lz4,
             drain,
             read,
         })
@@ -9031,6 +9051,9 @@ impl ThreadReader for RocksReader {
 
 impl Engine for Rocks {
     fn name(&self) -> &'static str {
+        if self.lz4 {
+            return "rocksdb-tuned-lz4";
+        }
         match (self.sync, self.tuned, self.drain) {
             (_, true, true) => "rocksdb-tuned-drain",
             (true, true, false) => "rocksdb-tuned",
@@ -9367,7 +9390,7 @@ pub const ARMS: [&str; 13] = [
 /// weaker configuration. The buffered group is not here: a bounded row is
 /// about reads from the device, and a buffered load reads nothing a
 /// durable one does not. `--arms` overrides it as it does `ARMS`.
-pub const OOC_ARMS: [&str; 7] = [
+pub const OOC_ARMS: [&str; 8] = [
     "supdb",
     "supdb-nocache",
     "supdb-cache256tofit",
@@ -9375,6 +9398,7 @@ pub const OOC_ARMS: [&str; 7] = [
     "supdb-nozpages",
     "lmdb-nordahead",
     "rocksdb-tuned",
+    "rocksdb-tuned-lz4",
 ];
 
 pub fn guarantee(arm: &str) -> Option<Guarantee> {
@@ -9598,6 +9622,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-bglag"
         | "lmdb"
         | "lmdb-nordahead"
+        | "rocksdb-tuned-lz4"
         | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest"
         | "supdb-ingestleave"
@@ -10342,6 +10367,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "lmdb-nordahead" => Box::new(Lmdb::create_nordahead(dir, map_gb)?),
         "lmdb-nosync" => Box::new(Lmdb::create_nosync(dir, map_gb)?),
         "rocksdb-tuned" => Box::new(Rocks::create_tuned(dir)?),
+        "rocksdb-tuned-lz4" => Box::new(Rocks::create_tuned_lz4(dir)?),
         "rocksdb-nosync" => Box::new(Rocks::create(dir, false)?),
         "rocksdb-tuned-nosync" => Box::new(Rocks::create_tuned_nosync(dir)?),
         other => return Err(format!("no such arm: {other}")),
@@ -10428,6 +10454,26 @@ mod tests {
         assert!(!plain.env_flags().contains(heed::EnvFlags::NO_READ_AHEAD));
         drop(plain);
         drop(off);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The compressing RocksDB is the tuned durable arm with LZ4 over its
+    /// SSTs and nothing else: named for it, durable, in the bounded roster,
+    /// and its features the tuned arm's.
+    #[test]
+    fn the_compressing_rocksdb_is_the_tuned_arm_with_lz4() {
+        assert_eq!(guarantee("rocksdb-tuned-lz4"), Some(Guarantee::Durable));
+        assert!(OOC_ARMS.contains(&"rocksdb-tuned-lz4"));
+        assert!(!ARMS.contains(&"rocksdb-tuned-lz4"));
+        let root = std::env::temp_dir().join(format!("supdb-bench-lz4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let plain = Rocks::create_tuned(&root.join("rocksdb-tuned")).unwrap();
+        let lz4 = Rocks::create_tuned_lz4(&root.join("rocksdb-tuned-lz4")).unwrap();
+        assert_eq!(lz4.name(), "rocksdb-tuned-lz4");
+        assert_eq!(lz4.features(), plain.features());
+        assert!(lz4.features().durable_commit);
+        drop(plain);
+        drop(lz4);
         let _ = std::fs::remove_dir_all(&root);
     }
 

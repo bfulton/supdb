@@ -28,13 +28,18 @@ serde_json = "1"
 # Comparators. Every arm is in-process Rust so the comparison carries no
 # binding overhead.
 heed = "0.20"
-# Built without compression libraries: every arm stores values uncompressed
-# and the adapter turns compression off explicitly. Not optional: RocksDB is
-# a headline comparator, and a comparison that is off by default is one that
-# does not get run. The build needs libclang for bindgen; on a host where
-# clang-sys does not find one, `scripts/libclang.sh` names the directory
-# holding it (libclang.so, or libclang.dylib on macOS).
-rocksdb = { version = "0.23", default-features = false }
+# Built with LZ4 alone of the compression libraries, for the arm that
+# compresses (`rocksdb-tuned-lz4`, the bounded roster's); every other arm
+# turns compression off explicitly. Not optional: RocksDB is a headline
+# comparator, and a comparison that is off by default is one that does not
+# get run. The allocator is the system's, RocksDB's own guidance being
+# jemalloc: the `rocksdb-jemalloc` feature below builds it on the prefixed
+# jemalloc the crate links, which touches no Rust allocation, and the
+# `rocksdb-alloc` workflow pairs the two builds. The build needs libclang
+# for bindgen; on a host where clang-sys does not find one,
+# `scripts/libclang.sh` names the directory holding it (libclang.so, or
+# libclang.dylib on macOS).
+rocksdb = { version = "0.23", default-features = false, features = ["lz4"] }
 
 # liblz4's decoder, for the probe that prices it against `lz4_flex` on the
 # form's own pages (`examples/zdecode.rs`, `--features lz4-c`). Optional, so
@@ -69,6 +74,9 @@ lz4-safe = ["lz4_flex/safe-encode", "lz4_flex/safe-decode"]
 # `zdecode` built with liblz4 beside the engine's decoder. Off for
 # everything the suite measures.
 lz4-c = ["dep:lz4"]
+# RocksDB on the jemalloc its own guidance names, prefixed, so that only
+# RocksDB's allocations change (`rocksdb-alloc.yml` pairs the builds).
+rocksdb-jemalloc = ["rocksdb/jemalloc"]
 # `zcodec` built with zstd, Snappy and LZAV (`vendor/lzav`, compiled by
 # `build.rs`) beside LZ4. Off for everything the suite measures.
 codecs = ["lz4-c", "dep:zstd", "dep:snap", "dep:cc"]
