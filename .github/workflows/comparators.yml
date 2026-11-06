@@ -1,0 +1,51 @@
+name: comparators
+
+# The suite's comparator cells held to the comparators' own tools, on one
+# hosted runner in one job, by hand and weekly: db_bench built from the
+# RocksDB tree the suite links (the source `librocksdb-sys` vendors, at the
+# version Cargo.lock pins) with the tuned arm's options, and a C program
+# against the LMDB `lmdb-master-sys` vendors; then the suite's own
+# `rocksdb-tuned` and `lmdb` arms over the quick ladder, and the table of the
+# suite's cell against the tool's. The rule is registered in docs/engine.md:
+# the suite's cell is at least 0.7x the tool's on every quantity the tool
+# measures, or the job fails naming the quantity. A failure is a finding
+# about an arm's configuration, not about the engine. The flags live in
+# bench/scripts/comparators.sh; the table is the step summary and the
+# artifact.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 6 * * 1'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: libclang, for bindgen
+        run: sh bench/scripts/libclang.sh
+      - name: cmake and gflags, for db_bench
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y cmake libgflags-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bench -> bench/target
+      - name: The tools, the suite's two arms, and the table
+        run: sh bench/scripts/comparators.sh comparators-ci
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: comparators
+          if-no-files-found: ignore
+          path: |
+            bench/comparators-ci/quick/
+            bench/comparators-ci/tools/*.txt
+            bench/comparators-ci/comparators.md

@@ -227,6 +227,16 @@ no Bloom filter) beside the tuned durable arm until the rows banked at
 rows before is against a configuration no deployment would choose; that
 series stops there and the tuned one starts.
 
+The comparator cells are held to the comparators' own tools once a week
+(`comparators.yml`, by hand as well): db_bench built from the RocksDB
+source the suite links, run with the tuned arm's options, and a C program
+against the LMDB the suite links, on the suite's shapes, beside the
+suite's `rocksdb-tuned` and `lmdb` arms over the quick ladder in the same
+job. The suite's cell must be at least 0.7x the tool's on the load, the
+point reads and the scans at every rung, or the job fails naming the
+quantity; the margin the cells hold is the job's summary (`docs/engine.md`,
+the comparators' check).
+
 What the suite's shape reaches in each engine. Every key holds one
 100-byte value, appended at the load and replaced by a `put` after it, so
 every supdb value lies inline in its index record (`Options::inline_bytes`
