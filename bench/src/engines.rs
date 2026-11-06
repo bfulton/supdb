@@ -634,10 +634,18 @@ pub struct Supdb {
     /// `supdb-ingestnoboundsheadwillneed`, and `supdb-noboundsheadwillneed`
     /// durable.
     noboundsheadwillneed: bool,
-    /// The builder ahead runs out of core too, where the default starts it
-    /// in core alone (`Options::ahead_out_of_core`). `supdb-ingestaheadooc`,
-    /// and `supdb-aheadooc` durable.
-    aheadooc: bool,
+    /// The builder ahead starts in core alone, the shape before it ran out
+    /// of core for the partitions in memory (`Options::ahead_out_of_core`
+    /// off). `supdb-ingestaheadincore`, and `supdb-aheadincore` durable.
+    aheadincore: bool,
+    /// The builder ahead out of core builds a partition whatever share of
+    /// its pages the cache holds (`Options::ahead_resident_pct` zero): the
+    /// shape refuted on the lag sweep. `supdb-aheadcold`.
+    aheadcold: bool,
+    /// The builder ahead out of core starting at a state's first scan
+    /// (`Options::ahead_out_of_core_scans` zero), the shape the lag sweep
+    /// priced against: `supdb-aheadeager`.
+    aheadeager: bool,
     /// Out of core a merge's landing chains the next merge through a
     /// write-only stretch too, where the default chains only while reads
     /// are around (`Options::merge_chains_writes`).
@@ -918,6 +926,14 @@ pub struct Supdb {
     /// the shape before the fill gave it back at a block.
     /// `supdb-fillholds`, and `supdb-ingestfillholds` buffered.
     fillholds: bool,
+    /// A form file's fence searched over its keys, the shape before the
+    /// flat words (`Options::zpages_fence_words` off): `supdb-fencekeys`.
+    fencekeys: bool,
+    /// The controller's reading at the crossing taken by a fill sample of
+    /// every partition however many form files are on disk, the shape
+    /// before the reading from the files (`Options::zpages_reading_from_files`
+    /// off): `supdb-zsamplefills`.
+    zsamplefills: bool,
     /// The fill yielding its conversions at any posted commit
     /// (`Options::forms_convert_behind` zero), the shape before it
     /// converted in the thread's slack. `supdb-postedyield`, and
@@ -1474,10 +1490,18 @@ struct Policy {
     /// `supdb-ingestnoboundsheadwillneed`, and `supdb-noboundsheadwillneed`
     /// durable.
     noboundsheadwillneed: bool,
-    /// The builder ahead runs out of core too, where the default starts it
-    /// in core alone (`Options::ahead_out_of_core`). `supdb-ingestaheadooc`,
-    /// and `supdb-aheadooc` durable.
-    aheadooc: bool,
+    /// The builder ahead starts in core alone, the shape before it ran out
+    /// of core for the partitions in memory (`Options::ahead_out_of_core`
+    /// off). `supdb-ingestaheadincore`, and `supdb-aheadincore` durable.
+    aheadincore: bool,
+    /// The builder ahead out of core builds a partition whatever share of
+    /// its pages the cache holds (`Options::ahead_resident_pct` zero): the
+    /// shape refuted on the lag sweep. `supdb-aheadcold`.
+    aheadcold: bool,
+    /// The builder ahead out of core starting at a state's first scan
+    /// (`Options::ahead_out_of_core_scans` zero), the shape the lag sweep
+    /// priced against: `supdb-aheadeager`.
+    aheadeager: bool,
     /// Out of core a merge's landing chains the next merge through a
     /// write-only stretch too, where the default chains only while reads
     /// are around (`Options::merge_chains_writes`).
@@ -1773,6 +1797,10 @@ struct Policy {
     /// The complete-table fill holding the writer until it is done:
     /// `supdb-fillholds`, and `supdb-ingestfillholds` buffered.
     fillholds: bool,
+    /// The fence searched over its keys: `supdb-fencekeys`.
+    fencekeys: bool,
+    /// The reading at the crossing by a fill sample: `supdb-zsamplefills`.
+    zsamplefills: bool,
     /// The fill yielding at any posted commit: `supdb-postedyield`, and
     /// `supdb-ingestpostedyield` buffered.
     postedyield: bool,
@@ -2047,7 +2075,9 @@ impl Default for Policy {
             boundarytop: false,
             nodirwillneed: false,
             noboundsheadwillneed: false,
-            aheadooc: false,
+            aheadincore: false,
+            aheadcold: false,
+            aheadeager: false,
             chainwrites: false,
             noland: false,
             landnearscans: false,
@@ -2099,6 +2129,8 @@ impl Default for Policy {
             shortpass: false,
             noyield: false,
             fillholds: false,
+            fencekeys: false,
+            zsamplefills: false,
             postedyield: false,
             behindyield: false,
             bg: false,
@@ -2528,6 +2560,33 @@ impl Supdb {
             path,
             Policy {
                 notrim: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose controller takes its reading at the crossing by a fill
+    /// sample of every partition, the form files on disk notwithstanding
+    /// (`Options::zpages_reading_from_files` off): the shape before the
+    /// reading from the files.
+    pub fn create_zsamplefills(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zsamplefills: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose form files' fences are searched over their keys
+    /// (`Options::zpages_fence_words` off): the shape before the flat
+    /// words.
+    pub fn create_fencekeys(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                fencekeys: true,
                 ..Policy::default()
             },
         )
@@ -6710,7 +6769,9 @@ impl Supdb {
             boundarytop,
             nodirwillneed,
             noboundsheadwillneed,
-            aheadooc,
+            aheadincore,
+            aheadcold,
+            aheadeager,
             chainwrites,
             noland,
             landnearscans,
@@ -6783,6 +6844,8 @@ impl Supdb {
             shortpass,
             noyield,
             fillholds,
+            fencekeys,
+            zsamplefills,
             postedyield,
             behindyield,
             bg,
@@ -7046,7 +7109,17 @@ impl Supdb {
             boundary_keys_from_top: boundarytop,
             pieces_dir_willneed: !nodirwillneed,
             bounds_heads_willneed: !noboundsheadwillneed,
-            ahead_out_of_core: aheadooc,
+            ahead_out_of_core: !aheadincore,
+            ahead_resident_pct: if aheadcold {
+                0
+            } else {
+                supdb::Options::default().ahead_resident_pct
+            },
+            ahead_out_of_core_scans: if aheadeager {
+                0
+            } else {
+                supdb::Options::default().ahead_out_of_core_scans
+            },
             merge_chains_writes: chainwrites,
             zpages_land_scans_far: !landnearscans,
             merge_plan_idle: !noidleplan,
@@ -7201,6 +7274,8 @@ impl Supdb {
             zpages_record_coding: zrecord || zrawtails,
             zpages_memo_first: zmemofirst,
             zpages_fence_tree: zfencetree,
+            zpages_fence_words: !fencekeys,
+            zpages_reading_from_files: !zsamplefills,
             zpages_memo_ahead: !zmemonoahead,
             scan_start_cache: if zstartcache { 4096 } else { 0 },
             zpages_block_cursor: !zperrun,
@@ -7334,7 +7409,9 @@ impl Supdb {
             boundarytop,
             nodirwillneed,
             noboundsheadwillneed,
-            aheadooc,
+            aheadincore,
+            aheadcold,
+            aheadeager,
             chainwrites,
             noland,
             landnearscans,
@@ -7407,6 +7484,8 @@ impl Supdb {
             shortpass,
             noyield,
             fillholds,
+            fencekeys,
+            zsamplefills,
             postedyield,
             behindyield,
             bg,
@@ -7746,6 +7825,12 @@ impl Engine for Supdb {
         }
         if self.notrim {
             return "supdb-notrim";
+        }
+        if self.fencekeys {
+            return "supdb-fencekeys";
+        }
+        if self.zsamplefills {
+            return "supdb-zsamplefills";
         }
         if self.postedyield {
             return if self.partition {
@@ -8163,12 +8248,18 @@ impl Engine for Supdb {
                 "supdb-ingestnoboundsheadwillneed"
             };
         }
-        if self.aheadooc {
+        if self.aheadincore {
             return if self.partition {
-                "supdb-aheadooc"
+                "supdb-aheadincore"
             } else {
-                "supdb-ingestaheadooc"
+                "supdb-ingestaheadincore"
             };
+        }
+        if self.aheadcold {
+            return "supdb-aheadcold";
+        }
+        if self.aheadeager {
+            return "supdb-aheadeager";
         }
         if self.chainwrites {
             return if self.partition {
@@ -8704,6 +8795,7 @@ impl Engine for Supdb {
             ("fill_walked", db.pass_steps().1 as f64),
             ("fill_passes", db.pass_steps().2 as f64),
             ("fill_cuts", db.pass_steps().3 as f64),
+            ("ahead_skip_cold", db.ahead_cold() as f64),
             ("forms_cloned", db.forms_cloned() as f64),
             ("forms_trims", db.forms_trims() as f64),
             ("forms_trim_looks", db.forms_trim_looks() as f64),
@@ -8783,6 +8875,7 @@ impl Engine for Supdb {
             ("zpage_finish_failed", z.finish_failed as f64),
             ("zpage_finish_waits", z.finish_waits as f64),
             ("zpage_sample_refreshed", z.sample_refreshed as f64),
+            ("zpage_sample_from_files", z.sample_from_files as f64),
             ("zpage_ahead_paired", z.ahead_paired as f64),
             ("zpage_ahead_cold", z.ahead_cold as f64),
             ("zpage_ahead_recoded", z.ahead_recoded as f64),
@@ -9708,7 +9801,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-boundarytop"
         | "supdb-nodirwillneed"
         | "supdb-noboundsheadwillneed"
-        | "supdb-aheadooc"
+        | "supdb-aheadincore"
+        | "supdb-aheadcold"
+        | "supdb-aheadeager"
         | "supdb-chainwrites"
         | "supdb-noland"
         | "supdb-landnearscans"
@@ -9763,6 +9858,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-noyield"
         | "supdb-fillholds"
         | "supdb-notrim"
+        | "supdb-fencekeys"
+        | "supdb-zsamplefills"
         | "supdb-postedyield"
         | "supdb-behindyield"
         | "supdb-bg"
@@ -9828,7 +9925,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestboundarytop"
         | "supdb-ingestnodirwillneed"
         | "supdb-ingestnoboundsheadwillneed"
-        | "supdb-ingestaheadooc"
+        | "supdb-ingestaheadincore"
         | "supdb-ingestchainwrites"
         | "supdb-ingestnoland"
         | "supdb-ingestlandnearscans"
@@ -10175,6 +10272,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-noyield" => supdb_arm(Supdb::create_noyield, dir)?,
         "supdb-fillholds" => supdb_arm(Supdb::create_fillholds, dir)?,
         "supdb-notrim" => supdb_arm(Supdb::create_notrim, dir)?,
+        "supdb-fencekeys" => supdb_arm(Supdb::create_fencekeys, dir)?,
+        "supdb-zsamplefills" => supdb_arm(Supdb::create_zsamplefills, dir)?,
         "supdb-postedyield" => supdb_arm(Supdb::create_postedyield, dir)?,
         "supdb-behindyield" => supdb_arm(Supdb::create_behindyield, dir)?,
         "supdb-bg" => supdb_arm(Supdb::create_bg, dir)?,
@@ -10316,26 +10415,50 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-aheadooc" => supdb_arm(
+        "supdb-aheadincore" => supdb_arm(
             |d| {
                 Supdb::with_policy(
                     d,
                     Policy {
-                        aheadooc: true,
+                        aheadincore: true,
                         ..Policy::default()
                     },
                 )
             },
             dir,
         )?,
-        "supdb-ingestaheadooc" => supdb_arm(
+        "supdb-aheadcold" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        aheadcold: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-aheadeager" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        aheadeager: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestaheadincore" => supdb_arm(
             |d| {
                 Supdb::with_policy(
                     d,
                     Policy {
                         partition: false,
                         durable: false,
-                        aheadooc: true,
+                        aheadincore: true,
                         ..Policy::default()
                     },
                 )

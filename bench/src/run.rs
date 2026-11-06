@@ -632,6 +632,7 @@ fn counters_line(
             "fill_walked",
             "fill_passes",
             "fill_cuts",
+            "ahead_skip_cold",
             "upkeep_partial",
             "upkeep_skipped",
             "upkeep_passes",

@@ -4106,9 +4106,12 @@ fn the_sizes_the_store_reports_are_the_files_it_holds() {
                 .header;
             groups += u64::from(h.ulen);
         }
-        let (fnc, filter) =
+        let (mut fnc, filter) =
             ZFence::decode_resident(&bytes[t.res_off as usize..bytes.len() - ZTRAILER], &t)
                 .unwrap();
+        // The fence as the attach keeps it: its word tree indexed
+        // (`Options::zpages_fence_words`, on).
+        fnc.index_words();
         fence += fnc.heap_bytes() as u64 + filter.len() as u64;
     }
     assert_eq!(c.file_bytes, file, "{c:?}");
@@ -7423,6 +7426,10 @@ fn the_sample_starts_between_builds_ahead_when_told_to() {
                 o.zpages_sample_between = between;
                 o.zpages_ahead_builders = 1;
                 o.partition_bytes = Some(400 << 10);
+                // The fill sample, whose order between the builds ahead is
+                // the test: with the files on disk the reading comes from
+                // them and no sample starts.
+                o.zpages_reading_from_files = false;
                 // The sample's wait for a build ahead, which a store whose
                 // resident and in-flight partitions count as covered never
                 // makes, and the build ahead started before the sample,
@@ -8108,9 +8115,12 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
                 o.zpages_land_drop_past = drop_past;
                 // The swap at the crossing before any buy: a controller
                 // that suspects at the crossing buys the attach on the
-                // prediction inside the steps this waits.
+                // prediction inside the steps this waits, and with the
+                // reading from the files on disk it buys in the step after
+                // it suspects, so no attach is bought on the prediction here.
                 o.zpages_cover_resident = false;
                 o.zpages_suspect_at_crossing = false;
+                o.zpages_attach_eager = false;
             });
         inject.set_budget(raw * 3 / 2);
         assert!(
@@ -8503,7 +8513,12 @@ fn a_build_ahead_over_resident_records_holds_no_sample() {
         wait_steps(&db, 3);
         let c = db.zpage_counts();
         if cover {
-            assert!(c.samples >= 1, "{what}: sampled beside it: {c:?}");
+            // A reading taken beside it: from the files on disk, or a
+            // sample where they do not cover.
+            assert!(
+                c.samples + c.sample_from_files >= 1,
+                "{what}: a reading beside it: {c:?}"
+            );
             // And the reading counts the partition in flight as covered:
             // the attach is bought on the prediction once the partitions
             // have stood, with the build still held and no read made.
@@ -8746,6 +8761,122 @@ fn an_attach_of_form_files_built_ahead_is_bought_on_the_prediction() {
                 "{what}: SUSPECT, the files dormant: {c:?}"
             );
         }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The reading at the crossing comes from the form files on disk where
+/// they cover the keys the install needs (`Options::zpages_reading_from_files`):
+/// no fill sample runs, the reading stands in the tick that wanted it, and
+/// the buy on the prediction follows within a few steps -- the model
+/// recomputed at the step after the reading, not at its period. With the
+/// option off the fill sample runs as before and the install still comes;
+/// and where a third of the files are gone the files do not cover, so the
+/// fill sample runs under both.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_reading_at_the_crossing_comes_from_the_files_on_disk() {
+    for (from_files, gone) in [(true, 0usize), (false, 0), (true, usize::MAX)] {
+        let what = format!("reading from files {from_files}, files removed {gone}");
+        let (dir, db, model, inject, raw) = land_store_with(
+            &format!("auto-reading-files-{from_files}-{gone}"),
+            50,
+            |o| {
+                o.partition_bytes = Some(160 << 10);
+                o.zpages_reading_from_files = from_files;
+                o.zpages_land_cold_past = false;
+            },
+        );
+        inject.set_budget(raw * 3 / 2);
+        assert!(
+            tick_until(&db, 400, |c| c.prebuilt >= c.partitions),
+            "{what}: built ahead: {:?}",
+            db.zpage_counts()
+        );
+        let n = db.zpage_counts().partitions;
+        assert!(n >= 12, "{what}: partitions enough: {n}");
+        let gone = gone.min(n as usize / 3);
+        inject.set_records_resident(0.0);
+        let files = form_files(&dir);
+        for f in &files[..gone] {
+            std::fs::remove_file(f).unwrap();
+        }
+        let before = db.zpage_counts();
+        assert_eq!(
+            (before.samples, before.sample_from_files),
+            (0, 0),
+            "{what}: nothing read yet: {before:?}"
+        );
+        // Past the budget, far: the crossing.
+        inject.set_budget(1 << 20);
+        inject.set_refault_rate(1_000_000.0);
+        inject.set_fault_cost(FAULT_1MS);
+        let covers = gone == 0;
+        // Where the files do not cover the keys the install needs, the
+        // attach on the prediction buys nothing (the attach-eager test has
+        // the case): the fill sample runs, and no reading comes from the
+        // files.
+        if !covers {
+            assert!(
+                !tick_until(&db, 120, |c| c.sel_installs >= 1),
+                "{what}: nothing bought without cover: {:?}",
+                db.zpage_counts()
+            );
+            let c = db.zpage_counts();
+            assert_eq!(
+                c.sample_from_files, 0,
+                "{what}: no reading from files: {c:?}"
+            );
+            assert!(c.samples >= 1, "{what}: the fill sample ran: {c:?}");
+            assert_eq!(
+                (c.phase, c.attached),
+                (1, 0),
+                "{what}: SUSPECT, dormant: {c:?}"
+            );
+            db.close().unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            continue;
+        }
+        assert!(
+            tick_until(&db, 400, |c| c.sel_installs >= 1),
+            "{what}: installed: {:?}",
+            db.zpage_counts()
+        );
+        let c = db.zpage_counts();
+        if from_files {
+            assert_eq!(
+                (c.sample_from_files, c.samples),
+                (1, 0),
+                "{what}: the reading from the files, no fill sample: {c:?}"
+            );
+            // The reading stands in the tick that wanted it and the model is
+            // recomputed at the next step: the buy within a few steps of the
+            // crossing, where a model recomputed at its period alone bought
+            // up to ten steps after the reading.
+            assert!(
+                c.sel_steps - before.sel_steps <= 6,
+                "{what}: bought within a few steps of the crossing: {} steps: {c:?}",
+                c.sel_steps - before.sel_steps
+            );
+        } else {
+            assert_eq!(
+                c.sample_from_files, 0,
+                "{what}: no reading from files: {c:?}"
+            );
+            assert!(c.samples >= 1, "{what}: the fill sample ran: {c:?}");
+        }
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= n),
+            "{what}: every partition attached: {:?}",
+            db.zpage_counts()
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
+        let r = db.reader().unwrap();
+        check(&r, &model, &some, &what);
+        assert!(db.zpage_counts().reads > 0, "{what}: through the form");
+        drop(r);
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1075,6 +1075,76 @@ fn a_pass_the_writer_wants_its_upkeep_back_from_yields_at_its_next_step() {
     );
 }
 
+/// The builder ahead builds a partition's blocks only where the page cache
+/// holds at least `Options::ahead_resident_pct` of the pages a build reads
+/// (the kernel's answer, or the test's seam `ZInject::set_records_resident`):
+/// out of core a partition the bound has pushed out is read from the
+/// device, a round trip a page, for scans that read a few of its blocks.
+/// Every partition read as half resident, the builder skips them all,
+/// counted, builds nothing, and the scans build their own blocks; read as
+/// resident whole, it builds every partition, as it does in core. The keys
+/// read right either way.
+#[test]
+fn the_builder_ahead_leaves_the_partitions_whose_pages_are_not_in_memory() {
+    let run = |name: &str, share: f64| {
+        let d = dir(name);
+        let inject = std::sync::Arc::new(supdb::ZInject::new());
+        inject.set_records_resident(share);
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 1 << 20,
+                partition_bytes: Some(2 << 10),
+                l0_trigger: 64,
+                scan_block_cache: true,
+                scan_cache_ahead: true,
+                scan_cache_ahead_min_blocks: 0,
+                zpages_inject: Some(inject),
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in (0..1200).step_by(3) {
+            m.append(&mut db, &key(k), &format!("p{k}"));
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        let parts = db.levels().0;
+        assert!(parts > 1);
+        for k in (0..1200).step_by(3) {
+            m.append(&mut db, &key(k), "r1");
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        db.settle().unwrap();
+        // The first scan over the published state starts the builder;
+        // `settle` waits for it.
+        let mut sink = 0usize;
+        db.scan(key(0).as_bytes(), 3, kv(&mut |_k, v| sink += v.len()))
+            .unwrap();
+        db.settle().unwrap();
+        let cold = db.ahead_cold();
+        let built = db.forms_events()[10];
+        m.check(&db, "every key right whatever the builder left");
+        (parts as u64, cold, built)
+    };
+    let (parts, cold_skipped, cold_built) = run("ahead-cold", 0.5);
+    let (_, warm_skipped, warm_built) = run("ahead-warm", 1.0);
+    assert_eq!(
+        (cold_skipped, cold_built),
+        (parts, 0),
+        "every partition read as half resident is left to the scans"
+    );
+    assert_eq!(warm_skipped, 0, "none left where the pages are in memory");
+    assert!(
+        warm_built > 0,
+        "the builder built where the pages are in memory"
+    );
+}
+
 /// The complete-table fill of a pass on the upkeep thread gives the writer
 /// its upkeep back at the fill's next block once the writer wants it
 /// (`Options::upkeep_fill_yields`), the settle before it standing and the
@@ -10908,17 +10978,27 @@ fn the_splice_bounds_off_the_top_level_are_the_records_bounds() {
 }
 
 /// The builder ahead starts while the store is in core, the controller's
-/// gate at the raw form, and not while it is out of core
-/// (`Options::ahead_out_of_core`): a burst out of core dirties every block,
-/// and the builder built each from pages the bound pushed out for scans
-/// that read a few. A publish over a piece starts the builder and the next
+/// gate at the raw form, and out of core only under the option
+/// (`Options::ahead_out_of_core`, on as shipped for the partitions whose
+/// pages are in memory; off is the shape before, `supdb-aheadincore`) and
+/// once the state has been scanned `Options::ahead_out_of_core_scans`
+/// times: a burst out of core dirties every block, and the builder built
+/// each from pages the bound pushed out for scans that read a few. A
+/// publish over a piece starts the builder and the next
 /// commit installs its forms with the gate at raw, installs nothing with
-/// the gate away from it, and installs them again under the option; the
-/// model holds through a handle and the writer in every case.
+/// the gate away from it, installs them again under the option where the
+/// scans are counted enough, and nothing where they are not; the model
+/// holds through a handle and the writer in every case.
 #[test]
 fn the_builder_ahead_starts_in_core_and_out_of_core_only_under_the_option() {
-    for (gate, ooc, builds) in [(0u8, false, true), (1, false, false), (1, true, true)] {
-        let d = dir(&format!("ahead-gate-{gate}-{ooc}"));
+    for (gate, ooc, scans, builds) in [
+        (0u8, false, 0u64, true),
+        (1, false, 0, false),
+        (1, true, 0, true),
+        (1, true, 3, true),
+        (1, true, u64::MAX, false),
+    ] {
+        let d = dir(&format!("ahead-gate-{gate}-{ooc}-{scans}"));
         let opts = Options {
             seal_bytes: 1 << 20,
             partition_bytes: Some(2 << 10),
@@ -10931,6 +11011,7 @@ fn the_builder_ahead_starts_in_core_and_out_of_core_only_under_the_option() {
             upkeep: supdb::Upkeep::Inline,
             zpages: supdb::ZPages::Off,
             ahead_out_of_core: ooc,
+            ahead_out_of_core_scans: scans,
             ..Options::default()
         };
         let mut db = Db::create(&d, opts).unwrap();
@@ -10952,6 +11033,16 @@ fn the_builder_ahead_starts_in_core_and_out_of_core_only_under_the_option() {
         db.seal().unwrap();
         db.settle().unwrap();
         assert_eq!(db.canonical_forms().0, 0, "the seal emptied the table");
+        // Scans over the published state, one more than the count the
+        // builder waits for where it waits for one it can reach.
+        if scans > 0 && scans < u64::MAX {
+            let mut sink = 0usize;
+            for _ in 0..=scans {
+                db.scan(key(7).as_bytes(), 1, kv(&mut |_k, v| sink += v.len()))
+                    .unwrap();
+            }
+            db.settle().unwrap();
+        }
         for k in (1..1500u32).step_by(11) {
             m.append(&mut db, &key(k), "v2");
         }
@@ -10960,7 +11051,7 @@ fn the_builder_ahead_starts_in_core_and_out_of_core_only_under_the_option() {
         assert_eq!(
             forms > 0,
             builds,
-            "gate {gate}, out of core {ooc}: the builder's forms installed: {forms}"
+            "gate {gate}, out of core {ooc}, scans {scans}: the builder's forms installed: {forms}"
         );
         let r = db.reader().unwrap();
         m.check(&r, "a reader");

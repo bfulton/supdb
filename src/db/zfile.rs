@@ -34,9 +34,9 @@ use super::zpages::{
     bind32, check_coded_group, check_entry, check_group, cmp_coded_key, coded_first, coded_header,
     coded_key_into, coded_rec, decode_group_with, decode_record, fill_page, filter_bytes,
     group_seek, page_view, parse_page, record_group_seek, verify_page_with, view_trusted,
-    walk_group, FenceEntry, Fill, FillScratch, FillStats, GroupBuf, Images, NoPage, PageView,
-    SegImages, Trailer, ZError, ZFence, ZCODING_BLOCK, ZGROUP_BYTES, ZMAX_GROUPS, ZNOPAGE, ZPAGE,
-    ZTRAILER,
+    walk_group, FenceEntry, FenceSearch, Fill, FillScratch, FillStats, GroupBuf, Images, NoPage,
+    PageView, SegImages, Trailer, ZError, ZFence, ZCODING_BLOCK, ZGROUP_BYTES, ZMAX_GROUPS,
+    ZNOPAGE, ZPAGE, ZTRAILER,
 };
 use crate::blob::{Blob, BlobOptions, ZSource};
 use crate::bytes::{Bytes, MmapBytes};
@@ -1974,7 +1974,9 @@ impl ZFile {
     /// absent with nothing raised, so each is an identity refusal.
     ///
     /// `advise` maps the file `MADV_RANDOM`, before its own sampled reads.
-    /// `fence_tree` builds the fence's search tree (`ZFence::index`,
+    /// `fence` is how the fence is searched: over its keys, over its words
+    /// laid flat (`ZFence::index_words`, `Options::zpages_fence_words`) or
+    /// through the tree over them (`ZFence::index`,
     /// `Options::zpages_fence_tree`); `memo_ahead` is
     /// `Options::zpages_memo_ahead`.
     #[allow(clippy::too_many_arguments)]
@@ -1988,7 +1990,7 @@ impl ZFile {
         prefetch: bool,
         trusted: bool,
         memo_first: bool,
-        fence_tree: bool,
+        fence: FenceSearch,
         memo_ahead: bool,
     ) -> std::result::Result<ZFile, Reject> {
         let memo = memo.into();
@@ -2038,9 +2040,12 @@ impl ZFile {
         let res = map
             .slice_at(t.res_off, res_len)
             .ok_or_else(|| damage(ZError::Length))?;
+        let fence_search = fence;
         let (mut fence, filter) = ZFence::decode_resident(res, &t).map_err(damage)?;
-        if fence_tree {
-            fence.index();
+        match fence_search {
+            FenceSearch::Keys => {}
+            FenceSearch::Words => fence.index_words(),
+            FenceSearch::Tree => fence.index(),
         }
         let filter = if t.filter {
             Some(engine_filter(&t, filter, &fence, nkeys)?)
@@ -3162,6 +3167,17 @@ impl ZFile {
         popcount(&self.bad)
     }
 
+    /// The share of the file's pages the page cache holds now (`mincore`
+    /// over the mapping): whether a build that reads the form reads memory
+    /// or the device.
+    pub(super) fn pages_resident(&self) -> f64 {
+        let len = self.map.len();
+        match self.map.slice_at(0, len as usize) {
+            Some(bytes) => super::resident_share(bytes),
+            None => 0.0,
+        }
+    }
+
     /// Heap bytes the form file keeps resident: the fence and the filter.
     pub(super) fn resident_bytes(&self) -> usize {
         self.fence.heap_bytes() + self.filter.as_ref().map_or(0, |f| f.blocks.len() * 64)
@@ -3555,6 +3571,10 @@ pub(super) struct ZEvents {
     /// Readings refreshed from the last sample's costs and a count of the
     /// form files on disk, in place of a sample (`Maint::z_sample_refresh`).
     pub sample_refreshed: AtomicU64,
+    /// Readings made from the form files on disk at the crossing, in place
+    /// of a fill sample (`Maint::z_reading_from_files`,
+    /// `Options::zpages_reading_from_files`).
+    pub sample_from_files: AtomicU64,
     /// The sampler's estimate of the form's bytes over the partitions it
     /// counted, at its last reading (`Sample::w_z` summed).
     pub sample_w_z: AtomicU64,
@@ -4903,6 +4923,136 @@ pub(super) fn sample(
     Ok(s)
 }
 
+/// What a form file on disk says of itself, for the controller's reading
+/// at the crossing (`Maint::z_reading_from_files`): its length, its pages,
+/// its resident part -- region B with the trailer, what an attach maps and
+/// keeps. Read from the trailer alone, one page of the file, advised random
+/// first where `advise` says, as the attach advises its mapping; `None` where the file is
+/// missing, does not open, is not a form file of this segment (another
+/// generation's, by `same_segment`) or is not the length its trailer says,
+/// which leaves the partition to the fill sample.
+pub(super) struct FileFacts {
+    pub bytes: u64,
+    pub pages: u64,
+    pub resident: u64,
+}
+
+pub(super) fn file_facts(
+    path: &Path,
+    blob: &Blob<MmapBytes>,
+    id: u64,
+    end_seq: u64,
+    advise: bool,
+) -> Option<FileFacts> {
+    let map = MmapBytes::open(path).ok()?;
+    // The advice before the first read, as the attach's: under the kernel's
+    // default the trailer's page pulls a readahead window in around it.
+    if advise {
+        map.advise_random();
+    }
+    let len = map.len();
+    if len < ZTRAILER as u64 || !len.is_multiple_of(ZPAGE as u64) {
+        return None;
+    }
+    let t = Trailer::decode(map.slice_at(len - ZTRAILER as u64, ZTRAILER)?).ok()?;
+    if t.expected_file_len() != Some(len) {
+        return None;
+    }
+    let facts = blob.z_source_facts()?;
+    same_segment(&t, &facts, id, end_seq).ok()?;
+    Some(FileFacts {
+        bytes: len,
+        pages: t.n_pages,
+        resident: len.saturating_sub(t.res_off),
+    })
+}
+
+/// The decodes' and walks' thread CPU over up to `pages` evenly spaced
+/// pages of the form file at `path`, every group of each decoded and walked
+/// as a read decodes and walks one, with the groups and records they held
+/// and the faults and the wait the touches took: what a read through the
+/// form pays a group, timed on the file as built, where a fill sample times
+/// it on the pages it fills. `None` where the file does not open, is not
+/// this segment's, or a page fails its own parse, decode or walk.
+pub(super) struct DecodeTiming {
+    pub decode_ns: u64,
+    pub groups: u64,
+    pub zgroups: u64,
+    pub records: u64,
+    pub wait_ns: u64,
+    pub faults: u64,
+}
+
+pub(super) fn time_file_decodes(
+    path: &Path,
+    blob: &Blob<MmapBytes>,
+    id: u64,
+    end_seq: u64,
+    pages: usize,
+    own_decode: bool,
+    advise: bool,
+) -> Option<DecodeTiming> {
+    let map = MmapBytes::open(path).ok()?;
+    if advise {
+        map.advise_random();
+    }
+    let len = map.len();
+    if len < ZTRAILER as u64 || !len.is_multiple_of(ZPAGE as u64) {
+        return None;
+    }
+    let t = Trailer::decode(map.slice_at(len - ZTRAILER as u64, ZTRAILER)?).ok()?;
+    let facts = blob.z_source_facts()?;
+    same_segment(&t, &facts, id, end_seq).ok()?;
+    let bind = bind32(id, end_seq, facts.nkeys, facts.row_crc);
+    let n_pages = usize::try_from(t.n_pages).ok()?;
+    if n_pages == 0 || pages == 0 {
+        return None;
+    }
+    let take = pages.min(n_pages);
+    let mut want: Vec<usize> = (0..take)
+        .map(|k| {
+            if take == n_pages {
+                k
+            } else {
+                k * (n_pages - 1) / (take - 1).max(1)
+            }
+        })
+        .collect();
+    want.dedup();
+    let mut buf = GroupBuf::new();
+    let mut d = DecodeTiming {
+        decode_ns: 0,
+        groups: 0,
+        zgroups: 0,
+        records: 0,
+        wait_ns: 0,
+        faults: 0,
+    };
+    let flt0 = thread_major_faults().unwrap_or(0);
+    let cpu0 = super::thread_cpu_ns();
+    let wall0 = std::time::Instant::now();
+    for p in want {
+        let page = map.slice_at((p as u64) * ZPAGE as u64, ZPAGE)?;
+        let view = parse_page(page, bind).ok()?;
+        let c0 = super::thread_cpu_ns();
+        for j in 0..view.groups() {
+            let group = decode_group_with(&view, j, &mut buf, own_decode).ok()?;
+            let count = view.group(j).map_or(0, |g| usize::from(g.count));
+            walk_group(group, count, None, None).ok()?;
+            d.records += count as u64;
+        }
+        d.decode_ns = d
+            .decode_ns
+            .saturating_add(super::thread_cpu_ns().saturating_sub(c0));
+        d.groups += 1;
+        d.zgroups += view.groups() as u64;
+    }
+    d.faults = thread_major_faults().unwrap_or(0).saturating_sub(flt0);
+    let cpu = super::thread_cpu_ns().saturating_sub(cpu0);
+    d.wait_ns = (wall0.elapsed().as_nanos().min(u64::MAX as u128) as u64).saturating_sub(cpu);
+    Some(d)
+}
+
 /// The platform's reading: the v1 memory controller's group where the
 /// process has one (this host is a hybrid whose v1 line wins), else the
 /// unified hierarchy's group with the least of `memory.max` and
@@ -5141,6 +5291,61 @@ mod tests {
         assert_eq!((d.groups, d.w_z), (0, 0), "{d:?}");
     }
 
+    /// The facts a form file on disk gives of itself are the build's --
+    /// its bytes, its pages, its coding -- and the decodes timed on it count
+    /// the groups and records of the pages they took; a file of another
+    /// segment, by id, gives neither, and a name no file is at gives none.
+    #[test]
+    fn a_form_files_facts_are_the_builds_and_its_decodes_time_on_the_file() {
+        let fx = Fixture::new("file-facts", suite(20_000, 0x5A5), 1 << 16);
+        let Outcome::Built(b) = fx.build() else {
+            panic!("the fixture builds")
+        };
+        let f = file_facts(&fx.out, &fx.blob, ID, END, true).expect("the file's facts");
+        assert_eq!(f.bytes, b.file_bytes);
+        assert_eq!(f.pages, b.fill.pages);
+        assert!(
+            f.resident > 0 && f.resident < f.bytes,
+            "{}/{}",
+            f.resident,
+            f.bytes
+        );
+        let s = sample(&fx.blob, ID, END, 0, FillShape::default()).unwrap();
+        assert!(s.resident_est > 0, "{s:?}");
+        let ratio = f.resident as f64 / s.resident_est as f64;
+        assert!(
+            (0.5..2.0).contains(&ratio),
+            "the file's resident part {} against the sample's estimate {}",
+            f.resident,
+            s.resident_est
+        );
+        let d = time_file_decodes(&fx.out, &fx.blob, ID, END, 8, true, true).expect("timed");
+        assert_eq!(d.groups, 8.min(b.fill.pages), "pages taken");
+        assert!(
+            d.zgroups >= d.groups && d.records >= d.zgroups,
+            "{}/{}/{}",
+            d.groups,
+            d.zgroups,
+            d.records
+        );
+        assert!(d.records <= 20_000);
+        assert!(d.decode_ns > 0, "timed");
+        // One page: the first; and more pages than the file has: every one.
+        let one = time_file_decodes(&fx.out, &fx.blob, ID, END, 1, true, true).expect("timed");
+        assert_eq!(one.groups, 1);
+        let all =
+            time_file_decodes(&fx.out, &fx.blob, ID, END, usize::MAX, true, true).expect("timed");
+        assert_eq!(all.groups, b.fill.pages);
+        assert_eq!(all.records, 20_000, "every record of every page");
+        // Another segment's id: not this partition's file.
+        assert!(file_facts(&fx.out, &fx.blob, ID + 1, END, true).is_none());
+        assert!(time_file_decodes(&fx.out, &fx.blob, ID + 1, END, 4, true, true).is_none());
+        // No file.
+        let missing = fx.out.with_extension("missing");
+        assert!(file_facts(&missing, &fx.blob, ID, END, true).is_none());
+        assert!(time_file_decodes(&missing, &fx.blob, ID, END, 4, true, true).is_none());
+    }
+
     /// The thread's major faults are read, and are the count the suite
     /// reads from `/proc/thread-self/stat` (its twelfth field after the
     /// command), so the engine and the row agree on what a fault is.
@@ -5341,7 +5546,17 @@ mod tests {
 
         fn attach(&self) -> std::result::Result<ZFile, Reject> {
             ZFile::attach(
-                &self.out, &self.blob, ID, END, false, true, false, true, false, false, true,
+                &self.out,
+                &self.blob,
+                ID,
+                END,
+                false,
+                true,
+                false,
+                true,
+                false,
+                FenceSearch::Keys,
+                true,
             )
         }
 
@@ -5353,7 +5568,17 @@ mod tests {
             prefetch: bool,
         ) -> std::result::Result<ZFile, Reject> {
             ZFile::attach(
-                &self.out, &self.blob, ID, END, advise, memo, prefetch, true, false, false, true,
+                &self.out,
+                &self.blob,
+                ID,
+                END,
+                advise,
+                memo,
+                prefetch,
+                true,
+                false,
+                FenceSearch::Keys,
+                true,
             )
         }
 
@@ -5365,7 +5590,20 @@ mod tests {
             memo_ahead: bool,
         ) -> std::result::Result<ZFile, Reject> {
             ZFile::attach(
-                &self.out, &self.blob, ID, END, false, true, false, true, false, fence_tree,
+                &self.out,
+                &self.blob,
+                ID,
+                END,
+                false,
+                true,
+                false,
+                true,
+                false,
+                if fence_tree {
+                    FenceSearch::Tree
+                } else {
+                    FenceSearch::Keys
+                },
                 memo_ahead,
             )
         }
@@ -5377,7 +5615,17 @@ mod tests {
         /// page's group is served as it was decoded while it holds.
         fn attach_nomemo(&self) -> std::result::Result<ZFile, Reject> {
             ZFile::attach(
-                &self.out, &self.blob, ID, END, false, false, false, true, false, false, true,
+                &self.out,
+                &self.blob,
+                ID,
+                END,
+                false,
+                false,
+                false,
+                true,
+                false,
+                FenceSearch::Keys,
+                true,
             )
         }
 
@@ -6205,7 +6453,17 @@ mod tests {
             "a new identity misses every group once"
         );
         let off = ZFile::attach(
-            &fx.out, &fx.blob, ID, END, false, false, false, true, false, false, true,
+            &fx.out,
+            &fx.blob,
+            ID,
+            END,
+            false,
+            false,
+            false,
+            true,
+            false,
+            FenceSearch::Keys,
+            true,
         )
         .unwrap();
         let d4 = read_all(&off);
@@ -6304,7 +6562,17 @@ mod tests {
             );
             assert!(matches!(fx.build(), Outcome::Built(_)));
             let zfile = ZFile::attach(
-                &fx.out, &fx.blob, ID, END, false, true, false, trusted, memo_first, false, true,
+                &fx.out,
+                &fx.blob,
+                ID,
+                END,
+                false,
+                true,
+                false,
+                trusted,
+                memo_first,
+                FenceSearch::Keys,
+                true,
             )
             .unwrap();
             type Emitted = Vec<(Vec<u8>, Vec<u8>)>;
@@ -6386,7 +6654,7 @@ mod tests {
                 false,
                 true,
                 false,
-                false,
+                FenceSearch::Keys,
                 true
             ),
             Err(Reject::Identity(_))
@@ -6402,7 +6670,7 @@ mod tests {
                 false,
                 true,
                 false,
-                false,
+                FenceSearch::Keys,
                 true
             ),
             Err(Reject::Identity(_))

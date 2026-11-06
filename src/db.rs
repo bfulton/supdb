@@ -613,6 +613,9 @@ pub struct ZCounts {
     /// Readings refreshed from the last sample in place of a sample
     /// (`Options::zpages_build_at_finish`, `Options::zpages_ahead_past_scans`).
     pub sample_refreshed: u64,
+    /// Readings made from the form files on disk at the crossing in place
+    /// of a fill sample (`Options::zpages_reading_from_files`).
+    pub sample_from_files: u64,
     /// The sampler's estimate of the form's bytes over the partitions it
     /// counted, at its last reading; `file_bytes` is what the build wrote.
     pub sample_w_z_bytes: u64,
@@ -664,7 +667,10 @@ pub struct ZCounts {
     pub sel_exit_e2: u64,
     pub sel_exit_e3: u64,
     pub sel_retired: u64,
-    /// The rent toward the build's price and the price, nanoseconds.
+    /// The rent toward the build's price, and the last reading's price,
+    /// nanoseconds; the price stands past the install that forgets the
+    /// reading, since a reading from the files on disk is bought in the
+    /// step after it lands.
     pub sel_excess_ns: u64,
     pub sel_c_build_ns: u64,
     /// E2's footprint as the tick last computed it: the compact pages the
@@ -1225,6 +1231,22 @@ pub struct Options {
     /// Twelve bytes an entry beside the fence's sixteen and the keys.
     #[doc(hidden)]
     pub zpages_fence_tree: bool,
+    /// A form file's fence searched over the entries' words laid flat
+    /// (`zpages::ZFence::index_words`, built at the attach), by a binary
+    /// search whose every step moves by arithmetic on the compare and not
+    /// by a branch, and the whole key compared only where entries tie on
+    /// the word. The search over the keys (the shape before) read a line
+    /// of the offsets and a line of the key blob a probe and mispredicted
+    /// half its probes, thirteen a search over a partition's fence of
+    /// some five thousand entries: at ten million keys under 1.25 GiB it
+    /// was 7% of ycsb-E's thread, 5% of C's and 8% of D's, a search a scan
+    /// and one or more a point read (`docs/engine.md`); the tree over the
+    /// words (`zpages_fence_tree`) took more, since a search of instructions
+    /// and cache hits had no misses for a tree to save. Eight bytes an
+    /// entry. On; `supdb-fencekeys` is the shape before. Where the tree is
+    /// asked for it is built instead.
+    #[doc(hidden)]
+    pub zpages_fence_words: bool,
     /// A group's decode asks for the line of the memo entry its put will
     /// displace before it begins (`zfile::Memo::prefetch_victim`): the put
     /// tries the displaced group's `Arc` for its last reference, a load of
@@ -2162,15 +2184,50 @@ pub struct Options {
     /// 682k-758k. A test that wants the builder on a small store sets 0.
     pub scan_cache_ahead_min_blocks: usize,
     /// The builder ahead starts while the store is out of core too -- the
-    /// controller's gate away from the raw form. Off, it starts in core
-    /// alone: a burst out of core dirties every block of the store, and the
-    /// builder built every one of them from partition pages the bound had
-    /// pushed out, for scans that read a few of them -- at ten million keys
-    /// under 1.25 GiB the ten-percent lag pass took 69,000-83,000 major
-    /// faults with the builder and 31,000 without, and the scanning thread
-    /// paid its install of the forms besides. `supdb-aheadooc` and
-    /// `supdb-ingestaheadooc` keep it running out of core.
+    /// controller's gate away from the raw form -- for the partitions
+    /// whose pages the cache holds (`ahead_resident_pct`). Off, it starts
+    /// in core alone, the shape before: a burst out of core dirties every
+    /// block of the store, and the builder built every one of them from
+    /// partition pages the bound had pushed out, for scans that read a few
+    /// of them -- at ten million keys under 1.25 GiB the ten-percent lag
+    /// pass took 69,000-83,000 major faults with the builder and 31,000
+    /// without, and the scanning thread paid its install of the forms
+    /// besides. That is the shape the residency gate is for; where the
+    /// pages are in memory the builder's work is what it is in core, and
+    /// at ten million keys under 1.25 GiB E, the one mix that scans, had
+    /// built its whole block cache inside its own window, 137,000 forms:
+    /// with the builder it found 100,000 of them built on the builder's
+    /// thread and read 1.07-1.10x in two sittings (`docs/engine.md`). On;
+    /// `supdb-aheadincore` and `supdb-ingestaheadincore` start it in core
+    /// alone.
     pub ahead_out_of_core: bool,
+    /// The share of a partition's pages, percent, the page cache must hold
+    /// for the builder ahead to build its blocks: the form file's where
+    /// one serves, else the record region's, read by `mincore` at the
+    /// builder's turn to the partition (the test's seam
+    /// `ZInject::set_records_resident` stands in for the kernel). A build
+    /// reads every block's records, and out of core a partition the bound
+    /// has pushed out is read from the device, a round trip a page, for
+    /// scans that read a few of its blocks -- the shape that refuted the
+    /// builder out of core (`ahead_out_of_core`); a partition in memory is
+    /// built from memory. A partition under the share is left to the scans
+    /// that want its blocks, counted (`Db::ahead_cold`). Zero builds
+    /// whatever the cache holds; `supdb-aheadcold` is that arm.
+    pub ahead_resident_pct: u32,
+    /// Out of core the builder ahead starts only once this many scans have
+    /// been made over the state it would build for; in core it starts at
+    /// the first, as before. Its forms repay their build through the
+    /// scans after it, and a pass of a few thousand scans does not repay
+    /// a build of a hundred thousand forms: at ten million keys under
+    /// 1.25 GiB the lag sweep's passes, 20,000 scans each over a store a
+    /// burst had just rewritten, ran up to twice as long with the builder
+    /// starting at their first scan, the one-percent pass taking 0.5
+    /// major faults an operation for the forms' pages where it took none,
+    /// while E, 1.6 million scans over one state, read 1.07-1.10x. A state
+    /// scanned a hundred thousand times is one being scanned, and the
+    /// builder's bet is placed where the scans that pay it are
+    /// (`docs/engine.md`). `supdb-aheadeager` starts it at the first scan.
+    pub ahead_out_of_core_scans: u64,
     /// EXPERIMENT: the range-read structure written at ingest. The writer
     /// keeps a canonical form of every block an unsealed key overlays
     /// current at each commit, the builder ahead having made the first
@@ -3810,6 +3867,26 @@ pub struct Options {
     /// drain. On as shipped, with `zpages_cover_resident`; off waits for the
     /// ticks, and `supdb-zinstallwaits` is the arm with both off.
     pub zpages_suspect_at_crossing: bool,
+    /// Whether the controller's reading at the crossing is made from the
+    /// form files on disk where they, with the partitions that stand in for
+    /// theirs (`zpages_cover_resident`), cover the keys the install needs
+    /// (`zselect::COVERED_ENOUGH`): their lengths, pages and resident parts
+    /// read from their trailers, a few pages of a few of them decoded for
+    /// the cost of a decode, the fill's price per record from the builds'
+    /// recorded CPU over the bytes they decoded, on the segment work's
+    /// thread in the tick that wants the reading; a partition without a
+    /// file is priced at the ratio of those with one. The fill sample ran
+    /// instead: every partition filled from thirty-two ranks three times in
+    /// each of two codings on a thread of its own, 0.4 s at ten million
+    /// keys under 1.25 GiB beside C's first reads, for a form whose bytes
+    /// were on disk to be read, and the reading it gave was bought only
+    /// when the model was next recomputed with it, up to a second later:
+    /// the install came 1.1 s after the crossing, two thirds of a divided
+    /// C of 1.4 s, every read before it raw at seven times the cost. On
+    /// as shipped; `supdb-zsamplefills` is the fill sample for every
+    /// reading, and a store whose files do not cover the keys samples as
+    /// before under both.
+    pub zpages_reading_from_files: bool,
     /// EXPERIMENT: under the controller (`ZPages::Auto`), once the form is
     /// installed, the re-code policy (`zpages_recode`) re-codes the hottest
     /// partitions to the raw tails while they serve, where their decodes
@@ -3955,6 +4032,7 @@ impl Default for Options {
             zpages_memo_bytes: 8 << 20,
             zpages_memo_first: false,
             zpages_fence_tree: false,
+            zpages_fence_words: true,
             zpages_memo_ahead: true,
             zpages_block_cursor: true,
             zpages_scan_prefetch: false,
@@ -4014,7 +4092,9 @@ impl Default for Options {
             scan_prefetch_bytes: 4096,
             seek_prefetch_dir: true,
             scan_cache_ahead_min_blocks: 1024,
-            ahead_out_of_core: false,
+            ahead_out_of_core: true,
+            ahead_resident_pct: 90,
+            ahead_out_of_core_scans: 100_000,
             commit_forms: true,
             forms_from_reader_scans: 0,
             commit_forms_build: true,
@@ -4120,6 +4200,7 @@ impl Default for Options {
             zpages_sample_between: false,
             zpages_cover_resident: true,
             zpages_suspect_at_crossing: true,
+            zpages_reading_from_files: true,
             zpages_recode_auto: false,
             zpages_reparse: false,
         }
@@ -14508,6 +14589,9 @@ struct Shared {
     fill_passes: AtomicU64,
     /// Fills that stopped at a block for the writer (`Options::upkeep_fill_yields`).
     fill_cuts: AtomicU64,
+    /// Partitions the builder ahead left to the scans for the page cache
+    /// holding too few of their pages (`Options::ahead_resident_pct`).
+    ahead_cold: AtomicU64,
     /// Ordered indexes the open rebuilt from their segments
     /// (`Seg::open_ord`); see `Db::ord_rebuilt`.
     ord_rebuilt: AtomicU64,
@@ -14851,7 +14935,7 @@ fn fadvise_dontneed(_file: &std::fs::File) {}
 /// The share of the pages under `bytes`, a range of a file's mapping, that
 /// the kernel holds in memory now, by `mincore`; zero for an empty range
 /// or where the kernel will not say.
-fn resident_share(bytes: &[u8]) -> f64 {
+pub(super) fn resident_share(bytes: &[u8]) -> f64 {
     if bytes.is_empty() {
         return 0.0;
     }
@@ -19075,6 +19159,7 @@ impl Reader {
             sample_declined: get(&ev.sample_declined),
             sample_us: get(&ev.sample_us),
             sample_refreshed: get(&ev.sample_refreshed),
+            sample_from_files: get(&ev.sample_from_files),
             sample_w_z_bytes: get(&ev.sample_w_z),
             sample_w_z_raw_bytes: get(&ev.sample_w_z_raw),
             coding_picks_block: get(&ev.coding_picks[0]),
@@ -26767,6 +26852,7 @@ impl Db {
             fill_walked: AtomicU64::new(0),
             fill_passes: AtomicU64::new(0),
             fill_cuts: AtomicU64::new(0),
+            ahead_cold: AtomicU64::new(0),
             ord_rebuilt: AtomicU64::new(0),
             z: zfile::ZEvents::default(),
             retired_z: RetireList::new(),
@@ -27155,7 +27241,7 @@ impl Db {
                     opts.zpages_trusted_views,
                     opts.zpages_memo_first,
                     (
-                        opts.zpages_fence_tree,
+                        Db::fence_search(&opts),
                         opts.zpages_memo_ahead,
                         opts.zpages_inplace_walk,
                         opts.zpages_drop_raw,
@@ -27312,6 +27398,7 @@ impl Db {
             fill_walked: AtomicU64::new(0),
             fill_passes: AtomicU64::new(0),
             fill_cuts: AtomicU64::new(0),
+            ahead_cold: AtomicU64::new(0),
             ord_rebuilt: AtomicU64::new(ord_rebuilt),
             z: zev,
             retired_z: RetireList::new(),
@@ -29912,8 +29999,18 @@ impl Reader {
         // Out of core the builder builds every block a burst dirtied from
         // pages the bound pushed out, for scans that read a few of them
         // (`Options::ahead_out_of_core`).
-        if !self.opts.ahead_out_of_core && self.shared.zgate.load() != zselect::GATE_RAW {
-            return;
+        if self.shared.zgate.load() != zselect::GATE_RAW {
+            if !self.opts.ahead_out_of_core {
+                return;
+            }
+            // Out of core the builder's forms repay their build through the
+            // scans after it, so it waits for a state that is being scanned
+            // (`Options::ahead_out_of_core_scans`); a pass of a few thousand
+            // scans never starts one, and is left as it was.
+            if self.state().scans.load(AtomicOrdering::Relaxed) < self.opts.ahead_out_of_core_scans
+            {
+                return;
+            }
         }
         // A store too small for a builder: its run beside the scans costs
         // them more than the builds it saves; the option's doc has the
@@ -30578,6 +30675,18 @@ impl Db {
 
     /// How a form file meets the handles' memos, by the options
     /// (`Options::zpages_memo`, `Options::zpages_memo_hash`).
+    /// How a form file's fence is searched, from the options: the tree
+    /// where asked, else the flat words where asked, else the keys.
+    fn fence_search(opts: &Options) -> zpages::FenceSearch {
+        if opts.zpages_fence_tree {
+            zpages::FenceSearch::Tree
+        } else if opts.zpages_fence_words {
+            zpages::FenceSearch::Words
+        } else {
+            zpages::FenceSearch::Keys
+        }
+    }
+
     fn z_memo(opts: &Options) -> zfile::MemoShape {
         match (opts.zpages_memo, opts.zpages_memo_hash) {
             (false, _) => zfile::MemoShape::Off,
@@ -30602,7 +30711,7 @@ impl Db {
         prefetch: bool,
         trusted: bool,
         memo_first: bool,
-        lines: (bool, bool, bool, bool, bool, bool),
+        lines: (zpages::FenceSearch, bool, bool, bool, bool, bool),
         ev: &zfile::ZEvents,
     ) -> bool {
         let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) else {
@@ -30677,7 +30786,7 @@ impl Db {
                 self.opts.zpages_trusted_views,
                 self.opts.zpages_memo_first,
                 (
-                    self.opts.zpages_fence_tree,
+                    Db::fence_search(&self.opts),
                     self.opts.zpages_memo_ahead,
                     self.opts.zpages_inplace_walk,
                     z_drop_now(&self.opts, &self.shared),
@@ -30723,7 +30832,7 @@ impl Db {
                     self.opts.zpages_scan_prefetch,
                     self.opts.zpages_trusted_views,
                     self.opts.zpages_memo_first,
-                    self.opts.zpages_fence_tree,
+                    Db::fence_search(&self.opts),
                     self.opts.zpages_memo_ahead,
                 ) {
                     Ok(mut side) => {
@@ -31511,6 +31620,31 @@ impl Reader {
     /// before it held it, or when the store has dropped the channel's
     /// other end. A block with no overlay is clean and needs no form;
     /// one past the wide bound is the store's to walk.
+    /// Whether the builder ahead builds a partition's blocks: the share of
+    /// the pages a build reads -- the form file's where one serves, else
+    /// the record region's -- that the page cache holds is at least
+    /// `Options::ahead_resident_pct`, by the kernel's answer or the test's
+    /// seam (`ZInject::set_records_resident`). Zero builds whatever is held.
+    fn ahead_partition_resident(&self, seg: &Seg) -> bool {
+        let pct = self.opts.ahead_resident_pct;
+        if pct == 0 {
+            return true;
+        }
+        let share = match self
+            .opts
+            .zpages_inject
+            .as_ref()
+            .and_then(|i| i.records_resident())
+        {
+            Some(s) => s,
+            None => match self.zc(seg) {
+                Some(z) => z.pages_resident(),
+                None => seg.records_resident(),
+            },
+        };
+        share * 100.0 >= f64::from(pct)
+    }
+
     fn build_ahead_job(
         &self,
         at: AtCommit,
@@ -31544,6 +31678,13 @@ impl Reader {
         let np = self.segs().partition_point(|s| s.level > 0);
         let l0 = &self.segs()[np..];
         for (pi, seg) in self.segs()[..np].iter().enumerate() {
+            // A partition whose pages the page cache does not hold is the
+            // scans' to build from, block by block, not the builder's to
+            // read whole from the device (`Options::ahead_resident_pct`).
+            if !self.ahead_partition_resident(seg) {
+                self.shared.ahead_cold.fetch_add(1, AtomicOrdering::Relaxed);
+                continue;
+            }
             let nblocks = seg.blocks();
             let (pieces, piece_ranks) = ctx.table_bounds(seg, l0)?;
             let table = BlockTable {
@@ -33110,6 +33251,14 @@ impl Db {
     /// -- the log read and settle; the snapshot's and runs' refresh with
     /// the builds ahead installed and the settled blocks built; the
     /// complete-table fill's walk over the blocks; and that fill's builds
+    /// Partitions the builder ahead left to the scans for the page cache
+    /// holding too few of their pages (`Options::ahead_resident_pct`), over
+    /// the store's life.
+    #[doc(hidden)]
+    pub fn ahead_cold(&self) -> u64 {
+        self.shared.ahead_cold.load(AtomicOrdering::Relaxed)
+    }
+
     /// -- then the blocks the fill walked, the passes stamped and the fills
     /// that stopped at a block for the writer (`Options::upkeep_fill_yields`).
     /// Atomics only: a read takes nothing back from the thread.
@@ -35790,6 +35939,19 @@ const RECODE_AUTO_EVICT: f64 = 0.95;
 /// eviction front passed them, and the controller built them after its buy
 /// from pages colder still; one of them took 47 faults then.
 const LAND_RESIDENT: f64 = 0.5;
+
+/// The reading from the form files on disk (`Maint::z_reading_from_files`)
+/// times the decodes of this many pages of each of this many files: forty
+/// pages of a few microseconds each, where the fill sample filled and
+/// decoded ninety-six pages of every partition.
+const READING_TIMED_FILES: usize = 4;
+const READING_TIMED_PAGES: usize = 10;
+
+/// The fill's price a record where no build has run and no sample has
+/// read one: the fill sample's own figure at ten million keys of the
+/// suite's shape, 7.1 s of CPU over the keys (`zsample ... build_cpu`),
+/// used until a build or a sample measures it.
+const READING_PRIOR_FILL_PER_RECORD: f64 = 7e-7;
 
 /// Whether the partitions that stand in for their form files
 /// (`Options::zpages_cover_resident`: resident, or built ahead in flight)
@@ -39090,6 +39252,58 @@ impl Maint {
             self.z_coding_pick = Some(c);
         }
         ev.sample_w_z_raw.store(raw.w_z, AtomicOrdering::Relaxed);
+        let sums = if pick == Some(zselect::Coding::RawTails) {
+            raw
+        } else {
+            block
+        };
+        let fill_per_record = if sums.records > 0 {
+            sums.fill_ns as f64 * 1e-9 / sums.records as f64
+        } else {
+            0.0
+        };
+        self.z_reading(
+            "zsample",
+            &sums,
+            fill_per_record,
+            on_disk,
+            missing_keys,
+            uncovered_keys,
+            job.generation,
+            raw.w_z,
+        );
+    }
+
+    /// The selector's reading from a sample's sums (`z_sample_collect`) or
+    /// from the form files on disk (`z_reading_from_files`), one
+    /// arithmetic for both: the form's bytes and resident part for the
+    /// model, the fill's price a record over the keys as the build's CPU
+    /// and its price, the decodes' CPU a group as the cost of a read and of
+    /// a scan through the form, the touches' wait a fault as the price of a
+    /// fault where any faulted, and the attach's price in place of the
+    /// build's where every partition's form file is on disk already. The
+    /// model is recomputed at the next tick with the form's size this
+    /// reading gives: it was recomputed at its period (`zselect::S1_PERIOD`)
+    /// alone, and the buy on the prediction needs the model's compact
+    /// prediction, which has no value until the model has the form's
+    /// size, so a reading landed a step after the period's reading stood
+    /// unbought for the rest of the second -- 0.5 s of C's divided window
+    /// at ten million keys under 1.25 GiB, the reading at hand and nothing
+    /// to decide it.
+    #[allow(clippy::too_many_arguments)]
+    fn z_reading(
+        &mut self,
+        kind: &str,
+        sums: &ZSums,
+        fill_per_record: f64,
+        on_disk: usize,
+        missing_keys: u64,
+        uncovered_keys: u64,
+        generation: u64,
+        w_z_raw: u64,
+    ) {
+        let shared = self.shared.clone();
+        let ev = &shared.z;
         let ZSums {
             counted,
             w_z,
@@ -39097,23 +39311,14 @@ impl Maint {
             nkeys,
             recs_len,
             pages,
-            fill_ns,
+            fill_ns: _,
             records,
             decode_ns,
             zgroups,
             wait_ns,
             faults,
-        } = if pick == Some(zselect::Coding::RawTails) {
-            raw
-        } else {
-            block
-        };
+        } = *sums;
         let declined = counted == 0;
-        let fill_per_record = if records > 0 {
-            fill_ns as f64 * 1e-9 / records as f64
-        } else {
-            0.0
-        };
         let build_cpu = fill_per_record * nkeys as f64;
         // The decode of one group, which is what a point read pays, as
         // timed over every group of the sampled pages, or as the seam
@@ -39166,6 +39371,9 @@ impl Maint {
             t_z_scan: Some(zselect::PRIOR_T_HIT_SCAN + groups_per_scan * 1.25 * decode_per_page),
         };
         self.z_sample_size = (!declined).then_some((w_z, resident, pages_per_key));
+        if !declined {
+            self.z_last_s1 = None;
+        }
         ev.sample_w_z.store(w_z, AtomicOrdering::Relaxed);
         // What a refresh prices from: a reading that declined priced
         // nothing, and the next generation is sampled as before.
@@ -39180,18 +39388,156 @@ impl Maint {
             costs,
             c_build,
             declined,
-            generation: job.generation,
+            generation,
             attach: !declined
                 && on_disk > 0
                 && uncovered_keys as f64 <= (1.0 - zselect::COVERED_ENOUGH) * nkeys as f64,
         });
         if self.z_trace {
             eprintln!(
-                "zsample partitions {counted} declined {declined} on_disk {on_disk} keys {nkeys} records {recs_len} w_z {w_z} resident {resident} build_cpu {build_cpu:.4} c_build {c_build:.4} t_f {t_f:?} decode_per_page {decode_per_page:.3e} coding {:?} w_z_raw {}",
+                "{kind} t={:.2} partitions {counted} declined {declined} on_disk {on_disk} keys {nkeys} records {recs_len} w_z {w_z} resident {resident} build_cpu {build_cpu:.4} c_build {c_build:.4} t_f {t_f:?} decode_per_page {decode_per_page:.3e} coding {:?} w_z_raw {w_z_raw}",
+                self.z_epoch.elapsed().as_secs_f64(),
                 self.z_coding_pick,
-                raw.w_z
             );
         }
+    }
+
+    /// The reading at the crossing from the form files on disk
+    /// (`Options::zpages_reading_from_files`), in place of a fill sample:
+    /// where the files on disk, with the partitions that stand in for
+    /// theirs, cover the keys the install needs (`ZCover::covers`), each
+    /// file's length, pages and resident part are read from its trailer
+    /// (`zfile::file_facts`), a few pages of the first few files are
+    /// decoded and walked for the cost of a decode
+    /// (`zfile::time_file_decodes`), the fill's price a record is the
+    /// builds' recorded CPU over the bytes they decoded times the mean
+    /// record, and a partition with no file is priced at the ratio of
+    /// those with one, since the file it will have is of the same
+    /// records. Nothing runs on another thread: the reading stands in this
+    /// tick, and the next step buys on it. `false` where the files do not
+    /// cover, or one of them is not what its name says, and the fill
+    /// sample runs as before.
+    fn z_reading_from_files(&mut self) -> bool {
+        let c = self.z_files_cover();
+        if c.counted == 0 || c.on_disk == 0 || !c.covers() {
+            return false;
+        }
+        let (segs, generation) = {
+            let _op = self.op();
+            let segs: Vec<std::sync::Arc<Seg>> = self
+                .segs()
+                .iter()
+                .filter(|s| s.level > 0 && !self.in_flight_input(&s.name))
+                .filter(|s| {
+                    let why = s.z_declined.load(AtomicOrdering::Relaxed);
+                    why == 0 || why == zfile::DECLINED_REFUSED
+                })
+                .cloned()
+                .collect();
+            (segs, self.z_generation())
+        };
+        let own = self.opts.zpages_own_decoder;
+        let advise = Db::z_advise(&self.opts);
+        let mut sums = ZSums::default();
+        let (mut on_disk, mut on_recs, mut missing_recs, mut timed) = (0usize, 0u64, 0u64, 0usize);
+        for seg in &segs {
+            let blob = seg.blob.for_zfile();
+            let Some(facts) = blob.z_source_facts() else {
+                continue;
+            };
+            sums.counted += 1;
+            sums.nkeys = sums.nkeys.saturating_add(facts.nkeys);
+            sums.recs_len = sums.recs_len.saturating_add(facts.recs_len);
+            let on = Db::name_id(&seg.name)
+                .zip(Db::name_end_seq(&seg.name))
+                .and_then(|(id, end)| {
+                    let path = self.dir.join(zfile::zpg_name(id, end));
+                    zfile::file_facts(&path, blob, id, end, advise).map(|f| (path, id, end, f))
+                });
+            let Some((path, id, end, f)) = on else {
+                missing_recs = missing_recs.saturating_add(facts.recs_len);
+                continue;
+            };
+            on_disk += 1;
+            on_recs = on_recs.saturating_add(facts.recs_len);
+            sums.w_z = sums.w_z.saturating_add(f.bytes);
+            sums.resident = sums.resident.saturating_add(f.resident);
+            sums.pages = sums.pages.saturating_add(f.pages);
+            if timed < READING_TIMED_FILES {
+                if let Some(d) =
+                    zfile::time_file_decodes(&path, blob, id, end, READING_TIMED_PAGES, own, advise)
+                {
+                    sums.decode_ns = sums.decode_ns.saturating_add(d.decode_ns);
+                    sums.zgroups = sums.zgroups.saturating_add(d.zgroups);
+                    sums.records = sums.records.saturating_add(d.records);
+                    sums.wait_ns = sums.wait_ns.saturating_add(d.wait_ns);
+                    sums.faults = sums.faults.saturating_add(d.faults);
+                    timed += 1;
+                }
+            }
+        }
+        if on_disk == 0 || on_recs == 0 || sums.zgroups == 0 {
+            return false;
+        }
+        // The partitions without a file, at the ratio of those with one.
+        let scale =
+            |x: u64| -> u64 { (x as f64 * missing_recs as f64 / on_recs as f64).round() as u64 };
+        sums.w_z = sums.w_z.saturating_add(scale(sums.w_z));
+        sums.resident = sums.resident.saturating_add(scale(sums.resident));
+        sums.pages = sums.pages.saturating_add(scale(sums.pages));
+        // The fill's price a record: the builds' CPU over the bytes they
+        // decoded, times the mean record; the last reading's where no build
+        // has run, and the prior where nothing has.
+        let built_bytes = self
+            .shared
+            .z
+            .build_group_bytes
+            .load(AtomicOrdering::Relaxed);
+        let built_cpu_us = self.shared.z.build_cpu_us.load(AtomicOrdering::Relaxed);
+        let mean_record = sums.recs_len as f64 / sums.nkeys.max(1) as f64;
+        let fill_per_record = if built_bytes > 0 && built_cpu_us > 0 {
+            built_cpu_us as f64 * 1e-6 / built_bytes as f64 * mean_record
+        } else {
+            self.z_sample_last
+                .as_ref()
+                .map_or(READING_PRIOR_FILL_PER_RECORD, |l| l.fill_per_record)
+        };
+        // The coding, where the selector chooses it (`zselect::choose_coding`),
+        // from the raw-tail form's size as the records' bytes: that form keeps
+        // the records' tails verbatim and codes their heads, so the fill
+        // sample's figure for it at ten million keys was 0.977 of the records,
+        // and the records are the conservative side of the fit the pick is
+        // made against (`zselect::FORM_FILL`).
+        let raw_w_z = sums.recs_len;
+        if self.opts.zpages_coding_auto {
+            let budget = self.z_budget().unwrap_or(0);
+            let pick = zselect::choose_coding(
+                budget,
+                zselect::FormSize {
+                    w_z: raw_w_z,
+                    resident: sums.resident,
+                },
+            );
+            let idx = usize::from(pick == zselect::Coding::RawTails);
+            zfile::ZEvents::add(&self.shared.z.coding_picks[idx], 1);
+            self.z_coding_pick = Some(pick);
+        }
+        self.shared
+            .z
+            .sample_w_z_raw
+            .store(raw_w_z, AtomicOrdering::Relaxed);
+        zfile::ZEvents::add(&self.shared.z.sample_from_files, 1);
+        self.z_reading(
+            "zreading",
+            &sums,
+            fill_per_record,
+            on_disk,
+            c.missing_keys,
+            c.uncovered_keys,
+            generation,
+            raw_w_z,
+        );
+        true
     }
 
     /// The price of the purchase a reading offers, as the ski rental prices
@@ -39521,6 +39867,9 @@ impl Maint {
             && self.z_sample_ready.is_none()
             && !self.z_sample_held()
         {
+            if self.opts.zpages_reading_from_files && self.z_reading_from_files() {
+                return;
+            }
             self.z_sample_start();
         }
     }
@@ -40225,8 +40574,14 @@ impl Maint {
         ev.sel_retired.store(c.retired, AtomicOrdering::Relaxed);
         ev.sel_excess_ns
             .store(ns(Some(self.zsel.excess())), AtomicOrdering::Relaxed);
-        ev.sel_c_build_ns
-            .store(ns(Some(self.zsel.c_build())), AtomicOrdering::Relaxed);
+        // The last reading's price, kept past the install that forgets it:
+        // a reading from the files on disk is bought in the step after it
+        // lands, and a count read between steps saw none.
+        let c_build = self.zsel.c_build();
+        if c_build > 0.0 {
+            ev.sel_c_build_ns
+                .store(ns(Some(c_build)), AtomicOrdering::Relaxed);
+        }
         // Once a second, at an event, and at every interval with operations
         // while a build runs, since the vanish rule reads those.
         let ops = input
@@ -40237,18 +40592,22 @@ impl Maint {
         if self.z_trace
             && (model.is_some()
                 || d.event.is_some()
+                || d.phase == zselect::Phase::Suspect
                 || (d.phase == zselect::Phase::Building && ops > 0))
         {
             let (saving, vanished) = self.zsel.evidence_state();
             let buy = self.zsel.buy_state(input.now);
             eprintln!(
-                "zselect {:?} gate {} census {} build {} sample {} event {:?} model {:?} e2 {:?} costs {:?} win r {}/{} s {}/{} refaults {:?} saving {:?} vanished {} theta {:.4}/{:.4} foot {}/{} gen {:x} inflight {}{}{} buy {:?}",
+                "zselect t={:.2} {:?} gate {} census {} build {} sample {} event {:?} rewriting {} ops {} model {:?} e2 {:?} costs {:?} win r {}/{} s {}/{} refaults {:?} saving {:?} vanished {} theta {:.4}/{:.4} foot {}/{} gen {:x} inflight {}{}{} buy {:?}",
+                self.z_epoch.elapsed().as_secs_f64(),
                 d.phase,
                 d.gate,
                 d.census,
                 d.build,
                 d.sample,
                 d.event,
+                input.rewriting,
+                ops,
                 model,
                 self.zsel.e2_state(),
                 m,
@@ -40382,7 +40741,7 @@ impl Maint {
                 self.opts.zpages_trusted_views,
                 self.opts.zpages_memo_first,
                 (
-                    self.opts.zpages_fence_tree,
+                    Db::fence_search(&self.opts),
                     self.opts.zpages_memo_ahead,
                     self.opts.zpages_inplace_walk,
                     z_drop_now(&self.opts, &self.shared),
@@ -40715,7 +41074,7 @@ impl Maint {
                     self.opts.zpages_scan_prefetch,
                     self.opts.zpages_trusted_views,
                     self.opts.zpages_memo_first,
-                    self.opts.zpages_fence_tree,
+                    Db::fence_search(&self.opts),
                     self.opts.zpages_memo_ahead,
                 ) {
                     Ok(mut side) => {
@@ -40762,7 +41121,7 @@ impl Maint {
                     self.opts.zpages_scan_prefetch,
                     self.opts.zpages_trusted_views,
                     self.opts.zpages_memo_first,
-                    self.opts.zpages_fence_tree,
+                    Db::fence_search(&self.opts),
                     self.opts.zpages_memo_ahead,
                 ) {
                     Ok(mut side) => {
@@ -40836,7 +41195,7 @@ impl Maint {
                         self.opts.zpages_scan_prefetch,
                         self.opts.zpages_trusted_views,
                         self.opts.zpages_memo_first,
-                        self.opts.zpages_fence_tree,
+                        Db::fence_search(&self.opts),
                         self.opts.zpages_memo_ahead,
                     ) {
                         Ok(mut side) => {
