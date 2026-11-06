@@ -3438,12 +3438,21 @@ through. The suspension holds off builds and never an attach now, a trip
 during an attach suspends the building of the rest without cancelling it,
 and where files land under the store's own writing the reading is
 refreshed against a count of them in place of a sample
-(`Maint::z_sample_refresh`). The rule: a guard is tested against the kind
+(`Maint::z_sample_refresh`). The default flipped under the gate then found
+what the arm had never met: the refresh stood in for every sample, and one
+made from a sample that had declined -- taken over no partition, before
+the drain's first landing -- priced a build at nothing, refused the
+attach and stood at the generation, so fourteen tests never reached
+COMPACT; the refresh hands a reading only where the files on disk cover
+the keys, from a sample that did not decline, and elsewhere the selector
+samples as before. The rule: a guard is tested against the kind
 of purchase it was written for, and a reading that a changing input
 invalidates is refreshed from the part of it that changed, or it never
-stands for long enough to be read; and a controller's refusal is read off
-its clause's inputs on the trace before its evidence is reasoned about,
-since four clauses looked satisfied from the fields the line carried.
+stands for long enough to be read -- and a stand-in for a measurement
+stands in only where it carries what the measurement would have carried;
+and a controller's refusal is read off its clause's inputs on the trace
+before its evidence is reasoned about, since four clauses looked satisfied
+from the fields the line carried.
 
 ## Standing limitations
 

@@ -1502,16 +1502,16 @@ pub struct Options {
     /// scans they would have served (`docs/engine.md`). Off.
     #[doc(hidden)]
     pub zpages_ahead_past_scans: bool,
-    /// EXPERIMENT: a merge's output partition is given its form file as it
+    /// A merge's output partition is given its form file as it
     /// is finished, by a builder the merge's thread starts while the pages
     /// it just wrote are in the page cache -- at most `zpages_ahead_builders`
     /// at once, the merge waiting for a slot, which keeps it at the
     /// builders' pace and its outputs resident for them -- where the store
     /// is past the share of its budget the builds ahead at landing start
     /// at (`zpages_land_pct`) or the form is installed; the landing finds
-    /// the files on disk, and the segment work's tick after the last build
-    /// asks the selector for a fresh reading where the files cover the
-    /// keys (`Maint::z_prebuilt_landed`), so the attach follows. The builds ahead at
+    /// the files on disk, and a build's end has the selector's reading
+    /// refreshed against the files where they cover the keys
+    /// (`Maint::z_sample_refresh`), so the attach follows. The builds ahead at
     /// landing wait for the landing, for the scans around them and for the
     /// builder's slot, and read the partition back from the device once
     /// the merge's later outputs have pushed it out: at ten million keys
@@ -1519,7 +1519,7 @@ pub struct Options {
     /// last merge with two files of twenty-four and its first pass walked
     /// the raw form, and the full rewrite's pass read the merges' outputs
     /// back for their builds, a third of the 3.7 GB it read at the device
-    /// (`docs/engine.md`). Off.
+    /// (`docs/engine.md`). On; `supdb-nozfinish` is the arm without it.
     #[doc(hidden)]
     pub zpages_build_at_finish: bool,
     /// Whether a build ahead (`zpages_land_pct`, `zpages_prebuild`) drops
@@ -3932,7 +3932,7 @@ impl Default for Options {
             zpages_build_sync: true,
             zpages_land_cold_past: true,
             zpages_ahead_past_scans: false,
-            zpages_build_at_finish: false,
+            zpages_build_at_finish: true,
             zpages_group_bytes: zpages::ZGROUP_BYTES,
             zpages_record_coding: false,
             zpages_store_all: false,
@@ -38421,8 +38421,8 @@ impl Maint {
         // A reading the selector would drop at this generation -- one just
         // collected at another, or the one it holds -- or one that refused
         // the attach for want of files a landing has since put on disk, is
-        // refreshed from the last sample and a count of the files, where
-        // files land under the store's own writing (`z_sample_refresh`).
+        // replaced by the attach's reading where the files on disk cover
+        // the keys (`z_sample_refresh`); elsewhere the selector samples.
         if self.zsel.phase() == zselect::Phase::Suspect {
             let stale = self
                 .z_sample_ready
@@ -38830,15 +38830,15 @@ impl Maint {
         };
         self.z_sample_size = (!declined).then_some((w_z, resident, pages_per_key));
         ev.sample_w_z.store(w_z, AtomicOrdering::Relaxed);
-        self.z_sample_last = Some(ZReading {
-            costs,
-            fill_per_record,
-            attach_per_file: if counted > 0 {
-                attach / counted as f64
-            } else {
-                0.0
-            },
-        });
+        // What a refresh prices from: a reading that declined priced
+        // nothing, and the next generation is sampled as before.
+        if !declined {
+            self.z_sample_last = Some(ZReading {
+                costs,
+                fill_per_record,
+                attach_per_file: attach / counted as f64,
+            });
+        }
         self.z_sample_ready = Some(zselect::Sampler {
             costs,
             c_build,
@@ -38944,17 +38944,22 @@ impl Maint {
         c
     }
 
-    /// The sampler's last reading refreshed for the partitions as they stand
-    /// and handed to the selector at `generation`, where form files land
+    /// The attach's reading, where the form files on disk cover the keys the
+    /// install needs and the selector holds no reading for the partitions as
+    /// they stand: the sampler's last reading refreshed against a count of
+    /// the files, cheaply, and handed at `generation`, where form files land
     /// under the store's own writing (`Options::zpages_build_at_finish`,
-    /// `Options::zpages_ahead_past_scans`): the files counted again, cheaply,
-    /// the purchase priced on the count with the reading's own costs. A
-    /// reading is of the partitions at a generation and the selector drops
-    /// one taken at another, so under a chain of merges, a landing every
-    /// half second and a sample longer than that, no reading reached a step:
-    /// forty-one samples ran through one pass of fifteen seconds, each over
-    /// every partition's pages on the thread the landings go through, and
-    /// the attach the files on disk offered was never bought.
+    /// `Options::zpages_ahead_past_scans`). A reading is of the partitions at
+    /// a generation and the selector drops one taken at another, so under a
+    /// chain of merges, a landing every half second and a sample longer than
+    /// that, no reading reached a step: forty-one samples ran through one
+    /// pass of fifteen seconds, each over every partition's pages on the
+    /// thread the landings go through, and the attach the files on disk
+    /// offered was never bought. Where the files do not cover the keys
+    /// nothing is handed and the selector samples as before: a reading
+    /// refreshed from one that had declined, over no partition, priced a
+    /// build at nothing and refused the attach, stood at the generation, and
+    /// kept every sample away for the store's life.
     fn z_sample_refresh(&mut self, generation: u64) {
         if !(self.opts.zpages_build_at_finish || self.opts.zpages_ahead_past_scans) {
             return;
@@ -38963,10 +38968,11 @@ impl Maint {
             return;
         };
         let c = self.z_files_cover();
-        let declined = c.counted == 0;
-        let attach = !declined && c.covers();
+        if c.counted == 0 || !c.covers() {
+            return;
+        }
         let c_build = self.z_price(
-            declined,
+            false,
             c.on_disk,
             c.counted,
             last.attach_per_file * c.counted as f64,
@@ -38978,14 +38984,14 @@ impl Maint {
         self.z_sample_ready = Some(zselect::Sampler {
             costs: last.costs,
             c_build,
-            declined,
+            declined: false,
             generation,
-            attach,
+            attach: true,
         });
         zfile::ZEvents::add(&self.shared.z.sample_refreshed, 1);
         if self.z_trace {
             eprintln!(
-                "zrefresh t={:.1} partitions {} on_disk {} uncovered {} of {} attach {attach} c_build {c_build:.4}",
+                "zrefresh t={:.1} partitions {} on_disk {} uncovered {} of {} c_build {c_build:.4}",
                 self.z_epoch.elapsed().as_secs_f64(),
                 c.counted,
                 c.on_disk,

@@ -7464,6 +7464,10 @@ fn builds_ahead_at_landing_wait_while_scans_are_around() {
         let (dir, mut db, model, inject, raw) =
             land_store_with(&format!("auto-land-scans-{far}"), 50, |o| {
                 o.zpages_land_scans_far = far;
+                // The builds ahead at landing alone, so that a merge's
+                // outputs have no file but theirs
+                // (`Options::zpages_build_at_finish`).
+                o.zpages_build_at_finish = false;
             });
         let mut seen = 0usize;
         db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
@@ -7724,14 +7728,13 @@ fn a_merges_outputs_have_their_form_files_when_it_lands() {
                 landed_now,
                 "{what}: the install followed the files, not a landing"
             );
-            // The one sample's reading carried across the landings by a
-            // refresh against the files on disk, never sampled again: a
-            // reading is of the partitions at a generation, and under a
-            // chain of merges none ever reached a step.
+            // The attach's reading came from a refresh against the files on
+            // disk, which no landing asked for: a reading is of the
+            // partitions at a generation, and the builds' end changes none.
             let c = db.zpage_counts();
             assert!(
-                c.sample_refreshed >= 1 && c.samples == 1,
-                "{what}: the reading refreshed, not sampled again: {c:?}"
+                c.sample_refreshed >= 1,
+                "{what}: the reading refreshed against the files: {c:?}"
             );
         } else {
             db.hold_zpage_build(false);
