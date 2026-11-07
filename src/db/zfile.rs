@@ -413,6 +413,9 @@ pub(super) struct ZCursor<'a> {
     pub(super) prefetches: u64,
     pub(super) views: u64,
     pub(super) aheads: u64,
+    /// The next open is the walk's, decoded into `buf` under
+    /// `ZFile::walk_owns`; taken at the open.
+    owns_next: bool,
     /// Whether the bulk walk has asked for the pages ahead of it
     /// (`walk_until`): once a cursor, as `scan_at` asks once a walk.
     asked: bool,
@@ -452,6 +455,7 @@ impl<'a> ZCursor<'a> {
             prefetches: 0,
             views: 0,
             aheads: 0,
+            owns_next: false,
             asked: false,
             fell: false,
             last: Vec::new(),
@@ -584,6 +588,10 @@ impl<'a> ZCursor<'a> {
     /// `false` where it could not be, the cursor fallen.
     fn open_at(&mut self, entry: &FenceEntry<'_>, j: usize) -> bool {
         let first = entry.first_rank as usize;
+        // Whether a decode goes into the memo: not for the walk's next
+        // group under `ZFile::walk_owns` (`owns_next`, set by `next_group`
+        // for this one open).
+        let memoise = !std::mem::take(&mut self.owns_next);
         self.eidx = entry.index;
         self.page_end = first
             .saturating_add(entry.count as usize)
@@ -631,6 +639,7 @@ impl<'a> ZCursor<'a> {
                         self.pview.as_ref(),
                         self.zfile.inplace,
                         true,
+                        memoise,
                     )
                 }
             }
@@ -648,6 +657,7 @@ impl<'a> ZCursor<'a> {
                 &mut self.buf,
                 self.pview.as_ref(),
                 self.zfile.inplace,
+                memoise,
             )
         };
         let Some((opened, gfirst, count, decoded)) = opened else {
@@ -765,13 +775,21 @@ impl<'a> ZCursor<'a> {
     fn next_group(&mut self) {
         if self.rank < self.page_end && !matches!(self.group, Group::Raw | Group::None) {
             if let Some(entry) = self.zfile.fence.entry(self.eidx, self.zfile.nkeys as u32) {
+                // The walk's next group: decoded into this cursor's own
+                // buffer under `ZFile::walk_owns`, the memo asked and not
+                // written.
+                self.owns_next = self.zfile.walk_owns;
                 if self.open_at(&entry, self.gidx + 1) && !matches!(self.group, Group::Raw) {
                     self.place();
                 }
                 return;
             }
         }
+        // The next page's first group is the walk's as much as the next
+        // group of this page.
+        self.owns_next = self.zfile.walk_owns;
         self.load();
+        self.owns_next = false;
     }
 
     /// The record at `off` parsed for its key and the record after it: a
@@ -2058,6 +2076,9 @@ pub(super) struct ZFile {
     /// million keys in the first of nineteen partitions -- without a shared
     /// write on every decode from every reader thread.
     pub(super) decodes16: AtomicU64,
+    /// Groups a walk decoded into its cursor's own buffer
+    /// (`walk_owns`), each a decode the memo would have taken.
+    pub(super) owned: AtomicU64,
     /// The time those counted decodes took, nanoseconds, where this form
     /// file times them (`ZFile::time_decodes`): the heat a re-code prices
     /// (`Options::zpages_recode`), since a decode the predictor and the
@@ -2102,6 +2123,10 @@ pub(super) struct ZFile {
     /// (`Options::zpages_group_ahead`, `ZCursor::ask_group_ahead`).
     pub(super) cursor_view: bool,
     pub(super) group_ahead: bool,
+    /// Whether a cursor's walk decodes the groups after its first into its
+    /// own buffer, the memo asked and not written
+    /// (`Options::zpages_walk_owns_decodes`).
+    pub(super) walk_owns: bool,
     /// Whether a decode asks for the line of the memo entry its put will
     /// displace before it begins (`Options::zpages_memo_ahead`,
     /// `ZFile::open_group`).
@@ -2238,6 +2263,7 @@ impl ZFile {
                 .collect(),
             damaged: AtomicBool::new(false),
             decodes16: AtomicU64::new(0),
+            owned: AtomicU64::new(0),
             decode_ns16: AtomicU64::new(0),
             opens16: AtomicU64::new(0),
             time_decodes: false,
@@ -2251,6 +2277,7 @@ impl ZFile {
             inplace: true,
             cursor_view: false,
             group_ahead: false,
+            walk_owns: false,
             memo_ahead,
             prefetch,
             #[cfg(test)]
@@ -2336,6 +2363,7 @@ impl ZFile {
     /// group is handed back as its payload, undecoded, for a caller that
     /// reads it record by record (`ZCursor`, `Group::Coded`); every other
     /// caller reads the bytes as a decoded group and passes `false`.
+    #[allow(clippy::too_many_arguments)]
     fn open_group<'a>(
         &'a self,
         memo: &ZMemo,
@@ -2344,8 +2372,9 @@ impl ZFile {
         buf: &'a mut GroupBuf,
         view: Option<&PageView<'a>>,
         inplace: bool,
+        memoise: bool,
     ) -> Option<(Opened<'a>, usize, usize, bool)> {
-        self.open_group_with(memo, entry, j, buf, view, inplace, false)
+        self.open_group_with(memo, entry, j, buf, view, inplace, false, memoise)
     }
 
     /// The memo's group for group `j` of `entry`'s page, asked before any
@@ -2400,6 +2429,7 @@ impl ZFile {
         view: Option<&PageView<'a>>,
         inplace: bool,
         after_memo: bool,
+        memoise: bool,
     ) -> Option<(Opened<'a>, usize, usize, bool)> {
         let p = entry.page as usize;
         let Some(page) = self.page_bytes(p).filter(|_| p < self.n_pages) else {
@@ -2490,47 +2520,53 @@ impl ZFile {
                     ));
                 }
             }
-            // The entry this decode's put will displace, its line asked for
-            // now: the put tries the displaced group's `Arc` for its last
-            // reference, a load of a line last touched when that entry was
-            // made, thousands of decodes ago, and the decode is long enough
-            // to bring it (`Options::zpages_memo_ahead`).
-            if self.memo_ahead {
-                memo.prefetch_victim(self.id, entry.page, index, self.memo_hashed);
-            }
-            let mut fresh = memo.fresh_buf();
-            let tick = self.decode_tick();
-            let (first, count, ulen) = {
-                let opened = if was_verified {
-                    verified_group_in(view, j, &mut fresh, self.own_decoder)
-                } else {
-                    first_decode(page, self.bind, entry, j, &mut fresh, self.own_decoder)
-                };
-                match opened {
-                    Ok((g, first, count, _)) => (first, count, g.len()),
-                    Err(Fail::Misaligned) => return None,
-                    Err(Fail::Check(_)) => {
-                        self.fail(p);
-                        return None;
-                    }
+            if !memoise {
+                // The walk's own decode (`walk_owns`): into the caller's
+                // buffer below, nothing put in the memo.
+                self.owned.fetch_add(1, Ordering::Relaxed);
+            } else {
+                // The entry this decode's put will displace, its line asked for
+                // now: the put tries the displaced group's `Arc` for its last
+                // reference, a load of a line last touched when that entry was
+                // made, thousands of decodes ago, and the decode is long enough
+                // to bring it (`Options::zpages_memo_ahead`).
+                if self.memo_ahead {
+                    memo.prefetch_victim(self.id, entry.page, index, self.memo_hashed);
                 }
-            };
-            if !was_verified {
-                set_bit(&self.verified, p);
+                let mut fresh = memo.fresh_buf();
+                let tick = self.decode_tick();
+                let (first, count, ulen) = {
+                    let opened = if was_verified {
+                        verified_group_in(view, j, &mut fresh, self.own_decoder)
+                    } else {
+                        first_decode(page, self.bind, entry, j, &mut fresh, self.own_decoder)
+                    };
+                    match opened {
+                        Ok((g, first, count, _)) => (first, count, g.len()),
+                        Err(Fail::Misaligned) => return None,
+                        Err(Fail::Check(_)) => {
+                            self.fail(p);
+                            return None;
+                        }
+                    }
+                };
+                if !was_verified {
+                    set_bit(&self.verified, p);
+                }
+                self.count_decode(tick);
+                let g = Arc::new(fresh);
+                memo.put(
+                    self.id,
+                    entry.page,
+                    index,
+                    self.memo_hashed,
+                    Arc::clone(&g),
+                    ulen,
+                    first as u16,
+                    count as u16,
+                );
+                return Some((Opened::Memo(g, ulen), first, count, true));
             }
-            self.count_decode(tick);
-            let g = Arc::new(fresh);
-            memo.put(
-                self.id,
-                entry.page,
-                index,
-                self.memo_hashed,
-                Arc::clone(&g),
-                ulen,
-                first as u16,
-                count as u16,
-            );
-            return Some((Opened::Memo(g, ulen), first, count, true));
         }
         let tick = self.decode_tick();
         let opened = if was_verified {
@@ -2650,7 +2686,7 @@ impl ZFile {
         };
         let j = view.group_of_index(rank - first);
         let Some((opened, gfirst, _, decoded)) =
-            self.open_group(memo, &entry, j, buf, Some(&view), false)
+            self.open_group(memo, &entry, j, buf, Some(&view), false, true)
         else {
             return Locate::Fallback;
         };
@@ -2767,7 +2803,7 @@ impl ZFile {
             }
         }
         let Some((opened, _, count, decoded)) =
-            self.open_group(memo, &entry, j, buf, Some(&view), false)
+            self.open_group(memo, &entry, j, buf, Some(&view), false, true)
         else {
             return Locate::Fallback;
         };
@@ -2962,7 +2998,7 @@ impl ZFile {
             // end.
             while out.seen < limit && rank < end {
                 let Some((opened, gfirst, count, decoded)) =
-                    self.open_group(memo, &entry, j, buf, Some(&view), self.inplace)
+                    self.open_group(memo, &entry, j, buf, Some(&view), self.inplace, true)
                 else {
                     out.end = ScanEnd::Fallback;
                     return Ok(());
@@ -3274,7 +3310,7 @@ impl ZFile {
             }
         }
         let mut buf = take_buf();
-        let r = match self.open_group(memo, &entry, j, &mut buf, Some(&view), false) {
+        let r = match self.open_group(memo, &entry, j, &mut buf, Some(&view), false, true) {
             None => ZSeek::Fallback,
             Some((opened, gfirst, count, decoded)) => {
                 match group_seek(opened.bytes(), count, key) {

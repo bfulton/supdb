@@ -950,6 +950,27 @@ pub struct Supdb {
     /// I/O class, held for the call (`Options::zpages_hot_ask_idle` on):
     /// `supdb-zhotaskidle`.
     zhotaskidle: bool,
+    /// The hot-raw room's growth share at five percent of the budget
+    /// (`Options::zpages_hot_growth_pct` 5): `supdb-zhotgrowth5`.
+    zhotgrowth5: bool,
+    /// A covered scan's start placed twice, the seek's rank and then the
+    /// reader's cursor at it, the shape before the seek's cursor was kept
+    /// (`Options::zpages_seek_seeds` off): `supdb-zseekrank`.
+    zseekrank: bool,
+    /// The sweep at an operation's end walking the reader table at every
+    /// end a pin holds it, the shape before the sweep remembered the pin
+    /// (`Options::sweep_remembers_pin` off): `supdb-sweepwalks`.
+    sweepwalks: bool,
+    /// A copy block's prefetch asking for the whole of its values
+    /// (`Options::copy_prefetch_whole` on): `supdb-copyprefetchwhole`.
+    copyprefetchwhole: bool,
+    /// The hot-raw policy's skew bar relaxed to the median where the
+    /// candidate fits the room (`Options::zpages_hot_skew_room` on):
+    /// `supdb-zhotskewroom`.
+    zhotskewroom: bool,
+    /// A cursor's walk decoding the groups after its first into its own
+    /// buffer (`Options::zpages_walk_owns_decodes` on): `supdb-zwalkowns`.
+    zwalkowns: bool,
     /// The block path's cursor building a page view at every group open,
     /// the shape before the view held across the page's groups
     /// (`Options::zpages_cursor_view` off): `supdb-zviewperopen`.
@@ -1849,6 +1870,18 @@ struct Policy {
     zhotline: bool,
     /// The ask under the idle I/O class: `supdb-zhotaskidle`.
     zhotaskidle: bool,
+    /// The growth share at five percent: `supdb-zhotgrowth5`.
+    zhotgrowth5: bool,
+    /// The start placed twice: `supdb-zseekrank`.
+    zseekrank: bool,
+    /// The reader table walked at every end: `supdb-sweepwalks`.
+    sweepwalks: bool,
+    /// The values prefetched whole: `supdb-copyprefetchwhole`.
+    copyprefetchwhole: bool,
+    /// The skew bar relaxed where the room fits: `supdb-zhotskewroom`.
+    zhotskewroom: bool,
+    /// The walk's own decodes: `supdb-zwalkowns`.
+    zwalkowns: bool,
     /// A page view an open: `supdb-zviewperopen`.
     zviewperopen: bool,
     /// No group's lines asked ahead: `supdb-znogroupahead`.
@@ -2195,6 +2228,12 @@ impl Default for Policy {
             zbusyevery: false,
             zhotline: false,
             zhotaskidle: false,
+            zhotgrowth5: false,
+            zseekrank: false,
+            sweepwalks: false,
+            copyprefetchwhole: false,
+            zhotskewroom: false,
+            zwalkowns: false,
             zviewperopen: false,
             znogroupahead: false,
             norunbuilds: false,
@@ -2713,6 +2752,81 @@ impl Supdb {
             path,
             Policy {
                 zhotaskidle: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose hot-raw room leaves five percent of the budget for
+    /// the process's growth instead of ten (`Options::zpages_hot_growth_pct`).
+    pub fn create_zhotgrowth5(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zhotgrowth5: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose covered scans place their start twice, the seek's rank
+    /// and the reader's cursor at it (`Options::zpages_seek_seeds` off): the
+    /// shape before the seek's cursor was kept.
+    pub fn create_zseekrank(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zseekrank: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose sweep at an operation's end walks the reader table at
+    /// every end a pin holds it (`Options::sweep_remembers_pin` off): the
+    /// shape before the sweep remembered the pin.
+    pub fn create_sweepwalks(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                sweepwalks: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose copy blocks' prefetch asks for the whole of the
+    /// values (`Options::copy_prefetch_whole` on).
+    pub fn create_copyprefetchwhole(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                copyprefetchwhole: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose hot-raw policy relaxes its skew bar to the median
+    /// where the candidate fits the room (`Options::zpages_hot_skew_room`
+    /// on).
+    pub fn create_zhotskewroom(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zhotskewroom: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose cursors' walks decode the groups after their first
+    /// into their own buffers (`Options::zpages_walk_owns_decodes` on).
+    pub fn create_zwalkowns(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zwalkowns: true,
                 ..Policy::default()
             },
         )
@@ -7068,6 +7182,12 @@ impl Supdb {
             zbusyevery,
             zhotline,
             zhotaskidle,
+            zhotgrowth5,
+            zseekrank,
+            sweepwalks,
+            copyprefetchwhole,
+            zhotskewroom,
+            zwalkowns,
             zviewperopen,
             znogroupahead,
             norunbuilds,
@@ -7508,6 +7628,12 @@ impl Supdb {
             zpages_census_sample: !zbusyevery,
             zpages_hot_raw_slack: !zhotline,
             zpages_hot_ask_idle: zhotaskidle,
+            zpages_hot_growth_pct: if zhotgrowth5 { 5 } else { 10 },
+            zpages_seek_seeds: !zseekrank,
+            sweep_remembers_pin: !sweepwalks,
+            copy_prefetch_whole: copyprefetchwhole,
+            zpages_hot_skew_room: zhotskewroom,
+            zpages_walk_owns_decodes: zwalkowns,
             zpages_cursor_view: !zviewperopen,
             zpages_group_ahead: !znogroupahead,
             scan_run_builds: !norunbuilds,
@@ -7728,6 +7854,12 @@ impl Supdb {
             zbusyevery,
             zhotline,
             zhotaskidle,
+            zhotgrowth5,
+            zseekrank,
+            sweepwalks,
+            copyprefetchwhole,
+            zhotskewroom,
+            zwalkowns,
             zviewperopen,
             znogroupahead,
             norunbuilds,
@@ -8094,6 +8226,24 @@ impl Engine for Supdb {
         }
         if self.zhotaskidle {
             return "supdb-zhotaskidle";
+        }
+        if self.zhotgrowth5 {
+            return "supdb-zhotgrowth5";
+        }
+        if self.zseekrank {
+            return "supdb-zseekrank";
+        }
+        if self.sweepwalks {
+            return "supdb-sweepwalks";
+        }
+        if self.copyprefetchwhole {
+            return "supdb-copyprefetchwhole";
+        }
+        if self.zhotskewroom {
+            return "supdb-zhotskewroom";
+        }
+        if self.zwalkowns {
+            return "supdb-zwalkowns";
         }
         if self.zviewperopen {
             return "supdb-zviewperopen";
@@ -8933,6 +9083,7 @@ impl Engine for Supdb {
         let bk = db.build_kinds();
         let wk = db.forms_walks();
         let cs = db.copy_starts();
+        let ss = db.seek_seeds();
         let ph = db.scan_phases();
         let uk = db.upkeep_counts();
         let ord = db.ord_point_reads();
@@ -9026,6 +9177,18 @@ impl Engine for Supdb {
             ("walk_copy", wk[0] as f64),
             ("start_at_rank", cs[0] as f64),
             ("start_search", cs[1] as f64),
+            // The writer's scans whose start seek seeded the partition's
+            // reader with its cursor (`Options::zpages_seek_seeds`).
+            ("seek_seeds", ss as f64),
+            // The sweeps answered from the remembered pin without a walk
+            // of the reader table (`Options::sweep_remembers_pin`).
+            ("sweep_shortcuts", db.sweep_shortcuts() as f64),
+            // The groups the walks decoded into their cursors' own buffers
+            // (`Options::zpages_walk_owns_decodes`), over every form file.
+            (
+                "zpage_walk_owned",
+                db.zpage_heat().iter().map(|h| h.walk_owned).sum::<u64>() as f64,
+            ),
             // The writer's builds by kind, the covered blocks copied on
             // their second touch and the budget's sheds: see
             // `Db::build_kinds`.
@@ -10154,6 +10317,12 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zhotline"
         | "supdb-memo64"
         | "supdb-zhotaskidle"
+        | "supdb-zhotgrowth5"
+        | "supdb-zseekrank"
+        | "supdb-sweepwalks"
+        | "supdb-copyprefetchwhole"
+        | "supdb-zhotskewroom"
+        | "supdb-zwalkowns"
         | "supdb-zviewperopen"
         | "supdb-znogroupahead"
         | "supdb-norunbuilds"
@@ -10579,6 +10748,12 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zhotline" => supdb_arm(Supdb::create_zhotline, dir)?,
         "supdb-memo64" => supdb_arm(Supdb::create_memo64, dir)?,
         "supdb-zhotaskidle" => supdb_arm(Supdb::create_zhotaskidle, dir)?,
+        "supdb-zhotgrowth5" => supdb_arm(Supdb::create_zhotgrowth5, dir)?,
+        "supdb-zseekrank" => supdb_arm(Supdb::create_zseekrank, dir)?,
+        "supdb-sweepwalks" => supdb_arm(Supdb::create_sweepwalks, dir)?,
+        "supdb-copyprefetchwhole" => supdb_arm(Supdb::create_copyprefetchwhole, dir)?,
+        "supdb-zhotskewroom" => supdb_arm(Supdb::create_zhotskewroom, dir)?,
+        "supdb-zwalkowns" => supdb_arm(Supdb::create_zwalkowns, dir)?,
         "supdb-zviewperopen" => supdb_arm(Supdb::create_zviewperopen, dir)?,
         "supdb-znogroupahead" => supdb_arm(Supdb::create_znogroupahead, dir)?,
         "supdb-norunbuilds" => supdb_arm(Supdb::create_norunbuilds, dir)?,
@@ -12457,6 +12632,48 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.zpages_hot_ask_idle && !b.zpages_hot_ask_idle);
+            }
+            {
+                let z = Supdb::create_zhotgrowth5(&dir("zhotgrowth5")).unwrap();
+                assert_eq!(z.name(), "supdb-zhotgrowth5");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert_eq!((o.zpages_hot_growth_pct, b.zpages_hot_growth_pct), (5, 10));
+            }
+            {
+                let z = Supdb::create_zseekrank(&dir("zseekrank")).unwrap();
+                assert_eq!(z.name(), "supdb-zseekrank");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.zpages_seek_seeds && b.zpages_seek_seeds);
+            }
+            {
+                let z = Supdb::create_sweepwalks(&dir("sweepwalks")).unwrap();
+                assert_eq!(z.name(), "supdb-sweepwalks");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.sweep_remembers_pin && b.sweep_remembers_pin);
+            }
+            {
+                let z = Supdb::create_copyprefetchwhole(&dir("copyprefetchwhole")).unwrap();
+                assert_eq!(z.name(), "supdb-copyprefetchwhole");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.copy_prefetch_whole && !b.copy_prefetch_whole);
+            }
+            {
+                let z = Supdb::create_zhotskewroom(&dir("zhotskewroom")).unwrap();
+                assert_eq!(z.name(), "supdb-zhotskewroom");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_hot_skew_room && !b.zpages_hot_skew_room);
+            }
+            {
+                let z = Supdb::create_zwalkowns(&dir("zwalkowns")).unwrap();
+                assert_eq!(z.name(), "supdb-zwalkowns");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_walk_owns_decodes && !b.zpages_walk_owns_decodes);
             }
             {
                 let z = Supdb::create_zviewperopen(&dir("zviewperopen")).unwrap();

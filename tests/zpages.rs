@@ -9933,6 +9933,108 @@ fn the_hot_raw_policy_rates_a_partitions_skew_over_the_windows_looks() {
     }
 }
 
+/// Under the controller with the hot-raw policy and room by every measure,
+/// the partition read most a key -- a third over the median partition's
+/// reads a key, three others read as the median is -- is asked for and
+/// released with the skew bar read against the room
+/// (`Options::zpages_hot_skew_room`), and held cold by the bar without it,
+/// since a third over is short of `HOT_RAW_SKEW`. Every read answers as the
+/// raw form does across the move.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_hot_raw_policy_relaxes_its_skew_bar_where_the_candidate_fits_the_room() {
+    for on in [true, false] {
+        let what = format!("hot raw skew by room {on}");
+        let (dir, db, model, inject) = auto_store_with(
+            &format!("auto-hotskew-{on}"),
+            1 << 20,
+            1_000_000.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_hot_raw = true;
+                o.zpages_hot_raw_slack = true;
+                o.zpages_hot_skew_room = on;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        inject.set_decode_cost(std::time::Duration::from_micros(10));
+        let c = db.zpage_counts();
+        assert!(
+            c.form_files >= 5,
+            "{what}: partitions to choose from: {c:?}"
+        );
+        let (partitions, total) = (c.partitions, c.file_bytes);
+        inject.set_budget(total * 4);
+        inject.set_slack(total * 4);
+        // Four partitions read every look, past the floor each; the
+        // second a third more than the other three, so the median is theirs
+        // and its skew over it is a third.
+        let base = usize::try_from(supdb::db::HOT_RAW_MIN_SAMPLES).unwrap() * 16;
+        let hot = keys_of_partition(&db, &model, 2);
+        let others: Vec<Vec<Vec<u8>>> = [1, 3, 4]
+            .iter()
+            .map(|&i| keys_of_partition(&db, &model, i))
+            .collect();
+        for _ in 0..3 {
+            for o in &others {
+                heat_up(&db, o, base);
+            }
+            heat_up(&db, &hot, base * 4 / 3);
+            hot_look(&db, std::time::Duration::from_millis(200));
+        }
+        let c = db.zpage_counts();
+        if on {
+            assert!(
+                c.hot_asks >= 1,
+                "{what}: a third over the median, fitting the room, asked for: {c:?}"
+            );
+            assert!(
+                hot_until(&db, 10, |c| c.hot_raw >= 1),
+                "{what}: the partition released: {:?}",
+                db.zpage_counts()
+            );
+            let before = db.zpage_counts();
+            assert_eq!(
+                (before.hot_raw_now, before.form_files),
+                (1, partitions - 1),
+                "{what}: one partition raw: {before:?}"
+            );
+            check(&r, &model, &hot, &format!("{what}: released, raw"));
+            let after = db.zpage_counts();
+            assert!(
+                after.rawserves > before.rawserves,
+                "{what}: the released partition read raw: {before:?} {after:?}"
+            );
+        } else {
+            assert_eq!(
+                (c.hot_asks, c.hot_raw, c.form_files),
+                (0, 0, partitions),
+                "{what}: a third over the median is under the bar: {c:?}"
+            );
+        }
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// Under the controller with the hot-raw policy and the release's room read
 /// from the group's unused memory (`Options::zpages_hot_raw_slack`), the
 /// hottest partition is released where its raw bytes fit in that room,
@@ -11173,6 +11275,189 @@ fn a_cursor_holds_a_pages_view_across_its_groups_and_asks_for_the_next() {
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// A block-cache scan's start over a covered partition is placed once
+/// (`Options::zpages_seek_seeds`): the writer's scan from a key in the
+/// partition's middle goes through the form file's cursor for its seek and
+/// seeds the partition's reader with it -- the seed count moves by one and
+/// the first block's walk resumes the cursor -- where without the option
+/// the seek finds the rank through the fence and a group and the walk
+/// places a second cursor at the rank, which opens the start's group
+/// again out of the memo. The entries come back as the model has them
+/// either way. The lowest keys
+/// are written first so the partition does not take the bulk walk, and the
+/// writer's own table is built by the scan (`commit_forms` off).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_covered_scans_start_seek_seeds_the_partitions_cursor() {
+    let mut by = [(0u64, 0u64, 0u64); 2];
+    for on in [true, false] {
+        let what = format!("seek seeds {on}");
+        let (dir, mut db, model, _inject, r, keys, _at) =
+            compact_store_with(&format!("seek-seeds-{on}"), 1 << 20, |o| {
+                o.zpages_seek_seeds = on;
+                o.commit_forms = false;
+            });
+        drop(r);
+        for k in &keys[..3] {
+            db.append(k, &model[k][0]);
+        }
+        db.commit().unwrap();
+        let want = 64 + 10;
+        let start = keys.len() / 2;
+        assert!(
+            start + want < keys.len(),
+            "{what}: keys enough: {}",
+            keys.len()
+        );
+        let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
+            .iter()
+            .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
+            .collect();
+        let before = db.zpage_counts();
+        let seeds_before = db.seek_seeds();
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let n = db
+            .scan(&keys[start], want, |k, v| {
+                got.push((k.to_vec(), v.to_vec()))
+            })
+            .unwrap();
+        let c = db.zpage_counts();
+        let seeds = db.seek_seeds() - seeds_before;
+        assert_eq!(n, want, "{what}: the scan's entries");
+        assert_eq!(got, expect, "{what}: the entries as the model has them");
+        by[usize::from(on)] = (
+            c.scans - before.scans,
+            c.scan_views - before.scan_views,
+            c.memo_hits - before.memo_hits,
+        );
+        if on {
+            assert_eq!(seeds, 1, "{what}: the start seek seeded the reader once");
+        } else {
+            assert_eq!(seeds, 0, "{what}: nothing seeded");
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // The second placement opened the start's group again, out of the
+    // memo the seek had put it in: one memo hit fewer, the scans and the
+    // views no more (the seek's own view is not a cursor's and is not
+    // counted either way).
+    let (seeded, placed) = (by[1], by[0]);
+    assert!(
+        seeded.0 <= placed.0 && seeded.1 <= placed.1 && seeded.2 < placed.2,
+        "the seeded scan opens the start's group once: seeded (scans, views, memo hits) {seeded:?}, placed {placed:?}"
+    );
+}
+
+/// A covered scan's groups after its first are decoded into the cursor's
+/// own buffer (`Options::zpages_walk_owns_decodes`): the form files' count
+/// of walk-owned decodes moves by the groups the walk opened past its
+/// start, the memo's misses by no more than before, and the entries come
+/// back as the model has them; without the option nothing is owned and
+/// every decode goes through the memo. The lowest keys are written first so
+/// the partition does not take the bulk walk.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_walks_groups_after_the_first_are_decoded_into_its_own_buffer() {
+    for on in [true, false] {
+        let what = format!("walk owns decodes {on}");
+        let (dir, mut db, model, _inject, r, keys, _at) =
+            compact_store_with(&format!("walk-owns-{on}"), 1 << 20, |o| {
+                o.zpages_walk_owns_decodes = on;
+                o.commit_forms = false;
+            });
+        drop(r);
+        for k in &keys[..3] {
+            db.append(k, &model[k][0]);
+        }
+        db.commit().unwrap();
+        let want = 4 * 64 + 10;
+        let start = keys.len() / 2;
+        assert!(
+            start + want < keys.len(),
+            "{what}: keys enough: {}",
+            keys.len()
+        );
+        let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
+            .iter()
+            .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
+            .collect();
+        let owned = |db: &Db| db.zpage_heat().iter().map(|h| h.walk_owned).sum::<u64>();
+        let (before, owned0) = (db.zpage_counts(), owned(&db));
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let n = db
+            .scan(&keys[start], want, |k, v| {
+                got.push((k.to_vec(), v.to_vec()))
+            })
+            .unwrap();
+        let c = db.zpage_counts();
+        let owned = owned(&db) - owned0;
+        assert_eq!(n, want, "{what}: the scan's entries");
+        assert_eq!(got, expect, "{what}: the entries as the model has them");
+        let groups = c.scan_groups - before.scan_groups;
+        assert!(groups >= 3, "{what}: groups decoded: {groups}");
+        if on {
+            // The start's group and a build's go through the memo; the
+            // walk's own after them.
+            assert!(
+                owned >= 1 && owned + 3 >= groups,
+                "{what}: the walk's groups owned: {owned} of {groups} decoded"
+            );
+        } else {
+            assert_eq!(owned, 0, "{what}: every decode through the memo");
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A handle's scan over a drained covered store, the clean run every scan
+/// over it takes, places the form file's cursor once with the start seek's
+/// seeded (`Options::zpages_seek_seeds`) as without it: the form's scan
+/// count moves by one a scan either way, and the entries come back as the
+/// model has them. The row's threaded scan passes read two dispatches a
+/// scan with the seed, which this holds at one.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_handles_clean_run_resumes_the_seeded_cursor_and_places_no_second() {
+    let mut by = [(0u64, 0u64); 2];
+    for on in [true, false] {
+        let what = format!("handle clean run seeds {on}");
+        let (dir, db, model, _inject, r, keys, _at) =
+            compact_store_with(&format!("handle-seeds-{on}"), 1 << 20, |o| {
+                o.zpages_seek_seeds = on;
+            });
+        let start = keys.len() / 2;
+        let want = 100;
+        let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
+            .iter()
+            .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
+            .collect();
+        // One scan first, so the handle's table and the partition's cursor
+        // state are what a pass's later scans meet.
+        r.scan(&keys[start / 2], want, |_k, _v| {}).unwrap();
+        let before = db.zpage_counts();
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let n = r
+            .scan(&keys[start], want, |k, v| {
+                got.push((k.to_vec(), v.to_vec()))
+            })
+            .unwrap();
+        let c = db.zpage_counts();
+        assert_eq!(n, want, "{what}: the scan's entries");
+        assert_eq!(got, expect, "{what}: the entries as the model has them");
+        by[usize::from(on)] = (c.scans - before.scans, c.scan_views - before.scan_views);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    let (seeded, placed) = (by[1], by[0]);
+    assert!(
+        seeded.0 <= placed.0 && placed.0 <= 1,
+        "the clean run places the cursor once: seeded (scans, views) {seeded:?}, placed {placed:?}"
+    );
 }
 
 /// A scan's blocks over a covered partition read through one cursor

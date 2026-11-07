@@ -801,6 +801,9 @@ pub struct ZHeat {
     pub decodes: u64,
     pub decode_ns: u64,
     pub coded: bool,
+    /// The groups a walk decoded into its cursor's own buffer
+    /// (`Options::zpages_walk_owns_decodes`).
+    pub walk_owned: u64,
 }
 
 #[derive(Clone)]
@@ -4179,6 +4182,69 @@ pub struct Options {
     /// thread's own class and the idle class is the arm,
     /// `supdb-zhotaskidle` (`docs/engine.md`).
     pub zpages_hot_ask_idle: bool,
+    /// With `zpages_hot_raw_slack`, the share of the budget a release leaves
+    /// of the group's unused memory for the process's growth through a
+    /// write mix, in percent: ten as shipped (`HOT_RAW_GROWTH`), what the
+    /// budget fell by through the suite's write mixes at ten million keys
+    /// under 1.25 GiB. `supdb-zhotgrowth5` leaves five, a release more
+    /// where the room allows.
+    pub zpages_hot_growth_pct: u8,
+    /// EXPERIMENT: a block-cache scan's start over a covered partition
+    /// (`zpages_scan_cursor`) is placed once: the seek for the start key
+    /// goes through the form file's cursor (`zfile::ZCursor::seek`), which
+    /// the partition's reader then keeps as its own, where before the seek
+    /// found the rank through the fence and a group and the reader placed
+    /// a second cursor at that rank -- a second fence search, a view and a
+    /// walk of the group's records to the rank, over cold lines for the
+    /// Zipfian's tail (`docs/engine.md`). Off is the two placements, the
+    /// shape before; `supdb-zseekrank` is the arm.
+    pub zpages_seek_seeds: bool,
+    /// The sweep at an operation's end that a pin holds remembers the pin
+    /// (`Readers::oldest_for`): the slot the last walk of the reader table
+    /// found pinned below every tag waiting, and the epoch it was pinned
+    /// at. While that slot still shows that epoch nothing retired since
+    /// can be freed -- a later pin is at a later epoch and a later
+    /// retirement has a later tag -- so the next end reads that one slot
+    /// and walks nothing. The walk was every slot of the table in
+    /// sequentially consistent loads at every operation's end for as long
+    /// as the pin stood, the upkeep thread's passes through E at ten
+    /// million keys under 1.25 GiB, 3% of its thread (`docs/engine.md`).
+    /// Off is the walk at every end; `supdb-sweepwalks` is the arm.
+    pub sweep_remembers_pin: bool,
+    /// EXPERIMENT: a copy block's prefetch ahead of its walk asks for the
+    /// whole of its values (`CachedBlock::prefetch`) and not their first
+    /// kilobyte, the rest left to the hardware's prefetcher: the walk's
+    /// copies of the values out of the block were a fifth of E's thread at
+    /// ten million keys under 1.25 GiB, on lines the stream had not
+    /// brought. Paired in the row's shape it read E 0.95x in one sitting
+    /// and 1.23x in the next, the scan pass 0.95x and 0.89x, with the
+    /// releases falling differently in each: unresolved, so the kilobyte is
+    /// the default and `supdb-copyprefetchwhole` is the arm.
+    pub copy_prefetch_whole: bool,
+    /// The hot-raw policy's skew bar read against the room
+    /// (`Maint::z_hot_look`): the candidate partition is asked for where its
+    /// raw bytes fit the group's unused memory and it is read more a key
+    /// than the median partition at all, and over the median by
+    /// `HOT_RAW_SKEW` only where it would not fit and a swap is the move.
+    /// The bar held the Zipfian's sixth partition back at 1.1x the median
+    /// with two partitions' worth of room unused at ten million keys under
+    /// 1.25 GiB, five releases in one rep and eight in another, and E's
+    /// covered scans, eight group decodes each, are what the room buys
+    /// back (`docs/engine.md`). Off, the bar whatever the room, is the
+    /// default; `supdb-zhotskewroom` is the arm.
+    pub zpages_hot_skew_room: bool,
+    /// EXPERIMENT: a cursor's walk decodes the groups after its first into
+    /// the cursor's own buffer (`ZCursor::buf`), the memo asked for each
+    /// and given none; the first group and every other open keep the memo
+    /// as before. A walk reads a group once, and the memo took every one:
+    /// a buffer recycled thousands of decodes ago and cold, an `Arc`
+    /// allocated for it and the displaced entry's freed -- E at ten million
+    /// keys under 1.25 GiB decoded 144,000 groups for 17,000 covered scans
+    /// with the memo answering 7% (`docs/engine.md`). Paired in the row's
+    /// shape the scan pass read 1.02-1.05x for it in three reps of four and
+    /// E both ways by a few percent, unresolved, so the memo's path is the
+    /// default and `supdb-zwalkowns` is the arm.
+    pub zpages_walk_owns_decodes: bool,
 }
 
 impl Options {
@@ -4463,6 +4529,12 @@ impl Default for Options {
             zpages_hot_raw: true,
             zpages_hot_raw_slack: true,
             zpages_hot_ask_idle: false,
+            zpages_hot_growth_pct: 10,
+            zpages_seek_seeds: true,
+            sweep_remembers_pin: true,
+            copy_prefetch_whole: false,
+            zpages_hot_skew_room: false,
+            zpages_walk_owns_decodes: false,
         }
     }
 }
@@ -10138,6 +10210,18 @@ pub(crate) struct Readers {
     /// Barriers issued, for the suite: each is a system call and an
     /// interrupt of every core a thread of the process is on.
     barriers: AtomicU64,
+    /// Whether a sweep remembers the pin that held it
+    /// (`Options::sweep_remembers_pin`).
+    remember: bool,
+    /// The slot the last walk found pinned below every tag the sweep had
+    /// waiting, and the epoch it was pinned at; a slot index past the
+    /// table when the last walk found none.
+    block_slot: AtomicUsize,
+    block_epoch: AtomicU64,
+    /// Sweeps answered from the remembered pin without a walk, and the
+    /// walks of the table the sweeps made.
+    block_hits: AtomicU64,
+    block_walks: AtomicU64,
 }
 
 /// Register this process for `membarrier`'s expedited private command,
@@ -10382,7 +10466,7 @@ impl Readers {
     /// `asym`: the sweep fences for the pins where the kernel lets it
     /// (`Options::asym_pins`); otherwise every pin fences and no sweep
     /// does.
-    fn new(asym: bool) -> Readers {
+    fn new(asym: bool, remember: bool) -> Readers {
         Readers {
             epoch: AtomicU64::new(1),
             slots: (0..ENGINE_SLOTS + READER_SLOTS)
@@ -10390,6 +10474,11 @@ impl Readers {
                 .collect(),
             asym: asym && register_membarrier(),
             barriers: AtomicU64::new(0),
+            remember,
+            block_slot: AtomicUsize::new(usize::MAX),
+            block_epoch: AtomicU64::new(0),
+            block_hits: AtomicU64::new(0),
+            block_walks: AtomicU64::new(0),
         }
     }
 
@@ -10420,23 +10509,65 @@ impl Readers {
     /// trusted only to say no: a pin it sees may be gone, which frees
     /// nothing early; a pin it misses is the barrier's to find.
     fn oldest_for(&self, lowest: u64) -> u64 {
-        if self.asym {
-            let seen = self.walk_pins();
-            if seen < lowest {
-                return seen;
+        // The pin the last walk found below every tag, still there
+        // (`Options::sweep_remembers_pin`): no pin since is below it, no
+        // tag since is at or below it, so the answer is the one that walk
+        // gave and nothing it did not free is freed now. A slot read as
+        // still pinned that has left frees nothing early; one read as
+        // gone takes the walk below, which is the protocol's.
+        if self.remember {
+            let at = self.block_slot.load(AtomicOrdering::Relaxed);
+            if let Some(slot) = self.slots.get(at) {
+                let epoch = self.block_epoch.load(AtomicOrdering::Relaxed);
+                if epoch < lowest && slot.epoch.load(AtomicOrdering::Relaxed) == epoch {
+                    self.block_hits.fetch_add(1, AtomicOrdering::Relaxed);
+                    return epoch;
+                }
             }
         }
-        self.oldest_pinned()
+        let (oldest, at) = if self.asym {
+            let seen = self.walk_pins_at();
+            if seen.0 < lowest {
+                seen
+            } else {
+                self.sync_pins();
+                self.walk_pins_at()
+            }
+        } else {
+            self.walk_pins_at()
+        };
+        self.block_walks.fetch_add(1, AtomicOrdering::Relaxed);
+        if self.remember {
+            // The lowest pin seen is remembered whether or not it is below
+            // this list's tags: a sweep of another list, whose tags are
+            // all above it, is answered by it next. Cleared only where no
+            // slot was pinned at all.
+            if oldest == u64::MAX {
+                self.block_slot.store(usize::MAX, AtomicOrdering::Relaxed);
+            } else {
+                self.block_epoch.store(oldest, AtomicOrdering::Relaxed);
+                self.block_slot.store(at, AtomicOrdering::Relaxed);
+            }
+        }
+        oldest
     }
 
     /// The lowest pinned epoch over every slot, as the slots read now.
     fn walk_pins(&self) -> u64 {
-        self.slots
-            .iter()
-            .map(|s| s.epoch.load(AtomicOrdering::SeqCst))
-            .filter(|&v| v != 0)
-            .min()
-            .unwrap_or(u64::MAX)
+        self.walk_pins_at().0
+    }
+
+    /// `walk_pins` with the slot it was found in; the table's length as
+    /// the slot where no slot is pinned.
+    fn walk_pins_at(&self) -> (u64, usize) {
+        let mut low = (u64::MAX, self.slots.len());
+        for (i, s) in self.slots.iter().enumerate() {
+            let v = s.epoch.load(AtomicOrdering::SeqCst);
+            if v != 0 && v < low.0 {
+                low = (v, i);
+            }
+        }
+        low
     }
 
     /// A slot for a reader handle's life, or none when every slot is
@@ -13771,10 +13902,17 @@ impl CachedBlock {
     /// and the lower bound over its entries is six dependent misses into
     /// two of them; issued together they cost one, and the values stream
     /// behind the walk once its first lines are in.
-    fn prefetch(&self) {
+    fn prefetch(&self, whole: bool) {
         prefetch_lines(self.ents.as_ptr() as *const u8, self.ents.len() * 16);
         prefetch_lines(self.keys.as_ptr(), self.keys.len());
-        prefetch_lines(self.vals.as_ptr(), self.vals.len().min(1024));
+        // The whole of the values (`Options::copy_prefetch_whole`), or
+        // their first kilobyte with the rest the hardware's.
+        let vals = if whole {
+            self.vals.len()
+        } else {
+            self.vals.len().min(1024)
+        };
+        prefetch_lines(self.vals.as_ptr(), vals);
     }
     /// The first lines of the three buffers from entry `i`, ahead of a walk
     /// that starts there and streams on (`Options::copy_prefetch_from_start`):
@@ -13899,9 +14037,9 @@ fn wide_mut(slot: &mut Option<std::sync::Arc<Cached>>) -> Option<&mut Cached> {
     }
 }
 
-fn prefetch_form(form: &Cached) {
+fn prefetch_form(form: &Cached, whole: bool) {
     match form {
-        Cached::Block(blk) => blk.prefetch(),
+        Cached::Block(blk) => blk.prefetch(whole),
         Cached::Sparse(sb) => sb.prefetch(),
         Cached::Clean | Cached::Wide(_) => {}
     }
@@ -13963,6 +14101,7 @@ impl Pace {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prefetch_block(
     blob: Option<&Blob<MmapBytes>>,
     form: &Cached,
@@ -13971,6 +14110,7 @@ fn prefetch_block(
     n: usize,
     cap: usize,
     estimate: bool,
+    whole: bool,
 ) {
     // The partition's records are asked for only where the walk will read
     // them raw: under the form file the walk's pages are the form's, which
@@ -13990,7 +14130,7 @@ fn prefetch_block(
         // will search, whole.
         Cached::Block(blk) => match at {
             Some(i) if blk.identity => blk.prefetch_from(i),
-            _ => blk.prefetch(),
+            _ => blk.prefetch(whole),
         },
         Cached::Sparse(sb) => {
             sb.prefetch();
@@ -16381,6 +16521,9 @@ struct FormsState {
     /// Scans that started a copy walk at the seek's rank, and that
     /// searched the copy (`Options::copy_start_at_rank`).
     copy_starts: std::cell::Cell<[u64; 2]>,
+    /// Scans whose start seek seeded the partition's reader with its cursor
+    /// (`Options::zpages_seek_seeds`).
+    seek_seeds: std::cell::Cell<u64>,
     /// Copy walks that paced the next block's prefetch through themselves
     /// (`Options::scan_prefetch_paced`).
     prefetch_paces: std::cell::Cell<u64>,
@@ -16537,6 +16680,7 @@ impl FormsState {
             sheds: std::cell::Cell::new(0),
             dir_prefetches: std::cell::Cell::new(0),
             copy_starts: std::cell::Cell::new([0; 2]),
+            seek_seeds: std::cell::Cell::new(0),
             prefetch_paces: std::cell::Cell::new(0),
             span_starts: std::cell::Cell::new(0),
             start_cache: std::cell::RefCell::new(StartCache::new()),
@@ -19511,6 +19655,7 @@ impl Reader {
                     decodes: 16 * z.decodes16.load(AtomicOrdering::Relaxed),
                     decode_ns: 16 * z.decode_ns16.load(AtomicOrdering::Relaxed),
                     coded: z.coded(),
+                    walk_owned: z.owned.load(AtomicOrdering::Relaxed),
                 });
             }
         }
@@ -20213,6 +20358,34 @@ impl Reader {
     /// form file's fence and one group where the handle reads it
     /// (`cache_seek_exact`); the heads' with the directory's lines asked for
     /// ahead otherwise.
+    /// `scan_seek` whose cursor the walk may keep
+    /// (`Options::zpages_seek_seeds`): over a covered partition under the
+    /// shared cursor, the seek goes through the form file's cursor, which
+    /// comes back standing at the rank it found for the walk to seed the
+    /// partition's reader with where its first block walks through the
+    /// reader, and to let go where it does not; elsewhere, and where the
+    /// cursor's seek declines, `scan_seek` as before and no cursor.
+    fn scan_seek_seeded<'a>(
+        &'a self,
+        seg: &'a Seg,
+        cursor: &[u8],
+        on: bool,
+    ) -> (usize, bool, Option<zfile::ZCursor<'a>>) {
+        if self.opts.zpages_seek_seeds && self.opts.zpages_scan_cursor && on {
+            if let Some(z) = self.zc(seg) {
+                if let Ok(c) = zfile::ZCursor::seek(&self.zmemo, z, seg.blob.for_zfile(), cursor) {
+                    let keys = seg.blob.keys();
+                    let rank = c.rank().min(keys);
+                    let same = rank < keys && c.key() == Some(cursor);
+                    self.zmemo_take();
+                    return (rank, same, Some(c));
+                }
+            }
+        }
+        let (rank, same) = self.scan_seek(seg, cursor);
+        (rank, same, None)
+    }
+
     fn scan_seek(&self, seg: &Seg, cursor: &[u8]) -> (usize, bool) {
         if self.zc(seg).is_some() {
             return self.cache_seek_exact(seg, cursor, 0);
@@ -20375,6 +20548,20 @@ impl Reader {
     }
 
     /// A partition walk's counts, filed on this handle's line as
+    /// A form file's cursor let go without a walk -- the seek's, where the
+    /// first block walks without the reader (`Options::zpages_seek_seeds`):
+    /// its groups, views and asks filed, and no walk counted, as the seek
+    /// through the file alone counts none.
+    fn pwalk_discard(&self, c: zfile::ZCursor<'_>) {
+        self.zmemo_take();
+        self.zbump_by(|s| &s.zscangroups, c.decoded);
+        self.zbump_by(|s| &s.zinplace, c.inplace);
+        self.zbump_by(|s| &s.znopagescans, c.nopage);
+        self.zbump_by(|s| &s.zprefetches, c.prefetches);
+        self.zbump_by(|s| &s.zviews, c.views);
+        self.zbump_by(|s| &s.zaheads, c.aheads);
+    }
+
     /// `scan_merged` leaves the partition: a served walk with the groups
     /// it decoded and the runs no page holds it met, a fallen one as a
     /// fallback and a raw walk, a raw one as a raw walk -- counted, as
@@ -24380,7 +24567,7 @@ impl Reader {
             if let Some((at2, b2)) = ahead.take() {
                 if at2 == at as u32 {
                     if let Some(form) = table.slots.get(b2 as usize).and_then(|s| s.as_deref()) {
-                        prefetch_form(form);
+                        prefetch_form(form, self.opts.copy_prefetch_whole);
                     }
                 }
             }
@@ -25225,9 +25412,9 @@ impl Reader {
             } else {
                 None
             };
-            let (mut rank, mut same) = match span_b {
-                Some(_) => (usize::MAX, false),
-                None => self.scan_seek(seg, cursor),
+            let (mut rank, mut same, mut seed) = match span_b {
+                Some(_) => (usize::MAX, false, None),
+                None => self.scan_seek_seeded(seg, cursor, shared.on),
             };
             let owner = if same { rank } else { rank.saturating_sub(1) };
             // The block the seek found, kept for the next scan from this
@@ -25287,7 +25474,19 @@ impl Reader {
                             self.zbump(|s| &s.zwillneedasks);
                         }
                     }
-                    seen += self.cache_scan(seg, rank, want, &mut *f)?;
+                    // Through the seek's cursor where it seeded the
+                    // partition's reader (`Options::zpages_seek_seeds`),
+                    // standing at the rank: the bulk walk dispatched
+                    // afresh beside it, and the drained store's scans paid
+                    // the seek's placement and a second.
+                    seen += if let Some(c) = seed.take() {
+                        shared.seed(c, rank);
+                        let fs = self.fs();
+                        fs.seek_seeds.set(fs.seek_seeds.get() + 1);
+                        shared.scan(rank, want, &mut *f)?
+                    } else {
+                        self.cache_scan(seg, rank, want, &mut *f)?
+                    };
                 }
                 match &seg.hi {
                     Some(h) => {
@@ -25459,6 +25658,25 @@ impl Reader {
                 } else {
                     rank.max(lo)
                 };
+                // The seek's cursor, seeded into the reader where this first
+                // block walks through it -- a sparse block, a clean run --
+                // and let go where it does not, a copy or a wide block, its
+                // counts filed and no walk counted
+                // (`Options::zpages_seek_seeds`): seeded whatever the form,
+                // a copy's walk left it to be closed unused, a dispatch the
+                // counts showed and the promotion's test caught.
+                if first {
+                    if let Some(c) = seed.take() {
+                        match form {
+                            Cached::Sparse(_) | Cached::Clean => {
+                                pr.seed(c, rank);
+                                let fs = self.fs();
+                                fs.seek_seeds.set(fs.seek_seeds.get() + 1);
+                            }
+                            _ => self.pwalk_discard(c),
+                        }
+                    }
+                }
                 // The kind the walk reads, for the promotion after it,
                 // which judges what was walked -- the canonical form as
                 // much as this handle's own.
@@ -25507,6 +25725,7 @@ impl Reader {
                         ahead,
                         self.opts.scan_prefetch_bytes,
                         self.opts.seek_prefetch_dir,
+                        self.opts.copy_prefetch_whole,
                     );
                 }
                 fetched = false;
@@ -25534,6 +25753,7 @@ impl Reader {
                                 ahead - (hi - start),
                                 self.opts.scan_prefetch_bytes,
                                 self.opts.seek_prefetch_dir,
+                                self.opts.copy_prefetch_whole,
                             ),
                         }
                         fetched = true;
@@ -27447,7 +27667,7 @@ impl Db {
         };
         let shared = std::sync::Arc::new(Shared {
             state: AtomicPtr::new(Box::into_raw(Box::new(state))),
-            readers: Readers::new(opts.asym_pins),
+            readers: Readers::new(opts.asym_pins, opts.sweep_remembers_pin),
             retired: RetireList::new(),
             advice_random: std::sync::atomic::AtomicBool::new(starts_random),
             retired_forms: RetireList::new(),
@@ -27863,6 +28083,7 @@ impl Db {
                         opts.zpages_own_decoder,
                         opts.zpages_cursor_view,
                         opts.zpages_group_ahead,
+                        opts.zpages_walk_owns_decodes,
                     ),
                     &zev,
                 );
@@ -27894,7 +28115,7 @@ impl Db {
         let mem = MemTable::new(opts.block_shape());
         // Replay's own table, for the index resizes a replayed delete
         // frees through; nothing reads beside it.
-        let readers = Readers::new(false);
+        let readers = Readers::new(false, true);
         let mut mem_bytes = 0usize;
         let mut from = sealed;
         let mut valid_len = 0u64;
@@ -30276,6 +30497,32 @@ impl Db {
         self.r.fs().copy_starts.get()
     }
 
+    /// The writer's scans whose start seek seeded the partition's reader
+    /// with its cursor (`Options::zpages_seek_seeds`).
+    pub fn seek_seeds(&self) -> u64 {
+        self.take_back_upkeep();
+        self.r.fs().seek_seeds.get()
+    }
+
+    /// The sweeps at an operation's end answered from the remembered pin
+    /// without a walk of the reader table (`Options::sweep_remembers_pin`).
+    pub fn sweep_shortcuts(&self) -> u64 {
+        self.r
+            .shared
+            .readers
+            .block_hits
+            .load(AtomicOrdering::Relaxed)
+    }
+
+    /// The sweeps' walks of the reader table.
+    pub fn sweep_walks(&self) -> u64 {
+        self.r
+            .shared
+            .readers
+            .block_walks
+            .load(AtomicOrdering::Relaxed)
+    }
+
     /// The writer's copy walks that paced the next block's prefetch
     /// through themselves (`Options::scan_prefetch_paced`).
     pub fn prefetch_paces(&self) -> u64 {
@@ -31347,6 +31594,7 @@ impl Db {
             bool,
             bool,
             bool,
+            bool,
         ),
         ev: &zfile::ZEvents,
     ) -> bool {
@@ -31372,6 +31620,7 @@ impl Db {
                 side.own_decoder = lines.5;
                 side.cursor_view = lines.6;
                 side.group_ahead = lines.7;
+                side.walk_owns = lines.8;
                 let installed = seg.z.install(side);
                 if installed {
                     zfile::ZEvents::add(&ev.attached, 1);
@@ -31432,6 +31681,7 @@ impl Db {
                     self.opts.zpages_own_decoder,
                     self.opts.zpages_cursor_view,
                     self.opts.zpages_group_ahead,
+                    self.opts.zpages_walk_owns_decodes,
                 ),
                 ev,
             )
@@ -31481,6 +31731,7 @@ impl Db {
                         side.own_decoder = self.opts.zpages_own_decoder;
                         side.cursor_view = self.opts.zpages_cursor_view;
                         side.group_ahead = self.opts.zpages_group_ahead;
+                        side.walk_owns = self.opts.zpages_walk_owns_decodes;
                         if seg.z.install(side) {
                             ev.built(&b);
                             zfile::ZEvents::add(&ev.attached, 1);
@@ -36164,6 +36415,14 @@ impl<'a> PartReader<'a> {
     /// a block before it -- the records overlay keys were emitted in place
     /// of, stepped over -- else one placed afresh, the held one's counts
     /// filed. None where the form file does not serve.
+    /// The seek's cursor kept as this reader's, standing at `at`
+    /// (`Options::zpages_seek_seeds`): the next read from `at` resumes it.
+    fn seed(&mut self, c: zfile::ZCursor<'a>, at: usize) {
+        self.close();
+        self.cur = Some(c);
+        self.at = at;
+    }
+
     fn cursor_at(&mut self, rank: usize) -> Option<&mut zfile::ZCursor<'a>> {
         if !self.on {
             return None;
@@ -36639,6 +36898,17 @@ const HOT_RAW_FILL: f64 = 0.75;
 /// takes is a reclaim.
 #[doc(hidden)]
 pub const HOT_RAW_GROWTH: f64 = 0.10;
+#[cfg(test)]
+mod hot_growth_tests {
+    #[test]
+    fn the_shipped_growth_share_is_the_constant() {
+        let o = super::Options::default();
+        assert_eq!(
+            f64::from(o.zpages_hot_growth_pct) / 100.0,
+            super::HOT_RAW_GROWTH
+        );
+    }
+}
 const HOT_RAW_TAU: std::time::Duration = std::time::Duration::from_secs(1);
 const HOT_RAW_SKEW: f64 = 1.5;
 #[doc(hidden)]
@@ -39872,7 +40142,8 @@ impl Maint {
         // `Options::zpages_hot_raw_slack`: the unused memory less the growth
         // share, where the platform or the seam says what the group holds.
         let room = if self.opts.zpages_hot_raw_slack {
-            slack.map(|s| s.saturating_sub((budget as f64 * HOT_RAW_GROWTH) as u64))
+            let growth = f64::from(self.opts.zpages_hot_growth_pct) / 100.0;
+            slack.map(|s| s.saturating_sub((budget as f64 * growth) as u64))
         } else {
             None
         };
@@ -39969,15 +40240,6 @@ impl Maint {
         else {
             return;
         };
-        // Hot: past the floor, its window not thin, and over the median by
-        // `HOT_RAW_SKEW`.
-        let skewed = p.delta >= HOT_RAW_MIN_SAMPLES && per_key(p) >= HOT_RAW_SKEW * median;
-        if p.heat < RECODE_FLOOR_NS || !skewed {
-            if self.z_trace {
-                trace("cold", Some(p));
-            }
-            return;
-        }
         let after = total
             .saturating_sub(p.file_bytes)
             .saturating_add(p.raw_bytes);
@@ -39987,6 +40249,23 @@ impl Maint {
             Some(r) => p.raw_bytes <= r && after <= fill,
             None => after <= line,
         };
+        // Hot: past the floor, its window not thin, and over the median --
+        // by `HOT_RAW_SKEW` where it would not fit and a swap is the move,
+        // at all where it fits the room (`Options::zpages_hot_skew_room`):
+        // room nobody else uses buys the partition read most whatever its
+        // skew, and the way back returns it should the room go.
+        let bar = if fits && self.opts.zpages_hot_skew_room {
+            1.0
+        } else {
+            HOT_RAW_SKEW
+        };
+        let skewed = p.delta >= HOT_RAW_MIN_SAMPLES && per_key(p) >= bar * median;
+        if p.heat < RECODE_FLOOR_NS || !skewed {
+            if self.z_trace {
+                trace("cold", Some(p));
+            }
+            return;
+        }
         if fits {
             if self.z_trace {
                 trace("ask", Some(p));
@@ -42000,6 +42279,7 @@ impl Maint {
                     self.opts.zpages_own_decoder,
                     self.opts.zpages_cursor_view,
                     self.opts.zpages_group_ahead,
+                    self.opts.zpages_walk_owns_decodes,
                 ),
                 ev,
             )
@@ -42336,6 +42616,7 @@ impl Maint {
                         side.own_decoder = self.opts.zpages_own_decoder;
                         side.cursor_view = self.opts.zpages_cursor_view;
                         side.group_ahead = self.opts.zpages_group_ahead;
+                        side.walk_owns = self.opts.zpages_walk_owns_decodes;
                         side.drop_cache();
                         let old = target.z_spare.keep(Box::into_raw(Box::new(side)));
                         if !old.is_null() {
@@ -42385,6 +42666,7 @@ impl Maint {
                         side.own_decoder = self.opts.zpages_own_decoder;
                         side.cursor_view = self.opts.zpages_cursor_view;
                         side.group_ahead = self.opts.zpages_group_ahead;
+                        side.walk_owns = self.opts.zpages_walk_owns_decodes;
                         let coded = side.coded();
                         let mut old = target.z.replace(side);
                         // Kept where the option keeps it, its pages dropped,
@@ -42461,6 +42743,7 @@ impl Maint {
                             side.own_decoder = self.opts.zpages_own_decoder;
                             side.cursor_view = self.opts.zpages_cursor_view;
                             side.group_ahead = self.opts.zpages_group_ahead;
+                            side.walk_owns = self.opts.zpages_walk_owns_decodes;
                             if target.z.install(side) {
                                 ev.built(&built);
                                 zfile::ZEvents::add(&ev.attached, 1);
@@ -43086,7 +43369,7 @@ mod streaming_writes {
     #[test]
     fn a_streamed_tables_keys_read_in_place_and_across_a_seam() {
         for compact in [false, true] {
-            let rd = Readers::new(false);
+            let rd = Readers::new(false, true);
             let mem = MemTable::new_ordered(
                 false,
                 BlockShape {
@@ -43349,7 +43632,7 @@ mod threading {
     #[test]
     fn a_reader_takes_a_commit_whole() {
         use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-        let rd = super::Readers::new(false);
+        let rd = super::Readers::new(false, true);
         let key = |i: u64| format!("k{:06}", i % 5000).into_bytes();
         let fill = |mem: &super::MemTable, mut on_commit: Box<dyn FnMut(&super::MemTable) + '_>| {
             let mut i = 0u64;

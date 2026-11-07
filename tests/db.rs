@@ -4836,6 +4836,92 @@ fn a_block_shed_from_any_partition_takes_its_published_form_with_it() {
     }
 }
 
+/// The sweep at an operation's end that a handle's pin holds remembers
+/// the pin (`Options::sweep_remembers_pin`): under a snapshot held, a
+/// flush's landing retires the state before it and the writer's scans
+/// after a commit retire snapshots, and each waits for that pin, so the
+/// sweep at every operation's end finds it. The first finds it by a walk
+/// of the reader table and remembers the slot; the ends after read that
+/// slot and walk no more -- the shortcut count moves by about one an
+/// operation and the walk count by a few, where without the option every
+/// end walks and nothing is shortcut. The pin released, the next
+/// commit's and scan's sweeps free what waited, so what the shortcut
+/// skipped was a walk and not a free.
+#[test]
+fn a_sweep_a_pin_holds_remembers_the_pin() {
+    for on in [true, false] {
+        let name = format!("sweep-remembers-{on}");
+        let (mut db, r, mut m) = shed_over_published_forms_with(&name, false, |o| {
+            o.sweep_remembers_pin = on;
+            // Room for the forms the rounds below make: nothing sheds.
+            o.scan_cache_bytes = 1 << 30;
+        });
+        let key = |k: u32| format!("key-{k:05}");
+        let mut sink = 0usize;
+        r.snapshot();
+        // A state retired under the pin: the flush's landing replaces the
+        // one the handle holds.
+        for k in (0..3000u32).step_by(40) {
+            m.delete(&mut db, &key(k));
+            m.append(&mut db, &key(k), "v5-0123456789");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        db.settle().unwrap();
+        let (hits0, walks0) = (db.sweep_shortcuts(), db.sweep_walks());
+        let ops = 40u64;
+        for i in 0..ops as u32 {
+            if i % 10 == 0 {
+                m.append(&mut db, &key(3000 + i), "v6-0123456789");
+                db.commit().unwrap();
+            }
+            db.scan(
+                key(i * 70 % 3000).as_bytes(),
+                120,
+                kv(&mut |_k, v| sink += v.len()),
+            )
+            .unwrap();
+        }
+        let hits = db.sweep_shortcuts() - hits0;
+        let walks = db.sweep_walks() - walks0;
+        if on {
+            assert!(
+                hits >= ops / 2 && walks <= ops / 4,
+                "{name}: the ends read the remembered pin: {hits} shortcuts, {walks} walks over {ops} operations"
+            );
+        } else {
+            assert!(
+                hits == 0 && walks >= ops,
+                "{name}: every end walks: {hits} shortcuts, {walks} walks over {ops} operations"
+            );
+        }
+        let held = db.retired_waiting();
+        assert!(
+            held.0 + held.1 > 0,
+            "{name}: the pin held nothing back, so nothing tested the sweep"
+        );
+        r.release();
+        // The forms a commit's sweep frees, the snapshots a scan's
+        // publish sweeps: one of each after the pin, and nothing waits.
+        m.append(&mut db, &key(3100), "v7-0123456789");
+        db.commit().unwrap();
+        db.scan(key(0).as_bytes(), 120, kv(&mut |_k, v| sink += v.len()))
+            .unwrap();
+        let after = db.retired_waiting();
+        assert_eq!(
+            after,
+            (0, 0),
+            "{name}: the pin released, the ends after free what waited: {after:?}"
+        );
+        std::hint::black_box(sink);
+        m.check(&r, &format!("{name}: the handle"));
+        m.check(&db, &format!("{name}: the writer"));
+        drop(r);
+        db.close().unwrap();
+    }
+}
+
 /// A handle's snapshot pins the epoch it is at, the writer's commits and
 /// scans publish under it, and what they replace -- forms, snapshots --
 /// waits for the pin; the writer's operations end and sweep, and find
