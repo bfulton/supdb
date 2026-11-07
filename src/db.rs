@@ -4196,8 +4196,10 @@ pub struct Options {
     /// found the rank through the fence and a group and the reader placed
     /// a second cursor at that rank -- a second fence search, a view and a
     /// walk of the group's records to the rank, over cold lines for the
-    /// Zipfian's tail (`docs/engine.md`). Off is the two placements, the
-    /// shape before; `supdb-zseekrank` is the arm.
+    /// Zipfian's tail (`docs/engine.md`). Paired in the row's shape through
+    /// the scrambled mixes it read E 1.20x, 0.91x, 0.89x and 0.97x by
+    /// sitting, the scans level: unresolved, so the two placements, the
+    /// shape before, are the default and `supdb-zseekseed` is the arm.
     pub zpages_seek_seeds: bool,
     /// The sweep at an operation's end that a pin holds remembers the pin
     /// (`Readers::oldest_for`): the slot the last walk of the reader table
@@ -4245,6 +4247,26 @@ pub struct Options {
     /// E both ways by a few percent, unresolved, so the memo's path is the
     /// default and `supdb-zwalkowns` is the arm.
     pub zpages_walk_owns_decodes: bool,
+    /// The hot-raw policy sends a raw partition back to its form file once
+    /// its reads a key over the look's window fall under the median
+    /// partition's by `HOT_RAW_BACK_SKEW`, coldest first and one a look,
+    /// whatever the room (`Maint::z_hot_look`); without it a raw partition
+    /// goes back only once the files and the raw partitions together pass
+    /// the fill. Released on a skew of `HOT_RAW_SKEW`, a partition is held
+    /// raw down to the median, the gap between the two bars the hysteresis.
+    /// The partitions the unscrambled Zipfian's head made raw stayed raw
+    /// into the scrambled mixes, where no partition is hot and a raw one
+    /// holds its records in a cache the form files need, and went back one
+    /// a look under pressure in the middle of the scrambled E: at ten
+    /// million keys under 1.25 GiB that E took 0.077 major faults an
+    /// operation against 0.021 with the line's three releases
+    /// (`docs/engine.md`). With the scans counted in the groups a form walk
+    /// would open, paired in the row's shape against the shape before, the
+    /// cold way back made 15-19 moves back a sitting and read the
+    /// unscrambled E 0.73x in one sitting and level in the next, the
+    /// scrambled E 1.42x and 1.12x: a trade, so off keeps a raw partition
+    /// raw until the fill and `supdb-zhotcoldback` is the arm.
+    pub zpages_hot_cold_back: bool,
 }
 
 impl Options {
@@ -4530,11 +4552,12 @@ impl Default for Options {
             zpages_hot_raw_slack: true,
             zpages_hot_ask_idle: false,
             zpages_hot_growth_pct: 10,
-            zpages_seek_seeds: true,
+            zpages_seek_seeds: false,
             sweep_remembers_pin: true,
             copy_prefetch_whole: false,
             zpages_hot_skew_room: false,
             zpages_walk_owns_decodes: false,
+            zpages_hot_cold_back: false,
         }
     }
 }
@@ -8709,12 +8732,26 @@ impl Seg {
     #[inline]
     fn hot_read(&self) {
         if self.z_declined.load(AtomicOrdering::Relaxed) == zfile::DECLINED_HOT_RAW {
-            self.hot_read_counted();
+            self.hot_read_counted(0);
+        }
+    }
+
+    /// `hot_read` for a scan of `n` records, counted as the groups the form
+    /// file's walk of them would open, since the policy holds a raw
+    /// partition's reads against the form files' opens: a covered scan of a
+    /// hundred records opens seven groups and counted seven, the same scan
+    /// of a raw partition counted one, and a raw partition under the scans
+    /// read a fifth as hot as the partitions beside it that the policy had
+    /// released it for being hotter than.
+    #[inline]
+    fn hot_scan(&self, n: usize) {
+        if self.z_declined.load(AtomicOrdering::Relaxed) == zfile::DECLINED_HOT_RAW {
+            self.hot_read_counted(n);
         }
     }
 
     #[inline(never)]
-    fn hot_read_counted(&self) {
+    fn hot_read_counted(&self, scanned: usize) {
         thread_local! {
             static TICK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         }
@@ -8724,7 +8761,14 @@ impl Seg {
             v % 16 == 0
         });
         if due {
-            self.hot_reads16.fetch_add(1, AtomicOrdering::Relaxed);
+            let groups = if scanned == 0 {
+                1
+            } else {
+                let keys = self.blob.keys().max(1) as u64;
+                let per_record = (self.foot().1 / keys).max(1);
+                1 + scanned as u64 * per_record / zpages::ZGROUP_BYTES as u64
+            };
+            self.hot_reads16.fetch_add(groups, AtomicOrdering::Relaxed);
         }
     }
 
@@ -19642,6 +19686,26 @@ impl Reader {
     /// the groups decoded from it over its life, counted in
     /// sixteens (`ZFile::decodes16`). For a test, and the suite's per-mix
     /// heat line (`SUPDB_MIX_HEAT`), which says where the decodes land.
+    /// The partitions the hot-raw policy holds raw, by lower fence, with
+    /// the reads counted on them (`Seg::hot_read`, `Seg::hot_scan`), for a
+    /// test.
+    #[doc(hidden)]
+    pub fn zpage_raw_heat(&self) -> Vec<(Vec<u8>, u64)> {
+        let _entered = self.enter();
+        self.segs()
+            .iter()
+            .filter(|s| {
+                s.level > 0 && s.z_declined.load(AtomicOrdering::Relaxed) == zfile::DECLINED_HOT_RAW
+            })
+            .map(|s| {
+                (
+                    s.lo.clone(),
+                    16 * s.hot_reads16.load(AtomicOrdering::Relaxed),
+                )
+            })
+            .collect()
+    }
+
     #[doc(hidden)]
     pub fn zpage_heat(&self) -> Vec<ZHeat> {
         let _entered = self.enter();
@@ -20118,7 +20182,7 @@ impl Reader {
             if self.z_on() {
                 self.zbump(|s| &s.zscans);
             }
-            seg.hot_read();
+            seg.hot_scan(n);
             return raw(rank, n, f);
         };
         let r = z
@@ -20272,7 +20336,7 @@ impl Reader {
         let got = if self.zc(seg).is_some() {
             self.part_scan_z(seg, rank, n, f)?
         } else {
-            seg.hot_read();
+            seg.hot_scan(n);
             seg.raw()
                 .scan_at(rank, n, &mut *f)
                 .map_err(|e| err(&format!("segment scan: {e}")))?
@@ -36911,6 +36975,10 @@ mod hot_growth_tests {
 }
 const HOT_RAW_TAU: std::time::Duration = std::time::Duration::from_secs(1);
 const HOT_RAW_SKEW: f64 = 1.5;
+/// The share of the median partition's reads a key under which a raw
+/// partition goes back to its form file (`Options::zpages_hot_cold_back`).
+#[doc(hidden)]
+pub const HOT_RAW_BACK_SKEW: f64 = 1.0;
 #[doc(hidden)]
 pub const HOT_RAW_MIN_SAMPLES: u64 = 128;
 /// With `Options::zpages_hot_raw_slack`, the looks whose sampled events a
@@ -40227,6 +40295,23 @@ impl Maint {
                 self.z_hot_back(seg);
             }
             return;
+        }
+        // A raw partition no longer read more than the median goes back
+        // (`Options::zpages_hot_cold_back`): the coldest under the bar by
+        // its reads a key over the window, one a look.
+        if self.opts.zpages_hot_cold_back && median > 0.0 {
+            let cold = parts
+                .iter()
+                .filter(|p| p.raw && p.rated && per_key(p) < HOT_RAW_BACK_SKEW * median)
+                .min_by(|a, b| per_key(a).total_cmp(&per_key(b)));
+            if let Some(q) = cold {
+                if self.z_trace {
+                    trace("cold-back", Some(q));
+                }
+                let seg = q.seg.clone();
+                self.z_hot_back(seg);
+                return;
+            }
         }
         if self.z_hot_hold.is_some_and(|t| now < t) {
             return;

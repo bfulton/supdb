@@ -9933,6 +9933,204 @@ fn the_hot_raw_policy_rates_a_partitions_skew_over_the_windows_looks() {
     }
 }
 
+/// A raw partition's scans count toward its heat as the groups the form
+/// file's walk of them would open, not one a scan (`Seg::hot_scan`): the
+/// policy holds a raw partition's reads against the form files' opens, so
+/// a hundred scans of a hundred records count several times what a hundred
+/// point reads do. Without the weighting a raw partition under scans read
+/// colder than the partitions beside it it had been released for being
+/// hotter than.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_raw_partitions_scans_count_the_groups_a_form_walk_would_open() {
+    let (dir, db, model, inject) = auto_store_with(
+        "auto-hotscanweight",
+        1 << 20,
+        1_000_000.0,
+        FAULT_1MS,
+        |o| {
+            o.zpages_hot_raw = true;
+            o.zpages_hot_raw_slack = true;
+            o.zpages_hot_cold_back = false;
+            o.zpages_memo = false;
+            o.partition_bytes = Some(400 << 10);
+        },
+        |_| {},
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    assert!(
+        drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+        "COMPACT: {:?}",
+        db.zpage_counts()
+    );
+    assert!(
+        tick_until(&db, 400, |c| c.attached >= c.partitions
+            && c.warms >= c.partitions),
+        "every file attached and warmed: {:?}",
+        db.zpage_counts()
+    );
+    inject.set_decode_cost(std::time::Duration::from_micros(10));
+    let total = db.zpage_counts().file_bytes;
+    inject.set_budget(total * 4);
+    inject.set_slack(total * 4);
+    let base = usize::try_from(supdb::db::HOT_RAW_MIN_SAMPLES).unwrap() * 16;
+    let hot = keys_of_partition(&db, &model, 2);
+    let others: Vec<Vec<Vec<u8>>> = [1, 3, 4]
+        .iter()
+        .map(|&i| keys_of_partition(&db, &model, i))
+        .collect();
+    for _ in 0..3 {
+        for o in &others {
+            heat_up(&db, o, base);
+        }
+        heat_up(&db, &hot, base * 4);
+        hot_look(&db, std::time::Duration::from_millis(200));
+    }
+    assert!(
+        hot_until(&db, 10, |c| c.hot_raw_now >= 1),
+        "the hot partition released: {:?}",
+        db.zpage_counts()
+    );
+    let heat = |db: &Db| db.zpage_raw_heat().iter().map(|(_, n)| n).sum::<u64>();
+    let h0 = heat(&db);
+    for i in 0..160 {
+        let k = &hot[i % hot.len()];
+        assert_eq!(read_vec(&db, k).len(), 1, "a key reads back");
+    }
+    let h1 = heat(&db);
+    let span = hot.len().saturating_sub(100).max(1);
+    for i in 0..160 {
+        let k = &hot[(i * 37) % span];
+        let mut n = 0usize;
+        r.scan(k, 100, |_k, _v| n += 1).unwrap();
+        assert_eq!(n, 100, "a scan of the raw partition reads its window");
+    }
+    let h2 = heat(&db);
+    let (reads, scans) = (h1 - h0, h2 - h1);
+    assert!(reads > 0, "the point reads counted: {reads}");
+    assert!(
+        scans >= 3 * reads,
+        "a scan of a hundred records counts its groups: {scans} for the scans, {reads} for the reads"
+    );
+    check(&r, &model, &keys, "after");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Under the controller with the hot-raw policy and room by every measure, a
+/// partition released for its skew and then read less than the others
+/// goes back to its form file with the cold way back
+/// (`Options::zpages_hot_cold_back`), with no pressure to send it, and stays
+/// raw without it. Every read answers as the raw form does across both
+/// moves.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_raw_partition_read_no_more_than_the_median_goes_back_to_its_form() {
+    for on in [true, false] {
+        let what = format!("hot raw cold back {on}");
+        let (dir, db, model, inject) = auto_store_with(
+            &format!("auto-hotcold-{on}"),
+            1 << 20,
+            1_000_000.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_hot_raw = true;
+                o.zpages_hot_raw_slack = true;
+                o.zpages_hot_cold_back = on;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        inject.set_decode_cost(std::time::Duration::from_micros(10));
+        let c = db.zpage_counts();
+        assert!(
+            c.form_files >= 5,
+            "{what}: partitions to choose from: {c:?}"
+        );
+        let (partitions, total) = (c.partitions, c.file_bytes);
+        inject.set_budget(total * 4);
+        inject.set_slack(total * 4);
+        let base = usize::try_from(supdb::db::HOT_RAW_MIN_SAMPLES).unwrap() * 16;
+        let hot = keys_of_partition(&db, &model, 2);
+        let others: Vec<Vec<Vec<u8>>> = [1, 3, 4]
+            .iter()
+            .map(|&i| keys_of_partition(&db, &model, i))
+            .collect();
+        // Every partition but the hot one, taken while every partition has
+        // its form file: the heat lists the served ones alone.
+        let rest: Vec<Vec<Vec<u8>>> = (0..usize::try_from(partitions).unwrap())
+            .filter(|&i| i != 2)
+            .map(|i| keys_of_partition(&db, &model, i))
+            .collect();
+        // Released: partition 2 read four times the others.
+        for _ in 0..3 {
+            for o in &others {
+                heat_up(&db, o, base);
+            }
+            heat_up(&db, &hot, base * 4);
+            hot_look(&db, std::time::Duration::from_millis(200));
+        }
+        assert!(
+            hot_until(&db, 10, |c| c.hot_raw_now >= 1),
+            "{what}: the hot partition released: {:?}",
+            db.zpage_counts()
+        );
+        check(&r, &model, &hot, &format!("{what}: released, raw"));
+        // Then every other partition read alike and this one a quarter as
+        // much, a window's worth of looks: its reads a key fall under the
+        // median's, the room still ample, and no other partition is skewed
+        // enough to be asked for.
+        let backs0 = db.zpage_counts().hot_back;
+        for _ in 0..(supdb::db::HOT_RAW_WINDOW + 4) {
+            for o in &rest {
+                heat_up(&db, o, base);
+            }
+            heat_up(&db, &hot, base / 4);
+            hot_look(&db, std::time::Duration::from_millis(200));
+        }
+        let c = db.zpage_counts();
+        if on {
+            assert!(
+                c.hot_back > backs0 && c.hot_raw_now == 0,
+                "{what}: gone back with the room ample: {c:?}"
+            );
+            assert!(
+                tick_until(&db, 400, |c| c.attached >= partitions),
+                "{what}: every file attached again: {:?}",
+                db.zpage_counts()
+            );
+        } else {
+            assert_eq!(
+                (c.hot_back - backs0, c.hot_raw_now),
+                (0, 1),
+                "{what}: raw until the fill: {c:?}"
+            );
+        }
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// Under the controller with the hot-raw policy and room by every measure,
 /// the partition read most a key -- a third over the median partition's
 /// reads a key, three others read as the median is -- is asked for and

@@ -953,10 +953,14 @@ pub struct Supdb {
     /// The hot-raw room's growth share at five percent of the budget
     /// (`Options::zpages_hot_growth_pct` 5): `supdb-zhotgrowth5`.
     zhotgrowth5: bool,
-    /// A covered scan's start placed twice, the seek's rank and then the
-    /// reader's cursor at it, the shape before the seek's cursor was kept
-    /// (`Options::zpages_seek_seeds` off): `supdb-zseekrank`.
-    zseekrank: bool,
+    /// A covered scan's start placed once, the seek's cursor kept as the
+    /// partition's reader's (`Options::zpages_seek_seeds` on):
+    /// `supdb-zseekseed`.
+    zseekseed: bool,
+    /// A raw partition sent back to its form file once its reads a key fall
+    /// under the median partition's (`Options::zpages_hot_cold_back` on):
+    /// `supdb-zhotcoldback`.
+    zhotcoldback: bool,
     /// The sweep at an operation's end walking the reader table at every
     /// end a pin holds it, the shape before the sweep remembered the pin
     /// (`Options::sweep_remembers_pin` off): `supdb-sweepwalks`.
@@ -1872,8 +1876,10 @@ struct Policy {
     zhotaskidle: bool,
     /// The growth share at five percent: `supdb-zhotgrowth5`.
     zhotgrowth5: bool,
-    /// The start placed twice: `supdb-zseekrank`.
-    zseekrank: bool,
+    /// The start placed once: `supdb-zseekseed`.
+    zseekseed: bool,
+    /// The cold way back: `supdb-zhotcoldback`.
+    zhotcoldback: bool,
     /// The reader table walked at every end: `supdb-sweepwalks`.
     sweepwalks: bool,
     /// The values prefetched whole: `supdb-copyprefetchwhole`.
@@ -2229,7 +2235,8 @@ impl Default for Policy {
             zhotline: false,
             zhotaskidle: false,
             zhotgrowth5: false,
-            zseekrank: false,
+            zseekseed: false,
+            zhotcoldback: false,
             sweepwalks: false,
             copyprefetchwhole: false,
             zhotskewroom: false,
@@ -2769,14 +2776,27 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose covered scans place their start twice, the seek's rank
-    /// and the reader's cursor at it (`Options::zpages_seek_seeds` off): the
-    /// shape before the seek's cursor was kept.
-    pub fn create_zseekrank(path: &Path) -> Res<Supdb> {
+    /// `supdb` whose covered scans place their start once, the seek's
+    /// cursor kept as the partition's reader's (`Options::zpages_seek_seeds`
+    /// on).
+    pub fn create_zseekseed(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
-                zseekrank: true,
+                zseekseed: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose hot-raw policy sends a raw partition back to its form
+    /// file once its reads a key fall under the median partition's
+    /// (`Options::zpages_hot_cold_back` on).
+    pub fn create_zhotcoldback(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zhotcoldback: true,
                 ..Policy::default()
             },
         )
@@ -7183,7 +7203,8 @@ impl Supdb {
             zhotline,
             zhotaskidle,
             zhotgrowth5,
-            zseekrank,
+            zseekseed,
+            zhotcoldback,
             sweepwalks,
             copyprefetchwhole,
             zhotskewroom,
@@ -7629,7 +7650,8 @@ impl Supdb {
             zpages_hot_raw_slack: !zhotline,
             zpages_hot_ask_idle: zhotaskidle,
             zpages_hot_growth_pct: if zhotgrowth5 { 5 } else { 10 },
-            zpages_seek_seeds: !zseekrank,
+            zpages_seek_seeds: zseekseed,
+            zpages_hot_cold_back: zhotcoldback,
             sweep_remembers_pin: !sweepwalks,
             copy_prefetch_whole: copyprefetchwhole,
             zpages_hot_skew_room: zhotskewroom,
@@ -7855,7 +7877,8 @@ impl Supdb {
             zhotline,
             zhotaskidle,
             zhotgrowth5,
-            zseekrank,
+            zseekseed,
+            zhotcoldback,
             sweepwalks,
             copyprefetchwhole,
             zhotskewroom,
@@ -8230,8 +8253,11 @@ impl Engine for Supdb {
         if self.zhotgrowth5 {
             return "supdb-zhotgrowth5";
         }
-        if self.zseekrank {
-            return "supdb-zseekrank";
+        if self.zseekseed {
+            return "supdb-zseekseed";
+        }
+        if self.zhotcoldback {
+            return "supdb-zhotcoldback";
         }
         if self.sweepwalks {
             return "supdb-sweepwalks";
@@ -10318,7 +10344,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-memo64"
         | "supdb-zhotaskidle"
         | "supdb-zhotgrowth5"
-        | "supdb-zseekrank"
+        | "supdb-zseekseed"
+        | "supdb-zhotcoldback"
         | "supdb-sweepwalks"
         | "supdb-copyprefetchwhole"
         | "supdb-zhotskewroom"
@@ -10749,7 +10776,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-memo64" => supdb_arm(Supdb::create_memo64, dir)?,
         "supdb-zhotaskidle" => supdb_arm(Supdb::create_zhotaskidle, dir)?,
         "supdb-zhotgrowth5" => supdb_arm(Supdb::create_zhotgrowth5, dir)?,
-        "supdb-zseekrank" => supdb_arm(Supdb::create_zseekrank, dir)?,
+        "supdb-zseekseed" => supdb_arm(Supdb::create_zseekseed, dir)?,
+        "supdb-zhotcoldback" => supdb_arm(Supdb::create_zhotcoldback, dir)?,
         "supdb-sweepwalks" => supdb_arm(Supdb::create_sweepwalks, dir)?,
         "supdb-copyprefetchwhole" => supdb_arm(Supdb::create_copyprefetchwhole, dir)?,
         "supdb-zhotskewroom" => supdb_arm(Supdb::create_zhotskewroom, dir)?,
@@ -12641,11 +12669,18 @@ mod tests {
                 assert_eq!((o.zpages_hot_growth_pct, b.zpages_hot_growth_pct), (5, 10));
             }
             {
-                let z = Supdb::create_zseekrank(&dir("zseekrank")).unwrap();
-                assert_eq!(z.name(), "supdb-zseekrank");
+                let z = Supdb::create_zseekseed(&dir("zseekseed")).unwrap();
+                assert_eq!(z.name(), "supdb-zseekseed");
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
-                assert!(!o.zpages_seek_seeds && b.zpages_seek_seeds);
+                assert!(o.zpages_seek_seeds && !b.zpages_seek_seeds);
+            }
+            {
+                let z = Supdb::create_zhotcoldback(&dir("zhotcoldback")).unwrap();
+                assert_eq!(z.name(), "supdb-zhotcoldback");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_hot_cold_back && !b.zpages_hot_cold_back);
             }
             {
                 let z = Supdb::create_sweepwalks(&dir("sweepwalks")).unwrap();
