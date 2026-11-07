@@ -937,6 +937,19 @@ pub struct Supdb {
     /// Every covered partition served from its form file, the shape before
     /// the hot-raw policy (`Options::zpages_hot_raw` off): `supdb-znohotraw`.
     znohotraw: bool,
+    /// Every operation's wall stamped onto the census window, the shape
+    /// before the stamps of one operation in sixteen
+    /// (`Options::zpages_census_sample` off): `supdb-zbusyevery`.
+    zbusyevery: bool,
+    /// The block walk's clean run stopping at a block no walk has built,
+    /// the shape before the run built the blocks it reaches
+    /// (`Options::scan_run_builds` off): `supdb-norunbuilds`.
+    norunbuilds: bool,
+    /// A cursor placed for each block's walk and each block's build, and
+    /// a clean run dispatched afresh, the shape before a scan's blocks over
+    /// a covered partition read through one cursor
+    /// (`Options::zpages_scan_cursor` off): `supdb-blockcursors`.
+    blockcursors: bool,
     /// The fill yielding its conversions at any posted commit
     /// (`Options::forms_convert_behind` zero), the shape before it
     /// converted in the thread's slack. `supdb-postedyield`, and
@@ -1806,6 +1819,13 @@ struct Policy {
     zsamplefills: bool,
     /// No hot-raw policy: `supdb-znohotraw`.
     znohotraw: bool,
+    /// Every operation's wall stamped onto the census window:
+    /// `supdb-zbusyevery`.
+    zbusyevery: bool,
+    /// The clean run stopping at an unbuilt block: `supdb-norunbuilds`.
+    norunbuilds: bool,
+    /// A cursor a block: `supdb-blockcursors`.
+    blockcursors: bool,
     /// The fill yielding at any posted commit: `supdb-postedyield`, and
     /// `supdb-ingestpostedyield` buffered.
     postedyield: bool,
@@ -2137,6 +2157,9 @@ impl Default for Policy {
             fencekeys: false,
             zsamplefills: false,
             znohotraw: false,
+            zbusyevery: false,
+            norunbuilds: false,
+            blockcursors: false,
             postedyield: false,
             behindyield: false,
             bg: false,
@@ -2594,6 +2617,47 @@ impl Supdb {
             path,
             Policy {
                 znohotraw: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose census stamps every operation's wall onto its window
+    /// (`Options::zpages_census_sample` off): the shape before the stamps
+    /// of one operation in sixteen where a window is a thousand operations
+    /// or longer.
+    pub fn create_zbusyevery(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zbusyevery: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose block walk's clean run stops at a block no walk of
+    /// the handle's has built (`Options::scan_run_builds` off): the shape
+    /// before the run built the blocks it reaches and took the clean ones.
+    pub fn create_norunbuilds(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                norunbuilds: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose scans place a cursor for each block's walk and each
+    /// block's build over a covered partition, and dispatch each clean run
+    /// afresh (`Options::zpages_scan_cursor` off): the shape before a scan's
+    /// blocks read through one cursor held across the partition.
+    pub fn create_blockcursors(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                blockcursors: true,
                 ..Policy::default()
             },
         )
@@ -6867,6 +6931,9 @@ impl Supdb {
             fencekeys,
             zsamplefills,
             znohotraw,
+            zbusyevery,
+            norunbuilds,
+            blockcursors,
             postedyield,
             behindyield,
             bg,
@@ -7298,6 +7365,9 @@ impl Supdb {
             zpages_fence_words: !fencekeys,
             zpages_reading_from_files: !zsamplefills,
             zpages_hot_raw: !znohotraw,
+            zpages_census_sample: !zbusyevery,
+            scan_run_builds: !norunbuilds,
+            zpages_scan_cursor: !blockcursors,
             zpages_memo_ahead: !zmemonoahead,
             scan_start_cache: if zstartcache { 4096 } else { 0 },
             zpages_block_cursor: !zperrun,
@@ -7509,6 +7579,9 @@ impl Supdb {
             fencekeys,
             zsamplefills,
             znohotraw,
+            zbusyevery,
+            norunbuilds,
+            blockcursors,
             postedyield,
             behindyield,
             bg,
@@ -7857,6 +7930,15 @@ impl Engine for Supdb {
         }
         if self.znohotraw {
             return "supdb-znohotraw";
+        }
+        if self.zbusyevery {
+            return "supdb-zbusyevery";
+        }
+        if self.norunbuilds {
+            return "supdb-norunbuilds";
+        }
+        if self.blockcursors {
+            return "supdb-blockcursors";
         }
         if self.postedyield {
             return if self.partition {
@@ -9893,6 +9975,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-fencekeys"
         | "supdb-zsamplefills"
         | "supdb-znohotraw"
+        | "supdb-zbusyevery"
+        | "supdb-norunbuilds"
+        | "supdb-blockcursors"
         | "supdb-postedyield"
         | "supdb-behindyield"
         | "supdb-bg"
@@ -10308,6 +10393,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-fencekeys" => supdb_arm(Supdb::create_fencekeys, dir)?,
         "supdb-zsamplefills" => supdb_arm(Supdb::create_zsamplefills, dir)?,
         "supdb-znohotraw" => supdb_arm(Supdb::create_znohotraw, dir)?,
+        "supdb-zbusyevery" => supdb_arm(Supdb::create_zbusyevery, dir)?,
+        "supdb-norunbuilds" => supdb_arm(Supdb::create_norunbuilds, dir)?,
+        "supdb-blockcursors" => supdb_arm(Supdb::create_blockcursors, dir)?,
         "supdb-postedyield" => supdb_arm(Supdb::create_postedyield, dir)?,
         "supdb-behindyield" => supdb_arm(Supdb::create_behindyield, dir)?,
         "supdb-bg" => supdb_arm(Supdb::create_bg, dir)?,
@@ -12123,6 +12211,27 @@ mod tests {
                     (o.zpages, o.zpages_cover_resident, o.wal_drop_bytes),
                     (b.zpages, b.zpages_cover_resident, b.wal_drop_bytes)
                 );
+            }
+            {
+                let z = Supdb::create_blockcursors(&dir("blockcursors")).unwrap();
+                assert_eq!(z.name(), "supdb-blockcursors");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.zpages_scan_cursor && b.zpages_scan_cursor);
+            }
+            {
+                let z = Supdb::create_norunbuilds(&dir("norunbuilds")).unwrap();
+                assert_eq!(z.name(), "supdb-norunbuilds");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.scan_run_builds && b.scan_run_builds);
+            }
+            {
+                let z = Supdb::create_zbusyevery(&dir("zbusyevery")).unwrap();
+                assert_eq!(z.name(), "supdb-zbusyevery");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.zpages_census_sample && b.zpages_census_sample);
             }
             {
                 let z = Supdb::create_znohotraw(&dir("znohotraw")).unwrap();

@@ -590,6 +590,12 @@ pub struct ZCounts {
     pub census_read_faults: u64,
     pub census_scans: u64,
     pub census_scan_faults: u64,
+    /// Over the windows that counted: the operations whose wall was
+    /// stamped (`Options::zpages_census_sample`), and the busy wall of the
+    /// windows with no commit inside, nanoseconds, scaled where the stride
+    /// skipped operations.
+    pub census_stamped: u64,
+    pub census_busy_ns: u64,
     pub census_t_f_ns: u64,
     pub census_t_hit_ns: u64,
     pub census_t_hit_scan_ns: u64,
@@ -1289,6 +1295,23 @@ pub struct Options {
     /// `supdb-cache64tofitautozpagesperrun` is the arm.
     #[doc(hidden)]
     pub zpages_block_cursor: bool,
+    /// A scan's blocks over a covered partition read through one cursor
+    /// held across the blocks the scan walks in that partition
+    /// (`PartReader`): the clean runs, the sparse blocks' runs between
+    /// their keys, and the builds of the blocks the walk reaches, each
+    /// group the scan crosses opened once. Off is the shape before: a
+    /// cursor placed for each block's walk and each block's build, and a
+    /// clean run dispatched into the form file afresh
+    /// (`Reader::cache_scan`), each placement a rank search over the
+    /// fence, the group opened again and the page's header checked. The
+    /// write mixes leave a few unsealed keys in every cold partition, so a
+    /// covered scan of fifty in ycsb-E at ten million keys under 1.25 GiB
+    /// crossed a sparse block in two of three and placed 2.5 cursors or
+    /// dispatches, 66,000 for 26,000 scans, and opened 7.5 groups where it
+    /// spans 2.7 -- the decode of the groups opened twice was a tenth of
+    /// its thread. `supdb-blockcursors` is the arm.
+    #[doc(hidden)]
+    pub zpages_scan_cursor: bool,
     /// EXPERIMENT: a scan's seek of a covered partition, and the cut where
     /// an unsealed key falls inside its walk, by the ordered index's heads
     /// and the raw records, as before the form served scans, instead of by
@@ -1432,6 +1455,24 @@ pub struct Options {
     /// million keys under 640 MiB.
     #[doc(hidden)]
     pub zpages_writer_census: bool,
+    /// The census window's busy wall -- the operations' own wall, which
+    /// with the thread's CPU and its major faults prices a fault, the
+    /// `t_f` of the costs -- taken from one operation in `ZBUSY_STRIDE`
+    /// once a window is `ZBUSY_SAMPLED_FROM` operations long, and scaled
+    /// by the window's operations over the ones stamped; every operation
+    /// of a shorter window is stamped. A stamp is two clock reads an
+    /// operation, and in the row's shape at ten million keys under
+    /// 1.25 GiB they were 6% of ycsb-E's thread: 73 of 962 samples in
+    /// `clock_gettime`, 11 of them the harness's own, with the compact
+    /// form serving and a scan a few microseconds. A window of a thousand
+    /// operations or more is one whose operations are under a hundred
+    /// microseconds, the regime where the stamps are a share of the
+    /// operation and the wait they measure is not; a shorter window's
+    /// operations are the faulting ones the price is for, and every one
+    /// of them is stamped. Off, every operation is stamped:
+    /// `supdb-zbusyevery`.
+    #[doc(hidden)]
+    pub zpages_census_sample: bool,
     /// Whether the controller buys on the model's prediction, as the eager
     /// entry buys a build (`zpages_build_eager`), where the sampler finds
     /// form files on disk for the share of the partitions' keys whose
@@ -2149,6 +2190,21 @@ pub struct Options {
     /// `scan_cache_ahead_min_blocks` gets none. `false` is the arm
     /// without the thread.
     pub scan_cache_ahead: bool,
+    /// A clean run of the block walk builds the blocks it reaches that no
+    /// walk of this handle's has built, where it has the snapshot, and
+    /// takes each into the run that comes out clean; off, the run stops at
+    /// the first block with no form in the table and the walk builds it at
+    /// its next turn, one dispatch into the partition a block. The run was
+    /// written for a store with nothing unsealed, where every block is
+    /// clean and the snapshot is empty, and extended over the blocks
+    /// already built; the cold partitions of a Zipfian mix are blocks no
+    /// scan has visited, so a scan of fifty there made 2.5 dispatches into
+    /// the form file -- the fence's rank search, the group opened again,
+    /// the page header checked, each time -- 75,000 for the 30,000 of
+    /// ycsb-E's scans that start past the hot partitions at ten million
+    /// keys under 1.25 GiB, 6.5 groups opened a scan where the scan spans
+    /// 2.7. `supdb-norunbuilds` is the run that stops.
+    pub scan_run_builds: bool,
     /// A block walk prefetches the lines it is about to read -- the
     /// form's, or the partition's records over the ranks the scan will
     /// take -- and the next block's where the scan will cross into it.
@@ -4074,6 +4130,7 @@ impl Default for Options {
             zpages_fence_words: true,
             zpages_memo_ahead: true,
             zpages_block_cursor: true,
+            zpages_scan_cursor: true,
             zpages_scan_prefetch: false,
             zpages_walk_cursor: true,
             zpages_block_cache: true,
@@ -4082,6 +4139,7 @@ impl Default for Options {
             zpages_sample_idle: false,
             zpages_attach_first: true,
             zpages_writer_census: true,
+            zpages_census_sample: true,
             zpages_attach_eager: true,
             zpages_build_ahead: 4 << 20,
             zpages_prebuild: false,
@@ -4127,6 +4185,7 @@ impl Default for Options {
             scan_cache_auto: true,
             scan_cache_auto_bytes: 0,
             scan_cache_ahead: true,
+            scan_run_builds: true,
             scan_prefetch: true,
             scan_prefetch_bytes: 4096,
             seek_prefetch_dir: true,
@@ -10041,7 +10100,8 @@ struct Slot {
     /// served, by class, as the bits of an `f64` of seconds (0: none);
     /// then the windows that counted, the ones with a commit inside, and
     /// the ones dropped: mixed (both classes), or moved (the thread or the
-    /// gate changed inside it).
+    /// gate changed inside it); and over the windows that counted, the
+    /// operations whose wall was stamped (`Options::zpages_census_sample`).
     zcreads: AtomicU64,
     zcrflt: AtomicU64,
     zcscans: AtomicU64,
@@ -10057,6 +10117,7 @@ struct Slot {
     zccommit: AtomicU64,
     zcmixed: AtomicU64,
     zcmoved: AtomicU64,
+    zcstamped: AtomicU64,
     /// The keys the scan windows' scans emitted, for the mean scan length
     /// the sampler prices a scan through the form by.
     zcskeys: AtomicU64,
@@ -10116,6 +10177,7 @@ impl Slot {
             zccommit: AtomicU64::new(0),
             zcmixed: AtomicU64::new(0),
             zcmoved: AtomicU64::new(0),
+            zcstamped: AtomicU64::new(0),
             zcskeys: AtomicU64::new(0),
             zcpages: AtomicU64::new(0),
         }
@@ -15704,6 +15766,11 @@ pub struct Reader {
     /// copy out of its cell (`zcensus_begin`). Set where the window opens
     /// and cleared where it closes or is abandoned, and nowhere else.
     zwin_open: std::cell::Cell<bool>,
+    /// Whether the operation in progress has its wall stamped onto the
+    /// window (`zcensus_begin_slow`): the one word the end hook reads, so
+    /// that an operation the stride skips pays a byte's load and a branch
+    /// at its end and never the window's copy out of its cell.
+    zwin_counting: std::cell::Cell<bool>,
     /// Whether this handle runs the census at all: a counted handle of a
     /// store under `Auto` where the controller runs. Decided once, so a
     /// read under `Off` or `Always` pays one load and a branch for it.
@@ -15759,6 +15826,12 @@ struct ZWindow {
     /// reads, and a put's or a commit's wall is no read's.
     t0: std::time::Instant,
     counting: bool,
+    /// The stamps' stride this window (`Options::zpages_census_sample`):
+    /// one operation in `stride` has its wall stamped, `sdown` of them to
+    /// go before the next, and `sampled` stamped so far.
+    stride: u32,
+    sdown: u32,
+    sampled: u32,
 }
 
 /// A window's length in operations at first, and its bounds.
@@ -15770,6 +15843,11 @@ const ZWINDOW_TARGET: std::time::Duration = std::time::Duration::from_millis(100
 /// closes at its next operation whatever its countdown says: two to
 /// three hundred milliseconds, so a sparse handle's window closes too.
 const ZWINDOW_TICKS: u64 = 3;
+/// One operation in this many has its wall stamped onto a window of
+/// `ZBUSY_SAMPLED_FROM` operations or more (`Options::zpages_census_sample`);
+/// every operation of a shorter window is stamped.
+const ZBUSY_STRIDE: u32 = 16;
+const ZBUSY_SAMPLED_FROM: u32 = 1024;
 
 impl ZWindow {
     fn closed() -> ZWindow {
@@ -15790,6 +15868,9 @@ impl ZWindow {
             busy: 0,
             t0: now,
             counting: false,
+            stride: 1,
+            sdown: 0,
+            sampled: 0,
         }
     }
 }
@@ -18090,7 +18171,7 @@ impl Reader {
                 self.sweep_at_leave();
             }
         }
-        if self.zcensus && self.zwin_open.get() {
+        if self.zcensus && self.zwin_counting.get() {
             self.zcensus_end();
         }
         if let Some(slot) = self.slot {
@@ -18142,6 +18223,7 @@ impl Reader {
             // abandon.
             if self.zwin_open.get() {
                 self.zwin_open.set(false);
+                self.zwin_counting.set(false);
                 self.zfootprint_track(false);
             }
             return;
@@ -18170,24 +18252,34 @@ impl Reader {
             w.reads += 1;
         }
         w.down -= 1;
-        w.t0 = std::time::Instant::now();
-        w.counting = true;
+        // One operation in the window's stride has its wall stamped: the
+        // window's first, and every `stride`th after it.
+        if w.sdown == 0 {
+            w.sdown = w.stride - 1;
+            w.sampled += 1;
+            w.t0 = std::time::Instant::now();
+            w.counting = true;
+        } else {
+            w.sdown -= 1;
+            w.counting = false;
+        }
+        self.zwin_counting.set(w.counting);
         self.zwin.set(w);
     }
 
     /// The census's hook at an operation's end: the operation's wall goes
-    /// onto the window's busy wall. Called behind the flag and the open
-    /// word.
+    /// onto the window's busy wall. Called behind the flag and the stamp
+    /// word, which the begin hook sets for the operations the stride
+    /// stamps and for no other.
     #[inline(never)]
     fn zcensus_end(&self) {
         let mut w = self.zwin.get();
-        if !w.counting {
-            return;
-        }
+        debug_assert!(w.counting);
         w.busy = w
             .busy
             .saturating_add(w.t0.elapsed().as_nanos().min(u64::MAX as u128) as u64);
         w.counting = false;
+        self.zwin_counting.set(false);
         self.zwin.set(w);
     }
 
@@ -18214,6 +18306,13 @@ impl Reader {
         let now = std::time::Instant::now();
         self.zwin_open.set(true);
         w.down = w.n;
+        w.stride = if self.opts.zpages_census_sample && w.n >= ZBUSY_SAMPLED_FROM {
+            ZBUSY_STRIDE
+        } else {
+            1
+        };
+        w.sdown = 0;
+        w.sampled = 0;
         w.reads = 0;
         w.scans = 0;
         w.gate = gate;
@@ -18313,6 +18412,12 @@ impl Reader {
             Some(cost) => {
                 cpu.saturating_add(flt.saturating_mul(cost.as_nanos().min(u64::MAX as u128) as u64))
             }
+            // The stamped operations' wall, scaled to the window's
+            // operations where the stride skipped some.
+            None if w.sampled > 0 && u64::from(w.sampled) < ops => {
+                (u128::from(w.busy) * u128::from(ops) / u128::from(w.sampled))
+                    .min(u128::from(u64::MAX)) as u64
+            }
             None => w.busy,
         };
         let scan = w.scans > 0;
@@ -18325,6 +18430,7 @@ impl Reader {
             bump(&s.zcrflt, flt);
         }
         bump(&s.zcwindows, 1);
+        bump(&s.zcstamped, u64::from(w.sampled));
         if gate == zselect::GATE_Z {
             s.zcpages
                 .store(self.zmemo.footprint_pages(), AtomicOrdering::Relaxed);
@@ -19252,6 +19358,8 @@ impl Reader {
             census_read_faults: rd.stat(|s| &s.zcrflt),
             census_scans: rd.stat(|s| &s.zcscans),
             census_scan_faults: rd.stat(|s| &s.zcsflt),
+            census_stamped: rd.stat(|s| &s.zcstamped),
+            census_busy_ns: rd.stat(|s| &s.zcfwall),
             census_t_f_ns: get(&ev.census_costs[0]),
             census_t_hit_ns: get(&ev.census_costs[1]),
             census_t_hit_scan_ns: get(&ev.census_costs[2]),
@@ -23105,7 +23213,7 @@ impl Reader {
             }
             table.snap_at(self, seg, unsealed)?;
             let src = Sources { seg, l0 };
-            let built = self.share_form(ctx.materialize(src, table, b, unsealed)?);
+            let built = self.share_form(ctx.materialize(src, None, table, b, unsealed)?);
             self.count_built_kind(&built);
             let bytes = self.fbytes(&built);
             table.slots[b] = Some(built);
@@ -23365,7 +23473,7 @@ impl Reader {
                         let copied = ctx.copy_from_deltas(src, lo..hi, sb)?;
                         #[cfg(debug_assertions)]
                         {
-                            let again = ctx.materialize(src, table, b, unsealed)?;
+                            let again = ctx.materialize(src, None, table, b, unsealed)?;
                             match &again {
                                 Cached::Block(cb) => debug_assert!(
                                     copied.agrees(cb),
@@ -23382,7 +23490,7 @@ impl Reader {
                         Cached::Block(copied)
                     } else {
                         self.shared.forms_events[5].fetch_add(1, AtomicOrdering::Relaxed);
-                        ctx.materialize(src, table, b, unsealed)?
+                        ctx.materialize(src, None, table, b, unsealed)?
                     };
                     stamp.build_ns += t_build.elapsed().as_nanos() as u64;
                     self.shared
@@ -23408,7 +23516,7 @@ impl Reader {
                 }
                 self.shared.forms_events[6].fetch_add(1, AtomicOrdering::Relaxed);
                 let t_build = std::time::Instant::now();
-                let built = self.share_form(ctx.materialize(src, table, b, unsealed)?);
+                let built = self.share_form(ctx.materialize(src, None, table, b, unsealed)?);
                 stamp.build_ns += t_build.elapsed().as_nanos() as u64;
                 self.count_built_kind(&built);
                 let bytes = self.fbytes(&built);
@@ -24646,6 +24754,41 @@ impl Reader {
         })
     }
 
+    /// A block with no form in this handle's table built and filed into it,
+    /// as the block walk does on reaching one: the block's records asked of
+    /// the kernel where the store is out of core (`blocks_willneed`), the
+    /// form materialized from the sources and the snapshot, counted by its
+    /// kind, and its bytes listed and shed against the budget.
+    #[allow(clippy::too_many_arguments)]
+    fn build_slot(
+        &self,
+        ctx: &BuildCtx,
+        src: Sources,
+        pr: Option<&mut PartReader<'_>>,
+        table: &mut BlockTable,
+        pi: usize,
+        b: usize,
+        unsealed: &Snapshot,
+    ) -> Result<()> {
+        let seg = src.seg;
+        let lo = b * CACHE_BLOCK;
+        let hi = ((b + 1) * CACHE_BLOCK).min(seg.blob.keys());
+        if self.blocks_willneed(seg) {
+            let n = seg.raw().willneed_ranks(lo, hi - lo, WILLNEED_CAP);
+            self.zbump(|s| &s.zblkwillneeds);
+            if n > 0 {
+                self.zbump(|s| &s.zwillneedasks);
+            }
+        }
+        let built = self.share_form(ctx.materialize(src, pr, table, b, unsealed)?);
+        self.count_built_kind(&built);
+        let bytes = self.fbytes(&built);
+        table.slots[b] = Some(built);
+        self.list_built_bytes(pi, b, table, bytes);
+        self.shed(pi, b, table);
+        Ok(())
+    }
+
     /// PROTOTYPE: the scan over partitions and everything above them,
     /// block by block: a cached copy is walked, a clean block is walked in
     /// the partition, a sparse one with its deltas, and a block not yet
@@ -24777,6 +24920,10 @@ impl Reader {
                 break;
             }
             let src = Sources { seg, l0 };
+            // One cursor for the blocks this scan walks in the partition
+            // (`Options::zpages_scan_cursor`); under the arm each block
+            // places its own below.
+            let mut shared = PartReader::new(self, seg);
             // The scan's first partition: the one whose start is the
             // scan's own key, which the start cache answers for.
             let scan_start = pi == first;
@@ -24898,6 +25045,11 @@ impl Reader {
             while seen < limit && b < nblocks {
                 let lo = b * CACHE_BLOCK;
                 let hi = ((b + 1) * CACHE_BLOCK).min(keys);
+                let mut own = (!self.opts.zpages_scan_cursor).then(|| PartReader::new(self, seg));
+                let pr: &mut PartReader<'_> = match own.as_mut() {
+                    Some(p) => p,
+                    None => &mut shared,
+                };
                 let from_key: &[u8] = if first { cursor } else { b"" };
                 // A wide form is the handle's own to walk against its own
                 // list of filed keys, so it is never taken from the
@@ -24942,19 +25094,7 @@ impl Reader {
                     None => &NO_SNAPSHOT,
                 };
                 if canon.is_none() && table.slots[b].is_none() {
-                    if self.blocks_willneed(seg) {
-                        let n = seg.raw().willneed_ranks(lo, hi - lo, WILLNEED_CAP);
-                        self.zbump(|s| &s.zblkwillneeds);
-                        if n > 0 {
-                            self.zbump(|s| &s.zwillneedasks);
-                        }
-                    }
-                    let built = self.share_form(ctx.materialize(src, table, b, unsealed)?);
-                    self.count_built_kind(&built);
-                    let bytes = self.fbytes(&built);
-                    table.slots[b] = Some(built);
-                    self.list_built_bytes(pi, b, table, bytes);
-                    self.shed(pi, b, table);
+                    self.build_slot(&ctx, src, None, table, pi, b, unsealed)?;
                 }
                 if bookkeep && canon.is_none() {
                     table.touched[b] = tick;
@@ -24978,7 +25118,7 @@ impl Reader {
                             copy_dense: true,
                             ..self.build_ctx()
                         }
-                        .materialize(src, table, b, unsealed)?,
+                        .materialize(src, None, table, b, unsealed)?,
                     );
                     self.fs().recopies.set(self.fs().recopies.get() + 1);
                     self.count_built_kind(&built);
@@ -25077,6 +25217,10 @@ impl Reader {
                 }] += 1;
                 self.fs().walk_kinds.set(k);
                 let took_from = seen;
+                // The first block this turn walks: the clean run below may
+                // take several, and the promotion after the walk credits
+                // each with what the run took from it.
+                let run_b0 = b;
                 // Under `pieces_only` the memtables' keys over this block,
                 // from the scan's cursor on, slipped into whatever form
                 // the block holds; none, and the form is walked alone.
@@ -25122,6 +25266,7 @@ impl Reader {
                         seen += match &mem_ov {
                             Some(ov) => ctx.walk_deltas_over(
                                 src,
+                                pr,
                                 start..hi,
                                 deltas,
                                 ov,
@@ -25129,7 +25274,7 @@ impl Reader {
                                 &mut *f,
                             )?,
                             None => ctx.walk_deltas(
-                                src,
+                                pr,
                                 start..hi,
                                 deltas,
                                 from_key,
@@ -25141,7 +25286,7 @@ impl Reader {
                     Cached::Clean if mem_ov.is_some() => {
                         let ov = mem_ov.as_ref().expect("checked");
                         seen += ctx
-                            .walk_block(src, start..hi, ov, limit - seen, |_k| {}, &mut *f)?
+                            .walk_block(src, pr, start..hi, ov, limit - seen, |_k| {}, &mut *f)?
                             .0;
                     }
                     Cached::Clean => {
@@ -25150,7 +25295,7 @@ impl Reader {
                         // a hundred entries is one walk, as the bulk walk
                         // makes it, not three block-sized ones.
                         let mut run_hi = hi;
-                        let clean_at = |b: usize| {
+                        let clean_at = |table: &BlockTable, b: usize| {
                             // Under `pieces_only` a block over memtable keys
                             // is walked with them, so the run stops before
                             // it; the bounds were taken for this block.
@@ -25161,14 +25306,41 @@ impl Reader {
                                     &table.added,
                                     b,
                                 ))
-                                && if canonical {
-                                    complete
-                                        && st.forms[pi][b].load(AtomicOrdering::Acquire).is_null()
+                                && if canonical && complete {
+                                    st.forms[pi][b].load(AtomicOrdering::Acquire).is_null()
                                 } else {
-                                    matches!(table.slots[b].as_deref(), Some(Cached::Clean))
+                                    // With the canonical table incomplete a
+                                    // null form says nothing, and the block
+                                    // is this handle's slot's, as the walk
+                                    // above takes it.
+                                    (!canonical
+                                        || st.forms[pi][b].load(AtomicOrdering::Acquire).is_null())
+                                        && matches!(table.slots[b].as_deref(), Some(Cached::Clean))
                                 }
                         };
-                        while b + 1 < nblocks && run_hi - start < limit - seen && clean_at(b + 1) {
+                        // A block the run reaches with no form yet is built
+                        // here, as the walk would build it at its next turn,
+                        // and joins the run when it comes out clean
+                        // (`Options::scan_run_builds`): the cold partitions
+                        // of a Zipfian mix are blocks no scan has visited,
+                        // and a run that stopped at each paid the form
+                        // file's dispatch per block. A walk without the
+                        // snapshot cannot build, and stops as before.
+                        while b + 1 < nblocks && run_hi - start < limit - seen {
+                            let next = b + 1;
+                            if self.opts.scan_run_builds
+                                && !lazy
+                                && !ctx.pieces_only
+                                && table.slots[next].is_none()
+                                && !(canonical && complete)
+                                && (!canonical
+                                    || st.forms[pi][next].load(AtomicOrdering::Acquire).is_null())
+                            {
+                                self.build_slot(&ctx, src, None, table, pi, next, unsealed)?;
+                            }
+                            if !clean_at(table, next) {
+                                break;
+                            }
                             b += 1;
                             // The run took the block the next-block
                             // fetch was for; the block after it was not
@@ -25181,7 +25353,14 @@ impl Reader {
                         }
                         if start < run_hi {
                             let want = (run_hi - start).min(limit - seen);
-                            seen += self.cache_scan(seg, start, want, &mut *f)?;
+                            // The run through the scan's cursor, which
+                            // stands where the last run ended; the
+                            // dispatch afresh under the arm.
+                            seen += if self.opts.zpages_scan_cursor {
+                                pr.scan(start, want, &mut *f)?
+                            } else {
+                                self.cache_scan(seg, start, want, &mut *f)?
+                            };
                         }
                     }
                     Cached::Block(blk) if mem_ov.is_some() => {
@@ -25231,7 +25410,7 @@ impl Reader {
                         let window = (from_key, limit - seen);
                         let ov = ctx.overlay_window(src, table, b, unsealed, w, window)?;
                         seen += ctx
-                            .walk_block(src, start..hi, &ov, limit - seen, |_k| {}, &mut *f)?
+                            .walk_block(src, pr, start..hi, &ov, limit - seen, |_k| {}, &mut *f)?
                             .0;
                     }
                 }
@@ -25246,66 +25425,85 @@ impl Reader {
                 // a block walked as a copy has nothing to promote.
                 // A copy is built from the snapshot; a walk without one
                 // leaves the promotion to the next.
-                if promote > 0
-                    && !lazy
-                    && table.dense[b].is_none()
-                    && !(in_slot && walked_kind == 0)
-                {
-                    let took = (seen - took_from) as u32;
-                    table.reads[b] = table.reads[b].saturating_add(took);
-                    // A walked block is copied only below the wide bound:
-                    // past it the block holds more than a copy should. Under
-                    // the form file the walked form is judged, the canonical
-                    // one included, and a clean block repays a copy, since
-                    // its walk is a group decoded a walk; the raw walk
-                    // streams its records, and the copy beside the cheap
-                    // form is for a block walked as deltas.
-                    let repays = if in_slot {
-                        match walked_kind {
-                            1 | 2 => true,
-                            3 => BuildCtx::overlay_count(table, b) <= WIDE,
-                            _ => false,
+                if promote > 0 && !lazy && !(in_slot && walked_kind == 0) {
+                    // The blocks this turn walked -- one, or the clean run's
+                    // several -- each credited with the keys the walk took
+                    // from it, and each judged on its own ranks: a run's
+                    // keys credited to its last block, and that block copied
+                    // from the first block's ranks, answered a later scan
+                    // from the wrong block's records.
+                    let took_all = seen - took_from;
+                    for k in run_b0..=b {
+                        if table.dense[k].is_some() {
+                            continue;
                         }
-                    } else {
-                        match table.slots[b].as_deref() {
-                            Some(Cached::Sparse(_)) => true,
-                            Some(Cached::Wide(_)) => BuildCtx::overlay_count(table, b) <= WIDE,
-                            _ => false,
-                        }
-                    };
-                    if table.reads[b] as usize >= promote && repays {
-                        let ctx = BuildCtx {
-                            dense_from: 1,
-                            copy_dense: true,
-                            ..self.build_ctx()
-                        };
-                        // `materialize` leaves a block with nothing over
-                        // it clean, so a clean block's copy is the records
-                        // between the overlay's keys, all of them.
-                        let copied = if in_slot && walked_kind == 2 {
-                            let ov = ctx.overlay_all(src, table, b, unsealed)?;
-                            Cached::Block(ctx.copy_block(src, lo..hi, &ov)?)
+                        let (klo, khi) = (k * CACHE_BLOCK, ((k + 1) * CACHE_BLOCK).min(keys));
+                        let took = if run_b0 == b {
+                            took_all
                         } else {
-                            ctx.materialize(src, table, b, unsealed)?
+                            // The run's records are the ranks from its
+                            // start, one a key.
+                            (start + took_all).min(khi).saturating_sub(start.max(klo))
                         };
-                        if matches!(copied, Cached::Block(_)) {
-                            let bytes = self.fbytes(&copied);
-                            let mut c = self.fs().choices.get();
-                            c[0] += 1;
-                            c[4] += bytes as u64;
-                            self.fs().choices.set(c);
-                            if in_slot {
-                                self.unlist(pi, b, table);
-                                let built = self.share_form(copied);
-                                self.count_built_kind(&built);
-                                table.slots[b] = Some(built);
-                                self.list_built_bytes(pi, b, table, bytes);
-                                self.shed(pi, b, table);
+                        if took == 0 {
+                            continue;
+                        }
+                        table.reads[k] = table.reads[k].saturating_add(took as u32);
+                        // A walked block is copied only below the wide bound:
+                        // past it the block holds more than a copy should. Under
+                        // the form file the walked form is judged, the canonical
+                        // one included, and a clean block repays a copy, since
+                        // its walk is a group decoded a walk; the raw walk
+                        // streams its records, and the copy beside the cheap
+                        // form is for a block walked as deltas.
+                        let repays = if in_slot {
+                            match walked_kind {
+                                1 | 2 => true,
+                                3 => BuildCtx::overlay_count(table, k) <= WIDE,
+                                _ => false,
+                            }
+                        } else {
+                            match table.slots[k].as_deref() {
+                                Some(Cached::Sparse(_)) => true,
+                                Some(Cached::Wide(_)) => BuildCtx::overlay_count(table, k) <= WIDE,
+                                _ => false,
+                            }
+                        };
+                        if table.reads[k] as usize >= promote && repays {
+                            let ctx = BuildCtx {
+                                dense_from: 1,
+                                copy_dense: true,
+                                ..self.build_ctx()
+                            };
+                            // `materialize` leaves a block with nothing over
+                            // it clean, so a clean block's copy is the records
+                            // between the overlay's keys, all of them.
+                            let copied = if in_slot && walked_kind == 2 {
+                                let ov = ctx.overlay_all(src, table, k, unsealed)?;
+                                let mut own = PartReader::new(self, seg);
+                                Cached::Block(ctx.copy_block(src, &mut own, klo..khi, &ov)?)
                             } else {
-                                self.fs()
-                                    .cache_bytes
-                                    .set(self.fs().cache_bytes.get() + bytes);
-                                table.dense[b] = Some(std::sync::Arc::new(copied));
+                                ctx.materialize(src, None, table, k, unsealed)?
+                            };
+                            if matches!(copied, Cached::Block(_)) {
+                                let bytes = self.fbytes(&copied);
+                                let mut c = self.fs().choices.get();
+                                c[0] += 1;
+                                c[4] += bytes as u64;
+                                self.fs().choices.set(c);
+                                if in_slot {
+                                    self.unlist(pi, k, table);
+                                    let built = self.share_form(copied);
+                                    self.count_built_kind(&built);
+                                    table.slots[k] = Some(built);
+                                    self.list_built_bytes(pi, k, table, bytes);
+                                    self.shed(pi, k, table);
+                                } else {
+                                    self.fs()
+                                        .cache_bytes
+                                        .set(self.fs().cache_bytes.get() + bytes);
+                                    table.dense[k] = Some(std::sync::Arc::new(copied));
+                                }
                             }
                         }
                     }
@@ -27078,6 +27276,7 @@ impl Db {
             zmemo: zfile::ZMemo::sized(opts.zpages_memo_bytes),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
+            zwin_counting: std::cell::Cell::new(false),
             zcensus: opts.zpages_writer_census
                 && opts.zpages == ZPages::Auto
                 && !z_auto_inert(&opts),
@@ -27624,6 +27823,7 @@ impl Db {
             zmemo: zfile::ZMemo::sized(opts.zpages_memo_bytes),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
+            zwin_counting: std::cell::Cell::new(false),
             zcensus: opts.zpages_writer_census
                 && opts.zpages == ZPages::Auto
                 && !z_auto_inert(&opts),
@@ -29913,6 +30113,7 @@ impl Reader {
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
+            zwin_counting: std::cell::Cell::new(false),
             zcensus: false,
             slot: None,
             pin_slot,
@@ -29948,6 +30149,7 @@ impl Reader {
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
+            zwin_counting: std::cell::Cell::new(false),
             zcensus: false,
             slot: Some(slot),
             pin_slot: None,
@@ -29990,6 +30192,7 @@ impl Reader {
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
+            zwin_counting: std::cell::Cell::new(false),
             zcensus: counted && self.opts.zpages == ZPages::Auto && !z_auto_inert(&self.opts),
             slot: Some(slot),
             pin_slot: None,
@@ -31876,7 +32079,7 @@ impl Reader {
                     self.shared.forms_events[8].fetch_add(1, AtomicOrdering::Relaxed);
                     continue;
                 }
-                let form = ctx.materialize(src, &table, b, &unsealed)?;
+                let form = ctx.materialize(src, None, &table, b, &unsealed)?;
                 if matches!(form, Cached::Clean | Cached::Wide(_)) {
                     self.shared.forms_events[8].fetch_add(1, AtomicOrdering::Relaxed);
                     continue;
@@ -32700,6 +32903,7 @@ impl Reader {
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
+            zwin_counting: std::cell::Cell::new(false),
             zcensus: false,
             slot: None,
             // A slot of its own for the passes, which pin it as the
@@ -34751,9 +34955,11 @@ impl<'s> BuildCtx<'s> {
     /// caller's closure does not. Answers the keys seen and whether every
     /// overlay key it emitted replaced a partition record of its own,
     /// which is `copy_block`'s identity.
+    #[allow(clippy::too_many_arguments)]
     fn walk_block<F: FnMut(&[u8], &[u8]), K: FnMut(&[u8])>(
         &self,
         src: Sources,
+        pr: &mut PartReader<'_>,
         ranks: std::ops::Range<usize>,
         ov: &Overlay,
         limit: usize,
@@ -34761,12 +34967,10 @@ impl<'s> BuildCtx<'s> {
         mut f: F,
     ) -> Result<(usize, bool)> {
         let mut oi = 0usize;
-        let seg = src.seg;
         let hi = ranks.end;
         let mut seen = 0usize;
         let mut rank = ranks.start;
         let mut em: Option<Emit> = None;
-        let mut pr = PartReader::new(self.rd, seg);
         let mut all_same = true;
         while seen < limit {
             let end = rank.saturating_add(limit - seen).min(hi);
@@ -34809,7 +35013,7 @@ impl<'s> BuildCtx<'s> {
                 scratch: self.take_offs(),
             });
             on_key(o.key);
-            self.emit_over(&mut f, em, ov, oi, same.then_some((rank, &mut pr)), src)?;
+            self.emit_over(&mut f, em, ov, oi, same.then_some((rank, &mut *pr)), src)?;
             if same {
                 rank += 1;
             }
@@ -34845,6 +35049,32 @@ impl<'s> BuildCtx<'s> {
     fn materialize(
         &self,
         src: Sources,
+        pr: Option<&mut PartReader<'_>>,
+        table: &BlockTable,
+        b: usize,
+        unsealed: &Snapshot,
+    ) -> Result<Cached> {
+        // Through the cursor a caller lends, else through one of this
+        // build's own. The scan's walk lends none, though it holds one
+        // across the partition (`Options::zpages_scan_cursor`): a build
+        // moves the cursor to its keys' cuts and the walk after it starts
+        // behind them, and placed afresh there the cursor decoded the group
+        // it held again -- E at ten million keys under 1.25 GiB opened 6%
+        // more groups with the memo hit a tenth less often -- where a
+        // build's own cursor leaves its groups in the memo for the walk.
+        match pr {
+            Some(p) => self.materialize_with(src, p, table, b, unsealed),
+            None => {
+                let mut own = PartReader::new(self.rd, src.seg);
+                self.materialize_with(src, &mut own, table, b, unsealed)
+            }
+        }
+    }
+
+    fn materialize_with(
+        &self,
+        src: Sources,
+        pr: &mut PartReader<'_>,
         table: &BlockTable,
         b: usize,
         unsealed: &Snapshot,
@@ -34900,9 +35130,9 @@ impl<'s> BuildCtx<'s> {
                 return Ok(Cached::Clean);
             }
             if ov.over.len() < self.dense_from {
-                return Ok(Cached::Sparse(self.deltas_for(src, lo..hi, &ov)?));
+                return Ok(Cached::Sparse(self.deltas_for(src, pr, lo..hi, &ov)?));
             }
-            return Ok(Cached::Block(self.copy_block(src, lo..hi, &ov)?));
+            return Ok(Cached::Block(self.copy_block(src, pr, lo..hi, &ov)?));
         }
         if floor > WIDE || covered {
             return Ok(Cached::Wide(WideBlock {
@@ -34917,9 +35147,9 @@ impl<'s> BuildCtx<'s> {
             return Ok(Cached::Clean);
         }
         if ov.over.len() < self.dense_from {
-            return Ok(Cached::Sparse(self.deltas_for(src, lo..hi, &ov)?));
+            return Ok(Cached::Sparse(self.deltas_for(src, pr, lo..hi, &ov)?));
         }
-        Ok(Cached::Block(self.copy_block(src, lo..hi, &ov)?))
+        Ok(Cached::Block(self.copy_block(src, pr, lo..hi, &ov)?))
     }
     /// PROTOTYPE: the overlay's keys resolved against the partition once:
     /// where each cuts the walk, and its values from every source that
@@ -34946,10 +35176,10 @@ impl<'s> BuildCtx<'s> {
     fn deltas_for(
         &self,
         src: Sources,
+        pr: &mut PartReader<'_>,
         ranks: std::ops::Range<usize>,
         ov: &Overlay,
     ) -> Result<SparseBlock> {
-        let seg = src.seg;
         let hi = ranks.end;
         let mut em = Emit {
             tombs: self.tombs,
@@ -34964,7 +35194,6 @@ impl<'s> BuildCtx<'s> {
             vals: Vec::with_capacity(ov.over.len() * 128),
         };
         let mut rank = ranks.start;
-        let mut pr = PartReader::new(self.rd, seg);
         for (oi, o) in ov.over.iter().enumerate() {
             let (cut, at) = if o.cut != u32::MAX {
                 BuildCtx::cut_known(o.cut, rank, hi)
@@ -34984,7 +35213,7 @@ impl<'s> BuildCtx<'s> {
                 &mut em,
                 ov,
                 oi,
-                same.then_some((cut, &mut pr)),
+                same.then_some((cut, &mut *pr)),
                 src,
             )?;
             blk.ents.push(DeltaEnt {
@@ -35116,9 +35345,11 @@ impl<'s> BuildCtx<'s> {
     /// beside the form's: two key-ordered lists over one walk of the
     /// partition, each key emitted at its cut, a key in both emitted once
     /// through `emit_both`.
+    #[allow(clippy::too_many_arguments)]
     fn walk_deltas_over<F: FnMut(&[u8], &[u8])>(
         &self,
         src: Sources,
+        pr: &mut PartReader<'_>,
         ranks: std::ops::Range<usize>,
         blk: &SparseBlock,
         ov: &Overlay,
@@ -35126,7 +35357,6 @@ impl<'s> BuildCtx<'s> {
         mut f: F,
     ) -> Result<usize> {
         let (cursor, limit) = window;
-        let seg = src.seg;
         let hi = ranks.end;
         let mut seen = 0usize;
         let mut rank = ranks.start;
@@ -35140,7 +35370,6 @@ impl<'s> BuildCtx<'s> {
             tombs: self.tombs,
             scratch: self.take_offs(),
         };
-        let mut pr = PartReader::new(self.rd, seg);
         while seen < limit {
             let d = blk.ents.get(di);
             let o = ov.over.get(oi);
@@ -35206,7 +35435,7 @@ impl<'s> BuildCtx<'s> {
                             &mut em,
                             ov,
                             oi,
-                            same.then_some((rank, &mut pr)),
+                            same.then_some((rank, &mut *pr)),
                             src,
                         )?;
                         if same {
@@ -35295,14 +35524,13 @@ impl<'s> BuildCtx<'s> {
     /// emitted, which is every one after the first block.
     fn walk_deltas<F: FnMut(&[u8], &[u8])>(
         &self,
-        src: Sources,
+        pr: &mut PartReader<'_>,
         ranks: std::ops::Range<usize>,
         blk: &SparseBlock,
         cursor: &[u8],
         limit: usize,
         mut f: F,
     ) -> Result<usize> {
-        let seg = src.seg;
         let hi = ranks.end;
         let mut seen = 0usize;
         let mut rank = ranks.start;
@@ -35314,7 +35542,6 @@ impl<'s> BuildCtx<'s> {
         } else {
             select_lower_bound(blk.ents.len(), |i| blk.key(&blk.ents[i]) < cursor)
         };
-        let mut pr = PartReader::new(self.rd, seg);
         for e in &blk.ents[di..] {
             let cut = (e.cut as usize).max(rank);
             if cut > rank && seen < limit {
@@ -35387,6 +35614,7 @@ impl<'s> BuildCtx<'s> {
     fn copy_block(
         &self,
         src: Sources,
+        pr: &mut PartReader<'_>,
         ranks: std::ops::Range<usize>,
         ov: &Overlay,
     ) -> Result<CachedBlock> {
@@ -35407,6 +35635,7 @@ impl<'s> BuildCtx<'s> {
         let mut open = false;
         let (_, all_same) = self.walk_block(
             src,
+            pr,
             ranks,
             ov,
             usize::MAX,
@@ -35573,6 +35802,10 @@ impl<'s> BuildCtx<'s> {
     }
 }
 
+/// The most records a held cursor steps over to reach the rank a read
+/// asks for before it is placed afresh (`PartReader::cursor_at`).
+const CURSOR_STEP: usize = 16;
+
 /// A block's reads of its partition through one cursor
 /// (`Options::zpages_block_cursor`): the records between the overlay's
 /// keys (`scan`), each key's cut where the records below it end
@@ -35620,9 +35853,14 @@ impl<'a> PartReader<'a> {
             return None;
         }
         let (fell, near) = match &self.cur {
+            // Behind the rank by a few records -- the ones overlay keys
+            // were emitted in place of -- the cursor steps over them; by
+            // more, as across a block the scan walked as a copy, it is
+            // placed afresh, since each step across a group decodes it and
+            // a placement is one rank search and one group.
             Some(c) => (
                 c.fell_back(),
-                self.at <= rank && rank - self.at <= CACHE_BLOCK,
+                self.at <= rank && rank - self.at <= CURSOR_STEP,
             ),
             None => (false, false),
         };

@@ -10691,3 +10691,242 @@ fn a_form_the_parsing_encoder_wrote_answers_as_the_greedy_ones_in_fewer_bytes() 
         "the parsing encoder's form is the smaller: {bytes:?}"
     );
 }
+
+/// The census window's busy wall is taken from one operation in sixteen
+/// once a window is a thousand operations long
+/// (`Options::zpages_census_sample`), and from every operation of a
+/// shorter window or with the option off. A window closed by its count
+/// has its reads' wall alone, so the window after it is a hundred
+/// milliseconds of reads, tens of thousands through the compact form of a
+/// small store, whatever length the drive to COMPACT left; three windows
+/// closed through the ticks after it then stamp one read in sixteen with
+/// the option and every read without, and the busy wall a read, scaled
+/// from the stamps, is within a factor of four of the wall every stamp
+/// gives, since a wall left unscaled would be a sixteenth of it.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_census_stamps_a_long_windows_wall_on_one_operation_in_sixteen() {
+    let mut per_read = [0.0f64; 2];
+    for (i, on) in [true, false].into_iter().enumerate() {
+        let what = format!("census sample {on}");
+        let (dir, db, _model, inject, r, keys, mut at) =
+            compact_store_with(&format!("census-sample-{on}"), 1 << 20, |o| {
+                o.zpages_census_sample = on;
+            });
+        // The seam's price of a fault cleared, so a window's busy wall is
+        // the stamps' own and not the faults'; no faults are injected.
+        inject
+            .fault_cost_ns
+            .store(0, std::sync::atomic::Ordering::Release);
+        // A window closed by its count, which sizes the next at a hundred
+        // milliseconds of these reads.
+        let was = db.zpage_counts().census_windows;
+        let mut n = 0usize;
+        while db.zpage_counts().census_windows == was {
+            reads(&r, &keys, &inject, 4096, &mut at, 0);
+            n += 4096;
+            assert!(
+                n <= 4 << 20,
+                "{what}: a window closed by its count within four million reads: {:?}",
+                db.zpage_counts()
+            );
+        }
+        // Three windows closed through the ticks, each over a stretch of
+        // reads: each window's reads, its stamps and its busy wall.
+        let mut windows: Vec<(u64, u64, u64)> = Vec::new();
+        for _ in 0..3 {
+            let b = db.zpage_counts();
+            reads(&r, &keys, &inject, 1024, &mut at, 0);
+            close_window(&db, &r, &keys[0]);
+            let c = db.zpage_counts();
+            let (dw, dr, ds, dbusy) = (
+                c.census_windows - b.census_windows,
+                c.census_reads - b.census_reads,
+                c.census_stamped - b.census_stamped,
+                c.census_busy_ns - b.census_busy_ns,
+            );
+            assert!(
+                dw >= 1 && dr >= 1024 && dbusy > 0,
+                "{what}: a window closed through the ticks: {c:?}"
+            );
+            windows.push((dr, ds, dbusy));
+        }
+        let (reads_n, stamped, busy) = windows
+            .iter()
+            .fold((0, 0, 0), |a, w| (a.0 + w.0, a.1 + w.1, a.2 + w.2));
+        if on {
+            for &(dr, ds, _) in &windows {
+                assert!(
+                    ds >= 1 && ds * 8 <= dr,
+                    "{what}: one read in sixteen stamped: {ds} of {dr}; {windows:?}"
+                );
+            }
+        } else {
+            assert_eq!(stamped, reads_n, "{what}: every read stamped: {windows:?}");
+        }
+        per_read[i] = busy as f64 / reads_n as f64;
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    let ratio = per_read[0] / per_read[1];
+    assert!(
+        (0.25..=4.0).contains(&ratio),
+        "the scaled busy wall a read against every read stamped: {:.0} ns against {:.0} ns",
+        per_read[0],
+        per_read[1]
+    );
+}
+
+/// A scan over a covered partition's blocks that no walk of the handle's
+/// has built is one dispatch into the form file with the clean run
+/// building the blocks it reaches (`Options::scan_run_builds`), and a
+/// dispatch a block without. A partition with no unsealed key over it
+/// takes the bulk walk, one dispatch either way, so a few of the lowest
+/// keys are written first, far below the scan, as the write mixes leave
+/// a few in every cold partition; a fresh handle, whose table holds no
+/// form, then scans four blocks and a bit from a key in the middle, and
+/// the form's scan count moves by one with the option and by at least
+/// four without. The handle builds its own table here (`commit_forms`
+/// off), since a canonical table complete at the handle's commit reads
+/// every null form as clean already.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_scan_over_unvisited_clean_blocks_is_one_dispatch_into_the_form() {
+    for on in [true, false] {
+        let what = format!("run builds {on}");
+        let (dir, mut db, model, _inject, r, keys, _at) =
+            compact_store_with(&format!("run-builds-{on}"), 1 << 20, |o| {
+                o.scan_run_builds = on;
+                o.commit_forms = false;
+                // A cursor a block (`Options::zpages_scan_cursor` off), so
+                // the dispatches count the runs; held across the scan, one
+                // placement is the count whatever the run does.
+                o.zpages_scan_cursor = false;
+            });
+        drop(r);
+        for k in &keys[..3] {
+            db.append(k, &model[k][0]);
+        }
+        db.commit().unwrap();
+        let r = db.reader().unwrap();
+        let want = 4 * 64 + 10;
+        let start = keys.len() / 2;
+        assert!(
+            start + want < keys.len(),
+            "{what}: keys enough: {}",
+            keys.len()
+        );
+        let before = db.zpage_counts();
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        let n = r
+            .scan(&keys[start], want, |k, _v| got.push(k.to_vec()))
+            .unwrap();
+        let c = db.zpage_counts();
+        assert_eq!(n, want, "{what}: the scan's entries");
+        assert_eq!(
+            got,
+            keys[start..start + want].to_vec(),
+            "{what}: the keys in order"
+        );
+        let dispatches = c.scans - before.scans;
+        if on {
+            assert_eq!(dispatches, 1, "{what}: one dispatch for the run: {c:?}");
+        } else {
+            assert!(dispatches >= 4, "{what}: a dispatch a block: {dispatches}");
+        }
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A scan's blocks over a covered partition read through one cursor
+/// (`Options::zpages_scan_cursor`): a scan of four blocks and a bit whose
+/// second block holds an unsealed key, through a fresh handle, places the
+/// cursor at most twice -- the form's scan count moves by that -- once for
+/// the walk and once more where the sparse block's build moved it to the
+/// key's cut, past the walk's start; and four times without the option:
+/// the clean run before the sparse block, the block's build, the block's
+/// walk, and the clean run after it. The entries come back as the
+/// model has them either way, the unsealed key's new value after its
+/// loaded one, one entry more than the keys the limit counts. A few of the lowest keys are written first so the partition
+/// does not take the bulk walk, and the handle builds its own table
+/// (`commit_forms` off), as the clean run's test does.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_scans_blocks_over_a_covered_partition_read_through_one_cursor() {
+    for on in [true, false] {
+        let what = format!("scan cursor {on}");
+        let (dir, mut db, mut model, _inject, r, keys, _at) =
+            compact_store_with(&format!("scan-cursor-{on}"), 1 << 20, |o| {
+                o.zpages_scan_cursor = on;
+                o.commit_forms = false;
+            });
+        drop(r);
+        for k in &keys[..3] {
+            db.append(k, &model[k][0]);
+        }
+        let want = 4 * 64 + 10;
+        let start = keys.len() / 2;
+        assert!(
+            start + want < keys.len(),
+            "{what}: keys enough: {}",
+            keys.len()
+        );
+        // A key in the scan's second block, with a value of its own.
+        let inner = &keys[start + 70];
+        db.append(inner, b"a second value");
+        model
+            .get_mut(inner)
+            .unwrap()
+            .push(b"a second value".to_vec());
+        db.commit().unwrap();
+        let r = db.reader().unwrap();
+        // The limit counts keys visited, so the key with two values makes
+        // the entries one more than the keys.
+        let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
+            .iter()
+            .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
+            .collect();
+        let before = db.zpage_counts();
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let n = r
+            .scan(&keys[start], want, |k, v| {
+                got.push((k.to_vec(), v.to_vec()))
+            })
+            .unwrap();
+        let c = db.zpage_counts();
+        assert_eq!(n, want, "{what}: the scan's entries");
+        if got != expect {
+            let at = got
+                .iter()
+                .zip(&expect)
+                .position(|(a, b)| a != b)
+                .unwrap_or(got.len().min(expect.len()));
+            let show = |w: &[(Vec<u8>, Vec<u8>)]| match w.get(at) {
+                Some((k, v)) => format!("{:?} ({} bytes)", String::from_utf8_lossy(k), v.len()),
+                None => "the end".to_string(),
+            };
+            panic!(
+                "{what}: {} entries, wanted {}; they part at entry {at}, got {}, wanted {}",
+                got.len(),
+                expect.len(),
+                show(&got),
+                show(&expect)
+            );
+        }
+        let placed = c.scans - before.scans;
+        if on {
+            assert!(
+                (1..=2).contains(&placed),
+                "{what}: the scan's cursor, placed again after the build: {placed}"
+            );
+        } else {
+            assert!(placed >= 4, "{what}: a cursor a run and a build: {placed}");
+        }
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
