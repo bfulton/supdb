@@ -369,6 +369,11 @@ fn coded_record_to<F: FnMut(&[u8], &[u8])>(
 /// The cursor holds the thread's group buffer for its life; a read of a
 /// covered partition made inside the walk makes a buffer of its own, as a
 /// callback's nested read does.
+/// The bytes of the next entry's page a cursor asks for at the last group
+/// of a page (`Options::zpages_group_ahead`): the header, the directory and
+/// the start of the first group, sixteen lines.
+const ZGROUP_AHEAD: usize = 1024;
+
 pub(super) struct ZCursor<'a> {
     memo: &'a ZMemo,
     zfile: &'a ZFile,
@@ -395,13 +400,19 @@ pub(super) struct ZCursor<'a> {
     /// The key at the position of a raw-tail coded group, assembled
     /// (`Group::Coded`).
     keybuf: Vec<u8>,
+    /// The view of page `pview_page`, held across the page's groups under
+    /// `ZFile::cursor_view`; the open's own otherwise.
+    pview: Option<PageView<'a>>,
+    pview_page: usize,
     /// Groups decoded, groups read in place without a decode, runs of
     /// records no page holds met and prefetch asks made, for the handle's
-    /// counters.
+    /// counters; the page views built and the groups asked for ahead.
     pub(super) decoded: u64,
     pub(super) inplace: u64,
     pub(super) nopage: u64,
     pub(super) prefetches: u64,
+    pub(super) views: u64,
+    pub(super) aheads: u64,
     /// Whether the bulk walk has asked for the pages ahead of it
     /// (`walk_until`): once a cursor, as `scan_at` asks once a walk.
     asked: bool,
@@ -433,10 +444,14 @@ impl<'a> ZCursor<'a> {
             group: Group::None,
             buf: take_buf(),
             keybuf: Vec::new(),
+            pview: None,
+            pview_page: usize::MAX,
             decoded: 0,
             inplace: 0,
             nopage: 0,
             prefetches: 0,
+            views: 0,
+            aheads: 0,
             asked: false,
             fell: false,
             last: Vec::new(),
@@ -586,22 +601,60 @@ impl<'a> ZCursor<'a> {
         self.gidx = j;
         // Where the group lies once opened: a stored group that is aligned
         // is parsed where it lies in the mapping, anything else is decoded
-        // into the buffer, whose borrow by the open ends with the open.
-        let view = self
-            .zfile
-            .page_bytes(self.page)
-            .and_then(|page| self.zfile.view(self.page, page).ok());
-        let Some((opened, gfirst, count, decoded)) = self.zfile.open_group(
-            self.memo,
-            entry,
-            j,
-            &mut self.buf,
-            view.as_ref(),
-            self.zfile.inplace,
-        ) else {
+        // into the buffer, whose borrow by the open ends with the open. The
+        // page's view, where the open needs one: under `ZFile::cursor_view`
+        // held across the page's groups, built once a page and not once an
+        // open, and not at all for a group the memo holds, which is asked
+        // first; else this open's own, built before the memo is asked, the
+        // shape before.
+        let opened = if self.zfile.cursor_view {
+            if self.pview_page != self.page {
+                self.pview = None;
+            }
+            self.pview_page = self.page;
+            match self.zfile.memo_first_hit(self.memo, entry, j) {
+                Err(()) => None,
+                Ok(Some(hit)) => Some(hit),
+                Ok(None) => {
+                    if self.pview.is_none() {
+                        self.pview = self
+                            .zfile
+                            .page_bytes(self.page)
+                            .and_then(|page| self.zfile.view(self.page, page).ok());
+                        self.views += 1;
+                    }
+                    self.zfile.open_group_with(
+                        self.memo,
+                        entry,
+                        j,
+                        &mut self.buf,
+                        self.pview.as_ref(),
+                        self.zfile.inplace,
+                        true,
+                    )
+                }
+            }
+        } else {
+            self.pview = self
+                .zfile
+                .page_bytes(self.page)
+                .and_then(|page| self.zfile.view(self.page, page).ok());
+            self.pview_page = self.page;
+            self.views += 1;
+            self.zfile.open_group(
+                self.memo,
+                entry,
+                j,
+                &mut self.buf,
+                self.pview.as_ref(),
+                self.zfile.inplace,
+            )
+        };
+        let Some((opened, gfirst, count, decoded)) = opened else {
             self.fall();
             return false;
         };
+        let view = self.pview.as_ref();
         self.gstart = first.saturating_add(gfirst).min(self.zfile.nkeys);
         self.end = self.gstart.saturating_add(count).min(self.page_end);
         if decoded {
@@ -611,10 +664,11 @@ impl<'a> ZCursor<'a> {
         // buffer's or the page's, and its borrow ends here.
         // A coded group read in place is the page's payload, taken from
         // the view, whose borrow is the mapping's and not the buffer's.
+        let mut inplace = 0u64;
         let placed = match opened {
             Opened::Memo(g, n) => Some(Group::Memo(g, n)),
-            Opened::Coded(_) => view.as_ref().and_then(|v| v.payload(j)).map(|payload| {
-                self.inplace += 1;
+            Opened::Coded(_) => view.and_then(|v| v.payload(j)).map(|payload| {
+                inplace += 1;
                 Group::Coded(payload, count)
             }),
             Opened::Borrowed(_) => match view {
@@ -626,13 +680,83 @@ impl<'a> ZCursor<'a> {
                 None => None,
             },
         };
+        self.inplace += inplace;
         let Some(group) = placed else {
             self.zfile.fail(self.page);
             self.fall();
             return false;
         };
         self.group = group;
+        if self.zfile.group_ahead {
+            self.ask_group_ahead(j);
+        }
         true
+    }
+
+    /// The lines of the group the walk reaches after group `j` asked for
+    /// while this one is walked (`ZFile::group_ahead`): the next group of
+    /// the page by the directory, else the first `ZGROUP_AHEAD` bytes of the
+    /// next entry's page -- its header, its directory and the start of its
+    /// first group. A group's walk is lead enough to bring them.
+    fn ask_group_ahead(&mut self, j: usize) {
+        // A group the memo held opened with no view, and the next group's
+        // lines are named by the directory: the view is built here, the
+        // page's header line warm or not, and held for the groups after;
+        // without it the ask fell to the next page's lines while the walk
+        // had groups of this page left.
+        if self.pview.is_none() {
+            self.pview = self
+                .zfile
+                .page_bytes(self.page)
+                .and_then(|page| self.zfile.view(self.page, page).ok());
+            self.pview_page = self.page;
+            self.views += 1;
+        }
+        let lines = match self.pview.as_ref().and_then(|v| v.payload(j + 1)) {
+            Some(payload) => Some((payload.as_ptr(), payload.len())),
+            None => self
+                .zfile
+                .fence
+                .page(self.eidx + 1)
+                .filter(|&p| p != ZNOPAGE)
+                .and_then(|p| self.zfile.page_bytes(p as usize))
+                .map(|page| (page.as_ptr(), ZGROUP_AHEAD.min(page.len()))),
+        };
+        if let Some((ptr, len)) = lines {
+            super::prefetch_lines(ptr, len.min(ZPAGE));
+            self.aheads += 1;
+        }
+    }
+
+    /// The group of page `p` that holds the page's record `i`, by the
+    /// directory: through the held view under `ZFile::cursor_view`, built
+    /// here where the page is new to the cursor so that the open after
+    /// reads the same one; else by a view of the file's own, the shape
+    /// before. `None` where the page does not parse, the page out of
+    /// service.
+    fn group_index(&mut self, p: usize, i: usize) -> Option<usize> {
+        if !self.zfile.cursor_view {
+            return self.zfile.group_of_index(p, i);
+        }
+        if self.pview_page != p {
+            self.pview = None;
+        }
+        self.pview_page = p;
+        if self.pview.is_none() {
+            self.pview = self
+                .zfile
+                .page_bytes(p)
+                .filter(|_| p < self.zfile.n_pages)
+                .and_then(|page| self.zfile.view(p, page).ok());
+            self.views += 1;
+        }
+        match self.pview.as_ref() {
+            Some(v) => Some(v.group_of_index(i)),
+            None => {
+                self.zfile.fail(p);
+                None
+            }
+        }
     }
 
     /// The position at the end of a group: the next group of the same
@@ -702,7 +826,7 @@ impl<'a> ZCursor<'a> {
             0
         } else {
             let i = self.rank - entry.first_rank as usize;
-            match self.zfile.group_of_index(entry.page as usize, i) {
+            match self.group_index(entry.page as usize, i) {
                 Some(j) => j,
                 None => {
                     self.fall();
@@ -1972,6 +2096,12 @@ pub(super) struct ZFile {
     /// cursor (`Options::zpages_inplace_walk`; `Group::Coded`), instead of
     /// decoded whole into the buffer.
     pub(super) inplace: bool,
+    /// Whether the cursor holds a page's view across its groups and asks
+    /// the memo before any view (`Options::zpages_cursor_view`), and
+    /// whether it asks for the next group's lines at an open
+    /// (`Options::zpages_group_ahead`, `ZCursor::ask_group_ahead`).
+    pub(super) cursor_view: bool,
+    pub(super) group_ahead: bool,
     /// Whether a decode asks for the line of the memo entry its put will
     /// displace before it begins (`Options::zpages_memo_ahead`,
     /// `ZFile::open_group`).
@@ -2119,6 +2249,8 @@ impl ZFile {
             trusted,
             memo_first,
             inplace: true,
+            cursor_view: false,
+            group_ahead: false,
             memo_ahead,
             prefetch,
             #[cfg(test)]
@@ -2213,18 +2345,76 @@ impl ZFile {
         view: Option<&PageView<'a>>,
         inplace: bool,
     ) -> Option<(Opened<'a>, usize, usize, bool)> {
+        self.open_group_with(memo, entry, j, buf, view, inplace, false)
+    }
+
+    /// The memo's group for group `j` of `entry`'s page, asked before any
+    /// view is built where the page is one this process has verified
+    /// (`Options::zpages_memo_first`), the page touched as an open touches
+    /// it: `Ok(Some)` on a hit, `Ok(None)` where the memo does not hold it
+    /// or is not asked first, and the caller opens through
+    /// `open_group_with` with `after_memo`; `Err` where the page or the
+    /// group is none the file has, the page failed. For the cursor under
+    /// `Options::zpages_cursor_view`, whose view is held and built only for
+    /// an open that reads the page.
+    fn memo_first_hit<'a>(
+        &'a self,
+        memo: &ZMemo,
+        entry: &FenceEntry<'_>,
+        j: usize,
+    ) -> std::result::Result<Option<(Opened<'a>, usize, usize, bool)>, ()> {
+        let p = entry.page as usize;
+        if self.page_bytes(p).filter(|_| p < self.n_pages).is_none() {
+            self.fail(p);
+            return Err(());
+        }
+        memo.touch(self.id, entry.page, self.n_pages);
+        let Ok(index) = u8::try_from(j) else {
+            self.fail(p);
+            return Err(());
+        };
+        if self.memo_first && self.memo && bit(&self.verified, p) {
+            if let Some((g, n, first, count)) =
+                memo.get(self.id, entry.page, index, self.memo_hashed)
+            {
+                return Ok(Some((
+                    Opened::Memo(g, n),
+                    usize::from(first),
+                    usize::from(count),
+                    false,
+                )));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `open_group`; with `after_memo`, for a caller that asked the memo
+    /// first itself (`memo_first_hit`) and touched the page, neither again.
+    #[allow(clippy::too_many_arguments)]
+    fn open_group_with<'a>(
+        &'a self,
+        memo: &ZMemo,
+        entry: &FenceEntry<'_>,
+        j: usize,
+        buf: &'a mut GroupBuf,
+        view: Option<&PageView<'a>>,
+        inplace: bool,
+        after_memo: bool,
+    ) -> Option<(Opened<'a>, usize, usize, bool)> {
         let p = entry.page as usize;
         let Some(page) = self.page_bytes(p).filter(|_| p < self.n_pages) else {
             self.fail(p);
             return None;
         };
-        memo.touch(self.id, entry.page, self.n_pages);
+        if !after_memo {
+            memo.touch(self.id, entry.page, self.n_pages);
+        }
         let Ok(index) = u8::try_from(j) else {
             self.fail(p);
             return None;
         };
         let was_verified = bit(&self.verified, p);
-        if self.memo_first && self.memo && was_verified {
+        if !after_memo && self.memo_first && self.memo && was_verified {
             if let Some((g, n, first, count)) =
                 memo.get(self.id, entry.page, index, self.memo_hashed)
             {
@@ -4638,6 +4828,10 @@ pub struct ZInject {
     /// `mincore`'s (`Options::zpages_land_pct`); `u64::MAX` for the
     /// kernel's. A test's files are small and fresh, and resident.
     pub records_resident: AtomicU64,
+    /// The group's unused memory less the margin, as `Budget::slack` reads
+    /// it, for the hot-raw policy's room (`Options::zpages_hot_raw_slack`);
+    /// `u64::MAX` for none, which leaves the policy its fill line.
+    pub slack: AtomicU64,
 }
 
 impl Default for ZInject {
@@ -4650,6 +4844,7 @@ impl Default for ZInject {
             fault_cost_ns: AtomicU64::new(0),
             decode_cost_ns: AtomicU64::new(0),
             records_resident: AtomicU64::new(u64::MAX),
+            slack: AtomicU64::new(u64::MAX),
         }
     }
 }
@@ -4662,6 +4857,17 @@ impl ZInject {
     /// The budget the tick reads, in place of the platform's.
     pub fn set_budget(&self, bytes: u64) {
         self.budget.store(bytes, Ordering::Release);
+    }
+
+    pub fn set_slack(&self, bytes: u64) {
+        self.slack.store(bytes, Ordering::Release);
+    }
+
+    pub fn slack(&self) -> Option<u64> {
+        match self.slack.load(Ordering::Acquire) {
+            u64::MAX => None,
+            b => Some(b),
+        }
     }
 
     /// The refault rate the tick reads, in place of the platform's.
@@ -5154,6 +5360,7 @@ fn budget_from(read: &dyn Fn(&Path) -> Option<String>) -> Option<Budget> {
                     .min(total);
                 return Some(
                     Budget::of(limit, st.rss.saturating_add(st.rss_huge), st.refaults)
+                        .with_cache(st.cache)
                         .within_available(available),
                 );
             }
@@ -5180,7 +5387,11 @@ fn budget_from(read: &dyn Fn(&Path) -> Option<String>) -> Option<Budget> {
                         _ => break,
                     }
                 }
-                return Some(Budget::of(limit, st.anon, st.refaults).within_available(available));
+                return Some(
+                    Budget::of(limit, st.anon, st.refaults)
+                        .with_cache(st.file)
+                        .within_available(available),
+                );
             }
         }
     }

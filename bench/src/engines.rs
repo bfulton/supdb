@@ -941,6 +941,23 @@ pub struct Supdb {
     /// before the stamps of one operation in sixteen
     /// (`Options::zpages_census_sample` off): `supdb-zbusyevery`.
     zbusyevery: bool,
+    /// The hot-raw policy's release asked where the form files and the raw
+    /// partitions would stay within the fill line of the budget, the shape
+    /// before the ask into the group's unused memory
+    /// (`Options::zpages_hot_raw_slack` off): `supdb-zhotline`.
+    zhotline: bool,
+    /// The hot-raw policy's ask for a partition's raw pages under the idle
+    /// I/O class, held for the call (`Options::zpages_hot_ask_idle` on):
+    /// `supdb-zhotaskidle`.
+    zhotaskidle: bool,
+    /// The block path's cursor building a page view at every group open,
+    /// the shape before the view held across the page's groups
+    /// (`Options::zpages_cursor_view` off): `supdb-zviewperopen`.
+    zviewperopen: bool,
+    /// The cursor asking for no lines ahead of a group's walk, the shape
+    /// before the next group's were asked for at the open
+    /// (`Options::zpages_group_ahead` off): `supdb-znogroupahead`.
+    znogroupahead: bool,
     /// The block walk's clean run stopping at a block no walk has built,
     /// the shape before the run built the blocks it reaches
     /// (`Options::scan_run_builds` off): `supdb-norunbuilds`.
@@ -950,6 +967,9 @@ pub struct Supdb {
     /// a covered partition read through one cursor
     /// (`Options::zpages_scan_cursor` off): `supdb-blockcursors`.
     blockcursors: bool,
+    /// A copy prefetched from the entry its walk starts at and not whole
+    /// (`Options::copy_prefetch_from_start`): `supdb-leancopyprefetch`.
+    leancopyprefetch: bool,
     /// The fill yielding its conversions at any posted commit
     /// (`Options::forms_convert_behind` zero), the shape before it
     /// converted in the thread's slack. `supdb-postedyield`, and
@@ -1822,10 +1842,20 @@ struct Policy {
     /// Every operation's wall stamped onto the census window:
     /// `supdb-zbusyevery`.
     zbusyevery: bool,
+    /// The release's room by the fill line: `supdb-zhotline`.
+    zhotline: bool,
+    /// The ask under the idle I/O class: `supdb-zhotaskidle`.
+    zhotaskidle: bool,
+    /// A page view an open: `supdb-zviewperopen`.
+    zviewperopen: bool,
+    /// No group's lines asked ahead: `supdb-znogroupahead`.
+    znogroupahead: bool,
     /// The clean run stopping at an unbuilt block: `supdb-norunbuilds`.
     norunbuilds: bool,
     /// A cursor a block: `supdb-blockcursors`.
     blockcursors: bool,
+    /// A copy prefetched from its start entry: `supdb-leancopyprefetch`.
+    leancopyprefetch: bool,
     /// The fill yielding at any posted commit: `supdb-postedyield`, and
     /// `supdb-ingestpostedyield` buffered.
     postedyield: bool,
@@ -2158,8 +2188,13 @@ impl Default for Policy {
             zsamplefills: false,
             znohotraw: false,
             zbusyevery: false,
+            zhotline: false,
+            zhotaskidle: false,
+            zviewperopen: false,
+            znogroupahead: false,
             norunbuilds: false,
             blockcursors: false,
+            leancopyprefetch: false,
             postedyield: false,
             behindyield: false,
             bg: false,
@@ -2636,6 +2671,59 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose hot-raw policy asks for a release where the form files
+    /// and the raw partitions together would stay within the fill line of
+    /// the budget (`Options::zpages_hot_raw_slack` off): the shape before
+    /// the ask into the group's unused memory.
+    pub fn create_zhotline(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zhotline: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose hot-raw policy asks for a partition's raw pages under
+    /// the idle I/O class, the segment work's thread lowered for the call
+    /// (`Options::zpages_hot_ask_idle` on).
+    pub fn create_zhotaskidle(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zhotaskidle: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose block-path cursor builds a page view at every group
+    /// open (`Options::zpages_cursor_view` off): the shape before the view
+    /// held across the page's groups.
+    pub fn create_zviewperopen(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zviewperopen: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose cursor asks for no lines ahead of a group's walk
+    /// (`Options::zpages_group_ahead` off): the shape before the next
+    /// group's lines were asked for at the open.
+    pub fn create_znogroupahead(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                znogroupahead: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` whose block walk's clean run stops at a block no walk of
     /// the handle's has built (`Options::scan_run_builds` off): the shape
     /// before the run built the blocks it reaches and took the clean ones.
@@ -2658,6 +2746,19 @@ impl Supdb {
             path,
             Policy {
                 blockcursors: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose identity copies are prefetched from the entry the
+    /// walk starts at, eight lines, and not whole
+    /// (`Options::copy_prefetch_from_start`).
+    pub fn create_leancopyprefetch(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                leancopyprefetch: true,
                 ..Policy::default()
             },
         )
@@ -6932,8 +7033,13 @@ impl Supdb {
             zsamplefills,
             znohotraw,
             zbusyevery,
+            zhotline,
+            zhotaskidle,
+            zviewperopen,
+            znogroupahead,
             norunbuilds,
             blockcursors,
+            leancopyprefetch,
             postedyield,
             behindyield,
             bg,
@@ -7366,8 +7472,13 @@ impl Supdb {
             zpages_reading_from_files: !zsamplefills,
             zpages_hot_raw: !znohotraw,
             zpages_census_sample: !zbusyevery,
+            zpages_hot_raw_slack: !zhotline,
+            zpages_hot_ask_idle: zhotaskidle,
+            zpages_cursor_view: !zviewperopen,
+            zpages_group_ahead: !znogroupahead,
             scan_run_builds: !norunbuilds,
             zpages_scan_cursor: !blockcursors,
+            copy_prefetch_from_start: leancopyprefetch,
             zpages_memo_ahead: !zmemonoahead,
             scan_start_cache: if zstartcache { 4096 } else { 0 },
             zpages_block_cursor: !zperrun,
@@ -7580,8 +7691,13 @@ impl Supdb {
             zsamplefills,
             znohotraw,
             zbusyevery,
+            zhotline,
+            zhotaskidle,
+            zviewperopen,
+            znogroupahead,
             norunbuilds,
             blockcursors,
+            leancopyprefetch,
             postedyield,
             behindyield,
             bg,
@@ -7934,11 +8050,26 @@ impl Engine for Supdb {
         if self.zbusyevery {
             return "supdb-zbusyevery";
         }
+        if self.zhotline {
+            return "supdb-zhotline";
+        }
+        if self.zhotaskidle {
+            return "supdb-zhotaskidle";
+        }
+        if self.zviewperopen {
+            return "supdb-zviewperopen";
+        }
+        if self.znogroupahead {
+            return "supdb-znogroupahead";
+        }
         if self.norunbuilds {
             return "supdb-norunbuilds";
         }
         if self.blockcursors {
             return "supdb-blockcursors";
+        }
+        if self.leancopyprefetch {
+            return "supdb-leancopyprefetch";
         }
         if self.postedyield {
             return if self.partition {
@@ -8997,6 +9128,8 @@ impl Engine for Supdb {
             ("zpage_memo_hits", z.memo_hits as f64),
             ("zpage_memo_misses", z.memo_misses as f64),
             ("zpage_prefetches", z.prefetches as f64),
+            ("zpage_scan_views", z.scan_views as f64),
+            ("zpage_group_aheads", z.group_aheads as f64),
             ("zpage_declined_small", z.declined_small as f64),
             ("zpage_declined_small_bytes", z.declined_small_bytes as f64),
             (
@@ -9976,8 +10109,13 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zsamplefills"
         | "supdb-znohotraw"
         | "supdb-zbusyevery"
+        | "supdb-zhotline"
+        | "supdb-zhotaskidle"
+        | "supdb-zviewperopen"
+        | "supdb-znogroupahead"
         | "supdb-norunbuilds"
         | "supdb-blockcursors"
+        | "supdb-leancopyprefetch"
         | "supdb-postedyield"
         | "supdb-behindyield"
         | "supdb-bg"
@@ -10394,8 +10532,13 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zsamplefills" => supdb_arm(Supdb::create_zsamplefills, dir)?,
         "supdb-znohotraw" => supdb_arm(Supdb::create_znohotraw, dir)?,
         "supdb-zbusyevery" => supdb_arm(Supdb::create_zbusyevery, dir)?,
+        "supdb-zhotline" => supdb_arm(Supdb::create_zhotline, dir)?,
+        "supdb-zhotaskidle" => supdb_arm(Supdb::create_zhotaskidle, dir)?,
+        "supdb-zviewperopen" => supdb_arm(Supdb::create_zviewperopen, dir)?,
+        "supdb-znogroupahead" => supdb_arm(Supdb::create_znogroupahead, dir)?,
         "supdb-norunbuilds" => supdb_arm(Supdb::create_norunbuilds, dir)?,
         "supdb-blockcursors" => supdb_arm(Supdb::create_blockcursors, dir)?,
+        "supdb-leancopyprefetch" => supdb_arm(Supdb::create_leancopyprefetch, dir)?,
         "supdb-postedyield" => supdb_arm(Supdb::create_postedyield, dir)?,
         "supdb-behindyield" => supdb_arm(Supdb::create_behindyield, dir)?,
         "supdb-bg" => supdb_arm(Supdb::create_bg, dir)?,
@@ -12213,6 +12356,13 @@ mod tests {
                 );
             }
             {
+                let z = Supdb::create_leancopyprefetch(&dir("leancopyprefetch")).unwrap();
+                assert_eq!(z.name(), "supdb-leancopyprefetch");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.copy_prefetch_from_start && !b.copy_prefetch_from_start);
+            }
+            {
                 let z = Supdb::create_blockcursors(&dir("blockcursors")).unwrap();
                 assert_eq!(z.name(), "supdb-blockcursors");
                 assert_eq!(z.features(), base.features());
@@ -12232,6 +12382,34 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.zpages_census_sample && b.zpages_census_sample);
+            }
+            {
+                let z = Supdb::create_zhotline(&dir("zhotline")).unwrap();
+                assert_eq!(z.name(), "supdb-zhotline");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.zpages_hot_raw_slack && b.zpages_hot_raw_slack);
+            }
+            {
+                let z = Supdb::create_zhotaskidle(&dir("zhotaskidle")).unwrap();
+                assert_eq!(z.name(), "supdb-zhotaskidle");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_hot_ask_idle && !b.zpages_hot_ask_idle);
+            }
+            {
+                let z = Supdb::create_zviewperopen(&dir("zviewperopen")).unwrap();
+                assert_eq!(z.name(), "supdb-zviewperopen");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.zpages_cursor_view && b.zpages_cursor_view);
+            }
+            {
+                let z = Supdb::create_znogroupahead(&dir("znogroupahead")).unwrap();
+                assert_eq!(z.name(), "supdb-znogroupahead");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.zpages_group_ahead && b.zpages_group_ahead);
             }
             {
                 let z = Supdb::create_znohotraw(&dir("znohotraw")).unwrap();

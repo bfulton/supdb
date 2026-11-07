@@ -9837,6 +9837,263 @@ fn the_controller_serves_the_hottest_partition_raw_within_the_budget() {
     }
 }
 
+/// Under the controller with the hot-raw policy and the skew read over the
+/// window's looks (`Options::zpages_hot_raw_slack`), a partition read under
+/// the sample floor at every look but steadily across the window's looks is
+/// rated on their sum and released; without the option each look's own
+/// count is under the floor, and the same reads release nothing. Every read
+/// answers as the raw form does across the move.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_hot_raw_policy_rates_a_partitions_skew_over_the_windows_looks() {
+    for on in [true, false] {
+        let what = format!("hot raw window {on}");
+        let (dir, db, model, inject) = auto_store_with(
+            &format!("auto-hotwindow-{on}"),
+            1 << 20,
+            1_000_000.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_hot_raw = true;
+                o.zpages_hot_raw_slack = on;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        inject.set_decode_cost(std::time::Duration::from_micros(10));
+        let c = db.zpage_counts();
+        assert!(
+            c.form_files >= 5,
+            "{what}: partitions to choose from: {c:?}"
+        );
+        let (partitions, total) = (c.partitions, c.file_bytes);
+        // Room by every measure: the budget four times the files, the
+        // group's unused memory as much.
+        inject.set_budget(total * 4);
+        inject.set_slack(total * 4);
+        let hot = keys_of_partition(&db, &model, 2);
+        // Reads a look of half the floor's events, one decode a read with
+        // the memo off and one event in sixteen sampled: under the floor
+        // alone, over it summed across two looks and more.
+        let per_look = usize::try_from(supdb::db::HOT_RAW_MIN_SAMPLES).unwrap() * 16 / 2;
+        for _ in 0..supdb::db::HOT_RAW_WINDOW {
+            heat_up(&db, &hot, per_look);
+            hot_look(&db, std::time::Duration::from_millis(200));
+        }
+        let c = db.zpage_counts();
+        if on {
+            assert!(
+                c.hot_asks >= 1,
+                "{what}: the thin looks summed past the floor: {c:?}"
+            );
+            assert!(
+                hot_until(&db, 10, |c| c.hot_raw >= 1),
+                "{what}: the partition released: {:?}",
+                db.zpage_counts()
+            );
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_raw, c.hot_raw_now, c.form_files),
+                (1, 1, partitions - 1),
+                "{what}: released on the window's count: {c:?}"
+            );
+            let before = db.zpage_counts();
+            check(&r, &model, &hot, &format!("{what}: released, raw"));
+            let after = db.zpage_counts();
+            assert!(
+                after.rawserves > before.rawserves,
+                "{what}: the released partition read raw: {before:?} {after:?}"
+            );
+        } else {
+            assert_eq!(
+                (c.hot_asks, c.hot_raw, c.hot_raw_now, c.form_files),
+                (0, 0, 0, partitions),
+                "{what}: every look under the floor on its own: {c:?}"
+            );
+        }
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Under the controller with the hot-raw policy and the release's room read
+/// from the group's unused memory (`Options::zpages_hot_raw_slack`), the
+/// hottest partition is released where its raw bytes fit in that room,
+/// though the form files and the raw partitions together would stand past
+/// the policy's line of the budget, and not where the room is short of them;
+/// the fill share the way back is taken at still bounds a release, so a
+/// second that would cross it is not asked for, and the way back is as it
+/// was. Without the option the same room releases nothing past the line.
+/// Every read and scan answers as the raw form does across each move.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_hot_raw_policy_releases_into_the_groups_unused_memory_where_the_line_would_not() {
+    for on in [true, false] {
+        let what = format!("hot raw slack {on}");
+        let (dir, db, model, inject) = auto_store_with(
+            &format!("auto-hotslack-{on}"),
+            1 << 20,
+            1_000_000.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_hot_raw = true;
+                o.zpages_hot_raw_slack = on;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        inject.set_decode_cost(std::time::Duration::from_micros(10));
+        let c = db.zpage_counts();
+        assert!(
+            c.form_files >= 5,
+            "{what}: partitions to choose from: {c:?}"
+        );
+        assert_eq!(
+            c.form_files, c.partitions,
+            "{what}: every partition served: {c:?}"
+        );
+        let (partitions, total) = (c.partitions, c.file_bytes);
+        let file_one = total / partitions;
+        let raw_one = (c.model_record_bytes + c.model_hash_bytes) / partitions;
+        assert!(
+            raw_one > file_one,
+            "{what}: the raw form over the file: {c:?}"
+        );
+        let d = raw_one - file_one;
+        // A budget whose fill share holds the files and a release and a
+        // half, and whose line does not hold one release: the release
+        // crosses the line and stays under the fill.
+        let budget = (total + d * 3 / 2) * 100 / 85;
+        assert!(
+            total + d > budget * 75 / 100,
+            "{what}: one release crosses the line: total {total} d {d} budget {budget}"
+        );
+        inject.set_budget(budget);
+        let growth = (budget as f64 * supdb::db::HOT_RAW_GROWTH) as u64;
+        let hot = keys_of_partition(&db, &model, 2);
+        let heat = |db: &Db| heat_up(db, &hot, 100_000);
+        // The room short of a partition's raw bytes: nothing asked, under
+        // the line as under the room.
+        inject.set_slack(raw_one / 2 + growth);
+        for _ in 0..3 {
+            heat(&db);
+            hot_look(&db, std::time::Duration::from_millis(200));
+        }
+        let c = db.zpage_counts();
+        assert_eq!(
+            (c.hot_asks, c.hot_raw, c.hot_raw_now),
+            (0, 0, 0),
+            "{what}: short of room: {c:?}"
+        );
+        // Room for a partition's raw bytes and half another's.
+        inject.set_slack(raw_one * 3 / 2 + growth);
+        heat(&db);
+        hot_look(&db, std::time::Duration::from_millis(200));
+        if on {
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_asks, c.hot_raw, c.form_files),
+                (1, 0, partitions),
+                "{what}: asked into the room, still served: {c:?}"
+            );
+            assert!(
+                hot_until(&db, 10, |c| c.hot_raw >= 1),
+                "{what}: the hot partition released: {:?}",
+                db.zpage_counts()
+            );
+            let c = db.zpage_counts();
+            assert_eq!(
+                (
+                    c.hot_asks,
+                    c.hot_dropped,
+                    c.hot_raw,
+                    c.hot_raw_now,
+                    c.form_files
+                ),
+                (1, 0, 1, 1, partitions - 1),
+                "{what}: the hot partition released past the line: {c:?}"
+            );
+            let before = db.zpage_counts();
+            check(&r, &model, &hot, &format!("{what}: released, raw"));
+            let after = db.zpage_counts();
+            assert!(
+                after.rawserves > before.rawserves,
+                "{what}: the released partition read raw: {before:?} {after:?}"
+            );
+            check_scan(&r, &model, &format!("{what}: scans across a raw partition"));
+            // The room holds another partition's raw bytes, and a second
+            // release would cross the fill share: nothing more moves.
+            heat(&db);
+            hot_look(&db, std::time::Duration::from_millis(200));
+            hot_look(&db, std::time::Duration::from_millis(200));
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_asks, c.hot_raw, c.hot_back, c.hot_raw_now),
+                (1, 1, 0, 1),
+                "{what}: one released and nothing more: {c:?}"
+            );
+            // The budget under the files and the raw partition past the
+            // fill share: the way back as before.
+            inject.set_budget(total);
+            hot_look(&db, std::time::Duration::from_millis(200));
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_back, c.hot_raw_now, c.form_files),
+                (1, 0, partitions),
+                "{what}: the way back: {c:?}"
+            );
+            check(&r, &model, &hot, &format!("{what}: served again"));
+        } else {
+            for _ in 0..3 {
+                heat(&db);
+                hot_look(&db, std::time::Duration::from_millis(200));
+            }
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_asks, c.hot_raw, c.hot_raw_now, c.form_files),
+                (0, 0, 0, partitions),
+                "{what}: the line refuses the release the room would take: {c:?}"
+            );
+        }
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// Under the controller with the re-parse (`Options::zpages_reparse`), once
 /// the form is installed, the block-coded partition whose decodes cost the
 /// most is built again by the parsing encoder and swapped in -- its form
@@ -10834,6 +11091,83 @@ fn a_scan_over_unvisited_clean_blocks_is_one_dispatch_into_the_form() {
             assert_eq!(dispatches, 1, "{what}: one dispatch for the run: {c:?}");
         } else {
             assert!(dispatches >= 4, "{what}: a dispatch a block: {dispatches}");
+        }
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A block-path scan's cursor over a covered partition holds the page's view
+/// across the page's groups (`Options::zpages_cursor_view`) and asks for
+/// the next group's lines at each open (`Options::zpages_group_ahead`): a
+/// scan of four blocks and a bit through a fresh handle builds fewer views
+/// than the groups it decodes with the first option and at least one a
+/// group without it, and asks ahead once a group opened with the second --
+/// the groups the cursor opened, the start seek's apart -- and never
+/// without. The entries come back as the model has them either way.
+/// A few of the lowest keys are written first so the partition does not
+/// take the bulk walk, and the handle builds its own table (`commit_forms`
+/// off), as the cursor's test does.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_cursor_holds_a_pages_view_across_its_groups_and_asks_for_the_next() {
+    for on in [true, false] {
+        let what = format!("cursor view and ahead {on}");
+        let (dir, mut db, model, _inject, r, keys, _at) =
+            compact_store_with(&format!("cursor-view-{on}"), 1 << 20, |o| {
+                o.zpages_cursor_view = on;
+                o.zpages_group_ahead = on;
+                o.commit_forms = false;
+            });
+        drop(r);
+        for k in &keys[..3] {
+            db.append(k, &model[k][0]);
+        }
+        db.commit().unwrap();
+        let r = db.reader().unwrap();
+        let want = 4 * 64 + 10;
+        let start = keys.len() / 2;
+        assert!(
+            start + want < keys.len(),
+            "{what}: keys enough: {}",
+            keys.len()
+        );
+        let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
+            .iter()
+            .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
+            .collect();
+        let before = db.zpage_counts();
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let n = r
+            .scan(&keys[start], want, |k, v| {
+                got.push((k.to_vec(), v.to_vec()))
+            })
+            .unwrap();
+        let c = db.zpage_counts();
+        assert_eq!(n, want, "{what}: the scan's entries");
+        assert_eq!(got, expect, "{what}: the entries as the model has them");
+        let groups = c.scan_groups - before.scan_groups;
+        let views = c.scan_views - before.scan_views;
+        let aheads = c.group_aheads - before.group_aheads;
+        assert!(groups >= 3, "{what}: groups decoded: {groups}");
+        if on {
+            assert!(
+                views < groups,
+                "{what}: a view a page and not a group: {views} views, {groups} groups"
+            );
+            // The scan's start seek decodes one group through no cursor.
+            assert!(
+                aheads + 1 >= groups,
+                "{what}: a group asked ahead at each open: {aheads} aheads, {groups} groups"
+            );
+        } else {
+            // A view at every open; the start seek's group apart, as above.
+            assert!(
+                views + 1 >= groups,
+                "{what}: a view an open: {views} views, {groups} groups"
+            );
+            assert_eq!(aheads, 0, "{what}: nothing asked ahead");
         }
         drop(r);
         db.close().unwrap();

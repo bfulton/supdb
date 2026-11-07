@@ -2306,6 +2306,9 @@ pub struct Budget {
     pub anon: u64,
     pub refaults: Option<u64>,
     pub budget: u64,
+    /// The file pages the group holds now, `None` where the platform does
+    /// not say: what `slack` is read from.
+    pub cache: Option<u64>,
 }
 
 /// A twentieth of the limit, and sixty-four mebibytes at least: what the
@@ -2321,7 +2324,28 @@ impl Budget {
             anon,
             refaults,
             budget: limit.saturating_sub(anon).saturating_sub(margin(limit)),
+            cache: None,
         }
+    }
+
+    /// The budget with the group's file pages read beside it.
+    pub fn with_cache(self, cache: Option<u64>) -> Budget {
+        Budget { cache, ..self }
+    }
+
+    /// The group's unused memory less the margin: its limit less its
+    /// anonymous memory, its page cache and the margin, `None` where the
+    /// cache is not known. The budget's shares price what the form files
+    /// and the raw partitions would hold against a model of the rest; this
+    /// is what the group has not got, which is what a partition released to
+    /// the raw form brings in (`Options::zpages_hot_raw_slack`).
+    pub fn slack(&self) -> Option<u64> {
+        self.cache.map(|c| {
+            self.limit
+                .saturating_sub(self.anon)
+                .saturating_sub(c)
+                .saturating_sub(margin(self.limit))
+        })
     }
 
     /// The budget held under the machine's `MemAvailable` less the margin:
@@ -2400,6 +2424,8 @@ pub struct StatV1 {
     pub rss: u64,
     pub rss_huge: u64,
     pub refaults: Option<u64>,
+    /// The page cache the group holds (`cache`), `None` where absent.
+    pub cache: Option<u64>,
 }
 
 pub fn parse_stat_v1(text: &str) -> StatV1 {
@@ -2414,6 +2440,7 @@ pub fn parse_stat_v1(text: &str) -> StatV1 {
             "hierarchical_memory_limit" => s.limit = Some(v),
             "rss" => s.rss = v,
             "rss_huge" => s.rss_huge = v,
+            "cache" => s.cache = Some(v),
             "workingset_refault_file" | "workingset_refault" => s.refaults = Some(v),
             _ => {}
         }
@@ -2427,6 +2454,8 @@ pub fn parse_stat_v1(text: &str) -> StatV1 {
 pub struct StatV2 {
     pub anon: u64,
     pub refaults: Option<u64>,
+    /// The file-backed pages the group holds (`file`), `None` where absent.
+    pub file: Option<u64>,
 }
 
 pub fn parse_stat_v2(text: &str) -> StatV2 {
@@ -2439,6 +2468,7 @@ pub fn parse_stat_v2(text: &str) -> StatV2 {
         let Ok(v) = v.parse::<u64>() else { continue };
         match k {
             "anon" => s.anon = v,
+            "file" => s.file = Some(v),
             "workingset_refault_file" | "workingset_refault" => s.refaults = Some(v),
             _ => {}
         }
@@ -2636,6 +2666,7 @@ mod tests {
                 rss: 2048,
                 rss_huge: 4096,
                 refaults: Some(99),
+                cache: Some(1024),
             }
         );
         assert_eq!(parse_stat_v1("rss 5\n").refaults, None);
@@ -2643,7 +2674,8 @@ mod tests {
             parse_stat_v2("anon 123\nfile 9\nworkingset_refault_file 4\n"),
             StatV2 {
                 anon: 123,
-                refaults: Some(4)
+                refaults: Some(4),
+                file: Some(9),
             }
         );
         assert_eq!(parse_limit("max\n"), None);

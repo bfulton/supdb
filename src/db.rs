@@ -206,6 +206,64 @@ fn idle_io_priority() {
     }
 }
 
+/// `f` run with the calling thread's I/O priority at the idle class and the
+/// priority it had given back after, whatever `f` does: for a readahead
+/// the thread asks for beside a writer whose commits sync, so that the
+/// requests wait behind the syncs at the device and not ahead of them
+/// (`Options::zpages_hot_ask_idle`). Linux only; elsewhere `f` runs as it
+/// is.
+fn with_idle_io<T>(f: impl FnOnce() -> T) -> T {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: two syscalls on this thread's own I/O priority, read and
+        // set, with no pointer passed; a failure of either is ignored on
+        // purpose, as `idle_io_priority` ignores one.
+        let before =
+            unsafe { libc::syscall(libc::SYS_ioprio_get, 1 as libc::c_int, 0 as libc::c_int) };
+        idle_io_priority();
+        let out = f();
+        if before >= 0 {
+            unsafe {
+                let _ = libc::syscall(
+                    libc::SYS_ioprio_set,
+                    1 as libc::c_int,
+                    0 as libc::c_int,
+                    before as libc::c_int,
+                );
+            }
+        }
+        out
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        f()
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod io_class_tests {
+    /// The idle class holds for the call and the thread's own priority is
+    /// given back after it, class none included.
+    #[test]
+    fn the_idle_class_is_held_for_the_call_and_given_back() {
+        let before = super::io_priority_class();
+        let inside = super::with_idle_io(super::io_priority_class);
+        assert_eq!(inside, 3, "idle inside the call");
+        assert_eq!(
+            super::io_priority_class(),
+            before,
+            "the thread's class after"
+        );
+        let twice = super::with_idle_io(|| super::with_idle_io(super::io_priority_class));
+        assert_eq!(twice, 3);
+        assert_eq!(
+            super::io_priority_class(),
+            before,
+            "given back through a nested call"
+        );
+    }
+}
+
 /// The calling thread's I/O class as the kernel reports it: 3 idle, 2 best
 /// effort, 1 real time, 0 none, which the kernel serves as best effort at
 /// the thread's nice level. Zero where the call is not had or fails.
@@ -482,6 +540,12 @@ pub struct ZCounts {
     /// Walks that asked for the pages after their first at once
     /// (`Options::zpages_scan_prefetch`).
     pub prefetches: u64,
+    /// The block path's cursor walks: the page views they built
+    /// (`Options::zpages_cursor_view` holds one across a page's groups)
+    /// and the groups whose lines they asked for ahead
+    /// (`Options::zpages_group_ahead`).
+    pub scan_views: u64,
+    pub group_aheads: u64,
     /// Form files built, their pages, bytes, the pages that hold their
     /// group verbatim, the decoded bytes of every group, and compress
     /// calls; builds that failed and builds a merge outran.
@@ -1276,6 +1340,30 @@ pub struct Options {
     /// and no cell against it, inside the band. On;
     /// `supdb-cache64tofitautozpagesmemonoahead` is the shape before.
     pub zpages_memo_ahead: bool,
+    /// EXPERIMENT: the block path's cursor over a form file
+    /// (`zfile::ZCursor`) keeps the page's view across the page's groups,
+    /// and where `zpages_memo_first` asks the memo before any view it builds
+    /// none for a group the memo holds: a view was built at every open --
+    /// the header parsed and checked, the directory's keys walked -- and
+    /// twice more where the cursor was placed by rank, for a page the cursor
+    /// had the view of already, a tenth of a covered scan's time beside the
+    /// decodes in E at ten million keys under 1.25 GiB; paired in the row's
+    /// shape the views over the row fell by half and E read 1.07x in both
+    /// reps (`docs/engine.md`). Off is a view an open, the shape before;
+    /// `supdb-zviewperopen` is the arm.
+    pub zpages_cursor_view: bool,
+    /// EXPERIMENT: at a group's open the cursor asks for the lines of the
+    /// group the walk reaches next -- the next group of the page by the
+    /// directory, else the first `zfile::ZGROUP_AHEAD` bytes of the next
+    /// entry's page, its header, directory and the start of its first
+    /// group -- so the decode after finds its input in the cache: the
+    /// decoder's copy of its compressed input took half the decode's
+    /// samples in E's covered scans, the input's lines cold at every
+    /// group, where a group's walk is lead enough to bring the next's;
+    /// paired in the row's shape E read 1.21x in both reps
+    /// (`docs/engine.md`). Off asks for nothing; `supdb-znogroupahead` is
+    /// the arm.
+    pub zpages_group_ahead: bool,
     /// A block's reads of its covered partition through one cursor
     /// (`PartReader`, `zfile::ZCursor`): a build or a walk reads the
     /// records between the overlay's keys, each key's cut where the walk
@@ -3734,6 +3822,27 @@ pub struct Options {
     /// patch. `supdb-copysearch` and `supdb-ingestcopysearch` are the
     /// second search; `docs/engine.md` has the figures.
     pub copy_start_at_rank: bool,
+    /// EXPERIMENT: a copy walked from the rank the seek found
+    /// (`copy_start_at_rank`, an identity copy) is prefetched from that
+    /// entry -- the first lines of its entries, keys and values from
+    /// there, eight lines -- and not whole, the fifty-six lines of its
+    /// three buffers that the search over them wanted, which such a walk
+    /// never makes. In ycsb-E at ten million keys every copy start was at
+    /// its rank (`start_at_rank` 102,500, `start_search` 0) and the
+    /// prefetch instructions were a sixth of the thread's samples in
+    /// core, the stall of issuing a hundred lines a scan; the walk streams
+    /// its three buffers from the start entry on, which the hardware's
+    /// prefetcher follows. A copy the walk searches, and the sparse and
+    /// clean forms, are prefetched as before. Refuted: paired in core at
+    /// ten million keys (`bench ab --arms supdb,supdb-leancopyprefetch
+    /// --size 10000000 --bound 8589934592 --passes load,mixes --ops-div 10
+    /// --reps 2`), E read 0.96x with the lean prefetch in both reps, so the
+    /// fifty-six lines are not the stall's cost but the walk's fills moved
+    /// ahead of it, the three buffers being cold for the hardware's
+    /// prefetcher at every block; the row's shape read E 1.05x with it
+    /// beside point-read mixes, which it never touches, at 0.84x, a sitting
+    /// that resolves nothing. Off; `supdb-leancopyprefetch` is the arm.
+    pub copy_prefetch_from_start: bool,
     /// A piece's keys are ranked against their partition over the ordered
     /// index's heads, galloping from the rank the key before reached, as
     /// the settle resolves a batch -- instead of over the partition's
@@ -4024,6 +4133,41 @@ pub struct Options {
     /// from its form file. Stands down where the re-code policy runs
     /// (`zpages_recode_auto`, `zpages_reparse`).
     pub zpages_hot_raw: bool,
+    /// EXPERIMENT: with the hot-raw policy, a release's room is the group's
+    /// unused memory -- its limit less its anonymous memory and its page
+    /// cache as the platform counts them (`zselect::Budget::slack`), the
+    /// margin, and `HOT_RAW_GROWTH` of the budget for the process's growth
+    /// through a write mix -- and a partition is asked for where its raw
+    /// bytes fit in it, under the fill share the way back is taken at
+    /// (`zselect::FORM_FILL`). Off, the ask is where the form files and the
+    /// raw partitions together would stay within `HOT_RAW_FILL` of the
+    /// budget: a model's share for the page cache's other tenants, which
+    /// left three or four partitions raw at ten million keys under 1.25 GiB
+    /// with 270-370 MB of the group unused through E, the tenants measuring
+    /// a quarter of the share (`docs/engine.md`). Where the platform gives
+    /// no page cache count the line stands. And the skew a candidate is
+    /// rated on is read over the last `HOT_RAW_WINDOW` looks' sampled
+    /// events and not the look's own: the Zipfian's fourth to eighth
+    /// partitions read forty to eighty samples a look under the point-read
+    /// mixes against the floor of `HOT_RAW_MIN_SAMPLES`, so under the line
+    /// nothing past the third was released before E's own scans made them
+    /// hot, and E's half second is too short for the asks to land. On;
+    /// `supdb-zhotline` is the line and the look's own window.
+    pub zpages_hot_raw_slack: bool,
+    /// EXPERIMENT: the hot-raw policy's ask -- the raw pages of a partition
+    /// it will release, asked of the kernel at the look before the release
+    /// (`MADV_WILLNEED`, 42 MB a partition at ten million keys) -- is issued
+    /// under the idle I/O class, the segment work's thread lowered for the
+    /// call and given back after (`with_idle_io`), so that the readahead's
+    /// requests wait behind the writer's fdatasyncs at the device and not
+    /// ahead of them: mq-deadline serves reads first, and three asks inside
+    /// A at ten million keys under 1.25 GiB took A's 833 durable commits
+    /// from 0.48-0.54 s to 0.59-0.60 s in both reps of a sitting. Paired in
+    /// the row's shape the class moved nothing the pairing resolves (E
+    /// 1.05x in both reps, D 0.95x in both, A split), so the ask keeps the
+    /// thread's own class and the idle class is the arm,
+    /// `supdb-zhotaskidle` (`docs/engine.md`).
+    pub zpages_hot_ask_idle: bool,
 }
 
 impl Options {
@@ -4129,6 +4273,8 @@ impl Default for Options {
             zpages_fence_tree: false,
             zpages_fence_words: true,
             zpages_memo_ahead: true,
+            zpages_cursor_view: true,
+            zpages_group_ahead: true,
             zpages_block_cursor: true,
             zpages_scan_cursor: true,
             zpages_scan_prefetch: false,
@@ -4284,6 +4430,7 @@ impl Default for Options {
             freeze_settles: false,
             forms_rebase: true,
             copy_start_at_rank: true,
+            copy_prefetch_from_start: false,
             piece_ranks_by_heads: true,
             forms_to_writer: false,
             form_dense_from: 0,
@@ -4302,6 +4449,8 @@ impl Default for Options {
             zpages_recode_auto: false,
             zpages_reparse: false,
             zpages_hot_raw: true,
+            zpages_hot_raw_slack: true,
+            zpages_hot_ask_idle: false,
         }
     }
 }
@@ -10089,6 +10238,10 @@ struct Slot {
     /// Walks that asked for the pages after their first
     /// (`Options::zpages_scan_prefetch`).
     zprefetches: AtomicU64,
+    /// The cursor walks' page views built and groups asked for ahead
+    /// (`Options::zpages_cursor_view`, `Options::zpages_group_ahead`).
+    zviews: AtomicU64,
+    zaheads: AtomicU64,
     /// The census (`ZPages::Auto`, `zselect` S2): what this handle's
     /// windows summed, written by the handle alone at a window's close
     /// and read by the controller's tick, which differences them. By
@@ -10162,6 +10315,8 @@ impl Slot {
             zmemohits: AtomicU64::new(0),
             zmemomisses: AtomicU64::new(0),
             zprefetches: AtomicU64::new(0),
+            zviews: AtomicU64::new(0),
+            zaheads: AtomicU64::new(0),
             zcreads: AtomicU64::new(0),
             zcrflt: AtomicU64::new(0),
             zcscans: AtomicU64::new(0),
@@ -10184,15 +10339,17 @@ impl Slot {
     }
 }
 
-// Three lines: the nine words that were here, the second form's thirteen
-// counters and the census's seventeen sums, thirty-nine words, are a
-// 384-byte slot since the census. What the layout is for is that no
-// other thread writes a slot's lines, which three lines a handle owns
-// keep as one did; the first line's sixteen words were full at the
-// seventh second-form counter and the second's at the census's third
-// sum. The size is pinned so that a counter added moves it here and not
-// in a threaded cell.
-const _: () = assert!(std::mem::align_of::<Slot>() >= 128 && std::mem::size_of::<Slot>() == 384);
+// Four lines: the nine words that were here, the second form's thirteen
+// counters and the census's seventeen sums, thirty-nine words, were a
+// 384-byte slot since the census, and the cursor's two counts (`zviews`,
+// `zaheads`) took it past forty-eight words into a fourth line. What the
+// layout is for is that no other thread writes a slot's lines, which four
+// lines a handle owns keep as one did; the first line's sixteen words
+// were full at the seventh second-form counter, the second's at the
+// census's third sum, the third's at the cursor's first count. The size
+// is pinned so that a counter added moves it here and not in a threaded
+// cell.
+const _: () = assert!(std::mem::align_of::<Slot>() >= 128 && std::mem::size_of::<Slot>() == 512);
 
 const READER_SLOTS: usize = 256;
 
@@ -13607,6 +13764,22 @@ impl CachedBlock {
         prefetch_lines(self.keys.as_ptr(), self.keys.len());
         prefetch_lines(self.vals.as_ptr(), self.vals.len().min(1024));
     }
+    /// The first lines of the three buffers from entry `i`, ahead of a walk
+    /// that starts there and streams on (`Options::copy_prefetch_from_start`):
+    /// two lines of entries, two of keys and four of values.
+    fn prefetch_from(&self, i: usize) {
+        let Some(e) = self.ents.get(i) else {
+            return;
+        };
+        prefetch_lines(
+            self.ents[i..].as_ptr() as *const u8,
+            (self.ents.len() - i).min(8) * 16,
+        );
+        let k = (e[0] as usize).min(self.keys.len());
+        prefetch_lines(self.keys[k..].as_ptr(), (self.keys.len() - k).min(128));
+        let r = (e[2] as usize).min(self.vals.len());
+        prefetch_lines(self.vals[r..].as_ptr(), (self.vals.len() - r).min(256));
+    }
     fn each_value(&self, e: &[u32; 4], mut f: impl FnMut(&[u8])) {
         let run = &self.vals[e[2] as usize..(e[2] + e[3]) as usize];
         let mut p = 0usize;
@@ -13731,6 +13904,7 @@ fn prefetch_form(form: &Cached) {
 fn prefetch_block(
     blob: Option<&Blob<MmapBytes>>,
     form: &Cached,
+    at: Option<usize>,
     from: usize,
     n: usize,
     cap: usize,
@@ -13749,7 +13923,13 @@ fn prefetch_block(
         }
     };
     match form {
-        Cached::Block(blk) => blk.prefetch(),
+        // An identity copy walked from the entry `at` names is prefetched
+        // from there (`Options::copy_prefetch_from_start`); a copy the walk
+        // will search, whole.
+        Cached::Block(blk) => match at {
+            Some(i) if blk.identity => blk.prefetch_from(i),
+            _ => blk.prefetch(),
+        },
         Cached::Sparse(sb) => {
             sb.prefetch();
             ranks();
@@ -19301,6 +19481,8 @@ impl Reader {
             memo_hits: rd.stat(|s| &s.zmemohits),
             memo_misses: rd.stat(|s| &s.zmemomisses),
             prefetches: rd.stat(|s| &s.zprefetches),
+            scan_views: rd.stat(|s| &s.zviews),
+            group_aheads: rd.stat(|s| &s.zaheads),
             builds: get(&ev.builds),
             build_pages: get(&ev.build_pages),
             build_bytes: get(&ev.build_bytes),
@@ -20134,6 +20316,8 @@ impl Reader {
                 self.zbump_by(|s| &s.zinplace, c.inplace);
                 self.zbump_by(|s| &s.znopagescans, c.nopage);
                 self.zbump_by(|s| &s.zprefetches, c.prefetches);
+                self.zbump_by(|s| &s.zviews, c.views);
+                self.zbump_by(|s| &s.zaheads, c.aheads);
                 if c.fell_back() {
                     self.zbump(|s| &s.zfallbacks);
                     self.zbump(|s| &s.zscans);
@@ -25229,10 +25413,17 @@ impl Reader {
                 } else {
                     None
                 };
+                // The entry a copy's walk starts at, where the walk takes
+                // it by rank: this block's start less its first rank.
+                let copy_at = (self.opts.copy_prefetch_from_start
+                    && self.opts.copy_start_at_rank
+                    && rank != usize::MAX)
+                    .then(|| start - lo);
                 if !fetched && self.opts.scan_prefetch {
                     prefetch_block(
                         self.zc(seg).is_none().then(|| seg.raw()),
                         form,
+                        copy_at,
                         start,
                         ahead,
                         self.opts.scan_prefetch_bytes,
@@ -25253,6 +25444,7 @@ impl Reader {
                         prefetch_block(
                             self.zc(seg).is_none().then(|| seg.raw()),
                             next,
+                            copy_at.map(|_| 0),
                             hi,
                             ahead - (hi - start),
                             self.opts.scan_prefetch_bytes,
@@ -27569,6 +27761,8 @@ impl Db {
                         opts.zpages_drop_raw,
                         opts.z_times_decodes(),
                         opts.zpages_own_decoder,
+                        opts.zpages_cursor_view,
+                        opts.zpages_group_ahead,
                     ),
                     &zev,
                 );
@@ -31037,7 +31231,16 @@ impl Db {
         prefetch: bool,
         trusted: bool,
         memo_first: bool,
-        lines: (zpages::FenceSearch, bool, bool, bool, bool, bool),
+        lines: (
+            zpages::FenceSearch,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+            bool,
+        ),
         ev: &zfile::ZEvents,
     ) -> bool {
         let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) else {
@@ -31060,6 +31263,8 @@ impl Db {
                 side.inplace = lines.2;
                 side.time_decodes = lines.4;
                 side.own_decoder = lines.5;
+                side.cursor_view = lines.6;
+                side.group_ahead = lines.7;
                 let installed = seg.z.install(side);
                 if installed {
                     zfile::ZEvents::add(&ev.attached, 1);
@@ -31118,6 +31323,8 @@ impl Db {
                     z_drop_now(&self.opts, &self.shared),
                     self.opts.z_times_decodes(),
                     self.opts.zpages_own_decoder,
+                    self.opts.zpages_cursor_view,
+                    self.opts.zpages_group_ahead,
                 ),
                 ev,
             )
@@ -31165,6 +31372,8 @@ impl Db {
                         side.inplace = self.opts.zpages_inplace_walk;
                         side.time_decodes = self.opts.z_times_decodes();
                         side.own_decoder = self.opts.zpages_own_decoder;
+                        side.cursor_view = self.opts.zpages_cursor_view;
+                        side.group_ahead = self.opts.zpages_group_ahead;
                         if seg.z.install(side) {
                             ev.built(&b);
                             zfile::ZEvents::add(&ev.attached, 1);
@@ -36315,9 +36524,25 @@ const RECODE_AUTO_EVICT: f64 = 0.95;
 /// Zipfian's third partition reads a hundred and fifty a window.
 const HOT_RAW_PERIOD: std::time::Duration = zselect::CENSUS_INTERVAL;
 const HOT_RAW_FILL: f64 = 0.75;
+/// With `Options::zpages_hot_raw_slack`, the share of the budget a release
+/// leaves of the group's unused memory for the process's growth through a
+/// write mix -- a tenth, what the budget fell by through the suite's write
+/// mixes at ten million keys under 1.25 GiB -- so that the anonymous memory
+/// the mixes add finds room and not the limit, where every page the writer
+/// takes is a reclaim.
+#[doc(hidden)]
+pub const HOT_RAW_GROWTH: f64 = 0.10;
 const HOT_RAW_TAU: std::time::Duration = std::time::Duration::from_secs(1);
 const HOT_RAW_SKEW: f64 = 1.5;
-const HOT_RAW_MIN_SAMPLES: u64 = 128;
+#[doc(hidden)]
+pub const HOT_RAW_MIN_SAMPLES: u64 = 128;
+/// With `Options::zpages_hot_raw_slack`, the looks whose sampled events a
+/// partition's skew is read over: eight, about a second, the heat's own
+/// decay, so that a partition the point-read mixes read forty samples a
+/// look is rated on three hundred and the floor keeps its meaning against
+/// a thin look.
+#[doc(hidden)]
+pub const HOT_RAW_WINDOW: usize = 8;
 /// A release's two steps: the raw pages are asked of the kernel at one look
 /// and the form file taken out of its cell at a later one, once this share
 /// of the record region is resident, so the reads sent raw find their pages
@@ -36655,6 +36880,9 @@ struct Maint {
     z_hot_seen: std::collections::HashMap<u64, (u64, u64)>,
     z_hot_raw_seen: std::collections::HashMap<Vec<u8>, u64>,
     z_hot_heat: std::collections::HashMap<Vec<u8>, f64>,
+    /// Each partition's sampled events over the last `HOT_RAW_WINDOW`
+    /// looks (`Options::zpages_hot_raw_slack`), by its lower fence.
+    z_hot_win: std::collections::HashMap<Vec<u8>, std::collections::VecDeque<u64>>,
     z_hot_ask: Option<(Vec<u8>, std::time::Duration)>,
     z_hot_hold: Option<std::time::Duration>,
 }
@@ -37243,6 +37471,7 @@ impl Maint {
             z_hot_seen: std::collections::HashMap::new(),
             z_hot_raw_seen: std::collections::HashMap::new(),
             z_hot_heat: std::collections::HashMap::new(),
+            z_hot_win: std::collections::HashMap::new(),
             z_hot_ask: None,
             z_hot_hold: None,
         }
@@ -39332,10 +39561,13 @@ impl Maint {
     /// budget, and no partition a merge holds as an input or a build holds.
     fn z_hot_look(&mut self, now: std::time::Duration, dt: Option<std::time::Duration>) {
         let inject = self.opts.zpages_inject.clone();
-        let budget = inject
-            .as_ref()
-            .and_then(|i| i.budget())
-            .or(zfile::read_budget().map(|b| b.budget));
+        // The budget, and the group's unused memory less the margin
+        // (`zselect::Budget::slack`): both from the seam where a test set
+        // the budget, else from the platform.
+        let (budget, slack) = match inject.as_ref().and_then(|i| i.budget()) {
+            Some(b) => (Some(b), inject.as_ref().and_then(|i| i.slack())),
+            None => zfile::read_budget().map_or((None, None), |b| (Some(b.budget), b.slack())),
+        };
         struct Part {
             seg: std::sync::Arc<Seg>,
             raw: bool,
@@ -39459,6 +39691,20 @@ impl Maint {
             let rate = delta
                 .zip(dt)
                 .map(|(n, d)| 16.0 * n as f64 * per_decode / d.as_secs_f64());
+            // The skew's count: under `Options::zpages_hot_raw_slack` the
+            // sampled events of the last `HOT_RAW_WINDOW` looks summed, so
+            // that a partition read thinly a look but steadily across them
+            // is rated on enough of them; else the look's own.
+            let window = if self.opts.zpages_hot_raw_slack {
+                let q = self.z_hot_win.entry(seg.lo.clone()).or_default();
+                q.push_back(delta.unwrap_or(0));
+                while q.len() > HOT_RAW_WINDOW {
+                    q.pop_front();
+                }
+                q.iter().sum::<u64>()
+            } else {
+                delta.unwrap_or(0)
+            };
             let old = self.z_hot_heat.get(&seg.lo).copied().unwrap_or(0.0);
             // Risen at once and decayed over `RECODE_TAU`: a release costs
             // no build, so the heat a partition shows is acted on when it
@@ -39491,7 +39737,7 @@ impl Maint {
                 keys: seg.blob.keys() as u64,
                 heat,
                 rated: delta.is_some(),
-                delta: delta.unwrap_or(0),
+                delta: window,
                 seg,
             });
         }
@@ -39504,6 +39750,7 @@ impl Maint {
         }
         self.z_hot_seen = seen;
         self.z_hot_raw_seen.retain(|lo, _| live.contains(lo));
+        self.z_hot_win.retain(|lo, _| live.contains(lo));
         self.z_hot_raw_seen.extend(raw_seen);
         self.z_hot_heat = heats;
         let (Some(budget), Some(_)) = (budget, dt) else {
@@ -39514,6 +39761,14 @@ impl Maint {
         let total = forms.saturating_add(raws);
         let fill = zselect::form_fill(budget);
         let line = (budget as f64 * HOT_RAW_FILL) as u64;
+        // The room a release is asked into under
+        // `Options::zpages_hot_raw_slack`: the unused memory less the growth
+        // share, where the platform or the seam says what the group holds.
+        let room = if self.opts.zpages_hot_raw_slack {
+            slack.map(|s| s.saturating_sub((budget as f64 * HOT_RAW_GROWTH) as u64))
+        } else {
+            None
+        };
         // The skew is read from the window: a partition's sampled events a
         // key against the median partition's, over the partitions rated this
         // look, raw ones among them.
@@ -39526,7 +39781,7 @@ impl Maint {
         let rated = parts.iter().filter(|p| p.rated).count();
         let trace = |what: &str, p: Option<&Part>| {
             eprintln!(
-                "zhot t={:.1} {what} seg={} heat_ms_s={:.2} delta={} per_key={:.5} median={:.5} rated={rated}/{} forms={forms} raw={raws} line={line} fill={fill} budget={budget}",
+                "zhot t={:.1} {what} seg={} heat_ms_s={:.2} delta={} per_key={:.5} median={:.5} rated={rated}/{} forms={forms} raw={raws} line={line} fill={fill} budget={budget} room={}",
                 now.as_secs_f64(),
                 p.map_or("-", |p| p.seg.name.as_str()),
                 p.map_or(0.0, |p| p.heat / 1e6),
@@ -39534,6 +39789,7 @@ impl Maint {
                 p.map_or(0.0, per_key),
                 median,
                 parts.len(),
+                room.map_or("-".to_string(), |r| r.to_string()),
             );
         };
         // The partition asked for at a look before: taken once its pages
@@ -39618,25 +39874,39 @@ impl Maint {
         let after = total
             .saturating_sub(p.file_bytes)
             .saturating_add(p.raw_bytes);
-        if after <= line {
+        // The room: the raw bytes in the group's unused memory, under the
+        // fill share the way back is taken at, or the model's line.
+        let fits = match room {
+            Some(r) => p.raw_bytes <= r && after <= fill,
+            None => after <= line,
+        };
+        if fits {
             if self.z_trace {
                 trace("ask", Some(p));
             }
-            Maint::z_hot_ask(&p.seg);
+            Maint::z_hot_ask(&p.seg, self.opts.zpages_hot_ask_idle);
             self.z_hot_ask = Some((p.seg.lo.clone(), now));
             zfile::ZEvents::add(&self.shared.z.hot_asks, 1);
             return;
         }
         // No room: made by the coldest raw partition where the hot one is
         // `RECODE_SWAP` times hotter and fits in it, taken at a later look.
+        // Under the group's unused memory the way back gives the coldest's
+        // raw bytes less its file's back to the room.
+        let swap_fits = |q: &Part| {
+            let after_swap = after
+                .saturating_sub(q.raw_bytes)
+                .saturating_add(q.file_bytes);
+            match room {
+                Some(r) => {
+                    p.raw_bytes <= r.saturating_add(q.raw_bytes.saturating_sub(q.file_bytes))
+                        && after_swap <= fill
+                }
+                None => after_swap <= line,
+            }
+        };
         match coldest_raw {
-            Some(q)
-                if q.heat * RECODE_SWAP < p.heat
-                    && after
-                        .saturating_sub(q.raw_bytes)
-                        .saturating_add(q.file_bytes)
-                        <= line =>
-            {
+            Some(q) if q.heat * RECODE_SWAP < p.heat && swap_fits(q) => {
                 if self.z_trace {
                     trace("swap", Some(q));
                 }
@@ -39654,12 +39924,21 @@ impl Maint {
     /// `seg`'s raw pages asked of the kernel ahead of the reads the hot-raw
     /// policy sends raw: the index section from its hash slots through its
     /// records (`Blob::raw_read_span`), and the ordered index's heads.
-    fn z_hot_ask(seg: &Seg) {
-        let raw = seg.blob.for_zfile();
-        if let Some((off, len)) = raw.raw_read_span() {
-            raw.willneed_span(off, len as usize);
+    /// With `idle`, under the idle I/O class for the call
+    /// (`Options::zpages_hot_ask_idle`).
+    fn z_hot_ask(seg: &Seg, idle: bool) {
+        let ask = || {
+            let raw = seg.blob.for_zfile();
+            if let Some((off, len)) = raw.raw_read_span() {
+                raw.willneed_span(off, len as usize);
+            }
+            seg.ord.willneed_heads_all();
+        };
+        if idle {
+            with_idle_io(ask)
+        } else {
+            ask()
         }
-        seg.ord.willneed_heads_all();
     }
 
     /// `seg` released to the raw form under the hot-raw policy, its raw pages
@@ -41612,6 +41891,8 @@ impl Maint {
                     z_drop_now(&self.opts, &self.shared),
                     self.opts.z_times_decodes(),
                     self.opts.zpages_own_decoder,
+                    self.opts.zpages_cursor_view,
+                    self.opts.zpages_group_ahead,
                 ),
                 ev,
             )
@@ -41946,6 +42227,8 @@ impl Maint {
                         side.inplace = self.opts.zpages_inplace_walk;
                         side.time_decodes = self.opts.z_times_decodes();
                         side.own_decoder = self.opts.zpages_own_decoder;
+                        side.cursor_view = self.opts.zpages_cursor_view;
+                        side.group_ahead = self.opts.zpages_group_ahead;
                         side.drop_cache();
                         let old = target.z_spare.keep(Box::into_raw(Box::new(side)));
                         if !old.is_null() {
@@ -41993,6 +42276,8 @@ impl Maint {
                         side.inplace = self.opts.zpages_inplace_walk;
                         side.time_decodes = self.opts.z_times_decodes();
                         side.own_decoder = self.opts.zpages_own_decoder;
+                        side.cursor_view = self.opts.zpages_cursor_view;
+                        side.group_ahead = self.opts.zpages_group_ahead;
                         let coded = side.coded();
                         let mut old = target.z.replace(side);
                         // Kept where the option keeps it, its pages dropped,
@@ -42067,6 +42352,8 @@ impl Maint {
                             side.inplace = self.opts.zpages_inplace_walk;
                             side.time_decodes = self.opts.z_times_decodes();
                             side.own_decoder = self.opts.zpages_own_decoder;
+                            side.cursor_view = self.opts.zpages_cursor_view;
+                            side.group_ahead = self.opts.zpages_group_ahead;
                             if target.z.install(side) {
                                 ev.built(&built);
                                 zfile::ZEvents::add(&ev.attached, 1);
