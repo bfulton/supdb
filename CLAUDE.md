@@ -3681,6 +3681,82 @@ of sixty-four is two blocks more often than one; and a cursor lent to a
 step that moves it is lent at the cost of the step after, which starts
 where the lender left off and not where the borrower did.
 
+**A room modeled as a share, measured as a quarter of the limit unused.**
+The hot-raw policy asked for a release where the form files and the raw
+partitions together would stay within three quarters of the budget
+(`HOT_RAW_FILL`), the rest a share for the page cache's other tenants, and
+the budget itself the limit less the process's anonymous memory and a
+margin: at ten million keys under 1.25 GiB it released three partitions and
+read the room as full, while the group's `memory.stat` at E's start held
+845 MB of page cache and 121 MB of anon under the 1,342 MB limit -- 270 to
+370 MB unused through the mix -- and the other tenants measured a quarter
+of the share reserved for them, the ordered indexes 25 MB resident, the
+WAL 30, the rest 15 (`scripts/resident.py` over the store and
+`memory.stat`, both at the mixes' phase marks). The release is asked into
+the room the group measures now (`Options::zpages_hot_raw_slack`: the
+limit less its anon and its cache, the margin, and a tenth of the budget
+for the write mixes' growth; `supdb-zhotline` is the line), and the first
+pairing of it read level: the room asked for a fourth partition at E's own
+start, where the line had said full, and for nothing before it, because the
+skew a candidate is rated on was the look's own hundred milliseconds and
+the Zipfian's fourth to eighth partitions read forty to eighty sampled
+events a look under the point-read mixes against a floor of a hundred and
+twenty-eight, so nothing past the third was hot enough to ask for until
+E's scans made it so, and E is half a second. The skew is read over the
+last eight looks' samples under the option now (`HOT_RAW_WINDOW`), and the
+pairing in the row's shape read six releases a rep against three -- the
+first four by A's end, the fifth in D, the sixth at E's start -- E 1.05x
+in both reps and 1.13x in a sitting with the counters on, D 1.06x, and the
+point-read mixes both ways by where the releases fell (B 0.75x in one
+sitting and 0.96x in the next, A 0.90x and 1.04x), since a release's
+device read of 42 MB and its form's drop land on the mix it happens in. A
+fourth part was built and taken out: the raw pages mapped into the page
+tables at the release (`MADV_POPULATE_READ`), on the reading that ten
+thousand pages were ten thousand minor faults on the mix that first read
+them; the test written for it read seven faults over ninety-one pages
+without it, the kernel's fault-around mapping sixteen a fault, so a release
+costs its first mix a millisecond of faults and the lever had nothing to
+save. The rules: a room modeled as a share of a budget is held against the
+group's own accounting -- `memory.stat`'s cache beside its rss -- before a
+policy is read as bound by room; a floor on a window's samples is read
+against the rate the window's workload gives the candidates it is for,
+since a floor drawn under one mix's rate silences the next's; and a lever
+on faults is priced after the kernel's fault-around is counted, by the
+faults a reader takes and never by the pages it touches.
+
+**A view an open, for a cursor that opens seven groups a scan.** The
+block path's cursor over a form file built the page's view at every group
+it opened -- the header parsed and checked, the directory's keys walked --
+and twice more where it was placed by rank, for a page it had the view of
+already, and asked the memo for the group only after; a covered scan of a
+hundred records in E at ten million keys under 1.25 GiB opens seven groups
+over two or three pages, and the profile put the view's parse and the
+header line's first touch at a tenth of a covered scan beside the decodes
+at half. The cursor holds the view across the page's groups now and asks
+the memo before any view is built (`Options::zpages_cursor_view`;
+`supdb-zviewperopen` is the view an open): the views over the row's scans
+fell by half (63,800 against 117,400) and E read 1.07x in both reps of a
+sitting. The decodes themselves were half a covered scan at 0.74 µs for a
+1.6 KB group, which is a quarter of the decoder's warm rate, and the
+profile put more than half their samples on the decoder's copy of its
+compressed input: the input's lines cold at every group. The cursor asks
+for the next group's lines at a group's open now -- the next group of the
+page by the directory, else the first kilobyte of the next entry's page --
+and a group's walk is lead enough to bring them
+(`Options::zpages_group_ahead`; `supdb-znogroupahead` asks for nothing):
+E read 1.21x in both reps of a sitting, with the arm's hot-raw policy
+releasing one partition more than the default's, which should have helped
+the arm. The first shape of the ask fell to the next page's lines after a
+group the memo had held, since that open had built no view, so the view is
+built at the ask where it is missing and held for the groups after. The
+rules: a structure a walk rebuilds at every step is counted per step
+against the steps the walk takes -- a view per open against seven opens a
+scan -- before the step's own cost is read as small; and a decode's cold
+figure is read for its input's misses before its branches, since a
+prefetch of the next group's lines, a dozen instructions behind a walk
+that is lead enough, moved E by a fifth where the probe over hot pages
+had read the whole page's lines as a tenth of a decode.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
