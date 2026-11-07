@@ -970,6 +970,9 @@ pub struct Supdb {
     /// A copy prefetched from the entry its walk starts at and not whole
     /// (`Options::copy_prefetch_from_start`): `supdb-leancopyprefetch`.
     leancopyprefetch: bool,
+    /// The next copy block's prefetch paced through the walk before it
+    /// (`Options::scan_prefetch_paced` on): `supdb-pacedprefetch`.
+    pacedprefetch: bool,
     /// The fill yielding its conversions at any posted commit
     /// (`Options::forms_convert_behind` zero), the shape before it
     /// converted in the thread's slack. `supdb-postedyield`, and
@@ -1856,6 +1859,8 @@ struct Policy {
     blockcursors: bool,
     /// A copy prefetched from its start entry: `supdb-leancopyprefetch`.
     leancopyprefetch: bool,
+    /// The next block's prefetch paced through the walk: `supdb-pacedprefetch`.
+    pacedprefetch: bool,
     /// The fill yielding at any posted commit: `supdb-postedyield`, and
     /// `supdb-ingestpostedyield` buffered.
     postedyield: bool,
@@ -2195,6 +2200,7 @@ impl Default for Policy {
             norunbuilds: false,
             blockcursors: false,
             leancopyprefetch: false,
+            pacedprefetch: false,
             postedyield: false,
             behindyield: false,
             bg: false,
@@ -2685,6 +2691,20 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with the memo of decoded groups at sixty-four mebibytes
+    /// (`Options::zpages_memo_bytes`) against the engine's eight: room for
+    /// the hottest partition's groups decoded, so its point reads through
+    /// the form file before the hot-raw policy releases it hit the memo.
+    pub fn create_memo64(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zmemo_mib: 64,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` whose hot-raw policy asks for a partition's raw pages under
     /// the idle I/O class, the segment work's thread lowered for the call
     /// (`Options::zpages_hot_ask_idle` on).
@@ -2759,6 +2779,19 @@ impl Supdb {
             path,
             Policy {
                 leancopyprefetch: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose copy walks pace the next copy block's prefetch through
+    /// themselves (`Options::scan_prefetch_paced` on), against the burst at
+    /// a block's start.
+    pub fn create_pacedprefetch(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                pacedprefetch: true,
                 ..Policy::default()
             },
         )
@@ -7040,6 +7073,7 @@ impl Supdb {
             norunbuilds,
             blockcursors,
             leancopyprefetch,
+            pacedprefetch,
             postedyield,
             behindyield,
             bg,
@@ -7479,6 +7513,7 @@ impl Supdb {
             scan_run_builds: !norunbuilds,
             zpages_scan_cursor: !blockcursors,
             copy_prefetch_from_start: leancopyprefetch,
+            scan_prefetch_paced: pacedprefetch,
             zpages_memo_ahead: !zmemonoahead,
             scan_start_cache: if zstartcache { 4096 } else { 0 },
             zpages_block_cursor: !zperrun,
@@ -7698,6 +7733,7 @@ impl Supdb {
             norunbuilds,
             blockcursors,
             leancopyprefetch,
+            pacedprefetch,
             postedyield,
             behindyield,
             bg,
@@ -8053,6 +8089,9 @@ impl Engine for Supdb {
         if self.zhotline {
             return "supdb-zhotline";
         }
+        if self.zmemo_mib == 64 && !self.zpages_auto {
+            return "supdb-memo64";
+        }
         if self.zhotaskidle {
             return "supdb-zhotaskidle";
         }
@@ -8070,6 +8109,9 @@ impl Engine for Supdb {
         }
         if self.leancopyprefetch {
             return "supdb-leancopyprefetch";
+        }
+        if self.pacedprefetch {
+            return "supdb-pacedprefetch";
         }
         if self.postedyield {
             return if self.partition {
@@ -10110,12 +10152,14 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-znohotraw"
         | "supdb-zbusyevery"
         | "supdb-zhotline"
+        | "supdb-memo64"
         | "supdb-zhotaskidle"
         | "supdb-zviewperopen"
         | "supdb-znogroupahead"
         | "supdb-norunbuilds"
         | "supdb-blockcursors"
         | "supdb-leancopyprefetch"
+        | "supdb-pacedprefetch"
         | "supdb-postedyield"
         | "supdb-behindyield"
         | "supdb-bg"
@@ -10533,12 +10577,14 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-znohotraw" => supdb_arm(Supdb::create_znohotraw, dir)?,
         "supdb-zbusyevery" => supdb_arm(Supdb::create_zbusyevery, dir)?,
         "supdb-zhotline" => supdb_arm(Supdb::create_zhotline, dir)?,
+        "supdb-memo64" => supdb_arm(Supdb::create_memo64, dir)?,
         "supdb-zhotaskidle" => supdb_arm(Supdb::create_zhotaskidle, dir)?,
         "supdb-zviewperopen" => supdb_arm(Supdb::create_zviewperopen, dir)?,
         "supdb-znogroupahead" => supdb_arm(Supdb::create_znogroupahead, dir)?,
         "supdb-norunbuilds" => supdb_arm(Supdb::create_norunbuilds, dir)?,
         "supdb-blockcursors" => supdb_arm(Supdb::create_blockcursors, dir)?,
         "supdb-leancopyprefetch" => supdb_arm(Supdb::create_leancopyprefetch, dir)?,
+        "supdb-pacedprefetch" => supdb_arm(Supdb::create_pacedprefetch, dir)?,
         "supdb-postedyield" => supdb_arm(Supdb::create_postedyield, dir)?,
         "supdb-behindyield" => supdb_arm(Supdb::create_behindyield, dir)?,
         "supdb-bg" => supdb_arm(Supdb::create_bg, dir)?,
@@ -12363,6 +12409,13 @@ mod tests {
                 assert!(o.copy_prefetch_from_start && !b.copy_prefetch_from_start);
             }
             {
+                let z = Supdb::create_pacedprefetch(&dir("pacedprefetch")).unwrap();
+                assert_eq!(z.name(), "supdb-pacedprefetch");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.scan_prefetch_paced && !b.scan_prefetch_paced);
+            }
+            {
                 let z = Supdb::create_blockcursors(&dir("blockcursors")).unwrap();
                 assert_eq!(z.name(), "supdb-blockcursors");
                 assert_eq!(z.features(), base.features());
@@ -12389,6 +12442,14 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.zpages_hot_raw_slack && b.zpages_hot_raw_slack);
+            }
+            {
+                let z = Supdb::create_memo64(&dir("memo64")).unwrap();
+                assert_eq!(z.name(), "supdb-memo64");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert_eq!(o.zpages_memo_bytes, 64 << 20);
+                assert_eq!(b.zpages_memo_bytes, 8 << 20);
             }
             {
                 let z = Supdb::create_zhotaskidle(&dir("zhotaskidle")).unwrap();

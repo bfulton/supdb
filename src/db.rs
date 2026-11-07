@@ -3843,6 +3843,17 @@ pub struct Options {
     /// beside point-read mixes, which it never touches, at 0.84x, a sitting
     /// that resolves nothing. Off; `supdb-leancopyprefetch` is the arm.
     pub copy_prefetch_from_start: bool,
+    /// EXPERIMENT: the prefetch of the copy block a copy walk reaches next
+    /// paced through the walk -- four lines of each of its three buffers
+    /// every sixteen entries, the whole of it by the forty-eighth
+    /// (`Pace`) -- instead of one burst at the block's start. Built on the
+    /// profile's reading that the burst's forty-eight prefetches outrun
+    /// the core's fill buffers and stall for the lines they wait on, 8.7%
+    /// of E's thread at ten million keys under 1.25 GiB on the prefetch
+    /// instructions themselves; paired in the row's shape the paced walk
+    /// read E 0.90x in both reps, so the burst is the shape and the pace
+    /// the arm, `supdb-pacedprefetch` (`docs/engine.md`). Off.
+    pub scan_prefetch_paced: bool,
     /// A piece's keys are ranked against their partition over the ordered
     /// index's heads, galloping from the rank the key before reached, as
     /// the settle resolves a batch -- instead of over the partition's
@@ -4431,6 +4442,7 @@ impl Default for Options {
             forms_rebase: true,
             copy_start_at_rank: true,
             copy_prefetch_from_start: false,
+            scan_prefetch_paced: false,
             piece_ranks_by_heads: true,
             forms_to_writer: false,
             form_dense_from: 0,
@@ -13901,6 +13913,56 @@ fn prefetch_form(form: &Cached) {
 /// directory or, with `estimate`, put at the mean record length times
 /// the ranks (`Options::seek_prefetch_dir`), since the read is a load
 /// the hint waits for before it can issue.
+/// The prefetch of a copy block paced through the walk of the block before
+/// it (`Options::scan_prefetch_paced`): its three buffers, each asked for
+/// `PACE_BYTES` at a step, a step every `PACE_STEP` entries of the walk,
+/// and the rest at the walk's end. The pointers are the next block's
+/// buffers', which nothing moves while the block before it is walked.
+struct Pace {
+    spans: [(*const u8, usize); 3],
+    at: usize,
+}
+
+/// Four lines of each buffer a step.
+const PACE_BYTES: usize = 256;
+/// Entries of the walk between steps: a block's sixty-four entries take
+/// four steps, the last with sixteen entries of lead.
+const PACE_STEP: usize = 16;
+
+impl Pace {
+    fn of(blk: &CachedBlock) -> Pace {
+        Pace {
+            spans: [
+                (blk.ents.as_ptr() as *const u8, blk.ents.len() * 16),
+                (blk.keys.as_ptr(), blk.keys.len()),
+                (blk.vals.as_ptr(), blk.vals.len().min(1024)),
+            ],
+            at: 0,
+        }
+    }
+
+    fn done(&self) -> bool {
+        self.spans.iter().all(|&(_, n)| self.at >= n)
+    }
+
+    fn step(&mut self) {
+        for &(p, n) in &self.spans {
+            if self.at < n {
+                // SAFETY: a prefetch is a hint that faults on no address,
+                // and `[at, at + len)` lies inside the buffer `p` names.
+                prefetch_lines(unsafe { p.add(self.at) }, PACE_BYTES.min(n - self.at));
+            }
+        }
+        self.at += PACE_BYTES;
+    }
+
+    fn finish(&mut self) {
+        while !self.done() {
+            self.step();
+        }
+    }
+}
+
 fn prefetch_block(
     blob: Option<&Blob<MmapBytes>>,
     form: &Cached,
@@ -14039,19 +14101,27 @@ impl SparseBlock {
     /// form before the thread has slack to convert one
     /// (`Options::copy_start_at_rank`).
     fn find_at_cut(&self, cut: u32, same: bool, key: &[u8]) -> (usize, bool) {
-        let mut i = self.ents.partition_point(|e| (e.cut, e.same) < (cut, same));
+        let i = self.ents.partition_point(|e| (e.cut, e.same) < (cut, same));
         if same {
             let found = i < self.ents.len() && self.ents[i].cut == cut && self.ents[i].same;
             return (i, found);
         }
-        while i < self.ents.len() && self.ents[i].cut == cut && !self.ents[i].same {
-            match key_cmp(self.key(&self.ents[i]), key) {
-                Ordering::Less => i += 1,
-                Ordering::Equal => return (i, true),
-                Ordering::Greater => break,
+        // The keys that share the cut, in key order: searched, not walked.
+        // The keys past a partition's end all share its last cut, and E's
+        // inserts at ten million keys were eight thousand of them in one
+        // block, each walked past every one before it.
+        let j = i + self.ents[i..].partition_point(|e| e.cut == cut && !e.same);
+        let run = &self.ents[i..j];
+        if let Some(last) = run.last() {
+            // The common case for a run of inserts above every key: past
+            // the last entry in one compare.
+            if key_cmp(self.key(last), key) == Ordering::Less {
+                return (j, false);
             }
         }
-        (i, false)
+        let k = run.partition_point(|e| key_cmp(self.key(e), key) == Ordering::Less);
+        let found = k < run.len() && key_cmp(self.key(&run[k]), key) == Ordering::Equal;
+        (i + k, found)
     }
     /// An empty form with room for `ROOM_AT_BIRTH` deltas of a key and a
     /// run like these, for the splices that make a form a delta at a
@@ -16311,6 +16381,9 @@ struct FormsState {
     /// Scans that started a copy walk at the seek's rank, and that
     /// searched the copy (`Options::copy_start_at_rank`).
     copy_starts: std::cell::Cell<[u64; 2]>,
+    /// Copy walks that paced the next block's prefetch through themselves
+    /// (`Options::scan_prefetch_paced`).
+    prefetch_paces: std::cell::Cell<u64>,
     /// Scans whose first block was a copy walked from the start key with
     /// the rank never sought (`Options::zpages_seek_span`).
     span_starts: std::cell::Cell<u64>,
@@ -16464,6 +16537,7 @@ impl FormsState {
             sheds: std::cell::Cell::new(0),
             dir_prefetches: std::cell::Cell::new(0),
             copy_starts: std::cell::Cell::new([0; 2]),
+            prefetch_paces: std::cell::Cell::new(0),
             span_starts: std::cell::Cell::new(0),
             start_cache: std::cell::RefCell::new(StartCache::new()),
             lazy_cuts: std::cell::Cell::new([0; 2]),
@@ -18331,8 +18405,15 @@ impl Reader {
             }
             // A form file retired by a settle waits for the same pins, and
             // the writer's next operation is the sweep a store between
-            // publishes has.
-            if self.shared.retired_z.len() > 0 {
+            // publishes has; where the guarded sweep below runs, it sweeps
+            // these too, on the retry span, since a sweep a reader's pin
+            // holds walked the reader table at every operation's end for
+            // as long as the pin stood -- a hot-raw release's two files
+            // through a whole mix, 2% of E's thread at ten million keys.
+            let guarded = (self.opts.forms_to_fit || self.fits_short())
+                && self.opts.forms_fit_sweep
+                && self.fs_home();
+            if !guarded && self.shared.retired_z.len() > 0 {
                 self.sweep_retired_z();
             }
             // The snapshots and forms a publish replaced during it, held
@@ -18344,10 +18425,7 @@ impl Reader {
             // handle that holds its upkeep, as the commit's sweep is: a
             // writer that has lent it leaves the sweeping to the thread
             // that has it.
-            if (self.opts.forms_to_fit || self.fits_short())
-                && self.opts.forms_fit_sweep
-                && self.fs_home()
-            {
+            if guarded {
                 self.sweep_at_leave();
             }
         }
@@ -22232,7 +22310,7 @@ impl Reader {
     /// loads, and a sweep one in the span of a retry.
     fn sweep_at_leave(&self) {
         let sh = &self.shared;
-        let waiting = sh.retired_snaps.len() + sh.retired_forms.len();
+        let waiting = sh.retired_snaps.len() + sh.retired_forms.len() + sh.retired_z.len();
         if waiting == 0 {
             // The count a later sweep compares with is of this list, not
             // of one that has emptied since.
@@ -25419,6 +25497,7 @@ impl Reader {
                     && self.opts.copy_start_at_rank
                     && rank != usize::MAX)
                     .then(|| start - lo);
+                let mut pace: Option<Pace> = None;
                 if !fetched && self.opts.scan_prefetch {
                     prefetch_block(
                         self.zc(seg).is_none().then(|| seg.raw()),
@@ -25441,15 +25520,22 @@ impl Reader {
                         None => table.slots[b + 1].as_deref(),
                     };
                     if let Some(next) = next {
-                        prefetch_block(
-                            self.zc(seg).is_none().then(|| seg.raw()),
-                            next,
-                            copy_at.map(|_| 0),
-                            hi,
-                            ahead - (hi - start),
-                            self.opts.scan_prefetch_bytes,
-                            self.opts.seek_prefetch_dir,
-                        );
+                        // A copy after a copy: paced through the walk below
+                        // (`Options::scan_prefetch_paced`); else the burst.
+                        match (self.opts.scan_prefetch_paced, form, next) {
+                            (true, Cached::Block(_), Cached::Block(nb)) => {
+                                pace = Some(Pace::of(nb))
+                            }
+                            _ => prefetch_block(
+                                self.zc(seg).is_none().then(|| seg.raw()),
+                                next,
+                                copy_at.map(|_| 0),
+                                hi,
+                                ahead - (hi - start),
+                                self.opts.scan_prefetch_bytes,
+                                self.opts.seek_prefetch_dir,
+                            ),
+                        }
                         fetched = true;
                     }
                 }
@@ -25589,13 +25675,22 @@ impl Reader {
                                 fs.span_starts.set(fs.span_starts.get() + 1);
                             }
                         }
-                        for e in &blk.ents[i..] {
+                        for (n, e) in blk.ents[i..].iter().enumerate() {
                             if seen >= limit {
                                 break;
+                            }
+                            if let Some(p) = pace.as_mut() {
+                                if n.is_multiple_of(PACE_STEP) {
+                                    p.step();
+                                }
                             }
                             let k = blk.key(e);
                             blk.each_value(e, |v| f(k, v));
                             seen += 1;
+                        }
+                        if pace.is_some() {
+                            let fs = self.fs();
+                            fs.prefetch_paces.set(fs.prefetch_paces.get() + 1);
                         }
                     }
                     Cached::Wide(w) => {
@@ -25605,6 +25700,11 @@ impl Reader {
                             .walk_block(src, pr, start..hi, &ov, limit - seen, |_k| {}, &mut *f)?
                             .0;
                     }
+                }
+                // The rest of the next block's prefetch, where the walk was
+                // shorter than its pace or took another shape.
+                if let Some(mut p) = pace.take() {
+                    p.finish();
                 }
                 // What this read took from the block is what pays for a
                 // copy of it; past the crossover the store holds it both
@@ -30174,6 +30274,13 @@ impl Db {
     pub fn copy_starts(&self) -> [u64; 2] {
         self.take_back_upkeep();
         self.r.fs().copy_starts.get()
+    }
+
+    /// The writer's copy walks that paced the next block's prefetch
+    /// through themselves (`Options::scan_prefetch_paced`).
+    pub fn prefetch_paces(&self) -> u64 {
+        self.take_back_upkeep();
+        self.r.fs().prefetch_paces.get()
     }
 
     /// The writer's settles over the store's life: settles run, keys

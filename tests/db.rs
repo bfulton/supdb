@@ -5719,6 +5719,54 @@ fn a_copy_of_updates_starts_a_scan_at_the_seeks_rank() {
     assert!(searched2 > 0, "the block with the insert is searched");
 }
 
+/// A copy walk paces the prefetch of the copy block it reaches next through
+/// itself (`Options::scan_prefetch_paced`): over a partition of several
+/// blocks, every one a copy, the model's scans across block boundaries pace
+/// one with the option and none without, and read the same entries either
+/// way.
+#[test]
+fn a_copy_walk_paces_the_next_blocks_prefetch_through_itself() {
+    for on in [true, false] {
+        let d = dir(&format!("copy-prefetch-paced-{on}"));
+        let opts = Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(64 << 10),
+            scan_block_cache: true,
+            scan_prefetch_paced: on,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in (0..1200).step_by(3) {
+            m.append(&mut db, &key(k), &format!("p{k}"));
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        assert_eq!(db.levels(), (1, 0), "one partition of several blocks");
+        for k in (0..1200).step_by(3) {
+            m.append(&mut db, &key(k), &format!("u{k}"));
+        }
+        db.commit().unwrap();
+        m.check(
+            &db,
+            &format!("paced {on}: every key updated once, copies of the records"),
+        );
+        let [at_rank, _] = db.copy_starts();
+        assert!(at_rank > 0, "paced {on}: the scans walked copies");
+        let paces = db.prefetch_paces();
+        if on {
+            assert!(
+                paces > 0,
+                "paced {on}: walks across a block paced the next's prefetch"
+            );
+        } else {
+            assert_eq!(paces, 0, "paced {on}: the burst paces nothing");
+        }
+    }
+}
+
 /// A dense sparse form is converted into a copy from its own deltas and the
 /// partition's records (`Options::convert_from_form`), where the build from
 /// the sources gathered every key's run again. The forms here grow dense
