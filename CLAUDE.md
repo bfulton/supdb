@@ -3590,6 +3590,97 @@ have been paying a bill the waiter inherits.
 
 **A policy that took its gate from the policy beside it, and read its heat in the units of two counters.** The hot-raw policy's turn (`Options::zpages_hot_raw`, the hot partitions served raw beside the form files of the rest) was written beside the re-code policy's and took its condition -- the builder idle and nothing to build -- which a re-code needs, since a re-code is a build, and a release does not. At the bounded rung the load's drain lands its last five partitions after the crossing and the controller builds their form files through the first mixes, so in a pairing of the mixes the policy never looked (`zpage_hot_looks` 0 in both arms) and the pairing read the instrument's cost alone, a tenth against the policy's arm in one rep: the shape a policy that costs and does nothing has. Then three readings of its heat were wrong before one was right. A served form file's heat was its decode *time*, and a decode's time holds the fault on a page not yet in, so under the uniform read pass the partitions whose files were coldest read hottest and two were released for it; the counts are the heat now, every count priced at the store's mean decode. The skew was the partition's share of the heat over its share of the keys, and the first window after the install is thin -- the files attached and warmed inside it -- so one partition in twenty-four read 1.3x its share on noise and was released; the skew is read against the median partition's reads a key now, over a window of at least thirty-two sampled events, which a uniform pass never crosses and the Zipfian's second to fourth partitions, at 1.2x their share of the keys but two to four times the median, do. And the window's count was taken as the form files keep it, sixteen times the samples, beside the raw partitions' count in samples, so a raw partition read sixteen times colder than a served one and the swap rule would have churned; the test's trace showed a heat sixteen times the arithmetic before any pairing ran on it. The rules: a gate copied from another mechanism is derived again from what this one needs, and a pairing of a policy is read after the counts that say it acted in its arm -- its looks and its moves -- since a policy that never acted prices nothing but its hooks; a measure of heat is a count and not a time wherever the time can hold a wait; a share read from a window is read with the window's size beside it, and against the median of its peers rather than a nominal share, since the peers carry the same noise; and two counters compared are brought to one unit first, the trace printing both so that a factor of sixteen is read off the arithmetic and not off a pairing.
 
+**An instrument of the profile read as the engine's.** The row's E at
+ten million keys under 1.25 GiB, the hot partitions raw and the rest
+compact, put 73 of its thread's 962 samples in `clock_gettime` where
+LMDB's E put 11, and the difference was read as the census window's two
+stamps an operation, the clock at every counted operation's start and end
+for the busy wall its fault price is drawn from. A lever was built for
+them -- one operation in sixteen stamped once a window is a thousand
+operations long (`Options::zpages_census_sample`), every operation of a
+shorter window still, since a window that short is one of slow operations,
+the faulting regime the price is for -- and paired in the row's shape
+against the arm that stamps every one (`supdb-zbusyevery`) E read 0.98x in
+both reps, under the pairing's resolution. The profile taken again
+without the harness's counter variable put the thread's clock samples at
+one of 973: the profiling script had set `SUPDB_MIX_COUNTERS`, which turns
+the scan timers on for the supdb arm and for no comparator
+(`bench/src/engines.rs`), ten clock reads a scan the row never pays, and
+the census's stamps were the rest. This file already said that a cell
+against a comparator is read from a pairing with the counters off; a
+profile is the same measurement, and the symbols the comparator lacks are
+the first place the instruments the environment turned on show. The rule:
+a profile is taken under the row's environment and nothing more, and a
+symbol the comparator does not have is checked against the instruments
+before it is checked against the engine; and a lever built on a reading
+is held to the reading after it is built -- here the clock samples --
+before it is held to the rate.
+
+**A run written for the store with nothing unsealed, measured on the one
+with something.** The block walk's clean run joins every clean block after
+the one it stands on into one walk of the partition, so that a scan of a
+hundred over a drained store is one dispatch and not three; it took a
+block as clean by the form in the table's slot, which a block no walk had
+built does not have, and the canonical table's null forms only while that
+table was complete. A drained store has every block built or every form
+null and complete, and the run was priced there. The write mixes leave a
+few unsealed keys in every partition, so no partition takes the bulk walk,
+the table is incomplete at every commit, and the cold partitions' blocks
+are ones no scan has visited: a scan there built one block, ran one block,
+and dispatched into the form file again at the next. The run builds the
+block it reaches now, where it has the snapshot, and takes it when it
+comes out clean (`Options::scan_run_builds`; `supdb-norunbuilds` is the
+run that stops), and a canonical table that is incomplete reads a null
+form through the slot as the walk itself does; paired in the row's shape
+E read 0.96x for the arm without it in both reps of one sitting and 3.5%
+in a second with the counters on, under the resolution. The promotion
+after a walk (`Options::promote_entries`) had credited every key a run
+took to the run's last block and copied the first block's ranks into the
+last block's slot, which the gate's promotion test caught once the run
+extended over unvisited blocks: it credits each block of the run with
+what the run took from it and judges each on its own ranks. The rule: a
+shortcut is priced on the store the workload leaves, not the store the
+pass before left, since a store with nothing unsealed is the one shape the
+mixes never show; and bookkeeping written for one block is read again
+when the thing it books becomes several.
+
+**A cursor a block for a scan that crosses two, and a count that named it.**
+A block's reads of its covered partition went through one cursor since
+the per-run dispatch was priced (`Options::zpages_block_cursor`), and each
+block's walk and each block's build placed its own, while a clean run
+dispatched into the form afresh; a scan of fifty crosses 1.8 blocks, and
+the distinct keys the write mixes leave are spread flatter than the draws
+that made them, so two in three of a covered scan's blocks in E at ten
+million keys under 1.25 GiB held an unsealed key, and the scan placed 2.5
+cursors or dispatches, each a rank search over a cold fence, a group
+opened again and a page header checked, 6.5 groups opened where the scan
+spans 2.7. The clean run's extension, built on the reading that the
+dispatches were the block boundaries', moved the dispatch count by nothing
+(`zpage_scans` 66,228 against 65,946 in E) and the clean walks by a
+quarter: the count said the boundaries were not the cause and the sparse
+blocks' cursors were. One cursor is held across the blocks a scan walks in
+a partition now, the clean runs and the sparse walks through it
+(`Options::zpages_scan_cursor`; `supdb-blockcursors` is the arm), and a
+cursor behind the rank a read asks for steps over a few records and is
+placed afresh past sixteen (`CURSOR_STEP`), since each step across a group
+decodes it. The first shape lent the scan's cursor to the builds as well
+and read E 4% slower with the groups opened up 6%: a build moves the
+cursor to its keys' cuts and the walk after it starts behind them, so the
+cursor was placed afresh and decoded the group it held again, where a
+build's own cursor leaves its groups in the memo for the walk. Builds
+place their own, the walks share: E's dispatches 48,800 against 59,800
+and its groups 171,000 against 178,000 in one rep with the counters on, E
+1.06x there and 1.00x over a sitting of two whose untouched cells -- the
+point-read mixes, the scan pass -- moved a tenth and more, so the count is
+the verdict and the rate unresolved. The rule: a lever built on a reading
+of a count is held to the count after it is built, before it is held to
+the rate, since a rate that moves a little in the right direction can be
+the lever's side effect and not its mechanism; a per-block structure is
+read against the blocks a scan crosses, since a scan of fifty over blocks
+of sixty-four is two blocks more often than one; and a cursor lent to a
+step that moves it is lent at the cost of the step after, which starts
+where the lender left off and not where the borrower did.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
