@@ -3793,6 +3793,126 @@ every key in one run; and a sweep at every operation's end is held to the
 guard its siblings have, since a pin that stands for a mix makes the sweep
 run for the mix.
 
+**A profile's largest symbol, read for its callers before it was read as
+anyone's.** The flat profile of E at ten million keys under 1.25 GiB put
+22% of the mixes thread in `memmove`, and the reading was the harness's
+copy of every value into its sink, the same bytes the comparator copies at
+12% of its thread, so the lever built on it was the copy block's values
+prefetched whole ahead of the walk where the first kilobyte had been
+(`Options::copy_prefetch_whole`), built before the callers were known. The
+profile with call graphs put the sink at 3% of the thread and the copies in
+the scan path's own block builds (`BuildCtx::materialize` 6.6% with its
+copies, `deltas_for` 5.3%) and the covered path's group opens (15.6%, the
+decode 11.2% of it); the counted run put the writer's builds at 15,396
+sparse, 29,538 clean and 619 copies over 158,000 scans, and 144,349 group
+decodes for about 17,000 covered scans, nine opens each, with the memo
+answering 7%. Paired in the row's shape the whole prefetch read E 0.95x in
+one sitting and 1.23x in the next, the scan pass 0.95x and 0.89x, the
+releases falling differently in each: unresolved, the kilobyte stays and
+`supdb-copyprefetchwhole` is the arm. The rule: a library symbol's share
+is attributed by its callers before a lever is built on it -- `memmove`
+has every copy in the process behind it and names none of them -- and a
+profile read beside the comparator's counts the symbols the comparator
+lacks before the ones both have.
+
+**A seed the shortcut beside it threw away.** The covered scan's start
+seek found its rank through the fence and one group, and the first block's
+walk then placed a second cursor at that rank: a second fence search, a
+view and a memo hit for the group the seek had just opened. Seeded -- the
+seek through the form file's cursor, kept as the partition's reader's and
+resumed by the walk (`Options::zpages_seek_seeds`) -- E read 1.20x in one
+rep of two and the scan pass 0.82x in both, with the form's dispatches
+doubled (`zpage_scans` 10.06 million against 5.05): a drained store's scans
+take the one-walk shortcut ahead of the block loop, which dispatched afresh
+and left the seeded cursor to be closed unused, so every scan of the
+drained passes paid the seek's placement and a second. A test of a handle's
+scan over a drained covered store reproduced it, two dispatches and a view
+where the shape before had one and none; the shortcut goes through the
+seeded cursor now. The gate then found the same leak in the other
+direction: a first block held as a copy, the promotion's, walks from the
+copy and never through the reader, so the seeded cursor was closed unused
+there too and counted as a form walk under a scan that walked none. The
+seek hands its cursor to the walk, which seeds the reader only where the
+first block walks through it -- a sparse block, a clean run -- and lets it
+go otherwise with its counts filed and no walk counted (`pwalk_discard`).
+The scan pass read 1.25x for the seed in both reps of
+the sitting after, with the form's dispatches one a scan in both arms and
+the memo's hits down by the second placements' (368,000 against 5.4
+million over a sitting), and 0.87x in one rep of a clean third whose E
+read 0.89x for the seed in both -- a spread the remembered pin's sittings
+also showed, 0.97x one way and then 1.10x the other for a mechanism that
+touches no scan, so the count is the verdict and the rate unresolved, as
+the scan's one cursor was read. On; `supdb-zseekrank` is the arm. The
+rule: a structure handed to a walk is checked at every dispatch that can
+take the walk's place and at every form the walk can take, and a count
+that moves the wrong way under a lever names the path the lever never
+reached, before any rate is read; a cursor that opened a group and walked
+nothing is the seek's and not a scan's, so its close counts no walk.
+
+**A bar taken for the policy's limit, and room the kernel was using.** The
+hot-raw policy released five partitions in one rep and eight in another
+while its trace showed 55-115 MB of room unused and the sixth partition
+held cold at 1.09x the median partition's reads a key against a bar of
+1.5x, so the bar read as the binding constraint and the room as E's gain
+to take: the covered scans, eight decodes each, were 11% of E's scans and a
+third of its thread. The bar relaxed to the median where the candidate fit
+the room (`Options::zpages_hot_skew_room`) released eighteen partitions a
+rep, and E read 0.72x in both reps of two sittings, D 0.86x, F 0.88x, with
+C 1.23x and 2.0x and B 1.28x: E took 0.037 major faults an operation
+against 0.0014 and read 153 bytes an operation at the device against 5.7,
+the group's cache at its limit with 765 MB of raw partitions in it, and the
+policy made twenty-one back moves, five swaps and six fulls across the
+mixes. The room `memory.stat` showed unused was room the kernel needed for
+what the policy itself had asked in, and a release's costs -- a 42 MB
+device read, the form's drop, the eviction behind both -- land in the mix
+it happens in, where its gain accrues over the mixes after; C won because
+the partitions released by chance during the uniform read passes were raw
+when its Zipfian began, which no policy can arrange. Off;
+`supdb-zhotskewroom` is the arm. The rule: a policy's bound that reads as
+the binding constraint is relaxed in a pairing before it is called slack,
+and a release is priced by the costs that land in its window -- the device
+bytes, the faults, the moves -- beside the rep's release count, since the
+same engine with more releases is a slower engine in a short enough
+window; and a lever that trades one lost cell for another has not won
+either.
+
+**A sweep that walked the table at every end a pin held it, and the pin
+remembered.** The retired form files' and snapshots' sweeps at an
+operation's end walked every slot of the reader table, in sequentially
+consistent loads, at every operation for as long as a pin held what they
+would free -- the upkeep thread's passes through E, hundreds of them, each
+pinning the state a landing had replaced -- 3% of the mixes thread, and the
+retry guard moved only the guarded arm's share. The sweep remembers the
+slot the last walk found pinned below every tag and the epoch it was
+pinned at, and reads that one slot until it moves
+(`Options::sweep_remembers_pin`, `Readers::oldest_for`): exact, since a
+later pin is at a later epoch and a later retirement has a later tag, so
+nothing retired since the walk can be freed while the slot still shows the
+epoch, and the answer is the one that walk gave. Paired in the row's shape
+the shortcut answered 27,000-50,000 sweeps a sitting with no walk where
+the shape before walked every one, and the rates read E 0.97x for the walks
+in one sitting and 1.10x in the next, with the mixes both ways: the count
+is the verdict and the rate unresolved, as the scan's one cursor was read;
+`supdb-sweepwalks` is the arm. The rule: a check that re-reads a whole set
+to confirm a blocker it found last time reads the blocker first, and a
+guard put on one path's sweep is checked on every path that sweeps.
+
+**A memo that took every decode of a walk that reads each group once.**
+The memo of decoded groups took every group a cursor decoded: a buffer
+recycled thousands of decodes ago and cold, an `Arc` allocated for it, the
+displaced entry's freed, and the group's lines written into a slot the
+walk would read once. A walk's groups after its first decoded into the
+cursor's own buffer, the memo asked and not written
+(`Options::zpages_walk_owns_decodes`), owned 31 million of the row's
+decodes and read the scan pass 1.02-1.05x in three reps of four, E 0.98x
+and 1.05x, C both ways: unresolved, so the memo's path is the default and
+`supdb-zwalkowns` is the arm; the walk's groups after the first were
+fourteen of twenty-two until the page's first group, opened by the
+cursor's load and not its next-group step, carried the flag too, which the
+test found by count. The rule: a flag that marks one step's opens is
+carried by every path the step takes to an open, and an option is held to
+the count that says its mechanism fired before its rate is read.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
