@@ -559,6 +559,43 @@ pub fn record_key_next(buf: &[u8], off: usize) -> Option<(&[u8], usize)> {
     (next <= buf.len()).then_some((key, next))
 }
 
+/// The common record read in place for a walk: the record at `off` where it
+/// is the compact shape with a fixed run -- one inline extent of `records`
+/// values of one width, the shipped writer's record and the suite's -- as
+/// its key, its run, the count and the offset of the record after it;
+/// `None` for any other shape, for a run whose length is not a multiple of
+/// its count, and for a record cut short, each of which the caller parses
+/// the general way, where `parse_record` judges it. `Blob::scan_at` reads
+/// the raw record region's records so, by the directory's offsets; a
+/// decoded group of the compact form holds the same images end to end, and
+/// its walk read each through `parse_record` and `read_exts`, five hundred
+/// instructions a record against the raw walk's hundred and thirty-five by
+/// callgrind at three hundred thousand keys (`bench/examples/scan_only.rs`).
+#[inline]
+pub(crate) fn compact_fixed_at(buf: &[u8], off: usize) -> Option<(&[u8], &[u8], usize, usize)> {
+    let h: &[u8; 4] = buf.get(off..off.checked_add(4)?)?.try_into().ok()?;
+    if u16::from_le_bytes([h[2], h[3]]) != COMPACT {
+        return None;
+    }
+    let klen = u16::from_le_bytes([h[0], h[1]]) as usize;
+    let key_at = off + 4;
+    let e_at = align_up(key_at + klen, REC_ALIGN);
+    let cb: &[u8; 4] = buf.get(e_at..e_at + 4)?.try_into().ok()?;
+    let c = u16::from_le_bytes([cb[2], cb[3]]);
+    if c & C_FIXED == 0 {
+        return None;
+    }
+    let elen = u16::from_le_bytes([cb[0], cb[1]]) as usize;
+    let records = (c & !(C_FIXED | C_TOMB)) as usize;
+    if records == 0 || elen == 0 || !elen.is_multiple_of(records) {
+        return None;
+    }
+    let run = buf.get(e_at + 4..e_at + 4 + elen)?;
+    let key = buf.get(key_at..key_at + klen)?;
+    let next = off + record_len_compact(klen, elen);
+    (next <= buf.len()).then_some((key, run, records, next))
+}
+
 #[inline]
 pub fn parse_record(buf: &[u8], off: usize) -> Option<ParsedRecord<'_>> {
     let klen = rd_u16(buf, off)? as usize;

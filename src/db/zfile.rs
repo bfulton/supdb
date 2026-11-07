@@ -40,7 +40,9 @@ use super::zpages::{
 };
 use crate::blob::{Blob, BlobOptions, ZSource};
 use crate::bytes::{Bytes, MmapBytes};
-use crate::flatindex::{parse_record, parse_record_tail, rd_u32, record_key, record_key_next};
+use crate::flatindex::{
+    compact_fixed_at, parse_record, parse_record_tail, rd_u32, record_key, record_key_next,
+};
 use crate::index::Ext;
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering as KeyOrder;
@@ -294,6 +296,23 @@ impl<'a> CodedGroup<'a> {
             count,
             head0,
         })
+    }
+}
+
+/// A fixed run's values handed to `f` with the key, as `Blob::scan_at`'s
+/// fast path hands them: the one value without a division, the rest as
+/// slices of one width, which `compact_fixed_at` has held the run to.
+#[inline]
+fn emit_fixed<F: FnMut(&[u8], &[u8])>(k: &[u8], run: &[u8], records: usize, f: &mut F) {
+    if records == 1 {
+        f(k, run);
+        return;
+    }
+    let w = run.len() / records;
+    let mut p = 0usize;
+    while let Some(v) = run.get(p..p + w) {
+        f(k, v);
+        p += w;
     }
 }
 
@@ -949,6 +968,24 @@ impl<'a> ZCursor<'a> {
             {
                 let group = self.group();
                 while n < limit && rank < end {
+                    // The common record in place; any other shape through
+                    // the parse.
+                    if let Some((k, run, records, next)) = compact_fixed_at(group, off) {
+                        if let Some(u) = until {
+                            match k.cmp(u) {
+                                KeyOrder::Less => {}
+                                order => {
+                                    stop = Some(order);
+                                    break;
+                                }
+                            }
+                        }
+                        emit_fixed(k, run, records, f);
+                        off = next;
+                        rank += 1;
+                        n += 1;
+                        continue;
+                    }
                     let Some((k, exts, tail, len)) = parse_record(group, off) else {
                         damaged = true;
                         break;
@@ -2815,13 +2852,23 @@ impl ZFile {
                     off = next;
                 }
                 for _ in 0..want {
-                    let Some((k, exts, tail, len)) = parse_record(group, off) else {
-                        self.fail(p);
-                        out.end = ScanEnd::Fallback;
-                        return Ok(());
-                    };
-                    raw.read_exts(&exts, tail, &mut |v: &[u8]| f(k, v))?;
-                    off += len;
+                    // The common record in place, as the raw walk reads it;
+                    // any other shape through the parse.
+                    match compact_fixed_at(group, off) {
+                        Some((k, run, records, next)) => {
+                            emit_fixed(k, run, records, f);
+                            off = next;
+                        }
+                        None => {
+                            let Some((k, exts, tail, len)) = parse_record(group, off) else {
+                                self.fail(p);
+                                out.end = ScanEnd::Fallback;
+                                return Ok(());
+                            };
+                            raw.read_exts(&exts, tail, &mut |v: &[u8]| f(k, v))?;
+                            off += len;
+                        }
+                    }
                     out.seen += 1;
                     rank += 1;
                 }
