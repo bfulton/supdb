@@ -3757,6 +3757,42 @@ prefetch of the next group's lines, a dozen instructions behind a walk
 that is lead enough, moved E by a fifth where the probe over hot pages
 had read the whole page's lines as a tenth of a decode.
 
+**A prefetch read as a stall of its own instructions, and a pace that lost
+to the burst.** The block walk's prefetch of the next copy block, forty-eight
+lines in one burst at a block's start, had been priced by taking it away (E
+1.23x in core with it) and stood; the profile of E at ten million keys under
+1.25 GiB put 8.7% of the thread in it, and the source lines put fifty-nine
+of its seventy-three samples on the prefetch instructions themselves, which
+read as a burst outrunning the core's fill buffers, each prefetch past them
+waiting a memory round trip. Paced through the walk of the block before --
+four lines of each of the next block's three buffers every sixteen entries,
+the whole by the forty-eighth and the rest at the walk's end
+(`Options::scan_prefetch_paced`) -- the walk read E 0.90x in both reps of
+the row's shape, with the arm's own hot-raw policy releasing a partition
+more, so the burst stands and the pace is the arm (`supdb-pacedprefetch`).
+The samples on the prefetch instructions were the lines' arrival, not the
+issuing: a prefetch that finds no fill buffer waits for one, and whether it
+waits at the block's start or spread through the walk, the lines cost what
+they cost, while the burst at the block's start has the whole walk of the
+block as its lead where the pace's last step had sixteen entries. Two more
+things the same profile named were bookkeeping with the wrong shape. The
+sparse form's search for a key within a cut's run walked the run by key, and
+the keys past a partition's end all share its last cut, so E's inserts,
+eight thousand above every key in the store, each walked past every one
+before it; the run is searched by binary search now, with one compare for a
+key above the last. And the retired form files' sweep at an operation's end
+walked the reader table's two hundred and sixty-five slots at every
+operation for as long as a pin held the files -- the hot-raw policy's
+releases through a mix -- where the forms' and snapshots' sweep beside it
+had a retry guard; the files are under the same guard now. The rules: a
+profile's samples on a prefetch instruction price the lines it waits for,
+not the issuing, and a lever that moves where the waiting happens is held to
+the pairing before the reading is believed; a search within a run keyed by
+one quantity is a search, never a walk, since a workload exists that puts
+every key in one run; and a sweep at every operation's end is held to the
+guard its siblings have, since a pin that stands for a mix makes the sweep
+run for the mix.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
