@@ -3937,7 +3937,8 @@ sitting. It read E 0.73x in one sitting and level in the next, and the
 scrambled E 1.42x and 1.12x, while the scrambled E's faults stayed at
 0.06-0.08 an operation in every arm with the room, with the way back or
 without it. So the way back is the arm (`supdb-zhotcoldback`), the units are
-a fix, and the scrambled E's faults are still the room's. The rules: a
+a fix, and the scrambled E's faults were read as the room's -- they were the
+way back's own, as the entry on a move made in one step says. The rules: a
 pairing runs the row's whole order, through every pass after the cell it was
 built for, since a policy whose state outlives the mix it was made in pays in
 the mixes after it. And a policy's way back is a move with the way out's
@@ -4003,6 +4004,28 @@ thread's profile is read, since a profile of a thread that waits shows
 its work and not the wait; and a lever on a device's queue is held to
 the latency it is for, the commits', not to the count of what it
 changed.
+
+**A move made in two steps one way and in one the other.** The hot-raw
+policy's release asks the kernel for a partition's raw pages and flips only
+once nine tenths of them are resident; its way back attached the form file at
+the look that decided it. A form file is advised random from its attach, which
+is right for the point reads it was advised for, so a file attached cold came
+in a 4 KB fault at a time under the scans it served. Every mix that took a
+major fault at ten million keys under 1.25 GiB had a back move in it, and every
+mix with releases alone took none: the scrambled E made two or three backs as
+its block cache took the budget under the fill share, and took 0.07-0.08 faults
+an operation, about two form files' pages. Two notes before this one had put
+those faults on the room's releases and on the raw partitions staying raw; the
+phase each move fell in, printed beside the mixes' fault counts, said otherwise
+in one run. The way back asks for the form file's pages now and attaches the
+file a look later, the raw form serving meanwhile
+(`Options::zpages_hot_back_ask`; `supdb-zbacknow` is the move in one step),
+and the scrambled E read 1.72x and 1.21x in two sittings with no faults. The
+rules: a move between two forms is made in the same steps both ways, the pages
+asked ahead of the flip, since a mapping advised for one access pattern reads a
+cold file at the worst rate it has; and an effect put on a policy is read
+against the moves the policy made, mix by mix, before it is put on the
+policy's choice of what to move.
 
 ## Standing limitations
 
