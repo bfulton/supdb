@@ -3756,6 +3756,11 @@ pub(super) struct ZEvents {
     /// end with the pages short of the share.
     pub hot_back_asks: AtomicU64,
     pub hot_back_waited: AtomicU64,
+    /// The form files asked for whole where scans came back after a
+    /// stretch without one (`Options::zpages_rewarm_scans`): the looks
+    /// that asked, and the files.
+    pub rewarms: AtomicU64,
+    pub rewarm_files: AtomicU64,
     /// Re-codes made by exchanging the served form file with the kept one.
     pub recode_flips: AtomicU64,
     /// Spares built and kept (`Options::zpages_both`), and spares that kept

@@ -9891,6 +9891,127 @@ fn the_controller_serves_the_hottest_partition_raw_within_the_budget() {
     }
 }
 
+/// Out of core with the form installed, the scans that come back after a
+/// stretch without one have the form files the page cache has lost asked
+/// for whole (`Options::zpages_rewarm_scans`): every form file dropped from
+/// the cache, a second and a half of the injected clock with no scan, then
+/// a scan of one entry, and the look after it asks for each file under the
+/// share resident and the files come back; a scan with no quiet stretch
+/// before it asks for nothing again. Without the option nothing is asked
+/// and the files stay out. The scan that brings the look is of one entry,
+/// so that the scan's own faults are not what brings the files back, and
+/// the writer's, since a handle counts its scans once a commit.
+#[cfg(target_os = "linux")]
+#[test]
+fn scans_after_a_quiet_stretch_have_the_cold_form_files_asked_for() {
+    for on in [true, false] {
+        let what = format!("rewarm {on}");
+        let (dir, db, model, inject) = auto_store_with(
+            &format!("auto-rewarm-{on}"),
+            1 << 20,
+            1_000_000.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_rewarm_scans = on;
+                o.zpages_hot_raw = false;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        let n = db.zpage_counts().form_files;
+        assert!(n >= 5, "{what}: form files: {:?}", db.zpage_counts());
+        // Every form file out of the cache: this process's mappings of it
+        // unmapped, then its pages dropped.
+        for p in form_files(&dir) {
+            unmap_pages(&p);
+            evict(&p);
+        }
+        let (size, cold) = resident_under(&dir, "zpg-");
+        assert!(
+            cold * 10 < size,
+            "{what}: the form files out of the cache: {cold} of {size}"
+        );
+        // A stretch with no scan, then a scan of one entry.
+        for _ in 0..5 {
+            advance_tick(&db, std::time::Duration::from_millis(300));
+        }
+        let mut one = 0usize;
+        db.scan(b"", 1, kv(&mut |_, _| one += 1)).unwrap();
+        assert_eq!(one, 1, "{what}: the scan");
+        advance_tick(&db, std::time::Duration::from_millis(200));
+        advance_tick(&db, std::time::Duration::from_millis(200));
+        let c = db.zpage_counts();
+        if on {
+            assert_eq!(c.rewarms, 1, "{what}: one rewarm: {c:?}");
+            assert!(
+                c.rewarm_files + 1 >= n,
+                "{what}: every cold file asked for: {c:?}"
+            );
+        } else {
+            assert_eq!((c.rewarms, c.rewarm_files), (0, 0), "{what}: {c:?}");
+        }
+        // The asks land in the cache; without them the files stay out.
+        let t = std::time::Instant::now();
+        let mut warm = resident_under(&dir, "zpg-").1;
+        while on && warm * 10 < size * 9 && t.elapsed().as_secs() < 30 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            warm = resident_under(&dir, "zpg-").1;
+        }
+        if on {
+            assert!(
+                warm * 10 >= size * 9,
+                "{what}: the form files back in the cache: {warm} of {size}"
+            );
+        } else {
+            assert!(
+                warm * 2 < size,
+                "{what}: the form files left out: {warm} of {size}"
+            );
+        }
+        // A scan with no quiet stretch before it asks for nothing more, the
+        // files out of the cache again so that there would be something to
+        // ask for.
+        for p in form_files(&dir) {
+            unmap_pages(&p);
+            evict(&p);
+        }
+        let (size, cold) = resident_under(&dir, "zpg-");
+        assert!(
+            cold * 10 < size,
+            "{what}: the form files out of the cache again: {cold} of {size}"
+        );
+        db.scan(b"", 1, kv(&mut |_, _| one += 1)).unwrap();
+        advance_tick(&db, std::time::Duration::from_millis(200));
+        db.scan(b"", 1, kv(&mut |_, _| one += 1)).unwrap();
+        advance_tick(&db, std::time::Duration::from_millis(200));
+        assert_eq!(
+            db.zpage_counts().rewarms,
+            u64::from(on),
+            "{what}: no rewarm without the quiet: {:?}",
+            db.zpage_counts()
+        );
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// Under the controller with the hot-raw policy and the skew read over the
 /// window's looks (`Options::zpages_hot_raw_slack`), a partition read under
 /// the sample floor at every look but steadily across the window's looks is

@@ -794,6 +794,9 @@ pub struct Supdb {
     /// that decides it, its pages unasked (`Options::zpages_hot_back_ask`
     /// off). `supdb-zbacknow`.
     zbacknow: bool,
+    /// No cold form file asked for where scans come back after a stretch
+    /// without one (`Options::zpages_rewarm_scans` off). `supdb-norewarm`.
+    norewarm: bool,
     /// A direct run's record stream kept whole in the arena, the shape
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
@@ -1729,6 +1732,9 @@ struct Policy {
     /// that decides it, its pages unasked (`Options::zpages_hot_back_ask`
     /// off). `supdb-zbacknow`.
     zbacknow: bool,
+    /// No cold form file asked for where scans come back after a stretch
+    /// without one (`Options::zpages_rewarm_scans` off). `supdb-norewarm`.
+    norewarm: bool,
     /// A direct run's record stream kept whole in the arena, the shape
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
@@ -2242,6 +2248,7 @@ impl Default for Policy {
             settlelazyraw: false,
             mergesync1m: false,
             zbacknow: false,
+            norewarm: false,
             norecycle: false,
             heapblocks: false,
             keysarena: false,
@@ -5717,6 +5724,18 @@ impl Supdb {
         )
     }
 
+    /// `supdb` that asks for no cold form file where scans come back after a
+    /// stretch without one (`Options::zpages_rewarm_scans` off).
+    pub fn create_norewarm(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                norewarm: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-ingest` as `supdb-latesync`.
     pub fn create_ingest_latesync(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
@@ -7243,6 +7262,7 @@ impl Supdb {
             settlelazyraw,
             mergesync1m,
             zbacknow,
+            norewarm,
             norecycle,
             heapblocks,
             keysarena,
@@ -7615,6 +7635,7 @@ impl Supdb {
             settle_lazy_raw: settlelazyraw,
             merge_sync_ahead: if mergesync1m { 1 << 20 } else { 0 },
             zpages_hot_back_ask: !zbacknow,
+            zpages_rewarm_scans: !norewarm,
             prefault: populate,
             direct_put_one: !recordsteps,
             direct_stream: !copyvals && !refvals,
@@ -7925,6 +7946,7 @@ impl Supdb {
             settlelazyraw,
             mergesync1m,
             zbacknow,
+            norewarm,
             norecycle,
             heapblocks,
             keysarena,
@@ -8995,6 +9017,9 @@ impl Engine for Supdb {
         if self.zbacknow {
             return "supdb-zbacknow";
         }
+        if self.norewarm {
+            return "supdb-norewarm";
+        }
         if self.norecycle {
             return if self.partition {
                 "supdb-norecycle"
@@ -9547,6 +9572,8 @@ impl Engine for Supdb {
             ("zpage_hot_asks", z.hot_asks as f64),
             ("zpage_hot_dropped", z.hot_dropped as f64),
             ("zpage_hot_back_asks", z.hot_back_asks as f64),
+            ("zpage_rewarms", z.rewarms as f64),
+            ("zpage_rewarm_files", z.rewarm_files as f64),
             ("zpage_spare_files", z.spare_files as f64),
             ("zpage_spare_builds", z.spare_builds as f64),
             ("zpage_spare_failed", z.spare_failed as f64),
@@ -10428,6 +10455,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-settlelazyraw"
         | "supdb-mergesync1m"
         | "supdb-zbacknow"
+        | "supdb-norewarm"
         | "supdb-norecycle"
         | "supdb-heapblocks"
         | "supdb-keysarena"
@@ -11246,6 +11274,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-settlelazyraw" => supdb_arm(Supdb::create_settlelazyraw, dir)?,
         "supdb-mergesync1m" => supdb_arm(Supdb::create_mergesync1m, dir)?,
         "supdb-zbacknow" => supdb_arm(Supdb::create_zbacknow, dir)?,
+        "supdb-norewarm" => supdb_arm(Supdb::create_norewarm, dir)?,
         "supdb-ingestlatesync" => supdb_arm(Supdb::create_ingest_latesync, dir)?,
         "supdb-norecycle" => supdb_arm(Supdb::create_norecycle, dir)?,
         "supdb-ingestnorecycle" => supdb_arm(Supdb::create_ingest_norecycle, dir)?,
@@ -12828,6 +12857,13 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.zpages_hot_back_ask && b.zpages_hot_back_ask);
+            }
+            {
+                let z = Supdb::create_norewarm(&dir("norewarm")).unwrap();
+                assert_eq!(z.name(), "supdb-norewarm");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.zpages_rewarm_scans && b.zpages_rewarm_scans);
             }
             {
                 let z = Supdb::create_sweepwalks(&dir("sweepwalks")).unwrap();

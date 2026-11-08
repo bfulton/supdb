@@ -719,6 +719,11 @@ pub struct ZCounts {
     /// end with the pages short of the share.
     pub hot_back_asks: u64,
     pub hot_back_waited: u64,
+    /// The form files asked for whole where scans came back after a
+    /// stretch without one (`Options::zpages_rewarm_scans`): the looks
+    /// that asked, and the files.
+    pub rewarms: u64,
+    pub rewarm_files: u64,
     /// Block-coded partitions re-parsed while served
     /// (`Options::zpages_reparse`).
     pub reparses: u64,
@@ -4340,6 +4345,26 @@ pub struct Options {
     /// took none. Off attaches the file at the look that decides it,
     /// `supdb-zbacknow`.
     pub zpages_hot_back_ask: bool,
+    /// Out of core with the form installed, where scans come back after a
+    /// stretch of `REWARM_QUIET` without one, every form file the page
+    /// cache holds under `HOT_RAW_RESIDENT` of is asked for whole
+    /// (`MADV_WILLNEED`) once no merge is in flight, on a thread of its
+    /// own, so its pages come in at the device's sequential rate and not a
+    /// 4 KB fault at a time under the scans: a form file is advised random
+    /// from its attach. The burst before the lag sweep's full-rewrite pass
+    /// at ten million keys under 1.25 GiB leaves 250 MB of the 746 MB of
+    /// form files out of the cache -- each built at a merge's finish with
+    /// its pages kept, then pushed out by the burst's later writes, as a
+    /// page written once and never read is -- and 97% of that pass's major
+    /// faults landed in them, eleven files of twenty-nine read cold end to
+    /// end. Asked at the pass's start, beside the chain's last merges, the
+    /// pages were pushed out again (117,000 refaults against 25,000), so
+    /// the ask waits for the chain. Paired at ten million keys under
+    /// 1.25 GiB the ten-percent pass read 1.24x and 1.81x in two sittings
+    /// with its faults a tenth, the full rewrite's 0.99x and 1.13x, and the
+    /// mixes found no form file cold (`docs/engine.md`). On;
+    /// `supdb-norewarm` asks for nothing.
+    pub zpages_rewarm_scans: bool,
 }
 
 impl Options {
@@ -4635,6 +4660,7 @@ impl Default for Options {
             zpages_walk_owns_decodes: false,
             zpages_hot_cold_back: false,
             zpages_hot_back_ask: true,
+            zpages_rewarm_scans: true,
         }
     }
 }
@@ -5530,12 +5556,13 @@ impl ZFinish {
                     Ok(zfile::Outcome::Built(b)) => {
                         if trace {
                             eprintln!(
-                                "zfinish t={:.1} {label} wall_ms {} cpu_ms {} majflt {} file_mb {:.1}",
+                                "zfinish t={:.1} {label} wall_ms {} cpu_ms {} majflt {} file_mb {:.1} drop {}",
                                 epoch.elapsed().as_secs_f64(),
                                 b.wall_us / 1000,
                                 b.cpu_us / 1000,
                                 b.majflt,
-                                b.file_bytes as f64 / 1e6
+                                b.file_bytes as f64 / 1e6,
+                                plan.drop_output
                             );
                         }
                         ev.built(&b);
@@ -20008,6 +20035,8 @@ impl Reader {
             hot_dropped: get(&ev.hot_dropped),
             hot_back_asks: get(&ev.hot_back_asks),
             hot_back_waited: get(&ev.hot_back_waited),
+            rewarms: get(&ev.rewarms),
+            rewarm_files: get(&ev.rewarm_files),
             reparses: get(&ev.reparses),
             recode_flips: get(&ev.recode_flips),
             spare_builds: get(&ev.spare_builds),
@@ -37223,6 +37252,11 @@ pub const HOT_RAW_WINDOW: usize = 8;
 /// raw reads would queue behind it -- and no ask is made again for this
 /// long.
 const HOT_RAW_RESIDENT: f64 = 0.9;
+/// How long a stretch without a scan is before the scans after it have the
+/// cold form files asked for (`Options::zpages_rewarm_scans`): longer than
+/// the gaps between a pass's scans and between the mixes' scans, shorter
+/// than a burst that leaves the forms cold.
+const REWARM_QUIET: std::time::Duration = std::time::Duration::from_secs(1);
 const HOT_RAW_ASK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 const HOT_RAW_HOLD: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -37561,6 +37595,12 @@ struct Maint {
     /// file on disk for the residency of its pages.
     z_hot_back_ask: Option<(Vec<u8>, std::time::Duration, MmapBytes)>,
     z_hot_hold: Option<std::time::Duration>,
+    /// The scans counted at the last look of `Options::zpages_rewarm_scans`,
+    /// since when none has come, and the thread asking for the form files.
+    z_rewarm_life: u64,
+    z_rewarm_quiet: Option<std::time::Duration>,
+    z_rewarm_due: bool,
+    z_rewarm: Option<std::thread::JoinHandle<()>>,
 }
 
 /// A sample job in flight (`zfile::sample` over the live partitions, on a
@@ -37739,6 +37779,7 @@ impl Maint {
                 self.join_compact()?;
                 self.join_tier()?;
                 z_finish_wait(&self.shared);
+                self.z_rewarm_join();
                 self.sync_owed_slot()
             }
             MaintAsk::ZSettle => {
@@ -37746,6 +37787,7 @@ impl Maint {
                 self.join_compact()?;
                 self.join_tier()?;
                 z_finish_wait(&self.shared);
+                self.z_rewarm_join();
                 // Every partition given its form file or its reason, one
                 // build at a time, with whatever lands meanwhile landed:
                 // a merge's outputs are partitions of their own and get
@@ -38151,6 +38193,10 @@ impl Maint {
             z_hot_ask: None,
             z_hot_back_ask: None,
             z_hot_hold: None,
+            z_rewarm_life: 0,
+            z_rewarm_quiet: None,
+            z_rewarm_due: false,
+            z_rewarm: None,
         }
     }
 
@@ -40689,6 +40735,95 @@ impl Maint {
         zfile::ZEvents::add(&shared.z.hot_raw, 1);
     }
 
+    /// `Options::zpages_rewarm_scans`: where the scans counted move after a
+    /// stretch of `REWARM_QUIET` that saw none, out of core with the form
+    /// installed, a rewarm is due; it is made once no merge is in flight,
+    /// since a merge writing beside the scans pushes out what a rewarm
+    /// brings in -- the full rewrite's pass refaulted 117,000 pages with a
+    /// rewarm made at its start against 25,000 without. The rewarm asks
+    /// for the form files under `HOT_RAW_RESIDENT` resident whole, on a
+    /// thread of its own, each mapped by its path so the thread holds
+    /// nothing a landing retires; one such thread at a time.
+    fn z_rewarm_look(&mut self, now: std::time::Duration) {
+        if !self.opts.zpages_rewarm_scans {
+            return;
+        }
+        if self.z_rewarm.as_ref().is_some_and(|h| h.is_finished()) {
+            if let Some(h) = self.z_rewarm.take() {
+                let _ = h.join();
+            }
+        }
+        let life = self.scan_life();
+        if life == self.z_rewarm_life {
+            self.z_rewarm_quiet.get_or_insert(now);
+        } else {
+            self.z_rewarm_life = life;
+            if self
+                .z_rewarm_quiet
+                .take()
+                .is_some_and(|t| now.saturating_sub(t) >= REWARM_QUIET)
+            {
+                self.z_rewarm_due = true;
+            }
+        }
+        if !self.z_rewarm_due
+            || self.z_rewarm.is_some()
+            || !self.compacting.is_empty()
+            || self.tiering.is_some()
+        {
+            return;
+        }
+        self.z_rewarm_due = false;
+        if self.zsel.counts().installs == 0 || self.shared.zgate.load() == zselect::GATE_RAW {
+            return;
+        }
+        let paths: Vec<PathBuf> = {
+            let _op = self.op();
+            self.segs()
+                .iter()
+                .filter(|s| s.level > 0)
+                .filter_map(|s| {
+                    let z = s.z.get()?;
+                    if z.pages_resident() >= HOT_RAW_RESIDENT {
+                        return None;
+                    }
+                    let (id, end) = (Db::name_id(&s.name)?, Db::name_end_seq(&s.name)?);
+                    Some(self.dir.join(zfile::zpg_name(id, end)))
+                })
+                .collect()
+        };
+        if self.z_trace {
+            eprintln!(
+                "zrewarm t={:.1} files {} life {life}",
+                now.as_secs_f64(),
+                paths.len()
+            );
+        }
+        if paths.is_empty() {
+            return;
+        }
+        zfile::ZEvents::add(&self.shared.z.rewarms, 1);
+        zfile::ZEvents::add(&self.shared.z.rewarm_files, paths.len() as u64);
+        self.z_rewarm = std::thread::Builder::new()
+            .name("supdb-zrewarm".into())
+            .spawn(move || {
+                for p in paths {
+                    if let Ok(map) = MmapBytes::open(&p) {
+                        let _ = crate::bytes::Bytes::advise_willneed(&map, 0, map.0.len());
+                    }
+                }
+            })
+            .ok();
+    }
+
+    /// The thread of `Options::zpages_rewarm_scans` joined, where a settle
+    /// asks that nothing the segment work started is still running.
+    fn z_rewarm_join(&mut self) {
+        if let Some(h) = self.z_rewarm.take() {
+            let _ = h.join();
+        }
+    }
+
     /// The way back for `seg` under `Options::zpages_hot_back_ask`: its form
     /// file on disk mapped and its pages asked of the kernel, under the
     /// release's ask's I/O class, and the back taken at a later look
@@ -40767,6 +40902,7 @@ impl Maint {
             return;
         }
         self.z_last_step = Some(now);
+        self.z_rewarm_look(now);
         self.z_land_look();
         let model = if self
             .z_last_s1
