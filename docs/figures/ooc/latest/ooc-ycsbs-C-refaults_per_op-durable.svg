@@ -2,7 +2,7 @@
 <rect width="760" height="420" fill="white"/>
 <text x="72" y="28" font-size="15" font-weight="600">YCSB-C, read-only (scrambled zipfian) at 10⁷ keys</text>
 <text x="72" y="47" font-size="12">YCSB-C, read-only (scrambled zipfian), refaults_per_op, durable per batch, to 10⁷ keys</text>
-<text x="72" y="64" font-size="11" fill="#6b6b6b">x86_64/intel-r-xeon-r-processor-2.10ghz/4c/16g/hypervisor/b1280m · 170042b · 2026-11-08 · median with 95% CI over 3 reps</text>
+<text x="72" y="64" font-size="11" fill="#6b6b6b">x86_64/intel-r-xeon-r-processor-2.10ghz/4c/16g/hypervisor/b1280m · 74b9dea · 2026-11-08 · median with 95% CI over 3 reps</text>
 <line x1="72" y1="372" x2="610" y2="372" stroke="#c8c8c8" stroke-width="1"/>
 <line x1="72" y1="88" x2="72" y2="372" stroke="#c8c8c8" stroke-width="1"/>
 <line x1="135.0" y1="372" x2="135.0" y2="375" stroke="#c8c8c8" stroke-width="1"/>
@@ -11,36 +11,38 @@
 <text x="610" y="408" font-size="11" text-anchor="end" fill="#6b6b6b">keys</text>
 <line x1="67" y1="372.0" x2="72" y2="372.0" stroke="#c8c8c8" stroke-width="1"/>
 <text x="63" y="376.0" font-size="11" text-anchor="end" fill="#6b6b6b">0</text>
-<line x1="67" y1="277.3" x2="72" y2="277.3" stroke="#c8c8c8" stroke-width="1"/>
-<text x="63" y="281.3" font-size="11" text-anchor="end" fill="#6b6b6b">0.2</text>
-<line x1="67" y1="182.7" x2="72" y2="182.7" stroke="#c8c8c8" stroke-width="1"/>
-<text x="63" y="186.7" font-size="11" text-anchor="end" fill="#6b6b6b">0.4</text>
+<line x1="67" y1="301.0" x2="72" y2="301.0" stroke="#c8c8c8" stroke-width="1"/>
+<text x="63" y="305.0" font-size="11" text-anchor="end" fill="#6b6b6b">0.2</text>
+<line x1="67" y1="230.0" x2="72" y2="230.0" stroke="#c8c8c8" stroke-width="1"/>
+<text x="63" y="234.0" font-size="11" text-anchor="end" fill="#6b6b6b">0.4</text>
+<line x1="67" y1="159.0" x2="72" y2="159.0" stroke="#c8c8c8" stroke-width="1"/>
+<text x="63" y="163.0" font-size="11" text-anchor="end" fill="#6b6b6b">0.6</text>
 <line x1="67" y1="88.0" x2="72" y2="88.0" stroke="#c8c8c8" stroke-width="1"/>
-<text x="63" y="92.0" font-size="11" text-anchor="end" fill="#6b6b6b">0.6</text>
+<text x="63" y="92.0" font-size="11" text-anchor="end" fill="#6b6b6b">0.8</text>
 <text x="10" y="80" font-size="11" text-anchor="start" fill="#6b6b6b">refaults/op</text>
-<path d="M135.0,372.0 L547.0,221.4 L547.0,254.3 L135.0,372.0 Z" fill="#8c8c8c" fill-opacity="0.10"/>
-<path d="M135.0,372.0 L547.0,358.6 L547.0,360.5 L135.0,372.0 Z" fill="#8c8c8c" fill-opacity="0.10"/>
+<path d="M135.0,372.0 L547.0,259.2 L547.0,275.0 L135.0,372.0 Z" fill="#8c8c8c" fill-opacity="0.10"/>
+<path d="M135.0,372.0 L547.0,361.9 L547.0,363.4 L135.0,372.0 Z" fill="#8c8c8c" fill-opacity="0.10"/>
 <path d="M135.0,372.0 L547.0,372.0 L547.0,372.0 L135.0,372.0 Z" fill="#8c8c8c" fill-opacity="0.10"/>
-<path d="M135.0,372.0 L547.0,94.0 L547.0,106.2 L135.0,372.0 Z" fill="#8c8c8c" fill-opacity="0.10"/>
+<path d="M135.0,372.0 L547.0,153.5 L547.0,164.9 L135.0,372.0 Z" fill="#8c8c8c" fill-opacity="0.10"/>
 <path d="M135.0,372.0 L547.0,372.0 L547.0,372.0 L135.0,372.0 Z" fill="#2b6cb0" fill-opacity="0.10"/>
 <path d="M135.0,372.0 L547.0,372.0 L547.0,372.0 L135.0,372.0 Z" fill="#2b6cb0" fill-opacity="0.10"/>
-<path d="M135.0,372.0 L547.0,194.2 L547.0,200.4 L135.0,372.0 Z" fill="#8c8c8c" fill-opacity="0.10"/>
+<path d="M135.0,372.0 L547.0,239.9 L547.0,240.1 L135.0,372.0 Z" fill="#8c8c8c" fill-opacity="0.10"/>
 <path d="M135.0,372.0 L547.0,372.0 L547.0,372.0 L135.0,372.0 Z" fill="#1b1b1b" fill-opacity="0.10"/>
-<path d="M135.0,372.0 L547.0,225.6 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="1,3"/>
-<path d="M135.0,372.0 L547.0,359.6 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="4,2"/>
+<path d="M135.0,372.0 L547.0,268.5 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="1,3"/>
+<path d="M135.0,372.0 L547.0,362.5 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="4,2"/>
 <path d="M135.0,372.0 L547.0,372.0 " fill="none" stroke="#8c8c8c" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="2,3"/>
-<path d="M135.0,372.0 L547.0,96.5 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7,4"/>
+<path d="M135.0,372.0 L547.0,158.2 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7,4"/>
 <path d="M135.0,372.0 L547.0,372.0 " fill="none" stroke="#2b6cb0" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7,4"/>
 <path d="M135.0,372.0 L547.0,372.0 " fill="none" stroke="#2b6cb0" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-<path d="M135.0,372.0 L547.0,196.4 " fill="none" stroke="#8c8c8c" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="2,3"/>
+<path d="M135.0,372.0 L547.0,240.0 " fill="none" stroke="#8c8c8c" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="2,3"/>
 <path d="M135.0,372.0 L547.0,372.0 " fill="none" stroke="#1b1b1b" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-<line x1="612.0" y1="96.5" x2="616.0" y2="55.0" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="59.0" font-size="11" fill="#8c8c8c">RocksDB</text>
-<line x1="612.0" y1="196.4" x2="616.0" y2="154.9" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="158.9" font-size="11" fill="#8c8c8c">?</text>
-<line x1="612.0" y1="225.6" x2="616.0" y2="184.0" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="188.0" font-size="11" fill="#8c8c8c">RocksDB (LZ4)</text>
-<line x1="612.0" y1="359.6" x2="616.0" y2="318.0" stroke="#8c8c8c" stroke-width="0.75"/>
+<line x1="612.0" y1="158.2" x2="616.0" y2="113.7" stroke="#8c8c8c" stroke-width="0.75"/>
+<text x="618.0" y="117.7" font-size="11" fill="#8c8c8c">RocksDB</text>
+<line x1="612.0" y1="240.0" x2="616.0" y2="195.4" stroke="#8c8c8c" stroke-width="0.75"/>
+<text x="618.0" y="199.4" font-size="11" fill="#8c8c8c">?</text>
+<line x1="612.0" y1="268.5" x2="616.0" y2="223.9" stroke="#8c8c8c" stroke-width="0.75"/>
+<text x="618.0" y="227.9" font-size="11" fill="#8c8c8c">RocksDB (LZ4)</text>
+<line x1="612.0" y1="362.5" x2="616.0" y2="318.0" stroke="#8c8c8c" stroke-width="0.75"/>
 <text x="618.0" y="322.0" font-size="11" fill="#8c8c8c">LMDB (no readahead)</text>
 <line x1="612.0" y1="372.0" x2="616.0" y2="331.0" stroke="#8c8c8c" stroke-width="0.75"/>
 <text x="618.0" y="335.0" font-size="11" fill="#8c8c8c">?</text>
