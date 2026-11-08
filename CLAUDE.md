@@ -3841,9 +3841,12 @@ the memo's hits down by the second placements' (368,000 against 5.4
 million over a sitting), and 0.87x in one rep of a clean third whose E
 read 0.89x for the seed in both -- a spread the remembered pin's sittings
 also showed, 0.97x one way and then 1.10x the other for a mechanism that
-touches no scan, so the count is the verdict and the rate unresolved, as
-the scan's one cursor was read. On; `supdb-zseekrank` is the arm. The
-rule: a structure handed to a walk is checked at every dispatch that can
+touches no scan, so the count was read as the verdict and the seed
+shipped on. A fourth sitting in the row's whole order, the scrambled mixes
+after the mixes, read E 0.97x for it and the scan pass level: E against the
+seed in three sittings of four. A count stands for a verdict only where the
+mechanism strictly removes work, and the seed replaces one placement with
+another, so it is off and `supdb-zseekseed` is the arm. The rule: a structure handed to a walk is checked at every dispatch that can
 take the walk's place and at every form the walk can take, and a count
 that moves the wrong way under a lever names the path the lever never
 reached, before any rate is read; a cursor that opened a group and walked
@@ -3912,6 +3915,34 @@ cursor's load and not its next-group step, carried the flag too, which the
 test found by count. The rule: a flag that marks one step's opens is
 carried by every path the step takes to an open, and an option is held to
 the count that says its mechanism fired before its rate is read.
+
+**A policy priced on the mixes it was built for, and paid for in the mixes
+after them.** The hot-raw policy's room (`Options::zpages_hot_raw_slack`)
+was paired in the row's shape up to its unscrambled mixes, and every pairing
+read E ahead. The row runs the scrambled mixes after those, and the first row
+banked with the room read the scrambled E at 0.59x of LMDB at ten million
+keys under 1.25 GiB where the row before had read 0.86x. Paired through the
+whole order, the room read E 1.10x and the scrambled E 0.76x, with 0.077
+major faults an operation against 0.021, from sixteen releases a sitting
+against four: the partitions the unscrambled Zipfian's head had made raw
+stayed raw where no partition is hot, their records holding cache the form
+files needed. A way back for a raw partition read under the median was built
+against it (`Options::zpages_hot_cold_back`), and its first reading was in
+two units. A raw partition's scan counted one read where the same scan over a
+form file counted the seven groups it opened, so a raw partition under the
+scans read a seventh as hot as it was, went back in the middle of E and was
+released again a look later. Counted in the groups a form walk would open
+(`Seg::hot_scan`), the way back still made fifteen to nineteen moves a
+sitting. It read E 0.73x in one sitting and level in the next, and the
+scrambled E 1.42x and 1.12x, while the scrambled E's faults stayed at
+0.06-0.08 an operation in every arm with the room, with the way back or
+without it. So the way back is the arm (`supdb-zhotcoldback`), the units are
+a fix, and the scrambled E's faults are still the room's. The rules: a
+pairing runs the row's whole order, through every pass after the cell it was
+built for, since a policy whose state outlives the mix it was made in pays in
+the mixes after it. And a policy's way back is a move with the way out's
+costs, the device read and the drop, so a policy that flaps is priced by its
+moves before its rates.
 
 ## Standing limitations
 
