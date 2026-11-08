@@ -9680,15 +9680,16 @@ fn hot_until(db: &Db, max: u32, cond: impl Fn(&supdb::db::ZCounts) -> bool) -> b
 #[cfg(target_os = "linux")]
 #[test]
 fn the_controller_serves_the_hottest_partition_raw_within_the_budget() {
-    for on in [true, false] {
-        let what = format!("hot raw {on}");
+    for (on, ask) in [(true, true), (true, false), (false, true)] {
+        let what = format!("hot raw {on} back ask {ask}");
         let (dir, db, model, inject) = auto_store_with(
-            &format!("auto-hotraw-{on}"),
+            &format!("auto-hotraw-{on}-{ask}"),
             1 << 20,
             1_000_000.0,
             FAULT_1MS,
             |o| {
                 o.zpages_hot_raw = on;
+                o.zpages_hot_back_ask = ask;
                 o.zpages_memo = false;
                 o.partition_bytes = Some(400 << 10);
             },
@@ -9806,15 +9807,68 @@ fn the_controller_serves_the_hottest_partition_raw_within_the_budget() {
                 "{what}: one released and nothing more: {c:?}"
             );
             // The budget under the form files and the raw partition past the
-            // fill share: the raw one's file attached again.
+            // fill share: the raw one's file attached again. The raw one's
+            // form file, out of its cell, is dropped from the cache first,
+            // so that only an ask brings its pages before the wait is out
+            // (`Options::zpages_hot_back_ask`); the served ones' mapped
+            // pages stay.
+            for e in std::fs::read_dir(&dir).unwrap() {
+                let path = e.unwrap().path();
+                if path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("zpg-")
+                {
+                    evict(&path);
+                }
+            }
+            let evicted = resident_under(&dir, "zpg-");
+            assert!(
+                evicted.1 + file_one / 2 <= evicted.0,
+                "{what}: the raw partition's form file out of the cache: {evicted:?} {file_one}"
+            );
             inject.set_budget(total);
             hot_look(&db, std::time::Duration::from_millis(200));
+            let c = db.zpage_counts();
+            if ask {
+                // Asked at the look that decides it, the raw form serving
+                // until the pages are there: the reads still go raw.
+                assert_eq!(
+                    (c.hot_back_asks, c.hot_back, c.hot_raw_now, c.form_files),
+                    (1, 0, 1, partitions - 1),
+                    "{what}: the way back asked: {c:?}"
+                );
+                let before = db.zpage_counts();
+                check(&r, &model, &hot, &format!("{what}: asked, raw"));
+                let after = db.zpage_counts();
+                assert!(
+                    after.rawserves > before.rawserves,
+                    "{what}: read raw while asked: {before:?} {after:?}"
+                );
+                // The pages come by the ask, well inside the wait's ten
+                // looks, and the file is attached with them there.
+                assert!(
+                    hot_until(&db, 8, |c| c.hot_back >= 1),
+                    "{what}: the way back taken: {:?}",
+                    db.zpage_counts()
+                );
+                let c = db.zpage_counts();
+                assert_eq!(
+                    (c.hot_back_asks, c.hot_back_waited),
+                    (1, 0),
+                    "{what}: taken with the pages there: {c:?}"
+                );
+            }
             let c = db.zpage_counts();
             assert_eq!(
                 (c.hot_back, c.hot_raw_now, c.form_files),
                 (1, 0, partitions),
                 "{what}: the way back: {c:?}"
             );
+            if !ask {
+                assert_eq!(c.hot_back_asks, 0, "{what}: nothing asked: {c:?}");
+            }
             check(&r, &model, &hot, &format!("{what}: served again"));
         } else {
             inject.set_budget(total * 4);
@@ -10365,9 +10419,22 @@ fn the_hot_raw_policy_releases_into_the_groups_unused_memory_where_the_line_woul
                 "{what}: one released and nothing more: {c:?}"
             );
             // The budget under the files and the raw partition past the
-            // fill share: the way back as before.
+            // fill share: the way back as before, its form file's pages
+            // asked at the look that decides it and the file attached at a
+            // look after (`Options::zpages_hot_back_ask`).
             inject.set_budget(total);
             hot_look(&db, std::time::Duration::from_millis(200));
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_back_asks, c.hot_back),
+                (1, 0),
+                "{what}: the way back asked: {c:?}"
+            );
+            assert!(
+                hot_until(&db, 8, |c| c.hot_back >= 1),
+                "{what}: the way back taken: {:?}",
+                db.zpage_counts()
+            );
             let c = db.zpage_counts();
             assert_eq!(
                 (c.hot_back, c.hot_raw_now, c.form_files),

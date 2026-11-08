@@ -790,6 +790,10 @@ pub struct Supdb {
     /// A merge's writers syncing behind them every megabyte
     /// (`Options::merge_sync_ahead` 1 MB). `supdb-mergesync1m`.
     mergesync1m: bool,
+    /// The hot-raw policy's way back attaching the form file at the look
+    /// that decides it, its pages unasked (`Options::zpages_hot_back_ask`
+    /// off). `supdb-zbacknow`.
+    zbacknow: bool,
     /// A direct run's record stream kept whole in the arena, the shape
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
@@ -1721,6 +1725,10 @@ struct Policy {
     /// A merge's writers syncing behind them every megabyte
     /// (`Options::merge_sync_ahead` 1 MB). `supdb-mergesync1m`.
     mergesync1m: bool,
+    /// The hot-raw policy's way back attaching the form file at the look
+    /// that decides it, its pages unasked (`Options::zpages_hot_back_ask`
+    /// off). `supdb-zbacknow`.
+    zbacknow: bool,
     /// A direct run's record stream kept whole in the arena, the shape
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
@@ -2233,6 +2241,7 @@ impl Default for Policy {
             cacheeighth: false,
             settlelazyraw: false,
             mergesync1m: false,
+            zbacknow: false,
             norecycle: false,
             heapblocks: false,
             keysarena: false,
@@ -5695,6 +5704,19 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose hot-raw policy's way back attaches the form file at
+    /// the look that decides it, its pages unasked
+    /// (`Options::zpages_hot_back_ask` off).
+    pub fn create_zbacknow(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zbacknow: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-ingest` as `supdb-latesync`.
     pub fn create_ingest_latesync(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
@@ -7220,6 +7242,7 @@ impl Supdb {
             cacheeighth,
             settlelazyraw,
             mergesync1m,
+            zbacknow,
             norecycle,
             heapblocks,
             keysarena,
@@ -7591,6 +7614,7 @@ impl Supdb {
             scan_cache_auto_room: !cacheeighth,
             settle_lazy_raw: settlelazyraw,
             merge_sync_ahead: if mergesync1m { 1 << 20 } else { 0 },
+            zpages_hot_back_ask: !zbacknow,
             prefault: populate,
             direct_put_one: !recordsteps,
             direct_stream: !copyvals && !refvals,
@@ -7900,6 +7924,7 @@ impl Supdb {
             cacheeighth,
             settlelazyraw,
             mergesync1m,
+            zbacknow,
             norecycle,
             heapblocks,
             keysarena,
@@ -8967,6 +8992,9 @@ impl Engine for Supdb {
         if self.mergesync1m {
             return "supdb-mergesync1m";
         }
+        if self.zbacknow {
+            return "supdb-zbacknow";
+        }
         if self.norecycle {
             return if self.partition {
                 "supdb-norecycle"
@@ -9518,6 +9546,7 @@ impl Engine for Supdb {
             ("zpage_hot_raw_now", z.hot_raw_now as f64),
             ("zpage_hot_asks", z.hot_asks as f64),
             ("zpage_hot_dropped", z.hot_dropped as f64),
+            ("zpage_hot_back_asks", z.hot_back_asks as f64),
             ("zpage_spare_files", z.spare_files as f64),
             ("zpage_spare_builds", z.spare_builds as f64),
             ("zpage_spare_failed", z.spare_failed as f64),
@@ -10398,6 +10427,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cacheeighth"
         | "supdb-settlelazyraw"
         | "supdb-mergesync1m"
+        | "supdb-zbacknow"
         | "supdb-norecycle"
         | "supdb-heapblocks"
         | "supdb-keysarena"
@@ -11215,6 +11245,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cacheeighth" => supdb_arm(Supdb::create_cacheeighth, dir)?,
         "supdb-settlelazyraw" => supdb_arm(Supdb::create_settlelazyraw, dir)?,
         "supdb-mergesync1m" => supdb_arm(Supdb::create_mergesync1m, dir)?,
+        "supdb-zbacknow" => supdb_arm(Supdb::create_zbacknow, dir)?,
         "supdb-ingestlatesync" => supdb_arm(Supdb::create_ingest_latesync, dir)?,
         "supdb-norecycle" => supdb_arm(Supdb::create_norecycle, dir)?,
         "supdb-ingestnorecycle" => supdb_arm(Supdb::create_ingest_norecycle, dir)?,
@@ -12790,6 +12821,13 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert_eq!((o.merge_sync_ahead, b.merge_sync_ahead), (1 << 20, 0));
+            }
+            {
+                let z = Supdb::create_zbacknow(&dir("zbacknow")).unwrap();
+                assert_eq!(z.name(), "supdb-zbacknow");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.zpages_hot_back_ask && b.zpages_hot_back_ask);
             }
             {
                 let z = Supdb::create_sweepwalks(&dir("sweepwalks")).unwrap();

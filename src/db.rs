@@ -714,6 +714,11 @@ pub struct ZCounts {
     /// asks it dropped.
     pub hot_asks: u64,
     pub hot_dropped: u64,
+    /// Its asks for a raw partition's form file pages ahead of the way back
+    /// (`Options::zpages_hot_back_ask`), and the backs taken at the wait's
+    /// end with the pages short of the share.
+    pub hot_back_asks: u64,
+    pub hot_back_waited: u64,
     /// Block-coded partitions re-parsed while served
     /// (`Options::zpages_reparse`).
     pub reparses: u64,
@@ -4321,6 +4326,21 @@ pub struct Options {
     /// scrambled E 1.42x and 1.12x: a trade, so off keeps a raw partition
     /// raw until the fill and `supdb-zhotcoldback` is the arm.
     pub zpages_hot_cold_back: bool,
+    /// The hot-raw policy's way back -- a raw partition's form file attached
+    /// again, at the fill, a swap or the cold way back -- in the release's
+    /// two steps: the form file's pages asked of the kernel at one look
+    /// (`MADV_WILLNEED` over the file, under the ask's I/O class) while
+    /// the raw form serves, and the file attached at a later one, once
+    /// `HOT_RAW_RESIDENT` of its pages are resident or `HOT_RAW_ASK_WAIT`
+    /// has passed. The form file is advised random from its attach, so a
+    /// file attached cold was read a page a fault by the reads it served:
+    /// every mix with major faults at ten million keys under 1.25 GiB was
+    /// one with a back move in it, two in the scrambled E as its block
+    /// cache took the budget down, about two form files' pages in faults,
+    /// and the mixes with releases alone, whose pages are asked ahead,
+    /// took none. Off attaches the file at the look that decides it,
+    /// `supdb-zbacknow`.
+    pub zpages_hot_back_ask: bool,
 }
 
 impl Options {
@@ -4615,6 +4635,7 @@ impl Default for Options {
             zpages_hot_skew_room: false,
             zpages_walk_owns_decodes: false,
             zpages_hot_cold_back: false,
+            zpages_hot_back_ask: true,
         }
     }
 }
@@ -19986,6 +20007,8 @@ impl Reader {
             hot_looks: get(&ev.hot_looks),
             hot_asks: get(&ev.hot_asks),
             hot_dropped: get(&ev.hot_dropped),
+            hot_back_asks: get(&ev.hot_back_asks),
+            hot_back_waited: get(&ev.hot_back_waited),
             reparses: get(&ev.reparses),
             recode_flips: get(&ev.recode_flips),
             spare_builds: get(&ev.spare_builds),
@@ -37534,6 +37557,10 @@ struct Maint {
     /// looks (`Options::zpages_hot_raw_slack`), by its lower fence.
     z_hot_win: std::collections::HashMap<Vec<u8>, std::collections::VecDeque<u64>>,
     z_hot_ask: Option<(Vec<u8>, std::time::Duration)>,
+    /// The way back asked at a look before (`Options::zpages_hot_back_ask`):
+    /// the raw partition by its lower fence, when, and a mapping of its form
+    /// file on disk for the residency of its pages.
+    z_hot_back_ask: Option<(Vec<u8>, std::time::Duration, MmapBytes)>,
     z_hot_hold: Option<std::time::Duration>,
 }
 
@@ -38123,6 +38150,7 @@ impl Maint {
             z_hot_heat: std::collections::HashMap::new(),
             z_hot_win: std::collections::HashMap::new(),
             z_hot_ask: None,
+            z_hot_back_ask: None,
             z_hot_hold: None,
         }
     }
@@ -40443,6 +40471,34 @@ impl Maint {
                 room.map_or("-".to_string(), |r| r.to_string()),
             );
         };
+        // The way back asked at a look before: taken once the form file's
+        // pages are there or the wait has run out, since the room wants
+        // it whether or not they came; the partition merged or retired
+        // since, nothing to take.
+        if let Some((lo, since, map)) = self.z_hot_back_ask.take() {
+            let Some(q) = parts.iter().find(|q| q.raw && q.seg.lo == lo) else {
+                return;
+            };
+            let resident = resident_share(&map.0[..]);
+            let waited = now.saturating_sub(since) >= HOT_RAW_ASK_WAIT;
+            if resident < HOT_RAW_RESIDENT && !waited {
+                if self.z_trace {
+                    trace("back-asked", Some(q));
+                }
+                self.z_hot_back_ask = Some((lo, since, map));
+                return;
+            }
+            drop(map);
+            if resident < HOT_RAW_RESIDENT {
+                zfile::ZEvents::add(&self.shared.z.hot_back_waited, 1);
+            }
+            if self.z_trace {
+                trace("back-taken", Some(q));
+            }
+            let seg = q.seg.clone();
+            self.z_hot_back(seg);
+            return;
+        }
         // The partition asked for at a look before: taken once its pages
         // are there and the room still holds, else dropped.
         if let Some((lo, since)) = self.z_hot_ask.clone() {
@@ -40497,7 +40553,7 @@ impl Maint {
             }
             if let Some(q) = coldest_raw {
                 let seg = q.seg.clone();
-                self.z_hot_back(seg);
+                self.z_hot_back_or_ask(seg, now);
             }
             return;
         }
@@ -40514,7 +40570,7 @@ impl Maint {
                     trace("cold-back", Some(q));
                 }
                 let seg = q.seg.clone();
-                self.z_hot_back(seg);
+                self.z_hot_back_or_ask(seg, now);
                 return;
             }
         }
@@ -40587,7 +40643,7 @@ impl Maint {
                     trace("swap", Some(q));
                 }
                 let seg = q.seg.clone();
-                self.z_hot_back(seg);
+                self.z_hot_back_or_ask(seg, now);
             }
             _ => {
                 if self.z_trace {
@@ -40632,6 +40688,33 @@ impl Maint {
             .store(zfile::DECLINED_HOT_RAW, AtomicOrdering::Relaxed);
         z_take_cell(&shared, &seg, true);
         zfile::ZEvents::add(&shared.z.hot_raw, 1);
+    }
+
+    /// The way back for `seg` under `Options::zpages_hot_back_ask`: its form
+    /// file on disk mapped and its pages asked of the kernel, under the
+    /// release's ask's I/O class, and the back taken at a later look
+    /// (`z_hot_look`); without the option, or where the file does not map,
+    /// the back now.
+    fn z_hot_back_or_ask(&mut self, seg: std::sync::Arc<Seg>, now: std::time::Duration) {
+        if self.opts.zpages_hot_back_ask {
+            if let (Some(id), Some(end)) = (Db::name_id(&seg.name), Db::name_end_seq(&seg.name)) {
+                let path = self.dir.join(zfile::zpg_name(id, end));
+                if let Ok(map) = MmapBytes::open(&path) {
+                    let ask = || {
+                        let _ = crate::bytes::Bytes::advise_willneed(&map, 0, map.0.len());
+                    };
+                    if self.opts.zpages_hot_ask_idle {
+                        with_idle_io(ask)
+                    } else {
+                        ask()
+                    }
+                    zfile::ZEvents::add(&self.shared.z.hot_back_asks, 1);
+                    self.z_hot_back_ask = Some((seg.lo.clone(), now, map));
+                    return;
+                }
+            }
+        }
+        self.z_hot_back(seg);
     }
 
     /// `seg`'s form file attached again from disk, the way back from a
@@ -41521,6 +41604,7 @@ impl Maint {
                 zfile::ZEvents::add(&self.shared.z.retired, 1);
             }
             self.z_hot_ask = None;
+            self.z_hot_back_ask = None;
             self.z_hot_raw_seen.clear();
         }
         if self.zbuild.as_ref().is_some_and(|b| b.job.is_finished()) {

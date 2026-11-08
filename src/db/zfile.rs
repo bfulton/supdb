@@ -3751,6 +3751,11 @@ pub(super) struct ZEvents {
     /// room gone.
     pub hot_asks: AtomicU64,
     pub hot_dropped: AtomicU64,
+    /// Its asks for a raw partition's form file pages ahead of the way back
+    /// (`Options::zpages_hot_back_ask`), and the backs taken at the wait's
+    /// end with the pages short of the share.
+    pub hot_back_asks: AtomicU64,
+    pub hot_back_waited: AtomicU64,
     /// Re-codes made by exchanging the served form file with the kept one.
     pub recode_flips: AtomicU64,
     /// Spares built and kept (`Options::zpages_both`), and spares that kept
