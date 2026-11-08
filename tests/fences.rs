@@ -732,6 +732,91 @@ fn a_merge_drops_its_inputs_pages_behind_its_second_pass() {
     }
 }
 
+/// A merge's writers sync their output behind them every
+/// `Options::merge_sync_ahead` bytes, on the writer's helper thread: at
+/// sixty-four kilobytes a merge that writes several megabytes makes syncs
+/// the store counts (`Db::merge_syncs`), and at zero, the segment's own
+/// eight megabytes, a merge of fewer makes none. The syncs move no byte:
+/// both stores' segments are the same. The helper syncs on a thread of its
+/// own and may take its turn late, but a stride of sixty-four kilobytes
+/// against outputs of megabytes leaves it dozens of strides to take one.
+#[test]
+fn a_merges_writers_sync_behind_them_at_the_merges_own_stride() {
+    let mut dirs = Vec::new();
+    for stride in [64u64 << 10, 0] {
+        let d = scratch(&format!("merge-sync-{stride}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 1 << 20,
+                partition_bytes: Some(4 << 20),
+                l0_trigger: 2,
+                merge_sync_ahead: stride,
+                // Pieces of sixty-four kilobytes, so a merge's writer hands
+                // its helper pieces at this store's size; the segment's
+                // megabyte is more than a merge output here holds before
+                // its finish, and the helper starts at the first piece.
+                segment: supdb::SegmentOptions {
+                    write_piece: 64 << 10,
+                    ..supdb::SegmentOptions::default()
+                },
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let key = |k: u32| format!("key-{k:05}").into_bytes();
+        // Bytes that do not compress, so a merge writes its values whole.
+        let value = |k: u32, round: u32| {
+            let mut x = (u64::from(k) << 8 | u64::from(round)) | 1;
+            let mut v = format!("{round}-{k:05}-").into_bytes();
+            while v.len() < 1500 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                v.extend_from_slice(&x.to_le_bytes());
+            }
+            v
+        };
+        for k in 0..4000u32 {
+            db.append(&key(k), &value(k, 0));
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        for round in 1..=2u32 {
+            for k in (0..4000u32).step_by(2) {
+                db.put(&key(k + round - 1), &value(k, round));
+            }
+            db.commit().unwrap();
+            db.seal().unwrap();
+        }
+        db.settle().unwrap();
+        let (by_heads, by_records) = db.merge_key_sources();
+        assert!(by_heads + by_records > 0, "a merge ran");
+        let syncs = db.merge_syncs();
+        if stride > 0 {
+            assert!(syncs > 0, "the merges' writers synced behind them: {syncs}");
+        } else {
+            assert_eq!(syncs, 0, "no merge output reached eight megabytes");
+        }
+        db.close().unwrap();
+        dirs.push(d);
+    }
+    let names: Vec<Vec<String>> = dirs.iter().map(|d| seg_names(d)).collect();
+    assert_eq!(names[0], names[1], "the same segments");
+    for n in &names[0] {
+        let a = std::fs::read(dirs[0].join(n)).unwrap();
+        let b = std::fs::read(dirs[1].join(n)).unwrap();
+        assert_eq!(
+            without_the_clock(&a),
+            without_the_clock(&b),
+            "{n} differs between the two strides"
+        );
+    }
+    for d in &dirs {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
 /// The segment work's loop plans a merge when none is in flight and a scan
 /// has come since its last look (`Options::merge_plan_idle`): the chain
 /// plans only at a landing, so a range left due when the last merge landed

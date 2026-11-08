@@ -787,6 +787,9 @@ pub struct Supdb {
     /// samples, its cut left for the build (`Options::settle_lazy_raw` on).
     /// `supdb-settlelazyraw`.
     settlelazyraw: bool,
+    /// A merge's writers syncing behind them every megabyte
+    /// (`Options::merge_sync_ahead` 1 MB). `supdb-mergesync1m`.
+    mergesync1m: bool,
     /// A direct run's record stream kept whole in the arena, the shape
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
@@ -1715,6 +1718,9 @@ struct Policy {
     /// samples, its cut left for the build (`Options::settle_lazy_raw` on).
     /// `supdb-settlelazyraw`.
     settlelazyraw: bool,
+    /// A merge's writers syncing behind them every megabyte
+    /// (`Options::merge_sync_ahead` 1 MB). `supdb-mergesync1m`.
+    mergesync1m: bool,
     /// A direct run's record stream kept whole in the arena, the shape
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
@@ -2226,6 +2232,7 @@ impl Default for Policy {
             cachenoauto: false,
             cacheeighth: false,
             settlelazyraw: false,
+            mergesync1m: false,
             norecycle: false,
             heapblocks: false,
             keysarena: false,
@@ -5676,6 +5683,18 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose merges' writers sync behind them every megabyte
+    /// (`Options::merge_sync_ahead` 1 MB).
+    pub fn create_mergesync1m(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                mergesync1m: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-ingest` as `supdb-latesync`.
     pub fn create_ingest_latesync(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
@@ -7200,6 +7219,7 @@ impl Supdb {
             cachenoauto,
             cacheeighth,
             settlelazyraw,
+            mergesync1m,
             norecycle,
             heapblocks,
             keysarena,
@@ -7570,6 +7590,7 @@ impl Supdb {
             scan_cache_auto: !cachenoauto,
             scan_cache_auto_room: !cacheeighth,
             settle_lazy_raw: settlelazyraw,
+            merge_sync_ahead: if mergesync1m { 1 << 20 } else { 0 },
             prefault: populate,
             direct_put_one: !recordsteps,
             direct_stream: !copyvals && !refvals,
@@ -7878,6 +7899,7 @@ impl Supdb {
             cachenoauto,
             cacheeighth,
             settlelazyraw,
+            mergesync1m,
             norecycle,
             heapblocks,
             keysarena,
@@ -8942,6 +8964,9 @@ impl Engine for Supdb {
         if self.settlelazyraw {
             return "supdb-settlelazyraw";
         }
+        if self.mergesync1m {
+            return "supdb-mergesync1m";
+        }
         if self.norecycle {
             return if self.partition {
                 "supdb-norecycle"
@@ -9222,6 +9247,7 @@ impl Engine for Supdb {
             // (`Options::scan_cache_auto`).
             ("cache_bindings", db.cache_bindings() as f64),
             ("cache_growths", db.cache_growths() as f64),
+            ("merge_syncs", db.merge_syncs() as f64),
             ("snap_switches", db.snapshot_switches() as f64),
             // The store's shape as it stands: what a read has to consult.
             ("segments", db.segments() as f64),
@@ -10371,6 +10397,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-cachenoauto"
         | "supdb-cacheeighth"
         | "supdb-settlelazyraw"
+        | "supdb-mergesync1m"
         | "supdb-norecycle"
         | "supdb-heapblocks"
         | "supdb-keysarena"
@@ -11187,6 +11214,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cachenoauto" => supdb_arm(Supdb::create_cachenoauto, dir)?,
         "supdb-cacheeighth" => supdb_arm(Supdb::create_cacheeighth, dir)?,
         "supdb-settlelazyraw" => supdb_arm(Supdb::create_settlelazyraw, dir)?,
+        "supdb-mergesync1m" => supdb_arm(Supdb::create_mergesync1m, dir)?,
         "supdb-ingestlatesync" => supdb_arm(Supdb::create_ingest_latesync, dir)?,
         "supdb-norecycle" => supdb_arm(Supdb::create_norecycle, dir)?,
         "supdb-ingestnorecycle" => supdb_arm(Supdb::create_ingest_norecycle, dir)?,
@@ -12755,6 +12783,13 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.settle_lazy_raw && !b.settle_lazy_raw);
+            }
+            {
+                let z = Supdb::create_mergesync1m(&dir("mergesync1m")).unwrap();
+                assert_eq!(z.name(), "supdb-mergesync1m");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert_eq!((o.merge_sync_ahead, b.merge_sync_ahead), (1 << 20, 0));
             }
             {
                 let z = Supdb::create_sweepwalks(&dir("sweepwalks")).unwrap();

@@ -1069,6 +1069,24 @@ pub struct Options {
     /// nothing; `supdb-mergeahead` is the arm with a window of
     /// `MERGE_AHEAD_WINDOW`; the asks are counted (`Db::merge_ahead`).
     pub merge_read_ahead: usize,
+    /// A merge's writer syncs its output behind it every this many bytes
+    /// (`SegmentOptions::sync_ahead` for the merge's writers alone), zero
+    /// for the segment's own. The writer's hint moves a piece to the
+    /// device and only an fsync makes the device flush its write-back
+    /// cache, so between two of the merge's syncs the cache fills with
+    /// its output and the next commit's fdatasync flushes it: through the
+    /// scrambled E mix at three million keys in core, beside the merges
+    /// of the scrambled write mixes' debt, the commits' fdatasync took
+    /// 2.85 ms where the unscrambled E's took 0.81, a third of them past
+    /// 3 ms, with the merges' helpers syncing 8 MB every 20 ms beside them
+    /// (`docs/engine.md`). A megabyte made seven times the merges' syncs
+    /// and moved the scrambled E's commits nothing in two sittings (638
+    /// ms against 631, 520 against 597), while the lag sweep at three
+    /// million keys read 12% worse by its weighted sum in both reps, the
+    /// merges paying the bursts down slower for the syncs: refuted, so
+    /// zero, the segment's own, is the default and `supdb-mergesync1m` is
+    /// the arm.
+    pub merge_sync_ahead: u64,
     /// I/O priority of the seal and merge threads.
     pub background_io: BackgroundIo,
     /// Have the segment writer fdatasync every this many bytes as it
@@ -4376,6 +4394,7 @@ impl Default for Options {
             merge_drop_behind: false,
             merge_drop_chunk: 2 << 20,
             merge_read_ahead: 0,
+            merge_sync_ahead: 0,
             background_io: BackgroundIo::Normal,
             seal_sync_every: 0,
             inline_bytes: 256,
@@ -8591,6 +8610,12 @@ impl PieceWriter {
             false,
             false,
         ))
+    }
+
+    /// The count of the syncs its helper thread makes behind it
+    /// (`SegmentOptions::sync_ahead`), to be read once it has finished.
+    fn helper_flushes(&self) -> std::sync::Arc<AtomicU64> {
+        self.0.out.flushes.clone()
     }
 
     /// `SegmentWriter::set_deferred_keys`: no copy of the keys here or in
@@ -12993,6 +13018,9 @@ struct Emitter<'a> {
     /// Each output's form file built as it is finished
     /// (`Options::zpages_build_at_finish`).
     zfinish: Option<std::sync::Arc<ZFinish>>,
+    /// The syncs the outputs' writers made behind them
+    /// (`Options::merge_sync_ahead`).
+    syncs: u64,
 }
 
 impl Emitter<'_> {
@@ -13061,9 +13089,14 @@ impl Emitter<'_> {
         self.r += 1;
         if self.r == to {
             let w = self.w.take().ok_or_else(|| err("merge piece not open"))?;
+            // The count read after the finish: a merge's records are
+            // inline in its key section, which the finish writes, and the
+            // helper syncs behind those writes until the finish stops it.
+            let flushes = w.helper_flushes();
             let ord = w
                 .finish()
                 .map_err(|e| err(&format!("compact finish: {e}")))?;
+            self.syncs += flushes.load(AtomicOrdering::Relaxed);
             let p = &self.pieces[self.pi];
             write_ord(self.dir, &p.name, &ord, self.ord_durable)?;
             std::fs::rename(&p.tmp, self.dir.join(&p.name))?;
@@ -13261,6 +13294,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         w: None,
         out: Vec::new(),
         zfinish: zfinish.clone(),
+        syncs: 0,
     };
     // Tombstones end here. Every merge writes the bottom level, so for each
     // key the inputs older than its newest flagged extent are dropped, the
@@ -13368,6 +13402,9 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
             .fetch_add(dropped_bytes, AtomicOrdering::Relaxed);
     }
     steps.step("values");
+    if let Some(c) = &counts {
+        c.merge_syncs.fetch_add(em.syncs, AtomicOrdering::Relaxed);
+    }
     let mut out = em.finish(total)?;
     out.extend(empties);
     File::open(&dir)?.sync_all()?;
@@ -13531,8 +13568,9 @@ fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
         w: None,
         out: Vec::new(),
         zfinish: zfinish.clone(),
+        syncs: 0,
     };
-    let mut ahead = MergeAhead::new(&blobs, read_ahead, counts);
+    let mut ahead = MergeAhead::new(&blobs, read_ahead, counts.clone());
     merge_ranks(&blobs, walk_cached, |k, tied| {
         let mut start = 0usize;
         let mut live = 0u64;
@@ -13563,6 +13601,9 @@ fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
             Ok(())
         })
     })?;
+    if let Some(c) = &counts {
+        c.merge_syncs.fetch_add(em.syncs, AtomicOrdering::Relaxed);
+    }
     let out = em.finish(total)?;
     File::open(&dir)?.sync_all()?;
     Ok(out)
@@ -15323,6 +15364,8 @@ struct Shared {
     /// Bytes of input records a merge's second pass dropped from the page
     /// cache behind itself (`Options::merge_drop_behind`).
     merge_dropped_bytes: AtomicU64,
+    /// The syncs merge writers made behind them (`Options::merge_sync_ahead`).
+    merge_syncs: AtomicU64,
     /// Whether the writer's last seal was near reads, a drain's counted
     /// near: the segment work's landings take the pieces' ranks and
     /// bounds only then (`Options::land_ranks_far`).
@@ -19660,6 +19703,13 @@ impl Reader {
     /// Bytes of input records the merges' second passes dropped from the
     /// page cache behind themselves over the store's life
     /// (`Options::merge_drop_behind`).
+    /// The syncs merge writers made behind them over the store's life
+    /// (`Options::merge_sync_ahead`).
+    #[doc(hidden)]
+    pub fn merge_syncs(&self) -> u64 {
+        self.shared.merge_syncs.load(AtomicOrdering::Relaxed)
+    }
+
     pub fn merge_dropped_bytes(&self) -> u64 {
         self.shared
             .merge_dropped_bytes
@@ -27780,6 +27830,16 @@ impl Db {
         s
     }
 
+    /// `segment_opts` for a merge's writers: the sync behind them every
+    /// `Options::merge_sync_ahead` bytes where that is set.
+    fn merge_segment_opts(opts: &Options) -> SegmentOptions {
+        let mut s = Db::segment_opts(opts);
+        if opts.merge_sync_ahead > 0 {
+            s.sync_ahead = opts.merge_sync_ahead;
+        }
+        s
+    }
+
     pub fn create(dir: &Path, opts: Options) -> Result<Db> {
         check_options(&opts)?;
         let starts_random = opts.read_advice.starts_random();
@@ -27892,6 +27952,7 @@ impl Db {
             merge_ahead_asks: AtomicU64::new(0),
             merge_ahead_bytes: AtomicU64::new(0),
             merge_dropped_bytes: AtomicU64::new(0),
+            merge_syncs: AtomicU64::new(0),
             reads_near: std::sync::atomic::AtomicBool::new(false),
             scans_far_at: AtomicU64::new(u64::MAX),
             mode_scans: AtomicU64::new(0),
@@ -28443,6 +28504,7 @@ impl Db {
             merge_ahead_asks: AtomicU64::new(0),
             merge_ahead_bytes: AtomicU64::new(0),
             merge_dropped_bytes: AtomicU64::new(0),
+            merge_syncs: AtomicU64::new(0),
             reads_near: std::sync::atomic::AtomicBool::new(false),
             scans_far_at: AtomicU64::new(u64::MAX),
             mode_scans: AtomicU64::new(0),
@@ -38842,7 +38904,7 @@ impl Maint {
             end_seq,
             lo,
             hi,
-            opts: Db::segment_opts(&self.opts),
+            opts: Db::merge_segment_opts(&self.opts),
             background_io: self.opts.background_io,
             sync_every: self.opts.seal_sync_every,
             inline_max: self.opts.inline_bytes,
@@ -43206,7 +43268,7 @@ impl Maint {
         // generously; gaps in the sequence cost nothing.
         let first_id = self.alloc_segs((parts * 4).max(8) as u64);
         let dir = self.dir.clone();
-        let opts = Db::segment_opts(&self.opts);
+        let opts = Db::merge_segment_opts(&self.opts);
         let cursors = self.opts.cursor_merge;
         let background_io = self.opts.background_io;
         let sync_every = self.opts.seal_sync_every;
