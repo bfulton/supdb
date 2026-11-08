@@ -864,7 +864,14 @@ the trailing thread took several batches a pass already and the share
 bounds the trail that lending's long passes amortise, so a lever on a
 pass's length is read against the passes counted before it is built.
 `supdb-ingestlendbursts` is the arm that lends every batch and
-`supdb-ingestnopace` the one that files every batch.
+`supdb-ingestnopace` the one that files every batch. A syncing commit
+lends every batch, since its thread files through the fsync, and in core
+it is paced too, within a quarter of a percent of the store's keys
+(`Options::upkeep_pace_syncs_bp`; `supdb-nopacesyncs` lends unpaced):
+unbounded, the thread's trail at the end of a full rewrite was the first
+scan's to wait out or settle, the pass's largest part. Out of core it is
+not paced, since there the thread's resolves are major faults and the
+hold paced the writer by the device.
 One thread holds it at a time, and one word says which:
 every hand-over is a single operation on that word, the side giving it
 up fills the cell before it and the side taking it empties the cell
@@ -4087,6 +4094,27 @@ pays the full path; a question one structure answers from memory is asked
 of it before a structure that has to be decoded to answer it; and a wait
 for a worker is read as the worker's slowness before the waiter's own work
 is profiled.
+
+**A bound written for one kind of commit, left off its sibling.** The
+pace that holds a buffered commit until the upkeep thread trails by at
+most a share of the store was written for the commits that would
+otherwise file their batch themselves, and a syncing commit, which lends
+every batch so its thread files through the fsync, was given no bound at
+all: the thread trailed by whatever the burst left it, and the first scan
+after the lag sweep's full rewrite at three million keys either waited up
+to 40 ms for the pass in flight or settled up to a hundred milliseconds of
+the residue itself, three fifths of a pass LMDB ran in a third of the time.
+The lag counters said which (`take`, `settle`), in every rep. Paced in core
+(`Options::upkeep_pace_syncs_bp`) the pass read 2.4-3.3x in two sittings
+and the bursts gave a seventh to a quarter of their rate and stayed ahead
+of RocksDB's. Paced out of core it lost: there the thread's resolves are
+major faults, and the hold held the writer to them, the one-percent burst
+at a third of its rate and under RocksDB's. The rules: a bound on how far
+a worker may trail is set on every path that hands it work, since the
+reader after the burst meets the trail whichever path made it; and a bound
+that holds a producer to a consumer is priced in each regime the
+consumer's rate changes in, since a hold is only as cheap as what it waits
+for.
 
 ## Standing limitations
 
