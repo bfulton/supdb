@@ -9487,13 +9487,17 @@ fn a_buffered_commit_near_reads_files_its_burst_and_lends_a_small_batch() {
 
 /// A commit that syncs lends the same burst, option or no option: the
 /// thread works through the fsync, and holds for nothing. The forms stand
-/// at the commit's position once the thread has run.
+/// at the commit's position once the thread has run. The pace a syncing
+/// commit's burst takes in core is off here, since it counts a hold for
+/// every paced commit, and is its own test's
+/// (`a_syncing_commits_burst_batches_are_paced_behind_the_thread`).
 #[test]
 fn a_commit_that_syncs_lends_its_burst_to_the_thread() {
     let d = dir("upkeep-inline-bursts-durable");
     let opts = Options {
         upkeep: supdb::Upkeep::Background(1),
         upkeep_inline_bursts: true,
+        upkeep_pace_syncs_bp: 0,
         partition_bytes: Some(256 << 10),
         seal_max_pct: 0,
         ..Options::default()
@@ -17474,4 +17478,103 @@ fn a_bursts_batches_after_the_first_are_lent_a_batch_behind_the_thread() {
         (0, 0, 0),
         "a batch over the share is filed in the commit"
     );
+}
+
+/// A syncing commit lends every batch to the upkeep thread, which files
+/// it through the fsync; with `Options::upkeep_pace_syncs_bp` a burst's
+/// batch near reads is paced as well while the store is in core, as this
+/// one is: after every such commit the thread
+/// trails by at most the share of the store's keys, every commit of the
+/// burst held for that, and every key reads as written through the
+/// writer and through a handle. Off, the commits lend unpaced and hold
+/// for nothing.
+#[test]
+fn a_syncing_commits_burst_batches_are_paced_behind_the_thread() {
+    // Batches of a thousand over twenty thousand keys, paced within a
+    // tenth of the store: two thousand writes, two batches.
+    let run = |name: &str, bp: usize| {
+        let d = dir(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                upkeep: supdb::Upkeep::Background(1),
+                upkeep_pace_syncs_bp: bp,
+                partition_bytes: Some(256 << 10),
+                seal_max_pct: 0,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(db.options().sync, supdb::SyncPolicy::Always),
+            "the commits sync: {:?}",
+            db.options().sync
+        );
+        let keys = 20_000u32;
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        let mut want: HashMap<u32, String> = HashMap::new();
+        for k in 0..keys {
+            db.append(&key(k), b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        assert!(db.levels().0 > 0, "partitions for the forms to hang on");
+        let check = |db: &Reader, want: &HashMap<u32, String>, when: &str| {
+            let mut seen = 0u32;
+            db.scan(
+                &key(0),
+                keys as usize,
+                kv(&mut |k, v| {
+                    let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                    let expect = want.get(&kn).map_or("0", |s| s.as_str());
+                    assert_eq!(std::str::from_utf8(v).unwrap(), expect, "key {kn} {when}");
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, keys, "every key {when}");
+        };
+        // Reads around: a scan over the store.
+        check(&db, &want, "before the burst");
+        let before = db.upkeep_counts();
+        let share = keys as u64 * bp as u64 / 10_000;
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        for round in 0..8u32 {
+            for _ in 0..1000 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % keys as u64) as u32;
+                db.put(&key(k), format!("b{round}").as_bytes());
+                want.insert(k, format!("b{round}"));
+            }
+            db.commit().unwrap();
+            if bp > 0 {
+                let behind = db.upkeep_behind_writes();
+                assert!(
+                    behind <= share.max(1000),
+                    "commit {round}: the thread trails by at most the share {share}, not {behind}"
+                );
+            }
+        }
+        let after = db.upkeep_counts();
+        let (passes, holds) = (after[0] - before[0], after[4] - before[4]);
+        db.settle().unwrap();
+        check(&db, &want, "after the burst");
+        let h = db.reader().unwrap();
+        check(&h, &want, "through a handle after the burst");
+        (passes, holds)
+    };
+    let (passes, holds) = run("paced-sync-burst", 1000);
+    assert!(
+        passes >= 1,
+        "the thread filed the lent batches: {passes} passes"
+    );
+    assert_eq!(holds, 8, "every commit of the burst held for the thread");
+    let (passes, holds) = run("unpaced-sync-burst", 0);
+    assert!(
+        passes >= 1,
+        "the thread filed the lent batches: {passes} passes"
+    );
+    assert_eq!(holds, 0, "lent unpaced: no commit held");
 }

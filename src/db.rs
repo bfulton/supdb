@@ -2933,6 +2933,26 @@ pub struct Options {
     /// out. Zero files every such batch in the commit, the shape before:
     /// `supdb-ingestnopace` (`docs/engine.md`).
     pub upkeep_pace_pct: usize,
+    /// A syncing commit's batch of a burst lent and paced as
+    /// `upkeep_pace_pct` paces a buffered one, within this share of the
+    /// store's keys in basis points, while the store is in core: the
+    /// commit returns, after its fsync, once the upkeep thread trails by
+    /// at most the share or the batch, whichever is larger. A syncing
+    /// commit lends every batch, since the thread works through the
+    /// fsync, and nothing bounded how far it trailed, so the first scan
+    /// after the lag sweep's full rewrite at three million keys met the
+    /// burst's last stretch unfiled: it waited up to 40 ms for the thread's
+    /// pass in flight or settled up to a hundred of the residue itself, in
+    /// passes of 38-175 ms where LMDB's took 24. Paced at a quarter of a
+    /// percent, that pass read 3.29x and 2.43x in two sittings, the tenth's
+    /// and the hundredth's 1.02-1.41x, and the bursts 0.70-0.86x, above
+    /// RocksDB's in every point (`docs/engine.md`). Out of core a resolve
+    /// is a major fault, and paced at ten million keys under 1.25 GiB the
+    /// bursts ran at 0.29-0.86x, the writer held to the thread's faults, so
+    /// the share applies in core alone. Zero lends unpaced, the shape
+    /// before: `supdb-nopacesyncs`.
+    #[doc(hidden)]
+    pub upkeep_pace_syncs_bp: usize,
     /// A buffered commit near reads whose batch is under
     /// `upkeep_inline_min` settles it here when a scan ran since the last
     /// commit, and lends the rest -- the forms the scans will walk, built
@@ -4584,6 +4604,7 @@ impl Default for Options {
             upkeep_inline_bursts: true,
             upkeep_inline_min: UPKEEP_WAKE_WRITES,
             upkeep_pace_pct: 1,
+            upkeep_pace_syncs_bp: 25,
             upkeep_settle_after_scans: true,
             scan_timers: false,
             upkeep_batch_pct: 0,
@@ -34178,7 +34199,7 @@ impl Db {
         let mut pace = false;
         // The share of the store's keys a paced batch is within and the
         // thread may trail by (`Options::upkeep_pace_pct`).
-        let share = (keys as u64).saturating_mul(self.opts.upkeep_pace_pct as u64) / 100;
+        let mut share = (keys as u64).saturating_mul(self.opts.upkeep_pace_pct as u64) / 100;
         if level == 1
             && self.opts.upkeep_inline_bursts
             && !syncs
@@ -34193,6 +34214,21 @@ impl Db {
                 self.upkeep_hand = Hand::File;
                 return;
             }
+            pace = true;
+        }
+        // A syncing commit's batch of a burst paced as well, within its own
+        // share, while the store is in core (`Options::upkeep_pace_syncs_bp`):
+        // its thread files through the fsync, and the hold after it bounds
+        // what the first scan after the burst meets. Out of core a resolve
+        // is a major fault, and the hold would pace the writer by the device.
+        if level == 1
+            && syncs
+            && self.opts.upkeep_pace_syncs_bp > 0
+            && reads_around
+            && batch >= self.opts.upkeep_inline_min
+            && self.shared.zgate.load() == zselect::GATE_RAW
+        {
+            share = (keys as u64).saturating_mul(self.opts.upkeep_pace_syncs_bp as u64) / 10_000;
             pace = true;
         }
         // A smaller batch with a scan since the last commit: the scans
