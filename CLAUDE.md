@@ -4027,24 +4027,36 @@ cold file at the worst rate it has; and an effect put on a policy is read
 against the moves the policy made, mix by mix, before it is put on the
 policy's choice of what to move.
 
+**A sum that traded a cell won for a cell lost.** The merge chain run
+through a burst was turned off on the lag sweep's weighted sum, the burst's
+time and twice the undivided pass's, which read it 6% behind: the burst
+slower by a quarter, the pass faster by less than twice that. The row reads
+neither the sum nor the undivided pass. It divides the sweep's passes by ten,
+so the pass after the full rewrite is the tenth of its scans where the
+chain's drain sits, and compares each cell with its comparator: the pass at
+0.15x of LMDB, the burst at 29x. Re-paired on the row's own division, the
+chain read the pass 3.1x and 3.0x in two sittings and the burst 0.7x, twenty
+times LMDB's still, and the sum level. The rules: an option is priced on the
+cells the bar reads, each against its comparator, and a sum over two of them
+is read beside them and never in place of them, since a cell won twenty-nine
+times over has room to give that a cell lost at a seventh does not; and a
+verdict is taken again when the division or the order it was read under is
+not the row's.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
 in the suite's figures, at `full` scale where it says so:
 
-- The lag pass after a full rewrite under a bound runs beside the merge
-  chain that rewrites the store once, and reads at the device's rate for
-  both: at ten million keys under 1.25 GiB the pass carries 4.5 GB of the
-  chain's reads and writes beside its scans' faults and trails LMDB, whose
-  burst rewrote in place and took thirty-five times ours, at 0.8x. Three
-  levers were priced on it and refuted (`docs/engine.md`): the merges at
-  the idle I/O class, which left the pieces standing for the scans (3x
-  slower); the merge's inputs asked of the kernel ahead of its walk, which
-  fired and moved nothing, the device not waiting; and the chain run through
-  the burst itself, which paid more. The bytes are the design's -- an
-  out-of-place rewrite is written once wherever it is paid -- and the sweep's
-  weighted sum of the burst and the pass reads 13.9x in the engine's favour
-  at that point.
+- The lag pass after a full rewrite under a bound runs beside what is left
+  of the merge chain that rewrites the store once. The chain runs through
+  the burst out of core (`Options::merge_chains_writes`), so the pass meets
+  the burst's last merges and a third of the pieces, and still trails LMDB,
+  whose burst rewrote in place and took twenty times ours. The idle I/O
+  class for the merges and their inputs asked ahead were priced on it and
+  refuted (`docs/engine.md`); what is left is the drain at the burst's end,
+  and the levers on it are the chain's pace through the burst and what a
+  pass pays for each piece it meets.
 - Out-of-core reads run at the speed of their misses. Once the file exceeds
   the memory that can cache it, every miss is a synchronous page fault and a
   rate is the faults an operation takes over the device's latency. The faults
