@@ -797,6 +797,10 @@ pub struct Supdb {
     /// No cold form file asked for where scans come back after a stretch
     /// without one (`Options::zpages_rewarm_scans` off). `supdb-norewarm`.
     norewarm: bool,
+    /// A covered partition's settle filing a key by the form's span alone,
+    /// the shape before the ordered index's samples
+    /// (`Options::settle_covered_samples` off). `supdb-settlespan`.
+    settlespan: bool,
     /// A direct run's record stream kept whole in the arena, the shape
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
@@ -1735,6 +1739,10 @@ struct Policy {
     /// No cold form file asked for where scans come back after a stretch
     /// without one (`Options::zpages_rewarm_scans` off). `supdb-norewarm`.
     norewarm: bool,
+    /// A covered partition's settle filing a key by the form's span alone,
+    /// the shape before the ordered index's samples
+    /// (`Options::settle_covered_samples` off). `supdb-settlespan`.
+    settlespan: bool,
     /// A direct run's record stream kept whole in the arena, the shape
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
@@ -2249,6 +2257,7 @@ impl Default for Policy {
             mergesync1m: false,
             zbacknow: false,
             norewarm: false,
+            settlespan: false,
             norecycle: false,
             heapblocks: false,
             keysarena: false,
@@ -5736,6 +5745,18 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose covered partitions' settle files a key by the form's
+    /// span alone (`Options::settle_covered_samples` off).
+    pub fn create_settlespan(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                settlespan: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-ingest` as `supdb-latesync`.
     pub fn create_ingest_latesync(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
@@ -7263,6 +7284,7 @@ impl Supdb {
             mergesync1m,
             zbacknow,
             norewarm,
+            settlespan,
             norecycle,
             heapblocks,
             keysarena,
@@ -7636,6 +7658,7 @@ impl Supdb {
             merge_sync_ahead: if mergesync1m { 1 << 20 } else { 0 },
             zpages_hot_back_ask: !zbacknow,
             zpages_rewarm_scans: !norewarm,
+            settle_covered_samples: !settlespan,
             prefault: populate,
             direct_put_one: !recordsteps,
             direct_stream: !copyvals && !refvals,
@@ -7947,6 +7970,7 @@ impl Supdb {
             mergesync1m,
             zbacknow,
             norewarm,
+            settlespan,
             norecycle,
             heapblocks,
             keysarena,
@@ -9019,6 +9043,9 @@ impl Engine for Supdb {
         }
         if self.norewarm {
             return "supdb-norewarm";
+        }
+        if self.settlespan {
+            return "supdb-settlespan";
         }
         if self.norecycle {
             return if self.partition {
@@ -10456,6 +10483,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-mergesync1m"
         | "supdb-zbacknow"
         | "supdb-norewarm"
+        | "supdb-settlespan"
         | "supdb-norecycle"
         | "supdb-heapblocks"
         | "supdb-keysarena"
@@ -11275,6 +11303,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-mergesync1m" => supdb_arm(Supdb::create_mergesync1m, dir)?,
         "supdb-zbacknow" => supdb_arm(Supdb::create_zbacknow, dir)?,
         "supdb-norewarm" => supdb_arm(Supdb::create_norewarm, dir)?,
+        "supdb-settlespan" => supdb_arm(Supdb::create_settlespan, dir)?,
         "supdb-ingestlatesync" => supdb_arm(Supdb::create_ingest_latesync, dir)?,
         "supdb-norecycle" => supdb_arm(Supdb::create_norecycle, dir)?,
         "supdb-ingestnorecycle" => supdb_arm(Supdb::create_ingest_norecycle, dir)?,
@@ -12864,6 +12893,13 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.zpages_rewarm_scans && b.zpages_rewarm_scans);
+            }
+            {
+                let z = Supdb::create_settlespan(&dir("settlespan")).unwrap();
+                assert_eq!(z.name(), "supdb-settlespan");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.settle_covered_samples && b.settle_covered_samples);
             }
             {
                 let z = Supdb::create_sweepwalks(&dir("sweepwalks")).unwrap();

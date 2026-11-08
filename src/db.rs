@@ -1285,6 +1285,23 @@ pub struct Options {
     /// `supdb-settlelazyraw` is the arm.
     #[doc(hidden)]
     pub settle_lazy_raw: bool,
+    /// A covered partition's settle files a written key under the block the
+    /// ordered index's samples name (`OrdIndex::floor_stride`, one sample a
+    /// block, in memory) before it asks the form file, its cut left for the
+    /// build: the form's span names a block only where the group that holds
+    /// the key lies inside one, and a group straddles a block's edge often
+    /// enough that the settle fell to the exact seek, which decodes the
+    /// group. The first scan after the lag sweep's one-percent burst at ten
+    /// million keys under 1.25 GiB waited 89-172 ms for the upkeep
+    /// thread's pass over the burst's 99,000 writes, or settled them itself
+    /// in 114, the decoder and the page views a third of its thread; filed
+    /// by the samples, the thread kept up, the scan waited a millisecond at
+    /// most, and that pass read 1.46x and 1.72x in two sittings, its first
+    /// scan 36-106 ms against 129-212 (`docs/engine.md`). A tie of the
+    /// key's head with a sample, which the samples cannot settle, asks the
+    /// form as before. On; `supdb-settlespan` files by the form's span.
+    #[doc(hidden)]
+    pub settle_covered_samples: bool,
     /// A verified page of a form file is read with its directory trusted
     /// (`zpages::view_trusted`, `ZFile::view`), and a read takes a page's
     /// view once, for the group it wants and the open of it. The checked
@@ -4466,6 +4483,7 @@ impl Default for Options {
             zpages_memo_hash: true,
             zpages_settle_span: true,
             settle_lazy_raw: false,
+            settle_covered_samples: true,
             zpages_trusted_views: true,
             zpages_memo_bytes: 8 << 20,
             zpages_memo_first: false,
@@ -20657,24 +20675,34 @@ impl Reader {
     /// before it reached as `floor`, so the heads' seek gallops from one
     /// answer to the next over warm heads.
     /// The block a settle may file `key` under with its cut unresolved
-    /// (`Options::zpages_settle_span`): the one the form file's fence and
-    /// the page's directory name (`ZFile::owner_span`), where they name
-    /// one, and where the partition's table holds no form for it that a
-    /// patch reads the cut of -- none, or a wide one, which files keys by
-    /// slot. `None` asks for the exact resolve.
+    /// (`Options::zpages_settle_span`): the one the ordered index's samples
+    /// name (`Options::settle_covered_samples`, `Options::settle_lazy_raw`)
+    /// or the form file's fence and the page's directory name
+    /// (`ZFile::owner_span`), where they name one, and where the
+    /// partition's table holds no form for it that a patch reads the cut
+    /// of -- none, or a wide one, which files keys by slot. `None` asks for
+    /// the exact resolve.
     fn lazy_block(&self, at: usize, seg: &Seg, key: &[u8], hint: &mut usize) -> Option<usize> {
+        // The block the ordered index's samples name, one a block, where
+        // the option for the partition's kind asks for them.
+        let sampled = |on: bool| if on { seg.ord.floor_stride(key) } else { None };
         let b = match self.zc(seg) {
-            Some(z) => {
-                let (lo, hi) = z.owner_span_from(key, hint)?;
-                if hi <= lo || lo / CACHE_BLOCK != (hi - 1) / CACHE_BLOCK {
-                    return None;
+            // A covered partition's from the samples first
+            // (`Options::settle_covered_samples`), and from the form's span
+            // where a sample ties the key's head.
+            Some(z) => match sampled(self.opts.settle_covered_samples) {
+                Some(b) => b,
+                None => {
+                    let (lo, hi) = z.owner_span_from(key, hint)?;
+                    if hi <= lo || lo / CACHE_BLOCK != (hi - 1) / CACHE_BLOCK {
+                        return None;
+                    }
+                    lo / CACHE_BLOCK
                 }
-                lo / CACHE_BLOCK
-            }
-            // A raw partition's block from the ordered index's samples,
-            // one a block (`Options::settle_lazy_raw`).
-            None if self.opts.settle_lazy_raw => seg.ord.floor_stride(key)?,
-            None => return None,
+            },
+            // A raw partition's from the samples alone
+            // (`Options::settle_lazy_raw`).
+            None => sampled(self.opts.settle_lazy_raw)?,
         };
         let tables = self.fs().tables.borrow();
         let held = tables.get(at)?.borrow();

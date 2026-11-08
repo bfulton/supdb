@@ -4342,6 +4342,93 @@ fn the_caches_own_budget_grows_into_the_room_the_partitions_leave() {
     );
 }
 
+/// A covered partition's settle files a written key under the block the
+/// ordered index's samples name, its cut left for the build
+/// (`Options::settle_covered_samples`): over a store whose partitions are
+/// all served by their form files, scattered writes, deletes and inserts
+/// read back as the model has them through every window and every handle,
+/// with more keys filed by the samples than the form's span alone files.
+#[test]
+fn a_covered_partitions_settle_files_a_key_under_the_block_its_samples_name() {
+    let mut filed_by = [0u64; 2];
+    for samples in [true, false] {
+        let name = format!("settle-covered-samples-{samples}");
+        let d = dir(&name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 1 << 20,
+                partition_bytes: Some(32 << 10),
+                l0_trigger: 64,
+                scan_block_cache: true,
+                scan_cache_ahead: false,
+                commit_forms: true,
+                forms_settle_backlog_pct: 0,
+                zpages: supdb::ZPages::Always,
+                zpages_min_bytes: 0,
+                settle_covered_samples: samples,
+                upkeep: supdb::Upkeep::Inline,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in 0..6000u32 {
+            m.append(&mut db, &key(k), "v0-0123456789");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        db.settle().unwrap();
+        db.zpages_settle().unwrap();
+        let c = db.zpage_counts();
+        assert!(
+            c.form_files > 1 && c.form_files == c.partitions,
+            "{name}: every partition served by its form file: {c:?}"
+        );
+        m.check_one(&db, key(0).as_bytes(), 10, &format!("{name}: before"));
+        let before = db.lazy_cuts();
+        let mut x = 0x5E77_1A2Bu64;
+        let mut rng = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for round in 0..3u32 {
+            for i in 0..150u32 {
+                let k = (rng() % 6000) as u32;
+                match rng() % 4 {
+                    0 => m.delete(&mut db, &key(k)),
+                    1 => m.append(&mut db, &format!("{}x{round}-{i}", key(k)), "n"),
+                    _ => m.append(&mut db, &key(k), &format!("s{round}-{i}")),
+                }
+            }
+            db.commit().unwrap();
+            for w in 0..20u32 {
+                let from = key((rng() % 6100) as u32);
+                let limit = 1 + (w as usize * 7) % 150;
+                m.check_one(
+                    &db,
+                    from.as_bytes(),
+                    limit,
+                    &format!("{name}: round {round} window {w}"),
+                );
+            }
+        }
+        m.check(&db, &format!("{name}: the writer at the end"));
+        let h = db.reader().unwrap();
+        m.check(&h, &format!("{name}: a handle at the end"));
+        let [filed, _] = db.lazy_cuts();
+        filed_by[usize::from(samples)] = filed - before[0];
+    }
+    assert!(
+        filed_by[1] > filed_by[0],
+        "more keys filed by the samples than by the form's span alone: {filed_by:?}"
+    );
+}
+
 /// A raw partition's settle files a written key under the block the
 /// ordered index's samples name, its cut left for the build that reads
 /// the block (`Options::settle_lazy_raw`), and the scans answer the model:
