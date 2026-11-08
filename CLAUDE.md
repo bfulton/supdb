@@ -4043,6 +4043,27 @@ times over has room to give that a cell lost at a seventh does not; and a
 verdict is taken again when the division or the order it was read under is
 not the row's.
 
+**A structure kept for readers, reclaimed first because nobody had read
+it.** The form files a merge's finish builds are kept in the page cache for
+the scans to come, and the burst before the lag sweep's full-rewrite pass
+took a third of them back out: a page written once and never read sits on
+the kernel's inactive list, the first reclaimed, whatever the store meant
+it for, and the burst's last seconds of writes -- pieces, merge outputs, the
+log -- were newer. The pass then read eleven form files of twenty-nine cold,
+a 4 KB fault at a time under an advice of random, 97% of its major faults,
+while the first reading had put them on the pieces; the faults by file and
+the cache's residency by kind at the pass's start (`scripts/resident.py`)
+said where they were in one run each. The form files under nine tenths
+resident are asked for whole when scans come back after a quiet stretch,
+once no merge is in flight (`Options::zpages_rewarm_scans`), since asked
+beside the chain's last merges they were pushed out again and refaulted
+fivefold. The rules: under a bound, what the store writes for its readers
+is asked for again when the readers come, because the kernel ranks a page
+by its reads and not by its writer's intent; an ask for pages is made when
+nothing is writing beside it, or it pays twice; and a test of a trigger
+that counts scans counts the writer's, since a handle says so once a
+commit.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
