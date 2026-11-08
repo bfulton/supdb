@@ -8618,6 +8618,13 @@ impl PieceWriter {
         self.0.out.flushes.clone()
     }
 
+    /// Whether its helper thread has started: on the writer's own thread,
+    /// at the first piece landed past the stride, where the syncs the
+    /// helper then makes are the scheduler's to time.
+    fn helper_started(&self) -> bool {
+        self.0.out.helper.is_some()
+    }
+
     /// `SegmentWriter::set_deferred_keys`: no copy of the keys here or in
     /// the ordered index's builder; the finish is handed them
     /// (`finish_unsynced_from`).
@@ -13021,6 +13028,8 @@ struct Emitter<'a> {
     /// The syncs the outputs' writers made behind them
     /// (`Options::merge_sync_ahead`).
     syncs: u64,
+    /// The outputs whose writers started a helper.
+    helpers: u64,
 }
 
 impl Emitter<'_> {
@@ -13093,6 +13102,7 @@ impl Emitter<'_> {
             // inline in its key section, which the finish writes, and the
             // helper syncs behind those writes until the finish stops it.
             let flushes = w.helper_flushes();
+            self.helpers += u64::from(w.helper_started());
             let ord = w
                 .finish()
                 .map_err(|e| err(&format!("compact finish: {e}")))?;
@@ -13295,6 +13305,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         out: Vec::new(),
         zfinish: zfinish.clone(),
         syncs: 0,
+        helpers: 0,
     };
     // Tombstones end here. Every merge writes the bottom level, so for each
     // key the inputs older than its newest flagged extent are dropped, the
@@ -13404,6 +13415,8 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
     steps.step("values");
     if let Some(c) = &counts {
         c.merge_syncs.fetch_add(em.syncs, AtomicOrdering::Relaxed);
+        c.merge_helpers
+            .fetch_add(em.helpers, AtomicOrdering::Relaxed);
     }
     let mut out = em.finish(total)?;
     out.extend(empties);
@@ -13569,6 +13582,7 @@ fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
         out: Vec::new(),
         zfinish: zfinish.clone(),
         syncs: 0,
+        helpers: 0,
     };
     let mut ahead = MergeAhead::new(&blobs, read_ahead, counts.clone());
     merge_ranks(&blobs, walk_cached, |k, tied| {
@@ -13603,6 +13617,8 @@ fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
     })?;
     if let Some(c) = &counts {
         c.merge_syncs.fetch_add(em.syncs, AtomicOrdering::Relaxed);
+        c.merge_helpers
+            .fetch_add(em.helpers, AtomicOrdering::Relaxed);
     }
     let out = em.finish(total)?;
     File::open(&dir)?.sync_all()?;
@@ -15366,6 +15382,8 @@ struct Shared {
     merge_dropped_bytes: AtomicU64,
     /// The syncs merge writers made behind them (`Options::merge_sync_ahead`).
     merge_syncs: AtomicU64,
+    /// The merge outputs whose writers started a helper.
+    merge_helpers: AtomicU64,
     /// Whether the writer's last seal was near reads, a drain's counted
     /// near: the segment work's landings take the pieces' ranks and
     /// bounds only then (`Options::land_ranks_far`).
@@ -19708,6 +19726,13 @@ impl Reader {
     #[doc(hidden)]
     pub fn merge_syncs(&self) -> u64 {
         self.shared.merge_syncs.load(AtomicOrdering::Relaxed)
+    }
+
+    /// The merge outputs whose writers started a helper thread, the first
+    /// time the output passed the stride (`Options::merge_sync_ahead`).
+    #[doc(hidden)]
+    pub fn merge_helpers(&self) -> u64 {
+        self.shared.merge_helpers.load(AtomicOrdering::Relaxed)
     }
 
     pub fn merge_dropped_bytes(&self) -> u64 {
@@ -27953,6 +27978,7 @@ impl Db {
             merge_ahead_bytes: AtomicU64::new(0),
             merge_dropped_bytes: AtomicU64::new(0),
             merge_syncs: AtomicU64::new(0),
+            merge_helpers: AtomicU64::new(0),
             reads_near: std::sync::atomic::AtomicBool::new(false),
             scans_far_at: AtomicU64::new(u64::MAX),
             mode_scans: AtomicU64::new(0),
@@ -28505,6 +28531,7 @@ impl Db {
             merge_ahead_bytes: AtomicU64::new(0),
             merge_dropped_bytes: AtomicU64::new(0),
             merge_syncs: AtomicU64::new(0),
+            merge_helpers: AtomicU64::new(0),
             reads_near: std::sync::atomic::AtomicBool::new(false),
             scans_far_at: AtomicU64::new(u64::MAX),
             mode_scans: AtomicU64::new(0),

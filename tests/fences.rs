@@ -733,13 +733,15 @@ fn a_merge_drops_its_inputs_pages_behind_its_second_pass() {
 }
 
 /// A merge's writers sync their output behind them every
-/// `Options::merge_sync_ahead` bytes, on the writer's helper thread: at
-/// sixty-four kilobytes a merge that writes several megabytes makes syncs
-/// the store counts (`Db::merge_syncs`), and at zero, the segment's own
-/// eight megabytes, a merge of fewer makes none. The syncs move no byte:
-/// both stores' segments are the same. The helper syncs on a thread of its
-/// own and may take its turn late, but a stride of sixty-four kilobytes
-/// against outputs of megabytes leaves it dozens of strides to take one.
+/// `Options::merge_sync_ahead` bytes, on the writer's helper thread, which
+/// the writer starts the first time its output passes the stride: at
+/// sixty-four kilobytes every output of a merge that writes megabytes
+/// starts one (`Db::merge_helpers`), and at zero, the segment's own eight
+/// megabytes, no output of fewer does, and none syncs. The helpers' syncs
+/// themselves are not held to a count: the helper takes its turns when
+/// the scheduler gives it them, and under the gate's load it took none
+/// before the finish asked it to stop. The syncs move no byte: both
+/// stores' segments are the same.
 #[test]
 fn a_merges_writers_sync_behind_them_at_the_merges_own_stride() {
     let mut dirs = Vec::new();
@@ -792,11 +794,18 @@ fn a_merges_writers_sync_behind_them_at_the_merges_own_stride() {
         db.settle().unwrap();
         let (by_heads, by_records) = db.merge_key_sources();
         assert!(by_heads + by_records > 0, "a merge ran");
-        let syncs = db.merge_syncs();
+        let (helpers, syncs) = (db.merge_helpers(), db.merge_syncs());
         if stride > 0 {
-            assert!(syncs > 0, "the merges' writers synced behind them: {syncs}");
+            assert!(
+                helpers > 0,
+                "the merges' writers started their helpers: {helpers}"
+            );
         } else {
-            assert_eq!(syncs, 0, "no merge output reached eight megabytes");
+            assert_eq!(
+                (helpers, syncs),
+                (0, 0),
+                "no merge output reached eight megabytes"
+            );
         }
         db.close().unwrap();
         dirs.push(d);
