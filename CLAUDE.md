@@ -4128,6 +4128,24 @@ The rule: an arm left as a trade is priced again once the effects it was
 traded against are fixed, since the verdict was a reading of the cells,
 and the cells had more in them than the arm.
 
+**A seam that priced one of a path's two costs.** The reading made from
+the form files on disk prices the form by timing a few of its pages'
+decodes, and the test seam pins the decode (`ZInject::set_decode_cost`)
+since the line to enter is a function of it; the same timing's faults
+priced a fault at their own wait, and the seam's fault cost was read by the
+census and not there. A store two percent past its budget, which the
+attach test holds to waiting for reads, was bought on the prediction once
+in a gate run and in none of thirty-three runs after it: the files' pages
+had been dropped behind the builds, the timed decodes faulted, and under
+the gate's load a stalled fault raised the price of a fault until the line
+to enter fell under the model's saving. The reading prices its faults at
+the seam's cost where one is set, publishes the price it carried
+(`sample_t_f_ns`), and the test puts the files out of the cache and holds
+the price to the seam's. The rule is the one the decode's seam was written
+for, read across the path: every measured cost a test's premise depends
+on goes through the seam, and a path that takes two costs from one timing
+takes both from it.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

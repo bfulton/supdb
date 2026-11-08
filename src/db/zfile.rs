@@ -3869,6 +3869,10 @@ pub(super) struct ZEvents {
     /// of a fill sample (`Maint::z_reading_from_files`,
     /// `Options::zpages_reading_from_files`).
     pub sample_from_files: AtomicU64,
+    /// The price of a fault the last reading carried, nanoseconds, zero
+    /// where its timed decodes took none: their wait over their faults, or
+    /// the seam's price where it sets one (`ZInject::set_fault_cost`).
+    pub sample_t_f_ns: AtomicU64,
     /// The sampler's estimate of the form's bytes over the partitions it
     /// counted, at its last reading (`Sample::w_z` summed).
     pub sample_w_z: AtomicU64,

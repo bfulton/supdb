@@ -8668,7 +8668,9 @@ fn a_form_file_built_ahead_in_the_coding_the_pick_refuses_is_built_again() {
 /// or with the option off, or two percent past the budget, where the
 /// model's saving is under the selector's line to enter and only the
 /// group's pressure says otherwise, the rent waits for the evidence reads
-/// would give, and the store stays in SUSPECT with its files dormant.
+/// would give, and the store stays in SUSPECT with its files dormant --
+/// with the files' pages out of the cache, whose faults the reading prices
+/// at the seam's cost and not at a wait the machine's load chooses.
 #[cfg(target_os = "linux")]
 #[test]
 fn an_attach_of_form_files_built_ahead_is_bought_on_the_prediction() {
@@ -8724,6 +8726,18 @@ fn an_attach_of_form_files_built_ahead_is_bought_on_the_prediction() {
             gone <= 1,
             "{what}: {removed} of {total} bytes removed"
         );
+        // Near, the files' pages put out of the cache, so that the reading's
+        // timed decodes fault: the reading prices those faults at the seam's
+        // cost and not at their wait, which under a gate's load was a
+        // stalled fault's and dropped the line to enter under the model's
+        // saving, so that the store was bought on the prediction.
+        // The files are dormant, mapped by nothing, so a drop of their cache
+        // takes every page.
+        if near {
+            for f in form_files(&dir) {
+                evict(&f);
+            }
+        }
         // Past the budget under the group's pressure: far past it, or two
         // percent past it, where the model's saving is under the line to
         // enter and the pressure alone buys nothing on the prediction.
@@ -8765,6 +8779,17 @@ fn an_attach_of_form_files_built_ahead_is_bought_on_the_prediction() {
                 (c.phase, c.attached, c.prebuilt),
                 (1, 0, n),
                 "{what}: SUSPECT, the files dormant: {c:?}"
+            );
+        }
+        if near {
+            assert!(
+                c.sample_from_files >= 1,
+                "{what}: a reading from the files: {c:?}"
+            );
+            assert_eq!(
+                c.sample_t_f_ns,
+                FAULT_40US.as_nanos() as u64,
+                "{what}: the reading's timed decodes faulted and were priced at the seam's cost: {c:?}"
             );
         }
         db.close().unwrap();

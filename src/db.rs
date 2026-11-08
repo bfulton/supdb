@@ -686,6 +686,9 @@ pub struct ZCounts {
     /// Readings made from the form files on disk at the crossing in place
     /// of a fill sample (`Options::zpages_reading_from_files`).
     pub sample_from_files: u64,
+    /// The price of a fault the last reading carried, nanoseconds; zero
+    /// where its timed decodes took no fault.
+    pub sample_t_f_ns: u64,
     /// The sampler's estimate of the form's bytes over the partitions it
     /// counted, at its last reading; `file_bytes` is what the build wrote.
     pub sample_w_z_bytes: u64,
@@ -20062,6 +20065,7 @@ impl Reader {
             sample_us: get(&ev.sample_us),
             sample_refreshed: get(&ev.sample_refreshed),
             sample_from_files: get(&ev.sample_from_files),
+            sample_t_f_ns: get(&ev.sample_t_f_ns),
             sample_w_z_bytes: get(&ev.sample_w_z),
             sample_w_z_raw_bytes: get(&ev.sample_w_z_raw),
             coding_picks_block: get(&ev.coding_picks[0]),
@@ -41419,7 +41423,21 @@ impl Maint {
             None if zgroups > 0 => decode_ns as f64 * 1e-9 / zgroups as f64,
             None => 0.0,
         };
-        let t_f = (faults > 0).then(|| wait_ns as f64 * 1e-9 / faults as f64);
+        // A fault's price, where the timed decodes took one: their wait over
+        // their faults, or the seam's price, as the census takes it, since
+        // the wait is the device's and the load's at that moment -- a test
+        // under a gate's load read a stalled fault there, the line to enter
+        // fell under the model's saving, and a store two percent past its
+        // budget was bought on the prediction where it is to wait for reads.
+        let seam_fault = self
+            .opts
+            .zpages_inject
+            .as_ref()
+            .and_then(|i| i.fault_cost())
+            .map(|d| d.as_secs_f64());
+        let t_f = (faults > 0).then(|| seam_fault.unwrap_or(wait_ns as f64 * 1e-9 / faults as f64));
+        ev.sample_t_f_ns
+            .store(t_f.map_or(0, |t| (t * 1e9) as u64), AtomicOrdering::Relaxed);
         let priced_t_f = t_f.unwrap_or(zselect::PRIOR_T_F);
         // The attach reads the trailer, the resident part and sixteen
         // sampled pages of each file, each a page the device may fault.
