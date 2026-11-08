@@ -779,6 +779,10 @@ pub struct Supdb {
     /// No budget of the cache's own, `Options::scan_cache_auto` off.
     /// `supdb-cachenoauto`.
     cachenoauto: bool,
+    /// The cache's own budget an eighth of the limit, binding where the
+    /// cache passes it whatever room the partitions leave, the shape
+    /// before `Options::scan_cache_auto_room`. `supdb-cacheeighth`.
+    cacheeighth: bool,
     /// A direct run's record stream kept whole in the arena, the shape
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
@@ -1699,6 +1703,10 @@ struct Policy {
     /// No budget of the cache's own, `Options::scan_cache_auto` off.
     /// `supdb-cachenoauto`.
     cachenoauto: bool,
+    /// The cache's own budget an eighth of the limit, binding where the
+    /// cache passes it whatever room the partitions leave, the shape
+    /// before `Options::scan_cache_auto_room`. `supdb-cacheeighth`.
+    cacheeighth: bool,
     /// A direct run's record stream kept whole in the arena, the shape
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
@@ -2208,6 +2216,7 @@ impl Default for Policy {
             deferbursts: false,
             passyield: false,
             cachenoauto: false,
+            cacheeighth: false,
             norecycle: false,
             heapblocks: false,
             keysarena: false,
@@ -5633,6 +5642,19 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose own cache budget is the eighth of the limit as it
+    /// was, binding where the cache passes it
+    /// (`Options::scan_cache_auto_room` off).
+    pub fn create_cacheeighth(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cacheeighth: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-ingest` as `supdb-latesync`.
     pub fn create_ingest_latesync(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
@@ -7155,6 +7177,7 @@ impl Supdb {
             deferbursts,
             passyield,
             cachenoauto,
+            cacheeighth,
             norecycle,
             heapblocks,
             keysarena,
@@ -7523,6 +7546,7 @@ impl Supdb {
             upkeep_yields: passyield,
             upkeep_fill_yields: !fillholds,
             scan_cache_auto: !cachenoauto,
+            scan_cache_auto_room: !cacheeighth,
             prefault: populate,
             direct_put_one: !recordsteps,
             direct_stream: !copyvals && !refvals,
@@ -7829,6 +7853,7 @@ impl Supdb {
             deferbursts,
             passyield,
             cachenoauto,
+            cacheeighth,
             norecycle,
             heapblocks,
             keysarena,
@@ -8887,6 +8912,9 @@ impl Engine for Supdb {
         if self.cachenoauto {
             return "supdb-cachenoauto";
         }
+        if self.cacheeighth {
+            return "supdb-cacheeighth";
+        }
         if self.norecycle {
             return if self.partition {
                 "supdb-norecycle"
@@ -9166,6 +9194,7 @@ impl Engine for Supdb {
             // The times the cache's own budget bound
             // (`Options::scan_cache_auto`).
             ("cache_bindings", db.cache_bindings() as f64),
+            ("cache_growths", db.cache_growths() as f64),
             ("snap_switches", db.snapshot_switches() as f64),
             // The store's shape as it stands: what a read has to consult.
             ("segments", db.segments() as f64),
@@ -10313,6 +10342,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-deferbursts"
         | "supdb-passyield"
         | "supdb-cachenoauto"
+        | "supdb-cacheeighth"
         | "supdb-norecycle"
         | "supdb-heapblocks"
         | "supdb-keysarena"
@@ -11127,6 +11157,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-deferbursts" => supdb_arm(Supdb::create_deferbursts, dir)?,
         "supdb-passyield" => supdb_arm(Supdb::create_passyield, dir)?,
         "supdb-cachenoauto" => supdb_arm(Supdb::create_cachenoauto, dir)?,
+        "supdb-cacheeighth" => supdb_arm(Supdb::create_cacheeighth, dir)?,
         "supdb-ingestlatesync" => supdb_arm(Supdb::create_ingest_latesync, dir)?,
         "supdb-norecycle" => supdb_arm(Supdb::create_norecycle, dir)?,
         "supdb-ingestnorecycle" => supdb_arm(Supdb::create_ingest_norecycle, dir)?,
@@ -12681,6 +12712,13 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.zpages_hot_cold_back && !b.zpages_hot_cold_back);
+            }
+            {
+                let z = Supdb::create_cacheeighth(&dir("cacheeighth")).unwrap();
+                assert_eq!(z.name(), "supdb-cacheeighth");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.scan_cache_auto_room && b.scan_cache_auto_room);
             }
             {
                 let z = Supdb::create_sweepwalks(&dir("sweepwalks")).unwrap();

@@ -2267,6 +2267,24 @@ pub struct Options {
     /// eighth of the memory available, and no budget where that cannot be
     /// read.
     pub scan_cache_auto_bytes: usize,
+    /// Where the cache passes the store's own budget, the budget grows into
+    /// the room the partitions leave of the page cache's, instead of binding
+    /// (`Reader::grow_auto_budget`): the controller's budget -- the group's
+    /// limit less its anonymous memory and the margin, which counts the
+    /// cache it has already -- less what the partitions' raw forms or form
+    /// files take (`settle_room_bytes`), read again at every crossing, and
+    /// the budget binds only once that room is under an eighth of what it
+    /// already allows. An eighth of the limit bound at three million keys
+    /// under 1.25 GiB, where the store and a cache of its own size fit:
+    /// after the lag sweep's full rewrite the pass's working set was 388 MB
+    /// of forms against a budget of 160, and the bound cache shed what the
+    /// scans and the builder ahead built and built it again, 11,000 blocks
+    /// in a pass of 3,000 scans with the allocator's arena locks between
+    /// the threads, 450-560 ms where the arm with no budget read the pass in
+    /// 36-38 (`docs/engine.md`). A budget given (`scan_cache_auto_bytes`) is
+    /// held as given unless the test's seam gives the page cache's budget
+    /// (`zpages_inject`). `supdb-cacheeighth` is the eighth as it was.
+    pub scan_cache_auto_room: bool,
     /// PROTOTYPE: with the block cache, build ahead of the reader on a
     /// thread of its own. At the writer's first scan over a published
     /// state, a reader handle pins the store as of the last commit and
@@ -4429,6 +4447,7 @@ impl Default for Options {
             scan_cache_bytes: 0,
             scan_cache_auto: true,
             scan_cache_auto_bytes: 0,
+            scan_cache_auto_room: true,
             scan_cache_ahead: true,
             scan_run_builds: true,
             scan_prefetch: true,
@@ -15444,6 +15463,9 @@ struct Shared {
     auto_cache_bytes: usize,
     /// The times a handle's automatic budget bound.
     cache_bindings: AtomicU64,
+    /// The times a handle's automatic budget grew into the room the
+    /// partitions leave instead of binding (`Options::scan_cache_auto_room`).
+    cache_growths: AtomicU64,
     /// The store's scans (`Shared::scans_all`) when a publish kept fewer
     /// tables than the upkeep was behind and asked the thread to give up
     /// its forms (`Options::upkeep_abandons`), `u64::MAX` when nothing is
@@ -16520,6 +16542,11 @@ struct FormsState {
     /// cache passed it once, and from then on this handle keeps it as a
     /// budget it was given keeps it.
     cache_bound: std::cell::Cell<bool>,
+    /// The automatic budget as this handle has grown it into the room the
+    /// partitions leave (`Options::scan_cache_auto_room`), zero until it
+    /// has: a handle's own, since each handle's cache is its own and the
+    /// room is read with every cache in it.
+    auto_grown: std::cell::Cell<usize>,
     /// `Shared::tables_landed` as the upkeep thread's pass in flight
     /// pinned its state, and what a table landed under the pin costs
     /// (`MemTable::kept_bytes` of the largest table the state stands on),
@@ -16708,6 +16735,7 @@ impl FormsState {
             tables_complete: std::cell::Cell::new(false),
             abandoned: std::cell::Cell::new(u64::MAX),
             cache_bound: std::cell::Cell::new(false),
+            auto_grown: std::cell::Cell::new(0),
             pass_landed: std::cell::Cell::new(0),
             pass_unit: std::cell::Cell::new(0),
             abandon_pinned: std::cell::Cell::new(false),
@@ -23930,7 +23958,11 @@ impl Reader {
                 // The store's own budget reached: it binds, and what the
                 // fill has not built is left to the scans that want it.
                 let budget = self.cache_budget();
-                if budget > 0 && !self.cache_binds() && self.fs().cache_bytes.get() > budget {
+                if budget > 0
+                    && !self.cache_binds()
+                    && self.fs().cache_bytes.get() > budget
+                    && !self.grow_auto_budget()
+                {
                     self.bind_cache();
                     return Ok(false);
                 }
@@ -24066,8 +24098,47 @@ impl Reader {
         if self.opts.scan_cache_bytes > 0 {
             self.opts.scan_cache_bytes
         } else {
-            self.shared.auto_cache_bytes
+            self.shared.auto_cache_bytes.max(self.fs().auto_grown.get())
         }
+    }
+
+    /// Where the cache has passed the store's own budget: the room the
+    /// partitions leave of the page cache's budget given to it, so the
+    /// budget holds the cache and what it may grow into, and true where it
+    /// grew (`Options::scan_cache_auto_room`). The page cache's budget
+    /// counts the process's anonymous memory, this cache with it, so the
+    /// room shrinks as the cache takes it; under an eighth of the budget
+    /// it already allows, the budget binds as it did, since a smaller step
+    /// would read the group's files at every few builds.
+    fn grow_auto_budget(&self) -> bool {
+        if !self.opts.scan_cache_auto_room
+            || self.opts.scan_cache_bytes > 0
+            || self.shared.auto_cache_bytes == 0
+            || self.cache_binds()
+        {
+            return false;
+        }
+        let seam = self.opts.zpages_inject.as_ref().and_then(|i| i.budget());
+        if seam.is_none() && self.opts.scan_cache_auto_bytes > 0 {
+            return false;
+        }
+        let Some(page_cache) = seam.or_else(|| zfile::read_budget().map(|b| b.budget)) else {
+            return false;
+        };
+        let room = self.settle_room_bytes(page_cache);
+        let now = self.cache_budget();
+        if room <= 0 || (room as u64) < (now as u64) / 8 {
+            return false;
+        }
+        let grown = self.fs().cache_bytes.get().saturating_add(room as usize);
+        if grown <= now {
+            return false;
+        }
+        self.fs().auto_grown.set(grown);
+        self.shared
+            .cache_growths
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        true
     }
 
     /// Whether the budget is kept: a budget given from the start, the
@@ -24181,11 +24252,17 @@ impl Reader {
     /// rather than borrowed again, and `keep` the block it is about to
     /// walk, never shed: a budget below one block holds that block.
     fn shed(&self, cur: usize, keep: usize, table: &mut BlockTable) {
-        let budget = self.cache_budget();
+        let mut budget = self.cache_budget();
         if budget == 0 || self.fs().cache_bytes.get() <= budget {
             return;
         }
         if !self.cache_binds() {
+            if self.grow_auto_budget() {
+                budget = self.cache_budget();
+                if self.fs().cache_bytes.get() <= budget {
+                    return;
+                }
+            }
             self.bind_cache();
         }
         let tick = self.fs().scan_tick.get();
@@ -26364,6 +26441,13 @@ impl Reader {
         self.shared.cache_bindings.load(AtomicOrdering::Relaxed)
     }
 
+    /// The times a handle's own cache budget grew into the room the
+    /// partitions leave (`Options::scan_cache_auto_room`).
+    #[doc(hidden)]
+    pub fn cache_growths(&self) -> u64 {
+        self.shared.cache_growths.load(AtomicOrdering::Relaxed)
+    }
+
     /// The store's own cache budget as resolved at open, zero for none.
     #[doc(hidden)]
     pub fn auto_cache_bytes(&self) -> usize {
@@ -27817,6 +27901,7 @@ impl Db {
             keep_bytes: Db::resolve_keep_bytes(&opts),
             auto_cache_bytes: Db::resolve_auto_cache(&opts),
             cache_bindings: AtomicU64::new(0),
+            cache_growths: AtomicU64::new(0),
             abandon_at: AtomicU64::new(u64::MAX),
             outran_at: AtomicU64::new(u64::MAX),
             abandons: AtomicU64::new(0),
@@ -28367,6 +28452,7 @@ impl Db {
             keep_bytes: Db::resolve_keep_bytes(&opts),
             auto_cache_bytes: Db::resolve_auto_cache(&opts),
             cache_bindings: AtomicU64::new(0),
+            cache_growths: AtomicU64::new(0),
             abandon_at: AtomicU64::new(u64::MAX),
             outran_at: AtomicU64::new(u64::MAX),
             abandons: AtomicU64::new(0),

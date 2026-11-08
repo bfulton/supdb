@@ -4268,6 +4268,80 @@ fn a_cache_bound_after_its_tables_were_complete_reads_no_shed_block_as_clean() {
     );
 }
 
+/// The store's own budget, crossed, grows into the room the partitions
+/// leave of the page cache's budget instead of binding
+/// (`Options::scan_cache_auto_room`): with a page-cache budget past the
+/// partitions it grows and nothing binds, with one the partitions fill it
+/// binds as it did, and with the option off it binds whatever the room.
+/// The budget is a kilobyte, which the first forms pass, and the page
+/// cache's budget is the test's seam; the scans answer the model in all
+/// three, the bound one shedding as it goes.
+#[test]
+fn the_caches_own_budget_grows_into_the_room_the_partitions_leave() {
+    let run = |name: &str, page_cache: u64, room: bool| {
+        let d = dir(name);
+        let inject = std::sync::Arc::new(supdb::ZInject::new());
+        inject.set_budget(page_cache);
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 1 << 20,
+                partition_bytes: Some(2 << 10),
+                l0_trigger: 64,
+                scan_block_cache: true,
+                scan_cache_ahead: false,
+                commit_forms: true,
+                forms_settle_backlog_pct: 0,
+                scan_cache_auto_bytes: 1 << 10,
+                scan_cache_auto_room: room,
+                zpages_inject: Some(inject),
+                upkeep: supdb::Upkeep::Inline,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in 0..3000u32 {
+            m.append(&mut db, &key(k), "v0-0123456789");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        db.settle().unwrap();
+        for round in 0..4u32 {
+            for b in 0..40u32 {
+                m.append(&mut db, &key(b * 64 + 1 + round), &format!("v{round}"));
+            }
+            db.commit().unwrap();
+            m.check(&db, &format!("{name}: round {round}"));
+        }
+        let h = db.reader().unwrap();
+        m.check(&h, &format!("{name}: a handle"));
+        (
+            db.cache_growths(),
+            db.cache_bindings(),
+            db.block_cache_bytes(),
+        )
+    };
+    let (grew, bound, bytes) = run("auto-room-grows", 1 << 30, true);
+    assert!(
+        grew > 0 && bound == 0 && bytes > 1 << 10,
+        "with room the budget grew past its kilobyte and nothing bound: \
+         {grew} growths, {bound} bindings, {bytes} B held"
+    );
+    let (grew, bound, _) = run("auto-room-none", 1, true);
+    assert!(
+        grew == 0 && bound > 0,
+        "with no room past the partitions the budget bound: {grew} growths, {bound} bindings"
+    );
+    let (grew, bound, _) = run("auto-room-off", 1 << 30, false);
+    assert!(
+        grew == 0 && bound > 0,
+        "with the option off the budget bound whatever the room: {grew} growths, {bound} bindings"
+    );
+}
+
 /// And a budget the cache never reaches keeps the unbounded shape: the
 /// same blocks built over the same model as the store with none.
 #[test]
