@@ -4116,6 +4116,18 @@ that holds a producer to a consumer is priced in each regime the
 consumer's rate changes in, since a hold is only as cheap as what it waits
 for.
 
+**A trade priced while two other losses stood in its cells.** Two merges
+in flight paid the full rewrite's merge debt sooner under a bound and
+read as a trade: the full rewrite's pass ahead, the clean store's pass and
+the one-percent pass behind in three reps of four. The losses were not the
+merges': the clean store's pass met form files the burst had pushed cold,
+and the one-percent pass's first scan settled through the form's decodes.
+Each got a lever of its own, and the same pairing then read every lag pass
+but the tenth ahead, 1.14-1.88x, in two sittings, and in core 1.13-1.80x.
+The rule: an arm left as a trade is priced again once the effects it was
+traded against are fixed, since the verdict was a reading of the cells,
+and the cells had more in them than the arm.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
