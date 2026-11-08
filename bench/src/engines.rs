@@ -783,6 +783,10 @@ pub struct Supdb {
     /// cache passes it whatever room the partitions leave, the shape
     /// before `Options::scan_cache_auto_room`. `supdb-cacheeighth`.
     cacheeighth: bool,
+    /// A raw partition's settle filing a written key by the ordered index's
+    /// samples, its cut left for the build (`Options::settle_lazy_raw` on).
+    /// `supdb-settlelazyraw`.
+    settlelazyraw: bool,
     /// A direct run's record stream kept whole in the arena, the shape
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
@@ -1707,6 +1711,10 @@ struct Policy {
     /// cache passes it whatever room the partitions leave, the shape
     /// before `Options::scan_cache_auto_room`. `supdb-cacheeighth`.
     cacheeighth: bool,
+    /// A raw partition's settle filing a written key by the ordered index's
+    /// samples, its cut left for the build (`Options::settle_lazy_raw` on).
+    /// `supdb-settlelazyraw`.
+    settlelazyraw: bool,
     /// A direct run's record stream kept whole in the arena, the shape
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
@@ -2217,6 +2225,7 @@ impl Default for Policy {
             passyield: false,
             cachenoauto: false,
             cacheeighth: false,
+            settlelazyraw: false,
             norecycle: false,
             heapblocks: false,
             keysarena: false,
@@ -5655,6 +5664,18 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose settle files a raw partition's written key by the
+    /// ordered index's samples (`Options::settle_lazy_raw` on).
+    pub fn create_settlelazyraw(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                settlelazyraw: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-ingest` as `supdb-latesync`.
     pub fn create_ingest_latesync(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
@@ -7178,6 +7199,7 @@ impl Supdb {
             passyield,
             cachenoauto,
             cacheeighth,
+            settlelazyraw,
             norecycle,
             heapblocks,
             keysarena,
@@ -7547,6 +7569,7 @@ impl Supdb {
             upkeep_fill_yields: !fillholds,
             scan_cache_auto: !cachenoauto,
             scan_cache_auto_room: !cacheeighth,
+            settle_lazy_raw: settlelazyraw,
             prefault: populate,
             direct_put_one: !recordsteps,
             direct_stream: !copyvals && !refvals,
@@ -7854,6 +7877,7 @@ impl Supdb {
             passyield,
             cachenoauto,
             cacheeighth,
+            settlelazyraw,
             norecycle,
             heapblocks,
             keysarena,
@@ -8914,6 +8938,9 @@ impl Engine for Supdb {
         }
         if self.cacheeighth {
             return "supdb-cacheeighth";
+        }
+        if self.settlelazyraw {
+            return "supdb-settlelazyraw";
         }
         if self.norecycle {
             return if self.partition {
@@ -10343,6 +10370,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-passyield"
         | "supdb-cachenoauto"
         | "supdb-cacheeighth"
+        | "supdb-settlelazyraw"
         | "supdb-norecycle"
         | "supdb-heapblocks"
         | "supdb-keysarena"
@@ -11158,6 +11186,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-passyield" => supdb_arm(Supdb::create_passyield, dir)?,
         "supdb-cachenoauto" => supdb_arm(Supdb::create_cachenoauto, dir)?,
         "supdb-cacheeighth" => supdb_arm(Supdb::create_cacheeighth, dir)?,
+        "supdb-settlelazyraw" => supdb_arm(Supdb::create_settlelazyraw, dir)?,
         "supdb-ingestlatesync" => supdb_arm(Supdb::create_ingest_latesync, dir)?,
         "supdb-norecycle" => supdb_arm(Supdb::create_norecycle, dir)?,
         "supdb-ingestnorecycle" => supdb_arm(Supdb::create_ingest_norecycle, dir)?,
@@ -12719,6 +12748,13 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.scan_cache_auto_room && b.scan_cache_auto_room);
+            }
+            {
+                let z = Supdb::create_settlelazyraw(&dir("settlelazyraw")).unwrap();
+                assert_eq!(z.name(), "supdb-settlelazyraw");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.settle_lazy_raw && !b.settle_lazy_raw);
             }
             {
                 let z = Supdb::create_sweepwalks(&dir("sweepwalks")).unwrap();

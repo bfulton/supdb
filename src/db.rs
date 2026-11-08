@@ -1239,6 +1239,24 @@ pub struct Options {
     /// the shape before; `supdb-cache64tofitautozpagesexactcut` is the arm.
     #[doc(hidden)]
     pub zpages_settle_span: bool,
+    /// With `zpages_settle_span`, a partition served raw files a written
+    /// key the same way, under the block the ordered index's top level
+    /// names (`OrdIndex::floor_stride`, a sample every block's first rank)
+    /// with its cut left for the build, where the key's head lies strictly
+    /// between two samples and the block holds no form a patch would need
+    /// the cut for; a head that ties a sample takes the exact resolve. The
+    /// exact resolve was a seek of the heads a written key: the scrambled
+    /// E mix's first scans at three million keys in core settled the
+    /// 40,827 writes the scrambled write mixes before it left, scattered
+    /// over 24,459 blocks, in 43 of its 235 ms of scans, for blocks most of
+    /// which E never builds (`docs/engine.md`). Paired in the row's whole
+    /// order at three million keys the scrambled E read 1.06x and 1.02x for
+    /// it in two sittings, every rep its way and both under what a pairing
+    /// resolves, with 44,000 keys a sitting filed so: unresolved, so the
+    /// exact resolve, the shape before, is the default and
+    /// `supdb-settlelazyraw` is the arm.
+    #[doc(hidden)]
+    pub settle_lazy_raw: bool,
     /// A verified page of a form file is read with its directory trusted
     /// (`zpages::view_trusted`, `ZFile::view`), and a read takes a page's
     /// view once, for the group it wants and the open of it. The checked
@@ -4384,6 +4402,7 @@ impl Default for Options {
             scan_start_cache: 0,
             zpages_memo_hash: true,
             zpages_settle_span: true,
+            settle_lazy_raw: false,
             zpages_trusted_views: true,
             zpages_memo_bytes: 8 << 20,
             zpages_memo_first: false,
@@ -14496,6 +14515,9 @@ const CACHE_DENSE: usize = 16;
 /// which the walk places by key. No resolved cut is this, since a cut packs
 /// a rank under the key count, shifted, with one bit beside it.
 const LAZY_CUT: u32 = u32::MAX;
+// A raw partition's block is named by the ordered index's samples
+// (`Options::settle_lazy_raw`), one at every block's first rank.
+const _: () = assert!(crate::ordindex::TOP_STRIDE == CACHE_BLOCK);
 
 /// Deltas a sparse form made by a splice has room for at birth; full, it
 /// grows to `CACHE_DENSE` at once and doubles from there (`SparseBlock::room`).
@@ -20515,11 +20537,19 @@ impl Reader {
     /// patch reads the cut of -- none, or a wide one, which files keys by
     /// slot. `None` asks for the exact resolve.
     fn lazy_block(&self, at: usize, seg: &Seg, key: &[u8], hint: &mut usize) -> Option<usize> {
-        let (lo, hi) = self.zc(seg)?.owner_span_from(key, hint)?;
-        if hi <= lo || lo / CACHE_BLOCK != (hi - 1) / CACHE_BLOCK {
-            return None;
-        }
-        let b = lo / CACHE_BLOCK;
+        let b = match self.zc(seg) {
+            Some(z) => {
+                let (lo, hi) = z.owner_span_from(key, hint)?;
+                if hi <= lo || lo / CACHE_BLOCK != (hi - 1) / CACHE_BLOCK {
+                    return None;
+                }
+                lo / CACHE_BLOCK
+            }
+            // A raw partition's block from the ordered index's samples,
+            // one a block (`Options::settle_lazy_raw`).
+            None if self.opts.settle_lazy_raw => seg.ord.floor_stride(key)?,
+            None => return None,
+        };
         let tables = self.fs().tables.borrow();
         let held = tables.get(at)?.borrow();
         match held.as_ref() {

@@ -185,7 +185,7 @@ const HEAD: usize = 8;
 /// Heads between two samples of the top level: a run of 512 bytes, eight
 /// cache lines the prefetcher walks, so a seek's cold probes fall in one
 /// run instead of across the file.
-const TOP_STRIDE: usize = 64;
+pub(crate) const TOP_STRIDE: usize = 64;
 /// Header word: one more than the keys' common length when every key has
 /// one length and it is at most `pfx + HEAD`, so a head is a whole key and
 /// a seek needs no record; 0 otherwise, and in every file from before the
@@ -630,6 +630,33 @@ impl OrdIndex {
     /// not carry the common prefix, or the prefix is not learned, since the
     /// seek then reads no head for it. For a reader asking for the stride's
     /// page ahead of the seek (`willneed_heads`).
+    /// The stride of the top level whose ranks hold `key`'s floor -- the
+    /// last rank whose key is at or below it, or rank 0 below the first --
+    /// read off the samples alone, where the key's head lies strictly
+    /// between two of them, below the first or above the last: a head
+    /// strictly below or above a sample's is a key strictly below or above
+    /// that rank's, so the floor is past one sample and before the next.
+    /// `None` where the head ties a sample, which only the stride's heads
+    /// (and past them the records) can settle, and where the key is not
+    /// under the index's prefix.
+    pub fn floor_stride(&self, key: &[u8]) -> Option<usize> {
+        if self.n == 0 {
+            return None;
+        }
+        if self.pfx > 0 {
+            let prefix = self.prefix.as_deref()?;
+            if key.len() < self.pfx || key[..self.pfx] != prefix[..self.pfx.min(prefix.len())] {
+                return None;
+            }
+        }
+        let h = head_of(key, self.pfx);
+        let t = lower_bound(&self.top, h);
+        if self.top.get(t) == Some(&h) {
+            return None;
+        }
+        Some(t.saturating_sub(1))
+    }
+
     pub fn stride_window(&self, key: &[u8]) -> Option<(usize, usize)> {
         if self.n == 0 {
             return None;

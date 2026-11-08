@@ -4342,6 +4342,95 @@ fn the_caches_own_budget_grows_into_the_room_the_partitions_leave() {
     );
 }
 
+/// A raw partition's settle files a written key under the block the
+/// ordered index's samples name, its cut left for the build that reads
+/// the block (`Options::settle_lazy_raw`), and the scans answer the model:
+/// updates, keys between records and deletes over every partition after a
+/// short scan has stood the tables with most of their blocks unbuilt, with
+/// the option on and off. On, the settle filed keys with their cuts left
+/// and the builds resolved them, each to the block it was filed under,
+/// which a debug assertion in the build holds; off, it filed none so.
+#[test]
+fn a_raw_partitions_settle_files_a_key_under_the_block_its_samples_name() {
+    for lazy in [true, false] {
+        let name = format!("settle-lazy-raw-{lazy}");
+        let d = dir(&name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 1 << 20,
+                partition_bytes: Some(32 << 10),
+                l0_trigger: 64,
+                scan_block_cache: true,
+                scan_cache_ahead: false,
+                commit_forms: true,
+                forms_settle_backlog_pct: 0,
+                settle_lazy_raw: lazy,
+                upkeep: supdb::Upkeep::Inline,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in 0..6000u32 {
+            m.append(&mut db, &key(k), "v0-0123456789");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        db.settle().unwrap();
+        m.check_one(
+            &db,
+            key(0).as_bytes(),
+            10,
+            &format!("{name}: before the writes"),
+        );
+        let before = db.lazy_cuts();
+        let mut x = 0x5E77_1A2Bu64;
+        let mut rng = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for round in 0..3u32 {
+            for i in 0..150u32 {
+                let k = (rng() % 6000) as u32;
+                match rng() % 4 {
+                    0 => m.delete(&mut db, &key(k)),
+                    1 => m.append(&mut db, &format!("{}x{round}-{i}", key(k)), "n"),
+                    _ => m.append(&mut db, &key(k), &format!("s{round}-{i}")),
+                }
+            }
+            db.commit().unwrap();
+            for w in 0..20u32 {
+                let from = key((rng() % 6100) as u32);
+                let limit = 1 + (w as usize * 7) % 150;
+                m.check_one(
+                    &db,
+                    from.as_bytes(),
+                    limit,
+                    &format!("{name}: round {round} window {w}"),
+                );
+            }
+        }
+        m.check(&db, &format!("{name}: the writer at the end"));
+        let h = db.reader().unwrap();
+        m.check(&h, &format!("{name}: a handle at the end"));
+        let [filed, resolved] = db.lazy_cuts();
+        let (filed, resolved) = (filed - before[0], resolved - before[1]);
+        if lazy {
+            assert!(
+                filed > 0 && resolved > 0,
+                "{name}: keys filed by the samples ({filed}) and resolved by the builds ({resolved})"
+            );
+        } else {
+            assert_eq!(filed, 0, "{name}: no key filed with its cut left");
+        }
+    }
+}
+
 /// And a budget the cache never reaches keeps the unbounded shape: the
 /// same blocks built over the same model as the store with none.
 #[test]
