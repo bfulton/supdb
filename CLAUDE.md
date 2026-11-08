@@ -4064,6 +4064,30 @@ nothing is writing beside it, or it pays twice; and a test of a trigger
 that counts scans counts the writer's, since a handle says so once a
 commit.
 
+**A shortcut taken where the structure being decoded agreed, beside a
+structure in memory that knew.** A covered partition's settle files a
+written key under its block with the cut left for the build, and asked the
+form file which block: the fence and the page's directory name the group a
+key falls in, and the answer was a block only where that group lay inside
+one block of sixty-four records. A group straddles a block's edge often
+enough that the rest of a burst's keys fell to the exact seek, which opens
+the group and decodes it, so the upkeep thread's passes over the lag
+sweep's one-percent burst at ten million keys under 1.25 GiB ran long
+enough that the first scan after the burst waited 89-172 ms to take the
+upkeep back, with the decoder and the page views a third of the scanning
+thread. The ordered index's top level holds one sample a block, in memory,
+and names the block of any key whose head ties no sample without reading
+the form; asked first (`Options::settle_covered_samples`), the thread kept
+up, the scan waited a millisecond at most and the pass read 1.46x and
+1.72x in two sittings. The scan's own counters named the wait (`take` in
+the lag counters) and the profile named the decode, where the pass's time
+alone read as the settle's. The rules: a shortcut valid on a subset is
+priced by how often its input falls outside the subset, since every miss
+pays the full path; a question one structure answers from memory is asked
+of it before a structure that has to be decoded to answer it; and a wait
+for a worker is read as the worker's slowness before the waiter's own work
+is profiled.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
