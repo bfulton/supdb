@@ -3944,6 +3944,37 @@ the mixes after it. And a policy's way back is a move with the way out's
 costs, the device read and the drop, so a policy that flaps is priced by its
 moves before its rates.
 
+**A budget drawn as a share of the limit, binding under a store that
+fit.** The block cache's own budget was an eighth of the memory limit, set
+so that the cache would not grow to the store's size at ten million keys
+and have the process killed. At three million keys under 1.25 GiB the
+store and a cache of its own size both fit, and the eighth bound anyway:
+after the lag sweep's full rewrite the pass's working set was 388 MB of
+forms against a budget of 160. A bound cache sheds what it builds, so the
+scans built 11,000 blocks in a pass of 3,000 scans. The builder ahead
+started again at every merge landing and posted forms the scans installed
+and then shed, and the scanner's frees of the builder's chunks met the
+builder's allocations at the allocator's arena locks: 4,500 voluntary
+switches. The pass ran 430-560 ms against LMDB's 27. The phase timers
+named the install and the builds, a pairing of one arm at a time against
+the default named the budget (the arm with no budget read the pass 12.6x
+faster, the arm with no builder 4x), and a profile cut to the pass named
+the locks. The budget grows now, at each crossing, into the room the
+partitions leave of the controller's page-cache budget
+(`Options::scan_cache_auto_room`), and binds only once that room is gone.
+Paired against the eighth, the pass read 6.7x and 9.1x in two sittings and
+the sweep's weighted sum 2.0x. It never fired at ten million keys under
+the same bound, where the partitions fill the page cache's budget, nor in
+the row's other passes at three million, where the cache never crossed.
+What is left of the pass is its first scan, which waits 10-50 ms for the
+upkeep thread's last fill of the burst. The rules: a budget for one
+structure is drawn from what the process's other tenants measure to need,
+never as a fixed share of the limit, since a share binds below the
+working set of a store that fits as surely as it holds back one that does
+not. And a cache bound below its working set is slower than no cache, so
+a bound is priced against the arm without the structure as well as the
+arm without the bound.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
