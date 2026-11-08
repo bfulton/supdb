@@ -646,11 +646,11 @@ pub struct Supdb {
     /// (`Options::ahead_out_of_core_scans` zero), the shape the lag sweep
     /// priced against: `supdb-aheadeager`.
     aheadeager: bool,
-    /// Out of core a merge's landing chains the next merge through a
-    /// write-only stretch too, where the default chains only while reads
-    /// are around (`Options::merge_chains_writes`).
-    /// `supdb-ingestchainwrites`, and `supdb-chainwrites` durable.
-    chainwrites: bool,
+    /// Out of core a merge's landing chains the next merge only while
+    /// reads are around, where the default chains through a write-only
+    /// stretch too (`Options::merge_chains_writes` off).
+    /// `supdb-ingestnochainwrites`, and `supdb-nochainwrites` durable.
+    nochainwrites: bool,
     /// The controller builds nothing ahead at a landing, where the default
     /// builds a partition's form file from memory once the raw form passes
     /// a share of the page cache's budget (`Options::zpages_land_pct` at
@@ -1581,11 +1581,11 @@ struct Policy {
     /// (`Options::ahead_out_of_core_scans` zero), the shape the lag sweep
     /// priced against: `supdb-aheadeager`.
     aheadeager: bool,
-    /// Out of core a merge's landing chains the next merge through a
-    /// write-only stretch too, where the default chains only while reads
-    /// are around (`Options::merge_chains_writes`).
-    /// `supdb-ingestchainwrites`, and `supdb-chainwrites` durable.
-    chainwrites: bool,
+    /// Out of core a merge's landing chains the next merge only while
+    /// reads are around, where the default chains through a write-only
+    /// stretch too (`Options::merge_chains_writes` off).
+    /// `supdb-ingestnochainwrites`, and `supdb-nochainwrites` durable.
+    nochainwrites: bool,
     /// The controller builds nothing ahead at a landing, where the default
     /// builds a partition's form file from memory once the raw form passes
     /// a share of the page cache's budget (`Options::zpages_land_pct` at
@@ -2207,7 +2207,7 @@ impl Default for Policy {
             aheadincore: false,
             aheadcold: false,
             aheadeager: false,
-            chainwrites: false,
+            nochainwrites: false,
             noland: false,
             landnearscans: false,
             noidleplan: false,
@@ -7208,7 +7208,7 @@ impl Supdb {
             aheadincore,
             aheadcold,
             aheadeager,
-            chainwrites,
+            nochainwrites,
             noland,
             landnearscans,
             noidleplan,
@@ -7577,7 +7577,7 @@ impl Supdb {
             } else {
                 supdb::Options::default().ahead_out_of_core_scans
             },
-            merge_chains_writes: chainwrites,
+            merge_chains_writes: !nochainwrites,
             zpages_land_scans_far: !landnearscans,
             merge_plan_idle: !noidleplan,
             seal_put_one: !sealrun,
@@ -7890,7 +7890,7 @@ impl Supdb {
             aheadincore,
             aheadcold,
             aheadeager,
-            chainwrites,
+            nochainwrites,
             noland,
             landnearscans,
             noidleplan,
@@ -8814,11 +8814,11 @@ impl Engine for Supdb {
         if self.aheadeager {
             return "supdb-aheadeager";
         }
-        if self.chainwrites {
+        if self.nochainwrites {
             return if self.partition {
-                "supdb-chainwrites"
+                "supdb-nochainwrites"
             } else {
-                "supdb-ingestchainwrites"
+                "supdb-ingestnochainwrites"
             };
         }
         if self.noland {
@@ -10393,7 +10393,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-aheadincore"
         | "supdb-aheadcold"
         | "supdb-aheadeager"
-        | "supdb-chainwrites"
+        | "supdb-nochainwrites"
         | "supdb-noland"
         | "supdb-landnearscans"
         | "supdb-noidleplan"
@@ -10537,7 +10537,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestnodirwillneed"
         | "supdb-ingestnoboundsheadwillneed"
         | "supdb-ingestaheadincore"
-        | "supdb-ingestchainwrites"
+        | "supdb-ingestnochainwrites"
         | "supdb-ingestnoland"
         | "supdb-ingestlandnearscans"
         | "supdb-ingestnoidleplan"
@@ -11094,26 +11094,26 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
-        "supdb-chainwrites" => supdb_arm(
+        "supdb-nochainwrites" => supdb_arm(
             |d| {
                 Supdb::with_policy(
                     d,
                     Policy {
-                        chainwrites: true,
+                        nochainwrites: true,
                         ..Policy::default()
                     },
                 )
             },
             dir,
         )?,
-        "supdb-ingestchainwrites" => supdb_arm(
+        "supdb-ingestnochainwrites" => supdb_arm(
             |d| {
                 Supdb::with_policy(
                     d,
                     Policy {
                         partition: false,
                         durable: false,
-                        chainwrites: true,
+                        nochainwrites: true,
                         ..Policy::default()
                     },
                 )

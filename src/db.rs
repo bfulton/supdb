@@ -3535,24 +3535,23 @@ pub struct Options {
     /// (`docs/engine.md`), so the default is one. `supdb-mergepar2`,
     /// `supdb-ingestmergepar2` and `supdb-nozpagesmergepar2` run two.
     pub merge_parallel: usize,
-    /// EXPERIMENT: under `merge_chains`, a merge's landing plans the next
-    /// merge out of core -- the controller's gate away from the raw form --
-    /// whether or not a scan has come since the last landing, so the
-    /// merges a burst's seals left are chained through the burst's own
-    /// writes and not first through the scans after it. By the suite's
-    /// decision quantity (`weighted_ms`, the burst and twice the undivided
-    /// pass) it read ahead in three sittings at ten million keys under
-    /// 1.25 GiB, the full rewrite at 0.54-0.98x of the default's time, for
-    /// a reason that was not its own: the default chained only at a
-    /// landing, and where no merge was in flight when a burst ended its
-    /// pieces stood through the pass, 286 of them over 76 s against 6 over
-    /// 32 in the other round, and a chain kept going through the burst
-    /// always had one in flight. With the default's own loop planning a
-    /// merge when none is in flight (`merge_plan_idle`), undivided, it
-    /// reads 1.06x of the default's time over the sweep, the full rewrite
-    /// 1.08x and the shuffled load at 0.83x of its rate, so it stays off.
-    /// In core the gate is at raw and nothing changes. Off:
-    /// `supdb-chainwrites`, `supdb-ingestchainwrites`.
+    /// Under `merge_chains`, a merge's landing plans the next merge out of
+    /// core -- the controller's gate away from the raw form -- whether or
+    /// not a scan has come since the last landing, so the merges a burst's
+    /// seals left are chained through the burst's own writes and not first
+    /// through the scans after it. The suite's divided pass after the full
+    /// rewrite is the first tenth of its scans, where the chain's drain
+    /// sits: at ten million keys under 1.25 GiB it read 3.1x and 3.0x in
+    /// two sittings (488,000 and 443,000 entries a second against 157,000
+    /// and 150,000), the burst it chains through 0.74x and 0.68x of the
+    /// default's rate, twenty times LMDB's still, and undivided the pass
+    /// 1.47x with the suite's weighted sum level (`docs/engine.md`). No
+    /// merge lands in the suite's mixes, so they run the same code. An
+    /// earlier pairing, before the default's own loop planned a merge
+    /// when none is in flight (`merge_plan_idle`), read the undivided
+    /// weighted sum 1.06x of the default's time and kept it off. In core
+    /// the gate is at raw and nothing changes. On; `supdb-nochainwrites`,
+    /// `supdb-ingestnochainwrites` chain only while reads are around.
     #[doc(hidden)]
     pub merge_chains_writes: bool,
     /// Under `merge_chains`, the segment work's own loop plans a merge
@@ -4581,7 +4580,7 @@ impl Default for Options {
             blocks_willneed: true,
             heads_willneed: true,
             merge_chains: true,
-            merge_chains_writes: false,
+            merge_chains_writes: true,
             merge_plan_idle: true,
             merge_bytes_cap: 64 << 20,
             merge_parallel: 1,

@@ -675,6 +675,10 @@ fn counters_line(
             "builds_clean",
             "recopies",
             "sheds",
+            // The merges the mix planned and landed, for a policy that
+            // chains them through writes (`Options::merge_chains_writes`).
+            "merge_plans",
+            "merges_landed",
         ];
         let ev: Vec<String> = names.iter().map(|n| format!("{n} {:.0}", d(n))).collect();
         eprintln!("{tag}-events {arm} {point} {}", ev.join(" | "));
