@@ -3564,18 +3564,22 @@ pub struct Options {
     /// `supdb-ingestmergeuncapped`. A wide piece's ranges stay one merge
     /// whatever the cap (`Maint::cover_inputs`).
     pub merge_bytes_cap: u64,
-    /// EXPERIMENT: the most partition merges in flight at once, each over
-    /// ranges no other holds -- its partitions, and every piece over them,
-    /// no other merge's input. At one a merge waits for the one in flight
-    /// to land, and under a bound the full rewrite's merge debt drained one
-    /// capped merge at a time, each a few seconds of the thread's CPU in
-    /// ten of wall, through the first third of the pass after it. The
-    /// first partitioning, which takes every segment, runs alone whatever
-    /// this says, and a piece merge still waits for every partition merge.
-    /// Two paid that debt a third sooner under the bound and left the pass
-    /// level, its tenths after the merges moving by as much between reps
-    /// (`docs/engine.md`), so the default is one. `supdb-mergepar2`,
-    /// `supdb-ingestmergepar2` and `supdb-nozpagesmergepar2` run two.
+    /// The most partition merges in flight at once, each over ranges no
+    /// other holds -- its partitions, and every piece over them, no other
+    /// merge's input. At one a merge waits for the one in flight to land,
+    /// and under a bound the full rewrite's merge debt drained one capped
+    /// merge at a time, each a few seconds of the thread's CPU in ten of
+    /// wall, through the first third of the pass after it. The first
+    /// partitioning, which takes every segment, runs alone whatever this
+    /// says, and a piece merge still waits for every partition merge. Two
+    /// was first priced level, its pass after the merges moved by the cold
+    /// form files and the settle's decodes as much as by the merges; with
+    /// those fixed, at ten million keys under 1.25 GiB the full rewrite's
+    /// pass read 1.56x and 1.88x in two sittings and the clean store's
+    /// 1.14x and 1.53x, and in core at three million keys every lag pass
+    /// 1.13-1.80x and its bursts 1.05-1.11x (`docs/engine.md`). One is the
+    /// shape before: `supdb-mergeone`, `supdb-ingestmergeone` and
+    /// `supdb-nozpagesmergeone`.
     pub merge_parallel: usize,
     /// Under `merge_chains`, a merge's landing plans the next merge out of
     /// core -- the controller's gate away from the raw form -- whether or
@@ -4647,7 +4651,7 @@ impl Default for Options {
             merge_chains_writes: true,
             merge_plan_idle: true,
             merge_bytes_cap: 64 << 20,
-            merge_parallel: 1,
+            merge_parallel: 2,
             boundary_keys_from_top: false,
             pieces_dir_willneed: true,
             bounds_heads_willneed: true,

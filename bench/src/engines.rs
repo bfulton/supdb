@@ -567,10 +567,10 @@ pub struct Supdb {
     /// (`Options::merge_bytes_cap` at zero). `supdb-ingestmergeuncapped`,
     /// and `supdb-mergeuncapped` durable.
     mergeuncapped: bool,
-    /// Two partition merges in flight at once over disjoint ranges, where
-    /// the default runs one (`Options::merge_parallel` at two).
-    /// `supdb-ingestmergepar2`, and `supdb-mergepar2` durable.
-    mergepar2: bool,
+    /// One partition merge in flight at a time, where the default runs two
+    /// over disjoint ranges (`Options::merge_parallel` at one).
+    /// `supdb-ingestmergeone`, and `supdb-mergeone` durable.
+    mergeone: bool,
     /// The seal held at its floor while the store is out of core, where the
     /// default grows it with the store (`Options::seal_floor_out_of_core`).
     /// `supdb-sealfloorooc`, durable.
@@ -1512,10 +1512,10 @@ struct Policy {
     /// (`Options::merge_bytes_cap` at zero). `supdb-ingestmergeuncapped`,
     /// and `supdb-mergeuncapped` durable.
     mergeuncapped: bool,
-    /// Two partition merges in flight at once over disjoint ranges, where
-    /// the default runs one (`Options::merge_parallel` at two).
-    /// `supdb-ingestmergepar2`, and `supdb-mergepar2` durable.
-    mergepar2: bool,
+    /// One partition merge in flight at a time, where the default runs two
+    /// over disjoint ranges (`Options::merge_parallel` at one).
+    /// `supdb-ingestmergeone`, and `supdb-mergeone` durable.
+    mergeone: bool,
     /// The seal held at its floor while the store is out of core, where the
     /// default grows it with the store (`Options::seal_floor_out_of_core`).
     /// `supdb-sealfloorooc`, durable.
@@ -2208,7 +2208,7 @@ impl Default for Policy {
             noheadwillneed: false,
             nomergechain: false,
             mergeuncapped: false,
-            mergepar2: false,
+            mergeone: false,
             sealfloorooc: false,
             nofitshort: false,
             walkeep: false,
@@ -4368,14 +4368,15 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with two partition merges in flight at once over disjoint
-    /// ranges (`Options::merge_parallel` at two): against `supdb` under a
-    /// bound it prices a burst's merge debt drained two merges at a time.
-    pub fn create_mergepar2(path: &Path) -> Res<Supdb> {
+    /// `supdb` with one partition merge in flight at a time
+    /// (`Options::merge_parallel` at one), the shape before two: against
+    /// `supdb` under a bound it prices a burst's merge debt drained one
+    /// merge at a time.
+    pub fn create_mergeone(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
-                mergepar2: true,
+                mergeone: true,
                 ..Policy::default()
             },
         )
@@ -4594,28 +4595,28 @@ impl Supdb {
         )
     }
 
-    /// `supdb-nozpages` with two merges in flight, as `supdb-mergepar2`:
+    /// `supdb-nozpages` with one merge in flight, as `supdb-mergeone`:
     /// the pair with `supdb-nozpages` prices the merges with no controller
     /// in either arm, whose buy moves a lag pass by more than the merges do.
-    pub fn create_nozpages_mergepar2(path: &Path) -> Res<Supdb> {
+    pub fn create_nozpages_mergeone(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
                 zpages_off: true,
-                mergepar2: true,
+                mergeone: true,
                 ..Policy::default()
             },
         )
     }
 
-    /// `supdb-ingest` with two merges in flight, as `supdb-mergepar2`.
-    pub fn create_ingest_mergepar2(path: &Path) -> Res<Supdb> {
+    /// `supdb-ingest` with one merge in flight, as `supdb-mergeone`.
+    pub fn create_ingest_mergeone(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
                 partition: false,
                 durable: false,
-                mergepar2: true,
+                mergeone: true,
                 ..Policy::default()
             },
         )
@@ -7248,7 +7249,7 @@ impl Supdb {
             noheadwillneed,
             nomergechain,
             mergeuncapped,
-            mergepar2,
+            mergeone,
             sealfloorooc,
             nofitshort,
             walkeep,
@@ -7591,8 +7592,8 @@ impl Supdb {
             } else {
                 supdb::Options::default().merge_bytes_cap
             },
-            merge_parallel: if mergepar2 {
-                2
+            merge_parallel: if mergeone {
+                1
             } else {
                 supdb::Options::default().merge_parallel
             },
@@ -7940,7 +7941,7 @@ impl Supdb {
             noheadwillneed,
             nomergechain,
             mergeuncapped,
-            mergepar2,
+            mergeone,
             sealfloorooc,
             nofitshort,
             walkeep,
@@ -8843,13 +8844,13 @@ impl Engine for Supdb {
         if self.zcacheraw && !self.zpages_auto && !self.tofit && self.budget == 0 {
             return "supdb-cacheraw";
         }
-        if self.mergepar2 {
+        if self.mergeone {
             return if self.zpages_off {
-                "supdb-nozpagesmergepar2"
+                "supdb-nozpagesmergeone"
             } else if self.partition {
-                "supdb-mergepar2"
+                "supdb-mergeone"
             } else {
-                "supdb-ingestmergepar2"
+                "supdb-ingestmergeone"
             };
         }
         if self.boundarytop {
@@ -10453,7 +10454,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-noheadwillneed"
         | "supdb-nomergechain"
         | "supdb-mergeuncapped"
-        | "supdb-mergepar2"
+        | "supdb-mergeone"
         | "supdb-sealfloorooc"
         | "supdb-cacheraw"
         | "supdb-nofitshort"
@@ -10469,7 +10470,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-mergeahead"
         | "supdb-zparse"
         | "supdb-nozpagesnofitshort"
-        | "supdb-nozpagesmergepar2"
+        | "supdb-nozpagesmergeone"
         | "supdb-boundarytop"
         | "supdb-nodirwillneed"
         | "supdb-noboundsheadwillneed"
@@ -10618,7 +10619,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestnoheadwillneed"
         | "supdb-ingestnomergechain"
         | "supdb-ingestmergeuncapped"
-        | "supdb-ingestmergepar2"
+        | "supdb-ingestmergeone"
         | "supdb-ingestboundarytop"
         | "supdb-ingestnodirwillneed"
         | "supdb-ingestnoboundsheadwillneed"
@@ -11058,7 +11059,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestnomergechain" => supdb_arm(Supdb::create_ingest_nomergechain, dir)?,
         "supdb-mergeuncapped" => supdb_arm(Supdb::create_mergeuncapped, dir)?,
         "supdb-ingestmergeuncapped" => supdb_arm(Supdb::create_ingest_mergeuncapped, dir)?,
-        "supdb-mergepar2" => supdb_arm(Supdb::create_mergepar2, dir)?,
+        "supdb-mergeone" => supdb_arm(Supdb::create_mergeone, dir)?,
         "supdb-sealfloorooc" => supdb_arm(Supdb::create_sealfloorooc, dir)?,
         "supdb-cacheraw" => supdb_arm(Supdb::create_cacheraw, dir)?,
         "supdb-nofitshort" => supdb_arm(Supdb::create_nofitshort, dir)?,
@@ -11074,8 +11075,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-mergeahead" => supdb_arm(Supdb::create_mergeahead, dir)?,
         "supdb-zparse" => supdb_arm(Supdb::create_zparse, dir)?,
         "supdb-nozpagesnofitshort" => supdb_arm(Supdb::create_nozpages_nofitshort, dir)?,
-        "supdb-nozpagesmergepar2" => supdb_arm(Supdb::create_nozpages_mergepar2, dir)?,
-        "supdb-ingestmergepar2" => supdb_arm(Supdb::create_ingest_mergepar2, dir)?,
+        "supdb-nozpagesmergeone" => supdb_arm(Supdb::create_nozpages_mergeone, dir)?,
+        "supdb-ingestmergeone" => supdb_arm(Supdb::create_ingest_mergeone, dir)?,
         "supdb-boundarytop" => supdb_arm(Supdb::create_boundarytop, dir)?,
         "supdb-ingestboundarytop" => supdb_arm(Supdb::create_ingest_boundarytop, dir)?,
         "supdb-nodirwillneed" => supdb_arm(
@@ -12608,10 +12609,10 @@ mod tests {
     /// (`Options::zpages_block_cache` off) and nothing else: named, durable
     /// like it, opened under its name by the dispatch, the cache and the
     /// controller as the base has them, and the engine's default on.
-    /// Each arm with two merges in flight is named as itself, opened through
+    /// Each arm with one merge in flight is named as itself, opened through
     /// `open` by that name, and differs from its base in the merges alone:
-    /// the arm without the compact form was named `supdb-mergepar2` by a
-    /// branch that came before the one for the form.
+    /// the arm without the compact form was once named as the plain arm by
+    /// a branch that came before the one for the form.
     #[test]
     fn the_parallel_merge_arms_differ_from_their_bases_in_the_merges_alone() {
         let root =
@@ -12620,21 +12621,21 @@ mod tests {
         type Make = fn(&Path) -> Res<Supdb>;
         let pairs: [(&str, &str, Make, Make); 3] = [
             (
-                "supdb-mergepar2",
+                "supdb-mergeone",
                 "supdb",
-                Supdb::create_mergepar2,
+                Supdb::create_mergeone,
                 Supdb::create,
             ),
             (
-                "supdb-ingestmergepar2",
+                "supdb-ingestmergeone",
                 "supdb-ingest",
-                Supdb::create_ingest_mergepar2,
+                Supdb::create_ingest_mergeone,
                 Supdb::create_ingest,
             ),
             (
-                "supdb-nozpagesmergepar2",
+                "supdb-nozpagesmergeone",
                 "supdb-nozpages",
-                Supdb::create_nozpages_mergepar2,
+                Supdb::create_nozpages_mergeone,
                 Supdb::create_nozpages,
             ),
         ];
@@ -12656,7 +12657,7 @@ mod tests {
                 a.db.as_ref().unwrap().options(),
                 b.db.as_ref().unwrap().options(),
             );
-            assert_eq!((oa.merge_parallel, ob.merge_parallel), (2, 1), "{arm}");
+            assert_eq!((oa.merge_parallel, ob.merge_parallel), (1, 2), "{arm}");
             assert_eq!(
                 (
                     oa.zpages,

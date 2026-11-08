@@ -65,6 +65,9 @@ fn a_merge_planned_with_fences_a_landing_old_takes_the_partitions_standing_after
             seal_bytes: 32 << 10,
             partition_bytes: Some(32 << 10),
             l0_trigger: 2,
+            // One merge in flight: the planner joins the held merge only
+            // where it has no room for a second.
+            merge_parallel: 1,
             ..Options::default()
         },
     )
@@ -847,6 +850,9 @@ fn a_store_read_with_no_merge_in_flight_plans_one_in_its_loop() {
                 merge_chains: true,
                 merge_bytes_cap: 0,
                 merge_plan_idle: idle,
+                // One merge in flight, so the second range waits for the
+                // held one's landing as the shape this is about does.
+                merge_parallel: 1,
                 ..Options::default()
             },
         )
@@ -968,6 +974,10 @@ fn a_merges_landing_plans_the_next_and_a_cap_lands_a_range_at_a_time() {
                 merge_chains: chain,
                 merge_bytes_cap: cap,
                 merge_chains_writes: writes,
+                // One merge in flight, which the counts below are of: with
+                // two, the landing that finds the held merge running plans
+                // a second over the other range.
+                merge_parallel: 1,
                 // The gate is the test's to set where it is not raw.
                 zpages: if gate == 0 {
                     supdb::ZPages::default()
