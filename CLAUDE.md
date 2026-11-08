@@ -3975,6 +3975,35 @@ not. And a cache bound below its working set is slower than no cache, so
 a bound is priced against the arm without the structure as well as the
 arm without the bound.
 
+**A loss read on the thread's CPU when the thread was waiting.** The
+scrambled E mix at three million keys in core read 0.84x of LMDB in the
+row, and its first decomposition, with the counters on, put 43 ms of its
+235 ms of scans in the settle of the scattered writes the scrambled
+write mixes before it had left, filed by an exact seek a key into
+blocks E mostly never builds. A filing by the ordered index's samples
+was built for that (`Options::settle_lazy_raw`) and read 1.06x and 1.02x
+in two sittings, under what a pairing resolves. The profile of the mix
+undivided then read the scanning thread's CPU at 1.84 s against LMDB's
+1.88 in windows of 2.47 s and 2.29, with 2,310 samples of merge threads
+beside it, and the run queue's wait at 11 ms: not the CPU and not a
+core, but blocking. The mix timed by kind put the gap in the commits,
+710 ms against LMDB's 244 for the same 249 commits, where the scans
+were within 5%, and a trace of the syncs read the commits' fdatasync at
+0.81 ms in the unscrambled E and spread to 10 ms and past in the
+scrambled one, beside the merges' writer helpers syncing 8 MB every
+20 ms. A merge sync every megabyte (`Options::merge_sync_ahead`) was the
+obvious lever on a device cache the merges fill between syncs; it made
+seven times the syncs and moved the commits nothing, and cost the lag
+sweep a tenth. The seals' and merges' threads at the idle I/O class
+(`supdb-bgidle`), on a device whose scheduler honours the classes
+(`mq-deadline`), read the commits slower still, 863 ms against 724 and
+756 against 673: what the commits wait on beside the merges is neither
+the device cache's backlog nor the queue's order, and is open. The rules: a mix's loss is timed by kind before its
+thread's profile is read, since a profile of a thread that waits shows
+its work and not the wait; and a lever on a device's queue is held to
+the latency it is for, the commits', not to the count of what it
+changed.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
