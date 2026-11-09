@@ -871,7 +871,9 @@ it is paced too, within a quarter of a percent of the store's keys
 unbounded, the thread's trail at the end of a full rewrite was the first
 scan's to wait out or settle, the pass's largest part. Out of core it is
 not paced, since there the thread's resolves are major faults and the
-hold paced the writer by the device.
+hold paced the writer by the device; out of core is the compact form
+installed, not the controller's census, which a full rewrite in core
+can enter (`Options::upkeep_pace_syncs_census`).
 One thread holds it at a time, and one word says which:
 every hand-over is a single operation on that word, the side giving it
 up fills the cell before it and the side taking it empties the cell
@@ -4145,6 +4147,33 @@ the price to the seam's. The rule is the one the decode's seam was written
 for, read across the path: every measured cost a test's premise depends
 on goes through the seam, and a path that takes two costs from one timing
 takes both from it.
+
+**A regime read off a state the regulated work can enter.** The pace that
+holds a syncing commit behind the upkeep thread is for a store in core, and
+it read "in core" as the controller's gate at the raw form. The controller
+leaves the raw form for its census on the group's refault rate, and a full
+rewrite at three million keys under 1.25 GiB raises it itself: with its
+block cache grown to 439 MB of the bound and its merges running, the rate
+went from 39 a second to 13,000 between two steps, the trace put the census
+four seconds into a burst of eight, the pace stopped there with the store
+still read from memory, and the first scan after the burst settled the rest of the
+burst's trail, 40-130 ms of a pass LMDB ran in 28. The lag-only pairings
+that priced the gate met the same census and a smaller residue, and the
+regime the gate was added for, ten million keys, had the compact form's
+gate from its load on, so the two gates had never been told apart. The pace
+stops at the compact form's gate now. The rule: a switch keyed on a
+controller's state is keyed on the state that means what the switch needs
+-- the form installed is the controller's verdict, the census a question it
+is still asking -- and a state the switched work can itself bring about is
+read off the trace of the run before it is read as the regime. The seal's
+floor, the asks ahead for pieces, blocks and heads, the builder ahead and
+the chain through writes read the census as out of core the same way, and
+each was priced where the gate was the compact form's. Beside it: the write
+mixes of that pairing, which run the same code in both arms, read 0.8x for
+one arm in two sittings, and timed by kind the gap was the commits'
+fdatasyncs, 0.41-0.78 ms a commit from process to process in both arms; a
+cell an option cannot reach is read by its kinds and its counters before
+its rate is read as anyone's.
 
 ## Standing limitations
 

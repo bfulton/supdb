@@ -2958,9 +2958,9 @@ pub struct Options {
     pub upkeep_pace_syncs_bp: usize,
     /// "In core" for `upkeep_pace_syncs_bp` is every gate but the compact
     /// form's: the pace holds through the controller's census and stops
-    /// once the form is installed. The census is entered on a refault rate,
-    /// and a full rewrite's own merges make one: at three million keys
-    /// under 1.25 GiB the lag sweep's full rewrite went SUSPECT four
+    /// once the form is installed. The census is entered on the group's
+    /// refault rate, and a full rewrite raises it itself: at three million
+    /// keys under 1.25 GiB the lag sweep's full rewrite went SUSPECT four
     /// seconds into its burst with the store still read from memory, the
     /// pace stopped there, and the first scan after the burst settled
     /// 40-130 ms of the trail the rest of the burst left, in passes of
@@ -34245,7 +34245,7 @@ impl Db {
         // what the first scan after the burst meets. Out of core a resolve
         // is a major fault, and the hold would pace the writer by the device;
         // out of core is the compact form installed, the census being one a
-        // full rewrite's merges enter (`Options::upkeep_pace_syncs_census`).
+        // full rewrite in core can enter (`Options::upkeep_pace_syncs_census`).
         let gate = self.shared.zgate.load();
         let in_core = if self.opts.upkeep_pace_syncs_census {
             gate != zselect::GATE_Z
