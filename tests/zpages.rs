@@ -5649,7 +5649,11 @@ fn an_eager_auto_store_buys_the_form_before_any_read() {
 /// and fills past the share -- the shape a line at the budget itself
 /// picked the raw tails for, at ten million keys under 1.25 GiB
 /// (`docs/engine.md`). With the option off the options' block coding is
-/// built under 64 MiB too, nothing chosen and nothing raw-tailed. Every
+/// built under 64 MiB too, nothing chosen and nothing raw-tailed; and the
+/// first case's store with no reader before its pick builds the block
+/// coding, the raw tails waiting for a reader (`ZCounts::coding_unread`),
+/// since a pick made before any read is made partway through the store's
+/// first writing. Every
 /// store is eager and under the group's pressure, as the eager test has
 /// them, so each buys and installs; the counts say which coding was chosen
 /// and built, the raw-tail form reads larger than the block form wherever
@@ -5669,14 +5673,17 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_the_fill_share_and_the
         Bytes(u64),
         OfRaw(u64),
     }
+    // The last case is the first's store with no reader before the pick:
+    // the raw tails wait for one, and the block coding is chosen.
     let cases = [
-        (At::Bytes(64 << 20), true, true),
-        (At::Bytes(1536 << 10), true, false),
-        (At::OfRaw(105), true, false),
-        (At::Bytes(64 << 20), false, false),
+        (At::Bytes(64 << 20), true, true, true),
+        (At::Bytes(1536 << 10), true, false, true),
+        (At::OfRaw(105), true, false, true),
+        (At::Bytes(64 << 20), false, false, true),
+        (At::Bytes(64 << 20), true, false, false),
     ];
     let mut raw_w_z = 0u64;
-    for (i, (at, gear, raw)) in cases.into_iter().enumerate() {
+    for (i, (at, gear, raw, read)) in cases.into_iter().enumerate() {
         let edge = matches!(at, At::OfRaw(_));
         let budget = match at {
             At::Bytes(b) => b,
@@ -5687,7 +5694,7 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_the_fill_share_and_the
         };
         let fill = supdb::db::zselect::form_fill(budget);
         let what = format!(
-            "case {i}: budget {budget} (fill {fill}), gear {gear}, raw tails expected {raw}"
+            "case {i}: budget {budget} (fill {fill}), gear {gear}, raw tails expected {raw}, a reader {read}"
         );
         let dir = scratch(&format!("coding-auto-{i}"));
         let inject = std::sync::Arc::new(supdb::ZInject::new());
@@ -5709,6 +5716,13 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_the_fill_share_and_the
         .unwrap();
         let model = ordered_load(&mut db, 20_000, 0x4AA);
         db.settle().unwrap();
+        // A reader before the pick: a raw-tail pick waits for one
+        // (`Maint::z_pick_raw_ok`).
+        if read {
+            let mut seen = 0usize;
+            db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
+            assert_eq!(seen, 10);
+        }
         for _ in 0..2 {
             advance_tick(&db, std::time::Duration::from_secs(1));
         }
@@ -5755,9 +5769,19 @@ fn the_selector_builds_the_raw_tails_where_that_form_fits_the_fill_share_and_the
                 c.sample_w_z_raw_bytes <= fill,
                 "{what}: the raw-tail form within the fill share: {c:?}"
             );
+        } else if gear && !read {
+            assert!(
+                c.coding_picks_block >= 1 && c.coding_picks_raw == 0 && c.coding_unread >= 1,
+                "{what}: the block coding chosen for want of a reader: {c:?}"
+            );
+            assert_eq!(c.builds_raw_tails, 0, "{what}: no build raw-tailed");
+            assert!(
+                c.sample_w_z_raw_bytes <= fill,
+                "{what}: where the raw tails fit the fill share: {c:?}"
+            );
         } else if gear {
             assert!(
-                c.coding_picks_block >= 1 && c.coding_picks_raw == 0,
+                c.coding_picks_block >= 1 && c.coding_picks_raw == 0 && c.coding_unread == 0,
                 "{what}: the block coding chosen: {c:?}"
             );
             assert_eq!(c.builds_raw_tails, 0, "{what}: no build raw-tailed");
@@ -8624,6 +8648,10 @@ fn a_raw_tail_pick_is_taken_back_once_the_store_grows_past_the_fill_share() {
             |o| o.zpages_build_eager = true,
             |_| {},
         );
+        // A reader before the pick, which the raw tails wait for.
+        let mut seen = 0usize;
+        db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
+        assert_eq!(seen, 10, "{what}");
         // The raw tails within the fill share half again: the records'
         // bytes, which the raw-tail form is the size of, and a store twice
         // as large past it.
@@ -8749,6 +8777,9 @@ fn a_form_file_built_at_a_merges_finish_in_a_coding_taken_back_is_built_again() 
         },
         |_| {},
     );
+    let mut seen = 0usize;
+    db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
+    assert_eq!(seen, 10, "a reader before the pick");
     let records = db.zpage_counts().model_record_bytes;
     inject.set_budget(records * 7 / 4);
     inject.set_refault_rate(1_000_000.0);
@@ -8850,6 +8881,10 @@ fn a_form_file_built_ahead_in_the_coding_the_pick_refuses_is_built_again() {
         (0, 0),
         "block-coded, FITS: {c:?}"
     );
+    // A reader, which a raw-tail pick waits for (`Maint::z_pick_raw_ok`).
+    let mut seen = 0usize;
+    db.scan(b"", 10, kv(&mut |_, _| seen += 1)).unwrap();
+    assert_eq!(seen, 10);
     // A budget the raw-tail form fits under, and the group's pressure: the
     // eager entry buys on the raw tails, as the coding test's store does.
     inject.set_budget(64 << 20);

@@ -3893,6 +3893,9 @@ pub(super) struct ZEvents {
     /// the files' cover then leaves out (`Maint::z_files_cover`).
     pub coding_repicks: AtomicU64,
     pub finish_refused: AtomicU64,
+    /// Raw-tail picks taken as the block coding for want of a reader
+    /// (`Maint::z_pick_raw_ok`).
+    pub coding_unread: AtomicU64,
     /// The partitions whose raw pages were dropped at their form file's
     /// install (`Options::zpages_drop_raw`).
     pub raw_dropped: AtomicU64,

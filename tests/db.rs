@@ -239,17 +239,19 @@ fn a_torn_tail_loses_its_batch_whole_and_earlier_batches_survive() {
     db.append(b"b", b"2");
     db.append(b"c", b"3");
     db.commit().unwrap();
+    let (_, _, tail) = db.wal_durable();
     drop(db);
 
     // Tear the tail: chop bytes off the WAL, the state a crash mid-write
     // leaves. The cut lands in the second batch's commit frame, so `b` is an
     // intact frame -- and it must NOT be served, because its batch never
     // committed. Before the commit frame existed this test expected the
-    // intact frame back; that was a partial batch replayed as whole.
+    // intact frame back; that was a partial batch replayed as whole. The
+    // cut is from the log's tail and not the file's end, which runs on in
+    // the zeros a pre-write leaves (`Options::wal_ahead_bytes`).
     let wal = d.join("wal-00000000");
-    let len = std::fs::metadata(&wal).unwrap().len();
     let f = std::fs::OpenOptions::new().write(true).open(&wal).unwrap();
-    f.set_len(len - 3).unwrap();
+    f.set_len(tail - 3).unwrap();
     drop(f);
 
     let db = Db::open(&d, Options::default()).unwrap();
@@ -3157,10 +3159,19 @@ fn a_seal_through_the_one_value_path_writes_the_segment_the_general_path_does() 
     }
 }
 
+/// The bytes of a store's files but its log's: the live WAL and its spare
+/// are pre-written and recycled at sizes of their own
+/// (`Options::recycle_wal`), and say nothing of what the store holds.
 fn dir_bytes(d: &std::path::Path) -> u64 {
     std::fs::read_dir(d)
         .unwrap()
-        .map(|e| e.unwrap().metadata().unwrap().len())
+        .map(|e| e.unwrap())
+        .filter(|e| {
+            let n = e.file_name();
+            let n = n.to_string_lossy();
+            !n.starts_with("wal-") && !n.starts_with("spare-")
+        })
+        .map(|e| e.metadata().unwrap().len())
         .sum()
 }
 
@@ -3353,9 +3364,12 @@ fn a_batch_without_its_commit_frame_is_lost_whole() {
         db.append(format!("b{i}").as_bytes(), b"B");
     }
     db.commit().unwrap();
+    let tail = db.wal_durable().2 as usize;
     drop(db);
+    // Cut from the log's tail, not the file's end: the file runs on in the
+    // zeros its pre-write left (`Options::wal_ahead_bytes`).
     let wal = d.join("wal-00000000");
-    let full = std::fs::read(&wal).unwrap();
+    let full = std::fs::read(&wal).unwrap()[..tail].to_vec();
     for cut in [3usize, 17, 17 + 12] {
         let dd = dir(&format!("torn-batch-{cut}"));
         for e in std::fs::read_dir(&d).unwrap() {
@@ -3512,6 +3526,12 @@ fn a_wal_header_torn_by_power_loss_opens_and_is_rewritten() {
         seal_bytes: 1 << 10,
         // The seal's rotation; a rotation by size has its own test.
         seal_rotates_wal: true,
+        // A fresh file's header, which a power loss can leave a prefix of.
+        // A recycled file is whole, and its header is rewritten in place
+        // within its first page, so a lost write leaves the old header over
+        // frames whose CRCs fail under the new file's id
+        // (`a_recycled_wal_never_adopts_a_frame_from_its_previous_life`).
+        recycle_wal: false,
         ..Options::default()
     };
     let newest_wal = |d: &std::path::Path| -> std::path::PathBuf {
@@ -3582,19 +3602,43 @@ fn a_recycled_wal_never_adopts_a_frame_from_its_previous_life() {
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     // Life 1 of wal-00000000: about 3 seals' worth, so the file is long.
-    for i in 0u32..3000 {
+    // Out of order, so the writes go through the log: keys in order above
+    // the store's greatest go to a segment directly and leave the log
+    // empty, and a test of them under a file pre-written whole found a
+    // long live file without one stale frame in it.
+    for n in 0u32..3000 {
+        let i = n * 7919 % 3000;
         db.append(format!("k{i:05}").as_bytes(), &[1u8; 64]);
-        if i % 50 == 49 {
+        if n % 50 == 49 {
             db.commit().unwrap();
         }
     }
     db.commit().unwrap();
     db.flush().unwrap();
-    let (live, _, _) = db.wal_durable();
-    // After the flush the live WAL is a recycled file with a long stale
-    // tail behind an eight-byte header.
+    db.settle().unwrap();
+    // The flush's landing retired the files it covers and kept one as the
+    // spare; the next rotation takes it, and the live WAL is then a
+    // recycled file with a long stale tail behind an eight-byte header.
     assert!(
-        std::fs::metadata(&live).unwrap().len() > 8,
+        std::fs::read_dir(&d).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("spare-")),
+        "a retired WAL is kept as the spare"
+    );
+    let (before, _, _) = db.wal_durable();
+    let mut fills = 0u32;
+    while db.wal_durable().0 == before {
+        db.append(format!("f{fills:05}").as_bytes(), &[2u8; 64]);
+        db.commit().unwrap();
+        fills += 1;
+        assert!(fills < 10_000, "the log never rotated");
+    }
+    let (live, _, _) = db.wal_durable();
+    let bytes = std::fs::read(&live).unwrap();
+    assert!(
+        bytes.len() > 4096 && bytes[8..].iter().any(|&b| b != 0),
         "the live WAL should be a recycled file with old frames behind the header"
     );
     // Life 2: two small batches, then a crash.
@@ -3616,6 +3660,9 @@ fn a_recycled_wal_never_adopts_a_frame_from_its_previous_life() {
             got.len()
         );
     }
+    for i in 0..fills {
+        assert_eq!(read_vec(&db, format!("f{i:05}").as_bytes()).len(), 1);
+    }
     drop(db);
     // And again after another commit and reopen: the truncation at open
     // must have cut the stale tail so nothing behind the new frames is
@@ -3629,6 +3676,99 @@ fn a_recycled_wal_never_adopts_a_frame_from_its_previous_life() {
     for i in (0u32..3000).step_by(97) {
         assert_eq!(read_vec(&db, format!("k{i:05}").as_bytes()).len(), 1);
     }
+}
+
+#[test]
+fn a_syncing_store_pre_writes_its_wal_ahead_of_the_tail_and_not_whole() {
+    // `wal_ahead_bytes`: nothing pre-written whole and no spare at create,
+    // the live file pre-written a reach past each commit's end and no
+    // further than the rotation's size and a reach, the frames after a
+    // reopen landing at the tail and not past the zeros, and a store whose
+    // commits do not sync pre-writing nothing.
+    let spares = |d: &std::path::Path| {
+        std::fs::read_dir(d)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("spare-")
+            })
+            .count()
+    };
+    let ahead = 256u64 << 10;
+    let opts = Options {
+        wal_ahead_bytes: ahead as usize,
+        ..Options::default()
+    };
+    assert!(opts.recycle_wal && matches!(opts.sync, supdb::SyncPolicy::Always));
+    let cap = opts.seal_bytes as u64 + ahead;
+    let d = dir("wal-ahead");
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let (live, _, _) = db.wal_durable();
+    assert!(
+        std::fs::metadata(&live).unwrap().len() < 4096,
+        "nothing is pre-written at create"
+    );
+    assert_eq!(spares(&d), 0, "no spare is made at create");
+    let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
+    let write = |db: &mut Db, round: u32, model: &mut HashMap<Vec<u8>, Vec<Vec<u8>>>| {
+        for i in 0u32..60 {
+            let k = format!("k{:04}", (i * 13 + round) % 400).into_bytes();
+            let v = format!("r{round}i{i}").repeat(8).into_bytes();
+            db.append(&k, &v);
+            model.entry(k).or_default().push(v);
+        }
+        db.commit().unwrap();
+    };
+    for round in 0u32..40 {
+        write(&mut db, round, &mut model);
+        let (live, synced, written) = db.wal_durable();
+        let len = std::fs::metadata(&live).unwrap().len();
+        assert_eq!(synced, written, "round {round}: the commit synced");
+        assert!(
+            len >= (written + ahead / 2).min(cap) && len <= (written + ahead).min(cap) + 4096,
+            "round {round}: {len} bytes for a tail at {written}, not a reach ahead of it"
+        );
+    }
+    drop(db); // crash, zeros past the tail
+    let mut db = Db::open(&d, opts.clone()).unwrap();
+    for (k, want) in &model {
+        assert_eq!(&read_vec(&db, k), want, "after the first crash");
+    }
+    for round in 40u32..60 {
+        write(&mut db, round, &mut model);
+    }
+    let (live, _, written) = db.wal_durable();
+    assert!(
+        std::fs::metadata(&live).unwrap().len() >= (written + ahead / 2).min(cap),
+        "a reopened store pre-writes its WAL as well"
+    );
+    drop(db); // crash again: the frames after the reopen are at the tail
+    let db = Db::open(&d, opts.clone()).unwrap();
+    for (k, want) in &model {
+        assert_eq!(&read_vec(&db, k), want, "after the second crash");
+    }
+    drop(db);
+
+    let d = dir("wal-ahead-buffered");
+    let opts = Options {
+        sync: supdb::SyncPolicy::EveryN(u32::MAX),
+        wal_ahead_bytes: ahead as usize,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    for round in 0u32..10 {
+        write(&mut db, round, &mut HashMap::new());
+    }
+    let (live, _, written) = db.wal_durable();
+    assert_eq!(
+        std::fs::metadata(&live).unwrap().len(),
+        written,
+        "a store whose commits do not sync pre-writes nothing"
+    );
+    assert_eq!(spares(&d), 0);
 }
 
 #[test]
@@ -3701,9 +3841,13 @@ fn a_flipped_byte_anywhere_in_a_batch_loses_that_batch_and_the_ones_after() {
     }
     drop(db);
     let wal = d.join("wal-00000000");
+    // The file runs on past the last batch in the zeros its pre-write
+    // left (`Options::wal_ahead_bytes`); every byte of the batches is
+    // flipped, with the zeros behind them as the log leaves them.
     let full = std::fs::read(&wal).unwrap();
-    assert_eq!(full.len(), *ends.last().unwrap());
-    for off in 8..full.len() {
+    let tail = *ends.last().unwrap();
+    assert!(full.len() >= tail && full[tail..].iter().all(|&b| b == 0));
+    for off in 8..tail {
         let dd = dir(&format!("flip-{off}"));
         for e in std::fs::read_dir(&d).unwrap() {
             let e = e.unwrap();
@@ -5840,6 +5984,10 @@ fn the_wal_drops_its_synced_frames_from_the_page_cache() {
             }
             db.commit().unwrap();
         }
+        // The log's tail, short of the file's end by the zeros its
+        // pre-write keeps ahead (`Options::wal_ahead_bytes`), which were
+        // written and not synced frames.
+        let len = db.wal_durable().2 as usize;
         let wal = std::fs::read_dir(&d)
             .unwrap()
             .map(|e| e.unwrap().path())
@@ -5849,7 +5997,6 @@ fn the_wal_drops_its_synced_frames_from_the_page_cache() {
                     .is_some_and(|n| n.starts_with("wal-"))
             })
             .expect("a WAL");
-        let len = std::fs::metadata(&wal).unwrap().len() as usize;
         assert!(len > 3 << 20, "the log holds {len} bytes");
         // Everything below the last stride before the tail was synced and
         // dropped; the tail's own stretch, and its page, stay.
@@ -17244,13 +17391,18 @@ fn a_loose_rotation_syncs_nothing_and_a_gap_at_its_boundary_ends_the_log() {
             db.commit().unwrap();
         }
     };
+    // The last frame's last byte cut off, wherever the frames end: a file
+    // pre-written ahead of its tail runs on in zeros past it
+    // (`Options::wal_ahead_bytes`), and a commit frame ends in its kind and
+    // CRC, never in more zeros than a few.
     let tear = |p: &std::path::Path| {
-        let len = std::fs::metadata(p).unwrap().len();
+        let bytes = std::fs::read(p).unwrap();
+        let end = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
         std::fs::OpenOptions::new()
             .write(true)
             .open(p)
             .unwrap()
-            .set_len(len - 1)
+            .set_len(end as u64 - 1)
             .unwrap();
     };
     let d = dir("loose-rotation");

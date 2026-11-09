@@ -703,6 +703,9 @@ pub struct ZCounts {
     /// record raw-tailed at each take-back, which the cover leaves out.
     pub coding_repicks: u64,
     pub finish_refused: u64,
+    /// Raw-tail picks a reading made before any reader came, taken as the
+    /// block coding (`Maint::z_pick_raw_ok`).
+    pub coding_unread: u64,
     pub builds_raw_tails: u64,
     /// Partitions re-coded while served (`Options::zpages_recode`): to the
     /// raw tails, back to the block coding, and re-codes that installed
@@ -2249,12 +2252,6 @@ pub struct Options {
     /// were also making more partitions and paying for them on every read;
     /// `Some` decouples the two.
     pub partition_bytes: Option<usize>,
-    /// Recycle retired WAL files instead of creating fresh ones, and
-    /// pre-write the first to the seal size, so every block a commit's
-    /// fdatasync touches is already allocated and written. On ext4 an
-    /// fdatasync of an append that grows the file commits an inode change
-    /// through the journal; an overwrite does not, and LMDB's commit is an
-    /// overwrite.
     /// How reads advise the kernel about the segment mappings.
     ///
     /// See `ReadAdvice`. `Adaptive` unless changed.
@@ -2285,7 +2282,45 @@ pub struct Options {
     /// It is NOT the device's readahead window. That was the first guess and
     /// it is wrong by a factor of forty: this device reports 8,192 kB.
     pub scan_readahead_bytes: usize,
+    /// Recycle retired WAL files instead of removing them, and pre-write a
+    /// file not yet written through ahead of its tail (`wal_ahead_bytes`),
+    /// so every block a commit's fdatasync touches is already allocated and
+    /// written. On ext4 an fdatasync of an append that grows the file
+    /// commits an inode change through the journal; an overwrite does not,
+    /// and LMDB's commit is an overwrite. The write mixes' commits are where
+    /// it pays, and the loads, whose commits are few and large, are where it
+    /// was first priced and read a tie (`docs/engine.md`, the open items).
+    /// Off is the log grown by its appends and a retired file removed,
+    /// `supdb-walappend`.
     pub recycle_wal: bool,
+    /// Under `recycle_wal`, a pre-written or recycled WAL's pages dropped
+    /// from the page cache once written, and every write into it padded in
+    /// zeros to its last page's end: a recycled file is overwritten in
+    /// place, and a commit's last page, written in part into a page the
+    /// cache does not hold, is read from the device first, on the commit's
+    /// path; padded, every page a write lands in is written whole but the
+    /// tail page, which the write before left in the cache, and the device
+    /// writes those pages whole either way. Kept resident instead, the pair
+    /// the store pre-writes, the live file and its spare, was 64 MiB of page
+    /// cache the store's reads could not use under a bound, and a window of
+    /// it kept ahead by `POSIX_FADV_WILLNEED` read each recycled file back
+    /// from the device, which the burst of syncing commits beside it paid
+    /// for. Off keeps the whole file resident, the shape first priced.
+    pub wal_recycle_pads: bool,
+    /// Under `recycle_wal`, where every commit syncs
+    /// (`SyncPolicy::Always`), how far ahead of the log's tail a file not
+    /// yet written through is pre-written: a write that comes within half
+    /// of it of the pre-written end first writes zeros out to this far
+    /// past its own end, and never further than `seal_bytes`, the size the
+    /// log rotates at, which the commit's fdatasync then flushes with
+    /// the frames, one journal commit for the file's growth where every
+    /// append paid one. Zero pre-writes the whole file to `seal_bytes`
+    /// when it is made, the live file and a spare at `Db::create` and a
+    /// file at a rotation that finds no spare, the shape first priced:
+    /// 64 MiB written and synced to create a store, and 32 MiB at rest in
+    /// every store however little it holds. Under any other policy only
+    /// the retired files are recycled, whose blocks their last life wrote.
+    pub wal_ahead_bytes: usize,
     /// The ordered scan's merge over unrouted sources. `true` is the merge
     /// that replaced the original: one cursor over the disjoint partitions
     /// in order rather than one per partition, each cursor's key resolved
@@ -4692,7 +4727,9 @@ impl Default for Options {
             seal_defers: false,
             seal_idle: false,
             seal_first_floor: false,
-            recycle_wal: false,
+            recycle_wal: true,
+            wal_recycle_pads: true,
+            wal_ahead_bytes: 1 << 20,
             read_advice: ReadAdvice::default(),
             scan_readahead_bytes: 256 << 10,
             scan_merge: true,
@@ -4887,6 +4924,33 @@ struct Wal {
     /// How far from the file's start its pages have been dropped from
     /// the page cache (`Options::wal_drop_bytes`), a page boundary.
     dropped: u64,
+    /// A pre-written or recycled file's length (`Options::recycle_wal`),
+    /// zero for one that grows by its appends; and whether a write into it
+    /// is padded to its last page's end (`Options::wal_recycle_pads`).
+    extent: u64,
+    pads: bool,
+    /// How far past a write's end the file is pre-written when the write
+    /// comes within half of it of `extent`, and the length the pre-write
+    /// stops at (`Options::wal_ahead_bytes`); zero for none.
+    ahead: u64,
+    cap: u64,
+}
+
+/// The pre-write ahead of the log's tail and the length it stops at, where
+/// the store recycles its WAL, pre-writes it as the commits reach it and
+/// syncs every commit (`Options::wal_ahead_bytes`); none otherwise. The
+/// stop is a pre-write's reach past the rotation's size, since the commit
+/// that crosses it writes its batch before the log rotates.
+fn wal_ahead(opts: &Options) -> Option<(u64, u64)> {
+    if !opts.recycle_wal || opts.wal_ahead_bytes == 0 || !matches!(opts.sync, SyncPolicy::Always) {
+        return None;
+    }
+    // No further than the rotation's own size: a store that rotates at a
+    // quarter of a mebibyte has no use for a mebibyte of zeros past it.
+    let ahead = (opts.wal_ahead_bytes as u64)
+        .min(opts.seal_bytes as u64)
+        .max(zselect::PAGE);
+    Some((ahead, opts.seal_bytes as u64 + ahead))
 }
 
 /// The WAL file starts with eight bytes, this name and a kind byte, so a
@@ -4960,6 +5024,10 @@ impl Wal {
             seed: wal_seed(id),
             loose: kind == WAL_LOOSE,
             dropped: 0,
+            extent: 0,
+            pads: false,
+            ahead: 0,
+            cap: 0,
         })
     }
 
@@ -4974,7 +5042,13 @@ impl Wal {
     /// a 1 MB folio writes back the whole megabyte. Pre-written in 1 MB
     /// pieces, every later 100 KB commit cost 11x its bytes at the device;
     /// in 4 KB pieces, 1.04x.
-    fn prefill(&mut self, bytes: u64) -> Result<()> {
+    ///
+    /// Where `pads`, the pages past the header's are dropped from the page
+    /// cache once the file is synced, and every write into the file is
+    /// padded to its last page's end (`Wal::write`), so that no write lands
+    /// in part on a page the cache does not hold; otherwise the whole file
+    /// stays resident (`Options::wal_recycle_pads`).
+    fn prefill(&mut self, bytes: u64, pads: bool) -> Result<()> {
         let zeros = vec![0u8; 4096];
         let mut at = self.written;
         while at < bytes {
@@ -4984,6 +5058,11 @@ impl Wal {
         }
         self.file.sync_all()?;
         self.file.seek(SeekFrom::Start(self.written))?;
+        self.extent = bytes.max(self.written);
+        self.pads = pads;
+        if pads && self.extent > zselect::PAGE {
+            fadvise_dontneed_range(&self.file, zselect::PAGE, self.extent - zselect::PAGE);
+        }
         Ok(())
     }
 
@@ -4992,12 +5071,13 @@ impl Wal {
     /// previous life's frames, written under another id, and is overwritten
     /// as this life appends; replay stops at the first frame whose CRC does
     /// not verify under this id.
-    fn recycle(spare: &Path, path: &Path, id: u64, kind: u8) -> Result<Wal> {
+    fn recycle(spare: &Path, path: &Path, id: u64, kind: u8, pads: bool) -> Result<Wal> {
         std::fs::rename(spare, path)?;
         let mut file = OpenOptions::new().write(true).open(path)?;
+        let extent = file.metadata()?.len();
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&wal_header(kind))?;
-        Ok(Wal {
+        let wal = Wal {
             file,
             path: path.to_path_buf(),
             seq: 0,
@@ -5007,17 +5087,57 @@ impl Wal {
             seed: wal_seed(id),
             loose: kind == WAL_LOOSE,
             dropped: 0,
-        })
+            extent,
+            pads,
+            ahead: 0,
+            cap: 0,
+        };
+        Ok(wal)
+    }
+
+    /// Pre-write the file `ahead` bytes past a write's end, up to `cap`,
+    /// whenever a write comes within half of that of what is pre-written
+    /// (`Options::wal_ahead_bytes`), padding writes as `pads` says.
+    fn set_ahead(&mut self, ahead: u64, cap: u64, pads: bool) {
+        self.ahead = ahead;
+        self.cap = cap;
+        self.pads = pads;
+        self.extent = self.extent.max(self.written);
+    }
+
+    /// Zeros from what is pre-written, or from the page after `end` where
+    /// the write about to land runs past it, out to `to`, in page-sized
+    /// writes as `prefill` writes them, at their offset and with the
+    /// cursor left where it was. Unsynced: the commit's fdatasync flushes
+    /// them with its frames, and pays the one journal commit the file's
+    /// growth needs there.
+    fn extend_to(&mut self, end: u64, to: u64) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        let page_end = (end + zselect::PAGE - 1) & !(zselect::PAGE - 1);
+        let mut at = self.extent.max(page_end);
+        let zeros = [0u8; 4096];
+        while at < to {
+            let n = (zeros.len() as u64).min(to - at) as usize;
+            self.file.write_all_at(&zeros[..n], at)?;
+            at += n as u64;
+        }
+        self.extent = self.extent.max(to);
+        Ok(())
     }
 
     /// Reopen a WAL for appending at `seq`, after replay has truncated it to
     /// its last commit frame. A file that does not exist yet gets its header
     /// so the next replay finds one.
     fn open_append(path: &Path, id: u64, seq: u64) -> Result<Wal> {
+        // Positioned and not opened to append, so that a pad's seek back
+        // to the tail and a pre-write past it land where they are put
+        // (`Options::wal_ahead_bytes`): an append-mode write goes to the
+        // file's end whatever the cursor says.
         let mut file = OpenOptions::new()
             .read(true)
+            .write(true)
             .create(true)
-            .append(true)
+            .truncate(false)
             .open(path)?;
         let mut written = file.metadata()?.len();
         let mut loose = false;
@@ -5031,6 +5151,7 @@ impl Wal {
             file.seek(SeekFrom::Start(0))?;
             file.read_exact(&mut head)?;
             loose = wal_kind(&head) == Some(WAL_LOOSE);
+            file.seek(SeekFrom::Start(written))?;
         }
         // What replay kept was read back from the device, so it counts as
         // synced; a header written just now does not until the first
@@ -5050,6 +5171,10 @@ impl Wal {
             seed: wal_seed(id),
             loose,
             dropped: 0,
+            extent: 0,
+            pads: false,
+            ahead: 0,
+            cap: 0,
         })
     }
 
@@ -5118,8 +5243,29 @@ impl Wal {
         if self.pending.is_empty() {
             return Ok(());
         }
-        self.file.write_all(&self.pending)?;
-        self.written += self.pending.len() as u64;
+        let end = self.written + self.pending.len() as u64;
+        if self.ahead > 0 && end + self.ahead / 2 > self.extent && self.extent < self.cap {
+            let to = ((end + self.ahead).min(self.cap) + zselect::PAGE - 1) & !(zselect::PAGE - 1);
+            self.extend_to(end, to)?;
+        }
+        // Inside a pre-written or recycled file, the write runs to its last
+        // page's end in zeros, so that page is written whole and never read
+        // back first; the next write starts at the true tail and overwrites
+        // the zeros, which a replay reads as the log's end.
+        let pad = if self.pads && end < self.extent {
+            let page_end = (end + zselect::PAGE - 1) & !(zselect::PAGE - 1);
+            (page_end.min(self.extent) - end) as usize
+        } else {
+            0
+        };
+        if pad > 0 {
+            self.pending.resize(self.pending.len() + pad, 0);
+            self.file.write_all(&self.pending)?;
+            self.file.seek(SeekFrom::Start(end))?;
+        } else {
+            self.file.write_all(&self.pending)?;
+        }
+        self.written = end;
         self.pending.clear();
         Ok(())
     }
@@ -20250,6 +20396,7 @@ impl Reader {
             coding_picks_raw: get(&ev.coding_picks[1]),
             coding_repicks: get(&ev.coding_repicks),
             finish_refused: get(&ev.finish_refused),
+            coding_unread: get(&ev.coding_unread),
             builds_raw_tails: get(&ev.builds_raw_tails),
             recodes: get(&ev.recodes),
             recodes_back: get(&ev.recodes_back),
@@ -28224,11 +28371,22 @@ impl Db {
             return Err(err("a rotation named the live WAL"));
         }
         if self.opts.recycle_wal {
+            let ahead = wal_ahead(&self.opts);
             if let Some(spare) = self.shared.take_spare() {
-                return Wal::recycle(&spare, &path, id, kind);
+                let mut wal = Wal::recycle(&spare, &path, id, kind, self.opts.wal_recycle_pads)?;
+                if let Some((ahead, cap)) = ahead {
+                    wal.set_ahead(ahead, cap, self.opts.wal_recycle_pads);
+                }
+                return Ok(wal);
             }
             let mut wal = Wal::create(&path, id, kind)?;
-            wal.prefill(self.opts.seal_bytes as u64)?;
+            match ahead {
+                Some((ahead, cap)) => wal.set_ahead(ahead, cap, self.opts.wal_recycle_pads),
+                None if self.opts.wal_ahead_bytes == 0 => {
+                    wal.prefill(self.opts.seal_bytes as u64, self.opts.wal_recycle_pads)?
+                }
+                None => {}
+            }
             return Ok(wal);
         }
         Wal::create(&path, id, kind)
@@ -28347,13 +28505,18 @@ impl Db {
         let mut wal = Wal::create(&Db::wal_path(dir, 0), 0, WAL_CHAINED)?;
         let mut spare_wal: *mut PathBuf = std::ptr::null_mut();
         let next_seg = 0u64;
-        if opts.recycle_wal {
+        if let Some((ahead, cap)) = wal_ahead(&opts) {
+            // Pre-written as the commits reach it, and no spare until a
+            // retired file is one.
+            wal.set_ahead(ahead, cap, opts.wal_recycle_pads);
+        } else if opts.recycle_wal && opts.wal_ahead_bytes == 0 {
             // The live file and one spare, both written through, so the
             // first rotation recycles too and no rotation ever pays the
             // pre-write on the commit path.
-            wal.prefill(opts.seal_bytes as u64)?;
+            wal.prefill(opts.seal_bytes as u64, opts.wal_recycle_pads)?;
             let spare = Db::spare_path(dir, 0);
-            Wal::create(&spare, 0, WAL_CHAINED)?.prefill(opts.seal_bytes as u64)?;
+            Wal::create(&spare, 0, WAL_CHAINED)?
+                .prefill(opts.seal_bytes as u64, opts.wal_recycle_pads)?;
             spare_wal = Box::into_raw(Box::new(spare));
             File::open(dir)?.sync_all()?;
         }
@@ -28921,7 +29084,10 @@ impl Db {
                 f.sync_data()?;
             }
         }
-        let wal = Wal::open_append(&wal_path, wal_id, from)?;
+        let mut wal = Wal::open_append(&wal_path, wal_id, from)?;
+        if let Some((ahead, cap)) = wal_ahead(&opts) {
+            wal.set_ahead(ahead, cap, opts.wal_recycle_pads);
+        }
         let next_seg = seg_ids.iter().map(|&(n, _)| n + 1).max().unwrap_or(0);
         let spare_wal = spare_wals
             .into_iter()
@@ -38015,6 +38181,9 @@ struct Maint {
     /// bytes, the raw-tail form's bytes and resident part as the reading
     /// sized them, and the budget (`Maint::z_repick`).
     z_pick_size: Option<(u64, u64, u64, u64)>,
+    /// The census's operations, reads and scans, counted over the store's
+    /// life: a raw-tail pick waits for a reader (`Maint::z_pick_raw_ok`).
+    z_ops_life: u64,
     z_report: zselect::Build,
     z_scan_len: f64,
     /// Whether the store's raw populations were past its budget at the
@@ -38667,6 +38836,7 @@ impl Maint {
             z_refresh_due: false,
             z_coding_pick: None,
             z_pick_size: None,
+            z_ops_life: 0,
             z_report: zselect::Build::default(),
             z_scan_len: 0.0,
             z_past_budget: false,
@@ -41440,6 +41610,10 @@ impl Maint {
             None
         };
         let census = self.z_census(now);
+        self.z_ops_life = self
+            .z_ops_life
+            .saturating_add(census.reads.ops)
+            .saturating_add(census.scans.ops);
         self.z_sample_collect();
         let (generation, build, footprint) = {
             let _op = self.op();
@@ -41787,6 +41961,12 @@ impl Maint {
                         resident: raw.resident,
                     },
                 );
+                let c = if c == zselect::Coding::RawTails && !self.z_pick_raw_ok() {
+                    zfile::ZEvents::add(&ev.coding_unread, 1);
+                    zselect::Coding::Block
+                } else {
+                    c
+                };
                 (c, budget)
             });
         if let Some((c, budget)) = pick {
@@ -42079,6 +42259,12 @@ impl Maint {
                     resident: sums.resident,
                 },
             );
+            let pick = if pick == zselect::Coding::RawTails && !self.z_pick_raw_ok() {
+                zfile::ZEvents::add(&self.shared.z.coding_unread, 1);
+                zselect::Coding::Block
+            } else {
+                pick
+            };
             let idx = usize::from(pick == zselect::Coding::RawTails);
             zfile::ZEvents::add(&self.shared.z.coding_picks[idx], 1);
             self.z_coding_pick = Some(pick);
@@ -42585,6 +42771,24 @@ impl Maint {
             .filter(|_| self.opts.zpages_coding_auto)
             .map(|c| c == zselect::Coding::RawTails);
         matches!((want, self.z_ahead_coding.get(name)), (Some(w), Some(&b)) if b != w)
+    }
+
+    /// Whether a reading may pick the raw tails: a reader has come -- a scan
+    /// in the store's life, or a read or scan the census counted. A pick is
+    /// a statement about the form the reads will use, made against the
+    /// partitions as they stand, and before any reader they stand partway
+    /// through the store's first writing: the lag sweep's store at ten
+    /// million keys under 1.25 GiB entered SUSPECT halfway through its load
+    /// in one rep of two in some sittings, picked the raw tails over the
+    /// fourteen to seventeen partitions it then had, built every output
+    /// raw-tailed until the pick was taken back near the load's end
+    /// (`Maint::z_repick`), and rebuilt all twenty-four through the lag
+    /// sweep's first passes. A reading with no reader yet picks the block
+    /// coding, which fits wherever the raw tails would; the first reading
+    /// after a reader picks again, and the files of the refused coding are
+    /// given back at their attach. Counted (`ZCounts::coding_unread`).
+    fn z_pick_raw_ok(&self) -> bool {
+        self.z_ops_life > 0 || self.scan_life() > 0
     }
 
     /// The raw-tail pick taken back where the partitions' records have grown

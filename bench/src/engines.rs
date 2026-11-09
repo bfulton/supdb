@@ -824,6 +824,13 @@ pub struct Supdb {
     /// The upkeep thread's fill run whatever the writer has posted, the
     /// shape before `Options::upkeep_fill_skips_posted`. `supdb-fillposted`.
     fillposted: bool,
+    /// The WAL grown by its appends and a retired file removed, the shape
+    /// before `Options::recycle_wal`. `supdb-walappend`.
+    walappend: bool,
+    /// The WAL pre-written whole when it is made, a live file and a spare
+    /// at create, the shape `Options::wal_ahead_bytes` replaced (zero).
+    /// `supdb-walprefill`.
+    walprefill: bool,
     /// A direct run's record stream kept whole in the arena, the shape
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
@@ -1789,6 +1796,13 @@ struct Policy {
     /// The upkeep thread's fill run whatever the writer has posted, the
     /// shape before `Options::upkeep_fill_skips_posted`. `supdb-fillposted`.
     fillposted: bool,
+    /// The WAL grown by its appends and a retired file removed, the shape
+    /// before `Options::recycle_wal`. `supdb-walappend`.
+    walappend: bool,
+    /// The WAL pre-written whole when it is made, a live file and a spare
+    /// at create, the shape `Options::wal_ahead_bytes` replaced (zero).
+    /// `supdb-walprefill`.
+    walprefill: bool,
     /// A direct run's record stream kept whole in the arena, the shape
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
@@ -2311,6 +2325,8 @@ impl Default for Policy {
             pacesyncs5: false,
             oocz: false,
             fillposted: false,
+            walappend: false,
+            walprefill: false,
             norecycle: false,
             heapblocks: false,
             keysarena: false,
@@ -5835,6 +5851,29 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose WAL grows by its appends (`Options::recycle_wal` off).
+    pub fn create_walappend(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                walappend: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose WAL is pre-written whole when it is made
+    /// (`Options::wal_ahead_bytes` zero).
+    pub fn create_walprefill(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                walprefill: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` whose upkeep thread fills whatever the writer has posted
     /// (`Options::upkeep_fill_skips_posted` off).
     pub fn create_fillposted(path: &Path) -> Res<Supdb> {
@@ -7430,6 +7469,8 @@ impl Supdb {
             pacesyncs5,
             oocz,
             fillposted,
+            walappend,
+            walprefill,
             norecycle,
             heapblocks,
             keysarena,
@@ -7816,6 +7857,8 @@ impl Supdb {
             upkeep_pace_syncs_census: !pacesyncsraw,
             out_of_core_installed: oocz,
             upkeep_fill_skips_posted: !fillposted,
+            recycle_wal: !walappend,
+            wal_ahead_bytes: if walprefill { 0 } else { 1 << 20 },
             prefault: populate,
             direct_put_one: !recordsteps,
             direct_stream: !copyvals && !refvals,
@@ -8135,6 +8178,8 @@ impl Supdb {
             pacesyncs5,
             oocz,
             fillposted,
+            walappend,
+            walprefill,
             norecycle,
             heapblocks,
             keysarena,
@@ -9229,6 +9274,12 @@ impl Engine for Supdb {
         if self.fillposted {
             return "supdb-fillposted";
         }
+        if self.walappend {
+            return "supdb-walappend";
+        }
+        if self.walprefill {
+            return "supdb-walprefill";
+        }
         if self.oocz {
             return "supdb-oocz";
         }
@@ -9766,6 +9817,7 @@ impl Engine for Supdb {
             ("zpage_coding_picks_raw", z.coding_picks_raw as f64),
             ("zpage_coding_repicks", z.coding_repicks as f64),
             ("zpage_finish_refused", z.finish_refused as f64),
+            ("zpage_coding_unread", z.coding_unread as f64),
             ("zpage_builds_raw_tails", z.builds_raw_tails as f64),
             ("zpage_raw_dropped", z.raw_dropped as f64),
             (
@@ -10684,6 +10736,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-pacesyncs5"
         | "supdb-oocz"
         | "supdb-fillposted"
+        | "supdb-walappend"
+        | "supdb-walprefill"
         | "supdb-norecycle"
         | "supdb-heapblocks"
         | "supdb-keysarena"
@@ -11511,6 +11565,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-pacesyncs5" => supdb_arm(Supdb::create_pacesyncs5, dir)?,
         "supdb-oocz" => supdb_arm(Supdb::create_oocz, dir)?,
         "supdb-fillposted" => supdb_arm(Supdb::create_fillposted, dir)?,
+        "supdb-walappend" => supdb_arm(Supdb::create_walappend, dir)?,
+        "supdb-walprefill" => supdb_arm(Supdb::create_walprefill, dir)?,
         "supdb-ingestlatesync" => supdb_arm(Supdb::create_ingest_latesync, dir)?,
         "supdb-norecycle" => supdb_arm(Supdb::create_norecycle, dir)?,
         "supdb-ingestnorecycle" => supdb_arm(Supdb::create_ingest_norecycle, dir)?,
@@ -13156,6 +13212,20 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.upkeep_fill_skips_posted && b.upkeep_fill_skips_posted);
+            }
+            {
+                let z = Supdb::create_walappend(&dir("walappend")).unwrap();
+                assert_eq!(z.name(), "supdb-walappend");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.recycle_wal && b.recycle_wal);
+            }
+            {
+                let z = Supdb::create_walprefill(&dir("walprefill")).unwrap();
+                assert_eq!(z.name(), "supdb-walprefill");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.wal_ahead_bytes == 0 && b.wal_ahead_bytes > 0);
             }
             {
                 let z = Supdb::create_sweepwalks(&dir("sweepwalks")).unwrap();
