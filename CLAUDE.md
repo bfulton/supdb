@@ -3569,7 +3569,12 @@ where the records have grown past the fill share since it
 nothing. The corollary: a decision held for a store's life is taken again
 wherever an input it is a function of is read again, and a pick made over
 a store still being written is a pick over a store that does not exist
-yet.
+yet. And the take-back was a second cost of the first: the arm whose
+reading came in the load built a sixth more form files and gave back up to
+twenty-four of them. A pick for readers waits for a reader now
+(`Maint::z_pick_raw_ok`). The corollary's corollary: a decision that has
+to be repaired when its input moves is not made before the input exists,
+since the repair costs what the early decision bought.
 
 **A fill that held the writer for forms nobody read, and a wait that was
 faults in disguise.** The upkeep thread's pass settles the commit it was
@@ -4225,6 +4230,26 @@ posted a newer commit now. The rule: a per-pass cost is priced at the
 rate passes come, and a regulator that shortens the passes multiplies it;
 work whose product the next pass rebuilds anyway is done by the pass that
 finds nothing waiting behind it.
+
+**A footprint priced on the stores the suite makes.** The WAL's recycling
+pre-wrote the live file and a spare whole at create, 64 MiB written and
+synced, and kept 32 MiB at rest in every store, which no pairing sees: the
+suite makes a store a pass, and a pairing prices the passes. The tests make
+hundreds, and the gate with that shape as the default would have left tens
+of gigabytes on an allowance of eighteen. The pre-write follows the tail
+now, a mebibyte ahead, flushed by the commit that reaches it. And the test
+written for the recycled file's stale frames passed under the whole-file
+pre-write for the wrong reason: its keys ascended, went to a segment
+directly and never touched the log, and its assertion that the live file
+was longer than its header was satisfied by the zeros; with the pre-write
+following the tail it failed, and its keys are permuted now. Six more
+took the file's length for the log's tail, tearing zeros where they meant
+to tear a batch, and read the tail from the store now. The rules: a
+default is priced on every store the library makes, the smallest
+included, at create and at rest as well as in the passes; and an
+assertion that a structure exists is held to the structure's content,
+since a fallback that makes something of the same size satisfies its
+length.
 
 ## Standing limitations
 

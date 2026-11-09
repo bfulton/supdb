@@ -6988,6 +6988,8 @@ The block path builds a form for every block a scan walks and repays the build o
 
 In one rep of those sittings the lag store's compact form was installed and decoded no group through the whole sweep, the ten-percent pass at 0.95 s where the arm's other reps read 0.28-0.35 and the full rewrite's at 1.5 against 0.40-1.29. The form was the raw tails. The controller's trace put the store in SUSPECT nineteen seconds into a load of thirty-six, on the refaults its own merges made, and the reading from the files on disk, fourteen partitions and 4.8 million keys, put the raw-tail form at 601 MB under a fill share of 940 (`zselect::FORM_FILL` of a budget of 1.11 GB). The pick held for every build after it: the store doubled, every output's form file was built raw-tailed at its finish, 1.14 GB of them asked for at the crossing against 0.75 in the other reps, and the install served a form the size of the raw records. A raw-tail pick is taken back now where the partitions' records have grown since it past the fill share of the budget it was made under (`Maint::z_repick`, at every build's plan and every refresh), and a form file on record in the coding the pick refuses covers nothing in the files' cover, so the attach waits for the selector's sample and the block coding's builds (`tests/zpages.rs`: a store that doubles after its pick builds the block coding after the growth, one rewritten at the same size keeps its raw tails). The shape before is no arm, as the pick at the budget's edge was none: a pick made against inputs that have moved is a wrong answer.
 
+The take-back costs what the early pick bought. In one of two sittings of the row's whole order at ten million keys under 1.25 GiB at `f95e79c` the default arm's reading came in the load, the controller in SUSPECT on the refaults of the load's own merges before a read: it picked the raw tails, took the pick back near the load's end and gave back the twenty-four form files its merges had finished raw-tailed, 173 builds against 150 in the arm beside it, and three more sittings of other arms on that tree read the same, 181-188 builds against 148-150. The raw tails are a form for a reader -- one a point read or a scan decodes nothing of -- and a reading before any read has no reader to judge one for. A reading taken before the store has served a read or a scan picks the block coding now, which fits wherever the raw tails would, and the first reading after one picks again (`Maint::z_pick_raw_ok`, counted as `zpage_coding_unread`). In the row's whole order at ten million keys (`SUPDB_LAG_COUNTERS=1 bench ab --arms supdb-walappend,supdb-walprefill --size 10000000 --bound 1342177280 --passes load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled,lag --ops-div 10 --reps 2`, both orders, on the tree of `91bf79f` before its pre-write ahead, where the two shapes were the default and the recycling arm) one arm a sitting took its reading in the load, picked the block coding and counted it, and neither arm picked the raw tails, took a pick back or gave a file back.
+
 Two merges in flight (`Options::merge_parallel` at two) were priced as a trade on top of the chain through the burst: the full rewrite's pass ahead, the clean store's and the one-percent pass behind. Both losses had causes of their own that are fixed now -- the clean store's pass met form files the burst had pushed cold, which the rewarm asks for again, and the one-percent pass's first scan settled through the form's decodes, which the samples' filing skips -- and paired again at ten million keys under 1.25 GiB (`SUPDB_LAG_COUNTERS=1 SUPDB_SCAN_OPS=1 SUPDB_LAG_MARK=1 SUPDB_ZPAGES_TRACE=1 bench ab --arms supdb,supdb-mergeone --size 10000000 --bound 1342177280 --passes load,lag --ops-div 10 --reps 2` at `7bc2e15`, and with the arms swapped in the row's whole order), two merges read the full rewrite's pass 1.56x and 1.88x, the clean store's 1.14x and 1.53x, the one-percent pass 1.61x and level and the ten-percent pass 0.97x and 0.95x; the bursts read 0.82-1.32x and the mixes, in the row's order, level to a tenth ahead. In core they lose nothing: at three million keys under the same bound in the row's whole order every lag pass read 1.13-1.80x and the bursts 1.05-1.11x, and at a million with no bound (`--passes load,lag,mixes --reps 4`) the lag cells sat within the sitting's noise and F read 1.23x in four reps of four. Two is the default; `supdb-mergeone`, `supdb-ingestmergeone` and `supdb-nozpagesmergeone` keep one.
 
 At ten million keys the shape above reads as designed where the store is past its line, and as a measurement's artefact where it is not (`SUPDB_ZPAGES_TRACE=1 bench ab --arms supdb-autozpages,lmdb-nordahead --size 10000000 --bound BYTES --passes load,read --reps 1` at `ad54c29`, one rep each way). Under 1.5 GiB the raw form is 1.38 GB against a budget of 1.40-1.49 GB, under the line: the builds ahead run at every landing from the twentieth partition, twenty-seven of twenty-nine within a quarter second of each landing with no major fault, nothing is dropped or swapped, the read pass divided by thirty is some two seconds, its reads fault at 0.06-0.08 a read on the files beside the records, and SUSPECT arrives as the pass ends -- a controller whose census ticks once a second and whose entry needs a sample cannot act inside a pass that short, and the sampler, which had waited for every build still due rather than the one in flight, would have waited past the pass in any case (`Maint::z_prebuild_pending`). Under 1 GiB the store is past the line in its load: SUSPECT at ten seconds, the sample finding twenty-three of twenty-four files on disk, the cross swapping those partitions' records for their files (`zahead ... crossed swapped 23 of 24`), the rest built behind the load's last landings, the buy at the load's end and the install about two seconds into a read pass divided by three. That pass reads 2.97x LMDB's with its readahead off (195,000 reads a second against 65,700, 0.036 major faults a read against 0.245, 148 bytes read a read against 1,002), the load 1.21x. With LMDB first and the scan pass added, the read pass reads 4.06x (222,800 against 54,900 reads a second, 0.025 major faults a read against 0.305, p99 59 µs against 106), the scan pass 4.54x (6.87 million entries a second against 1.52 million, no major fault a scan against 1.26) and the load 1.11x; LMDB's store of ten million keys is 1.3 GB and out of core under the bound as ours is. One rep each way, so the figures are the regime's and not a cell's: a pairing of three reps in each order is what a row needs, and the roster's read pass has to be long enough for the controller to act in -- divided by thirty it is not.
@@ -7611,17 +7613,52 @@ The comparators' check, registered before its first run. The suite's comparator 
   sweep priced beyond that is the incremental merge: below 32 MB every
   extra merge round rewrites the live set, and that is what stands between
   this engine and smaller seals.
-- **Recycling WAL files** — built and measured, not the default. An
-  fdatasync into blocks already allocated and written carries no inode
-  change through the journal, and the commit phase falls 19% on ordered
-  keys and 6% on uniform with retired WALs renamed back into place; but
-  the pool's one-time pre-write pays that back inside a 1M-key load and
-  the ingest reads a tie both ways, so a tie it stays until a longer-lived
-  shape is measured. The run also found a measurement trap worth more than
-  the flag: pre-writing in 1 MB pieces left 1 MB page-cache folios, and
-  every 100 KB commit wrote a megabyte back — 2.2x the device bytes, 11.2x
-  in isolation. A folio is sized by the write that creates it; pre-write
-  in pages.
+- ~~Recycling WAL files~~ — **the default** (`Options::recycle_wal`;
+  `supdb-walappend` is the log grown by its appends). An fdatasync into
+  blocks already allocated and written carries no inode change through the
+  journal. The first measurement priced it on the ordered and uniform
+  loads, whose commits are few and large, and the pool's one-time
+  pre-write paid back what they saved. The write mixes are where the
+  commits are: paired in the row's whole order under 1.25 GiB
+  (`SUPDB_MIX_KINDS=1 SUPDB_LAG_COUNTERS=1 bench ab --arms
+  supdb,supdb-walappend --size 3000000 --bound 1342177280 --passes
+  load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled,lag
+  --ops-div 10 --reps 2` at `91bf79f`, both orders, and at `--size 10000000`
+  with one rep each way), the commits of A and F and their scrambled forms
+  took 0.26-0.48 ms against 0.48-0.72 at three million keys and 0.33-0.42
+  against 0.47-0.69 at ten, and those mixes read 1.1-2.1x, B and D
+  1.06-1.16x and the shuffled load 1.03-1.14x; the lag passes, the reads
+  and the scans sat within their sittings' spread both ways, and ycsb-C,
+  which commits once, read 0.81-1.09x with its gets level over four reps in
+  the mixes' own order. Three things stood between the first shape and that.
+  A recycled file is overwritten in place, and a commit's last page,
+  written in part into a page the cache no longer holds, is read from the
+  device first, on the commit's path: every write into a pre-written or
+  recycled file is padded in zeros to its page's end now, and the next
+  write overwrites them from the true tail, so the log is as long as
+  before and no page is read back (`Options::wal_recycle_pads`). The pair
+  the store pre-wrote, the live file and a spare of 32 MiB each, was 64 MiB
+  of page cache under a bound if kept resident, and a device read under
+  the commits if dropped and asked back ahead; a file pre-written whole has
+  its pages dropped once written, and one pre-written ahead holds a
+  mebibyte of them at most. And the pre-write was 64 MiB written and synced to
+  create a store, 32 MiB at rest in every store however little it held,
+  and as many gigabytes as a test run makes stores: a file not yet written
+  through is pre-written a mebibyte past its tail as the commits reach it
+  now, the zeros flushed by the next commit's own fdatasync with one
+  journal commit for the growth, and no spare is made until a retired file
+  is one (`Options::wal_ahead_bytes`; zero is the whole-file pre-write,
+  `supdb-walprefill`). Paired against the whole file on the mixes alone
+  (`--arms supdb,supdb-walprefill --size 3000000 --bound 1342177280
+  --passes load,mixes --ops-div 10 --reps 3`), A's commits took 0.28-0.32
+  ms against 0.18-0.30 and F's 0.25-0.37 against 0.30-0.32, A 1.11x for the
+  whole file in two reps of three and F level: most of what the whole file
+  saved, for none of its footprint. A store whose commits do not sync
+  recycles its retired files and pre-writes nothing, and a reopened store
+  pre-writes as a created one does. The measurement trap the first run
+  found still holds: pre-written in 1 MB pieces the file left 1 MB
+  page-cache folios, and every 100 KB commit wrote a megabyte back — 2.2x
+  the device bytes, 11.2x in isolation; it is pre-written in pages.
 - **Group commit** — whether concurrent writers share a barrier; matters
   only after P-D.
 - **Read and write concurrency** — being built, readers first, in the
