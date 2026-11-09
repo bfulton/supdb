@@ -4175,6 +4175,29 @@ fdatasyncs, 0.41-0.78 ms a commit from process to process in both arms; a
 cell an option cannot reach is read by its kinds and its counters before
 its rate is read as anyone's.
 
+**A cache that measured its benefit where the benefit was another handle's.**
+The block cache out of core repays a block's build only where a later scan
+walks the block again, and the lag sweep's uniform passes meet each block
+about once, so a writer whose scans' start blocks do not recur now gives its
+forms up and takes the merge path, 2.2-2.6x on the full rewrite's pass at ten
+million keys under 1.25 GiB. The first version ran the measure on every
+handle, each over its own starts, and the threaded scans beside the mixes
+read 0.85x: the writer publishes its forms for the handles, and three
+threads reading the same blocks through them is a reuse none of their own
+starts shows, so each handle gave up what the others were paying for. The
+regime is the writer's, and a live handle takes the forms back at the
+writer's next commit, since the writer may make no scan while the handles
+read. The rule: a measure of a shared structure's reuse is taken where the
+structure is shared, or confined to the one consumer whose measure is whole;
+and a mode that turns a producer off is undone by a consumer's arrival at a
+point the producer passes whether or not it reads. Beside it: a test of the
+switch that wrote nothing where the scans after it read passed with the
+switch's drop removed, and the fuzz's stores, a few blocks each, never left
+the forms on under a real measure, so a seam flips the regime every few
+scans there (`scan_forms_off_flip`, `ZFUZZ_FORMSOFF`); a mechanism a test's
+input cannot drive is driven by a seam, and the seam is checked to have
+fired by its own count.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
