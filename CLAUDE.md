@@ -4212,6 +4212,20 @@ scans there (`scan_forms_off_flip`, `ZFUZZ_FORMSOFF`); a mechanism a test's
 input cannot drive is driven by a seam, and the seam is checked to have
 fired by its own count.
 
+**A fixed cost a pass, paid at the batches' rate.** The upkeep thread's
+fill walks every block of every partition whenever its tables are
+incomplete, a millisecond a pass at three million keys, and under the
+syncing pace a burst's passes come a few batches apart, so the walk was a
+sixth of the thread over the full rewrite and the writer was held for a
+quarter of the burst; the one-percent pass's first scan then waited for the
+pass in flight, the cell that lost to LMDB. A smaller pace share, the
+obvious lever on the scan's wait, made every batch a pass and paid the walk
+at every batch. The fill is left for a later pass while the writer has
+posted a newer commit now. The rule: a per-pass cost is priced at the
+rate passes come, and a regulator that shortens the passes multiplies it;
+work whose product the next pass rebuilds anyway is done by the pass that
+finds nothing waiting behind it.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
