@@ -2956,6 +2956,20 @@ pub struct Options {
     /// before: `supdb-nopacesyncs`.
     #[doc(hidden)]
     pub upkeep_pace_syncs_bp: usize,
+    /// "In core" for `upkeep_pace_syncs_bp` is every gate but the compact
+    /// form's: the pace holds through the controller's census and stops
+    /// once the form is installed. The census is entered on a refault rate,
+    /// and a full rewrite's own merges make one: at three million keys
+    /// under 1.25 GiB the lag sweep's full rewrite went SUSPECT four
+    /// seconds into its burst with the store still read from memory, the
+    /// pace stopped there, and the first scan after the burst settled
+    /// 40-130 ms of the trail the rest of the burst left, in passes of
+    /// 99-245 ms where LMDB's took 28. Where the hold cost the writer, at
+    /// ten million keys, the form was installed during the load and every
+    /// burst ran at its gate. Off, the pace stops at any gate but the raw
+    /// form's, the shape before: `supdb-pacesyncsraw`.
+    #[doc(hidden)]
+    pub upkeep_pace_syncs_census: bool,
     /// A buffered commit near reads whose batch is under
     /// `upkeep_inline_min` settles it here when a scan ran since the last
     /// commit, and lends the rest -- the forms the scans will walk, built
@@ -4612,6 +4626,7 @@ impl Default for Options {
             upkeep_inline_min: UPKEEP_WAKE_WRITES,
             upkeep_pace_pct: 1,
             upkeep_pace_syncs_bp: 25,
+            upkeep_pace_syncs_census: true,
             upkeep_settle_after_scans: true,
             scan_timers: false,
             upkeep_batch_pct: 0,
@@ -34228,13 +34243,21 @@ impl Db {
         // share, while the store is in core (`Options::upkeep_pace_syncs_bp`):
         // its thread files through the fsync, and the hold after it bounds
         // what the first scan after the burst meets. Out of core a resolve
-        // is a major fault, and the hold would pace the writer by the device.
+        // is a major fault, and the hold would pace the writer by the device;
+        // out of core is the compact form installed, the census being one a
+        // full rewrite's merges enter (`Options::upkeep_pace_syncs_census`).
+        let gate = self.shared.zgate.load();
+        let in_core = if self.opts.upkeep_pace_syncs_census {
+            gate != zselect::GATE_Z
+        } else {
+            gate == zselect::GATE_RAW
+        };
         if level == 1
             && syncs
             && self.opts.upkeep_pace_syncs_bp > 0
             && reads_around
             && batch >= self.opts.upkeep_inline_min
-            && self.shared.zgate.load() == zselect::GATE_RAW
+            && in_core
         {
             share = (keys as u64).saturating_mul(self.opts.upkeep_pace_syncs_bp as u64) / 10_000;
             pace = true;

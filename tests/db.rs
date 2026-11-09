@@ -17487,18 +17487,24 @@ fn a_bursts_batches_after_the_first_are_lent_a_batch_behind_the_thread() {
 /// trails by at most the share of the store's keys, every commit of the
 /// burst held for that, and every key reads as written through the
 /// writer and through a handle. Off, the commits lend unpaced and hold
-/// for nothing.
+/// for nothing. In core is every gate but the compact form's
+/// (`Options::upkeep_pace_syncs_census`): the burst holds at the census's
+/// gate as at the raw form's, and at the compact form's holds for nothing;
+/// with the option off the census's gate holds for nothing too. The gate
+/// is set by hand, the controller off so that nothing moves it.
 #[test]
 fn a_syncing_commits_burst_batches_are_paced_behind_the_thread() {
     // Batches of a thousand over twenty thousand keys, paced within a
     // tenth of the store: two thousand writes, two batches.
-    let run = |name: &str, bp: usize| {
+    let run = |name: &str, bp: usize, gate: u8, census: bool| {
         let d = dir(name);
         let mut db = Db::create(
             &d,
             Options {
                 upkeep: supdb::Upkeep::Background(1),
                 upkeep_pace_syncs_bp: bp,
+                upkeep_pace_syncs_census: census,
+                zpages: supdb::ZPages::Off,
                 partition_bytes: Some(256 << 10),
                 seal_max_pct: 0,
                 ..Options::default()
@@ -17536,6 +17542,8 @@ fn a_syncing_commits_burst_batches_are_paced_behind_the_thread() {
         };
         // Reads around: a scan over the store.
         check(&db, &want, "before the burst");
+        db.zgate_set(gate);
+        let paced = bp > 0 && if census { gate != 2 } else { gate == 0 };
         let before = db.upkeep_counts();
         let share = keys as u64 * bp as u64 / 10_000;
         let mut x = 0x2545_F491_4F6C_DD1Du64;
@@ -17549,7 +17557,7 @@ fn a_syncing_commits_burst_batches_are_paced_behind_the_thread() {
                 want.insert(k, format!("b{round}"));
             }
             db.commit().unwrap();
-            if bp > 0 {
+            if paced {
                 let behind = db.upkeep_behind_writes();
                 assert!(
                     behind <= share.max(1000),
@@ -17559,22 +17567,29 @@ fn a_syncing_commits_burst_batches_are_paced_behind_the_thread() {
         }
         let after = db.upkeep_counts();
         let (passes, holds) = (after[0] - before[0], after[4] - before[4]);
+        db.zgate_set(0);
         db.settle().unwrap();
         check(&db, &want, "after the burst");
         let h = db.reader().unwrap();
         check(&h, &want, "through a handle after the burst");
         (passes, holds)
     };
-    let (passes, holds) = run("paced-sync-burst", 1000);
-    assert!(
-        passes >= 1,
-        "the thread filed the lent batches: {passes} passes"
-    );
-    assert_eq!(holds, 8, "every commit of the burst held for the thread");
-    let (passes, holds) = run("unpaced-sync-burst", 0);
-    assert!(
-        passes >= 1,
-        "the thread filed the lent batches: {passes} passes"
-    );
-    assert_eq!(holds, 0, "lent unpaced: no commit held");
+    for (name, bp, gate, census, want_holds) in [
+        ("paced-sync-burst", 1000, 0u8, true, 8u64),
+        ("paced-sync-burst-census", 1000, 1, true, 8),
+        ("paced-sync-burst-compact", 1000, 2, true, 0),
+        ("paced-sync-burst-raw-only", 1000, 0, false, 8),
+        ("paced-sync-burst-census-raw-only", 1000, 1, false, 0),
+        ("unpaced-sync-burst", 0, 0, true, 0),
+    ] {
+        let (passes, holds) = run(name, bp, gate, census);
+        assert!(
+            passes >= 1,
+            "{name}: the thread filed the lent batches: {passes} passes"
+        );
+        assert_eq!(
+            holds, want_holds,
+            "{name}: gate {gate}, census {census}: the commits that held for the thread"
+        );
+    }
 }
