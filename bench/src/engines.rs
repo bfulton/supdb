@@ -814,6 +814,16 @@ pub struct Supdb {
     /// The syncing pace stopped at any gate but the raw form's, the shape
     /// before `Options::upkeep_pace_syncs_census`. `supdb-pacesyncsraw`.
     pacesyncsraw: bool,
+    /// The syncing pace at five basis points of the store's keys where
+    /// `Options::upkeep_pace_syncs_bp` ships 25. `supdb-pacesyncs5`.
+    pacesyncs5: bool,
+    /// The mechanisms for a store out of core read it so where the compact
+    /// form is installed alone (`Options::out_of_core_installed`).
+    /// `supdb-oocz`.
+    oocz: bool,
+    /// The upkeep thread's fill run whatever the writer has posted, the
+    /// shape before `Options::upkeep_fill_skips_posted`. `supdb-fillposted`.
+    fillposted: bool,
     /// A direct run's record stream kept whole in the arena, the shape
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
@@ -1769,6 +1779,16 @@ struct Policy {
     /// The syncing pace stopped at any gate but the raw form's, the shape
     /// before `Options::upkeep_pace_syncs_census`. `supdb-pacesyncsraw`.
     pacesyncsraw: bool,
+    /// The syncing pace at five basis points of the store's keys where
+    /// `Options::upkeep_pace_syncs_bp` ships 25. `supdb-pacesyncs5`.
+    pacesyncs5: bool,
+    /// The mechanisms for a store out of core read it so where the compact
+    /// form is installed alone (`Options::out_of_core_installed`).
+    /// `supdb-oocz`.
+    oocz: bool,
+    /// The upkeep thread's fill run whatever the writer has posted, the
+    /// shape before `Options::upkeep_fill_skips_posted`. `supdb-fillposted`.
+    fillposted: bool,
     /// A direct run's record stream kept whole in the arena, the shape
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
@@ -2288,6 +2308,9 @@ impl Default for Policy {
             settlespan: false,
             nopacesyncs: false,
             pacesyncsraw: false,
+            pacesyncs5: false,
+            oocz: false,
+            fillposted: false,
             norecycle: false,
             heapblocks: false,
             keysarena: false,
@@ -5812,6 +5835,42 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose upkeep thread fills whatever the writer has posted
+    /// (`Options::upkeep_fill_skips_posted` off).
+    pub fn create_fillposted(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                fillposted: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose mechanisms for a store out of core read it so where the
+    /// compact form is installed (`Options::out_of_core_installed` on).
+    pub fn create_oocz(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                oocz: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose syncing pace holds the upkeep thread within five basis
+    /// points of the store's keys (`Options::upkeep_pace_syncs_bp` at 5).
+    pub fn create_pacesyncs5(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                pacesyncs5: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` whose syncing pace stops at any gate but the raw form's
     /// (`Options::upkeep_pace_syncs_census` off).
     pub fn create_pacesyncsraw(path: &Path) -> Res<Supdb> {
@@ -7368,6 +7427,9 @@ impl Supdb {
             settlespan,
             nopacesyncs,
             pacesyncsraw,
+            pacesyncs5,
+            oocz,
+            fillposted,
             norecycle,
             heapblocks,
             keysarena,
@@ -7746,10 +7808,14 @@ impl Supdb {
             settle_covered_samples: !settlespan,
             upkeep_pace_syncs_bp: if nopacesyncs {
                 0
+            } else if pacesyncs5 {
+                5
             } else {
                 supdb::Options::default().upkeep_pace_syncs_bp
             },
             upkeep_pace_syncs_census: !pacesyncsraw,
+            out_of_core_installed: oocz,
+            upkeep_fill_skips_posted: !fillposted,
             prefault: populate,
             direct_put_one: !recordsteps,
             direct_stream: !copyvals && !refvals,
@@ -8066,6 +8132,9 @@ impl Supdb {
             settlespan,
             nopacesyncs,
             pacesyncsraw,
+            pacesyncs5,
+            oocz,
+            fillposted,
             norecycle,
             heapblocks,
             keysarena,
@@ -9154,6 +9223,15 @@ impl Engine for Supdb {
         if self.pacesyncsraw {
             return "supdb-pacesyncsraw";
         }
+        if self.pacesyncs5 {
+            return "supdb-pacesyncs5";
+        }
+        if self.fillposted {
+            return "supdb-fillposted";
+        }
+        if self.oocz {
+            return "supdb-oocz";
+        }
         if self.norecycle {
             return if self.partition {
                 "supdb-norecycle"
@@ -9534,6 +9612,7 @@ impl Engine for Supdb {
             ("fill_walked", db.pass_steps().1 as f64),
             ("fill_passes", db.pass_steps().2 as f64),
             ("fill_cuts", db.pass_steps().3 as f64),
+            ("fill_deferred", db.fill_deferred() as f64),
             ("ahead_skip_cold", db.ahead_cold() as f64),
             ("forms_cloned", db.forms_cloned() as f64),
             ("forms_trims", db.forms_trims() as f64),
@@ -10602,6 +10681,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-settlespan"
         | "supdb-nopacesyncs"
         | "supdb-pacesyncsraw"
+        | "supdb-pacesyncs5"
+        | "supdb-oocz"
+        | "supdb-fillposted"
         | "supdb-norecycle"
         | "supdb-heapblocks"
         | "supdb-keysarena"
@@ -11426,6 +11508,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-settlespan" => supdb_arm(Supdb::create_settlespan, dir)?,
         "supdb-nopacesyncs" => supdb_arm(Supdb::create_nopacesyncs, dir)?,
         "supdb-pacesyncsraw" => supdb_arm(Supdb::create_pacesyncsraw, dir)?,
+        "supdb-pacesyncs5" => supdb_arm(Supdb::create_pacesyncs5, dir)?,
+        "supdb-oocz" => supdb_arm(Supdb::create_oocz, dir)?,
+        "supdb-fillposted" => supdb_arm(Supdb::create_fillposted, dir)?,
         "supdb-ingestlatesync" => supdb_arm(Supdb::create_ingest_latesync, dir)?,
         "supdb-norecycle" => supdb_arm(Supdb::create_norecycle, dir)?,
         "supdb-ingestnorecycle" => supdb_arm(Supdb::create_ingest_norecycle, dir)?,
@@ -13050,6 +13135,27 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.upkeep_pace_syncs_census && b.upkeep_pace_syncs_census);
+            }
+            {
+                let z = Supdb::create_pacesyncs5(&dir("pacesyncs5")).unwrap();
+                assert_eq!(z.name(), "supdb-pacesyncs5");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.upkeep_pace_syncs_bp == 5 && b.upkeep_pace_syncs_bp == 25);
+            }
+            {
+                let z = Supdb::create_oocz(&dir("oocz")).unwrap();
+                assert_eq!(z.name(), "supdb-oocz");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.out_of_core_installed && !b.out_of_core_installed);
+            }
+            {
+                let z = Supdb::create_fillposted(&dir("fillposted")).unwrap();
+                assert_eq!(z.name(), "supdb-fillposted");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.upkeep_fill_skips_posted && b.upkeep_fill_skips_posted);
             }
             {
                 let z = Supdb::create_sweepwalks(&dir("sweepwalks")).unwrap();

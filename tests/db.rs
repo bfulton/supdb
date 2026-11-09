@@ -1261,6 +1261,113 @@ fn a_fill_the_writer_wants_its_upkeep_back_from_stops_at_its_next_block() {
     );
 }
 
+/// The upkeep thread's fill is left for a later pass while the writer has
+/// posted a newer commit (`Options::upkeep_fill_skips_posted`): a burst
+/// over every block is lent and the thread's pass holds inside, a second
+/// burst is posted behind it, and the held pass, released, settles the
+/// first burst and leaves its fill (`Db::fill_deferred`); the pass after,
+/// caught up with nothing posted, fills the store, every block walked. The
+/// scans read every key as the second burst wrote it, through the writer
+/// and through a handle. Without the option the held pass fills with the
+/// second burst waiting and defers nothing. The syncing pace is off here,
+/// so that the second commit posts and returns where the paced one would
+/// wait for the held thread.
+#[test]
+fn a_fill_with_a_newer_commit_posted_is_left_for_the_pass_caught_up() {
+    const KEYS: u32 = 300_000;
+    let run = |name: &str, skips: bool| {
+        let d = dir(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                upkeep: supdb::Upkeep::Background(1),
+                upkeep_fill_skips_posted: skips,
+                upkeep_pace_syncs_bp: 0,
+                scan_cache_ahead: false,
+                partition_bytes: Some(256 << 10),
+                seal_max_pct: 0,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        let mut want: HashMap<u32, &str> = HashMap::new();
+        for k in 0..KEYS {
+            db.append(&key(k), b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        assert!(db.levels().0 > 0, "partitions for the forms to hang on");
+        let check = |db: &Reader, want: &HashMap<u32, &str>, when: &str| {
+            let mut seen = 0u32;
+            db.scan(
+                &key(0),
+                KEYS as usize,
+                kv(&mut |k, v| {
+                    let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                    let expect = want.get(&kn).copied().unwrap_or("0");
+                    assert_eq!(std::str::from_utf8(v).unwrap(), expect, "key {kn} {when}");
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, KEYS, "every key {when}");
+        };
+        let mut n = 0usize;
+        db.scan(&key(0), 8, kv(&mut |_, _| n += 1)).unwrap();
+        assert_eq!(n, 8);
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut burst = |db: &mut Db, want: &mut HashMap<u32, &str>, v: &'static str| {
+            for _ in 0..100_000 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % KEYS as u64) as u32;
+                db.put(&key(k), v.as_bytes());
+                want.insert(k, v);
+            }
+            db.commit().unwrap();
+        };
+        db.hold_upkeep_pinned(true);
+        burst(&mut db, &mut want, "b");
+        let t = std::time::Instant::now();
+        while !db.upkeep_holding() {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(20),
+                "the pass began"
+            );
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+        // The second burst posted behind the held pass.
+        burst(&mut db, &mut want, "c");
+        db.hold_upkeep_pinned(false);
+        // The thread's passes run out with no reader asking: the fill of
+        // the pass caught up walks the store.
+        let blocks = u64::from(KEYS / 64);
+        let t = std::time::Instant::now();
+        while db.pass_steps().1 < blocks {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(60),
+                "a fill walked the store: {:?}",
+                db.pass_steps()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let deferred = db.fill_deferred();
+        check(&db, &want, "after the bursts");
+        let h = db.reader().unwrap();
+        check(&h, &want, "through a handle after the bursts");
+        deferred
+    };
+    let deferred_on = run("fill-skip-on", true);
+    let deferred_off = run("fill-skip-off", false);
+    assert!(
+        deferred_on >= 1,
+        "the held pass left its fill with a newer commit posted: {deferred_on}"
+    );
+    assert_eq!(deferred_off, 0, "without the option no fill is left");
+}
+
 /// The probe merge stays behind `cursor_merge` as the comparison arm -- and
 /// a path only one arm exercises is a path nothing tests.
 #[test]

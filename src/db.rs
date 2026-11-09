@@ -2962,8 +2962,11 @@ pub struct Options {
     /// RocksDB's in every point (`docs/engine.md`). Out of core a resolve
     /// is a major fault, and paced at ten million keys under 1.25 GiB the
     /// bursts ran at 0.29-0.86x, the writer held to the thread's faults, so
-    /// the share applies in core alone. Zero lends unpaced, the shape
-    /// before: `supdb-nopacesyncs`.
+    /// the share applies in core alone. At a twentieth of a percent the
+    /// passes after the bursts at three million keys read 1.09-1.75x and the
+    /// bursts 0.75-0.88x, the full rewrite's under RocksDB's, since every
+    /// batch was then a pass of the thread's (`supdb-pacesyncs5`). Zero
+    /// lends unpaced, the shape before: `supdb-nopacesyncs`.
     #[doc(hidden)]
     pub upkeep_pace_syncs_bp: usize,
     /// "In core" for `upkeep_pace_syncs_bp` is every gate but the compact
@@ -2980,6 +2983,25 @@ pub struct Options {
     /// form's, the shape before: `supdb-pacesyncsraw`.
     #[doc(hidden)]
     pub upkeep_pace_syncs_census: bool,
+    /// EXPERIMENT: the head asks that are for a store out of core -- the
+    /// settle's ahead of its resolves (`heads_willneed`) and the bounds'
+    /// ahead of their walk (`bounds_heads_willneed`) -- made where the
+    /// compact form is installed (`zselect::GATE_Z`), the controller's
+    /// verdict, and not wherever the gate has left the raw form: the lag
+    /// sweep's store at three million keys under 1.25 GiB sits at the census
+    /// from its load on, and asked for the heads of a resolve 580,000-690,000
+    /// times in its sweep with 1,500 of them submitted, a `mincore` each, five
+    /// percent of the upkeep thread over the full rewrite's burst. The asks
+    /// for a block's pieces and records, the seal's floor, the builder
+    /// ahead's stop and the chain through writes read the census as out of
+    /// core still: there the store refaults under its bound, and keyed on
+    /// the form installed with the head asks the row at that rung read A
+    /// 0.63x and the scan pass 0.82x, with the record asks alone E 0.95x.
+    /// The head asks alone read F 1.13-1.22x and A 1.03-1.20x in three
+    /// sittings of the row's order there, and E 0.86-0.98x: unresolved, so
+    /// it is off, and `supdb-oocz` is the arm with it on.
+    #[doc(hidden)]
+    pub out_of_core_installed: bool,
     /// A buffered commit near reads whose batch is under
     /// `upkeep_inline_min` settles it here when a scan ran since the last
     /// commit, and lends the rest -- the forms the scans will walk, built
@@ -3279,6 +3301,25 @@ pub struct Options {
     /// blocks they mostly never read (`docs/engine.md`). `supdb-fillholds`
     /// and `supdb-ingestfillholds` are the arms that wait.
     pub upkeep_fill_yields: bool,
+    /// The upkeep thread's fill (`Reader::complete_forms`) left for a later
+    /// pass while the writer has posted a newer commit: the fill walks every
+    /// block of every partition at every pass a table is incomplete, 25 ns a
+    /// block, a millisecond a pass at three million keys, and a burst's
+    /// passes come a few batches apart -- the thread's fill walk was 1.3 s
+    /// of its 7.1 s over the lag sweep's full rewrite there, its holds of the
+    /// syncing writer 2.4-2.6 s of the burst's 9.3, and the first scan after
+    /// the one-percent burst waited 1.4-8 ms for the pass in flight and
+    /// settled up to 4 more. Left while a commit is posted, the burst held
+    /// the writer for nothing, the first scan waited 0.2-0.8 ms and settled
+    /// nothing, and in the row's order at that rung under 1.25 GiB the
+    /// one-percent pass read 1.12-1.84x in three sittings, its burst
+    /// 1.16-1.63x, A and F 1.05-1.22x, the two-thread scan beside the mixes
+    /// 0.85-0.99x and E either way; at ten million keys the lag sweep's
+    /// forms are off and the fill never runs, and the mixes read level or
+    /// better (`docs/engine.md`). The pass caught up, with nothing posted,
+    /// fills as before. Off, the shape before: `supdb-fillposted`.
+    #[doc(hidden)]
+    pub upkeep_fill_skips_posted: bool,
     /// Whether the engine's large blocks -- a memtable's arena blocks,
     /// its entry slabs and its hash index, a scan snapshot's arena
     /// blocks -- are mapped from the kernel, from `blocks::MAP_FROM`
@@ -4698,6 +4739,7 @@ impl Default for Options {
             upkeep_pace_pct: 1,
             upkeep_pace_syncs_bp: 25,
             upkeep_pace_syncs_census: true,
+            out_of_core_installed: false,
             upkeep_settle_after_scans: true,
             scan_timers: false,
             upkeep_batch_pct: 0,
@@ -4720,6 +4762,7 @@ impl Default for Options {
             upkeep_files_bursts: true,
             upkeep_yields: false,
             upkeep_fill_yields: true,
+            upkeep_fill_skips_posted: true,
             blocks_mapped: true,
             forms_convert_yield: true,
             forms_convert_behind: usize::MAX,
@@ -5725,6 +5768,18 @@ impl ZFinish {
                 .z_finish_live
                 .fetch_sub(1, AtomicOrdering::AcqRel);
         }
+    }
+}
+
+/// Whether the store reads as out of core for the mechanisms that are for
+/// one: the compact form installed (`zselect::GATE_Z`), the controller's
+/// verdict, under `Options::out_of_core_installed`; the gate anywhere past
+/// the raw form, its census among them, without it.
+fn out_of_core(opts: &Options, gate: u8) -> bool {
+    if opts.out_of_core_installed {
+        gate == zselect::GATE_Z
+    } else {
+        gate != zselect::GATE_RAW
     }
 }
 
@@ -15482,6 +15537,9 @@ struct Shared {
     fill_passes: AtomicU64,
     /// Fills that stopped at a block for the writer (`Options::upkeep_fill_yields`).
     fill_cuts: AtomicU64,
+    /// Fills the upkeep thread left for a later pass because the writer
+    /// had posted a newer commit (`Options::upkeep_fill_skips_posted`).
+    fill_deferred: AtomicU64,
     /// Partitions the builder ahead left to the scans for the page cache
     /// holding too few of their pages (`Options::ahead_resident_pct`).
     ahead_cold: AtomicU64,
@@ -22319,6 +22377,14 @@ impl Reader {
     /// (`Options::upkeep_fill_yields`): asked at the fill's blocks, so that
     /// the writer waits for a block's build and not for the fill. Off the
     /// thread, never.
+    /// Whether the upkeep thread's fill is left for a later pass: the
+    /// writer has posted a newer commit (`Options::upkeep_fill_skips_posted`).
+    fn fill_deferred(&self) -> bool {
+        self.understudy
+            && self.opts.upkeep_fill_skips_posted
+            && self.shared.upkeep.state.load(AtomicOrdering::Acquire) & LEND_POSTED != 0
+    }
+
     fn fill_wanted(&self) -> bool {
         self.understudy
             && self.opts.upkeep_fill_yields
@@ -24395,12 +24461,24 @@ impl Reader {
             build_ns: 0,
             walked: 0,
         };
+        if self.fill_deferred() {
+            self.shared
+                .fill_deferred
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            return Ok(false);
+        }
         let np = self.segs().partition_point(|s| s.level > 0);
         let l0 = &self.segs()[np..];
         let ctx = self.build_ctx();
         ctx.rank_pieces()?;
         for pi in 0..np {
             if self.abandon_asked() {
+                return Ok(false);
+            }
+            if self.fill_deferred() {
+                self.shared
+                    .fill_deferred
+                    .fetch_add(1, AtomicOrdering::Relaxed);
                 return Ok(false);
             }
             if self.upkeep_wanted() {
@@ -25009,7 +25087,7 @@ impl Reader {
         // second of the full rewrite's settles.
         let page = crate::bytes::os_page_size();
         let asking =
-            self.opts.heads_willneed && self.shared.zgate.load() != zselect::GATE_RAW && np > 0;
+            self.opts.heads_willneed && out_of_core(&self.opts, self.shared.zgate.load()) && np > 0;
         // Per partition: the rank the asks have reached, the page of the
         // last resolve and whether the batch reads dense there; then the
         // sparse cursor's position in the batch and its partition.
@@ -28345,6 +28423,7 @@ impl Db {
             fill_walked: AtomicU64::new(0),
             fill_passes: AtomicU64::new(0),
             fill_cuts: AtomicU64::new(0),
+            fill_deferred: AtomicU64::new(0),
             ahead_cold: AtomicU64::new(0),
             ord_rebuilt: AtomicU64::new(0),
             z: zfile::ZEvents::default(),
@@ -28903,6 +28982,7 @@ impl Db {
             fill_walked: AtomicU64::new(0),
             fill_passes: AtomicU64::new(0),
             fill_cuts: AtomicU64::new(0),
+            fill_deferred: AtomicU64::new(0),
             ahead_cold: AtomicU64::new(0),
             ord_rebuilt: AtomicU64::new(ord_rebuilt),
             z: zev,
@@ -34865,10 +34945,6 @@ impl Db {
         self.shared.maint_cpu_ns.load(AtomicOrdering::Relaxed) / 1000
     }
 
-    /// The maintenance pass's steps, microseconds over the store's life
-    /// -- the log read and settle; the snapshot's and runs' refresh with
-    /// the builds ahead installed and the settled blocks built; the
-    /// complete-table fill's walk over the blocks; and that fill's builds
     /// Partitions the builder ahead left to the scans for the page cache
     /// holding too few of their pages (`Options::ahead_resident_pct`), over
     /// the store's life.
@@ -34877,6 +34953,17 @@ impl Db {
         self.shared.ahead_cold.load(AtomicOrdering::Relaxed)
     }
 
+    /// Fills the upkeep thread left for a later pass because the writer had
+    /// posted a newer commit (`Options::upkeep_fill_skips_posted`).
+    #[doc(hidden)]
+    pub fn fill_deferred(&self) -> u64 {
+        self.shared.fill_deferred.load(AtomicOrdering::Relaxed)
+    }
+
+    /// The maintenance pass's steps, microseconds over the store's life
+    /// -- the log read and settle; the snapshot's and runs' refresh with
+    /// the builds ahead installed and the settled blocks built; the
+    /// complete-table fill's walk over the blocks; and that fill's builds
     /// -- then the blocks the fill walked, the passes stamped and the fills
     /// that stopped at a block for the writer (`Options::upkeep_fill_yields`).
     /// Atomics only: a read takes nothing back from the thread.
@@ -35489,7 +35576,7 @@ impl<'s> BuildCtx<'s> {
                 Some(at) => at,
                 None => {
                     if self.rd.opts.bounds_heads_willneed
-                        && self.rd.shared.zgate.load() != zselect::GATE_RAW
+                        && out_of_core(&self.rd.opts, self.rd.shared.zgate.load())
                     {
                         ask_bounds_heads(&self.rd.shared, seg, p);
                     }
@@ -38948,8 +39035,8 @@ impl Maint {
                 rank_pieces_of(segs, self.opts.piece_ranks_by_heads)?;
             }
             let ask = (self.opts.bounds_heads_willneed
-                && self.shared.zgate.load() != zselect::GATE_RAW)
-                .then_some(&*self.shared);
+                && out_of_core(&self.opts, self.shared.zgate.load()))
+            .then_some(&*self.shared);
             bound_pieces_of(segs, ask)?;
         }
         Ok(())
