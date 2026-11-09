@@ -3761,6 +3761,11 @@ pub(super) struct ZEvents {
     /// that asked, and the files.
     pub rewarms: AtomicU64,
     pub rewarm_files: AtomicU64,
+    /// The rewarms that trimmed the allocator first
+    /// (`Options::zpages_rewarm_trims`), and the resident free bytes the
+    /// trims gave back.
+    pub rewarm_trims: AtomicU64,
+    pub rewarm_trim_bytes: AtomicU64,
     /// Re-codes made by exchanging the served form file with the kept one.
     pub recode_flips: AtomicU64,
     /// Spares built and kept (`Options::zpages_both`), and spares that kept

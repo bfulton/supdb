@@ -797,6 +797,9 @@ pub struct Supdb {
     /// No cold form file asked for where scans come back after a stretch
     /// without one (`Options::zpages_rewarm_scans` off). `supdb-norewarm`.
     norewarm: bool,
+    /// The rewarm trimming the allocator before it asks for the cold form
+    /// files (`Options::zpages_rewarm_trims`). `supdb-rewarmtrim`.
+    rewarmtrim: bool,
     /// A covered partition's settle filing a key by the form's span alone,
     /// the shape before the ordered index's samples
     /// (`Options::settle_covered_samples` off). `supdb-settlespan`.
@@ -1745,6 +1748,9 @@ struct Policy {
     /// No cold form file asked for where scans come back after a stretch
     /// without one (`Options::zpages_rewarm_scans` off). `supdb-norewarm`.
     norewarm: bool,
+    /// The rewarm trimming the allocator before it asks for the cold form
+    /// files (`Options::zpages_rewarm_trims`). `supdb-rewarmtrim`.
+    rewarmtrim: bool,
     /// A covered partition's settle filing a key by the form's span alone,
     /// the shape before the ordered index's samples
     /// (`Options::settle_covered_samples` off). `supdb-settlespan`.
@@ -2269,6 +2275,7 @@ impl Default for Policy {
             mergesync1m: false,
             zbacknow: false,
             norewarm: false,
+            rewarmtrim: false,
             settlespan: false,
             nopacesyncs: false,
             pacesyncsraw: false,
@@ -5760,6 +5767,18 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose rewarm trims the allocator before it asks for the cold
+    /// form files (`Options::zpages_rewarm_trims`).
+    pub fn create_rewarmtrim(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                rewarmtrim: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` whose syncing commits' burst batches are lent unpaced
     /// (`Options::upkeep_pace_syncs_bp` at zero).
     pub fn create_nopacesyncs(path: &Path) -> Res<Supdb> {
@@ -7323,6 +7342,7 @@ impl Supdb {
             mergesync1m,
             zbacknow,
             norewarm,
+            rewarmtrim,
             settlespan,
             nopacesyncs,
             pacesyncsraw,
@@ -7699,6 +7719,7 @@ impl Supdb {
             merge_sync_ahead: if mergesync1m { 1 << 20 } else { 0 },
             zpages_hot_back_ask: !zbacknow,
             zpages_rewarm_scans: !norewarm,
+            zpages_rewarm_trims: rewarmtrim,
             settle_covered_samples: !settlespan,
             upkeep_pace_syncs_bp: if nopacesyncs {
                 0
@@ -8017,6 +8038,7 @@ impl Supdb {
             mergesync1m,
             zbacknow,
             norewarm,
+            rewarmtrim,
             settlespan,
             nopacesyncs,
             pacesyncsraw,
@@ -9093,6 +9115,9 @@ impl Engine for Supdb {
         if self.norewarm {
             return "supdb-norewarm";
         }
+        if self.rewarmtrim {
+            return "supdb-rewarmtrim";
+        }
         if self.settlespan {
             return "supdb-settlespan";
         }
@@ -9656,6 +9681,8 @@ impl Engine for Supdb {
             ("zpage_hot_back_asks", z.hot_back_asks as f64),
             ("zpage_rewarms", z.rewarms as f64),
             ("zpage_rewarm_files", z.rewarm_files as f64),
+            ("zpage_rewarm_trims", z.rewarm_trims as f64),
+            ("zpage_rewarm_trim_bytes", z.rewarm_trim_bytes as f64),
             ("zpage_spare_files", z.spare_files as f64),
             ("zpage_spare_builds", z.spare_builds as f64),
             ("zpage_spare_failed", z.spare_failed as f64),
@@ -10538,6 +10565,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-mergesync1m"
         | "supdb-zbacknow"
         | "supdb-norewarm"
+        | "supdb-rewarmtrim"
         | "supdb-settlespan"
         | "supdb-nopacesyncs"
         | "supdb-pacesyncsraw"
@@ -11360,6 +11388,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-mergesync1m" => supdb_arm(Supdb::create_mergesync1m, dir)?,
         "supdb-zbacknow" => supdb_arm(Supdb::create_zbacknow, dir)?,
         "supdb-norewarm" => supdb_arm(Supdb::create_norewarm, dir)?,
+        "supdb-rewarmtrim" => supdb_arm(Supdb::create_rewarmtrim, dir)?,
         "supdb-settlespan" => supdb_arm(Supdb::create_settlespan, dir)?,
         "supdb-nopacesyncs" => supdb_arm(Supdb::create_nopacesyncs, dir)?,
         "supdb-pacesyncsraw" => supdb_arm(Supdb::create_pacesyncsraw, dir)?,
@@ -12952,6 +12981,13 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.zpages_rewarm_scans && b.zpages_rewarm_scans);
+            }
+            {
+                let z = Supdb::create_rewarmtrim(&dir("rewarmtrim")).unwrap();
+                assert_eq!(z.name(), "supdb-rewarmtrim");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_rewarm_trims && !b.zpages_rewarm_trims);
             }
             {
                 let z = Supdb::create_settlespan(&dir("settlespan")).unwrap();

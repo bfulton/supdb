@@ -727,6 +727,11 @@ pub struct ZCounts {
     /// that asked, and the files.
     pub rewarms: u64,
     pub rewarm_files: u64,
+    /// The rewarms that trimmed the allocator first
+    /// (`Options::zpages_rewarm_trims`), and the resident free bytes the
+    /// trims gave back.
+    pub rewarm_trims: u64,
+    pub rewarm_trim_bytes: u64,
     /// Block-coded partitions re-parsed while served
     /// (`Options::zpages_reparse`).
     pub reparses: u64,
@@ -4423,6 +4428,24 @@ pub struct Options {
     /// mixes found no form file cold (`docs/engine.md`). On;
     /// `supdb-norewarm` asks for nothing.
     pub zpages_rewarm_scans: bool,
+    /// EXPERIMENT: the rewarm gives the allocator's free pages back to the
+    /// system (`malloc_trim`) before it asks for the cold form files, so
+    /// the pages it brings in have the room the process's resident free
+    /// chunks held: after the lag sweep's full rewrite at ten million keys
+    /// under 1.25 GiB the process held 431-445 MB of anonymous memory with
+    /// 152 in use, beside 945 MB of form files in a cache of about 800, and
+    /// that pass took 0.45-0.98 major faults an operation where the arm
+    /// with no block cache took 0-0.14. A trim returned 79-170 MB at each
+    /// rewarm, and paired at ten million keys under 1.25 GiB in two
+    /// sittings the full rewrite's pass read 1.29x and 1.12x with a third
+    /// of the faults -- and the ten-percent pass 0.80x and 0.73x, under
+    /// RocksDB's where the default is level with it, and the bursts level
+    /// and 0.84-0.88x: the rewarm after the load trims the free chunks the
+    /// bursts after it would have taken again, and every page they touch
+    /// is a fresh one the host prices (`docs/engine.md`). On the rewarm's
+    /// own thread; an arena's lock is held while its pages go. Off;
+    /// `supdb-rewarmtrim` trims.
+    pub zpages_rewarm_trims: bool,
 }
 
 impl Options {
@@ -4722,6 +4745,7 @@ impl Default for Options {
             zpages_hot_cold_back: false,
             zpages_hot_back_ask: true,
             zpages_rewarm_scans: true,
+            zpages_rewarm_trims: false,
         }
     }
 }
@@ -20099,6 +20123,8 @@ impl Reader {
             hot_back_waited: get(&ev.hot_back_waited),
             rewarms: get(&ev.rewarms),
             rewarm_files: get(&ev.rewarm_files),
+            rewarm_trims: get(&ev.rewarm_trims),
+            rewarm_trim_bytes: get(&ev.rewarm_trim_bytes),
             reparses: get(&ev.reparses),
             recode_flips: get(&ev.recode_flips),
             spare_builds: get(&ev.spare_builds),
@@ -40899,9 +40925,35 @@ impl Maint {
         }
         zfile::ZEvents::add(&self.shared.z.rewarms, 1);
         zfile::ZEvents::add(&self.shared.z.rewarm_files, paths.len() as u64);
+        let (trims, shared, trace) = (
+            self.opts.zpages_rewarm_trims,
+            self.shared.clone(),
+            self.z_trace,
+        );
         self.z_rewarm = std::thread::Builder::new()
             .name("supdb-zrewarm".into())
             .spawn(move || {
+                // The allocator's free pages back first, so the pages
+                // asked for below have the room they held
+                // (`Options::zpages_rewarm_trims`).
+                if trims {
+                    let before = heap::resident_beyond_use();
+                    heap::trim();
+                    let after = heap::resident_beyond_use();
+                    let gave = match (before, after) {
+                        (Some(b), Some(a)) => b.saturating_sub(a),
+                        _ => 0,
+                    };
+                    zfile::ZEvents::add(&shared.z.rewarm_trims, 1);
+                    zfile::ZEvents::add(&shared.z.rewarm_trim_bytes, gave as u64);
+                    if trace {
+                        eprintln!(
+                            "zrewarm trim before_mb {:.1} after_mb {:.1}",
+                            before.unwrap_or(0) as f64 / 1e6,
+                            after.unwrap_or(0) as f64 / 1e6
+                        );
+                    }
+                }
                 for p in paths {
                     if let Ok(map) = MmapBytes::open(&p) {
                         let _ = crate::bytes::Bytes::advise_willneed(&map, 0, map.0.len());

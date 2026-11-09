@@ -9925,19 +9925,22 @@ fn the_controller_serves_the_hottest_partition_raw_within_the_budget() {
 /// before it asks for nothing again. Without the option nothing is asked
 /// and the files stay out. The scan that brings the look is of one entry,
 /// so that the scan's own faults are not what brings the files back, and
-/// the writer's, since a handle counts its scans once a commit.
+/// the writer's, since a handle counts its scans once a commit. With
+/// `Options::zpages_rewarm_trims` the rewarm trims the allocator before it
+/// asks, once a rewarm, and without it asks with no trim.
 #[cfg(target_os = "linux")]
 #[test]
 fn scans_after_a_quiet_stretch_have_the_cold_form_files_asked_for() {
-    for on in [true, false] {
-        let what = format!("rewarm {on}");
+    for (on, trims) in [(true, true), (true, false), (false, true)] {
+        let what = format!("rewarm {on} trims {trims}");
         let (dir, db, model, inject) = auto_store_with(
-            &format!("auto-rewarm-{on}"),
+            &format!("auto-rewarm-{on}-{trims}"),
             1 << 20,
             1_000_000.0,
             FAULT_1MS,
             |o| {
                 o.zpages_rewarm_scans = on;
+                o.zpages_rewarm_trims = trims;
                 o.zpages_hot_raw = false;
                 o.zpages_memo = false;
                 o.partition_bytes = Some(400 << 10);
@@ -10002,6 +10005,14 @@ fn scans_after_a_quiet_stretch_have_the_cold_form_files_asked_for() {
                 warm * 10 >= size * 9,
                 "{what}: the form files back in the cache: {warm} of {size}"
             );
+            // The trim runs on the rewarm's thread before its asks, so the
+            // files back in the cache are past it.
+            assert_eq!(
+                db.zpage_counts().rewarm_trims,
+                u64::from(trims),
+                "{what}: the trim before the asks: {:?}",
+                db.zpage_counts()
+            );
         } else {
             assert!(
                 warm * 2 < size,
@@ -10028,6 +10039,12 @@ fn scans_after_a_quiet_stretch_have_the_cold_form_files_asked_for() {
             db.zpage_counts().rewarms,
             u64::from(on),
             "{what}: no rewarm without the quiet: {:?}",
+            db.zpage_counts()
+        );
+        assert_eq!(
+            db.zpage_counts().rewarm_trims,
+            u64::from(on && trims),
+            "{what}: a trim a rewarm: {:?}",
             db.zpage_counts()
         );
         check(&r, &model, &keys, &format!("{what}: after"));
