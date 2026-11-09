@@ -800,6 +800,10 @@ pub struct Supdb {
     /// The rewarm trimming the allocator before it asks for the cold form
     /// files (`Options::zpages_rewarm_trims`). `supdb-rewarmtrim`.
     rewarmtrim: bool,
+    /// The writer's block forms kept out of core whatever its scans meet,
+    /// the shape before `Options::scan_forms_off_unreused`.
+    /// `supdb-formson`.
+    formson: bool,
     /// A covered partition's settle filing a key by the form's span alone,
     /// the shape before the ordered index's samples
     /// (`Options::settle_covered_samples` off). `supdb-settlespan`.
@@ -1751,6 +1755,10 @@ struct Policy {
     /// The rewarm trimming the allocator before it asks for the cold form
     /// files (`Options::zpages_rewarm_trims`). `supdb-rewarmtrim`.
     rewarmtrim: bool,
+    /// The writer's block forms kept out of core whatever its scans meet,
+    /// the shape before `Options::scan_forms_off_unreused`.
+    /// `supdb-formson`.
+    formson: bool,
     /// A covered partition's settle filing a key by the form's span alone,
     /// the shape before the ordered index's samples
     /// (`Options::settle_covered_samples` off). `supdb-settlespan`.
@@ -2276,6 +2284,7 @@ impl Default for Policy {
             zbacknow: false,
             norewarm: false,
             rewarmtrim: false,
+            formson: false,
             settlespan: false,
             nopacesyncs: false,
             pacesyncsraw: false,
@@ -5779,6 +5788,18 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose writer keeps its block forms out of core whatever its
+    /// scans meet (`Options::scan_forms_off_unreused` off).
+    pub fn create_formson(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                formson: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` whose syncing commits' burst batches are lent unpaced
     /// (`Options::upkeep_pace_syncs_bp` at zero).
     pub fn create_nopacesyncs(path: &Path) -> Res<Supdb> {
@@ -7343,6 +7364,7 @@ impl Supdb {
             zbacknow,
             norewarm,
             rewarmtrim,
+            formson,
             settlespan,
             nopacesyncs,
             pacesyncsraw,
@@ -7720,6 +7742,7 @@ impl Supdb {
             zpages_hot_back_ask: !zbacknow,
             zpages_rewarm_scans: !norewarm,
             zpages_rewarm_trims: rewarmtrim,
+            scan_forms_off_unreused: !formson,
             settle_covered_samples: !settlespan,
             upkeep_pace_syncs_bp: if nopacesyncs {
                 0
@@ -8039,6 +8062,7 @@ impl Supdb {
             zbacknow,
             norewarm,
             rewarmtrim,
+            formson,
             settlespan,
             nopacesyncs,
             pacesyncsraw,
@@ -9118,6 +9142,9 @@ impl Engine for Supdb {
         if self.rewarmtrim {
             return "supdb-rewarmtrim";
         }
+        if self.formson {
+            return "supdb-formson";
+        }
         if self.settlespan {
             return "supdb-settlespan";
         }
@@ -9683,6 +9710,9 @@ impl Engine for Supdb {
             ("zpage_rewarm_files", z.rewarm_files as f64),
             ("zpage_rewarm_trims", z.rewarm_trims as f64),
             ("zpage_rewarm_trim_bytes", z.rewarm_trim_bytes as f64),
+            ("forms_off_entries", db.forms_off_counts()[0] as f64),
+            ("forms_off_exits", db.forms_off_counts()[1] as f64),
+            ("forms_off_scans", db.forms_off_counts()[2] as f64),
             ("zpage_spare_files", z.spare_files as f64),
             ("zpage_spare_builds", z.spare_builds as f64),
             ("zpage_spare_failed", z.spare_failed as f64),
@@ -10566,6 +10596,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zbacknow"
         | "supdb-norewarm"
         | "supdb-rewarmtrim"
+        | "supdb-formson"
         | "supdb-settlespan"
         | "supdb-nopacesyncs"
         | "supdb-pacesyncsraw"
@@ -11389,6 +11420,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zbacknow" => supdb_arm(Supdb::create_zbacknow, dir)?,
         "supdb-norewarm" => supdb_arm(Supdb::create_norewarm, dir)?,
         "supdb-rewarmtrim" => supdb_arm(Supdb::create_rewarmtrim, dir)?,
+        "supdb-formson" => supdb_arm(Supdb::create_formson, dir)?,
         "supdb-settlespan" => supdb_arm(Supdb::create_settlespan, dir)?,
         "supdb-nopacesyncs" => supdb_arm(Supdb::create_nopacesyncs, dir)?,
         "supdb-pacesyncsraw" => supdb_arm(Supdb::create_pacesyncsraw, dir)?,
@@ -12988,6 +13020,13 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.zpages_rewarm_trims && !b.zpages_rewarm_trims);
+            }
+            {
+                let z = Supdb::create_formson(&dir("formson")).unwrap();
+                assert_eq!(z.name(), "supdb-formson");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.scan_forms_off_unreused && b.scan_forms_off_unreused);
             }
             {
                 let z = Supdb::create_settlespan(&dir("settlespan")).unwrap();

@@ -17593,3 +17593,214 @@ fn a_syncing_commits_burst_batches_are_paced_behind_the_thread() {
         );
     }
 }
+
+/// Out of core -- the gate set to the compact form's by hand, the
+/// controller off -- a writer whose scans start in blocks no recent scan
+/// started in gives its forms up and takes the merge path
+/// (`Options::scan_forms_off_unreused`), and its commits build no form
+/// meanwhile; scans that come back to one block take the forms back, and
+/// the block path builds again; a handle the caller claims takes them back
+/// at the writer's next commit, and the writer keeps them while the handle
+/// lives; back in core they are taken back at the next scan. Every scan
+/// answers as the model through every switch, with writes committed
+/// between the scans, through the writer and through a handle.
+#[test]
+fn scans_that_meet_their_blocks_once_out_of_core_keep_no_forms() {
+    let d = dir("forms-off-unreused");
+    let mut db = Db::create(
+        &d,
+        Options {
+            scan_forms_off_unreused: true,
+            scan_forms_off_window: 32,
+            scan_forms_off_ghost_bits: 6,
+            zpages: supdb::ZPages::Off,
+            partition_bytes: Some(256 << 10),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let keys = 100_000u32;
+    let key = |k: u32| format!("key-{k:06}").into_bytes();
+    let mut want: BTreeMap<Vec<u8>, String> = BTreeMap::new();
+    for k in 0..keys {
+        db.append(&key(k), b"0");
+        want.insert(key(k), "0".into());
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    assert!(db.levels().0 > 1, "partitions for the forms to hang on");
+    let check = |r: &Reader, want: &BTreeMap<Vec<u8>, String>, start: u32, when: &str| {
+        let mut got: Vec<(Vec<u8>, String)> = Vec::new();
+        r.scan(
+            &key(start),
+            20,
+            kv(&mut |k, v| {
+                got.push((k.to_vec(), std::str::from_utf8(v).unwrap().to_string()));
+            }),
+        )
+        .unwrap();
+        let expect: Vec<(Vec<u8>, String)> = want
+            .range(key(start)..)
+            .take(20)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        assert_eq!(got, expect, "scan from {start} {when}");
+    };
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let mut round = 0u32;
+    // Half of a round's writes are updates anywhere, half new keys among
+    // the hot starts below, where the scans after a switch read them.
+    let mut write =
+        |db: &mut Db, want: &mut BTreeMap<Vec<u8>, String>, next: &mut dyn FnMut() -> u64| {
+            round += 1;
+            for i in 0..50 {
+                let k = if i % 2 == 0 {
+                    key((next() % keys as u64) as u32)
+                } else {
+                    let mut k = key(2_000 + (next() % 40) as u32);
+                    k.extend_from_slice(format!("-{round}-{i}").as_bytes());
+                    k
+                };
+                db.put(&k, format!("w{round}").as_bytes());
+                want.insert(k, format!("w{round}"));
+            }
+            db.commit().unwrap();
+        };
+    // In core first: the forms are kept.
+    for i in 0..64 {
+        check(&db, &want, (next() % keys as u64) as u32, "in core");
+        if i % 8 == 0 {
+            write(&mut db, &mut want, &mut next);
+        }
+    }
+    assert_eq!(
+        db.forms_off_counts(),
+        [0, 0, 0],
+        "in core nothing is given up"
+    );
+    // Out of core, starts uniform over 1,500 blocks in a table of 64 slots.
+    db.zgate_set(2);
+    for i in 0..256 {
+        check(
+            &db,
+            &want,
+            (next() % keys as u64) as u32,
+            "uniform out of core",
+        );
+        if i % 8 == 0 {
+            write(&mut db, &mut want, &mut next);
+        }
+    }
+    let c = db.forms_off_counts();
+    assert!(c[0] >= 1 && c[2] > 0, "the forms given up: {c:?}");
+    // While they are off, commits build nothing and the scans keep none.
+    for _ in 0..4 {
+        write(&mut db, &mut want, &mut next);
+        check(&db, &want, (next() % keys as u64) as u32, "forms off");
+    }
+    assert_eq!(db.block_cache_size().0, 0, "no form kept while off");
+    // A handle claimed: the writer's next commit takes the forms back, and
+    // neither the writer nor the handle gives them up while it lives.
+    let h = db.reader().unwrap();
+    let before = db.forms_off_counts();
+    write(&mut db, &mut want, &mut next);
+    let after = db.forms_off_counts();
+    assert_eq!(
+        after[1],
+        before[1] + 1,
+        "taken back for the handle: {after:?}"
+    );
+    for i in 0..128 {
+        check(
+            &db,
+            &want,
+            (next() % keys as u64) as u32,
+            "a handle live, the writer",
+        );
+        check(
+            &h,
+            &want,
+            (next() % keys as u64) as u32,
+            "a handle live, the handle",
+        );
+        if i % 8 == 0 {
+            write(&mut db, &mut want, &mut next);
+        }
+    }
+    assert_eq!(
+        db.forms_off_counts(),
+        after,
+        "nothing given up while it lives"
+    );
+    drop(h);
+    for i in 0..256 {
+        check(
+            &db,
+            &want,
+            (next() % keys as u64) as u32,
+            "uniform, the handle gone",
+        );
+        if i % 8 == 0 {
+            write(&mut db, &mut want, &mut next);
+        }
+    }
+    assert!(
+        db.forms_off_counts()[0] > after[0],
+        "given up again with no handle"
+    );
+    // Scans back in one block: the forms taken back, the block path again.
+    let before = db.forms_off_counts();
+    for i in 0..128 {
+        check(&db, &want, 2_000 + (next() % 30) as u32, "hot out of core");
+        if i % 8 == 0 {
+            write(&mut db, &mut want, &mut next);
+        }
+    }
+    let after = db.forms_off_counts();
+    assert!(
+        after[1] > before[1],
+        "the forms taken back: {before:?} {after:?}"
+    );
+    let merged = after[2];
+    for _ in 0..16 {
+        check(&db, &want, 2_000 + (next() % 30) as u32, "hot, forms on");
+    }
+    assert_eq!(
+        db.forms_off_counts()[2],
+        merged,
+        "the block path serves them"
+    );
+    assert!(db.block_cache_size().0 > 0, "forms built again");
+    // Off once more, then back in core: taken back at the next scan.
+    for i in 0..256 {
+        check(&db, &want, (next() % keys as u64) as u32, "uniform again");
+        if i % 8 == 0 {
+            write(&mut db, &mut want, &mut next);
+        }
+    }
+    let off = db.forms_off_counts();
+    assert!(off[0] >= 2, "given up again: {off:?}");
+    db.zgate_set(0);
+    check(&db, &want, (next() % keys as u64) as u32, "back in core");
+    let back = db.forms_off_counts();
+    assert!(back[1] > off[1], "taken back in core: {off:?} {back:?}");
+    for i in 0..32 {
+        check(&db, &want, (next() % keys as u64) as u32, "in core again");
+        if i % 8 == 0 {
+            write(&mut db, &mut want, &mut next);
+        }
+    }
+    assert_eq!(db.forms_off_counts()[2], back[2], "no scan merged in core");
+    db.settle().unwrap();
+    let h = db.reader().unwrap();
+    for start in (0..keys).step_by(997) {
+        check(&db, &want, start, "after the settle");
+        check(&h, &want, start, "through a handle after the settle");
+    }
+}

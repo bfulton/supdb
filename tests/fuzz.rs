@@ -50,6 +50,9 @@
 //! - `ZFUZZ_BOTH=1`, with `ZFUZZ_ZPAGES`: the `z` store keeps both codings
 //!   of every partition and re-codes by exchanging them
 //!   (`Options::zpages_both`).
+//! - `ZFUZZ_FORMSOFF=1`, with `ZFUZZ_ZPAGES`: the `z` store's handles give
+//!   their block forms up for the merge path and take them back every few
+//!   scans (`Options::scan_forms_off_unreused`), a flag and not a draw.
 //! - `ZFUZZ_PARSE=1`: the `z` store's block-coded groups are written by the
 //!   parsing encoder (`Options::zpages_parse`), a flag and not a draw, so
 //!   that every seed's operations are the ones it had without it.
@@ -342,6 +345,17 @@ fn opts_z(c: &Cfg) -> Options {
     // sequences, read against the raw store.
     if env_flag("ZFUZZ_PARSE") {
         o.zpages_parse = true;
+    }
+    // Under `ZFUZZ_FORMSOFF`, with the form forced so that the gate is the
+    // compact form's, the `z` store's handles give their forms up for the
+    // merge path and take them back every three scans whatever their
+    // starts (`Options::scan_forms_off_unreused`, `scan_forms_off_flip`),
+    // so every switch, with the writes, seals and landings between them,
+    // is read against the raw store. A flag and not a draw.
+    if env_flag("ZFUZZ_FORMSOFF") {
+        o.scan_forms_off_unreused = true;
+        o.scan_forms_off_window = 3;
+        o.scan_forms_off_flip = true;
     }
     // Under `ZFUZZ_FLEXDEC` they are decoded by `lz4_flex` and not the
     // engine's own decoder (`Options::zpages_own_decoder`), read against the
@@ -702,6 +716,10 @@ struct Stats {
     /// Partition merges started beside another in flight, summed as
     /// `abandons` is: what says a run under `ZFUZZ_MERGEPAR` reached them.
     beside: u64,
+    /// The `z` store's switches between the block path and the merge path
+    /// with no forms (`Options::scan_forms_off_unreused`), summed as
+    /// `abandons` is: what says a run under `ZFUZZ_FORMSOFF` switched.
+    switches: u64,
 }
 
 fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
@@ -780,6 +798,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         abandons: 0,
         bindings: 0,
         beside: 0,
+        switches: 0,
     };
     let mut fails: Vec<String> = Vec::new();
     let mut absent = absent_around(&pool, &mut rng);
@@ -960,6 +979,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                     st.abandons += z.upkeep_abandons() + r.upkeep_abandons();
                     st.bindings += z.cache_bindings() + r.cache_bindings();
                     st.beside += z.seal_waits().merges_beside + r.seal_waits().merges_beside;
+                    st.switches += z.forms_off_counts()[..2].iter().sum::<u64>();
                     let clean = rng.chance(50) || !matches!(cfg.sync, SyncPolicy::Always);
                     if clean {
                         for op in staged.drain(..) {
@@ -1124,6 +1144,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
     st.abandons += z.upkeep_abandons() + r.upkeep_abandons();
     st.bindings += z.cache_bindings() + r.cache_bindings();
     st.beside += z.seal_waits().merges_beside + r.seal_waits().merges_beside;
+    st.switches += z.forms_off_counts()[..2].iter().sum::<u64>();
     drop(z);
     drop(r);
     if ok {
@@ -1150,8 +1171,8 @@ fn fuzz_range() {
         .ok()
         .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect());
     let seeds: Vec<u64> = list.unwrap_or_else(|| (from..to).collect());
-    let (mut bad, mut reopens, mut abandons, mut bindings, mut beside) =
-        (Vec::new(), 0u64, 0u64, 0u64, 0u64);
+    let (mut bad, mut reopens, mut abandons, mut bindings, mut beside, mut switches) =
+        (Vec::new(), 0u64, 0u64, 0u64, 0u64, 0u64);
     for seed in seeds {
         match run_seed(seed, want_cache, verbose) {
             Ok(s) => {
@@ -1159,12 +1180,13 @@ fn fuzz_range() {
                 abandons += s.abandons;
                 bindings += s.bindings;
                 beside += s.beside;
+                switches += s.switches;
             }
             Err(e) => bad.push(format!("seed {seed}: {e}")),
         }
     }
     eprintln!(
-        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, FAILURES {}",
+        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, forms-off switches {switches}, FAILURES {}",
         bad.len()
     );
     for b in &bad {

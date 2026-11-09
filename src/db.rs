@@ -3050,6 +3050,49 @@ pub struct Options {
     /// maintenance makes the rest either way. Off until a measurement
     /// says otherwise; `docs/engine.md` has the two fixes it needed first.
     pub scan_lazy_snapshot: bool,
+    /// Out of core -- the compact form installed -- the writer whose scans
+    /// start in the blocks recent scans started in under an eighth of the
+    /// time keeps no block forms and takes the merge path, as the arm with
+    /// no block cache does, until that share passes a quarter, the store is
+    /// back in core, or a handle the caller holds is live, which the forms
+    /// are published for. The block path builds a form
+    /// for every block a scan walks, and repays the build only where a
+    /// later scan walks the block again: at ten million keys under
+    /// 1.25 GiB the lag sweep's passes start uniformly over 156,000
+    /// blocks, meet each about once, and read 1.17-1.69x without a block
+    /// cache, while ycsb-E's Zipfian starts meet the same blocks over and
+    /// over and read 0.38x without one. The share is measured at every
+    /// scan's start, on either path, as whether its block -- the ordered
+    /// index's stride for the key, read off the samples in memory -- was
+    /// a recent scan's start, in a direct-mapped table of
+    /// `scan_forms_off_ghost_bits` slots, over windows of
+    /// `scan_forms_off_window` scans. Forms are given up and taken back
+    /// the way a change of generation drops them (tables, backlog and
+    /// snapshot), so the two paths' filing never meets in one snapshot,
+    /// and while they are off the writer's commits maintain none. Paired
+    /// at ten million keys under 1.25 GiB, in the lag sweep alone and in
+    /// the row's whole order over five sittings, the full rewrite's pass
+    /// read 2.2-2.6x, the ten-percent pass 1.4-2.2x and the one-percent
+    /// pass 1.3-1.5x, the bursts level or faster, ycsb-E level and
+    /// ycsbs-E about a twentieth slower (`docs/engine.md`). On;
+    /// `supdb-formson` keeps the forms on.
+    #[doc(hidden)]
+    pub scan_forms_off_unreused: bool,
+    /// The scans a window of `scan_forms_off_unreused`'s share is taken
+    /// over. A test sets a few.
+    #[doc(hidden)]
+    pub scan_forms_off_window: u32,
+    /// The slots of `scan_forms_off_unreused`'s table of recent start
+    /// blocks, as a power of two: 1,024, which a uniform pass over a store
+    /// of a hundred thousand blocks or more hits a hundredth of the time
+    /// at most and a Zipfian's hot head fills. A test's store, of a few
+    /// thousand blocks, sets fewer.
+    #[doc(hidden)]
+    pub scan_forms_off_ghost_bits: u32,
+    /// A test's: `scan_forms_off_unreused` flips at the end of every
+    /// window whatever the share, so that every switch is reached.
+    #[doc(hidden)]
+    pub scan_forms_off_flip: bool,
     /// EXPERIMENT: the writer's scan snapshot carried across a publish
     /// rather than dropped, by the cases `carry_snapshot` knows: whole
     /// across a merge, and its live entries made frozen ones across a
@@ -4658,6 +4701,10 @@ impl Default for Options {
             frozen_snaps: true,
             overlay_merge: true,
             scan_lazy_snapshot: false,
+            scan_forms_off_unreused: true,
+            scan_forms_off_window: 512,
+            scan_forms_off_ghost_bits: 10,
+            scan_forms_off_flip: false,
             forms_settle_rebuild_from: 0,
             forms_convert_unread: true,
             forms_convert_cap: 0,
@@ -15696,6 +15743,11 @@ struct Shared {
     /// what its own pin held.
     abandons: AtomicU64,
     abandons_pinned: AtomicU64,
+    /// `Options::scan_forms_off_unreused`: the times a handle gave its
+    /// forms up and took them back, and the scans it made without them.
+    forms_off_entries: AtomicU64,
+    forms_off_exits: AtomicU64,
+    forms_off_scans: AtomicU64,
     /// Tables a landing has retired, the live one a seal was handed or
     /// the oldest frozen one: what a pass pinned before the landing holds
     /// and nobody else does.
@@ -16366,6 +16418,10 @@ pub struct Reader {
     /// back, the look at the log, the leftover settle, the snapshot
     /// refreshed, the builder started, and its forms installed.
     scan_ns: std::cell::Cell<[u64; 6]>,
+    /// `Options::scan_forms_off_unreused`: whether this handle keeps no
+    /// forms, mirrored outside the forms the writer lends to its upkeep, so
+    /// that a commit reads it without taking them back.
+    forms_off_now: std::cell::Cell<bool>,
     /// This handle's slot in the reader table, or none for the writer's
     /// own handle, under which nothing is ever freed.
     slot: Option<usize>,
@@ -16753,6 +16809,12 @@ struct FormsState {
     /// (`Reader::abandon_forms`), the pass's end at the latest, so that
     /// tables a step left half-settled never go back to the writer.
     abandoned: std::cell::Cell<u64>,
+    /// `Options::scan_forms_off_unreused`: the start blocks of recent
+    /// scans, direct-mapped; the window's scans and the ones whose start
+    /// a recent scan's was; and whether this handle keeps no forms.
+    reuse_ghost: std::cell::RefCell<Vec<u64>>,
+    reuse: std::cell::Cell<(u32, u32)>,
+    forms_off: std::cell::Cell<bool>,
     /// The automatic budget (`Options::scan_cache_auto`) has bound: the
     /// cache passed it once, and from then on this handle keeps it as a
     /// budget it was given keeps it.
@@ -16949,6 +17011,9 @@ impl FormsState {
             dirty_any: std::cell::Cell::new(false),
             tables_complete: std::cell::Cell::new(false),
             abandoned: std::cell::Cell::new(u64::MAX),
+            reuse_ghost: std::cell::RefCell::new(Vec::new()),
+            reuse: std::cell::Cell::new((0, 0)),
+            forms_off: std::cell::Cell::new(false),
             cache_bound: std::cell::Cell::new(false),
             auto_grown: std::cell::Cell::new(0),
             pass_landed: std::cell::Cell::new(0),
@@ -21332,9 +21397,15 @@ impl Reader {
         // and at thirty million keys ycsb-E made 2,500 of them over two
         // million unsealed keys. The cache wants partitions to hang blocks
         // on: before the first partitioning it stands aside.
-        let use_cache =
-            self.opts.scan_block_cache && self.segs().first().is_some_and(|s| s.level > 0);
-        if !use_cache {
+        let partitioned = self.segs().first().is_some_and(|s| s.level > 0);
+        let forms_off = self.opts.scan_block_cache && partitioned && self.forms_off_scan(from);
+        let use_cache = self.opts.scan_block_cache && partitioned && !forms_off;
+        if forms_off {
+            self.signal_scan();
+            self.shared
+                .forms_off_scans
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        } else if !use_cache {
             self.count_unshaped();
             self.note_merged_scan();
         }
@@ -22909,6 +22980,159 @@ impl Reader {
     /// (`Shared::scans_merged`): the writer's at every scan, a handle's
     /// once per commit, by the mark the block path keeps for its own
     /// count, since a scan takes one path or the other within a state.
+    /// Whether this scan takes the merge path with no forms kept
+    /// (`Options::scan_forms_off_unreused`), the window's share taken at
+    /// its start: forms given up where recent scans' start blocks recur
+    /// under an eighth of the time out of core, and taken back where they
+    /// recur over a quarter or the store is back in core.
+    fn forms_off_scan(&self, from: &[u8]) -> bool {
+        // The writer's own scans alone, and only while no handle the
+        // caller holds is live: the forms are published for the handles,
+        // whose reads of one block across threads are a reuse no handle's
+        // own starts show (the threaded scans beside the mixes read 0.85x
+        // with every handle keeping none).
+        if !self.opts.scan_forms_off_unreused || self.slot.is_some() {
+            return false;
+        }
+        let off = self.forms_off_now.get();
+        // The flip a test asks for reaches the writer off beside a live
+        // handle too, which a claim makes until the writer's next commit.
+        if self.shared.zgate.load() != zselect::GATE_Z
+            || (self.shared.live_handles.load(AtomicOrdering::Relaxed) > 0
+                && !self.opts.scan_forms_off_flip)
+        {
+            if off {
+                self.forms_off_leave();
+            }
+            return false;
+        }
+        if self.opts.scan_forms_off_flip {
+            let off = self.fs().forms_off.get();
+            let (n, _) = self.fs().reuse.get();
+            if n + 1 < self.opts.scan_forms_off_window.max(1) {
+                self.fs().reuse.set((n + 1, 0));
+            } else {
+                self.fs().reuse.set((0, 0));
+                if off {
+                    self.forms_off_leave();
+                } else {
+                    self.forms_off_enter();
+                }
+            }
+            return self.fs().forms_off.get();
+        }
+        let np = self.segs().partition_point(|s| s.level > 0);
+        let seg = &self.segs()[self.first_reaching(np, from).min(np - 1)];
+        let Some(b) = seg.ord.floor_stride(from) else {
+            return off;
+        };
+        let bits = self.opts.scan_forms_off_ghost_bits.clamp(1, 20);
+        let id = (seg.blob.id() << 32) ^ b as u64;
+        let slot = (id.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize;
+        let hit = {
+            let mut ghost = self.fs().reuse_ghost.borrow_mut();
+            if ghost.len() != 1 << bits {
+                *ghost = vec![u64::MAX; 1 << bits];
+            }
+            std::mem::replace(&mut ghost[slot], id) == id
+        };
+        let (n, hits) = self.fs().reuse.get();
+        let (n, hits) = (n + 1, hits + u32::from(hit));
+        if n < self.opts.scan_forms_off_window.max(1) {
+            self.fs().reuse.set((n, hits));
+            return off;
+        }
+        self.fs().reuse.set((0, 0));
+        if !off && hits * 8 < n {
+            self.forms_off_enter();
+        } else if off && hits * 4 > n {
+            self.forms_off_leave();
+        }
+        self.fs().forms_off.get()
+    }
+
+    /// The forms given up for the merge path, as a change of generation
+    /// drops them: the builder stopped, the tables, the backlog and the
+    /// scan snapshot dropped, and the upkeep's look forgotten so that no
+    /// publish keeps tables for it.
+    fn forms_off_enter(&self) {
+        self.stop_ahead();
+        self.forms_drop_all();
+        self.fs().forms_off.set(true);
+        self.forms_off_now.set(true);
+        self.shared
+            .forms_off_entries
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.forms_off_trace("off");
+    }
+
+    fn forms_off_trace(&self, what: &str) {
+        if std::env::var_os("SUPDB_ZPAGES_TRACE").is_some() {
+            eprintln!(
+                "zformsoff {what} scans {} writes {}",
+                self.shared.scans_life.load(AtomicOrdering::Relaxed),
+                self.mem().log_len()
+            );
+        }
+    }
+
+    /// The forms taken back: the merge path's snapshot, which has filed
+    /// the keys created since it into side runs the block path does not
+    /// read, dropped with everything else, so the block path builds its
+    /// own from the memtables as they stand.
+    fn forms_off_leave(&self) {
+        self.forms_drop_all();
+        self.fs().forms_off.set(false);
+        self.forms_off_now.set(false);
+        self.shared
+            .forms_off_exits
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.forms_off_trace("on");
+    }
+
+    /// Everything a change of generation drops, and for the writer, every
+    /// form it published in the state marked as every reader's own to
+    /// build: a block the writer holds no form for has none published as
+    /// the block, since the writer's next write into it would leave the
+    /// published one standing short of the write.
+    fn forms_drop_all(&self) {
+        *self.fs().scan_keys.borrow_mut() = None;
+        self.fs().snap_added.borrow_mut().clear();
+        self.fs().snap_stale.borrow_mut().clear();
+        self.drop_blocks();
+        if self.slot.is_none() {
+            self.shared
+                .upkeep_lives
+                .store(u64::MAX, AtomicOrdering::Relaxed);
+            let st = self.state();
+            for (p, forms) in st.forms.iter().enumerate() {
+                for (b, slot) in forms.iter().enumerate() {
+                    if !slot.load(AtomicOrdering::Acquire).is_null() {
+                        self.publish_marker(p, b);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A scan said to the regimes that follow scans, as the block path
+    /// says it (`scan_blocks`): once a commit for a handle, at every scan
+    /// for the writer.
+    fn signal_scan(&self) {
+        if !(self.opts.commit_forms || self.opts.snapshot_keeper) {
+            return;
+        }
+        let st = self.state();
+        let now = (st.gen, self.mem().committed_log());
+        if self.slot.is_none() || self.signalled.replace(now) != now {
+            st.scans.fetch_add(1, AtomicOrdering::Relaxed);
+            self.shared.scans_life.fetch_add(1, AtomicOrdering::Relaxed);
+            if self.counted {
+                st.reader_scans.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+    }
+
     fn note_merged_scan(&self) {
         if self.slot.is_some() {
             let now = (self.state().gen, self.mem().committed_log());
@@ -23654,6 +23878,12 @@ impl Reader {
     /// the same question without acting.
     fn settle_due(&self, consume: bool) -> Option<bool> {
         if !(self.opts.commit_forms && self.opts.scan_block_cache) {
+            return None;
+        }
+        // No forms kept while this handle's scans take the merge path
+        // (`Options::scan_forms_off_unreused`): stopping is safe at any
+        // commit, as the regime's below.
+        if self.fs().forms_off.get() {
             return None;
         }
         // The regime, asked of the store rather than set for it: the
@@ -28171,6 +28401,9 @@ impl Db {
             abandon_at: AtomicU64::new(u64::MAX),
             outran_at: AtomicU64::new(u64::MAX),
             abandons: AtomicU64::new(0),
+            forms_off_entries: AtomicU64::new(0),
+            forms_off_exits: AtomicU64::new(0),
+            forms_off_scans: AtomicU64::new(0),
             abandons_pinned: AtomicU64::new(0),
             tables_landed: AtomicU64::new(0),
             upkeep_hold_at: std::sync::atomic::AtomicU8::new(0),
@@ -28198,6 +28431,7 @@ impl Db {
             counted: false,
             understudy: false,
             scan_ns: std::cell::Cell::new([0; 6]),
+            forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(opts.zpages_memo_bytes),
@@ -28724,6 +28958,9 @@ impl Db {
             abandon_at: AtomicU64::new(u64::MAX),
             outran_at: AtomicU64::new(u64::MAX),
             abandons: AtomicU64::new(0),
+            forms_off_entries: AtomicU64::new(0),
+            forms_off_exits: AtomicU64::new(0),
+            forms_off_scans: AtomicU64::new(0),
             abandons_pinned: AtomicU64::new(0),
             tables_landed: AtomicU64::new(0),
             upkeep_hold_at: std::sync::atomic::AtomicU8::new(0),
@@ -28751,6 +28988,7 @@ impl Db {
             counted: false,
             understudy: false,
             scan_ns: std::cell::Cell::new([0; 6]),
+            forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(opts.zpages_memo_bytes),
@@ -31074,6 +31312,7 @@ impl Reader {
             counted: false,
             understudy: false,
             scan_ns: std::cell::Cell::new([0; 6]),
+            forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes),
@@ -31110,6 +31349,7 @@ impl Reader {
             counted: false,
             understudy: false,
             scan_ns: std::cell::Cell::new([0; 6]),
+            forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes),
@@ -31153,6 +31393,7 @@ impl Reader {
             counted,
             understudy: false,
             scan_ns: std::cell::Cell::new([0; 6]),
+            forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes),
@@ -32390,6 +32631,17 @@ impl Db {
     #[doc(hidden)]
     pub fn fail_next_zpage_build(&self) {
         self.shared.fail_zbuild.store(true, AtomicOrdering::Release);
+    }
+
+    /// `Options::scan_forms_off_unreused`: the times a handle gave its
+    /// forms up for the merge path, the times one took them back, and the
+    /// scans made without them, over every handle of the store.
+    pub fn forms_off_counts(&self) -> [u64; 3] {
+        [
+            self.shared.forms_off_entries.load(AtomicOrdering::Relaxed),
+            self.shared.forms_off_exits.load(AtomicOrdering::Relaxed),
+            self.shared.forms_off_scans.load(AtomicOrdering::Relaxed),
+        ]
     }
 
     /// A test's: the gate word set by hand, so a store under `Always` can be
@@ -33883,6 +34135,7 @@ impl Reader {
             counted: false,
             understudy: true,
             scan_ns: std::cell::Cell::new([0; 6]),
+            forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes),
@@ -34188,6 +34441,16 @@ impl Db {
     /// commit while it has it, and woken for a batch worth waking it for;
     /// and what the commit does after its barrier decided: see `Hand`.
     fn hand_over_upkeep(&mut self, syncs: bool) {
+        // A handle the caller holds is what the forms are published for:
+        // the writer that gave its forms up takes them back at its next
+        // commit, as it would at its next scan, since it may make none
+        // while the handles read (`Options::scan_forms_off_unreused`).
+        if self.forms_off_now.get()
+            && self.shared.live_handles.load(AtomicOrdering::Relaxed) > 0
+            && !self.opts.scan_forms_off_flip
+        {
+            self.forms_off_leave();
+        }
         let Upkeep::Background(level) = self.opts.upkeep else {
             return;
         };
