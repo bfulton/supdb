@@ -2,7 +2,7 @@
 <rect width="760" height="420" fill="white"/>
 <text x="72" y="28" font-size="15" font-weight="600">Ordered scans at 10⁷ keys</text>
 <text x="72" y="47" font-size="12">Ordered scans, read_us_per_io_3t, durable per batch, to 10⁷ keys</text>
-<text x="72" y="64" font-size="11" fill="#6b6b6b">x86_64/intel-r-xeon-r-processor-2.10ghz/4c/16g/hypervisor/b1280m · 3a35695 · 2026-11-08 · median with 95% CI over 3 reps</text>
+<text x="72" y="64" font-size="11" fill="#6b6b6b">x86_64/intel-r-xeon-r-processor-2.10ghz/4c/16g/hypervisor/b1280m · c5c140b · 2026-11-09 · median with 95% CI over 3 reps</text>
 <line x1="72" y1="372" x2="610" y2="372" stroke="#c8c8c8" stroke-width="1"/>
 <line x1="72" y1="88" x2="72" y2="372" stroke="#c8c8c8" stroke-width="1"/>
 <line x1="341.0" y1="372" x2="341.0" y2="378" stroke="#c8c8c8" stroke-width="1"/>
@@ -17,15 +17,14 @@
 <line x1="67" y1="88.0" x2="72" y2="88.0" stroke="#c8c8c8" stroke-width="1"/>
 <text x="63" y="92.0" font-size="11" text-anchor="end" fill="#6b6b6b">60</text>
 <text x="10" y="80" font-size="11" text-anchor="start" fill="#6b6b6b">us/io</text>
-<path d="M341.0,148.8 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="1,3"/>
-<path d="M341.0,155.9 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="4,2"/>
-<path d="M341.0,148.8 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7,4"/>
-<path d="M341.0,154.8 " fill="none" stroke="#8c8c8c" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="2,3"/>
-<text x="618.0" y="152.8" font-size="11" fill="#8c8c8c">RocksDB (LZ4)</text>
-<line x1="612.0" y1="148.8" x2="616.0" y2="161.8" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="165.8" font-size="11" fill="#8c8c8c">RocksDB</text>
-<line x1="612.0" y1="154.8" x2="616.0" y2="174.8" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="178.8" font-size="11" fill="#8c8c8c">?</text>
-<line x1="612.0" y1="155.9" x2="616.0" y2="187.8" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="191.8" font-size="11" fill="#8c8c8c">LMDB (no readahead)</text>
+<path d="M341.0,115.4 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="1,3"/>
+<path d="M341.0,114.2 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="4,2"/>
+<path d="M341.0,98.1 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7,4"/>
+<path d="M341.0,109.2 " fill="none" stroke="#8c8c8c" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="2,3"/>
+<text x="618.0" y="102.1" font-size="11" fill="#8c8c8c">RocksDB</text>
+<text x="618.0" y="115.1" font-size="11" fill="#8c8c8c">?</text>
+<line x1="612.0" y1="114.2" x2="616.0" y2="124.1" stroke="#8c8c8c" stroke-width="0.75"/>
+<text x="618.0" y="128.1" font-size="11" fill="#8c8c8c">LMDB (no readahead)</text>
+<line x1="612.0" y1="115.4" x2="616.0" y2="137.1" stroke="#8c8c8c" stroke-width="0.75"/>
+<text x="618.0" y="141.1" font-size="11" fill="#8c8c8c">RocksDB (LZ4)</text>
 </svg>

@@ -2,7 +2,7 @@
 <rect width="760" height="420" fill="white"/>
 <text x="72" y="28" font-size="15" font-weight="600">Ordered scans at 10⁷ keys</text>
 <text x="72" y="47" font-size="12">Ordered scans, read_bytes_per_op_2t, durable per batch, to 10⁷ keys</text>
-<text x="72" y="64" font-size="11" fill="#6b6b6b">x86_64/intel-r-xeon-r-processor-2.10ghz/4c/16g/hypervisor/b1280m · 3a35695 · 2026-11-08 · median with 95% CI over 3 reps</text>
+<text x="72" y="64" font-size="11" fill="#6b6b6b">x86_64/intel-r-xeon-r-processor-2.10ghz/4c/16g/hypervisor/b1280m · c5c140b · 2026-11-09 · median with 95% CI over 3 reps</text>
 <line x1="72" y1="372" x2="610" y2="372" stroke="#c8c8c8" stroke-width="1"/>
 <line x1="72" y1="88" x2="72" y2="372" stroke="#c8c8c8" stroke-width="1"/>
 <line x1="135.0" y1="372" x2="135.0" y2="375" stroke="#c8c8c8" stroke-width="1"/>
@@ -18,29 +18,29 @@
 <line x1="67" y1="88.0" x2="72" y2="88.0" stroke="#c8c8c8" stroke-width="1"/>
 <text x="63" y="92.0" font-size="11" text-anchor="end" fill="#6b6b6b">15k</text>
 <text x="10" y="80" font-size="11" text-anchor="start" fill="#6b6b6b">B/op</text>
-<path d="M135.0,372.0 L547.0,296.9 L547.0,308.1 L135.0,372.0 Z" fill="#8c8c8c" fill-opacity="0.10"/>
-<path d="M135.0,372.0 L547.0,357.9 L547.0,359.9 L135.0,372.0 Z" fill="#8c8c8c" fill-opacity="0.10"/>
+<path d="M135.0,372.0 L547.0,191.7 L547.0,299.3 L135.0,372.0 Z" fill="#8c8c8c" fill-opacity="0.10"/>
+<path d="M135.0,372.0 L547.0,358.0 L547.0,360.1 L135.0,372.0 Z" fill="#8c8c8c" fill-opacity="0.10"/>
 <path d="M135.0,372.0 L547.0,372.0 L547.0,372.0 L135.0,372.0 Z" fill="#8c8c8c" fill-opacity="0.10"/>
-<path d="M135.0,372.0 L547.0,160.8 L547.0,176.2 L135.0,372.0 Z" fill="#8c8c8c" fill-opacity="0.10"/>
+<path d="M135.0,372.0 L547.0,155.9 L547.0,165.0 L135.0,372.0 Z" fill="#8c8c8c" fill-opacity="0.10"/>
 <path d="M135.0,372.0 L547.0,372.0 L547.0,372.0 L135.0,372.0 Z" fill="#2b6cb0" fill-opacity="0.10"/>
 <path d="M135.0,372.0 L547.0,372.0 L547.0,372.0 L135.0,372.0 Z" fill="#2b6cb0" fill-opacity="0.10"/>
-<path d="M135.0,372.0 L547.0,326.2 L547.0,329.5 L135.0,372.0 Z" fill="#8c8c8c" fill-opacity="0.10"/>
+<path d="M135.0,372.0 L547.0,324.9 L547.0,328.9 L135.0,372.0 Z" fill="#8c8c8c" fill-opacity="0.10"/>
 <path d="M135.0,372.0 L547.0,372.0 L547.0,372.0 L135.0,372.0 Z" fill="#1b1b1b" fill-opacity="0.10"/>
-<path d="M135.0,372.0 L547.0,305.6 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="1,3"/>
-<path d="M135.0,372.0 L547.0,358.9 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="4,2"/>
+<path d="M135.0,372.0 L547.0,255.0 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="1,3"/>
+<path d="M135.0,372.0 L547.0,359.1 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="4,2"/>
 <path d="M135.0,372.0 L547.0,372.0 " fill="none" stroke="#8c8c8c" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="2,3"/>
-<path d="M135.0,372.0 L547.0,166.7 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7,4"/>
+<path d="M135.0,372.0 L547.0,158.7 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7,4"/>
 <path d="M135.0,372.0 L547.0,372.0 " fill="none" stroke="#2b6cb0" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7,4"/>
 <path d="M135.0,372.0 L547.0,372.0 " fill="none" stroke="#2b6cb0" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-<path d="M135.0,372.0 L547.0,328.9 " fill="none" stroke="#8c8c8c" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="2,3"/>
+<path d="M135.0,372.0 L547.0,328.1 " fill="none" stroke="#8c8c8c" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="2,3"/>
 <path d="M135.0,372.0 L547.0,372.0 " fill="none" stroke="#1b1b1b" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-<line x1="612.0" y1="166.7" x2="616.0" y2="125.8" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="129.8" font-size="11" fill="#8c8c8c">RocksDB</text>
-<line x1="612.0" y1="305.6" x2="616.0" y2="264.6" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="268.6" font-size="11" fill="#8c8c8c">RocksDB (LZ4)</text>
-<line x1="612.0" y1="328.9" x2="616.0" y2="288.0" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="292.0" font-size="11" fill="#8c8c8c">?</text>
-<line x1="612.0" y1="358.9" x2="616.0" y2="318.0" stroke="#8c8c8c" stroke-width="0.75"/>
+<line x1="612.0" y1="158.7" x2="616.0" y2="117.6" stroke="#8c8c8c" stroke-width="0.75"/>
+<text x="618.0" y="121.6" font-size="11" fill="#8c8c8c">RocksDB</text>
+<line x1="612.0" y1="255.0" x2="616.0" y2="214.0" stroke="#8c8c8c" stroke-width="0.75"/>
+<text x="618.0" y="218.0" font-size="11" fill="#8c8c8c">RocksDB (LZ4)</text>
+<line x1="612.0" y1="328.1" x2="616.0" y2="287.0" stroke="#8c8c8c" stroke-width="0.75"/>
+<text x="618.0" y="291.0" font-size="11" fill="#8c8c8c">?</text>
+<line x1="612.0" y1="359.1" x2="616.0" y2="318.0" stroke="#8c8c8c" stroke-width="0.75"/>
 <text x="618.0" y="322.0" font-size="11" fill="#8c8c8c">LMDB (no readahead)</text>
 <line x1="612.0" y1="372.0" x2="616.0" y2="331.0" stroke="#8c8c8c" stroke-width="0.75"/>
 <text x="618.0" y="335.0" font-size="11" fill="#8c8c8c">?</text>
