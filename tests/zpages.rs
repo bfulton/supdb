@@ -8597,6 +8597,233 @@ fn the_sample_waits_for_a_seal_in_flight_where_the_controller_suspects_at_the_cr
     }
 }
 
+/// The selector's raw-tail pick is a function of the partitions' size at
+/// its reading and holds for every build after it, so where the store grows
+/// past the fill share of the budget the pick was made under it is taken
+/// back (`ZCounts::coding_repicks`): the lag sweep's store at ten million
+/// keys under 1.25 GiB took its reading four seconds into its load, doubled
+/// after it, and built every partition raw-tailed, a form the size of the
+/// raw records (`docs/engine.md`). A store of twenty thousand keys picks
+/// the raw tails under a budget whose fill share holds them half again,
+/// installs them, and then either doubles, ordered keys above its greatest,
+/// or has every key written again at the same size: grown, the partitions
+/// built after the growth are block-coded and the ones served before it
+/// keep their raw tails; rewritten, nothing is taken back and every build
+/// is raw-tailed. The reads answer the model through both.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_raw_tail_pick_is_taken_back_once_the_store_grows_past_the_fill_share() {
+    assert!(Options::default().zpages_coding_auto);
+    for grow in [true, false] {
+        let what = format!("grow {grow}");
+        let (dir, mut db, mut model, inject) = auto_store_with(
+            &format!("coding-repick-{grow}"),
+            1 << 40,
+            0.0,
+            FAULT_1MS,
+            |o| o.zpages_build_eager = true,
+            |_| {},
+        );
+        // The raw tails within the fill share half again: the records'
+        // bytes, which the raw-tail form is the size of, and a store twice
+        // as large past it.
+        let records = db.zpage_counts().model_record_bytes;
+        assert!(records > 0, "{what}: {:?}", db.zpage_counts());
+        let budget = records * 7 / 4;
+        let fill = supdb::db::zselect::form_fill(budget);
+        assert!(
+            records < fill && 2 * records > fill,
+            "{what}: {records} {fill}"
+        );
+        inject.set_budget(budget);
+        inject.set_refault_rate(1_000_000.0);
+        assert!(
+            tick_until(&db, 400, |c| c.sel_installs >= 1
+                && c.attached >= c.partitions),
+            "{what}: bought and installed: {:?}",
+            db.zpage_counts()
+        );
+        let c = db.zpage_counts();
+        assert!(
+            c.coding_picks_raw >= 1 && c.coding_picks_block == 0 && c.coding_repicks == 0,
+            "{what}: the raw tails picked: {c:?}"
+        );
+        assert_eq!(
+            c.builds_raw_tails, c.builds,
+            "{what}: every build raw-tailed"
+        );
+        let (n0, built0) = (c.partitions, c.builds);
+        let mut rng = Rng(0x5EED_C0DE);
+        if grow {
+            for chunk in (20_000..40_000).collect::<Vec<usize>>().chunks(500) {
+                for &i in chunk {
+                    let (k, v) = (spaced_key(i), suite_value(&mut rng));
+                    db.append(&k, &v);
+                    model.insert(k, vec![v]);
+                }
+                db.commit().unwrap();
+            }
+        } else {
+            let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+            for chunk in keys.chunks(500) {
+                for k in chunk {
+                    let v = suite_value(&mut rng);
+                    db.put(k, &v);
+                    model.insert(k.clone(), vec![v]);
+                }
+                db.commit().unwrap();
+            }
+        }
+        db.flush().unwrap();
+        db.settle().unwrap();
+        assert!(
+            tick_until(&db, 400, |c| c.builds > built0
+                && c.attached >= c.partitions),
+            "{what}: the partitions after the writes attached: {:?}",
+            db.zpage_counts()
+        );
+        let c = db.zpage_counts();
+        let coded = codings(&db);
+        if grow {
+            assert!(c.partitions > n0, "{what}: the store grew: {c:?}");
+            assert!(
+                c.coding_repicks >= 1 && c.coding_picks_block >= 1,
+                "{what}: the raw tails taken back: {c:?}"
+            );
+            assert_eq!(
+                c.builds_raw_tails, built0,
+                "{what}: nothing raw-tailed after the growth: {c:?}"
+            );
+            assert!(
+                coded.iter().any(|&raw| raw) && coded.iter().any(|&raw| !raw),
+                "{what}: the partitions served before keep their raw tails, the ones after are block-coded: {coded:?}"
+            );
+        } else {
+            assert_eq!(
+                (c.coding_repicks, c.coding_picks_block),
+                (0, 0),
+                "{what}: nothing taken back: {c:?}"
+            );
+            assert_eq!(
+                c.builds_raw_tails, c.builds,
+                "{what}: every build raw-tailed: {c:?}"
+            );
+            assert!(coded.iter().all(|&raw| raw), "{what}: {coded:?}");
+        }
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let some: Vec<Vec<u8>> = keys.iter().step_by(37).cloned().collect();
+        let r = db.reader().unwrap();
+        check(&r, &model, &some, &what);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The form files a merge builds at its outputs' finish carry the pick as
+/// the merge started (`Options::zpages_build_at_finish`), and a pick taken
+/// back while they are built leaves them on disk in the refused coding: the
+/// lag sweep's store built every output raw-tailed before its growth was
+/// read. Such a file is on record by its coding, given back at its attach
+/// and built again (`ZCounts::ahead_recoded`). A store installed on the raw
+/// tails has every key written again at the same size, so that its merge
+/// builds its outputs raw-tailed, held at their start; the store then
+/// doubles, the pick is taken back at the next build's plan, and once the
+/// builds go on every partition is block-coded, the merge's outputs
+/// included; the reads answer the model.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_form_file_built_at_a_merges_finish_in_a_coding_taken_back_is_built_again() {
+    assert!(Options::default().zpages_coding_auto && Options::default().zpages_build_at_finish);
+    let (dir, mut db, mut model, inject) = auto_store_with(
+        "coding-repick-finish",
+        1 << 40,
+        0.0,
+        FAULT_1MS,
+        |o| {
+            o.zpages_build_eager = true;
+            o.zpages_land_pct = 50;
+            o.zpages_ahead_builders = 8;
+            o.partition_bytes = Some(1 << 20);
+            o.l0_trigger = 1;
+        },
+        |_| {},
+    );
+    let records = db.zpage_counts().model_record_bytes;
+    inject.set_budget(records * 7 / 4);
+    inject.set_refault_rate(1_000_000.0);
+    assert!(
+        tick_until(&db, 400, |c| c.sel_installs >= 1
+            && c.attached >= c.partitions),
+        "bought and installed: {:?}",
+        db.zpage_counts()
+    );
+    let c = db.zpage_counts();
+    assert!(
+        c.coding_picks_raw >= 1 && c.coding_repicks == 0 && codings(&db).iter().all(|&raw| raw),
+        "the raw tails picked and served: {c:?} {:?}",
+        codings(&db)
+    );
+    // Every key written again at the same size: the merge's outputs are
+    // built at their finish raw-tailed, and held there.
+    db.hold_zpage_build(true);
+    let mut rng = Rng(0x5EED_F1A1);
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    for chunk in keys.chunks(250) {
+        for k in chunk {
+            let v = suite_value(&mut rng);
+            db.put(k, &v);
+            model.insert(k.clone(), vec![v]);
+        }
+        db.commit().unwrap();
+    }
+    db.seal().unwrap();
+    wait_for("builds at the outputs' finish, at their hold", || {
+        db.zpage_build_waiting() && db.zpage_counts().finish_live >= 1
+    });
+    assert_eq!(db.zpage_counts().coding_repicks, 0, "nothing grew yet");
+    // The store doubled while they wait: the next build's plan takes the
+    // raw tails back.
+    for chunk in (20_000..40_000).collect::<Vec<usize>>().chunks(500) {
+        for &i in chunk {
+            let (k, v) = (spaced_key(i), suite_value(&mut rng));
+            db.append(&k, &v);
+            model.insert(k, vec![v]);
+        }
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+    assert!(
+        tick_until(&db, 400, |c| c.coding_repicks >= 1),
+        "the raw tails taken back: {:?}",
+        db.zpage_counts()
+    );
+    db.hold_zpage_build(false);
+    wait_for("the builds at the outputs' finish to end", || {
+        db.zpage_counts().finish_live == 0 && db.merges_in_flight() == 0
+    });
+    db.settle().unwrap();
+    assert!(
+        tick_until(&db, 400, |c| c.attached >= c.partitions
+            && codings(&db).iter().all(|&raw| !raw)),
+        "every partition block-coded: {:?} {:?}",
+        db.zpage_counts(),
+        codings(&db)
+    );
+    let c = db.zpage_counts();
+    assert!(
+        c.finish_builds >= 1 && c.ahead_recoded >= 1,
+        "the outputs built at their finish raw-tailed given back: {c:?}"
+    );
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let some: Vec<Vec<u8>> = keys.iter().step_by(37).cloned().collect();
+    let r = db.reader().unwrap();
+    check(&r, &model, &some, "after the finish builds given back");
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A form file built ahead at landing comes before the sampler's coding
 /// pick and takes the options' coding, the block coding; where the pick
 /// is then the raw tails, the buy gives each such file back unattached

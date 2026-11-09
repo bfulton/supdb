@@ -1241,6 +1241,17 @@ impl<B: Bytes> Blob<B> {
         self.flat().map_or(0, |(_, idx)| idx.hash_bytes())
     }
 
+    /// The record region's bytes as the section's header gives them, the
+    /// `recs_len` of [`Blob::z_source_facts`] without the checksum row's
+    /// hash: what the raw-tail form's size is read off where the coding is
+    /// picked again (`Options::zpages_coding_auto`).
+    #[cfg(not(target_family = "wasm"))]
+    #[doc(hidden)]
+    pub fn z_records_len(&self) -> Option<u64> {
+        let (sec, _) = self.flat()?;
+        flatindex::Header::parse(sec).map(|h| h.recs_len as u64)
+    }
+
     /// What a form file binds itself to (`ZSource`), or `None` where there is
     /// nothing to bind to: a reader that does not hold the section whole,
     /// or a section with no checksum row (a store's in-place-editable

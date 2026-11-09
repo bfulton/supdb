@@ -9685,6 +9685,8 @@ impl Engine for Supdb {
             ("zpage_sample_w_z_raw_bytes", z.sample_w_z_raw_bytes as f64),
             ("zpage_coding_picks_block", z.coding_picks_block as f64),
             ("zpage_coding_picks_raw", z.coding_picks_raw as f64),
+            ("zpage_coding_repicks", z.coding_repicks as f64),
+            ("zpage_finish_refused", z.finish_refused as f64),
             ("zpage_builds_raw_tails", z.builds_raw_tails as f64),
             ("zpage_raw_dropped", z.raw_dropped as f64),
             (

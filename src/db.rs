@@ -698,6 +698,11 @@ pub struct ZCounts {
     pub sample_w_z_raw_bytes: u64,
     pub coding_picks_block: u64,
     pub coding_picks_raw: u64,
+    /// Raw-tail picks taken back for the partitions' growth past the fill
+    /// share (`Maint::z_repick`), and the live partitions' form files on
+    /// record raw-tailed at each take-back, which the cover leaves out.
+    pub coding_repicks: u64,
+    pub finish_refused: u64,
     pub builds_raw_tails: u64,
     /// Partitions re-coded while served (`Options::zpages_recode`): to the
     /// raw tails, back to the block coding, and re-codes that installed
@@ -5700,6 +5705,11 @@ impl ZFinish {
                         ev.built(&b);
                         zfile::ZEvents::add(&ev.prebuilt, 1);
                         zfile::ZEvents::add(&ev.finish_builds, 1);
+                        shared
+                            .z_finish_coded
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push((zfile::zpg_name(id, end), plan.raw_tails));
                     }
                     Ok(zfile::Outcome::Declined(d)) => ev.declined(d),
                     Ok(zfile::Outcome::Cancelled) => zfile::ZEvents::add(&ev.build_cancelled, 1),
@@ -15501,6 +15511,12 @@ struct Shared {
     /// in flight -- not built ahead again, and in flight for the sample's
     /// count -- until its file is on disk.
     z_finish_names: std::sync::Mutex<Vec<String>>,
+    /// The form files those builds wrote, by name, with whether each is
+    /// raw-tailed: the coding a merge's plan carried when it started, which
+    /// the segment work takes into its record of the files' codings
+    /// (`Maint::z_ahead_coding`) at its next look, so that a file in the
+    /// coding a later pick refuses is not counted as covering its partition.
+    z_finish_coded: std::sync::Mutex<Vec<(String, bool)>>,
     /// A test's: the next form file build fails as a write error would.
     fail_zbuild: std::sync::atomic::AtomicBool,
     /// A test's: `Options::zpages_hold_after_settle`, as it stands.
@@ -20174,6 +20190,8 @@ impl Reader {
             sample_w_z_raw_bytes: get(&ev.sample_w_z_raw),
             coding_picks_block: get(&ev.coding_picks[0]),
             coding_picks_raw: get(&ev.coding_picks[1]),
+            coding_repicks: get(&ev.coding_repicks),
+            finish_refused: get(&ev.finish_refused),
             builds_raw_tails: get(&ev.builds_raw_tails),
             recodes: get(&ev.recodes),
             recodes_back: get(&ev.recodes_back),
@@ -28335,6 +28353,7 @@ impl Db {
             zbuild_hold: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(zhold_of(&opts))),
             z_finish_live: std::sync::atomic::AtomicUsize::new(0),
             z_finish_names: std::sync::Mutex::new(Vec::new()),
+            z_finish_coded: std::sync::Mutex::new(Vec::new()),
             fail_zbuild: std::sync::atomic::AtomicBool::new(false),
             zsettle_hold: std::sync::atomic::AtomicBool::new(opts.zpages_hold_after_settle),
             zgate: ZGate::new(opts.zpages),
@@ -28892,6 +28911,7 @@ impl Db {
             zbuild_hold: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(zhold_of(&opts))),
             z_finish_live: std::sync::atomic::AtomicUsize::new(0),
             z_finish_names: std::sync::Mutex::new(Vec::new()),
+            z_finish_coded: std::sync::Mutex::new(Vec::new()),
             fail_zbuild: std::sync::atomic::AtomicBool::new(false),
             zsettle_hold: std::sync::atomic::AtomicBool::new(opts.zpages_hold_after_settle),
             zgate: ZGate::new(opts.zpages),
@@ -37904,6 +37924,10 @@ struct Maint {
     /// builds after it are planned in; none until a reading with both
     /// codings sized.
     z_coding_pick: Option<zselect::Coding>,
+    /// What the pick was made against: the counted partitions' records'
+    /// bytes, the raw-tail form's bytes and resident part as the reading
+    /// sized them, and the budget (`Maint::z_repick`).
+    z_pick_size: Option<(u64, u64, u64, u64)>,
     z_report: zselect::Build,
     z_scan_len: f64,
     /// Whether the store's raw populations were past its budget at the
@@ -37934,6 +37958,10 @@ struct Maint {
     /// pick (`Options::zpages_coding_auto`) and takes the options' coding,
     /// and a file in the coding the pick refused is given back and built
     /// again in the picked one where the controller buys, never attached.
+    /// The builds at a merge's output finish are entered here too
+    /// (`Shared::z_finish_coded`), since their plan carries the pick as the
+    /// merge started and the pick may be taken back after it
+    /// (`Maint::z_repick`).
     z_ahead_coding: std::collections::HashMap<String, bool>,
     /// The re-code policy's (`Options::zpages_recode`): when it last
     /// looked; each form file's decode time and opens then, by its attach's
@@ -38551,6 +38579,7 @@ impl Maint {
             z_handed_gen: u64::MAX,
             z_refresh_due: false,
             z_coding_pick: None,
+            z_pick_size: None,
             z_report: zselect::Build::default(),
             z_scan_len: 0.0,
             z_past_budget: false,
@@ -39397,7 +39426,7 @@ impl Maint {
             verify_inputs: self.opts.merge_verifies_inputs,
             read_ahead: self.opts.merge_read_ahead,
             counts: Some(self.shared.clone()),
-            zfinish: self.z_finish_plan(),
+            zfinish: self.z_finish_plan_repicked(),
         };
         let wake = self.wake.clone();
         let handle = std::thread::spawn(move || {
@@ -41664,19 +41693,22 @@ impl Maint {
             && raw.counted == block.counted)
             .then(|| {
                 let budget = self.z_budget().unwrap_or(0);
-                zselect::choose_coding(
+                let c = zselect::choose_coding(
                     budget,
                     zselect::FormSize {
                         w_z: raw.w_z,
                         resident: raw.resident,
                     },
-                )
+                );
+                (c, budget)
             });
-        if let Some(c) = pick {
+        if let Some((c, budget)) = pick {
             let idx = usize::from(c == zselect::Coding::RawTails);
             zfile::ZEvents::add(&ev.coding_picks[idx], 1);
             self.z_coding_pick = Some(c);
+            self.z_pick_size = Some((raw.recs_len, raw.w_z, raw.resident, budget));
         }
+        let pick = pick.map(|(c, _)| c);
         ev.sample_w_z_raw.store(raw.w_z, AtomicOrdering::Relaxed);
         let sums = if pick == Some(zselect::Coding::RawTails) {
             raw
@@ -41858,6 +41890,7 @@ impl Maint {
     /// cover, or one of them is not what its name says, and the fill
     /// sample runs as before.
     fn z_reading_from_files(&mut self) -> bool {
+        self.z_repick();
         let c = self.z_files_cover();
         if c.counted == 0 || c.on_disk == 0 || !c.covers() {
             return false;
@@ -41890,6 +41923,7 @@ impl Maint {
             sums.recs_len = sums.recs_len.saturating_add(facts.recs_len);
             let on = Db::name_id(&seg.name)
                 .zip(Db::name_end_seq(&seg.name))
+                .filter(|&(id, end)| !self.z_file_refused(&zfile::zpg_name(id, end)))
                 .and_then(|(id, end)| {
                     let path = self.dir.join(zfile::zpg_name(id, end));
                     zfile::file_facts(&path, blob, id, end, advise).map(|f| (path, id, end, f))
@@ -41961,6 +41995,7 @@ impl Maint {
             let idx = usize::from(pick == zselect::Coding::RawTails);
             zfile::ZEvents::add(&self.shared.z.coding_picks[idx], 1);
             self.z_coding_pick = Some(pick);
+            self.z_pick_size = Some((sums.recs_len, raw_w_z, sums.resident, budget));
         }
         self.shared
             .z
@@ -42042,10 +42077,15 @@ impl Maint {
             c.counted += 1;
             let keys = seg.blob.keys() as u64;
             c.nkeys = c.nkeys.saturating_add(keys);
+            // A file on record in the coding the pick refuses covers
+            // nothing: its attach gives it back (`Maint::z_file_refused`).
             let on = seg.z.get().is_some()
                 || Db::name_id(&seg.name)
                     .zip(Db::name_end_seq(&seg.name))
-                    .is_some_and(|(id, end)| self.dir.join(zfile::zpg_name(id, end)).is_file());
+                    .is_some_and(|(id, end)| {
+                        let name = zfile::zpg_name(id, end);
+                        !self.z_file_refused(&name) && self.dir.join(&name).is_file()
+                    });
             if on {
                 c.on_disk += 1;
                 c.on_disk_keys = c.on_disk_keys.saturating_add(keys);
@@ -42090,6 +42130,7 @@ impl Maint {
         let Some(last) = self.z_sample_last else {
             return;
         };
+        self.z_repick();
         let c = self.z_files_cover();
         if c.counted == 0 || !c.covers() {
             return;
@@ -42404,6 +42445,135 @@ impl Maint {
     /// Whether the second build ahead holds `name` (`Maint::zahead`).
     fn z_ahead_holds(&self, name: &str) -> bool {
         self.zahead.as_ref().is_some_and(|b| b.seg.name == name)
+    }
+
+    /// [`Maint::z_finish_plan`] after the coding's pick is taken again
+    /// against the partitions as they stand (`Maint::z_repick`), since the
+    /// plan carries the pick to every output the merge builds.
+    fn z_finish_plan_repicked(&mut self) -> Option<std::sync::Arc<ZFinish>> {
+        self.z_repick();
+        self.z_finish_plan()
+    }
+
+    /// The codings of the form files built at a merge's output finish,
+    /// taken into the record the builds ahead keep (`z_ahead_coding`), and
+    /// the record held to the live partitions' names once it outgrows them
+    /// by a factor, since a file whose partition a merge retired never
+    /// reaches the attach that takes its entry out.
+    fn z_take_finish_codings(&mut self) {
+        let coded = std::mem::take(
+            &mut *self
+                .shared
+                .z_finish_coded
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        self.z_ahead_coding.extend(coded);
+        let live = {
+            let _op = self.op();
+            self.segs().iter().filter(|s| s.level > 0).count()
+        };
+        if self.z_ahead_coding.len() > 4 * live.max(8) {
+            let names: std::collections::HashSet<String> = {
+                let _op = self.op();
+                self.segs()
+                    .iter()
+                    .filter(|s| s.level > 0)
+                    .filter_map(|s| zfile::zpg_name_for(&s.name))
+                    .collect()
+            };
+            self.z_ahead_coding.retain(|n, _| names.contains(n));
+        }
+    }
+
+    /// Whether the form file named `name` is on record in the coding the
+    /// selector's pick refuses (`Options::zpages_coding_auto`): a file built
+    /// ahead or at a merge's output finish before the pick, or before the
+    /// pick was taken back (`Maint::z_repick`). Such a file covers nothing:
+    /// the attach gives it back and builds the partition again
+    /// (`Maint::z_attach_on_disk`), so the files' cover leaves it out.
+    fn z_file_refused(&self, name: &str) -> bool {
+        let want = self
+            .z_coding_pick
+            .filter(|_| self.opts.zpages_coding_auto)
+            .map(|c| c == zselect::Coding::RawTails);
+        matches!((want, self.z_ahead_coding.get(name)), (Some(w), Some(&b)) if b != w)
+    }
+
+    /// The raw-tail pick taken back where the partitions' records have grown
+    /// past the fill share of the budget since it was made
+    /// (`zselect::choose_coding` over the pick's own reading of the raw-tail
+    /// form grown with the records' bytes, under the budget it was made
+    /// against: what moved is the store, and the budget's movement is the
+    /// fill share's to absorb). A pick
+    /// holds for every build after it, and a reading can come while the
+    /// store is still being loaded: the lag sweep's store at ten million keys
+    /// under 1.25 GiB entered SUSPECT four seconds into its load, on the
+    /// refaults its own merges made, and its reading over fourteen
+    /// partitions and 4.8 million keys put the raw tails at 601 MB under a
+    /// fill share of 940; the store doubled, every output's form file was
+    /// built raw-tailed at its finish, 1.14 GB of them asked for at the
+    /// crossing, and the install served a form the size of the raw records
+    /// through the whole sweep, its passes two to three times the other
+    /// reps' (`docs/engine.md`). Only the raw tails are taken back: a form
+    /// that faults loses more than a form that decodes, and a block pick
+    /// the store has shrunk under is the next reading's to change. Counted
+    /// (`ZCounts::coding_repicks`), with the files on record in the coding
+    /// it refuses (`ZCounts::finish_refused`).
+    fn z_repick(&mut self) {
+        self.z_take_finish_codings();
+        if !self.opts.zpages_coding_auto || self.z_coding_pick != Some(zselect::Coding::RawTails) {
+            return;
+        }
+        let Some((at_recs, at_w_z, at_resident, budget)) = self.z_pick_size else {
+            return;
+        };
+        let recs: u64 = {
+            let _op = self.op();
+            self.segs()
+                .iter()
+                .filter(|s| s.level > 0)
+                .filter_map(|s| s.blob.for_zfile().z_records_len())
+                .sum()
+        };
+        if at_recs == 0 || recs <= at_recs {
+            return;
+        }
+        // The reading's sizes grown with the records, against the budget the
+        // pick was made under: what moved is the store, and the budget's own
+        // movement is the fill share's to absorb.
+        let grow = |x: u64| (x as f64 * recs as f64 / at_recs as f64) as u64;
+        let pick = zselect::choose_coding(
+            budget,
+            zselect::FormSize {
+                w_z: grow(at_w_z),
+                resident: grow(at_resident),
+            },
+        );
+        if pick == zselect::Coding::RawTails {
+            return;
+        }
+        self.z_coding_pick = Some(pick);
+        let ev = &self.shared.z;
+        zfile::ZEvents::add(&ev.coding_picks[0], 1);
+        zfile::ZEvents::add(&ev.coding_repicks, 1);
+        let refused = {
+            let _op = self.op();
+            self.segs()
+                .iter()
+                .filter(|s| s.level > 0)
+                .filter_map(|s| zfile::zpg_name_for(&s.name))
+                .filter(|n| self.z_ahead_coding.get(n) == Some(&true))
+                .count() as u64
+        };
+        zfile::ZEvents::add(&ev.finish_refused, refused);
+        if self.z_trace {
+            eprintln!(
+                "zrepick t={:.1} records {recs} fill {} budget {budget} refused {refused}",
+                self.z_epoch.elapsed().as_secs_f64(),
+                zselect::form_fill(budget),
+            );
+        }
     }
 
     /// The builds at a merge's output finish (`Options::zpages_build_at_finish`),
@@ -43171,6 +43341,7 @@ impl Maint {
         dormant: bool,
         refused: bool,
     ) -> bool {
+        self.z_take_finish_codings();
         let shared = self.shared.clone();
         let ev = &shared.z;
         if !dormant {
@@ -43318,7 +43489,12 @@ impl Maint {
         plan.ahead = self.opts.zpages_build_ahead;
         plan.group_bytes = self.opts.zpages_group_bytes;
         // The coding: the other one for a re-code, the selector's pick where
-        // it chooses one (`Options::zpages_coding_auto`), else the options'.
+        // it chooses one (`Options::zpages_coding_auto`), taken again
+        // against the partitions as they stand (`Maint::z_repick`), else the
+        // options'.
+        if !(reparse || recode) {
+            self.z_repick();
+        }
         let served_coded = seg.z.get().map(|z| z.coded());
         let (coding, raw_tails) = match self.z_coding_pick {
             // A re-parse keeps the served block coding.
@@ -43950,7 +44126,7 @@ impl Maint {
         let walk_cached = self.opts.merge_walk_cached;
         let verify_inputs = self.opts.merge_verifies_inputs;
         let read_ahead = self.opts.merge_read_ahead;
-        let zfinish = self.z_finish_plan();
+        let zfinish = self.z_finish_plan_repicked();
         let job_inputs = inputs.clone();
         let kept_fences = fences.clone();
         let wake = self.wake.clone();

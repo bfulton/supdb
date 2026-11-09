@@ -3887,6 +3887,12 @@ pub(super) struct ZEvents {
     pub sample_w_z_raw: AtomicU64,
     pub coding_picks: [AtomicU64; 2],
     pub builds_raw_tails: AtomicU64,
+    /// A raw-tail pick taken back where the partitions' records grew past
+    /// the fill share after it (`Maint::z_repick`), and the live
+    /// partitions' form files on record raw-tailed at each take-back, which
+    /// the files' cover then leaves out (`Maint::z_files_cover`).
+    pub coding_repicks: AtomicU64,
+    pub finish_refused: AtomicU64,
     /// The partitions whose raw pages were dropped at their form file's
     /// install (`Options::zpages_drop_raw`).
     pub raw_dropped: AtomicU64,

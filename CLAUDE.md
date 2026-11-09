@@ -3555,7 +3555,21 @@ crossed by whatever moves them next -- here a partition in flight; a cell
 that reads bimodal under one engine and one arm is two decisions and not
 noise, and the counter that names the decision is read before the cells
 are read as the host's; and two policies that bound one quantity bound it
-at one line, named once.
+at one line, named once. It came again from the other input. A reading
+taken while the lag sweep's store at ten million keys was still being
+loaded, fourteen partitions of the twenty-four it would hold, picked the
+raw tails at 601 MB under a fill share of 940; the store doubled, every
+output's form file was built raw-tailed at its finish, and a form the size
+of the raw records was installed and served through the sweep, its passes
+two to three times the other reps'. The count that named it was the groups
+decoded, zero through the whole sweep, and the trace's reading line was
+nineteen seconds into a load of thirty-six. A raw-tail pick is taken back
+where the records have grown past the fill share since it
+(`Maint::z_repick`), and a file on record in the refused coding covers
+nothing. The corollary: a decision held for a store's life is taken again
+wherever an input it is a function of is read again, and a pick made over
+a store still being written is a pick over a store that does not exist
+yet.
 
 **A fill that held the writer for forms nobody read, and a wait that was
 faults in disguise.** The upkeep thread's pass settles the commit it was
