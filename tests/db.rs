@@ -881,6 +881,10 @@ fn a_burst_lent_to_the_upkeep_thread_is_filed_before_the_first_scan() {
                 forms_settle_backlog_pct: 50,
                 partition_bytes: Some(256 << 10),
                 seal_max_pct: 0,
+                // The burst's filing left to the backlog bound and the first scan, the shape before a commit near reads filed its own
+                // (`Options::forms_settle_every` and `forms_settle_builds` off).
+                forms_settle_every: false,
+                forms_settle_builds: false,
                 ..Options::default()
             },
         )
@@ -4928,7 +4932,13 @@ fn a_burst_filed_into_the_forms_is_kept_to_the_budget_when_they_are_kept_to_fit(
     assert_eq!(counted as u64, forms_bytes_of(&c, "cap"), "{c:?}");
     m.check(&db, "a burst filed into forms kept to fit");
 
-    let (db, m) = burst_into_forms("burst-unfit", budget, false);
+    // The patches of a burst the scans' builds formed, the shape before a
+    // commit near reads built its own forms under the budget
+    // (`Options::forms_settle_every` and `forms_settle_builds` off).
+    let (db, m) = burst_into_forms_with("burst-unfit", budget, false, |o| {
+        o.forms_settle_every = false;
+        o.forms_settle_builds = false;
+    });
     let counted = db.block_cache_bytes();
     assert!(
         counted > 2 * budget,
@@ -4942,7 +4952,12 @@ fn a_burst_filed_into_the_forms_is_kept_to_the_budget_when_they_are_kept_to_fit(
     // The patch's shed is a part of the flag of its own: with it off the
     // forms are counted by their buffers and the burst builds the cache
     // past the budget, as it does not kept to fit at all.
-    let (db, m) = burst_into_forms_with("burst-noshed", budget, true, |o| o.forms_fit_shed = false);
+    let (db, m) = burst_into_forms_with("burst-noshed", budget, true, |o| {
+        o.forms_fit_shed = false;
+        // The same shape: the patches are of forms the scans built.
+        o.forms_settle_every = false;
+        o.forms_settle_builds = false;
+    });
     let counted = db.block_cache_bytes();
     assert!(
         counted > 2 * budget,
@@ -5353,6 +5368,11 @@ fn a_sweep_a_pin_holds_remembers_the_pin() {
     for on in [true, false] {
         let name = format!("sweep-remembers-{on}");
         let (mut db, r, mut m) = shed_over_published_forms_with(&name, false, |o| {
+            // The commits leave their batches to the reads, so the pin
+            // this test releases is the one thing a sweep waits behind
+            // (`Options::forms_settle_every` and `forms_settle_builds` off).
+            o.forms_settle_every = false;
+            o.forms_settle_builds = false;
             o.sweep_remembers_pin = on;
             // Room for the forms the rounds below make: nothing sheds.
             o.scan_cache_bytes = 1 << 30;
@@ -9580,6 +9600,10 @@ fn the_adaptive_upkeep_holds_only_for_what_a_commit_leaves_to_a_read() {
         partition_bytes: Some(256 << 10),
         // The plain seal, so the few hundred writes below seal nothing.
         seal_max_pct: 0,
+        // A commit leaves its batch to the next read, which is what the hold is for
+        // (`Options::forms_settle_every` and `forms_settle_builds` off).
+        forms_settle_every: false,
+        forms_settle_builds: false,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -10907,6 +10931,10 @@ fn a_write_burst_is_settled_once_its_backlog_passes_the_bound() {
             // The commit's own rules, whose deferred burst the upkeep
             // thread would file ahead of the read.
             upkeep: supdb::Upkeep::Inline,
+            // The settle waits for the backlog bound, which is what is measured here
+            // (`Options::forms_settle_every` and `forms_settle_builds` off).
+            forms_settle_every: false,
+            forms_settle_builds: false,
             ..Options::default()
         };
         let mut db = Db::create(&d, opts).unwrap();
@@ -10975,6 +11003,10 @@ fn the_settle_bound_is_a_share_of_the_partitions_keys() {
             forms_settle_keys_all: all,
             // The commit's own rules; see the test above.
             upkeep: supdb::Upkeep::Inline,
+            // The settle waits for the backlog bound, which is what is measured here
+            // (`Options::forms_settle_every` and `forms_settle_builds` off).
+            forms_settle_every: false,
+            forms_settle_builds: false,
             ..Options::default()
         };
         let mut db = Db::create(&d, opts).unwrap();
@@ -12560,6 +12592,10 @@ fn a_scan_builds_the_snapshot_only_where_a_block_needs_it() {
             // The freeze's own carry, which this is about: off, the next look
             // at the log carries the tables (`the_next_look_carries_the_forms_across_a_freeze`).
             freeze_settles: true,
+            // The forms are the scans' to build, the shape whose first scan this counts
+            // (`Options::forms_settle_every` and `forms_settle_builds` off).
+            forms_settle_every: false,
+            forms_settle_builds: false,
             ..Options::default()
         };
         let mut db = Db::create(&d, opts).unwrap();
@@ -15397,6 +15433,10 @@ fn a_form_dropped_under_a_landings_carry_is_retracted_at_the_writers_look() {
         commit_forms: true,
         forms_carry: true,
         upkeep: supdb::Upkeep::Inline,
+        // The commit leaves its batch to the look, the shape this state is made in
+        // (`Options::forms_settle_every` and `forms_settle_builds` off).
+        forms_settle_every: false,
+        forms_settle_builds: false,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();

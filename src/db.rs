@@ -2785,7 +2785,7 @@ pub struct Options {
     /// after a tenth of the store rewritten was at half of LMDB either
     /// way this engine charged it to the reads.
     pub forms_settle_backlog_pct: usize,
-    /// EXPERIMENT: a commit near reads (`reads_around`: a scan in the
+    /// A commit near reads (`reads_around`: a scan in the
     /// store's life and no more than two stores' worth of writes since)
     /// settles its batch into the forms whatever the backlog, as if
     /// `forms_settle_backlog_pct` were one write. The writes of a mix with
@@ -2801,10 +2801,11 @@ pub struct Options {
     /// under 640 MiB its scans read 1.01-1.04x while F read 0.88-0.96x and
     /// D 0.93-0.95x in both sittings, the thread re-reading entries the
     /// writer is rewriting. With `forms_settle_builds` it is the shape that
-    /// pays. Off.
+    /// pays, and the two ship on together; `supdb-settlelate` leaves a
+    /// commit's batch to the backlog bound and the first scans after it.
     #[doc(hidden)]
     pub forms_settle_every: bool,
-    /// EXPERIMENT: the commit's fill builds a form for every block its
+    /// The commit's fill builds a form for every block its
     /// settle filed a write into that held none, as the scan that first
     /// walks the block would, under the cache's budget: with
     /// `forms_settle_every` the update mixes' blocks then hold their forms
@@ -2826,7 +2827,15 @@ pub struct Options {
     /// move (`SettleRoom`); and with no room a commit files only what the
     /// backlog bound asks, since filing alone costs F and D a tenth. Gated
     /// so, the combined arm reads every cell level and hot8 with the drop
-    /// reads E 1.07x. Off.
+    /// reads E 1.07x. On with `forms_settle_every`: on the default arm in
+    /// the row's order at three and ten million keys under 1.25 GiB the
+    /// scrambled E mix, which inherits the scrambled write mixes' scattered
+    /// keys, read 1.20-1.56x in every pair of four sittings and E
+    /// 1.05-1.29x, where the scrambled A mix, whose commits do the filing,
+    /// read 0.81-0.86x and the one-percent burst after a pass of scans at
+    /// ten million keys 0.68x -- cells the comparators trail by three
+    /// times and more (`docs/engine.md`). `supdb-settlelate` is the shape
+    /// without the two.
     #[doc(hidden)]
     pub forms_settle_builds: bool,
     /// Take the store's keys for `forms_settle_backlog_pct` and
@@ -4786,8 +4795,8 @@ impl Default for Options {
             forms_publish_lazily: true,
             forms_max_unsealed_pct: 0,
             forms_settle_backlog_pct: 2,
-            forms_settle_every: false,
-            forms_settle_builds: false,
+            forms_settle_every: true,
+            forms_settle_builds: true,
             forms_settle_keys_all: false,
             upkeep: Upkeep::default(),
             upkeep_lag_pct: 0,

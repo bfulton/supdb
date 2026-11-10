@@ -1319,15 +1319,19 @@ pub struct Supdb {
     /// `supdb-cache64tofitzpagesrecodedrop`.
     zrecodekeep: bool,
     /// Every commit near reads settling its batch into the forms
-    /// (`Options::forms_settle_every`): `supdb-cache64tofitzpageshot8dropsettleevery`
-    /// against `supdb-cache64tofitzpageshot8drop`.
-    settleevery: bool,
+    /// (`Options::forms_settle_every`), the engine's where this is `None`:
+    /// `supdb-cache64tofitzpageshot8dropsettleevery` against
+    /// `supdb-cache64tofitzpageshot8drop`, which pins it off.
+    settleevery: Option<bool>,
     /// And the commit's fill building a form for every block its settle
-    /// filed into that held none (`Options::forms_settle_builds`):
-    /// `supdb-cache64tofitzpageshot8dropsettlebuilds`, and on the shipping
-    /// arms `supdb-settlebuilds`, `supdb-ingestsettlebuilds` and
-    /// `supdb-cache64tofitautozpagessettlebuilds`.
-    settlebuilds: bool,
+    /// filed into that held none (`Options::forms_settle_builds`), the
+    /// engine's where this is `None`:
+    /// `supdb-cache64tofitzpageshot8dropsettlebuilds` and
+    /// `supdb-cache64tofitautozpagessettlebuilds` against bases that pin
+    /// both off, and both off on the shipping arms as `supdb-settlelate`
+    /// and `supdb-ingestsettlelate`, the shape before they were the
+    /// default.
+    settlebuilds: Option<bool>,
     /// Both codings of every partition built at write time and kept, the
     /// policy only exchanging them (`Options::zpages_both`):
     /// `supdb-cache64tofitzpagesbothdrop`.
@@ -2180,13 +2184,13 @@ struct Policy {
     /// (`Options::zpages_recode_keep`): `supdb-cache64tofitzpagesrecodekeepdrop`.
     zrecodekeep: bool,
     /// Every commit near reads settles its batch
-    /// (`Options::forms_settle_every`):
+    /// (`Options::forms_settle_every`), the engine's where `None`:
     /// `supdb-cache64tofitzpageshot8dropsettleevery`.
-    settleevery: bool,
-    /// Its settles' blocks built by the fill (`Options::forms_settle_builds`):
-    /// `supdb-cache64tofitzpageshot8dropsettlebuilds` and the shipping arms'
-    /// `...settlebuilds`.
-    settlebuilds: bool,
+    settleevery: Option<bool>,
+    /// Its settles' blocks built by the fill (`Options::forms_settle_builds`),
+    /// the engine's where `None`: `...settlebuilds` on the pinned families,
+    /// and both off as the shipping arms' `...settlelate`.
+    settlebuilds: Option<bool>,
     /// Both codings kept (`Options::zpages_both`): `supdb-cache64tofitzpagesbothdrop`.
     zboth: bool,
     /// (`Options::zpages_memo_first`): `supdb-cache64tofitautozpagesmemofirst`.
@@ -2424,8 +2428,8 @@ impl Default for Policy {
             zdropraw: None,
             zrecode: false,
             zrecodekeep: false,
-            settleevery: false,
-            settlebuilds: false,
+            settleevery: None,
+            settlebuilds: None,
             zboth: false,
             zmemofirst: false,
             zfencetree: false,
@@ -5000,6 +5004,10 @@ impl Supdb {
                 zpages_auto: true,
                 zdropraw: Some(false),
                 zlandpct: Some(0),
+                // The settle left to the backlog bound, the shape its
+                // `...settlebuilds` pair was priced against.
+                settleevery: Some(false),
+                settlebuilds: Some(false),
                 ..Policy::default()
             },
         )
@@ -6965,6 +6973,11 @@ impl Supdb {
                 zpages: true,
                 zhotfirst: 8,
                 zdropraw: Some(true),
+                // The settle left to the backlog bound, the shape its
+                // `...settleevery` and `...settlebuilds` pairs were priced
+                // against.
+                settleevery: Some(false),
+                settlebuilds: Some(false),
                 ..Policy::default()
             },
         )
@@ -6985,7 +6998,8 @@ impl Supdb {
                 zpages: true,
                 zhotfirst: 8,
                 zdropraw: Some(true),
-                settleevery: true,
+                settleevery: Some(true),
+                settlebuilds: Some(false),
                 ..Policy::default()
             },
         )
@@ -7006,8 +7020,8 @@ impl Supdb {
                 zpages: true,
                 zhotfirst: 8,
                 zdropraw: Some(true),
-                settleevery: true,
-                settlebuilds: true,
+                settleevery: Some(true),
+                settlebuilds: Some(true),
                 ..Policy::default()
             },
         )
@@ -7035,30 +7049,31 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with every commit near reads filing its batch and its fill
-    /// building the blocks it filed into (`Options::forms_settle_every`,
-    /// `forms_settle_builds`), `supdb-settlebuilds`: the out-of-core arm's
-    /// win on ycsb-E priced where the store fits.
-    pub fn create_settlebuilds(path: &Path) -> Res<Supdb> {
+    /// `supdb` whose commits leave their batches to the backlog bound and
+    /// the first scans after them, and whose fill builds no block of its
+    /// own (`Options::forms_settle_every` and `forms_settle_builds` off),
+    /// `supdb-settlelate`: the shape before a commit near reads filed and
+    /// built its own.
+    pub fn create_settlelate(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
-                settleevery: true,
-                settlebuilds: true,
+                settleevery: Some(false),
+                settlebuilds: Some(false),
                 ..Policy::default()
             },
         )
     }
 
-    /// `supdb-ingest` with the same, `supdb-ingestsettlebuilds`.
-    pub fn create_ingest_settlebuilds(path: &Path) -> Res<Supdb> {
+    /// `supdb-ingest` with the same, `supdb-ingestsettlelate`.
+    pub fn create_ingest_settlelate(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
                 partition: false,
                 durable: false,
-                settleevery: true,
-                settlebuilds: true,
+                settleevery: Some(false),
+                settlebuilds: Some(false),
                 ..Policy::default()
             },
         )
@@ -7075,8 +7090,8 @@ impl Supdb {
                 budget: 64 << 20,
                 tofit: true,
                 zpages_auto: true,
-                settleevery: true,
-                settlebuilds: true,
+                settleevery: Some(true),
+                settlebuilds: Some(true),
                 zdropraw: Some(false),
                 zlandpct: Some(0),
                 ..Policy::default()
@@ -7996,8 +8011,9 @@ impl Supdb {
             zpages_land_cold_past: !zcoldskip,
             zpages_recode: zrecode,
             zpages_recode_keep: zrecodekeep,
-            forms_settle_every: settleevery,
-            forms_settle_builds: settlebuilds,
+            forms_settle_every: settleevery.unwrap_or(supdb::Options::default().forms_settle_every),
+            forms_settle_builds: settlebuilds
+                .unwrap_or(supdb::Options::default().forms_settle_builds),
             zpages_both: zboth,
             zpages_record_coding: zrecord || zrawtails,
             zpages_memo_first: zmemofirst,
@@ -8408,7 +8424,7 @@ impl Engine for Supdb {
             if self.budget == 256 << 20 {
                 return "supdb-cache256tofitautozpages";
             }
-            return if self.settlebuilds {
+            return if self.settlebuilds == Some(true) {
                 "supdb-cache64tofitautozpagessettlebuilds"
             } else if self.zparse {
                 "supdb-cache64tofitautozpagesparse"
@@ -8491,9 +8507,9 @@ impl Engine for Supdb {
                 "supdb-cache64tofitzpagesrecodekeepdrop"
             } else if self.zrecode && zdropraw {
                 "supdb-cache64tofitzpagesrecodedrop"
-            } else if self.zhotfirst == 8 && zdropraw && self.settlebuilds {
+            } else if self.zhotfirst == 8 && zdropraw && self.settlebuilds == Some(true) {
                 "supdb-cache64tofitzpageshot8dropsettlebuilds"
-            } else if self.zhotfirst == 8 && zdropraw && self.settleevery {
+            } else if self.zhotfirst == 8 && zdropraw && self.settleevery == Some(true) {
                 "supdb-cache64tofitzpageshot8dropsettleevery"
             } else if self.zhotfirst == 8 && zdropraw {
                 "supdb-cache64tofitzpageshot8drop"
@@ -8892,11 +8908,11 @@ impl Engine for Supdb {
                 "supdb-ingestlazysettle"
             };
         }
-        if self.settlebuilds {
+        if self.settlebuilds == Some(false) {
             return if self.partition {
-                "supdb-settlebuilds"
+                "supdb-settlelate"
             } else {
-                "supdb-ingestsettlebuilds"
+                "supdb-ingestsettlelate"
             };
         }
         if self.walsync {
@@ -10683,7 +10699,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-lendbursts"
         | "supdb-inlineall"
         | "supdb-lazysettle"
-        | "supdb-settlebuilds"
+        | "supdb-settlelate"
         | "supdb-walsync"
         | "supdb-nodrainsnap"
         | "supdb-sealcopyfar"
@@ -10857,7 +10873,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestnopace"
         | "supdb-ingestinlineall"
         | "supdb-ingestlazysettle"
-        | "supdb-ingestsettlebuilds"
+        | "supdb-ingestsettlelate"
         | "supdb-ingestwalsync"
         | "supdb-ingestnodrainsnap"
         | "supdb-ingestsealcopyfar"
@@ -11256,8 +11272,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-inlineall" => supdb_arm(Supdb::create_inlineall, dir)?,
         "supdb-ingestinlineall" => supdb_arm(Supdb::create_ingest_inlineall, dir)?,
         "supdb-lazysettle" => supdb_arm(Supdb::create_lazysettle, dir)?,
-        "supdb-settlebuilds" => supdb_arm(Supdb::create_settlebuilds, dir)?,
-        "supdb-ingestsettlebuilds" => supdb_arm(Supdb::create_ingest_settlebuilds, dir)?,
+        "supdb-settlelate" => supdb_arm(Supdb::create_settlelate, dir)?,
+        "supdb-ingestsettlelate" => supdb_arm(Supdb::create_ingest_settlelate, dir)?,
         "supdb-ingestlazysettle" => supdb_arm(Supdb::create_ingest_lazysettle, dir)?,
         "supdb-walsync" => supdb_arm(Supdb::create_walsync, dir)?,
         "supdb-ingestwalsync" => supdb_arm(Supdb::create_ingest_walsync, dir)?,
@@ -14053,7 +14069,14 @@ mod tests {
                 g.zpages_recode_keep, keep,
                 "{name}: the replaced form file kept"
             );
-            assert!(!g.forms_settle_every, "{name}: the default settle");
+            // The engine's settle, but for the arm its settle pairs were
+            // priced against, which pins the one before it.
+            assert_eq!(
+                g.forms_settle_every,
+                name != "supdb-cache64tofitzpageshot8drop"
+                    && supdb::Options::default().forms_settle_every,
+                "{name}: the settle"
+            );
             assert!(!supdb::Options::default().zpages_recode_keep);
             assert!(!supdb::Options::default().zpages_recode);
             assert!(supdb::Options::default().zpages_drop_raw);
@@ -14089,13 +14112,13 @@ mod tests {
         assert_eq!(every.features(), base.features());
         {
             let e = every.db.as_ref().unwrap().options();
-            assert!(e.forms_settle_every && !supdb::Options::default().forms_settle_every);
+            assert!(e.forms_settle_every);
             assert_eq!(
                 (e.zpages_raw_tails_first, e.zpages_drop_raw, e.zpages_recode),
                 (8, true, false)
             );
             assert_eq!(e.forms_settle_backlog_pct, b.forms_settle_backlog_pct);
-            assert!(!e.forms_settle_builds && !supdb::Options::default().forms_settle_builds);
+            assert!(!e.forms_settle_builds && supdb::Options::default().forms_settle_builds);
         }
         drop(every);
         let builds = new(
@@ -14113,18 +14136,18 @@ mod tests {
             assert_eq!((e.zpages_raw_tails_first, e.zpages_drop_raw), (8, true));
         }
         drop(builds);
-        // The shipping arms with settle-builds: their bases' options but for
-        // the two.
+        // The shipping arms without settle-builds, and the combined arm with
+        // it: their bases' options but for the two.
         for (name, make, base_name, base_make) in [
             (
-                "supdb-settlebuilds",
-                Supdb::create_settlebuilds as fn(&Path) -> Res<Supdb>,
+                "supdb-settlelate",
+                Supdb::create_settlelate as fn(&Path) -> Res<Supdb>,
                 "supdb",
                 Supdb::create as fn(&Path) -> Res<Supdb>,
             ),
             (
-                "supdb-ingestsettlebuilds",
-                Supdb::create_ingest_settlebuilds,
+                "supdb-ingestsettlelate",
+                Supdb::create_ingest_settlelate,
                 "supdb-ingest",
                 Supdb::create_ingest,
             ),
@@ -14144,9 +14167,17 @@ mod tests {
                 arm.db.as_ref().unwrap().options(),
                 base_arm.db.as_ref().unwrap().options(),
             );
-            assert!(a.forms_settle_every && a.forms_settle_builds, "{name}");
-            assert!(
-                !o.forms_settle_every && !o.forms_settle_builds,
+            // The shipping arms' is the shape before the default, the
+            // combined arm's the default pinned on a base pinned without.
+            let late = name.ends_with("settlelate");
+            assert_eq!(
+                (a.forms_settle_every, a.forms_settle_builds),
+                (!late, !late),
+                "{name}"
+            );
+            assert_eq!(
+                (o.forms_settle_every, o.forms_settle_builds),
+                (late, late),
                 "{base_name}"
             );
             assert_eq!(

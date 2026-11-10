@@ -326,6 +326,15 @@ fn opts_z(c: &Cfg) -> Options {
     // cache sheds under a small budget (`Options::zpages_promote_copies`),
     // so the copies, the sheds and the writes spliced into copies are read
     // against the raw store over the same writes.
+    // Under `ZFUZZ_SETTLELATE` the commits leave their batches to the
+    // backlog bound and the scans, the shape before a commit near reads
+    // filed its own and built the blocks it filed into
+    // (`Options::forms_settle_every`, `forms_settle_builds`), so the arm
+    // that keeps it is read against the raw store too. Set, not drawn.
+    if env_flag("ZFUZZ_SETTLELATE") {
+        o.forms_settle_every = false;
+        o.forms_settle_builds = false;
+    }
     // Under `ZFUZZ_SETTLEBUILDS` every commit near reads files its batch
     // and builds the blocks it filed into that held no form
     // (`Options::forms_settle_every`, `forms_settle_builds`), under a
