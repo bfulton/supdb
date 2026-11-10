@@ -17149,6 +17149,10 @@ struct SettleRoom {
 const SETTLE_ROOM_PERIOD: std::time::Duration = std::time::Duration::from_millis(100);
 const SETTLE_ROOM_QUIET: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// The least the list of the fills' forms holds before it is pruned
+/// (`Reader::prune_settle_built`), for a store of a few blocks.
+const SETTLE_BUILT_LIST: usize = 64;
+
 struct FormsState {
     /// PROTOTYPE: the block cache's table for each segment, by position
     /// in `segs`, made on first use and dropped whenever the segments
@@ -24707,6 +24711,7 @@ impl Reader {
         if blocks.is_empty() {
             return Ok(());
         }
+        self.prune_settle_built();
         let np = self.segs().partition_point(|s| s.level > 0);
         let l0 = &self.segs()[np..];
         let ctx = self.build_ctx();
@@ -24748,6 +24753,34 @@ impl Reader {
             ));
         }
         Ok(())
+    }
+
+    /// The list of the forms the fills built (`settle_built_at`) kept to
+    /// what a shed could still take: the entries whose block holds a form
+    /// no scan has walked since, one a block. A build lists its form and
+    /// only a shed emptied the list, so in a store whose room never goes
+    /// -- any store in memory -- it grew by an entry a build for the
+    /// store's life, twelve bytes each, the forms it named long walked,
+    /// rebuilt or gone with their state. Pruned once it holds twice the
+    /// store's blocks, which no shed could take more than one each of, so
+    /// a prune leaves at most half of what calls the next.
+    fn prune_settle_built(&self) {
+        let np = self.segs().partition_point(|s| s.level > 0);
+        let blocks: usize = self.segs()[..np].iter().map(|s| s.blocks()).sum();
+        let mut list = self.fs().settle_built_at.borrow_mut();
+        if list.len() <= SETTLE_BUILT_LIST.max(2 * blocks) {
+            return;
+        }
+        let tables = self.fs().tables.borrow();
+        list.retain(|&(pi, b, tick)| {
+            let (pi, b) = (pi as usize, b as usize);
+            pi < np
+                && tables[pi].borrow().as_ref().is_some_and(|t| {
+                    b < t.slots.len() && t.slots[b].is_some() && t.touched[b] <= tick
+                })
+        });
+        list.sort_unstable();
+        list.dedup_by_key(|e| (e.0, e.1));
     }
 
     /// Whether the fill may build the blocks its settle filed into
@@ -31770,6 +31803,14 @@ impl Db {
     pub fn settle_built(&self) -> u64 {
         self.take_back_upkeep();
         self.r.fs().settle_built.get()
+    }
+
+    /// How many of those forms are listed for a shed
+    /// (`Reader::prune_settle_built`), a test's.
+    #[doc(hidden)]
+    pub fn settle_built_listed(&self) -> usize {
+        self.take_back_upkeep();
+        self.r.fs().settle_built_at.borrow().len()
     }
 
     /// Those forms shed unwalked when the fills' room went

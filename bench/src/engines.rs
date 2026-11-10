@@ -656,7 +656,8 @@ pub struct Supdb {
     rebasedrops: bool,
     /// The fills' forms shed where their room goes while the cache's
     /// budget is not bound, for the commit's fill to build again
-    /// (`Options::forms_settle_sheds_unbound`): `supdb-settleshedunbound`.
+    /// (`Options::forms_settle_sheds_unbound`): `supdb-settleshedunbound`,
+    /// and with the drop above `supdb-rebasedropsshed`.
     settleshedunbound: bool,
     /// Out of core a merge's landing chains the next merge only while
     /// reads are around, where the default chains through a write-only
@@ -1652,7 +1653,8 @@ struct Policy {
     rebasedrops: bool,
     /// The fills' forms shed where their room goes while the cache's
     /// budget is not bound, for the commit's fill to build again
-    /// (`Options::forms_settle_sheds_unbound`): `supdb-settleshedunbound`.
+    /// (`Options::forms_settle_sheds_unbound`): `supdb-settleshedunbound`,
+    /// and with the drop above `supdb-rebasedropsshed`.
     settleshedunbound: bool,
     /// Out of core a merge's landing chains the next merge only while
     /// reads are around, where the default chains through a write-only
@@ -9177,6 +9179,9 @@ impl Engine for Supdb {
         if self.aheadfirst {
             return "supdb-aheadfirst";
         }
+        if self.rebasedrops && self.settleshedunbound {
+            return "supdb-rebasedropsshed";
+        }
         if self.rebasedrops {
             return "supdb-rebasedrops";
         }
@@ -10821,6 +10826,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-aheadfirst"
         | "supdb-rebasedrops"
         | "supdb-settleshedunbound"
+        | "supdb-rebasedropsshed"
         | "supdb-nochainwrites"
         | "supdb-noland"
         | "supdb-landnearscans"
@@ -11550,6 +11556,21 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                 Supdb::with_policy(
                     d,
                     Policy {
+                        settleshedunbound: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        // Both at once, the default as it stood before either: the block
+        // forms a merge's rewrite and a refault each had built a second time.
+        "supdb-rebasedropsshed" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        rebasedrops: true,
                         settleshedunbound: true,
                         ..Policy::default()
                     },

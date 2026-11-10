@@ -877,6 +877,75 @@ fn the_fills_build_only_while_the_refaults_hold_still() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The fills list every form they build, for the shed that takes the
+/// unwalked ones back when their room goes, and only a shed emptied the
+/// list: in a store whose room never goes, which is any store in memory,
+/// it grew by an entry a build for the store's life. It is pruned to the
+/// forms a shed could still take once it holds twice the store's blocks.
+#[test]
+fn the_list_of_the_fills_forms_is_bounded_by_the_stores_blocks() {
+    let dir = scratch("settle-built-list");
+    let inject = std::sync::Arc::new(supdb::ZInject::new());
+    inject.set_refault_rate(0.0);
+    inject.set_budget(1 << 50);
+    let mut db = Db::create(
+        &dir,
+        Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(64 << 10),
+            partition_on_flush: true,
+            publish_in_background: false,
+            upkeep: Upkeep::Inline,
+            scan_block_cache: true,
+            forms_settle_every: true,
+            forms_settle_builds: true,
+            // A rewrite drops the partition's sparse forms, so that every
+            // round below builds its blocks' forms again.
+            rebase_recuts_sparse: false,
+            zpages_inject: Some(inject.clone()),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let value = [b'v'; 100];
+    let keys: Vec<Vec<u8>> = (0..2000).map(|i| format!("k{i:05}").into_bytes()).collect();
+    let mut want = std::collections::BTreeMap::new();
+    for k in &keys {
+        db.put(k, &value);
+        want.insert(k.clone(), vec![value.to_vec()]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let fences = partition_fences(&dir);
+    for round in 0..48usize {
+        // Near reads, then a write into every block or so, filed and built
+        // by the commit, and the flush whose rewrite drops the forms.
+        for (lo, _) in &fences {
+            db.scan(lo, 1, kv(&mut |_, _| {})).unwrap();
+        }
+        for i in (0..keys.len()).step_by(40) {
+            let k = &keys[(i + round) % keys.len()];
+            db.append(k, b"u");
+            want.get_mut(k).unwrap().push(b"u".to_vec());
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+    }
+    let built = db.settle_built();
+    assert!(built >= 600, "the rounds' fills built: {built}");
+    assert_eq!(db.settle_shed(), 0, "and nothing shed them");
+    let listed = db.settle_built_listed();
+    assert!(
+        listed <= 200,
+        "the list holds what a shed could take, not every build: {listed} of {built}"
+    );
+    assert!(scan_model(&db) == want, "the scan answers every write");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The forms the fills built are shed where their room goes, for the page
 /// cache to have back what they took. While the cache's budget is not
 /// bound the commit's own fill builds a form for every overlaid block that
