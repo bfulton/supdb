@@ -1105,6 +1105,9 @@ fn the_builder_ahead_leaves_the_partitions_whose_pages_are_not_in_memory() {
                 scan_block_cache: true,
                 scan_cache_ahead: true,
                 scan_cache_ahead_min_blocks: 0,
+                // The builder at the state's first scan, the one this
+                // test makes.
+                ahead_in_core_scans_div: 0,
                 zpages_inject: Some(inject),
                 ..Options::default()
             },
@@ -6921,6 +6924,9 @@ fn a_builder_ahead_of_the_reader_fills_the_cache() {
         scan_block_cache: true,
         scan_cache_ahead: true,
         scan_cache_ahead_min_blocks: 0,
+        // The builder at the state's first scan: one scan here stands for
+        // a state that is being scanned.
+        ahead_in_core_scans_div: 0,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -11873,6 +11879,99 @@ fn the_builder_ahead_starts_in_core_and_out_of_core_only_under_the_option() {
         m.check(&db, "the writer");
         db.close().unwrap();
     }
+}
+
+/// In core a scan starts the builder ahead once the state's scans number
+/// its blocks over `Options::ahead_in_core_scans_div`, and at the state's
+/// first scan where the option is zero, the shape before: a pass shorter
+/// than the builder's run paid for the install of forms it never walked.
+/// The scans it waits through build what they walk and answer the model,
+/// the count of scans it waits for is the blocks over the option at two
+/// values of it, and out of core the option decides nothing.
+#[test]
+fn a_scan_starts_the_builder_ahead_in_core_once_the_state_is_scanned() {
+    // The scans a state takes before a builder starts, capped.
+    let scans_to_start = |div: u64, gate: u8| -> (u64, bool) {
+        let d = dir(&format!("ahead-scanned-{div}-{gate}"));
+        let opts = Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(2 << 10),
+            l0_trigger: 64,
+            scan_block_cache: true,
+            scan_cache_ahead_min_blocks: 0,
+            // The scans start the builder here and no commit does.
+            commit_forms_build: false,
+            upkeep: supdb::Upkeep::Inline,
+            zpages: supdb::ZPages::Off,
+            ahead_in_core_scans_div: div,
+            ahead_out_of_core_scans: 0,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in 0..6000u32 {
+            m.append(&mut db, &key(k), "v0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        db.settle().unwrap();
+        db.zgate_set(gate);
+        for k in (0..6000u32).step_by(5) {
+            m.append(&mut db, &key(k), "v1");
+        }
+        db.commit().unwrap();
+        let started = |db: &Db| db.forms_events()[2];
+        assert_eq!(started(&db), 0, "div {div}: no commit started a builder");
+        let mut sink = 0usize;
+        let mut n = 0u64;
+        while started(&db) == 0 && n < 2000 {
+            let from = key(((n * 37) % 6000) as u32);
+            db.scan(from.as_bytes(), 5, kv(&mut |_k, v| sink += v.len()))
+                .unwrap();
+            n += 1;
+        }
+        let did = started(&db) > 0;
+        // A state's one builder, however many scans come after.
+        for i in 0..50u32 {
+            db.scan(key(i * 100).as_bytes(), 5, kv(&mut |_k, v| sink += v.len()))
+                .unwrap();
+        }
+        assert!(started(&db) <= 1, "div {div}: one builder a state");
+        db.settle().unwrap();
+        m.check(&db, "the writer");
+        let r = db.reader().unwrap();
+        m.check(&r, "a reader");
+        drop(r);
+        db.close().unwrap();
+        (n, did)
+    };
+    let (first, did) = scans_to_start(0, 0);
+    assert!(
+        did && first == 1,
+        "zero starts it at the first scan: {first}"
+    );
+    let (n8, did8) = scans_to_start(8, 0);
+    let (n2, did2) = scans_to_start(2, 0);
+    assert!(did8 && did2);
+    assert!(
+        n8 > 4,
+        "an eighth of the blocks is more than a few scans: {n8}"
+    );
+    // `n` is the first count with `n * div >= blocks`: the two readings
+    // bracket one block count.
+    let (lo, hi) = (((n8 - 1) * 8).max((n2 - 1) * 2), (n8 * 8).min(n2 * 2));
+    assert!(
+        lo < hi,
+        "the scans waited for are the blocks over the option: {n8} at an eighth, {n2} at a half"
+    );
+    // Out of core the builder's own count decides, here none.
+    let (ooc, did) = scans_to_start(8, 1);
+    assert!(
+        did && ooc == 1,
+        "out of core the option decides nothing: {ooc}"
+    );
 }
 
 /// EXPERIMENT: the forms are published for a handle and not before.

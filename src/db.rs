@@ -2560,6 +2560,26 @@ pub struct Options {
     /// builder's bet is placed where the scans that pay it are
     /// (`docs/engine.md`). `supdb-aheadeager` starts it at the first scan.
     pub ahead_out_of_core_scans: u64,
+    /// In core the builder ahead starts at a scan once the scans over the
+    /// state number its blocks over this: by then the scans have walked
+    /// about a fifth of the blocks themselves, which is the evidence that
+    /// the state is being scanned and that forms built ahead of the scans
+    /// will be walked. It started at the state's first scan, and its
+    /// forms come back to the scanning thread in one install: at three
+    /// million keys under 1.25 GiB the pass after the lag sweep's
+    /// ten-percent burst, three thousand scans in thirteen milliseconds
+    /// over a ninth of the store's blocks, read 20-32 ms in seven passes
+    /// of twelve with the builder, 3-7 ms of it the install of thirty
+    /// thousand forms the pass never walked, and 13-20 ms in twelve of
+    /// twelve without; in core at a hundred thousand to a million keys
+    /// the builder moved no lag pass either way, and what it buys is E,
+    /// a hundred thousand scans over one state and 1.22x at a million
+    /// keys (`docs/engine.md`). Out of core `ahead_out_of_core_scans` is
+    /// the count, and a commit that starts the builder starts it as
+    /// before. Zero starts it at a state's first scan;
+    /// `supdb-aheadfirst` is that arm.
+    #[doc(hidden)]
+    pub ahead_in_core_scans_div: u64,
     /// EXPERIMENT: the range-read structure written at ingest. The writer
     /// keeps a canonical form of every block an unsealed key overlays
     /// current at each commit, the builder ahead having made the first
@@ -4817,6 +4837,7 @@ impl Default for Options {
             ahead_out_of_core: true,
             ahead_resident_pct: 90,
             ahead_out_of_core_scans: 100_000,
+            ahead_in_core_scans_div: 8,
             commit_forms: true,
             forms_from_reader_scans: 0,
             commit_forms_build: true,
@@ -26273,6 +26294,7 @@ impl Reader {
                 .as_ref()
                 .is_none_or(|a| a.gen != gen)
             && !lazy
+            && self.ahead_scanned()
         {
             let t = self.tick_start();
             self.start_ahead();
@@ -31906,6 +31928,28 @@ impl Db {
 }
 
 impl Reader {
+    /// Whether the state has been scanned enough for a scan to start the
+    /// builder ahead in core: its scans times the option at least the
+    /// partitions' blocks (`Options::ahead_in_core_scans_div`). Out of
+    /// core the builder's own count decides (`start_ahead`).
+    fn ahead_scanned(&self) -> bool {
+        let div = self.opts.ahead_in_core_scans_div;
+        if div == 0 || self.shared.zgate.load() != zselect::GATE_RAW {
+            return true;
+        }
+        let blocks: u64 = self
+            .segs()
+            .iter()
+            .take_while(|s| s.level > 0)
+            .map(|s| s.blocks() as u64)
+            .sum();
+        self.state()
+            .scans
+            .load(AtomicOrdering::Relaxed)
+            .saturating_mul(div)
+            >= blocks
+    }
+
     /// PROTOTYPE: the builder started over the state as of the last
     /// commit, by the writer's own handle at its first scan on the block
     /// path over a state: a reader handle of its own, pinned to this

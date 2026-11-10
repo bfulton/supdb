@@ -646,6 +646,10 @@ pub struct Supdb {
     /// (`Options::ahead_out_of_core_scans` zero), the shape the lag sweep
     /// priced against: `supdb-aheadeager`.
     aheadeager: bool,
+    /// The builder ahead in core starting at a state's first scan
+    /// (`Options::ahead_in_core_scans_div` zero), the shape before it
+    /// waited for a state that is being scanned: `supdb-aheadfirst`.
+    aheadfirst: bool,
     /// Out of core a merge's landing chains the next merge only while
     /// reads are around, where the default chains through a write-only
     /// stretch too (`Options::merge_chains_writes` off).
@@ -1630,6 +1634,10 @@ struct Policy {
     /// (`Options::ahead_out_of_core_scans` zero), the shape the lag sweep
     /// priced against: `supdb-aheadeager`.
     aheadeager: bool,
+    /// The builder ahead in core starting at a state's first scan
+    /// (`Options::ahead_in_core_scans_div` zero), the shape before it
+    /// waited for a state that is being scanned: `supdb-aheadfirst`.
+    aheadfirst: bool,
     /// Out of core a merge's landing chains the next merge only while
     /// reads are around, where the default chains through a write-only
     /// stretch too (`Options::merge_chains_writes` off).
@@ -2301,6 +2309,7 @@ impl Default for Policy {
             aheadincore: false,
             aheadcold: false,
             aheadeager: false,
+            aheadfirst: false,
             nochainwrites: false,
             noland: false,
             landnearscans: false,
@@ -7483,6 +7492,7 @@ impl Supdb {
             aheadincore,
             aheadcold,
             aheadeager,
+            aheadfirst,
             nochainwrites,
             noland,
             landnearscans,
@@ -7865,6 +7875,11 @@ impl Supdb {
             } else {
                 supdb::Options::default().ahead_out_of_core_scans
             },
+            ahead_in_core_scans_div: if aheadfirst {
+                0
+            } else {
+                supdb::Options::default().ahead_in_core_scans_div
+            },
             merge_chains_writes: !nochainwrites,
             zpages_land_scans_far: !landnearscans,
             merge_plan_idle: !noidleplan,
@@ -8197,6 +8212,7 @@ impl Supdb {
             aheadincore,
             aheadcold,
             aheadeager,
+            aheadfirst,
             nochainwrites,
             noland,
             landnearscans,
@@ -9133,6 +9149,9 @@ impl Engine for Supdb {
         }
         if self.aheadeager {
             return "supdb-aheadeager";
+        }
+        if self.aheadfirst {
+            return "supdb-aheadfirst";
         }
         if self.nochainwrites {
             return if self.partition {
@@ -10766,6 +10785,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-aheadincore"
         | "supdb-aheadcold"
         | "supdb-aheadeager"
+        | "supdb-aheadfirst"
         | "supdb-nochainwrites"
         | "supdb-noland"
         | "supdb-landnearscans"
@@ -11460,6 +11480,18 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     d,
                     Policy {
                         aheadeager: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-aheadfirst" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        aheadfirst: true,
                         ..Policy::default()
                     },
                 )
