@@ -4251,6 +4251,34 @@ assertion that a structure exists is held to the structure's content,
 since a fallback that makes something of the same size satisfies its
 length.
 
+**Advice taken for an order, and a wait for work nobody was doing.** The
+lag sweep's clean-store pass at ten million keys under 1.25 GiB read two
+shapes, its scans taking a seventh of LMDB's major faults in one rep and
+four fifths in two, and the row's own per-rep quantities split them --
+the scans' major faults, the bytes other threads read, the device's time
+a read -- before any probe; twelve sweeps then failed to reproduce it at
+its worst, and the one line that separated the mild cases was the
+sampler's fault price on the trace. A shuffled load's last merge drops its outputs' form files as
+it builds them, its landing takes the store past the selector's line, and
+the crossing asks all of them back a second before the first scan. Read
+as a race with the read-in, that got two fixes its pairings refuted. Files
+kept at their build were gone by the landing, the rule this file already
+had for a page written once and never read, and were left dirty besides.
+A settle that waited for the read found no read: the residency it polled
+stood at half the files and did not move, because `POSIX_FADV_WILLNEED`
+is advice and a group at its limit reads what it has pages for and drops
+the rest without a word. The settle asks again where its looks stall,
+with room made first, and the slow shape went from two sweeps of seven to
+none (`Options::zpages_settle_joins_asks`). The rules: an ask of the
+kernel is held to the kernel's count of what it did (`mincore`), at the
+point that depends on it, and made again where it fell short, since
+advice declined raises nothing; a wait is written against the state it
+waits for and prints that state, since the first version of the wait
+would have read as a fix that did nothing until its trace line said
+`360.9 -> 360.9`; and a mechanism read off timing -- a read "still
+running" -- is confirmed by a count of the thing itself before a fix is
+built on it, twice here it was not.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
