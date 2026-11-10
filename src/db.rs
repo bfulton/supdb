@@ -735,6 +735,14 @@ pub struct ZCounts {
     /// that asked, and the files.
     pub rewarms: u64,
     pub rewarm_files: u64,
+    /// A settle's waits for the form files the store asked the kernel for
+    /// (`Options::zpages_settle_joins_asks`), their looks at the files'
+    /// residency, the asks they made again for files the kernel had left
+    /// short, and their milliseconds.
+    pub ask_joins: u64,
+    pub ask_join_polls: u64,
+    pub ask_join_reasks: u64,
+    pub ask_join_ms: u64,
     /// The rewarms that trimmed the allocator first
     /// (`Options::zpages_rewarm_trims`), and the resident free bytes the
     /// trims gave back.
@@ -4552,6 +4560,21 @@ pub struct Options {
     /// mixes found no form file cold (`docs/engine.md`). On;
     /// `supdb-norewarm` asks for nothing.
     pub zpages_rewarm_scans: bool,
+    /// A settle waits for the form files the store has asked the kernel
+    /// for -- at the look that first finds it past the selector's line
+    /// (`Maint::z_cross`) and at a rewarm (`zpages_rewarm_scans`) -- until
+    /// nine tenths of their pages are resident, asking again for what the
+    /// kernel left short (`Maint::z_join_asks`). Both asks are advice,
+    /// answered behind the call or not at all: a shuffled load's last
+    /// merge writes its outputs' form files and drops them, the bet a
+    /// build ahead makes, the landing that takes the store past the line
+    /// asks every one back, and in some loads the kernel brought half of
+    /// them and no more, so the lag sweep's first scans, a second later,
+    /// read the rest a fault at a time (`docs/engine.md`). Counted
+    /// (`ZCounts::ask_joins`, `ask_join_reasks`). On; `supdb-zsettleloose`
+    /// returns without the wait.
+    #[doc(hidden)]
+    pub zpages_settle_joins_asks: bool,
     /// EXPERIMENT: the rewarm gives the allocator's free pages back to the
     /// system (`malloc_trim`) before it asks for the cold form files, so
     /// the pages it brings in have the room the process's resident free
@@ -4877,6 +4900,7 @@ impl Default for Options {
             zpages_hot_cold_back: false,
             zpages_hot_back_ask: true,
             zpages_rewarm_scans: true,
+            zpages_settle_joins_asks: true,
             zpages_rewarm_trims: false,
         }
     }
@@ -20411,6 +20435,10 @@ impl Reader {
             hot_back_waited: get(&ev.hot_back_waited),
             rewarms: get(&ev.rewarms),
             rewarm_files: get(&ev.rewarm_files),
+            ask_joins: get(&ev.ask_joins),
+            ask_join_polls: get(&ev.ask_join_polls),
+            ask_join_reasks: get(&ev.ask_join_reasks),
+            ask_join_ms: get(&ev.ask_join_ms),
             rewarm_trims: get(&ev.rewarm_trims),
             rewarm_trim_bytes: get(&ev.rewarm_trim_bytes),
             reparses: get(&ev.reparses),
@@ -37909,6 +37937,18 @@ pub const HOT_RAW_WINDOW: usize = 8;
 /// raw reads would queue behind it -- and no ask is made again for this
 /// long.
 const HOT_RAW_RESIDENT: f64 = 0.9;
+/// A settle's wait for the form files the store asked the kernel for
+/// (`Options::zpages_settle_joins_asks`): how often it looks at their
+/// residency, how many looks in a row with no page more end it once it has
+/// no ask left to make again, and the longest it waits whatever the looks
+/// find.
+const ASK_JOIN_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+const ASK_JOIN_STALLS: u32 = 10;
+/// The looks in a row with no page more after which the wait asks again
+/// for the files still short, and how many times it does.
+const ASK_JOIN_REASK_AT: u32 = 2;
+const ASK_JOIN_REASKS: u32 = 3;
+const ASK_JOIN_CAP: std::time::Duration = std::time::Duration::from_secs(20);
 /// How long a stretch without a scan is before the scans after it have the
 /// cold form files asked for (`Options::zpages_rewarm_scans`): longer than
 /// the gaps between a pass's scans and between the mixes' scans, shorter
@@ -38209,6 +38249,9 @@ struct Maint {
     /// Whether the store's look past that line has swapped the partitions
     /// built ahead under it (`Maint::z_cross`): once a store.
     z_crossed: bool,
+    /// The store has asked the kernel for form files since a settle last
+    /// waited for them (`Options::zpages_settle_joins_asks`).
+    z_ask_pending: bool,
     /// The coding each build ahead wrote, by its form file's name, whether
     /// raw-tailed: a build ahead at landing comes before the sampler's
     /// pick (`Options::zpages_coding_auto`) and takes the options' coding,
@@ -38448,6 +38491,7 @@ impl Maint {
                 self.join_tier()?;
                 z_finish_wait(&self.shared);
                 self.z_rewarm_join();
+                self.z_join_asks();
                 self.sync_owed_slot()
             }
             MaintAsk::ZSettle => {
@@ -38456,6 +38500,7 @@ impl Maint {
                 self.join_tier()?;
                 z_finish_wait(&self.shared);
                 self.z_rewarm_join();
+                self.z_join_asks();
                 // Every partition given its form file or its reason, one
                 // build at a time, with whatever lands meanwhile landed:
                 // a merge's outputs are partitions of their own and get
@@ -38844,6 +38889,7 @@ impl Maint {
             z_land_sus: false,
             z_land_reason: std::cell::Cell::new(u8::MAX),
             z_crossed: false,
+            z_ask_pending: false,
             z_land_due: false,
             z_ahead_coding: std::collections::HashMap::new(),
             z_recode_last: None,
@@ -41474,6 +41520,7 @@ impl Maint {
         }
         zfile::ZEvents::add(&self.shared.z.rewarms, 1);
         zfile::ZEvents::add(&self.shared.z.rewarm_files, paths.len() as u64);
+        self.z_ask_pending = true;
         let (trims, shared, trace) = (
             self.opts.zpages_rewarm_trims,
             self.shared.clone(),
@@ -41517,6 +41564,127 @@ impl Maint {
     fn z_rewarm_join(&mut self) {
         if let Some(h) = self.z_rewarm.take() {
             let _ = h.join();
+        }
+    }
+
+    /// The kernel's read of the form files the store asked for, waited
+    /// out (`Options::zpages_settle_joins_asks`): the live partitions'
+    /// form files on disk, each mapped by its path so the wait holds
+    /// nothing a landing retires, looked at every `ASK_JOIN_POLL` until
+    /// `HOT_RAW_RESIDENT` of their pages are resident. An ask is advice,
+    /// and the kernel drops what it has no page for without a word: the
+    /// crossing's ask at ten million keys under 1.25 GiB left 361 and 593
+    /// of its 746 MiB resident in two sweeps of three and brought nothing
+    /// more in the second after, the group at its limit while the merge
+    /// that had just landed still held the cache. So where
+    /// `ASK_JOIN_REASK_AT` looks in a row find no page more, the files
+    /// still short are asked for again, the records of a partition its
+    /// form serves dropped first for the room (`zfile::swap_ahead`), up to
+    /// `ASK_JOIN_REASKS` times; and the wait ends at `ASK_JOIN_STALLS`
+    /// looks with no page more after the last of them -- a device that has
+    /// stopped, or a page cache giving the pages up as fast as they come
+    /// -- or at `ASK_JOIN_CAP`. Once an ask: a settle after it finds
+    /// nothing pending.
+    fn z_join_asks(&mut self) {
+        if !self.opts.zpages_settle_joins_asks || !std::mem::take(&mut self.z_ask_pending) {
+            return;
+        }
+        struct Asked {
+            seg: PathBuf,
+            records: Option<(u64, u64)>,
+            drop_records: bool,
+            form: PathBuf,
+            map: MmapBytes,
+        }
+        // Before any install a partition past the line has its records
+        // dropped for its form file, as the crossing left it; after one,
+        // only a partition its form serves: one served raw on purpose
+        // (`Options::zpages_hot_raw`) keeps its records.
+        let installed = self.zsel.counts().installs > 0;
+        let asked: Vec<Asked> = {
+            let _op = self.op();
+            self.segs()
+                .iter()
+                .filter(|s| s.level > 0)
+                .filter_map(|s| {
+                    let (id, end) = (Db::name_id(&s.name)?, Db::name_end_seq(&s.name)?);
+                    let form = self.dir.join(zfile::zpg_name(id, end));
+                    let map = MmapBytes::open(&form).ok()?;
+                    Some(Asked {
+                        seg: self.dir.join(&s.name),
+                        records: s.blob.for_zfile().record_region_span(),
+                        drop_records: s.z.get().is_some() || !installed,
+                        form,
+                        map,
+                    })
+                })
+                .collect()
+        };
+        let size: u64 = asked.iter().map(|a| a.map.0.len() as u64).sum();
+        if size == 0 {
+            return;
+        }
+        let inject = self.opts.zpages_inject.clone();
+        let resident = || -> u64 {
+            if inject.as_ref().is_some_and(|i| i.take_asked_hold()) {
+                return 0;
+            }
+            asked
+                .iter()
+                .map(|a| (resident_share(&a.map.0[..]) * a.map.0.len() as f64) as u64)
+                .sum()
+        };
+        let ask_again = || {
+            for a in &asked {
+                if resident_share(&a.map.0[..]) >= HOT_RAW_RESIDENT {
+                    continue;
+                }
+                match (a.drop_records, a.records, File::open(&a.seg)) {
+                    (true, Some((at, len)), Ok(f)) => {
+                        zfile::swap_ahead(&f, at, len, &a.form);
+                    }
+                    _ => {
+                        let _ = crate::bytes::Bytes::advise_willneed(&a.map, 0, a.map.0.len());
+                    }
+                }
+            }
+        };
+        let t0 = std::time::Instant::now();
+        let first = resident();
+        let (mut polls, mut now, mut best) = (1u64, first, first);
+        let (mut stalls, mut reasks) = (0u32, 0u32);
+        while (now as f64) < size as f64 * HOT_RAW_RESIDENT && t0.elapsed() < ASK_JOIN_CAP {
+            if now > best {
+                best = now;
+                stalls = 0;
+            } else {
+                stalls += 1;
+                if stalls == ASK_JOIN_REASK_AT && reasks < ASK_JOIN_REASKS {
+                    ask_again();
+                    reasks += 1;
+                    stalls = 0;
+                } else if stalls >= ASK_JOIN_STALLS {
+                    break;
+                }
+            }
+            std::thread::sleep(ASK_JOIN_POLL);
+            now = resident();
+            polls += 1;
+        }
+        let ms = t0.elapsed().as_millis() as u64;
+        let ev = &self.shared.z;
+        zfile::ZEvents::add(&ev.ask_joins, 1);
+        zfile::ZEvents::add(&ev.ask_join_polls, polls);
+        zfile::ZEvents::add(&ev.ask_join_reasks, u64::from(reasks));
+        zfile::ZEvents::add(&ev.ask_join_ms, ms);
+        if self.z_trace {
+            eprintln!(
+                "zjoin t={:.1} waited_ms {ms} looks {polls} reasks {reasks} resident_mb {:.1} -> {:.1} of {:.1}",
+                self.z_epoch.elapsed().as_secs_f64(),
+                first as f64 / 1048576.0,
+                now as f64 / 1048576.0,
+                size as f64 / 1048576.0
+            );
         }
     }
 
@@ -43144,6 +43312,7 @@ impl Maint {
         if self.z_land_past && !self.z_crossed && self.opts.zpages_land_drop_past {
             self.z_crossed = true;
             self.z_cross();
+            self.z_ask_pending = true;
         }
     }
 

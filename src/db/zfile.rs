@@ -3761,6 +3761,13 @@ pub(super) struct ZEvents {
     /// that asked, and the files.
     pub rewarms: AtomicU64,
     pub rewarm_files: AtomicU64,
+    /// A settle's waits for the form files the store asked the kernel for
+    /// (`Options::zpages_settle_joins_asks`): the waits, their looks at the
+    /// files' residency, the asks made again, and their milliseconds.
+    pub ask_joins: AtomicU64,
+    pub ask_join_polls: AtomicU64,
+    pub ask_join_reasks: AtomicU64,
+    pub ask_join_ms: AtomicU64,
     /// The rewarms that trimmed the allocator first
     /// (`Options::zpages_rewarm_trims`), and the resident free bytes the
     /// trims gave back.
@@ -4896,6 +4903,12 @@ pub struct ZInject {
     /// it, for the hot-raw policy's room (`Options::zpages_hot_raw_slack`);
     /// `u64::MAX` for none, which leaves the policy its fill line.
     pub slack: AtomicU64,
+    /// Looks at the asked form files' residency that a settle's wait for
+    /// them reads as nothing resident yet
+    /// (`Options::zpages_settle_joins_asks`), counted down by the looks: a
+    /// test's files are a mebibyte and resident before the first look, so
+    /// the wait is held to waiting, and to giving up, through this.
+    pub asked_holds: AtomicU64,
 }
 
 impl Default for ZInject {
@@ -4909,6 +4922,7 @@ impl Default for ZInject {
             decode_cost_ns: AtomicU64::new(0),
             records_resident: AtomicU64::new(u64::MAX),
             slack: AtomicU64::new(u64::MAX),
+            asked_holds: AtomicU64::new(0),
         }
     }
 }
@@ -4925,6 +4939,19 @@ impl ZInject {
 
     pub fn set_slack(&self, bytes: u64) {
         self.slack.store(bytes, Ordering::Release);
+    }
+
+    /// The next `looks` looks of a settle's wait for the asked form files
+    /// read nothing resident.
+    pub fn hold_asked(&self, looks: u64) {
+        self.asked_holds.store(looks, Ordering::Release);
+    }
+
+    /// One held look taken, if any is left.
+    pub(super) fn take_asked_hold(&self) -> bool {
+        self.asked_holds
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
     }
 
     pub fn slack(&self) -> Option<u64> {

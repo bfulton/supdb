@@ -831,6 +831,10 @@ pub struct Supdb {
     /// at create, the shape `Options::wal_ahead_bytes` replaced (zero).
     /// `supdb-walprefill`.
     walprefill: bool,
+    /// A settle that returns without waiting for the form files the store
+    /// asked the kernel for (`Options::zpages_settle_joins_asks` off).
+    /// `supdb-zsettleloose`.
+    zsettleloose: bool,
     /// A direct run's record stream kept whole in the arena, the shape
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
@@ -1803,6 +1807,10 @@ struct Policy {
     /// at create, the shape `Options::wal_ahead_bytes` replaced (zero).
     /// `supdb-walprefill`.
     walprefill: bool,
+    /// A settle that returns without waiting for the form files the store
+    /// asked the kernel for (`Options::zpages_settle_joins_asks` off).
+    /// `supdb-zsettleloose`.
+    zsettleloose: bool,
     /// A direct run's record stream kept whole in the arena, the shape
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
@@ -2327,6 +2335,7 @@ impl Default for Policy {
             fillposted: false,
             walappend: false,
             walprefill: false,
+            zsettleloose: false,
             norecycle: false,
             heapblocks: false,
             keysarena: false,
@@ -5874,6 +5883,18 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose settle does not wait for the form files the store
+    /// asked the kernel for (`Options::zpages_settle_joins_asks` off).
+    pub fn create_zsettleloose(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zsettleloose: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` whose upkeep thread fills whatever the writer has posted
     /// (`Options::upkeep_fill_skips_posted` off).
     pub fn create_fillposted(path: &Path) -> Res<Supdb> {
@@ -7471,6 +7492,7 @@ impl Supdb {
             fillposted,
             walappend,
             walprefill,
+            zsettleloose,
             norecycle,
             heapblocks,
             keysarena,
@@ -7859,6 +7881,7 @@ impl Supdb {
             upkeep_fill_skips_posted: !fillposted,
             recycle_wal: !walappend,
             wal_ahead_bytes: if walprefill { 0 } else { 1 << 20 },
+            zpages_settle_joins_asks: !zsettleloose,
             prefault: populate,
             direct_put_one: !recordsteps,
             direct_stream: !copyvals && !refvals,
@@ -8180,6 +8203,7 @@ impl Supdb {
             fillposted,
             walappend,
             walprefill,
+            zsettleloose,
             norecycle,
             heapblocks,
             keysarena,
@@ -9280,6 +9304,9 @@ impl Engine for Supdb {
         if self.walprefill {
             return "supdb-walprefill";
         }
+        if self.zsettleloose {
+            return "supdb-zsettleloose";
+        }
         if self.oocz {
             return "supdb-oocz";
         }
@@ -9841,6 +9868,9 @@ impl Engine for Supdb {
             ("zpage_hot_back_asks", z.hot_back_asks as f64),
             ("zpage_rewarms", z.rewarms as f64),
             ("zpage_rewarm_files", z.rewarm_files as f64),
+            ("zpage_ask_joins", z.ask_joins as f64),
+            ("zpage_ask_join_reasks", z.ask_join_reasks as f64),
+            ("zpage_ask_join_ms", z.ask_join_ms as f64),
             ("zpage_rewarm_trims", z.rewarm_trims as f64),
             ("zpage_rewarm_trim_bytes", z.rewarm_trim_bytes as f64),
             ("forms_off_entries", db.forms_off_counts()[0] as f64),
@@ -10738,6 +10768,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-fillposted"
         | "supdb-walappend"
         | "supdb-walprefill"
+        | "supdb-zsettleloose"
         | "supdb-norecycle"
         | "supdb-heapblocks"
         | "supdb-keysarena"
@@ -11567,6 +11598,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-fillposted" => supdb_arm(Supdb::create_fillposted, dir)?,
         "supdb-walappend" => supdb_arm(Supdb::create_walappend, dir)?,
         "supdb-walprefill" => supdb_arm(Supdb::create_walprefill, dir)?,
+        "supdb-zsettleloose" => supdb_arm(Supdb::create_zsettleloose, dir)?,
         "supdb-ingestlatesync" => supdb_arm(Supdb::create_ingest_latesync, dir)?,
         "supdb-norecycle" => supdb_arm(Supdb::create_norecycle, dir)?,
         "supdb-ingestnorecycle" => supdb_arm(Supdb::create_ingest_norecycle, dir)?,
@@ -13226,6 +13258,13 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.wal_ahead_bytes == 0 && b.wal_ahead_bytes > 0);
+            }
+            {
+                let z = Supdb::create_zsettleloose(&dir("zsettleloose")).unwrap();
+                assert_eq!(z.name(), "supdb-zsettleloose");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.zpages_settle_joins_asks && b.zpages_settle_joins_asks);
             }
             {
                 let z = Supdb::create_sweepwalks(&dir("sweepwalks")).unwrap();

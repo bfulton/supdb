@@ -8231,6 +8231,136 @@ fn builds_ahead_at_landing_start_past_the_percent_and_only_from_resident_records
     }
 }
 
+/// A settle waits for the form files the store has asked the kernel for
+/// and asks again for the ones the kernel left out
+/// (`Options::zpages_settle_joins_asks`): a store built ahead under its
+/// budget and then taken past the selector's line, whose crossing drops the
+/// records and asks the files back behind the call. An ask the kernel did
+/// not answer is made by putting the files out of the page cache once the
+/// crossing's ask has brought them: the settle finds them out, asks again
+/// where its looks stall, and returns with them in, by the kernel's own
+/// count; with the option off the settle looks at nothing and the files
+/// stay out. And the wait's bound, through the seam that holds its looks
+/// (`ZInject::hold_asked`): with every look reading nothing resident it
+/// asks again as often as it may and gives up at the looks a stall is after
+/// the last. A settle before any ask and a settle after the wait look at
+/// nothing, and the store reads as it did throughout.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_settle_waits_for_the_form_files_the_store_asked_for() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Case {
+        Evicted,
+        Held,
+        Off,
+    }
+    for case in [Case::Evicted, Case::Held, Case::Off] {
+        let what = format!("settle joins asks, {case:?}");
+        let (dir, mut db, model, inject, raw) =
+            land_store_with(&format!("auto-join-asks-{case:?}"), 50, |o| {
+                o.zpages_settle_joins_asks = case != Case::Off;
+                // The swap at the crossing before any buy, as the
+                // crossing's own test has it.
+                o.zpages_cover_resident = false;
+                o.zpages_suspect_at_crossing = false;
+                o.zpages_attach_eager = false;
+            });
+        inject.set_budget(raw * 3 / 2);
+        assert!(
+            tick_until(&db, 200, |c| c.prebuilt >= c.partitions),
+            "{what}: built ahead: {:?}",
+            db.zpage_counts()
+        );
+        // Nothing asked for yet: a settle looks at nothing.
+        db.settle().unwrap();
+        assert_eq!(
+            db.zpage_counts().ask_joins,
+            0,
+            "{what}: a wait with nothing asked"
+        );
+        inject.set_budget(raw * 2 / 3);
+        assert!(
+            tick_until(&db, 200, |c| c.ahead_swapped >= c.partitions),
+            "{what}: swapped: {:?}",
+            db.zpage_counts()
+        );
+        // The crossing's own ask answered, and then the files put out: the
+        // state an ask the kernel dropped leaves, made on purpose.
+        let t0 = std::time::Instant::now();
+        while {
+            let (size, resident) = resident_under(&dir, "zpg-");
+            resident * 2 < size && t0.elapsed() < std::time::Duration::from_secs(20)
+        } {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        for f in form_files(&dir) {
+            evict(&f);
+        }
+        let (size, out) = resident_under(&dir, "zpg-");
+        assert!(
+            size > 0 && out * 4 < size,
+            "{what}: the files were not put out: {out} of {size}"
+        );
+        if case == Case::Held {
+            inject.hold_asked(100);
+        }
+        db.settle().unwrap();
+        let c = db.zpage_counts();
+        let (size, resident) = resident_under(&dir, "zpg-");
+        match case {
+            Case::Evicted => {
+                assert_eq!(c.ask_joins, 1, "{what}: one wait an ask: {c:?}");
+                assert!(
+                    c.ask_join_reasks >= 1,
+                    "{what}: files left out and no ask made again: {c:?}"
+                );
+                assert!(
+                    resident * 10 >= size * 9,
+                    "{what}: the settle returned without the files: {resident} of {size}: {c:?}"
+                );
+            }
+            Case::Held => {
+                // No look found a page more: two looks and an ask again,
+                // three times over, then the looks a stall is -- the first
+                // look, six beside the asks, and nine before the tenth
+                // stall ends the wait.
+                assert_eq!(
+                    (c.ask_joins, c.ask_join_reasks, c.ask_join_polls),
+                    (1, 3, 16),
+                    "{what}: the asks again and the stall's looks: {c:?}"
+                );
+            }
+            Case::Off => {
+                assert_eq!(
+                    (c.ask_joins, c.ask_join_polls, c.ask_join_reasks),
+                    (0, 0, 0),
+                    "{what}: a wait with the option off: {c:?}"
+                );
+                assert!(
+                    resident * 4 < size,
+                    "{what}: the files came back with nothing asking: {resident} of {size}"
+                );
+            }
+        }
+        if case != Case::Off {
+            // Once an ask: the next settle finds nothing pending.
+            db.settle().unwrap();
+            assert_eq!(
+                db.zpage_counts().ask_joins,
+                1,
+                "{what}: a second wait for one ask"
+            );
+        }
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let some: Vec<Vec<u8>> = keys.iter().step_by(97).cloned().collect();
+        let r = db.reader().unwrap();
+        check(&r, &model, &some, &what);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// A form file built ahead below the selector's line, written back as it
 /// was built, is synced once it has its name, on its build's thread
 /// (`Options::zpages_build_sync`), so that the device's flush of it is the
