@@ -5036,13 +5036,13 @@ fn wal_ahead(opts: &Options) -> Option<(u64, bool, u64)> {
 
 /// The largest commit that pre-writes, and that counts toward a run
 /// (`Options::wal_ahead_small_runs`). Six mebibytes of commits of one
-/// size, appended against pre-written (`bench/examples/walsync.rs`),
-/// read the pre-written log ahead up to forty kilobytes a commit in two
-/// sittings at the device's two speeds, level at forty-eight in one of
-/// them and behind from fifty-six, and at 0.55-0.7x of the appended log
-/// from ninety-six up in both; a write mix's commit of a hundred writes
-/// is seventeen kilobytes and a load's of a thousand a hundred and
-/// thirty.
+/// size, appended against pre-written a megabyte at a step
+/// (`bench/examples/walsync.rs`), read the pre-written log ahead up to
+/// forty kilobytes a commit in two sittings, 1.1-1.8x, level at
+/// forty-eight in one of them, behind from fifty-six in both, and at
+/// 0.6-0.85x of the appended log from eighty up; a write mix's commit of
+/// a hundred writes is seventeen kilobytes and a load's of a thousand a
+/// hundred and thirty.
 const WAL_AHEAD_COMMIT: u64 = 32 << 10;
 
 /// The WAL file starts with eight bytes, this name and a kind byte, so a

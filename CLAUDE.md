@@ -4237,7 +4237,8 @@ synced, and kept 32 MiB at rest in every store, which no pairing sees: the
 suite makes a store a pass, and a pairing prices the passes. The tests make
 hundreds, and the gate with that shape as the default would have left tens
 of gigabytes on an allowance of eighteen. The pre-write follows the tail
-now, a mebibyte ahead, flushed by the commit that reaches it. And the test
+now, a mebibyte ahead, flushed by the commit that reaches it (ahead of
+which commits, the megabyte's own shape below says). And the test
 written for the recycled file's stale frames passed under the whole-file
 pre-write for the wrong reason: its keys ascended, went to a segment
 directly and never touched the log, and its assertion that the live file
@@ -4278,6 +4279,54 @@ would have read as a fix that did nothing until its trace line said
 `360.9 -> 360.9`; and a mechanism read off timing -- a read "still
 running" -- is confirmed by a count of the thing itself before a fix is
 built on it, twice here it was not.
+
+**A megabyte bought at the first commit, and three policies built before
+the device was priced.** The WAL's pre-write went in as a mebibyte of
+zeros ahead of every commit, priced on the write mixes at three and ten
+million keys, and the quick row a day later read ycsb-B at ten thousand
+keys at half of LMDB's: B there is one commit in a pass of a millisecond
+and a half, and it wrote and flushed the megabyte the mixes after it
+rode. Paired against the appended log, B read 0.32-0.40x, the shuffled
+load 0.73-0.83x and the full rewrite's burst 0.76-0.86x, with A and F as
+far ahead as before: the megabyte's price had moved from the cells that
+used it to whichever commit came first, and onto every commit of a
+thousand writes, which gains nothing by it. Two fixes were then built on
+a reading of that and paired -- a reach as long as the file, and steps
+doubling from sixty-four kibibytes under a size gate -- and each moved
+the megabyte between cells, B to A and F, the first commit to the first
+after a load. A probe of the primitives (`bench/examples/walsync.rs`)
+then said in a minute what four sittings had circled: zeros cost what
+frames do, a megabyte two and a half milliseconds, and an extension a
+fifth to two thirds of one beside; a pre-written commit saves a tenth of
+a millisecond; so the purchase pays where a megabyte holds sixty
+commits, loses by a third and more where it holds eight, and at ten
+thousand keys, where the mixes write two thirds of a megabyte in forty
+commits, no schedule comes out ahead of the appended log and each only
+chooses the cell that pays.
+And the size gate first written sat at sixteen kibibytes, under a guess
+that the mixes' commits were thirteen kilobytes; an `strace` of the
+writes read 16.8. A commit over thirty-two kibibytes appends now and
+ends the run, and a run of small commits pre-writes a reach once it has
+written one itself (`Options::wal_ahead_small_runs`). The rules: a cost
+bought ahead is bought on the evidence of the run it is for, since a
+store's first operation may be its only one -- the smallest write set
+again, under a rule this file had for it already, and the default went
+in without the quick row; a lever is priced on every size of the
+operation it touches, a commit of one write, of a hundred and of a
+thousand, and the sizes are read off the syscalls before a threshold is
+drawn between them; a lever that moves a fixed cost between cells is
+read on the cells' sum at the smallest rung, where a schedule that only
+relocates it shows as one cell up and another down in every pairing; and
+when two policies in a row trade the same cost, the primitive is priced
+before a third is built. Beside it: the first pairings of the last shape
+under a bound read the passes after two of the bursts a fifth slower in
+six pairs of six, a mechanism was written for it -- faster syncs leaving
+the upkeep thread a longer trail -- and the counters of the next sitting
+read the trail at nothing in both arms and the passes in two shapes
+under either, which a third sitting put on the builder ahead's install.
+A difference in a pass of twenty milliseconds is read off its counters
+before it is given a cause, and a cell that reads bimodal within one arm
+is not a verdict between two.
 
 ## Standing limitations
 

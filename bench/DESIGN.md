@@ -537,11 +537,12 @@ re-codes exchange the two without a build (`Options::zpages_recode_keep`);
 partition built at write time, the other beside each served file on the
 builder's thread, and the policy only exchanging them
 (`Options::zpages_both`);
-`supdb-settlebuilds`, `supdb-ingestsettlebuilds` and
-`supdb-cache64tofitautozpagessettlebuilds` are `supdb`, `supdb-ingest` and
-`supdb-cache64tofitautozpages` with every commit near reads filing its batch
-and building the blocks it filed into (`Options::forms_settle_every`,
-`forms_settle_builds`);
+`supdb-settlelate` and `supdb-ingestsettlelate` are `supdb` and
+`supdb-ingest` with a commit near reads leaving a batch under the backlog
+bound to the scans, the shape before every such commit filed its batch and
+built the blocks it filed into (`Options::forms_settle_every`,
+`forms_settle_builds`), and `supdb-cache64tofitautozpagessettlebuilds` is
+`supdb-cache64tofitautozpages`, which pins that shape, with the two on;
 `supdb-cache64tofitzpagesdropparse` and `supdb-cache64tofitautozpagesparse`
 are the forced form with the drop and the combined arm with their
 block-coded groups written by the engine's parsing encoder

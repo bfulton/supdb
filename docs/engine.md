@@ -7002,7 +7002,9 @@ The page is a container of groups now (`src/db/zpages.rs`, the layout's `ZPG2`):
 
 The form file a re-code replaced may be kept, attached and unserved, beside the one it serves (`Options::zpages_recode_keep`, off; `Seg::z_spare`, `ZCell::flip`): a partition's re-codes after its first are then the two files exchanged in the cell, the incoming one's pages asked for in windows of the device's largest request (`ZFile::prefetch_all`) and the outgoing one's dropped from the cache through its own handle (`ZFile::drop_cache`), since a kept file's name is gone once the build's rename replaced it -- no build, no bytes written, no device flush for the durable commits beside it. A reopen serves whichever coding holds the name and keeps nothing; the kept file goes with the segment, or with the served one where a check retires it. `tests/zpages.rs` holds the exchange to no build and every read and scan right across it; `supdb-cache64tofitzpagesrecodekeepdrop` is the arm. Both codings may be stored from write time (`Options::zpages_both`, off; `ZKind::Spare`): once the served form files are in, the builder builds the other coding of every partition, the hottest first, and keeps it unserved with its pages dropped, and the policy then only exchanges files -- the raw-tailed set chosen whole each look among the hottest partitions whose raw tails fit the budget, a served raw-tailed partition counted twice against the order and the floor, at most 32 MiB of incoming pages a look, a look every 200 ms beside a build in flight, a heat that rises to the rate a partition shows at once and fades over ten seconds, and nothing moved while nothing reads; under refaults a flip asks for none of the incoming file's pages. At five million keys under 640 MiB it reads E 1.04, D 1.08 and B 1.07 against the LZ4 form with the drop and A 0.92: nothing before the suite's first Zipfian mix says where its head is, so the policy pays one mix of flips, each a prefetch on the device the durable commits sync to; at ten times the operations it reads C 1.10, B 1.14, A 1.08 and the read pass 1.08-1.12, and F 0.95 and E 0.97 where both arms fault; `supdb-cache64tofitzpagesbothdrop` is the arm.
 
-Out of core the suite's ycsb-E inherits the update mixes' writes: their commits file nothing into the forms, since no scan runs between them and their writes are under the backlog bound, and E's first scans file the 49,000 keys and build the blocks over them, a sixth of its thread at five million keys under 640 MiB -- the work a B-tree does at the write. A commit near reads may file its batch whatever the backlog (`Options::forms_settle_every`, off) and its fill build the blocks the settle filed into that held no form (`Options::forms_settle_builds`, off; the fill's own build of every overlaid block runs only without a cache budget). The filing alone moved nothing E reads -- a settle patches only the blocks a scan has formed -- and cost F and D a tenth; with the builds, paired against the forced form with the first eight partitions raw-tailed and the raw pages dropped in four sittings, E read 1.07-1.17x in every one with every other cell level or faster and nothing faulting. `supdb-cache64tofitzpageshot8dropsettleevery` and `supdb-cache64tofitzpageshot8dropsettlebuilds` are the arms, and `tests/settle.rs` holds each to its effect; the pairings are `pair.sh supdb-cache64tofitzpageshot8dropsettleevery supdb-cache64tofitzpageshot8drop 5000000 --reps 5 --bound 671088640 --passes read,read-threaded,scan,scan-threaded,mixes --ops-div 10` and the same of `...settlebuilds`, each run twice, at `16679e4`. On the combined arm, which stands at its fit line, the forms the commits build cost D a quarter on major faults, since they hold the memory from the write to E's scans; the fill builds only while the memory group's file refaults hold still and sheds what it built unwalked when they move (`SettleRoom`), which brings D to 0.86 and no further, because a shed form's memory stays in the allocator's arena -- a build at the write has to be decided before the memory is taken. So the fill builds only while the budget the bound leaves exceeds what the reads keep resident -- the served form files, and the key sections and ordered indexes of partitions whose raw pages are not dropped -- and with no room a commit files only what the backlog bound asks, since the filing alone costs F and D a tenth: gated so, the combined arm reads every cell level, nothing faulting, and hot8 with the drop reads E 1.07x in both sittings. In core nothing resolved in five pairs a sitting (`supdb-settlebuilds`, `supdb-ingestsettlebuilds`, `supdb-cache64tofitautozpagessettlebuilds` are the arms).
+Out of core the suite's ycsb-E inherits the update mixes' writes: their commits file nothing into the forms, since no scan runs between them and their writes are under the backlog bound, and E's first scans file the 49,000 keys and build the blocks over them, a sixth of its thread at five million keys under 640 MiB -- the work a B-tree does at the write. A commit near reads may file its batch whatever the backlog (`Options::forms_settle_every`, off when this was priced and on since `f33f68b`, below) and its fill build the blocks the settle filed into that held no form (`Options::forms_settle_builds`, the same; the fill's own build of every overlaid block runs only without a cache budget). The filing alone moved nothing E reads -- a settle patches only the blocks a scan has formed -- and cost F and D a tenth; with the builds, paired against the forced form with the first eight partitions raw-tailed and the raw pages dropped in four sittings, E read 1.07-1.17x in every one with every other cell level or faster and nothing faulting. `supdb-cache64tofitzpageshot8dropsettleevery` and `supdb-cache64tofitzpageshot8dropsettlebuilds` are the arms, and `tests/settle.rs` holds each to its effect; the pairings are `pair.sh supdb-cache64tofitzpageshot8dropsettleevery supdb-cache64tofitzpageshot8drop 5000000 --reps 5 --bound 671088640 --passes read,read-threaded,scan,scan-threaded,mixes --ops-div 10` and the same of `...settlebuilds`, each run twice, at `16679e4`. On the combined arm, which stands at its fit line, the forms the commits build cost D a quarter on major faults, since they hold the memory from the write to E's scans; the fill builds only while the memory group's file refaults hold still and sheds what it built unwalked when they move (`SettleRoom`), which brings D to 0.86 and no further, because a shed form's memory stays in the allocator's arena -- a build at the write has to be decided before the memory is taken. So the fill builds only while the budget the bound leaves exceeds what the reads keep resident -- the served form files, and the key sections and ordered indexes of partitions whose raw pages are not dropped -- and with no room a commit files only what the backlog bound asks, since the filing alone costs F and D a tenth: gated so, the combined arm reads every cell level, nothing faulting, and hot8 with the drop reads E 1.07x in both sittings. In core nothing resolved in five pairs a sitting (`supdb-settlebuilds`, `supdb-ingestsettlebuilds`, `supdb-cache64tofitautozpagessettlebuilds` are the arms).
+
+Both are the default now, and `supdb-settlelate` and `supdb-ingestsettlelate` are the shape that leaves a batch under the backlog bound to the scans. What decided it was the scrambled mixes the row has run since: the scrambled Zipfian's writes fall over the whole key range, so the scrambled write mixes leave tens of thousands of scattered keys unfiled where the unscrambled ones leave the head of the store, and the scrambled E after them settled and built over all of them in its first scans. Paired in the row's order under 1.25 GiB at `0e3f284`, where the default was still the late shape and the arm `supdb-settlebuilds` (`bench ab --arms supdb,supdb-settlebuilds --size 10000000 --bound 1342177280 --passes load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled --ops-div 10 --reps 3`, the arms the other way, and both orders at `--size 3000000 --reps 4`), the scrambled E read 1.33x and 1.20x at ten million keys and 1.56x and 1.48x at three, in every pair of the four sittings, and E 1.13x, 1.05x, 1.13x and 1.29x. The cells that gave ground are the ones whose commits now do the filing: the scrambled A read 0.81-0.86x in all four sittings, and with the lag sweep in the order (the same passes and `lag`, `--reps 3`, three sittings) the one-percent burst at ten million keys, which follows a pass of scans, read 0.68x and the pass after it 0.86x in the one sitting at that size, three pairs of three, with the other lag cells in no direction. The row at `d8cece6` has the nearer comparator at a third of the scrambled A at three million keys and under a fifth at ten, and at under a third of that burst; the pass after the burst it has behind LMDB already, at 0.81x in three reps that read 0.51-1.76x, and that sitting's 0.86x is the one reading of the change there. In core nothing resolved (`bench ab --arms supdb,supdb-settlelate --size N --reps 12` at `f33f68b`, ten thousand keys, a hundred thousand in both orders, three hundred thousand); the scrambled D read 0.87-0.93x in all four sittings and the scrambled E 0.84-0.97x, which is open.
 
 The overlay was priced before anything was built for it, by a probe's step in the mix driver (`SUPDB_MIX_FOLD=E`, `Engine::fold`): before E and outside its window, the memtable sealed, the merges joined and the controller left to cover the rewritten partitions again. Paired against LMDB at ten million keys under 1.25 GiB at `d94690a` (`SUPDB_MIX_FOLD=E SUPDB_MIX_KINDS=1 bench ab --arms supdb,lmdb-nordahead --size 10000000 --bound 1342177280 --passes load,mixes --ops-div 1 --reps 2`, and the same with the variable unset), the fold took 29 s -- the write mixes touch every partition, so its merge took all twenty-nine and 87 pieces as inputs and the controller built every form file again -- and E then read 0.76x of LMDB where the sitting without it read 0.95x, E's scans 8.2-8.8 s against 6.8-7.6, with no major fault in either: E over a store just rewritten pays in CPU what its forms and caches had held, more than the overlay it no longer walks. The overlay is not E's gap to fold away. The same sitting read the other cells against LMDB on this host at A 5.9x, F 4.8x, B 1.9x, D 1.18x and C 1.04x, the ordered load 1.23x and the shuffled 12.7x.
 
@@ -7647,10 +7649,11 @@ The comparators' check, registered before its first run. The suite's comparator 
   create a store, 32 MiB at rest in every store however little it held,
   and as many gigabytes as a test run makes stores: a file not yet written
   through is pre-written a mebibyte past its tail as the commits reach it
-  now, the zeros flushed by the next commit's own fdatasync with one
-  journal commit for the growth, and no spare is made until a retired file
-  is one (`Options::wal_ahead_bytes`; zero is the whole-file pre-write,
-  `supdb-walprefill`). Paired against the whole file on the mixes alone
+  now (ahead of which commits is below), the zeros flushed by the next
+  commit's own fdatasync with one journal commit for the growth, and no
+  spare is made until a retired file is one (`Options::wal_ahead_bytes`;
+  zero is the whole-file pre-write, `supdb-walprefill`). Paired against
+  the whole file on the mixes alone
   (`--arms supdb,supdb-walprefill --size 3000000 --bound 1342177280
   --passes load,mixes --ops-div 10 --reps 3`), A's commits took 0.28-0.32
   ms against 0.18-0.30 and F's 0.25-0.37 against 0.30-0.32, A 1.11x for the
@@ -7661,6 +7664,91 @@ The comparators' check, registered before its first run. The suite's comparator 
   found still holds: pre-written in 1 MB pieces the file left 1 MB
   page-cache folios, and every 100 KB commit wrote a megabyte back — 2.2x
   the device bytes, 11.2x in isolation; it is pre-written in pages.
+  The mebibyte went in ahead of every commit from a file's first, priced
+  on the mixes at three and ten million keys, and was wrong at both ends
+  of a commit's size. The quick row after it read ycsb-B at ten thousand
+  keys at half of LMDB's, a cell every row before had at 1.5-1.7x: B there
+  is one commit in a pass of a millisecond and a half, and it wrote and
+  flushed the megabyte the mixes after it rode. Paired in core against the
+  appended log (`bench ab --arms supdb,supdb-walappend --size 10000 --reps
+  12`, both orders, and `--size 30000` and `300000`, at `f33f68b`), B read
+  0.32-0.40x at ten thousand keys and 0.57x at thirty; the shuffled load
+  0.73-0.83x and still 0.91x at three hundred thousand; the full rewrite's
+  burst 0.76-0.86x; and A 1.27-1.60x and F 1.15-1.4x. The device's prices
+  say why (`cargo run --release --example walsync` in `bench/`, at
+  `f50d31e`, two sittings an hour apart: six mebibytes of commits of one
+  size, appended against pre-written a megabyte at a step). The
+  pre-written log read 1.4-1.8x of the appended at four to twenty-four
+  kilobytes a commit, 1.1-1.3x at thirty-two and forty, 0.96x and 1.20x at
+  forty-eight, 0.92-0.97x at fifty-six and sixty-four, and 0.59-0.85x from
+  eighty up. A megabyte of zeros, written and flushed, adds 2.3-2.8 ms to a
+  megabyte of a load's commits; a commit that lands in pre-written pages
+  saves about a tenth of a millisecond, the journal commit its append would
+  force; a megabyte pre-written in four steps costs 0.6-2.2 ms more than in
+  one; and an append of a hundred kilobytes, which the kernel takes in
+  large folios, syncs for less than the same bytes laid over page-sized
+  zeros. The suite's write mixes commit a hundred writes, 16.8 KB, and its
+  loads and bursts a thousand, 133-167 KB (`strace -f -y -e
+  trace=pwrite64,fdatasync` over `bench ab`). Two shapes were built and
+  paired before those prices
+  were read, and each moved the megabyte without taking it away: a reach as
+  long as the file (B 2.4-2.8x of the first shape at ten thousand keys, A
+  0.81x, F 0.61-0.70x, the one-percent burst 0.28-0.33x, the shuffled load
+  still 0.78-0.84x of the appended log), and steps doubling from 64 KiB
+  for commits within 32 KiB (A 0.77x and F 0.57-0.64x of the first shape, B
+  and the one-percent burst 0.79-0.96x of the appended log for a first step
+  nothing after them used). At that rung no schedule wins: the mixes write
+  two thirds of a megabyte in forty commits, the journal commits they could
+  save are four milliseconds at most and the megabyte of zeros to hold
+  them two and a half with its extensions beside, so a schedule only
+  chooses the cell that pays. What ships
+  (`Options::wal_ahead_small_runs`; `supdb-walaheadflat` is the first
+  shape): a commit over 32 KiB appends, pre-writes nothing and ends the
+  run; a commit within it counts toward a run of small commits, and where
+  it does not fit what is pre-written it pre-writes the reach once the run
+  has written a reach itself; a run goes on across a rotation. Paired in
+  core at `f50d31e` (`bench ab --arms supdb,supdb-walappend --size N --reps
+  12` and `--arms supdb,supdb-walaheadflat`, both orders at ten and thirty
+  thousand keys, one sitting of ten reps at a hundred thousand and of eight
+  at three hundred thousand): against the appended log nothing resolved at
+  ten thousand keys, where the two write the same bytes; at thirty thousand
+  the scrambled F, the first mix past the run's megabyte, read 1.54x and
+  1.80x; at a hundred thousand A read 1.27x, D 1.25x, F 1.76x and the
+  scrambled A and F 1.48x and 1.27x, nine and ten pairs of ten; at three
+  hundred thousand A, F and their scrambled forms 1.23-1.33x. Against the
+  first shape B read 2.8x at ten thousand keys in both orders and 1.6-1.9x
+  at thirty, the shuffled load 1.16-1.39x up to a hundred thousand and the
+  full rewrite's burst 1.10-1.25x, and A read 0.64-0.78x up to thirty
+  thousand and 0.50x at a hundred thousand, where the megabyte the run
+  appends as its evidence is most of the mix: the price of buying on
+  evidence, which the first shape charged to B. Under 1.25 GiB in the row's
+  whole order (`SUPDB_LAG_MARK=1 SUPDB_ZPAGES_TRACE=1 bench ab --arms
+  supdb,supdb-walaheadflat --size 3000000 --bound 1342177280 --passes
+  load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled,lag
+  --ops-div 10 --reps 3`, the arms the other way, both at `--size
+  10000000`, and `--arms supdb,supdb-walappend` at three million keys with
+  three reps and at ten with two): against the first shape the shuffled
+  load read 1.09x in both orders at three million keys and 1.02-1.04x at
+  ten, the bursts 1.07-1.27x at ten in five cells of six, and the mixes
+  within their sittings' spread; against the appended log A, F and their
+  scrambled forms read 1.24-1.38x at three million keys in every pair, and
+  1.20-1.43x at ten, and the shuffled load 1.21x and 1.10x, since a load
+  rotates into the files it retired. The passes after the one-percent and
+  the ten-percent bursts at three million keys are not resolved between
+  the shapes: after the one-percent burst they read slower than the first
+  shape's in the row's order, 21 ms against 17 in six pairs of six, and
+  faster in three pairs of four of the lag sweep alone
+  (`SUPDB_LAG_COUNTERS=1 SUPDB_SCAN_OPS=1` and `--passes load,lag --reps
+  4`), and the ten-percent pass reads two shapes under either, 13-19 ms
+  or 20-41, in seventeen and fourteen passes whose counters agree. What
+  makes the two shapes is not the log. Paired against `supdb-noahead`
+  (`--arms supdb,supdb-noahead --passes load,lag --reps 6` with the two
+  variables, both orders, at `f50d31e`) the ten-percent pass read 13-20 ms
+  without the builder ahead in twelve passes of twelve and 20-32 with it
+  in seven of twelve: the builder's forms are installed in one step of 3-7
+  ms inside a pass of thirteen that visits a ninth of them, and in some
+  reps of both arms the first scan waits 2-9 ms for the upkeep's pass in
+  flight. Both are open.
 - **Group commit** — whether concurrent writers share a barrier; matters
   only after P-D.
 - **Read and write concurrency** — being built, readers first, in the
