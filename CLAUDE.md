@@ -4328,6 +4328,66 @@ A difference in a pass of twenty milliseconds is read off its counters
 before it is given a cause, and a cell that reads bimodal within one arm
 is not a verdict between two.
 
+**A shed the same pass undid.** The forms the commits' fills build at
+write time are listed, and shed unwalked when the group's refaults move,
+to give the page cache back what they took. That was priced where the
+cache's budget binds, and under a budget that binds a block with no form
+is left to the scan that wants it. At three million keys under 1.25 GiB
+the budget grows into the room the partitions leave and never binds, and
+there the commit's own fill builds a form for every overlaid block that
+holds none: the pass that shed forty thousand forms built each again in
+its next step, from the sources and sized for an overlay as large as the
+block, a hundred thousand builds a burst where the store has forty-seven
+thousand blocks, a hundred megabytes more in use and a second on the
+burst, in the sweeps where the refaults moved inside the burst and not
+in the others. The cell it lost was the scan pass after, and five
+readings went elsewhere first -- the allocator's free bytes, the copies'
+capacity, the page cache's tenants, the builder ahead, the first scan's
+wait -- each true of the slow sweeps and none their cause. What named it
+was a count every log already carried: the blocks the upkeep built over
+the burst, fifty thousand in the fast sweeps and a hundred thousand in
+the slow, and then the events line of the points before it, which split
+the same sweeps at the one-percent burst by who had built their forms.
+There is no shed while the fill stands to undo it
+(`Options::forms_settle_sheds_unbound`), and the list the shed reads,
+which only a shed had emptied, is pruned
+(`Reader::prune_settle_built`): in memory, where the room never goes, it
+had grown by an entry a build for the store's life. The rules: a
+mechanism that gives work back is checked against whatever takes the same
+work up in the regime it runs in, since a shed beside an unconditional
+fill is two builds; when a cell reads two shapes, the count that
+separates them is looked for among the counters already printed, at every
+point of the sweep and not only the slow one, before a mechanism is
+reasoned from the slow shape's symptoms; and a list something appends to
+is read for who empties it where the emptying event never comes.
+
+**A form dropped for a position that could be asked for again.** The
+look that carries a table across the merge that rewrites its partition
+over the same blocks kept the block's copies and dropped its sparse
+forms, because a delta's cut is a rank in the old records -- and in the
+same loop resolved again the cuts of the keys filed since the snapshot,
+by the seek the settle uses. The dropped blocks went back to the fill,
+two thousand a burst, and the ones a late landing left with few keys
+since stood sparse at the scan pass, where a sparse walk reads the
+partition's records between its deltas: under a bound those were records
+the merge had just written and nothing had read, the first pages
+reclaimed, a major fault a walk and the pass's whole wait. The look
+resolves each delta's cut again and keeps the form now
+(`Options::rebase_recuts_sparse`). The checked profile's comparison of a
+conversion against a build from the sources had assumed the drop twice:
+that a dense form's block is dense in the sources, and that the two
+copies agree entry for entry. A kept form is dense with deltas the merge
+folded in, and holds an entry of no values for a key the merge dropped,
+which the sources have no key for at all; forty seeds of a hundred and
+sixty failed on those two assertions with every answer right, and the
+check is held now to a copy forced from the sources and to what the two
+emit. The rules: where one loop re-derives a position for some of a
+structure's entries and drops the rest for holding the same kind of
+position, the drop is a choice and is priced as one; and an assertion
+that compares a derived thing with a rebuild encodes how the derived
+thing was made, so a change to what may be kept is read against every
+such check before a fuzz failure is read as a wrong answer.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

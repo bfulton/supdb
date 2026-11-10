@@ -466,6 +466,21 @@ what its ledger holds; a result the run discards is work the run does
 not do; and a failure a process boundary was built to contain is
 reported by the boundary, not relayed through it.
 
+**A run the session does not hold is the container's to end.** A roster
+of two hours was started detached, with a message scheduled for its end,
+and the container was restarted within minutes of the session going
+idle, twice, each time taking the rep in flight; the ledger took the run
+up from its last whole rep, and four hours went to learning that a
+scheduled message wakes a session and keeps no machine. A long run is
+held by a tracked background task for its whole length -- a watcher that
+ends when the ledger's next `rep-<size>-<n>.json` appears, armed again
+rep by rep, since a tracked task has a limit of its own -- and the
+ledger is what makes that limit harmless. And nothing reads the scratch
+logs wholesale beside one: a search over a gigabyte of old logs for a
+counter's name ran two minutes beside a ten-million-key pass, on the
+device the pass was faulting from, and the rep was taken again from its
+start. Beside a timing run only named files are opened.
+
 **A device the series does not measure.** Out of core a rate is the
 faults an operation takes times the device's answer to one, about 40 µs
 on this fleet's disk, and the faults are the kernel's reclaim over the

@@ -543,6 +543,12 @@ bound to the scans, the shape before every such commit filed its batch and
 built the blocks it filed into (`Options::forms_settle_every`,
 `forms_settle_builds`), and `supdb-cache64tofitautozpagessettlebuilds` is
 `supdb-cache64tofitautozpages`, which pins that shape, with the two on;
+`supdb-rebasedrops` is `supdb` with a partition's sparse block forms
+dropped at the look that carries its table across the merge that rewrites
+it (`Options::rebase_recuts_sparse` off), `supdb-settleshedunbound` with
+the fills' forms shed where their room goes while the cache's budget is
+not bound (`Options::forms_settle_sheds_unbound`), and
+`supdb-rebasedropsshed` with both, the default as it stood before the two;
 `supdb-cache64tofitzpagesdropparse` and `supdb-cache64tofitautozpagesparse`
 are the forced form with the drop and the combined arm with their
 block-coded groups written by the engine's parsing encoder
