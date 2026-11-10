@@ -2895,6 +2895,24 @@ pub struct Options {
     /// without the two.
     #[doc(hidden)]
     pub forms_settle_builds: bool,
+    /// Whether the forms the fills built are shed where their room goes
+    /// (`forms_settle_builds`) while the cache's budget is not bound. The
+    /// shed gives the page cache back what the fills took, and stands
+    /// where nothing builds the forms again: under a budget that binds,
+    /// where a block with no form is left to the scan that wants it. Short
+    /// of that the commit's own fill builds a form for every overlaid
+    /// block that holds none (`commit_forms_build`), so the pass that shed
+    /// them built each again, from the sources and sized for the whole
+    /// overlay: at three million keys under 1.25 GiB the group's refaults
+    /// moved inside the full rewrite's burst in about half the sweeps,
+    /// forty thousand of the store's forty-seven thousand forms were shed
+    /// and built a second time, the burst ran a sixth longer with a
+    /// hundred megabytes more in use, and the pass after it met the forms
+    /// the second builds left sparse. Off, the default: no shed while the
+    /// fill would undo it, and the forms listed for one are the fill's
+    /// from there on. `supdb-settleshedunbound` is the shed as it was.
+    #[doc(hidden)]
+    pub forms_settle_sheds_unbound: bool,
     /// Take the store's keys for `forms_settle_backlog_pct` and
     /// `forms_settle_recent_pct` as every live segment's (`true`, as they
     /// were) rather than the partitions'. A level-0 piece sealed from a
@@ -3518,6 +3536,19 @@ pub struct Options {
     /// the chunks the block before it freed. Off, the room, kept for
     /// pricing as `supdb-copyslack` and `supdb-ingestcopyslack`.
     pub copy_exact: bool,
+    /// Whether a sparse form outlives the merge that rewrites its
+    /// partition over the same blocks, as a copy does. A delta names its
+    /// place by a rank in the partition's records, and a rewrite moves the
+    /// ranks inside a block, so the look that carries a table across one
+    /// (`Reader::rebase_tables`) dropped every sparse form of the
+    /// partition and left the blocks to be built again. On, it resolves
+    /// each delta's cut again against the partition as it stands -- the
+    /// block is the same one, since the boundaries are -- and keeps the
+    /// form with the runs it holds, which are the keys' whole runs and
+    /// newer than anything the merge folded in. Off, the drop; a fix of
+    /// neither a wrong answer nor a format, so the arm stays for pricing
+    /// as `supdb-rebasedrops`.
+    pub rebase_recuts_sparse: bool,
     /// EXPERIMENT: the writer's buffers have their pages populated ahead
     /// of the fill, a window at a time, instead of faulting page by page
     /// as the bytes land -- the memtable arena's blocks and the segment
@@ -4856,6 +4887,7 @@ impl Default for Options {
             forms_settle_backlog_pct: 2,
             forms_settle_every: true,
             forms_settle_builds: true,
+            forms_settle_sheds_unbound: false,
             forms_settle_keys_all: false,
             upkeep: Upkeep::default(),
             upkeep_lag_pct: 0,
@@ -4896,6 +4928,7 @@ impl Default for Options {
             forms_convert_behind: usize::MAX,
             convert_from_form: true,
             copy_exact: true,
+            rebase_recuts_sparse: true,
             prefault: false,
             drain_names_partition: true,
             manifest_spare: true,
@@ -14525,6 +14558,20 @@ impl CachedBlock {
             && self.ents == other.ents
             && (self.identity || !other.identity)
     }
+    /// Whether a walk of this copy emits what a walk of `other` emits:
+    /// the keys that hold a value, each with its run, an entry of no
+    /// values on either side passed over. What `agrees` holds less the
+    /// entries a walk skips and the claim to identity.
+    #[cfg(debug_assertions)]
+    fn emits_as(&self, other: &CachedBlock) -> bool {
+        fn live(c: &CachedBlock) -> impl Iterator<Item = (&[u8], &[u8])> {
+            c.ents
+                .iter()
+                .filter(|e| e[3] != 0)
+                .map(|e| (c.key(e), &c.vals[e[2] as usize..(e[2] + e[3]) as usize]))
+        }
+        live(self).eq(live(other))
+    }
     /// Where this copy and `other` first part: the entry, its keys and
     /// its values' lengths on each side, for the check above to name.
     #[cfg(debug_assertions)]
@@ -15888,6 +15935,15 @@ struct Shared {
     /// Partitions whose forms were carried across a merge that rewrote
     /// them over the same keys; see `carry_forms`.
     forms_rebased: AtomicU64,
+    /// Sparse forms kept across such a rewrite with their deltas' cuts
+    /// resolved again, and the deltas resolved
+    /// (`Options::rebase_recuts_sparse`).
+    forms_recut: AtomicU64,
+    deltas_recut: AtomicU64,
+    /// The times the fills' room went while the commit's fill would have
+    /// built the shed forms again, and nothing was shed
+    /// (`Options::forms_settle_sheds_unbound`).
+    settle_sheds_declined: AtomicU64,
     /// Scans that reached the test for walking the forms, and the ones
     /// that passed it. A mechanism that holds 1,562 forms and is taken
     /// by no read is not slow, it is off, and these say which clause
@@ -21216,6 +21272,49 @@ impl Reader {
         }
     }
 
+    /// The deltas of block `b`'s sparse form resolved again against `seg`,
+    /// the partition a merge rewrote over the same blocks: each delta's
+    /// cut and whether the record there is its key, in key order, each
+    /// seek from the rank before it (`Options::rebase_recuts_sparse`).
+    /// False where a key resolves outside the block, which the same
+    /// boundaries rule out and a form is dropped for all the same; the
+    /// form is this table's own afterwards, a published one copied first.
+    fn recut_sparse(&self, seg: &Seg, b: usize, form: &mut std::sync::Arc<Cached>) -> bool {
+        let Cached::Sparse(sb) = std::sync::Arc::make_mut(form) else {
+            return false;
+        };
+        let mut floor = b * CACHE_BLOCK;
+        let keys = &sb.keys;
+        for e in sb.ents.iter_mut() {
+            let (at, len) = e.key;
+            let key = &keys[at as usize..(at + len) as usize];
+            let (rank, same) = self.cache_seek_exact(seg, key, floor);
+            let owner = if same { rank } else { rank.saturating_sub(1) };
+            if owner / CACHE_BLOCK != b || rank < floor {
+                return false;
+            }
+            e.cut = rank as u32;
+            e.same = same;
+            floor = rank;
+        }
+        // The order `SparseBlock::find_at_cut` searches by: the cut, the
+        // inserts below a record before the record's own update.
+        debug_assert!(
+            sb.ents
+                .windows(2)
+                .all(|w| (w[0].cut, w[0].same) < (w[1].cut, w[1].same)
+                    || (w[0].cut == w[1].cut && !w[0].same && !w[1].same)),
+            "a sparse form's deltas resolved again are out of their order"
+        );
+        self.shared
+            .forms_recut
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.shared
+            .deltas_recut
+            .fetch_add(sb.ents.len() as u64, AtomicOrdering::Relaxed);
+        true
+    }
+
     fn cache_owner_of(&self, seg: &Seg, key: &[u8], floor: usize) -> (usize, u32) {
         let (rank, same) = self.cache_seek_exact(seg, key, floor);
         let owner = if same { rank } else { rank.saturating_sub(1) };
@@ -22462,9 +22561,31 @@ impl Reader {
                         self.publish_marker(p, b);
                     }
                 }
-                let sparse = matches!(t.slots[b].as_deref(), Some(Cached::Sparse(_)));
+                let mut sparse = matches!(t.slots[b].as_deref(), Some(Cached::Sparse(_)));
                 let wide = matches!(t.slots[b].as_deref(), Some(Cached::Wide(_)));
                 let copy = matches!(t.slots[b].as_deref(), Some(Cached::Block(_)));
+                // A sparse form of a partition rewritten over the same
+                // blocks keeps its deltas, each cut resolved again against
+                // the records as they stand: the runs it holds are the
+                // keys' whole runs, newer than anything the merge folded
+                // in, and only the ranks they are spliced at moved. Dropped
+                // instead, every such block was built a second time -- a
+                // full rewrite at three million keys under 1.25 GiB built
+                // a hundred thousand forms where its blocks are forty-seven
+                // thousand whenever its merges landed inside the burst,
+                // the second builds sized for an overlay twice the block
+                // -- and the blocks a late landing left with few keys since
+                // stood sparse at the pass, their walks reading records the
+                // merge had just written and the bound had pushed out
+                // (`Options::rebase_recuts_sparse`).
+                if rebased
+                    && sparse
+                    && self.opts.rebase_recuts_sparse
+                    && !self.opts.forms_pieces_only
+                    && self.recut_sparse(seg, b, t.slots[b].as_mut().expect("a sparse form"))
+                {
+                    sparse = false;
+                }
                 if (rebased && sparse) || wide || (rewritten && copy) {
                     if sparse || copy {
                         complete = false;
@@ -24668,7 +24789,19 @@ impl Reader {
         }
         self.fs().settle_room.set(r);
         if was && !r.room {
-            self.shed_settle_built();
+            // Shed only where nothing builds the forms again: while the
+            // budget is not bound the fill that follows this builds every
+            // overlaid block that holds no form, the shed ones first among
+            // them (`Options::forms_settle_sheds_unbound`).
+            let refilled = self.opts.commit_forms_build && !self.cache_binds();
+            if refilled && !self.opts.forms_settle_sheds_unbound {
+                self.fs().settle_built_at.borrow_mut().clear();
+                self.shared
+                    .settle_sheds_declined
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            } else {
+                self.shed_settle_built();
+            }
         }
         r.room
     }
@@ -24887,20 +25020,24 @@ impl Reader {
                         let lo = b * CACHE_BLOCK;
                         let hi = ((b + 1) * CACHE_BLOCK).min(seg.blob.keys());
                         let copied = ctx.copy_from_deltas(src, lo..hi, sb)?;
+                        // Held to a copy built from the sources, whatever
+                        // the overlay's size there: a form kept across its
+                        // partition's rewrite
+                        // (`Options::rebase_recuts_sparse`) is dense with
+                        // deltas the sources no longer overlay, the merge
+                        // having folded them in, and holds an entry of no
+                        // values for a key the merge dropped, which the
+                        // sources have no key for at all; such a copy is
+                        // held to what the two emit.
                         #[cfg(debug_assertions)]
                         {
-                            let again = ctx.materialize(src, None, table, b, unsealed)?;
-                            match &again {
-                                Cached::Block(cb) => debug_assert!(
-                                    copied.agrees(cb),
-                                    "a copy from the form disagrees with the build from the sources: block {b}, {}",
-                                    copied.disagreement(cb)
-                                ),
-                                _ => debug_assert!(
-                                    false,
-                                    "a dense form's block built from the sources is not a copy"
-                                ),
-                            }
+                            let again = ctx.copy_of_sources(src, table, b, unsealed)?;
+                            debug_assert!(
+                                copied.agrees(&again)
+                                    || (self.opts.rebase_recuts_sparse && copied.emits_as(&again)),
+                                "a copy from the form disagrees with the build from the sources: block {b}, {}",
+                                copied.disagreement(&again)
+                            );
                         }
                         self.shared.forms_events[12].fetch_add(1, AtomicOrdering::Relaxed);
                         Cached::Block(copied)
@@ -28756,6 +28893,9 @@ impl Db {
             forms_cloned: AtomicU64::new(0),
             form_takes: AtomicU64::new(0),
             forms_rebased: AtomicU64::new(0),
+            forms_recut: AtomicU64::new(0),
+            deltas_recut: AtomicU64::new(0),
+            settle_sheds_declined: AtomicU64::new(0),
             canon_tried: AtomicU64::new(0),
             canon_hit: AtomicU64::new(0),
             rd_scans: AtomicU64::new(0),
@@ -29318,6 +29458,9 @@ impl Db {
             forms_cloned: AtomicU64::new(0),
             form_takes: AtomicU64::new(0),
             forms_rebased: AtomicU64::new(0),
+            forms_recut: AtomicU64::new(0),
+            deltas_recut: AtomicU64::new(0),
+            settle_sheds_declined: AtomicU64::new(0),
             canon_tried: AtomicU64::new(0),
             canon_hit: AtomicU64::new(0),
             rd_scans: AtomicU64::new(0),
@@ -31472,6 +31615,17 @@ impl Db {
         self.shared.forms_rebased.load(AtomicOrdering::Relaxed)
     }
 
+    /// The sparse forms kept across a partition's rewrite with their cuts
+    /// resolved again, and the deltas resolved for them
+    /// (`Options::rebase_recuts_sparse`).
+    #[doc(hidden)]
+    pub fn forms_recut(&self) -> (u64, u64) {
+        (
+            self.shared.forms_recut.load(AtomicOrdering::Relaxed),
+            self.shared.deltas_recut.load(AtomicOrdering::Relaxed),
+        )
+    }
+
     /// Frozen tables a reader sorted over this store's life, because the
     /// seal, the freeze or another reader had not sorted them first.
     pub fn frozen_sorts(&self) -> u64 {
@@ -31623,6 +31777,16 @@ impl Db {
     pub fn settle_shed(&self) -> u64 {
         self.take_back_upkeep();
         self.r.fs().settle_shed.get()
+    }
+
+    /// The times the fills' room went and nothing was shed, the commit's
+    /// fill standing to build the forms again
+    /// (`Options::forms_settle_sheds_unbound`).
+    #[doc(hidden)]
+    pub fn settle_sheds_declined(&self) -> u64 {
+        self.shared
+            .settle_sheds_declined
+            .load(AtomicOrdering::Relaxed)
     }
 
     /// The writer's own scans whose first block was a copy walked with the
@@ -37324,6 +37488,24 @@ impl<'s> BuildCtx<'s> {
                 }
             });
         }
+    }
+    /// The copy of block `b` built from the sources whatever the size of
+    /// the overlay over it, where `materialize` builds a sparse form or
+    /// none for a small one: what the conversion from a form is held to in
+    /// the checked profile.
+    #[cfg(debug_assertions)]
+    fn copy_of_sources(
+        &self,
+        src: Sources,
+        table: &BlockTable,
+        b: usize,
+        unsealed: &Snapshot,
+    ) -> Result<CachedBlock> {
+        let lo = b * CACHE_BLOCK;
+        let hi = ((b + 1) * CACHE_BLOCK).min(src.seg.blob.keys());
+        let ov = self.overlay_all(src, table, b, unsealed)?;
+        let mut pr = PartReader::new(self.rd, src.seg);
+        self.copy_block(src, &mut pr, lo..hi, &ov)
     }
     /// PROTOTYPE: the merged copy of the ranks with the overlay laid over
     /// them.

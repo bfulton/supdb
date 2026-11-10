@@ -729,6 +729,10 @@ struct Stats {
     /// with no forms (`Options::scan_forms_off_unreused`), summed as
     /// `abandons` is: what says a run under `ZFUZZ_FORMSOFF` switched.
     switches: u64,
+    /// Sparse forms either store kept across a partition's rewrite with
+    /// their cuts resolved again (`Options::rebase_recuts_sparse`), summed
+    /// as `abandons` is: what says a run with the cache on reached them.
+    recuts: u64,
 }
 
 fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
@@ -808,6 +812,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         bindings: 0,
         beside: 0,
         switches: 0,
+        recuts: 0,
     };
     let mut fails: Vec<String> = Vec::new();
     let mut absent = absent_around(&pool, &mut rng);
@@ -989,6 +994,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                     st.bindings += z.cache_bindings() + r.cache_bindings();
                     st.beside += z.seal_waits().merges_beside + r.seal_waits().merges_beside;
                     st.switches += z.forms_off_counts()[..2].iter().sum::<u64>();
+                    st.recuts += z.forms_recut().0 + r.forms_recut().0;
                     let clean = rng.chance(50) || !matches!(cfg.sync, SyncPolicy::Always);
                     if clean {
                         for op in staged.drain(..) {
@@ -1154,6 +1160,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
     st.bindings += z.cache_bindings() + r.cache_bindings();
     st.beside += z.seal_waits().merges_beside + r.seal_waits().merges_beside;
     st.switches += z.forms_off_counts()[..2].iter().sum::<u64>();
+    st.recuts += z.forms_recut().0 + r.forms_recut().0;
     drop(z);
     drop(r);
     if ok {
@@ -1182,6 +1189,7 @@ fn fuzz_range() {
     let seeds: Vec<u64> = list.unwrap_or_else(|| (from..to).collect());
     let (mut bad, mut reopens, mut abandons, mut bindings, mut beside, mut switches) =
         (Vec::new(), 0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut recuts = 0u64;
     for seed in seeds {
         match run_seed(seed, want_cache, verbose) {
             Ok(s) => {
@@ -1190,12 +1198,13 @@ fn fuzz_range() {
                 bindings += s.bindings;
                 beside += s.beside;
                 switches += s.switches;
+                recuts += s.recuts;
             }
             Err(e) => bad.push(format!("seed {seed}: {e}")),
         }
     }
     eprintln!(
-        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, forms-off switches {switches}, FAILURES {}",
+        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, forms-off switches {switches}, sparse forms recut {recuts}, FAILURES {}",
         bad.len()
     );
     for b in &bad {

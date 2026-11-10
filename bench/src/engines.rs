@@ -650,6 +650,14 @@ pub struct Supdb {
     /// (`Options::ahead_in_core_scans_div` zero), the shape before it
     /// waited for a state that is being scanned: `supdb-aheadfirst`.
     aheadfirst: bool,
+    /// A sparse form dropped at the look that carries its table across a
+    /// partition's rewrite, where the default resolves its cuts again and
+    /// keeps it (`Options::rebase_recuts_sparse` off): `supdb-rebasedrops`.
+    rebasedrops: bool,
+    /// The fills' forms shed where their room goes while the cache's
+    /// budget is not bound, for the commit's fill to build again
+    /// (`Options::forms_settle_sheds_unbound`): `supdb-settleshedunbound`.
+    settleshedunbound: bool,
     /// Out of core a merge's landing chains the next merge only while
     /// reads are around, where the default chains through a write-only
     /// stretch too (`Options::merge_chains_writes` off).
@@ -1638,6 +1646,14 @@ struct Policy {
     /// (`Options::ahead_in_core_scans_div` zero), the shape before it
     /// waited for a state that is being scanned: `supdb-aheadfirst`.
     aheadfirst: bool,
+    /// A sparse form dropped at the look that carries its table across a
+    /// partition's rewrite, where the default resolves its cuts again and
+    /// keeps it (`Options::rebase_recuts_sparse` off): `supdb-rebasedrops`.
+    rebasedrops: bool,
+    /// The fills' forms shed where their room goes while the cache's
+    /// budget is not bound, for the commit's fill to build again
+    /// (`Options::forms_settle_sheds_unbound`): `supdb-settleshedunbound`.
+    settleshedunbound: bool,
     /// Out of core a merge's landing chains the next merge only while
     /// reads are around, where the default chains through a write-only
     /// stretch too (`Options::merge_chains_writes` off).
@@ -2310,6 +2326,8 @@ impl Default for Policy {
             aheadcold: false,
             aheadeager: false,
             aheadfirst: false,
+            rebasedrops: false,
+            settleshedunbound: false,
             nochainwrites: false,
             noland: false,
             landnearscans: false,
@@ -7493,6 +7511,8 @@ impl Supdb {
             aheadcold,
             aheadeager,
             aheadfirst,
+            rebasedrops,
+            settleshedunbound,
             nochainwrites,
             noland,
             landnearscans,
@@ -7880,6 +7900,8 @@ impl Supdb {
             } else {
                 supdb::Options::default().ahead_in_core_scans_div
             },
+            rebase_recuts_sparse: !rebasedrops,
+            forms_settle_sheds_unbound: settleshedunbound,
             merge_chains_writes: !nochainwrites,
             zpages_land_scans_far: !landnearscans,
             merge_plan_idle: !noidleplan,
@@ -8213,6 +8235,8 @@ impl Supdb {
             aheadcold,
             aheadeager,
             aheadfirst,
+            rebasedrops,
+            settleshedunbound,
             nochainwrites,
             noland,
             landnearscans,
@@ -9153,6 +9177,12 @@ impl Engine for Supdb {
         if self.aheadfirst {
             return "supdb-aheadfirst";
         }
+        if self.rebasedrops {
+            return "supdb-rebasedrops";
+        }
+        if self.settleshedunbound {
+            return "supdb-settleshedunbound";
+        }
         if self.nochainwrites {
             return if self.partition {
                 "supdb-nochainwrites"
@@ -9726,6 +9756,7 @@ impl Engine for Supdb {
             ("settle_rebuilds", sd[3] as f64),
             ("settle_built", db.settle_built() as f64),
             ("settle_shed", db.settle_shed() as f64),
+            ("settle_sheds_declined", db.settle_sheds_declined() as f64),
             ("walk_sparse", wk[1] as f64),
             ("walk_other", wk[2] as f64),
             // Seeks that hinted their stride window's directory: see
@@ -9760,6 +9791,8 @@ impl Engine for Supdb {
             ("forms_trim_looks", db.forms_trim_looks() as f64),
             ("forms_trim_us", db.forms_trim_us() as f64),
             ("forms_rebased", db.forms_rebased() as f64),
+            ("forms_recut", db.forms_recut().0 as f64),
+            ("deltas_recut", db.forms_recut().1 as f64),
             ("pin_barriers", uk[10] as f64),
             // Point reads of a partition answered through its ordered
             // index, and the ones that left it for the hash: the writer's
@@ -10786,6 +10819,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-aheadcold"
         | "supdb-aheadeager"
         | "supdb-aheadfirst"
+        | "supdb-rebasedrops"
+        | "supdb-settleshedunbound"
         | "supdb-nochainwrites"
         | "supdb-noland"
         | "supdb-landnearscans"
@@ -11492,6 +11527,30 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     d,
                     Policy {
                         aheadfirst: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-rebasedrops" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        rebasedrops: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-settleshedunbound" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        settleshedunbound: true,
                         ..Policy::default()
                     },
                 )
