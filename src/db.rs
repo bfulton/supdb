@@ -2291,9 +2291,10 @@ pub struct Options {
     /// it is wrong by a factor of forty: this device reports 8,192 kB.
     pub scan_readahead_bytes: usize,
     /// Recycle retired WAL files instead of removing them, and pre-write a
-    /// file not yet written through ahead of its tail (`wal_ahead_bytes`),
-    /// so every block a commit's fdatasync touches is already allocated and
-    /// written. On ext4 an fdatasync of an append that grows the file
+    /// file not yet written through ahead of the commits that gain by it
+    /// (`wal_ahead_bytes`, `wal_ahead_small_runs`), so every block such a
+    /// commit's fdatasync touches is already allocated and written. On
+    /// ext4 an fdatasync of an append that grows the file
     /// commits an inode change through the journal; an overwrite does not,
     /// and LMDB's commit is an overwrite. The write mixes' commits are where
     /// it pays, and the loads, whose commits are few and large, are where it
@@ -2316,19 +2317,55 @@ pub struct Options {
     /// for. Off keeps the whole file resident, the shape first priced.
     pub wal_recycle_pads: bool,
     /// Under `recycle_wal`, where every commit syncs
-    /// (`SyncPolicy::Always`), how far ahead of the log's tail a file not
-    /// yet written through is pre-written: a write that comes within half
-    /// of it of the pre-written end first writes zeros out to this far
-    /// past its own end, and never further than `seal_bytes`, the size the
-    /// log rotates at, which the commit's fdatasync then flushes with
-    /// the frames, one journal commit for the file's growth where every
-    /// append paid one. Zero pre-writes the whole file to `seal_bytes`
-    /// when it is made, the live file and a spare at `Db::create` and a
-    /// file at a rotation that finds no spare, the shape first priced:
-    /// 64 MiB written and synced to create a store, and 32 MiB at rest in
-    /// every store however little it holds. Under any other policy only
-    /// the retired files are recycled, whose blocks their last life wrote.
+    /// (`SyncPolicy::Always`), how far past a commit's end a file not yet
+    /// written through is pre-written at once, and never further than
+    /// `seal_bytes`, the size the log rotates at: zeros in page-sized
+    /// writes, which the commit's fdatasync flushes with its frames, one
+    /// journal commit for the file's growth where every append paid one
+    /// (`wal_ahead_small_runs` says which commits pre-write). Zero
+    /// pre-writes the whole file to `seal_bytes` when it is made, the live
+    /// file and a spare at `Db::create` and a file at a rotation that
+    /// finds no spare, the shape first priced: 64 MiB written and synced
+    /// to create a store, and 32 MiB at rest in every store however
+    /// little it holds. Under any other policy only the retired files are
+    /// recycled, whose blocks their last life wrote.
     pub wal_ahead_bytes: usize,
+    /// The log is pre-written ahead only of a run of small commits, and
+    /// only once the run has written as much as the pre-write is long. A
+    /// mebibyte of zeros costs this device what a mebibyte of frames
+    /// does, written and flushed, and a quarter to a half of a
+    /// millisecond besides, and buys each commit that lands in it an
+    /// fdatasync with no journal commit behind it: up to two fifths of
+    /// the syncs' time where a mebibyte holds sixty commits, and less
+    /// than nothing where it holds eight, whose appends sync for less
+    /// than the same bytes laid over page-sized zeros
+    /// (`WAL_AHEAD_COMMIT`). So a commit over `WAL_AHEAD_COMMIT` appends,
+    /// pre-writes nothing and ends the run; a commit within it counts
+    /// toward the run, and where it does not fit what is pre-written --
+    /// it grows the file, and pays the journal commit either way -- it
+    /// pre-writes `wal_ahead_bytes` past its end once the run's commits
+    /// have written that much themselves. A run that long has paid in
+    /// journal commits about twice what the zeros cost, and is the
+    /// evidence that there is a run to buy them for: a store of a few
+    /// dozen commits never pays for a megabyte it will not write into,
+    /// and a pass of a few commits never reads the purchase. A run goes
+    /// on across a rotation into a file with nothing pre-written.
+    ///
+    /// Off is the shape first shipped, the whole of `wal_ahead_bytes`
+    /// past every commit that comes within half of it of the pre-written
+    /// end, whatever the commit's size and from a file's first: a
+    /// mebibyte of zeros written and flushed by whichever commit came
+    /// first, three milliseconds of it, and two megabytes of log written
+    /// for every one a load or a burst appends. At ten thousand keys the
+    /// suite's ycsb-B, one commit in a pass of a millisecond and a half,
+    /// read 0.32-0.40x of the log grown by its appends in every pair,
+    /// the shuffled load 0.73-0.83x and the full rewrite's burst
+    /// 0.76-0.86x, and the load still 0.91x at three hundred thousand --
+    /// a window priced on the write mixes at three and ten million keys
+    /// and never on the smallest write set, nor on the commits of a
+    /// thousand writes (`CLAUDE.md`). `supdb-walaheadflat` is that shape.
+    #[doc(hidden)]
+    pub wal_ahead_small_runs: bool,
     /// The ordered scan's merge over unrouted sources. `true` is the merge
     /// that replaced the original: one cursor over the disjoint partitions
     /// in order rather than one per partition, each cursor's key resolved
@@ -4762,6 +4799,7 @@ impl Default for Options {
             recycle_wal: true,
             wal_recycle_pads: true,
             wal_ahead_bytes: 1 << 20,
+            wal_ahead_small_runs: true,
             read_advice: ReadAdvice::default(),
             scan_readahead_bytes: 256 << 10,
             scan_merge: true,
@@ -4962,10 +5000,16 @@ struct Wal {
     /// is padded to its last page's end (`Options::wal_recycle_pads`).
     extent: u64,
     pads: bool,
-    /// How far past a write's end the file is pre-written when the write
-    /// comes within half of it of `extent`, and the length the pre-write
-    /// stops at (`Options::wal_ahead_bytes`); zero for none.
+    /// How far past a write's end the file is pre-written at once, and
+    /// the length the pre-write stops at (`Options::wal_ahead_bytes`);
+    /// zero for none.
     ahead: u64,
+    /// Whether only a run of small writes pre-writes, once it has written
+    /// `ahead` itself (`Options::wal_ahead_small_runs`), and what the run
+    /// in progress has written; without it every write that comes within
+    /// half of `ahead` of `extent` pre-writes.
+    ahead_runs: bool,
+    ahead_run: u64,
     cap: u64,
 }
 
@@ -4974,7 +5018,7 @@ struct Wal {
 /// syncs every commit (`Options::wal_ahead_bytes`); none otherwise. The
 /// stop is a pre-write's reach past the rotation's size, since the commit
 /// that crosses it writes its batch before the log rotates.
-fn wal_ahead(opts: &Options) -> Option<(u64, u64)> {
+fn wal_ahead(opts: &Options) -> Option<(u64, bool, u64)> {
     if !opts.recycle_wal || opts.wal_ahead_bytes == 0 || !matches!(opts.sync, SyncPolicy::Always) {
         return None;
     }
@@ -4983,8 +5027,23 @@ fn wal_ahead(opts: &Options) -> Option<(u64, u64)> {
     let ahead = (opts.wal_ahead_bytes as u64)
         .min(opts.seal_bytes as u64)
         .max(zselect::PAGE);
-    Some((ahead, opts.seal_bytes as u64 + ahead))
+    Some((
+        ahead,
+        opts.wal_ahead_small_runs,
+        opts.seal_bytes as u64 + ahead,
+    ))
 }
+
+/// The largest commit that pre-writes, and that counts toward a run
+/// (`Options::wal_ahead_small_runs`). Six mebibytes of commits of one
+/// size, appended against pre-written (`bench/examples/walsync.rs`),
+/// read the pre-written log ahead up to forty kilobytes a commit in two
+/// sittings at the device's two speeds, level at forty-eight in one of
+/// them and behind from fifty-six, and at 0.55-0.7x of the appended log
+/// from ninety-six up in both; a write mix's commit of a hundred writes
+/// is seventeen kilobytes and a load's of a thousand a hundred and
+/// thirty.
+const WAL_AHEAD_COMMIT: u64 = 32 << 10;
 
 /// The WAL file starts with eight bytes, this name and a kind byte, so a
 /// file from before frames carried a kind byte, before CRCs were seeded by
@@ -5060,6 +5119,8 @@ impl Wal {
             extent: 0,
             pads: false,
             ahead: 0,
+            ahead_runs: false,
+            ahead_run: 0,
             cap: 0,
         })
     }
@@ -5123,16 +5184,22 @@ impl Wal {
             extent,
             pads,
             ahead: 0,
+            ahead_runs: false,
+            ahead_run: 0,
             cap: 0,
         };
         Ok(wal)
     }
 
-    /// Pre-write the file `ahead` bytes past a write's end, up to `cap`,
-    /// whenever a write comes within half of that of what is pre-written
-    /// (`Options::wal_ahead_bytes`), padding writes as `pads` says.
-    fn set_ahead(&mut self, ahead: u64, cap: u64, pads: bool) {
+    /// Pre-write the file `ahead` past a write's end, up to `cap`
+    /// (`Options::wal_ahead_bytes`), padding writes as `pads` says: with
+    /// `runs`, at a small write that does not fit what is pre-written
+    /// once its run of small writes has written `ahead`
+    /// (`Options::wal_ahead_small_runs`); without, whenever a write comes
+    /// within half of `ahead` of what is pre-written.
+    fn set_ahead(&mut self, ahead: u64, runs: bool, cap: u64, pads: bool) {
         self.ahead = ahead;
+        self.ahead_runs = runs;
         self.cap = cap;
         self.pads = pads;
         self.extent = self.extent.max(self.written);
@@ -5207,6 +5274,8 @@ impl Wal {
             extent: 0,
             pads: false,
             ahead: 0,
+            ahead_runs: false,
+            ahead_run: 0,
             cap: 0,
         })
     }
@@ -5277,7 +5346,24 @@ impl Wal {
             return Ok(());
         }
         let end = self.written + self.pending.len() as u64;
-        if self.ahead > 0 && end + self.ahead / 2 > self.extent && self.extent < self.cap {
+        let grow = if self.ahead == 0 {
+            false
+        } else if !self.ahead_runs {
+            // The whole reach, kept at least half ahead of every write.
+            end + self.ahead / 2 > self.extent
+        } else if self.pending.len() as u64 > WAL_AHEAD_COMMIT {
+            // A large write appends, pre-writes nothing and ends the run
+            // (`Options::wal_ahead_small_runs`).
+            self.ahead_run = 0;
+            false
+        } else {
+            // A small write counts toward its run, and one that grows the
+            // file, and so pays the journal commit either way, pre-writes
+            // a reach once the run has written one itself.
+            self.ahead_run += self.pending.len() as u64;
+            end > self.extent && self.ahead_run >= self.ahead
+        };
+        if grow && self.extent < self.cap {
             let to = ((end + self.ahead).min(self.cap) + zselect::PAGE - 1) & !(zselect::PAGE - 1);
             self.extend_to(end, to)?;
         }
@@ -28411,14 +28497,19 @@ impl Db {
             let ahead = wal_ahead(&self.opts);
             if let Some(spare) = self.shared.take_spare() {
                 let mut wal = Wal::recycle(&spare, &path, id, kind, self.opts.wal_recycle_pads)?;
-                if let Some((ahead, cap)) = ahead {
-                    wal.set_ahead(ahead, cap, self.opts.wal_recycle_pads);
+                if let Some((ahead, runs, cap)) = ahead {
+                    wal.set_ahead(ahead, runs, cap, self.opts.wal_recycle_pads);
                 }
                 return Ok(wal);
             }
             let mut wal = Wal::create(&path, id, kind)?;
             match ahead {
-                Some((ahead, cap)) => wal.set_ahead(ahead, cap, self.opts.wal_recycle_pads),
+                Some((ahead, runs, cap)) => {
+                    wal.set_ahead(ahead, runs, cap, self.opts.wal_recycle_pads);
+                    // A run of small commits goes on across the rotation
+                    // (`Options::wal_ahead_small_runs`).
+                    wal.ahead_run = self.wal.ahead_run;
+                }
                 None if self.opts.wal_ahead_bytes == 0 => {
                     wal.prefill(self.opts.seal_bytes as u64, self.opts.wal_recycle_pads)?
                 }
@@ -28542,10 +28633,10 @@ impl Db {
         let mut wal = Wal::create(&Db::wal_path(dir, 0), 0, WAL_CHAINED)?;
         let mut spare_wal: *mut PathBuf = std::ptr::null_mut();
         let next_seg = 0u64;
-        if let Some((ahead, cap)) = wal_ahead(&opts) {
+        if let Some((ahead, runs, cap)) = wal_ahead(&opts) {
             // Pre-written as the commits reach it, and no spare until a
             // retired file is one.
-            wal.set_ahead(ahead, cap, opts.wal_recycle_pads);
+            wal.set_ahead(ahead, runs, cap, opts.wal_recycle_pads);
         } else if opts.recycle_wal && opts.wal_ahead_bytes == 0 {
             // The live file and one spare, both written through, so the
             // first rotation recycles too and no rotation ever pays the
@@ -29122,8 +29213,8 @@ impl Db {
             }
         }
         let mut wal = Wal::open_append(&wal_path, wal_id, from)?;
-        if let Some((ahead, cap)) = wal_ahead(&opts) {
-            wal.set_ahead(ahead, cap, opts.wal_recycle_pads);
+        if let Some((ahead, runs, cap)) = wal_ahead(&opts) {
+            wal.set_ahead(ahead, runs, cap, opts.wal_recycle_pads);
         }
         let next_seg = seg_ids.iter().map(|&(n, _)| n + 1).max().unwrap_or(0);
         let spare_wal = spare_wals

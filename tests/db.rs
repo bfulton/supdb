@@ -3685,10 +3685,17 @@ fn a_recycled_wal_never_adopts_a_frame_from_its_previous_life() {
 #[test]
 fn a_syncing_store_pre_writes_its_wal_ahead_of_the_tail_and_not_whole() {
     // `wal_ahead_bytes`: nothing pre-written whole and no spare at create,
-    // the live file pre-written a reach past each commit's end and no
-    // further than the rotation's size and a reach, the frames after a
-    // reopen landing at the tail and not past the zeros, and a store whose
-    // commits do not sync pre-writing nothing.
+    // the live file pre-written a reach past a commit's end and no further
+    // than the rotation's size and a reach, the frames after a reopen
+    // landing at the tail and not past the zeros, and a store whose commits
+    // do not sync pre-writing nothing. `wal_ahead_small_runs`: a commit of
+    // at most thirty-two kibibytes counts toward a run, and one that does
+    // not fit what is pre-written pre-writes a reach once the run has
+    // written a reach itself, so the run's first commits append; a commit
+    // over thirty-two kibibytes appends, pre-writes nothing and ends the
+    // run; a reopened store begins a run; and a run goes on across a
+    // rotation. Without the option, the whole reach past every commit from
+    // a file's first.
     let spares = |d: &std::path::Path| {
         std::fs::read_dir(d)
             .unwrap()
@@ -3701,13 +3708,14 @@ fn a_syncing_store_pre_writes_its_wal_ahead_of_the_tail_and_not_whole() {
             })
             .count()
     };
+    let page = |n: u64| (n + 4095) & !4095;
     let ahead = 256u64 << 10;
     let opts = Options {
         wal_ahead_bytes: ahead as usize,
         ..Options::default()
     };
     assert!(opts.recycle_wal && matches!(opts.sync, supdb::SyncPolicy::Always));
-    let cap = opts.seal_bytes as u64 + ahead;
+    assert!(opts.wal_ahead_small_runs);
     let d = dir("wal-ahead");
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let (live, _, _) = db.wal_durable();
@@ -3717,6 +3725,7 @@ fn a_syncing_store_pre_writes_its_wal_ahead_of_the_tail_and_not_whole() {
     );
     assert_eq!(spares(&d), 0, "no spare is made at create");
     let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
+    // Sixty writes, about five kilobytes of frames: a small commit.
     let write = |db: &mut Db, round: u32, model: &mut HashMap<Vec<u8>, Vec<Vec<u8>>>| {
         for i in 0u32..60 {
             let k = format!("k{:04}", (i * 13 + round) % 400).into_bytes();
@@ -3726,33 +3735,164 @@ fn a_syncing_store_pre_writes_its_wal_ahead_of_the_tail_and_not_whole() {
         }
         db.commit().unwrap();
     };
-    for round in 0u32..40 {
-        write(&mut db, round, &mut model);
-        let (live, synced, written) = db.wal_durable();
+    // Forty writes of a kilobyte: a large commit.
+    let big = |db: &mut Db, round: u32, model: &mut HashMap<Vec<u8>, Vec<Vec<u8>>>| {
+        for i in 0u32..40 {
+            let k = format!("b{round:02}{i:03}").into_bytes();
+            let v = vec![b'a' + (i % 26) as u8; 1024];
+            db.append(&k, &v);
+            model.entry(k).or_default().push(v);
+        }
+        db.commit().unwrap();
+    };
+    // Small commits until the file has been pre-written `reaches` times,
+    // each commit's file held to the rule: `run` is what the run has
+    // written and `extent` what is pre-written. Answers how many commits
+    // appended before the first pre-write.
+    let small_run = |db: &mut Db,
+                     round: &mut u32,
+                     run: &mut u64,
+                     extent: &mut u64,
+                     reaches: u32,
+                     model: &mut HashMap<Vec<u8>, Vec<Vec<u8>>>| {
+        let (mut reached, mut appended, mut into) = (0u32, 0u32, 0u32);
+        while into < 5 {
+            assert!(
+                *round < 2000,
+                "{reaches} reaches in two thousand small commits"
+            );
+            let before = db.wal_durable().2;
+            write(db, *round, model);
+            let (live, synced, written) = db.wal_durable();
+            let len = std::fs::metadata(&live).unwrap().len();
+            assert_eq!(synced, written, "round {round}: the commit synced");
+            assert!(written - before < 32 << 10, "round {round}: a small commit");
+            *run += written - before;
+            if written > *extent && *run >= ahead {
+                *extent = page(written + ahead);
+                reached += 1;
+            }
+            assert_eq!(
+                len,
+                (*extent).max(written),
+                "round {round}: {len} bytes for a tail at {written}, a run of {run} and {extent} pre-written"
+            );
+            appended += (reached == 0) as u32;
+            into += (reached >= reaches) as u32;
+            *round += 1;
+        }
+        appended
+    };
+    let (mut round, mut run, mut extent) = (0u32, 0u64, 0u64);
+    let appended = small_run(&mut db, &mut round, &mut run, &mut extent, 3, &mut model);
+    assert!(
+        appended >= 40,
+        "a run's first commits append until they have written a reach: {appended}"
+    );
+    // Large commits, into what is pre-written and past it: nothing more is
+    // pre-written, and the run ends.
+    let mut past = 0;
+    for r in 0u32..12 {
+        let before = db.wal_durable().2;
+        big(&mut db, r, &mut model);
+        let (live, _, written) = db.wal_durable();
+        assert!(written - before > 32 << 10, "a large commit");
         let len = std::fs::metadata(&live).unwrap().len();
-        assert_eq!(synced, written, "round {round}: the commit synced");
-        assert!(
-            len >= (written + ahead / 2).min(cap) && len <= (written + ahead).min(cap) + 4096,
-            "round {round}: {len} bytes for a tail at {written}, not a reach ahead of it"
+        assert_eq!(
+            len,
+            extent.max(written),
+            "large round {r}: {len} bytes for a tail at {written} with {extent} pre-written"
         );
+        past += (written > extent) as u32;
     }
+    assert!(past >= 2, "the large commits ran past what was pre-written");
+    run = 0;
+    let appended = small_run(&mut db, &mut round, &mut run, &mut extent, 1, &mut model);
+    assert!(
+        appended >= 40,
+        "a run after a large commit starts again from nothing: {appended}"
+    );
     drop(db); // crash, zeros past the tail
     let mut db = Db::open(&d, opts.clone()).unwrap();
     for (k, want) in &model {
         assert_eq!(&read_vec(&db, k), want, "after the first crash");
     }
-    for round in 40u32..60 {
-        write(&mut db, round, &mut model);
-    }
+    // The replay cut the file at its tail, and a reopened store's run
+    // starts from nothing.
     let (live, _, written) = db.wal_durable();
+    assert_eq!(std::fs::metadata(&live).unwrap().len(), written);
+    (run, extent) = (0, written);
+    let appended = small_run(&mut db, &mut round, &mut run, &mut extent, 1, &mut model);
     assert!(
-        std::fs::metadata(&live).unwrap().len() >= (written + ahead / 2).min(cap),
-        "a reopened store pre-writes its WAL as well"
+        appended >= 40,
+        "a reopened store's run appends first: {appended}"
     );
     drop(db); // crash again: the frames after the reopen are at the tail
     let db = Db::open(&d, opts.clone()).unwrap();
     for (k, want) in &model {
         assert_eq!(&read_vec(&db, k), want, "after the second crash");
+    }
+    drop(db);
+
+    // A run goes on across a rotation: the first rotation finds no spare,
+    // and the fresh file's first commit, which does not fit, pre-writes.
+    let d = dir("wal-ahead-rotate");
+    let small = 64u64 << 10;
+    let rot = Options {
+        wal_ahead_bytes: small as usize,
+        seal_bytes: 256 << 10,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, rot).unwrap();
+    let first = db.wal_durable().0;
+    let mut rotated = false;
+    for round in 0u32..400 {
+        write(&mut db, round, &mut HashMap::new());
+        if db.wal_durable().0 != first {
+            // The commit that crossed the size rotated the log behind
+            // itself; the next is the fresh file's first.
+            write(&mut db, 1000 + round, &mut HashMap::new());
+            let (live, _, written) = db.wal_durable();
+            assert_eq!(
+                std::fs::metadata(&live).unwrap().len(),
+                page(written + small),
+                "the first commit after a rotation in a run pre-writes a reach"
+            );
+            rotated = true;
+            break;
+        }
+    }
+    assert!(
+        rotated,
+        "four hundred small commits rotate a log of 256 KiB"
+    );
+    drop(db);
+
+    // Without the runs, the whole reach from a file's first write, kept
+    // at least half ahead of every commit, a large one too.
+    let d = dir("wal-ahead-flat");
+    let flat = Options {
+        wal_ahead_bytes: ahead as usize,
+        wal_ahead_small_runs: false,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, flat).unwrap();
+    write(&mut db, 0, &mut HashMap::new());
+    let (live, _, written) = db.wal_durable();
+    let len = std::fs::metadata(&live).unwrap().len();
+    assert_eq!(
+        len,
+        page(written + ahead),
+        "flat: the whole reach at the first commit"
+    );
+    for round in 0u32..8 {
+        big(&mut db, round, &mut HashMap::new());
+        let (live, _, written) = db.wal_durable();
+        let len = std::fs::metadata(&live).unwrap().len();
+        assert!(
+            len >= written + ahead / 2 && len <= written + ahead + 4096,
+            "flat: {len} bytes for a tail at {written} after a large commit"
+        );
     }
     drop(db);
 
