@@ -15692,7 +15692,12 @@ struct State {
     /// which a store only read may not make for seconds: the table a
     /// landing replaced and the seal's snapshot copy it holds, a hundred
     /// megabytes each at ten million keys, stood through a pass of scans
-    /// under a bound that could not spare them.
+    /// under a bound that could not spare them. A publish copies the list
+    /// from where the look stood when it read that, and swaps its state in
+    /// later: a look in between dropped its tables from the state being
+    /// replaced, so the publish trims its own list after its swap by where
+    /// the look stands then (`Db::swap_state`), and the look trims
+    /// whichever state is current after it has stored where it stands.
     replaced: std::sync::Mutex<Vec<std::sync::Arc<MemTable>>>,
     /// Mean bytes a key costs across the live segments, kept rather than
     /// recomputed because `scan` asks it on every call and a fold over the
@@ -16373,6 +16378,12 @@ struct Shared {
     /// whether it is waiting at either.
     upkeep_hold_at: std::sync::atomic::AtomicU8,
     upkeep_holding: std::sync::atomic::AtomicBool,
+    /// A test's (`Db::hold_landing_swap`, `Db::look_after_a_landing`): bit
+    /// 1 holds the publish that lands a seal's table between the state it
+    /// has made and its swap, bit 2 holds a look before it stores where it
+    /// stands; and the bits being waited at.
+    kept_hold: std::sync::atomic::AtomicU8,
+    kept_holding: std::sync::atomic::AtomicU8,
     /// `Options::forms_trim_bytes`: a handle has freed enough forms that
     /// the trim thread is to look at what the allocator holds free, and
     /// the thread to wake; what the allocator held free after the last
@@ -20210,6 +20221,15 @@ impl State {
         all[skip..].iter().map(|t| (*t).clone()).collect()
     }
 
+    /// `replaced` less the tables live before `from`, a value of `lives`:
+    /// the ones a look that stands at `from` has read.
+    fn drop_replaced_before(&self, from: u64) {
+        let mut replaced = self.replaced();
+        let first = self.lives - replaced.len() as u64;
+        let skip = (from.saturating_sub(first) as usize).min(replaced.len());
+        replaced.drain(..skip);
+    }
+
     /// Whether `replaced` keeps fewer tables than were live since the
     /// look `keep` names: the look is further behind than what was kept
     /// for it, and drops its tables when it comes.
@@ -22629,12 +22649,23 @@ impl Reader {
             lives: st.lives,
         });
         if self.slot.is_none() {
+            Db::kept_held(&self.shared, 2);
             self.shared
                 .upkeep_lives
-                .store(st.lives, AtomicOrdering::Relaxed);
+                .store(st.lives, AtomicOrdering::SeqCst);
             // The tables kept for this look are read: dropped here, with
             // the snapshot copies they hold, and not at the next publish.
             st.replaced().clear();
+            // And from the state a publish swapped in since this look
+            // took its own: that publish copied the list before the store
+            // above, and its own trim after its swap may have come before
+            // it too. Whichever of the two came second sees the other.
+            let cur_p = self.shared.state.load(AtomicOrdering::SeqCst);
+            if !std::ptr::eq(cur_p, st) {
+                // SAFETY: the look runs inside a pinned operation, and a
+                // state is freed only past every pinned slot.
+                unsafe { &*cur_p }.drop_replaced_before(st.lives);
+            }
         }
     }
 
@@ -29572,6 +29603,8 @@ impl Db {
             tables_landed: AtomicU64::new(0),
             upkeep_hold_at: std::sync::atomic::AtomicU8::new(0),
             upkeep_holding: std::sync::atomic::AtomicBool::new(false),
+            kept_hold: std::sync::atomic::AtomicU8::new(0),
+            kept_holding: std::sync::atomic::AtomicU8::new(0),
             trim_wanted: std::sync::atomic::AtomicBool::new(false),
             trim_floor: AtomicUsize::new(0),
             trims: AtomicU64::new(0),
@@ -30139,6 +30172,8 @@ impl Db {
             tables_landed: AtomicU64::new(0),
             upkeep_hold_at: std::sync::atomic::AtomicU8::new(0),
             upkeep_holding: std::sync::atomic::AtomicBool::new(false),
+            kept_hold: std::sync::atomic::AtomicU8::new(0),
+            kept_holding: std::sync::atomic::AtomicU8::new(0),
             trim_wanted: std::sync::atomic::AtomicBool::new(false),
             trim_floor: AtomicUsize::new(0),
             trims: AtomicU64::new(0),
@@ -31820,12 +31855,7 @@ impl Db {
             // is freed only past every pinned slot.
             let next = make(unsafe { &*cur_p })?;
             let p = Box::into_raw(Box::new(next));
-            if self
-                .shared
-                .state
-                .compare_exchange(cur_p, p, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
-                .is_err()
-            {
+            if !Db::swap_state(&self.opts, &self.shared, cur_p, p) {
                 // SAFETY: never published, still this call's.
                 drop(unsafe { Box::from_raw(p) });
                 continue;
@@ -32003,9 +32033,50 @@ impl Db {
     fn replaced_from(opts: &Options, shared: &Shared) -> Option<Keep> {
         (opts.forms_carry && opts.commit_forms && opts.scan_block_cache && !opts.freeze_settles)
             .then(|| Keep {
-                from: shared.upkeep_lives.load(AtomicOrdering::Relaxed),
+                from: shared.upkeep_lives.load(AtomicOrdering::SeqCst),
                 bytes: shared.keep_bytes,
             })
+    }
+
+    /// `p` swapped in as the store's state where `cur_p` still stands,
+    /// the one swap every publisher makes, the writer and the segment
+    /// work alike; false, and nothing changed, where another publish came
+    /// first. Then the kept tables of the state swapped in are trimmed by
+    /// where the upkeep's look stands now. The publish read that position
+    /// before it made the state and copied the list then; a look that
+    /// came between the reading and the swap stored its new position and
+    /// dropped its tables from the state it held, which the swap has
+    /// replaced, and the copy brought them back for as long as the store
+    /// published nothing more and nobody looked. The swap and the load
+    /// after it are sequentially consistent, as the look's store and its
+    /// load of the state after are (`Reader::note_over`): one of the two
+    /// sees the other. The caller is pinned, and frees `p` on a false.
+    fn swap_state(opts: &Options, shared: &Shared, cur_p: *mut State, p: *mut State) -> bool {
+        if shared
+            .state
+            .compare_exchange(cur_p, p, AtomicOrdering::SeqCst, AtomicOrdering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        if let Some(keep) = Db::replaced_from(opts, shared) {
+            // SAFETY: just published by this call, whose caller is pinned.
+            unsafe { &*p }.drop_replaced_before(keep.from);
+        }
+        true
+    }
+
+    /// A test's hold (`Db::hold_landing_swap`, `Db::look_after_a_landing`):
+    /// the caller waits here while `bit` is set.
+    fn kept_held(shared: &Shared, bit: u8) {
+        if shared.kept_hold.load(AtomicOrdering::Acquire) & bit == 0 {
+            return;
+        }
+        shared.kept_holding.fetch_or(bit, AtomicOrdering::AcqRel);
+        while shared.kept_hold.load(AtomicOrdering::Acquire) & bit != 0 {
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        shared.kept_holding.fetch_and(!bit, AtomicOrdering::AcqRel);
     }
 
     /// `Options::scan_cache_auto` resolved: zero where the store has a
@@ -36238,6 +36309,50 @@ impl Db {
     #[doc(hidden)]
     pub fn upkeep_holding(&self) -> bool {
         self.shared.upkeep_holding.load(AtomicOrdering::Acquire)
+    }
+
+    /// A test's: while `on`, the publish that lands a seal's table waits
+    /// between the state it has made, the kept tables copied into it, and
+    /// its swap, so a look can be made to fall in that window.
+    #[doc(hidden)]
+    pub fn hold_landing_swap(&self, on: bool) {
+        Db::set_hold_bit(&self.shared.kept_hold, 1, on);
+    }
+
+    /// Whether a landing is waiting at `hold_landing_swap`: for a test.
+    #[doc(hidden)]
+    pub fn landing_holding(&self) -> bool {
+        self.shared.kept_holding.load(AtomicOrdering::Acquire) & 1 != 0
+    }
+
+    /// A test's: a look -- the scan or the pass that takes the writer's
+    /// upkeep over a state -- waits before it stores where it stands, and
+    /// a thread of this call's lets the held seals land once the look is
+    /// waiting, waits for a landing to publish, and lets the look go on:
+    /// the look then holds a state a landing has replaced since. The
+    /// caller holds the seals' landing first (`hold_seal_landing`), and
+    /// its thread is the one that looks.
+    #[doc(hidden)]
+    pub fn look_after_a_landing(&self) -> std::thread::JoinHandle<bool> {
+        Db::set_hold_bit(&self.shared.kept_hold, 2, true);
+        let shared = self.shared.clone();
+        std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            let waited = |t: &std::time::Instant| t.elapsed() < std::time::Duration::from_secs(60);
+            while shared.kept_holding.load(AtomicOrdering::Acquire) & 2 == 0 && waited(&t) {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+            let landed = shared.tables_landed.load(AtomicOrdering::Acquire);
+            shared
+                .seal_hold
+                .fetch_and(!SEAL_HOLD_LANDING, AtomicOrdering::AcqRel);
+            while shared.tables_landed.load(AtomicOrdering::Acquire) == landed && waited(&t) {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+            let ok = waited(&t);
+            shared.kept_hold.fetch_and(!2, AtomicOrdering::AcqRel);
+            ok
+        })
     }
 
     /// Tables the seals' landings have retired: for a test.
@@ -40642,12 +40757,10 @@ impl Maint {
                 )
             };
             let p = Box::into_raw(Box::new(next));
-            if self
-                .shared
-                .state
-                .compare_exchange(cur_p, p, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
-                .is_err()
-            {
+            if landed.is_some() {
+                Db::kept_held(&self.shared, 1);
+            }
+            if !Db::swap_state(&self.opts, &self.shared, cur_p, p) {
                 // SAFETY: never published, still this call's.
                 drop(unsafe { Box::from_raw(p) });
                 continue;
@@ -45856,11 +45969,15 @@ impl Maint {
 impl Drop for Db {
     fn drop(&mut self) {
         let _op = self.op();
-        // A test's holds on the seal thread and on the form's builder are
-        // lifted: the close joins them, and a test that failed under a hold
-        // hung here in the builder's join before the second was.
+        // A test's holds on the seal thread, on the form's builder, on the
+        // upkeep thread and on a landing's swap or a look are lifted: the
+        // close joins the threads they hold, and a test that failed under
+        // a hold hung here in the builder's join before the second was,
+        // and in the upkeep thread's before the third and fourth were.
         self.shared.seal_hold.store(0, AtomicOrdering::Release);
         self.shared.zbuild_hold.store(0, AtomicOrdering::Release);
+        self.shared.upkeep_hold_at.store(0, AtomicOrdering::Release);
+        self.shared.kept_hold.store(0, AtomicOrdering::Release);
         self.stop_upkeep();
         self.stop_keeper();
         self.stop_trimmer();

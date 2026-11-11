@@ -654,7 +654,11 @@ fn a_look_drops_the_tables_it_passed_before_any_publish() {
         }
         db.commit().unwrap();
     }
-    while db.tables_landed() == landed0 {
+    // The table the loop froze, and not the load's, whose landing may come
+    // inside the loop: the count of landings moved for the load's table in
+    // every run of this test and for the frozen one in none, until the
+    // frozen one landed under the look it was written to precede.
+    while db.frozen_tables() > 0 || db.tables_landed() == landed0 {
         assert!(t.elapsed().as_secs() < 60, "the frozen table never landed");
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
@@ -673,6 +677,138 @@ fn a_look_drops_the_tables_it_passed_before_any_publish() {
         (kept, look, lives_now, db.tables_landed()),
         (0, lives, lives, landed),
         "the look dropped the tables it passed, with no publish between"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The store the two tests below start from: loaded, drained and scanned,
+/// with nothing of the load's in flight, the upkeep thread held before its
+/// pass, and writes made until a table froze. Answers the store, `lives`
+/// at the freeze and the landings counted before it.
+fn frozen_under_a_held_look(
+    name: &str,
+    before: impl Fn(&Db),
+) -> (Db, std::path::PathBuf, u64, u64) {
+    let d = dir(name);
+    let mut db = Db::create(
+        &d,
+        Options {
+            upkeep: supdb::Upkeep::Background(1),
+            seal_bytes: 64 << 10,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let put = |db: &mut Db, i: u32, v: &str| {
+        db.append(format!("k{:08}", i).as_bytes(), v.as_bytes());
+    };
+    for i in 0..20_000 {
+        put(&mut db, i, "a");
+    }
+    db.commit().unwrap();
+    db.sync().unwrap();
+    let mut n = 0;
+    db.scan(b"", 100, kv(&mut |_, _| n += 1)).unwrap();
+    assert!(n > 0);
+    // Every landing of the load's behind it, so that the next table a
+    // landing retires is the one frozen below.
+    db.settle().unwrap();
+    db.hold_upkeep_pass(true);
+    before(&db);
+    let (_, _, lives0, _) = db.upkeep_abandon_state();
+    let landed0 = db.tables_landed();
+    let t = std::time::Instant::now();
+    let mut i = 0u32;
+    while db.upkeep_abandon_state().2 == lives0 {
+        assert!(t.elapsed().as_secs() < 60, "no freeze");
+        for _ in 0..100 {
+            put(&mut db, (i * 37) % 20_000, "b");
+            i += 1;
+        }
+        db.commit().unwrap();
+    }
+    let (_, kept, lives, look) = db.upkeep_abandon_state();
+    assert!(
+        kept >= 1 && look < lives,
+        "a table kept for the look that has not come: kept {kept}, lives {lives}, look {look}"
+    );
+    (db, d, lives, landed0)
+}
+
+/// A landing that read where the look stood, copied the kept tables into
+/// the state it made, and swapped that state in after a look had passed
+/// them brings none of them back. The look drops its tables from the
+/// state it holds, which is the one the landing replaces; the landing's
+/// copy was made before, and without its trim after the swap the table
+/// and the seal's snapshot copy of it stood in the new state until the
+/// next look, whenever that came. The landing is held between its copy
+/// and its swap, the look made, and the landing let go.
+#[test]
+fn a_landing_that_swaps_after_a_look_keeps_none_of_the_tables_the_look_passed() {
+    let (db, d, lives, landed0) =
+        frozen_under_a_held_look("look-then-swap", |db| db.hold_landing_swap(true));
+    let t = std::time::Instant::now();
+    while !db.landing_holding() {
+        assert!(t.elapsed().as_secs() < 60, "no landing reached its swap");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(db.tables_landed(), landed0, "the landing has not swapped");
+    db.hold_upkeep_pass(false);
+    let mut n = 0;
+    db.scan(b"", 100, kv(&mut |_, _| n += 1)).unwrap();
+    assert!(n > 0);
+    let (_, kept, _, look) = db.upkeep_abandon_state();
+    assert_eq!(
+        (kept, look),
+        (0, lives),
+        "the look dropped the tables it passed"
+    );
+    db.hold_landing_swap(false);
+    while db.tables_landed() == landed0 {
+        assert!(t.elapsed().as_secs() < 60, "the held landing never swapped");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let (_, kept, lives_now, look) = db.upkeep_abandon_state();
+    assert_eq!(
+        (kept, look, lives_now),
+        (0, lives, lives),
+        "the landing's state keeps nothing the look had passed"
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The other order: a look that took its state, and stores where it stands
+/// after a landing has replaced that state, drops its tables from the
+/// state that stands as well as from its own. The landing read the look's
+/// old position and trimmed by it after its swap, both before the look
+/// stored the new one, so only the look can drop them. The seal is held
+/// before it writes, the look held before its store, the seal let go, and
+/// the look let go once the landing has published.
+#[test]
+fn a_look_over_a_state_a_landing_replaced_drops_its_tables_from_the_state_that_stands() {
+    let (db, d, lives, landed0) =
+        frozen_under_a_held_look("swap-then-look", |db| db.hold_seal_landing(true));
+    assert_eq!(
+        db.tables_landed(),
+        landed0,
+        "the frozen table's seal is held"
+    );
+    let landing = db.look_after_a_landing();
+    db.hold_upkeep_pass(false);
+    let mut n = 0;
+    db.scan(b"", 100, kv(&mut |_, _| n += 1)).unwrap();
+    assert!(n > 0);
+    assert!(
+        landing.join().unwrap(),
+        "a look waited and a landing published under it"
+    );
+    let (_, kept, lives_now, look) = db.upkeep_abandon_state();
+    assert_eq!(
+        (kept, look, lives_now, db.tables_landed()),
+        (0, lives, lives, landed0 + 1),
+        "the state the landing published keeps nothing the look passed"
     );
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&d);
