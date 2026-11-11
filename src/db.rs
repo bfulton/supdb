@@ -540,6 +540,21 @@ pub struct ZCounts {
     /// nothing.
     pub memo_hits: u64,
     pub memo_misses: u64,
+    /// Point reads through a form file (`Options::zpages_point_part`,
+    /// `Options::zpages_point_keys`): the groups a read decoded only as
+    /// far as its key, the bytes those decodes wrote and the bytes the
+    /// groups hold, the groups the memo took at their second touch, and
+    /// the reads the key table sent straight to their record.
+    pub point_parts: u64,
+    pub point_part_bytes: u64,
+    pub point_part_of: u64,
+    pub point_admits: u64,
+    pub point_key_hits: u64,
+    /// The groups walks decoded into their cursors' own buffers, each a
+    /// decode the memo would have taken (`Options::zpages_scan_admit`,
+    /// `Options::zpages_walk_owns_decodes`): counted on the handles'
+    /// lines, as the memo's hits are.
+    pub walk_owned: u64,
     /// Walks that asked for the pages after their first at once
     /// (`Options::zpages_scan_prefetch`).
     pub prefetches: u64,
@@ -838,9 +853,6 @@ pub struct ZHeat {
     pub decodes: u64,
     pub decode_ns: u64,
     pub coded: bool,
-    /// The groups a walk decoded into its cursor's own buffer
-    /// (`Options::zpages_walk_owns_decodes`).
-    pub walk_owned: u64,
 }
 
 #[derive(Clone)]
@@ -1433,6 +1445,39 @@ pub struct Options {
     /// and no cell against it, inside the band. On;
     /// `supdb-cache64tofitautozpagesmemonoahead` is the shape before.
     pub zpages_memo_ahead: bool,
+    /// EXPERIMENT: a point read's first touch of a block-coded group of a
+    /// verified page decodes the group into the read's own buffer only as
+    /// far as the walk for its key reads (`zpages::seek_group_partly`,
+    /// `zlz4::decompress_more`), and the handle's memo takes a group at
+    /// its second touch (`zfile::Memo::admit`), decoded whole as before.
+    /// A read wants one record and the decoder is sequential: every miss
+    /// of the memo decoded its group whole, into a buffer of the memo's
+    /// last written thousands of decodes ago, and displaced a group that
+    /// may have been read again -- and a store larger than its caches
+    /// reads most of its groups once. `supdb-zpointwhole` is the whole
+    /// decode into the memo at every miss.
+    pub zpages_point_part: bool,
+    /// EXPERIMENT: a handle keeps where the keys it read through the memo
+    /// lie -- the form file, the page, the group and the record's offset,
+    /// by the key's hash (`zfile::Memo::key_at`) -- and a point read asks
+    /// it first: the group asked of the memo and the record's key
+    /// compared where it lies, with no filter, fence, page view or walk
+    /// of the group for a key read again. A megabyte a handle that reads
+    /// the compact form by key, asked at every such read: where no key is
+    /// read again it is a probe of a table the core's cache does not
+    /// hold, for nothing, the pairing in `docs/engine.md`.
+    /// `supdb-znopointkeys` has no table.
+    pub zpages_point_keys: bool,
+    /// EXPERIMENT: a walk's first touch of a group through a form file is
+    /// decoded into its cursor's own buffer and put nowhere, and the
+    /// handle's memo takes a group at its second touch while the first's
+    /// tag stands (`zfile::Memo::admit`), the rule a point read's first
+    /// touch has (`zpages_point_part`). Every open of a group the memo did
+    /// not hold decoded it into a buffer of the memo's and displaced
+    /// another, so scans that read their groups once turned the memo's
+    /// slots over under the scans that start where others did.
+    /// `supdb-zscanputs` puts every decode of a walk in the memo.
+    pub zpages_scan_admit: bool,
     /// EXPERIMENT: the block path's cursor over a form file
     /// (`zfile::ZCursor`) keeps the page's view across the page's groups,
     /// and where `zpages_memo_first` asks the memo before any view it builds
@@ -4909,6 +4954,9 @@ impl Default for Options {
             zpages_fence_tree: false,
             zpages_fence_words: true,
             zpages_memo_ahead: true,
+            zpages_point_part: true,
+            zpages_point_keys: true,
+            zpages_scan_admit: true,
             zpages_cursor_view: true,
             zpages_group_ahead: true,
             zpages_block_cursor: true,
@@ -6003,7 +6051,15 @@ impl BlockedBloom {
 
     #[inline]
     fn maybe_contains(&self, key: &[u8]) -> bool {
-        let (bi, probes) = self.slots(key);
+        self.maybe_contains_hash(BlockedBloom::hash(key))
+    }
+
+    /// `maybe_contains` for a key whose hash (`BlockedBloom::hash`) the
+    /// caller has: a point read through a form file hashes its key once
+    /// for the key table and for this.
+    #[inline]
+    fn maybe_contains_hash(&self, h: u64) -> bool {
+        let (bi, probes) = self.slots_of(h);
         let b = &self.blocks[bi];
         probes.iter().all(|&(w, m)| b[w] & m != 0)
     }
@@ -11181,6 +11237,16 @@ struct Slot {
     /// dispatch (`zfile::memo_take`).
     zmemohits: AtomicU64,
     zmemomisses: AtomicU64,
+    /// The point reads' counts from the memo (`zfile::PointCounts`):
+    /// groups decoded in part, the bytes decoded of them and the bytes
+    /// they hold, groups the memo took at a second touch, and reads the
+    /// key table sent to their record.
+    zparts: AtomicU64,
+    zpartbytes: AtomicU64,
+    zpartof: AtomicU64,
+    zadmits: AtomicU64,
+    zkeyhits: AtomicU64,
+    zowned: AtomicU64,
     /// Walks that asked for the pages after their first
     /// (`Options::zpages_scan_prefetch`).
     zprefetches: AtomicU64,
@@ -11261,6 +11327,12 @@ impl Slot {
             znopage: AtomicU64::new(0),
             zmemohits: AtomicU64::new(0),
             zmemomisses: AtomicU64::new(0),
+            zparts: AtomicU64::new(0),
+            zpartbytes: AtomicU64::new(0),
+            zpartof: AtomicU64::new(0),
+            zadmits: AtomicU64::new(0),
+            zkeyhits: AtomicU64::new(0),
+            zowned: AtomicU64::new(0),
             zprefetches: AtomicU64::new(0),
             zviews: AtomicU64::new(0),
             zaheads: AtomicU64::new(0),
@@ -20828,7 +20900,6 @@ impl Reader {
                     decodes: 16 * z.decodes16.load(AtomicOrdering::Relaxed),
                     decode_ns: 16 * z.decode_ns16.load(AtomicOrdering::Relaxed),
                     coded: z.coded(),
-                    walk_owned: z.owned.load(AtomicOrdering::Relaxed),
                 });
             }
         }
@@ -20877,6 +20948,12 @@ impl Reader {
             raw_scans: rd.stat(|s| &s.zscans),
             memo_hits: rd.stat(|s| &s.zmemohits),
             memo_misses: rd.stat(|s| &s.zmemomisses),
+            point_parts: rd.stat(|s| &s.zparts),
+            point_part_bytes: rd.stat(|s| &s.zpartbytes),
+            point_part_of: rd.stat(|s| &s.zpartof),
+            point_admits: rd.stat(|s| &s.zadmits),
+            point_key_hits: rd.stat(|s| &s.zkeyhits),
+            walk_owned: rd.stat(|s| &s.zowned),
             prefetches: rd.stat(|s| &s.zprefetches),
             scan_views: rd.stat(|s| &s.zviews),
             group_aheads: rd.stat(|s| &s.zaheads),
@@ -21124,10 +21201,18 @@ impl Reader {
     /// line: taken at each dispatch.
     #[inline]
     fn zmemo_take(&self) {
-        let (h, m) = self.zmemo.take_counts();
+        let (h, m, p) = self.zmemo.take_all();
         if h | m != 0 {
             self.zbump_by(|s| &s.zmemohits, h);
             self.zbump_by(|s| &s.zmemomisses, m);
+        }
+        if p.parts | p.admits | p.key_hits | p.owned != 0 {
+            self.zbump_by(|s| &s.zparts, p.parts);
+            self.zbump_by(|s| &s.zpartbytes, p.part_bytes);
+            self.zbump_by(|s| &s.zpartof, p.part_of);
+            self.zbump_by(|s| &s.zadmits, p.admits);
+            self.zbump_by(|s| &s.zkeyhits, p.key_hits);
+            self.zbump_by(|s| &s.zowned, p.owned);
         }
     }
 
@@ -29631,7 +29716,9 @@ impl Db {
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zfile::ZMemo::sized(opts.zpages_memo_bytes),
+            zmemo: zfile::ZMemo::sized(opts.zpages_memo_bytes)
+                .point(opts.zpages_point_part, opts.zpages_point_keys)
+                .scans(opts.zpages_scan_admit),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
             zwin_counting: std::cell::Cell::new(false),
@@ -30200,7 +30287,9 @@ impl Db {
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zfile::ZMemo::sized(opts.zpages_memo_bytes),
+            zmemo: zfile::ZMemo::sized(opts.zpages_memo_bytes)
+                .point(opts.zpages_point_part, opts.zpages_point_keys)
+                .scans(opts.zpages_scan_admit),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
             zwin_counting: std::cell::Cell::new(false),
@@ -32612,7 +32701,9 @@ impl Reader {
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes),
+            zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
+                .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
+                .scans(self.opts.zpages_scan_admit),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
             zwin_counting: std::cell::Cell::new(false),
@@ -32649,7 +32740,9 @@ impl Reader {
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes),
+            zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
+                .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
+                .scans(self.opts.zpages_scan_admit),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
             zwin_counting: std::cell::Cell::new(false),
@@ -32693,7 +32786,9 @@ impl Reader {
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes),
+            zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
+                .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
+                .scans(self.opts.zpages_scan_admit),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
             zwin_counting: std::cell::Cell::new(false),
@@ -35457,7 +35552,9 @@ impl Reader {
             forms_off_now: std::cell::Cell::new(false),
             ord_served: std::cell::Cell::new(0),
             ord_declined: std::cell::Cell::new(0),
-            zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes),
+            zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
+                .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
+                .scans(self.opts.zpages_scan_admit),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
             zwin_counting: std::cell::Cell::new(false),

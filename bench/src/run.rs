@@ -666,6 +666,15 @@ fn counters_line(
             "zpage_decodes",
             "zpage_memo_hits",
             "zpage_memo_misses",
+            // The point reads through it: groups decoded only as far as
+            // their key, the bytes decoded of the bytes they hold, groups
+            // the memo took at a second touch, and reads the key table
+            // sent to their record.
+            "zpage_point_parts",
+            "zpage_point_part_bytes",
+            "zpage_point_part_of",
+            "zpage_point_admits",
+            "zpage_point_key_hits",
             "zpage_prefetches",
             "zpage_nopage_scans",
             "zpage_raw_scans",

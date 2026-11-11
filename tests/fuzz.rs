@@ -230,6 +230,20 @@ struct Cfg {
     /// off), with the record coding on; on in some seeds under
     /// `ZFUZZ_OPTVARY`.
     raw_tails: bool,
+    /// A point read's first touch of a group decoded in part with the
+    /// memo's admission at the second (`Options::zpages_point_part`), and
+    /// the table of where the keys read through the memo lie
+    /// (`Options::zpages_point_keys`): each off in a quarter of the seeds
+    /// under `ZFUZZ_OPTVARY`, so the shape before is read against the model
+    /// too. Drawn from a generator of their own, seeded from the seed's
+    /// and leaving it where it stood, so that no seed's other draws moved
+    /// when these were added.
+    point_part: bool,
+    point_keys: bool,
+    /// A walk's first touch of a group decoded into its cursor's own
+    /// buffer (`Options::zpages_scan_admit`): off in a quarter of the seeds
+    /// under `ZFUZZ_OPTVARY`, from the same side generator.
+    scan_admit: bool,
 }
 
 /// Whether a seed runs with the block cache on. The chance is drawn whenever
@@ -248,6 +262,9 @@ fn cache_asked(rng: &mut Rng, want_cache: bool) -> bool {
 }
 
 fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
+    let vary = std::env::var("ZFUZZ_OPTVARY").is_ok();
+    let mut side = Rng::new(rng.0 ^ 0x9017_7A27_0000_0001);
+    let (part_off, keys_off, scan_off) = (side.chance(25), side.chance(25), side.chance(25));
     Cfg {
         seal_bytes: [2 << 10, 4 << 10, 8 << 10, 16 << 10, 32 << 10][rng.below(5)],
         partition_bytes: match rng.below(4) {
@@ -285,6 +302,9 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         start_cache: std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25),
         store_all: std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25),
         raw_tails: std::env::var("ZFUZZ_OPTVARY").is_ok() && rng.chance(25),
+        point_part: !(vary && part_off),
+        point_keys: !(vary && keys_off),
+        scan_admit: !(vary && scan_off),
     }
 }
 
@@ -306,6 +326,9 @@ fn opts(c: &Cfg) -> Options {
         zpages_raw_tails: c.raw_tails,
         zpages_fence_tree: c.fence_tree,
         zpages_memo_ahead: c.memo_ahead,
+        zpages_point_part: c.point_part,
+        zpages_point_keys: c.point_keys,
+        zpages_scan_admit: c.scan_admit,
         zpages_store_all: c.store_all,
         scan_start_cache: if c.start_cache { 4096 } else { 0 },
         ..Options::default()
@@ -754,6 +777,23 @@ struct Stats {
     /// gave back (`Options::heads_owned`), summed as `abandons` is: what
     /// says a run under `ZFUZZ_CENSUS` or `ZFUZZ_ZPAGES` reached them.
     heads: [u64; 2],
+    /// Through either store's form files: groups a point read decoded in
+    /// part, groups the memo took at a second touch, reads the key table
+    /// sent to their record, and groups a walk decoded into its own buffer
+    /// (`Options::zpages_point_part`, `zpages_point_keys`,
+    /// `zpages_scan_admit`), summed as `recuts` is: what says a run under
+    /// `ZFUZZ_ZPAGES` reached each.
+    point: [u64; 4],
+}
+
+/// A store's point-read and walk counts through its form files, added to
+/// the seed's.
+fn count_point(st: &mut Stats, db: &Db) {
+    let c = db.zpage_counts();
+    st.point[0] += c.point_parts;
+    st.point[1] += c.point_admits;
+    st.point[2] += c.point_key_hits;
+    st.point[3] += c.walk_owned;
 }
 
 /// Under `ZFUZZ_CENSUS`, the store read as out of core: the census gate,
@@ -852,6 +892,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         switches: 0,
         recuts: 0,
         heads: [0; 2],
+        point: [0; 4],
     };
     let mut fails: Vec<String> = Vec::new();
     let mut absent = absent_around(&pool, &mut rng);
@@ -1040,6 +1081,8 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                     st.beside += z.seal_waits().merges_beside + r.seal_waits().merges_beside;
                     st.switches += z.forms_off_counts()[..2].iter().sum::<u64>();
                     st.recuts += z.forms_recut().0 + r.forms_recut().0;
+                    count_point(&mut st, &z);
+                    count_point(&mut st, &r);
                     count_heads(&mut st, &z);
                     count_heads(&mut st, &r);
                     let clean = rng.chance(50) || !matches!(cfg.sync, SyncPolicy::Always);
@@ -1210,6 +1253,8 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
     st.beside += z.seal_waits().merges_beside + r.seal_waits().merges_beside;
     st.switches += z.forms_off_counts()[..2].iter().sum::<u64>();
     st.recuts += z.forms_recut().0 + r.forms_recut().0;
+    count_point(&mut st, &z);
+    count_point(&mut st, &r);
     count_heads(&mut st, &z);
     count_heads(&mut st, &r);
     drop(z);
@@ -1241,6 +1286,7 @@ fn fuzz_range() {
     let (mut bad, mut reopens, mut abandons, mut bindings, mut beside, mut switches) =
         (Vec::new(), 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut recuts = 0u64;
+    let mut point = [0u64; 4];
     let mut heads = [0u64; 2];
     for seed in seeds {
         match run_seed(seed, want_cache, verbose) {
@@ -1251,6 +1297,9 @@ fn fuzz_range() {
                 beside += s.beside;
                 switches += s.switches;
                 recuts += s.recuts;
+                for (a, b) in point.iter_mut().zip(s.point) {
+                    *a += b;
+                }
                 heads[0] += s.heads[0];
                 heads[1] += s.heads[1];
             }
@@ -1258,9 +1307,13 @@ fn fuzz_range() {
         }
     }
     eprintln!(
-        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, FAILURES {}",
+        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {}, FAILURES {}",
         heads[0],
         heads[1],
+        point[0],
+        point[1],
+        point[2],
+        point[3],
         bad.len()
     );
     for b in &bad {

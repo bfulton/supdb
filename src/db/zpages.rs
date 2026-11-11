@@ -898,6 +898,125 @@ pub fn decode_group_with<'a>(
     Ok(out)
 }
 
+/// The output a point read's partial decode asks its decoder for past what
+/// it has ([`seek_group_partly`]): two of the suite's records, so that a
+/// call brings a record or two and the walk asks again once a record or
+/// so. Smaller, and the calls' own cost is a share of a short decode;
+/// larger, and the read decodes that much past its record.
+pub const PART_STEP: usize = 256;
+
+/// Where a key falls in a group decoded only as far as the walk for it
+/// read ([`seek_group_partly`]): the record's offset, or `None` for a key
+/// the group does not hold; the bytes of the group decoded, which hold the
+/// record whole; and the bytes the whole group decodes to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PartSeek {
+    pub off: Option<usize>,
+    pub len: usize,
+    pub of: usize,
+}
+
+/// [`group_seek`] over group `j` of a page this process has verified, the
+/// group decoded into `buf` a part at a time and only as far as the walk
+/// reads: the records are walked from the first as [`group_seek`] walks
+/// them, and where the next record does not lie whole in what is decoded
+/// the decoder is asked for [`PART_STEP`] bytes more
+/// (`zlz4::decompress_more`), until the key is met, passed, or the group
+/// ends. `Ok(None)` for a group this does not serve, which the caller opens
+/// whole: one that is stored or record-coded.
+///
+/// For a point read's first touch of a group (`Options::zpages_point_part`):
+/// the read wants one record, the decoder is sequential and its cost is its
+/// tokens, so a read of a record in the middle of its group pays for half
+/// of it. The page is one whose every group a first decode has walked
+/// whole (`first_checks`), so the prefix decoded here is a prefix of bytes
+/// already held to the page's CRC and the walk's checks; nothing is
+/// verified again, and a caller must not use this on a page that has not
+/// been. The bytes of `buf` past the length answered are not the group's.
+///
+/// An `Err` is damage, as [`group_seek`]'s is: a payload that does not
+/// decode, decodes past the group, ends short of it, or a record that does
+/// not parse with the whole group decoded. A walk that stops before the
+/// group's end does not see what a whole decode learns there, a decoded
+/// length that disagrees with the directory's: bytes that change under a
+/// verified page are no more this path's to find than the whole decode's,
+/// which reads the page's CRC once, at the page's first decode.
+pub fn seek_group_partly(
+    view: &PageView<'_>,
+    j: usize,
+    buf: &mut GroupBuf,
+    key: &[u8],
+) -> Result<Option<PartSeek>, ZError> {
+    const CUT: ZError = ZError::Walk("a record does not parse");
+    let g = view
+        .group(j)
+        .ok_or(ZError::Header("no such group in the page"))?;
+    if g.stored || g.coded {
+        return Ok(None);
+    }
+    let ulen = g.ulen as usize;
+    if ulen == 0 || ulen > ZMAX_ULEN {
+        return Err(ZError::Header(
+            "a group's ulen is not 4 to the most a group holds",
+        ));
+    }
+    let (rest, len) = view.payload_and_rest(j).ok_or(ZError::Length)?;
+    let out = buf.bytes_with_slack(ulen, super::zlz4::DECODE_SLACK);
+    let count = usize::from(g.count);
+    let mut st = super::zlz4::Part::default();
+    let mut off = 0usize;
+    for _ in 0..count {
+        let (k, next) = loop {
+            // The group's bytes decoded so far, never the decoder's
+            // overrun past them.
+            let have = st.op.min(ulen);
+            if let Some(r) = record_key_next(&out[..have], off) {
+                break r;
+            }
+            if st.done {
+                return Err(CUT);
+            }
+            let stop = st.op.max(off) + PART_STEP;
+            super::zlz4::decompress_more(rest, len, out, &mut st, stop)
+                .map_err(|_| ZError::Decode)?;
+            if st.op > ulen {
+                return Err(ZError::Decode);
+            }
+            if st.done && st.op < ulen {
+                return Err(ZError::DecodedLen);
+            }
+        };
+        // Nothing sorts below the empty key, so the first record is its
+        // answer, found where that record's key is empty too, and no
+        // compare is made, as `group_seek` makes none.
+        let ord = if !key.is_empty() {
+            key_cmp(k, key)
+        } else if k.is_empty() {
+            Ordering::Equal
+        } else {
+            Ordering::Greater
+        };
+        let at = match ord {
+            Ordering::Less => {
+                off = next;
+                continue;
+            }
+            Ordering::Equal => Some(off),
+            Ordering::Greater => None,
+        };
+        return Ok(Some(PartSeek {
+            off: at,
+            len: st.op.min(ulen),
+            of: ulen,
+        }));
+    }
+    Ok(Some(PartSeek {
+        off: None,
+        len: st.op.min(ulen),
+        of: ulen,
+    }))
+}
+
 /// Which LZ4 decoder a build links.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lz4Decoder {
@@ -7416,6 +7535,227 @@ mod tests {
         }
     }
 
+    // ---- a group sought a part at a time ----------------------------------
+
+    /// The suite's records in pages as a builder fills them, every group one
+    /// LZ4 block: each key of a group, a key just past it and one above the
+    /// whole group, sought by the whole decode's walk and by the partial
+    /// one. The same record at the same offset, the bytes decoded a prefix
+    /// of the whole decode's that holds the record whole, and over every
+    /// key of a group about half of it decoded.
+    #[test]
+    fn a_groups_partial_seek_is_the_whole_seek_and_stops_near_its_record() {
+        let images = suite_images(3000, 23);
+        let bind = 7;
+        let mut s = FillScratch::new();
+        let (mut rank, mut pages) = (0usize, Vec::new());
+        while rank < images.len() {
+            let mut page = [0u8; ZPAGE];
+            match fill_page(&images, rank, bind, &mut s, &mut page) {
+                Fill::Page(g) => {
+                    pages.push((rank, page));
+                    rank += g.count;
+                }
+                other => panic!("rank {rank}: {other:?}"),
+            }
+        }
+        let (mut whole, mut part) = (GroupBuf::new(), GroupBuf::new());
+        let (mut seeks, mut short, mut bytes, mut of) = (0usize, 0usize, 0usize, 0usize);
+        let mut groups = 0usize;
+        for (first, page) in &pages {
+            let v = parse_page(page, bind).unwrap();
+            let mut at = *first;
+            for j in 0..v.groups() {
+                let ge = v.group(j).unwrap();
+                let count = usize::from(ge.count);
+                assert!(!ge.stored && !ge.coded, "the suite's records compress");
+                groups += 1;
+                let g = decode_group_with(&v, j, &mut whole, true).unwrap();
+                let mut probes: Vec<Vec<u8>> = Vec::new();
+                for r in at..at + count {
+                    let key = format!("{r:016}").into_bytes();
+                    probes.push([key.as_slice(), b"x"].concat());
+                    probes.push(key);
+                }
+                for probe in &probes {
+                    let want = group_seek(g, count, probe).unwrap();
+                    let got = seek_group_partly(&v, j, &mut part, probe)
+                        .unwrap()
+                        .expect("a block-coded group");
+                    assert_eq!(got.off, want.found.then_some(want.off));
+                    assert_eq!(got.of, g.len());
+                    assert!(got.len <= got.of);
+                    assert!(
+                        part.bytes(got.len) == &g[..got.len],
+                        "a prefix of the group"
+                    );
+                    if let Some(off) = got.off {
+                        let end = record_key_next(g, off).unwrap().1;
+                        assert!(end <= got.len, "the record whole in what was decoded");
+                    }
+                    seeks += 1;
+                    short += usize::from(got.len < got.of);
+                    bytes += got.len;
+                    of += got.of;
+                }
+                // A key above every key of the group walks it to its end,
+                // and one below its first stops at the first record.
+                let above = seek_group_partly(&v, j, &mut part, b"z").unwrap().unwrap();
+                assert_eq!((above.off, above.len), (None, g.len()));
+                assert!(
+                    part.bytes(g.len()) == g,
+                    "the whole group, a part at a time"
+                );
+                let below = seek_group_partly(&v, j, &mut part, b"!").unwrap().unwrap();
+                assert_eq!(below.off, None);
+                assert!(below.len <= (2 * PART_STEP).min(g.len()), "{}", below.len);
+                // The empty key is answered by the first record with no
+                // compare, as the whole walk answers it: absent here,
+                // where no key is empty.
+                let empty = seek_group_partly(&v, j, &mut part, b"").unwrap().unwrap();
+                let want = group_seek(g, count, b"").unwrap();
+                assert_eq!(empty.off, want.found.then_some(want.off));
+                assert!(empty.len <= (2 * PART_STEP).min(g.len()));
+                at += count;
+            }
+        }
+        assert!(
+            groups > 100 && seeks > 5000,
+            "{groups} groups, {seeks} seeks"
+        );
+        assert!(
+            bytes * 100 < of * 80 && short * 2 > seeks,
+            "{bytes} of {of} bytes decoded, {short} of {seeks} seeks short of the group"
+        );
+    }
+
+    /// Bytes that changed under a verified page: every byte of a group's
+    /// payload flipped in turn and keys sought through the damage. The
+    /// partial seek returns and never panics, and where the whole decode
+    /// still decodes the payload, what the partial one decoded is a prefix
+    /// of the same bytes -- one decoder over one input -- so it answers
+    /// what the whole walk answers from them. What it does not see is what
+    /// a whole decode learns at the block's end, a length that disagrees:
+    /// neither path reads the page's CRC again, and a page is held to it
+    /// once, at its first decode.
+    #[test]
+    fn a_partial_seek_over_a_damaged_payload_reads_a_prefix_of_the_whole_decodes_bytes() {
+        let images = suite_images(40, 5);
+        let mut s = FillScratch::new();
+        let mut page = [0u8; ZPAGE];
+        let Fill::Page(_) = fill_page(&images, 0, 3, &mut s, &mut page) else {
+            panic!("a page")
+        };
+        let v = parse_page(&page, 3).unwrap();
+        let ge = v.group(0).unwrap();
+        assert!(!ge.stored && !ge.coded);
+        let count = usize::from(ge.count);
+        let (coff, clen) = (usize::from(ge.coff), usize::from(ge.clen));
+        let probes: Vec<Vec<u8>> = vec![
+            format!("{:016}", 0).into_bytes(),
+            format!("{:016}", count / 2).into_bytes(),
+            format!("{:016}", count - 1).into_bytes(),
+            b"z".to_vec(),
+        ];
+        let (mut whole, mut part) = (GroupBuf::new(), GroupBuf::new());
+        let (mut refused, mut prefixes, mut whole_refused) = (0usize, 0usize, 0usize);
+        for i in coff..coff + clen {
+            for bit in [1u8, 0x10, 0x80] {
+                let mut bad = page;
+                bad[i] ^= bit;
+                // The damaged page's view, its CRC not asked.
+                let Ok(bv) = page_view(&bad) else { continue };
+                let w = decode_group_with(&bv, 0, &mut whole, true).map(|g| g.to_vec());
+                whole_refused += usize::from(w.is_err());
+                for probe in &probes {
+                    match seek_group_partly(&bv, 0, &mut part, probe) {
+                        Err(_) => refused += 1,
+                        Ok(None) => panic!("a block-coded group"),
+                        Ok(Some(p)) => {
+                            assert!(p.len <= p.of && p.of == ge.ulen as usize);
+                            if let Ok(g) = &w {
+                                assert!(
+                                    part.bytes(p.len) == &g[..p.len],
+                                    "byte {i} bit {bit:#x}: not the whole decode's prefix"
+                                );
+                                if let Ok(want) = group_seek(g, count, probe) {
+                                    assert_eq!(p.off, want.found.then_some(want.off));
+                                }
+                                prefixes += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            refused > 0 && prefixes > 0 && whole_refused > 0,
+            "{refused} refused, {prefixes} prefixes held, {whole_refused} whole decodes refused"
+        );
+    }
+
+    /// A directory that names a group four bytes shorter than its payload
+    /// decodes to, the payload as it was. The whole decode refuses the
+    /// length at the block's end. A partial seek whose decode runs that far
+    /// refuses it too, and its own check is the only thing that does: the
+    /// decoder's bound is the stated length and its slack, which the four
+    /// bytes are inside, and the record sought lies whole in the stated
+    /// length. The check a verified page cannot reach, held here by the
+    /// forged directory; short records, so that the step for the last whole
+    /// record takes the decode to the block's end.
+    #[test]
+    fn a_partial_seek_refuses_a_payload_that_decodes_past_its_groups_length() {
+        let images: Vec<Vec<u8>> = (0..40)
+            .map(|i| one_value(format!("{i:016}").as_bytes(), b"foxfoxfo"))
+            .collect();
+        let mut s = FillScratch::new();
+        let mut page = [0u8; ZPAGE];
+        let Fill::Page(_) = fill_page(&images, 0, 3, &mut s, &mut page) else {
+            panic!("a page")
+        };
+        let v = parse_page(&page, 3).unwrap();
+        let ge = v.group(0).unwrap();
+        assert!(!ge.stored && !ge.coded, "a block-coded group: {ge:?}");
+        let count = usize::from(ge.count);
+        assert!(count >= 3);
+        let mut whole = GroupBuf::new();
+        let g = decode_group_with(&v, 0, &mut whole, true).unwrap().to_vec();
+        // The record before the last: its start and its key.
+        let (mut off, mut key) = (0usize, Vec::new());
+        for i in 0..count - 1 {
+            let (k, next) = record_key_next(&g, off).unwrap();
+            if i == count - 2 {
+                key = k.to_vec();
+            } else {
+                off = next;
+            }
+        }
+        // Through the page as written the seek answers the record, and its
+        // decode has run to the group's end by then.
+        let mut part = GroupBuf::new();
+        let got = seek_group_partly(&v, 0, &mut part, &key).unwrap().unwrap();
+        assert_eq!((got.off, got.len), (Some(off), g.len()));
+        // The group's length in the directory, and the header's sum of the
+        // groups' lengths by as much, which the view holds the directory to.
+        let cut = 4usize;
+        assert!(cut < super::super::zlz4::DECODE_SLACK);
+        let mut bad = page;
+        let at = ZHDR + D_ULEN4;
+        bad[at..at + 2].copy_from_slice(&(((g.len() - cut) / 4) as u16).to_le_bytes());
+        let sum = u32::from_le_bytes(bad[P_ULEN..P_ULEN + 4].try_into().unwrap());
+        bad[P_ULEN..P_ULEN + 4].copy_from_slice(&(sum - cut as u32).to_le_bytes());
+        let bv = page_view(&bad).expect("a view of the forged page");
+        assert_eq!(bv.group(0).unwrap().ulen as usize, g.len() - cut);
+        assert!(
+            decode_group_with(&bv, 0, &mut whole, true).is_err(),
+            "the whole decode refuses the length"
+        );
+        assert!(
+            seek_group_partly(&bv, 0, &mut part, &key).is_err(),
+            "a decode past the stated length is refused, not answered from"
+        );
+    }
+
     // ---- a whole form file ------------------------------------------------
 
     #[test]
@@ -7547,6 +7887,9 @@ mod tests {
             lo.checked_sub(1)
         };
         let mut raw_seen = 0;
+        let mut part_buf = GroupBuf::new();
+        let (mut part_seeks, mut part_bytes, mut part_of, mut part_short) =
+            (0usize, 0usize, 0usize, 0usize);
         for (rank, (k, _)) in recs.iter().enumerate() {
             for (probe, want_found) in [(k.clone(), true), ([k.as_slice(), &[0u8]].concat(), false)]
             {
@@ -7564,6 +7907,32 @@ mod tests {
                 let ge = v.group(j).unwrap();
                 let g = decode_group(&v, j, &mut buf).unwrap();
                 let p = group_seek(g, usize::from(ge.count), &probe).unwrap();
+                // The same seek with the group decoded only as far as the
+                // walk reads (`seek_group_partly`): the same record at the
+                // same offset, whole in what was decoded and byte for byte
+                // the whole decode's; a stored group is not its to serve.
+                match seek_group_partly(&v, j, &mut part_buf, &probe).unwrap() {
+                    Some(s) => {
+                        assert!(!ge.stored && !ge.coded, "rank {rank}");
+                        assert_eq!(s.of, ge.ulen as usize, "rank {rank}");
+                        assert_eq!(s.off, p.found.then_some(p.off), "rank {rank}");
+                        assert!(s.len <= s.of, "rank {rank}");
+                        assert_eq!(
+                            part_buf.bytes(s.len),
+                            &g[..s.len],
+                            "rank {rank}: the prefix"
+                        );
+                        if let Some(off) = s.off {
+                            let end = record_key_next(g, off).unwrap().1;
+                            assert!(end <= s.len, "rank {rank}: the record whole");
+                        }
+                        part_seeks += 1;
+                        part_bytes += s.len;
+                        part_of += s.of;
+                        part_short += usize::from(s.len < s.of);
+                    }
+                    None => assert!(ge.stored || ge.coded, "rank {rank}"),
+                }
                 let at_rank = e.first_rank as usize + usize::from(ge.first) + p.index;
                 if want_found {
                     assert!(p.found && at_rank == rank, "rank {rank}");
@@ -7581,6 +7950,18 @@ mod tests {
             raw_seen >= raw,
             "the raw records were reached through NOPAGE entries"
         );
+        // These records are mostly random bytes, so few of their groups
+        // are blocks; the ones that are were each held to the whole walk
+        // above, and the suite's shape has a test of its own.
+        assert!(part_bytes <= part_of && part_short <= part_seeks);
+        // A group the page does not have is refused.
+        let e = (0..fence.len())
+            .map(|i| fence.entry(i, n as u32).unwrap())
+            .find(|e| e.page != ZNOPAGE)
+            .unwrap();
+        let at = e.page as usize * ZPAGE;
+        let v = parse_page(&file[at..at + ZPAGE], t.bind32()).unwrap();
+        assert!(seek_group_partly(&v, v.groups(), &mut part_buf, b"k").is_err());
     }
 
     // ---- pins -----------------------------------------------------------

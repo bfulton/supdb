@@ -33,10 +33,10 @@
 use super::zpages::{
     bind32, check_coded_group, check_entry, check_group, cmp_coded_key, coded_first, coded_header,
     coded_key_into, coded_rec, decode_group_with, decode_record, fill_page, filter_bytes,
-    group_seek, page_view, parse_page, record_group_seek, verify_page_with, view_trusted,
-    walk_group, FenceEntry, FenceSearch, Fill, FillScratch, FillStats, GroupBuf, Images, NoPage,
-    PageView, SegImages, Trailer, ZError, ZFence, ZCODING_BLOCK, ZGROUP_BYTES, ZMAX_GROUPS,
-    ZNOPAGE, ZPAGE, ZTRAILER,
+    group_seek, page_view, parse_page, record_group_seek, seek_group_partly, verify_page_with,
+    view_trusted, walk_group, FenceEntry, FenceSearch, Fill, FillScratch, FillStats, GroupBuf,
+    Images, NoPage, PageView, SegImages, Trailer, ZError, ZFence, ZCODING_BLOCK, ZGROUP_BYTES,
+    ZMAX_GROUPS, ZNOPAGE, ZPAGE, ZTRAILER,
 };
 use crate::blob::{Blob, BlobOptions, ZSource};
 use crate::bytes::{Bytes, MmapBytes};
@@ -607,6 +607,27 @@ impl<'a> ZCursor<'a> {
         }
         self.page = entry.page as usize;
         self.gidx = j;
+        // A walk's first touch of a group (`Options::zpages_scan_admit`):
+        // decoded into this cursor's own buffer, nothing put in the memo,
+        // which takes a group at its second touch while the first's tag
+        // stands (`Memo::admit`), as it does for a point read's. A scan
+        // that reads a group once paid the memo's buffer, written
+        // thousands of decodes ago, its `Arc` and the group it displaced,
+        // for nothing; scans that start where others did find their groups
+        // still held, since the groups read once no longer turn the slots
+        // over. Where the walk's later groups are its own anyway
+        // (`ZFile::walk_owns`) this decides only the first.
+        let mut memoise = memoise;
+        if memoise && self.memo.scan_admit && self.zfile.memo {
+            if let Ok(index) = u8::try_from(j) {
+                let (id, hashed) = (self.zfile.id, self.zfile.memo_hashed);
+                if !self.memo.holds(id, entry.page, index, hashed)
+                    && !self.memo.admit(id, entry.page, index)
+                {
+                    memoise = false;
+                }
+            }
+        }
         // Where the group lies once opened: a stored group that is aligned
         // is parsed where it lies in the mapping, anything else is decoded
         // into the buffer, whose borrow by the open ends with the open. The
@@ -1701,6 +1722,61 @@ struct Memo {
     track: bool,
     touched: std::collections::HashMap<u64, Vec<u64>>,
     distinct: u64,
+    /// The groups point reads decoded in part lately, a tag a slot
+    /// (`Memo::admit`): made at the first ask.
+    admit: Vec<u32>,
+    /// Where the keys read through the memo lie (`Memo::key_at`): made at
+    /// the first put.
+    keys: Vec<KeyAt>,
+    /// The point reads' counts since the last take (`ZMemo::take_point`):
+    /// groups decoded in part, the bytes decoded of them and the bytes they
+    /// hold, groups taken at a second touch, and reads the key table sent
+    /// straight to their record.
+    point: PointCounts,
+}
+
+/// The point reads' counts a handle's memo keeps (`ZMemo::take_point`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct PointCounts {
+    /// Groups a point read decoded only as far as its key
+    /// (`Options::zpages_point_part`).
+    pub(super) parts: u64,
+    /// The bytes those decodes wrote, and the bytes the groups hold.
+    pub(super) part_bytes: u64,
+    pub(super) part_of: u64,
+    /// Groups the memo took at their second touch.
+    pub(super) admits: u64,
+    /// Point reads the key table answered with their record's place
+    /// (`Options::zpages_point_keys`).
+    pub(super) key_hits: u64,
+    /// Groups a walk decoded into its cursor's own buffer, each a decode
+    /// the memo would have taken (`Options::zpages_scan_admit`,
+    /// `Options::zpages_walk_owns_decodes`).
+    pub(super) owned: u64,
+}
+
+/// The slots of the tags of groups decoded in part (`Memo::admit`): sixty-
+/// four kilobytes a handle, in the core's second-level cache beside the
+/// read path, and enough that a group read again within a few tens of
+/// thousands of reads finds its tag standing.
+const ZADMIT_SLOTS: usize = 1 << 14;
+
+/// The key table's slots (`Memo::key_at`), sixteen bytes each: a megabyte
+/// a handle that reads the compact form by key.
+const ZKEYS_SLOTS: usize = 1 << 16;
+
+/// Where a key read through the memo lies: the form file's attach
+/// identity, the page, the group in it and the record's offset in the
+/// decoded group, with a byte of the key's hash to tell most other keys of
+/// the slot apart before the memo is asked. `zfile` zero is an empty slot,
+/// since an identity is never zero.
+#[derive(Clone, Copy, Default)]
+struct KeyAt {
+    zfile: u64,
+    page: u32,
+    off: u16,
+    index: u8,
+    tag: u8,
 }
 
 struct MemoEntry {
@@ -1730,7 +1806,104 @@ impl Memo {
             track: false,
             touched: std::collections::HashMap::new(),
             distinct: 0,
+            admit: Vec::new(),
+            keys: Vec::new(),
+            point: PointCounts::default(),
         }
+    }
+
+    /// The Fibonacci mix of a group's number and its form file's identity
+    /// that the hashed slot is cut from (`Memo::slot`), whole: the tag
+    /// filter cuts its slot and its tag from other bits of it.
+    fn group_hash(zfile: u64, page: u32, index: u8) -> u64 {
+        let group = u64::from(page)
+            .wrapping_mul(ZMAX_GROUPS as u64)
+            .wrapping_add(u64::from(index));
+        group
+            .wrapping_add(zfile.wrapping_mul(0xD6E8_FEB8_6659_FD93))
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    }
+
+    /// Whether the memo holds `(zfile, page, index)`, with nothing counted
+    /// and nothing cloned: a point read's look before it decides how to
+    /// open a group it may not want whole.
+    fn holds(&self, zfile: u64, page: u32, index: u8, hashed: bool) -> bool {
+        if self.slots.is_empty() {
+            return false;
+        }
+        matches!(
+            &self.slots[self.slot(zfile, page, index, hashed)],
+            Some(e) if e.zfile == zfile && e.page == page && e.index == index
+        )
+    }
+
+    /// Whether a point read that finds `(zfile, page, index)` out of the
+    /// memo decodes it whole for the memo: `true` at the group's second
+    /// such ask while its tag stands, `false` at the first, which leaves
+    /// the tag. A group read once is decoded as far as its key into the
+    /// read's own buffer and displaces nothing; one read again is worth
+    /// its whole decode and a slot. A tag is thirty-one bits of the
+    /// group's hash and a slot holds one, so another group's tag standing
+    /// there is taken for this group's once in two thousand million asks,
+    /// which admits a group a touch early, and a group whose slot another
+    /// overwrote between its two touches is asked a third time.
+    fn admit(&mut self, zfile: u64, page: u32, index: u8) -> bool {
+        if self.admit.is_empty() {
+            self.admit = vec![0u32; ZADMIT_SLOTS];
+        }
+        let h = Memo::group_hash(zfile, page, index);
+        let i = (h >> 50) as usize & (ZADMIT_SLOTS - 1);
+        let tag = ((h >> 18) as u32) | 1;
+        if self.admit[i] == tag {
+            self.admit[i] = 0;
+            self.point.admits += 1;
+            true
+        } else {
+            self.admit[i] = tag;
+            false
+        }
+    }
+
+    /// The key table's slot and tag for a key's hash.
+    fn key_slot(h: u64) -> (usize, u8) {
+        ((h >> 40) as usize & (ZKEYS_SLOTS - 1), (h >> 56) as u8)
+    }
+
+    /// Where the key of hash `h` was last read in form file `zfile`, where
+    /// the table has it: the page, the group and the record's offset in
+    /// the decoded group. A place, not an answer: the caller asks the memo
+    /// for the group and compares the record's key there, so a slot
+    /// another key of the same tag took sends a read to a record that is
+    /// not its own and nothing more, and the place named is always a
+    /// record's start in the group named, since a put names nothing else
+    /// and a group's bytes do not change under an identity.
+    fn key_at(&self, zfile: u64, h: u64) -> Option<(u32, u8, usize)> {
+        if self.keys.is_empty() {
+            return None;
+        }
+        let (i, tag) = Memo::key_slot(h);
+        let k = &self.keys[i];
+        (k.zfile == zfile && k.tag == tag).then_some((k.page, k.index, usize::from(k.off)))
+    }
+
+    /// The key of hash `h` read at `off` in the memoised group
+    /// `(zfile, page, index)`, for the next read of it; an offset past
+    /// what a slot holds is left out.
+    fn key_put(&mut self, zfile: u64, h: u64, page: u32, index: u8, off: usize) {
+        let Ok(off) = u16::try_from(off) else {
+            return;
+        };
+        if self.keys.is_empty() {
+            self.keys = vec![KeyAt::default(); ZKEYS_SLOTS];
+        }
+        let (i, tag) = Memo::key_slot(h);
+        self.keys[i] = KeyAt {
+            zfile,
+            page,
+            off,
+            index,
+            tag,
+        };
     }
 
     /// A page touched, for the footprint; nothing while it is not kept.
@@ -1800,13 +1973,7 @@ impl Memo {
                 .wrapping_add((zfile as usize).wrapping_mul(0x9E37_79B9))
                 % self.n;
         }
-        let group = u64::from(page)
-            .wrapping_mul(ZMAX_GROUPS as u64)
-            .wrapping_add(u64::from(index));
-        let h = group
-            .wrapping_add(zfile.wrapping_mul(0xD6E8_FEB8_6659_FD93))
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        ((h >> 32) as usize) % self.n
+        ((Memo::group_hash(zfile, page, index) >> 32) as usize) % self.n
     }
 
     /// The group memoised for `(side, page, index)`, counted a hit: its
@@ -1896,6 +2063,16 @@ pub(super) struct ZMemo {
     /// through the form with the borrow, counted, against the three the
     /// flag costs.
     track: Cell<bool>,
+    /// A point read's first touch of a block-coded group decodes it in
+    /// part and the memo takes a group at its second
+    /// (`Options::zpages_point_part`); the key table is kept and asked
+    /// (`Options::zpages_point_keys`). The handle's, set where it is made.
+    point_part: bool,
+    point_keys: bool,
+    /// A walk's first touch of a group is decoded into the cursor's own
+    /// buffer and the memo takes it at its second
+    /// (`Options::zpages_scan_admit`).
+    scan_admit: bool,
 }
 
 impl ZMemo {
@@ -1919,7 +2096,102 @@ impl ZMemo {
         ZMemo {
             memo: RefCell::new(memo),
             track: Cell::new(false),
+            point_part: false,
+            point_keys: false,
+            scan_admit: false,
         }
+    }
+
+    /// The memo with a walk's admission set (`Options::zpages_scan_admit`),
+    /// as `point` sets the point reads' options.
+    pub(super) fn scans(mut self, admit: bool) -> ZMemo {
+        self.scan_admit = admit;
+        self
+    }
+
+    /// The memo with the point reads' two options set
+    /// (`Options::zpages_point_part`, `Options::zpages_point_keys`): a
+    /// store's handles are made so, and a memo made without it has both
+    /// off, the shape before them.
+    pub(super) fn point(mut self, part: bool, keys: bool) -> ZMemo {
+        self.point_part = part;
+        self.point_keys = keys;
+        self
+    }
+
+    /// The hits, the misses and the point reads' counts since the last
+    /// take, in one borrow: the handle's take at each dispatch
+    /// (`Reader::zmemo_take`).
+    pub(super) fn take_all(&self) -> (u64, u64, PointCounts) {
+        let mut m = self.memo.borrow_mut();
+        let r = (m.hits, m.misses, m.point);
+        m.hits = 0;
+        m.misses = 0;
+        m.point = PointCounts::default();
+        r
+    }
+
+    /// The point reads' counts since the last take.
+    #[cfg(test)]
+    pub(super) fn take_point(&self) -> PointCounts {
+        std::mem::take(&mut self.memo.borrow_mut().point)
+    }
+
+    fn holds(&self, zfile: u64, page: u32, index: u8, hashed: bool) -> bool {
+        self.memo.borrow().holds(zfile, page, index, hashed)
+    }
+
+    fn admit(&self, zfile: u64, page: u32, index: u8) -> bool {
+        self.memo.borrow_mut().admit(zfile, page, index)
+    }
+
+    fn count_owned(&self) {
+        self.memo.borrow_mut().point.owned += 1;
+    }
+
+    fn count_part(&self, len: usize, of: usize) {
+        let mut m = self.memo.borrow_mut();
+        m.point.parts += 1;
+        m.point.part_bytes += len as u64;
+        m.point.part_of += of as u64;
+    }
+
+    fn key_at(&self, zfile: u64, h: u64) -> Option<(u32, u8, usize)> {
+        self.memo.borrow().key_at(zfile, h)
+    }
+
+    /// The memo's group for `(zfile, page, index)` and its bytes, nothing
+    /// counted: the key table's read, which counts its own hit once the
+    /// record there is the key's.
+    fn peek(
+        &self,
+        zfile: u64,
+        page: u32,
+        index: u8,
+        hashed: bool,
+    ) -> Option<(Arc<GroupBuf>, usize)> {
+        let m = self.memo.borrow();
+        if m.slots.is_empty() {
+            return None;
+        }
+        match &m.slots[m.slot(zfile, page, index, hashed)] {
+            Some(e) if e.zfile == zfile && e.page == page && e.index == index => {
+                Some((Arc::clone(&e.group), e.len))
+            }
+            _ => None,
+        }
+    }
+
+    fn key_put(&self, zfile: u64, h: u64, page: u32, index: u8, off: usize) {
+        self.memo.borrow_mut().key_put(zfile, h, page, index, off)
+    }
+
+    /// A read the key table sent to its record: a hit of the memo's, and
+    /// of the table's.
+    fn count_key_hit(&self) {
+        let mut m = self.memo.borrow_mut();
+        m.hits += 1;
+        m.point.key_hits += 1;
     }
 
     /// A test's: a memo of `slots` slots under `cap` bytes.
@@ -1930,6 +2202,7 @@ impl ZMemo {
 
     /// The hits and misses since the last take, for the handle's counters
     /// (`Reader::zpage_counts`: `memo_hits`, `memo_misses`).
+    #[cfg(test)]
     pub(super) fn take_counts(&self) -> (u64, u64) {
         let mut m = self.memo.borrow_mut();
         let r = (m.hits, m.misses);
@@ -2076,9 +2349,6 @@ pub(super) struct ZFile {
     /// million keys in the first of nineteen partitions -- without a shared
     /// write on every decode from every reader thread.
     pub(super) decodes16: AtomicU64,
-    /// Groups a walk decoded into its cursor's own buffer
-    /// (`walk_owns`), each a decode the memo would have taken.
-    pub(super) owned: AtomicU64,
     /// The time those counted decodes took, nanoseconds, where this form
     /// file times them (`ZFile::time_decodes`): the heat a re-code prices
     /// (`Options::zpages_recode`), since a decode the predictor and the
@@ -2263,7 +2533,6 @@ impl ZFile {
                 .collect(),
             damaged: AtomicBool::new(false),
             decodes16: AtomicU64::new(0),
-            owned: AtomicU64::new(0),
             decode_ns16: AtomicU64::new(0),
             opens16: AtomicU64::new(0),
             time_decodes: false,
@@ -2523,7 +2792,12 @@ impl ZFile {
             if !memoise {
                 // The walk's own decode (`walk_owns`): into the caller's
                 // buffer below, nothing put in the memo.
-                self.owned.fetch_add(1, Ordering::Relaxed);
+                // Counted on the handle's memo and not on the form file:
+                // a count every reader thread bumps at every such decode
+                // is a line they all write, and the threaded scan pass
+                // read a tenth slower for it once a walk's first touches
+                // were its own (`Options::zpages_scan_admit`).
+                memo.count_owned();
             } else {
                 // The entry this decode's put will displace, its line asked for
                 // now: the put tries the displaced group's `Arc` for its last
@@ -2712,9 +2986,46 @@ impl ZFile {
         if self.damaged.load(Ordering::Relaxed) {
             return Locate::Out;
         }
+        // The key table's shortcut (`Options::zpages_point_keys`): a key
+        // this handle read through the memo before is sent to where its
+        // record lay -- the group asked of the memo, the record's key
+        // compared where it lies -- with no filter, fence, page or walk of
+        // the group. The table names a place and the compare is the
+        // answer: a slot another key took, or a group the memo has let go,
+        // is the search below. The memo holds groups of verified pages
+        // alone, and a group's bytes do not change under an identity, so a
+        // place put for this identity is a record's start for good.
+        let keyed = memo.point_keys && self.memo && !key.is_empty();
+        let kh = if keyed {
+            super::BlockedBloom::hash(key)
+        } else {
+            0
+        };
+        if keyed {
+            if let Some((page, index, off)) = memo.key_at(self.id, kh) {
+                if let Some((g, n)) = memo.peek(self.id, page, index, self.memo_hashed) {
+                    if record_key(g.bytes(n), off) == Some(key) {
+                        memo.touch(self.id, page, self.n_pages);
+                        memo.count_key_hit();
+                        return Locate::Found {
+                            opened: Opened::Memo(g, n),
+                            off,
+                            page: page as usize,
+                            decoded: false,
+                        };
+                    }
+                }
+            }
+        }
         // A key the filter does not hold is not in the partition: answered
         // from the heap, no page touched.
-        if self.filter.as_ref().is_some_and(|f| !f.maybe_contains(key)) {
+        if self.filter.as_ref().is_some_and(|f| {
+            if keyed {
+                !f.maybe_contains_hash(kh)
+            } else {
+                !f.maybe_contains(key)
+            }
+        }) {
             return Locate::Absent { decoded: false };
         }
         // A key below the first key is not in the partition.
@@ -2802,6 +3113,53 @@ impl ZFile {
                 };
             }
         }
+        // A point read's first touch of a block-coded group
+        // (`Options::zpages_point_part`): the group is decoded into the
+        // read's own buffer only as far as the walk for the key reads
+        // (`seek_group_partly`), and nothing is put in the memo. A read
+        // wants one record and the decoder is sequential, so a whole decode
+        // was the rest of the group for nothing, into a buffer of the memo
+        // last touched thousands of decodes ago, displacing a group that
+        // may have been read again. The memo takes a group at its second
+        // touch (`Memo::admit`), whole, as before. Only on a page this
+        // process has verified, where the prefix is of bytes a first decode
+        // held to every check; a first touch of a page is the open below.
+        if memo.point_part && self.memo && self.own_decoder && bit(&self.verified, p) {
+            let Ok(index) = u8::try_from(j) else {
+                self.fail(p);
+                return Locate::Fallback;
+            };
+            if !memo.holds(self.id, entry.page, index, self.memo_hashed)
+                && !memo.admit(self.id, entry.page, index)
+            {
+                let tick = self.decode_tick();
+                match seek_group_partly(&view, j, buf, key) {
+                    Ok(Some(s)) => {
+                        memo.touch(self.id, entry.page, self.n_pages);
+                        self.count_decode(tick);
+                        memo.count_part(s.len, s.of);
+                        return match s.off {
+                            Some(off) => {
+                                let b: &'a GroupBuf = buf;
+                                Locate::Found {
+                                    opened: Opened::Borrowed(b.bytes(s.len)),
+                                    off,
+                                    page: p,
+                                    decoded: true,
+                                }
+                            }
+                            None => Locate::Absent { decoded: true },
+                        };
+                    }
+                    // A stored group: opened where it lies.
+                    Ok(None) => {}
+                    Err(_) => {
+                        self.fail(p);
+                        return Locate::Fallback;
+                    }
+                }
+            }
+        }
         let Some((opened, _, count, decoded)) =
             self.open_group(memo, &entry, j, buf, Some(&view), false, true)
         else {
@@ -2816,6 +3174,13 @@ impl ZFile {
         };
         if !pos.found {
             return Locate::Absent { decoded };
+        }
+        // The key's place for its next read, where the group is the
+        // memo's now -- a hit, or a decode the memo took.
+        if keyed && matches!(opened, Opened::Memo(..)) {
+            if let Ok(index) = u8::try_from(j) {
+                memo.key_put(self.id, kh, entry.page, index, pos.off);
+            }
         }
         Locate::Found {
             opened,
@@ -6658,6 +7023,369 @@ mod tests {
             })
             .unwrap();
         assert!(seen && served(r) == 1);
+    }
+
+    /// The block-coded groups of a form file, and how many hold more than
+    /// one record.
+    fn block_groups(zfile: &ZFile) -> (u64, u64) {
+        let (mut blocks, mut multi) = (0u64, 0u64);
+        for p in 0..zfile.pages() {
+            let v = page_view(zfile.page_bytes(p).unwrap()).unwrap();
+            for j in 0..v.groups() {
+                let g = v.group(j).unwrap();
+                if !g.stored && !g.coded {
+                    blocks += 1;
+                    multi += u64::from(g.count > 1);
+                }
+            }
+        }
+        (blocks, multi)
+    }
+
+    /// The point read's partial decode (`Options::zpages_point_part`): on
+    /// verified pages a group's first touch is decoded only as far as its
+    /// key and put nowhere, its second is the whole decode the memo takes,
+    /// and every probe answers as the segment answers it through both and
+    /// through the hits after. Off -- the memo's flag, or the engine's own
+    /// decoder -- no group is decoded in part.
+    #[test]
+    fn a_first_touched_group_is_decoded_in_part_and_the_memo_takes_it_at_its_second_touch() {
+        for (name, recs, inline) in [
+            ("part-suite", suite(3000, 11), 256),
+            ("part-shapes", shapes(), 1 << 20),
+        ] {
+            let fx = Fixture::new(name, recs, inline);
+            let mut zfile = fx.zfile();
+            zfile.own_decoder = true;
+            // Every page verified first, through a memo of its own: the
+            // partial decode is for a page this process has verified.
+            agree(&fx.memo, &zfile, &fx.blob, &fx.recs);
+            assert_eq!(fx.memo.take_point(), PointCounts::default(), "{name}");
+            let (blocks, _) = block_groups(&zfile);
+            let suite = name == "part-suite";
+            assert!(
+                !suite || blocks > 100,
+                "{name}: {blocks} block-coded groups"
+            );
+
+            let memo = ZMemo::new().point(true, false);
+            agree(&memo, &zfile, &fx.blob, &fx.recs);
+            let (hits, misses) = memo.take_counts();
+            let p = memo.take_point();
+            assert!(
+                p.parts >= blocks,
+                "{name}: every block-coded group's first touch is a partial decode: {p:?} of {blocks}"
+            );
+            assert!(p.part_bytes <= p.part_of, "{name}: {p:?}");
+            assert!(
+                misses <= p.admits,
+                "{name}: the memo takes a group only at an admission: {misses} puts, {p:?}"
+            );
+            assert!(blocks == 0 || hits > 0, "{name}: {hits} hits");
+            if suite {
+                // Two groups in one slot of the memo displace each other,
+                // and the displaced one's next touch is a first again: a
+                // few groups in a few hundred, so the counts are held to
+                // a tenth.
+                assert_eq!(misses, p.admits, "{name}: an admission a put");
+                assert!(
+                    misses >= blocks * 9 / 10 && misses <= blocks + blocks / 10,
+                    "{name}: every group read again is taken once: {misses} of {blocks}"
+                );
+                assert!(hits > misses, "{name}: and answers the reads after: {hits}");
+                assert!(
+                    p.part_bytes * 100 < p.part_of * 90,
+                    "{name}: a partial decode stops short of its group: {p:?}"
+                );
+            }
+            // Again: the groups read twice are the memo's now, and but for
+            // the displaced few nothing is decoded at all.
+            agree(&memo, &zfile, &fx.blob, &fx.recs);
+            if suite {
+                let (_, misses) = memo.take_counts();
+                let parts = memo.take_point().parts;
+                assert!(
+                    misses + parts <= blocks / 10,
+                    "{name}: hits: {misses} puts and {parts} partial decodes of {blocks} groups"
+                );
+            }
+            assert!(!zfile.damaged() && zfile.bad_pages() == 0, "{name}");
+
+            // The memo's flag off, or the engine's decoder off: whole
+            // decodes, as before.
+            let plain = ZMemo::new();
+            agree(&plain, &zfile, &fx.blob, &fx.recs);
+            assert_eq!(plain.take_point(), PointCounts::default(), "{name}");
+            zfile.own_decoder = false;
+            let other = ZMemo::new().point(true, false);
+            agree(&other, &zfile, &fx.blob, &fx.recs);
+            assert_eq!(
+                other.take_point().parts,
+                0,
+                "{name}: lz4_flex decodes whole"
+            );
+        }
+    }
+
+    /// A page not yet verified is opened by its first decode, whole and
+    /// with every check, whatever the memo's flag says: the partial decode
+    /// begins at the page's second read.
+    #[test]
+    fn a_pages_first_read_is_its_whole_first_decode_and_a_partial_one_follows() {
+        let fx = Fixture::new("part-first", suite(3000, 5), 256);
+        let mut zfile = fx.zfile();
+        zfile.own_decoder = true;
+        let memo = ZMemo::new().point(true, false);
+        let key = |i: usize| fx.recs[i].0.clone();
+        // The first read of the file: its page is not verified.
+        assert_eq!(zfile.verified_pages(), 0);
+        assert_eq!(
+            z_values(&memo, &zfile, &fx.blob, &key(0)),
+            Some(raw_values(&fx.blob, &key(0)))
+        );
+        assert_eq!(zfile.verified_pages(), 1);
+        assert_eq!(memo.take_point().parts, 0, "the first decode is whole");
+        assert_eq!(memo.take_counts(), (0, 1), "and the memo's");
+        // A key of another group of the page, one of several records: the
+        // page is verified now, the group is not the memo's, and its first
+        // touch is a partial decode.
+        let v = page_view(zfile.page_bytes(0).unwrap()).unwrap();
+        let g = (1..v.groups())
+            .map(|j| v.group(j).unwrap())
+            .find(|g| g.count >= 6)
+            .expect("a second group of several records in the first page");
+        assert!(!g.stored && !g.coded);
+        let i = usize::from(g.first);
+        assert_eq!(
+            z_values(&memo, &zfile, &fx.blob, &key(i)),
+            Some(raw_values(&fx.blob, &key(i)))
+        );
+        let p = memo.take_point();
+        assert_eq!((p.parts, p.admits), (1, 0), "{p:?}");
+        assert!(
+            p.part_bytes < p.part_of,
+            "the group's first record of several: {p:?}"
+        );
+        assert_eq!(
+            memo.take_counts(),
+            (0, 0),
+            "nothing asked of the memo's slots"
+        );
+        // Its second touch is the whole decode, the memo's; its third a hit.
+        assert!(z_values(&memo, &zfile, &fx.blob, &key(i + 1)).is_some());
+        let p = memo.take_point();
+        assert_eq!((p.parts, p.admits), (0, 1), "{p:?}");
+        assert_eq!(memo.take_counts(), (0, 1));
+        assert!(z_values(&memo, &zfile, &fx.blob, &key(i)).is_some());
+        assert_eq!(memo.take_counts(), (1, 0));
+        assert_eq!(memo.take_point(), PointCounts::default());
+    }
+
+    /// A walk's admission (`Options::zpages_scan_admit`): a cursor's first
+    /// touch of a group is decoded into its own buffer and counted the
+    /// walk's own, its second is the memo's, and its third a hit; every
+    /// walk reads every key in order. Off, every open is the memo's.
+    #[test]
+    fn a_walks_first_touch_of_a_group_is_its_own_decode_and_its_second_the_memos() {
+        let fx = Fixture::new("scan-admit", suite(3000, 29), 256);
+        let zfile = fx.zfile();
+        let (blocks, _) = block_groups(&zfile);
+        assert!(blocks > 100, "{blocks} block-coded groups");
+        let keys: Vec<Vec<u8>> = fx.recs.iter().map(|r| r.0.clone()).collect();
+        let walk = |memo: &ZMemo| {
+            let mut seen = Vec::new();
+            let mut cur = ZCursor::at(memo, &zfile, &fx.blob, 0);
+            let (n, _) = cur
+                .walk_until(None, usize::MAX, &mut |k: &[u8], _: &[u8]| {
+                    seen.push(k.to_vec())
+                })
+                .unwrap();
+            assert!(!cur.fell_back());
+            assert_eq!(n, keys.len());
+            assert!(seen == keys, "every key in order");
+        };
+        let memo = ZMemo::new().scans(true);
+        // The first walk: every page's first decode and every group after
+        // it, into the cursor's buffer; nothing put.
+        walk(&memo);
+        assert_eq!(
+            memo.take_counts(),
+            (0, 0),
+            "nothing asked for is the memo's yet"
+        );
+        let p = memo.take_point();
+        assert_eq!(p.owned, blocks, "a decode a group, the walk's own");
+        assert_eq!(p.admits, 0);
+        // The second: every group's second touch, admitted and put.
+        walk(&memo);
+        let (hits, misses) = memo.take_counts();
+        let p = memo.take_point();
+        assert_eq!(misses, p.admits, "an admission a put");
+        assert!(
+            hits == 0 && misses >= blocks * 9 / 10 && misses <= blocks,
+            "the groups' second touches: {hits} hits, {misses} puts of {blocks}"
+        );
+        assert_eq!(
+            misses + p.owned,
+            blocks,
+            "every group decoded once, one way or the other"
+        );
+        // The third: the memo's, but for the few two groups in one slot
+        // displaced.
+        walk(&memo);
+        let (hits, misses) = memo.take_counts();
+        let p = memo.take_point();
+        assert!(
+            hits >= blocks * 9 / 10 && misses + p.owned <= blocks / 10,
+            "{hits} hits, {misses} puts and {} own decodes of {blocks}",
+            p.owned
+        );
+        // Off: every open of a walk is a put, then a hit.
+        let plain = ZMemo::new();
+        walk(&plain);
+        assert_eq!(plain.take_counts(), (0, blocks));
+        assert_eq!(
+            plain.take_point(),
+            PointCounts::default(),
+            "none the walk's own"
+        );
+    }
+
+    /// The tag filter: a group's first ask is refused and leaves its tag,
+    /// its second while the tag stands is admitted and clears it, and a
+    /// group whose slot another took between its two asks starts again.
+    #[test]
+    fn the_memo_admits_a_group_at_its_second_ask_while_its_tag_stands() {
+        let mut m = Memo::new(8, 1 << 20);
+        assert!(!m.admit(1, 0, 0));
+        assert!(m.admit(1, 0, 0));
+        assert_eq!(m.point.admits, 1);
+        assert!(!m.admit(1, 0, 0), "the tag went with the admission");
+        // Another form file's same group, and the page's next group, are
+        // tags of their own.
+        assert!(!m.admit(2, 0, 0) && !m.admit(1, 0, 1));
+        assert!(m.admit(2, 0, 0) && m.admit(1, 0, 1));
+        // A group in the same slot overwrites the tag, found over the
+        // pages: the first group's next ask is a first again.
+        let slot = |z: u64, p: u32| (Memo::group_hash(z, p, 0) >> 50) as usize & (ZADMIT_SLOTS - 1);
+        let other = (1u32..)
+            .find(|&p| slot(7, p) == slot(7, 0))
+            .expect("two pages in one slot");
+        assert!(!m.admit(7, 0, 0));
+        assert!(!m.admit(7, other, 0), "the slot's other group");
+        assert!(!m.admit(7, 0, 0), "its tag was overwritten");
+        assert!(m.admit(7, 0, 0));
+        assert_eq!(m.point.admits, 4);
+        assert_eq!(m.admit.len(), ZADMIT_SLOTS);
+    }
+
+    /// The key table (`Options::zpages_point_keys`): a key read through
+    /// the memo is sent to its record at its next read, with the memo's
+    /// group asked and the key compared there; a slot that names another
+    /// record, a group the memo let go, and another attach of the same
+    /// file are each the search, and every answer is the segment's.
+    #[test]
+    fn a_key_read_through_the_memo_is_sent_to_its_record_and_a_stale_place_is_the_search() {
+        let fx = Fixture::new("point-keys", suite(3000, 17), 256);
+        let mut zfile = fx.zfile();
+        zfile.own_decoder = true;
+        let keys: Vec<Vec<u8>> = fx.recs.iter().map(|r| r.0.clone()).collect();
+        let read_all = |memo: &ZMemo, z: &ZFile| {
+            for k in &keys {
+                assert_eq!(
+                    z_values(memo, z, &fx.blob, k),
+                    Some(raw_values(&fx.blob, k)),
+                    "read of {k:?}"
+                );
+                assert_eq!(served(z.count(memo, k)), fx.blob.count(k).unwrap());
+            }
+        };
+        // The table alone, every miss a whole decode the memo takes: the
+        // first read of a key finds its record by the search and leaves its
+        // place, and the count beside it and every read after are sent
+        // there.
+        let memo = ZMemo::new().point(false, true);
+        read_all(&memo, &zfile);
+        let n = keys.len() as u64;
+        let first = memo.take_point();
+        assert!(
+            first.key_hits >= n * 9 / 10 && first.key_hits <= n,
+            "the count after each read: {first:?} of {n}"
+        );
+        read_all(&memo, &zfile);
+        let again = memo.take_point();
+        assert!(
+            again.key_hits >= 2 * n * 9 / 10,
+            "both reads of nearly every key: {again:?} of {n}"
+        );
+        // Probes around the keys are no key's record: the table sends
+        // none of them anywhere it answers from.
+        agree(&memo, &zfile, &fx.blob, &fx.recs);
+
+        // A place that names another key's record, forged: the compare
+        // there refuses it and the search answers.
+        let (k0, k1) = (&keys[10], &keys[11]);
+        let h0 = crate::db::BlockedBloom::hash(k0);
+        let h1 = crate::db::BlockedBloom::hash(k1);
+        let at1 = memo.key_at(zfile.id, h1).expect("a key just read");
+        memo.key_put(zfile.id, h0, at1.0, at1.1, at1.2);
+        memo.take_point();
+        assert_eq!(
+            z_values(&memo, &zfile, &fx.blob, k0),
+            Some(raw_values(&fx.blob, k0))
+        );
+        assert_eq!(memo.take_point().key_hits, 0, "another key's record");
+        // The search left the key's own place again.
+        assert!(z_values(&memo, &zfile, &fx.blob, k0).is_some());
+        assert_eq!(memo.take_point().key_hits, 1);
+        // An offset that is no record's start in the group: refused the
+        // same way.
+        memo.key_put(zfile.id, h0, at1.0, at1.1, at1.2 + 2);
+        assert_eq!(
+            z_values(&memo, &zfile, &fx.blob, k0),
+            Some(raw_values(&fx.blob, k0))
+        );
+        assert_eq!(memo.take_point().key_hits, 0);
+
+        // A memo of one slot: a key's place outlives the group it names,
+        // and a place whose group the memo let go is the search.
+        let small = ZMemo::with(1, 1 << 20).point(false, true);
+        let (ka, kb) = (&keys[0], &keys[keys.len() - 1]);
+        assert!(z_values(&small, &zfile, &fx.blob, ka).is_some());
+        assert!(z_values(&small, &zfile, &fx.blob, kb).is_some());
+        assert!(
+            small
+                .key_at(zfile.id, crate::db::BlockedBloom::hash(ka))
+                .is_some(),
+            "the first key's place stands"
+        );
+        small.take_point();
+        assert_eq!(
+            z_values(&small, &zfile, &fx.blob, ka),
+            Some(raw_values(&fx.blob, ka))
+        );
+        assert_eq!(small.take_point().key_hits, 0, "its group was displaced");
+        read_all(&small, &zfile);
+        read_all(&small, &zfile);
+
+        // Another attach of the same file is another identity: none of the
+        // places the first left is its.
+        let mut second = fx.attach().unwrap();
+        second.own_decoder = true;
+        assert_ne!(second.id, zfile.id);
+        memo.take_point();
+        for k in keys.iter().step_by(13) {
+            assert!(memo
+                .key_at(second.id, crate::db::BlockedBloom::hash(k))
+                .is_none());
+        }
+        // Both options together answer every probe, twice over.
+        let both = ZMemo::new().point(true, true);
+        agree(&both, &zfile, &fx.blob, &fx.recs);
+        agree(&both, &zfile, &fx.blob, &fx.recs);
+        let p = both.take_point();
+        assert!(p.parts > 0 && p.admits > 0 && p.key_hits > 0, "{p:?}");
+        assert!(!zfile.damaged() && zfile.bad_pages() == 0);
     }
 
     /// The memo: a direct-mapped table under a byte cap. An entry put is

@@ -2734,6 +2734,11 @@ fn the_memo_serves_repeated_reads_of_a_partition_and_off_every_read_decodes() {
             forced(|o| {
                 o.zpages_memo = memo;
                 o.zpages_record_coding = record;
+                // The memo as it serves every open: a point read's partial
+                // decode of a first touch and its key table have a test of
+                // their own below.
+                o.zpages_point_part = false;
+                o.zpages_point_keys = false;
             }),
         )
         .unwrap();
@@ -2793,6 +2798,106 @@ fn the_memo_serves_repeated_reads_of_a_partition_and_off_every_read_decodes() {
             assert_eq!(decodes, reads, "every read decodes: {c:?}");
         }
         drop(r);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A point read through a form file (`Options::zpages_point_part`,
+/// `Options::zpages_point_keys`), each option on and off: every key and
+/// every key between two answers as the model has it, through the writer
+/// and a handle, twice over. With the partial decode, a read that decodes
+/// is a group decoded as far as its key or a whole decode the memo takes
+/// at an admission, and the bytes decoded in part are short of their
+/// groups; without it no group is decoded in part and every decode is the
+/// memo's. With the key table, the second pass's reads go straight to
+/// their records, all but each group's first key and the few whose slot
+/// another key took; without it none does.
+#[test]
+fn a_point_read_decodes_a_first_touch_in_part_and_goes_straight_to_a_key_read_before() {
+    for (part, keyed) in [(true, true), (true, false), (false, true), (false, false)] {
+        let what = format!("part {part}, keys {keyed}");
+        let dir = scratch(&format!("point-{part}-{keyed}"));
+        let mut db = Db::create(
+            &dir,
+            forced(|o| {
+                o.zpages_point_part = part;
+                o.zpages_point_keys = keyed;
+            }),
+        )
+        .unwrap();
+        let model = ordered_load(&mut db, 4000, 0x9A7);
+        db.zpages_settle().unwrap();
+        let c0 = db.zpage_counts();
+        assert_eq!(
+            (c0.partitions, c0.form_files, c0.build_stored),
+            (1, 1, 0),
+            "{what}: {c0:?}"
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let between: Vec<Vec<u8>> = (0..4000)
+            .step_by(7)
+            .map(|i| format!("key-{:08}", i * 3 + 1).into_bytes())
+            .collect();
+        let n = keys.len() as u64;
+        let r = db.reader().unwrap();
+        let w: &Reader = &db;
+        // The first pass: each page's first read is its whole first
+        // decode, and from there each group's first touch a partial one.
+        for who in [w, &r] {
+            check(who, &model, &keys, &what);
+            check(who, &model, &between, &what);
+        }
+        let c1 = db.zpage_counts();
+        let decodes = c1.decodes - c0.decodes;
+        let (parts, misses) = (c1.point_parts, c1.memo_misses);
+        assert!(decodes > 0, "{what}: {c1:?}");
+        if part {
+            assert!(parts > 0 && c1.point_admits > 0, "{what}: {c1:?}");
+            assert!(
+                c1.point_part_bytes < c1.point_part_of,
+                "{what}: the partial decodes stop short of their groups: {c1:?}"
+            );
+            assert_eq!(
+                decodes,
+                parts + misses,
+                "{what}: a read that decodes is a partial decode or one the memo takes: {c1:?}"
+            );
+        } else {
+            assert_eq!(
+                (parts, c1.point_part_bytes, c1.point_admits),
+                (0, 0, 0),
+                "{what}: {c1:?}"
+            );
+            assert_eq!(
+                decodes, misses,
+                "{what}: every decode is the memo's: {c1:?}"
+            );
+        }
+        // The second pass: the groups are the memo's, and with the key
+        // table a key read through the memo before goes to its record.
+        for who in [w, &r] {
+            check(who, &model, &keys, &what);
+            check(who, &model, &between, &what);
+        }
+        let c2 = db.zpage_counts();
+        let hits = c2.point_key_hits - c1.point_key_hits;
+        if keyed {
+            // A read and a count of every key through two handles.
+            assert!(
+                hits >= 4 * n * 8 / 10 && hits <= 4 * n,
+                "{what}: {hits} of {} reads sent to their records: {c2:?}",
+                4 * n
+            );
+        } else {
+            assert_eq!(c2.point_key_hits, 0, "{what}: {c2:?}");
+        }
+        assert_eq!(
+            (c2.rawserves, c2.fallbacks),
+            (0, 0),
+            "{what}: every read served by the form: {c2:?}"
+        );
+        drop(r);
+        db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -12656,6 +12761,9 @@ fn a_covered_scans_start_seek_seeds_the_partitions_cursor() {
         let (dir, mut db, model, _inject, r, keys, _at) =
             compact_store_with(&format!("seek-seeds-{on}"), 1 << 20, |o| {
                 o.zpages_seek_seeds = on;
+                // The memo as every open's, so that the second placement
+                // shows as a hit of it.
+                o.zpages_scan_admit = false;
                 o.commit_forms = false;
             });
         drop(r);
@@ -12725,6 +12833,10 @@ fn a_walks_groups_after_the_first_are_decoded_into_its_own_buffer() {
         let (dir, mut db, model, _inject, r, keys, _at) =
             compact_store_with(&format!("walk-owns-{on}"), 1 << 20, |o| {
                 o.zpages_walk_owns_decodes = on;
+                // The walk's own rule alone: a first touch's admission
+                // (`zpages_scan_admit`) owns decodes too, and has its test
+                // beside the memo's.
+                o.zpages_scan_admit = false;
                 o.commit_forms = false;
             });
         drop(r);
@@ -12743,7 +12855,7 @@ fn a_walks_groups_after_the_first_are_decoded_into_its_own_buffer() {
             .iter()
             .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
             .collect();
-        let owned = |db: &Db| db.zpage_heat().iter().map(|h| h.walk_owned).sum::<u64>();
+        let owned = |db: &Db| db.zpage_counts().walk_owned;
         let (before, owned0) = (db.zpage_counts(), owned(&db));
         let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let n = db
@@ -12767,6 +12879,96 @@ fn a_walks_groups_after_the_first_are_decoded_into_its_own_buffer() {
         } else {
             assert_eq!(owned, 0, "{what}: every decode through the memo");
         }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A walk's first touch of a group through a form file is decoded into its
+/// cursor's own buffer and put nowhere, and the handle's memo takes the
+/// group at its second touch (`Options::zpages_scan_admit`): one scan made
+/// three times decodes its groups past the start's as the walk's own, then
+/// into the memo at their admission, then not at all. Without the option
+/// the first scan's decodes are all the memo's and the second scan decodes
+/// nothing. The entries come back as the model has them every time, and the
+/// lowest keys are written first so the partition does not take the bulk
+/// walk.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_scans_first_touch_of_a_group_is_its_own_decode_and_its_second_the_memos() {
+    for on in [true, false] {
+        let what = format!("scan admit {on}");
+        let (dir, mut db, model, _inject, r, keys, _at) =
+            compact_store_with(&format!("scan-admit-{on}"), 1 << 20, |o| {
+                o.zpages_scan_admit = on;
+                o.commit_forms = false;
+            });
+        drop(r);
+        for k in &keys[..3] {
+            db.append(k, &model[k][0]);
+        }
+        db.commit().unwrap();
+        let want = 4 * 64 + 10;
+        let start = keys.len() / 2;
+        assert!(
+            start + want < keys.len(),
+            "{what}: keys enough: {}",
+            keys.len()
+        );
+        let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
+            .iter()
+            .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
+            .collect();
+        // One scan: the groups decoded, the walk's own among them, the
+        // memo's admissions and its hits.
+        let pass = |db: &mut Db, nth: usize| {
+            let before = db.zpage_counts();
+            let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let n = db
+                .scan(&keys[start], want, |k, v| {
+                    got.push((k.to_vec(), v.to_vec()))
+                })
+                .unwrap();
+            let c = db.zpage_counts();
+            assert_eq!(n, want, "{what}, scan {nth}: the scan's entries");
+            assert_eq!(
+                got, expect,
+                "{what}, scan {nth}: the entries as the model has them"
+            );
+            (
+                c.scan_groups - before.scan_groups,
+                c.walk_owned - before.walk_owned,
+                c.point_admits - before.point_admits,
+                c.memo_hits - before.memo_hits,
+            )
+        };
+        let (first, second, third) = (pass(&mut db, 1), pass(&mut db, 2), pass(&mut db, 3));
+        assert!(first.0 >= 3, "{what}: groups decoded: {first:?}");
+        if on {
+            // The start's group and a build's go through the memo, the
+            // walk's others are its own; the second scan finds their tags
+            // and the memo takes each; the third decodes nothing.
+            assert!(
+                first.1 >= 1 && first.1 + 3 >= first.0 && first.2 == 0,
+                "{what}: the first scan's groups the walk's own: {first:?}"
+            );
+            assert!(
+                second.1 == 0 && second.2 == first.1 && second.0 == first.1,
+                "{what}: the second scan's groups the memo's, each admitted: {first:?} then {second:?}"
+            );
+        } else {
+            assert_eq!(
+                (first.1, first.2),
+                (0, 0),
+                "{what}: every decode the memo's: {first:?}"
+            );
+            assert_eq!(second.0, 0, "{what}: nothing decoded twice: {second:?}");
+        }
+        // All but the few groups the seek and a build hold by other means.
+        assert!(
+            third.0 == 0 && third.1 == 0 && third.3 + 3 >= first.0,
+            "{what}: the third scan read out of the memo: {third:?} after {first:?}"
+        );
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

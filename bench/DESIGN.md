@@ -566,6 +566,17 @@ milliseconds (`Options::heads_look_ms`);
 through their mappings throughout, no copy of a raw-served partition's
 held in the process's own memory out of core (`Options::heads_owned`
 off);
+`supdb-zpointwhole` is `supdb` with a point read through a form file
+decoding its group whole into the handle's memo at every miss, no decode
+of a first-touched group only as far as its key and no admission at the
+second touch (`Options::zpages_point_part` off), `supdb-znopointkeys`
+with no table of where the keys read through the memo lie
+(`Options::zpages_point_keys` off), and `supdb-zpointplain` with both
+off, the point read through the form as it stood; `supdb-zscanputs` is
+`supdb` with every decode of a walk through a form file put in the memo,
+no first touch of a group decoded into the cursor's own buffer
+(`Options::zpages_scan_admit` off), and `supdb-zmemoplain` with all three
+off, the memo as it stood;
 `supdb-cache64tofitzpagesdropparse` and `supdb-cache64tofitautozpagesparse`
 are the forced form with the drop and the combined arm with their
 block-coded groups written by the engine's parsing encoder

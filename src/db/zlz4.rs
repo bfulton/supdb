@@ -631,10 +631,10 @@ pub fn decompress_in(src: &[u8], len: usize, dst: &mut [u8]) -> Result<usize, De
         // checks its own room first. `src` and `dst` are different buffers,
         // and a match reads `dst` behind what it writes.
         let done = if readable - len >= PAD_IN {
-            unsafe { fast_loop::<true>(src, len, dst, &mut ip, &mut op, 0, olim)? }
+            unsafe { fast_loop::<true>(src, len, dst, &mut ip, &mut op, 0, olim, olim)? }
         } else if readable >= FAST_IN {
             let ilim = (readable - FAST_IN).min(len - 1);
-            unsafe { fast_loop::<false>(src, len, dst, &mut ip, &mut op, ilim, olim)? }
+            unsafe { fast_loop::<false>(src, len, dst, &mut ip, &mut op, ilim, olim, olim)? }
         } else {
             false
         };
@@ -651,16 +651,107 @@ pub fn decompress_in(src: &[u8], len: usize, dst: &mut [u8]) -> Result<usize, De
     Err(DecodeError)
 }
 
-/// The fast loop over the block `src[..len]`: turns while `op <= olim` and,
+/// Where a block's decode stands between two calls of [`decompress_more`]:
+/// the input read and the output written, at a sequence's boundary, and
+/// whether the block has ended. The default is a block not begun.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Part {
+    pub ip: usize,
+    pub op: usize,
+    pub done: bool,
+}
+
+/// [`decompress_in`] a part at a time: the block `src[..len]` decoded on
+/// into `dst` from where `st` stands until its output passes `stop` bytes
+/// or the block ends, `st` left at the sequence boundary reached. The
+/// bytes of `dst` before `st.op` are the block's first `st.op`, the same a
+/// whole decode writes there; the bytes past it are not the block's yet,
+/// the fast loop's wide copies landing in them. Called again with a larger
+/// `stop` it goes on, and a caller that stops asking has decoded a prefix
+/// and nothing has to be undone.
+///
+/// A point read wants one record of a group and the decoder is sequential,
+/// so the read decodes as far as its record and no further: a group read
+/// for one key and not again is the common read of a store larger than its
+/// caches, and a decode's cost is its tokens, a branch or two each that the
+/// predictor has never seen (`CLAUDE.md`, a decoder timed on one input).
+///
+/// `dst` is the same buffer at every call for one block, and `st` the
+/// state the last call left: a state from another block or another buffer
+/// decodes garbage or is refused, and writes nothing outside `dst` either
+/// way, since every bound is checked against the buffers given here.
+pub fn decompress_more(
+    src: &[u8],
+    len: usize,
+    dst: &mut [u8],
+    st: &mut Part,
+    stop: usize,
+) -> Result<(), DecodeError> {
+    if len > src.len() || st.ip > len || st.op > dst.len() {
+        return Err(DecodeError);
+    }
+    if st.done {
+        return Ok(());
+    }
+    let (readable, oend) = (src.len(), dst.len());
+    let (mut ip, mut op) = (st.ip, st.op);
+    let block = &src[..len];
+    while op <= stop {
+        if len > 0 && oend >= FAST_OUT && op <= oend - FAST_OUT {
+            let olim = oend - FAST_OUT;
+            let ostop = stop.min(olim);
+            // SAFETY: as `decompress_in`'s, with the turns ended at `ostop
+            // <= olim` and the room still `olim`; a turn starts at `op <=
+            // ostop` and, unpadded, at `ip <= ilim`.
+            let done = if readable - len >= PAD_IN {
+                unsafe { fast_loop::<true>(src, len, dst, &mut ip, &mut op, 0, olim, ostop)? }
+            } else if readable >= FAST_IN {
+                let ilim = (readable - FAST_IN).min(len - 1);
+                unsafe { fast_loop::<false>(src, len, dst, &mut ip, &mut op, ilim, olim, ostop)? }
+            } else {
+                false
+            };
+            if done {
+                *st = Part { ip, op, done: true };
+                return Ok(());
+            }
+            if op > stop {
+                break;
+            }
+        }
+        // A turn lacked its room, or the block is at its last bytes: one
+        // sequence with every bound checked, and the fast loop again.
+        if ip >= len {
+            return Err(DecodeError);
+        }
+        if careful_sequence(block, dst, &mut ip, &mut op)? {
+            *st = Part { ip, op, done: true };
+            return Ok(());
+        }
+    }
+    *st = Part {
+        ip,
+        op,
+        done: false,
+    };
+    Ok(())
+}
+
+/// The fast loop over the block `src[..len]`: turns while `op <= ostop` and,
 /// unless `PADDED`, `ip <= ilim`; `true` where the block ended in it, else
-/// the rest left to the careful loop where a turn lacked its room. Every
-/// length byte is read inside the block, so a turn starts at most a byte
-/// past it.
+/// the rest left to the caller where a turn lacked its room or the output
+/// passed `ostop`. Every length byte is read inside the block, so a turn
+/// starts at most a byte past it. `ostop` is where the turns end and `olim`
+/// the room they are given: a whole decode passes the room for both, and a
+/// decode that stops early (`decompress_more`) a smaller `ostop`, so that a
+/// run of literals longer than what is left to its stop is still moved by
+/// the fast loop, into the room past it.
 ///
 /// # Safety
-/// `olim + FAST_OUT == dst.len()`, `len <= src.len()`, and either `PADDED`
-/// and `len + PAD_IN <= src.len()`, or `ilim + FAST_IN <= src.len()` and
-/// `ilim < len`.
+/// `ostop <= olim`, `olim + FAST_OUT <= dst.len()`, `len <= src.len()`, and
+/// either `PADDED` and `len + PAD_IN <= src.len()`, or `ilim + FAST_IN <=
+/// src.len()` and `ilim < len`.
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 unsafe fn fast_loop<const PADDED: bool>(
     src: &[u8],
@@ -670,6 +761,7 @@ unsafe fn fast_loop<const PADDED: bool>(
     opr: &mut usize,
     ilim: usize,
     olim: usize,
+    ostop: usize,
 ) -> Result<bool, DecodeError> {
     let (iend, oend) = (src.len(), dst.len());
     let block = &src[..len];
@@ -682,7 +774,7 @@ unsafe fn fast_loop<const PADDED: bool>(
     // in `dst` ends at or before its destination starts (`offset >= 8` for
     // a move of eight, `>= 16` for sixteen, `step >= 8` in `near_copy`).
     unsafe {
-        while op <= olim && (PADDED || ip <= ilim) {
+        while op <= ostop && (PADDED || ip <= ilim) {
             let token = *sp.add(ip);
             ip += 1;
             // The run. Under fifteen literals, one move of sixteen inside
@@ -1370,6 +1462,254 @@ mod tests {
             cfg!(miri) || both > tried / 20,
             "the damage left some blocks decodable: {both} of {tried}"
         );
+    }
+
+    /// `block` decoded a part at a time, the stop moved on by `step` a call:
+    /// at every call the output's first `op` bytes are the block's, `op`
+    /// has passed the stop or the block has ended, and at its end the
+    /// whole of `want` is there.
+    fn decodes_in_parts(src: &[u8], len: usize, want: &[u8], room: usize, step: usize) {
+        let mut out = vec![0xC3u8; room];
+        let mut st = Part::default();
+        let (mut stop, mut calls) = (0usize, 0usize);
+        loop {
+            let before = st;
+            assert_eq!(
+                decompress_more(src, len, &mut out, &mut st, stop),
+                Ok(()),
+                "step {step}, stop {stop}, room {room}"
+            );
+            calls += 1;
+            assert!(st.op >= before.op && st.ip >= before.ip, "a call goes on");
+            assert!(st.op <= want.len(), "no byte past the block's");
+            assert!(
+                out[..st.op] == want[..st.op],
+                "step {step}: the first {} bytes differ",
+                st.op
+            );
+            if st.done {
+                assert_eq!(st.op, want.len(), "the block's end");
+                assert_eq!(st.ip, len, "the input's end");
+                break;
+            }
+            assert!(st.op > stop, "a call that has not ended passes its stop");
+            stop = st.op.max(stop) + step;
+            assert!(calls <= want.len() + 2, "a call a byte at most");
+        }
+        // Asked again at its end it stands, whatever the stop.
+        let end = st;
+        assert_eq!(
+            decompress_more(src, len, &mut out, &mut st, usize::MAX),
+            Ok(())
+        );
+        assert_eq!(st, end);
+    }
+
+    #[test]
+    fn a_block_decoded_a_part_at_a_time_writes_the_whole_decodes_bytes_at_every_stop() {
+        let mut enc = Encoder::new();
+        let steps: &[usize] = if cfg!(miri) {
+            &[1, 64, 256]
+        } else {
+            &[1, 2, 7, 63, 64, 65, 192, 256, 1000, 100_000]
+        };
+        for c in decode_cases() {
+            if c.is_empty() {
+                continue;
+            }
+            let mut blocks = Vec::new();
+            let mut out = vec![0u8; max_output(c.len())];
+            let n = enc.compress_into(&c, &mut out, Effort::SHIPPED).unwrap();
+            blocks.push(out[..n].to_vec());
+            blocks.push(lz4_flex::block::compress(&c));
+            for b in &blocks {
+                for &step in steps {
+                    // A long case a byte at a time is its length in calls,
+                    // each a compare of the prefix: the short steps on the
+                    // short cases.
+                    if step < 7 && c.len() > 1000 {
+                        continue;
+                    }
+                    for tail in [0usize, 17, 18, 63, 64, 200] {
+                        let mut src = b.clone();
+                        src.extend((0..tail).map(|i| (i * 131 + 7) as u8));
+                        for room in [c.len(), c.len() + DECODE_SLACK, c.len() + 4096] {
+                            decodes_in_parts(&src, b.len(), &c, room, step);
+                        }
+                    }
+                }
+                // One call with no stop is the whole decode.
+                let mut all = vec![0u8; c.len() + DECODE_SLACK];
+                let mut st = Part::default();
+                assert_eq!(
+                    decompress_more(b, b.len(), &mut all, &mut st, usize::MAX),
+                    Ok(())
+                );
+                assert!(st.done && st.op == c.len() && all[..c.len()] == c[..]);
+            }
+        }
+    }
+
+    /// A part asked with its stop where it stands decodes one sequence and
+    /// no more: a block takes as many such asks as it has sequences, on the
+    /// fast path and on the careful one alike. A short block, whose output
+    /// has no room for the fast loop's strides, is decoded by the careful
+    /// path alone, which is where a loop that ran on past its stop to the
+    /// block's end would be every byte right and no part at all.
+    #[test]
+    fn a_part_asked_where_it_stands_decodes_one_sequence() {
+        let mut enc = Encoder::new();
+        let short: Vec<u8> = b"abcdabcdabcdXYZWabcdabcdQRSTabcdabcdabcd-end".to_vec();
+        assert!(short.len() < FAST_OUT);
+        let mut careful_many = false;
+        for c in decode_cases().chain(std::iter::once(short)) {
+            if c.is_empty() {
+                continue;
+            }
+            let mut out = vec![0u8; max_output(c.len())];
+            let n = enc.compress_into(&c, &mut out, Effort::SHIPPED).unwrap();
+            for b in [out[..n].to_vec(), lz4_flex::block::compress(&c)] {
+                let want = sequences(&b).expect("a block");
+                for room in [c.len(), c.len() + DECODE_SLACK] {
+                    let mut dst = vec![0u8; room];
+                    let (mut st, mut asks) = (Part::default(), 0usize);
+                    while !st.done {
+                        let stop = st.op;
+                        assert_eq!(
+                            decompress_more(&b, b.len(), &mut dst, &mut st, stop),
+                            Ok(())
+                        );
+                        asks += 1;
+                        assert!(asks <= want, "more asks than sequences: {asks} of {want}");
+                    }
+                    assert_eq!(asks, want, "an ask a sequence, {} bytes", c.len());
+                    assert!(dst[..c.len()] == c[..]);
+                    careful_many |= room < FAST_OUT && want >= 3;
+                }
+            }
+        }
+        assert!(
+            careful_many,
+            "a block of several sequences the careful path decodes alone"
+        );
+    }
+
+    #[test]
+    fn a_damaged_block_decoded_in_parts_has_the_whole_decodes_verdict_and_bytes() {
+        // The damage of the test above, each block decoded whole and then a
+        // part at a time into an output of the same room: the parts end in
+        // the whole decode's verdict, and where it decodes, in its bytes; a
+        // prefix the parts wrote before a refusal is the whole decode's
+        // too, where the whole decode got so far. Nothing panics and, under
+        // Miri, nothing is read or written outside the buffers.
+        let mut r = Rng(0x9A27_DEC0);
+        let mut enc = Encoder::new();
+        let mut blocks = Vec::new();
+        for c in decode_cases() {
+            if c.len() < 20 || c.len() > 10_000 {
+                continue;
+            }
+            let mut out = vec![0u8; max_output(c.len())];
+            let n = enc.compress_into(&c, &mut out, Effort::SHIPPED).unwrap();
+            blocks.push((out[..n].to_vec(), c.len()));
+            blocks.push((lz4_flex::block::compress(&c), c.len()));
+        }
+        let (mut decoded, mut refused) = (0u64, 0u64);
+        for (b, ulen) in &blocks {
+            for t in 0..if cfg!(miri) { 6 } else { 30 } {
+                let mut d = b.clone();
+                match t % 4 {
+                    0 => {
+                        let i = r.below(d.len() as u64) as usize;
+                        d[i] ^= 1 << r.below(8);
+                    }
+                    1 => {
+                        let i = r.below(d.len() as u64) as usize;
+                        d[i] = r.below(256) as u8;
+                    }
+                    2 => d.truncate(r.below(d.len() as u64) as usize),
+                    _ => {
+                        let n = r.below(64) as usize;
+                        d = (0..n).map(|_| r.below(256) as u8).collect();
+                    }
+                }
+                for tail in [0usize, 80] {
+                    let mut src = d.clone();
+                    src.extend(std::iter::repeat_n(0xEEu8, tail));
+                    for room in [*ulen, ulen + DECODE_SLACK] {
+                        let mut whole = vec![0u8; room];
+                        let a = decompress_in(&src, d.len(), &mut whole);
+                        for step in [1usize, 64, 256] {
+                            let mut parts = vec![0u8; room];
+                            let mut st = Part::default();
+                            let mut stop = 0usize;
+                            let verdict = loop {
+                                match decompress_more(&src, d.len(), &mut parts, &mut st, stop) {
+                                    Err(e) => break Err(e),
+                                    Ok(()) if st.done => break Ok(st.op),
+                                    Ok(()) => {
+                                        assert!(st.op > stop);
+                                        stop = st.op + step;
+                                    }
+                                }
+                            };
+                            assert_eq!(
+                                verdict, a,
+                                "the parts' verdict is the whole decode's: step {step}, room {room}, tail {tail}"
+                            );
+                            match a {
+                                Ok(n) => {
+                                    decoded += 1;
+                                    assert!(parts[..n] == whole[..n], "the decoded bytes");
+                                }
+                                Err(_) => refused += 1,
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            cfg!(miri) || (decoded > 100 && refused > 100),
+            "both verdicts reached: {decoded} decoded, {refused} refused"
+        );
+    }
+
+    #[test]
+    fn a_part_state_that_is_not_the_buffers_is_refused() {
+        let input: Vec<u8> = (0..600).map(|i| (i % 11) as u8).collect();
+        let b = lz4_flex::block::compress(&input);
+        let mut out = vec![0u8; 600 + DECODE_SLACK];
+        for bad in [
+            Part {
+                ip: b.len() + 1,
+                op: 0,
+                done: false,
+            },
+            Part {
+                ip: 0,
+                op: out.len() + 1,
+                done: false,
+            },
+        ] {
+            let mut st = bad;
+            assert_eq!(
+                decompress_more(&b, b.len(), &mut out, &mut st, 10),
+                Err(DecodeError)
+            );
+        }
+        let mut st = Part::default();
+        assert_eq!(
+            decompress_more(&b, b.len() + 1, &mut out, &mut st, 10),
+            Err(DecodeError)
+        );
+        // A stop already passed decodes nothing more.
+        let mut st = Part::default();
+        decompress_more(&b, b.len(), &mut out, &mut st, 100).unwrap();
+        let at = st;
+        assert!(at.op > 100 && !at.done);
+        decompress_more(&b, b.len(), &mut out, &mut st, 50).unwrap();
+        assert_eq!(st, at);
     }
 
     #[test]

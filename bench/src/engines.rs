@@ -685,6 +685,18 @@ pub struct Supdb {
     /// no copy of them held in memory out of core
     /// (`Options::heads_owned` off): `supdb-headsmapped`.
     headsmapped: bool,
+    /// A point read through a form file decodes its group whole into the
+    /// memo at every miss, no partial decode of a first touch and no
+    /// admission at the second (`Options::zpages_point_part` off):
+    /// `supdb-zpointwhole`.
+    zpointwhole: bool,
+    /// No table of where the keys read through the memo lie
+    /// (`Options::zpages_point_keys` off): `supdb-znopointkeys`.
+    znopointkeys: bool,
+    /// Every decode of a walk through a form file put in the memo, no
+    /// first touch decoded into the cursor's own buffer
+    /// (`Options::zpages_scan_admit` off): `supdb-zscanputs`.
+    zscanputs: bool,
     /// Out of core a merge's landing chains the next merge only while
     /// reads are around, where the default chains through a write-only
     /// stretch too (`Options::merge_chains_writes` off).
@@ -1708,6 +1720,18 @@ struct Policy {
     /// no copy of them held in memory out of core
     /// (`Options::heads_owned` off): `supdb-headsmapped`.
     headsmapped: bool,
+    /// A point read through a form file decodes its group whole into the
+    /// memo at every miss, no partial decode of a first touch and no
+    /// admission at the second (`Options::zpages_point_part` off):
+    /// `supdb-zpointwhole`.
+    zpointwhole: bool,
+    /// No table of where the keys read through the memo lie
+    /// (`Options::zpages_point_keys` off): `supdb-znopointkeys`.
+    znopointkeys: bool,
+    /// Every decode of a walk through a form file put in the memo, no
+    /// first touch decoded into the cursor's own buffer
+    /// (`Options::zpages_scan_admit` off): `supdb-zscanputs`.
+    zscanputs: bool,
     /// Out of core a merge's landing chains the next merge only while
     /// reads are around, where the default chains through a write-only
     /// stretch too (`Options::merge_chains_writes` off).
@@ -2389,6 +2413,9 @@ impl Default for Policy {
             settletablenear: false,
             headslook: false,
             headsmapped: false,
+            zpointwhole: false,
+            znopointkeys: false,
+            zscanputs: false,
             nochainwrites: false,
             noland: false,
             landnearscans: false,
@@ -7581,6 +7608,9 @@ impl Supdb {
             settletablenear,
             headslook,
             headsmapped,
+            zpointwhole,
+            znopointkeys,
+            zscanputs,
             nochainwrites,
             noland,
             landnearscans,
@@ -7997,6 +8027,9 @@ impl Supdb {
                 supdb::Options::default().heads_look_ms
             },
             heads_owned: !headsmapped,
+            zpages_point_part: !zpointwhole,
+            zpages_point_keys: !znopointkeys,
+            zpages_scan_admit: !zscanputs,
             merge_chains_writes: !nochainwrites,
             zpages_land_scans_far: !landnearscans,
             merge_plan_idle: !noidleplan,
@@ -8339,6 +8372,9 @@ impl Supdb {
             settletablenear,
             headslook,
             headsmapped,
+            zpointwhole,
+            znopointkeys,
+            zscanputs,
             nochainwrites,
             noland,
             landnearscans,
@@ -9317,6 +9353,21 @@ impl Engine for Supdb {
         if self.headsmapped {
             return "supdb-headsmapped";
         }
+        if self.zpointwhole && self.znopointkeys && self.zscanputs {
+            return "supdb-zmemoplain";
+        }
+        if self.zpointwhole && self.znopointkeys {
+            return "supdb-zpointplain";
+        }
+        if self.zpointwhole {
+            return "supdb-zpointwhole";
+        }
+        if self.znopointkeys {
+            return "supdb-znopointkeys";
+        }
+        if self.zscanputs {
+            return "supdb-zscanputs";
+        }
         if self.nochainwrites {
             return if self.partition {
                 "supdb-nochainwrites"
@@ -9863,10 +9914,7 @@ impl Engine for Supdb {
             ("sweep_shortcuts", db.sweep_shortcuts() as f64),
             // The groups the walks decoded into their cursors' own buffers
             // (`Options::zpages_walk_owns_decodes`), over every form file.
-            (
-                "zpage_walk_owned",
-                db.zpage_heat().iter().map(|h| h.walk_owned).sum::<u64>() as f64,
-            ),
+            ("zpage_walk_owned", z.walk_owned as f64),
             // The writer's builds by kind, the covered blocks copied on
             // their second touch and the budget's sheds: see
             // `Db::build_kinds`.
@@ -10022,6 +10070,11 @@ impl Engine for Supdb {
             ("zpage_warm_us", z.warm_us as f64),
             ("zpage_memo_hits", z.memo_hits as f64),
             ("zpage_memo_misses", z.memo_misses as f64),
+            ("zpage_point_parts", z.point_parts as f64),
+            ("zpage_point_part_bytes", z.point_part_bytes as f64),
+            ("zpage_point_part_of", z.point_part_of as f64),
+            ("zpage_point_admits", z.point_admits as f64),
+            ("zpage_point_key_hits", z.point_key_hits as f64),
             ("zpage_prefetches", z.prefetches as f64),
             ("zpage_scan_views", z.scan_views as f64),
             ("zpage_group_aheads", z.group_aheads as f64),
@@ -10972,6 +11025,11 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-settletablenear"
         | "supdb-headslook"
         | "supdb-headsmapped"
+        | "supdb-zpointwhole"
+        | "supdb-znopointkeys"
+        | "supdb-zpointplain"
+        | "supdb-zscanputs"
+        | "supdb-zmemoplain"
         | "supdb-nochainwrites"
         | "supdb-noland"
         | "supdb-landnearscans"
@@ -11786,6 +11844,73 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     d,
                     Policy {
                         headsmapped: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-zpointwhole" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        zpointwhole: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-znopointkeys" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        znopointkeys: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-zscanputs" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        zscanputs: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        // All three off: every miss of the memo a whole decode it takes,
+        // for a point read and a walk alike, the memo as it stood.
+        "supdb-zmemoplain" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        zpointwhole: true,
+                        znopointkeys: true,
+                        zscanputs: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        // The partial decode and the table off: the point read through the
+        // form as it stood before either, the walk's admission on.
+        "supdb-zpointplain" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        zpointwhole: true,
+                        znopointkeys: true,
                         ..Policy::default()
                     },
                 )
