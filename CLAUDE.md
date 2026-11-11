@@ -800,7 +800,15 @@ whole is taken out under a fresh epoch, its pointer nulled, and reused
 for a later block only once no reader is pinned at or before that epoch;
 a reader that finds the block gone reads the record through the run's
 mapping, and one that loaded the pointer first is pinned below the
-epoch and keeps the memory until it leaves. Everyone
+epoch and keeps the memory until it leaves. A segment has one of the
+same kind: its ordered index reads its heads through a pointer the
+segment work moves between the index's mapping and a copy of them in
+the process's own memory (`Options::heads_owned`, `Maint::z_heads_look`),
+the copy whole before the pointer names it, and a copy given up is
+retired under a fresh epoch and freed only past every reader pinned
+before it, by the look that gave it up; every thread that seeks an index
+holds a pin, which is what the rule rests on, so a seek from a thread
+that pins nothing is a seek of freed memory. Everyone
 who reads a state
 pins the epoch it reads in through a slot in the reader table -- a handle
 for each read, the writer for each of its operations, the segment work
@@ -4387,6 +4395,129 @@ position, the drop is a choice and is priced as one; and an assertion
 that compares a derived thing with a rebuild encodes how the derived
 thing was made, so a change to what may be kept is read against every
 such check before a fuzz failure is read as a wrong answer.
+
+**A loop tuned under one regulator's batches, run under another's.** The
+settle's loops were tuned while the buffered pace set a pass's size: a
+hundredth of the store, fourteen thousand keys at three million, a few of
+them to a block and two hundred ranks apart. There the resolve's gallop
+from the last answer reads heads the seek before left warm, the next
+block's form is asked for whole because several keys land in it, and a
+seek from the index's top level, priced against the gallop, read level
+and was not kept. The syncing pace is a quarter of a percent, and the
+thread under it takes what a few commits left: over the full rewrite at
+three million keys a pass held nineteen hundred keys, sixteen hundred
+ranks apart, and the counters the sweep already printed said the rest,
+2.62 million block visits for 2.70 million keys. Every visit was one
+key's. The gallop over that distance was a dozen probes and a binary
+search of ten more, each waiting on the one before, a sixth of the thread;
+the whole-form ask was forty-eight lines for a patch that reads one entry
+and writes one run, two of whose lines it never asked for; the form's
+header, the slot that names it and the block's list of created keys were
+each a line nothing had touched since the block's last visit. Five asks
+ahead took the settle's cost a key down by two fifths
+(`docs/engine.md`), each sized by what a pass holds now: the stride a
+seek will search, named from the top level a few keys before the seek;
+the header by the slot's pointer; the patch's own lines by the key's cut;
+the value with its chunk; the table's lines further ahead still. The
+rules: an ask ahead is sized by the batch's density in the structure it
+is for, so when a regulator changes what a pass holds, every loop tuned
+under the old size is profiled again; a refutation at one density is a
+refutation at that density, and the lever comes back when the density
+moves by an order; and the count that says which regime a loop is in --
+here the keys against the blocks they were grouped into -- is read off
+the counters before the profile is.
+
+**A call saved and a wait bought.** Out of core a settle asks the kernel
+for the heads its resolves will seek, and each ask first reads its own
+page's residency, a `mincore` a key: a tenth of the upkeep thread at
+three million keys under 1.25 GiB, where the store sits at the
+controller's census with nearly all of its ordered indexes in memory. One
+look at a partition's whole index, standing for a hundred milliseconds,
+took that tenth off the thread's CPU, and the burst read one to three
+percent longer in both orders with the writer held a quarter to a half
+longer: under the bound the indexes' pages leave the cache all through
+the burst, and three to five thousand of the thread's seeks faulted on a
+page gone since its partition's look where six hundred did with an ask a
+key (`perf record -a -e major-faults -c 1 -d`, the faults laid to their
+files by address). The thread's CPU had been the measure and its wall was
+the price. The same record named what the calls had been standing in for:
+the scan after the burst took eleven to twenty major faults on those
+pages in one pass of three, in its start seek, and those were the passes
+that ran two and three times the others. The rules: a lever on a thread
+that paces another is priced by that thread's wall, the holds and the
+burst, before its CPU; a cache of an answer the kernel can change is as
+stale as the kernel is fast, so the rate the answer changes at is counted
+before the cache is built; and a call a key that guards against a fault
+is a sign the pages should not be the kind that leave.
+
+**A count keyed on a generation a landing moves.** The engine reads
+whether scans are around from the writes since the last one, two stores'
+worth being far from reads, and kept the count twice: the commit's
+hand-over by its batch (`upkeep_since_scan`), which paces a burst only
+while scans are around, and the pass by the log's growth
+(`Reader::settle_due`), which files only then. Each took "the whole log
+where the generation has changed since", which was a new memtable while
+the writer was the one publisher. Since the segment work has a thread of
+its own, a landing publishes a new generation over the live table it
+leaves alone, and every landing added that table's whole log to both
+counts again. Over the lag sweep's full rewrite at three million keys, a
+seal's two landings and a merge's for every hundred commits, the counts
+passed two stores' worth with one written: for the burst's last one to
+twelve percent the hand-over stopped pacing and the pass stopped filing,
+and the first scan after the burst read up to ten milliseconds of log and
+settled up to a hundred and twenty, a pass of a hundred milliseconds at
+the median where the others took sixteen. It was a third of the bursts
+on one host, thirty of ninety, and none of thirty on the host before it,
+where the same count had ended just under the line, and the pairings of
+that day read it as the host's until two counters every sweep prints
+were read rep by rep: the commits held, 2,363 to 2,668 of 2,700 in every
+stalled burst and 2,700 in every other, and the first scan's `sync` and
+`settle` phases. Both counts are keyed on
+the live table now (`State::lives`), as the lag tick's had been since the
+same mistake was found there. The rule is the one "a pass that reported
+done for a turn it skipped" gave, a check that a thing is the one named
+compares the quantity the work depends on and not a counter other things
+also move, with three corollaries: when a second publisher is given the
+pointer, every counter keyed on what only the first used to move is read
+again, not only the one that failed; a regulator that stops regulating
+raises nothing, so the count of the operations it held is printed beside
+the count it should have held and read per rep; and a cell that moves
+between hosts with the engine unchanged is read for a threshold the
+engine sits at before it is read as the host's.
+
+**Whatever the raw form serves now, taken for what it is left to
+serve.** The ordered index's heads are eight bytes a key that every seek
+of a raw partition reads, and under a bound their mapping's pages leave
+the cache between two seeks however often they are read; held in the
+process's own memory they are not the cache's to take, and the bound
+counts them either way (`Options::heads_owned`, the entry before this
+one's last rule). The first version copied the heads of every partition
+the raw form was serving at the look, and at three million keys, where
+the store sits at the controller's census through a full rewrite, it
+took a quarter off the upkeep thread's settle and the stalls of a device
+wait out of the pass after. One run of the same lever at ten
+million keys read its counters before its rates: ninety-two copies made
+over a lag sweep and ninety-two given back. A partition a merge lands is
+served raw until the controller attaches the file the merge built for
+it, a tick later, and at the load's end every partition is served raw
+for the second between the crossing and the install; copied in that
+second, the copies read every index file from the device beside the
+first scans, a pass of five hundred milliseconds against four hundred.
+The second version waited for a controller's step that had bought
+nothing, and the crossing still made eight to twenty, since the
+controller sits a moment on a purchase its model has already predicted
+while the reads' faults make the price. A copy is made now for a
+partition the controller is leaving raw by its own account: under the
+form's gate one it has declined, and at the census every one while its
+model says the raw form fits (`Maint::z_heads_look`, `heads_left_raw`).
+The rules: a state read off what serves at this instant is a state read
+between two steps of whoever decides what serves, so the decider's own
+account is asked -- its decline, its model -- and not the cell it has
+not filled yet; a lever built at one rung is run once at the other for
+its counters before any pairing of it, where a copy made and given back
+ninety-two times is one line of one run; and a memory economy that
+copies is priced by the reads the copy makes, on the thread and in the
+window it makes them.
 
 ## Standing limitations
 
