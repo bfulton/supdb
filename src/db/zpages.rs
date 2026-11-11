@@ -905,6 +905,106 @@ pub fn decode_group_with<'a>(
 /// larger, and the read decodes that much past its record.
 pub const PART_STEP: usize = 256;
 
+/// A block-coded group being decoded a part at a time for a walk
+/// ([`open_group_partly`], [`decode_group_more`]): where its decoder
+/// stands, the payload with the rest of its page behind it, and the bytes
+/// the whole group decodes to.
+#[derive(Clone, Copy, Debug)]
+pub struct PartGroup<'a> {
+    st: super::zlz4::Part,
+    rest: &'a [u8],
+    len: usize,
+    ulen: usize,
+}
+
+impl PartGroup<'_> {
+    /// The group's bytes decoded so far, never the decoder's overrun past
+    /// them.
+    pub fn have(&self) -> usize {
+        self.st.op.min(self.ulen)
+    }
+
+    /// The bytes the whole group decodes to.
+    pub fn ulen(&self) -> usize {
+        self.ulen
+    }
+
+    /// Whether the decode has reached the group's end.
+    pub fn done(&self) -> bool {
+        self.st.done
+    }
+}
+
+/// Group `j` of a page this process has verified, begun: decoded into
+/// `buf` from its first byte to `stop` bytes, a sequence past it at most,
+/// or to its end where that comes first, and handed back as what
+/// [`decode_group_more`] goes on from. `Ok(None)` for a group this does
+/// not serve, which the caller opens whole: one that is stored or
+/// record-coded.
+///
+/// For a walk's own decode of a group it will not read to the end
+/// (`Options::zpages_walk_part`): a scan's last group is read half way at
+/// the mean, the decoder is sequential and its cost is its tokens. The
+/// page is one whose every group a first decode has walked whole, as
+/// [`seek_group_partly`]'s is, and nothing is verified again; what a
+/// decode that stops short does not see is said there. The bytes of `buf`
+/// past [`PartGroup::have`] are not the group's.
+pub fn open_group_partly<'a>(
+    view: &PageView<'a>,
+    j: usize,
+    buf: &mut GroupBuf,
+    stop: usize,
+) -> Result<Option<PartGroup<'a>>, ZError> {
+    let g = view
+        .group(j)
+        .ok_or(ZError::Header("no such group in the page"))?;
+    if g.stored || g.coded {
+        return Ok(None);
+    }
+    let ulen = g.ulen as usize;
+    if ulen == 0 || ulen > ZMAX_ULEN {
+        return Err(ZError::Header(
+            "a group's ulen is not 4 to the most a group holds",
+        ));
+    }
+    let (rest, len) = view.payload_and_rest(j).ok_or(ZError::Length)?;
+    let mut part = PartGroup {
+        st: super::zlz4::Part::default(),
+        rest,
+        len,
+        ulen,
+    };
+    decode_group_more(&mut part, buf, stop)?;
+    Ok(Some(part))
+}
+
+/// The decode `part` began taken on to `stop` bytes or the group's end,
+/// in `buf`, the buffer it began in, which nothing has written since: the
+/// bytes of the group decoded after it. A call always decodes a sequence
+/// more of a group not yet at its end, whatever `stop`. An `Err` is
+/// damage, as [`seek_group_partly`]'s is: a payload that does not decode,
+/// decodes past the group, or ends short of it.
+pub fn decode_group_more(
+    part: &mut PartGroup<'_>,
+    buf: &mut GroupBuf,
+    stop: usize,
+) -> Result<usize, ZError> {
+    if part.st.done {
+        return Ok(part.have());
+    }
+    let out = buf.bytes_with_slack(part.ulen, super::zlz4::DECODE_SLACK);
+    let stop = stop.max(part.st.op);
+    super::zlz4::decompress_more(part.rest, part.len, out, &mut part.st, stop)
+        .map_err(|_| ZError::Decode)?;
+    if part.st.op > part.ulen {
+        return Err(ZError::Decode);
+    }
+    if part.st.done && part.st.op < part.ulen {
+        return Err(ZError::DecodedLen);
+    }
+    Ok(part.have())
+}
+
 /// Where a key falls in a group decoded only as far as the walk for it
 /// read ([`seek_group_partly`]): the record's offset, or `None` for a key
 /// the group does not hold; the bytes of the group decoded, which hold the
@@ -7754,6 +7854,240 @@ mod tests {
             seek_group_partly(&bv, 0, &mut part, &key).is_err(),
             "a decode past the stated length is refused, not answered from"
         );
+    }
+
+    // ---- a group decoded a part at a time for a walk ----------------------
+
+    /// The suite's records in pages as a builder fills them: every group
+    /// begun at a spread of stops and taken on in steps of several sizes.
+    /// What is decoded is at every step a prefix of the whole decode's
+    /// bytes, past what was asked or the whole group, a call goes on by a
+    /// sequence at the least, and the last leaves the whole group and says
+    /// so. A group begun for nothing stops well short of its end.
+    #[test]
+    fn a_group_decoded_a_part_at_a_time_is_a_prefix_of_the_whole_at_every_step() {
+        let images = suite_images(3000, 37);
+        let bind = 9;
+        let mut s = FillScratch::new();
+        let (mut rank, mut pages) = (0usize, Vec::new());
+        while rank < images.len() {
+            let mut page = [0u8; ZPAGE];
+            match fill_page(&images, rank, bind, &mut s, &mut page) {
+                Fill::Page(g) => {
+                    pages.push(page);
+                    rank += g.count;
+                }
+                other => panic!("rank {rank}: {other:?}"),
+            }
+        }
+        let (mut whole, mut part) = (GroupBuf::new(), GroupBuf::new());
+        let (mut groups, mut steps, mut begun0, mut of0) = (0usize, 0usize, 0usize, 0usize);
+        for page in &pages {
+            let v = parse_page(page, bind).unwrap();
+            for j in 0..v.groups() {
+                let ge = v.group(j).unwrap();
+                assert!(!ge.stored && !ge.coded, "the suite's records compress");
+                groups += 1;
+                let g = decode_group_with(&v, j, &mut whole, true).unwrap().to_vec();
+                let n = g.len();
+                for (stop, step) in [
+                    (0, 1),
+                    (1, 64),
+                    (n / 4, PART_STEP),
+                    (n / 2, 7),
+                    (n - 1, 1),
+                    (n, 1),
+                    (usize::MAX, 1),
+                ] {
+                    let mut p = open_group_partly(&v, j, &mut part, stop)
+                        .unwrap()
+                        .expect("a block-coded group");
+                    assert_eq!(p.ulen(), n);
+                    assert!(p.done() || p.have() > stop, "stop {stop}: {}", p.have());
+                    assert_eq!(p.done(), p.have() == n, "stop {stop}");
+                    assert!(part.bytes(p.have()) == &g[..p.have()], "a prefix");
+                    if stop == 0 {
+                        begun0 += p.have();
+                        of0 += n;
+                    }
+                    while !p.done() {
+                        let before = p.have();
+                        let got = decode_group_more(&mut p, &mut part, before + step).unwrap();
+                        assert_eq!(got, p.have());
+                        assert!(got > before, "a call goes on");
+                        assert!(p.done() || got > before + step, "past what was asked");
+                        assert!(part.bytes(got) == &g[..got], "a prefix still");
+                        steps += 1;
+                    }
+                    assert!(part.bytes(n) == g.as_slice(), "the whole group at the end");
+                    // A group at its end is left as it is.
+                    assert_eq!(decode_group_more(&mut p, &mut part, usize::MAX).unwrap(), n);
+                    assert!(part.bytes(n) == g.as_slice());
+                }
+            }
+        }
+        assert!(
+            groups > 100 && steps > 5000,
+            "{groups} groups, {steps} steps"
+        );
+        assert!(
+            begun0 * 4 < of0,
+            "{begun0} of {of0} bytes decoded by a begin that asked for none"
+        );
+    }
+
+    /// A group that is stored or record-coded is not begun, and the caller
+    /// opens it as it lies; a group the page does not have is an error.
+    #[test]
+    fn a_stored_or_record_coded_group_is_not_decoded_a_part_at_a_time() {
+        let mut part = GroupBuf::new();
+        let mut rng = Rng::new(31);
+        let noise: Vec<Vec<u8>> = (0..40).map(|_| rng.bytes(124)).collect();
+        let mut s = FillScratch::new();
+        let mut page = [0u8; ZPAGE];
+        let Fill::Page(_) = fill_page(&noise, 0, 3, &mut s, &mut page) else {
+            panic!("a page")
+        };
+        let v = parse_page(&page, 3).unwrap();
+        assert!(v.group(0).unwrap().stored);
+        assert!(open_group_partly(&v, 0, &mut part, 64).unwrap().is_none());
+        assert!(open_group_partly(&v, v.groups(), &mut part, 64).is_err());
+
+        let images = suite_images(200, 5);
+        let mut s = FillScratch::new();
+        s.coding = ZCODING_RECORD;
+        let Fill::Page(_) = fill_page(&images, 0, 3, &mut s, &mut page) else {
+            panic!("a page")
+        };
+        let v = parse_page(&page, 3).unwrap();
+        let mut coded = 0usize;
+        for j in 0..v.groups() {
+            if v.group(j).unwrap().coded {
+                coded += 1;
+                assert!(open_group_partly(&v, j, &mut part, 64).unwrap().is_none());
+            }
+        }
+        assert!(coded > 0, "a record-coded group in the page");
+    }
+
+    /// Bytes that changed under a verified page, as the partial seek's test
+    /// has them: every byte of a group's payload flipped in turn and the
+    /// group decoded a part at a time through the damage. It returns and
+    /// never panics, what it holds at every step is no longer than the
+    /// group, it reaches the group's end only where the whole decode
+    /// decodes the payload, and where that does, every step is a prefix of
+    /// the same bytes.
+    #[test]
+    fn a_damaged_payload_decoded_a_part_at_a_time_is_the_whole_decodes_prefix_or_refused() {
+        let images = suite_images(40, 5);
+        let mut s = FillScratch::new();
+        let mut page = [0u8; ZPAGE];
+        let Fill::Page(_) = fill_page(&images, 0, 3, &mut s, &mut page) else {
+            panic!("a page")
+        };
+        let v = parse_page(&page, 3).unwrap();
+        let ge = v.group(0).unwrap();
+        assert!(!ge.stored && !ge.coded);
+        let ulen = ge.ulen as usize;
+        let (coff, clen) = (usize::from(ge.coff), usize::from(ge.clen));
+        let (mut whole, mut part) = (GroupBuf::new(), GroupBuf::new());
+        let (mut refused, mut prefixes, mut ended) = (0usize, 0usize, 0usize);
+        for i in coff..coff + clen {
+            for bit in [1u8, 0x10, 0x80] {
+                let mut bad = page;
+                bad[i] ^= bit;
+                let Ok(bv) = page_view(&bad) else { continue };
+                let w = decode_group_with(&bv, 0, &mut whole, true).map(|g| g.to_vec());
+                for (stop, step) in [(0usize, 1usize), (ulen / 2, PART_STEP)] {
+                    let mut p = match open_group_partly(&bv, 0, &mut part, stop) {
+                        Err(_) => {
+                            refused += 1;
+                            continue;
+                        }
+                        Ok(None) => panic!("a block-coded group"),
+                        Ok(Some(p)) => p,
+                    };
+                    loop {
+                        assert!(p.have() <= ulen && p.ulen() == ulen);
+                        if let Ok(g) = &w {
+                            assert!(
+                                part.bytes(p.have()) == &g[..p.have()],
+                                "byte {i} bit {bit:#x}: not the whole decode's prefix"
+                            );
+                            prefixes += 1;
+                        }
+                        if p.done() {
+                            assert!(
+                                w.is_ok(),
+                                "byte {i} bit {bit:#x}: an end the whole decode refuses"
+                            );
+                            assert_eq!(p.have(), ulen);
+                            ended += 1;
+                            break;
+                        }
+                        let before = p.have();
+                        match decode_group_more(&mut p, &mut part, before + step) {
+                            Err(_) => {
+                                refused += 1;
+                                break;
+                            }
+                            Ok(got) => assert!(got > before, "a call goes on"),
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            refused > 0 && prefixes > 0 && ended > 0,
+            "{refused} refused, {prefixes} prefixes held, {ended} ended"
+        );
+    }
+
+    /// The directory forged four bytes short of what the payload decodes
+    /// to, as the partial seek's test forges it: a decode a part at a time
+    /// that runs to the block's end refuses the length there, in one call
+    /// or in steps, and never hands the group over as whole.
+    #[test]
+    fn a_part_at_a_time_decode_refuses_a_payload_that_decodes_past_its_groups_length() {
+        let images: Vec<Vec<u8>> = (0..40)
+            .map(|i| one_value(format!("{i:016}").as_bytes(), b"foxfoxfo"))
+            .collect();
+        let mut s = FillScratch::new();
+        let mut page = [0u8; ZPAGE];
+        let Fill::Page(_) = fill_page(&images, 0, 3, &mut s, &mut page) else {
+            panic!("a page")
+        };
+        let v = parse_page(&page, 3).unwrap();
+        let ge = v.group(0).unwrap();
+        assert!(!ge.stored && !ge.coded, "a block-coded group: {ge:?}");
+        let mut whole = GroupBuf::new();
+        let n = decode_group_with(&v, 0, &mut whole, true).unwrap().len();
+        let cut = 4usize;
+        assert!(cut < super::super::zlz4::DECODE_SLACK);
+        let mut bad = page;
+        let at = ZHDR + D_ULEN4;
+        bad[at..at + 2].copy_from_slice(&(((n - cut) / 4) as u16).to_le_bytes());
+        let sum = u32::from_le_bytes(bad[P_ULEN..P_ULEN + 4].try_into().unwrap());
+        bad[P_ULEN..P_ULEN + 4].copy_from_slice(&(sum - cut as u32).to_le_bytes());
+        let bv = page_view(&bad).expect("a view of the forged page");
+        assert_eq!(bv.group(0).unwrap().ulen as usize, n - cut);
+        let mut part = GroupBuf::new();
+        assert!(
+            open_group_partly(&bv, 0, &mut part, usize::MAX).is_err(),
+            "the whole of it in one call"
+        );
+        let mut p = open_group_partly(&bv, 0, &mut part, 0)
+            .expect("a begin short of the end")
+            .expect("a block-coded group");
+        let refused = loop {
+            assert!(!p.done(), "never whole");
+            let before = p.have();
+            match decode_group_more(&mut p, &mut part, before + 16) {
+                Err(_) => break true,
+                Ok(got) => assert!(got > before && got <= n - cut),
+            }
+        };
+        assert!(refused);
     }
 
     // ---- a whole form file ------------------------------------------------

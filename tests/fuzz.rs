@@ -244,6 +244,15 @@ struct Cfg {
     /// buffer (`Options::zpages_scan_admit`): off in a quarter of the seeds
     /// under `ZFUZZ_OPTVARY`, from the same side generator.
     scan_admit: bool,
+    /// A walk's own decode of a group taken only as far as the walk reads
+    /// (`Options::zpages_walk_part`): off in a quarter of the seeds under
+    /// `ZFUZZ_OPTVARY`, the side generator's next draw.
+    walk_part: bool,
+    /// The scans started in a block before its scans hold the blocks they
+    /// walk as copies under the form (`Options::promote_starts`): two in
+    /// a quarter of the seeds under `ZFUZZ_OPTVARY`, the side generator's
+    /// next draw, and the engine's otherwise.
+    hot_starts: u32,
 }
 
 /// Whether a seed runs with the block cache on. The chance is drawn whenever
@@ -265,6 +274,8 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
     let vary = std::env::var("ZFUZZ_OPTVARY").is_ok();
     let mut side = Rng::new(rng.0 ^ 0x9017_7A27_0000_0001);
     let (part_off, keys_off, scan_off) = (side.chance(25), side.chance(25), side.chance(25));
+    let walk_off = side.chance(25);
+    let hot_two = side.chance(25);
     Cfg {
         seal_bytes: [2 << 10, 4 << 10, 8 << 10, 16 << 10, 32 << 10][rng.below(5)],
         partition_bytes: match rng.below(4) {
@@ -305,6 +316,12 @@ fn pick_cfg(rng: &mut Rng, want_cache: bool) -> Cfg {
         point_part: !(vary && part_off),
         point_keys: !(vary && keys_off),
         scan_admit: !(vary && scan_off),
+        walk_part: !(vary && walk_off),
+        hot_starts: if vary && hot_two {
+            2
+        } else {
+            Options::default().promote_starts
+        },
     }
 }
 
@@ -329,6 +346,8 @@ fn opts(c: &Cfg) -> Options {
         zpages_point_part: c.point_part,
         zpages_point_keys: c.point_keys,
         zpages_scan_admit: c.scan_admit,
+        zpages_walk_part: c.walk_part,
+        promote_starts: c.hot_starts,
         zpages_store_all: c.store_all,
         scan_start_cache: if c.start_cache { 4096 } else { 0 },
         ..Options::default()
@@ -400,11 +419,15 @@ fn opts_z(c: &Cfg) -> Options {
     // merge path and take them back every three scans whatever their
     // starts (`Options::scan_forms_off_unreused`, `scan_forms_off_flip`),
     // so every switch, with the writes, seals and landings between them,
-    // is read against the raw store. A flag and not a draw.
+    // is read against the raw store; and a writer whose forms are off
+    // takes them back at the commit that makes three writes in a row with
+    // no scan between (`Options::scan_forms_off_stale_writes`), the exit a
+    // commit makes. A flag and not a draw.
     if env_flag("ZFUZZ_FORMSOFF") {
         o.scan_forms_off_unreused = true;
         o.scan_forms_off_window = 3;
         o.scan_forms_off_flip = true;
+        o.scan_forms_off_stale_writes = 3;
     }
     // Under `ZFUZZ_FLEXDEC` they are decoded by `lz4_flex` and not the
     // engine's own decoder (`Options::zpages_own_decoder`), read against the
@@ -779,11 +802,16 @@ struct Stats {
     heads: [u64; 2],
     /// Through either store's form files: groups a point read decoded in
     /// part, groups the memo took at a second touch, reads the key table
-    /// sent to their record, and groups a walk decoded into its own buffer
-    /// (`Options::zpages_point_part`, `zpages_point_keys`,
-    /// `zpages_scan_admit`), summed as `recuts` is: what says a run under
-    /// `ZFUZZ_ZPAGES` reached each.
-    point: [u64; 4],
+    /// sent to their record, groups a walk decoded into its own buffer and
+    /// of those the groups decoded in part (`Options::zpages_point_part`,
+    /// `zpages_point_keys`, `zpages_scan_admit`, `zpages_walk_part`),
+    /// summed as `recuts` is: what says a run under `ZFUZZ_ZPAGES` reached
+    /// each; then the writers' scans that started in a block gone hot, and
+    /// on a copy (`Options::promote_starts`); then the times a writer took
+    /// its forms back at a commit, its reading of the scans gone stale
+    /// (`Options::scan_forms_off_stale_writes`), what says a run under
+    /// `ZFUZZ_FORMSOFF` reached that exit.
+    point: [u64; 8],
 }
 
 /// A store's point-read and walk counts through its form files, added to
@@ -794,6 +822,11 @@ fn count_point(st: &mut Stats, db: &Db) {
     st.point[1] += c.point_admits;
     st.point[2] += c.point_key_hits;
     st.point[3] += c.walk_owned;
+    st.point[4] += c.walk_parts;
+    let h = db.hot_starts();
+    st.point[5] += h[0];
+    st.point[6] += h[1];
+    st.point[7] += db.forms_off_stale_exits();
 }
 
 /// Under `ZFUZZ_CENSUS`, the store read as out of core: the census gate,
@@ -892,7 +925,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         switches: 0,
         recuts: 0,
         heads: [0; 2],
-        point: [0; 4],
+        point: [0; 8],
     };
     let mut fails: Vec<String> = Vec::new();
     let mut absent = absent_around(&pool, &mut rng);
@@ -1286,7 +1319,7 @@ fn fuzz_range() {
     let (mut bad, mut reopens, mut abandons, mut bindings, mut beside, mut switches) =
         (Vec::new(), 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut recuts = 0u64;
-    let mut point = [0u64; 4];
+    let mut point = [0u64; 8];
     let mut heads = [0u64; 2];
     for seed in seeds {
         match run_seed(seed, want_cache, verbose) {
@@ -1307,13 +1340,17 @@ fn fuzz_range() {
         }
     }
     eprintln!(
-        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {}, FAILURES {}",
+        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, point parts {} admits {} key hits {} walk owned {} walk parts {} hot starts {} copy starts {} stale exits {}, FAILURES {}",
         heads[0],
         heads[1],
         point[0],
         point[1],
         point[2],
         point[3],
+        point[4],
+        point[5],
+        point[6],
+        point[7],
         bad.len()
     );
     for b in &bad {

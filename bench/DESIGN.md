@@ -576,7 +576,27 @@ off, the point read through the form as it stood; `supdb-zscanputs` is
 `supdb` with every decode of a walk through a form file put in the memo,
 no first touch of a group decoded into the cursor's own buffer
 (`Options::zpages_scan_admit` off), and `supdb-zmemoplain` with all three
-off, the memo as it stood;
+off, the memo as it stood; `supdb-zwalkwhole` is `supdb` with every group
+a walk opens through a form file decoded whole, none only as far as the
+walk reads (`Options::zpages_walk_part` off); `supdb-zpromote` is `supdb`
+with a block that scans have walked a block's worth of entries held as a
+merged copy in its slot under the form file (`Options::promote_entries` at
+sixty-four with `zpages_promote_copies`), and `supdb-zpromotestarts` the
+same with the scan start cache beside it (`Options::scan_start_cache`), so
+that a scan from a key scanned from before finds its block's copy with no
+seek through the form; `supdb-zhotstarts2` and `supdb-zhotstarts3` are
+`supdb` with a scan that starts in a block scans have started in twice,
+or three times, holding the blocks it walks as copies under the form
+(`Options::promote_starts`), and `supdb-nohotstarts` with none held so;
+`supdb-formsoffkept` is `supdb` whose writer, its block forms given up on a
+reading of its scans, keeps them off until its next scan whatever it
+commits meanwhile (`Options::scan_forms_off_stale_writes` at zero), and
+`supdb-settleroomstill` with the room its commits' fills build in closed
+for a second by any growth of the memory group's refaults since the last
+reading, however old (`Options::forms_settle_room_pressure` off);
+`supdb-zgroup1k` is `supdb` with the form's pages cut into groups of a
+kibibyte of records where the default cuts at two
+(`Options::zpages_group_bytes`);
 `supdb-cache64tofitzpagesdropparse` and `supdb-cache64tofitautozpagesparse`
 are the forced form with the drop and the combined arm with their
 block-coded groups written by the engine's parsing encoder

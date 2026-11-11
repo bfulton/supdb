@@ -697,6 +697,15 @@ pub struct Supdb {
     /// first touch decoded into the cursor's own buffer
     /// (`Options::zpages_scan_admit` off): `supdb-zscanputs`.
     zscanputs: bool,
+    /// Every group a walk opens through a form file decoded whole, none
+    /// only as far as the walk reads (`Options::zpages_walk_part` off):
+    /// `supdb-zwalkwhole`.
+    zwalkwhole: bool,
+    /// The scans started in a block before its scans hold the blocks they
+    /// walk as copies under the form (`Options::promote_starts`), `None`
+    /// for the engine's: `supdb-zhotstarts2`, `supdb-zhotstarts3`,
+    /// `supdb-nohotstarts`.
+    zhotstarts: Option<u32>,
     /// Out of core a merge's landing chains the next merge only while
     /// reads are around, where the default chains through a write-only
     /// stretch too (`Options::merge_chains_writes` off).
@@ -855,6 +864,14 @@ pub struct Supdb {
     /// the shape before `Options::scan_forms_off_unreused`.
     /// `supdb-formson`.
     formson: bool,
+    /// The forms a reading of the scans gave up kept off until a scan,
+    /// whatever the writer commits meanwhile
+    /// (`Options::scan_forms_off_stale_writes` zero). `supdb-formsoffkept`.
+    formsoffkept: bool,
+    /// The fills' room closed for a second by any growth of the group's
+    /// refaults since the last reading, however old the reading
+    /// (`Options::forms_settle_room_pressure` off). `supdb-settleroomstill`.
+    settleroomstill: bool,
     /// A covered partition's settle filing a key by the form's span alone,
     /// the shape before the ordered index's samples
     /// (`Options::settle_covered_samples` off). `supdb-settlespan`.
@@ -1732,6 +1749,15 @@ struct Policy {
     /// first touch decoded into the cursor's own buffer
     /// (`Options::zpages_scan_admit` off): `supdb-zscanputs`.
     zscanputs: bool,
+    /// Every group a walk opens through a form file decoded whole, none
+    /// only as far as the walk reads (`Options::zpages_walk_part` off):
+    /// `supdb-zwalkwhole`.
+    zwalkwhole: bool,
+    /// The scans started in a block before its scans hold the blocks they
+    /// walk as copies under the form (`Options::promote_starts`), `None`
+    /// for the engine's: `supdb-zhotstarts2`, `supdb-zhotstarts3`,
+    /// `supdb-nohotstarts`.
+    zhotstarts: Option<u32>,
     /// Out of core a merge's landing chains the next merge only while
     /// reads are around, where the default chains through a write-only
     /// stretch too (`Options::merge_chains_writes` off).
@@ -1890,6 +1916,14 @@ struct Policy {
     /// the shape before `Options::scan_forms_off_unreused`.
     /// `supdb-formson`.
     formson: bool,
+    /// The forms a reading of the scans gave up kept off until a scan,
+    /// whatever the writer commits meanwhile
+    /// (`Options::scan_forms_off_stale_writes` zero). `supdb-formsoffkept`.
+    formsoffkept: bool,
+    /// The fills' room closed for a second by any growth of the group's
+    /// refaults since the last reading, however old the reading
+    /// (`Options::forms_settle_room_pressure` off). `supdb-settleroomstill`.
+    settleroomstill: bool,
     /// A covered partition's settle filing a key by the form's span alone,
     /// the shape before the ordered index's samples
     /// (`Options::settle_covered_samples` off). `supdb-settlespan`.
@@ -2416,6 +2450,8 @@ impl Default for Policy {
             zpointwhole: false,
             znopointkeys: false,
             zscanputs: false,
+            zwalkwhole: false,
+            zhotstarts: None,
             nochainwrites: false,
             noland: false,
             landnearscans: false,
@@ -2454,6 +2490,8 @@ impl Default for Policy {
             norewarm: false,
             rewarmtrim: false,
             formson: false,
+            formsoffkept: false,
+            settleroomstill: false,
             settlespan: false,
             nopacesyncs: false,
             pacesyncsraw: false,
@@ -5968,6 +6006,46 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with the form's pages cut into groups of a kibibyte of
+    /// records where the default cuts at two (`Options::zpages_group_bytes`
+    /// 1024): half the decode for a point read's first touch of a group,
+    /// for more of the form's bytes in directories and less for the
+    /// compressor to match against.
+    pub fn create_zgroup1k(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zgroup: Some(1024),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose fills' room is closed by any growth of the group's
+    /// refaults (`Options::forms_settle_room_pressure` off).
+    pub fn create_settleroomstill(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                settleroomstill: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose writer, its forms given up on a reading of its scans,
+    /// keeps them off until its next scan whatever it commits meanwhile
+    /// (`Options::scan_forms_off_stale_writes` zero).
+    pub fn create_formsoffkept(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                formsoffkept: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` whose writer keeps its block forms out of core whatever its
     /// scans meet (`Options::scan_forms_off_unreused` off).
     pub fn create_formson(path: &Path) -> Res<Supdb> {
@@ -7611,6 +7689,8 @@ impl Supdb {
             zpointwhole,
             znopointkeys,
             zscanputs,
+            zwalkwhole,
+            zhotstarts,
             nochainwrites,
             noland,
             landnearscans,
@@ -7649,6 +7729,8 @@ impl Supdb {
             norewarm,
             rewarmtrim,
             formson,
+            formsoffkept,
+            settleroomstill,
             settlespan,
             nopacesyncs,
             pacesyncsraw,
@@ -8030,6 +8112,8 @@ impl Supdb {
             zpages_point_part: !zpointwhole,
             zpages_point_keys: !znopointkeys,
             zpages_scan_admit: !zscanputs,
+            zpages_walk_part: !zwalkwhole,
+            promote_starts: zhotstarts.unwrap_or(supdb::Options::default().promote_starts),
             merge_chains_writes: !nochainwrites,
             zpages_land_scans_far: !landnearscans,
             merge_plan_idle: !noidleplan,
@@ -8071,6 +8155,12 @@ impl Supdb {
             zpages_rewarm_scans: !norewarm,
             zpages_rewarm_trims: rewarmtrim,
             scan_forms_off_unreused: !formson,
+            forms_settle_room_pressure: !settleroomstill,
+            scan_forms_off_stale_writes: if formsoffkept {
+                0
+            } else {
+                supdb::Options::default().scan_forms_off_stale_writes
+            },
             settle_covered_samples: !settlespan,
             upkeep_pace_syncs_bp: if nopacesyncs {
                 0
@@ -8375,6 +8465,8 @@ impl Supdb {
             zpointwhole,
             znopointkeys,
             zscanputs,
+            zwalkwhole,
+            zhotstarts,
             nochainwrites,
             noland,
             landnearscans,
@@ -8413,6 +8505,8 @@ impl Supdb {
             norewarm,
             rewarmtrim,
             formson,
+            formsoffkept,
+            settleroomstill,
             settlespan,
             nopacesyncs,
             pacesyncsraw,
@@ -9368,6 +9462,23 @@ impl Engine for Supdb {
         if self.zscanputs {
             return "supdb-zscanputs";
         }
+        if self.zpromote > 0 && !self.zpages_auto {
+            return if self.zstartcache {
+                "supdb-zpromotestarts"
+            } else {
+                "supdb-zpromote"
+            };
+        }
+        if self.zwalkwhole {
+            return "supdb-zwalkwhole";
+        }
+        if let Some(n) = self.zhotstarts {
+            return match n {
+                0 => "supdb-nohotstarts",
+                2 => "supdb-zhotstarts2",
+                _ => "supdb-zhotstarts3",
+            };
+        }
         if self.nochainwrites {
             return if self.partition {
                 "supdb-nochainwrites"
@@ -9557,6 +9668,15 @@ impl Engine for Supdb {
         }
         if self.formson {
             return "supdb-formson";
+        }
+        if self.formsoffkept {
+            return "supdb-formsoffkept";
+        }
+        if self.settleroomstill {
+            return "supdb-settleroomstill";
+        }
+        if self.zgroup == Some(1024) {
+            return "supdb-zgroup1k";
         }
         if self.settlespan {
             return "supdb-settlespan";
@@ -9811,6 +9931,7 @@ impl Engine for Supdb {
         let wk = db.forms_walks();
         let cs = db.copy_starts();
         let ss = db.seek_seeds();
+        let hs = db.hot_starts();
         let ph = db.scan_phases();
         let uk = db.upkeep_counts();
         let ord = db.ord_point_reads();
@@ -9909,12 +10030,23 @@ impl Engine for Supdb {
             // The writer's scans whose start seek seeded the partition's
             // reader with its cursor (`Options::zpages_seek_seeds`).
             ("seek_seeds", ss as f64),
+            // The writer's scans that started in a block its scans keep
+            // starting in, and on a copy with no seek
+            // (`Options::promote_starts`).
+            ("hot_starts", hs[0] as f64),
+            ("hot_copy_starts", hs[1] as f64),
             // The sweeps answered from the remembered pin without a walk
             // of the reader table (`Options::sweep_remembers_pin`).
             ("sweep_shortcuts", db.sweep_shortcuts() as f64),
             // The groups the walks decoded into their cursors' own buffers
             // (`Options::zpages_walk_owns_decodes`), over every form file.
             ("zpage_walk_owned", z.walk_owned as f64),
+            // Of those, the groups decoded only as far as their walks read
+            // (`Options::zpages_walk_part`), the bytes decoded of them and
+            // the bytes they hold.
+            ("zpage_walk_parts", z.walk_parts as f64),
+            ("zpage_walk_part_bytes", z.walk_part_bytes as f64),
+            ("zpage_walk_part_of", z.walk_part_of as f64),
             // The writer's builds by kind, the covered blocks copied on
             // their second touch and the budget's sheds: see
             // `Db::build_kinds`.
@@ -9940,6 +10072,10 @@ impl Engine for Supdb {
             ("table_lines_ahead", db.settle_ahead_asks()[1] as f64),
             // The writer's settles: see `Db::settle_density`.
             ("settle_runs", sd[0] as f64),
+            ("settle_off", db.settle_refusals()[0] as f64),
+            ("settle_far", db.settle_refusals()[1] as f64),
+            ("settle_noroom", db.settle_refusals()[2] as f64),
+            ("settle_notdue", db.settle_refusals()[3] as f64),
             ("settle_keys", sd[1] as f64),
             ("settle_blocks", sd[2] as f64),
             ("settle_rebuilds", sd[3] as f64),
@@ -10167,6 +10303,7 @@ impl Engine for Supdb {
             ("forms_off_entries", db.forms_off_counts()[0] as f64),
             ("forms_off_exits", db.forms_off_counts()[1] as f64),
             ("forms_off_scans", db.forms_off_counts()[2] as f64),
+            ("forms_off_stale", db.forms_off_stale_exits() as f64),
             ("zpage_spare_files", z.spare_files as f64),
             ("zpage_spare_builds", z.spare_builds as f64),
             ("zpage_spare_failed", z.spare_failed as f64),
@@ -11029,6 +11166,12 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-znopointkeys"
         | "supdb-zpointplain"
         | "supdb-zscanputs"
+        | "supdb-zpromote"
+        | "supdb-zpromotestarts"
+        | "supdb-zwalkwhole"
+        | "supdb-zhotstarts2"
+        | "supdb-zhotstarts3"
+        | "supdb-nohotstarts"
         | "supdb-zmemoplain"
         | "supdb-nochainwrites"
         | "supdb-noland"
@@ -11068,6 +11211,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-norewarm"
         | "supdb-rewarmtrim"
         | "supdb-formson"
+        | "supdb-formsoffkept"
+        | "supdb-settleroomstill"
+        | "supdb-zgroup1k"
         | "supdb-settlespan"
         | "supdb-nopacesyncs"
         | "supdb-pacesyncsraw"
@@ -11886,6 +12032,82 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
             },
             dir,
         )?,
+        "supdb-zhotstarts2" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        zhotstarts: Some(2),
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-zhotstarts3" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        zhotstarts: Some(3),
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-nohotstarts" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        zhotstarts: Some(0),
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        // The default arm with a block scans have walked a block's worth of
+        // entries held as a merged copy in its slot under the form file,
+        // and with the scan start cache beside it.
+        "supdb-zpromote" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        zpromote: 64,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-zpromotestarts" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        zpromote: 64,
+                        zstartcache: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-zwalkwhole" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        zwalkwhole: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
         // All three off: every miss of the memo a whole decode it takes,
         // for a point read and a walk alike, the memo as it stood.
         "supdb-zmemoplain" => supdb_arm(
@@ -12120,6 +12342,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-norewarm" => supdb_arm(Supdb::create_norewarm, dir)?,
         "supdb-rewarmtrim" => supdb_arm(Supdb::create_rewarmtrim, dir)?,
         "supdb-formson" => supdb_arm(Supdb::create_formson, dir)?,
+        "supdb-formsoffkept" => supdb_arm(Supdb::create_formsoffkept, dir)?,
+        "supdb-settleroomstill" => supdb_arm(Supdb::create_settleroomstill, dir)?,
+        "supdb-zgroup1k" => supdb_arm(Supdb::create_zgroup1k, dir)?,
         "supdb-settlespan" => supdb_arm(Supdb::create_settlespan, dir)?,
         "supdb-nopacesyncs" => supdb_arm(Supdb::create_nopacesyncs, dir)?,
         "supdb-pacesyncsraw" => supdb_arm(Supdb::create_pacesyncsraw, dir)?,
@@ -13733,6 +13958,27 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.scan_forms_off_unreused && b.scan_forms_off_unreused);
+            }
+            {
+                let z = Supdb::create_formsoffkept(&dir("formsoffkept")).unwrap();
+                assert_eq!(z.name(), "supdb-formsoffkept");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.scan_forms_off_stale_writes == 0 && b.scan_forms_off_stale_writes > 0);
+            }
+            {
+                let z = Supdb::create_settleroomstill(&dir("settleroomstill")).unwrap();
+                assert_eq!(z.name(), "supdb-settleroomstill");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.forms_settle_room_pressure && b.forms_settle_room_pressure);
+            }
+            {
+                let z = Supdb::create_zgroup1k(&dir("zgroup1k")).unwrap();
+                assert_eq!(z.name(), "supdb-zgroup1k");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert_eq!((o.zpages_group_bytes, b.zpages_group_bytes), (1024, 2048));
             }
             {
                 let z = Supdb::create_settlespan(&dir("settlespan")).unwrap();

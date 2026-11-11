@@ -18479,6 +18479,190 @@ fn scans_that_meet_their_blocks_once_out_of_core_keep_no_forms() {
     }
 }
 
+/// The reading that gave the forms up is of the writer's last window of
+/// scans, and it is stale once the writer has made
+/// `Options::scan_forms_off_stale_writes` writes in a row in small commits
+/// with no scan between them: the commit that crosses the line takes the
+/// forms back, the commits after it file their writes, and the next scan is
+/// the block path's. A scan between the commits starts the count again,
+/// since the regime decides at every scan, and so does a burst's batch,
+/// whose filing would be the writer's to pay; with the line at zero the
+/// forms stay off until a scan, the shape before.
+#[test]
+fn forms_given_up_are_taken_back_by_a_stretch_of_small_commits_with_no_scan() {
+    for (case, stale, upkeep) in [
+        ("stale-inline", 150u32, supdb::Upkeep::Inline),
+        ("stale-lent", 150, supdb::Upkeep::default()),
+        ("kept", 0, supdb::Upkeep::Inline),
+    ] {
+        let d = dir(&format!("forms-off-{case}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                scan_forms_off_unreused: true,
+                scan_forms_off_stale_writes: stale,
+                scan_forms_off_window: 32,
+                scan_forms_off_ghost_bits: 6,
+                zpages: supdb::ZPages::Off,
+                partition_bytes: Some(256 << 10),
+                upkeep,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let keys = 100_000u32;
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        let mut want: BTreeMap<Vec<u8>, String> = BTreeMap::new();
+        for k in 0..keys {
+            db.append(&key(k), b"0");
+            want.insert(key(k), "0".into());
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        assert!(
+            db.levels().0 > 1,
+            "{case}: partitions for the forms to hang on"
+        );
+        let check = |r: &Reader, want: &BTreeMap<Vec<u8>, String>, start: u32, when: &str| {
+            let mut got: Vec<(Vec<u8>, String)> = Vec::new();
+            r.scan(
+                &key(start),
+                20,
+                kv(&mut |k, v| {
+                    got.push((k.to_vec(), std::str::from_utf8(v).unwrap().to_string()));
+                }),
+            )
+            .unwrap();
+            let expect: Vec<(Vec<u8>, String)> = want
+                .range(key(start)..)
+                .take(20)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            assert_eq!(got, expect, "{case}: scan from {start} {when}");
+        };
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut round = 0u32;
+        // A commit of `n` writes: updates anywhere and new keys among the
+        // starts the scans after the switch read.
+        let mut write = |db: &mut Db,
+                         want: &mut BTreeMap<Vec<u8>, String>,
+                         next: &mut dyn FnMut() -> u64,
+                         n: u32| {
+            round += 1;
+            for i in 0..n {
+                let k = if i % 2 == 0 {
+                    key((next() % keys as u64) as u32)
+                } else {
+                    let mut k = key(2_000 + (next() % 40) as u32);
+                    k.extend_from_slice(format!("-{round}-{i}").as_bytes());
+                    k
+                };
+                db.put(&k, format!("w{round}").as_bytes());
+                want.insert(k, format!("w{round}"));
+            }
+            db.commit().unwrap();
+        };
+        // Out of core, starts uniform over 1,500 blocks in a table of 64
+        // slots: the forms given up.
+        db.zgate_set(2);
+        for i in 0..256 {
+            check(&db, &want, (next() % keys as u64) as u32, "uniform");
+            if i % 8 == 0 {
+                write(&mut db, &mut want, &mut next, 50);
+            }
+        }
+        let off = db.forms_off_counts();
+        assert_eq!(off[0], off[1] + 1, "{case}: the forms given up: {off:?}");
+        // A scan between the commits: the regime is deciding, and nothing
+        // is stale however many writes the commits make.
+        for _ in 0..6 {
+            write(&mut db, &mut want, &mut next, 50);
+            check(
+                &db,
+                &want,
+                (next() % keys as u64) as u32,
+                "off, a scan a commit",
+            );
+        }
+        // A burst's batches with no scan between them leave the reading
+        // standing, and a batch of one starts the small commits' count
+        // again: a hundred writes on either side of it are short of the
+        // line.
+        for _ in 0..3 {
+            write(&mut db, &mut want, &mut next, 300);
+        }
+        write(&mut db, &mut want, &mut next, 50);
+        write(&mut db, &mut want, &mut next, 50);
+        write(&mut db, &mut want, &mut next, 300);
+        write(&mut db, &mut want, &mut next, 50);
+        write(&mut db, &mut want, &mut next, 50);
+        assert_eq!(
+            (db.forms_off_stale_exits(), db.forms_off_counts()),
+            (0, [off[0], off[1], db.forms_off_counts()[2]]),
+            "{case}: nothing stale across scans or a burst's batches"
+        );
+        assert_eq!(db.block_cache_size().0, 0, "{case}: no form kept while off");
+        let filed = db.settle_density()[1];
+        // The third small commit in a row crosses the line.
+        write(&mut db, &mut want, &mut next, 50);
+        let now = db.forms_off_counts();
+        if stale == 0 {
+            assert_eq!(
+                (db.forms_off_stale_exits(), now[1]),
+                (0, off[1]),
+                "{case}: kept off until a scan"
+            );
+        } else {
+            assert_eq!(
+                (db.forms_off_stale_exits(), now[1]),
+                (1, off[1] + 1),
+                "{case}: taken back at the commit that crossed the line"
+            );
+        }
+        // The commits after it file their writes where the forms are back,
+        // with no scan to ask for it; inline, where the commit's own fill
+        // is the filing and the count is exact.
+        for _ in 0..3 {
+            write(&mut db, &mut want, &mut next, 50);
+        }
+        if matches!(upkeep, supdb::Upkeep::Inline) {
+            let after = db.settle_density()[1];
+            assert_eq!(
+                after > filed,
+                stale > 0,
+                "{case}: keys filed at the commits, {filed} then {after}"
+            );
+        }
+        assert_eq!(
+            db.forms_off_stale_exits(),
+            u64::from(stale > 0),
+            "{case}: once, the forms being on"
+        );
+        // And the next scan is the block path's, where it was the merge
+        // path's.
+        let merged = db.forms_off_counts()[2];
+        check(&db, &want, 2_010, "after the stretch");
+        assert_eq!(
+            db.forms_off_counts()[2] == merged,
+            stale > 0,
+            "{case}: the scan after the stretch"
+        );
+        // Every answer the model's, through the writer and a handle.
+        db.settle().unwrap();
+        let h = db.reader().unwrap();
+        for start in (0..keys).step_by(997) {
+            check(&db, &want, start, "after the settle");
+            check(&h, &want, start, "through a handle after the settle");
+        }
+    }
+}
+
 /// The writes since the store's last scan are the live tables' logs, each
 /// write counted once. A landing from the segment work publishes a new
 /// generation over the live table it leaves alone, and counted by the

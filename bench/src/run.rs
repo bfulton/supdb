@@ -675,6 +675,13 @@ fn counters_line(
             "zpage_point_part_of",
             "zpage_point_admits",
             "zpage_point_key_hits",
+            // The walks' own decodes, and of them the groups decoded only
+            // as far as the walk read, with the bytes decoded of the bytes
+            // they hold.
+            "zpage_walk_owned",
+            "zpage_walk_parts",
+            "zpage_walk_part_bytes",
+            "zpage_walk_part_of",
             "zpage_prefetches",
             "zpage_nopage_scans",
             "zpage_raw_scans",
@@ -683,6 +690,13 @@ fn counters_line(
             // the keys filed with their cut unresolved against those
             // resolved by a seek (`Db::settle_density`, `Db::lazy_cuts`).
             "settle_runs",
+            // The commits that filed nothing, by why: the forms given
+            // up, far from the scans, no room to build, nothing due
+            // (`Db::settle_refusals`).
+            "settle_off",
+            "settle_far",
+            "settle_noroom",
+            "settle_notdue",
             "settle_keys",
             "settle_blocks",
             "settle_rebuilds",
@@ -699,6 +713,10 @@ fn counters_line(
             // starts it kept (`Db::start_cache_counts`).
             "start_cache_hits",
             "start_cache_puts",
+            // The scans that started in a block scans keep starting in,
+            // and on a copy with no seek (`Db::hot_starts`).
+            "hot_starts",
+            "hot_copy_starts",
             "builds_copy",
             "builds_sparse",
             "builds_wide",
@@ -709,6 +727,13 @@ fn counters_line(
             // chains them through writes (`Options::merge_chains_writes`).
             "merge_plans",
             "merges_landed",
+            // The writer's block forms given up for the merge path and
+            // taken back, and of the times taken back, those at a commit
+            // for a reading of the scans gone stale
+            // (`Db::forms_off_counts`, `Db::forms_off_stale_exits`).
+            "forms_off_entries",
+            "forms_off_exits",
+            "forms_off_stale",
         ];
         let ev: Vec<String> = names.iter().map(|n| format!("{n} {:.0}", d(n))).collect();
         eprintln!("{tag}-events {arm} {point} {}", ev.join(" | "));

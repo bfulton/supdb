@@ -10430,6 +10430,211 @@ fn a_block_read_often_enough_under_the_form_is_held_as_a_copy_and_walked_without
     }
 }
 
+/// Under the form file a scan that starts in a block scans have started in
+/// `promote_starts` times holds the blocks it walks as merged copies in
+/// their slots, and a scan that starts in a block held so walks the copy
+/// with no seek through the form (`Options::promote_starts`): starts met
+/// once copy nothing, the window's first two scans walk the form, the third
+/// finds its start's block hot and copies what it walked, and the fourth
+/// walks no form and seeks nothing. Scans from every few keys of a range,
+/// four rounds of them, answer as the model has them through whatever mix
+/// of copies and forms they meet, and a write into a copied block is
+/// spliced into the copy. With the option off the form is walked every
+/// time: the positive control.
+#[test]
+fn a_block_scans_keep_starting_in_is_held_as_a_copy_under_the_form() {
+    // On; off; and on with a budget no copy fits under, where a hot scan
+    // copies nothing.
+    for (starts, budget) in [(3u32, 0usize), (0, 0), (3, 1)] {
+        let on = starts > 0 && budget == 0;
+        let dir = scratch(match (starts, budget) {
+            (0, _) => "promote-starts-off",
+            (_, 0) => "promote-starts",
+            _ => "promote-starts-no-room",
+        });
+        let mut db = Db::create(
+            &dir,
+            forced(|o| {
+                o.partition_bytes = Some(160 << 10);
+                o.scan_block_cache = true;
+                o.promote_starts = starts;
+                if budget > 0 {
+                    o.scan_cache_bytes = budget;
+                }
+            }),
+        )
+        .unwrap();
+        let mut model = ordered_load(&mut db, 5000, 0x9A2);
+        db.zpages_settle().unwrap();
+        db.settle().unwrap();
+        assert!(db.zpage_counts().form_files >= 3);
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        // Starts met once each, none of them in the window's first block.
+        for i in 0..12 {
+            let k = &keys[100 + i * 331];
+            same_window(
+                &scanned(&r, k, 40),
+                &window(&model, k, 40),
+                &format!("a start met once, {i}"),
+            );
+        }
+        assert_eq!(r.form_choices()[0], 0, "a start met once copies nothing");
+        assert_eq!(r.hot_start_counts(), [0, 0]);
+        let start = keys[1003].clone();
+        let want = window(&model, &start, 100);
+        for i in 0..2 {
+            same_window(&scanned(&r, &start, 100), &want, &format!("scan {i}"));
+        }
+        assert_eq!(r.form_choices()[0], 0, "two starts in a block copy nothing");
+        same_window(&scanned(&r, &start, 100), &want, "the third scan");
+        let promoted = r.form_choices()[0];
+        let (walks, hot) = (db.zpage_counts().scans, r.hot_start_counts());
+        same_window(&scanned(&r, &start, 100), &want, "over the copies");
+        let walked = db.zpage_counts().scans - walks;
+        let after = r.hot_start_counts();
+        if on {
+            assert!(
+                promoted >= 2,
+                "the blocks the third scan walked: {promoted}"
+            );
+            assert_eq!(hot, [1, 0], "the third scan hot, none started on a copy");
+            assert_eq!(walked, 0, "a scan over the copies walks no form");
+            assert_eq!(after, [2, 1], "the fourth started on the copy, unsought");
+        } else {
+            assert_eq!(promoted, 0, "nothing copied with the option off");
+            assert!(walked >= 1, "the form walked every time: {walked}");
+            assert_eq!(after, [0, 0]);
+        }
+        // A start that is a block's first key ties the sample that would
+        // name its block -- the store's first key ties the first -- and is
+        // counted by its seek's answer: its scans go hot and copy their
+        // blocks all the same, each after a seek, none started on a copy.
+        let tie = keys[0].clone();
+        let twant = window(&model, &tie, 100);
+        let (h0, p0) = (r.hot_start_counts(), r.form_choices()[0]);
+        for i in 0..3 {
+            same_window(&scanned(&r, &tie, 100), &twant, &format!("tied scan {i}"));
+        }
+        let twalks = db.zpage_counts().scans;
+        same_window(&scanned(&r, &tie, 100), &twant, "tied, over the copies");
+        let (h1, p1) = (r.hot_start_counts(), r.form_choices()[0]);
+        if on {
+            assert_eq!(
+                (h1[0] - h0[0], h1[1] - h0[1]),
+                (2, 0),
+                "the tied start's third and fourth scans hot, each sought"
+            );
+            assert!(p1 - p0 >= 2, "the tied start's blocks copied: {}", p1 - p0);
+            assert_eq!(db.zpage_counts().scans, twalks, "and walked as copies");
+        } else {
+            assert_eq!((h1, p1), (h0, p0));
+        }
+        // The writer's own scans, over a drained partition: its first two
+        // take the one walk from the seek, the third goes through the
+        // blocks and copies them, the fourth starts on the copy.
+        let wstart = keys[3003].clone();
+        let wwant = window(&model, &wstart, 100);
+        for i in 0..4 {
+            same_window(
+                &scanned(&db, &wstart, 100),
+                &wwant,
+                &format!("the writer's scan {i}"),
+            );
+        }
+        if on {
+            assert_eq!(db.hot_starts(), [2, 1], "the writer's third and fourth");
+            assert!(
+                db.build_kinds().0[0] >= 2,
+                "the writer's copies: {:?}",
+                db.build_kinds()
+            );
+        } else {
+            assert_eq!(db.hot_starts(), [0, 0]);
+            assert_eq!(db.build_kinds().0[0], 0, "{:?}", db.build_kinds());
+        }
+        // A block the starts pass over at the partition's mean rate never
+        // goes hot: three starts in one block with a window of starts in
+        // the partition's other blocks after each -- the counts halved
+        // between them -- copy nothing, where three with nothing between
+        // them do.
+        if on {
+            let (h0, p0) = (r.hot_start_counts(), r.form_choices()[0]);
+            for round in 0..3 {
+                for j in [1usize, 0].into_iter().chain(2..16) {
+                    let k = &keys[4000 + 64 * j + 6];
+                    same_window(
+                        &scanned(&r, k, 10),
+                        &window(&model, k, 10),
+                        &format!("round {round}, block {j}"),
+                    );
+                }
+            }
+            assert_eq!(
+                (r.hot_start_counts(), r.form_choices()[0]),
+                (h0, p0),
+                "three starts a window apart are no rate"
+            );
+            let k = &keys[4000 + 64 + 6];
+            for i in 0..3 {
+                same_window(
+                    &scanned(&r, k, 10),
+                    &window(&model, k, 10),
+                    &format!("together, {i}"),
+                );
+            }
+            assert_eq!(
+                r.hot_start_counts()[0] - h0[0],
+                1,
+                "three with no window between them are"
+            );
+        }
+        // Scans from every few keys of a range, each four times: starts
+        // that tie a block's first key and name no block, starts inside
+        // blocks gone hot, windows over copies and forms mixed.
+        for round in 0..4 {
+            for k in keys[2000..2400].iter().step_by(7) {
+                same_window(
+                    &scanned(&r, k, 30),
+                    &window(&model, k, 30),
+                    &format!("round {round}"),
+                );
+            }
+        }
+        if on {
+            let c = r.hot_start_counts();
+            assert!(
+                c[0] > 100 && c[1] > 100,
+                "the range's blocks gone hot and walked as copies: {c:?}"
+            );
+        }
+        // A write into a copied block, and one that creates a key inside
+        // it: spliced into the copy by the settle, answered by the next
+        // scan, the handle's and the writer's.
+        db.append(&keys[1010], b"appended");
+        model
+            .get_mut(&keys[1010])
+            .unwrap()
+            .push(b"appended".to_vec());
+        let new = [keys[1020].as_slice(), b"+"].concat();
+        db.append(&new, b"created");
+        model.insert(new, vec![b"created".to_vec()]);
+        db.commit().unwrap();
+        same_window(
+            &scanned(&r, &start, 100),
+            &window(&model, &start, 100),
+            "after writes into a copied block",
+        );
+        same_window(
+            &scanned(&db, &start, 100),
+            &window(&model, &start, 100),
+            "the writer, after writes into a copied block",
+        );
+        drop(r);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// The bytes of the files under `dir` whose names start with `prefix` that
 /// the page cache holds: `mincore` over a read-only mapping of each, which
 /// faults nothing in, so the kernel's answer and not the store's record of
@@ -12969,6 +13174,156 @@ fn a_scans_first_touch_of_a_group_is_its_own_decode_and_its_second_the_memos() {
             third.0 == 0 && third.1 == 0 && third.3 + 3 >= first.0,
             "{what}: the third scan read out of the memo: {third:?} after {first:?}"
         );
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A walk's own decode of a group it does not read to the end goes only as
+/// far as the walk reads (`Options::zpages_walk_part`): scans of many
+/// lengths from starts spread over the store come back as the model has
+/// them with the option and without; with it the groups begun in part are
+/// counted among the walks' own and their bytes come short of the groups',
+/// and without it none is. The lowest keys are written first so the
+/// partition does not take the bulk walk. Then the same over a stretch
+/// dense with unsealed keys, where a scan's entries come from the
+/// memtable as well and its walk of a block is cut into runs at each of
+/// them: the reader tells the cursor what the scan has left at every block
+/// and after every run, so the scan's last group is still the one begun in
+/// part where a run opens it, and a count taken once at the scan's start,
+/// or once a block, wants that group whole.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_scans_last_group_is_decoded_only_as_far_as_the_scan_reads() {
+    for on in [true, false] {
+        let what = format!("walk part {on}");
+        let (dir, mut db, model, _inject, r, keys, _at) =
+            compact_store_with(&format!("walk-part-{on}"), 1 << 20, |o| {
+                o.zpages_walk_part = on;
+                o.commit_forms = false;
+            });
+        drop(r);
+        for k in &keys[..3] {
+            db.append(k, &model[k][0]);
+        }
+        db.commit().unwrap();
+        let lens = [1usize, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233];
+        let scans = 60usize;
+        assert!(keys.len() > 1000, "{what}: keys enough: {}", keys.len());
+        let before = db.zpage_counts();
+        for i in 0..scans {
+            let want = lens[i % lens.len()];
+            let start = 64 + i * (keys.len() - 400) / scans;
+            let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
+                .iter()
+                .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
+                .collect();
+            let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let n = db
+                .scan(&keys[start], want, |k, v| {
+                    got.push((k.to_vec(), v.to_vec()))
+                })
+                .unwrap();
+            assert_eq!(n, want, "{what}, scan {i}: the scan's entries");
+            assert_eq!(
+                got, expect,
+                "{what}, scan {i}: the entries as the model has them"
+            );
+        }
+        let c = db.zpage_counts();
+        let (parts, bytes, of, owned) = (
+            c.walk_parts - before.walk_parts,
+            c.walk_part_bytes - before.walk_part_bytes,
+            c.walk_part_of - before.walk_part_of,
+            c.walk_owned - before.walk_owned,
+        );
+        if on {
+            // A scan begins one group in part at most, its last: its runs
+            // tell the cursor what the scan has ahead of them.
+            assert!(
+                parts as usize >= scans / 6 && parts as usize <= scans && parts <= owned,
+                "{what}: groups begun in part: {parts} of {owned} the walks' own, over {scans} scans"
+            );
+            assert!(
+                bytes * 100 < of * 85,
+                "{what}: {bytes} of {of} bytes decoded of the groups begun in part"
+            );
+        } else {
+            assert_eq!((parts, bytes, of), (0, 0, 0), "{what}");
+            assert!(owned > 0, "{what}: the walks' own decodes, each whole");
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        // A stretch with an unsealed value at every fifth key, its blocks'
+        // forms built at the write by the commit's fill, and the scans a
+        // handle's, whose memo holds none of the groups the fill decoded:
+        // a scan of forty keys takes eight entries more than its keys from
+        // the memtable and walks each block in runs between them.
+        let (dir, mut db, mut model, inject, r, keys, _at) =
+            compact_store_with(&format!("walk-part-dense-{on}"), 1 << 20, |o| {
+                o.zpages_walk_part = on;
+                o.upkeep = supdb::Upkeep::Inline;
+            });
+        drop(r);
+        inject.set_refault_rate(0.0);
+        inject.set_budget(1 << 50);
+        db.scan(&keys[0], 1, |_k, _v| {}).unwrap();
+        let lo = keys.len() / 2;
+        for (j, k) in keys[lo..lo + 700].iter().enumerate() {
+            if j % 5 == 2 {
+                db.append(k, b"more");
+                model.get_mut(k).unwrap().push(b"more".to_vec());
+            }
+        }
+        db.commit().unwrap();
+        assert!(
+            db.settle_built() > 0,
+            "{what}: the commit's fill built the stretch's forms"
+        );
+        let h = db.reader().unwrap();
+        let dense = 12usize;
+        let before = db.zpage_counts();
+        for i in 0..dense {
+            let (start, want) = (lo + 3 + i * 50, 40);
+            let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
+                .iter()
+                .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
+                .collect();
+            let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            h.scan(&keys[start], want, |k, v| {
+                got.push((k.to_vec(), v.to_vec()))
+            })
+            .unwrap();
+            assert_eq!(
+                got, expect,
+                "{what}, dense scan {i}: the entries as the model has them"
+            );
+        }
+        let c = db.zpage_counts();
+        let (parts, bytes, of) = (
+            c.walk_parts - before.walk_parts,
+            c.walk_part_bytes - before.walk_part_bytes,
+            c.walk_part_of - before.walk_part_of,
+        );
+        if on {
+            // Where a run of the scan's last block opens the last group:
+            // a third of these scans, the rest opening it under the step
+            // past an unsealed key's own record, which is told no count
+            // and decodes whole. A count not taken down by the entries
+            // the memtable gave, or by the runs before in the block, wants
+            // the group whole in every one of them.
+            assert!(
+                parts as usize >= dense / 4 && parts as usize <= dense,
+                "{what}: groups begun in part over the dense stretch: {parts} over {dense} scans"
+            );
+            assert!(
+                bytes * 100 < of * 85,
+                "{what}: {bytes} of {of} bytes decoded of them"
+            );
+        } else {
+            assert_eq!((parts, bytes, of), (0, 0, 0), "{what}, the dense stretch");
+        }
+        drop(h);
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

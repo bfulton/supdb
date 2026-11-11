@@ -32,11 +32,11 @@
 
 use super::zpages::{
     bind32, check_coded_group, check_entry, check_group, cmp_coded_key, coded_first, coded_header,
-    coded_key_into, coded_rec, decode_group_with, decode_record, fill_page, filter_bytes,
-    group_seek, page_view, parse_page, record_group_seek, seek_group_partly, verify_page_with,
-    view_trusted, walk_group, FenceEntry, FenceSearch, Fill, FillScratch, FillStats, GroupBuf,
-    Images, NoPage, PageView, SegImages, Trailer, ZError, ZFence, ZCODING_BLOCK, ZGROUP_BYTES,
-    ZMAX_GROUPS, ZNOPAGE, ZPAGE, ZTRAILER,
+    coded_key_into, coded_rec, decode_group_more, decode_group_with, decode_record, fill_page,
+    filter_bytes, group_seek, open_group_partly, page_view, parse_page, record_group_seek,
+    seek_group_partly, verify_page_with, view_trusted, walk_group, FenceEntry, FenceSearch, Fill,
+    FillScratch, FillStats, GroupBuf, Images, NoPage, PageView, PartGroup, SegImages, Trailer,
+    ZError, ZFence, PART_STEP, ZCODING_BLOCK, ZGROUP_BYTES, ZMAX_GROUPS, ZNOPAGE, ZPAGE, ZTRAILER,
 };
 use crate::blob::{Blob, BlobOptions, ZSource};
 use crate::bytes::{Bytes, MmapBytes};
@@ -426,6 +426,19 @@ pub(super) struct ZCursor<'a> {
     /// (`skip_to`); a walk or a step from the position ends the claim.
     last: Vec<u8>,
     last_ok: bool,
+    /// The group in `buf` is decoded only so far (`ZMemo::walk_part`): what
+    /// its decoder goes on from, and `Group::Buf` the length decoded. `None`
+    /// for a group held whole, which every group is but a walk's own decode
+    /// of one it wanted less than the whole of.
+    part: Option<PartGroup<'a>>,
+    /// The records the walk in progress wants of a group it opens;
+    /// `usize::MAX` outside a walk, where a group is opened whole.
+    want: usize,
+    /// The records the reader expects to read from this cursor after the
+    /// run in progress (`walk_run_ahead`): counted into what a group is
+    /// wanted for, so that a run cut at a block's edge or at an unsealed
+    /// key does not open in part a group the scan goes on through.
+    ahead: usize,
 }
 
 impl<'a> ZCursor<'a> {
@@ -460,6 +473,9 @@ impl<'a> ZCursor<'a> {
             fell: false,
             last: Vec::new(),
             last_ok: false,
+            part: None,
+            want: usize::MAX,
+            ahead: 0,
         }
     }
 
@@ -473,6 +489,28 @@ impl<'a> ZCursor<'a> {
         let mut c = ZCursor::new(memo, zfile, raw);
         c.rank = rank;
         c.load();
+        c
+    }
+
+    /// `at`, for a reader that will walk `want` records from the rank and
+    /// may read no further: the group the rank falls in is opened as a
+    /// walk's is, decoded only as far as the rank and those records where
+    /// that is short of the group (`ZMemo::walk_part`). A run of a few
+    /// records placed in the middle of a group -- a scan's last, in a
+    /// block walked after one that was not walked through the form -- was
+    /// a group decoded whole for them.
+    pub(super) fn at_wanting(
+        memo: &'a ZMemo,
+        zfile: &'a ZFile,
+        raw: &'a Blob<MmapBytes>,
+        rank: usize,
+        want: usize,
+    ) -> ZCursor<'a> {
+        let mut c = ZCursor::new(memo, zfile, raw);
+        c.rank = rank;
+        c.want = want;
+        c.load();
+        c.want = usize::MAX;
         c
     }
 
@@ -577,6 +615,7 @@ impl<'a> ZCursor<'a> {
     /// The walk from here to the partition's end is the raw form's.
     fn fall(&mut self) {
         self.fell = true;
+        self.part = None;
         self.group = Group::Raw;
         self.end = self.zfile.nkeys;
         self.page_end = self.zfile.nkeys;
@@ -588,6 +627,7 @@ impl<'a> ZCursor<'a> {
     /// `false` where it could not be, the cursor fallen.
     fn open_at(&mut self, entry: &FenceEntry<'_>, j: usize) -> bool {
         let first = entry.first_rank as usize;
+        self.part = None;
         // Whether a decode goes into the memo: not for the walk's next
         // group under `ZFile::walk_owns` (`owns_next`, set by `next_group`
         // for this one open).
@@ -651,6 +691,11 @@ impl<'a> ZCursor<'a> {
                             .page_bytes(self.page)
                             .and_then(|page| self.zfile.view(self.page, page).ok());
                         self.views += 1;
+                    }
+                    if !memoise {
+                        if let Some(opened) = self.open_part(entry, j, first) {
+                            return opened;
+                        }
                     }
                     self.zfile.open_group_with(
                         self.memo,
@@ -722,6 +767,110 @@ impl<'a> ZCursor<'a> {
             self.ask_group_ahead(j);
         }
         true
+    }
+
+    /// The walk's own decode of group `j`, of which it wants fewer records
+    /// than the group holds, begun and taken only as far as their share of
+    /// the group's bytes and a record more (`ZMemo::walk_part`,
+    /// `zpages::open_group_partly`); the walk decodes on where a record it
+    /// reaches is not there yet (`more`). `None` where this open is not
+    /// one for it, and the caller opens the group whole: the option off,
+    /// the walk wanting the whole group or not a walk at all, a page not
+    /// yet verified, a group stored or record-coded or held by the memo, or
+    /// the other decoder in use. `Some(false)` for a payload that does not
+    /// decode, the page failed and the cursor fallen.
+    fn open_part(&mut self, entry: &FenceEntry<'_>, j: usize, first: usize) -> Option<bool> {
+        if !self.memo.walk_part
+            || self.want == usize::MAX
+            || !self.zfile.own_decoder
+            || !bit(&self.zfile.verified, self.page)
+        {
+            return None;
+        }
+        let view = self.pview.as_ref()?;
+        let g = view.group(j)?;
+        let (gfirst, count, ulen) = (usize::from(g.first), usize::from(g.count), g.ulen as usize);
+        if g.stored || g.coded {
+            return None;
+        }
+        // The records of the group the walk reads: the ones before the
+        // position, which a sequential decoder decodes on its way, and the
+        // ones the walk wants from it.
+        let gstart = first.saturating_add(gfirst).min(self.zfile.nkeys);
+        let reads = self.rank.saturating_sub(gstart).saturating_add(self.want);
+        if reads >= count {
+            return None;
+        }
+        // A group the memo holds is the memo's to hand over: asked already
+        // where the memo is asked first (`ZFile::memo_first_hit`).
+        if self.zfile.memo && !self.zfile.memo_first {
+            if let Ok(index) = u8::try_from(j) {
+                let (id, hashed) = (self.zfile.id, self.zfile.memo_hashed);
+                if self.memo.holds(id, entry.page, index, hashed) {
+                    return None;
+                }
+            }
+        }
+        let stop = (reads + 1).saturating_mul(ulen) / count;
+        let tick = self.zfile.decode_tick();
+        match open_group_partly(view, j, &mut self.buf, stop) {
+            Ok(Some(part)) => {
+                self.zfile.count_decode(tick);
+                if self.zfile.memo {
+                    self.memo.count_owned();
+                }
+                self.memo.count_walk_part(part.have(), part.ulen());
+                self.gstart = gstart;
+                self.end = self.gstart.saturating_add(count).min(self.page_end);
+                self.decoded += 1;
+                self.group = Group::Buf(part.have());
+                self.part = (!part.done()).then_some(part);
+                if self.zfile.group_ahead {
+                    self.ask_group_ahead(j);
+                }
+                Some(true)
+            }
+            Ok(None) => None,
+            Err(_) => {
+                self.zfile.fail(self.page);
+                self.fall();
+                Some(false)
+            }
+        }
+    }
+
+    /// The cursor's group, decoded in part, decoded on to `stop` bytes or
+    /// its end: true where it went on. False for a group held whole
+    /// already, and for a payload that does not decode on, which leaves the
+    /// group as far as it was decoded and no longer in part, so that the
+    /// record its reader wanted fails its parse and is the damage it is.
+    fn more(&mut self, stop: usize) -> bool {
+        let Some(part) = self.part.as_mut() else {
+            return false;
+        };
+        let before = part.have();
+        match decode_group_more(part, &mut self.buf, stop) {
+            Ok(n) => {
+                let done = part.done();
+                self.memo.count_walk_more(n - before);
+                self.group = Group::Buf(n);
+                if done {
+                    self.part = None;
+                }
+                true
+            }
+            Err(_) => {
+                self.part = None;
+                false
+            }
+        }
+    }
+
+    /// The cursor's group decoded to its end where it was decoded in part:
+    /// for the readers that walk a group by its bytes and not a run of
+    /// records at a time.
+    fn whole(&mut self) {
+        while self.part.is_some() && self.more(usize::MAX) {}
     }
 
     /// The lines of the group the walk reaches after group `j` asked for
@@ -834,6 +983,14 @@ impl<'a> ZCursor<'a> {
             self.next = self.off + 1;
             return;
         }
+        // A group decoded in part is decoded on until the record under the
+        // position lies whole in it, a step at a time, as the point read's
+        // partial seek goes on.
+        while self.part.is_some() && record_key_next(self.group(), self.off).is_none() {
+            if !self.more(self.off + PART_STEP) {
+                break;
+            }
+        }
         let Some((k, next)) = record_key_next(self.group(), self.off) else {
             self.zfile.fail(self.page);
             self.fall();
@@ -848,6 +1005,7 @@ impl<'a> ZCursor<'a> {
     /// and the walk to its record.
     fn load(&mut self) {
         self.off = 0;
+        self.part = None;
         if self.rank >= self.zfile.nkeys {
             self.group = Group::None;
             self.end = self.zfile.nkeys;
@@ -883,6 +1041,13 @@ impl<'a> ZCursor<'a> {
             return;
         }
         for _ in self.gstart..self.rank {
+            // A group decoded in part is decoded on where the record to
+            // step over does not lie whole in it yet.
+            while self.part.is_some() && record_key_next(self.group(), self.off).is_none() {
+                if !self.more(self.off + PART_STEP) {
+                    break;
+                }
+            }
             let Some((_, next)) = record_key_next(self.group(), self.off) else {
                 self.zfile.fail(self.page);
                 self.fall();
@@ -1017,16 +1182,46 @@ impl<'a> ZCursor<'a> {
     /// resumes it (they assert so under the checked profile); `rank` is
     /// right either way. The overlay walk keeps `walk_until`, whose caller
     /// reads the key under the cursor after a walk.
-    pub(super) fn walk_run<F: FnMut(&[u8], &[u8])>(
+    ///
+    /// The reader expects to read `ahead` records more from this cursor
+    /// after the run: a scan's runs end at a block's edge or at an
+    /// unsealed key with the scan's limit still ahead. A group the run
+    /// ends in is decoded as far as the run and those records reach, which
+    /// for every group but the scan's last is the whole of it, in one call
+    /// (`Options::zpages_walk_part`). The first shape wanted the run alone,
+    /// and a scan's groups were begun in part at every such cut and taken
+    /// on at the next run: 1.2 groups a scan begun in part in the scrambled
+    /// E mix at ten million keys, at three quarters of their bytes.
+    pub(super) fn walk_run_ahead<F: FnMut(&[u8], &[u8])>(
+        &mut self,
+        until: Option<&[u8]>,
+        limit: usize,
+        ahead: usize,
+        f: &mut F,
+    ) -> Result<(usize, KeyOrder)> {
+        self.ahead = ahead;
+        let walked = self.walk_impl(until, limit, f, true);
+        self.ahead = 0;
+        walked
+    }
+
+    fn walk_impl<F: FnMut(&[u8], &[u8])>(
         &mut self,
         until: Option<&[u8]>,
         limit: usize,
         f: &mut F,
+        lazy_end: bool,
     ) -> Result<(usize, KeyOrder)> {
-        self.walk_impl(until, limit, f, true)
+        // What the walk wants of a group it opens is what is left of its
+        // limit, set before every open it makes; outside a walk an open
+        // wants the whole group.
+        self.want = limit.saturating_add(self.ahead);
+        let walked = self.walk_inner(until, limit, f, lazy_end);
+        self.want = usize::MAX;
+        walked
     }
 
-    fn walk_impl<F: FnMut(&[u8], &[u8])>(
+    fn walk_inner<F: FnMut(&[u8], &[u8])>(
         &mut self,
         until: Option<&[u8]>,
         limit: usize,
@@ -1037,6 +1232,7 @@ impl<'a> ZCursor<'a> {
         self.resume();
         let mut n = 0usize;
         while n < limit {
+            self.want = (limit - n).saturating_add(self.ahead);
             if matches!(self.group, Group::None) {
                 return Ok((n, KeyOrder::Greater));
             }
@@ -1113,6 +1309,7 @@ impl<'a> ZCursor<'a> {
                         self.off = i;
                         return Ok((n, KeyOrder::Greater));
                     }
+                    self.want = (limit - n).saturating_add(self.ahead);
                     self.next_group();
                     continue;
                 }
@@ -1128,6 +1325,10 @@ impl<'a> ZCursor<'a> {
             let (mut off, mut rank, end) = (self.off, self.rank, self.end);
             let mut stop: Option<KeyOrder> = None;
             let mut damaged = false;
+            // A group decoded in part: a record that does not parse is one
+            // the decode has not reached, and the group is decoded on.
+            let partial = self.part.is_some();
+            let mut short = false;
             {
                 let group = self.group();
                 while n < limit && rank < end {
@@ -1150,7 +1351,11 @@ impl<'a> ZCursor<'a> {
                         continue;
                     }
                     let Some((k, exts, tail, len)) = parse_record(group, off) else {
-                        damaged = true;
+                        if partial {
+                            short = true;
+                        } else {
+                            damaged = true;
+                        }
                         break;
                     };
                     if let Some(u) = until {
@@ -1169,6 +1374,26 @@ impl<'a> ZCursor<'a> {
                 }
             }
             self.rank = rank;
+            if short {
+                // The records decoded are walked. The group is decoded on by
+                // the share of its bytes the records still wanted of it
+                // take, and a record more, or to its end where the walk
+                // wants the rest; and walked from where it stands.
+                self.off = off;
+                let (left, wanted) = (end - rank, (limit - n).saturating_add(self.ahead));
+                let to = match &self.part {
+                    Some(part) if wanted < left => {
+                        let count = (self.end - self.gstart).max(1);
+                        let share = (wanted + 1).saturating_mul(part.ulen()) / count;
+                        // A step at the least, where the records left are
+                        // longer than the group's mean.
+                        (off + share).max(part.have() + PART_STEP)
+                    }
+                    _ => usize::MAX,
+                };
+                self.more(to);
+                continue;
+            }
             if damaged {
                 // A record that does not parse in a group the checks let
                 // through is damage: the page out of service, and the rest
@@ -1179,12 +1404,13 @@ impl<'a> ZCursor<'a> {
             }
             if rank >= end {
                 if lazy_end && n >= limit {
-                    // `walk_run`'s end: the run ended at the group's last
+                    // `walk_run_ahead`'s end: the run ended at the group's last
                     // record, and the next group is the next read's to
                     // open (`resume`).
                     self.off = off;
                     return Ok((n, KeyOrder::Greater));
                 }
+                self.want = (limit - n).saturating_add(self.ahead);
                 self.next_group();
                 continue;
             }
@@ -1309,6 +1535,7 @@ impl<'a> ZCursor<'a> {
     /// not parse is damage, the page out of service and the cursor fallen,
     /// which the caller reads before the answer.
     fn advance_until(&mut self, until: &[u8]) -> KeyOrder {
+        self.whole();
         loop {
             match self.group {
                 Group::None => return KeyOrder::Greater,
@@ -1753,6 +1980,15 @@ pub(super) struct PointCounts {
     /// the memo would have taken (`Options::zpages_scan_admit`,
     /// `Options::zpages_walk_owns_decodes`).
     pub(super) owned: u64,
+    /// Of those, groups a walk decoded only as far as it read
+    /// (`Options::zpages_walk_part`), the bytes those decodes wrote, and
+    /// the bytes the groups hold.
+    pub(super) walk_parts: u64,
+    pub(super) walk_part_bytes: u64,
+    pub(super) walk_part_of: u64,
+    /// The times a group begun in part was decoded further: none where the
+    /// first stop covered what the walk went on to read.
+    pub(super) walk_mores: u64,
 }
 
 /// The slots of the tags of groups decoded in part (`Memo::admit`): sixty-
@@ -2073,6 +2309,9 @@ pub(super) struct ZMemo {
     /// buffer and the memo takes it at its second
     /// (`Options::zpages_scan_admit`).
     scan_admit: bool,
+    /// A walk's own decode of a group it wants less than the whole of goes
+    /// only as far as the walk reads (`Options::zpages_walk_part`).
+    walk_part: bool,
 }
 
 impl ZMemo {
@@ -2099,13 +2338,15 @@ impl ZMemo {
             point_part: false,
             point_keys: false,
             scan_admit: false,
+            walk_part: false,
         }
     }
 
     /// The memo with a walk's admission set (`Options::zpages_scan_admit`),
     /// as `point` sets the point reads' options.
-    pub(super) fn scans(mut self, admit: bool) -> ZMemo {
+    pub(super) fn scans(mut self, admit: bool, part: bool) -> ZMemo {
         self.scan_admit = admit;
+        self.walk_part = part;
         self
     }
 
@@ -2147,6 +2388,21 @@ impl ZMemo {
 
     fn count_owned(&self) {
         self.memo.borrow_mut().point.owned += 1;
+    }
+
+    /// A walk's group begun in part: `len` of its `of` bytes decoded.
+    fn count_walk_part(&self, len: usize, of: usize) {
+        let mut m = self.memo.borrow_mut();
+        m.point.walk_parts += 1;
+        m.point.walk_part_bytes += len as u64;
+        m.point.walk_part_of += of as u64;
+    }
+
+    /// `len` bytes more of a group begun in part decoded.
+    fn count_walk_more(&self, len: usize) {
+        let mut m = self.memo.borrow_mut();
+        m.point.walk_part_bytes += len as u64;
+        m.point.walk_mores += 1;
     }
 
     fn count_part(&self, len: usize, of: usize) {
@@ -6635,7 +6891,7 @@ mod tests {
     }
 
     /// A block reader's walk whose limit falls at a group's last record
-    /// (`walk_run`) opens the next group for nobody: the memo is asked for
+    /// (`walk_run_ahead`) opens the next group for nobody: the memo is asked for
     /// the group the walk opened and no other until the next read from the
     /// position -- a run, a step or a key sought -- which opens it then and
     /// stands where the walk left off; the overlay walk's `walk_until`
@@ -6651,7 +6907,9 @@ mod tests {
         let mut cur = ZCursor::at(&fx.memo, &zfile, &fx.blob, 0);
         let mut seen = Vec::new();
         let (n, at) = cur
-            .walk_run(None, count, &mut |k: &[u8], _: &[u8]| seen.push(k.to_vec()))
+            .walk_run_ahead(None, count, 0, &mut |k: &[u8], _: &[u8]| {
+                seen.push(k.to_vec())
+            })
             .unwrap();
         assert_eq!((n, at), (count, KeyOrder::Greater));
         assert_eq!(seen.len(), count);
@@ -6664,7 +6922,7 @@ mod tests {
         assert_eq!(hits + misses, 1, "the one group the walk opened");
         // The next read opens it and goes on from there.
         let (n, _) = cur
-            .walk_run(None, 1, &mut |k: &[u8], _: &[u8]| seen.push(k.to_vec()))
+            .walk_run_ahead(None, 1, 0, &mut |k: &[u8], _: &[u8]| seen.push(k.to_vec()))
             .unwrap();
         assert_eq!(n, 1);
         assert_eq!(
@@ -6675,14 +6933,14 @@ mod tests {
         assert_eq!(hits + misses, 1, "the next group, opened once");
         // A step from a spent group is a step into the next.
         let mut cur = ZCursor::at(&fx.memo, &zfile, &fx.blob, 0);
-        cur.walk_run(None, count, &mut |_: &[u8], _: &[u8]| {})
+        cur.walk_run_ahead(None, count, 0, &mut |_: &[u8], _: &[u8]| {})
             .unwrap();
         cur.advance();
         assert_eq!(cur.rank(), count + 1);
         assert_eq!(cur.key(), Some(fx.recs[count + 1].0.as_slice()));
         // And a key sought from one is sought from the next group's first.
         let mut cur = ZCursor::at(&fx.memo, &zfile, &fx.blob, 0);
-        cur.walk_run(None, count, &mut |_: &[u8], _: &[u8]| {})
+        cur.walk_run_ahead(None, count, 0, &mut |_: &[u8], _: &[u8]| {})
             .unwrap();
         assert_eq!(cur.skip_to(&fx.recs[count].0), Some(KeyOrder::Equal));
         assert_eq!(cur.rank(), count);
@@ -7204,7 +7462,7 @@ mod tests {
             assert_eq!(n, keys.len());
             assert!(seen == keys, "every key in order");
         };
-        let memo = ZMemo::new().scans(true);
+        let memo = ZMemo::new().scans(true, false);
         // The first walk: every page's first decode and every group after
         // it, into the cursor's buffer; nothing put.
         walk(&memo);
@@ -7249,6 +7507,453 @@ mod tests {
             PointCounts::default(),
             "none the walk's own"
         );
+    }
+
+    /// One read of a form file as a block's reader makes it, for the test
+    /// below: a cursor placed at `start`, a run of `limit`, and then the
+    /// position read every way -- its rank, the key and the values under
+    /// it, a short run more, a step, and a key sought a few records on.
+    /// What was read, the ranks it stood at, and the memo's counts as the
+    /// first run left them.
+    #[allow(clippy::type_complexity)]
+    fn read_every_way(
+        memo: &ZMemo,
+        zfile: &ZFile,
+        blob: &Blob<MmapBytes>,
+        recs: &[Rec],
+        start: usize,
+        limit: usize,
+        run: bool,
+    ) -> (Vec<(Vec<u8>, Vec<u8>)>, Vec<usize>, PointCounts) {
+        let mut seen: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut marks = Vec::new();
+        let mut cur = ZCursor::at_wanting(memo, zfile, blob, start, limit);
+        let (got, _) = {
+            let mut f = |k: &[u8], v: &[u8]| seen.push((k.to_vec(), v.to_vec()));
+            if run {
+                cur.walk_run_ahead(None, limit, 0, &mut f).unwrap()
+            } else {
+                cur.walk_until(None, limit, &mut f).unwrap()
+            }
+        };
+        let counts = memo.take_point();
+        marks.extend([got, cur.rank()]);
+        cur.resume();
+        if let Some(k) = cur.key().map(|k| k.to_vec()) {
+            let mut vals = Vec::new();
+            cur.values(&mut |v: &[u8]| vals.extend_from_slice(v))
+                .unwrap();
+            seen.push((k, vals));
+        }
+        let (more, _) = cur
+            .walk_run_ahead(None, 3, 0, &mut |k: &[u8], v: &[u8]| {
+                seen.push((k.to_vec(), v.to_vec()))
+            })
+            .unwrap();
+        marks.extend([more, cur.rank()]);
+        cur.advance();
+        marks.push(cur.rank());
+        if let Some(k) = cur.key() {
+            seen.push((k.to_vec(), Vec::new()));
+        }
+        let target = (cur.rank() + 5).min(recs.len() - 1);
+        let at = cur.skip_to(&recs[target].0);
+        marks.extend([
+            cur.rank(),
+            match at {
+                Some(KeyOrder::Equal) => 1,
+                Some(_) => 2,
+                None => 0,
+            },
+        ]);
+        assert!(!cur.fell_back(), "start {start} limit {limit}");
+        (seen, marks, counts)
+    }
+
+    /// A walk's partial decode (`Options::zpages_walk_part`): a walk that
+    /// wants fewer records of a group than it holds begins the group's
+    /// decode and takes it only as far as it reads, and every read after --
+    /// another run, a step, the key and the values under the position, a
+    /// key sought -- finds what a whole decode finds. From starts over the
+    /// whole file and limits from one record to several groups, by either
+    /// walk, the read in part hands over what the whole one hands over and
+    /// stands where it stands; the groups begun in part are decoded short
+    /// of their length, the ones walked to their ends whole; and off --
+    /// the memo's flag, a walk with no decode of its own, or the other
+    /// decoder -- nothing is decoded in part.
+    #[test]
+    fn a_walk_decodes_a_group_it_does_not_finish_only_as_far_as_it_reads() {
+        let fx = Fixture::new("walk-part", suite(1200, 43), 256);
+        let mut zfile = fx.zfile();
+        // As the store sets them: the engine's own decoder, and the page's
+        // view held across its groups, which the partial open reads.
+        zfile.own_decoder = true;
+        zfile.cursor_view = true;
+        let n = fx.recs.len();
+        // Every page verified first, through a memo of its own: the partial
+        // decode is for a page this process has verified.
+        {
+            let warm = ZMemo::new();
+            let mut cur = ZCursor::at(&warm, &zfile, &fx.blob, 0);
+            let (got, _) = cur
+                .walk_until(None, usize::MAX, &mut |_: &[u8], _: &[u8]| {})
+                .unwrap();
+            assert_eq!(got, n);
+        }
+        let (mut reads, mut parts, mut bytes, mut of, mut owned) = (0u64, 0u64, 0u64, 0u64, 0u64);
+        for start in (0..n).step_by(7) {
+            for limit in [1usize, 2, 3, 5, 9, 14, 23, 40, 77] {
+                for run in [true, false] {
+                    let part = ZMemo::new().scans(true, true);
+                    let whole = ZMemo::new().scans(true, false);
+                    let a = read_every_way(&part, &zfile, &fx.blob, &fx.recs, start, limit, run);
+                    let b = read_every_way(&whole, &zfile, &fx.blob, &fx.recs, start, limit, run);
+                    assert!(
+                        a.0 == b.0 && a.1 == b.1,
+                        "start {start} limit {limit} run {run}: {:?} against {:?}",
+                        a.1,
+                        b.1
+                    );
+                    let got = a.1[0];
+                    assert_eq!(got, limit.min(n - start));
+                    for (i, (k, v)) in a.0[..got].iter().enumerate() {
+                        let r = &fx.recs[start + i];
+                        assert!(
+                            k == &r.0 && v == &r.1[0],
+                            "start {start} limit {limit}: record {i}"
+                        );
+                    }
+                    assert_eq!(b.2.walk_parts, 0, "off, none in part");
+                    assert!(a.2.walk_parts <= a.2.owned, "{:?}", a.2);
+                    assert!(a.2.walk_part_bytes <= a.2.walk_part_of, "{:?}", a.2);
+                    reads += 1;
+                    parts += a.2.walk_parts;
+                    bytes += a.2.walk_part_bytes;
+                    of += a.2.walk_part_of;
+                    owned += a.2.owned;
+                }
+            }
+        }
+        assert!(
+            parts * 4 > reads,
+            "{parts} groups begun in part over {reads} reads"
+        );
+        assert!(
+            bytes * 100 < of * 80,
+            "{bytes} of {of} bytes decoded of the groups begun in part"
+        );
+        assert!(
+            owned > parts,
+            "the groups walked to their ends decoded whole: {owned} owned, {parts} in part"
+        );
+        // One walk taken apart: a cursor placed at a page's first record,
+        // not as a walk, opens its group whole, and a run two records
+        // into the next group begins that one and no other.
+        let v = page_view(zfile.page_bytes(0).unwrap()).unwrap();
+        let (c0, g1) = (usize::from(v.group(0).unwrap().count), v.group(1).unwrap());
+        assert!(g1.count > 8 && !g1.stored && !g1.coded, "{g1:?}");
+        let memo = ZMemo::new().scans(true, true);
+        let mut cur = ZCursor::at(&memo, &zfile, &fx.blob, 0);
+        assert_eq!(
+            memo.take_point().walk_parts,
+            0,
+            "a placement wants the group"
+        );
+        let (got, _) = cur
+            .walk_run_ahead(None, c0 + 2, 0, &mut |_: &[u8], _: &[u8]| {})
+            .unwrap();
+        assert_eq!(got, c0 + 2);
+        let p = memo.take_point();
+        assert_eq!((p.walk_parts, p.owned), (1, 1), "{p:?}");
+        assert_eq!(p.walk_part_of, u64::from(g1.ulen));
+        assert!(
+            p.walk_part_bytes * 2 < p.walk_part_of,
+            "three records' worth of {}: {p:?}",
+            g1.count
+        );
+        drop(cur);
+        // The same run by a reader with the rest of its scan ahead: the
+        // group is wanted whole, and is opened so.
+        let memo = ZMemo::new().scans(true, true);
+        let mut cur = ZCursor::at(&memo, &zfile, &fx.blob, 0);
+        memo.take_point();
+        let (got, _) = cur
+            .walk_run_ahead(None, c0 + 2, 100, &mut |_: &[u8], _: &[u8]| {})
+            .unwrap();
+        assert_eq!(got, c0 + 2);
+        let p = memo.take_point();
+        assert_eq!((p.walk_parts, p.owned), (0, 1), "{p:?}");
+        drop(cur);
+        // A run that ends at a group's last record leaves the next group
+        // unopened, and the run after it, wanting two records, opens it
+        // as it resumes: in part, by that run's count.
+        let memo = ZMemo::new().scans(true, true);
+        let mut cur = ZCursor::at(&memo, &zfile, &fx.blob, 0);
+        memo.take_point();
+        let (got, _) = cur
+            .walk_run_ahead(None, c0, 0, &mut |_: &[u8], _: &[u8]| {})
+            .unwrap();
+        assert_eq!(got, c0);
+        let p = memo.take_point();
+        assert_eq!((p.walk_parts, p.owned), (0, 0), "nothing opened: {p:?}");
+        let (got, _) = cur
+            .walk_run_ahead(None, 2, 0, &mut |_: &[u8], _: &[u8]| {})
+            .unwrap();
+        assert_eq!(got, 2);
+        let p = memo.take_point();
+        assert_eq!((p.walk_parts, p.owned, p.walk_mores), (1, 1, 0), "{p:?}");
+        assert!(
+            p.walk_part_bytes * 2 < p.walk_part_of,
+            "three records' worth of {}: {p:?}",
+            g1.count
+        );
+        drop(cur);
+        // A placement inside a group, told its walk wants two records:
+        // the group is begun in part as far as the three records skipped
+        // and those two, in one step, and the walk of the two decodes
+        // nothing more.
+        let memo = ZMemo::new().scans(true, true);
+        let mut cur = ZCursor::at_wanting(&memo, &zfile, &fx.blob, c0 + 3, 2);
+        let p = memo.take_point();
+        assert_eq!((p.walk_parts, p.owned, p.walk_mores), (1, 1, 0), "{p:?}");
+        let rec = u64::from(g1.ulen) / u64::from(g1.count);
+        assert!(
+            p.walk_part_bytes >= 5 * rec && p.walk_part_bytes <= 8 * rec,
+            "five records' worth of {rec} bytes each and a decoder's run past them: {p:?}"
+        );
+        let (got, _) = cur
+            .walk_run_ahead(None, 2, 0, &mut |_: &[u8], _: &[u8]| {})
+            .unwrap();
+        assert_eq!(got, 2);
+        let p = memo.take_point();
+        assert_eq!(
+            (p.walk_parts, p.walk_mores, p.walk_part_bytes),
+            (0, 0, 0),
+            "the two were decoded at the placement: {p:?}"
+        );
+        drop(cur);
+        // A walk with no decode of its own has none to cut short.
+        let plain = ZMemo::new().scans(false, true);
+        let c = read_every_way(&plain, &zfile, &fx.blob, &fx.recs, 3, 20, true);
+        assert_eq!((c.2.walk_parts, c.2.owned), (0, 0), "{:?}", c.2);
+        // The other decoder decodes whole, and so does a cursor that holds
+        // no view.
+        zfile.own_decoder = false;
+        let other = ZMemo::new().scans(true, true);
+        let c = read_every_way(&other, &zfile, &fx.blob, &fx.recs, 3, 20, true);
+        assert!(c.2.owned > 0 && c.2.walk_parts == 0, "{:?}", c.2);
+        zfile.own_decoder = true;
+        zfile.cursor_view = false;
+        let viewless = ZMemo::new().scans(true, true);
+        let c = read_every_way(&viewless, &zfile, &fx.blob, &fx.recs, 3, 20, true);
+        assert!(c.2.owned > 0 && c.2.walk_parts == 0, "{:?}", c.2);
+    }
+
+    /// Records of uneven sizes: every ninth and tenth carries a value thirty
+    /// times the others', inline, so a group's bytes are not its records'
+    /// count times a mean.
+    fn uneven(n: usize) -> Vec<Rec> {
+        (0..n)
+            .map(|i| {
+                let len = if i % 9 < 2 { 360 } else { 12 };
+                (
+                    format!("{i:016}").into_bytes(),
+                    vec![vec![b'a' + (i % 23) as u8; len]],
+                    false,
+                )
+            })
+            .collect()
+    }
+
+    /// The walk's partial decode sizes its first stop by the group's mean
+    /// record, and over records of uneven sizes the stop falls short: the
+    /// decode is taken on where a record runs past what stands -- at a
+    /// placement that skips into the group, in a walk, under a step -- and
+    /// a group left in part is never the state the next group is read
+    /// through. Random sequences of runs with and without a scan ahead of
+    /// them, walks, steps, the key and values under the position and keys
+    /// sought, from random starts, by a cursor that decodes in part and by
+    /// one that decodes whole: the two hand over the same entries and
+    /// stand at the same ranks after every step, and neither falls back.
+    #[test]
+    fn a_walk_in_part_over_uneven_records_reads_what_a_whole_decode_reads() {
+        let fx = Fixture::new("walk-part-uneven", uneven(900), 512);
+        let mut zfile = fx.zfile();
+        zfile.own_decoder = true;
+        zfile.cursor_view = true;
+        let n = fx.recs.len();
+        {
+            let warm = ZMemo::new();
+            let mut cur = ZCursor::at(&warm, &zfile, &fx.blob, 0);
+            let (got, _) = cur
+                .walk_until(None, usize::MAX, &mut |_: &[u8], _: &[u8]| {})
+                .unwrap();
+            assert_eq!(got, n);
+        }
+        let mut rng = Rng(0x05ee_d150);
+        let (mut parts, mut mores, mut placed_mores) = (0u64, 0u64, 0u64);
+        for round in 0..1500 {
+            let start = rng.below(n);
+            let want = [1usize, 2, 3, 5, 8, 13, 30][rng.below(7)];
+            let part = ZMemo::new().scans(true, true);
+            let whole = ZMemo::new().scans(true, false);
+            let mut a = ZCursor::at_wanting(&part, &zfile, &fx.blob, start, want);
+            let mut b = ZCursor::at_wanting(&whole, &zfile, &fx.blob, start, want);
+            placed_mores += part.take_point().walk_mores;
+            let mut steps = Vec::new();
+            for _ in 0..7 {
+                if a.rank() >= n {
+                    break;
+                }
+                let op = rng.below(6);
+                let (limit, ahead, d) = (
+                    [1usize, 2, 3, 5, 8, 13, 30][rng.below(7)],
+                    [0usize, 0, 100][rng.below(3)],
+                    rng.below(12),
+                );
+                steps.push((op, limit, ahead, d));
+                let mut out: [Vec<(Vec<u8>, Vec<u8>)>; 2] = [Vec::new(), Vec::new()];
+                let mut at = [0usize; 2];
+                for (i, cur) in [&mut a, &mut b].into_iter().enumerate() {
+                    let seen = &mut out[i];
+                    match op {
+                        0 | 1 => {
+                            cur.walk_run_ahead(None, limit, ahead, &mut |k: &[u8], v: &[u8]| {
+                                seen.push((k.to_vec(), v.to_vec()))
+                            })
+                            .unwrap();
+                        }
+                        2 => {
+                            cur.walk_until(None, limit, &mut |k: &[u8], v: &[u8]| {
+                                seen.push((k.to_vec(), v.to_vec()))
+                            })
+                            .unwrap();
+                        }
+                        3 => {
+                            cur.resume();
+                            if let Some(k) = cur.key().map(|k| k.to_vec()) {
+                                let mut vals = Vec::new();
+                                cur.values(&mut |v: &[u8]| vals.extend_from_slice(v))
+                                    .unwrap();
+                                seen.push((k, vals));
+                            }
+                        }
+                        4 => {
+                            cur.resume();
+                            cur.advance();
+                        }
+                        _ => {
+                            cur.resume();
+                            let target = (cur.rank() + d).min(n - 1);
+                            cur.skip_to(&fx.recs[target].0);
+                        }
+                    }
+                    at[i] = cur.rank();
+                    assert!(!cur.fell_back(), "round {round}, start {start}: {steps:?}");
+                }
+                assert!(
+                    out[0] == out[1] && at[0] == at[1],
+                    "round {round}, start {start} wanting {want}: {steps:?}: ranks {at:?}"
+                );
+            }
+            let p = part.take_point();
+            parts += p.walk_parts;
+            mores += p.walk_mores;
+            assert_eq!(whole.take_point().walk_parts, 0);
+        }
+        // The premises: groups were begun in part, taken on in walks, and
+        // taken on at a placement that skipped into one.
+        assert!(
+            parts > 500 && mores > 100 && placed_mores > 10,
+            "{parts} begun in part, {mores} taken on, {placed_mores} at a placement"
+        );
+    }
+
+    /// A page this process has not verified is not decoded in part: its
+    /// first decode is the whole one, which holds the page to its checks.
+    /// A byte of the last group of a page the attach does not sample is
+    /// flipped, and a walk crosses into the page wanting three records of
+    /// its first group, which a decode in part would hand over from a page
+    /// nothing had checked: the page fails its first decode instead, the
+    /// form file leaves service, and the walk's records are the raw form's,
+    /// every one right.
+    #[test]
+    fn a_walk_does_not_decode_a_page_in_part_before_its_first_decode() {
+        let fx = Fixture::new("walk-part-unverified", suite(4000, 17), 256);
+        assert!(matches!(fx.build(), Outcome::Built(_)));
+        let nkeys = fx.recs.len();
+        let (at, first_on_p) = {
+            let zfile = fx.attach().unwrap();
+            let pages = zfile.pages();
+            assert!(
+                pages > 3 * ZSAMPLE_PAGES,
+                "pages enough to leave some unsampled"
+            );
+            let sampled =
+                |p: usize| (0..ZSAMPLE_PAGES).any(|k| k * (pages - 1) / (ZSAMPLE_PAGES - 1) == p);
+            let unsampled: Vec<usize> = (1..pages - 1).filter(|&p| !sampled(p)).collect();
+            let p = unsampled[unsampled.len() / 2];
+            let v = page_view(zfile.page_bytes(p).unwrap()).unwrap();
+            assert!(v.groups() > 1, "a page of several groups");
+            let (first, last) = (v.group(0).unwrap(), v.group(v.groups() - 1).unwrap());
+            assert!(
+                !first.stored && !first.coded && first.count > 4,
+                "{first:?}"
+            );
+            assert!(!last.stored && !last.coded, "{last:?}");
+            let first_on_p = (0..zfile.fence.len())
+                .find_map(|e| {
+                    zfile
+                        .fence
+                        .entry(e, nkeys as u32)
+                        .filter(|en| en.page as usize == p)
+                        .map(|en| en.first_rank as usize)
+                })
+                .expect("a page the fence names");
+            (
+                p * ZPAGE + usize::from(last.coff) + usize::from(last.clen) / 2,
+                first_on_p,
+            )
+        };
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fx.out)
+            .unwrap();
+        let mut b = [0u8; 1];
+        f.read_at(&mut b, at as u64).unwrap();
+        f.write_at(&[b[0] ^ 0x5a], at as u64).unwrap();
+        drop(f);
+        let mut zfile = fx
+            .attach()
+            .expect("a damaged page the sample misses attaches");
+        zfile.own_decoder = true;
+        zfile.cursor_view = true;
+        assert!(first_on_p > 2 && first_on_p + 3 < nkeys);
+        let memo = ZMemo::new().scans(true, true);
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let mut cur = ZCursor::at(&memo, &zfile, &fx.blob, first_on_p - 2);
+        assert!(
+            !cur.fell_back() && !zfile.damaged(),
+            "the page before is sound"
+        );
+        let (got, _) = cur
+            .walk_run_ahead(None, 5, 0, &mut |k: &[u8], _: &[u8]| seen.push(k.to_vec()))
+            .unwrap();
+        assert_eq!(got, 5);
+        let want: Vec<Vec<u8>> = fx.recs[first_on_p - 2..first_on_p + 3]
+            .iter()
+            .map(|r| r.0.clone())
+            .collect();
+        assert!(
+            seen == want,
+            "every record, through the raw form past the damage"
+        );
+        assert!(
+            cur.fell_back() && zfile.damaged(),
+            "the page failed its first decode"
+        );
+        assert_eq!(memo.take_point().walk_parts, 0, "nothing decoded in part");
     }
 
     /// The tag filter: a group's first ask is refused and leaves its tag,

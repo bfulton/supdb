@@ -877,6 +877,94 @@ fn the_fills_build_only_while_the_refaults_hold_still() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// What closes the fills' room is the group refaulting past the line the
+/// controller's pressure term is drawn at, not a refault
+/// (`Options::forms_settle_room_pressure`): at a rate under the line the
+/// fills build, and past it they build nothing; with the option off any
+/// rate past zero closes the room, the shape before. The rate is the
+/// seam's; the platform's readings go through `refaults_moved`, which the
+/// engine's own test holds.
+#[test]
+fn the_fills_room_is_closed_by_pressure_and_not_by_a_refault() {
+    for (case, pressure) in [("pressure", true), ("still", false)] {
+        let dir = scratch(&format!("settle-room-{case}"));
+        let inject = std::sync::Arc::new(supdb::ZInject::new());
+        inject.set_refault_rate(100.0);
+        inject.set_budget(1 << 50);
+        let mut db = Db::create(
+            &dir,
+            Options {
+                seal_bytes: 1 << 20,
+                partition_bytes: Some(64 << 10),
+                partition_on_flush: true,
+                publish_in_background: false,
+                upkeep: Upkeep::Inline,
+                scan_block_cache: true,
+                forms_settle_every: true,
+                forms_settle_builds: true,
+                forms_settle_room_pressure: pressure,
+                scan_cache_bytes: 1 << 30,
+                zpages_inject: Some(inject.clone()),
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let value = [b'v'; 100];
+        let keys: Vec<Vec<u8>> = (0..2000).map(|i| format!("k{i:05}").into_bytes()).collect();
+        let mut want = std::collections::BTreeMap::new();
+        for k in &keys {
+            db.put(k, &value);
+            want.insert(k.clone(), vec![value.to_vec()]);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        for (lo, _) in &partition_fences(&dir) {
+            db.scan(lo, 1, kv(&mut |_, _| {})).unwrap();
+        }
+        let stretch = |db: &mut Db,
+                       want: &mut std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
+                       at: usize| {
+            for round in 0..10usize {
+                for i in 0..3usize {
+                    let k = &keys[(round * 191 + i * 613 + at) % keys.len()];
+                    db.append(k, b"u");
+                    want.get_mut(k).unwrap().push(b"u".to_vec());
+                }
+                db.commit().unwrap();
+            }
+        };
+        // A hundred refaults a second, under the line.
+        stretch(&mut db, &mut want, 300);
+        let built = db.settle_built();
+        assert_eq!(
+            built > 0,
+            pressure,
+            "{case}: a rate under the pressure line, {built} built"
+        );
+        let refused = db.settle_refusals();
+        assert_eq!(
+            refused[2] > 0,
+            !pressure,
+            "{case}: commits refused for want of room: {refused:?}"
+        );
+        // Past the line: nothing more under either.
+        inject.set_refault_rate(300.0);
+        stretch(&mut db, &mut want, 900);
+        assert_eq!(db.settle_built(), built, "{case}: past the line, no build");
+        assert!(
+            db.settle_refusals()[2] > refused[2],
+            "{case}: and the commits counted as refused for room"
+        );
+        assert!(
+            scan_model(&db) == want,
+            "{case}: the scan answers every write"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// The fills list every form they build, for the shed that takes the
 /// unwalked ones back when their room goes, and only a shed emptied the
 /// list: in a store whose room never goes, which is any store in memory,
