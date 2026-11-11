@@ -1299,7 +1299,19 @@ through a handle bumped seven to thirteen shared statistics, and four
 handles read the threaded scan mix at ten thousand keys at 0.46x of
 LMDB, 0.91x with the counters off. A handle's statistics live on its
 slot's line now, and the one word the writer must see, the regime's
-scan signal, a handle bumps once per commit and not once per scan.
+scan signal, a handle bumps once per commit and not once per scan. And
+a third time as a count kept on the thing counted: a form file counted
+the groups its walks decoded into their own buffers in one word of the
+file's, which was once a scan while such decodes were an arm's and
+became once a group when a walk's first touch of every group was made
+one (`Options::zpages_scan_admit`). Every single-threaded cell of that
+pairing read ahead and the threaded scan pass read 0.90-0.96x in both
+orders, two and three handles storing to one line a group; with the
+count on the handle's memo, beside its hits and misses, the same pass
+read level. A statistic of a shared structure is kept by whoever does
+the counting and summed where it is read, and a counter is priced again
+when a change moves the path it sits on from the rare case to every
+operation.
 
 **A join that walked the long side for an empty short one.** A block
 table maps a source's positions against a partition's block boundaries
@@ -4518,6 +4530,103 @@ its counters before any pairing of it, where a copy made and given back
 ninety-two times is one line of one run; and a memory economy that
 copies is priced by the reads the copy makes, on the thread and in the
 window it makes them.
+
+**A decode as long as its container for a read that wanted one record,
+into a cache that took whatever it was shown.** C at ten million keys
+under 1.25 GiB was one of the four cells the row at `7b90eb8` read at or
+under LMDB's, and its point read through the block-coded form decoded a
+group whole at every miss of the memo of decoded groups, into a buffer of
+the memo's, which the group then held a slot for. A divided C is 167,000
+reads; 71,000 of them decoded a group, and most of those groups were read
+once in the mix, a Zipfian's tail being most of its distinct keys, so each
+such read wrote eighteen hundred bytes to answer for a hundred and thirty
+and turned a group the head would read again out of one of the memo's four
+thousand slots. The profile named the decoder only after it was cut twice:
+the mix's window between the harness's marks was two fifths `pow`, the key
+generator's zeta sum over ten million terms, which the harness computes
+inside the marks and outside its clock, and of the engine's samples left
+the decoder was 35-39%. Three things were built, each an option priced by
+taking it away. A read's first touch of a group decodes it only as far as
+the walk for its key reads, into the read's own buffer, three fifths of
+the group's bytes at the mean, and the memo takes a group at its second
+touch while a tag of the first stands (`Options::zpages_point_part`,
+`zlz4::decompress_more`, `zfile::Memo::admit`): the read pass read
+1.2-1.4x on one thread and to 1.7x on three, and B, C, D and the scrambled
+B and C ahead in both orders. A walk's first touch of a group is its
+cursor's own decode by the same rule (`Options::zpages_scan_admit`): the
+threaded scans beside the mixes read 1.1-1.2x in both orders, with the
+threaded scan pass level. And a table of where the keys read through the
+memo lie, asked ahead of the filter and the fence
+(`Options::zpages_point_keys`), answered half of C's reads and a quarter
+of the scrambled C's: C read 1.02x to 1.19x for it in four sittings of
+four and the scrambled C ahead in three, and D, which reads the latest
+inserts and no key twice through the form, 0.95-0.98x in all four, the
+price of a probe of a megabyte the core's cache does not hold. The table
+was turned off between its second sitting and its fourth. The first two
+read the six scrambled mixes four to six percent lower by their geometric
+mean, and the scrambled D's count, a hit in two hundred and seventy reads,
+was written down as the scrambled mixes'; the next two read that mean
+three and eleven percent higher, every pairing of the lever was run again
+for a default that then moved back, and the counts by mix had said from
+the first counted run which cells the table reaches. One cell moved with
+nothing to move it. The scrambled E mix, which makes no point read, read
+0.87x, 0.92x, 1.00x and 0.90x for the partial decode over four sittings,
+and a counted rep of the two arms read its scans' groups, memo hits,
+misses and admissions the same per scan to two figures, the main thread's
+faults the same, and the hot-raw policy's releases the same in every run;
+E beside it read 1.13x and 0.81x in both pairings, the pair's first arm
+ahead, E's time being the price of its block cache's fresh pages, which a
+pair's second place pays more for. The lean is left as read, a tenth with
+every count against a cause. The partial decode is licensed by the page's
+first decode, which walks every group whole: a decode that stops at a
+record does not see what the block's end would have said, and the test
+that first asserted it did was the one wrong. The rules: a cache admits on
+evidence of a second reference where what it is shown is mostly seen once,
+since what a first touch displaces is the price of taking it; a decoder
+that runs to the end of its container is asked how far its reader reads;
+an option's verdict is read cell by cell where its mechanism counts, never
+as a mean over cells it reaches differently, and a count read in one mix
+is not its family's; a cell that moves under an option is held to a count
+of the option's mechanism in that cell before it is read for or against,
+since two sittings can agree about the pair's order or about nothing; and
+a profile cut to a phase by the harness's marks is cut again to the
+engine's symbols before a share of it is read, since the marks bracket the
+harness's own setup.
+
+**What a reader dropped in place, a publish in flight brought back.** A
+look that passes a table drops it from `State::replaced` where the state
+stands, and the list is copied into the next state by whoever publishes
+it. A publish reads where the look stood, copies the list and swaps its
+state in, three steps on a thread that is not the look's, and a look that
+fell between the first and the third stored its new position and cleared
+the list of a state the swap then replaced: the table it had passed, and
+the seal's snapshot copy it holds, stood in the new state until the next
+look, whenever that came. The test written for the drop found it, once in
+a gate and once in fifteen runs under eight-way load, never alone, after
+passing for a week on a wait for the wrong event: it waited for a landing
+to be counted, the count that moved was the load's table's in every run,
+and the table it froze landed later, under the look, in the runs that
+failed. A trace of the store's four counts at each step read the same to
+the last step in the runs that passed and the runs that failed, which is
+what said the wait was not waiting for what came next. Every publisher's
+swap is one function now, which trims the list of the state it swapped in
+by where the look stands after the swap (`Db::swap_state`), and the look
+trims whichever state is current after it has stored where it stands
+(`Reader::note_over`); the swap and the load after it, the store and the
+load after it, are sequentially consistent, so one of the two sees the
+other. Two seams leave each order standing (`Db::hold_landing_swap`,
+`Db::look_after_a_landing`), and the first test waits for the table it
+froze. A third seam, for the writer's own freeze under the upkeep thread's
+look, was built and taken out: the writer holds its upkeep through a
+commit's freeze, the look it was to race could not run, and a second copy
+of the trim that nothing could reach became the one function instead. The
+rules: a drop made in place on a structure others copy forward is made
+again by whoever copies, after the copy is published, and by the dropper
+on whatever was published since, both where neither can see the other
+first; a wait in a test names its event by something only that event
+moves, since a count another event also moves is moved by it in every run;
+and a check two callers need is one function, so that the test of one
+caller holds it for both.
 
 ## Standing limitations
 
