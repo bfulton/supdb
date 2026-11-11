@@ -481,6 +481,26 @@ counter's name ran two minutes beside a ten-million-key pass, on the
 device the pass was faulting from, and the rep was taken again from its
 start. Beside a timing run only named files are opened.
 
+**A stamp is the build's, a task has a limit, and a script a run reads is
+the run's.** One roster was cut three times in a morning and none of the
+three was the engine's. Its binary was built with the batch's docs still
+uncommitted, so its stamp read `-dirty` and the row it was banking rung by
+rung was no row of the series, which nothing said until the container's
+restart cut the run and the partial row was opened; the restart had moved
+the session to a host of another class, which a resume refuses, as it must.
+The run after it was held by a tracked task of two hours, the most one may
+have, and the roster on that host takes two and three quarters: stopped in
+its last rep and taken up from the ledger. And that resume was refused by
+the roster's own script, edited an hour earlier to ask the binary for its
+stamp, a command the binary in flight predated. `scripts/ooc.sh` refuses a
+binary stamped dirty before anything is measured now (`bench stamp`;
+`OOC_DIRTY=1` for a look that will not be banked); a roster is planned as
+sittings of under two hours with the ledger between them; and nothing a
+run in flight reads, its binary or its scripts, is edited until it has
+banked. The rule: a row's provenance is fixed at the build and checked at
+the start, since a check at the end is two hours late; and a run that can
+be resumed is resumed by exactly what started it.
+
 **A device the series does not measure.** Out of core a rate is the
 faults an operation takes times the device's answer to one, about 40 µs
 on this fleet's disk, and the faults are the kernel's reclaim over the

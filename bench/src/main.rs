@@ -17,6 +17,7 @@ usage:
   bench gate ROW.json [--runs DIR]
   bench figures [--runs DIR] [--out DIR] [--scale quick|full|ooc]
   bench machine
+  bench stamp
 
 run    measures every arm over the size ladder and writes runs/<scale>/<utc>-<sha7>.json
        --out   directory holding runs/ (default: runs)
@@ -160,6 +161,13 @@ fn main() {
         Some("gate") => cmd_gate(Args(args[1..].to_vec())),
         Some("figures") => cmd_figures(Args(args[1..].to_vec())),
         Some("machine") => cmd_machine(),
+        // The binary's stamp of the engine it was built from and of its
+        // compiler, as every row carries them: for a script that will not
+        // bank a row of a tree with uncommitted changes (`scripts/ooc.sh`).
+        Some("stamp") => {
+            println!("{} {}", run::sha(), run::rustc());
+            0
+        }
         _ => {
             eprintln!("{USAGE}");
             2

@@ -88,6 +88,27 @@ case "$L" in
 esac
 shift
 
+# The binary's stamp is the build's, not the tree's at the run: a binary
+# built with anything uncommitted -- a doc of the batch still in the
+# working tree is enough -- stamps its row `-dirty`, and a row of a dirty
+# tree is not the series'. A roster of two hours was built so and found
+# out when its row was read. Refused here before anything is measured;
+# OOC_DIRTY=1 runs one anyway, for a look that will not be banked.
+stamp=$("$bin" stamp 2>/dev/null | cut -d' ' -f1)
+case "$stamp" in
+  '')
+    echo "ooc.sh: $bin does not say its stamp (bench stamp); rebuild it" >&2
+    exit 2
+    ;;
+  *-dirty|unknown)
+    if [ "${OOC_DIRTY:-}" != 1 ]; then
+      echo "ooc.sh: refused: $bin is stamped $stamp; commit or stash, rebuild, and run again (OOC_DIRTY=1 for a row that will not be banked)" >&2
+      exit 2
+    fi
+    echo "ooc.sh: $bin is stamped $stamp: this row is not the series'" >&2
+    ;;
+esac
+
 # The run's stderr is both shown and kept: the group's path is read from
 # it and the banked-rungs line is the verdict. Its status is written by
 # the subshell that ran it, where `$?` is the run's own.
