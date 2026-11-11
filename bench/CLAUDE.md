@@ -540,6 +540,23 @@ the one it takes, so the value is built behind a call the match does
 not inline; and a stack overflow is read off the frames' sizes before
 the stack is made larger.
 
+**A pairing has a control too, and it is the cells its option cannot reach.**
+Six pairings of one afternoon, four reps each with the arms' order
+alternating, at ten million keys under the bound, read the ordered load, the
+threaded reads or the first read-only mix a twentieth to a sixth apart in one
+direction in every pair of four, or in three: cells that run before the
+option under test can act, the same code in both arms. The arm listed second
+was the slower in four of the pairings and the faster in a fifth, whichever
+arm it was. So four pairs of four at a tenth was inside what a sitting did to
+identical code, and one such reading, the scan pass 8% against an option that
+only removes decoding from it, with the load 6% the same way in the same
+table, would have been written down as the option's cost. `ab`'s sign test
+answers whether the pairs agree, not whether the sitting leaned. The cells an
+option cannot reach are read first, as a row's comparators are: an effect is
+read against their lean in the same sitting, one no larger than it is
+unresolved however many pairs agree, and the second sitting lists the arms
+the other way.
+
 **A workflow that never runs can be syntactically invalid for months.**
 Both self-hosted pickup watchdogs arrived with a block of an older draft
 pasted after their `exit 1`. `scripts/workflows.sh` parses every `run:`

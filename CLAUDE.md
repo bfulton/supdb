@@ -4628,6 +4628,71 @@ moves, since a count another event also moves is moved by it in every run;
 and a check two callers need is one function, so that the test of one
 caller holds it for both.
 
+**A reading kept past the workload it was of, and a gate that read a counter across a gap.**
+The writer gives its block forms up where its scans' start blocks do not recur
+and takes them back where they do (`Options::scan_forms_off_unreused`), and it
+decides at a scan: between two scans the last reading stands, and while it
+stands the commits file nothing. In the row's order the uniform scan pass gave
+the forms up and the writer's next scan was E's first, five mixes later: B, A,
+F and D committed a hundred and eighty thousand writes into no forms, and E
+took the forms back at its 512th scan and built its block cache inside its own
+window -- fifteen thousand sparse forms, twenty thousand more from the builder
+ahead and seven thousand first touches on the scanning thread, in half a
+second. That was the one cell the row at `e4021f7` lost at ten million keys,
+0.94x of LMDB's and two shapes by rep. The regime's own pairing had read E
+level against the arm that keeps its forms, and a later note had named what E
+pays, "the price of its block cache's fresh pages", without asking why E was
+the mix paying it. The reading is stale now after a stretch of a mix's small
+commits with no scan between them (`Options::scan_forms_off_stale_writes`; a
+burst's batches, the lag sweep's, leave it standing, since filing a burst is
+the writer's to pay), and that moved E in three counted reps of four. In the
+fourth the write mixes still filed nothing, and a count of the commits that
+file nothing by the clause that refused them (`Db::settle_refusals`: the forms
+off, far from a scan, no room, nothing due) put every one on the fills' room.
+The room closes for a second when the memory group's refaults grow, and it
+read growth as any growth since its last reading, however old: the first
+commit to ask after the read passes compared the counter with a reading
+twenty-six seconds old, the read pass's twenty-four thousand refaults, and
+closed the room for B and A; and three pages refaulted in a hundred
+milliseconds closed it for F and D, with three hundred megabytes of room by
+the gate's own byte count on the same line of the trace. The room reads the
+refaults against the line the controller's pressure term is drawn at, over a
+reading no older than its quiet (`Options::forms_settle_room_pressure`,
+`refaults_moved`). With both, the write mixes file at every commit on the
+upkeep thread in every rep, E builds no sparse form and takes four hundred
+first touches, and paired against the forms kept off until a scan E read
+1.56x and 1.24x with the arms listed either way, ahead in every pair of eight. The rules: a regime entered on a measurement of one kind of operation
+is looked at again when the workload stops making that operation, not only
+when the operation comes back to be measured, since the cost of the stale
+reading falls on whatever comes first after the stretch; a difference of two
+readings of a counter is a rate over the time between them, so a reading
+after a gap is a baseline and says nothing of now; a gate on a platform's
+counter is drawn where the counter's owner draws it, one line named once,
+since any growth at all is the background of a group at its limit; a lever
+behind two gates is read with the refusals counted by gate, since with one
+gate open it reads as a lever that works in some reps; and a note that names
+what a cell pays is half a finding until it says why that cell is the one
+paying.
+
+**A decode halved for a read whose cost was not its bytes, at the price of
+the room another cell lives in.** C's time at ten million keys under 1.25 GiB
+is three quarters first touches of tail groups, each a partial decode, and the
+obvious lever was the group cut: a kibibyte of records a group where the form
+ships two (`Options::zpages_group_bytes`, `supdb-zgroup1k`). The arm decoded
+0.60 of the bytes on its first touches, as designed, and C read 0.97x: a first
+touch is the page's header and directory, the payload's first lines and the
+tables beside them, misses a group's size does not change, and the bytes the
+decoder then runs over are the cheap part. And the cut costs the form a
+twentieth more of its bytes, which at this bound is the room the hot-raw
+policy releases into: five partitions released a rep where the default
+releases eight, E 0.75x in four pairs of four and the threaded scans 0.89x,
+for the scrambled point-read mixes a seventh ahead. The rules: a read's cold
+cost is counted in the lines it touches before a lever is built on the bytes
+it decodes, and the arm that changes only the bytes is the test; and a format
+parameter that trades size for speed under a bound is priced on the cells the
+size pays in, which are whichever tenants of the page cache the bound was
+already squeezing, not on the cell the speed was for.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
