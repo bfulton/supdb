@@ -3181,6 +3181,8 @@ fn a_settle_asks_for_the_heads_its_resolves_will_seek_only_out_of_core() {
                 upkeep: supdb::Upkeep::Inline,
                 publish_in_background: false,
                 heads_willneed: on,
+                // Every ask its own look: what is counted here is the asks.
+                heads_look_ms: 0,
                 ..Options::default()
             },
         )
@@ -3258,6 +3260,140 @@ fn a_settle_asks_for_the_heads_its_resolves_will_seek_only_out_of_core() {
             "with the gate at raw no heads are asked for"
         );
         check(&db, &model, "the gate at raw");
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// An ask for a run or a stride of heads is refused where its first page
+/// is resident, which it learns by a `mincore` of its own, so over an
+/// ordered index that is all in the page cache a settle's asks are those
+/// calls and nothing else. One look at each partition's whole stands in
+/// for them while it says the heads are resident
+/// (`Options::heads_look_ms`): such a settle looks and asks for nothing;
+/// with the indexes put out of the cache a look that has run out is made
+/// again, says so, and the asks go to the kernel as they did; a look that
+/// still stands is believed, a page gone since being a fault at the seek
+/// as it is with no ask; and zero is every ask's own look.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_look_at_a_partitions_heads_stands_in_for_the_asks_while_they_are_resident() {
+    for look_ms in [0u32, 1, 600_000] {
+        let dir = scratch(&format!("head-looks-{look_ms}"));
+        let mut db = Db::create(
+            &dir,
+            Options {
+                zpages: ZPages::Off,
+                partition_bytes: Some(160 << 10),
+                scan_block_cache: true,
+                upkeep: supdb::Upkeep::Inline,
+                publish_in_background: false,
+                heads_willneed: true,
+                heads_look_ms: look_ms,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let mut model = ordered_load(&mut db, 4000, 0x3B10E);
+        let check = |db: &Db, model: &Model, what: &str| {
+            for start in [b"".to_vec(), spaced_key(1000), spaced_key(2500)] {
+                for limit in [1usize, 57, 300] {
+                    same_window(
+                        &scanned(db, &start, limit),
+                        &window(model, &start, limit),
+                        &format!(
+                            "{what}, from {:?} for {limit}",
+                            String::from_utf8_lossy(&start)
+                        ),
+                    );
+                }
+            }
+        };
+        db.zgate_set(1);
+        // A scan first, so the commits after it file their batches.
+        check(&db, &model, "drained, the gate at the census");
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let mut rng = Rng(0x3B10E1);
+        // The indexes resident, as the load left them.
+        let (size, resident) = resident_under(&dir, "ord-");
+        // Counted in whole pages, so not under the files' bytes.
+        assert!(
+            size > 0 && resident >= size,
+            "{resident} of {size} resident"
+        );
+        for k in keys.iter().step_by(5) {
+            let v = suite_value(&mut rng);
+            db.append(k, &v);
+            model.entry(k.clone()).or_default().push(v);
+        }
+        db.commit().unwrap();
+        let first = db.zpage_counts();
+        if look_ms == 0 {
+            assert!(
+                first.head_asks > 0 && first.head_looks == 0,
+                "every ask its own look: {} asks, {} looks",
+                first.head_asks,
+                first.head_looks
+            );
+        } else {
+            assert!(
+                first.head_asks == 0 && first.head_looks > 0,
+                "{look_ms} ms: the looks stood in for the asks: {} asks, {} looks",
+                first.head_asks,
+                first.head_looks
+            );
+        }
+        check(&db, &model, "a batch settled over resident heads");
+        // The indexes out of the page cache, and past the short look's time.
+        for e in std::fs::read_dir(&dir).unwrap() {
+            let path = e.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if name.starts_with("ord-") {
+                unmap_pages(&path);
+                evict(&path);
+            }
+        }
+        let (size, resident) = resident_under(&dir, "ord-");
+        assert!(
+            resident < size / 2,
+            "{resident} of {size} resident after the eviction"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        for k in keys.iter().skip(2).step_by(7) {
+            let v = suite_value(&mut rng);
+            db.append(k, &v);
+            model.entry(k.clone()).or_default().push(v);
+        }
+        db.commit().unwrap();
+        let second = db.zpage_counts();
+        match look_ms {
+            0 => assert!(
+                second.head_asks > first.head_asks && second.head_submitted > first.head_submitted,
+                "every ask its own look, and the kernel asked: {} asks, {} submitted",
+                second.head_asks,
+                second.head_submitted
+            ),
+            1 => assert!(
+                second.head_looks > first.head_looks
+                    && second.head_asks > 0
+                    && second.head_submitted > 0,
+                "a look run out is made again and the asks go: {} looks, {} asks, {} submitted",
+                second.head_looks,
+                second.head_asks,
+                second.head_submitted
+            ),
+            _ => assert!(
+                second.head_looks == first.head_looks && second.head_asks == 0,
+                "a look that stands is believed: {} looks, {} asks",
+                second.head_looks,
+                second.head_asks
+            ),
+        }
+        check(
+            &db,
+            &model,
+            "a batch settled over heads put out of the cache",
+        );
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

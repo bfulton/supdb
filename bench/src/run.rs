@@ -679,6 +679,8 @@ fn counters_line(
             "settle_rebuilds",
             "lazy_cuts_filed",
             "lazy_cuts_resolved",
+            "seeks_planned",
+            "patch_asks",
             // The scans' start blocks the start cache named, and the
             // starts it kept (`Db::start_cache_counts`).
             "start_cache_hits",

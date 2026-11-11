@@ -1048,3 +1048,229 @@ fn the_fills_forms_are_not_shed_for_a_fill_that_builds_them_again() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// A settle resolves each of a batch's keys to its block by a seek over
+/// its partition's heads, the batch in key order. The stride each seek
+/// searches is named a few keys ahead from the ordered index's top level
+/// and asked of the core, and the key is then sought in its stride alone
+/// (`Options::settle_seek_ahead`); zero is the gallop from the rank the
+/// key before it reached. Either way a batch is filed where it belongs:
+/// keys updated, inserted between records, below every key and past every
+/// key, written twice in a batch, dense and scattered, over keys whose
+/// heads are whole keys and over keys whose heads tie, all of them in the
+/// scan through the cache.
+#[test]
+fn a_settles_seeks_planned_ahead_file_a_batch_as_the_gallop_does() {
+    for shape in ["whole", "tied"] {
+        for ahead in [0usize, 1, 8, 64] {
+            let dir = scratch(&format!("settle-seek-ahead-{shape}-{ahead}"));
+            let mut db = Db::create(
+                &dir,
+                Options {
+                    seal_bytes: 1 << 20,
+                    partition_bytes: Some(64 << 10),
+                    partition_on_flush: true,
+                    publish_in_background: false,
+                    upkeep: Upkeep::Inline,
+                    scan_block_cache: true,
+                    forms_settle_every: true,
+                    settle_seek_ahead: ahead,
+                    ..Options::default()
+                },
+            )
+            .unwrap();
+            let value = [b'v'; 100];
+            let keys: Vec<Vec<u8>> = (0..4000usize)
+                .map(|i| match shape {
+                    "whole" => format!("k{:05}", i * 2).into_bytes(),
+                    // Fifty keys to a head: the eight bytes past the common
+                    // prefix are the group's, and the records break the tie.
+                    _ => format!("{:04}-tail-{:04}", i / 50, (i % 50) * 2).into_bytes(),
+                })
+                .collect();
+            let mut want = std::collections::BTreeMap::new();
+            for k in &keys {
+                db.put(k, &value);
+                want.insert(k.clone(), vec![value.to_vec()]);
+            }
+            db.commit().unwrap();
+            db.flush().unwrap();
+            db.settle().unwrap();
+            let fences = partition_fences(&dir);
+            assert!(fences.len() >= 3, "several partitions: {}", fences.len());
+            let mut under = 0u64;
+            for (round, step) in [3usize, 40, 331, 7, 1].into_iter().enumerate() {
+                // Near reads, so the commit files its batch.
+                for (lo, _) in &fences {
+                    db.scan(lo, 1, kv(&mut |_, _| {})).unwrap();
+                }
+                for i in (round..keys.len()).step_by(step) {
+                    let k = &keys[i];
+                    db.append(k, b"u");
+                    want.get_mut(k).unwrap().push(b"u".to_vec());
+                    under += 1;
+                    if i % 3 == 0 {
+                        // Between this record and the next.
+                        let mut ins = k.clone();
+                        ins.push(b'm');
+                        db.append(&ins, b"i");
+                        want.entry(ins).or_insert_with(Vec::new).push(b"i".to_vec());
+                        under += 1;
+                    }
+                    if i % 5 == 0 {
+                        // The key a second time in the batch.
+                        db.append(k, b"w");
+                        want.get_mut(k).unwrap().push(b"w".to_vec());
+                    }
+                }
+                // Outside the keys' common prefix, below and above them all.
+                for (k, v) in [(&b"!"[..], &b"lo"[..]), (&b"~"[..], &b"hi"[..])] {
+                    db.append(k, v);
+                    want.entry(k.to_vec())
+                        .or_insert_with(Vec::new)
+                        .push(v.to_vec());
+                }
+                db.commit().unwrap();
+                assert!(
+                    scan_model(&db) == want,
+                    "{shape}, {ahead} ahead, round {round}: the scan answers every write"
+                );
+            }
+            let planned = db.seeks_planned();
+            if ahead == 0 {
+                assert_eq!(planned, 0, "{shape}: the gallop plans nothing");
+            } else {
+                // Every round but a batch the scan rebuilt its tables for
+                // is resolved key by key, each key under the prefix planned.
+                assert!(
+                    planned >= under / 4,
+                    "{shape}, {ahead} ahead: the resolves were planned: {planned} of {under}"
+                );
+            }
+            db.flush().unwrap();
+            db.settle().unwrap();
+            assert!(
+                scan_model(&db) == want,
+                "{shape}, {ahead} ahead: and after the flush"
+            );
+            drop(db);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+/// A settle's patch into a copy whose entries are its block's records
+/// writes the key's run at the entry its rank names and searches nothing,
+/// so the patch loop asks for that entry's line and the run it names by
+/// the cut, a key or three ahead, where it asked for the whole form
+/// (`Options::settle_patch_at_cut`). The ask is a hint and the patch is
+/// the same patch: the blocks rewritten until their forms are copies and
+/// then written again, key by key and several keys a block, read back as
+/// they were written under either, and only the option's patches are
+/// counted as asked for by their cut.
+#[test]
+fn a_patch_by_its_rank_asks_for_its_lines_by_the_cut() {
+    for at_cut in [true, false] {
+        // The asks for the form's header and for the block table's own
+        // lines ride along, on with the one and off with the other
+        // (`Options::settle_form_ahead`, `Options::settle_table_ahead`):
+        // hints too, counted where they are made.
+        let (form_ahead, table_ahead) = if at_cut { (6, 12) } else { (0, 0) };
+        let dir = scratch(&format!("settle-patch-at-cut-{at_cut}"));
+        let inject = std::sync::Arc::new(supdb::ZInject::new());
+        inject.set_refault_rate(0.0);
+        inject.set_budget(1 << 50);
+        let mut db = Db::create(
+            &dir,
+            Options {
+                seal_bytes: 8 << 20,
+                partition_bytes: Some(64 << 10),
+                partition_on_flush: true,
+                publish_in_background: false,
+                upkeep: Upkeep::Inline,
+                scan_block_cache: true,
+                forms_settle_every: true,
+                forms_settle_builds: true,
+                settle_patch_at_cut: at_cut,
+                settle_form_ahead: form_ahead,
+                settle_table_ahead: table_ahead,
+                zpages_inject: Some(inject.clone()),
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let value = [b'v'; 100];
+        let keys: Vec<Vec<u8>> = (0..4000).map(|i| format!("k{i:05}").into_bytes()).collect();
+        let mut want = std::collections::BTreeMap::new();
+        for k in &keys {
+            db.put(k, &value);
+            want.insert(k.clone(), vec![value.to_vec()]);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        let fences = partition_fences(&dir);
+        let round = |db: &mut Db,
+                     want: &mut std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
+                     step: usize,
+                     tag: u8| {
+            // A few hundred keys a commit, each commit near reads, so the
+            // commit files its batch and its fill builds and converts.
+            for chunk in (0..keys.len())
+                .step_by(step)
+                .collect::<Vec<_>>()
+                .chunks(250)
+            {
+                for (lo, _) in &fences {
+                    db.scan(lo, 1, kv(&mut |_, _| {})).unwrap();
+                }
+                for &i in chunk {
+                    let v = [tag; 100];
+                    db.put(&keys[i], &v);
+                    want.insert(keys[i].clone(), vec![v.to_vec()]);
+                }
+                db.commit().unwrap();
+            }
+        };
+        // Every other key, twice: thirty-two keys a block, past the count
+        // a sparse form is converted to a copy at.
+        round(&mut db, &mut want, 2, b'a');
+        round(&mut db, &mut want, 2, b'b');
+        assert!(scan_model(&db) == want, "{at_cut}: after the rewrites");
+        let before = db.patch_asks();
+        // The copies written again: one key a block or so, then several.
+        round(&mut db, &mut want, 61, b'c');
+        round(&mut db, &mut want, 3, b'd');
+        let asked = db.patch_asks() - before;
+        if at_cut {
+            assert!(
+                asked >= 500,
+                "the patches into the copies were asked for by their cut: {asked}"
+            );
+        } else {
+            assert_eq!(db.patch_asks(), 0, "every form asked for whole");
+        }
+        let [headers, lines] = db.settle_ahead_asks();
+        if at_cut {
+            assert!(
+                headers >= 500 && lines >= 500,
+                "the forms' headers and the table's lines were asked for ahead: {headers}, {lines}"
+            );
+        } else {
+            assert_eq!(
+                (headers, lines),
+                (0, 0),
+                "neither asked for with its option at zero"
+            );
+        }
+        assert!(
+            scan_model(&db) == want,
+            "{at_cut}: the scan answers every write"
+        );
+        db.flush().unwrap();
+        db.settle().unwrap();
+        assert!(scan_model(&db) == want, "{at_cut}: and after the flush");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

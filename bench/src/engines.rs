@@ -659,6 +659,28 @@ pub struct Supdb {
     /// (`Options::forms_settle_sheds_unbound`): `supdb-settleshedunbound`,
     /// and with the drop above `supdb-rebasedropsshed`.
     settleshedunbound: bool,
+    /// The settle's patch loop asking for the next block form's buffers
+    /// alone, its header read cold (`Options::settle_form_ahead` zero):
+    /// `supdb-settleformnear`.
+    settleformnear: bool,
+    /// The settle's raw resolves each a gallop over the heads from the
+    /// rank the key before reached, no stride planned ahead
+    /// (`Options::settle_seek_ahead` zero): `supdb-settlegallop`.
+    settlegallop: bool,
+    /// The settle's patch loop asking for every form whole, a copy patched
+    /// by its rank among them (`Options::settle_patch_at_cut` off):
+    /// `supdb-settlepatchwhole`.
+    settlepatchwhole: bool,
+    /// The settle asking for a written chunk's header alone
+    /// (`Options::settle_value_ahead` zero): `supdb-settlevaluenear`.
+    settlevaluenear: bool,
+    /// The settle asking for none of the block table's own lines ahead
+    /// (`Options::settle_table_ahead` zero): `supdb-settletablenear`.
+    settletablenear: bool,
+    /// One look at a partition's heads' residency standing in for a
+    /// settle's asks for a hundred milliseconds (`Options::heads_look_ms`):
+    /// `supdb-headslook`.
+    headslook: bool,
     /// Out of core a merge's landing chains the next merge only while
     /// reads are around, where the default chains through a write-only
     /// stretch too (`Options::merge_chains_writes` off).
@@ -1656,6 +1678,28 @@ struct Policy {
     /// (`Options::forms_settle_sheds_unbound`): `supdb-settleshedunbound`,
     /// and with the drop above `supdb-rebasedropsshed`.
     settleshedunbound: bool,
+    /// The settle's patch loop asking for the next block form's buffers
+    /// alone, its header read cold (`Options::settle_form_ahead` zero):
+    /// `supdb-settleformnear`.
+    settleformnear: bool,
+    /// The settle's raw resolves each a gallop over the heads from the
+    /// rank the key before reached, no stride planned ahead
+    /// (`Options::settle_seek_ahead` zero): `supdb-settlegallop`.
+    settlegallop: bool,
+    /// The settle's patch loop asking for every form whole, a copy patched
+    /// by its rank among them (`Options::settle_patch_at_cut` off):
+    /// `supdb-settlepatchwhole`.
+    settlepatchwhole: bool,
+    /// The settle asking for a written chunk's header alone
+    /// (`Options::settle_value_ahead` zero): `supdb-settlevaluenear`.
+    settlevaluenear: bool,
+    /// The settle asking for none of the block table's own lines ahead
+    /// (`Options::settle_table_ahead` zero): `supdb-settletablenear`.
+    settletablenear: bool,
+    /// One look at a partition's heads' residency standing in for a
+    /// settle's asks for a hundred milliseconds (`Options::heads_look_ms`):
+    /// `supdb-headslook`.
+    headslook: bool,
     /// Out of core a merge's landing chains the next merge only while
     /// reads are around, where the default chains through a write-only
     /// stretch too (`Options::merge_chains_writes` off).
@@ -2330,6 +2374,12 @@ impl Default for Policy {
             aheadfirst: false,
             rebasedrops: false,
             settleshedunbound: false,
+            settleformnear: false,
+            settlegallop: false,
+            settlepatchwhole: false,
+            settlevaluenear: false,
+            settletablenear: false,
+            headslook: false,
             nochainwrites: false,
             noland: false,
             landnearscans: false,
@@ -7515,6 +7565,12 @@ impl Supdb {
             aheadfirst,
             rebasedrops,
             settleshedunbound,
+            settleformnear,
+            settlegallop,
+            settlepatchwhole,
+            settlevaluenear,
+            settletablenear,
+            headslook,
             nochainwrites,
             noland,
             landnearscans,
@@ -7904,6 +7960,32 @@ impl Supdb {
             },
             rebase_recuts_sparse: !rebasedrops,
             forms_settle_sheds_unbound: settleshedunbound,
+            settle_form_ahead: if settleformnear {
+                0
+            } else {
+                supdb::Options::default().settle_form_ahead
+            },
+            settle_seek_ahead: if settlegallop {
+                0
+            } else {
+                supdb::Options::default().settle_seek_ahead
+            },
+            settle_patch_at_cut: !settlepatchwhole,
+            settle_value_ahead: if settlevaluenear {
+                0
+            } else {
+                supdb::Options::default().settle_value_ahead
+            },
+            settle_table_ahead: if settletablenear {
+                0
+            } else {
+                supdb::Options::default().settle_table_ahead
+            },
+            heads_look_ms: if headslook {
+                100
+            } else {
+                supdb::Options::default().heads_look_ms
+            },
             merge_chains_writes: !nochainwrites,
             zpages_land_scans_far: !landnearscans,
             merge_plan_idle: !noidleplan,
@@ -8239,6 +8321,12 @@ impl Supdb {
             aheadfirst,
             rebasedrops,
             settleshedunbound,
+            settleformnear,
+            settlegallop,
+            settlepatchwhole,
+            settlevaluenear,
+            settletablenear,
+            headslook,
             nochainwrites,
             noland,
             landnearscans,
@@ -9188,6 +9276,32 @@ impl Engine for Supdb {
         if self.settleshedunbound {
             return "supdb-settleshedunbound";
         }
+        if self.settleformnear
+            && self.settlegallop
+            && self.settlepatchwhole
+            && self.settlevaluenear
+            && self.settletablenear
+        {
+            return "supdb-settlenoahead";
+        }
+        if self.settleformnear {
+            return "supdb-settleformnear";
+        }
+        if self.settlegallop {
+            return "supdb-settlegallop";
+        }
+        if self.settlepatchwhole {
+            return "supdb-settlepatchwhole";
+        }
+        if self.settlevaluenear {
+            return "supdb-settlevaluenear";
+        }
+        if self.settletablenear {
+            return "supdb-settletablenear";
+        }
+        if self.headslook {
+            return "supdb-headslook";
+        }
         if self.nochainwrites {
             return if self.partition {
                 "supdb-nochainwrites"
@@ -9754,6 +9868,10 @@ impl Engine for Supdb {
             ("start_cache_puts", db.start_cache_counts().1 as f64),
             ("lazy_cuts_filed", db.lazy_cuts()[0] as f64),
             ("lazy_cuts_resolved", db.lazy_cuts()[1] as f64),
+            ("seeks_planned", db.seeks_planned() as f64),
+            ("patch_asks", db.patch_asks() as f64),
+            ("form_heads_ahead", db.settle_ahead_asks()[0] as f64),
+            ("table_lines_ahead", db.settle_ahead_asks()[1] as f64),
             // The writer's settles: see `Db::settle_density`.
             ("settle_runs", sd[0] as f64),
             ("settle_keys", sd[1] as f64),
@@ -9845,6 +9963,7 @@ impl Engine for Supdb {
             ("block_willneeds", z.block_willneeds as f64),
             ("willneed_asks", z.willneed_asks as f64),
             ("head_asks", z.head_asks as f64),
+            ("head_looks", z.head_looks as f64),
             ("head_submitted", z.head_submitted as f64),
             ("top_keys", z.top_keys as f64),
             ("dir_willneeds", z.dir_willneeds as f64),
@@ -10827,6 +10946,13 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-rebasedrops"
         | "supdb-settleshedunbound"
         | "supdb-rebasedropsshed"
+        | "supdb-settleformnear"
+        | "supdb-settlegallop"
+        | "supdb-settlepatchwhole"
+        | "supdb-settlevaluenear"
+        | "supdb-settlenoahead"
+        | "supdb-settletablenear"
+        | "supdb-headslook"
         | "supdb-nochainwrites"
         | "supdb-noland"
         | "supdb-landnearscans"
@@ -11557,6 +11683,97 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     d,
                     Policy {
                         settleshedunbound: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-settleformnear" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        settleformnear: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-settlegallop" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        settlegallop: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-settlepatchwhole" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        settlepatchwhole: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-settlevaluenear" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        settlevaluenear: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-settletablenear" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        settletablenear: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-headslook" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        headslook: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        // All five at once, the settle's loops as they stood before any of
+        // their asks ahead: the form's header, the seek's stride, the
+        // patch's lines by its cut, the value's and the table's own.
+        "supdb-settlenoahead" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        settleformnear: true,
+                        settlegallop: true,
+                        settlepatchwhole: true,
+                        settlevaluenear: true,
+                        settletablenear: true,
                         ..Policy::default()
                     },
                 )

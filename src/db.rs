@@ -483,6 +483,9 @@ pub struct ZCounts {
     /// that seek them, and those submitted (`Options::heads_willneed`).
     pub head_asks: u64,
     pub head_submitted: u64,
+    /// Looks at whether a partition's heads are all resident, which stand
+    /// in for those asks while they say so (`Options::heads_look_ms`).
+    pub head_looks: u64,
     /// Block-boundary keys the block cache read off an ordered index's top
     /// level, in memory, where it read a record before
     /// (`Options::boundary_keys_from_top`).
@@ -4578,6 +4581,101 @@ pub struct Options {
     /// releases falling differently in each: unresolved, so the kilobyte is
     /// the default and `supdb-copyprefetchwhole` is the arm.
     pub copy_prefetch_whole: bool,
+    /// How many of a settle's keys ahead the header of the block form a
+    /// key will be patched into is asked for, before the form's buffers
+    /// are, one group ahead (0: the buffers alone, as it was). The patch
+    /// loop asks for the next group's form while it patches this one's,
+    /// and the ask reads the form's header to find its buffers: over a
+    /// batch whose every key is another block's, a full rewrite's, that
+    /// header is a line nothing has touched since the block's last patch,
+    /// so the ask for the buffers waited a miss for it -- a fifth of the
+    /// loop's own samples on the load of the form's kind and a sixth on
+    /// the first prefetch behind the buffer's address, a tenth of the
+    /// upkeep thread over a full rewrite at three million keys. Asked a
+    /// few keys ahead by the slot's pointer alone, which is in the table,
+    /// the header is in the core when the buffers are asked for.
+    /// `supdb-settleformnear` is the one ask.
+    pub settle_form_ahead: usize,
+    /// How many of a settle's keys ahead the stride of heads a raw
+    /// resolve will search is named from the ordered index's top level,
+    /// in memory, and asked of the core (`OrdIndex::plan_seek`; 0: each
+    /// key's seek gallops from the rank the key before it resolved to, as
+    /// it did). The gallop was built for a batch dense in its partition,
+    /// keys a few ranks apart over heads the last seek left warm. A full
+    /// rewrite's passes under the syncing pace hold a few thousand keys
+    /// of a store of millions, a few thousand ranks apart, and the gallop
+    /// over that distance is a dozen probes and a binary search of ten
+    /// more, a line each and each waiting on the one before: a sixth of
+    /// the upkeep thread over the burst at three million keys, nine
+    /// tenths of it on the two head loads. A seek from the top level
+    /// reads one stride, eight lines, and pays their miss at the seek,
+    /// which priced level against the gallop for keys two hundred ranks
+    /// apart (`docs/engine.md`); named a few keys ahead, the lines arrive
+    /// while the keys before are resolved. `supdb-settlegallop` is the
+    /// gallop.
+    pub settle_seek_ahead: usize,
+    /// A settle's patch into a copy block asks for the lines it touches
+    /// by the key's cut, in place of the whole form. The patch loop asked
+    /// for the next group's form whole while it patched this one's -- a
+    /// copy's entries, its keys and the first kilobyte of its values,
+    /// forty-eight lines -- which is what a search over the copy reads. A
+    /// patch whose cut is the key's own record in a copy whose entries are
+    /// the block's records (`CachedBlock::identity`,
+    /// `Options::copy_start_at_rank`) searches nothing: it reads the one
+    /// entry at the rank and writes the run that entry names, three lines,
+    /// two of them past the first kilobyte for five records in six and so
+    /// never asked for. Over a full rewrite under the syncing pace every
+    /// visit to a block is one key's, three in four of them such a patch:
+    /// the copy of the run into the form was an eighth of the upkeep
+    /// thread waiting on its destination, behind forty-eight lines the
+    /// patch did not read. The entry's line is asked for three keys ahead,
+    /// once the form's header has arrived (`Options::settle_form_ahead`),
+    /// and the run it names one key ahead; every other form, and a group
+    /// with a key the copy must be searched for, is asked for whole as it
+    /// was. `supdb-settlepatchwhole` asks for every form whole.
+    pub settle_patch_at_cut: bool,
+    /// The bytes of a written value a settle asks for with the chunk's
+    /// header, four keys ahead of the patch that copies the value into its
+    /// run (0: the header alone, as it was). The chunk is the writer's
+    /// last store to that memory and the upkeep thread's first read of it,
+    /// a line the writer's core holds: the header's line was asked for
+    /// and the value's other lines were the copy's to wait on.
+    /// `supdb-settlevaluenear` asks for the header alone.
+    pub settle_value_ahead: usize,
+    /// How many of a settle's keys ahead the block table's own lines for
+    /// a key are asked for: the slot that names its block's form, the
+    /// promoted copy's and the reads' beside it, and for a key the table
+    /// files as created since the snapshot the header of its block's list
+    /// (0: none, as it was), with the list's end asked for one key ahead.
+    /// The table keeps a block's state in an array a field, a megabyte
+    /// and more over a store of millions of keys, and a settle whose
+    /// every key is another block's reads a line of each: with the form's
+    /// own lines asked for ahead, the loop's samples sat on these -- the
+    /// list's header a seventh of them, the slot's load ahead of the
+    /// form's header as much again. `supdb-settletablenear` asks for
+    /// none.
+    pub settle_table_ahead: usize,
+    /// EXPERIMENT: how long a look at whether a partition's heads are all
+    /// in the page cache stands, in milliseconds, for the asks a settle
+    /// makes ahead of its resolves out of core (`heads_willneed`): while a
+    /// look says they are, the settle asks for none of them (0, the
+    /// default: every ask reads its own page's residency). An ask is
+    /// refused where its first page is resident, which it learns by a
+    /// `mincore` of its own, so a store that reads as out of core with
+    /// most of its ordered indexes in memory -- three million keys under
+    /// 1.25 GiB at the controller's census -- pays a call a key to be told
+    /// so, a tenth of the upkeep thread over the full rewrite's burst. One
+    /// look a partition every hundred milliseconds took that tenth off the
+    /// thread's CPU and put more than it back as waiting: under the bound
+    /// the indexes' pages leave the cache all through the burst, three to
+    /// five thousand of the thread's seeks faulted on one gone since its
+    /// partition's look where six hundred did with an ask a key, the
+    /// writer was held a quarter to a half longer and the burst read one
+    /// to three percent longer in both orders (`docs/engine.md`). The
+    /// calls are the price of pages that will not stay, and the lever is
+    /// keeping them. `supdb-headslook` is the look, at a hundred
+    /// milliseconds.
+    pub heads_look_ms: u32,
     /// The hot-raw policy's skew bar read against the room
     /// (`Maint::z_hot_look`): the candidate partition is asked for where its
     /// raw bytes fit the group's unused memory and it is read more a key
@@ -4996,6 +5094,12 @@ impl Default for Options {
             zpages_seek_seeds: false,
             sweep_remembers_pin: true,
             copy_prefetch_whole: false,
+            settle_form_ahead: 6,
+            settle_seek_ahead: 8,
+            settle_patch_at_cut: true,
+            settle_value_ahead: 180,
+            settle_table_ahead: 12,
+            heads_look_ms: 0,
             zpages_hot_skew_room: false,
             zpages_walk_owns_decodes: false,
             zpages_hot_cold_back: false,
@@ -10995,6 +11099,9 @@ struct Slot {
     /// (`Options::heads_willneed`).
     zheadasks: AtomicU64,
     zheadsubmitted: AtomicU64,
+    /// Looks at a partition's heads' residency whole
+    /// (`Options::heads_look_ms`).
+    zheadlooks: AtomicU64,
     /// Partition walks of a scan served by a form file, the groups decoded
     /// for them, and the runs of records no page holds the raw form walked
     /// inside them.
@@ -11081,6 +11188,7 @@ impl Slot {
             zwillneedasks: AtomicU64::new(0),
             zheadasks: AtomicU64::new(0),
             zheadsubmitted: AtomicU64::new(0),
+            zheadlooks: AtomicU64::new(0),
             zscanz: AtomicU64::new(0),
             zscangroups: AtomicU64::new(0),
             znopagescans: AtomicU64::new(0),
@@ -14761,6 +14869,22 @@ fn prefetch_form(form: &Cached, whole: bool) {
     }
 }
 
+/// The copy a settle's patch of the key at `cut` writes by its rank, and
+/// the entry: block `b`'s form where it is a copy whose entries are the
+/// block's records (`CachedBlock::identity`) and the cut is the key's own
+/// record's, as `Reader::splice_run` decides it. `None` for every other
+/// form and cut, which a patch searches the form for.
+fn copy_entry_at(table: &BlockTable, b: u32, cut: u32) -> Option<(&CachedBlock, usize)> {
+    if cut == LAZY_CUT || cut & 1 == 0 {
+        return None;
+    }
+    let Some(Cached::Block(blk)) = table.slots.get(b as usize)?.as_deref() else {
+        return None;
+    };
+    let j = ((cut >> 1) as usize).checked_sub(b as usize * CACHE_BLOCK)?;
+    (blk.identity && j < blk.ents.len()).then_some((blk, j))
+}
+
 /// The lines a walk of `form` over the partition's ranks `from` to `n`
 /// on will read, asked for ahead of it: the form's own, and for a form
 /// walked in the partition the records' span, its end read from the
@@ -15452,6 +15576,9 @@ const FROZEN_CAP: usize = 3;
 const SETTLE_RUN: usize = 8192;
 const SETTLE_LEAD: usize = 65536;
 const SETTLE_AHEAD: usize = 64;
+/// The settle's planned seeks kept at once (`Options::settle_seek_ahead`,
+/// which is held under it): a ring over the batch's positions.
+const SETTLE_PLANS: usize = 16;
 
 /// The most a scan asks the kernel for ahead of one walk
 /// (`Options::blocks_willneed`, `Options::pieces_willneed`): a scan's
@@ -17305,6 +17432,20 @@ struct FormsState {
     /// under `Options::zpages_block_cursor` resolves them where its walk
     /// stops and counts none.
     lazy_cuts: std::cell::Cell<[u64; 2]>,
+    /// The settle's resolves whose stride was planned ahead
+    /// (`Options::settle_seek_ahead`).
+    seeks_planned: std::cell::Cell<u64>,
+    /// Per partition by position, the last look at its heads' residency:
+    /// the segment looked at, when, and whether every page was resident
+    /// (`Options::heads_look_ms`).
+    heads_looks: std::cell::RefCell<Vec<Option<(u64, std::time::Instant, bool)>>>,
+    /// The settle's patches whose lines were asked for by the cut
+    /// (`Options::settle_patch_at_cut`).
+    patch_asks: std::cell::Cell<u64>,
+    /// Keys whose block form's header a settle asked for ahead
+    /// (`Options::settle_form_ahead`), and keys whose lines of the block
+    /// table it asked for ahead (`Options::settle_table_ahead`).
+    settle_ahead: std::cell::Cell<[u64; 2]>,
     /// For a pass on the upkeep thread: the most writes it reads from the
     /// live log, and the most it settles from the frozen tables' carried
     /// lists, and whether it stopped short of either, for the thread to
@@ -17457,6 +17598,10 @@ impl FormsState {
             span_starts: std::cell::Cell::new(0),
             start_cache: std::cell::RefCell::new(StartCache::new()),
             lazy_cuts: std::cell::Cell::new([0; 2]),
+            seeks_planned: std::cell::Cell::new(0),
+            heads_looks: std::cell::RefCell::new(Vec::new()),
+            patch_asks: std::cell::Cell::new(0),
+            settle_ahead: std::cell::Cell::new([0; 2]),
             read_cap: std::cell::Cell::new(0),
             pass_lent: std::cell::Cell::new(0),
             pass_batch: std::cell::Cell::new(0),
@@ -20497,6 +20642,7 @@ impl Reader {
             willneed_asks: rd.stat(|s| &s.zwillneedasks),
             head_asks: rd.stat(|s| &s.zheadasks),
             head_submitted: rd.stat(|s| &s.zheadsubmitted),
+            head_looks: rd.stat(|s| &s.zheadlooks),
             top_keys: get(&self.shared.asks.top_keys),
             dir_willneeds: get(&self.shared.asks.dir_runs),
             dir_asks: get(&self.shared.asks.dir_submitted),
@@ -20808,6 +20954,27 @@ impl Reader {
         if seg.ord.willneed_heads(lo, hi) > 0 {
             self.zbump(|s| &s.zheadsubmitted);
         }
+    }
+
+    /// Whether partition `at`'s heads were all resident at the last look,
+    /// the look made again once it is `Options::heads_look_ms` old or the
+    /// partition there is another segment (`OrdIndex::heads_all_resident`).
+    fn heads_warm(&self, at: usize, seg: &Seg, now: std::time::Instant) -> bool {
+        let id = seg.blob.id();
+        let mut looks = self.fs().heads_looks.borrow_mut();
+        if looks.len() <= at {
+            looks.resize(at + 1, None);
+        }
+        let stands = std::time::Duration::from_millis(u64::from(self.opts.heads_look_ms));
+        if let Some((seen, when, warm)) = looks[at] {
+            if seen == id && now.saturating_duration_since(when) < stands {
+                return warm;
+            }
+        }
+        let warm = seg.ord.heads_all_resident();
+        self.zbump(|s| &s.zheadlooks);
+        looks[at] = Some((id, now, warm));
+        warm
     }
 
     /// The partition `key` falls in, of the first `np` segments: stepped to
@@ -21321,6 +21488,25 @@ impl Reader {
 
     fn cache_owner_of(&self, seg: &Seg, key: &[u8], floor: usize) -> (usize, u32) {
         let (rank, same) = self.cache_seek_exact(seg, key, floor);
+        let owner = if same { rank } else { rank.saturating_sub(1) };
+        (owner / CACHE_BLOCK, ((rank as u32) << 1) | same as u32)
+    }
+
+    /// `cache_owner_of` over the raw form's heads for a key whose stride
+    /// was planned ahead (`OrdIndex::plan_seek`,
+    /// `Options::settle_seek_ahead`): the seek's answer, from the one
+    /// stride.
+    fn cache_owner_planned(
+        &self,
+        seg: &Seg,
+        key: &[u8],
+        plan: crate::ordindex::SeekPlan,
+    ) -> (usize, u32) {
+        let keys = seg.blob.keys();
+        let (rank, exact) = seg
+            .ord
+            .seek_exact_planned(plan, key, |r| seg.raw().key_at(r));
+        let same = rank < keys && exact.unwrap_or_else(|| seg.raw().key_at(rank) == Some(key));
         let owner = if same { rank } else { rank.saturating_sub(1) };
         (owner / CACHE_BLOCK, ((rank as u32) << 1) | same as u32)
     }
@@ -25549,6 +25735,21 @@ impl Reader {
         let page = crate::bytes::os_page_size();
         let asking =
             self.opts.heads_willneed && out_of_core(&self.opts, self.shared.zgate.load()) && np > 0;
+        // One look a partition first (`Options::heads_look_ms`): the raw
+        // partitions whose heads are not all resident are the ones asked
+        // for, and with none there is no asking in this settle.
+        let cold: Vec<bool> = if asking && self.opts.heads_look_ms > 0 {
+            let now = std::time::Instant::now();
+            self.segs()[..np]
+                .iter()
+                .enumerate()
+                .map(|(p, s)| self.zc(s).is_none() && !self.heads_warm(p, s, now))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let asking = asking && (self.opts.heads_look_ms == 0 || cold.iter().any(|&c| c));
+        let asked_of = |p: usize| cold.get(p).copied().unwrap_or(true);
         // Per partition: the rank the asks have reached, the page of the
         // last resolve and whether the batch reads dense there; then the
         // sparse cursor's position in the batch and its partition.
@@ -25560,11 +25761,47 @@ impl Reader {
         };
         let mut dense: Vec<bool> = if asking { vec![false; np] } else { Vec::new() };
         let (mut ahead, mut at_ahead) = (0usize, 0usize);
+        // The raw resolves' strides, planned a few keys ahead
+        // (`Options::settle_seek_ahead`): a cursor over the batch that
+        // names each key's partition and its stride there from the top
+        // level and asks the core for the stride's lines, the partition
+        // and the plan kept for the key's own turn by its position in the
+        // batch. The cursor skips what the loop skips, a key's writes
+        // after its first, and steps from partition to partition as the
+        // loop does, over the same keys in the same order, so the
+        // partition it names is the one the loop would.
+        let seek_ahead = self.opts.settle_seek_ahead.min(SETTLE_PLANS - 1);
+        let mut plans: [(usize, usize, Option<crate::ordindex::SeekPlan>); SETTLE_PLANS] =
+            [(usize::MAX, 0, None); SETTLE_PLANS];
+        let (mut pre, mut at_pre, mut top_pre, mut slot_pre) = (0usize, 0usize, usize::MAX, last);
+        let mut planned = 0u64;
         for (n, &(_, _, i)) in keyed.iter().enumerate() {
             // A resolve out of core is a major fault a key: the ask to
             // give up is heard between them, not after the batch.
             if n % 64 == 63 && self.abandon_asked() {
                 return Ok(());
+            }
+            if seek_ahead > 0 && np > 0 {
+                while pre < keyed.len() && pre <= n + seek_ahead {
+                    let (_, _, j) = keyed[pre];
+                    let (off, len, _, slot) = pending[j as usize];
+                    plans[pre % SETTLE_PLANS] = (usize::MAX, 0, None);
+                    if slot != slot_pre {
+                        slot_pre = slot;
+                        let k = src.key_at(off, len);
+                        let was = at_pre;
+                        at_pre = self.settle_partition(np, at_pre, k);
+                        if at_pre != was {
+                            top_pre = usize::MAX;
+                        }
+                        let plan = match self.segs()[..np].get(at_pre) {
+                            Some(s) if self.zc(s).is_none() => s.ord.plan_seek(k, &mut top_pre),
+                            _ => None,
+                        };
+                        plans[pre % SETTLE_PLANS] = (pre, at_pre, plan);
+                    }
+                    pre += 1;
+                }
             }
             let (off, len, new, slot) = pending[i as usize];
             // A key's writes are adjacent here and skipped past the first,
@@ -25579,7 +25816,13 @@ impl Reader {
             // one in key order (`settle_partition`); the seek's floor and
             // the lazy filing's hint are the partition's.
             let was = at;
-            at = self.settle_partition(np, at, key);
+            let ahead_of = plans[n % SETTLE_PLANS];
+            at = if ahead_of.0 == n {
+                debug_assert_eq!(ahead_of.1, self.settle_partition(np, at, key));
+                ahead_of.1
+            } else {
+                self.settle_partition(np, at, key)
+            };
             if at != was {
                 floor = 0;
                 zhint = usize::MAX;
@@ -25604,7 +25847,7 @@ impl Reader {
                     let Some(s) = self.segs()[..np].get(at_ahead) else {
                         continue;
                     };
-                    if dense[at_ahead] || self.zc(s).is_some() {
+                    if dense[at_ahead] || self.zc(s).is_some() || !asked_of(at_ahead) {
                         continue;
                     }
                     if let Some((lo, hi)) = s.ord.stride_window(k) {
@@ -25624,7 +25867,19 @@ impl Reader {
                     (b, LAZY_CUT)
                 }
                 None => {
-                    let (b, cut) = self.cache_owner_of(seg, key, floor);
+                    // The stride planned for this key, where the cursor
+                    // ahead planned one in this partition and no form file
+                    // has come to serve it since; the gallop otherwise.
+                    let plan = ahead_of
+                        .2
+                        .filter(|_| ahead_of.0 == n && self.zc(seg).is_none());
+                    let (b, cut) = match plan {
+                        Some(plan) => {
+                            planned += 1;
+                            self.cache_owner_planned(seg, key, plan)
+                        }
+                        None => self.cache_owner_of(seg, key, floor),
+                    };
                     floor = (cut >> 1) as usize;
                     (b, cut)
                 }
@@ -25633,7 +25888,7 @@ impl Reader {
             // after this one -- this one is resident, the resolve just
             // seized it, and an ask that starts on a resident page asks
             // nothing -- until the frontier stands the lead past the rank.
-            if asking && cut != LAZY_CUT && self.zc(seg).is_none() {
+            if asking && cut != LAZY_CUT && self.zc(seg).is_none() && asked_of(at) {
                 let rank = (cut >> 1) as usize;
                 let pg = seg.ord.head_page(rank, page);
                 dense[at] = last_page[at] != usize::MAX && pg.saturating_sub(last_page[at]) <= 1;
@@ -25658,6 +25913,10 @@ impl Reader {
             let mut c = fs.lazy_cuts.get();
             c[0] += lazy_n;
             fs.lazy_cuts.set(c);
+        }
+        if planned > 0 {
+            let fs = self.fs();
+            fs.seeks_planned.set(fs.seeks_planned.get() + planned);
         }
         // By partition and then by position: a cut packs the rank it is
         // taken at, and a cut left unresolved sorts after its block's
@@ -25692,7 +25951,13 @@ impl Reader {
         density[0] += 1;
         let mut group_end = 0usize;
         let mut rebuild = false;
-        let mut ahead: Option<(u32, u32)> = None;
+        let mut ahead: Option<(u32, u32, bool)> = None;
+        let far = self.opts.settle_form_ahead;
+        let at_cut = self.opts.settle_patch_at_cut && self.opts.copy_start_at_rank;
+        let tfar = self.opts.settle_table_ahead;
+        let value_ahead = CHUNK_HDR + self.opts.settle_value_ahead;
+        let mut asked = 0u64;
+        let mut ahead_asks = [0u64; 2];
         for (i, &(at, b, cut, off, len, new, slot)) in resolved.iter().enumerate() {
             if i == group_end {
                 group_end = resolved[i..]
@@ -25713,7 +25978,16 @@ impl Reader {
                 // settle's time, and the keys are grouped by block here,
                 // so the next block's buffers have this group's patches
                 // to arrive in.
-                ahead = resolved.get(group_end).map(|r| (r.0, r.1));
+                // Whole, unless every key of that group is a patch by
+                // its rank, whose lines are asked for key by key below.
+                ahead = resolved.get(group_end).map(|r| {
+                    let exact = at_cut
+                        && resolved[group_end..]
+                            .iter()
+                            .take_while(|n| (n.0, n.1) == (r.0, r.1))
+                            .all(|n| n.2 != LAZY_CUT && n.2 & 1 == 1);
+                    (r.0, r.1, exact)
+                });
             }
             // The keys two ahead, whose bytes this loop reads in key
             // order where the log wrote them in arrival order: a miss
@@ -25735,7 +26009,7 @@ impl Reader {
             }
             if let Some(&(.., s4)) = resolved.get(i + 4) {
                 if s4 != u32::MAX {
-                    src.prefetch_chunk(MemTable::head(src.entry(s4 as usize)), CHUNK_HDR);
+                    src.prefetch_chunk(MemTable::head(src.entry(s4 as usize)), value_ahead);
                 }
             }
             let (at, b) = (at as usize, b as usize);
@@ -25746,10 +26020,89 @@ impl Reader {
                 self.shared.forms_events[4].fetch_add(1, AtomicOrdering::Relaxed);
                 continue;
             };
-            if let Some((at2, b2)) = ahead.take() {
+            // The table's own lines for a key further ahead
+            // (`Options::settle_table_ahead`): its block's slot with the
+            // promoted copy's and the reads', and its list's header where
+            // the table files the key as created; and one key ahead the
+            // list's end, where the push writes.
+            if tfar > 0 {
+                if let Some(&(at4, b4, _, _, _, new4, _)) = resolved.get(i + tfar) {
+                    let b4 = b4 as usize;
+                    if at4 == at as u32 && b4 < table.slots.len() {
+                        ahead_asks[1] += 1;
+                        prefetch_lines(table.slots[b4..].as_ptr() as *const u8, 8);
+                        prefetch_lines(table.dense[b4..].as_ptr() as *const u8, 8);
+                        prefetch_lines(table.reads[b4..].as_ptr() as *const u8, 4);
+                        if new4 {
+                            if let Some(list) = table.added.get(b4) {
+                                prefetch_lines(std::ptr::from_ref(list) as *const u8, 24);
+                            }
+                        }
+                    }
+                }
+                if let Some(&(at1, b1, _, _, _, true, _)) = resolved.get(i + 1) {
+                    if at1 == at as u32 {
+                        if let Some(list) = table.added.get(b1 as usize) {
+                            if list.capacity() > list.len() {
+                                // SAFETY: a hint, and one past the list's
+                                // last entry is inside its buffer.
+                                prefetch_lines(
+                                    unsafe { list.as_ptr().add(list.len()) } as *const u8,
+                                    8,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            // The header of the form a key a few ahead lands in, by the
+            // slot's pointer and with nothing of the form read: the ask for
+            // a form's buffers below reads the header to find them
+            // (`Options::settle_form_ahead`).
+            if far > 0 {
+                if let Some(&(at3, b3, ..)) = resolved.get(i + far) {
+                    if at3 == at as u32 && b3 != b as u32 {
+                        if let Some(form) = table.slots.get(b3 as usize).and_then(|s| s.as_ref()) {
+                            ahead_asks[0] += 1;
+                            prefetch_lines(
+                                std::sync::Arc::as_ptr(form) as *const u8,
+                                std::mem::size_of::<Cached>(),
+                            );
+                        }
+                    }
+                }
+            }
+            // The lines a patch by its rank touches, by the cut
+            // (`Options::settle_patch_at_cut`): the entry's line three
+            // keys ahead, the form's header asked for above having
+            // arrived, and one key ahead the run that entry names.
+            if at_cut {
+                if let Some(&(at2, b2, cut2, ..)) = resolved.get(i + 3) {
+                    if at2 == at as u32 {
+                        if let Some((blk, j)) = copy_entry_at(table, b2, cut2) {
+                            prefetch_lines(blk.ents[j..].as_ptr() as *const u8, 16);
+                        }
+                    }
+                }
+                if let Some(&(at1, b1, cut1, ..)) = resolved.get(i + 1) {
+                    if at1 == at as u32 {
+                        if let Some((blk, j)) = copy_entry_at(table, b1, cut1) {
+                            let e = blk.ents[j];
+                            let from = (e[2] as usize).min(blk.vals.len());
+                            let len = (e[3] as usize + 63).min(blk.vals.len() - from);
+                            prefetch_lines(blk.vals[from..].as_ptr(), len);
+                            asked += 1;
+                        }
+                    }
+                }
+            }
+            if let Some((at2, b2, exact)) = ahead.take() {
                 if at2 == at as u32 {
                     if let Some(form) = table.slots.get(b2 as usize).and_then(|s| s.as_deref()) {
-                        prefetch_form(form, self.opts.copy_prefetch_whole);
+                        let by_cut = exact && matches!(form, Cached::Block(blk) if blk.identity);
+                        if !by_cut {
+                            prefetch_form(form, self.opts.copy_prefetch_whole);
+                        }
                     }
                 }
             }
@@ -25836,6 +26189,17 @@ impl Reader {
             }
         }
         self.fs().settle_density.set(density);
+        if asked > 0 {
+            let fs = self.fs();
+            fs.patch_asks.set(fs.patch_asks.get() + asked);
+        }
+        if ahead_asks != [0; 2] {
+            let fs = self.fs();
+            let mut c = fs.settle_ahead.get();
+            c[0] += ahead_asks[0];
+            c[1] += ahead_asks[1];
+            fs.settle_ahead.set(c);
+        }
         Ok(())
     }
 
@@ -31853,6 +32217,29 @@ impl Db {
     pub fn lazy_cuts(&self) -> [u64; 2] {
         self.take_back_upkeep();
         self.r.fs().lazy_cuts.get()
+    }
+
+    /// The writer's own settles' resolves whose stride of heads was
+    /// planned ahead of the seek (`Options::settle_seek_ahead`).
+    pub fn seeks_planned(&self) -> u64 {
+        self.take_back_upkeep();
+        self.r.fs().seeks_planned.get()
+    }
+
+    /// The writer's own settles' patches into a copy by its rank whose
+    /// run was asked for by the key's cut ahead of the patch
+    /// (`Options::settle_patch_at_cut`).
+    pub fn patch_asks(&self) -> u64 {
+        self.take_back_upkeep();
+        self.r.fs().patch_asks.get()
+    }
+
+    /// The writer's own settles' keys whose block form's header was asked
+    /// for ahead of its patch (`Options::settle_form_ahead`), and those
+    /// whose lines of the block table were (`Options::settle_table_ahead`).
+    pub fn settle_ahead_asks(&self) -> [u64; 2] {
+        self.take_back_upkeep();
+        self.r.fs().settle_ahead.get()
     }
 
     /// The writer's own seeks that hinted their stride window's

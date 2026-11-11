@@ -549,6 +549,19 @@ it (`Options::rebase_recuts_sparse` off), `supdb-settleshedunbound` with
 the fills' forms shed where their room goes while the cache's budget is
 not bound (`Options::forms_settle_sheds_unbound`), and
 `supdb-rebasedropsshed` with both, the default as it stood before the two;
+`supdb-settlegallop`, `supdb-settleformnear`, `supdb-settlepatchwhole`,
+`supdb-settlevaluenear` and `supdb-settletablenear` are `supdb` with one of
+a settle's asks ahead taken away -- each raw resolve a gallop over the
+heads where its stride is planned (`Options::settle_seek_ahead`), the next
+form's header read where its buffers are asked for
+(`Options::settle_form_ahead`), a copy patched by its rank asked for whole
+(`Options::settle_patch_at_cut`), a written chunk's header asked for
+without its value (`Options::settle_value_ahead`), the block table's own
+lines not asked for (`Options::settle_table_ahead`) -- and
+`supdb-settlenoahead` with all five, the loops as they stood;
+`supdb-headslook` is `supdb` with one look at a partition's heads'
+residency standing in for a settle's asks of the kernel for a hundred
+milliseconds (`Options::heads_look_ms`);
 `supdb-cache64tofitzpagesdropparse` and `supdb-cache64tofitautozpagesparse`
 are the forced form with the drop and the combined arm with their
 block-coded groups written by the engine's parsing encoder
