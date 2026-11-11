@@ -3399,6 +3399,409 @@ fn a_look_at_a_partitions_heads_stands_in_for_the_asks_while_they_are_resident()
     }
 }
 
+/// Away from the raw gate a mapping's pages leave the page cache between
+/// two seeks of them, and the ordered index is what every seek of a raw
+/// partition reads. So the segment work copies a raw-served partition's
+/// heads into the process's own memory (`Options::heads_owned`) and the
+/// index reads the copy: nothing is copied in core; out of core every
+/// partition's heads are, eight bytes a key; and with the index files put
+/// out of the cache the scans and a settled batch read none of them back,
+/// where without the option they do.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_raw_partitions_heads_are_held_in_memory_out_of_core() {
+    for owned in [true, false] {
+        let dir = scratch(&format!("heads-owned-{owned}"));
+        let mut db = Db::create(
+            &dir,
+            Options {
+                zpages: ZPages::Off,
+                partition_bytes: Some(160 << 10),
+                scan_block_cache: true,
+                heads_owned: owned,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let mut model = ordered_load(&mut db, 4000, 0x3B10F);
+        db.settle().unwrap();
+        let check = |db: &Db, model: &Model, what: &str| {
+            for start in [b"".to_vec(), spaced_key(1000), spaced_key(2500)] {
+                for limit in [1usize, 57, 300] {
+                    same_window(
+                        &scanned(db, &start, limit),
+                        &window(model, &start, limit),
+                        &format!(
+                            "{what}, from {:?} for {limit}",
+                            String::from_utf8_lossy(&start)
+                        ),
+                    );
+                }
+            }
+        };
+        let ord_files = || -> Vec<PathBuf> {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("ord-"))
+                })
+                .collect()
+        };
+        let parts = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("par-"))
+            .count() as u64;
+        assert!(parts >= 2, "several partitions: {parts}");
+        // Out of core with no scan in the store's life nothing is copied,
+        // however long the segment work looks: a load nothing scans seeks
+        // no heads.
+        db.zgate_set(1);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert_eq!(
+            db.heads_owned_counts(),
+            (0, 0, 0),
+            "nothing copied before a scan"
+        );
+        // Nor in core, scanned.
+        db.zgate_set(0);
+        check(&db, &model, "in core");
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert_eq!(db.heads_owned_counts(), (0, 0, 0), "nothing copied in core");
+        // Out of core and scanned: every partition's heads, a few a look.
+        db.zgate_set(1);
+        let t = std::time::Instant::now();
+        while owned && db.heads_owned_counts().0 < parts && t.elapsed().as_secs() < 20 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        if !owned {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let (made, given, bytes) = db.heads_owned_counts();
+        if owned {
+            assert_eq!(
+                (made, given),
+                (parts, 0),
+                "every partition's heads copied, none given back"
+            );
+            assert_eq!(bytes, 8 * model.len() as u64, "eight bytes a key");
+        } else {
+            assert_eq!((made, given, bytes), (0, 0, 0), "the mapping throughout");
+        }
+        // The index files out of the page cache, then scans and a settled
+        // batch: the copies are what they read.
+        for f in ord_files() {
+            unmap_pages(&f);
+            evict(&f);
+        }
+        let (size, before) = resident_under(&dir, "ord-");
+        assert!(
+            before < size / 2,
+            "{before} of {size} resident after the eviction"
+        );
+        check(&db, &model, "out of core, the index files evicted");
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let mut rng = Rng(0x3B10F1);
+        for k in keys.iter().step_by(5) {
+            let v = suite_value(&mut rng);
+            db.append(k, &v);
+            model.entry(k.clone()).or_default().push(v);
+        }
+        db.commit().unwrap();
+        check(&db, &model, "a batch settled");
+        let (_, after) = resident_under(&dir, "ord-");
+        if owned {
+            assert!(
+                after <= before,
+                "no seek read the mapping: {before} resident before, {after} after"
+            );
+        } else {
+            assert!(
+                after > before,
+                "the seeks read the mapping back: {before} resident before, {after} after"
+            );
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A partition a form file serves is sought through the form's fence, and
+/// no seek reads its heads: none is copied while the files serve, the
+/// copies made once the gate leaves the form (the test's seam: the census,
+/// with no controller to cover anything) are given back when the files
+/// serve again, through the epoch a reader that loaded a copy's address is
+/// pinned under, and the reads are right throughout.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_partitions_heads_are_given_back_where_a_form_file_serves_it() {
+    let dir = scratch("heads-given-back");
+    let mut db = Db::create(
+        &dir,
+        forced(|o| {
+            o.partition_bytes = Some(160 << 10);
+            o.scan_block_cache = true;
+        }),
+    )
+    .unwrap();
+    let model = ordered_load(&mut db, 4000, 0x3B110);
+    db.zpages_settle().unwrap();
+    let check = |db: &Db, what: &str| {
+        for start in [b"".to_vec(), spaced_key(1000), spaced_key(2500)] {
+            for limit in [1usize, 57, 300] {
+                same_window(
+                    &scanned(db, &start, limit),
+                    &window(&model, &start, limit),
+                    &format!(
+                        "{what}, from {:?} for {limit}",
+                        String::from_utf8_lossy(&start)
+                    ),
+                );
+            }
+        }
+    };
+    let c = db.zpage_counts();
+    assert!(
+        c.partitions >= 2 && c.form_files == c.partitions,
+        "every partition covered: {c:?}"
+    );
+    // Scanned, the files serving: nothing copied.
+    check(&db, "covered");
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    assert_eq!(
+        db.heads_owned_counts(),
+        (0, 0, 0),
+        "no copy under the form files"
+    );
+    // The gate at the census: the raw form serves every partition.
+    db.zgate_set(1);
+    let t = std::time::Instant::now();
+    while db.heads_owned_counts().0 < c.partitions && t.elapsed().as_secs() < 20 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let (made, _, bytes) = db.heads_owned_counts();
+    assert_eq!(made, c.partitions, "every partition's heads copied");
+    assert_eq!(bytes, 8 * model.len() as u64, "eight bytes a key");
+    check(&db, "raw-served, the heads copied");
+    // A handle holding a snapshot from before the copies are given back:
+    // it may have loaded a copy's address, so none is freed while it
+    // holds, and all are once it lets go.
+    let held = db.reader().unwrap();
+    held.snapshot();
+    db.zgate_set(2);
+    let t = std::time::Instant::now();
+    while db.heads_owned_counts().2 > 0 && t.elapsed().as_secs() < 20 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let (made, given, bytes) = db.heads_owned_counts();
+    assert_eq!(bytes, 0, "no copy held under the form files");
+    assert_eq!(given, made, "every copy made was given back");
+    check(&db, "the form files serving, the copies given back");
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    assert_eq!(
+        db.heads_retired_waiting() as u64,
+        given,
+        "every copy given back waits for the handle pinned before it"
+    );
+    held.release();
+    drop(held);
+    // Nothing reads or writes the store from here to the assertion: the
+    // look that gave the copies up is what frees them, on a later turn.
+    let t = std::time::Instant::now();
+    while db.heads_retired_waiting() > 0 && t.elapsed().as_secs() < 20 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert_eq!(
+        db.heads_retired_waiting(),
+        0,
+        "freed once no reader is pinned before them"
+    );
+    check(&db, "the copies freed");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Under the form's gate a copy is for a partition the form has declined,
+/// not for one the raw form is serving until its file is attached: every
+/// partition a merge lands is the second kind for a moment, and copied then
+/// it gave the copy back at once -- ninety-two copies and ninety-two given
+/// back over a lag sweep at ten million keys. A partition whose build is
+/// held is not copied however long it waits; one under the size floor,
+/// which no file will serve, is.
+#[cfg(target_os = "linux")]
+#[test]
+fn under_the_forms_gate_a_declined_partitions_heads_are_copied_and_a_waiting_ones_are_not() {
+    let scans = |db: &Db, model: &Model, what: &str| {
+        for start in [b"".to_vec(), spaced_key(1000), spaced_key(2500)] {
+            same_window(
+                &scanned(db, &start, 57),
+                &window(model, &start, 57),
+                &format!("{what}, from {:?}", String::from_utf8_lossy(&start)),
+            );
+        }
+    };
+    // Waiting: the builds held, the raw form serving, scans near.
+    let dir = scratch("heads-waiting");
+    let mut db = Db::create(
+        &dir,
+        forced(|o| {
+            o.partition_bytes = Some(160 << 10);
+            o.scan_block_cache = true;
+        }),
+    )
+    .unwrap();
+    db.hold_zpage_build(true);
+    let model = ordered_load(&mut db, 4000, 0x3B111);
+    scans(&db, &model, "waiting for the builds");
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    assert_eq!(db.zpage_counts().form_files, 0, "no file attached yet");
+    assert_eq!(
+        db.heads_owned_counts(),
+        (0, 0, 0),
+        "a partition waiting for its file is not copied"
+    );
+    db.hold_zpage_build(false);
+    db.zpages_settle().unwrap();
+    scans(&db, &model, "the files serving");
+    assert_eq!(db.heads_owned_counts(), (0, 0, 0), "nor one a file serves");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    // Declined: the engine's own floor over partitions of a hundred and
+    // sixty kilobytes.
+    let dir = scratch("heads-declined");
+    let mut db = Db::create(
+        &dir,
+        Options {
+            zpages: ZPages::Always,
+            partition_bytes: Some(160 << 10),
+            scan_block_cache: true,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let model = ordered_load(&mut db, 4000, 0x3B112);
+    db.zpages_settle().unwrap();
+    let c = db.zpage_counts();
+    assert!(
+        c.partitions >= 2 && c.declined_small == c.partitions,
+        "every partition declined for its size: {c:?}"
+    );
+    scans(&db, &model, "declined");
+    let t = std::time::Instant::now();
+    while db.heads_owned_counts().0 < c.partitions && t.elapsed().as_secs() < 20 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let (made, given, bytes) = db.heads_owned_counts();
+    assert_eq!((made, given), (c.partitions, 0), "copied and kept");
+    assert_eq!(bytes, 8 * model.len() as u64, "eight bytes a key");
+    scans(&db, &model, "declined, the heads copied");
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// At the census under the controller a copy is for a store the model says
+/// fits, whose census is the group's pressure: such a store sits there for
+/// as long as its writes make the group refault, every seek of it reads
+/// its heads, and they are copied. A store the model says does not fit is
+/// one the controller is weighing a purchase for, and neither while it
+/// weighs nor while it builds is a copy made -- the copies made between a
+/// crossing and its install read every index file from the device beside
+/// the first scans after a load, to be given back at the install.
+#[cfg(target_os = "linux")]
+#[test]
+fn at_the_census_the_controller_copies_heads_only_where_the_model_says_the_store_fits() {
+    let scan = |db: &Db, model: &Model, what: &str| {
+        let first = model.keys().next().unwrap().clone();
+        same_window(&scanned(db, &first, 50), &window(model, &first, 50), what);
+    };
+    // Pressure with room: the budget far over the store, the group
+    // refaulting. SUSPECT stands, the store is scanned, the heads copied.
+    let (dir, db, model, _inject) =
+        auto_store("heads-census-fits", 1 << 40, 1_000_000.0, FAULT_40US);
+    let parts = db.zpage_counts().partitions;
+    wait_secs(&db, 3, 1);
+    let c = db.zpage_counts();
+    assert_eq!((c.phase, c.gate), (1, 1), "SUSPECT on the pressure: {c:?}");
+    assert_eq!(db.heads_owned_counts().0, 0, "nothing copied before a scan");
+    scan(&db, &model, "the census, scanned");
+    let t = std::time::Instant::now();
+    while db.heads_owned_counts().0 < parts && t.elapsed().as_secs() < 20 {
+        wait_secs(&db, 1, 1);
+    }
+    let (made, given, bytes) = db.heads_owned_counts();
+    assert_eq!((made, given), (parts, 0), "every partition's heads copied");
+    assert_eq!(bytes, 8 * model.len() as u64);
+    scan(&db, &model, "the heads copied");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+    // A misfit with no evidence yet: SUSPECT stands while the controller
+    // waits for the reads' faults, and nothing is copied meanwhile.
+    let (dir, db, model, _inject) = suspect_store("heads-census-weighs");
+    scan(&db, &model, "weighing, scanned");
+    wait_secs(&db, 3, 1);
+    let c = db.zpage_counts();
+    assert_eq!((c.phase, c.gate), (1, 1), "still SUSPECT: {c:?}");
+    assert_eq!(
+        db.heads_owned_counts(),
+        (0, 0, 0),
+        "no copy while the controller weighs a purchase"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+    // A purchase in progress: driven to the build by point reads, which
+    // seek no heads, the build held, and the store scanned while it
+    // builds. No copy is made for a store the controller is covering,
+    // while it builds or once the files serve.
+    let (dir, db, model, inject) = blocked_store("heads-census-buys");
+    let first = model.keys().next().unwrap().clone();
+    let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+    let r = db.reader().unwrap();
+    let mut at = 0usize;
+    db.hold_zpage_build(true);
+    assert!(
+        drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 2, 400),
+        "building: {:?}",
+        db.zpage_counts()
+    );
+    wait_for("the build at its hold", || db.zpage_build_waiting());
+    same_window(
+        &scanned(&db, &first, 50),
+        &window(&model, &first, 50),
+        "building, scanned",
+    );
+    wait_steps(&db, 3);
+    let c = db.zpage_counts();
+    assert_eq!((c.gate, c.phase), (1, 2), "{c:?}");
+    assert_eq!(
+        db.heads_owned_counts(),
+        (0, 0, 0),
+        "no copy while the controller buys"
+    );
+    db.hold_zpage_build(false);
+    assert!(
+        drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 200),
+        "COMPACT: {:?}",
+        db.zpage_counts()
+    );
+    same_window(
+        &scanned(&db, &first, 50),
+        &window(&model, &first, 50),
+        "the files serving",
+    );
+    assert_eq!(
+        db.heads_owned_counts(),
+        (0, 0, 0),
+        "nor once the files serve"
+    );
+    drop(r);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The prefetch arm (`Options::zpages_scan_prefetch`): the scans agree
 /// with the model as without it, every walk that wants more than its
 /// first page asks once, and a walk of one key asks for nothing.

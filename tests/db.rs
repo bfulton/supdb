@@ -18342,3 +18342,84 @@ fn scans_that_meet_their_blocks_once_out_of_core_keep_no_forms() {
         check(&h, &want, start, "through a handle after the settle");
     }
 }
+
+/// The writes since the store's last scan are the live tables' logs, each
+/// write counted once. A landing from the segment work publishes a new
+/// generation over the live table it leaves alone, and counted by the
+/// generation both counts -- the commit's hand-over's, which paces a
+/// burst while scans are around, and the pass's, which files only then --
+/// took the table's whole log again at the commit after every landing.
+/// Over a full rewrite the count passed two stores' worth of writes with
+/// one written: the burst's last commits were neither paced nor filed,
+/// and the first scan after it settled them.
+#[test]
+fn the_writes_since_a_scan_are_counted_once_across_a_landing() {
+    for (name, upkeep) in [
+        ("inline", supdb::Upkeep::Inline),
+        ("thread", supdb::Upkeep::Background(1)),
+    ] {
+        let d = dir(&format!("writes-once-{name}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                scan_block_cache: true,
+                partition_bytes: Some(256 << 10),
+                upkeep,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let keys = 20_000u32;
+        let key = |k: u32| format!("key-{k:08}").into_bytes();
+        for k in 0..keys {
+            db.append(&key(k), &[b'v'; 40]);
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        assert!(db.levels().0 >= 2, "partitions: {:?}", db.levels());
+        // Rewrites of keys the store holds, in an order that is no run.
+        let mut at = 7u32;
+        let mut write = |db: &mut Db, n: u32| {
+            for _ in 0..n {
+                at = (at.wrapping_mul(7919).wrapping_add(13)) % keys;
+                db.append(&key(at), &[b'w'; 40]);
+            }
+            db.commit().unwrap();
+        };
+        // A scan, and the commit after it, which both counts start from.
+        let mut seen = 0usize;
+        db.scan(&key(0), 50, kv(&mut |_, _| seen += 1)).unwrap();
+        assert_eq!(seen, 50);
+        write(&mut db, 10);
+        let (hand0, pass0) = db.writes_since_scan();
+        // A batch, the table frozen with its seal held before its landing,
+        // a larger batch into the table after it, the landing -- a publish
+        // over that live table -- and a batch more.
+        let (a, b, c) = (300u32, 2_000u32, 300u32);
+        write(&mut db, a);
+        db.hold_seal_landing(true);
+        db.seal().unwrap();
+        write(&mut db, b);
+        assert!(db.in_flight().0, "the seal is in flight, held");
+        db.hold_seal_landing(false);
+        db.settle().unwrap();
+        write(&mut db, c);
+        let (hand, pass) = db.writes_since_scan();
+        let written = (a + b + c) as u64;
+        assert!(
+            pass - pass0 <= written,
+            "{name}: the pass counted {} of {written} written",
+            pass - pass0
+        );
+        if upkeep == supdb::Upkeep::Inline {
+            // Every commit's own maintenance counts.
+            assert_eq!(pass - pass0, written, "{name}: the pass's count");
+        } else {
+            // Every commit hands over, and its batch is its own.
+            assert_eq!(hand - hand0, written, "{name}: the hand-over's count");
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

@@ -4676,6 +4676,19 @@ pub struct Options {
     /// keeping them. `supdb-headslook` is the look, at a hundred
     /// milliseconds.
     pub heads_look_ms: u32,
+    /// Whether a partition's ordered-index heads are held in anonymous
+    /// memory while the store reads as out of core and the controller
+    /// leaves the partition to the raw form (`Maint::z_heads_look`), and
+    /// given back where a form file comes to serve it. The index is eight bytes a key that
+    /// every seek of a raw partition reads -- a scan's start, each key a
+    /// settle resolves -- and under a memory bound its mapping's pages
+    /// leave the cache between two of them however often they are read,
+    /// each one gone a wait on the device at the seek that finds it. In
+    /// the process's own memory they are not the cache's to take, and the
+    /// bound counts them either way. In core nothing moves: the copy is
+    /// made away from the raw gate alone, and only while scans are near.
+    /// `supdb-headsmapped` reads the mapping throughout.
+    pub heads_owned: bool,
     /// The hot-raw policy's skew bar read against the room
     /// (`Maint::z_hot_look`): the candidate partition is asked for where its
     /// raw bytes fit the group's unused memory and it is read more a key
@@ -5100,6 +5113,7 @@ impl Default for Options {
             settle_value_ahead: 180,
             settle_table_ahead: 12,
             heads_look_ms: 0,
+            heads_owned: true,
             zpages_hot_skew_room: false,
             zpages_walk_owns_decodes: false,
             zpages_hot_cold_back: false,
@@ -6542,6 +6556,11 @@ struct Seg {
     /// controller's build: looked at once, since a partition the load has
     /// pushed out does not come back.
     z_ahead_cold: std::sync::atomic::AtomicBool,
+    /// The copy of the ordered index's heads the index reads through while
+    /// the store reads as out of core and the raw form serves this
+    /// partition (`Options::heads_owned`); none otherwise. Set and taken
+    /// by the segment work's thread alone.
+    heads: std::sync::Mutex<Option<HeadsBuf>>,
 }
 
 /// The order the live segments hold: partitions first, disjoint and by
@@ -9442,6 +9461,50 @@ impl PieceWriter {
 }
 
 impl Seg {
+    /// The ordered index's heads copied into anonymous memory and read
+    /// from there from here on (`Options::heads_owned`): whether this call
+    /// made the copy. The mapping's pages are asked for whole first, since
+    /// the copy reads every one and the mapping is advised for seeks.
+    fn own_heads(&self) -> bool {
+        if self.ord.is_empty() {
+            return false;
+        }
+        let mut held = self.heads.lock().unwrap_or_else(|e| e.into_inner());
+        if held.is_some() {
+            return false;
+        }
+        self.ord.willneed_heads_all();
+        let src = self.ord.mapped_heads();
+        let p = blocks::alloc(src.len(), false, true);
+        // SAFETY: `p` is `src.len()` bytes just allocated, apart from the
+        // mapping `src` borrows.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), p, src.len()) };
+        // SAFETY: the copy is whole, and it is freed with the segment or
+        // through the epoch by whoever takes it out (`disown_heads`).
+        unsafe { self.ord.set_heads(p) };
+        *held = Some(HeadsBuf { p, len: src.len() });
+        true
+    }
+
+    /// The copy taken out and the index's reads returned to the mapping:
+    /// for the caller to retire through the epoch, since a reader pinned
+    /// before this may have loaded the copy's address.
+    fn disown_heads(&self) -> Option<HeadsBuf> {
+        let mut held = self.heads.lock().unwrap_or_else(|e| e.into_inner());
+        let buf = held.take()?;
+        self.ord.reset_heads();
+        Some(buf)
+    }
+
+    /// The bytes of the heads' copy, none where the mapping is read.
+    fn heads_bytes(&self) -> usize {
+        self.heads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map_or(0, |b| b.len)
+    }
+
     /// The partition's raw file and its ordered index dropped from the page
     /// cache once its form file serves it (`Options::zpages_drop_raw`): the
     /// store's mappings of them unmapped, then the files' clean pages
@@ -9706,6 +9769,7 @@ impl Seg {
                 z_backoff: AtomicU64::new(0),
                 z_warmed: std::sync::atomic::AtomicBool::new(false),
                 z_ahead_cold: std::sync::atomic::AtomicBool::new(false),
+                heads: std::sync::Mutex::new(None),
             });
         }
         if let Some(rest) = name
@@ -9749,6 +9813,7 @@ impl Seg {
                 z_backoff: AtomicU64::new(0),
                 z_warmed: std::sync::atomic::AtomicBool::new(false),
                 z_ahead_cold: std::sync::atomic::AtomicBool::new(false),
+                heads: std::sync::Mutex::new(None),
             });
         }
         // L0: the Bloom from the writer where it had the keys' hashes, and
@@ -9784,6 +9849,7 @@ impl Seg {
             z_backoff: AtomicU64::new(0),
             z_warmed: std::sync::atomic::AtomicBool::new(false),
             z_ahead_cold: std::sync::atomic::AtomicBool::new(false),
+            heads: std::sync::Mutex::new(None),
         })
     }
 
@@ -16016,6 +16082,13 @@ struct Shared {
     /// pinned reader as the forms and the snapshots are; a reader that
     /// loaded the pointer before the take may be walking it.
     retired_z: RetireList<RetiredZ>,
+    /// Copies of partitions' heads given up where a form file came to
+    /// serve the partition (`Options::heads_owned`), each under the epoch
+    /// its giving up bumped, freed past every pinned reader by the look
+    /// that gives them up (`Maint::z_heads_look`), on a later turn.
+    retired_heads: RetireList<HeadsBuf>,
+    /// Copies of heads made, and copies given up.
+    heads_events: [AtomicU64; 2],
     /// The dead names given to retired form files (`zfile::zpg_dead_name`).
     next_dead: AtomicU64,
     /// A test's holds on the builder's thread (`ZHOLD_START`,
@@ -16647,6 +16720,135 @@ impl Drop for RetiredZ {
         drop(unsafe { Box::from_raw(self.0) });
     }
 }
+
+/// A partition's ordered-index heads copied into anonymous memory
+/// (`Options::heads_owned`, `Seg::own_heads`): from the block allocator,
+/// so a copy of a megabyte or two is a mapping given back at its drop and
+/// counted with the store's other mapped blocks. Dropping it frees the
+/// copy: with its segment, or through the retire list, past every reader
+/// that could have loaded its address, where the segment gave it up.
+struct HeadsBuf {
+    p: *mut u8,
+    len: usize,
+}
+
+// SAFETY: plain bytes, written once before the address is published and
+// only read after.
+unsafe impl Send for HeadsBuf {}
+unsafe impl Sync for HeadsBuf {}
+
+impl Drop for HeadsBuf {
+    fn drop(&mut self) {
+        // SAFETY: from `blocks::alloc` with this length, mapped, and no
+        // reader reads it after: see the type's doc.
+        unsafe { blocks::free(self.p, self.len, true) };
+    }
+}
+
+/// Whether the controller leaves the store raw at the census after a step
+/// (`Maint::z_tick`, for `Maint::z_heads_look`), given whether it did
+/// before and the raw form's predicted faults a read where the step had the
+/// model's reading. A step out of SUSPECT, or one that asks for the
+/// sampler's reading or decides a build, says it does not. A step in
+/// SUSPECT with the model's reading says what the model says: the raw form
+/// fits, and the census is the group's pressure and no misfit of the
+/// store's -- the store that sits at the census for as long as its writes
+/// make the group refault -- or it does not fit, and the controller is
+/// weighing a purchase the reads' faults will make. A step between the
+/// model's readings changes nothing.
+fn heads_left_raw(was: bool, d: &zselect::Decision, phi_raw: Option<f64>) -> bool {
+    if d.phase != zselect::Phase::Suspect || d.sample || d.build {
+        false
+    } else {
+        phi_raw.map_or(was, |phi| phi <= 0.0)
+    }
+}
+
+#[cfg(test)]
+mod heads_left_raw_tests {
+    use super::*;
+
+    const FITS: Option<f64> = Some(0.0);
+    const MISFIT: Option<f64> = Some(0.3);
+
+    fn step(phase: zselect::Phase, sample: bool, build: bool) -> zselect::Decision {
+        zselect::Decision {
+            phase,
+            gate: phase.gate(),
+            census: true,
+            sample,
+            build,
+            retire: false,
+            event: None,
+        }
+    }
+
+    /// A crossing that ends in a purchase never reads as left raw: the
+    /// step that enters SUSPECT asks for the sample, the steps while the
+    /// reads' faults make the price have a model that says the raw form
+    /// does not fit, and the step that buys decides a build.
+    #[test]
+    fn a_crossing_that_buys_is_never_left_raw() {
+        use zselect::Phase::*;
+        let mut left = false;
+        for (d, phi) in [
+            (step(Fits, false, false), FITS),
+            (step(Suspect, true, false), MISFIT),
+            (step(Suspect, false, false), None),
+            (step(Suspect, false, false), MISFIT),
+            (step(Suspect, false, false), None),
+            (step(Building, false, true), MISFIT),
+            (step(Building, false, true), None),
+            (step(Compact, false, true), MISFIT),
+            (step(Compact, false, false), FITS),
+        ] {
+            left = heads_left_raw(left, &d, phi);
+            assert!(!left, "{d:?} model {phi:?}");
+        }
+    }
+
+    /// A store that fits and sits at the census is left raw from the first
+    /// step whose model says so, through the steps between readings, until
+    /// a reading says it no longer fits or a step asks for a sample or a
+    /// build or leaves SUSPECT.
+    #[test]
+    fn a_store_that_fits_at_the_census_is_left_raw_until_a_step_says_otherwise() {
+        use zselect::Phase::*;
+        let mut left = heads_left_raw(false, &step(Suspect, true, false), FITS);
+        assert!(!left, "the sample asked for");
+        left = heads_left_raw(left, &step(Suspect, false, false), None);
+        assert!(!left, "no reading of the model yet");
+        left = heads_left_raw(left, &step(Suspect, false, false), FITS);
+        assert!(left, "the model says the raw form fits");
+        left = heads_left_raw(left, &step(Suspect, false, false), None);
+        assert!(left, "a step between readings changes nothing");
+        assert!(
+            !heads_left_raw(left, &step(Suspect, false, false), MISFIT),
+            "the model says it no longer fits"
+        );
+        assert!(
+            !heads_left_raw(left, &step(Suspect, true, false), FITS),
+            "a sample asked for again"
+        );
+        assert!(
+            !heads_left_raw(left, &step(Suspect, false, true), FITS),
+            "a build decided"
+        );
+        assert!(
+            !heads_left_raw(left, &step(Fits, false, false), FITS),
+            "back to FITS"
+        );
+        assert!(
+            !heads_left_raw(left, &step(Building, false, false), FITS),
+            "building"
+        );
+    }
+}
+
+/// How many partitions' heads one look copies (`Maint::z_heads_look`): a
+/// copy is a read of the index's file where its pages have gone, on the
+/// thread every landing goes through.
+const HEADS_A_LOOK: usize = 4;
 
 /// Things replaced in what readers follow, each with the first epoch no
 /// reader pinned at or after can reach it by, freed once every pinned
@@ -17389,9 +17591,9 @@ struct FormsState {
     scans_seen: std::cell::Cell<u64>,
     /// EXPERIMENT: for `forms_settle_recent_pct`: the store's scan count
     /// as this handle last saw it at a commit, the writes it has counted
-    /// over the store's life (the log's growth, summed across
-    /// generations, from the generation and length it last counted at),
-    /// and the count at the last scan it saw.
+    /// over the store's life (the log's growth, summed across the live
+    /// tables, from the table and length it last counted at), and the
+    /// count at the last scan it saw.
     scans_life_seen: std::cell::Cell<u64>,
     writes_seen: std::cell::Cell<u64>,
     writes_at_scan: std::cell::Cell<u64>,
@@ -17743,8 +17945,8 @@ pub struct Db {
     /// for it; see `Upkeep::Background`.
     upkeeper: Option<Upkeeper>,
     /// The upkeep thread's regime, kept by the writer since the upkeep
-    /// itself may be lent: the generation and committed log length at
-    /// the last hand-over, the store's scan count as last seen, and the
+    /// itself may be lent: the live table (`State::lives`) and its
+    /// committed log length at the last hand-over, the store's scan count as last seen, and the
     /// writes committed since it last moved.
     upkeep_log: (u64, usize),
     upkeep_life: u64,
@@ -24639,14 +24841,23 @@ impl Reader {
         };
         // The writes since the last scan over the store, through whichever
         // handle: the log's growth since this handle last counted it, the
-        // whole log where the generation has changed since.
-        let (gen_counted, len_counted) = self.fs().log_counted.get();
-        let grew = if gen_counted == st.gen {
+        // whole log where the live table has changed since. By the table
+        // (`State::lives`) and not by the state's generation: a landing
+        // from the segment work publishes a new generation over the same
+        // live table, and counted by the generation every landing added
+        // the table's whole log again -- over a full rewrite, a seal's two
+        // landings and a merge's every hundred commits, the count passed
+        // two stores' worth with one written, the store read as far from
+        // reads for the burst's last few percent, and the first scan after
+        // it settled what nothing had filed.
+        let table = st.lives;
+        let (table_counted, len_counted) = self.fs().log_counted.get();
+        let grew = if table_counted == table {
             log_len.saturating_sub(len_counted)
         } else {
             log_len
         };
-        self.fs().log_counted.set((st.gen, log_len));
+        self.fs().log_counted.set((table, log_len));
         let writes = self.fs().writes_seen.get() + grew as u64;
         self.fs().writes_seen.set(writes);
         let life = self.shared.scans_life.load(AtomicOrdering::Relaxed);
@@ -28123,6 +28334,7 @@ impl Reader {
         }
         // What the segments derive and keep in memory.
         let (mut seg_ranks, mut seg_bounds, mut seg_bloom) = (0u64, 0u64, 0u64);
+        let mut seg_heads = 0u64;
         for s in &st.segs {
             s.ranks
                 .each(|v: &Vec<u32>| seg_ranks += v.capacity() as u64 * 4);
@@ -28131,6 +28343,7 @@ impl Reader {
             if let Some(b) = &s.bloom {
                 seg_bloom += b.blocks.capacity() as u64 * 64;
             }
+            seg_heads += s.heads_bytes() as u64;
         }
         // The allocations the forms are behind: an `Arc` a distinct form,
         // a box a published one.
@@ -28180,6 +28393,7 @@ impl Reader {
         put(&mut out, "seg_ranks", seg_ranks);
         put(&mut out, "seg_bounds", seg_bounds);
         put(&mut out, "seg_bloom", seg_bloom);
+        put(&mut out, "seg_heads", seg_heads);
         put(&mut out, "census_cap", cap_total);
         out
     }
@@ -29275,6 +29489,8 @@ impl Db {
             ord_rebuilt: AtomicU64::new(0),
             z: zfile::ZEvents::default(),
             retired_z: RetireList::new(),
+            retired_heads: RetireList::new(),
+            heads_events: [AtomicU64::new(0), AtomicU64::new(0)],
             next_dead: AtomicU64::new(1),
             zbuild_hold: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(zhold_of(&opts))),
             z_finish_live: std::sync::atomic::AtomicUsize::new(0),
@@ -29840,6 +30056,8 @@ impl Db {
             ord_rebuilt: AtomicU64::new(ord_rebuilt),
             z: zev,
             retired_z: RetireList::new(),
+            retired_heads: RetireList::new(),
+            heads_events: [AtomicU64::new(0), AtomicU64::new(0)],
             next_dead: AtomicU64::new(1),
             zbuild_hold: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(zhold_of(&opts))),
             z_finish_live: std::sync::atomic::AtomicUsize::new(0),
@@ -35498,12 +35716,16 @@ impl Db {
             let (log, len, wm) = mem.committed_at();
             (st.gen, log, len, wm, keys, st.lives)
         };
-        let batch = if self.upkeep_log.0 == gen {
+        // The batch is the live table's log since the last hand-over: by
+        // the table (`State::lives`), since a landing bumps the generation
+        // over the same table and the whole log would be this commit's
+        // batch (`Reader::settle_due` has the count's other half).
+        let batch = if self.upkeep_log.0 == lives {
             log.saturating_sub(self.upkeep_log.1)
         } else {
             log
         };
-        self.upkeep_log = (gen, log);
+        self.upkeep_log = (lives, log);
         // Reads around: a scan over the store since the last two stores'
         // worth of writes. The writer's own scans say so at every scan,
         // a handle's once per commit.
@@ -35922,6 +36144,40 @@ impl Db {
     /// segment and rebuilt from their segments' keys (`Options::ord_durable`).
     pub fn ord_rebuilt(&self) -> u64 {
         self.shared.ord_rebuilt.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Partitions' ordered-index heads copied into anonymous memory over
+    /// the store's life, copies given back, and the bytes of the copies
+    /// the live segments hold now (`Options::heads_owned`).
+    pub fn heads_owned_counts(&self) -> (u64, u64, u64) {
+        let _e = self.r.enter();
+        let bytes: usize = self.r.segs().iter().map(|s| s.heads_bytes()).sum();
+        (
+            self.shared.heads_events[0].load(AtomicOrdering::Relaxed),
+            self.shared.heads_events[1].load(AtomicOrdering::Relaxed),
+            bytes as u64,
+        )
+    }
+
+    /// A test's: the writes counted since the store's last scan, by the
+    /// commit's hand-over (`upkeep_since_scan`) and by the pass
+    /// (`Reader::settle_due`), each of which reads whether scans are
+    /// around from its count. The upkeep taken home to read the pass's.
+    #[doc(hidden)]
+    pub fn writes_since_scan(&mut self) -> (u64, u64) {
+        self.take_back_upkeep();
+        let fs = self.fs();
+        (
+            self.upkeep_since_scan,
+            fs.writes_seen.get().saturating_sub(fs.writes_at_scan.get()),
+        )
+    }
+
+    /// A test's: the heads' copies given back and not yet freed, each
+    /// waiting for the readers pinned before its giving back.
+    #[doc(hidden)]
+    pub fn heads_retired_waiting(&self) -> usize {
+        self.shared.retired_heads.len()
     }
 
     /// `Reader::memory_census` with the table a `sync` handed to a seal
@@ -38966,6 +39222,9 @@ struct Maint {
     z_sample_last: Option<ZReading>,
     z_handed_gen: u64,
     z_refresh_due: bool,
+    /// Whether the controller leaves the store raw at the census by its
+    /// last steps (`heads_left_raw`): what `z_heads_look` copies heads on.
+    z_leaves_raw: bool,
     /// The coding the selector chose at its last reading
     /// (`Options::zpages_coding_auto`, `zselect::choose_coding`), which the
     /// builds after it are planned in; none until a reading with both
@@ -39633,6 +39892,7 @@ impl Maint {
             z_sample_last: None,
             z_handed_gen: u64::MAX,
             z_refresh_due: false,
+            z_leaves_raw: false,
             z_coding_pick: None,
             z_pick_size: None,
             z_ops_life: 0,
@@ -41112,6 +41372,95 @@ impl Maint {
         Ok(())
     }
 
+    /// The partitions' ordered-index heads moved between their mappings
+    /// and anonymous memory (`Options::heads_owned`). Away from the raw
+    /// gate the store reads as out of core, and there a mapping's pages
+    /// leave the page cache between two seeks of them: over the lag
+    /// sweep's full rewrite at three million keys under 1.25 GiB the
+    /// upkeep thread's resolves took hundreds of major faults a burst on
+    /// the indexes with every stride asked for ahead, and the scans after
+    /// it up to two hundred and forty in a pass of three thousand, each a
+    /// wait on a device the merges were writing to. So a partition the
+    /// controller is leaving to the raw form has its heads copied into the
+    /// process's own memory, eight bytes a key that every seek of it
+    /// reads, and the mapping's pages are let go; a partition a form file
+    /// serves gives its copy back, since no seek reads its heads, through
+    /// the epoch a reader that loaded the copy's address is pinned under.
+    ///
+    /// Left to the raw form, and not merely read through it now. Under the
+    /// form's gate that is a partition declined (`Seg::z_declined`: one the
+    /// hot-raw policy released, a sliver under the floor), not one waiting
+    /// for the attach of the file its merge built, which is every
+    /// partition a merge lands; at the census it is every partition while
+    /// the controller's model says the raw form fits (`heads_left_raw`),
+    /// the census being the group's pressure, and none while the model
+    /// says it does not, which is the stretch between a crossing and the
+    /// install its reads' faults buy. The first version copied whatever
+    /// the raw form was serving at the look: at ten million keys under the
+    /// same bound it made ninety-two copies over a lag sweep and gave back
+    /// ninety-two, and the ones at the crossing read the index files from
+    /// the device beside the first scans, a pass of 502 ms against 404;
+    /// the second waited for a step that had bought nothing, and the
+    /// crossing still made eight to twenty. Where no controller runs and
+    /// the gate is a test's, the store is left raw.
+    ///
+    /// A store back at the raw gate keeps the copies it has: giving them
+    /// up would send its seeks to pages the copy let go. A copy is made
+    /// only while scans are near (`scans_near`): the seeks that read heads
+    /// are a scan's start and the resolves of a settle near reads, a point
+    /// read goes by the hash slots, and a store nothing scans seeks none.
+    /// A few partitions a look, every turn of the loop.
+    fn z_heads_look(&mut self) {
+        // The copies given back at an earlier look, freed past the readers
+        // pinned before it: here and nowhere else, before this look pins,
+        // and whatever the gate reads now.
+        if self.shared.retired_heads.len() > 0 {
+            self.shared
+                .retired_heads
+                .sweep(|low| self.shared.readers.oldest_for(low));
+        }
+        if !self.opts.heads_owned {
+            return;
+        }
+        let gate = self.shared.zgate.load();
+        if gate == zselect::GATE_RAW {
+            return;
+        }
+        let near = self.scans_near();
+        let census_raw = !self.z_auto || self.z_leaves_raw;
+        let _op = self.op();
+        let mut made = 0usize;
+        for seg in self.segs().iter().filter(|s| s.level > 0) {
+            let served = seg.z.get().is_some_and(|z| !z.damaged());
+            let covered = gate == zselect::GATE_Z && served;
+            let left_raw = if gate == zselect::GATE_Z {
+                !served && seg.z_declined.load(AtomicOrdering::Relaxed) != 0
+            } else {
+                census_raw
+            };
+            let owned = seg.ord.heads_owned();
+            if covered && owned {
+                if let Some(buf) = seg.disown_heads() {
+                    let tag = self.shared.readers.bump();
+                    self.shared.retired_heads.push(tag, buf);
+                    self.shared.heads_events[1].fetch_add(1, AtomicOrdering::Relaxed);
+                }
+            } else if near && left_raw && !owned && made < HEADS_A_LOOK && seg.own_heads() {
+                made += 1;
+                self.shared.heads_events[0].fetch_add(1, AtomicOrdering::Relaxed);
+                // The mapping's pages are no seek's now: out of this
+                // process's tables, and out of the cache where it lets
+                // them go.
+                seg.ord.advise_dontneed();
+                if let Some(name) = Db::ord_name_for(&seg.name) {
+                    if let Ok(f) = std::fs::File::open(self.dir.join(&name)) {
+                        fadvise_dontneed(&f);
+                    }
+                }
+            }
+        }
+    }
+
     /// One turn of the second form's building (`Options::zpages`
     /// `Always`), on this thread's loop: a finished build collected and
     /// its form file installed, then the next build started, one at a time,
@@ -41124,6 +41473,7 @@ impl Maint {
     /// with nothing else to build, the re-code policy has its turn
     /// (`Options::zpages_recode`).
     fn z_step(&mut self) {
+        self.z_heads_look();
         if self.z_auto {
             self.z_tick();
             return;
@@ -42578,6 +42928,14 @@ impl Maint {
                 || !self.sealing.is_empty(),
         };
         let d = self.zsel.step(&input);
+        // Whether the controller is leaving the store raw at the census
+        // (`z_heads_look`): a step that had the model's reading and asked
+        // for neither a sample nor a build says so, a step that asks for
+        // either or leaves SUSPECT says not, and a step between the
+        // model's readings says nothing new. The steps between a
+        // crossing's first and its buy are of the last kind or ask.
+        self.z_leaves_raw =
+            heads_left_raw(self.z_leaves_raw, &d, model.as_ref().map(|m| m.phi_raw));
         self.z_apply(&d, model.as_ref(), &input);
         self.z_drive(&d);
     }

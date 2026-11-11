@@ -70,6 +70,20 @@
 //! - `ZFUZZ_MERGEPAR=n`: both stores run up to `n` partition merges at
 //!   once over disjoint ranges (`Options::merge_parallel`); a flag and not
 //!   a draw.
+//! - `ZFUZZ_CENSUS=1`: a store whose form is not forced runs no controller
+//!   and reads as out of core from its open on (the census gate, set
+//!   through the test's seam, which a controller's tick would write over),
+//!   so the paths a store takes there over the raw form -- the asks ahead
+//!   of a settle and a build, the partitions' ordered-index heads held in
+//!   anonymous memory (`Options::heads_owned`) -- are read against the
+//!   model; the summary counts the copies made and given back.
+//! - `ZFUZZ_HEADSFLIP=1`, with `ZFUZZ_ZPAGES`: the forced store's gate is
+//!   moved between the form's and the census every few dozen steps, so
+//!   its partitions' heads are copied where the raw form serves and given
+//!   back where the files do, over and over under the reads, the handles'
+//!   snapshots, the seals and the merges; `concurrent_range` runs its
+//!   store forced under it and flips beside its reader threads, each of
+//!   which may hold a copy's address when the copy is given up.
 //! - `ZFUZZ_NOPUT`, `ZFUZZ_NOBURST`: set, no puts, or no ordered bursts.
 //! - `ZFUZZ_SEEDKEY=1`: the store's first write is a key of its own, and
 //!   one goes ahead of every write of the empty key, so that no write of
@@ -298,6 +312,9 @@ fn opts(c: &Cfg) -> Options {
     };
     if let Some(i) = c.inline_bytes {
         o.inline_bytes = i;
+    }
+    if env_flag("ZFUZZ_CENSUS") {
+        o.zpages = supdb::ZPages::Off;
     }
     if env_flag("ZFUZZ_KEEPONE") {
         o.upkeep_keep_bytes = 1;
@@ -733,6 +750,25 @@ struct Stats {
     /// their cuts resolved again (`Options::rebase_recuts_sparse`), summed
     /// as `abandons` is: what says a run with the cache on reached them.
     recuts: u64,
+    /// Copies of partitions' ordered-index heads either store made, and
+    /// gave back (`Options::heads_owned`), summed as `abandons` is: what
+    /// says a run under `ZFUZZ_CENSUS` or `ZFUZZ_ZPAGES` reached them.
+    heads: [u64; 2],
+}
+
+/// Under `ZFUZZ_CENSUS`, the store read as out of core: the census gate,
+/// which a store whose form is forced does not take.
+fn census_gate(db: &Db, forced: bool) {
+    if env_flag("ZFUZZ_CENSUS") && !forced {
+        db.zgate_set(1);
+    }
+}
+
+/// A store's heads copies made and given back, added to the seed's.
+fn count_heads(st: &mut Stats, db: &Db) {
+    let (made, given, _) = db.heads_owned_counts();
+    st.heads[0] += made;
+    st.heads[1] += given;
 }
 
 fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
@@ -788,6 +824,8 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
     }
     let mut z = Db::create(&dz, opts_z(&cfg)).map_err(|e| format!("create z: {e}"))?;
     let mut r = Db::create(&dr, opts(&cfg)).map_err(|e| format!("create r: {e}"))?;
+    census_gate(&z, env_flag("ZFUZZ_ZPAGES"));
+    census_gate(&r, false);
     let seedkey_first = env_flag("ZFUZZ_SEEDKEY");
     let mut model: Model = BTreeMap::new();
     let mut staged: Vec<Op> = Vec::new();
@@ -813,6 +851,7 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
         beside: 0,
         switches: 0,
         recuts: 0,
+        heads: [0; 2],
     };
     let mut fails: Vec<String> = Vec::new();
     let mut absent = absent_around(&pool, &mut rng);
@@ -828,8 +867,14 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
     };
 
     let scan_every = env_flag("ZFUZZ_SCANEVERY");
+    let heads_flip = env_flag("ZFUZZ_HEADSFLIP") && env_flag("ZFUZZ_ZPAGES");
     for step in 0..cfg.ops as u64 {
         STEP.set(step as i64);
+        // By the step and not by a draw: every seed's stream stays as it
+        // was.
+        if heads_flip && step.is_multiple_of(37) {
+            z.zgate_set(if (step / 37) % 2 == 0 { 1 } else { 2 });
+        }
         let k = pool[rng.below(pool.len())].clone();
         if seedkey_first && k.is_empty() {
             let seedkey = b"\x01seed".to_vec();
@@ -995,6 +1040,8 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                     st.beside += z.seal_waits().merges_beside + r.seal_waits().merges_beside;
                     st.switches += z.forms_off_counts()[..2].iter().sum::<u64>();
                     st.recuts += z.forms_recut().0 + r.forms_recut().0;
+                    count_heads(&mut st, &z);
+                    count_heads(&mut st, &r);
                     let clean = rng.chance(50) || !matches!(cfg.sync, SyncPolicy::Always);
                     if clean {
                         for op in staged.drain(..) {
@@ -1010,6 +1057,8 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
                     }
                     z = Db::open(&dz, opts_z(&cfg)).map_err(|e| format!("open z: {e}"))?;
                     r = Db::open(&dr, opts(&cfg)).map_err(|e| format!("open r: {e}"))?;
+                    census_gate(&z, env_flag("ZFUZZ_ZPAGES"));
+                    census_gate(&r, false);
                     st.reopens += 1;
                     let probe = all_probe(&pool, &absent);
                     let how = if clean { "a close" } else { "a crash" };
@@ -1161,6 +1210,8 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
     st.beside += z.seal_waits().merges_beside + r.seal_waits().merges_beside;
     st.switches += z.forms_off_counts()[..2].iter().sum::<u64>();
     st.recuts += z.forms_recut().0 + r.forms_recut().0;
+    count_heads(&mut st, &z);
+    count_heads(&mut st, &r);
     drop(z);
     drop(r);
     if ok {
@@ -1190,6 +1241,7 @@ fn fuzz_range() {
     let (mut bad, mut reopens, mut abandons, mut bindings, mut beside, mut switches) =
         (Vec::new(), 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut recuts = 0u64;
+    let mut heads = [0u64; 2];
     for seed in seeds {
         match run_seed(seed, want_cache, verbose) {
             Ok(s) => {
@@ -1199,12 +1251,16 @@ fn fuzz_range() {
                 beside += s.beside;
                 switches += s.switches;
                 recuts += s.recuts;
+                heads[0] += s.heads[0];
+                heads[1] += s.heads[1];
             }
             Err(e) => bad.push(format!("seed {seed}: {e}")),
         }
     }
     eprintln!(
-        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, forms-off switches {switches}, sparse forms recut {recuts}, FAILURES {}",
+        "seeds {from}..{to}: reopens {reopens}, abandons {abandons}, bindings {bindings}, merges beside {beside}, forms-off switches {switches}, sparse forms recut {recuts}, heads owned {} given back {}, FAILURES {}",
+        heads[0],
+        heads[1],
         bad.len()
     );
     for b in &bad {
@@ -1240,7 +1296,10 @@ fn run_concurrent(seed: u64, secs_ops: usize, snapshots: bool) -> Result<(), Str
     let mut rng = Rng::new(seed ^ 0xC0FFEE);
     let cfg = pick_cfg(&mut rng, false);
     let dir = scratch(&format!("c{seed}"));
-    let mut db = Db::create(&dir, opts(&cfg)).map_err(|e| format!("create: {e}"))?;
+    let heads_flip = env_flag("ZFUZZ_HEADSFLIP") && env_flag("ZFUZZ_ZPAGES");
+    let made = if heads_flip { opts_z(&cfg) } else { opts(&cfg) };
+    let mut db = Db::create(&dir, made).map_err(|e| format!("create: {e}"))?;
+    census_gate(&db, heads_flip);
     let nkeys = 150 + rng.below(250);
     let keys: Arc<Vec<Vec<u8>>> = Arc::new(
         (0..nkeys)
@@ -1278,7 +1337,37 @@ fn run_concurrent(seed: u64, secs_ops: usize, snapshots: bool) -> Result<(), Str
             let mut rng = Rng::new(seed * 31 + t);
             let mut last = vec![0u64; keys.len()];
             let mut snap_state: Option<Vec<u64>> = None;
+            let mut turn = 0u64;
             while !stop.load(Ordering::Relaxed) {
+                // Under `ZFUZZ_HEADSFLIP` a short scan every few reads: a
+                // scan's start seeks its partition's ordered index, whose
+                // heads the flips copy and give back beside it, and the
+                // store's scans are what the copies wait for. Held to
+                // order alone, the values being the writer's to move.
+                turn += 1;
+                if heads_flip && turn.is_multiple_of(8) {
+                    let from = &keys[(turn as usize / 8) % keys.len()];
+                    let mut prev: Option<Vec<u8>> = None;
+                    let mut bad = None;
+                    let done = h.scan(from, 8, |k, _| {
+                        if k < from.as_slice() || prev.as_deref().is_some_and(|p| p > k) {
+                            bad = Some(k.to_vec());
+                        }
+                        prev = Some(k.to_vec());
+                    });
+                    if let Err(e) = done {
+                        errs.lock().unwrap().push(format!("thread {t}: scan: {e}"));
+                        return;
+                    }
+                    if let Some(k) = bad {
+                        errs.lock().unwrap().push(format!(
+                            "thread {t}: a scan from {} out of order at {}",
+                            show(from),
+                            show(&k)
+                        ));
+                        return;
+                    }
+                }
                 let i = rng.below(keys.len());
                 let lo = committed[i].load(Ordering::SeqCst);
                 let mut vals = Vec::new();
@@ -1390,6 +1479,9 @@ fn run_concurrent(seed: u64, secs_ops: usize, snapshots: bool) -> Result<(), Str
     let mut n = vec![0u32; keys.len()];
     let mut staged: Vec<usize> = Vec::new();
     for step in 0..secs_ops {
+        if heads_flip && step.is_multiple_of(61) {
+            db.zgate_set(if (step / 61) % 2 == 0 { 1 } else { 2 });
+        }
         let i = rng.below(keys.len());
         if rng.chance(4) {
             db.delete(&keys[i]);
@@ -1447,8 +1539,9 @@ fn run_concurrent(seed: u64, secs_ops: usize, snapshots: bool) -> Result<(), Str
     if !e.is_empty() {
         return Err(format!("seed {seed} ({cfg:?}): {:?}", &e[..e.len().min(4)]));
     }
+    let (owned, given, _) = db.heads_owned_counts();
     eprintln!(
-        "concurrent seed {seed}: reads {}",
+        "concurrent seed {seed}: reads {}, heads owned {owned} given back {given}",
         reads_done.load(Ordering::Relaxed)
     );
     let _ = std::fs::remove_dir_all(&dir);

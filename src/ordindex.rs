@@ -400,6 +400,12 @@ pub struct OrdIndex {
     /// every eighth line of the file -- 60 us at three hundred thousand
     /// keys, a third of that scan.
     top: Vec<u64>,
+    /// Where the heads are read: the mapping's, past its header, or a copy
+    /// of them the segment holds in anonymous memory (`set_heads`). Under
+    /// a memory bound the mapping's pages leave the page cache between two
+    /// seeks of them, and a seek that finds one gone waits on the device;
+    /// a copy in the process's own memory is not the cache's to take.
+    heads: std::sync::atomic::AtomicPtr<u8>,
 }
 
 impl OrdIndex {
@@ -456,7 +462,9 @@ impl OrdIndex {
                 u64::from_be_bytes(b[at..at + HEAD].try_into().expect("eight bytes"))
             })
             .collect();
+        let heads = std::sync::atomic::AtomicPtr::new(b[HEADER..].as_ptr() as *mut u8);
         Ok(OrdIndex {
+            heads,
             map,
             n,
             pfx,
@@ -614,8 +622,55 @@ impl OrdIndex {
 
     #[inline]
     fn head(&self, i: usize) -> u64 {
-        let at = HEADER + i * HEAD;
-        u64::from_be_bytes(self.map.0[at..at + HEAD].try_into().expect("eight bytes"))
+        assert!(i < self.n, "a head past the index");
+        // SAFETY: the pointer names `n` heads -- the mapping's, which `open`
+        // held to that many, or a copy of exactly those (`set_heads`) --
+        // and `i` is one of them.
+        u64::from_be(unsafe { self.heads_at(i).cast::<u64>().read_unaligned() })
+    }
+
+    /// The address of head `lo`, or one past the last.
+    #[inline]
+    fn heads_at(&self, lo: usize) -> *const u8 {
+        debug_assert!(lo <= self.n);
+        // SAFETY: inside the heads or one past them.
+        unsafe {
+            self.heads
+                .load(std::sync::atomic::Ordering::Acquire)
+                .add(lo * HEAD)
+        }
+    }
+
+    /// The mapping's heads: what a copy of them is made from.
+    pub(crate) fn mapped_heads(&self) -> &[u8] {
+        &self.map.0[HEADER..HEADER + self.n * HEAD]
+    }
+
+    /// Whether the heads are read from a copy and not from the mapping.
+    pub fn heads_owned(&self) -> bool {
+        !std::ptr::eq(
+            self.heads.load(std::sync::atomic::Ordering::Acquire),
+            self.mapped_heads().as_ptr(),
+        )
+    }
+
+    /// The heads read from `p` from here on.
+    ///
+    /// # Safety
+    /// `p` holds a copy of `mapped_heads`, whole before this call, that
+    /// stays as it is and allocated until `reset_heads` and past every
+    /// reader that may have loaded the pointer before it.
+    pub(crate) unsafe fn set_heads(&self, p: *const u8) {
+        self.heads
+            .store(p as *mut u8, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The heads read from the mapping again.
+    pub(crate) fn reset_heads(&self) {
+        self.heads.store(
+            self.mapped_heads().as_ptr() as *mut u8,
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     /// `seek` within ranks `lo..hi`: the first rank there whose key is
@@ -693,7 +748,7 @@ impl OrdIndex {
     /// a key, ten to fourteen thousand in a row on one thread.
     pub fn willneed_heads(&self, lo: usize, hi: usize) -> usize {
         let hi = hi.min(self.n);
-        if lo >= hi {
+        if lo >= hi || self.heads_owned() {
             return 0;
         }
         let off = (HEADER + lo * HEAD) as u64;
@@ -710,7 +765,7 @@ impl OrdIndex {
     /// (`willneed_heads`), and over an index that is resident whole they
     /// are calls and nothing else. False where the kernel will not say.
     pub fn heads_all_resident(&self) -> bool {
-        if self.n == 0 {
+        if self.n == 0 || self.heads_owned() {
             return true;
         }
         let len = self.n * HEAD;
@@ -723,7 +778,7 @@ impl OrdIndex {
     /// the hot-raw policy, which brings the index back whole. The bytes
     /// submitted.
     pub fn willneed_heads_all(&self) -> usize {
-        if self.n == 0 {
+        if self.n == 0 || self.heads_owned() {
             return 0;
         }
         self.map.advise_willneed(HEADER as u64, self.n * HEAD)
@@ -926,8 +981,7 @@ impl OrdIndex {
         // three of them one after another, each a miss on a cold
         // partition, and issued at once they cost one.
         if lo < hi {
-            let at = HEADER + lo * HEAD;
-            crate::db::prefetch_lines(self.map.0[at..].as_ptr(), (hi - lo) * HEAD);
+            crate::db::prefetch_lines(self.heads_at(lo), (hi - lo) * HEAD);
         }
         on_window(lo, hi);
         // The stride's heads searched with a mask a step, as the top
@@ -1038,8 +1092,7 @@ impl OrdIndex {
             ((at - 1) * TOP_STRIDE + 1, (at * TOP_STRIDE).min(self.n))
         };
         if !same && lo < hi {
-            let from = HEADER + lo * HEAD;
-            crate::db::prefetch_lines(self.map.0[from..].as_ptr(), (hi - lo) * HEAD);
+            crate::db::prefetch_lines(self.heads_at(lo), (hi - lo) * HEAD);
         }
         Some(SeekPlan {
             lo: lo as u32,
@@ -1554,6 +1607,54 @@ mod tests {
             );
             let _ = std::fs::remove_file(&p);
         }
+    }
+
+    /// The heads read from a copy answer every seek as the mapping's do,
+    /// and again once the reads go back to the mapping: the seek from the
+    /// top, the seek from a rank, the planned seek and the windowed one.
+    #[test]
+    fn an_index_read_through_a_copy_of_its_heads_answers_the_same() {
+        let digits: Vec<Vec<u8>> = (0u32..3_000)
+            .map(|i| format!("{:016}", i * 3).into_bytes())
+            .collect();
+        let keys: Vec<&[u8]> = digits.iter().map(|k| k.as_slice()).collect();
+        let p = write(&build(&keys), "owned-heads");
+        let mut idx = OrdIndex::open(&p, keys.len()).expect("opens");
+        idx.learn_prefix(keys[0]);
+        let mut probes: Vec<Vec<u8>> = digits.clone();
+        probes.extend(digits.iter().map(|k| [k.as_slice(), b"+"].concat()));
+        probes.extend([Vec::new(), b"zzz".to_vec()]);
+        probes.sort();
+        let answers = |idx: &OrdIndex| -> Vec<(usize, Option<bool>)> {
+            let mut out = Vec::new();
+            let mut t = usize::MAX;
+            let mut from = 0usize;
+            for q in &probes {
+                let a = idx.seek_exact(q, resolver(&keys));
+                assert_eq!(idx.seek_exact_from(from, q, resolver(&keys)), a);
+                if let Some(plan) = idx.plan_seek(q, &mut t) {
+                    assert_eq!(idx.seek_exact_planned(plan, q, resolver(&keys)), a);
+                }
+                assert_eq!(idx.seek_in(0, keys.len(), q, resolver(&keys)), a.0);
+                from = a.0;
+                out.push(a);
+            }
+            out
+        };
+        let mapped = answers(&idx);
+        assert!(!idx.heads_owned());
+        let copy: Vec<u8> = idx.mapped_heads().to_vec();
+        // SAFETY: a whole copy of the heads, alive until the reset below.
+        unsafe { idx.set_heads(copy.as_ptr()) };
+        assert!(idx.heads_owned());
+        assert!(idx.heads_all_resident(), "a copy is resident");
+        assert_eq!(idx.willneed_heads(0, keys.len()), 0, "and asks nothing");
+        assert_eq!(answers(&idx), mapped, "through the copy");
+        idx.reset_heads();
+        assert!(!idx.heads_owned());
+        assert_eq!(answers(&idx), mapped, "through the mapping again");
+        drop(copy);
+        let _ = std::fs::remove_file(&p);
     }
 
     /// The window the hinted seek names holds its answer and spans one

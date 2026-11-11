@@ -562,6 +562,10 @@ lines not asked for (`Options::settle_table_ahead`) -- and
 `supdb-headslook` is `supdb` with one look at a partition's heads'
 residency standing in for a settle's asks of the kernel for a hundred
 milliseconds (`Options::heads_look_ms`);
+`supdb-headsmapped` is `supdb` with the ordered indexes' heads read
+through their mappings throughout, no copy of a raw-served partition's
+held in the process's own memory out of core (`Options::heads_owned`
+off);
 `supdb-cache64tofitzpagesdropparse` and `supdb-cache64tofitautozpagesparse`
 are the forced form with the drop and the combined arm with their
 block-coded groups written by the engine's parsing encoder

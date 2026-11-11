@@ -681,6 +681,11 @@ fn counters_line(
             "lazy_cuts_resolved",
             "seeks_planned",
             "patch_asks",
+            // Partitions' ordered-index heads copied into the process's
+            // own memory over the window, and copies given back
+            // (`Db::heads_owned_counts`).
+            "heads_owned",
+            "heads_disowned",
             // The scans' start blocks the start cache named, and the
             // starts it kept (`Db::start_cache_counts`).
             "start_cache_hits",

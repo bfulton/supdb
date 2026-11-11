@@ -681,6 +681,10 @@ pub struct Supdb {
     /// settle's asks for a hundred milliseconds (`Options::heads_look_ms`):
     /// `supdb-headslook`.
     headslook: bool,
+    /// The ordered indexes' heads read through their mappings throughout,
+    /// no copy of them held in memory out of core
+    /// (`Options::heads_owned` off): `supdb-headsmapped`.
+    headsmapped: bool,
     /// Out of core a merge's landing chains the next merge only while
     /// reads are around, where the default chains through a write-only
     /// stretch too (`Options::merge_chains_writes` off).
@@ -1700,6 +1704,10 @@ struct Policy {
     /// settle's asks for a hundred milliseconds (`Options::heads_look_ms`):
     /// `supdb-headslook`.
     headslook: bool,
+    /// The ordered indexes' heads read through their mappings throughout,
+    /// no copy of them held in memory out of core
+    /// (`Options::heads_owned` off): `supdb-headsmapped`.
+    headsmapped: bool,
     /// Out of core a merge's landing chains the next merge only while
     /// reads are around, where the default chains through a write-only
     /// stretch too (`Options::merge_chains_writes` off).
@@ -2380,6 +2388,7 @@ impl Default for Policy {
             settlevaluenear: false,
             settletablenear: false,
             headslook: false,
+            headsmapped: false,
             nochainwrites: false,
             noland: false,
             landnearscans: false,
@@ -7571,6 +7580,7 @@ impl Supdb {
             settlevaluenear,
             settletablenear,
             headslook,
+            headsmapped,
             nochainwrites,
             noland,
             landnearscans,
@@ -7986,6 +7996,7 @@ impl Supdb {
             } else {
                 supdb::Options::default().heads_look_ms
             },
+            heads_owned: !headsmapped,
             merge_chains_writes: !nochainwrites,
             zpages_land_scans_far: !landnearscans,
             merge_plan_idle: !noidleplan,
@@ -8327,6 +8338,7 @@ impl Supdb {
             settlevaluenear,
             settletablenear,
             headslook,
+            headsmapped,
             nochainwrites,
             noland,
             landnearscans,
@@ -9302,6 +9314,9 @@ impl Engine for Supdb {
         if self.headslook {
             return "supdb-headslook";
         }
+        if self.headsmapped {
+            return "supdb-headsmapped";
+        }
         if self.nochainwrites {
             return if self.partition {
                 "supdb-nochainwrites"
@@ -9870,6 +9885,9 @@ impl Engine for Supdb {
             ("lazy_cuts_resolved", db.lazy_cuts()[1] as f64),
             ("seeks_planned", db.seeks_planned() as f64),
             ("patch_asks", db.patch_asks() as f64),
+            ("heads_owned", db.heads_owned_counts().0 as f64),
+            ("heads_disowned", db.heads_owned_counts().1 as f64),
+            ("heads_owned_mb", (db.heads_owned_counts().2 >> 20) as f64),
             ("form_heads_ahead", db.settle_ahead_asks()[0] as f64),
             ("table_lines_ahead", db.settle_ahead_asks()[1] as f64),
             // The writer's settles: see `Db::settle_density`.
@@ -10953,6 +10971,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-settlenoahead"
         | "supdb-settletablenear"
         | "supdb-headslook"
+        | "supdb-headsmapped"
         | "supdb-nochainwrites"
         | "supdb-noland"
         | "supdb-landnearscans"
@@ -11755,6 +11774,18 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     d,
                     Policy {
                         headslook: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-headsmapped" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        headsmapped: true,
                         ..Policy::default()
                     },
                 )
