@@ -455,7 +455,7 @@ fn main() {
     let mut ks: Vec<usize> = vec![1, 2, 4, 8, 16];
     let mut split_given = false;
     let mut hc: Option<i32> = None;
-    let mut rhc: Option<(u32, u32, u32, u32)> = None;
+    let mut rhc: Option<(u32, u32, u32, u32, bool)> = None;
     let mut first: Option<usize> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -469,10 +469,19 @@ fn main() {
             "--pages" => first = Some(val("a count").parse().expect("a count")),
             "--hc" => hc = Some(val("a level").parse().expect("a level")),
             "--rhc" => {
-                let v = val("ATTEMPTS:SEQCOST:SKIP[:LAZY]");
+                let v = val("ATTEMPTS:SEQCOST:SKIP[:LAZY[:SPARSE]]");
                 let f: Vec<u32> = v.split(':').map(|x| x.parse().expect("a count")).collect();
-                assert!(f.len() == 3 || f.len() == 4, "ATTEMPTS:SEQCOST:SKIP[:LAZY]");
-                rhc = Some((f[0], f[1], f[2], f.get(3).copied().unwrap_or(0)));
+                assert!(
+                    (3..=5).contains(&f.len()),
+                    "ATTEMPTS:SEQCOST:SKIP[:LAZY[:SPARSE]]"
+                );
+                rhc = Some((
+                    f[0],
+                    f[1],
+                    f[2],
+                    f.get(3).copied().unwrap_or(0),
+                    f.get(4).is_some_and(|&x| x != 0),
+                ));
             }
             "--split" => {
                 split_given = true;
@@ -553,7 +562,7 @@ fn main() {
             ks.clear();
         }
     }
-    if let Some((attempts, seq_cost, skip_min, lazy)) = rhc {
+    if let Some((attempts, seq_cost, skip_min, lazy, sparse)) = rhc {
         // The same recompression with the engine's own encoder, timed a
         // group: the decode into the scratch first, outside the clock.
         let before: usize = pages.iter().map(|p| p.payload.len()).sum();
@@ -566,6 +575,7 @@ fn main() {
             seq_cost,
             skip_min,
             lazy,
+            sparse,
         };
         let mut enc_ns = 0u128;
         let mut flex_ns = 0u128;
@@ -589,7 +599,8 @@ fn main() {
         }
         let after: usize = pages.iter().map(|p| p.payload.len()).sum();
         println!(
-            "rhc {attempts}:{seq_cost}:{skip_min}:{lazy}: {} compressed bytes recompressed to {} ({:.3} of the engine's), {:.2} us a group to encode, lz4_flex {:.2}",
+            "rhc {attempts}:{seq_cost}:{skip_min}:{lazy}:{}: {} compressed bytes recompressed to {} ({:.3} of the engine's), {:.2} us a group to encode, lz4_flex {:.2}",
+            u8::from(sparse),
             before,
             after,
             after as f64 / before as f64,

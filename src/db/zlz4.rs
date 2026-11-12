@@ -63,6 +63,19 @@ pub struct Effort {
     /// positions starts a longer one, and the positions it covers only
     /// inserted, searched by nothing.
     pub lazy: u32,
+    /// Under the lazy parse, the positions inside a match of `skip_min` or
+    /// more taken are not inserted either, but for the last [`RESUME`]
+    /// it covers: the chains hold fewer positions, a later match into the
+    /// inside of a long one is found from its end or not at all, and the
+    /// insert of every byte the match covers, most of the parse's cost on
+    /// a group of long matches, is not paid. Priced on the form's own
+    /// groups at sixteen positions (`bench/examples/zdecode.rs`, `--rhc
+    /// 16:0:8:1:1`): 6.3 µs a group to encode against 8.7, 54.8 sequences
+    /// a group against 51.9 and the cold decode 0.64 µs against 0.59, the
+    /// greedy encoder at 2.0 and about 62 -- the parse's price is its
+    /// search, so this saves little of it and gives back part of the
+    /// decode. Off in [`Effort::SHIPPED`].
+    pub sparse: bool,
 }
 
 impl Effort {
@@ -81,6 +94,7 @@ impl Effort {
         seq_cost: 0,
         skip_min: 8,
         lazy: 1,
+        sparse: false,
     };
 }
 
@@ -209,6 +223,9 @@ impl Encoder {
                 .push((anchor as u32, (s - anchor) as u32, off as u16, len as u32));
             s += len;
             anchor = s;
+            if e.sparse && len >= e.skip_min as usize {
+                ins = ins.max(s.saturating_sub(RESUME));
+            }
         }
         self.seqs.reverse();
     }
@@ -1163,12 +1180,14 @@ mod tests {
                 seq_cost: 0,
                 skip_min: 8,
                 lazy: 0,
+                sparse: false,
             },
             Effort {
                 attempts: 1,
                 seq_cost: 0,
                 skip_min: 8,
                 lazy: 0,
+                sparse: false,
             },
             Effort::SHIPPED,
             Effort {
@@ -1176,12 +1195,14 @@ mod tests {
                 seq_cost: 0,
                 skip_min: 8,
                 lazy: 0,
+                sparse: false,
             },
             Effort {
                 attempts: 64,
                 seq_cost: 6,
                 skip_min: 8,
                 lazy: 0,
+                sparse: false,
             },
             Effort {
                 lazy: 1,
@@ -1194,6 +1215,16 @@ mod tests {
             Effort {
                 attempts: 1,
                 lazy: 3,
+                ..Effort::SHIPPED
+            },
+            Effort {
+                sparse: true,
+                ..Effort::SHIPPED
+            },
+            Effort {
+                attempts: 4,
+                skip_min: 4,
+                sparse: true,
                 ..Effort::SHIPPED
             },
         ] {
@@ -1283,6 +1314,7 @@ mod tests {
                     seq_cost: 8,
                     skip_min: 8,
                     lazy: 0,
+                    sparse: false,
                 },
             )
             .unwrap();
@@ -1349,6 +1381,7 @@ mod tests {
                     seq_cost: 0,
                     skip_min: 8,
                     lazy: 0,
+                    sparse: false,
                 },
             ] {
                 let mut out = vec![0u8; max_output(c.len())];

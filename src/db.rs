@@ -2074,8 +2074,20 @@ pub struct Options {
     /// encoder's CPU, which is the builder's (`bench/examples/zdecode.rs`,
     /// `--rhc`). Off: under `Auto` the builds ahead carry the build beside
     /// the load, and at twice their CPU they fall behind it, so the install
-    /// comes later (`supdb-zparse`, `docs/engine.md`). The record coding's
-    /// tails keep `lz4_flex`.
+    /// comes later (`supdb-zparse`, `docs/engine.md`). Priced again with the
+    /// bound on each pass alone, at ten million keys under 1.25 GiB in the
+    /// row's order, the install came within a tenth of a second of the
+    /// default's in all four loads and the scans read 1.09-1.14x on two
+    /// and three threads in both orders, the rest by position; on the lag
+    /// sweep the pass after the full rewrite read 0.68x and 0.91x, since a
+    /// merge's form file is built at its finish and the chain draining the
+    /// rewrite ran at the encoder's price (`pair.sh supdb supdb-zparse
+    /// 10000000 --bound 1342177280 --passes
+    /// load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
+    /// --ops-div 10 --reps 2`, and `--passes load,lag`, at `c9599c2`). The
+    /// encoder's price is its search and not its inserts:
+    /// `zlz4::Effort::sparse` took 8.7 µs a group to 6.3 against the greedy
+    /// encoder's 2. The record coding's tails keep `lz4_flex`.
     #[doc(hidden)]
     pub zpages_parse: bool,
     /// The form's block-coded groups decoded by the engine's own LZ4 decoder
@@ -4927,9 +4939,39 @@ pub struct Options {
     /// with two partitions' worth of room unused at ten million keys under
     /// 1.25 GiB, five releases in one rep and eight in another, and E's
     /// covered scans, eight group decodes each, are what the room buys
-    /// back (`docs/engine.md`). Off, the bar whatever the room, is the
-    /// default; `supdb-zhotskewroom` is the arm.
+    /// back (`docs/engine.md`). Priced again with the bound on each pass
+    /// alone, in the row's order at ten million keys under 1.25 GiB, it
+    /// released seven or eight partitions a rep in the uniform read pass
+    /// and gave some back at every pass that grew the process, and read
+    /// the threaded point reads 1.15x, the scans on three threads 1.07x and
+    /// C 1.25x and 1.58x in both orders, against E at 0.83x and 0.75x, the
+    /// hot partitions bought by swaps inside it, and the mixed scans at
+    /// 0.89-0.98x (`pair.sh supdb supdb-zhotskewroom 10000000 --bound
+    /// 1342177280 --passes
+    /// load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
+    /// --ops-div 10 --reps 2` at `c9599c2`): a trade. Off, the bar whatever
+    /// the room, is the default; `supdb-zhotskewroom` is the arm.
     pub zpages_hot_skew_room: bool,
+    /// EXPERIMENT: with `zpages_hot_skew_room`, a release the room alone
+    /// buys -- a candidate under `HOT_RAW_SKEW` of the median -- is asked
+    /// only where the form files and the raw partitions after it stay this
+    /// share of the budget, in percent, under the fill line the way back
+    /// is taken at; a candidate over the skew bar keeps the line itself.
+    /// The room's releases otherwise filled the line and went back at the
+    /// next pass that grew the process -- three threads' handles took the
+    /// budget down by a share of it -- and were asked for again when they
+    /// left, a device read each way, and left no room for the hot
+    /// partition the mixes then wanted, which a swap inside the mix bought.
+    /// With five the room's releases stood through the read and scan
+    /// passes, E read level and C 1.38x and 1.18x, the scans on two and
+    /// three threads 1.06-1.12x, in both orders, and scrambled D 0.87x and
+    /// 0.85x with no fault in either arm, so the margin turned the room's
+    /// trade into a smaller one and not into a gain (`pair.sh supdb
+    /// supdb-zhotskewroomhyst 10000000 --bound 1342177280 --passes
+    /// load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
+    /// --ops-div 10 --reps 2`). Zero, the line itself, is the default;
+    /// `supdb-zhotskewroomhyst` is the room's bar with five.
+    pub zpages_hot_room_margin_pct: u8,
     /// EXPERIMENT: a cursor's walk decodes the groups after its first into
     /// the cursor's own buffer (`ZCursor::buf`), the memo asked for each
     /// and given none; the first group and every other open keep the memo
@@ -5358,6 +5400,7 @@ impl Default for Options {
             heads_look_ms: 0,
             heads_owned: true,
             zpages_hot_skew_room: false,
+            zpages_hot_room_margin_pct: 0,
             zpages_walk_owns_decodes: false,
             zpages_hot_cold_back: false,
             zpages_hot_back_ask: true,
@@ -43421,7 +43464,14 @@ impl Maint {
         // at all where it fits the room (`Options::zpages_hot_skew_room`):
         // room nobody else uses buys the partition read most whatever its
         // skew, and the way back returns it should the room go.
-        let bar = if fits && self.opts.zpages_hot_skew_room {
+        // A release the room alone buys stops short of the fill line by the
+        // margin (`Options::zpages_hot_room_margin_pct`), so that the next
+        // pass's growth does not send it back and a hot partition after it
+        // finds the room without a swap.
+        let margin =
+            (budget as f64 * f64::from(self.opts.zpages_hot_room_margin_pct) / 100.0) as u64;
+        let fits_room = fits && after <= fill.saturating_sub(margin);
+        let bar = if fits_room && self.opts.zpages_hot_skew_room {
             1.0
         } else {
             HOT_RAW_SKEW
