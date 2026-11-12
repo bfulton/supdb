@@ -5020,7 +5020,7 @@ pub struct Options {
     /// `supdb-zbacknow`.
     pub zpages_hot_back_ask: bool,
     /// Out of core with the form installed, where scans come back after a
-    /// stretch of `REWARM_QUIET` without one, every form file the page
+    /// stretch of `zpages_rewarm_quiet_ms` without one, every form file the page
     /// cache holds under `HOT_RAW_RESIDENT` of is asked for whole
     /// (`MADV_WILLNEED`) once no merge is in flight, on a thread of its
     /// own, so its pages come in at the device's sequential rate and not a
@@ -5072,6 +5072,37 @@ pub struct Options {
     /// own thread; an arena's lock is held while its pages go. Off;
     /// `supdb-rewarmtrim` trims.
     pub zpages_rewarm_trims: bool,
+    /// A rewarm due (`zpages_rewarm_scans`) is made while merges are in
+    /// flight, for the form files of the partitions no merge in flight
+    /// holds, where it waited for the merges to land. A burst that leaves
+    /// pieces standing keeps a chain of merges running through the pass
+    /// after it, and under a gibibyte at ten million keys the pass after
+    /// the ten-percent burst read the form files the burst's merges had
+    /// written and the cache had dropped -- written once and read by
+    /// nobody, the first pages a reclaim takes -- a 4 KB fault a scan,
+    /// about nine thousand in a pass and every one of them on those files
+    /// in the page view's first read, while the rewarm waited behind the
+    /// chain. The wait was drawn at the full rewrite, whose merges hold
+    /// every partition; a merge's own partitions are left to its landing
+    /// here. With `zpages_rewarm_quiet_ms` at a quarter second the pass
+    /// read 1.32x and 1.35x with a third of the faults on the lag sweep
+    /// alone, and 1.40x and 1.71x in the row's whole order, both orders
+    /// each (`pair.sh supdb-zrewarmwait supdb 10000000 --bound 1073741824
+    /// --passes load,lag --ops-div 10 --reps 2`, and the row's passes);
+    /// under 1.25 GiB no rewarm found a cold file in the mixes and the lag
+    /// passes read level. On; `supdb-zrewarmwait` is the shape before, both
+    /// off.
+    pub zpages_rewarm_beside_merges: bool,
+    /// The stretch without a scan after which the scans that come back
+    /// have the cold form files asked for (`zpages_rewarm_scans`), in
+    /// milliseconds: a quarter of a second. It was a second
+    /// (`REWARM_QUIET_BEFORE_MS`), and the ten-percent burst at ten million keys
+    /// under a gibibyte lasts 1.0-1.1 s, so the pass after it found the
+    /// second passed or not by a few milliseconds and the rewarm fired
+    /// there in two reps of eight; a pass's scans and a mix's scans come
+    /// microseconds apart, so a quarter of a second is a stretch with no
+    /// reader all the same. `supdb-zrewarmwait` keeps the second.
+    pub zpages_rewarm_quiet_ms: u32,
 }
 
 impl Options {
@@ -5407,6 +5438,8 @@ impl Default for Options {
             zpages_rewarm_scans: true,
             zpages_settle_joins_asks: true,
             zpages_rewarm_trims: false,
+            zpages_rewarm_beside_merges: true,
+            zpages_rewarm_quiet_ms: 250,
         }
     }
 }
@@ -39954,11 +39987,11 @@ const ASK_JOIN_STALLS: u32 = 10;
 const ASK_JOIN_REASK_AT: u32 = 2;
 const ASK_JOIN_REASKS: u32 = 3;
 const ASK_JOIN_CAP: std::time::Duration = std::time::Duration::from_secs(20);
-/// How long a stretch without a scan is before the scans after it have the
-/// cold form files asked for (`Options::zpages_rewarm_scans`): longer than
-/// the gaps between a pass's scans and between the mixes' scans, shorter
-/// than a burst that leaves the forms cold.
-const REWARM_QUIET: std::time::Duration = std::time::Duration::from_secs(1);
+/// How long a stretch without a scan was before the scans after it had the
+/// cold form files asked for (`Options::zpages_rewarm_scans`), before it
+/// was `Options::zpages_rewarm_quiet_ms`: the shape `supdb-zrewarmwait`
+/// keeps.
+pub const REWARM_QUIET_BEFORE_MS: u32 = 1000;
 const HOT_RAW_ASK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 const HOT_RAW_HOLD: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -43562,7 +43595,7 @@ impl Maint {
     }
 
     /// `Options::zpages_rewarm_scans`: where the scans counted move after a
-    /// stretch of `REWARM_QUIET` that saw none, out of core with the form
+    /// stretch of `zpages_rewarm_quiet_ms` that saw none, out of core with the form
     /// installed, a rewarm is due; it is made once no merge is in flight,
     /// since a merge writing beside the scans pushes out what a rewarm
     /// brings in -- the full rewrite's pass refaulted 117,000 pages with a
@@ -43584,18 +43617,17 @@ impl Maint {
             self.z_rewarm_quiet.get_or_insert(now);
         } else {
             self.z_rewarm_life = life;
-            if self
-                .z_rewarm_quiet
-                .take()
-                .is_some_and(|t| now.saturating_sub(t) >= REWARM_QUIET)
-            {
+            if self.z_rewarm_quiet.take().is_some_and(|t| {
+                now.saturating_sub(t)
+                    >= std::time::Duration::from_millis(u64::from(self.opts.zpages_rewarm_quiet_ms))
+            }) {
                 self.z_rewarm_due = true;
             }
         }
+        let merging = !self.compacting.is_empty() || self.tiering.is_some();
         if !self.z_rewarm_due
             || self.z_rewarm.is_some()
-            || !self.compacting.is_empty()
-            || self.tiering.is_some()
+            || (merging && !self.opts.zpages_rewarm_beside_merges)
         {
             return;
         }
@@ -43608,6 +43640,10 @@ impl Maint {
             self.segs()
                 .iter()
                 .filter(|s| s.level > 0)
+                // Beside merges in flight (`zpages_rewarm_beside_merges`),
+                // the partitions they hold are left: their files go at the
+                // landing.
+                .filter(|s| !(merging && self.in_flight_input(&s.name)))
                 .filter_map(|s| {
                     let z = s.z.get()?;
                     if z.pages_resident() >= HOT_RAW_RESIDENT {

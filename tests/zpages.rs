@@ -11376,6 +11376,151 @@ fn scans_after_a_quiet_stretch_have_the_cold_form_files_asked_for() {
     }
 }
 
+/// The rewarm's two gates, each held to firing: a rewarm due while a merge
+/// is in flight is made at once for the cold form files of the partitions
+/// the merge does not hold (`Options::zpages_rewarm_beside_merges`), and
+/// waits for the merge's landing without the option; and a stretch of
+/// 300 ms of the injected clock with no scan makes one due at a quiet of a
+/// quarter second (`Options::zpages_rewarm_quiet_ms`, as shipped) and not
+/// at a second, which a stretch of 1.6 s does. The merge rewrites the first
+/// partition and is held in flight; every form file is out of the cache
+/// when the scans come back, so a rewarm beside it asks for every file but
+/// that partition's.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_rewarm_is_made_beside_a_merge_in_flight_after_a_quarter_second() {
+    let ms = std::time::Duration::from_millis;
+    for (beside, quiet_ms) in [(true, 250u32), (false, 250), (true, 1000), (false, 1000)] {
+        let what = format!("rewarm beside {beside} quiet {quiet_ms}");
+        let (dir, mut db, mut model, inject) = auto_store_with(
+            &format!("auto-rewarm-beside-{beside}-{quiet_ms}"),
+            1 << 20,
+            1_000_000.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_rewarm_beside_merges = beside;
+                o.zpages_rewarm_quiet_ms = quiet_ms;
+                o.zpages_hot_raw = false;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+                o.l0_trigger = 1;
+            },
+            |_| {},
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        let n = db.zpage_counts().form_files;
+        assert!(n >= 5, "{what}: form files: {:?}", db.zpage_counts());
+        // A merge of the first partition, held in flight: its lowest keys
+        // written again and sealed, the landing planning the merge. The
+        // hold is released on the way out of a failed assertion too, since
+        // the store's drop joins the merge.
+        struct Release<'a>(&'a Db);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                self.0.hold_merge_landing(false);
+            }
+        }
+        db.hold_merge_landing(true);
+        let mut rng = Rng(0x5EED);
+        for k in keys.iter().take(50) {
+            let v = suite_value(&mut rng);
+            db.put(k, &v);
+            model.insert(k.clone(), vec![v]);
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        let release = Release(&db);
+        wait_for("a merge of the first partition", || {
+            db.merges_in_flight() >= 1
+        });
+        // A scan the looks have seen, so that the stretch below is
+        // counted from it; then every form file out of the cache.
+        let mut one = 0usize;
+        db.scan(b"", 1, kv(&mut |_, _| one += 1)).unwrap();
+        advance_tick(&db, ms(100));
+        for p in form_files(&dir) {
+            unmap_pages(&p);
+            evict(&p);
+        }
+        let (r0, f0) = (db.zpage_counts().rewarms, db.zpage_counts().rewarm_files);
+        // 300 ms with no scan, then a scan.
+        advance_tick(&db, ms(200));
+        advance_tick(&db, ms(200));
+        db.scan(b"", 1, kv(&mut |_, _| one += 1)).unwrap();
+        advance_tick(&db, ms(100));
+        advance_tick(&db, ms(100));
+        let c = db.zpage_counts();
+        let quick = quiet_ms <= 300;
+        if quick && beside {
+            assert_eq!(
+                c.rewarms - r0,
+                1,
+                "{what}: a rewarm beside the merge: {c:?}"
+            );
+            let asked = c.rewarm_files - f0;
+            assert!(
+                asked + 2 >= n && asked < n,
+                "{what}: every cold file but the merge's, of {n}: {c:?}"
+            );
+        } else {
+            assert_eq!(c.rewarms, r0, "{what}: no rewarm yet: {c:?}");
+        }
+        // 1.6 s with no scan, then a scan: due under either quiet, made
+        // beside the merge where the option says so.
+        for _ in 0..8 {
+            advance_tick(&db, ms(200));
+        }
+        db.scan(b"", 1, kv(&mut |_, _| one += 1)).unwrap();
+        advance_tick(&db, ms(100));
+        advance_tick(&db, ms(100));
+        // A rewarm made at the quarter second may be followed by one for
+        // files its asks had not brought in by this look.
+        let c = db.zpage_counts();
+        if beside {
+            assert!(
+                c.rewarms - r0 >= 1,
+                "{what}: beside the merge after a second: {c:?}"
+            );
+        } else {
+            assert_eq!(c.rewarms, r0, "{what}: waiting for the merge: {c:?}");
+        }
+        assert!(db.merges_in_flight() >= 1, "{what}: the merge still held");
+        // The merge lands; a rewarm waiting for it is made at the next look.
+        db.hold_merge_landing(false);
+        wait_for("the merge's landing", || db.merges_in_flight() == 0);
+        advance_tick(&db, ms(100));
+        advance_tick(&db, ms(100));
+        let c = db.zpage_counts();
+        if beside {
+            assert!(c.rewarms - r0 >= 1, "{what}: {c:?}");
+        } else {
+            assert_eq!(
+                c.rewarms - r0,
+                1,
+                "{what}: the rewarm made at the merge's landing: {c:?}"
+            );
+        }
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(release);
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// Under the controller with the hot-raw policy and the skew read over the
 /// window's looks (`Options::zpages_hot_raw_slack`), a partition read under
 /// the sample floor at every look but steadily across the window's looks is

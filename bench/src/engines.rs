@@ -1129,6 +1129,10 @@ pub struct Supdb {
     /// the fill line (`Options::zpages_hot_skew_room` on,
     /// `Options::zpages_hot_room_margin_pct` 5): `supdb-zhotskewroomhyst`.
     zhotskewroomhyst: bool,
+    /// The rewarm waiting for the merges in flight and a second without a
+    /// scan, the shape before (`Options::zpages_rewarm_beside_merges` off,
+    /// `Options::zpages_rewarm_quiet_ms` 1000): `supdb-zrewarmwait`.
+    zrewarmwait: bool,
     /// A cursor's walk decoding the groups after its first into its own
     /// buffer (`Options::zpages_walk_owns_decodes` on): `supdb-zwalkowns`.
     zwalkowns: bool,
@@ -2202,6 +2206,8 @@ struct Policy {
     zhotskewroom: bool,
     /// The room's bar under a margin: `supdb-zhotskewroomhyst`.
     zhotskewroomhyst: bool,
+    /// The rewarm that waits: `supdb-zrewarmwait`.
+    zrewarmwait: bool,
     /// The walk's own decodes: `supdb-zwalkowns`.
     zwalkowns: bool,
     /// A page view an open: `supdb-zviewperopen`.
@@ -2598,6 +2604,7 @@ impl Default for Policy {
             copyprefetchwhole: false,
             zhotskewroom: false,
             zhotskewroomhyst: false,
+            zrewarmwait: false,
             zwalkowns: false,
             zviewperopen: false,
             znogroupahead: false,
@@ -3207,6 +3214,20 @@ impl Supdb {
             path,
             Policy {
                 zhotskewroomhyst: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose rewarm waits for the merges in flight and a second
+    /// without a scan, the shape before
+    /// (`Options::zpages_rewarm_beside_merges` off,
+    /// `Options::zpages_rewarm_quiet_ms` 1000).
+    pub fn create_zrewarmwait(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zrewarmwait: true,
                 ..Policy::default()
             },
         )
@@ -7934,6 +7955,7 @@ impl Supdb {
             copyprefetchwhole,
             zhotskewroom,
             zhotskewroomhyst,
+            zrewarmwait,
             zwalkowns,
             zviewperopen,
             znogroupahead,
@@ -8457,6 +8479,12 @@ impl Supdb {
             copy_prefetch_whole: copyprefetchwhole,
             zpages_hot_skew_room: zhotskewroom || zhotskewroomhyst,
             zpages_hot_room_margin_pct: if zhotskewroomhyst { 5 } else { 0 },
+            zpages_rewarm_beside_merges: !zrewarmwait,
+            zpages_rewarm_quiet_ms: if zrewarmwait {
+                supdb::db::REWARM_QUIET_BEFORE_MS
+            } else {
+                supdb::Options::default().zpages_rewarm_quiet_ms
+            },
             zpages_walk_owns_decodes: zwalkowns,
             zpages_cursor_view: !zviewperopen,
             zpages_group_ahead: !znogroupahead,
@@ -8726,6 +8754,7 @@ impl Supdb {
             copyprefetchwhole,
             zhotskewroom,
             zhotskewroomhyst,
+            zrewarmwait,
             zwalkowns,
             zviewperopen,
             znogroupahead,
@@ -9114,6 +9143,9 @@ impl Engine for Supdb {
         }
         if self.zhotskewroomhyst {
             return "supdb-zhotskewroomhyst";
+        }
+        if self.zrewarmwait {
+            return "supdb-zrewarmwait";
         }
         if self.zwalkowns {
             return "supdb-zwalkowns";
@@ -11453,6 +11485,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-copyprefetchwhole"
         | "supdb-zhotskewroom"
         | "supdb-zhotskewroomhyst"
+        | "supdb-zrewarmwait"
         | "supdb-zwalkowns"
         | "supdb-zviewperopen"
         | "supdb-znogroupahead"
@@ -11886,6 +11919,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-copyprefetchwhole" => supdb_arm(Supdb::create_copyprefetchwhole, dir)?,
         "supdb-zhotskewroom" => supdb_arm(Supdb::create_zhotskewroom, dir)?,
         "supdb-zhotskewroomhyst" => supdb_arm(Supdb::create_zhotskewroomhyst, dir)?,
+        "supdb-zrewarmwait" => supdb_arm(Supdb::create_zrewarmwait, dir)?,
         "supdb-zwalkowns" => supdb_arm(Supdb::create_zwalkowns, dir)?,
         "supdb-zviewperopen" => supdb_arm(Supdb::create_zviewperopen, dir)?,
         "supdb-znogroupahead" => supdb_arm(Supdb::create_znogroupahead, dir)?,
@@ -14412,6 +14446,14 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.zpages_hot_skew_room && !b.zpages_hot_skew_room);
                 assert!(o.zpages_hot_room_margin_pct == 5 && b.zpages_hot_room_margin_pct == 0);
+            }
+            {
+                let z = Supdb::create_zrewarmwait(&dir("zrewarmwait")).unwrap();
+                assert_eq!(z.name(), "supdb-zrewarmwait");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.zpages_rewarm_beside_merges && b.zpages_rewarm_beside_merges);
+                assert!(o.zpages_rewarm_quiet_ms == 1000 && b.zpages_rewarm_quiet_ms == 250);
             }
             {
                 let z = Supdb::create_zwalkowns(&dir("zwalkowns")).unwrap();

@@ -4729,6 +4729,29 @@ has to be paged in; and a phase that runs faster under a lever is read for
 the work it pushed out of itself, since a burst whose merges did not start
 is a burst with less beside it.
 
+**A gate drawn at the largest burst, read at a smaller one.** The rewarm
+asks for the form files the cache has dropped when scans come back after a
+stretch without one, and waited for a second of quiet and for every merge
+in flight to land, both drawn at the full rewrite, whose merges hold every
+partition and pushed out what a rewarm beside them brought in. Under a
+gibibyte at ten million keys the ten-percent burst lasts 1.0-1.1 s and
+leaves a chain of merges running through the pass after it, so the rewarm
+fired at that pass in two reps of eight, and the pass read the burst's new
+form files a 4 KB fault at a time -- nine thousand faults, every one in the
+page view's first read of a file written once and read by nobody, the
+first pages a reclaim takes -- and trailed RocksDB, whose compactions' files
+stayed in its cache. A rewarm beside the merges, for the partitions they do
+not hold, after a quarter second (`Options::zpages_rewarm_beside_merges`,
+`Options::zpages_rewarm_quiet_ms`) read the pass 1.3-1.7x in every sitting
+with a third of the faults; under 1.25 GiB it found no cold file to ask
+for. The faults by file were read with `perf record -e major-faults -c 1
+-d` cut to the pass's lag marks and the process's maps. The rules: a gate
+drawn at one case is checked at the cases between it and the next, since a
+threshold a burst crosses by a few milliseconds fires in some reps and not
+others; and a pairing in which the mechanism never fired is the noise
+floor, read before any other -- the same pair under 1.25 GiB, no rewarm in
+either arm, moved its cells 10-20% each way between sittings.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
