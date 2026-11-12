@@ -602,7 +602,9 @@ merges dropping behind them the raw records of an input partition its form
 file serves (`Options::merge_drops_covered`), and
 `supdb-sameblocksrecords` with the landing's question whether a rewritten
 partition cuts the same blocks asked of the records whatever the ordered
-indexes hold (`Options::same_blocks_from_index` off);
+indexes hold (`Options::same_blocks_from_index` off), and
+`supdb-mergedropsrecords` with both, the shape the drop was first priced
+in;
 `supdb-zgroup1k` is `supdb` with the form's pages cut into groups of a
 kibibyte of records where the default cuts at two
 (`Options::zpages_group_bytes`);

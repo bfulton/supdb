@@ -6087,6 +6087,22 @@ impl Supdb {
     }
 
     /// `supdb` whose merges drop behind them the raw records of an input
+    /// partition its form file serves (`Options::merge_drops_covered`)
+    /// with the landing's same-blocks question asked of the records
+    /// (`Options::same_blocks_from_index` off): the shape that first priced
+    /// the drop, whose landings read back the pages the merge had dropped.
+    pub fn create_mergedropsrecords(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                mergedropscovered: true,
+                sameblocksrecords: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose merges drop behind them the raw records of an input
     /// partition its form file serves (`Options::merge_drops_covered`).
     pub fn create_mergedropscovered(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
@@ -9749,6 +9765,9 @@ impl Engine for Supdb {
         if self.snapdrops {
             return "supdb-snapdrops";
         }
+        if self.mergedropscovered && self.sameblocksrecords {
+            return "supdb-mergedropsrecords";
+        }
         if self.mergedropscovered {
             return "supdb-mergedropscovered";
         }
@@ -11298,6 +11317,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-formsoffkept"
         | "supdb-snapdrops"
         | "supdb-mergedropscovered"
+        | "supdb-mergedropsrecords"
         | "supdb-sameblocksrecords"
         | "supdb-settleroomstill"
         | "supdb-zgroup1k"
@@ -12432,6 +12452,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-formsoffkept" => supdb_arm(Supdb::create_formsoffkept, dir)?,
         "supdb-snapdrops" => supdb_arm(Supdb::create_snapdrops, dir)?,
         "supdb-mergedropscovered" => supdb_arm(Supdb::create_mergedropscovered, dir)?,
+        "supdb-mergedropsrecords" => supdb_arm(Supdb::create_mergedropsrecords, dir)?,
         "supdb-sameblocksrecords" => supdb_arm(Supdb::create_sameblocksrecords, dir)?,
         "supdb-settleroomstill" => supdb_arm(Supdb::create_settleroomstill, dir)?,
         "supdb-zgroup1k" => supdb_arm(Supdb::create_zgroup1k, dir)?,
@@ -14069,6 +14090,13 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.merge_drops_covered && !b.merge_drops_covered);
+            }
+            {
+                let z = Supdb::create_mergedropsrecords(&dir("mergedropsrecords")).unwrap();
+                assert_eq!(z.name(), "supdb-mergedropsrecords");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.merge_drops_covered && !o.same_blocks_from_index);
             }
             {
                 let z = Supdb::create_sameblocksrecords(&dir("sameblocksrecords")).unwrap();
