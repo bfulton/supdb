@@ -1,10 +1,13 @@
 name: ooc-hosted
 
 # One bounded (`ooc`) row on a hosted runner, by hand only. The runner is
-# cgroup v2, where a process cannot bound itself from inside a leaf, so the
-# run is started inside a transient systemd service with the limit on it
-# (MemoryMax, and no swap) and the suite attaches to that group, holding
-# its limit to the --bound it was asked for (bench/src/bound.rs). The row's
+# cgroup v2, where a group may hand the memory controller to the groups
+# under it only while no process is in it, so the run is started inside a
+# transient systemd service delegated to it (Delegate=yes, no limit on the
+# service and no swap): the suite moves itself into a leaf of the service's
+# group and gives each pass a leaf of its own with the --bound on it, so
+# that the bound holds the pass's process and nothing of the run's
+# (bench/src/bound.rs). The row's
 # class is this runner's with the bound in it: it is compared to its own
 # class's history alone and never to a cell from any other machine
 # (bench/CLAUDE.md), and until three rows of the class exist the gate can
@@ -60,7 +63,7 @@ jobs:
       - name: The machine, as the row records it
         working-directory: bench
         run: ./target/release/bench machine | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: The bounded run, inside a transient service with the limit on it
+      - name: The bounded run, inside a transient service delegated to it
         working-directory: bench
         env:
           ARMS: ${{ inputs.arms }}
@@ -79,7 +82,7 @@ jobs:
           sudo systemd-run --wait --pipe --collect --same-dir \
             --uid="$(id -un)" --gid="$(id -gn)" \
             --setenv=HOME="$HOME" --setenv=CARGO_TERM_COLOR=always \
-            -p MemoryMax="$BOUND" -p MemorySwapMax=0 \
+            -p Delegate=yes -p MemorySwapMax=0 \
             ./target/release/bench run --scale ooc --bound "$BOUND" --reps "$REPS" --out runs-ci $ARM_FLAG \
             2> >(tee ooc-stderr.log >&2)
           ls runs-ci/ooc/*.json

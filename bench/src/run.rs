@@ -1019,7 +1019,7 @@ fn start_floors(
         let seek = seek_floors(floor, bounded, &mut s, rep)?;
         let mem = mem_floor();
         let (page, held) = page_floor()?;
-        fresh.push(held);
+        hold_floor(plan, fresh, held);
         if rep > 0 {
             s.push(
                 "wal-floor",
@@ -1074,6 +1074,12 @@ fn start_floors(
 fn pass_measurements(size: u64, arm: &str, g: Guarantee, one: &OnePass) -> Vec<Measurement> {
     let mut s = Samples::new();
     let sz = Some(size);
+    if let Some(b) = one.bound_start_bytes {
+        s.push(AUDIT_WORKLOAD, sz, arm, g, ("group_bytes", "B"), b as f64);
+    }
+    if let Some(b) = one.start_process_bytes {
+        s.push(AUDIT_WORKLOAD, sz, arm, g, ("process_bytes", "B"), b as f64);
+    }
     s.push("load", sz, arm, g, ("ops_per_s", "ops/s"), one.load_ops_s);
     s.push(
         "load",
@@ -1449,6 +1455,9 @@ pub fn run(
                         killed.push(k);
                     }
                     PassOutcome::Done(one) => {
+                        if let Some(note) = audit_note(arm, size, rep, &one) {
+                            log(&note);
+                        }
                         let frag = if rep > 0 {
                             pass_measurements(size, arm, g, &one)
                         } else {
@@ -1511,7 +1520,7 @@ pub fn run(
             // mark that the rep is whole.
             let mut after = Samples::new();
             let (page, held) = page_floor()?;
-            fresh.push(held);
+            hold_floor(plan, &mut fresh, held);
             if rep > 0 {
                 after.push(
                     "page-floor",
@@ -1704,6 +1713,15 @@ pub struct OnePass {
     /// the phase's workload, the suffix its quantities carry (`_3t`,
     /// `_lag10pct`, or none), and the counts. Empty unbounded.
     phase_counts: Vec<(String, String, PhaseCounts)>,
+    /// Under a bound, what the pass's group held at its start and the
+    /// pass's own resident bytes then, read by its process before anything
+    /// else (`one_pass_child`): the audit that the pass was given its bound
+    /// whole, recorded in the row (`AUDIT_WORKLOAD`) and checked against
+    /// `AUDIT_START_BYTES` by the run.
+    #[serde(default)]
+    bound_start_bytes: Option<u64>,
+    #[serde(default)]
+    start_process_bytes: Option<u64>,
 }
 
 impl OnePass {
@@ -1722,6 +1740,12 @@ impl OnePass {
             ("scan entries_per_s".into(), self.scan_entries_s),
         ];
         v.retain(|(_, x)| !x.is_nan());
+        if let Some(b) = self.bound_start_bytes {
+            v.push((format!("{AUDIT_WORKLOAD} group_bytes"), b as f64));
+        }
+        if let Some(b) = self.start_process_bytes {
+            v.push((format!("{AUDIT_WORKLOAD} process_bytes"), b as f64));
+        }
         for (pct, x) in &self.scan_lag {
             v.push((format!("scan-lag entries_per_s_lag{pct}pct"), *x));
         }
@@ -2306,9 +2330,55 @@ struct PassSpec {
     out: PathBuf,
 }
 
+/// The workload a bounded row records each pass's start under: what the
+/// pass's group held (`group_bytes`) and the pass's own resident bytes
+/// (`process_bytes`) before the pass did anything. A record and not a
+/// measurement: the gate judges none of it (`gate::is_audit`) and the
+/// figures draw none of it; the run checks it (`audit_note`).
+pub const AUDIT_WORKLOAD: &str = "bound-start";
+
+/// The most a pass's group may hold at its start before the run says so:
+/// a pass in a group of its own starts at its own process's first pages, a
+/// few megabytes, and a group shared with the run's process (`Mode::Shared`)
+/// at the run's too, which is the case this exists to name.
+pub const AUDIT_START_BYTES: u64 = 32 << 20;
+
+/// The line a pass whose group held more than `AUDIT_START_BYTES` at its
+/// start is reported with, or none.
+pub fn audit_note(arm: &str, size: u64, rep: usize, one: &OnePass) -> Option<String> {
+    let b = one.bound_start_bytes?;
+    (b > AUDIT_START_BYTES).then(|| {
+        format!(
+            "AUDIT: the pass of {arm} at {size} keys, rep {rep}, began with {} MB charged to its              bound, over the {} MB a pass in a group of its own begins with",
+            b >> 20,
+            AUDIT_START_BYTES >> 20
+        )
+    })
+}
+
+/// The seam a test holds memory in a run's own process with:
+/// `SUPDB_BENCH_PARENT_BALLAST=<bytes>`, touched and held until the value
+/// returned is dropped. A pass's bound must see none of it.
+pub const PARENT_BALLAST: &str = "SUPDB_BENCH_PARENT_BALLAST";
+
+/// The ballast `PARENT_BALLAST` asks for, every page written so that it is
+/// resident, or none.
+pub fn parent_ballast() -> Option<Vec<u8>> {
+    let bytes: usize = std::env::var(PARENT_BALLAST).ok()?.parse().ok()?;
+    let mut v = vec![0u8; bytes];
+    for i in (0..v.len()).step_by(4096) {
+        v[i] = 1;
+    }
+    Some(std::hint::black_box(v))
+}
+
+/// The number of the next pass group a bounded run makes (`Bound::pass`),
+/// one a pass, so that no two passes of a run share a group's name.
+static PASS_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// `one_pass` in a process of its own (`Plan::fresh_process`): this
-/// binary again, `bench one-pass SPEC`, spawned inside whatever group this
-/// process is in -- a child is born into its parent's cgroup -- with the
+/// binary again, `bench one-pass SPEC`, which under a bound joins a group
+/// of its own before it runs anything (`Bound::pass`), with the
 /// pass's spec in a file beside the store and its result written to
 /// another, since the pass prints its own lines to both streams and the
 /// result must not share one. A child killed by SIGKILL is the bound's
@@ -2324,6 +2394,27 @@ fn pass_in_child(
 ) -> Result<PassOutcome, String> {
     let spec_path = PathBuf::from(format!("{}.spec.json", dir.display()));
     let out = PathBuf::from(format!("{}.pass.json", dir.display()));
+    // Under a bound, the pass's own group (`Bound::pass`), made here with
+    // the limit on it and removed when the pass is done; the pass's process
+    // joins it before it runs anything and is handed it in its spec, so its
+    // counts and its start are its own group's.
+    let group = match &plan.bound {
+        Some(b) => Some(
+            b.pass(PASS_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                .map_err(|e| format!("the pass's group: {e}"))?,
+        ),
+        None => None,
+    };
+    let child_plan;
+    let plan = match &group {
+        Some(g) => {
+            let mut p = plan.clone();
+            p.bound = Some(g.bound());
+            child_plan = p;
+            &child_plan
+        }
+        None => plan,
+    };
     let spec = PassSpecRef {
         arm,
         dir,
@@ -2336,14 +2427,22 @@ fn pass_in_child(
     let text = serde_json::to_vec(&spec).map_err(|e| format!("the pass's spec: {e}"))?;
     std::fs::write(&spec_path, text).map_err(|e| format!("writing the pass's spec: {e}"))?;
     let exe = std::env::current_exe().map_err(|e| format!("this binary's own path: {e}"))?;
-    let status = std::process::Command::new(&exe)
-        .arg("one-pass")
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("one-pass")
         .arg(&spec_path)
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null());
+    #[cfg(unix)]
+    if let Some(g) = &group {
+        g.join_before_exec(&mut cmd);
+    }
+    let status = cmd
         .status()
         .map_err(|e| format!("spawning the pass's process: {e}"))?;
     let _ = std::fs::remove_file(&spec_path);
     let mark = PhaseTrace::take(dir);
+    // The group's own figures where the trace left none, read before the
+    // group goes with `group`'s drop.
+    let group_stat = group.as_ref().and_then(|g| g.stat().ok());
     if !status.success() {
         let _ = std::fs::remove_file(&out);
         #[cfg(unix)]
@@ -2355,8 +2454,14 @@ fn pass_in_child(
                     size,
                     rep,
                     after_phase: mark.as_ref().map(|m| m.phase.clone()),
-                    rss_bytes: mark.as_ref().and_then(|m| m.rss_bytes),
-                    cache_bytes: mark.as_ref().and_then(|m| m.cache_bytes),
+                    rss_bytes: mark
+                        .as_ref()
+                        .and_then(|m| m.rss_bytes)
+                        .or(group_stat.map(|s| s.rss)),
+                    cache_bytes: mark
+                        .as_ref()
+                        .and_then(|m| m.cache_bytes)
+                        .or(group_stat.map(|s| s.cache)),
                     utc: crate::row::utc_now(),
                 }));
             }
@@ -2383,10 +2488,26 @@ pub fn one_pass_child(spec_path: &Path) -> Result<(), String> {
     let spec: PassSpec =
         serde_json::from_str(&text).map_err(|e| format!("the pass's spec: {e}"))?;
     debug_assert!(spec.plan.bound.as_ref().is_none_or(|b| !b.is_owned()));
+    // What the bound held before the pass did anything, and this process's
+    // own resident bytes: the record that the pass was given its bound
+    // whole (`OnePass::bound_start_bytes`). Read before the payload, the
+    // store or a thread exists.
+    let start = spec.plan.bound.as_ref().map(|b| {
+        (
+            b.usage()
+                .map_err(|e| format!("the bound at the pass's start: {e}")),
+            resident_bytes(),
+        )
+    });
+    let start = match start {
+        Some((Ok(group), own)) => Some((group, own)),
+        Some((Err(e), _)) => return Err(e),
+        None => None,
+    };
     let payload = Payload::new(spec.plan.value_size, spec.plan.compress, 0xE1);
     let seam = std::env::var(KILL_AFTER).ok();
     let trace = PhaseTrace::new(&spec.dir, &spec.arm, spec.rep, seam.as_deref());
-    let one = one_pass(
+    let mut one = one_pass(
         &spec.arm,
         &spec.dir,
         spec.size,
@@ -2395,6 +2516,10 @@ pub fn one_pass_child(spec_path: &Path) -> Result<(), String> {
         &payload,
         Some(trace),
     )?;
+    if let Some((group, own)) = start {
+        one.bound_start_bytes = Some(group);
+        one.start_process_bytes = own;
+    }
     let text = serde_json::to_vec(&one).map_err(|e| format!("the pass's result: {e}"))?;
     std::fs::write(&spec.out, text)
         .map_err(|e| format!("writing the pass's result {}: {e}", spec.out.display()))
@@ -2716,6 +2841,8 @@ fn one_pass(
     }
 
     Ok(OnePass {
+        bound_start_bytes: None,
+        start_process_bytes: None,
         prime_us_per_page: prime_a.max(prime_b),
         load_ops_s: if passes.load {
             size as f64 / load_s
@@ -3350,6 +3477,9 @@ pub fn ab(
                     break;
                 }
             };
+            if let Some(note) = audit_note(arm, size, rep, &one) {
+                let _ = writeln!(log, "{note}");
+            }
             if i == 0 {
                 got = one.flat();
             } else if rep > 0 {
@@ -4353,6 +4483,22 @@ fn populate_write(_ptr: *mut libc::c_void, _len: usize) -> bool {
 /// this floor came from. It is sampled through the row, not only at its
 /// start, because the price moves within one. Pages a second, and the
 /// mapping for the caller to hold.
+/// The page floor's pages held to the run's end (`FreshPages`), except
+/// where the run's process shares its bound with the passes
+/// (`Mode::Shared`): there every page it holds is a page no pass may use,
+/// and they are given back at once.
+fn hold_floor(plan: &Plan, fresh: &mut Vec<FreshPages>, held: FreshPages) {
+    if plan
+        .bound
+        .as_ref()
+        .is_some_and(|b| b.mode() == crate::bound::Mode::Shared)
+    {
+        drop(held);
+    } else {
+        fresh.push(held);
+    }
+}
+
 fn page_floor() -> Result<(f64, FreshPages), String> {
     // SAFETY: a plain query of the system's page size.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };

@@ -7,7 +7,8 @@
 #   sh scripts/ooc.sh --prove-red                     # the gate, proved on a known-red input
 #
 # The run makes a cgroup of its own under the group this shell is in,
-# moves itself into it and removes it when it is done (`bound::Bound`).
+# stays out of it, gives each pass a group under it with the bound on it,
+# and removes them when it is done (`bound::Bound`).
 # A run the kernel kills for exceeding the bound never gets there: its
 # group stays, named on stderr by the run's own `bench: bound ... in
 # group PATH` line, and the next run removes a stale sibling only where
@@ -53,6 +54,11 @@ cleanup() {
     group=$(sed -n 's/^bench: bound [0-9]* bytes in group //p' "$err" | tail -n 1)
   fi
   if [ -n "$group" ] && [ -d "$group" ]; then
+    # The pass groups first: a cgroup directory goes only once the groups
+    # under it have, and a pass cut by the exit leaves its own.
+    for p in "$group"/pass-*; do
+      [ -d "$p" ] && rmdir "$p" 2>/dev/null
+    done
     if rmdir "$group" 2>/dev/null; then
       echo "ooc.sh: removed the run's group $group" >&2
     else

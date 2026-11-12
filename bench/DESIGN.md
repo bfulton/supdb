@@ -312,7 +312,7 @@ out-of-core regime reached under a memory bound.
 |---|---|---|---|
 | `quick` | 300 000 keys | 5 | every pull request, on a GitHub Actions runner |
 | `full` | the rung at which the store is at least 1.5× the machine's memory | 7 | on demand or scheduled, on a quiet machine |
-| `ooc` | ten million keys, from three million, under `--bound BYTES`: under cgroup v1 a group of the run's own with that memory limit, the process moved into it before anything is measured; under cgroup v2 alone the group the run was started in, bounded by its starter (`systemd-run -p MemoryMax=BYTES -p MemorySwapMax=0`), whose limit the run holds to the bound it was asked for | 3 | on demand, on a quiet Linux machine with the cgroup v1 memory controller writable (`scripts/ooc.sh`), or by hand on a hosted runner (`ooc-hosted.yml`), its own class |
+| `ooc` | ten million keys, from three million, under `--bound BYTES`: each pass's process in a group of its own with that memory limit, made for the pass and joined before the process runs anything, the run's own process in none of them -- under cgroup v1 under a group the run makes and never enters, under cgroup v2 beside a leaf the run moves itself into in a delegated service (`systemd-run -p Delegate=yes -p MemorySwapMax=0`); a v2 group that is not delegated and has the limit on it is shared by the run and its passes, held to the bound | 3 | on demand, on a quiet Linux machine with the cgroup v1 memory controller writable (`scripts/ooc.sh`), or by hand on a hosted runner (`ooc-hosted.yml`), its own class |
 
 `ooc` exists because every banked row is in-core: `full`'s top was never
 reached. The bound is the row's class (`/b<MiB>m`), since a store past it
@@ -367,8 +367,26 @@ were, and each store opens from nothing; with every pass in a process
 of its own there is no warmup rep, since a warmup warms a process and
 under a bound every rep costs what the first does (`run::first_rep`).
 In core the arms share the process as they always have, so the quick
-and full rows' conditions are unchanged. The roster runs under 1.25 GiB,
-where both engines leave core at ten million keys; the same regime is
+and full rows' conditions are unchanged.
+
+The bound is the pass's and nothing else's: the engine and the workload
+driving it get `--bound` bytes, the run's floors, ledger and samples
+come out of no pass's bound, and no pass starts with what one before it
+left charged. Each pass records what its group held at its start and its
+own resident bytes then (`bound-start`, `group_bytes` and
+`process_bytes`), a record the gate judges none of and the figures draw
+none of, and the run names any pass that began with more than a few
+megabytes charged (`run::audit_note`); a pairing pairs the two like any
+quantity. `--one-process` under a bound is refused, since a pass in the
+run's process would run outside it.
+
+The roster runs twice: under 1.25 GiB at three and ten million keys
+(`sh scripts/ooc.sh 1342177280`), and under 1 GiB at ten million alone
+(`sh scripts/ooc.sh 1073741824 --bottom 10000000`). Under 1.25 GiB the
+comparator's file at ten million keys is the bound's size within a
+percent or two, the edge of fitting, where a few megabytes either way move
+its rates by half; under 1 GiB it is clearly out of core. A cell read at
+the edge is read with the other bound's beside it. The same regimes are
 reached by a pairing (`bench ab --bound`) over the passes that hold one
 store at a time, each pass there in a process of its own too, a killed
 rep's pair lost and the pairing going on.
@@ -583,9 +601,9 @@ walk reads (`Options::zpages_walk_part` off); `supdb-zbulkmemo` is
 (`ZFile::scan_at`) put in the memo, no first touch decoded into the
 thread's own buffer (`Options::zpages_bulk_admit` off), and
 `supdb-zbulknoahead` with the bulk walk asking for no group's lines ahead
-of its open (`Options::zpages_bulk_ahead` off), and `supdb-zbulkwhole`
-with its own decode of the group it ends inside made whole
-(`Options::zpages_bulk_part` off), and `supdb-zbulkaheadwithin` with its
+of its open (`Options::zpages_bulk_ahead` off), `supdb-zbulkpart` with
+its own decode of the group it ends inside made only as far as it reads
+(`Options::zpages_bulk_part` on), and `supdb-zbulkaheadwithin` with its
 ask made for the next group of a page as well as the next page's head
 (`Options::zpages_bulk_ahead_within`); `supdb-zpromote` is `supdb`
 with a block that scans have walked a block's worth of entries held as a

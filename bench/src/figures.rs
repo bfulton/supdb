@@ -234,7 +234,11 @@ fn arm_order<'a>(present: impl Iterator<Item = &'a String>) -> Vec<String> {
 fn render_row(row: &Row, out: &Path) -> io::Result<Vec<Rendered>> {
     let mut groups: Groups = BTreeMap::new();
     let mut floors = Floors::default();
-    for m in &row.measurements {
+    for m in row
+        .measurements
+        .iter()
+        .filter(|m| !crate::gate::is_audit(&m.workload))
+    {
         let Some(size) = m.size else {
             if m.arm == FLOOR_ARM {
                 let med = Samples::new(m.samples.clone()).median();

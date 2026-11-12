@@ -1550,12 +1550,17 @@ pub struct Options {
     /// bytes following the one being walked, which the core's prefetcher
     /// already fetches. `supdb-zbulkaheadwithin` is the arm.
     pub zpages_bulk_ahead_within: bool,
-    /// The bulk walk's own decode of the group it ends inside -- a first
-    /// touch, decoded into the thread's buffer (`zpages_bulk_admit`) --
-    /// goes only as far as the records it reads, and on a step at a time
-    /// where the guess fell short (`zfile::ZFile::walk_last_part`), as a
-    /// cursor's last group does (`zpages_walk_part`). `supdb-zbulkwhole`
-    /// decodes it whole, the shape before.
+    /// EXPERIMENT: the bulk walk's own decode of the group it ends inside
+    /// -- a first touch, decoded into the thread's buffer
+    /// (`zpages_bulk_admit`) -- goes only as far as the records it reads,
+    /// and on a step at a time where the guess fell short
+    /// (`zfile::ZFile::walk_last_part`), as a cursor's last group does
+    /// (`zpages_walk_part`). It fired four and a half million times in a
+    /// pairing at ten million keys under 1.25 GiB and read the
+    /// single-thread scan 0.99x in two sittings and the threaded scans
+    /// 1.01-1.05x, under what the pairing resolves: it decodes less and
+    /// asks whether each record lies whole, so the count is no verdict.
+    /// Off; `supdb-zbulkpart` is the arm.
     pub zpages_bulk_part: bool,
     /// EXPERIMENT: a walk's own decode of a group through a form file -- a
     /// first touch under `zpages_scan_admit`, any under
@@ -5140,7 +5145,7 @@ impl Default for Options {
             zpages_scan_admit: true,
             zpages_bulk_admit: true,
             zpages_bulk_ahead: true,
-            zpages_bulk_part: true,
+            zpages_bulk_part: false,
             zpages_bulk_ahead_within: false,
             zpages_walk_part: true,
             zpages_cursor_view: true,

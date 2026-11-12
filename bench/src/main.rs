@@ -118,9 +118,25 @@ fn enter_bound(bytes: u64) -> Result<Bound, String> {
         b.limit(),
         b.group().display()
     );
+    eprintln!(
+        "bench: {}",
+        match b.mode() {
+            supdb_bench::bound::Mode::PerPass =>
+                "each pass in a group of its own with the bound on it, this process in none",
+            supdb_bench::bound::Mode::Shared =>
+                "the passes share this process's group, which a wrapper bounded (cgroup v2, \
+                 not delegated): each pass records what the group held at its start",
+        }
+    );
     run::probe_counts(&b).map_err(|e| format!("refused: {e}"))?;
     Ok(b)
 }
+
+/// The refusal of `--one-process` under `--bound`: a bound is each pass's
+/// own process's (`bound::Bound::pass`), and a pass in this process has none.
+const ONE_PROCESS_BOUND: &str =
+    "refused: --one-process under --bound: the bound is each pass's own process's, and a pass in \
+     this process would run outside it";
 
 struct Args(Vec<String>);
 impl Args {
@@ -336,6 +352,14 @@ fn cmd_ab(a: Args) -> i32 {
     } else if a.has("--one-process") {
         plan.fresh_process = false;
     }
+    if plan.bound.is_some() && !plan.fresh_process {
+        eprintln!("bench ab: {ONE_PROCESS_BOUND}");
+        return 2;
+    }
+    // The test's seam: memory this process touches and holds for the
+    // pairing's length, which no pass's bound may see
+    // (`tests/bound_isolation.rs`).
+    let _ballast = run::parent_ballast();
     if let Some(l) = a.num("--len") {
         plan.scan_len = (l as usize).max(1);
     }
@@ -823,6 +847,10 @@ fn cmd_run(a: Args) -> i32 {
         plan.fresh_process = true;
     } else if a.has("--one-process") {
         plan.fresh_process = false;
+    }
+    if plan.bound.is_some() && !plan.fresh_process {
+        eprintln!("bench run: {ONE_PROCESS_BOUND}");
+        return 2;
     }
 
     // The rungs, not just the top: with a bottom set, the top alone does not

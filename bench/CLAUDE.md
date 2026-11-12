@@ -575,14 +575,19 @@ three-thread scan rate fell from 45 to 25-26 million entries a second,
 while the supdb arm faulted in neither harness (`sh scripts/pair.sh
 lmdb-nordahead lmdb-nordahead 10000000 --bound 1308622848 --passes
 load,read,read-threaded,scan,scan-threaded,mixes --ops-div 10 --reps 2`
-against the same at `--bound 1342177280`, at `03fdbe9`). Whether the bound
-covers the harness is a decision for the series and not made here; until
-it is, a cell read against LMDB at that edge says which harness it was
-read in, and the roster's are read as 30-40 MB tighter than their
-`--bound`. The rule: whatever the harness holds runs inside the bound it
-shares a group with, so its memory is read beside the bound before a
-comparator's cells at the edge of fitting are read; and a quantity that
-grows rep by rep in the parent is a drift in every cell that can feel it.
+against the same at `--bound 1342177280`, at `03fdbe9`). The bound is the
+pass's now: each pass's process joins a group of its own with the limit
+on it before it runs anything, the run's process is in none of them, and
+each pass records what its group held at its start (`bound-start`), so
+the arms' equal memory is a recorded fact and not an assumption
+(`bound::Bound::pass`, `run::audit_note`); the roster runs a second time
+under 1 GiB at ten million keys, where LMDB is clearly out of core, so a
+cell at the edge is read beside one that is not. The first row after it
+is a definition step, banked on its controls. The rule: whatever the
+harness holds is kept out of the bound the measured process runs under,
+by the structure and not by holding little, and the bound each pass got
+is read from the kernel at the pass's start; and a quantity that grows
+rep by rep in the parent is a drift in every cell that can feel it.
 
 **A workflow that never runs can be syntactically invalid for months.**
 Both self-hosted pickup watchdogs arrived with a block of an older draft

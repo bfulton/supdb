@@ -49,6 +49,8 @@ pub fn higher_is_better(quantity: &str) -> Option<bool> {
         "entries_per_s_lag10pct" | "entries_per_s_lag100pct" => true,
         "updates_per_s_lag1pct" | "updates_per_s_lag10pct" | "updates_per_s_lag100pct" => true,
         "p50_us" | "p99_us" | "device_bytes_per_byte" | "bytes_on_disk_per_byte" => false,
+        // The audit's (`is_audit`): named, and judged by nobody.
+        "group_bytes" | "process_bytes" => false,
         _ => return None,
     })
 }
@@ -64,6 +66,16 @@ pub fn is_floor(workload: &str) -> bool {
         workload,
         "wal-floor" | "scan-floor" | "mem-floor" | "page-floor" | "seek-floor" | "seek-floor-again"
     )
+}
+
+/// The workloads a row carries as a record and not a measurement: what each
+/// bounded pass's group and process held at the pass's start
+/// (`run::AUDIT_WORKLOAD`). The gate judges none of them -- a pass that
+/// began with more than its own process charged to its bound is the run's
+/// to report (`run::audit_note`), not a regression of anything -- and the
+/// figures draw none.
+pub fn is_audit(workload: &str) -> bool {
+    workload == crate::run::AUDIT_WORKLOAD
 }
 
 /// The floors a bounded row carries for the device's random read, which
@@ -376,7 +388,7 @@ pub fn gate(row: &Row, runs: &Path) -> io::Result<Report> {
     let mut prior: HashMap<Key, Vec<(f64, f64)>> = HashMap::new();
     let mut prior_med: HashMap<Key, Vec<f64>> = HashMap::new();
     for r in &window {
-        for m in &r.measurements {
+        for m in r.measurements.iter().filter(|m| !is_audit(&m.workload)) {
             let k = (
                 m.workload.clone(),
                 m.arm.clone(),
@@ -393,7 +405,7 @@ pub fn gate(row: &Row, runs: &Path) -> io::Result<Report> {
     }
 
     let mut findings = Vec::with_capacity(row.measurements.len());
-    for m in &row.measurements {
+    for m in row.measurements.iter().filter(|m| !is_audit(&m.workload)) {
         let Some(up) = higher_is_better(&m.quantity) else {
             return Err(io::Error::other(format!(
                 "quantity {:?} has no recorded direction; add it to gate::higher_is_better",
