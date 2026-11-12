@@ -2481,6 +2481,87 @@ fn a_scan_from_a_key_a_scan_started_at_takes_its_block_from_the_start_cache() {
     round(&stores, "sealed into a piece");
 }
 
+/// A merge drops behind its second pass the raw records of an input
+/// partition its form file serves (`Options::merge_drops_covered`), and only
+/// there: the gate at the form and a form file in the partition's cell. A
+/// served partition's raw records are read by nothing but the merge, which
+/// reads them back and would leave them the cache's newest pages; under the
+/// raw gate with the cells kept, with every partition declined its form, or
+/// with the option off, the merge drops nothing. The reads after it are the
+/// model's in every case.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_merge_drops_the_raw_records_of_an_input_its_form_serves() {
+    for (label, zpages, gate_raw, declined, drops, want) in [
+        ("served", ZPages::Always, false, false, true, true),
+        ("kept", ZPages::Always, false, false, false, false),
+        ("gate-raw", ZPages::Always, true, false, true, false),
+        ("declined", ZPages::Always, false, true, true, false),
+        ("raw", ZPages::Off, false, false, true, false),
+    ] {
+        let dir = scratch(&format!("merge-drops-{label}"));
+        let mut db = Db::create(
+            &dir,
+            forced(|o| {
+                o.zpages = zpages;
+                o.partition_bytes = Some(160 << 10);
+                o.inline_bytes = 1 << 16;
+                o.l0_trigger = 2;
+                o.merge_drops_covered = drops;
+                // A drop every sixteen kilobytes, so a partition of a
+                // hundred and sixty reaches several.
+                o.merge_drop_chunk = 16 << 10;
+                if declined {
+                    o.zpages_min_bytes = 1 << 40;
+                }
+            }),
+        )
+        .unwrap();
+        let mut model = ordered_load(&mut db, 6000, 0xD80F);
+        db.zpages_settle().unwrap();
+        db.settle().unwrap();
+        let c = db.zpage_counts();
+        if zpages == ZPages::Always && !declined {
+            assert!(
+                c.partitions >= 3 && c.form_files == c.partitions,
+                "{label}: {c:?}"
+            );
+        } else {
+            assert_eq!(c.form_files, 0, "{label}: {c:?}");
+        }
+        if gate_raw {
+            db.zgate_set(0);
+        }
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let mut rng = Rng(0xD80F1);
+        // Two pieces over every partition's range, so that each is merged.
+        for round in 0..2 {
+            for k in keys.iter().step_by(5 + round) {
+                let v = suite_value(&mut rng);
+                db.append(k, &v);
+                model.entry(k.clone()).or_default().push(v);
+            }
+            db.commit().unwrap();
+            db.seal().unwrap();
+        }
+        db.settle().unwrap();
+        assert_eq!(db.levels().1, 0, "{label}: the pieces merged");
+        let dropped = db.merge_dropped_bytes();
+        assert_eq!(
+            dropped > 0,
+            want,
+            "{label}: the merges dropped {dropped} bytes"
+        );
+        if gate_raw {
+            db.zgate_set(2);
+        }
+        check(&db, &model, &keys, label);
+        check_scan(&db, &model, label);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// The body of the three tests above: the store, its phases and the reads
 /// under each, counted on the writer and a handle. With `via_form` the
 /// count is held to zero; without it the touches are summed and returned.

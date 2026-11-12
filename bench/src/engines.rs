@@ -868,6 +868,18 @@ pub struct Supdb {
     /// whatever the writer commits meanwhile
     /// (`Options::scan_forms_off_stale_writes` zero). `supdb-formsoffkept`.
     formsoffkept: bool,
+    /// A handle's scan snapshot dropped at every publish, where its look
+    /// has no tables to carry (`Options::snapshot_stands` off).
+    /// `supdb-snapdrops`.
+    snapdrops: bool,
+    /// A merge drops behind it the raw records of an input partition its
+    /// form file serves (`Options::merge_drops_covered`).
+    /// `supdb-mergedropscovered`.
+    mergedropscovered: bool,
+    /// The landing's same-blocks check read from the records whatever the
+    /// indexes hold (`Options::same_blocks_from_index` off).
+    /// `supdb-sameblocksrecords`.
+    sameblocksrecords: bool,
     /// The fills' room closed for a second by any growth of the group's
     /// refaults since the last reading, however old the reading
     /// (`Options::forms_settle_room_pressure` off). `supdb-settleroomstill`.
@@ -1920,6 +1932,18 @@ struct Policy {
     /// whatever the writer commits meanwhile
     /// (`Options::scan_forms_off_stale_writes` zero). `supdb-formsoffkept`.
     formsoffkept: bool,
+    /// A handle's scan snapshot dropped at every publish, where its look
+    /// has no tables to carry (`Options::snapshot_stands` off).
+    /// `supdb-snapdrops`.
+    snapdrops: bool,
+    /// A merge drops behind it the raw records of an input partition its
+    /// form file serves (`Options::merge_drops_covered`).
+    /// `supdb-mergedropscovered`.
+    mergedropscovered: bool,
+    /// The landing's same-blocks check read from the records whatever the
+    /// indexes hold (`Options::same_blocks_from_index` off).
+    /// `supdb-sameblocksrecords`.
+    sameblocksrecords: bool,
     /// The fills' room closed for a second by any growth of the group's
     /// refaults since the last reading, however old the reading
     /// (`Options::forms_settle_room_pressure` off). `supdb-settleroomstill`.
@@ -2491,6 +2515,9 @@ impl Default for Policy {
             rewarmtrim: false,
             formson: false,
             formsoffkept: false,
+            snapdrops: false,
+            mergedropscovered: false,
+            sameblocksrecords: false,
             settleroomstill: false,
             settlespan: false,
             nopacesyncs: false,
@@ -6033,6 +6060,44 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose handles drop their scan snapshot at every publish
+    /// their look has no tables to carry across
+    /// (`Options::snapshot_stands` off).
+    pub fn create_snapdrops(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                snapdrops: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose landings ask the records whether a rewritten
+    /// partition cuts the same blocks, whatever the ordered indexes hold
+    /// (`Options::same_blocks_from_index` off).
+    pub fn create_sameblocksrecords(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                sameblocksrecords: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose merges drop behind them the raw records of an input
+    /// partition its form file serves (`Options::merge_drops_covered`).
+    pub fn create_mergedropscovered(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                mergedropscovered: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` whose writer, its forms given up on a reading of its scans,
     /// keeps them off until its next scan whatever it commits meanwhile
     /// (`Options::scan_forms_off_stale_writes` zero).
@@ -7730,6 +7795,9 @@ impl Supdb {
             rewarmtrim,
             formson,
             formsoffkept,
+            snapdrops,
+            mergedropscovered,
+            sameblocksrecords,
             settleroomstill,
             settlespan,
             nopacesyncs,
@@ -8020,6 +8088,8 @@ impl Supdb {
             merge_verifies_inputs: !mergenoverify,
             malloc_mmap_threshold: if mmapthr { 128 << 10 } else { 0 },
             merge_drop_behind: mergedropbehind,
+            merge_drops_covered: mergedropscovered,
+            same_blocks_from_index: !sameblocksrecords,
             heads_willneed: !noheadwillneed,
             merge_chains: !nomergechain,
             merge_bytes_cap: if mergeuncapped {
@@ -8193,6 +8263,7 @@ impl Supdb {
                 || std::env::var_os("SUPDB_MIX_COUNTERS").is_some(),
             forms_settle_rebuild_from: rebuild,
             snapshot_carry: snapcarry,
+            snapshot_stands: !snapdrops,
             scan_lazy_snapshot: lazysnap,
             // The pieces over a range merged into one piece beside the
             // partition merge, or left for it as the engine has it.
@@ -8506,6 +8577,9 @@ impl Supdb {
             rewarmtrim,
             formson,
             formsoffkept,
+            snapdrops,
+            mergedropscovered,
+            sameblocksrecords,
             settleroomstill,
             settlespan,
             nopacesyncs,
@@ -9672,6 +9746,15 @@ impl Engine for Supdb {
         if self.formsoffkept {
             return "supdb-formsoffkept";
         }
+        if self.snapdrops {
+            return "supdb-snapdrops";
+        }
+        if self.mergedropscovered {
+            return "supdb-mergedropscovered";
+        }
+        if self.sameblocksrecords {
+            return "supdb-sameblocksrecords";
+        }
         if self.settleroomstill {
             return "supdb-settleroomstill";
         }
@@ -9938,6 +10021,7 @@ impl Engine for Supdb {
         let z = db.zpage_counts();
         vec![
             ("snapshot_builds", db.snapshot_builds() as f64),
+            ("snapshots_stood", db.snapshots_stood() as f64),
             ("snapshot_extends", db.snapshot_extends() as f64),
             ("snapshot_refreshes", db.snapshot_refreshes() as f64),
             ("form_takes", db.form_takes() as f64),
@@ -11212,6 +11296,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-rewarmtrim"
         | "supdb-formson"
         | "supdb-formsoffkept"
+        | "supdb-snapdrops"
+        | "supdb-mergedropscovered"
+        | "supdb-sameblocksrecords"
         | "supdb-settleroomstill"
         | "supdb-zgroup1k"
         | "supdb-settlespan"
@@ -12343,6 +12430,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-rewarmtrim" => supdb_arm(Supdb::create_rewarmtrim, dir)?,
         "supdb-formson" => supdb_arm(Supdb::create_formson, dir)?,
         "supdb-formsoffkept" => supdb_arm(Supdb::create_formsoffkept, dir)?,
+        "supdb-snapdrops" => supdb_arm(Supdb::create_snapdrops, dir)?,
+        "supdb-mergedropscovered" => supdb_arm(Supdb::create_mergedropscovered, dir)?,
+        "supdb-sameblocksrecords" => supdb_arm(Supdb::create_sameblocksrecords, dir)?,
         "supdb-settleroomstill" => supdb_arm(Supdb::create_settleroomstill, dir)?,
         "supdb-zgroup1k" => supdb_arm(Supdb::create_zgroup1k, dir)?,
         "supdb-settlespan" => supdb_arm(Supdb::create_settlespan, dir)?,
@@ -13965,6 +14055,27 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.scan_forms_off_stale_writes == 0 && b.scan_forms_off_stale_writes > 0);
+            }
+            {
+                let z = Supdb::create_snapdrops(&dir("snapdrops")).unwrap();
+                assert_eq!(z.name(), "supdb-snapdrops");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.snapshot_stands && b.snapshot_stands);
+            }
+            {
+                let z = Supdb::create_mergedropscovered(&dir("mergedropscovered")).unwrap();
+                assert_eq!(z.name(), "supdb-mergedropscovered");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.merge_drops_covered && !b.merge_drops_covered);
+            }
+            {
+                let z = Supdb::create_sameblocksrecords(&dir("sameblocksrecords")).unwrap();
+                assert_eq!(z.name(), "supdb-sameblocksrecords");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.same_blocks_from_index && b.same_blocks_from_index);
             }
             {
                 let z = Supdb::create_settleroomstill(&dir("settleroomstill")).unwrap();

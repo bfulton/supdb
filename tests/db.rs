@@ -10387,6 +10387,241 @@ fn a_piece_kept_across_a_merge_is_ranked_against_the_partition_it_meets() {
     }
 }
 
+/// A handle's scan snapshot is the sorted keys of the memtables, and it
+/// stands across a publish that leaves them (`Options::snapshot_stands`): a
+/// merge's landing, which changes the segments alone, and a seal's, whose
+/// frozen table leaves with its base. The look that carries the writer's
+/// tables kept it across both; the look with no tables to carry -- the
+/// writer on the merge paths, every reader handle -- dropped it at each, and
+/// the scan after sorted every unsealed key again: one to three builds of
+/// 50-60 ms inside the pass after the lag sweep's full rewrite at ten
+/// million keys under 1.25 GiB, beside the merge chain's landings.
+///
+/// The merge is held before its landing (`Db::hold_merge_landing`) while
+/// the unsealed keys are written and scanned, so the snapshot is built
+/// over a state the landing then replaces, every run; the seal likewise
+/// (`Db::hold_seal_landing`). Without the option each landing is a build,
+/// and with it none is, the scans the same against the model either way:
+/// before the publish, after it, and after writes filed into the snapshot
+/// that stood.
+#[test]
+fn a_scan_snapshot_stands_across_a_publish_that_leaves_the_memtables() {
+    for (label, stands, block_cache, runs) in [
+        ("stands", true, false, false),
+        ("drops", false, false, false),
+        ("stands-cache", true, true, false),
+        // With the runs copied, so the slots written since the copy, which
+        // a stood snapshot keeps reading the chains for, matter.
+        ("stands-runs", true, false, true),
+    ] {
+        let d = dir(&format!("snap-stands-{label}"));
+        let opts = Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(64 << 20),
+            l0_trigger: 2,
+            scan_block_cache: block_cache,
+            snapshot_stands: stands,
+            snapshot_runs: runs,
+            // The builds counted below are the scans' own.
+            forms_settle_backlog_pct: 0,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:06}");
+        let between = |k: u32, i: u32| format!("key-{k:06}x{i}");
+        for k in 0..6000 {
+            m.append(&mut db, &key(k), "p");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        assert_eq!(db.levels(), (1, 0), "{label}: one partition over every key");
+        // Two pieces over keys the partition holds, so the range is merged
+        // and not promoted; the second's landing starts the merge, held
+        // before its own.
+        for i in 0..10 {
+            m.append(&mut db, &key(1000 + i), "a");
+            m.append(&mut db, &between(1000, i), "a");
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        for i in 0..10 {
+            m.append(&mut db, &key(2000 + i), "b");
+            m.append(&mut db, &between(2000, i), "b");
+        }
+        db.commit().unwrap();
+        db.hold_merge_landing(true);
+        db.seal().unwrap();
+        let t = std::time::Instant::now();
+        while !db.in_flight().1 && t.elapsed() < std::time::Duration::from_secs(10) {
+            db.commit().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(db.in_flight().1, "{label}: the merge did not start");
+        while db.in_flight().0 {
+            db.commit().unwrap();
+            std::thread::yield_now();
+        }
+        // The unsealed keys the snapshot is of: keys the partition holds,
+        // keys the pieces hold, and new ones between and past them.
+        for k in (0..6000u32).step_by(13) {
+            m.append(&mut db, &key(k), "u");
+        }
+        for i in 0..10 {
+            m.append(&mut db, &between(1000, i), "u");
+            m.append(&mut db, &between(4000, i), "n");
+            m.append(&mut db, &key(7000 + i), "n");
+        }
+        db.commit().unwrap();
+        m.check(&db, &format!("{label}: the writer before the landing"));
+        let reader = db.reader().unwrap();
+        m.check(&reader, &format!("{label}: a handle before the landing"));
+        assert!(
+            db.in_flight().1,
+            "{label}: the merge landed before the snapshot was built; the case was not reached"
+        );
+        // Writes between the scans and the landing: keys created since the
+        // snapshot and updates of keys it holds, read by a scan of the
+        // writer's and the handle's, so the lists of keys since the
+        // snapshot and of slots written since its runs are not empty at
+        // the landing; and then more, read by no scan, which the stood
+        // snapshot takes from the log where its look left it.
+        for i in 0..10 {
+            m.append(&mut db, &between(6000, i), "pre");
+        }
+        for k in (11..6000u32).step_by(29) {
+            m.append(&mut db, &key(k), "pre");
+        }
+        db.commit().unwrap();
+        m.check_one(
+            &db,
+            b"",
+            usize::MAX,
+            &format!("{label}: the writer after the pre-writes"),
+        );
+        m.check_one(
+            &reader,
+            b"",
+            usize::MAX,
+            &format!("{label}: a handle after the pre-writes"),
+        );
+        for i in 0..10 {
+            m.append(&mut db, &between(6100, i), "pre2");
+        }
+        for k in (13..6000u32).step_by(31) {
+            m.append(&mut db, &key(k), "pre2");
+        }
+        db.commit().unwrap();
+        let (builds, stood) = (db.snapshot_builds(), db.snapshots_stood());
+        assert!(builds > 0, "{label}: a snapshot was built");
+        // The landing: the segments change and the memtables do not.
+        db.hold_merge_landing(false);
+        let t = std::time::Instant::now();
+        while db.in_flight().1 && t.elapsed() < std::time::Duration::from_secs(20) {
+            db.commit().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!db.in_flight().1, "{label}: the merge did not land");
+        assert_eq!(db.levels(), (1, 0), "{label}: the pieces merged");
+        m.check(&db, &format!("{label}: the writer after the landing"));
+        m.check(&reader, &format!("{label}: a handle after the landing"));
+        if stands {
+            assert_eq!(
+                db.snapshot_builds(),
+                builds,
+                "{label}: nothing sorted again across the merge's landing"
+            );
+            // The handle's look has no tables to carry; the writer's has
+            // them with the cache and carries the snapshot with them.
+            let want = if block_cache { 1 } else { 2 };
+            assert!(
+                db.snapshots_stood() >= stood + want,
+                "{label}: the snapshot stood for the writer and the handle: {} from {stood}",
+                db.snapshots_stood()
+            );
+        } else {
+            assert!(
+                db.snapshot_builds() > builds,
+                "{label}: without the option the landing is a build"
+            );
+            assert_eq!(db.snapshots_stood(), 0, "{label}: and nothing stands");
+        }
+        // Writes after it: updates of keys the snapshot holds and keys
+        // created since, filed into the snapshot that stood.
+        for k in (5..6000u32).step_by(17) {
+            m.append(&mut db, &key(k), "v");
+        }
+        for i in 0..10 {
+            m.append(&mut db, &between(5000, i), "n2");
+            m.append(&mut db, &key(7000 + i), "n2");
+        }
+        db.commit().unwrap();
+        m.check(
+            &db,
+            &format!("{label}: the writer after writes over the stood snapshot"),
+        );
+        m.check(&reader, &format!("{label}: a handle after writes over it"));
+        // A seal held before its landing: the freeze is the writer's own
+        // publish and changes the memtables, so the scan after it builds;
+        // the landing then retires the frozen table and leaves the live
+        // one, and the snapshot stands without its base.
+        db.hold_seal_landing(true);
+        db.seal().unwrap();
+        for k in (3..6000u32).step_by(19) {
+            m.append(&mut db, &key(k), "w");
+        }
+        for i in 0..10 {
+            m.append(&mut db, &between(3000, i), "n3");
+        }
+        db.commit().unwrap();
+        m.check(&db, &format!("{label}: the writer over the frozen table"));
+        m.check(&reader, &format!("{label}: a handle over the frozen table"));
+        assert!(db.in_flight().0, "{label}: the seal is held");
+        let (builds, stood) = (db.snapshot_builds(), db.snapshots_stood());
+        db.hold_seal_landing(false);
+        let t = std::time::Instant::now();
+        while db.in_flight().0 && t.elapsed() < std::time::Duration::from_secs(20) {
+            db.commit().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!db.in_flight().0, "{label}: the seal did not land");
+        m.check(
+            &db,
+            &format!("{label}: the writer after the seal's landing"),
+        );
+        m.check(
+            &reader,
+            &format!("{label}: a handle after the seal's landing"),
+        );
+        if stands {
+            assert_eq!(
+                db.snapshot_builds(),
+                builds,
+                "{label}: nothing sorted again across the seal's landing"
+            );
+            assert!(
+                db.snapshots_stood() > stood,
+                "{label}: the snapshot stood without the landed table's base"
+            );
+        } else {
+            assert!(
+                db.snapshot_builds() > builds,
+                "{label}: without the option the seal's landing is a build"
+            );
+        }
+        for k in (7..6000u32).step_by(23) {
+            m.append(&mut db, &key(k), "x");
+        }
+        db.commit().unwrap();
+        m.check(&db, &format!("{label}: the writer at the end"));
+        m.check(&reader, &format!("{label}: a handle at the end"));
+        drop(reader);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
 /// The scan snapshot is the sorted keys of everything unsealed, and a
 /// handle that builds its own sorts all of them: at a hundred thousand
 /// keys each updated once, 9 ms, paid again by every handle that reads
@@ -11537,6 +11772,184 @@ fn the_copies_survive_a_merge_with(compact: bool) {
     );
     m.check(&db, "after a merge that deleted a key");
     std::hint::black_box(sink);
+}
+
+/// Whether a merge rewrote a partition over the same blocks -- the same
+/// key count and the same key at every block's first rank and at the last --
+/// is asked of the two ordered indexes where their heads are whole keys
+/// (`Options::same_blocks_from_index`) and of the records otherwise, and the
+/// two answer alike: over keys a head holds whole and keys it does not, the
+/// same partitions are carried across a merge that keeps every key and one
+/// that replaces the store's first key with another below it, the count
+/// kept; over the short keys, every partition across the first and every
+/// one but the changed partition across the second, and again across a
+/// merge that replaces the store's last key. Asked of the records the landing
+/// read the old partition's key every sixty-fourth rank, which under a
+/// bound are the pages the merge has just read past.
+#[test]
+fn a_rewrite_over_the_same_blocks_is_found_by_the_index_as_by_the_records() {
+    for long in [false, true] {
+        let mut seen = Vec::new();
+        for from_index in [true, false] {
+            let (carried, after, last, asked) = same_blocks_carries(long, from_index);
+            let label = format!("long {long}, from the index {from_index}");
+            assert!(
+                carried > 0,
+                "{label}: the forms were carried across the merge"
+            );
+            // Over the short keys every partition holds forms at both
+            // merges, so the count is exact; over the long ones a partition
+            // the first merge left without forms makes it inexact, and the
+            // agreement below is what holds.
+            if !long {
+                assert_eq!(
+                    after,
+                    carried - 1,
+                    "{label}: the partition whose first key changed is not carried, and only it"
+                );
+                assert_eq!(
+                    last,
+                    carried - 1,
+                    "{label}: the partition whose last key changed is not carried, and only it"
+                );
+            }
+            if from_index && !long {
+                assert!(
+                    asked[0] > 0 && asked[1] == 0,
+                    "{label}: every question answered from the indexes: {asked:?}"
+                );
+            } else {
+                assert!(
+                    asked[0] == 0 && asked[1] > 0,
+                    "{label}: every question answered from the records: {asked:?}"
+                );
+            }
+            seen.push((carried, after, last));
+        }
+        assert_eq!(
+            seen[0], seen[1],
+            "long {long}: the index and the records agree"
+        );
+    }
+}
+
+/// The body of the test above: the forms carried across a merge that keeps
+/// every key, across one that replaces the store's first key, and the
+/// landings' questions by how they were answered.
+fn same_blocks_carries(long: bool, from_index: bool) -> (u64, u64, u64, [u64; 2]) {
+    let d = dir(&format!("same-blocks-{long}-{from_index}"));
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(4 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_ahead: false,
+        forms_settle_backlog_pct: 0,
+        commit_forms: true,
+        forms_carry: true,
+        forms_rebase: true,
+        upkeep: supdb::Upkeep::Inline,
+        freeze_settles: true,
+        same_blocks_from_index: from_index,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    // Forty bytes past the number: one length, longer than a head holds.
+    let pad = "p".repeat(40);
+    let key = |k: &str| {
+        if long {
+            format!("key-{k}-{pad}")
+        } else {
+            format!("key-{k}")
+        }
+    };
+    let num = |k: u32| format!("{k:05}");
+    for k in 0..3000u32 {
+        m.append(&mut db, &key(&num(k)), "v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    let parts = db.levels().0;
+    assert!(parts > 1, "several partitions");
+    let mut sink = 0usize;
+    for k in 0..1500u32 {
+        m.append(&mut db, &key(&num(k)), "v1");
+    }
+    for k in (1500..3000u32).step_by(40) {
+        m.append(&mut db, &key(&num(k)), "v1");
+    }
+    db.commit().unwrap();
+    let r = db.reader().unwrap();
+    r.scan(
+        key(&num(0)).as_bytes(),
+        3000,
+        kv(&mut |_k, v| sink += v.len()),
+    )
+    .unwrap();
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.settle().unwrap();
+    let rebased0 = db.forms_rebased();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    assert_eq!(db.levels(), (parts, 0), "the pieces merged");
+    let carried = db.forms_rebased() - rebased0;
+    m.check(&db, "after a merge that keeps every key");
+    // Writes over every partition, and the store's first key replaced by
+    // one below it of the same length: the count kept, the first block's
+    // first key not.
+    for k in (0..3000u32).step_by(9) {
+        m.append(&mut db, &key(&num(k)), "after");
+    }
+    m.delete(&mut db, &key(&num(0)));
+    m.append(&mut db, &key("0000/"), "first");
+    db.commit().unwrap();
+    let r = db.reader().unwrap();
+    r.scan(
+        key(&num(0)).as_bytes(),
+        10,
+        kv(&mut |_k, v| sink += v.len()),
+    )
+    .unwrap();
+    db.commit().unwrap();
+    let rebased1 = db.forms_rebased();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    let after = db.forms_rebased() - rebased1;
+    m.check(&db, "after a merge that replaced the first key");
+    // And the store's last key replaced by one above it of the same
+    // length: every block's first key kept, the last key not.
+    for k in (4..3000u32).step_by(9) {
+        m.append(&mut db, &key(&num(k)), "last");
+    }
+    m.delete(&mut db, &key(&num(2999)));
+    m.append(&mut db, &key("0299:"), "last");
+    db.commit().unwrap();
+    let r = db.reader().unwrap();
+    r.scan(
+        key(&num(0)).as_bytes(),
+        10,
+        kv(&mut |_k, v| sink += v.len()),
+    )
+    .unwrap();
+    db.commit().unwrap();
+    let rebased2 = db.forms_rebased();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    let last = db.forms_rebased() - rebased2;
+    m.check(&db, "after a merge that replaced the last key");
+    std::hint::black_box(sink);
+    let asked = db.same_blocks_asked();
+    drop(r);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+    (carried, after, last, asked)
 }
 
 #[test]

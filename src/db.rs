@@ -1102,6 +1102,45 @@ pub struct Options {
     /// 9.3-9.9, with more read from the device at each. Off; the arm
     /// `supdb-mergedropbehind` and `supdb-ingestmergedropbehind` drops.
     pub merge_drop_behind: bool,
+    /// EXPERIMENT: a merge drops behind its second pass the record pages
+    /// of an input partition its form file serves (`merge_drop_behind` for
+    /// those inputs alone): the gate at the form and a form file in the
+    /// partition's cell when the merge starts. The drop of every input was
+    /// refuted because a merge's inputs are what the scans beside it read;
+    /// a partition its form serves is read through its form file by every
+    /// read path, and its raw records, dropped at the install
+    /// (`zpages_drop_raw`), come back for the merge and stand as the
+    /// cache's newest pages through the landing. At the pass after the lag
+    /// sweep's full rewrite at ten million keys under 1.25 GiB one sweep
+    /// had 118 MB of raw partition pages resident and 200 MB of its form
+    /// files out, and took 4,700 major faults; one with none took none.
+    /// Priced, the drop first cost the burst its merges: the landing's
+    /// same-blocks question read the old partition's records
+    /// (`same_blocks_from_index`), now out of the cache, half a second a
+    /// landing on the thread every landing goes through, and the pass met
+    /// 124 pieces where it met 26-31. With that answered from the indexes,
+    /// the burst landed its merges as without the drop, and the pass read
+    /// 314-665 ms in three reps against 400-428 without it, the faults
+    /// both ways. Off; `supdb-mergedropscovered` is the arm.
+    pub merge_drops_covered: bool,
+    /// The landing's question of a partition a merge rewrote over the same
+    /// fences -- does it cut the same blocks, so the writer's forms over
+    /// the old one carry (`Options::forms_rebase`) -- answered from the
+    /// two ordered indexes where their heads are whole keys, the block's
+    /// first ranks being the top level's, in memory (`Db::same_blocks`).
+    /// Asked of the records, it read the old partition's key at every
+    /// sixty-fourth rank, a page or two a block across its record region,
+    /// on the thread every landing goes through: out of core those are the
+    /// pages the merge has just read past, and with the merge dropping
+    /// them behind it (`merge_drops_covered`) every landing of the lag
+    /// sweep's full rewrite at ten million keys under 1.25 GiB read half a
+    /// partition back from the device a page at a time, half a second a
+    /// landing, while the next merge waited to be planned: 21 merges in
+    /// the burst where 72 ran without the drop, and 124 pieces left for
+    /// the pass (`docs/engine.md`). Keys a head cannot hold whole are
+    /// compared through the records still. Off asks the records always;
+    /// `supdb-sameblocksrecords` is the arm.
+    pub same_blocks_from_index: bool,
     /// How far a merge's second pass runs past the pages it last dropped
     /// before it drops again (`merge_drop_behind`): a drop is two
     /// syscalls, and two megabytes is a few hundred records a page. A
@@ -3397,6 +3436,25 @@ pub struct Options {
     /// first scan after -- so what it buys is the pass and what it costs
     /// is the burst. `supdb-snapcarry` prices it.
     pub snapshot_carry: bool,
+    /// A handle's scan snapshot stands across a publish that leaves the
+    /// memtables it is of: a merge's landing, a promotion, and a seal's
+    /// landing, whose frozen table goes with its base and leaves the live
+    /// runs. The snapshot is a function of the memtables, and what it
+    /// keeps against a partition, its bounds, it keeps under the
+    /// partition's blob id, so a publish that changes the segments alone
+    /// changes nothing it holds. The look that carries the writer's
+    /// tables across such a publish (`rebase_tables`) kept it already; the
+    /// look of a handle with no tables to carry -- every reader handle,
+    /// and the writer on the merge paths, which is where it scans once it
+    /// has given its forms up (`scan_forms_off_unreused`) -- dropped it
+    /// with the log position, and the next scan sorted every unsealed key
+    /// again. The pass after the lag sweep's full rewrite at ten million
+    /// keys under 1.25 GiB runs beside the merge chain's landings on that
+    /// path with 388,000 keys unsealed: one build at its first scan, and
+    /// one to three more at 50-60 ms each, a tenth to a fifth of the
+    /// pass, where the chain landed inside it (`docs/engine.md`). Off
+    /// drops it at every publish; `supdb-snapdrops` is the arm.
+    pub snapshot_stands: bool,
     /// A frozen table keeps its own sorted snapshot (`FrozenSnaps`): the
     /// seal, a freeze's carry, the keeper or the first scan sets it, and
     /// every later reader of the table -- the seal for its records, a
@@ -5004,6 +5062,8 @@ impl Default for Options {
             merge_verifies_inputs: true,
             malloc_mmap_threshold: 0,
             merge_drop_behind: false,
+            merge_drops_covered: false,
+            same_blocks_from_index: true,
             merge_drop_chunk: 2 << 20,
             merge_read_ahead: 0,
             merge_sync_ahead: 0,
@@ -5154,6 +5214,7 @@ impl Default for Options {
             upkeep_batch_pct: 0,
             upkeep_pass_pct: 0,
             snapshot_carry: false,
+            snapshot_stands: true,
             frozen_snaps: true,
             overlay_merge: true,
             scan_lazy_snapshot: false,
@@ -13391,8 +13452,12 @@ struct MergePlan {
     heads: bool,
     counts: Option<std::sync::Arc<Shared>>,
     /// The inputs' pages dropped behind the second pass, every this many
-    /// bytes (`Options::merge_drop_behind`, `Options::merge_drop_chunk`).
+    /// bytes (`Options::merge_drop_behind`, `Options::merge_drop_chunk`),
+    /// and with it off the inputs whose pages are dropped all the same,
+    /// one flag an input: the partitions a form file serves
+    /// (`Options::merge_drops_covered`).
     drop_behind: bool,
+    drop_covered: Vec<bool>,
     drop_chunk: u64,
     /// The window the second pass asks ahead of its walk of each input
     /// (`Options::merge_read_ahead`); zero asks nothing.
@@ -14083,6 +14148,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         heads,
         counts,
         drop_behind,
+        drop_covered,
         drop_chunk,
         walk_cached,
         read_ahead,
@@ -14221,21 +14287,29 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
     // behind the second pass (`Options::merge_drop_behind`): each input's
     // records dropped from its last drop to a page short of the record the
     // walk stands on, once the walk is a chunk past the last drop.
-    let files: Vec<Option<std::fs::File>> = if drop_behind {
-        inputs
-            .iter()
-            .map(|name| std::fs::File::open(dir.join(name)).ok())
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // Which inputs: every one under `merge_drop_behind`, else the
+    // partitions a form file serves (`Options::merge_drops_covered`).
+    let drops: Vec<bool> = (0..inputs.len())
+        .map(|i| drop_behind || drop_covered.get(i).copied().unwrap_or(false))
+        .collect();
+    let files: Vec<Option<std::fs::File>> = inputs
+        .iter()
+        .zip(&drops)
+        .map(|(name, &d)| {
+            if d {
+                std::fs::File::open(dir.join(name)).ok()
+            } else {
+                None
+            }
+        })
+        .collect();
     let mut dropped_to: Vec<u64> = blobs
         .iter()
         .map(|b| b.record_offset(0).unwrap_or(0))
         .collect();
     let mut dropped_bytes = 0u64;
     let mut drop_at = |i: usize, rank: usize| {
-        if !drop_behind {
+        if !drops[i] {
             return;
         }
         let Some(off) = blobs[i].record_offset(rank) else {
@@ -16223,6 +16297,13 @@ struct Shared {
     /// EXPERIMENT: scan snapshots built over this store's life, which is
     /// what publishing one is meant to bring down; for a test.
     snap_builds: AtomicU64,
+    /// Snapshots kept across a publish that left their memtables
+    /// (`Options::snapshot_stands`), by the looks that had no tables to
+    /// carry.
+    snap_stood: AtomicU64,
+    /// A landing's same-blocks questions (`Db::same_blocks`), by how each
+    /// was answered: from the ordered indexes, from the records.
+    same_blocks_asked: [AtomicU64; 2],
     /// Frozen tables sorted by a reader because nothing had sorted them
     /// yet (`Reader::frozen_snapshot`); the seal's own sorts are
     /// `SealCounts::seal_sorts`.
@@ -22831,16 +22912,20 @@ impl Reader {
             moved = true;
         } else if self.fs().log_gen.get() != st.gen {
             moved = true;
+            // Asked of the note before the note moves to `st`.
+            let stands = self.snapshot_stands(st);
             self.note_over(st);
             self.fs().log_gen.set(st.gen);
-            self.fs().log_seen.set(0);
             // A new state counts its own scans from zero, so the count
             // this handle last maintained at belongs to the old one.
             self.fs().scans_seen.set(0);
-            self.fs().snap_entries.set(0);
-            *self.fs().scan_keys.borrow_mut() = None;
-            self.fs().snap_added.borrow_mut().clear();
-            self.fs().snap_stale.borrow_mut().clear();
+            if !stands {
+                self.fs().log_seen.set(0);
+                self.fs().snap_entries.set(0);
+                *self.fs().scan_keys.borrow_mut() = None;
+                self.fs().snap_added.borrow_mut().clear();
+                self.fs().snap_stale.borrow_mut().clear();
+            }
             self.fs().pending.borrow_mut().clear();
             self.drop_blocks();
             if self.fs().tables.borrow().len() != st.segs.len() {
@@ -22928,6 +23013,65 @@ impl Reader {
             }
         }
         self.fs().log_seen.set(n);
+        true
+    }
+
+    /// Whether this handle's scan snapshot stands in `st`, a state
+    /// published since the one its log position is of
+    /// (`Options::snapshot_stands`), and the snapshot made `st`'s where it
+    /// does: the live table the one the note names, by identity and by
+    /// `State::lives`, and the frozen tables the ones it names or what the
+    /// landings since left of them. Landings retire the front of the list,
+    /// so the snapshot's bases for the tables they sealed go and its live
+    /// runs stand, as `rebase_tables` leaves them; a snapshot that does
+    /// not hold a base a frozen table of the note is not carried across a
+    /// landing. The log position, the keys created since the snapshot and
+    /// the slots written since its runs were copied are the live table's,
+    /// and stand with it. Offered to `st` for the handles after, since a
+    /// publish starts a state with no snapshot.
+    fn snapshot_stands(&self, st: &State) -> bool {
+        if !self.opts.snapshot_stands {
+            return false;
+        }
+        let kept = {
+            let over = self.fs().over.borrow();
+            let Some(over) = over.as_ref() else {
+                return false;
+            };
+            if over.lives != st.lives
+                || !std::ptr::eq(over.mem.as_ptr(), std::sync::Arc::as_ptr(&st.mem))
+            {
+                return false;
+            }
+            let same = same_tables(&over.frozen, &st.frozen);
+            let landed = st.frozen.len() < over.frozen.len()
+                && same_tables(
+                    &over.frozen[over.frozen.len() - st.frozen.len()..],
+                    &st.frozen,
+                );
+            if !same && !landed {
+                return false;
+            }
+            let mut cache = self.fs().scan_keys.borrow_mut();
+            let Some((g, snap)) = cache.as_mut() else {
+                return false;
+            };
+            // The snapshot is of the state the note is of.
+            if *g != self.fs().log_gen.get() {
+                return false;
+            }
+            if landed {
+                if snap.bases.len() != over.frozen.len() {
+                    return false;
+                }
+                let retired = over.frozen.len() - st.frozen.len();
+                *snap = std::sync::Arc::new(snap.with_bases(snap.bases[retired..].to_vec()));
+            }
+            *g = st.gen;
+            snap.clone()
+        };
+        self.shared.snap_stood.fetch_add(1, AtomicOrdering::Relaxed);
+        self.publish_snapshot(&kept);
         true
     }
 
@@ -24845,6 +24989,17 @@ impl Reader {
                 added > (held / 8).max(4096)
             }
         };
+        // A snapshot of this state holds a base for each frozen table it
+        // has, or none: a landing that retires one trims its base where
+        // the snapshot stands (`snapshot_stands`, `rebase_tables`), and a
+        // base left behind would hold the landed table for the
+        // snapshot's life while every read took the tables as they are.
+        debug_assert!(
+            cache.as_ref().is_none_or(|(g, s)| *g != gen
+                || s.bases.is_empty()
+                || s.bases.len() == self.frozen().len()),
+            "a snapshot's bases are its state's frozen tables"
+        );
         let mut stale = current || switch || cache.as_ref().is_none_or(|(g, _)| *g != gen);
         if !stale {
             let held = cache.as_ref().map_or(0, |(_, s)| s.len());
@@ -29924,6 +30079,8 @@ impl Db {
             retired_forms: RetireList::new(),
             retired_snaps: RetireList::new(),
             snap_builds: AtomicU64::new(0),
+            snap_stood: AtomicU64::new(0),
+            same_blocks_asked: [AtomicU64::new(0), AtomicU64::new(0)],
             frozen_sorts: AtomicU64::new(0),
             unshaped_wake: std::sync::atomic::AtomicBool::new(false),
             lag_wake: std::sync::atomic::AtomicBool::new(false),
@@ -30499,6 +30656,8 @@ impl Db {
             retired_forms: RetireList::new(),
             retired_snaps: RetireList::new(),
             snap_builds: AtomicU64::new(0),
+            snap_stood: AtomicU64::new(0),
+            same_blocks_asked: [AtomicU64::new(0), AtomicU64::new(0)],
             frozen_sorts: AtomicU64::new(0),
             unshaped_wake: std::sync::atomic::AtomicBool::new(false),
             lag_wake: std::sync::atomic::AtomicBool::new(false),
@@ -32759,6 +32918,23 @@ impl Db {
         self.shared.snap_builds.load(AtomicOrdering::Relaxed)
     }
 
+    /// Scan snapshots kept across a publish that left their memtables, by
+    /// a look with no tables to carry (`Options::snapshot_stands`).
+    pub fn snapshots_stood(&self) -> u64 {
+        self.shared.snap_stood.load(AtomicOrdering::Relaxed)
+    }
+
+    /// The landings' questions whether a rewritten partition cuts the same
+    /// blocks, by how each was answered: from the ordered indexes and from
+    /// the records (`Options::same_blocks_from_index`).
+    pub fn same_blocks_asked(&self) -> [u64; 2] {
+        let a = &self.shared.same_blocks_asked;
+        [
+            a[0].load(AtomicOrdering::Relaxed),
+            a[1].load(AtomicOrdering::Relaxed),
+        ]
+    }
+
     /// EXPERIMENT: snapshots carried forward by a merge rather than a
     /// sort of everything; see `Snapshot::extend`.
     pub fn snapshot_extends(&self) -> u64 {
@@ -33182,7 +33358,13 @@ impl Db {
     /// makes it: a partition keeps its predecessor's -- the one at the
     /// same fences -- when it is that partition, or, where `rebase`, one
     /// a merge rewrote over the same blocks; any other takes its own.
-    fn layout_of(cur: &State, segs: &[std::sync::Arc<Seg>], rebase: bool) -> Vec<u64> {
+    fn layout_of(
+        cur: &State,
+        segs: &[std::sync::Arc<Seg>],
+        rebase: bool,
+        from_index: bool,
+        asked: &[AtomicU64; 2],
+    ) -> Vec<u64> {
         let np_cur = cur.segs.partition_point(|s| s.level > 0);
         let parts = &cur.segs[..np_cur];
         segs.iter()
@@ -33191,7 +33373,9 @@ impl Db {
                 let was = parts.iter().position(|q| q.lo == seg.lo && q.hi == seg.hi);
                 match was {
                     Some(q) if std::sync::Arc::ptr_eq(&parts[q], seg) => cur.layout[q],
-                    Some(q) if rebase && Db::same_blocks(&parts[q], seg) => cur.layout[q],
+                    Some(q) if rebase && Db::same_blocks(&parts[q], seg, from_index, asked) => {
+                        cur.layout[q]
+                    }
                     _ => seg.blob.id(),
                 }
             })
@@ -33215,14 +33399,37 @@ impl Db {
     /// last, so each block covers the same range of keys in both. What a
     /// merge that folds updates into a partition leaves, and what lets a
     /// block's copy outlive the partition it was built over.
-    fn same_blocks(a: &Seg, b: &Seg) -> bool {
+    /// Whether `b`, a partition published over `a`'s fences, cuts the same
+    /// blocks: the same key count and the same key at every block's first
+    /// rank and at the last. Read from the two ordered indexes where both
+    /// hold whole keys in their heads (`OrdIndex::whole_key_at`), the
+    /// block's first ranks being the top level's, in memory, and from the
+    /// records otherwise (`Options::same_blocks_from_index`).
+    fn same_blocks(a: &Seg, b: &Seg, from_index: bool, asked: &[AtomicU64; 2]) -> bool {
         let n = a.blob.keys();
         if n != b.blob.keys() || a.level != b.level || a.lo != b.lo || a.hi != b.hi {
             return false;
         }
-        (0..n)
-            .step_by(CACHE_BLOCK)
-            .chain(n.checked_sub(1))
+        let ranks = || (0..n).step_by(CACHE_BLOCK).chain(n.checked_sub(1));
+        if from_index && a.ord.uniform() && b.ord.uniform() {
+            let (mut x, mut y) = (Vec::new(), Vec::new());
+            let mut whole = true;
+            let same = ranks().all(|r| {
+                match (a.ord.whole_key_at(r, &mut x), b.ord.whole_key_at(r, &mut y)) {
+                    (Some(p), Some(q)) => p == q,
+                    _ => {
+                        whole = false;
+                        false
+                    }
+                }
+            });
+            if whole {
+                asked[0].fetch_add(1, AtomicOrdering::Relaxed);
+                return same;
+            }
+        }
+        asked[1].fetch_add(1, AtomicOrdering::Relaxed);
+        ranks()
             .all(|r| matches!((a.raw().key_at(r), b.raw().key_at(r)), (Some(x), Some(y)) if x == y))
     }
 
@@ -41230,7 +41437,13 @@ impl Maint {
             // SAFETY: this handle is pinned for its operation, and a state
             // is freed only past every pinned slot.
             let cur = unsafe { &*cur_p };
-            let layout = Db::layout_of(cur, &segs, !tier && self.opts.forms_rebase);
+            let layout = Db::layout_of(
+                cur,
+                &segs,
+                !tier && self.opts.forms_rebase,
+                self.opts.same_blocks_from_index,
+                &self.shared.same_blocks_asked,
+            );
             let from = Db::replaced_from(&self.opts, &self.shared);
             let mut swapped_live = false;
             let mut retired_table = false;
@@ -46357,6 +46570,26 @@ impl Maint {
         let ord_durable = self.opts.ord_durable;
         let heads = self.opts.merge_keys_by_heads;
         let drop_behind = self.opts.merge_drop_behind;
+        // The inputs a form file serves, by the gate and the cell as they
+        // stand now: a partition whose form is attached or taken out while
+        // the merge runs is read back from the device by whoever reads its
+        // raw records next, which is a cost and never a wrong answer.
+        let drop_covered: Vec<bool> =
+            if self.opts.merge_drops_covered && self.shared.zgate.load() == zselect::GATE_Z {
+                // Pinned, as every look into a cell is.
+                let _op = self.op();
+                inputs
+                    .iter()
+                    .map(|n| {
+                        self.segs()
+                            .iter()
+                            .find(|s| &s.name == n)
+                            .is_some_and(|s| s.level > 0 && s.z.get().is_some())
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
         let drop_chunk = self.opts.merge_drop_chunk;
         let walk_cached = self.opts.merge_walk_cached;
         let verify_inputs = self.opts.merge_verifies_inputs;
@@ -46384,6 +46617,7 @@ impl Maint {
                 heads,
                 counts: Some(held.clone()),
                 drop_behind,
+                drop_covered,
                 drop_chunk,
                 walk_cached,
                 read_ahead,
