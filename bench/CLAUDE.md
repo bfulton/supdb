@@ -557,6 +557,33 @@ read against their lean in the same sitting, one no larger than it is
 unresolved however many pairs agree, and the second sitting lists the arms
 the other way.
 
+**A floor held inside the bound it runs beside.** The page floor holds
+the pages it touched to the row's end, so that a floor that gave them
+back would not hand the next pass a cheaper load (the entries above).
+Under a bound the parent that holds them is inside the group, and every
+sample is 4 MB: taken at a sitting's start and after every rep of every
+rung, it left the roster's parent at 37-45 MB of anonymous memory through
+the ten-million rung, where a pairing's parent holds 9. The arms of a
+rep share the parent, so the row is fair between them; but the bound a
+pass runs under shrinks by 4 MB a rep, and it is 30-40 MB under the bound
+a pairing at the same `--bound` runs under. LMDB at ten million keys under
+1.25 GiB sits at the edge of fitting: paired against itself under the
+bound less 32 MiB, its faults matched the roster's to two figures -- 0.058
+a read against the roster's 0.054-0.060 and 0.034 at the full bound, 0.143
+a scan on three threads against 0.112-0.150 and 0.039 -- and its
+three-thread scan rate fell from 45 to 25-26 million entries a second,
+while the supdb arm faulted in neither harness (`sh scripts/pair.sh
+lmdb-nordahead lmdb-nordahead 10000000 --bound 1308622848 --passes
+load,read,read-threaded,scan,scan-threaded,mixes --ops-div 10 --reps 2`
+against the same at `--bound 1342177280`, at `03fdbe9`). Whether the bound
+covers the harness is a decision for the series and not made here; until
+it is, a cell read against LMDB at that edge says which harness it was
+read in, and the roster's are read as 30-40 MB tighter than their
+`--bound`. The rule: whatever the harness holds runs inside the bound it
+shares a group with, so its memory is read beside the bound before a
+comparator's cells at the edge of fitting are read; and a quantity that
+grows rep by rep in the parent is a drift in every cell that can feel it.
+
 **A workflow that never runs can be syntactically invalid for months.**
 Both self-hosted pickup watchdogs arrived with a block of an older draft
 pasted after their `exit 1`. `scripts/workflows.sh` parses every `run:`

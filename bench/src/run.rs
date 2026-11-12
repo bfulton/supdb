@@ -3633,6 +3633,7 @@ fn threaded(
         if spans {
             sched_before = sched_of_tasks();
         }
+        phase_mark(e.name(), &format!("{pass}-{threads}t"), "start");
         barrier.wait();
         workers
             .into_iter()
@@ -3642,6 +3643,7 @@ fn threaded(
             })
             .collect()
     });
+    phase_mark(e.name(), &format!("{pass}-{threads}t"), "end");
     let sched_after = if spans { sched_of_tasks() } else { Vec::new() };
     let mut timed = Vec::with_capacity(threads);
     let mut bytes = 0u64;
