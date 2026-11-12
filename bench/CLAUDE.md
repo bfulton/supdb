@@ -580,7 +580,14 @@ pass's now: each pass's process joins a group of its own with the limit
 on it before it runs anything, the run's process is in none of them, and
 each pass records what its group held at its start (`bound-start`), so
 the arms' equal memory is a recorded fact and not an assumption
-(`bound::Bound::pass`, `run::audit_note`); the roster runs a second time
+(`bound::Bound::pass`, `run::audit_note`). LMDB against itself in a
+pairing and LMDB in the roster at ten million keys under 1.25 GiB then read
+the same faults to two figures, 0.067 a scan and 0.029 a read on one
+thread and 0.023 a scan on three, in both positions of the pairing and in
+the roster, every pass beginning with a megabyte or so charged to its
+group (`bench ab --arms lmdb-nordahead,lmdb-nordahead --size 10000000
+--bound 1342177280 --ops-div 10 --reps 1` beside `sh scripts/ooc.sh
+1342177280`, at `c9599c2`); the roster runs a second time
 under 1 GiB at ten million keys, where LMDB is clearly out of core, so a
 cell at the edge is read beside one that is not. The first row after it
 is a definition step, banked on its controls. The rule: whatever the
