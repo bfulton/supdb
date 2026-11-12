@@ -1946,6 +1946,98 @@ a snapshot in hand at a commit is one the fill walks its bounds against
 there instead of at the first scan after -- and at these rungs the two
 places cost the same. It is off, and the arm prices it.
 
+#### The snapshot that stands across a landing, and the landing's question of the records
+
+The pass after the lag sweep's full rewrite at ten million keys under
+1.25 GiB read 1.63x, 1.08x and 0.91x of LMDB's by rep in the row at
+`5afde75`, and two things were in its slow reps. Neither was the scans'.
+
+The first was the scan snapshot. The pass runs on the merge path -- the
+writer has given its block forms up on the uniform scans before it
+(`scan_forms_off_unreused`) -- with 388,000 keys unsealed beside the merge
+chain's landings, and the look at the log with no tables to carry dropped
+the snapshot at every publish, a merge's landing included, so the scan
+after each landing sorted every unsealed key again, 50-60 ms a build in a
+pass of 400-800 ms, as many builds as landings fell inside the pass. A
+merge's landing changes the segments and
+leaves the memtables, and the snapshot is a function of the memtables:
+what it keeps against a partition, its bounds, it keeps under the
+partition's blob id. The look that carries the writer's tables
+(`rebase_tables`) kept it already; the look without them keeps it now,
+across a merge's landing whole and across a seal's without the landed
+table's base (`Options::snapshot_stands`, `Reader::snapshot_stands`;
+`supdb-snapdrops` drops it). Where the chain lands inside the pass, as it
+does in every sweep of the shape below (`supdb-mergedropsrecords`), the
+snapshot stands at each landing: twelve times in one pass, one build where
+the shape before built a sort at each, and paired so on the tree before
+the commit the arm that drops built fourteen and fifteen and its scans'
+snapshot phase read 642 and 918 ms against 44 and 63. In the shipped
+shape the chain's last merge lands before the pass in most sweeps:
+counted at `e32e2ec` the stand fired in neither of the default's two, and
+the arm that drops built a second snapshot in one of two
+(`SUPDB_LAG_COUNTERS=1 SUPDB_SCAN_OPS=1 sh bench/scripts/pair.sh supdb
+supdb-snapdrops 10000000 --bound 1342177280 --passes load,lag --ops-div 10
+--reps 2`).
+
+The second was found by a lever built for something else. The form files
+the pass reads stood in the cache beside the raw records of the
+partitions the merge chain had just read back -- 118 MB of them at the
+pass's start in a sweep that took 4,700 major faults, none in one that
+took none -- so a merge was made to drop behind it the records of an input
+its form file serves (`Options::merge_drops_covered`). Paired, the arm
+that dropped ran its burst faster, 14.7-16.1 s against 20.2-20.7, and its
+pass ten times slower, with 124 pieces standing where the arm without the
+drop left 26-31 and 150,000 major faults; one sweep of the shape at
+`e32e2ec` reads the burst 14.2 s against 20.9, the pass 6.0 s against 0.38
+and 59 merges landed against 100 (`SUPDB_LAG_COUNTERS=1 SUPDB_MERGE_TRACE=1
+sh bench/scripts/pair.sh supdb supdb-mergedropsrecords 10000000 --bound
+1342177280 --passes load,lag --ops-div 10 --reps 1`). Its merges were not slower --
+0.39 s a job in both arms -- but 21 started in the burst against 72: of
+each pair started together, the second landed half a second after its job
+had ended, and the next pair started half a second after that. A CPU
+profile of the thread every landing goes through put a third of it in
+`Db::same_blocks`, the landing's question whether a rewritten partition
+cuts the same blocks, so the writer's forms over the old one carry
+(`Options::forms_rebase`): it compared the two partitions' keys every
+sixty-fourth rank through the records, and the old partition's were the
+pages the merge had just dropped -- half a partition read back a page at a
+time, at every landing, while the next merge waited to be planned.
+Without the drop those pages are still warm from the merge, and the
+question cost nothing anyone saw.
+
+The question reads the two ordered indexes now, where their heads are
+whole keys: a block's first rank is the top level's, held in memory, and
+the last key is one head (`Options::same_blocks_from_index`;
+`supdb-sameblocksrecords` asks the records, and keys a head cannot hold
+whole are compared there still). With it the drop's burst landed its
+merges as the arm without the drop did, each within a few milliseconds of
+its job, and the record-reading arm beside it read the pass at 5.8 s with
+130 pieces. What the drop then bought was nothing a pairing could show:
+the pass read 314-665 ms in three reps against 400-428 without it, the
+major faults both ways (`SUPDB_LAG_COUNTERS=1 sh bench/scripts/pair.sh supdb
+supdb-mergedropscovered 10000000 --bound 1342177280 --passes load,lag
+--ops-div 10 --reps 2`), so it is off and `supdb-mergedropscovered` is the
+arm.
+
+Paired in the row's whole order at ten million keys, the stand against
+`supdb-snapdrops` read the full-rewrite pass 1.19x with all four pairs
+one way and 0.98x with three of four the other, the arms' order swapped
+between the sittings and the cells the stand cannot reach leaning 3-7%
+against the default in the second. At three million keys, where the
+writer carries its tables and the sweep claims no handle, so that nothing
+stands, the same cell read 0.83x and 1.13x: it swings that far with
+nothing changed (`sh bench/scripts/pair.sh supdb supdb-snapdrops SIZE
+--bound 1342177280 --passes
+load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled,lag
+--ops-div 10 --reps 4`, `SIZE` 10000000 and 3000000, at `1d935dd`). The
+verdict is the count and the snapshot phase; the rate is unresolved. The
+question from the indexes against `supdb-sameblocksrecords`, on the lag
+sweep in both orders, carried the same forms (72 a sweep in both arms)
+after the same merges, and its pass split two pairs to two in both
+sittings (`sh bench/scripts/pair.sh supdb supdb-sameblocksrecords 10000000
+--bound 1342177280 --passes load,lag --ops-div 10 --reps 4`): it removes
+the reads and changes no answer, which is what it was for.
+
 #### The snapshot built where a block needs it
 
 A scan that finds no snapshot of the state in hand -- dropped at the

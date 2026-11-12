@@ -4693,6 +4693,47 @@ parameter that trades size for speed under a bound is priced on the cells the
 size pays in, which are whichever tenants of the page cache the bound was
 already squeezing, not on the cell the speed was for.
 
+**A structure dropped by a generation that counts what it was not derived
+from.** A handle's scan snapshot is the memtables' unsealed keys, sorted,
+and the look at the log dropped it at every new generation, which a merge's
+landing moves as surely as a freeze does. The writer's own look carried it
+across such a landing with its tables (`rebase_tables`); the look without
+tables -- every reader handle, and the writer on the merge paths, which is
+where it scans once it has given its forms up -- dropped it, and the scan
+after sorted every unsealed key again: 388,000 of them at the pass after the
+lag sweep's full rewrite at ten million keys under 1.25 GiB, 50-60 ms a
+build, fourteen or fifteen builds in a pass where the merge chain landed
+inside it. The snapshot stands across a publish that leaves the memtables
+now (`Options::snapshot_stands`), trimmed of a landed table's base. The
+rule is the one "a count keyed on a generation a landing moves" gave, for
+a cache: a derived structure is invalidated by the identity of what it was
+derived from, and a generation that every publish moves invalidates it at
+publishes that changed nothing it holds.
+
+**A question answered from the pages a step had just let go.** A merge was
+made to drop behind it the raw records of an input partition its form file
+serves, which nothing reads once the form serves it, so the pages it read
+back would not stand as the cache's newest through the landing
+(`Options::merge_drops_covered`). The burst ran faster with it and the pass
+after it ten times slower, 124 pieces standing where 26-31 had: its merges
+took as long, and a third as many started, because of each pair the
+second landed half a second after its job had ended. A CPU profile of the
+thread every landing goes through named `Db::same_blocks`, the landing's
+question whether a rewritten partition cuts the same blocks, which read the
+old partition's key every sixty-fourth rank through its records -- the
+pages the merge had just dropped, read back a page at a time while the next
+merge waited to be planned. Without the drop the merge had left them warm,
+and nobody had priced the question at all. It reads the ordered indexes
+now, whose top level holds a block's first key in memory
+(`Options::same_blocks_from_index`), and the drop, repriced with the
+question answered there, bought nothing and is off. The rules: a step that
+gives pages back is priced at every later reader of those pages, on every
+thread, and the thread that serialises the landings is one of them; a
+question one structure answers from memory is asked of it before one that
+has to be paged in; and a phase that runs faster under a lever is read for
+the work it pushed out of itself, since a burst whose merges did not start
+is a burst with less beside it.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve
