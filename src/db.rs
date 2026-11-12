@@ -567,7 +567,8 @@ pub struct ZCounts {
     /// The block path's cursor walks: the page views they built
     /// (`Options::zpages_cursor_view` holds one across a page's groups)
     /// and the groups whose lines they asked for ahead
-    /// (`Options::zpages_group_ahead`).
+    /// (`Options::zpages_group_ahead`), with the bulk walk's asks
+    /// (`Options::zpages_bulk_ahead`).
     pub scan_views: u64,
     pub group_aheads: u64,
     /// Form files built, their pages, bytes, the pages that hold their
@@ -1523,6 +1524,39 @@ pub struct Options {
     /// slots over under the scans that start where others did.
     /// `supdb-zscanputs` puts every decode of a walk in the memo.
     pub zpages_scan_admit: bool,
+    /// The bulk walk through a form file (`zfile::ZFile::scan_at`, what a
+    /// scan of a partition with no unsealed key over it takes) gives a
+    /// group's first touch the rule a cursor's has (`zpages_scan_admit`):
+    /// decoded into the thread's own buffer and put nowhere, the memo
+    /// taking a group at its second touch while the first's tag stands.
+    /// The walk put every decode in the memo: a buffer of the memo's
+    /// written thousands of decodes before, the group's `Arc` allocated
+    /// and the displaced group's freed, for groups a scan over a store
+    /// larger than the memo reads once, and the decoder's hottest
+    /// instructions in a profile of the threaded scans at ten million keys
+    /// under 1.25 GiB were its stores into that buffer.
+    /// `supdb-zbulkmemo` memoises every decode, the shape before.
+    pub zpages_bulk_admit: bool,
+    /// The bulk walk asks for the head of the next entry's page at the
+    /// last group of a page it walks on past (`zfile::ZFile::ask_next_group`),
+    /// the cursor's ask (`zpages_group_ahead`) on the path the cursor's was
+    /// never given: the core's prefetcher streams a page's bytes and stops
+    /// at its end. `supdb-zbulknoahead` asks for nothing, the shape before.
+    pub zpages_bulk_ahead: bool,
+    /// The bulk walk's ask made for the next group of the same page too,
+    /// at every open it walks on past. Paired at ten million keys under
+    /// 1.25 GiB it read the threaded scans 1.04-1.06x and the
+    /// single-threaded scan 0.94-0.97x in two sittings, the next group's
+    /// bytes following the one being walked, which the core's prefetcher
+    /// already fetches. `supdb-zbulkaheadwithin` is the arm.
+    pub zpages_bulk_ahead_within: bool,
+    /// The bulk walk's own decode of the group it ends inside -- a first
+    /// touch, decoded into the thread's buffer (`zpages_bulk_admit`) --
+    /// goes only as far as the records it reads, and on a step at a time
+    /// where the guess fell short (`zfile::ZFile::walk_last_part`), as a
+    /// cursor's last group does (`zpages_walk_part`). `supdb-zbulkwhole`
+    /// decodes it whole, the shape before.
+    pub zpages_bulk_part: bool,
     /// EXPERIMENT: a walk's own decode of a group through a form file -- a
     /// first touch under `zpages_scan_admit`, any under
     /// `zpages_walk_owns_decodes` -- goes only as far as the walk reads.
@@ -5104,6 +5138,10 @@ impl Default for Options {
             zpages_point_part: true,
             zpages_point_keys: true,
             zpages_scan_admit: true,
+            zpages_bulk_admit: true,
+            zpages_bulk_ahead: true,
+            zpages_bulk_part: true,
+            zpages_bulk_ahead_within: false,
             zpages_walk_part: true,
             zpages_cursor_view: true,
             zpages_group_ahead: true,
@@ -21710,6 +21748,7 @@ impl Reader {
         self.zbump_by(|s| &s.zinplace, r.inplace);
         self.zbump_by(|s| &s.znopagescans, r.nopage);
         self.zbump_by(|s| &s.zprefetches, r.prefetches);
+        self.zbump_by(|s| &s.zaheads, r.aheads);
         match r.end {
             zfile::ScanEnd::Served => {
                 self.zbump(|s| &s.zscanz);
@@ -30212,7 +30251,13 @@ impl Db {
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(opts.zpages_memo_bytes)
                 .point(opts.zpages_point_part, opts.zpages_point_keys)
-                .scans(opts.zpages_scan_admit, opts.zpages_walk_part),
+                .scans(opts.zpages_scan_admit, opts.zpages_walk_part)
+                .bulk(
+                    opts.zpages_bulk_admit,
+                    opts.zpages_bulk_ahead,
+                    opts.zpages_bulk_part,
+                )
+                .bulk_within(opts.zpages_bulk_ahead_within),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
             zwin_counting: std::cell::Cell::new(false),
@@ -30789,7 +30834,13 @@ impl Db {
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(opts.zpages_memo_bytes)
                 .point(opts.zpages_point_part, opts.zpages_point_keys)
-                .scans(opts.zpages_scan_admit, opts.zpages_walk_part),
+                .scans(opts.zpages_scan_admit, opts.zpages_walk_part)
+                .bulk(
+                    opts.zpages_bulk_admit,
+                    opts.zpages_bulk_ahead,
+                    opts.zpages_bulk_part,
+                )
+                .bulk_within(opts.zpages_bulk_ahead_within),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
             zwin_counting: std::cell::Cell::new(false),
@@ -33242,7 +33293,13 @@ impl Reader {
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
                 .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
-                .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part),
+                .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part)
+                .bulk(
+                    self.opts.zpages_bulk_admit,
+                    self.opts.zpages_bulk_ahead,
+                    self.opts.zpages_bulk_part,
+                )
+                .bulk_within(self.opts.zpages_bulk_ahead_within),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
             zwin_counting: std::cell::Cell::new(false),
@@ -33281,7 +33338,13 @@ impl Reader {
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
                 .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
-                .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part),
+                .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part)
+                .bulk(
+                    self.opts.zpages_bulk_admit,
+                    self.opts.zpages_bulk_ahead,
+                    self.opts.zpages_bulk_part,
+                )
+                .bulk_within(self.opts.zpages_bulk_ahead_within),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
             zwin_counting: std::cell::Cell::new(false),
@@ -33327,7 +33390,13 @@ impl Reader {
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
                 .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
-                .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part),
+                .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part)
+                .bulk(
+                    self.opts.zpages_bulk_admit,
+                    self.opts.zpages_bulk_ahead,
+                    self.opts.zpages_bulk_part,
+                )
+                .bulk_within(self.opts.zpages_bulk_ahead_within),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
             zwin_counting: std::cell::Cell::new(false),
@@ -36132,7 +36201,13 @@ impl Reader {
             ord_declined: std::cell::Cell::new(0),
             zmemo: zfile::ZMemo::sized(self.opts.zpages_memo_bytes)
                 .point(self.opts.zpages_point_part, self.opts.zpages_point_keys)
-                .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part),
+                .scans(self.opts.zpages_scan_admit, self.opts.zpages_walk_part)
+                .bulk(
+                    self.opts.zpages_bulk_admit,
+                    self.opts.zpages_bulk_ahead,
+                    self.opts.zpages_bulk_part,
+                )
+                .bulk_within(self.opts.zpages_bulk_ahead_within),
             zwin: std::cell::Cell::new(ZWindow::closed()),
             zwin_open: std::cell::Cell::new(false),
             zwin_counting: std::cell::Cell::new(false),

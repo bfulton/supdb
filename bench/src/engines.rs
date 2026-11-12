@@ -701,6 +701,19 @@ pub struct Supdb {
     /// only as far as the walk reads (`Options::zpages_walk_part` off):
     /// `supdb-zwalkwhole`.
     zwalkwhole: bool,
+    /// The bulk walk through a form file puts every decode in the memo,
+    /// no first touch decoded into the thread's own buffer
+    /// (`Options::zpages_bulk_admit` off): `supdb-zbulkmemo`.
+    zbulkmemo: bool,
+    /// The bulk walk asks for no group's lines ahead of its open
+    /// (`Options::zpages_bulk_ahead` off): `supdb-zbulknoahead`.
+    zbulknoahead: bool,
+    /// The bulk walk decodes the group it ends inside whole
+    /// (`Options::zpages_bulk_part` off): `supdb-zbulkwhole`.
+    zbulkwhole: bool,
+    /// The bulk walk asks for the next group of a page as well as the next
+    /// page's head (`Options::zpages_bulk_ahead_within`): `supdb-zbulkaheadwithin`.
+    zbulkaheadwithin: bool,
     /// The scans started in a block before its scans hold the blocks they
     /// walk as copies under the form (`Options::promote_starts`), `None`
     /// for the engine's: `supdb-zhotstarts2`, `supdb-zhotstarts3`,
@@ -1765,6 +1778,19 @@ struct Policy {
     /// only as far as the walk reads (`Options::zpages_walk_part` off):
     /// `supdb-zwalkwhole`.
     zwalkwhole: bool,
+    /// The bulk walk through a form file puts every decode in the memo,
+    /// no first touch decoded into the thread's own buffer
+    /// (`Options::zpages_bulk_admit` off): `supdb-zbulkmemo`.
+    zbulkmemo: bool,
+    /// The bulk walk asks for no group's lines ahead of its open
+    /// (`Options::zpages_bulk_ahead` off): `supdb-zbulknoahead`.
+    zbulknoahead: bool,
+    /// The bulk walk decodes the group it ends inside whole
+    /// (`Options::zpages_bulk_part` off): `supdb-zbulkwhole`.
+    zbulkwhole: bool,
+    /// The bulk walk asks for the next group of a page as well as the next
+    /// page's head (`Options::zpages_bulk_ahead_within`): `supdb-zbulkaheadwithin`.
+    zbulkaheadwithin: bool,
     /// The scans started in a block before its scans hold the blocks they
     /// walk as copies under the form (`Options::promote_starts`), `None`
     /// for the engine's: `supdb-zhotstarts2`, `supdb-zhotstarts3`,
@@ -2475,6 +2501,10 @@ impl Default for Policy {
             znopointkeys: false,
             zscanputs: false,
             zwalkwhole: false,
+            zbulkmemo: false,
+            zbulknoahead: false,
+            zbulkwhole: false,
+            zbulkaheadwithin: false,
             zhotstarts: None,
             nochainwrites: false,
             noland: false,
@@ -7771,6 +7801,10 @@ impl Supdb {
             znopointkeys,
             zscanputs,
             zwalkwhole,
+            zbulkmemo,
+            zbulknoahead,
+            zbulkwhole,
+            zbulkaheadwithin,
             zhotstarts,
             nochainwrites,
             noland,
@@ -8199,6 +8233,10 @@ impl Supdb {
             zpages_point_keys: !znopointkeys,
             zpages_scan_admit: !zscanputs,
             zpages_walk_part: !zwalkwhole,
+            zpages_bulk_admit: !zbulkmemo,
+            zpages_bulk_ahead: !zbulknoahead,
+            zpages_bulk_part: !zbulkwhole,
+            zpages_bulk_ahead_within: zbulkaheadwithin,
             promote_starts: zhotstarts.unwrap_or(supdb::Options::default().promote_starts),
             merge_chains_writes: !nochainwrites,
             zpages_land_scans_far: !landnearscans,
@@ -8553,6 +8591,10 @@ impl Supdb {
             znopointkeys,
             zscanputs,
             zwalkwhole,
+            zbulkmemo,
+            zbulknoahead,
+            zbulkwhole,
+            zbulkaheadwithin,
             zhotstarts,
             nochainwrites,
             noland,
@@ -9561,6 +9603,18 @@ impl Engine for Supdb {
         }
         if self.zwalkwhole {
             return "supdb-zwalkwhole";
+        }
+        if self.zbulkmemo {
+            return "supdb-zbulkmemo";
+        }
+        if self.zbulknoahead {
+            return "supdb-zbulknoahead";
+        }
+        if self.zbulkwhole {
+            return "supdb-zbulkwhole";
+        }
+        if self.zbulkaheadwithin {
+            return "supdb-zbulkaheadwithin";
         }
         if let Some(n) = self.zhotstarts {
             return match n {
@@ -11272,6 +11326,10 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zpromote"
         | "supdb-zpromotestarts"
         | "supdb-zwalkwhole"
+        | "supdb-zbulkmemo"
+        | "supdb-zbulknoahead"
+        | "supdb-zbulkwhole"
+        | "supdb-zbulkaheadwithin"
         | "supdb-zhotstarts2"
         | "supdb-zhotstarts3"
         | "supdb-nohotstarts"
@@ -12209,6 +12267,54 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     d,
                     Policy {
                         zwalkwhole: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-zbulkmemo" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        zbulkmemo: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-zbulknoahead" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        zbulknoahead: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-zbulkwhole" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        zbulkwhole: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-zbulkaheadwithin" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        zbulkaheadwithin: true,
                         ..Policy::default()
                     },
                 )
@@ -14104,6 +14210,66 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.same_blocks_from_index && b.same_blocks_from_index);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("zbulkmemo"),
+                    Policy {
+                        zbulkmemo: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-zbulkmemo");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.zpages_bulk_admit && b.zpages_bulk_admit);
+                assert!(o.zpages_bulk_ahead);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("zbulknoahead"),
+                    Policy {
+                        zbulknoahead: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-zbulknoahead");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.zpages_bulk_ahead && b.zpages_bulk_ahead);
+                assert!(o.zpages_bulk_admit);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("zbulkwhole"),
+                    Policy {
+                        zbulkwhole: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-zbulkwhole");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.zpages_bulk_part && b.zpages_bulk_part);
+                assert!(o.zpages_bulk_admit && o.zpages_bulk_ahead);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("zbulkaheadwithin"),
+                    Policy {
+                        zbulkaheadwithin: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-zbulkaheadwithin");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_bulk_ahead_within && !b.zpages_bulk_ahead_within);
+                assert!(o.zpages_bulk_ahead);
             }
             {
                 let z = Supdb::create_settleroomstill(&dir("settleroomstill")).unwrap();

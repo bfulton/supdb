@@ -578,7 +578,16 @@ no first touch of a group decoded into the cursor's own buffer
 (`Options::zpages_scan_admit` off), and `supdb-zmemoplain` with all three
 off, the memo as it stood; `supdb-zwalkwhole` is `supdb` with every group
 a walk opens through a form file decoded whole, none only as far as the
-walk reads (`Options::zpages_walk_part` off); `supdb-zpromote` is `supdb`
+walk reads (`Options::zpages_walk_part` off); `supdb-zbulkmemo` is
+`supdb` with every decode of the bulk walk through a form file
+(`ZFile::scan_at`) put in the memo, no first touch decoded into the
+thread's own buffer (`Options::zpages_bulk_admit` off), and
+`supdb-zbulknoahead` with the bulk walk asking for no group's lines ahead
+of its open (`Options::zpages_bulk_ahead` off), and `supdb-zbulkwhole`
+with its own decode of the group it ends inside made whole
+(`Options::zpages_bulk_part` off), and `supdb-zbulkaheadwithin` with its
+ask made for the next group of a page as well as the next page's head
+(`Options::zpages_bulk_ahead_within`); `supdb-zpromote` is `supdb`
 with a block that scans have walked a block's worth of entries held as a
 merged copy in its slot under the form file (`Options::promote_entries` at
 sixty-four with `zpages_promote_copies`), and `supdb-zpromotestarts` the

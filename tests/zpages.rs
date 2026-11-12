@@ -13260,6 +13260,207 @@ fn a_scans_first_touch_of_a_group_is_its_own_decode_and_its_second_the_memos() {
     }
 }
 
+/// The bulk walk through a form file (`ZFile::scan_at`, a handle's scan of
+/// a partition no unsealed key overlays) decodes its first touch of a group
+/// into the thread's own buffer and puts it nowhere, the handle's memo
+/// taking the group at its second touch (`Options::zpages_bulk_admit`), and
+/// asks for the next page's head at a page's last group it walks on past
+/// (`Options::zpages_bulk_ahead`), and for every next group under
+/// `Options::zpages_bulk_ahead_within`: one scan made three times decodes
+/// its groups past the start's as its own and asks ahead at each page it
+/// leaves, or at each group, then into the memo at their admission, then
+/// not at all. Without the options every decode is the memo's, the second
+/// scan decodes nothing, and nothing is asked ahead. The cursor's admission
+/// and asks are off in all three, so every count here is the bulk walk's,
+/// and the entries come back as the model has them every time.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_bulk_walks_first_touch_of_a_group_is_its_own_decode_and_it_asks_for_the_next() {
+    for (on, within) in [(true, false), (true, true), (false, false)] {
+        let what = format!("bulk {on} within {within}");
+        let (dir, db, model, _inject, r, keys, _at) =
+            compact_store_with(&format!("bulk-admit-{on}-{within}"), 1 << 20, |o| {
+                o.zpages_bulk_admit = on;
+                o.zpages_bulk_ahead = on;
+                o.zpages_bulk_ahead_within = within;
+                o.zpages_scan_admit = false;
+                o.zpages_group_ahead = false;
+                o.commit_forms = false;
+            });
+        // A handle of its own, whose memo and tags no read before has
+        // touched.
+        drop(r);
+        let r = db.reader().unwrap();
+        let want = 4 * 64 + 10;
+        let start = keys.len() / 2;
+        assert!(
+            start + want < keys.len(),
+            "{what}: keys enough: {}",
+            keys.len()
+        );
+        let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
+            .iter()
+            .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
+            .collect();
+        // One scan through the handle: the bulk walks it made, the groups
+        // decoded, the walk's own among them, the memo's admissions and
+        // hits, and the next groups' lines asked for.
+        let pass = |nth: usize| {
+            let before = db.zpage_counts();
+            let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let n = r
+                .scan(
+                    &keys[start],
+                    want,
+                    kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))),
+                )
+                .unwrap();
+            let c = db.zpage_counts();
+            assert_eq!(n, want, "{what}, scan {nth}: the scan's entries");
+            assert_eq!(
+                got, expect,
+                "{what}, scan {nth}: the entries as the model has them"
+            );
+            assert!(
+                c.scans > before.scans,
+                "{what}, scan {nth}: the bulk walk served it: {c:?}"
+            );
+            (
+                c.scan_groups - before.scan_groups,
+                c.walk_owned - before.walk_owned,
+                c.point_admits - before.point_admits,
+                c.memo_hits - before.memo_hits,
+                c.group_aheads - before.group_aheads,
+            )
+        };
+        let (first, second, third) = (pass(1), pass(2), pass(3));
+        assert!(first.0 >= 3, "{what}: groups decoded: {first:?}");
+        if on {
+            // The start's group is the seek's, through the memo, as is the
+            // first group of each partition the scan crosses into; the
+            // walk's others are its own, the second scan finds their tags
+            // and the memo takes each, and the third decodes nothing. Every
+            // open but the last asks for the group after it under `within`,
+            // and only a page's last group otherwise.
+            assert!(
+                first.1 >= 1 && first.1 + 3 >= first.0 && first.2 == 0,
+                "{what}: the first scan's groups the walk's own: {first:?}"
+            );
+            assert!(
+                second.1 == 0 && second.2 == first.1 && second.0 == first.1,
+                "{what}: the second scan's groups the memo's, each admitted: {first:?} then {second:?}"
+            );
+            if within {
+                assert!(
+                    first.4 + 3 >= first.0,
+                    "{what}: the next group asked for at each open: {first:?}"
+                );
+            } else {
+                // A page holds several groups, so the asks come at most
+                // one in two of the groups decoded.
+                assert!(
+                    first.4 >= 1 && first.4 * 2 <= first.0,
+                    "{what}: the next page's head asked for at each page left: {first:?}"
+                );
+            }
+        } else {
+            assert_eq!(
+                (first.1, first.2, first.4),
+                (0, 0, 0),
+                "{what}: every decode the memo's, nothing asked ahead: {first:?}"
+            );
+            assert_eq!(second.0, 0, "{what}: nothing decoded twice: {second:?}");
+        }
+        assert!(
+            third.0 == 0 && third.1 == 0 && third.3 >= first.0,
+            "{what}: the third scan read out of the memo: {third:?} after {first:?}"
+        );
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The bulk walk's own decode of the group it ends inside goes only as far
+/// as the walk reads (`Options::zpages_bulk_part`): a handle's scans of many
+/// lengths from starts spread over a drained store come back as the model
+/// has them with the option and without; with it the groups begun in part
+/// are counted among the walks' own and their bytes come short of the
+/// groups', and without it none is. The cursor's own partial decode and
+/// admission are off in both, so every count here is the bulk walk's.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_bulk_walks_last_group_is_decoded_only_as_far_as_the_scan_reads() {
+    for on in [true, false] {
+        let what = format!("bulk part {on}");
+        let (dir, db, model, _inject, r, keys, _at) =
+            compact_store_with(&format!("bulk-part-{on}"), 1 << 20, |o| {
+                o.zpages_bulk_part = on;
+                o.zpages_walk_part = false;
+                o.zpages_scan_admit = false;
+                o.commit_forms = false;
+            });
+        drop(r);
+        let r = db.reader().unwrap();
+        let lens = [1usize, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233];
+        let scans = 60usize;
+        assert!(keys.len() > 1000, "{what}: keys enough: {}", keys.len());
+        let before = db.zpage_counts();
+        for i in 0..scans {
+            let want = lens[i % lens.len()];
+            let start = 64 + i * (keys.len() - 400) / scans;
+            let expect: Vec<(Vec<u8>, Vec<u8>)> = keys[start..start + want]
+                .iter()
+                .flat_map(|k| model[k].iter().map(move |v| (k.clone(), v.clone())))
+                .collect();
+            let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let n = r
+                .scan(
+                    &keys[start],
+                    want,
+                    kv(&mut |k, v| got.push((k.to_vec(), v.to_vec()))),
+                )
+                .unwrap();
+            assert_eq!(n, want, "{what}, scan {i}: the scan's entries");
+            assert_eq!(
+                got, expect,
+                "{what}, scan {i}: the entries as the model has them"
+            );
+        }
+        let c = db.zpage_counts();
+        let (parts, bytes, of, owned, walks) = (
+            c.walk_parts - before.walk_parts,
+            c.walk_part_bytes - before.walk_part_bytes,
+            c.walk_part_of - before.walk_part_of,
+            c.walk_owned - before.walk_owned,
+            c.scans - before.scans,
+        );
+        assert!(
+            walks >= scans as u64,
+            "{what}: the bulk walk served them: {c:?}"
+        );
+        if on {
+            // A scan begins one group in part at most, its last, and only
+            // where that group is a first touch the scan does not read to
+            // its end.
+            assert!(
+                parts as usize >= scans / 6 && parts as usize <= scans && parts <= owned,
+                "{what}: groups begun in part: {parts} of {owned} the walks' own, over {scans} scans"
+            );
+            assert!(
+                bytes * 100 < of * 85,
+                "{what}: {bytes} of {of} bytes decoded of the groups begun in part"
+            );
+        } else {
+            assert_eq!((parts, bytes, of), (0, 0, 0), "{what}");
+            assert!(owned > 0, "{what}: the walks' own decodes, each whole");
+        }
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// A walk's own decode of a group it does not read to the end goes only as
 /// far as the walk reads (`Options::zpages_walk_part`): scans of many
 /// lengths from starts spread over the store come back as the model has
