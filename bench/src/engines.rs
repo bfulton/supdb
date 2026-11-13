@@ -1112,6 +1112,9 @@ pub struct Supdb {
     /// The hot-raw room's growth share at five percent of the budget
     /// (`Options::zpages_hot_growth_pct` 5): `supdb-zhotgrowth5`.
     zhotgrowth5: bool,
+    /// The fill's quiet looks take the growth share too
+    /// (`Options::zpages_hot_fill_quiet`): `supdb-zhotfillquiet`.
+    zhotfillquiet: bool,
     /// A covered scan's start placed once, the seek's cursor kept as the
     /// partition's reader's (`Options::zpages_seek_seeds` on):
     /// `supdb-zseekseed`.
@@ -2225,6 +2228,9 @@ struct Policy {
     zhotaskidle: bool,
     /// The growth share at five percent: `supdb-zhotgrowth5`.
     zhotgrowth5: bool,
+    /// The fill's quiet looks with the growth share in their room:
+    /// `supdb-zhotfillquiet`.
+    zhotfillquiet: bool,
     /// The start placed once: `supdb-zseekseed`.
     zseekseed: bool,
     /// The cold way back: `supdb-zhotcoldback`.
@@ -2646,6 +2652,7 @@ impl Default for Policy {
             zhotline: false,
             zhotaskidle: false,
             zhotgrowth5: false,
+            zhotfillquiet: false,
             zseekseed: false,
             zhotcoldback: false,
             sweepwalks: false,
@@ -8059,6 +8066,7 @@ impl Supdb {
             zhotline,
             zhotaskidle,
             zhotgrowth5,
+            zhotfillquiet,
             zseekseed,
             zhotcoldback,
             sweepwalks,
@@ -8600,6 +8608,7 @@ impl Supdb {
             zpages_hot_raw_slack: !zhotline,
             zpages_hot_ask_idle: zhotaskidle,
             zpages_hot_growth_pct: if zhotgrowth5 { 5 } else { 10 },
+            zpages_hot_fill_quiet: zhotfillquiet,
             zpages_seek_seeds: zseekseed,
             zpages_hot_cold_back: zhotcoldback,
             sweep_remembers_pin: !sweepwalks,
@@ -8877,6 +8886,7 @@ impl Supdb {
             zhotline,
             zhotaskidle,
             zhotgrowth5,
+            zhotfillquiet,
             zseekseed,
             zhotcoldback,
             sweepwalks,
@@ -9259,6 +9269,9 @@ impl Engine for Supdb {
         }
         if self.zhotgrowth5 {
             return "supdb-zhotgrowth5";
+        }
+        if self.zhotfillquiet {
+            return "supdb-zhotfillquiet";
         }
         if self.zseekseed {
             return "supdb-zseekseed";
@@ -11636,6 +11649,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-memo64"
         | "supdb-zhotaskidle"
         | "supdb-zhotgrowth5"
+        | "supdb-zhotfillquiet"
         | "supdb-zseekseed"
         | "supdb-zhotcoldback"
         | "supdb-sweepwalks"
@@ -12075,6 +12089,18 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-memo64" => supdb_arm(Supdb::create_memo64, dir)?,
         "supdb-zhotaskidle" => supdb_arm(Supdb::create_zhotaskidle, dir)?,
         "supdb-zhotgrowth5" => supdb_arm(Supdb::create_zhotgrowth5, dir)?,
+        "supdb-zhotfillquiet" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        zhotfillquiet: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
         "supdb-zseekseed" => supdb_arm(Supdb::create_zseekseed, dir)?,
         "supdb-zhotcoldback" => supdb_arm(Supdb::create_zhotcoldback, dir)?,
         "supdb-sweepwalks" => supdb_arm(Supdb::create_sweepwalks, dir)?,
@@ -14383,6 +14409,20 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert_eq!((o.zpages_hot_growth_pct, b.zpages_hot_growth_pct), (5, 10));
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("zhotfillquiet"),
+                    Policy {
+                        zhotfillquiet: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-zhotfillquiet");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_hot_fill_quiet && !b.zpages_hot_fill_quiet);
             }
             {
                 let z = Supdb::create_zseekseed(&dir("zseekseed")).unwrap();

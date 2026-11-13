@@ -5148,6 +5148,20 @@ pub struct Options {
     /// `supdb-znohotfill` is the shape before it.
     #[doc(hidden)]
     pub zpages_hot_fill: bool,
+    /// EXPERIMENT: under the fill (`zpages_hot_fill`), a quiet look --
+    /// nothing committed since the last and no merge in flight -- fills
+    /// the room with the growth share in it (`zpages_hot_growth_pct`), the
+    /// share kept for a write mix's growth and so idle while nothing
+    /// writes. A census at the threaded scan pass at ten million keys
+    /// under 1.25 GiB read 917 MB of page cache and 139 MB of process
+    /// memory under the limit's 1,342, the fill stopped a partition short
+    /// of the room past the share and the reserve: seven partitions raw of
+    /// twenty-nine, the threaded scans a quarter raw and the rest decoded.
+    /// When writes come the room is measured past the share again and a
+    /// look short of half of it sends the raw partition read least back.
+    /// `supdb-zhotfillquiet` turns it on.
+    #[doc(hidden)]
+    pub zpages_hot_fill_quiet: bool,
     /// The hot-raw policy's way back -- a raw partition's form file attached
     /// again, at the fill, a swap or the cold way back -- in the release's
     /// two steps: the form file's pages asked of the kernel at one look
@@ -5576,6 +5590,7 @@ impl Default for Options {
             zpages_hot_raw_slack: true,
             zpages_hot_ask_idle: false,
             zpages_hot_growth_pct: 10,
+            zpages_hot_fill_quiet: false,
             zpages_seek_seeds: false,
             sweep_remembers_pin: true,
             copy_prefetch_whole: false,
@@ -43998,6 +44013,16 @@ impl Maint {
             };
             let wrote = self.z_hot_fill_writes.replace(writes) != Some(writes);
             let quiet = !wrote && self.compacting.is_empty() && self.tiering.is_none();
+            // A quiet look's room with the growth share in it
+            // (`Options::zpages_hot_fill_quiet`): the share is kept for a
+            // write mix's growth, and a stretch with no writes has none to
+            // keep it for; the first look after writes come measures the
+            // room past it again and gives back what the writes take.
+            let room = if quiet && self.opts.zpages_hot_fill_quiet {
+                slack.unwrap_or(room)
+            } else {
+                room
+            };
             // The asks in flight: each released once its pages are in, or
             // its wait has run out with half of them in and the room still
             // there; the rest of the bytes still to come counted against
