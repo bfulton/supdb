@@ -2,33 +2,42 @@
 <rect width="760" height="420" fill="white"/>
 <text x="72" y="28" font-size="15" font-weight="600">Ordered scans at 10⁷ keys</text>
 <text x="72" y="47" font-size="12">Ordered scans, majfaults_per_op_2t, durable per batch, to 10⁷ keys</text>
-<text x="72" y="64" font-size="11" fill="#6b6b6b">x86_64/intel-r-xeon-r-processor-2.30ghz/4c/16g/hypervisor/b1024m · 78f6909 · 2026-11-12 · median with 95% CI over 3 reps</text>
+<text x="72" y="64" font-size="11" fill="#6b6b6b">x86_64/intel-r-xeon-r-processor-2.10ghz/4c/16g/hypervisor/b1280m · ac5cb81 · 2026-11-13 · median with 95% CI over 3 reps</text>
 <line x1="72" y1="372" x2="610" y2="372" stroke="#c8c8c8" stroke-width="1"/>
 <line x1="72" y1="88" x2="72" y2="372" stroke="#c8c8c8" stroke-width="1"/>
-<line x1="341.0" y1="372" x2="341.0" y2="378" stroke="#c8c8c8" stroke-width="1"/>
-<text x="341.0" y="392" font-size="11" text-anchor="middle" fill="#6b6b6b">10⁷</text>
+<line x1="135.0" y1="372" x2="135.0" y2="375" stroke="#c8c8c8" stroke-width="1"/>
+<line x1="547.0" y1="372" x2="547.0" y2="378" stroke="#c8c8c8" stroke-width="1"/>
+<text x="547.0" y="392" font-size="11" text-anchor="middle" fill="#6b6b6b">10⁷</text>
 <text x="610" y="408" font-size="11" text-anchor="end" fill="#6b6b6b">keys</text>
 <line x1="67" y1="372.0" x2="72" y2="372.0" stroke="#c8c8c8" stroke-width="1"/>
 <text x="63" y="376.0" font-size="11" text-anchor="end" fill="#6b6b6b">0</text>
 <line x1="67" y1="277.3" x2="72" y2="277.3" stroke="#c8c8c8" stroke-width="1"/>
-<text x="63" y="281.3" font-size="11" text-anchor="end" fill="#6b6b6b">0.5</text>
+<text x="63" y="281.3" font-size="11" text-anchor="end" fill="#6b6b6b">0.2</text>
 <line x1="67" y1="182.7" x2="72" y2="182.7" stroke="#c8c8c8" stroke-width="1"/>
-<text x="63" y="186.7" font-size="11" text-anchor="end" fill="#6b6b6b">1</text>
+<text x="63" y="186.7" font-size="11" text-anchor="end" fill="#6b6b6b">0.4</text>
 <line x1="67" y1="88.0" x2="72" y2="88.0" stroke="#c8c8c8" stroke-width="1"/>
-<text x="63" y="92.0" font-size="11" text-anchor="end" fill="#6b6b6b">1.5</text>
+<text x="63" y="92.0" font-size="11" text-anchor="end" fill="#6b6b6b">0.6</text>
 <text x="10" y="80" font-size="11" text-anchor="start" fill="#6b6b6b">faults/op</text>
-<path d="M341.0,372.0 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="1,3"/>
-<path d="M341.0,207.7 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="4,2"/>
-<path d="M341.0,372.0 " fill="none" stroke="#8c8c8c" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="2,3"/>
-<path d="M341.0,372.0 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7,4"/>
-<path d="M341.0,372.0 " fill="none" stroke="#2b6cb0" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7,4"/>
-<path d="M341.0,372.0 " fill="none" stroke="#2b6cb0" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-<path d="M341.0,126.2 " fill="none" stroke="#8c8c8c" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="2,3"/>
-<path d="M341.0,372.0 " fill="none" stroke="#1b1b1b" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-<line x1="612.0" y1="126.2" x2="616.0" y2="61.2" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="65.2" font-size="11" fill="#8c8c8c">?</text>
-<line x1="612.0" y1="207.7" x2="616.0" y2="142.7" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="146.7" font-size="11" fill="#8c8c8c">LMDB (no readahead)</text>
+<path d="M135.0,372.0 L547.0,372.0 L547.0,372.0 L135.0,372.0 Z" fill="#8c8c8c" fill-opacity="0.10"/>
+<path d="M135.0,372.0 L547.0,346.4 L547.0,346.4 L135.0,372.0 Z" fill="#8c8c8c" fill-opacity="0.10"/>
+<path d="M135.0,372.0 L547.0,372.0 L547.0,372.0 L135.0,372.0 Z" fill="#8c8c8c" fill-opacity="0.10"/>
+<path d="M135.0,372.0 L547.0,372.0 L547.0,372.0 L135.0,372.0 Z" fill="#8c8c8c" fill-opacity="0.10"/>
+<path d="M135.0,372.0 L547.0,372.0 L547.0,372.0 L135.0,372.0 Z" fill="#2b6cb0" fill-opacity="0.10"/>
+<path d="M135.0,372.0 L547.0,372.0 L547.0,372.0 L135.0,372.0 Z" fill="#2b6cb0" fill-opacity="0.10"/>
+<path d="M135.0,372.0 L547.0,166.6 L547.0,200.5 L135.0,372.0 Z" fill="#8c8c8c" fill-opacity="0.10"/>
+<path d="M135.0,372.0 L547.0,372.0 L547.0,372.0 L135.0,372.0 Z" fill="#1b1b1b" fill-opacity="0.10"/>
+<path d="M135.0,372.0 L547.0,372.0 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="1,3"/>
+<path d="M135.0,372.0 L547.0,346.4 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="4,2"/>
+<path d="M135.0,372.0 L547.0,372.0 " fill="none" stroke="#8c8c8c" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="2,3"/>
+<path d="M135.0,372.0 L547.0,372.0 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7,4"/>
+<path d="M135.0,372.0 L547.0,372.0 " fill="none" stroke="#2b6cb0" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7,4"/>
+<path d="M135.0,372.0 L547.0,372.0 " fill="none" stroke="#2b6cb0" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M135.0,372.0 L547.0,179.7 " fill="none" stroke="#8c8c8c" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="2,3"/>
+<path d="M135.0,372.0 L547.0,372.0 " fill="none" stroke="#1b1b1b" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<line x1="612.0" y1="179.7" x2="616.0" y2="114.7" stroke="#8c8c8c" stroke-width="0.75"/>
+<text x="618.0" y="118.7" font-size="11" fill="#8c8c8c">?</text>
+<line x1="612.0" y1="346.4" x2="616.0" y2="281.4" stroke="#8c8c8c" stroke-width="0.75"/>
+<text x="618.0" y="285.4" font-size="11" fill="#8c8c8c">LMDB (no readahead)</text>
 <line x1="612.0" y1="372.0" x2="616.0" y2="305.0" stroke="#8c8c8c" stroke-width="0.75"/>
 <text x="618.0" y="309.0" font-size="11" fill="#8c8c8c">RocksDB (LZ4)</text>
 <line x1="612.0" y1="372.0" x2="616.0" y2="318.0" stroke="#8c8c8c" stroke-width="0.75"/>
