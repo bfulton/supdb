@@ -5159,9 +5159,30 @@ pub struct Options {
     /// twenty-nine, the threaded scans a quarter raw and the rest decoded.
     /// When writes come the room is measured past the share again and a
     /// look short of half of it sends the raw partition read least back.
+    /// Paired in the row's whole order (`pair.sh supdb supdb-zhotfillquiet
+    /// 10000000 --bound 1342177280 --passes
+    /// load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
+    /// --ops-div 10 --reps 4`, at `5e58056`) it held twelve partitions raw
+    /// through the threaded scans where the default held eight, and the
+    /// three-thread scans read 1.03x and 1.01x: on three threads a raw
+    /// entry cost most of a decoded one, its walk stalled on the record
+    /// lines (`scan_raw_ahead`); the threaded reads read 1.11x and 1.15x,
+    /// and F 0.83x and 0.87x for the give-backs the write mixes take. Off;
     /// `supdb-zhotfillquiet` turns it on.
     #[doc(hidden)]
     pub zpages_hot_fill_quiet: bool,
+    /// EXPERIMENT: a walk of a partition's raw records in one run -- the
+    /// drained store's one walk from the seek (`cache_scan`) and a run of
+    /// the merge path's walk (`part_scan_z`) where no form file serves --
+    /// asks for the run's records ahead of it (`Blob::prefetch_ranks`, at
+    /// most `SCAN_RAW_AHEAD_CAP` bytes), as a block walk asks for the next
+    /// block's. The walk asked for nothing: on three threads at ten million
+    /// keys under 1.25 GiB two thirds of its samples were on the load of a
+    /// record's header, and a raw entry cost 55 ns against a decoded
+    /// one's 65 where one thread walks it at a third of that.
+    /// `supdb-scanrawahead` turns it on.
+    #[doc(hidden)]
+    pub scan_raw_ahead: bool,
     /// The hot-raw policy's way back -- a raw partition's form file attached
     /// again, at the fill, a swap or the cold way back -- in the release's
     /// two steps: the form file's pages asked of the kernel at one look
@@ -5591,6 +5612,7 @@ impl Default for Options {
             zpages_hot_ask_idle: false,
             zpages_hot_growth_pct: 10,
             zpages_hot_fill_quiet: false,
+            scan_raw_ahead: false,
             zpages_seek_seeds: false,
             sweep_remembers_pin: true,
             copy_prefetch_whole: false,
@@ -16524,6 +16546,11 @@ const SETTLE_PLANS: usize = 16;
 /// few pages.
 const WILLNEED_CAP: usize = 64 << 10;
 
+/// The most of a raw walk's records `Options::scan_raw_ahead` asks for at
+/// its start: a scan of a hundred of the suite's records is thirteen
+/// kilobytes, and a walk past this much has the hardware's own stream.
+const SCAN_RAW_AHEAD_CAP: usize = 16 << 10;
+
 /// What a reader reads: the store as of a publish. The writer builds a
 /// new one at every seal, join, merge or freeze and swaps it in whole,
 /// so a reader that loaded the old one keeps it, unchanged, until its
@@ -22344,6 +22371,7 @@ impl Reader {
         f: &mut F,
     ) -> Result<usize> {
         let raw = |rank: usize, n: usize, f: &mut F| {
+            self.raw_ahead(seg, rank, n);
             seg.raw()
                 .scan_at(rank, n, &mut *f)
                 .map_err(|e| err(&format!("segment scan: {e}")))
@@ -22511,6 +22539,7 @@ impl Reader {
             self.part_scan_z(seg, rank, n, f)?
         } else {
             seg.hot_scan(n);
+            self.raw_ahead(seg, rank, n);
             seg.raw()
                 .scan_at(rank, n, &mut *f)
                 .map_err(|e| err(&format!("segment scan: {e}")))?
@@ -22521,6 +22550,16 @@ impl Reader {
             ));
         }
         Ok(got)
+    }
+
+    /// The records of a raw walk of `n` ranks from `rank` asked for ahead of
+    /// it, where `Options::scan_raw_ahead` says so: a hint, nothing waited
+    /// for, at most `SCAN_RAW_AHEAD_CAP` bytes.
+    #[inline]
+    fn raw_ahead(&self, seg: &Seg, rank: usize, n: usize) {
+        if self.opts.scan_raw_ahead && n > 1 {
+            seg.raw().prefetch_ranks(rank, n, SCAN_RAW_AHEAD_CAP);
+        }
     }
 
     /// `Blob::values_at` for the block cache: the values of the record at
