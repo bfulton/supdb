@@ -2030,6 +2030,32 @@ impl<B: Bytes> Blob<B> {
         limit: usize,
         f: F,
     ) -> Result<usize> {
+        self.scan_at_with::<false, F>(from_rank, limit, 0, f)
+    }
+
+    /// `scan_at`, asking for the records `lead` bytes ahead of the one
+    /// being read as the walk goes: the first `lead` bytes at the start,
+    /// then each line as the walk comes within `lead` of it, so the fetch
+    /// runs beside the walk rather than before it. A hint, nothing waited
+    /// for; the common record shape only, as the walk's fast loop is.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn scan_at_paced<F: FnMut(&[u8], &[u8])>(
+        &self,
+        from_rank: usize,
+        limit: usize,
+        lead: usize,
+        f: F,
+    ) -> Result<usize> {
+        self.scan_at_with::<true, F>(from_rank, limit, lead, f)
+    }
+
+    fn scan_at_with<const PACE: bool, F: FnMut(&[u8], &[u8])>(
+        &self,
+        from_rank: usize,
+        limit: usize,
+        lead: usize,
+        f: F,
+    ) -> Result<usize> {
         let mut f = f;
         let mut rank = from_rank;
         let mut seen = 0usize;
@@ -2089,8 +2115,25 @@ impl<B: Bytes> Blob<B> {
                 .unwrap_or(&[])
                 .as_chunks::<4>()
                 .0;
+            // The next byte of the records not yet asked for, under `PACE`;
+            // the engine's prefetch is not built for wasm, and neither is a
+            // caller that paces.
+            #[cfg(not(target_family = "wasm"))]
+            let mut asked = 0usize;
+            #[cfg(target_family = "wasm")]
+            let _ = lead;
             for w in words {
                 let off = u32::from_le_bytes(*w) as usize;
+                #[cfg(not(target_family = "wasm"))]
+                if PACE {
+                    let want = off.saturating_add(lead).min(recs.len());
+                    let from = asked.max(off);
+                    if from < want {
+                        // SAFETY: `[from, want)` lies inside `recs`.
+                        crate::db::prefetch_lines(unsafe { recs.as_ptr().add(from) }, want - from);
+                        asked = want;
+                    }
+                }
                 let Some(h) = recs.get(off..off + 4) else {
                     break;
                 };

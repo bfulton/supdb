@@ -5183,6 +5183,15 @@ pub struct Options {
     /// `supdb-scanrawahead` turns it on.
     #[doc(hidden)]
     pub scan_raw_ahead: bool,
+    /// EXPERIMENT: under `scan_raw_ahead`, the records asked for as the
+    /// walk goes, this many bytes ahead of the record being read
+    /// (`Blob::scan_at_paced`), where zero asks for the run's whole span
+    /// at its start. Asked all at once, the run's two hundred lines waited
+    /// for fill buffers before the walk began: a third of the time the
+    /// ask saved, on three threads at ten million keys under 1.25 GiB.
+    /// `supdb-scanrawpaced` sets it.
+    #[doc(hidden)]
+    pub scan_raw_ahead_lead: usize,
     /// The hot-raw policy's way back -- a raw partition's form file attached
     /// again, at the fill, a swap or the cold way back -- in the release's
     /// two steps: the form file's pages asked of the kernel at one look
@@ -5613,6 +5622,7 @@ impl Default for Options {
             zpages_hot_growth_pct: 10,
             zpages_hot_fill_quiet: false,
             scan_raw_ahead: false,
+            scan_raw_ahead_lead: 0,
             zpages_seek_seeds: false,
             sweep_remembers_pin: true,
             copy_prefetch_whole: false,
@@ -22370,12 +22380,7 @@ impl Reader {
         n: usize,
         f: &mut F,
     ) -> Result<usize> {
-        let raw = |rank: usize, n: usize, f: &mut F| {
-            self.raw_ahead(seg, rank, n);
-            seg.raw()
-                .scan_at(rank, n, &mut *f)
-                .map_err(|e| err(&format!("segment scan: {e}")))
-        };
+        let raw = |rank: usize, n: usize, f: &mut F| self.raw_scan(seg, rank, n, f);
         if !self.z_on() {
             return raw(rank, n, f);
         }
@@ -22539,10 +22544,7 @@ impl Reader {
             self.part_scan_z(seg, rank, n, f)?
         } else {
             seg.hot_scan(n);
-            self.raw_ahead(seg, rank, n);
-            seg.raw()
-                .scan_at(rank, n, &mut *f)
-                .map_err(|e| err(&format!("segment scan: {e}")))?
+            self.raw_scan(seg, rank, n, f)?
         };
         if got < n {
             return Err(err(
@@ -22552,14 +22554,30 @@ impl Reader {
         Ok(got)
     }
 
-    /// The records of a raw walk of `n` ranks from `rank` asked for ahead of
-    /// it, where `Options::scan_raw_ahead` says so: a hint, nothing waited
-    /// for, at most `SCAN_RAW_AHEAD_CAP` bytes.
+    /// A walk of `n` of the partition's raw records from `rank`, with its
+    /// records asked for ahead of it where `Options::scan_raw_ahead` says
+    /// so: paced through the walk at `scan_raw_ahead_lead` bytes, or the
+    /// run's span at its start, at most `SCAN_RAW_AHEAD_CAP` bytes.
     #[inline]
-    fn raw_ahead(&self, seg: &Seg, rank: usize, n: usize) {
-        if self.opts.scan_raw_ahead && n > 1 {
-            seg.raw().prefetch_ranks(rank, n, SCAN_RAW_AHEAD_CAP);
-        }
+    fn raw_scan<F: FnMut(&[u8], &[u8])>(
+        &self,
+        seg: &Seg,
+        rank: usize,
+        n: usize,
+        f: &mut F,
+    ) -> Result<usize> {
+        let blob = seg.raw();
+        let r = if self.opts.scan_raw_ahead && n > 1 {
+            if self.opts.scan_raw_ahead_lead > 0 {
+                blob.scan_at_paced(rank, n, self.opts.scan_raw_ahead_lead, &mut *f)
+            } else {
+                blob.prefetch_ranks(rank, n, SCAN_RAW_AHEAD_CAP);
+                blob.scan_at(rank, n, &mut *f)
+            }
+        } else {
+            blob.scan_at(rank, n, &mut *f)
+        };
+        r.map_err(|e| err(&format!("segment scan: {e}")))
     }
 
     /// `Blob::values_at` for the block cache: the values of the record at

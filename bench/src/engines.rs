@@ -1118,6 +1118,9 @@ pub struct Supdb {
     /// A raw walk's records asked for ahead of it
     /// (`Options::scan_raw_ahead`): `supdb-scanrawahead`.
     scanrawahead: bool,
+    /// The same records asked for paced through the walk, a kilobyte ahead
+    /// (`Options::scan_raw_ahead_lead`): `supdb-scanrawpaced`.
+    scanrawpaced: bool,
     /// A covered scan's start placed once, the seek's cursor kept as the
     /// partition's reader's (`Options::zpages_seek_seeds` on):
     /// `supdb-zseekseed`.
@@ -2236,6 +2239,8 @@ struct Policy {
     zhotfillquiet: bool,
     /// A raw walk's records asked for ahead of it: `supdb-scanrawahead`.
     scanrawahead: bool,
+    /// Asked for paced through the walk: `supdb-scanrawpaced`.
+    scanrawpaced: bool,
     /// The start placed once: `supdb-zseekseed`.
     zseekseed: bool,
     /// The cold way back: `supdb-zhotcoldback`.
@@ -2659,6 +2664,7 @@ impl Default for Policy {
             zhotgrowth5: false,
             zhotfillquiet: false,
             scanrawahead: false,
+            scanrawpaced: false,
             zseekseed: false,
             zhotcoldback: false,
             sweepwalks: false,
@@ -8074,6 +8080,7 @@ impl Supdb {
             zhotgrowth5,
             zhotfillquiet,
             scanrawahead,
+            scanrawpaced,
             zseekseed,
             zhotcoldback,
             sweepwalks,
@@ -8616,7 +8623,8 @@ impl Supdb {
             zpages_hot_ask_idle: zhotaskidle,
             zpages_hot_growth_pct: if zhotgrowth5 { 5 } else { 10 },
             zpages_hot_fill_quiet: zhotfillquiet,
-            scan_raw_ahead: scanrawahead,
+            scan_raw_ahead: scanrawahead || scanrawpaced,
+            scan_raw_ahead_lead: if scanrawpaced { 1024 } else { 0 },
             zpages_seek_seeds: zseekseed,
             zpages_hot_cold_back: zhotcoldback,
             sweep_remembers_pin: !sweepwalks,
@@ -8896,6 +8904,7 @@ impl Supdb {
             zhotgrowth5,
             zhotfillquiet,
             scanrawahead,
+            scanrawpaced,
             zseekseed,
             zhotcoldback,
             sweepwalks,
@@ -9284,6 +9293,9 @@ impl Engine for Supdb {
         }
         if self.scanrawahead {
             return "supdb-scanrawahead";
+        }
+        if self.scanrawpaced {
+            return "supdb-scanrawpaced";
         }
         if self.zseekseed {
             return "supdb-zseekseed";
@@ -11663,6 +11675,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zhotgrowth5"
         | "supdb-zhotfillquiet"
         | "supdb-scanrawahead"
+        | "supdb-scanrawpaced"
         | "supdb-zseekseed"
         | "supdb-zhotcoldback"
         | "supdb-sweepwalks"
@@ -12102,6 +12115,18 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-memo64" => supdb_arm(Supdb::create_memo64, dir)?,
         "supdb-zhotaskidle" => supdb_arm(Supdb::create_zhotaskidle, dir)?,
         "supdb-zhotgrowth5" => supdb_arm(Supdb::create_zhotgrowth5, dir)?,
+        "supdb-scanrawpaced" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        scanrawpaced: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
         "supdb-scanrawahead" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -14462,6 +14487,21 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.scan_raw_ahead && !b.scan_raw_ahead);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("scanrawpaced"),
+                    Policy {
+                        scanrawpaced: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-scanrawpaced");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.scan_raw_ahead && o.scan_raw_ahead_lead == 1024);
+                assert!(!b.scan_raw_ahead && b.scan_raw_ahead_lead == 0);
             }
             {
                 let z = Supdb::create_zseekseed(&dir("zseekseed")).unwrap();
