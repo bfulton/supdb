@@ -126,6 +126,48 @@ fn err(msg: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
 }
 
+/// The name a checkpoint is built under before it is renamed to `dest`:
+/// beside it, so the rename stays on one filesystem.
+fn checkpoint_tmp(dest: &Path) -> Result<PathBuf> {
+    let name = dest.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "a checkpoint at {} has no name to be made under",
+                dest.display()
+            ),
+        )
+    })?;
+    let mut tmp = name.to_os_string();
+    tmp.push(".checkpoint-tmp");
+    Ok(dest.with_file_name(tmp))
+}
+
+/// One file of a checkpoint: `name` in `from` made `name` in `to`, by a
+/// hard link where the two are on one filesystem that has them -- the
+/// file is immutable once it has its name, every one a store keeps being
+/// written under a temp name and renamed or linked into place, so a link
+/// is a copy that shares its blocks -- and by a copy, synced, where a
+/// link is refused. A companion (`required` false) that is not there is
+/// left out.
+fn checkpoint_file(from: &Path, to: &Path, name: &str, required: bool) -> Result<()> {
+    let (src, dst) = (from.join(name), to.join(name));
+    let missing = |e: &std::io::Error| !required && e.kind() == std::io::ErrorKind::NotFound;
+    match std::fs::hard_link(&src, &dst) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return if required { Err(e) } else { Ok(()) };
+        }
+        // Another filesystem, or one with no links: copied below.
+        Err(_) => {}
+    }
+    match std::fs::copy(&src, &dst) {
+        Ok(_) => File::open(&dst)?.sync_all(),
+        Err(e) if missing(&e) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 fn put_uvarint(out: &mut Vec<u8>, mut v: u64) {
     loop {
         let b = (v & 0x7f) as u8;
@@ -33038,6 +33080,56 @@ impl Db {
         sealed
     }
 
+    /// A checkpoint: the store as of this call -- every commit made before
+    /// it, what is staged committed first as a flush commits it, and
+    /// nothing after -- made a store of its own at `dest`, which this one
+    /// does not hold: it is opened with `Db::open` under its own lock
+    /// while this store runs on, and neither sees what the other writes.
+    ///
+    /// The store is flushed, so that everything committed is in segments
+    /// the manifest names and the log holds nothing they do not. The
+    /// segment work, the one side that retires a segment, then links every
+    /// live segment into a directory beside `dest`, with the ordered index
+    /// and the form file each has, writes a manifest there that names
+    /// them, and renames the directory to `dest`. A segment is immutable
+    /// once it has its name, so a link is a copy that shares its blocks:
+    /// the checkpoint costs the flush and a link a file whatever the
+    /// store's size, and takes no space of its own until this store's
+    /// merges retire what the two share. Where `dest` is on another
+    /// filesystem, or one that has no links, the files are copied and
+    /// synced instead.
+    ///
+    /// `dest` must not exist, and its parent must. It is absent or a whole
+    /// store at every instant: a crash before the rename leaves a
+    /// directory named `<dest>.checkpoint-tmp`, which the next checkpoint
+    /// to `dest` removes.
+    pub fn checkpoint(&mut self, dest: &Path) -> Result<()> {
+        if dest.symlink_metadata().is_ok() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "a checkpoint is made at a path that does not exist, and {} does",
+                    dest.display()
+                ),
+            ));
+        }
+        // Refused before the store is drained for it: a name to be made
+        // under, in a directory that is there.
+        let tmp = checkpoint_tmp(dest)?;
+        if let Some(parent) = tmp.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::metadata(parent)?;
+        }
+        self.flush()?;
+        let unsealed = self.unsealed_keys();
+        if unsealed != 0 {
+            return Err(err(&format!(
+                "a checkpoint is of a drained store, and the flush left {unsealed} keys unsealed"
+            )));
+        }
+        let _op = self.op();
+        self.maint_request(MaintAsk::Checkpoint(dest.to_path_buf()))
+    }
+
     /// The state the writer's operation holds moved to whatever is
     /// current: another thread may have published since the operation
     /// began, and what the writer publishes next is made over the store as
@@ -40370,7 +40462,6 @@ struct SealJob {
 }
 
 /// What the writer waits for.
-#[derive(Clone, Copy)]
 enum MaintAsk {
     /// A flush's: the seal landed, then the store left partitioned or its
     /// partitioning scheduled (`Maint::drain`).
@@ -40381,6 +40472,9 @@ enum MaintAsk {
     /// partition given its form file or its reason, the landings meanwhile
     /// collected.
     ZSettle,
+    /// A checkpoint's (`Db::checkpoint`): the live segments linked into a
+    /// directory that is then this path.
+    Checkpoint(PathBuf),
 }
 
 /// How long the segment work's thread sleeps with nothing to do, and how
@@ -41063,6 +41157,18 @@ impl Maint {
                 self.z_rewarm_join();
                 self.z_join_asks();
                 self.sync_owed_slot()
+            }
+            MaintAsk::Checkpoint(dest) => {
+                // Every seal landed and durable, the names a pending slot
+                // left in doubt published, and the slot a drain left owed
+                // synced: what the state holds is on the device, and
+                // nothing lands while this thread links it.
+                self.join_seal(false)?;
+                if self.pending_on() && !self.pending.is_empty() {
+                    self.publish()?;
+                }
+                self.sync_owed_slot()?;
+                self.checkpoint_into(&dest)
             }
             MaintAsk::ZSettle => {
                 self.join_seal(false)?;
@@ -42877,6 +42983,59 @@ impl Maint {
             self.retire_covered();
         }
         Ok(())
+    }
+
+    /// The store as the state holds it made a store at `dest`
+    /// (`Db::checkpoint`): built under a temp name beside `dest` and
+    /// renamed, so `dest` is either absent or a whole store, and a
+    /// directory a crash left under the temp name is removed by the next
+    /// checkpoint to the same place. An open of a directory with segments
+    /// and no manifest takes every segment it finds for the store, which a
+    /// half-made checkpoint under its final name would be.
+    fn checkpoint_into(&mut self, dest: &Path) -> Result<()> {
+        let tmp = checkpoint_tmp(dest)?;
+        match std::fs::remove_dir_all(&tmp) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        std::fs::create_dir(&tmp)?;
+        let made = self.checkpoint_fill(&tmp).and_then(|()| {
+            std::fs::rename(&tmp, dest)?;
+            // The name itself durable: the parent's entry.
+            let parent = match dest.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                _ => Path::new("."),
+            };
+            File::open(parent)?.sync_all()
+        });
+        if made.is_err() {
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+        made
+    }
+
+    /// The checkpoint's files in `tmp`: every live segment with the
+    /// ordered index and the form file it has, then a manifest that names
+    /// the segments and covers what this store's does, synced, and the
+    /// directory's entries synced behind it. No log: every record the
+    /// manifest covers is in a segment, and an open makes the log it
+    /// appends to. Nothing lands while this runs -- it is the segment
+    /// work's own thread -- so the names are the state's at one moment and
+    /// none is retired under the links.
+    fn checkpoint_fill(&self, tmp: &Path) -> Result<()> {
+        let names = self.live_names();
+        for name in &names {
+            checkpoint_file(&self.dir, tmp, name, true)?;
+            // The companions are regenerable and a store runs without
+            // either: an open composes a missing index, and a form file is
+            // built where the store wants one.
+            let companions = [Db::ord_name_for(name), zfile::zpg_name_for(name)];
+            for companion in companions.into_iter().flatten() {
+                checkpoint_file(&self.dir, tmp, &companion, false)?;
+            }
+        }
+        manifest_write_shape(tmp, &self.opts, 1, self.covered_seq, &names)?;
+        File::open(tmp)?.sync_all()
     }
 
     fn publish(&mut self) -> Result<()> {

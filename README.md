@@ -124,6 +124,16 @@ db.append(b"user:42", b"logged in");
 db.commit()?;                        // the reader sees this from here on
 ```
 
+A checkpoint: the store as of the call, made a store of its own at a path
+that does not exist yet. The segments are hard-linked where the path is on
+the store's filesystem, so it costs a flush and takes no space until the
+live store's merges retire what the two share; elsewhere they are copied.
+
+```rust
+db.checkpoint(std::path::Path::new("./store-backup"))?;
+let backup = Db::open(std::path::Path::new("./store-backup"), Options::default())?;
+```
+
 A write-once segment: sorted input in, one immutable file out, read by the
 same reader the store uses.
 

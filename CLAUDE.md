@@ -39,7 +39,7 @@ of the change that produced the text.
 | `src/bytes.rs`, `src/blob.rs` | the read path over any byte source; compiles for wasm |
 | `src/wasmapi.rs` | the C ABI the browser calls; hand-written because the module's size is budgeted |
 | `web/` | the browser reader, its byte sources, the Worker it runs in, and the size control -- `web/README.md` |
-| `tests/` | the engine's contract, the read paths held to each other, the format's damage cases; `tests/common` holds what more than one file needs |
+| `tests/` | the engine's contract, the read paths held to each other, the format's damage cases, a checkpoint held to the store it was made of; `tests/common` holds what more than one file needs |
 | `bench/` | the benchmark suite: its own cargo workspace, the arms, the runner, the gate and the figures -- `bench/DESIGN.md` |
 | `experiments/ffi/` | what a C ABI and a Python binding cost a point read, borrowed against copied, beside LMDB's and RocksDB's C APIs; its own manifest and dated results, and not built by the gate -- its `README.md` |
 
@@ -1159,6 +1159,24 @@ the entries' range (`Options::direct_log_range`; `supdb-ordlog` and
 write and a fresh page a thousand that said nothing the entry count
 did not, and whose tail the truncation of an uncommitted run never
 trimmed. A run that kept no table at all is the shape left to price.
+
+**A file a store names never changes.** A segment, its ordered index
+and its form file are each written under a temp name and renamed or
+linked into place, and nothing writes one after that: no patch in place,
+no writable mapping. `Db::checkpoint` rests on it. A checkpoint is hard
+links to the files the manifest names, with a manifest of its own, so a
+byte changed in place under a name is changed in every checkpoint that
+shares the file, with nothing raised in either store, and a file rebuilt
+in place -- truncated and written again -- is torn under whoever has it
+mapped from the other one. A change that needs other bytes under a name
+writes a new file and renames it over the old, which leaves the other
+store's link on the old inode: an ordered index an open finds torn is
+composed again that way (`write_ord`), which is why a checkpoint may
+share one that was never synced. The checkpoint is made by the segment
+work, the one side that retires a segment, so no name goes while it is
+being linked; and it is built under a temp name and renamed, because an
+open of a directory with segments and no manifest takes every segment
+it finds for the store.
 
 ## Shapes the bugs come in
 

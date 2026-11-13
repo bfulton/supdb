@@ -174,9 +174,14 @@ What an engine picker would hit, roughly in order.
   the old run's end with its new owner). The WAL orders its files across
   a rotation with a loose boundary the first sync chains; a run needs the
   same, or the next run's first sync waits for the last run's.
-- [ ] **Backup or checkpoint.** A consistent copy of a live store, like
-  LMDB's `mdb_env_copy` or RocksDB's `Checkpoint`. Table stakes for
-  operating a store.
+- [x] **Backup or checkpoint.** A consistent copy of a live store, like
+  LMDB's `mdb_env_copy` or RocksDB's `Checkpoint`: `Db::checkpoint` makes
+  the store as of the call a store of its own at a new path, its segments
+  hard-linked where the path is on the store's filesystem and copied
+  where it is not (`tests/checkpoint.rs`). It flushes first, as RocksDB's
+  does by default; a checkpoint that leaves the memtable where it is and
+  carries the log would be the cheaper one for a store that writes
+  between them.
 - [ ] **Range delete.** Deleting a key range without a tombstone per key.
 - [ ] **Reverse and bounded scans.** `scan` is forward-only from a start key
   with a count; add an end bound and reverse order.
