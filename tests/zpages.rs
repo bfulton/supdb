@@ -11917,6 +11917,196 @@ fn the_hot_raw_policy_relaxes_its_skew_bar_where_the_candidate_fits_the_room() {
     }
 }
 
+/// Under the hot-raw policy's fill (`Options::zpages_hot_fill`), partitions
+/// read alike -- none over the median, so the skew releases none -- are
+/// released into the room the group leaves: the first look that rates them
+/// asks for as many as the room holds at once, the raw bytes of each not
+/// resident counted against it, and they are released as their pages come
+/// in, though at no look after a write; the room gone sends one back, and
+/// with the room full a partition read far over the median makes the
+/// coldest raw one give way. Without the option the same reads
+/// release nothing. Every read answers as the raw form does across each
+/// move.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_hot_raw_fill_releases_partitions_read_alike_into_the_room_and_gives_them_back() {
+    for on in [true, false] {
+        let what = format!("hot raw fill {on}");
+        let (dir, mut db, model, inject) = auto_store_with(
+            &format!("auto-hotfill-{on}"),
+            1 << 20,
+            1_000_000.0,
+            FAULT_1MS,
+            |o| {
+                o.zpages_hot_raw = true;
+                o.zpages_hot_raw_slack = true;
+                o.zpages_hot_fill = on;
+                o.zpages_memo = false;
+                o.partition_bytes = Some(400 << 10);
+            },
+            |_| {},
+        );
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        let r = db.reader().unwrap();
+        let mut at = 0usize;
+        assert!(
+            drive_to(&db, &r, &keys, &inject, &mut at, 640, 1, 3, 400),
+            "{what}: COMPACT: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            tick_until(&db, 400, |c| c.attached >= c.partitions
+                && c.warms >= c.partitions),
+            "{what}: every file attached and warmed: {:?}",
+            db.zpage_counts()
+        );
+        inject.set_decode_cost(std::time::Duration::from_micros(10));
+        // The group's refaults pinned under the pressure line, so that the
+        // fill's feedback reads the seam's and not the machine's.
+        inject.set_refault_rate(0.0);
+        let c = db.zpage_counts();
+        assert!(
+            c.form_files >= 5,
+            "{what}: partitions to choose from: {c:?}"
+        );
+        let (partitions, total) = (c.partitions, c.file_bytes);
+        let raw_one = (c.model_record_bytes + c.model_hash_bytes) / partitions;
+        // The raw partitions out of the cache, so that each ask's bytes are
+        // the room's to find.
+        let segs: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("par-") && n.ends_with(".sup"))
+            })
+            .collect();
+        assert!(segs.len() >= partitions as usize, "{what}: {segs:?}");
+        for p in &segs {
+            unmap_pages(p);
+            evict(p);
+        }
+        // Room for two and a half partitions' raw bytes over the growth
+        // share and the one the fill leaves for skewed reads.
+        let budget = total * 4;
+        let growth = budget / 10;
+        let raw_max = raw_one * 5 / 4;
+        inject.set_budget(budget);
+        inject.set_slack(growth + raw_max + raw_one * 5 / 2);
+        let base = usize::try_from(supdb::db::HOT_RAW_MIN_SAMPLES).unwrap() * 16;
+        let parts: Vec<Vec<Vec<u8>>> = (0..partitions as usize)
+            .map(|i| keys_of_partition(&db, &model, i))
+            .collect();
+        let los: Vec<Vec<u8>> = db.zpage_heat().iter().map(|h| h.lo.clone()).collect();
+        let heat_all = |db: &Db| {
+            for p in &parts {
+                heat_up(db, p, base);
+            }
+        };
+        // A write committed between every look: the store is not quiet, and
+        // partitions read alike are asked for at none of them.
+        if on {
+            for i in 0..4 {
+                heat_all(&db);
+                db.append(format!("zz-fill-{i}").as_bytes(), b"v");
+                db.commit().unwrap();
+                hot_look(&db, std::time::Duration::from_millis(200));
+            }
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_asks, c.hot_raw),
+                (0, 0),
+                "{what}: a look after a write fills nothing: {c:?}"
+            );
+        }
+        let mut first = None;
+        for _ in 0..4 {
+            heat_all(&db);
+            let before = db.zpage_counts().hot_asks;
+            hot_look(&db, std::time::Duration::from_millis(200));
+            let asks = db.zpage_counts().hot_asks - before;
+            if asks > 0 && first.is_none() {
+                first = Some(asks);
+            }
+        }
+        if !on {
+            let c = db.zpage_counts();
+            assert_eq!(
+                (c.hot_asks, c.hot_raw, c.form_files),
+                (0, 0, partitions),
+                "{what}: partitions read alike are under the bar: {c:?}"
+            );
+            check(&r, &model, &keys, &format!("{what}: after"));
+            drop(r);
+            db.close().unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            continue;
+        }
+        assert_eq!(
+            first,
+            Some(2),
+            "{what}: the first look asks for the two the room holds: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            hot_until(&db, 20, |c| c.hot_raw >= 2),
+            "{what}: both released: {:?}",
+            db.zpage_counts()
+        );
+        let c = db.zpage_counts();
+        assert!(
+            c.hot_raw_now >= 2 && c.form_files <= partitions - 2,
+            "{what}: two or more raw: {c:?}"
+        );
+        check(&r, &model, &keys, &format!("{what}: released"));
+        // The room gone: one goes back at the look, and the room again
+        // holds the rest.
+        let backs = c.hot_back_asks + c.hot_back;
+        inject.set_slack(growth / 2);
+        heat_all(&db);
+        hot_look(&db, std::time::Duration::from_millis(200));
+        let c = db.zpage_counts();
+        assert!(
+            c.hot_back_asks + c.hot_back > backs,
+            "{what}: the room gone sends one back: {c:?}"
+        );
+        inject.set_slack(growth + raw_max + raw_one * 5 / 2);
+        assert!(
+            hot_until(&db, 40, |c| c.hot_back >= 1),
+            "{what}: the way back taken: {:?}",
+            db.zpage_counts()
+        );
+        assert!(
+            db.zpage_counts().hot_raw_now >= 1,
+            "{what}: one raw left: {:?}",
+            db.zpage_counts()
+        );
+        check(&r, &model, &keys, &format!("{what}: one back"));
+        // One partition read far over the rest, with the room full: the raw
+        // one read least makes way for it, and it is asked for once the way
+        // back frees the room.
+        inject.set_slack(growth + raw_one / 4);
+        let served: Vec<Vec<u8>> = db.zpage_heat().iter().map(|h| h.lo.clone()).collect();
+        let i = los.iter().position(|lo| served.contains(lo)).unwrap();
+        let hot = &parts[i];
+        let raw_before = db.zpage_counts().hot_back;
+        for _ in 0..6 {
+            heat_up(&db, hot, base * 8);
+            hot_look(&db, std::time::Duration::from_millis(200));
+        }
+        assert!(
+            hot_until(&db, 20, |c| c.hot_back > raw_before),
+            "{what}: a skewed partition makes way for itself: {:?}",
+            db.zpage_counts()
+        );
+        check(&r, &model, &keys, &format!("{what}: after"));
+        drop(r);
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// Under the controller with the hot-raw policy and the release's room read
 /// from the group's unused memory (`Options::zpages_hot_raw_slack`), the
 /// hottest partition is released where its raw bytes fit in that room,

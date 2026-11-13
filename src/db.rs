@@ -5052,6 +5052,40 @@ pub struct Options {
     /// scrambled E 1.42x and 1.12x: a trade, so off keeps a raw partition
     /// raw until the fill and `supdb-zhotcoldback` is the arm.
     pub zpages_hot_cold_back: bool,
+    /// EXPERIMENT: under the hot-raw policy with its room read from the
+    /// group (`zpages_hot_raw`, `zpages_hot_raw_slack`), the policy fills
+    /// the room with raw partitions whatever their skew: at each look the
+    /// served partitions are taken hottest first and their raw pages asked
+    /// for together while the bytes of them not resident fit the room less
+    /// what the asks in flight will bring in, and each is released once its
+    /// pages are in, several in one look -- so a uniform pass, where no
+    /// partition is hotter than the median and the skew releases none, is
+    /// served raw over as much of the store as the memory holds, and the
+    /// first look jumps to the room's estimate where the skew went a
+    /// partition a look. A look fills only where the store is quiet --
+    /// nothing committed since the last look and no merge in flight -- since
+    /// the room a stretch of writes or a merge chain leaves is the room it
+    /// takes back a moment later, and a fill there paid its device reads
+    /// inside the lag sweep's passes and the write mixes; and it stops a
+    /// partition short of the room, where a partition skewed over the
+    /// median by `HOT_RAW_SKEW` may be asked for at any look into the whole
+    /// of it, one at a time outside a quiet stretch. The room is the
+    /// measure and its own feedback: where
+    /// it is gone the raw partition read least over the window goes back,
+    /// and while writes come only once they have taken half the growth
+    /// share the room is measured past.
+    /// The group's refaults are no check of it -- under a bound they count
+    /// the pages the load evicted as they are read again, with room to
+    /// spare, and held the first version through the read pass. Where the
+    /// room is full and a served partition reads `HOT_RAW_SKEW` times the
+    /// median over the window, the raw one read least, under the median,
+    /// makes way for it: the mixes' skew, and not one look's spread among
+    /// partitions read alike, which swapped on noise in the first version. The raw form at ten million keys with
+    /// memory to spare reads 1.4-2.0x LMDB's where the form's decode reads
+    /// under it (`pair.sh supdb lmdb-nordahead 10000000 --bound 4294967296`
+    /// in the row's passes, at `1846b85`). Off; `supdb-zhotfill` is the arm.
+    #[doc(hidden)]
+    pub zpages_hot_fill: bool,
     /// The hot-raw policy's way back -- a raw partition's form file attached
     /// again, at the fill, a swap or the cold way back -- in the release's
     /// two steps: the form file's pages asked of the kernel at one look
@@ -5484,6 +5518,7 @@ impl Default for Options {
             zpages_hot_room_margin_pct: 0,
             zpages_walk_owns_decodes: false,
             zpages_hot_cold_back: false,
+            zpages_hot_fill: false,
             zpages_hot_back_ask: true,
             zpages_rewarm_scans: true,
             zpages_settle_joins_asks: true,
@@ -40394,6 +40429,12 @@ struct Maint {
     /// looks (`Options::zpages_hot_raw_slack`), by its lower fence.
     z_hot_win: std::collections::HashMap<Vec<u8>, std::collections::VecDeque<u64>>,
     z_hot_ask: Option<(Vec<u8>, std::time::Duration)>,
+    /// The partitions whose raw pages a look asked for under
+    /// `Options::zpages_hot_fill`, by their lower fences, with when; and the
+    /// live table's count and committed length at the last look, which a
+    /// write moves.
+    z_hot_fill_asks: Vec<(Vec<u8>, std::time::Duration)>,
+    z_hot_fill_writes: Option<(u64, usize)>,
     /// The way back asked at a look before (`Options::zpages_hot_back_ask`):
     /// the raw partition by its lower fence, when, and a mapping of its form
     /// file on disk for the residency of its pages.
@@ -41001,6 +41042,8 @@ impl Maint {
             z_hot_heat: std::collections::HashMap::new(),
             z_hot_win: std::collections::HashMap::new(),
             z_hot_ask: None,
+            z_hot_fill_asks: Vec::new(),
+            z_hot_fill_writes: None,
             z_hot_back_ask: None,
             z_hot_hold: None,
             z_rewarm_life: 0,
@@ -43446,6 +43489,176 @@ impl Maint {
             }
             let seg = q.seg.clone();
             self.z_hot_back(seg);
+            return;
+        }
+        // The fill (`Options::zpages_hot_fill`): the room filled with raw
+        // partitions hottest first, asked for together and released as
+        // their pages come in, and given back where the room goes.
+        if let (true, Some(room)) = (self.opts.zpages_hot_fill, room) {
+            // Whether the store is quiet: nothing committed since the last
+            // look, and no merge in flight. A stretch of writes grows the
+            // process and a merge rewrites partitions, so the room a fill
+            // takes there is the room they need next, and every move it
+            // makes is a device read inside the pass beside it.
+            let writes = {
+                let _op = self.op();
+                (self.state().lives, self.mem().committed_len())
+            };
+            let wrote = self.z_hot_fill_writes.replace(writes) != Some(writes);
+            let quiet = !wrote && self.compacting.is_empty() && self.tiering.is_none();
+            // The asks in flight: each released once its pages are in, or
+            // its wait has run out with half of them in and the room still
+            // there; the rest of the bytes still to come counted against
+            // the room for the asks this look makes.
+            let mut pending = 0u64;
+            let mut released = 0usize;
+            for (lo, since) in std::mem::take(&mut self.z_hot_fill_asks) {
+                let Some(p) = parts.iter().find(|p| !p.raw && p.seg.lo == lo) else {
+                    continue;
+                };
+                let resident = p.seg.records_resident();
+                let waited = now.saturating_sub(since) >= HOT_RAW_ASK_WAIT;
+                if resident < HOT_RAW_RESIDENT && !waited {
+                    pending =
+                        pending.saturating_add((p.raw_bytes as f64 * (1.0 - resident)) as u64);
+                    self.z_hot_fill_asks.push((lo, since));
+                    continue;
+                }
+                if room > 0 && resident >= 0.5 {
+                    if self.z_trace {
+                        trace("fill-release", Some(p));
+                    }
+                    let seg = p.seg.clone();
+                    self.z_hot_release(seg);
+                    released += 1;
+                } else {
+                    if self.z_trace {
+                        trace("fill-dropped", Some(p));
+                    }
+                    zfile::ZEvents::add(&self.shared.z.hot_dropped, 1);
+                }
+            }
+            // The feedback: the room gone sends the raw partition read least
+            // over the window back, the way back freeing its raw bytes less
+            // its file's. No hold after it: what a back frees is short of
+            // what an ask needs, so the room it makes asks for nothing, and
+            // a hot partition the reads turn to is still let in by the swap.
+            let coldest = parts
+                .iter()
+                .filter(|p| p.raw)
+                .min_by(|a, b| per_key(a).total_cmp(&per_key(b)));
+            // While writes come, half the growth share is theirs to take
+            // before a partition goes back: a burst's memtable and merges
+            // are what the share is kept for, and a back is a device read
+            // inside the burst.
+            let growth =
+                (budget as f64 * f64::from(self.opts.zpages_hot_growth_pct) / 100.0) as u64;
+            let gone = if quiet {
+                room == 0
+            } else {
+                slack.is_some_and(|s| s < growth / 2)
+            };
+            if gone {
+                if self.z_trace {
+                    trace(
+                        if coldest.is_some() {
+                            "fill-back"
+                        } else {
+                            "fill-pressed"
+                        },
+                        coldest,
+                    );
+                }
+                if let Some(q) = coldest {
+                    let seg = q.seg.clone();
+                    self.z_hot_back_or_ask(seg, now);
+                }
+                return;
+            }
+            if released > 0 {
+                return;
+            }
+            // The asks: the served partitions read past the floor, hottest
+            // first, while the raw bytes of each not resident fit what the
+            // room has left over the asks in flight, and the form files and
+            // the raw partitions together stay within the budget. A quiet
+            // look asks for any of them, short of the room by a partition's
+            // raw bytes, so that the skewed reads that come next find room
+            // without a swap; any look asks for a skewed one, into the
+            // whole room.
+            let mut total_after = total;
+            let mut cands: Vec<&Part> = parts
+                .iter()
+                .filter(|p| {
+                    !p.raw
+                        && p.rated
+                        && p.heat >= RECODE_FLOOR_NS
+                        && p.delta >= HOT_RAW_MIN_SAMPLES
+                        && !self.z_hot_fill_asks.iter().any(|(lo, _)| *lo == p.seg.lo)
+                })
+                .collect();
+            cands.sort_by(|a, b| per_key(b).total_cmp(&per_key(a)));
+            let reserve = cands.iter().map(|p| p.raw_bytes).max().unwrap_or(0);
+            let mut avail = room.saturating_sub(pending);
+            let mut fill_avail = avail.saturating_sub(reserve);
+            let mut asked = 0usize;
+            for p in &cands {
+                let skewed = per_key(p) >= HOT_RAW_SKEW * median;
+                // Outside a quiet stretch, a skewed partition at a time, as
+                // the policy without the fill asks: a batch of them asked
+                // inside a write mix is its device reads all at once.
+                if !quiet && (!skewed || asked > 0 || !self.z_hot_fill_asks.is_empty()) {
+                    break;
+                }
+                let need = (p.raw_bytes as f64 * (1.0 - p.seg.records_resident())) as u64;
+                let after = total_after
+                    .saturating_sub(p.file_bytes)
+                    .saturating_add(p.raw_bytes);
+                if need > (if skewed { avail } else { fill_avail }) || after > budget {
+                    break;
+                }
+                avail -= need;
+                fill_avail = fill_avail.saturating_sub(need);
+                total_after = after;
+                if self.z_trace {
+                    trace("fill-ask", Some(p));
+                }
+                Maint::z_hot_ask(&p.seg, self.opts.zpages_hot_ask_idle);
+                self.z_hot_fill_asks.push((p.seg.lo.clone(), now));
+                zfile::ZEvents::add(&self.shared.z.hot_asks, 1);
+                asked += 1;
+            }
+            if asked > 0 || self.z_hot_back_ask.is_some() {
+                return;
+            }
+            if self.z_trace {
+                trace(
+                    if cands.is_empty() {
+                        "fill-cold"
+                    } else {
+                        "fill-full"
+                    },
+                    cands.first().copied(),
+                );
+            }
+            // Nothing fits: a served partition skewed by `HOT_RAW_SKEW` over
+            // the window, over the median and over the raw one read least,
+            // takes that one's place where it reads no more than the
+            // median -- the
+            // sustained skew of the mixes, not one look's spread among
+            // partitions read alike, which the decayed heat follows.
+            if let Some(q) = coldest {
+                let skewed = cands
+                    .iter()
+                    .any(|p| per_key(p) >= HOT_RAW_SKEW * median.max(per_key(q)));
+                if skewed && per_key(q) <= median {
+                    if self.z_trace {
+                        trace("fill-swap", Some(q));
+                    }
+                    let seg = q.seg.clone();
+                    self.z_hot_back_or_ask(seg, now);
+                }
+            }
             return;
         }
         // The partition asked for at a look before: taken once its pages
