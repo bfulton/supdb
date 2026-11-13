@@ -33,18 +33,16 @@ The suite has to be fair before any of its numbers are quoted.
   after the ordered load's batches and after the shuffled load's, in the
   in-core rows (`bench/DESIGN.md`). An accepted loss against LMDB; the
   point is to measure it.
-- [ ] **Match what a buffered commit survives, or state it.** The
+- [x] **Match what a buffered commit survives, or state it.** The
   recovery workloads hold every arm's reopened store to the batches its
-  writer was acknowledged, and the buffered supdb arm's ordered load does
-  not hold the newest of them: ordered ingest writes a run's records a
+  writer was acknowledged, and the buffered supdb arm's ordered load did
+  not hold the newest of them: ordered ingest wrote a run's records a
   write piece at a time, so under a policy that does not sync at every
-  commit the commits behind the last whole piece are in the writer's
-  memory when its process dies, where the WAL is written at every commit
-  and LMDB's and RocksDB's unsynced commits are in the kernel. The rows
-  record it (`unrecovered_batches`). Either a direct run hands every
-  commit to the kernel under every policy, priced on the buffered ordered
-  load, or the methods say the buffered group is matched on a machine's
-  crash and not on a process's.
+  commit the commits behind the last whole piece were in the writer's
+  memory when its process died. Every commit of a run is written to its
+  file now, as a commit is written to the WAL, and the rows' count of
+  acknowledged batches not recovered (`unrecovered_batches`) is zero for
+  every arm.
 - [ ] **Rows past memory.** The `full` ladder to at least 1.5x the machine's
   memory, as `bench/DESIGN.md` specifies, is banked to 3M keys. The bounded
   scale (`--scale ooc`) is banked through 10M keys under 1.5 GiB, where
@@ -161,19 +159,27 @@ What an engine picker would hit, roughly in order.
   `flock` for the store's life, and a second open, from another process or
   this one, fails at once and touches nothing (`tests/db.rs`). Readers in
   other processes are not supported.
-- [ ] **Order ordered ingest's runs across a machine's crash.** Under a
+- [ ] **Small buffered bursts pay the filing at their commits.** With the
+  forms filed at write time by default (`Options::forms_settle_every`,
+  `forms_settle_builds`), the buffered arm's lag bursts at the two
+  smallest rungs run behind the arm that files late, in nearly every
+  pair, and the pass after the burst gains nothing for it:
+  `bench/scripts/pair.sh supdb-ingestsettlelate supdb-ingest 30000
+  --passes load,lag`, and the same at 10000, at `5df99d6`. Where the
+  time goes inside those commits is not decomposed yet; whatever gates
+  the filing there is priced on every cell the gate crosses, the bounded
+  rungs' among them.
+- [x] **Order ordered ingest's runs across a machine's crash.** Under a
   policy that does not sync at every commit (`SyncPolicy::EveryN`), a
-  closed run's last records are synced by its seal while the writer
-  commits to the next run, and the policy's sync of that run can reach the
-  device first: a machine's crash in between recovers the later commits
-  without the earlier ones, where the policy promises a tail lost whole.
-  This is read from the code and not reproduced: it takes a rig that
-  cuts the power.
-  A process's death no longer can -- a closing run's records are written
-  before the run is handed to its seal (`CLAUDE.md`, a hand-off that left
-  the old run's end with its new owner). The WAL orders its files across
-  a rotation with a loose boundary the first sync chains; a run needs the
-  same, or the next run's first sync waits for the last run's.
+  machine's crash could keep a later run, or frames in the log, and take
+  the end of an earlier run no sync had covered, and the open served the
+  later commits without the earlier ones, where the policy promises a tail
+  lost whole. A run's records take sequence numbers now, the open walks
+  the frames and the runs as one history and ends it at the first loss,
+  and a sync by policy covers every file written before it (`CLAUDE.md`,
+  a history in several files). Held by tests that build the state a lost
+  page leaves (`tests/runlog.rs`); a rig that cuts the power is still the
+  one thing that would show a device lying about its sync.
 - [x] **Backup or checkpoint.** A consistent copy of a live store, like
   LMDB's `mdb_env_copy` or RocksDB's `Checkpoint`: `Db::checkpoint` makes
   the store as of the call a store of its own at a new path, its segments

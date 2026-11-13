@@ -149,7 +149,7 @@ fn a_killed_writers_acknowledged_batches_are_all_there() {
 }
 
 const BUFFERED_ENV: &str = "SUPDB_KILL_BUFFERED_CHILD";
-const BUFFERED_TEST: &str = "a_killed_buffered_writers_store_is_a_prefix_of_what_it_acknowledged";
+const BUFFERED_TEST: &str = "a_killed_buffered_writer_loses_nothing_it_acknowledged";
 /// The buffered child's batch and value: the suite's load, a thousand keys
 /// of a hundred bytes, so that a run of ordered ingest closes after about
 /// three hundred batches under the default seal and a megabyte, the
@@ -191,26 +191,26 @@ fn buffered_child(dir: &Path) -> ! {
 }
 
 /// A writer that syncs nothing at its commits promises the device nothing,
-/// and what its death may take is the newest of what it acknowledged: the
-/// store it leaves holds a prefix of its batches, each whole, and never a
-/// batch behind one it lost (`SyncPolicy`: an unsynced tail is lost whole
-/// and never served in part).
+/// and promises the kernel everything: a commit that returned is written
+/// where it goes under every policy (`SyncPolicy`), so the death of the
+/// process takes none of them, whichever of the log and a run's file they
+/// went to.
 ///
-/// The window this holds is a run's close. A run of ordered ingest goes to
-/// its file a write piece at a time, and the run was handed to its seal
-/// with its last piece still in the writer's buffer, for the seal's thread
-/// to write with the trailer; the writer went on into the next run, whose
-/// first whole piece reached its own file before that. A kill between the
-/// two left the first run's file short of its last commits and the second
-/// run's holding later ones, and the open recovered both: batch 290 there
-/// and 287 to 289 not, in the benchmark's recovery workload, which is what
-/// found it. The run's records are written by the writer at the hand-off
-/// now. Here the seal's thread is held, so the window is as wide as the
-/// test needs, and the kill comes once the second run has pieces on its
-/// file.
+/// Two things were found here, both by the benchmark's recovery workload.
+/// A run of ordered ingest went to its file a write piece at a time, so up
+/// to a megabyte of acknowledged batches was in the writer's buffer when a
+/// kill came: two to eight batches of the suite's load gone where LMDB and
+/// RocksDB without sync lost none. And a run that closed was handed to its
+/// seal with that last piece still in the buffer, for the seal's thread to
+/// write with the trailer, while the writer went on into the next run,
+/// whose first whole piece reached its own file first: a kill between the
+/// two left batch 290 there and 287 to 289 not. Every commit writes its
+/// batch now. Here the seal's thread is held, so the second window is as
+/// wide as the test needs, and the kill comes once the second run has
+/// pieces on its file.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_killed_buffered_writers_store_is_a_prefix_of_what_it_acknowledged() {
+fn a_killed_buffered_writer_loses_nothing_it_acknowledged() {
     if let Ok(d) = std::env::var(BUFFERED_ENV) {
         buffered_child(Path::new(&d));
     }
@@ -300,15 +300,12 @@ fn a_killed_buffered_writers_store_is_a_prefix_of_what_it_acknowledged() {
             _ => {}
         }
     }
-    // What the death took is the open run's unwritten end: under the two
-    // megabytes the second run had on its file, so every batch of the
-    // first run, the one whose close the kill followed, is there.
-    let lost = (last + 1).saturating_sub(first_lost.unwrap_or(last + 1));
-    let batch_bytes = u64::from(BUFFERED_BATCH) * (16 + BUFFERED_VALUE.len() as u64);
+    // Nothing acknowledged is gone: the first batch not there, if any, is
+    // the one the child was inside when it died.
     assert!(
-        u64::from(lost) * batch_bytes < 2 << 20,
-        "{lost} batches lost of {} acknowledged: more than the open run's unwritten end",
-        last + 1
+        first_lost.is_none_or(|lost| lost > last),
+        "batch {} was acknowledged and is not there (last acknowledged {last})",
+        first_lost.unwrap_or(0)
     );
     drop(db);
     let _ = std::fs::remove_dir_all(&d);

@@ -7224,6 +7224,26 @@ acknowledged from then on and an fdatasync of a file does not promise
 the entry that names it. One directory barrier per seal, off the
 per-commit path.
 
+The runs of ordered ingest came under the same question later, and failed
+it. A run keeps its records in a file of its own, outside the log, and it
+took no sequence numbers, so the open took every run it found beside
+whatever the log replayed: a later run, or frames behind a run, served
+without the end of an earlier run that a machine's crash had taken. A
+run's records take sequence numbers now, one each, and its file says where
+it starts; the open walks the frames and the runs as one history from the
+sequence the manifest covers and ends it at the first loss; and a sync that
+acknowledges, the policy's or `Db::sync`, covers every file written before
+it, where `sync` had covered the log alone and returned over a run in
+progress. `tests/runlog.rs` holds it two ways: a test for each state a lost
+page leaves, built by stopping a writer with its seals held and cutting a
+file back or taking it away, and an oracle that kills a writer of a seeded
+stream of runs, logged writes and seals at a random commit, tears every
+unsynced log to a random length or removes it, and asks which prefix of
+the stream the reopened store is. With nothing torn the prefix is every
+commit acknowledged, under either policy, since every commit is written
+where it goes: a run's commits once waited in the writer's buffer for a
+whole write piece, and a killed process took up to a megabyte of them.
+
 The comparators' check, registered before its first run. The suite's comparator arms are configured and driven by the same hand that wrote the engine, and the suite's own history has a comparator wrong for months while every check passed (the buffered RocksDB as it ships, `bench/DESIGN.md`). A job of the repository's CI (`comparators.yml`, by hand and weekly) holds the suite's comparator cells to the comparators' own tools on one hosted runner in one job: RocksDB's db_bench built from the very tree the suite links -- the source `librocksdb-sys` vendors at the version `bench/Cargo.lock` pins, with no compression library, as the suite's build has none -- and run with the tuned arm's options (compression off, a 256 MB block cache with the index and filter blocks in it, ten Bloom bits a key, 128 MB write buffers four deep merged two at a time, level 0 compacting at eight files, four background jobs), the load in synced batches of a thousand, N uniform point reads on one thread and seeks with ninety-nine nexts for the suite's scans of a hundred entries; and, since LMDB ships no benchmark tool, a C program of a hundred lines against the LMDB `lmdb-master-sys` vendors (`bench/tools/lmdb_bench.c`), the suite's shapes in its own doc, with one read transaction held across the reads as the suite's arm holds its own. Beside them the suite's `rocksdb-tuned` and `lmdb` arms run the quick ladder in the same job, and `bench/scripts/comparators.py` prints, at every rung, the suite's load, point-read and scan cell beside the tool's. The rule: the suite's cell is at least 0.7x the tool's on every quantity the tool measures, or the job fails and names the quantity. A cell under the margin is a comparator the suite configures or drives badly -- the finding is the arm's, to fix and bank a row for -- and never a reading of the engine; a cell far above the tool's is the tool driven badly, printed and not failed. The tools' flags live in `bench/scripts/comparators.sh`, so a reader can run both halves. The margin the cells hold is read off the job's summary once it has run, and `bench/DESIGN.md` states it.
 
 ## Open, and deliberately so

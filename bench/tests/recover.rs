@@ -105,23 +105,18 @@ fn a_row_carries_both_recoveries_for_every_arm() {
         for arm in buffered {
             let lost = one(arm, "unrecovered_batches")
                 .unwrap_or_else(|| panic!("no {workload} unrecovered_batches for {arm}: {got:?}"));
-            // The comparators hand every commit to the kernel, which
-            // outlives the process: a batch gone is a workload that killed
-            // the wrong thing or read the wrong store.
-            if arm != "supdb-ingest" {
-                assert_eq!(lost, 0.0, "{workload}: {arm} lost acknowledged batches");
-            }
-            // The first read is recorded exactly where its key was there.
-            assert_eq!(
+            // Every engine hands every commit to the kernel, which outlives
+            // the process, whatever it left unsynced: a batch gone is an
+            // engine that held acknowledged commits in its own buffers --
+            // supdb's ordered ingest did, up to a megabyte of them -- or a
+            // workload that killed the wrong thing or read the wrong store.
+            assert_eq!(lost, 0.0, "{workload}: {arm} lost acknowledged batches");
+            // The first read is of the last key committed before the kill,
+            // which is there.
+            assert!(
                 one(arm, "first_read_us").is_some(),
-                lost == 0.0,
-                "{workload}: {arm} lost {lost} batches"
+                "{workload}: no first read for {arm}"
             );
-        }
-        // supdb's log is written at every commit, under either policy:
-        // the shuffled load's batches all outlive the process.
-        if workload == "recover-shuffled" {
-            assert_eq!(one("supdb-ingest", "unrecovered_batches"), Some(0.0));
         }
     }
     let _ = std::fs::remove_dir_all(&root);

@@ -610,8 +610,10 @@ of a hundred at a hundred thousand, the same count every rep, and none
 after the shuffled load, which the WAL takes. The durable arm, whose
 every commit syncs the run, held every batch. So a buffered arm's loss
 is a quantity of the row (`unrecovered_batches`) and a durable arm's is
-a failed pass, and `ROADMAP.md` carries the decision the count asks
-for. The rule: a guarantee has more than one axis -- what a machine's
+a failed pass. The engine writes every commit of a run to its file now,
+the quantity reads zero for every arm, and the test of the workload
+holds it there (`tests/recover.rs`); the rows banked before that read
+the count the paragraph gives. The rule: a guarantee has more than one axis -- what a machine's
 crash may take and what a process's may -- and a group is matched on
 each one a user could mean, by a workload that kills something, since
 an axis nobody tested is matched by assumption.

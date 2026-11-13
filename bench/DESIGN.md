@@ -181,16 +181,15 @@ key of the staged batch is there; a store that fails that fails the run,
 since an open that answered fast for a store nobody was promised measured
 nothing. A durable arm holds every batch, or fails the run the same way.
 A buffered arm promised the device nothing, and what a process's death
-costs it is not the same in every engine, so it is a quantity and not an
-assumption: `unrecovered_batches`, the acknowledged batches the opened
-store does not hold, recorded for the buffered arms alone. LMDB without
-its sync and RocksDB without its sync hand every commit to the kernel,
-where it outlives the process; supdb's log is written at every commit
-too, and its ordered ingest, which bypasses the log, writes a run's
-records a write piece at a time, so the commits behind the last whole
-piece are in the writer's memory when it dies. The buffered group is
-matched on what a machine's crash may cost and not on what a process's
-does, and the quantity is where a row says by how much. The first read is
+costs it is a quantity and not an assumption: `unrecovered_batches`, the
+acknowledged batches the opened store does not hold, recorded for the
+buffered arms alone. Every engine of the group hands every commit to the
+kernel, where it outlives the process -- LMDB without its sync, RocksDB
+without its sync, and supdb through its log or, for ordered ingest, the
+run's own file -- so the quantity reads zero in every row, and the row
+that reads anything else is the finding: supdb's ordered ingest wrote a
+run's records a write piece at a time once, and the rows from before it
+wrote every commit read two to eight batches there. The first read is
 recorded only where it found its key, since a miss is not the read the
 hits are.
 
