@@ -21,7 +21,7 @@
 <path d="M341.0,219.8 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="4,2"/>
 <path d="M341.0,216.0 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7,4"/>
 <path d="M341.0,215.0 " fill="none" stroke="#8c8c8c" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="2,3"/>
-<text x="618.0" y="219.0" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="219.0" font-size="11" fill="#8c8c8c">supdb (no compact form)</text>
 <line x1="612.0" y1="216.0" x2="616.0" y2="228.0" stroke="#8c8c8c" stroke-width="0.75"/>
 <text x="618.0" y="232.0" font-size="11" fill="#8c8c8c">RocksDB</text>
 <line x1="612.0" y1="219.8" x2="616.0" y2="241.0" stroke="#8c8c8c" stroke-width="0.75"/>

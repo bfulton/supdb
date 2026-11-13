@@ -55,7 +55,7 @@
 <line x1="612.0" y1="234.1" x2="616.0" y2="287.0" stroke="#2b6cb0" stroke-width="0.75"/>
 <text x="618.0" y="291.0" font-size="11" fill="#2b6cb0">supdb (settle at commit, no forms)</text>
 <line x1="612.0" y1="234.1" x2="616.0" y2="300.0" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="304.0" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="304.0" font-size="11" fill="#8c8c8c">supdb (no compact form)</text>
 <line x1="612.0" y1="234.1" x2="616.0" y2="313.0" stroke="#2b6cb0" stroke-width="0.75"/>
 <text x="618.0" y="317.0" font-size="11" fill="#2b6cb0">supdb (no advice)</text>
 <line x1="612.0" y1="297.0" x2="616.0" y2="326.0" stroke="#8c8c8c" stroke-width="0.75"/>

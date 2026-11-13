@@ -63,12 +63,14 @@ fn style(arm: &str) -> (&'static str, &'static str) {
 fn pretty(arm: &str) -> &'static str {
     match arm {
         "supdb" => "supdb",
+        "supdb-nozpages" => "supdb (no compact form)",
         "supdb-noadvice" => "supdb (no advice)",
         "supdb-nocache" => "supdb (no block cache)",
         "supdb-forms" => "supdb (forms at ingest)",
         "supdb-nosnap" => "supdb (a snapshot per handle)",
         "supdb-settle" => "supdb (settle at commit, no forms)",
         "supdb-cache256" => "supdb (256 MB block cache)",
+        "supdb-cache256tofit" => "supdb (256 MB cache, fitted)",
         "supdb-ingest" => "supdb (buffered)",
         "lmdb" => "LMDB",
         "lmdb-nordahead" => "LMDB (no readahead)",
@@ -735,6 +737,16 @@ fn write_index(out: &Path, written: &[Rendered]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every arm a roster names has its name in a legend: `supdb-nozpages`
+    /// joined both rosters and was drawn as "?" in every figure after.
+    #[test]
+    fn every_roster_arm_has_a_legend_name() {
+        use crate::engines::{ARMS, OOC_ARMS};
+        for arm in ARMS.iter().chain(OOC_ARMS.iter()) {
+            assert_ne!(pretty(arm), "?", "{arm} has no name in a legend");
+        }
+    }
 
     #[test]
     fn power_labels() {

@@ -35,11 +35,11 @@
 <path d="M135.0,209.2 L547.0,308.2 " fill="none" stroke="#8c8c8c" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="2,3"/>
 <path d="M135.0,199.8 L547.0,147.7 " fill="none" stroke="#1b1b1b" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
 <text x="618.0" y="121.2" font-size="11" fill="#2b6cb0">supdb (no block cache)</text>
-<text x="618.0" y="144.6" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="144.6" font-size="11" fill="#8c8c8c">supdb (256 MB cache, fitted)</text>
 <text x="618.0" y="157.6" font-size="11" fill="#1b1b1b">supdb</text>
 <line x1="612.0" y1="151.2" x2="616.0" y2="166.6" stroke="#2b6cb0" stroke-width="0.75"/>
 <text x="618.0" y="170.6" font-size="11" fill="#2b6cb0">supdb (no advice)</text>
-<text x="618.0" y="312.2" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="312.2" font-size="11" fill="#8c8c8c">supdb (no compact form)</text>
 <line x1="612.0" y1="314.1" x2="616.0" y2="321.2" stroke="#8c8c8c" stroke-width="0.75"/>
 <text x="618.0" y="325.2" font-size="11" fill="#8c8c8c">RocksDB (LZ4)</text>
 <line x1="612.0" y1="319.7" x2="616.0" y2="334.2" stroke="#8c8c8c" stroke-width="0.75"/>

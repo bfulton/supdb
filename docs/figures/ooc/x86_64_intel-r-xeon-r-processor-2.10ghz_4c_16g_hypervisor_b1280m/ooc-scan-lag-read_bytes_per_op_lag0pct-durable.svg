@@ -34,7 +34,7 @@
 <path d="M135.0,372.0 L547.0,138.5 " fill="none" stroke="#2b6cb0" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
 <path d="M135.0,372.0 L547.0,133.3 " fill="none" stroke="#8c8c8c" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="2,3"/>
 <path d="M135.0,372.0 L547.0,297.5 " fill="none" stroke="#1b1b1b" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-<text x="618.0" y="137.3" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="137.3" font-size="11" fill="#8c8c8c">supdb (no compact form)</text>
 <line x1="612.0" y1="138.5" x2="616.0" y2="146.3" stroke="#2b6cb0" stroke-width="0.75"/>
 <text x="618.0" y="150.3" font-size="11" fill="#2b6cb0">supdb (no advice)</text>
 <text x="618.0" y="170.4" font-size="11" fill="#8c8c8c">RocksDB</text>
@@ -43,6 +43,6 @@
 <text x="618.0" y="246.4" font-size="11" fill="#8c8c8c">LMDB (no readahead)</text>
 <text x="618.0" y="301.5" font-size="11" fill="#1b1b1b">supdb</text>
 <line x1="612.0" y1="302.4" x2="616.0" y2="310.5" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="314.5" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="314.5" font-size="11" fill="#8c8c8c">supdb (256 MB cache, fitted)</text>
 <text x="618.0" y="327.5" font-size="11" fill="#2b6cb0">supdb (no block cache)</text>
 </svg>

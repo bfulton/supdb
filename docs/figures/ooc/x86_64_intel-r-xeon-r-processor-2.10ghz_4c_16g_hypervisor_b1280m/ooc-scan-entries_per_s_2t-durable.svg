@@ -42,11 +42,11 @@
 <line x1="612.0" y1="285.6" x2="616.0" y2="301.8" stroke="#2b6cb0" stroke-width="0.75"/>
 <text x="618.0" y="305.8" font-size="11" fill="#2b6cb0">supdb (no advice)</text>
 <line x1="612.0" y1="289.5" x2="616.0" y2="314.8" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="318.8" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="318.8" font-size="11" fill="#8c8c8c">supdb (256 MB cache, fitted)</text>
 <line x1="612.0" y1="293.4" x2="616.0" y2="327.8" stroke="#8c8c8c" stroke-width="0.75"/>
 <text x="618.0" y="331.8" font-size="11" fill="#8c8c8c">LMDB (no readahead)</text>
 <line x1="612.0" y1="347.2" x2="616.0" y2="340.9" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="344.9" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="344.9" font-size="11" fill="#8c8c8c">supdb (no compact form)</text>
 <line x1="612.0" y1="363.3" x2="616.0" y2="357.0" stroke="#8c8c8c" stroke-width="0.75"/>
 <text x="618.0" y="361.0" font-size="11" fill="#8c8c8c">RocksDB (LZ4)</text>
 <text x="618.0" y="374.0" font-size="11" fill="#8c8c8c">RocksDB</text>

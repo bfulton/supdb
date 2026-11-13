@@ -29,10 +29,10 @@
 <path d="M341.0,355.9 " fill="none" stroke="#1b1b1b" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
 <text x="618.0" y="103.4" font-size="11" fill="#8c8c8c">RocksDB</text>
 <text x="618.0" y="197.8" font-size="11" fill="#8c8c8c">RocksDB (LZ4)</text>
-<text x="618.0" y="212.8" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="212.8" font-size="11" fill="#8c8c8c">supdb (no compact form)</text>
 <text x="618.0" y="322.0" font-size="11" fill="#8c8c8c">LMDB (no readahead)</text>
 <text x="618.0" y="335.0" font-size="11" fill="#2b6cb0">supdb (no advice)</text>
-<text x="618.0" y="348.0" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="348.0" font-size="11" fill="#8c8c8c">supdb (256 MB cache, fitted)</text>
 <text x="618.0" y="361.0" font-size="11" fill="#1b1b1b">supdb</text>
 <text x="618.0" y="374.0" font-size="11" fill="#2b6cb0">supdb (no block cache)</text>
 </svg>

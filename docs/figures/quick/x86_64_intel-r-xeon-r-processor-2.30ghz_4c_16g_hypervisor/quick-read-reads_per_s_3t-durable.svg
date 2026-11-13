@@ -49,7 +49,7 @@
 <text x="618.0" y="283.0" font-size="11" fill="#1b1b1b">supdb</text>
 <text x="618.0" y="296.0" font-size="11" fill="#2b6cb0">supdb (no advice)</text>
 <line x1="612.0" y1="290.4" x2="616.0" y2="305.0" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="309.0" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="309.0" font-size="11" fill="#8c8c8c">supdb (no compact form)</text>
 <line x1="612.0" y1="290.4" x2="616.0" y2="318.0" stroke="#2b6cb0" stroke-width="0.75"/>
 <text x="618.0" y="322.0" font-size="11" fill="#2b6cb0">supdb (a snapshot per handle)</text>
 <line x1="612.0" y1="291.1" x2="616.0" y2="331.0" stroke="#2b6cb0" stroke-width="0.75"/>

@@ -49,7 +49,7 @@
 <line x1="612.0" y1="190.6" x2="616.0" y2="225.6" stroke="#2b6cb0" stroke-width="0.75"/>
 <text x="618.0" y="229.6" font-size="11" fill="#2b6cb0">supdb (forms at ingest)</text>
 <line x1="612.0" y1="195.5" x2="616.0" y2="238.6" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="242.6" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="242.6" font-size="11" fill="#8c8c8c">supdb (no compact form)</text>
 <line x1="612.0" y1="195.9" x2="616.0" y2="251.6" stroke="#2b6cb0" stroke-width="0.75"/>
 <text x="618.0" y="255.6" font-size="11" fill="#2b6cb0">supdb (no block cache)</text>
 <line x1="612.0" y1="205.1" x2="616.0" y2="264.6" stroke="#2b6cb0" stroke-width="0.75"/>

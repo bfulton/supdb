@@ -36,8 +36,8 @@
 <path d="M135.0,224.7 L547.0,248.3 " fill="none" stroke="#2b6cb0" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
 <path d="M135.0,220.7 L547.0,234.8 " fill="none" stroke="#8c8c8c" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="2,3"/>
 <path d="M135.0,217.3 L547.0,248.0 " fill="none" stroke="#1b1b1b" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-<text x="618.0" y="238.8" font-size="11" fill="#8c8c8c">?</text>
-<text x="618.0" y="251.8" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="238.8" font-size="11" fill="#8c8c8c">supdb (no compact form)</text>
+<text x="618.0" y="251.8" font-size="11" fill="#8c8c8c">supdb (256 MB cache, fitted)</text>
 <line x1="612.0" y1="245.8" x2="616.0" y2="260.8" stroke="#2b6cb0" stroke-width="0.75"/>
 <text x="618.0" y="264.8" font-size="11" fill="#2b6cb0">supdb (no block cache)</text>
 <line x1="612.0" y1="248.0" x2="616.0" y2="273.8" stroke="#1b1b1b" stroke-width="0.75"/>

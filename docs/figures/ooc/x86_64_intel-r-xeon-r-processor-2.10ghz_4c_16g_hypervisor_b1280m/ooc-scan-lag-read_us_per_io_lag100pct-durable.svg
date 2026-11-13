@@ -36,13 +36,13 @@
 <line x1="612.0" y1="325.5" x2="616.0" y2="258.7" stroke="#2b6cb0" stroke-width="0.75"/>
 <text x="618.0" y="262.7" font-size="11" fill="#2b6cb0">supdb (no advice)</text>
 <line x1="612.0" y1="358.8" x2="616.0" y2="292.0" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="296.0" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="296.0" font-size="11" fill="#8c8c8c">supdb (256 MB cache, fitted)</text>
 <line x1="612.0" y1="359.0" x2="616.0" y2="305.0" stroke="#1b1b1b" stroke-width="0.75"/>
 <text x="618.0" y="309.0" font-size="11" fill="#1b1b1b">supdb</text>
 <line x1="612.0" y1="362.0" x2="616.0" y2="318.0" stroke="#2b6cb0" stroke-width="0.75"/>
 <text x="618.0" y="322.0" font-size="11" fill="#2b6cb0">supdb (no block cache)</text>
 <line x1="612.0" y1="370.3" x2="616.0" y2="331.0" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="335.0" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="335.0" font-size="11" fill="#8c8c8c">supdb (no compact form)</text>
 <line x1="612.0" y1="371.3" x2="616.0" y2="344.0" stroke="#8c8c8c" stroke-width="0.75"/>
 <text x="618.0" y="348.0" font-size="11" fill="#8c8c8c">RocksDB</text>
 <line x1="612.0" y1="371.5" x2="616.0" y2="357.0" stroke="#8c8c8c" stroke-width="0.75"/>
