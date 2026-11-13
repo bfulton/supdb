@@ -2341,9 +2341,10 @@ thirty-six pairs at ten, a hundred and three hundred thousand keys, the
 reads and the scans level, where the stream's second shape, written at
 every commit, had read every pass over the segment behind. Two builds
 alternated, each against its comparator in one process, put the price
-on the buffered ordered load: about a twentieth at ten thousand keys,
-where the load is ten commits and each is now a write, and nothing at
-three hundred thousand; and the load's device bytes rise by a page for
+on the buffered ordered load: three to four percent at ten thousand
+keys in two sittings, where the load is ten commits and each is now a
+write, and nothing at a hundred or three hundred thousand, with the
+mixes level; and the load's device bytes rise by a page for
 every sync that lands inside a run -- the writer helper's and the
 drain's -- since the file now ends mid-page where it ended on a write
 piece, and the page a sync catches half full is written again when the
@@ -2382,15 +2383,23 @@ that acknowledges covers every file written before it; and the open
 syncs the log before it names a run's piece. `tests/runlog.rs` builds
 each state a lost page leaves, by stopping a writer with its seals held
 and cutting a file back or taking it away, since no test can pull the
-plug. The rules: a history kept in more than one file is ordered by a
+plug. A directory barrier for a run's temp name went in beside the fix,
+on the engine's own word that a file's sync does not promise the entry
+that names it, and came out again: the durable ordered load at ten
+thousand keys read a thirtieth slower in the before-and-after pairing,
+and `strace -T` put the barrier at a fifth of a millisecond, once a run,
+on a load of ten commits (`ROADMAP.md` has it as the open question it
+is). The rules: a history kept in more than one file is ordered by a
 number every file carries and one durable watermark, so that what stands
 behind a loss is found by arithmetic and not by which files happen to be
 there; a sync that acknowledges is a sync of everything written before
 it, wherever it went, and its test is a count of what it left unsynced on
 every path that writes; a recovery that makes something durable makes
-durable what stands before it first; and a crash a test cannot cause is
+durable what stands before it first; a crash a test cannot cause is
 built, since the kill tests had killed processes for a year and a
-process's death cannot tell `EveryN` from `Always`.
+process's death cannot tell `EveryN` from `Always`; and a barrier added
+beside a fix is a change of its own, priced on the smallest rung, where
+one of anything is a share of the pass.
 
 **A length read off the slab that held the exceptions.** The ordered
 table's write log became the range of its entries, its length the

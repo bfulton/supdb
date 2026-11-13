@@ -159,6 +159,17 @@ What an engine picker would hit, roughly in order.
   `flock` for the store's life, and a second open, from another process or
   this one, fails at once and touches nothing (`tests/db.rs`). Readers in
   other processes are not supported.
+- [ ] **A run's temp name is promised by its file's sync alone.** A run of
+  ordered ingest is acknowledged durable once its file is synced, and
+  nothing syncs the directory for the temp name that file is under: the
+  name rides the journal commit a new file's first sync forces, which
+  ext4 and XFS give and POSIX does not promise. A seal's rotation makes
+  that barrier for its new WAL file. One at each run's first sync costs a
+  fifth of a millisecond here, about a thirtieth of the durable ordered
+  load at ten thousand keys and nothing measurable from a hundred
+  thousand, and was left out for that. A name that did go missing is no
+  longer silent: frames past a run that is not there are a sequence gap,
+  and the open refuses.
 - [ ] **Small buffered bursts pay the filing at their commits.** With the
   forms filed at write time by default (`Options::forms_settle_every`,
   `forms_settle_builds`), the buffered arm's lag bursts at the two

@@ -6379,10 +6379,6 @@ struct Direct {
     /// under a policy that did not sync it, until one that does. A run
     /// that closes so is loose (`Db::loose_runs`).
     unsynced: bool,
-    /// Whether the directory's entry for the temp name is behind a
-    /// barrier: the run's first sync makes it so, since an fdatasync of
-    /// the file does not promise the entry that names it.
-    named: bool,
 }
 
 /// A run of ordered ingest that closed with commits no sync had covered,
@@ -30687,16 +30683,10 @@ impl Db {
     /// has landed is synced again for nothing.
     fn sync_wal(&mut self) -> Result<()> {
         self.wal_dir_barrier()?;
-        let mut names = false;
         while let Some(r) = self.loose_runs.first() {
             r.file.sync_data()?;
             SealCounts::add(&self.shared.seal_counts.loose_synced, 1);
             self.loose_runs.remove(0);
-            names = true;
-        }
-        if names {
-            // The runs' temp names, which no sync of theirs had promised.
-            File::open(&self.dir)?.sync_all()?;
         }
         while let Some(p) = self.loose_wals.first().cloned() {
             match File::open(&p) {
@@ -32590,7 +32580,6 @@ impl Db {
                 pending: std::collections::VecDeque::new(),
                 stream_from: 0,
                 unsynced: false,
-                named: false,
             });
         }
         let mem = self.r.mem().clone();
@@ -32726,11 +32715,15 @@ impl Db {
         Ok(())
     }
 
-    /// The open run's file synced, and the directory's entry for its temp
-    /// name behind a barrier once: what a sync by policy is to the run in
-    /// progress. The name after the file's own sync, whose journal commit
-    /// carries it here; the barrier is what promises it, as a seal's
-    /// rotation promises its new file's (`seal_table`).
+    /// The open run's file synced: what a sync by policy is to the run in
+    /// progress. The file and not the directory: the temp name rides the
+    /// journal commit the sync of a new file forces, as it always has, and
+    /// no barrier of its own promises it. One at each run's first sync was
+    /// tried with the rest of this and taken out again: a fifth of a
+    /// millisecond, a thirtieth of a durable ordered load of ten thousand
+    /// keys, for a name the open now misses loudly -- frames past a run
+    /// that is not there are a sequence gap, and the open refuses
+    /// (`ROADMAP.md`).
     fn sync_run(&mut self) -> Result<()> {
         let Some(d) = self.direct.as_mut() else {
             return Ok(());
@@ -32738,10 +32731,6 @@ impl Db {
         if d.unsynced {
             d.w.sync()?;
             d.unsynced = false;
-        }
-        if !d.named {
-            File::open(&self.dir)?.sync_all()?;
-            d.named = true;
         }
         Ok(())
     }
