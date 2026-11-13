@@ -33,10 +33,11 @@
 use super::zpages::{
     bind32, check_coded_group, check_entry, check_group, cmp_coded_key, coded_first, coded_header,
     coded_key_into, coded_rec, decode_group_more, decode_group_with, decode_record, fill_page,
-    filter_bytes, group_seek, open_group_partly, page_view, parse_page, record_group_seek,
-    seek_group_partly, verify_page_with, view_trusted, walk_group, FenceEntry, FenceSearch, Fill,
-    FillScratch, FillStats, GroupBuf, Images, NoPage, PageView, PartGroup, SegImages, Trailer,
-    ZError, ZFence, PART_STEP, ZCODING_BLOCK, ZGROUP_BYTES, ZMAX_GROUPS, ZNOPAGE, ZPAGE, ZTRAILER,
+    filter_bytes, group_seek, open_group_partly_with, page_view, parse_page, record_group_seek,
+    seek_group_partly_with, verify_page_with, view_trusted, walk_group, Dec, FenceEntry,
+    FenceSearch, Fill, FillScratch, FillStats, GroupBuf, Images, NoPage, PageView, PartGroup,
+    SegImages, Trailer, ZError, ZFence, PART_STEP, ZCODING_BLOCK, ZGROUP_BYTES, ZMAX_GROUPS,
+    ZNOPAGE, ZPAGE, ZTRAILER,
 };
 use crate::blob::{Blob, BlobOptions, ZSource};
 use crate::bytes::{Bytes, MmapBytes};
@@ -825,7 +826,7 @@ impl<'a> ZCursor<'a> {
         }
         let stop = (reads + 1).saturating_mul(ulen) / count;
         let tick = self.zfile.decode_tick();
-        match open_group_partly(view, j, &mut self.buf, stop) {
+        match open_group_partly_with(view, j, &mut self.buf, stop, self.zfile.dec()) {
             Ok(Some(part)) => {
                 self.zfile.count_decode(tick);
                 if self.zfile.memo {
@@ -1768,7 +1769,7 @@ pub(super) fn first_decode<'a>(
     entry: &FenceEntry<'_>,
     j: usize,
     buf: &'a mut GroupBuf,
-    own: bool,
+    own: Dec,
 ) -> std::result::Result<Open<'a>, Fail> {
     let view = first_checks(page, bind, entry, Some(j), own)?;
     let g = view
@@ -1795,7 +1796,7 @@ pub(super) fn first_checks<'a>(
     bind: u32,
     entry: &FenceEntry<'_>,
     except: Option<usize>,
-    own: bool,
+    own: Dec,
 ) -> std::result::Result<PageView<'a>, Fail> {
     let view = parse_page(page, bind)?;
     check_entry(&view, entry)?;
@@ -1828,7 +1829,7 @@ pub(super) fn verified_group<'a>(
     buf: &'a mut GroupBuf,
 ) -> std::result::Result<Open<'a>, Fail> {
     let view = page_view(page)?;
-    verified_group_in(&view, j, buf, false)
+    verified_group_in(&view, j, buf, Dec::Flex)
 }
 
 /// `verified_group` over a view the caller took of the page: the group the
@@ -1837,7 +1838,7 @@ pub(super) fn verified_group_in<'a>(
     view: &PageView<'a>,
     j: usize,
     buf: &'a mut GroupBuf,
-    own: bool,
+    own: Dec,
 ) -> std::result::Result<Open<'a>, Fail> {
     let g = view
         .group(j)
@@ -2637,6 +2638,9 @@ pub(super) struct ZFile {
     /// (`Options::zpages_own_decoder`), set by the store after the attach
     /// as `inplace` is; `lz4_flex`'s where not.
     pub(super) own_decoder: bool,
+    /// The engine's own decoder runs its flat loop ahead of its fast one
+    /// (`Options::zpages_flat_decode`), set beside `own_decoder`.
+    pub(super) flat_decoder: bool,
     /// One bit per page: the first-decode checks passed in this process,
     /// over every group of it.
     verified: Box<[AtomicU64]>,
@@ -2827,6 +2831,7 @@ impl ZFile {
             n_pages,
             bind,
             own_decoder: false,
+            flat_decoder: false,
             verified: (0..n_pages.div_ceil(64))
                 .map(|_| AtomicU64::new(0))
                 .collect(),
@@ -3053,7 +3058,7 @@ impl ZFile {
             if let Some(payload) = view.payload(j) {
                 if raw_tail_group(payload, usize::from(g.count)) {
                     if !was_verified {
-                        match first_checks(page, self.bind, entry, None, self.own_decoder) {
+                        match first_checks(page, self.bind, entry, None, self.dec()) {
                             Ok(_) => set_bit(&self.verified, p),
                             Err(Fail::Misaligned) => return None,
                             Err(Fail::Check(_)) => {
@@ -3113,9 +3118,9 @@ impl ZFile {
                 let tick = self.decode_tick();
                 let (first, count, ulen) = {
                     let opened = if was_verified {
-                        verified_group_in(view, j, &mut fresh, self.own_decoder)
+                        verified_group_in(view, j, &mut fresh, self.dec())
                     } else {
-                        first_decode(page, self.bind, entry, j, &mut fresh, self.own_decoder)
+                        first_decode(page, self.bind, entry, j, &mut fresh, self.dec())
                     };
                     match opened {
                         Ok((g, first, count, _)) => (first, count, g.len()),
@@ -3146,9 +3151,9 @@ impl ZFile {
         }
         let tick = self.decode_tick();
         let opened = if was_verified {
-            verified_group_in(view, j, buf, self.own_decoder)
+            verified_group_in(view, j, buf, self.dec())
         } else {
-            first_decode(page, self.bind, entry, j, buf, self.own_decoder)
+            first_decode(page, self.bind, entry, j, buf, self.dec())
         };
         match opened {
             Ok((g, first, count, decoded)) => {
@@ -3372,7 +3377,7 @@ impl ZFile {
                     self.fail(p);
                     return Locate::Fallback;
                 };
-                match first_checks(page, self.bind, &entry, None, self.own_decoder) {
+                match first_checks(page, self.bind, &entry, None, self.dec()) {
                     Ok(_) => set_bit(&self.verified, p),
                     Err(Fail::Misaligned) => return Locate::Fallback,
                     Err(Fail::Check(_)) => {
@@ -3435,7 +3440,7 @@ impl ZFile {
                 && !memo.admit(self.id, entry.page, index)
             {
                 let tick = self.decode_tick();
-                match seek_group_partly(&view, j, buf, key) {
+                match seek_group_partly_with(&view, j, buf, key, self.dec()) {
                     Ok(Some(s)) => {
                         memo.touch(self.id, entry.page, self.n_pages);
                         self.count_decode(tick);
@@ -3874,7 +3879,7 @@ impl ZFile {
         }
         let stop = (reads + 1).saturating_mul(ulen) / count;
         let tick = self.decode_tick();
-        let mut part = match open_group_partly(view, j, buf, stop) {
+        let mut part = match open_group_partly_with(view, j, buf, stop, self.dec()) {
             Ok(Some(part)) => part,
             Ok(None) => return Ok(PartWalk::Declined),
             Err(_) => {
@@ -4142,7 +4147,7 @@ impl ZFile {
             ) {
                 memo.touch(self.id, entry.page, self.n_pages);
                 if !bit(&self.verified, p) {
-                    match first_checks(page, self.bind, &entry, None, self.own_decoder) {
+                    match first_checks(page, self.bind, &entry, None, self.dec()) {
                         Ok(_) => set_bit(&self.verified, p),
                         Err(Fail::Misaligned) => return ZSeek::Fallback,
                         Err(Fail::Check(_)) => {
@@ -4319,6 +4324,11 @@ impl ZFile {
     /// A group's decode begun: whether it is the one in sixteen this
     /// thread counts (`ZFile::decodes16`), with its start where this form
     /// file times the decodes it counts (`ZFile::time_decodes`).
+    /// The decoder this file's block-coded groups are decoded by.
+    fn dec(&self) -> Dec {
+        Dec::of(self.own_decoder, self.flat_decoder)
+    }
+
     fn decode_tick(&self) -> (bool, Option<std::time::Instant>) {
         thread_local! {
             static TICK: Cell<u32> = const { Cell::new(0) };
@@ -7464,7 +7474,8 @@ mod tests {
         let (aligned, at) = page_at(&page, 0);
         let p = &aligned[at..at + ZPAGE];
         assert_eq!(p.as_ptr() as usize % 8, 0);
-        let (group, _, count, decoded) = first_decode(p, bind, &entry, 0, &mut buf, false).unwrap();
+        let (group, _, count, decoded) =
+            first_decode(p, bind, &entry, 0, &mut buf, Dec::Flex).unwrap();
         assert!(!decoded && count == usize::from(h.count));
         assert!(group_seek(group, count, &key0).unwrap().found);
         let (group, _, count, decoded) = verified_group(p, 0, &mut buf).unwrap();
@@ -7478,7 +7489,7 @@ mod tests {
             let p = &backing[at..at + ZPAGE];
             assert_ne!((p.as_ptr() as usize + ZHDR) % 4, 0, "skew {skew}");
             assert_eq!(
-                first_decode(p, bind, &entry, 0, &mut buf, false).unwrap_err(),
+                first_decode(p, bind, &entry, 0, &mut buf, Dec::Flex).unwrap_err(),
                 Fail::Misaligned,
                 "skew {skew}"
             );

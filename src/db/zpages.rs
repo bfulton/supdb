@@ -839,17 +839,60 @@ pub fn decode_group<'a>(
     decode_group_with(view, j, buf, false)
 }
 
-/// [`decode_group`] with the block coding's groups decoded by the engine's
-/// own decoder where `own` (`Options::zpages_own_decoder`, `super::zlz4`)
-/// and by `lz4_flex` where not: the same bytes from every block either
+/// The LZ4 decoder a block-coded group is decoded by: `lz4_flex`'s, the
+/// engine's own fast loop (`Options::zpages_own_decoder`), or the engine's
+/// own with its flat loop ahead of the fast one
+/// (`Options::zpages_flat_decode`, `zlz4::decompress_in_flat`). The same
+/// bytes from every block and the same refusals of every damage, from all
+/// three. A `bool` is the choice before the flat loop: the engine's own
+/// decoder or `lz4_flex`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Dec {
+    #[default]
+    Flex,
+    Own,
+    Flat,
+}
+
+impl Dec {
+    /// The decoder the two options name: `lz4_flex` without the engine's
+    /// own, and the flat loop only with it.
+    pub fn of(own: bool, flat: bool) -> Dec {
+        match (own, flat) {
+            (false, _) => Dec::Flex,
+            (true, false) => Dec::Own,
+            (true, true) => Dec::Flat,
+        }
+    }
+
+    /// Whether the engine's own decoder is this one, flat or not.
+    pub fn own(self) -> bool {
+        self != Dec::Flex
+    }
+
+    /// Whether the flat loop runs.
+    pub fn flat(self) -> bool {
+        self == Dec::Flat
+    }
+}
+
+impl From<bool> for Dec {
+    fn from(own: bool) -> Dec {
+        Dec::of(own, false)
+    }
+}
+
+/// [`decode_group`] with the block coding's groups decoded by the decoder
+/// `dec` names (`Dec`): the same bytes from every block either encoder
 /// writes, and the same refusals of every damage the page's checks let
 /// through.
 pub fn decode_group_with<'a>(
     view: &PageView<'a>,
     j: usize,
     buf: &'a mut GroupBuf,
-    own: bool,
+    dec: impl Into<Dec>,
 ) -> Result<&'a [u8], ZError> {
+    let dec = dec.into();
     let g = view
         .group(j)
         .ok_or(ZError::Header("no such group in the page"))?;
@@ -871,7 +914,7 @@ pub fn decode_group_with<'a>(
     if g.coded {
         return decode_record_group(payload, usize::from(g.count), ulen, buf);
     }
-    if own {
+    if dec.own() {
         // The engine's own decoder, into the group's bytes and the slack
         // its fast loop runs to the end in (`zlz4::DECODE_SLACK`), as much
         // of it as the buffer's whole pages hold past the group. A
@@ -881,7 +924,12 @@ pub fn decode_group_with<'a>(
         // refusals either decoder gives.
         let (rest, len) = view.payload_and_rest(j).ok_or(ZError::Length)?;
         let out = buf.bytes_with_slack(ulen, super::zlz4::DECODE_SLACK);
-        let n = super::zlz4::decompress_in(rest, len, out).map_err(|_| ZError::Decode)?;
+        let n = if dec.flat() {
+            super::zlz4::decompress_in_flat(rest, len, out)
+        } else {
+            super::zlz4::decompress_in(rest, len, out)
+        }
+        .map_err(|_| ZError::Decode)?;
         if n > ulen {
             return Err(ZError::Decode);
         }
@@ -915,6 +963,8 @@ pub struct PartGroup<'a> {
     rest: &'a [u8],
     len: usize,
     ulen: usize,
+    /// The flat loop runs (`Dec::Flat`).
+    flat: bool,
 }
 
 impl PartGroup<'_> {
@@ -955,6 +1005,17 @@ pub fn open_group_partly<'a>(
     buf: &mut GroupBuf,
     stop: usize,
 ) -> Result<Option<PartGroup<'a>>, ZError> {
+    open_group_partly_with(view, j, buf, stop, Dec::Own)
+}
+
+/// [`open_group_partly`] with the flat loop where `dec` names it.
+pub fn open_group_partly_with<'a>(
+    view: &PageView<'a>,
+    j: usize,
+    buf: &mut GroupBuf,
+    stop: usize,
+    dec: Dec,
+) -> Result<Option<PartGroup<'a>>, ZError> {
     let g = view
         .group(j)
         .ok_or(ZError::Header("no such group in the page"))?;
@@ -973,6 +1034,7 @@ pub fn open_group_partly<'a>(
         rest,
         len,
         ulen,
+        flat: dec.flat(),
     };
     decode_group_more(&mut part, buf, stop)?;
     Ok(Some(part))
@@ -994,8 +1056,12 @@ pub fn decode_group_more(
     }
     let out = buf.bytes_with_slack(part.ulen, super::zlz4::DECODE_SLACK);
     let stop = stop.max(part.st.op);
-    super::zlz4::decompress_more(part.rest, part.len, out, &mut part.st, stop)
-        .map_err(|_| ZError::Decode)?;
+    if part.flat {
+        super::zlz4::decompress_more_flat(part.rest, part.len, out, &mut part.st, stop)
+    } else {
+        super::zlz4::decompress_more(part.rest, part.len, out, &mut part.st, stop)
+    }
+    .map_err(|_| ZError::Decode)?;
     if part.st.op > part.ulen {
         return Err(ZError::Decode);
     }
@@ -1047,6 +1113,17 @@ pub fn seek_group_partly(
     buf: &mut GroupBuf,
     key: &[u8],
 ) -> Result<Option<PartSeek>, ZError> {
+    seek_group_partly_with(view, j, buf, key, Dec::Own)
+}
+
+/// [`seek_group_partly`] with the flat loop where `dec` names it.
+pub fn seek_group_partly_with(
+    view: &PageView<'_>,
+    j: usize,
+    buf: &mut GroupBuf,
+    key: &[u8],
+    dec: Dec,
+) -> Result<Option<PartSeek>, ZError> {
     const CUT: ZError = ZError::Walk("a record does not parse");
     let g = view
         .group(j)
@@ -1077,8 +1154,12 @@ pub fn seek_group_partly(
                 return Err(CUT);
             }
             let stop = st.op.max(off) + PART_STEP;
-            super::zlz4::decompress_more(rest, len, out, &mut st, stop)
-                .map_err(|_| ZError::Decode)?;
+            if dec.flat() {
+                super::zlz4::decompress_more_flat(rest, len, out, &mut st, stop)
+            } else {
+                super::zlz4::decompress_more(rest, len, out, &mut st, stop)
+            }
+            .map_err(|_| ZError::Decode)?;
             if st.op > ulen {
                 return Err(ZError::Decode);
             }
@@ -7636,6 +7717,74 @@ mod tests {
     }
 
     // ---- a group sought a part at a time ----------------------------------
+
+    /// The suite's records in pages as a builder fills them, decoded by the
+    /// flat loop (`Dec::Flat`) whole, a part at a time and sought a part at
+    /// a time: every byte, length, offset and stop the fast loop's
+    /// (`Dec::Own`) gives the same calls.
+    #[test]
+    fn a_group_decoded_by_the_flat_loop_is_the_fast_loops_whole_in_parts_and_sought() {
+        let images = suite_images(3000, 29);
+        let bind = 11;
+        let mut s = FillScratch::new();
+        let (mut rank, mut pages) = (0usize, Vec::new());
+        while rank < images.len() {
+            let mut page = [0u8; ZPAGE];
+            match fill_page(&images, rank, bind, &mut s, &mut page) {
+                Fill::Page(g) => {
+                    pages.push((rank, page));
+                    rank += g.count;
+                }
+                other => panic!("rank {rank}: {other:?}"),
+            }
+        }
+        let (mut fast, mut flat) = (GroupBuf::new(), GroupBuf::new());
+        let (mut fast_part, mut flat_part) = (GroupBuf::new(), GroupBuf::new());
+        let mut groups = 0usize;
+        for (first, page) in &pages {
+            let v = parse_page(page, bind).unwrap();
+            let mut at = *first;
+            for j in 0..v.groups() {
+                let count = usize::from(v.group(j).unwrap().count);
+                let g = decode_group_with(&v, j, &mut fast, Dec::Own)
+                    .unwrap()
+                    .to_vec();
+                let f = decode_group_with(&v, j, &mut flat, Dec::Flat).unwrap();
+                assert!(f == &g[..], "page at {first}, group {j}: the whole decode");
+                for probe in [
+                    format!("{at:016}").into_bytes(),
+                    format!("{:016}", at + count / 2).into_bytes(),
+                    format!("{:016}x", at + count - 1).into_bytes(),
+                    b"z".to_vec(),
+                ] {
+                    let a = seek_group_partly_with(&v, j, &mut fast_part, &probe, Dec::Own)
+                        .unwrap()
+                        .unwrap();
+                    let b = seek_group_partly_with(&v, j, &mut flat_part, &probe, Dec::Flat)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!((a.off, a.len, a.of), (b.off, b.len, b.of), "a seek");
+                    assert!(flat_part.bytes(b.len) == &g[..b.len], "the seek's prefix");
+                }
+                for step in [1usize, 64, 300] {
+                    let mut p = open_group_partly_with(&v, j, &mut flat_part, 0, Dec::Flat)
+                        .unwrap()
+                        .expect("a block-coded group");
+                    let mut before = p.have();
+                    while !p.done() {
+                        let got = decode_group_more(&mut p, &mut flat_part, before + step).unwrap();
+                        assert!(got > before || p.done(), "a call goes on");
+                        assert!(flat_part.bytes(got) == &g[..got], "step {step}: a prefix");
+                        before = got;
+                    }
+                    assert_eq!(p.have(), g.len());
+                }
+                at += count;
+                groups += 1;
+            }
+        }
+        assert!(groups > 20, "{groups} groups");
+    }
 
     /// The suite's records in pages as a builder fills them, every group one
     /// LZ4 block: each key of a group, a key just past it and one above the

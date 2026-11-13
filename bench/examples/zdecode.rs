@@ -52,7 +52,7 @@
 //! group beside it. The summary counts the sequences a group's payload
 //! holds, the tokens a decoder parses, whichever encoder wrote it.
 //!
-//!     cargo run --release --features lz4-c --example zdecode -- [--size N] [--rounds N] [--split k,...] [--pages N] [--count flex|c] [--hc LEVEL] [--rhc ATTEMPTS:SEQCOST:SKIP]
+//!     cargo run --release --features lz4-c --example zdecode -- [--size N] [--rounds N] [--split k,...] [--pages N] [--count flex|c] [--hc LEVEL] [--rhc ATTEMPTS:SEQCOST:SKIP[:LAZY[:SPARSE[:GREEDY]]]]
 use std::hint::black_box;
 use std::path::Path;
 use std::time::Instant;
@@ -183,6 +183,79 @@ fn ours_paged(p: &Page, out: &mut [u8]) -> usize {
         &mut out[..p.ulen + supdb::db::zlz4::DECODE_SLACK],
     )
     .expect("the engine's own decoder")
+}
+
+/// The engine's own decoder with its flat loop (`zlz4::decompress_in_flat`),
+/// called as the engine calls it.
+#[inline(always)]
+fn ours_flat_on(isa: supdb::db::zlz4::FlatIsa, p: &Page, out: &mut [u8]) -> usize {
+    supdb::db::zlz4::decompress_in_flat_on(
+        isa,
+        &p.padded,
+        p.payload.len(),
+        &mut out[..p.ulen + supdb::db::zlz4::DECODE_SLACK],
+    )
+    .expect("the engine's own decoder, flat")
+}
+
+fn ours_flat(p: &Page, out: &mut [u8]) -> usize {
+    ours_flat_on(supdb::db::zlz4::FlatIsa::Base, p, out)
+}
+
+fn ours_flat2(p: &Page, out: &mut [u8]) -> usize {
+    ours_flat_on(supdb::db::zlz4::FlatIsa::Avx2, p, out)
+}
+
+fn ours_flat5(p: &Page, out: &mut [u8]) -> usize {
+    ours_flat_on(supdb::db::zlz4::FlatIsa::Avx512, p, out)
+}
+
+#[inline(never)]
+fn decode_all_flat(isa: supdb::db::zlz4::FlatIsa, pages: &[Page], out: &mut [u8]) -> usize {
+    let mut n = 0;
+    for p in pages {
+        n += ours_flat_on(isa, black_box(p), out);
+    }
+    black_box(n)
+}
+
+/// A group's input lines read in, as the engine's ask ahead of a group's
+/// open brings them: the branches cold and the bytes in cache.
+#[inline(always)]
+fn touch(p: &Page) -> u64 {
+    let b = &p.padded[..p.payload.len()];
+    let mut x = 0u64;
+    let mut i = 0;
+    while i < b.len() {
+        x = x.wrapping_add(u64::from(b[i]));
+        i += 64;
+    }
+    x
+}
+
+#[inline(never)]
+fn touch_all(pages: &[Page]) -> u64 {
+    let mut x = 0;
+    for p in pages {
+        x += touch(black_box(p));
+    }
+    black_box(x)
+}
+
+/// Every page once, its input touched first, through the paged fast loop
+/// (`flat` none) or the flat loop.
+#[inline(never)]
+fn decode_all_touched(flat: bool, pages: &[Page], out: &mut [u8]) -> usize {
+    let mut n = 0;
+    for p in pages {
+        black_box(touch(black_box(p)));
+        n += if flat {
+            ours_flat(black_box(p), out)
+        } else {
+            ours_paged(black_box(p), out)
+        };
+    }
+    black_box(n)
 }
 
 /// Every page once through the engine's own decoder, exact and paged.
@@ -455,7 +528,7 @@ fn main() {
     let mut ks: Vec<usize> = vec![1, 2, 4, 8, 16];
     let mut split_given = false;
     let mut hc: Option<i32> = None;
-    let mut rhc: Option<(u32, u32, u32, u32, bool)> = None;
+    let mut rhc: Option<(u32, u32, u32, u32, bool, bool)> = None;
     let mut first: Option<usize> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -469,11 +542,11 @@ fn main() {
             "--pages" => first = Some(val("a count").parse().expect("a count")),
             "--hc" => hc = Some(val("a level").parse().expect("a level")),
             "--rhc" => {
-                let v = val("ATTEMPTS:SEQCOST:SKIP[:LAZY[:SPARSE]]");
+                let v = val("ATTEMPTS:SEQCOST:SKIP[:LAZY[:SPARSE[:GREEDY]]]");
                 let f: Vec<u32> = v.split(':').map(|x| x.parse().expect("a count")).collect();
                 assert!(
-                    (3..=5).contains(&f.len()),
-                    "ATTEMPTS:SEQCOST:SKIP[:LAZY[:SPARSE]]"
+                    (3..=6).contains(&f.len()),
+                    "ATTEMPTS:SEQCOST:SKIP[:LAZY[:SPARSE[:GREEDY]]]"
                 );
                 rhc = Some((
                     f[0],
@@ -481,6 +554,7 @@ fn main() {
                     f[2],
                     f.get(3).copied().unwrap_or(0),
                     f.get(4).is_some_and(|&x| x != 0),
+                    f.get(5).is_some_and(|&x| x != 0),
                 ));
             }
             "--split" => {
@@ -562,7 +636,7 @@ fn main() {
             ks.clear();
         }
     }
-    if let Some((attempts, seq_cost, skip_min, lazy, sparse)) = rhc {
+    if let Some((attempts, seq_cost, skip_min, lazy, sparse, greedy)) = rhc {
         // The same recompression with the engine's own encoder, timed a
         // group: the decode into the scratch first, outside the clock.
         let before: usize = pages.iter().map(|p| p.payload.len()).sum();
@@ -576,6 +650,7 @@ fn main() {
             skip_min,
             lazy,
             sparse,
+            greedy,
         };
         let mut enc_ns = 0u128;
         let mut flex_ns = 0u128;
@@ -599,8 +674,9 @@ fn main() {
         }
         let after: usize = pages.iter().map(|p| p.payload.len()).sum();
         println!(
-            "rhc {attempts}:{seq_cost}:{skip_min}:{lazy}:{}: {} compressed bytes recompressed to {} ({:.3} of the engine's), {:.2} us a group to encode, lz4_flex {:.2}",
+            "rhc {attempts}:{seq_cost}:{skip_min}:{lazy}:{}:{}: {} compressed bytes recompressed to {} ({:.3} of the engine's), {:.2} us a group to encode, lz4_flex {:.2}",
             u8::from(sparse),
+            u8::from(greedy),
             before,
             after,
             after as f64 / before as f64,
@@ -715,6 +791,9 @@ fn main() {
             ours as fn(&Page, &mut [u8]) -> usize,
             ours_roomy,
             ours_paged,
+            ours_flat,
+            ours_flat2,
+            ours_flat5,
         ] {
             assert_eq!(
                 dec(p, &mut b),
@@ -735,7 +814,8 @@ fn main() {
             "c" => decode_all_c(&pages, &mut a),
             "ours" => decode_all_ours(&pages, &mut a),
             "paged" => decode_all_roomy(&pages, &mut a),
-            other => panic!("--count takes flex, c, ours or paged, not {other}"),
+            "flat" => decode_all_flat(supdb::db::zlz4::flat_isa(), &pages, &mut a),
+            other => panic!("--count takes flex, c, ours, paged or flat, not {other}"),
         };
         println!(
             "counted {which}: {n} bytes decoded over {} groups",
@@ -748,22 +828,65 @@ fn main() {
     // each round.
     let (mut cyc_f, mut cyc_c) = (Vec::new(), Vec::new());
     let (mut cyc_o, mut cyc_r) = (Vec::new(), Vec::new());
+    let (mut cyc_flat, mut cyc_flat2, mut cyc_flat5) = (Vec::new(), Vec::new(), Vec::new());
     for r in 0..rounds {
-        // The four decoders in an order rotated a place each round.
-        for k in 0..4 {
-            let which = (k + r) % 4;
+        // The seven decoders in an order rotated a place each round.
+        for k in 0..7 {
+            let which = (k + r) % 7;
             let t = Instant::now();
+            use supdb::db::zlz4::FlatIsa;
             let n = match which {
                 0 => decode_all_flex(&pages, &mut a),
                 1 => decode_all_c(&pages, &mut a),
                 2 => decode_all_ours(&pages, &mut a),
-                _ => decode_all_roomy(&pages, &mut a),
+                3 => decode_all_roomy(&pages, &mut a),
+                4 => decode_all_flat(FlatIsa::Base, &pages, &mut a),
+                5 => decode_all_flat(FlatIsa::Avx2, &pages, &mut a),
+                _ => decode_all_flat(FlatIsa::Avx512, &pages, &mut a),
             };
             let d = t.elapsed().as_nanos() as f64 / pages.len() as f64;
             assert_eq!(n, total_u);
-            [&mut cyc_f, &mut cyc_c, &mut cyc_o, &mut cyc_r][which].push(d);
+            [
+                &mut cyc_f,
+                &mut cyc_c,
+                &mut cyc_o,
+                &mut cyc_r,
+                &mut cyc_flat,
+                &mut cyc_flat2,
+                &mut cyc_flat5,
+            ][which]
+                .push(d);
         }
     }
+    // Cold branches over warm input: each group's lines read in before its
+    // decode, the read timed alone and taken off.
+    let (mut tch, mut tfast, mut tflat) = (Vec::new(), Vec::new(), Vec::new());
+    for r in 0..rounds {
+        for k in 0..3 {
+            let which = (k + r) % 3;
+            let t = Instant::now();
+            match which {
+                0 => {
+                    touch_all(&pages);
+                }
+                1 => {
+                    assert_eq!(decode_all_touched(false, &pages, &mut a), total_u);
+                }
+                _ => {
+                    assert_eq!(decode_all_touched(true, &pages, &mut a), total_u);
+                }
+            }
+            let d = t.elapsed().as_nanos() as f64 / pages.len() as f64;
+            [&mut tch, &mut tfast, &mut tflat][which].push(d);
+        }
+    }
+    let (mt, mtf, mtl) = (median(&mut tch), median(&mut tfast), median(&mut tflat));
+    println!(
+        "warm input, cold branches: the touch {mt:.0} ns a group; the paged fast loop {:.0} ns after it, the flat loop {:.0} ({:.2})",
+        mtf - mt,
+        mtl - mt,
+        (mtl - mt) / (mtf - mt)
+    );
     // Hot: a few pages spread over the file, each decoded many times on
     // its own; the median over the pages of the median over the rounds.
     let picks: Vec<usize> = (0..16).map(|i| i * pages.len() / 16).collect();
@@ -789,9 +912,27 @@ fn main() {
     let hot_c2 = hot(&c, &mut a);
     let hot_o = hot(&ours, &mut a);
     let hot_r = hot(&ours_paged, &mut a);
+    let hot_flat = hot(&ours_flat, &mut a);
+    let hot_flat2 = hot(&ours_flat2, &mut a);
+    let hot_flat5 = hot(&ours_flat5, &mut a);
     let bytes = total_u as f64 / pages.len() as f64;
     let (mf, mc) = (median(&mut cyc_f), median(&mut cyc_c));
     let (mo, mr) = (median(&mut cyc_o), median(&mut cyc_r));
+    for (name, cyc, h) in [
+        ("base", &mut cyc_flat, hot_flat),
+        ("avx2", &mut cyc_flat2, hot_flat2),
+        ("avx512", &mut cyc_flat5, hot_flat5),
+    ] {
+        let m = median(cyc);
+        println!(
+            "cycle, the flat loop ({name}): {:.0} ns a group ({:.2} of the paged fast loop, {:.2} of liblz4); hot {:.0} ({:.2} of the paged)",
+            m,
+            m / mr,
+            m / mc,
+            h,
+            h / hot_r
+        );
+    }
     println!(
         "cycle, the engine's own decoder: exact {:.0} ns a group ({:.2} of lz4_flex, {:.2} of liblz4), paged {:.0} ({:.2}, {:.2}); hot exact {:.0}, paged {:.0}",
         mo,

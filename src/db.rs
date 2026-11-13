@@ -2090,6 +2090,27 @@ pub struct Options {
     /// encoder's 2. The record coding's tails keep `lz4_flex`.
     #[doc(hidden)]
     pub zpages_parse: bool,
+    /// EXPERIMENT: under `zpages_parse`, the form files a merge's outputs
+    /// are given at their finish (`zpages_build_at_finish`) written by the
+    /// parsing encoder as well. Off, those builds keep the greedy encoder
+    /// and the parse is the controller's builds' alone -- the builds ahead
+    /// and the bought builds, which carry the load's partitions -- since
+    /// the finish's builds are on the merge chain's path, and the chain
+    /// draining a full rewrite under a bound is what paid the parse's
+    /// encoder in the lag sweep (`zpages_parse`). On, the parse as it was
+    /// priced; `supdb-zparse` sets it, `supdb-zparsestart` does not. Paired
+    /// at ten million keys under 1.25 GiB, `supdb-zparsestart` against
+    /// `supdb` in both orders read the scan passes 1.12-1.16x, the threaded
+    /// scans beside the mixes 1.09-1.18x and C 1.07-1.09x, and the lag
+    /// sweep's weighted passes no worse (0.93 and 0.78 of the time); and the
+    /// single-threaded read pass 0.89-0.94x with four times the major
+    /// faults, since at the encoder's price the builds ahead trail the load
+    /// and the install comes after the read pass has begun (`pair.sh supdb
+    /// supdb-zparsestart 10000000 --bound 1342177280 --passes
+    /// load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
+    /// --ops-div 10 --reps 2`, and `--passes load,lag`).
+    #[doc(hidden)]
+    pub zpages_parse_finish: bool,
     /// The form's block-coded groups decoded by the engine's own LZ4 decoder
     /// (`db::zlz4::decompress_in`) and not `lz4_flex`'s: the same bytes for
     /// every block, by liblz4's fast loop in Rust -- a run of fewer than
@@ -2108,6 +2129,25 @@ pub struct Options {
     /// `supdb-cache64tofitzpagesdropflexdec` are the arms with it off.
     #[doc(hidden)]
     pub zpages_own_decoder: bool,
+    /// EXPERIMENT: the engine's own decoder (`zpages_own_decoder`) runs
+    /// its flat loop ahead of its fast one wherever a group is followed by
+    /// the rest of its page (`zlz4::decompress_in_flat`): a sequence a turn
+    /// with no branch on its lengths -- the one length byte a run or a
+    /// match of fifteen or more carries read whether or not the token asks
+    /// for it and taken by a select, the run one move of sixty-four and
+    /// the match two of thirty-two -- and a sequence outside that shape
+    /// one turn of the fast loop. The fast loop's tests of a run under
+    /// fifteen, a match under nineteen and one over thirty-two are a coin
+    /// a sequence on the form's records, and a group the predictor has not
+    /// seen pays a miss for most of them: on the form's own groups the
+    /// flat loop decodes a cold group in 0.72-0.78 of the fast loop's time
+    /// and a hot one in 1.15-1.35 of it, since its turn's chain is longer
+    /// than a predicted turn's (`bench/examples/zdecode.rs`, the `flat
+    /// loop` and `warm input` lines). A group decoded in the engine is one
+    /// the memo did not hold, cold for the predictor. The same bytes and
+    /// the same refusals as the fast loop for every input.
+    #[doc(hidden)]
+    pub zpages_flat_decode: bool,
     /// EXPERIMENT: the allocator trimmed once (`malloc_trim`) at the end of
     /// `zpages_settle`, after every partition has its form file: what the
     /// builds' threads and the load left free in their arenas is given back
@@ -5249,7 +5289,9 @@ impl Default for Options {
             zpages_store_all: false,
             zpages_raw_tails: false,
             zpages_parse: false,
+            zpages_parse_finish: true,
             zpages_own_decoder: true,
+            zpages_flat_decode: false,
             zpages_trim_install: false,
             upkeep_trim_look: false,
             trim_by_resident: false,
@@ -30636,7 +30678,7 @@ impl Db {
                         opts.zpages_inplace_walk,
                         opts.zpages_drop_raw,
                         opts.z_times_decodes(),
-                        opts.zpages_own_decoder,
+                        zpages::Dec::of(opts.zpages_own_decoder, opts.zpages_flat_decode),
                         opts.zpages_cursor_view,
                         opts.zpages_group_ahead,
                         opts.zpages_walk_owns_decodes,
@@ -34384,7 +34426,7 @@ impl Db {
             bool,
             bool,
             bool,
-            bool,
+            zpages::Dec,
             bool,
             bool,
             bool,
@@ -34410,7 +34452,8 @@ impl Db {
             Ok(mut side) => {
                 side.inplace = lines.2;
                 side.time_decodes = lines.4;
-                side.own_decoder = lines.5;
+                side.own_decoder = lines.5.own();
+                side.flat_decoder = lines.5.flat();
                 side.cursor_view = lines.6;
                 side.group_ahead = lines.7;
                 side.walk_owns = lines.8;
@@ -34471,7 +34514,7 @@ impl Db {
                     self.opts.zpages_inplace_walk,
                     z_drop_now(&self.opts, &self.shared),
                     self.opts.z_times_decodes(),
-                    self.opts.zpages_own_decoder,
+                    zpages::Dec::of(self.opts.zpages_own_decoder, self.opts.zpages_flat_decode),
                     self.opts.zpages_cursor_view,
                     self.opts.zpages_group_ahead,
                     self.opts.zpages_walk_owns_decodes,
@@ -34522,6 +34565,7 @@ impl Db {
                         side.inplace = self.opts.zpages_inplace_walk;
                         side.time_decodes = self.opts.z_times_decodes();
                         side.own_decoder = self.opts.zpages_own_decoder;
+                        side.flat_decoder = self.opts.zpages_flat_decode;
                         side.cursor_view = self.opts.zpages_cursor_view;
                         side.group_ahead = self.opts.zpages_group_ahead;
                         side.walk_owns = self.opts.zpages_walk_owns_decodes;
@@ -45225,7 +45269,7 @@ impl Maint {
         plan.coding = coding;
         plan.store_all = self.opts.zpages_store_all;
         plan.raw_tails = raw_tails;
-        plan.parse = self.opts.zpages_parse;
+        plan.parse = self.opts.zpages_parse && self.opts.zpages_parse_finish;
         plan.own_decode = self.opts.zpages_own_decoder;
         plan.hold = Some(self.shared.zbuild_hold.clone());
         Some(std::sync::Arc::new(ZFinish {
@@ -45994,7 +46038,7 @@ impl Maint {
                     self.opts.zpages_inplace_walk,
                     z_drop_now(&self.opts, &self.shared),
                     self.opts.z_times_decodes(),
-                    self.opts.zpages_own_decoder,
+                    zpages::Dec::of(self.opts.zpages_own_decoder, self.opts.zpages_flat_decode),
                     self.opts.zpages_cursor_view,
                     self.opts.zpages_group_ahead,
                     self.opts.zpages_walk_owns_decodes,
@@ -46337,6 +46381,7 @@ impl Maint {
                         side.inplace = self.opts.zpages_inplace_walk;
                         side.time_decodes = self.opts.z_times_decodes();
                         side.own_decoder = self.opts.zpages_own_decoder;
+                        side.flat_decoder = self.opts.zpages_flat_decode;
                         side.cursor_view = self.opts.zpages_cursor_view;
                         side.group_ahead = self.opts.zpages_group_ahead;
                         side.walk_owns = self.opts.zpages_walk_owns_decodes;
@@ -46387,6 +46432,7 @@ impl Maint {
                         side.inplace = self.opts.zpages_inplace_walk;
                         side.time_decodes = self.opts.z_times_decodes();
                         side.own_decoder = self.opts.zpages_own_decoder;
+                        side.flat_decoder = self.opts.zpages_flat_decode;
                         side.cursor_view = self.opts.zpages_cursor_view;
                         side.group_ahead = self.opts.zpages_group_ahead;
                         side.walk_owns = self.opts.zpages_walk_owns_decodes;
@@ -46464,6 +46510,7 @@ impl Maint {
                             side.inplace = self.opts.zpages_inplace_walk;
                             side.time_decodes = self.opts.z_times_decodes();
                             side.own_decoder = self.opts.zpages_own_decoder;
+                            side.flat_decoder = self.opts.zpages_flat_decode;
                             side.cursor_view = self.opts.zpages_cursor_view;
                             side.group_ahead = self.opts.zpages_group_ahead;
                             side.walk_owns = self.opts.zpages_walk_owns_decodes;
