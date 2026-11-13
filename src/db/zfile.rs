@@ -206,6 +206,13 @@ pub(super) struct ZScan {
     /// The next group's lines asked for at an open
     /// (`Options::zpages_bulk_ahead`).
     pub aheads: u64,
+    /// The entries the walk took by stepping the fence, and the groups it
+    /// opened without asking the memo again (`Options::zpages_bulk_steps`).
+    pub stepped: u64,
+    pub absent: u64,
+    /// Whether the walk's first entry was the one the handle's last seek
+    /// found (`ZMemo::seek_at`).
+    pub from_seek: bool,
     pub end: ScanEnd,
 }
 
@@ -718,6 +725,7 @@ impl<'a> ZCursor<'a> {
                         self.pview.as_ref(),
                         self.zfile.inplace,
                         true,
+                        false,
                         memoise,
                     )
                 }
@@ -1958,9 +1966,15 @@ struct Memo {
     misses: u64,
     /// E2's footprint (design 4.7): while the handle reads the compact form
     /// under the controller, one bit a page it touched, by form file, and
-    /// the distinct pages so far; off and empty otherwise.
+    /// the distinct pages so far; off and empty otherwise. A list and not
+    /// a map: a store has a few dozen form files and a walk opens group
+    /// after group of one, so the open looks at the file it touched last
+    /// before it looks at the rest, where a map hashed the file's identity
+    /// at every open -- a fiftieth of the threaded scan pass under the
+    /// bound, by the profile of its threads.
     track: bool,
-    touched: std::collections::HashMap<u64, Vec<u64>>,
+    touched: Vec<(u64, Vec<u64>)>,
+    touched_last: usize,
     distinct: u64,
     /// The groups point reads decoded in part lately, a tag a slot
     /// (`Memo::admit`): made at the first ask.
@@ -2053,7 +2067,8 @@ impl Memo {
             hits: 0,
             misses: 0,
             track: false,
-            touched: std::collections::HashMap::new(),
+            touched: Vec::new(),
+            touched_last: 0,
             distinct: 0,
             admit: Vec::new(),
             keys: Vec::new(),
@@ -2161,10 +2176,18 @@ impl Memo {
             return;
         }
         let words = n_pages.div_ceil(64).max(1);
-        let map = self
-            .touched
-            .entry(zfile)
-            .or_insert_with(|| vec![0u64; words]);
+        let at = match self.touched.get(self.touched_last) {
+            Some((z, _)) if *z == zfile => self.touched_last,
+            _ => match self.touched.iter().position(|(z, _)| *z == zfile) {
+                Some(i) => i,
+                None => {
+                    self.touched.push((zfile, vec![0u64; words]));
+                    self.touched.len() - 1
+                }
+            },
+        };
+        self.touched_last = at;
+        let map = &mut self.touched[at].1;
         if map.len() < words {
             map.resize(words, 0);
         }
@@ -2337,6 +2360,14 @@ pub(super) struct ZMemo {
     /// The bulk walk's ask is made for the next group of the same page as
     /// well as for the next page's head (`Options::zpages_bulk_ahead_within`).
     bulk_within: bool,
+    /// The bulk walk steps the fence to the next entry where it ran to the
+    /// end of one, and asks the memo once a group (`Options::zpages_bulk_steps`).
+    bulk_steps: bool,
+    /// The form file and the fence entry this handle's last seek found
+    /// (`ZFile::seek`), which a scan's walk starts in: under
+    /// `Options::zpages_bulk_steps` the walk takes it where it covers the
+    /// rank it starts at, and searches the fence otherwise.
+    seek_at: Cell<Option<(u64, usize)>>,
 }
 
 impl ZMemo {
@@ -2368,6 +2399,8 @@ impl ZMemo {
             bulk_ahead: false,
             bulk_part: false,
             bulk_within: false,
+            bulk_steps: false,
+            seek_at: Cell::new(None),
         }
     }
 
@@ -2394,6 +2427,13 @@ impl ZMemo {
     /// (`Options::zpages_bulk_ahead_within`).
     pub(super) fn bulk_within(mut self, within: bool) -> ZMemo {
         self.bulk_within = within;
+        self
+    }
+
+    /// The memo with the bulk walk's fence steps and single memo ask set
+    /// (`Options::zpages_bulk_steps`).
+    pub(super) fn bulk_steps(mut self, steps: bool) -> ZMemo {
+        self.bulk_steps = steps;
         self
     }
 
@@ -2536,7 +2576,8 @@ impl ZMemo {
         let mut m = self.memo.borrow_mut();
         m.track = on;
         if !on {
-            m.touched = std::collections::HashMap::new();
+            m.touched = Vec::new();
+            m.touched_last = 0;
             m.distinct = 0;
         }
     }
@@ -2639,8 +2680,10 @@ pub(super) struct ZFile {
     /// as `inplace` is; `lz4_flex`'s where not.
     pub(super) own_decoder: bool,
     /// The engine's own decoder runs its flat loop ahead of its fast one
-    /// (`Options::zpages_flat_decode`), set beside `own_decoder`.
+    /// (`Options::zpages_flat_decode`), set beside `own_decoder`; and runs
+    /// it to the group's end (`Options::zpages_flat_slack`).
     pub(super) flat_decoder: bool,
+    pub(super) flat_slack: bool,
     /// One bit per page: the first-decode checks passed in this process,
     /// over every group of it.
     verified: Box<[AtomicU64]>,
@@ -2832,6 +2875,7 @@ impl ZFile {
             bind,
             own_decoder: false,
             flat_decoder: false,
+            flat_slack: false,
             verified: (0..n_pages.div_ceil(64))
                 .map(|_| AtomicU64::new(0))
                 .collect(),
@@ -2950,7 +2994,7 @@ impl ZFile {
         inplace: bool,
         memoise: bool,
     ) -> Option<(Opened<'a>, usize, usize, bool)> {
-        self.open_group_with(memo, entry, j, buf, view, inplace, false, memoise)
+        self.open_group_with(memo, entry, j, buf, view, inplace, false, false, memoise)
     }
 
     /// The memo's group for group `j` of `entry`'s page, asked before any
@@ -2994,7 +3038,9 @@ impl ZFile {
     }
 
     /// `open_group`; with `after_memo`, for a caller that asked the memo
-    /// first itself (`memo_first_hit`) and touched the page, neither again.
+    /// first itself (`memo_first_hit`) and touched the page, neither again;
+    /// with `absent`, for a caller that has just found the memo without the
+    /// group (`ZMemo::holds`), the memo not asked for it again.
     #[allow(clippy::too_many_arguments)]
     fn open_group_with<'a>(
         &'a self,
@@ -3005,6 +3051,7 @@ impl ZFile {
         view: Option<&PageView<'a>>,
         inplace: bool,
         after_memo: bool,
+        absent: bool,
         memoise: bool,
     ) -> Option<(Opened<'a>, usize, usize, bool)> {
         let p = entry.page as usize;
@@ -3020,7 +3067,7 @@ impl ZFile {
             return None;
         };
         let was_verified = bit(&self.verified, p);
-        if !after_memo && self.memo_first && self.memo && was_verified {
+        if !after_memo && !absent && self.memo_first && self.memo && was_verified {
             if let Some((g, n, first, count)) =
                 memo.get(self.id, entry.page, index, self.memo_hashed)
             {
@@ -3084,7 +3131,7 @@ impl ZFile {
         // first decode verifying every group of it. A stored group is
         // parsed where it lies and has nothing to memoise.
         if self.memo && !g.stored {
-            if was_verified && !self.memo_first {
+            if was_verified && !self.memo_first && !absent {
                 if let Some((g, n, first, count)) =
                     memo.get(self.id, entry.page, index, self.memo_hashed)
                 {
@@ -3593,6 +3640,9 @@ impl ZFile {
             nopage: 0,
             prefetches: 0,
             aheads: 0,
+            stepped: 0,
+            absent: 0,
+            from_seek: false,
             end: ScanEnd::Served,
         };
         if self.damaged.load(Ordering::Relaxed) {
@@ -3623,15 +3673,46 @@ impl ZFile {
         let mut asked = false;
         // The key of a record read in place, assembled (`Opened::Coded`).
         let mut key: Vec<u8> = Vec::new();
+        // The entry after the one the walk ran to the end of, under
+        // `Options::zpages_bulk_steps`: the next entry's first rank is the
+        // rank the walk stands at, so the fence is stepped and not searched.
+        // The walk's first entry is the one this handle's last seek found
+        // where it is this file's: a scan seeks its start and then walks
+        // from the rank the seek found.
+        let mut next_e: Option<usize> = memo
+            .seek_at
+            .get()
+            .filter(|&(id, _)| memo.bulk_steps && id == self.id)
+            .map(|(_, e)| e);
         while out.seen < limit && rank < nkeys {
             // The entry the rank falls in, and how far its records go: a
             // fence that does not cover the rank is damage, since the
             // tiling check held every rank below the key count to an
-            // entry.
-            let entry = u32::try_from(rank)
-                .ok()
-                .and_then(|r| self.fence.entry_at_rank(r))
-                .and_then(|e| self.fence.entry(e, self.nkeys as u32));
+            // entry. A stepped or sought entry that does not cover the rank
+            // is left for the search, whose answer one that covers it is:
+            // the next entry begins past the rank, so it is the last whose
+            // first rank is at or below it.
+            let stepped = next_e
+                .take()
+                .and_then(|e| self.fence.entry(e, self.nkeys as u32))
+                .filter(|en| {
+                    (en.first_rank as usize) <= rank
+                        && rank < en.first_rank as usize + en.count as usize
+                });
+            let entry = match stepped {
+                Some(en) => {
+                    if out.seen == 0 && rank == from {
+                        out.from_seek = true;
+                    } else {
+                        out.stepped += 1;
+                    }
+                    Some(en)
+                }
+                None => u32::try_from(rank)
+                    .ok()
+                    .and_then(|r| self.fence.entry_at_rank(r))
+                    .and_then(|e| self.fence.entry(e, self.nkeys as u32)),
+            };
             let Some(entry) = entry else {
                 out.end = ScanEnd::Fallback;
                 return Ok(());
@@ -3656,6 +3737,9 @@ impl ZFile {
                     out.end = ScanEnd::Fallback;
                     return Ok(());
                 }
+                if memo.bulk_steps && rank == end {
+                    next_e = Some(entry.index + 1);
+                }
                 continue;
             }
             let p = entry.page as usize;
@@ -3679,12 +3763,19 @@ impl ZFile {
                 // thousands of decodes ago, line by line, allocated the
                 // group's `Arc` and freed the one it displaced, for a group
                 // a scan over a store larger than the memo reads once.
+                let mut held = false;
                 let memoise = !memo.bulk_admit
                     || !self.memo
                     || u8::try_from(j).map_or(true, |index| {
-                        memo.holds(self.id, entry.page, index, self.memo_hashed)
-                            || memo.admit(self.id, entry.page, index)
+                        held = memo.holds(self.id, entry.page, index, self.memo_hashed);
+                        held || memo.admit(self.id, entry.page, index)
                     });
+                // Found absent just now: the open asks the memo nothing
+                // more for it (`Options::zpages_bulk_steps`).
+                let absent = memo.bulk_steps && memo.bulk_admit && self.memo && !held;
+                if absent {
+                    out.absent += 1;
+                }
                 // The group the walk ends inside, its own, decoded only as
                 // far as the walk reads (`Options::zpages_bulk_part`), as a
                 // cursor's last group is (`zpages_walk_part`).
@@ -3715,9 +3806,17 @@ impl ZFile {
                         }
                     }
                 }
-                let Some((opened, gfirst, count, decoded)) =
-                    self.open_group(memo, &entry, j, buf, Some(&view), self.inplace, memoise)
-                else {
+                let Some((opened, gfirst, count, decoded)) = self.open_group_with(
+                    memo,
+                    &entry,
+                    j,
+                    buf,
+                    Some(&view),
+                    self.inplace,
+                    false,
+                    absent,
+                    memoise,
+                ) else {
                     out.end = ScanEnd::Fallback;
                     return Ok(());
                 };
@@ -3829,6 +3928,9 @@ impl ZFile {
                     rank += 1;
                 }
                 j += 1;
+            }
+            if memo.bulk_steps && rank == end {
+                next_e = Some(entry.index + 1);
             }
         }
         Ok(())
@@ -4108,6 +4210,9 @@ impl ZFile {
         let Some(entry) = self.fence.entry(e, self.nkeys as u32) else {
             return ZSeek::Fallback;
         };
+        if memo.bulk_steps {
+            memo.seek_at.set(Some((self.id, e)));
+        }
         let first = entry.first_rank as usize;
         if entry.page == ZNOPAGE {
             if entry.count != 1 {
@@ -4326,7 +4431,7 @@ impl ZFile {
     /// file times the decodes it counts (`ZFile::time_decodes`).
     /// The decoder this file's block-coded groups are decoded by.
     fn dec(&self) -> Dec {
-        Dec::of(self.own_decoder, self.flat_decoder)
+        Dec::of(self.own_decoder, self.flat_decoder).with_slack(self.flat_slack)
     }
 
     fn decode_tick(&self) -> (bool, Option<std::time::Instant>) {
@@ -5293,8 +5398,10 @@ pub(super) struct BuildPlan {
     /// (`Options::zpages_raw_tails`, `FillScratch::raw_tails`).
     pub raw_tails: bool,
     /// The block coding's groups written by the parsing encoder
-    /// (`Options::zpages_parse`, `FillScratch::parse`).
+    /// (`Options::zpages_parse`, `FillScratch::parse`), its search
+    /// (`Options::zpages_parse_chains`, `FillScratch::parse_chains`).
     pub parse: bool,
+    pub parse_chains: u32,
     /// The pages the build writes checked through the engine's own decoder
     /// (`Options::zpages_own_decoder`, `FillScratch::own_decode`), the one
     /// the store's readers take.
@@ -5335,6 +5442,7 @@ impl BuildPlan {
             store_all: false,
             raw_tails: false,
             parse: false,
+            parse_chains: 0,
             own_decode: false,
             cancel: None,
             hold: None,
@@ -5532,6 +5640,7 @@ fn write_pages(
     scratch.store_all = plan.store_all;
     scratch.raw_tails = plan.raw_tails;
     scratch.parse = plan.parse;
+    scratch.parse_chains = plan.parse_chains;
     scratch.own_decode = plan.own_decode;
     let mut verify_buf = GroupBuf::new();
     let mut fence = ZFence::new();
@@ -6014,6 +6123,7 @@ pub(super) struct FillShape {
     pub store_all: bool,
     pub raw_tails: bool,
     pub parse: bool,
+    pub parse_chains: u32,
     pub own_decode: bool,
 }
 
@@ -6025,6 +6135,7 @@ impl Default for FillShape {
             store_all: false,
             raw_tails: false,
             parse: false,
+            parse_chains: 0,
             own_decode: false,
         }
     }
@@ -6038,6 +6149,7 @@ impl FillShape {
         scratch.store_all = self.store_all;
         scratch.raw_tails = self.raw_tails;
         scratch.parse = self.parse;
+        scratch.parse_chains = self.parse_chains;
         scratch.own_decode = self.own_decode;
     }
 }
@@ -9732,30 +9844,96 @@ mod tests {
             let n = fx.recs.len();
             let starts: Vec<usize> = (0..n).step_by(37).chain([n - 1, n, n + 5]).collect();
             let limits = [0usize, 1, 2, 3, 5, 17, 56, 57, 58, 114, 1000, usize::MAX];
-            for &from in &starts {
-                for &limit in &limits {
+            // The walk under each of its shapes: the memo taking every
+            // decode, the first touch the walk's own, and the fence stepped
+            // with the memo asked once (`Options::zpages_bulk_steps`), with
+            // the first touch the walk's own and without.
+            let memos = [
+                ("memo", ZMemo::new()),
+                ("bulk", ZMemo::new().bulk(true, true, true)),
+                (
+                    "steps",
+                    ZMemo::new().bulk(true, true, true).bulk_steps(true),
+                ),
+                ("steps-memo", ZMemo::new().bulk_steps(true)),
+            ];
+            for (shape, memo) in &memos {
+                let (mut stepped, mut absent) = (0u64, 0u64);
+                for &from in &starts {
+                    for &limit in &limits {
+                        let mut want: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                        let raw_n = fx
+                            .blob
+                            .scan_at(from, limit, |k, v| want.push((k.to_vec(), v.to_vec())))
+                            .unwrap();
+                        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                        let z = zfile
+                            .scan_at(memo, &fx.blob, from, limit, &mut |k: &[u8], v: &[u8]| {
+                                got.push((k.to_vec(), v.to_vec()))
+                            })
+                            .unwrap();
+                        stepped += z.stepped;
+                        absent += z.absent;
+                        assert_eq!(
+                            z.end,
+                            ScanEnd::Served,
+                            "{name} {shape}: from {from} limit {limit}"
+                        );
+                        assert_eq!(
+                            z.seen, raw_n,
+                            "{name} {shape}: the count, from {from} limit {limit}"
+                        );
+                        assert_eq!(
+                            got, want,
+                            "{name} {shape}: the stream, from {from} limit {limit}"
+                        );
+                    }
+                }
+                // The steps and the single ask fire in the shapes they are
+                // for and in no other.
+                let steps = shape.starts_with("steps");
+                assert_eq!(
+                    stepped > 0,
+                    steps,
+                    "{name} {shape}: {stepped} entries stepped"
+                );
+                assert_eq!(
+                    absent > 0,
+                    *shape == "steps",
+                    "{name} {shape}: {absent} opens asked once"
+                );
+                // A seek and the walk from the rank it found, as a scan
+                // makes them: the walk starts in the entry the seek found,
+                // searching nothing, under the steps; the stream is the
+                // raw walk's under every shape.
+                let (mut seeded, mut walks) = (0u64, 0u64);
+                for i in (0..n).step_by(53) {
+                    let key = fx.recs[i].0.clone();
+                    let ZSeek::Served { rank, .. } = zfile.seek(memo, &key) else {
+                        panic!("{name} {shape}: the seek of record {i}");
+                    };
                     let mut want: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-                    let raw_n = fx
-                        .blob
-                        .scan_at(from, limit, |k, v| want.push((k.to_vec(), v.to_vec())))
+                    fx.blob
+                        .scan_at(rank, 9, |k, v| want.push((k.to_vec(), v.to_vec())))
                         .unwrap();
                     let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
                     let z = zfile
-                        .scan_at(
-                            &fx.memo,
-                            &fx.blob,
-                            from,
-                            limit,
-                            &mut |k: &[u8], v: &[u8]| got.push((k.to_vec(), v.to_vec())),
-                        )
+                        .scan_at(memo, &fx.blob, rank, 9, &mut |k: &[u8], v: &[u8]| {
+                            got.push((k.to_vec(), v.to_vec()))
+                        })
                         .unwrap();
-                    assert_eq!(z.end, ScanEnd::Served, "{name}: from {from} limit {limit}");
                     assert_eq!(
-                        z.seen, raw_n,
-                        "{name}: the count, from {from} limit {limit}"
+                        got, want,
+                        "{name} {shape}: the walk after the seek of record {i}"
                     );
-                    assert_eq!(got, want, "{name}: the stream, from {from} limit {limit}");
+                    seeded += u64::from(z.from_seek);
+                    walks += 1;
                 }
+                assert_eq!(
+                    seeded,
+                    if steps { walks } else { 0 },
+                    "{name} {shape}: {seeded} walks of {walks} began where the seek did"
+                );
             }
             // A walk across the record no page holds hands the raw form
             // exactly its run, once; the suite's shape never does.

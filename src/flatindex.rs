@@ -587,7 +587,11 @@ pub(crate) fn compact_fixed_at(buf: &[u8], off: usize) -> Option<(&[u8], &[u8], 
     }
     let elen = u16::from_le_bytes([cb[0], cb[1]]) as usize;
     let records = (c & !(C_FIXED | C_TOMB)) as usize;
-    if records == 0 || elen == 0 || !elen.is_multiple_of(records) {
+    // One value is the common record and a multiple of itself: no divide
+    // for it, since a sixteen-bit divide a record, its remainder tested at
+    // once, was a twentieth of the threaded scan pass over the compact form
+    // under the bound, by the profile of its threads.
+    if records == 0 || elen == 0 || (records != 1 && !elen.is_multiple_of(records)) {
         return None;
     }
     let run = buf.get(e_at + 4..e_at + 4 + elen)?;

@@ -605,7 +605,12 @@ of its open (`Options::zpages_bulk_ahead` off), `supdb-zbulkpart` with
 its own decode of the group it ends inside made only as far as it reads
 (`Options::zpages_bulk_part` on), and `supdb-zbulkaheadwithin` with its
 ask made for the next group of a page as well as the next page's head
-(`Options::zpages_bulk_ahead_within`); `supdb-zpromote` is `supdb`
+(`Options::zpages_bulk_ahead_within`), and `supdb-zbulksearch` with the
+fence searched at every page and the memo asked twice a group
+(`Options::zpages_bulk_steps` off), and `supdb-zflatshort` with the flat
+LZ4 decoder lent the fast loop's slack alone, so each group's last
+sequences go the fast loop's way (`Options::zpages_flat_slack` off);
+`supdb-zpromote` is `supdb`
 with a block that scans have walked a block's worth of entries held as a
 merged copy in its slot under the form file (`Options::promote_entries` at
 sixty-four with `zpages_promote_copies`), and `supdb-zpromotestarts` the

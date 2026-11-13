@@ -714,6 +714,12 @@ pub struct Supdb {
     /// The bulk walk asks for the next group of a page as well as the next
     /// page's head (`Options::zpages_bulk_ahead_within`): `supdb-zbulkaheadwithin`.
     zbulkaheadwithin: bool,
+    /// The bulk walk searches the fence at every page and asks the memo
+    /// twice a group (`Options::zpages_bulk_steps` off): `supdb-zbulksearch`.
+    zbulksearch: bool,
+    /// The flat decoder lent the fast loop's slack alone
+    /// (`Options::zpages_flat_slack` off): `supdb-zflatshort`.
+    zflatshort: bool,
     /// The scans started in a block before its scans hold the blocks they
     /// walk as copies under the form (`Options::promote_starts`), `None`
     /// for the engine's: `supdb-zhotstarts2`, `supdb-zhotstarts3`,
@@ -1366,10 +1372,15 @@ pub struct Supdb {
     /// `supdb-cache64tofitautozpagesparse` against
     /// `supdb-cache64tofitautozpages`.
     zparse: bool,
-    /// The parse at the controller's builds alone, a merge's finish builds
-    /// kept greedy (`Options::zpages_parse_finish` off): `supdb-zparsestart`
-    /// against `supdb-zparse` and `supdb`.
+    /// The lazy parse at the controller's builds alone, a merge's finish
+    /// builds kept greedy (`Options::zpages_parse_finish` off,
+    /// `Options::zpages_parse_chains` at zero): `supdb-zparsestart` against
+    /// `supdb-zparse` and `supdb`.
     zparsestart: bool,
+    /// Every group written by `lz4_flex`'s greedy encoder
+    /// (`Options::zpages_parse` off): `supdb-zgreedy`, the shape before the
+    /// parse over four chain positions at the controller's builds.
+    zgreedy: bool,
     /// The engine's own decoder without its flat loop, the fast loop
     /// alone (`Options::zpages_flat_decode` off): `supdb-znoflat` against
     /// `supdb`.
@@ -1813,6 +1824,12 @@ struct Policy {
     /// The bulk walk asks for the next group of a page as well as the next
     /// page's head (`Options::zpages_bulk_ahead_within`): `supdb-zbulkaheadwithin`.
     zbulkaheadwithin: bool,
+    /// The bulk walk searches the fence at every page and asks the memo
+    /// twice a group (`Options::zpages_bulk_steps` off): `supdb-zbulksearch`.
+    zbulksearch: bool,
+    /// The flat decoder lent the fast loop's slack alone
+    /// (`Options::zpages_flat_slack` off): `supdb-zflatshort`.
+    zflatshort: bool,
     /// The scans started in a block before its scans hold the blocks they
     /// walk as copies under the form (`Options::promote_starts`), `None`
     /// for the engine's: `supdb-zhotstarts2`, `supdb-zhotstarts3`,
@@ -2362,9 +2379,13 @@ struct Policy {
     /// Its block-coded groups the parsing encoder's (`Options::zpages_parse`):
     /// `supdb-cache64tofitzpagesdropparse`, `supdb-cache64tofitautozpagesparse`.
     zparse: bool,
-    /// The parse at the controller's builds alone
-    /// (`Options::zpages_parse_finish` off): `supdb-zparsestart`.
+    /// The lazy parse at the controller's builds alone
+    /// (`Options::zpages_parse_finish` off, the chains at zero):
+    /// `supdb-zparsestart`.
     zparsestart: bool,
+    /// The greedy encoder everywhere (`Options::zpages_parse` off):
+    /// `supdb-zgreedy`.
+    zgreedy: bool,
     /// The fast decode loop alone (`Options::zpages_flat_decode` off):
     /// `supdb-znoflat`.
     znoflat: bool,
@@ -2542,6 +2563,8 @@ impl Default for Policy {
             zbulknoahead: false,
             zbulkpart: false,
             zbulkaheadwithin: false,
+            zbulksearch: false,
+            zflatshort: false,
             zhotstarts: None,
             nochainwrites: false,
             noland: false,
@@ -2660,6 +2683,7 @@ impl Default for Policy {
             zcodingfixed: false,
             zparse: false,
             zparsestart: false,
+            zgreedy: false,
             znoflat: false,
             znohotfill: false,
             zflexdec: false,
@@ -7931,6 +7955,8 @@ impl Supdb {
             zbulknoahead,
             zbulkpart,
             zbulkaheadwithin,
+            zbulksearch,
+            zflatshort,
             zhotstarts,
             nochainwrites,
             noland,
@@ -8086,6 +8112,7 @@ impl Supdb {
             zdropraw,
             zparse,
             zparsestart,
+            zgreedy,
             znoflat,
             znohotfill,
             zflexdec,
@@ -8369,6 +8396,8 @@ impl Supdb {
             zpages_bulk_ahead: !zbulknoahead,
             zpages_bulk_part: zbulkpart,
             zpages_bulk_ahead_within: zbulkaheadwithin,
+            zpages_bulk_steps: !zbulksearch,
+            zpages_flat_slack: !zflatshort,
             promote_starts: zhotstarts.unwrap_or(supdb::Options::default().promote_starts),
             merge_chains_writes: !nochainwrites,
             zpages_land_scans_far: !landnearscans,
@@ -8514,8 +8543,15 @@ impl Supdb {
             zpages_build_eager: zpages_buildeager,
             zpages_block_cache: !zcacheraw,
             zpages_coding_auto: !zcodingfixed,
-            zpages_parse: zparse || zparsestart,
-            zpages_parse_finish: !zparsestart,
+            // The re-parse arm's builds keep the greedy encoder, as it was
+            // priced: the parse is bought there after the install.
+            zpages_parse: !(zgreedy || zreparse),
+            zpages_parse_finish: zparse,
+            zpages_parse_chains: if zparse || zparsestart {
+                0
+            } else {
+                supdb::Options::default().zpages_parse_chains
+            },
             zpages_flat_decode: !znoflat,
             zpages_hot_fill: !znohotfill,
             zpages_own_decoder: !zflexdec,
@@ -8737,6 +8773,8 @@ impl Supdb {
             zbulknoahead,
             zbulkpart,
             zbulkaheadwithin,
+            zbulksearch,
+            zflatshort,
             zhotstarts,
             nochainwrites,
             noland,
@@ -8892,6 +8930,7 @@ impl Supdb {
             zdropraw,
             zparse,
             zparsestart,
+            zgreedy,
             znoflat,
             znohotfill,
             zflexdec,
@@ -9642,6 +9681,9 @@ impl Engine for Supdb {
         if self.zparsestart {
             return "supdb-zparsestart";
         }
+        if self.zgreedy {
+            return "supdb-zgreedy";
+        }
         if self.znoflat {
             return "supdb-znoflat";
         }
@@ -9781,6 +9823,12 @@ impl Engine for Supdb {
         }
         if self.zbulkaheadwithin {
             return "supdb-zbulkaheadwithin";
+        }
+        if self.zbulksearch {
+            return "supdb-zbulksearch";
+        }
+        if self.zflatshort {
+            return "supdb-zflatshort";
         }
         if let Some(n) = self.zhotstarts {
             return match n {
@@ -11496,6 +11544,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zbulknoahead"
         | "supdb-zbulkpart"
         | "supdb-zbulkaheadwithin"
+        | "supdb-zbulksearch"
+        | "supdb-zflatshort"
         | "supdb-zhotstarts2"
         | "supdb-zhotstarts3"
         | "supdb-nohotstarts"
@@ -11595,6 +11645,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zrewarmwait"
         | "supdb-zrewarmbeside"
         | "supdb-zparsestart"
+        | "supdb-zgreedy"
         | "supdb-znoflat"
         | "supdb-znohotfill"
         | "supdb-zwalkowns"
@@ -12124,6 +12175,18 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-mergeahead" => supdb_arm(Supdb::create_mergeahead, dir)?,
         "supdb-zparse" => supdb_arm(Supdb::create_zparse, dir)?,
         "supdb-zparsestart" => supdb_arm(Supdb::create_zparsestart, dir)?,
+        "supdb-zgreedy" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        zgreedy: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
         "supdb-znoflat" => supdb_arm(Supdb::create_znoflat, dir)?,
         "supdb-znohotfill" => supdb_arm(Supdb::create_znohotfill, dir)?,
         "supdb-nozpagesnofitshort" => supdb_arm(Supdb::create_nozpages_nofitshort, dir)?,
@@ -12493,6 +12556,30 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     d,
                     Policy {
                         zbulkaheadwithin: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-zbulksearch" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        zbulksearch: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-zflatshort" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        zflatshort: true,
                         ..Policy::default()
                     },
                 )
@@ -13937,7 +14024,7 @@ mod tests {
     fn the_lz4_arms_differ_from_their_bases_in_the_codec_alone() {
         let root = std::env::temp_dir().join(format!("supdb-bench-zparse-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        assert!(!supdb::Options::default().zpages_parse);
+        assert!(supdb::Options::default().zpages_parse);
         assert!(supdb::Options::default().zpages_own_decoder);
         for (name, make, base_name, base_make, parse) in [
             (
@@ -13983,14 +14070,20 @@ mod tests {
                 arm.db.as_ref().unwrap().options(),
                 base.db.as_ref().unwrap().options(),
             );
-            // A parse arm sets the parse and keeps the own decoder; a
-            // `flexdec` arm sets neither.
-            assert_eq!(
-                (a.zpages_parse, a.zpages_own_decoder),
-                (parse, parse),
-                "{name}: the one option"
-            );
-            assert!(!b.zpages_parse && b.zpages_own_decoder, "{base_name}");
+            // A parse arm sets the lazy parse at every build and keeps the
+            // own decoder; a `flexdec` arm keeps its base's parse and sets
+            // the decoder alone.
+            let shape =
+                |o: &supdb::Options| (o.zpages_parse, o.zpages_parse_finish, o.zpages_parse_chains);
+            if parse {
+                assert_eq!(shape(a), (true, true, 0), "{name}: the lazy parse");
+                assert!(a.zpages_own_decoder, "{name}: the own decoder");
+            } else {
+                assert_eq!(shape(a), shape(b), "{name}: the base's parse");
+                assert!(!a.zpages_own_decoder, "{name}: the one option");
+            }
+            assert_eq!(shape(b), (true, false, 4), "{base_name}");
+            assert!(b.zpages_own_decoder, "{base_name}");
             assert_eq!(
                 (
                     a.zpages,
@@ -14451,6 +14544,34 @@ mod tests {
                 assert!(o.zpages_bulk_ahead);
             }
             {
+                let z = Supdb::with_policy(
+                    &dir("zbulksearch"),
+                    Policy {
+                        zbulksearch: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-zbulksearch");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.zpages_bulk_steps && b.zpages_bulk_steps);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("zflatshort"),
+                    Policy {
+                        zflatshort: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-zflatshort");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.zpages_flat_slack && b.zpages_flat_slack);
+            }
+            {
                 let z = Supdb::create_settleroomstill(&dir("settleroomstill")).unwrap();
                 assert_eq!(z.name(), "supdb-settleroomstill");
                 assert_eq!(z.features(), base.features());
@@ -14584,11 +14705,25 @@ mod tests {
                 assert_eq!(z.name(), "supdb-zparsestart");
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
-                assert!(o.zpages_parse && !b.zpages_parse);
-                assert!(!o.zpages_parse_finish && b.zpages_parse_finish);
+                assert!(o.zpages_parse && b.zpages_parse);
+                assert!(!o.zpages_parse_finish && !b.zpages_parse_finish);
+                assert_eq!((o.zpages_parse_chains, b.zpages_parse_chains), (0, 4));
                 let p = Supdb::create_zparse(&dir("zparsefinish")).unwrap();
                 let po = p.db.as_ref().unwrap().options();
                 assert!(po.zpages_parse && po.zpages_parse_finish);
+                assert_eq!(po.zpages_parse_chains, 0);
+                let c = Supdb::with_policy(
+                    &dir("zgreedy"),
+                    Policy {
+                        zgreedy: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(c.name(), "supdb-zgreedy");
+                assert_eq!(c.features(), base.features());
+                let co = c.db.as_ref().unwrap().options();
+                assert!(!co.zpages_parse && b.zpages_parse);
             }
             {
                 let z = Supdb::create_znoflat(&dir("znoflat")).unwrap();
@@ -14640,7 +14775,8 @@ mod tests {
                 let z = Supdb::create_zparse(&dir("zparse")).unwrap();
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
-                assert!(o.zpages_parse && !b.zpages_parse);
+                assert!(o.zpages_parse && o.zpages_parse_finish && o.zpages_parse_chains == 0);
+                assert!(b.zpages_parse && !b.zpages_parse_finish && b.zpages_parse_chains == 4);
                 assert_eq!(
                     (o.zpages, o.zpages_cover_resident, o.zpages_reparse),
                     (b.zpages, b.zpages_cover_resident, b.zpages_reparse)

@@ -1434,7 +1434,15 @@ on one line; the divider's latency is what it cost. The rule: in a
 loop measured in cycles an entry, read the assembly for the
 instructions whose cost is not their count -- a divide, a call through
 a pointer, a store the next load depends on -- and give the common
-shape a path without them.
+shape a path without them. It came again where the compact form's walk
+was given the raw walk's fast path: the check that a fixed run's length
+is a whole number of its values divided by the count, a sixteen-bit
+divide with its remainder tested at once, for a count that is one in
+the common record -- a twentieth of the threaded scan pass over the
+compact form at ten million keys under 1.25 GiB, every sample on the
+test after the divide (`perf annotate` of the scan threads' window, cut
+by `SUPDB_LAG_MARK`'s phase marks). A fast path copied from another walk
+is read for its divides again, since its guards came with it.
 
 **A value built a field at a time and handed back whole.** The scan
 snapshot's cursor, generalised to a base a frozen table, folded each
@@ -1901,9 +1909,20 @@ of a piece kept across a merge bet that a merge of four hundred thousand
 keys would outlast a seal of twenty, and the bet lost once under the
 gate's load, with a guard naming the case not reached; it holds the
 merge's landing now (`hold_merge_landing`) until the piece has published.
-The rule: a test that
+And as a builder: the test that a publish's builder has its forms
+installed by the next commit under the upkeep thread passed, in most
+runs, because the commit's fill built the blocks -- the builder had
+started at the seal's freeze, its forms were dropped as another
+generation's once the landing published, and the builder for the landed
+state started at the commit after the hand-over, installed only where
+its post beat the thread's pass, which it lost one run in sixty. The
+engine's counters printed at the assertion (`forms_events`) told the
+three shapes apart, and `settle` now starts and joins the builder for
+the state that stands under that arm. The rule: a test that
 needs a state holds it, and a bet on timing loses the first time the
-thing it bets against gets faster.
+thing it bets against gets faster; and a test that passes is read for
+the path that passed it, since a fallback that does the same work
+passes it too.
 
 **A test whose answer was a function of the clock, or of a thread's
 turn.** The superblock records the second a segment finished in, in each
