@@ -4769,6 +4769,35 @@ others; and a pairing in which the mechanism never fired is the noise
 floor, read before any other -- the same pair under 1.25 GiB, no rewarm in
 either arm, moved its cells 10-20% each way between sittings.
 
+**Two levers priced as one, and the half that was the cost.** That rewarm
+shipped as two changes paired together, the quarter second and the asks
+beside the merges, and the next 1.25 GiB row read the pass after the full
+rewrite at 0.54x of LMDB where the row before had read 1.81x. The row
+before was another host's; on this host class the cell had read 0.7-1.1M
+entries a second in every row since the chain, so the drop was the host's
+and the loss was a cell to win. The faults by file put the pass's major
+faults on form files in their page view's first read and on the burst's
+last pieces, and the rewarm's trace, given each asked file's residency, the
+room and whether merges ran, split the sweeps on one column: every pass
+whose rewarm asked beside the chain took 7,200-10,900 faults under 1.25
+GiB, every one whose rewarm found no merge 74-3,300. An asked file is read
+in by evicting what the kernel ranks last, and after a burst that is the
+burst's own pieces, written once and read next by the pass. Two levers
+were built on the way and taken out by their counts: skipping the files of
+partitions a merge was due to rewrite never fired, since the asked
+partitions held one or two pieces under a trigger of four; and bounding
+the asks by the room the group measured asked the moment room opened, and
+the merges' writes took the room back -- 7,300 faults in such a sweep, as
+many as the asks it replaced. The ten-percent pass the asks were for found
+no merge running at its rewarm in every sweep since, so the quarter second
+was its gain, and the rewarm waits for the merges again
+(`Options::zpages_rewarm_beside_merges` off; `supdb-zrewarmbeside`). The
+rules: a lever made of two changes is priced by taking each away; a cell
+that drops between two rows is read against its own history on the row's
+host class before it is read as the engine's; and a measured room is a
+reading of a moment, so an ask that the next writer will take the room
+from is not made into it.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

@@ -5167,24 +5167,31 @@ pub struct Options {
     pub zpages_rewarm_trims: bool,
     /// A rewarm due (`zpages_rewarm_scans`) is made while merges are in
     /// flight, for the form files of the partitions no merge in flight
-    /// holds, where it waited for the merges to land. A burst that leaves
-    /// pieces standing keeps a chain of merges running through the pass
-    /// after it, and under a gibibyte at ten million keys the pass after
-    /// the ten-percent burst read the form files the burst's merges had
-    /// written and the cache had dropped -- written once and read by
-    /// nobody, the first pages a reclaim takes -- a 4 KB fault a scan,
-    /// about nine thousand in a pass and every one of them on those files
-    /// in the page view's first read, while the rewarm waited behind the
-    /// chain. The wait was drawn at the full rewrite, whose merges hold
-    /// every partition; a merge's own partitions are left to its landing
-    /// here. With `zpages_rewarm_quiet_ms` at a quarter second the pass
-    /// read 1.32x and 1.35x with a third of the faults on the lag sweep
-    /// alone, and 1.40x and 1.71x in the row's whole order, both orders
-    /// each (`pair.sh supdb-zrewarmwait supdb 10000000 --bound 1073741824
-    /// --passes load,lag --ops-div 10 --reps 2`, and the row's passes);
-    /// under 1.25 GiB no rewarm found a cold file in the mixes and the lag
-    /// passes read level. On; `supdb-zrewarmwait` is the shape before, both
-    /// off.
+    /// holds, where off it waits for the merges to land. It was made beside
+    /// them for the pass after the ten-percent burst under a gibibyte at
+    /// ten million keys, which read the form files the burst's merges had
+    /// written and the cache had dropped while the rewarm waited behind
+    /// the chain (`pair.sh supdb-zrewarmwait supdb 10000000 --bound
+    /// 1073741824 --passes load,lag --ops-div 10 --reps 2`, read with the
+    /// quarter second of `zpages_rewarm_quiet_ms` that came with it). Off
+    /// by default: a file asked for beside the chain is read in by evicting
+    /// what the kernel ranks last, and after a burst that is the burst's
+    /// own last pieces, written once and read next by the pass, while the
+    /// merges' writes take back any room measured before the ask. At ten
+    /// million keys the pass after the full rewrite took 7,200-10,900
+    /// major faults in every sweep whose rewarm asked beside merges under
+    /// 1.25 GiB and 74-3,300 in every sweep whose rewarm found none
+    /// running, and 20,800-25,100 against 13,800-17,000 under a gibibyte;
+    /// the ten-percent pass's rewarm found no merge running in all of
+    /// them, so the quarter second is what that pass keeps. Paired in the
+    /// row's whole order under 1.25 GiB the full-rewrite pass read 2.1x and
+    /// 1.2x with a seventh and two fifths of the faults, the ten-percent
+    /// pass 1.07x and 1.15x, and no rewarm asked for a file in the mixes;
+    /// under a gibibyte the full-rewrite pass took 15,300-17,600 major
+    /// faults in every sweep against 21,000-25,100 (`pair.sh
+    /// supdb-zrewarmbeside supdb 10000000 --bound 1342177280 --ops-div 10
+    /// --reps 2`, and `--bound 1073741824 --passes load,lag --reps 3`).
+    /// Off; `supdb-zrewarmbeside` asks beside the merges.
     pub zpages_rewarm_beside_merges: bool,
     /// The stretch without a scan after which the scans that come back
     /// have the cold form files asked for (`zpages_rewarm_scans`), in
@@ -5534,7 +5541,7 @@ impl Default for Options {
             zpages_rewarm_scans: true,
             zpages_settle_joins_asks: true,
             zpages_rewarm_trims: false,
-            zpages_rewarm_beside_merges: true,
+            zpages_rewarm_beside_merges: false,
             zpages_rewarm_quiet_ms: 250,
         }
     }
@@ -44297,7 +44304,7 @@ impl Maint {
         if self.zsel.counts().installs == 0 || self.shared.zgate.load() == zselect::GATE_RAW {
             return;
         }
-        let paths: Vec<PathBuf> = {
+        let paths: Vec<(PathBuf, f64, u64)> = {
             let _op = self.op();
             self.segs()
                 .iter()
@@ -44308,21 +44315,34 @@ impl Maint {
                 .filter(|s| !(merging && self.in_flight_input(&s.name)))
                 .filter_map(|s| {
                     let z = s.z.get()?;
-                    if z.pages_resident() >= HOT_RAW_RESIDENT {
+                    let resident = z.pages_resident();
+                    if resident >= HOT_RAW_RESIDENT {
                         return None;
                     }
                     let (id, end) = (Db::name_id(&s.name)?, Db::name_end_seq(&s.name)?);
-                    Some(self.dir.join(zfile::zpg_name(id, end)))
+                    Some((
+                        self.dir.join(zfile::zpg_name(id, end)),
+                        resident,
+                        z.file_bytes(),
+                    ))
                 })
                 .collect()
         };
         if self.z_trace {
+            let shares: Vec<String> = paths
+                .iter()
+                .map(|(_, r, b)| format!("{:.2}/{}", r, b >> 20))
+                .collect();
+            let room = zfile::read_budget().and_then(|b| b.slack());
             eprintln!(
-                "zrewarm t={:.1} files {} life {life}",
+                "zrewarm t={:.1} files {} life {life} merging {merging} room_mb {} resident {}",
                 now.as_secs_f64(),
-                paths.len()
+                paths.len(),
+                room.map_or("-".to_string(), |r| (r >> 20).to_string()),
+                shares.join(",")
             );
         }
+        let paths: Vec<PathBuf> = paths.into_iter().map(|(p, _, _)| p).collect();
         if paths.is_empty() {
             return;
         }

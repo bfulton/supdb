@@ -1129,10 +1129,13 @@ pub struct Supdb {
     /// the fill line (`Options::zpages_hot_skew_room` on,
     /// `Options::zpages_hot_room_margin_pct` 5): `supdb-zhotskewroomhyst`.
     zhotskewroomhyst: bool,
-    /// The rewarm waiting for the merges in flight and a second without a
-    /// scan, the shape before (`Options::zpages_rewarm_beside_merges` off,
-    /// `Options::zpages_rewarm_quiet_ms` 1000): `supdb-zrewarmwait`.
+    /// The rewarm waiting for a second without a scan where the default
+    /// waits a quarter (`Options::zpages_rewarm_quiet_ms` 1000), the merges
+    /// in flight waited for as by default: `supdb-zrewarmwait`.
     zrewarmwait: bool,
+    /// The rewarm made beside merges in flight, the shape before
+    /// (`Options::zpages_rewarm_beside_merges` on): `supdb-zrewarmbeside`.
+    zrewarmbeside: bool,
     /// A cursor's walk decoding the groups after its first into its own
     /// buffer (`Options::zpages_walk_owns_decodes` on): `supdb-zwalkowns`.
     zwalkowns: bool,
@@ -2219,6 +2222,8 @@ struct Policy {
     zhotskewroomhyst: bool,
     /// The rewarm that waits: `supdb-zrewarmwait`.
     zrewarmwait: bool,
+    /// The rewarm beside merges: `supdb-zrewarmbeside`.
+    zrewarmbeside: bool,
     /// The walk's own decodes: `supdb-zwalkowns`.
     zwalkowns: bool,
     /// A page view an open: `supdb-zviewperopen`.
@@ -2625,6 +2630,7 @@ impl Default for Policy {
             zhotskewroom: false,
             zhotskewroomhyst: false,
             zrewarmwait: false,
+            zrewarmbeside: false,
             zwalkowns: false,
             zviewperopen: false,
             znogroupahead: false,
@@ -3246,15 +3252,25 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose rewarm waits for the merges in flight and a second
-    /// without a scan, the shape before
-    /// (`Options::zpages_rewarm_beside_merges` off,
-    /// `Options::zpages_rewarm_quiet_ms` 1000).
+    /// `supdb` whose rewarm waits for a second without a scan where the
+    /// default waits a quarter (`Options::zpages_rewarm_quiet_ms` 1000).
     pub fn create_zrewarmwait(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
                 zrewarmwait: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose rewarm is made beside merges in flight, the shape
+    /// before (`Options::zpages_rewarm_beside_merges` on).
+    pub fn create_zrewarmbeside(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                zrewarmbeside: true,
                 ..Policy::default()
             },
         )
@@ -8024,6 +8040,7 @@ impl Supdb {
             zhotskewroom,
             zhotskewroomhyst,
             zrewarmwait,
+            zrewarmbeside,
             zwalkowns,
             zviewperopen,
             znogroupahead,
@@ -8553,7 +8570,7 @@ impl Supdb {
             copy_prefetch_whole: copyprefetchwhole,
             zpages_hot_skew_room: zhotskewroom || zhotskewroomhyst,
             zpages_hot_room_margin_pct: if zhotskewroomhyst { 5 } else { 0 },
-            zpages_rewarm_beside_merges: !zrewarmwait,
+            zpages_rewarm_beside_merges: zrewarmbeside,
             zpages_rewarm_quiet_ms: if zrewarmwait {
                 supdb::db::REWARM_QUIET_BEFORE_MS
             } else {
@@ -8829,6 +8846,7 @@ impl Supdb {
             zhotskewroom,
             zhotskewroomhyst,
             zrewarmwait,
+            zrewarmbeside,
             zwalkowns,
             zviewperopen,
             znogroupahead,
@@ -9223,6 +9241,9 @@ impl Engine for Supdb {
         }
         if self.zrewarmwait {
             return "supdb-zrewarmwait";
+        }
+        if self.zrewarmbeside {
+            return "supdb-zrewarmbeside";
         }
         if self.zwalkowns {
             return "supdb-zwalkowns";
@@ -11572,6 +11593,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zhotskewroom"
         | "supdb-zhotskewroomhyst"
         | "supdb-zrewarmwait"
+        | "supdb-zrewarmbeside"
         | "supdb-zparsestart"
         | "supdb-znoflat"
         | "supdb-znohotfill"
@@ -12009,6 +12031,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zhotskewroom" => supdb_arm(Supdb::create_zhotskewroom, dir)?,
         "supdb-zhotskewroomhyst" => supdb_arm(Supdb::create_zhotskewroomhyst, dir)?,
         "supdb-zrewarmwait" => supdb_arm(Supdb::create_zrewarmwait, dir)?,
+        "supdb-zrewarmbeside" => supdb_arm(Supdb::create_zrewarmbeside, dir)?,
         "supdb-zwalkowns" => supdb_arm(Supdb::create_zwalkowns, dir)?,
         "supdb-zviewperopen" => supdb_arm(Supdb::create_zviewperopen, dir)?,
         "supdb-znogroupahead" => supdb_arm(Supdb::create_znogroupahead, dir)?,
@@ -14545,8 +14568,16 @@ mod tests {
                 assert_eq!(z.name(), "supdb-zrewarmwait");
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
-                assert!(!o.zpages_rewarm_beside_merges && b.zpages_rewarm_beside_merges);
+                assert!(!o.zpages_rewarm_beside_merges && !b.zpages_rewarm_beside_merges);
                 assert!(o.zpages_rewarm_quiet_ms == 1000 && b.zpages_rewarm_quiet_ms == 250);
+            }
+            {
+                let z = Supdb::create_zrewarmbeside(&dir("zrewarmbeside")).unwrap();
+                assert_eq!(z.name(), "supdb-zrewarmbeside");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_rewarm_beside_merges && !b.zpages_rewarm_beside_merges);
+                assert!(o.zpages_rewarm_quiet_ms == b.zpages_rewarm_quiet_ms);
             }
             {
                 let z = Supdb::create_zparsestart(&dir("zparsestart")).unwrap();
