@@ -55,8 +55,8 @@ ab     two arms in one process, alternating and paired rep by rep, for choosing
        --bound as for run: the pairing under a memory bound, with the counts per
                operation a bounded row records paired like any other quantity.
        --passes a comma-separated subset of load,read,read-threaded,scan,scan-threaded,
-               mixes,scan-mixed,mixes-scrambled,lag (default: all), for a question one
-               phase answers at a rung where the whole pass is an hour.
+               mixes,scan-mixed,mixes-scrambled,lag,recover (default: all but recover),
+               for a question one phase answers at a rung where the whole pass is an hour.
        --ops-div as for run, here at any scale (default 1): the read passes' counts
                divided, for a pairing at a rung where the whole pass is an hour.
        --compress the fraction of each value that is a repeated phrase (default 0.5,
@@ -159,6 +159,21 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(|s| s.as_str()) {
         Some("run") => cmd_run(Args(args[1..].to_vec())),
+        // The recovery workloads' writer (`run::crash_load_child`), spawned
+        // by a pass and killed by it: it returns only where it failed.
+        Some("crash-load") => match args.get(1) {
+            Some(spec) => match run::crash_load_child(std::path::Path::new(spec)) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("crash-load failed: {e}");
+                    2
+                }
+            },
+            None => {
+                eprintln!("crash-load SPEC: the spec file a pass wrote is required");
+                2
+            }
+        },
         // A pass's own process (`run::one_pass_child`), spawned by `run`.
         Some("one-pass") => match args.get(1) {
             Some(spec) => match run::one_pass_child(std::path::Path::new(spec)) {
@@ -322,7 +337,10 @@ fn cmd_ab(a: Args) -> i32 {
                 return 2;
             }
         },
-        None => run::Passes::all(),
+        // Every pass a pairing has always run: the recovery workloads are
+        // two stores more an arm a rep, and a pairing runs them when it
+        // names them.
+        None => run::Passes::paired(),
     };
     // The bound first, before the machine capture and the plan's threads:
     // a cgroup v1 move takes the whole thread group, and the pairing's
@@ -393,7 +411,7 @@ fn cmd_ab(a: Args) -> i32 {
             Some(b) => format!(", under a bound of {b} bytes"),
             None => String::new(),
         },
-        if plan.passes == run::Passes::all() {
+        if plan.passes == run::Passes::paired() {
             String::new()
         } else {
             format!(", passes {}", a.get("--passes").unwrap_or_default())

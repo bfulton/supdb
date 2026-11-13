@@ -171,6 +171,26 @@ impl Batch {
         Ok(())
     }
 
+    /// As `flush`, through `Engine::stage_batch`: the batch handed to the
+    /// engine and never committed.
+    pub fn stage(&mut self, e: &mut dyn Engine) -> Res<()> {
+        if self.ends.is_empty() {
+            return Ok(());
+        }
+        let mut pairs: Vec<(&[u8], &[u8])> = Vec::with_capacity(self.ends.len());
+        let (mut ks, mut vs) = (0usize, 0usize);
+        for &(ke, ve) in &self.ends {
+            pairs.push((&self.keys[ks..ke as usize], &self.vals[vs..ve as usize]));
+            ks = ke as usize;
+            vs = ve as usize;
+        }
+        e.stage_batch(&pairs)?;
+        self.keys.clear();
+        self.vals.clear();
+        self.ends.clear();
+        Ok(())
+    }
+
     /// As `flush`, through `Engine::update_batch`: the keys may exist and
     /// the values replace.
     pub fn flush_updates(&mut self, e: &mut dyn Engine) -> Res<()> {
@@ -245,6 +265,15 @@ pub trait Engine {
     /// through it accumulated values on hot keys until reads walked them.
     fn update_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
         self.write_batch(items)
+    }
+    /// Stage a batch and do not commit it: the uncommitted tail the
+    /// recovery workload's crash finds (`run::crash_load_child`). Nothing,
+    /// for an engine whose uncommitted batch never leaves the caller's
+    /// memory -- LMDB's write transaction and RocksDB's write batch hold
+    /// theirs until the commit -- and for supdb the appends with no commit
+    /// behind them.
+    fn stage_batch(&mut self, _items: &[(&[u8], &[u8])]) -> Res<()> {
+        Ok(())
     }
     /// Bytes returned for the key; 0 for a miss.
     fn get(&mut self, key: &[u8]) -> Res<usize>;
@@ -8650,7 +8679,12 @@ impl Supdb {
             },
             None => opts,
         };
-        let db = supdb::Db::create(path, opts).map_err(|e| e.to_string())?;
+        let db = if REOPEN.with(|r| r.get()) {
+            supdb::Db::open(path, opts)
+        } else {
+            supdb::Db::create(path, opts)
+        }
+        .map_err(|e| e.to_string())?;
         Ok(Supdb {
             db: Some(db),
             path: path.to_path_buf(),
@@ -10228,6 +10262,11 @@ impl Engine for Supdb {
         }
         db.commit().map_err(|e| e.to_string())
     }
+    fn stage_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
+        let db = self.db.as_mut().ok_or("db closed")?;
+        db.append_batch(items);
+        Ok(())
+    }
     fn get(&mut self, key: &[u8]) -> Res<usize> {
         let db = self.db.as_ref().ok_or("db closed")?;
         supdb_get(db, key)
@@ -11721,6 +11760,32 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
 #[inline(never)]
 fn supdb_arm(make: fn(&Path) -> Res<Supdb>, dir: &Path) -> Res<Box<dyn Engine>> {
     Ok(Box::new(make(dir)?))
+}
+
+thread_local! {
+    /// Set while `reopen` opens an arm: the supdb arms' one constructor
+    /// (`Supdb::with_policy`) opens the store at its path where this is
+    /// set and creates one where it is not. A flag and not an argument
+    /// because every arm's constructor is a `fn(&Path)` that ends there.
+    static REOPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Open the store an arm left at `dir`, under the arm's own options: what
+/// the recovery workload times after a crash (`run::recover_store`). A
+/// supdb arm opens with `Db::open`, which replays what the crash left;
+/// LMDB and RocksDB open what is there by the call that made it. An arm
+/// with no store at `dir` is an error for supdb and a fresh store for the
+/// comparators, so a caller checks what it reads back.
+pub fn reopen(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            REOPEN.with(|r| r.set(false));
+        }
+    }
+    REOPEN.with(|r| r.set(true));
+    let _reset = Reset;
+    open(arm, dir, map_gb)
 }
 
 pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {

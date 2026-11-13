@@ -90,6 +90,8 @@ fn workload_noun(w: &str) -> &'static str {
         "scan-mixed" => "Ordered scans on the store the mixes leave",
         "scan-lag" => "Ordered scans against merge lag",
         "lag-burst" => "The lag sweep's bursts",
+        "recover" => "Recovery after a crash at the end of an ordered load",
+        "recover-shuffled" => "Recovery after a crash at the end of a shuffled load",
         "ycsb-A" => "YCSB-A, update-heavy (50/50 read/update, zipfian)",
         "ycsb-B" => "YCSB-B, read-mostly (95/5 read/update, zipfian)",
         "ycsb-C" => "YCSB-C, read-only (zipfian)",
@@ -591,6 +593,9 @@ fn message(
     let what = match quantity {
         "ops_per_s" | "reads_per_s" | "entries_per_s" => "throughput".to_string(),
         "p99_us" => "p99 latency".to_string(),
+        "open_ms" => "time to open".to_string(),
+        "first_read_us" => "first read".to_string(),
+        "unrecovered_batches" => "acknowledged batches not recovered".to_string(),
         "device_bytes_per_byte" => "device bytes per byte".to_string(),
         "bytes_on_disk_per_byte" => "bytes on disk per byte".to_string(),
         q => match crate::run::threads_of(q) {

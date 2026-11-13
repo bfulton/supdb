@@ -13,8 +13,9 @@ is the cost of the design, and showing them is what makes the wins credible.
 - **Storage size.** 1.31 bytes on disk per byte stored, against LMDB's 1.15
   and RocksDB's 1.03 (2026-10-17 run). Measured already.
 - **Recovery after a crash.** LMDB never recovers: its file is always
-  consistent, so it opens instantly. supdb replays its WAL on open. Not
-  measured yet; see the recovery workload below.
+  consistent, so it opens instantly. supdb replays its WAL on open, and
+  rewrites a run of ordered ingest the crash left open. Measured by the
+  `recover` workloads (`bench/DESIGN.md`).
 
 ## Benchmark
 
@@ -26,10 +27,24 @@ The suite has to be fair before any of its numbers are quoted.
   buffered RocksDB is `rocksdb-tuned-nosync`, `rocksdb-tuned` with the
   sync alone off, and the rows banked from 2026-10-31 carry it. A buffered
   RocksDB number is quoted from those rows and never from `rocksdb-nosync`.
-- [ ] **A recovery workload.** Crash at a known point (kill the process
+- [x] **A recovery workload.** Crash at a known point (kill the process
   after N committed batches, with an uncommitted tail), then time the open
-  and the first read, for every arm. Done when it runs in the suite and
-  banks a row. An accepted loss against LMDB; the point is to measure it.
+  and the first read, for every arm. `recover` and `recover-shuffled` do,
+  after the ordered load's batches and after the shuffled load's, in the
+  in-core rows (`bench/DESIGN.md`). An accepted loss against LMDB; the
+  point is to measure it.
+- [ ] **Match what a buffered commit survives, or state it.** The
+  recovery workloads hold every arm's reopened store to the batches its
+  writer was acknowledged, and the buffered supdb arm's ordered load does
+  not hold the newest of them: ordered ingest writes a run's records a
+  write piece at a time, so under a policy that does not sync at every
+  commit the commits behind the last whole piece are in the writer's
+  memory when its process dies, where the WAL is written at every commit
+  and LMDB's and RocksDB's unsynced commits are in the kernel. The rows
+  record it (`unrecovered_batches`). Either a direct run hands every
+  commit to the kernel under every policy, priced on the buffered ordered
+  load, or the methods say the buffered group is matched on a machine's
+  crash and not on a process's.
 - [ ] **Rows past memory.** The `full` ladder to at least 1.5x the machine's
   memory, as `bench/DESIGN.md` specifies, is banked to 3M keys. The bounded
   scale (`--scale ooc`) is banked through 10M keys under 1.5 GiB, where

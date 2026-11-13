@@ -596,6 +596,26 @@ by the structure and not by holding little, and the bound each pass got
 is read from the kernel at the pass's start; and a quantity that grows
 rep by rep in the parent is a drift in every cell that can feel it.
 
+**A guarantee matched on one kind of crash.** The buffered group was
+matched on the sync: no arm in it reaches the device at a commit. The
+recovery workloads' first run held each arm's reopened store to every
+batch its killed writer had been acknowledged, on the reading that an
+unsynced commit is in the kernel and outlives its process, which LMDB's
+and RocksDB's documentation says of theirs and the engine's says of its
+WAL. `supdb-ingest` failed it at the first rung: the ordered load
+bypasses the WAL, and a direct run's records go to the file a megabyte
+piece at a time, so the commits behind the last whole piece were in the
+dead process's memory -- two batches of ten at ten thousand keys, eight
+of a hundred at a hundred thousand, the same count every rep, and none
+after the shuffled load, which the WAL takes. The durable arm, whose
+every commit syncs the run, held every batch. So a buffered arm's loss
+is a quantity of the row (`unrecovered_batches`) and a durable arm's is
+a failed pass, and `ROADMAP.md` carries the decision the count asks
+for. The rule: a guarantee has more than one axis -- what a machine's
+crash may take and what a process's may -- and a group is matched on
+each one a user could mean, by a workload that kills something, since
+an axis nobody tested is matched by assumption.
+
 **A workflow that never runs can be syntactically invalid for months.**
 Both self-hosted pickup watchdogs arrived with a block of an older draft
 pasted after their `exit 1`. `scripts/workflows.sh` parses every `run:`

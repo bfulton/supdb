@@ -49,6 +49,10 @@ pub fn higher_is_better(quantity: &str) -> Option<bool> {
         "entries_per_s_lag10pct" | "entries_per_s_lag100pct" => true,
         "updates_per_s_lag1pct" | "updates_per_s_lag10pct" | "updates_per_s_lag100pct" => true,
         "p50_us" | "p99_us" | "device_bytes_per_byte" | "bytes_on_disk_per_byte" => false,
+        // The recovery workloads': the open of a crashed store, and the
+        // first read through it.
+        // And a buffered arm's batches that went with its process.
+        "open_ms" | "first_read_us" | "unrecovered_batches" => false,
         // The audit's (`is_audit`): named, and judged by nobody.
         "group_bytes" | "process_bytes" => false,
         _ => return None,
