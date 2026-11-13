@@ -2129,7 +2129,7 @@ pub struct Options {
     /// `supdb-cache64tofitzpagesdropflexdec` are the arms with it off.
     #[doc(hidden)]
     pub zpages_own_decoder: bool,
-    /// EXPERIMENT: the engine's own decoder (`zpages_own_decoder`) runs
+    /// The engine's own decoder (`zpages_own_decoder`) runs
     /// its flat loop ahead of its fast one wherever a group is followed by
     /// the rest of its page (`zlz4::decompress_in_flat`): a sequence a turn
     /// with no branch on its lengths -- the one length byte a run or a
@@ -2145,7 +2145,15 @@ pub struct Options {
     /// than a predicted turn's (`bench/examples/zdecode.rs`, the `flat
     /// loop` and `warm input` lines). A group decoded in the engine is one
     /// the memo did not hold, cold for the predictor. The same bytes and
-    /// the same refusals as the fast loop for every input.
+    /// the same refusals as the fast loop for every input. Paired at ten
+    /// million keys under 1.25 GiB in both orders, the same decodes in both
+    /// arms, the scan passes read 1.17-1.29x, the threaded scans beside the
+    /// mixes 1.16-1.25x, C 1.08-1.20x, the scrambled E 1.11-1.12x, and every
+    /// lag pass 1.02-1.42x, with the load level (`pair.sh supdb supdb-zflat
+    /// 10000000 --bound 1342177280 --passes
+    /// load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
+    /// --ops-div 10 --reps 2`, and `--passes load,lag`, at `186e0ef`). On;
+    /// `supdb-znoflat` is the fast loop alone.
     #[doc(hidden)]
     pub zpages_flat_decode: bool,
     /// EXPERIMENT: the allocator trimmed once (`malloc_trim`) at the end of
@@ -5291,7 +5299,7 @@ impl Default for Options {
             zpages_parse: false,
             zpages_parse_finish: true,
             zpages_own_decoder: true,
-            zpages_flat_decode: false,
+            zpages_flat_decode: true,
             zpages_trim_install: false,
             upkeep_trim_look: false,
             trim_by_resident: false,

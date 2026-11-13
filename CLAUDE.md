@@ -576,7 +576,14 @@ the whole page slower (`bench/examples/zlines.rs`), where fewer tokens
 to parse did (`zdecode --hc`: liblz4's high-compression mode, 16% off
 the cold decode and 4% off the form at level 9). A software prefetch is
 a lever on a stall the profile shows as a load; a cold decode's stall is
-its branches. And a decode removed is priced by what it cost: raw tails on
+its branches, and the lever on those is a loop with none on the common
+sequence: the one length byte read whether the token asks for it or not
+and taken by a select, the run and the match moved a fixed sixty-four,
+read a cold group in three quarters of the branching loop's time and a
+learned one in more than its, and every decode the engine makes is a
+cold one, so the scans read a fifth to a quarter faster with the same
+decodes counted (`Options::zpages_flat_decode`). A loop priced on its hot
+figure would have been refuted. And a decode removed is priced by what it cost: raw tails on
 the partition that held half the E mix's decodes took them away and moved
 E by two percent, since that partition's groups came back warm, and the
 next three partitions' third as many decodes moved it by ten -- a heat

@@ -1367,9 +1367,10 @@ pub struct Supdb {
     /// kept greedy (`Options::zpages_parse_finish` off): `supdb-zparsestart`
     /// against `supdb-zparse` and `supdb`.
     zparsestart: bool,
-    /// The engine's own decoder with its flat loop
-    /// (`Options::zpages_flat_decode`): `supdb-zflat` against `supdb`.
-    zflat: bool,
+    /// The engine's own decoder without its flat loop, the fast loop
+    /// alone (`Options::zpages_flat_decode` off): `supdb-znoflat` against
+    /// `supdb`.
+    znoflat: bool,
     /// The form's groups decoded by `lz4_flex` and not the engine's own
     /// decoder (`Options::zpages_own_decoder` off), the shape before it:
     /// `supdb-cache64tofitzpagesdropflexdec` against
@@ -2356,8 +2357,9 @@ struct Policy {
     /// The parse at the controller's builds alone
     /// (`Options::zpages_parse_finish` off): `supdb-zparsestart`.
     zparsestart: bool,
-    /// The flat decode loop (`Options::zpages_flat_decode`): `supdb-zflat`.
-    zflat: bool,
+    /// The fast decode loop alone (`Options::zpages_flat_decode` off):
+    /// `supdb-znoflat`.
+    znoflat: bool,
     /// Its groups decoded by `lz4_flex` (`Options::zpages_own_decoder`
     /// off): `supdb-cache64tofitzpagesdropflexdec`,
     /// `supdb-cache64tofitautozpagesflexdec`.
@@ -2646,7 +2648,7 @@ impl Default for Policy {
             zcodingfixed: false,
             zparse: false,
             zparsestart: false,
-            zflat: false,
+            znoflat: false,
             zflexdec: false,
             zdropattach: false,
             zlandpct: None,
@@ -4914,13 +4916,14 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose form's groups are decoded with the flat loop ahead of
-    /// the fast one (`Options::zpages_flat_decode`), `supdb-zflat`.
-    pub fn create_zflat(path: &Path) -> Res<Supdb> {
+    /// `supdb` whose form's groups are decoded by the fast loop alone, the
+    /// shape before the flat loop (`Options::zpages_flat_decode` off),
+    /// `supdb-znoflat`.
+    pub fn create_znoflat(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
-                zflat: true,
+                znoflat: true,
                 ..Policy::default()
             },
         )
@@ -8041,7 +8044,7 @@ impl Supdb {
             zdropraw,
             zparse,
             zparsestart,
-            zflat,
+            znoflat,
             zflexdec,
             zdropattach,
             zlandpct,
@@ -8470,7 +8473,7 @@ impl Supdb {
             zpages_coding_auto: !zcodingfixed,
             zpages_parse: zparse || zparsestart,
             zpages_parse_finish: !zparsestart,
-            zpages_flat_decode: zflat,
+            zpages_flat_decode: !znoflat,
             zpages_own_decoder: !zflexdec,
             promote_entries: zpromote,
             zpages_promote_copies: zpromote > 0,
@@ -8844,7 +8847,7 @@ impl Supdb {
             zdropraw,
             zparse,
             zparsestart,
-            zflat,
+            znoflat,
             zflexdec,
             zdropattach,
             zlandpct,
@@ -9590,8 +9593,8 @@ impl Engine for Supdb {
         if self.zparsestart {
             return "supdb-zparsestart";
         }
-        if self.zflat {
-            return "supdb-zflat";
+        if self.znoflat {
+            return "supdb-znoflat";
         }
         if self.zsamplegap {
             return "supdb-zsamplegap";
@@ -11539,7 +11542,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zhotskewroomhyst"
         | "supdb-zrewarmwait"
         | "supdb-zparsestart"
-        | "supdb-zflat"
+        | "supdb-znoflat"
         | "supdb-zwalkowns"
         | "supdb-zviewperopen"
         | "supdb-znogroupahead"
@@ -12066,7 +12069,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-mergeahead" => supdb_arm(Supdb::create_mergeahead, dir)?,
         "supdb-zparse" => supdb_arm(Supdb::create_zparse, dir)?,
         "supdb-zparsestart" => supdb_arm(Supdb::create_zparsestart, dir)?,
-        "supdb-zflat" => supdb_arm(Supdb::create_zflat, dir)?,
+        "supdb-znoflat" => supdb_arm(Supdb::create_znoflat, dir)?,
         "supdb-nozpagesnofitshort" => supdb_arm(Supdb::create_nozpages_nofitshort, dir)?,
         "supdb-nozpagesmergeone" => supdb_arm(Supdb::create_nozpages_mergeone, dir)?,
         "supdb-ingestmergeone" => supdb_arm(Supdb::create_ingest_mergeone, dir)?,
@@ -14523,11 +14526,11 @@ mod tests {
                 assert!(po.zpages_parse && po.zpages_parse_finish);
             }
             {
-                let z = Supdb::create_zflat(&dir("zflat")).unwrap();
-                assert_eq!(z.name(), "supdb-zflat");
+                let z = Supdb::create_znoflat(&dir("znoflat")).unwrap();
+                assert_eq!(z.name(), "supdb-znoflat");
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
-                assert!(o.zpages_flat_decode && !b.zpages_flat_decode);
+                assert!(!o.zpages_flat_decode && b.zpages_flat_decode);
             }
             {
                 let z = Supdb::create_zwalkowns(&dir("zwalkowns")).unwrap();
