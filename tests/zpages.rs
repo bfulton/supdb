@@ -11724,6 +11724,9 @@ fn a_raw_partition_read_no_more_than_the_median_goes_back_to_its_form() {
                 o.zpages_hot_raw = true;
                 o.zpages_hot_raw_slack = true;
                 o.zpages_hot_cold_back = on;
+                // The fill off: with the room ample it releases every
+                // partition, and this is the skew's rule and its way back.
+                o.zpages_hot_fill = false;
                 o.zpages_memo = false;
                 o.partition_bytes = Some(400 << 10);
             },
@@ -11836,6 +11839,9 @@ fn the_hot_raw_policy_relaxes_its_skew_bar_where_the_candidate_fits_the_room() {
                 o.zpages_hot_raw = true;
                 o.zpages_hot_raw_slack = true;
                 o.zpages_hot_skew_room = on;
+                // The fill off: it releases into the room whatever the
+                // skew, and this is the skew's bar.
+                o.zpages_hot_fill = false;
                 o.zpages_memo = false;
                 o.partition_bytes = Some(400 << 10);
             },
@@ -12129,6 +12135,9 @@ fn the_hot_raw_policy_releases_into_the_groups_unused_memory_where_the_line_woul
             |o| {
                 o.zpages_hot_raw = true;
                 o.zpages_hot_raw_slack = on;
+                // The fill off: it fills whatever room there is, and this
+                // is the skew's release counted into the room.
+                o.zpages_hot_fill = false;
                 o.zpages_memo = false;
                 o.partition_bytes = Some(400 << 10);
             },

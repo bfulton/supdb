@@ -5052,7 +5052,7 @@ pub struct Options {
     /// scrambled E 1.42x and 1.12x: a trade, so off keeps a raw partition
     /// raw until the fill and `supdb-zhotcoldback` is the arm.
     pub zpages_hot_cold_back: bool,
-    /// EXPERIMENT: under the hot-raw policy with its room read from the
+    /// Under the hot-raw policy with its room read from the
     /// group (`zpages_hot_raw`, `zpages_hot_raw_slack`), the policy fills
     /// the room with raw partitions whatever their skew: at each look the
     /// served partitions are taken hottest first and their raw pages asked
@@ -5083,7 +5083,18 @@ pub struct Options {
     /// partitions read alike, which swapped on noise in the first version. The raw form at ten million keys with
     /// memory to spare reads 1.4-2.0x LMDB's where the form's decode reads
     /// under it (`pair.sh supdb lmdb-nordahead 10000000 --bound 4294967296`
-    /// in the row's passes, at `1846b85`). Off; `supdb-zhotfill` is the arm.
+    /// in the row's passes, at `1846b85`). Paired against the policy
+    /// without it in the row's passes, two sittings with the arms listed
+    /// both ways (`pair.sh supdb supdb-zhotfill 10000000 --bound 1342177280
+    /// --passes load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
+    /// --ops-div 10 --reps 2`, the same with `--passes load,lag`, and under
+    /// `--bound 1073741824`, at `19f151d`): under 1.25 GiB the threaded
+    /// reads 1.07-1.13x, the threaded scans 1.01-1.12x, and A, B, C, E and
+    /// F ahead in both orders, the lag sweep's passes level to 1.2x with
+    /// fewer major faults in every one; under 1 GiB, where the room holds a
+    /// partition or two, B 1.17x and the rest level; no cell behind in both
+    /// orders by more than the loads, which it cannot reach, leaned. On;
+    /// `supdb-znohotfill` is the shape before it.
     #[doc(hidden)]
     pub zpages_hot_fill: bool,
     /// The hot-raw policy's way back -- a raw partition's form file attached
@@ -5518,7 +5529,7 @@ impl Default for Options {
             zpages_hot_room_margin_pct: 0,
             zpages_walk_owns_decodes: false,
             zpages_hot_cold_back: false,
-            zpages_hot_fill: false,
+            zpages_hot_fill: true,
             zpages_hot_back_ask: true,
             zpages_rewarm_scans: true,
             zpages_settle_joins_asks: true,

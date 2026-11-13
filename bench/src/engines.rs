@@ -1371,9 +1371,9 @@ pub struct Supdb {
     /// alone (`Options::zpages_flat_decode` off): `supdb-znoflat` against
     /// `supdb`.
     znoflat: bool,
-    /// The hot-raw policy's fill (`Options::zpages_hot_fill`):
-    /// `supdb-zhotfill` against `supdb`.
-    zhotfill: bool,
+    /// The hot-raw policy without its fill (`Options::zpages_hot_fill`
+    /// off), the shape before it: `supdb-znohotfill` against `supdb`.
+    znohotfill: bool,
     /// The form's groups decoded by `lz4_flex` and not the engine's own
     /// decoder (`Options::zpages_own_decoder` off), the shape before it:
     /// `supdb-cache64tofitzpagesdropflexdec` against
@@ -2363,9 +2363,9 @@ struct Policy {
     /// The fast decode loop alone (`Options::zpages_flat_decode` off):
     /// `supdb-znoflat`.
     znoflat: bool,
-    /// The hot-raw policy's fill (`Options::zpages_hot_fill`):
-    /// `supdb-zhotfill`.
-    zhotfill: bool,
+    /// The hot-raw policy without its fill (`Options::zpages_hot_fill`
+    /// off): `supdb-znohotfill`.
+    znohotfill: bool,
     /// Its groups decoded by `lz4_flex` (`Options::zpages_own_decoder`
     /// off): `supdb-cache64tofitzpagesdropflexdec`,
     /// `supdb-cache64tofitautozpagesflexdec`.
@@ -2655,7 +2655,7 @@ impl Default for Policy {
             zparse: false,
             zparsestart: false,
             znoflat: false,
-            zhotfill: false,
+            znohotfill: false,
             zflexdec: false,
             zdropattach: false,
             zlandpct: None,
@@ -3179,12 +3179,16 @@ impl Supdb {
 
     /// `supdb` whose hot-raw policy sends a raw partition back to its form
     /// file once its reads a key fall under the median partition's
-    /// (`Options::zpages_hot_cold_back` on).
+    /// (`Options::zpages_hot_cold_back` on), with the fill off as it was
+    /// priced: the fill takes back into the room what the cold way back
+    /// sends back from it, so the two together move a partition each way
+    /// at every look.
     pub fn create_zhotcoldback(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
                 zhotcoldback: true,
+                znohotfill: true,
                 ..Policy::default()
             },
         )
@@ -4923,14 +4927,15 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose hot-raw policy fills the room the group leaves with raw
-    /// partitions whatever their skew (`Options::zpages_hot_fill`),
-    /// `supdb-zhotfill`.
-    pub fn create_zhotfill(path: &Path) -> Res<Supdb> {
+    /// `supdb` whose hot-raw policy releases partitions by their skew alone
+    /// and leaves the rest of the room the group measures empty
+    /// (`Options::zpages_hot_fill` off), the shape before the fill:
+    /// `supdb-znohotfill`.
+    pub fn create_znohotfill(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
-                zhotfill: true,
+                znohotfill: true,
                 ..Policy::default()
             },
         )
@@ -8065,7 +8070,7 @@ impl Supdb {
             zparse,
             zparsestart,
             znoflat,
-            zhotfill,
+            znohotfill,
             zflexdec,
             zdropattach,
             zlandpct,
@@ -8495,7 +8500,7 @@ impl Supdb {
             zpages_parse: zparse || zparsestart,
             zpages_parse_finish: !zparsestart,
             zpages_flat_decode: !znoflat,
-            zpages_hot_fill: zhotfill,
+            zpages_hot_fill: !znohotfill,
             zpages_own_decoder: !zflexdec,
             promote_entries: zpromote,
             zpages_promote_copies: zpromote > 0,
@@ -8870,7 +8875,7 @@ impl Supdb {
             zparse,
             zparsestart,
             znoflat,
-            zhotfill,
+            znohotfill,
             zflexdec,
             zdropattach,
             zlandpct,
@@ -9619,8 +9624,8 @@ impl Engine for Supdb {
         if self.znoflat {
             return "supdb-znoflat";
         }
-        if self.zhotfill {
-            return "supdb-zhotfill";
+        if self.znohotfill {
+            return "supdb-znohotfill";
         }
         if self.zsamplegap {
             return "supdb-zsamplegap";
@@ -11569,7 +11574,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zrewarmwait"
         | "supdb-zparsestart"
         | "supdb-znoflat"
-        | "supdb-zhotfill"
+        | "supdb-znohotfill"
         | "supdb-zwalkowns"
         | "supdb-zviewperopen"
         | "supdb-znogroupahead"
@@ -12097,7 +12102,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-zparse" => supdb_arm(Supdb::create_zparse, dir)?,
         "supdb-zparsestart" => supdb_arm(Supdb::create_zparsestart, dir)?,
         "supdb-znoflat" => supdb_arm(Supdb::create_znoflat, dir)?,
-        "supdb-zhotfill" => supdb_arm(Supdb::create_zhotfill, dir)?,
+        "supdb-znohotfill" => supdb_arm(Supdb::create_znohotfill, dir)?,
         "supdb-nozpagesnofitshort" => supdb_arm(Supdb::create_nozpages_nofitshort, dir)?,
         "supdb-nozpagesmergeone" => supdb_arm(Supdb::create_nozpages_mergeone, dir)?,
         "supdb-ingestmergeone" => supdb_arm(Supdb::create_ingest_mergeone, dir)?,
@@ -14276,6 +14281,7 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.zpages_hot_cold_back && !b.zpages_hot_cold_back);
+                assert!(!o.zpages_hot_fill && b.zpages_hot_fill);
             }
             {
                 let z = Supdb::create_cacheeighth(&dir("cacheeighth")).unwrap();
@@ -14561,11 +14567,11 @@ mod tests {
                 assert!(!o.zpages_flat_decode && b.zpages_flat_decode);
             }
             {
-                let z = Supdb::create_zhotfill(&dir("zhotfill")).unwrap();
-                assert_eq!(z.name(), "supdb-zhotfill");
+                let z = Supdb::create_znohotfill(&dir("znohotfill")).unwrap();
+                assert_eq!(z.name(), "supdb-znohotfill");
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
-                assert!(o.zpages_hot_fill && !b.zpages_hot_fill);
+                assert!(!o.zpages_hot_fill && b.zpages_hot_fill);
             }
             {
                 let z = Supdb::create_zwalkowns(&dir("zwalkowns")).unwrap();
