@@ -2268,6 +2268,37 @@ injects the failure for the test. The rule: an fsync's error is consumed
 by the call that sees it, so the result of every sync on a path is
 checked by that path and never left to a later sync of the same file.
 
+**A hand-off that left the old run's end with its new owner while the
+giver went on.** A run of ordered ingest goes to its file a write piece
+at a time, and a run that closed was handed to its seal with its last
+piece still in the writer's buffer, for the seal's thread to write with
+the trailer. Under a policy that syncs at every commit the buffer is
+empty at every commit. Under one that does not, the writer went on into
+the next run, and that run's first whole piece reached its own file
+before the seal's thread had written the old run's end: a process killed
+between the two left the first run's file short of its last commits and
+the second holding later ones, and the open recovered both --
+acknowledged batches gone from the middle of the history, batch 290 of a
+load there and 287 to 289 not, where `SyncPolicy`'s own words are that an
+unsynced tail is lost whole and never served in part. Nothing raised and
+every file was well-formed; `tests/kill.rs` killed a durable writer and
+no other. The suite's recovery workload found it in its first whole row,
+at the one rung whose load crosses the seal threshold just before its
+end (`bench/CLAUDE.md`, a guarantee matched on one kind of crash), and
+the engine's test holds the seal's thread so that the window is as wide
+as the kill needs. The writer writes a closing run's records before the
+hand-off now (`Db::close_run`), in the order it committed them, and a
+process's death takes only the open run's end. The rule: where work is
+handed to another thread and the giver goes on, whatever orders the
+giver's later effects behind its earlier ones is finished before the
+hand-off, never left with the receiver; and a guarantee stated of one
+path, here the WAL's, is tested on every path that bypasses it. Not
+closed by this, and read from the code, since no kill of a process can
+show it: a machine's crash under `EveryN` can still find a later run's
+synced pieces on the device and an earlier run's unsynced end not, as
+nothing orders the runs' syncs the way a loose boundary orders the WAL's
+files (`ROADMAP.md`).
+
 **A length read off the slab that held the exceptions.** The ordered
 table's write log became the range of its entries, its length the
 entries' count, and read that count off the entries' slab; the one-word

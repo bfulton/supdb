@@ -161,6 +161,19 @@ What an engine picker would hit, roughly in order.
   `flock` for the store's life, and a second open, from another process or
   this one, fails at once and touches nothing (`tests/db.rs`). Readers in
   other processes are not supported.
+- [ ] **Order ordered ingest's runs across a machine's crash.** Under a
+  policy that does not sync at every commit (`SyncPolicy::EveryN`), a
+  closed run's last records are synced by its seal while the writer
+  commits to the next run, and the policy's sync of that run can reach the
+  device first: a machine's crash in between recovers the later commits
+  without the earlier ones, where the policy promises a tail lost whole.
+  This is read from the code and not reproduced: it takes a rig that
+  cuts the power.
+  A process's death no longer can -- a closing run's records are written
+  before the run is handed to its seal (`CLAUDE.md`, a hand-off that left
+  the old run's end with its new owner). The WAL orders its files across
+  a rotation with a loose boundary the first sync chains; a run needs the
+  same, or the next run's first sync waits for the last run's.
 - [ ] **Backup or checkpoint.** A consistent copy of a live store, like
   LMDB's `mdb_env_copy` or RocksDB's `Checkpoint`. Table stakes for
   operating a store.

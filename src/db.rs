@@ -8614,6 +8614,17 @@ impl SegmentWriter {
     }
 
     pub fn sync(&mut self) -> Result<()> {
+        self.write_out()?;
+        self.out.get_ref().sync_data()?;
+        self.out.synced_all();
+        Ok(())
+    }
+
+    /// Everything written so far handed to the file, with no barrier: the
+    /// records the writer holds until a write piece is whole, which a
+    /// sync writes before its barrier and a direct run's close writes
+    /// before the run is handed to its seal (`Db::close_run`).
+    pub(crate) fn write_out(&mut self) -> Result<()> {
         // Records held for a marker that has not come are written, not
         // committed: without their marker the recovery walk stops before
         // them, as it does for a batch nobody was told was durable.
@@ -8626,12 +8637,10 @@ impl SegmentWriter {
             self.mark_crc = block::crc32_combine(self.mark_crc, c, self.batch_buf.len() as u64);
             self.batch_buf.clear();
         }
-        // A streamed writer's tail, held for a whole piece: the sync covers
+        // A streamed writer's tail, held for a whole piece: a sync covers
         // only what is on the file.
         self.out.stream_flush(true)?;
         self.out.flush()?;
-        self.out.get_ref().sync_data()?;
-        self.out.synced_all();
         Ok(())
     }
 
@@ -9850,6 +9859,10 @@ impl PieceWriter {
 
     fn sync(&mut self) -> Result<()> {
         self.0.sync()
+    }
+
+    fn write_out(&mut self) -> Result<()> {
+        self.0.write_out()
     }
 
     /// The segment, then its ordered index's bytes for the caller to write
@@ -32136,16 +32149,34 @@ impl Db {
         };
         self.land_seal()?;
         let table = self.freeze();
-        self.close_run(d, table);
-        Ok(())
+        self.close_run(d, table)
     }
 
     /// The direct run `d` -- `table`'s records, committed to its segment
     /// -- closed on the seal thread and handed to the segment work; the
     /// second half of `close_direct`, and of `hand_tail` for an ordered
     /// table handed without a freeze.
-    fn close_run(&mut self, d: Direct, table: std::sync::Arc<MemTable>) {
+    ///
+    /// The run's records are on its file before it is handed over. Under a
+    /// policy that syncs at every commit they are already; under one that
+    /// does not, the commits since the last whole write piece are in the
+    /// writer's buffer, and were left there for the seal's thread to write
+    /// with the trailer, while this thread went on into the next run and
+    /// its first whole piece reached its own file first. A process that
+    /// died between the two left the closed run's file short of its last
+    /// commits beside a newer run holding later ones, and the open
+    /// recovered both: acknowledged batches gone from the middle of the
+    /// history, which no policy allows (`SyncPolicy`: an unsynced tail is
+    /// lost whole and never served in part). Written here, in the order
+    /// the writer committed them, a death leaves every closed run whole
+    /// and takes only the open run's end. At a drain the writer waits for
+    /// the seal and commits nothing meanwhile, so the seal's thread writes
+    /// the end as it did.
+    fn close_run(&mut self, mut d: Direct, table: std::sync::Arc<MemTable>) -> Result<()> {
         debug_assert_eq!(table.len(), d.committed, "a run closes between batches");
+        if !self.draining {
+            d.w.write_out()?;
+        }
         let end_seq = self.wal.seq;
         // First, since it moves the held state to the latest, and the name
         // below is cut against the same state.
@@ -32296,6 +32327,7 @@ impl Db {
                 }
             }
         }
+        Ok(())
     }
 
     /// Freeze the memtable, rotate the WAL, and hand the frozen table to a
@@ -32895,7 +32927,7 @@ impl Db {
                 );
                 return Ok(());
             };
-            self.close_run(d, table.clone());
+            self.close_run(d, table.clone())?;
         } else {
             // Marked handed only once the seal is in flight: marked before,
             // a seal that failed to start -- the WAL rotation's create or
