@@ -5171,25 +5171,51 @@ pub struct Options {
     /// `supdb-zhotfillquiet` turns it on.
     #[doc(hidden)]
     pub zpages_hot_fill_quiet: bool,
-    /// EXPERIMENT: a walk of a partition's raw records in one run -- the
-    /// drained store's one walk from the seek (`cache_scan`) and a run of
-    /// the merge path's walk (`part_scan_z`) where no form file serves --
-    /// asks for the run's records ahead of it (`Blob::prefetch_ranks`, at
-    /// most `SCAN_RAW_AHEAD_CAP` bytes), as a block walk asks for the next
-    /// block's. The walk asked for nothing: on three threads at ten million
-    /// keys under 1.25 GiB two thirds of its samples were on the load of a
-    /// record's header, and a raw entry cost 55 ns against a decoded
-    /// one's 65 where one thread walks it at a third of that.
-    /// `supdb-scanrawahead` turns it on.
+    /// A walk of a partition's raw records in one run -- the drained
+    /// store's one walk from the seek (`cache_scan`) and a run of the merge
+    /// path's walk (`part_scan_z`) where no form file serves -- asks for the
+    /// run's records ahead of it (`Blob::prefetch_ranks`, at most
+    /// `SCAN_RAW_AHEAD_CAP` bytes), as a block walk asks for the next
+    /// block's, where the records are past the cache
+    /// (`scan_raw_ahead_past_llc`). The walk asked for nothing: on three
+    /// threads at ten million keys under 1.25 GiB two thirds of its samples
+    /// were on the load of a record's header, and a raw entry cost 55 ns
+    /// against a decoded one's 65. Paired there in the row's whole order
+    /// (`pair.sh supdb supdb-scanrawahead 10000000 --bound 1342177280
+    /// --passes
+    /// load,read,read-threaded,scan,scan-threaded,mixes,scan-mixed,mixes-scrambled
+    /// --ops-div 10 --reps 4`, at `0b89622`) the threaded scans read
+    /// 1.03-1.07x with the cells it cannot reach leaning 3-5% the other way
+    /// in one sitting; in core at three million keys (`pair.sh supdb
+    /// supdb-scanrawahead 3000000 --reps 6`) the scan passes read
+    /// 1.31-1.48x and the drained store's lag point 1.35x and 1.56x. At
+    /// three hundred thousand keys, whose records the cache holds, the
+    /// threaded scans read 0.84-0.90x: the asks waited for fill buffers on
+    /// lines the walk would have found in the cache. Paced through the walk
+    /// (`scan_raw_ahead_lead`) it read no better. `supdb-noscanrawahead`
+    /// walks without it.
     #[doc(hidden)]
     pub scan_raw_ahead: bool,
+    /// Under `scan_raw_ahead`, ask only where the partitions' key and value
+    /// bytes pass the last-level cache the platform reports (`llc_bytes`,
+    /// read once): within it the records a walk reads are the cache's, and
+    /// asked for they cost the threaded scans at three hundred thousand
+    /// keys a tenth. `supdb-scanrawahead` asks whatever the store's size.
+    #[doc(hidden)]
+    pub scan_raw_ahead_past_llc: bool,
     /// EXPERIMENT: under `scan_raw_ahead`, the records asked for as the
     /// walk goes, this many bytes ahead of the record being read
     /// (`Blob::scan_at_paced`), where zero asks for the run's whole span
     /// at its start. Asked all at once, the run's two hundred lines waited
     /// for fill buffers before the walk began: a third of the time the
     /// ask saved, on three threads at ten million keys under 1.25 GiB.
-    /// `supdb-scanrawpaced` sets it.
+    /// Paced a kilobyte ahead against the run asked at its start (`pair.sh
+    /// supdb-scanrawahead supdb-scanrawpaced 10000000 --bound 1342177280`
+    /// in the row's whole order, at `f933e14`) the three-thread scans read
+    /// 0.98x and 1.03x with the cells it cannot reach leaning 2% and 7%
+    /// its way, and the one-thread scan pass 0.85x and 0.90x: the check and
+    /// the ask on every record cost what the wait they spread had. Zero;
+    /// `supdb-scanrawpaced` sets a kilobyte.
     #[doc(hidden)]
     pub scan_raw_ahead_lead: usize,
     /// The hot-raw policy's way back -- a raw partition's form file attached
@@ -5621,7 +5647,8 @@ impl Default for Options {
             zpages_hot_ask_idle: false,
             zpages_hot_growth_pct: 10,
             zpages_hot_fill_quiet: false,
-            scan_raw_ahead: false,
+            scan_raw_ahead: true,
+            scan_raw_ahead_past_llc: true,
             scan_raw_ahead_lead: 0,
             zpages_seek_seeds: false,
             sweep_remembers_pin: true,
@@ -16556,6 +16583,94 @@ const SETTLE_PLANS: usize = 16;
 /// few pages.
 const WILLNEED_CAP: usize = 64 << 10;
 
+/// Whether a raw walk asks for its records ahead of it, for a store whose
+/// partitions hold `data_bytes` of keys and values (`Shared::raw_ahead`).
+fn raw_ahead_on(opts: &Options, data_bytes: u64) -> bool {
+    opts.scan_raw_ahead && (!opts.scan_raw_ahead_past_llc || data_bytes > llc_bytes())
+}
+
+/// The last-level cache's bytes as the platform reports them, read once:
+/// the line `Options::scan_raw_ahead_past_llc` draws, past which a raw
+/// walk's records come from memory rather than the cache. The size of the
+/// highest-level data or unified cache under
+/// `/sys/devices/system/cpu/cpu0/cache`, and 32 MiB where nothing says.
+fn llc_bytes() -> u64 {
+    static LLC: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LLC.get_or_init(|| {
+        let mut best: Option<(u32, u64)> = None;
+        for i in 0..16 {
+            let dir = format!("/sys/devices/system/cpu/cpu0/cache/index{i}");
+            let read = |f: &str| std::fs::read_to_string(format!("{dir}/{f}")).ok();
+            let Some(level) = read("level").and_then(|s| s.trim().parse::<u32>().ok()) else {
+                break;
+            };
+            if read("type").is_some_and(|t| t.trim() == "Instruction") {
+                continue;
+            }
+            let Some(bytes) = read("size").and_then(|s| cache_size_bytes(s.trim())) else {
+                continue;
+            };
+            if best.is_none_or(|(l, _)| level > l) {
+                best = Some((level, bytes));
+            }
+        }
+        best.map_or(32 << 20, |(_, b)| b)
+    })
+}
+
+/// A cache size as sysfs writes it -- `48K`, `2048K`, `32M` -- in bytes.
+fn cache_size_bytes(s: &str) -> Option<u64> {
+    let (num, mul) = match s.as_bytes().last()? {
+        b'K' => (&s[..s.len() - 1], 1u64 << 10),
+        b'M' => (&s[..s.len() - 1], 1 << 20),
+        b'G' => (&s[..s.len() - 1], 1 << 30),
+        _ => (s, 1),
+    };
+    num.parse::<u64>().ok().map(|n| n * mul)
+}
+
+#[cfg(test)]
+mod raw_ahead_tests {
+    use super::*;
+
+    /// The sizes sysfs writes, and what is not one.
+    #[test]
+    fn a_cache_size_reads_as_sysfs_writes_it() {
+        assert_eq!(cache_size_bytes("48K"), Some(48 << 10));
+        assert_eq!(cache_size_bytes("2048K"), Some(2 << 20));
+        assert_eq!(cache_size_bytes("266240K"), Some(272_629_760));
+        assert_eq!(cache_size_bytes("32M"), Some(32 << 20));
+        assert_eq!(cache_size_bytes("1G"), Some(1 << 30));
+        assert_eq!(cache_size_bytes("4096"), Some(4096));
+        assert_eq!(cache_size_bytes(""), None);
+        assert_eq!(cache_size_bytes("K"), None);
+        assert_eq!(cache_size_bytes("lots"), None);
+        assert!(llc_bytes() > 0);
+    }
+
+    /// The ask is the option's, and past the cache only where the option
+    /// for the line says so: a store within the cache walks without it.
+    #[test]
+    fn a_raw_walk_asks_ahead_only_past_the_cache() {
+        let o = Options::default();
+        assert!(o.scan_raw_ahead && o.scan_raw_ahead_past_llc);
+        assert!(!raw_ahead_on(&o, 0));
+        assert!(!raw_ahead_on(&o, llc_bytes()));
+        assert!(raw_ahead_on(&o, llc_bytes() + 1));
+        let always = Options {
+            scan_raw_ahead_past_llc: false,
+            ..Options::default()
+        };
+        assert!(raw_ahead_on(&always, 0));
+        let never = Options {
+            scan_raw_ahead: false,
+            scan_raw_ahead_past_llc: false,
+            ..Options::default()
+        };
+        assert!(!raw_ahead_on(&never, u64::MAX));
+    }
+}
+
 /// The most of a raw walk's records `Options::scan_raw_ahead` asks for at
 /// its start: a scan of a hundred of the suite's records is thirteen
 /// kilobytes, and a walk past this much has the hardware's own stream.
@@ -16922,6 +17037,13 @@ struct Shared {
     retired: RetireList<Box<State>>,
     /// Which form a read takes (`ZGate`).
     zgate: ZGate,
+    /// Whether a raw walk asks for its records ahead of it
+    /// (`Options::scan_raw_ahead`): the option, and the partitions' key and
+    /// value bytes past the last-level cache where
+    /// `Options::scan_raw_ahead_past_llc` says so. Set at the open and at
+    /// every segment publish, beside `State::data_bytes`, and read relaxed:
+    /// a hint a walk takes or leaves.
+    raw_ahead: std::sync::atomic::AtomicBool,
     /// The out-of-core asks' counts (`AskCounts`), on a line of their own.
     asks: AskCounts,
     /// Which mode the segment mappings are in: `true` is `MADV_RANDOM`.
@@ -22567,7 +22689,7 @@ impl Reader {
         f: &mut F,
     ) -> Result<usize> {
         let blob = seg.raw();
-        let r = if self.opts.scan_raw_ahead && n > 1 {
+        let r = if n > 1 && self.shared.raw_ahead.load(AtomicOrdering::Relaxed) {
             if self.opts.scan_raw_ahead_lead > 0 {
                 blob.scan_at_paced(rank, n, self.opts.scan_raw_ahead_lead, &mut *f)
             } else {
@@ -30790,6 +30912,7 @@ impl Db {
             state: AtomicPtr::new(Box::into_raw(Box::new(state))),
             readers: Readers::new(opts.asym_pins, opts.sweep_remembers_pin),
             retired: RetireList::new(),
+            raw_ahead: std::sync::atomic::AtomicBool::new(raw_ahead_on(&opts, data_bytes)),
             advice_random: std::sync::atomic::AtomicBool::new(starts_random),
             retired_forms: RetireList::new(),
             retired_snaps: RetireList::new(),
@@ -31383,6 +31506,7 @@ impl Db {
             state: AtomicPtr::new(Box::into_raw(Box::new(state))),
             readers,
             retired: RetireList::new(),
+            raw_ahead: std::sync::atomic::AtomicBool::new(raw_ahead_on(&opts, data_bytes)),
             advice_random: std::sync::atomic::AtomicBool::new(starts_random),
             retired_forms: RetireList::new(),
             retired_snaps: RetireList::new(),
@@ -42245,6 +42369,10 @@ impl Maint {
         let mean_key_bytes = Db::mean_key_bytes_of(&segs);
         let store_bytes = Db::store_bytes_of(&self.dir, &segs);
         let data_bytes = Db::data_bytes_of(&segs);
+        self.shared.raw_ahead.store(
+            raw_ahead_on(&self.opts, data_bytes),
+            AtomicOrdering::Relaxed,
+        );
         let l0_aligned = Db::l0_aligned_of(&segs);
         let segs_tombs = segs.iter().any(|s| s.tombs);
         loop {

@@ -1115,9 +1115,13 @@ pub struct Supdb {
     /// The fill's quiet looks take the growth share too
     /// (`Options::zpages_hot_fill_quiet`): `supdb-zhotfillquiet`.
     zhotfillquiet: bool,
-    /// A raw walk's records asked for ahead of it
-    /// (`Options::scan_raw_ahead`): `supdb-scanrawahead`.
+    /// A raw walk's records asked for ahead of it on every store, within
+    /// the cache or past it (`Options::scan_raw_ahead_past_llc` off):
+    /// `supdb-scanrawahead`.
     scanrawahead: bool,
+    /// A raw walk asks for nothing ahead of it (`Options::scan_raw_ahead`
+    /// off): `supdb-noscanrawahead`.
+    noscanrawahead: bool,
     /// The same records asked for paced through the walk, a kilobyte ahead
     /// (`Options::scan_raw_ahead_lead`): `supdb-scanrawpaced`.
     scanrawpaced: bool,
@@ -2237,8 +2241,11 @@ struct Policy {
     /// The fill's quiet looks with the growth share in their room:
     /// `supdb-zhotfillquiet`.
     zhotfillquiet: bool,
-    /// A raw walk's records asked for ahead of it: `supdb-scanrawahead`.
+    /// A raw walk's records asked for ahead of it on every store:
+    /// `supdb-scanrawahead`.
     scanrawahead: bool,
+    /// A raw walk asks for nothing ahead of it: `supdb-noscanrawahead`.
+    noscanrawahead: bool,
     /// Asked for paced through the walk: `supdb-scanrawpaced`.
     scanrawpaced: bool,
     /// The start placed once: `supdb-zseekseed`.
@@ -2664,6 +2671,7 @@ impl Default for Policy {
             zhotgrowth5: false,
             zhotfillquiet: false,
             scanrawahead: false,
+            noscanrawahead: false,
             scanrawpaced: false,
             zseekseed: false,
             zhotcoldback: false,
@@ -8080,6 +8088,7 @@ impl Supdb {
             zhotgrowth5,
             zhotfillquiet,
             scanrawahead,
+            noscanrawahead,
             scanrawpaced,
             zseekseed,
             zhotcoldback,
@@ -8623,8 +8632,13 @@ impl Supdb {
             zpages_hot_ask_idle: zhotaskidle,
             zpages_hot_growth_pct: if zhotgrowth5 { 5 } else { 10 },
             zpages_hot_fill_quiet: zhotfillquiet,
-            scan_raw_ahead: scanrawahead || scanrawpaced,
-            scan_raw_ahead_lead: if scanrawpaced { 1024 } else { 0 },
+            scan_raw_ahead: !noscanrawahead,
+            scan_raw_ahead_past_llc: !(scanrawahead || scanrawpaced),
+            scan_raw_ahead_lead: if scanrawpaced {
+                1024
+            } else {
+                supdb::Options::default().scan_raw_ahead_lead
+            },
             zpages_seek_seeds: zseekseed,
             zpages_hot_cold_back: zhotcoldback,
             sweep_remembers_pin: !sweepwalks,
@@ -8904,6 +8918,7 @@ impl Supdb {
             zhotgrowth5,
             zhotfillquiet,
             scanrawahead,
+            noscanrawahead,
             scanrawpaced,
             zseekseed,
             zhotcoldback,
@@ -9293,6 +9308,9 @@ impl Engine for Supdb {
         }
         if self.scanrawahead {
             return "supdb-scanrawahead";
+        }
+        if self.noscanrawahead {
+            return "supdb-noscanrawahead";
         }
         if self.scanrawpaced {
             return "supdb-scanrawpaced";
@@ -11676,6 +11694,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zhotfillquiet"
         | "supdb-scanrawahead"
         | "supdb-scanrawpaced"
+        | "supdb-noscanrawahead"
         | "supdb-zseekseed"
         | "supdb-zhotcoldback"
         | "supdb-sweepwalks"
@@ -12115,6 +12134,18 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-memo64" => supdb_arm(Supdb::create_memo64, dir)?,
         "supdb-zhotaskidle" => supdb_arm(Supdb::create_zhotaskidle, dir)?,
         "supdb-zhotgrowth5" => supdb_arm(Supdb::create_zhotgrowth5, dir)?,
+        "supdb-noscanrawahead" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        noscanrawahead: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
         "supdb-scanrawpaced" => supdb_arm(
             |d| {
                 Supdb::with_policy(
@@ -14486,7 +14517,22 @@ mod tests {
                 assert_eq!(z.name(), "supdb-scanrawahead");
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
-                assert!(o.scan_raw_ahead && !b.scan_raw_ahead);
+                assert!(o.scan_raw_ahead && !o.scan_raw_ahead_past_llc);
+                assert!(b.scan_raw_ahead && b.scan_raw_ahead_past_llc);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("noscanrawahead"),
+                    Policy {
+                        noscanrawahead: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-noscanrawahead");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.scan_raw_ahead && b.scan_raw_ahead);
             }
             {
                 let z = Supdb::with_policy(
@@ -14501,7 +14547,7 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.scan_raw_ahead && o.scan_raw_ahead_lead == 1024);
-                assert!(!b.scan_raw_ahead && b.scan_raw_ahead_lead == 0);
+                assert!(!o.scan_raw_ahead_past_llc && b.scan_raw_ahead_lead == 0);
             }
             {
                 let z = Supdb::create_zseekseed(&dir("zseekseed")).unwrap();

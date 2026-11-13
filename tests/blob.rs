@@ -676,11 +676,7 @@ fn a_paced_walk_hands_out_what_the_plain_walk_does() {
     // general loop, at leads short of a record, longer than one, and past
     // the record region's end.
     for compact in [false, true] {
-        let path = scratch(if compact {
-            "paced-compact"
-        } else {
-            "paced"
-        });
+        let path = scratch(if compact { "paced-compact" } else { "paced" });
         build_opts(&path, 300, false, 256, compact);
         let blob = Blob::open(MmapBytes::open(&path).expect("map")).expect("open");
         let keys = blob.keys();

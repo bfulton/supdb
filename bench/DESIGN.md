@@ -610,6 +610,14 @@ fence searched at every page and the memo asked twice a group
 (`Options::zpages_bulk_steps` off), and `supdb-zflatshort` with the flat
 LZ4 decoder lent the fast loop's slack alone, so each group's last
 sequences go the fast loop's way (`Options::zpages_flat_slack` off);
+`supdb-noscanrawahead` is `supdb` with a walk of a partition's raw
+records asking for none of them ahead of it (`Options::scan_raw_ahead`
+off), `supdb-scanrawahead` with the ask made on every store, within the
+last-level cache or past it (`Options::scan_raw_ahead_past_llc` off), and
+`supdb-scanrawpaced` with it made a kilobyte ahead as the walk goes
+(`Options::scan_raw_ahead_lead`); `supdb-zhotfillquiet` is `supdb` with
+the hot-raw fill's quiet looks taking the growth share into their room
+(`Options::zpages_hot_fill_quiet`);
 `supdb-zpromote` is `supdb`
 with a block that scans have walked a block's worth of entries held as a
 merged copy in its slot under the form file (`Options::promote_entries` at
