@@ -197,9 +197,17 @@ sh web/build.sh                # the browser module
 
 ## Status
 
-A prototype. The on-disk format is not yet stable: it changes its magic
-whenever an older reader would misread a newer file, and refuses the file
-rather than serving wrong bytes.
+A prototype. A store records its format version in its manifest
+(`supdb::STORE_FORMAT`, version 1). A release opens a store of any version
+from `supdb::STORE_FORMAT_OLDEST` to its own, and refuses any other at
+open, naming both versions, before it sweeps, replays or rewrites
+anything; it never opens a store it would misread. Each file also carries
+a magic that moves whenever an older reader would misread it, so a reader
+refuses the file rather than serving wrong bytes.
+
+A store is open in one place at a time. A second open, from another process
+or from the same one, fails at once while the first holds the store's
+`LOCK`, and the lock goes with the process that holds it.
 
 ## License
 

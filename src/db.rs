@@ -13328,7 +13328,65 @@ fn check_options(opts: &Options) -> Result<()> {
 /// body_len | u32 crc | body`, had no sequence and one file; it is read as
 /// a sequence of zero, and a store that has one gets its second slot at
 /// the open.
+///
+/// A version-3 body ends in the store's format version
+/// (`STORE_FORMAT`), the four bytes behind the names: a reader from before
+/// it stops at the names and never reads the word, and a body without it
+/// was written before versions were recorded, which is version 1.
 const MANIFEST_MAGIC: &[u8; 9] = b"SUPDBMAN\x03";
+/// The magic's bytes before the version byte: a manifest that carries them
+/// with a version past this one's is a newer release's, refused as one.
+const MANIFEST_HEAD: &[u8; 8] = b"SUPDBMAN";
+
+/// The store's format version: one number for the files a store's
+/// directory holds, recorded in every manifest the store writes and
+/// checked when the store opens, before anything in its directory is
+/// swept, replayed or written.
+///
+/// Version 1 is the first one recorded, and it names the files as they
+/// stand at it: the segment's superblock (`format::MAGIC`, version 0007),
+/// the manifest (`SUPDBMAN\x03`), the WAL (`SUPDBWL\x04`), the ordered
+/// index (`SUPDORD1`) and the compact form's file (`SUPDZPG2`). A change
+/// that moves any of those moves this, and
+/// `store_format_names_the_files_magics` is the test that holds the two
+/// together.
+///
+/// What a release promises: it opens a store of any version from
+/// `STORE_FORMAT_OLDEST` to its own, and refuses any other with an error
+/// that names the store's version and the ones it reads, so it never opens
+/// a store it would misread. A store whose manifests record no version was
+/// written before versions were, and is version 1; its files' magics hold
+/// it to that as they did before.
+pub const STORE_FORMAT: u32 = 1;
+
+/// The oldest store format version this release opens.
+pub const STORE_FORMAT_OLDEST: u32 = 1;
+const _: () = assert!(STORE_FORMAT_OLDEST <= STORE_FORMAT);
+
+/// The refusal for a store of format `format` where this release reads
+/// another; `Ok` where it reads it.
+fn check_store_format(dir: &Path, format: u32) -> Result<()> {
+    if (STORE_FORMAT_OLDEST..=STORE_FORMAT).contains(&format) {
+        return Ok(());
+    }
+    let reads = if STORE_FORMAT_OLDEST == STORE_FORMAT {
+        format!("version {STORE_FORMAT}")
+    } else {
+        format!("versions {STORE_FORMAT_OLDEST} to {STORE_FORMAT}")
+    };
+    let whose = if format > STORE_FORMAT {
+        "a newer release's"
+    } else {
+        "an older release's"
+    };
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!(
+            "the store at {} is format version {format}, {whose}; this release reads {reads}",
+            dir.display()
+        ),
+    ))
+}
 const MANIFEST_MAGIC_V2: &[u8; 9] = b"SUPDBMAN\x02";
 const MANIFEST_MAGIC_V1: &[u8; 9] = b"SUPDBMAN\x01";
 /// The flag byte behind each name in a version-3 body: the segment is
@@ -13367,8 +13425,21 @@ fn sweep_manifest_spares(dir: &Path) -> Result<()> {
 
 /// A manifest's bytes: the header, then the covered sequence and the
 /// names, each with its flag byte -- `MANIFEST_PENDING` for the names in
-/// `pending`.
+/// `pending` -- and the store's format version.
 fn manifest_encode(seq: u64, covered_seq: u64, names: &[String], pending: &[String]) -> Vec<u8> {
+    manifest_encode_as(seq, covered_seq, names, pending, Some(STORE_FORMAT))
+}
+
+/// `manifest_encode` recording `format`, or no version where it is `None`,
+/// as a release before versions wrote: the tests' way to make the stores
+/// another release would leave.
+fn manifest_encode_as(
+    seq: u64,
+    covered_seq: u64,
+    names: &[String],
+    pending: &[String],
+    format: Option<u32>,
+) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&covered_seq.to_le_bytes());
     body.extend_from_slice(&(names.len() as u32).to_le_bytes());
@@ -13380,6 +13451,9 @@ fn manifest_encode(seq: u64, covered_seq: u64, names: &[String], pending: &[Stri
         } else {
             0
         });
+    }
+    if let Some(f) = format {
+        body.extend_from_slice(&f.to_le_bytes());
     }
     let crc = block::crc32_resume(crc32(&seq.to_le_bytes()), &body);
     let mut out = Vec::with_capacity(body.len() + 25);
@@ -13516,6 +13590,9 @@ struct Manifest {
     names: Vec<String>,
     /// The names flagged `MANIFEST_PENDING`; none below version 3.
     pending: Vec<String>,
+    /// The store's format version the slot records (`STORE_FORMAT`): 1
+    /// where it records none.
+    format: u32,
 }
 
 /// One manifest file parsed, either version. A file that fails its CRC is
@@ -13535,6 +13612,14 @@ fn manifest_parse(buf: &[u8]) -> Result<Manifest> {
         )
     } else if buf.len() >= 17 && &buf[..9] == MANIFEST_MAGIC_V1 {
         (1u8, 0u64, 9usize)
+    } else if buf.len() >= 9 && &buf[..8] == MANIFEST_HEAD && buf[8] > MANIFEST_MAGIC[8] {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "manifest version {} is a newer release's; this release reads up to {}",
+                buf[8], MANIFEST_MAGIC[8]
+            ),
+        ));
     } else {
         return Err(err("manifest magic is wrong"));
     };
@@ -13581,12 +13666,17 @@ fn manifest_parse(buf: &[u8]) -> Result<Manifest> {
         }
         names.push(name);
     }
+    let format = match body.get(p..p + 4) {
+        Some(w) if version >= 3 => u32::from_le_bytes(w.try_into().unwrap()),
+        _ => 1,
+    };
     Ok(Manifest {
         version,
         seq,
         covered,
         names,
         pending,
+        format,
     })
 }
 
@@ -13596,6 +13686,8 @@ fn manifest_parse(buf: &[u8]) -> Result<Manifest> {
 /// fails its CRC is a torn write: ignored where another slot is valid,
 /// since the torn one is the publish the crash interrupted and the other
 /// is the store, and refused where no slot is valid rather than guessed at.
+/// A slot of a newer release's layout is no torn write, and is refused
+/// whatever the other slot holds.
 fn manifest_read_all(dir: &Path) -> Result<Vec<Manifest>> {
     let mut valid: Vec<Manifest> = Vec::new();
     let mut torn: Option<std::io::Error> = None;
@@ -13611,6 +13703,10 @@ fn manifest_read_all(dir: &Path) -> Result<Vec<Manifest>> {
         }
         match manifest_parse(&buf) {
             Ok(m) => valid.push(m),
+            // A newer release's slot beside an older one is not a torn
+            // write: the older slot is the state before the newer
+            // release's publish, and taking it would be a misread.
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => return Err(e),
             Err(e) => torn = Some(e),
         }
     }
@@ -13618,6 +13714,224 @@ fn manifest_read_all(dir: &Path) -> Result<Vec<Manifest>> {
     match (valid.is_empty(), torn) {
         (true, Some(e)) => Err(e),
         _ => Ok(valid),
+    }
+}
+
+#[cfg(test)]
+mod store_format {
+    use super::*;
+
+    fn fresh(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("supdb-next-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Every file in `dir` by name, with its bytes.
+    fn the_directory(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                let name = e.file_name().to_string_lossy().into_owned();
+                (name, std::fs::read(e.path()).unwrap())
+            })
+            .collect()
+    }
+
+    /// A closed store of a thousand keys sealed into a segment, with the
+    /// newest of its manifests.
+    fn a_store(name: &str) -> (PathBuf, Manifest) {
+        let d = fresh(name);
+        let mut db = Db::create(&d, Options::default()).unwrap();
+        for i in 0..1000u32 {
+            db.append(format!("k{i:05}").as_bytes(), b"v");
+        }
+        db.commit().unwrap();
+        db.close().unwrap();
+        let m = manifest_read_all(&d).unwrap().remove(0);
+        assert!(!m.names.is_empty(), "a store with a segment");
+        (d, m)
+    }
+
+    /// The files format version 1 names, by their magics: a change that
+    /// moves one of them makes a new store format, so it moves
+    /// `STORE_FORMAT` and this table with it, and says by
+    /// `STORE_FORMAT_OLDEST` whether the release still reads the version
+    /// before.
+    #[test]
+    fn store_format_names_the_files_magics() {
+        let version_1 = (
+            0x5355_5044_4200_0007u64,
+            *b"SUPDBMAN\x03",
+            (*b"SUPDBWL", 4u8, 5u8),
+            0x3144_524f_4450_5553u64,
+            *b"SUPDZPG2",
+        );
+        let now = (
+            crate::format::MAGIC,
+            *MANIFEST_MAGIC,
+            (*WAL_HEAD, WAL_CHAINED, WAL_LOOSE),
+            crate::ordindex::MAGIC,
+            zpages::ZMAGIC,
+        );
+        assert_eq!(
+            (STORE_FORMAT, now),
+            (1, version_1),
+            "a file's magic moved without the store's format version: \
+             move STORE_FORMAT, this table and STORE_FORMAT_OLDEST together"
+        );
+    }
+
+    /// Every manifest a store writes records its version, from the slot
+    /// `create` writes on.
+    #[test]
+    fn every_manifest_records_the_format() {
+        let (d, m) = a_store("format-recorded");
+        assert_eq!(m.format, STORE_FORMAT);
+        // By its bytes, since a slot without the word reads as version 1
+        // too: the slot is the encoding with the word, not without it.
+        let slot = std::fs::read(d.join(manifest_slot(m.seq))).unwrap();
+        let with = manifest_encode_as(m.seq, m.covered, &m.names, &m.pending, Some(STORE_FORMAT));
+        let without = manifest_encode_as(m.seq, m.covered, &m.names, &m.pending, None);
+        assert_eq!(&slot[..with.len()], &with[..]);
+        assert_ne!(&slot[..without.len()], &without[..]);
+        let born = fresh("format-born");
+        drop(Db::create(&born, Options::default()).unwrap());
+        let slots = manifest_read_all(&born).unwrap();
+        assert!(!slots.is_empty() && slots.iter().all(|m| m.format == STORE_FORMAT));
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&born);
+    }
+
+    /// The refusal names the store's version and the ones the release
+    /// reads, on either side of them.
+    #[test]
+    fn the_refusal_names_both_versions() {
+        let d = Path::new("/store");
+        assert!(check_store_format(d, STORE_FORMAT).is_ok());
+        assert!(check_store_format(d, STORE_FORMAT_OLDEST).is_ok());
+        let newer = check_store_format(d, STORE_FORMAT + 1).unwrap_err();
+        assert_eq!(newer.kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(
+            newer.to_string(),
+            format!(
+                "the store at /store is format version {}, a newer release's; \
+                 this release reads version 1",
+                STORE_FORMAT + 1
+            )
+        );
+        let older = check_store_format(d, STORE_FORMAT_OLDEST - 1).unwrap_err();
+        assert!(older.to_string().contains("an older release's"), "{older}");
+    }
+
+    /// A store whose newest manifest a newer release wrote is refused at
+    /// open, before the open sweeps, replays or rewrites anything: an
+    /// orphan the open would sweep is still there after it, and every
+    /// file's bytes with it.
+    #[test]
+    fn a_store_of_a_newer_format_is_refused_before_its_directory_changes() {
+        let (d, m) = a_store("format-newer");
+        let newer = manifest_encode_as(m.seq + 1, m.covered, &m.names, &[], Some(STORE_FORMAT + 1));
+        std::fs::write(d.join(manifest_slot(m.seq + 1)), newer).unwrap();
+        std::fs::write(d.join("seg-00000000000000ff.sup"), b"an orphan").unwrap();
+        let before = the_directory(&d);
+        let e = Db::open(&d, Options::default())
+            .err()
+            .expect("a newer store refused");
+        assert_eq!(e.kind(), std::io::ErrorKind::Unsupported, "{e}");
+        assert!(e.to_string().contains("a newer release's"), "{e}");
+        assert_eq!(
+            the_directory(&d),
+            before,
+            "the refused open changed the directory"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The older slot counts as much as the newest: a store a newer
+    /// release published into, then a release from before versions
+    /// published over without the word, is the newer release's store.
+    #[test]
+    fn a_newer_format_in_the_older_slot_is_refused() {
+        let (d, m) = a_store("format-older-slot");
+        let newer = manifest_encode_as(m.seq + 1, m.covered, &m.names, &[], Some(STORE_FORMAT + 1));
+        std::fs::write(d.join(manifest_slot(m.seq + 1)), newer).unwrap();
+        let unversioned = manifest_encode_as(m.seq + 2, m.covered, &m.names, &[], None);
+        std::fs::write(d.join(manifest_slot(m.seq + 2)), unversioned).unwrap();
+        let slots = manifest_read_all(&d).unwrap();
+        assert_eq!((slots[0].seq, slots[0].format), (m.seq + 2, 1));
+        let e = Db::open(&d, Options::default()).err().expect("refused");
+        assert!(e.to_string().contains("a newer release's"), "{e}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A manifest of a newer layout, its magic's version past this one's,
+    /// is a newer release's and not a torn write: the slot beside it is
+    /// the state before that release's publish, and is not taken for the
+    /// store.
+    #[test]
+    fn a_newer_manifest_layout_is_refused_and_not_taken_for_torn() {
+        let (d, m) = a_store("format-newer-layout");
+        let mut newer = manifest_encode(m.seq + 1, m.covered, &m.names, &[]);
+        newer[8] = MANIFEST_MAGIC[8] + 1;
+        std::fs::write(d.join(manifest_slot(m.seq + 1)), newer).unwrap();
+        let before = the_directory(&d);
+        let e = Db::open(&d, Options::default()).err().expect("refused");
+        assert_eq!(e.kind(), std::io::ErrorKind::Unsupported, "{e}");
+        assert!(e.to_string().contains("manifest version 4"), "{e}");
+        assert_eq!(the_directory(&d), before);
+        // A slot of garbage beside a valid one is still a torn write.
+        std::fs::write(d.join(manifest_slot(m.seq + 1)), b"SUPDBMXN torn").unwrap();
+        let db = Db::open(&d, Options::default()).unwrap();
+        assert_eq!(db.count(b"k00999").unwrap(), 1);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A store written before versions were recorded -- every slot without
+    /// the word -- is version 1: it opens, reads, and records the version
+    /// at its next publish; and the word behind the names leaves what a
+    /// reader from before it parses as it was.
+    #[test]
+    fn a_store_from_before_versions_is_version_one() {
+        let (d, m) = a_store("format-before");
+        for seq in [m.seq, m.seq + 1] {
+            let old = manifest_encode_as(seq, m.covered, &m.names, &[], None);
+            std::fs::write(d.join(manifest_slot(seq)), old).unwrap();
+        }
+        assert!(manifest_read_all(&d).unwrap().iter().all(|s| s.format == 1));
+        let mut db = Db::open(&d, Options::default()).unwrap();
+        assert_eq!(db.count(b"k00500").unwrap(), 1);
+        db.append(b"k99999", b"v");
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.close().unwrap();
+        let newest = manifest_read_all(&d).unwrap().remove(0);
+        assert!(newest.seq > m.seq + 1);
+        assert_eq!(newest.format, STORE_FORMAT);
+        let with =
+            manifest_parse(&manifest_encode_as(9, 7, &m.names, &m.names[..1], Some(42))).unwrap();
+        let without =
+            manifest_parse(&manifest_encode_as(9, 7, &m.names, &m.names[..1], None)).unwrap();
+        assert_eq!(
+            (
+                with.seq,
+                with.covered,
+                &with.names,
+                &with.pending,
+                with.format
+            ),
+            (
+                without.seq,
+                without.covered,
+                &without.names,
+                &without.pending,
+                42
+            )
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
 
@@ -18533,6 +18847,57 @@ pub struct Db {
     /// What the commit in progress does with its batch, decided when it
     /// hands the upkeep over: see `Hand`.
     upkeep_hand: Hand,
+    /// The store's lock, the last field so that it is the last thing the
+    /// close gives up: `Drop` joins every thread that writes the directory
+    /// and the fields before this one drop after it, and a second open
+    /// that took the lock while any of them still wrote would write beside
+    /// them.
+    lock: StoreLock,
+}
+
+/// A store's lock: `LOCK` in its directory, held under an exclusive
+/// `flock` for the `Db`'s life, so a second open of the store -- another
+/// process's, or this one's while the first is alive -- fails at once
+/// rather than writing beside it. The kernel gives the lock up when the
+/// process holding it dies, so a crashed store opens as it always did, and
+/// the file holds no bytes, so it costs the store nothing on disk. The name
+/// is the same in every release: two releases must exclude each other as
+/// two processes of one do.
+struct StoreLock(File);
+
+impl StoreLock {
+    const NAME: &'static str = "LOCK";
+
+    /// The lock taken, or the refusal that names it. Taken before the
+    /// constructors read or write anything else in the directory: an open
+    /// sweeps the files its manifest does not name, which beside a live
+    /// store are the seal and the merges it has in flight.
+    fn take(dir: &Path) -> Result<StoreLock> {
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(StoreLock::NAME))?;
+        match f.try_lock() {
+            Ok(()) => Ok(StoreLock(f)),
+            Err(std::fs::TryLockError::WouldBlock) => Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                format!(
+                    "the store at {} is open elsewhere: its LOCK is held, by another \
+                     process or by another open of it in this one",
+                    dir.display()
+                ),
+            )),
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
+        }
+    }
+
+    /// The lock given up with its descriptor left open, as a process's
+    /// death gives it up: what `Db::crash` leaves.
+    fn release(&self) {
+        let _ = self.0.unlock();
+    }
 }
 
 /// What a commit does with its batch under `Upkeep::Background`.
@@ -30212,6 +30577,7 @@ impl Db {
         check_options(&opts)?;
         let starts_random = opts.read_advice.starts_random();
         std::fs::create_dir_all(dir)?;
+        let lock = StoreLock::take(dir)?;
         let mut wal = Wal::create(&Db::wal_path(dir, 0), 0, WAL_CHAINED)?;
         let mut spare_wal: *mut PathBuf = std::ptr::null_mut();
         let next_seg = 0u64;
@@ -30488,6 +30854,7 @@ impl Db {
             phase_ns: [0; 3],
             draining: false,
             presync_failed: None,
+            lock,
         };
         db.go_away()?;
         db.start_trimmer();
@@ -30506,6 +30873,7 @@ impl Db {
     /// its first seal, and it opens -- the brief's P-E.
     pub fn open(dir: &Path, opts: Options) -> Result<Db> {
         check_options(&opts)?;
+        let lock = StoreLock::take(dir)?;
         // The manifest is the truth when it exists, and every store made
         // by `create` has one from birth. Without one the directory is
         // scanned, which is how a store written before manifests still
@@ -30531,6 +30899,12 @@ impl Db {
         // since a reader of those versions skips a slot it cannot parse for
         // one it can, and would take the older state for the store.
         let mut slots = manifest_read_all(dir)?;
+        // Every slot's version, the older one's too: a slot a newer release
+        // wrote is refused whichever slot is the newest, before anything
+        // below changes the directory.
+        for m in &slots {
+            check_store_format(dir, m.format)?;
+        }
         let upgrade = slots.iter().any(|m| m.version < 3);
         // Only the newest slot's pending names are in doubt: the slot
         // before it was written by a publish that waited for that seal's
@@ -31071,6 +31445,7 @@ impl Db {
             phase_ns: [0; 3],
             draining: false,
             presync_failed: None,
+            lock,
         };
         db.go_away()?;
         db.start_trimmer();
@@ -34366,6 +34741,17 @@ impl Db {
     /// `Always`.
     pub fn wal_durable(&self) -> (PathBuf, u64, u64) {
         (self.wal.path.clone(), self.wal.synced, self.wal.written)
+    }
+
+    /// The store left as a crash leaves it, for the tests and experiments
+    /// that emulate one: nothing committed, joined, flushed or freed -- its
+    /// threads run on until the process ends, as `mem::forget` leaves them
+    /// -- and its lock given up, as the kernel gives up a dead process's, so
+    /// that the store opens again in this process. `mem::forget` alone
+    /// keeps the lock, and the reopen is refused as a second open.
+    #[doc(hidden)]
+    pub fn crash(self) {
+        std::mem::ManuallyDrop::new(self).lock.release();
     }
 
     /// Commit what is pending, seal the rest. Close is a convenience, not a

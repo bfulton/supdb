@@ -136,13 +136,16 @@ The suite has to be fair before any of its numbers are quoted.
 
 What an engine picker would hit, roughly in order.
 
-- [ ] **A stable on-disk format.** The README calls supdb a prototype whose
-  format is not yet stable. Done when there is a format version and a
-  stated compatibility promise (what a newer release will still open).
-- [ ] **A process lock.** No lock against a second process opening the same
-  store was found. Confirm first; if so, two writers in two processes could
-  corrupt it. Done when a second open fails cleanly (or readers in other
-  processes are supported deliberately).
+- [x] **A stable on-disk format.** A store records its format version in
+  every manifest (`STORE_FORMAT`), and a release opens the versions from
+  `STORE_FORMAT_OLDEST` to its own and refuses any other at open, naming
+  both, before it changes the directory (the README's Status). A test holds
+  the version to the files' magics, so a magic cannot move without it.
+- [x] **A process lock.** There was none: two processes could open one store
+  and write beside each other. A store's `LOCK` is held under an exclusive
+  `flock` for the store's life, and a second open, from another process or
+  this one, fails at once and touches nothing (`tests/db.rs`). Readers in
+  other processes are not supported.
 - [ ] **Backup or checkpoint.** A consistent copy of a live store, like
   LMDB's `mdb_env_copy` or RocksDB's `Checkpoint`. Table stakes for
   operating a store.

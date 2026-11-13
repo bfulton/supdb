@@ -7834,7 +7834,7 @@ fn a_direct_run_streamed_from_its_table_is_the_run_the_copies_write() {
     {
         let d = dir("stream-torn-tail");
         let (db, m) = load(&d);
-        std::mem::forget(db);
+        db.crash();
         let tmp = tmp_of(&d);
         assert!(tmp.exists(), "the open run's temp file");
         let mut f = std::fs::OpenOptions::new().append(true).open(&tmp).unwrap();
@@ -7850,7 +7850,7 @@ fn a_direct_run_streamed_from_its_table_is_the_run_the_copies_write() {
     {
         let d = dir("stream-torn-marker");
         let (db, mut m) = load(&d);
-        std::mem::forget(db);
+        db.crash();
         let tmp = tmp_of(&d);
         let len = std::fs::metadata(&tmp).unwrap().len();
         std::fs::OpenOptions::new()
@@ -7891,7 +7891,7 @@ fn a_direct_run_streamed_from_its_table_is_the_run_the_copies_write() {
             }
             db.commit().unwrap();
         }
-        std::mem::forget(db);
+        db.crash();
     };
     let (dc, ds) = (dir("stream-buffered-copies"), dir("stream-buffered-stream"));
     buffered(&dc, false);
@@ -7954,7 +7954,7 @@ fn a_direct_segment_recovers_to_its_last_commit_marker() {
     {
         let d = dir("direct-torn-tail");
         let (db, m) = load(&d);
-        std::mem::forget(db);
+        db.crash();
         let tmp = tmp_of(&d);
         assert!(tmp.exists(), "the open segment's temp file");
         let mut f = std::fs::OpenOptions::new().append(true).open(&tmp).unwrap();
@@ -7971,7 +7971,7 @@ fn a_direct_segment_recovers_to_its_last_commit_marker() {
     {
         let d = dir("direct-torn-marker");
         let (db, mut m) = load(&d);
-        std::mem::forget(db);
+        db.crash();
         let tmp = tmp_of(&d);
         let len = std::fs::metadata(&tmp).unwrap().len();
         std::fs::OpenOptions::new()
@@ -8005,7 +8005,7 @@ fn a_direct_segment_recovers_to_its_last_commit_marker() {
     {
         let d = dir("direct-lost-page");
         let (db, mut m) = load(&d);
-        std::mem::forget(db);
+        db.crash();
         let tmp = tmp_of(&d);
         let mut bytes = std::fs::read(&tmp).unwrap();
         let last = key(299);
@@ -8088,7 +8088,7 @@ fn a_value_the_record_cannot_hold_sends_its_batch_through_the_wal() {
             assert!(written <= 8, "{name}: the WAL untouched");
             assert!(tmp.exists(), "{name}: a segment open");
         }
-        std::mem::forget(db);
+        db.crash();
         let db = Db::open(&d, Options::default()).unwrap();
         m.check(&db, &format!("{name}: every batch back after a crash"));
     }
@@ -10517,8 +10517,15 @@ fn a_scan_snapshot_stands_across_a_publish_that_leaves_the_memtables() {
         assert!(builds > 0, "{label}: a snapshot was built");
         // The landing: the segments change and the memtables do not.
         db.hold_merge_landing(false);
+        // The wait is for the landing itself, the pieces gone: the merge's
+        // count drops when the segment work takes the merge home, before
+        // it joins the merge's thread and publishes the outputs, so a wait
+        // on the count alone read the store before its landing, once under
+        // the gate's load.
         let t = std::time::Instant::now();
-        while db.in_flight().1 && t.elapsed() < std::time::Duration::from_secs(20) {
+        while (db.in_flight().1 || db.levels() != (1, 0))
+            && t.elapsed() < std::time::Duration::from_secs(20)
+        {
             db.commit().unwrap();
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -17450,7 +17457,7 @@ fn a_pending_manifest_is_the_store_only_once_its_segment_reads_back_whole() {
         // The crash: nothing of the store runs on, the seal thread parked
         // at its hold; the file is what the page cache held, whole, or
         // with a run of its records lost.
-        std::mem::forget(db);
+        db.crash();
         if torn {
             use std::os::unix::fs::FileExt;
             let f = std::fs::OpenOptions::new().write(true).open(&seg).unwrap();
@@ -19155,4 +19162,114 @@ fn the_writes_since_a_scan_are_counted_once_across_a_landing() {
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&d);
     }
+}
+
+/// Every file in a store's directory by name, with its bytes: what a
+/// refused open leaves as it found it.
+fn the_directory(d: &std::path::Path) -> BTreeMap<String, Vec<u8>> {
+    std::fs::read_dir(d)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            let name = e.file_name().to_string_lossy().into_owned();
+            (name, std::fs::read(e.path()).unwrap())
+        })
+        .collect()
+}
+
+/// A second open of a store while the first is alive is refused -- `create`
+/// as much as `open` -- before it changes anything in the directory: an
+/// orphan the open would sweep is still there after it. Each open takes the
+/// lock through a description of its own, so a second open in one process
+/// is refused as a second process's is. Once the first is closed, or
+/// crashed, the store opens.
+#[test]
+fn a_second_open_of_a_store_is_refused_until_the_first_is_gone() {
+    let d = dir("second-open");
+    let mut db = Db::create(&d, Options::default()).unwrap();
+    for i in 0..1000u32 {
+        db.append(format!("k{i:05}").as_bytes(), b"v");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    std::fs::write(d.join("seg-00000000000000ff.sup"), b"an orphan").unwrap();
+    let before = the_directory(&d);
+    for (what, e) in [
+        ("open", Db::open(&d, Options::default()).err()),
+        ("create", Db::create(&d, Options::default()).err()),
+    ] {
+        let e = e.unwrap_or_else(|| panic!("a second {what} of a live store"));
+        assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{what}: {e}");
+        assert!(e.to_string().contains("LOCK"), "{what}: {e}");
+    }
+    assert_eq!(
+        the_directory(&d),
+        before,
+        "a refused open changed the directory"
+    );
+    db.append(b"k99999", b"after");
+    db.commit().unwrap();
+    db.close().unwrap();
+    let mut db = Db::open(&d, Options::default()).unwrap();
+    assert_eq!(db.count(b"k00500").unwrap(), 1);
+    assert_eq!(db.count(b"k99999").unwrap(), 1);
+    assert!(
+        !d.join("seg-00000000000000ff.sup").exists(),
+        "the open that took the lock swept the orphan"
+    );
+    db.append(b"k99998", b"before the crash");
+    db.commit().unwrap();
+    db.crash();
+    let db = Db::open(&d, Options::default()).unwrap();
+    assert_eq!(db.count(b"k99998").unwrap(), 1, "a crashed store opens");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The same refusal from another process: this test binary run again on
+/// this one test, with the store's path in `SUPDB_LOCK_PROBE`, opens the
+/// store and says through its exit code what it got. Refused while the
+/// first process holds the store, opened once it has let go.
+#[test]
+fn a_store_open_in_one_process_is_refused_to_another() {
+    const PROBE: &str = "SUPDB_LOCK_PROBE";
+    const TEST: &str = "a_store_open_in_one_process_is_refused_to_another";
+    if let Some(p) = std::env::var_os(PROBE) {
+        let code = match Db::open(std::path::Path::new(&p), Options::default()) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => 3,
+            Err(_) => 4,
+            Ok(_) => 5,
+        };
+        std::process::exit(code);
+    }
+    let d = dir("lock-process");
+    let probe = |d: &std::path::Path| {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--test-threads", "1", "--nocapture"])
+            .env(PROBE, d)
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let mut db = Db::create(&d, Options::default()).unwrap();
+    db.append(b"k", b"v");
+    db.commit().unwrap();
+    let (code, err) = probe(&d);
+    assert_eq!(
+        code,
+        Some(3),
+        "another process's open of a live store: {err}"
+    );
+    db.close().unwrap();
+    let (code, err) = probe(&d);
+    assert_eq!(
+        code,
+        Some(5),
+        "another process's open once the first closed: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&d);
 }

@@ -177,7 +177,7 @@ use std::path::Path;
 
 /// "SUPDORD1", little-endian. The trailing digit is the version, and it
 /// moves whenever an older reader would misread rather than refuse.
-const MAGIC: u64 = 0x3144_524f_4450_5553;
+pub(crate) const MAGIC: u64 = 0x3144_524f_4450_5553;
 /// Room for the header and the alignment the heads want, in one constant so
 /// the writer and the reader cannot disagree about where the body starts.
 const HEADER: usize = 64;

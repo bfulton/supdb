@@ -945,7 +945,11 @@ key-section checksum row, whose header words are zero in every older file
 and unread by every older reader, nor the segment's payload in a spare word
 of the superblock extension, for the same reason: a zero there reads as
 "not recorded" and the engine estimates it. Decide which case a change is
-before writing it.
+before writing it. A magic that moves moves the store's format version
+with it (`STORE_FORMAT`, in every manifest's body behind the names, which
+a reader from before it never reads), and `STORE_FORMAT_OLDEST` says
+whether the release still reads the version before; a unit test holds the
+version to the files' magics, so a magic moved alone fails it.
 
 **A checksum that cannot see a corruption is not a checksum for it.** Block
 checksums cannot see a flipped bit in an index record -- a flipped `FIXED`
@@ -1034,7 +1038,13 @@ list's back only when the writer freezes it; the writer freezes into
 room and waits only when the list is full, for the oldest's readable
 landing; and the count of seals
 (`in_seal`) is read before the state whoever decides against it, so a
-count of zero is one whose landings the state shows. A crash between any
+count of zero is one whose landings the state shows. A store is held by one open at a time, under an exclusive `flock` of
+its `LOCK` taken before the open reads its directory -- an open sweeps the
+segments its manifest does not name, which beside a live store are the
+seals and merges in flight -- and given up last at the close; a test that
+emulates a crash calls `Db::crash`, which gives the lock up as a dead
+process's is given up, since a `mem::forget` keeps it and the reopen is
+refused as a second open. A crash between any
 two of those leaves either a WAL that replays the whole memtable, with a
 segment the manifest never named --
 possibly torn -- swept at open, or a complete, named segment plus a WAL
