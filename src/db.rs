@@ -5148,6 +5148,18 @@ pub struct Options {
     /// `supdb-znohotfill` is the shape before it.
     #[doc(hidden)]
     pub zpages_hot_fill: bool,
+    /// EXPERIMENT: under the fill (`zpages_hot_fill`), the candidates the
+    /// reads have not skewed are asked for by how much of their records the
+    /// cache holds, most first, after the skewed ones by heat. Under the
+    /// uniform read pass every partition's heat is the same but for noise,
+    /// so the fill released seven to nine partitions as the noise ranked
+    /// them, at ten million keys under 1.25 GiB, most of each read from the
+    /// device inside the pass -- the background threads read about a
+    /// gigabyte in the slow read passes and 0.4 in the fast -- while the
+    /// load had left a few hundred megabytes of raw records in the cache.
+    /// `supdb-zhotresident` turns it on.
+    #[doc(hidden)]
+    pub zpages_hot_fill_resident_first: bool,
     /// EXPERIMENT: under the fill (`zpages_hot_fill`), a quiet look --
     /// nothing committed since the last and no merge in flight -- fills
     /// the room with the growth share in it (`zpages_hot_growth_pct`), the
@@ -5660,6 +5672,7 @@ impl Default for Options {
             zpages_hot_ask_idle: false,
             zpages_hot_growth_pct: 10,
             zpages_hot_fill_quiet: false,
+            zpages_hot_fill_resident_first: false,
             scan_raw_ahead: true,
             scan_raw_ahead_past_llc: true,
             scan_raw_ahead_lead: 0,
@@ -44322,6 +44335,20 @@ impl Maint {
                 })
                 .collect();
             cands.sort_by(|a, b| per_key(b).total_cmp(&per_key(a)));
+            // The skewed first, and among the rest the one whose records
+            // the cache holds most of (`Options::zpages_hot_fill_resident_first`):
+            // a release of resident records reads nothing from the device.
+            if self.opts.zpages_hot_fill_resident_first {
+                let mut keyed: Vec<(&Part, bool, u64)> = cands
+                    .iter()
+                    .map(|p| {
+                        let need = (p.raw_bytes as f64 * (1.0 - p.seg.records_resident())) as u64;
+                        (*p, per_key(p) >= HOT_RAW_SKEW * median, need)
+                    })
+                    .collect();
+                keyed.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
+                cands = keyed.into_iter().map(|(p, _, _)| p).collect();
+            }
             let reserve = cands.iter().map(|p| p.raw_bytes).max().unwrap_or(0);
             let mut avail = room.saturating_sub(pending);
             let mut fill_avail = avail.saturating_sub(reserve);

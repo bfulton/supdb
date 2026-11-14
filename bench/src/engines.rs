@@ -1158,6 +1158,9 @@ pub struct Supdb {
     /// The controller's install makes a rewarm due
     /// (`Options::zpages_rewarm_at_install`): `supdb-zrewarminstall`.
     zrewarminstall: bool,
+    /// The fill's unskewed candidates asked for by their records' residency
+    /// (`Options::zpages_hot_fill_resident_first`): `supdb-zhotresident`.
+    zhotresident: bool,
     /// A cursor's walk decoding the groups after its first into its own
     /// buffer (`Options::zpages_walk_owns_decodes` on): `supdb-zwalkowns`.
     zwalkowns: bool,
@@ -2269,6 +2272,8 @@ struct Policy {
     zrewarmbeside: bool,
     /// A rewarm at the install: `supdb-zrewarminstall`.
     zrewarminstall: bool,
+    /// The fill's resident records first: `supdb-zhotresident`.
+    zhotresident: bool,
     /// The walk's own decodes: `supdb-zwalkowns`.
     zwalkowns: bool,
     /// A page view an open: `supdb-zviewperopen`.
@@ -2687,6 +2692,7 @@ impl Default for Policy {
             zrewarmwait: false,
             zrewarmbeside: false,
             zrewarminstall: false,
+            zhotresident: false,
             zwalkowns: false,
             zviewperopen: false,
             znogroupahead: false,
@@ -8105,6 +8111,7 @@ impl Supdb {
             zrewarmwait,
             zrewarmbeside,
             zrewarminstall,
+            zhotresident,
             zwalkowns,
             zviewperopen,
             znogroupahead,
@@ -8654,6 +8661,7 @@ impl Supdb {
             zpages_hot_room_margin_pct: if zhotskewroomhyst { 5 } else { 0 },
             zpages_rewarm_beside_merges: zrewarmbeside,
             zpages_rewarm_at_install: zrewarminstall,
+            zpages_hot_fill_resident_first: zhotresident,
             zpages_rewarm_quiet_ms: if zrewarmwait {
                 supdb::db::REWARM_QUIET_BEFORE_MS
             } else {
@@ -8937,6 +8945,7 @@ impl Supdb {
             zrewarmwait,
             zrewarmbeside,
             zrewarminstall,
+            zhotresident,
             zwalkowns,
             zviewperopen,
             znogroupahead,
@@ -9347,6 +9356,9 @@ impl Engine for Supdb {
         }
         if self.zrewarminstall {
             return "supdb-zrewarminstall";
+        }
+        if self.zhotresident {
+            return "supdb-zhotresident";
         }
         if self.zrewarmbeside {
             return "supdb-zrewarmbeside";
@@ -11706,6 +11718,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zhotfillquiet"
         | "supdb-scanrawahead"
         | "supdb-zrewarminstall"
+        | "supdb-zhotresident"
         | "supdb-scanrawpaced"
         | "supdb-noscanrawahead"
         | "supdb-zseekseed"
@@ -12153,6 +12166,18 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     d,
                     Policy {
                         noscanrawahead: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-zhotresident" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        zhotresident: true,
                         ..Policy::default()
                     },
                 )
@@ -14572,6 +14597,20 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.zpages_rewarm_at_install && !b.zpages_rewarm_at_install);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("zhotresident"),
+                    Policy {
+                        zhotresident: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-zhotresident");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_hot_fill_resident_first && !b.zpages_hot_fill_resident_first);
             }
             {
                 let z = Supdb::with_policy(
