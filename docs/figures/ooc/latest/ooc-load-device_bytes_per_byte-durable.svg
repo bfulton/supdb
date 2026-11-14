@@ -36,7 +36,7 @@
 <path d="M135.0,244.7 L547.0,199.6 " fill="none" stroke="#1b1b1b" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
 <text x="618.0" y="129.6" font-size="11" fill="#8c8c8c">LMDB (no readahead)</text>
 <text x="618.0" y="188.0" font-size="11" fill="#8c8c8c">RocksDB</text>
-<text x="618.0" y="203.4" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="203.4" font-size="11" fill="#8c8c8c">supdb (256 MB cache, fitted)</text>
 <line x1="612.0" y1="199.6" x2="616.0" y2="212.4" stroke="#1b1b1b" stroke-width="0.75"/>
 <text x="618.0" y="216.4" font-size="11" fill="#1b1b1b">supdb</text>
 <line x1="612.0" y1="200.0" x2="616.0" y2="225.4" stroke="#2b6cb0" stroke-width="0.75"/>
@@ -46,5 +46,5 @@
 <line x1="612.0" y1="219.2" x2="616.0" y2="251.4" stroke="#8c8c8c" stroke-width="0.75"/>
 <text x="618.0" y="255.4" font-size="11" fill="#8c8c8c">RocksDB (LZ4)</text>
 <line x1="612.0" y1="245.2" x2="616.0" y2="264.4" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="268.4" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="268.4" font-size="11" fill="#8c8c8c">supdb (no compact form)</text>
 </svg>

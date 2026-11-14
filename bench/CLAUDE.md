@@ -596,6 +596,47 @@ by the structure and not by holding little, and the bound each pass got
 is read from the kernel at the pass's start; and a quantity that grows
 rep by rep in the parent is a drift in every cell that can feel it.
 
+**A guarantee matched on one kind of crash.** The buffered group was
+matched on the sync: no arm in it reaches the device at a commit. The
+recovery workloads' first run held each arm's reopened store to every
+batch its killed writer had been acknowledged, on the reading that an
+unsynced commit is in the kernel and outlives its process, which LMDB's
+and RocksDB's documentation says of theirs and the engine's says of its
+WAL. `supdb-ingest` failed it at the first rung: the ordered load
+bypasses the WAL, and a direct run's records go to the file a megabyte
+piece at a time, so the commits behind the last whole piece were in the
+dead process's memory -- two batches of ten at ten thousand keys, eight
+of a hundred at a hundred thousand, the same count every rep, and none
+after the shuffled load, which the WAL takes. The durable arm, whose
+every commit syncs the run, held every batch. So a buffered arm's loss
+is a quantity of the row (`unrecovered_batches`) and a durable arm's is
+a failed pass. The engine writes every commit of a run to its file now,
+the quantity reads zero for every arm, and the test of the workload
+holds it there (`tests/recover.rs`); the rows banked before that read
+the count the paragraph gives. The rule: a guarantee has more than one axis -- what a machine's
+crash may take and what a process's may -- and a group is matched on
+each one a user could mean, by a workload that kills something, since
+an axis nobody tested is matched by assumption.
+
+**A device filed as virtual that was a disk's.** `run` refuses a
+RAM-backed device under its stores, and asked whether the device's entry
+in sysfs lies under the kernel's virtual devices, where zram, brd and
+loop devices are filed. A device-mapper volume and an md array are filed
+there too, and are the disks under them. A hosted x86 runner whose work
+disk was a device-mapper volume (`dm-0`) was refused as RAM-backed, and
+`tests/fresh_process.rs` failed there with the engine and the suite
+unchanged, in a job the ARM runner beside it passed. A mapped volume is
+judged by the devices its `slaves` directory names now, each link
+resolved before it is read, since a slave beside its volume is linked as
+`../../zram0` and names no directory on the way
+(`env::virtual_block_device`); the test builds sysfs's tree, a volume
+over a partition, over zram, over another volume and over both. The
+rule: a class read off where the kernel files a thing is held to
+everything else filed there, so the directory's other members are listed
+before its name is trusted; and a refusal that guards the series is run
+on the hosts the series' CI runs on, where the first one to differ finds
+it.
+
 **A workflow that never runs can be syntactically invalid for months.**
 Both self-hosted pickup watchdogs arrived with a block of an older draft
 pasted after their `exit 1`. `scripts/workflows.sh` parses every `run:`

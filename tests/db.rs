@@ -4479,7 +4479,14 @@ fn a_merge_asks_ahead_only_where_its_inputs_are_not_resident() {
     assert!(asks >= 6, "cold inputs: {asks} asks of {bytes} bytes");
     assert!(bytes >= 4 << 20, "{bytes} bytes over {asks} asks");
     let (asks, bytes) = build("mergeahead-warm", 1 << 20, false);
-    assert_eq!((asks, bytes), (0, 0), "resident inputs were asked for");
+    // A mapping says whether a page is resident on Linux alone
+    // (`Bytes::resident_at`); elsewhere it cannot say, and every window is
+    // asked for.
+    if cfg!(target_os = "linux") {
+        assert_eq!((asks, bytes), (0, 0), "resident inputs were asked for");
+    } else {
+        assert!(asks > 0, "a mapping that cannot say asked for nothing");
+    }
     let (asks, bytes) = build("mergeahead-off", 0, true);
     assert_eq!((asks, bytes), (0, 0), "the option off asked");
 }
@@ -8316,11 +8323,13 @@ fn a_direct_run_streamed_from_its_table_is_the_run_the_copies_write() {
             );
         }
     }
-    // Buffered, no sync at the commits: the stream's tail is held in the
-    // table until a write piece is whole, as the copies path's buffer
-    // holds its records, so the file a crash leaves is the copies path's
-    // byte for byte -- the whole pieces, with the batches and markers
-    // they hold -- and recovers the same batches, nothing of the tail.
+    // Buffered, no sync at the commits: every commit writes its batch to
+    // the file all the same, records and marker, from the stream's arena
+    // as from the copies path's buffer, so the file a crash leaves is the
+    // copies path's byte for byte and holds every batch. The tail waited
+    // for a whole write piece once, in the table as in the buffer, and a
+    // crash left the whole pieces alone: up to a megabyte of acknowledged
+    // batches gone with the process.
     let buffered = |d: &std::path::Path, stream: bool| {
         let o = Options {
             sync: supdb::SyncPolicy::EveryN(u32::MAX),
@@ -8345,8 +8354,8 @@ fn a_direct_run_streamed_from_its_table_is_the_run_the_copies_write() {
         std::fs::read(tmp_of(&ds)).unwrap(),
     );
     assert!(
-        fc.len() >= 1 << 20 && fc.len() < 12_000 * 130,
-        "the whole pieces on the file and the tail held: {} bytes",
+        fc.len() > 12_000 * 100,
+        "every batch is on the file: {} bytes",
         fc.len()
     );
     assert_eq!(
@@ -8363,10 +8372,7 @@ fn a_direct_run_streamed_from_its_table_is_the_run_the_copies_write() {
     };
     let (rc, rs) = (recovered(&dc, false), recovered(&ds, true));
     assert_eq!(rc, rs, "the same keys recovered from the two shapes");
-    assert!(
-        (7000..12_000).contains(&rc) && rc % 1000 == 0,
-        "whole batches up to the last marker on the file: {rc}"
-    );
+    assert_eq!(rc, 12_000, "every batch committed is recovered");
 }
 
 /// A direct segment's crash windows, emulated on the file a dropped store

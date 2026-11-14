@@ -43,7 +43,7 @@
 <path d="M98.3,181.9 L255.1,197.0 L426.9,221.0 L583.7,252.9 " fill="none" stroke="#1b1b1b" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
 <text x="618.0" y="240.5" font-size="11" fill="#2b6cb0">supdb (a snapshot per handle)</text>
 <line x1="612.0" y1="241.2" x2="616.0" y2="249.5" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="253.5" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="253.5" font-size="11" fill="#8c8c8c">supdb (no compact form)</text>
 <line x1="612.0" y1="245.5" x2="616.0" y2="262.5" stroke="#2b6cb0" stroke-width="0.75"/>
 <text x="618.0" y="266.5" font-size="11" fill="#2b6cb0">supdb (forms at ingest)</text>
 <line x1="612.0" y1="248.8" x2="616.0" y2="275.5" stroke="#2b6cb0" stroke-width="0.75"/>

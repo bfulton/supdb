@@ -53,7 +53,7 @@
 <line x1="612.0" y1="125.2" x2="616.0" y2="190.2" stroke="#2b6cb0" stroke-width="0.75"/>
 <text x="618.0" y="194.2" font-size="11" fill="#2b6cb0">supdb (forms at ingest)</text>
 <line x1="612.0" y1="125.2" x2="616.0" y2="203.2" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="207.2" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="207.2" font-size="11" fill="#8c8c8c">supdb (no compact form)</text>
 <line x1="612.0" y1="125.2" x2="616.0" y2="216.2" stroke="#1b1b1b" stroke-width="0.75"/>
 <text x="618.0" y="220.2" font-size="11" fill="#1b1b1b">supdb</text>
 <line x1="612.0" y1="154.6" x2="616.0" y2="229.2" stroke="#8c8c8c" stroke-width="0.75"/>

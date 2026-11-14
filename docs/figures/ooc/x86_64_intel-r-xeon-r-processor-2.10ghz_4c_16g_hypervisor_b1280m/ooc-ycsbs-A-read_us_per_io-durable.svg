@@ -23,7 +23,7 @@
 <path d="M341.0,307.4 " fill="none" stroke="#8c8c8c" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="2,3"/>
 <text x="618.0" y="265.2" font-size="11" fill="#8c8c8c">LMDB (no readahead)</text>
 <text x="618.0" y="293.7" font-size="11" fill="#8c8c8c">RocksDB (LZ4)</text>
-<text x="618.0" y="311.4" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="311.4" font-size="11" fill="#8c8c8c">supdb (no compact form)</text>
 <line x1="612.0" y1="313.8" x2="616.0" y2="320.4" stroke="#8c8c8c" stroke-width="0.75"/>
 <text x="618.0" y="324.4" font-size="11" fill="#8c8c8c">RocksDB</text>
 </svg>

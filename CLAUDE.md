@@ -39,7 +39,7 @@ of the change that produced the text.
 | `src/bytes.rs`, `src/blob.rs` | the read path over any byte source; compiles for wasm |
 | `src/wasmapi.rs` | the C ABI the browser calls; hand-written because the module's size is budgeted |
 | `web/` | the browser reader, its byte sources, the Worker it runs in, and the size control -- `web/README.md` |
-| `tests/` | the engine's contract, the read paths held to each other, the format's damage cases; `tests/common` holds what more than one file needs |
+| `tests/` | the engine's contract, the read paths held to each other, the format's damage cases, a checkpoint held to the store it was made of, a crashed store's runs held to its log; `tests/common` holds what more than one file needs |
 | `bench/` | the benchmark suite: its own cargo workspace, the arms, the runner, the gate and the figures -- `bench/DESIGN.md` |
 | `experiments/ffi/` | what a C ABI and a Python binding cost a point read, borrowed against copied, beside LMDB's and RocksDB's C APIs; its own manifest and dated results, and not built by the gate -- its `README.md` |
 
@@ -949,7 +949,13 @@ before writing it. A magic that moves moves the store's format version
 with it (`STORE_FORMAT`, in every manifest's body behind the names, which
 a reader from before it never reads), and `STORE_FORMAT_OLDEST` says
 whether the release still reads the version before; a unit test holds the
-version to the files' magics, so a magic moved alone fails it.
+version to the files' magics, so a magic moved alone fails it. Version 2
+is the run's place in the sequence: no segment's magic moved, since a
+reader of segments reads them as it did, but a reader of the log from
+before takes a run's numbers for records missing and the WAL's new kind
+for no WAL at all, so the manifest refuses it first, and a version-1 store
+is rewritten as version 2 at its first open, before anything of the new
+kind is written into it.
 
 **A checksum that cannot see a corruption is not a checksum for it.** Block
 checksums cannot see a flipped bit in an index record -- a flipped `FIXED`
@@ -1086,10 +1092,45 @@ segment open for append: the batch's records, then a commit marker carrying
 their CRC, length and count, then one fdatasync on that file. The WAL never
 sees them (`direct_ingest: false` is the arm that still sends them there).
 Recovery walks the temp file's record stream to the last marker whose three
-quantities agree with the records before it and rewrites what precedes it as
-a piece; what follows is a batch nobody was told was durable. The CRC is
+quantities agree with the records before it and makes what precedes it a
+piece where it lies: the file cut back to that marker and finished as the
+run's close would have finished it (`SegmentWriter::resume_run`), the walk
+standing in for the table as the keys' source; what follows is a batch
+nobody was told was durable. The CRC is
 there because a crash can land the page a marker is on and not a page of its
-batch, and a record whose bytes came back zero still parses. The close is
+batch, and a record whose bytes came back zero still parses. A run stands in
+the store's sequence: its records take one number each, as a WAL record
+does, from the number its file names in its superblock page (`run_note`),
+so the frames and the runs written after it stand past it by exactly what it
+holds, and the manifest's covered sequence is the one watermark for both.
+The open walks the log from that watermark -- frames in their files, and at
+each gap in them and at their end the run that starts there
+(`Db::fill_runs`) -- and takes a run only where the walk reaches its start:
+one that starts past the walk's end is commits a machine's crash kept
+without the ones before them, and is removed with the frames past that
+point -- unless its note says it began with everything before it behind
+a sync (`RUN_NOTE_CHAINED`, a run begun where `Db::owes_sync` finds
+nothing a sync would have to do), where what is missing before it was
+promised: a record lost, and the open refuses, having asked every run
+left before it removes one. A gap no run fills is the log's end where a header says something
+before the file was left unsynced -- `WAL_LOOSE`, and `WAL_LOOSE_RUN`, the
+kind a run that closes unsynced leaves on the file the next frame goes to
+-- and a record lost anywhere else. A run the open takes becomes a piece,
+and until the manifest covers its numbers an empty file named by the range
+(`cov-`) says the gap is held. Every commit writes its batch to the run's
+file, synced or not, as a commit writes the WAL; a sync by policy syncs
+whatever was left unsynced before it, the loose files and the runs that
+closed loose, ahead of the live log or the run in progress, and `sync`
+syncs the run in progress too. The first sync that acknowledges a commit
+of a run fsyncs the directory once, after the run's file, for the temp
+name the file is under (`Db::sync_run`, `Db::dir_barrier`): a file's sync
+does not promise the entry that names it, and a run whose name a crash
+took is every commit of it gone. One barrier a run, none where a
+rotation's barrier for its new log file had the name in the directory
+already, and none in a store whose commits never sync, whose landings'
+directory fsyncs carry it; a barrier that fails fails the commit, and a
+run that closes owing one is the next sync's, as a run that closed
+unsynced is. The close is
 the seal's shape with one difference: the finished segment is hard-linked
 under its piece name rather than renamed, and the temp name stays until the
 manifest names the segment, because a name the manifest lacks is swept at
@@ -1109,9 +1150,10 @@ writer's CPU and moved the load 4% in twelve pairs, short of the tenth it
 was predicted to, so the references are an arm. What ships is the table
 whose arena is the record stream (`Options::direct_stream`): a value is
 laid out as its record at the append and the commit writes the batch to
-the file from the arena, a whole write piece at a time as the buffer
-path's pieces reached it, so the staged copy and the piece buffer's pages
-are gone from the writer's faults and the copies are the arm
+the file from the arena, the whole write pieces it completes as the buffer
+path's pieces reached it and the rest behind them, so the staged copy and
+the piece buffer's pages are gone from the writer's faults and the copies
+are the arm
 (`supdb-copyvals`, `supdb-ingestcopyvals`). The segment writer kept two
 more copies of every key for the close -- its own key, span, offset and
 hash for the key section and the Bloom, and the ordered index builder's
@@ -1159,6 +1201,24 @@ the entries' range (`Options::direct_log_range`; `supdb-ordlog` and
 write and a fresh page a thousand that said nothing the entry count
 did not, and whose tail the truncation of an uncommitted run never
 trimmed. A run that kept no table at all is the shape left to price.
+
+**A file a store names never changes.** A segment, its ordered index
+and its form file are each written under a temp name and renamed or
+linked into place, and nothing writes one after that: no patch in place,
+no writable mapping. `Db::checkpoint` rests on it. A checkpoint is hard
+links to the files the manifest names, with a manifest of its own, so a
+byte changed in place under a name is changed in every checkpoint that
+shares the file, with nothing raised in either store, and a file rebuilt
+in place -- truncated and written again -- is torn under whoever has it
+mapped from the other one. A change that needs other bytes under a name
+writes a new file and renames it over the old, which leaves the other
+store's link on the old inode: an ordered index an open finds torn is
+composed again that way (`write_ord`), which is why a checkpoint may
+share one that was never synced. The checkpoint is made by the segment
+work, the one side that retires a segment, so no name goes while it is
+being linked; and it is built under a temp name and renamed, because an
+open of a directory with segments and no manifest takes every segment
+it finds for the store.
 
 ## Shapes the bugs come in
 
@@ -2286,6 +2346,142 @@ shipped. The flush answers with the presync's error now, and a hook
 injects the failure for the test. The rule: an fsync's error is consumed
 by the call that sees it, so the result of every sync on a path is
 checked by that path and never left to a later sync of the same file.
+
+**A hand-off that left the old run's end with its new owner while the
+giver went on.** A run of ordered ingest goes to its file a write piece
+at a time, and a run that closed was handed to its seal with its last
+piece still in the writer's buffer, for the seal's thread to write with
+the trailer. Under a policy that syncs at every commit the buffer is
+empty at every commit. Under one that does not, the writer went on into
+the next run, and that run's first whole piece reached its own file
+before the seal's thread had written the old run's end: a process killed
+between the two left the first run's file short of its last commits and
+the second holding later ones, and the open recovered both --
+acknowledged batches gone from the middle of the history, batch 290 of a
+load there and 287 to 289 not, where `SyncPolicy`'s own words are that an
+unsynced tail is lost whole and never served in part. Nothing raised and
+every file was well-formed; `tests/kill.rs` killed a durable writer and
+no other. The suite's recovery workload found it in its first whole row,
+at the one rung whose load crosses the seal threshold just before its
+end (`bench/CLAUDE.md`, a guarantee matched on one kind of crash), and
+the engine's test holds the seal's thread so that the window is as wide
+as the kill needs. The writer wrote a closing run's records before the
+hand-off first (`Db::close_run`), which left a process's death the open
+run's end to take: up to a megabyte of acknowledged commits, two to eight
+batches of the suite's load, where a commit to the WAL and the
+comparators' unsynced commits lose none. Every commit writes its batch
+now (`Db::commit_direct`), priced in the tree that measured by an arm
+that wrote at every commit beside one that did not: nothing resolved in
+thirty-six pairs at ten, a hundred and three hundred thousand keys, the
+reads and the scans level, where the stream's second shape, written at
+every commit, had read every pass over the segment behind. Two builds
+alternated, each against its comparator in one process, put the price
+on the buffered ordered load: three to four percent at ten thousand
+keys in two sittings, where the load is ten commits and each is now a
+write, and nothing at a hundred or three hundred thousand, with the
+mixes level; and the load's device bytes rise by a page for
+every sync that lands inside a run -- the writer helper's and the
+drain's -- since the file now ends mid-page where it ended on a write
+piece, and the page a sync catches half full is written again when the
+next commit fills it. The durable arm's file has always ended so. The
+rule: where work is handed to another
+thread and the giver goes on, whatever orders the giver's later effects
+behind its earlier ones is finished before the hand-off, never left with
+the receiver; and a guarantee stated of one path, here the WAL's, is
+tested on every path that bypasses it. What a machine's crash could
+still take is the entry after this one.
+
+**A history in several files, ordered by nothing a crash keeps.** A run
+of ordered ingest kept its records in a file of its own and took no
+sequence numbers, so nothing on disk said where it stood: the open took
+every run it found, each to its own last marker, and replayed the log
+beside them. A process's death leaves every file whole, and with the
+hand-off above fixed the order no longer mattered to it. A machine's
+crash under a policy that does not sync every commit keeps whichever
+pages the kernel had written, and those are not the oldest: a later run's
+megabytes written back while an earlier run's last pages sat dirty, or
+frames in the log behind a run whose file had not reached the directory,
+came back as commits served without the ones before them. Three more of
+the family stood beside it, each read off the code while the fix was
+being placed and none with a test. `sync` over a run in progress synced
+nothing, since it synced the log and the log holds none of a run's
+records. A sync by policy under `EveryN` synced the file it was writing
+and started its count over, leaving frames, or a run, written before it
+and never synced behind an acknowledgement that covered them. And the
+open made a recovered run durable, as a piece the manifest named, in
+front of log frames a killed writer had left in the page cache alone. A
+run's records take sequence numbers now and its file says where it
+starts; the open walks the frames and the runs as one history from the
+manifest's watermark and ends it at the first loss (the ordered ingest
+paragraph under the crash discipline has the whole of it); every sync
+that acknowledges covers every file written before it; and the open
+syncs the log before it names a run's piece. `tests/runlog.rs` builds
+each state a lost page leaves, by stopping a writer with its seals held
+and cutting a file back or taking it away, since no test can pull the
+plug. A directory barrier for a run's temp name went in beside the fix,
+on the engine's own word that a file's sync does not promise the entry
+that names it, came out on its price, and went back in. The price was
+real and small: the durable ordered load at ten thousand keys a
+thirtieth slower in the before-and-after pairing, `strace -T` putting
+the barrier at a tenth to a quarter of a millisecond once a run, on a
+load of ten commits -- a flush of the device with nothing to write,
+since the file's own sync has forced the journal commit that carries the
+entry -- and nothing that resolves from a hundred thousand keys. Priced
+again as it went back, the two builds alternated eight times, each
+against its comparator, it read a tenth of a millisecond on a run's first
+commit in every pair (`SUPDB_LOAD_PHASES`, the `first` column), the
+commits after it level, and the load's total slower in three pairs of
+eight; the rate against the comparator leaned a twentieth, and so did
+the comparator's own load between the two builds, code the change cannot
+reach. What it
+had been traded for was the wording of the guarantee: without it a
+commit acknowledged as durable rested on what ext4 and XFS do with a new
+file's first sync, which POSIX does not promise, and a name that went
+missing was refused at the open only where log frames followed the run.
+The rules: a history kept in more than one file is ordered by a
+number every file carries and one durable watermark, so that what stands
+behind a loss is found by arithmetic and not by which files happen to be
+there; a sync that acknowledges is a sync of everything written before
+it, wherever it went, and its test is a count of what it left unsynced on
+every path that writes; a recovery that makes something durable makes
+durable what stands before it first; a crash a test cannot cause is
+built, since the kill tests had killed processes for a year and a
+process's death cannot tell `EveryN` from `Always`; a barrier added
+beside a fix is a change of its own, priced on the smallest rung, where
+one of anything is a share of the pass; and the price is then weighed
+against what the barrier promises and not against the pass, since a
+thirtieth of the smallest rung had bought back a durable commit that
+depended on the filesystem under it, which no row measures and a reader
+of the guarantee takes for granted.
+
+**A flag set on the word of a comment, found by the next thing to trust
+it.** A reopened log counted the frames it had replayed as synced, under
+a comment that said they were "read back from the device". A killed
+writer leaves its unsynced frames in the page cache, and the open reads
+them from there: a `sync` after the reopen found nothing to sync and
+returned over them, and the log's older files were on no list at all, so
+the first sync by policy after the reopen marked the live file's header
+chained over files it had not synced. Nothing found it for as long as
+the flag stood, since no test reopened a killed store and then asked
+what a sync had left.
+What found it was a new reader of the same predicate: a run of ordered
+ingest now says in its note whether everything before it was synced as
+it began (`RUN_NOTE_CHAINED`), the open refuses a gap before a run that
+says so, and a run that said so falsely is a store that will not open
+after a crash it should have survived -- so every state that reaches the
+question was read for whether its answer was true, and two were not: the
+reopen, and a drain that failed, whose closed run was unsynced and on no
+list. The replayed frames count as unsynced now and the older files are
+the first sync's; a failed drain's run is loose as any run that closed
+unsynced is (`Db::drain_run`); and the question has one definition
+(`Db::owes_sync`), asked by the syncs and by the run. The rules: read
+back is not synced, and a flag that says "durable" is set by a sync this
+process issued or by nothing; a predicate a new mechanism leans on is
+audited at every state that reaches it, the recovery's and the failure's
+first, since the old callers only ever asked it to decide a sync that a
+wrong answer made cheaper and never one that a wrong answer made fatal;
+and where a wrong "yes" refuses a store, the tests build the states
+where the answer is "no" and hold the open to opening.
 
 **A length read off the slab that held the exceptions.** The ordered
 table's write log became the range of its entries, its length the
@@ -4886,6 +5082,47 @@ before it probed takes that pass's answers, since a probe asked twice is
 paid twice; and a cost that appears only once a store has a property the
 workloads give it after their first write is priced in that store, not in
 the clean one the read pass meets.
+
+**A recovery that made again what it had been left, and that nobody had
+timed.** The open made a piece of a run a killed writer left by reading
+the run's file whole, copying every key and every value out of it into
+vectors of their own, feeding each back through a segment writer into a
+new file, syncing that and removing the old one, and then opened the
+piece and walked its records again for a Bloom. The log beside it was
+read whole into a buffer before a frame of it was parsed, and the store's
+greatest key was found by a walk of the table the replay had just filled.
+Nothing was wrong, and the open of a store of three hundred thousand keys
+took a fifth of a second: the suite had opened no store until the
+recovery workloads, their first rows read supdb's open of an ordered
+load level with RocksDB's replay of its log and two hundred times
+LMDB's, which recovers nothing, and were read as what a recovery costs,
+and the profile of one open was taken only when somebody asked what
+there was to do while a pull request waited (`bench/examples/reopen.rs`; the counts are
+in `docs/engine.md`, crash injection). A third of the ordered open's
+instructions were the allocator's and most of the rest the second
+writing of bytes the file already held in the form a segment keeps them.
+The open finishes the run's file where it lies now, by the finish its
+close would have run (`SegmentWriter::resume_run`), over a walk that
+keeps offsets and copies nothing; the log is parsed through a mapping,
+and the greatest key kept as the records go by. A recovery that edits
+the file it recovers has crash windows the file never had, since an open
+cut short leaves the writer's file with part of an index, or whole, or
+linked, or named: `tests/runlog.rs` builds each, and holds the finished
+piece to the segment a clean close of the same commits makes, byte for
+byte. One line written beside the change was a hazard: a removal of
+whatever stood under the piece's name before the link, against a stale
+name an earlier open might have left. A mutant without it passed every
+test, and reading for a state that reaches it found the open's sweep of
+unnamed files ahead of it -- so the only file that could stand there was
+one the manifest names, and the removal would have unlinked it. The
+rules: a recovery path is a path, profiled when a workload first takes
+it and never excused as rare or as the design's price; in one, look
+first for work that reproduces what is already on disk in the form the
+format keeps; a recovery that writes into what it recovers is tested at
+each of its own crash windows, built from the states before and after
+it; and a defensive step that no test can reach is read for what it
+would do in the state that could reach it, before it is kept as
+harmless.
 
 ## Standing limitations
 

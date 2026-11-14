@@ -56,7 +56,8 @@ pub fn capture() -> MachineInfo {
 
 /// The RAM-backed block device under `path`, by name, or none: zram, a
 /// loop device, brd, anything the kernel files under
-/// `/sys/devices/virtual/block/`, where a disk's entry names its bus.
+/// `/sys/devices/virtual/block/`, where a disk's entry names its bus,
+/// that is not a mapping over a disk (`virtual_block_device`).
 /// Such a device answers a fault in microseconds where the machine's
 /// disk takes tens, with the kernel's reclaim and the engine's page
 /// touches the same, so a pairing on one reads the disk's counts at a
@@ -70,11 +71,42 @@ pub fn ram_backed_device(path: &std::path::Path) -> Option<String> {
     virtual_block_device(std::path::Path::new("/sys/block"), &dev).then_some(dev)
 }
 
-/// Whether `sys_block/<dev>` links into the kernel's virtual devices.
+/// Whether `sys_block/<dev>` is a device with no disk under it: one the
+/// kernel files under its virtual devices that maps no other device, or
+/// maps one that is such a device itself.
+///
+/// The kernel files a device-mapper volume and an md array as virtual
+/// too, and those are the devices under them, which their `slaves`
+/// directory names. The first version asked for the virtual link alone,
+/// and a hosted runner whose work disk was a device-mapper volume
+/// (`dm-0`) was refused as RAM-backed: the test that runs a pass in a
+/// process of its own failed on it with the engine and the suite
+/// unchanged, where the same job on the runner beside it passed.
 fn virtual_block_device(sys_block: &std::path::Path, dev: &str) -> bool {
-    std::fs::read_link(sys_block.join(dev))
+    no_disk_under(&sys_block.join(dev), 0)
+}
+
+/// `virtual_block_device` for a device by its link: under `/sys/block`,
+/// or in the `slaves` of the device mapped over it. A stack of mappings
+/// is a few deep; past eight it is taken for what its link says.
+fn no_disk_under(link: &std::path::Path, depth: usize) -> bool {
+    // Where the link leads, through every link on the way: a slave's
+    // link to a device beside it is `../../zram0`, which names no
+    // directory it passes.
+    let filed_virtual = std::fs::canonicalize(link)
+        .or_else(|_| std::fs::read_link(link))
         .map(|target| target.components().any(|c| c.as_os_str() == "virtual"))
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if !filed_virtual {
+        return false;
+    }
+    let under: Vec<std::path::PathBuf> = std::fs::read_dir(link.join("slaves"))
+        .map(|d| d.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    if under.is_empty() || depth >= 8 {
+        return true;
+    }
+    under.iter().any(|s| no_disk_under(s, depth + 1))
 }
 
 #[cfg(test)]
@@ -100,6 +132,54 @@ mod tests {
         assert!(virtual_block_device(&root, "loop3"));
         assert!(!virtual_block_device(&root, "vda"));
         assert!(!virtual_block_device(&root, "nvme0n1"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A mapped volume is what it maps. The tree is sysfs's shape: the
+    /// devices' directories, each mapped one's `slaves` linking to the
+    /// devices under it, and `block/` linking to every whole device. A
+    /// volume over a disk's partition is a disk's, one over zram is not,
+    /// one stacked over another follows it down, and one over a disk and
+    /// zram both is refused with the zram under it.
+    #[test]
+    fn a_mapped_volume_is_ram_backed_only_where_what_it_maps_is() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("supdb-bench-sysdm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let block = root.join("block");
+        let virt = root.join("devices/virtual/block");
+        let disk = root.join("devices/pci0000:00/0000:00:02.0/virtio1/block/vda");
+        std::fs::create_dir_all(&block).unwrap();
+        std::fs::create_dir_all(disk.join("vda2")).unwrap();
+        symlink(
+            "../devices/pci0000:00/0000:00:02.0/virtio1/block/vda",
+            block.join("vda"),
+        )
+        .unwrap();
+        for dev in ["zram0", "dm-0", "dm-1", "dm-2", "dm-3"] {
+            std::fs::create_dir_all(virt.join(dev).join("slaves")).unwrap();
+            symlink(format!("../devices/virtual/block/{dev}"), block.join(dev)).unwrap();
+        }
+        // A slave's link as sysfs writes it, relative to the `slaves`
+        // directory it is in.
+        let partition = "../../../../pci0000:00/0000:00:02.0/virtio1/block/vda/vda2";
+        symlink(partition, virt.join("dm-0/slaves/vda2")).unwrap();
+        symlink("../../zram0", virt.join("dm-1/slaves/zram0")).unwrap();
+        symlink("../../dm-0", virt.join("dm-2/slaves/dm-0")).unwrap();
+        symlink(partition, virt.join("dm-3/slaves/vda2")).unwrap();
+        symlink("../../zram0", virt.join("dm-3/slaves/zram0")).unwrap();
+        assert!(!virtual_block_device(&block, "vda"));
+        assert!(virtual_block_device(&block, "zram0"));
+        assert!(
+            !virtual_block_device(&block, "dm-0"),
+            "a volume over a disk"
+        );
+        assert!(virtual_block_device(&block, "dm-1"), "a volume over zram");
+        assert!(
+            !virtual_block_device(&block, "dm-2"),
+            "a volume over a volume"
+        );
+        assert!(virtual_block_device(&block, "dm-3"), "a volume over both");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

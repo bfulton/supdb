@@ -13,8 +13,10 @@ is the cost of the design, and showing them is what makes the wins credible.
 - **Storage size.** 1.31 bytes on disk per byte stored, against LMDB's 1.15
   and RocksDB's 1.03 (2026-10-17 run). Measured already.
 - **Recovery after a crash.** LMDB never recovers: its file is always
-  consistent, so it opens instantly. supdb replays its WAL on open. Not
-  measured yet; see the recovery workload below.
+  consistent, so it opens instantly. supdb replays its WAL on open, and
+  walks a run of ordered ingest the crash left open to write the index
+  its close would have written. Measured by the `recover` workloads
+  (`bench/DESIGN.md`).
 
 ## Benchmark
 
@@ -26,10 +28,22 @@ The suite has to be fair before any of its numbers are quoted.
   buffered RocksDB is `rocksdb-tuned-nosync`, `rocksdb-tuned` with the
   sync alone off, and the rows banked from 2026-10-31 carry it. A buffered
   RocksDB number is quoted from those rows and never from `rocksdb-nosync`.
-- [ ] **A recovery workload.** Crash at a known point (kill the process
+- [x] **A recovery workload.** Crash at a known point (kill the process
   after N committed batches, with an uncommitted tail), then time the open
-  and the first read, for every arm. Done when it runs in the suite and
-  banks a row. An accepted loss against LMDB; the point is to measure it.
+  and the first read, for every arm. `recover` and `recover-shuffled` do,
+  after the ordered load's batches and after the shuffled load's, in the
+  in-core rows (`bench/DESIGN.md`). An accepted loss against LMDB; the
+  point is to measure it.
+- [x] **Match what a buffered commit survives, or state it.** The
+  recovery workloads hold every arm's reopened store to the batches its
+  writer was acknowledged, and the buffered supdb arm's ordered load did
+  not hold the newest of them: ordered ingest wrote a run's records a
+  write piece at a time, so under a policy that does not sync at every
+  commit the commits behind the last whole piece were in the writer's
+  memory when its process died. Every commit of a run is written to its
+  file now, as a commit is written to the WAL, and the rows' count of
+  acknowledged batches not recovered (`unrecovered_batches`) is zero for
+  every arm.
 - [ ] **Rows past memory.** The `full` ladder to at least 1.5x the machine's
   memory, as `bench/DESIGN.md` specifies, is banked to 3M keys. The bounded
   scale (`--scale ooc`) is banked through 10M keys under 1.5 GiB, where
@@ -146,9 +160,59 @@ What an engine picker would hit, roughly in order.
   `flock` for the store's life, and a second open, from another process or
   this one, fails at once and touches nothing (`tests/db.rs`). Readers in
   other processes are not supported.
-- [ ] **Backup or checkpoint.** A consistent copy of a live store, like
-  LMDB's `mdb_env_copy` or RocksDB's `Checkpoint`. Table stakes for
-  operating a store.
+- [x] **A run's temp name behind a directory barrier.** A run of ordered
+  ingest was acknowledged durable once its file was synced, and nothing
+  synced the directory for the temp name that file is under: the name rode
+  the journal commit a new file's first sync forces, which ext4 and XFS
+  give and POSIX does not promise. The first sync that acknowledges a
+  commit of a run fsyncs the directory once, after the file, as a
+  rotation does for its new WAL file (`Db::sync_run`; `tests/runlog.rs`
+  counts it on every path that syncs). A store whose commits never sync
+  makes none.
+- [x] **A synced run that is lost anyway is refused where anything
+  follows it.** With its file synced and its name behind a barrier, a run
+  goes missing only where the device loses what it was told to keep.
+  Frames in the log past a run that is not there are a sequence gap, and
+  the open refuses. A run written after the missing one says in its note
+  whether everything before it was synced when it began, as a WAL file's
+  kind says, and where it was the open refuses too, before it removes
+  anything (`tests/runlog.rs`). A run that was the last thing written is
+  gone with nothing said, as a log's last synced record would be: nothing
+  on disk stands after it to say so.
+- [ ] **A buffered burst of one commit pays the filing in that commit.** A
+  commit near reads files its batch (`Options::forms_settle_every`), and
+  where a burst is one commit the filing is in the burst: the buffered
+  arm's one-percent burst at thirty thousand keys runs at two thirds to
+  four fifths of the arm that files late, behind in thirty-one pairs of
+  thirty-two across both orders (`bench/scripts/pair.sh
+  supdb-ingestsettlelate supdb-ingest 30000 --passes load,lag --reps 16`
+  at `8eb02b6`). Since that commit stopped building what it filed into
+  (`forms_settle_builds_filed` off) the pass after it makes the
+  difference back, the point's weighted sum level in both sittings, and
+  the quick row at `0526b89` has the burst ahead of both comparators. The
+  ten-percent burst at ten thousand keys, behind in the same pairing at
+  `5df99d6`, is unresolved by it now and sits level with LMDB's without
+  sync in the rows. What the filing costs a burst of one commit is not
+  decomposed.
+- [x] **Order ordered ingest's runs across a machine's crash.** Under a
+  policy that does not sync at every commit (`SyncPolicy::EveryN`), a
+  machine's crash could keep a later run, or frames in the log, and take
+  the end of an earlier run no sync had covered, and the open served the
+  later commits without the earlier ones, where the policy promises a tail
+  lost whole. A run's records take sequence numbers now, the open walks
+  the frames and the runs as one history and ends it at the first loss,
+  and a sync by policy covers every file written before it (`CLAUDE.md`,
+  a history in several files). Held by tests that build the state a lost
+  page leaves (`tests/runlog.rs`); a rig that cuts the power is still the
+  one thing that would show a device lying about its sync.
+- [x] **Backup or checkpoint.** A consistent copy of a live store, like
+  LMDB's `mdb_env_copy` or RocksDB's `Checkpoint`: `Db::checkpoint` makes
+  the store as of the call a store of its own at a new path, its segments
+  hard-linked where the path is on the store's filesystem and copied
+  where it is not (`tests/checkpoint.rs`). It flushes first, as RocksDB's
+  does by default; a checkpoint that leaves the memtable where it is and
+  carries the log would be the cheaper one for a store that writes
+  between them.
 - [ ] **Range delete.** Deleting a key range without a tombstone per key.
 - [ ] **Reverse and bounded scans.** `scan` is forward-only from a start key
   with a count; add an end bound and reverse order.

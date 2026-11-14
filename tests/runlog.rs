@@ -1,0 +1,1562 @@
+//! The runs of ordered ingest held to the log across a crash.
+//!
+//! A run keeps its records in a file of its own and the WAL never sees
+//! them, so the store's history lies in several files: the log's, and one
+//! for each run not yet a named segment. What a process's death leaves is
+//! all of them whole, since every commit is written where it goes. What a
+//! machine's crash may leave, under a policy that does not sync every
+//! commit, is any of them cut back to what a sync had covered, and which
+//! ones is the kernel's choice and not the order they were written in. The
+//! store that reopens holds a prefix of what was committed all the same:
+//! `SyncPolicy`'s words are that an unsynced tail is lost whole and never
+//! served in part.
+//!
+//! No test can pull the plug, so each one builds the state a lost page
+//! leaves: the writer is stopped as a crash stops it (`Db::crash`) with its
+//! seals held, so that every run is still under its temp name as the
+//! writer left it, and then a file is cut or taken away by hand before the
+//! store is opened again.
+
+use std::path::{Path, PathBuf};
+
+use supdb::{Db, Options, SyncPolicy};
+
+mod common;
+use common::vf;
+
+const BATCH: u64 = 1_000;
+const VALUE: [u8; 100] = [0x5a; 100];
+
+fn dir(name: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("supdb-next-runlog-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn key(i: u64) -> Vec<u8> {
+    format!("{i:016}").into_bytes()
+}
+
+/// A store that syncs nothing at a commit and closes a run every megabyte
+/// or so, eight batches of these.
+fn buffered() -> Options {
+    Options {
+        sync: SyncPolicy::EveryN(u32::MAX),
+        seal_bytes: 1 << 20,
+        ..Options::default()
+    }
+}
+
+/// The options of a store that is read and then stopped as a crash stops
+/// it: its segment work inline, since `Db::crash` leaves a store's threads
+/// running, and a thread that shapes what the reads touched would go on
+/// publishing beside the store opened next.
+fn inline(o: Options) -> Options {
+    Options {
+        publish_in_background: false,
+        ..o
+    }
+}
+
+fn values(db: &Db, k: &[u8]) -> Vec<Vec<u8>> {
+    let mut got = Vec::new();
+    db.read_all(k, vf(&mut |v| got.push(v.to_vec()))).unwrap();
+    got
+}
+
+/// Batch `b` appended in key order and committed: keys `b * BATCH` on.
+fn ordered_batch(db: &mut Db, b: u64) {
+    for j in 0..BATCH {
+        db.append(&key(b * BATCH + j), &VALUE);
+    }
+    db.commit().unwrap();
+}
+
+/// Whether batch `b` is in the store: every key with its value, or none.
+fn holds(db: &Db, b: u64) -> bool {
+    let n = (0..BATCH)
+        .filter(|&j| {
+            let v = values(db, &key(b * BATCH + j));
+            assert!(
+                v.is_empty() || v == vec![VALUE.to_vec()],
+                "batch {b}, key {j}: not the value written"
+            );
+            !v.is_empty()
+        })
+        .count() as u64;
+    assert!(n == 0 || n == BATCH, "batch {b} is there in part, {n} keys");
+    n == BATCH
+}
+
+fn run_file(d: &Path, id: u64) -> PathBuf {
+    d.join(format!("direct-{id:08}.tmp"))
+}
+
+fn names(d: &Path, prefix: &str) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(d)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(prefix))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Ordered batches committed with every seal held until a second run has
+/// `more` batches on its file behind the first run's close; the count of
+/// batches committed and the first batch of the second run.
+fn two_runs(db: &mut Db, d: &Path, more: u64) -> (u64, u64) {
+    db.hold_seal_landing(true);
+    let mut b = 0;
+    while !run_file(d, 1).exists() {
+        assert!(b < 64, "no second run after {b} batches");
+        ordered_batch(db, b);
+        b += 1;
+    }
+    let second = b - 1;
+    for _ in 0..more {
+        ordered_batch(db, b);
+        b += 1;
+    }
+    assert!(run_file(d, 0).exists(), "the first run's seal was held");
+    (b, second)
+}
+
+/// The window the suite's recovery workload could not reach: a run closed
+/// with nothing synced, the writer went on into the next, and the machine
+/// went down holding the second run's pages and not the first run's last.
+/// The open took every run it found, each to its own last commit marker,
+/// and served the second run's batches without the ones before them.
+#[test]
+fn a_run_cut_short_ends_the_history_before_the_run_after_it() {
+    let d = dir("short");
+    let mut db = Db::create(&d, buffered()).unwrap();
+    let (n, second) = two_runs(&mut db, &d, 3);
+    db.crash();
+    // The first run's end, lost: a quarter of a megabyte, two batches.
+    let first = run_file(&d, 0);
+    let len = std::fs::metadata(&first).unwrap().len();
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&first)
+        .unwrap();
+    f.set_len(len - (256 << 10)).unwrap();
+    drop(f);
+
+    let check = |db: &Db| -> u64 {
+        let kept = (0..n).take_while(|&b| holds(db, b)).count() as u64;
+        assert!(
+            kept > 0 && kept < second,
+            "the cut took batches of the first run: {kept} kept of {second}"
+        );
+        for b in kept..n + 1 {
+            assert!(
+                !holds(db, b),
+                "batch {b} is there and batch {kept}, committed before it, is not"
+            );
+        }
+        kept
+    };
+    let db = Db::open(&d, inline(buffered())).unwrap();
+    let kept = check(&db);
+    assert!(
+        names(&d, "direct-").is_empty(),
+        "a run the history never reached is still there: {:?}",
+        names(&d, "direct-")
+    );
+    // The store goes on from where its history ends, and what it writes
+    // next stands there: the lost batches again, a crash, and all of it.
+    let mut db = db;
+    for b in kept..n {
+        ordered_batch(&mut db, b);
+    }
+    db.crash();
+    let db = Db::open(&d, buffered()).unwrap();
+    for b in 0..n {
+        assert!(holds(&db, b), "batch {b}, written again, is not there");
+    }
+    db.close().unwrap();
+    let db = Db::open(&d, buffered()).unwrap();
+    for b in 0..n {
+        assert!(holds(&db, b), "batch {b} is gone after a close");
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A run that closed unsynced, frames in the log after it, and a crash
+/// that kept the frames and not the run's file at all: young enough that
+/// its name had not reached the directory. The frames stand past the run's
+/// sequence numbers, in a file whose header says a run was left unsynced
+/// before it, so the log ends there and the update the frames carry is not
+/// served over a store without the keys it updated.
+#[test]
+fn frames_behind_a_run_that_is_gone_are_not_served() {
+    let d = dir("gone");
+    let mut db = Db::create(&d, buffered()).unwrap();
+    db.hold_seal_landing(true);
+    for b in 0..3 {
+        ordered_batch(&mut db, b);
+    }
+    // A key below the run's greatest: the run closes and the write goes to
+    // the log, with two more behind it.
+    for i in 0..3u64 {
+        db.put(&key(i), b"after the run");
+        db.commit().unwrap();
+    }
+    assert_eq!(
+        db.runs_unsynced(),
+        (None, 1),
+        "the run closed with commits no sync had covered"
+    );
+    db.crash();
+    std::fs::remove_file(run_file(&d, 0)).unwrap();
+
+    let db = Db::open(&d, buffered()).unwrap();
+    for i in 0..3 * BATCH {
+        assert!(
+            values(&db, &key(i)).is_empty(),
+            "key {i} is served and the run that held it is gone"
+        );
+    }
+    // And the store takes writes where its history ends.
+    let mut db = db;
+    ordered_batch(&mut db, 0);
+    db.close().unwrap();
+    let db = Db::open(&d, buffered()).unwrap();
+    assert!(holds(&db, 0));
+    assert_eq!(values(&db, &key(BATCH)), Vec::<Vec<u8>>::new());
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The other order: frames in the log, unsynced, then a run, and a crash
+/// that kept the run's file and not the log's tail. The run stands past
+/// the frames' sequence numbers, the log does not reach its start, and it
+/// is not taken.
+#[test]
+fn a_run_behind_frames_that_are_gone_is_not_served() {
+    let d = dir("tail");
+    let mut db = Db::create(&d, buffered()).unwrap();
+    db.hold_seal_landing(true);
+    // Frames: three keys, greatest first, so none of them opens a run.
+    for i in [900u64, 800, 700] {
+        db.put(&key(10 * BATCH + i), b"in the log");
+        db.commit().unwrap();
+    }
+    // The table sealed, so the next key above the store's greatest finds
+    // it empty and opens a run.
+    db.seal().unwrap();
+    for b in 11..14 {
+        ordered_batch(&mut db, b);
+    }
+    assert!(
+        run_file(&d, 1).exists() || run_file(&d, 0).exists(),
+        "a run opened"
+    );
+    let (wal, _, written) = db.wal_durable();
+    assert!(written > 8, "the log holds the three frames");
+    db.crash();
+    // The log's unsynced tail, lost: everything behind its header.
+    let f = std::fs::OpenOptions::new().write(true).open(&wal).unwrap();
+    f.set_len(8).unwrap();
+    drop(f);
+
+    let db = Db::open(&d, buffered()).unwrap();
+    for b in 11..14 {
+        assert!(
+            !holds(&db, b),
+            "batch {b} of the run is served and the frames before it are gone"
+        );
+    }
+    for i in [900u64, 800, 700] {
+        assert!(values(&db, &key(10 * BATCH + i)).is_empty());
+    }
+    assert!(names(&d, "direct-").is_empty(), "the run is still there");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Nothing lost: frames, a run, frames behind it, a second run, and a
+/// writer stopped as a kill stops it, under each policy. Everything is
+/// there at the open; at the open after a second crash with nothing
+/// written between, when the runs are pieces and their numbers a gap in
+/// the log that only the store's own note fills; after more writes and a
+/// third; and after a close, when the manifest covers all of it and the
+/// notes are gone.
+#[test]
+fn runs_and_frames_come_back_whole_and_stay_so() {
+    for sync in [
+        SyncPolicy::EveryN(u32::MAX),
+        SyncPolicy::Always,
+        SyncPolicy::EveryN(3),
+    ] {
+        let opts = || Options {
+            sync,
+            seal_bytes: 1 << 20,
+            ..Options::default()
+        };
+        let d = dir(&format!("whole-{sync:?}").replace(['(', ')'], "-"));
+        let mut db = Db::create(&d, opts()).unwrap();
+        db.hold_seal_landing(true);
+        // Frames, sealed; a run of three batches; an update that closes
+        // it, in the log; then keys above the store's greatest again.
+        for i in [900u64, 800, 700] {
+            db.put(&key(i), b"first frames");
+            db.commit().unwrap();
+        }
+        db.seal().unwrap();
+        for b in 1..4 {
+            ordered_batch(&mut db, b);
+        }
+        db.put(&key(900), b"second frames");
+        db.commit().unwrap();
+        db.put(&key(4 * BATCH + 5), b"second frames");
+        db.commit().unwrap();
+        db.crash();
+
+        let check = |db: &Db, what: &str| {
+            for b in 1..4 {
+                assert!(holds(db, b), "{sync:?}, {what}: batch {b} of the run");
+            }
+            assert_eq!(
+                values(db, &key(900)),
+                vec![b"second frames".to_vec()],
+                "{sync:?}, {what}: the update behind the run"
+            );
+            assert_eq!(values(db, &key(800)), vec![b"first frames".to_vec()]);
+            assert_eq!(values(db, &key(700)), vec![b"first frames".to_vec()]);
+            assert_eq!(
+                values(db, &key(4 * BATCH + 5)),
+                vec![b"second frames".to_vec()],
+                "{sync:?}, {what}: the last commit"
+            );
+        };
+        let db = Db::open(&d, inline(opts())).unwrap();
+        check(&db, "the first open");
+        assert!(names(&d, "direct-").is_empty(), "{sync:?}: a run was left");
+        assert_eq!(
+            names(&d, "cov-").len(),
+            1,
+            "{sync:?}: the run's numbers are noted while the manifest covers less"
+        );
+        db.crash();
+        let mut db = Db::open(&d, inline(opts())).unwrap();
+        check(&db, "the second open");
+        db.put(&key(5), b"third frames");
+        db.commit().unwrap();
+        db.crash();
+        let db = Db::open(&d, opts()).unwrap();
+        check(&db, "the third open");
+        assert_eq!(values(&db, &key(5)), vec![b"third frames".to_vec()]);
+        db.close().unwrap();
+        let db = Db::open(&d, opts()).unwrap();
+        check(&db, "after a close");
+        assert_eq!(values(&db, &key(5)), vec![b"third frames".to_vec()]);
+        assert!(
+            names(&d, "cov-").is_empty(),
+            "{sync:?}: a note outlived the manifest that covers its range: {:?}",
+            names(&d, "cov-")
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// A run every commit of which was synced, frames behind it, and the run's
+/// file gone: not a tail a crash may take, since the policy promised every
+/// one of those commits, so the open refuses as it refuses a log with a
+/// record missing, and serves nothing from behind the hole.
+#[test]
+fn a_synced_run_that_is_gone_is_a_record_lost() {
+    let d = dir("damage");
+    let mut db = Db::create(&d, Options::default()).unwrap();
+    db.hold_seal_landing(true);
+    for b in 0..2 {
+        ordered_batch(&mut db, b);
+    }
+    db.put(&key(7), b"behind the run");
+    db.commit().unwrap();
+    assert_eq!(db.runs_unsynced(), (None, 0), "every commit was synced");
+    db.crash();
+    std::fs::remove_file(run_file(&d, 0)).unwrap();
+    let e = match Db::open(&d, Options::default()) {
+        Ok(_) => panic!("a store with a synced run missing opened"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        e.contains("sequence gap"),
+        "refused for another reason: {e}"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// What a sync by policy acknowledges is every commit so far, wherever it
+/// was written: a run that closed with commits unsynced is synced by the
+/// policy's next sync, though that sync is of the log, and `sync` covers
+/// the run in progress, which holds none of its records in the log.
+#[test]
+fn a_sync_covers_the_runs_as_well_as_the_log() {
+    let d = dir("sync");
+    let mut db = Db::create(
+        &d,
+        Options {
+            sync: SyncPolicy::EveryN(4),
+            // The run in progress stays where it is at a `sync`.
+            adaptive_shape: false,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    db.hold_seal_landing(true);
+    // Two commits into a run, a third that closes it into the log: three
+    // of the policy's four, none synced.
+    ordered_batch(&mut db, 0);
+    ordered_batch(&mut db, 1);
+    assert_eq!(db.runs_unsynced(), (Some(true), 0));
+    db.put(&key(0), b"closes the run");
+    db.commit().unwrap();
+    assert_eq!(db.runs_unsynced(), (None, 1));
+    let before = db.seal_waits().loose_synced;
+    // The fourth: the policy's sync, of the log and of the run before it.
+    db.put(&key(1), b"the fourth commit");
+    db.commit().unwrap();
+    assert_eq!(
+        db.runs_unsynced(),
+        (None, 0),
+        "the policy's sync left a run loose"
+    );
+    assert_eq!(db.seal_waits().loose_synced, before + 1);
+    let (_, synced, written) = db.wal_durable();
+    assert_eq!(synced, written, "the policy's sync left frames unsynced");
+
+    // The other order: a frame in the log, unsynced, a run behind it, and
+    // the policy's fourth commit falling in the run. The sync is of the
+    // run's file, and of the log before it.
+    db.put(&key(2), b"a frame before the run");
+    db.commit().unwrap();
+    let (_, synced, written) = db.wal_durable();
+    assert!(synced < written, "the frame is unsynced");
+    db.seal().unwrap();
+    ordered_batch(&mut db, 2);
+    ordered_batch(&mut db, 3);
+    assert_eq!(db.runs_unsynced().0, Some(true));
+    ordered_batch(&mut db, 4);
+    assert_eq!(
+        db.runs_unsynced().0,
+        Some(false),
+        "the policy's sync left the run in progress unsynced"
+    );
+    let (_, synced, written) = db.wal_durable();
+    assert_eq!(
+        synced, written,
+        "the policy's sync, made in a run, left the frames before the run unsynced"
+    );
+
+    // A run in progress with a commit unsynced, and a `sync`.
+    ordered_batch(&mut db, 5);
+    assert_eq!(db.runs_unsynced().0, Some(true));
+    db.sync().unwrap();
+    assert_eq!(
+        db.runs_unsynced().0,
+        Some(false),
+        "`sync` returned over a run with commits no sync had covered"
+    );
+    db.crash();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A run's temp name is behind a directory barrier before a commit of the
+/// run is acknowledged as synced: a sync of the file promises the file and
+/// not the entry that names it, and a run whose name a machine's crash took
+/// is every commit of it gone. One barrier a run, at the first sync that
+/// covers it, on each path that makes one: a commit under a policy that
+/// syncs every commit, the policy's sync falling in the run, the policy's
+/// sync falling after the run has closed, and `sync`. No test can lose a
+/// name, so this one counts what each acknowledgement left unpromised and
+/// the barriers the writer made.
+#[test]
+fn a_runs_name_is_behind_a_barrier_before_its_commits_are_acknowledged() {
+    // Every commit synced: the run's first commit carries the barrier, and
+    // no commit after it.
+    let d = dir("name-always");
+    let mut db = Db::create(
+        &d,
+        Options {
+            sync: SyncPolicy::Always,
+            adaptive_shape: false,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    db.hold_seal_landing(true);
+    assert_eq!(db.seal_waits().run_names, 0);
+    ordered_batch(&mut db, 0);
+    assert_eq!(
+        db.run_names_unsynced(),
+        (Some(false), 0),
+        "a synced commit was acknowledged into a run whose name nothing promises"
+    );
+    assert_eq!(db.seal_waits().run_names, 1);
+    ordered_batch(&mut db, 1);
+    ordered_batch(&mut db, 2);
+    assert_eq!(
+        db.seal_waits().run_names,
+        1,
+        "one barrier a run, not one a commit"
+    );
+    // The run closes into the log, synced and named: nothing is owed.
+    db.put(&key(0), b"closes the run");
+    db.commit().unwrap();
+    assert_eq!(db.runs_unsynced(), (None, 0));
+    assert_eq!(db.run_names_unsynced(), (None, 0));
+    assert_eq!(db.seal_waits().run_names, 1);
+    // The next run is a new name.
+    db.seal().unwrap();
+    ordered_batch(&mut db, 3);
+    assert_eq!(db.run_names_unsynced(), (Some(false), 0));
+    assert_eq!(db.seal_waits().run_names, 2);
+    db.crash();
+    let _ = std::fs::remove_dir_all(&d);
+
+    // A sync every fourth commit.
+    let d = dir("name-everyn");
+    let mut db = Db::create(
+        &d,
+        Options {
+            sync: SyncPolicy::EveryN(4),
+            adaptive_shape: false,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    db.hold_seal_landing(true);
+    // The policy's sync falling in the run.
+    ordered_batch(&mut db, 0);
+    ordered_batch(&mut db, 1);
+    ordered_batch(&mut db, 2);
+    assert_eq!(
+        db.run_names_unsynced(),
+        (Some(true), 0),
+        "nothing is acknowledged as synced yet, and nothing is owed"
+    );
+    assert_eq!(db.seal_waits().run_names, 0);
+    ordered_batch(&mut db, 3);
+    assert_eq!(db.runs_unsynced(), (Some(false), 0));
+    assert_eq!(
+        db.run_names_unsynced(),
+        (Some(false), 0),
+        "the policy's sync covered the run's file and not its name"
+    );
+    assert_eq!(db.seal_waits().run_names, 1);
+    // That run closes named, with two commits the policy has not synced:
+    // loose for its file, and its name is owed nothing more.
+    ordered_batch(&mut db, 4);
+    ordered_batch(&mut db, 5);
+    db.put(&key(0), b"closes the run");
+    db.commit().unwrap();
+    assert_eq!(db.runs_unsynced(), (None, 1));
+    assert_eq!(db.run_names_unsynced(), (None, 0));
+    db.put(&key(1), b"the policy's fourth");
+    db.commit().unwrap();
+    assert_eq!(db.runs_unsynced(), (None, 0));
+    assert_eq!(db.seal_waits().run_names, 1, "a name promised twice");
+
+    // The policy's sync falling after a run closed that no sync had
+    // reached, the live log file holding frames: the frames after the run
+    // go to a new file (`WAL_LOOSE_RUN`), whose name is owed a barrier of
+    // its own, and that one barrier is the run's name's too.
+    db.seal().unwrap();
+    ordered_batch(&mut db, 6);
+    ordered_batch(&mut db, 7);
+    let rotations = db.seal_waits().wal_rotations;
+    db.put(&key(2), b"closes the run");
+    db.commit().unwrap();
+    assert_eq!(db.seal_waits().wal_rotations, rotations + 1);
+    assert_eq!(db.runs_unsynced(), (None, 1));
+    assert_eq!(db.run_names_unsynced(), (None, 1), "the run closed unnamed");
+    db.put(&key(3), b"the policy's fourth");
+    db.commit().unwrap();
+    assert_eq!(db.runs_unsynced(), (None, 0));
+    assert_eq!(db.run_names_unsynced(), (None, 0));
+    assert_eq!(
+        db.seal_waits().run_names,
+        1,
+        "the rotation's barrier is of the directory, and the run's name was in it"
+    );
+    db.crash();
+    let _ = std::fs::remove_dir_all(&d);
+
+    // The same close where the live log file holds no frame: the file's
+    // header is marked in place, no file is begun, and the run's name is
+    // the policy's sync's to promise.
+    let d = dir("name-inplace");
+    let mut db = Db::create(
+        &d,
+        Options {
+            sync: SyncPolicy::EveryN(4),
+            adaptive_shape: false,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    db.hold_seal_landing(true);
+    ordered_batch(&mut db, 0);
+    ordered_batch(&mut db, 1);
+    let rotations = db.seal_waits().wal_rotations;
+    db.put(&key(0), b"closes the run");
+    db.commit().unwrap();
+    assert_eq!(db.seal_waits().wal_rotations, rotations);
+    assert_eq!(db.run_names_unsynced(), (None, 1));
+    assert_eq!(db.seal_waits().run_names, 0);
+    db.put(&key(1), b"the policy's fourth");
+    db.commit().unwrap();
+    assert_eq!(db.runs_unsynced(), (None, 0));
+    assert_eq!(
+        db.seal_waits().run_names,
+        1,
+        "the policy's sync covered a closed run's file and not its name"
+    );
+    db.crash();
+    let _ = std::fs::remove_dir_all(&d);
+
+    // `sync` over a run the policy has synced nothing of.
+    let d = dir("name-sync");
+    let mut db = Db::create(
+        &d,
+        Options {
+            adaptive_shape: false,
+            ..buffered()
+        },
+    )
+    .unwrap();
+    db.hold_seal_landing(true);
+    ordered_batch(&mut db, 0);
+    assert_eq!(db.run_names_unsynced(), (Some(true), 0));
+    db.sync().unwrap();
+    assert_eq!(db.runs_unsynced(), (Some(false), 0));
+    assert_eq!(
+        db.run_names_unsynced(),
+        (Some(false), 0),
+        "`sync` returned over a run whose name nothing promises"
+    );
+    assert_eq!(db.seal_waits().run_names, 1);
+    db.sync().unwrap();
+    assert_eq!(db.seal_waits().run_names, 1);
+    db.crash();
+    let _ = std::fs::remove_dir_all(&d);
+
+    // A store whose commits never sync owes the name to nothing: its
+    // flush is answered behind the landing, whose own directory barrier
+    // carries every name in it.
+    let d = dir("name-never");
+    let mut db = Db::create(&d, buffered()).unwrap();
+    for b in 0..4 {
+        ordered_batch(&mut db, b);
+    }
+    db.flush().unwrap();
+    assert_eq!(db.seal_waits().run_names, 0);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The barrier's failure is the commit's: a commit whose run's name could
+/// not be promised is not acknowledged, the next sync owes the barrier
+/// still, and a run that closes owing it is the next sync's as a run that
+/// closed unsynced is.
+#[test]
+fn a_barrier_that_fails_is_owed_until_it_is_made() {
+    let d = dir("name-fails");
+    let mut db = Db::create(
+        &d,
+        inline(Options {
+            sync: SyncPolicy::Always,
+            adaptive_shape: false,
+            ..Options::default()
+        }),
+    )
+    .unwrap();
+    db.fail_next_dir_barrier();
+    for j in 0..BATCH {
+        db.append(&key(j), &VALUE);
+    }
+    let e = db
+        .commit()
+        .expect_err("the barrier failed and the commit was acknowledged");
+    assert!(e.to_string().contains("injected"), "{e}");
+    assert_eq!(db.run_names_unsynced(), (Some(true), 0));
+    assert_eq!(db.seal_waits().run_names, 0);
+    // The next commit of the run makes it.
+    ordered_batch(&mut db, 1);
+    assert_eq!(db.run_names_unsynced(), (Some(false), 0));
+    assert_eq!(db.seal_waits().run_names, 1);
+    db.flush().unwrap();
+
+    // A run whose one commit's barrier failed, closed by a write into the
+    // log: its file is synced and its name is not, and the commit into
+    // the log does not return before the name is promised. Its seal is
+    // held, so the run is under its temp name when the commit looks.
+    db.hold_seal_landing(true);
+    db.fail_next_dir_barrier();
+    for j in 0..BATCH {
+        db.append(&key(2 * BATCH + j), &VALUE);
+    }
+    db.commit()
+        .expect_err("the barrier failed and the commit was acknowledged");
+    assert_eq!(db.runs_unsynced(), (Some(false), 0));
+    assert_eq!(db.run_names_unsynced(), (Some(true), 0));
+    db.put(&key(0), b"closes the run");
+    assert_eq!(
+        db.run_names_unsynced(),
+        (None, 1),
+        "a run closed with its name unpromised and nothing owes it"
+    );
+    db.commit().unwrap();
+    assert_eq!(db.runs_unsynced(), (None, 0));
+    assert_eq!(db.run_names_unsynced(), (None, 0));
+    assert_eq!(db.seal_waits().run_names, 2);
+    db.crash();
+
+    let db = Db::open(&d, Options::default()).unwrap();
+    assert_eq!(values(&db, &key(0)), vec![b"closes the run".to_vec()]);
+    assert_eq!(values(&db, &key(1)), vec![VALUE.to_vec()]);
+    for b in 1..3 {
+        assert!(holds(&db, b), "batch {b} is gone");
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Batch `b` of writes into the log: keys in falling order under the
+/// store's greatest, so that none of them continues a run.
+fn logged_batch(db: &mut Db, b: u64) {
+    for j in (0..BATCH).rev() {
+        db.put(&key((1_000 - b) * BATCH + j), &VALUE);
+    }
+    db.commit().unwrap();
+}
+
+/// What an open replays from the log is not thereby synced. A killed
+/// writer leaves its unsynced frames in the page cache, the open reads
+/// them back from there, and they are no nearer the device for it: a
+/// `sync` after the reopen syncs them, in the live file and in the files
+/// before it, where it once found the log "synced" and returned.
+#[test]
+fn a_sync_after_a_reopen_covers_what_the_open_replayed() {
+    let d = dir("reopen-sync");
+    let mut db = Db::create(&d, inline(buffered())).unwrap();
+    logged_batch(&mut db, 0);
+    assert_eq!(db.runs_unsynced(), (None, 0), "the batch went to a run");
+    let (_, synced, written) = db.wal_durable();
+    assert!(synced < written, "the policy synced the batch");
+    db.crash();
+
+    let mut db = Db::open(&d, inline(buffered())).unwrap();
+    let (_, synced, written) = db.wal_durable();
+    assert!(
+        synced < written,
+        "the open counted the frames it replayed as synced, {synced} of {written}"
+    );
+    db.sync().unwrap();
+    let (_, synced, written) = db.wal_durable();
+    assert_eq!(synced, written, "`sync` left replayed frames unsynced");
+    db.crash();
+    let _ = std::fs::remove_dir_all(&d);
+
+    // Two files of the log: the first closed by size with its frames
+    // unsynced, the second live. Neither seal lands, so neither retires.
+    let d = dir("reopen-sync-files");
+    let mut db = Db::create(&d, buffered()).unwrap();
+    db.hold_seal_landing(true);
+    let mut b = 0;
+    while names(&d, "wal-").len() < 2 {
+        logged_batch(&mut db, b);
+        b += 1;
+        assert!(b < 64, "the log never rotated");
+    }
+    logged_batch(&mut db, b);
+    db.crash();
+
+    let mut db = Db::open(&d, inline(buffered())).unwrap();
+    assert!(names(&d, "wal-").len() >= 2, "{:?}", names(&d, "wal-"));
+    let before = db.seal_waits().loose_synced;
+    db.sync().unwrap();
+    assert!(
+        db.seal_waits().loose_synced > before,
+        "`sync` after a reopen left the log's older files as the writer before left them"
+    );
+    for k in 0..=b {
+        assert_eq!(
+            values(&db, &key((1_000 - k) * BATCH)),
+            vec![VALUE.to_vec()],
+            "batch {k}"
+        );
+    }
+    db.crash();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A run that began with everything before it behind a sync says so, and
+/// an open that finds the history ending before such a run has found a
+/// record lost: it refuses, and removes nothing. The same run after one
+/// whose commits no sync had covered says nothing of the kind, and goes
+/// with the tail a crash took, as the tests above hold.
+#[test]
+fn a_run_begun_behind_a_sync_refuses_a_gap_before_it() {
+    // Every commit synced: the first run closed by a seal, a second run
+    // behind it, and the first run's file gone -- which no crash does to a
+    // file whose every commit was synced and whose name is behind a
+    // barrier.
+    let d = dir("chained-always");
+    let always = || Options {
+        sync: SyncPolicy::Always,
+        seal_bytes: 1 << 20,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, always()).unwrap();
+    db.hold_seal_landing(true);
+    ordered_batch(&mut db, 0);
+    ordered_batch(&mut db, 1);
+    db.seal().unwrap();
+    ordered_batch(&mut db, 2);
+    ordered_batch(&mut db, 3);
+    db.crash();
+    let runs = names(&d, "direct-");
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    std::fs::remove_file(d.join(&runs[0])).unwrap();
+    let e = match Db::open(&d, always()) {
+        Ok(_) => panic!("a store missing a synced run opened, without the run after it either"),
+        Err(e) => e,
+    };
+    assert!(e.to_string().contains("a record is lost"), "{e}");
+    assert_eq!(
+        names(&d, "direct-"),
+        vec![runs[1].clone()],
+        "the refusal changed what it refused"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+
+    // A sync every fourth commit. The first run takes two commits and
+    // closes with them unsynced; the second begins over it, loose, and
+    // the policy's sync falls in it and covers both; the third begins
+    // after that sync, with everything before it synced. With the first
+    // run gone the second is past the history's end and says nothing, the
+    // third is past it and says a record is lost: the open refuses, and
+    // the second run is still there.
+    let d = dir("chained-everyn");
+    let everyn = || Options {
+        sync: SyncPolicy::EveryN(4),
+        seal_bytes: 1 << 20,
+        adaptive_shape: false,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, everyn()).unwrap();
+    db.hold_seal_landing(true);
+    ordered_batch(&mut db, 0);
+    ordered_batch(&mut db, 1);
+    db.seal().unwrap();
+    assert_eq!(db.runs_unsynced(), (None, 1));
+    ordered_batch(&mut db, 2);
+    ordered_batch(&mut db, 3);
+    assert_eq!(db.runs_unsynced(), (Some(false), 0), "the policy's fourth");
+    db.seal().unwrap();
+    ordered_batch(&mut db, 4);
+    db.crash();
+    let runs = names(&d, "direct-");
+    assert_eq!(runs.len(), 3, "{runs:?}");
+    std::fs::remove_file(d.join(&runs[0])).unwrap();
+    let e = match Db::open(&d, everyn()) {
+        Ok(_) => panic!("a store missing a synced run opened"),
+        Err(e) => e,
+    };
+    assert!(e.to_string().contains("a record is lost"), "{e}");
+    assert_eq!(
+        names(&d, "direct-"),
+        runs[1..].to_vec(),
+        "the refusal removed a run before it refused"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A run says everything before it was synced only where it was. Two
+/// states a writer reaches with nothing in its lists and something
+/// unsynced all the same: frames a reopen replayed, which a killed writer
+/// left in the page cache, and a run a failed drain closed. A run begun
+/// over either says nothing, and a crash that takes the unsynced tail
+/// before it takes the run with it and no more: the store opens.
+#[test]
+fn a_run_begun_over_something_unsynced_does_not_say_otherwise() {
+    // Frames replayed at a reopen, never synced; a seal; a run.
+    let d = dir("unchained-reopen");
+    let mut db = Db::create(&d, inline(buffered())).unwrap();
+    logged_batch(&mut db, 0);
+    db.crash();
+    let mut db = Db::open(&d, buffered()).unwrap();
+    db.hold_seal_landing(true);
+    db.seal().unwrap();
+    for j in 0..BATCH {
+        db.append(&key(2_000 * BATCH + j), &VALUE);
+    }
+    db.commit().unwrap();
+    assert_eq!(db.runs_unsynced().0, Some(true), "the batch opened no run");
+    db.crash();
+    // The crash a machine makes of it: the log's frames gone, the run's
+    // file whole.
+    for w in names(&d, "wal-") {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(d.join(w))
+            .unwrap()
+            .set_len(8)
+            .unwrap();
+    }
+    let db = match Db::open(&d, inline(buffered())) {
+        Ok(db) => db,
+        Err(e) => panic!("a run begun over unsynced frames said they were synced: {e}"),
+    };
+    assert!(values(&db, &key(2_000 * BATCH)).is_empty());
+    assert!(values(&db, &key(1_000 * BATCH)).is_empty());
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+
+    // A drain that fails at its landing, its run unsynced; a run after it.
+    let d = dir("unchained-drain");
+    let mut db = Db::create(&d, buffered()).unwrap();
+    ordered_batch(&mut db, 0);
+    ordered_batch(&mut db, 1);
+    db.fail_next_landing();
+    db.flush()
+        .expect_err("the landing failed and the flush answered");
+    assert_eq!(
+        db.runs_unsynced(),
+        (None, 1),
+        "the run a failed drain closed is nobody's to sync"
+    );
+    db.crash();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A run's file from before runs took sequence numbers names no start, and
+/// is taken as those were, wherever it stands: a store a release from
+/// before was killed over opens with what that release would have found.
+#[test]
+fn a_run_that_names_no_start_is_taken_as_it_stands() {
+    let d = dir("legacy");
+    let mut db = Db::create(&d, buffered()).unwrap();
+    db.hold_seal_landing(true);
+    for b in 0..3 {
+        ordered_batch(&mut db, b);
+    }
+    db.crash();
+    // The note out of the superblock page, as a file from before has it.
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(run_file(&d, 0))
+        .unwrap();
+    f.write_all_at(&[0u8; 24], 2048).unwrap();
+    drop(f);
+    let db = Db::open(&d, buffered()).unwrap();
+    for b in 0..3 {
+        assert!(holds(&db, b), "batch {b} of a run from before");
+    }
+    assert!(
+        names(&d, "cov-").is_empty(),
+        "a run with no numbers was noted"
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The store's greatest key at an open is the greatest the replay
+/// applied, kept as the records go by, and a checked build holds it to a
+/// walk of the replayed table. A delete makes an entry as a put does, so
+/// a replayed delete above every key written is the greatest key: the
+/// input on which keeping only the puts' keys and walking the table
+/// disagree.
+#[test]
+fn a_replayed_delete_above_every_put_is_the_greatest_key() {
+    let d = dir("replayed-delete");
+    let mut db = Db::create(&d, buffered()).unwrap();
+    for i in [40u64, 10, 30] {
+        db.put(&key(i), b"put");
+    }
+    db.commit().unwrap();
+    db.delete(&key(90));
+    db.delete(&key(20));
+    db.commit().unwrap();
+    db.crash();
+    let mut db = Db::open(&d, inline(buffered())).unwrap();
+    assert_eq!(values(&db, &key(40)), vec![b"put".to_vec()]);
+    assert!(values(&db, &key(90)).is_empty());
+    // A key between the puts' greatest and the delete's is not above the
+    // store's greatest, and is written as any other.
+    db.append(&key(50), b"after");
+    db.commit().unwrap();
+    assert_eq!(values(&db, &key(50)), vec![b"after".to_vec()]);
+    db.crash();
+    let db = Db::open(&d, inline(buffered())).unwrap();
+    assert_eq!(values(&db, &key(50)), vec![b"after".to_vec()]);
+    assert_eq!(values(&db, &key(40)), vec![b"put".to_vec()]);
+    db.crash();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The files of the store at `from`, copied to a fresh directory: the
+/// same state, for another open to start from.
+fn copy_of(from: &Path, name: &str) -> PathBuf {
+    let to = dir(name);
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
+    }
+    to
+}
+
+/// The store's one segment file: its name and its bytes.
+fn one_segment(d: &Path, what: &str) -> (String, Vec<u8>) {
+    let segs = common::seg_names(d);
+    assert_eq!(segs.len(), 1, "{what}: one segment, of {segs:?}");
+    let bytes = std::fs::read(d.join(&segs[0])).unwrap();
+    (segs[0].clone(), bytes)
+}
+
+/// An open makes a piece of a run where the run lies: the file the killed
+/// writer left is finished as its close would have finished it, and
+/// linked under the piece's name. So the piece is that file, by its inode,
+/// and it is byte for byte the segment the same commits closed cleanly
+/// make, but for the second it was finished in. The open used to parse
+/// every record out of the run's file and write it into a new one, which
+/// was most of the open of a killed store whose load arrived in order.
+#[test]
+fn a_run_an_open_takes_is_finished_where_it_lies() {
+    use std::os::unix::fs::MetadataExt;
+    for sync in [SyncPolicy::EveryN(u32::MAX), SyncPolicy::Always] {
+        let opts = || Options {
+            sync,
+            ..Options::default()
+        };
+        let tag = format!("{sync:?}").replace(['(', ')'], "-");
+        let write = |d: &Path| {
+            let mut db = Db::create(d, opts()).unwrap();
+            for b in 0..3 {
+                ordered_batch(&mut db, b);
+            }
+            // An empty value and a long key, which the record lays out
+            // otherwise than the batches' sixteen bytes and a hundred.
+            db.append(&key(3 * BATCH), b"");
+            let long = format!("{:016}{:048}", 3 * BATCH + 1, 0);
+            db.append(long.as_bytes(), &VALUE[..7]);
+            db.commit().unwrap();
+            db
+        };
+
+        let killed = dir(&format!("inplace-killed-{tag}"));
+        write(&killed).crash();
+        let run = run_file(&killed, 0);
+        let inode = std::fs::metadata(&run).unwrap().ino();
+        let left = std::fs::metadata(&run).unwrap().len();
+        let db = Db::open(&killed, inline(opts())).unwrap();
+        for b in 0..3 {
+            assert!(holds(&db, b), "{sync:?}: batch {b} of the run");
+        }
+        assert_eq!(values(&db, &key(3 * BATCH)), vec![Vec::<u8>::new()]);
+        let long = format!("{:016}{:048}", 3 * BATCH + 1, 0);
+        assert_eq!(values(&db, long.as_bytes()), vec![VALUE[..7].to_vec()]);
+        db.crash();
+        let (name, taken) = one_segment(&killed, "the killed store");
+        assert!(
+            names(&killed, "direct-").is_empty(),
+            "the run's name stayed"
+        );
+        assert_eq!(
+            std::fs::metadata(killed.join(&name)).unwrap().ino(),
+            inode,
+            "{sync:?}: the piece is another file than the run's"
+        );
+        assert!(
+            taken.len() as u64 > left,
+            "{sync:?}: nothing was written behind the run's records"
+        );
+
+        let closed = dir(&format!("inplace-closed-{tag}"));
+        write(&closed).close().unwrap();
+        let (_, made) = one_segment(&closed, "the closed store");
+        assert_eq!(taken.len(), made.len(), "{sync:?}: the two files' lengths");
+        assert!(
+            common::without_the_clock(&taken) == common::without_the_clock(&made),
+            "{sync:?}: a run finished at an open is not the segment its close makes"
+        );
+        let _ = std::fs::remove_dir_all(&killed);
+        let _ = std::fs::remove_dir_all(&closed);
+    }
+}
+
+/// The open that finishes a run's file is itself an open a crash may
+/// take, and the file is no longer the one the writer left once it has
+/// begun: the index half written behind the records, the file whole and
+/// under no other name, the file linked under the piece's name with no
+/// manifest naming it (which the open sweeps with the orphans before it
+/// takes a run), and the piece named with the run's range not yet noted. Each is built from the store a writer left and the store the
+/// open made of it, and the open after it finds the same store: every
+/// batch of the run, the frames behind it at their numbers, and the same
+/// piece, the run's own file cut back to its last commit and finished
+/// again -- or, once a manifest names it, not touched at all.
+#[test]
+fn an_open_cut_short_in_a_runs_finish_is_made_again() {
+    let opts = || Options {
+        seal_bytes: 1 << 30,
+        ..buffered()
+    };
+    let left = dir("refinish-left");
+    {
+        let mut db = Db::create(&left, opts()).unwrap();
+        db.hold_seal_landing(true);
+        for b in 1..4 {
+            ordered_batch(&mut db, b);
+        }
+        // Frames behind the run: an update, which closes it, and a key
+        // above the store's greatest in the same log.
+        db.put(&key(BATCH + 7), b"behind the run");
+        db.commit().unwrap();
+        db.put(&key(5), b"the last commit");
+        db.commit().unwrap();
+        db.crash();
+    }
+    let raw = std::fs::read(run_file(&left, 0)).unwrap();
+    let check = |db: &Db, what: &str| {
+        for b in 2..4 {
+            assert!(holds(db, b), "{what}: batch {b} of the run");
+        }
+        assert_eq!(
+            values(db, &key(BATCH + 7)),
+            vec![b"behind the run".to_vec()],
+            "{what}: the update behind the run"
+        );
+        assert_eq!(
+            values(db, &key(BATCH + 8)),
+            vec![VALUE.to_vec()],
+            "{what}: the key beside the update"
+        );
+        assert_eq!(
+            values(db, &key(5)),
+            vec![b"the last commit".to_vec()],
+            "{what}: the last commit"
+        );
+    };
+
+    // The open nothing cut short, for what it makes.
+    let made = copy_of(&left, "refinish-made");
+    let db = Db::open(&made, inline(opts())).unwrap();
+    check(&db, "the open that finished");
+    db.crash();
+    let (name, piece) = one_segment(&made, "the open that finished");
+    assert!(piece.len() > raw.len(), "an index behind the records");
+    // Where a run's records begin: past the superblock region and the
+    // key section's header.
+    const RECORDS: usize = 4096 + 192;
+    assert!(piece[RECORDS..raw.len()] == raw[RECORDS..], "the records");
+    let index = piece.len() - raw.len();
+
+    // The run's file as each crash before the manifest leaves it, and
+    // whether the piece's name is linked to it. The last two are a
+    // writer's leavings and not an open's: bytes that are no record, more
+    // of them than the index is long, and a batch of whole records with
+    // no marker behind it -- the first batch's again, which is a third of
+    // the stream less its marker.
+    let mut junk = raw.clone();
+    junk.extend(std::iter::repeat_n(0xa5u8, 3 * index));
+    let batch = (raw.len() - RECORDS) / 3 - 24;
+    let mut unmarked = raw.clone();
+    unmarked.extend_from_slice(&raw[RECORDS..RECORDS + batch]);
+    let windows: [(&str, Vec<u8>, bool); 5] = [
+        (
+            "half an index",
+            piece[..raw.len() + index / 2].to_vec(),
+            false,
+        ),
+        ("finished and not linked", piece.clone(), false),
+        ("linked and not named", piece.clone(), true),
+        ("a tail longer than the index", junk, false),
+        ("a batch with no marker", unmarked, false),
+    ];
+    for (what, file, linked) in windows {
+        let d = copy_of(&left, &format!("refinish-{}", what.replace(' ', "-")));
+        std::fs::write(run_file(&d, 0), &file).unwrap();
+        if linked {
+            std::fs::hard_link(run_file(&d, 0), d.join(&name)).unwrap();
+        }
+        let db = Db::open(&d, inline(opts())).unwrap();
+        check(&db, what);
+        db.crash();
+        let (again, bytes) = one_segment(&d, what);
+        assert_eq!(again, name, "{what}: the piece's name");
+        assert!(
+            common::without_the_clock(&bytes) == common::without_the_clock(&piece),
+            "{what}: the piece made again is not the piece ({} bytes, {})",
+            bytes.len(),
+            piece.len()
+        );
+        assert!(names(&d, "direct-").is_empty(), "{what}: the run's name");
+        assert_eq!(names(&d, "cov-").len(), 1, "{what}: the run's range");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // Named, and the range not noted: the temp name is a second name of
+    // the piece. The open counts the run's records for the note and
+    // writes nothing into a file a manifest names.
+    let d = copy_of(&made, "refinish-named");
+    for n in names(&d, "cov-") {
+        std::fs::remove_file(d.join(n)).unwrap();
+    }
+    std::fs::hard_link(d.join(&name), run_file(&d, 0)).unwrap();
+    let db = Db::open(&d, inline(opts())).unwrap();
+    check(&db, "named and not noted");
+    db.crash();
+    let (again, bytes) = one_segment(&d, "named and not noted");
+    assert_eq!(again, name);
+    assert!(
+        bytes == piece,
+        "a file the manifest names was written again"
+    );
+    assert!(names(&d, "direct-").is_empty(), "the run's second name");
+    assert_eq!(names(&d, "cov-").len(), 1, "the run's range, noted");
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&made);
+    let _ = std::fs::remove_dir_all(&left);
+}
+
+// ------------------------------------------------------------- the oracle --
+
+/// The stream the oracle's writer commits: a function of a seed and of the
+/// commits before, so that the parent makes the same stream again and asks
+/// which prefix of it the reopened store is. Runs of ordered ingest, writes
+/// into the log over the keys already there, a batch that begins as a run
+/// and ends in the log, and seals between them, so that a store is killed
+/// with runs open, runs closed and unsealed, runs landed, and frames on
+/// every side of them.
+#[cfg(target_os = "linux")]
+struct Stream {
+    rng: u64,
+    /// Keys `0..next` have been written; the next run starts here.
+    next: u64,
+}
+
+#[cfg(target_os = "linux")]
+enum Op {
+    Append(Vec<u8>, Vec<u8>),
+    Put(Vec<u8>, Vec<u8>),
+    Delete(Vec<u8>),
+}
+
+#[cfg(target_os = "linux")]
+impl Stream {
+    fn new(seed: u64) -> Stream {
+        Stream {
+            rng: seed | 1,
+            next: 0,
+        }
+    }
+
+    fn draw(&mut self, n: u64) -> u64 {
+        self.rng = self
+            .rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.rng >> 33) % n
+    }
+
+    fn value(&mut self, commit: u64, j: u64) -> Vec<u8> {
+        let mut v = format!("c{commit}-{j}-").into_bytes();
+        let pad = 40 + self.draw(80) as usize;
+        v.resize(v.len() + pad, b'.');
+        v
+    }
+
+    fn ordered(&mut self, commit: u64, ops: &mut Vec<Op>) {
+        let n = 1 + self.draw(300);
+        for j in 0..n {
+            let v = self.value(commit, j);
+            ops.push(Op::Append(key(self.next + j), v));
+        }
+        self.next += n;
+    }
+
+    fn logged(&mut self, commit: u64, ops: &mut Vec<Op>) {
+        if self.next == 0 {
+            return self.ordered(commit, ops);
+        }
+        for j in 0..1 + self.draw(8) {
+            let k = key(self.draw(self.next));
+            let v = self.value(commit, 1000 + j);
+            ops.push(match self.draw(5) {
+                0 => Op::Delete(k),
+                1 => Op::Append(k, v),
+                _ => Op::Put(k, v),
+            });
+        }
+    }
+
+    /// Commit `commit`'s writes, and whether a seal follows it.
+    fn commit(&mut self, commit: u64) -> (Vec<Op>, bool) {
+        let mut ops = Vec::new();
+        match self.draw(10) {
+            0..=4 => self.ordered(commit, &mut ops),
+            5..=7 => self.logged(commit, &mut ops),
+            8 => {
+                // A run's batch that ends in the log: the run's committed
+                // records close as a segment and the batch's own go to the
+                // log behind them.
+                self.ordered(commit, &mut ops);
+                self.logged(commit, &mut ops);
+            }
+            _ => {
+                self.logged(commit, &mut ops);
+                return (ops, true);
+            }
+        }
+        (ops, false)
+    }
+}
+
+#[cfg(target_os = "linux")]
+type Model = std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>;
+
+#[cfg(target_os = "linux")]
+fn apply(m: &mut Model, ops: &[Op]) {
+    for op in ops {
+        match op {
+            Op::Append(k, v) => m.entry(k.clone()).or_default().push(v.clone()),
+            Op::Put(k, v) => {
+                m.insert(k.clone(), vec![v.clone()]);
+            }
+            Op::Delete(k) => {
+                m.remove(k);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+const ORACLE_ENV: &str = "SUPDB_RUNLOG_CHILD";
+#[cfg(target_os = "linux")]
+const ORACLE_TEST: &str = "a_torn_store_is_a_prefix_of_what_was_committed";
+
+#[cfg(target_os = "linux")]
+fn oracle_options(sync: SyncPolicy) -> Options {
+    Options {
+        sync,
+        // Small seals: a run closes, a table seals and a merge starts
+        // every few commits.
+        seal_bytes: 96 << 10,
+        ..Options::default()
+    }
+}
+
+/// The oracle's writer: the stream committed without end, each commit
+/// acknowledged on stdout. Killed from outside; never returns.
+#[cfg(target_os = "linux")]
+fn oracle_child(spec: &str) -> ! {
+    use std::io::Write;
+    let (seed, rest) = spec.split_once(':').unwrap();
+    let (sync, d) = rest.split_once(':').unwrap();
+    let sync = match sync {
+        "always" => SyncPolicy::Always,
+        _ => SyncPolicy::EveryN(u32::MAX),
+    };
+    let mut db = Db::create(Path::new(d), oracle_options(sync)).unwrap();
+    let mut s = Stream::new(seed.parse().unwrap());
+    let out = std::io::stdout();
+    for i in 0.. {
+        let (ops, seal) = s.commit(i);
+        for op in &ops {
+            match op {
+                Op::Append(k, v) => db.append(k, v),
+                Op::Put(k, v) => db.put(k, v),
+                Op::Delete(k) => db.delete(k),
+            }
+        }
+        db.commit().unwrap();
+        if matches!(sync, SyncPolicy::Always) {
+            // What a commit under this policy acknowledges is everything
+            // so far, on whatever path the stream took to it: no run's
+            // file with a commit unsynced, and no run's temp name that a
+            // crash could take.
+            let (run, loose) = db.runs_unsynced();
+            let (name, names) = db.run_names_unsynced();
+            if run == Some(true) || loose != 0 || name == Some(true) || names != 0 {
+                let mut o = out.lock();
+                writeln!(
+                    o,
+                    "commit {i} left unsynced: run {run:?}, loose runs {loose}, \
+                     the run's name {name:?}, loose runs' names {names}"
+                )
+                .unwrap();
+                o.flush().unwrap();
+                std::process::exit(1);
+            }
+        }
+        let mut o = out.lock();
+        writeln!(o, "{i}").unwrap();
+        o.flush().unwrap();
+        drop(o);
+        if seal {
+            db.seal().unwrap();
+        }
+    }
+    unreachable!()
+}
+
+/// What a machine's crash may do to the files of a store whose writer
+/// synced nothing at its commits: every log -- the WAL's files, and each
+/// run not yet a named segment -- cut back to some length, since nothing
+/// promised the device any of it, and a run's file gone altogether, since
+/// nothing promised its name either. A run's temp name that shares its
+/// file with a finished segment is left alone: that file was synced whole
+/// before anything named it. What the choices were comes back for a
+/// failure's message.
+#[cfg(target_os = "linux")]
+fn tear(d: &Path, rng: &mut Stream) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt;
+    let mut did = Vec::new();
+    for name in names(d, "wal-").into_iter().chain(names(d, "direct-")) {
+        let p = d.join(&name);
+        let md = std::fs::metadata(&p).unwrap();
+        let run = name.starts_with("direct-");
+        if run && md.nlink() > 1 {
+            continue;
+        }
+        match rng.draw(if run { 5 } else { 4 }) {
+            0 | 1 => {}
+            4 => {
+                std::fs::remove_file(&p).unwrap();
+                did.push(format!("{name} gone"));
+            }
+            _ => {
+                let to = rng.draw(md.len() + 1);
+                let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+                f.set_len(to).unwrap();
+                did.push(format!("{name} cut from {} to {to}", md.len()));
+            }
+        }
+    }
+    did
+}
+
+/// The property the tests above hold one state at a time, held over
+/// whatever states a killed writer leaves: the store that reopens is the
+/// stream's first `p` commits for some `p`, every key with its values in
+/// their order and no key beyond them. With nothing torn, `p` is every
+/// commit acknowledged, under either policy -- a process's death takes
+/// nothing. With the logs torn as a machine's crash may tear them under a
+/// policy that syncs no commit, `p` is anything, and it is still a prefix.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_torn_store_is_a_prefix_of_what_was_committed() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    if let Ok(spec) = std::env::var(ORACLE_ENV) {
+        oracle_child(&spec);
+    }
+    let exe = std::env::current_exe().unwrap();
+    let mut pick = Stream::new(0x0BAD_5EED);
+    for round in 0..24u64 {
+        let seed = 1000 + round;
+        // One round in four under a policy that syncs every commit, and
+        // one in four of the others with nothing torn: those lose nothing.
+        let always = round % 4 == 3;
+        let torn = !always && round % 4 != 0;
+        let d = dir(&format!("oracle-{round}"));
+        let sync = if always { "always" } else { "never" };
+        let mut c = Command::new(&exe)
+            .args(["--exact", ORACLE_TEST, "--nocapture", "--test-threads=1"])
+            .env(ORACLE_ENV, format!("{seed}:{sync}:{}", d.display()))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut lines = BufReader::new(c.stdout.take().unwrap()).lines();
+        let want = 20 + pick.draw(if always { 60 } else { 400 });
+        let mut last: Option<u64> = None;
+        let mut acked = 0;
+        let mut said = String::new();
+        while acked < want {
+            match lines.next() {
+                Some(Ok(l)) => {
+                    if let Ok(n) = l.trim().parse::<u64>() {
+                        last = Some(n);
+                        acked += 1;
+                    } else if l.starts_with("commit ") {
+                        said = l;
+                    }
+                }
+                _ => panic!("round {round}: the writer ended before {want} commits: {said}"),
+            }
+        }
+        c.kill().unwrap();
+        let _ = c.wait();
+        for l in lines.map_while(Result::ok) {
+            if let Ok(n) = l.trim().parse::<u64>() {
+                last = Some(n);
+            }
+        }
+        let last = last.expect("no commit acknowledged");
+        let did = if torn {
+            tear(&d, &mut pick)
+        } else {
+            Vec::new()
+        };
+        let what = format!(
+            "round {round}, seed {seed}, {sync}, last acknowledged {last}, torn: {did:?}, store {}",
+            d.display()
+        );
+
+        let db = match Db::open(&d, oracle_options(SyncPolicy::EveryN(u32::MAX))) {
+            Ok(db) => db,
+            Err(e) => panic!("{what}: the store does not open: {e}"),
+        };
+        let mut got = Model::new();
+        db.scan(
+            b"",
+            usize::MAX,
+            common::kv(&mut |k, v| got.entry(k.to_vec()).or_default().push(v.to_vec())),
+        )
+        .unwrap();
+        // The prefix it is: the stream made again, a commit at a time. The
+        // writer may have been inside the commit after the last it
+        // acknowledged, and that one may be there whole.
+        let mut s = Stream::new(seed);
+        let mut model = Model::new();
+        let mut prefix = None;
+        for p in 0..=last + 2 {
+            if model == got {
+                prefix = Some(p);
+            }
+            let (ops, _) = s.commit(p);
+            apply(&mut model, &ops);
+        }
+        let Some(p) = prefix else {
+            panic!(
+                "{what}: the store, {} keys, is no prefix of the commits",
+                got.len()
+            );
+        };
+        if !torn {
+            assert!(
+                p > last,
+                "{what}: nothing was torn and the store is the first {p} commits"
+            );
+        }
+        // The point reads agree with the scan on a sample of it.
+        for (k, v) in got.iter().step_by(1 + got.len() / 64) {
+            assert_eq!(
+                &values(&db, k),
+                v,
+                "{what}: a point read of a key the scan holds"
+            );
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

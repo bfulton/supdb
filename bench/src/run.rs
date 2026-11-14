@@ -145,10 +145,16 @@ pub struct Passes {
     /// The second mix family, `ycsbs-A..F`, after `scan-mixed`.
     pub mixes_scrambled: bool,
     pub lag: bool,
+    /// The recovery workloads, `recover` and `recover-shuffled`, each on
+    /// a store of its own that a process loaded and was killed over
+    /// (`recover_store`). Absent from a plan written before the
+    /// workloads, where it reads as off.
+    #[serde(default)]
+    pub recover: bool,
 }
 
 impl Passes {
-    pub const NAMES: [&'static str; 9] = [
+    pub const NAMES: [&'static str; 10] = [
         "load",
         "read",
         "read-threaded",
@@ -158,6 +164,7 @@ impl Passes {
         "scan-mixed",
         "mixes-scrambled",
         "lag",
+        "recover",
     ];
 
     pub fn all() -> Passes {
@@ -171,6 +178,17 @@ impl Passes {
             scan_mixed: true,
             mixes_scrambled: true,
             lag: true,
+            recover: true,
+        }
+    }
+
+    /// What a pairing runs where it names no passes (`bench ab`): every
+    /// pass but the recovery workloads, which load two stores more an arm
+    /// a rep and are run by the pairing that asks for them.
+    pub fn paired() -> Passes {
+        Passes {
+            recover: false,
+            ..Passes::all()
         }
     }
 
@@ -187,6 +205,7 @@ impl Passes {
             scan_mixed: false,
             mixes_scrambled: false,
             lag: false,
+            recover: false,
         };
         let mut any = false;
         for name in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -201,6 +220,7 @@ impl Passes {
                 "scan-mixed" => p.scan_mixed = true,
                 "mixes-scrambled" => p.mixes_scrambled = true,
                 "lag" => p.lag = true,
+                "recover" => p.recover = true,
                 other => {
                     return Err(format!(
                         "no pass named {other:?}; the passes are {}",
@@ -306,7 +326,14 @@ impl Plan {
             },
             compress: 0.5,
             bound: None,
-            passes: Passes::all(),
+            // The recovery workloads are the in-core scales' until a
+            // bounded row is taken with them on purpose: each loads two
+            // stores more a rep, and a bounded roster's hours are counted.
+            passes: if scale == Scale::Ooc {
+                Passes::paired()
+            } else {
+                Passes::all()
+            },
             fresh_process: scale == Scale::Ooc,
         }
     }
@@ -1155,6 +1182,16 @@ fn pass_measurements(size: u64, arm: &str, g: Guarantee, one: &OnePass) -> Vec<M
         let q = threaded_quantity("entries_per_s", *threads);
         s.push("scan-mixed", sz, arm, g, (q.as_str(), "entries/s"), *v);
     }
+    for (workload, r) in one.recoveries() {
+        s.push(workload, sz, arm, g, ("open_ms", "ms"), r.open_ms);
+        if let Some(us) = r.first_read_us {
+            s.push(workload, sz, arm, g, ("first_read_us", "µs"), us);
+        }
+        if let Some(n) = r.unrecovered_batches {
+            let q = ("unrecovered_batches", "batches");
+            s.push(workload, sz, arm, g, q, n as f64);
+        }
+    }
     // The counts around each phase, a bounded row's only.
     for (workload, suffix, c) in &one.phase_counts {
         for (base, v) in c.each() {
@@ -1722,9 +1759,43 @@ pub struct OnePass {
     bound_start_bytes: Option<u64>,
     #[serde(default)]
     start_process_bytes: Option<u64>,
+    /// The recovery workloads' readings: the open and the first read of
+    /// the store a killed process left after the ordered load's batches,
+    /// and after the shuffled load's (`recover_store`). None where the
+    /// pass left them out. Boxed, so that a pass's result stays the size
+    /// it is passed around at.
+    #[serde(default)]
+    recovered: Option<Box<[Recovered; 2]>>,
+}
+
+/// What one recovery read (`recover_store`): the open of a store its
+/// writer was killed over, and the first point read through it.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct Recovered {
+    /// Milliseconds from the open's call to its return: whatever the
+    /// engine does to make the store it finds the store that was
+    /// acknowledged.
+    open_ms: f64,
+    /// Microseconds of the first point read through the opened store, of
+    /// the last key the dead process committed; none where the store did
+    /// not hold that key, a buffered arm's whose last batches went with
+    /// the process, since a miss is not the read the hits are.
+    first_read_us: Option<f64>,
+    /// A buffered arm's alone: the batches the dead process had been
+    /// acknowledged that the opened store does not hold, the newest of
+    /// them. A durable arm that lost one fails the pass instead.
+    unrecovered_batches: Option<u64>,
 }
 
 impl OnePass {
+    /// The recovery workloads' readings by workload, or none where the
+    /// pass left them out.
+    fn recoveries(&self) -> impl Iterator<Item = (&'static str, &Recovered)> {
+        [RECOVER, RECOVER_SHUFFLED]
+            .into_iter()
+            .zip(self.recovered.iter().flat_map(|r| r.iter()))
+    }
+
     /// Every quantity of the pass under one name, for `ab` to pair. A
     /// phase the plan's passes left out is a NaN here and is skipped, so
     /// a pairing over a subset pairs the subset.
@@ -1766,6 +1837,15 @@ impl OnePass {
         }
         for (c, x) in &self.ycsbs_ops_s {
             v.push((format!("ycsbs-{c} ops_per_s"), *x));
+        }
+        for (workload, r) in self.recoveries() {
+            v.push((format!("{workload} open_ms"), r.open_ms));
+            if let Some(us) = r.first_read_us {
+                v.push((format!("{workload} first_read_us"), us));
+            }
+            if let Some(n) = r.unrecovered_batches {
+                v.push((format!("{workload} unrecovered_batches"), n as f64));
+            }
         }
         for (n, x) in &self.counters {
             v.push((format!("count {n}"), *x));
@@ -2840,7 +2920,20 @@ fn one_pass(
         release_freed_memory();
     }
 
+    // The recovery workloads, each on a store of its own: the ordered
+    // load's batches and then the shuffled load's, committed by a process
+    // that is killed where the last was acknowledged, and the store it
+    // left opened here (`recover_store`).
+    let mut recovered = None;
+    if passes.recover {
+        recovered = Some(Box::new([
+            recover_store(arm, dir, size, map_gb, plan, false)?,
+            recover_store(arm, dir, size, map_gb, plan, true)?,
+        ]));
+    }
+
     Ok(OnePass {
+        recovered,
         bound_start_bytes: None,
         start_process_bytes: None,
         prime_us_per_page: prime_a.max(prime_b),
@@ -2883,6 +2976,277 @@ fn one_pass(
             .map(|(n, v)| (n.to_string(), v))
             .collect(),
         phase_counts: counting.out,
+    })
+}
+
+/// The recovery workloads' names: the store a process loaded in key order
+/// and was killed over, and the one it loaded shuffled.
+pub const RECOVER: &str = "recover";
+pub const RECOVER_SHUFFLED: &str = "recover-shuffled";
+
+/// What the crash load's process prints once its last batch is
+/// acknowledged and its tail staged: the line its parent kills it on.
+const CRASH_READY: &str = "crash-load: staged";
+
+/// The crash load's spec, as its parent writes it and as its own process
+/// reads it (`crash_load`, `crash_load_child`).
+#[derive(Serialize)]
+struct CrashSpecRef<'a> {
+    arm: &'a str,
+    dir: &'a Path,
+    size: u64,
+    map_gb: usize,
+    batch: usize,
+    value_size: usize,
+    compress: f64,
+    shuffled: bool,
+}
+
+#[derive(Deserialize)]
+struct CrashSpec {
+    arm: String,
+    dir: PathBuf,
+    size: u64,
+    map_gb: usize,
+    batch: usize,
+    value_size: usize,
+    compress: f64,
+    shuffled: bool,
+}
+
+/// The key the load's `i`-th record carries: `i` in key order, and its
+/// place in the shuffled load's permutation.
+fn load_key(perm: Option<&Permutation>, i: u64) -> u64 {
+    perm.map_or(i, |p| p.at(i))
+}
+
+/// The crash load's own process, `bench crash-load SPEC`: a fresh store
+/// of the arm's, the load's batches committed one by one under the arm's
+/// guarantee -- the same keys, values and batches as `load`, in key order
+/// or shuffled, and no sync behind the last -- then one batch more of keys
+/// above them staged and not committed (`Engine::stage_batch`), and the
+/// line that says so. It never returns: its parent kills it there, with
+/// the store open, every batch acknowledged and the tail in its memory,
+/// which is the crash the recovery workloads recover from.
+pub fn crash_load_child(spec_path: &Path) -> Result<(), String> {
+    let text = std::fs::read_to_string(spec_path)
+        .map_err(|e| format!("the crash load's spec {}: {e}", spec_path.display()))?;
+    let spec: CrashSpec =
+        serde_json::from_str(&text).map_err(|e| format!("the crash load's spec: {e}"))?;
+    let payload = Payload::new(spec.value_size, spec.compress, 0xE1);
+    std::fs::create_dir_all(&spec.dir).map_err(|e| e.to_string())?;
+    let mut e = engines::open(&spec.arm, &spec.dir, spec.map_gb)?;
+    let perm = spec.shuffled.then(|| Permutation::new(spec.size, 0x5EED));
+    let mut vrng = Rng::new(0xE1);
+    let mut buf = Batch::with_capacity(spec.batch, payload.value_size());
+    let mut kb = [0u8; KEY_SIZE];
+    for i in 0..spec.size {
+        db_key_into(load_key(perm.as_ref(), i), &mut kb);
+        buf.push(&kb, payload.get(&mut vrng));
+        if buf.len() == spec.batch {
+            buf.flush(e.as_mut())?;
+        }
+    }
+    buf.flush(e.as_mut())?;
+    for i in spec.size..spec.size + spec.batch as u64 {
+        db_key_into(i, &mut kb);
+        buf.push(&kb, payload.get(&mut vrng));
+    }
+    buf.stage(e.as_mut())?;
+    let mut out = std::io::stdout();
+    writeln!(out, "{CRASH_READY}").map_err(|e| e.to_string())?;
+    out.flush().map_err(|e| e.to_string())?;
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
+/// A store at `dir` as a crash leaves it: this binary again, `bench
+/// crash-load SPEC`, killed with SIGKILL the moment it says its last
+/// batch is acknowledged and its tail staged. A process's death and not
+/// a machine's: what the process had handed the kernel is there, synced
+/// or not, and the page cache is as it left it.
+fn crash_load(
+    arm: &str,
+    dir: &Path,
+    size: u64,
+    map_gb: usize,
+    plan: &Plan,
+    shuffled: bool,
+) -> Result<(), String> {
+    use std::io::BufRead as _;
+    let spec_path = PathBuf::from(format!("{}.crash.json", dir.display()));
+    let spec = CrashSpecRef {
+        arm,
+        dir,
+        size,
+        map_gb,
+        batch: plan.batch,
+        value_size: plan.value_size,
+        compress: plan.compress,
+        shuffled,
+    };
+    let text = serde_json::to_vec(&spec).map_err(|e| format!("the crash load's spec: {e}"))?;
+    std::fs::write(&spec_path, text).map_err(|e| format!("writing the crash load's spec: {e}"))?;
+    let exe = std::env::current_exe().map_err(|e| format!("this binary's own path: {e}"))?;
+    let mut child = std::process::Command::new(&exe)
+        .arg("crash-load")
+        .arg(&spec_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawning the crash load's process: {e}"))?;
+    let mut lines = std::io::BufReader::new(child.stdout.take().expect("a piped stdout"));
+    let mut line = String::new();
+    let ready = loop {
+        line.clear();
+        match lines.read_line(&mut line) {
+            Ok(0) | Err(_) => break false,
+            Ok(_) if line.trim_end() == CRASH_READY => break true,
+            Ok(_) => {}
+        }
+    };
+    // `Child::kill` is SIGKILL: nothing of the process runs after it, no
+    // drop and no close.
+    let _ = child.kill();
+    let status = child
+        .wait()
+        .map_err(|e| format!("the crash load's process: {e}"))?;
+    let _ = std::fs::remove_file(&spec_path);
+    if !ready {
+        return Err(format!(
+            "the crash load of {arm} at {size} keys ended before its batches were acknowledged ({status})"
+        ));
+    }
+    Ok(())
+}
+
+/// A reopened store held to what its dead writer was acknowledged
+/// (`recover_store`): the batches it does not hold, the newest of them,
+/// or the refusal of a store nobody was promised. A batch is read by its
+/// first and last key. The refusals: a batch in part; a batch held behind
+/// one that is not, since what a crash takes is a tail; any batch missing
+/// from a durable arm's store; a key of the staged tail; and a timed read
+/// of the last committed key, `got` bytes, that does not agree with what
+/// this read of the last batch.
+fn unrecovered(
+    e: &mut dyn Engine,
+    who: &str,
+    size: u64,
+    plan: &Plan,
+    perm: Option<&Permutation>,
+    durable: bool,
+    got: usize,
+) -> Result<u64, String> {
+    let mut kb = [0u8; KEY_SIZE];
+    let batch = plan.batch as u64;
+    let batches = size.div_ceil(batch);
+    let whole = [plan.value_size; 2];
+    // The first batch the store does not hold; `batches` while it holds
+    // every one so far.
+    let mut held = batches;
+    for b in 0..batches {
+        let (first, last) = (b * batch, ((b + 1) * batch).min(size) - 1);
+        let mut read = [0usize; 2];
+        for (slot, i) in read.iter_mut().zip([first, last]) {
+            db_key_into(load_key(perm, i), &mut kb);
+            *slot = e.get(&kb)?;
+        }
+        if read == whole {
+            if held != batches {
+                return Err(format!(
+                    "{who} holds batch {b} and not batch {held} before it"
+                ));
+            }
+        } else if read == [0; 2] {
+            held = held.min(b);
+        } else {
+            return Err(format!(
+                "{who} holds batch {b} in part: its first and last keys read back {} and {} \
+                 bytes of {}",
+                read[0], read[1], plan.value_size
+            ));
+        }
+    }
+    let lost = batches - held;
+    if durable && lost > 0 {
+        return Err(format!(
+            "{who} lost {lost} of the {batches} batches a durable arm acknowledged before the \
+             kill, from batch {held}"
+        ));
+    }
+    let hit = got == plan.value_size;
+    if hit != (lost == 0) || (!hit && got != 0) {
+        return Err(format!(
+            "{who} read {got} bytes for the last key committed before the kill, with {lost} of \
+             {batches} batches not held"
+        ));
+    }
+    for i in size..size + batch {
+        db_key_into(i, &mut kb);
+        let n = e.get(&kb)?;
+        if n != 0 {
+            return Err(format!(
+                "{who} read {n} bytes for key {i} of the tail that was staged and never committed"
+            ));
+        }
+    }
+    Ok(lost)
+}
+
+/// One recovery workload: the store a killed process left (`crash_load`),
+/// opened under the arm's own options with the clock around the open, and
+/// then around one point read of the last key the process committed. The
+/// open draws its tables from a primed pool, as every store a pass opens
+/// does.
+///
+/// Then, outside the clock, the store is held to what was acknowledged, a
+/// batch at a time by its first and last key. Under either guarantee the
+/// batches it holds are a prefix of the ones acknowledged, each whole, and
+/// no key of the staged tail is there: a batch in part, a batch behind a
+/// missing one, or a tail that came back is a store nobody was promised,
+/// and fails the pass. A durable arm holds every batch, or fails it. A
+/// buffered arm promised the device nothing, and what a process's death
+/// costs it is the engine's to say: LMDB and RocksDB hand every commit to
+/// the kernel, where it outlives the process, and supdb's ordered ingest
+/// keeps a commit in the writer's buffer until a write piece is whole. So
+/// the batches a buffered arm's store does not hold are counted and
+/// recorded (`unrecovered_batches`), and its first read is recorded only
+/// where it found the key.
+fn recover_store(
+    arm: &str,
+    dir: &Path,
+    size: u64,
+    map_gb: usize,
+    plan: &Plan,
+    shuffled: bool,
+) -> Result<Recovered, String> {
+    let workload = if shuffled { RECOVER_SHUFFLED } else { RECOVER };
+    let durable = engines::guarantee(arm) == Some(Guarantee::Durable);
+    let _ = std::fs::remove_dir_all(dir);
+    crash_load(arm, dir, size, map_gb, plan, shuffled)?;
+    let perm = shuffled.then(|| Permutation::new(size, 0x5EED));
+    let mut kb = [0u8; KEY_SIZE];
+    db_key_into(load_key(perm.as_ref(), size.saturating_sub(1)), &mut kb);
+    prime_fresh_pool(prime_bytes_for(size, plan.bound_bytes()))?;
+    phase_mark(arm, workload, "start");
+    let t = Instant::now();
+    let mut e = engines::reopen(arm, dir, map_gb)?;
+    let open_s = t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    let got = e.get(&kb)?;
+    let first_s = t.elapsed().as_secs_f64();
+    phase_mark(arm, workload, "end");
+    let who = format!("{arm} at {size}: {workload}");
+    let lost = unrecovered(e.as_mut(), &who, size, plan, perm.as_ref(), durable, got)?;
+    let hit = got == plan.value_size;
+    drop(e);
+    release_freed_memory();
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(Recovered {
+        open_ms: open_s * 1e3,
+        first_read_us: hit.then_some(first_s * 1e6),
+        unrecovered_batches: (!durable).then_some(lost),
     })
 }
 
@@ -5258,6 +5622,124 @@ mod tests {
         assert!(out.contains("out of service"), "{out}");
     }
 
+    /// An engine that holds the keys it is told to and nothing else: the
+    /// recovery check asked of something that can lie, since a real
+    /// engine's reopened store is never one the refusals are for.
+    struct Holding {
+        /// Keys below this are held, but for `gone`; none at or above it,
+        /// but for `stray`.
+        below: u64,
+        gone: Vec<u64>,
+        stray: Vec<u64>,
+        value: usize,
+    }
+
+    impl Engine for Holding {
+        fn name(&self) -> &'static str {
+            "holding"
+        }
+        fn features(&self) -> engines::Features {
+            engines::Features {
+                durable_commit: true,
+                transactions: false,
+                checksums: false,
+                reopen_for_write: false,
+                read_your_writes: true,
+                ordered_scan: true,
+            }
+        }
+        fn write_batch(&mut self, _: &[(&[u8], &[u8])]) -> engines::Res<()> {
+            Ok(())
+        }
+        fn get(&mut self, key: &[u8]) -> engines::Res<usize> {
+            let k = key_number(key);
+            let held = (k < self.below && !self.gone.contains(&k)) || self.stray.contains(&k);
+            Ok(if held { self.value } else { 0 })
+        }
+        fn range(&mut self, _: &[u8], _: usize) -> engines::Res<usize> {
+            Ok(0)
+        }
+        fn sync(&mut self) -> engines::Res<()> {
+            Ok(())
+        }
+        fn size_bytes(&self) -> u64 {
+            0
+        }
+        fn thread_reader(&self) -> engines::Res<engines::ReaderOpener> {
+            Err("no reader".into())
+        }
+    }
+
+    /// The recovery check counts the tail of batches a store does not hold
+    /// and refuses every store nobody was promised: a durable store short
+    /// of a batch, a batch in part, a batch behind a missing one, a key of
+    /// the staged tail, and a timed read that disagrees with the walk.
+    #[test]
+    fn a_reopened_store_is_held_to_what_was_acknowledged() {
+        let plan = Plan::new(Scale::Quick, vec![], 10_000, 4);
+        let (size, batch, value) = (10_000u64, plan.batch as u64, plan.value_size);
+        assert_eq!(
+            batch, 1_000,
+            "the fixtures below are in batches of a thousand"
+        );
+        let store = |below: u64, gone: &[u64], stray: &[u64]| Holding {
+            below,
+            gone: gone.to_vec(),
+            stray: stray.to_vec(),
+            value,
+        };
+        let ask = |mut e: Holding, durable: bool, got: usize| {
+            unrecovered(&mut e, "holding", size, &plan, None, durable, got)
+        };
+        // Every batch held: nothing lost under either guarantee.
+        assert_eq!(ask(store(size, &[], &[]), true, value), Ok(0));
+        assert_eq!(ask(store(size, &[], &[]), false, value), Ok(0));
+        // The last two batches gone: a buffered store's count, a durable
+        // store's refusal.
+        assert_eq!(ask(store(8_000, &[], &[]), false, 0), Ok(2));
+        let why = ask(store(8_000, &[], &[]), true, 0).unwrap_err();
+        assert!(
+            why.contains("lost 2 of the 10 batches") && why.contains("from batch 8"),
+            "{why}"
+        );
+        // Every batch gone is still a prefix, of none.
+        assert_eq!(ask(store(0, &[], &[]), false, 0), Ok(10));
+        // A batch in part, by either end.
+        for gone in [3_000, 3_999] {
+            let why = ask(store(size, &[gone], &[]), false, value).unwrap_err();
+            assert!(why.contains("holds batch 3 in part"), "{why}");
+        }
+        // A batch held behind one that is not.
+        let why = ask(store(5_000, &[], &[7_000, 7_999]), false, 0).unwrap_err();
+        assert!(why.contains("holds batch 7 and not batch 5"), "{why}");
+        // A key of the staged tail, anywhere in it.
+        for stray in [size, size + batch - 1] {
+            let why = ask(store(size, &[], &[stray]), true, value).unwrap_err();
+            assert!(why.contains(&format!("key {stray} of the tail")), "{why}");
+        }
+        // The first key past the tail is nobody's, and is not asked for.
+        assert_eq!(ask(store(size, &[], &[size + batch]), true, value), Ok(0));
+        // The timed read agrees with the walk: a hit over a store short of
+        // its last batch, a miss over a whole one, and a value of another
+        // length are each refused.
+        for (below, got) in [(8_000, value), (size, 0), (size, value - 1), (8_000, 7)] {
+            let why = ask(store(below, &[], &[]), false, got).unwrap_err();
+            assert!(
+                why.contains("for the last key committed"),
+                "{below} {got}: {why}"
+            );
+        }
+        // A last batch shorter than the others is read by its own ends.
+        let short = |below: u64, durable: bool, got: usize| {
+            let mut e = store(below, &[], &[]);
+            unrecovered(&mut e, "holding", 9_500, &plan, None, durable, got)
+        };
+        assert_eq!(short(9_500, true, value), Ok(0));
+        assert_eq!(short(9_000, false, 0), Ok(1));
+        let why = short(9_400, false, 0).unwrap_err();
+        assert!(why.contains("holds batch 9 in part"), "{why}");
+    }
+
     /// An engine that records what a mix asks of it, in order: the keys
     /// read, the keys scans start from, and each batch's keys as it is
     /// written, so a test can hold every read to the keys committed before
@@ -5636,6 +6118,29 @@ mod tests {
         assert!(err.contains("scna"), "{err}");
         assert!(Passes::parse("").is_err());
         assert!(Passes::parse(" , ").is_err());
+    }
+
+    /// The recovery workloads are a row's in core, and a pairing's or a
+    /// bounded row's only where they are named; and a plan a binary from
+    /// before them wrote names none.
+    #[test]
+    fn the_recovery_workloads_run_in_core_rows_and_elsewhere_by_name() {
+        assert!(Plan::new(Scale::Quick, vec![], 10_000, 4).passes.recover);
+        assert!(Plan::new(Scale::Full, vec![], 10_000, 4).passes.recover);
+        assert!(!Plan::new(Scale::Ooc, vec![], 3_000_000, 4).passes.recover);
+        assert!(!Passes::paired().recover);
+        assert_eq!(
+            Passes {
+                recover: true,
+                ..Passes::paired()
+            },
+            Passes::all()
+        );
+        assert!(Passes::parse("recover").unwrap().recover);
+        let mut old = serde_json::to_value(Passes::all()).unwrap();
+        old.as_object_mut().unwrap().remove("recover").unwrap();
+        let old: Passes = serde_json::from_value(old).unwrap();
+        assert_eq!(old, Passes::paired());
     }
 
     /// The count names: each of the five under no suffix, a thread

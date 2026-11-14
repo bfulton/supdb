@@ -22,6 +22,8 @@ The workloads below, plus four floors. Each yields one or more quantities.
 | `scan-mixed` | the threaded `scan` passes again on the store the six mixes leave | entries/s per thread count |
 | `ycsbs` | core A–F again, on the store `scan-mixed` leaves, with YCSB's own key distributions: its scrambled Zipfian for A, B, C, E and F, and the latest distribution for D | ops/s per mix |
 | `scan-lag` | on the store the shuffled load leaves, the keys updated in slices to 0, 1, 10 and 100% of the store, each slice a burst of batches followed by the `scan` workload's scans with nothing merged between | entries/s of each point's scans; updates/s of each point's burst |
+| `recover` | a fresh store given the `load` workload's batches by a process of its own, each committed under the arm's guarantee with no sync behind the last, and one batch more staged and never committed; the process killed there, and the store it left opened in the run's process | open ms, first read µs; for a buffered arm, acknowledged batches not recovered |
+| `recover-shuffled` | the same after the `load-shuffled` workload's batches | the same |
 | `wal-floor` | framed 1,000-record batches appended to one file, one `fdatasync` each, no engine | ops/s |
 | `scan-floor` | one `mmap` sequential walk of a file the top rung's size (capped at 4 GiB), no engine | bytes/s |
 | `mem-floor` | one dependent load at a time around a permutation of a 64 MiB buffer's cache lines, no engine | chases/s |
@@ -153,6 +155,48 @@ another leaves them for its scans or its background; timed alone, the
 scans would credit the first for work they never see it do. The two
 quantities are each a rate, and a change that moves work between them
 is read by both.
+
+The recovery workloads time what an engine does to open a store its
+writer died over. The writer is a process of its own (`bench crash-load`),
+killed with SIGKILL where its last batch was acknowledged and a batch more
+sits staged in its memory, so nothing of it runs after the kill: no close,
+no flush, no join of what it had in flight. That is a process's death and
+not a machine's -- what the process had handed the kernel is there whether
+or not it was synced, and the page cache is as the process left it -- so
+the quantity is the engine's work at the open and not the device's. The
+open is the arm's own, under the options the arm was loaded with, and it
+draws from a primed pool as every store a pass opens does; the first read
+is of the last key the dead process committed. There are two because an
+engine recovers what its write path left, and the two loads leave supdb
+different things: the ordered load a segment open for append, whose
+records the open walks to the last commit marker and whose index it then
+writes behind them, and the shuffled load a log to replay with seals and
+merges cut off in flight.
+LMDB's file is consistent at every commit and its open recovers nothing;
+RocksDB replays its log into a memtable.
+
+Outside the clock the opened store is held to what was acknowledged, a
+batch at a time by its first and last key. Under either guarantee the
+batches it holds are a prefix of the ones acknowledged, each whole, and no
+key of the staged batch is there; a store that fails that fails the run,
+since an open that answered fast for a store nobody was promised measured
+nothing. A durable arm holds every batch, or fails the run the same way.
+A buffered arm promised the device nothing, and what a process's death
+costs it is a quantity and not an assumption: `unrecovered_batches`, the
+acknowledged batches the opened store does not hold, recorded for the
+buffered arms alone. Every engine of the group hands every commit to the
+kernel, where it outlives the process -- LMDB without its sync, RocksDB
+without its sync, and supdb through its log or, for ordered ingest, the
+run's own file -- so the quantity reads zero in every row, and the row
+that reads anything else is the finding: supdb's ordered ingest wrote a
+run's records a write piece at a time once, and the rows from before it
+wrote every commit read two to eight batches there. The first read is
+recorded only where it found its key, since a miss is not the read the
+hits are.
+
+The workloads are the in-core scales'. A pairing or a bounded row runs
+them only when asked (`--passes recover`), each being two loads more an
+arm a rep.
 
 The mixes run twice, as two families of six. The first, `ycsb-A..F`, is the
 one every row so far carries: its Zipfian is over the key space itself, so
