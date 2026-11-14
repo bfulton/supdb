@@ -1698,6 +1698,100 @@ fn a_lone_piece_holding_a_tombstone_still_merges() {
     db.close().unwrap();
 }
 
+/// A point read over a store with tombstones in every kind of source --
+/// level-0 pieces carrying puts, a frozen table held short of its landing
+/// with deletes and appends, and the live table over both -- answers the
+/// model with the tombstone pass's probes kept for the reads after it
+/// (`Options::read_probes_once`) and with every source probed again, the
+/// shape before: through the writer, whose reads honour no watermark, and
+/// through a handle, whose live table is bounded by its mark; `read_all`
+/// and `count` both, every key the model has touched and one no source
+/// holds.
+#[test]
+fn a_point_read_over_tombstones_in_every_source_answers_from_one_probe_of_each() {
+    for once in [true, false] {
+        let name = if once { "probes-once" } else { "probes-twice" };
+        let d = dir(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                read_probes_once: once,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let mut m = ScanModel::default();
+        for k in 0u32..3000 {
+            m.append(&mut db, &format!("key-{k:05}"), &format!("v0-{k}"));
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        // Two pieces of puts, each a delete and an append.
+        for round in 1..=2u32 {
+            for k in (round..3000u32).step_by(7) {
+                let key = format!("key-{k:05}");
+                m.delete(&mut db, &key);
+                m.append(&mut db, &key, &format!("v{round}-{k}"));
+            }
+            db.commit().unwrap();
+            db.seal().unwrap();
+            db.settle().unwrap();
+        }
+        let pieces = seg_names(&d)
+            .iter()
+            .filter(|n| !n.starts_with("par-"))
+            .count();
+        assert!(pieces >= 2, "{name}: the pieces: {:?}", seg_names(&d));
+        // A frozen table with deletes and appends, its landing held.
+        db.hold_seal_landing(true);
+        for k in (0..3000u32).step_by(11) {
+            m.delete(&mut db, &format!("key-{k:05}"));
+        }
+        for k in (5..3000u32).step_by(13) {
+            m.append(&mut db, &format!("key-{k:05}"), &format!("v3-{k}"));
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        assert_eq!(db.frozen_tables(), 1, "{name}: the frozen table");
+        // The live table over it: puts, second values and a key nothing
+        // older holds.
+        for k in (3..3000u32).step_by(5) {
+            let key = format!("key-{k:05}");
+            m.delete(&mut db, &key);
+            m.append(&mut db, &key, &format!("v4-{k}"));
+        }
+        for k in (1..3000u32).step_by(17) {
+            m.append(&mut db, &format!("key-{k:05}"), &format!("v5-{k}"));
+        }
+        m.append(&mut db, "key-99999", "past-the-end");
+        db.commit().unwrap();
+        let h = db.reader().unwrap();
+        let mut keys: Vec<Vec<u8>> = m.vals.keys().cloned().collect();
+        keys.push(b"key-77777x".to_vec());
+        for k in &keys {
+            let want = m.vals.get(k).cloned().unwrap_or_default();
+            let lossy = String::from_utf8_lossy(k);
+            assert_eq!(read_vec(&db, k), want, "{name}: the writer reads {lossy}");
+            assert_eq!(read_vec(&h, k), want, "{name}: the handle reads {lossy}");
+            assert_eq!(
+                db.count(k).unwrap(),
+                want.len() as u64,
+                "{name}: the writer counts {lossy}"
+            );
+            assert_eq!(
+                h.count(k).unwrap(),
+                want.len() as u64,
+                "{name}: the handle counts {lossy}"
+            );
+        }
+        drop(h);
+        db.hold_seal_landing(false);
+        db.settle().unwrap();
+        db.close().unwrap();
+    }
+}
+
 fn ord_names(d: &std::path::Path) -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir(d)
         .unwrap()
@@ -19037,6 +19131,92 @@ fn a_bursts_batches_after_the_first_are_lent_a_batch_behind_the_thread() {
         (0, 0, 0),
         "a batch over the share is filed in the commit"
     );
+}
+
+/// A syncing commit's paced batch of at least a twentieth of the store is
+/// held until the thread trails by the share alone, so the first scan after
+/// the burst meets nothing of it (`Options::upkeep_pace_syncs_to_share`);
+/// a smaller batch, and every batch with the option off, may leave the
+/// thread up to the batch behind. Every key reads as written after.
+#[test]
+fn a_syncing_commits_large_batch_is_held_to_the_share() {
+    let run = |name: &str, to_share: bool, batch: u32| {
+        let d = dir(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                upkeep: supdb::Upkeep::Background(1),
+                upkeep_pace_syncs_to_share: to_share,
+                zpages: supdb::ZPages::Off,
+                partition_bytes: Some(256 << 10),
+                seal_max_pct: 0,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(db.options().sync, supdb::SyncPolicy::Always));
+        let keys = 10_000u32;
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        let mut want: HashMap<u32, String> = HashMap::new();
+        for k in 0..keys {
+            db.append(&key(k), b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        let check = |db: &Reader, want: &HashMap<u32, String>, when: &str| {
+            let mut seen = 0u32;
+            db.scan(
+                &key(0),
+                keys as usize,
+                kv(&mut |k, v| {
+                    let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                    let expect = want.get(&kn).map_or("0", |s| s.as_str());
+                    assert_eq!(
+                        std::str::from_utf8(v).unwrap(),
+                        expect,
+                        "{name}: key {kn} {when}"
+                    );
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, keys, "{name}: every key {when}");
+        };
+        check(&db, &want, "before the burst");
+        let share = keys as u64 * db.options().upkeep_pace_syncs_bp as u64 / 10_000;
+        let held_to_share = to_share && batch as u64 * 20 >= keys as u64 && batch <= 2048;
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut over = 0u32;
+        for round in 0..6u32 {
+            for _ in 0..batch {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % keys as u64) as u32;
+                db.put(&key(k), format!("b{round}").as_bytes());
+                want.insert(k, format!("b{round}"));
+            }
+            db.commit().unwrap();
+            let behind = db.upkeep_behind_writes();
+            let bound = if held_to_share {
+                share
+            } else {
+                share.max(batch as u64)
+            };
+            assert!(
+                behind <= bound,
+                "{name}: commit {round}: the thread trails by at most {bound}, not {behind}"
+            );
+            over += u32::from(behind > share);
+        }
+        db.settle().unwrap();
+        check(&db, &want, "after the burst");
+        over
+    };
+    assert_eq!(run("pace-share-large", true, 1000), 0, "held to the share");
+    run("pace-share-small", true, 400);
+    run("pace-share-huge", true, 3000);
+    run("pace-share-off", false, 1000);
 }
 
 /// A syncing commit lends every batch to the upkeep thread, which files
