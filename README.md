@@ -21,7 +21,8 @@ from either source.
   it, rather than answering wrongly.
 - A finished segment can be published encrypted and read in place, natively
   and in the browser: an authenticated envelope around the file, under a
-  cipher the caller supplies.
+  cipher the caller supplies, decrypted once and read after that at the
+  plain file's speed.
 
 ## Benchmarks
 
@@ -156,7 +157,7 @@ const values = reader.lookup(key);      // then read synchronously, with no miss
 budgeted page cache over HTTP or S3 -- and why the reader has to run in a
 Worker.
 
-A segment published encrypted, and read without a decrypted copy:
+A segment published encrypted, and read at the plain file's speed:
 
 ```rust
 use supdb::crypt::{self, EncryptOptions, Encrypted};
@@ -169,7 +170,7 @@ crypt::encrypt(&MmapBytes::open(path)?, &mut out, &key, &EncryptOptions::default
 
 let stored = MmapBytes::open(std::path::Path::new("./day.sup.enc"))?;
 let seg = Blob::open(Encrypted::open(stored, key)?)?;   // a wrong key fails here
-seg.read_all(b"term", |v| { /* decrypted and verified, chunk by chunk */ })?;
+seg.read_all(b"term", |v| { /* a borrow, as from the plain file */ })?;
 ```
 
 ```js
@@ -181,6 +182,17 @@ const cache = await CachedBytes.open({
   budgetBytes: 32 << 20,
 });
 ```
+
+A reader decrypts each part of the file once, the first time a read touches
+it, keeps it, and lends it from then on as a mapping lends: after that first
+touch a read costs what it costs on the plain file. The first touch runs at
+your cipher's speed, so the cipher matters; `cargo run --release --example
+crypt_cost` prints its rate and every read's cost beside the plain read's.
+What a reader keeps is memory the size of what it has read
+(`ReadOptions::keep_bytes` bounds it, down to nothing for a file larger than
+memory, where each read decrypts what it touches). In the browser the
+decryption happens once, at the fetch, costs no extra round trip, and the
+cache holds plaintext.
 
 The envelope hides the file's bytes and refuses any change to them: a byte
 altered, a part moved or taken from another file, a file cut short. It does

@@ -8,31 +8,33 @@
 //!
 //! `KEYFILE` holds the key and nothing else: 32 bytes, as they are. `supdb`
 //! ships no cipher; `Gcm` below is the whole of what a caller writes to give
-//! it one, here over the `aes-gcm` crate. Reading an encrypted file in place,
+//! it one, here over `ring`'s AES-GCM. Reading an encrypted file in place,
 //! without a decrypted copy, is `Blob::open(Encrypted::open(src, key)?)`.
 //!
 //! `OUT` is written under a temporary name, synced and renamed into place,
 //! since a reader may hold the file it replaces open.
 
-use aes_gcm::aead::{AeadInPlace, KeyInit};
-use aes_gcm::Aes256Gcm;
+use ring::aead::{Aad, LessSafeKey, Nonce, Tag, UnboundKey, AES_256_GCM};
 use std::io::{Error, ErrorKind, Result, Write};
 use std::path::Path;
 use supdb::crypt::{self, Aead, EncryptOptions, Encrypted, Header, NONCE, TAG};
 use supdb::{Bytes, MmapBytes};
 
-struct Gcm(Aes256Gcm);
+struct Gcm(LessSafeKey);
 
 impl Aead for Gcm {
     fn encrypt(&self, nonce: &[u8; NONCE], aad: &[u8], buf: &mut [u8]) -> [u8; TAG] {
-        self.0
-            .encrypt_in_place_detached(nonce.into(), aad, buf)
-            .expect("a chunk is far under the cipher's limit")
-            .into()
+        let nonce = Nonce::assume_unique_for_key(*nonce);
+        let tag = self
+            .0
+            .seal_in_place_separate_tag(nonce, Aad::from(aad), buf)
+            .expect("a chunk is far under the cipher's limit");
+        tag.as_ref().try_into().expect("a sixteen-byte tag")
     }
     fn decrypt(&self, nonce: &[u8; NONCE], aad: &[u8], buf: &mut [u8], tag: &[u8; TAG]) -> bool {
+        let nonce = Nonce::assume_unique_for_key(*nonce);
         self.0
-            .decrypt_in_place_detached(nonce.into(), aad, buf, tag.into())
+            .open_in_place_separate_tag(nonce, Aad::from(aad), Tag::from(*tag), buf, 0..)
             .is_ok()
     }
 }
@@ -45,7 +47,9 @@ fn key(path: &Path) -> Result<Gcm> {
             format!("{} holds {} bytes; a key is 32", path.display(), raw.len()),
         )
     })?;
-    Ok(Gcm(Aes256Gcm::new(key.into())))
+    Ok(Gcm(LessSafeKey::new(
+        UnboundKey::new(&AES_256_GCM, key).expect("a 32-byte key"),
+    )))
 }
 
 /// Write `out` whole or not at all: a temporary name beside it, synced,

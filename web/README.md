@@ -152,9 +152,9 @@ number of requests at either page.
 ## An encrypted object
 
 An object can be published as an envelope (`supdb::crypt` on the Rust side
-writes it): a 48-byte header, then the file in chunks, each encrypted and
-tagged on its own. `crypt.mjs` reads one with WebCrypto's AES-GCM, as a
-wrapper around the fetcher:
+writes it): a header in the object's first page, then the file in chunks,
+each encrypted and tagged on its own. `crypt.mjs` reads one with WebCrypto's
+AES-GCM, as a wrapper around the fetcher:
 
 ```js
 fetcher: decryptingFetcher(httpRangeFetcher(url), await importKey(rawKey)),
@@ -167,6 +167,15 @@ as they were, and the module carries no cipher. The worker takes the key as
 `decryptObject(bytes, key)` is the same for an object already in memory.
 `key` may be a function of the parsed header instead, for a caller that
 keeps several keys (`keyId`) or derives one per object (`id`).
+
+It adds no round trip. The header rides in the first request, which starts
+at the object's first byte and runs through what the open's first fetch
+wanted, and every fetch after is one request for one contiguous span, as it
+is for a plain object. A chunk and its tag are 4 KiB stored, so a fetched
+page of plaintext is its sixteen or seventeen chunks and the request is a
+few percent longer than the page. Decryption happens once, at the fetch, in
+the browser's own AES; what the cache holds after is plaintext, read at the
+speed any cached page is.
 
 Every byte the wrapper hands up was verified first: a chunk that fails its
 tag rejects the fetch, so an `ensure` over a changed object throws and

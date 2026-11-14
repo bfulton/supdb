@@ -10,34 +10,39 @@
 //! layout is written down in Rust and in JavaScript, and that file is what
 //! keeps the two from drifting.
 
-use aes_gcm::aead::{AeadInPlace, KeyInit};
-use aes_gcm::Aes256Gcm;
+use ring::aead::{Aad, LessSafeKey, Nonce, Tag, UnboundKey, AES_256_GCM};
 use std::path::{Path, PathBuf};
-use supdb::crypt::{self, Aead, EncryptOptions, Encrypted, Header, NONCE, TAG};
+use supdb::crypt::{self, Aead, EncryptOptions, Encrypted, Header, ReadOptions, NONCE, TAG};
 use supdb::{Blob, Bytes, MmapBytes, SegmentOptions, SegmentWriter, SparseBlob, VecBytes};
 
 mod common;
 use common::{kv, vf};
 
-/// AES-256-GCM as the hook takes it: the whole of what a caller writes.
-struct Gcm(Aes256Gcm);
+/// AES-256-GCM, `ring`'s, as the hook takes it: the whole of what a caller
+/// writes.
+struct Gcm(LessSafeKey);
 
 impl Gcm {
     fn new(key: &[u8; 32]) -> Gcm {
-        Gcm(Aes256Gcm::new(key.into()))
+        Gcm(LessSafeKey::new(
+            UnboundKey::new(&AES_256_GCM, key).expect("a 32-byte key"),
+        ))
     }
 }
 
 impl Aead for Gcm {
     fn encrypt(&self, nonce: &[u8; NONCE], aad: &[u8], buf: &mut [u8]) -> [u8; TAG] {
-        self.0
-            .encrypt_in_place_detached(nonce.into(), aad, buf)
-            .expect("a chunk is far under the cipher's limit")
-            .into()
+        let nonce = Nonce::assume_unique_for_key(*nonce);
+        let tag = self
+            .0
+            .seal_in_place_separate_tag(nonce, Aad::from(aad), buf)
+            .expect("a chunk is far under the cipher's limit");
+        tag.as_ref().try_into().expect("a sixteen-byte tag")
     }
     fn decrypt(&self, nonce: &[u8; NONCE], aad: &[u8], buf: &mut [u8], tag: &[u8; TAG]) -> bool {
+        let nonce = Nonce::assume_unique_for_key(*nonce);
         self.0
-            .decrypt_in_place_detached(nonce.into(), aad, buf, tag.into())
+            .open_in_place_separate_tag(nonce, Aad::from(aad), Tag::from(*tag), buf, 0..)
             .is_ok()
     }
 }
@@ -154,16 +159,43 @@ fn an_encrypted_segment_answers_as_the_plain_one_does() {
             assert_eq!(stored.len() as u64, hdr.stored_len());
             assert_eq!(hdr.plain_len(), std::fs::metadata(&path).unwrap().len());
 
-            let lending = Encrypted::open(MmapBytes::open(&enc).unwrap(), Gcm::new(&KEY)).unwrap();
-            let blob = Blob::open(lending).expect("open through a mapping");
-            assert!(!blob.zero_copy(), "an envelope has no plaintext to lend");
-            assert_eq!(answers(&blob, &want), truth, "mapped, shift {shift}");
+            // A reader that keeps what it decrypts lends it, and the index
+            // is borrowed out of it as it is out of a mapping.
+            let kept = Encrypted::open(MmapBytes::open(&enc).unwrap(), Gcm::new(&KEY)).unwrap();
+            let blob = Blob::open(kept).expect("open through a mapping");
+            assert!(blob.zero_copy(), "a kept envelope lends its index");
+            assert_eq!(answers(&blob, &want), truth, "kept, shift {shift}");
+            assert_eq!(
+                answers(&blob, &want),
+                truth,
+                "kept and read again, shift {shift}"
+            );
             assert_eq!(blob.version(), plain.version());
             assert_eq!(blob.index_checksummed(), plain.index_checksummed());
 
-            let copying = Encrypted::open(Copying(stored), Gcm::new(&KEY)).unwrap();
-            let blob = Blob::open(copying).expect("open through a copying source");
+            // One that keeps nothing lends nothing, through a mapping and
+            // through a source that cannot lend either.
+            let nothing = ReadOptions { keep_bytes: 0 };
+            let stored_map = MmapBytes::open(&enc).unwrap();
+            let bounded = Encrypted::open_with(stored_map, Gcm::new(&KEY), &nothing).unwrap();
+            let blob = Blob::open(bounded).expect("open keeping nothing");
+            assert!(!blob.zero_copy(), "nothing kept is nothing to lend");
+            assert_eq!(answers(&blob, &want), truth, "mapped, shift {shift}");
+            let copying = Encrypted::open_with(Copying(stored.clone()), Gcm::new(&KEY), &nothing);
+            let blob = Blob::open(copying.unwrap()).expect("open through a copying source");
             assert_eq!(answers(&blob, &want), truth, "copied, shift {shift}");
+
+            // And one that keeps a quarter of the object reads the rest.
+            let some = ReadOptions {
+                keep_bytes: hdr.plain_len() / 4,
+            };
+            let part = Encrypted::open_with(Copying(stored), Gcm::new(&KEY), &some).unwrap();
+            let blob = Blob::open(part).expect("open keeping a part");
+            assert_eq!(
+                answers(&blob, &want),
+                truth,
+                "a quarter kept, shift {shift}"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -319,7 +351,7 @@ fn a_changed_byte_is_an_error_and_never_another_answer() {
 // ------------------------------------------------- the envelope on record --
 
 /// What `tests/data/crypt-v1.bin` holds, as `web/crypt.test.mjs` also has
-/// it: 1200 bytes under AES-256-GCM, in chunks of 512.
+/// it: 1200 bytes under AES-256-GCM, in stored chunks of 512.
 fn on_record() -> (Vec<u8>, [u8; 32], EncryptOptions, [u8; 16]) {
     let plain = (0..1200usize).map(|i| (i * 7 + i / 251) as u8).collect();
     let key = std::array::from_fn(|i| i as u8);
@@ -351,7 +383,7 @@ fn envelope_now() -> Vec<u8> {
 #[test]
 fn the_envelope_written_is_the_one_on_record() {
     let recorded = std::fs::read(record_path()).expect("tests/data/crypt-v1.bin");
-    assert_eq!(recorded.len(), 48 + 1200 + 3 * 16);
+    assert_eq!(recorded.len(), 4096 + 1200 + 3 * 16);
     assert!(
         envelope_now() == recorded,
         "the envelope's layout moved: a reader of version 1, the browser's included, no longer \

@@ -26,11 +26,14 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std", "fra
 memmap2 = "0.9"
 libc = "0.2"
 
-# The tests' and the example's cipher, and nothing a build of the crate
+# The tests' and the examples' cipher, and nothing a build of the crate
 # links: `supdb::crypt` defines the envelope and takes the cipher from its
-# caller, and this is a caller.
+# caller, and this is a caller. `ring`, because an envelope's first read of
+# a chunk runs at the cipher's rate and nothing else: AES-GCM through the
+# CPU's wide AES instructions, several times a portable implementation's
+# (`examples/crypt_cost.rs` prints the rate of the one linked).
 [dev-dependencies]
-aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+ring = "0.17"
 
 # `supdb_emulated` is set by the CI job that runs the unit tests under
 # qemu-user (`.github/workflows/ci.yml`, cross-arm), which takes `madvise`

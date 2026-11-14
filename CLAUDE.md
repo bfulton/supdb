@@ -890,39 +890,91 @@ pins it, because a native reader that started copying would still pass every
 correctness check.
 
 **The envelope is around the file, and nothing inside the format knows
-it.** `supdb::crypt` wraps a finished file: a header, then the plaintext
-in chunks, each encrypted on its own under the caller's cipher, read back as
-a `Bytes` that lends nothing. That is why it cost the readers no change,
+it.** `supdb::crypt` wraps a finished file: a header in the first page,
+then the plaintext in chunks, each encrypted on its own under the caller's
+cipher, read back as a `Bytes`. That is why it cost the readers no change,
 and it is the constraint. The crate ships no cipher -- the dev-dependency
-on `aes-gcm` is the tests' and the example's, a caller like any other --
-and the wasm module links none: the browser decrypts at the fetch with
+on `ring` is the tests' and the examples', a caller like any other -- and
+the wasm module links none: the browser decrypts at the fetch with
 WebCrypto (`web/crypt.mjs`, a wrapper round the fetcher every source
-takes), so the module's size does not move, the plans stay plaintext
-ranges, and what the cache keeps in OPFS is plaintext. The layout is
+takes), so nothing of `crypt` is in the module (a build with its names
+kept has no symbol of it; the size moves by tens of bytes with what LTO
+inlines elsewhere, which is not the module growing), the plans stay
+plaintext ranges, and what the cache keeps in OPFS is plaintext. The layout is
 therefore written down twice, in Rust and in JavaScript, which is what
 this file says not to do with a superblock constant;
 `tests/data/crypt-v1.bin` is what holds the two to one answer.
 `tests/crypt.rs` requires `encrypt_with_id` to write exactly those bytes,
 and `web/crypt.test.mjs`, which the wasm group runs under Node
 (`scripts/deps.sh` readies it), requires `crypt.mjs` to read them, so a
-layout change is a new version and a new file beside that one, never that
-file written again. An `Encrypted` verifies its first chunk at open, so a
-header is never believed before a tag has covered it, `len()` included,
-and a wrong key fails there; every tag covers the whole header and every
-nonce is the object's id and the chunk's index, which is what refuses a
-chunk moved, borrowed from another object or cut off the end. A nonce
-repeated under one key gives both objects away, so an id is drawn per
-envelope and `encrypt_with_id` is for tests. The plain native path is not
-touched by any of it: `Blob::zero_copy()` over a mapping stays true, and
-`tests/crypt.rs` asserts it beside the envelope's `false`. The first tests
-of the browser's half changed every byte of the record and required a
-refusal, and seven of fourteen mutants of `crypt.mjs` survived them: a
-header with a wrong magic, version or shift fails every tag as well, so
-the three checks could each be deleted, and two checks of the object's
-length each caught what the other was for. A check behind a tag is held by
-asking the parser alone or by an input made under the key, as a check
-behind a checksum is held by a forged one, and of two checks on one
-quantity the test has to reach each where the other cannot.
+layout change once this has merged is a new version and a new file beside
+that one, never that file written again. An `Encrypted` verifies its first
+chunk at open, so a header is never believed before a tag has covered it,
+`len()` included, and a wrong key fails there; every tag covers the header
+and every nonce is the object's id and the chunk's index, which is what
+refuses a chunk moved, borrowed from another object or cut off the end; the
+zeroes between the header and the first chunk are under no tag and are
+checked to be zeroes. A nonce repeated under one key gives both objects
+away, so an id is drawn per envelope and `encrypt_with_id` is for tests.
+
+Every choice in it that is not the cipher's was made on
+`cargo run --release --example crypt_cost`, which reads one segment plain
+and through each kind of reader in one process, and the first version,
+pushed before that probe existed, was wrong in each of them. It decrypted
+at every read, with the thread's last chunk remembered, on the reading
+that a `Blob` copies its index once at open and a lookup touches the
+source rarely: a point read of a run in a block read the source at every
+call and paid two chunks' decryption for it, thirteen times the plain
+read for a short run and near eighty for a run of a value or two at the
+smallest chunk, and worse at every larger one. A reader keeps what it
+decrypts now (`ReadOptions::keep_bytes`, unbounded by default): a chunk
+goes once into an anonymous mapping the plaintext's length and is lent
+from it after (`slice_at`), so `Blob::zero_copy()` is true over an
+envelope and a warm read costs the plain read's time; the bound of zero
+is the reader for an object larger than memory, and what is kept is
+anonymous and the kernel's to reclaim never. Its test cipher was a
+portable AES-GCM at a sixth of the rate `ring` reaches on the same
+core through the wide AES instructions, and the first touch of a chunk
+is the cipher's rate and little else: the adapter an example shows is
+the one a caller copies, so it is the fast one. Its chunks were whole
+pages of plaintext with the tag after, 4112 stored bytes, so every chunk
+lay across two pages of the file and a cold read faulted two where the
+plain file faults one; a stored chunk is the power of two now and the
+plaintext in it sixteen short, and from cold with random advice a read
+through an envelope takes the plain read's faults at the default chunk
+and two to two and a half times them at 16 KiB and up, which is what the
+default was chosen on. That left a chunk found by a divide by 4080 at
+every call, which is a multiply and a shift instead (`Per`): built on
+the divider's latency as this file has it and not priced here. A lent
+section is asked for again at every lookup (`Sec::get` calls `slice_at`
+each time), so a borrow that walked its chunks' states would cost what
+it saves: a reader with every chunk kept answers on one
+load, and before that the longest ranges lent are remembered whole
+(`Kept::known`), the longest kept when a fifth comes, since a run of
+values must not put the key section out. The browser's wrapper asked for
+the header alone before its first fetch, a round trip an open did not
+have; the header rides in the first request now, sized for the whole
+chunks of the default chunk -- sized first by the bytes wanted and their
+tags, it fell short of the last chunk's end and asked twice anyway. And
+the writer made a write a chunk; it hands its sink a megabyte at a time,
+for the folios the page cache makes of it. With a fast cipher what is
+left of a first touch is the fresh page the plaintext is kept in, which
+costs more than decrypting into it and is not yet priced
+(`ROADMAP.md`). The rule: a second way to read is priced beside the
+first, in one process, on every operation the first is measured on,
+before its default is chosen; and the order of the costs is read off the
+probe before any of them is tuned -- the reader's shape was up to
+eighty times, the cipher six, and the layout two by its count of pages.
+
+The first tests of the browser's half changed every byte of the record
+and required a refusal, and seven of fourteen mutants of `crypt.mjs`
+survived them: a header with a wrong magic, version or shift fails every
+tag as well, so the three checks could each be deleted, and two checks of
+the object's length each caught what the other was for. A check behind a
+tag is held by asking the parser alone or by an input made under the
+key, as a check behind a checksum is held by a forged one, and of two
+checks on one quantity the test has to reach each where the other
+cannot.
 
 **The three readers agree, and are tested against each other rather than
 against themselves.** The failure mode of a second read path is not a crash

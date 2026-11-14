@@ -154,14 +154,20 @@ What an engine picker would hit, roughly in order.
 - [ ] **Encryption at rest for a live store.** A finished segment has an
   envelope (`supdb::crypt`): encrypted and authenticated under a cipher the
   caller supplies, read in place by `Blob`, `SparseBlob` and the browser
-  reader. A store's own directory -- the log, the segments, the manifest,
+  reader at the plain file's speed once a part has been read. A store's own
+  directory -- the log, the segments, the manifest,
   the ordered indexes and the form files -- is still written in the clear,
   and its reads lend from the mapping, which an encrypted file cannot. Done
   when a store opens under a key and nothing it writes is plaintext, with
   the cost of the copy priced by an arm. Until then it is the filesystem's.
-- [ ] **The encrypted reader, priced.** No arm reads through an envelope, so
-  what a point read and a scan pay for it is not in any row. Done when the
-  suite has the arm and the chunk size is chosen from it.
+- [ ] **The encrypted reader in the suite.** `examples/crypt_cost.rs` prices
+  every read through an envelope beside the same read of the plain file, in
+  one process, and the reader, the layout and the chunk size were chosen
+  from it. Nothing gates it: no arm reads through an envelope and no row
+  holds one. Done when the suite has the arm.
+- [ ] **An envelope's first touch.** With a fast cipher, the fresh pages a
+  reader keeps its plaintext in cost more than decrypting into them. Done
+  when populating them in bulk, or not at all, has been priced.
 
 ## Out of core
 
