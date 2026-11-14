@@ -4868,6 +4868,25 @@ ascending run of inserts into an empty table opens a direct run, whose close
 drops every block table, which read as the form being dropped until a
 backtrace on its drop named `close_direct`.
 
+**A second pass that asked again what the first had found.** A point
+read over a store with tombstones runs a pass newest source first for the
+newest tombstone and then reads the values oldest first, and the second
+pass asked every source again: the live table's probe, each frozen
+table's, each piece's filter and, where the filter passed, its index. A
+`put` is a delete and an append, so every store an update mix has reached
+has tombstones, and every point read after the first write mix paid the
+second probe; the scrambled D read 0.93x of LMDB in the row's order with a
+seventh of its thread in the pieces' filters, and the read pass, over a
+store with none, never showed it. The pass keeps what it found of each
+source for the reads after it (`Options::read_probes_once`): callgrind
+over three hundred thousand keys with two pieces of puts and puts in the
+live table counted 1,492 instructions a read against 1,658, and the read
+pass with no tombstones level. The rule: a pass over sources a pass
+before it probed takes that pass's answers, since a probe asked twice is
+paid twice; and a cost that appears only once a store has a property the
+workloads give it after their first write is priced in that store, not in
+the clean one the read pass meets.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

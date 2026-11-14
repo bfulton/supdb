@@ -1271,6 +1271,21 @@ pub struct Options {
     /// `read_hash_once`, whose word names the lines. `supdb-readnoahead`
     /// and `supdb-ingestreadnoahead` ask for the memtable's slot alone.
     pub read_lines_ahead: bool,
+    /// A point read or a count over a store with tombstones reads each
+    /// source once: the pass that finds the newest tombstone, newest source
+    /// first, keeps what it found of each source it probed -- the live
+    /// table's entry, each frozen table's, and for each piece whether its
+    /// filter and its index hold the key (`Probed`) -- and the reads after
+    /// it take those answers where they had probed every source again. A
+    /// `put` is a delete and an append, so every store an update has
+    /// reached has tombstones, and every point read after the first write
+    /// mix probed the live table, the frozen tables and each piece's filter
+    /// twice. The answers are the same: the state is taken once for the
+    /// read, the segments and frozen tables do not change, and the live
+    /// table's entries are bounded by the mark the read took at its start.
+    /// Off, the value pass probes every source again, the shape before:
+    /// `supdb-probestwice`, and `supdb-ingestprobestwice` buffered.
+    pub read_probes_once: bool,
     /// EXPERIMENT: a point read of a partition whose ordered index holds
     /// whole keys (`OrdIndex::uniform`: every key one length, no longer
     /// than the common prefix and eight bytes) finds its rank through the
@@ -5708,6 +5723,7 @@ impl Default for Options {
             exts_by_value: false,
             read_hash_once: true,
             read_lines_ahead: true,
+            read_probes_once: true,
             point_via_ord: false,
             zpages: ZPages::Auto,
             zpages_min_bytes: zfile::ZMIN_RECS,
@@ -11183,6 +11199,38 @@ struct Entry<'a> {
     klen: u16,
     count: u32,
     _table: std::marker::PhantomData<&'a MemTable>,
+}
+
+/// What a point read's tombstone pass found of each source it probed, for
+/// the reads after it (`Options::read_probes_once`): `None` where the pass
+/// did not reach a source, and the probe's answer where it did. A piece is
+/// known by its place in the read's run of pieces, the first sixty-four.
+#[derive(Default)]
+struct Probed<'a> {
+    mem: Option<Option<Entry<'a>>>,
+    frozen: [Option<Option<Entry<'a>>>; FROZEN_CAP],
+    /// The pieces the pass found without the key: its filter or its index
+    /// said no.
+    absent: u64,
+    /// The pieces whose filter and index the pass found the key in.
+    held: u64,
+}
+
+impl Probed<'_> {
+    /// For piece `i`: `Some(true)` where the pass found the key there,
+    /// `Some(false)` where it found it absent, `None` where it did not ask.
+    fn piece(&self, i: usize) -> Option<bool> {
+        if i >= 64 {
+            return None;
+        }
+        if self.held >> i & 1 == 1 {
+            Some(true)
+        } else if self.absent >> i & 1 == 1 {
+            Some(false)
+        } else {
+            None
+        }
+    }
 }
 
 impl<'a> Entry<'a> {
@@ -23589,6 +23637,78 @@ impl Reader {
         }
     }
 
+    /// A point read's pass over a store with tombstones: the sources newest
+    /// first -- the live table, the frozen tables newest first, the pieces
+    /// newest first -- to the newest one holding a tombstone for `key`,
+    /// whose place among the sources (as `read_all` numbers them) is where
+    /// live values begin, zero where none does. A piece is asked only where
+    /// it has tombstones at all. What the pass found of each source it
+    /// probed comes back beside the cut, for the reads after it to take
+    /// (`Options::read_probes_once`; empty with the option off).
+    #[allow(clippy::too_many_arguments)]
+    fn tomb_pass<'s>(
+        &self,
+        st: &'s State,
+        l0: &[std::sync::Arc<Seg>],
+        key: &[u8],
+        fnv: u64,
+        hash: u64,
+        frozen_hash: u64,
+        mem_empty: bool,
+        holds: impl Fn(&Seg) -> bool,
+    ) -> (usize, Probed<'s>) {
+        let keep = self.opts.read_probes_once;
+        let once = self.opts.read_hash_once;
+        let mem = &*st.mem;
+        let fr_ix = 1 + l0.len();
+        let mut probed = Probed::default();
+        if !mem_empty {
+            let got = mem.get_with(hash, key, self.len_bound.get());
+            if keep {
+                probed.mem = Some(got);
+            }
+            if got.is_some_and(|e| mem.has_tomb(e, self.wm())) {
+                return (fr_ix + st.frozen.len(), probed);
+            }
+        }
+        // The frozen tables newest first: the newest holding a tombstone is
+        // the cut.
+        for (i, fr) in st.frozen.iter().enumerate().rev() {
+            let got = fr.get_with(frozen_hash, key, MemTable::ALL);
+            if keep {
+                if let Some(slot) = probed.frozen.get_mut(i) {
+                    *slot = Some(got);
+                }
+            }
+            if got.is_some_and(|e| fr.has_tomb(e, SEE_ALL)) {
+                return (fr_ix + i, probed);
+            }
+        }
+        for (i, seg) in l0.iter().enumerate().rev() {
+            if !seg.tombs {
+                continue;
+            }
+            let exts = if !holds(seg) {
+                None
+            } else if once {
+                seg.raw().lookup_hashed(key, fnv)
+            } else {
+                seg.raw().lookup(key)
+            };
+            if keep && i < 64 {
+                if exts.is_some() {
+                    probed.held |= 1 << i;
+                } else {
+                    probed.absent |= 1 << i;
+                }
+            }
+            if exts.is_some_and(|exts| exts.iter().any(|e| e.is_tombstone())) {
+                return (1 + i, probed);
+            }
+        }
+        (0, probed)
+    }
+
     pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {
         let _entered = self.enter();
         self.advise(true);
@@ -23664,47 +23784,13 @@ impl Reader {
         // second probe on the sources that hold the key.
         let fr_ix = 1 + l0.len();
         let mem_ix = fr_ix + st.frozen.len();
-        let mut start = 0usize;
-        if tombs {
-            if !mem_empty {
-                if let Some(e) = mem.get_with(hash, key, self.len_bound.get()) {
-                    if mem.has_tomb(e, self.wm()) {
-                        start = mem_ix;
-                    }
-                }
-            }
-            if start == 0 {
-                // The frozen tables newest first: the newest holding a
-                // tombstone is the cut.
-                for (i, fr) in st.frozen.iter().enumerate().rev() {
-                    if fr
-                        .get_with(mem_h(key), key, MemTable::ALL)
-                        .is_some_and(|e| fr.has_tomb(e, SEE_ALL))
-                    {
-                        start = fr_ix + i;
-                        break;
-                    }
-                }
-            }
-            if start == 0 {
-                for (i, seg) in l0.iter().enumerate().rev() {
-                    if !seg.tombs || !holds(seg) {
-                        continue;
-                    }
-                    let exts = if once {
-                        seg.raw().lookup_hashed(key, fnv)
-                    } else {
-                        seg.raw().lookup(key)
-                    };
-                    if let Some(exts) = exts {
-                        if exts.iter().any(|e| e.is_tombstone()) {
-                            start = 1 + i;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+        // The newest-first pass tombstones require, and what it found of
+        // each source it probed (`Options::read_probes_once`).
+        let (start, probed) = if tombs {
+            self.tomb_pass(st, l0, key, fnv, hash, mem_h(key), mem_empty, holds)
+        } else {
+            (0, Probed::default())
+        };
         let mut n = 0u64;
         // The segment read lends the extents on the index's frame; the arm
         // takes them by value, the shape before (`Options::exts_by_value`).
@@ -23752,7 +23838,7 @@ impl Reader {
             }
         }
         for (i, seg) in l0.iter().enumerate() {
-            if 1 + i < start || !holds(seg) {
+            if 1 + i < start || !probed.piece(i).unwrap_or_else(|| holds(seg)) {
                 continue;
             }
             n += seg_read(seg, &mut f)?;
@@ -23761,7 +23847,11 @@ impl Reader {
             if fr_ix + i < start {
                 continue;
             }
-            if let Some(e) = fr.get_with(mem_h(key), key, MemTable::ALL) {
+            let got = match probed.frozen.get(i) {
+                Some(&Some(got)) => got,
+                _ => fr.get_with(mem_h(key), key, MemTable::ALL),
+            };
+            if let Some(e) = got {
                 let (offs, _) = fr.live_chain(e, SEE_ALL);
                 n += offs.len() as u64;
                 for off in offs {
@@ -23770,7 +23860,11 @@ impl Reader {
             }
         }
         if mem_ix >= start && !mem_empty {
-            if let Some(e) = mem.get_with(hash, key, self.len_bound.get()) {
+            let got = match probed.mem {
+                Some(got) => got,
+                None => mem.get_with(hash, key, self.len_bound.get()),
+            };
+            if let Some(e) = got {
                 let (offs, _) = mem.live_chain(e, self.wm());
                 n += offs.len() as u64;
                 for off in offs {
@@ -31125,47 +31219,13 @@ impl Reader {
         }
         let fr_ix = 1 + l0.len();
         let mem_ix = fr_ix + st.frozen.len();
-        let mut start = 0usize;
-        if tombs {
-            if !mem_empty {
-                if let Some(e) = mem.get_with(hash, key, self.len_bound.get()) {
-                    if mem.has_tomb(e, self.wm()) {
-                        start = mem_ix;
-                    }
-                }
-            }
-            if start == 0 {
-                // The frozen tables newest first: the newest holding a
-                // tombstone is the cut.
-                for (i, fr) in st.frozen.iter().enumerate().rev() {
-                    if fr
-                        .get_with(mem_h(key), key, MemTable::ALL)
-                        .is_some_and(|e| fr.has_tomb(e, SEE_ALL))
-                    {
-                        start = fr_ix + i;
-                        break;
-                    }
-                }
-            }
-            if start == 0 {
-                for (i, seg) in l0.iter().enumerate().rev() {
-                    if !seg.tombs || !holds(seg) {
-                        continue;
-                    }
-                    let exts = if once {
-                        seg.raw().lookup_hashed(key, fnv)
-                    } else {
-                        seg.raw().lookup(key)
-                    };
-                    if let Some(exts) = exts {
-                        if exts.iter().any(|e| e.is_tombstone()) {
-                            start = 1 + i;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+        // The newest-first pass tombstones require, and what it found of
+        // each source it probed (`Options::read_probes_once`).
+        let (start, probed) = if tombs {
+            self.tomb_pass(st, l0, key, fnv, hash, mem_h(key), mem_empty, holds)
+        } else {
+            (0, Probed::default())
+        };
         let mut n = 0u64;
         if start == 0 {
             if let Some(seg) = part {
@@ -31179,7 +31239,7 @@ impl Reader {
             }
         }
         for (i, seg) in l0.iter().enumerate() {
-            if 1 + i < start || !holds(seg) {
+            if 1 + i < start || !probed.piece(i).unwrap_or_else(|| holds(seg)) {
                 continue;
             }
             n += raw_count(seg)?;
@@ -31188,12 +31248,20 @@ impl Reader {
             if fr_ix + i < start {
                 continue;
             }
-            if let Some(e) = fr.get_with(mem_h(key), key, MemTable::ALL) {
+            let got = match probed.frozen.get(i) {
+                Some(&Some(got)) => got,
+                _ => fr.get_with(mem_h(key), key, MemTable::ALL),
+            };
+            if let Some(e) = got {
                 n += u64::from(e.count);
             }
         }
         if mem_ix >= start && !mem_empty {
-            if let Some(e) = mem.get_with(hash, key, self.len_bound.get()) {
+            let got = match probed.mem {
+                Some(got) => got,
+                None => mem.get_with(hash, key, self.len_bound.get()),
+            };
+            if let Some(e) = got {
                 n += mem.live_chain(e, self.wm()).0.len() as u64;
             }
         }

@@ -657,6 +657,10 @@ it once its walks have paid (`Options::forms_copy_hot_wide`);
 share or the batch, the larger, where the default holds a batch of a
 twentieth of the store or more within the share alone
 (`Options::upkeep_pace_syncs_to_share`);
+`supdb-probestwice` and `supdb-ingestprobestwice` have a point read over a
+store with tombstones probe every source again after its tombstone pass,
+where the default keeps what the pass found of each source
+(`Options::read_probes_once`);
 `supdb-zhotresident` is `supdb` with the hot-raw fill asking for the
 partitions the reads have not skewed by how much of their records the cache
 holds, most first (`Options::zpages_hot_fill_resident_first`);

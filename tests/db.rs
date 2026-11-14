@@ -1698,6 +1698,100 @@ fn a_lone_piece_holding_a_tombstone_still_merges() {
     db.close().unwrap();
 }
 
+/// A point read over a store with tombstones in every kind of source --
+/// level-0 pieces carrying puts, a frozen table held short of its landing
+/// with deletes and appends, and the live table over both -- answers the
+/// model with the tombstone pass's probes kept for the reads after it
+/// (`Options::read_probes_once`) and with every source probed again, the
+/// shape before: through the writer, whose reads honour no watermark, and
+/// through a handle, whose live table is bounded by its mark; `read_all`
+/// and `count` both, every key the model has touched and one no source
+/// holds.
+#[test]
+fn a_point_read_over_tombstones_in_every_source_answers_from_one_probe_of_each() {
+    for once in [true, false] {
+        let name = if once { "probes-once" } else { "probes-twice" };
+        let d = dir(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                read_probes_once: once,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let mut m = ScanModel::default();
+        for k in 0u32..3000 {
+            m.append(&mut db, &format!("key-{k:05}"), &format!("v0-{k}"));
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        // Two pieces of puts, each a delete and an append.
+        for round in 1..=2u32 {
+            for k in (round..3000u32).step_by(7) {
+                let key = format!("key-{k:05}");
+                m.delete(&mut db, &key);
+                m.append(&mut db, &key, &format!("v{round}-{k}"));
+            }
+            db.commit().unwrap();
+            db.seal().unwrap();
+            db.settle().unwrap();
+        }
+        let pieces = seg_names(&d)
+            .iter()
+            .filter(|n| !n.starts_with("par-"))
+            .count();
+        assert!(pieces >= 2, "{name}: the pieces: {:?}", seg_names(&d));
+        // A frozen table with deletes and appends, its landing held.
+        db.hold_seal_landing(true);
+        for k in (0..3000u32).step_by(11) {
+            m.delete(&mut db, &format!("key-{k:05}"));
+        }
+        for k in (5..3000u32).step_by(13) {
+            m.append(&mut db, &format!("key-{k:05}"), &format!("v3-{k}"));
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        assert_eq!(db.frozen_tables(), 1, "{name}: the frozen table");
+        // The live table over it: puts, second values and a key nothing
+        // older holds.
+        for k in (3..3000u32).step_by(5) {
+            let key = format!("key-{k:05}");
+            m.delete(&mut db, &key);
+            m.append(&mut db, &key, &format!("v4-{k}"));
+        }
+        for k in (1..3000u32).step_by(17) {
+            m.append(&mut db, &format!("key-{k:05}"), &format!("v5-{k}"));
+        }
+        m.append(&mut db, "key-99999", "past-the-end");
+        db.commit().unwrap();
+        let h = db.reader().unwrap();
+        let mut keys: Vec<Vec<u8>> = m.vals.keys().cloned().collect();
+        keys.push(b"key-77777x".to_vec());
+        for k in &keys {
+            let want = m.vals.get(k).cloned().unwrap_or_default();
+            let lossy = String::from_utf8_lossy(k);
+            assert_eq!(read_vec(&db, k), want, "{name}: the writer reads {lossy}");
+            assert_eq!(read_vec(&h, k), want, "{name}: the handle reads {lossy}");
+            assert_eq!(
+                db.count(k).unwrap(),
+                want.len() as u64,
+                "{name}: the writer counts {lossy}"
+            );
+            assert_eq!(
+                h.count(k).unwrap(),
+                want.len() as u64,
+                "{name}: the handle counts {lossy}"
+            );
+        }
+        drop(h);
+        db.hold_seal_landing(false);
+        db.settle().unwrap();
+        db.close().unwrap();
+    }
+}
+
 fn ord_names(d: &std::path::Path) -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir(d)
         .unwrap()
