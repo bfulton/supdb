@@ -13,6 +13,12 @@
 //! acknowledgements, drains what the child printed before it died, reopens
 //! the store and checks it against the stream. Ten rounds a run.
 
+// A child killed with SIGKILL and its store read back: run on Linux
+// alone, so everything here is, the helpers with the tests. They were not,
+// and on another platform every one of them was code nothing used, which
+// the lint refuses.
+#![cfg(target_os = "linux")]
+
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -64,7 +70,6 @@ fn values(db: &Db, k: &[u8]) -> Vec<Vec<u8>> {
     got
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn a_killed_writers_acknowledged_batches_are_all_there() {
     if let Ok(d) = std::env::var(ENV) {
@@ -208,7 +213,6 @@ fn buffered_child(dir: &Path) -> ! {
 /// batch now. Here the seal's thread is held, so the second window is as
 /// wide as the test needs, and the kill comes once the second run has
 /// pieces on its file.
-#[cfg(target_os = "linux")]
 #[test]
 fn a_killed_buffered_writer_loses_nothing_it_acknowledged() {
     if let Ok(d) = std::env::var(BUFFERED_ENV) {

@@ -769,18 +769,21 @@ fn a_run_that_names_no_start_is_taken_as_it_stands() {
 /// and ends in the log, and seals between them, so that a store is killed
 /// with runs open, runs closed and unsealed, runs landed, and frames on
 /// every side of them.
+#[cfg(target_os = "linux")]
 struct Stream {
     rng: u64,
     /// Keys `0..next` have been written; the next run starts here.
     next: u64,
 }
 
+#[cfg(target_os = "linux")]
 enum Op {
     Append(Vec<u8>, Vec<u8>),
     Put(Vec<u8>, Vec<u8>),
     Delete(Vec<u8>),
 }
 
+#[cfg(target_os = "linux")]
 impl Stream {
     fn new(seed: u64) -> Stream {
         Stream {
@@ -850,8 +853,10 @@ impl Stream {
     }
 }
 
+#[cfg(target_os = "linux")]
 type Model = std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>;
 
+#[cfg(target_os = "linux")]
 fn apply(m: &mut Model, ops: &[Op]) {
     for op in ops {
         match op {
@@ -866,9 +871,12 @@ fn apply(m: &mut Model, ops: &[Op]) {
     }
 }
 
+#[cfg(target_os = "linux")]
 const ORACLE_ENV: &str = "SUPDB_RUNLOG_CHILD";
+#[cfg(target_os = "linux")]
 const ORACLE_TEST: &str = "a_torn_store_is_a_prefix_of_what_was_committed";
 
+#[cfg(target_os = "linux")]
 fn oracle_options(sync: SyncPolicy) -> Options {
     Options {
         sync,
@@ -881,6 +889,7 @@ fn oracle_options(sync: SyncPolicy) -> Options {
 
 /// The oracle's writer: the stream committed without end, each commit
 /// acknowledged on stdout. Killed from outside; never returns.
+#[cfg(target_os = "linux")]
 fn oracle_child(spec: &str) -> ! {
     use std::io::Write;
     let (seed, rest) = spec.split_once(':').unwrap();
