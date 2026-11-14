@@ -1092,8 +1092,11 @@ segment open for append: the batch's records, then a commit marker carrying
 their CRC, length and count, then one fdatasync on that file. The WAL never
 sees them (`direct_ingest: false` is the arm that still sends them there).
 Recovery walks the temp file's record stream to the last marker whose three
-quantities agree with the records before it and rewrites what precedes it as
-a piece; what follows is a batch nobody was told was durable. The CRC is
+quantities agree with the records before it and makes what precedes it a
+piece where it lies: the file cut back to that marker and finished as the
+run's close would have finished it (`SegmentWriter::resume_run`), the walk
+standing in for the table as the keys' source; what follows is a batch
+nobody was told was durable. The CRC is
 there because a crash can land the page a marker is on and not a page of its
 batch, and a record whose bytes came back zero still parses. A run stands in
 the store's sequence: its records take one number each, as a WAL record

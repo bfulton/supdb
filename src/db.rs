@@ -6643,7 +6643,7 @@ impl Wal {
         mut fill: impl FnMut(u64, u64) -> Result<u64>,
     ) -> Result<(u64, u64, bool)> {
         let seed = wal_seed(id);
-        let mut file = match File::open(path) {
+        let file = match File::open(path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((from, 0, false)),
             Err(e) => return Err(e),
@@ -6656,33 +6656,16 @@ impl Wal {
         // once, into the memtable; read whole into a buffer first, a log
         // of forty megabytes was forty megabytes of fresh pages, the
         // kernel's copy into them and their unmapping, a quarter of the
-        // open of a killed store of three hundred thousand keys. The
-        // store is held under its lock for the open and nothing writes the
-        // file while it is mapped; where a file cannot be mapped it is
-        // read as before.
-        let mapped;
-        let owned;
-        // SAFETY: a read-only private view of a file this open holds the
-        // store's lock over; nothing in this process writes it while the
-        // view stands, and the view is dropped before the caller truncates
-        // or appends to the file.
-        let buf: &[u8] = match unsafe { memmap2::Mmap::map(&file) } {
-            Ok(m) => {
-                #[cfg(unix)]
-                let _ = m.advise(memmap2::Advice::Sequential);
-                mapped = m;
-                &mapped
-            }
-            Err(_) => {
-                let mut v = Vec::new();
-                file.read_to_end(&mut v)?;
-                owned = v;
-                &owned
-            }
-        };
-        if buf.is_empty() {
-            return Ok((from, 0, false));
-        }
+        // open of a killed store of three hundred thousand keys.
+        //
+        // SAFETY: a read-only view of a file this open holds the store's
+        // lock over; nothing in this process writes it while the view
+        // stands, and the view is dropped before the caller truncates or
+        // appends to the file.
+        let mapped = unsafe { memmap2::Mmap::map(&file)? };
+        #[cfg(unix)]
+        let _ = mapped.advise(memmap2::Advice::Sequential);
+        let buf: &[u8] = &mapped;
         // A file shorter than the header but a prefix of it is a header a
         // power loss tore before its first barrier -- a WAL with nothing in
         // it, not a foreign one. The caller truncates it and the header is
@@ -8737,6 +8720,102 @@ pub(crate) trait KeySource {
 /// hook told each key in order as the pass takes it.
 type KeyWalk<'s, 'k> = (&'s dyn KeySource, &'k mut dyn FnMut(&[u8]));
 
+/// What the file of a run of ordered ingest holds up to its last good
+/// commit marker (`SegmentWriter::walk_run`): where each committed record
+/// starts in the record section, the file offset the last good marker
+/// ends at, and the key and value bytes of the records, which a segment
+/// records as its payload. The records are read where they lie, through a
+/// mapping of the file the walk keeps; a walk of no record keeps none.
+pub(crate) struct RunWalk {
+    map: Option<memmap2::MmapRaw>,
+    offs: Vec<u32>,
+    end: u64,
+    payload: u64,
+}
+
+impl RunWalk {
+    /// Where a run's record section begins in its file: past the
+    /// superblock region and the section's header, with no head reserve.
+    const BASE: usize = crate::format::SUPER as usize + flatindex::HEADER;
+
+    /// The committed records.
+    pub(crate) fn len(&self) -> usize {
+        self.offs.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.offs.is_empty()
+    }
+
+    /// One record of a run's stream at the start of `rest`: its key, its
+    /// one inline value, and the record's length. None for anything else,
+    /// which is where a walk ends.
+    fn parse(rest: &[u8]) -> Option<(&[u8], &[u8], usize)> {
+        let (key, exts, tail, len) = flatindex::parse_record(rest, 0)?;
+        let [e] = *exts else {
+            return None;
+        };
+        if !e.is_inline() || e.is_tombstone() {
+            return None;
+        }
+        let run = tail.get(e.off as usize..(e.off as usize).saturating_add(e.len as usize))?;
+        let value = if e.count & Ext::FIXED != 0 {
+            run
+        } else {
+            let mut q = 0usize;
+            let vlen = get_uvarint(run, &mut q)?;
+            run.get(q..q.saturating_add(vlen as usize))?
+        };
+        Some((key, value, len))
+    }
+
+    /// The file's bytes from the i-th committed record to the last good
+    /// marker's end.
+    fn from_record(&self, i: usize) -> &[u8] {
+        let p = RunWalk::BASE + self.offs[i] as usize;
+        let map = self
+            .map
+            .as_ref()
+            .expect("a walk with a record keeps its mapping");
+        // SAFETY: the walk parsed a record at `p`, inside the mapping and
+        // below `end`. The bytes from the first record to `end` are
+        // written by nothing while the walk stands: a finish over the
+        // file appends past `end` and patches the superblock region and
+        // the section's header, which lie below the first record
+        // (`SegmentWriter::resume_run`).
+        unsafe { std::slice::from_raw_parts(map.as_ptr().add(p), self.end as usize - p) }
+    }
+
+    /// The i-th committed record's key: the record's first two bytes are
+    /// its length and it starts at the fifth (`flatindex::parse_record`).
+    fn key(&self, i: usize) -> &[u8] {
+        let rec = self.from_record(i);
+        let klen = u16::from_le_bytes([rec[0], rec[1]]) as usize;
+        &rec[4..4 + klen]
+    }
+
+    /// The i-th committed record's key and value.
+    fn record(&self, i: usize) -> (&[u8], &[u8]) {
+        let (k, v, _) = RunWalk::parse(self.from_record(i)).expect("a record the walk parsed");
+        (k, v)
+    }
+}
+
+impl KeySource for RunWalk {
+    fn len(&self) -> usize {
+        self.offs.len()
+    }
+
+    fn key_at(&self, i: usize) -> &[u8] {
+        self.key(i)
+    }
+
+    fn at(&self, i: usize) -> (&[u8], u32, u64) {
+        let key = self.key(i);
+        (key, self.offs[i], flatindex::key_hash(key))
+    }
+}
+
 pub struct SegmentWriter {
     out: AlignedWriter,
     /// File offset the next write lands at. Data starts after the header
@@ -9019,8 +9098,14 @@ impl SegmentWriter {
         // was never finished is a file no reader accepts rather than a
         // segment with some of its keys.
         out.write_all(&[0u8; crate::format::SUPER as usize])?;
+        Ok(SegmentWriter::over(out, opts))
+    }
+
+    /// The writer over `out`, which holds the file's zeroed head and
+    /// nothing else: before the first key.
+    fn over(out: AlignedWriter, opts: &SegmentOptions) -> SegmentWriter {
         let block_size = opts.block_size.max(1);
-        Ok(SegmentWriter {
+        SegmentWriter {
             out,
             pos: crate::format::SUPER,
             last_value: (0, 0),
@@ -9063,7 +9148,7 @@ impl SegmentWriter {
             rec_buf: Vec::new(),
             batch_buf: Vec::new(),
             pending_blocks: Vec::new(),
-        })
+        }
     }
 
     /// Spread the writer's syncs: fdatasync every `bytes` of blocks written
@@ -9335,19 +9420,61 @@ impl SegmentWriter {
     }
 
     /// The keys and values a direct segment's stream holds up to its last
-    /// commit marker, in order: what a crash left acknowledged. The stream
+    /// commit marker, in order: what a crash left acknowledged
+    /// (`walk_run`), each copied out.
+    pub fn recover_direct(path: &Path) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let run = SegmentWriter::walk_run(path)?;
+        Ok((0..run.len())
+            .map(|i| {
+                let (k, v) = run.record(i);
+                (k.to_vec(), v.to_vec())
+            })
+            .collect())
+    }
+
+    /// What a direct segment's stream holds up to its last commit marker:
+    /// where each record a crash left acknowledged starts, read through a
+    /// mapping of the file with nothing of a record copied. The stream
     /// starts after the superblock region and the section header, where
     /// `create` puts it with no head reserve; each key carries one inline
     /// extent, a fixed run of one value or a prefixed one. A record the
-    /// stream cannot parse ends the
-    /// walk, as does a marker whose CRC, length or count disagrees with
-    /// the records before it; what follows the last good marker is a
-    /// batch that never committed.
-    pub fn recover_direct(path: &Path) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let buf = std::fs::read(path)?;
-        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    /// stream cannot parse ends the walk, as does a marker whose CRC,
+    /// length or count disagrees with the records before it; what follows
+    /// the last good marker is a batch that never committed.
+    ///
+    /// The first shape of this read the file whole into a buffer and
+    /// copied every key and every value out of it into vectors of their
+    /// own, two allocations a record, for a caller that wrote each back
+    /// into a new file: a third of the instructions of the open of a
+    /// killed store of three hundred thousand keys.
+    pub(crate) fn walk_run(path: &Path) -> Result<RunWalk> {
+        let base = RunWalk::BASE;
+        let file = File::open(path)?;
+        if file.metadata()?.len() <= base as u64 {
+            return Ok(RunWalk {
+                map: None,
+                offs: Vec::new(),
+                end: base as u64,
+                payload: 0,
+            });
+        }
+        // A raw mapping, which lends no slice of itself: the file is
+        // written again under it by the finish that follows a walk
+        // (`resume_run`), past the last good marker and in its head, and
+        // the walk's readers take only the records between
+        // (`RunWalk::from_record`).
+        let map = memmap2::MmapOptions::new().map_raw_read_only(&file)?;
+        #[cfg(unix)]
+        let _ = map.advise(memmap2::Advice::Sequential);
+        // SAFETY: the mapping's own bytes, read-only, of a file this open
+        // holds the store's lock over; nothing writes the file during the
+        // walk, and the slice is dropped with this function.
+        let buf: &[u8] = unsafe { std::slice::from_raw_parts(map.as_ptr(), map.len()) };
+        let mut offs: Vec<u32> = Vec::new();
         let mut committed = 0usize;
-        let mut p = crate::format::SUPER as usize + flatindex::HEADER;
+        let mut end = base;
+        let (mut payload, mut committed_payload) = (0u64, 0u64);
+        let mut p = base;
         let mut batch = p;
         while p + 4 <= buf.len() {
             let klen = u16::from_le_bytes([buf[p], buf[p + 1]]);
@@ -9360,45 +9487,87 @@ impl SegmentWriter {
                 let len = u32::from_le_bytes(buf[p + 12..p + 16].try_into().expect("four"));
                 let count = u64::from_le_bytes(buf[p + 16..p + 24].try_into().expect("eight"));
                 if len as usize != p - batch
-                    || count as usize != out.len()
+                    || count as usize != offs.len()
                     || crc != crc32(&buf[batch..p])
                 {
                     break;
                 }
-                committed = out.len();
                 p += DIRECT_MARK_LEN;
+                committed = offs.len();
+                committed_payload = payload;
+                end = p;
                 batch = p;
                 continue;
             }
-            let Some((key, exts, tail, len)) = flatindex::parse_record(&buf, p) else {
+            let Some((key, value, len)) = RunWalk::parse(&buf[p..]) else {
                 break;
             };
-            let [e] = *exts else { break };
-            if !e.is_inline() || e.is_tombstone() {
+            let Ok(off) = u32::try_from(p - base) else {
                 break;
-            }
-            let run =
-                match tail.get(e.off as usize..(e.off as usize).saturating_add(e.len as usize)) {
-                    Some(r) => r,
-                    None => break,
-                };
-            let value = if e.count & Ext::FIXED != 0 {
-                run
-            } else {
-                let mut q = 0usize;
-                let Some(vlen) = get_uvarint(run, &mut q) else {
-                    break;
-                };
-                match run.get(q..q.saturating_add(vlen as usize)) {
-                    Some(v) => v,
-                    None => break,
-                }
             };
-            out.push((key.to_vec(), value.to_vec()));
+            offs.push(off);
+            payload += (key.len() + value.len()) as u64;
             p += len;
         }
-        out.truncate(committed);
-        Ok(out)
+        offs.truncate(committed);
+        Ok(RunWalk {
+            map: Some(map),
+            offs,
+            end: end as u64,
+            payload: committed_payload,
+        })
+    }
+
+    /// A writer over the file a run of ordered ingest left, standing
+    /// where the run's last commit left it: the file cut back to its last
+    /// good marker (`walk_run`) and the writer as one that was streamed
+    /// the records before it with its keys deferred, so that the finish a
+    /// clean close makes (`finish_unsynced_from`, the walk as the keys'
+    /// source) writes the index behind the records the file already
+    /// holds. `run_start` is the run's note, which the finish writes back
+    /// into the superblock page.
+    ///
+    /// An open used to write a recovered run's records into a new
+    /// segment and remove the file they came from: every record parsed,
+    /// encoded and written again, and an inode of the run's size freed,
+    /// which the device is told of -- two fifths of the instructions and
+    /// most of the device time of the open of a killed store of three
+    /// hundred thousand keys, for bytes the file already held in the
+    /// form a segment keeps them.
+    pub(crate) fn resume_run(
+        path: &Path,
+        opts: &SegmentOptions,
+        run: &RunWalk,
+        run_start: Option<(u64, bool)>,
+    ) -> Result<SegmentWriter> {
+        if run.is_empty() {
+            return Err(err("segment writer: a run with no record is not resumed"));
+        }
+        block::CHECKSUMS.store(opts.checksums, std::sync::atomic::Ordering::Relaxed);
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        // What stands past the last good marker is a batch nobody was
+        // told was durable, or the index an earlier finish wrote here
+        // before a crash took the open that made it.
+        if file.metadata()?.len() != run.end {
+            file.set_len(run.end)?;
+        }
+        file.seek(SeekFrom::Start(run.end))?;
+        // No helper thread and no row kept as the bytes land: the records
+        // were written by another process, so the finish reads the
+        // section back for its checksum row (`row_for`).
+        let mut out = AlignedWriter::new(file, opts.write_piece, opts.early_writeback, 0, false);
+        out.written = run.end;
+        let mut w = SegmentWriter::over(out, opts);
+        w.pos = run.end;
+        w.mode = Some(Layout::RecordsFirst);
+        w.recs_len = (run.end as usize) - RunWalk::BASE;
+        w.mark_start = w.recs_len;
+        w.marks = true;
+        w.deferred = Some(run.len());
+        w.last_key = run.key(run.len() - 1).to_vec();
+        w.payload = run.payload;
+        w.run_start = run_start;
+        Ok(w)
     }
 
     /// Store runs up to `bytes` long inline in the index record, and write
@@ -10453,6 +10622,23 @@ impl PieceWriter {
             crate::ordindex::Builder::new(),
             false,
             false,
+        ))
+    }
+
+    /// `SegmentWriter::resume_run`: the piece's writer over the file a
+    /// run left, its keys deferred to the walk that found them.
+    fn resume_run(
+        path: &Path,
+        opts: &SegmentOptions,
+        run: &RunWalk,
+        run_start: Option<(u64, bool)>,
+    ) -> Result<PieceWriter> {
+        let w = SegmentWriter::resume_run(path, opts, run, run_start)?;
+        Ok(PieceWriter(
+            Box::new(w),
+            crate::ordindex::Builder::new(),
+            false,
+            true,
         ))
     }
 
@@ -32471,6 +32657,9 @@ impl Db {
         direct_tmps.sort_unstable();
         let mut runs: std::collections::BTreeMap<u64, (u64, PathBuf, bool)> =
             std::collections::BTreeMap::new();
+        // The pieces this open makes of the runs it takes, each with what
+        // its finish composed (`finish_run`).
+        let mut run_facts: Vec<(String, (BlockedBloom, bool))> = Vec::new();
         for (id, tmp) in direct_tmps {
             let named = live.iter().any(|n| Db::name_id(n) == Some(id));
             match SegmentWriter::run_start_of(&tmp)? {
@@ -32480,9 +32669,20 @@ impl Db {
                 // never unlinked it.
                 None => {
                     if !named {
-                        let recs = SegmentWriter::recover_direct(&tmp)?;
-                        if !recs.is_empty() {
-                            Db::rebuild_run(dir, &opts, id, &recs, sealed, &mut live, &mut mseq)?;
+                        let run = SegmentWriter::walk_run(&tmp)?;
+                        if !run.is_empty() {
+                            Db::finish_run(
+                                dir,
+                                &opts,
+                                id,
+                                &tmp,
+                                &run,
+                                None,
+                                sealed,
+                                &mut live,
+                                &mut mseq,
+                                &mut run_facts,
+                            )?;
                         }
                     }
                     let _ = std::fs::remove_file(&tmp);
@@ -32500,8 +32700,7 @@ impl Db {
                 // Named above what the manifest covers: an open took the
                 // run and a crash came before it said so by the range.
                 Some((start, _)) if named => {
-                    let recs = SegmentWriter::recover_direct(&tmp)?;
-                    let end = start + recs.len() as u64;
+                    let end = start + SegmentWriter::walk_run(&tmp)?.len() as u64;
                     Db::write_cov(dir, start, end)?;
                     covs.push((start, end));
                     let _ = std::fs::remove_file(&tmp);
@@ -32536,7 +32735,16 @@ impl Db {
             {
                 let mut fill = |next: u64, upto: u64| {
                     Db::fill_runs(
-                        dir, &opts, sealed, next, upto, &mut runs, &mut covs, &mut live, &mut mseq,
+                        dir,
+                        &opts,
+                        sealed,
+                        next,
+                        upto,
+                        &mut runs,
+                        &mut covs,
+                        &mut live,
+                        &mut mseq,
+                        &mut run_facts,
                     )
                 };
                 for (i, &id) in chain.iter().enumerate() {
@@ -32625,14 +32833,30 @@ impl Db {
         let starts_random = opts.read_advice.starts_random();
         let mut segs = Vec::with_capacity(live.len());
         for name in &live {
-            segs.push(Seg::open(
-                dir,
-                name,
-                starts_random,
-                opts.read_advice != ReadAdvice::Normal,
-                opts.segment.checksums,
-                true,
-            )?);
+            let advise_ord = opts.read_advice != ReadAdvice::Normal;
+            let made = run_facts
+                .iter()
+                .position(|(n, _)| n == name)
+                .map(|i| run_facts.swap_remove(i).1);
+            segs.push(match made {
+                // A piece this open made of a run, a moment ago.
+                Some(fact) => Seg::open_landed(
+                    dir,
+                    name,
+                    starts_random,
+                    advise_ord,
+                    opts.segment.checksums,
+                    Some(fact),
+                )?,
+                None => Seg::open(
+                    dir,
+                    name,
+                    starts_random,
+                    advise_ord,
+                    opts.segment.checksums,
+                    true,
+                )?,
+            });
         }
         segs.sort_by(seg_order);
         // A store reopened under `Always` attaches the form files it finds
@@ -33226,19 +33450,28 @@ impl Db {
         Ok(())
     }
 
-    /// The records an open recovered from the run `id` written as a piece
-    /// and named live: over the last range, the whole range before the
-    /// first partitioning, at the sequence the manifest covers, which it
-    /// goes on covering -- the piece is synced, renamed and named in a
-    /// manifest of its own before this returns.
-    fn rebuild_run(
+    /// The run `id` an open recovered, made a piece where it lies and
+    /// named live: over the last range, the whole range before the first
+    /// partitioning, at the sequence the manifest covers, which it goes on
+    /// covering. The run's own file is finished as a clean close would
+    /// have finished it (`SegmentWriter::resume_run`), synced, and linked
+    /// under the piece's name, and the piece is named in a manifest of
+    /// its own before this returns. The temp name is the caller's to
+    /// remove, once the run's range is noted: until then an open that
+    /// finds it finds the run, at its last good marker as this one did,
+    /// whatever of the finish a crash left behind it.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_run(
         dir: &Path,
         opts: &Options,
         id: u64,
-        recs: &[(Vec<u8>, Vec<u8>)],
+        tmp: &Path,
+        run: &RunWalk,
+        run_start: Option<(u64, bool)>,
         sealed: u64,
         live: &mut Vec<String>,
         mseq: &mut u64,
+        facts: &mut Vec<(String, (BlockedBloom, bool))>,
     ) -> Result<()> {
         let last_lo: Option<Vec<u8>> = live
             .iter()
@@ -33254,21 +33487,26 @@ impl Db {
             Some(lo) => format!("pcs-{id:08}-{sealed:016}-{}-.sup", hex(lo)),
             None => Db::seg_name(id, sealed),
         };
-        let rebuilt = dir.join(format!("seal-{id:08}.tmp"));
-        let _ = std::fs::remove_file(&rebuilt);
-        let ord = {
-            let mut w =
-                PieceWriter::create(&rebuilt, &Db::segment_opts(opts), 0, opts.inline_bytes)?;
-            for (k, v) in recs {
-                w.begin(k)?;
-                w.value(v);
-                w.end_with(false)?;
-            }
-            w.finish()?
-        };
+        let w = PieceWriter::resume_run(tmp, &Db::segment_opts(opts), run, run_start)?;
+        let (seg, ord, fact) = w.finish_unsynced_from(run)?;
+        seg.sync_all()?;
+        drop(seg);
         write_ord(dir, &name, &ord, true)?;
-        std::fs::rename(&rebuilt, dir.join(&name))?;
+        // A link and not a rename: the temp name stays for the open after
+        // a crash here. Nothing stands under the piece's name -- one an
+        // earlier open linked and no manifest named was swept with the
+        // orphans before any run was taken, and a name the manifest has
+        // is a run this open does not finish -- so a file found there is
+        // refused and not replaced.
+        std::fs::hard_link(tmp, dir.join(&name))?;
         File::open(dir)?.sync_all()?;
+        // What the finish's pass over the keys composed, for this open's
+        // own open of the piece (`Seg::open_landed`): the walk held every
+        // record to its marker and the finish read the section back for
+        // its checksum row, so a second walk for the Bloom and a third
+        // read for the row would find what this process just made of the
+        // same bytes.
+        facts.push((name.clone(), fact));
         live.push(name);
         *mseq += 1;
         manifest_write_shape(dir, opts, *mseq, sealed, live)
@@ -33293,27 +33531,40 @@ impl Db {
         covs: &mut Vec<(u64, u64)>,
         live: &mut Vec<String>,
         mseq: &mut u64,
+        facts: &mut Vec<(String, (BlockedBloom, bool))>,
     ) -> Result<u64> {
         loop {
             if let Some(&(_, b)) = covs.iter().find(|&&(a, b)| a == next && b <= upto) {
                 next = b;
                 continue;
             }
-            let Some((id, tmp, _)) = runs.remove(&next) else {
+            let Some((id, tmp, chained)) = runs.remove(&next) else {
                 break;
             };
-            let recs = SegmentWriter::recover_direct(&tmp)?;
-            let end = next + recs.len() as u64;
+            let run = SegmentWriter::walk_run(&tmp)?;
+            let end = next + run.len() as u64;
             if end > upto {
                 return Err(err(
                     "a run of ordered ingest holds more records than the log leaves it numbers",
                 ));
             }
-            if recs.is_empty() {
+            if run.is_empty() {
                 let _ = std::fs::remove_file(&tmp);
                 break;
             }
-            Db::rebuild_run(dir, opts, id, &recs, sealed, live, mseq)?;
+            Db::finish_run(
+                dir,
+                opts,
+                id,
+                &tmp,
+                &run,
+                Some((next, chained)),
+                sealed,
+                live,
+                mseq,
+                facts,
+            )?;
+            drop(run);
             Db::write_cov(dir, next, end)?;
             covs.push((next, end));
             let _ = std::fs::remove_file(&tmp);
