@@ -35,11 +35,11 @@
 <path d="M135.0,199.6 L547.0,222.1 " fill="none" stroke="#8c8c8c" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="2,3"/>
 <path d="M135.0,147.0 L547.0,303.0 " fill="none" stroke="#1b1b1b" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
 <line x1="612.0" y1="222.1" x2="616.0" y2="211.1" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="215.1" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="215.1" font-size="11" fill="#8c8c8c">supdb (no compact form)</text>
 <line x1="612.0" y1="303.0" x2="616.0" y2="292.0" stroke="#1b1b1b" stroke-width="0.75"/>
 <text x="618.0" y="296.0" font-size="11" fill="#1b1b1b">supdb</text>
 <text x="618.0" y="309.0" font-size="11" fill="#2b6cb0">supdb (no block cache)</text>
-<text x="618.0" y="322.0" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="322.0" font-size="11" fill="#8c8c8c">supdb (256 MB cache, fitted)</text>
 <line x1="612.0" y1="316.5" x2="616.0" y2="331.0" stroke="#2b6cb0" stroke-width="0.75"/>
 <text x="618.0" y="335.0" font-size="11" fill="#2b6cb0">supdb (no advice)</text>
 <line x1="612.0" y1="337.3" x2="616.0" y2="344.0" stroke="#8c8c8c" stroke-width="0.75"/>

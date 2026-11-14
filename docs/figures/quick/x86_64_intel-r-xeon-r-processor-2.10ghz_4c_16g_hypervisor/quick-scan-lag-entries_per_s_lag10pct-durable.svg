@@ -41,7 +41,7 @@
 <path d="M98.3,156.6 L255.1,176.4 L426.9,152.1 L583.7,201.1 " fill="none" stroke="#2b6cb0" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="4,2"/>
 <path d="M98.3,124.5 L255.1,194.4 L426.9,161.7 L583.7,195.4 " fill="none" stroke="#8c8c8c" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="2,3"/>
 <path d="M98.3,116.9 L255.1,154.5 L426.9,158.8 L583.7,227.9 " fill="none" stroke="#1b1b1b" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-<text x="618.0" y="199.4" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="199.4" font-size="11" fill="#8c8c8c">supdb (no compact form)</text>
 <line x1="612.0" y1="201.1" x2="616.0" y2="208.4" stroke="#2b6cb0" stroke-width="0.75"/>
 <text x="618.0" y="212.4" font-size="11" fill="#2b6cb0">supdb (forms at ingest)</text>
 <line x1="612.0" y1="203.4" x2="616.0" y2="221.4" stroke="#2b6cb0" stroke-width="0.75"/>

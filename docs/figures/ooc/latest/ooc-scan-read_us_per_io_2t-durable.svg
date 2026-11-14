@@ -27,7 +27,7 @@
 <line x1="612.0" y1="211.3" x2="616.0" y2="217.3" stroke="#8c8c8c" stroke-width="0.75"/>
 <text x="618.0" y="221.3" font-size="11" fill="#8c8c8c">RocksDB</text>
 <line x1="612.0" y1="212.0" x2="616.0" y2="230.3" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="234.3" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="234.3" font-size="11" fill="#8c8c8c">supdb (no compact form)</text>
 <line x1="612.0" y1="214.8" x2="616.0" y2="243.3" stroke="#8c8c8c" stroke-width="0.75"/>
 <text x="618.0" y="247.3" font-size="11" fill="#8c8c8c">RocksDB (LZ4)</text>
 </svg>

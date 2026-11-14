@@ -47,7 +47,7 @@
 <line x1="612.0" y1="149.1" x2="616.0" y2="161.9" stroke="#2b6cb0" stroke-width="0.75"/>
 <text x="618.0" y="165.9" font-size="11" fill="#2b6cb0">supdb (no block cache)</text>
 <line x1="612.0" y1="159.1" x2="616.0" y2="174.9" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="178.9" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="178.9" font-size="11" fill="#8c8c8c">supdb (no compact form)</text>
 <line x1="612.0" y1="164.7" x2="616.0" y2="187.9" stroke="#2b6cb0" stroke-width="0.75"/>
 <text x="618.0" y="191.9" font-size="11" fill="#2b6cb0">supdb (a snapshot per handle)</text>
 <line x1="612.0" y1="171.6" x2="616.0" y2="200.9" stroke="#2b6cb0" stroke-width="0.75"/>

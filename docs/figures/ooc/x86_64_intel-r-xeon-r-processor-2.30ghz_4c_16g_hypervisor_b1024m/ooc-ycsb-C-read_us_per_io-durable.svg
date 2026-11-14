@@ -26,5 +26,5 @@
 <line x1="612.0" y1="226.4" x2="616.0" y2="232.7" stroke="#8c8c8c" stroke-width="0.75"/>
 <text x="618.0" y="236.7" font-size="11" fill="#8c8c8c">LMDB (no readahead)</text>
 <line x1="612.0" y1="237.7" x2="616.0" y2="245.7" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="249.7" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="249.7" font-size="11" fill="#8c8c8c">supdb (no compact form)</text>
 </svg>

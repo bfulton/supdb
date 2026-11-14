@@ -34,7 +34,7 @@
 <line x1="612.0" y1="187.5" x2="616.0" y2="172.7" stroke="#1b1b1b" stroke-width="0.75"/>
 <text x="618.0" y="176.7" font-size="11" fill="#1b1b1b">supdb</text>
 <line x1="612.0" y1="192.7" x2="616.0" y2="185.7" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="189.7" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="189.7" font-size="11" fill="#8c8c8c">supdb (256 MB cache, fitted)</text>
 <line x1="612.0" y1="205.7" x2="616.0" y2="198.7" stroke="#2b6cb0" stroke-width="0.75"/>
 <text x="618.0" y="202.7" font-size="11" fill="#2b6cb0">supdb (no advice)</text>
 <line x1="612.0" y1="337.1" x2="616.0" y2="322.3" stroke="#8c8c8c" stroke-width="0.75"/>
@@ -43,5 +43,5 @@
 <text x="618.0" y="348.0" font-size="11" fill="#8c8c8c">RocksDB (LZ4)</text>
 <text x="618.0" y="361.0" font-size="11" fill="#8c8c8c">RocksDB</text>
 <line x1="612.0" y1="360.6" x2="616.0" y2="370.0" stroke="#8c8c8c" stroke-width="0.75"/>
-<text x="618.0" y="374.0" font-size="11" fill="#8c8c8c">?</text>
+<text x="618.0" y="374.0" font-size="11" fill="#8c8c8c">supdb (no compact form)</text>
 </svg>

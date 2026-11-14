@@ -37,10 +37,18 @@ jobs:
     # second kernel's mmap. A path only one arm exercises is a path nothing
     # tests. macos-latest is arm64, and a public repository pays nothing
     # for it.
+    #
+    # The Linux runners are named by their image and not as `ubuntu-latest`:
+    # that label moved to Ubuntu 26.04 between two runs of one afternoon,
+    # where `bench/scripts/libclang.sh` finds no libclang after installing
+    # it and `qemu-user-static` is no longer a package, and three jobs
+    # failed in their set-up on a tree that had not changed. The image is
+    # this workflow's to choose, as the ARM leg's already was; moving to a
+    # newer one is a change made here, with the scripts it needs.
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-latest]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -71,7 +79,7 @@ jobs:
     # three rows it can only prove the runner, the gate and the renderer
     # work end to end. The row and the figures are published as artifacts;
     # committing a row is a person's decision.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -93,7 +101,7 @@ jobs:
 
   cross-arm:
     # Proves the ARM paths build and pass before any ARM hardware is involved.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -123,7 +131,7 @@ jobs:
     # `extern` block for the host imports stopped linking ("undefined
     # symbol: supdb_host_read") and no CI run noticed, because no CI run had
     # ever built it.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

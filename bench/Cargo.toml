@@ -8,6 +8,8 @@
 name = "supdb-bench"
 version = "0.2.0"
 edition = "2021"
+# The engine's floor (`../Cargo.toml`).
+rust-version = "1.95"
 build = "build.rs"
 
 [lib]
