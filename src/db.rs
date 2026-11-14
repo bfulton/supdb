@@ -2800,6 +2800,35 @@ pub struct Options {
     /// 0.85x at three hundred thousand: no direction held at both rungs.
     /// `supdb-prefetch1k` and `supdb-ingestprefetch1k` ask for a kilobyte.
     pub scan_prefetch_bytes: usize,
+    /// EXPERIMENT, refuted: a scan's seek, at the moment the ordered
+    /// index's top level names the stride its answer lies in, asks for the
+    /// form headers of the two blocks that stride spans in the handle's
+    /// table: the first block's form is the scan's next dependent load
+    /// after the seek, a cold line on the scrambled E's spread starts, and
+    /// the second the one the next block's prefetch reads its buffers
+    /// through. With `scan_prefetch_sparse_span` and `scan_runs_held` it
+    /// read the scrambled E 1.00x in six pairs at a hundred thousand keys
+    /// (`supdb-scanlevers`): the scan's stalls there are the lines the
+    /// walk needs, which it executes 5% fewer instructions over than LMDB
+    /// does. `supdb-formahead` is the arm.
+    pub scan_form_ahead: bool,
+    /// EXPERIMENT, refuted with `scan_form_ahead`: a sparse form's buffers
+    /// asked for ahead of its walk only over the part the walk's ranks
+    /// reach, by proportion of the block's sixty-four ranks with two
+    /// entries of margin, where the whole form was asked for: a scan of
+    /// fifty takes about a third of the block after its first. The entries
+    /// and keys a walk's first block searches are asked for whole.
+    /// `supdb-sparsespan` is the arm.
+    pub scan_prefetch_sparse_span: bool,
+    /// EXPERIMENT, refuted with `scan_form_ahead`: a partition walk's runs
+    /// over the raw records through one walker, the record regions resolved
+    /// once for the partition's walk (`Blob::run_walk`), where each run
+    /// resolved the flat index, its regions and the form file's gate again:
+    /// a sparse walk is six runs a scan on the scrambled E, about 190
+    /// instructions of setup each. Not where the raw records are asked for
+    /// ahead (`Options::scan_raw_ahead`), which keeps its own path.
+    /// `supdb-runsheld` is the arm.
+    pub scan_runs_held: bool,
     /// A scan's seek asks for the partition's directory words of the
     /// stride window its answer lies in at the moment it asks for the
     /// stride's heads, and the record hint after it estimates its span
@@ -4696,6 +4725,67 @@ pub struct Options {
     /// economics from one rebuilt on a read: `CACHE_DENSE` was measured
     /// against the rebuilding cache.
     pub form_dense_from: usize,
+    /// The deltas a sparse form the patches grew must hold before a fill
+    /// converts it to a merged copy; zero is `CACHE_DENSE`. A copy is walked
+    /// as one buffer, where a sparse form alternates the partition's
+    /// records with its deltas, and the scrambled E walks the write mixes'
+    /// light forms, a few deltas over every block: at the dense count the
+    /// buffered arm's walks there were 3,443 copies to 23,638 sparse forms
+    /// at a hundred thousand keys, at four 26,839 to 242. A light form,
+    /// under `CACHE_DENSE`, converts on the upkeep thread alone, off a
+    /// burst's pass (`Reader::burst_pass`) and while the store is in core:
+    /// the writer's inline fill of a burst's first batch converted every
+    /// light form the burst had made, the upkeep thread's pass over a
+    /// burst's batches 1,146 of them in eight milliseconds of a
+    /// ten-percent burst the pace held the writer to (0.56x), and out of
+    /// core a copy's memory is the page cache's. The scrambled E read
+    /// 1.07-1.45x at thirty thousand keys over three sittings, 1.20x at a
+    /// hundred thousand and 1.10x at three hundred thousand on the
+    /// buffered arm, 1.11x and 1.03-1.09x at a hundred and three hundred
+    /// thousand on the durable one (`pair.sh supdb-ingest supdb-ingestconvert16
+    /// 100000 --reps 20`). The conversions it makes run in the write mixes
+    /// before the scrambled E, which itself fills nothing, its commits each
+    /// filed inline after a scan; converted on the scan's own path at a
+    /// count of entries read (`forms_convert_at_walk`) the scrambled E read
+    /// 0.85x, as the promotion did (`promote_entries`). `supdb-convert16`
+    /// and `supdb-ingestconvert16` keep the dense count.
+    pub forms_convert_from: usize,
+    /// EXPERIMENT: entries the walks must have taken from a light sparse
+    /// form, one under `CACHE_DENSE` deltas and at least
+    /// `forms_convert_from`, since its last write halved the count, before
+    /// a fill converts it, so that a light form is converted where the
+    /// scans ask for it. The scans that ask are the scrambled E's, which
+    /// leave a fill no window -- its commits are filed inline after a scan,
+    /// and the upkeep thread is taken back by the next scan -- so at 128
+    /// the copies walked there were 1,513-1,562 of 8,199 walks at thirty
+    /// thousand keys against the default's 1,303. Zero, the default,
+    /// converts by the deltas alone.
+    pub forms_convert_reads: u32,
+    /// EXPERIMENT, refuted: the light form whose reads cross
+    /// `forms_convert_reads` converted by the walk that took them across,
+    /// on the reading thread, where the scans that ask for it leave a fill
+    /// no window. It converted -- 6,312 copies walked of 8,199 at thirty
+    /// thousand keys -- and the conversions on the scan's path cost more
+    /// than the walks they shortened: the scrambled E read 0.85x and E
+    /// 0.90x in twenty pairs at a hundred thousand keys, as the promotion
+    /// did (`promote_entries`). Off, the walk marks the tables for the next
+    /// fill.
+    pub forms_convert_at_walk: bool,
+    /// EXPERIMENT, refuted: light conversions (`forms_convert_from` under
+    /// `CACHE_DENSE`) on the writer's fills as well as the upkeep thread's.
+    /// A burst's first batch, filed inline, converted every light form the
+    /// burst had made: the ten-percent burst at thirty thousand keys read
+    /// 0.61x, two milliseconds of its five in conversions on the writer.
+    pub forms_convert_light_writer: bool,
+    /// EXPERIMENT, refuted: a light conversion on the upkeep thread yields
+    /// to any commit posted and to the writer's wait, where a dense one
+    /// yields to a posted commit only past `forms_convert_behind`. The
+    /// write mixes post a commit every few hundred operations, and the
+    /// conversions the scrambled E gains by are theirs, so it made almost
+    /// none: the scrambled E read 1.01x in twenty pairs at a hundred
+    /// thousand keys. The burst passes are skipped by `Reader::burst_pass`
+    /// either way.
+    pub forms_convert_light_yields: bool,
     /// How the ordered scan builds its sorted snapshot of the unsealed keys.
     /// `true` keeps the keys in one arena and sorts 24-byte records (a
     /// 16-byte key prefix and an index), touching the arena only on a shared
@@ -5659,6 +5749,14 @@ impl Default for Options {
             scan_run_builds: true,
             scan_prefetch: true,
             scan_prefetch_bytes: 4096,
+            scan_form_ahead: false,
+            forms_convert_from: 4,
+            forms_convert_reads: 0,
+            forms_convert_at_walk: false,
+            forms_convert_light_writer: false,
+            forms_convert_light_yields: false,
+            scan_prefetch_sparse_span: false,
+            scan_runs_held: false,
             seek_prefetch_dir: true,
             scan_cache_ahead_min_blocks: 1024,
             ahead_out_of_core: true,
@@ -16117,6 +16215,7 @@ fn prefetch_block(
     cap: usize,
     estimate: bool,
     whole: bool,
+    sparse_span: bool,
 ) {
     // The partition's records are asked for only where the walk will read
     // them raw: under the form file the walk's pages are the form's, which
@@ -16139,7 +16238,11 @@ fn prefetch_block(
             _ => blk.prefetch(whole),
         },
         Cached::Sparse(sb) => {
-            sb.prefetch();
+            if sparse_span {
+                sb.prefetch_span(from % CACHE_BLOCK, n);
+            } else {
+                sb.prefetch();
+            }
             ranks();
         }
         Cached::Clean => ranks(),
@@ -16320,6 +16423,39 @@ impl SparseBlock {
         );
         prefetch_lines(self.keys.as_ptr(), self.keys.len());
         prefetch_lines(self.vals.as_ptr(), self.vals.len().min(1024));
+    }
+    /// `prefetch` over the part a walk of `n` ranks from rank `off` of the
+    /// block reads (`Options::scan_prefetch_sparse_span`): the deltas are
+    /// taken as spread evenly over the block's ranks, which the entries
+    /// cannot be asked where they are without being read, so the span is
+    /// their share of the walk's ranks with two entries' margin each side,
+    /// and the keys and values the same share of their buffers. A walk
+    /// from inside the block searches its entries by key first, so there
+    /// the entries and keys are asked for whole; a walk from the block's
+    /// start reads them in order from the first.
+    fn prefetch_span(&self, off: usize, n: usize) {
+        let len = self.ents.len();
+        if len == 0 {
+            return;
+        }
+        let a = off.min(CACHE_BLOCK);
+        let z = off.saturating_add(n).min(CACHE_BLOCK);
+        let i0 = (len * a / CACHE_BLOCK).saturating_sub(2);
+        let i1 = ((len * z).div_ceil(CACHE_BLOCK) + 2).min(len);
+        let ent = std::mem::size_of::<DeltaEnt>();
+        let share = |bytes: usize, i: usize| bytes * i / len;
+        if off > 0 {
+            prefetch_lines(self.ents.as_ptr() as *const u8, len * ent);
+            prefetch_lines(self.keys.as_ptr(), self.keys.len());
+        } else {
+            prefetch_lines(self.ents.as_ptr() as *const u8, i1 * ent);
+            prefetch_lines(self.keys.as_ptr(), share(self.keys.len(), i1));
+        }
+        if i0 < i1 {
+            let (v0, v1) = (share(self.vals.len(), i0), share(self.vals.len(), i1));
+            // SAFETY: `v0 <= v1 <= vals.len()`, so the span lies in the buffer.
+            prefetch_lines(unsafe { self.vals.as_ptr().add(v0) }, (v1 - v0).min(1024));
+        }
     }
     fn key(&self, e: &DeltaEnt) -> &[u8] {
         &self.keys[e.key.0 as usize..(e.key.0 + e.key.1) as usize]
@@ -18797,6 +18933,39 @@ mod settle_room_tests {
 /// (`Reader::prune_settle_built`), for a store of a few blocks.
 const SETTLE_BUILT_LIST: usize = 64;
 
+/// A handle's counts of one kind, a cell a count. As one cell of an array
+/// each bump read the array, wrote one word of it on the stack and copied
+/// the array back, and the copy's sixteen-byte load spans the eight-byte
+/// store the bump just made, which the core does not forward: a stall a
+/// bump, on every scan, and a profile of the scrambled E put it on the copy
+/// (`walk_kinds`, `choices`). A bump here is one load and one store of its
+/// own word.
+struct Counts<const N: usize>([std::cell::Cell<u64>; N]);
+
+impl<const N: usize> Counts<N> {
+    fn new() -> Counts<N> {
+        Counts(std::array::from_fn(|_| std::cell::Cell::new(0)))
+    }
+    fn get(&self) -> [u64; N] {
+        std::array::from_fn(|i| self.0[i].get())
+    }
+    fn set(&self, v: [u64; N]) {
+        for (c, v) in self.0.iter().zip(v) {
+            c.set(v);
+        }
+    }
+    #[inline]
+    fn add(&self, i: usize, d: u64) {
+        let c = &self.0[i];
+        c.set(c.get() + d);
+    }
+    #[inline]
+    fn sub_sat(&self, i: usize, d: u64) {
+        let c = &self.0[i];
+        c.set(c.get().saturating_sub(d));
+    }
+}
+
 struct FormsState {
     /// PROTOTYPE: the block cache's table for each segment, by position
     /// in `segs`, made on first use and dropped whenever the segments
@@ -18916,14 +19085,14 @@ struct FormsState {
     /// EXPERIMENT: what the reads chose, for a run to report:
     /// promotions, drops by a write, walks over a copy, walks over the
     /// cheap form, and the copies' bytes.
-    choices: std::cell::Cell<[u64; 5]>,
+    choices: Counts<5>,
     /// The forms the writer's block walks met: copies, sparse forms,
     /// anything else -- what a pass after a burst is walking.
-    walk_kinds: std::cell::Cell<[u64; 3]>,
+    walk_kinds: Counts<3>,
     /// The blocks this handle built, by the form's kind -- copy, sparse,
     /// wide, clean -- the covered blocks it copied on their second touch,
     /// and the blocks the budget shed (`Db::build_kinds`).
-    built_kinds: std::cell::Cell<[u64; 4]>,
+    built_kinds: Counts<4>,
     recopies: std::cell::Cell<u64>,
     sheds: std::cell::Cell<u64>,
     /// Seeks whose stride window's directory lines were asked for ahead
@@ -18932,13 +19101,13 @@ struct FormsState {
     dir_prefetches: std::cell::Cell<u64>,
     /// Scans that started a copy walk at the seek's rank, and that
     /// searched the copy (`Options::copy_start_at_rank`).
-    copy_starts: std::cell::Cell<[u64; 2]>,
+    copy_starts: Counts<2>,
     /// Scans whose start seek seeded the partition's reader with its cursor
     /// (`Options::zpages_seek_seeds`).
     seek_seeds: std::cell::Cell<u64>,
     /// Scans that started in a block scans keep starting in, and scans
     /// that started on a copy with no seek (`Options::promote_starts`).
-    hot_starts: std::cell::Cell<[u64; 2]>,
+    hot_starts: Counts<2>,
     /// Copy walks that paced the next block's prefetch through themselves
     /// (`Options::scan_prefetch_paced`).
     prefetch_paces: std::cell::Cell<u64>,
@@ -18951,7 +19120,7 @@ struct FormsState {
     /// build resolved by a seek (`Options::zpages_settle_span`); a build
     /// under `Options::zpages_block_cursor` resolves them where its walk
     /// stops and counts none.
-    lazy_cuts: std::cell::Cell<[u64; 2]>,
+    lazy_cuts: Counts<2>,
     /// The settle's resolves whose stride was planned ahead
     /// (`Options::settle_seek_ahead`).
     seeks_planned: std::cell::Cell<u64>,
@@ -18965,7 +19134,7 @@ struct FormsState {
     /// Keys whose block form's header a settle asked for ahead
     /// (`Options::settle_form_ahead`), and keys whose lines of the block
     /// table it asked for ahead (`Options::settle_table_ahead`).
-    settle_ahead: std::cell::Cell<[u64; 2]>,
+    settle_ahead: Counts<2>,
     /// For a pass on the upkeep thread: the most writes it reads from the
     /// live log, and the most it settles from the frozen tables' carried
     /// lists, and whether it stopped short of either, for the thread to
@@ -18986,16 +19155,16 @@ struct FormsState {
     /// What the lazy snapshot did, for a measurement and for the test
     /// that must know the path was taken: scans that finished without a
     /// snapshot, and scans that stopped to build one and went on.
-    lazy_scans: std::cell::Cell<[u64; 2]>,
+    lazy_scans: Counts<2>,
     /// EXPERIMENT: what the settles met, for a measurement of the
     /// backlog's density: settles, keys, blocks those keys fall in, and
     /// blocks at or past `Options::forms_settle_rebuild_from`.
-    settle_density: std::cell::Cell<[u64; 4]>,
+    settle_density: Counts<4>,
     /// The commits whose maintenance filed nothing, by the clause of
     /// `settle_due` that said so: the forms given up, the store far from
     /// its scans, every commit's filing wanted and no room to build what
     /// it files into (`SettleRoom`), and nothing due under the rules left.
-    settle_refused: std::cell::Cell<[u64; 4]>,
+    settle_refused: Counts<4>,
     /// The blocks the last settle filed a write into that held no form
     /// (`Options::forms_settle_builds`): built by the commit's fill after
     /// the snapshot has moved.
@@ -19111,30 +19280,30 @@ impl FormsState {
             writes_seen: std::cell::Cell::new(0),
             writes_at_scan: std::cell::Cell::new(0),
             log_counted: std::cell::Cell::new((0, 0)),
-            choices: std::cell::Cell::new([0; 5]),
-            walk_kinds: std::cell::Cell::new([0; 3]),
-            built_kinds: std::cell::Cell::new([0; 4]),
+            choices: Counts::new(),
+            walk_kinds: Counts::new(),
+            built_kinds: Counts::new(),
             recopies: std::cell::Cell::new(0),
             sheds: std::cell::Cell::new(0),
             dir_prefetches: std::cell::Cell::new(0),
-            copy_starts: std::cell::Cell::new([0; 2]),
+            copy_starts: Counts::new(),
             seek_seeds: std::cell::Cell::new(0),
-            hot_starts: std::cell::Cell::new([0; 2]),
+            hot_starts: Counts::new(),
             prefetch_paces: std::cell::Cell::new(0),
             span_starts: std::cell::Cell::new(0),
             start_cache: std::cell::RefCell::new(StartCache::new()),
-            lazy_cuts: std::cell::Cell::new([0; 2]),
+            lazy_cuts: Counts::new(),
             seeks_planned: std::cell::Cell::new(0),
             heads_looks: std::cell::RefCell::new(Vec::new()),
             patch_asks: std::cell::Cell::new(0),
-            settle_ahead: std::cell::Cell::new([0; 2]),
+            settle_ahead: Counts::new(),
             read_cap: std::cell::Cell::new(0),
             pass_lent: std::cell::Cell::new(0),
             pass_batch: std::cell::Cell::new(0),
             log_short: std::cell::Cell::new(false),
-            lazy_scans: std::cell::Cell::new([0; 2]),
-            settle_density: std::cell::Cell::new([0; 4]),
-            settle_refused: std::cell::Cell::new([0; 4]),
+            lazy_scans: Counts::new(),
+            settle_density: Counts::new(),
+            settle_refused: Counts::new(),
             settle_blocks: std::cell::RefCell::new(Vec::new()),
             settle_built: std::cell::Cell::new(0),
             settle_room: std::cell::Cell::new(SettleRoom {
@@ -23004,6 +23173,7 @@ impl Reader {
         seg: &'a Seg,
         cursor: &[u8],
         on: bool,
+        ahead: Option<usize>,
     ) -> (usize, bool, Option<zfile::ZCursor<'a>>) {
         if self.opts.zpages_seek_seeds && self.opts.zpages_scan_cursor && on {
             if let Some(z) = self.zc(seg) {
@@ -23016,11 +23186,16 @@ impl Reader {
                 }
             }
         }
-        let (rank, same) = self.scan_seek(seg, cursor);
+        let (rank, same) = self.scan_seek(seg, cursor, ahead);
         (rank, same, None)
     }
 
-    fn scan_seek(&self, seg: &Seg, cursor: &[u8]) -> (usize, bool) {
+    /// The rank of the first of `seg`'s keys not below `cursor`, and
+    /// whether it is `cursor`; with `ahead` the partition's index in the
+    /// handle's tables, whose forms for the stride the seek's answer lies
+    /// in are asked for once the top level names it
+    /// (`Options::scan_form_ahead`).
+    fn scan_seek(&self, seg: &Seg, cursor: &[u8], ahead: Option<usize>) -> (usize, bool) {
         if self.zc(seg).is_some() {
             return self.cache_seek_exact(seg, cursor, 0);
         }
@@ -23034,10 +23209,28 @@ impl Reader {
                     let fs = self.fs();
                     fs.dir_prefetches.set(fs.dir_prefetches.get() + 1);
                 }
+                if let Some(pi) = ahead {
+                    self.prefetch_form_heads(pi, lo / CACHE_BLOCK);
+                }
             },
         );
         let same = rank < keys && exact.unwrap_or_else(|| seg.raw().key_at(rank) == Some(cursor));
         (rank, same)
+    }
+
+    /// The form headers of blocks `b` and `b + 1` of partition `pi`'s table
+    /// asked for (`Options::scan_form_ahead`): what the walk after a seek
+    /// reads first of each, the enum in the slot's allocation. Nothing where
+    /// the table is missing or held, as it is at a seek a walk defers.
+    fn prefetch_form_heads(&self, pi: usize, b: usize) {
+        let tables = self.fs().tables.borrow();
+        let Some(cell) = tables.get(pi) else { return };
+        let Ok(held) = cell.try_borrow() else { return };
+        let Some(t) = held.as_ref() else { return };
+        let end = (b + 2).min(t.slots.len());
+        for arc in t.slots.get(b..end).into_iter().flatten().flatten() {
+            prefetch_lines(std::sync::Arc::as_ptr(arc) as *const u8, 128);
+        }
     }
 
     /// The block whose key range holds `key`, and the key's cut as the
@@ -23827,11 +24020,9 @@ impl Reader {
             .is_none_or(|(g, _)| *g != gen);
         let unsealed_any = !self.mem().is_empty() || !self.frozen().is_empty();
         if use_cache && absent && unsealed_any && self.opts.scan_lazy_snapshot {
-            let mut counts = self.fs().lazy_scans.get();
             let (seen, from) = match self.scan_blocks(from, limit, None, false, &mut f)? {
                 Walk::Done(n) => {
-                    counts[0] += 1;
-                    self.fs().lazy_scans.set(counts);
+                    self.fs().lazy_scans.add(0, 1);
                     self.zcensus_scanned(n);
                     return Ok(n);
                 }
@@ -23840,8 +24031,7 @@ impl Reader {
                     std::mem::take(&mut *self.fs().resume_key.borrow_mut()),
                 ),
             };
-            counts[1] += 1;
-            self.fs().lazy_scans.set(counts);
+            self.fs().lazy_scans.add(1, 1);
             self.refresh_snapshot(gen, use_cache, true);
             let cache = self.fs().scan_keys.borrow();
             let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
@@ -24662,9 +24852,7 @@ impl Reader {
         self.fs().cache_bytes.set(cache_bytes);
         self.fs().dirty_any.set(dirty_any || any);
         self.fs().tables_complete.set(complete);
-        let mut c = self.fs().choices.get();
-        c[4] = c[4].saturating_sub(dense_bytes);
-        self.fs().choices.set(c);
+        self.fs().choices.sub_sat(4, dense_bytes);
         // The log position stands: the live table is the one it is of.
         self.fs().log_gen.set(st.gen);
         self.fs().scans_seen.set(0);
@@ -25635,9 +25823,7 @@ impl Reader {
             Cached::Wide(_) => 2,
             Cached::Clean => 3,
         };
-        let mut k = self.fs().built_kinds.get();
-        k[i] += 1;
-        self.fs().built_kinds.set(k);
+        self.fs().built_kinds.add(i, 1);
     }
 
     /// One block materialised, charged to whoever built it.
@@ -25981,6 +26167,31 @@ impl Reader {
         k.clear();
         k.extend_from_slice(key);
         Walk::Resume { seen }
+    }
+
+    /// The deltas from which a fill converts a sparse form to a copy
+    /// (`Options::forms_convert_from`): a line under `CACHE_DENSE` on the
+    /// upkeep thread alone, whose conversions yield to the writer, since
+    /// the writer's inline fill of a burst's first batch converted every
+    /// light form the burst had made, two milliseconds of a ten-percent
+    /// burst of five at thirty thousand keys, for walks the pass after it
+    /// would have taken either way.
+    /// Under `Options::forms_convert_reads` the line holds on either thread,
+    /// since a light form converts there only once the walks have read it
+    /// and a burst's writes have halved its count.
+    #[inline]
+    fn convert_from(&self) -> usize {
+        match self.opts.forms_convert_from {
+            0 => CACHE_DENSE,
+            n if n >= CACHE_DENSE
+                || self.understudy
+                || self.opts.forms_convert_light_writer
+                || self.opts.forms_convert_reads > 0 =>
+            {
+                n
+            }
+            _ => CACHE_DENSE,
+        }
     }
 
     /// PROTOTYPE: the build context over this store's own state.
@@ -26540,9 +26751,7 @@ impl Reader {
     /// not the hand-over's of the same commit.
     fn settle_refuse(&self, consume: bool, why: usize) {
         if consume {
-            let mut c = self.fs().settle_refused.get();
-            c[why] += 1;
-            self.fs().settle_refused.set(c);
+            self.fs().settle_refused.add(why, 1);
         }
     }
 
@@ -27043,7 +27252,11 @@ impl Reader {
                 let dense = self.fs().convert_dense.get()
                     && matches!(
                         table.slots[b].as_deref(),
-                        Some(Cached::Sparse(sb)) if sb.ents.len() >= CACHE_DENSE
+                        Some(Cached::Sparse(sb)) if sb.ents.len() >= self.convert_from()
+                            && (sb.ents.len() >= CACHE_DENSE
+                                || (table.reads[b] >= self.opts.forms_convert_reads
+                                    && !self.burst_pass()
+                                    && self.shared.zgate.load() == zselect::GATE_RAW))
                     );
                 if dense {
                     let cap = self.opts.forms_convert_cap;
@@ -27051,10 +27264,21 @@ impl Reader {
                     // only once the thread is behind it by more than the
                     // allowance (`Options::forms_convert_behind`).
                     let state = self.shared.upkeep.state.load(AtomicOrdering::Acquire);
-                    let yielding = self.opts.forms_convert_yield
-                        && self.understudy
-                        && (state & LEND_WANT != 0
-                            || (state & LEND_POSTED != 0 && self.convert_behind()));
+                    // A light form, one converted under `CACHE_DENSE`
+                    // (`Options::forms_convert_from`), yields to any commit
+                    // posted: its copy repays only through walks, and the
+                    // burst the post belongs to is paced by this thread.
+                    let light = matches!(
+                        table.slots[b].as_deref(),
+                        Some(Cached::Sparse(sb)) if sb.ents.len() < CACHE_DENSE
+                    );
+                    let yielding = (light
+                        && self.opts.forms_convert_light_yields
+                        && state & (LEND_WANT | LEND_POSTED) != 0)
+                        || (self.opts.forms_convert_yield
+                            && self.understudy
+                            && (state & LEND_WANT != 0
+                                || (state & LEND_POSTED != 0 && self.convert_behind())));
                     if (cap > 0 && converted >= cap) || yielding {
                         continue;
                     }
@@ -27139,6 +27363,60 @@ impl Reader {
             }
         }
         Ok(true)
+    }
+
+    /// Block `b`'s light sparse form converted to a merged copy by the walk
+    /// that took its reads past `Options::forms_convert_reads`
+    /// (`Options::forms_convert_at_walk`): from the form itself, as the
+    /// fill's conversion makes it, and booked as the fill books it.
+    fn convert_walked(
+        &self,
+        ctx: &BuildCtx<'_>,
+        src: Sources,
+        table: &mut BlockTable,
+        pi: usize,
+        b: usize,
+        unsealed: Option<&Snapshot>,
+    ) -> Result<()> {
+        let Some(form) = table.slots[b].clone() else {
+            return Ok(());
+        };
+        let Cached::Sparse(sb) = &*form else {
+            return Ok(());
+        };
+        let lo = b * CACHE_BLOCK;
+        let hi = ((b + 1) * CACHE_BLOCK).min(src.seg.blob.keys());
+        self.unlist(pi, b, table);
+        let copied = ctx.copy_from_deltas(src, lo..hi, sb)?;
+        #[cfg(debug_assertions)]
+        if let Some(unsealed) = unsealed {
+            let again = ctx.copy_of_sources(src, table, b, unsealed)?;
+            debug_assert!(
+                copied.agrees(&again)
+                    || (self.opts.rebase_recuts_sparse && copied.emits_as(&again)),
+                "a walk's copy from the form disagrees with the build from the sources: block {b}, {}",
+                copied.disagreement(&again)
+            );
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = unsealed;
+        self.shared.forms_events[12].fetch_add(1, AtomicOrdering::Relaxed);
+        let built = std::sync::Arc::new(Cached::Block(copied));
+        self.count_built_kind(&built);
+        let bytes = self.fbytes(&built);
+        table.slots[b] = Some(built);
+        self.list_built_bytes(pi, b, table, bytes);
+        Ok(())
+    }
+
+    /// Whether this is the upkeep thread's pass over a burst's batch, as
+    /// `settle_due` tells one from a mix's: a light conversion waits for a
+    /// pass that is not, since the burst's pace holds the writer to the
+    /// thread and the copies repay only through the walks after it. A
+    /// ten-percent burst at a hundred thousand keys converted 1,146 light
+    /// forms in eight milliseconds and read 0.56x.
+    fn burst_pass(&self) -> bool {
+        self.understudy && self.fs().pass_batch.get() >= UPKEEP_WAKE_WRITES as u64
     }
 
     /// Whether the upkeep thread is behind the writer by more than the
@@ -27752,9 +28030,7 @@ impl Reader {
         }
         if lazy_n > 0 {
             let fs = self.fs();
-            let mut c = fs.lazy_cuts.get();
-            c[0] += lazy_n;
-            fs.lazy_cuts.set(c);
+            fs.lazy_cuts.add(0, lazy_n);
         }
         if planned > 0 {
             let fs = self.fs();
@@ -27969,10 +28245,8 @@ impl Reader {
                             .get()
                             .saturating_sub(self.fbytes(&old)),
                     );
-                    let mut c = self.fs().choices.get();
-                    c[1] += 1;
-                    c[4] = c[4].saturating_sub(self.fbytes(&old) as u64);
-                    self.fs().choices.set(c);
+                    self.fs().choices.add(1, 1);
+                    self.fs().choices.sub_sat(4, self.fbytes(&old) as u64);
                 }
                 table.reads[b] /= 2;
                 // A write into a block the writer holds no form for
@@ -28038,10 +28312,8 @@ impl Reader {
         }
         if ahead_asks != [0; 2] {
             let fs = self.fs();
-            let mut c = fs.settle_ahead.get();
-            c[0] += ahead_asks[0];
-            c[1] += ahead_asks[1];
-            fs.settle_ahead.set(c);
+            fs.settle_ahead.add(0, ahead_asks[0]);
+            fs.settle_ahead.add(1, ahead_asks[1]);
         }
         Ok(())
     }
@@ -28822,9 +29094,7 @@ impl Reader {
                 cached_b
             } else if hot_copy {
                 let fs = self.fs();
-                let mut h = fs.hot_starts.get();
-                h[1] += 1;
-                fs.hot_starts.set(h);
+                fs.hot_starts.add(1, 1);
                 hot_b
             } else if self.opts.zpages_seek_span {
                 self.zc(seg)
@@ -28838,7 +29108,12 @@ impl Reader {
             };
             let (mut rank, mut same, mut seed) = match span_b {
                 Some(_) => (usize::MAX, false, None),
-                None => self.scan_seek_seeded(seg, cursor, shared.on),
+                None => self.scan_seek_seeded(
+                    seg,
+                    cursor,
+                    shared.on,
+                    self.opts.scan_form_ahead.then_some(pi),
+                ),
             };
             let owner = if same { rank } else { rank.saturating_sub(1) };
             // The block the seek found, kept for the next scan from this
@@ -28905,9 +29180,7 @@ impl Reader {
                     hot = false;
                 }
                 let fs = self.fs();
-                let mut h = fs.hot_starts.get();
-                h[0] += u64::from(hot);
-                fs.hot_starts.set(h);
+                fs.hot_starts.add(0, u64::from(hot));
             }
             // Clean throughout is a statement about the snapshot's span
             // over the partition, which is re-taken above only with a
@@ -28932,7 +29205,7 @@ impl Reader {
                 // walk makes it. Measured through the blocks it was a
                 // tenth slower, in first touches and bookkeeping.
                 if rank == usize::MAX {
-                    (rank, _) = self.scan_seek(seg, cursor);
+                    (rank, _) = self.scan_seek(seg, cursor, None);
                 }
                 if rank < keys {
                     let want = (keys - rank).min(limit - seen);
@@ -29119,7 +29392,7 @@ impl Reader {
                 // The rank the span left unsought, sought now for a form
                 // walked by rank; a copy needs none.
                 if first && rank == usize::MAX && !matches!(form, Cached::Block(_)) {
-                    (rank, same) = self.scan_seek(seg, cursor);
+                    (rank, same) = self.scan_seek(seg, cursor, None);
                     debug_assert_eq!(
                         (if same { rank } else { rank.saturating_sub(1) }) / CACHE_BLOCK,
                         b,
@@ -29159,16 +29432,17 @@ impl Reader {
                     Cached::Clean => 2,
                     Cached::Wide(_) => 3,
                 };
-                let mut c = self.fs().choices.get();
-                c[if dense.is_some() { 2 } else { 3 }] += 1;
-                self.fs().choices.set(c);
-                let mut k = self.fs().walk_kinds.get();
-                k[match form {
-                    Cached::Block(_) => 0,
-                    Cached::Sparse(_) => 1,
-                    _ => 2,
-                }] += 1;
-                self.fs().walk_kinds.set(k);
+                self.fs()
+                    .choices
+                    .add(if dense.is_some() { 2 } else { 3 }, 1);
+                self.fs().walk_kinds.add(
+                    match form {
+                        Cached::Block(_) => 0,
+                        Cached::Sparse(_) => 1,
+                        _ => 2,
+                    },
+                    1,
+                );
                 let took_from = seen;
                 // The first block this turn walks: the clean run below may
                 // take several, and the promotion after the walk credits
@@ -29199,6 +29473,7 @@ impl Reader {
                         self.opts.scan_prefetch_bytes,
                         self.opts.seek_prefetch_dir,
                         self.opts.copy_prefetch_whole,
+                        self.opts.scan_prefetch_sparse_span,
                     );
                 }
                 fetched = false;
@@ -29227,6 +29502,7 @@ impl Reader {
                                 self.opts.scan_prefetch_bytes,
                                 self.opts.seek_prefetch_dir,
                                 self.opts.copy_prefetch_whole,
+                                self.opts.scan_prefetch_sparse_span,
                             ),
                         }
                         fetched = true;
@@ -29360,9 +29636,7 @@ impl Reader {
                             blk.lower_bound(cursor)
                         };
                         if first {
-                            let mut c = self.fs().copy_starts.get();
-                            c[usize::from(!at_rank)] += 1;
-                            self.fs().copy_starts.set(c);
+                            self.fs().copy_starts.add(usize::from(!at_rank), 1);
                             if rank == usize::MAX {
                                 let fs = self.fs();
                                 fs.span_starts.set(fs.span_starts.get() + 1);
@@ -29398,6 +29672,32 @@ impl Reader {
                 // shorter than its pace or took another shape.
                 if let Some(mut p) = pace.take() {
                     p.finish();
+                }
+                // A light sparse form's walk credits the block with what it
+                // took, and the walk that takes it past the line has the
+                // next fill visit the tables, where the upkeep thread
+                // converts it (`Options::forms_convert_reads`).
+                let conv = self.opts.forms_convert_reads;
+                if conv > 0 && walked_kind == 1 && run_b0 == b && !canonical {
+                    let light_from = match self.opts.forms_convert_from {
+                        0 => CACHE_DENSE,
+                        n => n,
+                    };
+                    if let Some(Cached::Sparse(sb)) = table.slots[b].as_deref() {
+                        if (light_from..CACHE_DENSE).contains(&sb.ents.len()) {
+                            let took = u32::try_from(seen - took_from).unwrap_or(u32::MAX);
+                            let had = table.reads[b];
+                            let now = had.saturating_add(took);
+                            table.reads[b] = now;
+                            if had < conv && now >= conv {
+                                if self.opts.forms_convert_at_walk {
+                                    self.convert_walked(&ctx, src, table, pi, b, Some(unsealed))?;
+                                } else {
+                                    self.fs().tables_complete.set(false);
+                                }
+                            }
+                        }
+                    }
                 }
                 // What this read took from the block is what pays for a
                 // copy of it; past the crossover the store holds it both
@@ -29479,10 +29779,8 @@ impl Reader {
                             };
                             if matches!(copied, Cached::Block(_)) {
                                 let bytes = self.fbytes(&copied);
-                                let mut c = self.fs().choices.get();
-                                c[0] += 1;
-                                c[4] += bytes as u64;
-                                self.fs().choices.set(c);
+                                self.fs().choices.add(0, 1);
+                                self.fs().choices.add(4, bytes as u64);
                                 if in_slot {
                                     self.unlist(pi, k, table);
                                     let built = self.share_form(copied);
@@ -34010,9 +34308,7 @@ impl Db {
                             .get()
                             .saturating_sub(self.fbytes(&old)),
                     );
-                    let mut c = self.fs().choices.get();
-                    c[4] = c[4].saturating_sub(self.fbytes(&old) as u64);
-                    self.fs().choices.set(c);
+                    self.fs().choices.sub_sat(4, self.fbytes(&old) as u64);
                 }
             }
             t.pieces = pieces;
@@ -39327,9 +39623,7 @@ impl<'s> BuildCtx<'s> {
             })
             .collect();
         let fs = self.rd.fs();
-        let mut c = fs.lazy_cuts.get();
-        c[1] += n;
-        fs.lazy_cuts.set(c);
+        fs.lazy_cuts.add(1, n);
         std::borrow::Cow::Owned(out)
     }
 
@@ -40517,6 +40811,18 @@ struct PartReader<'a> {
     /// the cursor is ahead of them. `usize::MAX` for a reader with no scan
     /// behind it -- a build's -- whose runs are all it reads.
     left: usize,
+    /// The raw records' walker the runs go through where the raw form
+    /// serves them (`Options::scan_runs_held`): resolved at the first run
+    /// that wants it, and `Held::No` where the form file or the ask ahead
+    /// takes the runs instead.
+    raw: Held<'a>,
+}
+
+/// What a partition reader knows of its raw walker (`PartReader::raw`).
+enum Held<'a> {
+    Unasked,
+    No,
+    Walk(crate::blob::RunWalk<'a, MmapBytes>),
 }
 
 impl<'a> PartReader<'a> {
@@ -40529,6 +40835,7 @@ impl<'a> PartReader<'a> {
             at: usize::MAX,
             on,
             left: usize::MAX,
+            raw: Held::Unasked,
         }
     }
 
@@ -40627,6 +40934,20 @@ impl<'a> PartReader<'a> {
         }
         let want = self.want_for(n);
         let Some(c) = self.cursor_at(rank, want) else {
+            let seg = self.seg;
+            if let Some(w) = self.raw_walk() {
+                // `Reader::cache_scan`'s raw arm, over the regions held.
+                seg.hot_scan(n);
+                let got = w
+                    .scan_at(rank, n, &mut *f)
+                    .map_err(|e| err(&format!("segment scan: {e}")))?;
+                if got < n {
+                    return Err(err(
+                        "segment scan: a partition's walk stopped short of its key count",
+                    ));
+                }
+                return Ok(got);
+            }
             return self.rd.cache_scan(self.seg, rank, n, f);
         };
         let (got, _) = c
@@ -40640,6 +40961,28 @@ impl<'a> PartReader<'a> {
             ));
         }
         Ok(got)
+    }
+
+    /// The raw walker the runs go through (`Options::scan_runs_held`):
+    /// none where the option is off, the form file serves the partition's
+    /// reads, or the raw records are asked for ahead of each run, all as
+    /// `Reader::cache_scan` and `Reader::raw_scan` decide them, once.
+    fn raw_walk(&mut self) -> Option<&crate::blob::RunWalk<'a, MmapBytes>> {
+        if let Held::Unasked = self.raw {
+            let rd = self.rd;
+            self.raw = if rd.opts.scan_runs_held
+                && rd.zc(self.seg).is_none()
+                && !rd.shared.raw_ahead.load(AtomicOrdering::Relaxed)
+            {
+                Held::Walk(self.seg.raw().run_walk())
+            } else {
+                Held::No
+            };
+        }
+        match &self.raw {
+            Held::Walk(w) => Some(w),
+            _ => None,
+        }
     }
 
     /// `Reader::cache_scan` to the cut of `key` and `Reader::cache_cut` in

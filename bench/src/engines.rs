@@ -1173,6 +1173,30 @@ pub struct Supdb {
     /// probes (`Options::read_lines_ahead` off): `supdb-readnoahead` and
     /// `supdb-ingestreadnoahead`.
     readnoahead: bool,
+    /// The seek asking for the first two blocks' form headers
+    /// (`Options::scan_form_ahead`): `supdb-formahead` and
+    /// `supdb-ingestformahead`.
+    formahead: bool,
+    /// A sparse form asked for over the walk's share of it
+    /// (`Options::scan_prefetch_sparse_span`): `supdb-sparsespan` and
+    /// `supdb-ingestsparsespan`.
+    sparsespan: bool,
+    /// A partition walk's runs through one raw walker
+    /// (`Options::scan_runs_held`): `supdb-runsheld` and
+    /// `supdb-ingestrunsheld`.
+    runsheld: bool,
+    /// The three scan levers together: `supdb-scanlevers` and
+    /// `supdb-ingestscanlevers`.
+    scanlevers: bool,
+    /// The fills' conversion to a copy at the dense count alone, the shape
+    /// before light forms converted (`Options::forms_convert_from`):
+    /// `supdb-convert16` and `supdb-ingestconvert16`.
+    convert16: bool,
+    /// EXPERIMENT: the deltas from which the upkeep thread converts a sparse
+    /// form the walks have read `CONVREADS` entries of to a copy
+    /// (`Options::forms_convert_from`, `forms_convert_reads`), from
+    /// `DENSEFROM`: `supdb-densefrom` and `supdb-ingestdensefrom`.
+    densefrom: usize,
     /// A burst's batch filed in the commit building the forms its settle
     /// filed into (`Options::forms_settle_builds_filed` on):
     /// `supdb-settlebuildsfiled` and `supdb-ingestsettlebuildsfiled`.
@@ -2296,6 +2320,18 @@ struct Policy {
     readhashes: bool,
     /// No sources' lines asked ahead of the point read: `...readnoahead`.
     readnoahead: bool,
+    /// The seek's ask for the first forms: `...formahead`.
+    formahead: bool,
+    /// The sparse form's ask over the walk's share: `...sparsespan`.
+    sparsespan: bool,
+    /// The runs through one raw walker: `...runsheld`.
+    runsheld: bool,
+    /// The three scan levers together: `...scanlevers`.
+    scanlevers: bool,
+    /// The writer's copy line from `DENSEFROM`: `...densefrom`.
+    densefrom: usize,
+    /// Conversions at the dense count alone: `...convert16`.
+    convert16: bool,
     /// A filed burst's builds in the commit: `...settlebuildsfiled`.
     settlebuildsfiled: bool,
     /// The walk's own decodes: `supdb-zwalkowns`.
@@ -2720,6 +2756,12 @@ impl Default for Policy {
             settlegated: false,
             readhashes: false,
             readnoahead: false,
+            formahead: false,
+            sparsespan: false,
+            runsheld: false,
+            scanlevers: false,
+            densefrom: 0,
+            convert16: false,
             settlebuildsfiled: false,
             zwalkowns: false,
             zviewperopen: false,
@@ -8143,6 +8185,12 @@ impl Supdb {
             settlegated,
             readhashes,
             readnoahead,
+            formahead,
+            sparsespan,
+            runsheld,
+            scanlevers,
+            densefrom,
+            convert16,
             settlebuildsfiled,
             zwalkowns,
             zviewperopen,
@@ -8697,6 +8745,22 @@ impl Supdb {
             forms_settle_past_llc: settlegated,
             read_hash_once: !readhashes,
             read_lines_ahead: !readnoahead,
+            scan_form_ahead: formahead || scanlevers,
+            scan_prefetch_sparse_span: sparsespan || scanlevers,
+            scan_runs_held: runsheld || scanlevers,
+            forms_convert_from: if densefrom > 0 {
+                densefrom
+            } else if convert16 {
+                0
+            } else {
+                supdb::Options::default().forms_convert_from
+            },
+            forms_convert_reads: if densefrom > 0 { conv_reads_env() } else { 0 },
+            forms_convert_at_walk: densefrom > 0 && std::env::var("CONVWALK").as_deref() == Ok("1"),
+            forms_convert_light_writer: densefrom > 0
+                && std::env::var("CONVWRITER").as_deref() == Ok("1"),
+            forms_convert_light_yields: densefrom > 0
+                && std::env::var("CONVSTRICT").as_deref() == Ok("1"),
             forms_settle_builds_filed: settlebuildsfiled,
             zpages_rewarm_quiet_ms: if zrewarmwait {
                 supdb::db::REWARM_QUIET_BEFORE_MS
@@ -8985,6 +9049,12 @@ impl Supdb {
             settlegated,
             readhashes,
             readnoahead,
+            formahead,
+            sparsespan,
+            runsheld,
+            scanlevers,
+            densefrom,
+            convert16,
             settlebuildsfiled,
             zwalkowns,
             zviewperopen,
@@ -9678,6 +9748,48 @@ impl Engine for Supdb {
                 "supdb-readnoahead"
             } else {
                 "supdb-ingestreadnoahead"
+            };
+        }
+        if self.convert16 {
+            return if self.partition {
+                "supdb-convert16"
+            } else {
+                "supdb-ingestconvert16"
+            };
+        }
+        if self.densefrom > 0 {
+            return if self.partition {
+                "supdb-densefrom"
+            } else {
+                "supdb-ingestdensefrom"
+            };
+        }
+        if self.scanlevers {
+            return if self.partition {
+                "supdb-scanlevers"
+            } else {
+                "supdb-ingestscanlevers"
+            };
+        }
+        if self.formahead {
+            return if self.partition {
+                "supdb-formahead"
+            } else {
+                "supdb-ingestformahead"
+            };
+        }
+        if self.sparsespan {
+            return if self.partition {
+                "supdb-sparsespan"
+            } else {
+                "supdb-ingestsparsespan"
+            };
+        }
+        if self.runsheld {
+            return if self.partition {
+                "supdb-runsheld"
+            } else {
+                "supdb-ingestrunsheld"
             };
         }
         if self.settlebuildsfiled {
@@ -11796,6 +11908,18 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestreadhashes"
         | "supdb-readnoahead"
         | "supdb-ingestreadnoahead"
+        | "supdb-formahead"
+        | "supdb-ingestformahead"
+        | "supdb-sparsespan"
+        | "supdb-ingestsparsespan"
+        | "supdb-runsheld"
+        | "supdb-ingestrunsheld"
+        | "supdb-scanlevers"
+        | "supdb-ingestscanlevers"
+        | "supdb-densefrom"
+        | "supdb-ingestdensefrom"
+        | "supdb-convert16"
+        | "supdb-ingestconvert16"
         | "supdb-settlebuildsfiled"
         | "supdb-ingestsettlebuildsfiled"
         | "supdb-ingestpromote"
@@ -11935,6 +12059,25 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
 /// `open`'s frame, two megabytes at three hundred arms -- the default
 /// stack of a test's thread, which the first arm past it overflowed.
 #[inline(never)]
+/// The reads a light form takes before its conversion for
+/// `supdb-densefrom`, from `CONVREADS` (none where unset).
+fn conv_reads_env() -> u32 {
+    std::env::var("CONVREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// The writer's copy line for `supdb-densefrom`, from `DENSEFROM` (four
+/// where unset), at least one.
+fn dense_from_env() -> usize {
+    std::env::var("DENSEFROM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4)
+        .max(1)
+}
+
 fn supdb_arm(make: fn(&Path) -> Res<Supdb>, dir: &Path) -> Res<Box<dyn Engine>> {
     Ok(Box::new(make(dir)?))
 }
@@ -12338,6 +12481,162 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         partition: false,
                         durable: false,
                         readnoahead: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-formahead" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        formahead: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestformahead" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        formahead: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-sparsespan" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        sparsespan: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestsparsespan" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        sparsespan: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-runsheld" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        runsheld: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestrunsheld" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        runsheld: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-scanlevers" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        scanlevers: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestscanlevers" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        scanlevers: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-convert16" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        convert16: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestconvert16" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        convert16: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-densefrom" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        densefrom: dense_from_env(),
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestdensefrom" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        densefrom: dense_from_env(),
                         ..Policy::default()
                     },
                 )
@@ -14854,6 +15153,76 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.read_lines_ahead && b.read_lines_ahead);
                 assert!(o.read_hash_once);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("formahead"),
+                    Policy {
+                        formahead: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-formahead");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.scan_form_ahead && !b.scan_form_ahead);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("sparsespan"),
+                    Policy {
+                        sparsespan: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-sparsespan");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.scan_prefetch_sparse_span && !b.scan_prefetch_sparse_span);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("runsheld"),
+                    Policy {
+                        runsheld: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-runsheld");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.scan_runs_held && !b.scan_runs_held);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("convert16"),
+                    Policy {
+                        convert16: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-convert16");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.forms_convert_from == 0 && b.forms_convert_from == 4);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("scanlevers"),
+                    Policy {
+                        scanlevers: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-scanlevers");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.scan_form_ahead && o.scan_prefetch_sparse_span && o.scan_runs_held);
             }
             {
                 let z = Supdb::with_policy(

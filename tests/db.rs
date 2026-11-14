@@ -6800,6 +6800,83 @@ fn a_dense_form_converts_from_its_own_deltas() {
     );
 }
 
+/// A light sparse form -- under the dense count, at least
+/// `Options::forms_convert_from` deltas -- is converted to a copy by a fill
+/// on the upkeep thread, where the write mixes' few deltas a block are filed,
+/// and by no pass over a burst's batch (`Reader::burst_pass`), whose pace
+/// holds the writer to the thread; at the dense count alone it stays deltas.
+/// Each case gives sixty blocks one delta a round for six rounds, in commits
+/// of sixty writes, or of three hundred where the case is a burst's -- under
+/// the paced share of a store of 32,000 keys and past `UPKEEP_WAKE_WRITES`,
+/// so the batches are lent to the thread rather than filed in the commit --
+/// with one write a round into a block no write has reached, which has the
+/// fill walk the table, and the scans after hold every block to the model.
+#[test]
+fn a_light_form_converts_on_the_upkeep_thread_and_not_over_a_burst() {
+    for (line, burst, converts) in [(4usize, false, true), (0, false, false), (4, true, false)] {
+        let d = dir(&format!("convert-light-{line}-{burst}"));
+        let opts = Options {
+            seal_bytes: 1 << 26,
+            partition_bytes: Some(1 << 20),
+            scan_block_cache: true,
+            forms_convert_from: line,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in 0..32_000u32 {
+            m.append(&mut db, &key(k), "p");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        // A scan, so that the commits after it maintain the forms.
+        m.check_one(&db, key(0).as_bytes(), 100, "clean");
+        let before = db.forms_events()[13];
+        let passes = db.upkeep_counts()[0];
+        for round in 0..6u32 {
+            for b in 0..60u32 {
+                let k = b * 64 + 2 + round * 9;
+                for i in 0..if burst { 5 } else { 1 } {
+                    m.append(&mut db, &key(k), &format!("u{round}-{i}"));
+                }
+            }
+            // And a block no write has reached, as the mixes' writes keep
+            // reaching: a write into a block the table holds no form for is
+            // what has the next fill walk the table, and the walk is where
+            // a light form is met.
+            m.append(&mut db, &key((100 + round) * 64 + 5), "fresh");
+            db.commit().unwrap();
+            db.settle().unwrap();
+        }
+        assert!(
+            db.upkeep_counts()[0] > passes,
+            "line {line}, burst {burst}: the thread made no pass, so nothing above tested it"
+        );
+        let converted = db.forms_events()[13] - before;
+        if converts {
+            assert!(
+                converted >= 30,
+                "line {line}: the thread converted {converted} light forms of sixty"
+            );
+        } else {
+            assert_eq!(
+                converted, 0,
+                "line {line}, burst {burst}: a light form converted"
+            );
+        }
+        for b in (0..60u32).step_by(7) {
+            m.check_one(
+                &db,
+                key(b * 64).as_bytes(),
+                200,
+                &format!("line {line}, burst {burst}: block {b} after the rounds"),
+            );
+        }
+    }
+}
+
 /// A manifest publish keeps the manifest it replaces linked under a spare
 /// name, so that the rename frees no inode on the publish's path, and the
 /// spare is unlinked by the segment work when idle and at open

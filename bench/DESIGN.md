@@ -629,6 +629,22 @@ burst's batch filed in the commit building the forms its settle filed into
 (`Options::forms_settle_builds_filed`); `supdb-ingestpromote` is
 `supdb-ingest` with a block the reads have taken 256 entries from held as a
 merged copy beside its cheap form (`Options::promote_entries`);
+`supdb-convert16` and `supdb-ingestconvert16` are `supdb` and
+`supdb-ingest` with the upkeep thread's fill converting a sparse form to a
+copy only at the dense count, the shape before a light form of four deltas
+or more converted (`Options::forms_convert_from`), and
+`supdb-densefrom` and `supdb-ingestdensefrom` take the line from
+`DENSEFROM`, with the reads a form takes first from `CONVREADS` and the
+writer's fills, the yields and the walk's crossing from `CONVWRITER`,
+`CONVSTRICT` and `CONVWALK` (`Options::forms_convert_reads`,
+`forms_convert_light_writer`, `forms_convert_light_yields`,
+`forms_convert_at_walk`); `supdb-formahead`, `supdb-sparsespan` and
+`supdb-runsheld`, with their `supdb-ingest` siblings, are the scan's seek
+asking for the first two blocks' form headers
+(`Options::scan_form_ahead`), a sparse form asked for over the walk's share
+of it (`Options::scan_prefetch_sparse_span`) and a partition walk's raw
+runs through one walker (`Options::scan_runs_held`), and
+`supdb-scanlevers` and `supdb-ingestscanlevers` the three together;
 `supdb-zhotresident` is `supdb` with the hot-raw fill asking for the
 partitions the reads have not skewed by how much of their records the cache
 holds, most first (`Options::zpages_hot_fill_resident_first`);
