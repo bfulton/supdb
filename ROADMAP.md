@@ -168,17 +168,16 @@ What an engine picker would hit, roughly in order.
   rotation does for its new WAL file (`Db::sync_run`; `tests/runlog.rs`
   counts it on every path that syncs). A store whose commits never sync
   makes none.
-- [ ] **A synced run that is lost anyway is refused only where frames
-  follow it.** With its file synced and its name behind a barrier, a run
-  goes missing only where the device loses what it was told to keep, and
-  the open answers that as it answers a lost log record in one case of
-  three. Frames in the log past a run that is not there are a sequence
-  gap, and the open refuses. A run written after the missing one is taken
-  for commits past the history's end and removed with it: a run's note
-  that said whether everything before it was synced when it began, as a
-  WAL file's kind says, would make that a refusal too. A run that was
-  the last thing written is gone with nothing said, as a log's last
-  synced record would be.
+- [x] **A synced run that is lost anyway is refused where anything
+  follows it.** With its file synced and its name behind a barrier, a run
+  goes missing only where the device loses what it was told to keep.
+  Frames in the log past a run that is not there are a sequence gap, and
+  the open refuses. A run written after the missing one says in its note
+  whether everything before it was synced when it began, as a WAL file's
+  kind says, and where it was the open refuses too, before it removes
+  anything (`tests/runlog.rs`). A run that was the last thing written is
+  gone with nothing said, as a log's last synced record would be: nothing
+  on disk stands after it to say so.
 - [ ] **A buffered burst of one commit pays the filing in that commit.** A
   commit near reads files its batch (`Options::forms_settle_every`), and
   where a burst is one commit the filing is in the burst: the buffered

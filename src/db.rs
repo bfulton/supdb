@@ -6042,26 +6042,43 @@ const DIRECT_MARK_LEN: usize = 24;
 /// finish, which writes the page whole, so it reads the same from a run
 /// in progress, a run closed and a segment. A file without one is a run
 /// from before runs took numbers, recovered as those were.
+///
+/// The magic is the note's kind, as a WAL file's header carries one. A run
+/// that began with everything before it behind a sync says so
+/// (`RUN_NOTE_CHAINED`): nothing before its first record can be lost short
+/// of the device losing what it was told to keep, so an open that finds
+/// the history ending before such a run's start has found a record lost
+/// and refuses, as it refuses a gap at a chained file of the log. A run
+/// that began with something before it unsynced (`RUN_NOTE_MAGIC`) may
+/// stand past a tail a crash took, and is removed with it.
 const RUN_NOTE_OFF: usize = 2048;
 const RUN_NOTE_MAGIC: u64 = 0x5355_5044_5255_4e31;
+const RUN_NOTE_CHAINED: u64 = 0x5355_5044_5255_4e32;
 const RUN_NOTE_BYTES: usize = 24;
 
-fn run_note(start: u64) -> [u8; RUN_NOTE_BYTES] {
+fn run_note(start: u64, chained: bool) -> [u8; RUN_NOTE_BYTES] {
     let mut n = [0u8; RUN_NOTE_BYTES];
-    n[..8].copy_from_slice(&RUN_NOTE_MAGIC.to_le_bytes());
+    let magic = if chained {
+        RUN_NOTE_CHAINED
+    } else {
+        RUN_NOTE_MAGIC
+    };
+    n[..8].copy_from_slice(&magic.to_le_bytes());
     n[8..16].copy_from_slice(&start.to_le_bytes());
     let c = crc32(&n[..16]) as u64;
     n[16..].copy_from_slice(&c.to_le_bytes());
     n
 }
 
-/// The start a run's note names, out of the first bytes of its file; none
-/// for a file too short to hold one, without one, or whose note's CRC
+/// The start a run's note names and whether it says the run began with
+/// everything before it synced, out of the first bytes of its file; none
+/// for a file too short to hold a note, without one, or whose note's CRC
 /// does not hold.
-fn run_note_start(head: &[u8]) -> Option<u64> {
+fn run_note_start(head: &[u8]) -> Option<(u64, bool)> {
     let n = head.get(RUN_NOTE_OFF..RUN_NOTE_OFF + RUN_NOTE_BYTES)?;
     let w = |i: usize| u64::from_le_bytes(n[i * 8..i * 8 + 8].try_into().expect("eight"));
-    (w(0) == RUN_NOTE_MAGIC && w(2) == crc32(&n[..16]) as u64).then(|| w(1))
+    let chained = w(0) == RUN_NOTE_CHAINED;
+    ((chained || w(0) == RUN_NOTE_MAGIC) && w(2) == crc32(&n[..16]) as u64).then(|| (w(1), chained))
 }
 
 struct Wal {
@@ -6369,14 +6386,14 @@ impl Wal {
             after_run = wal_kind(&head) == Some(WAL_LOOSE_RUN);
             file.seek(SeekFrom::Start(written))?;
         }
-        // What replay kept was read back from the device, so it counts as
-        // synced; a header written just now does not until the first
-        // barrier.
-        let synced = if written == WAL_MAGIC.len() as u64 {
-            0
-        } else {
-            written
-        };
+        // What replay kept counts as unsynced. It was read back, but from
+        // the page cache where a killed writer left it there: this said
+        // "from the device" once and counted the frames as synced, so a
+        // `sync` after a reopen synced nothing of them and returned, and
+        // a run of ordered ingest begun then would have said everything
+        // before it was behind a sync. The first sync that acknowledges
+        // anything covers them, for nothing where they were clean.
+        let synced = 0;
         Ok(Wal {
             file,
             path: path.to_path_buf(),
@@ -8752,7 +8769,7 @@ pub struct SegmentWriter {
     reserve_off: u64,
     /// The sequence number a run of ordered ingest starts at, which its
     /// superblock page says from its first byte on (`run_note`).
-    run_start: Option<u64>,
+    run_start: Option<(u64, bool)>,
     /// The inline runs, concatenated, with each key's span in it (empty for
     /// a key whose run went to a block). Blocks-first mode only; the
     /// records-first mode streams each tail out inside its record.
@@ -9372,20 +9389,21 @@ impl SegmentWriter {
     /// The sequence number this segment's first record takes, for a run
     /// of ordered ingest (`run_note`): into the file's head, before the
     /// first key.
-    pub(crate) fn set_run_start(&mut self, seq: u64) -> Result<()> {
+    pub(crate) fn set_run_start(&mut self, seq: u64, chained: bool) -> Result<()> {
         if self.pos != crate::format::SUPER {
             return Err(err(
                 "segment writer: a run's start is said before its first key",
             ));
         }
-        self.out.patch_head(RUN_NOTE_OFF, &run_note(seq))?;
-        self.run_start = Some(seq);
+        self.out.patch_head(RUN_NOTE_OFF, &run_note(seq, chained))?;
+        self.run_start = Some((seq, chained));
         Ok(())
     }
 
-    /// The sequence number the run in `path` starts at; none for a file
-    /// that says none (`run_note_start`).
-    pub(crate) fn run_start_of(path: &Path) -> Result<Option<u64>> {
+    /// The sequence number the run in `path` starts at, and whether it
+    /// began with everything before it synced; none for a file that says
+    /// none (`run_note_start`).
+    pub(crate) fn run_start_of(path: &Path) -> Result<Option<(u64, bool)>> {
         let mut head = Vec::with_capacity(RUN_NOTE_OFF + RUN_NOTE_BYTES);
         File::open(path)?
             .take((RUN_NOTE_OFF + RUN_NOTE_BYTES) as u64)
@@ -10197,8 +10215,9 @@ impl SegmentWriter {
             .copy_from_slice(&sb);
         let x = crate::blob::encode_super_ext(&ext, generation);
         page[1024..1024 + x.len()].copy_from_slice(&x);
-        if let Some(start) = self.run_start {
-            page[RUN_NOTE_OFF..RUN_NOTE_OFF + RUN_NOTE_BYTES].copy_from_slice(&run_note(start));
+        if let Some((start, chained)) = self.run_start {
+            page[RUN_NOTE_OFF..RUN_NOTE_OFF + RUN_NOTE_BYTES]
+                .copy_from_slice(&run_note(start, chained));
         }
         file.write_all_at(&page, 0)?;
         if steps_on {
@@ -10524,8 +10543,8 @@ impl PieceWriter {
         self.0.set_marks(on)
     }
 
-    fn set_run_start(&mut self, seq: u64) -> Result<()> {
-        self.0.set_run_start(seq)
+    fn set_run_start(&mut self, seq: u64, chained: bool) -> Result<()> {
+        self.0.set_run_start(seq, chained)
     }
 
     fn mark(&mut self) -> Result<()> {
@@ -14513,7 +14532,8 @@ mod store_format {
     /// `STORE_FORMAT_OLDEST` whether the release still reads the version
     /// before. Version 1 had the WAL's kinds 4 and 5; version 2 adds the
     /// kind for a boundary a run of ordered ingest left unsynced, and the
-    /// run's place in the sequence with it.
+    /// run's place in the sequence with it: the note in a run's file, in
+    /// its two kinds.
     #[test]
     fn store_format_names_the_files_magics() {
         let version_2 = (
@@ -14522,6 +14542,7 @@ mod store_format {
             (*b"SUPDBWL", 4u8, 5u8, 6u8),
             0x3144_524f_4450_5553u64,
             *b"SUPDZPG2",
+            (0x5355_5044_5255_4e31u64, 0x5355_5044_5255_4e32u64),
         );
         let now = (
             crate::format::MAGIC,
@@ -14529,6 +14550,7 @@ mod store_format {
             (*WAL_HEAD, WAL_CHAINED, WAL_LOOSE, WAL_LOOSE_RUN),
             crate::ordindex::MAGIC,
             zpages::ZMAGIC,
+            (RUN_NOTE_MAGIC, RUN_NOTE_CHAINED),
         );
         assert_eq!(
             (STORE_FORMAT, now),
@@ -19764,6 +19786,10 @@ pub struct Db {
     /// covered (`LooseRun`), oldest first: synced by the first sync by
     /// policy after them, as the loose files are.
     loose_runs: Vec<LooseRun>,
+    /// The run a drain in progress closed with a commit unsynced or its
+    /// temp name unpromised: nothing's to sync if the drain succeeds, and
+    /// a loose run if it fails (`flush`).
+    drain_run: Option<(PathBuf, bool)>,
     mem_bytes: usize,
     /// The segment ordered ingest streams into, while one is open. The
     /// memtable is ordered exactly while a run is forming or open.
@@ -31694,6 +31720,23 @@ impl Db {
         Ok(())
     }
 
+    /// Whether anything written before the run in progress is behind no
+    /// sync: frames of the live log file, a header that says a file before
+    /// it was left loose, a name owed its barrier, a file of the log or a
+    /// run that closed loose. What a sync that acknowledges syncs first
+    /// (`sync_wal`), and what a run asks as it begins: one that begins
+    /// with none of it says so in its note (`RUN_NOTE_CHAINED`), and the
+    /// open refuses a gap before it. One definition for both, since a run
+    /// that said "synced" over something a sync would still have to do is
+    /// a store that refuses to open after a crash it should have survived.
+    fn owes_sync(&self) -> bool {
+        self.wal.frames_unsynced()
+            || self.wal.loose
+            || self.wal_dir_unsynced
+            || !self.loose_wals.is_empty()
+            || !self.loose_runs.is_empty()
+    }
+
     /// The directory fsync a rotation owes its new file, retried by the
     /// syncs by policy after it until it succeeds; see `wal_dir_unsynced`.
     fn wal_dir_barrier(&mut self) -> Result<()> {
@@ -32197,6 +32240,7 @@ impl Db {
             closed_wals: Vec::new(),
             loose_wals: Vec::new(),
             loose_runs: Vec::new(),
+            drain_run: None,
             mem_bytes: 0,
             direct: None,
             mem_handed: None,
@@ -32396,7 +32440,7 @@ impl Db {
             }
         }
         direct_tmps.sort_unstable();
-        let mut runs: std::collections::BTreeMap<u64, (u64, PathBuf)> =
+        let mut runs: std::collections::BTreeMap<u64, (u64, PathBuf, bool)> =
             std::collections::BTreeMap::new();
         for (id, tmp) in direct_tmps {
             let named = live.iter().any(|n| Db::name_id(n) == Some(id));
@@ -32419,22 +32463,22 @@ impl Db {
                 // open that took the run, and never unlinked it. The
                 // seals land in the order they were handed, so a manifest
                 // that covers a run's start covers its end.
-                Some(start)
+                Some((start, _))
                     if start < sealed || covs.iter().any(|&(a, b)| a <= start && start < b) =>
                 {
                     let _ = std::fs::remove_file(&tmp);
                 }
                 // Named above what the manifest covers: an open took the
                 // run and a crash came before it said so by the range.
-                Some(start) if named => {
+                Some((start, _)) if named => {
                     let recs = SegmentWriter::recover_direct(&tmp)?;
                     let end = start + recs.len() as u64;
                     Db::write_cov(dir, start, end)?;
                     covs.push((start, end));
                     let _ = std::fs::remove_file(&tmp);
                 }
-                Some(start) => {
-                    if runs.insert(start, (id, tmp)).is_some() {
+                Some((start, chained)) => {
+                    if runs.insert(start, (id, tmp, chained)).is_some() {
                         return Err(err("two runs of ordered ingest start at one sequence"));
                     }
                 }
@@ -32488,14 +32532,31 @@ impl Db {
             // What is left starts past where the history ends: commits a
             // crash kept without the ones before them. Gone before the
             // store takes a write, and durably, since a write could bring
-            // the log to such a run's start.
-            let cut = !runs.is_empty();
-            for (start, (_, tmp)) in std::mem::take(&mut runs) {
+            // the log to such a run's start. Unless such a run says it
+            // began with everything before it behind a sync
+            // (`RUN_NOTE_CHAINED`): then what is missing before it was
+            // promised, a record lost and not a tail a crash may take, and
+            // the open refuses as it refuses a gap at a chained file of
+            // the log. Every run left is asked before any is removed, so a
+            // refusal takes nothing with it.
+            for (&start, (_, _, chained)) in &runs {
                 if start < at {
                     return Err(err(
                         "a run of ordered ingest starts inside the sequence the log's frames hold",
                     ));
                 }
+                if *chained {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "a record is lost: the history ends at sequence {at}, and a run of \
+                             ordered ingest that began at {start} says everything before it was synced"
+                        ),
+                    ));
+                }
+            }
+            let cut = !runs.is_empty();
+            for (_, (_, tmp, _)) in std::mem::take(&mut runs) {
                 std::fs::remove_file(&tmp)?;
             }
             if cut {
@@ -32668,6 +32729,7 @@ impl Db {
             .skip(1)
             .map(|&id| Db::wal_path(dir, id))
             .collect();
+        let replayed_wals = retiring.clone();
         let wal_id = wal_ids.last().copied().unwrap_or(0);
         let wal_path = Db::wal_path(dir, wal_id);
         // A batch that never committed is cut off before anything is
@@ -32911,8 +32973,13 @@ impl Db {
             wal,
             wal_id,
             closed_wals: Vec::new(),
-            loose_wals: Vec::new(),
+            // The log's older files, as the live one is: replayed, and
+            // synced or not as the writer before left them. The first
+            // sync by policy syncs them ahead of the live file
+            // (`sync_wal`), since what it acknowledges stands on them.
+            loose_wals: replayed_wals,
             loose_runs: Vec::new(),
+            drain_run: None,
             mem_bytes,
             direct: None,
             mem_handed: None,
@@ -33178,7 +33245,7 @@ impl Db {
         sealed: u64,
         mut next: u64,
         upto: u64,
-        runs: &mut std::collections::BTreeMap<u64, (u64, PathBuf)>,
+        runs: &mut std::collections::BTreeMap<u64, (u64, PathBuf, bool)>,
         covs: &mut Vec<(u64, u64)>,
         live: &mut Vec<String>,
         mseq: &mut u64,
@@ -33188,7 +33255,7 @@ impl Db {
                 next = b;
                 continue;
             }
-            let Some((id, tmp)) = runs.remove(&next) else {
+            let Some((id, tmp, _)) = runs.remove(&next) else {
                 break;
             };
             let recs = SegmentWriter::recover_direct(&tmp)?;
@@ -33587,8 +33654,14 @@ impl Db {
             let opts = Db::segment_opts(&self.opts);
             let mut w = PieceWriter::create(&tmp, &opts, 0, self.opts.inline_bytes)?;
             // Where the run stands in the history: its records take the
-            // sequence numbers from here, one each, as they commit.
-            w.set_run_start(self.wal.seq)?;
+            // sequence numbers from here, one each, as they commit. And
+            // whether everything before it is behind a sync as it begins
+            // -- nothing in the log unsynced, no file of the log or run
+            // that closed loose, no name owed a barrier -- which is what
+            // a sync by policy would find nothing to do for: the open
+            // refuses a gap before a run that says so (`RUN_NOTE_CHAINED`).
+            let chained = !self.owes_sync();
+            w.set_run_start(self.wal.seq, chained)?;
             if self.r.mem().stream && self.opts.direct_derive_keys {
                 // The table keeps the keys; the writer counts them and
                 // the close reads them from there.
@@ -33700,12 +33773,7 @@ impl Db {
             // so whatever was written before this run and left unsynced
             // -- the log's frames, a run that closed loose -- is synced
             // first; nothing, under a policy that syncs every commit.
-            if self.wal.frames_unsynced()
-                || self.wal.loose
-                || self.wal_dir_unsynced
-                || !self.loose_wals.is_empty()
-                || !self.loose_runs.is_empty()
-            {
+            if self.owes_sync() {
                 self.sync_wal()?;
             }
             self.sync_run()?;
@@ -33833,8 +33901,17 @@ impl Db {
         // Loose where a commit of the run is unsynced, and where its temp
         // name is behind no barrier, which after a sync of the file is a
         // barrier that failed: either way a machine's crash may take the
-        // run, and the next sync by policy owes it (`sync_wal`).
-        let loose = ((d.unsynced || !d.named) && !self.draining).then(|| (d.tmp.clone(), d.named));
+        // run, and the next sync by policy owes it (`sync_wal`). A drain
+        // owes it nothing while it succeeds, since it answers behind the
+        // run's durable landing; the run is kept aside for the one that
+        // fails (`drain_run`).
+        let owed = (d.unsynced || !d.named).then(|| (d.tmp.clone(), d.named));
+        let loose = if self.draining {
+            self.drain_run = owed;
+            None
+        } else {
+            owed
+        };
         let end_seq = self.wal.seq;
         // First, since it moves the held state to the latest, and the name
         // below is cut against the same state.
@@ -33986,16 +34063,24 @@ impl Db {
             }
         }
         if let Some((tmp, named)) = loose {
-            self.loose_runs.retain(|r| r.tmp.exists());
-            match File::open(&tmp) {
-                Ok(file) => self.loose_runs.push(LooseRun { tmp, file, named }),
-                // Landed and named already: durable, and nothing's to sync.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-            }
-            self.wal_after_loose_run()?;
+            self.note_loose_run(tmp, named)?;
         }
         Ok(())
+    }
+
+    /// A run that closed with a commit no sync had covered, or with its
+    /// temp name behind no barrier, taken into the list the next sync by
+    /// policy syncs (`sync_wal`), and the log made to say that what
+    /// follows stands past such a run (`wal_after_loose_run`).
+    fn note_loose_run(&mut self, tmp: PathBuf, named: bool) -> Result<()> {
+        self.loose_runs.retain(|r| r.tmp.exists());
+        match File::open(&tmp) {
+            Ok(file) => self.loose_runs.push(LooseRun { tmp, file, named }),
+            // Landed and named already: durable, and nothing's to sync.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        }
+        self.wal_after_loose_run()
     }
 
     /// The log made to say that a run of ordered ingest closed before its
@@ -34587,12 +34672,7 @@ impl Db {
         // the policy had not synced returned with the run's commits, and
         // any frames a table sealed before it had left loose, in the page
         // cache alone.
-        if self.wal.frames_unsynced()
-            || self.wal.loose
-            || self.wal_dir_unsynced
-            || !self.loose_wals.is_empty()
-            || !self.loose_runs.is_empty()
-        {
+        if self.owes_sync() {
             self.sync_wal()?;
         }
         self.sync_run()?;
@@ -34747,7 +34827,21 @@ impl Db {
         self.draining = false;
         self.shared.drain_steps.stamp(13);
         self.shared.drain_steps.report();
-        if let Some(e) = self.presync_failed.take() {
+        let owed = self.drain_run.take();
+        let presync = self.presync_failed.take();
+        if presync.is_some() || sealed.is_err() {
+            // A drain that failed promised nothing, and the run it closed
+            // is as any run that closed unsynced: the next sync by policy
+            // owes it, the log says what follows stands past it, and a
+            // run begun before then does not say everything before it was
+            // synced. Left untracked, it was a run whose unsynced end a
+            // crash could take from under a run that said so.
+            // The drain's own error is the answer, whatever this says.
+            if let Some((tmp, named)) = owed {
+                let _ = self.note_loose_run(tmp, named);
+            }
+        }
+        if let Some(e) = presync {
             return Err(e);
         }
         if sealed.is_ok() {

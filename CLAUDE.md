@@ -1105,7 +1105,11 @@ each gap in them and at their end the run that starts there
 (`Db::fill_runs`) -- and takes a run only where the walk reaches its start:
 one that starts past the walk's end is commits a machine's crash kept
 without the ones before them, and is removed with the frames past that
-point. A gap no run fills is the log's end where a header says something
+point -- unless its note says it began with everything before it behind
+a sync (`RUN_NOTE_CHAINED`, a run begun where `Db::owes_sync` finds
+nothing a sync would have to do), where what is missing before it was
+promised: a record lost, and the open refuses, having asked every run
+left before it removes one. A gap no run fills is the log's end where a header says something
 before the file was left unsynced -- `WAL_LOOSE`, and `WAL_LOOSE_RUN`, the
 kind a run that closes unsynced leaves on the file the next frame goes to
 -- and a record lost anywhere else. A run the open takes becomes a piece,
@@ -2446,6 +2450,35 @@ against what the barrier promises and not against the pass, since a
 thirtieth of the smallest rung had bought back a durable commit that
 depended on the filesystem under it, which no row measures and a reader
 of the guarantee takes for granted.
+
+**A flag set on the word of a comment, found by the next thing to trust
+it.** A reopened log counted the frames it had replayed as synced, under
+a comment that said they were "read back from the device". A killed
+writer leaves its unsynced frames in the page cache, and the open reads
+them from there: a `sync` after the reopen found nothing to sync and
+returned over them, and the log's older files were on no list at all, so
+the first sync by policy after the reopen marked the live file's header
+chained over files it had not synced. Nothing found it for as long as
+the flag stood, since no test reopened a killed store and then asked
+what a sync had left.
+What found it was a new reader of the same predicate: a run of ordered
+ingest now says in its note whether everything before it was synced as
+it began (`RUN_NOTE_CHAINED`), the open refuses a gap before a run that
+says so, and a run that said so falsely is a store that will not open
+after a crash it should have survived -- so every state that reaches the
+question was read for whether its answer was true, and two were not: the
+reopen, and a drain that failed, whose closed run was unsynced and on no
+list. The replayed frames count as unsynced now and the older files are
+the first sync's; a failed drain's run is loose as any run that closed
+unsynced is (`Db::drain_run`); and the question has one definition
+(`Db::owes_sync`), asked by the syncs and by the run. The rules: read
+back is not synced, and a flag that says "durable" is set by a sync this
+process issued or by nothing; a predicate a new mechanism leans on is
+audited at every state that reaches it, the recovery's and the failure's
+first, since the old callers only ever asked it to decide a sync that a
+wrong answer made cheaper and never one that a wrong answer made fatal;
+and where a wrong "yes" refuses a store, the tests build the states
+where the answer is "no" and hold the open to opening.
 
 **A length read off the slab that held the exceptions.** The ordered
 table's write log became the range of its entries, its length the

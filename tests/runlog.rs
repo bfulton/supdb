@@ -728,6 +728,215 @@ fn a_barrier_that_fails_is_owed_until_it_is_made() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// Batch `b` of writes into the log: keys in falling order under the
+/// store's greatest, so that none of them continues a run.
+fn logged_batch(db: &mut Db, b: u64) {
+    for j in (0..BATCH).rev() {
+        db.put(&key((1_000 - b) * BATCH + j), &VALUE);
+    }
+    db.commit().unwrap();
+}
+
+/// What an open replays from the log is not thereby synced. A killed
+/// writer leaves its unsynced frames in the page cache, the open reads
+/// them back from there, and they are no nearer the device for it: a
+/// `sync` after the reopen syncs them, in the live file and in the files
+/// before it, where it once found the log "synced" and returned.
+#[test]
+fn a_sync_after_a_reopen_covers_what_the_open_replayed() {
+    let d = dir("reopen-sync");
+    let mut db = Db::create(&d, inline(buffered())).unwrap();
+    logged_batch(&mut db, 0);
+    assert_eq!(db.runs_unsynced(), (None, 0), "the batch went to a run");
+    let (_, synced, written) = db.wal_durable();
+    assert!(synced < written, "the policy synced the batch");
+    db.crash();
+
+    let mut db = Db::open(&d, inline(buffered())).unwrap();
+    let (_, synced, written) = db.wal_durable();
+    assert!(
+        synced < written,
+        "the open counted the frames it replayed as synced, {synced} of {written}"
+    );
+    db.sync().unwrap();
+    let (_, synced, written) = db.wal_durable();
+    assert_eq!(synced, written, "`sync` left replayed frames unsynced");
+    db.crash();
+    let _ = std::fs::remove_dir_all(&d);
+
+    // Two files of the log: the first closed by size with its frames
+    // unsynced, the second live. Neither seal lands, so neither retires.
+    let d = dir("reopen-sync-files");
+    let mut db = Db::create(&d, buffered()).unwrap();
+    db.hold_seal_landing(true);
+    let mut b = 0;
+    while names(&d, "wal-").len() < 2 {
+        logged_batch(&mut db, b);
+        b += 1;
+        assert!(b < 64, "the log never rotated");
+    }
+    logged_batch(&mut db, b);
+    db.crash();
+
+    let mut db = Db::open(&d, inline(buffered())).unwrap();
+    assert!(names(&d, "wal-").len() >= 2, "{:?}", names(&d, "wal-"));
+    let before = db.seal_waits().loose_synced;
+    db.sync().unwrap();
+    assert!(
+        db.seal_waits().loose_synced > before,
+        "`sync` after a reopen left the log's older files as the writer before left them"
+    );
+    for k in 0..=b {
+        assert_eq!(
+            values(&db, &key((1_000 - k) * BATCH)),
+            vec![VALUE.to_vec()],
+            "batch {k}"
+        );
+    }
+    db.crash();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A run that began with everything before it behind a sync says so, and
+/// an open that finds the history ending before such a run has found a
+/// record lost: it refuses, and removes nothing. The same run after one
+/// whose commits no sync had covered says nothing of the kind, and goes
+/// with the tail a crash took, as the tests above hold.
+#[test]
+fn a_run_begun_behind_a_sync_refuses_a_gap_before_it() {
+    // Every commit synced: the first run closed by a seal, a second run
+    // behind it, and the first run's file gone -- which no crash does to a
+    // file whose every commit was synced and whose name is behind a
+    // barrier.
+    let d = dir("chained-always");
+    let always = || Options {
+        sync: SyncPolicy::Always,
+        seal_bytes: 1 << 20,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, always()).unwrap();
+    db.hold_seal_landing(true);
+    ordered_batch(&mut db, 0);
+    ordered_batch(&mut db, 1);
+    db.seal().unwrap();
+    ordered_batch(&mut db, 2);
+    ordered_batch(&mut db, 3);
+    db.crash();
+    let runs = names(&d, "direct-");
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    std::fs::remove_file(d.join(&runs[0])).unwrap();
+    let e = match Db::open(&d, always()) {
+        Ok(_) => panic!("a store missing a synced run opened, without the run after it either"),
+        Err(e) => e,
+    };
+    assert!(e.to_string().contains("a record is lost"), "{e}");
+    assert_eq!(
+        names(&d, "direct-"),
+        vec![runs[1].clone()],
+        "the refusal changed what it refused"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+
+    // A sync every fourth commit. The first run takes two commits and
+    // closes with them unsynced; the second begins over it, loose, and
+    // the policy's sync falls in it and covers both; the third begins
+    // after that sync, with everything before it synced. With the first
+    // run gone the second is past the history's end and says nothing, the
+    // third is past it and says a record is lost: the open refuses, and
+    // the second run is still there.
+    let d = dir("chained-everyn");
+    let everyn = || Options {
+        sync: SyncPolicy::EveryN(4),
+        seal_bytes: 1 << 20,
+        adaptive_shape: false,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, everyn()).unwrap();
+    db.hold_seal_landing(true);
+    ordered_batch(&mut db, 0);
+    ordered_batch(&mut db, 1);
+    db.seal().unwrap();
+    assert_eq!(db.runs_unsynced(), (None, 1));
+    ordered_batch(&mut db, 2);
+    ordered_batch(&mut db, 3);
+    assert_eq!(db.runs_unsynced(), (Some(false), 0), "the policy's fourth");
+    db.seal().unwrap();
+    ordered_batch(&mut db, 4);
+    db.crash();
+    let runs = names(&d, "direct-");
+    assert_eq!(runs.len(), 3, "{runs:?}");
+    std::fs::remove_file(d.join(&runs[0])).unwrap();
+    let e = match Db::open(&d, everyn()) {
+        Ok(_) => panic!("a store missing a synced run opened"),
+        Err(e) => e,
+    };
+    assert!(e.to_string().contains("a record is lost"), "{e}");
+    assert_eq!(
+        names(&d, "direct-"),
+        runs[1..].to_vec(),
+        "the refusal removed a run before it refused"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A run says everything before it was synced only where it was. Two
+/// states a writer reaches with nothing in its lists and something
+/// unsynced all the same: frames a reopen replayed, which a killed writer
+/// left in the page cache, and a run a failed drain closed. A run begun
+/// over either says nothing, and a crash that takes the unsynced tail
+/// before it takes the run with it and no more: the store opens.
+#[test]
+fn a_run_begun_over_something_unsynced_does_not_say_otherwise() {
+    // Frames replayed at a reopen, never synced; a seal; a run.
+    let d = dir("unchained-reopen");
+    let mut db = Db::create(&d, inline(buffered())).unwrap();
+    logged_batch(&mut db, 0);
+    db.crash();
+    let mut db = Db::open(&d, buffered()).unwrap();
+    db.hold_seal_landing(true);
+    db.seal().unwrap();
+    for j in 0..BATCH {
+        db.append(&key(2_000 * BATCH + j), &VALUE);
+    }
+    db.commit().unwrap();
+    assert_eq!(db.runs_unsynced().0, Some(true), "the batch opened no run");
+    db.crash();
+    // The crash a machine makes of it: the log's frames gone, the run's
+    // file whole.
+    for w in names(&d, "wal-") {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(d.join(w))
+            .unwrap()
+            .set_len(8)
+            .unwrap();
+    }
+    let db = match Db::open(&d, inline(buffered())) {
+        Ok(db) => db,
+        Err(e) => panic!("a run begun over unsynced frames said they were synced: {e}"),
+    };
+    assert!(values(&db, &key(2_000 * BATCH)).is_empty());
+    assert!(values(&db, &key(1_000 * BATCH)).is_empty());
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+
+    // A drain that fails at its landing, its run unsynced; a run after it.
+    let d = dir("unchained-drain");
+    let mut db = Db::create(&d, buffered()).unwrap();
+    ordered_batch(&mut db, 0);
+    ordered_batch(&mut db, 1);
+    db.fail_next_landing();
+    db.flush()
+        .expect_err("the landing failed and the flush answered");
+    assert_eq!(
+        db.runs_unsynced(),
+        (None, 1),
+        "the run a failed drain closed is nobody's to sync"
+    );
+    db.crash();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// A run's file from before runs took sequence numbers names no start, and
 /// is taken as those were, wherever it stands: a store a release from
 /// before was killed over opens with what that release would have found.
