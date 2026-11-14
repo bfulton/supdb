@@ -175,16 +175,21 @@ What an engine picker would hit, roughly in order.
   end and removed with it, synced or not: a run's note that said whether
   everything before it was synced when it began, as a WAL file's kind
   says, would make that a refusal too.
-- [ ] **Small buffered bursts pay the filing at their commits.** With the
-  forms filed at write time by default (`Options::forms_settle_every`,
-  `forms_settle_builds`), the buffered arm's lag bursts at the two
-  smallest rungs run behind the arm that files late, in nearly every
-  pair, and the pass after the burst gains nothing for it:
-  `bench/scripts/pair.sh supdb-ingestsettlelate supdb-ingest 30000
-  --passes load,lag`, and the same at 10000, at `5df99d6`. Where the
-  time goes inside those commits is not decomposed yet; whatever gates
-  the filing there is priced on every cell the gate crosses, the bounded
-  rungs' among them.
+- [ ] **A buffered burst of one commit pays the filing in that commit.** A
+  commit near reads files its batch (`Options::forms_settle_every`), and
+  where a burst is one commit the filing is in the burst: the buffered
+  arm's one-percent burst at thirty thousand keys runs at two thirds to
+  four fifths of the arm that files late, behind in thirty-one pairs of
+  thirty-two across both orders (`bench/scripts/pair.sh
+  supdb-ingestsettlelate supdb-ingest 30000 --passes load,lag --reps 16`
+  at `8eb02b6`). Since that commit stopped building what it filed into
+  (`forms_settle_builds_filed` off) the pass after it makes the
+  difference back, the point's weighted sum level in both sittings, and
+  the quick row at `0526b89` has the burst ahead of both comparators. The
+  ten-percent burst at ten thousand keys, behind in the same pairing at
+  `5df99d6`, is unresolved by it now and sits level with LMDB's without
+  sync in the rows. What the filing costs a burst of one commit is not
+  decomposed.
 - [x] **Order ordered ingest's runs across a machine's crash.** Under a
   policy that does not sync at every commit (`SyncPolicy::EveryN`), a
   machine's crash could keep a later run, or frames in the log, and take
