@@ -380,6 +380,10 @@ pub struct Supdb {
     path: PathBuf,
     /// The store's directory is under a key (`Policy::dir_key`).
     dirkey: bool,
+    /// The store is under a cipher of the caller's (`Policy::cipher`), or
+    /// is that store's twin in the clear (`Policy::cipher_base`).
+    cipher: bool,
+    cipher_base: bool,
     /// False for the ingest-first arm: a flush stops partitioning what it
     /// sealed and leaves that to the background -- promotion at once, a
     /// merge for the rest (`Options::flush_schedules`). Both arms exist so
@@ -1235,6 +1239,18 @@ struct Policy {
     /// has to stand on a filesystem that can encrypt
     /// (`scripts/fscrypt.sh`), and so has the arm it is paired with.
     dir_key: bool,
+    /// The store under a cipher the caller supplies (`Options::cipher`),
+    /// here AES-256-GCM: `supdb-cipher` and `supdb-ingestcipher`. Its
+    /// files are memory files and its directory their envelopes, and it
+    /// runs with ordered ingest through the log and the compact form off
+    /// whatever it is asked, so it is priced twice: against
+    /// `cipher_base`, which is what the cipher alone costs, and against
+    /// `supdb`, which is what the mode costs.
+    cipher: bool,
+    /// `supdb` with the two options a cipher fixes and no cipher
+    /// (`supdb-cipherbase`, `supdb-ingestcipherbase`): the store a cipher
+    /// runs, in the clear.
+    cipher_base: bool,
     partition: bool,
     drain: bool,
     advice: Option<supdb::ReadAdvice>,
@@ -1931,6 +1947,8 @@ impl Default for Policy {
     fn default() -> Policy {
         Policy {
             dir_key: false,
+            cipher: false,
+            cipher_base: false,
             partition: true,
             drain: true,
             advice: None,
@@ -2148,6 +2166,55 @@ impl Supdb {
             path,
             Policy {
                 dir_key: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` under a cipher the caller supplies (`Options::cipher`).
+    pub fn create_cipher(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` as a cipher runs it, in the clear: ordered ingest through
+    /// the log and the compact form off. The pair of `supdb-cipher` that
+    /// differs by the cipher alone.
+    pub fn create_cipherbase(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher_base: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` under a cipher, and its twin in the clear.
+    pub fn create_ingest_cipher(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher: true,
+                partition: false,
+                durable: false,
+                ..Policy::default()
+            },
+        )
+    }
+
+    pub fn create_ingest_cipherbase(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                cipher_base: true,
+                partition: false,
+                durable: false,
                 ..Policy::default()
             },
         )
@@ -6474,6 +6541,8 @@ impl Supdb {
     fn with_policy(path: &Path, policy: Policy) -> Res<Supdb> {
         let Policy {
             dir_key,
+            cipher,
+            cipher_base,
             partition,
             drain,
             advice,
@@ -7076,11 +7145,29 @@ impl Supdb {
             dir_key: dir_key.then(|| supdb::DirKey::new([0x5a; 32])),
             ..opts
         };
+        // What a cipher fixes, set for its twin in the clear as well, so
+        // the pair differs by the cipher and nothing else.
+        let opts = if cipher || cipher_base {
+            supdb::Options {
+                direct_ingest: false,
+                zpages: supdb::ZPages::Off,
+                recycle_wal: false,
+                ..opts
+            }
+        } else {
+            opts
+        };
+        let opts = supdb::Options {
+            cipher: cipher.then(|| supdb::StoreCipher::new(Gcm::new(), Gcm::of)),
+            ..opts
+        };
         let db = supdb::Db::create(path, opts).map_err(|e| e.to_string())?;
         Ok(Supdb {
             db: Some(db),
             path: path.to_path_buf(),
             dirkey: dir_key,
+            cipher,
+            cipher_base,
             partition,
             drain,
             advice,
@@ -7347,6 +7434,14 @@ impl Engine for Supdb {
                 "supdb-dirkey"
             } else {
                 "supdb-ingestdirkey"
+            };
+        }
+        if self.cipher || self.cipher_base {
+            return match (self.cipher, self.durable) {
+                (true, true) => "supdb-cipher",
+                (true, false) => "supdb-ingestcipher",
+                (false, true) => "supdb-cipherbase",
+                (false, false) => "supdb-ingestcipherbase",
             };
         }
         // The pinned shapes alone name an arm; a field that follows the
@@ -9211,8 +9306,14 @@ struct Gcm(ring::aead::LessSafeKey);
 
 impl Gcm {
     fn new() -> Gcm {
-        let key = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &[0x5a; 32])
-            .expect("a 32-byte key");
+        Gcm::of(&[0x5a; 32])
+    }
+
+    /// The cipher under `key`: what a store under a cipher makes one of for
+    /// each key it draws (`supdb::StoreCipher`).
+    fn of(key: &[u8; 32]) -> Gcm {
+        let key =
+            ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, key).expect("a 32-byte key");
         Gcm(ring::aead::LessSafeKey::new(key))
     }
 }
@@ -9564,6 +9665,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-advicerandom"
         | "supdb-nocache"
         | "supdb-dirkey"
+        | "supdb-cipher"
+        | "supdb-cipherbase"
         | "supdb-nocacheordread"
         | "supdb-nocachezpages"
         | "supdb-nocachezpagesnodrop"
@@ -9845,6 +9948,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "rocksdb-nosync"
         | "rocksdb-tuned-nosync"
         | "supdb-ingestdirkey"
+        | "supdb-ingestcipher"
+        | "supdb-ingestcipherbase"
         // A write-once segment makes nothing durable before its one sync.
         | "supdb-segment"
         | "supdb-segment-enc"
@@ -9904,6 +10009,10 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nocache" => supdb_arm(Supdb::create_nocache, dir)?,
         "supdb-dirkey" => supdb_arm(Supdb::create_dirkey, dir)?,
         "supdb-ingestdirkey" => supdb_arm(Supdb::create_ingest_dirkey, dir)?,
+        "supdb-cipher" => supdb_arm(Supdb::create_cipher, dir)?,
+        "supdb-cipherbase" => supdb_arm(Supdb::create_cipherbase, dir)?,
+        "supdb-ingestcipher" => supdb_arm(Supdb::create_ingest_cipher, dir)?,
+        "supdb-ingestcipherbase" => supdb_arm(Supdb::create_ingest_cipherbase, dir)?,
         "supdb-nocacheordread" => supdb_arm(Supdb::create_nocache_ordread, dir)?,
         "supdb-nocachezpages" => supdb_arm(Supdb::create_nocache_zpages, dir)?,
         "supdb-nocachezpagesnodrop" => supdb_arm(Supdb::create_nocache_zpages_nodrop, dir)?,

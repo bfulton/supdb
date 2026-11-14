@@ -375,3 +375,41 @@ fn a_directory_under_one_key_refuses_a_store_under_another() {
     let _ = std::fs::remove_dir_all(&outer);
     assert!(dirkey::lock(&encrypting().0, &key).unwrap());
 }
+
+/// The two ways a store is kept under a key, together: the kernel encrypts
+/// the directory, and the store seals what it writes into it under the
+/// caller's cipher (`Options::cipher`). The store reads as itself, opens
+/// again under both, and is refused under the key without the cipher; and
+/// the files in its directory are a store under a cipher's.
+#[test]
+#[ignore = "needs a filesystem that can encrypt: scripts/check.sh fscrypt"]
+fn a_store_under_a_key_and_a_cipher_is_under_both() {
+    let (dir, key) = (on_the_filesystem("both"), key(16));
+    let both = || Options {
+        cipher: Some(supdb::StoreCipher::new(
+            common::Gcm::new(&[16; 32]),
+            common::Gcm::new,
+        )),
+        ..under(&key)
+    };
+    let n = 6_000;
+    {
+        let mut db = Db::create(&dir, both()).unwrap();
+        fill(&mut db, n);
+        holds(&db, n);
+    }
+    assert_eq!(dirkey::state(&dir).unwrap(), DirState::Unlocked);
+    holds(&Db::open(&dir, both()).unwrap(), n);
+    assert!(
+        Db::open(&dir, under(&key)).is_err(),
+        "the key without the cipher"
+    );
+    for name in names(&dir) {
+        let known = name == "supdb.cipher"
+            || name.starts_with("manifest")
+            || name.starts_with("wal-")
+            || name.starts_with("x-");
+        assert!(known, "a file named {name}");
+    }
+    holds(&Db::open(&dir, both()).unwrap(), n);
+}

@@ -277,7 +277,16 @@ store under a key: `supdb-dirkey` is `supdb`, and `supdb-ingestdirkey`
 (`Options::dir_key`). Both arms of that pairing stand on a filesystem that
 can encrypt, which `scripts/fscrypt.sh` makes in a file behind a loop
 device, so `ab` names the device at its table's head and its rates are
-read as two arms on one device and not as a disk's.
+read as two arms on one device and not as a disk's. And a store under a
+cipher of the caller's (`Options::cipher`), here AES-256-GCM:
+`supdb-cipher` and `supdb-ingestcipher`. Such a store runs with ordered
+ingest through the log and the compact form off whatever it is asked, so
+it has a twin in the clear with the same two settings, `supdb-cipherbase`
+and `supdb-ingestcipherbase`, and is paired twice: against its twin, which
+differs by the cipher and the memory files alone, and against `supdb`,
+which is what the mode costs with what it forgoes. The suite does not
+reopen a store, so what an open under a cipher costs, the whole store
+decrypted, is `cargo run --release --example cipher_store` and no cell.
 
 ## Scale
 

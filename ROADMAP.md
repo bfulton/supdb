@@ -157,14 +157,49 @@ What an engine picker would hit, roughly in order.
   so its reads lend from the mapping as they did (`supdb::dirkey`). It is
   Linux's file encryption, on a filesystem that has it, and it is refused
   anywhere else rather than written in the clear.
-- [ ] **A store under a key on another platform, or a filesystem without
-  the feature.** The kernel's encryption is ext4's and f2fs's on Linux. A
-  store that encrypted its own files would go anywhere, and would hold
-  every byte it reads in memory of its own, where the page cache holds it
-  now: the envelope's reader does that for a finished segment
-  (`supdb::crypt`), and for a live store it is the log, the segments in
-  flight, the manifest, the indexes and the form files as well, and the
-  engine's accounting out of core with them. Not started, and not decided.
+- [x] **A live store under a cipher the caller supplies.** A store opens
+  under a cipher of the caller's (`Options::cipher`) and seals everything
+  it writes to its directory under it: the segments and their indexes as
+  envelopes, the log record by record, the manifest slot by slot, and the
+  files' names, which stay in the manifest. Its plaintext is held in memory
+  files and read by lending from their mappings, so a read runs the code a
+  plain store's runs. The caller's cipher wraps the store's own key and
+  nothing else, each file is under a key drawn for it, and
+  `supdb::cipher_rewrap` hands a store from one of the caller's keys to
+  another without touching a file (`supdb::db::vault`). On any filesystem,
+  Linux only. What it does not do yet is the four items below.
+- [ ] **An envelope written beside its segment.** A plain segment's bytes
+  go to the device while the segment is built, and its fsync finds little
+  left to write; a segment under a cipher is encrypted and written after
+  it is finished, since the envelope's check covers the file's length and
+  nothing can be sealed before the length is known. That is the whole of
+  what the pairings show against the same store in the clear: the loads
+  slower, and a merge's landing later. Done when the segment writer hands
+  finished pieces to the cipher as it writes them, which wants an
+  envelope whose chunks do not bind the length, and a last chunk that says
+  it is the last.
+- [ ] **A store under a cipher larger than memory.** The plaintext is in
+  memory whole, and an open decrypts all of it. A file decrypted when it
+  is first read, and put out again under a bound, is what the envelope's
+  reader does for a finished segment (`supdb::crypt`); for a live store it
+  is every read path over a source that may have to decrypt, where the
+  engine is written over one mapping.
+- [ ] **Ordered ingest and the compact form under a cipher.** Both are
+  off there: ordered ingest's run is a segment synced at every commit,
+  which a memory file cannot be, so an ordered load goes through the log;
+  and the compact form is for a store its memory does not hold. The first
+  wants the streamed envelope above, with a record sealed a commit.
+- [ ] **A store under a cipher on another platform.** The memory files are
+  Linux's (`memfd_create`); elsewhere the store is refused before it writes
+  anything.
+- [ ] **The first single-threaded pass of point reads under a cipher.** It
+  ran about a tenth behind the same store in the clear at a hundred
+  thousand keys in five sittings of six, and a twentieth at three hundred
+  thousand in the buffered pair, with the threaded passes after it and the
+  read mixes level. A merge's later landing accounts for some of
+  it and the memory files' small pages may account for the rest; neither
+  is established. `bench/scripts/pair.sh supdb-cipher supdb-cipherbase
+  100000 --passes load,read` is the pairing.
 - [ ] **A store under a key, priced on a kernel with hardware AES.** The
   pairings of `supdb-dirkey` against `supdb` ran where the kernel has no
   AES instructions built in (`/proc/crypto` names `aes-fixed-time`): reads,

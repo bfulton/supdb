@@ -67,6 +67,12 @@
 //! - `ZFUZZ_MERGEPAR=n`: both stores run up to `n` partition merges at
 //!   once over disjoint ranges (`Options::merge_parallel`); a flag and not
 //!   a draw.
+//! - `ZFUZZ_CIPHER=1`: the `z` store is kept under a cipher
+//!   (`Options::cipher`) and `r` in the clear, so a store whose files are in
+//!   memory and whose directory is sealed is read against the model and
+//!   against a plain store over the same writes, across closes and crashes.
+//!   `fuzz_range_under_a_cipher` is the range run so with nothing set, and
+//!   the variable is for the other tests and for a range run by hand.
 //! - `ZFUZZ_NOPUT`, `ZFUZZ_NOBURST`: set, no puts, or no ordered bursts.
 //! - `ZFUZZ_SEEDKEY=1`: the store's first write is a key of its own, and
 //!   one goes ahead of every write of the empty key, so that no write of
@@ -86,6 +92,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use supdb::{Db, Options, Reader, SyncPolicy, Upkeep};
+
+mod common;
 
 /// The seeds a run with no range takes: few, because the test lives in the gate.
 const DEFAULT_SEEDS: u64 = 4;
@@ -116,6 +124,15 @@ thread_local! {
     /// return an error are far from the loop that knows it, and the failure
     /// line names it.
     static STEP: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) };
+    /// Whether this thread's seeds keep `z` under a cipher: the test that
+    /// runs the range so sets it, and `ZFUZZ_CIPHER` sets it for every
+    /// test. A thread's and not the process's, since the tests of a binary
+    /// run beside each other.
+    static CIPHER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn under_cipher() -> bool {
+    CIPHER.get() || env_flag("ZFUZZ_CIPHER")
 }
 
 type Model = BTreeMap<Vec<u8>, Vec<Vec<u8>>>;
@@ -360,11 +377,29 @@ fn opts_z(c: &Cfg) -> Options {
         o.zpages_both = true;
         o.zpages_drop_raw = true;
     }
+    // Under `ZFUZZ_CIPHER` the `z` store is kept under a cipher
+    // (`Options::cipher`) while `r` is in the clear over the same writes:
+    // its files in memory, its directory sealed, its ordered bursts through
+    // the log, and a crash there a store whose memory is gone, reopened
+    // from what its directory holds.
+    o = with_cipher(o);
     if env_flag("ZFUZZ_PROMOTE") && c.cache {
         o.promote_entries = 8;
         o.zpages_promote_copies = true;
         o.scan_cache_bytes = 32 << 10;
         o.forms_to_fit = true;
+    }
+    o
+}
+
+/// `o` under a cipher where the thread's seeds run so (`under_cipher`), and
+/// as it is otherwise.
+fn with_cipher(mut o: Options) -> Options {
+    if under_cipher() {
+        o.cipher = Some(supdb::StoreCipher::new(
+            common::Gcm::new(&[0x5a; 32]),
+            common::Gcm::new,
+        ));
     }
     o
 }
@@ -750,7 +785,9 @@ fn cfg_line(c: &Cfg) -> String {
 fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, String> {
     let mut rng = Rng::new(seed);
     let cfg = pick_cfg(&mut rng, want_cache);
-    let tag = format!("s{seed}");
+    // A directory of its own for the range that runs under a cipher beside
+    // the plain one, over the same seeds.
+    let tag = format!("s{seed}{}", if CIPHER.get() { "c" } else { "" });
     let (dz, dr) = (scratch(&format!("{tag}-z")), scratch(&format!("{tag}-r")));
     if verbose {
         eprintln!("seed {seed}: {cfg:?}");
@@ -1141,6 +1178,21 @@ fn run_seed_inner(seed: u64, want_cache: bool, verbose: bool) -> Result<Stats, S
 
 #[test]
 fn fuzz_range() {
+    run_range();
+}
+
+/// The range again with `z` kept under a cipher (`Options::cipher`) and
+/// `r` in the clear: the store whose files are in memory and whose
+/// directory is sealed, read against the model and against a plain store
+/// over the same writes, with each crash a store whose memory is gone.
+#[test]
+#[cfg(target_os = "linux")]
+fn fuzz_range_under_a_cipher() {
+    CIPHER.set(true);
+    run_range();
+}
+
+fn run_range() {
     let from = env_u64("ZFUZZ_FROM").unwrap_or(0);
     let to = env_u64("ZFUZZ_TO").unwrap_or(from + DEFAULT_SEEDS);
     let want_cache =
@@ -1200,7 +1252,7 @@ fn run_concurrent(seed: u64, secs_ops: usize, snapshots: bool) -> Result<(), Str
     let mut rng = Rng::new(seed ^ 0xC0FFEE);
     let cfg = pick_cfg(&mut rng, false);
     let dir = scratch(&format!("c{seed}"));
-    let mut db = Db::create(&dir, opts(&cfg)).map_err(|e| format!("create: {e}"))?;
+    let mut db = Db::create(&dir, with_cipher(opts(&cfg))).map_err(|e| format!("create: {e}"))?;
     let nkeys = 150 + rng.below(250);
     let keys: Arc<Vec<Vec<u8>>> = Arc::new(
         (0..nkeys)

@@ -10,42 +10,12 @@
 //! layout is written down in Rust and in JavaScript, and that file is what
 //! keeps the two from drifting.
 
-use ring::aead::{Aad, LessSafeKey, Nonce, Tag, UnboundKey, AES_256_GCM};
 use std::path::{Path, PathBuf};
-use supdb::crypt::{self, Aead, EncryptOptions, Encrypted, Header, ReadOptions, NONCE, TAG};
+use supdb::crypt::{self, EncryptOptions, Encrypted, Header, ReadOptions};
 use supdb::{Blob, Bytes, MmapBytes, SegmentOptions, SegmentWriter, SparseBlob, VecBytes};
 
 mod common;
-use common::{kv, vf};
-
-/// AES-256-GCM, `ring`'s, as the hook takes it: the whole of what a caller
-/// writes.
-struct Gcm(LessSafeKey);
-
-impl Gcm {
-    fn new(key: &[u8; 32]) -> Gcm {
-        Gcm(LessSafeKey::new(
-            UnboundKey::new(&AES_256_GCM, key).expect("a 32-byte key"),
-        ))
-    }
-}
-
-impl Aead for Gcm {
-    fn encrypt(&self, nonce: &[u8; NONCE], aad: &[u8], buf: &mut [u8]) -> [u8; TAG] {
-        let nonce = Nonce::assume_unique_for_key(*nonce);
-        let tag = self
-            .0
-            .seal_in_place_separate_tag(nonce, Aad::from(aad), buf)
-            .expect("a chunk is far under the cipher's limit");
-        tag.as_ref().try_into().expect("a sixteen-byte tag")
-    }
-    fn decrypt(&self, nonce: &[u8; NONCE], aad: &[u8], buf: &mut [u8], tag: &[u8; TAG]) -> bool {
-        let nonce = Nonce::assume_unique_for_key(*nonce);
-        self.0
-            .open_in_place_separate_tag(nonce, Aad::from(aad), Tag::from(*tag), buf, 0..)
-            .is_ok()
-    }
-}
+use common::{kv, vf, Gcm};
 
 const KEY: [u8; 32] = [7; 32];
 

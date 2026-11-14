@@ -23,8 +23,10 @@ from either source.
   and in the browser: an authenticated envelope around the file, under a
   cipher the caller supplies, decrypted once and read after that at the
   plain file's speed.
-- A live store opens under a key: the kernel encrypts its directory, and
-  the store reads as it does without one.
+- A live store opens under a key, either of two ways: the kernel encrypts
+  its directory and the store reads as it does without one, or the store
+  seals everything it writes under a cipher the caller supplies, on any
+  filesystem, and holds its plaintext in memory.
 
 ## Benchmarks
 
@@ -200,7 +202,7 @@ The envelope hides the file's bytes and refuses any change to them: a byte
 altered, a part moved or taken from another file, a file cut short. It does
 not hide the file's length, and an older envelope served whole in place of a
 newer one is still a valid envelope. It covers a finished file; a live
-store takes a key another way, below. The `supdb::crypt` module docs have
+store takes a key in one of two other ways, below. The `supdb::crypt` module docs have
 the layout and how many files one key should be used for.
 
 A live store under a key:
@@ -226,6 +228,52 @@ on) and protects the device: file contents and names, not sizes, and not
 against whoever can read the files while the kernel holds the key
 (`supdb::dirkey::lock` gives it up). The `supdb::dirkey` module docs have
 the rest.
+
+A live store under a cipher you supply:
+
+```rust
+use supdb::{Db, Options, StoreCipher};
+
+// `Gcm` is your cipher behind `supdb::crypt::Aead`, as for an envelope:
+// once under your key, and as the constructor of one from a key the store
+// draws.
+let opts = Options {
+    cipher: Some(StoreCipher::new(Gcm::new(&my_key), Gcm::new).key_id(1)),
+    ..Options::default()
+};
+let mut db = Db::create(std::path::Path::new("./store"), opts)?;
+```
+
+Everything the store writes to its directory is sealed and authenticated:
+the segments, the log, the manifest, and the names of the files, which in
+a plain store carry the first bytes of keys. Your cipher wraps one key, the
+store's own, at `create` and at each `open`, so your key can be slow to
+reach or kept elsewhere; the store draws a key for each file and makes
+their ciphers with your constructor. It needs no filesystem feature and no
+privilege. `create` wants an empty directory; `open` refuses a store that
+is not under the cipher it was given, and a store under a cipher is refused
+where none is given. `supdb::cipher_key_id` reads back the `key_id` of a
+directory without the key, and `supdb::cipher_rewrap` hands a store from
+one of your keys to another by rewriting that one wrapped key.
+
+The store's plaintext is held in memory files, and its reads borrow from
+their mappings as a plain store's borrow from the page cache, so a read
+runs the same code. What that costs: the store has to fit in memory, an
+`open` decrypts all of it, an ordered load goes through the log, each
+segment holds two file descriptors open, and it is Linux only. A byte
+changed anywhere in the directory is refused, or ends the log as a torn
+write does; the whole directory put back to an older copy of itself is
+not detected. `cargo run --release --example cipher_store` has the
+adapter and times an open, and the `supdb::db::vault` module docs have
+the layout, the keys and the limits.
+
+Which of the two a store wants: `dir_key` keeps the page cache, so a store
+larger than memory works and an open decrypts nothing, on ext4 or f2fs
+with `encrypt` on; it does not authenticate, and the files read as
+plaintext to whatever can read them while the kernel holds the key.
+`cipher` goes wherever Linux does, authenticates, and leaves files that
+are ciphertext wherever they are copied, and holds the store in memory.
+A store may be under both.
 
 ## Building
 

@@ -28,7 +28,7 @@
 
 use std::cell::UnsafeCell;
 use std::cmp::Ordering;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Result, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
@@ -78,6 +78,10 @@ pub use zfile::ZInject;
 // A store's directory encrypted by the kernel, under a key the caller gives
 // (`Options::dir_key`).
 pub mod dirkey;
+// A store under a cipher the caller gives (`Options::cipher`): its files in
+// memory, their envelopes in the directory, and the door the engine's file
+// operations go through to reach either.
+pub mod vault;
 
 /// Write a segment's ordered index, and make it durable where `durable`
 /// says so (`Options::ord_durable`).
@@ -97,7 +101,7 @@ fn write_ord(dir: &Path, seg_name: &str, bytes: &[u8], durable: bool) -> Result<
         f.sync_all()?;
     }
     drop(f);
-    std::fs::rename(&tmp, dir.join(&name))?;
+    vault::rename(&tmp, dir.join(&name))?;
     Ok(())
 }
 
@@ -111,7 +115,7 @@ fn write_ord(dir: &Path, seg_name: &str, bytes: &[u8], durable: bool) -> Result<
 /// not name is swept at open with its index.
 fn write_ord_unsynced(dir: &Path, seg_name: &str, bytes: &[u8]) -> Result<File> {
     let (f, tmp, name) = write_ord_tmp(dir, seg_name, bytes)?;
-    std::fs::rename(&tmp, dir.join(&name))?;
+    vault::rename(&tmp, dir.join(&name))?;
     Ok(f)
 }
 
@@ -120,7 +124,7 @@ fn write_ord_unsynced(dir: &Path, seg_name: &str, bytes: &[u8]) -> Result<File> 
 fn write_ord_tmp(dir: &Path, seg_name: &str, bytes: &[u8]) -> Result<(File, PathBuf, String)> {
     let name = Db::ord_name_for(seg_name).ok_or_else(|| err("segment name is malformed"))?;
     let tmp = dir.join(format!("{name}.tmp"));
-    let mut f = File::create(&tmp)?;
+    let mut f = vault::create(&tmp)?;
     f.write_all(bytes)?;
     Ok((f, tmp, name))
 }
@@ -713,6 +717,22 @@ pub struct Options {
     /// encrypted under it. `None`, the default, is a store in the clear,
     /// or one on a directory the kernel already holds the key of.
     pub dir_key: Option<dirkey::DirKey>,
+    /// The cipher the store is kept under, the caller's (`vault`): every
+    /// byte the store writes to its directory is sealed under it -- the
+    /// segments, the log, the manifest, and the names of the files -- and
+    /// authenticated, on any filesystem. The store's plaintext is held in
+    /// memory files, which is what a read lends from as it lends from the
+    /// page cache of a plain store, so reads run the same code; the store
+    /// has to fit in memory, an open decrypts all of it, and ordered ingest
+    /// goes through the log, the compact form is off and the log's files
+    /// are not recycled, whatever the options beside this one say.
+    /// Each of its files is a descriptor held open, two a segment, so a
+    /// large store wants the process's limit on open files raised.
+    /// `Db::create` makes a store under the cipher in an empty directory;
+    /// `Db::open` refuses a store that is not under it, and a store under a
+    /// cipher is refused where none is given. `None`, the default, is a
+    /// store in the clear, or one under `dir_key` alone.
+    pub cipher: Option<vault::StoreCipher>,
     /// Memtable bytes that trigger a seal at the next commit. Sealing is off
     /// the commit path in cost accounting but runs on the committing thread
     /// in milestone 1; the brief's "Segment size" question owns this number.
@@ -3767,6 +3787,7 @@ impl Default for Options {
         Options {
             sync: SyncPolicy::Always,
             dir_key: None,
+            cipher: None,
             // 32 MB seals over 64 MB partitions: measured at 1.129x the
             // ingest of 64 MB seals at identical device bytes and identical
             // reads. Smaller still buys nothing and costs 1.5x the device
@@ -4032,6 +4053,16 @@ struct Wal {
     /// How far from the file's start its pages have been dropped from
     /// the page cache (`Options::wal_drop_bytes`), a page boundary.
     dropped: u64,
+    /// The file's header length: `WAL_MAGIC`'s, or under a cipher that and
+    /// the file's wrapped key.
+    head: u64,
+    /// Under a cipher (`Options::cipher`), the file's: each `write` is one
+    /// record sealed under it, a commit's batch whole, where a plain log
+    /// takes the frames as they are. Replay unseals the records into the
+    /// frames a plain log holds and walks those.
+    enc: Option<vault::LogCipher>,
+    /// The record being sealed.
+    sealed: Vec<u8>,
 }
 
 /// The WAL file starts with eight bytes, this name and a kind byte, so a
@@ -4050,6 +4081,11 @@ struct Wal {
 /// (`Db::sync_wal`). Every file from before the kind byte could say
 /// otherwise reads as chained, which is what its rotation did.
 const WAL_HEAD: &[u8; 7] = b"SUPDBWL";
+/// The name of a log under a cipher, with the kind byte after it as after
+/// the plain name and the file's wrapped key after that: a log of either
+/// sort is refused by name where the other is expected.
+const WAL_HEAD_SEALED: &[u8; 7] = b"SUPDBWE";
+const WAL_SEALED_LEN: usize = WAL_MAGIC.len() + vault::WRAPPED;
 const WAL_CHAINED: u8 = 4;
 const WAL_LOOSE: u8 = 5;
 /// The header of a file begun on a chained boundary.
@@ -4064,7 +4100,13 @@ fn wal_header(kind: u8) -> [u8; 8] {
 
 /// The kind byte of a header, or none for bytes that are not a WAL's header.
 fn wal_kind(header: &[u8]) -> Option<u8> {
-    if header.len() < WAL_MAGIC.len() || &header[..WAL_HEAD.len()] != WAL_HEAD {
+    wal_kind_named(WAL_HEAD, header)
+}
+
+/// `wal_kind` for a log of the name `head`: the plain one's, or a sealed
+/// one's.
+fn wal_kind_named(head: &[u8; 7], header: &[u8]) -> Option<u8> {
+    if header.len() < WAL_MAGIC.len() || &header[..WAL_HEAD.len()] != head {
         return None;
     }
     match header[WAL_HEAD.len()] {
@@ -4089,23 +4131,60 @@ const WAL_COMMIT: u8 = 2;
 
 impl Wal {
     fn create(path: &Path, id: u64, kind: u8) -> Result<Wal> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(path)?;
-        file.write_all(&wal_header(kind))?;
+        let mut file = vault::create(path)?;
+        let (enc, head) = Wal::begin(path, id, kind)?;
+        file.write_all(&head)?;
         Ok(Wal {
             file,
             path: path.to_path_buf(),
             seq: 0,
             pending: Vec::new(),
-            written: WAL_MAGIC.len() as u64,
+            written: head.len() as u64,
             synced: 0,
             seed: wal_seed(id),
             loose: kind == WAL_LOOSE,
             dropped: 0,
+            head: head.len() as u64,
+            enc,
+            sealed: Vec::new(),
         })
+    }
+
+    /// The header a file begun now takes, and under a cipher the file's
+    /// own: the plain header, or the sealed name, the kind, and a key drawn
+    /// for this file and wrapped under the store's.
+    fn begin(path: &Path, id: u64, kind: u8) -> Result<(Option<vault::LogCipher>, Vec<u8>)> {
+        let Some(v) = path.parent().and_then(vault::under) else {
+            return Ok((None, wal_header(kind).to_vec()));
+        };
+        let (enc, wrapped) = v.log_begin(id)?;
+        let mut head = Vec::with_capacity(WAL_SEALED_LEN);
+        head.extend_from_slice(WAL_HEAD_SEALED);
+        head.push(kind);
+        head.extend_from_slice(&wrapped);
+        Ok((Some(enc), head))
+    }
+
+    /// The cipher of the sealed log whose whole bytes, or whose header,
+    /// `buf` is, and its kind: for a store under a cipher, which reads no
+    /// other sort. Nothing for a header a power loss tore before its first
+    /// barrier, which is a log with nothing in it; an error for bytes that
+    /// are not this store's log.
+    fn resume(v: &vault::Vault, id: u64, buf: &[u8]) -> Result<Option<(vault::LogCipher, u8)>> {
+        let foreign =
+            || err("not this store's log: the header is not a sealed log's, or was changed");
+        if buf.len() < WAL_SEALED_LEN {
+            let n = buf.len().min(WAL_HEAD_SEALED.len());
+            if buf[..n] == WAL_HEAD_SEALED[..n] {
+                return Ok(None);
+            }
+            return Err(foreign());
+        }
+        let kind = wal_kind_named(WAL_HEAD_SEALED, buf).ok_or_else(foreign)?;
+        let enc = v
+            .log_resume(id, &buf[WAL_MAGIC.len()..WAL_SEALED_LEN])
+            .ok_or_else(foreign)?;
+        Ok(Some((enc, kind)))
     }
 
     /// Write zeros out to `bytes` so the blocks behind the coming appends
@@ -4120,6 +4199,9 @@ impl Wal {
     /// pieces, every later 100 KB commit cost 11x its bytes at the device;
     /// in 4 KB pieces, 1.04x.
     fn prefill(&mut self, bytes: u64) -> Result<()> {
+        // A plain log's alone: a store under a cipher recycles none
+        // (`under_cipher`).
+        debug_assert!(self.enc.is_none());
         let zeros = vec![0u8; 4096];
         let mut at = self.written;
         while at < bytes {
@@ -4138,8 +4220,8 @@ impl Wal {
     /// as this life appends; replay stops at the first frame whose CRC does
     /// not verify under this id.
     fn recycle(spare: &Path, path: &Path, id: u64, kind: u8) -> Result<Wal> {
-        std::fs::rename(spare, path)?;
-        let mut file = OpenOptions::new().write(true).open(path)?;
+        vault::rename(spare, path)?;
+        let mut file = vault::open_write(path)?;
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&wal_header(kind))?;
         Ok(Wal {
@@ -4152,6 +4234,9 @@ impl Wal {
             seed: wal_seed(id),
             loose: kind == WAL_LOOSE,
             dropped: 0,
+            head: WAL_MAGIC.len() as u64,
+            enc: None,
+            sealed: Vec::new(),
         })
     }
 
@@ -4159,16 +4244,28 @@ impl Wal {
     /// its last commit frame. A file that does not exist yet gets its header
     /// so the next replay finds one.
     fn open_append(path: &Path, id: u64, seq: u64) -> Result<Wal> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let mut file = vault::open_append(path)?;
         let mut written = file.metadata()?.len();
         let mut loose = false;
+        let mut head = WAL_MAGIC.len() as u64;
+        let mut enc = None;
         if written == 0 {
-            file.write_all(WAL_MAGIC)?;
-            written = WAL_MAGIC.len() as u64;
+            let (e, h) = Wal::begin(path, id, WAL_CHAINED)?;
+            file.write_all(&h)?;
+            written = h.len() as u64;
+            head = written;
+            enc = e;
+        } else if let Some(v) = path.parent().and_then(vault::under) {
+            // The file replay accepted: its key from its header, and the
+            // records from here under nonces this open draws.
+            let mut h = [0u8; WAL_SEALED_LEN];
+            file.seek(SeekFrom::Start(0))?;
+            file.read_exact(&mut h)?;
+            let (e, kind) = Wal::resume(&v, id, &h)?
+                .ok_or_else(|| err("a sealed log's header is cut short"))?;
+            loose = kind == WAL_LOOSE;
+            head = WAL_SEALED_LEN as u64;
+            enc = Some(e);
         } else {
             // The kind replay accepted, kept so a sync by policy knows
             // whether the header is to be rewritten chained.
@@ -4180,11 +4277,7 @@ impl Wal {
         // What replay kept was read back from the device, so it counts as
         // synced; a header written just now does not until the first
         // barrier.
-        let synced = if written == WAL_MAGIC.len() as u64 {
-            0
-        } else {
-            written
-        };
+        let synced = if written == head { 0 } else { written };
         Ok(Wal {
             file,
             path: path.to_path_buf(),
@@ -4195,6 +4288,9 @@ impl Wal {
             seed: wal_seed(id),
             loose,
             dropped: 0,
+            head,
+            enc,
+            sealed: Vec::new(),
         })
     }
 
@@ -4263,8 +4359,20 @@ impl Wal {
         if self.pending.is_empty() {
             return Ok(());
         }
-        self.file.write_all(&self.pending)?;
-        self.written += self.pending.len() as u64;
+        match &mut self.enc {
+            None => {
+                self.file.write_all(&self.pending)?;
+                self.written += self.pending.len() as u64;
+            }
+            // One record for what is pending, which is whole batches: every
+            // write follows a `mark_commit`, so a record that fails its
+            // check takes whole commits with it and no part of one.
+            Some(enc) => {
+                enc.seal_into(self.written, &self.pending, &mut self.sealed)?;
+                self.file.write_all(&self.sealed)?;
+                self.written += self.sealed.len() as u64;
+            }
+        }
         self.pending.clear();
         Ok(())
     }
@@ -4301,7 +4409,7 @@ impl Wal {
     /// not hold. The header needs no sync of its own: an open takes a
     /// file short of it, or torn inside it, as a log with nothing in it.
     fn frames_unsynced(&self) -> bool {
-        self.written > self.synced.max(WAL_MAGIC.len() as u64)
+        self.written > self.synced.max(self.head)
     }
 
     /// The header rewritten chained once no file before this one is
@@ -4313,7 +4421,7 @@ impl Wal {
         if !self.loose {
             return Ok(());
         }
-        let mut f = OpenOptions::new().write(true).open(&self.path)?;
+        let mut f = vault::open_write(&self.path)?;
         f.seek(SeekFrom::Start(WAL_HEAD.len() as u64))?;
         f.write_all(&[WAL_CHAINED])?;
         self.loose = false;
@@ -4346,11 +4454,10 @@ impl Wal {
         id: u64,
         from: u64,
         first: bool,
-        mut apply: impl FnMut(u8, &[u8], &[u8]),
+        apply: impl FnMut(u8, &[u8], &[u8]),
     ) -> Result<(u64, u64, bool)> {
-        let seed = wal_seed(id);
         let mut buf = Vec::new();
-        match File::open(path) {
+        match vault::open(path) {
             Ok(mut f) => {
                 f.read_to_end(&mut buf)?;
             }
@@ -4360,6 +4467,37 @@ impl Wal {
         if buf.is_empty() {
             return Ok((from, 0, false));
         }
+        let Some(v) = path.parent().and_then(vault::under) else {
+            return Wal::replay_frames(&buf, id, from, first, apply);
+        };
+        // Under a cipher: the records unsealed, one after another to the
+        // first that fails its check, into the frames a plain log holds
+        // behind a plain header of the file's kind; those walked as a plain
+        // log's are; and the length answered in the file's own bytes, the
+        // end of the last record the walk kept all of.
+        let Some((enc, kind)) = Wal::resume(&v, id, &buf)? else {
+            return Ok((from, 0, false));
+        };
+        let mut frames = wal_header(kind).to_vec();
+        let ends = enc.open_records(&buf, WAL_SEALED_LEN, &mut frames);
+        let (next, valid, ended) = Wal::replay_frames(&frames, id, from, first, apply)?;
+        let valid = ends
+            .iter()
+            .rev()
+            .find(|&&(plain_end, _)| plain_end as u64 <= valid)
+            .map_or(WAL_SEALED_LEN as u64, |&(_, file_end)| file_end);
+        Ok((next, valid, ended))
+    }
+
+    /// `replay` over a plain log's bytes, `buf`.
+    fn replay_frames(
+        buf: &[u8],
+        id: u64,
+        from: u64,
+        first: bool,
+        mut apply: impl FnMut(u8, &[u8], &[u8]),
+    ) -> Result<(u64, u64, bool)> {
+        let seed = wal_seed(id);
         // A file shorter than the header but a prefix of it is a header a
         // power loss tore before its first barrier -- a WAL with nothing in
         // it, not a foreign one. The caller truncates it and the header is
@@ -4882,7 +5020,7 @@ fn z_retire_cell(shared: &Shared, dir: &Path, seg: &Seg) -> Option<PathBuf> {
     let (id, end) = (Db::name_id(&seg.name)?, Db::name_end_seq(&seg.name)?);
     let n = shared.next_dead.fetch_add(1, AtomicOrdering::Relaxed);
     let dead = dir.join(zfile::zpg_dead_name(n));
-    std::fs::rename(dir.join(zfile::zpg_name(id, end)), &dead)
+    vault::rename(dir.join(zfile::zpg_name(id, end)), &dead)
         .ok()
         .map(|_| dead)
 }
@@ -6398,12 +6536,7 @@ impl SegmentWriter {
         block::CHECKSUMS.store(opts.checksums, std::sync::atomic::Ordering::Relaxed);
         // Read as well as write: `finish` reads the streamed records back to
         // compute the key section's checksum row.
-        let file = OpenOptions::new()
-            .read(true)
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(path)?;
+        let file = vault::create_rw(path)?;
         let mut out = AlignedWriter::new(
             file,
             opts.write_piece,
@@ -6719,7 +6852,7 @@ impl SegmentWriter {
     /// the records before it; what follows the last good marker is a
     /// batch that never committed.
     pub fn recover_direct(path: &Path) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let buf = std::fs::read(path)?;
+        let buf = vault::read(path)?;
         let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut committed = 0usize;
         let mut p = crate::format::SUPER as usize + flatindex::HEADER;
@@ -7964,7 +8097,7 @@ impl Seg {
         self.ord.advise_dontneed();
         let names = [Some(self.name.clone()), Db::ord_name_for(&self.name)];
         for name in names.into_iter().flatten() {
-            if let Ok(f) = std::fs::File::open(dir.join(&name)) {
+            if let Ok(f) = vault::open(dir.join(&name)) {
                 fadvise_dontneed(&f);
             }
         }
@@ -8073,7 +8206,7 @@ impl Seg {
         verify_index: bool,
         facts: Option<(BlockedBloom, bool)>,
     ) -> Result<Seg> {
-        let src = MmapBytes::open(&dir.join(name)).map_err(|e| {
+        let src = vault::map(dir.join(name)).map_err(|e| {
             // A manifest naming a segment that is not on disk is a damaged
             // store, not a missing file, and saying so is the difference
             // between a diagnosis and an ENOENT.
@@ -11101,7 +11234,7 @@ fn grow_run_map(mem: &MemTable, tmp: &Path, written: u64, shared: &Shared) -> Re
 
 impl RunMap {
     fn open(path: &Path, cap: usize) -> Result<RunMap> {
-        let file = File::open(path)?;
+        let file = vault::open(path)?;
         // SAFETY: the file is appended to and never truncated or edited in
         // the record bytes while a table maps it (`SegmentWriter` patches
         // only its head reserve, which no reference names), and a read
@@ -11160,6 +11293,22 @@ fn ref_pack(off: u64, len: u32) -> u64 {
 /// published snapshot, replaced a state and freed it under the writer's
 /// read, and the suite's unpinned arm faulted in a third of its runs once
 /// the segment work moved to a thread of its own.
+/// What a store under a cipher runs with whatever it was asked for
+/// (`Options::cipher`), each for the same reason: a file the engine makes
+/// durable by its own fsync is a memory file there, and the fsync is of
+/// nothing. Ordered ingest's run is a segment open for append and synced
+/// at every commit, so its batches go through the log, whose records the
+/// engine seals as it writes them. The compact form is a second copy of a
+/// partition for a store whose first does not fit the page cache, and a
+/// store under a cipher is held in memory whole. And a recycled log file
+/// is one written through before its first record, to be written again in
+/// place.
+fn under_cipher(opts: &mut Options) {
+    opts.direct_ingest = false;
+    opts.zpages = ZPages::Off;
+    opts.recycle_wal = false;
+}
+
 fn check_options(opts: &Options) -> Result<()> {
     if opts.direct_stream && opts.direct_table_refs {
         return Err(err(
@@ -11233,10 +11382,9 @@ fn is_manifest_spare(name: &str) -> bool {
 /// Every spare in `dir` removed: at open, and when the segment work is
 /// idle.
 fn sweep_manifest_spares(dir: &Path) -> Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let name = entry?.file_name();
-        if is_manifest_spare(&name.to_string_lossy()) {
-            let _ = std::fs::remove_file(dir.join(name));
+    for name in vault::names(dir)? {
+        if is_manifest_spare(&name) {
+            let _ = vault::remove_file(dir.join(name));
         }
     }
     Ok(())
@@ -11268,6 +11416,46 @@ fn manifest_encode(seq: u64, covered_seq: u64, names: &[String], pending: &[Stri
     out
 }
 
+/// The bytes a manifest's file holds: the manifest's own, or, for a store
+/// under a cipher (`Options::cipher`), those sealed under the store's key
+/// with each named segment's envelope and wrapped key behind them
+/// (`vault::Vault::seal_manifest`).
+///
+/// Under a cipher this is where a segment reaches the directory. A plain
+/// store's segment is durable by the fsync its seal or its merge issues,
+/// and the manifest is written after; a segment under a cipher is a memory
+/// file until its envelope is written, so every segment the manifest names
+/// has its envelope written and synced here, before the manifest that
+/// names it exists in any form, and the order a crash is survived by is
+/// the plain store's: a manifest names only what is durable.
+fn manifest_image(
+    dir: &Path,
+    seq: u64,
+    covered_seq: u64,
+    names: &[String],
+    pending: &[String],
+) -> Result<Vec<u8>> {
+    let out = manifest_encode(seq, covered_seq, names, pending);
+    let Some(v) = vault::under(dir) else {
+        return Ok(out);
+    };
+    let files = v.persist(&Db::with_ords(names), true)?;
+    v.seal_manifest(seq, &out, &files)
+}
+
+/// One slot's bytes as the manifest they hold: parsed as they are, or,
+/// under a cipher, unsealed first, and the segments the manifest names
+/// then known to the store by the envelopes the slot lists for them.
+fn manifest_open(dir: &Path, buf: &[u8]) -> Result<Manifest> {
+    let Some(v) = vault::under(dir) else {
+        return manifest_parse(buf);
+    };
+    let (plain, files) = v.open_manifest(buf)?;
+    let m = manifest_parse(&plain)?;
+    v.adopt_all(&Db::with_ords(&m.names), files)?;
+    Ok(m)
+}
+
 /// The manifest of sequence `seq` written into its slot in place and
 /// fsynced: one device round trip, no rename and no directory fsync, since
 /// both slots exist from the store's birth or its first open under them.
@@ -11296,12 +11484,8 @@ fn manifest_write_slot_unsynced(
     pending: &[String],
 ) -> Result<File> {
     use std::os::unix::fs::FileExt;
-    let out = manifest_encode(seq, covered_seq, names, pending);
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(dir.join(manifest_slot(seq)))?;
+    let out = manifest_image(dir, seq, covered_seq, names, pending)?;
+    let f = vault::open_slot(dir.join(manifest_slot(seq)))?;
     f.write_all_at(&out, 0)?;
     Ok(f)
 }
@@ -11313,13 +11497,13 @@ fn manifest_make_slots(dir: &Path) -> Result<()> {
     let mut made = false;
     for slot in MANIFEST_SLOTS {
         let path = dir.join(slot);
-        if !path.exists() {
-            File::create(path)?;
+        if !vault::exists(&path) {
+            vault::create(&path)?;
             made = true;
         }
     }
     if made {
-        File::open(dir)?.sync_all()?;
+        vault::sync_dir(dir)?;
     }
     Ok(())
 }
@@ -11338,7 +11522,7 @@ fn manifest_write_shape(
         return manifest_write_slot(dir, seq, covered_seq, names, &[]);
     }
     if let Some(spare) = manifest_write(dir, seq, covered_seq, names, false)? {
-        let _ = std::fs::remove_file(spare);
+        let _ = vault::remove_file(spare);
     }
     Ok(())
 }
@@ -11355,10 +11539,10 @@ fn manifest_write(
     names: &[String],
     spare: bool,
 ) -> Result<Option<PathBuf>> {
-    let out = manifest_encode(seq, covered_seq, names, &[]);
+    let out = manifest_image(dir, seq, covered_seq, names, &[])?;
     let tmp = dir.join("manifest.tmp");
     {
-        let mut f = File::create(&tmp)?;
+        let mut f = vault::create(&tmp)?;
         f.write_all(&out)?;
         f.sync_all()?;
     }
@@ -11369,7 +11553,7 @@ fn manifest_write(
             MANIFEST_SPARE_SEQ.fetch_add(1, AtomicOrdering::Relaxed)
         );
         let spare_path = dir.join(name);
-        match std::fs::hard_link(&cur, &spare_path) {
+        match vault::hard_link(&cur, &spare_path) {
             Ok(()) => Some(spare_path),
             // A store's birth: no manifest yet to keep.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -11378,8 +11562,8 @@ fn manifest_write(
     } else {
         None
     };
-    std::fs::rename(&tmp, &cur)?;
-    File::open(dir)?.sync_all()?;
+    vault::rename(&tmp, &cur)?;
+    vault::sync_dir(dir)?;
     Ok(kept)
 }
 
@@ -11478,7 +11662,7 @@ fn manifest_read_all(dir: &Path) -> Result<Vec<Manifest>> {
     let mut torn: Option<std::io::Error> = None;
     for slot in MANIFEST_SLOTS {
         let mut buf = Vec::new();
-        match File::open(dir.join(slot)) {
+        match vault::open(dir.join(slot)) {
             Ok(mut f) => f.read_to_end(&mut buf)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e),
@@ -11486,7 +11670,7 @@ fn manifest_read_all(dir: &Path) -> Result<Vec<Manifest>> {
         if buf.is_empty() {
             continue;
         }
-        match manifest_parse(&buf) {
+        match manifest_open(dir, &buf) {
             Ok(m) => valid.push(m),
             Err(e) => torn = Some(e),
         }
@@ -12046,7 +12230,7 @@ impl Emitter<'_> {
         }
         let (from, to, tmp) = (p.from, p.to, p.tmp.clone());
         if self.r == from {
-            let _ = std::fs::remove_file(&tmp);
+            let _ = vault::remove_file(&tmp);
             self.w = Some(
                 PieceWriter::create(&tmp, self.opts, self.sync_every, self.inline_max)
                     .map_err(|e| err(&format!("compact create: {e}")))?,
@@ -12066,7 +12250,7 @@ impl Emitter<'_> {
                 .map_err(|e| err(&format!("compact finish: {e}")))?;
             let p = &self.pieces[self.pi];
             write_ord(self.dir, &p.name, &ord, self.ord_durable)?;
-            std::fs::rename(&p.tmp, self.dir.join(&p.name))?;
+            vault::rename(&p.tmp, self.dir.join(&p.name))?;
             self.out.push(p.name.clone());
             self.pi += 1;
         }
@@ -12212,14 +12396,14 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
             // A fence with no rank: pass two visits none of it, so its
             // empty partition is written here, as the emitter writes one
             // around a slice whose every key is dead.
-            let _ = std::fs::remove_file(&tmp);
+            let _ = vault::remove_file(&tmp);
             let w = PieceWriter::create(&tmp, &opts, sync_every, inline_max)
                 .map_err(|e| err(&format!("compact create: {e}")))?;
             let ord = w
                 .finish()
                 .map_err(|e| err(&format!("compact finish: {e}")))?;
             write_ord(&dir, &name, &ord, ord_durable)?;
-            std::fs::rename(&tmp, dir.join(&name))?;
+            vault::rename(&tmp, dir.join(&name))?;
             empties.push(name);
             continue;
         }
@@ -12257,7 +12441,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
     let files: Vec<Option<std::fs::File>> = if drop_behind {
         inputs
             .iter()
-            .map(|name| std::fs::File::open(dir.join(name)).ok())
+            .map(|name| vault::open(dir.join(name)).ok())
             .collect()
     } else {
         Vec::new()
@@ -12350,13 +12534,15 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
     steps.step("values");
     let mut out = em.finish(total)?;
     out.extend(empties);
-    File::open(&dir)?.sync_all()?;
+    // A merge's outputs under a cipher: their envelopes, on this thread,
+    // where a plain merge's writer fsynced each.
+    vault::persist(&dir, &Db::with_ords(&out))?;
+    vault::sync_dir(&dir)?;
     steps.step("finish");
     if steps.on {
         let bytes: u64 = inputs
             .iter()
-            .filter_map(|n| std::fs::metadata(dir.join(n)).ok())
-            .map(|m| m.len())
+            .filter_map(|n| vault::len(dir.join(n)).ok())
             .sum();
         steps.print("merge", total, bytes);
     }
@@ -12402,7 +12588,7 @@ fn merge_open_inputs(
     for name in inputs {
         blobs.push(
             Blob::open_with(
-                MmapBytes::open(&dir.join(name))?,
+                vault::map(dir.join(name))?,
                 crate::blob::BlobOptions {
                     verify_checksums: opts.checksums,
                     verify_index: verify,
@@ -12507,7 +12693,8 @@ fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
         })
     })?;
     let out = em.finish(total)?;
-    File::open(&dir)?.sync_all()?;
+    vault::persist(&dir, &Db::with_ords(&out))?;
+    vault::sync_dir(&dir)?;
     Ok(out)
 }
 
@@ -14906,7 +15093,7 @@ impl Shared {
         {
             // SAFETY: never published, still this call's.
             let spare = unsafe { Box::from_raw(p) };
-            let _ = std::fs::remove_file(*spare);
+            let _ = vault::remove_file(*spare);
         }
     }
 
@@ -15695,6 +15882,10 @@ pub struct Db {
     /// descriptors are one open file description, and an fsync error
     /// is reported once per description.
     presync_failed: Option<std::io::Error>,
+    /// The store's registration under its cipher (`Options::cipher`), which
+    /// the engine's file operations find its memory files by: held to the
+    /// store's end, past the last thread that names a file.
+    vault: Option<vault::Held>,
     /// PROTOTYPE: the run keeper, once the first commit has started it.
     keeper: Option<Keeper>,
     /// EXPERIMENT: the upkeep thread, once a commit has had something
@@ -25808,6 +25999,12 @@ impl Reader {
 }
 
 impl Db {
+    /// What the store has done with its cipher since it was opened, or
+    /// nothing for a store that has none (`Options::cipher`).
+    pub fn cipher_counts(&self) -> Option<vault::CipherCounts> {
+        self.vault.as_ref().map(|h| h.vault().counts())
+    }
+
     /// WAL files are numbered and rotate at each seal: the sealing thread
     /// owns the old file and deletes it once its segment is renamed into
     /// place, while commits continue into the next file. Replay walks them
@@ -25875,7 +26072,7 @@ impl Db {
             // Pruned of the files the landings have retired, so a store
             // whose policy never syncs keeps a name per closed file still
             // standing and not one per rotation of its life.
-            self.loose_wals.retain(|p| p.exists());
+            self.loose_wals.retain(|p| vault::exists(p));
             self.loose_wals.push(old_wal.path.clone());
         }
         // The directory barrier the new name needs before anything is
@@ -25901,7 +26098,7 @@ impl Db {
     fn sync_wal(&mut self) -> Result<()> {
         self.wal_dir_barrier()?;
         while let Some(p) = self.loose_wals.first().cloned() {
-            match File::open(&p) {
+            match vault::open(&p) {
                 Ok(f) => {
                     f.sync_data()?;
                     SealCounts::add(&self.shared.seal_counts.loose_synced, 1);
@@ -25922,7 +26119,7 @@ impl Db {
     /// syncs by policy after it until it succeeds; see `wal_dir_unsynced`.
     fn wal_dir_barrier(&mut self) -> Result<()> {
         if self.wal_dir_unsynced {
-            File::open(&self.dir)?.sync_all()?;
+            vault::sync_dir(&self.dir)?;
             self.wal_dir_unsynced = false;
         }
         Ok(())
@@ -26095,6 +26292,15 @@ impl Db {
         Some(Db::ord_name(Db::name_id(seg)?, Db::name_end_seq(seg)?))
     }
 
+    /// Each segment named with its ordered index's name: what a store
+    /// under a cipher writes the envelopes of together (`vault::persist`).
+    fn with_ords(names: &[String]) -> Vec<(String, Option<String>)> {
+        names
+            .iter()
+            .map(|n| (n.clone(), Db::ord_name_for(n)))
+            .collect()
+    }
+
     fn name_id(name: &str) -> Option<u64> {
         Db::name_field(name, 0)
     }
@@ -26119,6 +26325,21 @@ impl Db {
         if let Some(key) = opts.dir_key.take() {
             dirkey::protect(dir, &key)?;
         }
+        // Under a cipher the marker is written before anything else, and
+        // from here the engine names its files in a directory only the
+        // vault's door finds (`vault`).
+        let held = match opts.cipher.take() {
+            Some(cipher) => {
+                under_cipher(&mut opts);
+                Some(vault::Vault::create(dir, &cipher)?)
+            }
+            None => {
+                vault::refuse_marked(dir)?;
+                None
+            }
+        };
+        let decoy = held.as_ref().map(vault::Held::dir);
+        let dir = decoy.as_deref().unwrap_or(dir);
         let mut wal = Wal::create(&Db::wal_path(dir, 0), 0, WAL_CHAINED)?;
         let mut spare_wal: *mut PathBuf = std::ptr::null_mut();
         let next_seg = 0u64;
@@ -26130,7 +26351,7 @@ impl Db {
             let spare = Db::spare_path(dir, 0);
             Wal::create(&spare, 0, WAL_CHAINED)?.prefill(opts.seal_bytes as u64)?;
             spare_wal = Box::into_raw(Box::new(spare));
-            File::open(dir)?.sync_all()?;
+            vault::sync_dir(dir)?;
         }
         // A manifest from birth, naming nothing. Without one, `open` takes
         // every `seg-` file in the directory as live and skips the WAL
@@ -26350,6 +26571,7 @@ impl Db {
             phase_ns: [0; 3],
             draining: false,
             presync_failed: None,
+            vault: held,
         };
         db.go_away()?;
         db.start_trimmer();
@@ -26376,21 +26598,27 @@ impl Db {
             Some(key) => dirkey::unlock(dir, &key)?,
             None => dirkey::refuse_locked(dir)?,
         }
+        // And held to the cipher given: a store under one opens under it
+        // alone, and a cipher given to a store in the clear is refused,
+        // since the store would go on in the clear.
+        let held = match opts.cipher.take() {
+            Some(cipher) => {
+                under_cipher(&mut opts);
+                Some(vault::Vault::open(dir, &cipher)?)
+            }
+            None => {
+                vault::refuse_marked(dir)?;
+                None
+            }
+        };
+        let decoy = held.as_ref().map(vault::Held::dir);
+        let dir = decoy.as_deref().unwrap_or(dir);
         // The manifest is the truth when it exists, and every store made
         // by `create` has one from birth. Without one the directory is
         // scanned, which is how a store written before manifests still
         // opens; a store from after them never takes this path, and must
         // not, since a `seg-` file the manifest does not name may be one
         // a seal renamed into place and never synced.
-        let mut on_disk: Vec<String> = Vec::new();
-        for entry in std::fs::read_dir(dir)? {
-            let name = entry?.file_name().to_string_lossy().into_owned();
-            if (name.starts_with("seg-") || name.starts_with("par-") || name.starts_with("pcs-"))
-                && name.ends_with(".sup")
-            {
-                on_disk.push(name);
-            }
-        }
         // The newest valid slot whose pending segments -- named at their
         // seal's readable landing, before their fsync returned
         // (`Options::manifest_pending`) -- read back whole; a slot whose do
@@ -26401,6 +26629,20 @@ impl Db {
         // since a reader of those versions skips a slot it cannot parse for
         // one it can, and would take the older state for the store.
         let mut slots = manifest_read_all(dir)?;
+        // Listed after the manifests are read: under a cipher the segments
+        // the directory holds are known by the slots that name them, and an
+        // envelope neither slot names is nobody's and goes here.
+        if let Some(h) = &held {
+            h.vault().sweep()?;
+        }
+        let mut on_disk: Vec<String> = Vec::new();
+        for name in vault::names(dir)? {
+            if (name.starts_with("seg-") || name.starts_with("par-") || name.starts_with("pcs-"))
+                && name.ends_with(".sup")
+            {
+                on_disk.push(name);
+            }
+        }
         let upgrade = slots.iter().any(|m| m.version < 3);
         // Only the newest slot's pending names are in doubt: the slot
         // before it was written by a publish that waited for that seal's
@@ -26445,7 +26687,7 @@ impl Db {
         // anything else is unreachable and is removed rather than kept.
         for name in &on_disk {
             if !live.contains(name) {
-                let _ = std::fs::remove_file(dir.join(name));
+                let _ = vault::remove_file(dir.join(name));
             }
         }
         // A store from before manifests gets one here, naming what the
@@ -26473,8 +26715,7 @@ impl Db {
         // A temp file whose id the manifest already names is a close that
         // published and never unlinked it.
         let mut direct_tmps: Vec<(u64, PathBuf)> = Vec::new();
-        for entry in std::fs::read_dir(dir)? {
-            let name = entry?.file_name().to_string_lossy().into_owned();
+        for name in vault::names(dir)? {
             if let Some(id) = name
                 .strip_prefix("direct-")
                 .and_then(|r| r.strip_suffix(".tmp"))
@@ -26485,12 +26726,12 @@ impl Db {
         }
         for (id, tmp) in direct_tmps {
             if live.iter().any(|n| Db::name_id(n) == Some(id)) {
-                let _ = std::fs::remove_file(&tmp);
+                let _ = vault::remove_file(&tmp);
                 continue;
             }
             let recs = SegmentWriter::recover_direct(&tmp)?;
             if recs.is_empty() {
-                let _ = std::fs::remove_file(&tmp);
+                let _ = vault::remove_file(&tmp);
                 continue;
             }
             let last_lo: Option<Vec<u8>> = live
@@ -26508,7 +26749,7 @@ impl Db {
                 None => Db::seg_name(id, sealed),
             };
             let rebuilt = dir.join(format!("seal-{id:08}.tmp"));
-            let _ = std::fs::remove_file(&rebuilt);
+            let _ = vault::remove_file(&rebuilt);
             let ord = {
                 let mut w =
                     PieceWriter::create(&rebuilt, &Db::segment_opts(&opts), 0, opts.inline_bytes)?;
@@ -26520,12 +26761,12 @@ impl Db {
                 w.finish()?
             };
             write_ord(dir, &name, &ord, true)?;
-            std::fs::rename(&rebuilt, dir.join(&name))?;
-            File::open(dir)?.sync_all()?;
+            vault::rename(&rebuilt, dir.join(&name))?;
+            vault::sync_dir(dir)?;
             live.push(name);
             mseq += 1;
             manifest_write_shape(dir, &opts, mseq, sealed, &live)?;
-            let _ = std::fs::remove_file(&tmp);
+            let _ = vault::remove_file(&tmp);
         }
         // The same for ordered indexes, which outlive their segment by a
         // crash window at either end: written before a seal's rename, and
@@ -26537,10 +26778,9 @@ impl Db {
         sweep_manifest_spares(dir)?;
         let live_ord: std::collections::HashSet<String> =
             live.iter().filter_map(|n| Db::ord_name_for(n)).collect();
-        for entry in std::fs::read_dir(dir)? {
-            let name = entry?.file_name().to_string_lossy().into_owned();
+        for name in vault::names(dir)? {
             if name.starts_with("ord-") && !live_ord.contains(&name) {
-                let _ = std::fs::remove_file(dir.join(name));
+                let _ = vault::remove_file(dir.join(name));
             }
         }
         // And the same for form files, under either option: one a live segment
@@ -26558,6 +26798,14 @@ impl Db {
         );
         // Where the store starts. `Random` starts advised and never moves;
         let starts_random = opts.read_advice.starts_random();
+        // Under a cipher every live segment and its index are decrypted
+        // into memory here, several at once, ahead of the opens below,
+        // which would read them in turn on this thread.
+        if let Some(h) = &held {
+            let mut names = live.clone();
+            names.extend(live.iter().filter_map(|n| Db::ord_name_for(n)));
+            h.vault().preload(&names);
+        }
         let mut segs = Vec::with_capacity(live.len());
         for name in &live {
             segs.push(Seg::open(
@@ -26604,18 +26852,16 @@ impl Db {
             .collect();
         let mut wal_ids: Vec<u64> = Vec::new();
         let mut spare_wals: Vec<PathBuf> = Vec::new();
-        for entry in std::fs::read_dir(dir)? {
-            let name = entry?.file_name();
-            let name = name.to_string_lossy();
+        for name in vault::names(dir)? {
             if let Some(id) = name.strip_prefix("wal-") {
                 wal_ids.push(id.parse().map_err(|_| err("wal file name is malformed"))?);
             } else if name.starts_with("spare-") {
                 // A retired WAL kept for recycling. It holds nothing a
                 // segment does not, so it is either the pool or garbage.
                 if opts.recycle_wal && spare_wals.is_empty() {
-                    spare_wals.push(dir.join(name.as_ref()));
+                    spare_wals.push(dir.join(&name));
                 } else {
-                    let _ = std::fs::remove_file(dir.join(name.as_ref()));
+                    let _ = vault::remove_file(dir.join(&name));
                 }
             }
         }
@@ -26648,7 +26894,7 @@ impl Db {
                 live = i;
                 valid_len = valid;
                 for &later in &wal_ids[i + 1..] {
-                    std::fs::remove_file(Db::wal_path(dir, later))?;
+                    vault::remove_file(Db::wal_path(dir, later))?;
                 }
                 break;
             }
@@ -26675,9 +26921,9 @@ impl Db {
         // A batch that never committed is cut off before anything is
         // appended behind it: left in place, its records would sit in front
         // of the next batch's commit frame and be adopted by it.
-        if let Ok(md) = std::fs::metadata(&wal_path) {
-            if md.len() > valid_len {
-                let f = OpenOptions::new().write(true).open(&wal_path)?;
+        if let Ok(len) = vault::len(&wal_path) {
+            if len > valid_len {
+                let f = vault::open_write(&wal_path)?;
                 f.set_len(valid_len)?;
                 f.sync_data()?;
             }
@@ -26895,6 +27141,7 @@ impl Db {
             phase_ns: [0; 3],
             draining: false,
             presync_failed: None,
+            vault: held,
         };
         db.go_away()?;
         db.start_trimmer();
@@ -27415,7 +27662,7 @@ impl Db {
         if self.direct.is_none() {
             let id = self.shared.next_seg.fetch_add(1, AtomicOrdering::Relaxed);
             let tmp = self.dir.join(format!("direct-{id:08}.tmp"));
-            let _ = std::fs::remove_file(&tmp);
+            let _ = vault::remove_file(&tmp);
             let opts = Db::segment_opts(&self.opts);
             let mut w = PieceWriter::create(&tmp, &opts, 0, self.opts.inline_bytes)?;
             if self.r.mem().stream && self.opts.direct_derive_keys {
@@ -27639,14 +27886,14 @@ impl Db {
                   presynced: Option<std::thread::JoinHandle<std::io::Result<()>>>|
                   -> Result<Vec<String>> {
                 let (tombs, seg, ord, fact) = done?;
-                let name = if first_partition && !tombs && std::fs::metadata(&tmp)?.len() <= limit {
+                let name = if first_partition && !tombs && vault::len(&tmp)? <= limit {
                     Db::first_partition_name(id, seq)
                 } else {
                     name
                 };
                 let ordf = write_ord_unsynced(&dir, &name, &ord)?;
                 shared.drain_steps.stamp(4);
-                std::fs::hard_link(&tmp, dir.join(&name))?;
+                vault::hard_link(&tmp, dir.join(&name))?;
                 shared.drain_steps.stamp(5);
                 // Phase R, then the fsyncs, as a seal's job orders them; the
                 // link is this job's rename.
@@ -28060,7 +28307,7 @@ impl Db {
                 }
                 let id = first_id + ri as u64;
                 let tmp = dir.join(format!("seal-{id:08}.tmp"));
-                let _ = std::fs::remove_file(&tmp);
+                let _ = vault::remove_file(&tmp);
                 let ord;
                 let seg;
                 let tombs;
@@ -28149,11 +28396,7 @@ impl Db {
                 }
                 shared.drain_steps.stamp(3);
                 let whole = ranges.len() == 1 && lo.is_empty() && hi.is_none();
-                let name = if whole
-                    && first_partition
-                    && !tombs
-                    && std::fs::metadata(&tmp)?.len() <= limit
-                {
+                let name = if whole && first_partition && !tombs && vault::len(&tmp)? <= limit {
                     Db::first_partition_name(id, end_seq)
                 } else if whole {
                     Db::seg_name(id, end_seq)
@@ -28168,7 +28411,7 @@ impl Db {
                 // exists without it.
                 let ordf = write_ord_unsynced(&dir, &name, &ord)?;
                 shared.drain_steps.stamp(4);
-                std::fs::rename(&tmp, dir.join(&name))?;
+                vault::rename(&tmp, dir.join(&name))?;
                 shared.drain_steps.stamp(5);
                 names.push(name);
                 facts.push(fact);
@@ -28179,6 +28422,10 @@ impl Db {
             // fsyncs, which nothing but the manifest waits for.
             seal_readable(&shared, readable, &names, facts);
             shared.drain_steps.stamp(6);
+            // Under a cipher the pieces are memory files and their fsyncs
+            // below are of nothing: what makes each durable is its
+            // envelope, written here, where a plain seal pays its fsync.
+            vault::persist(&dir, &Db::with_ords(&names))?;
             for (seg, ordf) in files {
                 seg.sync_all()?;
                 shared.drain_steps.stamp(7);
@@ -29277,8 +29524,7 @@ impl Db {
     fn store_bytes_of(dir: &Path, segs: &[std::sync::Arc<Seg>]) -> u64 {
         segs.iter()
             .filter(|s| s.level > 0)
-            .filter_map(|s| std::fs::metadata(dir.join(&s.name)).ok())
-            .map(|m| m.len())
+            .filter_map(|s| vault::len(dir.join(&s.name)).ok())
             .sum()
     }
 
@@ -29939,7 +30185,13 @@ impl Db {
     /// kill alone leaves the page cache intact and cannot tell `EveryN` from
     /// `Always`.
     pub fn wal_durable(&self) -> (PathBuf, u64, u64) {
-        (self.wal.path.clone(), self.wal.synced, self.wal.written)
+        // Where the file is, which for a store under a cipher is not the
+        // path the engine names it by.
+        (
+            vault::real(&self.wal.path),
+            self.wal.synced,
+            self.wal.written,
+        )
     }
 
     /// Commit what is pending, seal the rest. Close is a convenience, not a
@@ -29958,7 +30210,7 @@ impl Db {
         self.settle()?;
         // Nothing will rotate into a spare again.
         if let Some(spare) = self.shared.take_spare() {
-            let _ = std::fs::remove_file(spare);
+            let _ = vault::remove_file(spare);
         }
         Ok(())
     }
@@ -30164,7 +30416,7 @@ impl Db {
                     Err(_) => {
                         // A file the builder wrote and the reader's own
                         // attach refuses: the build failed.
-                        let _ = std::fs::remove_file(&out);
+                        let _ = vault::remove_file(&out);
                         failed(zfile::DECLINED_FAILED);
                     }
                 }
@@ -30175,7 +30427,7 @@ impl Db {
                 if refused {
                     // The file under the name was not this segment's, and
                     // no build is replacing it.
-                    let _ = std::fs::remove_file(&out);
+                    let _ = vault::remove_file(&out);
                 }
             }
             // An inline build has no cancel flag; counted all the same.
@@ -30209,11 +30461,10 @@ impl Db {
         let claimed: std::collections::HashSet<String> =
             live.filter_map(zfile::zpg_name_for).collect();
         let mut removed = 0;
-        for entry in std::fs::read_dir(dir)? {
-            let name = entry?.file_name().to_string_lossy().into_owned();
+        for name in vault::names(dir)? {
             if zfile::is_zpg_file(&name)
                 && !claimed.contains(&name)
-                && std::fs::remove_file(dir.join(&name)).is_ok()
+                && vault::remove_file(dir.join(&name)).is_ok()
             {
                 removed += 1;
             }
@@ -30353,7 +30604,7 @@ impl Db {
                     continue;
                 };
                 if seg.z.get().is_some() && !live.contains(&name) {
-                    let _ = std::fs::remove_file(self.dir.join(&name));
+                    let _ = vault::remove_file(self.dir.join(&name));
                     zfile::ZEvents::add(&self.shared.z.build_orphaned, 1);
                 }
             }
@@ -36276,7 +36527,7 @@ impl Maint {
             });
             let slot =
                 manifest_write_slot_unsynced(&self.dir, self.manifest_seq, covered, &live, names)?;
-            let dir = File::open(&self.dir)?;
+            let dir = vault::open_dir(&self.dir)?;
             if self.sync_helper.is_none() {
                 self.sync_helper = Some(SyncHelper::spawn()?);
             }
@@ -36336,7 +36587,7 @@ impl Maint {
             // leaves the segments published and unnamed, which is the
             // state a crash before the publish leaves: the WAL holds the
             // writes, and the seal is wedged by the caller.
-            File::open(&self.dir)?.sync_all()?;
+            vault::sync_dir(&self.dir)?;
         }
         Ok(())
     }
@@ -36455,15 +36706,15 @@ impl Maint {
                     .and_then(|n| n.parse::<u64>().ok())
                     .unwrap_or(0);
                 let spare = Db::spare_path(&self.dir, id);
-                if std::fs::rename(&old, &spare).is_ok() {
+                if vault::rename(&old, &spare).is_ok() {
                     self.shared.offer_spare(spare);
                     continue;
                 }
             }
-            let _ = std::fs::remove_file(old);
+            let _ = vault::remove_file(old);
         }
         for tmp in std::mem::take(&mut self.retiring_tmps) {
-            let _ = std::fs::remove_file(tmp);
+            let _ = vault::remove_file(tmp);
         }
     }
 
@@ -36911,7 +37162,7 @@ impl Maint {
     /// it by name alone took the index of a segment that was still open, and
     /// seven tests said so.
     fn retire_seg(&mut self, name: &str) {
-        let _ = std::fs::remove_file(self.dir.join(name));
+        let _ = vault::remove_file(self.dir.join(name));
         let Some(ord) = Db::ord_name_for(name) else {
             return;
         };
@@ -36920,7 +37171,7 @@ impl Maint {
             .iter()
             .any(|s| Db::ord_name_for(&s.name).as_deref() == Some(ord.as_str()));
         if !claimed {
-            let _ = std::fs::remove_file(self.dir.join(&ord));
+            let _ = vault::remove_file(self.dir.join(&ord));
         }
         // A form file is named by the same two fields and claimed by the same
         // test: a promotion keeps them, so the retired name and the live one
@@ -36949,7 +37200,7 @@ impl Maint {
         // two leaves a file the next open sweeps.
         if let Some(fields) = zfile::zpg_fields(name) {
             let zpg = self.dir.join(zfile::zpg_name(fields.0, fields.1));
-            if zpg.exists()
+            if vault::exists(&zpg)
                 && !self
                     .segs()
                     .iter()
@@ -36965,13 +37216,13 @@ impl Maint {
                 if self.wake.is_some() {
                     let n = self.shared.next_dead.fetch_add(1, AtomicOrdering::Relaxed);
                     let dead = self.dir.join(zfile::zpg_dead_name(n));
-                    if std::fs::rename(&zpg, &dead).is_ok() {
+                    if vault::rename(&zpg, &dead).is_ok() {
                         self.spares.push(dead);
                     } else {
-                        let _ = std::fs::remove_file(zpg);
+                        let _ = vault::remove_file(zpg);
                     }
                 } else {
-                    let _ = std::fs::remove_file(zpg);
+                    let _ = vault::remove_file(zpg);
                 }
             }
         }
@@ -37101,8 +37352,7 @@ impl Maint {
                 .segs()
                 .iter()
                 .filter(|s| s.level > 0 && s.lo == f.0 && s.hi == f.1)
-                .filter_map(|s| std::fs::metadata(self.dir.join(&s.name)).ok())
-                .map(|m| m.len())
+                .filter_map(|s| vault::len(self.dir.join(&s.name)).ok())
                 .sum();
             if !taken.is_empty() && bytes.saturating_add(size) > cap {
                 break;
@@ -37295,8 +37545,8 @@ impl Maint {
                 .partition_bytes
                 .unwrap_or(self.opts.seal_bytes)
                 .max(1) as u64;
-            match std::fs::metadata(self.dir.join(&s.name)) {
-                Ok(m) if m.len() <= pb => {}
+            match vault::len(self.dir.join(&s.name)) {
+                Ok(len) if len <= pb => {}
                 _ => return Ok(false),
             }
         }
@@ -37346,7 +37596,7 @@ impl Maint {
             if new == old {
                 continue;
             }
-            std::fs::hard_link(self.dir.join(&old), self.dir.join(&new))?;
+            vault::hard_link(self.dir.join(&old), self.dir.join(&new))?;
             // A segment is immutable once open, so the promoted one is
             // opened again under its new name: the partition's fences and
             // level come from the name. Its key index's checksum row is not
@@ -37364,7 +37614,7 @@ impl Maint {
             )?);
             old_names.push(old);
         }
-        File::open(&self.dir)?.sync_all()?;
+        vault::sync_dir(&self.dir)?;
         self.rank_before_publish(&segs)?;
         self.publish_segs(segs);
         self.publish()?;
@@ -37468,7 +37718,7 @@ impl Maint {
             } else {
                 // Inline, on the writer's thread: now, as the rename that
                 // freed did.
-                let _ = std::fs::remove_file(p);
+                let _ = vault::remove_file(p);
             }
         }
         Ok(())
@@ -38911,7 +39161,7 @@ impl Maint {
                 let Some((at, len)) = s.blob.for_zfile().record_region_span() else {
                     continue;
                 };
-                let Ok(f) = File::open(self.dir.join(&s.name)) else {
+                let Ok(f) = vault::open(self.dir.join(&s.name)) else {
                     continue;
                 };
                 asked += zfile::swap_ahead(&f, at, len, &form);
@@ -38923,12 +39173,8 @@ impl Maint {
             // What the directory holds beside what the live partitions
             // are named: a form file for a partition no longer live is a
             // build ahead a merge retired.
-            let on_disk = std::fs::read_dir(&self.dir)
-                .map(|d| {
-                    d.filter_map(|e| e.ok())
-                        .filter(|e| e.file_name().to_string_lossy().ends_with(".zpg"))
-                        .count()
-                })
+            let on_disk = vault::names(&self.dir)
+                .map(|d| d.iter().filter(|n| n.ends_with(".zpg")).count())
                 .unwrap_or(0);
             let live_ids: Vec<String> = {
                 let _op = self.op();
@@ -39364,10 +39610,10 @@ impl Maint {
                 if built != want && self.dir.join(&name).is_file() {
                     let n = shared.next_dead.fetch_add(1, AtomicOrdering::Relaxed);
                     let dead = self.dir.join(zfile::zpg_dead_name(n));
-                    if std::fs::rename(self.dir.join(&name), &dead).is_ok() {
+                    if vault::rename(self.dir.join(&name), &dead).is_ok() {
                         self.spares.push(dead);
                     } else {
-                        let _ = std::fs::remove_file(self.dir.join(&name));
+                        let _ = vault::remove_file(self.dir.join(&name));
                     }
                     zfile::ZEvents::add(&ev.ahead_recoded, 1);
                 }
@@ -39450,7 +39696,7 @@ impl Maint {
             seg.z_declined.store(why, AtomicOrdering::Relaxed);
             seg.z_schedule_retry(retry_ms);
         };
-        let file = match File::open(self.dir.join(&seg.name)) {
+        let file = match vault::open(self.dir.join(&seg.name)) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Retired since it was listed: outrun, not failed.
@@ -39796,7 +40042,7 @@ impl Maint {
                         // The reader's own attach refuses what the builder
                         // wrote: the old form file serves on, unlinked, and
                         // the partition is built again at the next open.
-                        let _ = std::fs::remove_file(&out);
+                        let _ = vault::remove_file(&out);
                         zfile::ZEvents::add(&ev.recode_failed, 1);
                     }
                 }
@@ -39846,7 +40092,7 @@ impl Maint {
                         Err(_) => {
                             // The reader's own attach refuses what the
                             // builder wrote: the build failed.
-                            let _ = std::fs::remove_file(&out);
+                            let _ = vault::remove_file(&out);
                             failed(zfile::DECLINED_FAILED);
                         }
                     }
@@ -39857,10 +40103,10 @@ impl Maint {
                     self.z_report.superseded += 1;
                     let n = shared.next_dead.fetch_add(1, AtomicOrdering::Relaxed);
                     let dead = self.dir.join(zfile::zpg_dead_name(n));
-                    if std::fs::rename(&out, &dead).is_ok() {
+                    if vault::rename(&out, &dead).is_ok() {
                         self.spares.push(dead);
                     } else {
-                        let _ = std::fs::remove_file(&out);
+                        let _ = vault::remove_file(&out);
                     }
                     zfile::ZEvents::add(&ev.build_orphaned, 1);
                 }
@@ -39871,7 +40117,7 @@ impl Maint {
                 if refused {
                     // The file under the name was not this segment's, and
                     // no build is replacing it.
-                    let _ = std::fs::remove_file(&out);
+                    let _ = vault::remove_file(&out);
                 }
             }
             Ok(zfile::Outcome::Cancelled) => zfile::ZEvents::add(&ev.build_cancelled, 1),
@@ -39941,7 +40187,7 @@ impl Maint {
     /// discard round trip here, paid where nobody waits.
     fn sweep_spares(&mut self) {
         for p in std::mem::take(&mut self.spares) {
-            let _ = std::fs::remove_file(p);
+            let _ = vault::remove_file(p);
         }
     }
 
@@ -40054,16 +40300,14 @@ impl Maint {
             None => {
                 let b: u64 = inputs
                     .iter()
-                    .filter_map(|n| std::fs::metadata(self.dir.join(n)).ok())
-                    .map(|m| m.len())
+                    .filter_map(|n| vault::len(self.dir.join(n)).ok())
                     .sum();
                 (b as usize).div_ceil(pb).max(1)
             }
         };
         let bytes: u64 = inputs
             .iter()
-            .filter_map(|n| std::fs::metadata(self.dir.join(n)).ok())
-            .map(|m| m.len())
+            .filter_map(|n| vault::len(self.dir.join(n)).ok())
             .sum();
         if self.merge_trace {
             let parts_in = inputs.iter().filter(|n| n.starts_with("par-")).count();
@@ -40204,8 +40448,7 @@ impl Maint {
         if self.merge_trace {
             let bytes: u64 = outputs
                 .iter()
-                .filter_map(|n| std::fs::metadata(self.dir.join(n)).ok())
-                .map(|m| m.len())
+                .filter_map(|n| vault::len(self.dir.join(n)).ok())
                 .sum();
             eprintln!(
                 "mergetrace land t={:.6} ran_ms {:.1} outputs {} mb {:.1} inflight {} trigger {} chain {}",

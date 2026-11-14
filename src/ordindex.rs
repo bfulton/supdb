@@ -398,7 +398,7 @@ impl OrdIndex {
     /// under an id handed out again later -- is refused here rather than
     /// believed.
     pub fn open(path: &Path, keys: usize) -> Result<OrdIndex> {
-        let map = MmapBytes::open(path)?;
+        let map = crate::db::vault::map(path)?;
         let b = &map.0[..];
         if b.len() < HEADER + 4 {
             return Err(bad("shorter than its header"));

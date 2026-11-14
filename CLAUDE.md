@@ -34,6 +34,7 @@ of the change that produced the text.
 | `src/db/zpages.rs` | the compact form's layout: the page, the directory of the groups it holds, the group, the fill that cuts records into groups and packs them into pages, the fence, the trailer and the identity a form file is bound by, with no file, thread or clock in it -- the module's own docs, and `bench/examples/zsize.rs` for what it makes of the engine's bytes |
 | `src/db/zfile.rs` | the compact form's file on the engine's side: the builder that writes a partition's form file from the partition's own bytes, the attach that binds it to its segment by content, the cell a segment holds it in, the point read, the count, the scan walk and the cursor through it, behind `Options::zpages`, and the controller's platform side, the cache budget read from the cgroup and the test's seam for it; the block cache's reads of a covered partition go through it too (`Options::zpages_block_cache`) -- the module's own docs |
 | `src/db/dirkey.rs` | a live store's directory under a key, encrypted by the kernel (`Options::dir_key`): the requests of Linux's file encryption, what `create` and `open` hold a directory to, and `lock`, with no cipher and no byte of a read path in it -- the module's own docs, and `scripts/fscrypt.sh` for a filesystem to test it on |
+| `src/db/vault.rs` | a live store under a cipher the caller supplies (`Options::cipher`): the door every file operation of the engine goes through, which is the standard library's call for a plain store; a store's files as memory files and their envelopes in the directory; the marker and the keys, the caller's wrapping the store's and the store's wrapping a key a file; the manifest's slot and the log's record sealed, with no cipher in the crate -- the module's own docs, `tests/cipher.rs`, and `ZFUZZ_CIPHER=1` for the differential fuzz |
 | `src/db/zselect.rs` | the compact form's selector: `ZSelect::step`, a function of its state and an explicit `Input` (no clock, thread or file), the one definition of the transitions between FITS, SUSPECT, building, COMPACT and the trial, and the replays that hold it -- the module's own docs |
 | `src/format.rs` | the on-disk format's fixed quantities, owned by no writer |
 | `src/block.rs`, `src/index.rs`, `src/flatindex.rs` | the format itself: blocks, extents, the flat key index -- `docs/index-theory.md` |
@@ -1060,6 +1061,198 @@ rule: under the kernel's encryption a write rate is read after
 `/proc/crypto` has named the cipher's driver and after a floor with no
 engine in it has been taken in the same two directories, since the
 cipher is the kernel's and its speed is a property of the build.
+
+**A live store under the caller's cipher is the plain engine over memory
+files, and what the engine owes is the door.** `Options::cipher` is the
+second way a store is kept under a key, for a caller who brings the cipher
+(`src/db/vault.rs`). It was asked for first and built second: the caller's
+cipher was the plan from the question that started this, the envelope gave
+it to a finished file, and the live store was then handed to the kernel
+because that kept the read path, without anyone being told the plan had
+changed. The two are not one feature done twice. The kernel's keeps the
+page cache and wants a filesystem that can encrypt; this one goes wherever
+Linux does, authenticates every byte, leaves files that are ciphertext
+wherever they are copied, and holds the store's plaintext in memory.
+That last is the constraint and not an accident. A store reads by lending
+from mappings, the cipher is in the process, so the plaintext is the
+process's: each file of the store is a memory file (`memfd_create`),
+written and mapped by the code that writes and maps a plain store's, and
+what reaches the directory is the file's envelope (`supdb::crypt`),
+written once the file is finished. A read path that asked its source
+whether a chunk was decrypted yet would be the envelope's reader under the
+engine: every `Blob<MmapBytes>` in forty thousand lines another type, the
+advice and the residency counts aimed at ciphertext, and the plain store
+paying a branch a section for a feature it does not use. A memory file is
+a mapping like any other, so nothing on a read path knows, and the price
+is said plainly instead: the store has to fit in memory, an open decrypts
+all of it, and the kernel cannot reclaim a page of it.
+
+The engine reaches its files through `vault::` (`create`, `open`, `map`,
+`rename`, `hard_link`, `remove_file`, `names`, `len`, `exists`,
+`sync_dir`), each the standard library's call after one load of a counter
+where no store under a cipher is open in the process. A store under a
+cipher is given a directory that cannot exist, its marker file's path with
+a name after it, so a file operation the door is not in front of fails
+with "not a directory" and writes nothing; and a unit test reads `db.rs`'s
+own source for the calls the door stands for
+(`the_engine_names_no_file_but_through_the_door`), since the first only
+fires where a test under a cipher reaches the call. A name nobody classed
+is kept in memory: the log and the manifest alone pass to the directory
+under their own names, and the engine seals what it writes into those
+itself, a record a commit and a slot a publish. A new kind of file is
+therefore safe before anyone has thought about it, and lost at the close
+until someone has.
+
+An fsync of a memory file is of nothing, so every durability the engine
+takes from an fsync of a file that is not the log or the manifest is one a
+store under a cipher gets another way, and there were three. A segment
+before the manifest that names it: the manifest's bytes are made by
+`manifest_image`, which writes and syncs the envelope of every segment it
+names before the slot that names them exists in any form; a seal and a
+merge write theirs earlier, on their own threads, where a plain store pays
+the fsync (`vault::persist`), by name, and pass over a name that has gone,
+since a promotion links a piece under another name and unlinks the first
+while the seal's thread is on its way there, and the manifest that names
+the file writes it whoever did not. Ordered ingest's run, a segment synced
+at every commit: off under a cipher, with the compact form and the
+recycled log (`under_cipher`), so an ordered load goes through the log.
+And the ordered index, which a plain store leaves unsynced and composes
+again where it is missing, as a store under a cipher does. A fourth fsync
+of a kept file is a durability that is not there, and the list is the
+thing to check a change against.
+
+A plain store's partition is named by its fences, sixteen bytes of two
+keys, so the names cannot go to the directory either: an envelope is named
+by a token drawn for it, the names live in the sealed manifest beside the
+tokens, and an envelope neither slot names is swept at the open, as a
+segment no manifest names is.
+
+The keys were decided on a count. The first sketch sealed everything under
+the caller's cipher, with an envelope's id as its nonces' prefix: eight
+random bytes against a key that seals an envelope a seal and a merge, and
+the chance of two prefixes alike passes the 2^-32 a cipher of this kind is
+held to at sixty-five thousand files, days of a busy store. So the
+caller's cipher wraps one key, the store's own, in the marker, once at the
+creation and once at each open, which is also what lets the caller's key
+live somewhere slow, and lets it be rotated by writing a hundred bytes
+(`cipher_rewrap`); the store's key wraps a key a file, in the manifest for
+a segment and in the header for a log file; and a file's bytes are under
+its own key, where a nonce is a chunk's index or a record's count behind a
+prefix drawn at the open, so a log reopened after a crash never meets a
+nonce its torn tail used. What is authenticated is every byte of a segment,
+an index, a manifest and a log record; what is not is the store taken back
+to an earlier state of itself, the directory put back whole or the log cut
+at a record's end, since nothing in a directory can say a newer one
+existed. `tests/cipher.rs` holds that as a property: a byte changed
+anywhere is a store refused or a store that opens as a state it
+acknowledged, the last or one before it, and never anything else.
+
+The fuzz is the test that matters most (`ZFUZZ_CIPHER=1`, and
+`fuzz_range_under_a_cipher` in the gate): `z` under a cipher and `r` in the
+clear over the same operations, against the model. A crash there is a
+`drop`, and a plain store's dropped files are whole in the page cache
+where a store under a cipher has lost every memory file it had, so the
+order a crash is survived by -- the log kept until a manifest names a
+durable segment -- is held by that run more strictly than by the plain
+one.
+
+Four things building it, each a shape. The rewrite of the engine's file
+calls was mechanical, and one of them was not a file: `File::open(&self.dir)`,
+a handle on the directory for the pending manifest's helper to sync later,
+became `vault::open(&self.dir)`, which under a cipher opens the marker
+file, and the directory's fsync would have been a file's, in an arm no
+test runs under a cipher. It was found reading the list of opens the
+rewrite left and has a call of its own now (`vault::open_dir`); a
+mechanical rewrite is read at every site for what the path names. The
+first test's control, the same store in the clear, was to find a fence in
+a file's name and found none: every key shared its first sixteen bytes,
+the fence's length, so the plain store was one partition named with no
+fence, which this file already says of keys with a long common prefix; a
+control is given something to find, and asserts it found it. The test of
+a log cut at every byte passed its first run with every cut opening as
+the whole store, and the assertion that the cuts fall in several states
+is what said so: a store dropped is not a store crashed with its tail in
+the log, since the drop joins the seals in flight and lands them, so the
+fixture ends in commits small enough to stay under a seal. And the first
+envelopes were written with nothing about the memory files' pages or the
+device thought of, which is the paragraph below.
+
+Forty mutants of it, and seven outlived the first tests, in the three
+ways this file already names. Two were checks behind a tag: a record of
+no bytes refused before its tag was looked at, and a log's name checked
+before its wrapped key, each of which the tag refuses anyway -- the first
+was taken out, since a check nothing can reach is a line nobody can hold,
+and the second is the kind byte's reader and stays. Two were checks no
+input could reach: a slot whose files are not whole files and a slot that
+lists more files than its manifest names, both behind the slot's own tag,
+held now by a slot sealed under the store's key in the test and by the
+count's check moved to where a test can hand it a count
+(`Vault::adopt_all`). And three were tests that did not look: a replay
+that answered the log's header as its length cut the log to nothing at
+the open, and a store that crashes twice in a row, the second time before
+it has written anything, is the test that reads that; an ordered index
+adopted where the directory held none; and the compact form left on,
+which the door had made harmless -- its builds failed at "not a
+directory" and the store went on -- so the test counts the builds begun.
+
+What it costs was read off pairings against the same store in the clear,
+`supdb-cipherbase`, which runs with the options a cipher fixes and no
+cipher (`bench/scripts/pair.sh supdb-cipher supdb-cipherbase 300000`, and
+at 100000; `bench/DESIGN.md`), and against `supdb` for what the mode costs
+with what it forgoes (`pair.sh supdb-cipher supdb 300000`). The first
+pairing, at a hundred thousand keys, read three things in both sittings:
+the loads at 0.77-0.89x, the scan pass after the shuffled load at 0.8x,
+and nothing else. The scan pass was faults. `SUPDB_LAG_COUNTERS=1` read 220
+on the scanning thread against a plain store's 40 over the same fourteen
+megabytes, since a memory file's pages are four kilobytes and a first
+touch maps sixteen of them where the plain file's megabyte folios map one
+a fault; whoever opens a kept file maps every page of it now
+(`MADV_POPULATE_READ` in `vault::map`), the pass takes fewer faults than
+the plain store's, and the cell reads level. The loads were the drain, and
+the drain's stamps (`SUPDB_DRAIN_STEPS=1`) said where: from the seal's
+readable landing to its fsync, 5 ms in the clear and 25 under the cipher,
+for a segment of fifteen megabytes whose cipher is three of them. A plain
+segment's bytes go to the device while the segment is built -- the writer
+hints each piece and a helper syncs behind it -- so its fsync finds little
+left to write; an envelope is written after the segment is finished,
+whole, because the envelope's header is every chunk's associated data and
+holds the file's length, so nothing can be sealed before the length is
+known. Two levers were tried on the write itself. Past the page cache
+(`O_DIRECT`, a megabyte a write), on the reading that the ciphertext's
+fresh pages were the cost -- `cargo run --release --example crypt_cost`
+reads the envelope's writer at 1.3 GB/s where the cipher alone runs 7.9
+-- the step grew from 25 ms to 35, each piece waiting for the device where
+the cached pieces go to it together: refuted and taken out. Each piece
+hinted to the device behind the cipher (`sync_file_range`, `vault::Ahead`)
+took it to 21 and stays. What is left is the format's, and is the first
+item under this one in `ROADMAP.md`: at three hundred thousand keys the
+ordered and the shuffled load read 0.83-0.86x of the same store in the
+clear in both sittings, the buffered arms' 0.76-0.84x (`pair.sh
+supdb-ingestcipher supdb-ingestcipherbase 300000`), the full-rewrite
+burst a few percent behind in one sitting, and the scans and the mixes
+level; against `supdb` the shuffled load reads the same and the ordered
+load 0.6x, which is ordered ingest's run forgone and not the cipher. One
+cell is not explained: the first single-threaded pass of point reads read
+0.9x at a hundred thousand keys in five sittings of six, and at three
+hundred thousand 0.95x in both sittings of the buffered pair and
+unresolved in the durable one, with the threaded passes after it level;
+with megabyte folios allowed for shared memory
+(`/sys/kernel/mm/transparent_hugepage/hugepages-1024kB/shmem_enabled`) it
+read 0.93x and unresolved, and a merge that lands later under the cipher
+would do the same to a pass of fifty milliseconds. An open decrypts the
+store, which `cargo run --release --example cipher_store` times beside a
+plain store's open; it halved when the files were decrypted several at
+once (`Vault::preload`), and is still the store's size over a few cores'
+rate. A store under a cipher also holds a descriptor a file for the
+file's life, two a segment, where a plain store holds almost none: a
+store of tens of gigabytes passes a limit of 1024, and the error says so.
+The rules: a second way to hold the same bytes is priced on the first
+operation of every pass as well as on its rate, since a mapping's first
+touch is where two kinds of memory differ; a write slower than its cipher
+is stamped step by step before a lever is chosen, and fresh pages were the
+wrong lever here as they were for the buffered load's sync; and a mode
+that fixes options is given a twin arm with the same options and no mode,
+or its pairing prices the options.
 
 The first tests of the browser's half changed every byte of the record
 and required a refusal, and seven of fourteen mutants of `crypt.mjs`

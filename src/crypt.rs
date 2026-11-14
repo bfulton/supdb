@@ -424,6 +424,87 @@ where
     Ok(hdr)
 }
 
+/// The header of the object `src` holds, after everything an open checks
+/// before a tag: long enough to be one, a header that parses, zeroes from
+/// the header to the first chunk, which no tag covers and a reader
+/// therefore looks at, and the length the header describes.
+fn checked_header<B: Bytes + ?Sized>(src: &B) -> Result<Header> {
+    // The header's page in one read.
+    let mut head = [0u8; DATA_START as usize];
+    if src.len() < DATA_START {
+        return Err(refused("too short to be an encrypted object"));
+    }
+    src.read_at(0, &mut head)?;
+    let hdr = Header::parse(&head)?;
+    if head[Header::LEN..].iter().any(|&b| b != 0) {
+        return Err(refused(
+            "an encrypted object with something other than zeroes after its header",
+        ));
+    }
+    if src.len() != hdr.stored_len() {
+        return Err(refused(&format!(
+            "an encrypted object of {} bytes whose header describes {}: cut short, or grown",
+            src.len(),
+            hdr.stored_len()
+        )));
+    }
+    Ok(hdr)
+}
+
+/// What a chunk that fails its tag is refused with.
+fn chunk_refused(c: u64) -> Error {
+    refused(&format!(
+        "chunk {c} of an encrypted object failed its check: the key is wrong, or the object was \
+         changed"
+    ))
+}
+
+/// Write the plaintext of the object `src` holds to `out`, from its first
+/// byte to its last, and answer the header read: `encrypt` undone, for a
+/// caller that wants the whole object and not a reader over it.
+///
+/// Every check an `Encrypted` makes is made: the header's at the start, and
+/// each chunk's tag before a byte of that chunk is written. A chunk that
+/// fails ends the call with some of the chunks before it already in `out`
+/// and nothing of it or after it, so a caller that cannot use a prefix
+/// writes to a place it discards on an error.
+pub fn decrypt<S, W, A>(src: &S, out: &mut W, aead: &A) -> Result<Header>
+where
+    S: Bytes + ?Sized,
+    W: Write + ?Sized,
+    A: Aead + ?Sized,
+{
+    let hdr = checked_header(src)?;
+    let aad = hdr.encode();
+    let mut buf = Vec::with_capacity(WRITE_PIECE + hdr.stored_chunk());
+    let mut stored = Vec::new();
+    for c in 0..hdr.chunks() {
+        let (at, n) = (buf.len(), hdr.chunk_plain_len(c));
+        let mut tag = [0u8; TAG];
+        match src.slice_at(hdr.stored_off(c), n + TAG) {
+            Some(s) => {
+                buf.extend_from_slice(&s[..n]);
+                tag.copy_from_slice(&s[n..]);
+            }
+            None => {
+                stored.resize(n + TAG, 0);
+                src.read_at(hdr.stored_off(c), &mut stored)?;
+                buf.extend_from_slice(&stored[..n]);
+                tag.copy_from_slice(&stored[n..]);
+            }
+        }
+        if !aead.decrypt(&hdr.nonce(c), &aad, &mut buf[at..], &tag) {
+            return Err(chunk_refused(c));
+        }
+        if buf.len() >= WRITE_PIECE {
+            out.write_all(&buf)?;
+            buf.clear();
+        }
+    }
+    out.write_all(&buf)?;
+    Ok(hdr)
+}
+
 /// The thread's buffers for the chunks a reader does not keep: a chunk's
 /// stored bytes, read whole from a source that cannot lend them, and the
 /// last few chunks decrypted, each with whose it is. The thread's rather
@@ -749,26 +830,7 @@ impl<B: Bytes, A: Aead> Encrypted<B, A> {
     /// a changed header and a length that is not the header's are refused
     /// here and not at some later read.
     pub fn open_with(src: B, aead: A, opts: &ReadOptions) -> Result<Encrypted<B, A>> {
-        // The header's page in one read: the header, and the zeroes after
-        // it, which no tag covers and a reader therefore looks at.
-        let mut head = [0u8; DATA_START as usize];
-        if src.len() < DATA_START {
-            return Err(refused("too short to be an encrypted object"));
-        }
-        src.read_at(0, &mut head)?;
-        let hdr = Header::parse(&head)?;
-        if head[Header::LEN..].iter().any(|&b| b != 0) {
-            return Err(refused(
-                "an encrypted object with something other than zeroes after its header",
-            ));
-        }
-        if src.len() != hdr.stored_len() {
-            return Err(refused(&format!(
-                "an encrypted object of {} bytes whose header describes {}: cut short, or grown",
-                src.len(),
-                hdr.stored_len()
-            )));
-        }
+        let hdr = checked_header(&src)?;
         #[cfg(target_family = "wasm")]
         let _ = opts;
         let e = Encrypted {
@@ -831,10 +893,7 @@ impl<B: Bytes, A: Aead> Encrypted<B, A> {
         if !self.aead.decrypt(&self.hdr.nonce(c), &self.aad, dst, &tag) {
             // Whatever the cipher left there is not plaintext anyone may see.
             dst.fill(0);
-            return Err(refused(&format!(
-                "chunk {c} of an encrypted object failed its check: the key is wrong, or the \
-                 object was changed"
-            )));
+            return Err(chunk_refused(c));
         }
         Ok(())
     }
@@ -2048,5 +2107,63 @@ mod tests {
         lend(1, p.len() - 1);
         lend(90 * C, 99 * C);
         assert_eq!(walked(&e), all);
+    }
+
+    /// `decrypt` writes what `encrypt` read, at every length around a
+    /// chunk's and a write piece's, from a source that lends and one that
+    /// copies, and answers the header.
+    #[test]
+    fn the_whole_object_decrypts_to_what_was_encrypted() {
+        let lens = [0, 1, C - 1, C, C + 1, 5 * C, 5 * C + 7, 3000];
+        for n in lens {
+            let p = plain(n);
+            let stored = envelope(&p, 9, 4, 11);
+            let mut out = Vec::new();
+            let hdr = decrypt(&SliceBytes(&stored), &mut out, &Toy::new(11)).unwrap();
+            assert_eq!(out, p, "{n} bytes, lent");
+            assert_eq!((hdr.plain_len(), hdr.key_id()), (n as u64, 9));
+            let mut out = Vec::new();
+            decrypt(&Copying::new(stored), &mut out, &Toy::new(11)).unwrap();
+            assert_eq!(out, p, "{n} bytes, copied");
+        }
+        // Past a write piece, at the default chunk: the pieces written as
+        // they fill and the tail after them, nothing twice and nothing lost.
+        let p = plain(WRITE_PIECE * 2 + 4321);
+        let stored = envelope(&p, DEFAULT_CHUNK_SHIFT, 5, 11);
+        let mut out = Vec::new();
+        decrypt(&SliceBytes(&stored), &mut out, &Toy::new(11)).unwrap();
+        assert!(out == p, "past two write pieces");
+    }
+
+    /// A byte changed anywhere in the object, a wrong key, an object cut
+    /// short: each refuses the whole of it, and what reached the output
+    /// before the refusal is plaintext from before the damage and nothing
+    /// else -- never a byte of the chunk that failed.
+    #[test]
+    fn a_whole_object_that_fails_a_check_gives_nothing_past_it() {
+        let p = plain(4 * C + 100);
+        let stored = envelope(&p, 9, 4, 11);
+        for at in (0..stored.len()).step_by(3) {
+            let mut bad = stored.clone();
+            bad[at] ^= 0x40;
+            let mut out = Vec::new();
+            assert!(
+                decrypt(&SliceBytes(&bad), &mut out, &Toy::new(11)).is_err(),
+                "byte {at} changed"
+            );
+            assert!(p.starts_with(&out), "byte {at}: the output is a prefix");
+            let chunk = at.saturating_sub(D) / S;
+            assert!(out.len() <= chunk * C, "byte {at}: nothing of its chunk");
+        }
+        let mut out = Vec::new();
+        assert!(decrypt(&SliceBytes(&stored), &mut out, &Toy::new(12)).is_err());
+        assert!(out.is_empty(), "a wrong key gives nothing");
+        let mut out = Vec::new();
+        let cut = &stored[..stored.len() - 1];
+        assert!(decrypt(&SliceBytes(cut), &mut out, &Toy::new(11)).is_err());
+        assert!(
+            out.is_empty(),
+            "an object cut short is refused at its header"
+        );
     }
 }
