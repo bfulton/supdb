@@ -75,6 +75,9 @@ pub mod zlz4;
 mod blocks;
 mod zfile;
 pub use zfile::ZInject;
+// A store's directory encrypted by the kernel, under a key the caller gives
+// (`Options::dir_key`).
+pub mod dirkey;
 
 /// Write a segment's ordered index, and make it durable where `durable`
 /// says so (`Options::ord_durable`).
@@ -700,6 +703,16 @@ pub struct ZHeat {
 #[derive(Clone)]
 pub struct Options {
     pub sync: SyncPolicy,
+    /// The key the store's directory is encrypted under, by the kernel
+    /// (`dirkey`, Linux's file encryption): every file the store writes is
+    /// ciphertext on the device and plaintext in the page cache, so no
+    /// read path changes and a store under a key reads as one without.
+    /// `Db::create` encrypts the directory before it writes anything, and
+    /// refuses where the directory cannot be encrypted; `Db::open` holds
+    /// the directory to the key, and refuses a directory that is not
+    /// encrypted under it. `None`, the default, is a store in the clear,
+    /// or one on a directory the kernel already holds the key of.
+    pub dir_key: Option<dirkey::DirKey>,
     /// Memtable bytes that trigger a seal at the next commit. Sealing is off
     /// the commit path in cost accounting but runs on the committing thread
     /// in milestone 1; the brief's "Segment size" question owns this number.
@@ -3753,6 +3766,7 @@ impl Default for Options {
     fn default() -> Options {
         Options {
             sync: SyncPolicy::Always,
+            dir_key: None,
             // 32 MB seals over 64 MB partitions: measured at 1.129x the
             // ingest of 64 MB seals at identical device bytes and identical
             // reads. Smaller still buys nothing and costs 1.5x the device
@@ -26095,10 +26109,16 @@ impl Db {
         s
     }
 
-    pub fn create(dir: &Path, opts: Options) -> Result<Db> {
+    pub fn create(dir: &Path, mut opts: Options) -> Result<Db> {
         check_options(&opts)?;
         let starts_random = opts.read_advice.starts_random();
         std::fs::create_dir_all(dir)?;
+        // Under a key the directory is encrypted before anything is written
+        // into it, or nothing is: a store asked for a key writes no
+        // plaintext. The key is the kernel's from here and is not kept.
+        if let Some(key) = opts.dir_key.take() {
+            dirkey::protect(dir, &key)?;
+        }
         let mut wal = Wal::create(&Db::wal_path(dir, 0), 0, WAL_CHAINED)?;
         let mut spare_wal: *mut PathBuf = std::ptr::null_mut();
         let next_seg = 0u64;
@@ -26346,8 +26366,16 @@ impl Db {
     /// replays whatever outlived the last seal, torn tail tolerated. A
     /// directory with no segments and only a WAL is a store killed before
     /// its first seal, and it opens -- the brief's P-E.
-    pub fn open(dir: &Path, opts: Options) -> Result<Db> {
+    pub fn open(dir: &Path, mut opts: Options) -> Result<Db> {
         check_options(&opts)?;
+        // Before anything is read: the directory held to the key given, or,
+        // with none, an encrypted directory whose key the kernel does not
+        // hold refused by name, since its files' names are encrypted too
+        // and it would read as a store of nothing.
+        match opts.dir_key.take() {
+            Some(key) => dirkey::unlock(dir, &key)?,
+            None => dirkey::refuse_locked(dir)?,
+        }
         // The manifest is the truth when it exists, and every store made
         // by `create` has one from birth. Without one the directory is
         // scanned, which is how a store written before manifests still

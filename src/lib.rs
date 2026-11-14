@@ -100,6 +100,8 @@ pub use bytes::{Bytes, SliceBytes, VecBytes};
 /// names were the other way round while a second engine owned the shorter
 /// one.
 #[cfg(not(target_family = "wasm"))]
+pub use db::dirkey::{self, DirKey, DirState};
+#[cfg(not(target_family = "wasm"))]
 pub use db::{
     BackgroundIo, Db, Isolation, Options, ReadAdvice, Reader, SegmentOptions, SegmentWrite,
     SegmentWriter, SyncPolicy, Txn, Upkeep, ZInject, ZPages,

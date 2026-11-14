@@ -33,6 +33,7 @@ of the change that produced the text.
 | `src/db.rs` | the engine: WAL with atomic batches, memtable, sealed segments, partitioned compaction, tombstones, `Txn`, and the `SegmentWriter` every segment is written by -- `docs/engine.md` |
 | `src/db/zpages.rs` | the compact form's layout: the page, the directory of the groups it holds, the group, the fill that cuts records into groups and packs them into pages, the fence, the trailer and the identity a form file is bound by, with no file, thread or clock in it -- the module's own docs, and `bench/examples/zsize.rs` for what it makes of the engine's bytes |
 | `src/db/zfile.rs` | the compact form's file on the engine's side: the builder that writes a partition's form file from the partition's own bytes, the attach that binds it to its segment by content, the cell a segment holds it in, the point read, the count, the scan walk and the cursor through it, behind `Options::zpages`, and the controller's platform side, the cache budget read from the cgroup and the test's seam for it; the block cache's reads of a covered partition go through it too (`Options::zpages_block_cache`) -- the module's own docs |
+| `src/db/dirkey.rs` | a live store's directory under a key, encrypted by the kernel (`Options::dir_key`): the requests of Linux's file encryption, what `create` and `open` hold a directory to, and `lock`, with no cipher and no byte of a read path in it -- the module's own docs, and `scripts/fscrypt.sh` for a filesystem to test it on |
 | `src/db/zselect.rs` | the compact form's selector: `ZSelect::step`, a function of its state and an explicit `Input` (no clock, thread or file), the one definition of the transitions between FITS, SUSPECT, building, COMPACT and the trial, and the replays that hold it -- the module's own docs |
 | `src/format.rs` | the on-disk format's fixed quantities, owned by no writer |
 | `src/block.rs`, `src/index.rs`, `src/flatindex.rs` | the format itself: blocks, extents, the flat key index -- `docs/index-theory.md` |
@@ -959,12 +960,106 @@ tags, it fell short of the last chunk's end and asked twice anyway. And
 the writer made a write a chunk; it hands its sink a megabyte at a time,
 for the folios the page cache makes of it. With a fast cipher what is
 left of a first touch is the fresh page the plaintext is kept in, which
-costs more than decrypting into it and is not yet priced
-(`ROADMAP.md`). The rule: a second way to read is priced beside the
+costs more than decrypting into it: a long range's pages asked for in
+one call before its chunks are filled took a quarter off the open of a
+`Blob` over an envelope and is the default (`ReadOptions::populate`,
+never past what the reader has room to keep), and huge pages under the
+plaintext added four tenths to the open and to the first pass of point
+reads, the kernel zeroing two megabytes for a chunk of four kilobytes
+(`ReadOptions::huge_pages`, refuted and off). The rule: a second way to read is priced beside the
 first, in one process, on every operation the first is measured on,
 before its default is chosen; and the order of the costs is read off the
 probe before any of them is tuned -- the reader's shape was up to
 eighty times, the cipher six, and the layout two by its count of pages.
+
+The suite has the arms the probe could not be: `supdb-segment`, a
+write-once segment read through `Blob`, beside `supdb-segment-enc` and
+`supdb-segment-encbounded`, the same file as an envelope through the
+reader that keeps and the one that keeps nothing, and all three again
+with every value in a block (`bench/DESIGN.md`). They found two things
+the probe had not. The reader that keeps nothing remembered one
+decrypted chunk a thread, and a value in a block is read as the piece of
+the block it lies in, which lies across two chunks more often than in
+one: a walk of a block's values asked for the same two chunks turn about
+and decrypted both at every value, a scan at a twenty-sixth of the
+keeping reader's rate, where the probe's scan had read 1.6x. A thread
+remembers eight now, each in the place its index names, and the same
+pairing reads the scan at a quarter and the point read at a quarter,
+which is its two chunks a read. And the first envelope arm wrote its
+plain file beside the envelope, the segment on the device twice, at half
+the plain arm's load: the plain file goes to memory now (`/dev/shm`),
+which is also the only way the plaintext is never on the device, and the
+load still reads six tenths, the segment written and then encrypted in
+two passes with the reader's open decrypting the index after
+(`ROADMAP.md`, an envelope written in one pass). Through the keeping
+reader the suite's own passes read level with the plain file where the
+values are inline, and the first pass of point reads over values in
+blocks a tenth lower with its p99 three times, each chunk's one
+decryption falling in that pass. The pairing of the two readers at a
+million keys was stopped at forty minutes of ninety: a threaded scan
+pass is `size` scans a thread, so an arm four times slower there is
+priced at a hundred thousand.
+
+**A live store under a key is the kernel's, and the engine's part is to
+refuse.** `Options::dir_key` does not encrypt anything: `Db::create` hands
+the kernel the key and sets Linux's file-encryption policy on the store's
+empty directory before it writes into it, `Db::open` holds the
+directory's policy to the key it was given, and from there every file
+the store makes is ciphertext on the device and plaintext in the page
+cache (`src/db/dirkey.rs`). That is the whole reason it is done this
+way: a store reads by lending from its files' mappings, the page cache
+is what holds those bytes, and the kernel is the one place a file can be
+decrypted into it. Encryption the engine did itself would put every byte
+a store reads into memory of its own, as the envelope's reader does for
+one finished file, and take the advice, the residency counts and the
+out-of-core accounting with it. What the engine owes is the refusals,
+and each is a test: a store given a key where the directory cannot be
+encrypted writes nothing; a key given to a store in the clear is refused
+before a byte is read, since the store would go on in the clear under a
+caller who believes otherwise; a directory under another key is refused;
+and an encrypted directory whose key the kernel does not hold is refused
+by name when opened with none, because its files' names are encrypted
+too and it would open as a store of nothing. The key is not kept in the
+options past the call, and a store does not give it up at its close:
+another store or another process may be open under it, and a key given
+up under them is their next file refused.
+
+The tests are in two halves because a test cannot make a filesystem. The
+refusals run wherever the tests do. The rest wants a directory on a
+filesystem with the feature and the file that filesystem is in, to
+search what the device holds for the store's keys, values and file
+names: `scripts/fscrypt.sh up` makes one in a file behind a loop device,
+`scripts/check.sh fscrypt` runs the ignored tests of `tests/dirkey.rs`
+on it and asks for each by name, since a run of no tests is green, and
+CI has a job that does both as the runner's own user. Three things it
+taught. A key is given up through a descriptor, and `lock` asked through
+the store's own directory, which is a file under the key held open for
+the asking: the kernel answered that files were busy every time, and the
+filesystem's root is the descriptor to ask through. A mutant that
+skipped the encryption wrote a store in the clear onto the test
+filesystem, and every run after it found that store's keys on the
+device, in blocks a removed file leaves behind: the device remembers, so
+a red run of that test is followed by `fscrypt.sh down` and `up`, and
+the search has a control, a file written in the clear beside the store
+that it has to find. The same test searched the device for the store's
+file names and went red in the gate after a pairing had put a plain
+store on the filesystem: every store's files have the same names, so a
+name on the device says nothing about this store, and the names are
+held by the locked store's listing, which is this store's alone. And the pairing: `supdb-dirkey` against `supdb`,
+both on that filesystem, read level on every read, scan and read mix in
+both sittings, and at half on every write that syncs, the buffered load
+at a quarter. A bare write and `fdatasync` in an encrypted directory and
+a plain one, no engine in it, read the same 2.4x, and `/proc/crypto`
+named the reason: `xts(ecb(aes-fixed-time))`, a kernel built without the
+AES instructions (`CRYPTO_AES_NI_INTEL` is not set in this guest's), a
+software cipher at a hundred megabytes a second where a kernel that
+names `xts-aes-aesni` runs gigabytes. So the write cells of that pairing
+are this kernel's and nobody's, the read cells are the design's, and the
+price on a kernel with the instructions is not known (`ROADMAP.md`). The
+rule: under the kernel's encryption a write rate is read after
+`/proc/crypto` has named the cipher's driver and after a floor with no
+engine in it has been taken in the same two directories, since the
+cipher is the kernel's and its speed is a property of the build.
 
 The first tests of the browser's half changed every byte of the record
 and required a refusal, and seven of fourteen mutants of `crypt.mjs`

@@ -175,7 +175,10 @@ fn an_encrypted_segment_answers_as_the_plain_one_does() {
 
             // One that keeps nothing lends nothing, through a mapping and
             // through a source that cannot lend either.
-            let nothing = ReadOptions { keep_bytes: 0 };
+            let nothing = ReadOptions {
+                keep_bytes: 0,
+                ..ReadOptions::default()
+            };
             let stored_map = MmapBytes::open(&enc).unwrap();
             let bounded = Encrypted::open_with(stored_map, Gcm::new(&KEY), &nothing).unwrap();
             let blob = Blob::open(bounded).expect("open keeping nothing");
@@ -188,6 +191,7 @@ fn an_encrypted_segment_answers_as_the_plain_one_does() {
             // And one that keeps a quarter of the object reads the rest.
             let some = ReadOptions {
                 keep_bytes: hdr.plain_len() / 4,
+                ..ReadOptions::default()
             };
             let part = Encrypted::open_with(Copying(stored), Gcm::new(&KEY), &some).unwrap();
             let blob = Blob::open(part).expect("open keeping a part");

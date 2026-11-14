@@ -378,6 +378,8 @@ fn dir_size_into(p: &Path, seen: &mut std::collections::HashSet<(u64, u64)>) -> 
 pub struct Supdb {
     db: Option<supdb::Db>,
     path: PathBuf,
+    /// The store's directory is under a key (`Policy::dir_key`).
+    dirkey: bool,
     /// False for the ingest-first arm: a flush stops partitioning what it
     /// sealed and leaves that to the background -- promotion at once, a
     /// merge for the rest (`Options::flush_schedules`). Both arms exist so
@@ -1227,6 +1229,12 @@ impl Drop for TallyReader {
 /// What an arm differs from `supdb` by. One struct rather than a row of
 /// positional flags, which reached seven and could not take the eighth.
 struct Policy {
+    /// The store's directory encrypted by the kernel under a key
+    /// (`Options::dir_key`): `supdb-dirkey` and `supdb-ingestdirkey`, the
+    /// default and the buffered arm with nothing else changed. The store
+    /// has to stand on a filesystem that can encrypt
+    /// (`scripts/fscrypt.sh`), and so has the arm it is paired with.
+    dir_key: bool,
     partition: bool,
     drain: bool,
     advice: Option<supdb::ReadAdvice>,
@@ -1922,6 +1930,7 @@ impl Default for Policy {
     /// `supdb`: the shipping configuration.
     fn default() -> Policy {
         Policy {
+            dir_key: false,
             partition: true,
             drain: true,
             advice: None,
@@ -2121,6 +2130,36 @@ impl Supdb {
         Supdb::with_policy(
             path,
             Policy {
+                partition: false,
+                durable: false,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with its directory under a key: every file the store writes
+    /// encrypted by the kernel (`Options::dir_key`). The pair against
+    /// `supdb`, both on a filesystem that can encrypt, differs by the key
+    /// and prices what the kernel's encryption costs a store: nothing
+    /// where a pass reads the page cache, which holds plaintext, and the
+    /// cipher where a page is written back or read in.
+    pub fn create_dirkey(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                dir_key: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` with its directory under a key, as `supdb-dirkey` is
+    /// `supdb` with one: the buffered arm's pair.
+    pub fn create_ingest_dirkey(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                dir_key: true,
                 partition: false,
                 durable: false,
                 ..Policy::default()
@@ -6434,6 +6473,7 @@ impl Supdb {
 
     fn with_policy(path: &Path, policy: Policy) -> Res<Supdb> {
         let Policy {
+            dir_key,
             partition,
             drain,
             advice,
@@ -7032,10 +7072,15 @@ impl Supdb {
             },
             None => opts,
         };
+        let opts = supdb::Options {
+            dir_key: dir_key.then(|| supdb::DirKey::new([0x5a; 32])),
+            ..opts
+        };
         let db = supdb::Db::create(path, opts).map_err(|e| e.to_string())?;
         Ok(Supdb {
             db: Some(db),
             path: path.to_path_buf(),
+            dirkey: dir_key,
             partition,
             drain,
             advice,
@@ -7295,6 +7340,15 @@ impl ThreadReader for TallyReader {
 
 impl Engine for Supdb {
     fn name(&self) -> &'static str {
+        // A store under a key is the default or the buffered arm with
+        // nothing else changed.
+        if self.dirkey {
+            return if self.durable {
+                "supdb-dirkey"
+            } else {
+                "supdb-ingestdirkey"
+            };
+        }
         // The pinned shapes alone name an arm; a field that follows the
         // engine names nothing.
         let zdropraw = self.zdropraw == Some(true);
@@ -9148,6 +9202,274 @@ impl Engine for Lmdb {
 }
 
 // ---------------------------------------------------------------------------
+// A write-once segment, plain and through an envelope.
+
+/// AES-256-GCM for the envelope arms: `ring`'s, behind the hook
+/// `supdb::crypt` takes its cipher through. The engine ships no cipher, so
+/// this is what a caller writes, as `examples/crypt.rs` has it.
+struct Gcm(ring::aead::LessSafeKey);
+
+impl Gcm {
+    fn new() -> Gcm {
+        let key = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &[0x5a; 32])
+            .expect("a 32-byte key");
+        Gcm(ring::aead::LessSafeKey::new(key))
+    }
+}
+
+impl supdb::crypt::Aead for Gcm {
+    fn encrypt(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
+        let nonce = ring::aead::Nonce::assume_unique_for_key(*nonce);
+        let tag = self
+            .0
+            .seal_in_place_separate_tag(nonce, ring::aead::Aad::from(aad), buf)
+            .expect("a chunk is far under the cipher's limit");
+        tag.as_ref().try_into().expect("a sixteen-byte tag")
+    }
+    fn decrypt(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8], tag: &[u8; 16]) -> bool {
+        let nonce = ring::aead::Nonce::assume_unique_for_key(*nonce);
+        self.0
+            .open_in_place_separate_tag(nonce, ring::aead::Aad::from(aad), (*tag).into(), buf, 0..)
+            .is_ok()
+    }
+}
+
+/// How a segment arm publishes its file and reads it back.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Envelope {
+    /// The segment as it is written, read through a mapping.
+    None,
+    /// Encrypted at the load's `sync`, read through a reader that keeps
+    /// what it decrypts: `supdb::crypt`'s default.
+    Kept,
+    /// The same envelope through a reader that keeps nothing and decrypts
+    /// at each read (`ReadOptions::keep_bytes` of zero).
+    Bounded,
+}
+
+/// A finished segment behind one of its readers. Boxed alike, so that a
+/// read through either reaches its reader by the same steps: the reader
+/// that keeps what it decrypts is three times the plain one's size, and one
+/// boxed beside one not is a load the other arm does not make.
+enum SegBlob {
+    Plain(Box<supdb::Blob<supdb::MmapBytes>>),
+    Enc(Box<supdb::Blob<supdb::crypt::Encrypted<supdb::MmapBytes, Gcm>>>),
+}
+
+fn blob_get<B: supdb::Bytes>(b: &supdb::Blob<B>, key: &[u8]) -> Res<usize> {
+    let mut n = 0usize;
+    b.read_all(key, |v| n += consume(v))
+        .map_err(|e| e.to_string())?;
+    Ok(n)
+}
+
+fn blob_range<B: supdb::Bytes>(b: &supdb::Blob<B>, from: &[u8], n: usize) -> Res<usize> {
+    let mut bytes = 0usize;
+    b.scan(from, n, |_k, v| bytes += consume(v))
+        .map_err(|e| e.to_string())?;
+    Ok(bytes)
+}
+
+impl SegBlob {
+    fn get(&self, key: &[u8]) -> Res<usize> {
+        match self {
+            SegBlob::Plain(b) => blob_get(b, key),
+            SegBlob::Enc(b) => blob_get(b, key),
+        }
+    }
+    fn range(&self, from: &[u8], n: usize) -> Res<usize> {
+        match self {
+            SegBlob::Plain(b) => blob_range(b, from, n),
+            SegBlob::Enc(b) => blob_range(b, from, n),
+        }
+    }
+}
+
+/// A write-once segment: the load's keys through `SegmentWriter` as they
+/// arrive, the file finished at `sync` and read by `Blob` from then on.
+///
+/// The other producer of the format, and the one a published index is made
+/// by: sorted input in, one immutable file out. It takes the ordered load
+/// and nothing after it that writes -- a shuffled load, an update and a mix
+/// with writes are refused by name -- so its passes are `load`, `read` and
+/// `scan`, threaded or not, and it is an arm for a pairing, never the
+/// roster's. What it is here for is the envelope: the same file published
+/// encrypted (`supdb::crypt`) and read through each of the two readers,
+/// beside itself read plain, in one process.
+///
+/// `sync` is where the file is finished and, for an envelope, encrypted,
+/// the plain file removed and the envelope synced, so the load's rate has
+/// the encryption in it; the readers are opened there too, outside every
+/// read pass, as a store's are. An envelope arm writes its plain file to
+/// memory (`/dev/shm`, where there is one) and only the envelope to the
+/// store's directory: a plain file written beside the envelope is the
+/// segment written to the device twice, half the load's rate in the first
+/// pairing of these arms, and it is the plaintext on the device, which is
+/// what the envelope was for. `blocks` writes every value into a block
+/// where the engine's own shape keeps a hundred bytes inline in the index
+/// record: inline, a read touches the index alone, which any reader holds
+/// after its open, and the envelope's cost at a read shows only where the
+/// read reaches a block.
+pub struct Segment {
+    dir: PathBuf,
+    /// Where the writer writes: the store's directory, or memory for a
+    /// segment that is published as an envelope.
+    plain: PathBuf,
+    envelope: Envelope,
+    blocks: bool,
+    writer: Option<supdb::SegmentWriter>,
+    blob: Option<std::sync::Arc<SegBlob>>,
+}
+
+/// Plain files in memory, one a segment, named apart.
+static SEGMENT_TEMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl Segment {
+    fn create(dir: &Path, envelope: Envelope, blocks: bool) -> Res<Segment> {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let shm = Path::new("/dev/shm");
+        let plain = if envelope != Envelope::None && shm.is_dir() {
+            let n = SEGMENT_TEMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            shm.join(format!(
+                "supdb-bench-segment-{}-{n}.sup",
+                std::process::id()
+            ))
+        } else {
+            dir.join("segment.sup")
+        };
+        let mut writer =
+            supdb::SegmentWriter::create(&plain, &Default::default()).map_err(|e| e.to_string())?;
+        // The engine's own bound on an inline run, or none.
+        let inline = supdb::Options::default().inline_bytes;
+        writer.set_inline_max(if blocks { 0 } else { inline });
+        Ok(Segment {
+            dir: dir.to_path_buf(),
+            plain,
+            envelope,
+            blocks,
+            writer: Some(writer),
+            blob: None,
+        })
+    }
+
+    fn reader(&self) -> Res<&std::sync::Arc<SegBlob>> {
+        self.blob
+            .as_ref()
+            .ok_or_else(|| "a write-once segment is read after its sync".to_string())
+    }
+}
+
+struct SegmentReader(std::sync::Arc<SegBlob>);
+
+impl ThreadReader for SegmentReader {
+    fn get(&mut self, key: &[u8]) -> Res<usize> {
+        self.0.get(key)
+    }
+    fn range(&mut self, from: &[u8], n: usize) -> Res<usize> {
+        self.0.range(from, n)
+    }
+}
+
+impl Engine for Segment {
+    fn name(&self) -> &'static str {
+        match (self.blocks, self.envelope) {
+            (false, Envelope::None) => "supdb-segment",
+            (false, Envelope::Kept) => "supdb-segment-enc",
+            (false, Envelope::Bounded) => "supdb-segment-encbounded",
+            (true, Envelope::None) => "supdb-segmentblocks",
+            (true, Envelope::Kept) => "supdb-segmentblocks-enc",
+            (true, Envelope::Bounded) => "supdb-segmentblocks-encbounded",
+        }
+    }
+    fn features(&self) -> Features {
+        Features {
+            // Nothing is durable, or readable, before the one `sync`.
+            durable_commit: false,
+            transactions: false,
+            checksums: true,
+            reopen_for_write: false,
+            read_your_writes: false,
+            ordered_scan: true,
+        }
+    }
+    fn write_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
+        let w = self
+            .writer
+            .as_mut()
+            .ok_or("a write-once segment takes no write after its sync")?;
+        for &(k, v) in items {
+            // The writer refuses a key out of order, which is what a
+            // shuffled load hands it.
+            w.begin(k).map_err(|e| e.to_string())?;
+            w.value(v);
+            w.end().map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+    fn update_batch(&mut self, _items: &[(&[u8], &[u8])]) -> Res<()> {
+        Err("a write-once segment takes no update".into())
+    }
+    fn get(&mut self, key: &[u8]) -> Res<usize> {
+        self.reader()?.get(key)
+    }
+    fn range(&mut self, from: &[u8], n: usize) -> Res<usize> {
+        self.reader()?.range(from, n)
+    }
+    fn thread_reader(&self) -> Res<ReaderOpener> {
+        // One reader, shared: a `Blob` is, and a kept chunk is every
+        // thread's once any of them has decrypted it.
+        let blob = self.reader()?.clone();
+        Ok(Box::new(move || {
+            Ok(Box::new(SegmentReader(blob)) as Box<dyn ThreadReader>)
+        }))
+    }
+    fn sync(&mut self) -> Res<()> {
+        let Some(w) = self.writer.take() else {
+            return Ok(());
+        };
+        let e = |e: std::io::Error| e.to_string();
+        let plain = self.plain.clone();
+        w.finish(1).map_err(e)?;
+        if self.envelope == Envelope::None {
+            let src = supdb::MmapBytes::open(&plain).map_err(e)?;
+            let blob = Box::new(supdb::Blob::open(src).map_err(e)?);
+            self.blob = Some(SegBlob::Plain(blob).into());
+            return Ok(());
+        }
+        let stored = self.dir.join("segment.sup.enc");
+        {
+            let src = supdb::MmapBytes::open(&plain).map_err(e)?;
+            let mut out = std::fs::File::create(&stored).map_err(e)?;
+            supdb::crypt::encrypt(&src, &mut out, &Gcm::new(), &Default::default()).map_err(e)?;
+            out.sync_all().map_err(e)?;
+        }
+        std::fs::remove_file(&plain).map_err(e)?;
+        let mut opts = supdb::crypt::ReadOptions::default();
+        if self.envelope == Envelope::Bounded {
+            opts.keep_bytes = 0;
+        }
+        let src = supdb::MmapBytes::open(&stored).map_err(e)?;
+        let src = supdb::crypt::Encrypted::open_with(src, Gcm::new(), &opts).map_err(e)?;
+        let blob = Box::new(supdb::Blob::open(src).map_err(e)?);
+        self.blob = Some(SegBlob::Enc(blob).into());
+        Ok(())
+    }
+    fn size_bytes(&self) -> u64 {
+        dir_size(&self.dir)
+    }
+}
+
+impl Drop for Segment {
+    fn drop(&mut self) {
+        // A segment dropped before its sync leaves its plain file, and one
+        // in memory is under nobody's directory to be removed with it.
+        if self.writer.take().is_some() {
+            let _ = std::fs::remove_file(&self.plain);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The arms.
 use crate::row::Guarantee;
 
@@ -9201,6 +9523,14 @@ pub const OOC_ARMS: [&str; 7] = [
     "rocksdb-tuned",
 ];
 
+/// Whether the arm writes one file, once, from keys in order: the segment
+/// arms. Such an arm has the ordered load and the reads over it and
+/// nothing else, so the runner makes it no second store for a shuffled
+/// load (`run::one_pass`).
+pub fn write_once(arm: &str) -> bool {
+    arm.starts_with("supdb-segment")
+}
+
 pub fn guarantee(arm: &str) -> Option<Guarantee> {
     Some(match arm {
         "supdb"
@@ -9233,6 +9563,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-noadvice"
         | "supdb-advicerandom"
         | "supdb-nocache"
+        | "supdb-dirkey"
         | "supdb-nocacheordread"
         | "supdb-nocachezpages"
         | "supdb-nocachezpagesnodrop"
@@ -9512,7 +9843,15 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingesthold"
         | "lmdb-nosync"
         | "rocksdb-nosync"
-        | "rocksdb-tuned-nosync" => Guarantee::Buffered,
+        | "rocksdb-tuned-nosync"
+        | "supdb-ingestdirkey"
+        // A write-once segment makes nothing durable before its one sync.
+        | "supdb-segment"
+        | "supdb-segment-enc"
+        | "supdb-segment-encbounded"
+        | "supdb-segmentblocks"
+        | "supdb-segmentblocks-enc"
+        | "supdb-segmentblocks-encbounded" => Guarantee::Buffered,
         _ => return None,
     })
 }
@@ -9563,6 +9902,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-noadvice" => supdb_arm(Supdb::create_noadvice, dir)?,
         "supdb-advicerandom" => supdb_arm(Supdb::create_advicerandom, dir)?,
         "supdb-nocache" => supdb_arm(Supdb::create_nocache, dir)?,
+        "supdb-dirkey" => supdb_arm(Supdb::create_dirkey, dir)?,
+        "supdb-ingestdirkey" => supdb_arm(Supdb::create_ingest_dirkey, dir)?,
         "supdb-nocacheordread" => supdb_arm(Supdb::create_nocache_ordread, dir)?,
         "supdb-nocachezpages" => supdb_arm(Supdb::create_nocache_zpages, dir)?,
         "supdb-nocachezpagesnodrop" => supdb_arm(Supdb::create_nocache_zpages_nodrop, dir)?,
@@ -10152,6 +10493,14 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-shapeidle" => supdb_arm(Supdb::create_shape_idle, dir)?,
         "supdb-ingestadaptloose" => supdb_arm(Supdb::create_ingest_adaptloose, dir)?,
         "supdb-ingestnoseal" => supdb_arm(Supdb::create_ingest_noseal, dir)?,
+        "supdb-segment" => Box::new(Segment::create(dir, Envelope::None, false)?),
+        "supdb-segment-enc" => Box::new(Segment::create(dir, Envelope::Kept, false)?),
+        "supdb-segment-encbounded" => Box::new(Segment::create(dir, Envelope::Bounded, false)?),
+        "supdb-segmentblocks" => Box::new(Segment::create(dir, Envelope::None, true)?),
+        "supdb-segmentblocks-enc" => Box::new(Segment::create(dir, Envelope::Kept, true)?),
+        "supdb-segmentblocks-encbounded" => {
+            Box::new(Segment::create(dir, Envelope::Bounded, true)?)
+        }
         "lmdb" => Box::new(Lmdb::create(dir, map_gb)?),
         "lmdb-nordahead" => Box::new(Lmdb::create_nordahead(dir, map_gb)?),
         "lmdb-nosync" => Box::new(Lmdb::create_nosync(dir, map_gb)?),
@@ -13000,6 +13349,120 @@ mod tests {
             assert_eq!(e.name(), name, "the dispatch");
         }
         drop(base);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The segment arms answer alike, plain and through an envelope with
+    /// either reader, inline and in blocks, on the writer's thread and on
+    /// another; an envelope leaves no plain file and no value in the clear;
+    /// and a write-once segment says so of everything it does not take.
+    #[test]
+    fn a_segment_reads_the_same_plain_and_through_an_envelope() {
+        let root = std::env::temp_dir().join(format!("supdb-bench-segment-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let n = 4_000u64;
+        let key = |i: u64| format!("{i:016}").into_bytes();
+        let value = |i: u64| {
+            let mut v = format!("the value of key {i:016}, in the clear.").into_bytes();
+            v.resize(100, b'.');
+            v
+        };
+        let mut answers = Vec::new();
+        for arm in [
+            "supdb-segment",
+            "supdb-segment-enc",
+            "supdb-segment-encbounded",
+            "supdb-segmentblocks",
+            "supdb-segmentblocks-enc",
+            "supdb-segmentblocks-encbounded",
+        ] {
+            assert_eq!(guarantee(arm), Some(Guarantee::Buffered), "{arm}");
+            assert!(write_once(arm), "{arm}");
+            let dir = root.join(arm);
+            let mut e = open(arm, &dir, 1).unwrap();
+            assert_eq!(e.name(), arm);
+            assert!(e.get(&key(0)).is_err(), "{arm}: read before its sync");
+            for chunk in (0..n).collect::<Vec<_>>().chunks(500) {
+                let items: Vec<(Vec<u8>, Vec<u8>)> =
+                    chunk.iter().map(|&i| (key(i), value(i))).collect();
+                let refs: Vec<(&[u8], &[u8])> =
+                    items.iter().map(|(k, v)| (&k[..], &v[..])).collect();
+                e.write_batch(&refs).unwrap();
+            }
+            e.sync().unwrap();
+            e.sync().unwrap();
+            assert!(
+                e.write_batch(&[(&key(n)[..], &value(n)[..])]).is_err(),
+                "{arm}: a write after"
+            );
+            assert!(
+                e.update_batch(&[(&key(1)[..], &value(1)[..])]).is_err(),
+                "{arm}: an update"
+            );
+
+            let mut got = Vec::new();
+            for i in (0..n).step_by(7) {
+                got.push(e.get(&key(i)).unwrap());
+            }
+            assert!(
+                got.iter().all(|&b| b == 100),
+                "{arm}: a hundred bytes a key"
+            );
+            assert_eq!(e.get(b"no such key").unwrap(), 0);
+            got.push(e.range(&key(1_234), 100).unwrap());
+            got.push(e.range(&key(n - 10), 100).unwrap());
+            assert_eq!(got[got.len() - 2..], [10_000, 1_000], "{arm}: scans");
+            let opener = e.thread_reader().unwrap();
+            let (k1, k2) = (key(77), key(3_000));
+            let threaded = std::thread::spawn(move || {
+                let mut r = opener().unwrap();
+                (r.get(&k1).unwrap(), r.range(&k2, 50).unwrap())
+            })
+            .join()
+            .unwrap();
+            assert_eq!(threaded, (100, 5_000), "{arm}: another thread");
+            answers.push(got);
+
+            let files: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|f| f.unwrap().file_name().into_string().unwrap())
+                .collect();
+            let enveloped = arm.contains("-enc");
+            assert_eq!(
+                files,
+                [if enveloped {
+                    "segment.sup.enc"
+                } else {
+                    "segment.sup"
+                }],
+                "{arm}"
+            );
+            let bytes = std::fs::read(dir.join(&files[0])).unwrap();
+            let clear = bytes.windows(13).any(|w| w == b"in the clear.");
+            assert_eq!(clear, !enveloped, "{arm}: a value in the clear");
+            assert!(e.size_bytes() >= n * 116, "{arm}: {} bytes", e.size_bytes());
+            drop(e);
+        }
+        assert!(
+            answers.windows(2).all(|w| w[0] == w[1]),
+            "the arms answered differently"
+        );
+        // Nothing of an envelope arm is left in memory: not after its sync,
+        // and not when it is dropped before one.
+        let unsynced = open("supdb-segment-enc", &root.join("unsynced"), 1).unwrap();
+        drop(unsynced);
+        let mine = format!("supdb-bench-segment-{}-", std::process::id());
+        if let Ok(shm) = std::fs::read_dir("/dev/shm") {
+            let left: Vec<_> = shm
+                .map(|f| f.unwrap().file_name().into_string().unwrap())
+                .filter(|f| f.starts_with(&mine))
+                .collect();
+            assert!(left.is_empty(), "plain files left in memory: {left:?}");
+        }
+        assert!(
+            ARMS.iter().chain(&OOC_ARMS).all(|a| !write_once(a)),
+            "a roster arm takes every load"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

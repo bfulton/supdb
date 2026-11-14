@@ -35,6 +35,10 @@ heed = "0.20"
 # clang-sys does not find one, `scripts/libclang.sh` names the directory
 # holding it (libclang.so, or libclang.dylib on macOS).
 rocksdb = { version = "0.23", default-features = false }
+# The cipher of the envelope arms (`supdb-segment-enc`): the engine takes
+# its cipher from the caller, and here the suite is the caller. `ring`'s
+# AES-GCM, as the engine's own tests and examples link.
+ring = "0.17"
 
 # liblz4's decoder, for the probe that prices it against `lz4_flex` on the
 # form's own pages (`examples/zdecode.rs`, `--features lz4-c`). Optional, so

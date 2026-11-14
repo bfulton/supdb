@@ -151,23 +151,40 @@ What an engine picker would hit, roughly in order.
   with a count; add an end bound and reverse order.
 - [ ] **Batched point reads (`MultiGet`).** Cheap to add, and a natural new
   benchmark workload.
-- [ ] **Encryption at rest for a live store.** A finished segment has an
-  envelope (`supdb::crypt`): encrypted and authenticated under a cipher the
-  caller supplies, read in place by `Blob`, `SparseBlob` and the browser
-  reader at the plain file's speed once a part has been read. A store's own
-  directory -- the log, the segments, the manifest,
-  the ordered indexes and the form files -- is still written in the clear,
-  and its reads lend from the mapping, which an encrypted file cannot. Done
-  when a store opens under a key and nothing it writes is plaintext, with
-  the cost of the copy priced by an arm. Until then it is the filesystem's.
-- [ ] **The encrypted reader in the suite.** `examples/crypt_cost.rs` prices
-  every read through an envelope beside the same read of the plain file, in
-  one process, and the reader, the layout and the chunk size were chosen
-  from it. Nothing gates it: no arm reads through an envelope and no row
-  holds one. Done when the suite has the arm.
-- [ ] **An envelope's first touch.** With a fast cipher, the fresh pages a
-  reader keeps its plaintext in cost more than decrypting into them. Done
-  when populating them in bulk, or not at all, has been priced.
+- [x] **Encryption at rest for a live store.** A store opens under a key
+  (`Options::dir_key`) and the kernel encrypts its directory: every file
+  it writes is ciphertext on the device and plaintext in the page cache,
+  so its reads lend from the mapping as they did (`supdb::dirkey`). It is
+  Linux's file encryption, on a filesystem that has it, and it is refused
+  anywhere else rather than written in the clear.
+- [ ] **A store under a key on another platform, or a filesystem without
+  the feature.** The kernel's encryption is ext4's and f2fs's on Linux. A
+  store that encrypted its own files would go anywhere, and would hold
+  every byte it reads in memory of its own, where the page cache holds it
+  now: the envelope's reader does that for a finished segment
+  (`supdb::crypt`), and for a live store it is the log, the segments in
+  flight, the manifest, the indexes and the form files as well, and the
+  engine's accounting out of core with them. Not started, and not decided.
+- [ ] **A store under a key, priced on a kernel with hardware AES.** The
+  pairings of `supdb-dirkey` against `supdb` ran where the kernel has no
+  AES instructions built in (`/proc/crypto` names `aes-fixed-time`): reads,
+  scans and the read mixes were level, and every write that syncs ran at
+  about half, as a bare write and `fdatasync` with no engine did in the
+  same two directories. Done when the pairing has run on a kernel that
+  names `xts-aes-aesni`.
+- [x] **The encrypted reader in the suite.** `supdb-segment`,
+  `supdb-segment-enc` and `supdb-segment-encbounded`, and the same three
+  with every value in a block (`supdb-segmentblocks...`): a write-once
+  segment read plain and through an envelope with either reader, paired by
+  `bench ab`. They are arms for a pairing and no row holds them.
+- [ ] **An envelope written in one pass.** Publishing a segment encrypted
+  writes it plain, in memory, and encrypts that into the file: the load of
+  `supdb-segment-enc` runs at about six tenths of `supdb-segment`'s. Done
+  when the segment writer writes the envelope itself.
+- [x] **An envelope's first touch.** Asking for a long range's pages in one
+  call took a quarter off the open and is the default
+  (`ReadOptions::populate`); huge pages added four tenths to it and are off
+  (`ReadOptions::huge_pages`). `examples/crypt_cost.rs` has both arms.
 
 ## Out of core
 

@@ -21,6 +21,10 @@
 //!   read.
 //! - `enc-kept@N`: the same envelope through a reader that keeps each chunk
 //!   it decrypts, the default, which lends.
+//! - `kept+populate`, `kept+huge`: the default chunk again, the reader
+//!   asking for a long range's pages in one call, or for huge pages
+//!   (`ReadOptions::populate`, `huge_pages`): what the fresh pages a reader
+//!   keeps its plaintext in cost a first touch.
 //!
 //! The operations: the open; point reads of keys whose values are inline in
 //! the index record, of keys with a short run in a block, and of keys with a
@@ -272,6 +276,8 @@ fn main() {
         names.push(format!("enc-copy@{s}"));
         names.push(format!("enc-kept@{s}"));
     }
+    names.push("kept+populate".into());
+    names.push("kept+huge".into());
     let mut first = vec![vec![Vec::new(); OPS.len()]; names.len()];
     let mut later = vec![vec![Vec::new(); OPS.len()]; names.len()];
     let mut truth: Option<Vec<u64>> = None;
@@ -292,7 +298,10 @@ fn main() {
         ];
         for s in shifts {
             let stored = || MmapBytes::open(&enc(s)).unwrap();
-            let nothing = ReadOptions { keep_bytes: 0 };
+            let nothing = ReadOptions {
+                keep_bytes: 0,
+                ..ReadOptions::default()
+            };
             results.push(arm(
                 &|| Blob::open(Encrypted::open_with(stored(), gcm(), &nothing).unwrap()).unwrap(),
                 &sets,
@@ -301,6 +310,24 @@ fn main() {
             ));
             results.push(arm(
                 &|| Blob::open(Encrypted::open(stored(), gcm()).unwrap()).unwrap(),
+                &sets,
+                keys,
+                passes,
+            ));
+        }
+        for opts in [
+            ReadOptions {
+                populate: true,
+                ..ReadOptions::default()
+            },
+            ReadOptions {
+                huge_pages: true,
+                ..ReadOptions::default()
+            },
+        ] {
+            let stored = || MmapBytes::open(&enc(crypt::DEFAULT_CHUNK_SHIFT)).unwrap();
+            results.push(arm(
+                &|| Blob::open(Encrypted::open_with(stored(), gcm(), &opts).unwrap()).unwrap(),
                 &sets,
                 keys,
                 passes,
@@ -344,7 +371,10 @@ fn main() {
     println!(
         "\nfrom cold, random advice: major faults at the open, major faults a read, us a read"
     );
-    let nothing = ReadOptions { keep_bytes: 0 };
+    let nothing = ReadOptions {
+        keep_bytes: 0,
+        ..ReadOptions::default()
+    };
     let row = |name: &str, (at_open, a_read, us): (i64, f64, f64)| {
         println!("{name:<14}{at_open:>8}{a_read:>10.2}{us:>10.1}");
     };

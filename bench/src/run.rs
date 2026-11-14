@@ -2601,7 +2601,10 @@ fn one_pass(
     let mut burst_lag = Vec::with_capacity(LAG_PCT.len());
     let mut prime_b = f64::NAN;
     let mut shuf_s = f64::NAN;
-    if passes.load || passes.lag {
+    // An arm that writes once and in order takes neither: its shuffled
+    // load is left the NaN a phase not run leaves, and a sweep asked of it
+    // is refused by its first update.
+    if (passes.load && !engines::write_once(arm)) || passes.lag {
         prime_b = prime_fresh_pool(prime_bytes_for(size, plan.bound_bytes()))?;
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         let mut e = engines::open(arm, dir, map_gb)?;

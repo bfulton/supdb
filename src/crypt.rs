@@ -7,6 +7,10 @@
 //! `Bytes`, so `Blob::open(Encrypted::open(src, key)?)` and `SparseBlob` read
 //! an encrypted object with nothing in the format or the readers changed.
 //!
+//! This is for a file that is finished and goes somewhere. A live store
+//! takes a key another way, `Options::dir_key`: the kernel encrypts its
+//! directory, and its reads stay borrows from the page cache.
+//!
 //! The cipher is the caller's. The crate ships none: `Aead` is the hook, any
 //! authenticated cipher with a twelve-byte nonce and a sixteen-byte tag fits
 //! it (AES-GCM, ChaCha20-Poly1305), and `examples/crypt.rs` is the adapter
@@ -76,10 +80,11 @@
 //! file's.
 //!
 //! `ReadOptions::keep_bytes` bounds that. Past the bound, and at zero, a
-//! read decrypts the chunks its range touches every time and copies out the
-//! part asked for, with the thread's last chunk remembered: memory stays
-//! flat and a read of a value in a block costs a chunk's decryption, which
-//! is why the default chunk is the smallest that is a page. That is the
+//! read decrypts the chunks its range touches and copies out the part
+//! asked for, with the thread's last few chunks remembered, so that a walk
+//! decrypts each chunk it crosses once: memory stays flat, and a point
+//! read of a value in a block costs a chunk or two's decryption, which is
+//! why the default chunk is the smallest that is a page. That is the
 //! reader for an object larger than memory.
 //!
 //! The cipher is most of a first touch, and implementations of one cipher
@@ -421,22 +426,42 @@ where
 
 /// The thread's buffers for the chunks a reader does not keep: a chunk's
 /// stored bytes, read whole from a source that cannot lend them, and the
-/// last chunk decrypted, with whose it is, which reader and which chunk.
-/// The thread's rather than the reader's, since a reader is shared between
-/// threads, and `Cell`s so that a reader over a reader finds an empty buffer
-/// rather than a borrow in use.
+/// last few chunks decrypted, each with whose it is. The thread's rather
+/// than the reader's, since a reader is shared between threads, and `Cell`s
+/// so that a reader over a reader finds an empty buffer rather than a
+/// borrow in use.
 struct Scratch {
     stored: Cell<Vec<u8>>,
-    plain: Cell<Vec<u8>>,
-    at: Cell<Option<(u64, u64)>>,
+    memo: Cell<Vec<Remembered>>,
 }
+
+/// A decrypted chunk the thread remembers: which reader's, which chunk,
+/// and its plaintext. No reader's while it is being filled or was refused.
+#[derive(Default)]
+struct Remembered {
+    of: Option<(u64, u64)>,
+    plain: Vec<u8>,
+}
+
+/// The most chunks a thread remembers, and the most plaintext they may come
+/// to: a chunk larger than the second is remembered alone.
+///
+/// One was not enough. A value in a block is read as the piece of the block
+/// it lies in, and that piece lies across two chunks more often than in
+/// one, so a walk of a block's values asked for the same two chunks turn
+/// about and decrypted both at every value: a scan through a reader that
+/// keeps nothing ran at a twenty-sixth of the rate of one that keeps
+/// (`supdb-segmentblocks-enc` against `-encbounded` in the suite). A chunk
+/// takes the place its index names among these, so a walk's two chunks have
+/// a place each and the chunks behind it are put out as it moves on.
+const REMEMBERED: usize = 8;
+const REMEMBERED_BYTES: usize = 64 << 10;
 
 thread_local! {
     static SCRATCH: Scratch = const {
         Scratch {
             stored: Cell::new(Vec::new()),
-            plain: Cell::new(Vec::new()),
-            at: Cell::new(None),
+            memo: Cell::new(Vec::new()),
         }
     };
 }
@@ -457,12 +482,33 @@ pub struct ReadOptions {
     /// plaintext as its reads have touched, up to the whole object, until
     /// it is dropped. Nothing is kept on a wasm target, whatever this says.
     pub keep_bytes: u64,
+    /// Ask the kernel for the fresh pages of a long range in one call
+    /// (`MADV_POPULATE_WRITE`, Linux) before its chunks are decrypted into
+    /// them, where each chunk's first write would otherwise fault its page
+    /// in alone. On by default: with a fast cipher the pages are most of a
+    /// first touch, and it took a quarter off the open of a `Blob` over an
+    /// envelope, which is its index sections' first touch, with no read
+    /// after it moved (`examples/crypt_cost.rs`, `kept+populate`). Only a
+    /// range of several chunks is asked for, and no more of it than the
+    /// reader has room to keep, so a read of one chunk and a reader at its
+    /// bound take no page they will not write.
+    pub populate: bool,
+    /// REFUTED here, and off: huge pages under the kept plaintext
+    /// (`MADV_HUGEPAGE`, Linux), one fault for two megabytes. The open and
+    /// the first pass of point reads both took four tenths longer with it
+    /// (`kept+huge` in the same probe), the kernel zeroing two megabytes
+    /// for a chunk of four kilobytes, and memory is then taken two
+    /// megabytes at a time whatever `keep_bytes` counts. Kept as the arm
+    /// for a host that prices a page otherwise.
+    pub huge_pages: bool,
 }
 
 impl Default for ReadOptions {
     fn default() -> Self {
         ReadOptions {
             keep_bytes: u64::MAX,
+            populate: true,
+            huge_pages: false,
         }
     }
 }
@@ -500,6 +546,8 @@ struct Kept {
     /// Plaintext bytes held, and the most that may be.
     bytes: AtomicU64,
     limit: u64,
+    /// `ReadOptions::populate`.
+    populate: bool,
     /// Chunks `READY`, and whether that is all of them.
     ready: AtomicU64,
     whole: std::sync::atomic::AtomicBool,
@@ -520,16 +568,23 @@ struct Kept {
 
 #[cfg(not(target_family = "wasm"))]
 impl Kept {
-    fn new(hdr: &Header, limit: u64) -> Option<Kept> {
-        let len = usize::try_from(hdr.plain_len).ok()?;
+    fn new(hdr: &Header, opts: &ReadOptions) -> Option<Kept> {
+        let (limit, len) = (opts.keep_bytes, usize::try_from(hdr.plain_len).ok()?);
         if limit == 0 || len == 0 {
             return None;
         }
         // A mapping the kernel will not make, an object past what it will
         // promise, is a reader that keeps nothing and not one that fails.
-        let map = memmap2::MmapOptions::new().len(len).map_anon().ok()?;
+        let map: memmap2::MmapRaw = memmap2::MmapOptions::new().len(len).map_anon().ok()?.into();
+        #[cfg(target_os = "linux")]
+        if opts.huge_pages {
+            // SAFETY: advice over the whole of a mapping this value owns;
+            // it changes how the kernel backs the pages and no byte of one.
+            unsafe { libc::madvise(map.as_mut_ptr().cast(), len, libc::MADV_HUGEPAGE) };
+        }
         Some(Kept {
-            map: map.into(),
+            map,
+            populate: opts.populate,
             state: (0..hdr.chunks())
                 .map(|_| std::sync::atomic::AtomicU8::new(EMPTY))
                 .collect(),
@@ -578,6 +633,28 @@ impl Kept {
         if span(shortest.load(Ordering::Relaxed)) < chunks {
             shortest.store(first << 32 | last, Ordering::Release);
         }
+    }
+
+    /// The pages under plaintext `from..to` made present in one call, so
+    /// that the chunks about to be decrypted into them fault on none.
+    fn populate(&self, from: u64, to: u64) {
+        #[cfg(target_os = "linux")]
+        if from < to {
+            let page = crate::bytes::os_page_size();
+            let (a, b) = (from as usize / page * page, to as usize);
+            // SAFETY: a range inside this mapping, which lives as long as
+            // `self`. The advice faults the pages in as a write would and
+            // writes nothing: a chunk already kept reads the same after.
+            unsafe {
+                libc::madvise(
+                    self.map.as_mut_ptr().add(a).cast(),
+                    b - a,
+                    libc::MADV_POPULATE_WRITE,
+                );
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (from, to);
     }
 
     /// `len` kept bytes at `off`.
@@ -698,7 +775,7 @@ impl<B: Bytes, A: Aead> Encrypted<B, A> {
             aad: hdr.encode(),
             per: Per::new(hdr.chunk_len() as u64),
             #[cfg(not(target_family = "wasm"))]
-            kept: Kept::new(&hdr, opts.keep_bytes),
+            kept: Kept::new(&hdr, opts),
             src,
             aead,
             hdr,
@@ -763,24 +840,31 @@ impl<B: Bytes, A: Aead> Encrypted<B, A> {
     }
 
     /// Chunk `c`'s plaintext for a reader that does not keep it: decrypted
-    /// into the thread's buffer unless it is what the buffer already holds.
+    /// into the place the thread remembers it in, unless it is there
+    /// already.
     fn with_chunk<R>(&self, c: u64, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
         SCRATCH.with(|s| {
-            let mut buf = s.plain.take();
+            let mut memo = s.memo.take();
+            if memo.len() < REMEMBERED {
+                memo.resize_with(REMEMBERED, Remembered::default);
+            }
+            let places = (REMEMBERED_BYTES / self.hdr.chunk_len()).clamp(1, REMEMBERED);
+            let slot = &mut memo[(c % places as u64) as usize];
             // Nobody's while it is being filled: an error below leaves it so.
-            let held = s.at.replace(None) == Some((self.id, c));
+            let held = slot.of.take() == Some((self.id, c));
             let r = if held {
                 Ok(())
             } else {
-                buf.clear();
-                buf.resize(self.hdr.chunk_plain_len(c), 0);
-                self.open_chunk(c, &mut buf).inspect_err(|_| buf.clear())
+                slot.plain.clear();
+                slot.plain.resize(self.hdr.chunk_plain_len(c), 0);
+                self.open_chunk(c, &mut slot.plain)
+                    .inspect_err(|_| slot.plain.clear())
             };
             let r = r.map(|()| {
-                s.at.set(Some((self.id, c)));
-                f(&buf)
+                slot.of = Some((self.id, c));
+                f(&slot.plain)
             });
-            s.plain.set(buf);
+            s.memo.set(memo);
             r
         })
     }
@@ -919,11 +1003,22 @@ impl<B: Bytes, A: Aead> Bytes for Encrypted<B, A> {
             // neither looked up nor remembered.
             let long = last - first + 1 >= KNOWN_MIN;
             if !(long && k.knows(first, last)) {
+                // The pages from the first chunk not yet kept to the
+                // range's end, in one call, once.
+                let mut fresh = long && k.populate;
                 for c in first..=last {
                     #[cfg(test)]
                     k.walked.fetch_add(1, Ordering::Relaxed);
-                    if k.state[c as usize].load(Ordering::Acquire) != READY && !self.keep(c).ok()? {
-                        return None;
+                    if k.state[c as usize].load(Ordering::Acquire) != READY {
+                        if std::mem::take(&mut fresh) {
+                            // No further than the reader has room to keep.
+                            let from = self.hdr.plain_off(c);
+                            let room = k.limit.saturating_sub(k.bytes.load(Ordering::Relaxed));
+                            k.populate(from, end.min(from.saturating_add(room)));
+                        }
+                        if !self.keep(c).ok()? {
+                            return None;
+                        }
                     }
                 }
                 if long {
@@ -1037,7 +1132,11 @@ mod tests {
     const KEEPS: [u64; 3] = [u64::MAX, 0, 2 * C as u64 + 108];
 
     fn open<B: Bytes>(src: B, key: u64, keep: u64) -> Result<Encrypted<B, Toy>> {
-        Encrypted::open_with(src, Toy::new(key), &ReadOptions { keep_bytes: keep })
+        let opts = ReadOptions {
+            keep_bytes: keep,
+            ..ReadOptions::default()
+        };
+        Encrypted::open_with(src, Toy::new(key), &opts)
     }
 
     fn plain(n: usize) -> Vec<u8> {
@@ -1432,6 +1531,17 @@ mod tests {
         }
         assert_eq!(e.source().reads.get(), opened + 1, "one read for three");
         assert_eq!(e.aead.decrypts.load(Ordering::Relaxed), 2);
+        // A walk of pieces that lie across the two chunks, which is how a
+        // block's values are read, decrypts neither again.
+        for off in [480u64, 490, 485, 100, 495, 600, 488] {
+            e.read_at(off, &mut b).unwrap();
+            assert_eq!(b, p[off as usize..off as usize + 16]);
+        }
+        assert_eq!(
+            e.aead.decrypts.load(Ordering::Relaxed),
+            2,
+            "two chunks, each once"
+        );
         // A whole chunk goes to the caller's buffer and is not remembered:
         // the part of it read next is decrypted again.
         let mut whole = [0u8; C];
@@ -1809,6 +1919,56 @@ mod tests {
             "and the chunk is not left taken"
         );
         assert_eq!(e.kept_bytes(), 2 * C as u64);
+    }
+
+    /// The pages asked for ahead of a long range are no more than the
+    /// reader may keep: a reader at its bound takes none it will not write.
+    /// And neither way of asking for pages changes an answer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pages_asked_for_ahead_stay_inside_the_bound() {
+        let p = plain(1 << 20);
+        let stored = envelope(&p, 12, 5, 11);
+        // The kept mapping's pages the kernel holds now.
+        let resident = |e: &Encrypted<SliceBytes, Toy>| {
+            let k = e.kept.as_ref().unwrap();
+            let mut vec = vec![0u8; k.map.len().div_ceil(4096)];
+            // SAFETY: the mapping lives as long as the reader, and `vec`
+            // has a byte for each of its pages.
+            let rc =
+                unsafe { libc::mincore(k.map.as_mut_ptr().cast(), k.map.len(), vec.as_mut_ptr()) };
+            assert_eq!(rc, 0);
+            vec.iter().filter(|&&b| b & 1 != 0).count()
+        };
+        let bound = ReadOptions {
+            keep_bytes: 16 * 4080,
+            ..ReadOptions::default()
+        };
+        assert!(bound.populate, "the default asks");
+        let e = Encrypted::open_with(SliceBytes(&stored), Toy::new(11), &bound).unwrap();
+        assert!(
+            e.slice_at(0, p.len()).is_none(),
+            "the whole object is past the bound"
+        );
+        assert_eq!(e.kept_bytes(), 16 * 4080);
+        assert!(
+            resident(&e) <= 17,
+            "pages taken past the bound: {}",
+            resident(&e)
+        );
+        assert_eq!(read_whole(&e).unwrap(), p);
+
+        for (populate, huge_pages) in [(true, false), (false, false), (false, true), (true, true)] {
+            let opts = ReadOptions {
+                populate,
+                huge_pages,
+                ..ReadOptions::default()
+            };
+            let e = Encrypted::open_with(SliceBytes(&stored), Toy::new(11), &opts).unwrap();
+            assert_eq!(e.slice_at(4096, 300_000).unwrap(), &p[4096..304_096]);
+            assert_eq!(e.slice_at(0, p.len()).unwrap(), &p[..]);
+            assert_eq!(e.kept_bytes(), p.len() as u64);
+        }
     }
 
     /// A long range lent once is known whole after, and asked for again it

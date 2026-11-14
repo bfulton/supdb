@@ -261,6 +261,24 @@ is a question the series answers.
 All arms in one process, interleaved one round at a time, so a machine that
 drifts drifts across all of them.
 
+Two families are arms for a pairing and never the roster's. A write-once
+segment, the format's other producer: `supdb-segment` takes the ordered
+load through the segment writer, finishes the file at `sync` and reads it
+through `Blob`; `supdb-segment-enc` publishes the same file as an
+encrypted envelope and reads it through the reader that keeps what it
+decrypts, and `supdb-segment-encbounded` through the one that keeps
+nothing. The three again with every value in a block
+(`supdb-segmentblocks...`), since the suite's hundred-byte value lies
+inline in the index record and a read there reaches the index alone. They
+take `load`, `read` and `scan`, threaded or not; the shuffled load is left
+out for them and a pass that writes is refused by its first update. And a
+store under a key: `supdb-dirkey` is `supdb`, and `supdb-ingestdirkey`
+`supdb-ingest`, with the kernel encrypting the store's directory
+(`Options::dir_key`). Both arms of that pairing stand on a filesystem that
+can encrypt, which `scripts/fscrypt.sh` makes in a file behind a loop
+device, so `ab` names the device at its table's head and its rates are
+read as two arms on one device and not as a disk's.
+
 ## Scale
 
 Three. `quick` gates pull requests; `full` is the number; `ooc` is the

@@ -110,6 +110,22 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: --cfg supdb_emulated
         run: cargo test --profile checked --target aarch64-unknown-linux-gnu --lib
 
+  fscrypt:
+    # A store under a key (`Options::dir_key`) asks the kernel to encrypt
+    # its directory, and the kernel does that on a filesystem made for it,
+    # which the runner's own is not: this job makes one in a file, mounts
+    # it, and runs the half of tests/dirkey.rs that reads what the device
+    # holds. As the runner's user, which is who hands the kernel the key.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: A filesystem that can encrypt
+        run: sudo sh scripts/fscrypt.sh up /mnt/supdb-fscrypt "$(id -u):$(id -g)" >> "$GITHUB_ENV"
+      - name: A store under a key
+        run: sh scripts/check.sh fscrypt
+
   wasm:
     # The browser reader, built. Nothing else in this workflow compiles the
     # wasm module, and that gap hid a real break: on rustc 1.98 the bare

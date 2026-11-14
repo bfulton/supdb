@@ -23,6 +23,8 @@ from either source.
   and in the browser: an authenticated envelope around the file, under a
   cipher the caller supplies, decrypted once and read after that at the
   plain file's speed.
+- A live store opens under a key: the kernel encrypts its directory, and
+  the store reads as it does without one.
 
 ## Benchmarks
 
@@ -197,10 +199,33 @@ cache holds plaintext.
 The envelope hides the file's bytes and refuses any change to them: a byte
 altered, a part moved or taken from another file, a file cut short. It does
 not hide the file's length, and an older envelope served whole in place of a
-newer one is still a valid envelope. It covers a finished file. A live
-store's directory is written in the clear, and encrypting that is the
-filesystem's job today. The `supdb::crypt` module docs have the layout and
-how many files one key should be used for.
+newer one is still a valid envelope. It covers a finished file; a live
+store takes a key another way, below. The `supdb::crypt` module docs have
+the layout and how many files one key should be used for.
+
+A live store under a key:
+
+```rust
+use supdb::{Db, DirKey, Options};
+
+let opts = Options {
+    dir_key: Some(DirKey::new(key_bytes)),   // 32 bytes, yours to keep
+    ..Options::default()
+};
+let mut db = Db::create(std::path::Path::new("./store"), opts)?;
+```
+
+The kernel encrypts the store's directory (Linux's file encryption): every
+file the store writes is ciphertext on the device and plaintext in the page
+cache, so the store reads exactly as it does without a key, by borrowing
+from its files' mappings. `create` encrypts the directory before it writes
+anything and refuses where it cannot, so a store given a key never writes
+plaintext; `open` refuses a directory that is not under the key it was
+given. It needs a filesystem with the feature (ext4 or f2fs with `encrypt`
+on) and protects the device: file contents and names, not sizes, and not
+against whoever can read the files while the kernel holds the key
+(`supdb::dirkey::lock` gives it up). The `supdb::dirkey` module docs have
+the rest.
 
 ## Building
 
@@ -210,6 +235,7 @@ cargo build --release
 cargo test --profile checked  # the release profile with overflow checks and debug assertions on
 sh scripts/check.sh            # build, test, lint, wasm, bench -- what CI runs
 sh scripts/check.sh quick      # one quick-scale measurement, on an otherwise idle machine
+sh scripts/check.sh fscrypt    # a store under a key, on a filesystem scripts/fscrypt.sh makes
 sh web/build.sh                # the browser module
 ```
 

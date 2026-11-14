@@ -26,6 +26,11 @@
 #   quick    one quick-scale measurement of every arm, the gate against
 #            bench/runs/, and the figures. Not in the default set: it is a
 #            timing run and needs the machine to itself
+#   fscrypt  a store under a key, on a filesystem that can encrypt: the
+#            ignored half of tests/dirkey.rs, each test named and required
+#            to have run. Not in the default set: it needs that filesystem,
+#            which scripts/fscrypt.sh makes, with root, and names in
+#            SUPDB_FSCRYPT_DIR and SUPDB_FSCRYPT_IMAGE
 #
 # Not here, deliberately: cross-arm, which needs a cross toolchain and qemu
 # and so is CI-only.
@@ -74,6 +79,31 @@ for g in $groups; do
     quick)
       say "quick"
       sh bench/scripts/check.sh quick
+      ;;
+    fscrypt)
+      say "fscrypt"
+      if [ -z "${SUPDB_FSCRYPT_DIR:-}" ] || [ -z "${SUPDB_FSCRYPT_IMAGE:-}" ]; then
+        echo "fscrypt: SUPDB_FSCRYPT_DIR and SUPDB_FSCRYPT_IMAGE are not set. Make them with" >&2
+        echo "  sudo sh scripts/fscrypt.sh up /mnt/supdb-fscrypt \"\$(id -u):\$(id -g)\"" >&2
+        echo "and export the two lines it prints." >&2
+        exit 2
+      fi
+      out=$(cargo test --profile checked --test dirkey -- --ignored 2>&1) || {
+        printf '%s\n' "$out"
+        exit 1
+      }
+      printf '%s\n' "$out"
+      # A test renamed or no longer ignored is a test this group stopped
+      # running, and a run of none is green: each is asked for by name.
+      for t in \
+        a_store_under_a_key_is_ciphertext_on_the_device_and_reads_as_itself \
+        a_locked_store_is_refused_by_name_and_opens_under_its_key \
+        a_directory_under_one_key_refuses_a_store_under_another; do
+        printf '%s\n' "$out" | grep -q "^test $t \.\.\. ok" || {
+          echo "fscrypt: $t did not run" >&2
+          exit 1
+        }
+      done
       ;;
     *)
       echo "unknown group: $g" >&2
