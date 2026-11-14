@@ -626,7 +626,10 @@ for the memtable's slot alone ahead of its probes
 (`Options::read_lines_ahead` off); `supdb-settlebuildsfiled` and
 `supdb-ingestsettlebuildsfiled` are `supdb` and `supdb-ingest` with a
 burst's batch filed in the commit building the forms its settle filed into
-(`Options::forms_settle_builds_filed`); `supdb-zhotresident` is `supdb` with the hot-raw fill asking for the
+(`Options::forms_settle_builds_filed`); `supdb-ingestpromote` is
+`supdb-ingest` with a block the reads have taken 256 entries from held as a
+merged copy beside its cheap form (`Options::promote_entries`);
+`supdb-zhotresident` is `supdb` with the hot-raw fill asking for the
 partitions the reads have not skewed by how much of their records the cache
 holds, most first (`Options::zpages_hot_fill_resident_first`);
 `supdb-zrewarminstall` is `supdb` with the controller's install making a

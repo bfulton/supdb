@@ -3042,7 +3042,14 @@ pub struct Options {
     /// entries of reading. A write to a block drops its copy and halves
     /// its count, which is the hysteresis: a block the writes own never
     /// holds one, and a block the reads own has it back after half the
-    /// entries.
+    /// entries. Priced again in core on the scrambled E, whose scans walk
+    /// the write mixes' few-delta blocks as sparse forms over the raw
+    /// records (6,900 sparse walks to 1,300 copies at thirty thousand
+    /// keys, where the unscrambled E walks copies): at 256 entries the
+    /// buffered arm read the scrambled E 0.69x and 0.77x at thirty thousand
+    /// keys and 0.64x and 0.61x at a hundred thousand, and E 0.83-0.92x
+    /// (`pair.sh supdb-ingest supdb-ingestpromote 100000 --reps 8`, at
+    /// `577c932`). Zero, and `supdb-ingestpromote` is the buffered arm.
     pub promote_entries: usize,
     /// EXPERIMENT: under the form file, a scan that starts in a block scans
     /// have started in this many times holds the blocks it walks as merged

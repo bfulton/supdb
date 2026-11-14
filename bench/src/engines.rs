@@ -9949,6 +9949,9 @@ impl Engine for Supdb {
         if self.zscanputs {
             return "supdb-zscanputs";
         }
+        if self.zpromote > 0 && !self.partition && !self.zpages_auto {
+            return "supdb-ingestpromote";
+        }
         if self.zpromote > 0 && !self.zpages_auto {
             return if self.zstartcache {
                 "supdb-zpromotestarts"
@@ -11795,6 +11798,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestreadnoahead"
         | "supdb-settlebuildsfiled"
         | "supdb-ingestsettlebuildsfiled"
+        | "supdb-ingestpromote"
         | "supdb-scanrawpaced"
         | "supdb-noscanrawahead"
         | "supdb-zseekseed"
@@ -12242,6 +12246,20 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     d,
                     Policy {
                         noscanrawahead: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestpromote" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        zpromote: 256,
                         ..Policy::default()
                     },
                 )
