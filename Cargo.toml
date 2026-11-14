@@ -26,6 +26,12 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std", "fra
 memmap2 = "0.9"
 libc = "0.2"
 
+# The tests' and the example's cipher, and nothing a build of the crate
+# links: `supdb::crypt` defines the envelope and takes the cipher from its
+# caller, and this is a caller.
+[dev-dependencies]
+aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+
 # `supdb_emulated` is set by the CI job that runs the unit tests under
 # qemu-user (`.github/workflows/ci.yml`, cross-arm), which takes `madvise`
 # advice as a no-op: the tests that read the kernel's answer to that advice

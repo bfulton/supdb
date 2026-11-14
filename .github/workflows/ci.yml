@@ -123,5 +123,8 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - name: Build the reader and the floor
+      # The group also runs web/crypt.test.mjs under the runner's own Node:
+      # the browser's decrypter against the envelope the Rust tests hold the
+      # writer to.
+      - name: Build the reader and the floor, and test the decrypter
         run: sh scripts/check.sh wasm

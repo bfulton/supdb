@@ -61,6 +61,9 @@ pub mod index;
 pub mod blob;
 /// Where a reader's bytes come from. The seam the wasm build needed.
 pub mod bytes;
+/// An encrypted object read as its plaintext, through the same seam: the
+/// envelope, and the hook a caller's cipher fits.
+pub mod crypt;
 /// The engine: a WAL, a memtable and threads that seal and merge -- none of
 /// which a browser has, and all of which want files to write and map.
 /// Excluded from the wasm build rather than stubbed; `blob` is the read path

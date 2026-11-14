@@ -453,12 +453,17 @@ export async function openCached(wasm, cache) {
 /// This is the asynchronous half, and the only asynchronous half. It is a
 /// worker-only call: `createSyncAccessHandle` does not exist on the main
 /// thread.
-export async function fetchIntoOpfs(url, name) {
+///
+/// `decrypt`, for an encrypted object, is what turns the downloaded bytes
+/// into the file's: `(bytes) => decryptObject(bytes, key)` from `crypt.mjs`.
+/// The file in OPFS is then the plaintext.
+export async function fetchIntoOpfs(url, name, { decrypt } = {}) {
   const root = await navigator.storage.getDirectory();
   const file = await root.getFileHandle(name, { create: true });
   const res = await fetch(url);
   if (!res.ok) throw new Error(`supdb: ${url} answered ${res.status}`);
-  const bytes = new Uint8Array(await res.arrayBuffer());
+  let bytes = new Uint8Array(await res.arrayBuffer());
+  if (decrypt) bytes = await decrypt(bytes);
   const handle = await file.createSyncAccessHandle();
   handle.truncate(0);
   handle.write(bytes, { at: 0 });

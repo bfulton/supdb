@@ -10,6 +10,7 @@
 #   sh scripts/deps.sh profile      # the profilers CLAUDE.md's recipes use
 #
 # rust      rustfmt, clippy and the wasm32-unknown-unknown target (lint, wasm)
+# node      Node, for the browser decrypter's test (wasm)
 # libclang  bindgen's libclang, for the comparators (bench, quick); the one
 #           definition is bench/scripts/libclang.sh, which CI calls too
 # profile   perf and valgrind; not in the default set
@@ -19,7 +20,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-groups="${*:-rust libclang}"
+groups="${*:-rust node libclang}"
 say() { printf '\n== %s ==\n' "$1"; }
 # A container runs as root and may have no sudo; anywhere else, ask for it.
 if [ "$(id -u)" = 0 ]; then root=; else root=sudo; fi
@@ -42,6 +43,18 @@ for g in $groups; do
       fi
       rustup component add rustfmt clippy
       rustup target add wasm32-unknown-unknown
+      ;;
+    node)
+      say node
+      # web/crypt.test.mjs wants WebCrypto as a global, which Node has had
+      # since 20.
+      command -v node >/dev/null || apt_install nodejs
+      major=$(node -p 'process.versions.node.split(".")[0]')
+      if [ "$major" -lt 20 ]; then
+        echo "node $(node --version) is older than 20; the wasm group needs 20 or later" >&2
+        exit 1
+      fi
+      node --version
       ;;
     libclang)
       say libclang
@@ -90,7 +103,7 @@ for g in $groups; do
       ;;
     *)
       echo "unknown group: $g" >&2
-      echo "groups: rust libclang profile" >&2
+      echo "groups: rust node libclang profile" >&2
       exit 2
       ;;
   esac

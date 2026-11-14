@@ -18,7 +18,8 @@
 #            with overflow and invariant checks on
 #   lint     clippy at -D warnings, and the format gate
 #   wasm     the browser reader and its floor, built for wasm32-unknown-unknown
-#            by web/build.sh
+#            by web/build.sh, and the browser's decrypter held under Node to
+#            the envelope the Rust tests hold the writer to
 #   bench    the benchmark suite in bench/: its build, tests and lint, through
 #            its own scripts/check.sh. Builds the comparators, which is a
 #            ten-minute C++ build the first time and cached after
@@ -61,6 +62,10 @@ for g in $groups; do
       # Builds the module and the floor and prints their sizes; the check
       # is that the module still links.
       sh web/build.sh
+      # The envelope's layout is written down in src/crypt.rs and again in
+      # web/crypt.mjs; tests/data/crypt-v1.bin is what holds the two to one
+      # answer, and this is the half of that the test group does not run.
+      node web/crypt.test.mjs
       ;;
     bench)
       say "bench"

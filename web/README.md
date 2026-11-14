@@ -13,6 +13,8 @@ web/build.sh           # build the module and the floor, print their sizes
 | `supdb.mjs` | the library: three byte sources, one synchronous API |
 | `cache.mjs` | the caching byte source over ranged HTTP -- budget, pages, eviction |
 | `s3.mjs` | a minimal SigV4 range fetcher, the S3 adapter for `cache.mjs` |
+| `crypt.mjs` | reads an encrypted object: a fetcher that decrypts, over any fetcher |
+| `crypt.test.mjs` | holds `crypt.mjs` to the envelope the Rust writer is held to; runs under Node |
 | `worker.mjs` | the Web Worker the reader runs in, and why it has to |
 | `build.sh` | builds the module and the floor, and prints their sizes |
 | `floor/` | an empty cdylib with the same std surface -- the size control |
@@ -146,6 +148,41 @@ span several 64 KiB pages each. So the sparse reader's cache opens at 16 KiB
 pages (`openSparse` through the worker passes `pageSize`), and `ensure`
 coalesces adjacent pages into one request, so a block read costs the same
 number of requests at either page.
+
+## An encrypted object
+
+An object can be published as an envelope (`supdb::crypt` on the Rust side
+writes it): a 48-byte header, then the file in chunks, each encrypted and
+tagged on its own. `crypt.mjs` reads one with WebCrypto's AES-GCM, as a
+wrapper around the fetcher:
+
+```js
+fetcher: decryptingFetcher(httpRangeFetcher(url), await importKey(rawKey)),
+```
+
+The wrapper answers plaintext offsets and asks the fetcher under it for
+the whole chunks they lie in, so the cache, the module and every plan are
+as they were, and the module carries no cipher. The worker takes the key as
+`key` in its `open` message, raw bytes or a `CryptoKey`, for every source;
+`decryptObject(bytes, key)` is the same for an object already in memory.
+`key` may be a function of the parsed header instead, for a caller that
+keeps several keys (`keyId`) or derives one per object (`id`).
+
+Every byte the wrapper hands up was verified first: a chunk that fails its
+tag rejects the fetch, so an `ensure` over a changed object throws and
+nothing of it reaches the cache. A wrong key fails the same way, at the
+first fetch.
+
+Decrypting at the fetch means what the browser keeps is plaintext: the
+cache's pages, and an object downloaded whole, sit decrypted in the
+origin's private storage. The envelope protects the object in the bucket,
+at the CDN and on the wire. A client that holds the key holds the data.
+
+The header's layout and the nonce are written down twice, in
+`src/crypt.rs` and in `crypt.mjs`. `tests/data/crypt-v1.bin` is one
+envelope both are held to: `tests/crypt.rs` requires the Rust writer to
+produce exactly those bytes, and `node web/crypt.test.mjs`, which
+`scripts/check.sh wasm` runs, requires `crypt.mjs` to read them.
 
 ## What a lookup costs
 

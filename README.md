@@ -19,6 +19,9 @@ from either source.
 - Every data block and every piece of the key index is checksummed: a damaged
   key index fails the open, and a damaged block fails the read that reaches
   it, rather than answering wrongly.
+- A finished segment can be published encrypted and read in place, natively
+  and in the browser: an authenticated envelope around the file, under a
+  cipher the caller supplies.
 
 ## Benchmarks
 
@@ -152,6 +155,40 @@ const values = reader.lookup(key);      // then read synchronously, with no miss
 `web/README.md` covers the three byte sources -- memory, OPFS, and a
 budgeted page cache over HTTP or S3 -- and why the reader has to run in a
 Worker.
+
+A segment published encrypted, and read without a decrypted copy:
+
+```rust
+use supdb::crypt::{self, EncryptOptions, Encrypted};
+use supdb::{Blob, MmapBytes};
+
+// `key` is your cipher behind `supdb::crypt::Aead`: supdb ships none.
+// `examples/crypt.rs` is the adapter for AES-256-GCM.
+let mut out = std::fs::File::create("./day.sup.enc")?;
+crypt::encrypt(&MmapBytes::open(path)?, &mut out, &key, &EncryptOptions::default())?;
+
+let stored = MmapBytes::open(std::path::Path::new("./day.sup.enc"))?;
+let seg = Blob::open(Encrypted::open(stored, key)?)?;   // a wrong key fails here
+seg.read_all(b"term", |v| { /* decrypted and verified, chunk by chunk */ })?;
+```
+
+```js
+import { decryptingFetcher, importKey } from "./crypt.mjs";
+
+const cache = await CachedBytes.open({
+  name: "day",
+  fetcher: decryptingFetcher(httpRangeFetcher(url), await importKey(rawAesKey)),
+  budgetBytes: 32 << 20,
+});
+```
+
+The envelope hides the file's bytes and refuses any change to them: a byte
+altered, a part moved or taken from another file, a file cut short. It does
+not hide the file's length, and an older envelope served whole in place of a
+newer one is still a valid envelope. It covers a finished file. A live
+store's directory is written in the clear, and encrypting that is the
+filesystem's job today. The `supdb::crypt` module docs have the layout and
+how many files one key should be used for.
 
 ## Building
 

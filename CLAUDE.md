@@ -37,9 +37,10 @@ of the change that produced the text.
 | `src/format.rs` | the on-disk format's fixed quantities, owned by no writer |
 | `src/block.rs`, `src/index.rs`, `src/flatindex.rs` | the format itself: blocks, extents, the flat key index -- `docs/index-theory.md` |
 | `src/bytes.rs`, `src/blob.rs` | the read path over any byte source; compiles for wasm |
+| `src/crypt.rs` | a finished file published encrypted and read through the `Bytes` seam: the envelope, the hook a caller's cipher fits (`Aead`), `Encrypted` as a byte source over the stored object and `encrypt` as its writer, with no cipher in the crate; compiles for wasm and nothing in the module links it -- the module's own docs, `examples/crypt.rs` for the adapter, and `web/crypt.mjs` for the browser's half |
 | `src/wasmapi.rs` | the C ABI the browser calls; hand-written because the module's size is budgeted |
-| `web/` | the browser reader, its byte sources, the Worker it runs in, and the size control -- `web/README.md` |
-| `tests/` | the engine's contract, the read paths held to each other, the format's damage cases; `tests/common` holds what more than one file needs |
+| `web/` | the browser reader, its byte sources, the fetcher that decrypts, the Worker it runs in, and the size control -- `web/README.md` |
+| `tests/` | the engine's contract, the read paths held to each other, the format's damage cases; `tests/common` holds what more than one file needs, and `tests/data` the envelope on record |
 | `bench/` | the benchmark suite: its own cargo workspace, the arms, the runner, the gate and the figures -- `bench/DESIGN.md` |
 | `experiments/ffi/` | what a C ABI and a Python binding cost a point read, borrowed against copied, beside LMDB's and RocksDB's C APIs; its own manifest and dated results, and not built by the gate -- its `README.md` |
 
@@ -887,6 +888,41 @@ every access and copies nothing, which is the axis `flatindex` exists to win
 and the one a byte-source abstraction most easily loses. `tests/blob.rs`
 pins it, because a native reader that started copying would still pass every
 correctness check.
+
+**The envelope is around the file, and nothing inside the format knows
+it.** `supdb::crypt` wraps a finished file: a header, then the plaintext
+in chunks, each encrypted on its own under the caller's cipher, read back as
+a `Bytes` that lends nothing. That is why it cost the readers no change,
+and it is the constraint. The crate ships no cipher -- the dev-dependency
+on `aes-gcm` is the tests' and the example's, a caller like any other --
+and the wasm module links none: the browser decrypts at the fetch with
+WebCrypto (`web/crypt.mjs`, a wrapper round the fetcher every source
+takes), so the module's size does not move, the plans stay plaintext
+ranges, and what the cache keeps in OPFS is plaintext. The layout is
+therefore written down twice, in Rust and in JavaScript, which is what
+this file says not to do with a superblock constant;
+`tests/data/crypt-v1.bin` is what holds the two to one answer.
+`tests/crypt.rs` requires `encrypt_with_id` to write exactly those bytes,
+and `web/crypt.test.mjs`, which the wasm group runs under Node
+(`scripts/deps.sh` readies it), requires `crypt.mjs` to read them, so a
+layout change is a new version and a new file beside that one, never that
+file written again. An `Encrypted` verifies its first chunk at open, so a
+header is never believed before a tag has covered it, `len()` included,
+and a wrong key fails there; every tag covers the whole header and every
+nonce is the object's id and the chunk's index, which is what refuses a
+chunk moved, borrowed from another object or cut off the end. A nonce
+repeated under one key gives both objects away, so an id is drawn per
+envelope and `encrypt_with_id` is for tests. The plain native path is not
+touched by any of it: `Blob::zero_copy()` over a mapping stays true, and
+`tests/crypt.rs` asserts it beside the envelope's `false`. The first tests
+of the browser's half changed every byte of the record and required a
+refusal, and seven of fourteen mutants of `crypt.mjs` survived them: a
+header with a wrong magic, version or shift fails every tag as well, so
+the three checks could each be deleted, and two checks of the object's
+length each caught what the other was for. A check behind a tag is held by
+asking the parser alone or by an input made under the key, as a check
+behind a checksum is held by a forged one, and of two checks on one
+quantity the test has to reach each where the other cannot.
 
 **The three readers agree, and are tested against each other rather than
 against themselves.** The failure mode of a second read path is not a crash

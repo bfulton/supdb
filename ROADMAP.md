@@ -151,6 +151,17 @@ What an engine picker would hit, roughly in order.
   with a count; add an end bound and reverse order.
 - [ ] **Batched point reads (`MultiGet`).** Cheap to add, and a natural new
   benchmark workload.
+- [ ] **Encryption at rest for a live store.** A finished segment has an
+  envelope (`supdb::crypt`): encrypted and authenticated under a cipher the
+  caller supplies, read in place by `Blob`, `SparseBlob` and the browser
+  reader. A store's own directory -- the log, the segments, the manifest,
+  the ordered indexes and the form files -- is still written in the clear,
+  and its reads lend from the mapping, which an encrypted file cannot. Done
+  when a store opens under a key and nothing it writes is plaintext, with
+  the cost of the copy priced by an arm. Until then it is the filesystem's.
+- [ ] **The encrypted reader, priced.** No arm reads through an envelope, so
+  what a point read and a scan pay for it is not in any row. Done when the
+  suite has the arm and the chunk size is chosen from it.
 
 ## Out of core
 
@@ -208,4 +219,4 @@ confirm or move any of these up.
 - Column families
 - Wide columns, user-defined timestamps
 - TTL, compaction filters
-- Encryption at rest, tracing and replay
+- Tracing and replay
