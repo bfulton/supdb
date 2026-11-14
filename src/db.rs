@@ -5314,6 +5314,19 @@ pub struct Options {
     /// --reps 2`, and `--bound 1073741824 --passes load,lag --reps 3`).
     /// Off; `supdb-zrewarmbeside` asks beside the merges.
     pub zpages_rewarm_beside_merges: bool,
+    /// EXPERIMENT: the controller's install makes a rewarm due
+    /// (`zpages_rewarm_scans`), so the form files under nine tenths
+    /// resident are asked for whole once no merge is in flight. A store
+    /// opened past the line installs its form at its first reads with
+    /// whatever of the files the cache kept, and the rewarm waits for scans
+    /// that a pass of point reads never makes: at ten million keys under
+    /// 1.25 GiB the read pass after the load, in a process of its own, met
+    /// the form files whole in some reps and 48-180 MB of 543 short in
+    /// others, and those took 28,000-41,000 major faults against 4,000-
+    /// 7,000, a 4 KB fault for each cold page under the random advice.
+    /// `supdb-zrewarminstall` turns it on.
+    #[doc(hidden)]
+    pub zpages_rewarm_at_install: bool,
     /// The stretch without a scan after which the scans that come back
     /// have the cold form files asked for (`zpages_rewarm_scans`), in
     /// milliseconds: a quarter of a second. It was a second
@@ -5667,6 +5680,7 @@ impl Default for Options {
             zpages_hot_fill: true,
             zpages_hot_back_ask: true,
             zpages_rewarm_scans: true,
+            zpages_rewarm_at_install: false,
             zpages_settle_joins_asks: true,
             zpages_rewarm_trims: false,
             zpages_rewarm_beside_merges: false,
@@ -44959,6 +44973,13 @@ impl Maint {
         self.z_leaves_raw =
             heads_left_raw(self.z_leaves_raw, &d, model.as_ref().map(|m| m.phi_raw));
         self.z_apply(&d, model.as_ref(), &input);
+        // The form installed is the form every read is served from, so its
+        // files' cold pages are asked for now and not a fault at a time
+        // under the reads (`Options::zpages_rewarm_at_install`).
+        if self.opts.zpages_rewarm_at_install && matches!(d.event, Some(zselect::Event::Install))
+        {
+            self.z_rewarm_due = true;
+        }
         self.z_drive(&d);
     }
 

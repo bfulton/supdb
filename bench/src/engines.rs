@@ -1155,6 +1155,9 @@ pub struct Supdb {
     /// The rewarm made beside merges in flight, the shape before
     /// (`Options::zpages_rewarm_beside_merges` on): `supdb-zrewarmbeside`.
     zrewarmbeside: bool,
+    /// The controller's install makes a rewarm due
+    /// (`Options::zpages_rewarm_at_install`): `supdb-zrewarminstall`.
+    zrewarminstall: bool,
     /// A cursor's walk decoding the groups after its first into its own
     /// buffer (`Options::zpages_walk_owns_decodes` on): `supdb-zwalkowns`.
     zwalkowns: bool,
@@ -2264,6 +2267,8 @@ struct Policy {
     zrewarmwait: bool,
     /// The rewarm beside merges: `supdb-zrewarmbeside`.
     zrewarmbeside: bool,
+    /// A rewarm at the install: `supdb-zrewarminstall`.
+    zrewarminstall: bool,
     /// The walk's own decodes: `supdb-zwalkowns`.
     zwalkowns: bool,
     /// A page view an open: `supdb-zviewperopen`.
@@ -2681,6 +2686,7 @@ impl Default for Policy {
             zhotskewroomhyst: false,
             zrewarmwait: false,
             zrewarmbeside: false,
+            zrewarminstall: false,
             zwalkowns: false,
             zviewperopen: false,
             znogroupahead: false,
@@ -8098,6 +8104,7 @@ impl Supdb {
             zhotskewroomhyst,
             zrewarmwait,
             zrewarmbeside,
+            zrewarminstall,
             zwalkowns,
             zviewperopen,
             znogroupahead,
@@ -8646,6 +8653,7 @@ impl Supdb {
             zpages_hot_skew_room: zhotskewroom || zhotskewroomhyst,
             zpages_hot_room_margin_pct: if zhotskewroomhyst { 5 } else { 0 },
             zpages_rewarm_beside_merges: zrewarmbeside,
+            zpages_rewarm_at_install: zrewarminstall,
             zpages_rewarm_quiet_ms: if zrewarmwait {
                 supdb::db::REWARM_QUIET_BEFORE_MS
             } else {
@@ -8928,6 +8936,7 @@ impl Supdb {
             zhotskewroomhyst,
             zrewarmwait,
             zrewarmbeside,
+            zrewarminstall,
             zwalkowns,
             zviewperopen,
             znogroupahead,
@@ -9335,6 +9344,9 @@ impl Engine for Supdb {
         }
         if self.zrewarmwait {
             return "supdb-zrewarmwait";
+        }
+        if self.zrewarminstall {
+            return "supdb-zrewarminstall";
         }
         if self.zrewarmbeside {
             return "supdb-zrewarmbeside";
@@ -11693,6 +11705,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-zhotgrowth5"
         | "supdb-zhotfillquiet"
         | "supdb-scanrawahead"
+        | "supdb-zrewarminstall"
         | "supdb-scanrawpaced"
         | "supdb-noscanrawahead"
         | "supdb-zseekseed"
@@ -12140,6 +12153,18 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     d,
                     Policy {
                         noscanrawahead: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-zrewarminstall" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        zrewarminstall: true,
                         ..Policy::default()
                     },
                 )
@@ -14533,6 +14558,20 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.scan_raw_ahead && b.scan_raw_ahead);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("zrewarminstall"),
+                    Policy {
+                        zrewarminstall: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-zrewarminstall");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.zpages_rewarm_at_install && !b.zpages_rewarm_at_install);
             }
             {
                 let z = Supdb::with_policy(
