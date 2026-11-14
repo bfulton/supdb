@@ -2089,8 +2089,41 @@ impl<B: Bytes> Blob<B> {
         self.scan_at_with::<true, F>(from_rank, limit, lead, f)
     }
 
+    /// A walker over this segment's records for several runs in turn, the
+    /// record regions resolved once (`RunWalk::scan_at`): what a sparse
+    /// block's walk takes between its deltas, a run at a time.
+    pub fn run_walk(&self) -> RunWalk<'_, B> {
+        RunWalk {
+            blob: self,
+            walk: self.walk_regions(),
+        }
+    }
+
+    /// The flat index and its record region and directory, as a walk over
+    /// the records reads them.
+    fn walk_regions(&self) -> Option<(&FlatIndex, &[u8], &[u8])> {
+        self.flat()
+            .and_then(|(sec, idx)| idx.regions(sec).map(|(recs, dir)| (idx, recs, dir)))
+    }
+
     fn scan_at_with<const PACE: bool, F: FnMut(&[u8], &[u8])>(
         &self,
+        from_rank: usize,
+        limit: usize,
+        lead: usize,
+        f: F,
+    ) -> Result<usize> {
+        // The regions once, not once a key: `exts_at_full` re-resolves the
+        // section and re-slices the directory and the records every call, and
+        // that plumbing rather than the record read is most of what resolving
+        // a rank costs.
+        self.scan_at_in::<PACE, F>(self.walk_regions(), from_rank, limit, lead, f)
+    }
+
+    /// `scan_at_with` over regions the caller resolved (`walk_regions`).
+    fn scan_at_in<const PACE: bool, F: FnMut(&[u8], &[u8])>(
+        &self,
+        walk: Option<(&FlatIndex, &[u8], &[u8])>,
         from_rank: usize,
         limit: usize,
         lead: usize,
@@ -2100,13 +2133,6 @@ impl<B: Bytes> Blob<B> {
         let mut rank = from_rank;
         let mut seen = 0usize;
         let mut cached: Option<(u32, &[u8])> = None;
-        // The regions once, not once a key: `exts_at_full` re-resolves the
-        // section and re-slices the directory and the records every call, and
-        // that plumbing rather than the record read is most of what resolving
-        // a rank costs.
-        let walk = self
-            .flat()
-            .and_then(|(sec, idx)| idx.regions(sec).map(|(recs, dir)| (idx, recs, dir)));
         // The common shape first -- one extent, inline, fixed width -- in a
         // loop of its own, with nothing per entry but the parse, a bounds
         // check and the call. The first record of any other shape breaks
@@ -2314,6 +2340,27 @@ impl<B: Bytes> Blob<B> {
             rank += 1;
         }
         Ok(seen)
+    }
+}
+
+/// A segment's record regions resolved once, for a walk that reads several
+/// runs of its records in turn (`Blob::run_walk`): each `scan_at` is the
+/// blob's own over the same regions, without resolving them again.
+pub struct RunWalk<'a, B: Bytes> {
+    blob: &'a Blob<B>,
+    walk: Option<(&'a FlatIndex, &'a [u8], &'a [u8])>,
+}
+
+impl<B: Bytes> RunWalk<'_, B> {
+    /// `Blob::scan_at` over the regions this walker holds.
+    pub fn scan_at<F: FnMut(&[u8], &[u8])>(
+        &self,
+        from_rank: usize,
+        limit: usize,
+        f: F,
+    ) -> Result<usize> {
+        self.blob
+            .scan_at_in::<false, F>(self.walk, from_rank, limit, 0, f)
     }
 }
 

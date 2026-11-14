@@ -5000,6 +5000,34 @@ store shape -- a piece standing, a frozen table -- is read for which
 sources its operations consult before its cells are compared with the
 family that leaves none.
 
+**A form given up for a cost that had since gone, and the costs that
+scaled with it when it came back.** The last block of the last partition
+collects every key inserted past the store's greatest, and it had been a
+copy once and was made a merge of its sources (the wide form) because the
+copy was rebuilt after every inserting commit, 12 ms a rebuild at three
+million keys. A patch has spliced into a copy since, so the reason was gone
+and the rule stayed: the scrambled E's scans that started among the inserts
+merged a window of every source over the block, 50,000 instructions a walk
+and 385 walks a mix at a hundred thousand keys, about a tenth of the mix's instructions.
+Copied once its walks had paid for the build and kept past the wide bound,
+the block read slower at three hundred thousand keys before it read faster,
+because two costs no copy had paid scaled with its size: the patch summed
+every entry's run to ask whether the copy had bloated, and the walk into it
+asked for its whole entry and key buffers ahead, a few hundred kilobytes of
+lines a walk. A running count of dead bytes and the copy's first lines took
+both away (`Options::forms_copy_hot_wide`, `CachedBlock::dead`). The same
+work found the window's merge taking a scan's limit from every source and
+merging them all for the limit it read (`Options::scan_wide_capped`), and the
+tombstone search run for a key one source held (`Options::emit_lone_unsearched`).
+The rules: a structure retired for a cost is looked at again when the cost
+goes, since the rule outlives its reason; a form allowed past a bound its
+code was written under is read for every per-operation step that is linear
+in its size, since none of them was ever priced at that size; and a test of
+a form that stands across writes writes the way the workload does -- an
+ascending run of inserts into an empty table opens a direct run, whose close
+drops every block table, which read as the form being dropped until a
+backtrace on its drop named `close_direct`.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

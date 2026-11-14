@@ -6485,7 +6485,16 @@ fn a_live_write_over_a_frozen_key_folds_into_it_after_the_snapshot() {
 /// The fold with the forms holding the pieces' fold alone.
 #[test]
 fn the_fold_answers_the_same_model_with_pieces_only_forms() {
-    fold_model_with(true, true);
+    fold_model_with(true, true, false);
+}
+
+/// The fold with the blocks the bursts make wide copied once their walks
+/// have paid (`Options::forms_copy_hot_wide`): every phase -- the rebuilds
+/// of the snapshot, the rehash, the seal and the landing -- with the copies
+/// standing where the other runs walk the blocks wide.
+#[test]
+fn the_fold_answers_the_same_model_with_hot_wide_copies() {
+    fold_model_with(true, false, true);
 }
 
 /// The same phases on the merge path, where the keys written since the
@@ -6498,16 +6507,22 @@ fn the_merge_path_files_the_keys_written_since_its_snapshot() {
 }
 
 fn fold_model(block_cache: bool) {
-    fold_model_with(block_cache, false)
+    fold_model_with(block_cache, false, false)
 }
 
-fn fold_model_with(block_cache: bool, pieces_only: bool) {
-    let d = dir(&format!("overlay-fold-{block_cache}-{pieces_only}"));
+/// `hot_copy` lets the wide blocks be copied once their walks pay
+/// (`Options::forms_copy_hot_wide`); without it they stay wide, the form
+/// these phases are written for.
+fn fold_model_with(block_cache: bool, pieces_only: bool, hot_copy: bool) {
+    let d = dir(&format!(
+        "overlay-fold-{block_cache}-{pieces_only}-{hot_copy}"
+    ));
     let opts = Options {
         seal_bytes: 1 << 20,
         partition_bytes: Some(2 << 10),
         scan_block_cache: block_cache,
         forms_pieces_only: pieces_only,
+        forms_copy_hot_wide: hot_copy,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -6556,7 +6571,7 @@ fn fold_model_with(block_cache: bool, pieces_only: bool) {
     // With the forms holding the pieces' fold alone, a block dense with
     // memtable keys overlays the snapshot and is not held wide.
     assert!(
-        !block_cache || pieces_only || db.block_cache_wide() > 0,
+        !block_cache || pieces_only || hot_copy || db.block_cache_wide() > 0,
         "the burst's blocks are walked wide"
     );
     // Fewer than the snapshot holds, so no rebuild: the wide blocks take
@@ -6592,8 +6607,12 @@ fn fold_model_with(block_cache: bool, pieces_only: bool) {
     m.check(&db, "keys filed into wide blocks after the rebuild");
     held(&db, 0);
     assert!(
-        !block_cache || pieces_only || db.block_cache_wide() > 0,
+        !block_cache || pieces_only || hot_copy || db.block_cache_wide() > 0,
         "the wide blocks stand after the rebuild"
+    );
+    assert!(
+        !hot_copy || db.build_kinds().1 > 0,
+        "the bursts' wide blocks were copied once their walks paid"
     );
     m.delete(&mut db, &key(303));
     m.append(&mut db, &key(309), "l-after-rebuild");
@@ -6805,6 +6824,83 @@ fn a_dense_form_converts_from_its_own_deltas() {
         db.forms_events()[13] > before,
         "dense forms were converted from their own deltas"
     );
+}
+
+/// A light sparse form -- under the dense count, at least
+/// `Options::forms_convert_from` deltas -- is converted to a copy by a fill
+/// on the upkeep thread, where the write mixes' few deltas a block are filed,
+/// and by no pass over a burst's batch (`Reader::burst_pass`), whose pace
+/// holds the writer to the thread; at the dense count alone it stays deltas.
+/// Each case gives sixty blocks one delta a round for six rounds, in commits
+/// of sixty writes, or of three hundred where the case is a burst's -- under
+/// the paced share of a store of 32,000 keys and past `UPKEEP_WAKE_WRITES`,
+/// so the batches are lent to the thread rather than filed in the commit --
+/// with one write a round into a block no write has reached, which has the
+/// fill walk the table, and the scans after hold every block to the model.
+#[test]
+fn a_light_form_converts_on_the_upkeep_thread_and_not_over_a_burst() {
+    for (line, burst, converts) in [(4usize, false, true), (0, false, false), (4, true, false)] {
+        let d = dir(&format!("convert-light-{line}-{burst}"));
+        let opts = Options {
+            seal_bytes: 1 << 26,
+            partition_bytes: Some(1 << 20),
+            scan_block_cache: true,
+            forms_convert_from: line,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in 0..32_000u32 {
+            m.append(&mut db, &key(k), "p");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        // A scan, so that the commits after it maintain the forms.
+        m.check_one(&db, key(0).as_bytes(), 100, "clean");
+        let before = db.forms_events()[13];
+        let passes = db.upkeep_counts()[0];
+        for round in 0..6u32 {
+            for b in 0..60u32 {
+                let k = b * 64 + 2 + round * 9;
+                for i in 0..if burst { 5 } else { 1 } {
+                    m.append(&mut db, &key(k), &format!("u{round}-{i}"));
+                }
+            }
+            // And a block no write has reached, as the mixes' writes keep
+            // reaching: a write into a block the table holds no form for is
+            // what has the next fill walk the table, and the walk is where
+            // a light form is met.
+            m.append(&mut db, &key((100 + round) * 64 + 5), "fresh");
+            db.commit().unwrap();
+            db.settle().unwrap();
+        }
+        assert!(
+            db.upkeep_counts()[0] > passes,
+            "line {line}, burst {burst}: the thread made no pass, so nothing above tested it"
+        );
+        let converted = db.forms_events()[13] - before;
+        if converts {
+            assert!(
+                converted >= 30,
+                "line {line}: the thread converted {converted} light forms of sixty"
+            );
+        } else {
+            assert_eq!(
+                converted, 0,
+                "line {line}, burst {burst}: a light form converted"
+            );
+        }
+        for b in (0..60u32).step_by(7) {
+            m.check_one(
+                &db,
+                key(b * 64).as_bytes(),
+                200,
+                &format!("line {line}, burst {burst}: block {b} after the rounds"),
+            );
+        }
+    }
 }
 
 /// A manifest publish keeps the manifest it replaces linked under a spare
@@ -7276,6 +7372,8 @@ fn a_key_held_by_many_pieces_counts_once_toward_a_wide_block() {
         scan_block_cache: true,
         // The premise is sixteen pieces over every range, so none merge.
         tier_pieces: 0,
+        // What is counted is the wide form: the block stays wide.
+        forms_copy_hot_wide: false,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -7317,6 +7415,178 @@ fn a_key_held_by_many_pieces_counts_once_toward_a_wide_block() {
     m.check(&db, "three hundred keys past the end in one source");
     held(&db, 0);
     assert_eq!(db.block_cache_wide(), 1, "the tail's block is wide");
+}
+
+/// A wide block's walk takes at most a scan's limit of the overlay's keys,
+/// and the window that merges its sources for the scan stops there
+/// (`Options::scan_wide_capped`); a key one source holds is emitted without
+/// the tombstone search (`Options::emit_lone_unsearched`). Each held to the
+/// model, and so to the shape before it, over a block whose keys past the
+/// end sit in four pieces interleaved key by key, every seventh in two
+/// pieces, every eleventh deleted in another, and the live memtable over
+/// some of them and between them.
+#[test]
+fn a_wide_blocks_window_stops_at_the_scans_limit() {
+    for (capped, lone) in [(true, true), (false, true), (true, false), (false, false)] {
+        let d = dir(&format!("wide-window-{capped}-{lone}"));
+        let opts = Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(2 << 10),
+            l0_trigger: 64,
+            scan_block_cache: true,
+            // Four pieces over the last range, none merged.
+            tier_pieces: 0,
+            scan_wide_capped: capped,
+            emit_lone_unsearched: lone,
+            // The window is what is tested: the block stays wide.
+            forms_copy_hot_wide: false,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in (0..600).step_by(3) {
+            m.append(&mut db, &key(k), &format!("p{k}"));
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        let tail = |k: u32| format!("key-00600x{k:04}");
+        for round in 0..4u32 {
+            for k in 0..1280u32 {
+                if k % 4 == round || (k % 7 == 0 && (k + 1) % 4 == round) {
+                    m.append(&mut db, &tail(k), &format!("r{round}"));
+                }
+                if k % 11 == 0 && (k + 2) % 4 == round {
+                    m.delete(&mut db, &tail(k));
+                }
+            }
+            db.commit().unwrap();
+            db.seal().unwrap();
+            db.settle().unwrap();
+        }
+        assert!(db.levels().1 >= 4, "the tail's four pieces stand");
+        for k in (0..1280u32).step_by(5) {
+            m.append(&mut db, &tail(k), "live");
+        }
+        for k in (0..1280u32).step_by(13) {
+            m.append(&mut db, &format!("{}+", tail(k)), "live-new");
+        }
+        m.delete(&mut db, &tail(40));
+        db.commit().unwrap();
+        let state = format!("pieces and the live table past the end, capped {capped} lone {lone}");
+        m.check(&db, &state);
+        held(&db, 0);
+        assert!(
+            db.block_cache_wide() > 0,
+            "{state}: the tail's block is wide"
+        );
+        // That table frozen and held, and a live one over it and between
+        // its keys: the window's memtable sources are a base and the live
+        // run, a key in both folded from both, a live tombstone over a
+        // frozen key.
+        db.hold_seal_landing(true);
+        db.seal().unwrap();
+        for k in (0..1280u32).step_by(10) {
+            m.append(&mut db, &tail(k), "over-frozen");
+        }
+        for k in (3..1280u32).step_by(17) {
+            m.append(&mut db, &format!("{}-", tail(k)), "live-between");
+        }
+        m.delete(&mut db, &tail(65));
+        db.commit().unwrap();
+        assert!(db.in_flight().0, "the seal is held");
+        let state =
+            format!("a frozen table and a live one past the end, capped {capped} lone {lone}");
+        m.check(&db, &state);
+        held(&db, 0);
+        db.hold_seal_landing(false);
+        db.settle().unwrap();
+        m.check(&db, &format!("{state}, landed"));
+        held(&db, 0);
+    }
+}
+
+/// A block wide by its count of keys past the end is copied once its walks
+/// have paid for the copy, and the copy stands past the wide bound: the
+/// inserts after it are appended to it, a delete and an update of keys in it
+/// are spliced in, and every scan answers what the model holds
+/// (`Options::forms_copy_hot_wide`). Without the option the block stays
+/// wide.
+#[test]
+fn a_hot_wide_block_is_copied_and_kept_past_the_bound() {
+    for on in [true, false] {
+        let d = dir(&format!("hot-wide-{on}"));
+        let opts = Options {
+            seal_bytes: 1 << 26,
+            partition_bytes: Some(2 << 10),
+            scan_block_cache: true,
+            forms_copy_hot_wide: on,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in (0..600).step_by(3) {
+            m.append(&mut db, &key(k), &format!("p{k}"));
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        let tail = |k: u32| format!("key-00600x{k:04}");
+        // An update first, as the mixes' batches have, so the inserts past
+        // the end go to the hash table and open no direct run.
+        m.append(&mut db, &key(3), "u");
+        for k in 0..600u32 {
+            m.append(&mut db, &tail(k), "t");
+        }
+        db.commit().unwrap();
+        let state = format!("hot wide {on}");
+        // Six hundred keys past the end: the block is copied at its eighth
+        // walk.
+        for i in 0..12u32 {
+            m.check_one(
+                &db,
+                tail(i * 37).as_bytes(),
+                1 + (i as usize * 7) % 60,
+                &state,
+            );
+        }
+        let (_, recopies, _) = db.build_kinds();
+        if on {
+            assert_eq!(recopies, 1, "{state}: the tail's block copied once");
+            assert_eq!(db.block_cache_wide(), 0, "{state}: and no longer wide");
+        } else {
+            assert_eq!(recopies, 0, "{state}: never copied");
+            assert_eq!(db.block_cache_wide(), 1, "{state}: and wide");
+        }
+        // Inserts past the end, a delete and an update in the copy, filed
+        // by the settle after a scan.
+        m.append(&mut db, &key(6), "u2");
+        for k in 600..900u32 {
+            m.append(&mut db, &tail(k), "t2");
+        }
+        m.delete(&mut db, &tail(5));
+        m.append(&mut db, &tail(77), "updated");
+        db.commit().unwrap();
+        for i in 0..12u32 {
+            m.check_one(
+                &db,
+                tail(i * 61).as_bytes(),
+                1 + (i as usize * 11) % 90,
+                &state,
+            );
+        }
+        m.check(&db, &format!("{state}, after the inserts"));
+        held(&db, 0);
+        let (_, recopies, _) = db.build_kinds();
+        if on {
+            assert_eq!(recopies, 1, "{state}: the copy stood across the inserts");
+            assert_eq!(db.block_cache_wide(), 0, "{state}: and is a copy still");
+        } else {
+            assert_eq!(db.block_cache_wide(), 1, "{state}: still wide");
+        }
+    }
 }
 
 /// A read consults the level-0 pieces over its key, found by their
