@@ -8811,7 +8811,7 @@ impl RunWalk {
 
     /// The file's bytes from the i-th committed record to the last good
     /// marker's end.
-    fn from_record(&self, i: usize) -> &[u8] {
+    fn bytes_at(&self, i: usize) -> &[u8] {
         let p = RunWalk::BASE + self.offs[i] as usize;
         let map = self
             .map
@@ -8829,14 +8829,14 @@ impl RunWalk {
     /// The i-th committed record's key: the record's first two bytes are
     /// its length and it starts at the fifth (`flatindex::parse_record`).
     fn key(&self, i: usize) -> &[u8] {
-        let rec = self.from_record(i);
+        let rec = self.bytes_at(i);
         let klen = u16::from_le_bytes([rec[0], rec[1]]) as usize;
         &rec[4..4 + klen]
     }
 
     /// The i-th committed record's key and value.
     fn record(&self, i: usize) -> (&[u8], &[u8]) {
-        let (k, v, _) = RunWalk::parse(self.from_record(i)).expect("a record the walk parsed");
+        let (k, v, _) = RunWalk::parse(self.bytes_at(i)).expect("a record the walk parsed");
         (k, v)
     }
 }
@@ -9502,7 +9502,7 @@ impl SegmentWriter {
         // written again under it by the finish that follows a walk
         // (`resume_run`), past the last good marker and in its head, and
         // the walk's readers take only the records between
-        // (`RunWalk::from_record`).
+        // (`RunWalk::bytes_at`).
         let map = memmap2::MmapOptions::new().map_raw_read_only(&file)?;
         #[cfg(unix)]
         let _ = map.advise(memmap2::Advice::Sequential);
