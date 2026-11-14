@@ -2419,7 +2419,14 @@ thirtieth slower in the before-and-after pairing, `strace -T` putting
 the barrier at a tenth to a quarter of a millisecond once a run, on a
 load of ten commits -- a flush of the device with nothing to write,
 since the file's own sync has forced the journal commit that carries the
-entry -- and nothing that resolves from a hundred thousand keys. What it
+entry -- and nothing that resolves from a hundred thousand keys. Priced
+again as it went back, the two builds alternated eight times, each
+against its comparator, it read a tenth of a millisecond on a run's first
+commit in every pair (`SUPDB_LOAD_PHASES`, the `first` column), the
+commits after it level, and the load's total slower in three pairs of
+eight; the rate against the comparator leaned a twentieth, and so did
+the comparator's own load between the two builds, code the change cannot
+reach. What it
 had been traded for was the wording of the guarantee: without it a
 commit acknowledged as durable rested on what ext4 and XFS do with a new
 file's first sync, which POSIX does not promise, and a name that went
