@@ -18607,10 +18607,30 @@ fn a_load_nobody_reads_files_no_forms() {
         db.commit().unwrap();
         db.settle().unwrap();
         let built = db.blocks_built().1 - built0;
+        // What the upkeep did over the stretch, said with either failure.
+        // The arm's forms are built on the upkeep thread, so a count of
+        // none is a schedule of that thread's, and these are what tell
+        // one schedule from another: the hosted x86 runner read none
+        // once, on a tree the same job had passed half an hour before,
+        // and the assertion had only its own sentence to say.
+        let did = format!(
+            "upkeep {:?}, events {:?}, refusals {:?}, abandon {:?}, outran {}",
+            db.upkeep_counts(),
+            db.forms_events(),
+            db.settle_refusals(),
+            db.upkeep_abandon_state(),
+            db.upkeep_outran()
+        );
         if far {
-            assert!(built > 0, "the arm that files far from a scan built forms");
+            assert!(
+                built > 0,
+                "the arm that files far from a scan built no forms: {did}"
+            );
         } else {
-            assert_eq!(built, 0, "a stretch nobody read built {built} blocks");
+            assert_eq!(
+                built, 0,
+                "a stretch nobody read built {built} blocks: {did}"
+            );
         }
         // A scan through the handle and through the writer reads every
         // key with every value in order, forms or none.
