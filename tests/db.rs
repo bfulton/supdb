@@ -4385,7 +4385,14 @@ fn a_merge_asks_ahead_only_where_its_inputs_are_not_resident() {
     assert!(asks >= 6, "cold inputs: {asks} asks of {bytes} bytes");
     assert!(bytes >= 4 << 20, "{bytes} bytes over {asks} asks");
     let (asks, bytes) = build("mergeahead-warm", 1 << 20, false);
-    assert_eq!((asks, bytes), (0, 0), "resident inputs were asked for");
+    // A mapping says whether a page is resident on Linux alone
+    // (`Bytes::resident_at`); elsewhere it cannot say, and every window is
+    // asked for.
+    if cfg!(target_os = "linux") {
+        assert_eq!((asks, bytes), (0, 0), "resident inputs were asked for");
+    } else {
+        assert!(asks > 0, "a mapping that cannot say asked for nothing");
+    }
     let (asks, bytes) = build("mergeahead-off", 0, true);
     assert_eq!((asks, bytes), (0, 0), "the option off asked");
 }

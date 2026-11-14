@@ -36311,7 +36311,6 @@ impl Db {
     /// that the build's round does not ask of the same file again and count
     /// it twice; no file is not a rejection.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn z_attach(
         dir: &Path,
         seg: &Seg,
