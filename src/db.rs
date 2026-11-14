@@ -6643,14 +6643,43 @@ impl Wal {
         mut fill: impl FnMut(u64, u64) -> Result<u64>,
     ) -> Result<(u64, u64, bool)> {
         let seed = wal_seed(id);
-        let mut buf = Vec::new();
-        match File::open(path) {
-            Ok(mut f) => {
-                f.read_to_end(&mut buf)?;
-            }
+        let mut file = match File::open(path) {
+            Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((from, 0, false)),
             Err(e) => return Err(e),
+        };
+        if file.metadata()?.len() == 0 {
+            return Ok((from, 0, false));
         }
+        // Read through a mapping and not into a buffer. The frames are
+        // parsed where they lie and a record's key and value are copied
+        // once, into the memtable; read whole into a buffer first, a log
+        // of forty megabytes was forty megabytes of fresh pages, the
+        // kernel's copy into them and their unmapping, a quarter of the
+        // open of a killed store of three hundred thousand keys. The
+        // store is held under its lock for the open and nothing writes the
+        // file while it is mapped; where a file cannot be mapped it is
+        // read as before.
+        let mapped;
+        let owned;
+        // SAFETY: a read-only private view of a file this open holds the
+        // store's lock over; nothing in this process writes it while the
+        // view stands, and the view is dropped before the caller truncates
+        // or appends to the file.
+        let buf: &[u8] = match unsafe { memmap2::Mmap::map(&file) } {
+            Ok(m) => {
+                #[cfg(unix)]
+                let _ = m.advise(memmap2::Advice::Sequential);
+                mapped = m;
+                &mapped
+            }
+            Err(_) => {
+                let mut v = Vec::new();
+                file.read_to_end(&mut v)?;
+                owned = v;
+                &owned
+            }
+        };
         if buf.is_empty() {
             return Ok((from, 0, false));
         }
@@ -32682,6 +32711,12 @@ impl Db {
             Ok(next)
         };
         let mut log_ended = false;
+        // The greatest key the replay applies, kept as it goes: every
+        // record makes or finds its key's entry, so this is the greatest
+        // key the table holds, without the walk of every entry that
+        // finding it afterwards took (`max_key_of`), an eighth of the
+        // instructions of a replay of three hundred thousand records.
+        let mut replay_max: Vec<u8> = Vec::new();
         for (i, &id) in wal_ids.iter().enumerate() {
             let (next, valid, ended) = Wal::replay(
                 &Db::wal_path(dir, id),
@@ -32689,6 +32724,10 @@ impl Db {
                 from,
                 i == 0,
                 |kind, k, v| {
+                    if k > replay_max.as_slice() {
+                        replay_max.clear();
+                        replay_max.extend_from_slice(k);
+                    }
                     if kind == WAL_DEL {
                         mem.delete(mem_hash(k), k, &readers);
                         mem_bytes += k.len() + 16;
@@ -32757,7 +32796,12 @@ impl Db {
         let data_bytes = Db::data_bytes_of(&segs);
         let l0_aligned = Db::l0_aligned_of(&segs);
         let segs_tombs = segs.iter().any(|s| s.tombs);
-        let max_key = Db::max_key_of(&segs, &mem);
+        let max_key = Db::max_seg_key(&segs).max(replay_max);
+        debug_assert_eq!(
+            max_key,
+            Db::max_key_of(&segs, &mem),
+            "the greatest key the replay applied is not the table's greatest"
+        );
         let ntables = segs.len();
         let layout = segs
             .iter()
@@ -33328,9 +33372,9 @@ impl Db {
         }
     }
 
-    /// The greatest key any source holds: the partitions' and pieces' last
-    /// keys and the memtable's, for a store that opens with all of them.
-    fn max_key_of(segs: &[std::sync::Arc<Seg>], mem: &MemTable) -> Vec<u8> {
+    /// The greatest key any segment holds: the partitions' and pieces'
+    /// last keys.
+    fn max_seg_key(segs: &[std::sync::Arc<Seg>]) -> Vec<u8> {
         let mut best: Vec<u8> = Vec::new();
         for s in segs {
             let b = s.raw();
@@ -33342,6 +33386,15 @@ impl Db {
                 }
             }
         }
+        best
+    }
+
+    /// The greatest key any source holds: the partitions' and pieces' last
+    /// keys and the memtable's, by a walk of every entry of the table. The
+    /// open keeps the greatest key its replay applies instead, and holds
+    /// it to this in a checked build.
+    fn max_key_of(segs: &[std::sync::Arc<Seg>], mem: &MemTable) -> Vec<u8> {
+        let mut best = Db::max_seg_key(segs);
         for e in (0..mem.len()).map(|i| mem.entry(i)) {
             let k = mem.key_of(e);
             if k > best.as_slice() {
