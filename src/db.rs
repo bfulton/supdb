@@ -3660,6 +3660,36 @@ pub struct Options {
     /// holds within the batch, the shape before (`supdb-pacesyncsbatch`).
     #[doc(hidden)]
     pub upkeep_pace_syncs_to_share: bool,
+    /// A syncing commit's pace decided by what it costs and saves, in
+    /// place of `upkeep_pace_syncs_to_share`'s cut-offs on the batch and
+    /// the store. Holding a commit until the upkeep thread has filed its
+    /// batch moves that filing from the next scan to the commit, and buys
+    /// nothing when a commit comes next instead, since the thread files it
+    /// beside the next batch anyway; so the hold pays, by the suite's own
+    /// trade between a burst and the pass after it (`weighted_ms`, the
+    /// burst plus twice the pass: `PACE_READ_WEIGHT`), where twice the
+    /// probability that a scan comes before the next commit passes one.
+    /// That probability is read off the store's own history: the runs of
+    /// commits between scans, each begun while reads were around, give
+    /// for the run's commit `k` the share of the runs that reached `k` and
+    /// ended there, under the uniform prior (`PaceRuns`). A burst of one
+    /// commit between scans holds; the later commits of a longer burst,
+    /// and the commits of a mix with no scan between them, hold only to
+    /// the backlog bound (the share or the batch, the larger), whatever
+    /// the batch's size, with no cut-off on the batch or the store -- a
+    /// batch under `upkeep_inline_min` was not paced before. Priced
+    /// against the cut-offs in the row's whole order from ten to three
+    /// hundred thousand keys, in both orders: at ten thousand keys the
+    /// full rewrite's burst read 1.14-1.18x, since the cut-offs held every
+    /// one of its commits, and its first scan waited for nothing in either
+    /// arm, the thread having built every block of the store by then in
+    /// both; elsewhere nothing moved by more than the cells neither arm
+    /// treats differently, and the small batches now paced waited at most
+    /// two milliseconds a mix, in the scrambled write mixes at a hundred
+    /// thousand keys. Off, `upkeep_pace_syncs_to_share` decides as it did:
+    /// `supdb-pacesyncsthresholds`.
+    #[doc(hidden)]
+    pub upkeep_pace_syncs_model: bool,
     /// "In core" for `upkeep_pace_syncs_bp` is every gate but the compact
     /// form's: the pace holds through the controller's census and stops
     /// once the form is installed. The census is entered on the group's
@@ -5926,6 +5956,7 @@ impl Default for Options {
             upkeep_pace_pct: 1,
             upkeep_pace_syncs_bp: 25,
             upkeep_pace_syncs_to_share: true,
+            upkeep_pace_syncs_model: true,
             upkeep_pace_syncs_census: true,
             out_of_core_installed: false,
             upkeep_settle_after_scans: true,
@@ -20151,6 +20182,8 @@ pub struct Db {
     upkeep_log: (u64, usize),
     upkeep_life: u64,
     upkeep_since_scan: u64,
+    /// The runs of commits between scans (`Options::upkeep_pace_syncs_model`).
+    pace_runs: PaceRuns,
     /// `Options::scan_forms_off_stale_writes`: the writes made in small
     /// commits, with the forms given up, since the store's last scan or
     /// the last batch of a burst; and what the count is taken against, the
@@ -32562,6 +32595,7 @@ impl Db {
             upkeep_log: (0, 0),
             upkeep_life: 0,
             upkeep_since_scan: 0,
+            pace_runs: PaceRuns::default(),
             forms_off_quiet: 0,
             forms_off_log: (0, 0),
             forms_off_life: 0,
@@ -33354,6 +33388,7 @@ impl Db {
             upkeep_log: (0, 0),
             upkeep_life: 0,
             upkeep_since_scan: 0,
+            pace_runs: PaceRuns::default(),
             forms_off_quiet: 0,
             forms_off_log: (0, 0),
             forms_off_life: 0,
@@ -38900,6 +38935,135 @@ const PACE_SYNCS_SHARE_FROM: u64 = 20;
 /// left a batch behind as before rather than holding the writer for its
 /// whole filing (`Options::upkeep_pace_syncs_to_share`).
 const PACE_SYNCS_SHARE_MAX_BATCH: usize = 2048;
+
+/// The weight `Options::upkeep_pace_syncs_model` gives the scan's wait
+/// against the commit's: the suite's `weighted_ms`, which trades a burst
+/// against the pass after it, counts the pass twice.
+const PACE_READ_WEIGHT: u64 = 2;
+
+/// The longest run of commits between scans `PaceRuns` keeps apart; the
+/// runs longer than this share its last count.
+const PACE_RUN_HIST: usize = 64;
+
+/// The runs of syncing commits between scans, for
+/// `Options::upkeep_pace_syncs_model`: the run in progress, whether reads
+/// were around at its first commit, and how many of the runs that were
+/// ended after each count of commits.
+struct PaceRuns {
+    len: u32,
+    live: bool,
+    ended: [u32; PACE_RUN_HIST],
+}
+
+impl Default for PaceRuns {
+    fn default() -> Self {
+        PaceRuns {
+            len: 0,
+            live: false,
+            ended: [0; PACE_RUN_HIST],
+        }
+    }
+}
+
+impl PaceRuns {
+    /// A commit: the first of a run where a scan came since the commit
+    /// before, which ends the run before it, or the run's next.
+    fn note(&mut self, scanned: bool, around: bool) {
+        if scanned || self.len == 0 {
+            if self.live && self.len > 0 {
+                let at = (self.len as usize).min(PACE_RUN_HIST) - 1;
+                self.ended[at] = self.ended[at].saturating_add(1);
+            }
+            self.len = 1;
+            self.live = around;
+        } else {
+            self.len = self.len.saturating_add(1);
+        }
+    }
+
+    /// The odds that the run ends at the commit just noted, as the
+    /// runs that ended there and the runs that reached it, each with the
+    /// uniform prior's one and two added; past the longest count kept
+    /// apart, none is known to have ended there.
+    fn ends_here(&self) -> (u64, u64) {
+        let k = self.len.max(1) as usize;
+        let at = k.min(PACE_RUN_HIST) - 1;
+        let reached: u64 = self.ended[at..].iter().map(|&n| u64::from(n)).sum();
+        let ended = if k > PACE_RUN_HIST {
+            0
+        } else {
+            u64::from(self.ended[at])
+        };
+        (ended + 1, reached + 2)
+    }
+
+    /// Whether holding the commit just noted for its batch's filing pays:
+    /// the weighted probability that a scan comes next passes one.
+    fn hold_pays(&self) -> bool {
+        let (ended, reached) = self.ends_here();
+        PACE_READ_WEIGHT * ended > reached
+    }
+}
+
+#[cfg(test)]
+mod pace_runs_tests {
+    use super::*;
+
+    /// With nothing on record the odds are the prior's even ones, and an
+    /// even chance weighted twice does not pass one: no hold. One run of a
+    /// single commit between scans makes the next first commit a hold; its
+    /// run's second commit, at a count no run has reached, is not. A run
+    /// begun with reads away is not counted, and a run longer than the
+    /// counts kept apart is known to have reached every one of them.
+    #[test]
+    fn the_odds_a_run_ends_at_a_commit_come_from_the_runs_before() {
+        let mut r = PaceRuns::default();
+        r.note(true, true);
+        assert_eq!(r.ends_here(), (1, 2));
+        assert!(!r.hold_pays(), "no history: even odds do not pay");
+        r.note(true, true);
+        assert_eq!(r.ends_here(), (2, 3), "one run of one commit on record");
+        assert!(r.hold_pays());
+        r.note(false, true);
+        assert_eq!(r.ends_here(), (1, 2), "no run on record reached two");
+        assert!(!r.hold_pays());
+        // That run of two ends at the next scan; a run begun with reads
+        // away is not recorded when it ends.
+        r.note(true, false);
+        assert_eq!(r.ended[1], 1);
+        r.note(true, true);
+        assert_eq!(
+            r.ended[0], 1,
+            "the run begun with reads away is not counted"
+        );
+        assert_eq!(
+            r.ends_here(),
+            (2, 4),
+            "of two runs that reached one, one ended there"
+        );
+        assert!(
+            !r.hold_pays(),
+            "a half chance weighted twice is not more than one"
+        );
+        for _ in 0..PACE_RUN_HIST + 3 {
+            r.note(false, true);
+        }
+        r.note(true, true);
+        assert_eq!(
+            r.ended[PACE_RUN_HIST - 1],
+            1,
+            "a long run shares the last count"
+        );
+        for _ in 0..PACE_RUN_HIST + 3 {
+            r.note(false, true);
+        }
+        assert_eq!(
+            r.ends_here(),
+            (1, 3),
+            "past the counts kept apart, none ended here"
+        );
+    }
+}
 /// The steps a pass on the upkeep thread reads and settles in where it
 /// yields (`Options::upkeep_yields`): entries of the live log a step, and
 /// writes of the frozen tables' carried tails a step. A step is what a
@@ -39515,7 +39679,8 @@ impl Db {
         // worth of writes. The writer's own scans say so at every scan,
         // a handle's once per commit.
         let life = self.shared.scans_life.load(AtomicOrdering::Relaxed);
-        if life != self.upkeep_life {
+        let scanned = life != self.upkeep_life;
+        if scanned {
             self.upkeep_life = life;
             self.upkeep_since_scan = 0;
         } else {
@@ -39523,6 +39688,9 @@ impl Db {
         }
         let reads_around =
             reads_around(life, self.upkeep_since_scan, keys) && !self.shared.outran();
+        if batch > 0 {
+            self.pace_runs.note(scanned, reads_around);
+        }
         // The thread stays alert on its own timer while reads are around
         // (`Options::upkeep_alert`), but it chooses a park's length only
         // when it parks: one that fell into a long park while nothing was
@@ -39584,7 +39752,8 @@ impl Db {
             && syncs
             && self.opts.upkeep_pace_syncs_bp > 0
             && reads_around
-            && batch >= self.opts.upkeep_inline_min
+            && batch > 0
+            && (self.opts.upkeep_pace_syncs_model || batch >= self.opts.upkeep_inline_min)
             && in_core
         {
             share = (keys as u64).saturating_mul(self.opts.upkeep_pace_syncs_bp as u64) / 10_000;
@@ -39715,7 +39884,16 @@ impl Db {
             // A syncing batch within the share alone: its thread filed it
             // beside the fsync, and what is left is the first scan's to wait
             // for otherwise (`Options::upkeep_pace_syncs_to_share`).
-            let within = if pace_syncs
+            let within = if pace_syncs && self.opts.upkeep_pace_syncs_model {
+                // The batch's filing held for where a scan is the likelier
+                // next, the backlog bound otherwise
+                // (`Options::upkeep_pace_syncs_model`).
+                if self.pace_runs.hold_pays() {
+                    0
+                } else {
+                    share.max(batch as u64)
+                }
+            } else if pace_syncs
                 && self.opts.upkeep_pace_syncs_to_share
                 && batch as u64 * PACE_SYNCS_SHARE_FROM >= keys as u64
                 && batch <= PACE_SYNCS_SHARE_MAX_BATCH

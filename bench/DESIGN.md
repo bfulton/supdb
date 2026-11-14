@@ -698,9 +698,13 @@ tombstone, a lone source's too (`Options::emit_lone_unsearched`), and
 count of keys past the end for as long as it is, where the default copies
 it once its walks have paid (`Options::forms_copy_hot_wide`);
 `supdb-pacesyncsbatch` holds a syncing commit's paced batch within the
-share or the batch, the larger, where the default holds a batch of a
-twentieth of the store or more within the share alone
-(`Options::upkeep_pace_syncs_to_share`);
+share or the batch, the larger, and `supdb-pacesyncsthresholds` holds a
+batch of a twentieth of the store and at most 2048 writes within the share
+alone and paces no batch under 256 writes
+(`Options::upkeep_pace_syncs_to_share`), where the default holds a
+commit for its batch's filing where the store's own runs of commits
+between scans make a scan the likelier next operation, and paces every
+other batch within the backlog bound (`Options::upkeep_pace_syncs_model`);
 `supdb-probestwice` and `supdb-ingestprobestwice` have a point read over a
 store with tombstones probe every source again after its tombstone pass,
 where the default keeps what the pass found of each source

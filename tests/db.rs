@@ -19166,6 +19166,7 @@ fn a_syncing_commits_large_batch_is_held_to_the_share() {
             &d,
             Options {
                 upkeep: supdb::Upkeep::Background(1),
+                upkeep_pace_syncs_model: false,
                 upkeep_pace_syncs_to_share: to_share,
                 zpages: supdb::ZPages::Off,
                 partition_bytes: Some(256 << 10),
@@ -19237,6 +19238,103 @@ fn a_syncing_commits_large_batch_is_held_to_the_share() {
     run("pace-share-small", true, 400);
     run("pace-share-huge", true, 3000);
     run("pace-share-off", false, 1000);
+}
+
+/// Under `Options::upkeep_pace_syncs_model` a syncing commit holds for its
+/// batch's filing where a scan is the likelier next operation, by the
+/// store's own runs of commits between scans: once a burst of one commit
+/// followed by a scan is on record, each such commit returns with the
+/// thread caught up, so the scan after it meets nothing to file, and a
+/// small batch is paced as a large one is. With the model off, the commit
+/// returns as soon as the batch is lent and the thread is still filing it.
+/// Every key reads as written after each scan.
+#[test]
+fn a_syncing_commit_a_scan_follows_holds_for_its_filing() {
+    let run = |name: &str, model: bool, batch: u32| -> (u32, u32) {
+        let d = dir(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                upkeep: supdb::Upkeep::Background(1),
+                upkeep_pace_syncs_model: model,
+                upkeep_pace_syncs_to_share: false,
+                zpages: supdb::ZPages::Off,
+                partition_bytes: Some(256 << 10),
+                seal_max_pct: 0,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(db.options().sync, supdb::SyncPolicy::Always));
+        let keys = 10_000u32;
+        let key = |k: u32| format!("key-{k:06}").into_bytes();
+        let mut want: HashMap<u32, String> = HashMap::new();
+        for k in 0..keys {
+            db.append(&key(k), b"0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        let check = |db: &Reader, want: &HashMap<u32, String>, when: &str| {
+            let mut seen = 0u32;
+            db.scan(
+                &key(0),
+                keys as usize,
+                kv(&mut |k, v| {
+                    let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                    let expect = want.get(&kn).map_or("0", |s| s.as_str());
+                    assert_eq!(
+                        std::str::from_utf8(v).unwrap(),
+                        expect,
+                        "{name}: key {kn} {when}"
+                    );
+                    seen += 1;
+                }),
+            )
+            .unwrap();
+            assert_eq!(seen, keys, "{name}: every key {when}");
+        };
+        check(&db, &want, "before the bursts");
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let (mut caught_up, mut behind_any) = (0u32, 0u32);
+        for round in 0..6u32 {
+            for _ in 0..batch {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % keys as u64) as u32;
+                db.put(&key(k), format!("b{round}").as_bytes());
+                want.insert(k, format!("b{round}"));
+            }
+            db.commit().unwrap();
+            // The first burst has no run on record; from the second on, a
+            // burst of one commit has one.
+            if round > 0 {
+                if db.upkeep_behind_writes() == 0 {
+                    caught_up += 1;
+                } else {
+                    behind_any += 1;
+                }
+            }
+            check(&db, &want, &format!("after burst {round}"));
+        }
+        db.settle().unwrap();
+        (caught_up, behind_any)
+    };
+    assert_eq!(
+        run("pace-model-large", true, 1000),
+        (5, 0),
+        "held, large batches"
+    );
+    assert_eq!(
+        run("pace-model-small", true, 100),
+        (5, 0),
+        "held, small batches"
+    );
+    let (_, off_behind) = run("pace-model-off", false, 1000);
+    assert!(
+        off_behind > 0,
+        "with the model off a commit returns with its batch unfiled"
+    );
 }
 
 /// A syncing commit lends every batch to the upkeep thread, which files

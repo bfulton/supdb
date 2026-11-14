@@ -1234,9 +1234,13 @@ pub struct Supdb {
     /// `supdb-ingestwidewalks`.
     widewalks: bool,
     /// A syncing commit's paced batch held within the share or the batch,
-    /// the larger (`Options::upkeep_pace_syncs_to_share` off):
-    /// `supdb-pacesyncsbatch`.
+    /// the larger (`Options::upkeep_pace_syncs_model` and
+    /// `upkeep_pace_syncs_to_share` off): `supdb-pacesyncsbatch`.
     pacesyncsbatch: bool,
+    /// A syncing commit's pace by the cut-offs on the batch and the store
+    /// (`Options::upkeep_pace_syncs_model` off):
+    /// `supdb-pacesyncsthresholds`.
+    pacesyncsthresholds: bool,
     /// A point read over a store with tombstones probing every source
     /// again after its tombstone pass (`Options::read_probes_once` off):
     /// `supdb-probestwice` and `supdb-ingestprobestwice`.
@@ -2389,6 +2393,8 @@ struct Policy {
     widewalks: bool,
     /// Syncing batches held within the batch: `supdb-pacesyncsbatch`.
     pacesyncsbatch: bool,
+    /// The syncing pace by cut-offs: `supdb-pacesyncsthresholds`.
+    pacesyncsthresholds: bool,
     /// Every source probed again after the tombstone pass: `...probestwice`.
     probestwice: bool,
     /// A filed burst's builds in the commit: `...settlebuildsfiled`.
@@ -2825,6 +2831,7 @@ impl Default for Policy {
             lonetombs: false,
             widewalks: false,
             pacesyncsbatch: false,
+            pacesyncsthresholds: false,
             probestwice: false,
             settlebuildsfiled: false,
             zwalkowns: false,
@@ -8259,6 +8266,7 @@ impl Supdb {
             lonetombs,
             widewalks,
             pacesyncsbatch,
+            pacesyncsthresholds,
             probestwice,
             settlebuildsfiled,
             zwalkowns,
@@ -8834,6 +8842,7 @@ impl Supdb {
             emit_lone_unsearched: !lonetombs,
             forms_copy_hot_wide: !widewalks,
             upkeep_pace_syncs_to_share: !pacesyncsbatch,
+            upkeep_pace_syncs_model: !pacesyncsbatch && !pacesyncsthresholds,
             read_probes_once: !probestwice,
             forms_settle_builds_filed: settlebuildsfiled,
             zpages_rewarm_quiet_ms: if zrewarmwait {
@@ -9138,6 +9147,7 @@ impl Supdb {
             lonetombs,
             widewalks,
             pacesyncsbatch,
+            pacesyncsthresholds,
             probestwice,
             settlebuildsfiled,
             zwalkowns,
@@ -9843,6 +9853,9 @@ impl Engine for Supdb {
         }
         if self.pacesyncsbatch {
             return "supdb-pacesyncsbatch";
+        }
+        if self.pacesyncsthresholds {
+            return "supdb-pacesyncsthresholds";
         }
         if self.probestwice {
             return if self.partition {
@@ -12047,6 +12060,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-widewalks"
         | "supdb-ingestwidewalks"
         | "supdb-pacesyncsbatch"
+        | "supdb-pacesyncsthresholds"
         | "supdb-probestwice"
         | "supdb-ingestprobestwice"
         | "supdb-settlebuildsfiled"
@@ -12714,6 +12728,18 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         partition: false,
                         durable: false,
                         probestwice: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-pacesyncsthresholds" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        pacesyncsthresholds: true,
                         ..Policy::default()
                     },
                 )
@@ -15512,6 +15538,21 @@ mod tests {
             }
             {
                 let z = Supdb::with_policy(
+                    &dir("pacesyncsthresholds"),
+                    Policy {
+                        pacesyncsthresholds: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-pacesyncsthresholds");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.upkeep_pace_syncs_model && b.upkeep_pace_syncs_model);
+                assert!(o.upkeep_pace_syncs_to_share);
+            }
+            {
+                let z = Supdb::with_policy(
                     &dir("pacesyncsbatch"),
                     Policy {
                         pacesyncsbatch: true,
@@ -15523,6 +15564,7 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.upkeep_pace_syncs_to_share && b.upkeep_pace_syncs_to_share);
+                assert!(!o.upkeep_pace_syncs_model);
             }
             {
                 let z = Supdb::with_policy(
