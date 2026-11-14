@@ -1234,12 +1234,12 @@ impl Drop for TallyReader {
 /// positional flags, which reached seven and could not take the eighth.
 struct Policy {
     /// The store's directory encrypted by the kernel under a key
-    /// (`Options::dir_key`): `supdb-dirkey` and `supdb-ingestdirkey`, the
+    /// (`Encryption::Kernel`): `supdb-dirkey` and `supdb-ingestdirkey`, the
     /// default and the buffered arm with nothing else changed. The store
     /// has to stand on a filesystem that can encrypt
     /// (`scripts/fscrypt.sh`), and so has the arm it is paired with.
     dir_key: bool,
-    /// The store under a cipher the caller supplies (`Options::cipher`),
+    /// The store under a cipher the caller supplies (`Encryption::Cipher`),
     /// here AES-256-GCM: `supdb-cipher` and `supdb-ingestcipher`. Its
     /// files are memory files and its directory their envelopes, and it
     /// runs with ordered ingest through the log and the compact form off
@@ -2156,7 +2156,7 @@ impl Supdb {
     }
 
     /// `supdb` with its directory under a key: every file the store writes
-    /// encrypted by the kernel (`Options::dir_key`). The pair against
+    /// encrypted by the kernel (`Encryption::Kernel`). The pair against
     /// `supdb`, both on a filesystem that can encrypt, differs by the key
     /// and prices what the kernel's encryption costs a store: nothing
     /// where a pass reads the page cache, which holds plaintext, and the
@@ -2171,7 +2171,7 @@ impl Supdb {
         )
     }
 
-    /// `supdb` under a cipher the caller supplies (`Options::cipher`).
+    /// `supdb` under a cipher the caller supplies (`Encryption::Cipher`).
     pub fn create_cipher(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
@@ -7141,10 +7141,6 @@ impl Supdb {
             },
             None => opts,
         };
-        let opts = supdb::Options {
-            dir_key: dir_key.then(|| supdb::DirKey::new([0x5a; 32])),
-            ..opts
-        };
         // What a cipher fixes, set for its twin in the clear as well, so
         // the pair differs by the cipher and nothing else.
         let opts = if cipher || cipher_base {
@@ -7157,10 +7153,16 @@ impl Supdb {
         } else {
             opts
         };
-        let opts = supdb::Options {
-            cipher: cipher.then(|| supdb::StoreCipher::new(Gcm::new(), Gcm::of)),
-            ..opts
+        // One way or neither: the engine takes one choice, and no arm is
+        // under both.
+        let encryption = match (dir_key, cipher) {
+            (true, _) => supdb::Encryption::Kernel(supdb::DirKey::new([0x5a; 32])),
+            (false, true) => {
+                supdb::Encryption::Cipher(supdb::StoreCipher::new(Gcm::new(), Gcm::of))
+            }
+            (false, false) => supdb::Encryption::None,
         };
+        let opts = supdb::Options { encryption, ..opts };
         let db = supdb::Db::create(path, opts).map_err(|e| e.to_string())?;
         Ok(Supdb {
             db: Some(db),

@@ -101,7 +101,7 @@ pub use bytes::{Bytes, SliceBytes, VecBytes};
 /// one.
 #[cfg(not(target_family = "wasm"))]
 pub use db::dirkey::{self, DirKey, DirState};
-/// A live store under a cipher the caller supplies (`Options::cipher`): the
+/// A live store under a cipher the caller supplies (`Encryption::Cipher`): the
 /// cipher as the store takes it, what it counts, the name a store's marker
 /// gives its key, and the store handed from one of the caller's keys to
 /// another.
@@ -109,6 +109,6 @@ pub use db::dirkey::{self, DirKey, DirState};
 pub use db::vault::{key_id as cipher_key_id, rewrap as cipher_rewrap, CipherCounts, StoreCipher};
 #[cfg(not(target_family = "wasm"))]
 pub use db::{
-    BackgroundIo, Db, Isolation, Options, ReadAdvice, Reader, SegmentOptions, SegmentWrite,
-    SegmentWriter, SyncPolicy, Txn, Upkeep, ZInject, ZPages,
+    BackgroundIo, Db, Encryption, Isolation, Options, ReadAdvice, Reader, SegmentOptions,
+    SegmentWrite, SegmentWriter, SyncPolicy, Txn, Upkeep, ZInject, ZPages,
 };

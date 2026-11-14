@@ -99,7 +99,7 @@ for g in $groups; do
         a_store_under_a_key_is_ciphertext_on_the_device_and_reads_as_itself \
         a_locked_store_is_refused_by_name_and_opens_under_its_key \
         a_directory_under_one_key_refuses_a_store_under_another \
-        a_store_under_a_key_and_a_cipher_is_under_both; do
+        a_store_kept_one_way_is_refused_the_other; do
         printf '%s\n' "$out" | grep -q "^test $t \.\.\. ok" || {
           echo "fscrypt: $t did not run" >&2
           exit 1

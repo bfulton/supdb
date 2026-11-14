@@ -1,5 +1,5 @@
 //! A store under a key: its directory encrypted by the kernel
-//! (`Options::dir_key`, `supdb::dirkey`).
+//! (`Encryption::Kernel`, `supdb::dirkey`).
 //!
 //! Two halves, since a test cannot make a filesystem. The first runs
 //! wherever the tests do and holds the refusals: a store given a key where
@@ -18,7 +18,7 @@
 
 use std::path::{Path, PathBuf};
 use supdb::dirkey::{self, DirKey, DirState};
-use supdb::{Db, Options};
+use supdb::{Db, Encryption, Options};
 
 mod common;
 use common::{kv, vf};
@@ -31,7 +31,7 @@ fn key(n: u8) -> DirKey {
 
 fn under(key: &DirKey) -> Options {
     Options {
-        dir_key: Some(key.clone()),
+        encryption: Encryption::Kernel(key.clone()),
         ..small()
     }
 }
@@ -376,40 +376,54 @@ fn a_directory_under_one_key_refuses_a_store_under_another() {
     assert!(dirkey::lock(&encrypting().0, &key).unwrap());
 }
 
-/// The two ways a store is kept under a key, together: the kernel encrypts
-/// the directory, and the store seals what it writes into it under the
-/// caller's cipher (`Options::cipher`). The store reads as itself, opens
-/// again under both, and is refused under the key without the cipher; and
-/// the files in its directory are a store under a cipher's.
+/// A store is kept one way, and is refused the other. A cipher given to a
+/// store under the kernel's key finds no store under a cipher. And a store
+/// under a cipher, here in a directory the kernel encrypts already, which
+/// is the filesystem's business and not the store's, is not opened by the
+/// kernel's key or by nothing: it is the cipher's.
 #[test]
 #[ignore = "needs a filesystem that can encrypt: scripts/check.sh fscrypt"]
-fn a_store_under_a_key_and_a_cipher_is_under_both() {
-    let (dir, key) = (on_the_filesystem("both"), key(16));
-    let both = || Options {
-        cipher: Some(supdb::StoreCipher::new(
+fn a_store_kept_one_way_is_refused_the_other() {
+    let (outer, key) = (on_the_filesystem("ways"), key(16));
+    let sealed = || Options {
+        encryption: Encryption::Cipher(supdb::StoreCipher::new(
             common::Gcm::new(&[16; 32]),
             common::Gcm::new,
         )),
-        ..under(&key)
+        ..small()
     };
-    let n = 6_000;
+    let n = 3_000;
     {
-        let mut db = Db::create(&dir, both()).unwrap();
+        let mut db = Db::create(&outer, under(&key)).unwrap();
         fill(&mut db, n);
-        holds(&db, n);
     }
-    assert_eq!(dirkey::state(&dir).unwrap(), DirState::Unlocked);
-    holds(&Db::open(&dir, both()).unwrap(), n);
-    assert!(
-        Db::open(&dir, under(&key)).is_err(),
-        "the key without the cipher"
-    );
-    for name in names(&dir) {
-        let known = name == "supdb.cipher"
-            || name.starts_with("manifest")
-            || name.starts_with("wal-")
-            || name.starts_with("x-");
-        assert!(known, "a file named {name}");
+    let e = Db::open(&outer, sealed())
+        .err()
+        .expect("a cipher given to a store under the kernel's key")
+        .to_string();
+    assert!(e.contains("not kept under one"), "{e}");
+    holds(&Db::open(&outer, under(&key)).unwrap(), n);
+
+    let inner = outer.join("inner");
+    {
+        let mut db = Db::create(&inner, sealed()).unwrap();
+        fill(&mut db, n);
     }
-    holds(&Db::open(&dir, both()).unwrap(), n);
+    assert_eq!(dirkey::state(&inner).unwrap(), DirState::Unlocked);
+    // Refused for what it is, before anything is read or written: an open
+    // that went on would fail further in, at a manifest it cannot parse,
+    // having said nothing of why.
+    let before = names(&inner);
+    for (opts, what) in [
+        (
+            under(&key),
+            "the kernel's key given to a store under a cipher",
+        ),
+        (small(), "nothing given to a store under a cipher"),
+    ] {
+        let e = Db::open(&inner, opts).err().expect(what).to_string();
+        assert!(e.contains("kept under a cipher"), "{what}: {e}");
+        assert_eq!(names(&inner), before, "{what}");
+    }
+    holds(&Db::open(&inner, sealed()).unwrap(), n);
 }

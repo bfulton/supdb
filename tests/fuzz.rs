@@ -68,7 +68,7 @@
 //!   once over disjoint ranges (`Options::merge_parallel`); a flag and not
 //!   a draw.
 //! - `ZFUZZ_CIPHER=1`: the `z` store is kept under a cipher
-//!   (`Options::cipher`) and `r` in the clear, so a store whose files are in
+//!   (`Encryption::Cipher`) and `r` in the clear, so a store whose files are in
 //!   memory and whose directory is sealed is read against the model and
 //!   against a plain store over the same writes, across closes and crashes.
 //!   `fuzz_range_under_a_cipher` is the range run so with nothing set, and
@@ -378,7 +378,7 @@ fn opts_z(c: &Cfg) -> Options {
         o.zpages_drop_raw = true;
     }
     // Under `ZFUZZ_CIPHER` the `z` store is kept under a cipher
-    // (`Options::cipher`) while `r` is in the clear over the same writes:
+    // (`Encryption::Cipher`) while `r` is in the clear over the same writes:
     // its files in memory, its directory sealed, its ordered bursts through
     // the log, and a crash there a store whose memory is gone, reopened
     // from what its directory holds.
@@ -396,7 +396,7 @@ fn opts_z(c: &Cfg) -> Options {
 /// as it is otherwise.
 fn with_cipher(mut o: Options) -> Options {
     if under_cipher() {
-        o.cipher = Some(supdb::StoreCipher::new(
+        o.encryption = supdb::Encryption::Cipher(supdb::StoreCipher::new(
             common::Gcm::new(&[0x5a; 32]),
             common::Gcm::new,
         ));
@@ -1181,7 +1181,7 @@ fn fuzz_range() {
     run_range();
 }
 
-/// The range again with `z` kept under a cipher (`Options::cipher`) and
+/// The range again with `z` kept under a cipher (`Encryption::Cipher`) and
 /// `r` in the clear: the store whose files are in memory and whose
 /// directory is sealed, read against the model and against a plain store
 /// over the same writes, with each crash a store whose memory is gone.

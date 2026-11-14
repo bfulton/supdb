@@ -205,13 +205,15 @@ newer one is still a valid envelope. It covers a finished file; a live
 store takes a key in one of two other ways, below. The `supdb::crypt` module docs have
 the layout and how many files one key should be used for.
 
-A live store under a key:
+A live store is kept under a key one of two ways, and `Options::encryption`
+says which: `Encryption::None`, the default, `Encryption::Kernel` or
+`Encryption::Cipher`. Under the kernel's:
 
 ```rust
-use supdb::{Db, DirKey, Options};
+use supdb::{Db, DirKey, Encryption, Options};
 
 let opts = Options {
-    dir_key: Some(DirKey::new(key_bytes)),   // 32 bytes, yours to keep
+    encryption: Encryption::Kernel(DirKey::new(key_bytes)),   // 32 bytes, yours to keep
     ..Options::default()
 };
 let mut db = Db::create(std::path::Path::new("./store"), opts)?;
@@ -229,16 +231,17 @@ against whoever can read the files while the kernel holds the key
 (`supdb::dirkey::lock` gives it up). The `supdb::dirkey` module docs have
 the rest.
 
-A live store under a cipher you supply:
+Under a cipher you supply:
 
 ```rust
-use supdb::{Db, Options, StoreCipher};
+use supdb::{Db, Encryption, Options, StoreCipher};
 
 // `Gcm` is your cipher behind `supdb::crypt::Aead`, as for an envelope:
 // once under your key, and as the constructor of one from a key the store
 // draws.
+let cipher = StoreCipher::new(Gcm::new(&my_key), Gcm::new).key_id(1);
 let opts = Options {
-    cipher: Some(StoreCipher::new(Gcm::new(&my_key), Gcm::new).key_id(1)),
+    encryption: Encryption::Cipher(cipher),
     ..Options::default()
 };
 let mut db = Db::create(std::path::Path::new("./store"), opts)?;
@@ -267,13 +270,15 @@ not detected. `cargo run --release --example cipher_store` has the
 adapter and times an open, and the `supdb::db::vault` module docs have
 the layout, the keys and the limits.
 
-Which of the two a store wants: `dir_key` keeps the page cache, so a store
-larger than memory works and an open decrypts nothing, on ext4 or f2fs
-with `encrypt` on; it does not authenticate, and the files read as
-plaintext to whatever can read them while the kernel holds the key.
-`cipher` goes wherever Linux does, authenticates, and leaves files that
-are ciphertext wherever they are copied, and holds the store in memory.
-A store may be under both.
+Which of the two a store wants: `Encryption::Kernel` keeps the page
+cache, so a store larger than memory works and an open decrypts nothing,
+on ext4 or f2fs with `encrypt` on; it does not authenticate, and the files
+read as plaintext to whatever can read them while the kernel holds the
+key. `Encryption::Cipher` goes wherever Linux does, authenticates, and
+leaves files that are ciphertext wherever they are copied, and holds the
+store in memory. It is one or the other: a store under both would encrypt
+every byte twice for nothing, so the option takes one, and a store kept
+one way is refused when it is opened the other.
 
 ## Building
 

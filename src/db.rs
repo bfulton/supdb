@@ -76,9 +76,9 @@ mod blocks;
 mod zfile;
 pub use zfile::ZInject;
 // A store's directory encrypted by the kernel, under a key the caller gives
-// (`Options::dir_key`).
+// (`Encryption::Kernel`).
 pub mod dirkey;
-// A store under a cipher the caller gives (`Options::cipher`): its files in
+// A store under a cipher the caller gives (`Encryption::Cipher`): its files in
 // memory, their envelopes in the directory, and the door the engine's file
 // operations go through to reach either.
 pub mod vault;
@@ -704,35 +704,55 @@ pub struct ZHeat {
     pub coded: bool,
 }
 
-#[derive(Clone)]
-pub struct Options {
-    pub sync: SyncPolicy,
-    /// The key the store's directory is encrypted under, by the kernel
+/// How a store is kept under a key (`Options::encryption`).
+///
+/// The two ways are for two callers and are not layers. The kernel's keeps
+/// the page cache, so a store larger than memory works and an open decrypts
+/// nothing, on a filesystem that can encrypt. The caller's cipher goes
+/// anywhere, authenticates every byte, and holds the store's plaintext in
+/// memory. A store under both would pay the kernel's cipher on every byte
+/// it writes and reads back for bytes that are ciphertext already, and get
+/// nothing for it, so there is one choice and not two switches.
+#[derive(Clone, Debug, Default)]
+pub enum Encryption {
+    /// A store in the clear, or one whose directory the kernel already
+    /// holds the key of.
+    #[default]
+    None,
+    /// The store's directory encrypted by the kernel under this key
     /// (`dirkey`, Linux's file encryption): every file the store writes is
     /// ciphertext on the device and plaintext in the page cache, so no
     /// read path changes and a store under a key reads as one without.
     /// `Db::create` encrypts the directory before it writes anything, and
     /// refuses where the directory cannot be encrypted; `Db::open` holds
     /// the directory to the key, and refuses a directory that is not
-    /// encrypted under it. `None`, the default, is a store in the clear,
-    /// or one on a directory the kernel already holds the key of.
-    pub dir_key: Option<dirkey::DirKey>,
-    /// The cipher the store is kept under, the caller's (`vault`): every
-    /// byte the store writes to its directory is sealed under it -- the
-    /// segments, the log, the manifest, and the names of the files -- and
-    /// authenticated, on any filesystem. The store's plaintext is held in
-    /// memory files, which is what a read lends from as it lends from the
-    /// page cache of a plain store, so reads run the same code; the store
-    /// has to fit in memory, an open decrypts all of it, and ordered ingest
-    /// goes through the log, the compact form is off and the log's files
-    /// are not recycled, whatever the options beside this one say.
-    /// Each of its files is a descriptor held open, two a segment, so a
-    /// large store wants the process's limit on open files raised.
-    /// `Db::create` makes a store under the cipher in an empty directory;
-    /// `Db::open` refuses a store that is not under it, and a store under a
-    /// cipher is refused where none is given. `None`, the default, is a
-    /// store in the clear, or one under `dir_key` alone.
-    pub cipher: Option<vault::StoreCipher>,
+    /// encrypted under it.
+    Kernel(dirkey::DirKey),
+    /// Everything the store writes to its directory sealed under a cipher
+    /// of the caller's (`vault`): the segments, the log, the manifest, and
+    /// the names of the files, each authenticated, on any filesystem. The
+    /// store's plaintext is held in memory files, which is what a read
+    /// lends from as it lends from the page cache of a plain store, so
+    /// reads run the same code; the store has to fit in memory, an open
+    /// decrypts all of it, and ordered ingest goes through the log, the
+    /// compact form is off and the log's files are not recycled, whatever
+    /// the options say. Each of its files is a descriptor held open, two a
+    /// segment, so a large store wants the process's limit on open files
+    /// raised. `Db::create` makes a store under the cipher in an empty
+    /// directory; `Db::open` refuses a store that is not under it, and a
+    /// store under a cipher is refused where none is given.
+    Cipher(vault::StoreCipher),
+}
+
+#[derive(Clone)]
+pub struct Options {
+    pub sync: SyncPolicy,
+    /// How the store is kept under a key, if it is: in the clear, under
+    /// the kernel's encryption of its directory, or under a cipher the
+    /// caller supplies (`Encryption`). One of the three, and the choice is
+    /// the store's for its life: `Db::open` refuses a store that is not
+    /// kept the way it is asked to open it.
+    pub encryption: Encryption,
     /// Memtable bytes that trigger a seal at the next commit. Sealing is off
     /// the commit path in cost accounting but runs on the committing thread
     /// in milestone 1; the brief's "Segment size" question owns this number.
@@ -3786,8 +3806,7 @@ impl Default for Options {
     fn default() -> Options {
         Options {
             sync: SyncPolicy::Always,
-            dir_key: None,
-            cipher: None,
+            encryption: Encryption::None,
             // 32 MB seals over 64 MB partitions: measured at 1.129x the
             // ingest of 64 MB seals at identical device bytes and identical
             // reads. Smaller still buys nothing and costs 1.5x the device
@@ -4056,7 +4075,7 @@ struct Wal {
     /// The file's header length: `WAL_MAGIC`'s, or under a cipher that and
     /// the file's wrapped key.
     head: u64,
-    /// Under a cipher (`Options::cipher`), the file's: each `write` is one
+    /// Under a cipher (`Encryption::Cipher`), the file's: each `write` is one
     /// record sealed under it, a commit's batch whole, where a plain log
     /// takes the frames as they are. Replay unseals the records into the
     /// frames a plain log holds and walks those.
@@ -11294,7 +11313,7 @@ fn ref_pack(off: u64, len: u32) -> u64 {
 /// read, and the suite's unpinned arm faulted in a third of its runs once
 /// the segment work moved to a thread of its own.
 /// What a store under a cipher runs with whatever it was asked for
-/// (`Options::cipher`), each for the same reason: a file the engine makes
+/// (`Encryption::Cipher`), each for the same reason: a file the engine makes
 /// durable by its own fsync is a memory file there, and the fsync is of
 /// nothing. Ordered ingest's run is a segment open for append and synced
 /// at every commit, so its batches go through the log, whose records the
@@ -11417,7 +11436,7 @@ fn manifest_encode(seq: u64, covered_seq: u64, names: &[String], pending: &[Stri
 }
 
 /// The bytes a manifest's file holds: the manifest's own, or, for a store
-/// under a cipher (`Options::cipher`), those sealed under the store's key
+/// under a cipher (`Encryption::Cipher`), those sealed under the store's key
 /// with each named segment's envelope and wrapped key behind them
 /// (`vault::Vault::seal_manifest`).
 ///
@@ -15882,7 +15901,7 @@ pub struct Db {
     /// descriptors are one open file description, and an fsync error
     /// is reported once per description.
     presync_failed: Option<std::io::Error>,
-    /// The store's registration under its cipher (`Options::cipher`), which
+    /// The store's registration under its cipher (`Encryption::Cipher`), which
     /// the engine's file operations find its memory files by: held to the
     /// store's end, past the last thread that names a file.
     vault: Option<vault::Held>,
@@ -26000,7 +26019,7 @@ impl Reader {
 
 impl Db {
     /// What the store has done with its cipher since it was opened, or
-    /// nothing for a store that has none (`Options::cipher`).
+    /// nothing for a store that has none (`Encryption::Cipher`).
     pub fn cipher_counts(&self) -> Option<vault::CipherCounts> {
         self.vault.as_ref().map(|h| h.vault().counts())
     }
@@ -26319,23 +26338,26 @@ impl Db {
         check_options(&opts)?;
         let starts_random = opts.read_advice.starts_random();
         std::fs::create_dir_all(dir)?;
-        // Under a key the directory is encrypted before anything is written
-        // into it, or nothing is: a store asked for a key writes no
-        // plaintext. The key is the kernel's from here and is not kept.
-        if let Some(key) = opts.dir_key.take() {
-            dirkey::protect(dir, &key)?;
-        }
-        // Under a cipher the marker is written before anything else, and
-        // from here the engine names its files in a directory only the
+        // The key or the cipher is taken out of the options here and is not
+        // kept in them. Under the kernel's key the directory is encrypted
+        // before anything is written into it, or nothing is: a store asked
+        // for a key writes no plaintext, and the key is the kernel's from
+        // here. Under a cipher the marker is written before anything else,
+        // and from here the engine names its files in a directory only the
         // vault's door finds (`vault`).
-        let held = match opts.cipher.take() {
-            Some(cipher) => {
-                under_cipher(&mut opts);
-                Some(vault::Vault::create(dir, &cipher)?)
-            }
-            None => {
+        let held = match std::mem::take(&mut opts.encryption) {
+            Encryption::None => {
                 vault::refuse_marked(dir)?;
                 None
+            }
+            Encryption::Kernel(key) => {
+                vault::refuse_marked(dir)?;
+                dirkey::protect(dir, &key)?;
+                None
+            }
+            Encryption::Cipher(cipher) => {
+                under_cipher(&mut opts);
+                Some(vault::Vault::create(dir, &cipher)?)
             }
         };
         let decoy = held.as_ref().map(vault::Held::dir);
@@ -26590,25 +26612,30 @@ impl Db {
     /// its first seal, and it opens -- the brief's P-E.
     pub fn open(dir: &Path, mut opts: Options) -> Result<Db> {
         check_options(&opts)?;
-        // Before anything is read: the directory held to the key given, or,
-        // with none, an encrypted directory whose key the kernel does not
+        // Before anything is read, the store held to the way it is asked
+        // to open. Under the kernel's key, the directory held to the key.
+        // With none, an encrypted directory whose key the kernel does not
         // hold refused by name, since its files' names are encrypted too
-        // and it would read as a store of nothing.
-        match opts.dir_key.take() {
-            Some(key) => dirkey::unlock(dir, &key)?,
-            None => dirkey::refuse_locked(dir)?,
-        }
-        // And held to the cipher given: a store under one opens under it
-        // alone, and a cipher given to a store in the clear is refused,
-        // since the store would go on in the clear.
-        let held = match opts.cipher.take() {
-            Some(cipher) => {
-                under_cipher(&mut opts);
-                Some(vault::Vault::open(dir, &cipher)?)
-            }
-            None => {
+        // and it would read as a store of nothing. Under a cipher, the
+        // store held to it: a store under one opens under it alone, and a
+        // cipher given to a store in the clear is refused, since the store
+        // would go on in the clear. And a store under a cipher is refused
+        // where it is given anything else.
+        let held = match std::mem::take(&mut opts.encryption) {
+            Encryption::None => {
+                dirkey::refuse_locked(dir)?;
                 vault::refuse_marked(dir)?;
                 None
+            }
+            Encryption::Kernel(key) => {
+                dirkey::unlock(dir, &key)?;
+                vault::refuse_marked(dir)?;
+                None
+            }
+            Encryption::Cipher(cipher) => {
+                dirkey::refuse_locked(dir)?;
+                under_cipher(&mut opts);
+                Some(vault::Vault::open(dir, &cipher)?)
             }
         };
         let decoy = held.as_ref().map(vault::Held::dir);

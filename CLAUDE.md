@@ -33,8 +33,8 @@ of the change that produced the text.
 | `src/db.rs` | the engine: WAL with atomic batches, memtable, sealed segments, partitioned compaction, tombstones, `Txn`, and the `SegmentWriter` every segment is written by -- `docs/engine.md` |
 | `src/db/zpages.rs` | the compact form's layout: the page, the directory of the groups it holds, the group, the fill that cuts records into groups and packs them into pages, the fence, the trailer and the identity a form file is bound by, with no file, thread or clock in it -- the module's own docs, and `bench/examples/zsize.rs` for what it makes of the engine's bytes |
 | `src/db/zfile.rs` | the compact form's file on the engine's side: the builder that writes a partition's form file from the partition's own bytes, the attach that binds it to its segment by content, the cell a segment holds it in, the point read, the count, the scan walk and the cursor through it, behind `Options::zpages`, and the controller's platform side, the cache budget read from the cgroup and the test's seam for it; the block cache's reads of a covered partition go through it too (`Options::zpages_block_cache`) -- the module's own docs |
-| `src/db/dirkey.rs` | a live store's directory under a key, encrypted by the kernel (`Options::dir_key`): the requests of Linux's file encryption, what `create` and `open` hold a directory to, and `lock`, with no cipher and no byte of a read path in it -- the module's own docs, and `scripts/fscrypt.sh` for a filesystem to test it on |
-| `src/db/vault.rs` | a live store under a cipher the caller supplies (`Options::cipher`): the door every file operation of the engine goes through, which is the standard library's call for a plain store; a store's files as memory files and their envelopes in the directory; the marker and the keys, the caller's wrapping the store's and the store's wrapping a key a file; the manifest's slot and the log's record sealed, with no cipher in the crate -- the module's own docs, `tests/cipher.rs`, and `ZFUZZ_CIPHER=1` for the differential fuzz |
+| `src/db/dirkey.rs` | a live store's directory under a key, encrypted by the kernel (`Encryption::Kernel`): the requests of Linux's file encryption, what `create` and `open` hold a directory to, and `lock`, with no cipher and no byte of a read path in it -- the module's own docs, and `scripts/fscrypt.sh` for a filesystem to test it on |
+| `src/db/vault.rs` | a live store under a cipher the caller supplies (`Encryption::Cipher`): the door every file operation of the engine goes through, which is the standard library's call for a plain store; a store's files as memory files and their envelopes in the directory; the marker and the keys, the caller's wrapping the store's and the store's wrapping a key a file; the manifest's slot and the log's record sealed, with no cipher in the crate -- the module's own docs, `tests/cipher.rs`, and `ZFUZZ_CIPHER=1` for the differential fuzz |
 | `src/db/zselect.rs` | the compact form's selector: `ZSelect::step`, a function of its state and an explicit `Input` (no clock, thread or file), the one definition of the transitions between FITS, SUSPECT, building, COMPACT and the trial, and the replays that hold it -- the module's own docs |
 | `src/format.rs` | the on-disk format's fixed quantities, owned by no writer |
 | `src/block.rs`, `src/index.rs`, `src/flatindex.rs` | the format itself: blocks, extents, the flat key index -- `docs/index-theory.md` |
@@ -1002,7 +1002,7 @@ pass is `size` scans a thread, so an arm four times slower there is
 priced at a hundred thousand.
 
 **A live store under a key is the kernel's, and the engine's part is to
-refuse.** `Options::dir_key` does not encrypt anything: `Db::create` hands
+refuse.** `Encryption::Kernel` does not encrypt anything: `Db::create` hands
 the kernel the key and sets Linux's file-encryption policy on the store's
 empty directory before it writes into it, `Db::open` holds the
 directory's policy to the key it was given, and from there every file
@@ -1063,7 +1063,7 @@ engine in it has been taken in the same two directories, since the
 cipher is the kernel's and its speed is a property of the build.
 
 **A live store under the caller's cipher is the plain engine over memory
-files, and what the engine owes is the door.** `Options::cipher` is the
+files, and what the engine owes is the door.** `Encryption::Cipher` is the
 second way a store is kept under a key, for a caller who brings the cipher
 (`src/db/vault.rs`). It was asked for first and built second: the caller's
 cipher was the plan from the question that started this, the envelope gave
@@ -1073,7 +1073,30 @@ changed. The two are not one feature done twice. The kernel's keeps the
 page cache and wants a filesystem that can encrypt; this one goes wherever
 Linux does, authenticates every byte, leaves files that are ciphertext
 wherever they are copied, and holds the store's plaintext in memory.
-That last is the constraint and not an accident. A store reads by lending
+They are one option with three values (`Options::encryption`:
+`Encryption::None`, `Kernel`, `Cipher`) and were two for a day: a key
+beside a cipher, each an `Option`, with a test on an encrypting filesystem
+that a store under both read as itself. It did, and it was the wrong
+thing to have made possible. A store under both hands the kernel bytes
+that are ciphertext already, so every byte it writes and every byte an
+open reads is encrypted twice for a device that learns nothing more from
+the second, and the two switches read as two layers to be stacked where
+they are two answers to one question. The choice is an enum, a store kept
+one way is refused when it is opened the other (`tests/dirkey.rs` holds
+both refusals, the cipher's inside a directory the kernel encrypts
+already, which is the filesystem's business and stays possible), and the
+test that composed them is gone. The refusal's own first test passed with
+the refusal deleted: the kernel's key opened the directory, the open went
+on, and failed further in at a manifest it could not parse, an error all
+the same and for no reason anyone would recognise. The test asks for the
+refusal's words and a directory left as it was. The rule: two options
+that answer one question are one option; a test that two things compose
+is first asked whether anyone should want them to; and a refusal is
+tested by what it says, since a store that fails later for another reason
+is refused by accident.
+
+That the cipher's way holds the plaintext in memory is the constraint and
+not an accident. A store reads by lending
 from mappings, the cipher is in the process, so the plaintext is the
 process's: each file of the store is a memory file (`memfd_create`),
 written and mapped by the code that writes and maps a plain store's, and

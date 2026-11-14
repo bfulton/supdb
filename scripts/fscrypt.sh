@@ -4,7 +4,7 @@
 #   sudo sh scripts/fscrypt.sh up DIR [OWNER] [SIZE]   # make it and mount it
 #   sudo sh scripts/fscrypt.sh down DIR                # unmount and remove it
 #
-# A store under a key (`Options::dir_key`) asks the kernel to encrypt its
+# A store under a key (`Encryption::Kernel`) asks the kernel to encrypt its
 # directory, which the kernel does on a filesystem made for it: ext4 or f2fs
 # with the `encrypt` feature. A test cannot make one and most temporary
 # directories are not on one, so this makes one in a file: DIR.img, an ext4

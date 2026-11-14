@@ -274,11 +274,11 @@ take `load`, `read` and `scan`, threaded or not; the shuffled load is left
 out for them and a pass that writes is refused by its first update. And a
 store under a key: `supdb-dirkey` is `supdb`, and `supdb-ingestdirkey`
 `supdb-ingest`, with the kernel encrypting the store's directory
-(`Options::dir_key`). Both arms of that pairing stand on a filesystem that
+(`Encryption::Kernel`). Both arms of that pairing stand on a filesystem that
 can encrypt, which `scripts/fscrypt.sh` makes in a file behind a loop
 device, so `ab` names the device at its table's head and its rates are
 read as two arms on one device and not as a disk's. And a store under a
-cipher of the caller's (`Options::cipher`), here AES-256-GCM:
+cipher of the caller's (`Encryption::Cipher`), here AES-256-GCM:
 `supdb-cipher` and `supdb-ingestcipher`. Such a store runs with ordered
 ingest through the log and the compact form off whatever it is asked, so
 it has a twin in the clear with the same two settings, `supdb-cipherbase`

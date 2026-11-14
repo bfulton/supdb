@@ -94,7 +94,7 @@ fn memory_files() -> (usize, usize) {
 }
 
 /// A store under a cipher keeps its files in memory files
-/// (`Options::cipher`), which are the process's until their last
+/// (`Encryption::Cipher`), which are the process's until their last
 /// descriptor and their last mapping go: an open store holds some, and a
 /// closed one none, of either. Called from the one test, since the count is
 /// the process's.
@@ -104,7 +104,7 @@ fn a_closed_store_under_a_cipher_holds_no_memory_file() {
     assert_eq!(memory_files(), (0, 0));
     let cipher = supdb::StoreCipher::new(common::Gcm::new(&[9; 32]), common::Gcm::new);
     let opts = || Options {
-        cipher: Some(cipher.clone()),
+        encryption: supdb::Encryption::Cipher(cipher.clone()),
         seal_bytes: 256 << 10,
         ..Options::default()
     };

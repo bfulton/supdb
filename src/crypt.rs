@@ -8,8 +8,10 @@
 //! an encrypted object with nothing in the format or the readers changed.
 //!
 //! This is for a file that is finished and goes somewhere. A live store
-//! takes a key another way, `Options::dir_key`: the kernel encrypts its
-//! directory, and its reads stay borrows from the page cache.
+//! takes a key one of two other ways (`crate::Encryption`): the kernel
+//! encrypts its directory and its reads stay borrows from the page cache,
+//! or the store seals what it writes under the caller's cipher, as
+//! envelopes of this kind, and holds its plaintext in memory.
 //!
 //! The cipher is the caller's. The crate ships none: `Aead` is the hook, any
 //! authenticated cipher with a twelve-byte nonce and a sixteen-byte tag fits

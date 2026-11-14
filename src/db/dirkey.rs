@@ -12,7 +12,7 @@
 //! Nothing on a read path changes. A page is decrypted once, where the
 //! kernel reads it in, and encrypted where it is written back.
 //!
-//! What a store does with a key (`Options::dir_key`):
+//! What a store does with a key (`Encryption::Kernel`):
 //!
 //! - `Db::create` hands the kernel the key and sets the policy on the
 //!   store's directory before it writes anything into it. A directory that
@@ -487,7 +487,7 @@ pub(crate) fn refuse_locked(dir: &Path) -> Result<()> {
         DirState::Locked => Err(refused(
             dir,
             "the directory is encrypted and its key is not held: open it with \
-             `Options::dir_key`",
+             `Encryption::Kernel`",
         )),
         DirState::Plain | DirState::Unlocked => Ok(()),
     }

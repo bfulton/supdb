@@ -1,4 +1,4 @@
-//! A store under a cipher the caller supplies (`Options::cipher`,
+//! A store under a cipher the caller supplies (`Encryption::Cipher`,
 //! `supdb::db::vault`), under a real one.
 //!
 //! `src/db/vault.rs` holds the layer's own pieces to its unit tests, under a
@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use supdb::{Db, Options, StoreCipher};
+use supdb::{Db, Encryption, Options, StoreCipher};
 
 mod common;
 use common::{kv, vf, Gcm};
@@ -27,7 +27,7 @@ fn cipher(n: u8) -> StoreCipher {
 
 fn under(n: u8) -> Options {
     Options {
-        cipher: Some(cipher(n)),
+        encryption: Encryption::Cipher(cipher(n)),
         ..small()
     }
 }
@@ -292,7 +292,7 @@ fn digest_of_model(model: &BTreeMap<Vec<u8>, Vec<u8>>) -> u64 {
 /// and a log, small enough to open hundreds of times.
 fn tiny(n: u8) -> Options {
     Options {
-        cipher: Some(cipher(n)),
+        encryption: Encryption::Cipher(cipher(n)),
         seal_bytes: 16 << 10,
         partition_bytes: Some(16 << 10),
         l0_trigger: 2,

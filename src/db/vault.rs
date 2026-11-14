@@ -1,4 +1,4 @@
-//! A live store under a cipher the caller supplies (`Options::cipher`).
+//! A live store under a cipher the caller supplies (`Encryption::Cipher`).
 //!
 //! The other way a store is kept under a key is the kernel's
 //! (`crate::dirkey`): there the page cache holds the plaintext and nothing
@@ -132,7 +132,8 @@ type Maker = dyn Fn(&[u8; KEY]) -> Box<DynAead> + Send + Sync;
 ///
 /// ```ignore
 /// let cipher = StoreCipher::new(Gcm::new(&my_key), |k| Gcm::new(k)).key_id(7);
-/// let db = Db::create(dir, Options { cipher: Some(cipher), ..Options::default() })?;
+/// let opts = Options { encryption: Encryption::Cipher(cipher), ..Options::default() };
+/// let db = Db::create(dir, opts)?;
 /// ```
 #[derive(Clone)]
 pub struct StoreCipher {
@@ -376,7 +377,7 @@ pub(crate) fn refuse_marked(dir: &Path) -> Result<()> {
     if dir.join(MARKER).exists() {
         return Err(Error::new(
             ErrorKind::PermissionDenied,
-            "the store is kept under a cipher and none was given (Options::cipher)",
+            "the store is kept under a cipher and none was given (Encryption::Cipher)",
         ));
     }
     Ok(())

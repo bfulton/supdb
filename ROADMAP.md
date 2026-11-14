@@ -152,13 +152,13 @@ What an engine picker would hit, roughly in order.
 - [ ] **Batched point reads (`MultiGet`).** Cheap to add, and a natural new
   benchmark workload.
 - [x] **Encryption at rest for a live store.** A store opens under a key
-  (`Options::dir_key`) and the kernel encrypts its directory: every file
+  (`Encryption::Kernel`) and the kernel encrypts its directory: every file
   it writes is ciphertext on the device and plaintext in the page cache,
   so its reads lend from the mapping as they did (`supdb::dirkey`). It is
   Linux's file encryption, on a filesystem that has it, and it is refused
   anywhere else rather than written in the clear.
 - [x] **A live store under a cipher the caller supplies.** A store opens
-  under a cipher of the caller's (`Options::cipher`) and seals everything
+  under a cipher of the caller's (`Encryption::Cipher`) and seals everything
   it writes to its directory under it: the segments and their indexes as
   envelopes, the log record by record, the manifest slot by slot, and the
   files' names, which stay in the manifest. Its plaintext is held in memory

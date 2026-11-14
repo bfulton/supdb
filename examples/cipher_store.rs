@@ -20,7 +20,7 @@ use ring::aead::{Aad, LessSafeKey, Nonce, Tag, UnboundKey, AES_256_GCM};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use supdb::crypt::{Aead, NONCE, TAG};
-use supdb::{Db, Options, StoreCipher};
+use supdb::{Db, Encryption, Options, StoreCipher};
 
 struct Gcm(LessSafeKey);
 
@@ -55,7 +55,7 @@ impl Aead for Gcm {
 /// directory wants.
 fn under(key: &[u8; 32]) -> Options {
     Options {
-        cipher: Some(StoreCipher::new(Gcm::new(key), Gcm::new).key_id(1)),
+        encryption: Encryption::Cipher(StoreCipher::new(Gcm::new(key), Gcm::new).key_id(1)),
         ..Options::default()
     }
 }
