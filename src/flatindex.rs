@@ -1879,9 +1879,30 @@ impl FlatIndex {
         hash_of: fn(&[u8]) -> u64,
         f: impl FnOnce(&[Ext], &'a [u8]) -> R,
     ) -> Option<R> {
+        self.with_lookup_hashed(sec, key, hash_of(key), f)
+    }
+
+    /// Where in the section the first slot a lookup of hash `h` reads
+    /// lies, for a hint to fetch its line ahead of the lookup; `None` for
+    /// an index whose hash region is not inside the section.
+    #[inline]
+    pub fn slot_pos(&self, sec_len: usize, h: u64) -> Option<usize> {
+        let at = self.hash.0 + ((h as usize) & self.mask) * SLOT;
+        (self.hash.1 <= sec_len && at + SLOT <= self.hash.1).then_some(at)
+    }
+
+    /// `with_lookup` for a key whose hash the caller has already taken, as
+    /// a point read over several sources takes it once for all of them.
+    #[inline]
+    pub fn with_lookup_hashed<'a, R>(
+        &self,
+        sec: &'a [u8],
+        key: &[u8],
+        h: u64,
+        f: impl FnOnce(&[Ext], &'a [u8]) -> R,
+    ) -> Option<R> {
         let hash = sec.get(self.hash.0..self.hash.1)?;
         let recs = sec.get(self.recs.0..self.recs.1)?;
-        let h = hash_of(key);
         let tag = ((h >> 56) | 1) & 0xff;
         let mut s = (h as usize) & self.mask;
         for _ in 0..self.hash_cap {
@@ -1912,8 +1933,17 @@ impl FlatIndex {
         key: &[u8],
         hash_of: fn(&[u8]) -> u64,
     ) -> Option<(Exts<'a>, &'a [u8])> {
+        self.lookup_full_hashed(sec, key, hash_of(key))
+    }
+
+    /// `lookup_full` for a key whose hash the caller has already taken.
+    pub fn lookup_full_hashed<'a>(
+        &self,
+        sec: &'a [u8],
+        key: &[u8],
+        h: u64,
+    ) -> Option<(Exts<'a>, &'a [u8])> {
         let hash = sec.get(self.hash.0..self.hash.1)?;
-        let h = hash_of(key);
         let tag = ((h >> 56) | 1) & 0xff;
         let mut s = (h as usize) & self.mask;
         // Bounded by the table size: a full table would otherwise spin here,

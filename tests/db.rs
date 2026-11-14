@@ -1887,19 +1887,23 @@ struct OrdFixture {
 }
 
 fn ord_fixture(name: &str, shape: OrdShape, via_ord: bool) -> OrdFixture {
-    // The first flush makes the store's partition, whole, under its own
-    // name. The second step is a seal and not a flush: a flush drains, and
-    // a drain merges every piece into its partition, tombstones with them,
-    // where a lone seal leaves its piece beside the partition until
-    // `l0_trigger` of them pile up.
-    let mut db = Db::create(
-        &dir(name),
+    ord_fixture_with(
+        name,
+        shape,
         Options {
             point_via_ord: via_ord,
             ..Options::default()
         },
     )
-    .unwrap();
+}
+
+fn ord_fixture_with(name: &str, shape: OrdShape, opts: Options) -> OrdFixture {
+    // The first flush makes the store's partition, whole, under its own
+    // name. The second step is a seal and not a flush: a flush drains, and
+    // a drain merges every piece into its partition, tombstones with them,
+    // where a lone seal leaves its piece beside the partition until
+    // `l0_trigger` of them pile up.
+    let mut db = Db::create(&dir(name), opts).unwrap();
     let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
     let mut masked = BTreeSet::new();
     let key = |k: u32| ord_key(shape, k);
@@ -2020,6 +2024,82 @@ fn ord_probes(shape: OrdShape) -> Vec<Vec<u8>> {
         v.push(k.to_vec());
     }
     v
+}
+
+/// `Options::read_hash_once` and `Options::read_lines_ahead` change how a
+/// point read hashes its key and what it asks for ahead, and nothing it
+/// returns: the fixture's store -- a partition, a piece with tombstones and
+/// a live table over both -- with a table frozen in a held seal between
+/// the piece and the live table, read with each of the four settings
+/// through the writer and through a handle, answers every probe as the
+/// model does, held and after the seal lands; and the count with it.
+#[test]
+fn a_point_read_hashed_once_answers_as_one_hashed_per_source() {
+    let d = Options::default();
+    assert!(d.read_hash_once && d.read_lines_ahead, "the default");
+    for shape in [
+        OrdShape::Short,
+        OrdShape::Mixed,
+        OrdShape::Wide,
+        OrdShape::Binary,
+    ] {
+        for (once, ahead) in [(true, true), (true, false), (false, true), (false, false)] {
+            let name = format!("hashonce-{shape:?}-{once}-{ahead}");
+            let mut fx = ord_fixture_with(
+                &name,
+                shape,
+                Options {
+                    read_hash_once: once,
+                    read_lines_ahead: ahead,
+                    ..Options::default()
+                },
+            );
+            let key = |k: u32| ord_key(shape, k);
+            // The table the fixture left live, frozen in a seal that does
+            // not land, and a live table over it with tombstones over all
+            // four sources and values after some.
+            fx.db.hold_seal_landing(true);
+            fx.db.seal().unwrap();
+            assert!(fx.db.frozen_tables() >= 1, "{name}: a frozen table");
+            for k in (1u32..4_010).step_by(9) {
+                if k.is_multiple_of(2) {
+                    fx.db.delete(&key(k));
+                    fx.model.insert(key(k), Vec::new());
+                } else {
+                    let v = format!("v4-{k}").into_bytes();
+                    fx.db.append(&key(k), &v);
+                    fx.model.entry(key(k)).or_default().push(v);
+                }
+            }
+            fx.db.commit().unwrap();
+            let show = |p: &[u8]| String::from_utf8_lossy(p).into_owned();
+            let probes = ord_probes(shape);
+            let check = |fx: &OrdFixture, when: &str| {
+                let h = fx.db.reader().unwrap();
+                for p in &probes {
+                    let want = fx.model.get(p).cloned().unwrap_or_default();
+                    assert_eq!(read_vec(&fx.db, p), want, "{name} {when}: {}", show(p));
+                    assert_eq!(
+                        read_vec(&h, p),
+                        want,
+                        "{name} {when}, a handle: {}",
+                        show(p)
+                    );
+                    assert_eq!(
+                        fx.db.count(p).unwrap(),
+                        want.len() as u64,
+                        "{name} {when}: the count of {}",
+                        show(p)
+                    );
+                }
+            };
+            check(&fx, "with the seal held");
+            fx.db.hold_seal_landing(false);
+            fx.db.settle().unwrap();
+            check(&fx, "after the landing");
+            fx.db.close().unwrap();
+        }
+    }
 }
 
 /// The same store read with the option and without answers every key as

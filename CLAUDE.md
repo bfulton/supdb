@@ -4817,6 +4817,29 @@ host class before it is read as the engine's; and a measured room is a
 reading of a moment, so an ask that the next writer will take the room
 from is not made into it.
 
+**A key hashed by every source it was looked up in.** A point read
+consults the partition, each level-0 piece over its range, the frozen
+tables and the live one, and each hashed the key itself, the same FNV a
+byte and a multiply at a time, and only once the source before it had
+been read: the piece's filter probe, its fence and the hash in front of
+it were a fifth of the scrambled D mix's thread at a hundred and three
+hundred thousand keys, the whole of the gap to LMDB, because the
+scrambled write mixes leave a piece below the merge trigger and the
+unscrambled ones leave none. The read takes the index's FNV word once
+and every source's hash from it, and asks for each piece's filter block
+before it reads the partition (`Options::read_hash_once`,
+`Options::read_lines_ahead`). The first shape of the asks also asked for
+the partition's first slot on every read, an ask the lookup followed at
+once: callgrind over the read pass counted it at 44 instructions a read,
+and the pairing read the pass 0.94x for it while the mixes with a piece
+gained a fifth. The rules: a quantity every source derives from the key
+is derived once by the caller; an ask ahead is made only where there is
+work between it and the load it is for, and its instructions are counted
+on the path that has none; and a mix family that leaves a different
+store shape -- a piece standing, a frozen table -- is read for which
+sources its operations consult before its cells are compared with the
+family that leaves none.
+
 ## Standing limitations
 
 These are the engine's, as opposed to refuted predictions. Each is a curve

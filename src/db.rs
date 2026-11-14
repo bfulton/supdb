@@ -1230,6 +1230,44 @@ pub struct Options {
     /// `Blob::lookup_full`, the shape before `Blob::with_lookup` lent them
     /// on the index's frame; kept to price it. `supdb-extsval`.
     pub exts_by_value: bool,
+    /// A point read or a count hashes its key once, the index's FNV word
+    /// (`flatindex::key_hash`), and takes every source's hash from it:
+    /// the memtables' slot (`mem_hash_of`), the partition's index and each
+    /// level-0 piece's index and filter (`BlockedBloom::finalize`). Off,
+    /// each source hashed the key itself, a byte at a time and a multiply
+    /// a byte, three times over a read that met a piece: the scrambled D
+    /// mix, which reads the newest inserts in a store the scrambled write
+    /// mixes left a piece in, put a fifth of its thread on the piece's
+    /// `may_hold` at a hundred and three hundred thousand keys, where the
+    /// unscrambled D, with no piece, put a twenty-fifth. Paired on the
+    /// buffered arm, both options against neither, two sittings of eight
+    /// pairs in both orders at a hundred and three hundred thousand keys,
+    /// the scrambled D read 1.24-1.37x in the second sitting, the
+    /// scrambled B, C and F 1.07-1.25x, D 1.12-1.30x and the read pass
+    /// level to 1.14x, with the loads and scans the options cannot reach
+    /// leaning the other way where they leaned. The first sitting, with
+    /// the partition's slot asked for on every read, read the read pass
+    /// at 0.94x at three hundred thousand keys, which callgrind put at 44
+    /// instructions a read (`read_lines_ahead`). `supdb-readhashes` and
+    /// `supdb-ingestreadhashes` hash per source.
+    pub read_hash_once: bool,
+    /// A point read or a count asks for the lines its later sources'
+    /// first probes will load as soon as it has the key's hash, before it
+    /// reads the earlier ones: each level-0 piece's filter block
+    /// (`BlockedBloom::prefetch_fnv`), beside the memtable's slot it asked
+    /// for already, so the filter's miss overlaps the partition's read
+    /// where it was taken after it; and the partition's first hash slot
+    /// (`Blob::prefetch_slot`) only where the tombstone pass reads the
+    /// newer sources first, since with no pass the lookup follows the ask
+    /// at once and the ask was 44 instructions a read of the read pass
+    /// for nothing (callgrind over `bench/examples/read_only.rs` at three
+    /// hundred thousand keys). Taken away alone on the buffered arm, two
+    /// sittings of eight pairs at three hundred thousand keys, D read
+    /// 0.90-0.95x without it in both and the scrambled D 0.95-0.97x, the
+    /// read pass and the cells with no piece level. Needs
+    /// `read_hash_once`, whose word names the lines. `supdb-readnoahead`
+    /// and `supdb-ingestreadnoahead` ask for the memtable's slot alone.
+    pub read_lines_ahead: bool,
     /// EXPERIMENT: a point read of a partition whose ordered index holds
     /// whole keys (`OrdIndex::uniform`: every key one length, no longer
     /// than the common prefix and eight bytes) finds its rank through the
@@ -2739,7 +2777,14 @@ pub struct Options {
     /// at three hundred thousand keys, where the store is past the
     /// cache, the lag passes read 0.80-0.93x and E 0.97x without them,
     /// 12/12 and 11/12. So they stay; `supdb-noprefetch` and
-    /// `supdb-ingestnoprefetch` are the arm that priced them.
+    /// `supdb-ingestnoprefetch` are the arm that priced them. The scrambled
+    /// E mix's profile puts a sixth of its thread on the prefetch's own
+    /// instructions at thirty thousand keys, three times the unscrambled
+    /// E's, and those samples are the lines arriving: without the prefetch
+    /// the buffered arm read the scrambled E 0.84x and 0.95x there and
+    /// 0.69x and 0.65x at three hundred thousand, E 0.83x and 0.82x and the
+    /// threaded scans beside the mixes 0.75x at the larger store (`pair.sh
+    /// supdb-ingest supdb-ingestnoprefetch 300000 --reps 8`, at `c703ab1`).
     pub scan_prefetch: bool,
     /// How far into the partition's records a walk's prefetch reaches,
     /// in bytes from the walk's first record: the lines are asked for at
@@ -3188,8 +3233,17 @@ pub struct Options {
     /// without them and its ten-percent burst at ten thousand 0.86x and
     /// 0.84x, with the passes after level (`pair.sh supdb-ingestsettlelate
     /// supdb-ingest 30000 --passes load,lag --reps 16`, at `84d4ce4`).
-    /// `supdb-settlesmall` and `supdb-ingestsettlesmall` file at the write
-    /// whatever the store's size.
+    /// Paired against the default at every rung of the quick scale, the
+    /// gate gave back what the filing costs and took what it buys: the
+    /// buffered arm's A and F read 1.04-1.18x and the one-percent burst
+    /// 1.06-1.23x, and E 0.76-0.94x in both orders at ten, thirty, a
+    /// hundred and three hundred thousand keys, the durable arm's E 0.87x
+    /// and 0.89x at three hundred thousand (`pair.sh supdb-ingest
+    /// supdb-ingestsettlegated SIZE --reps 8`, and `supdb
+    /// supdb-settlegated`, at `200bbd5`). The cells it buys stand two and
+    /// three times the comparators' but for the bursts at ten and thirty
+    /// thousand; E is a cell the comparators contest at every rung. Off;
+    /// `supdb-settlegated` and `supdb-ingestsettlegated` turn it on.
     #[doc(hidden)]
     pub forms_settle_past_llc: bool,
     /// What "the group's refaults hold still" is for `forms_settle_builds`'s
@@ -5171,6 +5225,13 @@ pub struct Options {
     /// device inside the pass -- the background threads read about a
     /// gigabyte in the slow read passes and 0.4 in the fast -- while the
     /// load had left a few hundred megabytes of raw records in the cache.
+    /// Run beside the default in one process (`bench ab --arms
+    /// supdb,supdb-zhotresident --size 10000000 --bound 1342177280 --passes
+    /// load,read,read-threaded,scan,scan-threaded,mixes --ops-div 10 --reps
+    /// 6`, at `84d4ce4`) the read pass read in two shapes under both arms,
+    /// 3.1-3.3 s or 4.4-5.4, the default in its fast shape once in six and
+    /// the arm three times, with the same seven to ten partitions released
+    /// a pass: the order of the asks does not decide the shape. Off;
     /// `supdb-zhotresident` turns it on.
     #[doc(hidden)]
     pub zpages_hot_fill_resident_first: bool,
@@ -5350,7 +5411,13 @@ pub struct Options {
     /// the form files whole in some reps and 48-180 MB of 543 short in
     /// others, and those took 28,000-41,000 major faults against 4,000-
     /// 7,000, a 4 KB fault for each cold page under the random advice.
-    /// `supdb-zrewarminstall` turns it on.
+    /// The rewarm it makes due found every form file resident at the
+    /// install (`of_all 1.000` on the `zrewarm` line) in six traced reps
+    /// of six, the slow ones among them, so the cold pages are the pass's
+    /// own churn and not the install's; paired in the row's whole order the
+    /// read pass read 0.97x and 1.01x (`pair.sh supdb supdb-zrewarminstall
+    /// 10000000 --bound 1342177280 --ops-div 10 --reps 4`, at `6694659`).
+    /// Off; `supdb-zrewarminstall` turns it on.
     #[doc(hidden)]
     pub zpages_rewarm_at_install: bool,
     /// The stretch without a scan after which the scans that come back
@@ -5449,6 +5516,8 @@ impl Default for Options {
             writer_pins: true,
             asym_pins: false,
             exts_by_value: false,
+            read_hash_once: true,
+            read_lines_ahead: true,
             point_via_ord: false,
             zpages: ZPages::Auto,
             zpages_min_bytes: zfile::ZMIN_RECS,
@@ -6601,6 +6670,13 @@ impl BlockedBloom {
     /// `maybe_contains` for a key whose hash (`BlockedBloom::hash`) the
     /// caller has: a point read through a form file hashes its key once
     /// for the key table and for this.
+    /// `maybe_contains` for a key whose FNV word (`key_hash`) the caller
+    /// has (`Options::read_hash_once`).
+    #[inline]
+    fn maybe_contains_fnv(&self, fnv: u64) -> bool {
+        self.maybe_contains_hash(BlockedBloom::finalize(fnv))
+    }
+
     #[inline]
     fn maybe_contains_hash(&self, h: u64) -> bool {
         let (bi, probes) = self.slots_of(h);
@@ -10577,6 +10653,33 @@ impl Seg {
         self.bloom.as_ref().is_none_or(|b| b.maybe_contains(key))
     }
 
+    /// `may_hold` for a key whose FNV word (`flatindex::key_hash`) the
+    /// caller has taken (`Options::read_hash_once`).
+    #[inline]
+    fn may_hold_fnv(&self, key: &[u8], fnv: u64) -> bool {
+        if self.below_lo(key) {
+            return false;
+        }
+        if self.hi.as_ref().is_some_and(|h| key >= h.as_slice()) {
+            return false;
+        }
+        self.bloom
+            .as_ref()
+            .is_none_or(|b| b.maybe_contains_fnv(fnv))
+    }
+
+    /// A hint to fetch the lines a point read of the key with FNV word
+    /// `fnv` will load first here: the filter's block, where the segment
+    /// has a filter, else the index's first hash slot
+    /// (`Options::read_lines_ahead`). Nothing is read.
+    #[inline]
+    fn prefetch_probe(&self, fnv: u64) {
+        match &self.bloom {
+            Some(b) => b.prefetch_fnv(fnv),
+            None => self.raw().prefetch_slot(fnv),
+        }
+    }
+
     /// Could this segment hold anything at or after `from`?
     #[inline]
     fn may_reach(&self, from: &[u8]) -> bool {
@@ -10916,11 +11019,15 @@ const SEE_ALL: u64 = u64::MAX;
 fn mem_hash(key: &[u8]) -> u64 {
     // FNV-1a, then a splitmix finish; the std SipHash was part of what the
     // memtable's decomposition priced.
-    let mut h = 0xcbf29ce484222325u64;
-    for &b in key {
-        h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
-    }
-    h = (h ^ (h >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    mem_hash_of(crate::flatindex::key_hash(key))
+}
+
+/// The memtable's hash from the key's FNV word (`flatindex::key_hash`), the
+/// word the segments' indexes and filters are hashed from too, so a read
+/// over every source hashes the key once (`Options::read_hash_once`).
+#[inline]
+fn mem_hash_of(fnv: u64) -> u64 {
+    let h = (fnv ^ (fnv >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
     h | 1 // 0 marks a vacant slot
 }
 
@@ -13316,7 +13423,11 @@ impl MemTable {
     /// while the line comes in. At thirty million keys the slot and the
     /// entry behind it are both misses, and this hides the first.
     fn prefetch(&self, key: &[u8]) -> u64 {
-        let hash = mem_hash(key);
+        self.prefetch_hashed(mem_hash(key))
+    }
+
+    /// `prefetch` for a key whose hash (`mem_hash`) the caller has.
+    fn prefetch_hashed(&self, hash: u64) -> u64 {
         if let Some(idx) = self.index() {
             let i = (hash as usize) & idx.mask;
             prefetch_lines(idx.slots[i..].as_ptr() as *const u8, 64);
@@ -23163,11 +23274,52 @@ impl Reader {
         let st = self.state();
         let (segs, mem) = (&st.segs, &*st.mem);
         let mem_empty = mem.is_empty();
-        let hash = if mem_empty { 0 } else { mem.prefetch(key) };
+        // The key's FNV word once, every source's hash taken from it
+        // (`Options::read_hash_once`); zero where each source hashes.
+        let once = self.opts.read_hash_once;
+        let fnv = if once {
+            crate::flatindex::key_hash(key)
+        } else {
+            0
+        };
+        let mem_h = |k: &[u8]| if once { mem_hash_of(fnv) } else { mem_hash(k) };
+        let hash = if mem_empty {
+            0
+        } else {
+            mem.prefetch_hashed(mem_h(key))
+        };
         let np = segs.partition_point(|s| s.level > 0);
         let at = segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
-        let part = segs[..np].get(at).filter(|s| s.may_hold(key));
+        let holds = |s: &Seg| {
+            if once {
+                s.may_hold_fnv(key, fnv)
+            } else {
+                s.may_hold(key)
+            }
+        };
+        let part = segs[..np].get(at).filter(|s| holds(s));
         let l0 = st.pieces_over(np, at);
+        // The form's dispatch under either option that may serve the
+        // partition, and only with the gate at the form (below).
+        let part_z = self.opts.zpages != ZPages::Off && self.z_on();
+        // The first lines the later sources' probes load, asked for before
+        // the earlier ones are read (`Options::read_lines_ahead`): each
+        // piece's filter block, which the partition's read is the lead
+        // for, and the partition's first hash slot only where the
+        // tombstone pass reads the newer sources ahead of it -- with no
+        // pass the lookup follows the ask at once, and the ask was 44
+        // instructions a read of the read pass for nothing.
+        let tombs = st.has_tombstones();
+        if once && self.opts.read_lines_ahead && (!l0.is_empty() || tombs) {
+            for seg in l0 {
+                seg.prefetch_probe(fnv);
+            }
+            if !part_z && tombs {
+                if let Some(seg) = part {
+                    seg.raw().prefetch_slot(fnv);
+                }
+            }
+        }
         if np == 0 {
             self.count_unshaped();
         }
@@ -23185,7 +23337,7 @@ impl Reader {
         let fr_ix = 1 + l0.len();
         let mem_ix = fr_ix + st.frozen.len();
         let mut start = 0usize;
-        if st.has_tombstones() {
+        if tombs {
             if !mem_empty {
                 if let Some(e) = mem.get_with(hash, key, self.len_bound.get()) {
                     if mem.has_tomb(e, self.wm()) {
@@ -23198,7 +23350,7 @@ impl Reader {
                 // tombstone is the cut.
                 for (i, fr) in st.frozen.iter().enumerate().rev() {
                     if fr
-                        .get(key, MemTable::ALL)
+                        .get_with(mem_h(key), key, MemTable::ALL)
                         .is_some_and(|e| fr.has_tomb(e, SEE_ALL))
                     {
                         start = fr_ix + i;
@@ -23208,10 +23360,15 @@ impl Reader {
             }
             if start == 0 {
                 for (i, seg) in l0.iter().enumerate().rev() {
-                    if !seg.tombs || !seg.may_hold(key) {
+                    if !seg.tombs || !holds(seg) {
                         continue;
                     }
-                    if let Some(exts) = seg.raw().lookup(key) {
+                    let exts = if once {
+                        seg.raw().lookup_hashed(key, fnv)
+                    } else {
+                        seg.raw().lookup(key)
+                    };
+                    if let Some(exts) = exts {
                         if exts.iter().any(|e| e.is_tombstone()) {
                             start = 1 + i;
                             break;
@@ -23227,6 +23384,8 @@ impl Reader {
         let seg_read = |seg: &Seg, f: &mut F| {
             if by_value {
                 seg.raw().read_all_by_value(key, f)
+            } else if once {
+                seg.raw().read_all_hashed(key, fnv, f)
             } else {
                 seg.raw().read_all(key, f)
             }
@@ -23244,7 +23403,7 @@ impl Reader {
                 // the raw read. The dispatch asked for `Always` here for as
                 // long as only `Always` was tested through it: a store
                 // under `Auto` in COMPACT read every key raw.
-                if self.opts.zpages != ZPages::Off && self.z_on() {
+                if part_z {
                     // The partition from its form file, or from the raw form
                     // and counted where it has none in service.
                     n += self.part_read_z(seg, key, &mut f, seg_read)?;
@@ -23265,7 +23424,7 @@ impl Reader {
             }
         }
         for (i, seg) in l0.iter().enumerate() {
-            if 1 + i < start || !seg.may_hold(key) {
+            if 1 + i < start || !holds(seg) {
                 continue;
             }
             n += seg_read(seg, &mut f)?;
@@ -23274,7 +23433,7 @@ impl Reader {
             if fr_ix + i < start {
                 continue;
             }
-            if let Some(e) = fr.get(key, MemTable::ALL) {
+            if let Some(e) = fr.get_with(mem_h(key), key, MemTable::ALL) {
                 let (offs, _) = fr.live_chain(e, SEE_ALL);
                 n += offs.len() as u64;
                 for off in offs {
@@ -30449,15 +30608,56 @@ impl Reader {
         let st = self.state();
         let (segs, mem) = (&st.segs, &*st.mem);
         let mem_empty = mem.is_empty();
-        let hash = if mem_empty { 0 } else { mem.prefetch(key) };
+        // One hash for every source and their first lines asked for
+        // together, as the read takes them (`Options::read_hash_once`,
+        // `Options::read_lines_ahead`).
+        let once = self.opts.read_hash_once;
+        let fnv = if once {
+            crate::flatindex::key_hash(key)
+        } else {
+            0
+        };
+        let mem_h = |k: &[u8]| if once { mem_hash_of(fnv) } else { mem_hash(k) };
+        let hash = if mem_empty {
+            0
+        } else {
+            mem.prefetch_hashed(mem_h(key))
+        };
         let np = segs.partition_point(|s| s.level > 0);
         let at = segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
-        let part = segs[..np].get(at).filter(|s| s.may_hold(key));
+        let holds = |s: &Seg| {
+            if once {
+                s.may_hold_fnv(key, fnv)
+            } else {
+                s.may_hold(key)
+            }
+        };
+        let raw_count = |s: &Seg| {
+            if once {
+                s.raw().count_hashed(key, fnv)
+            } else {
+                s.raw().count(key)
+            }
+            .map_err(|e| err(&format!("segment count: {e}")))
+        };
+        let part = segs[..np].get(at).filter(|s| holds(s));
         let l0 = st.pieces_over(np, at);
+        let part_z = self.opts.zpages != ZPages::Off && self.z_on();
+        let tombs = st.has_tombstones();
+        if once && self.opts.read_lines_ahead && (!l0.is_empty() || tombs) {
+            for seg in l0 {
+                seg.prefetch_probe(fnv);
+            }
+            if !part_z && tombs {
+                if let Some(seg) = part {
+                    seg.raw().prefetch_slot(fnv);
+                }
+            }
+        }
         let fr_ix = 1 + l0.len();
         let mem_ix = fr_ix + st.frozen.len();
         let mut start = 0usize;
-        if st.has_tombstones() {
+        if tombs {
             if !mem_empty {
                 if let Some(e) = mem.get_with(hash, key, self.len_bound.get()) {
                     if mem.has_tomb(e, self.wm()) {
@@ -30470,7 +30670,7 @@ impl Reader {
                 // tombstone is the cut.
                 for (i, fr) in st.frozen.iter().enumerate().rev() {
                     if fr
-                        .get(key, MemTable::ALL)
+                        .get_with(mem_h(key), key, MemTable::ALL)
                         .is_some_and(|e| fr.has_tomb(e, SEE_ALL))
                     {
                         start = fr_ix + i;
@@ -30480,10 +30680,15 @@ impl Reader {
             }
             if start == 0 {
                 for (i, seg) in l0.iter().enumerate().rev() {
-                    if !seg.tombs || !seg.may_hold(key) {
+                    if !seg.tombs || !holds(seg) {
                         continue;
                     }
-                    if let Some(exts) = seg.raw().lookup(key) {
+                    let exts = if once {
+                        seg.raw().lookup_hashed(key, fnv)
+                    } else {
+                        seg.raw().lookup(key)
+                    };
+                    if let Some(exts) = exts {
                         if exts.iter().any(|e| e.is_tombstone()) {
                             start = 1 + i;
                             break;
@@ -30497,30 +30702,24 @@ impl Reader {
             if let Some(seg) = part {
                 // As the read's dispatch: the gate asked here, so that the
                 // raw gate takes the raw count without the call.
-                if self.opts.zpages != ZPages::Off && self.z_on() {
+                if part_z {
                     n += self.part_count_z(seg, key)?;
                 } else {
-                    n += seg
-                        .raw()
-                        .count(key)
-                        .map_err(|e| err(&format!("segment count: {e}")))?;
+                    n += raw_count(seg)?;
                 }
             }
         }
         for (i, seg) in l0.iter().enumerate() {
-            if 1 + i < start || !seg.may_hold(key) {
+            if 1 + i < start || !holds(seg) {
                 continue;
             }
-            n += seg
-                .raw()
-                .count(key)
-                .map_err(|e| err(&format!("segment count: {e}")))?;
+            n += raw_count(seg)?;
         }
         for (i, fr) in st.frozen.iter().enumerate() {
             if fr_ix + i < start {
                 continue;
             }
-            if let Some(e) = fr.get(key, MemTable::ALL) {
+            if let Some(e) = fr.get_with(mem_h(key), key, MemTable::ALL) {
                 n += u64::from(e.count);
             }
         }
@@ -45070,8 +45269,7 @@ impl Maint {
         // The form installed is the form every read is served from, so its
         // files' cold pages are asked for now and not a fault at a time
         // under the reads (`Options::zpages_rewarm_at_install`).
-        if self.opts.zpages_rewarm_at_install && matches!(d.event, Some(zselect::Event::Install))
-        {
+        if self.opts.zpages_rewarm_at_install && matches!(d.event, Some(zselect::Event::Install)) {
             self.z_rewarm_due = true;
             self.z_rewarm_whole = true;
         }
