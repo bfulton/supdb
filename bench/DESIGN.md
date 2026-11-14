@@ -653,6 +653,10 @@ tombstone, a lone source's too (`Options::emit_lone_unsearched`), and
 `supdb-widewalks` and `supdb-ingestwidewalks` walk a block wide by its
 count of keys past the end for as long as it is, where the default copies
 it once its walks have paid (`Options::forms_copy_hot_wide`);
+`supdb-pacesyncsbatch` holds a syncing commit's paced batch within the
+share or the batch, the larger, where the default holds a batch of a
+twentieth of the store or more within the share alone
+(`Options::upkeep_pace_syncs_to_share`);
 `supdb-zhotresident` is `supdb` with the hot-raw fill asking for the
 partitions the reads have not skewed by how much of their records the cache
 holds, most first (`Options::zpages_hot_fill_resident_first`);

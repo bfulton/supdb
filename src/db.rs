@@ -3573,6 +3573,29 @@ pub struct Options {
     /// lends unpaced, the shape before: `supdb-nopacesyncs`.
     #[doc(hidden)]
     pub upkeep_pace_syncs_bp: usize,
+    /// A syncing commit's paced batch held until the thread trails by the
+    /// share alone, where it was the share or the batch, whichever is
+    /// larger: the batch term lets a writer run a batch ahead of a thread
+    /// that has no barrier to file beside, and a syncing commit's thread
+    /// files through the fsync. Where a batch is more than the share --
+    /// stores under about four hundred thousand keys, whose share is under
+    /// the suite's thousand-write batch -- the last batch of a burst was the
+    /// first scan's to wait out: the ten-percent burst at ten thousand keys
+    /// is one commit of a thousand, filed in one pass of 0.6-0.9 ms beside
+    /// an fsync of a few tenths, and the first scan waited up to half a
+    /// millisecond of it in a pass LMDB runs in a quarter of one. Held to
+    /// the share, that pass read 1.50x and 1.77x in two orders and the
+    /// burst 0.78x, ahead of both comparators still; at a hundred thousand
+    /// keys, where a batch is a hundredth of the store and the pass after a
+    /// burst ten times as long, the bursts paid 11-25% for passes won
+    /// already. So the hold is to the share only for a batch of at least a
+    /// twentieth of the store's keys (`PACE_SYNCS_SHARE_FROM`), where the
+    /// leftover is the pass after it, and of at most a couple of thousand
+    /// writes (`PACE_SYNCS_SHARE_MAX_BATCH`), so the writer waits out a
+    /// millisecond or two of filing and never a large batch's whole. Off
+    /// holds within the batch, the shape before (`supdb-pacesyncsbatch`).
+    #[doc(hidden)]
+    pub upkeep_pace_syncs_to_share: bool,
     /// "In core" for `upkeep_pace_syncs_bp` is every gate but the compact
     /// form's: the pace holds through the controller's census and stops
     /// once the form is installed. The census is entered on the group's
@@ -5837,6 +5860,7 @@ impl Default for Options {
             upkeep_inline_min: UPKEEP_WAKE_WRITES,
             upkeep_pace_pct: 1,
             upkeep_pace_syncs_bp: 25,
+            upkeep_pace_syncs_to_share: true,
             upkeep_pace_syncs_census: true,
             out_of_core_installed: false,
             upkeep_settle_after_scans: true,
@@ -37554,6 +37578,18 @@ const UPKEEP_POLL_MAX: std::time::Duration = std::time::Duration::from_millis(20
 /// `Options::upkeep_alert_poll_us`.
 const UPKEEP_ALERT: std::time::Duration = std::time::Duration::from_millis(100);
 const UPKEEP_WAKE_WRITES: usize = 256;
+
+/// A syncing commit's paced batch is held to the share alone where the
+/// batch times this is at least the store's keys -- a batch of a twentieth
+/// of the store or more (`Options::upkeep_pace_syncs_to_share`).
+const PACE_SYNCS_SHARE_FROM: u64 = 20;
+
+/// The largest batch held to the share alone: the hold waits out the
+/// thread's filing of the batch, under a microsecond a write in core, so a
+/// batch of this many is a millisecond or two of it, and a larger one is
+/// left a batch behind as before rather than holding the writer for its
+/// whole filing (`Options::upkeep_pace_syncs_to_share`).
+const PACE_SYNCS_SHARE_MAX_BATCH: usize = 2048;
 /// The steps a pass on the upkeep thread reads and settles in where it
 /// yields (`Options::upkeep_yields`): entries of the live log a step, and
 /// writes of the frozen tables' carried tails a step. A step is what a
@@ -38200,6 +38236,7 @@ impl Db {
         // `Options::upkeep_inline_min` for where "worth waking for" is
         // drawn.
         let mut pace = false;
+        let mut pace_syncs = false;
         // The share of the store's keys a paced batch is within and the
         // thread may trail by (`Options::upkeep_pace_pct`).
         let mut share = (keys as u64).saturating_mul(self.opts.upkeep_pace_pct as u64) / 100;
@@ -38242,6 +38279,7 @@ impl Db {
         {
             share = (keys as u64).saturating_mul(self.opts.upkeep_pace_syncs_bp as u64) / 10_000;
             pace = true;
+            pace_syncs = true;
         }
         // A smaller batch with a scan since the last commit: the scans
         // behind it take the batch back before the thread's first poll,
@@ -38364,7 +38402,19 @@ impl Db {
         // the thread at three million keys against 1.5 of filing, and
         // the writer waited for all of it.
         if pace && self.upkeep_hand == Hand::Lend {
-            self.upkeep_hand = Hand::Pace(share.max(batch as u64));
+            // A syncing batch within the share alone: its thread filed it
+            // beside the fsync, and what is left is the first scan's to wait
+            // for otherwise (`Options::upkeep_pace_syncs_to_share`).
+            let within = if pace_syncs
+                && self.opts.upkeep_pace_syncs_to_share
+                && batch as u64 * PACE_SYNCS_SHARE_FROM >= keys as u64
+                && batch <= PACE_SYNCS_SHARE_MAX_BATCH
+            {
+                share
+            } else {
+                share.max(batch as u64)
+            };
+            self.upkeep_hand = Hand::Pace(within);
         }
     }
 

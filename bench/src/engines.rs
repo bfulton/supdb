@@ -1204,6 +1204,10 @@ pub struct Supdb {
     /// (`Options::forms_copy_hot_wide` off): `supdb-widewalks` and
     /// `supdb-ingestwidewalks`.
     widewalks: bool,
+    /// A syncing commit's paced batch held within the share or the batch,
+    /// the larger (`Options::upkeep_pace_syncs_to_share` off):
+    /// `supdb-pacesyncsbatch`.
+    pacesyncsbatch: bool,
     /// EXPERIMENT: the deltas from which the upkeep thread converts a sparse
     /// form the walks have read `CONVREADS` entries of to a copy
     /// (`Options::forms_convert_from`, `forms_convert_reads`), from
@@ -2350,6 +2354,8 @@ struct Policy {
     lonetombs: bool,
     /// A hot wide block walked wide: `...widewalks`.
     widewalks: bool,
+    /// Syncing batches held within the batch: `supdb-pacesyncsbatch`.
+    pacesyncsbatch: bool,
     /// A filed burst's builds in the commit: `...settlebuildsfiled`.
     settlebuildsfiled: bool,
     /// The walk's own decodes: `supdb-zwalkowns`.
@@ -2783,6 +2789,7 @@ impl Default for Policy {
             widefull: false,
             lonetombs: false,
             widewalks: false,
+            pacesyncsbatch: false,
             settlebuildsfiled: false,
             zwalkowns: false,
             zviewperopen: false,
@@ -8215,6 +8222,7 @@ impl Supdb {
             widefull,
             lonetombs,
             widewalks,
+            pacesyncsbatch,
             settlebuildsfiled,
             zwalkowns,
             zviewperopen,
@@ -8788,6 +8796,7 @@ impl Supdb {
             scan_wide_capped: !widefull,
             emit_lone_unsearched: !lonetombs,
             forms_copy_hot_wide: !widewalks,
+            upkeep_pace_syncs_to_share: !pacesyncsbatch,
             forms_settle_builds_filed: settlebuildsfiled,
             zpages_rewarm_quiet_ms: if zrewarmwait {
                 supdb::db::REWARM_QUIET_BEFORE_MS
@@ -9085,6 +9094,7 @@ impl Supdb {
             widefull,
             lonetombs,
             widewalks,
+            pacesyncsbatch,
             settlebuildsfiled,
             zwalkowns,
             zviewperopen,
@@ -9786,6 +9796,9 @@ impl Engine for Supdb {
             } else {
                 "supdb-ingestwidefull"
             };
+        }
+        if self.pacesyncsbatch {
+            return "supdb-pacesyncsbatch";
         }
         if self.widewalks {
             return if self.partition {
@@ -11977,6 +11990,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestlonetombs"
         | "supdb-widewalks"
         | "supdb-ingestwidewalks"
+        | "supdb-pacesyncsbatch"
         | "supdb-settlebuildsfiled"
         | "supdb-ingestsettlebuildsfiled"
         | "supdb-ingestpromote"
@@ -12590,6 +12604,18 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         partition: false,
                         durable: false,
                         lonetombs: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-pacesyncsbatch" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        pacesyncsbatch: true,
                         ..Policy::default()
                     },
                 )
@@ -15359,6 +15385,20 @@ mod tests {
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.scan_wide_capped && b.scan_wide_capped);
                 assert!(o.emit_lone_unsearched);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("pacesyncsbatch"),
+                    Policy {
+                        pacesyncsbatch: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-pacesyncsbatch");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.upkeep_pace_syncs_to_share && b.upkeep_pace_syncs_to_share);
             }
             {
                 let z = Supdb::with_policy(
