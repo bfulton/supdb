@@ -7616,6 +7616,9 @@ fn a_hot_wide_block_is_copied_and_kept_past_the_bound() {
             partition_bytes: Some(2 << 10),
             scan_block_cache: true,
             forms_copy_hot_wide: on,
+            // The walk at which the copy pays by the fixed ratio; the
+            // priced rule has a test of its own.
+            forms_copy_wide_priced: false,
             ..Options::default()
         };
         let mut db = Db::create(&d, opts).unwrap();
@@ -7680,6 +7683,81 @@ fn a_hot_wide_block_is_copied_and_kept_past_the_bound() {
         } else {
             assert_eq!(db.block_cache_wide(), 1, "{state}: still wide");
         }
+    }
+}
+
+/// A hot wide block's copy is bought once the keys its earlier walks
+/// merged reach the entries the copy will merge, every source's run over
+/// the block and its records (`Options::forms_copy_wide_priced`): six
+/// hundred keys past the end and the block's eight records are 608
+/// entries, a scan of fifty from the tail merges fifty, and the fourteenth
+/// walk copies -- the keys all in the live table, or half of them in a
+/// frozen table under it, where the largest source's run alone would have
+/// copied at the eighth. The fixed ratio copies at the eighth
+/// (`a_hot_wide_block_is_copied_and_kept_past_the_bound`).
+#[test]
+fn a_hot_wide_blocks_copy_is_bought_once_its_walks_have_paid() {
+    for frozen in [false, true] {
+        let d = dir(&format!("wide-priced-{frozen}"));
+        let opts = Options {
+            seal_bytes: 1 << 26,
+            partition_bytes: Some(2 << 10),
+            scan_block_cache: true,
+            ..Options::default()
+        };
+        assert!(opts.forms_copy_hot_wide && opts.forms_copy_wide_priced);
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in (0..600).step_by(3) {
+            m.append(&mut db, &key(k), &format!("p{k}"));
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        let tail = |k: u32| format!("key-00600x{k:04}");
+        // An update first in each table, so the inserts past the end go to
+        // the hash table and open no direct run.
+        m.append(&mut db, &key(3), "u");
+        let split = if frozen { 300 } else { 600 };
+        for k in 0..split {
+            m.append(&mut db, &tail(k), "t");
+        }
+        db.commit().unwrap();
+        if frozen {
+            db.hold_seal_landing(true);
+            db.seal().unwrap();
+            assert_eq!(db.frozen_tables(), 1, "the frozen table");
+            m.append(&mut db, &key(6), "u");
+            for k in split..600 {
+                m.append(&mut db, &tail(k), "t");
+            }
+            db.commit().unwrap();
+        }
+        let state = format!("priced, frozen {frozen}");
+        let copies_at = 14;
+        for walk in 1..=copies_at {
+            let (_, recopies, _) = db.build_kinds();
+            assert_eq!(recopies, 0, "{state}: no copy before walk {walk}");
+            if walk > 1 {
+                assert_eq!(db.block_cache_wide(), 1, "{state}: wide before walk {walk}");
+            }
+            m.check_one(&db, tail(walk * 7).as_bytes(), 50, &state);
+        }
+        let (_, recopies, _) = db.build_kinds();
+        assert_eq!(recopies, 1, "{state}: copied at walk {copies_at}");
+        assert_eq!(db.block_cache_wide(), 0, "{state}: and no longer wide");
+        assert_eq!(
+            db.wide_walks(),
+            u64::from(copies_at) - 1,
+            "{state}: the walks before the copy"
+        );
+        m.check(&db, &format!("{state}, after the copy"));
+        if frozen {
+            db.hold_seal_landing(false);
+            db.settle().unwrap();
+        }
+        held(&db, 0);
     }
 }
 

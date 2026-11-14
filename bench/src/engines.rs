@@ -1233,6 +1233,10 @@ pub struct Supdb {
     /// (`Options::forms_copy_hot_wide` off): `supdb-widewalks` and
     /// `supdb-ingestwidewalks`.
     widewalks: bool,
+    /// A hot wide block copied at the walk the fixed ratio of a walk to a
+    /// hundred copied keys names (`Options::forms_copy_wide_priced` off):
+    /// `supdb-widecopyfixed` and `supdb-ingestwidecopyfixed`.
+    widecopyfixed: bool,
     /// A syncing commit's paced batch held within the share or the batch,
     /// the larger (`Options::upkeep_pace_syncs_model` and
     /// `upkeep_pace_syncs_to_share` off): `supdb-pacesyncsbatch`.
@@ -2391,6 +2395,8 @@ struct Policy {
     lonetombs: bool,
     /// A hot wide block walked wide: `...widewalks`.
     widewalks: bool,
+    /// A hot wide block copied by the fixed ratio: `...widecopyfixed`.
+    widecopyfixed: bool,
     /// Syncing batches held within the batch: `supdb-pacesyncsbatch`.
     pacesyncsbatch: bool,
     /// The syncing pace by cut-offs: `supdb-pacesyncsthresholds`.
@@ -2830,6 +2836,7 @@ impl Default for Policy {
             widefull: false,
             lonetombs: false,
             widewalks: false,
+            widecopyfixed: false,
             pacesyncsbatch: false,
             pacesyncsthresholds: false,
             probestwice: false,
@@ -8265,6 +8272,7 @@ impl Supdb {
             widefull,
             lonetombs,
             widewalks,
+            widecopyfixed,
             pacesyncsbatch,
             pacesyncsthresholds,
             probestwice,
@@ -8841,6 +8849,7 @@ impl Supdb {
             scan_wide_capped: !widefull,
             emit_lone_unsearched: !lonetombs,
             forms_copy_hot_wide: !widewalks,
+            forms_copy_wide_priced: !widecopyfixed,
             upkeep_pace_syncs_to_share: !pacesyncsbatch,
             upkeep_pace_syncs_model: !pacesyncsbatch && !pacesyncsthresholds,
             read_probes_once: !probestwice,
@@ -9146,6 +9155,7 @@ impl Supdb {
             widefull,
             lonetombs,
             widewalks,
+            widecopyfixed,
             pacesyncsbatch,
             pacesyncsthresholds,
             probestwice,
@@ -9869,6 +9879,13 @@ impl Engine for Supdb {
                 "supdb-widewalks"
             } else {
                 "supdb-ingestwidewalks"
+            };
+        }
+        if self.widecopyfixed {
+            return if self.partition {
+                "supdb-widecopyfixed"
+            } else {
+                "supdb-ingestwidecopyfixed"
             };
         }
         if self.lonetombs {
@@ -10821,6 +10838,7 @@ impl Engine for Supdb {
             ("builds_wide", bk.0[2] as f64),
             ("builds_clean", bk.0[3] as f64),
             ("recopies", bk.1 as f64),
+            ("wide_walks", db.wide_walks() as f64),
             ("sheds", bk.2 as f64),
             ("span_starts", db.span_starts() as f64),
             // The scans' start blocks the start cache named, and the
@@ -12059,6 +12077,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestlonetombs"
         | "supdb-widewalks"
         | "supdb-ingestwidewalks"
+        | "supdb-widecopyfixed"
+        | "supdb-ingestwidecopyfixed"
         | "supdb-pacesyncsbatch"
         | "supdb-pacesyncsthresholds"
         | "supdb-probestwice"
@@ -12778,6 +12798,32 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         partition: false,
                         durable: false,
                         widewalks: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-widecopyfixed" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        widecopyfixed: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestwidecopyfixed" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        widecopyfixed: true,
                         ..Policy::default()
                     },
                 )
@@ -15579,6 +15625,21 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(!o.forms_copy_hot_wide && b.forms_copy_hot_wide);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("widecopyfixed"),
+                    Policy {
+                        widecopyfixed: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-widecopyfixed");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.forms_copy_wide_priced && b.forms_copy_wide_priced);
+                assert!(o.forms_copy_hot_wide);
             }
             {
                 let z = Supdb::with_policy(

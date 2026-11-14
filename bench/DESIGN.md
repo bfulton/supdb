@@ -696,7 +696,11 @@ whole for a scan, where the default stops at the scan's limit
 tombstone, a lone source's too (`Options::emit_lone_unsearched`), and
 `supdb-widewalks` and `supdb-ingestwidewalks` walk a block wide by its
 count of keys past the end for as long as it is, where the default copies
-it once its walks have paid (`Options::forms_copy_hot_wide`);
+it once its walks have paid (`Options::forms_copy_hot_wide`), and
+`supdb-widecopyfixed` and `supdb-ingestwidecopyfixed` copy it at the walk a
+fixed ratio of a walk to a hundred copied keys names, where the default
+copies it once the keys its walks merged reach the entries the copy will
+merge (`Options::forms_copy_wide_priced`);
 `supdb-pacesyncsbatch` holds a syncing commit's paced batch within the
 share or the batch, the larger, and `supdb-pacesyncsthresholds` holds a
 batch of a twentieth of the store and at most 2048 writes within the share

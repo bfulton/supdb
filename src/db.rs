@@ -2931,6 +2931,30 @@ pub struct Options {
     /// stopped asking for the whole of it ahead. Off walks the block wide
     /// for as long as it is (`supdb-widewalks`).
     pub forms_copy_hot_wide: bool,
+    /// A hot wide block's copy bought when its walks have paid for it, the
+    /// rent and the price both counted in the merge they run, in place of
+    /// `WIDE_COPY_PER_WALK`'s fixed ratio of a walk to a hundred copied
+    /// keys (`Options::forms_copy_hot_wide`). The rent is the keys the
+    /// block's walks merged, a window of a scan each; the price is the
+    /// entries the copy will merge, every source's run over the block and
+    /// the block's records. The block is copied at the walk where the
+    /// rent the walks before it paid reaches the price -- a buyer who knew
+    /// how many walks were to come would have paid at least half of that.
+    /// The one assumption is that a walk merges a key for about what a
+    /// copy merges an entry for, and over the scrambled E's tail at a
+    /// hundred and three hundred thousand keys a walk took 6.2-7.7 us for
+    /// its 48-50 keys, about 140 ns a key, and the copy 110-230 ns an
+    /// entry. The fixed ratio was the suite's -- a walk of a window of
+    /// fifty, its E's scan -- and bought at a third of the copy's price.
+    /// Paired against it in the row's order at a hundred and three hundred
+    /// thousand keys in both orders, the scrambled E's copy came at the
+    /// 37th walk and the 102nd where the ratio's came at the 18th and the
+    /// 51st, about 0.3% of the mix by the walks' count, and the mix read
+    /// 0.95-1.07x over the four sittings with the unscrambled E, which
+    /// walks nothing wide, leaning as far. Off, `supdb-widecopyfixed` and
+    /// `supdb-ingestwidecopyfixed`.
+    #[doc(hidden)]
+    pub forms_copy_wide_priced: bool,
     /// A scan's seek asks for the partition's directory words of the
     /// stride window its answer lies in at the moment it asks for the
     /// stride's heads, and the record hint after it estimates its span
@@ -5916,6 +5940,7 @@ impl Default for Options {
             scan_wide_capped: true,
             emit_lone_unsearched: true,
             forms_copy_hot_wide: true,
+            forms_copy_wide_priced: true,
             seek_prefetch_dir: true,
             scan_cache_ahead_min_blocks: 1024,
             ahead_out_of_core: true,
@@ -17009,6 +17034,9 @@ struct WideBlock {
     /// keys, so a second touch copies it; and the touches so far.
     covered: bool,
     walks: u32,
+    /// The keys the walks so far merged: the rent a copy is weighed
+    /// against (`Options::forms_copy_wide_priced`).
+    rent_keys: u64,
 }
 
 /// PROTOTYPE: keys above the partition, as `overlay_count` counts them,
@@ -17882,6 +17910,7 @@ static NEWER_FORM: Cached = Cached::Wide(WideBlock {
     seen: 0,
     covered: false,
     walks: 0,
+    rent_keys: 0,
 });
 
 /// EXPERIMENT: a block form the writer keeps current at every commit,
@@ -17996,6 +18025,7 @@ impl State {
                         seen: 0,
                         covered: false,
                         walks: 0,
+                        rent_keys: 0,
                     }))
                 } else {
                     form.clone()
@@ -19824,6 +19854,8 @@ struct FormsState {
     built_kinds: Counts<4>,
     recopies: std::cell::Cell<u64>,
     sheds: std::cell::Cell<u64>,
+    /// The wide walks this handle made (`Db::wide_walks`).
+    wide_walks: std::cell::Cell<u64>,
     /// Seeks whose stride window's directory lines were asked for ahead
     /// of the heads' read (`Options::seek_prefetch_dir`), the window
     /// empty or not: one a scan's start on the block path.
@@ -20013,6 +20045,7 @@ impl FormsState {
             walk_kinds: Counts::new(),
             built_kinds: Counts::new(),
             recopies: std::cell::Cell::new(0),
+            wide_walks: std::cell::Cell::new(0),
             sheds: std::cell::Cell::new(0),
             dir_prefetches: std::cell::Cell::new(0),
             copy_starts: Counts::new(),
@@ -26654,6 +26687,7 @@ impl Reader {
             seen: 0,
             covered: false,
             walks: 0,
+            rent_keys: 0,
         }));
         // A mark is every reader's to build at any position, so its own
         // position is no reader's business.
@@ -29697,6 +29731,18 @@ impl Reader {
         Ok(())
     }
 
+    /// Whether a hot wide block's walks have paid for its copy, at the walk
+    /// `w.walks` counts (`Options::forms_copy_hot_wide`): the keys its
+    /// earlier walks merged against the `entries` the copy will merge
+    /// (`Options::forms_copy_wide_priced`); off, the fixed ratio of a walk
+    /// to a hundred copied keys over the largest source's run.
+    fn wide_copy_pays(&self, w: &WideBlock, n_over: usize, entries: usize) -> bool {
+        if !self.opts.forms_copy_wide_priced {
+            return w.walks as usize >= 2 + n_over / WIDE_COPY_PER_WALK;
+        }
+        w.walks >= 2 && w.rent_keys >= entries as u64
+    }
+
     /// PROTOTYPE: the scan over partitions and everything above them,
     /// block by block: a cached copy is walked, a clean block is walked in
     /// the partition, a sparse one with its deltas, and a block not yet
@@ -30113,6 +30159,7 @@ impl Reader {
                 // (`Options::forms_copy_hot_wide`).
                 let mut recopy = false;
                 let mut wide_copy = false;
+                let mut wide_rent: Option<u64> = None;
                 let hot_wide = self.opts.forms_copy_hot_wide
                     && matches!(table.slots[b].as_deref(), Some(Cached::Wide(w)) if !w.covered);
                 let n_over = if hot_wide {
@@ -30120,10 +30167,18 @@ impl Reader {
                 } else {
                     0
                 };
+                // The copy's merge: every source's run over the block and
+                // the block's records.
+                let entries = if hot_wide && self.opts.forms_copy_wide_priced {
+                    BuildCtx::overlay_sum(table, b) + ((b + 1) * CACHE_BLOCK).min(keys)
+                        - b * CACHE_BLOCK
+                } else {
+                    0
+                };
                 if let (None, Some(Cached::Wide(w))) = (canon, wide_mut(&mut table.slots[b])) {
                     w.walks = w.walks.saturating_add(1);
                     recopy = w.covered && w.walks >= 2;
-                    if hot_wide && w.walks as usize >= 2 + n_over / WIDE_COPY_PER_WALK {
+                    if hot_wide && self.wide_copy_pays(w, n_over, entries) {
                         recopy = true;
                         wide_copy = true;
                     }
@@ -30473,11 +30528,27 @@ impl Reader {
                         }
                     }
                     Cached::Wide(w) => {
+                        // A hot wide block's walk pays the keys it merged
+                        // toward the copy (`Options::forms_copy_wide_priced`).
+                        let priced = self.opts.forms_copy_hot_wide
+                            && self.opts.forms_copy_wide_priced
+                            && !w.covered;
                         let window = (from_key, limit - seen);
                         let ov = ctx.overlay_window(src, table, b, unsealed, w, window)?;
+                        let merged = ov.over.len() as u64;
                         seen += ctx
                             .walk_block(src, pr, start..hi, &ov, limit - seen, |_k| {}, &mut *f)?
                             .0;
+                        let fs = self.fs();
+                        fs.wide_walks.set(fs.wide_walks.get() + 1);
+                        if priced {
+                            wide_rent = Some(merged);
+                        }
+                    }
+                }
+                if let Some(merged) = wide_rent.take() {
+                    if let (None, Some(Cached::Wide(w))) = (canon, wide_mut(&mut table.slots[b])) {
+                        w.rent_keys = w.rent_keys.saturating_add(merged);
                     }
                 }
                 // The rest of the next block's prefetch, where the walk was
@@ -35946,6 +36017,12 @@ impl Db {
         self.take_back_upkeep();
         let fs = self.r.fs();
         (fs.built_kinds.get(), fs.recopies.get(), fs.sheds.get())
+    }
+
+    /// The writer's wide walks (`Options::forms_copy_hot_wide`).
+    pub fn wide_walks(&self) -> u64 {
+        self.take_back_upkeep();
+        self.r.fs().wide_walks.get()
     }
 
     /// The writer's own copy walks by how they started: at the seek's
@@ -41617,6 +41694,25 @@ impl<'s> BuildCtx<'s> {
                 .any(|f| f.get().is_some_and(|sb| sb.at[b + 1] > sb.at[b]))
             || !added[b].is_empty()
     }
+    /// Every source's run over block `b`, summed: the entries a copy's
+    /// merge reads (`Options::forms_copy_wide_priced`).
+    fn overlay_sum(table: &BlockTable, b: usize) -> usize {
+        let snap = table
+            .snap_at
+            .get()
+            .map_or(0, |sb| (sb.at[b + 1] - sb.at[b]) as usize);
+        let frozen: usize = table
+            .fsnap_at
+            .iter()
+            .map(|f| f.get().map_or(0, |sb| (sb.at[b + 1] - sb.at[b]) as usize))
+            .sum();
+        let pieces: usize = table
+            .pieces
+            .iter()
+            .map(|(_, at)| (at[b + 1] - at[b]) as usize)
+            .sum();
+        snap + frozen + table.added[b].len() + pieces
+    }
     fn overlay_count(table: &BlockTable, b: usize) -> usize {
         // A table without its bounds has built nothing, and the one
         // caller that asks before a build unlists, which on an unbuilt
@@ -42038,6 +42134,7 @@ impl<'s> BuildCtx<'s> {
                 seen: table.added[b].len(),
                 covered: floor <= WIDE,
                 walks: 0,
+                rent_keys: 0,
             }));
         }
         let ov = self.overlay_all(src, table, b, unsealed)?;
