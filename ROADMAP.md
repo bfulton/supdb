@@ -14,8 +14,9 @@ is the cost of the design, and showing them is what makes the wins credible.
   and RocksDB's 1.03 (2026-10-17 run). Measured already.
 - **Recovery after a crash.** LMDB never recovers: its file is always
   consistent, so it opens instantly. supdb replays its WAL on open, and
-  rewrites a run of ordered ingest the crash left open. Measured by the
-  `recover` workloads (`bench/DESIGN.md`).
+  walks a run of ordered ingest the crash left open to write the index
+  its close would have written. Measured by the `recover` workloads
+  (`bench/DESIGN.md`).
 
 ## Benchmark
 

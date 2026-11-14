@@ -969,6 +969,264 @@ fn a_run_that_names_no_start_is_taken_as_it_stands() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// The store's greatest key at an open is the greatest the replay
+/// applied, kept as the records go by, and a checked build holds it to a
+/// walk of the replayed table. A delete makes an entry as a put does, so
+/// a replayed delete above every key written is the greatest key: the
+/// input on which keeping only the puts' keys and walking the table
+/// disagree.
+#[test]
+fn a_replayed_delete_above_every_put_is_the_greatest_key() {
+    let d = dir("replayed-delete");
+    let mut db = Db::create(&d, buffered()).unwrap();
+    for i in [40u64, 10, 30] {
+        db.put(&key(i), b"put");
+    }
+    db.commit().unwrap();
+    db.delete(&key(90));
+    db.delete(&key(20));
+    db.commit().unwrap();
+    db.crash();
+    let mut db = Db::open(&d, inline(buffered())).unwrap();
+    assert_eq!(values(&db, &key(40)), vec![b"put".to_vec()]);
+    assert!(values(&db, &key(90)).is_empty());
+    // A key between the puts' greatest and the delete's is not above the
+    // store's greatest, and is written as any other.
+    db.append(&key(50), b"after");
+    db.commit().unwrap();
+    assert_eq!(values(&db, &key(50)), vec![b"after".to_vec()]);
+    db.crash();
+    let db = Db::open(&d, inline(buffered())).unwrap();
+    assert_eq!(values(&db, &key(50)), vec![b"after".to_vec()]);
+    assert_eq!(values(&db, &key(40)), vec![b"put".to_vec()]);
+    db.crash();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The files of the store at `from`, copied to a fresh directory: the
+/// same state, for another open to start from.
+fn copy_of(from: &Path, name: &str) -> PathBuf {
+    let to = dir(name);
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
+    }
+    to
+}
+
+/// The store's one segment file: its name and its bytes.
+fn one_segment(d: &Path, what: &str) -> (String, Vec<u8>) {
+    let segs = common::seg_names(d);
+    assert_eq!(segs.len(), 1, "{what}: one segment, of {segs:?}");
+    let bytes = std::fs::read(d.join(&segs[0])).unwrap();
+    (segs[0].clone(), bytes)
+}
+
+/// An open makes a piece of a run where the run lies: the file the killed
+/// writer left is finished as its close would have finished it, and
+/// linked under the piece's name. So the piece is that file, by its inode,
+/// and it is byte for byte the segment the same commits closed cleanly
+/// make, but for the second it was finished in. The open used to parse
+/// every record out of the run's file and write it into a new one, which
+/// was most of the open of a killed store whose load arrived in order.
+#[test]
+fn a_run_an_open_takes_is_finished_where_it_lies() {
+    use std::os::unix::fs::MetadataExt;
+    for sync in [SyncPolicy::EveryN(u32::MAX), SyncPolicy::Always] {
+        let opts = || Options {
+            sync,
+            ..Options::default()
+        };
+        let tag = format!("{sync:?}").replace(['(', ')'], "-");
+        let write = |d: &Path| {
+            let mut db = Db::create(d, opts()).unwrap();
+            for b in 0..3 {
+                ordered_batch(&mut db, b);
+            }
+            // An empty value and a long key, which the record lays out
+            // otherwise than the batches' sixteen bytes and a hundred.
+            db.append(&key(3 * BATCH), b"");
+            let long = format!("{:016}{:048}", 3 * BATCH + 1, 0);
+            db.append(long.as_bytes(), &VALUE[..7]);
+            db.commit().unwrap();
+            db
+        };
+
+        let killed = dir(&format!("inplace-killed-{tag}"));
+        write(&killed).crash();
+        let run = run_file(&killed, 0);
+        let inode = std::fs::metadata(&run).unwrap().ino();
+        let left = std::fs::metadata(&run).unwrap().len();
+        let db = Db::open(&killed, inline(opts())).unwrap();
+        for b in 0..3 {
+            assert!(holds(&db, b), "{sync:?}: batch {b} of the run");
+        }
+        assert_eq!(values(&db, &key(3 * BATCH)), vec![Vec::<u8>::new()]);
+        let long = format!("{:016}{:048}", 3 * BATCH + 1, 0);
+        assert_eq!(values(&db, long.as_bytes()), vec![VALUE[..7].to_vec()]);
+        db.crash();
+        let (name, taken) = one_segment(&killed, "the killed store");
+        assert!(
+            names(&killed, "direct-").is_empty(),
+            "the run's name stayed"
+        );
+        assert_eq!(
+            std::fs::metadata(killed.join(&name)).unwrap().ino(),
+            inode,
+            "{sync:?}: the piece is another file than the run's"
+        );
+        assert!(
+            taken.len() as u64 > left,
+            "{sync:?}: nothing was written behind the run's records"
+        );
+
+        let closed = dir(&format!("inplace-closed-{tag}"));
+        write(&closed).close().unwrap();
+        let (_, made) = one_segment(&closed, "the closed store");
+        assert_eq!(taken.len(), made.len(), "{sync:?}: the two files' lengths");
+        assert!(
+            common::without_the_clock(&taken) == common::without_the_clock(&made),
+            "{sync:?}: a run finished at an open is not the segment its close makes"
+        );
+        let _ = std::fs::remove_dir_all(&killed);
+        let _ = std::fs::remove_dir_all(&closed);
+    }
+}
+
+/// The open that finishes a run's file is itself an open a crash may
+/// take, and the file is no longer the one the writer left once it has
+/// begun: the index half written behind the records, the file whole and
+/// under no other name, the file linked under the piece's name with no
+/// manifest naming it (which the open sweeps with the orphans before it
+/// takes a run), and the piece named with the run's range not yet noted. Each is built from the store a writer left and the store the
+/// open made of it, and the open after it finds the same store: every
+/// batch of the run, the frames behind it at their numbers, and the same
+/// piece, the run's own file cut back to its last commit and finished
+/// again -- or, once a manifest names it, not touched at all.
+#[test]
+fn an_open_cut_short_in_a_runs_finish_is_made_again() {
+    let opts = || Options {
+        seal_bytes: 1 << 30,
+        ..buffered()
+    };
+    let left = dir("refinish-left");
+    {
+        let mut db = Db::create(&left, opts()).unwrap();
+        db.hold_seal_landing(true);
+        for b in 1..4 {
+            ordered_batch(&mut db, b);
+        }
+        // Frames behind the run: an update, which closes it, and a key
+        // above the store's greatest in the same log.
+        db.put(&key(BATCH + 7), b"behind the run");
+        db.commit().unwrap();
+        db.put(&key(5), b"the last commit");
+        db.commit().unwrap();
+        db.crash();
+    }
+    let raw = std::fs::read(run_file(&left, 0)).unwrap();
+    let check = |db: &Db, what: &str| {
+        for b in 2..4 {
+            assert!(holds(db, b), "{what}: batch {b} of the run");
+        }
+        assert_eq!(
+            values(db, &key(BATCH + 7)),
+            vec![b"behind the run".to_vec()],
+            "{what}: the update behind the run"
+        );
+        assert_eq!(
+            values(db, &key(BATCH + 8)),
+            vec![VALUE.to_vec()],
+            "{what}: the key beside the update"
+        );
+        assert_eq!(
+            values(db, &key(5)),
+            vec![b"the last commit".to_vec()],
+            "{what}: the last commit"
+        );
+    };
+
+    // The open nothing cut short, for what it makes.
+    let made = copy_of(&left, "refinish-made");
+    let db = Db::open(&made, inline(opts())).unwrap();
+    check(&db, "the open that finished");
+    db.crash();
+    let (name, piece) = one_segment(&made, "the open that finished");
+    assert!(piece.len() > raw.len(), "an index behind the records");
+    // Where a run's records begin: past the superblock region and the
+    // key section's header.
+    const RECORDS: usize = 4096 + 192;
+    assert!(piece[RECORDS..raw.len()] == raw[RECORDS..], "the records");
+    let index = piece.len() - raw.len();
+
+    // The run's file as each crash before the manifest leaves it, and
+    // whether the piece's name is linked to it. The last two are a
+    // writer's leavings and not an open's: bytes that are no record, more
+    // of them than the index is long, and a batch of whole records with
+    // no marker behind it -- the first batch's again, which is a third of
+    // the stream less its marker.
+    let mut junk = raw.clone();
+    junk.extend(std::iter::repeat_n(0xa5u8, 3 * index));
+    let batch = (raw.len() - RECORDS) / 3 - 24;
+    let mut unmarked = raw.clone();
+    unmarked.extend_from_slice(&raw[RECORDS..RECORDS + batch]);
+    let windows: [(&str, Vec<u8>, bool); 5] = [
+        (
+            "half an index",
+            piece[..raw.len() + index / 2].to_vec(),
+            false,
+        ),
+        ("finished and not linked", piece.clone(), false),
+        ("linked and not named", piece.clone(), true),
+        ("a tail longer than the index", junk, false),
+        ("a batch with no marker", unmarked, false),
+    ];
+    for (what, file, linked) in windows {
+        let d = copy_of(&left, &format!("refinish-{}", what.replace(' ', "-")));
+        std::fs::write(run_file(&d, 0), &file).unwrap();
+        if linked {
+            std::fs::hard_link(run_file(&d, 0), d.join(&name)).unwrap();
+        }
+        let db = Db::open(&d, inline(opts())).unwrap();
+        check(&db, what);
+        db.crash();
+        let (again, bytes) = one_segment(&d, what);
+        assert_eq!(again, name, "{what}: the piece's name");
+        assert!(
+            common::without_the_clock(&bytes) == common::without_the_clock(&piece),
+            "{what}: the piece made again is not the piece ({} bytes, {})",
+            bytes.len(),
+            piece.len()
+        );
+        assert!(names(&d, "direct-").is_empty(), "{what}: the run's name");
+        assert_eq!(names(&d, "cov-").len(), 1, "{what}: the run's range");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // Named, and the range not noted: the temp name is a second name of
+    // the piece. The open counts the run's records for the note and
+    // writes nothing into a file a manifest names.
+    let d = copy_of(&made, "refinish-named");
+    for n in names(&d, "cov-") {
+        std::fs::remove_file(d.join(n)).unwrap();
+    }
+    std::fs::hard_link(d.join(&name), run_file(&d, 0)).unwrap();
+    let db = Db::open(&d, inline(opts())).unwrap();
+    check(&db, "named and not noted");
+    db.crash();
+    let (again, bytes) = one_segment(&d, "named and not noted");
+    assert_eq!(again, name);
+    assert!(
+        bytes == piece,
+        "a file the manifest names was written again"
+    );
+    assert!(names(&d, "direct-").is_empty(), "the run's second name");
+    assert_eq!(names(&d, "cov-").len(), 1, "the run's range, noted");
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&made);
+    let _ = std::fs::remove_dir_all(&left);
+}
+
 // ------------------------------------------------------------- the oracle --
 
 /// The stream the oracle's writer commits: a function of a seed and of the

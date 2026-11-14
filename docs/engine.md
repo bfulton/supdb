@@ -7252,6 +7252,60 @@ commit acknowledged, under either policy, since every commit is written
 where it goes: a run's commits once waited in the writer's buffer for a
 whole write piece, and a killed process took up to a megabyte of them.
 
+What that open costs was priced once the suite had a workload that made
+one (`recover`, `bench/DESIGN.md`), by one open of a killed store in a
+process of its own (`bench/examples/reopen.rs`, whose head has the steps:
+`bench crash-load` killed at its last line, a copy of the store for each
+open, the probe under `valgrind --tool=callgrind` or `strace -f -T -y`).
+At three hundred thousand keys the store an ordered load leaves is two
+runs under their temp names, thirty-six megabytes and one, and the open
+at `072d722` spent 754 million instructions on it: 85% taking the runs,
+31% in the walk that copied every key and value into vectors of their
+own, half of that the allocator's, and 44% in the segment writer the
+copies were fed back through; and 12% more in the open of the rebuilt
+piece, which walked every record again for its Bloom. In wall time it
+was the same order again in the device's: the records read, written to
+a new file, synced, and the old file's inode freed. The run's file is the
+segment's record section as it stands -- a clean close writes an index
+behind those bytes and links the file under its name -- so the open does
+what the close does (`SegmentWriter::resume_run`, at `c7fc5ce`): the walk
+keeps each committed record's offset over a mapping of the file, a
+writer is stood up at the last good marker as one that had streamed
+those records with its keys deferred, and the close's finish writes the
+index behind them with the walk as the keys' source. The piece is the
+run's own file, by inode, and byte for byte the segment a clean close of
+the same commits makes but for the second in its superblock; the Bloom
+the finish composes is handed to the open's own open of the piece, as a
+landing hands it. The count is 180 million, two thirds of it the pass
+over the keys a close makes too, and the open reads 62 to 75 ms where
+it read 190 to 290, under either sync policy, faster in six alternated
+pairs of six each. The store a shuffled load leaves is a log to replay, forty
+megabytes in two files: the open read each whole into a buffer before
+parsing it and found the store's greatest key afterwards by a walk of
+every entry of the table it had replayed, and parses the frames through
+a mapping now and keeps the greatest key as the records go by (a checked
+build holds it to the walk) -- 277 million instructions to 261, a third
+of the open's first-touched pages gone, and 90 to 115 ms where it read
+105 to 150, faster in eleven pairs of twelve over two sittings. What is
+left of it is the table's inserts.
+
+A file the open finishes is no longer the file the writer left once the
+finish has begun, so the open has crash windows of its own, and
+`tests/runlog.rs` builds each from the store a writer left and the store
+an open made of it: half an index behind the records, the file whole
+under its temp name alone, linked under the piece's name with no
+manifest naming it, and named with the run's range not yet noted --
+where the temp name is a second name of a file the manifest has, and the
+open counts its records and writes nothing. Each opens to the same
+store, and but for the last to the same piece, the file cut back to its
+last commit marker and finished again. Twelve mutants of the walk, the
+resumed writer and the replay's greatest key were each caught by a
+test, after one was not: a removal of whatever stood under the piece's
+name ahead of the link, which no state reaches, since the open sweeps
+every name the manifest lacks before it takes a run, and which would
+have unlinked a live segment had a state reached it. The link refuses a
+name that is taken.
+
 The comparators' check, registered before its first run. The suite's comparator arms are configured and driven by the same hand that wrote the engine, and the suite's own history has a comparator wrong for months while every check passed (the buffered RocksDB as it ships, `bench/DESIGN.md`). A job of the repository's CI (`comparators.yml`, by hand and weekly) holds the suite's comparator cells to the comparators' own tools on one hosted runner in one job: RocksDB's db_bench built from the very tree the suite links -- the source `librocksdb-sys` vendors at the version `bench/Cargo.lock` pins, with no compression library, as the suite's build has none -- and run with the tuned arm's options (compression off, a 256 MB block cache with the index and filter blocks in it, ten Bloom bits a key, 128 MB write buffers four deep merged two at a time, level 0 compacting at eight files, four background jobs), the load in synced batches of a thousand, N uniform point reads on one thread and seeks with ninety-nine nexts for the suite's scans of a hundred entries; and, since LMDB ships no benchmark tool, a C program of a hundred lines against the LMDB `lmdb-master-sys` vendors (`bench/tools/lmdb_bench.c`), the suite's shapes in its own doc, with one read transaction held across the reads as the suite's arm holds its own. Beside them the suite's `rocksdb-tuned` and `lmdb` arms run the quick ladder in the same job, and `bench/scripts/comparators.py` prints, at every rung, the suite's load, point-read and scan cell beside the tool's. The rule: the suite's cell is at least 0.7x the tool's on every quantity the tool measures, or the job fails and names the quantity. A cell under the margin is a comparator the suite configures or drives badly -- the finding is the arm's, to fix and bank a row for -- and never a reading of the engine; a cell far above the tool's is the tool driven badly, printed and not failed. The tools' flags live in `bench/scripts/comparators.sh`, so a reader can run both halves. The margin the cells hold is read off the job's summary once it has run, and `bench/DESIGN.md` states it.
 
 ## Open, and deliberately so

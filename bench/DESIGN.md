@@ -169,8 +169,9 @@ draws from a primed pool as every store a pass opens does; the first read
 is of the last key the dead process committed. There are two because an
 engine recovers what its write path left, and the two loads leave supdb
 different things: the ordered load a segment open for append, whose
-records the open walks to the last commit marker and rewrites, and the
-shuffled load a log to replay with seals and merges cut off in flight.
+records the open walks to the last commit marker and whose index it then
+writes behind them, and the shuffled load a log to replay with seals and
+merges cut off in flight.
 LMDB's file is consistent at every commit and its open recovers nothing;
 RocksDB replays its log into a memtable.
 
