@@ -615,7 +615,10 @@ records asking for none of them ahead of it (`Options::scan_raw_ahead`
 off), `supdb-scanrawahead` with the ask made on every store, within the
 last-level cache or past it (`Options::scan_raw_ahead_past_llc` off), and
 `supdb-scanrawpaced` with it made a kilobyte ahead as the walk goes
-(`Options::scan_raw_ahead_lead`); `supdb-zhotresident` is `supdb` with the hot-raw fill asking for the
+(`Options::scan_raw_ahead_lead`); `supdb-settlegated` and `supdb-ingestsettlegated` are `supdb` and
+`supdb-ingest` filing a commit's batch at the write only where the
+partitions' data passes the last-level cache
+(`Options::forms_settle_past_llc`); `supdb-zhotresident` is `supdb` with the hot-raw fill asking for the
 partitions the reads have not skewed by how much of their records the cache
 holds, most first (`Options::zpages_hot_fill_resident_first`);
 `supdb-zrewarminstall` is `supdb` with the controller's install making a

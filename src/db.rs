@@ -3178,6 +3178,20 @@ pub struct Options {
     /// without the two.
     #[doc(hidden)]
     pub forms_settle_builds: bool,
+    /// EXPERIMENT: `forms_settle_every` and `forms_settle_builds` apply only
+    /// where the partitions' key and value bytes pass the last-level cache
+    /// (`llc_bytes`), as `scan_raw_ahead` does. They were priced at three
+    /// million keys and up, where a scan's first settle of the write mixes'
+    /// keys is misses; in a store the cache holds that settle is cheap and
+    /// the filing is the writer's cost alone: the buffered arm's one-percent
+    /// burst at thirty thousand keys read 0.73x and 0.79x of the shape
+    /// without them and its ten-percent burst at ten thousand 0.86x and
+    /// 0.84x, with the passes after level (`pair.sh supdb-ingestsettlelate
+    /// supdb-ingest 30000 --passes load,lag --reps 16`, at `84d4ce4`).
+    /// `supdb-settlesmall` and `supdb-ingestsettlesmall` file at the write
+    /// whatever the store's size.
+    #[doc(hidden)]
+    pub forms_settle_past_llc: bool,
     /// What "the group's refaults hold still" is for `forms_settle_builds`'s
     /// room (`SettleRoom`): the group refaulting under the line the
     /// controller's pressure term is drawn at
@@ -5562,6 +5576,7 @@ impl Default for Options {
             forms_settle_backlog_pct: 2,
             forms_settle_every: true,
             forms_settle_builds: true,
+            forms_settle_past_llc: false,
             forms_settle_room_pressure: true,
             forms_settle_sheds_unbound: false,
             forms_settle_keys_all: false,
@@ -16616,6 +16631,12 @@ fn raw_ahead_on(opts: &Options, data_bytes: u64) -> bool {
     opts.scan_raw_ahead && (!opts.scan_raw_ahead_past_llc || data_bytes > llc_bytes())
 }
 
+/// Whether write-time filing applies to a store whose partitions hold
+/// `data_bytes` of keys and values (`Shared::settle_write`).
+fn settle_write_on(opts: &Options, data_bytes: u64) -> bool {
+    !opts.forms_settle_past_llc || data_bytes > llc_bytes()
+}
+
 /// The last-level cache's bytes as the platform reports them, read once:
 /// the line `Options::scan_raw_ahead_past_llc` draws, past which a raw
 /// walk's records come from memory rather than the cache. The size of the
@@ -17071,6 +17092,11 @@ struct Shared {
     /// every segment publish, beside `State::data_bytes`, and read relaxed:
     /// a hint a walk takes or leaves.
     raw_ahead: std::sync::atomic::AtomicBool,
+    /// Whether a commit files its batch and builds what it filed into at
+    /// the write (`Options::forms_settle_every`, `forms_settle_builds`) for
+    /// a store of this size: everywhere, or past the last-level cache where
+    /// `Options::forms_settle_past_llc` says so. Set beside `raw_ahead`.
+    settle_write: std::sync::atomic::AtomicBool,
     /// The out-of-core asks' counts (`AskCounts`), on a line of their own.
     asks: AskCounts,
     /// Which mode the segment mappings are in: `true` is `MADV_RANDOM`.
@@ -22703,6 +22729,13 @@ impl Reader {
         Ok(got)
     }
 
+    /// Whether a commit files at the write for this store's size
+    /// (`Shared::settle_write`).
+    #[inline]
+    fn settle_at_write(&self) -> bool {
+        self.shared.settle_write.load(AtomicOrdering::Relaxed)
+    }
+
     /// A walk of `n` of the partition's raw records from `rank`, with its
     /// records asked for ahead of it where `Options::scan_raw_ahead` says
     /// so: paced through the walk at `scan_raw_ahead_lead` bytes, or the
@@ -26179,8 +26212,9 @@ impl Reader {
         // it files into (`SettleRoom`): filing alone cost F and D a tenth
         // and bought E nothing, and with no room to build that is all a
         // commit's filing would be.
-        let every =
-            self.opts.forms_settle_every && (!self.opts.forms_settle_builds || self.settle_room());
+        let every = self.opts.forms_settle_every
+            && self.settle_at_write()
+            && (!self.opts.forms_settle_builds || self.settle_room());
         let bound = if every {
             1
         } else if self.opts.forms_settle_backlog_pct == 0 {
@@ -26379,7 +26413,11 @@ impl Reader {
             let cache = self.fs().scan_keys.borrow();
             let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
             self.install_ahead(unsealed)?;
-            if moved && self.opts.forms_settle_builds && !self.abandon_pending() {
+            if moved
+                && self.opts.forms_settle_builds
+                && self.settle_at_write()
+                && !self.abandon_pending()
+            {
                 let blocks = std::mem::take(&mut *self.fs().settle_blocks.borrow_mut());
                 if !blocks.is_empty() && self.settle_room() {
                     self.build_settled(&blocks, unsealed)?;
@@ -27757,6 +27795,7 @@ impl Reader {
             // A block the settle filed into and nothing formed, for the
             // fill to build (`Options::forms_settle_builds`).
             if self.opts.forms_settle_builds
+                && self.settle_at_write()
                 && i + 1 == group_end
                 && table.slots.get(b).is_some_and(|s| s.is_none())
             {
@@ -30940,6 +30979,7 @@ impl Db {
             readers: Readers::new(opts.asym_pins, opts.sweep_remembers_pin),
             retired: RetireList::new(),
             raw_ahead: std::sync::atomic::AtomicBool::new(raw_ahead_on(&opts, data_bytes)),
+            settle_write: std::sync::atomic::AtomicBool::new(settle_write_on(&opts, data_bytes)),
             advice_random: std::sync::atomic::AtomicBool::new(starts_random),
             retired_forms: RetireList::new(),
             retired_snaps: RetireList::new(),
@@ -31534,6 +31574,7 @@ impl Db {
             readers,
             retired: RetireList::new(),
             raw_ahead: std::sync::atomic::AtomicBool::new(raw_ahead_on(&opts, data_bytes)),
+            settle_write: std::sync::atomic::AtomicBool::new(settle_write_on(&opts, data_bytes)),
             advice_random: std::sync::atomic::AtomicBool::new(starts_random),
             retired_forms: RetireList::new(),
             retired_snaps: RetireList::new(),
@@ -42406,6 +42447,10 @@ impl Maint {
         let data_bytes = Db::data_bytes_of(&segs);
         self.shared.raw_ahead.store(
             raw_ahead_on(&self.opts, data_bytes),
+            AtomicOrdering::Relaxed,
+        );
+        self.shared.settle_write.store(
+            settle_write_on(&self.opts, data_bytes),
             AtomicOrdering::Relaxed,
         );
         let l0_aligned = Db::l0_aligned_of(&segs);

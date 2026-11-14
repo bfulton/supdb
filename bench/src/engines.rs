@@ -1161,6 +1161,10 @@ pub struct Supdb {
     /// The fill's unskewed candidates asked for by their records' residency
     /// (`Options::zpages_hot_fill_resident_first`): `supdb-zhotresident`.
     zhotresident: bool,
+    /// Write-time filing only past the last-level cache
+    /// (`Options::forms_settle_past_llc`): `supdb-settlegated` and
+    /// `supdb-ingestsettlegated`.
+    settlegated: bool,
     /// A cursor's walk decoding the groups after its first into its own
     /// buffer (`Options::zpages_walk_owns_decodes` on): `supdb-zwalkowns`.
     zwalkowns: bool,
@@ -2274,6 +2278,8 @@ struct Policy {
     zrewarminstall: bool,
     /// The fill's resident records first: `supdb-zhotresident`.
     zhotresident: bool,
+    /// Write-time filing past the cache alone: `...settlegated`.
+    settlegated: bool,
     /// The walk's own decodes: `supdb-zwalkowns`.
     zwalkowns: bool,
     /// A page view an open: `supdb-zviewperopen`.
@@ -2693,6 +2699,7 @@ impl Default for Policy {
             zrewarmbeside: false,
             zrewarminstall: false,
             zhotresident: false,
+            settlegated: false,
             zwalkowns: false,
             zviewperopen: false,
             znogroupahead: false,
@@ -8112,6 +8119,7 @@ impl Supdb {
             zrewarmbeside,
             zrewarminstall,
             zhotresident,
+            settlegated,
             zwalkowns,
             zviewperopen,
             znogroupahead,
@@ -8662,6 +8670,7 @@ impl Supdb {
             zpages_rewarm_beside_merges: zrewarmbeside,
             zpages_rewarm_at_install: zrewarminstall,
             zpages_hot_fill_resident_first: zhotresident,
+            forms_settle_past_llc: settlegated,
             zpages_rewarm_quiet_ms: if zrewarmwait {
                 supdb::db::REWARM_QUIET_BEFORE_MS
             } else {
@@ -8946,6 +8955,7 @@ impl Supdb {
             zrewarmbeside,
             zrewarminstall,
             zhotresident,
+            settlegated,
             zwalkowns,
             zviewperopen,
             znogroupahead,
@@ -9617,6 +9627,13 @@ impl Engine for Supdb {
                 "supdb-settlelate"
             } else {
                 "supdb-ingestsettlelate"
+            };
+        }
+        if self.settlegated {
+            return if self.partition {
+                "supdb-settlegated"
+            } else {
+                "supdb-ingestsettlegated"
             };
         }
         if self.walsync {
@@ -11719,6 +11736,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-scanrawahead"
         | "supdb-zrewarminstall"
         | "supdb-zhotresident"
+        | "supdb-settlegated"
+        | "supdb-ingestsettlegated"
         | "supdb-scanrawpaced"
         | "supdb-noscanrawahead"
         | "supdb-zseekseed"
@@ -12166,6 +12185,32 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                     d,
                     Policy {
                         noscanrawahead: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-settlegated" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        settlegated: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestsettlegated" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        settlegated: true,
                         ..Policy::default()
                     },
                 )
@@ -14611,6 +14656,21 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.zpages_hot_fill_resident_first && !b.zpages_hot_fill_resident_first);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("settlegated"),
+                    Policy {
+                        settlegated: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-settlegated");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(o.forms_settle_past_llc && !b.forms_settle_past_llc);
+                assert!(o.forms_settle_every && o.forms_settle_builds);
             }
             {
                 let z = Supdb::with_policy(
