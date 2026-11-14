@@ -167,9 +167,14 @@ What an engine picker would hit, roughly in order.
   that barrier for its new WAL file. One at each run's first sync costs a
   fifth of a millisecond here, about a thirtieth of the durable ordered
   load at ten thousand keys and nothing measurable from a hundred
-  thousand, and was left out for that. A name that did go missing is no
-  longer silent: frames past a run that is not there are a sequence gap,
-  and the open refuses.
+  thousand, and was left out for that. A name that did go missing is
+  loud in one case of three. Frames in the log past a run that is not
+  there are a sequence gap, and the open refuses. A run that was the last
+  thing written is gone with nothing said, as it always was. And a run
+  written after the missing one is taken for commits past the history's
+  end and removed with it, synced or not: a run's note that said whether
+  everything before it was synced when it began, as a WAL file's kind
+  says, would make that a refusal too.
 - [ ] **Small buffered bursts pay the filing at their commits.** With the
   forms filed at write time by default (`Options::forms_settle_every`,
   `forms_settle_builds`), the buffered arm's lag bursts at the two

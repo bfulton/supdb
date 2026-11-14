@@ -32721,8 +32721,10 @@ impl Db {
     /// no barrier of its own promises it. One at each run's first sync was
     /// tried with the rest of this and taken out again: a fifth of a
     /// millisecond, a thirtieth of a durable ordered load of ten thousand
-    /// keys, for a name the open now misses loudly -- frames past a run
-    /// that is not there are a sequence gap, and the open refuses
+    /// keys. A name that went missing is missed loudly only where frames
+    /// follow the run, a sequence gap the open refuses; a run that was the
+    /// last thing written is gone with nothing said, and a run written
+    /// after it is removed with it as past the history's end
     /// (`ROADMAP.md`).
     fn sync_run(&mut self) -> Result<()> {
         let Some(d) = self.direct.as_mut() else {
