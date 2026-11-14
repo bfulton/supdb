@@ -1,8 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="760" height="420" viewBox="0 0 760 420" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" fill="#1b1b1b">
 <rect width="760" height="420" fill="white"/>
-<text x="72" y="28" font-size="15" font-weight="600">At 3×10⁵ keys supdb is 1.1× ahead of LMDB and 7.2× ahead of RocksDB</text>
+<text x="72" y="28" font-size="15" font-weight="600">At 3×10⁵ keys supdb is 1.3× ahead of LMDB and 6.3× ahead of RocksDB</text>
 <text x="72" y="47" font-size="12">Ordered scans on the store the mixes leave, aggregate throughput on 2 threads, durable per batch, to 3×10⁵ keys</text>
-<text x="72" y="64" font-size="11" fill="#6b6b6b">x86_64/intel-r-xeon-r-processor-2.10ghz/4c/16g/hypervisor · b1bd544 · 2026-10-31 · median with 95% CI over 5 reps</text>
+<text x="72" y="64" font-size="11" fill="#6b6b6b">x86_64/intel-r-xeon-r-processor-2.10ghz/4c/16g/hypervisor · 200bbd5 · 2026-11-14 · median with 95% CI over 5 reps</text>
 <line x1="72" y1="372" x2="610" y2="372" stroke="#c8c8c8" stroke-width="1"/>
 <line x1="72" y1="88" x2="72" y2="372" stroke="#c8c8c8" stroke-width="1"/>
 <line x1="98.3" y1="372" x2="98.3" y2="378" stroke="#c8c8c8" stroke-width="1"/>
@@ -21,13 +21,41 @@
 <line x1="67" y1="88.0" x2="72" y2="88.0" stroke="#c8c8c8" stroke-width="1"/>
 <text x="63" y="92.0" font-size="11" text-anchor="end" fill="#6b6b6b">150M</text>
 <text x="10" y="80" font-size="11" text-anchor="start" fill="#6b6b6b">entries/s</text>
-<path d="M98.3,340.2 L255.1,342.8 L426.9,345.6 L583.7,350.0 L583.7,354.1 L426.9,350.2 L255.1,349.7 L98.3,348.7 Z" fill="#8c8c8c" fill-opacity="0.10"/>
-<path d="M98.3,202.9 L255.1,170.7 L426.9,192.1 L583.7,237.4 L583.7,253.6 L426.9,254.6 L255.1,245.0 L98.3,240.7 Z" fill="#8c8c8c" fill-opacity="0.10"/>
-<path d="M98.3,120.8 L255.1,138.1 L426.9,194.3 L583.7,209.8 L583.7,266.8 L426.9,248.0 L255.1,212.3 L98.3,234.6 Z" fill="#1b1b1b" fill-opacity="0.10"/>
-<path d="M98.3,344.3 L255.1,347.2 L426.9,348.1 L583.7,352.4 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7,4"/>
-<path d="M98.3,227.6 L255.1,179.7 L426.9,199.7 L583.7,241.2 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
-<path d="M98.3,210.3 L255.1,182.8 L426.9,239.1 L583.7,229.9 " fill="none" stroke="#1b1b1b" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-<text x="618.0" y="233.9" font-size="11" fill="#1b1b1b">supdb</text>
-<text x="618.0" y="246.9" font-size="11" fill="#8c8c8c">LMDB</text>
-<text x="618.0" y="356.4" font-size="11" fill="#8c8c8c">RocksDB</text>
+<path d="M98.3,333.0 L255.1,335.3 L426.9,339.2 L583.7,344.6 L583.7,345.9 L426.9,341.2 L255.1,339.6 L98.3,339.7 Z" fill="#8c8c8c" fill-opacity="0.10"/>
+<path d="M98.3,129.9 L255.1,167.1 L426.9,195.1 L583.7,225.1 L583.7,242.1 L426.9,224.0 L255.1,249.5 L98.3,227.3 Z" fill="#8c8c8c" fill-opacity="0.10"/>
+<path d="M98.3,110.9 L255.1,157.0 L426.9,180.2 L583.7,197.4 L583.7,210.5 L426.9,223.4 L255.1,218.2 L98.3,145.8 Z" fill="#2b6cb0" fill-opacity="0.10"/>
+<path d="M98.3,198.1 L255.1,232.8 L426.9,317.0 L583.7,321.9 L583.7,329.1 L426.9,324.7 L255.1,264.4 L98.3,260.5 Z" fill="#2b6cb0" fill-opacity="0.10"/>
+<path d="M98.3,106.5 L255.1,158.5 L426.9,165.2 L583.7,195.0 L583.7,234.8 L426.9,193.2 L255.1,201.2 L98.3,199.3 Z" fill="#2b6cb0" fill-opacity="0.10"/>
+<path d="M98.3,100.0 L255.1,150.4 L426.9,172.2 L583.7,200.7 L583.7,211.4 L426.9,193.4 L255.1,171.9 L98.3,168.6 Z" fill="#2b6cb0" fill-opacity="0.10"/>
+<path d="M98.3,108.6 L255.1,134.5 L426.9,171.9 L583.7,191.8 L583.7,207.8 L426.9,255.8 L255.1,166.2 L98.3,274.2 Z" fill="#2b6cb0" fill-opacity="0.10"/>
+<path d="M98.3,98.9 L255.1,148.7 L426.9,174.7 L583.7,193.7 L583.7,230.1 L426.9,189.9 L255.1,189.8 L98.3,220.7 Z" fill="#2b6cb0" fill-opacity="0.10"/>
+<path d="M98.3,98.0 L255.1,146.5 L426.9,177.4 L583.7,191.6 L583.7,220.9 L426.9,215.6 L255.1,202.3 L98.3,138.3 Z" fill="#8c8c8c" fill-opacity="0.10"/>
+<path d="M98.3,99.6 L255.1,145.2 L426.9,175.0 L583.7,194.3 L583.7,226.9 L426.9,203.3 L255.1,219.8 L98.3,175.0 Z" fill="#1b1b1b" fill-opacity="0.10"/>
+<path d="M98.3,334.8 L255.1,336.9 L426.9,340.0 L583.7,344.8 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7,4"/>
+<path d="M98.3,191.0 L255.1,174.3 L426.9,203.9 L583.7,238.2 " fill="none" stroke="#8c8c8c" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M98.3,117.2 L255.1,164.7 L426.9,181.3 L583.7,202.0 " fill="none" stroke="#2b6cb0" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="2,3"/>
+<path d="M98.3,208.8 L255.1,235.4 L426.9,317.3 L583.7,323.2 " fill="none" stroke="#2b6cb0" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7,4"/>
+<path d="M98.3,184.0 L255.1,159.8 L426.9,177.4 L583.7,204.0 " fill="none" stroke="#2b6cb0" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M98.3,114.7 L255.1,161.0 L426.9,188.2 L583.7,202.6 " fill="none" stroke="#2b6cb0" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="6,2"/>
+<path d="M98.3,120.8 L255.1,149.9 L426.9,177.3 L583.7,202.7 " fill="none" stroke="#2b6cb0" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="8,2"/>
+<path d="M98.3,190.3 L255.1,167.5 L426.9,182.4 L583.7,213.8 " fill="none" stroke="#2b6cb0" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="4,2"/>
+<path d="M98.3,105.2 L255.1,154.5 L426.9,181.5 L583.7,197.5 " fill="none" stroke="#8c8c8c" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="2,3"/>
+<path d="M98.3,108.3 L255.1,171.6 L426.9,183.7 L583.7,199.5 " fill="none" stroke="#1b1b1b" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+<text x="618.0" y="201.5" font-size="11" fill="#8c8c8c">?</text>
+<line x1="612.0" y1="199.5" x2="616.0" y2="210.5" stroke="#1b1b1b" stroke-width="0.75"/>
+<text x="618.0" y="214.5" font-size="11" fill="#1b1b1b">supdb</text>
+<line x1="612.0" y1="202.0" x2="616.0" y2="223.5" stroke="#2b6cb0" stroke-width="0.75"/>
+<text x="618.0" y="227.5" font-size="11" fill="#2b6cb0">supdb (256 MB block cache)</text>
+<line x1="612.0" y1="202.6" x2="616.0" y2="236.5" stroke="#2b6cb0" stroke-width="0.75"/>
+<text x="618.0" y="240.5" font-size="11" fill="#2b6cb0">supdb (a snapshot per handle)</text>
+<line x1="612.0" y1="202.7" x2="616.0" y2="249.5" stroke="#2b6cb0" stroke-width="0.75"/>
+<text x="618.0" y="253.5" font-size="11" fill="#2b6cb0">supdb (settle at commit, no forms)</text>
+<line x1="612.0" y1="204.0" x2="616.0" y2="262.5" stroke="#2b6cb0" stroke-width="0.75"/>
+<text x="618.0" y="266.5" font-size="11" fill="#2b6cb0">supdb (no advice)</text>
+<line x1="612.0" y1="213.8" x2="616.0" y2="275.5" stroke="#2b6cb0" stroke-width="0.75"/>
+<text x="618.0" y="279.5" font-size="11" fill="#2b6cb0">supdb (forms at ingest)</text>
+<line x1="612.0" y1="238.2" x2="616.0" y2="288.5" stroke="#8c8c8c" stroke-width="0.75"/>
+<text x="618.0" y="292.5" font-size="11" fill="#8c8c8c">LMDB</text>
+<text x="618.0" y="327.2" font-size="11" fill="#2b6cb0">supdb (no block cache)</text>
+<text x="618.0" y="348.8" font-size="11" fill="#8c8c8c">RocksDB</text>
 </svg>
