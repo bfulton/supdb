@@ -7234,7 +7234,10 @@ it starts; the open walks the frames and the runs as one history from the
 sequence the manifest covers and ends it at the first loss; and a sync that
 acknowledges, the policy's or `Db::sync`, covers every file written before
 it, where `sync` had covered the log alone and returned over a run in
-progress. `tests/runlog.rs` holds it two ways: a test for each state a lost
+progress. The first such sync over a run fsyncs the directory once, after
+the run's file, for the temp name the file is under, as the seal does for
+its new WAL: one barrier a run, and none in a store whose commits never
+sync. `tests/runlog.rs` holds it two ways: a test for each state a lost
 page leaves, built by stopping a writer with its seals held and cutting a
 file back or taking it away, and an oracle that kills a writer of a seeded
 stream of runs, logged writes and seals at a random commit, tears every

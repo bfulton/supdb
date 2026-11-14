@@ -159,22 +159,26 @@ What an engine picker would hit, roughly in order.
   `flock` for the store's life, and a second open, from another process or
   this one, fails at once and touches nothing (`tests/db.rs`). Readers in
   other processes are not supported.
-- [ ] **A run's temp name is promised by its file's sync alone.** A run of
-  ordered ingest is acknowledged durable once its file is synced, and
-  nothing syncs the directory for the temp name that file is under: the
-  name rides the journal commit a new file's first sync forces, which
-  ext4 and XFS give and POSIX does not promise. A seal's rotation makes
-  that barrier for its new WAL file. One at each run's first sync costs a
-  fifth of a millisecond here, about a thirtieth of the durable ordered
-  load at ten thousand keys and nothing measurable from a hundred
-  thousand, and was left out for that. A name that did go missing is
-  loud in one case of three. Frames in the log past a run that is not
-  there are a sequence gap, and the open refuses. A run that was the last
-  thing written is gone with nothing said, as it always was. And a run
-  written after the missing one is taken for commits past the history's
-  end and removed with it, synced or not: a run's note that said whether
-  everything before it was synced when it began, as a WAL file's kind
-  says, would make that a refusal too.
+- [x] **A run's temp name behind a directory barrier.** A run of ordered
+  ingest was acknowledged durable once its file was synced, and nothing
+  synced the directory for the temp name that file is under: the name rode
+  the journal commit a new file's first sync forces, which ext4 and XFS
+  give and POSIX does not promise. The first sync that acknowledges a
+  commit of a run fsyncs the directory once, after the file, as a
+  rotation does for its new WAL file (`Db::sync_run`; `tests/runlog.rs`
+  counts it on every path that syncs). A store whose commits never sync
+  makes none.
+- [ ] **A synced run that is lost anyway is refused only where frames
+  follow it.** With its file synced and its name behind a barrier, a run
+  goes missing only where the device loses what it was told to keep, and
+  the open answers that as it answers a lost log record in one case of
+  three. Frames in the log past a run that is not there are a sequence
+  gap, and the open refuses. A run written after the missing one is taken
+  for commits past the history's end and removed with it: a run's note
+  that said whether everything before it was synced when it began, as a
+  WAL file's kind says, would make that a refusal too. A run that was
+  the last thing written is gone with nothing said, as a log's last
+  synced record would be.
 - [ ] **A buffered burst of one commit pays the filing in that commit.** A
   commit near reads files its batch (`Options::forms_settle_every`), and
   where a burst is one commit the filing is in the burst: the buffered

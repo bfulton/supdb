@@ -467,6 +467,267 @@ fn a_sync_covers_the_runs_as_well_as_the_log() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// A run's temp name is behind a directory barrier before a commit of the
+/// run is acknowledged as synced: a sync of the file promises the file and
+/// not the entry that names it, and a run whose name a machine's crash took
+/// is every commit of it gone. One barrier a run, at the first sync that
+/// covers it, on each path that makes one: a commit under a policy that
+/// syncs every commit, the policy's sync falling in the run, the policy's
+/// sync falling after the run has closed, and `sync`. No test can lose a
+/// name, so this one counts what each acknowledgement left unpromised and
+/// the barriers the writer made.
+#[test]
+fn a_runs_name_is_behind_a_barrier_before_its_commits_are_acknowledged() {
+    // Every commit synced: the run's first commit carries the barrier, and
+    // no commit after it.
+    let d = dir("name-always");
+    let mut db = Db::create(
+        &d,
+        Options {
+            sync: SyncPolicy::Always,
+            adaptive_shape: false,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    db.hold_seal_landing(true);
+    assert_eq!(db.seal_waits().run_names, 0);
+    ordered_batch(&mut db, 0);
+    assert_eq!(
+        db.run_names_unsynced(),
+        (Some(false), 0),
+        "a synced commit was acknowledged into a run whose name nothing promises"
+    );
+    assert_eq!(db.seal_waits().run_names, 1);
+    ordered_batch(&mut db, 1);
+    ordered_batch(&mut db, 2);
+    assert_eq!(
+        db.seal_waits().run_names,
+        1,
+        "one barrier a run, not one a commit"
+    );
+    // The run closes into the log, synced and named: nothing is owed.
+    db.put(&key(0), b"closes the run");
+    db.commit().unwrap();
+    assert_eq!(db.runs_unsynced(), (None, 0));
+    assert_eq!(db.run_names_unsynced(), (None, 0));
+    assert_eq!(db.seal_waits().run_names, 1);
+    // The next run is a new name.
+    db.seal().unwrap();
+    ordered_batch(&mut db, 3);
+    assert_eq!(db.run_names_unsynced(), (Some(false), 0));
+    assert_eq!(db.seal_waits().run_names, 2);
+    db.crash();
+    let _ = std::fs::remove_dir_all(&d);
+
+    // A sync every fourth commit.
+    let d = dir("name-everyn");
+    let mut db = Db::create(
+        &d,
+        Options {
+            sync: SyncPolicy::EveryN(4),
+            adaptive_shape: false,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    db.hold_seal_landing(true);
+    // The policy's sync falling in the run.
+    ordered_batch(&mut db, 0);
+    ordered_batch(&mut db, 1);
+    ordered_batch(&mut db, 2);
+    assert_eq!(
+        db.run_names_unsynced(),
+        (Some(true), 0),
+        "nothing is acknowledged as synced yet, and nothing is owed"
+    );
+    assert_eq!(db.seal_waits().run_names, 0);
+    ordered_batch(&mut db, 3);
+    assert_eq!(db.runs_unsynced(), (Some(false), 0));
+    assert_eq!(
+        db.run_names_unsynced(),
+        (Some(false), 0),
+        "the policy's sync covered the run's file and not its name"
+    );
+    assert_eq!(db.seal_waits().run_names, 1);
+    // That run closes named, with two commits the policy has not synced:
+    // loose for its file, and its name is owed nothing more.
+    ordered_batch(&mut db, 4);
+    ordered_batch(&mut db, 5);
+    db.put(&key(0), b"closes the run");
+    db.commit().unwrap();
+    assert_eq!(db.runs_unsynced(), (None, 1));
+    assert_eq!(db.run_names_unsynced(), (None, 0));
+    db.put(&key(1), b"the policy's fourth");
+    db.commit().unwrap();
+    assert_eq!(db.runs_unsynced(), (None, 0));
+    assert_eq!(db.seal_waits().run_names, 1, "a name promised twice");
+
+    // The policy's sync falling after a run closed that no sync had
+    // reached, the live log file holding frames: the frames after the run
+    // go to a new file (`WAL_LOOSE_RUN`), whose name is owed a barrier of
+    // its own, and that one barrier is the run's name's too.
+    db.seal().unwrap();
+    ordered_batch(&mut db, 6);
+    ordered_batch(&mut db, 7);
+    let rotations = db.seal_waits().wal_rotations;
+    db.put(&key(2), b"closes the run");
+    db.commit().unwrap();
+    assert_eq!(db.seal_waits().wal_rotations, rotations + 1);
+    assert_eq!(db.runs_unsynced(), (None, 1));
+    assert_eq!(db.run_names_unsynced(), (None, 1), "the run closed unnamed");
+    db.put(&key(3), b"the policy's fourth");
+    db.commit().unwrap();
+    assert_eq!(db.runs_unsynced(), (None, 0));
+    assert_eq!(db.run_names_unsynced(), (None, 0));
+    assert_eq!(
+        db.seal_waits().run_names,
+        1,
+        "the rotation's barrier is of the directory, and the run's name was in it"
+    );
+    db.crash();
+    let _ = std::fs::remove_dir_all(&d);
+
+    // The same close where the live log file holds no frame: the file's
+    // header is marked in place, no file is begun, and the run's name is
+    // the policy's sync's to promise.
+    let d = dir("name-inplace");
+    let mut db = Db::create(
+        &d,
+        Options {
+            sync: SyncPolicy::EveryN(4),
+            adaptive_shape: false,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    db.hold_seal_landing(true);
+    ordered_batch(&mut db, 0);
+    ordered_batch(&mut db, 1);
+    let rotations = db.seal_waits().wal_rotations;
+    db.put(&key(0), b"closes the run");
+    db.commit().unwrap();
+    assert_eq!(db.seal_waits().wal_rotations, rotations);
+    assert_eq!(db.run_names_unsynced(), (None, 1));
+    assert_eq!(db.seal_waits().run_names, 0);
+    db.put(&key(1), b"the policy's fourth");
+    db.commit().unwrap();
+    assert_eq!(db.runs_unsynced(), (None, 0));
+    assert_eq!(
+        db.seal_waits().run_names,
+        1,
+        "the policy's sync covered a closed run's file and not its name"
+    );
+    db.crash();
+    let _ = std::fs::remove_dir_all(&d);
+
+    // `sync` over a run the policy has synced nothing of.
+    let d = dir("name-sync");
+    let mut db = Db::create(
+        &d,
+        Options {
+            adaptive_shape: false,
+            ..buffered()
+        },
+    )
+    .unwrap();
+    db.hold_seal_landing(true);
+    ordered_batch(&mut db, 0);
+    assert_eq!(db.run_names_unsynced(), (Some(true), 0));
+    db.sync().unwrap();
+    assert_eq!(db.runs_unsynced(), (Some(false), 0));
+    assert_eq!(
+        db.run_names_unsynced(),
+        (Some(false), 0),
+        "`sync` returned over a run whose name nothing promises"
+    );
+    assert_eq!(db.seal_waits().run_names, 1);
+    db.sync().unwrap();
+    assert_eq!(db.seal_waits().run_names, 1);
+    db.crash();
+    let _ = std::fs::remove_dir_all(&d);
+
+    // A store whose commits never sync owes the name to nothing: its
+    // flush is answered behind the landing, whose own directory barrier
+    // carries every name in it.
+    let d = dir("name-never");
+    let mut db = Db::create(&d, buffered()).unwrap();
+    for b in 0..4 {
+        ordered_batch(&mut db, b);
+    }
+    db.flush().unwrap();
+    assert_eq!(db.seal_waits().run_names, 0);
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The barrier's failure is the commit's: a commit whose run's name could
+/// not be promised is not acknowledged, the next sync owes the barrier
+/// still, and a run that closes owing it is the next sync's as a run that
+/// closed unsynced is.
+#[test]
+fn a_barrier_that_fails_is_owed_until_it_is_made() {
+    let d = dir("name-fails");
+    let mut db = Db::create(
+        &d,
+        inline(Options {
+            sync: SyncPolicy::Always,
+            adaptive_shape: false,
+            ..Options::default()
+        }),
+    )
+    .unwrap();
+    db.fail_next_dir_barrier();
+    for j in 0..BATCH {
+        db.append(&key(j), &VALUE);
+    }
+    let e = db
+        .commit()
+        .expect_err("the barrier failed and the commit was acknowledged");
+    assert!(e.to_string().contains("injected"), "{e}");
+    assert_eq!(db.run_names_unsynced(), (Some(true), 0));
+    assert_eq!(db.seal_waits().run_names, 0);
+    // The next commit of the run makes it.
+    ordered_batch(&mut db, 1);
+    assert_eq!(db.run_names_unsynced(), (Some(false), 0));
+    assert_eq!(db.seal_waits().run_names, 1);
+    db.flush().unwrap();
+
+    // A run whose one commit's barrier failed, closed by a write into the
+    // log: its file is synced and its name is not, and the commit into
+    // the log does not return before the name is promised. Its seal is
+    // held, so the run is under its temp name when the commit looks.
+    db.hold_seal_landing(true);
+    db.fail_next_dir_barrier();
+    for j in 0..BATCH {
+        db.append(&key(2 * BATCH + j), &VALUE);
+    }
+    db.commit()
+        .expect_err("the barrier failed and the commit was acknowledged");
+    assert_eq!(db.runs_unsynced(), (Some(false), 0));
+    assert_eq!(db.run_names_unsynced(), (Some(true), 0));
+    db.put(&key(0), b"closes the run");
+    assert_eq!(
+        db.run_names_unsynced(),
+        (None, 1),
+        "a run closed with its name unpromised and nothing owes it"
+    );
+    db.commit().unwrap();
+    assert_eq!(db.runs_unsynced(), (None, 0));
+    assert_eq!(db.run_names_unsynced(), (None, 0));
+    assert_eq!(db.seal_waits().run_names, 2);
+    db.crash();
+
+    let db = Db::open(&d, Options::default()).unwrap();
+    assert_eq!(values(&db, &key(0)), vec![b"closes the run".to_vec()]);
+    assert_eq!(values(&db, &key(1)), vec![VALUE.to_vec()]);
+    for b in 1..3 {
+        assert!(holds(&db, b), "batch {b} is gone");
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// A run's file from before runs took sequence numbers names no start, and
 /// is taken as those were, wherever it stands: a store a release from
 /// before was killed over opens with what that release would have found.
@@ -641,6 +902,25 @@ fn oracle_child(spec: &str) -> ! {
             }
         }
         db.commit().unwrap();
+        if matches!(sync, SyncPolicy::Always) {
+            // What a commit under this policy acknowledges is everything
+            // so far, on whatever path the stream took to it: no run's
+            // file with a commit unsynced, and no run's temp name that a
+            // crash could take.
+            let (run, loose) = db.runs_unsynced();
+            let (name, names) = db.run_names_unsynced();
+            if run == Some(true) || loose != 0 || name == Some(true) || names != 0 {
+                let mut o = out.lock();
+                writeln!(
+                    o,
+                    "commit {i} left unsynced: run {run:?}, loose runs {loose}, \
+                     the run's name {name:?}, loose runs' names {names}"
+                )
+                .unwrap();
+                o.flush().unwrap();
+                std::process::exit(1);
+            }
+        }
         let mut o = out.lock();
         writeln!(o, "{i}").unwrap();
         o.flush().unwrap();
@@ -724,15 +1004,18 @@ fn a_torn_store_is_a_prefix_of_what_was_committed() {
         let want = 20 + pick.draw(if always { 60 } else { 400 });
         let mut last: Option<u64> = None;
         let mut acked = 0;
+        let mut said = String::new();
         while acked < want {
             match lines.next() {
                 Some(Ok(l)) => {
                     if let Ok(n) = l.trim().parse::<u64>() {
                         last = Some(n);
                         acked += 1;
+                    } else if l.starts_with("commit ") {
+                        said = l;
                     }
                 }
-                _ => panic!("round {round}: the writer ended before {want} commits"),
+                _ => panic!("round {round}: the writer ended before {want} commits: {said}"),
             }
         }
         c.kill().unwrap();

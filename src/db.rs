@@ -6658,6 +6658,11 @@ struct Direct {
     /// under a policy that did not sync it, until one that does. A run
     /// that closes so is loose (`Db::loose_runs`).
     unsynced: bool,
+    /// Whether the directory's entry for the temp name is behind a
+    /// barrier: the first sync that acknowledges a commit of the run
+    /// makes it so (`Db::sync_run`), since a sync of the file does not
+    /// promise the entry that names it.
+    named: bool,
 }
 
 /// A run of ordered ingest that closed with commits no sync had covered,
@@ -6667,11 +6672,13 @@ struct Direct {
 /// seal's handle has seen. The first sync by policy syncs it, before the
 /// live log, since what the policy acknowledges then is everything
 /// committed so far and this run's records are before it
-/// (`Db::sync_wal`); one whose temp name is gone landed durable and needs
-/// nothing.
+/// (`Db::sync_wal`), and the directory with it where no barrier has
+/// promised the temp name yet (`named`, the run's own at its close); one
+/// whose temp name is gone landed durable and needs nothing.
 struct LooseRun {
     tmp: PathBuf,
     file: File,
+    named: bool,
 }
 
 /// A half-open key range `[lo, hi)`, `None` above meaning unbounded. The
@@ -15992,6 +15999,11 @@ struct SealCounts {
     wal_rotations: AtomicU64,
     rotated_unsynced: AtomicU64,
     loose_synced: AtomicU64,
+    /// Directory barriers the writer made for the temp names of runs of
+    /// ordered ingest: one a run at most, at the first sync that
+    /// acknowledges a commit of it, and none where a rotation's barrier
+    /// had carried the name already (`Db::dir_barrier`).
+    run_names: AtomicU64,
     /// Time the writer spent in the seals its commits started: the wait
     /// for room, the freeze, and the seal's writer half.
     freeze_ns: AtomicU64,
@@ -16021,6 +16033,7 @@ impl SealCounts {
             wal_rotations: get(&self.wal_rotations),
             rotated_unsynced: get(&self.rotated_unsynced),
             loose_synced: get(&self.loose_synced),
+            run_names: get(&self.run_names),
             freeze_ns: get(&self.freeze_ns),
         }
     }
@@ -16073,6 +16086,9 @@ pub struct SealWaits {
     pub wal_rotations: u64,
     pub rotated_unsynced: u64,
     pub loose_synced: u64,
+    /// Directory barriers made for the temp names of runs of ordered
+    /// ingest (`SealCounts`).
+    pub run_names: u64,
     pub freeze_ns: u64,
 }
 
@@ -17852,6 +17868,9 @@ struct Shared {
     /// A test's: the next close's presync reports a failure as a failed
     /// fdatasync would.
     fail_presync: std::sync::atomic::AtomicBool,
+    /// A test's: the writer's next directory barrier fails
+    /// (`Db::fail_next_dir_barrier`).
+    fail_dir_barrier: std::sync::atomic::AtomicBool,
     /// An error of the segment work's, for the writer's next commit to
     /// return: one slot, the first error kept.
     maint_err: AtomicPtr<std::io::Error>,
@@ -31242,20 +31261,31 @@ impl Db {
     }
 
     /// The barrier a sync by policy is: the directory a rotation owes its
-    /// new file, then the files loose rotations closed, each synced and
-    /// forgotten, and the runs of ordered ingest that closed loose, then
-    /// the live file's header chained, since nothing before it is loose
-    /// any more, and the live file itself; `unsynced` starts over. A
-    /// loose file a landing has retired meanwhile is covered by a durable
-    /// segment, and its absence is no error; a loose run whose segment
-    /// has landed is synced again for nothing.
+    /// new file, then the runs of ordered ingest that closed loose, each
+    /// file synced and the directory once for the temp names no barrier
+    /// has promised, then the files loose rotations closed, each synced
+    /// and forgotten, then the live file's header chained, since nothing
+    /// before it is loose any more, and the live file itself; `unsynced`
+    /// starts over. A loose file a landing has retired meanwhile is
+    /// covered by a durable segment, and its absence is no error; a loose
+    /// run whose segment has landed is synced again for nothing, and its
+    /// temp name, gone, asks for no barrier. The runs are forgotten
+    /// together and only once the barrier is through, so a sync that
+    /// failed part way leaves every one of them for the next.
     fn sync_wal(&mut self) -> Result<()> {
         self.wal_dir_barrier()?;
-        while let Some(r) = self.loose_runs.first() {
+        for r in &self.loose_runs {
             r.file.sync_data()?;
-            SealCounts::add(&self.shared.seal_counts.loose_synced, 1);
-            self.loose_runs.remove(0);
         }
+        if self.loose_runs.iter().any(|r| !r.named && r.tmp.exists()) {
+            self.dir_barrier()?;
+            SealCounts::add(&self.shared.seal_counts.run_names, 1);
+        }
+        SealCounts::add(
+            &self.shared.seal_counts.loose_synced,
+            self.loose_runs.len() as u64,
+        );
+        self.loose_runs.clear();
         while let Some(p) = self.loose_wals.first().cloned() {
             match File::open(&p) {
                 Ok(f) => {
@@ -31278,8 +31308,36 @@ impl Db {
     /// syncs by policy after it until it succeeds; see `wal_dir_unsynced`.
     fn wal_dir_barrier(&mut self) -> Result<()> {
         if self.wal_dir_unsynced {
-            File::open(&self.dir)?.sync_all()?;
-            self.wal_dir_unsynced = false;
+            self.dir_barrier()?;
+        }
+        Ok(())
+    }
+
+    /// The store's directory fsynced, and every name of the writer's that
+    /// waited for a barrier behind one: a rotation's new log file, the
+    /// temp name of the run of ordered ingest in progress, and the temp
+    /// names of the runs that closed loose. The barrier is of the
+    /// directory and not of a name, so one promises them all, and a run
+    /// whose name a rotation's barrier carried asks for none of its own.
+    /// Nothing is marked where it fails: whoever owed the barrier owes it
+    /// still, and the next sync that acknowledges anything retries it.
+    fn dir_barrier(&mut self) -> Result<()> {
+        if self
+            .shared
+            .fail_dir_barrier
+            .swap(false, AtomicOrdering::AcqRel)
+        {
+            return Err(std::io::Error::other(
+                "the directory's sync failed (injected)",
+            ));
+        }
+        File::open(&self.dir)?.sync_all()?;
+        self.wal_dir_unsynced = false;
+        if let Some(d) = self.direct.as_mut() {
+            d.named = true;
+        }
+        for r in &mut self.loose_runs {
+            r.named = true;
         }
         Ok(())
     }
@@ -31646,6 +31704,7 @@ impl Db {
             seal_wedged: std::sync::atomic::AtomicBool::new(false),
             fail_landing: std::sync::atomic::AtomicBool::new(false),
             fail_presync: std::sync::atomic::AtomicBool::new(false),
+            fail_dir_barrier: std::sync::atomic::AtomicBool::new(false),
             maint_err: AtomicPtr::new(std::ptr::null_mut()),
             maint_stop: std::sync::atomic::AtomicBool::new(false),
             spare_wal: AtomicPtr::new(spare_wal),
@@ -32361,6 +32420,7 @@ impl Db {
             seal_wedged: std::sync::atomic::AtomicBool::new(false),
             fail_landing: std::sync::atomic::AtomicBool::new(false),
             fail_presync: std::sync::atomic::AtomicBool::new(false),
+            fail_dir_barrier: std::sync::atomic::AtomicBool::new(false),
             maint_err: AtomicPtr::new(std::ptr::null_mut()),
             maint_stop: std::sync::atomic::AtomicBool::new(false),
             spare_wal: AtomicPtr::new(spare_wal),
@@ -33159,6 +33219,7 @@ impl Db {
                 pending: std::collections::VecDeque::new(),
                 stream_from: 0,
                 unsynced: false,
+                named: false,
             });
         }
         let mem = self.r.mem().clone();
@@ -33294,17 +33355,24 @@ impl Db {
         Ok(())
     }
 
-    /// The open run's file synced: what a sync by policy is to the run in
-    /// progress. The file and not the directory: the temp name rides the
-    /// journal commit the sync of a new file forces, as it always has, and
-    /// no barrier of its own promises it. One at each run's first sync was
-    /// tried with the rest of this and taken out again: a fifth of a
-    /// millisecond, a thirtieth of a durable ordered load of ten thousand
-    /// keys. A name that went missing is missed loudly only where frames
-    /// follow the run, a sequence gap the open refuses; a run that was the
-    /// last thing written is gone with nothing said, and a run written
-    /// after it is removed with it as past the history's end
-    /// (`ROADMAP.md`).
+    /// The open run's file synced, and the directory's entry for its temp
+    /// name behind a barrier once: what a sync by policy is to the run in
+    /// progress. A sync of a file promises the file and not the entry that
+    /// names it, and a run whose name a machine's crash took is every
+    /// commit of the run gone, acknowledged or not, so the first sync that
+    /// acknowledges one makes the name durable as a rotation makes its new
+    /// log file's (`rotate_wal_as`). The file first: its sync forces the
+    /// journal commit that carries the entry on the filesystems the store
+    /// is run on, and the directory's fsync after it is then a flush of
+    /// the device with nothing to write -- a fifth of a millisecond on the
+    /// disk this was priced on, once a run, a thirtieth of a durable
+    /// ordered load of ten thousand keys in ten commits and nothing that
+    /// resolves from a hundred thousand. It was added with the runs'
+    /// sequence numbers, taken out for that thirtieth and put back: the
+    /// price is the smallest rung's, and what it buys is a durable commit
+    /// that rests on what POSIX says of a directory and not on what two
+    /// filesystems happen to do. A store whose commits never sync owes
+    /// the name to nothing, and its landings' directory fsyncs carry it.
     fn sync_run(&mut self) -> Result<()> {
         let Some(d) = self.direct.as_mut() else {
             return Ok(());
@@ -33312,6 +33380,10 @@ impl Db {
         if d.unsynced {
             d.w.sync()?;
             d.unsynced = false;
+        }
+        if !d.named {
+            self.dir_barrier()?;
+            SealCounts::add(&self.shared.seal_counts.run_names, 1);
         }
         Ok(())
     }
@@ -33368,7 +33440,11 @@ impl Db {
     /// run's segment is durable and writes nothing meanwhile.
     fn close_run(&mut self, d: Direct, table: std::sync::Arc<MemTable>) -> Result<()> {
         debug_assert_eq!(table.len(), d.committed, "a run closes between batches");
-        let loose = (d.unsynced && !self.draining).then(|| d.tmp.clone());
+        // Loose where a commit of the run is unsynced, and where its temp
+        // name is behind no barrier, which after a sync of the file is a
+        // barrier that failed: either way a machine's crash may take the
+        // run, and the next sync by policy owes it (`sync_wal`).
+        let loose = ((d.unsynced || !d.named) && !self.draining).then(|| (d.tmp.clone(), d.named));
         let end_seq = self.wal.seq;
         // First, since it moves the held state to the latest, and the name
         // below is cut against the same state.
@@ -33519,10 +33595,10 @@ impl Db {
                 }
             }
         }
-        if let Some(tmp) = loose {
+        if let Some((tmp, named)) = loose {
             self.loose_runs.retain(|r| r.tmp.exists());
             match File::open(&tmp) {
-                Ok(file) => self.loose_runs.push(LooseRun { tmp, file }),
+                Ok(file) => self.loose_runs.push(LooseRun { tmp, file, named }),
                 // Landed and named already: durable, and nothing's to sync.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
@@ -35986,6 +36062,16 @@ impl Db {
             .store(true, AtomicOrdering::Release);
     }
 
+    /// A test's: the writer's next directory barrier fails, as a device
+    /// error in the fsync would -- a rotation's for its new log file, or
+    /// a run of ordered ingest's for its temp name.
+    #[doc(hidden)]
+    pub fn fail_next_dir_barrier(&self) {
+        self.shared
+            .fail_dir_barrier
+            .store(true, AtomicOrdering::Release);
+    }
+
     #[doc(hidden)]
     pub fn fail_next_landing(&self) {
         self.shared
@@ -36113,6 +36199,18 @@ impl Db {
         (
             self.direct.as_ref().map(|d| d.unsynced),
             self.loose_runs.len(),
+        )
+    }
+
+    /// A test's: whether the temp name of the run of ordered ingest in
+    /// progress is behind no directory barrier yet, none where no run is
+    /// open; and the count of runs that closed loose whose names are
+    /// behind none.
+    #[doc(hidden)]
+    pub fn run_names_unsynced(&self) -> (Option<bool>, usize) {
+        (
+            self.direct.as_ref().map(|d| !d.named),
+            self.loose_runs.iter().filter(|r| !r.named).count(),
         )
     }
 

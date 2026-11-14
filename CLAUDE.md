@@ -1114,7 +1114,16 @@ and until the manifest covers its numbers an empty file named by the range
 file, synced or not, as a commit writes the WAL; a sync by policy syncs
 whatever was left unsynced before it, the loose files and the runs that
 closed loose, ahead of the live log or the run in progress, and `sync`
-syncs the run in progress too. The close is
+syncs the run in progress too. The first sync that acknowledges a commit
+of a run fsyncs the directory once, after the run's file, for the temp
+name the file is under (`Db::sync_run`, `Db::dir_barrier`): a file's sync
+does not promise the entry that names it, and a run whose name a crash
+took is every commit of it gone. One barrier a run, none where a
+rotation's barrier for its new log file had the name in the directory
+already, and none in a store whose commits never sync, whose landings'
+directory fsyncs carry it; a barrier that fails fails the commit, and a
+run that closes owing one is the next sync's, as a run that closed
+unsynced is. The close is
 the seal's shape with one difference: the finished segment is hard-linked
 under its piece name rather than renamed, and the temp name stays until the
 manifest names the segment, because a name the manifest lacks is swept at
@@ -2404,11 +2413,18 @@ each state a lost page leaves, by stopping a writer with its seals held
 and cutting a file back or taking it away, since no test can pull the
 plug. A directory barrier for a run's temp name went in beside the fix,
 on the engine's own word that a file's sync does not promise the entry
-that names it, and came out again: the durable ordered load at ten
-thousand keys read a thirtieth slower in the before-and-after pairing,
-and `strace -T` put the barrier at a fifth of a millisecond, once a run,
-on a load of ten commits (`ROADMAP.md` has it as the open question it
-is). The rules: a history kept in more than one file is ordered by a
+that names it, came out on its price, and went back in. The price was
+real and small: the durable ordered load at ten thousand keys a
+thirtieth slower in the before-and-after pairing, `strace -T` putting
+the barrier at a tenth to a quarter of a millisecond once a run, on a
+load of ten commits -- a flush of the device with nothing to write,
+since the file's own sync has forced the journal commit that carries the
+entry -- and nothing that resolves from a hundred thousand keys. What it
+had been traded for was the wording of the guarantee: without it a
+commit acknowledged as durable rested on what ext4 and XFS do with a new
+file's first sync, which POSIX does not promise, and a name that went
+missing was refused at the open only where log frames followed the run.
+The rules: a history kept in more than one file is ordered by a
 number every file carries and one durable watermark, so that what stands
 behind a loss is found by arithmetic and not by which files happen to be
 there; a sync that acknowledges is a sync of everything written before
@@ -2416,9 +2432,13 @@ it, wherever it went, and its test is a count of what it left unsynced on
 every path that writes; a recovery that makes something durable makes
 durable what stands before it first; a crash a test cannot cause is
 built, since the kill tests had killed processes for a year and a
-process's death cannot tell `EveryN` from `Always`; and a barrier added
+process's death cannot tell `EveryN` from `Always`; a barrier added
 beside a fix is a change of its own, priced on the smallest rung, where
-one of anything is a share of the pass.
+one of anything is a share of the pass; and the price is then weighed
+against what the barrier promises and not against the pass, since a
+thirtieth of the smallest rung had bought back a durable commit that
+depended on the filesystem under it, which no row measures and a reader
+of the guarantee takes for granted.
 
 **A length read off the slab that held the exceptions.** The ordered
 table's write log became the range of its entries, its length the
