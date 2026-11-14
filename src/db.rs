@@ -40782,6 +40782,10 @@ const ASK_JOIN_CAP: std::time::Duration = std::time::Duration::from_secs(20);
 /// keeps.
 pub const REWARM_QUIET_BEFORE_MS: u32 = 1000;
 const HOT_RAW_ASK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// The share of a form file's pages under which an install's rewarm asks for
+/// it (`Options::zpages_rewarm_at_install`): short of whole, since a pass of
+/// point reads over a form touches every page of it.
+const INSTALL_REWARM_RESIDENT: f64 = 0.995;
 const HOT_RAW_HOLD: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The share of a partition's records the page cache must hold for a build
@@ -41147,6 +41151,9 @@ struct Maint {
     z_rewarm_life: u64,
     z_rewarm_quiet: Option<std::time::Duration>,
     z_rewarm_due: bool,
+    /// The rewarm due is an install's (`Options::zpages_rewarm_at_install`),
+    /// which asks for every form file short of whole.
+    z_rewarm_whole: bool,
     z_rewarm: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -41751,6 +41758,7 @@ impl Maint {
             z_rewarm_life: 0,
             z_rewarm_quiet: None,
             z_rewarm_due: false,
+            z_rewarm_whole: false,
             z_rewarm: None,
         }
     }
@@ -44613,9 +44621,19 @@ impl Maint {
             return;
         }
         self.z_rewarm_due = false;
+        // An install's rewarm asks for every file short of whole: the point
+        // reads after it touch every page of the form many times over, so
+        // each cold page is a fault where a scan's walk has the next group
+        // asked for ahead of it.
+        let line = if std::mem::take(&mut self.z_rewarm_whole) {
+            INSTALL_REWARM_RESIDENT
+        } else {
+            HOT_RAW_RESIDENT
+        };
         if self.zsel.counts().installs == 0 || self.shared.zgate.load() == zselect::GATE_RAW {
             return;
         }
+        let mut whole = (0.0f64, 0u64);
         let paths: Vec<(PathBuf, f64, u64)> = {
             let _op = self.op();
             self.segs()
@@ -44628,7 +44646,9 @@ impl Maint {
                 .filter_map(|s| {
                     let z = s.z.get()?;
                     let resident = z.pages_resident();
-                    if resident >= HOT_RAW_RESIDENT {
+                    whole.0 += resident * z.file_bytes() as f64;
+                    whole.1 += z.file_bytes();
+                    if resident >= line {
                         return None;
                     }
                     let (id, end) = (Db::name_id(&s.name)?, Db::name_end_seq(&s.name)?);
@@ -44647,9 +44667,11 @@ impl Maint {
                 .collect();
             let room = zfile::read_budget().and_then(|b| b.slack());
             eprintln!(
-                "zrewarm t={:.1} files {} life {life} merging {merging} room_mb {} resident {}",
+                "zrewarm t={:.1} files {} line {line} of_all {:.3}/{} life {life} merging {merging} room_mb {} resident {}",
                 now.as_secs_f64(),
                 paths.len(),
+                whole.0 / whole.1.max(1) as f64,
+                whole.1 >> 20,
                 room.map_or("-".to_string(), |r| (r >> 20).to_string()),
                 shares.join(",")
             );
@@ -44979,6 +45001,7 @@ impl Maint {
         if self.opts.zpages_rewarm_at_install && matches!(d.event, Some(zselect::Event::Install))
         {
             self.z_rewarm_due = true;
+            self.z_rewarm_whole = true;
         }
         self.z_drive(&d);
     }
