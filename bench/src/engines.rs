@@ -1192,6 +1192,18 @@ pub struct Supdb {
     /// before light forms converted (`Options::forms_convert_from`):
     /// `supdb-convert16` and `supdb-ingestconvert16`.
     convert16: bool,
+    /// A wide block's overlay merged from every source in full for a scan
+    /// (`Options::scan_wide_capped` off): `supdb-widefull` and
+    /// `supdb-ingestwidefull`.
+    widefull: bool,
+    /// The tombstone search for every overlay key, a lone source's too
+    /// (`Options::emit_lone_unsearched` off): `supdb-lonetombs` and
+    /// `supdb-ingestlonetombs`.
+    lonetombs: bool,
+    /// A block wide by its count walked wide for as long as it is
+    /// (`Options::forms_copy_hot_wide` off): `supdb-widewalks` and
+    /// `supdb-ingestwidewalks`.
+    widewalks: bool,
     /// EXPERIMENT: the deltas from which the upkeep thread converts a sparse
     /// form the walks have read `CONVREADS` entries of to a copy
     /// (`Options::forms_convert_from`, `forms_convert_reads`), from
@@ -2332,6 +2344,12 @@ struct Policy {
     densefrom: usize,
     /// Conversions at the dense count alone: `...convert16`.
     convert16: bool,
+    /// A wide block's overlay merged in full: `...widefull`.
+    widefull: bool,
+    /// Every overlay key's tombstone search: `...lonetombs`.
+    lonetombs: bool,
+    /// A hot wide block walked wide: `...widewalks`.
+    widewalks: bool,
     /// A filed burst's builds in the commit: `...settlebuildsfiled`.
     settlebuildsfiled: bool,
     /// The walk's own decodes: `supdb-zwalkowns`.
@@ -2762,6 +2780,9 @@ impl Default for Policy {
             scanlevers: false,
             densefrom: 0,
             convert16: false,
+            widefull: false,
+            lonetombs: false,
+            widewalks: false,
             settlebuildsfiled: false,
             zwalkowns: false,
             zviewperopen: false,
@@ -8191,6 +8212,9 @@ impl Supdb {
             scanlevers,
             densefrom,
             convert16,
+            widefull,
+            lonetombs,
+            widewalks,
             settlebuildsfiled,
             zwalkowns,
             zviewperopen,
@@ -8761,6 +8785,9 @@ impl Supdb {
                 && std::env::var("CONVWRITER").as_deref() == Ok("1"),
             forms_convert_light_yields: densefrom > 0
                 && std::env::var("CONVSTRICT").as_deref() == Ok("1"),
+            scan_wide_capped: !widefull,
+            emit_lone_unsearched: !lonetombs,
+            forms_copy_hot_wide: !widewalks,
             forms_settle_builds_filed: settlebuildsfiled,
             zpages_rewarm_quiet_ms: if zrewarmwait {
                 supdb::db::REWARM_QUIET_BEFORE_MS
@@ -9055,6 +9082,9 @@ impl Supdb {
             scanlevers,
             densefrom,
             convert16,
+            widefull,
+            lonetombs,
+            widewalks,
             settlebuildsfiled,
             zwalkowns,
             zviewperopen,
@@ -9748,6 +9778,27 @@ impl Engine for Supdb {
                 "supdb-readnoahead"
             } else {
                 "supdb-ingestreadnoahead"
+            };
+        }
+        if self.widefull {
+            return if self.partition {
+                "supdb-widefull"
+            } else {
+                "supdb-ingestwidefull"
+            };
+        }
+        if self.widewalks {
+            return if self.partition {
+                "supdb-widewalks"
+            } else {
+                "supdb-ingestwidewalks"
+            };
+        }
+        if self.lonetombs {
+            return if self.partition {
+                "supdb-lonetombs"
+            } else {
+                "supdb-ingestlonetombs"
             };
         }
         if self.convert16 {
@@ -11920,6 +11971,12 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestdensefrom"
         | "supdb-convert16"
         | "supdb-ingestconvert16"
+        | "supdb-widefull"
+        | "supdb-ingestwidefull"
+        | "supdb-lonetombs"
+        | "supdb-ingestlonetombs"
+        | "supdb-widewalks"
+        | "supdb-ingestwidewalks"
         | "supdb-settlebuildsfiled"
         | "supdb-ingestsettlebuildsfiled"
         | "supdb-ingestpromote"
@@ -12481,6 +12538,84 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
                         partition: false,
                         durable: false,
                         readnoahead: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-widefull" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        widefull: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestwidefull" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        widefull: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-lonetombs" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        lonetombs: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestlonetombs" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        lonetombs: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-widewalks" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        widewalks: true,
+                        ..Policy::default()
+                    },
+                )
+            },
+            dir,
+        )?,
+        "supdb-ingestwidewalks" => supdb_arm(
+            |d| {
+                Supdb::with_policy(
+                    d,
+                    Policy {
+                        partition: false,
+                        durable: false,
+                        widewalks: true,
                         ..Policy::default()
                     },
                 )
@@ -15209,6 +15344,50 @@ mod tests {
                 assert_eq!(z.features(), base.features());
                 let o = z.db.as_ref().unwrap().options();
                 assert!(o.forms_convert_from == 0 && b.forms_convert_from == 4);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("widefull"),
+                    Policy {
+                        widefull: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-widefull");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.scan_wide_capped && b.scan_wide_capped);
+                assert!(o.emit_lone_unsearched);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("widewalks"),
+                    Policy {
+                        widewalks: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-widewalks");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.forms_copy_hot_wide && b.forms_copy_hot_wide);
+            }
+            {
+                let z = Supdb::with_policy(
+                    &dir("lonetombs"),
+                    Policy {
+                        lonetombs: true,
+                        ..Policy::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(z.name(), "supdb-lonetombs");
+                assert_eq!(z.features(), base.features());
+                let o = z.db.as_ref().unwrap().options();
+                assert!(!o.emit_lone_unsearched && b.emit_lone_unsearched);
+                assert!(o.scan_wide_capped);
             }
             {
                 let z = Supdb::with_policy(

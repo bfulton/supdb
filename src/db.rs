@@ -2829,6 +2829,44 @@ pub struct Options {
     /// ahead (`Options::scan_raw_ahead`), which keeps its own path.
     /// `supdb-runsheld` is the arm.
     pub scan_runs_held: bool,
+    /// A wide block's overlay for a scan merged only as far as the scan
+    /// reads: the walk takes at most its limit of the overlay's keys, and
+    /// the window took its limit of keys from every source and merged them
+    /// all -- the level-0 pieces' runs read key by key and merged, the
+    /// memtables' folded -- so a scan starting among the inserts above the
+    /// store merged a limit from each of nine or ten pieces for the limit
+    /// it emitted, 28,000 instructions a scan on the scrambled E at a
+    /// hundred thousand keys, and about half that capped. The answer is
+    /// the same and the work strictly less, so the count is the verdict;
+    /// the scrambled E leaned its way in both orders, under what a pairing
+    /// resolves. Off is that merge (`supdb-widefull`).
+    pub scan_wide_capped: bool,
+    /// An overlay key one source holds, with no partition record of its
+    /// own, emitted without the search for the newest tombstone: the
+    /// search only decides which older sources a tombstone cuts, and a
+    /// lone source is emitted whatever it finds. It was a third of the
+    /// overlay's 620 instructions a key on the scrambled E's inserts above
+    /// the store, each in one source. Off is the search for every key
+    /// (`supdb-lonetombs`).
+    pub emit_lone_unsearched: bool,
+    /// A block wide by its count of keys above the partition -- the last
+    /// block, where every insert past the store's greatest key lands --
+    /// copied once its walks have paid for the copy, and the copy kept past
+    /// the wide bound, the settle appending each later insert to it: every
+    /// scan that started among the inserts merged a window of the block's
+    /// sources, about 50,000 instructions where a copy's walk takes a tenth
+    /// of that, 385 such walks in the scrambled E at a hundred thousand
+    /// keys. The block was a copy once and stopped being one because the
+    /// copy was rebuilt after every inserting commit; a patch splices into
+    /// a copy now, so the build is paid once. The scrambled E's wide walks
+    /// fell from 385 to 17 at a hundred thousand keys and from 2,250 to 62
+    /// at three hundred thousand, and it read 1.07-1.08x and 1.07-1.13x in
+    /// both orders (`sh bench/scripts/pair.sh supdb-ingest
+    /// supdb-ingestwidewalks 300000 --reps 12`), once a patch stopped
+    /// summing the copy's every run (`CachedBlock::dead`) and a walk
+    /// stopped asking for the whole of it ahead. Off walks the block wide
+    /// for as long as it is (`supdb-widewalks`).
+    pub forms_copy_hot_wide: bool,
     /// A scan's seek asks for the partition's directory words of the
     /// stride window its answer lies in at the moment it asks for the
     /// stride's heads, and the record hint after it estimates its span
@@ -5757,6 +5795,9 @@ impl Default for Options {
             forms_convert_light_yields: false,
             scan_prefetch_sparse_span: false,
             scan_runs_held: false,
+            scan_wide_capped: true,
+            emit_lone_unsearched: true,
+            forms_copy_hot_wide: true,
             seek_prefetch_dir: true,
             scan_cache_ahead_min_blocks: 1024,
             ahead_out_of_core: true,
@@ -15887,6 +15928,15 @@ struct CachedBlock {
     /// for good; a delete leaves the entry, with an empty run, so it
     /// holds.
     identity: bool,
+    /// A copy of a block wide by its count (`Options::forms_copy_hot_wide`),
+    /// kept past the wide bound: the settle that grows its overlay past the
+    /// bound appends to it where it drops any other form for a wide build.
+    wide: bool,
+    /// Bytes of `vals` no entry's run names: the runs a patch replaced,
+    /// so the check for a copy past twice its live bytes is a subtraction,
+    /// where it summed every entry's run at every patch -- a copy kept past
+    /// the wide bound holds thousands, and each insert into it paid the sum.
+    dead: usize,
 }
 
 impl CachedBlock {
@@ -15991,6 +16041,14 @@ impl CachedBlock {
     /// two of them; issued together they cost one, and the values stream
     /// behind the walk once its first lines are in.
     fn prefetch(&self, whole: bool) {
+        // A copy kept past the wide bound holds thousands of entries, and a
+        // walk into it from the block before starts at its first: its
+        // first lines, where the whole of its entries and keys was a few
+        // hundred kilobytes of asks a walk (`Options::forms_copy_hot_wide`).
+        if self.wide {
+            self.prefetch_from(0);
+            return;
+        }
         prefetch_lines(self.ents.as_ptr() as *const u8, self.ents.len() * 16);
         prefetch_lines(self.keys.as_ptr(), self.keys.len());
         // The whole of the values (`Options::copy_prefetch_whole`), or
@@ -16295,6 +16353,13 @@ struct WideBlock {
 /// PROTOTYPE: keys above the partition, as `overlay_count` counts them,
 /// past which a block is walked as a merge instead of built.
 const WIDE: usize = 4 * CACHE_BLOCK;
+
+/// The overlay keys a copy of a block wide by its count builds for each
+/// walk the block has had before it is built (`Options::forms_copy_hot_wide`):
+/// a wide walk merges a window of a scan's length from every source, about
+/// what a copy's build pays for a hundred of its keys, so a block of `n`
+/// keys is copied at its `2 + n / WIDE_COPY_PER_WALK`th walk.
+const WIDE_COPY_PER_WALK: usize = 100;
 
 /// PROTOTYPE: a sparse block's keys above the partition, resolved once:
 /// each key's bytes, where it cuts the walk, and its values as (source,
@@ -26214,6 +26279,7 @@ impl Reader {
             stale: self.fs().snap_stale.borrow(),
             offs: Some(&self.fs().emit_offs),
             copy_dense: false,
+            wide_copy: false,
             copy_exact: self.opts.copy_exact,
             fit: self.fits(),
             merge_pieces: self.opts.overlay_merge,
@@ -28300,7 +28366,10 @@ impl Reader {
             if i + 1 == group_end
                 && b < table.slots.len()
                 && BuildCtx::overlay_count(table, b) > WIDE
-                && !matches!(table.slots[b].as_deref(), Some(Cached::Wide(_)))
+                && !matches!(
+                    table.slots[b].as_deref(),
+                    Some(Cached::Wide(_)) | Some(Cached::Block(CachedBlock { wide: true, .. }))
+                )
             {
                 self.unlist(at, b, table);
             }
@@ -28534,6 +28603,7 @@ impl Reader {
                 if found && run.len() <= blk.ents[i][3] as usize {
                     let at = blk.ents[i][2] as usize;
                     blk.vals[at..at + run.len()].copy_from_slice(run);
+                    blk.dead += blk.ents[i][3] as usize - run.len();
                     blk.ents[i][3] = run.len() as u32;
                 } else if found {
                     if self.fits() {
@@ -28541,6 +28611,7 @@ impl Reader {
                     }
                     let at_run = blk.vals.len() as u32;
                     blk.vals.extend_from_slice(run);
+                    blk.dead += blk.ents[i][3] as usize;
                     blk.ents[i][2] = at_run;
                     blk.ents[i][3] = run.len() as u32;
                 } else {
@@ -28560,7 +28631,12 @@ impl Reader {
                 // Bloated only past twice the floor: below that the sum
                 // over the entries, a load an entry a write, cannot say so.
                 if blk.vals.len() > 2 * 4096 {
-                    let live: usize = blk.ents.iter().map(|e| e[3] as usize).sum();
+                    let live = blk.vals.len() - blk.dead;
+                    debug_assert_eq!(
+                        live,
+                        blk.ents.iter().map(|e| e[3] as usize).sum::<usize>(),
+                        "a copy's dead bytes disagree with its entries' runs"
+                    );
                     bloated = blk.vals.len() > 2 * live.max(4096);
                 }
             }
@@ -29312,10 +29388,25 @@ impl Reader {
                 // burst, and a copy of the run is what a block read again
                 // and again wants -- ycsb-E at a hundred thousand keys
                 // read 0.58x with every touch assembling the window.
+                // A block wide by its count is copied once its walks have
+                // paid for the copy, and kept past the wide bound
+                // (`Options::forms_copy_hot_wide`).
                 let mut recopy = false;
+                let mut wide_copy = false;
+                let hot_wide = self.opts.forms_copy_hot_wide
+                    && matches!(table.slots[b].as_deref(), Some(Cached::Wide(w)) if !w.covered);
+                let n_over = if hot_wide {
+                    BuildCtx::overlay_count(table, b)
+                } else {
+                    0
+                };
                 if let (None, Some(Cached::Wide(w))) = (canon, wide_mut(&mut table.slots[b])) {
                     w.walks = w.walks.saturating_add(1);
                     recopy = w.covered && w.walks >= 2;
+                    if hot_wide && w.walks as usize >= 2 + n_over / WIDE_COPY_PER_WALK {
+                        recopy = true;
+                        wide_copy = true;
+                    }
                 }
                 if recopy {
                     self.unlist(pi, b, table);
@@ -29323,6 +29414,7 @@ impl Reader {
                         BuildCtx {
                             dense_from: 1,
                             copy_dense: true,
+                            wide_copy,
                             ..self.build_ctx()
                         }
                         .materialize(src, None, table, b, unsealed)?,
@@ -39110,6 +39202,10 @@ struct BuildCtx<'s> {
     /// the builder ahead and a promotion copy, since they run where no
     /// read waits or for a block whose reads have repaid it.
     copy_dense: bool,
+    /// A block wide by its count built as a copy, kept past the wide bound
+    /// (`Options::forms_copy_hot_wide`), where the build would answer the
+    /// wide form.
+    wide_copy: bool,
     /// See `Options::copy_exact`.
     copy_exact: bool,
     /// See `Options::forms_to_fit`.
@@ -39345,7 +39441,11 @@ impl<'s> BuildCtx<'s> {
         frozen: &FrozenRuns<'_>,
         filed: &[(u32, u32)],
         sorted: bool,
+        cap: usize,
     ) -> Result<Vec<Over<'a>>> {
+        if cap != usize::MAX && sorted {
+            return self.overlay_mem_capped(unsealed, snap, cuts, frozen, filed, cap);
+        }
         let run = |s: &'a Snapshot,
                    r: std::ops::Range<usize>,
                    cuts: &[AtomicU32],
@@ -39381,7 +39481,7 @@ impl<'s> BuildCtx<'s> {
             out = if out.is_empty() {
                 fout
             } else {
-                Self::fold_overs(out, fout, UKey::merge)
+                Self::fold_overs(out, fout, UKey::merge, cap)
             };
         }
         let lout = run(unsealed, snap, cuts, &|e| {
@@ -39393,7 +39493,7 @@ impl<'s> BuildCtx<'s> {
         } else if lout.is_empty() {
             out
         } else {
-            Self::fold_overs(out, lout, UKey::merge)
+            Self::fold_overs(out, lout, UKey::merge, cap)
         };
         if filed.is_empty() {
             return Ok(out);
@@ -39419,7 +39519,150 @@ impl<'s> BuildCtx<'s> {
         // one's tombstone must cut the frozen values. Merged as two entries
         // they came out as two keys, the tombstone cutting nothing, and the
         // test that scans between a seal and a live delete found it.
-        Ok(Self::fold_overs(out, fresh, UKey::merge))
+        Ok(Self::fold_overs(out, fresh, UKey::merge, cap))
+    }
+    /// `overlay_mem` for a walk that takes at most `cap` of its keys, with
+    /// the filed keys in key order (`Options::scan_wide_capped`): the
+    /// sources merged by their heads and stopped at the `cap`th key, where
+    /// each source's window was listed whole and the lists folded. A key's
+    /// entry is folded from its sources in `overlay_mem`'s order -- the
+    /// bases oldest first, the live run, the keys filed since -- and its cut
+    /// is the first of theirs a source knows.
+    fn overlay_mem_capped<'a>(
+        &'a self,
+        unsealed: &'a Snapshot,
+        snap: std::ops::Range<usize>,
+        cuts: &[AtomicU32],
+        frozen: &FrozenRuns<'_>,
+        filed: &[(u32, u32)],
+        cap: usize,
+    ) -> Result<Vec<Over<'a>>> {
+        // A source: a run of a snapshot (a base's, `Some(i)`, or the live
+        // one's) or the filed keys, with its head's key and prefix.
+        enum Run<'s, 'c> {
+            Snap(&'s Snapshot, Option<usize>, &'c [AtomicU32]),
+            Filed(&'c [(u32, u32)]),
+        }
+        // A source and its head: the key, its prefix, its entry and its cut,
+        // read once as the head moves onto it.
+        struct Src<'s, 'c> {
+            run: Run<'s, 'c>,
+            at: usize,
+            end: usize,
+            key: &'s [u8],
+            pre: (u64, u64),
+            uk: UKey,
+            cut: u32,
+        }
+        let key_of = |slot: u32| self.mem.key_of(self.mem.entry(slot as usize));
+        let load = |src: &mut Src<'a, '_>| -> Result<()> {
+            match src.run {
+                Run::Snap(s, base, sc) => {
+                    let (k, e) = s
+                        .get(src.at)
+                        .ok_or_else(|| err("block cache: a snapshot bound did not resolve"))?;
+                    src.key = k;
+                    src.uk = match base {
+                        Some(i) => {
+                            debug_assert_eq!(e.mem, u32::MAX, "a base holds no live entry");
+                            UKey::frozen(i, e.frozen, e.frun)
+                        }
+                        None => {
+                            debug_assert_eq!(
+                                e.frozen,
+                                u32::MAX,
+                                "a live run holds no frozen entry"
+                            );
+                            UKey::live(e.mem, e.lrun)
+                        }
+                    };
+                    src.cut = sc
+                        .get(src.at)
+                        .map_or(u32::MAX, |c| c.load(AtomicOrdering::Relaxed));
+                }
+                Run::Filed(f) => {
+                    let (slot, c) = f[src.at];
+                    src.key = key_of(slot);
+                    src.uk = UKey::live(slot, NO_RUN);
+                    src.cut = c;
+                }
+            }
+            src.pre = key_prefix(src.key);
+            Ok(())
+        };
+        let mut runs: Vec<(Run<'a, '_>, std::ops::Range<usize>)> =
+            Vec::with_capacity(MAX_FROZEN + 2);
+        for (i, (base, f)) in unsealed.bases.iter().zip(frozen).enumerate() {
+            if let Some((fr, fcuts)) = f {
+                runs.push((Run::Snap(base, Some(i), fcuts), fr.clone()));
+            }
+        }
+        runs.push((Run::Snap(unsealed, None, cuts), snap));
+        runs.push((Run::Filed(filed), 0..filed.len()));
+        let mut srcs: Vec<Src<'a, '_>> = Vec::with_capacity(runs.len());
+        for (run, r) in runs {
+            if r.start < r.end {
+                let mut src = Src {
+                    run,
+                    at: r.start,
+                    end: r.end,
+                    key: &[],
+                    pre: (0, 0),
+                    uk: UKey::NONE,
+                    cut: u32::MAX,
+                };
+                load(&mut src)?;
+                srcs.push(src);
+            }
+        }
+        let mut out: Vec<Over<'a>> = Vec::with_capacity(cap.min(64));
+        while out.len() < cap && !srcs.is_empty() {
+            // The least head, by prefix and then by key.
+            let mut l = 0usize;
+            for i in 1..srcs.len() {
+                let (h, m) = (&srcs[i], &srcs[l]);
+                let less = match h.pre.cmp(&m.pre) {
+                    Ordering::Less => true,
+                    Ordering::Greater => false,
+                    Ordering::Equal => h.key < m.key,
+                };
+                if less {
+                    l = i;
+                }
+            }
+            let (k, kp) = (srcs[l].key, srcs[l].pre);
+            let mut sk: Option<UKey> = None;
+            let mut cut = u32::MAX;
+            let mut spent = false;
+            for (i, src) in srcs.iter_mut().enumerate() {
+                if i != l && (src.pre != kp || src.key != k) {
+                    continue;
+                }
+                sk = Some(match sk {
+                    Some(prev) => UKey::merge(prev, src.uk),
+                    None => src.uk,
+                });
+                if cut == u32::MAX {
+                    cut = src.cut;
+                }
+                src.at += 1;
+                if src.at < src.end {
+                    load(src)?;
+                } else {
+                    spent = true;
+                }
+            }
+            if spent {
+                srcs.retain(|s| s.at < s.end);
+            }
+            out.push(Over {
+                key: k,
+                sk,
+                cut,
+                pieces: 0..0,
+            });
+        }
+        Ok(out)
     }
     /// Two key-ordered lists of overlay keys, each holding a key once,
     /// merged into one where a key both hold is one entry: `fold` makes
@@ -39429,10 +39672,13 @@ impl<'s> BuildCtx<'s> {
         a: Vec<Over<'a>>,
         b: Vec<Over<'a>>,
         fold: impl Fn(UKey, UKey) -> UKey,
+        cap: usize,
     ) -> Vec<Over<'a>> {
-        let mut merged = Vec::with_capacity(a.len() + b.len());
+        let mut merged = Vec::with_capacity((a.len() + b.len()).min(cap));
         let (mut a, mut b) = (a.into_iter().peekable(), b.into_iter().peekable());
-        loop {
+        // The first `cap` keys of the merge are the first `cap` of either
+        // list's merged, so the merge stops there.
+        while merged.len() < cap {
             match (a.peek(), b.peek()) {
                 (None, None) => break,
                 (Some(_), None) => merged.push(a.next().unwrap()),
@@ -39471,6 +39717,7 @@ impl<'s> BuildCtx<'s> {
         mem: Vec<Over<'a>>,
         pieces: &[PieceRun<'_>],
         snap: &'a Snapshot,
+        cap: usize,
     ) -> Result<Overlay<'a>> {
         let stale: &'a SlotSet = &self.stale;
         let mut held: Vec<(&[u8], usize, usize, u32)> = Vec::new();
@@ -39513,6 +39760,9 @@ impl<'s> BuildCtx<'s> {
                     }
                 }
             }
+        }
+        if cap != usize::MAX {
+            return Self::overlay_capped(src, mem, pieces, snap, stale, cap);
         }
         for (j, run, ranks) in pieces {
             let p = &src.l0[*j];
@@ -39577,6 +39827,132 @@ impl<'s> BuildCtx<'s> {
                 sk,
                 cut,
                 pieces: from as u32..h as u32,
+            });
+        }
+        Ok(Overlay {
+            over,
+            held,
+            snap,
+            stale,
+        })
+    }
+    /// `overlay_runs` for a walk that takes at most `cap` of the overlay's
+    /// keys (`Options::scan_wide_capped`): the memtables' keys and the
+    /// pieces' runs merged by their heads, each piece's key read as its
+    /// head moves, and stopped at the `cap`th key. The keys and the piece
+    /// entries are `overlay_runs`' first `cap`, in its order: a key's
+    /// pieces oldest first and its cut the first of theirs a source knows,
+    /// then the memtables'.
+    fn overlay_capped<'a>(
+        src: Sources<'a>,
+        mem: Vec<Over<'a>>,
+        pieces: &[PieceRun<'_>],
+        snap: &'a Snapshot,
+        stale: &'a SlotSet,
+        cap: usize,
+    ) -> Result<Overlay<'a>> {
+        let key_at = |j: usize, r: usize| {
+            src.l0[j]
+                .raw()
+                .key_at(r)
+                .ok_or_else(|| err("block cache: a rank did not resolve"))
+        };
+        // Each piece's head: its index in `pieces`, rank, end, and key with
+        // the key's leading sixteen bytes, oldest piece first.
+        struct Head<'k> {
+            at: usize,
+            rank: usize,
+            end: usize,
+            key: &'k [u8],
+            pre: (u64, u64),
+        }
+        let mut heads: Vec<Head<'a>> = Vec::with_capacity(pieces.len());
+        for (at, (j, run, _)) in pieces.iter().enumerate() {
+            if run.start < run.end {
+                let key = key_at(*j, run.start)?;
+                heads.push(Head {
+                    at,
+                    rank: run.start,
+                    end: run.end,
+                    key,
+                    pre: key_prefix(key),
+                });
+            }
+        }
+        // The heads in order, by prefix, key and then piece, oldest first:
+        // a key's pieces are the heads that lead, and a head that moves
+        // finds its place from the front, where a piece whose keys run past
+        // the others' stays in one compare.
+        let ord = |a: &Head, b: &Head| match a.pre.cmp(&b.pre) {
+            Ordering::Equal => a
+                .key
+                .cmp(b.key)
+                .then_with(|| pieces[a.at].0.cmp(&pieces[b.at].0)),
+            o => o,
+        };
+        heads.sort_by(ord);
+        let mut held: Vec<(&'a [u8], usize, usize, u32)> = Vec::with_capacity(cap.min(256));
+        let mut over: Vec<Over<'a>> = Vec::with_capacity(cap.min(mem.len() + 64));
+        let mut mem = mem.into_iter().peekable();
+        while over.len() < cap {
+            let Some(h0) = heads.first() else {
+                // No piece left: the rest is the memtables'.
+                match mem.next() {
+                    Some(m) => {
+                        over.push(m);
+                        continue;
+                    }
+                    None => break,
+                }
+            };
+            let (k, kp) = (h0.key, h0.pre);
+            if mem.peek().is_some_and(|m| m.key < k) {
+                over.push(mem.next().unwrap());
+                continue;
+            }
+            let mut n = 1usize;
+            while n < heads.len() && heads[n].pre == kp && heads[n].key == k {
+                n += 1;
+            }
+            let from = held.len();
+            let mut cut = u32::MAX;
+            for h in &mut heads[..n] {
+                let (j, _, ranks) = &pieces[h.at];
+                let c = ranks.map_or(u32::MAX, |v| v[h.rank]);
+                if cut == u32::MAX {
+                    cut = c;
+                }
+                held.push((h.key, *j, h.rank, c));
+                h.rank += 1;
+                if h.rank < h.end {
+                    h.key = key_at(*j, h.rank)?;
+                    h.pre = key_prefix(h.key);
+                }
+            }
+            if n == 1 && heads[0].rank < heads[0].end {
+                let mut i = 0usize;
+                while i + 1 < heads.len() && ord(&heads[i + 1], &heads[i]) == Ordering::Less {
+                    heads.swap(i, i + 1);
+                    i += 1;
+                }
+            } else {
+                heads.retain(|h| h.rank < h.end);
+                heads.sort_by(ord);
+            }
+            let sk = if mem.peek().is_some_and(|m| m.key == k) {
+                let m = mem.next().unwrap();
+                if cut == u32::MAX {
+                    cut = m.cut;
+                }
+                m.sk
+            } else {
+                None
+            };
+            over.push(Over {
+                key: k,
+                sk,
+                cut,
+                pieces: from as u32..held.len() as u32,
             });
         }
         Ok(Overlay {
@@ -39651,7 +40027,7 @@ impl<'s> BuildCtx<'s> {
             Vec::new()
         } else {
             let filed = self.filed_cuts(src, b, &table.added[b]);
-            self.overlay_mem(unsealed, snap, cuts, &frozen, &filed, false)?
+            self.overlay_mem(unsealed, snap, cuts, &frozen, &filed, false, usize::MAX)?
         };
         let pieces: Vec<PieceRun<'_>> = table
             .pieces
@@ -39665,7 +40041,7 @@ impl<'s> BuildCtx<'s> {
                 )
             })
             .collect();
-        self.overlay_runs(src, mem, &pieces, unsealed)
+        self.overlay_runs(src, mem, &pieces, unsealed, usize::MAX)
     }
     /// PROTOTYPE: a floor under how many keys above the partition block
     /// `b` has, from the table's bounds alone: its largest source's run
@@ -39758,7 +40134,14 @@ impl<'s> BuildCtx<'s> {
         let key_of = |slot: u32| self.mem.key_of(self.mem.entry(slot as usize));
         let f0 = wide.sorted.partition_point(|&(i, _)| key_of(i) < cursor);
         let filed = &wide.sorted[f0..wide.sorted.len().min(f0.saturating_add(limit))];
-        let mem = self.overlay_mem(unsealed, snap, cuts, &frozen, filed, true)?;
+        // A scan's walk takes at most `limit` of the overlay's keys
+        // (`Options::scan_wide_capped`).
+        let cap = if self.rd.opts.scan_wide_capped {
+            limit
+        } else {
+            usize::MAX
+        };
+        let mem = self.overlay_mem(unsealed, snap, cuts, &frozen, filed, true, cap)?;
         let pieces: Vec<PieceRun<'_>> = table
             .pieces
             .iter()
@@ -39777,7 +40160,7 @@ impl<'s> BuildCtx<'s> {
                 )
             })
             .collect();
-        self.overlay_runs(src, mem, &pieces, unsealed)
+        self.overlay_runs(src, mem, &pieces, unsealed, cap)
     }
     /// PROTOTYPE: the oldest source whose values for an overlay key are
     /// live: 0 with no tombstone in the way, else one past the newest
@@ -39862,7 +40245,26 @@ impl<'s> BuildCtx<'s> {
         let nc = src.l0.len();
         let key = o.key;
         let read = |e: std::io::Error| err(&format!("block cache read: {e}"));
-        let start = self.oldest_live(em, ov, o, held, src);
+        // A key no partition record of its own and one source holds emits
+        // that source whatever the search finds: the search names the
+        // oldest source to emit, and a lone source is at or past it
+        // (`Options::emit_lone_unsearched`).
+        let lone = part.is_none()
+            && self.rd.opts.emit_lone_unsearched
+            && held.len()
+                + o.sk.map_or(0, |sk| {
+                    usize::from(sk.mem != u32::MAX)
+                        + sk.fz[..self.frozen.len()]
+                            .iter()
+                            .filter(|&&(slot, _)| slot != u32::MAX)
+                            .count()
+                })
+                <= 1;
+        let start = if lone {
+            0
+        } else {
+            self.oldest_live(em, ov, o, held, src)
+        };
         if start == 0 {
             if let Some((r, pr)) = part {
                 pr.values_at(r, &mut |v| f(key, v))?;
@@ -40092,7 +40494,7 @@ impl<'s> BuildCtx<'s> {
             }
             return Ok(Cached::Block(self.copy_block(src, pr, lo..hi, &ov)?));
         }
-        if floor > WIDE || covered {
+        if (floor > WIDE && !self.wide_copy) || covered {
             return Ok(Cached::Wide(WideBlock {
                 sorted: self.sorted_filed(&table.added[b]),
                 seen: table.added[b].len(),
@@ -40107,7 +40509,9 @@ impl<'s> BuildCtx<'s> {
         if ov.over.len() < self.dense_from {
             return Ok(Cached::Sparse(self.deltas_for(src, pr, lo..hi, &ov)?));
         }
-        Ok(Cached::Block(self.copy_block(src, pr, lo..hi, &ov)?))
+        let mut cb = self.copy_block(src, pr, lo..hi, &ov)?;
+        cb.wide = self.wide_copy && floor > WIDE;
+        Ok(Cached::Block(cb))
     }
     /// PROTOTYPE: the overlay's keys resolved against the partition once:
     /// where each cuts the walk, and its values from every source that
@@ -40263,7 +40667,7 @@ impl<'s> BuildCtx<'s> {
             .copied()
             .filter(|&(i, _)| cursor.is_empty() || key_of(i) >= cursor)
             .collect();
-        let over = self.overlay_mem(unsealed, snap, cuts, &frozen, &filed, false)?;
+        let over = self.overlay_mem(unsealed, snap, cuts, &frozen, &filed, false, usize::MAX)?;
         if over.is_empty() {
             return Ok(None);
         }
@@ -40606,6 +41010,8 @@ impl<'s> BuildCtx<'s> {
             vals: Vec::with_capacity(n * 128),
             ents: Vec::with_capacity(n),
             identity: false,
+            wide: false,
+            dead: 0,
         });
         let mut current: Vec<u8> = Vec::with_capacity(32);
         let mut open = false;
@@ -40673,6 +41079,8 @@ impl<'s> BuildCtx<'s> {
             vals: Vec::with_capacity(sb.vals.len() + kept * 128),
             ents: Vec::with_capacity(sb.ents.len() + kept),
             identity: false,
+            wide: false,
+            dead: 0,
         };
         // Every key once, then its values, as `copy_block` opens them: an
         // entry opens on a key change, and a key without values -- a
